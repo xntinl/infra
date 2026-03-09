@@ -1,0 +1,225 @@
+{
+  "main": {
+    "id": "adf28c96852c9e62",
+    "type": "split",
+    "children": [
+      {
+        "id": "000e6690fc1f0313",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "9f0face6a124d7b5",
+            "type": "leaf",
+            "state": {
+              "type": "markdown",
+              "state": {
+                "file": "challenges/just/README.md",
+                "mode": "source",
+                "source": false
+              },
+              "icon": "lucide-file",
+              "title": "README"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "vertical"
+  },
+  "left": {
+    "id": "505eae71d6b86e0e",
+    "type": "split",
+    "children": [
+      {
+        "id": "224e47067bcd40ce",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "cda3cf7535287934",
+            "type": "leaf",
+            "state": {
+              "type": "file-explorer",
+              "state": {
+                "sortOrder": "alphabetical",
+                "autoReveal": false
+              },
+              "icon": "lucide-folder-closed",
+              "title": "Files"
+            }
+          },
+          {
+            "id": "5365699635981bee",
+            "type": "leaf",
+            "state": {
+              "type": "search",
+              "state": {
+                "query": "",
+                "matchingCase": false,
+                "explainSearch": false,
+                "collapseAll": false,
+                "extraContext": false,
+                "sortOrder": "alphabetical"
+              },
+              "icon": "lucide-search",
+              "title": "Search"
+            }
+          },
+          {
+            "id": "ca5671e7ea6ce0a6",
+            "type": "leaf",
+            "state": {
+              "type": "bookmarks",
+              "state": {},
+              "icon": "lucide-bookmark",
+              "title": "Bookmarks"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "horizontal",
+    "width": 300
+  },
+  "right": {
+    "id": "5fc7016a0482e1b8",
+    "type": "split",
+    "children": [
+      {
+        "id": "c843ee5686fe5c6b",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "9c44cb557b286781",
+            "type": "leaf",
+            "state": {
+              "type": "backlink",
+              "state": {
+                "file": "challenges/just/README.md",
+                "collapseAll": false,
+                "extraContext": false,
+                "sortOrder": "alphabetical",
+                "showSearch": false,
+                "searchQuery": "",
+                "backlinkCollapsed": false,
+                "unlinkedCollapsed": true
+              },
+              "icon": "links-coming-in",
+              "title": "Backlinks for README"
+            }
+          },
+          {
+            "id": "5429ae50080d0be1",
+            "type": "leaf",
+            "state": {
+              "type": "outgoing-link",
+              "state": {
+                "file": "challenges/just/README.md",
+                "linksCollapsed": false,
+                "unlinkedCollapsed": true
+              },
+              "icon": "links-going-out",
+              "title": "Outgoing links from README"
+            }
+          },
+          {
+            "id": "3e6f2f53237c207d",
+            "type": "leaf",
+            "state": {
+              "type": "tag",
+              "state": {
+                "sortOrder": "frequency",
+                "useHierarchy": true,
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-tags",
+              "title": "Tags"
+            }
+          },
+          {
+            "id": "d5f69cfa1e08dde5",
+            "type": "leaf",
+            "state": {
+              "type": "all-properties",
+              "state": {
+                "sortOrder": "frequency",
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-archive",
+              "title": "All properties"
+            }
+          },
+          {
+            "id": "51ebb2ffb928da03",
+            "type": "leaf",
+            "state": {
+              "type": "outline",
+              "state": {
+                "file": "challenges/just/README.md",
+                "followCursor": false,
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-list",
+              "title": "Outline of README"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "horizontal",
+    "width": 300,
+    "collapsed": true
+  },
+  "left-ribbon": {
+    "hiddenItems": {
+      "switcher:Open quick switcher": false,
+      "graph:Open graph view": false,
+      "canvas:Create new canvas": false,
+      "daily-notes:Open today's daily note": false,
+      "templates:Insert template": false,
+      "command-palette:Open command palette": false,
+      "bases:Create new base": false
+    }
+  },
+  "active": "9f0face6a124d7b5",
+  "lastOpenFiles": [
+    "challenges/kubernetes/22-cicd-and-developer-tools/10-developer-platform-with-backstage/README.md",
+    "challenges/aws/15-advanced-hcl/15.06-type-constraints-optional-defaults/15.06-type-constraints-optional-defaults.md",
+    "challenges/aws/15-advanced-hcl/15.01-dynamic-security-groups-complex-rules/15.01-dynamic-security-groups-complex-rules.md",
+    "challenges/aws/15-advanced-hcl/15.03-conditional-resource-creation-patterns/15.03-conditional-resource-creation-patterns.md",
+    "challenges/aws/15-advanced-hcl/15.09-meta-arguments-deep-dive/15.09-meta-arguments-deep-dive.md",
+    "challenges/aws/15-advanced-hcl/15.02-complex-for-each-maps-objects/15.02-complex-for-each-maps-objects.md",
+    "challenges/aws/15-advanced-hcl/15.10-data-source-patterns-external-data/15.10-data-source-patterns-external-data.md",
+    "challenges/aws/15-advanced-hcl/15.08-generating-json-yaml-from-hcl/15.08-generating-json-yaml-from-hcl.md",
+    "challenges/aws/15-advanced-hcl/15.04-local-exec-remote-exec-provisioners/15.04-local-exec-remote-exec-provisioners.md",
+    "challenges/aws/15-advanced-hcl/15.07-multi-region-multi-account-provider-config/15.07-multi-region-multi-account-provider-config.md",
+    "challenges/aws/15-advanced-hcl/15.05-advanced-function-mastery/15.05-advanced-function-mastery.md",
+    "challenges/aws/03-storage-databases/3.05-s3-lifecycle-policies/3.05-s3-lifecycle-policies.md",
+    "challenges/aws/03-storage-databases/3.09-s3-intelligent-tiering-storage-lens/3.09-s3-intelligent-tiering-storage-lens.md",
+    "challenges/aws/03-storage-databases/3.02-dynamodb-single-table-design-gsi-lsi/3.02-dynamodb-single-table-design-gsi-lsi.md",
+    "challenges/aws/03-storage-databases/3.03-s3-encryption-at-rest/3.03-s3-encryption-at-rest.md",
+    "challenges/aws/03-storage-databases/3.06-s3-cross-region-replication/3.06-s3-cross-region-replication.md",
+    "challenges/aws/03-storage-databases/3.04-dax-cluster-cache-patterns/3.04-dax-cluster-cache-patterns.md",
+    "challenges/aws/03-storage-databases/3.07-s3-event-driven-processing-pipeline/3.07-s3-event-driven-processing-pipeline.md",
+    "challenges/aws/03-storage-databases/3.02-s3-versioning-mfa-delete/3.02-s3-versioning-mfa-delete.md",
+    "challenges/aws/03-storage-databases/3.07-s3-event-driven-processing/3.07-s3-event-driven-processing.md",
+    "challenges/aws/03-storage-databases/3.01-s3-cross-region-replication-lifecycle/3.01-s3-cross-region-replication-lifecycle.md",
+    "challenges/aws/03-storage-databases/3.03-dynamodb-global-tables-conflict-resolution/3.03-dynamodb-global-tables-conflict-resolution.md",
+    "challenges/aws/03-storage-databases/3.10-efs-cross-az-performance-testing/3.10-efs-cross-az-performance-testing.md",
+    "challenges/aws/03-storage-databases/3.08-s3-performance-multipart/3.08-s3-performance-multipart.md",
+    "challenges/aws/03-storage-databases/3.06-elasticache-redis-cluster-pubsub/3.06-elasticache-redis-cluster-pubsub.md",
+    "challenges/aws/03-storage-databases/3.01-s3-fundamentals-buckets-objects/3.01-s3-fundamentals-buckets-objects.md",
+    "challenges/kubernetes/19-gitops/14-gitops-disaster-recovery",
+    "challenges/kubernetes/19-gitops/13-full-gitops-platform",
+    "challenges/kubernetes/19-gitops/12-gitops-secrets-management",
+    "challenges/kubernetes/19-gitops/11-flux-image-automation",
+    "challenges/kubernetes/19-gitops/10-argo-rollouts-blue-green",
+    "challenges/kubernetes/19-gitops/09-argo-rollouts-canary",
+    "challenges/kubernetes/19-gitops/08-argocd-multi-cluster",
+    "challenges/kubernetes/19-gitops/07-flux-helmrelease",
+    "challenges/kubernetes/19-gitops/06-argocd-applicationsets",
+    "challenges/kubernetes/19-gitops/05-argocd-app-of-apps"
+  ]
+}

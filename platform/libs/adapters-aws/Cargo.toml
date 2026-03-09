@@ -1,0 +1,9 @@
+[package]
+name = "adapters-aws"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ports = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }

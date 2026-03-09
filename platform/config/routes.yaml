@@ -1,0 +1,9 @@
+routes:
+  hello:
+    method: GET
+    path: /hello
+    function: hello-api
+  health:
+    method: GET
+    path: /health
+    function: health-api

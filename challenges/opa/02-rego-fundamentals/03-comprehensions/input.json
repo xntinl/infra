@@ -1,0 +1,68 @@
+{
+  "servers": [
+    {
+      "name": "web-us-1",
+      "region": "us-east-1",
+      "cpu_percent": 45,
+      "owner": "alice",
+      "public_ip": "54.23.10.5",
+      "tags": ["production", "frontend"]
+    },
+    {
+      "name": "web-us-2",
+      "region": "us-east-1",
+      "cpu_percent": 82,
+      "owner": "alice",
+      "public_ip": "54.23.10.6",
+      "tags": ["production", "frontend"]
+    },
+    {
+      "name": "db-us-1",
+      "region": "us-east-1",
+      "cpu_percent": 91,
+      "owner": "bob",
+      "public_ip": null,
+      "tags": ["production", "database"]
+    },
+    {
+      "name": "web-eu-1",
+      "region": "eu-west-1",
+      "cpu_percent": 33,
+      "owner": "charlie",
+      "public_ip": "52.18.44.2",
+      "tags": ["staging", "frontend"]
+    },
+    {
+      "name": "db-eu-1",
+      "region": "us-west-1",
+      "cpu_percent": 67,
+      "owner": "charlie",
+      "public_ip": null,
+      "tags": ["staging", "database"]
+    },
+    {
+      "name": "cache-ue-1",
+      "region": "eu-west-1",
+      "cpu_percent": 12,
+      "owner": "bob",
+      "public_ip": null,
+      "tags": ["staging", "cache"]
+    },
+    {
+      "name": "web-ap-1",
+      "region": "ap-southeast-1",
+      "cpu_percent": 88,
+      "owner": "diana",
+      "public_ip": "13.250.1.7",
+      "tags": ["production", "frontend"]
+    },
+    {
+      "name": "db-ap-1",
+      "region": "ap-southeast-1",
+      "cpu_percent": 55,
+      "owner": "diana",
+      "public_ip": null,
+      "tags": ["production", "database"]
+    }
+  ]
+}

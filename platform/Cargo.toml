@@ -1,0 +1,43 @@
+[workspace]
+resolver = "2"
+members = [
+    "functions/hello-api",
+    "functions/health-api",
+    "functions/hello-scheduled",
+    "libs/domain",
+    "libs/ports",
+    "libs/adapters-aws",
+    "libs/app-http",
+    "libs/shared",
+]
+
+[workspace.dependencies]
+# HTTP framework (cloud-agnostic)
+axum = "0.8"
+
+# AWS Lambda runtime (feature-gated in consumers)
+aws_lambda_events = "0.15"
+lambda_http = "0.13"
+lambda_runtime = "0.13"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Async
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Internal crates
+domain = { path = "libs/domain" }
+ports = { path = "libs/ports" }
+adapters-aws = { path = "libs/adapters-aws" }
+app-http = { path = "libs/app-http" }
+shared = { path = "libs/shared" }

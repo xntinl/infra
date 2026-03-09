@@ -1,0 +1,232 @@
+region := "us-east-1"
+
+# Scan for AWS resources that cost money
+scan:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    region="{{region}}"
+
+    section() { printf "\n\033[1;34m=== %s ===\033[0m\n" "$1"; }
+    none()    { echo "  (none)"; }
+    check()   { [[ -n "$1" && ! "$1" =~ ^[[:space:]]*$ && "$1" != *"None"* ]] && echo "$1" || none; }
+
+    section "EC2 Instances"
+    result=$(aws ec2 describe-instances --region "$region" \
+        --filters "Name=instance-state-name,Values=running,stopped,stopping" \
+        --query 'Reservations[].Instances[].{Id:InstanceId,Type:InstanceType,State:State.Name,Name:Tags[?Key==`Name`]|[0].Value}' \
+        --output table 2>/dev/null) || true
+    check "$result"
+
+    section "NAT Gateways (\$32+/mo each)"
+    result=$(aws ec2 describe-nat-gateways --region "$region" \
+        --filter "Name=state,Values=available,pending" \
+        --query 'NatGateways[].{Id:NatGatewayId,State:State,Vpc:VpcId}' \
+        --output table 2>/dev/null) || true
+    check "$result"
+
+    section "Elastic IPs (unattached = \$3.60/mo)"
+    result=$(aws ec2 describe-addresses --region "$region" \
+        --query 'Addresses[?AssociationId==null].{IP:PublicIp,AllocationId:AllocationId}' \
+        --output table 2>/dev/null) || true
+    check "$result"
+
+    section "EBS Volumes (unattached)"
+    result=$(aws ec2 describe-volumes --region "$region" \
+        --filters "Name=status,Values=available" \
+        --query 'Volumes[].{Id:VolumeId,SizeGB:Size,Type:VolumeType}' \
+        --output table 2>/dev/null) || true
+    check "$result"
+
+    section "RDS Instances"
+    result=$(aws rds describe-db-instances --region "$region" \
+        --query 'DBInstances[].{Id:DBInstanceIdentifier,Class:DBInstanceClass,Status:DBInstanceStatus,Engine:Engine}' \
+        --output table 2>/dev/null) || true
+    check "$result"
+
+    section "Load Balancers (\$16+/mo each)"
+    result=$(aws elbv2 describe-load-balancers --region "$region" \
+        --query 'LoadBalancers[].{Name:LoadBalancerName,Type:Type,State:State.Code}' \
+        --output table 2>/dev/null) || true
+    check "$result"
+
+    section "ElastiCache Clusters"
+    result=$(aws elasticache describe-cache-clusters --region "$region" \
+        --query 'CacheClusters[].{Id:CacheClusterId,Type:CacheNodeType,Status:CacheClusterStatus,Engine:Engine}' \
+        --output table 2>/dev/null) || true
+    check "$result"
+
+    section "OpenSearch Domains"
+    result=$(aws opensearch list-domain-names --region "$region" \
+        --query 'DomainNames[].DomainName' \
+        --output table 2>/dev/null) || true
+    check "$result"
+
+    section "EKS Clusters (\$72/mo control plane)"
+    result=$(aws eks list-clusters --region "$region" \
+        --query 'clusters[]' \
+        --output table 2>/dev/null) || true
+    check "$result"
+
+    section "Redshift Clusters (\$180+/mo)"
+    result=$(aws redshift describe-clusters --region "$region" \
+        --query 'Clusters[].{Id:ClusterIdentifier,Type:NodeType,Status:ClusterStatus,Nodes:NumberOfNodes}' \
+        --output table 2>/dev/null) || true
+    check "$result"
+
+    section "SageMaker Notebook Instances (\$50+/mo)"
+    result=$(aws sagemaker list-notebook-instances --region "$region" \
+        --query 'NotebookInstances[].{Name:NotebookInstanceName,Type:InstanceType,Status:NotebookInstanceStatus}' \
+        --output table 2>/dev/null) || true
+    check "$result"
+
+    section "SageMaker Endpoints"
+    result=$(aws sagemaker list-endpoints --region "$region" \
+        --query 'Endpoints[].{Name:EndpointName,Status:EndpointStatus}' \
+        --output table 2>/dev/null) || true
+    check "$result"
+
+    section "Neptune Clusters"
+    result=$(aws neptune describe-db-clusters --region "$region" \
+        --query 'DBClusters[].{Id:DBClusterIdentifier,Status:Status,Engine:Engine}' \
+        --output table 2>/dev/null) || true
+    check "$result"
+
+    section "DocumentDB Clusters"
+    result=$(aws docdb describe-db-clusters --region "$region" \
+        --query 'DBClusters[].{Id:DBClusterIdentifier,Status:Status,Engine:Engine}' \
+        --output table 2>/dev/null) || true
+    check "$result"
+
+    section "MSK (Kafka) Clusters"
+    result=$(aws kafka list-clusters-v2 --region "$region" \
+        --query 'ClusterInfoList[].{Name:ClusterName,Type:ClusterType,State:State}' \
+        --output table 2>/dev/null) || true
+    check "$result"
+
+    section "ECS Fargate Tasks (running)"
+    for cluster in $(aws ecs list-clusters --region "$region" --query 'clusterArns[]' --output text 2>/dev/null || true); do
+        cname=$(basename "$cluster")
+        tasks=$(aws ecs list-tasks --region "$region" --cluster "$cluster" --desired-status RUNNING --query 'taskArns[]' --output text 2>/dev/null) || true
+        if [[ -n "$tasks" && "$tasks" != "None" ]]; then
+            echo "  Cluster: $cname — $(echo "$tasks" | wc -w | tr -d ' ') running tasks"
+        fi
+    done || none
+
+    section "Kinesis Streams (\$11/mo per shard)"
+    result=$(aws kinesis list-streams --region "$region" \
+        --query 'StreamNames[]' \
+        --output table 2>/dev/null) || true
+    check "$result"
+
+    section "Global Accelerator (\$18/mo)"
+    result=$(aws globalaccelerator list-accelerators --region us-west-2 \
+        --query 'Accelerators[].{Name:Name,Status:Status,DNS:DnsName}' \
+        --output table 2>/dev/null) || true
+    check "$result"
+
+    section "VPC Endpoints — Interface (\$7.20/mo each)"
+    result=$(aws ec2 describe-vpc-endpoints --region "$region" \
+        --filters "Name=vpc-endpoint-type,Values=Interface" \
+        --query 'VpcEndpoints[].{Id:VpcEndpointId,Service:ServiceName,State:State}' \
+        --output table 2>/dev/null) || true
+    check "$result"
+
+    section "Route 53 Hosted Zones (\$0.50/mo each)"
+    result=$(aws route53 list-hosted-zones \
+        --query 'HostedZones[].{Name:Name,Id:Id,Records:ResourceRecordSetCount}' \
+        --output table 2>/dev/null) || true
+    check "$result"
+
+    section "KMS Customer-Managed Keys (\$1/mo each)"
+    result=$(aws kms list-keys --region "$region" --query 'Keys[].KeyId' --output text 2>/dev/null) || true
+    count=0
+    if [[ -n "$result" && "$result" != "None" ]]; then
+        for kid in $result; do
+            mgr=$(aws kms describe-key --region "$region" --key-id "$kid" --query 'KeyMetadata.KeyManager' --output text 2>/dev/null) || true
+            state=$(aws kms describe-key --region "$region" --key-id "$kid" --query 'KeyMetadata.KeyState' --output text 2>/dev/null) || true
+            [[ "$mgr" == "CUSTOMER" && "$state" == "Enabled" ]] && ((count++))
+        done
+    fi
+    [[ $count -gt 0 ]] && echo "  $count customer-managed key(s) active" || none
+
+    section "Secrets Manager (\$0.40/mo per secret)"
+    result=$(aws secretsmanager list-secrets --region "$region" \
+        --query 'SecretList[].{Name:Name,LastAccessed:LastAccessedDate}' \
+        --output table 2>/dev/null) || true
+    check "$result"
+
+    echo ""
+    printf "\033[1;32mScan complete.\033[0m Review above for unexpected resources.\n"
+
+# Destroy all Terraform projects (keeps cost-guard)
+teardown:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    infra_dir="$(cd "$(dirname "$(realpath "${BASH_SOURCE[0]:-justfile}")")/.." && pwd)"
+
+    projects=()
+    for dir in "$infra_dir"/*/; do
+        name=$(basename "$dir")
+        [[ -f "$dir/main.tf" && "$name" != "cost-guard" && "$name" != "cloud-sweep" ]] && projects+=("$name")
+    done
+
+    if [[ ${#projects[@]} -eq 0 ]]; then
+        echo "No Terraform projects found to destroy."
+        exit 0
+    fi
+
+    echo "Will destroy these Terraform projects:"
+    for p in "${projects[@]}"; do echo "  - $p"; done
+    echo ""
+    echo "(cost-guard is excluded — use 'just teardown-all' to include it)"
+    echo ""
+    read -p "Type 'yes' to confirm: " confirm
+    [[ "$confirm" == "yes" ]] || { echo "Aborted."; exit 1; }
+
+    for p in "${projects[@]}"; do
+        echo ""
+        printf "\033[1;31m=== Destroying %s ===\033[0m\n" "$p"
+        terraform -chdir="$infra_dir/$p" destroy -auto-approve
+    done
+
+    echo ""
+    printf "\033[1;32mDone.\033[0m Run 'just scan' to verify nothing is left.\n"
+
+# Destroy everything including cost-guard
+teardown-all:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    infra_dir="$(cd "$(dirname "$(realpath "${BASH_SOURCE[0]:-justfile}")")/.." && pwd)"
+
+    projects=()
+    for dir in "$infra_dir"/*/; do
+        name=$(basename "$dir")
+        [[ -f "$dir/main.tf" && "$name" != "cloud-sweep" ]] && projects+=("$name")
+    done
+
+    if [[ ${#projects[@]} -eq 0 ]]; then
+        echo "No Terraform projects found to destroy."
+        exit 0
+    fi
+
+    echo "Will destroy ALL Terraform projects (including cost-guard!):"
+    for p in "${projects[@]}"; do echo "  - $p"; done
+    echo ""
+    read -p "Type 'yes' to confirm: " confirm
+    [[ "$confirm" == "yes" ]] || { echo "Aborted."; exit 1; }
+
+    for p in "${projects[@]}"; do
+        [[ "$p" == "cost-guard" ]] && continue
+        echo ""
+        printf "\033[1;31m=== Destroying %s ===\033[0m\n" "$p"
+        terraform -chdir="$infra_dir/$p" destroy -auto-approve
+    done
+
+    if [[ " ${projects[*]} " =~ " cost-guard " ]]; then
+        echo ""
+        printf "\033[1;31m=== Destroying cost-guard (last) ===\033[0m\n"
+        terraform -chdir="$infra_dir/cost-guard" destroy -auto-approve
+    fi
+
+    echo ""
+    printf "\033[1;32mDone.\033[0m Run 'just scan' to verify nothing is left.\n"

@@ -1,0 +1,17 @@
+[package]
+name = "hello-api"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = ["lambda"]
+lambda = ["dep:lambda_http"]
+
+[dependencies]
+anyhow = { workspace = true }
+app-http = { workspace = true }
+axum = { workspace = true }
+shared = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+lambda_http = { workspace = true, optional = true }

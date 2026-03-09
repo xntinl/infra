@@ -1,0 +1,7 @@
+workflows:
+  hello-workflow:
+    description: "Orchestrate hello-api and hello-scheduled in sequence"
+    definition_file: hello-workflow.json
+    functions:
+      - hello-api
+      - hello-scheduled

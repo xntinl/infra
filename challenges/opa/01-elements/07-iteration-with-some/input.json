@@ -1,0 +1,15 @@
+{
+  "servers": [
+    { "name": "web-1", "port": 80, "protocol": "http" },
+    { "name": "web-2", "port": 443, "protocol": "https" },
+    { "name": "db-1", "port": 5432, "protocol": "tcp" },
+    { "name": "cache-1", "port": 6379, "protocol": "tcp" }
+  ],
+  "permissions": {
+    "alice": "admin",
+    "bob": "editor",
+    "charlie": "viewer",
+    "diana": "admin"
+  },
+  "allowed_ports": [80, 443, 8080, 8443]
+}

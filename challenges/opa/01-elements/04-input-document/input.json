@@ -1,0 +1,12 @@
+{
+  "user": "alice",
+  "action": "read",
+  "resource": "documents",
+  "environment": {
+    "ip": "192.168.1.100",
+    "time": "14:30",
+    "region": "us-east-1"
+  },
+  "tags": ["internal", "confidential"],
+  "medata": null
+}

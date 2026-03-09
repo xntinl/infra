@@ -1,0 +1,16 @@
+{
+  "servers": [
+    {
+      "name": "web-1",
+      "tags": ["production", "frontend"],
+      "public_ip": null,
+      "encryption": true
+    },
+    {
+      "name": "db-1",
+      "tags": ["production", "database"],
+      "public_ip": null,
+      "encryption": true
+    }
+  ]
+}

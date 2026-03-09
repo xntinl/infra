@@ -1,0 +1,13 @@
+functions:
+  hello-api:
+    description: "Hello World HTTP API handler"
+    timeout: 10
+    memory_size: 128
+  health-api:
+    description: "Health check HTTP API handler"
+    timeout: 10
+    memory_size: 128
+  hello-scheduled:
+    description: "Hello World scheduled handler"
+    timeout: 10
+    memory_size: 128

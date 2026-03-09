@@ -1,0 +1,30 @@
+{
+  "Comment": "Orchestrate hello-api and hello-scheduled in sequence",
+  "StartAt": "InvokeHelloApi",
+  "States": {
+    "InvokeHelloApi": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${hello_api_arn}",
+        "Payload.$": "$"
+      },
+      "ResultSelector": {
+        "result.$": "$.Payload"
+      },
+      "Next": "InvokeHelloScheduled"
+    },
+    "InvokeHelloScheduled": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${hello_scheduled_arn}",
+        "Payload.$": "$"
+      },
+      "ResultSelector": {
+        "result.$": "$.Payload"
+      },
+      "End": true
+    }
+  }
+}

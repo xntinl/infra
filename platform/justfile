@@ -1,0 +1,52 @@
+set dotenv-load := false
+
+env := env("ENV", "dev")
+tf_dir := "terraform"
+region := `grep '^region' terraform/terraform.tfvars | sed 's/.*= *"\(.*\)"/\1/'`
+project_name := `grep 'project_name' terraform/terraform.tfvars | sed 's/.*= *"\(.*\)"/\1/'`
+aws_account_id := `aws sts get-caller-identity --query Account --output text 2>/dev/null`
+
+build:
+    cargo lambda build --release --arm64 --output-format zip
+
+build-one name:
+    cargo lambda build --release --arm64 --output-format zip -p {{name}}
+
+fmt:
+    cargo fmt --all
+    terraform -chdir={{tf_dir}} fmt -recursive
+
+lint:
+    cargo clippy --workspace -- -D warnings
+    terraform -chdir={{tf_dir}} validate
+
+test:
+    cargo test --workspace
+
+serve name:
+    cargo run -p {{name}} --no-default-features
+
+init:
+    terraform -chdir={{tf_dir}} init -reconfigure \
+        -backend-config="bucket={{project_name}}-terraform-state-{{aws_account_id}}" \
+        -backend-config="key=terraform.tfstate" \
+        -backend-config="region={{region}}" \
+        -backend-config="encrypt=true"
+    terraform -chdir={{tf_dir}} workspace select -or-create {{env}}
+
+plan: build
+    terraform -chdir={{tf_dir}} plan
+
+apply: build
+    terraform -chdir={{tf_dir}} apply
+
+destroy:
+    terraform -chdir={{tf_dir}} destroy
+
+destroy-all: destroy
+    aws s3 rm s3://{{project_name}}-terraform-state-{{aws_account_id}} --recursive
+    aws s3api delete-bucket --bucket {{project_name}}-terraform-state-{{aws_account_id}} --region {{region}}
+
+clean:
+    cargo clean
+    rm -rf {{tf_dir}}/.terraform

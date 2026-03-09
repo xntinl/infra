@@ -1,0 +1,5 @@
+schedules:
+  hello-every-5-min:
+    description: "Trigger hello-scheduled every 5 minutes"
+    expression: "rate(5 minutes)"
+    function: hello-scheduled

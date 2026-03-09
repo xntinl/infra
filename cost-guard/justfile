@@ -1,0 +1,21 @@
+project := "cost-guard"
+
+init:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    account_id=$(aws sts get-caller-identity --query Account --output text)
+    bucket="{{project}}-terraform-state-${account_id}"
+    if ! aws s3api head-bucket --bucket "$bucket" 2>/dev/null; then
+        aws s3api create-bucket --bucket "$bucket" --region us-east-1
+        aws s3api put-bucket-versioning --bucket "$bucket" --versioning-configuration Status=Enabled
+    fi
+    terraform -chdir=. init -backend-config="bucket=${bucket}"
+
+plan:
+    terraform plan
+
+apply:
+    terraform apply
+
+destroy:
+    terraform destroy
