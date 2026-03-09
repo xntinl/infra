@@ -185,6 +185,7 @@
   },
   "active": "9f0face6a124d7b5",
   "lastOpenFiles": [
+    "README.md",
     "challenges/kubernetes/22-cicd-and-developer-tools/10-developer-platform-with-backstage/README.md",
     "challenges/aws/15-advanced-hcl/15.06-type-constraints-optional-defaults/15.06-type-constraints-optional-defaults.md",
     "challenges/aws/15-advanced-hcl/15.01-dynamic-security-groups-complex-rules/15.01-dynamic-security-groups-complex-rules.md",
@@ -210,7 +211,6 @@
     "challenges/aws/03-storage-databases/3.10-efs-cross-az-performance-testing/3.10-efs-cross-az-performance-testing.md",
     "challenges/aws/03-storage-databases/3.08-s3-performance-multipart/3.08-s3-performance-multipart.md",
     "challenges/aws/03-storage-databases/3.06-elasticache-redis-cluster-pubsub/3.06-elasticache-redis-cluster-pubsub.md",
-    "challenges/aws/03-storage-databases/3.01-s3-fundamentals-buckets-objects/3.01-s3-fundamentals-buckets-objects.md",
     "challenges/kubernetes/19-gitops/14-gitops-disaster-recovery",
     "challenges/kubernetes/19-gitops/13-full-gitops-platform",
     "challenges/kubernetes/19-gitops/12-gitops-secrets-management",
