@@ -4,21 +4,17 @@
     "type": "split",
     "children": [
       {
-        "id": "000e6690fc1f0313",
+        "id": "926e246d3001a6e8",
         "type": "tabs",
         "children": [
           {
-            "id": "9f0face6a124d7b5",
+            "id": "8b900e88ae28dd18",
             "type": "leaf",
             "state": {
-              "type": "markdown",
-              "state": {
-                "file": "challenges/just/README.md",
-                "mode": "source",
-                "source": false
-              },
-              "icon": "lucide-file",
-              "title": "README"
+              "type": "graph",
+              "state": {},
+              "icon": "lucide-git-fork",
+              "title": "Graph view"
             }
           }
         ]
@@ -41,7 +37,7 @@
               "type": "file-explorer",
               "state": {
                 "sortOrder": "alphabetical",
-                "autoReveal": false
+                "autoReveal": true
               },
               "icon": "lucide-folder-closed",
               "title": "Files"
@@ -183,43 +179,44 @@
       "bases:Create new base": false
     }
   },
-  "active": "9f0face6a124d7b5",
+  "active": "8b900e88ae28dd18",
   "lastOpenFiles": [
-    "README.md",
-    "challenges/kubernetes/22-cicd-and-developer-tools/10-developer-platform-with-backstage/README.md",
-    "challenges/aws/15-advanced-hcl/15.06-type-constraints-optional-defaults/15.06-type-constraints-optional-defaults.md",
-    "challenges/aws/15-advanced-hcl/15.01-dynamic-security-groups-complex-rules/15.01-dynamic-security-groups-complex-rules.md",
-    "challenges/aws/15-advanced-hcl/15.03-conditional-resource-creation-patterns/15.03-conditional-resource-creation-patterns.md",
-    "challenges/aws/15-advanced-hcl/15.09-meta-arguments-deep-dive/15.09-meta-arguments-deep-dive.md",
-    "challenges/aws/15-advanced-hcl/15.02-complex-for-each-maps-objects/15.02-complex-for-each-maps-objects.md",
-    "challenges/aws/15-advanced-hcl/15.10-data-source-patterns-external-data/15.10-data-source-patterns-external-data.md",
-    "challenges/aws/15-advanced-hcl/15.08-generating-json-yaml-from-hcl/15.08-generating-json-yaml-from-hcl.md",
-    "challenges/aws/15-advanced-hcl/15.04-local-exec-remote-exec-provisioners/15.04-local-exec-remote-exec-provisioners.md",
-    "challenges/aws/15-advanced-hcl/15.07-multi-region-multi-account-provider-config/15.07-multi-region-multi-account-provider-config.md",
-    "challenges/aws/15-advanced-hcl/15.05-advanced-function-mastery/15.05-advanced-function-mastery.md",
-    "challenges/aws/03-storage-databases/3.05-s3-lifecycle-policies/3.05-s3-lifecycle-policies.md",
-    "challenges/aws/03-storage-databases/3.09-s3-intelligent-tiering-storage-lens/3.09-s3-intelligent-tiering-storage-lens.md",
-    "challenges/aws/03-storage-databases/3.02-dynamodb-single-table-design-gsi-lsi/3.02-dynamodb-single-table-design-gsi-lsi.md",
-    "challenges/aws/03-storage-databases/3.03-s3-encryption-at-rest/3.03-s3-encryption-at-rest.md",
-    "challenges/aws/03-storage-databases/3.06-s3-cross-region-replication/3.06-s3-cross-region-replication.md",
-    "challenges/aws/03-storage-databases/3.04-dax-cluster-cache-patterns/3.04-dax-cluster-cache-patterns.md",
-    "challenges/aws/03-storage-databases/3.07-s3-event-driven-processing-pipeline/3.07-s3-event-driven-processing-pipeline.md",
-    "challenges/aws/03-storage-databases/3.02-s3-versioning-mfa-delete/3.02-s3-versioning-mfa-delete.md",
-    "challenges/aws/03-storage-databases/3.07-s3-event-driven-processing/3.07-s3-event-driven-processing.md",
-    "challenges/aws/03-storage-databases/3.01-s3-cross-region-replication-lifecycle/3.01-s3-cross-region-replication-lifecycle.md",
-    "challenges/aws/03-storage-databases/3.03-dynamodb-global-tables-conflict-resolution/3.03-dynamodb-global-tables-conflict-resolution.md",
-    "challenges/aws/03-storage-databases/3.10-efs-cross-az-performance-testing/3.10-efs-cross-az-performance-testing.md",
-    "challenges/aws/03-storage-databases/3.08-s3-performance-multipart/3.08-s3-performance-multipart.md",
-    "challenges/aws/03-storage-databases/3.06-elasticache-redis-cluster-pubsub/3.06-elasticache-redis-cluster-pubsub.md",
-    "challenges/kubernetes/19-gitops/14-gitops-disaster-recovery",
-    "challenges/kubernetes/19-gitops/13-full-gitops-platform",
-    "challenges/kubernetes/19-gitops/12-gitops-secrets-management",
-    "challenges/kubernetes/19-gitops/11-flux-image-automation",
-    "challenges/kubernetes/19-gitops/10-argo-rollouts-blue-green",
-    "challenges/kubernetes/19-gitops/09-argo-rollouts-canary",
-    "challenges/kubernetes/19-gitops/08-argocd-multi-cluster",
-    "challenges/kubernetes/19-gitops/07-flux-helmrelease",
-    "challenges/kubernetes/19-gitops/06-argocd-applicationsets",
-    "challenges/kubernetes/19-gitops/05-argocd-app-of-apps"
+    "challenges/rust/04-insane/31-cp-persistent-data-structures/31-cp-persistent-data-structures.md",
+    "challenges/rust/04-insane/28-build-http2-implementation/28-build-http2-implementation.md",
+    "challenges/rust/04-insane/30-cp-heavy-light-decomposition/30-cp-heavy-light-decomposition.md",
+    "challenges/rust/04-insane/27-build-container-runtime/27-build-container-runtime.md",
+    "challenges/rust/04-insane/26-build-database-storage-engine/26-build-database-storage-engine.md",
+    "challenges/rust/04-insane/29-cp-suffix-array-and-lcp/29-cp-suffix-array-and-lcp.md",
+    "challenges/go/08-interfaces/14-interface-based-middleware-chain/14-interface-based-middleware-chain.md",
+    "challenges/go/08-interfaces/13-designing-a-plugin-system/13-designing-a-plugin-system.md",
+    "challenges/go/37-distributed-systems-fundamentals/24-consistent-prefix-reads/24-consistent-prefix-reads.md",
+    "challenges/go/37-distributed-systems-fundamentals/23-quorum-based-replication/23-quorum-based-replication.md",
+    "challenges/go/37-distributed-systems-fundamentals/22-failure-detector-phi-accrual/22-failure-detector-phi-accrual.md",
+    "challenges/go/37-distributed-systems-fundamentals/21-anti-entropy-protocol/21-anti-entropy-protocol.md",
+    "challenges/go/37-distributed-systems-fundamentals/20-distributed-transaction-coordinator/20-distributed-transaction-coordinator.md",
+    "challenges/go/37-distributed-systems-fundamentals/19-cqrs-eventual-consistency/19-cqrs-eventual-consistency.md",
+    "challenges/go/37-distributed-systems-fundamentals/18-event-sourcing-engine/18-event-sourcing-engine.md",
+    "challenges/rust/03-avanzado/50-build-task-scheduler/50-build-task-scheduler.md",
+    "challenges/go/37-distributed-systems-fundamentals/17-saga-orchestrator/17-saga-orchestrator.md",
+    "challenges/rust/03-avanzado/44-graceful-shutdown-patterns/44-graceful-shutdown-patterns.md",
+    "challenges/go/37-distributed-systems-fundamentals/16-two-phase-commit/16-two-phase-commit.md",
+    "challenges/go/37-distributed-systems-fundamentals/15-paxos-consensus/15-paxos-consensus.md",
+    "challenges/go/37-distributed-systems-fundamentals/14-chaos-testing-framework/14-chaos-testing-framework.md",
+    "challenges/go/37-distributed-systems-fundamentals/13-sharded-key-value-store/13-sharded-key-value-store.md",
+    "challenges/go/47-capstone-systems-and-kernel/13-interactive-debugger-ptrace/13-interactive-debugger-ptrace.md",
+    "challenges/go/37-distributed-systems-fundamentals/12-distributed-rate-limiter/12-distributed-rate-limiter.md",
+    "challenges/rust/03-avanzado/49-build-load-balancer/49-build-load-balancer.md",
+    "challenges/go/47-capstone-systems-and-kernel/12-go-to-wasm-compiler/12-go-to-wasm-compiler.md",
+    "challenges/rust/04-insane/45-build-message-queue",
+    "challenges/rust/04-insane/44-build-regex-engine",
+    "challenges/rust/04-insane/43-cp-link-cut-trees",
+    "challenges/rust/04-insane/42-build-crdt-collaborative-editor",
+    "challenges/rust/04-insane/41-build-profiler",
+    "challenges/rust/04-insane/40-cp-centroid-decomposition",
+    "challenges/rust/04-insane/39-build-memory-safe-kernel-module",
+    "challenges/rust/04-insane/38-build-tls-handshake",
+    "challenges/rust/04-insane/37-cp-fft-number-theoretic-transform",
+    "challenges/rust/04-insane/36-build-interpreter-with-jit",
+    "Untitled.canvas"
   ]
 }
