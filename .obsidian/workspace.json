@@ -4,17 +4,21 @@
     "type": "split",
     "children": [
       {
-        "id": "926e246d3001a6e8",
+        "id": "303611cd64c0ebf3",
         "type": "tabs",
         "children": [
           {
-            "id": "8b900e88ae28dd18",
+            "id": "390227c9d9c27d87",
             "type": "leaf",
             "state": {
-              "type": "graph",
-              "state": {},
-              "icon": "lucide-git-fork",
-              "title": "Graph view"
+              "type": "markdown",
+              "state": {
+                "file": "Obsidian.md",
+                "mode": "preview",
+                "source": true
+              },
+              "icon": "lucide-file",
+              "title": "Obsidian"
             }
           }
         ]
@@ -90,7 +94,7 @@
             "state": {
               "type": "backlink",
               "state": {
-                "file": "challenges/just/README.md",
+                "file": "Obsidian.md",
                 "collapseAll": false,
                 "extraContext": false,
                 "sortOrder": "alphabetical",
@@ -100,7 +104,7 @@
                 "unlinkedCollapsed": true
               },
               "icon": "links-coming-in",
-              "title": "Backlinks for README"
+              "title": "Backlinks for Obsidian"
             }
           },
           {
@@ -160,8 +164,19 @@
               "icon": "lucide-list",
               "title": "Outline of README"
             }
+          },
+          {
+            "id": "ad87fd4e923ab78d",
+            "type": "leaf",
+            "state": {
+              "type": "advanced-tables-toolbar",
+              "state": {},
+              "icon": "spreadsheet",
+              "title": "Advanced Tables"
+            }
           }
-        ]
+        ],
+        "currentTab": 5
       }
     ],
     "direction": "horizontal",
@@ -176,11 +191,23 @@
       "daily-notes:Open today's daily note": false,
       "templates:Insert template": false,
       "command-palette:Open command palette": false,
-      "bases:Create new base": false
+      "bases:Create new base": false,
+      "table-editor-obsidian:Advanced Tables Toolbar": false,
+      "obsidian-excalidraw-plugin:New drawing": false
     }
   },
-  "active": "8b900e88ae28dd18",
+  "active": "390227c9d9c27d87",
   "lastOpenFiles": [
+    "Obsidian.md",
+    "Excalidraw/Arquitectura.excalidraw.md",
+    "Excalidraw/Drawing 2026-03-27 07.34.39.excalidraw.md",
+    "Untitled.canvas",
+    "Excalidraw",
+    "Untitled 3.base",
+    "Untitled 2.base",
+    "Untitled 1.base",
+    "Untitled.base",
+    "2026-03-27.md",
     "challenges/rust/04-insane/31-cp-persistent-data-structures/31-cp-persistent-data-structures.md",
     "challenges/rust/04-insane/28-build-http2-implementation/28-build-http2-implementation.md",
     "challenges/rust/04-insane/30-cp-heavy-light-decomposition/30-cp-heavy-light-decomposition.md",
@@ -203,20 +230,10 @@
     "challenges/go/37-distributed-systems-fundamentals/15-paxos-consensus/15-paxos-consensus.md",
     "challenges/go/37-distributed-systems-fundamentals/14-chaos-testing-framework/14-chaos-testing-framework.md",
     "challenges/go/37-distributed-systems-fundamentals/13-sharded-key-value-store/13-sharded-key-value-store.md",
-    "challenges/go/47-capstone-systems-and-kernel/13-interactive-debugger-ptrace/13-interactive-debugger-ptrace.md",
-    "challenges/go/37-distributed-systems-fundamentals/12-distributed-rate-limiter/12-distributed-rate-limiter.md",
-    "challenges/rust/03-avanzado/49-build-load-balancer/49-build-load-balancer.md",
-    "challenges/go/47-capstone-systems-and-kernel/12-go-to-wasm-compiler/12-go-to-wasm-compiler.md",
     "challenges/rust/04-insane/45-build-message-queue",
     "challenges/rust/04-insane/44-build-regex-engine",
     "challenges/rust/04-insane/43-cp-link-cut-trees",
     "challenges/rust/04-insane/42-build-crdt-collaborative-editor",
-    "challenges/rust/04-insane/41-build-profiler",
-    "challenges/rust/04-insane/40-cp-centroid-decomposition",
-    "challenges/rust/04-insane/39-build-memory-safe-kernel-module",
-    "challenges/rust/04-insane/38-build-tls-handshake",
-    "challenges/rust/04-insane/37-cp-fft-number-theoretic-transform",
-    "challenges/rust/04-insane/36-build-interpreter-with-jit",
-    "Untitled.canvas"
+    "challenges/rust/04-insane/41-build-profiler"
   ]
 }
