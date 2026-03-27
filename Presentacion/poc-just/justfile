@@ -18,6 +18,7 @@ setup: _check-deps install
     @echo "Proyecto listo v{{version}} ({{git_hash}})"
 
 # Detener servicios y liberar puertos
+[confirm("¿Seguro? quieres deterner todo")]
 [unix]
 stop:
     #!/usr/bin/env bash

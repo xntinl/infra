@@ -55,12 +55,12 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "Presentacion/Just Ejemplos.md",
+                "file": "Presentacion/Just Presentacion.md",
                 "mode": "source",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "Just Ejemplos"
+              "title": "Just Presentacion"
             }
           }
         ],
@@ -137,7 +137,7 @@
             "state": {
               "type": "backlink",
               "state": {
-                "file": "Presentacion/Just Ejemplos.md",
+                "file": "Presentacion/Just Presentacion.md",
                 "collapseAll": false,
                 "extraContext": false,
                 "sortOrder": "alphabetical",
@@ -147,7 +147,7 @@
                 "unlinkedCollapsed": true
               },
               "icon": "links-coming-in",
-              "title": "Backlinks for Just Ejemplos"
+              "title": "Backlinks for Just Presentacion"
             }
           },
           {
@@ -250,8 +250,9 @@
       "obsidian-git:Open Git source control": false
     }
   },
-  "active": "cda3cf7535287934",
+  "active": "c15dfb6a36155fe6",
   "lastOpenFiles": [
+    "Presentacion/Just Ejemplos.md",
     "Presentacion/poc-just/web/node_modules/@angular/common/locales/zh.d.ts",
     "Presentacion/poc-just/web/node_modules/@angular/common/locales/zh-Hans-SG.d.ts",
     "Presentacion/poc-just/web/node_modules/@angular/common/locales/yue-Hant.d.ts",
@@ -262,7 +263,6 @@
     "Presentacion/poc-just/web/node_modules/@angular/common/locales/sw-KE.d.ts",
     "Presentacion/poc-just/web/node_modules/@angular/common/locales/sr-Cyrl-ME.d.ts",
     "Presentacion/poc-just/web/node_modules/@angular/common/locales/sl.d.ts",
-    "Presentacion/poc-just/web/node_modules/@angular/common/locales/rhg-Rohg-BD.d.ts",
     "Presentacion/poc-just/web/node_modules/zod/README.md",
     "Presentacion/poc-just/web/node_modules/yoctocolors-cjs/readme.md",
     "Presentacion/poc-just/web/node_modules/tinyglobby/README.md",
