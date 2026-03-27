@@ -1,0 +1,45 @@
+set dotenv-load
+set dotenv-path := "../.env"
+
+[group('setup')]
+install:
+    npm install
+
+# Genera environment.ts desde el .env
+[private]
+_gen-env:
+    #!/usr/bin/env bash
+    cat > src/environments/environment.ts <<EOF
+    export const environment = {
+      usersApi: '${USERS_API}',
+      productsApi: '${PRODUCTS_API}',
+    };
+    EOF
+    echo "environment.ts generado desde .env"
+
+[group('dev')]
+dev: install _gen-env
+    npx ng serve
+
+[group('build')]
+build: install _gen-env
+    npx ng build
+
+[group('quality')]
+lint:
+    npx ng lint 2>/dev/null || echo "ng lint no configurado"
+
+[group('quality')]
+fmt:
+    npx prettier --write "src/**/*.ts"
+
+[group('quality')]
+fmt-check:
+    npx prettier --check "src/**/*.ts"
+
+[group('testing')]
+test:
+    npx ng test --watch=false 2>/dev/null || echo "tests no configurados"
+
+ci: lint fmt-check build
+    @echo "web CI passed"

@@ -1,0 +1,37 @@
+set dotenv-load
+set dotenv-path := "../.env"
+
+[group('setup')]
+install:
+    npm install
+
+[group('dev')]
+dev: install
+    npx tsx watch src/main.ts
+
+[group('build')]
+build: install
+    npx tsc --outDir dist
+
+[group('build')]
+run: build
+    node dist/main.js
+
+[group('quality')]
+lint:
+    npx eslint src/
+
+[group('quality')]
+fmt:
+    npx prettier --write "src/**/*.ts"
+
+[group('quality')]
+fmt-check:
+    npx prettier --check "src/**/*.ts"
+
+[group('testing')]
+test:
+    npx vitest run
+
+ci: lint fmt-check test build
+    @echo "api-users CI passed"

@@ -3,6 +3,7 @@ title: Obsidian Markdown Cheatsheet
 tags:
   - obsidian
   - init
+date: 2026-03-27
 ---
 
 
@@ -17,6 +18,7 @@ tags:
 ## H2 — Sección
 ### H3 — Subsección
 ---
+
 ## Formato de texto
 
 | Sintaxis                | Resultado             |
@@ -32,45 +34,6 @@ tags:
 
 ---
   
-## Links internos (Wikilinks)
-
-  
-
-```markdown
-
-[[nota]] → link a nota
-
-[[nota#Sección]] → link a heading específico
-
-[[nota#^bloque-id]] → link a bloque específico
-
-[[nota|texto visible]] → alias (texto personalizado)
-
-![[nota]] → embeber nota completa
-
-![[nota#Sección]] → embeber solo una sección
-
-```
-
-  
-
-### Links externos
-
-  
-
-```markdown
-
-[Google](https://google.com)
-
-[Google](https://google.com "tooltip al hover")
-
-```
-
-  
-
----
-
-  
 
 ## Listas
 
@@ -78,30 +41,18 @@ tags:
 ### Desordenadas
 
 - Item 1
-
 - Item 2
-
 - Sub-item
-
 - Otro sub-item
-
 - Más profundo
-
-  
 
 ### Ordenadas
 
 1. Primero
-
 2. Segundo
-
 3. Sub-paso
-
 4. Otro sub-paso
-
 5. Tercero
-
-  
 
 ### Checkboxes (tareas)
 
@@ -116,7 +67,6 @@ tags:
   
 ---
 
-  
 
 ## Tablas
   
@@ -139,8 +89,6 @@ tags:
   
 
 ## Bloques de código
-
-  
 
 ### Inline
 
@@ -198,15 +146,10 @@ ORDER BY total DESC;
 ```hcl
 
 resource "aws_s3_bucket" "data" {
-
 bucket = "my-data-bucket"
-
 tags = {
-
-Environment = "production"
-
+	Environment = "production"
 }
-
 }
 
 ```
@@ -214,15 +157,13 @@ Environment = "production"
   
 
 ```yaml
-
 services:
 api:
-image: node:20-alpine
+	image: node:20-alpine
 ports:
-- "3000:3000"
+	- "3000:3000"
 environment:
-- NODE_ENV=production
-
+	- NODE_ENV=production
 ```
 
   
@@ -358,12 +299,6 @@ publish: true
 
 ## Footnotes (notas al pie)
 
-  
-
-Einstein revolucionó la física[^1] con una ecuación elegante[^relatividad].
-
-  
-
 Obsidian renderiza las notas al pie al final de la nota[^inline].
 
   
@@ -402,60 +337,6 @@ $$
 
   
 
-### Bloque — Ecuación de Schrödinger
-
-  
-
-$$
-
-i\hbar \frac{\partial}{\partial t} \Psi(\mathbf{r}, t) = \hat{H} \Psi(\mathbf{r}, t)
-
-$$
-
-  
-
-### Bloque — Ecuaciones de Maxwell
-
-  
-
-$$
-
-\begin{aligned}
-
-\nabla \cdot \mathbf{E} &= \frac{\rho}{\varepsilon_0} \\
-
-\nabla \cdot \mathbf{B} &= 0 \\
-
-\nabla \times \mathbf{E} &= -\frac{\partial \mathbf{B}}{\partial t} \\
-
-\nabla \times \mathbf{B} &= \mu_0 \mathbf{J} + \mu_0 \varepsilon_0 \frac{\partial \mathbf{E}}{\partial t}
-
-\end{aligned}
-
-$$
-
-  
-
-### Bloque — Sumatoria e integral
-
-  
-
-$$
-
-\sum_{i=1}^{n} x_i = x_1 + x_2 + \cdots + x_n
-
-$$
-
-  
-
-$$
-
-\int_{a}^{b} f(x) \, dx = F(b) - F(a)
-
-$$
-
-  
-
 ---
 
   
@@ -474,9 +355,9 @@ flowchart TD
 
 A[Inicio] --> B{¿Condición?}
 
-B -->|Sí| C[Acción 1]
+B -->|Sí| C[Acción START]
 
-B -->|No| D[Acción 2]
+B -->|No| D[Acción STOP]
 
 C --> E[Fin]
 
@@ -577,7 +458,5 @@ A-->>U: 200 JWT token
   
 
 > [!quote] Recordá
-
-> La mejor nota es la que podés encontrar cuando la necesitás.
-
+> La mejor nota es la que puedes encontrar cuando la necesitás.
 > Usá **links**, **tags** y **propiedades** para conectar todo.

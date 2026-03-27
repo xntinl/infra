@@ -1,0 +1,138 @@
+set dotenv-load
+set windows-shell := ["powershell.exe", "-NoLogo", "-Command"]
+
+version := "1.0.0"
+git_hash := `git rev-parse --short HEAD`
+
+default:
+    @just --list
+
+# Instalar dependencias de todos los proyectos
+install:
+    cd api-users && just install
+    cd api-products && just install
+    cd web && just install
+
+# Verificar dependencias e instalar
+setup: _check-deps install
+    @echo "Proyecto listo v{{version}} ({{git_hash}})"
+
+# Detener servicios y liberar puertos
+[unix]
+stop:
+    #!/usr/bin/env bash
+    for port in $USERS_PORT $PRODUCTS_PORT $WEB_PORT; do
+        pids=$(lsof -ti:$port 2>/dev/null)
+        if [ -n "$pids" ]; then
+            echo "$pids" | xargs kill -9
+            echo "Puerto $port liberado"
+        fi
+    done
+
+[windows]
+stop:
+    #!powershell
+    $ports = @($env:USERS_PORT, $env:PRODUCTS_PORT, $env:WEB_PORT)
+    foreach ($port in $ports) {
+        $conn = Get-NetTCPConnection -LocalPort $port -ErrorAction SilentlyContinue
+        if ($conn) {
+            Stop-Process -Id $conn.OwningProcess -Force
+            Write-Host "Puerto $port liberado"
+        }
+    }
+
+# Levantar todo: backends primero, frontend después
+[unix]
+dev: stop
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "Levantando backends..."
+    cd api-users && just dev &
+    cd api-products && just dev &
+    for port in $USERS_PORT $PRODUCTS_PORT; do
+        until curl -sf http://localhost:$port/health > /dev/null 2>&1; do
+            sleep 0.5
+        done
+        echo "OK: localhost:$port"
+    done
+    echo "Levantando frontend..."
+    cd web && just dev &
+    wait
+
+[windows]
+dev: stop
+    #!powershell
+    Write-Host "Levantando backends..."
+    Start-Process -NoNewWindow just -ArgumentList "dev" -WorkingDirectory api-users
+    Start-Process -NoNewWindow just -ArgumentList "dev" -WorkingDirectory api-products
+    foreach ($port in @($env:USERS_PORT, $env:PRODUCTS_PORT)) {
+        do { Start-Sleep -Milliseconds 500 }
+        until (Test-NetConnection -ComputerName localhost -Port $port -InformationLevel Quiet -ErrorAction SilentlyContinue)
+        Write-Host "OK: localhost:$port"
+    }
+    Write-Host "Levantando frontend..."
+    Start-Process -NoNewWindow just -ArgumentList "dev" -WorkingDirectory web
+    Wait-Process -Name node -ErrorAction SilentlyContinue
+
+# Verificar salud de los 3 servicios
+[unix]
+health:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for port in $USERS_PORT $PRODUCTS_PORT $WEB_PORT; do
+        if curl -sf http://localhost:$port > /dev/null 2>&1; then
+            echo "OK: localhost:$port"
+        else
+            echo "FALLO: localhost:$port"
+        fi
+    done
+
+[windows]
+health:
+    #!powershell
+    foreach ($port in @($env:USERS_PORT, $env:PRODUCTS_PORT, $env:WEB_PORT)) {
+        try {
+            Invoke-WebRequest -Uri "http://localhost:$port" -UseBasicParsing -TimeoutSec 2 | Out-Null
+            Write-Host "OK: localhost:$port"
+        } catch {
+            Write-Host "FALLO: localhost:$port"
+        }
+    }
+
+# CI completo de todos los proyectos
+ci:
+    cd api-users && just ci
+    cd api-products && just ci
+    cd web && just ci
+    @echo "CI passed for v{{version}} ({{git_hash}})"
+
+# Limpiar node_modules de todos los proyectos
+[confirm("¿Borrar node_modules de todos los proyectos?")]
+[unix]
+clean:
+    -rm -rf api-users/node_modules
+    -rm -rf api-products/node_modules
+    -rm -rf web/node_modules
+    @echo "Limpieza completada"
+
+[confirm("¿Borrar node_modules de todos los proyectos?")]
+[windows]
+clean:
+    #!powershell
+    Remove-Item -Recurse -Force api-users/node_modules -ErrorAction SilentlyContinue
+    Remove-Item -Recurse -Force api-products/node_modules -ErrorAction SilentlyContinue
+    Remove-Item -Recurse -Force web/node_modules -ErrorAction SilentlyContinue
+    Write-Host "Limpieza completada"
+
+[unix]
+[private]
+_check-deps:
+    @which node > /dev/null || (echo "Falta node" && exit 1)
+    @which npx > /dev/null || (echo "Falta npx" && exit 1)
+
+[windows]
+[private]
+_check-deps:
+    #!powershell
+    if (-not (Get-Command node -ErrorAction SilentlyContinue)) { Write-Error "Falta node"; exit 1 }
+    if (-not (Get-Command npx -ErrorAction SilentlyContinue)) { Write-Error "Falta npx"; exit 1 }

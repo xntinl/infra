@@ -1,0 +1,15 @@
+version := "1.0.0"
+git_hash := `git rev-parse --short HEAD`
+node_env := `echo ${NODE_ENV:-development}`
+
+build:
+	@echo "Construyendo v{{version}} ({{git_hash}}) en modo {{node_env}}"
+	npx tsc --outDir dist
+
+# Compila y ejecuta
+run: build
+	node dist/main.js
+
+# Ejecuta TypeScript directo (sin compilar)
+dev:
+	npx tsx src/main.ts
