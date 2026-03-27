@@ -87,6 +87,11 @@ health:
         fi
     done
 
+# este comando permite hacer las migraciones de los repositorios ....
+[unix]
+migrate:
+    echo "voy hacer una migracion"
+
 [windows]
 health:
     #!powershell
