@@ -55,12 +55,12 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "Prueba obsidian.md",
+                "file": "Presentacion/Just Ejemplos.md",
                 "mode": "source",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "Prueba obsidian"
+              "title": "Just Ejemplos"
             }
           }
         ],
@@ -137,7 +137,7 @@
             "state": {
               "type": "backlink",
               "state": {
-                "file": "Prueba obsidian.md",
+                "file": "Presentacion/Just Ejemplos.md",
                 "collapseAll": false,
                 "extraContext": false,
                 "sortOrder": "alphabetical",
@@ -147,7 +147,7 @@
                 "unlinkedCollapsed": true
               },
               "icon": "links-coming-in",
-              "title": "Backlinks for Prueba obsidian"
+              "title": "Backlinks for Just Ejemplos"
             }
           },
           {
@@ -250,44 +250,44 @@
       "obsidian-git:Open Git source control": false
     }
   },
-  "active": "c15dfb6a36155fe6",
+  "active": "cda3cf7535287934",
   "lastOpenFiles": [
-    "Presentacion/Obsidian.md",
-    "Prueba obsidian.md",
-    "Excalidraw/Drawing 2026-03-27 16.23.29.excalidraw.md",
-    "README.md",
-    "TL.md",
-    "Presentacion/Just Ejemplos.md",
     "Presentacion/poc-just/web/node_modules/@angular/common/locales/zh.d.ts",
     "Presentacion/poc-just/web/node_modules/@angular/common/locales/zh-Hans-SG.d.ts",
-    "Presentacion/poc-just/web/node_modules/@angular/common/locales/zh-Hans-HK.d.ts",
     "Presentacion/poc-just/web/node_modules/@angular/common/locales/yue-Hant.d.ts",
     "Presentacion/poc-just/web/node_modules/@angular/common/locales/xnr.d.ts",
     "Presentacion/poc-just/web/node_modules/@angular/common/locales/tr.d.ts",
     "Presentacion/poc-just/web/node_modules/@angular/common/locales/tg.d.ts",
-    "Presentacion/poc-just/web/node_modules/@angular/common/locales/teo.d.ts",
     "Presentacion/poc-just/web/node_modules/@angular/common/locales/szl.d.ts",
     "Presentacion/poc-just/web/node_modules/@angular/common/locales/sw-KE.d.ts",
+    "Presentacion/poc-just/web/node_modules/@angular/common/locales/sr-Cyrl-ME.d.ts",
+    "Presentacion/poc-just/web/node_modules/@angular/common/locales/sl.d.ts",
+    "Presentacion/poc-just/web/node_modules/@angular/common/locales/rhg-Rohg-BD.d.ts",
     "Presentacion/poc-just/web/node_modules/zod/README.md",
-    "Presentacion/poc-just/web/node_modules/tinyglobby/README.md",
     "Presentacion/poc-just/web/node_modules/yoctocolors-cjs/readme.md",
+    "Presentacion/poc-just/web/node_modules/tinyglobby/README.md",
     "Presentacion/poc-just/web/node_modules/pkce-challenge/README.md",
     "Presentacion/poc-just/web/node_modules/pkce-challenge/CHANGELOG.md",
-    "Presentacion/poc-just/api-products/node_modules/eslint/README.md",
-    "Presentacion/poc-just/api-products/node_modules/ajv/README.md",
-    "Presentacion/poc-just/api-products/node_modules/esquery/README.md",
-    "Presentacion/poc-just/api-products/node_modules/@jridgewell/sourcemap-codec/README.md",
-    "Presentacion/poc-just/api-products/node_modules/esbuild/README.md",
-    "Presentacion/poc-just/api-products/node_modules/esbuild/LICENSE.md",
-    "Presentacion/poc-just/api-products/node_modules/gopd/README.md",
-    "Presentacion/poc-just/api-products/node_modules/cookie/SECURITY.md",
-    "Presentacion/poc-just/api-products/node_modules/import-fresh/readme.md",
-    "Presentacion/poc-just/api-products/node_modules/espree/node_modules/eslint-visitor-keys/README.md",
-    "Presentacion/poc-just/api-products/node_modules/espree/README.md",
-    "Presentacion/poc-just/api-products/node_modules/word-wrap/README.md",
-    "Presentacion/poc-just/api-products/node_modules/yocto-queue/readme.md",
-    "Presentacion/poc-just/api-products/node_modules/vite-node/README.md",
-    "Presentacion/poc-just/api-products/node_modules/vite/node_modules/@esbuild/darwin-arm64/README.md",
+    "Presentacion/poc-just/api-products/node_modules/typescript/README.md",
+    "Presentacion/poc-just/api-products/node_modules/chai/README.md",
+    "Presentacion/poc-just/api-products/node_modules/ts-api-utils/README.md",
+    "Presentacion/poc-just/api-products/node_modules/ts-api-utils/LICENSE.md",
+    "Presentacion/poc-just/api-products/node_modules/globals/readme.md",
+    "Presentacion/poc-just/api-products/node_modules/gopd/CHANGELOG.md",
+    "Presentacion/poc-just/api-products/node_modules/cookie/README.md",
+    "Presentacion/poc-just/api-products/node_modules/@types/node/README.md",
+    "Presentacion/poc-just/api-products/node_modules/@types/send/README.md",
+    "Presentacion/poc-just/api-products/node_modules/@types/connect/README.md",
+    "Presentacion/poc-just/api-products/node_modules/@types/serve-static/README.md",
+    "Presentacion/poc-just/api-products/node_modules/@types/qs/README.md",
+    "Presentacion/poc-just/api-products/node_modules/@types/range-parser/README.md",
+    "Presentacion/poc-just/api-products/node_modules/@types/http-errors/README.md",
+    "Presentacion/poc-just/api-products/node_modules/@types/express-serve-static-core/README.md",
+    "Presentacion/poc-just/api-products/node_modules/@types/express/README.md",
+    "Presentacion/poc-just/api-products/node_modules/@types/estree/README.md",
+    "Presentacion/poc-just/api-products/node_modules/tinyglobby/README.md",
+    "Presentacion/poc-just/api-products/node_modules/destroy/README.md",
+    "Presentacion/poc-just/api-products/node_modules/callsites/readme.md",
     "Presentacion/poc-just/web/node_modules/ordered-binary/assets/powers-dre.png",
     "Presentacion/poc-just/web/node_modules/retry/equation.gif",
     "Untitled.canvas"
