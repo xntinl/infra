@@ -1,6 +1,8 @@
 ---
 title: Obsidian Markdown Cheatsheet
-tags: [obsidian]  
+tags:
+  - obsidian
+  - init
 ---
 
 
