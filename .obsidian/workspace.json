@@ -252,6 +252,7 @@
   },
   "active": "c15dfb6a36155fe6",
   "lastOpenFiles": [
+    "challenges/dart-flutter/README.md",
     "challenges/dart-flutter/19-flutter-performance/SOLUTION.md",
     "challenges/dart-flutter/15-flutter-state-advanced/SOLUTION.md",
     "challenges/dart-flutter/18-flutter-architecture/SOLUTION.md",
@@ -277,7 +278,6 @@
     "challenges/dart-flutter/16-flutter-animations/README.md",
     "challenges/dart-flutter/17-flutter-testing/README.md",
     "challenges/dart-flutter/14-flutter-networking-data/README.md",
-    "challenges/dart-flutter/01-dart-variables-types/SOLUTION.md",
     "challenges/dart-flutter/20-flutter-advanced-ui",
     "challenges/dart-flutter/19-flutter-performance",
     "challenges/dart-flutter/18-flutter-architecture",
