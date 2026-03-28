@@ -1,11 +1,11 @@
---
+---
 difficulty: basic
 concepts: [basic-recipe-syntax, silent-prefix, os-arch-functions, arguments-with-defaults, just-list]
 tools: [just]
 estimated_time: 15m
 bloom_level: remember
 prerequisites: [none]
---
+---
 
 # 1. Your First Justfile
 ## Prerequisites
