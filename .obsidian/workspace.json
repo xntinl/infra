@@ -8,63 +8,20 @@
         "type": "tabs",
         "children": [
           {
-            "id": "39baa32887de6e82",
-            "type": "leaf",
-            "state": {
-              "type": "markdown",
-              "state": {
-                "file": "Presentacion/Obsidian.md",
-                "mode": "source",
-                "source": false
-              },
-              "icon": "lucide-file",
-              "title": "Obsidian"
-            }
-          },
-          {
-            "id": "cece3459363af7e9",
-            "type": "leaf",
-            "state": {
-              "type": "markdown",
-              "state": {
-                "file": "Presentacion/Just Presentacion.md",
-                "mode": "source",
-                "source": false
-              },
-              "icon": "lucide-file",
-              "title": "Just Presentacion"
-            }
-          },
-          {
-            "id": "4548cde69972ba87",
-            "type": "leaf",
-            "state": {
-              "type": "markdown",
-              "state": {
-                "file": "Presentacion/Obsidian.md",
-                "mode": "preview",
-                "source": true
-              },
-              "icon": "lucide-file",
-              "title": "Obsidian"
-            }
-          },
-          {
             "id": "c15dfb6a36155fe6",
             "type": "leaf",
             "state": {
               "type": "markdown",
               "state": {
-                "file": "challenges/just/03-advanced/01-monorepo-with-modules/01-monorepo-with-modules.md",
+                "file": "challenges/programming-challenges/01-intermediate-advanced/03-bloom-filter-dynamic-resizing/README.md",
                 "mode": "preview",
                 "source": true
               },
               "icon": "lucide-file",
-              "title": "01-monorepo-with-modules"
+              "title": "README"
             }
           }
-        ],
-        "currentTab": 3
+        ]
       }
     ],
     "direction": "vertical"
@@ -137,7 +94,7 @@
             "state": {
               "type": "backlink",
               "state": {
-                "file": "challenges/just/03-advanced/01-monorepo-with-modules/01-monorepo-with-modules.md",
+                "file": "challenges/programming-challenges/01-intermediate-advanced/03-bloom-filter-dynamic-resizing/README.md",
                 "collapseAll": false,
                 "extraContext": false,
                 "sortOrder": "alphabetical",
@@ -147,7 +104,7 @@
                 "unlinkedCollapsed": true
               },
               "icon": "links-coming-in",
-              "title": "Backlinks for 01-monorepo-with-modules"
+              "title": "Backlinks for README"
             }
           },
           {
@@ -250,8 +207,34 @@
       "obsidian-git:Open Git source control": false
     }
   },
-  "active": "c15dfb6a36155fe6",
+  "active": "cda3cf7535287934",
   "lastOpenFiles": [
+    "challenges/programming-challenges/03-insane/43-heap-memory-allocator-malloc/SOLUTION.md",
+    "challenges/programming-challenges/03-insane/49-jit-compiler-backend/SOLUTION.md",
+    "challenges/programming-challenges/03-insane/50-distributed-sql-query-engine/SOLUTION.md",
+    "challenges/programming-challenges/03-insane/44-columnar-database-engine/SOLUTION.md",
+    "challenges/programming-challenges/03-insane/43-heap-memory-allocator-malloc/README.md",
+    "challenges/programming-challenges/03-insane/46-simd-optimized-matrix-ops/SOLUTION.md",
+    "challenges/programming-challenges/03-insane/37-bytecode-compiler-optimizations/SOLUTION.md",
+    "challenges/programming-challenges/03-insane/48-consensus-replicated-state-machine/SOLUTION.md",
+    "challenges/programming-challenges/02-advanced/24-type-checker-simple-language/SOLUTION.md",
+    "challenges/programming-challenges/03-insane/42-thread-scheduler-simulation/SOLUTION.md",
+    "challenges/programming-challenges/03-insane/50-distributed-sql-query-engine/README.md",
+    "challenges/programming-challenges/03-insane/47-event-driven-pubsub-durability/SOLUTION.md",
+    "challenges/programming-challenges/02-advanced/35-lock-manager-deadlock-detection/SOLUTION.md",
+    "challenges/programming-challenges/02-advanced/24-type-checker-simple-language/README.md",
+    "challenges/programming-challenges/03-insane/46-simd-optimized-matrix-ops/README.md",
+    "challenges/programming-challenges/03-insane/39-mapreduce-framework/SOLUTION.md",
+    "challenges/programming-challenges/03-insane/36-complete-language-interpreter/SOLUTION.md",
+    "challenges/programming-challenges/03-insane/42-thread-scheduler-simulation/README.md",
+    "challenges/programming-challenges/02-advanced/23-recursive-descent-parser-ast/SOLUTION.md",
+    "challenges/programming-challenges/03-insane/45-zero-knowledge-proof-system/SOLUTION.md",
+    "challenges/programming-challenges/03-insane/41-custom-file-system-in-memory/SOLUTION.md",
+    "challenges/programming-challenges/02-advanced/30-connection-pool-health-checking/SOLUTION.md",
+    "challenges/programming-challenges/03-insane/47-event-driven-pubsub-durability/README.md",
+    "challenges/programming-challenges/02-advanced/21-page-based-storage-engine/SOLUTION.md",
+    "challenges/programming-challenges/02-advanced/17-lock-free-queue-michael-scott/SOLUTION.md",
+    "challenges/programming-challenges/03-insane/38-distributed-key-value-store/SOLUTION.md",
     "challenges/programming-challenges/03-insane/50-distributed-sql-query-engine",
     "challenges/programming-challenges/03-insane/49-jit-compiler-backend",
     "challenges/programming-challenges/03-insane/48-consensus-replicated-state-machine",
@@ -262,32 +245,6 @@
     "challenges/programming-challenges/03-insane/43-heap-memory-allocator-malloc",
     "challenges/programming-challenges/03-insane/42-thread-scheduler-simulation",
     "challenges/programming-challenges/03-insane/41-custom-file-system-in-memory",
-    "challenges/programming-challenges/03-insane/40-ray-tracing-engine",
-    "challenges/dart-flutter/README.md",
-    "challenges/dart-flutter/19-flutter-performance/SOLUTION.md",
-    "challenges/dart-flutter/15-flutter-state-advanced/SOLUTION.md",
-    "challenges/dart-flutter/18-flutter-architecture/SOLUTION.md",
-    "challenges/dart-flutter/20-flutter-advanced-ui/SOLUTION.md",
-    "challenges/dart-flutter/13-flutter-forms-input/SOLUTION.md",
-    "challenges/dart-flutter/09-flutter-setup-widgets/SOLUTION.md",
-    "challenges/dart-flutter/16-flutter-animations/SOLUTION.md",
-    "challenges/dart-flutter/14-flutter-networking-data/SOLUTION.md",
-    "challenges/dart-flutter/17-flutter-testing/SOLUTION.md",
-    "challenges/dart-flutter/10-flutter-layouts/SOLUTION.md",
-    "challenges/dart-flutter/11-flutter-navigation-routing/SOLUTION.md",
-    "challenges/dart-flutter/19-flutter-performance/README.md",
-    "challenges/dart-flutter/08-dart-advanced/SOLUTION.md",
-    "challenges/dart-flutter/20-flutter-advanced-ui/README.md",
-    "challenges/dart-flutter/12-flutter-state-basics/SOLUTION.md",
-    "challenges/dart-flutter/07-dart-error-handling-null-safety/SOLUTION.md",
-    "challenges/dart-flutter/05-dart-async-programming/SOLUTION.md",
-    "challenges/dart-flutter/18-flutter-architecture/README.md",
-    "challenges/dart-flutter/15-flutter-state-advanced/README.md",
-    "challenges/dart-flutter/03-dart-control-flow-collections/SOLUTION.md",
-    "challenges/dart-flutter/06-dart-generics-type-system/SOLUTION.md",
-    "challenges/dart-flutter/09-flutter-setup-widgets/README.md",
-    "challenges/dart-flutter/16-flutter-animations/README.md",
-    "challenges/dart-flutter/17-flutter-testing/README.md",
     "Presentacion/poc-just/web/node_modules/ordered-binary/assets/powers-dre.png",
     "Presentacion/poc-just/web/node_modules/retry/equation.gif",
     "Untitled.canvas"
