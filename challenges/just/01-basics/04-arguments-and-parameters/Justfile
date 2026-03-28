@@ -1,0 +1,4 @@
+backup +files:
+    @for f in {{files}}; do \
+        echo "backup up: $f"; \
+    done

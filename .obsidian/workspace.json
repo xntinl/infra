@@ -252,6 +252,7 @@
   },
   "active": "c15dfb6a36155fe6",
   "lastOpenFiles": [
+    "challenges/just/01-basics/04-arguments-and-parameters/Justfile",
     "challenges/just/01-basics/03-dependencies/03-dependencies.md",
     "challenges/just/01-basics/03-dependencies/Justfile",
     "challenges/just/01-basics/02-variables-and-backticks/02-variables-and-backticks.md",
@@ -287,7 +288,6 @@
     "Presentacion/poc-just/api-products/node_modules/@types/connect/README.md",
     "Presentacion/poc-just/api-products/node_modules/@types/serve-static/README.md",
     "Presentacion/poc-just/api-products/node_modules/@types/qs/README.md",
-    "Presentacion/poc-just/api-products/node_modules/@types/range-parser/README.md",
     "Presentacion/poc-just/web/node_modules/ordered-binary/assets/powers-dre.png",
     "Presentacion/poc-just/web/node_modules/retry/equation.gif",
     "Untitled.canvas"
