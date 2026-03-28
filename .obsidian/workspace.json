@@ -209,6 +209,7 @@
   },
   "active": "cda3cf7535287934",
   "lastOpenFiles": [
+    "challenges/programming-challenges/programming-challenges.md",
     "challenges/programming-challenges/03-insane/43-heap-memory-allocator-malloc/SOLUTION.md",
     "challenges/programming-challenges/03-insane/49-jit-compiler-backend/SOLUTION.md",
     "challenges/programming-challenges/03-insane/50-distributed-sql-query-engine/SOLUTION.md",
@@ -234,7 +235,6 @@
     "challenges/programming-challenges/03-insane/47-event-driven-pubsub-durability/README.md",
     "challenges/programming-challenges/02-advanced/21-page-based-storage-engine/SOLUTION.md",
     "challenges/programming-challenges/02-advanced/17-lock-free-queue-michael-scott/SOLUTION.md",
-    "challenges/programming-challenges/03-insane/38-distributed-key-value-store/SOLUTION.md",
     "challenges/programming-challenges/03-insane/50-distributed-sql-query-engine",
     "challenges/programming-challenges/03-insane/49-jit-compiler-backend",
     "challenges/programming-challenges/03-insane/48-consensus-replicated-state-machine",

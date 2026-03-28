@@ -14,6 +14,7 @@
 | [OPA](opa/opa.md) | 40 | 9 | Open Policy Agent: Rego, Terraform, K8s, CI/CD |
 | [Go](go/go.md) | 497 | 47 | Go programming: fundamentals to systems, concurrency, distributed systems |
 | [Rust](rust/rust.md) | 145 | 4 | Rust programming: fundamentals, patterns, systems, competitive programming, insane challenges |
+| [Programming Challenges](programming-challenges/programming-challenges.md) | 50 | 9 | Go & Rust systems programming challenges: concurrency, compilers, distributed systems, crypto |
 | [Just](just/just.md) | 50 | 5 | Just command runner: recipes, modules, CI/CD, orchestration |
 
 ---
@@ -75,6 +76,14 @@ Categories: Basics (8), Intermediate (12), Advanced (10), Challenges (8), Insane
 85 hands-on exercises across 4 difficulty levels from basic syntax to systems programming.
 
 Categories: Basico (15), Intermedio (15), Avanzado (30), Insane (25). Covers ownership, traits, generics, async/tokio, macros, unsafe, FFI, WASM, SIMD, formal verification, JIT compilation, distributed systems, compiler construction.
+
+---
+
+## [Programming Challenges](programming-challenges/programming-challenges.md)
+
+50 standalone systems programming challenges in Go and Rust across 3 difficulty levels.
+
+Categories: Concurrency, Data Structures, Algorithms, Parsers & Compilers, Databases, Networking, Distributed Systems, Cryptography, Systems Programming. Difficulty levels: Intermediate-Advanced (15), Advanced (20), Insane (15).
 
 ---
 
