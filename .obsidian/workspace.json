@@ -55,12 +55,12 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "challenges/just/01-basics/04-arguments-and-parameters/04-arguments-and-parameters.md",
+                "file": "challenges/just/03-advanced/01-monorepo-with-modules/01-monorepo-with-modules.md",
                 "mode": "preview",
                 "source": true
               },
               "icon": "lucide-file",
-              "title": "04-arguments-and-parameters"
+              "title": "01-monorepo-with-modules"
             }
           }
         ],
@@ -137,7 +137,7 @@
             "state": {
               "type": "backlink",
               "state": {
-                "file": "challenges/just/01-basics/04-arguments-and-parameters/04-arguments-and-parameters.md",
+                "file": "challenges/just/03-advanced/01-monorepo-with-modules/01-monorepo-with-modules.md",
                 "collapseAll": false,
                 "extraContext": false,
                 "sortOrder": "alphabetical",
@@ -147,7 +147,7 @@
                 "unlinkedCollapsed": true
               },
               "icon": "links-coming-in",
-              "title": "Backlinks for 04-arguments-and-parameters"
+              "title": "Backlinks for 01-monorepo-with-modules"
             }
           },
           {
@@ -252,6 +252,9 @@
   },
   "active": "c15dfb6a36155fe6",
   "lastOpenFiles": [
+    "challenges/just/05-insane/01-justfile-meta-generator/01-justfile-meta-generator.md",
+    "challenges/just/01-basics/05-conditionals-and-expressions/05-conditionals-and-expressions.md",
+    "challenges/just/01-basics/04-arguments-and-parameters/04-arguments-and-parameters.md",
     "challenges/just/01-basics/04-arguments-and-parameters/Justfile",
     "challenges/just/01-basics/03-dependencies/03-dependencies.md",
     "challenges/just/01-basics/03-dependencies/Justfile",
@@ -270,7 +273,6 @@
     "Presentacion/poc-just/web/node_modules/@angular/common/locales/zh-Hans-SG.d.ts",
     "Presentacion/poc-just/web/node_modules/@angular/common/locales/yue-Hant.d.ts",
     "Presentacion/poc-just/web/node_modules/@angular/common/locales/xnr.d.ts",
-    "Presentacion/poc-just/web/node_modules/@angular/common/locales/tr.d.ts",
     "Presentacion/poc-just/web/node_modules/zod/README.md",
     "Presentacion/poc-just/web/node_modules/yoctocolors-cjs/readme.md",
     "Presentacion/poc-just/web/node_modules/tinyglobby/README.md",
@@ -286,8 +288,6 @@
     "Presentacion/poc-just/api-products/node_modules/@types/node/README.md",
     "Presentacion/poc-just/api-products/node_modules/@types/send/README.md",
     "Presentacion/poc-just/api-products/node_modules/@types/connect/README.md",
-    "Presentacion/poc-just/api-products/node_modules/@types/serve-static/README.md",
-    "Presentacion/poc-just/api-products/node_modules/@types/qs/README.md",
     "Presentacion/poc-just/web/node_modules/ordered-binary/assets/powers-dre.png",
     "Presentacion/poc-just/web/node_modules/retry/equation.gif",
     "Untitled.canvas"
