@@ -1,0 +1,6 @@
+test: build
+    @echo "runnning test"
+build: clean
+   @echo "compiling source code"     
+clean:
+    @echo "removing build artifacts"

@@ -55,12 +55,12 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "challenges/just/01-basics/03-dependencies/03-dependencies.md",
+                "file": "challenges/just/01-basics/04-arguments-and-parameters/04-arguments-and-parameters.md",
                 "mode": "preview",
                 "source": true
               },
               "icon": "lucide-file",
-              "title": "03-dependencies"
+              "title": "04-arguments-and-parameters"
             }
           }
         ],
@@ -137,7 +137,7 @@
             "state": {
               "type": "backlink",
               "state": {
-                "file": "challenges/just/01-basics/03-dependencies/03-dependencies.md",
+                "file": "challenges/just/01-basics/04-arguments-and-parameters/04-arguments-and-parameters.md",
                 "collapseAll": false,
                 "extraContext": false,
                 "sortOrder": "alphabetical",
@@ -147,7 +147,7 @@
                 "unlinkedCollapsed": true
               },
               "icon": "links-coming-in",
-              "title": "Backlinks for 03-dependencies"
+              "title": "Backlinks for 04-arguments-and-parameters"
             }
           },
           {
@@ -252,6 +252,7 @@
   },
   "active": "c15dfb6a36155fe6",
   "lastOpenFiles": [
+    "challenges/just/01-basics/03-dependencies/03-dependencies.md",
     "challenges/just/01-basics/03-dependencies/Justfile",
     "challenges/just/01-basics/02-variables-and-backticks/02-variables-and-backticks.md",
     "challenges/just/01-basics/02-variables-and-backticks/Justfile",
@@ -269,7 +270,6 @@
     "Presentacion/poc-just/web/node_modules/@angular/common/locales/yue-Hant.d.ts",
     "Presentacion/poc-just/web/node_modules/@angular/common/locales/xnr.d.ts",
     "Presentacion/poc-just/web/node_modules/@angular/common/locales/tr.d.ts",
-    "Presentacion/poc-just/web/node_modules/@angular/common/locales/tg.d.ts",
     "Presentacion/poc-just/web/node_modules/zod/README.md",
     "Presentacion/poc-just/web/node_modules/yoctocolors-cjs/readme.md",
     "Presentacion/poc-just/web/node_modules/tinyglobby/README.md",
