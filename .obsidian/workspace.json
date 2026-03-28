@@ -250,8 +250,9 @@
       "obsidian-git:Open Git source control": false
     }
   },
-  "active": "c15dfb6a36155fe6",
+  "active": "cda3cf7535287934",
   "lastOpenFiles": [
+    "challenges/just/01-basics/02-variables-and-backticks/Justfile",
     "challenges/just/01-basics/01-your-first-justfile/01-your-first-justfile.md",
     "challenges/just/01-basics/01-your-first-justfile/Justfile",
     "challenges/just/01-basics/01-your-first-justfile/jusfile",

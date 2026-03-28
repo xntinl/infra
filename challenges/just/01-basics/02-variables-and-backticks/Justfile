@@ -1,0 +1,4 @@
+api_key := env("API_KEY","")
+
+info:
+    @echo "api key {{api_key}}"
