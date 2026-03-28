@@ -55,12 +55,12 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "challenges/just/01-basics/01-your-first-justfile/01-your-first-justfile.md",
+                "file": "challenges/just/01-basics/02-variables-and-backticks/02-variables-and-backticks.md",
                 "mode": "preview",
                 "source": true
               },
               "icon": "lucide-file",
-              "title": "01-your-first-justfile"
+              "title": "02-variables-and-backticks"
             }
           }
         ],
@@ -137,7 +137,7 @@
             "state": {
               "type": "backlink",
               "state": {
-                "file": "challenges/just/01-basics/01-your-first-justfile/01-your-first-justfile.md",
+                "file": "challenges/just/01-basics/02-variables-and-backticks/02-variables-and-backticks.md",
                 "collapseAll": false,
                 "extraContext": false,
                 "sortOrder": "alphabetical",
@@ -147,7 +147,7 @@
                 "unlinkedCollapsed": true
               },
               "icon": "links-coming-in",
-              "title": "Backlinks for 01-your-first-justfile"
+              "title": "Backlinks for 02-variables-and-backticks"
             }
           },
           {
@@ -252,8 +252,10 @@
   },
   "active": "c15dfb6a36155fe6",
   "lastOpenFiles": [
-    "challenges/just/01-basics/02-variables-and-backticks/02-variables-and-backticks.md",
     "challenges/just/01-basics/01-your-first-justfile/01-your-first-justfile.md",
+    "challenges/just/01-basics/01-your-first-justfile/Justfile",
+    "challenges/just/01-basics/01-your-first-justfile/jusfile",
+    "challenges/just/01-basics/02-variables-and-backticks/02-variables-and-backticks.md",
     "Presentacion/Obsidian.md",
     "Untitled.base",
     "Presentacion/Plugins.md",
@@ -267,8 +269,6 @@
     "Presentacion/poc-just/web/node_modules/@angular/common/locales/tr.d.ts",
     "Presentacion/poc-just/web/node_modules/@angular/common/locales/tg.d.ts",
     "Presentacion/poc-just/web/node_modules/@angular/common/locales/szl.d.ts",
-    "Presentacion/poc-just/web/node_modules/@angular/common/locales/sw-KE.d.ts",
-    "Presentacion/poc-just/web/node_modules/@angular/common/locales/sr-Cyrl-ME.d.ts",
     "Presentacion/poc-just/web/node_modules/zod/README.md",
     "Presentacion/poc-just/web/node_modules/yoctocolors-cjs/readme.md",
     "Presentacion/poc-just/web/node_modules/tinyglobby/README.md",
@@ -287,7 +287,6 @@
     "Presentacion/poc-just/api-products/node_modules/@types/serve-static/README.md",
     "Presentacion/poc-just/api-products/node_modules/@types/qs/README.md",
     "Presentacion/poc-just/api-products/node_modules/@types/range-parser/README.md",
-    "Presentacion/poc-just/api-products/node_modules/@types/http-errors/README.md",
     "Presentacion/poc-just/web/node_modules/ordered-binary/assets/powers-dre.png",
     "Presentacion/poc-just/web/node_modules/retry/equation.gif",
     "Untitled.canvas"

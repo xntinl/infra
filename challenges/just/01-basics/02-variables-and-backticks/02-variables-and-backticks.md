@@ -1,13 +1,13 @@
-# 2. Variables and Backticks
-
-<!--
+---
 difficulty: basic
 concepts: [assignment-operator, backtick-evaluation, env-function, read-function, string-interpolation]
 tools: [just]
 estimated_time: 20m
 bloom_level: understand
 prerequisites: [01-your-first-justfile]
--->
+---
+
+# 2. Variables and Backticks
 
 ## Prerequisites
 

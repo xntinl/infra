@@ -1,0 +1,9 @@
+defalut:
+    @just infor
+info:
+    @echo "OS: {{os()}} "
+    @echo "ARCH: {{arch()}} "
+    @echo "CPU cores: {{num_cpus()}} "
+    @echo "Justfile: {{justfile()}}"
+hello name="world":
+    @echo "hello {{name}}"
