@@ -14,7 +14,7 @@
 | [OPA](opa/opa.md) | 40 | 9 | Open Policy Agent: Rego, Terraform, K8s, CI/CD |
 | [Go](go/go.md) | 497 | 47 | Go programming: fundamentals to systems, concurrency, distributed systems |
 | [Rust](rust/rust.md) | 145 | 4 | Rust programming: fundamentals, patterns, systems, competitive programming, insane challenges |
-| [Programming Challenges](programming-challenges/programming-challenges.md) | 50 | 9 | Go & Rust systems programming challenges: concurrency, compilers, distributed systems, crypto |
+| [Programming Challenges](programming-challenges/programming-challenges.md) | 150 | 27 | Go & Rust systems programming challenges: concurrency, compilers, distributed systems, crypto, networking, databases, ML, and more |
 | [Just](just/just.md) | 50 | 5 | Just command runner: recipes, modules, CI/CD, orchestration |
 
 ---
@@ -81,9 +81,9 @@ Categories: Basico (15), Intermedio (15), Avanzado (30), Insane (25). Covers own
 
 ## [Programming Challenges](programming-challenges/programming-challenges.md)
 
-50 standalone systems programming challenges in Go and Rust across 3 difficulty levels.
+150 standalone systems programming challenges in Go and Rust across 3 difficulty levels.
 
-Categories: Concurrency, Data Structures, Algorithms, Parsers & Compilers, Databases, Networking, Distributed Systems, Cryptography, Systems Programming. Difficulty levels: Intermediate-Advanced (15), Advanced (20), Insane (15).
+Categories: Algorithms, Audio, Compilers, Compression, Concurrency, Containers, Crypto, Data Structures, Databases, Distributed, Embedded, Functional, GameDev, Graphics, HPC, ML, Network Protocols, Networking, Observability, OS, Parsers, Search, Security, Systems, Testing, Verification, Video, WebServers. Difficulty levels: Intermediate-Advanced (45), Advanced (60), Insane (45).
 
 ---
 
