@@ -210,6 +210,7 @@
   },
   "active": "286335b4b13ac6fc",
   "lastOpenFiles": [
+    "challenges/go-concepts/concurrency/01-goroutines-and-scheduling/01-launching-goroutines/terminal",
     "challenges/go-concepts/concurrency/01-goroutines-and-scheduling/01-launching-goroutines/main.go",
     "challenges/go-concepts/concurrency/01-goroutines-and-scheduling/01-launching-goroutines/go.mod",
     "challenges/go-concepts/concurrency/01-goroutines-and-scheduling/02-goroutine-vs-os-thread/02-goroutine-vs-os-thread.md",
@@ -227,7 +228,6 @@
     "challenges/go-concepts/concurrency/02-channels/09-buffered-channel-as-semaphore/buffered-channel-as-semaphore",
     "challenges/go-concepts/concurrency/02-channels/08-channel-of-channels/channel-of-channels",
     "challenges/go-concepts/concurrency/02-channels/07-nil-channel-behavior/nil-channel-behavior",
-    "challenges/go-concepts/concurrency/02-channels/06-closing-channels/closing-channels",
     "challenges/go-concepts/concurrency/04-sync-primitives/09-sync-map-concurrent-access/09-sync-map-concurrent-access.md",
     "challenges/go-concepts/concurrency/07-concurrency-patterns/09-rate-limiter-token-bucket/09-rate-limiter-token-bucket.md",
     "challenges/go-concepts/concurrency/02-channels/10-channel-vs-shared-memory/10-channel-vs-shared-memory.md",
