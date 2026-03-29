@@ -13,12 +13,12 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "challenges/go/02-variables-types-and-constants/01-variable-declaration-and-short-assignment/01-variable-declaration-and-short-assignment.md",
+                "file": "challenges/go/02-variables-types-and-constants/02-zero-values-and-default-initialization/02-zero-values-and-default-initialization.md",
                 "mode": "source",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "01-variable-declaration-and-short-assignment"
+              "title": "02-zero-values-and-default-initialization"
             }
           }
         ]
@@ -210,6 +210,8 @@
   },
   "active": "5e7b140048226118",
   "lastOpenFiles": [
+    "challenges/go/02-variables-types-and-constants/01-variable-declaration-and-short-assignment/01-variable-declaration-and-short-assignment.md",
+    "challenges/go/02-variables-types-and-constants/01-variable-declaration-and-short-assignment/declaration.go",
     "challenges/go/02-variables-types-and-constants/01-variable-declaration-and-short-assignment/multiple-declaration.go",
     "challenges/go/02-variables-types-and-constants/01-variable-declaration-and-short-assignment/mutliple-declaration.go",
     "challenges/go/02-variables-types-and-constants/01-variable-declaration-and-short-assignment/main.go",
@@ -224,7 +226,6 @@
     "challenges/go/01-environment-and-tooling/04-go-tool-commands/tool-commands",
     "challenges/go/01-environment-and-tooling/04-go-tool-commands/main.go",
     "challenges/go/01-environment-and-tooling/04-go-tool-commands/go.mod",
-    "challenges/go/01-environment-and-tooling/02-go-modules-and-dependencies/hello",
     "challenges/go/01-environment-and-tooling/03-go-workspace-and-project-layout/03-go-workspace-and-project-layout.md",
     "challenges/go/01-environment-and-tooling/02-go-modules-and-dependencies/02-go-modules-and-dependencies.md",
     "challenges/programming-challenges/03-insane/141-observability-platform-pipeline/SOLUTION.md",
@@ -245,7 +246,6 @@
     "challenges/programming-challenges/03-insane/145-property-testing-shrinking-engine/README.md",
     "challenges/programming-challenges/03-insane/138-embedded-rtos-kernel-nostd/README.md",
     "challenges/programming-challenges/02-advanced/100-coverage-guided-fuzzer/SOLUTION.md",
-    "challenges/go/01-environment-and-tooling/02-go-modules-and-dependencies/go.sum",
     "Presentacion/poc-just/web/node_modules/ordered-binary/assets/powers-dre.png",
     "Presentacion/poc-just/web/node_modules/retry/equation.gif",
     "Untitled.canvas"
