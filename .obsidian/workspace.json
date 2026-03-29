@@ -13,12 +13,12 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "challenges/go/01-environment-and-tooling/04-go-tool-commands/04-go-tool-commands.md",
+                "file": "challenges/go/01-environment-and-tooling/05-go-install-and-third-party-packages/05-go-install-and-third-party-packages.md",
                 "mode": "source",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "04-go-tool-commands"
+              "title": "05-go-install-and-third-party-packages"
             }
           }
         ]
@@ -210,6 +210,9 @@
   },
   "active": "5e7b140048226118",
   "lastOpenFiles": [
+    "challenges/go/01-environment-and-tooling/05-go-install-and-third-party-packages/main.go",
+    "challenges/go/01-environment-and-tooling/05-go-install-and-third-party-packages/go.mod",
+    "challenges/go/01-environment-and-tooling/04-go-tool-commands/04-go-tool-commands.md",
     "challenges/go/01-environment-and-tooling/04-go-tool-commands/tool-commands",
     "challenges/go/01-environment-and-tooling/04-go-tool-commands/main.go",
     "challenges/go/01-environment-and-tooling/04-go-tool-commands/go.mod",
@@ -238,14 +241,11 @@
     "challenges/programming-challenges/03-insane/146-effect-system-algebraic/README.md",
     "challenges/programming-challenges/03-insane/122-container-runtime-from-scratch/README.md",
     "challenges/programming-challenges/02-advanced/97-a-star-pathfinding-grid/SOLUTION.md",
-    "challenges/programming-challenges/03-insane/129-symbolic-execution-engine/SOLUTION.md",
     "challenges/go/01-environment-and-tooling/02-go-modules-and-dependencies/go.sum",
     "challenges/go/01-environment-and-tooling/02-go-modules-and-dependencies/main.go",
     "challenges/go/01-environment-and-tooling/02-go-modules-and-dependencies/go.mod",
     "challenges/go/01-environment-and-tooling/01-your-first-go-program/gretting",
     "challenges/go/01-environment-and-tooling/01-your-first-go-program/hello",
-    "challenges/go/01-environment-and-tooling/01-your-first-go-program/main.go",
-    "challenges/go/01-environment-and-tooling/01-your-first-go-program/go.mod",
     "Presentacion/poc-just/web/node_modules/ordered-binary/assets/powers-dre.png",
     "Presentacion/poc-just/web/node_modules/retry/equation.gif",
     "Untitled.canvas"
