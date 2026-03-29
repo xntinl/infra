@@ -1,13 +1,14 @@
-# 3. Atomic Compare-And-Swap
-
-<!--
+---
 difficulty: intermediate
 concepts: [CompareAndSwapInt64, CAS loop, optimistic concurrency, lock-free increment]
 tools: [go]
 estimated_time: 30m
 bloom_level: apply
 prerequisites: [goroutines, sync.WaitGroup, atomic.LoadInt64, atomic.StoreInt64]
--->
+---
+
+# 3. Atomic Compare-And-Swap
+
 
 ## Learning Objectives
 After completing this exercise, you will be able to:
