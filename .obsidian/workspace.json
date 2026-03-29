@@ -210,6 +210,8 @@
   },
   "active": "5e7b140048226118",
   "lastOpenFiles": [
+    "challenges/go/02-variables-types-and-constants/05-type-conversions-and-type-assertions/main.go",
+    "challenges/go/02-variables-types-and-constants/05-type-conversions-and-type-assertions/composite_types.go",
     "challenges/go/02-variables-types-and-constants/05-type-conversions-and-type-assertions/maing.go",
     "challenges/go/02-variables-types-and-constants/05-type-conversions-and-type-assertions/go.mod",
     "challenges/go/02-variables-types-and-constants/01-variable-declaration-and-short-assignment/01-variable-declaration-and-short-assignment.md",
@@ -225,8 +227,6 @@
     "challenges/go/01-environment-and-tooling/05-go-install-and-third-party-packages/main.go",
     "challenges/go/01-environment-and-tooling/05-go-install-and-third-party-packages/go.mod",
     "challenges/go/01-environment-and-tooling/04-go-tool-commands/04-go-tool-commands.md",
-    "challenges/go/01-environment-and-tooling/04-go-tool-commands/tool-commands",
-    "challenges/go/01-environment-and-tooling/04-go-tool-commands/main.go",
     "challenges/go/01-environment-and-tooling/03-go-workspace-and-project-layout/03-go-workspace-and-project-layout.md",
     "challenges/go/01-environment-and-tooling/02-go-modules-and-dependencies/02-go-modules-and-dependencies.md",
     "challenges/programming-challenges/03-insane/141-observability-platform-pipeline/SOLUTION.md",
