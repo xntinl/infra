@@ -97,7 +97,7 @@ main.go:6:2: no required module provides package github.com/fatih/color; to add 
 Use `go get` to download and add the dependency:
 
 ```bash
-go get github.com/fatih/color
+ 
 ```
 
 This command does three things:
