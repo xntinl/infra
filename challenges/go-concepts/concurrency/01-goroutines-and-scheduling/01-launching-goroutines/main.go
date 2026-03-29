@@ -9,7 +9,7 @@ import (
 func printNumbers(label string){
 
 		for i:=0; i<5; i++{
-			fmt.Print("%s-%d",label,i)
+			fmt.Printf("%s-%d",label,i)
 			time.Sleep(20*time.Millisecond)
 		}
 		fmt.Println()
@@ -28,13 +28,13 @@ func main() {
 
 
 	fmt.Println("--- Concurrent ---")
-	start:= time.Now()
+	start = time.Now()
 
 	var wg sync.WaitGroup
 
 	for _, label := range []string{"A","B","C"} {
 		wg.Add(1)
-		go func(l label){
+		go func(l string){
 			defer wg.Done()
 			printNumbers(l)
 		}(label)
