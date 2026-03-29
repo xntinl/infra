@@ -210,6 +210,7 @@
   },
   "active": "5e7b140048226118",
   "lastOpenFiles": [
+    "challenges/go/02-variables-types-and-constants/05-type-conversions-and-type-assertions/useful_zero_values.go",
     "challenges/go/02-variables-types-and-constants/05-type-conversions-and-type-assertions/zero_values_arrays.go",
     "challenges/go/02-variables-types-and-constants/05-type-conversions-and-type-assertions/zero_values_structs.go",
     "challenges/go/02-variables-types-and-constants/05-type-conversions-and-type-assertions/main.go",
@@ -221,7 +222,6 @@
     "challenges/go/02-variables-types-and-constants/01-variable-declaration-and-short-assignment/multiple-declaration.go",
     "challenges/go/02-variables-types-and-constants/01-variable-declaration-and-short-assignment/mutliple-declaration.go",
     "challenges/go/02-variables-types-and-constants/01-variable-declaration-and-short-assignment/main.go",
-    "challenges/go/02-variables-types-and-constants/01-variable-declaration-and-short-assignment/go.mod",
     "challenges/go/01-environment-and-tooling/08-cross-compilation-and-build-tags/08-cross-compilation-and-build-tags.md",
     "challenges/go/01-environment-and-tooling/07-debugging-with-delve/07-debugging-with-delve.md",
     "challenges/go/01-environment-and-tooling/06-linting-with-golangci-lint/06-linting-with-golangci-lint.md",
