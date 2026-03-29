@@ -13,12 +13,12 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "challenges/go/01-environment-and-tooling/02-go-modules-and-dependencies/02-go-modules-and-dependencies.md",
+                "file": "challenges/go/01-environment-and-tooling/03-go-workspace-and-project-layout/03-go-workspace-and-project-layout.md",
                 "mode": "source",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "02-go-modules-and-dependencies"
+              "title": "03-go-workspace-and-project-layout"
             }
           }
         ]
@@ -210,6 +210,17 @@
   },
   "active": "5e7b140048226118",
   "lastOpenFiles": [
+    "challenges/go/01-environment-and-tooling/02-go-modules-and-dependencies/02-go-modules-and-dependencies.md",
+    "challenges/programming-challenges/03-insane/141-observability-platform-pipeline/SOLUTION.md",
+    "challenges/programming-challenges/03-insane/145-property-testing-shrinking-engine/SOLUTION.md",
+    "challenges/programming-challenges/03-insane/139-register-allocator-graph-coloring/SOLUTION.md",
+    "challenges/programming-challenges/03-insane/138-embedded-rtos-kernel-nostd/SOLUTION.md",
+    "challenges/programming-challenges/03-insane/125-video-codec-h264-baseline/SOLUTION.md",
+    "challenges/programming-challenges/03-insane/148-persistent-data-structures-immutable/README.md",
+    "challenges/programming-challenges/02-advanced/111-reverse-proxy-tls-termination/SOLUTION.md",
+    "challenges/programming-challenges/02-advanced/98-time-series-database-engine/SOLUTION.md",
+    "challenges/programming-challenges/03-insane/122-container-runtime-from-scratch/SOLUTION.md",
+    "challenges/programming-challenges/03-insane/146-effect-system-algebraic/SOLUTION.md",
     "challenges/programming-challenges/03-insane/139-register-allocator-graph-coloring/README.md",
     "challenges/programming-challenges/02-advanced/111-reverse-proxy-tls-termination/README.md",
     "challenges/programming-challenges/03-insane/141-observability-platform-pipeline/README.md",
@@ -225,17 +236,6 @@
     "challenges/programming-challenges/03-insane/129-symbolic-execution-engine/SOLUTION.md",
     "challenges/programming-challenges/01-intermediate-advanced/78-union-find-disjoint-sets/SOLUTION.md",
     "challenges/programming-challenges/02-advanced/116-monad-transformer-stack/SOLUTION.md",
-    "challenges/programming-challenges/03-insane/125-video-codec-h264-baseline/README.md",
-    "challenges/programming-challenges/02-advanced/119-arena-allocator-generational/SOLUTION.md",
-    "challenges/programming-challenges/02-advanced/104-namespace-isolation-sandbox/SOLUTION.md",
-    "challenges/programming-challenges/02-advanced/106-audio-fft-spectrum-analyzer/SOLUTION.md",
-    "challenges/programming-challenges/02-advanced/100-coverage-guided-fuzzer/README.md",
-    "challenges/programming-challenges/01-intermediate-advanced/76-interval-tree-overlap-queries/SOLUTION.md",
-    "challenges/programming-challenges/03-insane/134-garbage-collector-generational/README.md",
-    "challenges/programming-challenges/02-advanced/97-a-star-pathfinding-grid/README.md",
-    "challenges/programming-challenges/02-advanced/119-arena-allocator-generational/README.md",
-    "challenges/programming-challenges/02-advanced/104-namespace-isolation-sandbox/README.md",
-    "challenges/programming-challenges/03-insane/136-distributed-log-kafka-style/README.md",
     "challenges/go/01-environment-and-tooling/02-go-modules-and-dependencies/go.sum",
     "challenges/go/01-environment-and-tooling/02-go-modules-and-dependencies/main.go",
     "challenges/go/01-environment-and-tooling/02-go-modules-and-dependencies/go.mod",
