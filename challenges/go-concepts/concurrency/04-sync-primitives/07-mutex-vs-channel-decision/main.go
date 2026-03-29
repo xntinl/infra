@@ -1,3 +1,39 @@
+// Exercise 07: Mutex vs Channel -- Decision Criteria
+//
+// The same bank account problem solved with both mutex and channels.
+// Demonstrates when to choose each approach and why.
+//
+// Expected output:
+//
+//   === 1. Mutex Account ===
+//   Final balance: 1500 (expected: 1500)
+//
+//   === 2. Channel Account ===
+//   Final balance: 1500 (expected: 1500)
+//
+//   === 3. Performance Comparison ===
+//   Mutex:   balance=XXXX, time=Xms
+//   Channel: balance=XXXX, time=Xms
+//   Mutex is typically faster for simple state protection.
+//
+//   === 4. Decision Guide ===
+//   Use MUTEX when:
+//     - Protecting internal state of a struct
+//     - Simple read/write access patterns
+//     - Performance is critical (lower overhead)
+//     - The protected data has a clear owner
+//
+//   Use CHANNELS when:
+//     - Transferring data ownership between goroutines
+//     - Coordinating sequential phases of work (pipelines)
+//     - Fan-out/fan-in patterns
+//     - Select-based multiplexing with timeouts/cancellation
+//
+//   Go Proverb: "Do not communicate by sharing memory;
+//                share memory by communicating."
+//
+// Run: go run main.go
+
 package main
 
 import (
@@ -12,19 +48,23 @@ import (
 // ---------------------------------------------------------------------------
 
 // MutexAccount protects its balance with a sync.Mutex.
-// TODO: Implement Deposit, Withdraw, and Balance methods using mu.Lock/Unlock.
+// This is the natural choice when a struct owns data and needs to make it
+// safe for concurrent access. The mutex is an implementation detail -- callers
+// do not need to know about it.
 type MutexAccount struct {
 	mu      sync.Mutex
 	balance int
 }
 
 func (a *MutexAccount) Deposit(amount int) {
-	// TODO: Lock, update balance, Unlock
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	a.balance += amount
 }
 
 func (a *MutexAccount) Withdraw(amount int) bool {
-	// TODO: Lock, check balance, subtract if sufficient, Unlock
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	if a.balance < amount {
 		return false
 	}
@@ -33,13 +73,22 @@ func (a *MutexAccount) Withdraw(amount int) bool {
 }
 
 func (a *MutexAccount) Balance() int {
-	// TODO: Lock, read balance, Unlock
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	return a.balance
 }
 
 // ---------------------------------------------------------------------------
 // Approach 2: Channel-based account
 // ---------------------------------------------------------------------------
+
+// ChannelAccount uses a single goroutine as the exclusive owner of the balance.
+// All operations are sent as messages through a channel. The owner goroutine
+// processes them sequentially -- no mutex needed because there is no shared state.
+type ChannelAccount struct {
+	ops  chan accountOp
+	done chan struct{}
+}
 
 type accountOp struct {
 	kind     string // "deposit", "withdraw", "balance"
@@ -52,15 +101,6 @@ type accountResult struct {
 	ok      bool
 }
 
-// ChannelAccount uses a goroutine as the single owner of the balance.
-// All operations are sent as messages via a channel.
-type ChannelAccount struct {
-	ops  chan accountOp
-	done chan struct{}
-}
-
-// NewChannelAccount creates an account and starts the owner goroutine.
-// TODO: Implement the run method that processes operations from the ops channel.
 func NewChannelAccount(initialBalance int) *ChannelAccount {
 	a := &ChannelAccount{
 		ops:  make(chan accountOp),
@@ -70,9 +110,8 @@ func NewChannelAccount(initialBalance int) *ChannelAccount {
 	return a
 }
 
-// run is the goroutine that owns the balance.
-// It processes operations sequentially -- no mutex needed.
-// TODO: Range over a.ops and handle deposit/withdraw/balance operations.
+// run is the owner goroutine. It processes operations sequentially from the
+// ops channel. Since only this goroutine touches the balance, no lock is needed.
 func (a *ChannelAccount) run(balance int) {
 	for op := range a.ops {
 		switch op.kind {
@@ -80,7 +119,6 @@ func (a *ChannelAccount) run(balance int) {
 			balance += op.amount
 			op.response <- accountResult{balance: balance, ok: true}
 		case "withdraw":
-			// TODO: check balance, subtract if sufficient
 			if balance >= op.amount {
 				balance -= op.amount
 				op.response <- accountResult{balance: balance, ok: true}
@@ -94,14 +132,12 @@ func (a *ChannelAccount) run(balance int) {
 	close(a.done)
 }
 
-// Deposit sends a deposit operation to the owner goroutine.
 func (a *ChannelAccount) Deposit(amount int) {
 	resp := make(chan accountResult)
 	a.ops <- accountOp{kind: "deposit", amount: amount, response: resp}
 	<-resp
 }
 
-// Withdraw sends a withdraw operation to the owner goroutine.
 func (a *ChannelAccount) Withdraw(amount int) bool {
 	resp := make(chan accountResult)
 	a.ops <- accountOp{kind: "withdraw", amount: amount, response: resp}
@@ -109,7 +145,6 @@ func (a *ChannelAccount) Withdraw(amount int) bool {
 	return result.ok
 }
 
-// Balance sends a balance query to the owner goroutine.
 func (a *ChannelAccount) Balance() int {
 	resp := make(chan accountResult)
 	a.ops <- accountOp{kind: "balance", response: resp}
@@ -117,7 +152,6 @@ func (a *ChannelAccount) Balance() int {
 	return result.balance
 }
 
-// Close shuts down the owner goroutine.
 func (a *ChannelAccount) Close() {
 	close(a.ops)
 	<-a.done
@@ -158,7 +192,7 @@ func main() {
 }
 
 func testMutexAccount() {
-	fmt.Println("=== Mutex Account ===")
+	fmt.Println("=== 1. Mutex Account ===")
 	ma := &MutexAccount{balance: 1000}
 
 	var wg sync.WaitGroup
@@ -172,11 +206,13 @@ func testMutexAccount() {
 	}
 	wg.Wait()
 
+	// Each goroutine: +10, -5 = +5. 100 goroutines: 100 * 5 = 500. 1000 + 500 = 1500.
 	fmt.Printf("Final balance: %d (expected: 1500)\n", ma.Balance())
+	fmt.Println()
 }
 
 func testChannelAccount() {
-	fmt.Println("\n=== Channel Account ===")
+	fmt.Println("=== 2. Channel Account ===")
 	ca := NewChannelAccount(1000)
 
 	var wg sync.WaitGroup
@@ -192,14 +228,13 @@ func testChannelAccount() {
 
 	fmt.Printf("Final balance: %d (expected: 1500)\n", ca.Balance())
 	ca.Close()
+	fmt.Println()
 }
 
 // compareApproaches runs the same random workload on both implementations
 // and measures execution time.
-// TODO: Run runWorkload on both MutexAccount and ChannelAccount,
-// print balances and execution times.
 func compareApproaches() {
-	fmt.Println("\n=== Comparison ===")
+	fmt.Println("=== 3. Performance Comparison ===")
 
 	const goroutines = 100
 	const opsPerGoroutine = 1000
@@ -213,18 +248,30 @@ func compareApproaches() {
 		func(amount int) bool { return ma.Withdraw(amount) },
 	)
 	mutexTime := time.Since(start)
-	fmt.Printf("Mutex:   balance=%d, time=%v\n", ma.Balance(), mutexTime)
+	fmt.Printf("Mutex:   balance=%d, time=%v\n", ma.Balance(), mutexTime.Round(time.Millisecond))
 
-	// TODO: Channel approach -- same workload
-	// ca := NewChannelAccount(10000)
-	// ...
-	// ca.Close()
+	// Channel approach -- same workload
+	ca := NewChannelAccount(10000)
+	start = time.Now()
+	runWorkload(
+		goroutines, opsPerGoroutine,
+		func(amount int) { ca.Deposit(amount) },
+		func(amount int) bool { return ca.Withdraw(amount) },
+	)
+	channelTime := time.Since(start)
+	fmt.Printf("Channel: balance=%d, time=%v\n", ca.Balance(), channelTime.Round(time.Millisecond))
+	ca.Close()
 
-	fmt.Println("TODO: implement channel approach benchmark")
+	if mutexTime < channelTime {
+		fmt.Println("Mutex is typically faster for simple state protection.")
+	} else {
+		fmt.Println("Results vary; mutex generally wins for pure state protection.")
+	}
+	fmt.Println()
 }
 
 func decisionGuide() {
-	fmt.Println("\n=== Decision Guide ===")
+	fmt.Println("=== 4. Decision Guide ===")
 	fmt.Println("Use MUTEX when:")
 	fmt.Println("  - Protecting internal state of a struct")
 	fmt.Println("  - Simple read/write access patterns")

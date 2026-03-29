@@ -32,35 +32,66 @@ This makes `RWMutex` ideal for data structures that are read far more often than
 
 ## Step 1 -- Build a Thread-Safe Data Store
 
-Open `main.go`. Implement the `DataStore` struct methods. The store holds a `map[string]string` protected by an `RWMutex`:
+Run `main.go` to see the DataStore with RLock for reads and Lock for writes:
 
 ```go
+package main
+
+import (
+	"fmt"
+	"sync"
+)
+
+type DataStore struct {
+	mu   sync.RWMutex
+	data map[string]string
+}
+
+func NewDataStore() *DataStore {
+	return &DataStore{data: make(map[string]string)}
+}
+
 func (ds *DataStore) Get(key string) (string, bool) {
-    ds.mu.RLock()
-    defer ds.mu.RUnlock()
-    val, ok := ds.data[key]
-    return val, ok
+	ds.mu.RLock()         // shared read lock -- multiple readers OK
+	defer ds.mu.RUnlock()
+	val, ok := ds.data[key]
+	return val, ok
 }
 
 func (ds *DataStore) Set(key, value string) {
-    ds.mu.Lock()
-    defer ds.mu.Unlock()
-    ds.data[key] = value
+	ds.mu.Lock()          // exclusive write lock -- blocks all readers and writers
+	defer ds.mu.Unlock()
+	ds.data[key] = value
 }
 
 func (ds *DataStore) GetAll() map[string]string {
-    ds.mu.RLock()
-    defer ds.mu.RUnlock()
-    // Return a copy to avoid exposing internal state
-    result := make(map[string]string, len(ds.data))
-    for k, v := range ds.data {
-        result[k] = v
-    }
-    return result
+	ds.mu.RLock()
+	defer ds.mu.RUnlock()
+	result := make(map[string]string, len(ds.data))
+	for k, v := range ds.data {
+		result[k] = v
+	}
+	return result // return a COPY to avoid exposing internal state
+}
+
+func main() {
+	ds := NewDataStore()
+	ds.Set("name", "Go")
+	ds.Set("version", "1.22")
+
+	name, ok := ds.Get("name")
+	fmt.Printf("Get 'name': %s (found: %v)\n", name, ok)
+
+	all := ds.GetAll()
+	fmt.Printf("All entries: %v\n", all)
 }
 ```
 
-Notice: `Get` and `GetAll` use `RLock` (shared), while `Set` uses `Lock` (exclusive).
+Expected output:
+```
+Get 'name': Go (found: true)
+All entries: map[name:Go version:1.22]
+```
 
 ### Intermediate Verification
 ```bash
@@ -70,31 +101,70 @@ The basic operations test should print that all reads and writes succeeded corre
 
 ## Step 2 -- Demonstrate Concurrent Readers
 
-Implement `demonstrateConcurrentReads` to show that multiple readers proceed simultaneously:
+The program shows that multiple readers proceed simultaneously:
 
 ```go
-func demonstrateConcurrentReads(ds *DataStore) {
-    fmt.Println("\n=== Concurrent Readers ===")
-    ds.Set("shared-key", "shared-value")
+package main
 
-    var wg sync.WaitGroup
-    start := time.Now()
+import (
+	"fmt"
+	"sync"
+	"time"
+)
 
-    for i := 0; i < 10; i++ {
-        wg.Add(1)
-        go func(id int) {
-            defer wg.Done()
-            val, _ := ds.Get("shared-key")
-            time.Sleep(100 * time.Millisecond) // simulate read processing
-            fmt.Printf("Reader %d read: %s (at %v)\n", id, val, time.Since(start).Round(time.Millisecond))
-        }(i)
-    }
-
-    wg.Wait()
-    elapsed := time.Since(start)
-    fmt.Printf("All 10 readers finished in %v\n", elapsed.Round(time.Millisecond))
-    fmt.Println("(If serialized, this would take ~1s. Concurrent readers finish in ~100ms.)")
+type DataStore struct {
+	mu   sync.RWMutex
+	data map[string]string
 }
+
+func NewDataStore() *DataStore {
+	return &DataStore{data: make(map[string]string)}
+}
+
+func (ds *DataStore) Get(key string) (string, bool) {
+	ds.mu.RLock()
+	defer ds.mu.RUnlock()
+	val, ok := ds.data[key]
+	return val, ok
+}
+
+func (ds *DataStore) Set(key, value string) {
+	ds.mu.Lock()
+	defer ds.mu.Unlock()
+	ds.data[key] = value
+}
+
+func main() {
+	ds := NewDataStore()
+	ds.Set("shared-key", "shared-value")
+
+	var wg sync.WaitGroup
+	start := time.Now()
+
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			val, _ := ds.Get("shared-key")
+			time.Sleep(100 * time.Millisecond) // simulate read processing
+			fmt.Printf("Reader %d read: %s (at %v)\n", id, val, time.Since(start).Round(time.Millisecond))
+		}(i)
+	}
+
+	wg.Wait()
+	elapsed := time.Since(start)
+	fmt.Printf("All 10 readers finished in %v\n", elapsed.Round(time.Millisecond))
+	fmt.Println("(If serialized, this would take ~1s. Concurrent readers finish in ~100ms.)")
+}
+```
+
+Expected output:
+```
+Reader 0 read: shared-value (at 100ms)
+Reader 1 read: shared-value (at 100ms)
+...
+All 10 readers finished in 100ms
+(If serialized, this would take ~1s. Concurrent readers finish in ~100ms.)
 ```
 
 ### Intermediate Verification
@@ -105,42 +175,70 @@ All 10 readers should finish in approximately 100ms, proving they ran concurrent
 
 ## Step 3 -- Writer Blocks Readers
 
-Implement `demonstrateWriterBlocking` to show that a writer gets exclusive access:
+The program demonstrates that a writer gets exclusive access:
 
 ```go
-func demonstrateWriterBlocking(ds *DataStore) {
-    fmt.Println("\n=== Writer Blocks Readers ===")
-    var wg sync.WaitGroup
-    start := time.Now()
+package main
 
-    // Start a writer that holds the lock for 200ms
-    wg.Add(1)
-    go func() {
-        defer wg.Done()
-        ds.mu.Lock()
-        fmt.Printf("[%v] Writer: acquired exclusive lock\n", time.Since(start).Round(time.Millisecond))
-        time.Sleep(200 * time.Millisecond)
-        ds.data["writer-key"] = "writer-value"
-        fmt.Printf("[%v] Writer: releasing lock\n", time.Since(start).Round(time.Millisecond))
-        ds.mu.Unlock()
-    }()
+import (
+	"fmt"
+	"sync"
+	"time"
+)
 
-    time.Sleep(10 * time.Millisecond) // let writer acquire lock first
-
-    // Start readers that will block until the writer releases
-    for i := 0; i < 3; i++ {
-        wg.Add(1)
-        go func(id int) {
-            defer wg.Done()
-            fmt.Printf("[%v] Reader %d: waiting for read lock...\n", time.Since(start).Round(time.Millisecond), id)
-            val, _ := ds.Get("writer-key")
-            fmt.Printf("[%v] Reader %d: got value %q\n", time.Since(start).Round(time.Millisecond), id, val)
-        }(i)
-    }
-
-    wg.Wait()
-    fmt.Println("Readers had to wait for writer to finish.")
+type DataStore struct {
+	mu   sync.RWMutex
+	data map[string]string
 }
+
+func main() {
+	ds := &DataStore{data: make(map[string]string)}
+	var wg sync.WaitGroup
+	start := time.Now()
+
+	// Start a writer that holds the lock for 200ms
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		ds.mu.Lock()
+		fmt.Printf("[%v] Writer: acquired exclusive lock\n", time.Since(start).Round(time.Millisecond))
+		time.Sleep(200 * time.Millisecond)
+		ds.data["writer-key"] = "writer-value"
+		fmt.Printf("[%v] Writer: releasing lock\n", time.Since(start).Round(time.Millisecond))
+		ds.mu.Unlock()
+	}()
+
+	time.Sleep(10 * time.Millisecond) // let writer acquire lock first
+
+	// Start readers that will block until the writer releases
+	for i := 0; i < 3; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			fmt.Printf("[%v] Reader %d: waiting for read lock...\n", time.Since(start).Round(time.Millisecond), id)
+			ds.mu.RLock()
+			val := ds.data["writer-key"]
+			ds.mu.RUnlock()
+			fmt.Printf("[%v] Reader %d: got value %q\n", time.Since(start).Round(time.Millisecond), id, val)
+		}(i)
+	}
+
+	wg.Wait()
+	fmt.Println("Readers had to wait for writer to finish.")
+}
+```
+
+Expected output:
+```
+[0ms] Writer: acquired exclusive lock
+[10ms] Reader 0: waiting for read lock...
+[10ms] Reader 1: waiting for read lock...
+[10ms] Reader 2: waiting for read lock...
+[200ms] Writer: releasing lock
+[200ms] Reader 0: got value "writer-value"
+[200ms] Reader 1: got value "writer-value"
+[200ms] Reader 2: got value "writer-value"
+Readers had to wait for writer to finish.
 ```
 
 ### Intermediate Verification
@@ -151,85 +249,84 @@ Readers should start waiting around 10ms and only succeed after ~200ms when the 
 
 ## Step 4 -- Performance Comparison: Mutex vs RWMutex
 
-Implement `benchmarkComparison` to measure the difference for a read-heavy workload:
+The program benchmarks read-heavy workloads with both approaches:
 
-```go
-func benchmarkComparison() {
-    fmt.Println("\n=== Performance Comparison ===")
-    const readers = 100
-    const readsPerGoroutine = 10000
-    const writers = 2
-    const writesPerGoroutine = 100
-
-    // Benchmark with regular Mutex
-    mutexDuration := benchmarkMutex(readers, readsPerGoroutine, writers, writesPerGoroutine)
-
-    // Benchmark with RWMutex
-    rwMutexDuration := benchmarkRWMutex(readers, readsPerGoroutine, writers, writesPerGoroutine)
-
-    fmt.Printf("Mutex:   %v\n", mutexDuration.Round(time.Millisecond))
-    fmt.Printf("RWMutex: %v\n", rwMutexDuration.Round(time.Millisecond))
-
-    if rwMutexDuration < mutexDuration {
-        speedup := float64(mutexDuration) / float64(rwMutexDuration)
-        fmt.Printf("RWMutex is %.1fx faster for this read-heavy workload\n", speedup)
-    }
-}
-```
-
-### Intermediate Verification
 ```bash
 go run main.go
 ```
-For the read-heavy workload (100 readers, 2 writers), `RWMutex` should be noticeably faster.
+
+Expected output (times vary by machine):
+```
+=== 4. Performance Comparison: Mutex vs RWMutex ===
+Mutex:   45ms
+RWMutex: 15ms
+RWMutex is 3.0x faster for this read-heavy workload
+```
+
+For the read-heavy workload (100 readers, 2 writers), `RWMutex` should be noticeably faster because reads proceed concurrently.
 
 ## Common Mistakes
 
 ### Using Lock When RLock Suffices
-**Wrong:**
+
 ```go
 func (ds *DataStore) Get(key string) string {
-    ds.mu.Lock() // exclusive lock for a read-only operation
-    defer ds.mu.Unlock()
-    return ds.data[key]
+	ds.mu.Lock() // WRONG: exclusive lock for a read-only operation
+	defer ds.mu.Unlock()
+	return ds.data[key]
 }
 ```
-**What happens:** Readers serialize unnecessarily, losing the concurrency benefit of RWMutex.
+
+**What happens:** Readers serialize unnecessarily, losing the concurrency benefit of RWMutex. You have essentially turned your RWMutex into a regular Mutex.
 
 **Fix:** Use `RLock/RUnlock` for read-only operations.
 
 ### Upgrading RLock to Lock
-**Wrong:**
+
 ```go
-ds.mu.RLock()
-val := ds.data[key]
-if val == "" {
-    ds.mu.Lock() // DEADLOCK: cannot upgrade RLock to Lock
-    ds.data[key] = "default"
-    ds.mu.Unlock()
+package main
+
+import (
+	"fmt"
+	"sync"
+)
+
+func main() {
+	var mu sync.RWMutex
+	data := map[string]string{"key": ""}
+
+	mu.RLock()
+	val := data["key"]
+	if val == "" {
+		mu.Lock() // DEADLOCK: cannot upgrade RLock to Lock
+		data["key"] = "default"
+		mu.Unlock()
+	}
+	mu.RUnlock()
+	fmt.Println("This line is never reached")
 }
-ds.mu.RUnlock()
 ```
-**What happens:** Deadlock. You cannot acquire a write lock while holding a read lock.
 
-**Fix:** Release the read lock first, then acquire the write lock:
+**What happens:** Deadlock. You cannot acquire a write lock while holding a read lock. The write lock waits for all read locks to release, but this goroutine holds a read lock that will never release because it is waiting for the write lock.
+
+**Fix:** Release the read lock first, then acquire the write lock with a double-check:
 ```go
-ds.mu.RLock()
-val := ds.data[key]
-ds.mu.RUnlock()
+mu.RLock()
+val := data["key"]
+mu.RUnlock()
 
 if val == "" {
-    ds.mu.Lock()
-    // Double-check after acquiring write lock
-    if ds.data[key] == "" {
-        ds.data[key] = "default"
-    }
-    ds.mu.Unlock()
+	mu.Lock()
+	// Double-check after acquiring write lock -- another goroutine may have set it
+	if data["key"] == "" {
+		data["key"] = "default"
+	}
+	mu.Unlock()
 }
 ```
 
 ### RWMutex for Write-Heavy Workloads
-Using `RWMutex` when writes are frequent provides no benefit over `Mutex` and adds overhead. `RWMutex` shines only when reads vastly outnumber writes.
+Using `RWMutex` when writes are frequent provides no benefit over `Mutex` and adds overhead. RWMutex tracks reader counts internally, which costs more than a simple Mutex when there are few or no concurrent readers. `RWMutex` shines only when reads vastly outnumber writes.
 
 ## Verify What You Learned
 

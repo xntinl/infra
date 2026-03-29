@@ -1,3 +1,41 @@
+// Exercise 09: sync.Map -- Concurrent Access
+//
+// Demonstrates sync.Map API and when to use it vs map+mutex.
+// Covers: Store/Load/LoadOrStore/Delete/Range, concurrent crash, performance.
+//
+// Expected output (approximate):
+//
+//   === 1. Regular Map Panic ===
+//   PANIC recovered: concurrent map writes
+//   Regular maps are NOT safe for concurrent access!
+//
+//   === 2. sync.Map Basics ===
+//   Load 'name': Go (found: true)
+//   Load 'missing': <nil> (found: false)
+//   LoadOrStore 'version': 1.22 (was loaded: true, key existed)
+//   LoadOrStore 'new-key': new-value (was loaded: false, key was stored)
+//   After Delete 'mascot': found=false
+//   All entries:
+//     name: Go
+//     new-key: new-value
+//     version: 1.22
+//
+//   === 3. Concurrent sync.Map ===
+//   Stored 100 entries concurrently with no panic.
+//
+//   === 4. Performance Comparison ===
+//   Read-heavy (90% reads, 10% writes):
+//     sync.Map:    Xms
+//     map+RWMutex: Yms
+//   Write-heavy (50% reads, 50% writes):
+//     sync.Map:    Xms
+//     map+RWMutex: Yms
+//
+//   === 5. When to Use sync.Map ===
+//   ...decision criteria...
+//
+// Run: go run main.go
+
 package main
 
 import (
@@ -12,14 +50,18 @@ func main() {
 	syncMapBasics()
 	concurrentSyncMap()
 	comparePerformance()
+	whenToUseSyncMap()
 }
 
 // showMapPanic demonstrates that regular Go maps panic under concurrent access.
+// Go deliberately crashes rather than silently corrupting data.
 func showMapPanic() {
-	fmt.Println("=== Regular Map Panic ===")
+	fmt.Println("=== 1. Regular Map Panic ===")
+
 	m := make(map[int]int)
 	var wg sync.WaitGroup
 
+	// recover from the expected panic
 	defer func() {
 		if r := recover(); r != nil {
 			fmt.Printf("PANIC recovered: %v\n", r)
@@ -43,52 +85,53 @@ func showMapPanic() {
 }
 
 // syncMapBasics demonstrates all core sync.Map operations.
-// TODO: Use Store, Load, LoadOrStore, Delete, and Range.
 func syncMapBasics() {
-	fmt.Println("=== sync.Map Basics ===")
+	fmt.Println("=== 2. sync.Map Basics ===")
+	var m sync.Map
 
-	// TODO: Declare a sync.Map and use the operations below.
-	// var m sync.Map
+	// Store: set key-value pairs (like m[key] = value)
+	m.Store("name", "Go")
+	m.Store("version", "1.22")
+	m.Store("mascot", "Gopher")
 
-	// TODO: Store three key-value pairs
-	// m.Store("name", "Go")
-	// m.Store("version", "1.22")
-	// m.Store("mascot", "Gopher")
+	// Load: retrieve a value (like val, ok := m[key])
+	val, ok := m.Load("name")
+	fmt.Printf("Load 'name': %v (found: %v)\n", val, ok)
 
-	// TODO: Load a key that exists
-	// val, ok := m.Load("name")
-	// fmt.Printf("Load 'name': %v (found: %v)\n", val, ok)
+	val, ok = m.Load("missing")
+	fmt.Printf("Load 'missing': %v (found: %v)\n", val, ok)
 
-	// TODO: Load a key that does not exist
-	// val, ok = m.Load("missing")
-	// fmt.Printf("Load 'missing': %v (found: %v)\n", val, ok)
+	// LoadOrStore: atomic load-or-insert. If the key exists, returns the
+	// existing value. If not, stores the provided value and returns it.
+	actual, loaded := m.LoadOrStore("version", "2.0")
+	fmt.Printf("LoadOrStore 'version': %v (was loaded: %v, key existed)\n", actual, loaded)
 
-	// TODO: LoadOrStore -- returns existing value if key exists,
-	// stores and returns new value if key does not exist
-	// actual, loaded := m.LoadOrStore("version", "2.0")
+	actual, loaded = m.LoadOrStore("new-key", "new-value")
+	fmt.Printf("LoadOrStore 'new-key': %v (was loaded: %v, key was stored)\n", actual, loaded)
 
-	// TODO: Delete a key
-	// m.Delete("mascot")
+	// Delete: remove a key
+	m.Delete("mascot")
+	_, ok = m.Load("mascot")
+	fmt.Printf("After Delete 'mascot': found=%v\n", ok)
 
-	// TODO: Range over all entries
-	// m.Range(func(key, value any) bool {
-	//     fmt.Printf("  %v: %v\n", key, value)
-	//     return true
-	// })
-
-	fmt.Println("TODO: implement sync.Map basics")
+	// Range: iterate over all entries. Return true to continue, false to stop.
+	// WARNING: Range does NOT provide a consistent snapshot. Other goroutines
+	// can Store or Delete during iteration.
+	fmt.Println("All entries:")
+	m.Range(func(key, value any) bool {
+		fmt.Printf("  %v: %v\n", key, value)
+		return true
+	})
 	fmt.Println()
 }
 
-// concurrentSyncMap shows sync.Map handles concurrent reads and writes safely.
-// TODO: Launch 100 writer goroutines and 100 reader goroutines,
-// then count the total entries with Range.
+// concurrentSyncMap proves sync.Map handles concurrent reads and writes safely.
 func concurrentSyncMap() {
-	fmt.Println("=== Concurrent sync.Map ===")
+	fmt.Println("=== 3. Concurrent sync.Map ===")
 	var m sync.Map
 	var wg sync.WaitGroup
 
-	// TODO: Launch 100 goroutines that Store(n, n*n)
+	// 100 goroutines writing concurrently
 	for i := 0; i < 100; i++ {
 		wg.Add(1)
 		go func(n int) {
@@ -97,29 +140,52 @@ func concurrentSyncMap() {
 		}(i)
 	}
 
-	// TODO: Launch 100 goroutines that Load(n)
+	// 100 goroutines reading concurrently (overlapping with writes)
 	for i := 0; i < 100; i++ {
 		wg.Add(1)
 		go func(n int) {
 			defer wg.Done()
-			m.Load(n)
+			if val, ok := m.Load(n); ok {
+				_ = val // use value
+			}
 		}(i)
 	}
 
 	wg.Wait()
 
+	// Count entries
 	count := 0
 	m.Range(func(_, _ any) bool {
 		count++
 		return true
 	})
-	fmt.Printf("Stored %d entries concurrently with no panic.\n\n", count)
+	fmt.Printf("Stored %d entries concurrently with no panic.\n", count)
+	fmt.Println()
 }
 
-// benchmarkSyncMap measures sync.Map performance with given read ratio.
+// comparePerformance benchmarks sync.Map vs map+RWMutex for different workloads.
+func comparePerformance() {
+	fmt.Println("=== 4. Performance Comparison ===")
+	const n = 100000
+
+	// Read-heavy workload (90% reads, 10% writes)
+	fmt.Println("Read-heavy (90% reads, 10% writes):")
+	syncMapTime := benchmarkSyncMap(n, 0.9)
+	rwMutexTime := benchmarkRWMutexMap(n, 0.9)
+	fmt.Printf("  sync.Map:    %v\n", syncMapTime.Round(time.Millisecond))
+	fmt.Printf("  map+RWMutex: %v\n", rwMutexTime.Round(time.Millisecond))
+
+	// Write-heavy workload (50% reads, 50% writes)
+	fmt.Println("Write-heavy (50% reads, 50% writes):")
+	syncMapTime = benchmarkSyncMap(n, 0.5)
+	rwMutexTime = benchmarkRWMutexMap(n, 0.5)
+	fmt.Printf("  sync.Map:    %v\n", syncMapTime.Round(time.Millisecond))
+	fmt.Printf("  map+RWMutex: %v\n", rwMutexTime.Round(time.Millisecond))
+	fmt.Println()
+}
+
 func benchmarkSyncMap(ops int, readRatio float64) time.Duration {
 	var m sync.Map
-	// Pre-populate
 	for i := 0; i < 1000; i++ {
 		m.Store(i, i)
 	}
@@ -146,7 +212,6 @@ func benchmarkSyncMap(ops int, readRatio float64) time.Duration {
 	return time.Since(start)
 }
 
-// benchmarkRWMutexMap measures map+RWMutex performance with given read ratio.
 func benchmarkRWMutexMap(ops int, readRatio float64) time.Duration {
 	var mu sync.RWMutex
 	m := make(map[int]int)
@@ -180,23 +245,21 @@ func benchmarkRWMutexMap(ops int, readRatio float64) time.Duration {
 	return time.Since(start)
 }
 
-// comparePerformance benchmarks sync.Map vs map+RWMutex for different workloads.
-// TODO: Run benchmarks for read-heavy and write-heavy workloads.
-func comparePerformance() {
-	fmt.Println("=== Performance Comparison ===")
-	const n = 100000
-
-	// TODO: Read-heavy workload (90% reads)
-	fmt.Println("Read-heavy workload (90% reads, 10% writes):")
-	syncMapTime := benchmarkSyncMap(n, 0.9)
-	rwMutexTime := benchmarkRWMutexMap(n, 0.9)
-	fmt.Printf("  sync.Map:      %v\n", syncMapTime.Round(time.Millisecond))
-	fmt.Printf("  map+RWMutex:   %v\n", rwMutexTime.Round(time.Millisecond))
-
-	// TODO: Write-heavy workload (50% reads)
-	fmt.Println("Write-heavy workload (50% reads, 50% writes):")
-	syncMapTime = benchmarkSyncMap(n, 0.5)
-	rwMutexTime = benchmarkRWMutexMap(n, 0.5)
-	fmt.Printf("  sync.Map:      %v\n", syncMapTime.Round(time.Millisecond))
-	fmt.Printf("  map+RWMutex:   %v\n", rwMutexTime.Round(time.Millisecond))
+func whenToUseSyncMap() {
+	fmt.Println("=== 5. When to Use sync.Map ===")
+	fmt.Println("sync.Map is optimized for TWO specific patterns:")
+	fmt.Println()
+	fmt.Println("  1. Append-only maps: keys are written once, then only read.")
+	fmt.Println("     Examples: caches, registries, configuration stores.")
+	fmt.Println("     sync.Map eliminates lock contention on reads.")
+	fmt.Println()
+	fmt.Println("  2. Disjoint key access: different goroutines work on")
+	fmt.Println("     different key subsets. sync.Map avoids locking the")
+	fmt.Println("     entire map for unrelated operations.")
+	fmt.Println()
+	fmt.Println("For general-purpose concurrent maps, prefer map + sync.RWMutex.")
+	fmt.Println("It is simpler, type-safe (no interface{} assertions), and")
+	fmt.Println("often faster for mixed workloads.")
+	fmt.Println()
+	fmt.Println("Rule of thumb: profile first. Do not use sync.Map as a default.")
 }

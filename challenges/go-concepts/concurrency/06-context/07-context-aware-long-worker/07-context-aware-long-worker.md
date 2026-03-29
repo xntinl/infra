@@ -31,235 +31,275 @@ The advanced challenge is handling partial work. If a worker is halfway through 
 
 ## Step 1 -- Basic Loop with Context Check
 
-Edit `main.go` and implement `basicWorkerLoop`. Build a worker that processes numbered items until cancelled:
+The simplest pattern: check `ctx.Done()` at the top of each loop iteration using a non-blocking select:
 
 ```go
-func basicWorkerLoop() {
-    fmt.Println("=== Basic Worker Loop ===")
+package main
 
-    ctx, cancel := context.WithTimeout(context.Background(), 350*time.Millisecond)
-    defer cancel()
+import (
+	"context"
+	"fmt"
+	"time"
+)
 
-    for i := 1; ; i++ {
-        select {
-        case <-ctx.Done():
-            fmt.Printf("  worker: stopped after %d items (%v)\n\n", i-1, ctx.Err())
-            return
-        default:
-        }
+func main() {
+	ctx, cancel := context.WithTimeout(context.Background(), 350*time.Millisecond)
+	defer cancel()
 
-        fmt.Printf("  worker: processing item %d\n", i)
-        time.Sleep(100 * time.Millisecond)
-    }
+	for i := 1; ; i++ {
+		select {
+		case <-ctx.Done():
+			fmt.Printf("worker: stopped after %d items (%v)\n", i-1, ctx.Err())
+			return
+		default:
+		}
+
+		fmt.Printf("worker: processing item %d\n", i)
+		time.Sleep(100 * time.Millisecond)
+	}
 }
 ```
 
-### Intermediate Verification
+### Verification
 ```bash
 go run main.go
 ```
 Expected output:
 ```
-=== Basic Worker Loop ===
-  worker: processing item 1
-  worker: processing item 2
-  worker: processing item 3
-  worker: stopped after 3 items (context deadline exceeded)
+worker: processing item 1
+worker: processing item 2
+worker: processing item 3
+worker: stopped after 3 items (context deadline exceeded)
 ```
 
-The worker processes items until the 350ms timeout fires. It checks `ctx.Done()` at the top of each iteration, so it never starts a new item after cancellation.
+The worker processes items until the 350ms timeout fires. It checks `ctx.Done()` at the top of each iteration, so it never starts a new item after cancellation. The `default` case in the select makes it non-blocking -- if Done is not ready, execution falls through to the work.
 
 ## Step 2 -- Select with Work Channel
 
-Implement `workerWithChannel`. Build a worker that reads items from a channel, using `select` to handle both new work and cancellation:
+When reading from a channel, combine `ctx.Done()` and the job channel in the SAME select:
 
 ```go
-func workerWithChannel() {
-    fmt.Println("=== Worker with Channel ===")
+package main
 
-    ctx, cancel := context.WithCancel(context.Background())
-    defer cancel()
+import (
+	"context"
+	"fmt"
+	"time"
+)
 
-    jobs := make(chan int, 10)
-    done := make(chan []int)
+func main() {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-    // Producer: send 20 jobs
-    go func() {
-        for i := 1; i <= 20; i++ {
-            jobs <- i
-        }
-        close(jobs)
-    }()
+	jobs := make(chan int, 10)
+	done := make(chan []int)
 
-    // Worker: process jobs, respecting cancellation
-    go func() {
-        var processed []int
-        for {
-            select {
-            case <-ctx.Done():
-                fmt.Printf("  worker: cancelled, processed %d items\n", len(processed))
-                done <- processed
-                return
-            case job, ok := <-jobs:
-                if !ok {
-                    fmt.Printf("  worker: all jobs done, processed %d items\n", len(processed))
-                    done <- processed
-                    return
-                }
-                fmt.Printf("  worker: processing job %d\n", job)
-                time.Sleep(50 * time.Millisecond)
-                processed = append(processed, job)
-            }
-        }
-    }()
+	// Producer: sends 20 jobs.
+	go func() {
+		for i := 1; i <= 20; i++ {
+			jobs <- i
+		}
+		close(jobs)
+	}()
 
-    // Cancel after 300ms
-    time.Sleep(300 * time.Millisecond)
-    fmt.Println("  main: cancelling worker")
-    cancel()
+	// Worker: processes jobs until cancelled or channel is drained.
+	go func() {
+		var processed []int
+		for {
+			select {
+			case <-ctx.Done():
+				fmt.Printf("worker: cancelled, processed %d items\n", len(processed))
+				done <- processed
+				return
+			case job, ok := <-jobs:
+				if !ok {
+					fmt.Printf("worker: all jobs done, processed %d items\n", len(processed))
+					done <- processed
+					return
+				}
+				fmt.Printf("worker: processing job %d\n", job)
+				time.Sleep(50 * time.Millisecond)
+				processed = append(processed, job)
+			}
+		}
+	}()
 
-    result := <-done
-    fmt.Printf("  main: worker completed %d items: %v\n\n", len(result), result)
+	// Cancel after 300ms.
+	time.Sleep(300 * time.Millisecond)
+	fmt.Println("main: cancelling worker")
+	cancel()
+
+	result := <-done
+	fmt.Printf("main: worker completed %d items: %v\n", len(result), result)
 }
 ```
 
-### Intermediate Verification
+### Verification
 ```bash
 go run main.go
 ```
 Expected output (approximately):
 ```
-=== Worker with Channel ===
-  worker: processing job 1
-  worker: processing job 2
-  worker: processing job 3
-  worker: processing job 4
-  worker: processing job 5
-  main: cancelling worker
-  worker: cancelled, processed 5 items
-  main: worker completed 5 items: [1 2 3 4 5]
+worker: processing job 1
+worker: processing job 2
+worker: processing job 3
+worker: processing job 4
+worker: processing job 5
+main: cancelling worker
+worker: cancelled, processed 5 items
+main: worker completed 5 items: [1 2 3 4 5]
 ```
 
-The `select` statement picks between `ctx.Done()` and a new job from the channel. When cancellation arrives, the worker reports what it processed.
+The `select` statement picks between `ctx.Done()` and a new job from the channel. When cancellation arrives, the worker reports what it processed. This is the standard pattern for cancellable consumers.
 
 ## Step 3 -- Finish Current Item Before Stopping
 
-Implement `gracefulItemCompletion`. Build a worker where each item has multiple sub-steps. On cancellation, finish the current item's remaining sub-steps before stopping:
+Sometimes each item has multiple sub-steps that must complete together. Check cancellation BETWEEN items, but once an item starts, run all its sub-steps to completion:
 
 ```go
-func gracefulItemCompletion() {
-    fmt.Println("=== Graceful Item Completion ===")
+package main
 
-    ctx, cancel := context.WithTimeout(context.Background(), 450*time.Millisecond)
-    defer cancel()
+import (
+	"context"
+	"fmt"
+	"time"
+)
 
-    for item := 1; ; item++ {
-        // Check cancellation BEFORE starting a new item
-        select {
-        case <-ctx.Done():
-            fmt.Printf("  worker: stopped before item %d (%v)\n\n", item, ctx.Err())
-            return
-        default:
-        }
+func main() {
+	ctx, cancel := context.WithTimeout(context.Background(), 450*time.Millisecond)
+	defer cancel()
 
-        fmt.Printf("  worker: starting item %d\n", item)
+	for item := 1; ; item++ {
+		// Check cancellation BEFORE starting a new item.
+		select {
+		case <-ctx.Done():
+			fmt.Printf("worker: stopped before item %d (%v)\n", item, ctx.Err())
+			return
+		default:
+		}
 
-        // Each item has 3 sub-steps -- once started, finish the item
-        for step := 1; step <= 3; step++ {
-            fmt.Printf("    step %d/%d\n", step, 3)
-            time.Sleep(50 * time.Millisecond)
-        }
+		fmt.Printf("worker: starting item %d\n", item)
 
-        fmt.Printf("  worker: item %d complete\n", item)
-    }
+		// Once started, the item runs to completion regardless of cancellation.
+		for step := 1; step <= 3; step++ {
+			fmt.Printf("  step %d/%d\n", step, 3)
+			time.Sleep(50 * time.Millisecond)
+		}
+
+		fmt.Printf("worker: item %d complete\n", item)
+	}
 }
 ```
 
-### Intermediate Verification
+### Verification
 ```bash
 go run main.go
 ```
 Expected output:
 ```
-=== Graceful Item Completion ===
-  worker: starting item 1
-    step 1/3
-    step 2/3
-    step 3/3
-  worker: item 1 complete
-  worker: starting item 2
-    step 1/3
-    step 2/3
-    step 3/3
-  worker: item 2 complete
-  worker: stopped before item 3 (context deadline exceeded)
+worker: starting item 1
+  step 1/3
+  step 2/3
+  step 3/3
+worker: item 1 complete
+worker: starting item 2
+  step 1/3
+  step 2/3
+  step 3/3
+worker: item 2 complete
+worker: stopped before item 3 (context deadline exceeded)
 ```
 
-The worker finishes each item's sub-steps atomically. It only checks for cancellation between items, never in the middle of one. This ensures data consistency.
+The worker finishes each item's sub-steps atomically. It only checks for cancellation between items, never in the middle of one. This ensures data consistency -- no partially processed items.
 
 ## Step 4 -- Progress Reporting
 
-Implement `workerWithProgress`. Build a worker that reports its progress through a channel, letting the caller monitor how far along it is:
+Build a worker that reports progress through a channel, letting the caller monitor how far along it is:
 
 ```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"time"
+)
+
 type Progress struct {
-    ItemsProcessed int
-    CurrentItem    string
-    Done           bool
-    Err            error
+	ItemsProcessed int
+	TotalItems     int
+	CurrentItem    string
+	Done           bool
+	Err            error
 }
 
-func workerWithProgress() {
-    fmt.Println("=== Worker with Progress ===")
+func main() {
+	ctx, cancel := context.WithTimeout(context.Background(), 350*time.Millisecond)
+	defer cancel()
 
-    ctx, cancel := context.WithTimeout(context.Background(), 350*time.Millisecond)
-    defer cancel()
+	progress := make(chan Progress)
 
-    progress := make(chan Progress)
+	go func() {
+		defer close(progress)
 
-    go func() {
-        items := []string{"alpha", "beta", "gamma", "delta", "epsilon"}
-        for i, item := range items {
-            select {
-            case <-ctx.Done():
-                progress <- Progress{ItemsProcessed: i, Done: true, Err: ctx.Err()}
-                return
-            default:
-            }
+		items := []string{"alpha", "beta", "gamma", "delta", "epsilon"}
+		for i, item := range items {
+			select {
+			case <-ctx.Done():
+				progress <- Progress{
+					ItemsProcessed: i,
+					TotalItems:     len(items),
+					Done:           true,
+					Err:            ctx.Err(),
+				}
+				return
+			default:
+			}
 
-            progress <- Progress{ItemsProcessed: i, CurrentItem: item}
-            time.Sleep(100 * time.Millisecond)
-        }
-        progress <- Progress{ItemsProcessed: len(items), Done: true}
-    }()
+			progress <- Progress{
+				ItemsProcessed: i,
+				TotalItems:     len(items),
+				CurrentItem:    item,
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
 
-    for p := range progress {
-        if p.Done {
-            if p.Err != nil {
-                fmt.Printf("  progress: stopped at %d items (%v)\n", p.ItemsProcessed, p.Err)
-            } else {
-                fmt.Printf("  progress: completed all %d items\n", p.ItemsProcessed)
-            }
-            break
-        }
-        fmt.Printf("  progress: [%d] processing %q\n", p.ItemsProcessed, p.CurrentItem)
-    }
-    fmt.Println()
+		progress <- Progress{
+			ItemsProcessed: len(items),
+			TotalItems:     len(items),
+			Done:           true,
+		}
+	}()
+
+	for p := range progress {
+		if p.Done {
+			if p.Err != nil {
+				fmt.Printf("progress: stopped at %d/%d items (%v)\n",
+					p.ItemsProcessed, p.TotalItems, p.Err)
+			} else {
+				fmt.Printf("progress: completed all %d/%d items\n",
+					p.ItemsProcessed, p.TotalItems)
+			}
+			break
+		}
+		fmt.Printf("progress: [%d] processing %q\n", p.ItemsProcessed, p.CurrentItem)
+	}
 }
 ```
 
-### Intermediate Verification
+### Verification
 ```bash
 go run main.go
 ```
 Expected output:
 ```
-=== Worker with Progress ===
-  progress: [0] processing "alpha"
-  progress: [1] processing "beta"
-  progress: [2] processing "gamma"
-  progress: stopped at 3 items (context deadline exceeded)
+progress: [0] processing "alpha"
+progress: [1] processing "beta"
+progress: [2] processing "gamma"
+progress: stopped at 3/5 items (context deadline exceeded)
 ```
+
+This pattern is useful for UI progress bars, health checks, or partial result collection.
 
 ## Common Mistakes
 
@@ -275,14 +315,14 @@ for {
     veryLongOperation() // runs for minutes -- no cancellation check inside
 }
 ```
-**Fix:** Check `ctx.Done()` at multiple points within long operations, or break them into smaller steps.
+**Fix:** Check `ctx.Done()` at multiple points within long operations, or break them into smaller steps. A worker that only checks at the start of each iteration is effectively unresponsive to cancellation during the work phase.
 
 ### Blocking on Channel Send After Cancellation
 **Wrong:**
 ```go
 select {
 case <-ctx.Done():
-    results <- partialResult // blocks if nobody is reading results
+    results <- partialResult // blocks forever if nobody is reading results!
     return
 }
 ```
@@ -306,16 +346,87 @@ case <-ctx.Done():
     fmt.Println("cancelled")
     // falls through to continue working!
 }
-doMoreWork()
+doMoreWork() // this still runs
 ```
-**Fix:** Always `return` after handling cancellation.
+**Fix:** Always `return` after handling cancellation. The `select` case does not break out of the surrounding loop or function -- you must explicitly return.
+
+### Using default in a Select with ctx.Done() and a Channel
+**Caution:** When you have both `ctx.Done()` and a work channel in a select, adding a `default` case creates a busy loop:
+```go
+select {
+case <-ctx.Done():
+    return
+case job := <-jobs:
+    process(job)
+default:
+    // THIS SPINS THE CPU when both channels are empty!
+}
+```
+Only use `default` when you intentionally want a non-blocking check (like the top-of-loop pattern in Step 1).
 
 ## Verify What You Learned
 
-Implement `verifyKnowledge`: build a batch processor that receives a slice of 10 strings to process. Each string takes 80ms. Use a 500ms timeout. The processor should:
-1. Check cancellation before each item
-2. Track which items were processed and which were skipped
-3. Return a summary with processed items and the reason for stopping (completion or timeout)
+Build a batch processor that receives a slice of 10 strings. Each takes 80ms. Use a 500ms timeout. Track which items were processed and which were skipped:
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"time"
+)
+
+type BatchResult struct {
+	Processed []string
+	Skipped   []string
+	Reason    string
+}
+
+func batchProcessor(ctx context.Context, items []string) BatchResult {
+	var processed []string
+	for i, item := range items {
+		select {
+		case <-ctx.Done():
+			return BatchResult{
+				Processed: processed,
+				Skipped:   items[i:],
+				Reason:    ctx.Err().Error(),
+			}
+		default:
+		}
+		time.Sleep(80 * time.Millisecond)
+		processed = append(processed, item)
+	}
+	return BatchResult{
+		Processed: processed,
+		Reason:    "completed",
+	}
+}
+
+func main() {
+	items := []string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+
+	result := batchProcessor(ctx, items)
+	fmt.Printf("Processed: %v\n", result.Processed)
+	fmt.Printf("Skipped:   %v\n", result.Skipped)
+	fmt.Printf("Reason:    %s\n", result.Reason)
+}
+```
+
+### Verification
+```bash
+go run main.go
+```
+Expected output (approximately):
+```
+Processed: [a b c d e f]
+Skipped:   [g h i j]
+Reason:    context deadline exceeded
+```
 
 ## What's Next
 Continue to [08-graceful-shutdown-with-context](../08-graceful-shutdown-with-context/08-graceful-shutdown-with-context.md) to build a complete graceful shutdown system using context, signals, and WaitGroup.
@@ -327,6 +438,7 @@ Continue to [08-graceful-shutdown-with-context](../08-graceful-shutdown-with-con
 - Report progress through a channel so callers can monitor long-running operations
 - Always `return` after handling cancellation -- do not fall through to more work
 - For multi-step items, check cancellation between items but finish sub-steps atomically
+- Avoid `default` in selects with work channels -- it creates busy loops
 
 ## Reference
 - [Go Blog: Pipelines](https://go.dev/blog/pipelines)

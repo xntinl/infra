@@ -26,15 +26,45 @@ Fan-in is the complement of fan-out. Where fan-out distributes work across multi
 
 The merge function is the core of fan-in. It takes N input channels, launches a goroutine per channel to forward values to a single output, and uses a WaitGroup to close the output when all inputs are drained. This is a recurring building block in Go systems -- from aggregating results of parallel API calls to combining log streams from multiple services.
 
-Without fan-in, a consumer would need to select from all producer channels manually, which becomes unwieldy as the number of producers grows. The merge function abstracts this into a clean, reusable pattern.
+```
+         Fan-In Data Flow
+  ch-A ---+
+           |
+  ch-B ---+--> merged output --> consumer
+           |
+  ch-C ---+
+
+  Each input gets a forwarding goroutine.
+  A WaitGroup + closer goroutine closes
+  the output after ALL inputs are drained.
+```
 
 ## Step 1 -- Merge Two Channels
 
 Start with the simplest case: merging exactly two channels into one.
 
-Edit `main.go` and implement the `mergeTwo` function:
-
 ```go
+package main
+
+import (
+    "fmt"
+    "sync"
+    "time"
+)
+
+func producer(name string, values ...int) <-chan int {
+    out := make(chan int)
+    go func() {
+        for _, v := range values {
+            fmt.Printf("  %s sending %d\n", name, v)
+            out <- v
+            time.Sleep(20 * time.Millisecond)
+        }
+        close(out)
+    }()
+    return out
+}
+
 func mergeTwo(a, b <-chan int) <-chan int {
     out := make(chan int)
     var wg sync.WaitGroup
@@ -57,6 +87,16 @@ func mergeTwo(a, b <-chan int) <-chan int {
 
     return out
 }
+
+func main() {
+    a := producer("A", 1, 2, 3)
+    b := producer("B", 10, 20, 30)
+    fmt.Print("Merged: ")
+    for v := range mergeTwo(a, b) {
+        fmt.Printf("%d ", v)
+    }
+    fmt.Println()
+}
 ```
 
 Each input channel gets its own forwarding goroutine. A third goroutine waits for both to finish and closes the output.
@@ -67,7 +107,7 @@ go run main.go
 ```
 Expected: all values from both channels appear (order varies):
 ```
-Merged (two): 1 2 3 10 20 30
+Merged: 1 10 2 20 3 30
 ```
 
 ## Step 2 -- Generalize to N Channels
@@ -75,6 +115,26 @@ Merged (two): 1 2 3 10 20 30
 Now implement a variadic `merge` that accepts any number of input channels:
 
 ```go
+package main
+
+import (
+    "fmt"
+    "sync"
+    "time"
+)
+
+func producer(name string, values ...int) <-chan int {
+    out := make(chan int)
+    go func() {
+        for _, v := range values {
+            out <- v
+            time.Sleep(20 * time.Millisecond)
+        }
+        close(out)
+    }()
+    return out
+}
+
 func merge(channels ...<-chan int) <-chan int {
     out := make(chan int)
     var wg sync.WaitGroup
@@ -96,6 +156,17 @@ func merge(channels ...<-chan int) <-chan int {
 
     return out
 }
+
+func main() {
+    x := producer("X", 1, 2, 3)
+    y := producer("Y", 10, 20, 30)
+    z := producer("Z", 100, 200, 300)
+    fmt.Print("Merged (N): ")
+    for v := range merge(x, y, z) {
+        fmt.Printf("%d ", v)
+    }
+    fmt.Println()
+}
 ```
 
 The pattern is identical to `mergeTwo` but works with a slice of channels. Each channel gets its own forwarding goroutine.
@@ -106,7 +177,7 @@ go run main.go
 ```
 Expected: all values from three channels merged:
 ```
-Merged (N): 1 2 3 10 20 30 100 200 300
+Merged (N): 1 10 100 2 20 200 3 30 300
 ```
 
 ## Step 3 -- Fan-Out + Fan-In Pipeline
@@ -114,10 +185,48 @@ Merged (N): 1 2 3 10 20 30 100 200 300
 Combine fan-out and fan-in into a complete parallel processing pipeline. Generate values, fan-out to multiple workers, and fan-in the results.
 
 ```go
-func parallelPipeline() {
-    fmt.Println("=== Parallel Pipeline ===")
+package main
 
-    // Generator
+import (
+    "fmt"
+    "sync"
+    "time"
+)
+
+func merge(channels ...<-chan int) <-chan int {
+    out := make(chan int)
+    var wg sync.WaitGroup
+    for _, ch := range channels {
+        wg.Add(1)
+        go func(c <-chan int) {
+            defer wg.Done()
+            for v := range c {
+                out <- v
+            }
+        }(ch)
+    }
+    go func() {
+        wg.Wait()
+        close(out)
+    }()
+    return out
+}
+
+func squareWorker(id int, in <-chan int) <-chan int {
+    out := make(chan int)
+    go func() {
+        for n := range in {
+            result := n * n
+            fmt.Printf("  worker %d: %d^2 = %d\n", id, n, result)
+            out <- result
+            time.Sleep(10 * time.Millisecond)
+        }
+        close(out)
+    }()
+    return out
+}
+
+func main() {
     gen := func(nums ...int) <-chan int {
         out := make(chan int)
         go func() {
@@ -131,7 +240,7 @@ func parallelPipeline() {
 
     input := gen(1, 2, 3, 4, 5, 6, 7, 8, 9, 10)
 
-    // Fan-out: 3 workers, each with its own output channel
+    // Fan-out: 3 workers share the input channel
     numWorkers := 3
     workers := make([]<-chan int, numWorkers)
     for i := 0; i < numWorkers; i++ {
@@ -141,16 +250,13 @@ func parallelPipeline() {
     // Fan-in: merge all worker outputs
     results := merge(workers...)
 
-    // Consume
     var total int
     for r := range results {
         total += r
     }
-    fmt.Printf("  Sum of squares: %d\n\n", total)
+    fmt.Printf("Sum of squares 1-10: %d\n", total) // 385
 }
 ```
-
-Note: this fan-out approach shares one input channel across all workers (they compete for values). Each worker has its own output channel, and fan-in merges those outputs.
 
 ### Intermediate Verification
 ```bash
@@ -158,8 +264,9 @@ go run main.go
 ```
 Expected: sum of squares of 1-10 = 385
 ```
-=== Parallel Pipeline ===
-  Sum of squares: 385
+  worker 0: 1^2 = 1
+  ...
+Sum of squares 1-10: 385
 ```
 
 ## Common Mistakes
@@ -200,7 +307,11 @@ If all producers send simultaneously and the consumer is slow, an unbuffered out
 
 ## Verify What You Learned
 
-Create a pipeline where three different generators produce different ranges (1-5, 6-10, 11-15), merge them with fan-in, then pass the merged stream through a `double` stage. Verify the output contains all 15 values doubled.
+Run `go run main.go` and verify the output includes:
+- Merge two: all 6 values from both channels
+- Merge N: all 9 values from three channels
+- Parallel pipeline: sum of squares 1-10 = 385
+- Merge + double: 15 values doubled
 
 ## What's Next
 Continue to [04-worker-pool-fixed](../04-worker-pool-fixed/04-worker-pool-fixed.md) to build a fixed worker pool -- a structured combination of fan-out and fan-in.

@@ -5,141 +5,199 @@ import (
 	"strings"
 )
 
-// ============================================================
-// Step 2: Producer with send-only channel
-// ============================================================
-
-// produce sends integers 1..5 to the output channel, then closes it.
-// TODO: Note the chan<- direction — this function can only send.
-func produce(out chan<- int) {
-	for i := 1; i <= 5; i++ {
-		out <- i
-	}
-	close(out)
-
-	// Uncomment the next line to see a compile error:
-	// val := <-out  // cannot receive from send-only channel
-}
-
-// ============================================================
-// Step 3: Consumer with receive-only channel
-// ============================================================
-
-// consume reads all values from a receive-only channel and prints them.
-// TODO: Note the <-chan direction — this function can only receive.
-func consume(in <-chan int) {
-	for val := range in {
-		fmt.Println("Received:", val)
-	}
-
-	// Uncomment the next line to see a compile error:
-	// in <- 99    // cannot send to receive-only channel
-	// close(in)   // cannot close receive-only channel
-}
-
-// ============================================================
-// Step 4: Transformer in a pipeline
-// ============================================================
-
-// double reads values from in, doubles them, and sends to out.
-// TODO: Implement this function.
-func double(in <-chan int, out chan<- int) {
-	// TODO: Range over in, send val*2 to out, then close out
-}
-
-func stepPipeline() {
-	fmt.Println("--- Pipeline: produce -> double -> consume ---")
-
-	raw := make(chan int)
-	doubled := make(chan int)
-
-	go produce(raw)
-	go double(raw, doubled)
-	consume(doubled)
-}
-
-// ============================================================
-// Step 5: Generator returning receive-only channel
-// ============================================================
-
-// generateNumbers creates a channel, launches a goroutine that sends
-// 1..n, closes it, and returns the channel as receive-only.
-func generateNumbers(n int) <-chan int {
-	// TODO: Create a bidirectional channel
-	// TODO: Launch goroutine that sends 1..n and closes channel
-	// TODO: Return the channel (auto-converts to <-chan int)
-
-	ch := make(chan int) // placeholder — implement the goroutine
-	return ch
-}
-
-func stepGenerator() {
-	fmt.Println("--- Generator Pattern ---")
-
-	// TODO: Call generateNumbers(5) and range over the result
-	nums := generateNumbers(5)
-	_ = nums // replace with range loop
-}
-
-// ============================================================
-// Final Challenge: Three-stage word pipeline
+// This program demonstrates directional channel types for compile-time safety.
+// Run: go run main.go
 //
-// 1. generateWords(words) <-chan string — sends each word, closes
-// 2. toUpper(in, out)                  — uppercases, closes out
-// 3. addPrefix(in, out)                — prepends "PROCESSED: ", closes out
+// Expected output:
+//   === Example 1: Send-Only Producer ===
+//   1
+//   2
+//   3
+//   4
+//   5
 //
-// Wire them and consume in main.
-// Words: "go", "channels", "are", "typed"
-// Expected:
+//   === Example 2: Receive-Only Consumer ===
+//   Received: 10
+//   Received: 20
+//   Received: 30
+//
+//   === Example 3: Pipeline (produce -> double -> print) ===
+//   Doubled: 2
+//   Doubled: 4
+//   Doubled: 6
+//   Doubled: 8
+//   Doubled: 10
+//
+//   === Example 4: Generator Returns Receive-Only ===
+//   1
+//   2
+//   3
+//   4
+//   5
+//
+//   === Example 5: Three-Stage Word Pipeline ===
 //   PROCESSED: GO
 //   PROCESSED: CHANNELS
 //   PROCESSED: ARE
 //   PROCESSED: TYPED
-// ============================================================
+
+func main() {
+	example1SendOnlyProducer()
+	example2ReceiveOnlyConsumer()
+	example3Pipeline()
+	example4Generator()
+	example5WordPipeline()
+}
+
+// produce takes a send-only channel: chan<- int.
+// The arrow points INTO chan, meaning this function can ONLY send.
+// Attempting to receive (val := <-out) would be a compile error:
+//
+//	"invalid operation: cannot receive from send-only channel"
+func produce(out chan<- int, count int) {
+	for i := 1; i <= count; i++ {
+		out <- i
+	}
+	// The producer owns the channel lifecycle -- it closes when done.
+	close(out)
+}
+
+// example1SendOnlyProducer demonstrates a function that only writes to a channel.
+func example1SendOnlyProducer() {
+	fmt.Println("=== Example 1: Send-Only Producer ===")
+
+	// make creates a bidirectional channel. When passed to produce(),
+	// Go automatically narrows it to send-only. This is an implicit conversion.
+	ch := make(chan int)
+	go produce(ch, 5)
+
+	for val := range ch {
+		fmt.Println(val)
+	}
+	fmt.Println()
+}
+
+// consume takes a receive-only channel: <-chan int.
+// The arrow points OUT of chan, meaning this function can ONLY receive.
+// Attempting to send (in <- 99) or close (close(in)) would be a compile error.
+func consume(in <-chan int) {
+	for val := range in {
+		fmt.Println("Received:", val)
+	}
+}
+
+// example2ReceiveOnlyConsumer demonstrates a function that only reads from a channel.
+func example2ReceiveOnlyConsumer() {
+	fmt.Println("=== Example 2: Receive-Only Consumer ===")
+
+	ch := make(chan int)
+	go func() {
+		for _, v := range []int{10, 20, 30} {
+			ch <- v
+		}
+		close(ch)
+	}()
+
+	consume(ch) // ch narrows from chan int to <-chan int automatically
+	fmt.Println()
+}
+
+// double is a pipeline stage: reads from input (receive-only), writes to output (send-only).
+// Each parameter constrains exactly what this function can do with each channel.
+// Reading the signature tells you the data flow direction without looking at the body.
+func double(in <-chan int, out chan<- int) {
+	for val := range in {
+		out <- val * 2
+	}
+	close(out)
+}
+
+// example3Pipeline wires three stages: produce -> double -> consume in main.
+func example3Pipeline() {
+	fmt.Println("=== Example 3: Pipeline (produce -> double -> print) ===")
+
+	raw := make(chan int)
+	doubled := make(chan int)
+
+	go produce(raw, 5)       // sends 1..5 to raw
+	go double(raw, doubled)  // reads from raw, sends *2 to doubled
+
+	// Final stage runs in main goroutine.
+	for val := range doubled {
+		fmt.Println("Doubled:", val)
+	}
+	fmt.Println()
+}
+
+// generateNumbers creates a channel internally and returns it as receive-only.
+// The caller can only read from the returned channel. The goroutine inside holds
+// the only send-capable reference. This enforces the producer-closes contract.
+func generateNumbers(n int) <-chan int {
+	ch := make(chan int) // bidirectional inside the function
+	go func() {
+		for i := 1; i <= n; i++ {
+			ch <- i
+		}
+		close(ch)
+	}()
+	// Returning chan int as <-chan int is an automatic narrowing conversion.
+	return ch
+}
+
+// example4Generator demonstrates the generator pattern: a function that returns
+// a receive-only channel. The internal goroutine is the producer; the caller is
+// the consumer. This is a clean ownership model.
+func example4Generator() {
+	fmt.Println("=== Example 4: Generator Returns Receive-Only ===")
+
+	nums := generateNumbers(5)
+	for val := range nums {
+		fmt.Println(val)
+	}
+	fmt.Println()
+}
+
+// --- Three-stage word pipeline for Example 5 ---
 
 func generateWords(words []string) <-chan string {
-	// TODO: Create channel, launch goroutine, return receive-only channel
 	ch := make(chan string)
-	_ = words // remove when used
+	go func() {
+		for _, w := range words {
+			ch <- w
+		}
+		close(ch)
+	}()
 	return ch
 }
 
 func toUpper(in <-chan string, out chan<- string) {
-	// TODO: Range over in, send strings.ToUpper(val) to out, close out
-	_ = strings.ToUpper // remove when used
+	for word := range in {
+		out <- strings.ToUpper(word)
+	}
+	close(out)
 }
 
 func addPrefix(in <-chan string, out chan<- string) {
-	// TODO: Range over in, send "PROCESSED: "+val to out, close out
+	for word := range in {
+		out <- "PROCESSED: " + word
+	}
+	close(out)
 }
 
-func finalChallenge() {
-	fmt.Println("--- Final: Word Processing Pipeline ---")
+// example5WordPipeline wires three string-processing stages together.
+// Each stage only has the channel direction it needs, enforced by the compiler.
+func example5WordPipeline() {
+	fmt.Println("=== Example 5: Three-Stage Word Pipeline ===")
 
-	// TODO: Create the intermediate channels
-	// TODO: Wire: generateWords -> toUpper -> addPrefix -> consume in main
+	words := generateWords([]string{"go", "channels", "are", "typed"})
 
-	// Hint: the final stage consumption can be a simple range loop:
-	// for word := range finalOutput {
-	//     fmt.Println(word)
-	// }
-}
+	uppered := make(chan string)
+	prefixed := make(chan string)
 
-func main() {
-	fmt.Println("=== Step 2-3: Produce and Consume ===")
-	ch := make(chan int)
-	go produce(ch)
-	consume(ch)
+	go toUpper(words, uppered)
+	go addPrefix(uppered, prefixed)
 
-	fmt.Println()
-	fmt.Println("=== Step 4: Pipeline ===")
-	stepPipeline()
-
-	fmt.Println()
-	fmt.Println("=== Step 5: Generator ===")
-	stepGenerator()
-
-	fmt.Println()
-	fmt.Println("=== Final Challenge ===")
-	finalChallenge()
+	for result := range prefixed {
+		fmt.Println(result)
+	}
 }

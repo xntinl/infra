@@ -30,7 +30,7 @@ The idiomatic Go pattern is to call `defer mu.Unlock()` immediately after `Lock(
 
 ## Step 1 -- Observe the Race Condition
 
-Open `main.go`. The `unsafeIncrement` function launches 1000 goroutines that each increment a shared counter 1000 times. Run it and observe that the final count is wrong:
+Run `main.go` and observe the unsafe counter produces an incorrect result:
 
 ```bash
 go run main.go
@@ -38,12 +38,12 @@ go run main.go
 
 You should see output like:
 ```
-=== Unsafe Counter (no mutex) ===
+=== 1. Unsafe Counter (no mutex) ===
 Expected: 1000000, Got: 547832
-Race condition detected!
+Race condition detected! Lost 452168 increments.
 ```
 
-The exact number will vary between runs. Now run it with Go's race detector to confirm:
+The exact number will vary between runs. Now run with Go's race detector to confirm:
 
 ```bash
 go run -race main.go
@@ -54,34 +54,37 @@ The race detector will report `DATA RACE` warnings with stack traces showing the
 ### Intermediate Verification
 You should see `WARNING: DATA RACE` output from the race detector pointing to the `counter++` line.
 
-## Step 2 -- Protect with sync.Mutex
+## Step 2 -- Understand the Fix with sync.Mutex
 
-Implement the `safeIncrement` function. Add a `sync.Mutex` and wrap the counter increment in a Lock/Unlock pair:
+Read the `safeIncrement` function. It wraps the counter increment in a Lock/Unlock pair:
 
 ```go
-func safeIncrement() {
-    var mu sync.Mutex
-    counter := 0
-    var wg sync.WaitGroup
+package main
 
-    for i := 0; i < 1000; i++ {
-        wg.Add(1)
-        go func() {
-            defer wg.Done()
-            for j := 0; j < 1000; j++ {
-                mu.Lock()
-                counter++
-                mu.Unlock()
-            }
-        }()
-    }
+import (
+	"fmt"
+	"sync"
+)
 
-    wg.Wait()
-    fmt.Printf("\n=== Safe Counter (with mutex) ===\n")
-    fmt.Printf("Expected: 1000000, Got: %d\n", counter)
-    if counter == 1000000 {
-        fmt.Println("No race condition -- mutex works!")
-    }
+func main() {
+	counter := 0
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+
+	for i := 0; i < 1000; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 1000; j++ {
+				mu.Lock()
+				counter++
+				mu.Unlock()
+			}
+		}()
+	}
+
+	wg.Wait()
+	fmt.Printf("Expected: 1000000, Got: %d\n", counter)
 }
 ```
 
@@ -98,33 +101,39 @@ No `DATA RACE` warnings should appear for the safe version.
 
 ## Step 3 -- The defer Unlock Pattern
 
-Implement `safeIncrementWithDefer` using the idiomatic `defer` pattern. Extract the critical section into a helper to show how `defer` pairs naturally with `Lock`:
+The `safeIncrementWithDefer` function extracts the critical section into a helper closure using `defer`:
 
 ```go
-func safeIncrementWithDefer() {
-    var mu sync.Mutex
-    counter := 0
-    var wg sync.WaitGroup
+package main
 
-    increment := func() {
-        mu.Lock()
-        defer mu.Unlock()
-        counter++
-    }
+import (
+	"fmt"
+	"sync"
+)
 
-    for i := 0; i < 1000; i++ {
-        wg.Add(1)
-        go func() {
-            defer wg.Done()
-            for j := 0; j < 1000; j++ {
-                increment()
-            }
-        }()
-    }
+func main() {
+	counter := 0
+	var mu sync.Mutex
+	var wg sync.WaitGroup
 
-    wg.Wait()
-    fmt.Printf("\n=== Safe Counter (defer pattern) ===\n")
-    fmt.Printf("Expected: 1000000, Got: %d\n", counter)
+	increment := func() {
+		mu.Lock()
+		defer mu.Unlock() // runs when increment() returns
+		counter++
+	}
+
+	for i := 0; i < 1000; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 1000; j++ {
+				increment()
+			}
+		}()
+	}
+
+	wg.Wait()
+	fmt.Printf("Expected: 1000000, Got: %d\n", counter)
 }
 ```
 
@@ -136,46 +145,190 @@ go run -race main.go
 ```
 All three functions should run. The unsafe version shows an incorrect count; both safe versions show exactly `1000000`.
 
+## Step 4 -- Struct with Embedded Mutex
+
+The idiomatic Go pattern places the mutex alongside the data it protects inside a struct:
+
+```go
+package main
+
+import (
+	"fmt"
+	"sync"
+)
+
+type ScoreBoard struct {
+	mu     sync.Mutex
+	scores map[string]int
+}
+
+func NewScoreBoard() *ScoreBoard {
+	return &ScoreBoard{scores: make(map[string]int)}
+}
+
+func (sb *ScoreBoard) AddPoint(player string) {
+	sb.mu.Lock()
+	defer sb.mu.Unlock()
+	sb.scores[player]++
+}
+
+// Returns a COPY so callers cannot bypass the mutex.
+func (sb *ScoreBoard) Scores() map[string]int {
+	sb.mu.Lock()
+	defer sb.mu.Unlock()
+	result := make(map[string]int, len(sb.scores))
+	for k, v := range sb.scores {
+		result[k] = v
+	}
+	return result
+}
+
+func main() {
+	board := NewScoreBoard()
+	var wg sync.WaitGroup
+
+	for i := 0; i < 1000; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			board.AddPoint("alice")
+		}()
+	}
+
+	wg.Wait()
+	fmt.Printf("Alice's score: %d\n", board.Scores()["alice"])
+}
+```
+
+Expected output:
+```
+Alice's score: 1000
+```
+
+### Intermediate Verification
+Run `go run -race main.go` on the full program. All five demos should complete without any race warnings.
+
+## Step 5 -- Protecting a Shared Map
+
+Maps in Go are NOT safe for concurrent access. Writing from multiple goroutines without a mutex causes a fatal runtime panic. The `protectSharedMap` function demonstrates the fix:
+
+```go
+package main
+
+import (
+	"fmt"
+	"sync"
+)
+
+func main() {
+	var mu sync.Mutex
+	m := make(map[int]int)
+	var wg sync.WaitGroup
+
+	for i := 0; i < 100; i++ {
+		wg.Add(1)
+		go func(base int) {
+			defer wg.Done()
+			for j := 0; j < 10; j++ {
+				key := base*10 + j
+				mu.Lock()
+				m[key] = key * key
+				mu.Unlock()
+			}
+		}(i)
+	}
+
+	wg.Wait()
+	fmt.Printf("Map has %d entries (expected 1000).\n", len(m))
+}
+```
+
+Expected output:
+```
+Map has 1000 entries (expected 1000).
+```
+
 ## Common Mistakes
 
 ### Forgetting to Unlock
-**Wrong:**
+
 ```go
-mu.Lock()
-counter++
-// forgot mu.Unlock() -- all other goroutines block forever
+package main
+
+import (
+	"fmt"
+	"sync"
+)
+
+func main() {
+	var mu sync.Mutex
+	mu.Lock()
+	fmt.Println("acquired lock")
+	// Forgot mu.Unlock() -- any goroutine that calls mu.Lock() will block forever.
+	// This causes a deadlock if main also tries to lock again.
+	mu.Lock() // DEADLOCK: blocks forever waiting for itself
+	fmt.Println("this line is never reached")
+}
 ```
+
 **What happens:** Deadlock. All goroutines waiting on Lock will block permanently.
 
 **Fix:** Always pair Lock with Unlock. Use `defer mu.Unlock()` immediately after Lock.
 
 ### Copying a Mutex
-**Wrong:**
+
 ```go
-func doWork(mu sync.Mutex) { // receives a COPY of the mutex
-    mu.Lock()
-    defer mu.Unlock()
-    // this lock is independent of the original
+package main
+
+import (
+	"fmt"
+	"sync"
+)
+
+func doWork(mu sync.Mutex, counter *int) { // receives a COPY of the mutex
+	mu.Lock()
+	defer mu.Unlock()
+	*counter++ // this lock is independent of the original -- no protection!
+}
+
+func main() {
+	var mu sync.Mutex
+	counter := 0
+	var wg sync.WaitGroup
+
+	for i := 0; i < 1000; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			doWork(mu, &counter) // each goroutine gets its own mutex copy!
+		}()
+	}
+
+	wg.Wait()
+	fmt.Printf("Counter: %d (likely != 1000 due to copied mutex)\n", counter)
 }
 ```
+
 **What happens:** Each goroutine locks its own copy -- no mutual exclusion at all.
 
 **Fix:** Always pass `*sync.Mutex` (a pointer):
 ```go
-func doWork(mu *sync.Mutex) {
-    mu.Lock()
-    defer mu.Unlock()
+func doWork(mu *sync.Mutex, counter *int) {
+	mu.Lock()
+	defer mu.Unlock()
+	*counter++
 }
 ```
 
 ### Locking Too Broadly
-**Wrong:**
+
 ```go
 mu.Lock()
 result := expensiveComputation() // holds the lock during slow work
 counter += result
 mu.Unlock()
 ```
+
 **What happens:** All goroutines are serialized through the expensive computation, eliminating concurrency benefits.
 
 **Fix:** Only hold the lock for the shared state access:
@@ -197,8 +350,9 @@ Continue to [02-rwmutex-readers-writers](../02-rwmutex-readers-writers/02-rwmute
 - A data race occurs when multiple goroutines access shared state without synchronization and at least one writes
 - `sync.Mutex` provides mutual exclusion: only one goroutine holds the lock at a time
 - Always use `defer mu.Unlock()` immediately after `mu.Lock()` for safety
-- Never copy a mutex -- pass it by pointer
+- Never copy a mutex -- pass it by pointer or embed it in a struct
 - Minimize the critical section: hold the lock only while accessing shared state
+- Return copies from locked methods to prevent callers from bypassing the mutex
 - Use `go run -race` to detect data races during development
 
 ## Reference

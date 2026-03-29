@@ -6,6 +6,7 @@ import (
 )
 
 // --- Correctness Tests ---
+// These verify each counter produces the correct result under concurrency.
 
 func TestAtomicCounterCorrectness(t *testing.T) {
 	c := &AtomicCounter{}
@@ -15,6 +16,11 @@ func TestAtomicCounterCorrectness(t *testing.T) {
 func TestMutexCounterCorrectness(t *testing.T) {
 	c := &MutexCounter{}
 	runCorrectnessTest(t, "MutexCounter", c.Inc, c.Get)
+}
+
+func TestRWMutexCounterCorrectness(t *testing.T) {
+	c := &RWMutexCounter{}
+	runCorrectnessTest(t, "RWMutexCounter", c.Inc, c.Get)
 }
 
 func TestChannelCounterCorrectness(t *testing.T) {
@@ -46,104 +52,183 @@ func runCorrectnessTest(t *testing.T, name string, inc func(), get func() int64)
 	}
 }
 
-// --- Step 2: Sequential Benchmarks ---
+// --- Sequential Benchmarks ---
 // Measure the base cost per operation without concurrency.
+// This isolates the overhead of each synchronization mechanism.
 
-// TODO: Implement BenchmarkAtomicCounter_Sequential
-// Loop b.N times, calling c.Inc() each iteration.
 func BenchmarkAtomicCounter_Sequential(b *testing.B) {
 	c := &AtomicCounter{}
-	_ = c // remove once used
-	// TODO: for i := 0; i < b.N; i++ { c.Inc() }
+	for i := 0; i < b.N; i++ {
+		c.Inc()
+	}
 }
 
-// TODO: Implement BenchmarkMutexCounter_Sequential
 func BenchmarkMutexCounter_Sequential(b *testing.B) {
 	c := &MutexCounter{}
-	_ = c // remove once used
-	// TODO: for i := 0; i < b.N; i++ { c.Inc() }
+	for i := 0; i < b.N; i++ {
+		c.Inc()
+	}
 }
 
-// TODO: Implement BenchmarkChannelCounter_Sequential
+func BenchmarkRWMutexCounter_Sequential(b *testing.B) {
+	c := &RWMutexCounter{}
+	for i := 0; i < b.N; i++ {
+		c.Inc()
+	}
+}
+
 func BenchmarkChannelCounter_Sequential(b *testing.B) {
 	c := NewChannelCounter()
-	_ = c // remove once used
-	// TODO: for i := 0; i < b.N; i++ { c.Inc() }
+	for i := 0; i < b.N; i++ {
+		c.Inc()
+	}
 }
 
-// --- Step 3: Parallel Benchmarks ---
-// Use b.RunParallel to measure under concurrent contention.
+// --- Parallel Benchmarks ---
+// Use b.RunParallel to measure under realistic concurrent contention.
+// The framework spawns GOMAXPROCS goroutines and distributes b.N across them.
 
-// TODO: Implement BenchmarkAtomicCounter_Parallel
-// Use b.RunParallel(func(pb *testing.PB) { for pb.Next() { c.Inc() } })
 func BenchmarkAtomicCounter_Parallel(b *testing.B) {
 	c := &AtomicCounter{}
-	_ = c // remove once used
-	// TODO: b.RunParallel(...)
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			c.Inc()
+		}
+	})
 }
 
-// TODO: Implement BenchmarkMutexCounter_Parallel
 func BenchmarkMutexCounter_Parallel(b *testing.B) {
 	c := &MutexCounter{}
-	_ = c // remove once used
-	// TODO: b.RunParallel(...)
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			c.Inc()
+		}
+	})
 }
 
-// TODO: Implement BenchmarkChannelCounter_Parallel
+func BenchmarkRWMutexCounter_Parallel(b *testing.B) {
+	c := &RWMutexCounter{}
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			c.Inc()
+		}
+	})
+}
+
 func BenchmarkChannelCounter_Parallel(b *testing.B) {
 	c := NewChannelCounter()
-	_ = c // remove once used
-	// TODO: b.RunParallel(...)
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			c.Inc()
+		}
+	})
 }
 
-// --- Step 4: Read-Heavy Benchmarks ---
-// 90% reads, 10% writes. Atomics should excel here.
+// --- Read-Heavy Benchmarks ---
+// 90% reads, 10% writes. Simulates real workloads where reads dominate.
+// Atomics should excel because readers never block each other.
+// RWMutex should outperform Mutex because concurrent reads are allowed.
 
-// TODO: Implement BenchmarkAtomicCounter_ReadHeavy
-// Use b.RunParallel. Inside the loop: if i%10 == 0 { c.Inc() } else { c.Get() }
 func BenchmarkAtomicCounter_ReadHeavy(b *testing.B) {
 	c := &AtomicCounter{}
-	_ = c // remove once used
-	// TODO: b.RunParallel with 90/10 read/write split
+	b.RunParallel(func(pb *testing.PB) {
+		i := 0
+		for pb.Next() {
+			if i%10 == 0 {
+				c.Inc()
+			} else {
+				c.Get()
+			}
+			i++
+		}
+	})
 }
 
-// TODO: Implement BenchmarkMutexCounter_ReadHeavy
 func BenchmarkMutexCounter_ReadHeavy(b *testing.B) {
 	c := &MutexCounter{}
-	_ = c // remove once used
-	// TODO: b.RunParallel with 90/10 read/write split
+	b.RunParallel(func(pb *testing.PB) {
+		i := 0
+		for pb.Next() {
+			if i%10 == 0 {
+				c.Inc()
+			} else {
+				c.Get()
+			}
+			i++
+		}
+	})
 }
 
-// TODO: Implement BenchmarkChannelCounter_ReadHeavy
+func BenchmarkRWMutexCounter_ReadHeavy(b *testing.B) {
+	c := &RWMutexCounter{}
+	b.RunParallel(func(pb *testing.PB) {
+		i := 0
+		for pb.Next() {
+			if i%10 == 0 {
+				c.Inc()
+			} else {
+				c.Get()
+			}
+			i++
+		}
+	})
+}
+
 func BenchmarkChannelCounter_ReadHeavy(b *testing.B) {
 	c := NewChannelCounter()
-	_ = c // remove once used
-	// TODO: b.RunParallel with 90/10 read/write split
+	b.RunParallel(func(pb *testing.PB) {
+		i := 0
+		for pb.Next() {
+			if i%10 == 0 {
+				c.Inc()
+			} else {
+				c.Get()
+			}
+			i++
+		}
+	})
 }
 
-// --- Verify: High Contention Benchmark ---
-// Use b.SetParallelism(100) before b.RunParallel to simulate extreme contention.
+// --- High Contention Benchmarks ---
+// b.SetParallelism(100) creates 100 * GOMAXPROCS goroutines.
+// This simulates extreme contention to see how each approach degrades.
 
-// TODO: Implement BenchmarkAtomicCounter_HighContention
 func BenchmarkAtomicCounter_HighContention(b *testing.B) {
 	c := &AtomicCounter{}
-	_ = c // remove once used
-	// TODO: b.SetParallelism(100)
-	// TODO: b.RunParallel(...)
+	b.SetParallelism(100)
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			c.Inc()
+		}
+	})
 }
 
-// TODO: Implement BenchmarkMutexCounter_HighContention
 func BenchmarkMutexCounter_HighContention(b *testing.B) {
 	c := &MutexCounter{}
-	_ = c // remove once used
-	// TODO: b.SetParallelism(100)
-	// TODO: b.RunParallel(...)
+	b.SetParallelism(100)
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			c.Inc()
+		}
+	})
 }
 
-// TODO: Implement BenchmarkChannelCounter_HighContention
+func BenchmarkRWMutexCounter_HighContention(b *testing.B) {
+	c := &RWMutexCounter{}
+	b.SetParallelism(100)
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			c.Inc()
+		}
+	})
+}
+
 func BenchmarkChannelCounter_HighContention(b *testing.B) {
 	c := NewChannelCounter()
-	_ = c // remove once used
-	// TODO: b.SetParallelism(100)
-	// TODO: b.RunParallel(...)
+	b.SetParallelism(100)
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			c.Inc()
+		}
+	})
 }

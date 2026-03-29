@@ -2,7 +2,7 @@
 
 <!--
 difficulty: intermediate
-concepts: [sync.Mutex, Lock, Unlock, defer, critical section, contention]
+concepts: [sync.Mutex, Lock, Unlock, defer, critical section, contention, encapsulation]
 tools: [go]
 estimated_time: 25m
 bloom_level: apply
@@ -18,21 +18,34 @@ prerequisites: [goroutines, sync.WaitGroup, data race concept, race detector]
 After completing this exercise, you will be able to:
 - **Fix** a data race by protecting shared state with `sync.Mutex`
 - **Apply** the `Lock()`/`defer Unlock()` idiom correctly
+- **Encapsulate** locking inside a struct for production-quality code
+- **Measure** the contention cost of mutex-based synchronization
 - **Verify** the fix using the `-race` flag
-- **Identify** the tradeoff between correctness and contention when using mutexes
 
 ## Why Mutex
-A `sync.Mutex` provides mutual exclusion: only one goroutine can hold the lock at a time. All others block until the lock is released. This is the most straightforward way to protect shared state. When a goroutine calls `Lock()`, it gains exclusive access to the critical section. When it calls `Unlock()`, the next waiting goroutine can proceed.
 
-The mutex approach is simple and works for any type of shared state. The tradeoff is contention: when many goroutines compete for the same lock, they serialize their access, reducing parallelism. For a simple counter this is acceptable. For high-throughput scenarios with mostly reads, consider `sync.RWMutex`. For simple numeric operations, consider `sync/atomic` (exercise 05).
+A `sync.Mutex` provides **mutual exclusion**: only one goroutine can hold the lock at a time. All others block until the lock is released. This is the most straightforward way to protect shared state.
 
-This exercise uses the same counter problem from exercises 01 and 02. You will fix the race by wrapping the increment in a mutex-protected critical section.
+How it works:
+- `Lock()`: acquire the lock. If another goroutine holds it, block until it releases.
+- `Unlock()`: release the lock. The next waiting goroutine can now proceed.
 
-## Step 1 -- Add a Mutex to the Racy Counter
+The tradeoff is **contention**: when many goroutines compete for the same lock, they serialize their access, reducing parallelism. For a simple counter this is acceptable. For high-throughput scenarios with mostly reads, consider `sync.RWMutex`. For simple numeric operations, consider `sync/atomic` (exercise 05).
 
-Edit `main.go` and implement `safeCounterMutex`. Protect the `counter++` operation with a `sync.Mutex`:
+This exercise uses the same counter problem from exercises 01-02.
+
+## Step 1 -- Basic Mutex
+
+The simplest fix wraps `counter++` in `Lock()`/`Unlock()`:
 
 ```go
+package main
+
+import (
+    "fmt"
+    "sync"
+)
+
 func safeCounterMutex() int {
     counter := 0
     var mu sync.Mutex
@@ -44,7 +57,7 @@ func safeCounterMutex() int {
             defer wg.Done()
             for j := 0; j < 1000; j++ {
                 mu.Lock()
-                counter++
+                counter++ // only one goroutine at a time reaches this line
                 mu.Unlock()
             }
         }()
@@ -53,50 +66,49 @@ func safeCounterMutex() int {
     wg.Wait()
     return counter
 }
+
+func main() {
+    result := safeCounterMutex()
+    fmt.Printf("Result: %d (expected 1000000)\n", result)
+}
 ```
 
-The `mu.Lock()` call ensures only one goroutine executes `counter++` at a time. No two goroutines can read-modify-write simultaneously.
-
-### Intermediate Verification
+### Verification
 ```bash
 go run main.go
 ```
-Expected output:
+Expected:
 ```
-=== Fix Race with Mutex ===
-Racy counter:  <some wrong number>
-Safe counter:  1000000
+Result: 1000000 (expected 1000000) -- CORRECT
 ```
-
-## Step 2 -- Verify with the Race Detector
-
-Run with the `-race` flag to confirm the fix eliminates the race:
 
 ```bash
 go run -race main.go
 ```
+Expected: NO `DATA RACE` warning from `safeCounterMutex`. The mutex establishes a happens-before relationship: each `Unlock()` happens-before the next `Lock()`.
 
-The race detector should report a race for `racyCounter` but NOT for `safeCounterMutex`. The mutex establishes a happens-before relationship: each `Unlock()` happens-before the next `Lock()`, so the read-modify-write sequence is properly ordered.
+## Step 2 -- Defer Pattern
 
-### Intermediate Verification
-```bash
-go run -race main.go 2>&1 | grep -c "DATA RACE"
-```
-You should see race reports only from `racyCounter`, not from `safeCounterMutex`.
-
-## Step 3 -- Use the defer Pattern
-
-Implement `safeCounterDefer` using the idiomatic `defer` pattern. This ensures the mutex is always released, even if a panic occurs inside the critical section:
+The `defer` pattern ensures the mutex is always released, even if a panic occurs inside the critical section:
 
 ```go
+package main
+
+import (
+    "fmt"
+    "sync"
+)
+
 func safeCounterDefer() int {
     counter := 0
     var mu sync.Mutex
     var wg sync.WaitGroup
 
+    // Extract the critical section into a named closure.
+    // This makes the locking scope explicit and limits it to the minimum.
     increment := func() {
         mu.Lock()
-        defer mu.Unlock()
+        defer mu.Unlock() // guaranteed to execute even on panic
         counter++
     }
 
@@ -113,59 +125,108 @@ func safeCounterDefer() int {
     wg.Wait()
     return counter
 }
-```
 
-Extracting the critical section into a named function makes the locking scope explicit and limits the critical section to the minimum necessary code.
-
-### Intermediate Verification
-```bash
-go run -race main.go
-```
-Both `safeCounterMutex` and `safeCounterDefer` should produce 1,000,000 with no race warnings.
-
-## Step 4 -- Observe Contention Cost
-
-Implement `compareTiming` to measure the performance difference between the racy (unsynchronized) and safe (mutex-protected) versions:
-
-```go
-func compareTiming() {
-    fmt.Println("\n=== Timing Comparison ===")
-
-    start := time.Now()
-    racyCounter()
-    racyDuration := time.Since(start)
-
-    start = time.Now()
-    safeCounterMutex()
-    safeDuration := time.Since(start)
-
-    fmt.Printf("Racy (wrong but fast):   %v\n", racyDuration)
-    fmt.Printf("Mutex (correct but slower): %v\n", safeDuration)
-    fmt.Printf("Slowdown factor: %.1fx\n", float64(safeDuration)/float64(racyDuration))
+func main() {
+    result := safeCounterDefer()
+    fmt.Printf("Result: %d (expected 1000000)\n", result)
 }
 ```
 
-The mutex version will be slower because goroutines must wait for each other. This is the cost of correctness. The slowdown factor depends on your hardware and number of CPU cores.
+### Verification
+```bash
+go run -race main.go
+```
+Expected: 1,000,000 with zero race warnings.
 
-### Intermediate Verification
+## Step 3 -- Encapsulated Counter
+
+In production code, the mutex should be an implementation detail, not something callers must remember to use:
+
+```go
+package main
+
+import (
+    "fmt"
+    "sync"
+)
+
+type SafeCounter struct {
+    mu    sync.Mutex
+    value int
+}
+
+func (c *SafeCounter) Increment() {
+    c.mu.Lock()
+    defer c.mu.Unlock()
+    c.value++
+}
+
+func (c *SafeCounter) Value() int {
+    c.mu.Lock()
+    defer c.mu.Unlock()
+    return c.value
+}
+
+func main() {
+    c := &SafeCounter{}
+    var wg sync.WaitGroup
+
+    for i := 0; i < 1000; i++ {
+        wg.Add(1)
+        go func() {
+            defer wg.Done()
+            for j := 0; j < 1000; j++ {
+                c.Increment()
+            }
+        }()
+    }
+
+    wg.Wait()
+    fmt.Printf("Result: %d (expected 1000000)\n", c.Value())
+}
+```
+
+### Verification
+```bash
+go run -race main.go
+```
+Expected: 1,000,000 with zero race warnings.
+
+This pattern prevents forgetting to lock because callers never access `value` directly.
+
+## Step 4 -- Measure Contention Cost
+
+The full `main.go` includes a timing comparison. The mutex version is slower because goroutines must wait for each other:
+
+### Verification
 ```bash
 go run main.go
 ```
-You should see the mutex version taking noticeably longer than the racy version.
+Sample output:
+```
+=== Timing Comparison ===
+  Racy (wrong):        12.3ms
+  Mutex (basic):       245.6ms
+  Mutex (defer):       251.2ms
+  Slowdown: ~20x (the cost of correctness under high contention)
+```
+
+This is the worst case: 1000 goroutines competing for a single lock on a single integer. In real code, contention is usually lower because:
+- Goroutines do useful work between lock acquisitions
+- Lock scope is narrow
+- Different goroutines lock different resources
 
 ## Common Mistakes
 
 ### Forgetting to Unlock
-**Wrong:**
 ```go
 mu.Lock()
 counter++
 // forgot mu.Unlock() -- all other goroutines are now blocked forever (deadlock)
 ```
-**Fix:** Always use `defer mu.Unlock()` immediately after `Lock()`, or extract the critical section into a small function with `defer`.
+**Fix:** Always use `defer mu.Unlock()` immediately after `Lock()`.
 
 ### Locking Too Much
-**Wrong:**
 ```go
 mu.Lock()
 for j := 0; j < 1000; j++ {
@@ -173,7 +234,7 @@ for j := 0; j < 1000; j++ {
 }
 mu.Unlock()
 ```
-This locks the entire loop, eliminating all parallelism. Each goroutine holds the lock for 1000 iterations. Other goroutines cannot make progress until the lock is released.
+This locks the entire loop, eliminating all parallelism. Each goroutine holds the lock for 1000 iterations.
 
 **Better:** Lock only the specific operation that needs protection:
 ```go
@@ -191,9 +252,21 @@ mu2 := mu // BUG: mu2 is a copy, not the same mutex
 ```
 Never copy a `sync.Mutex` after first use. Pass mutexes by pointer, or embed them in a struct.
 
+### Double-Locking from the Same Goroutine
+```go
+mu.Lock()
+// ... some code that calls another function ...
+mu.Lock() // DEADLOCK: same goroutine already holds the lock
+```
+`sync.Mutex` is NOT reentrant. Calling `Lock()` twice from the same goroutine without an `Unlock()` in between causes a deadlock.
+
 ## Verify What You Learned
 
-1. Run `go run -race main.go` and confirm zero race warnings for the mutex-protected functions
+```bash
+go run -race main.go
+```
+
+1. Confirm zero race warnings for all mutex-protected functions
 2. What happens if you call `Lock()` twice from the same goroutine without `Unlock()`?
 3. Why is `defer mu.Unlock()` preferred over calling `mu.Unlock()` explicitly?
 4. What is the tradeoff of using a mutex for this counter problem?
@@ -205,6 +278,7 @@ Continue to [04-fix-race-with-channel](../04-fix-race-with-channel/04-fix-race-w
 - `sync.Mutex` provides mutual exclusion: only one goroutine enters the critical section at a time
 - Always pair `Lock()` with `Unlock()`; prefer `defer mu.Unlock()` for safety
 - Extract critical sections into small functions to make the locking scope explicit
+- Encapsulate the mutex inside a struct to prevent callers from forgetting to lock
 - The mutex establishes happens-before relationships that satisfy the race detector
 - Tradeoff: mutexes add contention, reducing parallelism, but guarantee correctness
 - Verify with `go run -race main.go` to confirm the race is eliminated

@@ -5,13 +5,59 @@ import (
 	"time"
 )
 
-// ============================================================
-// Step 1: The fragile sleep version
-// Run this and observe that worker 3 never prints "done".
-// ============================================================
+// This program demonstrates replacing fragile time.Sleep with channel synchronization.
+// Run: go run main.go
+//
+// Expected output:
+//   === Example 1: Fragile Sleep (Worker 3 Lost) ===
+//   Worker 1: starting
+//   Worker 2: starting
+//   Worker 3: starting
+//   Worker 1: done
+//   Worker 2: done
+//   main: exiting (worker 3 lost!)
+//
+//   === Example 2: Done Channel (All Workers Complete) ===
+//   Worker 1: starting
+//   Worker 2: starting
+//   Worker 3: starting
+//   Worker 1: done
+//   Worker 2: done
+//   Worker 3: done
+//   main: all workers completed
+//
+//   === Example 3: Signal Without Data (chan struct{}) ===
+//   Worker 1: finished task
+//   Worker 2: finished task
+//   Worker 3: finished task
+//   all 3 workers confirmed done
+//
+//   === Example 4: Collecting Results Through Channels ===
+//   Worker 1 result: data-from-1
+//   Worker 2 result: data-from-2
+//   Worker 3 result: data-from-3
+//
+//   === Example 5: Reliable Processor (Elapsed ~ Slowest Worker) ===
+//   Task 1: working for 200ms
+//   Task 2: working for 400ms
+//   Task 3: working for 600ms
+//   Task 4: working for 800ms
+//   Task 5: working for 1000ms
+//   ...
+//   Total time: ~1s (not ~3s)
 
-func fragileVersion() {
-	fmt.Println("--- Fragile Sleep Version ---")
+func main() {
+	example1FragileSleep()
+	example2DoneChannel()
+	example3SignalWithStruct()
+	example4CollectResults()
+	example5ReliableProcessor()
+}
+
+// example1FragileSleep shows how time.Sleep is a guess, not a guarantee.
+// Worker 3 needs 300ms but main only waits 200ms, so its "done" message is lost.
+func example1FragileSleep() {
+	fmt.Println("=== Example 1: Fragile Sleep (Worker 3 Lost) ===")
 
 	worker := func(id int) {
 		fmt.Printf("Worker %d: starting\n", id)
@@ -23,126 +69,125 @@ func fragileVersion() {
 		go worker(i)
 	}
 
-	// This only waits 200ms, but worker 3 needs 300ms
+	// This only waits 200ms. Worker 3 needs 300ms, so its output is lost.
+	// In production, this means lost data, incomplete operations, or silent failures.
 	time.Sleep(200 * time.Millisecond)
-	fmt.Println("main: exiting (some workers lost!)")
+	fmt.Println("main: exiting (worker 3 lost!)")
+	fmt.Println()
 }
 
-// ============================================================
-// Step 2: Convert to done channel (chan bool)
-// Fix fragileVersion by using a done channel.
-// ============================================================
+// example2DoneChannel replaces time.Sleep with a deterministic done channel.
+// Each worker signals completion. Main receives exactly N signals, one per worker.
+// This guarantees ALL workers finish before main proceeds, regardless of timing.
+func example2DoneChannel() {
+	fmt.Println("=== Example 2: Done Channel (All Workers Complete) ===")
 
-func doneChannelVersion() {
-	fmt.Println("--- Done Channel Version ---")
+	done := make(chan bool)
 
-	// TODO: Create a done channel of type chan bool
-
-	workerWithSignal := func(id int, done chan bool) {
+	worker := func(id int) {
 		fmt.Printf("Worker %d: starting\n", id)
 		time.Sleep(time.Duration(id*100) * time.Millisecond)
 		fmt.Printf("Worker %d: done\n", id)
-		// TODO: Signal completion on the done channel
+		// Signal completion. The value doesn't matter -- we just need the synchronization.
+		done <- true
 	}
 
 	for i := 1; i <= 3; i++ {
-		// TODO: Launch goroutine with workerWithSignal
-		_ = workerWithSignal // remove when used
+		go worker(i)
 	}
 
-	// TODO: Wait for all 3 workers by receiving 3 times from done
+	// Receive once per worker. This blocks until ALL three have sent.
+	// It doesn't matter if a worker takes 1ms or 10 seconds -- we wait exactly as long as needed.
+	for i := 0; i < 3; i++ {
+		<-done
+	}
 	fmt.Println("main: all workers completed")
+	fmt.Println()
 }
 
-// ============================================================
-// Step 3: Use chan struct{} for signaling
-// Refactor to use struct{} instead of bool.
-// ============================================================
+// example3SignalWithStruct uses chan struct{} instead of chan bool for pure signaling.
+// struct{} is zero bytes -- it communicates intent: "this channel carries no data,
+// only synchronization." This is the idiomatic Go convention for done/quit channels.
+func example3SignalWithStruct() {
+	fmt.Println("=== Example 3: Signal Without Data (chan struct{}) ===")
 
-func structChannelVersion() {
-	fmt.Println("--- Struct Channel Version ---")
+	done := make(chan struct{})
 
-	// TODO: Create done channel as chan struct{}
+	for i := 1; i <= 3; i++ {
+		go func(id int) {
+			time.Sleep(time.Duration(id*50) * time.Millisecond)
+			fmt.Printf("Worker %d: finished task\n", id)
+			// struct{}{} is the zero-size value. It carries no information --
+			// the synchronization itself IS the message.
+			done <- struct{}{}
+		}(i)
+	}
 
-	// TODO: Launch 3 goroutines, each signaling done <- struct{}{}
-
-	// TODO: Wait for all 3
-
-	fmt.Println("main: all workers completed (struct version)")
+	for i := 0; i < 3; i++ {
+		<-done
+	}
+	fmt.Println("all 3 workers confirmed done")
+	fmt.Println()
 }
 
-// ============================================================
-// Step 4: Waiting for N goroutines
-// ============================================================
+// example4CollectResults shows a more practical pattern: goroutines send actual
+// results back through a channel, not just completion signals. This combines
+// synchronization with data transfer.
+func example4CollectResults() {
+	fmt.Println("=== Example 4: Collecting Results Through Channels ===")
 
-func waitForN(n int) {
-	fmt.Printf("--- Waiting for %d Workers ---\n", n)
+	type Result struct {
+		WorkerID int
+		Data     string
+	}
 
-	// TODO: Create done channel
+	results := make(chan Result)
 
-	// TODO: Launch n goroutines, each:
-	//   - Prints "Worker <id>: processing"
-	//   - Sleeps for id*50 ms
-	//   - Prints "Worker <id>: finished"
-	//   - Signals done
+	for i := 1; i <= 3; i++ {
+		go func(id int) {
+			// Simulate work that produces a result.
+			time.Sleep(time.Duration(id*50) * time.Millisecond)
+			results <- Result{
+				WorkerID: id,
+				Data:     fmt.Sprintf("data-from-%d", id),
+			}
+		}(i)
+	}
 
-	// TODO: Receive n times from done
-
-	fmt.Println("All workers completed")
-	_ = n // remove when used
+	// Collect all results. Each receive both synchronizes AND transfers data.
+	for i := 0; i < 3; i++ {
+		r := <-results
+		fmt.Printf("Worker %d result: %s\n", r.WorkerID, r.Data)
+	}
+	fmt.Println()
 }
 
-// ============================================================
-// Final Challenge: reliableProcessor
-// Launch 5 goroutines with variable work durations.
-// Wait for ALL to complete using channels (no time.Sleep).
-// Print total elapsed time — should be ~= slowest worker.
-// ============================================================
+// example5ReliableProcessor launches N goroutines with variable work times and
+// waits for ALL to complete. Total elapsed time equals the slowest worker (parallel),
+// not the sum of all workers (sequential).
+func example5ReliableProcessor() {
+	fmt.Println("=== Example 5: Reliable Processor (Elapsed ~ Slowest Worker) ===")
 
-func reliableProcessor() {
-	fmt.Println("--- Reliable Processor ---")
 	start := time.Now()
+	done := make(chan struct{})
+	numTasks := 5
 
-	// TODO: Create a done channel
-
-	// TODO: Launch 5 goroutines where goroutine i sleeps for i*200ms
-	// Each should print: "Task <i>: working for <duration>"
-	// And when done: "Task <i>: complete"
-
-	// TODO: Wait for all 5 goroutines
-
-	elapsed := time.Since(start)
-	fmt.Printf("Total time: %v (should be ~1s, not ~3s)\n", elapsed.Round(time.Millisecond*100))
-}
-
-func main() {
-	step1 := true
-	step2 := false // set to true as you progress
-	step3 := false
-	step4 := false
-	final := false
-
-	if step1 {
-		fragileVersion()
-		fmt.Println()
+	for i := 1; i <= numTasks; i++ {
+		go func(id int) {
+			duration := time.Duration(id*200) * time.Millisecond
+			fmt.Printf("Task %d: working for %v\n", id, duration)
+			time.Sleep(duration)
+			fmt.Printf("Task %d: complete\n", id)
+			done <- struct{}{}
+		}(i)
 	}
 
-	if step2 {
-		doneChannelVersion()
-		fmt.Println()
+	// Wait for all tasks. The total time is ~1s (the slowest task),
+	// NOT ~3s (sum of 200+400+600+800+1000ms) because they run concurrently.
+	for i := 0; i < numTasks; i++ {
+		<-done
 	}
 
-	if step3 {
-		structChannelVersion()
-		fmt.Println()
-	}
-
-	if step4 {
-		waitForN(5)
-		fmt.Println()
-	}
-
-	if final {
-		reliableProcessor()
-	}
+	elapsed := time.Since(start).Round(100 * time.Millisecond)
+	fmt.Printf("Total time: %v (parallel -- not the sum of all durations)\n", elapsed)
 }

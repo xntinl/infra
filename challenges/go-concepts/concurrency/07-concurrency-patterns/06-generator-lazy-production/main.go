@@ -1,80 +1,186 @@
 package main
 
-// Exercise: Generator -- Lazy Production
-// Instructions: see 06-generator-lazy-production.md
+// Generator: Lazy Production -- Complete Working Example
+//
+// A generator is a function that returns <-chan T and produces values in
+// a background goroutine. The consumer drives the pace: if the consumer
+// stops reading, the generator blocks on send. This is lazy evaluation
+// through backpressure.
+//
+// Expected output:
+//   Range [1,5]: 1 2 3 4 5
+//
+//   First 10 Fibonacci: [0 1 1 2 3 5 8 13 21 34]
+//
+//   First 10 Fibonacci (cancelable): [0 1 1 2 3 5 8 13 21 34]
+//
+//   Squares: [0 1 4 9 16 25 36 49]
+//   Powers of 2: [1 2 4 8 16 32 64 128]
+//
+//   First 15 primes: [2 3 5 7 11 13 17 19 23 29 31 37 41 43 47]
 
 import "fmt"
 
-// Step 1: Implement rangeGen.
-// Returns a channel that lazily produces integers from start to end (inclusive).
-// Close the channel after the last value.
+// ---------------------------------------------------------------------------
+// rangeGen: finite generator that produces integers from start to end.
+// The unbuffered channel means values are produced lazily -- the goroutine
+// blocks on each send until the consumer reads.
+// ---------------------------------------------------------------------------
+
 func rangeGen(start, end int) <-chan int {
 	out := make(chan int)
-	// TODO: launch goroutine that sends start..end, then closes out
 	go func() {
-		close(out)
+		for i := start; i <= end; i++ {
+			out <- i
+		}
+		close(out) // Signal: no more values. Lets `range` loop exit.
 	}()
 	return out
 }
 
-// Step 2: Implement fibonacci (infinite generator).
-// Returns a channel that produces Fibonacci numbers forever.
-// The goroutine blocks on send when the consumer is not reading.
+// ---------------------------------------------------------------------------
+// fibonacci: infinite generator for the Fibonacci sequence.
+// The goroutine runs forever, but it only produces a value when the
+// consumer is ready to receive. No CPU or memory is wasted on values
+// that will never be consumed.
+//
+// WARNING: This version leaks the goroutine after the consumer stops
+// reading. The goroutine blocks on `out <- a` with no way to unblock.
+// See fibonacciWithDone below for the fix.
+// ---------------------------------------------------------------------------
+
 func fibonacci() <-chan int {
 	out := make(chan int)
-	// TODO: launch goroutine: a, b := 0, 1; loop forever sending a, then a, b = b, a+b
 	go func() {
-		close(out)
+		a, b := 0, 1
+		for {
+			out <- a
+			a, b = b, a+b
+		}
+		// Never closes -- this goroutine runs until the process exits
+		// or (in the leak case) it blocks forever on send.
 	}()
 	return out
 }
 
-// take consumes exactly n values from a channel.
+// ---------------------------------------------------------------------------
+// take: consumes exactly n values from a channel.
+// This is the standard way to limit consumption from an infinite generator.
+// ---------------------------------------------------------------------------
+
 func take(n int, in <-chan int) []int {
 	result := make([]int, 0, n)
-	// TODO: read n values from in (break if channel closes early)
-	_ = in
+	for i := 0; i < n; i++ {
+		v, ok := <-in
+		if !ok {
+			break // channel was closed before we got n values
+		}
+		result = append(result, v)
+	}
 	return result
 }
 
-// Step 3: Implement fibonacciWithDone.
-// Same as fibonacci but accepts a done channel for cancellation.
-// Use select to listen for both send and done.
+// ---------------------------------------------------------------------------
+// fibonacciWithDone: production-quality infinite generator.
+// Accepts a done channel for cancellation. The select statement lets the
+// goroutine exit cleanly when the consumer closes done.
+//
+// Rule: EVERY infinite generator must accept a cancellation signal.
+// Without it, you leak goroutines in long-running programs.
+// ---------------------------------------------------------------------------
+
 func fibonacciWithDone(done <-chan struct{}) <-chan int {
 	out := make(chan int)
-	// TODO: launch goroutine with select { case out <- a: ... case <-done: return }
-	// TODO: defer close(out) inside the goroutine
 	go func() {
-		defer close(out)
-		_ = done
+		defer close(out) // Single exit path with defer.
+		a, b := 0, 1
+		for {
+			select {
+			case out <- a:
+				// Consumer received the value. Advance the sequence.
+				a, b = b, a+b
+			case <-done:
+				// Consumer is done. Exit the goroutine cleanly.
+				return
+			}
+		}
 	}()
 	return out
 }
 
-// Step 4: Implement generateFrom (higher-order generator).
-// Accepts a done channel and a function fn(index) -> value.
-// Produces fn(0), fn(1), fn(2), ... until done is closed.
+// ---------------------------------------------------------------------------
+// generateFrom: higher-order generator.
+// Accepts a function fn(index)->value and produces fn(0), fn(1), fn(2)...
+// until done is closed. This is the general-purpose generator factory.
+// ---------------------------------------------------------------------------
+
 func generateFrom(done <-chan struct{}, fn func(int) int) <-chan int {
 	out := make(chan int)
-	// TODO: launch goroutine with index counter, select on out <- fn(i) and <-done
 	go func() {
 		defer close(out)
-		_ = done
-		_ = fn
+		i := 0
+		for {
+			select {
+			case out <- fn(i):
+				i++
+			case <-done:
+				return
+			}
+		}
 	}()
 	return out
 }
 
-// Verify: Implement a prime sieve generator.
-// filterMultiples reads from in and forwards only values not divisible by prime.
-func filterMultiples(done <-chan struct{}, in <-chan int, prime int) <-chan int {
+// ---------------------------------------------------------------------------
+// Prime sieve: a chain of goroutines, each filtering out multiples of a
+// prime. This is the classic concurrent prime sieve from Hoare's CSP.
+//
+//   numbers(2,3,4,...) -> filter(2) -> filter(3) -> filter(5) -> ...
+//                          |            |            |
+//                          2            3            5     (primes)
+//
+// Each time we read a value from the chain, it is prime (it survived all
+// previous filters). We then attach a new filter for that prime.
+// ---------------------------------------------------------------------------
+
+// naturalsFrom produces an infinite stream of integers starting at start.
+func naturalsFrom(done <-chan struct{}, start int) <-chan int {
 	out := make(chan int)
-	// TODO: launch goroutine that ranges over in, forwards n if n%prime != 0
-	// TODO: use select with done for cancellation
 	go func() {
 		defer close(out)
-		_ = done
-		_ = prime
+		for i := start; ; i++ {
+			select {
+			case out <- i:
+			case <-done:
+				return
+			}
+		}
+	}()
+	return out
+}
+
+// filterMultiples forwards only values not divisible by prime.
+func filterMultiples(done <-chan struct{}, in <-chan int, prime int) <-chan int {
+	out := make(chan int)
+	go func() {
+		defer close(out)
+		for {
+			select {
+			case n, ok := <-in:
+				if !ok {
+					return
+				}
+				if n%prime != 0 {
+					select {
+					case out <- n:
+					case <-done:
+						return
+					}
+				}
+			case <-done:
+				return
+			}
+		}
 	}()
 	return out
 }
@@ -82,35 +188,47 @@ func filterMultiples(done <-chan struct{}, in <-chan int, prime int) <-chan int 
 // primes returns the first n primes using a sieve of goroutines.
 func primes(n int) []int {
 	result := make([]int, 0, n)
-	// TODO: create done channel
-	// TODO: create a generator for 2, 3, 4, 5, ...
-	// TODO: loop n times: read a prime, add filterMultiples stage to the chain
-	// TODO: close done to clean up all goroutines
-	_ = n
+	done := make(chan struct{})
+
+	// Start with the stream 2, 3, 4, 5, ...
+	ch := naturalsFrom(done, 2)
+
+	for i := 0; i < n; i++ {
+		// The first value to survive all filters is prime.
+		prime := <-ch
+		result = append(result, prime)
+		// Attach a new filter that removes multiples of this prime.
+		ch = filterMultiples(done, ch, prime)
+	}
+
+	// Clean up all goroutines in the sieve chain.
+	close(done)
 	return result
 }
 
 func main() {
-	fmt.Println("Exercise: Generator -- Lazy Production\n")
+	fmt.Println("Exercise: Generator -- Lazy Production")
+	fmt.Println()
 
-	// Step 1: finite generator
+	// Finite generator
 	fmt.Print("Range [1,5]: ")
 	for v := range rangeGen(1, 5) {
 		fmt.Printf("%d ", v)
 	}
-	fmt.Println("\n")
+	fmt.Println()
+	fmt.Println()
 
-	// Step 2: infinite generator (leaks goroutine -- fixed in Step 3)
+	// Infinite generator (leaks -- educational, see Step 3 for fix)
 	fmt.Printf("First 10 Fibonacci: %v\n\n", take(10, fibonacci()))
 
-	// Step 3: cancelable generator
+	// Cancelable infinite generator (no leak)
 	done := make(chan struct{})
 	fib := fibonacciWithDone(done)
 	result := take(10, fib)
-	close(done) // signal generator to stop
+	close(done) // Signal generator to stop -- goroutine exits cleanly.
 	fmt.Printf("First 10 Fibonacci (cancelable): %v\n\n", result)
 
-	// Step 4: higher-order generators
+	// Higher-order generators
 	done2 := make(chan struct{})
 	squares := generateFrom(done2, func(i int) int { return i * i })
 	fmt.Printf("Squares: %v\n", take(8, squares))
@@ -127,6 +245,6 @@ func main() {
 	fmt.Printf("Powers of 2: %v\n\n", take(8, powersOf2))
 	close(done3)
 
-	// Verify: prime sieve
+	// Prime sieve
 	fmt.Printf("First 15 primes: %v\n", primes(15))
 }

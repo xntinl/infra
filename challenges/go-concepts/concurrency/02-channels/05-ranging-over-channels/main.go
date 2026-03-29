@@ -5,12 +5,52 @@ import (
 	"strings"
 )
 
-// ============================================================
-// Step 1: Basic range over a channel
-// ============================================================
+// This program demonstrates for-range on channels and the producer-closes pattern.
+// Run: go run main.go
+//
+// Expected output:
+//   === Example 1: Basic Range Over Channel ===
+//   1
+//   2
+//   3
+//   4
+//   5
+//   Channel fully drained
+//
+//   === Example 2: Range Over Buffered Channel ===
+//   alpha
+//   beta
+//   gamma
+//   All buffered values consumed after close
+//
+//   === Example 3: Fibonacci Generator ===
+//   0 1 1 2 3 5 8 13 21 34
+//
+//   === Example 4: Pipeline with Range ===
+//   Squared: 1
+//   Squared: 4
+//   Squared: 9
+//   Squared: 16
+//   Squared: 25
+//
+//   === Example 5: Word Frequency Counter ===
+//   go: 2
+//   channels: 2
+//   ...
 
-func step1() {
-	fmt.Println("--- Step 1: Basic Range ---")
+func main() {
+	example1BasicRange()
+	example2BufferedRange()
+	example3FibonacciGenerator()
+	example4PipelineWithRange()
+	example5WordFrequencyCounter()
+}
+
+// example1BasicRange shows the simplest for-range loop on a channel.
+// range receives values one at a time and exits when the channel is closed
+// AND all values have been consumed.
+func example1BasicRange() {
+	fmt.Println("=== Example 1: Basic Range Over Channel ===")
 
 	ch := make(chan int)
 
@@ -18,152 +58,149 @@ func step1() {
 		for i := 1; i <= 5; i++ {
 			ch <- i
 		}
-		// TODO: Close the channel so range terminates
+		// close() is REQUIRED. Without it, range blocks forever waiting for more
+		// values, and Go's runtime detects a deadlock.
+		close(ch)
 	}()
 
-	// TODO: Use for-range to print all values from ch
-	// for val := range ch { ... }
-
-	fmt.Println("Channel drained")
+	// for val := range ch is equivalent to:
+	//   for { val, ok := <-ch; if !ok { break }; ... }
+	// It's cleaner and idiomatic.
+	for val := range ch {
+		fmt.Println(val)
+	}
+	fmt.Println("Channel fully drained")
+	fmt.Println()
 }
 
-// ============================================================
-// Step 2: Deadlock without close
-// Uncomment this to see the deadlock, then comment it back.
-// ============================================================
-
-func step2Deadlock() {
-	fmt.Println("--- Step 2: Deadlock Without Close ---")
-
-	// ch := make(chan int)
-	//
-	// go func() {
-	//     for i := 1; i <= 3; i++ {
-	//         ch <- i
-	//     }
-	//     // No close() — range will block forever!
-	// }()
-	//
-	// for val := range ch {
-	//     fmt.Println(val)
-	// }
-
-	fmt.Println("(uncomment code to observe deadlock)")
-}
-
-// ============================================================
-// Step 3: Range with buffered channel
-// ============================================================
-
-func step3() {
-	fmt.Println("--- Step 3: Buffered Channel Range ---")
+// example2BufferedRange proves that range on a closed buffered channel drains
+// all remaining values before exiting. Close doesn't discard queued data.
+func example2BufferedRange() {
+	fmt.Println("=== Example 2: Range Over Buffered Channel ===")
 
 	ch := make(chan string, 3)
 
-	// Send values and close — no goroutine needed since buffer has room
+	// No goroutine needed -- the buffer holds all three values.
 	ch <- "alpha"
 	ch <- "beta"
 	ch <- "gamma"
-	// TODO: Close the channel
+	close(ch) // close with 3 values still in the buffer
 
-	// TODO: Range over ch and print each value
+	// range consumes all three buffered values, then exits.
+	for val := range ch {
+		fmt.Println(val)
+	}
+	fmt.Println("All buffered values consumed after close")
+	fmt.Println()
 }
 
-// ============================================================
-// Step 4: Producer-closes, consumer-ranges
-// ============================================================
-
 // fibonacci returns a channel that produces the first n Fibonacci numbers.
-// The goroutine inside closes the channel when done.
+// The goroutine inside owns the channel lifecycle: it produces, then closes.
+// The consumer simply ranges over the channel -- no need to know the count.
 func fibonacci(n int) <-chan int {
 	ch := make(chan int)
-
 	go func() {
-		// TODO: Generate Fibonacci sequence
-		// a, b := 0, 1
-		// Send a, then shift: a, b = b, a+b
-		// Close channel when done
-
-		close(ch) // placeholder — move after generating values
+		a, b := 0, 1
+		for i := 0; i < n; i++ {
+			ch <- a
+			a, b = b, a+b
+		}
+		close(ch)
 	}()
-
 	return ch
 }
 
-func step4() {
-	fmt.Println("--- Step 4: Fibonacci Generator ---")
+// example3FibonacciGenerator demonstrates the producer-closes, consumer-ranges pattern.
+// The producer (fibonacci) decides how many values to produce and closes when done.
+// The consumer doesn't need to track count -- it just ranges.
+func example3FibonacciGenerator() {
+	fmt.Println("=== Example 3: Fibonacci Generator ===")
 
-	// TODO: Range over fibonacci(10) and print each number
-	fib := fibonacci(10)
-	_ = fib // replace with range loop
+	for num := range fibonacci(10) {
+		fmt.Printf("%d ", num)
+	}
+	fmt.Println()
+	fmt.Println()
 }
 
-// ============================================================
-// Final Challenge: Word Frequency Counter
-//
-// 1. generateLines() -> <-chan string (sends lines, closes)
-// 2. extractWords(lines) -> <-chan string (splits lines, closes)
-// 3. main counts word frequencies and prints them
-//
-// Lines:
-//   "go channels are powerful"
-//   "channels make concurrency safe"
-//   "go is powerful and safe"
-// ============================================================
+// square is a pipeline stage that reads ints, squares them, and writes to output.
+func square(in <-chan int, out chan<- int) {
+	for val := range in {
+		out <- val * val
+	}
+	close(out)
+}
+
+// example4PipelineWithRange demonstrates chaining range-based stages in a pipeline.
+// Each stage reads from its input until it's closed, processes, and closes its output.
+func example4PipelineWithRange() {
+	fmt.Println("=== Example 4: Pipeline with Range ===")
+
+	// Stage 1: generate numbers
+	nums := make(chan int)
+	go func() {
+		for i := 1; i <= 5; i++ {
+			nums <- i
+		}
+		close(nums)
+	}()
+
+	// Stage 2: square each number
+	squared := make(chan int)
+	go square(nums, squared)
+
+	// Stage 3: consume (runs in main goroutine)
+	for val := range squared {
+		fmt.Println("Squared:", val)
+	}
+	fmt.Println()
+}
+
+// --- Word frequency pipeline for Example 5 ---
 
 func generateLines() <-chan string {
 	ch := make(chan string)
-
 	go func() {
 		lines := []string{
 			"go channels are powerful",
 			"channels make concurrency safe",
 			"go is powerful and safe",
 		}
-		// TODO: Send each line, then close
-		_ = lines // remove when used
+		for _, line := range lines {
+			ch <- line
+		}
+		close(ch)
 	}()
-
 	return ch
 }
 
 func extractWords(lines <-chan string) <-chan string {
 	ch := make(chan string)
-
 	go func() {
-		// TODO: Range over lines
-		// For each line, split by space (strings.Fields)
-		// Send each word to ch
-		// Close ch when done
-
-		_ = strings.Fields // remove when used
+		for line := range lines {
+			for _, word := range strings.Fields(line) {
+				ch <- word
+			}
+		}
+		close(ch)
 	}()
-
 	return ch
 }
 
-func finalChallenge() {
-	fmt.Println("--- Final: Word Frequency Counter ---")
+// example5WordFrequencyCounter builds a two-stage pipeline (lines -> words)
+// and counts word frequencies in the final stage. This is a realistic example
+// of how range-based channel pipelines compose naturally.
+func example5WordFrequencyCounter() {
+	fmt.Println("=== Example 5: Word Frequency Counter ===")
 
-	// TODO: Wire generateLines -> extractWords -> count in main
-	// words := extractWords(generateLines())
-	// freq := make(map[string]int)
-	// for word := range words { freq[word]++ }
-	// Print each word and its count
-}
+	words := extractWords(generateLines())
 
-func main() {
-	step1()
-	fmt.Println()
+	freq := make(map[string]int)
+	for word := range words {
+		freq[word]++
+	}
 
-	step2Deadlock()
-	fmt.Println()
-
-	step3()
-	fmt.Println()
-
-	step4()
-	fmt.Println()
-
-	finalChallenge()
+	for word, count := range freq {
+		fmt.Printf("  %s: %d\n", word, count)
+	}
 }

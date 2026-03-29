@@ -29,15 +29,30 @@ Real-world use cases include: sending the same request to multiple replicas and 
 
 The pattern has three parts: launch N goroutines doing equivalent work, select the first result from any of them, and cancel the rest immediately. Without proper cancellation, the losing goroutines waste resources running to completion.
 
+```
+  Or-Channel Data Flow
+
+  request ---> server 1 (slow)     --+
+           --> server 2 (fast) ------+--> take first, cancel rest
+           --> server 3 (medium)  --+
+
+  The fastest response wins. Others are canceled via context.
+```
+
 ## Step 1 -- Basic First-Result Race
 
 Create multiple goroutines that simulate work with different durations and take the fastest result.
 
-Edit `main.go` and implement the `raceSimple` function:
-
 ```go
-func raceSimple() {
-    fmt.Println("=== Simple Race ===")
+package main
+
+import (
+    "fmt"
+    "math/rand"
+    "time"
+)
+
+func main() {
     type result struct {
         value  string
         source int
@@ -57,7 +72,7 @@ func raceSimple() {
     }
 
     winner := <-ch
-    fmt.Printf("  Winner: %s\n\n", winner.value)
+    fmt.Printf("Winner: %s\n", winner.value)
 }
 ```
 
@@ -69,8 +84,7 @@ go run main.go
 ```
 Expected: one winner, which worker wins varies between runs:
 ```
-=== Simple Race ===
-  Winner: result from worker 2 (took 73ms)
+Winner: result from worker 2 (took 73ms)
 ```
 
 ## Step 2 -- Race with Cancellation
@@ -78,8 +92,16 @@ Expected: one winner, which worker wins varies between runs:
 Use `context.WithCancel` to properly cancel losing goroutines:
 
 ```go
-func raceWithCancel() {
-    fmt.Println("=== Race with Cancellation ===")
+package main
+
+import (
+    "context"
+    "fmt"
+    "math/rand"
+    "time"
+)
+
+func main() {
     type result struct {
         value  int
         worker int
@@ -92,11 +114,9 @@ func raceWithCancel() {
 
     for i := 1; i <= 5; i++ {
         go func(id int) {
-            // Simulate work in a cancelable way
             duration := time.Duration(rand.Intn(300)+100) * time.Millisecond
             select {
             case <-time.After(duration):
-                // Work completed
                 select {
                 case ch <- result{value: id * 100, worker: id}:
                 case <-ctx.Done():
@@ -112,10 +132,9 @@ func raceWithCancel() {
 
     winner := <-ch
     cancel() // cancel all remaining workers
-    fmt.Printf("  Winner: worker %d with value %d\n", winner.worker, winner.value)
+    fmt.Printf("Winner: worker %d with value %d\n", winner.worker, winner.value)
 
     time.Sleep(50 * time.Millisecond) // let cancel messages print
-    fmt.Println()
 }
 ```
 
@@ -127,11 +146,8 @@ go run main.go
 ```
 Expected: one winner, other workers report cancellation:
 ```
-=== Race with Cancellation ===
   worker 3: canceled during work
-  worker 5: canceled during work
   Winner: worker 1 with value 100
-  worker 2: canceled before sending
   worker 4: canceled during work
 ```
 
@@ -140,6 +156,13 @@ Expected: one winner, other workers report cancellation:
 Implement a reusable `or` function that takes multiple `<-chan struct{}` channels and returns a channel that closes when any of them closes. This is the general-purpose "first signal wins" combiner.
 
 ```go
+package main
+
+import (
+    "fmt"
+    "time"
+)
+
 func or(channels ...<-chan struct{}) <-chan struct{} {
     switch len(channels) {
     case 0:
@@ -168,6 +191,28 @@ func or(channels ...<-chan struct{}) <-chan struct{} {
     }()
     return orDone
 }
+
+func sig(after time.Duration) <-chan struct{} {
+    ch := make(chan struct{})
+    go func() {
+        defer close(ch)
+        time.Sleep(after)
+    }()
+    return ch
+}
+
+func main() {
+    start := time.Now()
+    <-or(
+        sig(2*time.Second),
+        sig(500*time.Millisecond),
+        sig(1*time.Second),
+        sig(100*time.Millisecond), // fastest
+        sig(3*time.Second),
+    )
+    fmt.Printf("Signal received after %v (fastest was 100ms)\n",
+        time.Since(start).Round(time.Millisecond))
+}
 ```
 
 This recursive implementation handles any number of channels. The `orDone` channel is passed into the recursive call so that when one branch triggers, the entire tree collapses.
@@ -176,20 +221,25 @@ This recursive implementation handles any number of channels. The `orDone` chann
 ```bash
 go run main.go
 ```
-Test with signals at different delays:
 ```
-=== Or-Channel Function ===
-  Signal received after ~100ms (fastest signal was 100ms)
+Signal received after 100ms (fastest was 100ms)
 ```
 
 ## Step 4 -- Practical Application: Redundant Requests
 
-Simulate a real-world scenario where you send the same request to multiple backend servers and use the fastest response:
+Simulate sending the same request to multiple backend servers and using the fastest response:
 
 ```go
-func redundantRequests() {
-    fmt.Println("=== Redundant Requests ===")
+package main
 
+import (
+    "context"
+    "fmt"
+    "math/rand"
+    "time"
+)
+
+func main() {
     queryServer := func(ctx context.Context, serverID int) (string, error) {
         latency := time.Duration(rand.Intn(400)+100) * time.Millisecond
         select {
@@ -221,7 +271,7 @@ func redundantRequests() {
 
     resp := <-ch
     cancel()
-    fmt.Printf("  Fastest: %s\n\n", resp.data)
+    fmt.Printf("Fastest: %s\n", resp.data)
 }
 ```
 
@@ -236,12 +286,20 @@ Expected: the fastest server's response, varying between runs.
 ### Unbuffered Channel Causes Goroutine Leaks
 **Wrong:**
 ```go
-ch := make(chan result) // unbuffered
-for i := 0; i < 3; i++ {
-    go func() { ch <- work() }()
+package main
+
+import "fmt"
+
+func main() {
+    type result struct{ v int }
+    ch := make(chan result) // unbuffered
+    for i := 0; i < 3; i++ {
+        go func(id int) { ch <- result{id} }(i)
+    }
+    winner := <-ch
+    fmt.Println(winner)
+    // two goroutines are stuck trying to send forever
 }
-winner := <-ch // only reads one value
-// two goroutines are stuck trying to send
 ```
 **What happens:** The losing goroutines block on send forever because nobody reads their values.
 
@@ -262,7 +320,12 @@ If multiple goroutines finish at the same instant, only one value is read. The o
 
 ## Verify What You Learned
 
-Implement a `fetchWithTimeout` function that races a simulated API call against a timeout. If the API responds within the timeout, return the result. If not, return a timeout error. Use `context.WithTimeout` and verify both the success and timeout paths.
+Run `go run main.go` and verify:
+- Simple race: one winner reported
+- Race with cancellation: winner plus cancellation messages from losers
+- Or-channel: signal received in ~100ms (the fastest)
+- Redundant requests: fastest server responds
+- Fetch with timeout: some succeed, some time out (200ms limit)
 
 ## What's Next
 Continue to [08-tee-channel-split-stream](../08-tee-channel-split-stream/08-tee-channel-split-stream.md) to learn how to duplicate a channel stream for parallel processing.

@@ -38,56 +38,52 @@ The four conditions for deadlock (Coffman conditions):
 
 Breaking any one condition prevents deadlock. The most practical approach in Go is to break the **circular wait** by establishing a **consistent lock ordering**: always acquire locks in the same order, regardless of which goroutine is executing.
 
-## Step 1 -- Create a Deadlock
+## Step 1 -- Understand the Deadlock
 
-Open `main.go`. The `createDeadlock` function demonstrates a classic two-mutex deadlock:
+The `createDeadlock` function (commented out in main) demonstrates a classic two-mutex deadlock:
 
 ```go
-func createDeadlock() {
-    fmt.Println("=== Deadlock Demonstration ===")
-    fmt.Println("(This will freeze! Press Ctrl+C to kill.)")
+package main
 
-    var muA, muB sync.Mutex
-    var wg sync.WaitGroup
+import (
+	"fmt"
+	"sync"
+	"time"
+)
 
-    // Goroutine 1: locks A then B
-    wg.Add(1)
-    go func() {
-        defer wg.Done()
-        muA.Lock()
-        fmt.Println("G1: locked A")
-        time.Sleep(50 * time.Millisecond) // give G2 time to lock B
-        fmt.Println("G1: waiting for B...")
-        muB.Lock() // BLOCKED: G2 holds B
-        fmt.Println("G1: locked B")
-        muB.Unlock()
-        muA.Unlock()
-    }()
+func main() {
+	var muA, muB sync.Mutex
+	var wg sync.WaitGroup
 
-    // Goroutine 2: locks B then A (OPPOSITE ORDER)
-    wg.Add(1)
-    go func() {
-        defer wg.Done()
-        muB.Lock()
-        fmt.Println("G2: locked B")
-        time.Sleep(50 * time.Millisecond) // give G1 time to lock A
-        fmt.Println("G2: waiting for A...")
-        muA.Lock() // BLOCKED: G1 holds A
-        fmt.Println("G2: locked A")
-        muA.Unlock()
-        muB.Unlock()
-    }()
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		muA.Lock()
+		fmt.Println("G1: locked A")
+		time.Sleep(50 * time.Millisecond) // give G2 time to lock B
+		fmt.Println("G1: waiting for B...")
+		muB.Lock() // BLOCKED: G2 holds B
+		muB.Unlock()
+		muA.Unlock()
+	}()
 
-    wg.Wait() // never returns
-    fmt.Println("This line is never reached.")
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		muB.Lock()
+		fmt.Println("G2: locked B")
+		time.Sleep(50 * time.Millisecond) // give G1 time to lock A
+		fmt.Println("G2: waiting for A...")
+		muA.Lock() // BLOCKED: G1 holds A
+		muA.Unlock()
+		muB.Unlock()
+	}()
+
+	wg.Wait() // never returns
 }
 ```
 
-### Intermediate Verification
-```bash
-go run main.go
-```
-Expected output:
+Expected output (then freeze):
 ```
 G1: locked A
 G2: locked B
@@ -96,17 +92,16 @@ G2: waiting for A...
 fatal error: all goroutines are asleep - deadlock!
 ```
 
-Go's runtime detects the deadlock because all goroutines are blocked. Note: this only works when ALL goroutines are blocked. If even one goroutine is running (e.g., an HTTP server), the runtime will not detect the deadlock.
+### Intermediate Verification
+Uncomment `createDeadlock()` in `main.go` to see it. Press Ctrl+C to kill. Go's runtime detects the deadlock because ALL goroutines are blocked.
 
-## Step 2 -- Analyze the Deadlock
-
-Before fixing, analyze the circular wait:
+## Step 2 -- Analyze the Circular Wait
 
 ```
 Timeline:
-  T0: G1 locks A, G2 locks B
-  T1: G1 wants B (held by G2) -- BLOCKED
-      G2 wants A (held by G1) -- BLOCKED
+  T0: G1 locks A, G2 locks B         (both succeed)
+  T1: G1 wants B (held by G2)        -- G1 BLOCKED
+      G2 wants A (held by G1)        -- G2 BLOCKED
 
   G1 --> waits for B --> held by G2
   G2 --> waits for A --> held by G1
@@ -116,103 +111,157 @@ Timeline:
 
 The root cause: G1 acquires locks in order `A, B` while G2 acquires them in order `B, A`. This inconsistency creates the possibility of circular wait.
 
-### Intermediate Verification
-Understand the diagram above. Trace through the code manually and confirm the circular dependency.
-
 ## Step 3 -- Fix with Consistent Lock Ordering
 
-Implement `fixedWithOrdering` using a consistent lock order:
+Both goroutines must acquire locks in the SAME order:
 
 ```go
-func fixedWithOrdering() {
-    fmt.Println("\n=== Fixed: Consistent Lock Ordering ===")
+package main
 
-    var muA, muB sync.Mutex
-    var wg sync.WaitGroup
+import (
+	"fmt"
+	"sync"
+	"time"
+)
 
-    // Both goroutines acquire locks in the SAME order: A then B
+func main() {
+	var muA, muB sync.Mutex
+	var wg sync.WaitGroup
 
-    wg.Add(1)
-    go func() {
-        defer wg.Done()
-        muA.Lock() // always A first
-        fmt.Println("G1: locked A")
-        time.Sleep(50 * time.Millisecond)
-        muB.Lock() // then B
-        fmt.Println("G1: locked B")
-        muB.Unlock()
-        muA.Unlock()
-        fmt.Println("G1: released both locks")
-    }()
+	// Both goroutines: always A first, then B
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		muA.Lock()
+		fmt.Println("G1: locked A")
+		time.Sleep(50 * time.Millisecond)
+		muB.Lock()
+		fmt.Println("G1: locked B")
+		muB.Unlock()
+		muA.Unlock()
+		fmt.Println("G1: released both")
+	}()
 
-    wg.Add(1)
-    go func() {
-        defer wg.Done()
-        muA.Lock() // always A first (same order as G1!)
-        fmt.Println("G2: locked A")
-        time.Sleep(50 * time.Millisecond)
-        muB.Lock() // then B
-        fmt.Println("G2: locked B")
-        muB.Unlock()
-        muA.Unlock()
-        fmt.Println("G2: released both locks")
-    }()
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		muA.Lock() // same order as G1
+		fmt.Println("G2: locked A")
+		time.Sleep(50 * time.Millisecond)
+		muB.Lock()
+		fmt.Println("G2: locked B")
+		muB.Unlock()
+		muA.Unlock()
+		fmt.Println("G2: released both")
+	}()
 
-    wg.Wait()
-    fmt.Println("No deadlock! Both goroutines completed.")
+	wg.Wait()
+	fmt.Println("No deadlock!")
 }
+```
+
+Expected output:
+```
+G1: locked A
+G1: locked B
+G1: released both
+G2: locked A
+G2: locked B
+G2: released both
+No deadlock!
 ```
 
 ### Intermediate Verification
 ```bash
 go run main.go
 ```
-Both goroutines should complete successfully. One will run first (acquiring A then B), then the other.
+Both goroutines complete. One runs first (holding A then B), then the other.
 
-## Step 4 -- Realistic Example: Transfer Between Accounts
+## Step 4 -- Realistic Example: Safe Account Transfers
 
-Implement a money transfer between accounts that requires locking both accounts:
+Transfer money between accounts by always locking the lower-ID account first:
 
 ```go
+package main
+
+import (
+	"fmt"
+	"sync"
+)
+
 type Account struct {
-    id      int
-    mu      sync.Mutex
-    balance int
+	id      int
+	mu      sync.Mutex
+	balance int
 }
 
 func transferSafe(from, to *Account, amount int) bool {
-    // Always lock the account with the lower ID first
-    first, second := from, to
-    if from.id > to.id {
-        first, second = to, from
-    }
+	// Always lock the lower-ID account first
+	first, second := from, to
+	if from.id > to.id {
+		first, second = to, from
+	}
 
-    first.mu.Lock()
-    defer first.mu.Unlock()
-    second.mu.Lock()
-    defer second.mu.Unlock()
+	first.mu.Lock()
+	defer first.mu.Unlock()
+	second.mu.Lock()
+	defer second.mu.Unlock()
 
-    if from.balance < amount {
-        return false
-    }
-    from.balance -= amount
-    to.balance += amount
-    return true
+	if from.balance < amount {
+		return false
+	}
+	from.balance -= amount
+	to.balance += amount
+	return true
+}
+
+func main() {
+	accounts := []*Account{
+		{id: 1, balance: 1000},
+		{id: 2, balance: 1000},
+		{id: 3, balance: 1000},
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 200; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			from := accounts[i%3]
+			to := accounts[(i+1)%3]
+			transferSafe(from, to, 10)
+		}(i)
+	}
+
+	wg.Wait()
+
+	total := 0
+	for _, a := range accounts {
+		fmt.Printf("Account %d: %d\n", a.id, a.balance)
+		total += a.balance
+	}
+	fmt.Printf("Total: %d (should be 3000)\n", total)
 }
 ```
 
-The key insight: by always locking the lower-ID account first, no two goroutines can create a circular wait, regardless of which direction the transfer goes.
+Expected output:
+```
+Account 1: XXX
+Account 2: XXX
+Account 3: XXX
+Total: 3000 (should be 3000)
+```
 
 ### Intermediate Verification
 ```bash
 go run -race main.go
 ```
-Run 100 concurrent transfers between accounts. All should complete without deadlock or data races. Total money in the system should remain constant.
+No deadlocks, no data races. Total money is conserved.
 
 ## Common Mistakes
 
 ### Locking Based on Caller Order
-**Wrong:**
+
 ```go
 func transfer(from, to *Account, amount int) {
     from.mu.Lock()   // depends on which account is "from"
@@ -220,6 +269,7 @@ func transfer(from, to *Account, amount int) {
     // ...
 }
 ```
+
 **What happens:** `transfer(A, B, 100)` and `transfer(B, A, 50)` running concurrently create a deadlock.
 
 **Fix:** Lock based on a stable ordering (ID, address, etc.), not the parameter names.
@@ -231,6 +281,7 @@ Go's deadlock detector only triggers when ALL goroutines are blocked. In a real 
 Acquiring more locks while already holding one is inherently risky. Minimize nested locking. If you must, document the lock ordering invariant clearly.
 
 ### Trying to Detect Deadlocks with Timeouts
+
 ```go
 // Tempting but fragile
 select {
@@ -238,6 +289,7 @@ case <-time.After(5 * time.Second):
     log.Fatal("possible deadlock")
 }
 ```
+
 This hides the real problem. Fix the lock ordering instead.
 
 ## Verify What You Learned

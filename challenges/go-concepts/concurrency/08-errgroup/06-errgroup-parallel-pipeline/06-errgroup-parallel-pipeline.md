@@ -13,7 +13,7 @@ prerequisites: [errgroup basics, errgroup WithContext, errgroup SetLimit, channe
 - Go 1.22+ installed
 - Completed exercises 01-05 of this section
 - Understanding of channel-based pipelines (send on one channel, receive on another)
-- Familiarity with producer-consumer pattern
+- Familiarity with the producer-consumer pattern
 - Context cancellation and cooperative shutdown
 
 ## Learning Objectives
@@ -24,10 +24,11 @@ After completing this exercise, you will be able to:
 - **Apply** SetLimit to control parallelism within a pipeline stage
 
 ## Why Errgroup Pipelines
+
 Real-world data processing often follows a pipeline pattern: produce data, process it in parallel, aggregate the results. Each stage can fail independently. Without errgroup, you need to manually coordinate goroutine shutdown, channel closing, and error propagation across stages -- a notoriously error-prone task.
 
 By using errgroup with context, you get a clean architecture:
-- Each stage is a set of goroutines managed by a single errgroup
+- Each stage is a goroutine (or set of goroutines) managed by a single errgroup
 - A shared context connects all stages: when one fails, the context is cancelled, and all stages shut down
 - Channels connect stages, with proper close semantics handled by the producing stage
 - `SetLimit` controls parallelism within the processing stage
@@ -36,37 +37,51 @@ The pattern is: **Producer -> Channel -> Worker Pool -> Channel -> Aggregator**,
 
 ## Step 1 -- Understand the Pipeline Architecture
 
-Run the starter code:
+The pipeline processes orders through three stages:
+
+```
+[Producer] --ordersCh--> [Worker Pool (bounded)] --resultsCh--> [Aggregator]
+     |                           |                                    |
+     +------ shared context (errgroup.WithContext) -------------------+
+```
+
+Run the program:
 
 ```bash
 go mod tidy
 go run main.go
 ```
 
-The program outlines a three-stage pipeline:
-1. **Producer**: Generates work items and sends them on a channel
-2. **Processor Pool**: Multiple workers read from the input channel, process items, and send results on an output channel
-3. **Aggregator**: Reads from the output channel and collects final results
-
-Study the `Order` and `ProcessedOrder` types in `main.go`. The pipeline simulates order processing: receive orders, validate and enrich them in parallel, then aggregate statistics.
-
-### Intermediate Verification
-The program compiles and shows the pipeline structure. The stages are stubbed out.
+You see orders flowing through all three stages, with workers processing in parallel.
 
 ## Step 2 -- Build the Producer Stage
 
-Implement the `producer` function that generates orders and sends them on a channel:
+The producer sends orders on a channel and closes it when done. The `defer close(out)` is critical -- without it, the workers' `range` loop never ends and the pipeline deadlocks.
 
 ```go
+package main
+
+import (
+    "context"
+    "fmt"
+)
+
+// Order represents an incoming order.
+type Order struct {
+    ID       int
+    Customer string
+    Amount   float64
+}
+
 func producer(ctx context.Context, orders []Order, out chan<- Order) error {
-    defer close(out) // CRITICAL: close channel when done producing
+    defer close(out) // CRITICAL: signals workers that no more orders are coming
 
     for _, order := range orders {
         select {
         case <-ctx.Done():
-            return ctx.Err()
+            return ctx.Err() // pipeline cancelled -- stop producing
         case out <- order:
-            fmt.Printf("  [producer] sent order %d\n", order.ID)
+            fmt.Printf("  [producer] sent order %d (%s)\n", order.ID, order.Customer)
         }
     }
     return nil
@@ -74,24 +89,40 @@ func producer(ctx context.Context, orders []Order, out chan<- Order) error {
 ```
 
 Key points:
-- The producer closes the output channel when done (or on error). This signals downstream stages that no more items are coming.
-- The `select` on `ctx.Done()` allows the producer to stop if the pipeline is cancelled.
-- The producer is launched as a single goroutine within the errgroup.
+- `defer close(out)` at the top -- ensures the channel is closed even if the function returns early due to cancellation
+- `select` on `ctx.Done()` -- allows the producer to stop if a downstream stage fails
+- The producer is launched as a single goroutine in the errgroup
 
-### Intermediate Verification
-Add the producer to the pipeline and verify that orders flow into the channel. The processor and aggregator can be stubs that drain the channel.
+## Step 3 -- Build the Worker Pool
 
-## Step 3 -- Build the Processor Pool
-
-Implement the `processorPool` function. This is the parallelized stage with multiple workers:
+The worker pool is the parallelized stage. It uses an inner errgroup with `SetLimit` to control concurrency:
 
 ```go
+package main
+
+import (
+    "context"
+    "fmt"
+    "math/rand"
+    "time"
+
+    "golang.org/x/sync/errgroup"
+)
+
+// ProcessedOrder is the result after validation and tax calculation.
+type ProcessedOrder struct {
+    ID       int
+    Customer string
+    Total    float64
+    Status   string
+}
+
 func processorPool(ctx context.Context, numWorkers int, in <-chan Order, out chan<- ProcessedOrder) error {
     var g errgroup.Group
     g.SetLimit(numWorkers)
 
     for order := range in {
-        order := order // capture
+        order := order // capture for the closure
         g.Go(func() error {
             select {
             case <-ctx.Done():
@@ -108,70 +139,127 @@ func processorPool(ctx context.Context, numWorkers int, in <-chan Order, out cha
             case <-ctx.Done():
                 return ctx.Err()
             case out <- result:
+                fmt.Printf("  [worker] processed order %d: $%.2f\n", result.ID, result.Total)
             }
             return nil
         })
     }
 
-    // Wait for all workers to finish before closing the output channel
+    // Wait for ALL workers to finish, THEN close the output channel
     err := g.Wait()
-    close(out) // signal aggregator that no more results are coming
+    close(out) // safe: all workers are done
     return err
+}
+
+func processOrder(order Order) (ProcessedOrder, error) {
+    time.Sleep(time.Duration(50+rand.Intn(100)) * time.Millisecond)
+    if order.Amount < 0 {
+        return ProcessedOrder{}, fmt.Errorf("invalid amount: %.2f", order.Amount)
+    }
+    total := order.Amount * 1.08 // 8% tax
+    return ProcessedOrder{ID: order.ID, Customer: order.Customer, Total: total, Status: "completed"}, nil
 }
 ```
 
-Key design decisions:
-- `SetLimit(numWorkers)` ensures at most N orders are processed concurrently
-- The `range in` loop reads until the producer closes the input channel
-- The output channel is closed AFTER `g.Wait()` -- only when all workers are done
-- Each worker checks `ctx.Done()` for pipeline cancellation
-
-### Intermediate Verification
-```bash
-go run main.go
-```
-Orders flow from producer through the worker pool. Workers process items in parallel, limited by SetLimit.
+Critical design decisions:
+- **`SetLimit(numWorkers)`** ensures at most N orders are processed concurrently
+- **`range in`** reads until the producer closes the input channel
+- **`close(out)` comes AFTER `g.Wait()`** -- if you close before Wait, a worker that is still running will panic trying to send on a closed channel
+- Each worker checks `ctx.Done()` before and after processing
 
 ## Step 4 -- Build the Aggregator
 
-Implement the `aggregator` function that collects results:
+The aggregator collects results from the output channel:
 
 ```go
-func aggregator(ctx context.Context, in <-chan ProcessedOrder, results *[]ProcessedOrder) error {
+package main
+
+import (
+    "context"
+    "fmt"
+    "sync"
+)
+
+func aggregator(ctx context.Context, in <-chan ProcessedOrder, mu *sync.Mutex, results *[]ProcessedOrder) error {
     for {
         select {
         case <-ctx.Done():
             return ctx.Err()
         case result, ok := <-in:
             if !ok {
-                return nil // channel closed, all results collected
+                return nil // channel closed -- all workers are done
             }
+            mu.Lock()
             *results = append(*results, result)
-            fmt.Printf("  [aggregator] collected order %d (total: $%.2f)\n",
-                result.ID, result.Total)
+            mu.Unlock()
+            fmt.Printf("  [aggregator] collected order %d\n", result.ID)
         }
     }
 }
 ```
 
-The aggregator reads from the results channel until it is closed by the processor pool. It appends each result to the shared results slice (safe because only one goroutine runs the aggregator).
+The aggregator reads until the channel is closed by the worker pool. It uses a mutex for the results slice because the results pointer is shared with the caller.
 
-### Intermediate Verification
-```bash
-go run main.go
-```
-The full pipeline runs: producer -> processors -> aggregator. Results are collected and printed.
+## Step 5 -- Wire Everything Together
 
-## Step 5 -- Wire Everything Together with a Shared Context
-
-The `runPipeline` function ties all stages together:
+The `runPipeline` function ties all stages together with a single errgroup:
 
 ```go
+package main
+
+import (
+    "context"
+    "fmt"
+    "math/rand"
+    "sync"
+    "time"
+
+    "golang.org/x/sync/errgroup"
+)
+
+type Order struct {
+    ID       int
+    Customer string
+    Amount   float64
+}
+
+type ProcessedOrder struct {
+    ID       int
+    Customer string
+    Total    float64
+    Status   string
+}
+
+func main() {
+    orders := []Order{
+        {ID: 1, Customer: "Alice", Amount: 99.99},
+        {ID: 2, Customer: "Bob", Amount: 149.50},
+        {ID: 3, Customer: "Charlie", Amount: 29.99},
+        {ID: 4, Customer: "Diana", Amount: 250.00},
+        {ID: 5, Customer: "Eve", Amount: 75.00},
+    }
+
+    fmt.Printf("Processing %d orders with 3 workers...\n\n", len(orders))
+
+    results, err := runPipeline(orders, 3)
+    if err != nil {
+        fmt.Printf("\nPipeline error: %v\n", err)
+    }
+    fmt.Printf("Processed: %d orders\n", len(results))
+    var total float64
+    for _, r := range results {
+        fmt.Printf("  Order %d (%s): $%.2f\n", r.ID, r.Customer, r.Total)
+        total += r.Total
+    }
+    fmt.Printf("Total revenue: $%.2f\n", total)
+}
+
 func runPipeline(orders []Order, numWorkers int) ([]ProcessedOrder, error) {
     g, ctx := errgroup.WithContext(context.Background())
 
     ordersCh := make(chan Order)
     resultsCh := make(chan ProcessedOrder)
+    var mu sync.Mutex
     var results []ProcessedOrder
 
     // Stage 1: Producer
@@ -179,40 +267,138 @@ func runPipeline(orders []Order, numWorkers int) ([]ProcessedOrder, error) {
         return producer(ctx, orders, ordersCh)
     })
 
-    // Stage 2: Processor Pool
+    // Stage 2: Worker Pool
     g.Go(func() error {
         return processorPool(ctx, numWorkers, ordersCh, resultsCh)
     })
 
     // Stage 3: Aggregator
     g.Go(func() error {
-        return aggregator(ctx, resultsCh, &results)
+        return aggregator(ctx, resultsCh, &mu, &results)
     })
 
-    if err := g.Wait(); err != nil {
-        return results, err // return partial results + error
-    }
-
-    return results, nil
+    err := g.Wait()
+    return results, err
 }
+
+func producer(ctx context.Context, orders []Order, out chan<- Order) error {
+    defer close(out)
+    for _, order := range orders {
+        select {
+        case <-ctx.Done():
+            return ctx.Err()
+        case out <- order:
+            fmt.Printf("  [producer]   sent order %d\n", order.ID)
+        }
+    }
+    return nil
+}
+
+func processorPool(ctx context.Context, numWorkers int, in <-chan Order, out chan<- ProcessedOrder) error {
+    var g errgroup.Group
+    g.SetLimit(numWorkers)
+    for order := range in {
+        order := order
+        g.Go(func() error {
+            select {
+            case <-ctx.Done():
+                return ctx.Err()
+            default:
+            }
+            result, err := processOrder(order)
+            if err != nil {
+                return fmt.Errorf("processing order %d: %w", order.ID, err)
+            }
+            select {
+            case <-ctx.Done():
+                return ctx.Err()
+            case out <- result:
+                fmt.Printf("  [worker]     processed order %d: $%.2f\n", result.ID, result.Total)
+            }
+            return nil
+        })
+    }
+    err := g.Wait()
+    close(out)
+    return err
+}
+
+func aggregator(ctx context.Context, in <-chan ProcessedOrder, mu *sync.Mutex, results *[]ProcessedOrder) error {
+    for {
+        select {
+        case <-ctx.Done():
+            return ctx.Err()
+        case result, ok := <-in:
+            if !ok {
+                return nil
+            }
+            mu.Lock()
+            *results = append(*results, result)
+            mu.Unlock()
+        }
+    }
+}
+
+func processOrder(order Order) (ProcessedOrder, error) {
+    time.Sleep(time.Duration(50+rand.Intn(100)) * time.Millisecond)
+    if order.Amount < 0 {
+        return ProcessedOrder{}, fmt.Errorf("invalid amount: %.2f", order.Amount)
+    }
+    return ProcessedOrder{
+        ID: order.ID, Customer: order.Customer,
+        Total: order.Amount * 1.08, Status: "completed",
+    }, nil
+}
+```
+
+**Expected output:**
+```
+Processing 5 orders with 3 workers...
+
+  [producer]   sent order 1
+  [producer]   sent order 2
+  [producer]   sent order 3
+  [worker]     processed order 1: $107.99
+  [producer]   sent order 4
+  ...
+Processed: 5 orders
+  Order 1 (Alice): $107.99
+  Order 2 (Bob): $161.46
+  ...
+Total revenue: $XXX.XX
 ```
 
 The beauty of this design:
 - A single `errgroup.WithContext` manages all three stages
-- If the producer fails, the context is cancelled and workers + aggregator shut down
-- If a worker fails, the context is cancelled and the producer + aggregator shut down
-- Channel close semantics propagate "done" signals from producer -> workers -> aggregator
-- `g.Wait()` returns when all stages are done, with any error that occurred
+- If the producer fails, the context cancels and workers + aggregator shut down
+- If a worker fails, the context cancels and the producer + aggregator shut down
+- Channel close semantics propagate "done" signals: producer -> workers -> aggregator
+- `g.Wait()` returns when all stages are done, with any error
 
-### Intermediate Verification
-```bash
-go run main.go
+## Error Propagation
+
+To test error handling, add an order with a negative amount:
+
+```go
+orders := []Order{
+    {ID: 1, Customer: "Alice", Amount: 99.99},
+    {ID: 2, Customer: "Bob", Amount: -50.00}, // invalid -- triggers error
+    {ID: 3, Customer: "Charlie", Amount: 29.99},
+}
 ```
-Run with normal orders to see success. Then add an invalid order to trigger an error and observe the pipeline shutting down gracefully.
+
+**Expected output:**
+```
+Pipeline error: processing order 2: invalid amount: -50.00
+Partial results: N orders processed
+```
+
+The error from the worker propagates to the errgroup, which cancels the context. The producer stops sending, other workers bail out, and the aggregator stops collecting.
 
 ## Common Mistakes
 
 ### Forgetting to close channels
+
 **Wrong:**
 ```go
 func producer(ctx context.Context, out chan<- Order) error {
@@ -223,11 +409,13 @@ func producer(ctx context.Context, out chan<- Order) error {
     return nil
 }
 ```
-**What happens:** The processor stage's `range in` loop never terminates. The pipeline deadlocks.
 
-**Fix:** Always `defer close(out)` at the beginning of the producing function.
+**What happens:** The workers' `range in` loop never ends. The pipeline deadlocks because nobody signals "no more data."
+
+**Fix:** Always `defer close(out)` at the top of the producing function.
 
 ### Closing the output channel before Wait returns
+
 **Wrong:**
 ```go
 func processorPool(..., out chan<- ProcessedOrder) error {
@@ -241,9 +429,10 @@ func processorPool(..., out chan<- ProcessedOrder) error {
     return g.Wait()
 }
 ```
-**What happens:** Workers send on a closed channel -- panic.
 
-**Fix:** Close the channel AFTER `g.Wait()`:
+**What happens:** A worker that is still running sends on the closed channel -- panic.
+
+**Fix:** Close AFTER Wait:
 ```go
 err := g.Wait()
 close(out) // safe: all workers are done
@@ -251,10 +440,12 @@ return err
 ```
 
 ### Not checking ctx.Done() in channel sends
+
 **Wrong:**
 ```go
-case out <- result: // blocks forever if aggregator is cancelled
+out <- result // blocks forever if aggregator is cancelled
 ```
+
 **What happens:** If the aggregator stops reading (due to cancellation), this send blocks forever. The pipeline deadlocks instead of shutting down.
 
 **Fix:** Always pair channel sends with `ctx.Done()`:
@@ -266,25 +457,28 @@ case out <- result:
 }
 ```
 
-### Using unbuffered channels without context checks
+### Using buffered channels to "fix" deadlocks
+
 **Wrong:**
 ```go
-ordersCh := make(chan Order) // unbuffered
-// producer sends, but if processor is cancelled, no one reads
+ordersCh := make(chan Order, 1000) // big buffer to avoid blocking
 ```
-**What happens:** The producer blocks on send, the context is cancelled but the producer never checks it because it is stuck in the channel send.
 
-**Fix:** Always use `select` with `ctx.Done()` when sending on channels in a pipeline.
+**What happens:** Buffers mask the real problem. If a stage fails, the pipeline should shut down promptly. Large buffers mean the producer keeps filling the channel long after the context is cancelled, wasting work and memory.
+
+**Fix:** Use unbuffered channels and proper `ctx.Done()` checks. Unbuffered channels enforce backpressure -- the producer cannot get ahead of the workers.
 
 ## Verify What You Learned
 
-Extend the pipeline with a fourth stage: a "reporter" that receives aggregated results and generates a summary report. The reporter should:
-1. Calculate total revenue, average order value, and count of processed orders
-2. Print the report after all results are collected
-3. Properly shut down on context cancellation
+Run the full program and confirm:
+1. The successful pipeline processes all 8 orders
+2. The failing pipeline (with a negative amount) stops gracefully
+3. Partial results are available even after an error
+4. Workers run with bounded concurrency (3 at a time)
 
-## What's Next
-You have completed all errgroup exercises. You now understand the full spectrum: from basic group coordination to complex multi-stage pipelines. Consider revisiting the [concurrency patterns](../07-concurrency-patterns/) section to see how errgroup integrates with other patterns like fan-out/fan-in and worker pools.
+```bash
+go run main.go
+```
 
 ## Summary
 - A pipeline is a series of stages connected by channels, each stage managed by goroutines
@@ -295,6 +489,7 @@ You have completed all errgroup exercises. You now understand the full spectrum:
 - Always use `select` with `ctx.Done()` on channel operations to enable graceful shutdown
 - `SetLimit` within a stage controls the degree of parallelism
 - Errors in any stage cancel the context, triggering shutdown across all stages
+- Use unbuffered channels for backpressure; large buffers mask design problems
 
 ## Reference
 - [Go Blog: Pipelines and cancellation](https://go.dev/blog/pipelines)

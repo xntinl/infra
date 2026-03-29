@@ -1,3 +1,30 @@
+// Exercise 10: Build a Thread-Safe Counter
+//
+// Integration exercise: the same counter implemented 4 ways.
+// Covers: Mutex, RWMutex, atomic, channels -- benchmarks and tradeoffs.
+//
+// Expected output:
+//
+//   === Correctness Tests ===
+//   [PASS] Mutex    : expected=100000, got=100000
+//   [PASS] RWMutex  : expected=100000, got=100000
+//   [PASS] Atomic   : expected=100000, got=100000
+//   [PASS] Channel  : expected=100000, got=100000
+//
+//   === Benchmarks (100 goroutines x 10,000 ops) ===
+//   Mutex    : Xus  (final value: 1000000+)
+//   RWMutex  : Xus  (final value: 1000000+)
+//   Atomic   : Xus  (final value: 1000000+)
+//   Channel  : Xus  (final value: 1000000+)
+//
+//   === Tradeoff Summary ===
+//   Atomic:   Best throughput, simplest, limited to simple operations
+//   Mutex:    Good default, flexible, works for complex critical sections
+//   RWMutex:  Helps for read-heavy workloads, overhead for write-heavy
+//   Channel:  Clearest ownership, highest overhead, best for state machines
+//
+// Run: go run main.go
+
 package main
 
 import (
@@ -16,7 +43,7 @@ type Counter interface {
 
 // ---------------------------------------------------------------------------
 // Implementation 1: Mutex Counter
-// TODO: Protect all operations with sync.Mutex
+// The simplest and most flexible approach. All operations serialized.
 // ---------------------------------------------------------------------------
 
 type MutexCounter struct {
@@ -25,23 +52,27 @@ type MutexCounter struct {
 }
 
 func (c *MutexCounter) Increment() {
-	// TODO: Lock, increment, Unlock
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.value++
 }
 
 func (c *MutexCounter) Decrement() {
-	// TODO: Lock, decrement, Unlock
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.value--
 }
 
 func (c *MutexCounter) Value() int64 {
-	// TODO: Lock, read, Unlock
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	return c.value
 }
 
 // ---------------------------------------------------------------------------
 // Implementation 2: RWMutex Counter
-// TODO: Use RLock for Value(), Lock for Increment/Decrement
+// Read lock for Value() allows concurrent reads. Write lock for mutations.
+// For a counter (write-heavy), this adds overhead with no real benefit.
 // ---------------------------------------------------------------------------
 
 type RWMutexCounter struct {
@@ -50,23 +81,27 @@ type RWMutexCounter struct {
 }
 
 func (c *RWMutexCounter) Increment() {
-	// TODO: Lock (exclusive), increment, Unlock
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.value++
 }
 
 func (c *RWMutexCounter) Decrement() {
-	// TODO: Lock (exclusive), decrement, Unlock
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.value--
 }
 
 func (c *RWMutexCounter) Value() int64 {
-	// TODO: RLock (shared), read, RUnlock
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	return c.value
 }
 
 // ---------------------------------------------------------------------------
 // Implementation 3: Atomic Counter
-// TODO: Use atomic.Int64 for lock-free operations
+// Lock-free, highest throughput for simple operations.
+// No deadlock possible. Limited to CPU-supported atomic operations.
 // ---------------------------------------------------------------------------
 
 type AtomicCounter struct {
@@ -74,23 +109,21 @@ type AtomicCounter struct {
 }
 
 func (c *AtomicCounter) Increment() {
-	// TODO: c.value.Add(1)
 	c.value.Add(1)
 }
 
 func (c *AtomicCounter) Decrement() {
-	// TODO: c.value.Add(-1)
 	c.value.Add(-1)
 }
 
 func (c *AtomicCounter) Value() int64 {
-	// TODO: c.value.Load()
 	return c.value.Load()
 }
 
 // ---------------------------------------------------------------------------
 // Implementation 4: Channel Counter
-// TODO: A single goroutine owns the value. All operations are messages.
+// A single goroutine owns the value. All operations are messages.
+// No shared state, no locks. Clearest ownership model but highest overhead.
 // ---------------------------------------------------------------------------
 
 type counterOp struct {
@@ -113,7 +146,7 @@ func NewChannelCounter() *ChannelCounter {
 }
 
 // run is the owner goroutine that processes all operations sequentially.
-// TODO: Range over c.ops and handle inc/dec/val operations.
+// Since only this goroutine reads/writes the value, no synchronization is needed.
 func (c *ChannelCounter) run() {
 	var value int64
 	for op := range c.ops {
@@ -149,6 +182,7 @@ func (c *ChannelCounter) Value() int64 {
 	return <-resp
 }
 
+// Close shuts down the owner goroutine. Must be called to avoid goroutine leaks.
 func (c *ChannelCounter) Close() {
 	close(c.ops)
 	<-c.done
@@ -158,6 +192,7 @@ func (c *ChannelCounter) Close() {
 // Testing and Benchmarking
 // ---------------------------------------------------------------------------
 
+// testCounter verifies correctness: 100 goroutines x 1000 increments = 100000.
 func testCounter(name string, c Counter) {
 	var wg sync.WaitGroup
 	const goroutines = 100
@@ -180,9 +215,11 @@ func testCounter(name string, c Counter) {
 	if actual != expected {
 		status = "FAIL"
 	}
-	fmt.Printf("[%s] %-10s: expected=%d, got=%d\n", status, name, expected, actual)
+	fmt.Printf("[%s] %-8s: expected=%d, got=%d\n", status, name, expected, actual)
 }
 
+// benchmarkCounter measures throughput under concurrent load.
+// Mix: mostly increments with occasional reads (every 10th op).
 func benchmarkCounter(name string, c Counter, goroutines, opsPerGoroutine int) time.Duration {
 	var wg sync.WaitGroup
 	start := time.Now()
@@ -194,7 +231,7 @@ func benchmarkCounter(name string, c Counter, goroutines, opsPerGoroutine int) t
 			for j := 0; j < opsPerGoroutine; j++ {
 				c.Increment()
 				if j%10 == 0 {
-					c.Value()
+					c.Value() // occasional read
 				}
 			}
 		}()
@@ -207,7 +244,7 @@ func benchmarkCounter(name string, c Counter, goroutines, opsPerGoroutine int) t
 func main() {
 	fmt.Println("=== Correctness Tests ===")
 
-	// Test all four implementations
+	// Test all four implementations for correctness
 	testCounter("Mutex", &MutexCounter{})
 	testCounter("RWMutex", &RWMutexCounter{})
 	testCounter("Atomic", &AtomicCounter{})
@@ -216,7 +253,7 @@ func main() {
 	testCounter("Channel", cc)
 	cc.Close()
 
-	// Benchmarks
+	// Benchmark all four implementations
 	fmt.Println("\n=== Benchmarks (100 goroutines x 10,000 ops) ===")
 	const goroutines = 100
 	const ops = 10000
@@ -239,7 +276,7 @@ func main() {
 	for _, tc := range cases {
 		duration := benchmarkCounter(tc.name, tc.counter, goroutines, ops)
 		finalValue := tc.counter.Value()
-		fmt.Printf("%-10s: %v (final value: %d)\n", tc.name, duration.Round(time.Microsecond), finalValue)
+		fmt.Printf("%-8s: %v (final value: %d)\n", tc.name, duration.Round(time.Microsecond), finalValue)
 		if tc.cleanup != nil {
 			tc.cleanup()
 		}
@@ -247,8 +284,18 @@ func main() {
 
 	// Tradeoff summary
 	fmt.Println("\n=== Tradeoff Summary ===")
-	fmt.Println("Atomic:   Best throughput, simplest, but limited to simple operations")
-	fmt.Println("Mutex:    Good default, flexible, works for complex critical sections")
-	fmt.Println("RWMutex:  Helps for read-heavy workloads, overhead for write-heavy")
-	fmt.Println("Channel:  Clearest ownership, highest overhead, best for state machines")
+	fmt.Println("Atomic:   Best throughput, simplest, limited to simple operations")
+	fmt.Println("          (add, load, store, compare-and-swap). No deadlock risk.")
+	fmt.Println("Mutex:    Good default for most use cases. Flexible -- works for")
+	fmt.Println("          complex critical sections (read-modify-write on structs).")
+	fmt.Println("RWMutex:  Benefits read-heavy workloads. For a counter (write-heavy),")
+	fmt.Println("          it adds overhead tracking reader counts with no benefit.")
+	fmt.Println("Channel:  Clearest ownership model, no shared state. Highest per-op")
+	fmt.Println("          overhead. Best for complex state machines, not simple counters.")
+	fmt.Println()
+	fmt.Println("Decision guide:")
+	fmt.Println("  - Simple counter/gauge?       Use atomic")
+	fmt.Println("  - Complex struct protection?   Use mutex")
+	fmt.Println("  - Read-heavy cache/config?     Use RWMutex")
+	fmt.Println("  - State machine / actor model? Use channels")
 }

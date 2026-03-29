@@ -31,186 +31,285 @@ The cancel function returned by `WithTimeout` must still be deferred. Even if th
 
 ## Step 1 -- Basic Timeout
 
-Edit `main.go` and implement `basicTimeout`. Create a context with a short timeout and simulate a slow operation that exceeds it:
+Create a context with a short timeout and simulate a slow operation that exceeds it:
 
 ```go
-func basicTimeout() {
-    fmt.Println("=== Basic WithTimeout ===")
+package main
 
-    ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
-    defer cancel()
+import (
+	"context"
+	"fmt"
+	"time"
+)
 
-    fmt.Println("  Starting slow operation (will take 500ms)...")
+func main() {
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
 
-    select {
-    case <-time.After(500 * time.Millisecond):
-        fmt.Println("  Operation completed successfully")
-    case <-ctx.Done():
-        fmt.Printf("  Operation aborted: %v\n", ctx.Err())
-    }
+	fmt.Println("Starting slow operation (needs 500ms, allowed 200ms)...")
 
-    fmt.Println()
+	select {
+	case <-time.After(500 * time.Millisecond):
+		fmt.Println("Operation completed successfully")
+	case <-ctx.Done():
+		fmt.Printf("Operation aborted: %v\n", ctx.Err())
+	}
 }
 ```
 
-### Intermediate Verification
+### Verification
 ```bash
 go run main.go
 ```
 Expected output:
 ```
-=== Basic WithTimeout ===
-  Starting slow operation (will take 500ms)...
-  Operation aborted: context deadline exceeded
+Starting slow operation (needs 500ms, allowed 200ms)...
+Operation aborted: context deadline exceeded
 ```
 
-The operation needed 500ms but the context only allowed 200ms. The `ctx.Done()` channel closed first, and `ctx.Err()` returns `context.DeadlineExceeded`.
+The operation needed 500ms but the context only allowed 200ms. The `ctx.Done()` channel closed first, and `ctx.Err()` returns `context.DeadlineExceeded`. This is a different error from `context.Canceled`, which is returned on manual cancellation.
 
 ## Step 2 -- Fast Operation Completes Before Timeout
 
-Implement `fastOperation`. Show that when the operation finishes before the timeout, everything proceeds normally:
+Show that when the operation finishes before the timeout, everything proceeds normally:
 
 ```go
-func fastOperation() {
-    fmt.Println("=== Fast Operation (within timeout) ===")
+package main
 
-    ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
-    defer cancel() // still required even though timeout won't fire
+import (
+	"context"
+	"fmt"
+	"time"
+)
 
-    fmt.Println("  Starting fast operation (will take 100ms)...")
+func main() {
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel() // still required even though timeout will not fire
 
-    select {
-    case <-time.After(100 * time.Millisecond):
-        fmt.Println("  Operation completed successfully")
-    case <-ctx.Done():
-        fmt.Printf("  Operation aborted: %v\n", ctx.Err())
-    }
+	fmt.Println("Starting fast operation (needs 100ms, allowed 500ms)...")
 
-    fmt.Printf("  Context error after completion: %v\n\n", ctx.Err())
+	select {
+	case <-time.After(100 * time.Millisecond):
+		fmt.Println("Operation completed successfully")
+	case <-ctx.Done():
+		fmt.Printf("Operation aborted: %v\n", ctx.Err())
+	}
+
+	fmt.Printf("Context error after success: %v\n", ctx.Err())
 }
 ```
 
-### Intermediate Verification
+### Verification
 ```bash
 go run main.go
 ```
 Expected output:
 ```
-=== Fast Operation (within timeout) ===
-  Starting fast operation (will take 100ms)...
-  Operation completed successfully
-  Context error after completion: <nil>
+Starting fast operation (needs 100ms, allowed 500ms)...
+Operation completed successfully
+Context error after success: <nil>
 ```
 
-The operation finished in 100ms, well within the 500ms timeout. The context error is still nil because the timeout has not fired yet.
+The operation finished in 100ms, well within the 500ms timeout. `ctx.Err()` is nil because the timeout has not fired yet. The deferred `cancel()` is still important -- it stops the internal timer and frees resources immediately instead of waiting for garbage collection.
 
 ## Step 3 -- Timeout with Goroutine Worker
 
-Implement `timeoutWithWorker`. Pass the timeout context to a goroutine that simulates work in a loop, checking `ctx.Done()` between iterations:
+Pass the timeout context to a goroutine that simulates work in a loop, checking `ctx.Done()` between iterations:
 
 ```go
-func timeoutWithWorker() {
-    fmt.Println("=== Timeout with Worker Goroutine ===")
+package main
 
-    ctx, cancel := context.WithTimeout(context.Background(), 350*time.Millisecond)
-    defer cancel()
+import (
+	"context"
+	"fmt"
+	"time"
+)
 
-    done := make(chan string)
+func main() {
+	ctx, cancel := context.WithTimeout(context.Background(), 350*time.Millisecond)
+	defer cancel()
 
-    go func(ctx context.Context) {
-        for i := 1; ; i++ {
-            select {
-            case <-ctx.Done():
-                done <- fmt.Sprintf("worker stopped at iteration %d: %v", i, ctx.Err())
-                return
-            default:
-                fmt.Printf("  worker: processing item %d\n", i)
-                time.Sleep(100 * time.Millisecond)
-            }
-        }
-    }(ctx)
+	done := make(chan string)
 
-    result := <-done
-    fmt.Printf("  %s\n\n", result)
+	go func(ctx context.Context) {
+		for i := 1; ; i++ {
+			select {
+			case <-ctx.Done():
+				done <- fmt.Sprintf("worker stopped at item %d: %v", i, ctx.Err())
+				return
+			default:
+				fmt.Printf("worker: processing item %d\n", i)
+				time.Sleep(100 * time.Millisecond)
+			}
+		}
+	}(ctx)
+
+	result := <-done
+	fmt.Println(result)
 }
 ```
 
-### Intermediate Verification
+### Verification
 ```bash
 go run main.go
 ```
 Expected output (approximately):
 ```
-=== Timeout with Worker Goroutine ===
-  worker: processing item 1
-  worker: processing item 2
-  worker: processing item 3
-  worker stopped at iteration 4: context deadline exceeded
+worker: processing item 1
+worker: processing item 2
+worker: processing item 3
+worker stopped at item 4: context deadline exceeded
 ```
 
 The worker processes items until the 350ms timeout fires. The goroutine detects the cancellation via `ctx.Done()` and reports back through the `done` channel.
 
 ## Step 4 -- Manual Cancel Before Timeout
 
-Implement `earlyCancel`. Show that calling `cancel()` before the timeout triggers `context.Canceled` instead of `context.DeadlineExceeded`:
+Show that calling `cancel()` before the timeout triggers `context.Canceled` instead of `context.DeadlineExceeded`:
 
 ```go
-func earlyCancel() {
-    fmt.Println("=== Early Cancel (before timeout) ===")
+package main
 
-    ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-    // Note: not deferring -- we will call it manually
+import (
+	"context"
+	"fmt"
+	"time"
+)
 
-    go func() {
-        <-ctx.Done()
-        fmt.Printf("  goroutine: context ended: %v\n", ctx.Err())
-    }()
+func main() {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 
-    time.Sleep(100 * time.Millisecond)
-    fmt.Println("  main: calling cancel() manually (timeout was 5s)")
-    cancel()
+	go func() {
+		<-ctx.Done()
+		fmt.Printf("goroutine: context ended: %v\n", ctx.Err())
+	}()
 
-    time.Sleep(50 * time.Millisecond)
-    fmt.Println()
+	time.Sleep(100 * time.Millisecond)
+	fmt.Println("main: calling cancel() manually (timeout was 5s)")
+	cancel()
+
+	time.Sleep(50 * time.Millisecond)
+	fmt.Println("Key insight: Canceled (not DeadlineExceeded) because we cancelled manually")
 }
 ```
 
-### Intermediate Verification
+### Verification
 ```bash
 go run main.go
 ```
 Expected output:
 ```
-=== Early Cancel (before timeout) ===
-  main: calling cancel() manually (timeout was 5s)
-  goroutine: context ended: context canceled
+main: calling cancel() manually (timeout was 5s)
+goroutine: context ended: context canceled
+Key insight: Canceled (not DeadlineExceeded) because we cancelled manually
 ```
 
-When you cancel manually, `ctx.Err()` returns `context.Canceled`, not `context.DeadlineExceeded`. This distinction lets you differentiate "we chose to stop" from "we ran out of time."
+When you cancel manually, `ctx.Err()` returns `context.Canceled`, not `context.DeadlineExceeded`. This distinction lets callers differentiate "we chose to stop" from "we ran out of time" -- useful for metrics, logging, and retry decisions.
+
+## Step 5 -- Child Cannot Extend Parent Timeout
+
+A child context cannot have a longer timeout than its parent. The shorter deadline always wins:
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"time"
+)
+
+func main() {
+	parent, cancelParent := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancelParent()
+
+	child, cancelChild := context.WithTimeout(parent, 10*time.Second)
+	defer cancelChild()
+
+	parentDeadline, _ := parent.Deadline()
+	childDeadline, _ := child.Deadline()
+
+	fmt.Printf("Parent deadline remaining: ~%v\n", time.Until(parentDeadline).Round(time.Millisecond))
+	fmt.Printf("Child requested: 10s\n")
+	fmt.Printf("Child actual remaining:    ~%v  (parent's wins)\n",
+		time.Until(childDeadline).Round(time.Millisecond))
+}
+```
+
+### Verification
+```bash
+go run main.go
+```
+Expected output:
+```
+Parent deadline remaining: ~1s
+Child requested: 10s
+Child actual remaining:    ~1s  (parent's wins)
+```
+
+The child inherits the parent's shorter deadline. This is a fundamental rule: you can tighten a timeout by creating a child with a shorter duration, but you can never loosen it.
 
 ## Common Mistakes
 
 ### Not Deferring Cancel on WithTimeout
 **Wrong:**
 ```go
-ctx, cancel := context.WithTimeout(parent, 5*time.Second)
-// forgot defer cancel()
+package main
+
+import (
+	"context"
+	"fmt"
+	"time"
+)
+
+func main() {
+	ctx, _ := context.WithTimeout(context.Background(), 5*time.Second)
+	// forgot defer cancel() -- timer goroutine leaks!
+	fmt.Printf("ctx.Err(): %v\n", ctx.Err())
+}
 ```
-**What happens:** Even if the timeout fires, internal resources (a timer goroutine) are not freed until the parent is cancelled or garbage collected. This leaks resources.
+**What happens:** Even if the timeout fires, internal resources (a timer goroutine) are not freed until the parent is cancelled or garbage collected. This leaks resources, especially in long-running servers.
 
 **Fix:** Always `defer cancel()` immediately:
 ```go
-ctx, cancel := context.WithTimeout(parent, 5*time.Second)
-defer cancel()
+package main
+
+import (
+	"context"
+	"fmt"
+	"time"
+)
+
+func main() {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	fmt.Printf("ctx.Err(): %v\n", ctx.Err())
+}
 ```
 
 ### Setting Timeout Longer Than Parent's
 **Wrong:**
 ```go
-parent, _ := context.WithTimeout(bg, 1*time.Second)
-child, _ := context.WithTimeout(parent, 10*time.Second) // this 10s is useless
+package main
+
+import (
+	"context"
+	"fmt"
+	"time"
+)
+
+func main() {
+	parent, cancelParent := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancelParent()
+
+	child, cancelChild := context.WithTimeout(parent, 10*time.Second) // this 10s is useless
+	defer cancelChild()
+
+	childDeadline, _ := child.Deadline()
+	fmt.Printf("Child deadline: ~%v (not 10s!)\n", time.Until(childDeadline).Round(time.Millisecond))
+}
 ```
-**What happens:** The child inherits the parent's 1-second deadline. The 10-second timeout on the child is never reached because the parent cancels first. This is not an error, but it is misleading.
+**What happens:** The child inherits the parent's 1-second deadline. The 10-second timeout on the child is never reached because the parent cancels first. This is not an error, but it is misleading code.
 
 ### Ignoring ctx.Err() After Timeout
 **Wrong:**
@@ -228,9 +327,52 @@ case <-ctx.Done():
 }
 ```
 
+Always wrap and return `ctx.Err()` so callers know whether the operation timed out or was cancelled.
+
 ## Verify What You Learned
 
-Implement `verifyKnowledge`: simulate a "database query" function that takes a `context.Context` and a simulated duration. Call it twice -- once with a timeout shorter than the query (should time out) and once with a timeout longer (should succeed). Print which error type you get in each case.
+Simulate a "database query" function that takes a context and a simulated duration. Call it twice -- once with a timeout shorter than the query (should time out) and once with a timeout longer (should succeed):
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"time"
+)
+
+func simulateQuery(ctx context.Context, queryDuration time.Duration) error {
+	select {
+	case <-time.After(queryDuration):
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func main() {
+	ctx1, cancel1 := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel1()
+	err1 := simulateQuery(ctx1, 100*time.Millisecond)
+	fmt.Printf("Fast query (100ms, timeout 500ms): %v\n", err1)
+
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel2()
+	err2 := simulateQuery(ctx2, 800*time.Millisecond)
+	fmt.Printf("Slow query (800ms, timeout 200ms): %v\n", err2)
+}
+```
+
+### Verification
+```bash
+go run main.go
+```
+Expected output:
+```
+Fast query (100ms, timeout 500ms): <nil>
+Slow query (800ms, timeout 200ms): context deadline exceeded
+```
 
 ## What's Next
 Continue to [04-context-withdeadline](../04-context-withdeadline/04-context-withdeadline.md) to learn about absolute deadlines and how `WithTimeout` is really a shorthand for `WithDeadline`.

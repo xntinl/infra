@@ -31,201 +31,375 @@ The key insight: cancellation is cooperative. The goroutine must explicitly chec
 
 ## Step 1 -- Basic Cancel and Done
 
-Edit `main.go` and implement `basicCancel`. Create a cancellable context, pass it to a goroutine that loops until cancelled, then cancel from main:
+Create a cancellable context, pass it to a goroutine that loops until cancelled, then cancel from main:
 
 ```go
-func basicCancel() {
-    fmt.Println("=== Basic WithCancel ===")
+package main
 
-    ctx, cancel := context.WithCancel(context.Background())
-    defer cancel() // always defer cancel to avoid resource leaks
+import (
+	"context"
+	"fmt"
+	"time"
+)
 
-    go func(ctx context.Context) {
-        for i := 0; ; i++ {
-            select {
-            case <-ctx.Done():
-                fmt.Printf("  goroutine: stopped (reason: %v)\n", ctx.Err())
-                return
-            default:
-                fmt.Printf("  goroutine: working... iteration %d\n", i)
-                time.Sleep(100 * time.Millisecond)
-            }
-        }
-    }(ctx)
+func main() {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel() // always defer cancel to avoid resource leaks
 
-    // Let the goroutine work for a bit
-    time.Sleep(350 * time.Millisecond)
+	go func(ctx context.Context) {
+		for i := 0; ; i++ {
+			select {
+			case <-ctx.Done():
+				fmt.Printf("goroutine: stopped (reason: %v)\n", ctx.Err())
+				return
+			default:
+				fmt.Printf("goroutine: working... iteration %d\n", i)
+				time.Sleep(100 * time.Millisecond)
+			}
+		}
+	}(ctx)
 
-    fmt.Println("  main: calling cancel()")
-    cancel()
+	// Let the goroutine work for a bit.
+	time.Sleep(350 * time.Millisecond)
 
-    // Give goroutine time to receive the signal and print
-    time.Sleep(50 * time.Millisecond)
-    fmt.Println()
+	fmt.Println("main: calling cancel()")
+	cancel()
+
+	// Give goroutine time to receive the signal and print.
+	time.Sleep(50 * time.Millisecond)
 }
 ```
 
-### Intermediate Verification
+### Verification
 ```bash
 go run main.go
 ```
 Expected output (approximately):
 ```
-=== Basic WithCancel ===
-  goroutine: working... iteration 0
-  goroutine: working... iteration 1
-  goroutine: working... iteration 2
-  main: calling cancel()
-  goroutine: stopped (reason: context canceled)
+goroutine: working... iteration 0
+goroutine: working... iteration 1
+goroutine: working... iteration 2
+main: calling cancel()
+goroutine: stopped (reason: context canceled)
 ```
 
-The goroutine runs 3 iterations (~300ms), then main calls `cancel()`, closing the `Done()` channel. The goroutine's `select` picks up the signal and exits.
+The goroutine runs 3 iterations (~300ms), then main calls `cancel()`, closing the `Done()` channel. The goroutine's `select` picks up the signal and exits. Note that `ctx.Err()` returns `context.Canceled` -- this is how you know cancellation happened (as opposed to a timeout).
 
 ## Step 2 -- Cancellation Propagates to Children
 
-Implement `cancellationPropagation`. Create a parent context, derive two child contexts from it, and show that cancelling the parent stops both children:
+Create a parent context, derive two child contexts from it, and show that cancelling the parent stops both children:
 
 ```go
-func cancellationPropagation() {
-    fmt.Println("=== Cancellation Propagation ===")
+package main
 
-    parent, cancelParent := context.WithCancel(context.Background())
-    child1, cancelChild1 := context.WithCancel(parent)
-    child2, cancelChild2 := context.WithCancel(parent)
-    defer cancelChild1()
-    defer cancelChild2()
+import (
+	"context"
+	"fmt"
+	"time"
+)
 
-    // Launch a worker for each child context
-    worker := func(name string, ctx context.Context) {
-        <-ctx.Done()
-        fmt.Printf("  %s: stopped (reason: %v)\n", name, ctx.Err())
-    }
+func main() {
+	parent, cancelParent := context.WithCancel(context.Background())
+	child1, cancelChild1 := context.WithCancel(parent)
+	child2, cancelChild2 := context.WithCancel(parent)
+	defer cancelChild1()
+	defer cancelChild2()
 
-    go worker("child1", child1)
-    go worker("child2", child2)
+	worker := func(name string, ctx context.Context) {
+		<-ctx.Done()
+		fmt.Printf("%s: stopped (reason: %v)\n", name, ctx.Err())
+	}
 
-    fmt.Println("  Cancelling parent context...")
-    cancelParent()
+	go worker("child1", child1)
+	go worker("child2", child2)
 
-    // Give workers time to receive the signal
-    time.Sleep(50 * time.Millisecond)
-    fmt.Println()
+	fmt.Println("Cancelling parent context...")
+	cancelParent()
+
+	time.Sleep(50 * time.Millisecond)
 }
 ```
 
-### Intermediate Verification
+### Verification
 ```bash
 go run main.go
 ```
 Expected output (order of children may vary):
 ```
-=== Cancellation Propagation ===
-  Cancelling parent context...
-  child1: stopped (reason: context canceled)
-  child2: stopped (reason: context canceled)
+Cancelling parent context...
+child1: stopped (reason: context canceled)
+child2: stopped (reason: context canceled)
 ```
 
-Both children are cancelled when the parent is cancelled. This is the tree structure of contexts in action: cancellation flows downward.
+Both children are cancelled when the parent is cancelled. This is the tree structure of contexts in action: cancellation flows downward through the entire subtree.
 
 ## Step 3 -- Cancel Only a Child
 
-Implement `cancelOnlyChild`. Show that cancelling a child does not affect the parent or siblings:
+Show that cancelling a child does not affect the parent or siblings:
 
 ```go
-func cancelOnlyChild() {
-    fmt.Println("=== Cancel Only Child ===")
+package main
 
-    parent, cancelParent := context.WithCancel(context.Background())
-    defer cancelParent()
+import (
+	"context"
+	"fmt"
+	"time"
+)
 
-    child1, cancelChild1 := context.WithCancel(parent)
-    child2, cancelChild2 := context.WithCancel(parent)
-    defer cancelChild2()
+func main() {
+	parent, cancelParent := context.WithCancel(context.Background())
+	defer cancelParent()
 
-    fmt.Println("  Cancelling child1 only...")
-    cancelChild1()
+	child1, cancelChild1 := context.WithCancel(parent)
+	child2, cancelChild2 := context.WithCancel(parent)
+	defer cancelChild2()
 
-    // Check states
-    time.Sleep(10 * time.Millisecond)
+	fmt.Println("Cancelling child1 only...")
+	cancelChild1()
 
-    fmt.Printf("  parent.Err(): %v\n", parent.Err())
-    fmt.Printf("  child1.Err(): %v\n", child1.Err())
-    fmt.Printf("  child2.Err(): %v\n", child2.Err())
-    fmt.Println()
+	time.Sleep(10 * time.Millisecond)
+
+	fmt.Printf("parent.Err(): %v\n", parent.Err())
+	fmt.Printf("child1.Err(): %v\n", child1.Err())
+	fmt.Printf("child2.Err(): %v\n", child2.Err())
 }
 ```
 
-### Intermediate Verification
+### Verification
 ```bash
 go run main.go
 ```
 Expected output:
 ```
-=== Cancel Only Child ===
-  Cancelling child1 only...
-  parent.Err(): <nil>
-  child1.Err(): context canceled
-  child2.Err(): <nil>
+Cancelling child1 only...
+parent.Err(): <nil>
+child1.Err(): context canceled
+child2.Err(): <nil>
 ```
 
-Cancellation flows down, never up. The parent and sibling remain active.
+Cancellation flows down, never up. The parent and sibling remain active. This is critical: a failing sub-operation should not tear down unrelated parts of the system.
+
+## Step 4 -- Cancel Is Idempotent
+
+Calling `cancel()` more than once is safe. The Go documentation explicitly states this. This matters because `defer cancel()` and an explicit `cancel()` call may both execute:
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+)
+
+func main() {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	cancel()
+	fmt.Printf("First cancel:  %v\n", ctx.Err())
+
+	cancel() // no panic
+	fmt.Printf("Second cancel: %v  (no panic, same error)\n", ctx.Err())
+
+	cancel() // still safe
+	fmt.Printf("Third cancel:  %v  (still safe)\n", ctx.Err())
+}
+```
+
+### Verification
+```bash
+go run main.go
+```
+Expected output:
+```
+First cancel:  context canceled
+Second cancel: context canceled  (no panic, same error)
+Third cancel:  context canceled  (still safe)
+```
 
 ## Common Mistakes
 
 ### Forgetting to Call Cancel
 **Wrong:**
 ```go
-ctx, cancel := context.WithCancel(parentCtx)
-_ = cancel // unused -- resource leak!
-// use ctx...
+package main
+
+import (
+	"context"
+	"fmt"
+)
+
+func main() {
+	ctx, cancel := context.WithCancel(context.Background())
+	_ = cancel // unused -- resource leak!
+	fmt.Printf("ctx.Err(): %v\n", ctx.Err())
+}
 ```
-**What happens:** The derived context and its internal goroutine are never cleaned up, causing a resource leak.
+**What happens:** The derived context and its internal goroutine are never cleaned up, causing a resource leak. The Go runtime cannot garbage-collect the context's internal resources until cancel is called.
 
 **Fix:** Always `defer cancel()` immediately after creating the context:
 ```go
-ctx, cancel := context.WithCancel(parentCtx)
-defer cancel()
+package main
+
+import (
+	"context"
+	"fmt"
+)
+
+func main() {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	fmt.Printf("ctx.Err(): %v\n", ctx.Err())
+}
 ```
 
 ### Not Checking ctx.Done() in the Goroutine
 **Wrong:**
 ```go
-go func(ctx context.Context) {
-    for {
-        doWork() // never checks ctx.Done() -- goroutine runs forever
-    }
-}(ctx)
+package main
+
+import (
+	"context"
+	"fmt"
+	"time"
+)
+
+func doWork() {
+	time.Sleep(100 * time.Millisecond)
+	fmt.Println("working...")
+}
+
+func main() {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func(ctx context.Context) {
+		for {
+			doWork() // never checks ctx.Done() -- goroutine runs forever
+		}
+	}(ctx)
+
+	time.Sleep(300 * time.Millisecond)
+	cancel()
+	time.Sleep(200 * time.Millisecond) // goroutine is STILL running
+}
 ```
+**What happens:** The goroutine ignores the cancellation signal and continues consuming CPU and memory.
+
 **Fix:**
 ```go
-go func(ctx context.Context) {
-    for {
-        select {
-        case <-ctx.Done():
-            return
-        default:
-            doWork()
-        }
-    }
-}(ctx)
+package main
+
+import (
+	"context"
+	"fmt"
+	"time"
+)
+
+func doWork() {
+	time.Sleep(100 * time.Millisecond)
+	fmt.Println("working...")
+}
+
+func main() {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func(ctx context.Context) {
+		for {
+			select {
+			case <-ctx.Done():
+				fmt.Println("stopped")
+				return
+			default:
+				doWork()
+			}
+		}
+	}(ctx)
+
+	time.Sleep(300 * time.Millisecond)
+	cancel()
+	time.Sleep(200 * time.Millisecond)
+}
 ```
 
-### Calling Cancel Multiple Times
-This is actually safe. Calling `cancel()` more than once is a no-op after the first call. The Go documentation explicitly states this. However, relying on it as a pattern is confusing -- prefer a single, clear cancellation point.
+### Passing cancel Function to Other Goroutines
+Prefer keeping the cancel function close to where the context was created. Passing it to multiple goroutines makes it unclear who is responsible for cancellation, leading to premature or accidental cancellation. If a goroutine needs to stop the operation, signal through a separate channel and let the owner call cancel.
 
 ## Verify What You Learned
 
-Implement `verifyKnowledge`: create a root context, derive three levels of child contexts (grandparent -> parent -> child). Launch a goroutine on each that prints when it is cancelled. Cancel the middle (parent) context and verify that the grandparent is unaffected while both parent and child are cancelled.
+Create a context tree with branching: root -> branch1, branch2, and leaf under branch1. Cancel branch1 and verify that root and branch2 are unaffected while branch1 and leaf are cancelled:
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"time"
+)
+
+func main() {
+	//         root
+	//        /    \
+	//   branch1  branch2
+	//      |
+	//     leaf
+
+	root, cancelRoot := context.WithCancel(context.Background())
+	defer cancelRoot()
+
+	branch1, cancelBranch1 := context.WithCancel(root)
+	branch2, cancelBranch2 := context.WithCancel(root)
+	defer cancelBranch2()
+
+	leaf, cancelLeaf := context.WithCancel(branch1)
+	defer cancelLeaf()
+
+	fmt.Println("Before any cancellation:")
+	fmt.Printf("  root.Err():    %v\n", root.Err())
+	fmt.Printf("  branch1.Err(): %v\n", branch1.Err())
+	fmt.Printf("  branch2.Err(): %v\n", branch2.Err())
+	fmt.Printf("  leaf.Err():    %v\n", leaf.Err())
+
+	cancelBranch1()
+	time.Sleep(10 * time.Millisecond)
+
+	fmt.Println("After cancelling branch1:")
+	fmt.Printf("  root.Err():    %v\n", root.Err())
+	fmt.Printf("  branch1.Err(): %v\n", branch1.Err())
+	fmt.Printf("  branch2.Err(): %v\n", branch2.Err())
+	fmt.Printf("  leaf.Err():    %v\n", leaf.Err())
+}
+```
+
+### Verification
+```bash
+go run main.go
+```
+Expected output:
+```
+Before any cancellation:
+  root.Err():    <nil>
+  branch1.Err(): <nil>
+  branch2.Err(): <nil>
+  leaf.Err():    <nil>
+After cancelling branch1:
+  root.Err():    <nil>
+  branch1.Err(): context canceled
+  branch2.Err(): <nil>
+  leaf.Err():    context canceled
+```
 
 ## What's Next
 Continue to [03-context-withtimeout](../03-context-withtimeout/03-context-withtimeout.md) to learn how to automatically cancel a context after a specified duration.
 
 ## Summary
 - `context.WithCancel` returns a derived context and a `cancel` function
-- Calling `cancel()` closes the `Done()` channel, signaling all listeners
-- Cancellation propagates from parent to all descendant contexts
+- Calling `cancel()` closes the `Done()` channel, signaling all listeners simultaneously
+- Cancellation propagates from parent to all descendant contexts (the entire subtree)
 - Cancellation never propagates upward -- parent and siblings are unaffected
 - Always `defer cancel()` to prevent resource leaks
+- Calling cancel multiple times is safe (idempotent)
 - Goroutines must cooperatively check `ctx.Done()` to respond to cancellation
 
 ## Reference

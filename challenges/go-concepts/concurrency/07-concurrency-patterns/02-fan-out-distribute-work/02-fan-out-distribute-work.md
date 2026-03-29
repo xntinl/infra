@@ -27,15 +27,36 @@ Fan-out is the pattern of distributing work from a single source to multiple gor
 
 This pattern is critical for parallelizing CPU-bound or I/O-bound stages in a pipeline. If one stage is a bottleneck, you can fan it out to N workers, each pulling from the same input channel, processing independently, and feeding results downstream. The key mental model is a single funnel (the channel) feeding multiple workers.
 
-Unlike thread pools in other languages that require explicit queue data structures, mutexes, and condition variables, Go's fan-out requires nothing beyond a shared channel and the `go` keyword.
+```
+              Fan-Out Data Flow
+  +----------+
+  | producer |
+  +----+-----+
+       |
+    jobs channel
+       |
+  +----+----+----+
+  |    |    |    |
+  w1   w2   w3   w4   (workers compete for values)
+  |    |    |    |
+  +----+----+----+
+       |
+  results channel
+```
 
 ## Step 1 -- Single-Channel Work Distribution
 
 Create a work channel and launch multiple workers that all read from it. Observe how Go distributes the values.
 
-Edit `main.go` and implement the `basicFanOut` function:
-
 ```go
+package main
+
+import (
+    "fmt"
+    "sync"
+    "time"
+)
+
 func basicFanOut() {
     fmt.Println("=== Basic Fan-Out ===")
     jobs := make(chan int, 10)
@@ -47,7 +68,7 @@ func basicFanOut() {
             defer wg.Done()
             for job := range jobs {
                 fmt.Printf("  worker %d processing job %d\n", id, job)
-                time.Sleep(50 * time.Millisecond) // simulate work
+                time.Sleep(50 * time.Millisecond)
             }
         }(w)
     }
@@ -59,6 +80,10 @@ func basicFanOut() {
 
     wg.Wait()
     fmt.Println()
+}
+
+func main() {
+    basicFanOut()
 }
 ```
 
@@ -82,6 +107,14 @@ Expected: all 9 jobs processed, roughly 3 per worker (order varies):
 Integrate fan-out into a pipeline. Create a generator stage, then fan out the processing stage to multiple workers.
 
 ```go
+package main
+
+import (
+    "fmt"
+    "sync"
+    "time"
+)
+
 func generate(start, end int) <-chan int {
     out := make(chan int)
     go func() {
@@ -117,6 +150,16 @@ func fanOutSquare(in <-chan int, numWorkers int) <-chan int {
 
     return results
 }
+
+func main() {
+    nums := generate(1, 12)
+    squared := fanOutSquare(nums, 3)
+    fmt.Print("Results: ")
+    for r := range squared {
+        fmt.Printf("%d ", r)
+    }
+    fmt.Println()
+}
 ```
 
 The `fanOutSquare` function launches N workers that all read from the same input channel. A separate goroutine waits for all workers to finish and then closes the results channel.
@@ -127,7 +170,6 @@ go run main.go
 ```
 Expected: each number 1-12 squared, distributed across workers:
 ```
-=== Fan-Out Pipeline ===
   worker 0: 1^2 = 1
   worker 1: 2^2 = 4
   ...
@@ -139,6 +181,14 @@ Results: 1 4 9 16 ...
 Implement a function that shows how distribution changes with different worker counts and workload characteristics.
 
 ```go
+package main
+
+import (
+    "fmt"
+    "sync"
+    "time"
+)
+
 func distributionAnalysis() {
     fmt.Println("=== Distribution Analysis ===")
     const totalJobs = 20
@@ -169,11 +219,15 @@ func distributionAnalysis() {
         close(jobs)
         wg.Wait()
 
-        for id, count := range counts {
-            fmt.Printf("    worker %d handled %d jobs\n", id, count)
+        for id := 0; id < numWorkers; id++ {
+            fmt.Printf("    worker %d handled %d jobs\n", id, counts[id])
         }
     }
     fmt.Println()
+}
+
+func main() {
+    distributionAnalysis()
 }
 ```
 
@@ -188,10 +242,29 @@ With 1 worker, it handles all 20. With 3 and 5, the work distributes roughly eve
 ### Not Closing the Jobs Channel
 **Wrong:**
 ```go
-for j := 0; j < 10; j++ {
-    jobs <- j
+package main
+
+import (
+    "fmt"
+    "sync"
+)
+
+func main() {
+    jobs := make(chan int, 10)
+    var wg sync.WaitGroup
+    wg.Add(1)
+    go func() {
+        defer wg.Done()
+        for j := range jobs { // blocks forever
+            fmt.Println(j)
+        }
+    }()
+    for j := 0; j < 10; j++ {
+        jobs <- j
+    }
+    // forgot close(jobs) -- worker blocks on range forever
+    wg.Wait() // deadlock
 }
-// forgot close(jobs)
 ```
 **What happens:** Workers block on `range jobs` forever after all values are consumed. The program deadlocks.
 
@@ -214,7 +287,11 @@ Go's scheduler does not guarantee round-robin distribution. If one worker is sli
 
 ## Verify What You Learned
 
-Modify the fan-out pipeline to use a configurable number of workers. Run it with 1 worker and 5 workers, timing each. Observe the speedup from parallelizing the processing stage.
+Run `go run main.go` and verify the output includes:
+- Basic fan-out: all 9 jobs processed across 3 workers
+- Fan-out pipeline: all 12 values squared
+- Distribution analysis: work distributes roughly evenly
+- Speedup comparison: 5 workers noticeably faster than 1
 
 ## What's Next
 Continue to [03-fan-in-merge-results](../03-fan-in-merge-results/03-fan-in-merge-results.md) to learn the complementary pattern: merging multiple channels into one.

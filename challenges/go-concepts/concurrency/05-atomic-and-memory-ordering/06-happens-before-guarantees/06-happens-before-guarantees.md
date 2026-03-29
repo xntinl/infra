@@ -22,6 +22,7 @@ After completing this exercise, you will be able to:
 - **Recognize** code that lacks happens-before guarantees and is therefore incorrect
 
 ## Why the Memory Model Matters
+
 A concurrent program is correct only if its goroutines observe shared state in a consistent order. Modern CPUs reorder instructions, cache writes in store buffers, and delay flushes to main memory. Compilers reorder operations for optimization. Without explicit rules, a write in one goroutine may never be visible to a read in another, or may be visible out of order.
 
 The Go Memory Model defines the "happens-before" relation: a partial order on memory operations that specifies when a write in one goroutine is guaranteed to be visible to a read in another. If write W happens-before read R, then R is guaranteed to observe W (or a later write).
@@ -38,241 +39,363 @@ The key guarantees are:
 
 Code that reads shared data without a happens-before relationship to the write is a data race, and its behavior is undefined.
 
-## Step 1 -- Goroutine Creation Ordering
+## Example 1 -- Goroutine Creation Ordering
 
-Demonstrate that the `go` statement happens-before the goroutine begins executing:
+The `go` statement happens-before the goroutine begins executing. Writes before the `go` statement are visible inside the goroutine:
 
 ```go
-func goroutineCreationOrder() {
-    var msg string
+package main
 
-    msg = "hello from before go" // write happens before go statement
+import "fmt"
 
-    done := make(chan struct{})
-    go func() {
-        fmt.Printf("  Goroutine sees: %q\n", msg) // guaranteed to see the write
-        close(done)
-    }()
+func main() {
+	var msg string
 
-    <-done
+	msg = "hello from before go" // write happens before go statement
+
+	done := make(chan struct{})
+	go func() {
+		// Guaranteed to see the write above because:
+		// write to msg -> go statement -> goroutine reads msg
+		fmt.Printf("Goroutine sees: %q\n", msg)
+		close(done)
+	}()
+
+	<-done
 }
 ```
 
-The write to `msg` happens before the `go` statement, which happens before the goroutine starts. Therefore, the goroutine is guaranteed to see `msg == "hello from before go"`. This is not a data race because the happens-before chain is: write to msg -> go statement -> goroutine reads msg.
-
-### Intermediate Verification
+### Verification
 ```bash
 go run -race main.go
 ```
-No race warnings. The goroutine always prints the correct message.
+Expected: no race warnings. The goroutine always sees the correct message.
 
-## Step 2 -- Channel Send Happens-Before Receive
+## Example 2 -- Channel Send Happens-Before Receive
 
-Demonstrate that a send on a channel happens-before the receive completes:
+The most common synchronization pattern in Go. The channel operation creates the happens-before edge:
 
 ```go
-func channelSendReceiveOrder() {
-    var data int
-    ch := make(chan struct{})
+package main
 
-    go func() {
-        data = 42                // (1) write data
-        ch <- struct{}{}         // (2) send on channel
-    }()
+import "fmt"
 
-    <-ch                         // (3) receive from channel
-    fmt.Printf("  Data: %d\n", data) // (4) read data
+func main() {
+	var data int
+	ch := make(chan struct{})
 
-    // Ordering: (1) happens-before (2) [program order within goroutine]
-    //           (2) happens-before (3) [channel send hb receive]
-    //           (3) happens-before (4) [program order within goroutine]
-    // Therefore: (1) happens-before (4) -- the read sees data=42
+	go func() {
+		data = 42        // (1) write data
+		ch <- struct{}{} // (2) send on channel
+	}()
+
+	<-ch                          // (3) receive — happens-after (2)
+	fmt.Printf("Data: %d\n", data) // (4) read — sees (1) because (1) hb (2) hb (3) hb (4)
 }
 ```
 
-This is the most common synchronization pattern in Go. The channel operation establishes the happens-before edge that makes the data write visible to the data read.
+The ordering chain: (1) happens-before (2) by program order; (2) happens-before (3) by channel semantics; (3) happens-before (4) by program order. Therefore (1) happens-before (4), and the read sees data=42.
 
-### Intermediate Verification
+### Verification
 ```bash
 go run -race main.go
 ```
-Always prints 42. No race warnings.
+Expected: always prints 42. No race warnings.
 
-## Step 3 -- No Happens-Before: The Broken Version
+## Example 3 -- No Happens-Before: The Broken Version
 
-Show what happens when there is no happens-before relationship:
+Without synchronization, reads may observe stale data or no data at all:
 
 ```go
-func noHappensBefore() {
-    var data int
-    var ready bool
+package main
 
-    go func() {
-        data = 42
-        ready = true
-    }()
+import (
+	"fmt"
+	"runtime"
+)
 
-    for !ready {
-        runtime.Gosched()
-    }
+func main() {
+	var data int
+	var ready bool
 
-    fmt.Printf("  Data: %d (may not be 42!)\n", data)
+	go func() {
+		data = 42
+		ready = true // non-atomic write — no happens-before
+	}()
+
+	for !ready { // non-atomic read — data race
+		runtime.Gosched()
+	}
+
+	fmt.Printf("Data: %d (may NOT be 42!)\n", data)
 }
 ```
 
-This code has two data races: both `ready` and `data` are accessed concurrently without synchronization. There is no happens-before between the writes and reads. The race detector will report this. On weakly-ordered architectures, the reader might see `ready == true` but `data == 0` because the writes were reordered.
+This code has TWO data races: both `ready` and `data` are accessed concurrently without synchronization. On weakly-ordered architectures, the reader might see `ready == true` but `data == 0` because the CPU reordered the writes.
 
-Now fix it using a channel:
+Fix it with a channel:
 
 ```go
-func withHappensBefore() {
-    var data int
-    ch := make(chan struct{})
+package main
 
-    go func() {
-        data = 42
-        close(ch) // close happens-before receive of zero value
-    }()
+import "fmt"
 
-    <-ch // blocks until closed
-    fmt.Printf("  Data: %d (guaranteed 42)\n", data)
+func main() {
+	var data int
+	ch := make(chan struct{})
+
+	go func() {
+		data = 42
+		close(ch) // close happens-before receive of zero value
+	}()
+
+	<-ch // blocks until closed — establishes happens-before
+	fmt.Printf("Data: %d (guaranteed 42)\n", data)
 }
 ```
 
-### Intermediate Verification
+### Verification
 ```bash
 go run -race main.go
 ```
-The fixed version has no race warnings. The broken version (if uncommented) will trigger DATA RACE reports.
+The fixed version has no race warnings. The broken version (if uncommented) triggers DATA RACE reports.
 
-## Step 4 -- Mutex Unlock Happens-Before Next Lock
+## Example 4 -- Mutex Unlock Happens-Before Next Lock
 
-Demonstrate that `sync.Mutex` Unlock happens-before the next Lock on the same mutex:
+`sync.Mutex` Unlock happens-before the next Lock on the same mutex. All writes before Unlock are visible after the subsequent Lock:
 
 ```go
-func mutexOrdering() {
-    var mu sync.Mutex
-    var data string
-    var wg sync.WaitGroup
+package main
 
-    // Writer goroutine
-    wg.Add(1)
-    go func() {
-        defer wg.Done()
-        mu.Lock()
-        data = "written under lock"
-        mu.Unlock() // Unlock happens-before next Lock
-    }()
+import (
+	"fmt"
+	"sync"
+)
 
-    // Reader goroutine
-    wg.Add(1)
-    go func() {
-        defer wg.Done()
-        mu.Lock() // this Lock happens-after the Unlock above
-        fmt.Printf("  Reader sees: %q\n", data)
-        mu.Unlock()
-    }()
+func main() {
+	var mu sync.Mutex
+	var data string
 
-    wg.Wait()
+	writerDone := make(chan struct{})
+
+	// Writer: lock, write, unlock
+	go func() {
+		mu.Lock()
+		data = "written under lock"
+		mu.Unlock() // Unlock happens-before next Lock
+		close(writerDone)
+	}()
+
+	<-writerDone // ensure writer runs first
+
+	// Reader: lock, read, unlock
+	mu.Lock()
+	fmt.Printf("Reader sees: %q\n", data)
+	mu.Unlock()
 }
 ```
 
-The Unlock in the writer happens-before the Lock in the reader. All writes performed before the Unlock are visible after the subsequent Lock. This is why protecting shared data with a mutex is sufficient for correctness.
-
-### Intermediate Verification
+### Verification
 ```bash
 go run -race main.go
 ```
-No race warnings. The reader always sees the written value.
+Expected: reader sees "written under lock". No race warnings.
 
-## Step 5 -- Sync/Atomic Happens-Before
+## Example 5 -- Atomic Store Happens-Before Atomic Load
 
-Since Go 1.19, the memory model explicitly states that `sync/atomic` operations participate in happens-before. An atomic store happens-before any atomic load that observes the stored value:
+Since Go 1.19, `sync/atomic` operations formally participate in happens-before. An atomic store happens-before any atomic load that observes the stored value:
 
 ```go
-func atomicHappensBefore() {
-    var flag atomic.Int32
-    var data int
-    var wg sync.WaitGroup
+package main
 
-    wg.Add(1)
-    go func() {
-        defer wg.Done()
-        data = 42
-        flag.Store(1) // atomic store happens-before...
-    }()
+import (
+	"fmt"
+	"runtime"
+	"sync"
+	"sync/atomic"
+)
 
-    wg.Add(1)
-    go func() {
-        defer wg.Done()
-        for flag.Load() == 0 { // ...the atomic load that observes 1
-            runtime.Gosched()
-        }
-        fmt.Printf("  Data via atomic: %d\n", data)
-    }()
+func main() {
+	var flag atomic.Int32
+	var data int
+	var wg sync.WaitGroup
 
-    wg.Wait()
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		data = 42
+		flag.Store(1) // atomic store happens-before...
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for flag.Load() == 0 { // ...atomic load that observes 1
+			runtime.Gosched()
+		}
+		fmt.Printf("Data via atomic: %d\n", data)
+	}()
+
+	wg.Wait()
 }
 ```
 
-The atomic store of `flag` establishes a happens-before edge to the atomic load that reads the stored value. The write to `data` before the store is therefore visible to the read of `data` after the load.
-
-### Intermediate Verification
+### Verification
 ```bash
 go run -race main.go
 ```
-No race warnings. Data is always 42.
+Expected: always prints 42. No race warnings.
+
+## Example 6 -- Pipeline with Transitive Happens-Before
+
+Channels create happens-before edges that compose transitively. Each stage signals the next:
+
+```go
+package main
+
+import "fmt"
+
+func main() {
+	var resultA, resultB string
+	ch1 := make(chan struct{})
+	ch2 := make(chan struct{})
+
+	// Stage 1
+	go func() {
+		resultA = "alpha"
+		close(ch1)
+	}()
+
+	// Stage 2
+	go func() {
+		<-ch1
+		resultB = resultA + "-beta"
+		close(ch2)
+	}()
+
+	// Stage 3 (main goroutine)
+	<-ch2
+	fmt.Printf("Result: %s\n", resultB+"-gamma")
+}
+```
+
+The happens-before chain: `resultA` write -> `close(ch1)` -> `<-ch1` -> `resultB` write -> `close(ch2)` -> `<-ch2` -> final read. Transitivity guarantees the final reader sees all previous writes.
+
+### Verification
+```bash
+go run -race main.go
+```
+Expected: `Result: alpha-beta-gamma`. No race warnings.
+
+## Example 7 -- WaitGroup Done Happens-Before Wait Returns
+
+All `Done()` calls happen-before `Wait()` returns. Writes before `Done()` are visible after `Wait()`:
+
+```go
+package main
+
+import (
+	"fmt"
+	"sync"
+)
+
+func main() {
+	var data [3]string
+	var wg sync.WaitGroup
+
+	for i := 0; i < 3; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			data[idx] = fmt.Sprintf("result-%d", idx)
+		}(i)
+	}
+
+	wg.Wait() // all Done calls happened-before this returns
+	for i, d := range data {
+		fmt.Printf("data[%d] = %q\n", i, d)
+	}
+}
+```
+
+### Verification
+```bash
+go run -race main.go
+```
+Expected: all three data values are set. No race warnings.
 
 ## Common Mistakes
 
 ### Assuming Program Order Across Goroutines
+
 **Wrong assumption:** "I wrote `data = 42` before `go func() { print(data) }()`, so the goroutine sees 42."
-**Reality:** The `go` statement does guarantee that writes before it are visible (goroutine creation happens-before). But this only works because the `go` statement is the synchronization point, not because of source code ordering. Do not extrapolate this to arbitrary cross-goroutine access.
+
+**Reality:** This is actually correct! The `go` statement guarantees that writes before it are visible (goroutine creation happens-before). But do NOT extrapolate this to arbitrary cross-goroutine access without a `go` statement or channel in between.
 
 ### Using time.Sleep as Synchronization
+
 **Wrong:**
 ```go
-go func() { data = 42 }()
-time.Sleep(time.Second)
-fmt.Println(data) // no happens-before!
+package main
+
+import (
+	"fmt"
+	"time"
+)
+
+func main() {
+	var data int
+	go func() { data = 42 }()
+	time.Sleep(time.Second) // NOT synchronization!
+	fmt.Println(data)       // no happens-before — data race
+}
 ```
-**What happens:** `time.Sleep` does NOT establish a happens-before relationship. The Go memory model says nothing about time. The race detector will flag this, and on some architectures the read may return stale data.
+
+**What happens:** `time.Sleep` does NOT establish a happens-before relationship. The Go memory model says nothing about time. The race detector will flag this.
 
 **Fix:** Use a channel, mutex, WaitGroup, or atomic operation.
 
-### Relying on Happens-Before for Multiple Independent Variables
-**Wrong (subtle):**
+### Relying on Observation of One Variable to Infer Another
+
+**Wrong:**
 ```go
-go func() {
-    x = 1
-    y = 2
-}()
-// in another goroutine:
-if y == 2 {
-    // Can I assume x == 1?
+package main
+
+import "fmt"
+
+func main() {
+	var x, y int
+	ch := make(chan struct{})
+
+	go func() {
+		x = 1
+		y = 2
+		close(ch)
+	}()
+
+	<-ch
+	// SAFE: both x and y are visible because close(ch) hb <-ch
+	fmt.Println(x, y) // 1, 2
 }
 ```
-**What happens:** Without a synchronization point between the goroutines, there is no happens-before for either variable. Even if you observe `y == 2`, you cannot assume `x == 1`. The compiler or CPU may have reordered the writes.
 
-**Fix:** Use an atomic, channel, or mutex to establish ordering.
+This one is actually SAFE because the channel provides the happens-before edge. But WITHOUT the channel:
+```go
+go func() { x = 1; y = 2 }()
+// NO synchronization — cannot assume anything about x or y
+```
 
-## Verify What You Learned
-
-Implement `pipeline` that chains three goroutines:
-1. Stage 1: sets `resultA = "alpha"`, signals via channel
-2. Stage 2: waits for stage 1, reads `resultA`, sets `resultB = resultA + "-beta"`, signals via channel
-3. Stage 3: waits for stage 2, reads `resultB`, prints `resultB + "-gamma"`
-
-The final output must be `"alpha-beta-gamma"`. Identify the happens-before chain that guarantees correctness. Run with `-race` to confirm.
+**Fix:** Always use an explicit synchronization point (channel, mutex, atomic, WaitGroup).
 
 ## What's Next
 Continue to [07-atomic-vs-mutex-benchmark](../07-atomic-vs-mutex-benchmark/07-atomic-vs-mutex-benchmark.md) to measure the actual performance difference between atomic operations and mutexes under various contention levels.
 
 ## Summary
 - Happens-before is a partial order that determines when a write is visible to a read
-- Go provides specific guarantees: goroutine creation, channel send/receive, mutex unlock/lock, atomic store/load
+- Go provides specific guarantees: goroutine creation, channel send/receive/close, mutex unlock/lock, WaitGroup Done/Wait, atomic store/load
 - Without a happens-before relationship, a read may observe stale data -- this is a data race
 - `time.Sleep` is NOT synchronization and does NOT create happens-before edges
+- Happens-before is transitive: if A hb B and B hb C, then A hb C
 - Channels are the idiomatic way to establish happens-before in Go
 - The Go Memory Model was updated in 2022 to formally include `sync/atomic` in the happens-before relation
 

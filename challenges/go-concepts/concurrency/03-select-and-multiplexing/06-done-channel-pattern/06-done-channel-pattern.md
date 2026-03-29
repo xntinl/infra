@@ -17,7 +17,7 @@ prerequisites: [select-basics, select-in-for-loop, channels, goroutines, channel
 ## Learning Objectives
 - **Implement** a done channel to signal cancellation to one or more goroutines
 - **Explain** why closing a channel is a broadcast mechanism
-- **Propagate** cancellation across a tree of goroutines
+- **Propagate** cancellation across a multi-stage pipeline
 
 ## Why Done Channels
 
@@ -27,160 +27,324 @@ When you close a channel, every receiver waiting on it unblocks immediately. Thi
 
 This pattern is so fundamental that it was formalized into `context.Context` in Go 1.7. The `ctx.Done()` method returns exactly this kind of channel. Understanding the raw done channel pattern gives you deep intuition for how context cancellation works under the hood.
 
-## Step 1 -- Single Goroutine Cancellation
+## Example 1 -- Single Goroutine Cancellation
 
 Create a worker goroutine that runs until a done channel is closed.
 
 ```go
-done := make(chan struct{})
-results := make(chan int)
+package main
 
-go func() {
-    defer close(results)
-    i := 0
-    for {
-        select {
-        case <-done:
-            fmt.Println("worker: received cancellation")
-            return
-        case results <- i:
-            i++
-            time.Sleep(50 * time.Millisecond)
-        }
-    }
-}()
+import (
+	"fmt"
+	"time"
+)
 
-// Consume a few results
-for i := 0; i < 5; i++ {
-    fmt.Println("received:", <-results)
+func main() {
+	done := make(chan struct{})
+	results := make(chan int)
+
+	go func() {
+		defer close(results)
+		i := 0
+		for {
+			select {
+			case <-done:
+				fmt.Println("worker: received cancellation")
+				return
+			case results <- i:
+				i++
+				time.Sleep(50 * time.Millisecond)
+			}
+		}
+	}()
+
+	// Consume 5 values, then cancel.
+	for i := 0; i < 5; i++ {
+		fmt.Println("received:", <-results)
+	}
+
+	close(done)
+	time.Sleep(100 * time.Millisecond)
+	fmt.Println("main: worker stopped")
 }
-
-// Signal the worker to stop
-close(done)
-time.Sleep(100 * time.Millisecond)
-fmt.Println("main: worker stopped")
 ```
 
-The worker produces values until the done channel is closed. The main goroutine consumes 5 values, then signals cancellation. The worker detects it via the `<-done` case and returns.
+The worker produces values until the done channel is closed. The main goroutine consumes 5 values, then signals cancellation.
 
-### Intermediate Verification
-Run the program. You should see 5 values, then "worker: received cancellation" and "main: worker stopped".
+### Verification
+```
+received: 0
+received: 1
+received: 2
+received: 3
+received: 4
+worker: received cancellation
+main: worker stopped
+```
 
-## Step 2 -- Broadcasting Cancellation to Multiple Goroutines
+## Example 2 -- Broadcasting Cancellation to Multiple Goroutines
 
 Close one channel to stop multiple goroutines simultaneously.
 
 ```go
-done := make(chan struct{})
-var wg sync.WaitGroup
+package main
 
-worker := func(id int) {
-    defer wg.Done()
-    for {
-        select {
-        case <-done:
-            fmt.Printf("worker %d: stopping\n", id)
-            return
-        default:
-            fmt.Printf("worker %d: working\n", id)
-            time.Sleep(100 * time.Millisecond)
-        }
-    }
+import (
+	"fmt"
+	"sync"
+	"time"
+)
+
+func main() {
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+
+	worker := func(id int) {
+		defer wg.Done()
+		for {
+			select {
+			case <-done:
+				fmt.Printf("worker %d: stopping\n", id)
+				return
+			default:
+				fmt.Printf("worker %d: working\n", id)
+				time.Sleep(100 * time.Millisecond)
+			}
+		}
+	}
+
+	for i := 1; i <= 3; i++ {
+		wg.Add(1)
+		go worker(i)
+	}
+
+	time.Sleep(350 * time.Millisecond)
+	fmt.Println("main: cancelling all workers")
+	close(done) // One close stops all three.
+	wg.Wait()
+	fmt.Println("main: all workers stopped")
 }
-
-for i := 1; i <= 3; i++ {
-    wg.Add(1)
-    go worker(i)
-}
-
-time.Sleep(350 * time.Millisecond)
-fmt.Println("main: cancelling all workers")
-close(done)
-wg.Wait()
-fmt.Println("main: all workers stopped")
 ```
 
-One `close(done)` stops all three workers. This is the power of the broadcast property: you do not need to track or signal each goroutine individually.
+One `close(done)` stops all three workers. You do not need to track or signal each goroutine individually.
 
-### Intermediate Verification
-Run the program. You should see interleaved "working" messages from all 3 workers, followed by all 3 "stopping" messages after cancellation.
+### Verification
+```
+worker 1: working
+worker 2: working
+worker 3: working
+...
+main: cancelling all workers
+worker 2: stopping
+worker 1: stopping
+worker 3: stopping
+main: all workers stopped
+```
 
-## Step 3 -- Propagating Cancellation Through a Pipeline
+## Example 3 -- Pipeline Cancellation
 
-Build a two-stage pipeline where cancellation flows from the top through all stages.
+Build a two-stage pipeline where cancellation flows from the consumer through all stages.
 
 ```go
-done := make(chan struct{})
-var wg sync.WaitGroup
+package main
 
-// Stage 1: generates numbers
-stage1Out := make(chan int)
-wg.Add(1)
-go func() {
-    defer wg.Done()
-    defer close(stage1Out)
-    i := 0
-    for {
-        select {
-        case <-done:
-            fmt.Println("stage1: cancelled")
-            return
-        case stage1Out <- i:
-            i++
-            time.Sleep(50 * time.Millisecond)
-        }
-    }
-}()
+import (
+	"fmt"
+	"sync"
+	"time"
+)
 
-// Stage 2: doubles numbers
-stage2Out := make(chan int)
-wg.Add(1)
-go func() {
-    defer wg.Done()
-    defer close(stage2Out)
-    for {
-        select {
-        case <-done:
-            fmt.Println("stage2: cancelled")
-            return
-        case val, ok := <-stage1Out:
-            if !ok {
-                return
-            }
-            select {
-            case <-done:
-                return
-            case stage2Out <- val * 2:
-            }
-        }
-    }
-}()
+func main() {
+	done := make(chan struct{})
+	var wg sync.WaitGroup
 
-// Consumer
-for i := 0; i < 5; i++ {
-    val := <-stage2Out
-    fmt.Println("consumed:", val)
+	// Stage 1: generates numbers.
+	stage1Out := make(chan int)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer close(stage1Out)
+		i := 0
+		for {
+			select {
+			case <-done:
+				fmt.Println("stage1: cancelled")
+				return
+			case stage1Out <- i:
+				i++
+				time.Sleep(50 * time.Millisecond)
+			}
+		}
+	}()
+
+	// Stage 2: doubles numbers.
+	stage2Out := make(chan int)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer close(stage2Out)
+		for {
+			select {
+			case <-done:
+				fmt.Println("stage2: cancelled")
+				return
+			case val, ok := <-stage1Out:
+				if !ok {
+					return
+				}
+				// Check done on the send side too — prevents blocking
+				// on a write after cancellation was signaled.
+				select {
+				case <-done:
+					return
+				case stage2Out <- val * 2:
+				}
+			}
+		}
+	}()
+
+	// Consumer: take 5 values, then cancel.
+	for i := 0; i < 5; i++ {
+		fmt.Println("consumed:", <-stage2Out)
+	}
+
+	close(done)
+	wg.Wait()
+	fmt.Println("pipeline shut down cleanly")
 }
-
-close(done)
-wg.Wait()
-fmt.Println("pipeline shut down cleanly")
 ```
 
-Both stages check the same done channel. When the consumer closes it, both stages exit. The `sync.WaitGroup` ensures the main goroutine waits for all stages to finish cleanup before proceeding.
+Both stages check the same done channel. The `sync.WaitGroup` ensures main waits for all stages to finish cleanup.
 
-### Intermediate Verification
-Run the program. You should see 5 consumed values (0, 2, 4, 6, 8), then both stages reporting cancellation, then "pipeline shut down cleanly".
+### Verification
+```
+consumed: 0
+consumed: 2
+consumed: 4
+consumed: 6
+consumed: 8
+stage1: cancelled
+stage2: cancelled
+pipeline shut down cleanly
+```
+
+## Example 4 -- Done Channel with Graceful Cleanup
+
+The worker drains its internal buffer before exiting. This demonstrates that done is a signal, not a kill.
+
+```go
+package main
+
+import (
+	"fmt"
+	"time"
+)
+
+func main() {
+	done := make(chan struct{})
+	finished := make(chan struct{})
+
+	go func() {
+		defer close(finished)
+		var buffer []int
+
+		for i := 0; i < 5; i++ {
+			buffer = append(buffer, i)
+			fmt.Printf("worker: buffered item %d\n", i)
+			time.Sleep(50 * time.Millisecond)
+		}
+
+		// Wait for cancellation signal.
+		<-done
+
+		// Graceful shutdown: flush before exiting.
+		fmt.Printf("worker: flushing %d items\n", len(buffer))
+		for _, item := range buffer {
+			fmt.Printf("  flushed: %d\n", item)
+		}
+		fmt.Println("worker: cleanup complete")
+	}()
+
+	time.Sleep(300 * time.Millisecond)
+	close(done)
+	<-finished
+}
+```
+
+### Verification
+```
+worker: buffered item 0
+worker: buffered item 1
+worker: buffered item 2
+worker: buffered item 3
+worker: buffered item 4
+worker: flushing 5 items
+  flushed: 0
+  flushed: 1
+  flushed: 2
+  flushed: 3
+  flushed: 4
+worker: cleanup complete
+```
 
 ## Common Mistakes
 
-1. **Sending a value on the done channel instead of closing it.** Sending a value only wakes one receiver. If you have 5 goroutines, you would need to send 5 values. Closing is the correct approach because it wakes all receivers.
+### 1. Sending a Value Instead of Closing
+Sending a value on the done channel only wakes one receiver. If you have 5 goroutines, you need to send 5 values. Closing wakes ALL receivers:
 
-2. **Using `chan bool` instead of `chan struct{}`.** Both work, but `chan struct{}` communicates intent: this channel carries a signal, not data. It also has zero allocation cost per element.
+```go
+// BAD: only wakes one goroutine.
+done <- struct{}{}
 
-3. **Checking done outside of select.** A direct `<-done` blocks until the channel is closed. It must be inside a `select` alongside the work channel so the goroutine can do work while also being responsive to cancellation.
+// GOOD: wakes all goroutines.
+close(done)
+```
 
-4. **Forgetting to check done on both sides of a pipeline stage.** A stage that reads from an input channel and writes to an output channel needs done checks on both operations. Otherwise, it can block on a write after cancellation was signaled.
+### 2. Using chan bool Instead of chan struct{}
+Both work, but `chan struct{}` communicates intent: this channel carries a signal, not data. It also has zero allocation cost per element:
+
+```go
+// Acceptable but unclear intent.
+done := make(chan bool)
+
+// Preferred: zero-size signal.
+done := make(chan struct{})
+```
+
+### 3. Checking Done Outside of Select
+A direct `<-done` blocks until the channel is closed. It must be inside a `select` alongside the work channel so the goroutine can do work while also being responsive to cancellation:
+
+```go
+// BAD: blocks until done is closed. Cannot do work.
+<-done
+
+// GOOD: checks done alongside work.
+select {
+case <-done:
+    return
+case results <- value:
+}
+```
+
+### 4. Forgetting Done on Both Sides of a Pipeline Stage
+A stage that reads from input and writes to output needs done checks on BOTH operations. Otherwise, it can block on a write after cancellation:
+
+```go
+// BAD: can block on the send after done is closed.
+case val := <-input:
+    output <- val * 2
+
+// GOOD: checks done on the send.
+case val, ok := <-input:
+    if !ok {
+        return
+    }
+    select {
+    case <-done:
+        return
+    case output <- val * 2:
+    }
+```
 
 ## Verify What You Learned
 

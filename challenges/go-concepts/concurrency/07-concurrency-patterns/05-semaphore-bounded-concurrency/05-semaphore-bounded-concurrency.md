@@ -26,17 +26,34 @@ A semaphore limits the number of concurrent operations. In Go, a buffered channe
 
 The semaphore pattern differs from worker pools in a subtle but important way. With a worker pool, you have a fixed set of long-lived goroutines processing a shared queue. With a semaphore, you launch a new goroutine per task but limit how many run simultaneously. The goroutines are short-lived -- each handles exactly one task and exits.
 
-This pattern is ideal when tasks are heterogeneous (different function signatures, different work) and a uniform worker pool does not fit. It is also simpler to implement when you do not need a jobs-results pipeline. The trade-off is that you create more goroutines over time (one per task instead of reusing N workers), but since goroutines are cheap, this is rarely a problem.
+```
+  Semaphore Flow
+
+  main loop:
+    for each task:
+      sem <- struct{}{}    // ACQUIRE (blocks if N already running)
+      go func() {
+        defer func() { <-sem }()  // RELEASE
+        doWork()
+      }()
+
+  Buffered channel capacity = max concurrent goroutines
+```
 
 ## Step 1 -- Buffered Channel as Semaphore
 
 Create a semaphore and use it to limit concurrency.
 
-Edit `main.go` and implement the `basicSemaphore` function:
-
 ```go
-func basicSemaphore() {
-    fmt.Println("=== Basic Semaphore ===")
+package main
+
+import (
+    "fmt"
+    "sync"
+    "time"
+)
+
+func main() {
     const maxConcurrency = 3
     const totalTasks = 10
 
@@ -51,13 +68,12 @@ func basicSemaphore() {
             defer func() { <-sem }() // release
 
             fmt.Printf("  task %d: started\n", id)
-            time.Sleep(100 * time.Millisecond) // simulate work
+            time.Sleep(100 * time.Millisecond)
             fmt.Printf("  task %d: done\n", id)
         }(i)
     }
 
     wg.Wait()
-    fmt.Println()
 }
 ```
 
@@ -69,7 +85,6 @@ go run main.go
 ```
 Expected: at most 3 tasks run concurrently. You will see groups of 3 starting, then finishing:
 ```
-=== Basic Semaphore ===
   task 1: started
   task 2: started
   task 3: started
@@ -83,8 +98,16 @@ Expected: at most 3 tasks run concurrently. You will see groups of 3 starting, t
 Add instrumentation to prove the semaphore works by tracking the count of active goroutines:
 
 ```go
-func trackedSemaphore() {
-    fmt.Println("=== Tracked Semaphore ===")
+package main
+
+import (
+    "fmt"
+    "sync"
+    "sync/atomic"
+    "time"
+)
+
+func main() {
     const maxConcurrency = 3
     const totalTasks = 12
 
@@ -112,7 +135,7 @@ func trackedSemaphore() {
     }
 
     wg.Wait()
-    fmt.Println()
+    fmt.Printf("Max concurrency respected: active never exceeded %d\n", maxConcurrency)
 }
 ```
 
@@ -129,8 +152,15 @@ Expected: active count stays at or below 3.
 Implement the same work using both approaches and compare:
 
 ```go
-func compareApproaches() {
-    fmt.Println("=== Semaphore vs Worker Pool ===")
+package main
+
+import (
+    "fmt"
+    "sync"
+    "time"
+)
+
+func main() {
     const numTasks = 15
     const concurrency = 4
 
@@ -148,7 +178,7 @@ func compareApproaches() {
         }(i)
     }
     wg1.Wait()
-    fmt.Printf("  Semaphore: %v\n", time.Since(start))
+    fmt.Printf("Semaphore:   %v\n", time.Since(start))
 
     // Worker pool approach
     start = time.Now()
@@ -168,8 +198,7 @@ func compareApproaches() {
     }
     close(jobs)
     wg2.Wait()
-    fmt.Printf("  Worker pool: %v\n", time.Since(start))
-    fmt.Println()
+    fmt.Printf("Worker pool: %v\n", time.Since(start))
 }
 ```
 
@@ -177,18 +206,37 @@ func compareApproaches() {
 ```bash
 go run main.go
 ```
-Both approaches should take roughly the same time. The performance difference is negligible for most workloads.
+Both approaches should take roughly the same time.
 
 ## Common Mistakes
 
 ### Acquiring Inside the Goroutine
 **Wrong:**
 ```go
-go func(id int) {
-    sem <- struct{}{} // acquire inside goroutine
-    defer func() { <-sem }()
-    // ...
-}(i)
+package main
+
+import (
+    "fmt"
+    "sync"
+    "time"
+)
+
+func main() {
+    sem := make(chan struct{}, 3)
+    var wg sync.WaitGroup
+
+    for i := 0; i < 100; i++ {
+        wg.Add(1)
+        go func(id int) { // ALL 100 goroutines launch immediately
+            sem <- struct{}{}     // acquire inside goroutine
+            defer func() { <-sem }()
+            defer wg.Done()
+            fmt.Printf("task %d\n", id)
+            time.Sleep(100 * time.Millisecond)
+        }(i)
+    }
+    wg.Wait()
+}
 ```
 **What happens:** All goroutines launch immediately (unbounded), then compete for the semaphore. You get a burst of goroutine creation, defeating the purpose.
 
@@ -200,7 +248,6 @@ go func(id int) {
 go func(id int) {
     defer wg.Done()
     // forgot: defer func() { <-sem }()
-    sem <- struct{}{}
     doWork()
 }(i)
 ```
@@ -213,7 +260,11 @@ A mutex limits concurrency to 1. If you need N > 1, a mutex does not work. A buf
 
 ## Verify What You Learned
 
-Implement a URL fetcher simulation that processes 20 URLs with a semaphore limiting to 5 concurrent "downloads". Each download sleeps for a random duration (50-150ms). Print the start and end of each download with timestamps to verify the concurrency limit.
+Run `go run main.go` and verify:
+- Basic semaphore: all 10 tasks complete, at most 3 concurrent
+- Tracked semaphore: active count never exceeds 3
+- Comparison: semaphore and worker pool have similar performance
+- URL fetcher: at most 5 concurrent downloads, all 20 complete
 
 ## What's Next
 Continue to [06-generator-lazy-production](../06-generator-lazy-production/06-generator-lazy-production.md) to learn how to produce values lazily with channels.

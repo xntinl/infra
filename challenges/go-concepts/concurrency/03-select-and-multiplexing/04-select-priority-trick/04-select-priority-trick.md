@@ -27,138 +27,271 @@ Go has no built-in priority `select`. The language designers intentionally avoid
 
 Understanding this pattern also highlights a deeper truth: `select` is a building block, not a complete solution. Complex scheduling requires deliberate design above the language primitives.
 
-## Step 1 -- Demonstrating Random Selection
+## Example 1 -- Demonstrating Random Selection
 
-First, prove that `select` is truly random when both channels are ready. Send many values on two channels and count which case gets selected.
-
-```go
-high := make(chan string, 100)
-low := make(chan string, 100)
-
-for i := 0; i < 100; i++ {
-    high <- "high"
-    low <- "low"
-}
-
-highCount, lowCount := 0, 0
-for i := 0; i < 100; i++ {
-    select {
-    case <-high:
-        highCount++
-    case <-low:
-        lowCount++
-    }
-}
-
-fmt.Printf("high: %d, low: %d\n", highCount, lowCount)
-```
-
-You will see roughly 50/50 distribution. The "high" channel gets no special treatment.
-
-### Intermediate Verification
-Run multiple times. Both counts should hover around 50, varying by ~10. This confirms random selection.
-
-## Step 2 -- The Nested Select Trick
-
-To prioritize the high channel, check it first in an inner `select` with a `default` case. Only fall through to the outer `select` (which listens on both) if the high channel is empty.
+First, prove that `select` is truly random when both channels are ready.
 
 ```go
-high := make(chan string, 100)
-low := make(chan string, 100)
+package main
 
-for i := 0; i < 100; i++ {
-    high <- "high"
-    low <- "low"
-}
+import "fmt"
 
-highCount, lowCount := 0, 0
-for i := 0; i < 200; i++ {
-    select {
-    case <-high:
-        highCount++
-    default:
-        select {
-        case <-high:
-            highCount++
-        case <-low:
-            lowCount++
-        }
-    }
-}
+func main() {
+	high := make(chan string, 100)
+	low := make(chan string, 100)
 
-fmt.Printf("high: %d, low: %d\n", highCount, lowCount)
-```
+	for i := 0; i < 100; i++ {
+		high <- "high"
+		low <- "low"
+	}
 
-The outer `select` first tries to receive from `high` only. If `high` is empty (hits `default`), the inner `select` listens on both channels. This drains the high-priority channel before touching the low-priority one.
+	highCount, lowCount := 0, 0
+	for i := 0; i < 100; i++ {
+		select {
+		case <-high:
+			highCount++
+		case <-low:
+			lowCount++
+		}
+	}
 
-### Intermediate Verification
-Run the program. You should see approximately `high: 100, low: 100`, but critically, the high messages are consumed first. Add print statements inside the cases to verify ordering.
-
-## Step 3 -- Priority with Continuous Producers
-
-Apply the pattern to live goroutines that produce messages at different rates.
-
-```go
-high := make(chan string, 10)
-low := make(chan string, 10)
-done := make(chan struct{})
-
-// High-priority producer
-go func() {
-    for i := 0; i < 5; i++ {
-        high <- fmt.Sprintf("URGENT-%d", i)
-        time.Sleep(50 * time.Millisecond)
-    }
-}()
-
-// Low-priority producer
-go func() {
-    for i := 0; i < 20; i++ {
-        low <- fmt.Sprintf("normal-%d", i)
-        time.Sleep(10 * time.Millisecond)
-    }
-    close(done)
-}()
-
-for {
-    select {
-    case msg := <-high:
-        fmt.Println("[HIGH]", msg)
-    default:
-        select {
-        case msg := <-high:
-            fmt.Println("[HIGH]", msg)
-        case msg := <-low:
-            fmt.Println("[LOW]", msg)
-        case <-done:
-            fmt.Println("all producers finished")
-            return
-        }
-    }
+	fmt.Printf("high: %d, low: %d\n", highCount, lowCount)
 }
 ```
 
-The high-priority messages appear as soon as they arrive, even when low-priority messages are also available.
+### Verification
+Run multiple times. Both counts should hover around 50, varying by ~10:
+```
+high: 47, low: 53
+```
 
-### Intermediate Verification
-Run the program. Observe that URGENT messages are processed immediately, while normal messages fill the gaps.
+## Example 2 -- The Nested Select Trick
+
+To prioritize the high channel, check it first in an outer `select` with a `default` case. Only fall through to the inner `select` (which listens on both) if the high channel is empty.
+
+```go
+package main
+
+import "fmt"
+
+func main() {
+	high := make(chan string, 100)
+	low := make(chan string, 100)
+
+	for i := 0; i < 100; i++ {
+		high <- "high"
+		low <- "low"
+	}
+
+	highCount, lowCount := 0, 0
+	for i := 0; i < 200; i++ {
+		select {
+		case <-high:
+			highCount++
+		default:
+			// High channel empty — fall through to inner select.
+			select {
+			case <-high:
+				highCount++
+			case <-low:
+				lowCount++
+			}
+		}
+	}
+
+	fmt.Printf("high: %d, low: %d\n", highCount, lowCount)
+}
+```
+
+The outer `select` first tries to receive from `high` only. If `high` is empty (hits `default`), the inner `select` listens on both channels. This ensures high-priority messages are drained before low-priority ones get attention.
+
+### Verification
+```
+high: 100, low: 100
+```
+All 100 high messages are consumed first, then all 100 low messages. Add print statements inside the cases to verify ordering.
+
+## Example 3 -- Priority with Live Producers
+
+Apply the pattern to goroutines that produce messages at different rates.
+
+```go
+package main
+
+import (
+	"fmt"
+	"time"
+)
+
+func main() {
+	highCh := make(chan string, 10)
+	lowCh := make(chan string, 10)
+	done := make(chan struct{})
+
+	// High-priority: 5 messages, 50ms apart.
+	go func() {
+		for i := 0; i < 5; i++ {
+			highCh <- fmt.Sprintf("URGENT-%d", i)
+			time.Sleep(50 * time.Millisecond)
+		}
+	}()
+
+	// Low-priority: 20 messages, 10ms apart.
+	go func() {
+		for i := 0; i < 20; i++ {
+			lowCh <- fmt.Sprintf("normal-%d", i)
+			time.Sleep(10 * time.Millisecond)
+		}
+		close(done)
+	}()
+
+	for {
+		select {
+		case msg := <-highCh:
+			fmt.Println("[HIGH]", msg)
+		default:
+			select {
+			case msg := <-highCh:
+				fmt.Println("[HIGH]", msg)
+			case msg := <-lowCh:
+				fmt.Println("[LOW]", msg)
+			case <-done:
+				fmt.Println("all producers finished")
+				return
+			}
+		}
+	}
+}
+```
+
+### Verification
+URGENT messages appear as soon as they arrive, interleaved with normal messages during gaps:
+```
+[LOW]  normal-0
+[LOW]  normal-1
+[HIGH] URGENT-0
+[LOW]  normal-2
+...
+all producers finished
+```
+
+## Example 4 -- Understanding the Limitation
+
+The nested select is best-effort, not absolute. Between the outer `default` and the inner `select`, a high-priority message can arrive. The inner `select` then sees both channels ready and picks randomly.
+
+```go
+package main
+
+import "fmt"
+
+func main() {
+	hi := make(chan string, 50)
+	lo := make(chan string, 50)
+
+	for i := 0; i < 50; i++ {
+		hi <- "hi"
+		lo <- "lo"
+	}
+
+	hiWins, loWins := 0, 0
+
+	for i := 0; i < 50; i++ {
+		select {
+		case <-hi:
+			hiWins++
+		default:
+			select {
+			case <-hi:
+				hiWins++
+			case <-lo:
+				loWins++
+			}
+		}
+	}
+
+	fmt.Printf("hi: %d, lo: %d\n", hiWins, loWins)
+	if loWins > 0 {
+		fmt.Println("lo > 0 proves priority is best-effort, not absolute")
+	}
+}
+```
+
+### Verification
+```
+hi: 48, lo: 2
+```
+The exact split varies, but `lo` is almost always > 0. The outer select consumes most high messages, but occasionally the default fires when `hi` has data (race between evaluation and availability).
 
 ## Common Mistakes
 
-1. **Assuming perfect priority.** The nested select trick is best-effort. Between the outer `default` and the inner `select`, a high-priority message might arrive. The inner `select` then sees both channels ready and picks randomly. Priority is strongly biased, not absolute.
+### 1. Assuming Perfect Priority
+The nested select trick is best-effort. Between the outer `default` and the inner `select`, a high-priority message might arrive. The inner `select` then sees both channels ready and picks randomly. Priority is strongly biased, not absolute.
 
-2. **Starving low-priority channels.** If the high-priority channel always has data, the low-priority channel is never read. This is by design for priority, but if the low-priority channel has a bounded buffer, its senders will block and potentially deadlock. Monitor queue depths.
+### 2. Starving Low-Priority Channels
+If the high-priority channel always has data, the low-priority channel is never read. This is by design for priority, but if the low-priority channel has a bounded buffer, its senders will block and potentially deadlock. Monitor queue depths.
 
-3. **Nesting too deeply.** More than two priority levels with nested selects becomes unreadable. For complex priority, use a priority queue data structure protected by a mutex instead.
+### 3. Nesting Too Deeply
+More than two priority levels with nested selects becomes unreadable and error-prone. For three or more levels, use a priority queue data structure protected by a mutex:
 
-4. **Forgetting the done/quit channel in the inner select.** If `done` is only in the outer select, the goroutine can get stuck in the inner select waiting on low-priority messages after shutdown was signaled.
+```go
+package main
+
+import (
+	"container/heap"
+	"fmt"
+	"sync"
+)
+
+// Item represents a prioritized message.
+type Item struct {
+	value    string
+	priority int // lower = higher priority
+}
+
+// PriorityQueue implements heap.Interface.
+type PriorityQueue []*Item
+
+func (pq PriorityQueue) Len() int            { return len(pq) }
+func (pq PriorityQueue) Less(i, j int) bool   { return pq[i].priority < pq[j].priority }
+func (pq PriorityQueue) Swap(i, j int)        { pq[i], pq[j] = pq[j], pq[i] }
+func (pq *PriorityQueue) Push(x interface{})  { *pq = append(*pq, x.(*Item)) }
+func (pq *PriorityQueue) Pop() interface{} {
+	old := *pq
+	n := len(old)
+	item := old[n-1]
+	*pq = old[:n-1]
+	return item
+}
+
+func main() {
+	var mu sync.Mutex
+	pq := &PriorityQueue{}
+	heap.Init(pq)
+
+	mu.Lock()
+	heap.Push(pq, &Item{value: "low task", priority: 3})
+	heap.Push(pq, &Item{value: "critical task", priority: 1})
+	heap.Push(pq, &Item{value: "medium task", priority: 2})
+	mu.Unlock()
+
+	mu.Lock()
+	for pq.Len() > 0 {
+		item := heap.Pop(pq).(*Item)
+		fmt.Printf("priority %d: %s\n", item.priority, item.value)
+	}
+	mu.Unlock()
+}
+```
+
+### 4. Forgetting the Done Channel in the Inner Select
+If `done` is only in the outer select, the goroutine can get stuck in the inner select waiting on low-priority messages after shutdown was signaled. Always include the done/quit channel in the inner select too.
 
 ## Verify What You Learned
 
 - [ ] Can you explain why a flat `select` cannot provide priority?
 - [ ] Can you draw the flow of the nested select pattern?
-- [ ] Can you describe a scenario where the priority trick fails (gives random selection)?
-- [ ] Can you explain when you should use a priority queue + mutex instead?
+- [ ] Can you describe a scenario where the priority trick gives random selection instead of priority?
+- [ ] Can you explain when a priority queue + mutex is better than nested select?
 
 ## What's Next
 In the next exercise, you will combine `select` with `for` loops to build continuous event loops -- the standard pattern for long-running goroutines.

@@ -8,40 +8,67 @@ import (
 	"time"
 )
 
-// ============================================================
-// Step 1: The problem — data race without protection
-// Run with: go run -race main.go
-// ============================================================
+// This program compares channels vs shared memory (mutexes) for the same problems.
+// Run: go run main.go
+// Run with race detector: go run -race main.go (skip example 1 which intentionally races)
+//
+// Expected output:
+//   === Example 1: Data Race (The Problem) ===
+//   Counter: ~1000 (may be wrong without -race flag)
+//
+//   === Example 2: Mutex Solution ===
+//   Counter: 1000 (always correct)
+//
+//   === Example 3: Channel Solution ===
+//   Counter: 1000 (always correct, no shared state)
+//
+//   === Example 4: Cache -- Both Approaches ===
+//   Mutex cache and channel cache produce same results
+//
+//   === Example 5: Hit Counter Benchmark ===
+//   Mutex: faster for simple state guarding
+//   Channel: cleaner for complex coordination
 
-func step1DataRace() {
-	fmt.Println("--- Step 1: Data Race (run with -race to detect) ---")
+func main() {
+	example1DataRace()
+	example2MutexCounter()
+	example3ChannelCounter()
+	example4CacheComparison()
+	example5HitCounterBenchmark()
+}
 
-	var counter int
+// example1DataRace shows the problem: multiple goroutines modify shared state without
+// synchronization. The result is undefined -- sometimes correct, sometimes wrong.
+// Run with `go run -race main.go` to see the race detector flag it.
+func example1DataRace() {
+	fmt.Println("=== Example 1: Data Race (The Problem) ===")
+
+	counter := 0
 	var wg sync.WaitGroup
 
 	for i := 0; i < 1000; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			counter++ // DATA RACE: unsynchronized access
+			// DATA RACE: counter++ is read-modify-write, not atomic.
+			// Two goroutines can read the same value, both increment, both write --
+			// one increment is lost.
+			counter++
 		}()
 	}
 
 	wg.Wait()
-	fmt.Printf("Counter: %d (expected 1000, got something else with -race)\n", counter)
+	fmt.Printf("Counter: %d (expected 1000, may be wrong due to race)\n\n", counter)
 }
 
-// ============================================================
-// Step 2: Solution A — Mutex
-// ============================================================
+// example2MutexCounter fixes the race with sync.Mutex: lock before access, unlock after.
+// Simple, low overhead, directly protects the data.
+func example2MutexCounter() {
+	fmt.Println("=== Example 2: Mutex Solution ===")
 
-func step2Mutex() {
-	fmt.Println("--- Step 2: Mutex Counter ---")
-
-	var counter int
+	counter := 0
 	var mu sync.Mutex
 	var wg sync.WaitGroup
-
 	start := time.Now()
 
 	for i := 0; i < 1000; i++ {
@@ -56,58 +83,51 @@ func step2Mutex() {
 
 	wg.Wait()
 	elapsed := time.Since(start)
-	fmt.Printf("Counter: %d (took %v)\n", counter, elapsed)
+	fmt.Printf("Counter: %d (took %v)\n\n", counter, elapsed)
 }
 
-// ============================================================
-// Step 3: Solution B — Channel
-// ============================================================
-
-func step3Channel() {
-	fmt.Println("--- Step 3: Channel Counter ---")
+// example3ChannelCounter fixes the race with channels: a dedicated goroutine owns
+// the counter. Other goroutines send increment signals. No shared state at all.
+func example3ChannelCounter() {
+	fmt.Println("=== Example 3: Channel Solution ===")
 
 	start := time.Now()
 
-	// TODO: Create a channel for increment signals
-	// increments := make(chan struct{}, 100)
-	// result := make(chan int)
+	// Increment signals and result channel.
+	increments := make(chan struct{}, 100)
+	result := make(chan int)
 
-	// Counter goroutine: owns the counter, no shared state
-	// TODO: Launch goroutine that counts increments, sends result when channel closes
-	// go func() {
-	//     counter := 0
-	//     for range increments {
-	//         counter++
-	//     }
-	//     result <- counter
-	// }()
+	// Counter goroutine: the ONLY goroutine that touches the counter variable.
+	go func() {
+		counter := 0
+		for range increments {
+			counter++
+		}
+		result <- counter
+	}()
 
-	// Send 1000 increments
+	// 1000 goroutines send increment signals. They never touch the counter directly.
 	var wg sync.WaitGroup
 	for i := 0; i < 1000; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			// TODO: Send increment signal
-			// increments <- struct{}{}
+			increments <- struct{}{}
 		}()
 	}
 
 	wg.Wait()
-	// TODO: Close increments channel and receive final count
-	// close(increments)
-	// total := <-result
+	close(increments) // signal counter goroutine that no more increments are coming
+	total := <-result
 
 	elapsed := time.Since(start)
-	fmt.Printf("Counter: (implement me) (took %v)\n", elapsed)
+	fmt.Printf("Counter: %d (took %v, no shared state)\n\n", total, elapsed)
 }
 
-// ============================================================
-// Step 4: Richer problem — Concurrent Cache
-// ============================================================
+// --- Cache: a richer problem that shows when channels vs mutexes each shine ---
 
-// --- Mutex version ---
-
+// MutexCache uses RWMutex for concurrent-safe access. RLock allows multiple concurrent
+// readers, which is efficient for read-heavy workloads.
 type MutexCache struct {
 	mu    sync.RWMutex
 	items map[string]string
@@ -130,15 +150,14 @@ func (c *MutexCache) Get(key string) (string, bool) {
 	return val, ok
 }
 
-// --- Channel version ---
-
+// ChannelCache uses a service goroutine that owns the map.
 type CacheResponse struct {
 	Value string
 	Found bool
 }
 
 type CacheRequest struct {
-	Op    string // "get", "set"
+	Op    string
 	Key   string
 	Value string
 	Reply chan CacheResponse
@@ -146,63 +165,66 @@ type CacheRequest struct {
 
 func cacheService(requests <-chan CacheRequest) {
 	items := make(map[string]string)
-
 	for req := range requests {
 		switch req.Op {
 		case "set":
 			items[req.Key] = req.Value
 			req.Reply <- CacheResponse{Value: req.Value, Found: true}
 		case "get":
-			// TODO: Look up key, respond with value and found status
 			val, ok := items[req.Key]
 			req.Reply <- CacheResponse{Value: val, Found: ok}
 		}
 	}
 }
 
-func step4() {
-	fmt.Println("--- Step 4: Cache Comparison ---")
+// example4CacheComparison runs the same operations on both cache implementations
+// and verifies they produce identical results.
+func example4CacheComparison() {
+	fmt.Println("=== Example 4: Cache -- Both Approaches ===")
 
-	// Mutex version
+	// --- Mutex version ---
 	fmt.Println("  Mutex Cache:")
 	mc := NewMutexCache()
 	mc.Set("language", "Go")
-	mc.Set("year", "2009")
+	mc.Set("creator", "Rob Pike")
 	if val, ok := mc.Get("language"); ok {
-		fmt.Println("    language =", val)
+		fmt.Printf("    language = %s\n", val)
+	}
+	if val, ok := mc.Get("creator"); ok {
+		fmt.Printf("    creator = %s\n", val)
 	}
 
-	// Channel version
+	// --- Channel version ---
 	fmt.Println("  Channel Cache:")
 	requests := make(chan CacheRequest)
 	go cacheService(requests)
 
-	// TODO: Use the channel cache to set and get values
-	// reply := make(chan CacheResponse, 1)
-	// requests <- CacheRequest{Op: "set", Key: "language", Value: "Go", Reply: reply}
-	// <-reply
-	// requests <- CacheRequest{Op: "get", Key: "language", Reply: reply}
-	// resp := <-reply
-	// fmt.Println("    language =", resp.Value)
+	reply := make(chan CacheResponse, 1)
+	requests <- CacheRequest{Op: "set", Key: "language", Value: "Go", Reply: reply}
+	<-reply
+	requests <- CacheRequest{Op: "set", Key: "creator", Value: "Rob Pike", Reply: reply}
+	<-reply
+
+	requests <- CacheRequest{Op: "get", Key: "language", Reply: reply}
+	resp := <-reply
+	fmt.Printf("    language = %s\n", resp.Value)
+
+	requests <- CacheRequest{Op: "get", Key: "creator", Reply: reply}
+	resp = <-reply
+	fmt.Printf("    creator = %s\n", resp.Value)
 
 	close(requests)
+	fmt.Println()
 }
 
-// ============================================================
-// Final Challenge: Hit Counter — Both Versions
-//
-// Track page views with record(page) and topPages(n)
-// 100 goroutines, each recording 100 views across 10 pages
-// Compare both implementations
-// ============================================================
+// --- Hit Counter: benchmark comparing both approaches ---
 
 var pages = []string{
 	"/home", "/about", "/products", "/blog", "/contact",
 	"/faq", "/pricing", "/docs", "/login", "/signup",
 }
 
-// --- Mutex Hit Counter ---
-
+// MutexHitCounter protects a map with a mutex.
 type MutexHitCounter struct {
 	mu   sync.Mutex
 	hits map[string]int
@@ -213,39 +235,9 @@ func NewMutexHitCounter() *MutexHitCounter {
 }
 
 func (h *MutexHitCounter) Record(page string) {
-	// TODO: Lock, increment hits[page], unlock
-}
-
-func (h *MutexHitCounter) TopPages(n int) []struct {
-	Page  string
-	Count int
-} {
 	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	type entry struct {
-		Page  string
-		Count int
-	}
-	var entries []entry
-	for page, count := range h.hits {
-		entries = append(entries, entry{page, count})
-	}
-	sort.Slice(entries, func(i, j int) bool {
-		return entries[i].Count > entries[j].Count
-	})
-
-	result := make([]struct {
-		Page  string
-		Count int
-	}, 0, n)
-	for i := 0; i < n && i < len(entries); i++ {
-		result = append(result, struct {
-			Page  string
-			Count int
-		}{entries[i].Page, entries[i].Count})
-	}
-	return result
+	h.hits[page]++
+	h.mu.Unlock()
 }
 
 func (h *MutexHitCounter) Total() int {
@@ -258,10 +250,31 @@ func (h *MutexHitCounter) Total() int {
 	return total
 }
 
-// --- Channel Hit Counter ---
+func (h *MutexHitCounter) TopPages(n int) []PageCount {
+	h.mu.Lock()
+	defer h.mu.Unlock()
 
+	var entries []PageCount
+	for page, count := range h.hits {
+		entries = append(entries, PageCount{page, count})
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].Count > entries[j].Count
+	})
+	if n < len(entries) {
+		entries = entries[:n]
+	}
+	return entries
+}
+
+type PageCount struct {
+	Page  string
+	Count int
+}
+
+// ChannelHitCounter uses a service goroutine to manage state.
 type HitRequest struct {
-	Op    string // "record", "top", "total"
+	Op    string
 	Page  string
 	N     int
 	Reply chan interface{}
@@ -273,12 +286,10 @@ func hitCounterService(requests <-chan HitRequest) {
 	for req := range requests {
 		switch req.Op {
 		case "record":
-			// TODO: Increment hits[req.Page], reply with nil
 			hits[req.Page]++
 			req.Reply <- nil
 
 		case "total":
-			// TODO: Sum all hits, reply with total (int)
 			total := 0
 			for _, c := range hits {
 				total += c
@@ -286,14 +297,9 @@ func hitCounterService(requests <-chan HitRequest) {
 			req.Reply <- total
 
 		case "top":
-			// TODO: Sort and reply with top N pages
-			type entry struct {
-				Page  string
-				Count int
-			}
-			var entries []entry
+			var entries []PageCount
 			for page, count := range hits {
-				entries = append(entries, entry{page, count})
+				entries = append(entries, PageCount{page, count})
 			}
 			sort.Slice(entries, func(i, j int) bool {
 				return entries[i].Count > entries[j].Count
@@ -306,10 +312,13 @@ func hitCounterService(requests <-chan HitRequest) {
 	}
 }
 
-func finalChallenge() {
-	fmt.Println("--- Final: Hit Counter Comparison ---")
+// example5HitCounterBenchmark runs 10,000 operations on both implementations
+// and compares timing. The mutex version is typically faster for this use case
+// because channels have higher per-operation overhead.
+func example5HitCounterBenchmark() {
+	fmt.Println("=== Example 5: Hit Counter Benchmark ===")
 
-	// ---- Mutex version ----
+	// --- Mutex version ---
 	fmt.Println("\n  Mutex Version:")
 	mhc := NewMutexHitCounter()
 	var wg1 sync.WaitGroup
@@ -335,7 +344,7 @@ func finalChallenge() {
 		fmt.Printf("      %s: %d\n", p.Page, p.Count)
 	}
 
-	// ---- Channel version ----
+	// --- Channel version ---
 	fmt.Println("\n  Channel Version:")
 	requests := make(chan HitRequest, 100)
 	go hitCounterService(requests)
@@ -350,7 +359,6 @@ func finalChallenge() {
 			for i := 0; i < 100; i++ {
 				page := pages[rand.Intn(len(pages))]
 				reply := make(chan interface{}, 1)
-				// TODO: Send record request and wait for reply
 				requests <- HitRequest{Op: "record", Page: page, Reply: reply}
 				<-reply
 			}
@@ -359,43 +367,35 @@ func finalChallenge() {
 	wg2.Wait()
 	elapsed2 := time.Since(start2)
 
-	// Query total
+	// Query total.
 	reply := make(chan interface{}, 1)
 	requests <- HitRequest{Op: "total", Reply: reply}
 	total := (<-reply).(int)
 
-	// Query top 3
+	// Query top 3.
 	requests <- HitRequest{Op: "top", N: 3, Reply: reply}
-	// topResult := (<-reply) // type assert to use
+	topResult := (<-reply).([]PageCount)
 
 	fmt.Printf("    Total hits: %d (expected 10000)\n", total)
 	fmt.Printf("    Time: %v\n", elapsed2)
-
-	// TODO: Print top 3 pages from channel version
+	fmt.Println("    Top 3:")
+	for _, p := range topResult {
+		fmt.Printf("      %s: %d\n", p.Page, p.Count)
+	}
 
 	close(requests)
 
-	// Comparison
+	// --- Comparison ---
 	fmt.Println("\n  Comparison:")
 	fmt.Printf("    Mutex:   %v\n", elapsed1)
 	fmt.Printf("    Channel: %v\n", elapsed2)
-	fmt.Println("    (Mutex is typically faster for this use case)")
-	fmt.Println("    (Channels shine for coordination, not simple state guarding)")
-}
-
-func main() {
-	// Comment out step1 if running with -race (it intentionally races)
-	step1DataRace()
+	fmt.Println("    Mutex is typically faster for simple state guarding.")
+	fmt.Println("    Channels shine for coordination, pipelines, and complex workflows.")
 	fmt.Println()
 
-	step2Mutex()
-	fmt.Println()
-
-	step3Channel()
-	fmt.Println()
-
-	step4()
-	fmt.Println()
-
-	finalChallenge()
+	// --- Decision guide ---
+	fmt.Println("  When to use which:")
+	fmt.Println("    Channels: passing data, fan-out/fan-in, signaling, request-response")
+	fmt.Println("    Mutexes:  protecting internal struct state, counters, caches")
+	fmt.Println("    Both:     most real Go programs use both where each fits best")
 }

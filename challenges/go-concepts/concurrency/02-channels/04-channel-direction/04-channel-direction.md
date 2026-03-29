@@ -26,13 +26,13 @@ A bidirectional channel (`chan T`) lets any code both send and receive. In a rea
 
 Go's type system lets you restrict channels to send-only (`chan<- T`) or receive-only (`<-chan T`). The compiler enforces these restrictions, turning potential runtime bugs into compile errors. You get the restriction for free: a bidirectional channel automatically converts to a directional one when passed to a function that expects it.
 
-This is a core principle of Go's design philosophy: use the type system to make illegal states unrepresentable. When a function's signature says `<-chan int`, you know at a glance that it only reads from the channel. No need to inspect the implementation.
+This is a core principle of Go's design philosophy: use the type system to make illegal states unrepresentable.
 
 ## Step 1 -- Send-Only and Receive-Only Syntax
 
 Understand the syntax by reading the arrow's direction relative to `chan`:
 
-```go
+```
 chan T      // bidirectional: can send and receive
 chan<- T    // send-only: can only send (arrow points INTO chan)
 <-chan T    // receive-only: can only receive (arrow points OUT of chan)
@@ -40,56 +40,81 @@ chan<- T    // send-only: can only send (arrow points INTO chan)
 
 Mnemonic: the arrow `<-` always represents data flow. `chan<- T` means data flows into the channel (send). `<-chan T` means data flows out of the channel (receive).
 
-### Intermediate Verification
-No code to run yet. Make sure you can read and distinguish the three types.
-
 ## Step 2 -- Write a Producer with Send-Only Channel
 
-A producer function takes a send-only channel and writes values to it. It cannot accidentally read from the channel.
+A producer function takes a send-only channel and writes values to it.
 
 ```go
-func produce(out chan<- int) {
-    for i := 1; i <= 5; i++ {
+package main
+
+import "fmt"
+
+// produce can only SEND to out. Attempting to receive would be a compile error.
+func produce(out chan<- int, count int) {
+    for i := 1; i <= count; i++ {
         out <- i
     }
     close(out) // producers close when done
 }
-```
 
-Try adding `val := <-out` inside the function. The compiler rejects it:
-```
-invalid operation: cannot receive from send-only channel out
-```
+func main() {
+    ch := make(chan int)  // bidirectional
+    go produce(ch, 5)    // auto-narrows to send-only
 
-### Intermediate Verification
-```bash
-go run main.go
-# Should compile and send values successfully
-# If you add a receive from out, it should fail to compile
-```
-
-## Step 3 -- Write a Consumer with Receive-Only Channel
-
-A consumer takes a receive-only channel and processes incoming values. It cannot accidentally send or close the channel.
-
-```go
-func consume(in <-chan int) {
-    for val := range in {
-        fmt.Println("Received:", val)
+    for val := range ch {
+        fmt.Println(val)
     }
 }
 ```
 
-Try adding `in <- 99` or `close(in)` inside the function. Both are compile errors:
+Try adding `val := <-out` inside `produce`. The compiler rejects it:
 ```
-invalid operation: cannot send to receive-only channel in
-invalid operation: cannot close receive-only channel in
+invalid operation: cannot receive from send-only channel out
 ```
 
-### Intermediate Verification
+### Verification
 ```bash
 go run main.go
-# Should compile and consume values successfully
+# Expected: 1 2 3 4 5 (one per line)
+```
+
+## Step 3 -- Write a Consumer with Receive-Only Channel
+
+A consumer takes a receive-only channel and processes incoming values.
+
+```go
+package main
+
+import "fmt"
+
+func consume(in <-chan int) {
+    for val := range in {
+        fmt.Println("Received:", val)
+    }
+    // close(in)  -- compile error! Can't close a receive-only channel.
+    // in <- 99   -- compile error! Can't send to a receive-only channel.
+}
+
+func main() {
+    ch := make(chan int)
+    go func() {
+        for _, v := range []int{10, 20, 30} {
+            ch <- v
+        }
+        close(ch)
+    }()
+
+    consume(ch) // auto-narrows to receive-only
+}
+```
+
+### Verification
+```bash
+go run main.go
+# Expected:
+#   Received: 10
+#   Received: 20
+#   Received: 30
 ```
 
 ## Step 4 -- Build a Pipeline
@@ -97,65 +122,153 @@ go run main.go
 Connect producer and consumer through a transformer. Each stage uses directional channels to enforce data flow.
 
 ```go
+package main
+
+import "fmt"
+
+func produce(out chan<- int, count int) {
+    for i := 1; i <= count; i++ {
+        out <- i
+    }
+    close(out)
+}
+
+// double reads from in (receive-only) and writes to out (send-only).
+// The signature enforces the data flow direction.
 func double(in <-chan int, out chan<- int) {
     for val := range in {
         out <- val * 2
     }
     close(out)
 }
+
+func main() {
+    raw := make(chan int)
+    doubled := make(chan int)
+
+    go produce(raw, 5)        // sends 1..5 to raw
+    go double(raw, doubled)   // reads raw, writes *2 to doubled
+
+    for val := range doubled {
+        fmt.Println("Doubled:", val)
+    }
+}
 ```
 
-Wire it together:
-```go
-raw := make(chan int)
-doubled := make(chan int)
+Each function only has access to the direction it needs. `double` can read from `in` and write to `out`, but not the reverse.
 
-go produce(raw)       // produce -> raw
-go double(raw, doubled) // raw -> doubled
-consume(doubled)       // doubled -> consumer (runs in main)
-```
-
-Each function only has access to the direction it needs. `double` can read from `in` and write to `out`, but not the reverse. The pipeline's data flow is enforced by the compiler.
-
-### Intermediate Verification
+### Verification
 ```bash
 go run main.go
 # Expected:
-# Received: 2
-# Received: 4
-# Received: 6
-# Received: 8
-# Received: 10
+#   Doubled: 2
+#   Doubled: 4
+#   Doubled: 6
+#   Doubled: 8
+#   Doubled: 10
 ```
 
 ## Step 5 -- Return Receive-Only Channel from Function
 
-A common pattern is a generator function that creates a channel internally and returns it as receive-only:
+A common pattern is a generator function that creates a channel internally and returns it as receive-only.
 
 ```go
+package main
+
+import "fmt"
+
 func generateNumbers(n int) <-chan int {
-    ch := make(chan int)
+    ch := make(chan int)  // bidirectional inside the function
     go func() {
         for i := 1; i <= n; i++ {
             ch <- i
         }
         close(ch)
     }()
-    return ch // bidirectional converts to receive-only automatically
+    // Returning chan int as <-chan int is an automatic narrowing conversion.
+    // The caller can only receive. The goroutine holds the only send reference.
+    return ch
+}
+
+func main() {
+    nums := generateNumbers(5)
+    for val := range nums {
+        fmt.Println(val)
+    }
 }
 ```
 
-The caller can only receive from the returned channel. The internal goroutine holds the only send-capable reference.
-
-### Intermediate Verification
+### Verification
 ```bash
 go run main.go
-# Iterate over the returned channel and print values
+# Expected: 1 2 3 4 5 (one per line)
+```
+
+## Step 6 -- Three-Stage Word Pipeline
+
+Wire three string-processing stages together. Each stage only has the direction it needs, enforced by the compiler.
+
+```go
+package main
+
+import (
+    "fmt"
+    "strings"
+)
+
+func generateWords(words []string) <-chan string {
+    ch := make(chan string)
+    go func() {
+        for _, w := range words {
+            ch <- w
+        }
+        close(ch)
+    }()
+    return ch
+}
+
+func toUpper(in <-chan string, out chan<- string) {
+    for word := range in {
+        out <- strings.ToUpper(word)
+    }
+    close(out)
+}
+
+func addPrefix(in <-chan string, out chan<- string) {
+    for word := range in {
+        out <- "PROCESSED: " + word
+    }
+    close(out)
+}
+
+func main() {
+    words := generateWords([]string{"go", "channels", "are", "typed"})
+    uppered := make(chan string)
+    prefixed := make(chan string)
+
+    go toUpper(words, uppered)
+    go addPrefix(uppered, prefixed)
+
+    for result := range prefixed {
+        fmt.Println(result)
+    }
+}
+```
+
+### Verification
+```bash
+go run main.go
+# Expected:
+#   PROCESSED: GO
+#   PROCESSED: CHANNELS
+#   PROCESSED: ARE
+#   PROCESSED: TYPED
 ```
 
 ## Common Mistakes
 
 ### Trying to Close a Receive-Only Channel
+
 **Wrong:**
 ```go
 func consumer(in <-chan int) {
@@ -165,10 +278,13 @@ func consumer(in <-chan int) {
     close(in) // compile error!
 }
 ```
+
 **What happens:** Compile error. Only the sender should close a channel. The type system enforces this convention.
+
 **Fix:** Remove the close. The producer closes the channel when done.
 
-### Passing Directional Channel Where Bidirectional Is Expected
+### Trying to Widen Permissions
+
 **Wrong:**
 ```go
 func needsBidirectional(ch chan int) { /* ... */ }
@@ -176,25 +292,10 @@ func needsBidirectional(ch chan int) { /* ... */ }
 var readOnly <-chan int = make(chan int)
 needsBidirectional(readOnly) // compile error!
 ```
-**What happens:** Compile error. You cannot widen permissions — a receive-only channel cannot become bidirectional.
+
+**What happens:** Compile error. You cannot widen permissions -- a receive-only channel cannot become bidirectional.
+
 **Fix:** Pass the bidirectional channel, or change the function signature to accept the narrower type.
-
-## Verify What You Learned
-
-Build a three-stage word processing pipeline in `main.go`:
-1. `generateWords(words []string) <-chan string` -- sends each word, closes channel
-2. `toUpper(in <-chan string, out chan<- string)` -- converts each word to uppercase, closes out
-3. `addPrefix(in <-chan string, out chan<- string)` -- prepends "PROCESSED: " to each word, closes out
-
-Wire them together and consume the final output in main. Use the words: "go", "channels", "are", "typed".
-
-Expected output:
-```
-PROCESSED: GO
-PROCESSED: CHANNELS
-PROCESSED: ARE
-PROCESSED: TYPED
-```
 
 ## What's Next
 Continue to [05-ranging-over-channels](../05-ranging-over-channels/05-ranging-over-channels.md) to learn the `for range` pattern for consuming all values from a channel.
@@ -202,7 +303,7 @@ Continue to [05-ranging-over-channels](../05-ranging-over-channels/05-ranging-ov
 ## Summary
 - `chan<- T` is send-only, `<-chan T` is receive-only
 - Bidirectional channels implicitly convert to directional when passed to functions
-- The reverse is not true — you cannot widen a directional channel to bidirectional
+- The reverse is not true -- you cannot widen a directional channel to bidirectional
 - Only send-side code can `close()` a channel; receive-only channels prevent closing
 - Directional channels make data flow explicit in function signatures
 - Use directional types to catch direction bugs at compile time, not runtime

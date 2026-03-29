@@ -1,7 +1,28 @@
 package main
 
-// Exercise: End-to-End Pipeline with Cancellation
-// Instructions: see 10-end-to-end-pipeline-with-cancel.md
+// End-to-End Pipeline with Cancellation -- Complete Working Example
+//
+// Capstone exercise combining all patterns: generator, fan-out, fan-in,
+// error propagation, context cancellation, rate limiting, and goroutine
+// leak prevention. This is the architecture behind real ETL pipelines,
+// stream processors, and HTTP request handlers.
+//
+// Expected output:
+//   === Pipeline: 30 records ===
+//     Successes: 26, Errors: 4
+//     error: record 7 failed validation
+//     error: record 14 failed validation
+//     error: record 21 failed validation
+//     error: record 28 failed validation
+//     OK: no goroutine leaks
+//
+//   === Pipeline: 30 records, cancel after 10 ===
+//     [pipeline] canceling after 10 results
+//     [generator] canceled at record X
+//     OK: no goroutine leaks
+//
+//   === Rate-Limited Pipeline (20/sec, 50 records) ===
+//     Total time: ~2.5s
 
 import (
 	"context"
@@ -11,7 +32,13 @@ import (
 	"time"
 )
 
-// Step 1: Data types for the pipeline.
+// ---------------------------------------------------------------------------
+// Data types: typed records flowing through the pipeline.
+// Every ProcessedRecord carries the original record, the processing result,
+// which stage produced it, any error, and timing info. This traceability
+// is critical for debugging production pipelines.
+// ---------------------------------------------------------------------------
+
 type Record struct {
 	ID   int
 	Data string
@@ -25,27 +52,38 @@ type ProcessedRecord struct {
 	Duration time.Duration
 }
 
-// Step 2: Implement generateRecords.
-// Produces Record values and sends them to a channel.
-// Respects context cancellation.
+// ---------------------------------------------------------------------------
+// generateRecords: the pipeline source.
+// Produces Record values and respects context cancellation on every send.
+// Every blocking operation (channel send) must check ctx.Done() -- this
+// is how cancellation propagates through the pipeline.
+// ---------------------------------------------------------------------------
+
 func generateRecords(ctx context.Context, count int) <-chan Record {
 	out := make(chan Record)
 	go func() {
 		defer close(out)
 		for i := 1; i <= count; i++ {
 			record := Record{ID: i, Data: fmt.Sprintf("record-%d", i)}
-			// TODO: select on out <- record and ctx.Done()
-			// TODO: on cancellation, print message and return
-			_ = record
-			_ = ctx
+			select {
+			case out <- record:
+				// Value delivered to next stage.
+			case <-ctx.Done():
+				fmt.Printf("  [generator] canceled at record %d: %v\n", i, ctx.Err())
+				return
+			}
 		}
 	}()
 	return out
 }
 
-// Step 3: Implement validate stage.
-// Reads Records, validates them (ID%7==0 is invalid), sends ProcessedRecord.
-// Respects context cancellation on sends.
+// ---------------------------------------------------------------------------
+// validate: first processing stage.
+// Reads records, validates them (ID%7==0 is "invalid"), sends
+// ProcessedRecord downstream. Errors are wrapped in the record and
+// forwarded -- they are NOT dropped. The consumer decides what to do.
+// ---------------------------------------------------------------------------
+
 func validate(ctx context.Context, in <-chan Record) <-chan ProcessedRecord {
 	out := make(chan ProcessedRecord)
 	go func() {
@@ -54,69 +92,189 @@ func validate(ctx context.Context, in <-chan Record) <-chan ProcessedRecord {
 			start := time.Now()
 			var result ProcessedRecord
 
-			// TODO: if record.ID%7 == 0, create error result
-			// TODO: else, sleep 10ms (simulate work), create success result
-			// TODO: select on out <- result and ctx.Done()
-			_ = start
-			_ = result
-			_ = record
+			if record.ID%7 == 0 {
+				// Validation failure: record the error but don't stop the pipeline.
+				result = ProcessedRecord{
+					Record:   record,
+					Stage:    "validate",
+					Error:    fmt.Errorf("record %d failed validation", record.ID),
+					Duration: time.Since(start),
+				}
+			} else {
+				time.Sleep(10 * time.Millisecond) // Simulate validation work.
+				result = ProcessedRecord{
+					Record:   record,
+					Result:   fmt.Sprintf("valid(%s)", record.Data),
+					Stage:    "validate",
+					Duration: time.Since(start),
+				}
+			}
+
+			select {
+			case out <- result:
+			case <-ctx.Done():
+				return
+			}
 		}
 	}()
 	return out
 }
 
-// Step 3 continued: Implement transform stage.
-// Reads ProcessedRecords, transforms successful ones, forwards errors unchanged.
-// Respects context cancellation.
+// ---------------------------------------------------------------------------
+// transform: second processing stage.
+// Reads ProcessedRecords, transforms successful ones, forwards errors
+// unchanged. This "pass-through errors" pattern ensures errors propagate
+// through the entire pipeline without being silently dropped.
+// ---------------------------------------------------------------------------
+
 func transform(ctx context.Context, in <-chan ProcessedRecord) <-chan ProcessedRecord {
 	out := make(chan ProcessedRecord)
 	go func() {
 		defer close(out)
 		for pr := range in {
-			// TODO: if pr.Error != nil, forward as-is (with select + ctx.Done)
-			// TODO: else, sleep 20ms, create transformed result, send with select
-			_ = pr
-			_ = ctx
+			// Errors pass through unchanged -- never swallow errors.
+			if pr.Error != nil {
+				select {
+				case out <- pr:
+				case <-ctx.Done():
+					return
+				}
+				continue
+			}
+
+			start := time.Now()
+			time.Sleep(20 * time.Millisecond) // Heavier processing.
+
+			result := ProcessedRecord{
+				Record:   pr.Record,
+				Result:   fmt.Sprintf("transformed(%s)", pr.Result),
+				Stage:    "transform",
+				Duration: time.Since(start),
+			}
+
+			select {
+			case out <- result:
+			case <-ctx.Done():
+				return
+			}
 		}
 	}()
 	return out
 }
 
-// Step 4: Implement mergeProcessed (fan-in for ProcessedRecord channels).
+// ---------------------------------------------------------------------------
+// mergeProcessed: fan-in for ProcessedRecord channels.
+// One forwarder per input channel, WaitGroup + closer goroutine.
+// Every forwarder checks ctx.Done() to exit on cancellation.
+// ---------------------------------------------------------------------------
+
 func mergeProcessed(ctx context.Context, channels ...<-chan ProcessedRecord) <-chan ProcessedRecord {
 	out := make(chan ProcessedRecord)
 	var wg sync.WaitGroup
 
-	// TODO: for each channel, launch a forwarding goroutine
-	// TODO: each forwarder uses select with ctx.Done()
-	// TODO: closer goroutine: wg.Wait() then close(out)
-	_ = ctx
-	_ = wg
+	for _, ch := range channels {
+		wg.Add(1)
+		go func(c <-chan ProcessedRecord) {
+			defer wg.Done()
+			for pr := range c {
+				select {
+				case out <- pr:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}(ch)
+	}
+
+	go func() {
+		wg.Wait()
+		close(out)
+	}()
 
 	return out
 }
 
-// Step 4 continued: Implement fanOutTransform.
-// Creates numWorkers transform stages all reading from the same input.
-// Merges their outputs.
+// ---------------------------------------------------------------------------
+// fanOutTransform: parallelizes the transform stage.
+// Creates numWorkers transform stages sharing the same input.
+// Workers compete for input values (fan-out), and their outputs
+// are merged (fan-in). This is the scatter-gather pattern.
+//
+//   validated records
+//         |
+//   +-----+-----+-----+
+//   |     |     |     |
+//  xfm0  xfm1  xfm2  (fan-out: share input)
+//   |     |     |     |
+//   +-----+-----+-----+
+//         |
+//   merged output        (fan-in: merge outputs)
+// ---------------------------------------------------------------------------
+
 func fanOutTransform(ctx context.Context, in <-chan ProcessedRecord, numWorkers int) <-chan ProcessedRecord {
-	// TODO: create slice of worker output channels
-	// TODO: launch numWorkers transform stages sharing `in`
-	// TODO: return mergeProcessed(ctx, workers...)
-	_ = numWorkers
-	return transform(ctx, in) // replace with fan-out implementation
+	workers := make([]<-chan ProcessedRecord, numWorkers)
+	for i := 0; i < numWorkers; i++ {
+		workers[i] = transform(ctx, in)
+	}
+	return mergeProcessed(ctx, workers...)
 }
 
-// Step 5: Implement collect.
-// Drains the pipeline output and separates successes from errors.
-func collect(in <-chan ProcessedRecord) (successes []ProcessedRecord, errors []ProcessedRecord) {
-	// TODO: range over in, append to successes or errors based on pr.Error
+// ---------------------------------------------------------------------------
+// collect: drains the pipeline output and separates successes from errors.
+// ---------------------------------------------------------------------------
+
+func collect(in <-chan ProcessedRecord) (successes, errors []ProcessedRecord) {
+	for pr := range in {
+		if pr.Error != nil {
+			errors = append(errors, pr)
+		} else {
+			successes = append(successes, pr)
+		}
+	}
 	return
 }
 
-// Step 6: Implement runPipeline.
-// Wires all stages together, optionally cancels after N results,
-// and checks for goroutine leaks.
+// ---------------------------------------------------------------------------
+// rateLimitStage: applies token-bucket rate limiting to the pipeline.
+// Waits for a tick before forwarding each record. Respects cancellation.
+// ---------------------------------------------------------------------------
+
+func rateLimitStage(ctx context.Context, in <-chan ProcessedRecord, ratePerSecond int) <-chan ProcessedRecord {
+	out := make(chan ProcessedRecord)
+	go func() {
+		defer close(out)
+		interval := time.Second / time.Duration(ratePerSecond)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+
+		for pr := range in {
+			// Wait for the next tick (rate gate).
+			select {
+			case <-ticker.C:
+			case <-ctx.Done():
+				return
+			}
+			// Forward the record.
+			select {
+			case out <- pr:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return out
+}
+
+// ---------------------------------------------------------------------------
+// runPipeline: wires all stages together.
+//
+//   generateRecords -> validate -> fanOutTransform(3) -> collect/cancel
+//
+// After completion (or cancellation), checks for goroutine leaks using
+// runtime.NumGoroutine(). A leak means some goroutine did not exit --
+// usually a missing ctx.Done() check or an unclosed channel.
+// ---------------------------------------------------------------------------
+
 func runPipeline(totalRecords int, cancelAfter int) {
 	fmt.Printf("=== Pipeline: %d records", totalRecords)
 	if cancelAfter > 0 {
@@ -129,19 +287,35 @@ func runPipeline(totalRecords int, cancelAfter int) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// TODO: build pipeline: generateRecords -> validate -> fanOutTransform(3)
-	_ = ctx // remove once you use ctx in generateRecords/validate/fanOutTransform
+	// Build pipeline: source -> validate -> parallel transform.
+	records := generateRecords(ctx, totalRecords)
+	validated := validate(ctx, records)
+	transformed := fanOutTransform(ctx, validated, 3)
 
 	if cancelAfter > 0 {
-		// TODO: consume up to cancelAfter results, then cancel
-		// TODO: sleep briefly to let cancellation propagate
+		// Consume up to cancelAfter results, then cancel the pipeline.
+		count := 0
+		for range transformed {
+			count++
+			if count >= cancelAfter {
+				fmt.Printf("  [pipeline] canceling after %d results\n", cancelAfter)
+				cancel()
+				break
+			}
+		}
+		// Let cancellation propagate through all stages.
+		time.Sleep(100 * time.Millisecond)
 	} else {
-		// TODO: collect all results
-		// TODO: print success count, error count
-		// TODO: print each error
+		// Full run: collect all results.
+		successes, errors := collect(transformed)
+		fmt.Printf("  Successes: %d, Errors: %d\n", len(successes), len(errors))
+		for _, e := range errors {
+			fmt.Printf("    error: %v\n", e.Error)
+		}
 	}
 
-	// Goroutine leak check
+	// Goroutine leak check: after cancellation and a settling delay,
+	// the goroutine count should return to baseline.
 	time.Sleep(100 * time.Millisecond)
 	goroutinesAfter := runtime.NumGoroutine()
 	leaked := goroutinesAfter - goroutinesBefore
@@ -155,32 +329,52 @@ func runPipeline(totalRecords int, cancelAfter int) {
 	fmt.Println()
 }
 
-// Verify: Add a rate-limiting stage and run with 50 records.
-func rateLimitStage(ctx context.Context, in <-chan ProcessedRecord, ratePerSecond int) <-chan ProcessedRecord {
-	out := make(chan ProcessedRecord)
-	// TODO: create a ticker at the appropriate interval
-	// TODO: for each value from in, wait for tick, then forward
-	// TODO: respect ctx.Done()
-	go func() {
-		defer close(out)
-		_ = ratePerSecond
-		_ = ctx
-	}()
-	return out
+// ---------------------------------------------------------------------------
+// runRateLimitedPipeline: adds a rate limiter between validate and transform.
+// Demonstrates composing patterns: pipeline + fan-out + rate limiting.
+// ---------------------------------------------------------------------------
+
+func runRateLimitedPipeline(totalRecords, ratePerSecond int) {
+	fmt.Printf("=== Rate-Limited Pipeline (%d/sec, %d records) ===\n", ratePerSecond, totalRecords)
+
+	goroutinesBefore := runtime.NumGoroutine()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Pipeline: generate -> validate -> rate-limit -> parallel transform.
+	records := generateRecords(ctx, totalRecords)
+	validated := validate(ctx, records)
+	limited := rateLimitStage(ctx, validated, ratePerSecond)
+	transformed := fanOutTransform(ctx, limited, 3)
+
+	successes, errors := collect(transformed)
+	fmt.Printf("  Successes: %d, Errors: %d\n", len(successes), len(errors))
+
+	// Leak check
+	time.Sleep(100 * time.Millisecond)
+	goroutinesAfter := runtime.NumGoroutine()
+	leaked := goroutinesAfter - goroutinesBefore
+	if leaked > 0 {
+		fmt.Printf("  WARNING: %d goroutine(s) may have leaked\n", leaked)
+	} else {
+		fmt.Printf("  OK: no goroutine leaks\n")
+	}
+	fmt.Println()
 }
 
 func main() {
-	fmt.Println("Exercise: End-to-End Pipeline with Cancellation\n")
+	fmt.Println("Exercise: End-to-End Pipeline with Cancellation")
+	fmt.Println()
 
-	// Full pipeline run
+	// Full pipeline run: all 30 records processed.
 	runPipeline(30, 0)
 
-	// Pipeline with cancellation after 10 results
+	// Pipeline with cancellation after 10 results.
 	runPipeline(30, 10)
 
-	// Verify: rate-limited pipeline (uncomment after implementing)
-	// fmt.Println("=== Verify: Rate-Limited Pipeline ===")
-	// start := time.Now()
-	// runRateLimitedPipeline(50, 20) // 50 records at 20/sec
-	// fmt.Printf("  Total time: %v (expected ~2.5s at 20/sec)\n", time.Since(start))
+	// Rate-limited pipeline: 50 records at 20/sec.
+	start := time.Now()
+	runRateLimitedPipeline(50, 20)
+	fmt.Printf("  Total time: %v (expected ~2.5s at 20/sec)\n", time.Since(start).Truncate(time.Millisecond))
 }

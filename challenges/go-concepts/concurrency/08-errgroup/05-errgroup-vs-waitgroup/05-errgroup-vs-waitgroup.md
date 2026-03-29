@@ -23,39 +23,38 @@ After completing this exercise, you will be able to:
 - **Identify** scenarios where WaitGroup is more appropriate than errgroup
 
 ## Why This Comparison Matters
+
 Developers who learn errgroup often ask: "Should I always use errgroup instead of WaitGroup?" The answer is no. Each tool has its sweet spot:
 
 - **errgroup**: When goroutines can fail and you need to propagate errors. The common case for I/O, network calls, and any fallible operation.
-- **WaitGroup**: When goroutines are fire-and-forget or when you need manual control over goroutine lifecycle that errgroup does not provide (e.g., spawning goroutines conditionally in a loop, or goroutines that outlive the group).
+- **WaitGroup**: When goroutines are fire-and-forget or when you need manual control over goroutine lifecycle.
 
 By solving the same problem with both approaches, you develop an intuition for which tool fits naturally and where the other creates friction.
 
 ## Step 1 -- The Problem: Parallel File Processing
 
-The task is to process 5 files concurrently. Each file can succeed or fail. You need to:
-1. Process all files in parallel
-2. Know if any processing failed
-3. Print a summary of successes and failures
-
-Run the starter code:
+Process 5 files concurrently. Some succeed, some fail. Report a summary of successes and the first error.
 
 ```bash
 go mod tidy
 go run main.go
 ```
 
-The `processFile` helper simulates file processing -- some files succeed, some fail.
-
-### Intermediate Verification
-The program compiles and runs. The WaitGroup version shows the boilerplate required for error handling.
-
 ## Step 2 -- WaitGroup Solution (Manual Error Handling)
 
-Study and complete the `solveWithWaitGroup` function. This requires manual orchestration:
+The WaitGroup approach requires four primitives wired together:
 
 ```go
-func solveWithWaitGroup() {
-    fmt.Println("=== WaitGroup Solution ===")
+package main
+
+import (
+    "fmt"
+    "math/rand"
+    "sync"
+    "time"
+)
+
+func main() {
     files := []string{"config.yaml", "data.csv", "CORRUPT", "readme.md", "MISSING"}
 
     var wg sync.WaitGroup
@@ -89,23 +88,48 @@ func solveWithWaitGroup() {
         fmt.Printf("First error: %v\n", firstErr)
     }
 }
+
+func processFile(name string) error {
+    time.Sleep(time.Duration(50+rand.Intn(100)) * time.Millisecond)
+    switch name {
+    case "CORRUPT":
+        return fmt.Errorf("file %q is corrupted", name)
+    case "MISSING":
+        return fmt.Errorf("file %q not found", name)
+    default:
+        fmt.Printf("  Processed: %s\n", name)
+        return nil
+    }
+}
 ```
 
-Notice the ceremony: WaitGroup + mutex + error variable + success counter. Five concerns interleaved in one function.
-
-### Intermediate Verification
-```bash
-go run main.go
+**Expected output:**
 ```
-The function reports the number of successes and the first error. It works, but the code is dense.
+  Processed: config.yaml
+  Processed: data.csv
+  Processed: readme.md
+Processed: 3/5 succeeded
+First error: file "CORRUPT" is corrupted
+```
+
+Five interleaved concerns: WaitGroup (Add, Done, Wait), mutex (Lock, Unlock x2), error variable (check-then-set), success counter (increment). Easy to forget Add before the goroutine, forget Done with defer, or forget to lock the mutex.
 
 ## Step 3 -- Errgroup Solution (Built-in Error Handling)
 
-Implement the same logic using `solveWithErrgroup`:
+The same problem with errgroup -- no WaitGroup, no mutex for errors:
 
 ```go
-func solveWithErrgroup() {
-    fmt.Println("\n=== Errgroup Solution ===")
+package main
+
+import (
+    "fmt"
+    "math/rand"
+    "time"
+
+    "golang.org/x/sync/errgroup"
+)
+
+func main() {
     files := []string{"config.yaml", "data.csv", "CORRUPT", "readme.md", "MISSING"}
     results := make([]bool, len(files))
 
@@ -135,113 +159,139 @@ func solveWithErrgroup() {
         fmt.Printf("First error: %v\n", err)
     }
 }
+
+func processFile(name string) error {
+    time.Sleep(time.Duration(50+rand.Intn(100)) * time.Millisecond)
+    switch name {
+    case "CORRUPT":
+        return fmt.Errorf("file %q is corrupted", name)
+    case "MISSING":
+        return fmt.Errorf("file %q not found", name)
+    default:
+        fmt.Printf("  Processed: %s\n", name)
+        return nil
+    }
+}
 ```
 
-No WaitGroup, no mutex for error collection, no manual Add/Done. Error propagation is built in. The only manual part is counting successes, which uses the index-based pattern (no mutex needed).
-
-### Intermediate Verification
-```bash
-go run main.go
+**Expected output:**
 ```
-Both versions produce equivalent results. The errgroup version is shorter and has fewer opportunities for bugs.
+  Processed: config.yaml
+  Processed: data.csv
+  Processed: readme.md
+Processed: 3/5 succeeded
+First error: file "CORRUPT" is corrupted
+```
+
+Same result, but: no Add/Done, no mutex for error collection (errgroup handles it), and success tracking uses the index-based pattern (no mutex needed for that either).
 
 ## Step 4 -- When WaitGroup Wins
 
-Implement `waitgroupForFireAndForget` to show a case where WaitGroup is the better choice:
+Fire-and-forget work where errors are meaningless:
 
 ```go
-func waitgroupForFireAndForget() {
-    fmt.Println("\n=== WaitGroup: Fire-and-Forget (best fit) ===")
+package main
+
+import (
+    "fmt"
+    "sync"
+    "time"
+)
+
+func main() {
     var wg sync.WaitGroup
 
-    // Launch background workers that never fail
     for i := 0; i < 5; i++ {
         i := i
         wg.Add(1)
         go func() {
             defer wg.Done()
-            // Pure side-effect work: logging, metrics, notifications
-            time.Sleep(time.Duration(i*50) * time.Millisecond)
+            time.Sleep(time.Duration(i*30) * time.Millisecond)
             fmt.Printf("  Worker %d: sent notification\n", i)
         }()
     }
 
     wg.Wait()
-    fmt.Println("All notifications sent")
+    fmt.Println("All 5 notifications sent")
 }
 ```
 
-When goroutines perform infallible operations (logging, metrics emission, notifications to best-effort systems), there is no error to propagate. Using errgroup here adds unnecessary `func() error` wrappers with `return nil` boilerplate.
-
-### Intermediate Verification
-```bash
-go run main.go
+**Expected output:**
 ```
-Clean, simple code. No errors to handle, no error return values cluttering the logic.
+  Worker 0: sent notification
+  Worker 1: sent notification
+  Worker 2: sent notification
+  Worker 3: sent notification
+  Worker 4: sent notification
+All 5 notifications sent
+```
 
-## Common Mistakes
+Using errgroup here would force every closure to return `nil` -- noise with no benefit. WaitGroup is the natural fit for infallible side-effects: logging, metrics emission, best-effort notifications.
 
-### Using WaitGroup when tasks can fail
-**Wrong:**
+## Step 5 -- Both Tools in One Program
+
+In real programs, fallible and infallible work coexist. Use each tool where it fits:
+
 ```go
-var wg sync.WaitGroup
-wg.Add(1)
-go func() {
-    defer wg.Done()
-    if err := riskyOperation(); err != nil {
-        log.Println(err) // error is logged and lost
+package main
+
+import (
+    "fmt"
+    "math/rand"
+    "sync"
+    "time"
+
+    "golang.org/x/sync/errgroup"
+)
+
+func main() {
+    // Fallible: errgroup for HTTP fetches
+    var g errgroup.Group
+    urls := []string{"https://api.example.com/users", "https://api.example.com/orders", "https://api.example.com/BROKEN"}
+    for _, url := range urls {
+        url := url
+        g.Go(func() error {
+            time.Sleep(time.Duration(50+rand.Intn(50)) * time.Millisecond)
+            if url == "https://api.example.com/BROKEN" {
+                return fmt.Errorf("fetch %s: 500", url)
+            }
+            fmt.Printf("  Fetched: %s\n", url)
+            return nil
+        })
     }
-}()
-wg.Wait()
-// caller has no idea if riskyOperation failed
-```
-**What happens:** Errors are silently swallowed or only logged. The caller proceeds as if everything succeeded.
 
-**Fix:** Use errgroup when tasks can fail:
-```go
-var g errgroup.Group
-g.Go(func() error {
-    return riskyOperation()
-})
-if err := g.Wait(); err != nil {
-    // caller can handle the error
+    // Infallible: WaitGroup for background logging
+    var wg sync.WaitGroup
+    for i := 0; i < 3; i++ {
+        i := i
+        wg.Add(1)
+        go func() {
+            defer wg.Done()
+            time.Sleep(time.Duration(30+i*20) * time.Millisecond)
+            fmt.Printf("  Logger %d: wrote audit log\n", i)
+        }()
+    }
+
+    if err := g.Wait(); err != nil {
+        fmt.Printf("Fetch error: %v\n", err)
+    }
+    wg.Wait()
+    fmt.Println("Background logging complete")
 }
 ```
 
-### Wrapping infallible work in errgroup
-**Not wrong, but noisy:**
-```go
-g.Go(func() error {
-    log.Println("sent metric")
-    return nil // always nil -- errgroup adds nothing here
-})
+**Expected output:**
 ```
-**Better:** Use WaitGroup for fire-and-forget work. Reserve errgroup for fallible operations.
-
-### Forgetting wg.Add before launching the goroutine
-**Wrong:**
-```go
-go func() {
-    wg.Add(1) // INSIDE the goroutine -- race with wg.Wait()
-    defer wg.Done()
-}()
-wg.Wait() // might return before Add is called
+  Fetched: https://api.example.com/users
+  Fetched: https://api.example.com/orders
+  Logger 0: wrote audit log
+  Logger 1: wrote audit log
+Fetch error: fetch https://api.example.com/BROKEN: 500
+  Logger 2: wrote audit log
+Background logging complete
 ```
-**What happens:** `Wait()` can return before the goroutine even calls `Add(1)`. Errgroup avoids this entirely because `g.Go()` handles both launching and tracking.
 
-## Verify What You Learned
-
-Create a scenario with 10 tasks where:
-- 5 tasks are fallible (HTTP fetches) -- use errgroup
-- 5 tasks are infallible (metric emissions) -- use WaitGroup
-- Both groups run concurrently, and you wait for both to complete
-
-This demonstrates using both tools in the same program, each for its appropriate use case.
-
-## What's Next
-Continue to [06-errgroup-parallel-pipeline](../06-errgroup-parallel-pipeline/06-errgroup-parallel-pipeline.md) for a comprehensive exercise building a multi-stage parallel pipeline with errgroup.
-
-## Summary
+## Decision Table
 
 | Criterion | sync.WaitGroup | errgroup.Group |
 |-----------|---------------|----------------|
@@ -252,10 +302,85 @@ Continue to [06-errgroup-parallel-pipeline](../06-errgroup-parallel-pipeline/06-
 | Fire-and-forget | Natural fit | Unnecessary overhead |
 | Best for | Infallible goroutines | Fallible goroutines |
 
+**Rule of thumb:** If the goroutine can return an error, use errgroup. If it cannot, use WaitGroup.
+
+## Common Mistakes
+
+### Using WaitGroup when tasks can fail
+
+**Wrong:**
+```go
+var wg sync.WaitGroup
+wg.Add(1)
+go func() {
+    defer wg.Done()
+    if err := riskyOperation(); err != nil {
+        log.Println(err) // logged and forgotten
+    }
+}()
+wg.Wait()
+// caller has no idea if riskyOperation failed
+```
+
+**What happens:** Errors are silently swallowed. The caller proceeds as if everything succeeded.
+
+**Fix:** Use errgroup:
+```go
+var g errgroup.Group
+g.Go(func() error {
+    return riskyOperation()
+})
+if err := g.Wait(); err != nil {
+    // caller can handle the error properly
+}
+```
+
+### Forgetting wg.Add before launching the goroutine
+
+**Wrong:**
+```go
+go func() {
+    wg.Add(1) // INSIDE the goroutine -- race with wg.Wait()
+    defer wg.Done()
+}()
+wg.Wait() // might return before Add is called
+```
+
+**What happens:** `Wait()` can return before the goroutine even calls `Add(1)`. Errgroup avoids this entirely because `g.Go()` handles both launching and tracking atomically.
+
+### Wrapping infallible work in errgroup
+
+**Not wrong, but noisy:**
+```go
+g.Go(func() error {
+    log.Println("sent metric")
+    return nil // always nil -- errgroup adds nothing here
+})
+```
+
+**Better:** Use WaitGroup for fire-and-forget work. Reserve errgroup for fallible operations.
+
+## Verify What You Learned
+
+Run the full program and confirm:
+1. WaitGroup and errgroup solutions produce equivalent results for the same problem
+2. WaitGroup requires more boilerplate for error handling
+3. WaitGroup is cleaner for fire-and-forget work
+4. Both tools coexist naturally in the same program
+
+```bash
+go run main.go
+```
+
+## What's Next
+Continue to [06-errgroup-parallel-pipeline](../06-errgroup-parallel-pipeline/06-errgroup-parallel-pipeline.md) for a comprehensive exercise building a multi-stage parallel pipeline with errgroup.
+
+## Summary
 - Use **errgroup** when goroutines can fail and errors matter
 - Use **WaitGroup** for fire-and-forget goroutines with no meaningful errors
 - Errgroup eliminates the WaitGroup + mutex + error channel boilerplate
 - Both can coexist in the same program -- use each where it fits
+- The rule of thumb: if the goroutine returns `error`, use errgroup
 
 ## Reference
 - [sync.WaitGroup documentation](https://pkg.go.dev/sync#WaitGroup)

@@ -34,7 +34,7 @@ Each has different strengths. By implementing and measuring all four, you develo
 
 ## Step 1 -- Define the Counter Interface
 
-Open `main.go`. The `Counter` interface defines the contract:
+The `Counter` interface defines the contract all implementations must satisfy:
 
 ```go
 type Counter interface {
@@ -44,38 +44,67 @@ type Counter interface {
 }
 ```
 
-All four implementations must satisfy this interface.
-
-### Intermediate Verification
-Verify the interface is defined in `main.go`. Each implementation will be tested against it.
+All four implementations satisfy this interface, enabling identical testing and benchmarking.
 
 ## Step 2 -- Mutex Counter
 
-Implement the simplest approach with `sync.Mutex`:
+The simplest approach:
 
 ```go
+package main
+
+import (
+	"fmt"
+	"sync"
+)
+
+type Counter interface {
+	Increment()
+	Decrement()
+	Value() int64
+}
+
 type MutexCounter struct {
-    mu    sync.Mutex
-    value int64
+	mu    sync.Mutex
+	value int64
 }
 
 func (c *MutexCounter) Increment() {
-    c.mu.Lock()
-    defer c.mu.Unlock()
-    c.value++
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.value++
 }
 
 func (c *MutexCounter) Decrement() {
-    c.mu.Lock()
-    defer c.mu.Unlock()
-    c.value--
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.value--
 }
 
 func (c *MutexCounter) Value() int64 {
-    c.mu.Lock()
-    defer c.mu.Unlock()
-    return c.value
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.value
 }
+
+func main() {
+	c := &MutexCounter{}
+	var wg sync.WaitGroup
+	for i := 0; i < 1000; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			c.Increment()
+		}()
+	}
+	wg.Wait()
+	fmt.Printf("Value: %d\n", c.Value())
+}
+```
+
+Expected output:
+```
+Value: 1000
 ```
 
 **Characteristics**: simple, correct, all operations serialized (including reads).
@@ -84,212 +113,210 @@ func (c *MutexCounter) Value() int64 {
 ```bash
 go run main.go
 ```
-The mutex counter should report the correct value after concurrent operations.
+The mutex counter should report the correct value.
 
 ## Step 3 -- RWMutex Counter
 
-Optimize reads with `sync.RWMutex`:
+Optimize reads with shared read lock:
 
 ```go
 type RWMutexCounter struct {
-    mu    sync.RWMutex
-    value int64
+	mu    sync.RWMutex
+	value int64
 }
 
 func (c *RWMutexCounter) Increment() {
-    c.mu.Lock()
-    defer c.mu.Unlock()
-    c.value++
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.value++
 }
 
 func (c *RWMutexCounter) Decrement() {
-    c.mu.Lock()
-    defer c.mu.Unlock()
-    c.value--
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.value--
 }
 
 func (c *RWMutexCounter) Value() int64 {
-    c.mu.RLock()
-    defer c.mu.RUnlock()
-    return c.value
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.value
 }
 ```
 
-**Characteristics**: reads can proceed concurrently, writes still exclusive. Benefits when reads vastly outnumber writes.
-
-### Intermediate Verification
-```bash
-go run main.go
-```
-The RWMutex counter should match the mutex counter result.
+**Characteristics**: reads can proceed concurrently, writes still exclusive. For a counter (write-heavy), this adds overhead tracking readers with no benefit.
 
 ## Step 4 -- Atomic Counter
 
-Use `sync/atomic` for lock-free operations:
+Lock-free operations using CPU-level atomics:
 
 ```go
+package main
+
+import (
+	"fmt"
+	"sync"
+	"sync/atomic"
+)
+
 type AtomicCounter struct {
-    value atomic.Int64
+	value atomic.Int64
 }
 
 func (c *AtomicCounter) Increment() {
-    c.value.Add(1)
+	c.value.Add(1)
 }
 
 func (c *AtomicCounter) Decrement() {
-    c.value.Add(-1)
+	c.value.Add(-1)
 }
 
 func (c *AtomicCounter) Value() int64 {
-    return c.value.Load()
+	return c.value.Load()
+}
+
+func main() {
+	c := &AtomicCounter{}
+	var wg sync.WaitGroup
+	for i := 0; i < 1000; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			c.Increment()
+		}()
+	}
+	wg.Wait()
+	fmt.Printf("Value: %d\n", c.Value())
 }
 ```
 
-**Characteristics**: lock-free, highest throughput for simple counters, no deadlock possible. Limited to operations the CPU supports atomically.
-
-### Intermediate Verification
-```bash
-go run main.go
+Expected output:
 ```
-The atomic counter should match the others.
+Value: 1000
+```
+
+**Characteristics**: lock-free, highest throughput for simple counters, no deadlock possible. Limited to operations the CPU supports atomically (add, load, store, compare-and-swap).
 
 ## Step 5 -- Channel Counter
 
-Use a channel with a single owner goroutine:
+A single goroutine owns the state:
 
 ```go
-type ChannelCounter struct {
-    ops   chan counterOp
-    done  chan struct{}
-}
+package main
+
+import (
+	"fmt"
+	"sync"
+)
 
 type counterOp struct {
-    kind     string // "inc", "dec", "val"
-    response chan int64
+	kind     string
+	response chan int64
+}
+
+type ChannelCounter struct {
+	ops  chan counterOp
+	done chan struct{}
 }
 
 func NewChannelCounter() *ChannelCounter {
-    c := &ChannelCounter{
-        ops:  make(chan counterOp),
-        done: make(chan struct{}),
-    }
-    go c.run()
-    return c
+	c := &ChannelCounter{
+		ops:  make(chan counterOp),
+		done: make(chan struct{}),
+	}
+	go c.run()
+	return c
 }
 
 func (c *ChannelCounter) run() {
-    var value int64
-    for op := range c.ops {
-        switch op.kind {
-        case "inc":
-            value++
-            if op.response != nil {
-                op.response <- value
-            }
-        case "dec":
-            value--
-            if op.response != nil {
-                op.response <- value
-            }
-        case "val":
-            op.response <- value
-        }
-    }
-    close(c.done)
+	var value int64
+	for op := range c.ops {
+		switch op.kind {
+		case "inc":
+			value++
+			if op.response != nil {
+				op.response <- value
+			}
+		case "dec":
+			value--
+			if op.response != nil {
+				op.response <- value
+			}
+		case "val":
+			op.response <- value
+		}
+	}
+	close(c.done)
 }
 
 func (c *ChannelCounter) Increment() {
-    c.ops <- counterOp{kind: "inc"}
+	c.ops <- counterOp{kind: "inc"}
 }
 
 func (c *ChannelCounter) Decrement() {
-    c.ops <- counterOp{kind: "dec"}
+	c.ops <- counterOp{kind: "dec"}
 }
 
 func (c *ChannelCounter) Value() int64 {
-    resp := make(chan int64)
-    c.ops <- counterOp{kind: "val", response: resp}
-    return <-resp
+	resp := make(chan int64)
+	c.ops <- counterOp{kind: "val", response: resp}
+	return <-resp
 }
 
 func (c *ChannelCounter) Close() {
-    close(c.ops)
-    <-c.done
+	close(c.ops)
+	<-c.done
+}
+
+func main() {
+	c := NewChannelCounter()
+	var wg sync.WaitGroup
+	for i := 0; i < 1000; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			c.Increment()
+		}()
+	}
+	wg.Wait()
+	fmt.Printf("Value: %d\n", c.Value())
+	c.Close()
 }
 ```
 
-**Characteristics**: no shared state, no locks, clear ownership model. Higher overhead per operation due to channel send/receive.
-
-### Intermediate Verification
-```bash
-go run main.go
+Expected output:
 ```
-The channel counter should match all others.
+Value: 1000
+```
+
+**Characteristics**: no shared state, no locks, clear ownership model. Higher overhead per operation due to channel send/receive and goroutine scheduling.
 
 ## Step 6 -- Benchmark All Four
 
-Implement `benchmarkCounter` and run all benchmarks:
+Run the full program to see correctness tests and benchmarks:
 
-```go
-func benchmarkCounter(name string, c Counter, goroutines, opsPerGoroutine int) time.Duration {
-    var wg sync.WaitGroup
-    start := time.Now()
-
-    for i := 0; i < goroutines; i++ {
-        wg.Add(1)
-        go func() {
-            defer wg.Done()
-            for j := 0; j < opsPerGoroutine; j++ {
-                c.Increment()
-                if j%10 == 0 {
-                    c.Value() // occasional read
-                }
-            }
-        }()
-    }
-
-    wg.Wait()
-    return time.Since(start)
-}
-
-func runBenchmarks() {
-    fmt.Println("\n=== Benchmarks ===")
-    const goroutines = 100
-    const ops = 10000
-
-    counters := []struct {
-        name    string
-        counter Counter
-        cleanup func()
-    }{
-        {"Mutex", &MutexCounter{}, nil},
-        {"RWMutex", &RWMutexCounter{}, nil},
-        {"Atomic", &AtomicCounter{}, nil},
-        {"Channel", NewChannelCounter(), nil},
-    }
-    // Set cleanup for channel counter
-    counters[3].cleanup = func() { counters[3].counter.(*ChannelCounter).Close() }
-
-    for _, tc := range counters {
-        duration := benchmarkCounter(tc.name, tc.counter, goroutines, ops)
-        finalValue := tc.counter.Value()
-        fmt.Printf("%-10s: %v (final value: %d)\n", tc.name, duration.Round(time.Microsecond), finalValue)
-        if tc.cleanup != nil {
-            tc.cleanup()
-        }
-    }
-}
-```
-
-### Intermediate Verification
 ```bash
 go run main.go
 ```
-All four should report the same final value (100 * 10000 = 1,000,000). Execution times will differ.
+
+Expected output (times vary by machine):
+```
+=== Correctness Tests ===
+[PASS] Mutex   : expected=100000, got=100000
+[PASS] RWMutex : expected=100000, got=100000
+[PASS] Atomic  : expected=100000, got=100000
+[PASS] Channel : expected=100000, got=100000
+
+=== Benchmarks (100 goroutines x 10,000 ops) ===
+Mutex   : 15ms  (final value: 1010000)
+RWMutex : 18ms  (final value: 1010000)
+Atomic  : 3ms   (final value: 1010000)
+Channel : 180ms (final value: 1010000)
+```
+
+All four report the same final value. Atomic is fastest. Channel is slowest.
 
 ## Step 7 -- Analyze the Tradeoffs
-
-After running the benchmarks, reflect on these tradeoffs:
 
 | Approach | Throughput | Complexity | Flexibility | Deadlock Risk |
 |----------|-----------|------------|-------------|---------------|
@@ -298,7 +325,7 @@ After running the benchmarks, reflect on these tradeoffs:
 | Atomic | Highest | Lowest | Low | None |
 | Channel | Lowest | Medium | Medium | Possible |
 
-- **Atomic** wins for simple counters but cannot protect complex operations (e.g., "read-modify-write on two fields").
+- **Atomic** wins for simple counters but cannot protect complex operations (e.g., "read two fields, modify one, write both").
 - **Mutex** is the workhorse: correct, flexible, reasonable performance.
 - **RWMutex** helps only when reads vastly outnumber writes. For a counter (write-heavy), it adds overhead with no benefit.
 - **Channel** is the most flexible for complex state machines but has the highest per-operation cost for simple operations.
@@ -306,15 +333,16 @@ After running the benchmarks, reflect on these tradeoffs:
 ## Common Mistakes
 
 ### Using Atomic for Complex Operations
-**Wrong:**
+
 ```go
 var balance atomic.Int64
 func transfer(amount int64) {
     if balance.Load() >= amount { // check
-        balance.Add(-amount)      // act -- but another goroutine may have changed balance!
+        balance.Add(-amount)      // act -- NOT atomic with the check!
     }
 }
 ```
+
 **What happens:** The check-then-act is not atomic. Another goroutine can drain the balance between Load and Add.
 
 **Fix:** Use `CompareAndSwap` in a loop, or switch to a mutex for the compound operation.

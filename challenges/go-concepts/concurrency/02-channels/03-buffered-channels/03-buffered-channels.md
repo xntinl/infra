@@ -34,27 +34,36 @@ Think of it like a mailbox: you can drop off letters (send) without the recipien
 Create a buffered channel with capacity 3 and send values without a receiver goroutine.
 
 ```go
-ch := make(chan int, 3) // buffer can hold 3 ints
+package main
 
-ch <- 10  // doesn't block — buffer has room
-ch <- 20  // doesn't block
-ch <- 30  // doesn't block
-// ch <- 40 would block here — buffer is full!
+import "fmt"
 
-fmt.Println(<-ch) // 10 (FIFO order)
-fmt.Println(<-ch) // 20
-fmt.Println(<-ch) // 30
+func main() {
+    ch := make(chan int, 3) // buffer can hold 3 ints
+
+    // All three sends succeed immediately -- no goroutine needed.
+    // With an unbuffered channel, these would deadlock.
+    ch <- 10
+    ch <- 20
+    ch <- 30
+    // ch <- 40 would block here -- buffer is full!
+
+    // Receives drain the buffer in FIFO order.
+    fmt.Println(<-ch) // 10
+    fmt.Println(<-ch) // 20
+    fmt.Println(<-ch) // 30
+}
 ```
 
 Key difference from unbuffered: you can send three values *without* any goroutine receiving them. The buffer holds the values until they're consumed.
 
-### Intermediate Verification
+### Verification
 ```bash
 go run main.go
 # Expected:
-# 10
-# 20
-# 30
+#   10
+#   20
+#   30
 ```
 
 ## Step 2 -- Observe Blocking When Full
@@ -62,97 +71,223 @@ go run main.go
 Fill the buffer completely, then try to send one more value. This blocks until someone receives.
 
 ```go
-ch := make(chan int, 2)
-ch <- 1
-ch <- 2
-fmt.Println("Buffer full, len:", len(ch), "cap:", cap(ch))
+package main
 
-go func() {
-    time.Sleep(500 * time.Millisecond)
-    val := <-ch
-    fmt.Println("Received:", val, "— made room in buffer")
-}()
+import (
+    "fmt"
+    "time"
+)
 
-fmt.Println("Sending 3rd value (will block until space available)...")
-ch <- 3
-fmt.Println("3rd value sent!")
+func main() {
+    ch := make(chan int, 2)
+    ch <- 1
+    ch <- 2
+    fmt.Printf("Buffer state: len=%d, cap=%d (full)\n", len(ch), cap(ch))
+
+    go func() {
+        time.Sleep(500 * time.Millisecond)
+        val := <-ch
+        fmt.Printf("Drained one: %d -- made room\n", val)
+    }()
+
+    fmt.Println("Sending 3rd value (will block)...")
+    ch <- 3  // blocks until the goroutine receives
+    fmt.Println("3rd value sent successfully!")
+}
 ```
 
-### Intermediate Verification
+The send on line `ch <- 3` blocks for ~500ms because the buffer is full. Once the goroutine receives a value and makes room, the send completes.
+
+### Verification
 ```bash
 go run main.go
 # Expected:
-# Buffer full, len: 2 cap: 2
-# Sending 3rd value (will block until space available)...
-# Received: 1 — made room in buffer
-# 3rd value sent!
+#   Buffer state: len=2, cap=2 (full)
+#   Sending 3rd value (will block)...
+#   Drained one: 1 -- made room
+#   3rd value sent successfully!
 ```
 
 ## Step 3 -- Inspect with len() and cap()
 
-`len(ch)` returns the number of values currently in the buffer. `cap(ch)` returns the total capacity. These are useful for diagnostics but should not be used for synchronization (the values can change between checking and acting).
+`len(ch)` returns the number of values currently in the buffer. `cap(ch)` returns the total capacity. These are useful for diagnostics but should NOT be used for synchronization (the values can change between checking and acting).
 
 ```go
-ch := make(chan string, 5)
-fmt.Printf("Empty:  len=%d cap=%d\n", len(ch), cap(ch))
+package main
 
-ch <- "a"
-ch <- "b"
-fmt.Printf("After 2: len=%d cap=%d\n", len(ch), cap(ch))
+import "fmt"
 
-<-ch
-fmt.Printf("After recv: len=%d cap=%d\n", len(ch), cap(ch))
+func main() {
+    ch := make(chan string, 5)
+    fmt.Printf("Empty:      len=%d  cap=%d\n", len(ch), cap(ch))
+
+    ch <- "a"
+    ch <- "b"
+    fmt.Printf("After 2:    len=%d  cap=%d\n", len(ch), cap(ch))
+
+    <-ch
+    fmt.Printf("After recv: len=%d  cap=%d\n", len(ch), cap(ch))
+
+    ch <- "c"
+    ch <- "d"
+    ch <- "e"
+    fmt.Printf("After 3:    len=%d  cap=%d\n", len(ch), cap(ch))
+
+    ch <- "f"
+    fmt.Printf("Full:       len=%d  cap=%d\n", len(ch), cap(ch))
+}
 ```
 
-### Intermediate Verification
+### Verification
 ```bash
 go run main.go
 # Expected:
-# Empty:  len=0 cap=5
-# After 2: len=2 cap=5
-# After recv: len=1 cap=5
+#   Empty:      len=0  cap=5
+#   After 2:    len=2  cap=5
+#   After recv: len=1  cap=5
+#   After 3:    len=4  cap=5
+#   Full:       len=5  cap=5
 ```
 
-## Step 4 -- Compare Unbuffered vs Buffered
+## Step 4 -- Unbuffered vs Buffered Timing
 
-Write a comparison that demonstrates the timing difference between unbuffered and buffered channels when a producer sends 5 values.
+This comparison demonstrates the timing difference. With an unbuffered channel, the producer must wait for each receive. With a buffered channel, the producer sends all values instantly.
 
-With an unbuffered channel, the producer can only send one value at a time and must wait for each receive. With a buffered channel (capacity 5), the producer sends all 5 instantly and the consumer reads them at its own pace.
+```go
+package main
 
-### Intermediate Verification
+import (
+    "fmt"
+    "time"
+)
+
+func main() {
+    // --- Unbuffered: producer waits for each receive ---
+    fmt.Println("Unbuffered (producer waits each time):")
+    unbuffered := make(chan int)
+    start := time.Now()
+
+    go func() {
+        for i := 1; i <= 5; i++ {
+            unbuffered <- i
+            fmt.Printf("  Sent %d at +%v\n", i, time.Since(start).Round(time.Millisecond))
+        }
+    }()
+
+    for i := 0; i < 5; i++ {
+        time.Sleep(100 * time.Millisecond)
+        <-unbuffered
+    }
+    fmt.Printf("Unbuffered total: %v\n\n", time.Since(start).Round(time.Millisecond))
+
+    // --- Buffered: producer sends all 5 almost instantly ---
+    fmt.Println("Buffered (cap=5, producer sends instantly):")
+    buffered := make(chan int, 5)
+    start = time.Now()
+
+    go func() {
+        for i := 1; i <= 5; i++ {
+            buffered <- i
+            fmt.Printf("  Sent %d at +%v\n", i, time.Since(start).Round(time.Millisecond))
+        }
+    }()
+
+    time.Sleep(10 * time.Millisecond) // let producer fill buffer
+    for i := 0; i < 5; i++ {
+        time.Sleep(100 * time.Millisecond)
+        <-buffered
+    }
+    fmt.Printf("Buffered total: %v\n", time.Since(start).Round(time.Millisecond))
+}
+```
+
+### Verification
 ```bash
 go run main.go
-# The unbuffered version takes longer because each send waits for a receive
-# The buffered version's sends complete almost instantly
+# The unbuffered sends are spaced ~100ms apart (waiting for consumer)
+# The buffered sends complete in <1ms (all 5 fit in buffer)
+```
+
+## Step 5 -- Producer-Consumer with Buffer Monitoring
+
+A realistic producer-consumer where the producer is 3x faster than the consumer. Watch the buffer fill up, block the producer, then drain as the consumer catches up.
+
+```go
+package main
+
+import (
+    "fmt"
+    "time"
+)
+
+func main() {
+    ch := make(chan int, 3)
+    done := make(chan struct{})
+
+    // Producer: fast (50ms per item)
+    go func() {
+        for i := 1; i <= 10; i++ {
+            ch <- i
+            fmt.Printf("Produced: %2d | buffer: %d/%d\n", i, len(ch), cap(ch))
+            time.Sleep(50 * time.Millisecond)
+        }
+        close(ch)
+    }()
+
+    // Consumer: slow (150ms per item) -- buffer will fill up
+    go func() {
+        for val := range ch {
+            fmt.Printf("Consumed: %2d | buffer: %d/%d\n", val, len(ch), cap(ch))
+            time.Sleep(150 * time.Millisecond)
+        }
+        done <- struct{}{}
+    }()
+
+    <-done
+    fmt.Println("All items processed")
+}
+```
+
+### Verification
+```bash
+go run main.go
+# You'll see the buffer fill to 3/3, then the producer blocks until the consumer drains
 ```
 
 ## Common Mistakes
 
 ### Using Buffer Size as a Synchronization Mechanism
+
 **Wrong:**
 ```go
-ch := make(chan int, 100)
-// "I'll just make the buffer big enough"
-for i := 0; i < 200; i++ {
-    ch <- i // blocks at item 101!
+package main
+
+func main() {
+    ch := make(chan int, 100)
+    // "I'll just make the buffer big enough"
+    for i := 0; i < 200; i++ {
+        ch <- i // blocks at item 101!
+    }
 }
 ```
+
 **What happens:** If you produce more than the buffer holds, you block. A large buffer hides the problem temporarily but doesn't solve it.
+
 **Fix:** Use appropriate buffer sizes based on your throughput needs, not as a replacement for proper synchronization.
 
 ### Checking len() Before Sending
+
 **Wrong:**
 ```go
+// In concurrent code:
 if len(ch) < cap(ch) {
     ch <- value // RACE: another goroutine might have filled it
 }
 ```
+
 **What happens:** Between checking `len()` and sending, another goroutine might fill the buffer. The send still blocks.
-**Fix:** Just send. If you need non-blocking behavior, use `select` with a `default` case (covered in section 03).
 
-## Verify What You Learned
-
-Implement a producer-consumer system in `main.go`: a producer goroutine generates numbers 1 through 10, sending each to a buffered channel of capacity 3. A consumer goroutine receives and prints each number. Use `len()` to print the buffer occupancy after each send and receive. Observe how the buffer fills and drains as the producer and consumer run at different speeds (add small sleeps to make this visible).
+**Fix:** Just send. If you need non-blocking behavior, use `select` with a `default` case (covered in the select section).
 
 ## What's Next
 Continue to [04-channel-direction](../04-channel-direction/04-channel-direction.md) to learn how directional channel types enforce correct usage at compile time.
@@ -162,7 +297,7 @@ Continue to [04-channel-direction](../04-channel-direction/04-channel-direction.
 - Sends block only when the buffer is full; receives block only when empty
 - `len(ch)` returns current items in buffer; `cap(ch)` returns total capacity
 - Buffered channels decouple producer and consumer timing
-- Buffer size is not a synchronization mechanism — choose it based on throughput needs
+- Buffer size is not a synchronization mechanism -- choose it based on throughput needs
 - Unbuffered = synchronization point; Buffered = async queue
 
 ## Reference

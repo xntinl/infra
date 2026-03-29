@@ -2,7 +2,7 @@
 
 <!--
 difficulty: basic
-concepts: [data race, shared variable, concurrent write, non-determinism]
+concepts: [data race, shared variable, concurrent write, non-determinism, lost update]
 tools: [go]
 estimated_time: 20m
 bloom_level: understand
@@ -22,27 +22,51 @@ After completing this exercise, you will be able to:
 - **Explain** why the final result differs between runs
 
 ## Why Data Races Matter
-A data race occurs when two or more goroutines access the same memory location concurrently, and at least one of the accesses is a write, with no synchronization between them. Data races are one of the most insidious bugs in concurrent programming because they produce non-deterministic results: the program may appear to work correctly most of the time, then fail unpredictably under load or on different hardware.
 
-The Go memory model explicitly states that a data race results in undefined behavior. This means the compiler and runtime make no guarantees about the outcome -- you cannot reason about the program's correctness when races exist.
+A data race occurs when three conditions are ALL true simultaneously:
 
-In this exercise, you will create a program with an intentional data race to see the problem firsthand. The next seven exercises in this section will teach you how to detect and fix races.
+1. Two or more goroutines access the same memory location
+2. At least one of the accesses is a write
+3. There is no synchronization between the accesses
 
-## Step 1 -- Create a Shared Counter
+Data races are one of the most insidious bugs in concurrent programming because they produce **non-deterministic** results: the program may appear correct most of the time, then fail unpredictably under load or on different hardware.
 
-Edit `main.go` and implement the `racyCounter` function. Launch 1000 goroutines, each incrementing a shared `counter` variable 1000 times:
+The Go memory model explicitly states that a data race results in **undefined behavior**. This means the compiler and runtime make no guarantees about the outcome -- you cannot reason about the program's correctness when races exist.
+
+In this exercise and the next four, we use the SAME counter problem (1000 goroutines x 1000 increments = expected 1,000,000) to demonstrate the progression from detecting races to fixing them.
+
+## The Counter Problem
+
+We launch 1000 goroutines, each incrementing a shared counter 1000 times. The expected result is 1,000,000. But without synchronization, the actual result is far less -- and different every time.
+
+## Step 1 -- Understand the Code
+
+Open `main.go`. The core function is `racyCounter`:
 
 ```go
+package main
+
+import (
+    "fmt"
+    "sync"
+)
+
+const (
+    numGoroutines   = 1000
+    incrementsPerGR = 1000
+    expectedTotal   = numGoroutines * incrementsPerGR
+)
+
 func racyCounter() int {
     counter := 0
     var wg sync.WaitGroup
 
-    for i := 0; i < 1000; i++ {
+    for i := 0; i < numGoroutines; i++ {
         wg.Add(1)
         go func() {
             defer wg.Done()
-            for j := 0; j < 1000; j++ {
-                counter++ // unsynchronized write to shared variable
+            for j := 0; j < incrementsPerGR; j++ {
+                counter++ // DATA RACE: read-modify-write without synchronization
             }
         }()
     }
@@ -52,65 +76,45 @@ func racyCounter() int {
 }
 ```
 
-The operation `counter++` is not atomic. It consists of three steps: read the current value, add one, write the result back. When multiple goroutines do this simultaneously, some increments are lost because goroutines read the same value before any of them writes back.
+The operation `counter++` is **not atomic**. It consists of three CPU-level steps:
+1. **READ** the current value of counter from memory
+2. **ADD** one to the value
+3. **WRITE** the new value back to memory
 
-### Intermediate Verification
+When multiple goroutines do this simultaneously, some increments are lost because goroutines read the same value before any of them writes back.
+
+## Step 2 -- Run and Observe
+
+### Verification
 ```bash
 go run main.go
 ```
-Expected: the counter should be 1,000,000 (1000 goroutines x 1000 increments), but you will see a number less than 1,000,000.
 
-## Step 2 -- Observe Non-Determinism
+Sample output (your numbers WILL differ):
+```
+=== Your First Data Race ===
+Expected result: 1000000 (1000 goroutines x 1000 increments)
 
-Implement the `main` function to run `racyCounter` multiple times and observe that the result changes between runs:
+--- Run 1 ---
+Result: 547832     WRONG (lost 452168 increments)
+--- Run 2 ---
+Result: 611204     WRONG (lost 388796 increments)
+--- Run 3 ---
+Result: 503019     WRONG (lost 496981 increments)
+--- Run 4 ---
+Result: 589412     WRONG (lost 410588 increments)
+--- Run 5 ---
+Result: 528741     WRONG (lost 471259 increments)
 
-```go
-func main() {
-    fmt.Println("=== Data Race Demonstration ===")
-    fmt.Println("Expected result: 1000000")
-    fmt.Println()
-
-    for run := 1; run <= 5; run++ {
-        result := racyCounter()
-        status := "CORRECT"
-        if result != 1000000 {
-            status = "WRONG (race!)"
-        }
-        fmt.Printf("Run %d: counter = %d  %s\n", run, result, status)
-    }
-
-    fmt.Println()
-    fmt.Println("Notice: results vary between runs.")
-    fmt.Println("This non-determinism is the hallmark of a data race.")
-    fmt.Println()
-    fmt.Println("Next exercise: use 'go run -race main.go' to detect this race automatically.")
-}
+Results across 5 runs: [547832 611204 503019 589412 528741]
+All different! This non-determinism is the hallmark of a data race.
 ```
 
-### Intermediate Verification
-```bash
-go run main.go
-```
-Sample output (your numbers will differ):
-```
-=== Data Race Demonstration ===
-Expected result: 1000000
-
-Run 1: counter = 548923  WRONG (race!)
-Run 2: counter = 611047  WRONG (race!)
-Run 3: counter = 503891  WRONG (race!)
-Run 4: counter = 587102  WRONG (race!)
-Run 5: counter = 529467  WRONG (race!)
-
-Notice: results vary between runs.
-This non-determinism is the hallmark of a data race.
-```
-
-Run it several times and compare the results. They will be different each time.
+Run it several times. Each execution produces different results. This non-determinism is the unmistakable signature of a data race.
 
 ## Step 3 -- Understand Why the Race Happens
 
-Think through the following scenario with two goroutines:
+Think through this scenario with two goroutines accessing counter simultaneously:
 
 ```
 Time    Goroutine A          Goroutine B          counter (memory)
@@ -118,18 +122,29 @@ Time    Goroutine A          Goroutine B          counter (memory)
  1      READ counter (= 42)                       42
  2                           READ counter (= 42)  42
  3      WRITE counter (= 43)                      43
- 4                           WRITE counter (= 43) 43  <-- increment lost!
+ 4                           WRITE counter (= 43) 43  <-- increment LOST!
 ```
 
-Both goroutines read 42, both compute 43, both write 43. Two increments happened, but the counter only went up by one. This is called a **lost update**, and it is the direct consequence of a data race.
+Both goroutines read 42, both compute 43, both write 43. Two increments happened, but the counter only went up by one. This is called a **lost update** and is the direct consequence of a data race.
+
+With 1000 goroutines competing, thousands of increments are lost per second.
+
+## Step 4 -- How Bad Can It Get?
+
+The range of possible results:
+- **Minimum**: 1000 (if every goroutine's entire 1000-increment loop overlaps with others)
+- **Maximum**: 1,000,000 (if all goroutines happen to run sequentially -- extremely unlikely with 1000 goroutines)
+- **Typical**: 400,000 - 700,000 depending on hardware and system load
+
+The exact number depends on CPU architecture, number of cores, OS scheduler behavior, and current system load. This unpredictability is why data races are **undefined behavior** -- you cannot predict or control the outcome.
 
 ## Common Mistakes
 
 ### Thinking "It Worked Once, So It's Fine"
-A data race may produce the correct result on some runs, especially on single-core machines or with few goroutines. The absence of symptoms does not prove the absence of the bug. Data races are undefined behavior -- they must be eliminated, not tolerated.
+A data race may produce the correct result on some runs, especially on single-core machines or with few goroutines. The absence of symptoms does NOT prove the absence of the bug. Data races are undefined behavior -- they must be eliminated, not tolerated.
 
 ### Assuming Small Operations Are Atomic
-Even `counter++` (or `counter += 1`) is not atomic in Go. It compiles to multiple machine instructions. Only operations from the `sync/atomic` package are guaranteed to be atomic.
+Even `counter++` (or `counter += 1`) is NOT atomic in Go. It compiles to multiple machine instructions. Only operations from the `sync/atomic` package are guaranteed to be atomic (see exercise 05).
 
 ### Using time.Sleep as Synchronization
 Sleeping does not synchronize memory. Even if you sleep "long enough," the compiler and CPU may reorder memory operations. Only proper synchronization primitives (`sync.Mutex`, channels, `sync/atomic`) establish happens-before relationships.
@@ -140,16 +155,18 @@ Answer these questions:
 1. What three conditions must be true for a data race to exist?
 2. Why does `counter++` produce wrong results when called from multiple goroutines?
 3. If you run the program and get 1,000,000, does that prove there is no race? Why or why not?
+4. Why is a data race worse than a regular bug?
 
 ## What's Next
 Continue to [02-race-detector-flag](../02-race-detector-flag/02-race-detector-flag.md) to learn how Go's built-in race detector can automatically find this bug.
 
 ## Summary
-- A data race occurs when two or more goroutines access the same variable concurrently and at least one access is a write, without synchronization
-- The `counter++` operation is not atomic: it is read-modify-write, and concurrent execution causes lost updates
-- Data race results are non-deterministic -- the program produces different results on different runs
-- Correct output on one run does not prove the absence of a data race
-- Data races are undefined behavior in Go and must be eliminated
+- A data race occurs when two or more goroutines access the same variable concurrently, at least one access is a write, and there is no synchronization
+- `counter++` is not atomic: it is read-modify-write, and concurrent execution causes **lost updates**
+- Data race results are non-deterministic: the program produces different results on different runs
+- Correct output on one run does NOT prove the absence of a data race
+- Data races are **undefined behavior** in Go and must be eliminated
+- Exercises 01-05 use the same counter problem (1000 goroutines x 1000 increments = 1,000,000 expected) to show progression from detection to fix
 
 ## Reference
 - [Go Memory Model](https://go.dev/ref/mem)

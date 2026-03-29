@@ -26,13 +26,23 @@ The worker pool is the most widely used concurrency pattern in Go. It combines f
 
 Worker pools are essential when you need bounded concurrency. Unlike launching a goroutine per task (which can overwhelm resources), a pool caps the number of concurrent operations. This is critical for scenarios like database connections, HTTP clients, file I/O, or any resource with limited capacity. The pool provides backpressure naturally -- when all workers are busy, new job submissions block until a worker becomes available.
 
-The fixed pool design has three components: a jobs channel (the queue), workers (goroutines reading from jobs), and a results channel (the collection point). The separation of concerns is clean: producers only know about the jobs channel, workers only know about jobs and results, and consumers only know about results.
+```
+  Worker Pool Architecture
+
+  +--------+    +------+    +---------+
+  |producer| -> | jobs | -> | worker1 | --+
+  +--------+    | chan  | -> | worker2 | --+--> results chan --> consumer
+                |      | -> | worker3 | --+
+                +------+    +---------+
+
+  Flow: send jobs -> close jobs -> workers drain queue
+  -> workers exit -> WaitGroup zero -> close results
+  -> consumer finishes
+```
 
 ## Step 1 -- Define Job and Result Types
 
 Start by defining structured types for jobs and results. This makes the pool type-safe and extensible.
-
-Edit `main.go` and verify the type definitions:
 
 ```go
 type Job struct {
@@ -49,17 +59,32 @@ type Result struct {
 
 Each `Result` carries a reference to the original `Job`, the computed output, and which worker processed it. This traceability is invaluable for debugging and monitoring.
 
-### Intermediate Verification
-The types compile. Proceed to Step 2.
-
 ## Step 2 -- Implement the Worker Function
 
 Each worker reads from the jobs channel, processes the job, and sends the result:
 
 ```go
+package main
+
+import (
+    "fmt"
+    "sync"
+    "time"
+)
+
+type Job struct {
+    ID      int
+    Payload int
+}
+
+type Result struct {
+    Job    Job
+    Output int
+    Worker int
+}
+
 func worker(id int, jobs <-chan Job, results chan<- Result) {
     for job := range jobs {
-        // Simulate variable processing time
         time.Sleep(time.Duration(50+job.Payload%50) * time.Millisecond)
         result := Result{
             Job:    job,
@@ -67,6 +92,26 @@ func worker(id int, jobs <-chan Job, results chan<- Result) {
             Worker: id,
         }
         results <- result
+    }
+}
+
+func main() {
+    jobs := make(chan Job, 3)
+    results := make(chan Result, 3)
+    var wg sync.WaitGroup
+    wg.Add(1)
+    go func() {
+        defer wg.Done()
+        worker(1, jobs, results)
+    }()
+    jobs <- Job{ID: 1, Payload: 5}
+    jobs <- Job{ID: 2, Payload: 10}
+    jobs <- Job{ID: 3, Payload: 15}
+    close(jobs)
+    wg.Wait()
+    close(results)
+    for r := range results {
+        fmt.Printf("Job %d: %d -> %d\n", r.Job.ID, r.Job.Payload, r.Output)
     }
 }
 ```
@@ -77,18 +122,53 @@ The worker has no knowledge of how many jobs exist or how many other workers are
 ```bash
 go run main.go
 ```
-A single worker should process all jobs sequentially.
+A single worker should process all jobs sequentially:
+```
+Job 1: 5 -> 25
+Job 2: 10 -> 100
+Job 3: 15 -> 225
+```
 
 ## Step 3 -- Build the Pool
 
 Now create the pool: launch N workers, send jobs, and collect results.
 
 ```go
+package main
+
+import (
+    "fmt"
+    "sync"
+    "time"
+)
+
+type Job struct {
+    ID      int
+    Payload int
+}
+
+type Result struct {
+    Job    Job
+    Output int
+    Worker int
+}
+
+func worker(id int, jobs <-chan Job, results chan<- Result) {
+    for job := range jobs {
+        time.Sleep(time.Duration(50+job.Payload%50) * time.Millisecond)
+        result := Result{
+            Job:    job,
+            Output: job.Payload * job.Payload,
+            Worker: id,
+        }
+        results <- result
+    }
+}
+
 func runPool(numWorkers, numJobs int) {
     jobs := make(chan Job, numJobs)
     results := make(chan Result, numJobs)
 
-    // Launch workers
     var wg sync.WaitGroup
     for w := 1; w <= numWorkers; w++ {
         wg.Add(1)
@@ -98,27 +178,26 @@ func runPool(numWorkers, numJobs int) {
         }(w)
     }
 
-    // Send jobs
     for j := 1; j <= numJobs; j++ {
         jobs <- Job{ID: j, Payload: j * 10}
     }
     close(jobs)
 
-    // Close results after all workers finish
     go func() {
         wg.Wait()
         close(results)
     }()
 
-    // Collect results
     for r := range results {
         fmt.Printf("  Job %d (payload=%d) -> result=%d [worker %d]\n",
             r.Job.ID, r.Job.Payload, r.Output, r.Worker)
     }
 }
-```
 
-The flow is: send all jobs -> close jobs channel -> workers drain the queue -> each worker exits when jobs is closed -> WaitGroup reaches zero -> results channel closes -> consumer finishes.
+func main() {
+    runPool(3, 10)
+}
+```
 
 ### Intermediate Verification
 ```bash
@@ -126,7 +205,6 @@ go run main.go
 ```
 Expected: all jobs processed, distributed across workers:
 ```
-=== Worker Pool (3 workers, 10 jobs) ===
   Job 1 (payload=10) -> result=100 [worker 2]
   Job 2 (payload=20) -> result=400 [worker 1]
   ...
@@ -137,10 +215,34 @@ Expected: all jobs processed, distributed across workers:
 Compare execution time with different pool sizes to see the concurrency benefit:
 
 ```go
-func benchmarkPool() {
-    fmt.Println("=== Pool Performance ===")
-    numJobs := 20
+package main
 
+import (
+    "fmt"
+    "time"
+    "sync"
+)
+
+type Job struct {
+    ID      int
+    Payload int
+}
+
+type Result struct {
+    Job    Job
+    Output int
+    Worker int
+}
+
+func worker(id int, jobs <-chan Job, results chan<- Result) {
+    for job := range jobs {
+        time.Sleep(time.Duration(50+job.Payload%50) * time.Millisecond)
+        results <- Result{Job: job, Output: job.Payload * job.Payload, Worker: id}
+    }
+}
+
+func main() {
+    numJobs := 20
     for _, nw := range []int{1, 2, 5, 10} {
         start := time.Now()
         jobs := make(chan Job, numJobs)
@@ -170,9 +272,8 @@ func benchmarkPool() {
             count++
         }
 
-        fmt.Printf("  %2d workers: %v (%d results)\n", nw, time.Since(start), count)
+        fmt.Printf("%2d workers: %v (%d results)\n", nw, time.Since(start), count)
     }
-    fmt.Println()
 }
 ```
 
@@ -200,7 +301,7 @@ go func() {
 ### Forgetting to Buffer the Channels
 **Wrong:**
 ```go
-jobs := make(chan Job)     // unbuffered
+jobs := make(chan Job)       // unbuffered
 results := make(chan Result) // unbuffered
 ```
 **What happens:** With unbuffered channels, the sender blocks until a receiver is ready. If you try to send all jobs before collecting results, you deadlock (job send blocks because no worker can receive because it's blocked trying to send a result).
@@ -212,7 +313,11 @@ Always validate that the number of workers is at least 1. A pool with zero worke
 
 ## Verify What You Learned
 
-Modify the pool to accept a custom processing function instead of hardcoding the square operation. Create a pool that computes factorials for jobs with payloads 1-12. Verify correctness by checking known factorial values.
+Run `go run main.go` and verify:
+- Single worker test: 3 jobs processed correctly
+- Pool with 3 workers and 10 jobs: all results collected
+- Performance benchmark: more workers = faster (up to a point)
+- Custom pool: factorial values match known results (1!=1, 12!=479001600)
 
 ## What's Next
 Continue to [05-semaphore-bounded-concurrency](../05-semaphore-bounded-concurrency/05-semaphore-bounded-concurrency.md) to learn an alternative approach to bounding concurrency using a buffered channel as a semaphore.

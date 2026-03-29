@@ -42,213 +42,259 @@ Why a loop? Because after `Wait` returns, the condition might no longer be true 
 
 ## Step 1 -- Basic Cond: Wait and Signal
 
-Open `main.go`. Implement `basicCondDemo` to show the fundamental wait/signal pattern:
+Run `main.go` to see the fundamental wait/signal pattern:
 
 ```go
-func basicCondDemo() {
-    fmt.Println("=== Basic Cond: Wait and Signal ===")
+package main
 
-    var mu sync.Mutex
-    cond := sync.NewCond(&mu)
-    ready := false
+import (
+	"fmt"
+	"sync"
+	"time"
+)
 
-    // Waiter goroutine
-    go func() {
-        cond.L.Lock()
-        for !ready {
-            fmt.Println("Waiter: condition not met, waiting...")
-            cond.Wait() // atomically releases lock and suspends
-        }
-        fmt.Println("Waiter: condition met! Proceeding.")
-        cond.L.Unlock()
-    }()
+func main() {
+	var mu sync.Mutex
+	cond := sync.NewCond(&mu)
+	ready := false
 
-    // Give the waiter time to start waiting
-    time.Sleep(100 * time.Millisecond)
+	var wg sync.WaitGroup
+	wg.Add(1)
 
-    // Signaler: set condition and wake the waiter
-    cond.L.Lock()
-    ready = true
-    fmt.Println("Signaler: condition set to true, signaling...")
-    cond.Signal() // wake one waiting goroutine
-    cond.L.Unlock()
+	go func() {
+		defer wg.Done()
+		cond.L.Lock()
+		for !ready {
+			fmt.Println("Waiter: condition not met, waiting...")
+			cond.Wait() // atomically releases lock and suspends
+		}
+		fmt.Println("Waiter: condition met! Proceeding.")
+		cond.L.Unlock()
+	}()
 
-    time.Sleep(50 * time.Millisecond)
-    fmt.Println()
+	time.Sleep(100 * time.Millisecond)
+
+	cond.L.Lock()
+	ready = true
+	fmt.Println("Signaler: setting condition, signaling...")
+	cond.Signal()
+	cond.L.Unlock()
+
+	wg.Wait()
 }
+```
+
+Expected output:
+```
+Waiter: condition not met, waiting...
+Signaler: setting condition, signaling...
+Waiter: condition met! Proceeding.
 ```
 
 ### Intermediate Verification
 ```bash
 go run main.go
-```
-Expected output:
-```
-Waiter: condition not met, waiting...
-Signaler: condition set to true, signaling...
-Waiter: condition met! Proceeding.
 ```
 
 ## Step 2 -- Producer-Consumer with Signal
 
-Implement a bounded buffer where a producer adds items and a consumer removes them. `Signal` wakes one waiter when the buffer state changes:
+A bounded buffer where the producer adds items and the consumer removes them:
 
 ```go
-func producerConsumerDemo() {
-    fmt.Println("=== Producer-Consumer with Signal ===")
+package main
 
-    var mu sync.Mutex
-    cond := sync.NewCond(&mu)
-    queue := make([]int, 0, 5)
-    done := false
+import (
+	"fmt"
+	"sync"
+	"time"
+)
 
-    // Consumer
-    go func() {
-        for {
-            cond.L.Lock()
-            for len(queue) == 0 && !done {
-                cond.Wait()
-            }
-            if len(queue) == 0 && done {
-                cond.L.Unlock()
-                fmt.Println("Consumer: no more items, exiting.")
-                return
-            }
-            item := queue[0]
-            queue = queue[1:]
-            fmt.Printf("Consumer: consumed %d (queue len: %d)\n", item, len(queue))
-            cond.L.Unlock()
-            cond.Signal() // notify producer that space is available
-        }
-    }()
+func main() {
+	var mu sync.Mutex
+	cond := sync.NewCond(&mu)
+	queue := make([]int, 0, 5)
+	done := false
+	var wg sync.WaitGroup
 
-    // Producer
-    for i := 1; i <= 8; i++ {
-        cond.L.Lock()
-        for len(queue) >= 5 {
-            fmt.Println("Producer: queue full, waiting...")
-            cond.Wait()
-        }
-        queue = append(queue, i)
-        fmt.Printf("Producer: produced %d (queue len: %d)\n", i, len(queue))
-        cond.L.Unlock()
-        cond.Signal() // notify consumer that an item is available
-        time.Sleep(20 * time.Millisecond)
-    }
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			cond.L.Lock()
+			for len(queue) == 0 && !done {
+				cond.Wait()
+			}
+			if len(queue) == 0 && done {
+				cond.L.Unlock()
+				fmt.Println("Consumer: done.")
+				return
+			}
+			item := queue[0]
+			queue = queue[1:]
+			fmt.Printf("Consumer: consumed %d (queue len: %d)\n", item, len(queue))
+			cond.L.Unlock()
+			cond.Signal() // notify producer that space is available
+		}
+	}()
 
-    cond.L.Lock()
-    done = true
-    cond.L.Unlock()
-    cond.Signal() // wake consumer to check done flag
+	for i := 1; i <= 8; i++ {
+		cond.L.Lock()
+		for len(queue) >= 5 {
+			fmt.Println("Producer: queue full, waiting...")
+			cond.Wait()
+		}
+		queue = append(queue, i)
+		fmt.Printf("Producer: produced %d (queue len: %d)\n", i, len(queue))
+		cond.L.Unlock()
+		cond.Signal()
+		time.Sleep(20 * time.Millisecond)
+	}
 
-    time.Sleep(200 * time.Millisecond)
-    fmt.Println()
+	cond.L.Lock()
+	done = true
+	cond.L.Unlock()
+	cond.Signal()
+	wg.Wait()
 }
+```
+
+Expected output:
+```
+Producer: produced 1 (queue len: 1)
+Consumer: consumed 1 (queue len: 0)
+Producer: produced 2 (queue len: 1)
+...
+Consumer: done.
 ```
 
 ### Intermediate Verification
 ```bash
 go run main.go
 ```
-Producer should produce 8 items. Consumer consumes them. When the queue hits capacity 5, the producer waits. The consumer drains and the producer resumes.
+Producer should produce 8 items. When the queue hits capacity 5, the producer waits.
 
 ## Step 3 -- Broadcast: Wake All Waiters
 
-Implement `broadcastDemo` where multiple workers wait for a "start" signal:
+Multiple workers wait for a "start" signal:
 
 ```go
-func broadcastDemo() {
-    fmt.Println("=== Broadcast: Wake All Waiters ===")
+package main
 
-    var mu sync.Mutex
-    cond := sync.NewCond(&mu)
-    started := false
-    var wg sync.WaitGroup
+import (
+	"fmt"
+	"sync"
+	"time"
+)
 
-    // Launch 5 workers that all wait for the start signal
-    for i := 0; i < 5; i++ {
-        wg.Add(1)
-        go func(id int) {
-            defer wg.Done()
+func main() {
+	var mu sync.Mutex
+	cond := sync.NewCond(&mu)
+	started := false
+	var wg sync.WaitGroup
 
-            cond.L.Lock()
-            for !started {
-                fmt.Printf("Worker %d: waiting for start signal...\n", id)
-                cond.Wait()
-            }
-            cond.L.Unlock()
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			cond.L.Lock()
+			for !started {
+				fmt.Printf("Worker %d: waiting...\n", id)
+				cond.Wait()
+			}
+			cond.L.Unlock()
+			fmt.Printf("Worker %d: started!\n", id)
+			time.Sleep(50 * time.Millisecond)
+			fmt.Printf("Worker %d: done.\n", id)
+		}(i)
+	}
 
-            fmt.Printf("Worker %d: started working!\n", id)
-            time.Sleep(50 * time.Millisecond)
-            fmt.Printf("Worker %d: done.\n", id)
-        }(i)
-    }
+	time.Sleep(100 * time.Millisecond)
 
-    // Let all workers reach the Wait state
-    time.Sleep(100 * time.Millisecond)
+	fmt.Println("\nMain: broadcasting start signal!")
+	cond.L.Lock()
+	started = true
+	cond.Broadcast() // wake ALL waiters at once
+	cond.L.Unlock()
 
-    // Broadcast: wake ALL waiting goroutines at once
-    fmt.Println("\nMain: broadcasting start signal!")
-    cond.L.Lock()
-    started = true
-    cond.Broadcast() // wake ALL waiters, not just one
-    cond.L.Unlock()
-
-    wg.Wait()
-    fmt.Println("All workers completed.")
-    fmt.Println()
+	wg.Wait()
+	fmt.Println("All workers completed.")
 }
+```
+
+Expected output:
+```
+Worker 0: waiting...
+Worker 1: waiting...
+...
+Main: broadcasting start signal!
+Worker 0: started!
+...
+All workers completed.
 ```
 
 ### Intermediate Verification
 ```bash
 go run main.go
 ```
-All 5 workers should print "waiting" first, then after the broadcast, all should start working simultaneously.
+All 5 workers should print "waiting" first, then all start after the broadcast.
 
-## Step 4 -- Wait-in-Loop Pattern (Spurious Wakeups)
+## Step 4 -- Wait-in-Loop (Spurious Wakeups)
 
-Implement `spuriousWakeupDemo` to show why the loop is essential:
+Two consumers compete for items -- the loop ensures correctness:
 
 ```go
-func spuriousWakeupDemo() {
-    fmt.Println("=== Wait-in-Loop Pattern ===")
+package main
 
-    var mu sync.Mutex
-    cond := sync.NewCond(&mu)
-    itemCount := 0
-    var wg sync.WaitGroup
+import (
+	"fmt"
+	"sync"
+	"time"
+)
 
-    // Two consumers competing for items
-    for i := 0; i < 2; i++ {
-        wg.Add(1)
-        go func(id int) {
-            defer wg.Done()
-            for j := 0; j < 3; j++ {
-                cond.L.Lock()
-                for itemCount == 0 { // LOOP, not if -- re-check after wakeup
-                    cond.Wait()
-                }
-                itemCount--
-                fmt.Printf("Consumer %d: took item (remaining: %d)\n", id, itemCount)
-                cond.L.Unlock()
-            }
-        }(i)
-    }
+func main() {
+	var mu sync.Mutex
+	cond := sync.NewCond(&mu)
+	itemCount := 0
+	var wg sync.WaitGroup
 
-    // Producer adds items one at a time
-    for i := 0; i < 6; i++ {
-        time.Sleep(30 * time.Millisecond)
-        cond.L.Lock()
-        itemCount++
-        fmt.Printf("Producer: added item (count: %d)\n", itemCount)
-        cond.L.Unlock()
-        cond.Signal() // wake ONE consumer
-    }
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for j := 0; j < 3; j++ {
+				cond.L.Lock()
+				for itemCount == 0 { // FOR, not IF -- re-check after wakeup
+					cond.Wait()
+				}
+				itemCount--
+				fmt.Printf("Consumer %d: took item (remaining: %d)\n", id, itemCount)
+				cond.L.Unlock()
+			}
+		}(i)
+	}
 
-    wg.Wait()
-    fmt.Println("Both consumers processed 3 items each.")
+	for i := 0; i < 6; i++ {
+		time.Sleep(30 * time.Millisecond)
+		cond.L.Lock()
+		itemCount++
+		fmt.Printf("Producer: added item (count: %d)\n", itemCount)
+		cond.L.Unlock()
+		cond.Signal()
+	}
+
+	wg.Wait()
+	fmt.Println("Both consumers processed 3 items each.")
 }
+```
+
+Expected output:
+```
+Producer: added item (count: 1)
+Consumer 0: took item (remaining: 0)
+Producer: added item (count: 1)
+Consumer 1: took item (remaining: 0)
+...
+Both consumers processed 3 items each.
 ```
 
 If you used `if` instead of `for`, a consumer might wake up and find `itemCount == 0` because the other consumer already took the item.
@@ -257,21 +303,22 @@ If you used `if` instead of `for`, a consumer might wake up and find `itemCount 
 ```bash
 go run main.go
 ```
-Both consumers should each consume exactly 3 items without panicking or reading negative counts.
+Both consumers should each consume exactly 3 items without panicking.
 
 ## Common Mistakes
 
 ### Wait Without Holding the Lock
-**Wrong:**
+
 ```go
 cond.Wait() // panic: sync: unlock of unlocked mutex
 ```
+
 **What happens:** `Wait` calls `L.Unlock()` internally. If the lock is not held, it panics.
 
 **Fix:** Always acquire `cond.L.Lock()` before calling `Wait`.
 
 ### Using if Instead of for
-**Wrong:**
+
 ```go
 cond.L.Lock()
 if !ready { // NOT safe -- condition might change between Signal and wake
@@ -279,6 +326,7 @@ if !ready { // NOT safe -- condition might change between Signal and wake
 }
 // might proceed even though ready is false again
 ```
+
 **Fix:** Always use `for`:
 ```go
 for !ready {
@@ -287,18 +335,19 @@ for !ready {
 ```
 
 ### Signal Without Changing the Condition
-**Wrong:**
+
 ```go
 cond.Signal() // wake a waiter, but the condition has not changed
 ```
-**What happens:** The waiter wakes up, re-checks the condition in the loop, finds it still false, and goes back to sleep. Useless wakeup but not a bug -- just wasted CPU.
+
+**What happens:** The waiter wakes up, re-checks the condition in the loop, finds it still false, and goes back to sleep. Not a bug, but a wasted wakeup.
 
 ### Broadcast When Signal Suffices
 Using `Broadcast` when only one goroutine should proceed causes a thundering herd: all waiters wake up, re-check the condition, and all but one go back to sleep. Use `Signal` for single-consumer patterns.
 
 ## Verify What You Learned
 
-Implement a "barrier" using `sync.Cond` and `Broadcast`: N goroutines each do some work, then wait at the barrier until all N have arrived. Once all N are waiting, broadcast to release them all simultaneously. This is useful for benchmarking and phased computation.
+Implement a "barrier" using `sync.Cond` and `Broadcast`: N goroutines each do some work, then wait at the barrier until all N have arrived. Once all N are waiting, broadcast to release them all simultaneously.
 
 ## What's Next
 Continue to [07-mutex-vs-channel-decision](../07-mutex-vs-channel-decision/07-mutex-vs-channel-decision.md) to learn when to choose mutexes versus channels for different concurrency problems.

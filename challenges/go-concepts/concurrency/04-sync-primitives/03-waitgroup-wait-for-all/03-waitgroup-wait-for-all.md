@@ -29,58 +29,54 @@ The critical rule is: **call `Add` before the `go` statement, not inside the gor
 
 ## Step 1 -- Replace time.Sleep with WaitGroup
 
-Open `main.go`. The `withSleep` function uses `time.Sleep` -- observe how it is unreliable. Then implement `withWaitGroup`:
+Run `main.go` and compare the fragile sleep-based approach with the reliable WaitGroup:
 
-```go
-func withWaitGroup() {
-    fmt.Println("\n=== With WaitGroup ===")
-    var wg sync.WaitGroup
-    start := time.Now()
-
-    for i := 0; i < 5; i++ {
-        wg.Add(1) // Add BEFORE the go statement
-        go func(id int) {
-            defer wg.Done() // Done when goroutine completes
-            duration := time.Duration(100*(id+1)) * time.Millisecond
-            time.Sleep(duration)
-            fmt.Printf("Worker %d finished (took %v)\n", id, duration)
-        }(i)
-    }
-
-    wg.Wait() // Blocks until counter reaches 0
-    fmt.Printf("All workers done in %v\n", time.Since(start).Round(time.Millisecond))
-}
-```
-
-### Intermediate Verification
 ```bash
 go run main.go
 ```
-All 5 workers should finish, and the total time should be approximately 500ms (the slowest worker determines total time since they run concurrently).
+
+The WaitGroup version finishes in exactly the time of the slowest worker (~500ms), while the sleep version always waits a fixed 600ms regardless.
+
+### Intermediate Verification
+All 5 workers should finish, and the WaitGroup version reports the actual total time.
 
 ## Step 2 -- Add Before Go, Not Inside
 
-Implement `demonstrateCorrectAdd` to show why `Add` must come before `go`:
+The `addBeforeGo` function shows the correct pattern:
 
 ```go
-func demonstrateCorrectAdd() {
-    fmt.Println("\n=== Correct: Add Before Go ===")
-    var wg sync.WaitGroup
+package main
 
-    tasks := []string{"fetch-users", "fetch-orders", "fetch-products"}
+import (
+	"fmt"
+	"sync"
+	"time"
+)
 
-    for _, task := range tasks {
-        wg.Add(1) // CORRECT: Add is called in the launching goroutine
-        go func(name string) {
-            defer wg.Done()
-            time.Sleep(50 * time.Millisecond)
-            fmt.Printf("Task %q completed\n", name)
-        }(task)
-    }
+func main() {
+	var wg sync.WaitGroup
+	tasks := []string{"fetch-users", "fetch-orders", "fetch-products"}
 
-    wg.Wait()
-    fmt.Println("All tasks completed.")
+	for _, task := range tasks {
+		wg.Add(1) // CORRECT: Add before the go statement
+		go func(name string) {
+			defer wg.Done()
+			time.Sleep(50 * time.Millisecond)
+			fmt.Printf("Task %q completed\n", name)
+		}(task)
+	}
+
+	wg.Wait()
+	fmt.Println("All tasks completed.")
 }
+```
+
+Expected output:
+```
+Task "fetch-users" completed
+Task "fetch-orders" completed
+Task "fetch-products" completed
+All tasks completed.
 ```
 
 ### Intermediate Verification
@@ -91,26 +87,37 @@ All three tasks should print their completion message before "All tasks complete
 
 ## Step 3 -- Batch Add for Known Count
 
-When you know the number of goroutines upfront, you can call `Add` once with the total count:
+When you know the number of goroutines upfront, you can call `Add` once:
 
 ```go
-func batchAdd() {
-    fmt.Println("\n=== Batch Add ===")
-    const numWorkers = 10
-    var wg sync.WaitGroup
-    results := make([]int, numWorkers)
+package main
 
-    wg.Add(numWorkers) // Add all at once
-    for i := 0; i < numWorkers; i++ {
-        go func(id int) {
-            defer wg.Done()
-            results[id] = id * id // each goroutine writes to its own index
-        }(i)
-    }
+import (
+	"fmt"
+	"sync"
+)
 
-    wg.Wait()
-    fmt.Printf("Results: %v\n", results)
+func main() {
+	const numWorkers = 10
+	var wg sync.WaitGroup
+	results := make([]int, numWorkers)
+
+	wg.Add(numWorkers) // add all at once
+	for i := 0; i < numWorkers; i++ {
+		go func(id int) {
+			defer wg.Done()
+			results[id] = id * id // each goroutine writes to its own index -- safe
+		}(i)
+	}
+
+	wg.Wait()
+	fmt.Printf("Results: %v\n", results)
 }
+```
+
+Expected output:
+```
+Results: [0 1 4 9 16 25 36 49 64 81]
 ```
 
 Note: each goroutine writes to a unique index in the slice, so no mutex is needed. This is a common and safe pattern.
@@ -121,108 +128,187 @@ go run main.go
 ```
 Results should contain the squares: `[0 1 4 9 16 25 36 49 64 81]`.
 
-## Step 4 -- Dynamic Work with WaitGroup
+## Step 4 -- Parallel Sum
 
-Implement `dynamicWork` where the number of goroutines is determined at runtime:
+The `parallelSum` function splits computation across 10 goroutines:
 
 ```go
-func dynamicWork() {
-    fmt.Println("\n=== Dynamic Work ===")
-    var wg sync.WaitGroup
+package main
 
-    urls := []string{
-        "https://api.example.com/users",
-        "https://api.example.com/orders",
-        "https://api.example.com/products",
-        "https://api.example.com/inventory",
-    }
+import (
+	"fmt"
+	"sync"
+)
 
-    for _, url := range urls {
-        wg.Add(1)
-        go func(u string) {
-            defer wg.Done()
-            // Simulate HTTP request
-            time.Sleep(time.Duration(50+len(u)) * time.Millisecond)
-            fmt.Printf("Fetched: %s\n", u)
-        }(url)
-    }
+func main() {
+	const size = 1_000_000
+	numbers := make([]int, size)
+	for i := range numbers {
+		numbers[i] = i
+	}
 
-    wg.Wait()
-    fmt.Println("All URLs fetched.")
+	// Sequential sum for verification
+	sequentialSum := int64(0)
+	for _, n := range numbers {
+		sequentialSum += int64(n)
+	}
+
+	// Parallel sum: 10 chunks
+	const numWorkers = 10
+	chunkSize := size / numWorkers
+	partialSums := make([]int64, numWorkers)
+	var wg sync.WaitGroup
+
+	wg.Add(numWorkers)
+	for i := 0; i < numWorkers; i++ {
+		go func(workerID int) {
+			defer wg.Done()
+			start := workerID * chunkSize
+			end := start + chunkSize
+
+			var sum int64
+			for _, n := range numbers[start:end] {
+				sum += int64(n)
+			}
+			partialSums[workerID] = sum
+		}(i)
+	}
+
+	wg.Wait()
+
+	parallelTotal := int64(0)
+	for _, s := range partialSums {
+		parallelTotal += s
+	}
+
+	fmt.Printf("Sequential: %d\n", sequentialSum)
+	fmt.Printf("Parallel:   %d\n", parallelTotal)
+	fmt.Printf("Match: %v\n", sequentialSum == parallelTotal)
 }
+```
+
+Expected output:
+```
+Sequential: 499999500000
+Parallel:   499999500000
+Match: true
 ```
 
 ### Intermediate Verification
 ```bash
 go run main.go
 ```
-All four URLs should be printed before the "All URLs fetched." message.
+Both sums should match perfectly.
 
 ## Common Mistakes
 
 ### Add Inside the Goroutine
-**Wrong:**
+
 ```go
-var wg sync.WaitGroup
-for i := 0; i < 5; i++ {
-    go func(id int) {
-        wg.Add(1) // RACE: main might reach Wait() before this executes
-        defer wg.Done()
-        fmt.Println(id)
-    }(i)
+package main
+
+import (
+	"fmt"
+	"sync"
+)
+
+func main() {
+	var wg sync.WaitGroup
+	for i := 0; i < 5; i++ {
+		go func(id int) {
+			wg.Add(1) // RACE: main might reach Wait() before this executes
+			defer wg.Done()
+			fmt.Println(id)
+		}(i)
+	}
+	wg.Wait() // might return immediately with goroutines still running
+	fmt.Println("done -- but some goroutines may have been skipped!")
 }
-wg.Wait() // might return immediately with goroutines still running
 ```
+
 **What happens:** `Wait()` can return before all goroutines have called `Add`, so some goroutines may not be waited for.
 
 **Fix:** Always call `Add` before the `go` statement.
 
 ### Negative WaitGroup Counter
-**Wrong:**
+
 ```go
-var wg sync.WaitGroup
-wg.Add(1)
-go func() {
-    wg.Done()
-    wg.Done() // panic: negative WaitGroup counter
-}()
-wg.Wait()
+package main
+
+import "sync"
+
+func main() {
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		wg.Done()
+		wg.Done() // panic: sync: negative WaitGroup counter
+	}()
+	wg.Wait()
+}
 ```
+
 **What happens:** Runtime panic. Each goroutine must call `Done` exactly once.
 
 **Fix:** Use `defer wg.Done()` as the first line inside the goroutine to guarantee it is called exactly once.
 
 ### Forgetting Done
-**Wrong:**
+
 ```go
-var wg sync.WaitGroup
-wg.Add(1)
-go func() {
-    if someCondition {
-        return // Done is never called
-    }
-    wg.Done()
-}()
-wg.Wait() // blocks forever
+package main
+
+import "sync"
+
+func main() {
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		// Some condition causes early return
+		if true {
+			return // Done is never called!
+		}
+		wg.Done()
+	}()
+	wg.Wait() // blocks forever -- deadlock
+}
 ```
+
 **What happens:** Deadlock. The counter never reaches zero.
 
 **Fix:** Use `defer wg.Done()` so it runs regardless of how the goroutine exits.
 
 ### Passing WaitGroup by Value
-**Wrong:**
+
 ```go
-func worker(wg sync.WaitGroup) { // receives a COPY
-    defer wg.Done() // decrements the copy, not the original
-    // ...
+package main
+
+import (
+	"fmt"
+	"sync"
+)
+
+func worker(wg sync.WaitGroup, id int) { // receives a COPY
+	defer wg.Done() // decrements the copy, not the original
+	fmt.Printf("Worker %d done\n", id)
+}
+
+func main() {
+	var wg sync.WaitGroup
+	for i := 0; i < 3; i++ {
+		wg.Add(1)
+		go worker(wg, i) // passes by value -- the original never decrements
+	}
+	wg.Wait() // blocks forever -- deadlock
 }
 ```
+
 **What happens:** The original WaitGroup counter is never decremented. Deadlock.
 
 **Fix:** Pass `*sync.WaitGroup` (pointer):
 ```go
-func worker(wg *sync.WaitGroup) {
-    defer wg.Done()
+func worker(wg *sync.WaitGroup, id int) {
+	defer wg.Done()
+	fmt.Printf("Worker %d done\n", id)
 }
 ```
 

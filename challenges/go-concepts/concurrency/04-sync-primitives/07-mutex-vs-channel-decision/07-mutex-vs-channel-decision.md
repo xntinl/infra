@@ -32,242 +32,274 @@ The decision framework:
 - **Channel** when you are transferring ownership of data, coordinating phases of work, or signaling events between goroutines.
 - **Guideline**: if your channel is used as a mutex (e.g., buffered channel of size 1 used as a semaphore with no data flow), consider an actual mutex. If your mutex is being locked and unlocked across multiple goroutines to coordinate steps, consider a channel.
 
-## Step 1 -- Problem: Concurrent Bank Account
+## Step 1 -- Mutex-Based Bank Account
 
-The same problem, two solutions. A bank account supports concurrent deposits and withdrawals, and must report the final balance correctly.
-
-Open `main.go`. Implement the mutex-based solution first:
+Run `main.go`. The mutex version protects the balance as a struct field:
 
 ```go
+package main
+
+import (
+	"fmt"
+	"sync"
+)
+
 type MutexAccount struct {
-    mu      sync.Mutex
-    balance int
+	mu      sync.Mutex
+	balance int
 }
 
 func (a *MutexAccount) Deposit(amount int) {
-    a.mu.Lock()
-    defer a.mu.Unlock()
-    a.balance += amount
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.balance += amount
 }
 
 func (a *MutexAccount) Withdraw(amount int) bool {
-    a.mu.Lock()
-    defer a.mu.Unlock()
-    if a.balance < amount {
-        return false
-    }
-    a.balance -= amount
-    return true
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.balance < amount {
+		return false
+	}
+	a.balance -= amount
+	return true
 }
 
 func (a *MutexAccount) Balance() int {
-    a.mu.Lock()
-    defer a.mu.Unlock()
-    return a.balance
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.balance
+}
+
+func main() {
+	ma := &MutexAccount{balance: 1000}
+	var wg sync.WaitGroup
+
+	for i := 0; i < 100; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ma.Deposit(10)
+			ma.Withdraw(5)
+		}()
+	}
+	wg.Wait()
+	fmt.Printf("Balance: %d (expected: 1500)\n", ma.Balance())
 }
 ```
 
-### Intermediate Verification
-```bash
-go run main.go
+Expected output:
 ```
-The mutex account should show the correct final balance after 1000 concurrent operations.
-
-## Step 2 -- Channel-Based Solution
-
-Implement the same account using channels. A single goroutine owns the balance; all operations are sent as messages:
-
-```go
-type ChannelAccount struct {
-    ops     chan accountOp
-    done    chan struct{}
-}
-
-type accountOp struct {
-    kind     string // "deposit", "withdraw", "balance"
-    amount   int
-    response chan accountResult
-}
-
-type accountResult struct {
-    balance int
-    ok      bool
-}
-
-func NewChannelAccount(initialBalance int) *ChannelAccount {
-    a := &ChannelAccount{
-        ops:  make(chan accountOp),
-        done: make(chan struct{}),
-    }
-    go a.run(initialBalance)
-    return a
-}
-
-func (a *ChannelAccount) run(balance int) {
-    for op := range a.ops {
-        switch op.kind {
-        case "deposit":
-            balance += op.amount
-            op.response <- accountResult{balance: balance, ok: true}
-        case "withdraw":
-            if balance >= op.amount {
-                balance -= op.amount
-                op.response <- accountResult{balance: balance, ok: true}
-            } else {
-                op.response <- accountResult{balance: balance, ok: false}
-            }
-        case "balance":
-            op.response <- accountResult{balance: balance, ok: true}
-        }
-    }
-    close(a.done)
-}
-
-func (a *ChannelAccount) Deposit(amount int) {
-    resp := make(chan accountResult)
-    a.ops <- accountOp{kind: "deposit", amount: amount, response: resp}
-    <-resp
-}
-
-func (a *ChannelAccount) Withdraw(amount int) bool {
-    resp := make(chan accountResult)
-    a.ops <- accountOp{kind: "withdraw", amount: amount, response: resp}
-    result := <-resp
-    return result.ok
-}
-
-func (a *ChannelAccount) Balance() int {
-    resp := make(chan accountResult)
-    a.ops <- accountOp{kind: "balance", response: resp}
-    result := <-resp
-    return result.balance
-}
-
-func (a *ChannelAccount) Close() {
-    close(a.ops)
-    <-a.done
-}
-```
-
-### Intermediate Verification
-```bash
-go run main.go
-```
-Both accounts should produce identical final balances for the same sequence of operations.
-
-## Step 3 -- Compare the Approaches
-
-Implement `compareApproaches` to run the same workload on both:
-
-```go
-func compareApproaches() {
-    fmt.Println("=== Comparison ===")
-
-    const goroutines = 100
-    const opsPerGoroutine = 1000
-
-    // Mutex approach
-    ma := &MutexAccount{balance: 10000}
-    start := time.Now()
-    runWorkload(
-        goroutines, opsPerGoroutine,
-        func(amount int) { ma.Deposit(amount) },
-        func(amount int) bool { return ma.Withdraw(amount) },
-    )
-    mutexTime := time.Since(start)
-    fmt.Printf("Mutex:   balance=%d, time=%v\n", ma.Balance(), mutexTime)
-
-    // Channel approach
-    ca := NewChannelAccount(10000)
-    start = time.Now()
-    runWorkload(
-        goroutines, opsPerGoroutine,
-        func(amount int) { ca.Deposit(amount) },
-        func(amount int) bool { return ca.Withdraw(amount) },
-    )
-    channelTime := time.Since(start)
-    fmt.Printf("Channel: balance=%d, time=%v\n", ca.Balance(), channelTime)
-    ca.Close()
-}
+Balance: 1500 (expected: 1500)
 ```
 
 ### Intermediate Verification
 ```bash
 go run -race main.go
 ```
-Both should be race-free and produce consistent balances.
+No race conditions. Balance is exactly 1500 (1000 + 100*5).
 
-## Step 4 -- Analyze When to Use Which
+## Step 2 -- Channel-Based Bank Account
 
-Implement `decisionGuide` that prints the decision framework:
+The channel version uses a single goroutine as the exclusive owner of the balance:
 
 ```go
-func decisionGuide() {
-    fmt.Println("\n=== Decision Guide ===")
-    fmt.Println("Use MUTEX when:")
-    fmt.Println("  - Protecting internal state of a struct")
-    fmt.Println("  - Simple read/write access patterns")
-    fmt.Println("  - Performance is critical (lower overhead)")
-    fmt.Println("  - The protected data has a clear owner")
-    fmt.Println()
-    fmt.Println("Use CHANNELS when:")
-    fmt.Println("  - Transferring data ownership between goroutines")
-    fmt.Println("  - Coordinating sequential phases of work (pipelines)")
-    fmt.Println("  - Fan-out/fan-in patterns")
-    fmt.Println("  - Select-based multiplexing with timeouts/cancellation")
-    fmt.Println()
-    fmt.Println("Go Proverb: 'Do not communicate by sharing memory;")
-    fmt.Println("             share memory by communicating.'")
-    fmt.Println()
-    fmt.Println("Translation: If goroutines need to TALK, use channels.")
-    fmt.Println("             If a struct needs to be SAFE, use a mutex.")
+package main
+
+import (
+	"fmt"
+	"sync"
+)
+
+type accountOp struct {
+	kind     string
+	amount   int
+	response chan accountResult
+}
+
+type accountResult struct {
+	balance int
+	ok      bool
+}
+
+type ChannelAccount struct {
+	ops  chan accountOp
+	done chan struct{}
+}
+
+func NewChannelAccount(initialBalance int) *ChannelAccount {
+	a := &ChannelAccount{
+		ops:  make(chan accountOp),
+		done: make(chan struct{}),
+	}
+	go a.run(initialBalance)
+	return a
+}
+
+func (a *ChannelAccount) run(balance int) {
+	for op := range a.ops {
+		switch op.kind {
+		case "deposit":
+			balance += op.amount
+			op.response <- accountResult{balance: balance, ok: true}
+		case "withdraw":
+			if balance >= op.amount {
+				balance -= op.amount
+				op.response <- accountResult{balance: balance, ok: true}
+			} else {
+				op.response <- accountResult{balance: balance, ok: false}
+			}
+		case "balance":
+			op.response <- accountResult{balance: balance, ok: true}
+		}
+	}
+	close(a.done)
+}
+
+func (a *ChannelAccount) Deposit(amount int) {
+	resp := make(chan accountResult)
+	a.ops <- accountOp{kind: "deposit", amount: amount, response: resp}
+	<-resp
+}
+
+func (a *ChannelAccount) Withdraw(amount int) bool {
+	resp := make(chan accountResult)
+	a.ops <- accountOp{kind: "withdraw", amount: amount, response: resp}
+	return (<-resp).ok
+}
+
+func (a *ChannelAccount) Balance() int {
+	resp := make(chan accountResult)
+	a.ops <- accountOp{kind: "balance", response: resp}
+	return (<-resp).balance
+}
+
+func (a *ChannelAccount) Close() {
+	close(a.ops)
+	<-a.done
+}
+
+func main() {
+	ca := NewChannelAccount(1000)
+	var wg sync.WaitGroup
+
+	for i := 0; i < 100; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ca.Deposit(10)
+			ca.Withdraw(5)
+		}()
+	}
+	wg.Wait()
+	fmt.Printf("Balance: %d (expected: 1500)\n", ca.Balance())
+	ca.Close()
 }
 ```
 
+Expected output:
+```
+Balance: 1500 (expected: 1500)
+```
+
 ### Intermediate Verification
-The guide should print clearly and help internalize the decision criteria.
+```bash
+go run -race main.go
+```
+Both accounts produce identical results for the same operations.
+
+## Step 3 -- Compare Performance
+
+The program benchmarks 100 goroutines doing 1000 random operations each:
+
+```bash
+go run main.go
+```
+
+Expected output:
+```
+Mutex:   balance=XXXX, time=15ms
+Channel: balance=XXXX, time=85ms
+Mutex is typically faster for simple state protection.
+```
+
+The mutex version is faster because each operation is a simple lock/unlock. The channel version requires channel send, goroutine scheduling, channel receive -- more overhead per operation. The channel version's advantage is clarity of ownership, not speed.
+
+## Step 4 -- Decision Guide
+
+The program prints a decision framework:
+
+```
+Use MUTEX when:
+  - Protecting internal state of a struct
+  - Simple read/write access patterns
+  - Performance is critical (lower overhead)
+  - The protected data has a clear owner
+
+Use CHANNELS when:
+  - Transferring data ownership between goroutines
+  - Coordinating sequential phases of work (pipelines)
+  - Fan-out/fan-in patterns
+  - Select-based multiplexing with timeouts/cancellation
+```
 
 ## Common Mistakes
 
 ### Channel as a Mutex
-**Questionable:**
+
 ```go
 sem := make(chan struct{}, 1)
 sem <- struct{}{} // "lock"
 counter++
 <-sem             // "unlock"
 ```
-**Why:** This works but is a mutex in disguise. A real `sync.Mutex` is clearer, lighter, and has better tooling support (race detector, deadlock detection).
+
+**Why this is a code smell:** It works but is a mutex in disguise. A real `sync.Mutex` is clearer, lighter, and has better tooling support (race detector, deadlock detection).
 
 ### Mutex for Pipeline Coordination
-**Questionable:**
+
 ```go
-var mu sync.Mutex
-var phase1Done, phase2Done bool
+package main
 
-go func() {
-    doPhase1()
-    mu.Lock()
-    phase1Done = true
-    mu.Unlock()
-}()
+import (
+	"fmt"
+	"sync"
+	"time"
+)
 
-// Polling loop to wait for phase 1
-for {
-    mu.Lock()
-    if phase1Done { mu.Unlock(); break }
-    mu.Unlock()
-    time.Sleep(time.Millisecond)
+func main() {
+	var mu sync.Mutex
+	var phase1Done bool
+
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		mu.Lock()
+		phase1Done = true
+		mu.Unlock()
+	}()
+
+	// Polling loop -- wasteful and ugly
+	for {
+		mu.Lock()
+		done := phase1Done
+		mu.Unlock()
+		if done {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	fmt.Println("phase 1 done (but this code is terrible)")
 }
 ```
-**Why:** This is coordination, not state protection. A channel is far cleaner:
+
+**Why this is a code smell:** This is coordination, not state protection. A channel is far cleaner:
 ```go
 phase1Done := make(chan struct{})
 go func() {
     doPhase1()
     close(phase1Done)
 }()
-<-phase1Done
+<-phase1Done // blocks cleanly, no polling
 ```
 
 ### Over-Channeling Simple State

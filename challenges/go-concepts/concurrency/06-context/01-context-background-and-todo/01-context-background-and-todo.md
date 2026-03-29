@@ -34,37 +34,40 @@ Understanding these root contexts is the foundation. Every `WithCancel`, `WithTi
 
 ## Step 1 -- Create and Inspect Background Context
 
-Edit `main.go` and implement the `exploreBackground` function. Create a background context and print its properties:
+The `exploreBackground` function creates a background context and prints every observable property. Run it to see that a root context is completely empty:
 
 ```go
-func exploreBackground() {
-    fmt.Println("=== context.Background() ===")
+package main
 
-    ctx := context.Background()
+import (
+	"context"
+	"fmt"
+)
 
-    fmt.Printf("Type:     %T\n", ctx)
-    fmt.Printf("String:   %s\n", ctx)
-    fmt.Printf("Err:      %v\n", ctx.Err())
-    fmt.Printf("Done:     %v\n", ctx.Done())
-    fmt.Printf("Deadline: ")
+func main() {
+	ctx := context.Background()
 
-    deadline, ok := ctx.Deadline()
-    if ok {
-        fmt.Printf("%v\n", deadline)
-    } else {
-        fmt.Println("none (no deadline set)")
-    }
-    fmt.Printf("Value(\"key\"): %v\n\n", ctx.Value("key"))
+	fmt.Printf("Type:     %T\n", ctx)
+	fmt.Printf("String:   %s\n", ctx)
+	fmt.Printf("Err:      %v\n", ctx.Err())
+	fmt.Printf("Done:     %v\n", ctx.Done())
+
+	deadline, ok := ctx.Deadline()
+	if ok {
+		fmt.Printf("Deadline: %v\n", deadline)
+	} else {
+		fmt.Println("Deadline: none (no deadline set)")
+	}
+	fmt.Printf("Value(\"key\"): %v\n", ctx.Value("key"))
 }
 ```
 
-### Intermediate Verification
+### Verification
 ```bash
 go run main.go
 ```
 Expected output:
 ```
-=== context.Background() ===
 Type:     *context.emptyCtx
 String:   context.Background
 Err:      <nil>
@@ -73,85 +76,142 @@ Deadline: none (no deadline set)
 Value("key"): <nil>
 ```
 
-The background context has no deadline, no error, a nil `Done()` channel (meaning it can never be cancelled), and no values.
+The background context has no deadline, no error, a nil `Done()` channel (meaning it can never be cancelled), and no values. The nil `Done()` channel is significant: a receive on a nil channel blocks forever, which is correct because a root context should never be cancelled.
 
 ## Step 2 -- Create and Inspect TODO Context
 
-Implement `exploreTODO`. Create a TODO context and print the same properties:
+`context.TODO()` returns a context structurally identical to `Background()`. The only difference is the string representation, which serves as documentation of intent:
 
 ```go
-func exploreTODO() {
-    fmt.Println("=== context.TODO() ===")
+package main
 
-    ctx := context.TODO()
+import (
+	"context"
+	"fmt"
+)
 
-    fmt.Printf("Type:     %T\n", ctx)
-    fmt.Printf("String:   %s\n", ctx)
-    fmt.Printf("Err:      %v\n", ctx.Err())
-    fmt.Printf("Done:     %v\n", ctx.Done())
+func main() {
+	bg := context.Background()
+	todo := context.TODO()
 
-    deadline, ok := ctx.Deadline()
-    if ok {
-        fmt.Printf("Deadline: %v\n", deadline)
-    } else {
-        fmt.Println("Deadline: none (no deadline set)")
-    }
-    fmt.Printf("Value(\"key\"): %v\n\n", ctx.Value("key"))
+	fmt.Printf("Background string: %s\n", bg)
+	fmt.Printf("TODO string:       %s\n", todo)
+
+	// Prove they are behaviorally identical.
+	fmt.Printf("Both nil Err:   %v\n", bg.Err() == todo.Err())
+	fmt.Printf("Both nil Done:  %v\n", bg.Done() == todo.Done())
+
+	_, bgOk := bg.Deadline()
+	_, todoOk := todo.Deadline()
+	fmt.Printf("Both no deadline: %v\n", bgOk == todoOk)
 }
 ```
 
-### Intermediate Verification
+### Verification
 ```bash
 go run main.go
 ```
 Expected output:
 ```
-=== context.TODO() ===
-Type:     *context.emptyCtx
-String:   context.TODO
-Err:      <nil>
-Done:     <nil>
-Deadline: none (no deadline set)
-Value("key"): <nil>
+Background string: context.Background
+TODO string:       context.TODO
+Both nil Err:   true
+Both nil Done:  true
+Both no deadline: true
 ```
 
-Notice that `Background()` and `TODO()` are structurally identical. The only difference is the string representation, which serves as documentation of intent.
+Notice that `Background()` and `TODO()` are structurally identical. The only difference is the string representation. Static analysis tools like `go vet` can flag `TODO()` contexts that remain in production code.
 
 ## Step 3 -- Passing Context to a Function
 
-Implement `greet` and call it from `demonstratePassingContext`. This establishes the convention that `context.Context` is always the first parameter:
+The universal Go convention: `context.Context` is always the **first** parameter, named `ctx`. This is not optional style -- the entire standard library and ecosystem follows it. Linters like `revive` and `contextcheck` enforce it.
 
 ```go
+package main
+
+import (
+	"context"
+	"fmt"
+)
+
 func greet(ctx context.Context, name string) {
-    if ctx.Err() != nil {
-        fmt.Println("context already cancelled, skipping greet")
-        return
-    }
-    fmt.Printf("Hello, %s! (context: %s)\n", name, ctx)
+	if ctx.Err() != nil {
+		fmt.Printf("greet: context already cancelled, skipping\n")
+		return
+	}
+	fmt.Printf("Hello, %s! (via %s)\n", name, ctx)
 }
 
-func demonstratePassingContext() {
-    fmt.Println("=== Passing Context ===")
+func main() {
+	greet(context.Background(), "Alice")
+	greet(context.TODO(), "Bob")
 
-    bgCtx := context.Background()
-    greet(bgCtx, "Background User")
-
-    todoCtx := context.TODO()
-    greet(todoCtx, "TODO User")
-
-    fmt.Println()
+	// Show behavior with a cancelled context.
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	greet(cancelled, "Charlie")
 }
 ```
 
-### Intermediate Verification
+### Verification
 ```bash
 go run main.go
 ```
 Expected output:
 ```
-=== Passing Context ===
-Hello, Background User! (context: context.Background)
-Hello, TODO User! (context: context.TODO)
+Hello, Alice! (via context.Background)
+Hello, Bob! (via context.TODO)
+greet: context already cancelled, skipping
+```
+
+Checking `ctx.Err()` before doing work is a defensive pattern that avoids wasting resources when the context is already cancelled (e.g., the HTTP client disconnected before the handler started processing).
+
+## Step 4 -- Context Tree Visualization
+
+Every context in Go forms a tree. Root contexts sit at the top. Derived contexts are children. Cancellation flows DOWN: cancelling a parent cancels all descendants. It never flows UP -- parents and siblings are unaffected.
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+)
+
+func main() {
+	root := context.Background()
+	child, cancelChild := context.WithCancel(root)
+	grandchild, cancelGrandchild := context.WithCancel(child)
+	defer cancelGrandchild()
+
+	fmt.Printf("Before cancel:\n")
+	fmt.Printf("  root.Err():       %v\n", root.Err())
+	fmt.Printf("  child.Err():      %v\n", child.Err())
+	fmt.Printf("  grandchild.Err(): %v\n", grandchild.Err())
+
+	cancelChild()
+
+	fmt.Printf("After cancelling child:\n")
+	fmt.Printf("  root.Err():       %v  (unaffected)\n", root.Err())
+	fmt.Printf("  child.Err():      %v\n", child.Err())
+	fmt.Printf("  grandchild.Err(): %v  (cascaded from child)\n", grandchild.Err())
+}
+```
+
+### Verification
+```bash
+go run main.go
+```
+Expected output:
+```
+Before cancel:
+  root.Err():       <nil>
+  child.Err():      <nil>
+  grandchild.Err(): <nil>
+After cancelling child:
+  root.Err():       <nil>  (unaffected)
+  child.Err():      context canceled
+  grandchild.Err(): context canceled  (cascaded from child)
 ```
 
 ## Common Mistakes
@@ -166,33 +226,127 @@ Hello, TODO User! (context: context.TODO)
 ### Creating Context Inside a Helper Instead of Receiving It
 **Wrong:**
 ```go
+package main
+
+import (
+	"context"
+	"fmt"
+)
+
 func fetchData() {
-    ctx := context.Background() // creates a new root -- isolated from caller
-    // ...
+	ctx := context.Background() // creates a new root -- isolated from caller
+	_ = ctx
+	fmt.Println("fetching data...")
+}
+
+func main() {
+	fetchData()
 }
 ```
 **Fix:**
 ```go
+package main
+
+import (
+	"context"
+	"fmt"
+)
+
 func fetchData(ctx context.Context) {
-    // uses the caller's context -- cancellation propagates
-    // ...
+	_ = ctx // uses the caller's context -- cancellation propagates
+	fmt.Println("fetching data...")
+}
+
+func main() {
+	fetchData(context.Background())
 }
 ```
+
+When a function creates its own `context.Background()`, it breaks the cancellation chain. The caller has no way to cancel or set a deadline on that operation. Always accept context as a parameter.
 
 ### Storing Context in a Struct
 **Wrong:**
 ```go
+package main
+
+import "context"
+
 type Server struct {
-    ctx context.Context // do not do this
+	ctx context.Context // do not do this
+}
+
+func main() {
+	_ = Server{ctx: context.Background()}
 }
 ```
-**Why it matters:** Contexts are request-scoped. Storing them in a struct ties a short-lived value to a long-lived object, leading to stale contexts and subtle bugs.
+**Why it matters:** Contexts are request-scoped. Storing them in a struct ties a short-lived value to a long-lived object, leading to stale contexts and subtle bugs. The context would outlive the request it was meant for.
 
-**Fix:** Pass context as the first parameter of each method call.
+**Fix:** Pass context as the first parameter of each method call:
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+)
+
+type Server struct{}
+
+func (s *Server) HandleRequest(ctx context.Context) {
+	fmt.Printf("handling request with context: %s\n", ctx)
+}
+
+func main() {
+	s := &Server{}
+	s.HandleRequest(context.Background())
+}
+```
 
 ## Verify What You Learned
 
-Implement `verifyKnowledge`: create both a `Background` and a `TODO` context, then write a function `describeContext` that accepts a `context.Context` and prints whether it has a deadline, whether its `Done` channel is nil, and its string representation. Call it with both contexts and confirm they behave identically aside from their string output.
+Write a function `describeContext(ctx context.Context)` that accepts any context and prints whether it has a deadline, whether its `Done` channel is nil, and its string representation. Call it with both `Background` and `TODO` contexts and confirm they behave identically aside from their string output.
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+)
+
+func describeContext(ctx context.Context) {
+	_, hasDeadline := ctx.Deadline()
+	doneIsNil := ctx.Done() == nil
+
+	fmt.Printf("  Has deadline: %v\n", hasDeadline)
+	fmt.Printf("  Done is nil:  %v\n", doneIsNil)
+	fmt.Printf("  String:       %s\n", ctx)
+}
+
+func main() {
+	fmt.Println("describe(context.Background):")
+	describeContext(context.Background())
+
+	fmt.Println("describe(context.TODO):")
+	describeContext(context.TODO())
+}
+```
+
+### Verification
+```bash
+go run main.go
+```
+Expected output:
+```
+describe(context.Background):
+  Has deadline: false
+  Done is nil:  true
+  String:       context.Background
+describe(context.TODO):
+  Has deadline: false
+  Done is nil:  true
+  String:       context.TODO
+```
 
 ## What's Next
 Continue to [02-context-withcancel](../02-context-withcancel/02-context-withcancel.md) to learn how to create cancellable contexts and signal goroutines to stop.
@@ -204,6 +358,7 @@ Continue to [02-context-withcancel](../02-context-withcancel/02-context-withcanc
 - Context in Go forms a tree: root contexts are the starting point for all derived contexts
 - Convention: `context.Context` is always the first parameter, named `ctx`
 - Never store contexts in structs; pass them through function parameters
+- A nil `Done()` channel blocks forever, which is correct for root contexts
 
 ## Reference
 - [Go Blog: Go Concurrency Patterns: Context](https://go.dev/blog/context)

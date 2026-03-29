@@ -31,180 +31,275 @@ Consider a request arriving at 14:00:00 with a deadline of 14:00:05 (set by the 
 
 ## Step 1 -- Basic Deadline
 
-Edit `main.go` and implement `basicDeadline`. Set a deadline 300ms in the future and simulate a 500ms operation:
+Set a deadline 300ms in the future and simulate a 500ms operation:
 
 ```go
-func basicDeadline() {
-    fmt.Println("=== Basic WithDeadline ===")
+package main
 
-    deadline := time.Now().Add(300 * time.Millisecond)
-    ctx, cancel := context.WithDeadline(context.Background(), deadline)
-    defer cancel()
+import (
+	"context"
+	"fmt"
+	"time"
+)
 
-    fmt.Printf("  Deadline set to: %v\n", deadline.Format("15:04:05.000"))
-    fmt.Printf("  Current time:    %v\n", time.Now().Format("15:04:05.000"))
+func main() {
+	deadline := time.Now().Add(300 * time.Millisecond)
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
+	defer cancel()
 
-    select {
-    case <-time.After(500 * time.Millisecond):
-        fmt.Println("  Operation completed")
-    case <-ctx.Done():
-        fmt.Printf("  Deadline hit at: %v\n", time.Now().Format("15:04:05.000"))
-        fmt.Printf("  Error: %v\n", ctx.Err())
-    }
+	fmt.Printf("Deadline set to: %v\n", deadline.Format("15:04:05.000"))
+	fmt.Printf("Current time:    %v\n", time.Now().Format("15:04:05.000"))
 
-    fmt.Println()
+	select {
+	case <-time.After(500 * time.Millisecond):
+		fmt.Println("Operation completed")
+	case <-ctx.Done():
+		fmt.Printf("Deadline hit at: %v\n", time.Now().Format("15:04:05.000"))
+		fmt.Printf("Error: %v\n", ctx.Err())
+	}
 }
 ```
 
-### Intermediate Verification
+### Verification
 ```bash
 go run main.go
 ```
 Expected output (times will vary):
 ```
-=== Basic WithDeadline ===
-  Deadline set to: 14:30:01.300
-  Current time:    14:30:01.000
-  Deadline hit at: 14:30:01.300
-  Error: context deadline exceeded
+Deadline set to: 14:30:01.300
+Current time:    14:30:01.000
+Deadline hit at: 14:30:01.300
+Error: context deadline exceeded
 ```
+
+The key difference from `WithTimeout`: you pass a `time.Time`, not a `time.Duration`. This matters when propagating deadlines from upstream callers.
 
 ## Step 2 -- Inspecting the Deadline
 
-Implement `inspectDeadline`. Use `ctx.Deadline()` to read back the deadline from a context:
+Use `ctx.Deadline()` to read back the deadline from a context. This method returns `(time.Time, bool)` -- the boolean is `false` for contexts without a deadline:
 
 ```go
-func inspectDeadline() {
-    fmt.Println("=== Inspecting Deadline ===")
+package main
 
-    deadline := time.Now().Add(2 * time.Second)
-    ctx, cancel := context.WithDeadline(context.Background(), deadline)
-    defer cancel()
+import (
+	"context"
+	"fmt"
+	"time"
+)
 
-    if d, ok := ctx.Deadline(); ok {
-        fmt.Printf("  Context has deadline: %v\n", d.Format("15:04:05.000"))
-        fmt.Printf("  Time remaining: %v\n", time.Until(d).Round(time.Millisecond))
-    }
+func main() {
+	// WithDeadline context has a deadline.
+	deadline := time.Now().Add(2 * time.Second)
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
+	defer cancel()
 
-    // Compare with a plain Background context
-    bgCtx := context.Background()
-    if _, ok := bgCtx.Deadline(); !ok {
-        fmt.Println("  Background context has no deadline")
-    }
+	if d, ok := ctx.Deadline(); ok {
+		fmt.Printf("WithDeadline context:  deadline=%v, remaining=~%v\n",
+			d.Format("15:04:05.000"),
+			time.Until(d).Round(time.Millisecond))
+	}
 
-    // WithTimeout also sets a deadline
-    timeoutCtx, cancelTimeout := context.WithTimeout(context.Background(), 1*time.Second)
-    defer cancelTimeout()
+	// Background context has NO deadline.
+	bgCtx := context.Background()
+	if _, ok := bgCtx.Deadline(); !ok {
+		fmt.Println("Background context:    no deadline")
+	}
 
-    if d, ok := timeoutCtx.Deadline(); ok {
-        fmt.Printf("  WithTimeout(1s) deadline: %v\n", d.Format("15:04:05.000"))
-    }
+	// WithTimeout also sets a deadline internally.
+	timeoutCtx, cancelTimeout := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancelTimeout()
 
-    fmt.Println()
+	if d, ok := timeoutCtx.Deadline(); ok {
+		fmt.Printf("WithTimeout(1s):       deadline=%v\n", d.Format("15:04:05.000"))
+	}
 }
 ```
 
-### Intermediate Verification
+### Verification
 ```bash
 go run main.go
 ```
 Expected output:
 ```
-=== Inspecting Deadline ===
-  Context has deadline: 14:30:03.000
-  Time remaining: 1.999s
-  Background context has no deadline
-  WithTimeout(1s) deadline: 14:30:02.000
+WithDeadline context:  deadline=14:30:03.000, remaining=~2s
+Background context:    no deadline
+WithTimeout(1s):       deadline=14:30:02.000
 ```
 
-Both `WithDeadline` and `WithTimeout` set a deadline that is visible through `ctx.Deadline()`.
+Both `WithDeadline` and `WithTimeout` set a deadline that is visible through `ctx.Deadline()`. This allows downstream code to check how much time remains and make decisions accordingly.
 
 ## Step 3 -- WithTimeout Is WithDeadline in Disguise
 
-Implement `equivalenceDemo`. Show that `WithTimeout(parent, d)` behaves identically to `WithDeadline(parent, time.Now().Add(d))`:
+Show that `WithTimeout(parent, d)` behaves identically to `WithDeadline(parent, time.Now().Add(d))`:
 
 ```go
-func equivalenceDemo() {
-    fmt.Println("=== WithTimeout == WithDeadline(now + d) ===")
+package main
 
-    now := time.Now()
-    duration := 500 * time.Millisecond
+import (
+	"context"
+	"fmt"
+	"time"
+)
 
-    ctxTimeout, cancelTimeout := context.WithTimeout(context.Background(), duration)
-    defer cancelTimeout()
+func main() {
+	now := time.Now()
+	duration := 500 * time.Millisecond
 
-    ctxDeadline, cancelDeadline := context.WithDeadline(context.Background(), now.Add(duration))
-    defer cancelDeadline()
+	ctxTimeout, cancelTimeout := context.WithTimeout(context.Background(), duration)
+	defer cancelTimeout()
 
-    deadlineFromTimeout, _ := ctxTimeout.Deadline()
-    deadlineFromDeadline, _ := ctxDeadline.Deadline()
+	ctxDeadline, cancelDeadline := context.WithDeadline(context.Background(), now.Add(duration))
+	defer cancelDeadline()
 
-    diff := deadlineFromTimeout.Sub(deadlineFromDeadline).Abs()
-    fmt.Printf("  WithTimeout deadline:  %v\n", deadlineFromTimeout.Format("15:04:05.000000"))
-    fmt.Printf("  WithDeadline deadline: %v\n", deadlineFromDeadline.Format("15:04:05.000000"))
-    fmt.Printf("  Difference: %v (should be < 1ms)\n", diff)
-    fmt.Println()
+	deadlineFromTimeout, _ := ctxTimeout.Deadline()
+	deadlineFromDeadline, _ := ctxDeadline.Deadline()
+
+	diff := deadlineFromTimeout.Sub(deadlineFromDeadline).Abs()
+	fmt.Printf("WithTimeout deadline:  %v\n", deadlineFromTimeout.Format("15:04:05.000000"))
+	fmt.Printf("WithDeadline deadline: %v\n", deadlineFromDeadline.Format("15:04:05.000000"))
+	fmt.Printf("Difference: %v (should be < 1ms)\n", diff)
 }
 ```
 
-### Intermediate Verification
+### Verification
 ```bash
 go run main.go
 ```
 Expected output:
 ```
-=== WithTimeout == WithDeadline(now + d) ===
-  WithTimeout deadline:  14:30:01.500000
-  WithDeadline deadline: 14:30:01.500000
-  Difference: 50us (should be < 1ms)
+WithTimeout deadline:  14:30:01.500000
+WithDeadline deadline: 14:30:01.500000
+Difference: 50us (should be < 1ms)
 ```
+
+The tiny difference is the time elapsed between the two calls. They are functionally equivalent.
 
 ## Step 4 -- Shorter Deadline Wins
 
-Implement `shorterDeadlineWins`. Show that a child context cannot extend its parent's deadline:
+A child context cannot extend its parent's deadline. This is a fundamental invariant of the context tree:
 
 ```go
-func shorterDeadlineWins() {
-    fmt.Println("=== Shorter Deadline Always Wins ===")
+package main
 
-    parent, cancelParent := context.WithDeadline(
-        context.Background(),
-        time.Now().Add(200*time.Millisecond),
-    )
-    defer cancelParent()
+import (
+	"context"
+	"fmt"
+	"time"
+)
 
-    // Attempt to set a longer deadline on the child
-    child, cancelChild := context.WithDeadline(parent, time.Now().Add(5*time.Second))
-    defer cancelChild()
+func main() {
+	parent, cancelParent := context.WithDeadline(
+		context.Background(),
+		time.Now().Add(200*time.Millisecond),
+	)
+	defer cancelParent()
 
-    parentDeadline, _ := parent.Deadline()
-    childDeadline, _ := child.Deadline()
+	// Attempt to set a much longer deadline on the child.
+	child, cancelChild := context.WithDeadline(parent, time.Now().Add(5*time.Second))
+	defer cancelChild()
 
-    fmt.Printf("  Parent deadline: %v\n", parentDeadline.Format("15:04:05.000"))
-    fmt.Printf("  Child deadline:  %v\n", childDeadline.Format("15:04:05.000"))
-    fmt.Println("  (Child inherits parent's shorter deadline)")
+	parentDeadline, _ := parent.Deadline()
+	childDeadline, _ := child.Deadline()
 
-    <-child.Done()
-    fmt.Printf("  Child cancelled: %v\n", child.Err())
-    fmt.Printf("  Actual wait: ~200ms (parent's deadline, not child's 5s)\n\n")
+	fmt.Printf("Parent deadline: %v (200ms from now)\n", parentDeadline.Format("15:04:05.000"))
+	fmt.Printf("Child deadline:  %v (same as parent!)\n", childDeadline.Format("15:04:05.000"))
+	fmt.Println("(Child inherits parent's shorter deadline)")
+
+	<-child.Done()
+	fmt.Printf("Child cancelled: %v\n", child.Err())
+	fmt.Println("Actual wait: ~200ms (parent's deadline, not child's 5s)")
 }
 ```
 
-### Intermediate Verification
+### Verification
 ```bash
 go run main.go
 ```
 Expected output:
 ```
-=== Shorter Deadline Always Wins ===
-  Parent deadline: 14:30:01.200
-  Child deadline:  14:30:01.200
-  (Child inherits parent's shorter deadline)
-  Child cancelled: context deadline exceeded
-  Actual wait: ~200ms (parent's deadline, not child's 5s)
+Parent deadline: 14:30:01.200 (200ms from now)
+Child deadline:  14:30:01.200 (same as parent!)
+(Child inherits parent's shorter deadline)
+Child cancelled: context deadline exceeded
+Actual wait: ~200ms (parent's deadline, not child's 5s)
 ```
 
-The child's `Deadline()` returns the parent's deadline because it is earlier. The child cannot extend beyond its parent.
+The child's `Deadline()` returns the parent's deadline because it is earlier. You can tighten a deadline by deriving a child with a shorter one, but you can never extend beyond the parent.
+
+## Step 5 -- Pipeline with Deadline Budget
+
+A single deadline context shared across multiple pipeline stages. Each stage consumes part of the budget, and later stages can check how much time remains:
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"time"
+)
+
+func pipelineStage(ctx context.Context, name string, work time.Duration) (string, error) {
+	deadline, hasDeadline := ctx.Deadline()
+	if hasDeadline {
+		remaining := time.Until(deadline).Round(time.Millisecond)
+		fmt.Printf("[%s] starting (budget remaining: ~%v)\n", name, remaining)
+	}
+
+	select {
+	case <-time.After(work):
+		fmt.Printf("[%s] completed in %v\n", name, work)
+		return name, nil
+	case <-ctx.Done():
+		return "", fmt.Errorf("%s: %w", name, ctx.Err())
+	}
+}
+
+func main() {
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(500*time.Millisecond))
+	defer cancel()
+
+	stages := []struct {
+		name string
+		work time.Duration
+	}{
+		{"stage-1", 100 * time.Millisecond},
+		{"stage-2", 100 * time.Millisecond},
+		{"stage-3", 100 * time.Millisecond},
+	}
+
+	result := ""
+	for _, s := range stages {
+		name, err := pipelineStage(ctx, s.name, s.work)
+		if err != nil {
+			fmt.Printf("Pipeline failed: %v\n", err)
+			return
+		}
+		if result != "" {
+			result += " -> "
+		}
+		result += name
+	}
+	fmt.Printf("Pipeline result: %s -> done\n", result)
+}
+```
+
+### Verification
+```bash
+go run main.go
+```
+Expected output:
+```
+[stage-1] starting (budget remaining: ~500ms)
+[stage-1] completed in 100ms
+[stage-2] starting (budget remaining: ~400ms)
+[stage-2] completed in 100ms
+[stage-3] starting (budget remaining: ~300ms)
+[stage-3] completed in 100ms
+Pipeline result: stage-1 -> stage-2 -> stage-3 -> done
+```
+
+This pattern is common in request pipelines where middleware, business logic, and data access all share a single request deadline.
 
 ## Common Mistakes
 
@@ -226,24 +321,74 @@ As shown in Step 4, a child context always gets the minimum of its own deadline 
 ### Not Checking Deadline Before Starting Expensive Work
 **Wrong:**
 ```go
-func process(ctx context.Context) {
+func process(ctx context.Context) error {
     // starts expensive work without checking if deadline already passed
-    expensiveOperation()
+    return expensiveOperation()
 }
 ```
 **Fix:**
 ```go
-func process(ctx context.Context) {
+func process(ctx context.Context) error {
     if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) < minimumRequired {
-        return fmt.Errorf("insufficient time: need %v, have %v", minimumRequired, time.Until(deadline))
+        return fmt.Errorf("insufficient time: need %v, have %v",
+            minimumRequired, time.Until(deadline))
     }
-    expensiveOperation()
+    return expensiveOperation()
 }
 ```
 
+This fail-fast check avoids starting work that will certainly be cancelled.
+
 ## Verify What You Learned
 
-Implement `verifyKnowledge`: simulate a "request pipeline" where an incoming request has a deadline 500ms from now. Pass the context through three stages (each taking 100ms). After each stage, print the remaining time. Then repeat with a 250ms deadline and observe which stage gets cut off.
+Simulate a "request pipeline" where an incoming request has a deadline. Pass the context through three stages (each taking 100ms). Test with a 500ms deadline (all pass) and a 250ms deadline (observe which stage gets cut off):
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"time"
+)
+
+func runPipeline(label string, budget time.Duration) {
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(budget))
+	defer cancel()
+
+	stages := []string{"stage-1", "stage-2", "stage-3"}
+	result := ""
+
+	for _, name := range stages {
+		select {
+		case <-time.After(100 * time.Millisecond):
+			if result != "" {
+				result += " -> "
+			}
+			result += name
+		case <-ctx.Done():
+			fmt.Printf("%s: failed at %s: %v\n", label, name, ctx.Err())
+			return
+		}
+	}
+	fmt.Printf("%s: %s -> done\n", label, result)
+}
+
+func main() {
+	runPipeline("Generous (500ms)", 500*time.Millisecond)
+	runPipeline("Tight (250ms)", 250*time.Millisecond)
+}
+```
+
+### Verification
+```bash
+go run main.go
+```
+Expected output:
+```
+Generous (500ms): stage-1 -> stage-2 -> stage-3 -> done
+Tight (250ms): failed at stage-3: context deadline exceeded
+```
 
 ## What's Next
 Continue to [05-context-withvalue](../05-context-withvalue/05-context-withvalue.md) to learn how to attach request-scoped data to contexts.
@@ -255,6 +400,7 @@ Continue to [05-context-withvalue](../05-context-withvalue/05-context-withvalue.
 - A child context inherits the shorter of its own and its parent's deadline
 - Use `WithDeadline` when the deadline is an absolute time (propagated from upstream)
 - Use `WithTimeout` when you want a relative duration from "now"
+- Check remaining time with `time.Until(deadline)` before starting expensive work
 
 ## Reference
 - [Package context: WithDeadline](https://pkg.go.dev/context#WithDeadline)

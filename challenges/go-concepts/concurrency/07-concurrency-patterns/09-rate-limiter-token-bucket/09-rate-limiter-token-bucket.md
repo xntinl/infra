@@ -19,7 +19,7 @@ After completing this exercise, you will be able to:
 - **Implement** a token bucket rate limiter using channels and time.Ticker
 - **Configure** both steady-state rate and burst capacity
 - **Observe** how the limiter throttles requests that exceed the rate
-- **Apply** rate limiting to protect resources from overload
+- **Build** a reusable rate limiter type with blocking and non-blocking acquire
 
 ## Why Rate Limiting
 Rate limiting controls how frequently an operation can be performed. It protects services from being overwhelmed by too many requests, ensures fair resource sharing, and prevents abuse. The token bucket algorithm is the most widely used rate-limiting approach because it naturally handles both steady-state rate and short bursts.
@@ -28,15 +28,34 @@ The token bucket model works like this: a bucket holds tokens (up to a maximum c
 
 In Go, this maps perfectly to channels: a buffered channel is the bucket, `time.Ticker` fills it at a constant rate, and workers drain it by receiving tokens. The buffer capacity determines the burst size -- if tokens have been accumulating while the system is idle, a burst of requests can be served immediately up to the buffer capacity.
 
+```
+  Token Bucket Model
+
+  +------------------+
+  | token  token     |  <- buffered channel (capacity = burst)
+  | token            |
+  +------------------+
+      ^           |
+      |           |
+   ticker       consumer
+   refills      drains
+   (select/     (<-tokens)
+    default)
+```
+
 ## Step 1 -- Basic Rate Limiter with Ticker
 
 Create a rate limiter that allows one operation per interval.
 
-Edit `main.go` and implement the `basicRateLimiter` function:
-
 ```go
-func basicRateLimiter() {
-    fmt.Println("=== Basic Rate Limiter ===")
+package main
+
+import (
+    "fmt"
+    "time"
+)
+
+func main() {
     limiter := time.NewTicker(200 * time.Millisecond) // 5 per second
     defer limiter.Stop()
 
@@ -44,9 +63,8 @@ func basicRateLimiter() {
 
     for _, req := range requests {
         <-limiter.C // wait for next tick
-        fmt.Printf("  request %d served at %v\n", req, time.Now().Format("04:05.000"))
+        fmt.Printf("request %d served at %v\n", req, time.Now().Format("04:05.000"))
     }
-    fmt.Println()
 }
 ```
 
@@ -58,11 +76,10 @@ go run main.go
 ```
 Expected: requests spaced ~200ms apart:
 ```
-=== Basic Rate Limiter ===
-  request 1 served at 00:01.200
-  request 2 served at 00:01.400
-  request 3 served at 00:01.600
-  ...
+request 1 served at 00:01.200
+request 2 served at 00:01.400
+request 3 served at 00:01.600
+...
 ```
 
 ## Step 2 -- Token Bucket with Burst Support
@@ -70,42 +87,41 @@ Expected: requests spaced ~200ms apart:
 Implement a token bucket that allows bursts by pre-filling tokens in a buffered channel:
 
 ```go
-func tokenBucketLimiter() {
-    fmt.Println("=== Token Bucket with Burst ===")
-    const rate = 200 * time.Millisecond  // 5 tokens per second
+package main
+
+import (
+    "fmt"
+    "time"
+)
+
+func main() {
+    const rate = 200 * time.Millisecond
     const burstCapacity = 3
 
-    // The bucket: a buffered channel holding tokens
     tokens := make(chan struct{}, burstCapacity)
 
-    // Fill with initial burst capacity
+    // Pre-fill with initial burst capacity
     for i := 0; i < burstCapacity; i++ {
         tokens <- struct{}{}
     }
 
-    // Background refiller: adds a token every `rate` interval
+    // Background refiller
     ticker := time.NewTicker(rate)
     defer ticker.Stop()
     go func() {
         for range ticker.C {
             select {
             case tokens <- struct{}{}: // add token if bucket not full
-            default: // bucket full, discard token
+            default:                   // bucket full, discard token
             }
         }
     }()
 
-    // Simulate a burst of 10 requests arriving at once
-    requests := make([]int, 10)
-    for i := range requests {
-        requests[i] = i + 1
-    }
-
-    for _, req := range requests {
+    // Simulate a burst of 10 requests
+    for req := 1; req <= 10; req++ {
         <-tokens // acquire token
-        fmt.Printf("  request %d served at %v\n", req, time.Now().Format("04:05.000"))
+        fmt.Printf("request %d served at %v\n", req, time.Now().Format("04:05.000"))
     }
-    fmt.Println()
 }
 ```
 
@@ -117,13 +133,12 @@ go run main.go
 ```
 Expected: first 3 requests instant, then ~200ms apart:
 ```
-=== Token Bucket with Burst ===
-  request 1 served at 00:01.000
-  request 2 served at 00:01.000
-  request 3 served at 00:01.000
-  request 4 served at 00:01.200
-  request 5 served at 00:01.400
-  ...
+request 1 served at 00:01.000
+request 2 served at 00:01.000
+request 3 served at 00:01.000
+request 4 served at 00:01.200
+request 5 served at 00:01.400
+...
 ```
 
 ## Step 3 -- Rate Limiter as a Reusable Type
@@ -131,28 +146,40 @@ Expected: first 3 requests instant, then ~200ms apart:
 Wrap the token bucket into a clean struct:
 
 ```go
+package main
+
+import (
+    "fmt"
+    "time"
+)
+
 type RateLimiter struct {
     tokens chan struct{}
     ticker *time.Ticker
+    stop   chan struct{}
 }
 
 func NewRateLimiter(rate time.Duration, burst int) *RateLimiter {
     rl := &RateLimiter{
         tokens: make(chan struct{}, burst),
         ticker: time.NewTicker(rate),
+        stop:   make(chan struct{}),
     }
 
-    // Pre-fill burst capacity
     for i := 0; i < burst; i++ {
         rl.tokens <- struct{}{}
     }
 
-    // Background refill
     go func() {
-        for range rl.ticker.C {
+        for {
             select {
-            case rl.tokens <- struct{}{}:
-            default:
+            case <-rl.ticker.C:
+                select {
+                case rl.tokens <- struct{}{}:
+                default:
+                }
+            case <-rl.stop:
+                return
             }
         }
     }()
@@ -164,8 +191,27 @@ func (rl *RateLimiter) Wait() {
     <-rl.tokens
 }
 
+func (rl *RateLimiter) TryAcquire() bool {
+    select {
+    case <-rl.tokens:
+        return true
+    default:
+        return false
+    }
+}
+
 func (rl *RateLimiter) Stop() {
     rl.ticker.Stop()
+    close(rl.stop)
+}
+
+func main() {
+    rl := NewRateLimiter(100*time.Millisecond, 3)
+    for i := 1; i <= 8; i++ {
+        rl.Wait()
+        fmt.Printf("call %d at %v\n", i, time.Now().Format("04:05.000"))
+    }
+    rl.Stop()
 }
 ```
 
@@ -173,24 +219,57 @@ func (rl *RateLimiter) Stop() {
 ```bash
 go run main.go
 ```
-Use the limiter to rate-limit 15 simulated API calls:
-```
-=== Reusable Rate Limiter ===
-  call 1 at 00:01.000 (burst)
-  call 2 at 00:01.000 (burst)
-  call 3 at 00:01.000 (burst)
-  call 4 at 00:01.100
-  ...
-```
+Expected: first 3 calls instant (burst), then ~100ms apart.
 
-## Step 4 -- Rate Limiter with Multiple Workers
+## Step 4 -- Rate Limiter with Concurrent Workers
 
 Apply the rate limiter to a pool of concurrent workers:
 
 ```go
-func rateLimitedWorkers() {
-    fmt.Println("=== Rate-Limited Workers ===")
-    rl := NewRateLimiter(100*time.Millisecond, 2) // 10/sec, burst 2
+package main
+
+import (
+    "fmt"
+    "sync"
+    "time"
+)
+
+type RateLimiter struct {
+    tokens chan struct{}
+    ticker *time.Ticker
+    stop   chan struct{}
+}
+
+func NewRateLimiter(rate time.Duration, burst int) *RateLimiter {
+    rl := &RateLimiter{
+        tokens: make(chan struct{}, burst),
+        ticker: time.NewTicker(rate),
+        stop:   make(chan struct{}),
+    }
+    for i := 0; i < burst; i++ {
+        rl.tokens <- struct{}{}
+    }
+    go func() {
+        for {
+            select {
+            case <-rl.ticker.C:
+                select {
+                case rl.tokens <- struct{}{}:
+                default:
+                }
+            case <-rl.stop:
+                return
+            }
+        }
+    }()
+    return rl
+}
+
+func (rl *RateLimiter) Wait()        { <-rl.tokens }
+func (rl *RateLimiter) Stop()        { rl.ticker.Stop(); close(rl.stop) }
+
+func main() {
+    rl := NewRateLimiter(100*time.Millisecond, 2)
     defer rl.Stop()
 
     var wg sync.WaitGroup
@@ -198,18 +277,17 @@ func rateLimitedWorkers() {
         wg.Add(1)
         go func(id int) {
             defer wg.Done()
-            rl.Wait() // acquire rate limit token
-            fmt.Printf("  worker %2d: started at %v\n", id, time.Now().Format("04:05.000"))
-            time.Sleep(50 * time.Millisecond) // simulate work
+            rl.Wait()
+            fmt.Printf("worker %2d: started at %v\n", id, time.Now().Format("04:05.000"))
+            time.Sleep(50 * time.Millisecond)
         }(i)
     }
 
     wg.Wait()
-    fmt.Println()
 }
 ```
 
-All 20 goroutines launch immediately, but they are throttled by the rate limiter. At most 10 per second pass through, with an initial burst of 2.
+All 20 goroutines launch immediately, but they are throttled by the rate limiter.
 
 ### Intermediate Verification
 ```bash
@@ -252,7 +330,12 @@ tokens := make(chan struct{}, 0) // unbuffered = no burst
 
 ## Verify What You Learned
 
-Implement a `TryAcquire` method on `RateLimiter` that returns immediately with a boolean indicating whether a token was available (non-blocking). Use this to build a system where requests that cannot be served immediately receive a "rate limit exceeded" error instead of waiting.
+Run `go run main.go` and verify:
+- Basic rate limiter: requests spaced ~200ms apart
+- Token bucket: first 3 instant (burst), then ~200ms apart
+- Reusable type: first 3 instant, then ~100ms apart
+- Rate-limited workers: throttled to ~10/sec
+- TryAcquire: first 2 accepted, rest rejected, then refill shows new accepts
 
 ## What's Next
 Continue to [10-end-to-end-pipeline-with-cancel](../10-end-to-end-pipeline-with-cancel/10-end-to-end-pipeline-with-cancel.md) for the capstone exercise combining all patterns from this section.
@@ -263,6 +346,7 @@ Continue to [10-end-to-end-pipeline-with-cancel](../10-end-to-end-pipeline-with-
 - Pre-fill the bucket for initial burst capacity
 - Use `select/default` in the refiller to discard tokens when the bucket is full
 - The rate limiter works transparently with concurrent workers
+- `TryAcquire` enables non-blocking rate limiting (reject excess instead of queuing)
 - Always stop the ticker to prevent goroutine leaks
 
 ## Reference

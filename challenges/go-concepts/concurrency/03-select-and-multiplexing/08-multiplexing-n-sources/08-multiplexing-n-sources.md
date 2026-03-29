@@ -19,6 +19,7 @@ prerequisites: [select-basics, select-in-for-loop, done-channel-pattern, gorouti
 - **Build** a merge function that combines N channels into one output channel
 - **Use** goroutine-per-channel fan-in with proper cleanup via WaitGroup
 - **Handle** source closure and output channel lifecycle correctly
+- **Add** cancellation support to the merge pattern
 
 ## Why Multiplexing N Sources
 
@@ -28,214 +29,377 @@ You cannot write a `select` with a variable number of cases (Go's `select` requi
 
 This is the general-purpose channel multiplexer. It appears in Go's standard patterns, in the `x/sync/errgroup` package, and in virtually every pipeline-based architecture. Mastering it gives you the ability to compose arbitrary channel topologies.
 
-## Step 1 -- Merge Two Channels
+## Example 1 -- Merge Two Channels
 
 Start with the simplest case: merge two channels into one.
 
 ```go
+package main
+
+import (
+	"fmt"
+	"sync"
+	"time"
+)
+
 func merge(ch1, ch2 <-chan int) <-chan int {
-    out := make(chan int)
-    var wg sync.WaitGroup
+	out := make(chan int)
+	var wg sync.WaitGroup
 
-    forward := func(ch <-chan int) {
-        defer wg.Done()
-        for val := range ch {
-            out <- val
-        }
-    }
+	forward := func(ch <-chan int) {
+		defer wg.Done()
+		for val := range ch {
+			out <- val
+		}
+	}
 
-    wg.Add(2)
-    go forward(ch1)
-    go forward(ch2)
+	wg.Add(2)
+	go forward(ch1)
+	go forward(ch2)
 
-    go func() {
-        wg.Wait()
-        close(out)
-    }()
+	go func() {
+		wg.Wait()
+		close(out)
+	}()
 
-    return out
+	return out
 }
-```
 
-Usage:
+func main() {
+	ch1 := make(chan int)
+	ch2 := make(chan int)
 
-```go
-ch1 := make(chan int)
-ch2 := make(chan int)
+	go func() {
+		for i := 0; i < 5; i++ {
+			ch1 <- i
+			time.Sleep(30 * time.Millisecond)
+		}
+		close(ch1)
+	}()
 
-go func() {
-    for i := 0; i < 5; i++ {
-        ch1 <- i
-        time.Sleep(30 * time.Millisecond)
-    }
-    close(ch1)
-}()
+	go func() {
+		for i := 100; i < 105; i++ {
+			ch2 <- i
+			time.Sleep(50 * time.Millisecond)
+		}
+		close(ch2)
+	}()
 
-go func() {
-    for i := 100; i < 105; i++ {
-        ch2 <- i
-        time.Sleep(50 * time.Millisecond)
-    }
-    close(ch2)
-}()
-
-for val := range merge(ch1, ch2) {
-    fmt.Println("merged:", val)
+	for val := range merge(ch1, ch2) {
+		fmt.Println("merged:", val)
+	}
+	fmt.Println("all sources closed")
 }
-fmt.Println("all sources closed")
 ```
 
 Each source gets its own goroutine that forwards values to `out`. When a source closes, `range` exits and `wg.Done()` is called. After all sources finish, the WaitGroup goroutine closes `out`, which terminates the consumer's `range`.
 
-### Intermediate Verification
-Run the program. You should see 10 values (0-4 and 100-104) in interleaved order, then "all sources closed".
+### Verification
+```
+merged: 0
+merged: 100
+merged: 1
+merged: 101
+merged: 2
+merged: 3
+merged: 102
+merged: 4
+merged: 103
+merged: 104
+all sources closed
+```
+The exact interleaving varies, but all 10 values appear.
 
-## Step 2 -- Generalize to N Channels
+## Example 2 -- Generalize to N Channels
 
 Replace the two-channel merge with a variadic version that accepts any number of channels.
 
 ```go
+package main
+
+import (
+	"fmt"
+	"sync"
+	"time"
+)
+
 func mergeN(channels ...<-chan int) <-chan int {
-    out := make(chan int)
-    var wg sync.WaitGroup
+	out := make(chan int)
+	var wg sync.WaitGroup
 
-    forward := func(ch <-chan int) {
-        defer wg.Done()
-        for val := range ch {
-            out <- val
-        }
-    }
+	forward := func(ch <-chan int) {
+		defer wg.Done()
+		for val := range ch {
+			out <- val
+		}
+	}
 
-    wg.Add(len(channels))
-    for _, ch := range channels {
-        go forward(ch)
-    }
+	wg.Add(len(channels))
+	for _, ch := range channels {
+		go forward(ch)
+	}
 
-    go func() {
-        wg.Wait()
-        close(out)
-    }()
+	go func() {
+		wg.Wait()
+		close(out)
+	}()
 
-    return out
-}
-```
-
-Usage with dynamic number of sources:
-
-```go
-n := 4
-sources := make([]<-chan int, n)
-
-for i := 0; i < n; i++ {
-    ch := make(chan int)
-    sources[i] = ch
-    go func(id int, c chan<- int) {
-        for j := 0; j < 3; j++ {
-            c <- id*100 + j
-            time.Sleep(time.Duration(20*(id+1)) * time.Millisecond)
-        }
-        close(c)
-    }(i, ch)
+	return out
 }
 
-for val := range mergeN(sources...) {
-    fmt.Printf("received: %d\n", val)
+func main() {
+	n := 4
+	sources := make([]<-chan int, n)
+
+	for i := 0; i < n; i++ {
+		ch := make(chan int)
+		sources[i] = ch
+		go func(id int, c chan<- int) {
+			for j := 0; j < 3; j++ {
+				c <- id*100 + j
+				time.Sleep(time.Duration(20*(id+1)) * time.Millisecond)
+			}
+			close(c)
+		}(i, ch)
+	}
+
+	for val := range mergeN(sources...) {
+		fmt.Printf("received: %d\n", val)
+	}
+	fmt.Println("all done")
 }
-fmt.Println("all done")
 ```
 
 The pattern is identical to the two-channel version. The only change is iterating over the variadic slice instead of hardcoding two goroutines.
 
-### Intermediate Verification
-Run the program. You should see 12 values (4 sources x 3 values each) in interleaved order, then "all done".
+### Verification
+```
+received: 0
+received: 100
+received: 200
+received: 300
+received: 1
+received: 101
+...
+all done
+```
+You should see 12 values (4 sources x 3 values each) in interleaved order.
 
-## Step 3 -- Merge with Cancellation
+## Example 3 -- Merge with Cancellation
 
-Add a done channel to the merge function so the consumer can cancel all forwarding goroutines without waiting for sources to close.
+Add a done channel so the consumer can cancel all forwarding goroutines without waiting for sources to close.
 
 ```go
+package main
+
+import (
+	"fmt"
+	"sync"
+	"time"
+)
+
 func mergeWithDone(done <-chan struct{}, channels ...<-chan int) <-chan int {
-    out := make(chan int)
-    var wg sync.WaitGroup
+	out := make(chan int)
+	var wg sync.WaitGroup
 
-    forward := func(ch <-chan int) {
-        defer wg.Done()
-        for val := range ch {
-            select {
-            case <-done:
-                return
-            case out <- val:
-            }
-        }
-    }
+	forward := func(ch <-chan int) {
+		defer wg.Done()
+		for val := range ch {
+			select {
+			case <-done:
+				return
+			case out <- val:
+			}
+		}
+	}
 
-    wg.Add(len(channels))
-    for _, ch := range channels {
-        go forward(ch)
-    }
+	wg.Add(len(channels))
+	for _, ch := range channels {
+		go forward(ch)
+	}
 
-    go func() {
-        wg.Wait()
-        close(out)
-    }()
+	go func() {
+		wg.Wait()
+		close(out)
+	}()
 
-    return out
+	return out
+}
+
+func main() {
+	done := make(chan struct{})
+
+	// Create sources that produce indefinitely.
+	sources := make([]<-chan int, 3)
+	for i := 0; i < 3; i++ {
+		ch := make(chan int)
+		sources[i] = ch
+		go func(id int, c chan<- int) {
+			val := 0
+			for {
+				select {
+				case <-done:
+					close(c)
+					return
+				case c <- val:
+					val++
+					time.Sleep(50 * time.Millisecond)
+				}
+			}
+		}(i, ch)
+	}
+
+	merged := mergeWithDone(done, sources...)
+
+	// Consume 10 values, then cancel.
+	for i := 0; i < 10; i++ {
+		fmt.Println("value:", <-merged)
+	}
+
+	close(done)
+	// Drain remaining in-flight values so goroutines can exit.
+	for range merged {
+	}
+	fmt.Println("cancelled and cleaned up")
 }
 ```
 
-Usage:
+The forward goroutines check `done` on every send to `out`. When `done` is closed, they exit immediately. The drain loop after `close(done)` consumes any values that were in flight.
+
+### Verification
+```
+value: 0
+value: 0
+value: 0
+value: 1
+value: 1
+value: 1
+value: 2
+value: 2
+value: 2
+value: 3
+cancelled and cleaned up
+```
+Exactly 10 values appear, then clean shutdown. No goroutine leaks.
+
+## Example 4 -- Merge Channels of Different Types
+
+The same pattern works for any channel type. Here is a string version.
 
 ```go
-done := make(chan struct{})
+package main
 
-// Create sources that produce indefinitely
-sources := make([]<-chan int, 3)
-for i := 0; i < 3; i++ {
-    ch := make(chan int)
-    sources[i] = ch
-    go func(id int, c chan<- int) {
-        val := 0
-        for {
-            select {
-            case <-done:
-                close(c)
-                return
-            case c <- val:
-                val++
-                time.Sleep(50 * time.Millisecond)
-            }
-        }
-    }(i, ch)
+import (
+	"fmt"
+	"sync"
+	"time"
+)
+
+func mergeStrings(channels ...<-chan string) <-chan string {
+	out := make(chan string)
+	var wg sync.WaitGroup
+
+	forward := func(ch <-chan string) {
+		defer wg.Done()
+		for val := range ch {
+			out <- val
+		}
+	}
+
+	wg.Add(len(channels))
+	for _, ch := range channels {
+		go forward(ch)
+	}
+
+	go func() {
+		wg.Wait()
+		close(out)
+	}()
+
+	return out
 }
 
-merged := mergeWithDone(done, sources...)
+func main() {
+	ch1 := make(chan string)
+	ch2 := make(chan string)
 
-// Consume 10 values, then cancel
-for i := 0; i < 10; i++ {
-    fmt.Println("value:", <-merged)
-}
+	go func() {
+		for i := 0; i < 3; i++ {
+			ch1 <- fmt.Sprintf("hello-%d", i)
+			time.Sleep(40 * time.Millisecond)
+		}
+		close(ch1)
+	}()
 
-close(done)
-// Drain remaining values to unblock goroutines
-for range merged {
+	go func() {
+		for i := 0; i < 3; i++ {
+			ch2 <- fmt.Sprintf("world-%d", i)
+			time.Sleep(60 * time.Millisecond)
+		}
+		close(ch2)
+	}()
+
+	for val := range mergeStrings(ch1, ch2) {
+		fmt.Println("merged:", val)
+	}
+	fmt.Println("complete")
 }
-fmt.Println("cancelled and cleaned up")
 ```
 
-The forward goroutines check `done` on every send to `out`. When `done` is closed, they exit immediately. The drain loop after `close(done)` consumes any values that were in flight before the forwarders noticed the cancellation.
-
-### Intermediate Verification
-Run the program. You should see exactly 10 values, then "cancelled and cleaned up". No goroutine leaks.
+### Verification
+```
+merged: hello-0
+merged: world-0
+merged: hello-1
+merged: world-1
+merged: hello-2
+merged: world-2
+complete
+```
 
 ## Common Mistakes
 
-1. **Closing the output channel in forward goroutines.** Only one goroutine should close `out`, and only after all forwarders have finished. This is the WaitGroup goroutine's job. If a forwarder closes `out`, other forwarders will panic when they try to send.
+### 1. Closing the Output Channel in Forward Goroutines
+Only one goroutine should close `out`, and only after ALL forwarders have finished. This is the WaitGroup goroutine's job. If a forwarder closes `out`, other forwarders will panic when they try to send:
 
-2. **Not closing source channels.** The forwarder uses `range`, which blocks until the source closes. If a source never closes and there is no done channel, the forwarder goroutine leaks forever.
+```go
+// BAD: multiple goroutines might close out.
+forward := func(ch <-chan int) {
+    for val := range ch {
+        out <- val
+    }
+    close(out) // PANIC if another forwarder is still sending.
+}
 
-3. **Capturing the loop variable in Go < 1.22.** In Go versions before 1.22, `for _, ch := range channels { go forward(ch) }` captures the loop variable correctly only because `ch` is passed as a function argument. If you used a closure capturing `ch` directly in older Go versions, all goroutines would share the last value.
+// GOOD: one goroutine closes out after all forwarders finish.
+go func() {
+    wg.Wait()
+    close(out)
+}()
+```
 
-4. **Forgetting to drain after cancellation.** If forwarding goroutines sent values to `out` before noticing `done`, those values sit in the channel. Without draining, the goroutines block on the send forever.
+### 2. Not Closing Source Channels
+The forwarder uses `range`, which blocks until the source closes. If a source never closes and there is no done channel, the forwarder goroutine leaks forever.
+
+### 3. Forgetting to Drain After Cancellation
+If forwarding goroutines sent values to `out` before noticing `done`, those values sit in the channel. Without draining, the goroutines block on the send forever:
+
+```go
+close(done)
+// REQUIRED: drain in-flight values.
+for range merged {
+}
+```
+
+### 4. Capturing the Loop Variable (Go < 1.22)
+In Go versions before 1.22, the loop variable in a `for range` is shared across iterations. Passing it as a function argument avoids the issue:
+
+```go
+// SAFE: ch is a function parameter, not a closure capture.
+for _, ch := range channels {
+    go forward(ch) // ch is passed by value.
+}
+```
 
 ## Verify What You Learned
 

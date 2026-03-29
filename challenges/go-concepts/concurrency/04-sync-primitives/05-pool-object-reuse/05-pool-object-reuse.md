@@ -18,8 +18,8 @@ prerequisites: [goroutines, sync.Mutex, sync.WaitGroup]
 After completing this exercise, you will be able to:
 - **Use** `sync.Pool` to reuse objects and reduce allocation pressure
 - **Implement** the `New` function for automatic pool population
-- **Measure** the allocation reduction using `testing.AllocsPerRun` patterns
-- **Apply** buffer pooling to a realistic use case
+- **Apply** the Get/Reset/Put lifecycle correctly
+- **Recognize** that `sync.Pool` is not a permanent cache -- GC may clear it
 
 ## Why sync.Pool
 Every allocation in Go eventually becomes work for the garbage collector. In high-throughput systems -- HTTP servers handling thousands of requests per second, parsers processing streams of data, encoders serializing messages -- creating and discarding temporary objects generates significant GC pressure. This increases latency through GC pauses and wastes CPU time on collection.
@@ -34,232 +34,216 @@ Key characteristics of `sync.Pool`:
 
 ## Step 1 -- Create a Pool with New
 
-Open `main.go`. Implement the buffer pool with a `New` function:
+The `New` function is called when `Get` finds the pool empty:
 
 ```go
-var bufferPool = sync.Pool{
-    New: func() any {
-        fmt.Println("  [pool] Allocating new buffer")
-        buf := make([]byte, 0, 1024)
-        return &buf
-    },
+package main
+
+import (
+	"fmt"
+	"sync"
+)
+
+func main() {
+	pool := &sync.Pool{
+		New: func() any {
+			fmt.Println("[pool] Allocating new buffer")
+			buf := make([]byte, 0, 1024)
+			return &buf
+		},
+	}
+
+	// First Get: pool empty, calls New
+	bufPtr := pool.Get().(*[]byte)
+	buf := *bufPtr
+	fmt.Printf("Got buffer: len=%d, cap=%d\n", len(buf), cap(buf))
+
+	// Use, reset, return
+	buf = append(buf, []byte("hello")...)
+	buf = buf[:0] // reset
+	*bufPtr = buf
+	pool.Put(bufPtr)
+
+	// Second Get: reuses the pooled buffer
+	bufPtr2 := pool.Get().(*[]byte)
+	buf2 := *bufPtr2
+	fmt.Printf("Recycled buffer: len=%d, cap=%d\n", len(buf2), cap(buf2))
+	pool.Put(bufPtr2)
 }
 ```
 
-The `New` function is called when `Get` finds the pool empty. It should return a pointer to the buffer so the pool stores a reference, not a copy.
-
-### Intermediate Verification
-```bash
-go run main.go
+Expected output:
 ```
-The basic pool demo should show "Allocating new buffer" only when the pool is empty.
-
-## Step 2 -- Get, Use, Reset, Put
-
-Implement `basicPoolDemo` showing the Get/Put lifecycle:
-
-```go
-func basicPoolDemo() {
-    fmt.Println("=== Basic Pool Demo ===")
-
-    // First Get: pool is empty, calls New
-    bufPtr := bufferPool.Get().(*[]byte)
-    buf := *bufPtr
-    fmt.Printf("Got buffer: len=%d, cap=%d\n", len(buf), cap(buf))
-
-    // Use the buffer
-    buf = append(buf, []byte("hello world")...)
-    fmt.Printf("After use: len=%d, cap=%d, content=%q\n", len(buf), cap(buf), buf)
-
-    // Reset and put back -- CRITICAL: always reset before Put
-    buf = buf[:0]
-    *bufPtr = buf
-    bufferPool.Put(bufPtr)
-    fmt.Println("Buffer returned to pool.")
-
-    // Second Get: pool has a recycled buffer, no New call
-    bufPtr2 := bufferPool.Get().(*[]byte)
-    buf2 := *bufPtr2
-    fmt.Printf("Got recycled buffer: len=%d, cap=%d\n", len(buf2), cap(buf2))
-    *bufPtr2 = buf2
-    bufferPool.Put(bufPtr2)
-}
+[pool] Allocating new buffer
+Got buffer: len=0, cap=1024
+Recycled buffer: len=0, cap=1024
 ```
 
 ### Intermediate Verification
 ```bash
 go run main.go
 ```
-The second `Get` should NOT trigger "Allocating new buffer" -- it reuses the pooled object.
+The second Get should NOT trigger "Allocating new buffer" -- it reuses the pooled object.
 
-## Step 3 -- Pool Under Concurrent Load
+## Step 2 -- Concurrent Pool Usage
 
-Implement `concurrentPoolDemo` to show pooling under realistic concurrency:
+The pool handles concurrent Get/Put safely:
 
 ```go
-func concurrentPoolDemo() {
-    fmt.Println("\n=== Concurrent Pool Usage ===")
+package main
 
-    var wg sync.WaitGroup
-    const numGoroutines = 20
-    const iterations = 5
+import (
+	"fmt"
+	"sync"
+	"sync/atomic"
+)
 
-    for i := 0; i < numGoroutines; i++ {
-        wg.Add(1)
-        go func(id int) {
-            defer wg.Done()
-            for j := 0; j < iterations; j++ {
-                // Get a buffer from the pool
-                bufPtr := bufferPool.Get().(*[]byte)
-                buf := *bufPtr
+func main() {
+	var allocCount atomic.Int64
+	pool := &sync.Pool{
+		New: func() any {
+			allocCount.Add(1)
+			buf := make([]byte, 0, 1024)
+			return &buf
+		},
+	}
 
-                // Use it
-                buf = append(buf, []byte(fmt.Sprintf("goroutine-%d-iter-%d", id, j))...)
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for j := 0; j < 5; j++ {
+				bufPtr := pool.Get().(*[]byte)
+				buf := *bufPtr
+				buf = append(buf, []byte(fmt.Sprintf("g-%d-i-%d", id, j))...)
+				buf = buf[:0]
+				*bufPtr = buf
+				pool.Put(bufPtr)
+			}
+		}(i)
+	}
 
-                // Reset and return
-                buf = buf[:0]
-                *bufPtr = buf
-                bufferPool.Put(bufPtr)
-            }
-        }(i)
-    }
-
-    wg.Wait()
-    fmt.Println("All goroutines completed. Pool handled concurrent access safely.")
+	wg.Wait()
+	fmt.Printf("Allocations: %d (out of 100 total Get calls)\n", allocCount.Load())
 }
+```
+
+Expected output:
+```
+Allocations: ~20 (out of 100 total Get calls)
 ```
 
 ### Intermediate Verification
 ```bash
 go run main.go
 ```
-All goroutines should complete without panics. The number of "Allocating new buffer" messages should be much less than 100 (20 goroutines * 5 iterations).
+The allocation count should be much less than 100 (20 goroutines * 5 iterations).
 
-## Step 4 -- Measure Allocation Savings
+## Step 3 -- Realistic Use Case: JSON Response Builder
 
-Implement `measureAllocations` to compare allocations with and without pooling:
+The key pattern: build in a pooled buffer, copy the result, return the buffer.
 
 ```go
-func measureAllocations() {
-    fmt.Println("\n=== Allocation Comparison ===")
+package main
 
-    const iterations = 10000
+import (
+	"fmt"
+	"sync"
+)
 
-    // Without pool: allocate a new buffer each time
-    start := time.Now()
-    for i := 0; i < iterations; i++ {
-        buf := make([]byte, 0, 1024)
-        buf = append(buf, []byte("some data to process")...)
-        _ = buf // use and discard
-    }
-    withoutPool := time.Since(start)
+func main() {
+	responsePool := &sync.Pool{
+		New: func() any {
+			buf := make([]byte, 0, 4096)
+			return &buf
+		},
+	}
 
-    // With pool: reuse buffers
-    pool := &sync.Pool{
-        New: func() any {
-            buf := make([]byte, 0, 1024)
-            return &buf
-        },
-    }
+	buildResponse := func(userID int) []byte {
+		bufPtr := responsePool.Get().(*[]byte)
+		buf := *bufPtr
 
-    start = time.Now()
-    for i := 0; i < iterations; i++ {
-        bufPtr := pool.Get().(*[]byte)
-        buf := *bufPtr
-        buf = append(buf, []byte("some data to process")...)
-        buf = buf[:0] // reset
-        *bufPtr = buf
-        pool.Put(bufPtr)
-    }
-    withPool := time.Since(start)
+		buf = append(buf, '{')
+		buf = append(buf, []byte(fmt.Sprintf(`"user_id":%d,"status":"ok"`, userID))...)
+		buf = append(buf, '}')
 
-    fmt.Printf("Without pool: %v (%d allocations)\n", withoutPool, iterations)
-    fmt.Printf("With pool:    %v (far fewer allocations)\n", withPool)
+		// CRITICAL: copy before returning the buffer to the pool
+		result := make([]byte, len(buf))
+		copy(result, buf)
+
+		buf = buf[:0]
+		*bufPtr = buf
+		responsePool.Put(bufPtr)
+		return result
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			resp := buildResponse(id)
+			fmt.Printf("User %d: %s\n", id, resp)
+		}(i)
+	}
+	wg.Wait()
 }
+```
+
+Expected output:
+```
+User 0: {"user_id":0,"status":"ok"}
+User 1: {"user_id":1,"status":"ok"}
+...
 ```
 
 ### Intermediate Verification
 ```bash
 go run main.go
 ```
-The pool version should show reduced allocation count and potentially faster execution.
+Each goroutine should produce a valid JSON response.
 
-## Step 5 -- Realistic Use Case: JSON Response Builder
+## Step 4 -- GC Clears the Pool
 
-Implement `jsonResponseDemo` showing a practical buffer pool for building JSON responses:
+The program demonstrates that `runtime.GC()` can clear pool contents:
 
-```go
-func jsonResponseDemo() {
-    fmt.Println("\n=== Realistic Use Case: Response Builder ===")
-
-    responsePool := &sync.Pool{
-        New: func() any {
-            buf := make([]byte, 0, 4096)
-            return &buf
-        },
-    }
-
-    buildResponse := func(userID int) []byte {
-        bufPtr := responsePool.Get().(*[]byte)
-        buf := *bufPtr
-
-        buf = append(buf, '{')
-        buf = append(buf, []byte(fmt.Sprintf(`"user_id":%d,"status":"ok","data":"payload-%d"`, userID, userID))...)
-        buf = append(buf, '}')
-
-        // Copy the result before returning the buffer to the pool
-        result := make([]byte, len(buf))
-        copy(result, buf)
-
-        buf = buf[:0]
-        *bufPtr = buf
-        responsePool.Put(bufPtr)
-
-        return result
-    }
-
-    var wg sync.WaitGroup
-    for i := 0; i < 5; i++ {
-        wg.Add(1)
-        go func(id int) {
-            defer wg.Done()
-            resp := buildResponse(id)
-            fmt.Printf("Response for user %d: %s\n", id, resp)
-        }(i)
-    }
-
-    wg.Wait()
-}
-```
-
-### Intermediate Verification
 ```bash
 go run main.go
 ```
-Each goroutine should produce a valid JSON response. Buffers are recycled between responses.
+
+Expected output:
+```
+Before GC: got recycled buffer (no new allocation)
+After GC: pool was cleared, had to allocate a new buffer
+```
+
+This is why `sync.Pool` is NOT a permanent cache. If you need objects to persist across GC cycles, use a map with a mutex instead.
 
 ## Common Mistakes
 
 ### Forgetting to Reset Before Put
-**Wrong:**
+
 ```go
 bufPtr := pool.Get().(*[]byte)
 buf := *bufPtr
 buf = append(buf, sensitiveData...)
 *bufPtr = buf
-pool.Put(bufPtr) // next Get receives buffer with old data!
+pool.Put(bufPtr) // WRONG: next Get receives buffer with old data!
 ```
-**What happens:** The next consumer gets a buffer containing leftover data from the previous user.
+
+**What happens:** The next consumer gets a buffer containing leftover data from the previous user. This can leak sensitive information.
 
 **Fix:** Always reset (`buf = buf[:0]`) before `Put`.
 
-### Storing the Returned Pointer After Put
-**Wrong:**
+### Using After Put
+
 ```go
 bufPtr := pool.Get().(*[]byte)
 pool.Put(bufPtr)
-*bufPtr = append(*bufPtr, data...) // another goroutine may already be using it
+*bufPtr = append(*bufPtr, data...) // WRONG: another goroutine may already be using it
 ```
+
 **What happens:** Use-after-free semantics. Once you Put an object back, you must not use it.
 
 ### Using Pool as a Permanent Cache
@@ -268,7 +252,7 @@ pool.Put(bufPtr)
 **Reality:** The GC may clear the pool at any time. `sync.Pool` is for reducing allocations, not for caching. If you need a permanent cache, use a map with a mutex.
 
 ### Pool of Large Objects Without Size Limits
-Pools that store arbitrarily large objects can waste memory. Consider limiting the maximum size of objects you return to the pool:
+Pools that store arbitrarily large objects can waste memory. Consider capping the size:
 ```go
 if cap(*bufPtr) > maxBufSize {
     return // let GC reclaim oversized buffers
