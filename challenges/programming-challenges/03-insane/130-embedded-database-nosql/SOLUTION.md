@@ -234,38 +234,21 @@ pub struct PageManager {
 
 impl PageManager {
     pub fn open(path: &Path) -> io::Result<Self> {
-        let file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .open(path)?;
-
+        let file = OpenOptions::new().create(true).read(true).write(true).open(path)?;
         let file_len = file.metadata()?.len();
-        let next_page_id = if file_len == 0 {
-            1 // page 0 is reserved (INVALID_PAGE)
-        } else {
-            (file_len as u32) / PAGE_SIZE as u32
-        };
-
-        Ok(Self {
-            file,
-            next_page_id,
-            free_pages: HashSet::new(),
-        })
+        let next_page_id = if file_len == 0 { 1 } else { (file_len as u32) / PAGE_SIZE as u32 };
+        Ok(Self { file, next_page_id, free_pages: HashSet::new() })
     }
 
     pub fn allocate(&mut self) -> io::Result<PageId> {
-        if let Some(&page_id) = self.free_pages.iter().next() {
-            self.free_pages.remove(&page_id);
-            return Ok(page_id);
+        if let Some(&id) = self.free_pages.iter().next() {
+            self.free_pages.remove(&id);
+            return Ok(id);
         }
-
-        let page_id = self.next_page_id;
+        let id = self.next_page_id;
         self.next_page_id += 1;
-
-        let page = Page::new(page_id);
-        self.write_page(&page)?;
-        Ok(page_id)
+        self.write_page(&Page::new(id))?;
+        Ok(id)
     }
 
     pub fn read_page(&mut self, page_id: PageId) -> io::Result<Page> {
@@ -566,12 +549,6 @@ impl BPlusTree {
         }
     }
 
-    fn find_leaf_mut(&self, pm: &mut PageManager, key: &[u8]) -> io::Result<LeafNode> {
-        self.find_leaf(pm, key)
-    }
-
-    // Serialization helpers
-
     fn write_leaf(pm: &mut PageManager, leaf: &LeafNode) -> io::Result<()> {
         let mut page = Page::new(leaf.page_id);
         page.data[0] = LEAF_NODE;
@@ -783,18 +760,11 @@ impl MvccStore {
         }
     }
 
-    pub fn scan_range(
-        &self,
-        start: &[u8],
-        end: &[u8],
-        snapshot: u64,
-    ) -> Vec<(Vec<u8>, Vec<u8>)> {
+    pub fn scan_range(&self, start: &[u8], end: &[u8], snapshot: u64) -> Vec<(Vec<u8>, Vec<u8>)> {
         let entries = self.entries.read().unwrap();
-        let mut results: Vec<(Vec<u8>, Vec<u8>)> = entries.iter()
+        let mut results: Vec<_> = entries.iter()
             .filter(|(k, _)| k.as_slice() >= start && k.as_slice() < end)
-            .filter_map(|(k, entry)| {
-                entry.get_visible(snapshot).map(|v| (k.clone(), v.data.clone()))
-            })
+            .filter_map(|(k, e)| e.get_visible(snapshot).map(|v| (k.clone(), v.data.clone())))
             .collect();
         results.sort_by(|a, b| a.0.cmp(&b.0));
         results
@@ -802,11 +772,9 @@ impl MvccStore {
 
     pub fn scan_prefix(&self, prefix: &[u8], snapshot: u64) -> Vec<(Vec<u8>, Vec<u8>)> {
         let entries = self.entries.read().unwrap();
-        let mut results: Vec<(Vec<u8>, Vec<u8>)> = entries.iter()
+        let mut results: Vec<_> = entries.iter()
             .filter(|(k, _)| k.starts_with(prefix))
-            .filter_map(|(k, entry)| {
-                entry.get_visible(snapshot).map(|v| (k.clone(), v.data.clone()))
-            })
+            .filter_map(|(k, e)| e.get_visible(snapshot).map(|v| (k.clone(), v.data.clone())))
             .collect();
         results.sort_by(|a, b| a.0.cmp(&b.0));
         results
@@ -944,31 +912,23 @@ pub struct SecondaryIndex {
 
 impl SecondaryIndex {
     pub fn new(field_path: &str) -> Self {
-        Self {
-            field_path: field_path.to_string(),
-            index: HashMap::new(),
-        }
+        Self { field_path: field_path.to_string(), index: HashMap::new() }
     }
 
     pub fn insert(&mut self, doc_id: &str, doc: &JsonValue) {
-        if let Some(field_val) = extract_field(doc, &self.field_path) {
-            let key = field_val.to_string();
-            self.index.entry(key).or_default().push(doc_id.to_string());
+        if let Some(v) = extract_field(doc, &self.field_path) {
+            self.index.entry(v.to_string()).or_default().push(doc_id.to_string());
         }
     }
 
     pub fn remove(&mut self, doc_id: &str, doc: &JsonValue) {
-        if let Some(field_val) = extract_field(doc, &self.field_path) {
-            let key = field_val.to_string();
-            if let Some(ids) = self.index.get_mut(&key) {
-                ids.retain(|id| id != doc_id);
-            }
+        if let Some(v) = extract_field(doc, &self.field_path) {
+            if let Some(ids) = self.index.get_mut(&v.to_string()) { ids.retain(|id| id != doc_id); }
         }
     }
 
     pub fn lookup(&self, value: &JsonValue) -> Vec<DocId> {
-        let key = value.to_string();
-        self.index.get(&key).cloned().unwrap_or_default()
+        self.index.get(&value.to_string()).cloned().unwrap_or_default()
     }
 }
 
@@ -988,15 +948,7 @@ pub struct Collection {
 
 impl Collection {
     pub fn new(name: &str) -> Self {
-        Self {
-            name: name.to_string(),
-            next_id: 1,
-            indexes: RwLock::new(HashMap::new()),
-        }
-    }
-
-    pub fn name(&self) -> &str {
-        &self.name
+        Self { name: name.to_string(), next_id: 1, indexes: RwLock::new(HashMap::new()) }
     }
 
     pub fn generate_id(&mut self) -> DocId {
@@ -1006,27 +958,19 @@ impl Collection {
     }
 
     pub fn create_index(&self, field_path: &str) {
-        let mut indexes = self.indexes.write().unwrap();
-        indexes.insert(field_path.to_string(), SecondaryIndex::new(field_path));
+        self.indexes.write().unwrap().insert(field_path.to_string(), SecondaryIndex::new(field_path));
     }
 
     pub fn on_insert(&self, doc_id: &str, doc: &JsonValue) {
-        let mut indexes = self.indexes.write().unwrap();
-        for idx in indexes.values_mut() {
-            idx.insert(doc_id, doc);
-        }
+        for idx in self.indexes.write().unwrap().values_mut() { idx.insert(doc_id, doc); }
     }
 
     pub fn on_delete(&self, doc_id: &str, doc: &JsonValue) {
-        let mut indexes = self.indexes.write().unwrap();
-        for idx in indexes.values_mut() {
-            idx.remove(doc_id, doc);
-        }
+        for idx in self.indexes.write().unwrap().values_mut() { idx.remove(doc_id, doc); }
     }
 
     pub fn find_by_index(&self, field_path: &str, value: &JsonValue) -> Option<Vec<DocId>> {
-        let indexes = self.indexes.read().unwrap();
-        indexes.get(field_path).map(|idx| idx.lookup(value))
+        self.indexes.read().unwrap().get(field_path).map(|idx| idx.lookup(value))
     }
 }
 
@@ -1563,8 +1507,6 @@ The MVCC version chain grows with every update. Without periodic compaction, mem
 ## Going Further
 
 - Replace the in-memory MVCC store with B+ tree-backed versioned storage and a buffer pool
-- Add LSM-tree compaction as an alternative storage strategy
 - Implement write-ahead log checkpointing to bound WAL size automatically
 - Add network server layer with a simple protocol (Redis-compatible or custom)
-- Implement full-text search indexing for document fields
 - Add query operators beyond equality (`$gt`, `$lt`, `$in`, `$regex`)

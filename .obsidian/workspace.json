@@ -210,6 +210,8 @@
   },
   "active": "5e7b140048226118",
   "lastOpenFiles": [
+    "challenges/programming-challenges/03-insane/150-optimizing-compiler-ssa-form/SOLUTION.md",
+    "challenges/programming-challenges/03-insane/140-linker-elf-object-files/SOLUTION.md",
     "challenges/programming-challenges/03-insane/149-chaos-engineering-fault-injector/SOLUTION.md",
     "challenges/programming-challenges/03-insane/133-afl-style-mutation-fuzzer/SOLUTION.md",
     "challenges/programming-challenges/03-insane/148-persistent-data-structures-immutable/SOLUTION.md",
@@ -244,8 +246,6 @@
     "challenges/go/01-environment-and-tooling/06-linting-with-golangci-lint/06-linting-with-golangci-lint.md",
     "challenges/go/01-environment-and-tooling/05-go-install-and-third-party-packages/05-go-install-and-third-party-packages.md",
     "challenges/go/01-environment-and-tooling/04-go-tool-commands/04-go-tool-commands.md",
-    "challenges/go/01-environment-and-tooling/03-go-workspace-and-project-layout/03-go-workspace-and-project-layout.md",
-    "challenges/go/01-environment-and-tooling/02-go-modules-and-dependencies/02-go-modules-and-dependencies.md",
     "Presentacion/poc-just/web/node_modules/ordered-binary/assets/powers-dre.png",
     "Presentacion/poc-just/web/node_modules/retry/equation.gif",
     "Untitled.canvas"

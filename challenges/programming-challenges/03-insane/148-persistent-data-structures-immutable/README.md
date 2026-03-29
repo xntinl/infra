@@ -15,6 +15,7 @@ bloom_level: [create]
 - Bit manipulation: popcount, bit partitioning, bitmap indexing
 - Algorithmic complexity: amortized analysis, understanding O(log32 N) vs O(log2 N)
 - Functional programming concepts: immutability, structural sharing, persistent data structures theory
+- Generic programming in Rust: trait bounds (`Clone`, `Hash`, `Eq`), associated types, blanket implementations
 
 ## Learning Objectives
 
@@ -30,6 +31,8 @@ After completing this challenge you will be able to:
 Build a library of persistent (immutable, versioned) data structures in Rust that use structural sharing to achieve near-constant-time operations. When you "modify" a persistent vector or map, you get back a new version; the old version remains unchanged and accessible. Internally, the new version shares almost all of its tree structure with the old version, copying only the nodes along the path from root to the modified leaf.
 
 This is the approach used by Clojure's PersistentVector and PersistentHashMap, Scala's immutable collections, and Immutable.js, implemented in Rust with proper ownership semantics.
+
+The key insight is path copying: to update element 42 in a million-element vector, you clone only the 7 nodes on the path from root to the leaf containing element 42, then relink. The other 999,993 elements are shared. The cost is O(log32 N) per update, which is 7 or fewer node copies for any practical collection size.
 
 ## Requirements
 
@@ -71,3 +74,6 @@ This is the approach used by Clojure's PersistentVector and PersistentHashMap, S
 - [Okasaki: "Purely Functional Data Structures" (1998)](https://www.cambridge.org/core/books/purely-functional-data-structures/0409255DA1B48FA731859AC72E34D494) - Theoretical foundation
 - [Steindorfer & Vinju: "Optimizing Hash-Array Mapped Tries" (2015)](https://michael.steindorfer.name/publications/oopsla15.pdf) - CHAMP optimization
 - [Rust Reference Counting: Rc and Arc](https://doc.rust-lang.org/std/rc/struct.Rc.html) - Rust shared ownership primitives
+- [L'orange: "Understanding Clojure's Persistent Vector, Parts 1-4"](https://hypirion.com/musings/understanding-persistent-vector-pt-1) - Visual walkthrough of bit-partitioned tries with diagrams
+- [Driscoll et al.: "Making Data Structures Persistent" (1989)](https://www.cs.cmu.edu/~sleator/papers/making-data-structures-persistent.pdf) - Foundational theory on fat nodes vs path copying
+- [The `im` crate (Rust)](https://docs.rs/im/latest/im/) - Production persistent data structures in Rust, useful as a reference for API design
