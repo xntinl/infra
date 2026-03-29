@@ -32,6 +32,16 @@ func main() {
 
 	var wg sync.WaitGroup
 
+	for _, label := range []string{"A","B","C"} {
+		wg.Add(1)
+		go func(l label){
+			defer wg.Done()
+			printNumbers(l)
+		}(label)
+	}
+	wg.Wait()
+
+	fmt.Printf("Concurrent took: %v\n",time.Since(start).Round(time.Millisecond))
 
 }
 
