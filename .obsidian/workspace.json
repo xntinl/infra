@@ -210,6 +210,7 @@
   },
   "active": "5e7b140048226118",
   "lastOpenFiles": [
+    "challenges/go/02-variables-types-and-constants/05-type-conversions-and-type-assertions/zero_values_arrays.go",
     "challenges/go/02-variables-types-and-constants/05-type-conversions-and-type-assertions/zero_values_structs.go",
     "challenges/go/02-variables-types-and-constants/05-type-conversions-and-type-assertions/main.go",
     "challenges/go/02-variables-types-and-constants/05-type-conversions-and-type-assertions/composite_types.go",
@@ -225,7 +226,6 @@
     "challenges/go/01-environment-and-tooling/07-debugging-with-delve/07-debugging-with-delve.md",
     "challenges/go/01-environment-and-tooling/06-linting-with-golangci-lint/06-linting-with-golangci-lint.md",
     "challenges/go/01-environment-and-tooling/05-go-install-and-third-party-packages/05-go-install-and-third-party-packages.md",
-    "challenges/go/01-environment-and-tooling/05-go-install-and-third-party-packages/main.go",
     "challenges/go/01-environment-and-tooling/04-go-tool-commands/04-go-tool-commands.md",
     "challenges/go/01-environment-and-tooling/03-go-workspace-and-project-layout/03-go-workspace-and-project-layout.md",
     "challenges/go/01-environment-and-tooling/02-go-modules-and-dependencies/02-go-modules-and-dependencies.md",
