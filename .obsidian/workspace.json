@@ -210,6 +210,8 @@
   },
   "active": "5e7b140048226118",
   "lastOpenFiles": [
+    "challenges/go/02-variables-types-and-constants/01-variable-declaration-and-short-assignment/multiple-declaration.go",
+    "challenges/go/02-variables-types-and-constants/01-variable-declaration-and-short-assignment/mutliple-declaration.go",
     "challenges/go/02-variables-types-and-constants/01-variable-declaration-and-short-assignment/main.go",
     "challenges/go/02-variables-types-and-constants/01-variable-declaration-and-short-assignment/go.mod",
     "challenges/go/01-environment-and-tooling/08-cross-compilation-and-build-tags/08-cross-compilation-and-build-tags.md",
@@ -244,8 +246,6 @@
     "challenges/programming-challenges/03-insane/138-embedded-rtos-kernel-nostd/README.md",
     "challenges/programming-challenges/02-advanced/100-coverage-guided-fuzzer/SOLUTION.md",
     "challenges/go/01-environment-and-tooling/02-go-modules-and-dependencies/go.sum",
-    "challenges/go/01-environment-and-tooling/02-go-modules-and-dependencies/main.go",
-    "challenges/go/01-environment-and-tooling/02-go-modules-and-dependencies/go.mod",
     "Presentacion/poc-just/web/node_modules/ordered-binary/assets/powers-dre.png",
     "Presentacion/poc-just/web/node_modules/retry/equation.gif",
     "Untitled.canvas"
