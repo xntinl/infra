@@ -13,12 +13,12 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "challenges/programming-challenges/01-intermediate-advanced/72-csv-parser-streaming/README.md",
+                "file": "challenges/programming-challenges/01-intermediate-advanced/72-csv-parser-streaming/SOLUTION.md",
                 "mode": "source",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "README"
+              "title": "SOLUTION"
             }
           }
         ]
@@ -210,6 +210,8 @@
   },
   "active": "5e7b140048226118",
   "lastOpenFiles": [
+    "challenges/programming-challenges/03-insane/130-embedded-database-nosql/SOLUTION.md",
+    "challenges/programming-challenges/01-intermediate-advanced/72-csv-parser-streaming/README.md",
     "challenges/go/04-functions/01-function-declaration-and-multiple-return-values/function-declaration-and-multiple-return-values.md",
     "challenges/programming-challenges/03-insane/150-optimizing-compiler-ssa-form/README.md",
     "challenges/programming-challenges/03-insane/140-linker-elf-object-files/README.md",
@@ -244,8 +246,6 @@
     "challenges/programming-challenges/03-insane/139-register-allocator-graph-coloring/SOLUTION.md",
     "challenges/programming-challenges/03-insane/138-embedded-rtos-kernel-nostd/SOLUTION.md",
     "challenges/programming-challenges/03-insane/125-video-codec-h264-baseline/SOLUTION.md",
-    "challenges/programming-challenges/03-insane/148-persistent-data-structures-immutable/README.md",
-    "challenges/programming-challenges/02-advanced/111-reverse-proxy-tls-termination/SOLUTION.md",
     "Presentacion/poc-just/web/node_modules/ordered-binary/assets/powers-dre.png",
     "Presentacion/poc-just/web/node_modules/retry/equation.gif",
     "Untitled.canvas"
