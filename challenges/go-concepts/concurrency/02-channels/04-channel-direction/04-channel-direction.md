@@ -1,18 +1,14 @@
-# 4. Channel Direction
-
-<!--
+---
 difficulty: intermediate
 concepts: [directional-channels, send-only, receive-only, type-safety, function-signatures]
 tools: [go]
 estimated_time: 25m
 bloom_level: apply
 prerequisites: [goroutines, unbuffered-channels, buffered-channels]
--->
+---
 
-## Prerequisites
-- Go 1.22+ installed
-- Completed exercises 01-03 (channel basics, synchronization, buffered channels)
-- Familiarity with Go function signatures and type system
+# 4. Channel Direction
+
 
 ## Learning Objectives
 After completing this exercise, you will be able to:

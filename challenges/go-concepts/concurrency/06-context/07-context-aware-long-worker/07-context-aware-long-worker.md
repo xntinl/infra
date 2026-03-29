@@ -1,18 +1,14 @@
-# 7. Context-Aware Long Worker
-
-<!--
+---
 difficulty: advanced
 concepts: [cancellation in loops, select with ctx.Done and work channel, partial work handling, cooperative cancellation]
 tools: [go]
 estimated_time: 35m
 bloom_level: analyze
 prerequisites: [context.WithCancel, context.WithTimeout, select, channels, goroutines]
--->
+---
 
-## Prerequisites
-- Go 1.22+ installed
-- Completed exercises 01 through 06 in this section
-- Solid understanding of `select` with multiple channels
+# 7. Context-Aware Long Worker
+
 
 ## Learning Objectives
 After completing this exercise, you will be able to:

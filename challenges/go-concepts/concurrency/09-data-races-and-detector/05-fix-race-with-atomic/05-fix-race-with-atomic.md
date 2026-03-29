@@ -1,18 +1,14 @@
-# 5. Fix Race with Atomic
-
-<!--
+---
 difficulty: intermediate
 concepts: [sync/atomic, atomic.AddInt64, atomic.LoadInt64, lock-free, CAS, comparison]
 tools: [go]
 estimated_time: 25m
 bloom_level: apply
 prerequisites: [goroutines, sync.WaitGroup, data race concept, race detector, mutex, channels]
--->
+---
 
-## Prerequisites
-- Go 1.22+ installed
-- Completed exercises 01-04 (data races, race detector, mutex fix, channel fix)
-- Basic understanding that some CPU operations can be atomic
+# 5. Fix Race with Atomic
+
 
 ## Learning Objectives
 After completing this exercise, you will be able to:

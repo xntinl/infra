@@ -1,18 +1,14 @@
-# 5. Context WithValue
-
-<!--
+---
 difficulty: intermediate
 concepts: [context.WithValue, type-safe keys, request-scoped data, key collision avoidance]
 tools: [go]
 estimated_time: 30m
 bloom_level: apply
 prerequisites: [context.Background, context.WithCancel, custom types]
--->
+---
 
-## Prerequisites
-- Go 1.22+ installed
-- Completed [02-context-withcancel](../02-context-withcancel/02-context-withcancel.md)
-- Understanding of Go custom types and type assertions
+# 5. Context WithValue
+
 
 ## Learning Objectives
 After completing this exercise, you will be able to:

@@ -1,19 +1,14 @@
-# 5. Errgroup vs WaitGroup
-
-<!--
+---
 difficulty: intermediate
 concepts: [errgroup.Group, sync.WaitGroup, error handling patterns, decision criteria]
 tools: [go]
 estimated_time: 25m
 bloom_level: analyze
 prerequisites: [errgroup basics, sync.WaitGroup, error handling, channels]
--->
+---
 
-## Prerequisites
-- Go 1.22+ installed
-- Completed exercise 01 (errgroup basics)
-- Solid understanding of `sync.WaitGroup` (Add, Done, Wait)
-- Familiarity with channel-based error collection
+# 5. Errgroup vs WaitGroup
+
 
 ## Learning Objectives
 After completing this exercise, you will be able to:

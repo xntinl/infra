@@ -1,18 +1,14 @@
-# 4. Select Priority Trick
-
-<!--
+---
 difficulty: intermediate
 concepts: [select, priority, nested-select, fairness, starvation]
 tools: [go]
 estimated_time: 30m
 bloom_level: analyze
 prerequisites: [select-basics, select-with-default, channels, goroutines]
--->
+---
 
-## Prerequisites
-- Go 1.22+ installed
-- Completed exercises 01-02 (select basics, select with default)
-- Understanding of random case selection in `select`
+# 4. Select Priority Trick
+
 
 ## Learning Objectives
 - **Demonstrate** that `select` picks randomly among ready cases

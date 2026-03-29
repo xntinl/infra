@@ -1,18 +1,14 @@
-# 3. WaitGroup: Wait for All
-
-<!--
+---
 difficulty: basic
 concepts: [sync.WaitGroup, Add, Done, Wait, goroutine synchronization]
 tools: [go]
 estimated_time: 20m
 bloom_level: apply
 prerequisites: [goroutines, go keyword]
--->
+---
 
-## Prerequisites
-- Go 1.22+ installed
-- Ability to launch goroutines with the `go` keyword
-- Understanding that `main` exits when it returns, killing all goroutines
+# 3. WaitGroup: Wait for All
+
 
 ## Learning Objectives
 After completing this exercise, you will be able to:

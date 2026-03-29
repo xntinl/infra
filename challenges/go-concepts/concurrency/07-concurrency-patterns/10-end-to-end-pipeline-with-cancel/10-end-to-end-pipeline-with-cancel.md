@@ -1,18 +1,14 @@
-# 10. End-to-End Pipeline with Cancellation
-
-<!--
+---
 difficulty: advanced
 concepts: [pipeline, context cancellation, error handling, goroutine leak prevention, graceful shutdown]
 tools: [go]
 estimated_time: 45m
 bloom_level: create
 prerequisites: [goroutines, channels, select, context, sync.WaitGroup, pipeline, fan-out, fan-in, worker pool]
--->
+---
 
-## Prerequisites
-- Go 1.22+ installed
-- Completion of exercises 01-09 in this section
-- Strong understanding of context cancellation, pipelines, fan-out/fan-in, and worker pools
+# 10. End-to-End Pipeline with Cancellation
+
 
 ## Learning Objectives
 After completing this exercise, you will be able to:

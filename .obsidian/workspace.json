@@ -14,7 +14,7 @@
               "type": "markdown",
               "state": {
                 "file": "challenges/go-concepts/concurrency/01-goroutines-and-scheduling/01-launching-goroutines/01-launching-goroutines.md",
-                "mode": "preview",
+                "mode": "source",
                 "source": true
               },
               "icon": "lucide-file",

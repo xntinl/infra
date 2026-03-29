@@ -1,18 +1,14 @@
-# 4. Goroutine Stack Growth
-
-<!--
+---
 difficulty: intermediate
 concepts: [initial stack size, dynamic growth, stack copying, contiguous stacks, runtime.MemStats]
 tools: [go]
 estimated_time: 30m
 bloom_level: analyze
 prerequisites: [01-launching-goroutines, 02-goroutine-vs-os-thread]
--->
+---
 
-## Prerequisites
-- Go 1.22+ installed
-- Completed [02-goroutine-vs-os-thread](../02-goroutine-vs-os-thread/02-goroutine-vs-os-thread.md)
-- Understanding of recursion and call stacks
+# 4. Goroutine Stack Growth
+
 
 ## Learning Objectives
 After completing this exercise, you will be able to:

@@ -1,18 +1,14 @@
-# 3. Select with Timeout
-
-<!--
+---
 difficulty: intermediate
 concepts: [select, timeout, time.After, time.NewTimer, timer-cleanup]
 tools: [go]
 estimated_time: 25m
 bloom_level: apply
 prerequisites: [select-basics, select-with-default, channels, goroutines]
--->
+---
 
-## Prerequisites
-- Go 1.22+ installed
-- Completed exercises 01-02 (select basics, select with default)
-- Familiarity with `time` package basics
+# 3. Select with Timeout
+
 
 ## Learning Objectives
 - **Implement** a timeout on a channel operation using `time.After`

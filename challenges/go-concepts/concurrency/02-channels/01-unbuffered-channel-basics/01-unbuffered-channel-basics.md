@@ -1,18 +1,14 @@
-# 1. Unbuffered Channel Basics
-
-<!--
+---
 difficulty: basic
 concepts: [channels, make, send, receive, synchronization, goroutines]
 tools: [go]
 estimated_time: 15m
 bloom_level: understand
 prerequisites: [goroutines, go-basics]
--->
+---
 
-## Prerequisites
-- Go 1.22+ installed
-- Understanding of goroutines (section 01-goroutines)
-- Basic Go syntax (functions, types)
+# 1. Unbuffered Channel Basics
+
 
 ## Learning Objectives
 After completing this exercise, you will be able to:

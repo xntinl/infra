@@ -1,18 +1,14 @@
-# 8. Race-Free Design Patterns
-
-<!--
+---
 difficulty: advanced
 concepts: [confinement, immutability, ownership, communication, pipeline, fan-out, fan-in]
 tools: [go]
 estimated_time: 40m
 bloom_level: create
 prerequisites: [goroutines, channels, sync.WaitGroup, data race concept, race detector, mutex, channels, atomic]
--->
+---
 
-## Prerequisites
-- Go 1.22+ installed
-- Completed exercises 01-07 (all data race exercises)
-- Solid understanding of goroutines, channels, and synchronization primitives
+# 8. Race-Free Design Patterns
+
 
 ## Learning Objectives
 After completing this exercise, you will be able to:

@@ -1,18 +1,14 @@
-# 7. Heartbeat with Select
-
-<!--
+---
 difficulty: advanced
 concepts: [select, time.Ticker, heartbeat, health-monitoring, stall-detection]
 tools: [go]
 estimated_time: 35m
 bloom_level: create
 prerequisites: [select-basics, select-in-for-loop, done-channel-pattern, time.Ticker]
--->
+---
 
-## Prerequisites
-- Go 1.22+ installed
-- Completed exercises 01, 05, and 06 (select basics, for-select, done channel)
-- Understanding of `time.Ticker` (periodic channel sends)
+# 7. Heartbeat with Select
+
 
 ## Learning Objectives
 - **Create** a heartbeat signal using `time.Ticker` inside a select loop

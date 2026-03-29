@@ -1,19 +1,14 @@
-# 1. Errgroup Basics
-
-<!--
+---
 difficulty: basic
 concepts: [errgroup.Group, Go, Wait, error propagation, golang.org/x/sync]
 tools: [go]
 estimated_time: 20m
 bloom_level: apply
 prerequisites: [goroutines, sync.WaitGroup, error handling]
--->
+---
 
-## Prerequisites
-- Go 1.22+ installed
-- Understanding of `sync.WaitGroup` (Add, Done, Wait)
-- Familiarity with Go error handling (`error` interface, `fmt.Errorf`)
-- Basic goroutine usage
+# 1. Errgroup Basics
+
 
 ## Learning Objectives
 After completing this exercise, you will be able to:

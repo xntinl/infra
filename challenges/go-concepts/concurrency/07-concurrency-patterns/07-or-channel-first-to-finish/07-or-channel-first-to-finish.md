@@ -1,19 +1,14 @@
-# 7. Or-Channel: First to Finish
-
-<!--
+---
 difficulty: advanced
 concepts: [or-channel, speculative execution, cancellation, select, redundant work]
 tools: [go]
 estimated_time: 35m
 bloom_level: analyze
 prerequisites: [goroutines, channels, select, context, done channel pattern]
--->
+---
 
-## Prerequisites
-- Go 1.22+ installed
-- Strong understanding of goroutines, channels, and `select`
-- Familiarity with `context.Context` for cancellation
-- Understanding of the done-channel pattern (exercise 06)
+# 7. Or-Channel: First to Finish
+
 
 ## Learning Objectives
 After completing this exercise, you will be able to:

@@ -1,19 +1,14 @@
-# 8. A Million Goroutines
-
-<!--
+---
 difficulty: advanced
 concepts: [goroutine scalability, memory overhead, runtime.MemStats, practical limits, when NOT to goroutine, worker pools]
 tools: [go]
 estimated_time: 45m
 bloom_level: create
 prerequisites: [01-launching-goroutines, 02-goroutine-vs-os-thread, 05-gomaxprocs-and-parallelism]
--->
+---
 
-## Prerequisites
-- Go 1.22+ installed
-- Completed exercises 01 through 07 in this section
-- Understanding of goroutine memory overhead and scheduling
-- At least 4 GB of free RAM (this exercise creates many goroutines)
+# 8. A Million Goroutines
+
 
 ## Learning Objectives
 After completing this exercise, you will be able to:

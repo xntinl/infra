@@ -1,18 +1,14 @@
-# 1. Atomic Add Counter
-
-<!--
+---
 difficulty: basic
 concepts: [sync/atomic, AddInt64, AddUint64, atomic.Int64, data race]
 tools: [go]
 estimated_time: 20m
 bloom_level: apply
 prerequisites: [goroutines, sync.WaitGroup, data races]
--->
+---
 
-## Prerequisites
-- Go 1.22+ installed
-- Understanding of goroutines and `sync.WaitGroup`
-- Basic awareness that concurrent writes to shared variables cause data races
+# 1. Atomic Add Counter
+
 
 ## Learning Objectives
 After completing this exercise, you will be able to:

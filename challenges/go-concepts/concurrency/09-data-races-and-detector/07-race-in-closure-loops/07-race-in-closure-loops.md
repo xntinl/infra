@@ -1,18 +1,14 @@
-# 7. Race in Closure Loops
-
-<!--
+---
 difficulty: intermediate
 concepts: [closure capture, loop variable, goroutine scheduling, Go 1.22 loop semantics]
 tools: [go]
 estimated_time: 25m
 bloom_level: analyze
 prerequisites: [goroutines, closures, data race concept, race detector]
--->
+---
 
-## Prerequisites
-- Go 1.22+ installed
-- Completed exercises 01-06 (data races and fixes)
-- Understanding of Go closures
+# 7. Race in Closure Loops
+
 
 ## Learning Objectives
 After completing this exercise, you will be able to:

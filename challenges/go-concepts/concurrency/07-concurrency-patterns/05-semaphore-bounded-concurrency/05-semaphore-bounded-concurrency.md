@@ -1,18 +1,14 @@
-# 5. Semaphore: Bounded Concurrency
-
-<!--
+---
 difficulty: intermediate
 concepts: [semaphore, buffered channel, bounded concurrency, backpressure]
 tools: [go]
 estimated_time: 30m
 bloom_level: apply
 prerequisites: [goroutines, channels, sync.WaitGroup, worker pool]
--->
+---
 
-## Prerequisites
-- Go 1.22+ installed
-- Understanding of goroutines, buffered channels, and `sync.WaitGroup`
-- Familiarity with the worker pool pattern (exercise 04)
+# 5. Semaphore: Bounded Concurrency
+
 
 ## Learning Objectives
 After completing this exercise, you will be able to:

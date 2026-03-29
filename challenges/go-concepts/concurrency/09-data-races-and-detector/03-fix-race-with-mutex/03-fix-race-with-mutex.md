@@ -1,18 +1,14 @@
-# 3. Fix Race with Mutex
-
-<!--
+---
 difficulty: intermediate
 concepts: [sync.Mutex, Lock, Unlock, defer, critical section, contention, encapsulation]
 tools: [go]
 estimated_time: 25m
 bloom_level: apply
 prerequisites: [goroutines, sync.WaitGroup, data race concept, race detector]
--->
+---
 
-## Prerequisites
-- Go 1.22+ installed
-- Completed exercises 01 and 02 (understanding data races and the race detector)
-- Basic familiarity with `sync.Mutex`
+# 3. Fix Race with Mutex
+
 
 ## Learning Objectives
 After completing this exercise, you will be able to:

@@ -1,18 +1,14 @@
-# 1. Context Background and TODO
-
-<!--
+---
 difficulty: basic
 concepts: [context.Background, context.TODO, root contexts, context tree]
 tools: [go]
 estimated_time: 15m
 bloom_level: understand
 prerequisites: [Go basics, interfaces]
--->
+---
 
-## Prerequisites
-- Go 1.22+ installed
-- Familiarity with Go interfaces
-- Basic understanding of function signatures and parameter passing
+# 1. Context Background and TODO
+
 
 ## Learning Objectives
 After completing this exercise, you will be able to:

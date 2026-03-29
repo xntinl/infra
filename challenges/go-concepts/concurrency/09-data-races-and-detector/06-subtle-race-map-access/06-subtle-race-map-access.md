@@ -1,18 +1,14 @@
-# 6. Subtle Race: Map Access
-
-<!--
+---
 difficulty: intermediate
 concepts: [concurrent map access, fatal error, sync.Mutex, sync.RWMutex, sync.Map, map safety]
 tools: [go]
 estimated_time: 30m
 bloom_level: apply
 prerequisites: [goroutines, sync.WaitGroup, data race concept, sync.Mutex]
--->
+---
 
-## Prerequisites
-- Go 1.22+ installed
-- Completed exercises 01-05 (data races and fixes)
-- Familiarity with Go maps
+# 6. Subtle Race: Map Access
+
 
 ## Learning Objectives
 After completing this exercise, you will be able to:

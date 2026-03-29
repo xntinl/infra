@@ -1,18 +1,14 @@
-# 6. Done Channel Pattern
-
-<!--
+---
 difficulty: intermediate
 concepts: [done-channel, cancellation, close-broadcast, goroutine-lifecycle, context-foundation]
 tools: [go]
 estimated_time: 25m
 bloom_level: apply
 prerequisites: [select-basics, select-in-for-loop, channels, goroutines, channel-close]
--->
+---
 
-## Prerequisites
-- Go 1.22+ installed
-- Completed exercises 01 and 05 (select basics, for-select loop)
-- Understanding of channel close semantics (a closed channel returns zero value immediately)
+# 6. Done Channel Pattern
+
 
 ## Learning Objectives
 - **Implement** a done channel to signal cancellation to one or more goroutines

@@ -1,18 +1,14 @@
-# 3. GMP Model in Action
-
-<!--
+---
 difficulty: intermediate
 concepts: [G (goroutine), M (machine/OS thread), P (processor/logical processor), runtime.GOMAXPROCS, runtime.NumGoroutine, scheduler internals]
 tools: [go]
 estimated_time: 30m
 bloom_level: analyze
 prerequisites: [01-launching-goroutines, 02-goroutine-vs-os-thread]
--->
+---
 
-## Prerequisites
-- Go 1.22+ installed
-- Completed [01-launching-goroutines](../01-launching-goroutines/01-launching-goroutines.md) and [02-goroutine-vs-os-thread](../02-goroutine-vs-os-thread/02-goroutine-vs-os-thread.md)
-- Conceptual understanding of OS threads vs goroutines
+# 3. GMP Model in Action
+
 
 ## Learning Objectives
 After completing this exercise, you will be able to:

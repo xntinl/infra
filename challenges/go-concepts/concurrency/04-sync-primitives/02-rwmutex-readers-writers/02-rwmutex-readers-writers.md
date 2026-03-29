@@ -1,18 +1,14 @@
-# 2. RWMutex: Readers-Writers
-
-<!--
+---
 difficulty: intermediate
 concepts: [sync.RWMutex, RLock, RUnlock, concurrent reads, exclusive writes, read-heavy optimization]
 tools: [go]
 estimated_time: 30m
 bloom_level: apply
 prerequisites: [sync.Mutex, goroutines, WaitGroup]
--->
+---
 
-## Prerequisites
-- Go 1.22+ installed
-- Understanding of `sync.Mutex` (exercise 01)
-- Familiarity with goroutines and `sync.WaitGroup`
+# 2. RWMutex: Readers-Writers
+
 
 ## Learning Objectives
 After completing this exercise, you will be able to:

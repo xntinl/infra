@@ -1,18 +1,14 @@
-# 7. Nil Channel Behavior
-
-<!--
+---
 difficulty: intermediate
 concepts: [nil-channel, select, dynamic-disable, channel-state-machine]
 tools: [go]
 estimated_time: 30m
 bloom_level: analyze
 prerequisites: [goroutines, unbuffered-channels, buffered-channels, close, select-basics]
--->
+---
 
-## Prerequisites
-- Go 1.22+ installed
-- Completed exercises 01-06 (channels through closing)
-- Basic familiarity with `select` (reading from multiple channels)
+# 7. Nil Channel Behavior
+
 
 ## Learning Objectives
 After completing this exercise, you will be able to:

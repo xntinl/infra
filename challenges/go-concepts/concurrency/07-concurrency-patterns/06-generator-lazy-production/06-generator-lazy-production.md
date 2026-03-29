@@ -1,19 +1,14 @@
-# 6. Generator: Lazy Production
-
-<!--
+---
 difficulty: intermediate
 concepts: [generator pattern, lazy evaluation, channel backpressure, producer-consumer, done channel]
 tools: [go]
 estimated_time: 25m
 bloom_level: apply
 prerequisites: [goroutines, channels, channel direction, select]
--->
+---
 
-## Prerequisites
-- Go 1.22+ installed
-- Understanding of goroutines and channels
-- Familiarity with channel direction types (`<-chan`, `chan<-`)
-- Basic understanding of `select` statement
+# 6. Generator: Lazy Production
+
 
 ## Learning Objectives
 After completing this exercise, you will be able to:

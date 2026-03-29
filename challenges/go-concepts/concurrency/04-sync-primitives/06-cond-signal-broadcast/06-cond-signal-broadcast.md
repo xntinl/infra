@@ -1,18 +1,14 @@
-# 6. Cond: Signal and Broadcast
-
-<!--
+---
 difficulty: advanced
 concepts: [sync.Cond, Wait, Signal, Broadcast, producer-consumer, spurious wakeup, condition variable]
 tools: [go]
 estimated_time: 35m
 bloom_level: analyze
 prerequisites: [sync.Mutex, sync.WaitGroup, goroutines]
--->
+---
 
-## Prerequisites
-- Go 1.22+ installed
-- Solid understanding of `sync.Mutex`
-- Familiarity with goroutines and `sync.WaitGroup`
+# 6. Cond: Signal and Broadcast
+
 
 ## Learning Objectives
 After completing this exercise, you will be able to:

@@ -1,18 +1,14 @@
-# 10. Channel vs Shared Memory
-
-<!--
+---
 difficulty: advanced
 concepts: [channels-vs-mutex, share-by-communicating, sync.Mutex, design-tradeoffs, concurrency-philosophy]
 tools: [go]
 estimated_time: 35m
 bloom_level: analyze
 prerequisites: [goroutines, unbuffered-channels, buffered-channels, channel-direction, close]
--->
+---
 
-## Prerequisites
-- Go 1.22+ installed
-- Completed exercises 01-09 (all previous channel exercises)
-- Basic understanding of mutexes (will be explained as needed)
+# 10. Channel vs Shared Memory
+
 
 ## Learning Objectives
 After completing this exercise, you will be able to:

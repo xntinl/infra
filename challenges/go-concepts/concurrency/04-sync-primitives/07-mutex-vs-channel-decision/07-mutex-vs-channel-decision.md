@@ -1,19 +1,14 @@
-# 7. Mutex vs Channel: Decision Criteria
-
-<!--
+---
 difficulty: intermediate
 concepts: [mutex vs channel, share memory by communicating, state ownership, Go proverb]
 tools: [go]
 estimated_time: 25m
 bloom_level: analyze
 prerequisites: [sync.Mutex, channels, goroutines, sync.WaitGroup]
--->
+---
 
-## Prerequisites
-- Go 1.22+ installed
-- Understanding of `sync.Mutex` (exercise 01)
-- Familiarity with Go channels (section 02)
-- Ability to reason about goroutine communication
+# 7. Mutex vs Channel: Decision Criteria
+
 
 ## Learning Objectives
 After completing this exercise, you will be able to:

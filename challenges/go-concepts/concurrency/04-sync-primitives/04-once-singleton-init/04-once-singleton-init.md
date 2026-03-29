@@ -1,18 +1,14 @@
-# 4. Once: Singleton Initialization
-
-<!--
+---
 difficulty: intermediate
 concepts: [sync.Once, Do, sync.OnceValue, sync.OnceFunc, lazy initialization, thread safety]
 tools: [go]
 estimated_time: 25m
 bloom_level: apply
 prerequisites: [goroutines, sync.Mutex, sync.WaitGroup]
--->
+---
 
-## Prerequisites
-- Go 1.22+ installed
-- Understanding of `sync.Mutex` and race conditions
-- Familiarity with `sync.WaitGroup`
+# 4. Once: Singleton Initialization
+
 
 ## Learning Objectives
 After completing this exercise, you will be able to:

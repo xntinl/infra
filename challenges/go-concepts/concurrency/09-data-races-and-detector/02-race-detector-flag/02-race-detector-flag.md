@@ -1,18 +1,14 @@
-# 2. Race Detector Flag
-
-<!--
+---
 difficulty: basic
 concepts: [race detector, -race flag, happens-before, ThreadSanitizer, race report]
 tools: [go]
 estimated_time: 20m
 bloom_level: understand
 prerequisites: [goroutines, sync.WaitGroup, data race concept]
--->
+---
 
-## Prerequisites
-- Go 1.22+ installed
-- Completed exercise 01 (Your First Data Race)
-- Understanding of what a data race is
+# 2. Race Detector Flag
+
 
 ## Learning Objectives
 After completing this exercise, you will be able to:

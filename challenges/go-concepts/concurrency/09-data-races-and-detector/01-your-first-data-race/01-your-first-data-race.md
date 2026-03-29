@@ -1,18 +1,14 @@
-# 1. Your First Data Race
-
-<!--
+---
 difficulty: basic
 concepts: [data race, shared variable, concurrent write, non-determinism, lost update]
 tools: [go]
 estimated_time: 20m
 bloom_level: understand
 prerequisites: [goroutines, sync.WaitGroup]
--->
+---
 
-## Prerequisites
-- Go 1.22+ installed
-- Familiarity with launching goroutines using the `go` keyword
-- Basic understanding of `sync.WaitGroup`
+# 1. Your First Data Race
+
 
 ## Learning Objectives
 After completing this exercise, you will be able to:

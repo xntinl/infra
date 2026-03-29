@@ -1,18 +1,14 @@
-# 7. Atomic vs Mutex Benchmark
-
-<!--
+---
 difficulty: advanced
 concepts: [testing.B, benchmark functions, atomic performance, mutex performance, channel counter, RWMutex, contention analysis]
 tools: [go]
 estimated_time: 35m
 bloom_level: analyze
 prerequisites: [goroutines, sync.WaitGroup, atomic operations, sync.Mutex, channels, Go testing package]
--->
+---
 
-## Prerequisites
-- Go 1.22+ installed
-- Completed exercises 01-06 (atomic operations, happens-before)
-- Basic familiarity with Go's `testing` package
+# 7. Atomic vs Mutex Benchmark
+
 
 ## Learning Objectives
 After completing this exercise, you will be able to:

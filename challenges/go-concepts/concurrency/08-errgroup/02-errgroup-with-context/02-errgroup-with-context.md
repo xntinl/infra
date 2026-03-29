@@ -1,19 +1,14 @@
-# 2. Errgroup with Context
-
-<!--
+---
 difficulty: intermediate
 concepts: [errgroup.WithContext, context.Context, automatic cancellation, ctx.Done, ctx.Err]
 tools: [go]
 estimated_time: 30m
 bloom_level: apply
 prerequisites: [errgroup basics, context.Context, context.WithCancel]
--->
+---
 
-## Prerequisites
-- Go 1.22+ installed
-- Completed exercise 01 (errgroup basics)
-- Understanding of `context.Context`, `ctx.Done()`, and `ctx.Err()`
-- Familiarity with `context.WithCancel` and cancellation propagation
+# 2. Errgroup with Context
+
 
 ## Learning Objectives
 After completing this exercise, you will be able to:

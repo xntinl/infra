@@ -1,18 +1,14 @@
-# 9. Rate Limiter: Token Bucket
-
-<!--
+---
 difficulty: advanced
 concepts: [rate limiting, token bucket, time.Ticker, buffered channel, burst handling]
 tools: [go]
 estimated_time: 35m
 bloom_level: analyze
 prerequisites: [goroutines, channels, select, time.Ticker, buffered channels]
--->
+---
 
-## Prerequisites
-- Go 1.22+ installed
-- Understanding of goroutines, channels, `select`, and `time.Ticker`
-- Familiarity with buffered channels as resource containers
+# 9. Rate Limiter: Token Bucket
+
 
 ## Learning Objectives
 After completing this exercise, you will be able to:

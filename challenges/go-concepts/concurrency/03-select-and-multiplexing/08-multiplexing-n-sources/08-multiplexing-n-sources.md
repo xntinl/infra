@@ -1,19 +1,14 @@
-# 8. Multiplexing N Sources
-
-<!--
+---
 difficulty: advanced
 concepts: [fan-in, merge, variadic-channels, WaitGroup, goroutine-per-channel, dynamic-multiplexing]
 tools: [go]
 estimated_time: 40m
 bloom_level: create
 prerequisites: [select-basics, select-in-for-loop, done-channel-pattern, goroutines, WaitGroup]
--->
+---
 
-## Prerequisites
-- Go 1.22+ installed
-- Completed exercises 01, 05, and 06 (select basics, for-select, done channel)
-- Understanding of `sync.WaitGroup`
-- Understanding of variadic functions
+# 8. Multiplexing N Sources
+
 
 ## Learning Objectives
 - **Build** a merge function that combines N channels into one output channel

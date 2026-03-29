@@ -1,18 +1,14 @@
-# 1. Select Basics
-
-<!--
+---
 difficulty: basic
 concepts: [select, channels, goroutines, multiplexing]
 tools: [go]
 estimated_time: 15m
 bloom_level: understand
 prerequisites: [goroutines, unbuffered-channels, buffered-channels]
--->
+---
 
-## Prerequisites
-- Go 1.22+ installed
-- Understanding of goroutines (section 01)
-- Understanding of channels: sending, receiving, blocking behavior (section 02)
+# 1. Select Basics
+
 
 ## Learning Objectives
 - **Explain** what the `select` statement does and why it exists

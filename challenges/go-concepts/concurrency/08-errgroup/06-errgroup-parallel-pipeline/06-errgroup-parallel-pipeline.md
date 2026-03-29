@@ -1,20 +1,14 @@
-# 6. Errgroup Parallel Pipeline
-
-<!--
+---
 difficulty: advanced
 concepts: [errgroup pipeline, channel stages, producer-consumer, parallel workers, error propagation across stages]
 tools: [go]
 estimated_time: 40m
 bloom_level: create
 prerequisites: [errgroup basics, errgroup WithContext, errgroup SetLimit, channels, context cancellation]
--->
+---
 
-## Prerequisites
-- Go 1.22+ installed
-- Completed exercises 01-05 of this section
-- Understanding of channel-based pipelines (send on one channel, receive on another)
-- Familiarity with the producer-consumer pattern
-- Context cancellation and cooperative shutdown
+# 6. Errgroup Parallel Pipeline
+
 
 ## Learning Objectives
 After completing this exercise, you will be able to:

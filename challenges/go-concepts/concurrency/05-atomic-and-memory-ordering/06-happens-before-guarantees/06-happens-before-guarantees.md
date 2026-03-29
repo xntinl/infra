@@ -1,18 +1,14 @@
-# 6. Happens-Before Guarantees
-
-<!--
+---
 difficulty: advanced
 concepts: [Go memory model, happens-before, visibility, goroutine creation, channel synchronization, sync primitives ordering]
 tools: [go]
 estimated_time: 35m
 bloom_level: analyze
 prerequisites: [goroutines, channels, sync.Mutex, sync.WaitGroup, atomic operations]
--->
+---
 
-## Prerequisites
-- Go 1.22+ installed
-- Completed exercises 01-04 (atomic operations)
-- Familiarity with channels and `sync.Mutex`
+# 6. Happens-Before Guarantees
+
 
 ## Learning Objectives
 After completing this exercise, you will be able to:

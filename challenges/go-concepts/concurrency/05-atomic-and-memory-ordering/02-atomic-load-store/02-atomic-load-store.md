@@ -1,18 +1,14 @@
-# 2. Atomic Load and Store
-
-<!--
+---
 difficulty: intermediate
 concepts: [atomic.LoadInt64, atomic.StoreInt64, visibility, publish pattern, memory visibility]
 tools: [go]
 estimated_time: 25m
 bloom_level: understand
 prerequisites: [goroutines, sync.WaitGroup, atomic.AddInt64]
--->
+---
 
-## Prerequisites
-- Go 1.22+ installed
-- Completed exercise 01 (atomic add counter)
-- Understanding of why non-atomic access to shared variables is unsafe
+# 2. Atomic Load and Store
+
 
 ## Learning Objectives
 After completing this exercise, you will be able to:

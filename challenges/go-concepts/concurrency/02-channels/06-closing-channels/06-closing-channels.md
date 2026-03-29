@@ -1,18 +1,14 @@
-# 6. Closing Channels
-
-<!--
+---
 difficulty: intermediate
 concepts: [close, comma-ok, zero-value, broadcast, channel-lifecycle]
 tools: [go]
 estimated_time: 25m
 bloom_level: analyze
 prerequisites: [goroutines, unbuffered-channels, buffered-channels, range-channels]
--->
+---
 
-## Prerequisites
-- Go 1.22+ installed
-- Completed exercises 01-05 (channels basics through ranging)
-- Understanding of channel send/receive mechanics
+# 6. Closing Channels
+
 
 ## Learning Objectives
 After completing this exercise, you will be able to:

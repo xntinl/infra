@@ -1,18 +1,14 @@
-# 3. Buffered Channels
-
-<!--
+---
 difficulty: basic
 concepts: [buffered-channels, capacity, blocking, len, cap, channel-semantics]
 tools: [go]
 estimated_time: 20m
 bloom_level: understand
 prerequisites: [goroutines, unbuffered-channels]
--->
+---
 
-## Prerequisites
-- Go 1.22+ installed
-- Completed exercises 01-02 (unbuffered channels, synchronization)
-- Understanding of send/receive blocking behavior
+# 3. Buffered Channels
+
 
 ## Learning Objectives
 After completing this exercise, you will be able to:

@@ -1,19 +1,14 @@
-# 2. Fan-Out: Distribute Work
-
-<!--
+---
 difficulty: intermediate
 concepts: [fan-out, work distribution, channel sharing, goroutine workers]
 tools: [go]
 estimated_time: 30m
 bloom_level: apply
 prerequisites: [goroutines, channels, sync.WaitGroup, pipeline pattern]
--->
+---
 
-## Prerequisites
-- Go 1.22+ installed
-- Understanding of goroutines and channels
-- Familiarity with `sync.WaitGroup`
-- Completion of exercise 01 (pipeline pattern)
+# 2. Fan-Out: Distribute Work
+
 
 ## Learning Objectives
 After completing this exercise, you will be able to:

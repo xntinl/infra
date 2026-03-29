@@ -1,19 +1,14 @@
-# 1. Pipeline Pattern
-
-<!--
+---
 difficulty: intermediate
 concepts: [pipeline, channel chaining, stage decomposition, goroutine composition]
 tools: [go]
 estimated_time: 30m
 bloom_level: apply
 prerequisites: [goroutines, channels, channel direction]
--->
+---
 
-## Prerequisites
-- Go 1.22+ installed
-- Understanding of goroutines and how to launch them
-- Familiarity with channels (send, receive, close)
-- Understanding of channel direction types (`<-chan`, `chan<-`)
+# 1. Pipeline Pattern
+
 
 ## Learning Objectives
 After completing this exercise, you will be able to:

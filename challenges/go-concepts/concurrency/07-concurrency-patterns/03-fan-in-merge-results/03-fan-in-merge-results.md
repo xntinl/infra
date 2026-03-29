@@ -1,18 +1,14 @@
-# 3. Fan-In: Merge Results
-
-<!--
+---
 difficulty: intermediate
 concepts: [fan-in, channel merging, WaitGroup, pipeline composition]
 tools: [go]
 estimated_time: 30m
 bloom_level: apply
 prerequisites: [goroutines, channels, sync.WaitGroup, fan-out pattern]
--->
+---
 
-## Prerequisites
-- Go 1.22+ installed
-- Understanding of goroutines, channels, and `sync.WaitGroup`
-- Completion of exercises 01 (pipeline) and 02 (fan-out)
+# 3. Fan-In: Merge Results
+
 
 ## Learning Objectives
 After completing this exercise, you will be able to:

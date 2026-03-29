@@ -1,18 +1,14 @@
-# 8. Channel of Channels
-
-<!--
+---
 difficulty: advanced
 concepts: [channel-of-channels, request-response, future, service-pattern]
 tools: [go]
 estimated_time: 35m
 bloom_level: create
 prerequisites: [goroutines, unbuffered-channels, buffered-channels, channel-direction, close]
--->
+---
 
-## Prerequisites
-- Go 1.22+ installed
-- Completed exercises 01-06 (channels through closing)
-- Comfortable with directional channels and struct types
+# 8. Channel of Channels
+
 
 ## Learning Objectives
 After completing this exercise, you will be able to:

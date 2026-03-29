@@ -1,19 +1,14 @@
-# 8. Graceful Shutdown with Context
-
-<!--
+---
 difficulty: advanced
 concepts: [graceful shutdown, os.Signal, SIGINT, SIGTERM, context cancellation tree, sync.WaitGroup, coordinated shutdown]
 tools: [go]
 estimated_time: 40m
 bloom_level: create
 prerequisites: [context.WithCancel, context.WithTimeout, sync.WaitGroup, goroutines, channels, os/signal]
--->
+---
 
-## Prerequisites
-- Go 1.22+ installed
-- Completed exercises 01 through 07 in this section
-- Understanding of `sync.WaitGroup` from [04-sync-primitives](../../04-sync-primitives/)
-- Familiarity with Unix signals (SIGINT from Ctrl+C)
+# 8. Graceful Shutdown with Context
+
 
 ## Learning Objectives
 After completing this exercise, you will be able to:

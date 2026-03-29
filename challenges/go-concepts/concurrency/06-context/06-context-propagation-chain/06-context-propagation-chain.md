@@ -1,18 +1,14 @@
-# 6. Context Propagation Chain
-
-<!--
+---
 difficulty: intermediate
 concepts: [context propagation, layered architecture, context as first parameter, multi-layer cancellation]
 tools: [go]
 estimated_time: 30m
 bloom_level: apply
 prerequisites: [context.WithCancel, context.WithTimeout, context.WithValue, goroutines]
--->
+---
 
-## Prerequisites
-- Go 1.22+ installed
-- Completed exercises 01 through 05 in this section
-- Understanding of layered application architecture (handler -> service -> repository)
+# 6. Context Propagation Chain
+
 
 ## Learning Objectives
 After completing this exercise, you will be able to:

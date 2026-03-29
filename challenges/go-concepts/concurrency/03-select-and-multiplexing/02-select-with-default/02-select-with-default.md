@@ -1,18 +1,14 @@
-# 2. Select with Default
-
-<!--
+---
 difficulty: basic
 concepts: [select, default-case, non-blocking-operations, polling]
 tools: [go]
 estimated_time: 20m
 bloom_level: apply
 prerequisites: [select-basics, channels, goroutines]
--->
+---
 
-## Prerequisites
-- Go 1.22+ installed
-- Completed exercise 01 (select basics)
-- Understanding of blocking vs. non-blocking operations
+# 2. Select with Default
+
 
 ## Learning Objectives
 - **Use** the `default` case to make channel operations non-blocking

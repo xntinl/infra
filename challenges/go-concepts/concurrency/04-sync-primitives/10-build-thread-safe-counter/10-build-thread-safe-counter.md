@@ -1,18 +1,14 @@
-# 10. Build a Thread-Safe Counter
-
-<!--
+---
 difficulty: advanced
 concepts: [sync.Mutex, sync.RWMutex, sync/atomic, channels, benchmarking, tradeoffs]
 tools: [go]
 estimated_time: 40m
 bloom_level: create
 prerequisites: [sync.Mutex, sync.RWMutex, channels, goroutines, sync.WaitGroup]
--->
+---
 
-## Prerequisites
-- Go 1.22+ installed
-- Completed exercises 01-09 in this section
-- Understanding of `sync.Mutex`, `sync.RWMutex`, channels, and `sync/atomic`
+# 10. Build a Thread-Safe Counter
+
 
 ## Learning Objectives
 After completing this exercise, you will be able to:

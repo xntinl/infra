@@ -1,18 +1,14 @@
-# 5. Spinlock with Atomic CAS
-
-<!--
+---
 difficulty: advanced
 concepts: [spinlock, CompareAndSwapInt32, busy-wait, lock contention, sync.Mutex comparison]
 tools: [go]
 estimated_time: 40m
 bloom_level: analyze
 prerequisites: [goroutines, sync.WaitGroup, CAS, atomic Load/Store, sync.Mutex]
--->
+---
 
-## Prerequisites
-- Go 1.22+ installed
-- Completed exercises 01-03 (atomic add, load/store, CAS)
-- Understanding of `sync.Mutex` basics
+# 5. Spinlock with Atomic CAS
+
 
 ## Learning Objectives
 After completing this exercise, you will be able to:

@@ -1,18 +1,14 @@
-# 4. Worker Pool (Fixed)
-
-<!--
+---
 difficulty: intermediate
 concepts: [worker pool, job queue, result collection, goroutine lifecycle]
 tools: [go]
 estimated_time: 35m
 bloom_level: apply
 prerequisites: [goroutines, channels, sync.WaitGroup, fan-out, fan-in]
--->
+---
 
-## Prerequisites
-- Go 1.22+ installed
-- Understanding of goroutines, channels, and `sync.WaitGroup`
-- Familiarity with fan-out and fan-in patterns (exercises 02-03)
+# 4. Worker Pool (Fixed)
+
 
 ## Learning Objectives
 After completing this exercise, you will be able to:

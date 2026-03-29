@@ -1,18 +1,14 @@
-# 8. Tee-Channel: Split Stream
-
-<!--
+---
 difficulty: advanced
 concepts: [tee channel, stream splitting, nil-channel select, backpressure, data duplication]
 tools: [go]
 estimated_time: 30m
 bloom_level: analyze
 prerequisites: [goroutines, channels, select, done channel pattern, pipeline]
--->
+---
 
-## Prerequisites
-- Go 1.22+ installed
-- Strong understanding of goroutines, channels, and `select`
-- Familiarity with the done-channel and pipeline patterns (exercises 01, 06)
+# 8. Tee-Channel: Split Stream
+
 
 ## Learning Objectives
 After completing this exercise, you will be able to:

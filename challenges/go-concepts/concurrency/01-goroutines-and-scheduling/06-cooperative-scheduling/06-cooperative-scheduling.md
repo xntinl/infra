@@ -1,18 +1,14 @@
-# 6. Cooperative Scheduling
-
-<!--
+---
 difficulty: intermediate
 concepts: [scheduling points, runtime.Gosched, preemption, Go 1.14+ async preemption, tight loops, fairness]
 tools: [go]
 estimated_time: 30m
 bloom_level: analyze
 prerequisites: [01-launching-goroutines, 03-gmp-model-in-action, 05-gomaxprocs-and-parallelism]
--->
+---
 
-## Prerequisites
-- Go 1.22+ installed
-- Completed [05-gomaxprocs-and-parallelism](../05-gomaxprocs-and-parallelism/05-gomaxprocs-and-parallelism.md)
-- Understanding of GOMAXPROCS and the GMP model
+# 6. Cooperative Scheduling
+
 
 ## Learning Objectives
 After completing this exercise, you will be able to:

@@ -1,18 +1,14 @@
-# 5. Select in For Loop
-
-<!--
+---
 difficulty: intermediate
 concepts: [select, for-select, event-loop, quit-channel, goroutine-lifecycle]
 tools: [go]
 estimated_time: 25m
 bloom_level: apply
 prerequisites: [select-basics, select-with-default, channels, goroutines]
--->
+---
 
-## Prerequisites
-- Go 1.22+ installed
-- Completed exercises 01-02 (select basics, select with default)
-- Understanding of channel close semantics
+# 5. Select in For Loop
+
 
 ## Learning Objectives
 - **Build** a continuous event loop with `for` + `select`

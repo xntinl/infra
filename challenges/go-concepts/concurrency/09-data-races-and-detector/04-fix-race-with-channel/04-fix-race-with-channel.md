@@ -1,18 +1,14 @@
-# 4. Fix Race with Channel
-
-<!--
+---
 difficulty: intermediate
 concepts: [channels, ownership, share by communicating, goroutine confinement, batching]
 tools: [go]
 estimated_time: 25m
 bloom_level: apply
 prerequisites: [goroutines, channels, sync.WaitGroup, data race concept, race detector]
--->
+---
 
-## Prerequisites
-- Go 1.22+ installed
-- Completed exercises 01-03 (data races, race detector, mutex fix)
-- Understanding of Go channels (send, receive, buffered/unbuffered)
+# 4. Fix Race with Channel
+
 
 ## Learning Objectives
 After completing this exercise, you will be able to:

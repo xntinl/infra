@@ -1,18 +1,14 @@
-# 8. Nested Locking and Deadlock
-
-<!--
+---
 difficulty: advanced
 concepts: [deadlock, lock ordering, nested locking, deadlock detection, circular wait]
 tools: [go]
 estimated_time: 35m
 bloom_level: analyze
 prerequisites: [sync.Mutex, goroutines, sync.WaitGroup]
--->
+---
 
-## Prerequisites
-- Go 1.22+ installed
-- Solid understanding of `sync.Mutex` and `Lock/Unlock`
-- Understanding of goroutine scheduling
+# 8. Nested Locking and Deadlock
+
 
 ## Learning Objectives
 After completing this exercise, you will be able to:

@@ -1,18 +1,14 @@
-# 2. Context WithCancel
-
-<!--
+---
 difficulty: basic
 concepts: [context.WithCancel, cancel function, ctx.Done channel, cancellation propagation]
 tools: [go]
 estimated_time: 25m
 bloom_level: apply
 prerequisites: [context.Background, goroutines, channels basics]
--->
+---
 
-## Prerequisites
-- Go 1.22+ installed
-- Completed [01-context-background-and-todo](../01-context-background-and-todo/01-context-background-and-todo.md)
-- Familiarity with goroutines and channel receive operations (`<-ch`)
+# 2. Context WithCancel
+
 
 ## Learning Objectives
 After completing this exercise, you will be able to:

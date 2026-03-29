@@ -1,18 +1,14 @@
-# 3. Context WithTimeout
-
-<!--
+---
 difficulty: intermediate
 concepts: [context.WithTimeout, automatic cancellation, ctx.Done, ctx.Err, DeadlineExceeded, defer cancel]
 tools: [go]
 estimated_time: 25m
 bloom_level: apply
 prerequisites: [context.Background, context.WithCancel, goroutines, select]
--->
+---
 
-## Prerequisites
-- Go 1.22+ installed
-- Completed [02-context-withcancel](../02-context-withcancel/02-context-withcancel.md)
-- Understanding of `select` with channels
+# 3. Context WithTimeout
+
 
 ## Learning Objectives
 After completing this exercise, you will be able to:

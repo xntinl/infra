@@ -1,18 +1,14 @@
-# 2. Goroutine vs OS Thread
-
-<!--
+---
 difficulty: basic
 concepts: [goroutine lightweight nature, dynamic stack, OS thread comparison, runtime.NumGoroutine, runtime.MemStats]
 tools: [go]
 estimated_time: 20m
 bloom_level: understand
 prerequisites: [01-launching-goroutines]
--->
+---
 
-## Prerequisites
-- Go 1.22+ installed
-- Completed [01-launching-goroutines](../01-launching-goroutines/01-launching-goroutines.md)
-- Basic understanding of memory concepts (stack, heap, kilobytes vs megabytes)
+# 2. Goroutine vs OS Thread
+
 
 ## Learning Objectives
 After completing this exercise, you will be able to:

@@ -1,19 +1,14 @@
-# 4. Errgroup Collect Results
-
-<!--
+---
 difficulty: intermediate
 concepts: [errgroup result collection, index-based results, mutex-protected slice, pre-allocated arrays]
 tools: [go]
 estimated_time: 30m
 bloom_level: analyze
 prerequisites: [errgroup basics, sync.Mutex, slices, goroutine safety]
--->
+---
 
-## Prerequisites
-- Go 1.22+ installed
-- Completed exercise 01 (errgroup basics)
-- Understanding of `sync.Mutex` for protecting shared state
-- Knowledge of why concurrent writes to a slice are unsafe
+# 4. Errgroup Collect Results
+
 
 ## Learning Objectives
 After completing this exercise, you will be able to:

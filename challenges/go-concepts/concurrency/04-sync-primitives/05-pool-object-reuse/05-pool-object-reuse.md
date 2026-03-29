@@ -1,18 +1,14 @@
-# 5. Pool: Object Reuse
-
-<!--
+---
 difficulty: intermediate
 concepts: [sync.Pool, Get, Put, object reuse, GC pressure, buffer pooling]
 tools: [go]
 estimated_time: 30m
 bloom_level: apply
 prerequisites: [goroutines, sync.Mutex, sync.WaitGroup]
--->
+---
 
-## Prerequisites
-- Go 1.22+ installed
-- Understanding of goroutines and synchronization basics
-- Basic awareness of garbage collection in Go
+# 5. Pool: Object Reuse
+
 
 ## Learning Objectives
 After completing this exercise, you will be able to:

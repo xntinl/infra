@@ -1,18 +1,14 @@
-# 2. Channel as Synchronization
-
-<!--
+---
 difficulty: basic
 concepts: [channels, synchronization, done-channel, signaling, goroutine-coordination]
 tools: [go]
 estimated_time: 20m
 bloom_level: apply
 prerequisites: [goroutines, unbuffered-channels]
--->
+---
 
-## Prerequisites
-- Go 1.22+ installed
-- Completed exercise 01 (unbuffered channel basics)
-- Understanding of goroutine lifecycle
+# 2. Channel as Synchronization
+
 
 ## Learning Objectives
 After completing this exercise, you will be able to:

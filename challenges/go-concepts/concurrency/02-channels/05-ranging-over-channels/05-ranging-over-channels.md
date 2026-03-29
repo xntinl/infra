@@ -1,18 +1,14 @@
-# 5. Ranging Over Channels
-
-<!--
+---
 difficulty: intermediate
 concepts: [range, close, channel-iteration, deadlock, producer-consumer]
 tools: [go]
 estimated_time: 20m
 bloom_level: apply
 prerequisites: [goroutines, unbuffered-channels, buffered-channels, channel-direction]
--->
+---
 
-## Prerequisites
-- Go 1.22+ installed
-- Completed exercises 01-04 (channels basics through direction)
-- Understanding of `close()` on channels
+# 5. Ranging Over Channels
+
 
 ## Learning Objectives
 After completing this exercise, you will be able to:

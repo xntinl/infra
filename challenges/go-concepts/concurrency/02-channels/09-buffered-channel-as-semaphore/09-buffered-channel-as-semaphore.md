@@ -1,18 +1,14 @@
-# 9. Buffered Channel as Semaphore
-
-<!--
+---
 difficulty: advanced
 concepts: [semaphore, concurrency-limiting, buffered-channels, resource-management, backpressure]
 tools: [go]
 estimated_time: 30m
 bloom_level: apply
 prerequisites: [goroutines, unbuffered-channels, buffered-channels, channel-direction]
--->
+---
 
-## Prerequisites
-- Go 1.22+ installed
-- Completed exercises 01-04 (channels basics through direction)
-- Understanding of buffered channel blocking behavior
+# 9. Buffered Channel as Semaphore
+
 
 ## Learning Objectives
 After completing this exercise, you will be able to:

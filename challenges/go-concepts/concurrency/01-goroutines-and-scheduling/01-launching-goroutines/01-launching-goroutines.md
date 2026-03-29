@@ -1,18 +1,14 @@
-# 1. Launching Goroutines
-
-<!--
+---
 difficulty: basic
 concepts: [go keyword, concurrent execution, anonymous goroutines, safe argument passing, WaitGroup]
 tools: [go]
 estimated_time: 15m
 bloom_level: apply
 prerequisites: [Go basics, functions, closures]
--->
+---
 
-## Prerequisites
-- Go 1.22+ installed
-- Familiarity with Go functions and closures
-- Basic understanding of sequential program execution
+# 1. Launching Goroutines
+
 
 ## Learning Objectives
 After completing this exercise, you will be able to:

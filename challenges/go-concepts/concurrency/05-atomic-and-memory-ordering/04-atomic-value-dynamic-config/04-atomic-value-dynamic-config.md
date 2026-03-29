@@ -1,18 +1,14 @@
-# 4. Atomic Value for Dynamic Configuration
-
-<!--
+---
 difficulty: intermediate
 concepts: [atomic.Value, Store, Load, dynamic config, hot-reload, type assertion]
 tools: [go]
 estimated_time: 30m
 bloom_level: apply
 prerequisites: [goroutines, sync.WaitGroup, atomic Load/Store, structs, interfaces]
--->
+---
 
-## Prerequisites
-- Go 1.22+ installed
-- Completed exercises 01-02 (atomic add, load/store)
-- Familiarity with Go structs and type assertions
+# 4. Atomic Value for Dynamic Configuration
+
 
 ## Learning Objectives
 After completing this exercise, you will be able to:

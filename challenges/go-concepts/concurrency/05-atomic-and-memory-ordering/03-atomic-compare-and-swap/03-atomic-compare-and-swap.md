@@ -9,11 +9,6 @@ bloom_level: apply
 prerequisites: [goroutines, sync.WaitGroup, atomic.LoadInt64, atomic.StoreInt64]
 -->
 
-## Prerequisites
-- Go 1.22+ installed
-- Completed exercises 01 and 02 (atomic add, atomic load/store)
-- Understanding of why concurrent modification requires synchronization
-
 ## Learning Objectives
 After completing this exercise, you will be able to:
 - **Explain** the compare-and-swap (CAS) operation and why it is the foundation of lock-free algorithms

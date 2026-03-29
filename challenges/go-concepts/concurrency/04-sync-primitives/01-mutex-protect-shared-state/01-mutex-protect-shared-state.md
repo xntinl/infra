@@ -1,18 +1,14 @@
-# 1. Mutex: Protect Shared State
-
-<!--
+---
 difficulty: basic
 concepts: [sync.Mutex, Lock, Unlock, defer, race condition, critical section]
 tools: [go]
 estimated_time: 15m
 bloom_level: apply
 prerequisites: [goroutines, go keyword, WaitGroup basics]
--->
+---
 
-## Prerequisites
-- Go 1.22+ installed
-- Ability to launch goroutines with the `go` keyword
-- Understanding of shared memory between goroutines
+# 1. Mutex: Protect Shared State
+
 
 ## Learning Objectives
 After completing this exercise, you will be able to:

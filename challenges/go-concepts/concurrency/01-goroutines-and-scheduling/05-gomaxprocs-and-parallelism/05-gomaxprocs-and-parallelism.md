@@ -1,18 +1,14 @@
-# 5. GOMAXPROCS and Parallelism
-
-<!--
+---
 difficulty: intermediate
 concepts: [GOMAXPROCS, concurrency vs parallelism, CPU-bound vs IO-bound, wall-clock time, benchmarking]
 tools: [go]
 estimated_time: 30m
 bloom_level: analyze
 prerequisites: [01-launching-goroutines, 03-gmp-model-in-action]
--->
+---
 
-## Prerequisites
-- Go 1.22+ installed
-- Completed [03-gmp-model-in-action](../03-gmp-model-in-action/03-gmp-model-in-action.md)
-- Understanding of GMP model basics
+# 5. GOMAXPROCS and Parallelism
+
 
 ## Learning Objectives
 After completing this exercise, you will be able to:

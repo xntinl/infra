@@ -1,18 +1,14 @@
-# 9. sync.Map: Concurrent Access
-
-<!--
+---
 difficulty: intermediate
 concepts: [sync.Map, Load, Store, LoadOrStore, Delete, Range, concurrent map access]
 tools: [go]
 estimated_time: 25m
 bloom_level: apply
 prerequisites: [sync.Mutex, goroutines, sync.WaitGroup, maps]
--->
+---
 
-## Prerequisites
-- Go 1.22+ installed
-- Understanding of `sync.Mutex` and `sync.RWMutex`
-- Familiarity with Go maps and goroutines
+# 9. sync.Map: Concurrent Access
+
 
 ## Learning Objectives
 After completing this exercise, you will be able to:

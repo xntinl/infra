@@ -1,19 +1,14 @@
-# 3. Errgroup SetLimit
-
-<!--
+---
 difficulty: intermediate
 concepts: [errgroup.SetLimit, bounded concurrency, semaphore pattern, backpressure]
 tools: [go]
 estimated_time: 25m
 bloom_level: apply
 prerequisites: [errgroup basics, goroutines, channels as semaphores]
--->
+---
 
-## Prerequisites
-- Go 1.22+ installed
-- Completed exercise 01 (errgroup basics)
-- Understanding of unbounded vs bounded concurrency
-- Familiarity with the semaphore pattern (buffered channel to limit goroutines)
+# 3. Errgroup SetLimit
+
 
 ## Learning Objectives
 After completing this exercise, you will be able to:

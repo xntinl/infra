@@ -1,18 +1,14 @@
-# 4. Context WithDeadline
-
-<!--
+---
 difficulty: intermediate
 concepts: [context.WithDeadline, absolute deadline, time.Now, DeadlineExceeded, WithTimeout equivalence]
 tools: [go]
 estimated_time: 25m
 bloom_level: apply
 prerequisites: [context.Background, context.WithCancel, context.WithTimeout, time package]
--->
+---
 
-## Prerequisites
-- Go 1.22+ installed
-- Completed [03-context-withtimeout](../03-context-withtimeout/03-context-withtimeout.md)
-- Understanding of `time.Time` and `time.Now()`
+# 4. Context WithDeadline
+
 
 ## Learning Objectives
 After completing this exercise, you will be able to:

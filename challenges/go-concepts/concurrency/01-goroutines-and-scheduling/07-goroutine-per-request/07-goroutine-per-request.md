@@ -1,18 +1,14 @@
-# 7. Goroutine Per Request
-
-<!--
+---
 difficulty: intermediate
 concepts: [one-goroutine-per-task, isolation, independence, error handling, channels for results, panic recovery]
 tools: [go]
 estimated_time: 25m
 bloom_level: apply
 prerequisites: [01-launching-goroutines, 02-goroutine-vs-os-thread]
--->
+---
 
-## Prerequisites
-- Go 1.22+ installed
-- Completed [01-launching-goroutines](../01-launching-goroutines/01-launching-goroutines.md)
-- Basic understanding of channels (send and receive)
+# 7. Goroutine Per Request
+
 
 ## Learning Objectives
 After completing this exercise, you will be able to:
