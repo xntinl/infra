@@ -1,0 +1,161 @@
+# Concurrency
+
+Go's concurrency model -- built on goroutines, channels, and the select statement -- is one of the language's defining features. These 75 exercises take you from spawning your first goroutine through production-grade patterns like pipelines, rate limiters, and graceful shutdown.
+
+> 75 exercises | 9 sections | basic to advanced
+
+---
+
+## 01 - Goroutines and Scheduling
+
+Understand how Go's runtime manages lightweight threads: the GMP model, stack growth, GOMAXPROCS, and cooperative scheduling.
+
+| # | Exercise | Difficulty | Time |
+|---|----------|------------|------|
+| 1 | [Launching Goroutines](01-goroutines-and-scheduling/01-launching-goroutines/01-launching-goroutines.md) | basic | 15m |
+| 2 | [Goroutine vs OS Thread](01-goroutines-and-scheduling/02-goroutine-vs-os-thread/02-goroutine-vs-os-thread.md) | basic | 20m |
+| 3 | [GMP Model in Action](01-goroutines-and-scheduling/03-gmp-model-in-action/03-gmp-model-in-action.md) | intermediate | 30m |
+| 4 | [Goroutine Stack Growth](01-goroutines-and-scheduling/04-goroutine-stack-growth/04-goroutine-stack-growth.md) | intermediate | 30m |
+| 5 | [GOMAXPROCS and Parallelism](01-goroutines-and-scheduling/05-gomaxprocs-and-parallelism/05-gomaxprocs-and-parallelism.md) | intermediate | 30m |
+| 6 | [Cooperative Scheduling](01-goroutines-and-scheduling/06-cooperative-scheduling/06-cooperative-scheduling.md) | intermediate | 30m |
+| 7 | [Goroutine Per Request](01-goroutines-and-scheduling/07-goroutine-per-request/07-goroutine-per-request.md) | intermediate | 25m |
+| 8 | [A Million Goroutines](01-goroutines-and-scheduling/08-million-goroutines/08-million-goroutines.md) | advanced | 45m |
+
+---
+
+## 02 - Channels
+
+Master Go's primary communication mechanism: unbuffered and buffered channels, direction constraints, ranging, closing, nil behavior, and the "share memory by communicating" philosophy.
+
+| # | Exercise | Difficulty | Time |
+|---|----------|------------|------|
+| 1 | [Unbuffered Channel Basics](02-channels/01-unbuffered-channel-basics/01-unbuffered-channel-basics.md) | basic | 15m |
+| 2 | [Channel as Synchronization](02-channels/02-channel-as-synchronization/02-channel-as-synchronization.md) | basic | 20m |
+| 3 | [Buffered Channels](02-channels/03-buffered-channels/03-buffered-channels.md) | basic | 20m |
+| 4 | [Channel Direction](02-channels/04-channel-direction/04-channel-direction.md) | intermediate | 25m |
+| 5 | [Ranging Over Channels](02-channels/05-ranging-over-channels/05-ranging-over-channels.md) | intermediate | 20m |
+| 6 | [Closing Channels](02-channels/06-closing-channels/06-closing-channels.md) | intermediate | 25m |
+| 7 | [Nil Channel Behavior](02-channels/07-nil-channel-behavior/07-nil-channel-behavior.md) | intermediate | 30m |
+| 8 | [Channel of Channels](02-channels/08-channel-of-channels/08-channel-of-channels.md) | advanced | 35m |
+| 9 | [Buffered Channel as Semaphore](02-channels/09-buffered-channel-as-semaphore/09-buffered-channel-as-semaphore.md) | advanced | 30m |
+| 10 | [Channel vs Shared Memory](02-channels/10-channel-vs-shared-memory/10-channel-vs-shared-memory.md) | advanced | 35m |
+
+---
+
+## 03 - Select and Multiplexing
+
+Use Go's select statement for non-blocking operations, timeouts, priority tricks, done-channel patterns, heartbeats, and multiplexing multiple sources.
+
+| # | Exercise | Difficulty | Time |
+|---|----------|------------|------|
+| 1 | [Select Basics](03-select-and-multiplexing/01-select-basics/01-select-basics.md) | basic | 15m |
+| 2 | [Select with Default](03-select-and-multiplexing/02-select-with-default/02-select-with-default.md) | basic | 20m |
+| 3 | [Select with Timeout](03-select-and-multiplexing/03-select-with-timeout/03-select-with-timeout.md) | intermediate | 25m |
+| 4 | [Select Priority Trick](03-select-and-multiplexing/04-select-priority-trick/04-select-priority-trick.md) | intermediate | 30m |
+| 5 | [Select in For Loop](03-select-and-multiplexing/05-select-in-for-loop/05-select-in-for-loop.md) | intermediate | 25m |
+| 6 | [Done Channel Pattern](03-select-and-multiplexing/06-done-channel-pattern/06-done-channel-pattern.md) | intermediate | 25m |
+| 7 | [Heartbeat with Select](03-select-and-multiplexing/07-heartbeat-with-select/07-heartbeat-with-select.md) | advanced | 35m |
+| 8 | [Multiplexing N Sources](03-select-and-multiplexing/08-multiplexing-n-sources/08-multiplexing-n-sources.md) | advanced | 40m |
+
+---
+
+## 04 - Sync Primitives
+
+Explore the sync package: Mutex, RWMutex, WaitGroup, Once, Pool, Cond, and sync.Map. Learn when to choose locks over channels and how to avoid deadlocks.
+
+| # | Exercise | Difficulty | Time |
+|---|----------|------------|------|
+| 1 | [Mutex: Protect Shared State](04-sync-primitives/01-mutex-protect-shared-state/01-mutex-protect-shared-state.md) | basic | 15m |
+| 2 | [RWMutex: Readers-Writers](04-sync-primitives/02-rwmutex-readers-writers/02-rwmutex-readers-writers.md) | intermediate | 30m |
+| 3 | [WaitGroup: Wait for All](04-sync-primitives/03-waitgroup-wait-for-all/03-waitgroup-wait-for-all.md) | basic | 20m |
+| 4 | [Once: Singleton Initialization](04-sync-primitives/04-once-singleton-init/04-once-singleton-init.md) | intermediate | 25m |
+| 5 | [Pool: Object Reuse](04-sync-primitives/05-pool-object-reuse/05-pool-object-reuse.md) | intermediate | 30m |
+| 6 | [Cond: Signal and Broadcast](04-sync-primitives/06-cond-signal-broadcast/06-cond-signal-broadcast.md) | advanced | 35m |
+| 7 | [Mutex vs Channel: Decision Criteria](04-sync-primitives/07-mutex-vs-channel-decision/07-mutex-vs-channel-decision.md) | intermediate | 25m |
+| 8 | [Nested Locking and Deadlock](04-sync-primitives/08-nested-locking-deadlock/08-nested-locking-deadlock.md) | advanced | 35m |
+| 9 | [sync.Map: Concurrent Access](04-sync-primitives/09-sync-map-concurrent-access/09-sync-map-concurrent-access.md) | intermediate | 25m |
+| 10 | [Build a Thread-Safe Counter](04-sync-primitives/10-build-thread-safe-counter/10-build-thread-safe-counter.md) | advanced | 40m |
+
+---
+
+## 05 - Atomic and Memory Ordering
+
+Work with the sync/atomic package for lock-free programming: Add, Load/Store, CompareAndSwap, atomic.Value, spinlocks, and happens-before semantics.
+
+| # | Exercise | Difficulty | Time |
+|---|----------|------------|------|
+| 1 | [Atomic Add Counter](05-atomic-and-memory-ordering/01-atomic-add-counter/01-atomic-add-counter.md) | basic | 20m |
+| 2 | [Atomic Load and Store](05-atomic-and-memory-ordering/02-atomic-load-store/02-atomic-load-store.md) | intermediate | 25m |
+| 3 | [Atomic Compare-And-Swap](05-atomic-and-memory-ordering/03-atomic-compare-and-swap/03-atomic-compare-and-swap.md) | intermediate | 30m |
+| 4 | [Atomic Value for Dynamic Configuration](05-atomic-and-memory-ordering/04-atomic-value-dynamic-config/04-atomic-value-dynamic-config.md) | intermediate | 30m |
+| 5 | [Spinlock with Atomic CAS](05-atomic-and-memory-ordering/05-spinlock-with-atomic/05-spinlock-with-atomic.md) | advanced | 40m |
+| 6 | [Happens-Before Guarantees](05-atomic-and-memory-ordering/06-happens-before-guarantees/06-happens-before-guarantees.md) | advanced | 35m |
+| 7 | [Atomic vs Mutex Benchmark](05-atomic-and-memory-ordering/07-atomic-vs-mutex-benchmark/07-atomic-vs-mutex-benchmark.md) | advanced | 35m |
+
+---
+
+## 06 - Context
+
+Learn the context package for cancellation, timeouts, deadlines, and value propagation across API boundaries and goroutine trees.
+
+| # | Exercise | Difficulty | Time |
+|---|----------|------------|------|
+| 1 | [Context Background and TODO](06-context/01-context-background-and-todo/01-context-background-and-todo.md) | basic | 15m |
+| 2 | [Context WithCancel](06-context/02-context-withcancel/02-context-withcancel.md) | basic | 25m |
+| 3 | [Context WithTimeout](06-context/03-context-withtimeout/03-context-withtimeout.md) | intermediate | 25m |
+| 4 | [Context WithDeadline](06-context/04-context-withdeadline/04-context-withdeadline.md) | intermediate | 25m |
+| 5 | [Context WithValue](06-context/05-context-withvalue/05-context-withvalue.md) | intermediate | 30m |
+| 6 | [Context Propagation Chain](06-context/06-context-propagation-chain/06-context-propagation-chain.md) | intermediate | 30m |
+| 7 | [Context-Aware Long Worker](06-context/07-context-aware-long-worker/07-context-aware-long-worker.md) | advanced | 35m |
+| 8 | [Graceful Shutdown with Context](06-context/08-graceful-shutdown-with-context/08-graceful-shutdown-with-context.md) | advanced | 40m |
+
+---
+
+## 07 - Concurrency Patterns
+
+Implement the classic Go concurrency patterns: pipelines, fan-out/fan-in, worker pools, semaphores, generators, or-channel, tee-channel, and rate limiters.
+
+| # | Exercise | Difficulty | Time |
+|---|----------|------------|------|
+| 1 | [Pipeline Pattern](07-concurrency-patterns/01-pipeline-pattern/01-pipeline-pattern.md) | intermediate | 30m |
+| 2 | [Fan-Out: Distribute Work](07-concurrency-patterns/02-fan-out-distribute-work/02-fan-out-distribute-work.md) | intermediate | 30m |
+| 3 | [Fan-In: Merge Results](07-concurrency-patterns/03-fan-in-merge-results/03-fan-in-merge-results.md) | intermediate | 30m |
+| 4 | [Worker Pool (Fixed)](07-concurrency-patterns/04-worker-pool-fixed/04-worker-pool-fixed.md) | intermediate | 35m |
+| 5 | [Semaphore: Bounded Concurrency](07-concurrency-patterns/05-semaphore-bounded-concurrency/05-semaphore-bounded-concurrency.md) | intermediate | 30m |
+| 6 | [Generator: Lazy Production](07-concurrency-patterns/06-generator-lazy-production/06-generator-lazy-production.md) | intermediate | 25m |
+| 7 | [Or-Channel: First to Finish](07-concurrency-patterns/07-or-channel-first-to-finish/07-or-channel-first-to-finish.md) | advanced | 35m |
+| 8 | [Tee-Channel: Split Stream](07-concurrency-patterns/08-tee-channel-split-stream/08-tee-channel-split-stream.md) | advanced | 30m |
+| 9 | [Rate Limiter: Token Bucket](07-concurrency-patterns/09-rate-limiter-token-bucket/09-rate-limiter-token-bucket.md) | advanced | 35m |
+| 10 | [End-to-End Pipeline with Cancellation](07-concurrency-patterns/10-end-to-end-pipeline-with-cancel/10-end-to-end-pipeline-with-cancel.md) | advanced | 45m |
+
+---
+
+## 08 - Errgroup
+
+Use golang.org/x/sync/errgroup for structured concurrency with error propagation, context-aware groups, concurrency limits, and result collection.
+
+| # | Exercise | Difficulty | Time |
+|---|----------|------------|------|
+| 1 | [Errgroup Basics](08-errgroup/01-errgroup-basics/01-errgroup-basics.md) | basic | 20m |
+| 2 | [Errgroup with Context](08-errgroup/02-errgroup-with-context/02-errgroup-with-context.md) | intermediate | 30m |
+| 3 | [Errgroup SetLimit](08-errgroup/03-errgroup-setlimit/03-errgroup-setlimit.md) | intermediate | 25m |
+| 4 | [Errgroup Collect Results](08-errgroup/04-errgroup-collect-results/04-errgroup-collect-results.md) | intermediate | 30m |
+| 5 | [Errgroup vs WaitGroup](08-errgroup/05-errgroup-vs-waitgroup/05-errgroup-vs-waitgroup.md) | intermediate | 25m |
+| 6 | [Errgroup Parallel Pipeline](08-errgroup/06-errgroup-parallel-pipeline/06-errgroup-parallel-pipeline.md) | advanced | 40m |
+
+---
+
+## 09 - Data Races and Detector
+
+Learn to identify, detect, and fix data races using Go's race detector, mutexes, channels, atomics, and race-free design patterns.
+
+| # | Exercise | Difficulty | Time |
+|---|----------|------------|------|
+| 1 | [Your First Data Race](09-data-races-and-detector/01-your-first-data-race/01-your-first-data-race.md) | basic | 20m |
+| 2 | [Race Detector Flag](09-data-races-and-detector/02-race-detector-flag/02-race-detector-flag.md) | basic | 20m |
+| 3 | [Fix Race with Mutex](09-data-races-and-detector/03-fix-race-with-mutex/03-fix-race-with-mutex.md) | intermediate | 25m |
+| 4 | [Fix Race with Channel](09-data-races-and-detector/04-fix-race-with-channel/04-fix-race-with-channel.md) | intermediate | 25m |
+| 5 | [Fix Race with Atomic](09-data-races-and-detector/05-fix-race-with-atomic/05-fix-race-with-atomic.md) | intermediate | 25m |
+| 6 | [Subtle Race: Map Access](09-data-races-and-detector/06-subtle-race-map-access/06-subtle-race-map-access.md) | intermediate | 30m |
+| 7 | [Race in Closure Loops](09-data-races-and-detector/07-race-in-closure-loops/07-race-in-closure-loops.md) | intermediate | 25m |
+| 8 | [Race-Free Design Patterns](09-data-races-and-detector/08-race-free-design-patterns/08-race-free-design-patterns.md) | advanced | 40m |
