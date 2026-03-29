@@ -11,15 +11,15 @@ func main() {
 	var buf bytes.Buffer
 	buf.WriteString("Hello, ")
 	buf.WriteString("world!")
-	buf.Println(buf.String())
+	fmt.Println(buf.String())
 
 	var mu sync.Mutex
 	mu.Lock()
 	fmt.Println("Lock acquired")
-	mu.UnLock()
+	mu.Unlock()
 	
 
-	var items []String
+	var items []string
 	items = append(items,"first")
 	items = append(items,"second")
 	fmt.Println(items)
