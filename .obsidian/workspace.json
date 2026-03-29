@@ -210,6 +210,7 @@
   },
   "active": "5e7b140048226118",
   "lastOpenFiles": [
+    "challenges/programming-challenges/03-insane/147-service-mesh-sidecar-proxy/SOLUTION.md",
     "challenges/programming-challenges/03-insane/130-embedded-database-nosql/SOLUTION.md",
     "challenges/programming-challenges/01-intermediate-advanced/72-csv-parser-streaming/README.md",
     "challenges/go/04-functions/01-function-declaration-and-multiple-return-values/function-declaration-and-multiple-return-values.md",
@@ -245,7 +246,6 @@
     "challenges/programming-challenges/03-insane/145-property-testing-shrinking-engine/SOLUTION.md",
     "challenges/programming-challenges/03-insane/139-register-allocator-graph-coloring/SOLUTION.md",
     "challenges/programming-challenges/03-insane/138-embedded-rtos-kernel-nostd/SOLUTION.md",
-    "challenges/programming-challenges/03-insane/125-video-codec-h264-baseline/SOLUTION.md",
     "Presentacion/poc-just/web/node_modules/ordered-binary/assets/powers-dre.png",
     "Presentacion/poc-just/web/node_modules/retry/equation.gif",
     "Untitled.canvas"
