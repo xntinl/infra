@@ -13,12 +13,12 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "challenges/go/02-variables-types-and-constants/02-zero-values-and-default-initialization/02-zero-values-and-default-initialization.md",
+                "file": "challenges/programming-challenges/01-intermediate-advanced/72-csv-parser-streaming/README.md",
                 "mode": "source",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "02-zero-values-and-default-initialization"
+              "title": "README"
             }
           }
         ]
@@ -210,6 +210,17 @@
   },
   "active": "5e7b140048226118",
   "lastOpenFiles": [
+    "challenges/go/04-functions/01-function-declaration-and-multiple-return-values/function-declaration-and-multiple-return-values.md",
+    "challenges/programming-challenges/03-insane/150-optimizing-compiler-ssa-form/README.md",
+    "challenges/programming-challenges/03-insane/140-linker-elf-object-files/README.md",
+    "challenges/programming-challenges/03-insane/149-chaos-engineering-fault-injector/README.md",
+    "challenges/programming-challenges/03-insane/133-afl-style-mutation-fuzzer/README.md",
+    "challenges/programming-challenges/03-insane/132-audio-synthesis-daw-engine/README.md",
+    "challenges/programming-challenges/03-insane/147-service-mesh-sidecar-proxy/README.md",
+    "challenges/programming-challenges/03-insane/130-embedded-database-nosql/README.md",
+    "challenges/go/03-control-flow/01-if-else-and-init-statements/01-if-else-and-init-statements.md",
+    "challenges/go/02-variables-types-and-constants/03-basic-types/03-basic-types.md",
+    "challenges/go/02-variables-types-and-constants/02-zero-values-and-default-initialization/02-zero-values-and-default-initialization.md",
     "challenges/go/02-variables-types-and-constants/05-type-conversions-and-type-assertions/useful_zero_values.go",
     "challenges/go/02-variables-types-and-constants/05-type-conversions-and-type-assertions/zero_values_arrays.go",
     "challenges/go/02-variables-types-and-constants/05-type-conversions-and-type-assertions/zero_values_structs.go",
@@ -221,7 +232,6 @@
     "challenges/go/02-variables-types-and-constants/01-variable-declaration-and-short-assignment/declaration.go",
     "challenges/go/02-variables-types-and-constants/01-variable-declaration-and-short-assignment/multiple-declaration.go",
     "challenges/go/02-variables-types-and-constants/01-variable-declaration-and-short-assignment/mutliple-declaration.go",
-    "challenges/go/02-variables-types-and-constants/01-variable-declaration-and-short-assignment/main.go",
     "challenges/go/01-environment-and-tooling/08-cross-compilation-and-build-tags/08-cross-compilation-and-build-tags.md",
     "challenges/go/01-environment-and-tooling/07-debugging-with-delve/07-debugging-with-delve.md",
     "challenges/go/01-environment-and-tooling/06-linting-with-golangci-lint/06-linting-with-golangci-lint.md",
@@ -236,16 +246,6 @@
     "challenges/programming-challenges/03-insane/125-video-codec-h264-baseline/SOLUTION.md",
     "challenges/programming-challenges/03-insane/148-persistent-data-structures-immutable/README.md",
     "challenges/programming-challenges/02-advanced/111-reverse-proxy-tls-termination/SOLUTION.md",
-    "challenges/programming-challenges/02-advanced/98-time-series-database-engine/SOLUTION.md",
-    "challenges/programming-challenges/03-insane/122-container-runtime-from-scratch/SOLUTION.md",
-    "challenges/programming-challenges/03-insane/146-effect-system-algebraic/SOLUTION.md",
-    "challenges/programming-challenges/03-insane/139-register-allocator-graph-coloring/README.md",
-    "challenges/programming-challenges/02-advanced/111-reverse-proxy-tls-termination/README.md",
-    "challenges/programming-challenges/03-insane/141-observability-platform-pipeline/README.md",
-    "challenges/programming-challenges/02-advanced/98-time-series-database-engine/README.md",
-    "challenges/programming-challenges/03-insane/134-garbage-collector-generational/SOLUTION.md",
-    "challenges/programming-challenges/03-insane/145-property-testing-shrinking-engine/README.md",
-    "challenges/programming-challenges/03-insane/138-embedded-rtos-kernel-nostd/README.md",
     "Presentacion/poc-just/web/node_modules/ordered-binary/assets/powers-dre.png",
     "Presentacion/poc-just/web/node_modules/retry/equation.gif",
     "Untitled.canvas"
