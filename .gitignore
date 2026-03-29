@@ -1,4 +1,147 @@
+# ========================
+# OS & Editor
+# ========================
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+*.iml
+.project
+.classpath
+.settings/
+
+# ========================
+# Terraform
+# ========================
 .terraform/
 *.tfstate
 *.tfstate.backup
+*.tfstate.*.backup
 .terraform.lock.hcl
+crash.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+*.tfvars
+!*.tfvars.example
+
+# ========================
+# Rust
+# ========================
+target/
+**/*.rs.bk
+Cargo.lock
+# Keep Cargo.lock for binaries, uncomment above for libraries
+
+# ========================
+# Go
+# ========================
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+vendor/
+
+# ========================
+# TypeScript / JavaScript / Node.js
+# ========================
+node_modules/
+dist/
+build/
+*.js.map
+*.tsbuildinfo
+.next/
+.nuxt/
+.output/
+.cache/
+.parcel-cache/
+.turbo/
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+.env
+.env.*
+!.env.example
+
+# ========================
+# Java / Kotlin / JVM
+# ========================
+*.class
+*.jar
+*.war
+*.ear
+*.nar
+hs_err_pid*
+replay_pid*
+.gradle/
+build/
+out/
+.mvn/wrapper/maven-wrapper.jar
+
+# ========================
+# Python
+# ========================
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+.eggs/
+.venv/
+venv/
+env/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+htmlcov/
+.coverage
+*.whl
+
+# ========================
+# C / C++
+# ========================
+*.o
+*.obj
+*.a
+*.lib
+*.lo
+*.la
+*.lai
+*.mod
+*.dSYM/
+
+# ========================
+# Docker
+# ========================
+.docker/
+
+# ========================
+# Secrets & credentials
+# ========================
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.cer
+secrets/
+credentials.json
+
+# ========================
+# Logs & temp
+# ========================
+*.log
+tmp/
+temp/
+
+# ========================
+# Obsidian (vault metadata)
+# ========================
+.obsidian/
