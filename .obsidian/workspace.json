@@ -225,6 +225,7 @@
   },
   "active": "caa0937ea8cbd901",
   "lastOpenFiles": [
+    "challenges/go-concepts/concurrency/02-channels/01-unbuffered-channel-basics/channels_typed.go",
     "challenges/go-concepts/concurrency/02-channels/01-unbuffered-channel-basics/multiple_values.go",
     "challenges/go-concepts/concurrency/02-channels/01-unbuffered-channel-basics/create_channel.go",
     "challenges/go-concepts/concurrency/01-goroutines-and-scheduling/04-goroutine-stack-growth/04-goroutine-stack-growth.md",
@@ -241,7 +242,6 @@
     "README.md",
     "vim",
     "Untitled 1",
-    "Untitled",
     "challenges/go-concepts/concurrency/concurrency.md",
     "challenges/go-concepts/go-concepts.md",
     "challenges/go-concepts/concurrency/02-channels/01-unbuffered-channel-basics/01-unbuffered-channel-basics.md",
