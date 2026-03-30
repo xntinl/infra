@@ -225,6 +225,7 @@
   },
   "active": "caa0937ea8cbd901",
   "lastOpenFiles": [
+    "challenges/go-concepts/concurrency/02-channels/01-unbuffered-channel-basics/create_channel.go",
     "challenges/go-concepts/concurrency/01-goroutines-and-scheduling/04-goroutine-stack-growth/04-goroutine-stack-growth.md",
     "challenges/go-concepts/concurrency/01-goroutines-and-scheduling/03-gmp-model-in-action/03-gmp-model-in-action.md",
     "challenges/go-concepts/concurrency/01-goroutines-and-scheduling/02-goroutine-vs-os-thread/02-goroutine-vs-os-thread.md",
@@ -260,7 +261,6 @@
     "challenges/go-concepts/concurrency/09-data-races-and-detector/07-race-in-closure-loops/07-race-in-closure-loops.md",
     "challenges/go-concepts/concurrency/01-goroutines-and-scheduling/07-goroutine-per-request/07-goroutine-per-request.md",
     "challenges/go-concepts/concurrency/07-concurrency-patterns/07-or-channel-first-to-finish/07-or-channel-first-to-finish.md",
-    "challenges/go-concepts/concurrency/04-sync-primitives/07-mutex-vs-channel-decision/07-mutex-vs-channel-decision.md",
     "Presentacion/poc-just/web/node_modules/ordered-binary/assets/powers-dre.png",
     "Presentacion/poc-just/web/node_modules/retry/equation.gif",
     "Untitled.canvas"
