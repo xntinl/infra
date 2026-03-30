@@ -313,7 +313,8 @@ func main() {
 	done := make(chan struct{})
 	defer close(done)
 
-	fmt.Println("=== Buffered Tee: Decoupling Slow Consumer ===\n")
+	fmt.Println("=== Buffered Tee: Decoupling Slow Consumer ===")
+	fmt.Println()
 
 	events := make(chan Event)
 	go func() {

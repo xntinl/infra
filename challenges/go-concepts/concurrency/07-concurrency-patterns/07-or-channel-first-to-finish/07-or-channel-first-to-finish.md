@@ -54,7 +54,8 @@ type QueryResult struct {
 }
 
 func main() {
-	fmt.Println("=== Database Replica Race ===\n")
+	fmt.Println("=== Database Replica Race ===")
+	fmt.Println()
 
 	replicas := []string{"us-east-1", "us-west-2", "eu-west-1"}
 	ch := make(chan QueryResult, len(replicas))
@@ -138,7 +139,8 @@ func queryReplica(ctx context.Context, replica string) (QueryResult, error) {
 }
 
 func main() {
-	fmt.Println("=== Replica Race with Cancellation ===\n")
+	fmt.Println("=== Replica Race with Cancellation ===")
+	fmt.Println()
 
 	replicas := []string{"us-east-1", "us-west-2", "eu-west-1"}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -227,7 +229,8 @@ func main() {
 	const iterations = 100
 
 	// Single replica: take whatever latency you get
-	fmt.Println("=== Tail Latency Comparison (100 queries) ===\n")
+	fmt.Println("=== Tail Latency Comparison (100 queries) ===")
+	fmt.Println()
 	singleLatencies := make([]time.Duration, iterations)
 	for i := 0; i < iterations; i++ {
 		ctx := context.Background()
@@ -344,7 +347,8 @@ func replicaSignal(replica string, latency time.Duration) <-chan struct{} {
 }
 
 func main() {
-	fmt.Println("=== Or-Channel: First Replica Wins ===\n")
+	fmt.Println("=== Or-Channel: First Replica Wins ===")
+	fmt.Println()
 
 	start := time.Now()
 	<-or(

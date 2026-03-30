@@ -402,7 +402,8 @@ func queryPages(ctx context.Context, query string, pageSize int) <-chan Page {
 }
 
 func main() {
-	fmt.Println("=== Paginated Query with Context ===\n")
+	fmt.Println("=== Paginated Query with Context ===")
+	fmt.Println()
 
 	// Cancel after 2 pages using a timeout
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)

@@ -388,7 +388,6 @@ package main
 
 import (
 	"fmt"
-	"strings"
 	"sync"
 	"time"
 )
@@ -611,14 +610,6 @@ func main() {
 func containsKey(m map[string]string, key string) bool {
 	_, ok := m[key]
 	return ok
-}
-
-func formatHeaders(h map[string]string) string {
-	parts := make([]string, 0, len(h))
-	for k, v := range h {
-		parts = append(parts, k+"="+v)
-	}
-	return strings.Join(parts, ", ")
 }
 ```
 

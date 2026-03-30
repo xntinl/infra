@@ -120,8 +120,6 @@ func main() {
 	results := make([]QueryResult, len(queries)) // pre-allocate exact size
 
 	var wg sync.WaitGroup
-	var once sync.Once
-	var firstErr error
 
 	for i, q := range queries {
 		i, q := i, q
@@ -144,11 +142,6 @@ func main() {
 
 	wg.Wait()
 	elapsed := time.Since(start).Round(time.Millisecond)
-
-	if firstErr != nil {
-		fmt.Printf("Error: %v\n", firstErr)
-	}
-	_ = firstErr
 
 	fmt.Printf("\nDashboard Data (loaded in %v):\n", elapsed)
 	for _, r := range results {
@@ -222,8 +215,6 @@ func main() {
 	var allMetrics []Metric
 
 	var wg sync.WaitGroup
-	var once sync.Once
-	var firstErr error
 
 	for _, src := range sources {
 		src := src
@@ -245,8 +236,6 @@ func main() {
 
 	wg.Wait()
 	elapsed := time.Since(start).Round(time.Millisecond)
-	_ = once
-	_ = firstErr
 
 	fmt.Printf("Collected %d metrics from %d sources in %v:\n", len(allMetrics), len(sources), elapsed)
 	for _, m := range allMetrics {
@@ -413,8 +402,6 @@ func main() {
 	regionData := make(map[string]RegionStats)
 
 	var wg sync.WaitGroup
-	var once sync.Once
-	var firstErr error
 
 	for _, region := range regions {
 		region := region
@@ -448,8 +435,6 @@ func main() {
 
 	wg.Wait()
 	elapsed := time.Since(start).Round(time.Millisecond)
-	_ = once
-	_ = firstErr
 
 	fmt.Printf("Regional breakdown (loaded in %v):\n", elapsed)
 	var totalRevenue float64

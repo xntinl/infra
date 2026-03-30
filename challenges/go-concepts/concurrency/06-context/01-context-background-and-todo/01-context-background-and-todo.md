@@ -84,7 +84,7 @@ go run main.go
 ```
 Expected output:
 ```
-Root context type:   *context.emptyCtx
+Root context type:   context.backgroundCtx
 Root context string: context.Background
 Root context Err:    <nil>
 Root context Done:   <nil> (nil = never cancelled)

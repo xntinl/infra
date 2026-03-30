@@ -448,14 +448,24 @@ func validateConfigs(configs []string) error {
 				return
 			default:
 			}
-			time.Sleep(60 * time.Millisecond)
+			if err := validateConfig(cfg); err != nil {
+				once.Do(func() {
+					firstErr = err
+					cancel()
+				})
+				return
+			}
 			fmt.Printf("  Validated: %s\n", cfg)
 		}()
 	}
 
 	wg.Wait()
-	_ = once
 	return firstErr
+}
+
+func validateConfig(name string) error {
+	time.Sleep(60 * time.Millisecond)
+	return nil // all configs valid in this scenario
 }
 
 func notifyAll(recipients []string) {

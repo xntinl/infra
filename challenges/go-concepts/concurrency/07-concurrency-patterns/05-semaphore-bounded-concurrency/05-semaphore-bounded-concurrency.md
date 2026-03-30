@@ -79,7 +79,8 @@ func fetchProfile(userID int) (UserProfile, error) {
 
 func main() {
 	fmt.Println("=== Unbounded Concurrency (NO semaphore) ===")
-	fmt.Println("  Launching 30 goroutines with no limit...\n")
+	fmt.Println("  Launching 30 goroutines with no limit...")
+	fmt.Println()
 
 	var wg sync.WaitGroup
 	var successes, failures int64

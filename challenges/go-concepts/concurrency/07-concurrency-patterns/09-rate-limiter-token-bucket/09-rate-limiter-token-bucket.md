@@ -54,7 +54,8 @@ import (
 )
 
 func main() {
-	fmt.Println("=== Basic API Rate Limiter (5 req/sec) ===\n")
+	fmt.Println("=== Basic API Rate Limiter (5 req/sec) ===")
+	fmt.Println()
 
 	limiter := time.NewTicker(200 * time.Millisecond)
 	defer limiter.Stop()
@@ -118,7 +119,8 @@ import (
 )
 
 func main() {
-	fmt.Println("=== Token Bucket with Burst (rate=10/sec, burst=3) ===\n")
+	fmt.Println("=== Token Bucket with Burst (rate=10/sec, burst=3) ===")
+	fmt.Println()
 
 	const rate = 100 * time.Millisecond // 10 per second
 	const burstCapacity = 3
@@ -242,7 +244,8 @@ func (rl *RateLimiter) Stop() {
 }
 
 func main() {
-	fmt.Println("=== Rate Limiter: Blocking vs Non-Blocking ===\n")
+	fmt.Println("=== Rate Limiter: Blocking vs Non-Blocking ===")
+	fmt.Println()
 
 	// Blocking mode: queue requests
 	fmt.Println("--- Blocking (Wait) ---")
@@ -365,7 +368,8 @@ func (rl *RateLimiter) Wait()        { <-rl.tokens }
 func (rl *RateLimiter) Stop()        { rl.ticker.Stop(); close(rl.stop) }
 
 func main() {
-	fmt.Println("=== Rate-Limited API Server (10 req/sec, burst=3, 20 handlers) ===\n")
+	fmt.Println("=== Rate-Limited API Server (10 req/sec, burst=3, 20 handlers) ===")
+	fmt.Println()
 
 	rl := NewRateLimiter(100*time.Millisecond, 3)
 	defer rl.Stop()

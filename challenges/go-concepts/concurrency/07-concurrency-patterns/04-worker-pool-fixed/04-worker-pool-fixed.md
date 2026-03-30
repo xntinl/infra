@@ -367,7 +367,8 @@ func thumbnailWorker(id int, jobs <-chan ImageJob, wg *sync.WaitGroup) {
 
 func main() {
 	fmt.Println("=== Backpressure Demo (2 workers, buffer=1) ===")
-	fmt.Println("  Producer blocks when both workers are busy and buffer is full\n")
+	fmt.Println("  Producer blocks when both workers are busy and buffer is full")
+	fmt.Println()
 
 	jobs := make(chan ImageJob, 1) // tiny buffer
 	var wg sync.WaitGroup

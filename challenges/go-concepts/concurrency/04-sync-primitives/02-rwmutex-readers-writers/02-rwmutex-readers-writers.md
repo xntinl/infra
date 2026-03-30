@@ -131,7 +131,7 @@ The basic operations test should print correct settings and feature flag states.
 
 ## Step 2 -- Demonstrate Concurrent Readers
 
-In production, many goroutines check feature flags simultaneously. With `RLock`, they all proceed in parallel instead of waiting for each other:
+In production, many goroutines check feature flags simultaneously. With `RLock`, they all proceed in parallel instead of waiting for each other. To show the difference, this example holds the read lock for the full duration of simulated work. With a regular `Mutex`, this would serialize all 10 handlers; with `RWMutex`, they run concurrently:
 
 ```go
 package main
@@ -151,11 +151,15 @@ func NewConfigStore() *ConfigStore {
 	return &ConfigStore{settings: make(map[string]string)}
 }
 
-func (cs *ConfigStore) Get(key string) (string, bool) {
+// GetAndProcess simulates reading config and doing work while holding the read lock.
+// In real code, you would release the lock sooner. This exaggerates the effect to
+// demonstrate that multiple readers can hold an RLock simultaneously.
+func (cs *ConfigStore) GetAndProcess(key string) string {
 	cs.mu.RLock()
 	defer cs.mu.RUnlock()
-	val, ok := cs.settings[key]
-	return val, ok
+	val := cs.settings[key]
+	time.Sleep(100 * time.Millisecond) // simulate work while holding the lock
+	return val
 }
 
 func (cs *ConfigStore) Set(key, value string) {
@@ -175,8 +179,7 @@ func main() {
 		wg.Add(1)
 		go func(handlerID int) {
 			defer wg.Done()
-			val, _ := cs.Get("feature.dark_mode")
-			time.Sleep(100 * time.Millisecond) // simulate handler doing work after reading config
+			val := cs.GetAndProcess("feature.dark_mode")
 			fmt.Printf("Handler %d: dark_mode=%s (at %v)\n", handlerID, val, time.Since(start).Round(time.Millisecond))
 		}(i)
 	}
@@ -184,7 +187,8 @@ func main() {
 	wg.Wait()
 	elapsed := time.Since(start)
 	fmt.Printf("\nAll 10 handlers finished in %v\n", elapsed.Round(time.Millisecond))
-	fmt.Println("(With a regular Mutex, this would take ~1s. With RWMutex, ~100ms because all readers run concurrently.)")
+	fmt.Println("(With a regular Mutex, this would take ~1s because only one goroutine holds the lock at a time.)")
+	fmt.Println("(With RWMutex, ~100ms because all readers hold RLock simultaneously.)")
 }
 ```
 
@@ -194,14 +198,15 @@ Handler 0: dark_mode=true (at 100ms)
 Handler 1: dark_mode=true (at 100ms)
 ...
 All 10 handlers finished in 100ms
-(With a regular Mutex, this would take ~1s. With RWMutex, ~100ms because all readers run concurrently.)
+(With a regular Mutex, this would take ~1s because only one goroutine holds the lock at a time.)
+(With RWMutex, ~100ms because all readers hold RLock simultaneously.)
 ```
 
 ### Intermediate Verification
 ```bash
 go run main.go
 ```
-All 10 handlers should finish in approximately 100ms, proving they ran concurrently (not serialized to ~1s).
+All 10 handlers should finish in approximately 100ms, proving they ran concurrently. With a regular `Mutex` and the lock held during the sleep, this would take ~1s because each handler would wait for the previous one to release the lock.
 
 ## Step 3 -- Config Reload Blocks All Readers
 

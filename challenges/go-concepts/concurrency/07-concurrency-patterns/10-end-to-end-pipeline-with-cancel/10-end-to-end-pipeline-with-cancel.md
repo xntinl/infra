@@ -432,7 +432,8 @@ func main() {
 		}
 	}()
 
-	fmt.Println("=== Fan-Out Enrichment (3 workers, 15 records) ===\n")
+	fmt.Println("=== Fan-Out Enrichment (3 workers, 15 records) ===")
+	fmt.Println()
 	start := time.Now()
 
 	validated := validate(ctx, in)
@@ -658,7 +659,8 @@ func main() {
 	}
 
 	// ========== Run 1: Complete import (no cancellation) ==========
-	fmt.Println("=== Complete Import (30 records) ===\n")
+	fmt.Println("=== Complete Import (30 records) ===")
+	fmt.Println()
 	ctx1 := context.Background()
 	start := time.Now()
 
@@ -692,7 +694,8 @@ func main() {
 	}
 
 	// ========== Run 2: User cancels import after 100ms ==========
-	fmt.Println("=== Canceled Import (user cancels after 100ms) ===\n")
+	fmt.Println("=== Canceled Import (user cancels after 100ms) ===")
+	fmt.Println()
 	ctx2, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 	start = time.Now()

@@ -117,13 +117,6 @@ func main() {
 	fmt.Printf("  Sequential would have taken: ~%v\n",
 		time.Duration(requestCount*50)*time.Millisecond)
 }
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
 ```
 
 **What's happening here:** Eight simulated HTTP requests arrive via a channel. Each is handled in its own goroutine -- exactly how Go's `net/http` server works. Each handler parses the request, queries a simulated database, and formats a response. The buffered channel holds results without blocking the senders.
@@ -234,13 +227,6 @@ func main() {
 	fmt.Printf("\n  Summary: %d succeeded, %d failed out of %d endpoints\n",
 		successes, failures, len(endpoints))
 }
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
 ```
 
 **What's happening here:** The `APIResult` struct carries both success data and error information. Each goroutine calls an endpoint and returns a result regardless of success or failure. Some endpoints randomly fail (simulating real-world flaky services).
@@ -296,11 +282,10 @@ func main() {
 			}
 		}()
 
-		// Request 3 has a bug: nil pointer dereference
+		// Request 3 has a bug: write to nil map
 		if reqID == 3 {
 			var m map[string]string
-			_ = m["key"] // panic: nil map access in a handler with a bug
-			panic("unreachable")
+			m["key"] = "value" // panic: assignment to entry in nil map
 		}
 
 		// Request 7 has a different bug: index out of bounds

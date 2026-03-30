@@ -372,7 +372,8 @@ func mergeRanked(channels ...<-chan RankedResult) <-chan RankedResult {
 }
 
 func main() {
-	fmt.Println("=== Fan-Out/Fan-In: Search Ranking Pipeline ===\n")
+	fmt.Println("=== Fan-Out/Fan-In: Search Ranking Pipeline ===")
+	fmt.Println()
 
 	start := time.Now()
 	input := generateResults()
