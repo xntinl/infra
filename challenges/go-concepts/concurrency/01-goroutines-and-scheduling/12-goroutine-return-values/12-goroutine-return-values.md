@@ -130,8 +130,10 @@ func main() {
 		"MegaStore", "ValueMart", "PremiumGoods", "BudgetDirect", "TechSupply",
 	}
 
-	fmt.Println("=== Price Comparison: Channel Pattern ===\n")
-	fmt.Println("  Product: Wireless Keyboard\n")
+	fmt.Println("=== Price Comparison: Channel Pattern ===")
+	fmt.Println()
+	fmt.Println("  Product: Wireless Keyboard")
+	fmt.Println()
 
 	start := time.Now()
 	compareWithChannels("Wireless Keyboard", suppliers)
@@ -285,8 +287,10 @@ func main() {
 		"MegaStore", "ValueMart", "PremiumGoods", "BudgetDirect", "TechSupply",
 	}
 
-	fmt.Println("=== Price Comparison: Mutex Pattern ===\n")
-	fmt.Println("  Product: USB-C Hub\n")
+	fmt.Println("=== Price Comparison: Mutex Pattern ===")
+	fmt.Println()
+	fmt.Println("  Product: USB-C Hub")
+	fmt.Println()
 
 	start := time.Now()
 	compareWithMutex("USB-C Hub", suppliers)
@@ -386,8 +390,10 @@ func main() {
 		"MegaStore", "ValueMart", "PremiumGoods", "BudgetDirect", "TechSupply",
 	}
 
-	fmt.Println("=== Price Comparison: Callback Pattern ===\n")
-	fmt.Println("  Product: Mechanical Keyboard\n")
+	fmt.Println("=== Price Comparison: Callback Pattern ===")
+	fmt.Println()
+	fmt.Println("  Product: Mechanical Keyboard")
+	fmt.Println()
 
 	// Example 1: Simple logging callback
 	fmt.Println("  --- Callback: real-time logging ---")
@@ -603,7 +609,8 @@ func main() {
 		"AlphaSupply", "BetaStore", "GammaDirect", "DeltaMart", "EpsilonCo",
 	}
 
-	fmt.Println("=== Return Value Patterns: Side-by-Side ===\n")
+	fmt.Println("=== Return Value Patterns: Side-by-Side ===")
+	fmt.Println()
 
 	// Pattern 1: Channels
 	start := time.Now()

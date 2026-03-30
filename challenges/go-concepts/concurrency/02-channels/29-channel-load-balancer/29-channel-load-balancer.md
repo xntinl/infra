@@ -125,7 +125,8 @@ func main() {
 	}
 
 	wg.Wait()
-	fmt.Println("\n=== Distribution ===")
+	fmt.Println()
+	fmt.Println("=== Distribution ===")
 	for id := 1; id <= workerCount; id++ {
 		fmt.Printf("  worker %d: %d requests\n", id, counts[id])
 	}
@@ -292,7 +293,8 @@ func main() {
 	}
 
 	wg.Wait()
-	fmt.Println("\n=== Distribution ===")
+	fmt.Println()
+	fmt.Println("=== Distribution ===")
 	for id := 1; id <= lcWorkerCount; id++ {
 		fmt.Printf("  worker %d: %d requests (lag: %v)\n", id, counts[id], lags[id-1])
 	}
@@ -639,7 +641,7 @@ func (w *Worker) Run(wg *sync.WaitGroup) {
 	}
 }
 
-func runRoundRobin(workers []*Worker, requests []Request) time.Duration {
+func runRoundRobin(workers []*Worker, requests []Request) (map[int]int, time.Duration) {
 	intake := make(chan Request, len(requests))
 	go func() {
 		idx := 0
@@ -657,13 +659,15 @@ func runRoundRobin(workers []*Worker, requests []Request) time.Duration {
 		intake <- req
 	}
 	close(intake)
+	counts := make(map[int]int)
 	for _, req := range requests {
-		<-req.Reply
+		resp := <-req.Reply
+		counts[resp.WorkerID]++
 	}
-	return time.Since(start)
+	return counts, time.Since(start)
 }
 
-func runLeastConn(workers []*Worker, requests []Request, feedback <-chan Completion) time.Duration {
+func runLeastConn(workers []*Worker, requests []Request, feedback <-chan Completion) (map[int]int, time.Duration) {
 	intake := make(chan Request, len(requests))
 	go func() {
 		pending := make(map[int]int)
@@ -700,10 +704,12 @@ func runLeastConn(workers []*Worker, requests []Request, feedback <-chan Complet
 		intake <- req
 	}
 	close(intake)
+	counts := make(map[int]int)
 	for _, req := range requests {
-		<-req.Reply
+		resp := <-req.Reply
+		counts[resp.WorkerID]++
 	}
-	return time.Since(start)
+	return counts, time.Since(start)
 }
 
 func main() {
@@ -726,14 +732,8 @@ func main() {
 	for i := range rrRequests {
 		rrRequests[i] = NewRequest(i + 1)
 	}
-	rrTime := runRoundRobin(rrWorkers, rrRequests)
+	rrCounts, rrTime := runRoundRobin(rrWorkers, rrRequests)
 	rrWG.Wait()
-
-	rrCounts := make(map[int]int)
-	for _, req := range rrRequests {
-		resp := <-req.Reply
-		rrCounts[resp.WorkerID]++
-	}
 
 	// Least-connections test.
 	lcFeedback := make(chan Completion, cmpRequestCount)
@@ -748,14 +748,8 @@ func main() {
 	for i := range lcRequests {
 		lcRequests[i] = NewRequest(i + 1)
 	}
-	lcTime := runLeastConn(lcWorkers, lcRequests, lcFeedback)
+	lcCounts, lcTime := runLeastConn(lcWorkers, lcRequests, lcFeedback)
 	lcWG.Wait()
-
-	lcCounts := make(map[int]int)
-	for _, req := range lcRequests {
-		resp := <-req.Reply
-		lcCounts[resp.WorkerID]++
-	}
 
 	fmt.Println("=== Round-Robin ===")
 	for id := 1; id <= cmpWorkerCount; id++ {
@@ -763,7 +757,8 @@ func main() {
 	}
 	fmt.Printf("  wall time: %v\n", rrTime.Round(time.Millisecond))
 
-	fmt.Println("\n=== Least-Connections ===")
+	fmt.Println()
+	fmt.Println("=== Least-Connections ===")
 	for id := 1; id <= cmpWorkerCount; id++ {
 		fmt.Printf("  worker %d: %d requests (lag: %v)\n", id, lcCounts[id], lags[id-1])
 	}
@@ -826,7 +821,7 @@ case req, ok := <-intake:
 2. Implement a circuit breaker that temporarily removes a worker from the pool after 3 consecutive request timeouts, then reintroduces it after a cooldown period.
 
 ## What's Next
-Continue to [30-Channel Broadcast](../30-channel-broadcast/30-channel-broadcast.md) to learn how a broadcaster goroutine can push updates to dynamically subscribing consumers with late-join replay and slow-consumer eviction.
+Continue to [30. Channel-Based Broadcast with Late Subscribers](../30-channel-broadcast/30-channel-broadcast.md) to learn how a broadcaster goroutine can push updates to dynamically subscribing consumers with late-join replay and slow-consumer eviction.
 
 ## Summary
 - A channel-based load balancer uses a central goroutine that actively chooses which worker receives each request

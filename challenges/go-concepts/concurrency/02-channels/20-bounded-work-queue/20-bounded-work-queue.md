@@ -274,7 +274,8 @@ func main() {
 	}
 
 	// Start consumer to drain.
-	fmt.Println("\n=== Phase 2: Start consumer ===")
+	fmt.Println()
+	fmt.Println("=== Phase 2: Start consumer ===")
 	wg.Add(1)
 	go queue.Drain(1, &wg)
 
@@ -282,7 +283,8 @@ func main() {
 	time.Sleep(submissionPause)
 
 	// Retry previously rejected job.
-	fmt.Println("\n=== Phase 3: Retry after drain ===")
+	fmt.Println()
+	fmt.Println("=== Phase 3: Retry after drain ===")
 	if err := queue.Submit(overflow); err != nil {
 		fmt.Printf("  job 4 still rejected: %v\n", err)
 	} else {
@@ -303,7 +305,8 @@ func main() {
 
 	queue.Close()
 	wg.Wait()
-	fmt.Println("\nAll jobs processed")
+	fmt.Println()
+	fmt.Println("All jobs processed")
 }
 ```
 

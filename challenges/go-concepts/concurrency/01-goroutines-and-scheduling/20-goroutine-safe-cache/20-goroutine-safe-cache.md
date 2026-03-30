@@ -216,7 +216,8 @@ func main() {
 		}
 	}
 
-	fmt.Println("\n--- Waiting 300ms (session:abc expires) ---")
+	fmt.Println()
+	fmt.Println("--- Waiting 300ms (session:abc expires) ---")
 	time.Sleep(300 * time.Millisecond)
 
 	fmt.Printf("  Logical size: %d | Physical size: %d\n", cache.Len(), cache.physicalLen())
@@ -228,7 +229,8 @@ func main() {
 		}
 	}
 
-	fmt.Println("\n--- Waiting 300ms more (session:def expires) ---")
+	fmt.Println()
+	fmt.Println("--- Waiting 300ms more (session:def expires) ---")
 	time.Sleep(300 * time.Millisecond)
 
 	fmt.Printf("  Logical size: %d | Physical size: %d\n", cache.Len(), cache.physicalLen())
@@ -393,7 +395,8 @@ func main() {
 	fmt.Println()
 	cache.Stop()
 	time.Sleep(50 * time.Millisecond)
-	fmt.Println("\nCache stopped. Background goroutine exited cleanly.")
+	fmt.Println()
+	fmt.Println("Cache stopped. Background goroutine exited cleanly.")
 }
 ```
 
@@ -573,7 +576,6 @@ func simulateRequests(id int, cache *Cache, wg *sync.WaitGroup) {
 }
 
 func main() {
-	rand.Seed(time.Now().UnixNano())
 	cache := NewCache(cleanupInterval)
 
 	fmt.Printf("=== Goroutine-Safe Cache ===\n")

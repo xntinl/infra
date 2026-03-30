@@ -118,8 +118,6 @@ func (p *WorkerPool) Shutdown() {
 }
 
 func main() {
-	rand.Seed(time.Now().UnixNano())
-
 	pool := NewWorkerPool(initialWorkers, totalJobs)
 	fmt.Printf("=== Worker Pool with Metrics ===\n")
 	fmt.Printf("  Workers: %d, Queue capacity: %d\n\n", initialWorkers, totalJobs)
@@ -284,7 +282,7 @@ func (p *AdaptivePool) runWorker(w *Worker) {
 			processingTime := time.Duration(minJobProcessMs+rand.Intn(maxJobProcessMs-minJobProcessMs)) * time.Millisecond
 			time.Sleep(processingTime)
 			p.metrics.RecordJob(time.Since(start))
-			_ = jobID
+			fmt.Printf("  worker %d: job %d (%v)\n", w.ID, jobID, time.Since(start).Round(time.Millisecond))
 		case <-w.stop:
 			return
 		}
@@ -342,8 +340,6 @@ func (p *AdaptivePool) Shutdown() {
 }
 
 func main() {
-	rand.Seed(time.Now().UnixNano())
-
 	pool := NewAdaptivePool()
 	fmt.Printf("=== Adaptive Pool with Control Loop ===\n")
 	fmt.Printf("  Min workers: %d, Max workers: %d\n", minWorkers, maxWorkers)
@@ -357,10 +353,12 @@ func main() {
 
 	time.Sleep(3 * time.Second)
 
-	fmt.Println("\n--- Phase 2: Idle period ---")
+	fmt.Println()
+	fmt.Println("--- Phase 2: Idle period ---")
 	time.Sleep(5 * time.Second)
 
-	fmt.Println("\n--- Phase 3: Second burst (30 jobs) ---")
+	fmt.Println()
+	fmt.Println("--- Phase 3: Second burst (30 jobs) ---")
 	for i := 51; i <= 80; i++ {
 		pool.Submit(i)
 	}
@@ -581,7 +579,7 @@ func (p *AdaptivePool) runWorker(w *PoolWorker) {
 			dur := time.Duration(poolMinJobMs+rand.Intn(poolMaxJobMs-poolMinJobMs)) * time.Millisecond
 			time.Sleep(dur)
 			p.metrics.Record(time.Since(start))
-			_ = jobID
+			fmt.Printf("  worker %d: job %d (%v)\n", w.ID, jobID, time.Since(start).Round(time.Millisecond))
 		case <-w.stop:
 			return
 		}
@@ -671,8 +669,6 @@ func (p *AdaptivePool) Shutdown() {
 }
 
 func main() {
-	rand.Seed(time.Now().UnixNano())
-
 	pool := NewAdaptivePool()
 	fmt.Println("=== Adaptive Pool with Cooldown ===")
 	fmt.Printf("  Workers: %d-%d | Queue trigger: %d | Latency target: %v\n",
@@ -685,10 +681,12 @@ func main() {
 	}
 	time.Sleep(4 * time.Second)
 
-	fmt.Println("\n--- Phase 2: Idle (let workers scale down) ---")
+	fmt.Println()
+	fmt.Println("--- Phase 2: Idle (let workers scale down) ---")
 	time.Sleep(8 * time.Second)
 
-	fmt.Println("\n--- Phase 3: Moderate burst (40 jobs) ---")
+	fmt.Println()
+	fmt.Println("--- Phase 3: Moderate burst (40 jobs) ---")
 	for i := 81; i <= 120; i++ {
 		pool.Submit(i)
 	}
@@ -973,8 +971,6 @@ func generateLoad(pool *FullAdaptivePool, profiles []LoadProfile) int {
 }
 
 func main() {
-	rand.Seed(time.Now().UnixNano())
-
 	pool := NewFullAdaptivePool()
 	fmt.Println("=== Full Adaptive Pool ===")
 	fmt.Printf("  Workers: %d-%d | Cooldown: %v\n\n", adaptiveMinW, adaptiveMaxW, adaptiveCooldown)

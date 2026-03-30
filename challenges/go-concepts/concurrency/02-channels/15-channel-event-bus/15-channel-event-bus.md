@@ -208,7 +208,8 @@ func main() {
 
 	bus.Close()
 	wg.Wait()
-	fmt.Println("\nAll subscribers finished processing")
+	fmt.Println()
+	fmt.Println("All subscribers finished processing")
 }
 ```
 
@@ -352,11 +353,13 @@ func main() {
 		bus.Publish(event)
 	}
 
-	fmt.Println("\n=== Shutting Down ===")
+	fmt.Println()
+	fmt.Println("=== Shutting Down ===")
 	bus.Close()
 	wg.Wait()
 
-	fmt.Println("\n=== Event Processing Complete ===")
+	fmt.Println()
+	fmt.Println("=== Event Processing Complete ===")
 }
 ```
 
@@ -493,16 +496,19 @@ func main() {
 		bus.Publish(event)
 	}
 
-	fmt.Println("\n=== Closing Bus ===")
+	fmt.Println()
+	fmt.Println("=== Closing Bus ===")
 	bus.Close()
 	wg.Wait()
 
-	fmt.Println("\n=== Clean Shutdown Complete ===")
+	fmt.Println()
+	fmt.Println("=== Clean Shutdown Complete ===")
 	fmt.Println("All subscriber goroutines have exited.")
 	fmt.Println("No goroutine leaks, no blocked channels.")
 
 	// Demonstrate that publishing after close panics.
-	fmt.Println("\n=== Demonstrate Post-Close Safety ===")
+	fmt.Println()
+	fmt.Println("=== Demonstrate Post-Close Safety ===")
 	func() {
 		defer func() {
 			if r := recover(); r != nil {

@@ -486,7 +486,7 @@ case <-done:
 2. Add a counter to each source reader that reports how many lines it forwarded before shutdown.
 
 ## What's Next
-Continue to [29-Channel Load Balancer](../29-channel-load-balancer/29-channel-load-balancer.md) to learn how channels can implement active load-aware distribution where a balancer goroutine chooses which worker receives each request.
+Continue to [29. Channel-Based Load Balancer](../29-channel-load-balancer/29-channel-load-balancer.md) to learn how channels can implement active load-aware distribution where a balancer goroutine chooses which worker receives each request.
 
 ## Summary
 - The bridge pattern flattens a channel-of-channels into a single output stream

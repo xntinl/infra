@@ -88,15 +88,14 @@ func printResults(results []ValidationResult, elapsed time.Duration) {
 }
 
 func main() {
-	rand.Seed(time.Now().UnixNano())
-
 	rules := []ValidationRule{
 		newRule("namespace-exists", 80*time.Millisecond, true, "namespace 'production' found"),
 		newRule("resource-limits-set", 120*time.Millisecond, true, "CPU and memory limits defined"),
 		newRule("image-tag-not-latest", 60*time.Millisecond, false, "image uses 'latest' tag -- pin to specific version"),
 	}
 
-	fmt.Println("=== Sequential Validation (3 rules) ===\n")
+	fmt.Println("=== Sequential Validation (3 rules) ===")
+	fmt.Println()
 	start := time.Now()
 	results := runSequential(rules)
 	elapsed := time.Since(start)
@@ -209,21 +208,22 @@ func printResults(results []ValidationResult, elapsed time.Duration) {
 }
 
 func main() {
-	rand.Seed(time.Now().UnixNano())
-
 	rules := []ValidationRule{
 		newRule("namespace-exists", 80*time.Millisecond, true, "namespace 'production' found"),
 		newRule("resource-limits-set", 120*time.Millisecond, true, "CPU and memory limits defined"),
 		newRule("image-tag-not-latest", 60*time.Millisecond, false, "image uses 'latest' tag -- pin to specific version"),
 	}
 
-	fmt.Println("=== Sequential (3 rules) ===\n")
+	fmt.Println("=== Sequential (3 rules) ===")
+	fmt.Println()
 	start := time.Now()
 	seqResults := runSequential(rules)
 	seqElapsed := time.Since(start)
 	printResults(seqResults, seqElapsed)
 
-	fmt.Println("\n=== Concurrent (3 rules) ===\n")
+	fmt.Println()
+	fmt.Println("=== Concurrent (3 rules) ===")
+	fmt.Println()
 	validator := NewValidator(rules...)
 	start = time.Now()
 	concResults := validator.RunAll()

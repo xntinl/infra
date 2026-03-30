@@ -88,7 +88,13 @@ func (m *GoroutineMonitor) collectLoop() {
 	}
 }
 
-func (m *GoroutineMonitor) Report() (min, max, latest int, trend string) {
+func (m *GoroutineMonitor) SampleCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.samples)
+}
+
+func (m *GoroutineMonitor) Report() (minVal, maxVal, latest int, trend string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -96,14 +102,14 @@ func (m *GoroutineMonitor) Report() (min, max, latest int, trend string) {
 		return 0, 0, 0, "no data"
 	}
 
-	min = m.samples[0]
-	max = m.samples[0]
+	minVal = m.samples[0]
+	maxVal = m.samples[0]
 	for _, s := range m.samples {
-		if s < min {
-			min = s
+		if s < minVal {
+			minVal = s
 		}
-		if s > max {
-			max = s
+		if s > maxVal {
+			maxVal = s
 		}
 	}
 	latest = m.samples[len(m.samples)-1]
@@ -148,11 +154,11 @@ func main() {
 	time.Sleep(monitorDuration)
 	monitor.Stop()
 
-	min, max, latest, trend := monitor.Report()
+	minVal, maxVal, latest, trend := monitor.Report()
 	fmt.Printf("\n=== Monitor Report ===\n")
-	fmt.Printf("  Samples:  %d\n", len(monitor.samples))
-	fmt.Printf("  Min:      %d\n", min)
-	fmt.Printf("  Max:      %d\n", max)
+	fmt.Printf("  Samples:  %d\n", monitor.SampleCount())
+	fmt.Printf("  Min:      %d\n", minVal)
+	fmt.Printf("  Max:      %d\n", maxVal)
 	fmt.Printf("  Latest:   %d\n", latest)
 	fmt.Printf("  Trend:    %s\n", trend)
 }
@@ -321,12 +327,14 @@ func main() {
 		fmt.Printf("    %-20s %d\n", state, count)
 	}
 
-	fmt.Println("\n  By function (main.* only):")
+	fmt.Println()
+	fmt.Println("  By function (main.* only):")
 	for fn, count := range analysis.ByFunction {
 		fmt.Printf("    %-30s %d\n", fn, count)
 	}
 
-	fmt.Println("\n  Diagnosis:")
+	fmt.Println()
+	fmt.Println("  Diagnosis:")
 	if count, ok := analysis.ByFunction["main.leakyHandler"]; ok && count > 2 {
 		fmt.Printf("    ALERT: %d goroutines blocked in main.leakyHandler\n", count)
 		fmt.Println("    These goroutines are waiting on channels that may never close")
@@ -820,7 +828,8 @@ func main() {
 	fmt.Println()
 	detector.Report()
 
-	fmt.Println("\n  Root cause: processAsync goroutines outlive their callers")
+	fmt.Println()
+	fmt.Println("  Root cause: processAsync goroutines outlive their callers")
 	fmt.Println("  Fix: use buffered channel (cap=1) so send does not block if receiver timed out")
 }
 ```

@@ -415,7 +415,8 @@ func main() {
 	updates <- ConfigUpdate{Version: 3, Key: "log.level", Value: "info"}
 	time.Sleep(30 * time.Millisecond)
 
-	fmt.Println("\n--- subscriber 2 joins late ---")
+	fmt.Println()
+	fmt.Println("--- subscriber 2 joins late ---")
 	ch2 := make(chan ConfigUpdate, 20)
 	register <- Registration{ID: 2, Ch: ch2}
 	subWG.Add(1)
@@ -426,7 +427,8 @@ func main() {
 	updates <- ConfigUpdate{Version: 4, Key: "db.host", Value: "db-secondary.local"}
 	time.Sleep(20 * time.Millisecond)
 
-	fmt.Println("\n--- subscriber 3 joins even later ---")
+	fmt.Println()
+	fmt.Println("--- subscriber 3 joins even later ---")
 	ch3 := make(chan ConfigUpdate, 20)
 	register <- Registration{ID: 3, Ch: ch3}
 	subWG.Add(1)
@@ -710,7 +712,7 @@ b.state[update.Key] = update
 2. Implement a "backpressure" mode as an alternative to eviction: when a subscriber's buffer is full, the broadcaster slows down its send rate to all subscribers, trading latency for delivery guarantee.
 
 ## What's Next
-Continue to [31-Channel Resource Pool](../31-channel-resource-pool/31-channel-resource-pool.md) to learn how channels can manage a database connection pool with acquire, release, health checks, and connection replacement -- all without mutexes.
+Continue to [31. Channel-Based Resource Pool with Health Checks](../31-channel-resource-pool/31-channel-resource-pool.md) to learn how channels can manage a database connection pool with acquire, release, health checks, and connection replacement -- all without mutexes.
 
 ## Summary
 - Channel-based broadcast requires explicit fan-out since Go channels are point-to-point

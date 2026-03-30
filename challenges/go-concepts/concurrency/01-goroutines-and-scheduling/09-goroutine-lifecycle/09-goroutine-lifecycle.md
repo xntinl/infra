@@ -342,7 +342,9 @@ func main() {
 
 	// Give workers time to start, then signal shutdown
 	time.Sleep(100 * time.Millisecond)
-	fmt.Println("\n  --- Sending quit signal ---\n")
+	fmt.Println()
+	fmt.Println("  --- Sending quit signal ---")
+	fmt.Println()
 	close(quit)
 
 	// Obedient workers exit quickly, but we must wait for the stubborn one
@@ -454,7 +456,8 @@ func (tm *TaskManager) PrintDashboard() {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 
-	fmt.Println("\n  --- Worker Dashboard ---")
+	fmt.Println()
+	fmt.Println("  --- Worker Dashboard ---")
 	for id := 1; id <= len(tm.states); id++ {
 		state := tm.states[id]
 		icon := " "

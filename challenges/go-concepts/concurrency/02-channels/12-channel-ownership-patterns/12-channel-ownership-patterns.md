@@ -324,11 +324,13 @@ func main() {
 
 	dispatcher.Submit(jobs)
 
-	fmt.Println("\n=== Results ===")
+	fmt.Println()
+	fmt.Println("=== Results ===")
 	for result := range dispatcher.Results() {
 		fmt.Printf("  Job %d: %s\n", result.JobID, result.Output)
 	}
-	fmt.Println("\nAll jobs complete. No panics, no leaked goroutines.")
+	fmt.Println()
+	fmt.Println("All jobs complete. No panics, no leaked goroutines.")
 }
 ```
 

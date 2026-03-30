@@ -445,11 +445,13 @@ func main() {
 	wg.Wait()
 
 	// Phase 2: wait for health checks to evict old connections.
-	fmt.Println("\n=== Phase 2: waiting for health checks ===")
+	fmt.Println()
+	fmt.Println("=== Phase 2: waiting for health checks ===")
 	time.Sleep(350 * time.Millisecond)
 
 	// Phase 3: use connections again (should get replacement connections).
-	fmt.Println("\n=== Phase 3: using replacement connections ===")
+	fmt.Println()
+	fmt.Println("=== Phase 3: using replacement connections ===")
 	for i := 4; i <= 6; i++ {
 		wg.Add(1)
 		go func(id int) {
@@ -514,7 +516,7 @@ package main
 
 import (
 	"fmt"
-	"math/rand"
+	"math/rand/v2"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -647,7 +649,7 @@ func main() {
 	go fullPoolManager(acquire, release, badConn, done, ticker.C)
 
 	var wg sync.WaitGroup
-	rng := rand.New(rand.NewSource(42))
+	rng := rand.New(rand.NewPCG(42, 0))
 
 	successCount := 0
 	failCount := 0
@@ -747,7 +749,7 @@ case <-done:
 2. Implement pool metrics: track average wait time, utilization rate (in-use vs idle), and the total number of health check evictions over the pool's lifetime.
 
 ## What's Next
-Continue to [32-Channel Request Coalescing](../32-channel-request-coalescing/32-channel-request-coalescing.md) to learn how a central goroutine can deduplicate concurrent requests for the same resource, preventing thundering herd problems.
+Continue to [32. Channel-Based Request Coalescing (Singleflight)](../32-channel-request-coalescing/32-channel-request-coalescing.md) to learn how a central goroutine can deduplicate concurrent requests for the same resource, preventing thundering herd problems.
 
 ## Summary
 - A channel-based resource pool uses a single manager goroutine that owns all connection state

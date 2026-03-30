@@ -212,7 +212,8 @@ func main() {
 	}
 
 	levels := dag.ParallelLevels()
-	fmt.Println("\n=== Parallel Execution Levels ===")
+	fmt.Println()
+	fmt.Println("=== Parallel Execution Levels ===")
 	totalSequential := time.Duration(0)
 	totalCriticalPath := time.Duration(0)
 	for i, level := range levels {
@@ -504,7 +505,8 @@ func main() {
 	fmt.Printf("  Completed: %d | Failed: %d | Skipped: %d\n", completed, failed, skipped)
 
 	if failed > 0 {
-		fmt.Println("\n  Pipeline FAILED: error propagation skipped downstream tasks")
+		fmt.Println()
+		fmt.Println("  Pipeline FAILED: error propagation skipped downstream tasks")
 	}
 }
 ```
@@ -836,7 +838,8 @@ func main() {
 		fmt.Printf("  %-25s %v (cumulative: %v)\n", name, task.Duration, pathTime)
 	}
 
-	fmt.Println("\n  Tasks NOT on critical path can be optimized only up to the critical path time.")
+	fmt.Println()
+	fmt.Println("  Tasks NOT on critical path can be optimized only up to the critical path time.")
 	fmt.Println("  To reduce wall time, optimize tasks ON the critical path.")
 }
 ```

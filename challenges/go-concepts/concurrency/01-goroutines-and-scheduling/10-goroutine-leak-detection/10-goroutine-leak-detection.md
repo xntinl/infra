@@ -425,7 +425,8 @@ func (ld *LeakDetector) TakeSnapshot(label string) {
 }
 
 func (ld *LeakDetector) Report() {
-	fmt.Println("\n  --- Leak Detection Report ---")
+	fmt.Println()
+	fmt.Println("  --- Leak Detection Report ---")
 	maxCount := 0
 	maxDelta := 0
 	for _, s := range ld.snapshots {
@@ -472,7 +473,8 @@ func simulateCleanEndpoint(quit <-chan struct{}) {
 }
 
 func main() {
-	fmt.Println("=== Goroutine Leak Detection Dashboard ===\n")
+	fmt.Println("=== Goroutine Leak Detection Dashboard ===")
+	fmt.Println()
 	ld := NewLeakDetector()
 
 	ld.TakeSnapshot("startup")

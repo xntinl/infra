@@ -133,7 +133,8 @@ func main() {
 		"2024-01-15 10:04:00 [INFO] Health check passed",
 	})
 
-	fmt.Println("=== Single File Analysis ===\n")
+	fmt.Println("=== Single File Analysis ===")
+	fmt.Println()
 	analysis := logFile.Analyze()
 	printAnalysis(analysis)
 }
@@ -352,7 +353,8 @@ func main() {
 	files := buildLogFiles()
 	analyzer := NewLogAnalyzer(files)
 
-	fmt.Println("=== Concurrent Log Analysis (8 files) ===\n")
+	fmt.Println("=== Concurrent Log Analysis (8 files) ===")
+	fmt.Println()
 	start := time.Now()
 	results := analyzer.AnalyzeAll()
 	wallClock := time.Since(start)
@@ -526,7 +528,8 @@ func printDetailedReport(analyses []FileAnalysis) {
 		totalLines, totalErrors, totalWarns, totalMalformed)
 
 	if totalMalformed > 0 {
-		fmt.Println("\n  --- Malformed Lines ---")
+		fmt.Println()
+		fmt.Println("  --- Malformed Lines ---")
 		for _, a := range analyses {
 			for _, m := range a.MalformedList {
 				fmt.Printf("  [%s] %s\n", a.FileName, m)
@@ -574,7 +577,8 @@ func main() {
 	files := buildLogFilesWithGarbage()
 	analyzer := NewLogAnalyzer(files)
 
-	fmt.Println("=== Log Analysis with Malformed Lines ===\n")
+	fmt.Println("=== Log Analysis with Malformed Lines ===")
+	fmt.Println()
 	start := time.Now()
 	results := analyzer.AnalyzeAll()
 	wallClock := time.Since(start)
@@ -822,7 +826,8 @@ func buildAllLogFiles() []*LogFile {
 func main() {
 	files := buildAllLogFiles()
 
-	fmt.Println("=== Log Analysis: Sequential vs Concurrent ===\n")
+	fmt.Println("=== Log Analysis: Sequential vs Concurrent ===")
+	fmt.Println()
 
 	seqAnalyzer := NewLogAnalyzer(files)
 	seqStart := time.Now()

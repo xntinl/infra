@@ -149,7 +149,8 @@ func main() {
 	fmt.Printf("  deregistered -> healthy:    %v\n", isValidTransition(StateDeregistered, StateHealthy))
 	fmt.Printf("  unhealthy -> deregistered:  %v\n", isValidTransition(StateUnhealthy, StateDeregistered))
 
-	fmt.Println("\n=== Event Log ===")
+	fmt.Println()
+	fmt.Println("=== Event Log ===")
 	for _, e := range log.All() {
 		fmt.Printf("  %s\n", e)
 	}
@@ -378,7 +379,8 @@ func main() {
 	reregistered := reg.UpdateHealth("payments-svc", true, "recovered")
 	fmt.Printf("\nUpdate deregistered payments-svc: %v (should be false)\n", reregistered)
 
-	fmt.Println("\n=== Full Event Log ===")
+	fmt.Println()
+	fmt.Println("=== Full Event Log ===")
 	for _, e := range reg.Events() {
 		fmt.Printf("  [%s] %s: %s -> %s (%s)\n",
 			e.Timestamp.Format("15:04:05.000"),
@@ -425,6 +427,7 @@ import (
 	"fmt"
 	"math/rand"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -666,7 +669,7 @@ func healthChecker(reg *Registry, stop <-chan struct{}, wg *sync.WaitGroup) {
 	}
 }
 
-func router(id int, reg *Registry, stop <-chan struct{}, wg *sync.WaitGroup, lookups *int64, mu *sync.Mutex) {
+func router(id int, reg *Registry, stop <-chan struct{}, wg *sync.WaitGroup, lookups *int64) {
 	defer wg.Done()
 	ticker := time.NewTicker(routerQueryInterval)
 	defer ticker.Stop()
@@ -675,9 +678,7 @@ func router(id int, reg *Registry, stop <-chan struct{}, wg *sync.WaitGroup, loo
 		select {
 		case <-ticker.C:
 			healthy := reg.GetHealthy()
-			mu.Lock()
-			*lookups++
-			mu.Unlock()
+			atomic.AddInt64(lookups, 1)
 			_ = healthy
 		case <-stop:
 			return
@@ -686,13 +687,11 @@ func router(id int, reg *Registry, stop <-chan struct{}, wg *sync.WaitGroup, loo
 }
 
 func main() {
-	rand.Seed(time.Now().UnixNano())
 	reg := NewRegistry()
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
 
 	var totalLookups int64
-	var lookupMu sync.Mutex
 
 	fmt.Println("=== Service Registry Simulation ===")
 	fmt.Printf("  Services: %d | Health interval: %v | Duration: %v\n\n",
@@ -708,7 +707,7 @@ func main() {
 
 	for i := 1; i <= 3; i++ {
 		wg.Add(1)
-		go router(i, reg, stop, &wg, &totalLookups, &lookupMu)
+		go router(i, reg, stop, &wg, &totalLookups)
 	}
 
 	time.Sleep(simulationDuration)
@@ -724,9 +723,7 @@ func main() {
 	}
 
 	healthy := reg.GetHealthy()
-	lookupMu.Lock()
-	lookups := totalLookups
-	lookupMu.Unlock()
+	lookups := atomic.LoadInt64(&totalLookups)
 
 	fmt.Printf("\n=== Final State ===\n")
 	fmt.Printf("  Healthy services: %d\n", len(healthy))

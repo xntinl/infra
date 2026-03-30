@@ -78,7 +78,8 @@ func main() {
 	errCh := make(chan ValidationError, len(files))
 	var wg sync.WaitGroup
 
-	fmt.Println("=== Parallel Config Validator (Error Channel) ===\n")
+	fmt.Println("=== Parallel Config Validator (Error Channel) ===")
+	fmt.Println()
 	fmt.Printf("  Validating %d config files...\n\n", len(files))
 
 	for _, f := range files {
@@ -204,7 +205,8 @@ func main() {
 
 	results := make(chan ConfigResult, len(files))
 
-	fmt.Println("=== Parallel Config Validator (Result Struct) ===\n")
+	fmt.Println("=== Parallel Config Validator (Result Struct) ===")
+	fmt.Println()
 
 	for _, f := range files {
 		go func(filename string) {
@@ -346,7 +348,8 @@ func main() {
 	results := make(chan ParseResult, len(files))
 	var wg sync.WaitGroup
 
-	fmt.Println("=== Panic Recovery in Concurrent Parsers ===\n")
+	fmt.Println("=== Panic Recovery in Concurrent Parsers ===")
+	fmt.Println()
 
 	for _, f := range files {
 		wg.Add(1)
@@ -530,7 +533,8 @@ func main() {
 	results := make(chan FileReport, len(files))
 	var wg sync.WaitGroup
 
-	fmt.Println("=== Production Config Validator ===\n")
+	fmt.Println("=== Production Config Validator ===")
+	fmt.Println()
 	start := time.Now()
 
 	for _, f := range files {
@@ -602,7 +606,8 @@ func main() {
 		time.Duration(len(files)*25)*time.Millisecond)
 
 	if fatalCount > 0 {
-		fmt.Println("\n  FATAL findings indicate panics that were recovered.")
+		fmt.Println()
+		fmt.Println("  FATAL findings indicate panics that were recovered.")
 		fmt.Println("  These are BUGS that must be fixed -- recovery is a safety net,")
 		fmt.Println("  not a substitute for correct code.")
 	}

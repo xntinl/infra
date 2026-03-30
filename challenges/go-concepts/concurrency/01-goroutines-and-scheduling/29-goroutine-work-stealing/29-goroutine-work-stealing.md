@@ -264,7 +264,8 @@ func main() {
 
 	fmt.Printf("\nQueue size after steal: %d\n", q.Len())
 
-	fmt.Println("\nRemaining tasks:")
+	fmt.Println()
+	fmt.Println("Remaining tasks:")
 	for {
 		task, ok := q.Pop()
 		if !ok {

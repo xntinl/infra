@@ -385,6 +385,8 @@ All workers done. Completed: 12, Pending: 0
 
 Write tests that use barrier channels to force all goroutines to start simultaneously, guaranteeing concurrent access.
 
+The demo `main.go` includes the `TaskScheduler`, the `setupBarrier` helper, and a concurrent demo:
+
 ```go
 package main
 
@@ -392,7 +394,6 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
-	"testing"
 )
 
 const (
@@ -486,22 +487,6 @@ func (s *TaskScheduler) findTaskLocked(id int) *Task {
 
 // --- Test Helpers ---
 
-func startBarrier(n int) chan struct{} {
-	barrier := make(chan struct{})
-	var ready sync.WaitGroup
-	ready.Add(n)
-
-	go func() {
-		ready.Wait()
-		close(barrier)
-	}()
-
-	// Callers must call ready.Done() -- but we return a simplified API.
-	// The barrier channel is closed once all participants are ready.
-	// Use setupBarrier instead for full control.
-	return barrier
-}
-
 func setupBarrier(n int) (ready func(), wait <-chan struct{}) {
 	barrier := make(chan struct{})
 	var readyWg sync.WaitGroup
@@ -515,7 +500,57 @@ func setupBarrier(n int) (ready func(), wait <-chan struct{}) {
 	return readyWg.Done, barrier
 }
 
-// --- Tests ---
+func main() {
+	fmt.Println("=== Testing Concurrent Code ===")
+	fmt.Println("  Barrier-synchronized concurrent demo.")
+	fmt.Println("  Run tests with: go test -v -race")
+	fmt.Println()
+
+	sched := NewTaskScheduler()
+
+	const workers = 10
+	for i := 1; i <= workers; i++ {
+		sched.AddTask(fmt.Sprintf("task-%d", i))
+	}
+
+	signalReady, barrier := setupBarrier(workers)
+	var wg sync.WaitGroup
+	var successCount int64
+
+	for i := 1; i <= workers; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			signalReady()
+			<-barrier
+			if err := sched.AssignToWorker(workerID, workerID); err == nil {
+				atomic.AddInt64(&successCount, 1)
+				if err := sched.CompleteTask(workerID); err == nil {
+					fmt.Printf("  worker %d: assigned and completed task %d\n", workerID, workerID)
+				}
+			}
+		}(i)
+	}
+
+	wg.Wait()
+	fmt.Println()
+	fmt.Printf("  Barrier-synchronized: %d workers started simultaneously\n", workers)
+	fmt.Printf("  Successful assignments: %d\n", successCount)
+	fmt.Printf("  Completions: %d\n", sched.CompletionCount())
+}
+```
+
+The test file `scheduler_test.go` uses the same `setupBarrier` helper and the `testing` package:
+
+```go
+package main
+
+import (
+	"fmt"
+	"sync"
+	"sync/atomic"
+	"testing"
+)
 
 func TestConcurrentAssignment(t *testing.T) {
 	const workers = 20
@@ -629,44 +664,6 @@ func TestConcurrentAddAndAssign(t *testing.T) {
 	t.Logf("tasks added: %d, assignment errors: %d, completions: %d",
 		iterations, assignErrors, completions)
 }
-
-func main() {
-	fmt.Println("=== Testing Concurrent Code ===")
-	fmt.Println("  This file contains both the code and its tests.")
-	fmt.Println("  Run with: go test -v -race")
-	fmt.Println()
-
-	sched := NewTaskScheduler()
-
-	const workers = 10
-	for i := 1; i <= workers; i++ {
-		sched.AddTask(fmt.Sprintf("task-%d", i))
-	}
-
-	signalReady, barrier := setupBarrier(workers)
-	var wg sync.WaitGroup
-	var successCount int64
-
-	for i := 1; i <= workers; i++ {
-		wg.Add(1)
-		go func(workerID int) {
-			defer wg.Done()
-			signalReady()
-			<-barrier
-			if err := sched.AssignToWorker(workerID, workerID); err == nil {
-				atomic.AddInt64(&successCount, 1)
-				if err := sched.CompleteTask(workerID); err == nil {
-					fmt.Printf("  worker %d: assigned and completed task %d\n", workerID, workerID)
-				}
-			}
-		}(i)
-	}
-
-	wg.Wait()
-	fmt.Printf("\n  Barrier-synchronized: %d workers started simultaneously\n", workers)
-	fmt.Printf("  Successful assignments: %d\n", successCount)
-	fmt.Printf("  Completions: %d\n", sched.CompletionCount())
-}
 ```
 
 **What's happening here:** The `setupBarrier` function creates a synchronization barrier. Each goroutine calls `signalReady()` when it is prepared to start, then blocks on `<-barrier`. Once all N goroutines have signaled ready, the barrier channel is closed and they all proceed simultaneously. This guarantees concurrent access -- no sleeps, no timing dependencies.
@@ -680,8 +677,8 @@ go run main.go
 Expected output (worker order varies):
 ```
 === Testing Concurrent Code ===
-  This file contains both the code and its tests.
-  Run with: go test -v -race
+  Barrier-synchronized concurrent demo.
+  Run tests with: go test -v -race
 
   worker 3: assigned and completed task 3
   worker 7: assigned and completed task 7
@@ -1034,7 +1031,8 @@ func demoExclusiveAssignment() {
 }
 
 func demoFullLifecycle() {
-	fmt.Println("\n--- Test: Full Lifecycle Under Concurrency ---")
+	fmt.Println()
+	fmt.Println("--- Test: Full Lifecycle Under Concurrency ---")
 	const tasks = 50
 
 	sched := NewTaskScheduler()
@@ -1069,7 +1067,8 @@ func demoFullLifecycle() {
 }
 
 func demoStressTest() {
-	fmt.Println("\n--- Test: Stress Test (100 concurrent operations) ---")
+	fmt.Println()
+	fmt.Println("--- Test: Stress Test (100 concurrent operations) ---")
 	const ops = 100
 
 	sched := NewTaskScheduler()
@@ -1097,13 +1096,15 @@ func demoStressTest() {
 
 func main() {
 	fmt.Println("=== Concurrent Test Suite Demonstration ===")
-	fmt.Println("  Using ConcurrentTestRunner with barrier synchronization\n")
+	fmt.Println("  Using ConcurrentTestRunner with barrier synchronization")
+	fmt.Println()
 
 	demoExclusiveAssignment()
 	demoFullLifecycle()
 	demoStressTest()
 
-	fmt.Println("\n=== Key Patterns ===")
+	fmt.Println()
+	fmt.Println("=== Key Patterns ===")
 	fmt.Println("  1. Barrier: all goroutines start at exactly the same time")
 	fmt.Println("  2. Error collection: atomic.Value stores per-goroutine errors")
 	fmt.Println("  3. No time.Sleep: synchronization via channels, not timers")

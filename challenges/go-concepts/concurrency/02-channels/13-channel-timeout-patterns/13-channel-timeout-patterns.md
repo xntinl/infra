@@ -296,12 +296,14 @@ func demonstrateTimerFix() {
 }
 
 func main() {
-	fmt.Println("=== Timer Leak Demonstration ===\n")
+	fmt.Println("=== Timer Leak Demonstration ===")
+	fmt.Println()
 	demonstrateTimerLeak()
 	fmt.Println()
 	demonstrateTimerFix()
 
-	fmt.Println("\n=== Summary ===")
+	fmt.Println()
+	fmt.Println("=== Summary ===")
 	fmt.Println("time.After in a loop: new timer each iteration (leaks until fired)")
 	fmt.Println("time.NewTimer + Reset: one timer reused (no leak)")
 	fmt.Println("Rule: use time.After only in one-shot selects, never in loops")
@@ -423,7 +425,8 @@ func main() {
 	}
 
 	if len(errors) > 0 {
-		fmt.Println("\nFailed calls:")
+		fmt.Println()
+		fmt.Println("Failed calls:")
 		for _, err := range errors {
 			fmt.Printf("  %v\n", err)
 		}

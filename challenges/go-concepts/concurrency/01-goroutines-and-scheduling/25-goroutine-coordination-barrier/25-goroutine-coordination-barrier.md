@@ -125,8 +125,6 @@ func printResults(phase string, results []TaskResult) {
 }
 
 func main() {
-	rand.Seed(time.Now().UnixNano())
-
 	fmt.Println("=== Phase Barrier: Basic ===")
 
 	validate := NewPhaseBarrier("validate")
@@ -147,7 +145,8 @@ func main() {
 	}
 
 	if !allPassed {
-		fmt.Println("\n  Pipeline aborted: validation failed")
+		fmt.Println()
+		fmt.Println("  Pipeline aborted: validation failed")
 		return
 	}
 
@@ -159,7 +158,8 @@ func main() {
 	})
 	printResults("migrate", results)
 
-	fmt.Println("\n  Pipeline complete")
+	fmt.Println()
+	fmt.Println("  Pipeline complete")
 }
 ```
 
@@ -283,11 +283,10 @@ func cancellableTask(name string, duration time.Duration, shouldFail bool) func(
 }
 
 func main() {
-	rand.Seed(time.Now().UnixNano())
-
 	fmt.Println("=== Fail-Fast Barrier ===")
 
-	fmt.Println("\n--- Scenario 1: All tasks succeed ---")
+	fmt.Println()
+	fmt.Println("--- Scenario 1: All tasks succeed ---")
 	barrier1 := NewFailFastBarrier("deploy-checks")
 	results, ok := barrier1.Run(map[string]func(cancel <-chan struct{}) error{
 		"health-check":  cancellableTask("health", 100*time.Millisecond, false),
@@ -296,7 +295,8 @@ func main() {
 	})
 	printPhaseResults("deploy-checks", results, ok)
 
-	fmt.Println("\n--- Scenario 2: One task fails fast ---")
+	fmt.Println()
+	fmt.Println("--- Scenario 2: One task fails fast ---")
 	barrier2 := NewFailFastBarrier("validation")
 	results, ok = barrier2.Run(map[string]func(cancel <-chan struct{}) error{
 		"schema-check":  cancellableTask("schema", 500*time.Millisecond, false),
@@ -307,7 +307,8 @@ func main() {
 	printPhaseResults("validation", results, ok)
 
 	if !ok {
-		fmt.Println("\n  Pipeline halted: fail-fast triggered")
+		fmt.Println()
+		fmt.Println("  Pipeline halted: fail-fast triggered")
 		fmt.Println("  Note: slow tasks were cancelled, saving ~400ms of wasted work")
 	}
 }
@@ -549,11 +550,10 @@ func statusString(ok bool) string {
 }
 
 func main() {
-	rand.Seed(time.Now().UnixNano())
-
 	fmt.Println("=== Deploy Orchestrator ===")
 
-	fmt.Println("\n--- Run 1: All phases succeed ---")
+	fmt.Println()
+	fmt.Println("--- Run 1: All phases succeed ---")
 	pipeline1 := NewDeployPipeline()
 	pipeline1.AddPhase("validate", map[string]func(cancel <-chan struct{}) error{
 		"validate-db-schema":  deployTask("db-schema", 0),
@@ -571,7 +571,8 @@ func main() {
 	})
 	printReport(pipeline1.Execute())
 
-	fmt.Println("\n--- Run 2: Migration fails (deploy never runs) ---")
+	fmt.Println()
+	fmt.Println("--- Run 2: Migration fails (deploy never runs) ---")
 	pipeline2 := NewDeployPipeline()
 	pipeline2.AddPhase("validate", map[string]func(cancel <-chan struct{}) error{
 		"validate-db-schema":  deployTask("db-schema", 0),

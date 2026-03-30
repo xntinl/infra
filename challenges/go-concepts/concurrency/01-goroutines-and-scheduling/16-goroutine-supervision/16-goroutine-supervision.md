@@ -120,7 +120,8 @@ func main() {
 
 	worker := NewWorker("metrics-collector", metricsTask)
 
-	fmt.Println("=== Single Worker with Recovery ===\n")
+	fmt.Println("=== Single Worker with Recovery ===")
+	fmt.Println()
 	go worker.RunWithRecovery(crashes, done)
 
 	go func() {
@@ -317,7 +318,8 @@ func (s *Supervisor) PrintStatus() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	fmt.Println("\n  === Supervisor Status ===")
+	fmt.Println()
+	fmt.Println("  === Supervisor Status ===")
 	fmt.Println("  Worker               Restarts  Status")
 	fmt.Println("  ──────               ────────  ──────")
 	for _, ws := range s.statuses {
@@ -346,7 +348,8 @@ func main() {
 		fmt.Printf("  [%s] tick %d: warmed %d keys\n", name, i, rand.Intn(100)+50)
 	})
 
-	fmt.Println("=== Supervisor Managing 3 Workers ===\n")
+	fmt.Println("=== Supervisor Managing 3 Workers ===")
+	fmt.Println()
 	sup.StartAll()
 	sup.PrintStatus()
 }
@@ -538,7 +541,8 @@ func (s *Supervisor) PrintReport() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	fmt.Println("\n  === Supervisor Final Report ===")
+	fmt.Println()
+	fmt.Println("  === Supervisor Final Report ===")
 	fmt.Println("  Worker               Restarts  Status")
 	fmt.Println("  ──────               ────────  ──────")
 	for _, ws := range s.statuses {
@@ -553,7 +557,8 @@ func (s *Supervisor) PrintReport() {
 
 	fmt.Printf("\n  Total crashes recorded: %d\n", len(s.crashes))
 	if len(s.crashes) > 0 {
-		fmt.Println("\n  --- Crash Log ---")
+		fmt.Println()
+		fmt.Println("  --- Crash Log ---")
 		for _, c := range s.crashes {
 			fmt.Printf("  %s  %-20s  restart #%d  %s\n",
 				c.Timestamp.Format("15:04:05.000"), c.WorkerName,
@@ -586,7 +591,8 @@ func main() {
 		fmt.Printf("  [%s] tick %d: warmed %d keys\n", name, i, rand.Intn(100)+50)
 	})
 
-	fmt.Println("=== Supervisor with Flaky Worker ===\n")
+	fmt.Println("=== Supervisor with Flaky Worker ===")
+	fmt.Println()
 	sup.StartAll()
 	sup.PrintReport()
 }
@@ -789,7 +795,8 @@ func (s *Supervisor) PrintFinalReport() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	fmt.Println("\n  ╔══════════════════════════════════════════════════╗")
+	fmt.Println()
+	fmt.Println("  ╔══════════════════════════════════════════════════╗")
 	fmt.Println("  ║           SUPERVISOR FINAL REPORT                ║")
 	fmt.Println("  ╠══════════════════════════════════════════════════╣")
 
@@ -824,7 +831,8 @@ func (s *Supervisor) PrintFinalReport() {
 	fmt.Println("  ╚══════════════════════════════════════════════════╝")
 
 	if len(s.crashes) > 0 {
-		fmt.Println("\n  --- Full Crash History ---")
+		fmt.Println()
+		fmt.Println("  --- Full Crash History ---")
 		for i, c := range s.crashes {
 			fmt.Printf("  %2d. %s  %-20s  attempt #%d  %s\n",
 				i+1, c.Timestamp.Format("15:04:05.000"),
@@ -833,7 +841,8 @@ func (s *Supervisor) PrintFinalReport() {
 	}
 
 	if failed > 0 {
-		fmt.Println("\n  ACTION REQUIRED: Some workers are permanently failed.")
+		fmt.Println()
+		fmt.Println("  ACTION REQUIRED: Some workers are permanently failed.")
 		fmt.Println("  Investigate crash reasons above and deploy a fix.")
 	}
 }
@@ -869,7 +878,8 @@ func main() {
 			name, i, rand.Intn(100)+50)
 	})
 
-	fmt.Println("=== Goroutine Supervision: Permanent Failure ===\n")
+	fmt.Println("=== Goroutine Supervision: Permanent Failure ===")
+	fmt.Println()
 	start := time.Now()
 	sup.StartAll()
 	elapsed := time.Since(start)

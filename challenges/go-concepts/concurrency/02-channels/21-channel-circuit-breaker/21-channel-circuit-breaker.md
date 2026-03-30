@@ -306,18 +306,22 @@ func main() {
 		fmt.Printf("  call %d: FAILURE -> allowed=%v (breaker: %s)\n", i, allowed, state)
 	}
 
-	fmt.Println("\n=== Phase 2: Rejected while open ===")
+	fmt.Println()
+	fmt.Println("=== Phase 2: Rejected while open ===")
 	allowed, state := cb.Call(true)
 	fmt.Printf("  call 5: SUCCESS -> allowed=%v (breaker: %s)\n", allowed, state)
 
-	fmt.Println("\n=== Phase 3: Wait for cooldown ===")
+	fmt.Println()
+	fmt.Println("=== Phase 3: Wait for cooldown ===")
 	time.Sleep(cooldownDuration + 50*time.Millisecond)
 
-	fmt.Println("\n=== Phase 4: Probe succeeds ===")
+	fmt.Println()
+	fmt.Println("=== Phase 4: Probe succeeds ===")
 	allowed, state = cb.Call(true)
 	fmt.Printf("  call 6: SUCCESS -> allowed=%v (breaker: %s)\n", allowed, state)
 
-	fmt.Println("\n=== Phase 5: Normal traffic resumes ===")
+	fmt.Println()
+	fmt.Println("=== Phase 5: Normal traffic resumes ===")
 	for i := 7; i <= 9; i++ {
 		allowed, state = cb.Call(true)
 		fmt.Printf("  call %d: SUCCESS -> allowed=%v (breaker: %s)\n", i, allowed, state)
@@ -501,7 +505,8 @@ func main() {
 		time.Sleep(callInterval)
 	}
 
-	fmt.Println("\n=== Summary ===")
+	fmt.Println()
+	fmt.Println("=== Summary ===")
 	fmt.Printf("Total calls:  %d\n", totalCalls)
 	fmt.Printf("Allowed:      %d (succeeded: %d, failed: %d)\n", allowed, succeeded, failed)
 	fmt.Printf("Rejected:     %d (saved from calling failing API)\n", rejected)
@@ -722,7 +727,8 @@ func main() {
 		time.Sleep(timelineCallDelay)
 	}
 
-	fmt.Println("\n=== State Transition Timeline ===")
+	fmt.Println()
+	fmt.Println("=== State Transition Timeline ===")
 	fmt.Printf("%-10s %-12s %-12s %s\n", "TIME", "FROM", "TO", "REASON")
 	fmt.Println("------------------------------------------------")
 	for _, t := range cb.Transitions() {

@@ -85,23 +85,23 @@ func cpuHeavyWork(stop <-chan struct{}, wg *sync.WaitGroup) {
 	}
 }
 
-func collectResults(results <-chan time.Duration, count int) (min, max, avg time.Duration) {
-	min = time.Hour
+func collectResults(results <-chan time.Duration, count int) (minD, maxD, avgD time.Duration) {
+	minD = time.Hour
 	var total time.Duration
 	collected := 0
 
 	for collected < count {
 		d := <-results
 		total += d
-		if d < min {
-			min = d
+		if d < minD {
+			minD = d
 		}
-		if d > max {
-			max = d
+		if d > maxD {
+			maxD = d
 		}
 		collected++
 	}
-	avg = total / time.Duration(count)
+	avgD = total / time.Duration(count)
 	return
 }
 
@@ -129,28 +129,24 @@ func main() {
 
 	stop2 := make(chan struct{})
 	results2 := make(chan time.Duration, numMeasurements)
-	var wg2 sync.WaitGroup
+	var wgHeavy sync.WaitGroup
+	var wgMeasure sync.WaitGroup
 
 	for i := 0; i < numHeavy; i++ {
-		wg2.Add(1)
-		go cpuHeavyWork(stop2, &wg2)
+		wgHeavy.Add(1)
+		go cpuHeavyWork(stop2, &wgHeavy)
 	}
 
 	time.Sleep(50 * time.Millisecond) // let CPU goroutines saturate
 
-	wg2.Add(1)
-	go measureLatency("starved", stop2, &wg2, results2)
-
-	// wait only for the measurement goroutine's results
-	for i := 0; i < numMeasurements; i++ {
-		d := <-results2
-		results <- d
-	}
+	wgMeasure.Add(1)
+	go measureLatency("starved", stop2, &wgMeasure, results2)
+	wgMeasure.Wait()
 
 	close(stop2)
-	wg2.Wait()
+	wgHeavy.Wait()
 
-	minS, maxS, avgS := collectResults(results, numMeasurements)
+	minS, maxS, avgS := collectResults(results2, numMeasurements)
 	fmt.Printf("  Latency overhead: min=%v avg=%v max=%v\n", minS.Round(time.Microsecond), avgS.Round(time.Microsecond), maxS.Round(time.Microsecond))
 
 	if avgS > avgB*2 {
@@ -321,7 +317,8 @@ func main() {
 		throughputCost := (1.0 - float64(opsYes)/float64(opsNo)) * 100
 		fmt.Printf("  Throughput cost: %.1f%% fewer batches\n", throughputCost)
 	}
-	fmt.Println("\n  Gosched trades a small throughput cost for significantly better latency fairness")
+	fmt.Println()
+	fmt.Println("  Gosched trades a small throughput cost for significantly better latency fairness")
 }
 ```
 
@@ -485,7 +482,8 @@ func main() {
 			result.Throughput)
 	}
 
-	fmt.Println("\n=== Analysis ===")
+	fmt.Println()
+	fmt.Println("=== Analysis ===")
 	fmt.Println("  - GOMAXPROCS=1: all goroutines share one processor, highest starvation")
 	fmt.Println("  - More processors: latency-sensitive goroutines find idle processors faster")
 	fmt.Println("  - Diminishing returns: beyond CPU core count, adding processors has no effect")

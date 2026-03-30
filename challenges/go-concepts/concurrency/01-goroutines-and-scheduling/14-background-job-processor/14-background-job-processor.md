@@ -244,7 +244,8 @@ func main() {
 	progress := make(chan ProgressUpdate, 100)
 	var wg sync.WaitGroup
 
-	fmt.Println("=== Launching 3 Concurrent CSV Jobs ===\n")
+	fmt.Println("=== Launching 3 Concurrent CSV Jobs ===")
+	fmt.Println()
 
 	for _, j := range jobs {
 		wg.Add(1)
@@ -417,7 +418,8 @@ func (jt *JobTracker) PrintSummary() {
 	jt.mu.Lock()
 	defer jt.mu.Unlock()
 
-	fmt.Println("\n  === Job Summary ===")
+	fmt.Println()
+	fmt.Println("  === Job Summary ===")
 	totalRows := 0
 	for _, job := range jt.jobs {
 		elapsed := job.DoneAt.Sub(job.StartedAt)
@@ -505,7 +507,8 @@ func main() {
 		{"import-skus", 5},
 	}
 
-	fmt.Println("=== Job Tracker Dashboard ===\n")
+	fmt.Println("=== Job Tracker Dashboard ===")
+	fmt.Println()
 
 	for _, u := range uploads {
 		rows := generateRows(u.count)
@@ -639,7 +642,8 @@ func (jt *JobTracker) PrintReport() {
 	}
 	sort.Strings(ids)
 
-	fmt.Println("\n  === Final Job Report ===")
+	fmt.Println()
+	fmt.Println("  === Final Job Report ===")
 	fmt.Println("  Job              Status    Progress     Error")
 	fmt.Println("  ───              ──────    ────────     ─────")
 	for _, id := range ids {
@@ -715,7 +719,8 @@ func main() {
 		{"import-products", 6, -1},
 	}
 
-	fmt.Println("=== Background Jobs with Panic Recovery ===\n")
+	fmt.Println("=== Background Jobs with Panic Recovery ===")
+	fmt.Println()
 
 	for _, j := range jobs {
 		rows := generateRows(j.rows)

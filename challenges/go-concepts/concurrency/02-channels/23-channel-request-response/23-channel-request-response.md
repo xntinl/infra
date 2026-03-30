@@ -226,7 +226,7 @@ SET user:1           value: "alice"  found: true
 SET user:2           value: "bob"  found: true
 GET user:1           value: "alice"  found: true
 GET user:99          error: key "user:99" not found
-DELETE user:2        found: true
+DELETE user:2        value: ""  found: true
 GET user:2           error: key "user:2" not found
 ```
 

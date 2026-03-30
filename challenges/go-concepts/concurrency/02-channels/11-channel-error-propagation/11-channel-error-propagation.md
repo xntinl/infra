@@ -351,7 +351,8 @@ func main() {
 	for _, r := range validRecords {
 		fmt.Printf("  %s <%s>\n", r.Name, r.Email)
 	}
-	fmt.Println("\n=== Errors (sent to error log) ===")
+	fmt.Println()
+	fmt.Println("=== Errors (sent to error log) ===")
 	for _, err := range collectedErrors {
 		fmt.Printf("  %v\n", err)
 	}

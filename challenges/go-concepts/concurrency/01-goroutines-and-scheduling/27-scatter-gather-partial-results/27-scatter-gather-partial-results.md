@@ -64,14 +64,14 @@ func (s ResultStatus) String() string {
 type ServiceResult struct {
 	ServiceName string
 	Status      ResultStatus
-	Data        interface{}
+	Data        any
 	Error       string
 	Duration    time.Duration
 }
 
 type ServiceCall struct {
 	Name string
-	Fn   func() (interface{}, error)
+	Fn   func() (any, error)
 }
 
 func main() {
@@ -163,14 +163,14 @@ func (s ResultStatus) String() string {
 type ServiceResult struct {
 	ServiceName string
 	Status      ResultStatus
-	Data        interface{}
+	Data        any
 	Error       string
 	Duration    time.Duration
 }
 
 type ServiceCall struct {
 	Name string
-	Fn   func() (interface{}, error)
+	Fn   func() (any, error)
 }
 
 type ScatterGatherResult struct {
@@ -250,23 +250,23 @@ func ScatterGather(calls []ServiceCall, deadline time.Duration) ScatterGatherRes
 
 func main() {
 	calls := []ServiceCall{
-		{Name: "profile", Fn: func() (interface{}, error) {
+		{Name: "profile", Fn: func() (any, error) {
 			time.Sleep(50 * time.Millisecond)
 			return map[string]string{"name": "Alice", "email": "alice@example.com"}, nil
 		}},
-		{Name: "orders", Fn: func() (interface{}, error) {
+		{Name: "orders", Fn: func() (any, error) {
 			time.Sleep(120 * time.Millisecond)
 			return "3 recent orders", nil
 		}},
-		{Name: "recommendations", Fn: func() (interface{}, error) {
+		{Name: "recommendations", Fn: func() (any, error) {
 			time.Sleep(800 * time.Millisecond)
 			return "5 items", nil
 		}},
-		{Name: "notifications", Fn: func() (interface{}, error) {
+		{Name: "notifications", Fn: func() (any, error) {
 			time.Sleep(30 * time.Millisecond)
 			return nil, errors.New("503 Service Unavailable")
 		}},
-		{Name: "reviews", Fn: func() (interface{}, error) {
+		{Name: "reviews", Fn: func() (any, error) {
 			time.Sleep(200 * time.Millisecond)
 			return "4.5 stars (128 reviews)", nil
 		}},
@@ -356,14 +356,14 @@ const (
 type ServiceResult struct {
 	ServiceName string
 	Status      ResultStatus
-	Data        interface{}
+	Data        any
 	Error       string
 	Duration    time.Duration
 }
 
 type ServiceCall struct {
 	Name string
-	Fn   func() (interface{}, error)
+	Fn   func() (any, error)
 }
 
 type ScatterGatherResult struct {
@@ -482,7 +482,7 @@ func makeServiceCalls(rng *rand.Rand) []ServiceCall {
 
 		calls[i] = ServiceCall{
 			Name: cfg.name,
-			Fn: func() (interface{}, error) {
+			Fn: func() (any, error) {
 				time.Sleep(latency)
 				if willFail {
 					return nil, errors.New("service error")
@@ -495,7 +495,6 @@ func makeServiceCalls(rng *rand.Rand) []ServiceCall {
 }
 
 func main() {
-	rand.Seed(time.Now().UnixNano())
 	stats := NewAggregateStats()
 
 	fmt.Printf("=== BFF Scatter-Gather Simulation ===\n")

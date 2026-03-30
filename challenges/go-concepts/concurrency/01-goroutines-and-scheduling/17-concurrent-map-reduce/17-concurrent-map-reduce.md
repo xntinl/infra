@@ -105,7 +105,6 @@ func printReport(label string, report RevenueReport, elapsed time.Duration) {
 }
 
 func main() {
-	rand.Seed(42)
 	transactions := generateTransactions(transactionCount)
 
 	start := time.Now()
@@ -245,7 +244,6 @@ func printPartials(partials []PartialResult) {
 }
 
 func main() {
-	rand.Seed(42)
 	transactions := generateTransactions(transactionCount)
 	chunks := partition(transactions, chunkSize)
 
@@ -442,7 +440,6 @@ func printReport(label string, report RevenueReport, elapsed time.Duration) {
 }
 
 func main() {
-	rand.Seed(42)
 	transactions := generateTransactions(transactionCount)
 
 	start := time.Now()
@@ -666,7 +663,6 @@ func benchmark(label string, fn func() RevenueReport, runs int) time.Duration {
 }
 
 func main() {
-	rand.Seed(42)
 	transactions := generateTransactions(transactionCount)
 
 	seqAvg := benchmark("Sequential", func() RevenueReport {
@@ -710,7 +706,8 @@ func main() {
 			r.Label, r.Chunks, r.AvgTime.Round(time.Microsecond), r.Speedup)
 	}
 
-	fmt.Println("\n--- Analysis ---")
+	fmt.Println()
+	fmt.Println("--- Analysis ---")
 	fmt.Println("  1 chunk  = pure sequential (no goroutine overhead)")
 	fmt.Println("  2-4 chunks = sweet spot (matches typical core count)")
 	fmt.Println("  1000 chunks = goroutine creation overhead dominates")

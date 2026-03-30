@@ -140,7 +140,6 @@ package main
 
 import (
 	"fmt"
-	"sync"
 	"time"
 )
 
@@ -250,9 +249,6 @@ func main() {
 	fmt.Println("-------------------------------")
 
 	critBeforeInfo := true
-	var wg sync.WaitGroup
-	_ = wg // suppress unused warning for sync import in verification
-
 	firstInfoPos := -1
 	lastCritPos := -1
 	for i, alert := range processed {

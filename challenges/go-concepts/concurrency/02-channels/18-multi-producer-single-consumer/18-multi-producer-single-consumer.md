@@ -232,7 +232,8 @@ func main() {
 	aggregator.Consume(logCh)
 	aggregator.Report()
 
-	fmt.Println("\nProblem: time.Sleep is fragile. If producers are slower, we miss entries.")
+	fmt.Println()
+	fmt.Println("Problem: time.Sleep is fragile. If producers are slower, we miss entries.")
 	fmt.Println("Solution: WaitGroup-close pattern (Step 3).")
 }
 ```
@@ -313,12 +314,14 @@ func (la *LogAggregator) Report() {
 	fmt.Printf("\n=== Aggregator Report ===\n")
 	fmt.Printf("Total entries: %d\n", la.totalEntries)
 
-	fmt.Println("\nBy service:")
+	fmt.Println()
+	fmt.Println("By service:")
 	for service, count := range la.entriesByService {
 		fmt.Printf("  %-12s: %d\n", service, count)
 	}
 
-	fmt.Println("\nBy level:")
+	fmt.Println()
+	fmt.Println("By level:")
 	for level, count := range la.entriesByLevel {
 		fmt.Printf("  %-5s: %d\n", level, count)
 	}
@@ -367,7 +370,8 @@ func main() {
 	// This is NOT a producer -- it only manages the channel lifecycle.
 	go func() {
 		wg.Wait()
-		fmt.Println("\n  [coordinator] all producers finished, closing channel")
+		fmt.Println()
+		fmt.Println("  [coordinator] all producers finished, closing channel")
 		close(logCh)
 	}()
 
@@ -375,7 +379,8 @@ func main() {
 	aggregator.Start(logCh)
 	aggregator.Report()
 
-	fmt.Println("\nPattern: WaitGroup tracks producers, coordinator closes channel.")
+	fmt.Println()
+	fmt.Println("Pattern: WaitGroup tracks producers, coordinator closes channel.")
 	fmt.Println("No producer closes the channel. No time.Sleep. No race.")
 }
 ```
@@ -418,7 +423,8 @@ type LogEntry struct {
 // demonstrateWrongClose shows what happens when a producer closes the shared channel.
 func demonstrateWrongClose() {
 	fmt.Println("=== WRONG: Producer Closes Channel ===")
-	fmt.Println("(Wrapped in recover to catch the panic)\n")
+	fmt.Println("(Wrapped in recover to catch the panic)")
+	fmt.Println()
 
 	logCh := make(chan LogEntry, 10)
 	var panicMessage interface{}
@@ -478,7 +484,9 @@ func demonstrateWrongClose() {
 
 // demonstrateCorrectClose shows the WaitGroup-close pattern.
 func demonstrateCorrectClose() {
-	fmt.Println("\n=== CORRECT: Coordinator Closes Channel ===\n")
+	fmt.Println()
+	fmt.Println("=== CORRECT: Coordinator Closes Channel ===")
+	fmt.Println()
 
 	logCh := make(chan LogEntry, 10)
 	var wg sync.WaitGroup
@@ -518,7 +526,8 @@ func main() {
 	demonstrateWrongClose()
 	demonstrateCorrectClose()
 
-	fmt.Println("\n=== Key Takeaway ===")
+	fmt.Println()
+	fmt.Println("=== Key Takeaway ===")
 	fmt.Println("  WRONG:   Any producer calls close() -> other producers panic on send")
 	fmt.Println("  CORRECT: WaitGroup + coordinator goroutine closes after all producers finish")
 	fmt.Println("  Rule:    Only the goroutine that KNOWS all sends are done should close the channel")

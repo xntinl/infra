@@ -223,7 +223,8 @@ func main() {
 
 	wg.Wait()
 	close(commands)
-	fmt.Println("\nAll clients finished")
+	fmt.Println()
+	fmt.Println("All clients finished")
 }
 ```
 
@@ -365,7 +366,8 @@ func main() {
 	}
 
 	// Query the full history.
-	fmt.Println("\n=== Transition History ===")
+	fmt.Println()
+	fmt.Println("=== Transition History ===")
 	history := queryHistory(commands)
 	fmt.Print(formatHistory(history))
 	fmt.Printf("\nTotal transitions: %d\n", len(history))
@@ -517,14 +519,16 @@ func main() {
 
 	fmt.Printf("\n=== Results: %d accepted, %d rejected ===\n", accepted, rejected)
 
-	fmt.Println("\n=== Final Transition History ===")
+	fmt.Println()
+	fmt.Println("=== Final Transition History ===")
 	history := queryHistory(commands)
 	fmt.Print(formatHistory(history))
 
 	close(commands)
 
 	// Print the state machine's invariant.
-	fmt.Println("\n=== State Machine Guarantees ===")
+	fmt.Println()
+	fmt.Println("=== State Machine Guarantees ===")
 	fmt.Println("- Single goroutine owns state: no mutex needed")
 	fmt.Println("- Commands serialized: no race conditions")
 	fmt.Println("- Invalid transitions rejected: state invariants enforced")

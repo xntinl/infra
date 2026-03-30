@@ -567,11 +567,13 @@ func main() {
 	baseline := runBaseline(keys, benchRequestsPerKey)
 	baseline.Print()
 
-	fmt.Println("\n=== With Coalescing ===")
+	fmt.Println()
+	fmt.Println("=== With Coalescing ===")
 	coalesced := runCoalesced(keys, benchRequestsPerKey)
 	coalesced.Print()
 
-	fmt.Println("\n=== Comparison ===")
+	fmt.Println()
+	fmt.Println("=== Comparison ===")
 	fmt.Printf("  DB calls: %d -> %d (%.0fx reduction)\n",
 		baseline.DBCalls, coalesced.DBCalls,
 		float64(baseline.DBCalls)/float64(coalesced.DBCalls))

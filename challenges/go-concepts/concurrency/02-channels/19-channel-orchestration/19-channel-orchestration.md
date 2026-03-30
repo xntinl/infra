@@ -264,7 +264,8 @@ func main() {
 
 	elapsed := time.Since(epoch).Round(time.Millisecond)
 	fmt.Printf("[%6s] DEPLOYMENT COMPLETE\n", elapsed)
-	fmt.Println("\nDependency graph:")
+	fmt.Println()
+	fmt.Println("Dependency graph:")
 	fmt.Println("  pull-image (A) --> run-migration (C) --+")
 	fmt.Println("                                          +--> start-app (D)")
 	fmt.Println("  seed-cache (B) ------------------------+")
@@ -369,7 +370,8 @@ func (o *Orchestrator) PrintTimeline() {
 		return sorted[i].Start < sorted[j].Start
 	})
 
-	fmt.Println("\n=== Deployment Timeline ===")
+	fmt.Println()
+	fmt.Println("=== Deployment Timeline ===")
 	fmt.Printf("%-20s %10s %10s %10s\n", "TASK", "START", "END", "DURATION")
 	fmt.Println("-------------------------------------------------------")
 	for _, r := range sorted {

@@ -206,7 +206,8 @@ func main() {
 	elapsed := time.Since(start).Round(time.Millisecond)
 	fmt.Printf("\nConsumed: %d lines in %v\n", consumed, elapsed)
 	fmt.Printf("Effective rate: ~%v per line\n", elapsed/time.Duration(consumed))
-	fmt.Println("\nObservation: producer fills buffer fast, then blocks repeatedly.")
+	fmt.Println()
+	fmt.Println("Observation: producer fills buffer fast, then blocks repeatedly.")
 	fmt.Println("Latency grows as entries wait longer in the buffer.")
 }
 ```
@@ -313,7 +314,8 @@ func main() {
 
 	elapsed := time.Since(start).Round(time.Millisecond)
 	fmt.Printf("\nTotal: %d lines in %v\n", consumed, elapsed)
-	fmt.Println("\nAnalysis:")
+	fmt.Println()
+	fmt.Println("Analysis:")
 	fmt.Println("- Producer starts at ~10ms/item (its natural rate)")
 	fmt.Println("- After buffer fills, producer slows to ~50ms/item (consumer's rate)")
 	fmt.Println("- Both rates equalize: this is backpressure in action")
@@ -429,7 +431,8 @@ func main() {
 	}
 
 	// Print comparison table.
-	fmt.Println("\n+--------+-----------+------------+------------+----------+")
+	fmt.Println()
+	fmt.Println("+--------+-----------+------------+------------+----------+")
 	fmt.Println("| Buffer | Total     | Avg Latency| Max Latency| Lines/s  |")
 	fmt.Println("+--------+-----------+------------+------------+----------+")
 	for _, r := range results {
@@ -438,7 +441,8 @@ func main() {
 	}
 	fmt.Println("+--------+-----------+------------+------------+----------+")
 
-	fmt.Println("\n=== Analysis ===")
+	fmt.Println()
+	fmt.Println("=== Analysis ===")
 	fmt.Println("Total time: roughly equal for all buffer sizes (consumer-limited).")
 	fmt.Println("  The consumer processes at 50ms/line regardless of buffer.")
 	fmt.Println()

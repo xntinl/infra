@@ -355,7 +355,8 @@ func main() {
 		fmt.Printf("  Send: %s -> %s\n", email.Subject, email.To)
 	}
 
-	fmt.Println("\nShutdown cascade:")
+	fmt.Println()
+	fmt.Println("Shutdown cascade:")
 	fmt.Println("  stage1 finishes -> closes ch1")
 	fmt.Println("  stage2 range exits -> closes ch2")
 	fmt.Println("  stage3 range exits -> closes ch3")
@@ -481,12 +482,14 @@ func main() {
 		fmt.Printf("  %s -> %s\n", email.Subject, email.To)
 	}
 
-	fmt.Println("\n=== Pipeline Metrics ===")
+	fmt.Println()
+	fmt.Println("=== Pipeline Metrics ===")
 	fmt.Println(genMetrics.Report())
 	fmt.Println(valMetrics.Report())
 	fmt.Println(emailMetrics.Report())
 
-	fmt.Println("\n=== Data Flow ===")
+	fmt.Println()
+	fmt.Println("=== Data Flow ===")
 	fmt.Println("  6 records in -> 3 validated -> 3 emails out")
 	fmt.Println("  3 records rejected at validation stage")
 }

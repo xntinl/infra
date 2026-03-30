@@ -150,7 +150,8 @@ func main() {
 	time.Sleep(100 * time.Millisecond)
 
 	server.Shutdown()
-	fmt.Println("\n  Server shut down cleanly")
+	fmt.Println()
+	fmt.Println("  Server shut down cleanly")
 }
 ```
 
@@ -400,7 +401,8 @@ func main() {
 	clientWg.Wait()
 	close(results)
 
-	fmt.Println("\n--- Client Results ---")
+	fmt.Println()
+	fmt.Println("--- Client Results ---")
 	for r := range results {
 		fmt.Printf("  %s\n", r)
 	}
@@ -705,7 +707,8 @@ func main() {
 
 	time.Sleep(1 * time.Second)
 
-	fmt.Println("\n--- Client Results ---")
+	fmt.Println()
+	fmt.Println("--- Client Results ---")
 	for i := 0; i < srvClients; i++ {
 		select {
 		case r := <-doneCh:
@@ -716,7 +719,8 @@ func main() {
 	}
 
 	server.Shutdown()
-	fmt.Println("\n  Server shut down cleanly")
+	fmt.Println()
+	fmt.Println("  Server shut down cleanly")
 }
 ```
 
@@ -1037,10 +1041,12 @@ func main() {
 
 	time.Sleep(1 * time.Second)
 
-	fmt.Println("\n--- Graceful Shutdown ---")
+	fmt.Println()
+	fmt.Println("--- Graceful Shutdown ---")
 	server.GracefulShutdown()
 
-	fmt.Println("\n--- Client Results ---")
+	fmt.Println()
+	fmt.Println("--- Client Results ---")
 	for i := 0; i < fullClients; i++ {
 		select {
 		case r := <-results:

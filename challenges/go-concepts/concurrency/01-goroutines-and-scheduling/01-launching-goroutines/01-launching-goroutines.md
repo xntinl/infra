@@ -237,7 +237,8 @@ func demonstrateBuggyCapture(endpoints []string) {
 }
 
 func demonstrateCorrectCapture(endpoints []string) {
-	fmt.Println("\n--- FIX: argument passing ---")
+	fmt.Println()
+	fmt.Println("--- FIX: argument passing ---")
 	var wg sync.WaitGroup
 	for i, ep := range endpoints {
 		wg.Add(1)

@@ -342,7 +342,8 @@ func printReport(responses []SupplierResponse, wallClock time.Duration) {
 			r.Supplier, r.Quantity, r.Latency.Round(time.Millisecond))
 	}
 
-	fmt.Println("\n  --- Failed Suppliers ---")
+	fmt.Println()
+	fmt.Println("  --- Failed Suppliers ---")
 	if len(failures) == 0 {
 		fmt.Println("  (none)")
 	}
