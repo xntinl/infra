@@ -1,8 +1,8 @@
 # Concurrency
 
-Go's concurrency model -- built on goroutines, channels, and the select statement -- is one of the language's defining features. These 75 exercises take you from spawning your first goroutine through production-grade patterns like pipelines, rate limiters, and graceful shutdown.
+Go's concurrency model -- built on goroutines, channels, and the select statement -- is one of the language's defining features. These 87 exercises take you from spawning your first goroutine through production-grade patterns like pipelines, rate limiters, and graceful shutdown.
 
-> 75 exercises | 9 sections | basic to advanced
+> 87 exercises | 9 sections | basic to advanced
 
 ---
 
@@ -20,6 +20,10 @@ Understand how Go's runtime manages lightweight threads: the GMP model, stack gr
 | 6 | [Cooperative Scheduling](01-goroutines-and-scheduling/06-cooperative-scheduling/06-cooperative-scheduling.md) | intermediate | 30m |
 | 7 | [Goroutine Per Request](01-goroutines-and-scheduling/07-goroutine-per-request/07-goroutine-per-request.md) | intermediate | 25m |
 | 8 | [A Million Goroutines](01-goroutines-and-scheduling/08-million-goroutines/08-million-goroutines.md) | advanced | 45m |
+| 9 | [Goroutine Lifecycle](01-goroutines-and-scheduling/09-goroutine-lifecycle/09-goroutine-lifecycle.md) | intermediate | 30m |
+| 10 | [Goroutine Leak Detection](01-goroutines-and-scheduling/10-goroutine-leak-detection/10-goroutine-leak-detection.md) | intermediate | 35m |
+| 11 | [Goroutine Error Handling](01-goroutines-and-scheduling/11-goroutine-error-handling/11-goroutine-error-handling.md) | intermediate | 30m |
+| 12 | [Goroutine Return Values](01-goroutines-and-scheduling/12-goroutine-return-values/12-goroutine-return-values.md) | intermediate | 25m |
 
 ---
 
@@ -39,6 +43,10 @@ Master Go's primary communication mechanism: unbuffered and buffered channels, d
 | 8 | [Channel of Channels](02-channels/08-channel-of-channels/08-channel-of-channels.md) | advanced | 35m |
 | 9 | [Buffered Channel as Semaphore](02-channels/09-buffered-channel-as-semaphore/09-buffered-channel-as-semaphore.md) | advanced | 30m |
 | 10 | [Channel vs Shared Memory](02-channels/10-channel-vs-shared-memory/10-channel-vs-shared-memory.md) | advanced | 35m |
+| 11 | [Channel Error Propagation](02-channels/11-channel-error-propagation/11-channel-error-propagation.md) | intermediate | 30m |
+| 12 | [Channel Ownership Patterns](02-channels/12-channel-ownership-patterns/12-channel-ownership-patterns.md) | intermediate | 30m |
+| 13 | [Channel Timeout Patterns](02-channels/13-channel-timeout-patterns/13-channel-timeout-patterns.md) | intermediate | 30m |
+| 14 | [Channel Pipeline Basics](02-channels/14-channel-pipeline-basics/14-channel-pipeline-basics.md) | intermediate | 30m |
 
 ---
 
@@ -56,6 +64,8 @@ Use Go's select statement for non-blocking operations, timeouts, priority tricks
 | 6 | [Done Channel Pattern](03-select-and-multiplexing/06-done-channel-pattern/06-done-channel-pattern.md) | intermediate | 25m |
 | 7 | [Heartbeat with Select](03-select-and-multiplexing/07-heartbeat-with-select/07-heartbeat-with-select.md) | advanced | 35m |
 | 8 | [Multiplexing N Sources](03-select-and-multiplexing/08-multiplexing-n-sources/08-multiplexing-n-sources.md) | advanced | 40m |
+| 9 | [Select with Context](03-select-and-multiplexing/09-select-with-context/09-select-with-context.md) | intermediate | 30m |
+| 10 | [Select Deadlock Prevention](03-select-and-multiplexing/10-select-deadlock-prevention/10-select-deadlock-prevention.md) | intermediate | 30m |
 
 ---
 
@@ -75,6 +85,8 @@ Explore the sync package: Mutex, RWMutex, WaitGroup, Once, Pool, Cond, and sync.
 | 8 | [Nested Locking and Deadlock](04-sync-primitives/08-nested-locking-deadlock/08-nested-locking-deadlock.md) | advanced | 35m |
 | 9 | [sync.Map: Concurrent Access](04-sync-primitives/09-sync-map-concurrent-access/09-sync-map-concurrent-access.md) | intermediate | 25m |
 | 10 | [Build a Thread-Safe Counter](04-sync-primitives/10-build-thread-safe-counter/10-build-thread-safe-counter.md) | advanced | 40m |
+| 11 | [WaitGroup Patterns](04-sync-primitives/11-waitgroup-patterns/11-waitgroup-patterns.md) | intermediate | 30m |
+| 12 | [Mutex Granularity](04-sync-primitives/12-mutex-granularity/12-mutex-granularity.md) | advanced | 35m |
 
 ---
 
