@@ -210,6 +210,8 @@
   },
   "active": "ce71c186b1594d7a",
   "lastOpenFiles": [
+    "challenges/go-concepts/concurrency/01-goroutines-and-scheduling/15-concurrent-file-processing/15-concurrent-file-processing.md",
+    "challenges/go-concepts/concurrency/02-channels/18-multi-producer-single-consumer/18-multi-producer-single-consumer.md",
     "challenges/go-concepts/concurrency/01-goroutines-and-scheduling/19-parallel-validation/19-parallel-validation.md",
     "challenges/go-concepts/concurrency/02-channels/21-channel-circuit-breaker/21-channel-circuit-breaker.md",
     "challenges/go-concepts/concurrency/02-channels/17-channel-streaming-backpressure/17-channel-streaming-backpressure.md",
@@ -244,8 +246,6 @@
     "challenges/go-concepts/concurrency/03-select-and-multiplexing/10-select-deadlock-prevention/10-select-deadlock-prevention.md",
     "challenges/go-concepts/concurrency/02-channels/12-channel-ownership-patterns/12-channel-ownership-patterns.md",
     "challenges/go-concepts/concurrency/01-goroutines-and-scheduling/09-goroutine-lifecycle/09-goroutine-lifecycle.md",
-    "challenges/go-concepts/concurrency/03-select-and-multiplexing/09-select-with-context/09-select-with-context.md",
-    "challenges/go-concepts/concurrency/02-channels/11-channel-error-propagation/11-channel-error-propagation.md",
     "Presentacion/poc-just/web/node_modules/ordered-binary/assets/powers-dre.png",
     "Presentacion/poc-just/web/node_modules/retry/equation.gif",
     "Untitled.canvas"

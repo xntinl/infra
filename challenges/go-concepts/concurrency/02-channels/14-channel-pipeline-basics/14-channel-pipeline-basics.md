@@ -575,7 +575,7 @@ for _, u := range validated {
 3. How does the shutdown cascade work when the first stage finishes?
 
 ## What's Next
-You have completed the channels section. Continue to section [03-select-and-multiplexing](../../03-select-and-multiplexing/01-select-basics/01-select-basics.md) to learn how `select` lets you wait on multiple channel operations simultaneously -- the tool that makes advanced pipeline patterns like fan-out, fan-in, and cancellation possible.
+Continue to [15-channel-event-bus](../15-channel-event-bus/15-channel-event-bus.md) to build a publish-subscribe event bus where multiple subscriber goroutines each receive events through their own dedicated channel.
 
 ## Summary
 - A pipeline is a series of stages connected by channels, each running as a goroutine
