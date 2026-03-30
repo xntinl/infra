@@ -210,6 +210,10 @@
   },
   "active": "ce71c186b1594d7a",
   "lastOpenFiles": [
+    "challenges/go-concepts/concurrency/01-goroutines-and-scheduling/14-background-job-processor/14-background-job-processor.md",
+    "challenges/go-concepts/concurrency/01-goroutines-and-scheduling/18-connection-pool/18-connection-pool.md",
+    "challenges/go-concepts/concurrency/02-channels/20-bounded-work-queue/20-bounded-work-queue.md",
+    "challenges/go-concepts/concurrency/02-channels/16-channel-state-machine/16-channel-state-machine.md",
     "challenges/go-concepts/concurrency/02-channels/19-channel-orchestration/19-channel-orchestration.md",
     "challenges/go-concepts/concurrency/01-goroutines-and-scheduling/17-concurrent-map-reduce/17-concurrent-map-reduce.md",
     "challenges/go-concepts/concurrency/02-channels/15-channel-event-bus/15-channel-event-bus.md",
@@ -242,10 +246,6 @@
     "challenges/go-concepts/concurrency/02-channels/07-nil-channel-behavior/07-nil-channel-behavior.md",
     "challenges/go-concepts/concurrency/02-channels/04-channel-direction/04-channel-direction.md",
     "challenges/go-concepts/concurrency/02-channels/03-buffered-channels/03-buffered-channels.md",
-    "challenges/go-concepts/concurrency/02-channels/02-channel-as-synchronization/02-channel-as-synchronization.md",
-    "challenges/go-concepts/concurrency/02-channels/01-unbuffered-channel-basics/01-unbuffered-channel-basics.md",
-    "challenges/go-concepts/concurrency/01-goroutines-and-scheduling/04-goroutine-stack-growth/04-goroutine-stack-growth.md",
-    "challenges/go-concepts/concurrency/01-goroutines-and-scheduling/03-gmp-model-in-action/03-gmp-model-in-action.md",
     "Presentacion/poc-just/web/node_modules/ordered-binary/assets/powers-dre.png",
     "Presentacion/poc-just/web/node_modules/retry/equation.gif",
     "Untitled.canvas"
