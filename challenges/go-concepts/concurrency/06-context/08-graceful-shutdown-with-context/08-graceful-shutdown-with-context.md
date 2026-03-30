@@ -45,30 +45,38 @@ import (
 	"time"
 )
 
+const (
+	autoShutdownDelay = 2 * time.Second
+	cleanupDelay      = 100 * time.Millisecond
+)
+
+func simulateSignal(delay time.Duration) {
+	time.Sleep(delay)
+	fmt.Println("[auto] triggering shutdown (simulating SIGTERM)")
+	p, _ := os.FindProcess(os.Getpid())
+	p.Signal(syscall.SIGTERM)
+}
+
+func runCleanup() {
+	fmt.Println("[server] starting cleanup...")
+	time.Sleep(cleanupDelay)
+	fmt.Println("[server] cleanup complete, exiting")
+}
+
 func main() {
-	// signal.NotifyContext: context is cancelled on SIGINT or SIGTERM.
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	// Auto-cancel after 2s for non-interactive testing.
-	go func() {
-		time.Sleep(2 * time.Second)
-		fmt.Println("[auto] triggering shutdown (simulating SIGTERM)")
-		// Send ourselves a signal for realistic behavior.
-		p, _ := os.FindProcess(os.Getpid())
-		p.Signal(syscall.SIGTERM)
-	}()
+	go simulateSignal(autoShutdownDelay)
 
 	fmt.Println("[server] running... (press Ctrl+C or wait 2s)")
 	fmt.Printf("[server] PID: %d\n", os.Getpid())
 
 	<-ctx.Done()
-	stop() // Reset signal handling so a second signal forces exit.
+	stop()
 
 	fmt.Printf("[server] shutdown signal received: %v\n", ctx.Err())
-	fmt.Println("[server] starting cleanup...")
-	time.Sleep(100 * time.Millisecond)
-	fmt.Println("[server] cleanup complete, exiting")
+	runCleanup()
 }
 ```
 
@@ -102,9 +110,15 @@ import (
 	"time"
 )
 
+const drainTimeout = 2 * time.Second
+
 type RequestProcessor struct {
-	wg       sync.WaitGroup
+	wg        sync.WaitGroup
 	accepting bool
+}
+
+func NewRequestProcessor() *RequestProcessor {
+	return &RequestProcessor{accepting: true}
 }
 
 func (rp *RequestProcessor) HandleRequest(ctx context.Context, reqID string) {
@@ -139,28 +153,29 @@ func (rp *RequestProcessor) DrainAndWait(timeout time.Duration) bool {
 	}
 }
 
+func (rp *RequestProcessor) StopAccepting() {
+	rp.accepting = false
+}
+
 func main() {
 	ctx, cancel := context.WithCancel(context.Background())
-	processor := &RequestProcessor{accepting: true}
+	processor := NewRequestProcessor()
 
-	// Simulate incoming requests.
 	processor.HandleRequest(ctx, "order-1")
 	processor.HandleRequest(ctx, "order-22")
 	processor.HandleRequest(ctx, "order-333")
 
 	time.Sleep(50 * time.Millisecond)
 
-	// Shutdown signal arrives.
 	fmt.Println("\n[system] SIGTERM received, stopping new requests")
-	processor.accepting = false
+	processor.StopAccepting()
 
-	// One more request arrives during shutdown -- should be rejected in real code.
 	fmt.Println("[system] rejecting new request: order-4444 (shutting down)")
 
-	fmt.Println("[system] draining in-flight requests (timeout: 2s)...")
-	cancel() // Signal all in-flight requests.
+	fmt.Printf("[system] draining in-flight requests (timeout: %v)...\n", drainTimeout)
+	cancel()
 
-	if processor.DrainAndWait(2 * time.Second) {
+	if processor.DrainAndWait(drainTimeout) {
 		fmt.Println("[system] all requests drained successfully")
 	} else {
 		fmt.Println("[system] drain timeout exceeded, some requests may be lost")
@@ -203,15 +218,30 @@ import (
 	"time"
 )
 
+const (
+	serverRunDuration = 1 * time.Second
+	shutdownTimeout   = 5 * time.Second
+	httpTickInterval  = 200 * time.Millisecond
+	queueTickInterval = 300 * time.Millisecond
+	httpDrainDelay    = 150 * time.Millisecond
+	queueCommitDelay  = 100 * time.Millisecond
+	dbCloseDelay      = 50 * time.Millisecond
+	logFlushDelay     = 30 * time.Millisecond
+)
+
 type Server struct {
 	wg sync.WaitGroup
 }
 
-func (s *Server) httpWorker(ctx context.Context, name string) {
+func NewServer() *Server {
+	return &Server{}
+}
+
+func (s *Server) StartHTTPWorker(ctx context.Context, name string) {
 	defer s.wg.Done()
 	fmt.Printf("[%s] listening\n", name)
 
-	ticker := time.NewTicker(200 * time.Millisecond)
+	ticker := time.NewTicker(httpTickInterval)
 	defer ticker.Stop()
 
 	count := 0
@@ -219,7 +249,7 @@ func (s *Server) httpWorker(ctx context.Context, name string) {
 		select {
 		case <-ctx.Done():
 			fmt.Printf("[%s] draining %d in-flight requests...\n", name, count%3)
-			time.Sleep(150 * time.Millisecond) // Simulate drain.
+			time.Sleep(httpDrainDelay)
 			fmt.Printf("[%s] stopped\n", name)
 			return
 		case <-ticker.C:
@@ -229,11 +259,11 @@ func (s *Server) httpWorker(ctx context.Context, name string) {
 	}
 }
 
-func (s *Server) queueConsumer(ctx context.Context, name string) {
+func (s *Server) StartQueueConsumer(ctx context.Context, name string) {
 	defer s.wg.Done()
 	fmt.Printf("[%s] polling queue\n", name)
 
-	ticker := time.NewTicker(300 * time.Millisecond)
+	ticker := time.NewTicker(queueTickInterval)
 	defer ticker.Stop()
 
 	count := 0
@@ -241,7 +271,7 @@ func (s *Server) queueConsumer(ctx context.Context, name string) {
 		select {
 		case <-ctx.Done():
 			fmt.Printf("[%s] finishing current message...\n", name)
-			time.Sleep(100 * time.Millisecond)
+			time.Sleep(queueCommitDelay)
 			fmt.Printf("[%s] committed offset, stopped\n", name)
 			return
 		case <-ticker.C:
@@ -251,57 +281,59 @@ func (s *Server) queueConsumer(ctx context.Context, name string) {
 	}
 }
 
+func (s *Server) WaitForWorkers(timeout time.Duration) bool {
+	workersDone := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(workersDone)
+	}()
+
+	select {
+	case <-workersDone:
+		return true
+	case <-time.After(timeout):
+		return false
+	}
+}
+
 func closeDatabase() {
 	fmt.Println("[db] closing connection pool...")
-	time.Sleep(50 * time.Millisecond)
+	time.Sleep(dbCloseDelay)
 	fmt.Println("[db] all connections returned to pool and closed")
 }
 
 func flushLogs() {
 	fmt.Println("[logs] flushing buffered log entries...")
-	time.Sleep(30 * time.Millisecond)
+	time.Sleep(logFlushDelay)
 	fmt.Println("[logs] 247 entries flushed to disk")
 }
 
 func main() {
 	rootCtx, rootCancel := context.WithCancel(context.Background())
-	server := &Server{}
+	server := NewServer()
 
-	// Start workers.
 	server.wg.Add(3)
-	go server.httpWorker(rootCtx, "http-8080")
-	go server.httpWorker(rootCtx, "http-8443")
-	go server.queueConsumer(rootCtx, "queue-orders")
+	go server.StartHTTPWorker(rootCtx, "http-8080")
+	go server.StartHTTPWorker(rootCtx, "http-8443")
+	go server.StartQueueConsumer(rootCtx, "queue-orders")
 
-	// Simulate running for 1 second, then shutdown.
-	time.Sleep(1 * time.Second)
+	time.Sleep(serverRunDuration)
 
 	fmt.Println("\n========================================")
 	fmt.Println("[system] SIGTERM received")
 	fmt.Println("[system] initiating graceful shutdown...")
 	fmt.Println("========================================\n")
 
-	// Phase 1: Signal all workers to stop.
 	rootCancel()
 
-	// Phase 2: Wait for workers with a 5-second timeout.
-	shutdownTimeout := 5 * time.Second
 	fmt.Printf("[system] waiting up to %v for workers to drain...\n\n", shutdownTimeout)
 
-	workersDone := make(chan struct{})
-	go func() {
-		server.wg.Wait()
-		close(workersDone)
-	}()
-
-	select {
-	case <-workersDone:
+	if server.WaitForWorkers(shutdownTimeout) {
 		fmt.Println("\n[system] all workers stopped gracefully")
-	case <-time.After(shutdownTimeout):
+	} else {
 		fmt.Println("\n[system] WARNING: shutdown timeout exceeded, forcing exit")
 	}
 
-	// Phase 3: Cleanup resources.
 	fmt.Println()
 	closeDatabase()
 	flushLogs()
@@ -364,7 +396,15 @@ import (
 	"time"
 )
 
-func processPayment(ctx context.Context, wg *sync.WaitGroup, id string) {
+const hardKillTimeout = 120 * time.Millisecond
+
+type PaymentProcessor struct{}
+
+func NewPaymentProcessor() *PaymentProcessor {
+	return &PaymentProcessor{}
+}
+
+func (p *PaymentProcessor) Process(ctx context.Context, wg *sync.WaitGroup, id string) {
 	defer wg.Done()
 	fmt.Printf("[payment] %s: debit started\n", id)
 	time.Sleep(100 * time.Millisecond)
@@ -378,7 +418,7 @@ func processPayment(ctx context.Context, wg *sync.WaitGroup, id string) {
 	}
 }
 
-func writeToDatabase(ctx context.Context, wg *sync.WaitGroup) {
+func writeTransactionLog(ctx context.Context, wg *sync.WaitGroup) {
 	defer wg.Done()
 	fmt.Println("[db] writing transaction log...")
 	select {
@@ -400,28 +440,30 @@ func flushMetrics(ctx context.Context, wg *sync.WaitGroup) {
 	}
 }
 
-func main() {
-	fmt.Println("=== Without Graceful Shutdown (hard kill after 120ms) ===\n")
-
-	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Millisecond)
-	defer cancel()
-
-	var wg sync.WaitGroup
-
-	wg.Add(1)
-	go processPayment(ctx, &wg, "PAY-001")
-	wg.Add(1)
-	go writeToDatabase(ctx, &wg)
-	wg.Add(1)
-	go flushMetrics(ctx, &wg)
-
-	wg.Wait()
-
+func printConsequences() {
 	fmt.Println("\n=== Consequences ===")
 	fmt.Println("1. Payment PAY-001: money debited but never credited")
 	fmt.Println("2. Transaction log: lost, no audit trail")
 	fmt.Println("3. Metrics: 1,247 data points gone, dashboards show gaps")
 	fmt.Println("\nThis is why graceful shutdown matters.")
+}
+
+func main() {
+	fmt.Printf("=== Without Graceful Shutdown (hard kill after %v) ===\n\n", hardKillTimeout)
+
+	ctx, cancel := context.WithTimeout(context.Background(), hardKillTimeout)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	processor := NewPaymentProcessor()
+
+	wg.Add(3)
+	go processor.Process(ctx, &wg, "PAY-001")
+	go writeTransactionLog(ctx, &wg)
+	go flushMetrics(ctx, &wg)
+
+	wg.Wait()
+	printConsequences()
 }
 ```
 
@@ -466,21 +508,39 @@ import (
 	"time"
 )
 
+const (
+	simulatedRunTime      = 1200 * time.Millisecond
+	gracefulShutdownLimit = 30 * time.Second
+	httpRequestInterval   = 250 * time.Millisecond
+	queuePollInterval     = 350 * time.Millisecond
+	schedulerInterval     = 400 * time.Millisecond
+	httpDrainTime         = 200 * time.Millisecond
+	queueOffsetCommitTime = 100 * time.Millisecond
+	schedulerStopTime     = 50 * time.Millisecond
+	dbPoolCloseTime       = 50 * time.Millisecond
+	logBufferFlushTime    = 30 * time.Millisecond
+	metricsCloseTime      = 20 * time.Millisecond
+)
+
 type Service struct {
 	wg sync.WaitGroup
 }
 
-func (s *Service) startHTTP(ctx context.Context) {
+func NewService() *Service {
+	return &Service{}
+}
+
+func (s *Service) StartHTTP(ctx context.Context) {
 	defer s.wg.Done()
 	fmt.Println("[http] server started on :8080")
-	ticker := time.NewTicker(250 * time.Millisecond)
+	ticker := time.NewTicker(httpRequestInterval)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
 			fmt.Println("[http] draining connections (5 in-flight)...")
-			time.Sleep(200 * time.Millisecond)
+			time.Sleep(httpDrainTime)
 			fmt.Println("[http] all connections drained")
 			return
 		case <-ticker.C:
@@ -489,17 +549,17 @@ func (s *Service) startHTTP(ctx context.Context) {
 	}
 }
 
-func (s *Service) startQueueConsumer(ctx context.Context) {
+func (s *Service) StartQueueConsumer(ctx context.Context) {
 	defer s.wg.Done()
 	fmt.Println("[queue] consumer started")
-	ticker := time.NewTicker(350 * time.Millisecond)
+	ticker := time.NewTicker(queuePollInterval)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
 			fmt.Println("[queue] committing current offset...")
-			time.Sleep(100 * time.Millisecond)
+			time.Sleep(queueOffsetCommitTime)
 			fmt.Println("[queue] offset committed, consumer stopped")
 			return
 		case <-ticker.C:
@@ -508,17 +568,17 @@ func (s *Service) startQueueConsumer(ctx context.Context) {
 	}
 }
 
-func (s *Service) startScheduler(ctx context.Context) {
+func (s *Service) StartScheduler(ctx context.Context) {
 	defer s.wg.Done()
 	fmt.Println("[scheduler] started")
-	ticker := time.NewTicker(400 * time.Millisecond)
+	ticker := time.NewTicker(schedulerInterval)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
 			fmt.Println("[scheduler] cancelling pending jobs...")
-			time.Sleep(50 * time.Millisecond)
+			time.Sleep(schedulerStopTime)
 			fmt.Println("[scheduler] stopped")
 			return
 		case <-ticker.C:
@@ -527,59 +587,66 @@ func (s *Service) startScheduler(ctx context.Context) {
 	}
 }
 
-func main() {
-	// signal.NotifyContext: the modern way to handle shutdown signals.
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
-
-	svc := &Service{}
-
-	// Start all components.
-	svc.wg.Add(3)
-	go svc.startHTTP(ctx)
-	go svc.startQueueConsumer(ctx)
-	go svc.startScheduler(ctx)
-
-	// Auto-trigger for testing (in production, wait for real signal).
-	go func() {
-		time.Sleep(1200 * time.Millisecond)
-		fmt.Println("\n[test] simulating SIGTERM...")
-		p, _ := os.FindProcess(os.Getpid())
-		p.Signal(syscall.SIGTERM)
-	}()
-
-	// Wait for shutdown signal.
-	<-ctx.Done()
-	stop() // Reset signal handling: second signal will force exit.
-
-	fmt.Println("\n======================================")
-	fmt.Println("[system] shutdown initiated")
-	fmt.Println("======================================")
-
-	// Wait for all workers with a 30-second timeout.
-	shutdownDeadline := 30 * time.Second
-	fmt.Printf("[system] waiting up to %v for workers...\n\n", shutdownDeadline)
-
+func (s *Service) WaitForWorkers(timeout time.Duration) bool {
 	done := make(chan struct{})
 	go func() {
-		svc.wg.Wait()
+		s.wg.Wait()
 		close(done)
 	}()
 
 	select {
 	case <-done:
+		return true
+	case <-time.After(timeout):
+		return false
+	}
+}
+
+func cleanupResources() {
+	fmt.Println("\n[cleanup] closing database pool...")
+	time.Sleep(dbPoolCloseTime)
+	fmt.Println("[cleanup] flushing log buffer...")
+	time.Sleep(logBufferFlushTime)
+	fmt.Println("[cleanup] closing metrics exporter...")
+	time.Sleep(metricsCloseTime)
+}
+
+func simulateShutdownSignal(delay time.Duration) {
+	time.Sleep(delay)
+	fmt.Println("\n[test] simulating SIGTERM...")
+	p, _ := os.FindProcess(os.Getpid())
+	p.Signal(syscall.SIGTERM)
+}
+
+func main() {
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	svc := NewService()
+
+	svc.wg.Add(3)
+	go svc.StartHTTP(ctx)
+	go svc.StartQueueConsumer(ctx)
+	go svc.StartScheduler(ctx)
+
+	go simulateShutdownSignal(simulatedRunTime)
+
+	<-ctx.Done()
+	stop()
+
+	fmt.Println("\n======================================")
+	fmt.Println("[system] shutdown initiated")
+	fmt.Println("======================================")
+
+	fmt.Printf("[system] waiting up to %v for workers...\n\n", gracefulShutdownLimit)
+
+	if svc.WaitForWorkers(gracefulShutdownLimit) {
 		fmt.Println("\n[system] all workers stopped")
-	case <-time.After(shutdownDeadline):
+	} else {
 		fmt.Println("\n[system] TIMEOUT: forcing exit (some workers did not stop)")
 	}
 
-	// Resource cleanup.
-	fmt.Println("\n[cleanup] closing database pool...")
-	time.Sleep(50 * time.Millisecond)
-	fmt.Println("[cleanup] flushing log buffer...")
-	time.Sleep(30 * time.Millisecond)
-	fmt.Println("[cleanup] closing metrics exporter...")
-	time.Sleep(20 * time.Millisecond)
+	cleanupResources()
 
 	fmt.Println("\n[system] graceful shutdown complete")
 }
@@ -678,56 +745,64 @@ import (
 	"time"
 )
 
-func main() {
-	ctx, cancel := context.WithCancel(context.Background())
-	var wg sync.WaitGroup
+const (
+	producerInterval   = 150 * time.Millisecond
+	consumerDelay      = 100 * time.Millisecond
+	systemRunDuration  = 800 * time.Millisecond
+	systemDrainTimeout = 2 * time.Second
+	workBufferSize     = 5
+)
 
-	work := make(chan int, 5)
+type Producer struct{}
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		defer close(work)
-		for i := 1; ; i++ {
-			select {
-			case <-ctx.Done():
-				fmt.Printf("[producer]   stopped after sending %d items\n", i-1)
-				return
-			case work <- i:
-				fmt.Printf("[producer]   sent item %d\n", i)
-				time.Sleep(150 * time.Millisecond)
-			}
-		}
-	}()
+func NewProducer() *Producer {
+	return &Producer{}
+}
 
-	startConsumer := func(name string) {
-		defer wg.Done()
-		count := 0
-		for {
-			select {
-			case <-ctx.Done():
-				fmt.Printf("[%s] stopped after %d items\n", name, count)
-				return
-			case item, ok := <-work:
-				if !ok {
-					fmt.Printf("[%s] channel closed, processed %d items\n", name, count)
-					return
-				}
-				count++
-				fmt.Printf("[%s] processed item %d\n", name, item)
-				time.Sleep(100 * time.Millisecond)
-			}
+func (p *Producer) Run(ctx context.Context, wg *sync.WaitGroup, work chan<- int) {
+	defer wg.Done()
+	defer close(work)
+	for i := 1; ; i++ {
+		select {
+		case <-ctx.Done():
+			fmt.Printf("[producer]   stopped after sending %d items\n", i-1)
+			return
+		case work <- i:
+			fmt.Printf("[producer]   sent item %d\n", i)
+			time.Sleep(producerInterval)
 		}
 	}
+}
 
-	wg.Add(2)
-	go startConsumer("consumer-A")
-	go startConsumer("consumer-B")
+type Consumer struct {
+	name string
+}
 
-	time.Sleep(800 * time.Millisecond)
-	fmt.Println("\n[system] initiating shutdown")
-	cancel()
+func NewConsumer(name string) *Consumer {
+	return &Consumer{name: name}
+}
 
+func (c *Consumer) Run(ctx context.Context, wg *sync.WaitGroup, work <-chan int) {
+	defer wg.Done()
+	count := 0
+	for {
+		select {
+		case <-ctx.Done():
+			fmt.Printf("[%s] stopped after %d items\n", c.name, count)
+			return
+		case item, ok := <-work:
+			if !ok {
+				fmt.Printf("[%s] channel closed, processed %d items\n", c.name, count)
+				return
+			}
+			count++
+			fmt.Printf("[%s] processed item %d\n", c.name, item)
+			time.Sleep(consumerDelay)
+		}
+	}
+}
+
+func waitWithTimeout(wg *sync.WaitGroup, timeout time.Duration) bool {
 	done := make(chan struct{})
 	go func() {
 		wg.Wait()
@@ -736,8 +811,35 @@ func main() {
 
 	select {
 	case <-done:
+		return true
+	case <-time.After(timeout):
+		return false
+	}
+}
+
+func main() {
+	ctx, cancel := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+
+	work := make(chan int, workBufferSize)
+
+	producer := NewProducer()
+	wg.Add(1)
+	go producer.Run(ctx, &wg, work)
+
+	consumerA := NewConsumer("consumer-A")
+	consumerB := NewConsumer("consumer-B")
+	wg.Add(2)
+	go consumerA.Run(ctx, &wg, work)
+	go consumerB.Run(ctx, &wg, work)
+
+	time.Sleep(systemRunDuration)
+	fmt.Println("\n[system] initiating shutdown")
+	cancel()
+
+	if waitWithTimeout(&wg, systemDrainTimeout) {
 		fmt.Println("[system] graceful shutdown complete")
-	case <-time.After(2 * time.Second):
+	} else {
 		fmt.Println("[system] shutdown timeout exceeded")
 	}
 }

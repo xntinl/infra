@@ -48,41 +48,55 @@ import (
 	"time"
 )
 
+const dbQueryLatency = 50 * time.Millisecond
+
+// Record represents a single database row.
 type Record struct {
 	ID   int
 	Name string
 }
 
+// Page holds a batch of records fetched in one query.
 type Page struct {
 	Number  int
 	Records []Record
 }
 
-func fetchPages(totalRecords, pageSize int) <-chan Page {
+// PageGenerator lazily fetches database pages on demand.
+type PageGenerator struct {
+	totalRecords int
+	pageSize     int
+}
+
+func NewPageGenerator(totalRecords, pageSize int) *PageGenerator {
+	return &PageGenerator{totalRecords: totalRecords, pageSize: pageSize}
+}
+
+func buildPage(pageNum, offset, end int) Page {
+	records := make([]Record, 0, end-offset)
+	for i := offset; i < end; i++ {
+		records = append(records, Record{
+			ID:   i + 1,
+			Name: fmt.Sprintf("record_%04d", i+1),
+		})
+	}
+	return Page{Number: pageNum, Records: records}
+}
+
+func (pg *PageGenerator) FetchPages() <-chan Page {
 	out := make(chan Page)
 	go func() {
+		defer close(out)
 		pageNum := 1
-		for offset := 0; offset < totalRecords; offset += pageSize {
-			end := offset + pageSize
-			if end > totalRecords {
-				end = totalRecords
+		for offset := 0; offset < pg.totalRecords; offset += pg.pageSize {
+			end := offset + pg.pageSize
+			if end > pg.totalRecords {
+				end = pg.totalRecords
 			}
-
-			// Simulate database query latency
-			time.Sleep(50 * time.Millisecond)
-
-			records := make([]Record, 0, end-offset)
-			for i := offset; i < end; i++ {
-				records = append(records, Record{
-					ID:   i + 1,
-					Name: fmt.Sprintf("record_%04d", i+1),
-				})
-			}
-
-			out <- Page{Number: pageNum, Records: records}
+			time.Sleep(dbQueryLatency)
+			out <- buildPage(pageNum, offset, end)
 			pageNum++
 		}
-		close(out)
 	}()
 	return out
 }
@@ -90,7 +104,9 @@ func fetchPages(totalRecords, pageSize int) <-chan Page {
 func main() {
 	fmt.Println("=== Paginated Generator (fetch all) ===")
 	start := time.Now()
-	pages := fetchPages(50, 10)
+
+	gen := NewPageGenerator(50, 10)
+	pages := gen.FetchPages()
 
 	var totalRecords int
 	for page := range pages {
@@ -133,40 +149,60 @@ import (
 	"time"
 )
 
+const (
+	dbQueryLatency     = 50 * time.Millisecond
+	pagesNeededForDemo = 3
+)
+
+// Record represents a single database row.
 type Record struct {
 	ID   int
 	Name string
 }
 
+// Page holds a batch of records fetched in one query.
 type Page struct {
 	Number  int
 	Records []Record
 }
 
-func fetchPagesWithCancel(done <-chan struct{}, totalRecords, pageSize int) <-chan Page {
+// PageGenerator lazily fetches database pages with cancellation support.
+type PageGenerator struct {
+	totalRecords int
+	pageSize     int
+}
+
+func NewPageGenerator(totalRecords, pageSize int) *PageGenerator {
+	return &PageGenerator{totalRecords: totalRecords, pageSize: pageSize}
+}
+
+func buildPage(pageNum, offset, end int) Page {
+	records := make([]Record, 0, end-offset)
+	for i := offset; i < end; i++ {
+		records = append(records, Record{
+			ID:   i + 1,
+			Name: fmt.Sprintf("record_%04d", i+1),
+		})
+	}
+	return Page{Number: pageNum, Records: records}
+}
+
+func (pg *PageGenerator) FetchWithCancel(done <-chan struct{}) <-chan Page {
 	out := make(chan Page)
 	go func() {
 		defer close(out)
 		pageNum := 1
-		for offset := 0; offset < totalRecords; offset += pageSize {
-			end := offset + pageSize
-			if end > totalRecords {
-				end = totalRecords
+		for offset := 0; offset < pg.totalRecords; offset += pg.pageSize {
+			end := offset + pg.pageSize
+			if end > pg.totalRecords {
+				end = pg.totalRecords
 			}
 
-			time.Sleep(50 * time.Millisecond)
+			time.Sleep(dbQueryLatency)
 			fmt.Printf("    [generator] fetched page %d from DB\n", pageNum)
 
-			records := make([]Record, 0, end-offset)
-			for i := offset; i < end; i++ {
-				records = append(records, Record{
-					ID:   i + 1,
-					Name: fmt.Sprintf("record_%04d", i+1),
-				})
-			}
-
 			select {
-			case out <- Page{Number: pageNum, Records: records}:
+			case out <- buildPage(pageNum, offset, end):
 				pageNum++
 			case <-done:
 				fmt.Printf("    [generator] canceled at page %d, stopping early\n", pageNum)
@@ -178,36 +214,43 @@ func fetchPagesWithCancel(done <-chan struct{}, totalRecords, pageSize int) <-ch
 	return out
 }
 
-func main() {
-	// Scenario 1: Load everything (wasteful)
+func demoFetchAll(gen *PageGenerator) {
 	fmt.Println("=== Without Early Stop: Fetch All 100 Pages ===")
 	start := time.Now()
-	done1 := make(chan struct{})
-	pages1 := fetchPagesWithCancel(done1, 1000, 10)
-	var count1 int
-	for range pages1 {
-		count1++
+	done := make(chan struct{})
+	pages := gen.FetchWithCancel(done)
+
+	var count int
+	for range pages {
+		count++
 	}
-	close(done1)
-	fmt.Printf("  Fetched %d pages in %v\n\n", count1, time.Since(start))
+	close(done)
+	fmt.Printf("  Fetched %d pages in %v\n\n", count, time.Since(start))
+}
 
-	// Scenario 2: Only need first 3 pages (efficient)
+func demoEarlyStop(gen *PageGenerator) {
 	fmt.Println("=== With Early Stop: Only Need 3 Pages ===")
-	start = time.Now()
-	done2 := make(chan struct{})
-	pages2 := fetchPagesWithCancel(done2, 1000, 10)
+	start := time.Now()
+	done := make(chan struct{})
+	pages := gen.FetchWithCancel(done)
 
-	var count2 int
-	for page := range pages2 {
-		count2++
+	var count int
+	for page := range pages {
+		count++
 		fmt.Printf("  Consumer got page %d (%d records)\n", page.Number, len(page.Records))
-		if count2 >= 3 {
-			close(done2) // signal generator to stop
+		if count >= pagesNeededForDemo {
+			close(done)
 			break
 		}
 	}
 	fmt.Printf("  Fetched only %d pages in %v (saved 97 unnecessary queries)\n",
-		count2, time.Since(start))
+		count, time.Since(start))
+}
+
+func main() {
+	gen := NewPageGenerator(1000, 10)
+	demoFetchAll(gen)
+	demoEarlyStop(gen)
 }
 ```
 
@@ -249,75 +292,104 @@ import (
 	"time"
 )
 
+const (
+	totalRecordCount  = 10000
+	recordPageSize    = 100
+	pagesNeeded       = 3
+	estimatedRecordKB = 280
+)
+
+// Record represents a database row with a payload.
 type Record struct {
 	ID   int
 	Name string
-	Data [256]byte // simulate a record with some payload
+	Data [256]byte
 }
 
-func main() {
-	totalRecords := 10000
-	pageSize := 100
-	pagesNeeded := 3
+// MemoryComparison demonstrates eager vs lazy loading memory impact.
+type MemoryComparison struct {
+	totalRecords int
+	pageSize     int
+	pagesNeeded  int
+}
 
-	// Eager: load everything into memory
+func NewMemoryComparison() *MemoryComparison {
+	return &MemoryComparison{
+		totalRecords: totalRecordCount,
+		pageSize:     recordPageSize,
+		pagesNeeded:  pagesNeeded,
+	}
+}
+
+func (mc *MemoryComparison) RunEager() {
 	fmt.Println("=== Eager Loading ===")
 	start := time.Now()
-	allRecords := make([]Record, totalRecords)
+
+	allRecords := make([]Record, mc.totalRecords)
 	for i := range allRecords {
 		allRecords[i] = Record{ID: i + 1, Name: fmt.Sprintf("rec_%d", i+1)}
 	}
-	// Only use first 3 pages
-	used := allRecords[:pagesNeeded*pageSize]
-	fmt.Printf("  Allocated %d records (%d KB)\n", len(allRecords), len(allRecords)*280/1024)
-	fmt.Printf("  Actually used: %d records\n", len(used))
-	fmt.Printf("  Wasted: %d records (%d KB)\n",
-		len(allRecords)-len(used),
-		(len(allRecords)-len(used))*280/1024)
+
+	usedCount := mc.pagesNeeded * mc.pageSize
+	wastedCount := len(allRecords) - usedCount
+
+	fmt.Printf("  Allocated %d records (%d KB)\n", len(allRecords), len(allRecords)*estimatedRecordKB/1024)
+	fmt.Printf("  Actually used: %d records\n", usedCount)
+	fmt.Printf("  Wasted: %d records (%d KB)\n", wastedCount, wastedCount*estimatedRecordKB/1024)
 	fmt.Printf("  Time: %v\n\n", time.Since(start))
+}
 
-	// Lazy: generate pages on demand
-	fmt.Println("=== Lazy Generator ===")
-	start = time.Now()
-	done := make(chan struct{})
-	pages := func() <-chan []Record {
-		out := make(chan []Record)
-		go func() {
-			defer close(out)
-			for offset := 0; offset < totalRecords; offset += pageSize {
-				end := offset + pageSize
-				if end > totalRecords {
-					end = totalRecords
-				}
-				page := make([]Record, end-offset)
-				for i := range page {
-					page[i] = Record{ID: offset + i + 1, Name: fmt.Sprintf("rec_%d", offset+i+1)}
-				}
-				select {
-				case out <- page:
-				case <-done:
-					return
-				}
+func (mc *MemoryComparison) generatePages(done <-chan struct{}) <-chan []Record {
+	out := make(chan []Record)
+	go func() {
+		defer close(out)
+		for offset := 0; offset < mc.totalRecords; offset += mc.pageSize {
+			end := offset + mc.pageSize
+			if end > mc.totalRecords {
+				end = mc.totalRecords
 			}
-		}()
-		return out
+			page := make([]Record, end-offset)
+			for i := range page {
+				page[i] = Record{ID: offset + i + 1, Name: fmt.Sprintf("rec_%d", offset+i+1)}
+			}
+			select {
+			case out <- page:
+			case <-done:
+				return
+			}
+		}
 	}()
+	return out
+}
 
-	var lazyUsed int
-	pageCount := 0
+func (mc *MemoryComparison) RunLazy() {
+	fmt.Println("=== Lazy Generator ===")
+	start := time.Now()
+
+	done := make(chan struct{})
+	pages := mc.generatePages(done)
+
+	var lazyUsed, pageCount int
 	for page := range pages {
 		pageCount++
 		lazyUsed += len(page)
-		if pageCount >= pagesNeeded {
+		if pageCount >= mc.pagesNeeded {
 			close(done)
 			break
 		}
 	}
+
 	fmt.Printf("  Allocated only %d records at a time (%d KB per page)\n",
-		pageSize, pageSize*280/1024)
+		mc.pageSize, mc.pageSize*estimatedRecordKB/1024)
 	fmt.Printf("  Total records processed: %d\n", lazyUsed)
-	fmt.Printf("  Pages fetched: %d out of %d possible\n", pageCount, totalRecords/pageSize)
+	fmt.Printf("  Pages fetched: %d out of %d possible\n", pageCount, mc.totalRecords/mc.pageSize)
 	fmt.Printf("  Time: %v\n", time.Since(start))
+}
+
+func main() {
+	comparison := NewMemoryComparison()
+	comparison.RunEager()
+	comparison.RunLazy()
 }
 ```
 
@@ -352,45 +424,70 @@ import (
 	"time"
 )
 
+const (
+	simulatedTotalResults = 85
+	contextQueryLatency   = 30 * time.Millisecond
+	contextQueryTimeout   = 100 * time.Millisecond
+)
+
+// Record represents a single database row.
 type Record struct {
 	ID   int
 	Name string
 }
 
+// Page holds a batch of records with pagination metadata.
 type Page struct {
 	Number  int
 	Records []Record
 	HasMore bool
 }
 
-func queryPages(ctx context.Context, query string, pageSize int) <-chan Page {
+// PageGenerator lazily fetches pages with context-based cancellation.
+type PageGenerator struct {
+	totalResults int
+	pageSize     int
+	query        string
+}
+
+func NewPageGenerator(query string, pageSize int) *PageGenerator {
+	return &PageGenerator{
+		totalResults: simulatedTotalResults,
+		pageSize:     pageSize,
+		query:        query,
+	}
+}
+
+func (pg *PageGenerator) buildPage(pageNum, offset, end int) Page {
+	records := make([]Record, 0, end-offset)
+	for i := offset; i < end; i++ {
+		records = append(records, Record{
+			ID:   i + 1,
+			Name: fmt.Sprintf("match_%d_for_%s", i+1, pg.query),
+		})
+	}
+	return Page{
+		Number:  pageNum,
+		Records: records,
+		HasMore: end < pg.totalResults,
+	}
+}
+
+func (pg *PageGenerator) QueryPages(ctx context.Context) <-chan Page {
 	out := make(chan Page)
 	go func() {
 		defer close(out)
-		totalResults := 85 // simulate: query found 85 matching records
 		pageNum := 1
-		for offset := 0; offset < totalResults; offset += pageSize {
-			end := offset + pageSize
-			if end > totalResults {
-				end = totalResults
+		for offset := 0; offset < pg.totalResults; offset += pg.pageSize {
+			end := offset + pg.pageSize
+			if end > pg.totalResults {
+				end = pg.totalResults
 			}
 
-			time.Sleep(30 * time.Millisecond) // DB latency
-
-			records := make([]Record, 0, end-offset)
-			for i := offset; i < end; i++ {
-				records = append(records, Record{
-					ID:   i + 1,
-					Name: fmt.Sprintf("match_%d_for_%s", i+1, query),
-				})
-			}
+			time.Sleep(contextQueryLatency)
 
 			select {
-			case out <- Page{
-				Number:  pageNum,
-				Records: records,
-				HasMore: end < totalResults,
-			}:
+			case out <- pg.buildPage(pageNum, offset, end):
 				pageNum++
 			case <-ctx.Done():
 				fmt.Printf("    [query] canceled: %v\n", ctx.Err())
@@ -405,12 +502,11 @@ func main() {
 	fmt.Println("=== Paginated Query with Context ===")
 	fmt.Println()
 
-	// Cancel after 2 pages using a timeout
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), contextQueryTimeout)
 	defer cancel()
 
-	pages := queryPages(ctx, "laptop", 25)
-	for page := range pages {
+	gen := NewPageGenerator("laptop", 25)
+	for page := range gen.QueryPages(ctx) {
 		fmt.Printf("  Page %d: %d results (hasMore: %v)\n",
 			page.Number, len(page.Records), page.HasMore)
 	}

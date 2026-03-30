@@ -36,14 +36,24 @@ import (
 	"time"
 )
 
-func verifyPayment(ctx context.Context, transactionID string) (string, error) {
+const (
+	paymentTimeout    = 2 * time.Second
+	paymentServiceLatency = 3 * time.Second
+)
+
+type PaymentClient struct {
+	timeout time.Duration
+}
+
+func NewPaymentClient(timeout time.Duration) *PaymentClient {
+	return &PaymentClient{timeout: timeout}
+}
+
+func (c *PaymentClient) VerifyTransaction(ctx context.Context, transactionID string) (string, error) {
 	fmt.Printf("[payment-api] verifying transaction %s...\n", transactionID)
 
-	// Simulate an external service that takes variable time.
-	serviceLatency := 3 * time.Second // service is slow today
-
 	select {
-	case <-time.After(serviceLatency):
+	case <-time.After(paymentServiceLatency):
 		return "verified", nil
 	case <-ctx.Done():
 		return "", fmt.Errorf("payment verification failed: %w", ctx.Err())
@@ -51,14 +61,15 @@ func verifyPayment(ctx context.Context, transactionID string) (string, error) {
 }
 
 func main() {
-	// Timeout: if payment service does not respond in 2 seconds, give up.
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), paymentTimeout)
 	defer cancel()
 
-	fmt.Println("Calling payment verification service (timeout: 2s)...")
+	client := NewPaymentClient(paymentTimeout)
+
+	fmt.Printf("Calling payment verification service (timeout: %v)...\n", paymentTimeout)
 	start := time.Now()
 
-	result, err := verifyPayment(ctx, "TXN-2024-98765")
+	result, err := client.VerifyTransaction(ctx, "TXN-2024-98765")
 	elapsed := time.Since(start).Round(time.Millisecond)
 
 	if err != nil {
@@ -97,11 +108,20 @@ import (
 	"time"
 )
 
-func fetchUserProfile(ctx context.Context, userID string) (string, error) {
-	serviceLatency := 200 * time.Millisecond // service is fast
+const (
+	profileTimeout = 2 * time.Second
+	profileLatency = 200 * time.Millisecond
+)
 
+type UserProfileClient struct{}
+
+func NewUserProfileClient() *UserProfileClient {
+	return &UserProfileClient{}
+}
+
+func (c *UserProfileClient) Fetch(ctx context.Context, userID string) (string, error) {
 	select {
-	case <-time.After(serviceLatency):
+	case <-time.After(profileLatency):
 		return fmt.Sprintf("User{id: %s, name: Alice, plan: premium}", userID), nil
 	case <-ctx.Done():
 		return "", fmt.Errorf("fetch user profile: %w", ctx.Err())
@@ -109,13 +129,15 @@ func fetchUserProfile(ctx context.Context, userID string) (string, error) {
 }
 
 func main() {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel() // Required even when timeout will not fire -- frees the timer.
+	ctx, cancel := context.WithTimeout(context.Background(), profileTimeout)
+	defer cancel()
 
-	fmt.Println("Fetching user profile (timeout: 2s, expected latency: 200ms)...")
+	client := NewUserProfileClient()
+
+	fmt.Printf("Fetching user profile (timeout: %v, expected latency: %v)...\n", profileTimeout, profileLatency)
 	start := time.Now()
 
-	profile, err := fetchUserProfile(ctx, "user-42")
+	profile, err := client.Fetch(ctx, "user-42")
 	elapsed := time.Since(start).Round(time.Millisecond)
 
 	if err != nil {
@@ -124,7 +146,6 @@ func main() {
 		fmt.Printf("[success] %s (after %v)\n", profile, elapsed)
 	}
 
-	// The context has not expired yet.
 	fmt.Printf("Context error after success: %v (nil means timeout has not fired)\n", ctx.Err())
 }
 ```
@@ -156,36 +177,42 @@ import (
 	"time"
 )
 
-func leakyTimeout() {
-	// BAD: ignoring the cancel function.
-	ctx, _ := context.WithTimeout(context.Background(), 10*time.Second)
+const leakyTimeoutDuration = 10 * time.Second
+
+func createLeakyTimeout() {
+	ctx, _ := context.WithTimeout(context.Background(), leakyTimeoutDuration)
 	_ = ctx
-	// The timer goroutine runs for 10 seconds even though we are done.
 }
 
-func properTimeout() {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel() // Stops the timer immediately.
+func createProperTimeout() {
+	ctx, cancel := context.WithTimeout(context.Background(), leakyTimeoutDuration)
+	defer cancel()
 	_ = ctx
+}
+
+func reportGoroutines(label string) int {
+	count := runtime.NumGoroutine()
+	fmt.Printf("%s: %d\n", label, count)
+	return count
 }
 
 func main() {
-	baseline := runtime.NumGoroutine()
-	fmt.Printf("Baseline goroutines: %d\n\n", baseline)
+	baseline := reportGoroutines("Baseline goroutines")
+	fmt.Println()
 
 	fmt.Println("Creating 100 timeouts WITHOUT cancel...")
 	for i := 0; i < 100; i++ {
-		leakyTimeout()
+		createLeakyTimeout()
 	}
-	leaked := runtime.NumGoroutine()
-	fmt.Printf("Goroutines after leaky calls: %d (leaked: %d)\n\n", leaked, leaked-baseline)
+	leaked := reportGoroutines("Goroutines after leaky calls")
+	fmt.Printf("Leaked: %d\n\n", leaked-baseline)
 
 	fmt.Println("Creating 100 timeouts WITH proper cancel...")
 	for i := 0; i < 100; i++ {
-		properTimeout()
+		createProperTimeout()
 	}
-	proper := runtime.NumGoroutine()
-	fmt.Printf("Goroutines after proper calls: %d (leaked from those: %d)\n", proper, proper-leaked)
+	proper := reportGoroutines("Goroutines after proper calls")
+	fmt.Printf("Leaked from proper: %d\n", proper-leaked)
 	fmt.Println("\nThe leaky calls left timer goroutines running for 10 seconds each.")
 	fmt.Println("In a server handling 1000 req/s, this consumes gigabytes of memory.")
 }
@@ -200,10 +227,12 @@ Expected output:
 Baseline goroutines: 1
 
 Creating 100 timeouts WITHOUT cancel...
-Goroutines after leaky calls: 101 (leaked: 100)
+Goroutines after leaky calls: 101
+Leaked: 100
 
 Creating 100 timeouts WITH proper cancel...
-Goroutines after proper calls: 101 (leaked from those: 0)
+Goroutines after proper calls: 101
+Leaked from proper: 0
 
 The leaky calls left timer goroutines running for 10 seconds each.
 In a server handling 1000 req/s, this consumes gigabytes of memory.
@@ -225,16 +254,29 @@ import (
 	"time"
 )
 
-func callService(ctx context.Context, name string) error {
+const (
+	serviceLatency     = 5 * time.Second
+	shortTimeout       = 100 * time.Millisecond
+	longTimeout        = 5 * time.Second
+	cancelDelay        = 100 * time.Millisecond
+)
+
+type APIClient struct{}
+
+func NewAPIClient() *APIClient {
+	return &APIClient{}
+}
+
+func (c *APIClient) Call(ctx context.Context, name string) error {
 	select {
-	case <-time.After(5 * time.Second): // Service takes 5s.
+	case <-time.After(serviceLatency):
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
 	}
 }
 
-func classifyError(err error) string {
+func classifyContextError(err error) string {
 	if errors.Is(err, context.DeadlineExceeded) {
 		return "TIMEOUT: service too slow, consider increasing timeout or adding cache"
 	}
@@ -245,27 +287,27 @@ func classifyError(err error) string {
 }
 
 func main() {
-	// Case 1: Timeout fires.
+	client := NewAPIClient()
+
 	fmt.Println("=== Case 1: Timeout ===")
-	ctx1, cancel1 := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	ctx1, cancel1 := context.WithTimeout(context.Background(), shortTimeout)
 	defer cancel1()
 
-	err1 := callService(ctx1, "inventory")
+	err1 := client.Call(ctx1, "inventory")
 	fmt.Printf("Error: %v\n", err1)
-	fmt.Printf("Diagnosis: %s\n\n", classifyError(err1))
+	fmt.Printf("Diagnosis: %s\n\n", classifyContextError(err1))
 
-	// Case 2: Manual cancellation before timeout.
 	fmt.Println("=== Case 2: Manual Cancel ===")
-	ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx2, cancel2 := context.WithTimeout(context.Background(), longTimeout)
 
 	go func() {
-		time.Sleep(100 * time.Millisecond)
-		cancel2() // User disconnected.
+		time.Sleep(cancelDelay)
+		cancel2()
 	}()
 
-	err2 := callService(ctx2, "inventory")
+	err2 := client.Call(ctx2, "inventory")
 	fmt.Printf("Error: %v\n", err2)
-	fmt.Printf("Diagnosis: %s\n", classifyError(err2))
+	fmt.Printf("Diagnosis: %s\n", classifyContextError(err2))
 }
 ```
 
@@ -299,13 +341,16 @@ import (
 	"time"
 )
 
+const (
+	gatewayTimeout  = 1 * time.Second
+	requestedDBTimeout = 10 * time.Second
+)
+
 func main() {
-	// API gateway sets a 1-second budget for the entire request.
-	gateway, cancelGateway := context.WithTimeout(context.Background(), 1*time.Second)
+	gateway, cancelGateway := context.WithTimeout(context.Background(), gatewayTimeout)
 	defer cancelGateway()
 
-	// Service layer tries to give the database 10 seconds. It will not work.
-	dbQuery, cancelDB := context.WithTimeout(gateway, 10*time.Second)
+	dbQuery, cancelDB := context.WithTimeout(gateway, requestedDBTimeout)
 	defer cancelDB()
 
 	gatewayDeadline, _ := gateway.Deadline()
@@ -405,35 +450,49 @@ import (
 	"time"
 )
 
-func callService(ctx context.Context, name string, latency time.Duration) (string, error) {
+const (
+	userServiceTimeout    = 500 * time.Millisecond
+	userServiceLatency    = 100 * time.Millisecond
+	recsServiceTimeout    = 300 * time.Millisecond
+	recsServiceLatency    = 2 * time.Second
+)
+
+type ServiceClient struct {
+	name    string
+	latency time.Duration
+}
+
+func NewServiceClient(name string, latency time.Duration) *ServiceClient {
+	return &ServiceClient{name: name, latency: latency}
+}
+
+func (c *ServiceClient) Call(ctx context.Context) (string, error) {
 	select {
-	case <-time.After(latency):
-		return fmt.Sprintf("%s: OK", name), nil
+	case <-time.After(c.latency):
+		return fmt.Sprintf("%s: OK", c.name), nil
 	case <-ctx.Done():
-		return "", fmt.Errorf("%s: %w", name, ctx.Err())
+		return "", fmt.Errorf("%s: %w", c.name, ctx.Err())
+	}
+}
+
+func callWithTimeout(client *ServiceClient, timeout time.Duration) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	result, err := client.Call(ctx)
+	if err != nil {
+		fmt.Printf("[FAIL] %v\n", err)
+	} else {
+		fmt.Printf("[OK]   %s\n", result)
 	}
 }
 
 func main() {
-	// Fast service: 100ms latency, 500ms timeout. Should succeed.
-	ctx1, cancel1 := context.WithTimeout(context.Background(), 500*time.Millisecond)
-	defer cancel1()
-	result, err := callService(ctx1, "user-service", 100*time.Millisecond)
-	if err != nil {
-		fmt.Printf("[FAIL] %v\n", err)
-	} else {
-		fmt.Printf("[OK]   %s\n", result)
-	}
+	userClient := NewServiceClient("user-service", userServiceLatency)
+	callWithTimeout(userClient, userServiceTimeout)
 
-	// Slow service: 2s latency, 300ms timeout. Should timeout.
-	ctx2, cancel2 := context.WithTimeout(context.Background(), 300*time.Millisecond)
-	defer cancel2()
-	result, err = callService(ctx2, "recommendation-service", 2*time.Second)
-	if err != nil {
-		fmt.Printf("[FAIL] %v\n", err)
-	} else {
-		fmt.Printf("[OK]   %s\n", result)
-	}
+	recsClient := NewServiceClient("recommendation-service", recsServiceLatency)
+	callWithTimeout(recsClient, recsServiceTimeout)
 }
 ```
 

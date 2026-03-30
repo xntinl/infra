@@ -45,44 +45,71 @@ import (
 	"time"
 )
 
-func racyHitCounter() int {
+const (
+	defaultHandlers       = 100
+	defaultReqsPerHandler = 100
+	benchmarkRuns         = 5
+)
+
+// HitCounter simulates a web server's page-view tracker.
+// BUG: hitCount is shared across goroutines without synchronization.
+type HitCounter struct {
+	handlers       int
+	reqsPerHandler int
+}
+
+func NewHitCounter(handlers, reqsPerHandler int) *HitCounter {
+	return &HitCounter{
+		handlers:       handlers,
+		reqsPerHandler: reqsPerHandler,
+	}
+}
+
+// CountHits launches concurrent handlers that all increment the same variable.
+// DATA RACE: the read-modify-write on hitCount has no synchronization.
+func (hc *HitCounter) CountHits() int {
 	hitCount := 0
 	var wg sync.WaitGroup
 
-	// Simulate 100 concurrent HTTP handlers, each processing 100 requests.
-	for handler := 0; handler < 100; handler++ {
+	for handler := 0; handler < hc.handlers; handler++ {
 		wg.Add(1)
-		go func(handlerID int) {
+		go func() {
 			defer wg.Done()
-			for req := 0; req < 100; req++ {
+			for req := 0; req < hc.reqsPerHandler; req++ {
 				hitCount++ // DATA RACE: read-modify-write without synchronization
 			}
-		}(handler)
+		}()
 	}
 
 	wg.Wait()
 	return hitCount
 }
 
-func main() {
-	fmt.Println("=== Web Hit Counter Data Race ===")
-	fmt.Println("Expected: 10000 hits (100 handlers x 100 requests each)")
-	fmt.Println()
+func (hc *HitCounter) Expected() int {
+	return hc.handlers * hc.reqsPerHandler
+}
 
-	results := make([]int, 5)
-	for run := 0; run < 5; run++ {
+func runBenchmark(counter *HitCounter) {
+	expected := counter.Expected()
+	results := make([]int, benchmarkRuns)
+
+	for run := 0; run < benchmarkRuns; run++ {
 		start := time.Now()
-		result := racyHitCounter()
+		actual := counter.CountHits()
 		elapsed := time.Since(start)
-		lost := 10000 - result
-		results[run] = result
+		lost := expected - actual
+		results[run] = actual
 		fmt.Printf("Run %d: %d hits recorded, %d lost (%v)\n",
-			run+1, result, lost, elapsed)
+			run+1, actual, lost, elapsed)
 	}
 
 	fmt.Println()
+	printProductionImpact(results)
+}
+
+func printProductionImpact(results []int) {
 	fmt.Println("--- Production Impact ---")
-	fmt.Printf("Results across 5 runs: %v\n", results)
+	fmt.Printf("Results across %d runs: %v\n", len(results), results)
 	fmt.Println("Every run produces a different number. None reach 10000.")
 	fmt.Println()
 	fmt.Println("If this were real:")
@@ -90,6 +117,15 @@ func main() {
 	fmt.Println("  - Billing:   customer charged for 7000 API calls instead of 10000")
 	fmt.Println("  - Alerting:  error counter shows 50 errors instead of 80, threshold never triggers")
 	fmt.Println("  - Capacity:  load balancer thinks server handles fewer requests than it does")
+}
+
+func main() {
+	fmt.Println("=== Web Hit Counter Data Race ===")
+	fmt.Println("Expected: 10000 hits (100 handlers x 100 requests each)")
+	fmt.Println()
+
+	counter := NewHitCounter(defaultHandlers, defaultReqsPerHandler)
+	runBenchmark(counter)
 }
 ```
 
@@ -150,33 +186,65 @@ import (
 	"sync"
 )
 
-func measureLoss(numHandlers, reqsPerHandler int) (expected, actual int) {
+// TrafficScenario describes a concurrency level for benchmarking data loss.
+type TrafficScenario struct {
+	Handlers       int
+	ReqsPerHandler int
+	Label          string
+}
+
+// HitCounter simulates a web server's page-view tracker.
+// BUG: hitCount is shared across goroutines without synchronization.
+type HitCounter struct {
+	handlers       int
+	reqsPerHandler int
+}
+
+func NewHitCounter(handlers, reqsPerHandler int) *HitCounter {
+	return &HitCounter{
+		handlers:       handlers,
+		reqsPerHandler: reqsPerHandler,
+	}
+}
+
+func (hc *HitCounter) Expected() int {
+	return hc.handlers * hc.reqsPerHandler
+}
+
+// CountHits launches concurrent handlers that all increment the same variable.
+// DATA RACE: the read-modify-write on hitCount has no synchronization.
+func (hc *HitCounter) CountHits() int {
 	hitCount := 0
 	var wg sync.WaitGroup
 
-	for h := 0; h < numHandlers; h++ {
+	for h := 0; h < hc.handlers; h++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for r := 0; r < reqsPerHandler; r++ {
+			for r := 0; r < hc.reqsPerHandler; r++ {
 				hitCount++
 			}
 		}()
 	}
 
 	wg.Wait()
-	return numHandlers * reqsPerHandler, hitCount
+	return hitCount
+}
+
+func measureLoss(scenario TrafficScenario) {
+	counter := NewHitCounter(scenario.Handlers, scenario.ReqsPerHandler)
+	expected := counter.Expected()
+	actual := counter.CountHits()
+	lossPercent := float64(expected-actual) / float64(expected) * 100
+	fmt.Printf("%-35s expected=%d actual=%d lost=%.1f%%\n",
+		scenario.Label, expected, actual, lossPercent)
 }
 
 func main() {
 	fmt.Println("=== Data Loss vs Concurrency Level ===")
 	fmt.Println()
 
-	scenarios := []struct {
-		handlers    int
-		reqsPerHandler int
-		label       string
-	}{
+	scenarios := []TrafficScenario{
 		{10, 1000, "Light traffic (10 handlers)"},
 		{50, 1000, "Moderate traffic (50 handlers)"},
 		{200, 1000, "Heavy traffic (200 handlers)"},
@@ -184,10 +252,7 @@ func main() {
 	}
 
 	for _, s := range scenarios {
-		expected, actual := measureLoss(s.handlers, s.reqsPerHandler)
-		lossPercent := float64(expected-actual) / float64(expected) * 100
-		fmt.Printf("%-35s expected=%d actual=%d lost=%.1f%%\n",
-			s.label, expected, actual, lossPercent)
+		measureLoss(s)
 	}
 
 	fmt.Println()

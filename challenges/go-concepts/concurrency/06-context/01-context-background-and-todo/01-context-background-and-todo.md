@@ -41,38 +41,49 @@ import (
 	"time"
 )
 
-func processOrder(ctx context.Context, orderID string) error {
+const orderProcessingDelay = 50 * time.Millisecond
+const orderPersistenceDelay = 30 * time.Millisecond
+
+type OrderService struct{}
+
+func NewOrderService() *OrderService {
+	return &OrderService{}
+}
+
+func (s *OrderService) Process(ctx context.Context, orderID string) error {
 	if ctx.Err() != nil {
 		return fmt.Errorf("context already cancelled: %w", ctx.Err())
 	}
 	fmt.Printf("[order-service] processing order %s\n", orderID)
-	time.Sleep(50 * time.Millisecond)
+	time.Sleep(orderProcessingDelay)
 
-	return saveOrder(ctx, orderID)
+	return s.persist(ctx, orderID)
 }
 
-func saveOrder(ctx context.Context, orderID string) error {
+func (s *OrderService) persist(ctx context.Context, orderID string) error {
 	if ctx.Err() != nil {
 		return fmt.Errorf("context already cancelled: %w", ctx.Err())
 	}
 	fmt.Printf("[repository]    saving order %s to database\n", orderID)
-	time.Sleep(30 * time.Millisecond)
+	time.Sleep(orderPersistenceDelay)
 	fmt.Printf("[repository]    order %s saved\n", orderID)
 	return nil
 }
 
-func main() {
-	// main() is the ONLY place where context.Background() belongs.
-	ctx := context.Background()
-
+func printContextInfo(ctx context.Context) {
 	fmt.Printf("Root context type:   %T\n", ctx)
 	fmt.Printf("Root context string: %s\n", ctx)
 	fmt.Printf("Root context Err:    %v\n", ctx.Err())
 	fmt.Printf("Root context Done:   %v (nil = never cancelled)\n", ctx.Done())
 	fmt.Println()
+}
 
-	err := processOrder(ctx, "ORD-2024-1001")
-	if err != nil {
+func main() {
+	ctx := context.Background()
+	printContextInfo(ctx)
+
+	svc := NewOrderService()
+	if err := svc.Process(ctx, "ORD-2024-1001"); err != nil {
 		fmt.Printf("Error: %v\n", err)
 	}
 }
@@ -94,7 +105,7 @@ Root context Done:   <nil> (nil = never cancelled)
 [repository]    order ORD-2024-1001 saved
 ```
 
-The background context has no deadline, no error, and a nil `Done()` channel. A nil `Done()` channel blocks forever on receive, which is correct because a root context should never be cancelled. The context flows from `main` -> `processOrder` -> `saveOrder`, establishing the chain that cancellation and deadlines will follow.
+The background context has no deadline, no error, and a nil `Done()` channel. A nil `Done()` channel blocks forever on receive, which is correct because a root context should never be cancelled. The context flows from `main` -> `Process` -> `persist`, establishing the chain that cancellation and deadlines will follow.
 
 ## Step 2 -- Where context.TODO() Belongs
 
@@ -108,14 +119,20 @@ import (
 	"fmt"
 )
 
-// sendNotification is new code. The caller (an event handler) does not
-// pass a context yet. TODO() marks this as "needs proper context wiring."
-func sendNotification(userID string, message string) error {
-	ctx := context.TODO() // Placeholder: will receive ctx from caller after refactor
-	return deliverEmail(ctx, userID, message)
+type NotificationService struct{}
+
+func NewNotificationService() *NotificationService {
+	return &NotificationService{}
 }
 
-func deliverEmail(ctx context.Context, userID string, message string) error {
+// Send is new code. The caller (an event handler) does not
+// pass a context yet. TODO() marks this as "needs proper context wiring."
+func (n *NotificationService) Send(userID string, message string) error {
+	ctx := context.TODO()
+	return n.deliverEmail(ctx, userID, message)
+}
+
+func (n *NotificationService) deliverEmail(ctx context.Context, userID string, message string) error {
 	if ctx.Err() != nil {
 		return fmt.Errorf("context cancelled: %w", ctx.Err())
 	}
@@ -123,7 +140,7 @@ func deliverEmail(ctx context.Context, userID string, message string) error {
 	return nil
 }
 
-func main() {
+func compareRootContexts() {
 	bg := context.Background()
 	todo := context.TODO()
 
@@ -132,11 +149,13 @@ func main() {
 	fmt.Printf("Same Err:   %v\n", bg.Err() == todo.Err())
 	fmt.Printf("Same Done:  %v\n", bg.Done() == todo.Done())
 	fmt.Println()
+}
 
-	// In production, this would be called from an event handler
-	// that will eventually pass its own context.
-	err := sendNotification("user-42", "Your order has shipped")
-	if err != nil {
+func main() {
+	compareRootContexts()
+
+	notifier := NewNotificationService()
+	if err := notifier.Send("user-42", "Your order has shipped"); err != nil {
 		fmt.Printf("Error: %v\n", err)
 	}
 }
@@ -171,41 +190,52 @@ import (
 	"time"
 )
 
-// WRONG: creates its own root context, ignoring the caller's cancellation.
-func fetchUserBroken(userID string) (string, error) {
-	ctx := context.Background() // isolated from caller -- silent bug
+const userFetchDelay = 100 * time.Millisecond
+const simulatedDeadline = 50 * time.Millisecond
+
+type UserRepository struct{}
+
+func NewUserRepository() *UserRepository {
+	return &UserRepository{}
+}
+
+// FetchBroken creates its own root context, ignoring the caller's cancellation.
+func (r *UserRepository) FetchBroken(userID string) (string, error) {
+	ctx := context.Background()
 	_ = ctx
 	fmt.Printf("[broken-repo]  fetching user %s (ignores cancellation)\n", userID)
-	time.Sleep(100 * time.Millisecond)
+	time.Sleep(userFetchDelay)
 	return "Alice", nil
 }
 
-// CORRECT: accepts the caller's context, propagating cancellation.
-func fetchUserCorrect(ctx context.Context, userID string) (string, error) {
+// FetchCorrect accepts the caller's context, propagating cancellation.
+func (r *UserRepository) FetchCorrect(ctx context.Context, userID string) (string, error) {
 	if ctx.Err() != nil {
 		return "", fmt.Errorf("fetch user: %w", ctx.Err())
 	}
 	fmt.Printf("[correct-repo] fetching user %s (respects cancellation)\n", userID)
-	time.Sleep(100 * time.Millisecond)
+	time.Sleep(userFetchDelay)
 	return "Alice", nil
 }
 
-func main() {
-	// Simulate a request with a tight deadline.
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+func demonstrateBrokenChain() {
+	ctx, cancel := context.WithTimeout(context.Background(), simulatedDeadline)
 	defer cancel()
 
-	// Wait for the deadline to pass.
 	time.Sleep(60 * time.Millisecond)
 	fmt.Printf("Context state: %v\n\n", ctx.Err())
 
-	// The broken function ignores that the deadline has passed.
-	name, err := fetchUserBroken("user-42")
+	repo := NewUserRepository()
+
+	name, err := repo.FetchBroken("user-42")
 	fmt.Printf("Broken result:  name=%s, err=%v (wasted work!)\n\n", name, err)
 
-	// The correct function detects the cancelled context immediately.
-	name, err = fetchUserCorrect(ctx, "user-42")
+	name, err = repo.FetchCorrect(ctx, "user-42")
 	fmt.Printf("Correct result: name=%q, err=%v (failed fast)\n", name, err)
+}
+
+func main() {
+	demonstrateBrokenChain()
 }
 ```
 
@@ -238,27 +268,22 @@ import (
 	"time"
 )
 
-func apiHandler(ctx context.Context, orderID string) (string, error) {
-	fmt.Printf("[handler]    received request for order %s\n", orderID)
-	if ctx.Err() != nil {
-		return "", fmt.Errorf("handler: %w", ctx.Err())
-	}
-	return orderService(ctx, orderID)
+const (
+	handlerTimeout       = 500 * time.Millisecond
+	serviceValidationDelay = 30 * time.Millisecond
+	repositoryQueryDelay   = 50 * time.Millisecond
+)
+
+type OrderRepository struct{}
+
+func NewOrderRepository() *OrderRepository {
+	return &OrderRepository{}
 }
 
-func orderService(ctx context.Context, orderID string) (string, error) {
-	fmt.Printf("[service]    validating order %s\n", orderID)
-	time.Sleep(30 * time.Millisecond)
-	if ctx.Err() != nil {
-		return "", fmt.Errorf("service: %w", ctx.Err())
-	}
-	return orderRepository(ctx, orderID)
-}
-
-func orderRepository(ctx context.Context, orderID string) (string, error) {
+func (r *OrderRepository) FindByID(ctx context.Context, orderID string) (string, error) {
 	fmt.Printf("[repository] querying database for order %s\n", orderID)
 	select {
-	case <-time.After(50 * time.Millisecond):
+	case <-time.After(repositoryQueryDelay):
 		result := fmt.Sprintf("Order{id: %s, status: shipped}", orderID)
 		fmt.Printf("[repository] query complete\n")
 		return result, nil
@@ -267,16 +292,48 @@ func orderRepository(ctx context.Context, orderID string) (string, error) {
 	}
 }
 
-func main() {
-	// main() owns the root context. In a real server, the HTTP framework
-	// creates a per-request context derived from this root.
-	ctx := context.Background()
+type OrderService struct {
+	repo *OrderRepository
+}
 
-	// Add a timeout to simulate a real request budget.
-	ctx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+func NewOrderService(repo *OrderRepository) *OrderService {
+	return &OrderService{repo: repo}
+}
+
+func (s *OrderService) GetOrder(ctx context.Context, orderID string) (string, error) {
+	fmt.Printf("[service]    validating order %s\n", orderID)
+	time.Sleep(serviceValidationDelay)
+	if ctx.Err() != nil {
+		return "", fmt.Errorf("service: %w", ctx.Err())
+	}
+	return s.repo.FindByID(ctx, orderID)
+}
+
+type APIHandler struct {
+	orderSvc *OrderService
+}
+
+func NewAPIHandler(orderSvc *OrderService) *APIHandler {
+	return &APIHandler{orderSvc: orderSvc}
+}
+
+func (h *APIHandler) HandleGetOrder(ctx context.Context, orderID string) (string, error) {
+	fmt.Printf("[handler]    received request for order %s\n", orderID)
+	if ctx.Err() != nil {
+		return "", fmt.Errorf("handler: %w", ctx.Err())
+	}
+	return h.orderSvc.GetOrder(ctx, orderID)
+}
+
+func main() {
+	ctx, cancel := context.WithTimeout(context.Background(), handlerTimeout)
 	defer cancel()
 
-	result, err := apiHandler(ctx, "ORD-2024-1001")
+	repo := NewOrderRepository()
+	svc := NewOrderService(repo)
+	handler := NewAPIHandler(svc)
+
+	result, err := handler.HandleGetOrder(ctx, "ORD-2024-1001")
 	if err != nil {
 		fmt.Printf("\nError: %v\n", err)
 		return
@@ -407,23 +464,35 @@ import (
 	"fmt"
 )
 
-func handler(ctx context.Context, data string) error {
+type RequestHandler struct{}
+
+func NewRequestHandler() *RequestHandler {
+	return &RequestHandler{}
+}
+
+func (h *RequestHandler) Handle(ctx context.Context, data string) error {
 	fmt.Printf("[handler]   context=%s, err=%v\n", ctx, ctx.Err())
 	if ctx.Err() != nil {
 		return fmt.Errorf("handler: %w", ctx.Err())
 	}
-	return validator(ctx, data)
+	v := &Validator{}
+	return v.Validate(ctx, data)
 }
 
-func validator(ctx context.Context, data string) error {
+type Validator struct{}
+
+func (v *Validator) Validate(ctx context.Context, data string) error {
 	fmt.Printf("[validator] context=%s, err=%v\n", ctx, ctx.Err())
 	if ctx.Err() != nil {
 		return fmt.Errorf("validator: %w", ctx.Err())
 	}
-	return storage(ctx, data)
+	s := &Storage{}
+	return s.Save(ctx, data)
 }
 
-func storage(ctx context.Context, data string) error {
+type Storage struct{}
+
+func (s *Storage) Save(ctx context.Context, data string) error {
 	fmt.Printf("[storage]   context=%s, err=%v\n", ctx, ctx.Err())
 	if ctx.Err() != nil {
 		return fmt.Errorf("storage: %w", ctx.Err())
@@ -432,16 +501,20 @@ func storage(ctx context.Context, data string) error {
 	return nil
 }
 
-func main() {
-	fmt.Println("=== With Background (healthy) ===")
-	err := handler(context.Background(), "order-data")
-	fmt.Printf("Result: %v\n\n", err)
+func runScenario(label string, ctx context.Context, data string) {
+	fmt.Println(label)
+	handler := NewRequestHandler()
+	err := handler.Handle(ctx, data)
+	fmt.Printf("Result: %v\n", err)
+}
 
-	fmt.Println("=== With cancelled context ===")
+func main() {
+	runScenario("=== With Background (healthy) ===", context.Background(), "order-data")
+	fmt.Println()
+
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	err = handler(ctx, "order-data")
-	fmt.Printf("Result: %v\n", err)
+	runScenario("=== With cancelled context ===", ctx, "order-data")
 }
 ```
 

@@ -38,7 +38,18 @@ import (
 	"sync"
 )
 
-func main() {
+const (
+	simulatedHandlers = 100
+	endpointCount     = 10
+)
+
+func simulateUnsafeCacheAccess(cache map[string]string, handlerID int) {
+	key := fmt.Sprintf("endpoint-%d", handlerID%endpointCount)
+	cache[key] = fmt.Sprintf(`{"handler":%d,"status":"ok"}`, handlerID)
+	_ = cache[key]
+}
+
+func runUnsafeCacheDemo() {
 	cache := make(map[string]string)
 	var wg sync.WaitGroup
 
@@ -49,18 +60,20 @@ func main() {
 		}
 	}()
 
-	for i := 0; i < 100; i++ {
+	for i := 0; i < simulatedHandlers; i++ {
 		wg.Add(1)
 		go func(handlerID int) {
 			defer wg.Done()
-			key := fmt.Sprintf("endpoint-%d", handlerID%10)
-			cache[key] = fmt.Sprintf(`{"handler":%d,"status":"ok"}`, handlerID)
-			_ = cache[key]
+			simulateUnsafeCacheAccess(cache, handlerID)
 		}(i)
 	}
 
 	wg.Wait()
 	fmt.Printf("Cache has %d entries\n", len(cache))
+}
+
+func main() {
+	runUnsafeCacheDemo()
 }
 ```
 
@@ -99,30 +112,45 @@ import (
 	"sync"
 )
 
+const (
+	simulatedHandlers = 100
+	endpointCount     = 10
+)
+
+func writeCacheEntry(mu *sync.Mutex, cache map[string]string, key, value string) {
+	mu.Lock()
+	cache[key] = value
+	mu.Unlock()
+}
+
+func readCacheEntry(mu *sync.Mutex, cache map[string]string, key string) string {
+	mu.Lock()
+	defer mu.Unlock()
+	return cache[key]
+}
+
+func simulateSafeCacheAccess(mu *sync.Mutex, cache map[string]string, handlerID int) {
+	key := fmt.Sprintf("endpoint-%d", handlerID%endpointCount)
+	response := fmt.Sprintf(`{"handler":%d,"status":"ok"}`, handlerID)
+	writeCacheEntry(mu, cache, key, response)
+	_ = readCacheEntry(mu, cache, key)
+}
+
 func main() {
 	cache := make(map[string]string)
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 
-	for i := 0; i < 100; i++ {
+	for i := 0; i < simulatedHandlers; i++ {
 		wg.Add(1)
 		go func(handlerID int) {
 			defer wg.Done()
-			key := fmt.Sprintf("endpoint-%d", handlerID%10)
-			response := fmt.Sprintf(`{"handler":%d,"status":"ok"}`, handlerID)
-
-			mu.Lock()
-			cache[key] = response
-			mu.Unlock()
-
-			mu.Lock()
-			_ = cache[key]
-			mu.Unlock()
+			simulateSafeCacheAccess(&mu, cache, handlerID)
 		}(i)
 	}
 
 	wg.Wait()
-	fmt.Printf("Cache has %d entries (expected 10)\n", len(cache))
+	fmt.Printf("Cache has %d entries (expected %d)\n", len(cache), endpointCount)
 }
 ```
 
@@ -153,40 +181,61 @@ import (
 	"time"
 )
 
-func main() {
-	cache := make(map[string]string)
-	var mu sync.Mutex
+const (
+	writerCount  = 50
+	userKeyCount = 5
+)
+
+type SimpleCache struct {
+	mu      sync.Mutex
+	entries map[string]string
+}
+
+func NewSimpleCache() *SimpleCache {
+	return &SimpleCache{entries: make(map[string]string)}
+}
+
+func (c *SimpleCache) Set(key, value string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.entries[key] = value
+}
+
+func (c *SimpleCache) Get(key string) (string, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	val, ok := c.entries[key]
+	return val, ok
+}
+
+func populateCacheConcurrently(cache *SimpleCache) {
 	var wg sync.WaitGroup
 
-	cacheSet := func(key, value string) {
-		mu.Lock()
-		defer mu.Unlock()
-		cache[key] = value
-	}
-
-	cacheGet := func(key string) (string, bool) {
-		mu.Lock()
-		defer mu.Unlock()
-		val, ok := cache[key]
-		return val, ok
-	}
-
-	for i := 0; i < 50; i++ {
+	for i := 0; i < writerCount; i++ {
 		wg.Add(1)
 		go func(handlerID int) {
 			defer wg.Done()
-			key := fmt.Sprintf("user-%d", handlerID%5)
-			cacheSet(key, fmt.Sprintf(`{"id":%d,"ts":"%s"}`, handlerID, time.Now().Format(time.RFC3339Nano)))
+			key := fmt.Sprintf("user-%d", handlerID%userKeyCount)
+			value := fmt.Sprintf(`{"id":%d,"ts":"%s"}`, handlerID, time.Now().Format(time.RFC3339Nano))
+			cache.Set(key, value)
 		}(i)
 	}
 
 	wg.Wait()
+}
 
-	for i := 0; i < 5; i++ {
+func printCacheContents(cache *SimpleCache) {
+	for i := 0; i < userKeyCount; i++ {
 		key := fmt.Sprintf("user-%d", i)
-		val, ok := cacheGet(key)
+		val, ok := cache.Get(key)
 		fmt.Printf("  %s: found=%v value=%s\n", key, ok, val)
 	}
+}
+
+func main() {
+	cache := NewSimpleCache()
+	populateCacheConcurrently(cache)
+	printCacheContents(cache)
 }
 ```
 
@@ -211,14 +260,16 @@ import (
 	"time"
 )
 
+const simulatedRequests = 200
+
+type CacheEntry struct {
+	Body     string
+	CachedAt time.Time
+}
+
 type APICache struct {
 	mu      sync.Mutex
 	entries map[string]CacheEntry
-}
-
-type CacheEntry struct {
-	Body      string
-	CachedAt  time.Time
 }
 
 func NewAPICache() *APICache {
@@ -255,32 +306,39 @@ func (c *APICache) Snapshot() map[string]CacheEntry {
 	return result
 }
 
-func main() {
-	cache := NewAPICache()
+func simulateHandlerTraffic(cache *APICache, endpoints []string) {
 	var wg sync.WaitGroup
 
-	endpoints := []string{"/api/users", "/api/orders", "/api/products", "/api/health", "/api/config"}
-
-	for i := 0; i < 200; i++ {
+	for i := 0; i < simulatedRequests; i++ {
 		wg.Add(1)
 		go func(handlerID int) {
 			defer wg.Done()
-			ep := endpoints[handlerID%len(endpoints)]
-			cache.Set(ep, fmt.Sprintf(`{"handler":%d,"status":"ok"}`, handlerID))
+			endpoint := endpoints[handlerID%len(endpoints)]
+			cache.Set(endpoint, fmt.Sprintf(`{"handler":%d,"status":"ok"}`, handlerID))
 
-			if entry, ok := cache.Get(ep); ok {
+			if entry, ok := cache.Get(endpoint); ok {
 				_ = entry.Body
 			}
 		}(i)
 	}
 
 	wg.Wait()
+}
 
+func printCacheSnapshot(cache *APICache) {
 	snap := cache.Snapshot()
 	fmt.Printf("Cache has %d endpoints:\n", len(snap))
-	for ep, entry := range snap {
-		fmt.Printf("  %s -> cached at %s\n", ep, entry.CachedAt.Format("15:04:05.000"))
+	for endpoint, entry := range snap {
+		fmt.Printf("  %s -> cached at %s\n", endpoint, entry.CachedAt.Format("15:04:05.000"))
 	}
+}
+
+func main() {
+	cache := NewAPICache()
+	endpoints := []string{"/api/users", "/api/orders", "/api/products", "/api/health", "/api/config"}
+
+	simulateHandlerTraffic(cache, endpoints)
+	printCacheSnapshot(cache)
 }
 ```
 

@@ -40,6 +40,14 @@ import (
 	"time"
 )
 
+const (
+	requestTimeout       = 1 * time.Second
+	authDelay            = 30 * time.Millisecond
+	rateLimitCheckDelay  = 10 * time.Millisecond
+	serviceValidateDelay = 40 * time.Millisecond
+	databaseQueryDelay   = 80 * time.Millisecond
+)
+
 type requestIDKey struct{}
 type userIDKey struct{}
 type rateLimitKey struct{}
@@ -49,14 +57,15 @@ func requestIDFrom(ctx context.Context) string {
 	return id
 }
 
-func log(ctx context.Context, layer, msg string) {
+func logLayer(ctx context.Context, layer, msg string) {
 	fmt.Printf("[%-12s] req=%s | %s\n", layer, requestIDFrom(ctx), msg)
 }
 
-// Layer 1: Auth middleware -- validates token and adds user ID to context.
-func authMiddleware(ctx context.Context, token string) (context.Context, error) {
-	log(ctx, "auth", "validating token")
-	time.Sleep(30 * time.Millisecond)
+type AuthMiddleware struct{}
+
+func (a *AuthMiddleware) Authenticate(ctx context.Context, token string) (context.Context, error) {
+	logLayer(ctx, "auth", "validating token")
+	time.Sleep(authDelay)
 
 	if token == "" {
 		return ctx, fmt.Errorf("auth: missing token")
@@ -66,24 +75,32 @@ func authMiddleware(ctx context.Context, token string) (context.Context, error) 
 	}
 
 	ctx = context.WithValue(ctx, userIDKey{}, "user-42")
-	log(ctx, "auth", "authenticated as user-42")
+	logLayer(ctx, "auth", "authenticated as user-42")
 	return ctx, nil
 }
 
-// Layer 2: Rate limiter -- checks if user has exceeded rate limit.
-func rateLimiter(ctx context.Context) (context.Context, error) {
+type RateLimiter struct{}
+
+func (r *RateLimiter) Check(ctx context.Context) (context.Context, error) {
 	userID, _ := ctx.Value(userIDKey{}).(string)
-	log(ctx, "rate-limiter", fmt.Sprintf("checking rate for %s", userID))
-	time.Sleep(10 * time.Millisecond)
+	logLayer(ctx, "rate-limiter", fmt.Sprintf("checking rate for %s", userID))
+	time.Sleep(rateLimitCheckDelay)
 
 	ctx = context.WithValue(ctx, rateLimitKey{}, "50/min")
-	log(ctx, "rate-limiter", "within limits (50/min)")
+	logLayer(ctx, "rate-limiter", "within limits (50/min)")
 	return ctx, nil
 }
 
-// Layer 3: Handler -- orchestrates business logic.
-func handler(ctx context.Context, orderID string) (string, error) {
-	log(ctx, "handler", fmt.Sprintf("processing order %s", orderID))
+type OrderHandler struct {
+	service *OrderService
+}
+
+func NewOrderHandler(service *OrderService) *OrderHandler {
+	return &OrderHandler{service: service}
+}
+
+func (h *OrderHandler) Handle(ctx context.Context, orderID string) (string, error) {
+	logLayer(ctx, "handler", fmt.Sprintf("processing order %s", orderID))
 
 	select {
 	case <-ctx.Done():
@@ -91,13 +108,20 @@ func handler(ctx context.Context, orderID string) (string, error) {
 	default:
 	}
 
-	return orderService(ctx, orderID)
+	return h.service.GetOrder(ctx, orderID)
 }
 
-// Layer 4: Service -- business logic.
-func orderService(ctx context.Context, orderID string) (string, error) {
-	log(ctx, "service", "validating business rules")
-	time.Sleep(40 * time.Millisecond)
+type OrderService struct {
+	repo *OrderRepository
+}
+
+func NewOrderService(repo *OrderRepository) *OrderService {
+	return &OrderService{repo: repo}
+}
+
+func (s *OrderService) GetOrder(ctx context.Context, orderID string) (string, error) {
+	logLayer(ctx, "service", "validating business rules")
+	time.Sleep(serviceValidateDelay)
 
 	select {
 	case <-ctx.Done():
@@ -105,47 +129,56 @@ func orderService(ctx context.Context, orderID string) (string, error) {
 	default:
 	}
 
-	return queryDatabase(ctx, orderID)
+	return s.repo.FindByID(ctx, orderID)
 }
 
-// Layer 5: Database query.
-func queryDatabase(ctx context.Context, orderID string) (string, error) {
-	log(ctx, "database", fmt.Sprintf("SELECT * FROM orders WHERE id = '%s'", orderID))
+type OrderRepository struct{}
+
+func NewOrderRepository() *OrderRepository {
+	return &OrderRepository{}
+}
+
+func (r *OrderRepository) FindByID(ctx context.Context, orderID string) (string, error) {
+	logLayer(ctx, "database", fmt.Sprintf("SELECT * FROM orders WHERE id = '%s'", orderID))
 
 	select {
-	case <-time.After(80 * time.Millisecond):
+	case <-time.After(databaseQueryDelay):
 		result := fmt.Sprintf("Order{id: %s, status: processing, user: %s}",
 			orderID, ctx.Value(userIDKey{}))
-		log(ctx, "database", "query complete")
+		logLayer(ctx, "database", "query complete")
 		return result, nil
 	case <-ctx.Done():
-		log(ctx, "database", fmt.Sprintf("query cancelled: %v", ctx.Err()))
+		logLayer(ctx, "database", fmt.Sprintf("query cancelled: %v", ctx.Err()))
 		return "", fmt.Errorf("database: %w", ctx.Err())
 	}
 }
 
 func main() {
-	// Root context with request ID and 1-second timeout.
 	ctx := context.WithValue(context.Background(), requestIDKey{}, "req-7f3a")
-	ctx, cancel := context.WithTimeout(ctx, 1*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, requestTimeout)
 	defer cancel()
 
 	fmt.Println("=== Request Flow (budget: 1s) ===\n")
 
-	// Flow through all layers.
-	ctx, err := authMiddleware(ctx, "valid-token-xyz")
+	auth := &AuthMiddleware{}
+	ctx, err := auth.Authenticate(ctx, "valid-token-xyz")
 	if err != nil {
 		fmt.Printf("REJECTED: %v\n", err)
 		return
 	}
 
-	ctx, err = rateLimiter(ctx)
+	limiter := &RateLimiter{}
+	ctx, err = limiter.Check(ctx)
 	if err != nil {
 		fmt.Printf("REJECTED: %v\n", err)
 		return
 	}
 
-	result, err := handler(ctx, "ORD-2024-5678")
+	repo := NewOrderRepository()
+	svc := NewOrderService(repo)
+	handler := NewOrderHandler(svc)
+
+	result, err := handler.Handle(ctx, "ORD-2024-5678")
 	if err != nil {
 		fmt.Printf("\nFAILED: %v\n", err)
 		return
@@ -190,6 +223,14 @@ import (
 	"time"
 )
 
+const (
+	tightTimeout   = 100 * time.Millisecond
+	authLatency    = 30 * time.Millisecond
+	rateLatency    = 10 * time.Millisecond
+	serviceLatency = 40 * time.Millisecond
+	dbLatency      = 200 * time.Millisecond
+)
+
 type requestIDKey struct{}
 
 func requestIDFrom(ctx context.Context) string {
@@ -197,33 +238,39 @@ func requestIDFrom(ctx context.Context) string {
 	return id
 }
 
-func authMiddleware(ctx context.Context) (context.Context, error) {
+type Server struct{}
+
+func NewServer() *Server {
+	return &Server{}
+}
+
+func (s *Server) authMiddleware(ctx context.Context) (context.Context, error) {
 	fmt.Printf("[auth]       req=%s processing\n", requestIDFrom(ctx))
-	time.Sleep(30 * time.Millisecond)
+	time.Sleep(authLatency)
 	return ctx, nil
 }
 
-func rateLimiter(ctx context.Context) error {
+func (s *Server) rateLimiter(ctx context.Context) error {
 	fmt.Printf("[rate-limit] req=%s checking\n", requestIDFrom(ctx))
-	time.Sleep(10 * time.Millisecond)
+	time.Sleep(rateLatency)
 	return nil
 }
 
-func handler(ctx context.Context) (string, error) {
+func (s *Server) handler(ctx context.Context) (string, error) {
 	fmt.Printf("[handler]    req=%s starting\n", requestIDFrom(ctx))
-	return service(ctx)
+	return s.service(ctx)
 }
 
-func service(ctx context.Context) (string, error) {
+func (s *Server) service(ctx context.Context) (string, error) {
 	fmt.Printf("[service]    req=%s business logic\n", requestIDFrom(ctx))
-	time.Sleep(40 * time.Millisecond)
-	return database(ctx)
+	time.Sleep(serviceLatency)
+	return s.database(ctx)
 }
 
-func database(ctx context.Context) (string, error) {
-	fmt.Printf("[database]   req=%s executing query (needs 200ms)\n", requestIDFrom(ctx))
+func (s *Server) database(ctx context.Context) (string, error) {
+	fmt.Printf("[database]   req=%s executing query (needs %v)\n", requestIDFrom(ctx), dbLatency)
 	select {
-	case <-time.After(200 * time.Millisecond):
+	case <-time.After(dbLatency):
 		return "data", nil
 	case <-ctx.Done():
 		fmt.Printf("[database]   req=%s CANCELLED: %v\n", requestIDFrom(ctx), ctx.Err())
@@ -231,17 +278,21 @@ func database(ctx context.Context) (string, error) {
 	}
 }
 
+func (s *Server) ProcessRequest(ctx context.Context) (string, error) {
+	ctx, _ = s.authMiddleware(ctx)
+	_ = s.rateLimiter(ctx)
+	return s.handler(ctx)
+}
+
 func main() {
-	// Only 100ms budget for: auth(30ms) + rate(10ms) + service(40ms) + db(200ms) = 280ms
 	ctx := context.WithValue(context.Background(), requestIDKey{}, "req-timeout-demo")
-	ctx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+	ctx, cancel := context.WithTimeout(ctx, tightTimeout)
 	defer cancel()
 
-	fmt.Println("=== Request Flow (budget: 100ms, needs: 280ms) ===\n")
+	fmt.Printf("=== Request Flow (budget: %v, needs: 280ms) ===\n\n", tightTimeout)
 
-	ctx, _ = authMiddleware(ctx)
-	_ = rateLimiter(ctx)
-	result, err := handler(ctx)
+	server := NewServer()
+	result, err := server.ProcessRequest(ctx)
 	if err != nil {
 		fmt.Printf("\nRequest failed: %v\n", err)
 		fmt.Println("The timeout propagated through handler -> service -> database")
@@ -285,6 +336,11 @@ import (
 	"time"
 )
 
+const (
+	callerTimeout    = 100 * time.Millisecond
+	slowQueryLatency = 500 * time.Millisecond
+)
+
 type requestIDKey struct{}
 
 func requestIDFrom(ctx context.Context) string {
@@ -295,24 +351,23 @@ func requestIDFrom(ctx context.Context) string {
 	return id
 }
 
-func handler(ctx context.Context) (string, error) {
+type BrokenService struct{}
+
+func (b *BrokenService) Handler(ctx context.Context) (string, error) {
 	fmt.Printf("[handler]  req=%s starting\n", requestIDFrom(ctx))
-	return brokenService(ctx)
+	return b.brokenServiceLayer(ctx)
 }
 
-// BROKEN: creates its own context instead of using the caller's.
-func brokenService(ctx context.Context) (string, error) {
+func (b *BrokenService) brokenServiceLayer(ctx context.Context) (string, error) {
 	fmt.Printf("[service]  req=%s (BROKEN: creating new Background)\n", requestIDFrom(ctx))
-
-	// This breaks the chain. The database has no connection to the caller.
 	newCtx := context.Background()
-	return database(newCtx)
+	return b.database(newCtx)
 }
 
-func database(ctx context.Context) (string, error) {
+func (b *BrokenService) database(ctx context.Context) (string, error) {
 	fmt.Printf("[database] req=%s executing slow query...\n", requestIDFrom(ctx))
 	select {
-	case <-time.After(500 * time.Millisecond):
+	case <-time.After(slowQueryLatency):
 		fmt.Printf("[database] req=%s query finished (but caller already gave up!)\n",
 			requestIDFrom(ctx))
 		return "data", nil
@@ -324,14 +379,16 @@ func database(ctx context.Context) (string, error) {
 
 func main() {
 	ctx := context.WithValue(context.Background(), requestIDKey{}, "req-broken-chain")
-	ctx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+	ctx, cancel := context.WithTimeout(ctx, callerTimeout)
 	defer cancel()
 
 	fmt.Println("=== Broken Chain: service creates new Background() ===\n")
 
+	svc := &BrokenService{}
+
 	done := make(chan struct{})
 	go func() {
-		result, err := handler(ctx)
+		result, err := svc.Handler(ctx)
 		if err != nil {
 			fmt.Printf("\nResult: error=%v\n", err)
 		} else {
@@ -340,11 +397,10 @@ func main() {
 		close(done)
 	}()
 
-	// The caller's timeout fires, but the database keeps running.
 	<-ctx.Done()
-	fmt.Printf("\n[caller] timeout fired at 100ms, but database is STILL running...\n")
+	fmt.Printf("\n[caller] timeout fired at %v, but database is STILL running...\n", callerTimeout)
 
-	<-done // Wait for the database to finish its wasted work.
+	<-done
 	fmt.Println("\n[caller] database finally finished 400ms AFTER the caller gave up.")
 	fmt.Println("[caller] That was a wasted database connection, CPU, and 400ms of work.")
 	fmt.Println("[caller] FIX: pass ctx through the service instead of creating Background().")
@@ -388,6 +444,15 @@ import (
 	"time"
 )
 
+const (
+	defaultRequestTimeout = 1 * time.Second
+	tightRequestTimeout   = 80 * time.Millisecond
+	rateLimitDelay        = 5 * time.Millisecond
+	handlerDelay          = 50 * time.Millisecond
+	dbQueryDelay          = 60 * time.Millisecond
+	tokenPrefixLength     = 10
+)
+
 type requestIDKey struct{}
 type userIDKey struct{}
 
@@ -396,83 +461,91 @@ func requestIDFrom(ctx context.Context) string {
 	return id
 }
 
-func log(ctx context.Context, layer, msg string) {
+func logRequest(ctx context.Context, layer, msg string) {
 	fmt.Printf("[%-12s] req=%s | %s\n", layer, requestIDFrom(ctx), msg)
 }
 
-func authMiddleware(ctx context.Context, token string) (context.Context, error) {
-	log(ctx, "auth", fmt.Sprintf("checking token: %s...", token[:10]))
+type RequestPipeline struct{}
+
+func NewRequestPipeline() *RequestPipeline {
+	return &RequestPipeline{}
+}
+
+func (p *RequestPipeline) authMiddleware(ctx context.Context, token string) (context.Context, error) {
+	logRequest(ctx, "auth", fmt.Sprintf("checking token: %s...", token[:tokenPrefixLength]))
 	if token != "valid-token" {
-		log(ctx, "auth", "REJECTED: invalid token")
+		logRequest(ctx, "auth", "REJECTED: invalid token")
 		return ctx, fmt.Errorf("auth: invalid token")
 	}
 	ctx = context.WithValue(ctx, userIDKey{}, "user-42")
-	log(ctx, "auth", "OK")
+	logRequest(ctx, "auth", "OK")
 	return ctx, nil
 }
 
-func rateLimiter(ctx context.Context) error {
-	log(ctx, "rate-limiter", "checking quota")
-	time.Sleep(5 * time.Millisecond)
-	log(ctx, "rate-limiter", "OK (45/50 remaining)")
+func (p *RequestPipeline) rateLimiter(ctx context.Context) error {
+	logRequest(ctx, "rate-limiter", "checking quota")
+	time.Sleep(rateLimitDelay)
+	logRequest(ctx, "rate-limiter", "OK (45/50 remaining)")
 	return nil
 }
 
-func businessHandler(ctx context.Context) (string, error) {
-	log(ctx, "handler", "processing")
+func (p *RequestPipeline) handler(ctx context.Context) (string, error) {
+	logRequest(ctx, "handler", "processing")
 	select {
 	case <-ctx.Done():
 		return "", fmt.Errorf("handler: %w", ctx.Err())
-	case <-time.After(50 * time.Millisecond):
+	case <-time.After(handlerDelay):
 	}
-	return databaseQuery(ctx)
+	return p.databaseQuery(ctx)
 }
 
-func databaseQuery(ctx context.Context) (string, error) {
-	log(ctx, "database", "executing query")
+func (p *RequestPipeline) databaseQuery(ctx context.Context) (string, error) {
+	logRequest(ctx, "database", "executing query")
 	select {
-	case <-time.After(60 * time.Millisecond):
-		log(ctx, "database", "complete")
+	case <-time.After(dbQueryDelay):
+		logRequest(ctx, "database", "complete")
 		return "Order{status: confirmed}", nil
 	case <-ctx.Done():
 		return "", fmt.Errorf("database: %w", ctx.Err())
 	}
 }
 
-func processRequest(reqID string, token string, timeout time.Duration) {
+func (p *RequestPipeline) ProcessRequest(reqID string, token string, timeout time.Duration) {
 	ctx := context.WithValue(context.Background(), requestIDKey{}, reqID)
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	ctx, err := authMiddleware(ctx, token)
+	ctx, err := p.authMiddleware(ctx, token)
 	if err != nil {
-		log(ctx, "response", fmt.Sprintf("401: %v", err))
+		logRequest(ctx, "response", fmt.Sprintf("401: %v", err))
 		return
 	}
 
-	if err := rateLimiter(ctx); err != nil {
-		log(ctx, "response", fmt.Sprintf("429: %v", err))
+	if err := p.rateLimiter(ctx); err != nil {
+		logRequest(ctx, "response", fmt.Sprintf("429: %v", err))
 		return
 	}
 
-	result, err := businessHandler(ctx)
+	result, err := p.handler(ctx)
 	if err != nil {
-		log(ctx, "response", fmt.Sprintf("500: %v", err))
+		logRequest(ctx, "response", fmt.Sprintf("500: %v", err))
 		return
 	}
 
-	log(ctx, "response", fmt.Sprintf("200: %s", result))
+	logRequest(ctx, "response", fmt.Sprintf("200: %s", result))
 }
 
 func main() {
+	pipeline := NewRequestPipeline()
+
 	fmt.Println("=== Request 1: Happy path ===")
-	processRequest("req-001", "valid-token", 1*time.Second)
+	pipeline.ProcessRequest("req-001", "valid-token", defaultRequestTimeout)
 
 	fmt.Println("\n=== Request 2: Auth failure ===")
-	processRequest("req-002", "bad-token!!", 1*time.Second)
+	pipeline.ProcessRequest("req-002", "bad-token!!", defaultRequestTimeout)
 
 	fmt.Println("\n=== Request 3: Timeout ===")
-	processRequest("req-003", "valid-token", 80*time.Millisecond)
+	pipeline.ProcessRequest("req-003", "valid-token", tightRequestTimeout)
 }
 ```
 
@@ -566,27 +639,30 @@ func reqIDFrom(ctx context.Context) string {
 	return id
 }
 
-func runRequest(reqID string, budget time.Duration) {
+type LayerConfig struct {
+	Name     string
+	Duration time.Duration
+}
+
+type LayeredPipeline struct {
+	layers []LayerConfig
+}
+
+func NewLayeredPipeline(layers []LayerConfig) *LayeredPipeline {
+	return &LayeredPipeline{layers: layers}
+}
+
+func (p *LayeredPipeline) Run(reqID string, budget time.Duration) {
 	ctx := context.WithValue(context.Background(), reqIDKey{}, reqID)
 	ctx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
 
-	layers := []struct {
-		name string
-		work time.Duration
-	}{
-		{"gateway", 30 * time.Millisecond},
-		{"auth", 20 * time.Millisecond},
-		{"handler", 40 * time.Millisecond},
-		{"storage", 100 * time.Millisecond},
-	}
-
-	for _, l := range layers {
-		fmt.Printf("[%-8s] req=%s processing\n", l.name, reqIDFrom(ctx))
+	for _, l := range p.layers {
+		fmt.Printf("[%-8s] req=%s processing\n", l.Name, reqIDFrom(ctx))
 		select {
-		case <-time.After(l.work):
+		case <-time.After(l.Duration):
 		case <-ctx.Done():
-			fmt.Printf("[%-8s] req=%s CANCELLED: %v\n", l.name, reqIDFrom(ctx), ctx.Err())
+			fmt.Printf("[%-8s] req=%s CANCELLED: %v\n", l.Name, reqIDFrom(ctx), ctx.Err())
 			return
 		}
 	}
@@ -594,11 +670,19 @@ func runRequest(reqID string, budget time.Duration) {
 }
 
 func main() {
+	layers := []LayerConfig{
+		{Name: "gateway", Duration: 30 * time.Millisecond},
+		{Name: "auth", Duration: 20 * time.Millisecond},
+		{Name: "handler", Duration: 40 * time.Millisecond},
+		{Name: "storage", Duration: 100 * time.Millisecond},
+	}
+	pipeline := NewLayeredPipeline(layers)
+
 	fmt.Println("=== 500ms budget (needs 190ms) ===")
-	runRequest("req-ok", 500*time.Millisecond)
+	pipeline.Run("req-ok", 500*time.Millisecond)
 
 	fmt.Println("\n=== 100ms budget (needs 190ms) ===")
-	runRequest("req-tight", 100*time.Millisecond)
+	pipeline.Run("req-tight", 100*time.Millisecond)
 }
 ```
 

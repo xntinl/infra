@@ -38,32 +38,34 @@ import (
 	"sync"
 )
 
+const iterationsPerJob = 5
+
+func runMetricsCollector(wg *sync.WaitGroup) {
+	defer wg.Done()
+	ch := make(chan int, 1)
+	for i := 0; i < iterationsPerJob; i++ {
+		ch <- i  // scheduling point: channel send
+		_ = <-ch // scheduling point: channel receive
+		fmt.Printf("metrics-collector:%d ", i)
+	}
+}
+
+func runLogShipper(wg *sync.WaitGroup) {
+	defer wg.Done()
+	for i := 0; i < iterationsPerJob; i++ {
+		fmt.Printf("log-shipper:%d ", i) // scheduling point: I/O syscall
+	}
+}
+
 func main() {
 	runtime.GOMAXPROCS(1)
 	defer runtime.GOMAXPROCS(runtime.NumCPU())
 
 	var wg sync.WaitGroup
+	wg.Add(2)
 
-	// Job A: IO-heavy metrics collector (channel ops are scheduling points)
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		ch := make(chan int, 1)
-		for i := 0; i < 5; i++ {
-			ch <- i  // scheduling point: channel send
-			_ = <-ch // scheduling point: channel receive
-			fmt.Printf("metrics-collector:%d ", i)
-		}
-	}()
-
-	// Job B: Log shipper (fmt.Printf involves IO syscall = scheduling point)
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for i := 0; i < 5; i++ {
-			fmt.Printf("log-shipper:%d ", i) // scheduling point: I/O syscall
-		}
-	}()
+	go runMetricsCollector(&wg)
+	go runLogShipper(&wg)
 
 	wg.Wait()
 	fmt.Println()
@@ -99,6 +101,13 @@ import (
 	"time"
 )
 
+const (
+	primeSearchLimit   = 100_000
+	goSchedInterval    = 1000
+	healthCheckTicks   = 5
+	healthCheckPeriod  = 10 * time.Millisecond
+)
+
 func isPrime(n int) bool {
 	if n < 2 {
 		return false
@@ -111,54 +120,56 @@ func isPrime(n int) bool {
 	return true
 }
 
+func runPrimeGenerator(wg *sync.WaitGroup, yieldEveryN int) {
+	defer wg.Done()
+	primes := 0
+	for n := 2; n < primeSearchLimit; n++ {
+		if isPrime(n) {
+			primes++
+		}
+		if yieldEveryN > 0 && n%yieldEveryN == 0 {
+			runtime.Gosched()
+		}
+	}
+	fmt.Printf("  prime-generator: found %d primes\n", primes)
+}
+
+func runPeriodicHealthCheck(wg *sync.WaitGroup, start time.Time) int {
+	defer wg.Done()
+	completed := 0
+	for i := 0; i < healthCheckTicks; i++ {
+		time.Sleep(healthCheckPeriod)
+		completed++
+		fmt.Printf("  health-check: tick %d (%v)\n", i, time.Since(start).Round(time.Millisecond))
+	}
+	return completed
+}
+
+func runExperiment(label string, yieldInterval int) {
+	fmt.Printf("--- %s ---\n", label)
+
+	start := time.Now()
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go runPrimeGenerator(&wg, yieldInterval)
+
+	healthChecks := 0
+	go func() {
+		healthChecks = runPeriodicHealthCheck(&wg, start)
+	}()
+
+	wg.Wait()
+	fmt.Printf("  Health checks completed: %d/%d | Total: %v\n\n",
+		healthChecks, healthCheckTicks, time.Since(start).Round(time.Millisecond))
+}
+
 func main() {
 	runtime.GOMAXPROCS(1)
 	defer runtime.GOMAXPROCS(runtime.NumCPU())
 
-	var wg sync.WaitGroup
-
-	// Run the experiment twice: without and with Gosched
-	for _, useGosched := range []bool{false, true} {
-		label := "WITHOUT Gosched"
-		if useGosched {
-			label = "WITH Gosched"
-		}
-		fmt.Printf("--- %s ---\n", label)
-
-		start := time.Now()
-		healthChecksCompleted := 0
-
-		wg.Add(2)
-
-		// Job 1: CPU-heavy prime computation (key generation simulation)
-		go func() {
-			defer wg.Done()
-			primes := 0
-			for n := 2; n < 100_000; n++ {
-				if isPrime(n) {
-					primes++
-				}
-				if useGosched && n%1000 == 0 {
-					runtime.Gosched() // "I've done enough, let others run"
-				}
-			}
-			fmt.Printf("  prime-generator: found %d primes\n", primes)
-		}()
-
-		// Job 2: Periodic health check (needs to run regularly)
-		go func() {
-			defer wg.Done()
-			for i := 0; i < 5; i++ {
-				time.Sleep(10 * time.Millisecond)
-				healthChecksCompleted++
-				fmt.Printf("  health-check: tick %d (%v)\n", i, time.Since(start).Round(time.Millisecond))
-			}
-		}()
-
-		wg.Wait()
-		fmt.Printf("  Health checks completed: %d/5 | Total: %v\n\n",
-			healthChecksCompleted, time.Since(start).Round(time.Millisecond))
-	}
+	runExperiment("WITHOUT Gosched", 0)
+	runExperiment("WITH Gosched", goSchedInterval)
 }
 ```
 
@@ -203,6 +214,46 @@ import (
 	"time"
 )
 
+const (
+	monitorTicks       = 10
+	monitorInterval    = 10 * time.Millisecond
+)
+
+func runTightCPULoop(counter *int64, done <-chan struct{}) {
+	for {
+		select {
+		case <-done:
+			return
+		default:
+			atomic.AddInt64(counter, 1)
+		}
+	}
+}
+
+func runPeriodicMonitor(counter *int64) bool {
+	successes := 0
+	for i := 0; i < monitorTicks; i++ {
+		time.Sleep(monitorInterval)
+		successes++
+		fmt.Printf("  monitor tick %d (computations so far: %d)\n",
+			i, atomic.LoadInt64(counter))
+	}
+	return successes == monitorTicks
+}
+
+func printPreemptionReport(allTicksCompleted bool) {
+	if !allTicksCompleted {
+		return
+	}
+	fmt.Println()
+	fmt.Println("  All 10 monitoring ticks completed on schedule.")
+	fmt.Println("  Async preemption (Go 1.14+) prevented the CPU-heavy")
+	fmt.Println("  goroutine from starving the monitor.")
+	fmt.Println()
+	fmt.Println("  Before Go 1.14, the monitor would NEVER run. The CPU loop")
+	fmt.Println("  would hold the P forever, and your monitoring would be blind.")
+}
+
 func main() {
 	runtime.GOMAXPROCS(1)
 	defer runtime.GOMAXPROCS(runtime.NumCPU())
@@ -210,45 +261,17 @@ func main() {
 	var counter int64
 	done := make(chan struct{})
 
-	// Goroutine A: tight prime-sieve loop with NO natural scheduling points.
-	// Before Go 1.14, this would starve all other goroutines on this P.
-	go func() {
-		for {
-			select {
-			case <-done:
-				return
-			default:
-				// Pure CPU work: no function calls, no IO, no channels
-				atomic.AddInt64(&counter, 1)
-			}
-		}
-	}()
+	go runTightCPULoop(&counter, done)
 
-	// Goroutine B: periodic monitoring that must run on schedule.
 	completed := make(chan bool)
 	go func() {
-		successes := 0
-		for i := 0; i < 10; i++ {
-			time.Sleep(10 * time.Millisecond)
-			successes++
-			fmt.Printf("  monitor tick %d (computations so far: %d)\n",
-				i, atomic.LoadInt64(&counter))
-		}
-		completed <- successes == 10
+		completed <- runPeriodicMonitor(&counter)
 	}()
 
 	success := <-completed
 	close(done)
 
-	if success {
-		fmt.Println()
-		fmt.Println("  All 10 monitoring ticks completed on schedule.")
-		fmt.Println("  Async preemption (Go 1.14+) prevented the CPU-heavy")
-		fmt.Println("  goroutine from starving the monitor.")
-		fmt.Println()
-		fmt.Println("  Before Go 1.14, the monitor would NEVER run. The CPU loop")
-		fmt.Println("  would hold the P forever, and your monitoring would be blind.")
-	}
+	printPreemptionReport(success)
 }
 ```
 
@@ -292,92 +315,101 @@ import (
 	"time"
 )
 
-func main() {
-	runtime.GOMAXPROCS(1)
-	defer runtime.GOMAXPROCS(runtime.NumCPU())
+const (
+	workerCount        = 3
+	experimentDuration = 100 * time.Millisecond
+	goSchedFrequency   = 1000
+)
 
-	type result struct {
-		name   string
-		counts [3]int64
+type WorkerFunc func(id int, counter *int64, stop <-chan struct{})
+
+type FairnessResult struct {
+	Name    string
+	Counts  [workerCount]int64
+}
+
+func runFairnessExperiment(name string, workFn WorkerFunc) FairnessResult {
+	var counters [workerCount]int64
+	stop := make(chan struct{})
+
+	for i := 0; i < workerCount; i++ {
+		go workFn(i, &counters[i], stop)
 	}
 
-	runExperiment := func(name string, workFn func(id int, counter *int64, stop <-chan struct{})) result {
-		var counters [3]int64
-		stop := make(chan struct{})
+	time.Sleep(experimentDuration)
+	close(stop)
+	time.Sleep(10 * time.Millisecond)
 
-		for i := 0; i < 3; i++ {
-			go workFn(i, &counters[i], stop)
+	return FairnessResult{Name: name, Counts: counters}
+}
+
+func tightLoopWorker(_ int, counter *int64, stop <-chan struct{}) {
+	for {
+		select {
+		case <-stop:
+			return
+		default:
+			atomic.AddInt64(counter, 1)
 		}
-
-		time.Sleep(100 * time.Millisecond)
-		close(stop)
-		time.Sleep(10 * time.Millisecond)
-
-		return result{name: name, counts: counters}
 	}
+}
 
-	// Experiment 1: tight loop (relies only on async preemption)
-	r1 := runExperiment("tight loop (preemption only)", func(id int, counter *int64, stop <-chan struct{}) {
-		for {
-			select {
-			case <-stop:
-				return
-			default:
-				atomic.AddInt64(counter, 1)
+func goSchedWorker(_ int, counter *int64, stop <-chan struct{}) {
+	for {
+		select {
+		case <-stop:
+			return
+		default:
+			atomic.AddInt64(counter, 1)
+			if atomic.LoadInt64(counter)%goSchedFrequency == 0 {
+				runtime.Gosched()
 			}
 		}
-	})
+	}
+}
 
-	// Experiment 2: Gosched every 1000 iterations (cooperative)
-	r2 := runExperiment("Gosched every 1K iters", func(id int, counter *int64, stop <-chan struct{}) {
-		for {
-			select {
-			case <-stop:
-				return
-			default:
-				atomic.AddInt64(counter, 1)
-				if atomic.LoadInt64(counter)%1000 == 0 {
-					runtime.Gosched()
-				}
-			}
+func channelYieldWorker(_ int, counter *int64, stop <-chan struct{}) {
+	ch := make(chan struct{}, 1)
+	ch <- struct{}{}
+	for {
+		select {
+		case <-stop:
+			return
+		default:
+			<-ch
+			atomic.AddInt64(counter, 1)
+			ch <- struct{}{}
 		}
-	})
+	}
+}
 
-	// Experiment 3: channel operation every iteration (most cooperative)
-	r3 := runExperiment("channel yield per iter", func(id int, counter *int64, stop <-chan struct{}) {
-		ch := make(chan struct{}, 1)
-		ch <- struct{}{}
-		for {
-			select {
-			case <-stop:
-				return
-			default:
-				<-ch
-				atomic.AddInt64(counter, 1)
-				ch <- struct{}{}
-			}
-		}
-	})
+func calculateFairness(counts [workerCount]int64) float64 {
+	var total int64
+	for _, c := range counts {
+		total += c
+	}
+	if total == 0 {
+		return 0
+	}
+	avg := float64(total) / float64(workerCount)
+	variance := 0.0
+	for _, c := range counts {
+		diff := float64(c) - avg
+		variance += diff * diff
+	}
+	return 1.0 - (variance / (avg * avg * float64(workerCount)))
+}
 
-	fmt.Println("=== Scheduling Fairness: 3 Workers Sharing 1 P for 100ms ===")
+func printFairnessTable(results []FairnessResult) {
+	fmt.Printf("=== Scheduling Fairness: %d Workers Sharing 1 P for %v ===\n", workerCount, experimentDuration)
 	fmt.Println()
 	fmt.Printf("%-30s %12s %12s %12s %10s\n", "Strategy", "Worker 0", "Worker 1", "Worker 2", "Fairness")
 	fmt.Println(strings.Repeat("-", 80))
 
-	for _, r := range []result{r1, r2, r3} {
-		total := r.counts[0] + r.counts[1] + r.counts[2]
-		var fairness float64
-		if total > 0 {
-			avg := float64(total) / 3.0
-			variance := 0.0
-			for _, c := range r.counts {
-				diff := float64(c) - avg
-				variance += diff * diff
-			}
-			fairness = 1.0 - (variance / (avg * avg * 3))
-		}
+	for _, r := range results {
+		fairness := calculateFairness(r.Counts)
 		fmt.Printf("%-30s %12d %12d %12d %10.3f\n",
-			r.name, r.counts[0], r.counts[1], r.counts[2], fairness)
+			r.Name, r.Counts[0], r.Counts[1], r.Counts[2], fairness)
 	}
 
 	fmt.Println()
@@ -385,6 +417,19 @@ func main() {
 	fmt.Println("Tight loops: worst fairness (one worker hogs the P for ~10ms at a time)")
 	fmt.Println("Channel ops: best fairness but lowest throughput (context switch overhead)")
 	fmt.Println("Gosched:     good balance of fairness and throughput")
+}
+
+func main() {
+	runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(runtime.NumCPU())
+
+	results := []FairnessResult{
+		runFairnessExperiment("tight loop (preemption only)", tightLoopWorker),
+		runFairnessExperiment("Gosched every 1K iters", goSchedWorker),
+		runFairnessExperiment("channel yield per iter", channelYieldWorker),
+	}
+
+	printFairnessTable(results)
 }
 ```
 

@@ -39,19 +39,22 @@ import (
 	"testing"
 )
 
-// --- Pattern 1: Pure Counter (write-only) ---
+// --- Counter Implementations ---
 
 type AtomicCounter struct {
 	val atomic.Int64
 }
 
-func (c *AtomicCounter) Inc()       { c.val.Add(1) }
-func (c *AtomicCounter) Get() int64 { return c.val.Load() }
+func NewAtomicCounter() *AtomicCounter     { return &AtomicCounter{} }
+func (c *AtomicCounter) Inc()              { c.val.Add(1) }
+func (c *AtomicCounter) Get() int64        { return c.val.Load() }
 
 type MutexCounter struct {
 	mu  sync.Mutex
 	val int64
 }
+
+func NewMutexCounter() *MutexCounter { return &MutexCounter{} }
 
 func (c *MutexCounter) Inc() {
 	c.mu.Lock()
@@ -70,6 +73,8 @@ type RWMutexCounter struct {
 	val int64
 }
 
+func NewRWMutexCounter() *RWMutexCounter { return &RWMutexCounter{} }
+
 func (c *RWMutexCounter) Inc() {
 	c.mu.Lock()
 	c.val++
@@ -82,24 +87,47 @@ func (c *RWMutexCounter) Get() int64 {
 	return c.val
 }
 
+// --- Counter interface for read-heavy gauge benchmarks ---
+
+type Counter interface {
+	Inc()
+	Get() int64
+}
+
+const writeEveryN = 10 // 10% writes, 90% reads
+
+func runReadHeavyBenchmark(b *testing.B, c Counter) {
+	b.RunParallel(func(pb *testing.PB) {
+		i := 0
+		for pb.Next() {
+			if i%writeEveryN == 0 {
+				c.Inc()
+			} else {
+				c.Get()
+			}
+			i++
+		}
+	})
+}
+
 // --- Pattern 1 Benchmarks: Pure Counter ---
 
 func BenchmarkCounter_Atomic_Sequential(b *testing.B) {
-	c := &AtomicCounter{}
+	c := NewAtomicCounter()
 	for i := 0; i < b.N; i++ {
 		c.Inc()
 	}
 }
 
 func BenchmarkCounter_Mutex_Sequential(b *testing.B) {
-	c := &MutexCounter{}
+	c := NewMutexCounter()
 	for i := 0; i < b.N; i++ {
 		c.Inc()
 	}
 }
 
 func BenchmarkCounter_Atomic_Parallel(b *testing.B) {
-	c := &AtomicCounter{}
+	c := NewAtomicCounter()
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
 			c.Inc()
@@ -108,7 +136,7 @@ func BenchmarkCounter_Atomic_Parallel(b *testing.B) {
 }
 
 func BenchmarkCounter_Mutex_Parallel(b *testing.B) {
-	c := &MutexCounter{}
+	c := NewMutexCounter()
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
 			c.Inc()
@@ -116,9 +144,11 @@ func BenchmarkCounter_Mutex_Parallel(b *testing.B) {
 	})
 }
 
+const highContentionParallelism = 100
+
 func BenchmarkCounter_Atomic_HighContention(b *testing.B) {
-	c := &AtomicCounter{}
-	b.SetParallelism(100) // 100x GOMAXPROCS goroutines
+	c := NewAtomicCounter()
+	b.SetParallelism(highContentionParallelism)
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
 			c.Inc()
@@ -127,8 +157,8 @@ func BenchmarkCounter_Atomic_HighContention(b *testing.B) {
 }
 
 func BenchmarkCounter_Mutex_HighContention(b *testing.B) {
-	c := &MutexCounter{}
-	b.SetParallelism(100)
+	c := NewMutexCounter()
+	b.SetParallelism(highContentionParallelism)
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
 			c.Inc()
@@ -138,52 +168,11 @@ func BenchmarkCounter_Mutex_HighContention(b *testing.B) {
 
 // --- Pattern 2 Benchmarks: Read-Heavy Gauge (90% reads, 10% writes) ---
 
-func BenchmarkGauge_Atomic_ReadHeavy(b *testing.B) {
-	c := &AtomicCounter{}
-	b.RunParallel(func(pb *testing.PB) {
-		i := 0
-		for pb.Next() {
-			if i%10 == 0 {
-				c.Inc() // 10% writes
-			} else {
-				c.Get() // 90% reads
-			}
-			i++
-		}
-	})
-}
+func BenchmarkGauge_Atomic_ReadHeavy(b *testing.B)  { runReadHeavyBenchmark(b, NewAtomicCounter()) }
+func BenchmarkGauge_Mutex_ReadHeavy(b *testing.B)   { runReadHeavyBenchmark(b, NewMutexCounter()) }
+func BenchmarkGauge_RWMutex_ReadHeavy(b *testing.B) { runReadHeavyBenchmark(b, NewRWMutexCounter()) }
 
-func BenchmarkGauge_Mutex_ReadHeavy(b *testing.B) {
-	c := &MutexCounter{}
-	b.RunParallel(func(pb *testing.PB) {
-		i := 0
-		for pb.Next() {
-			if i%10 == 0 {
-				c.Inc()
-			} else {
-				c.Get()
-			}
-			i++
-		}
-	})
-}
-
-func BenchmarkGauge_RWMutex_ReadHeavy(b *testing.B) {
-	c := &RWMutexCounter{}
-	b.RunParallel(func(pb *testing.PB) {
-		i := 0
-		for pb.Next() {
-			if i%10 == 0 {
-				c.Inc()
-			} else {
-				c.Get()
-			}
-			i++
-		}
-	})
-}
-
-// --- Pattern 3 Benchmarks: Complex State (multi-field update) ---
+// --- Stats Implementations (multi-field) ---
 
 type ServiceStats struct {
 	Requests   int64
@@ -193,15 +182,14 @@ type ServiceStats struct {
 	AvgLatency float64
 }
 
-type AtomicStats struct {
+type AtomicServiceStats struct {
 	requests atomic.Int64
 	bytesIn  atomic.Int64
 	bytesOut atomic.Int64
 	errors   atomic.Int64
-	// AvgLatency cannot be atomic -- needs mutex for read-modify-write on float
 }
 
-func (s *AtomicStats) Record(bytesIn, bytesOut int64, isError bool) {
+func (s *AtomicServiceStats) Record(bytesIn, bytesOut int64, isError bool) {
 	s.requests.Add(1)
 	s.bytesIn.Add(bytesIn)
 	s.bytesOut.Add(bytesOut)
@@ -210,12 +198,12 @@ func (s *AtomicStats) Record(bytesIn, bytesOut int64, isError bool) {
 	}
 }
 
-type MutexStats struct {
+type MutexServiceStats struct {
 	mu    sync.Mutex
 	stats ServiceStats
 }
 
-func (s *MutexStats) Record(bytesIn, bytesOut int64, isError bool) {
+func (s *MutexServiceStats) Record(bytesIn, bytesOut int64, isError bool) {
 	s.mu.Lock()
 	s.stats.Requests++
 	s.stats.BytesIn += bytesIn
@@ -223,45 +211,51 @@ func (s *MutexStats) Record(bytesIn, bytesOut int64, isError bool) {
 	if isError {
 		s.stats.Errors++
 	}
-	// Can compute running average here -- impossible with atomics alone
 	s.stats.AvgLatency = float64(s.stats.BytesOut) / float64(s.stats.Requests)
 	s.mu.Unlock()
 }
 
+// --- Pattern 3 Benchmarks: Complex State ---
+
+const (
+	benchBytesIn  int64 = 256
+	benchBytesOut int64 = 1024
+)
+
 func BenchmarkStats_Atomic_Parallel(b *testing.B) {
-	s := &AtomicStats{}
+	s := &AtomicServiceStats{}
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
-			s.Record(256, 1024, false)
+			s.Record(benchBytesIn, benchBytesOut, false)
 		}
 	})
 }
 
 func BenchmarkStats_Mutex_Parallel(b *testing.B) {
-	s := &MutexStats{}
+	s := &MutexServiceStats{}
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
-			s.Record(256, 1024, false)
+			s.Record(benchBytesIn, benchBytesOut, false)
 		}
 	})
 }
 
 func BenchmarkStats_Atomic_HighContention(b *testing.B) {
-	s := &AtomicStats{}
-	b.SetParallelism(100)
+	s := &AtomicServiceStats{}
+	b.SetParallelism(highContentionParallelism)
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
-			s.Record(256, 1024, false)
+			s.Record(benchBytesIn, benchBytesOut, false)
 		}
 	})
 }
 
 func BenchmarkStats_Mutex_HighContention(b *testing.B) {
-	s := &MutexStats{}
-	b.SetParallelism(100)
+	s := &MutexServiceStats{}
+	b.SetParallelism(highContentionParallelism)
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
-			s.Record(256, 1024, false)
+			s.Record(benchBytesIn, benchBytesOut, false)
 		}
 	})
 }
@@ -348,7 +342,25 @@ import (
 	"time"
 )
 
-func measure(name string, goroutines, iterations int, work func()) time.Duration {
+const (
+	benchGoroutines = 64
+	benchIterations = 50000
+	readWriteRatio  = 9 // 9 reads per 1 write = 90% reads
+	statsBytesIn    = 256
+	statsBytesOut   = 1024
+)
+
+type PatternResult struct {
+	AtomicDuration time.Duration
+	OtherDuration  time.Duration
+	OtherLabel     string
+}
+
+func (r PatternResult) SpeedupRatio() float64 {
+	return float64(r.OtherDuration) / float64(r.AtomicDuration)
+}
+
+func measureConcurrent(goroutines, iterations int, work func()) time.Duration {
 	var wg sync.WaitGroup
 	start := time.Now()
 	for i := 0; i < goroutines; i++ {
@@ -364,104 +376,98 @@ func measure(name string, goroutines, iterations int, work func()) time.Duration
 	return time.Since(start)
 }
 
-func main() {
-	const goroutines = 64
-	const iterations = 50000
-
-	fmt.Println("=== Atomic vs Mutex: Data-Driven Decision Guide ===")
-	fmt.Printf("Configuration: %d goroutines x %d iterations\n\n", goroutines, iterations)
-
-	// Pattern 1: Pure counter (write-only)
+func benchmarkPureCounter() PatternResult {
 	var ac atomic.Int64
-	var mc struct {
-		mu  sync.Mutex
-		val int64
-	}
+	var mu sync.Mutex
+	var mc int64
 
-	atomicTime := measure("atomic-counter", goroutines, iterations, func() {
-		ac.Add(1)
-	})
-	mutexTime := measure("mutex-counter", goroutines, iterations, func() {
-		mc.mu.Lock()
-		mc.val++
-		mc.mu.Unlock()
+	atomicTime := measureConcurrent(benchGoroutines, benchIterations, func() { ac.Add(1) })
+	mutexTime := measureConcurrent(benchGoroutines, benchIterations, func() {
+		mu.Lock()
+		mc++
+		mu.Unlock()
 	})
 
 	fmt.Println("Pattern 1: Pure Counter Increment")
 	fmt.Printf("  Atomic:  %v  (count=%d)\n", atomicTime, ac.Load())
-	fmt.Printf("  Mutex:   %v  (count=%d)\n", mutexTime, mc.val)
-	fmt.Printf("  Winner:  Atomic (%.1fx faster)\n\n", float64(mutexTime)/float64(atomicTime))
+	fmt.Printf("  Mutex:   %v  (count=%d)\n", mutexTime, mc)
 
-	// Pattern 2: Read-heavy gauge (90% reads, 10% writes)
+	return PatternResult{AtomicDuration: atomicTime, OtherDuration: mutexTime, OtherLabel: "Mutex"}
+}
+
+func benchmarkReadHeavyGauge() PatternResult {
 	var ag atomic.Int64
-	var rg struct {
-		mu  sync.RWMutex
-		val int64
-	}
+	var rwmu sync.RWMutex
+	var rv int64
 
-	atomicTime = measure("atomic-gauge", goroutines, iterations, func() {
-		ag.Load()
-		ag.Load()
-		ag.Load()
-		ag.Load()
-		ag.Load()
-		ag.Load()
-		ag.Load()
-		ag.Load()
-		ag.Load()
-		ag.Add(1) // 1 in 10 = 10% writes
-	})
-	rwmTime := measure("rwmutex-gauge", goroutines, iterations, func() {
-		for k := 0; k < 9; k++ {
-			rg.mu.RLock()
-			_ = rg.val
-			rg.mu.RUnlock()
+	atomicTime := measureConcurrent(benchGoroutines, benchIterations, func() {
+		for k := 0; k < readWriteRatio; k++ {
+			ag.Load()
 		}
-		rg.mu.Lock()
-		rg.val++
-		rg.mu.Unlock()
+		ag.Add(1)
+	})
+	rwmTime := measureConcurrent(benchGoroutines, benchIterations, func() {
+		for k := 0; k < readWriteRatio; k++ {
+			rwmu.RLock()
+			_ = rv
+			rwmu.RUnlock()
+		}
+		rwmu.Lock()
+		rv++
+		rwmu.Unlock()
 	})
 
 	fmt.Println("Pattern 2: Read-Heavy Gauge (90% reads, 10% writes)")
 	fmt.Printf("  Atomic:   %v\n", atomicTime)
 	fmt.Printf("  RWMutex:  %v\n", rwmTime)
-	fmt.Printf("  Winner:   Atomic (%.1fx faster)\n\n", float64(rwmTime)/float64(atomicTime))
 
-	// Pattern 3: Complex state (multi-field, needs derived values)
-	var as struct {
-		reqs     atomic.Int64
-		bytesIn  atomic.Int64
-		bytesOut atomic.Int64
-	}
-	var ms struct {
-		mu       sync.Mutex
-		reqs     int64
-		bytesIn  int64
-		bytesOut int64
-		avgBytes float64
-	}
+	return PatternResult{AtomicDuration: atomicTime, OtherDuration: rwmTime, OtherLabel: "RWMutex"}
+}
 
-	atomicTime = measure("atomic-stats", goroutines, iterations, func() {
-		as.reqs.Add(1)
-		as.bytesIn.Add(256)
-		as.bytesOut.Add(1024)
-		// Cannot compute avgBytes atomically
-	})
-	mutexTime = measure("mutex-stats", goroutines, iterations, func() {
-		ms.mu.Lock()
-		ms.reqs++
-		ms.bytesIn += 256
-		ms.bytesOut += 1024
-		ms.avgBytes = float64(ms.bytesOut) / float64(ms.reqs)
-		ms.mu.Unlock()
-	})
+type AtomicMultiFieldStats struct {
+	reqs     atomic.Int64
+	bytesIn  atomic.Int64
+	bytesOut atomic.Int64
+}
+
+func (s *AtomicMultiFieldStats) Record() {
+	s.reqs.Add(1)
+	s.bytesIn.Add(statsBytesIn)
+	s.bytesOut.Add(statsBytesOut)
+}
+
+type MutexMultiFieldStats struct {
+	mu       sync.Mutex
+	reqs     int64
+	bytesIn  int64
+	bytesOut int64
+	avgBytes float64
+}
+
+func (s *MutexMultiFieldStats) Record() {
+	s.mu.Lock()
+	s.reqs++
+	s.bytesIn += statsBytesIn
+	s.bytesOut += statsBytesOut
+	s.avgBytes = float64(s.bytesOut) / float64(s.reqs)
+	s.mu.Unlock()
+}
+
+func benchmarkComplexState() (PatternResult, float64) {
+	as := &AtomicMultiFieldStats{}
+	ms := &MutexMultiFieldStats{}
+
+	atomicTime := measureConcurrent(benchGoroutines, benchIterations, as.Record)
+	mutexTime := measureConcurrent(benchGoroutines, benchIterations, ms.Record)
 
 	fmt.Println("Pattern 3: Complex State (multi-field + derived value)")
 	fmt.Printf("  Atomic:  %v  (but CANNOT compute avgBytes)\n", atomicTime)
 	fmt.Printf("  Mutex:   %v  (avgBytes=%.2f)\n", mutexTime, ms.avgBytes)
-	fmt.Printf("  Winner:  Depends on requirements\n\n")
 
-	// Decision guide
+	return PatternResult{AtomicDuration: atomicTime, OtherDuration: mutexTime, OtherLabel: "Mutex"}, ms.avgBytes
+}
+
+func printDecisionGuide() {
 	fmt.Println("=== Decision Guide ===")
 	fmt.Println()
 	fmt.Println("  Use atomic.Int64 / atomic.Bool when:")
@@ -479,6 +485,22 @@ func main() {
 	fmt.Println("    - Derived values computed during update (running averages, etc)")
 	fmt.Println("    - Critical section includes I/O or complex logic")
 	fmt.Println("    - Simplicity matters more than raw throughput")
+}
+
+func main() {
+	fmt.Println("=== Atomic vs Mutex: Data-Driven Decision Guide ===")
+	fmt.Printf("Configuration: %d goroutines x %d iterations\n\n", benchGoroutines, benchIterations)
+
+	p1 := benchmarkPureCounter()
+	fmt.Printf("  Winner:  Atomic (%.1fx faster)\n\n", p1.SpeedupRatio())
+
+	p2 := benchmarkReadHeavyGauge()
+	fmt.Printf("  Winner:  Atomic (%.1fx faster)\n\n", p2.SpeedupRatio())
+
+	benchmarkComplexState()
+	fmt.Printf("  Winner:  Depends on requirements\n\n")
+
+	printDecisionGuide()
 }
 ```
 

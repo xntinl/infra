@@ -40,6 +40,8 @@ import (
 	"sync"
 )
 
+const featureKeyPrefix = "feature."
+
 type ConfigStore struct {
 	mu       sync.RWMutex
 	settings map[string]string
@@ -65,7 +67,7 @@ func (cs *ConfigStore) Set(key, value string) {
 func (cs *ConfigStore) IsFeatureEnabled(feature string) bool {
 	cs.mu.RLock()
 	defer cs.mu.RUnlock()
-	return cs.settings["feature."+feature] == "true"
+	return cs.settings[featureKeyPrefix+feature] == "true"
 }
 
 func (cs *ConfigStore) Reload(newConfig map[string]string) {
@@ -88,24 +90,31 @@ func (cs *ConfigStore) Snapshot() map[string]string {
 	return result
 }
 
-func main() {
-	cs := NewConfigStore()
-	cs.Set("db.host", "postgres.internal:5432")
-	cs.Set("db.pool_size", "25")
-	cs.Set("feature.dark_mode", "true")
-	cs.Set("feature.beta_api", "false")
-	cs.Set("http.timeout", "30s")
+func loadInitialConfig(store *ConfigStore) {
+	store.Set("db.host", "postgres.internal:5432")
+	store.Set("db.pool_size", "25")
+	store.Set("feature.dark_mode", "true")
+	store.Set("feature.beta_api", "false")
+	store.Set("http.timeout", "30s")
+}
 
-	host, _ := cs.Get("db.host")
+func printConfigSummary(store *ConfigStore) {
+	host, _ := store.Get("db.host")
 	fmt.Printf("db.host = %s\n", host)
-	fmt.Printf("dark_mode enabled: %v\n", cs.IsFeatureEnabled("dark_mode"))
-	fmt.Printf("beta_api enabled: %v\n", cs.IsFeatureEnabled("beta_api"))
+	fmt.Printf("dark_mode enabled: %v\n", store.IsFeatureEnabled("dark_mode"))
+	fmt.Printf("beta_api enabled: %v\n", store.IsFeatureEnabled("beta_api"))
 
-	snap := cs.Snapshot()
+	snap := store.Snapshot()
 	fmt.Printf("\nAll settings (%d entries):\n", len(snap))
-	for k, v := range snap {
-		fmt.Printf("  %s = %s\n", k, v)
+	for key, value := range snap {
+		fmt.Printf("  %s = %s\n", key, value)
 	}
+}
+
+func main() {
+	store := NewConfigStore()
+	loadInitialConfig(store)
+	printConfigSummary(store)
 }
 ```
 
@@ -142,6 +151,11 @@ import (
 	"time"
 )
 
+const (
+	concurrentReaders   = 10
+	simulatedWorkDelay  = 100 * time.Millisecond
+)
+
 type ConfigStore struct {
 	mu       sync.RWMutex
 	settings map[string]string
@@ -158,7 +172,7 @@ func (cs *ConfigStore) GetAndProcess(key string) string {
 	cs.mu.RLock()
 	defer cs.mu.RUnlock()
 	val := cs.settings[key]
-	time.Sleep(100 * time.Millisecond) // simulate work while holding the lock
+	time.Sleep(simulatedWorkDelay)
 	return val
 }
 
@@ -168,25 +182,30 @@ func (cs *ConfigStore) Set(key, value string) {
 	cs.settings[key] = value
 }
 
-func main() {
-	cs := NewConfigStore()
-	cs.Set("feature.dark_mode", "true")
-
+func demonstrateConcurrentReaders(store *ConfigStore) time.Duration {
 	var wg sync.WaitGroup
 	start := time.Now()
 
-	for i := 0; i < 10; i++ {
+	for i := 0; i < concurrentReaders; i++ {
 		wg.Add(1)
 		go func(handlerID int) {
 			defer wg.Done()
-			val := cs.GetAndProcess("feature.dark_mode")
+			val := store.GetAndProcess("feature.dark_mode")
 			fmt.Printf("Handler %d: dark_mode=%s (at %v)\n", handlerID, val, time.Since(start).Round(time.Millisecond))
 		}(i)
 	}
 
 	wg.Wait()
-	elapsed := time.Since(start)
-	fmt.Printf("\nAll 10 handlers finished in %v\n", elapsed.Round(time.Millisecond))
+	return time.Since(start)
+}
+
+func main() {
+	store := NewConfigStore()
+	store.Set("feature.dark_mode", "true")
+
+	elapsed := demonstrateConcurrentReaders(store)
+
+	fmt.Printf("\nAll %d handlers finished in %v\n", concurrentReaders, elapsed.Round(time.Millisecond))
 	fmt.Println("(With a regular Mutex, this would take ~1s because only one goroutine holds the lock at a time.)")
 	fmt.Println("(With RWMutex, ~100ms because all readers hold RLock simultaneously.)")
 }
@@ -221,17 +240,23 @@ import (
 	"time"
 )
 
+const (
+	readerCount         = 3
+	writerAcquireDelay  = 10 * time.Millisecond
+	reloadSimDelay      = 200 * time.Millisecond
+)
+
 type ConfigStore struct {
 	mu       sync.RWMutex
 	settings map[string]string
 }
 
 func NewConfigStore(initial map[string]string) *ConfigStore {
-	s := make(map[string]string, len(initial))
+	settings := make(map[string]string, len(initial))
 	for k, v := range initial {
-		s[k] = v
+		settings[k] = v
 	}
-	return &ConfigStore{settings: s}
+	return &ConfigStore{settings: settings}
 }
 
 func (cs *ConfigStore) Get(key string) (string, bool) {
@@ -246,7 +271,7 @@ func (cs *ConfigStore) Reload(newConfig map[string]string) {
 	defer cs.mu.Unlock()
 	fmt.Printf("[%v] Config reload: acquired write lock, updating %d settings...\n",
 		time.Now().Format("15:04:05.000"), len(newConfig))
-	time.Sleep(200 * time.Millisecond) // simulate reading config from file/remote
+	time.Sleep(reloadSimDelay)
 	cs.settings = make(map[string]string, len(newConfig))
 	for k, v := range newConfig {
 		cs.settings[k] = v
@@ -254,35 +279,42 @@ func (cs *ConfigStore) Reload(newConfig map[string]string) {
 	fmt.Printf("[%v] Config reload: complete\n", time.Now().Format("15:04:05.000"))
 }
 
+func startConfigReload(store *ConfigStore, wg *sync.WaitGroup, newConfig map[string]string) {
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		store.Reload(newConfig)
+	}()
+}
+
+func startBlockedReaders(store *ConfigStore, wg *sync.WaitGroup, start time.Time) {
+	for i := 0; i < readerCount; i++ {
+		wg.Add(1)
+		go func(handlerID int) {
+			defer wg.Done()
+			fmt.Printf("[%v] Handler %d: waiting for read lock...\n", time.Since(start).Round(time.Millisecond), handlerID)
+			val, _ := store.Get("db.host")
+			fmt.Printf("[%v] Handler %d: db.host=%s\n", time.Since(start).Round(time.Millisecond), handlerID, val)
+		}(i)
+	}
+}
+
 func main() {
-	cs := NewConfigStore(map[string]string{
+	store := NewConfigStore(map[string]string{
 		"db.host": "old-host:5432",
 	})
 	var wg sync.WaitGroup
 	start := time.Now()
 
-	// Start the config reload (writer) that holds the lock for 200ms
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		cs.Reload(map[string]string{
-			"db.host": "new-host:5432",
-			"db.pool":  "50",
-		})
-	}()
-
-	time.Sleep(10 * time.Millisecond) // let writer acquire lock first
-
-	// Start readers that will block until the reload finishes
-	for i := 0; i < 3; i++ {
-		wg.Add(1)
-		go func(id int) {
-			defer wg.Done()
-			fmt.Printf("[%v] Handler %d: waiting for read lock...\n", time.Since(start).Round(time.Millisecond), id)
-			val, _ := cs.Get("db.host")
-			fmt.Printf("[%v] Handler %d: db.host=%s\n", time.Since(start).Round(time.Millisecond), id, val)
-		}(i)
+	newConfig := map[string]string{
+		"db.host": "new-host:5432",
+		"db.pool": "50",
 	}
+	startConfigReload(store, &wg, newConfig)
+
+	time.Sleep(writerAcquireDelay) // let writer acquire lock first
+
+	startBlockedReaders(store, &wg, start)
 
 	wg.Wait()
 	fmt.Println("\nReaders saw the NEW config because they waited for the reload to finish.")
@@ -322,86 +354,62 @@ import (
 	"time"
 )
 
-func benchMutex(readers, writers int, opsPerGoroutine int) time.Duration {
+const (
+	benchReaders       = 100
+	benchWriters       = 2
+	opsPerGoroutine    = 10000
+	writeRatio         = 10 // writers do ops/writeRatio operations
+)
+
+func runReadWriteWorkload(readFn, writeFn func(), readers, writers, readOps, writeOps int) time.Duration {
+	var wg sync.WaitGroup
+	start := time.Now()
+
+	for i := 0; i < readers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < readOps; j++ {
+				readFn()
+			}
+		}()
+	}
+
+	for i := 0; i < writers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < writeOps; j++ {
+				writeFn()
+			}
+		}()
+	}
+
+	wg.Wait()
+	return time.Since(start)
+}
+
+func benchMutex(readers, writers, ops int) time.Duration {
 	var mu sync.Mutex
 	config := map[string]string{"feature.dark_mode": "true"}
-	var wg sync.WaitGroup
 
-	start := time.Now()
+	readFn := func() { mu.Lock(); _ = config["feature.dark_mode"]; mu.Unlock() }
+	writeFn := func() { mu.Lock(); config["feature.dark_mode"] = "true"; mu.Unlock() }
 
-	for i := 0; i < readers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for j := 0; j < opsPerGoroutine; j++ {
-				mu.Lock()
-				_ = config["feature.dark_mode"]
-				mu.Unlock()
-			}
-		}()
-	}
-
-	for i := 0; i < writers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for j := 0; j < opsPerGoroutine/10; j++ {
-				mu.Lock()
-				config["feature.dark_mode"] = "true"
-				mu.Unlock()
-			}
-		}()
-	}
-
-	wg.Wait()
-	return time.Since(start)
+	return runReadWriteWorkload(readFn, writeFn, readers, writers, ops, ops/writeRatio)
 }
 
-func benchRWMutex(readers, writers int, opsPerGoroutine int) time.Duration {
+func benchRWMutex(readers, writers, ops int) time.Duration {
 	var mu sync.RWMutex
 	config := map[string]string{"feature.dark_mode": "true"}
-	var wg sync.WaitGroup
 
-	start := time.Now()
+	readFn := func() { mu.RLock(); _ = config["feature.dark_mode"]; mu.RUnlock() }
+	writeFn := func() { mu.Lock(); config["feature.dark_mode"] = "true"; mu.Unlock() }
 
-	for i := 0; i < readers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for j := 0; j < opsPerGoroutine; j++ {
-				mu.RLock()
-				_ = config["feature.dark_mode"]
-				mu.RUnlock()
-			}
-		}()
-	}
-
-	for i := 0; i < writers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for j := 0; j < opsPerGoroutine/10; j++ {
-				mu.Lock()
-				config["feature.dark_mode"] = "true"
-				mu.Unlock()
-			}
-		}()
-	}
-
-	wg.Wait()
-	return time.Since(start)
+	return runReadWriteWorkload(readFn, writeFn, readers, writers, ops, ops/writeRatio)
 }
 
-func main() {
-	const readers = 100
-	const writers = 2
-	const ops = 10000
-
-	fmt.Printf("Benchmark: %d readers, %d writers, %d ops/reader\n\n", readers, writers, ops)
-
-	mutexTime := benchMutex(readers, writers, ops)
-	rwTime := benchRWMutex(readers, writers, ops)
-
+func printBenchResults(mutexTime, rwTime time.Duration) {
 	fmt.Printf("Mutex:   %v\n", mutexTime.Round(time.Millisecond))
 	fmt.Printf("RWMutex: %v\n", rwTime.Round(time.Millisecond))
 
@@ -413,6 +421,15 @@ func main() {
 	}
 
 	fmt.Println("\nRule of thumb: use RWMutex when reads outnumber writes by 10:1 or more.")
+}
+
+func main() {
+	fmt.Printf("Benchmark: %d readers, %d writers, %d ops/reader\n\n", benchReaders, benchWriters, opsPerGoroutine)
+
+	mutexTime := benchMutex(benchReaders, benchWriters, opsPerGoroutine)
+	rwTime := benchRWMutex(benchReaders, benchWriters, opsPerGoroutine)
+
+	printBenchResults(mutexTime, rwTime)
 }
 ```
 

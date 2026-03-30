@@ -37,6 +37,13 @@ import (
 	"time"
 )
 
+const (
+	minProcessingMs = 50
+	maxExtraMs      = 150
+	minFileSize     = 100
+	maxExtraSize    = 10000
+)
+
 type FileResult struct {
 	Name    string
 	Status  string
@@ -46,16 +53,51 @@ type FileResult struct {
 
 func processFile(name string) FileResult {
 	start := time.Now()
-	// Simulate variable processing time (50-200ms)
-	processingTime := time.Duration(50+rand.Intn(150)) * time.Millisecond
+	processingTime := time.Duration(minProcessingMs+rand.Intn(maxExtraMs)) * time.Millisecond
 	time.Sleep(processingTime)
 
 	return FileResult{
 		Name:    name,
 		Status:  "ok",
-		Size:    rand.Intn(10000) + 100,
+		Size:    rand.Intn(maxExtraSize) + minFileSize,
 		Elapsed: time.Since(start),
 	}
+}
+
+func processFilesInParallel(files []string) ([]FileResult, time.Duration) {
+	results := make([]FileResult, len(files))
+	var wg sync.WaitGroup
+	start := time.Now()
+
+	for i, file := range files {
+		wg.Add(1) // CORRECT: Add before the go statement
+		go func(idx int, name string) {
+			defer wg.Done()
+			results[idx] = processFile(name) // each goroutine writes to its own index -- safe
+		}(i, file)
+	}
+
+	wg.Wait()
+	return results, time.Since(start)
+}
+
+func estimateSequentialTime(results []FileResult) time.Duration {
+	total := time.Duration(0)
+	for _, r := range results {
+		total += r.Elapsed
+	}
+	return total
+}
+
+func printProcessingSummary(results []FileResult, parallelTime time.Duration) {
+	fmt.Println("=== File Processing Summary ===")
+	for _, r := range results {
+		fmt.Printf("  %-35s %s  %5d bytes  (%v)\n", r.Name, r.Status, r.Size, r.Elapsed.Round(time.Millisecond))
+	}
+	fmt.Printf("\nProcessed %d files in %v (parallel)\n", len(results), parallelTime.Round(time.Millisecond))
+
+	sequentialTime := estimateSequentialTime(results)
+	fmt.Printf("Sequential would have taken ~%v\n", sequentialTime.Round(time.Millisecond))
 }
 
 func main() {
@@ -67,34 +109,8 @@ func main() {
 		"audit-log-2024.json",
 	}
 
-	results := make([]FileResult, len(files))
-	var wg sync.WaitGroup
-
-	start := time.Now()
-
-	for i, file := range files {
-		wg.Add(1) // CORRECT: Add before the go statement
-		go func(idx int, name string) {
-			defer wg.Done()
-			results[idx] = processFile(name) // each goroutine writes to its own index -- safe
-		}(i, file)
-	}
-
-	wg.Wait() // blocks until all files are processed
-	totalElapsed := time.Since(start)
-
-	fmt.Println("=== File Processing Summary ===")
-	for _, r := range results {
-		fmt.Printf("  %-35s %s  %5d bytes  (%v)\n", r.Name, r.Status, r.Size, r.Elapsed.Round(time.Millisecond))
-	}
-	fmt.Printf("\nProcessed %d files in %v (parallel)\n", len(files), totalElapsed.Round(time.Millisecond))
-
-	// Compare with sequential time
-	sequentialTime := time.Duration(0)
-	for _, r := range results {
-		sequentialTime += r.Elapsed
-	}
-	fmt.Printf("Sequential would have taken ~%v\n", sequentialTime.Round(time.Millisecond))
+	results, parallelTime := processFilesInParallel(files)
+	printProcessingSummary(results, parallelTime)
 }
 ```
 
@@ -132,8 +148,28 @@ import (
 	"time"
 )
 
-func main() {
+const taskSimulationDelay = 50 * time.Millisecond
+
+func runValidationTask(name string) {
+	time.Sleep(taskSimulationDelay)
+	fmt.Printf("  [done] %s\n", name)
+}
+
+func runAllValidations(tasks []string) {
 	var wg sync.WaitGroup
+
+	for _, task := range tasks {
+		wg.Add(1) // CORRECT: Add before the go statement
+		go func(name string) {
+			defer wg.Done()
+			runValidationTask(name)
+		}(task)
+	}
+
+	wg.Wait()
+}
+
+func main() {
 	tasks := []string{
 		"validate-schema",
 		"check-duplicates",
@@ -141,16 +177,7 @@ func main() {
 		"scan-malware",
 	}
 
-	for _, task := range tasks {
-		wg.Add(1) // CORRECT: Add before the go statement
-		go func(name string) {
-			defer wg.Done()
-			time.Sleep(50 * time.Millisecond) // simulate work
-			fmt.Printf("  [done] %s\n", name)
-		}(task)
-	}
-
-	wg.Wait()
+	runAllValidations(tasks)
 	fmt.Println("All validation tasks completed. Safe to proceed with import.")
 }
 ```
@@ -182,27 +209,43 @@ import (
 	"sync"
 )
 
-func main() {
-	// Simulate processing 10 file chunks in parallel
-	const numChunks = 10
-	var wg sync.WaitGroup
-	chunkResults := make([]int, numChunks)
+const (
+	numChunks       = 10
+	recordsPerChunk = 100
+)
 
-	wg.Add(numChunks) // add all at once -- we know the count
-	for i := 0; i < numChunks; i++ {
+func countRecordsInChunk(chunkID int) int {
+	return (chunkID + 1) * recordsPerChunk
+}
+
+func processChunksInParallel(chunkCount int) []int {
+	results := make([]int, chunkCount)
+	var wg sync.WaitGroup
+
+	wg.Add(chunkCount) // add all at once -- we know the count
+	for i := 0; i < chunkCount; i++ {
 		go func(chunkID int) {
 			defer wg.Done()
-			// Simulate: count "valid records" in this chunk
-			chunkResults[chunkID] = (chunkID + 1) * 100
+			results[chunkID] = countRecordsInChunk(chunkID)
 		}(i)
 	}
 
 	wg.Wait()
+	return results
+}
 
-	totalRecords := 0
-	for _, count := range chunkResults {
-		totalRecords += count
+func sumResults(results []int) int {
+	total := 0
+	for _, count := range results {
+		total += count
 	}
+	return total
+}
+
+func main() {
+	chunkResults := processChunksInParallel(numChunks)
+	totalRecords := sumResults(chunkResults)
+
 	fmt.Printf("Chunk results: %v\n", chunkResults)
 	fmt.Printf("Total valid records across all chunks: %d\n", totalRecords)
 }
@@ -234,6 +277,14 @@ import (
 	"time"
 )
 
+const (
+	minProcessingDelayMs = 30
+	maxExtraDelayMs      = 100
+	failureRate          = 0.2
+	minRecords           = 500
+	maxExtraRecords      = 5000
+)
+
 type ProcessResult struct {
 	FileName string
 	Success  bool
@@ -244,10 +295,9 @@ type ProcessResult struct {
 
 func processFileWithErrors(name string) ProcessResult {
 	start := time.Now()
-	time.Sleep(time.Duration(30+rand.Intn(100)) * time.Millisecond)
+	time.Sleep(time.Duration(minProcessingDelayMs+rand.Intn(maxExtraDelayMs)) * time.Millisecond)
 
-	// Simulate 20% failure rate
-	if rand.Float64() < 0.2 {
+	if rand.Float64() < failureRate {
 		return ProcessResult{
 			FileName: name,
 			Success:  false,
@@ -259,22 +309,14 @@ func processFileWithErrors(name string) ProcessResult {
 	return ProcessResult{
 		FileName: name,
 		Success:  true,
-		Records:  rand.Intn(5000) + 500,
+		Records:  rand.Intn(maxExtraRecords) + minRecords,
 		Duration: time.Since(start),
 	}
 }
 
-func main() {
-	files := []string{
-		"batch-001.csv", "batch-002.csv", "batch-003.csv",
-		"batch-004.csv", "batch-005.csv", "batch-006.csv",
-		"batch-007.csv", "batch-008.csv", "batch-009.csv",
-		"batch-010.csv",
-	}
-
+func processAllFiles(files []string) ([]ProcessResult, time.Duration) {
 	results := make([]ProcessResult, len(files))
 	var wg sync.WaitGroup
-
 	start := time.Now()
 
 	wg.Add(len(files))
@@ -286,9 +328,10 @@ func main() {
 	}
 
 	wg.Wait()
-	totalElapsed := time.Since(start)
+	return results, time.Since(start)
+}
 
-	// Summary
+func printBatchReport(results []ProcessResult, totalElapsed time.Duration) {
 	succeeded := 0
 	failed := 0
 	totalRecords := 0
@@ -307,6 +350,18 @@ func main() {
 
 	fmt.Printf("\nCompleted in %v: %d succeeded, %d failed, %d total records\n",
 		totalElapsed.Round(time.Millisecond), succeeded, failed, totalRecords)
+}
+
+func main() {
+	files := []string{
+		"batch-001.csv", "batch-002.csv", "batch-003.csv",
+		"batch-004.csv", "batch-005.csv", "batch-006.csv",
+		"batch-007.csv", "batch-008.csv", "batch-009.csv",
+		"batch-010.csv",
+	}
+
+	results, elapsed := processAllFiles(files)
+	printBatchReport(results, elapsed)
 }
 ```
 

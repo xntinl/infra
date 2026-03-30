@@ -38,33 +38,56 @@ import (
 	"time"
 )
 
-func main() {
-	var before, after runtime.MemStats
+const idleHandlerCount = 10_000
 
+type StackUsage struct {
+	TotalBytes   uint64
+	PerGoroutine uint64
+}
+
+func captureMemBaseline() runtime.MemStats {
 	runtime.GC()
-	runtime.ReadMemStats(&before)
+	var stats runtime.MemStats
+	runtime.ReadMemStats(&stats)
+	return stats
+}
 
-	const count = 10_000
-	done := make(chan struct{})
-
+func launchIdleHandlers(count int, done <-chan struct{}) {
 	for i := 0; i < count; i++ {
 		go func() {
-			<-done // idle handler waiting for work
+			<-done
 		}()
 	}
-	time.Sleep(50 * time.Millisecond)
+}
 
+func measureStackUsage(before runtime.MemStats, count int) StackUsage {
+	var after runtime.MemStats
 	runtime.ReadMemStats(&after)
+	growth := after.StackInuse - before.StackInuse
+	return StackUsage{
+		TotalBytes:   growth,
+		PerGoroutine: growth / uint64(count),
+	}
+}
 
-	stackGrowth := after.StackInuse - before.StackInuse
-	perGoroutine := stackGrowth / count
-
+func printIdleHandlerReport(count int, usage StackUsage) {
 	fmt.Printf("Idle handlers:       %d\n", count)
-	fmt.Printf("Stack in use:        %d bytes (%.2f MB)\n", stackGrowth, float64(stackGrowth)/(1024*1024))
-	fmt.Printf("Stack per handler:   %d bytes (%.1f KB)\n", perGoroutine, float64(perGoroutine)/1024)
+	fmt.Printf("Stack in use:        %d bytes (%.2f MB)\n", usage.TotalBytes, float64(usage.TotalBytes)/(1024*1024))
+	fmt.Printf("Stack per handler:   %d bytes (%.1f KB)\n", usage.PerGoroutine, float64(usage.PerGoroutine)/1024)
 	fmt.Println()
 	fmt.Println("This is the minimum cost: handlers doing nothing but waiting.")
 	fmt.Println("As they process data, stacks will grow to fit the workload.")
+}
+
+func main() {
+	before := captureMemBaseline()
+
+	done := make(chan struct{})
+	launchIdleHandlers(idleHandlerCount, done)
+	time.Sleep(50 * time.Millisecond)
+
+	usage := measureStackUsage(before, idleHandlerCount)
+	printIdleHandlerReport(idleHandlerCount, usage)
 
 	close(done)
 	time.Sleep(100 * time.Millisecond)
@@ -108,44 +131,56 @@ func processNestedStructure(depth int) int {
 	if depth <= 0 {
 		return 0
 	}
-	// Simulate per-level state: field names, values, metadata
 	var localBuffer [64]byte
 	localBuffer[0] = byte(depth % 256)
 	_ = localBuffer
-
 	return processNestedStructure(depth-1) + 1
 }
 
-func main() {
-	depths := []int{10, 100, 1_000, 10_000, 50_000}
+type StackGrowthResult struct {
+	Depth     int
+	BytesDiff int64
+}
 
+func measureStackGrowthAtDepth(depth int) StackGrowthResult {
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+
+	done := make(chan struct{})
+	go func() {
+		processNestedStructure(depth)
+		close(done)
+	}()
+	<-done
+
+	runtime.ReadMemStats(&after)
+
+	return StackGrowthResult{
+		Depth:     depth,
+		BytesDiff: int64(after.StackInuse) - int64(before.StackInuse),
+	}
+}
+
+func printStackGrowthTable(depths []int) {
 	fmt.Println("=== Stack Growth When Processing Nested Structures ===")
 	fmt.Println("Each recursion level simulates walking one level of a nested document.")
 	fmt.Println()
 
 	for _, depth := range depths {
-		var before, after runtime.MemStats
-
-		runtime.GC()
-		runtime.ReadMemStats(&before)
-
-		done := make(chan struct{})
-		go func() {
-			processNestedStructure(depth)
-			close(done)
-		}()
-		<-done
-
-		runtime.ReadMemStats(&after)
-
-		stackDiff := int64(after.StackInuse) - int64(before.StackInuse)
+		result := measureStackGrowthAtDepth(depth)
 		fmt.Printf("Nesting depth %-8d -> stack grew: %+d bytes (%+.1f KB)\n",
-			depth, stackDiff, float64(stackDiff)/1024)
+			result.Depth, result.BytesDiff, float64(result.BytesDiff)/1024)
 	}
 
 	fmt.Println()
 	fmt.Println("The runtime doubled the stack multiple times for deep nesting.")
 	fmt.Println("Your code never saw this -- it happened transparently.")
+}
+
+func main() {
+	depths := []int{10, 100, 1_000, 10_000, 50_000}
+	printStackGrowthTable(depths)
 }
 ```
 
@@ -184,6 +219,19 @@ import (
 	"time"
 )
 
+const handlersPerScenario = 1000
+
+type WorkloadScenario struct {
+	Name  string
+	Depth int
+}
+
+type ScenarioResult struct {
+	Name         string
+	PerHandler   uint64
+	TotalStackMB float64
+}
+
 func processNestedStructure(depth int) int {
 	if depth <= 0 {
 		return 0
@@ -194,61 +242,66 @@ func processNestedStructure(depth int) int {
 	return processNestedStructure(depth-1) + 1
 }
 
-func main() {
-	const count = 1000
+func measureHandlerStackUsage(scenario WorkloadScenario, handlerCount int) ScenarioResult {
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
 
-	scenarios := []struct {
-		name  string
-		depth int
-	}{
-		{"cache-hit (idle)", 0},
-		{"simple-query (10 levels)", 10},
-		{"nested-api (100 levels)", 100},
-		{"deep-graphql (1000 levels)", 1000},
+	done := make(chan struct{})
+	ready := make(chan struct{}, handlerCount)
+
+	for i := 0; i < handlerCount; i++ {
+		go func(depth int) {
+			if depth > 0 {
+				processNestedStructure(depth)
+			}
+			ready <- struct{}{}
+			<-done
+		}(scenario.Depth)
 	}
 
+	for i := 0; i < handlerCount; i++ {
+		<-ready
+	}
+
+	runtime.ReadMemStats(&after)
+	stackDiff := after.StackInuse - before.StackInuse
+
+	close(done)
+	time.Sleep(50 * time.Millisecond)
+
+	return ScenarioResult{
+		Name:         scenario.Name,
+		PerHandler:   stackDiff / uint64(handlerCount),
+		TotalStackMB: float64(stackDiff) / (1024 * 1024),
+	}
+}
+
+func printWorkloadComparison(scenarios []WorkloadScenario) {
 	fmt.Println("=== Stack Usage by Handler Workload ===")
-	fmt.Println("1000 goroutines per scenario, each simulating a different endpoint.")
+	fmt.Printf("%d goroutines per scenario, each simulating a different endpoint.\n", handlersPerScenario)
 	fmt.Println()
 
 	for _, s := range scenarios {
-		var before, after runtime.MemStats
-		runtime.GC()
-		runtime.ReadMemStats(&before)
-
-		done := make(chan struct{})
-		ready := make(chan struct{})
-
-		for i := 0; i < count; i++ {
-			go func(depth int) {
-				if depth > 0 {
-					processNestedStructure(depth)
-				}
-				ready <- struct{}{}
-				<-done
-			}(s.depth)
-		}
-
-		for i := 0; i < count; i++ {
-			<-ready
-		}
-
-		runtime.ReadMemStats(&after)
-		stackDiff := after.StackInuse - before.StackInuse
-		perGoroutine := stackDiff / count
-
+		result := measureHandlerStackUsage(s, handlersPerScenario)
 		fmt.Printf("%-32s -> %6d bytes/handler (%5.1f KB) | total: %.2f MB\n",
-			s.name, perGoroutine, float64(perGoroutine)/1024,
-			float64(stackDiff)/(1024*1024))
-
-		close(done)
-		time.Sleep(50 * time.Millisecond)
+			result.Name, result.PerHandler, float64(result.PerHandler)/1024, result.TotalStackMB)
 	}
 
 	fmt.Println()
 	fmt.Println("Dynamic stacks mean you pay for what you use.")
 	fmt.Println("Cache-hit handlers use ~8 KB; deep-GraphQL handlers use ~128 KB.")
 	fmt.Println("With fixed 1 MB OS thread stacks, ALL handlers would use 1 MB.")
+}
+
+func main() {
+	scenarios := []WorkloadScenario{
+		{"cache-hit (idle)", 0},
+		{"simple-query (10 levels)", 10},
+		{"nested-api (100 levels)", 100},
+		{"deep-graphql (1000 levels)", 1000},
+	}
+	printWorkloadComparison(scenarios)
 }
 ```
 
@@ -283,6 +336,11 @@ import (
 	"runtime"
 )
 
+const (
+	targetNestingDepth  = 100_000
+	estimatedFrameBytes = 128
+)
+
 func processNestedStructure(depth int) int {
 	if depth <= 0 {
 		return 0
@@ -293,37 +351,41 @@ func processNestedStructure(depth int) int {
 	return processNestedStructure(depth-1) + 1
 }
 
-func main() {
-	const depth = 100_000
-
+func runDeepRecursionInGoroutine(depth int) (levelsProcessed int, stackGrowthBytes int64) {
 	var before, after runtime.MemStats
 	runtime.GC()
 	runtime.ReadMemStats(&before)
 
-	result := make(chan int)
+	resultCh := make(chan int)
 	go func() {
-		result <- processNestedStructure(depth)
+		resultCh <- processNestedStructure(depth)
 	}()
-
-	got := <-result
+	levelsProcessed = <-resultCh
 
 	runtime.ReadMemStats(&after)
-	stackDiff := int64(after.StackInuse) - int64(before.StackInuse)
+	stackGrowthBytes = int64(after.StackInuse) - int64(before.StackInuse)
+	return levelsProcessed, stackGrowthBytes
+}
 
+func printDeepRecursionReport(depth int, levelsProcessed int, stackGrowthBytes int64) {
 	fmt.Printf("Nesting depth:       %d\n", depth)
-	fmt.Printf("Levels processed:    %d\n", got)
-	fmt.Printf("Stack grew by:       %.2f MB\n", float64(stackDiff)/(1024*1024))
+	fmt.Printf("Levels processed:    %d\n", levelsProcessed)
+	fmt.Printf("Stack grew by:       %.2f MB\n", float64(stackGrowthBytes)/(1024*1024))
 	fmt.Printf("Status:              No stack overflow!\n")
 	fmt.Println()
 
-	estimatedPerFrame := 128
-	equivalentFixed := float64(depth*estimatedPerFrame) / (1024 * 1024)
+	equivalentFixed := float64(depth*estimatedFrameBytes) / (1024 * 1024)
 	fmt.Printf("Equivalent fixed stack: would need ~%.0f MB\n", equivalentFixed)
 	fmt.Printf("OS thread default:      1 MB (Linux) or 8 MB (macOS)\n")
 	fmt.Println()
 	fmt.Println("A Linux OS thread would crash at ~7,800 levels of nesting.")
 	fmt.Println("A macOS OS thread would crash at ~62,500 levels.")
 	fmt.Println("Go handled 100,000 levels by growing the stack transparently.")
+}
+
+func main() {
+	levels, stackGrowth := runDeepRecursionInGoroutine(targetNestingDepth)
+	printDeepRecursionReport(targetNestingDepth, levels, stackGrowth)
 }
 ```
 
@@ -363,6 +425,12 @@ import (
 	"strings"
 )
 
+const (
+	stackTraceBufSize = 4096
+	maxPreviewLines   = 10
+	totalRecursionMax = 100
+)
+
 func processLevel(depth, maxDepth int, captureAt int) {
 	if depth >= maxDepth {
 		return
@@ -373,25 +441,41 @@ func processLevel(depth, maxDepth int, captureAt int) {
 	_ = localData
 
 	if depth == captureAt {
-		buf := make([]byte, 4096)
-		n := runtime.Stack(buf, false)
-		stack := string(buf[:n])
-		lines := strings.Split(stack, "\n")
-
-		fmt.Printf("=== Stack snapshot at depth %d ===\n", depth)
-		fmt.Printf("Total stack trace lines: %d\n", len(lines))
-		fmt.Println("First 10 lines:")
-		for i, line := range lines {
-			if i >= 10 {
-				fmt.Printf("  ... (%d more lines)\n", len(lines)-10)
-				break
-			}
-			fmt.Printf("  %s\n", line)
-		}
-		fmt.Println()
+		printStackSnapshot(depth)
 	}
 
 	processLevel(depth+1, maxDepth, captureAt)
+}
+
+func captureCurrentStack() []string {
+	buf := make([]byte, stackTraceBufSize)
+	n := runtime.Stack(buf, false)
+	return strings.Split(string(buf[:n]), "\n")
+}
+
+func printStackSnapshot(depth int) {
+	lines := captureCurrentStack()
+
+	fmt.Printf("=== Stack snapshot at depth %d ===\n", depth)
+	fmt.Printf("Total stack trace lines: %d\n", len(lines))
+	fmt.Println("First 10 lines:")
+	for i, line := range lines {
+		if i >= maxPreviewLines {
+			fmt.Printf("  ... (%d more lines)\n", len(lines)-maxPreviewLines)
+			break
+		}
+		fmt.Printf("  %s\n", line)
+	}
+	fmt.Println()
+}
+
+func runRecursionWithCapture(maxDepth, captureAt int) {
+	done := make(chan struct{})
+	go func() {
+		processLevel(0, maxDepth, captureAt)
+		close(done)
+	}()
+	<-done
 }
 
 func main() {
@@ -400,14 +484,8 @@ func main() {
 	fmt.Println("and understanding where goroutines are blocked.")
 	fmt.Println()
 
-	// Capture stack at depth 5 (shallow) and depth 50 (medium)
 	for _, captureAt := range []int{5, 50} {
-		done := make(chan struct{})
-		go func() {
-			processLevel(0, 100, captureAt)
-			close(done)
-		}()
-		<-done
+		runRecursionWithCapture(totalRecursionMax, captureAt)
 	}
 
 	fmt.Println("Stack traces grow proportionally to call depth.")

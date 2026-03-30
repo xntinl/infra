@@ -190,17 +190,33 @@ import (
 	"time"
 )
 
-func benchMutex() (int, time.Duration) {
+const (
+	comparisonWorkers    = 100
+	comparisonIncrements = 10000
+	channelBufferSize    = 256
+)
+
+// ComparisonResult holds the outcome of a single synchronization benchmark.
+type ComparisonResult struct {
+	Label   string
+	Value   int64
+	Elapsed time.Duration
+}
+
+// MutexBench benchmarks mutex-based counter increments.
+type MutexBench struct{}
+
+func (MutexBench) Run(workers, increments int) ComparisonResult {
 	counter := 0
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 
 	start := time.Now()
-	for i := 0; i < 100; i++ {
+	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for j := 0; j < 10000; j++ {
+			for j := 0; j < increments; j++ {
 				mu.Lock()
 				counter++
 				mu.Unlock()
@@ -208,11 +224,14 @@ func benchMutex() (int, time.Duration) {
 		}()
 	}
 	wg.Wait()
-	return counter, time.Since(start)
+	return ComparisonResult{"Mutex", int64(counter), time.Since(start)}
 }
 
-func benchChannel() (int, time.Duration) {
-	inc := make(chan struct{}, 256)
+// ChannelBench benchmarks channel-based counter increments.
+type ChannelBench struct{}
+
+func (ChannelBench) Run(workers, increments int) ComparisonResult {
+	inc := make(chan struct{}, channelBufferSize)
 	done := make(chan int)
 
 	go func() {
@@ -225,11 +244,11 @@ func benchChannel() (int, time.Duration) {
 
 	var wg sync.WaitGroup
 	start := time.Now()
-	for i := 0; i < 100; i++ {
+	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for j := 0; j < 10000; j++ {
+			for j := 0; j < increments; j++ {
 				inc <- struct{}{}
 			}
 		}()
@@ -237,44 +256,52 @@ func benchChannel() (int, time.Duration) {
 	wg.Wait()
 	close(inc)
 	result := <-done
-	return result, time.Since(start)
+	return ComparisonResult{"Channel", int64(result), time.Since(start)}
 }
 
-func benchAtomic() (int64, time.Duration) {
+// AtomicBench benchmarks atomic counter increments.
+type AtomicBench struct{}
+
+func (AtomicBench) Run(workers, increments int) ComparisonResult {
 	var counter atomic.Int64
 	var wg sync.WaitGroup
 
 	start := time.Now()
-	for i := 0; i < 100; i++ {
+	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for j := 0; j < 10000; j++ {
+			for j := 0; j < increments; j++ {
 				counter.Add(1)
 			}
 		}()
 	}
 	wg.Wait()
-	return counter.Load(), time.Since(start)
+	return ComparisonResult{"Atomic", counter.Load(), time.Since(start)}
+}
+
+func printResults(results []ComparisonResult) {
+	for _, r := range results {
+		fmt.Printf("  %-10s %d in %v\n", r.Label+":", r.Value, r.Elapsed)
+	}
+	fmt.Println()
+	fmt.Println("Decision Guide:")
+	fmt.Println("  atomic  -> single counter, flag, or gauge")
+	fmt.Println("  mutex   -> map, struct, multi-field update")
+	fmt.Println("  channel -> ownership transfer, pipeline, command pattern")
 }
 
 func main() {
 	fmt.Println("=== Grand Comparison: 100 goroutines x 10000 increments ===")
 	fmt.Println()
 
-	mutexVal, mutexTime := benchMutex()
-	chanVal, chanTime := benchChannel()
-	atomicVal, atomicTime := benchAtomic()
+	results := []ComparisonResult{
+		MutexBench{}.Run(comparisonWorkers, comparisonIncrements),
+		ChannelBench{}.Run(comparisonWorkers, comparisonIncrements),
+		AtomicBench{}.Run(comparisonWorkers, comparisonIncrements),
+	}
 
-	fmt.Printf("  Mutex:   %d in %v\n", mutexVal, mutexTime)
-	fmt.Printf("  Channel: %d in %v\n", chanVal, chanTime)
-	fmt.Printf("  Atomic:  %d in %v\n", atomicVal, atomicTime)
-	fmt.Println()
-
-	fmt.Println("Decision Guide:")
-	fmt.Println("  atomic  -> single counter, flag, or gauge")
-	fmt.Println("  mutex   -> map, struct, multi-field update")
-	fmt.Println("  channel -> ownership transfer, pipeline, command pattern")
+	printResults(results)
 }
 ```
 

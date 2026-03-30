@@ -38,6 +38,8 @@ import (
 	"sync"
 )
 
+const simulatedRequests = 1000
+
 type MetricsStore struct {
 	mu       sync.Mutex
 	counters map[string]int64
@@ -63,31 +65,37 @@ func (m *MetricsStore) Snapshot() map[string]int64 {
 	return result
 }
 
-func main() {
-	metrics := NewMetricsStore()
+func simulateTraffic(metrics *MetricsStore, endpoints []string, requestCount int) {
 	var wg sync.WaitGroup
 
-	endpoints := []string{"/api/users", "/api/orders", "/api/products", "/healthz"}
-
-	for i := 0; i < 1000; i++ {
+	for i := 0; i < requestCount; i++ {
 		wg.Add(1)
 		go func(reqID int) {
 			defer wg.Done()
-			ep := endpoints[reqID%len(endpoints)]
-			metrics.Increment(ep)
+			endpoint := endpoints[reqID%len(endpoints)]
+			metrics.Increment(endpoint)
 		}(i)
 	}
 
 	wg.Wait()
+}
 
-	fmt.Println("=== Request Metrics (mutex approach) ===")
-	snap := metrics.Snapshot()
+func printMetricsReport(title string, snap map[string]int64) {
+	fmt.Printf("=== %s ===\n", title)
 	total := int64(0)
-	for ep, count := range snap {
-		fmt.Printf("  %-20s %d requests\n", ep, count)
+	for endpoint, count := range snap {
+		fmt.Printf("  %-20s %d requests\n", endpoint, count)
 		total += count
 	}
 	fmt.Printf("  %-20s %d requests\n", "TOTAL", total)
+}
+
+func main() {
+	metrics := NewMetricsStore()
+	endpoints := []string{"/api/users", "/api/orders", "/api/products", "/healthz"}
+
+	simulateTraffic(metrics, endpoints, simulatedRequests)
+	printMetricsReport("Request Metrics (mutex approach)", metrics.Snapshot())
 }
 ```
 
@@ -121,8 +129,17 @@ import (
 	"sync"
 )
 
+const simulatedRequests = 1000
+
+type opKind int
+
+const (
+	opIncrement opKind = iota
+	opSnapshot
+)
+
 type metricsOp struct {
-	kind     string
+	kind     opKind
 	endpoint string
 	response chan map[string]int64
 }
@@ -137,34 +154,38 @@ func NewChannelMetrics() *ChannelMetrics {
 		ops:  make(chan metricsOp),
 		done: make(chan struct{}),
 	}
-	go m.run()
+	go m.eventLoop()
 	return m
 }
 
-func (m *ChannelMetrics) run() {
+func (m *ChannelMetrics) eventLoop() {
 	counters := make(map[string]int64)
 	for op := range m.ops {
 		switch op.kind {
-		case "inc":
+		case opIncrement:
 			counters[op.endpoint]++
-		case "snapshot":
-			result := make(map[string]int64, len(counters))
-			for k, v := range counters {
-				result[k] = v
-			}
-			op.response <- result
+		case opSnapshot:
+			op.response <- copyCounters(counters)
 		}
 	}
 	close(m.done)
 }
 
+func copyCounters(src map[string]int64) map[string]int64 {
+	result := make(map[string]int64, len(src))
+	for k, v := range src {
+		result[k] = v
+	}
+	return result
+}
+
 func (m *ChannelMetrics) Increment(endpoint string) {
-	m.ops <- metricsOp{kind: "inc", endpoint: endpoint}
+	m.ops <- metricsOp{kind: opIncrement, endpoint: endpoint}
 }
 
 func (m *ChannelMetrics) Snapshot() map[string]int64 {
 	resp := make(chan map[string]int64)
-	m.ops <- metricsOp{kind: "snapshot", response: resp}
+	m.ops <- metricsOp{kind: opSnapshot, response: resp}
 	return <-resp
 }
 
@@ -173,31 +194,37 @@ func (m *ChannelMetrics) Close() {
 	<-m.done
 }
 
-func main() {
-	metrics := NewChannelMetrics()
+func simulateTraffic(metrics *ChannelMetrics, endpoints []string, requestCount int) {
 	var wg sync.WaitGroup
 
-	endpoints := []string{"/api/users", "/api/orders", "/api/products", "/healthz"}
-
-	for i := 0; i < 1000; i++ {
+	for i := 0; i < requestCount; i++ {
 		wg.Add(1)
 		go func(reqID int) {
 			defer wg.Done()
-			ep := endpoints[reqID%len(endpoints)]
-			metrics.Increment(ep)
+			endpoint := endpoints[reqID%len(endpoints)]
+			metrics.Increment(endpoint)
 		}(i)
 	}
 
 	wg.Wait()
+}
 
-	fmt.Println("=== Request Metrics (channel approach) ===")
-	snap := metrics.Snapshot()
+func printMetricsReport(title string, snap map[string]int64) {
+	fmt.Printf("=== %s ===\n", title)
 	total := int64(0)
-	for ep, count := range snap {
-		fmt.Printf("  %-20s %d requests\n", ep, count)
+	for endpoint, count := range snap {
+		fmt.Printf("  %-20s %d requests\n", endpoint, count)
 		total += count
 	}
 	fmt.Printf("  %-20s %d requests\n", "TOTAL", total)
+}
+
+func main() {
+	metrics := NewChannelMetrics()
+	endpoints := []string{"/api/users", "/api/orders", "/api/products", "/healthz"}
+
+	simulateTraffic(metrics, endpoints, simulatedRequests)
+	printMetricsReport("Request Metrics (channel approach)", metrics.Snapshot())
 	metrics.Close()
 }
 ```
@@ -221,28 +248,34 @@ package main
 
 import (
 	"fmt"
-	"sync"
 	"time"
 )
 
+const (
+	fetchDelay  = 20 * time.Millisecond
+	resizeDelay = 30 * time.Millisecond
+	writeDelay  = 10 * time.Millisecond
+	pipelineBuf = 2
+)
+
 type ImageJob struct {
-	URL       string
-	Stage     string
-	Data      string
+	URL   string
+	Stage string
+	Data  string
 }
 
-func fetcher(urls []string, out chan<- ImageJob) {
+func fetchImages(urls []string, out chan<- ImageJob) {
 	for _, url := range urls {
-		time.Sleep(20 * time.Millisecond) // simulate HTTP fetch
+		time.Sleep(fetchDelay)
 		out <- ImageJob{URL: url, Stage: "fetched", Data: "raw-bytes"}
 		fmt.Printf("  [fetch]  %s\n", url)
 	}
 	close(out)
 }
 
-func resizer(in <-chan ImageJob, out chan<- ImageJob) {
+func resizeImages(in <-chan ImageJob, out chan<- ImageJob) {
 	for job := range in {
-		time.Sleep(30 * time.Millisecond) // simulate resize
+		time.Sleep(resizeDelay)
 		job.Stage = "resized"
 		job.Data = "resized-bytes"
 		out <- job
@@ -251,12 +284,27 @@ func resizer(in <-chan ImageJob, out chan<- ImageJob) {
 	close(out)
 }
 
-func writer(in <-chan ImageJob, done chan<- struct{}) {
+func writeImages(in <-chan ImageJob, done chan<- struct{}) {
 	for job := range in {
-		time.Sleep(10 * time.Millisecond) // simulate disk write
+		time.Sleep(writeDelay)
 		fmt.Printf("  [write]  %s -> saved\n", job.URL)
 	}
 	close(done)
+}
+
+func runImagePipeline(urls []string) time.Duration {
+	start := time.Now()
+
+	fetchCh := make(chan ImageJob, pipelineBuf)
+	resizeCh := make(chan ImageJob, pipelineBuf)
+	done := make(chan struct{})
+
+	go fetchImages(urls, fetchCh)
+	go resizeImages(fetchCh, resizeCh)
+	go writeImages(resizeCh, done)
+
+	<-done
+	return time.Since(start)
 }
 
 func main() {
@@ -269,18 +317,8 @@ func main() {
 	}
 
 	fmt.Println("=== Image Processing Pipeline (channels) ===")
-	start := time.Now()
-
-	fetchCh := make(chan ImageJob, 2)
-	resizeCh := make(chan ImageJob, 2)
-	done := make(chan struct{})
-
-	go fetcher(urls, fetchCh)
-	go resizer(fetchCh, resizeCh)
-	go writer(resizeCh, done)
-
-	<-done
-	fmt.Printf("\nPipeline complete: %d images in %v\n", len(urls), time.Since(start).Round(time.Millisecond))
+	elapsed := runImagePipeline(urls)
+	fmt.Printf("\nPipeline complete: %d images in %v\n", len(urls), elapsed.Round(time.Millisecond))
 }
 ```
 
@@ -317,20 +355,107 @@ import (
 	"time"
 )
 
+const (
+	fetchSimDelay  = 20 * time.Millisecond
+	resizeSimDelay = 30 * time.Millisecond
+	writeSimDelay  = 10 * time.Millisecond
+	pollInterval   = 5 * time.Millisecond
+)
+
 type ImageJob struct {
 	URL   string
 	Stage string
 }
 
+type SharedPipelineState struct {
+	mu           sync.Mutex
+	fetchedQueue []ImageJob
+	resizedQueue []ImageJob
+	fetchDone    bool
+	resizeDone   bool
+}
+
+func (s *SharedPipelineState) appendFetched(job ImageJob) {
+	s.mu.Lock()
+	s.fetchedQueue = append(s.fetchedQueue, job)
+	s.mu.Unlock()
+}
+
+func (s *SharedPipelineState) markFetchDone() {
+	s.mu.Lock()
+	s.fetchDone = true
+	s.mu.Unlock()
+}
+
+func (s *SharedPipelineState) appendResized(job ImageJob) {
+	s.mu.Lock()
+	s.resizedQueue = append(s.resizedQueue, job)
+	s.mu.Unlock()
+}
+
+func (s *SharedPipelineState) markResizeDone() {
+	s.mu.Lock()
+	s.resizeDone = true
+	s.mu.Unlock()
+}
+
+func runMutexFetcher(state *SharedPipelineState, urls []string, wg *sync.WaitGroup) {
+	defer wg.Done()
+	for _, url := range urls {
+		time.Sleep(fetchSimDelay)
+		state.appendFetched(ImageJob{URL: url, Stage: "fetched"})
+		fmt.Printf("  [fetch] %s\n", url)
+	}
+	state.markFetchDone()
+}
+
+func runMutexResizer(state *SharedPipelineState, wg *sync.WaitGroup) {
+	defer wg.Done()
+	for {
+		state.mu.Lock()
+		if len(state.fetchedQueue) > 0 {
+			job := state.fetchedQueue[0]
+			state.fetchedQueue = state.fetchedQueue[1:]
+			state.mu.Unlock()
+			time.Sleep(resizeSimDelay)
+			job.Stage = "resized"
+			state.appendResized(job)
+			fmt.Printf("  [resize] %s\n", job.URL)
+		} else if state.fetchDone {
+			state.mu.Unlock()
+			state.markResizeDone()
+			return
+		} else {
+			state.mu.Unlock()
+			time.Sleep(pollInterval) // POLLING -- wasteful
+		}
+	}
+}
+
+func runMutexWriter(state *SharedPipelineState, wg *sync.WaitGroup) {
+	defer wg.Done()
+	for {
+		state.mu.Lock()
+		if len(state.resizedQueue) > 0 {
+			job := state.resizedQueue[0]
+			state.resizedQueue = state.resizedQueue[1:]
+			state.mu.Unlock()
+			time.Sleep(writeSimDelay)
+			fmt.Printf("  [write] %s -> saved\n", job.URL)
+		} else if state.resizeDone {
+			state.mu.Unlock()
+			return
+		} else {
+			state.mu.Unlock()
+			time.Sleep(pollInterval) // POLLING -- wasteful
+		}
+	}
+}
+
 func main() {
 	fmt.Println("=== Image Processing Pipeline (mutex -- awkward) ===")
 
-	var mu sync.Mutex
-	fetchedQueue := make([]ImageJob, 0)
-	resizedQueue := make([]ImageJob, 0)
-	fetchDone := false
-	resizeDone := false
-
+	state := &SharedPipelineState{}
 	urls := []string{
 		"cdn.example.com/img/001.jpg",
 		"cdn.example.com/img/002.jpg",
@@ -338,73 +463,10 @@ func main() {
 	}
 
 	var wg sync.WaitGroup
-
-	// Fetcher
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for _, url := range urls {
-			time.Sleep(20 * time.Millisecond)
-			mu.Lock()
-			fetchedQueue = append(fetchedQueue, ImageJob{URL: url, Stage: "fetched"})
-			mu.Unlock()
-			fmt.Printf("  [fetch] %s\n", url)
-		}
-		mu.Lock()
-		fetchDone = true
-		mu.Unlock()
-	}()
-
-	// Resizer: must POLL the fetchedQueue
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for {
-			mu.Lock()
-			if len(fetchedQueue) > 0 {
-				job := fetchedQueue[0]
-				fetchedQueue = fetchedQueue[1:]
-				mu.Unlock()
-				time.Sleep(30 * time.Millisecond)
-				mu.Lock()
-				job.Stage = "resized"
-				resizedQueue = append(resizedQueue, job)
-				mu.Unlock()
-				fmt.Printf("  [resize] %s\n", job.URL)
-			} else if fetchDone {
-				mu.Unlock()
-				mu.Lock()
-				resizeDone = true
-				mu.Unlock()
-				return
-			} else {
-				mu.Unlock()
-				time.Sleep(5 * time.Millisecond) // POLLING -- wasteful
-			}
-		}
-	}()
-
-	// Writer: must POLL the resizedQueue
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for {
-			mu.Lock()
-			if len(resizedQueue) > 0 {
-				job := resizedQueue[0]
-				resizedQueue = resizedQueue[1:]
-				mu.Unlock()
-				time.Sleep(10 * time.Millisecond)
-				fmt.Printf("  [write] %s -> saved\n", job.URL)
-			} else if resizeDone {
-				mu.Unlock()
-				return
-			} else {
-				mu.Unlock()
-				time.Sleep(5 * time.Millisecond) // POLLING -- wasteful
-			}
-		}
-	}()
+	wg.Add(3)
+	go runMutexFetcher(state, urls, &wg)
+	go runMutexResizer(state, &wg)
+	go runMutexWriter(state, &wg)
 
 	wg.Wait()
 	fmt.Println("\nThis works, but the polling loops are ugly, wasteful, and error-prone.")

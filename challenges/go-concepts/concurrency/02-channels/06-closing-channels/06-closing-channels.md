@@ -32,23 +32,35 @@ package main
 
 import "fmt"
 
+const taskBufferSize = 3
+
+// Task represents a unit of work with an identifier and name.
 type Task struct {
-    ID   int
-    Name string
+	ID   int
+	Name string
+}
+
+// demonstrateZeroValueReads shows that after a channel is closed and
+// drained, every subsequent receive returns the zero value of the type.
+func demonstrateZeroValueReads(tasks <-chan Task, readCount int) {
+	for i := 1; i <= readCount; i++ {
+		task := <-tasks
+		label := "real task"
+		if task == (Task{}) {
+			label = "zero value -- channel closed and empty"
+		}
+		fmt.Printf("Read %d: %+v (%s)\n", i, task, label)
+	}
 }
 
 func main() {
-    tasks := make(chan Task, 3)
-    tasks <- Task{ID: 1, Name: "process-invoice"}
-    tasks <- Task{ID: 2, Name: "send-email"}
-    close(tasks)
+	tasks := make(chan Task, taskBufferSize)
+	tasks <- Task{ID: 1, Name: "process-invoice"}
+	tasks <- Task{ID: 2, Name: "send-email"}
+	close(tasks)
 
-    // First two reads return real tasks.
-    fmt.Printf("Read 1: %+v (real task)\n", <-tasks)
-    fmt.Printf("Read 2: %+v (real task)\n", <-tasks)
-    // After buffer is drained, reads return zero value forever.
-    fmt.Printf("Read 3: %+v (zero value -- channel closed and empty)\n", <-tasks)
-    fmt.Printf("Read 4: %+v (zero value -- repeats forever)\n", <-tasks)
+	// First two reads return real tasks. After that, zero values forever.
+	demonstrateZeroValueReads(tasks, 4)
 }
 ```
 
@@ -73,18 +85,24 @@ package main
 
 import "fmt"
 
+// receiveWithStatus uses the comma-ok idiom to distinguish real values
+// from closed-channel zero values.
+func receiveWithStatus(tasks <-chan int, label string) {
+	id, ok := <-tasks
+	status := "real task (happens to have ID 0)"
+	if !ok {
+		status = "channel closed, no more tasks"
+	}
+	fmt.Printf("id=%d, ok=%v -- %s [%s]\n", id, ok, status, label)
+}
+
 func main() {
-    tasks := make(chan int, 2)
-    tasks <- 0 // intentionally sending zero -- this is a real task ID
-    close(tasks)
+	tasks := make(chan int, 2)
+	tasks <- 0 // intentionally sending zero -- this is a real task ID
+	close(tasks)
 
-    // First read: ok=true -- the zero is a real task ID sent before close.
-    id, ok := <-tasks
-    fmt.Printf("id=%d, ok=%v -- real task (happens to have ID 0)\n", id, ok)
-
-    // Second read: ok=false -- the zero means the channel is closed and empty.
-    id, ok = <-tasks
-    fmt.Printf("id=%d, ok=%v -- channel closed, no more tasks\n", id, ok)
+	receiveWithStatus(tasks, "first read")
+	receiveWithStatus(tasks, "second read")
 }
 ```
 
@@ -106,32 +124,50 @@ Closing a channel unblocks ALL receivers simultaneously. This is the simplest wa
 package main
 
 import (
-    "fmt"
-    "time"
+	"fmt"
+	"time"
 )
 
+const (
+	numWorkers      = 5
+	workerStartWait = 50 * time.Millisecond
+)
+
+// waitForShutdown blocks until the shutdown channel is closed,
+// then signals completion on the done channel.
+func waitForShutdown(id int, shutdown <-chan struct{}, done chan<- struct{}) {
+	fmt.Printf("Worker %d: waiting for tasks...\n", id)
+	<-shutdown
+	fmt.Printf("Worker %d: received shutdown broadcast, cleaning up\n", id)
+	done <- struct{}{}
+}
+
+// launchWorkerPool starts numWorkers goroutines, each waiting for shutdown.
+func launchWorkerPool(count int, shutdown <-chan struct{}, done chan<- struct{}) {
+	for id := 1; id <= count; id++ {
+		go waitForShutdown(id, shutdown, done)
+	}
+}
+
+// collectCompletions waits for exactly count workers to finish.
+func collectCompletions(done <-chan struct{}, count int) {
+	for i := 0; i < count; i++ {
+		<-done
+	}
+}
+
 func main() {
-    shutdown := make(chan struct{})
-    done := make(chan struct{})
-    numWorkers := 5
+	shutdown := make(chan struct{})
+	done := make(chan struct{})
 
-    for i := 1; i <= numWorkers; i++ {
-        go func(id int) {
-            fmt.Printf("Worker %d: waiting for tasks...\n", id)
-            <-shutdown // blocks until shutdown is closed
-            fmt.Printf("Worker %d: received shutdown broadcast, cleaning up\n", id)
-            done <- struct{}{}
-        }(i)
-    }
+	launchWorkerPool(numWorkers, shutdown, done)
 
-    time.Sleep(50 * time.Millisecond) // let workers start
-    fmt.Printf("\nDispatcher: no more work -- broadcasting shutdown to %d workers...\n\n", numWorkers)
-    close(shutdown) // ALL 5 workers unblock simultaneously
+	time.Sleep(workerStartWait)
+	fmt.Printf("\nDispatcher: no more work -- broadcasting shutdown to %d workers...\n\n", numWorkers)
+	close(shutdown) // ALL 5 workers unblock simultaneously
 
-    for i := 0; i < numWorkers; i++ {
-        <-done
-    }
-    fmt.Println("Dispatcher: all workers shut down cleanly")
+	collectCompletions(done, numWorkers)
+	fmt.Println("Dispatcher: all workers shut down cleanly")
 }
 ```
 
@@ -152,32 +188,34 @@ package main
 
 import "fmt"
 
+// safeExecute runs fn inside a deferred recover, printing any panic message.
+func safeExecute(fn func()) {
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Printf("Caught panic: %v\n", r)
+		}
+	}()
+	fn()
+}
+
+// demonstrateSendOnClosed triggers a panic by sending on a closed channel.
+func demonstrateSendOnClosed() {
+	tasks := make(chan int)
+	close(tasks)
+	tasks <- 42 // panic: send on closed channel
+}
+
+// demonstrateDoubleClose triggers a panic by closing an already-closed channel.
+func demonstrateDoubleClose() {
+	tasks := make(chan int)
+	close(tasks)
+	close(tasks) // panic: close of closed channel
+}
+
 func main() {
-    // Demonstrate send-on-closed-channel panic.
-    func() {
-        defer func() {
-            if r := recover(); r != nil {
-                fmt.Printf("Caught panic: %v\n", r)
-            }
-        }()
-        tasks := make(chan int)
-        close(tasks)
-        tasks <- 42 // panic: send on closed channel
-    }()
-
-    // Demonstrate double-close panic.
-    func() {
-        defer func() {
-            if r := recover(); r != nil {
-                fmt.Printf("Caught panic: %v\n", r)
-            }
-        }()
-        tasks := make(chan int)
-        close(tasks)
-        close(tasks) // panic: close of closed channel
-    }()
-
-    fmt.Println("Both panics caught and handled")
+	safeExecute(demonstrateSendOnClosed)
+	safeExecute(demonstrateDoubleClose)
+	fmt.Println("Both panics caught and handled")
 }
 ```
 
@@ -198,51 +236,82 @@ A realistic example combining everything: the dispatcher sends work items to wor
 package main
 
 import (
-    "fmt"
-    "time"
+	"fmt"
+	"time"
 )
 
+const (
+	taskBufferCapacity  = 5
+	workerCount         = 3
+	taskCount           = 10
+	taskProcessDuration = 30 * time.Millisecond
+)
+
+// TaskDispatcher distributes work items to a pool of workers and
+// coordinates graceful or emergency shutdown.
+type TaskDispatcher struct {
+	tasks chan string
+	quit  chan struct{}
+	done  chan struct{}
+}
+
+// NewTaskDispatcher creates a dispatcher with a buffered task channel.
+func NewTaskDispatcher(bufferSize int) *TaskDispatcher {
+	return &TaskDispatcher{
+		tasks: make(chan string, bufferSize),
+		quit:  make(chan struct{}),
+		done:  make(chan struct{}),
+	}
+}
+
+// runWorker processes tasks until the task channel is closed or an
+// emergency quit is signaled. It reports completion on the done channel.
+func (d *TaskDispatcher) runWorker(id int) {
+	defer func() { d.done <- struct{}{} }()
+	for {
+		select {
+		case task, ok := <-d.tasks:
+			if !ok {
+				fmt.Printf("Worker %d: task channel closed, exiting\n", id)
+				return
+			}
+			fmt.Printf("Worker %d: processing %s\n", id, task)
+			time.Sleep(taskProcessDuration)
+		case <-d.quit:
+			fmt.Printf("Worker %d: emergency shutdown\n", id)
+			return
+		}
+	}
+}
+
+// LaunchWorkers starts count worker goroutines.
+func (d *TaskDispatcher) LaunchWorkers(count int) {
+	for id := 1; id <= count; id++ {
+		go d.runWorker(id)
+	}
+}
+
+// SubmitTasks sends the given number of tasks, then closes the channel.
+func (d *TaskDispatcher) SubmitTasks(count int) {
+	for i := 1; i <= count; i++ {
+		d.tasks <- fmt.Sprintf("task-%d", i)
+	}
+	close(d.tasks)
+}
+
+// WaitForWorkers blocks until all workers report completion.
+func (d *TaskDispatcher) WaitForWorkers(count int) {
+	for i := 0; i < count; i++ {
+		<-d.done
+	}
+}
+
 func main() {
-    tasks := make(chan string, 5)
-    quit := make(chan struct{})
-    done := make(chan struct{})
-    numWorkers := 3
-
-    worker := func(id int) {
-        defer func() { done <- struct{}{} }()
-        for {
-            select {
-            case task, ok := <-tasks:
-                if !ok {
-                    fmt.Printf("Worker %d: task channel closed, exiting\n", id)
-                    return
-                }
-                fmt.Printf("Worker %d: processing %s\n", id, task)
-                time.Sleep(30 * time.Millisecond)
-            case <-quit:
-                fmt.Printf("Worker %d: emergency shutdown\n", id)
-                return
-            }
-        }
-    }
-
-    for i := 1; i <= numWorkers; i++ {
-        go worker(i)
-    }
-
-    // Dispatcher sends 10 tasks.
-    for i := 1; i <= 10; i++ {
-        tasks <- fmt.Sprintf("task-%d", i)
-    }
-
-    // Signal no more work by closing the task channel.
-    close(tasks)
-
-    for i := 0; i < numWorkers; i++ {
-        <-done
-    }
-    fmt.Println("Dispatcher: all workers finished")
-    _ = quit // quit channel available for emergency shutdown scenarios
+	dispatcher := NewTaskDispatcher(taskBufferCapacity)
+	dispatcher.LaunchWorkers(workerCount)
+	dispatcher.SubmitTasks(taskCount)
+	dispatcher.WaitForWorkers(workerCount)
+	fmt.Println("Dispatcher: all workers finished")
 }
 ```
 

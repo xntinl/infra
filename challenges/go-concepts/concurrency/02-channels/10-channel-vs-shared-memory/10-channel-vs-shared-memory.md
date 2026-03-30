@@ -31,27 +31,31 @@ Multiple goroutines increment a shared counter and notify listeners about page h
 package main
 
 import (
-    "fmt"
-    "sync"
+	"fmt"
+	"sync"
 )
 
+const raceGoroutineCount = 1000
+
+// unsafeIncrement demonstrates a data race: counter++ is a
+// read-modify-write that is not atomic. Multiple goroutines can
+// read the same value, both increment, both write -- losing increments.
+func unsafeIncrement(counter *int, wg *sync.WaitGroup) {
+	defer wg.Done()
+	*counter++ // DATA RACE
+}
+
 func main() {
-    counter := 0
-    var wg sync.WaitGroup
+	counter := 0
+	var wg sync.WaitGroup
 
-    for i := 0; i < 1000; i++ {
-        wg.Add(1)
-        go func() {
-            defer wg.Done()
-            // DATA RACE: counter++ is read-modify-write, not atomic.
-            // Two goroutines can read the same value, both increment,
-            // both write -- one increment is lost.
-            counter++
-        }()
-    }
+	for i := 0; i < raceGoroutineCount; i++ {
+		wg.Add(1)
+		go unsafeIncrement(&counter, &wg)
+	}
 
-    wg.Wait()
-    fmt.Printf("Counter: %d (expected 1000, likely wrong)\n", counter)
+	wg.Wait()
+	fmt.Printf("Counter: %d (expected %d, likely wrong)\n", counter, raceGoroutineCount)
 }
 ```
 
@@ -71,82 +75,110 @@ Protect the hit counter and event notification with `sync.Mutex`. Lock before re
 package main
 
 import (
-    "fmt"
-    "sync"
-    "time"
+	"fmt"
+	"sync"
+	"time"
 )
 
+const mutexHitCount = 1000
+
+// MutexHitCounter protects page hit counts with a RWMutex.
+// It fires an onChange callback (if set) after each hit.
 type MutexHitCounter struct {
-    mu       sync.RWMutex
-    counts   map[string]int
-    total    int
-    onChange func(page string, count int) // event callback
+	mu       sync.RWMutex
+	counts   map[string]int
+	total    int
+	onChange func(page string, count int)
 }
 
+// NewMutexHitCounter creates a counter with an optional change callback.
 func NewMutexHitCounter(onChange func(string, int)) *MutexHitCounter {
-    return &MutexHitCounter{
-        counts:   make(map[string]int),
-        onChange: onChange,
-    }
+	return &MutexHitCounter{
+		counts:   make(map[string]int),
+		onChange: onChange,
+	}
 }
 
+// RecordHit atomically increments the hit count for the given page.
 func (h *MutexHitCounter) RecordHit(page string) {
-    h.mu.Lock()
-    h.counts[page]++
-    h.total++
-    count := h.counts[page]
-    h.mu.Unlock()
+	h.mu.Lock()
+	h.counts[page]++
+	h.total++
+	count := h.counts[page]
+	h.mu.Unlock()
 
-    if h.onChange != nil {
-        h.onChange(page, count)
-    }
+	if h.onChange != nil {
+		h.onChange(page, count)
+	}
 }
 
+// GetCount returns the hit count for a single page.
 func (h *MutexHitCounter) GetCount(page string) int {
-    h.mu.RLock()
-    defer h.mu.RUnlock()
-    return h.counts[page]
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.counts[page]
 }
 
+// GetTotal returns the total number of hits across all pages.
 func (h *MutexHitCounter) GetTotal() int {
-    h.mu.RLock()
-    defer h.mu.RUnlock()
-    return h.total
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.total
+}
+
+// NotificationCounter tracks the number of change notifications, protected by its own mutex.
+type NotificationCounter struct {
+	mu    sync.Mutex
+	count int
+}
+
+// Increment safely increments the notification count.
+func (nc *NotificationCounter) Increment() {
+	nc.mu.Lock()
+	nc.count++
+	nc.mu.Unlock()
+}
+
+// Count returns the current notification count.
+func (nc *NotificationCounter) Count() int {
+	nc.mu.Lock()
+	defer nc.mu.Unlock()
+	return nc.count
+}
+
+// simulateHitLoad launches goroutines that record hits across the given pages.
+func simulateHitLoad(counter *MutexHitCounter, pages []string, hitCount int) {
+	var wg sync.WaitGroup
+	for i := 0; i < hitCount; i++ {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			page := pages[n%len(pages)]
+			counter.RecordHit(page)
+		}(i)
+	}
+	wg.Wait()
 }
 
 func main() {
-    var notifyMu sync.Mutex
-    notifications := 0
+	notifications := &NotificationCounter{}
+	counter := NewMutexHitCounter(func(page string, count int) {
+		notifications.Increment()
+	})
 
-    counter := NewMutexHitCounter(func(page string, count int) {
-        notifyMu.Lock()
-        notifications++
-        notifyMu.Unlock()
-    })
+	pages := []string{"/home", "/about", "/api/users", "/api/orders", "/health"}
+	start := time.Now()
 
-    var wg sync.WaitGroup
-    pages := []string{"/home", "/about", "/api/users", "/api/orders", "/health"}
-    start := time.Now()
+	simulateHitLoad(counter, pages, mutexHitCount)
+	elapsed := time.Since(start)
 
-    for i := 0; i < 1000; i++ {
-        wg.Add(1)
-        go func(n int) {
-            defer wg.Done()
-            page := pages[n%len(pages)]
-            counter.RecordHit(page)
-        }(i)
-    }
-
-    wg.Wait()
-    elapsed := time.Since(start)
-
-    fmt.Println("=== Mutex Version ===")
-    fmt.Printf("Total hits: %d\n", counter.GetTotal())
-    for _, page := range pages {
-        fmt.Printf("  %-15s %d hits\n", page, counter.GetCount(page))
-    }
-    fmt.Printf("Notifications sent: %d\n", notifications)
-    fmt.Printf("Time: %v\n", elapsed)
+	fmt.Println("=== Mutex Version ===")
+	fmt.Printf("Total hits: %d\n", counter.GetTotal())
+	for _, page := range pages {
+		fmt.Printf("  %-15s %d hits\n", page, counter.GetCount(page))
+	}
+	fmt.Printf("Notifications sent: %d\n", notifications.Count())
+	fmt.Printf("Time: %v\n", elapsed)
 }
 ```
 
@@ -167,98 +199,149 @@ Send hit events to a single goroutine that owns the counter state. Notifications
 package main
 
 import (
-    "fmt"
-    "sync"
-    "time"
+	"fmt"
+	"sync"
+	"time"
 )
 
+const (
+	channelHitCount       = 1000
+	hitEventBufferSize    = 100
+	notificationBufferSize = 100
+)
+
+// HitEvent signals that a page was visited.
 type HitEvent struct {
-    Page string
+	Page string
 }
 
+// QueryRequest asks for the hit count of a specific page.
 type QueryRequest struct {
-    Page  string
-    Reply chan int
+	Page  string
+	Reply chan int
 }
 
+// TotalRequest asks for the total hit count across all pages.
 type TotalRequest struct {
-    Reply chan int
+	Reply chan int
 }
 
-func hitCounterService(
-    hits <-chan HitEvent,
-    queries <-chan QueryRequest,
-    totals <-chan TotalRequest,
-    notifications chan<- HitEvent,
-) {
-    counts := make(map[string]int)
-    total := 0
+// ChannelHitCounter owns hit-count state in a single goroutine,
+// processing hits, queries, and total requests through channels.
+type ChannelHitCounter struct {
+	hits          chan HitEvent
+	queries       chan QueryRequest
+	totals        chan TotalRequest
+	notifications chan HitEvent
+}
 
-    for {
-        select {
-        case hit, ok := <-hits:
-            if !ok {
-                close(notifications)
-                return
-            }
-            counts[hit.Page]++
-            total++
-            notifications <- hit
-        case q := <-queries:
-            q.Reply <- counts[q.Page]
-        case t := <-totals:
-            t.Reply <- total
-        }
-    }
+// NewChannelHitCounter creates and starts a channel-based hit counter.
+func NewChannelHitCounter() *ChannelHitCounter {
+	c := &ChannelHitCounter{
+		hits:          make(chan HitEvent, hitEventBufferSize),
+		queries:       make(chan QueryRequest),
+		totals:        make(chan TotalRequest),
+		notifications: make(chan HitEvent, notificationBufferSize),
+	}
+	go c.run()
+	return c
+}
+
+func (c *ChannelHitCounter) run() {
+	counts := make(map[string]int)
+	total := 0
+
+	for {
+		select {
+		case hit, ok := <-c.hits:
+			if !ok {
+				close(c.notifications)
+				return
+			}
+			counts[hit.Page]++
+			total++
+			c.notifications <- hit
+		case q := <-c.queries:
+			q.Reply <- counts[q.Page]
+		case t := <-c.totals:
+			t.Reply <- total
+		}
+	}
+}
+
+// RecordHit sends a hit event to the counter service.
+func (c *ChannelHitCounter) RecordHit(page string) {
+	c.hits <- HitEvent{Page: page}
+}
+
+// GetCount returns the hit count for a specific page via request-response.
+func (c *ChannelHitCounter) GetCount(page string) int {
+	reply := make(chan int, 1)
+	c.queries <- QueryRequest{Page: page, Reply: reply}
+	return <-reply
+}
+
+// GetTotal returns the total hit count via request-response.
+func (c *ChannelHitCounter) GetTotal() int {
+	reply := make(chan int, 1)
+	c.totals <- TotalRequest{Reply: reply}
+	return <-reply
+}
+
+// Close signals the service to shut down and waits for notification drain.
+func (c *ChannelHitCounter) Close() {
+	close(c.hits)
+}
+
+// countNotifications drains the notification channel and returns the count.
+func countNotifications(notifications <-chan HitEvent) (int, <-chan struct{}) {
+	done := make(chan struct{})
+	var count int
+	go func() {
+		for range notifications {
+			count++
+		}
+		done <- struct{}{}
+	}()
+	return count, done
 }
 
 func main() {
-    hits := make(chan HitEvent, 100)
-    queries := make(chan QueryRequest)
-    totals := make(chan TotalRequest)
-    notifications := make(chan HitEvent, 100)
+	counter := NewChannelHitCounter()
 
-    go hitCounterService(hits, queries, totals, notifications)
+	notifyCount := 0
+	notifyDone := make(chan struct{})
+	go func() {
+		for range counter.notifications {
+			notifyCount++
+		}
+		notifyDone <- struct{}{}
+	}()
 
-    // Notification consumer.
-    var notifyCount int
-    notifyDone := make(chan struct{})
-    go func() {
-        for range notifications {
-            notifyCount++
-        }
-        notifyDone <- struct{}{}
-    }()
+	pages := []string{"/home", "/about", "/api/users", "/api/orders", "/health"}
+	var wg sync.WaitGroup
+	start := time.Now()
 
-    var wg sync.WaitGroup
-    pages := []string{"/home", "/about", "/api/users", "/api/orders", "/health"}
-    start := time.Now()
+	for i := 0; i < channelHitCount; i++ {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			counter.RecordHit(pages[n%len(pages)])
+		}(i)
+	}
 
-    for i := 0; i < 1000; i++ {
-        wg.Add(1)
-        go func(n int) {
-            defer wg.Done()
-            page := pages[n%len(pages)]
-            hits <- HitEvent{Page: page}
-        }(i)
-    }
+	wg.Wait()
+	counter.Close()
+	<-notifyDone
+	elapsed := time.Since(start)
 
-    wg.Wait()
-    close(hits)
-    <-notifyDone
-    elapsed := time.Since(start)
-
-    fmt.Println("=== Channel Version ===")
-    reply := make(chan int, 1)
-    totals <- TotalRequest{Reply: reply}
-    fmt.Printf("Total hits: %d\n", <-reply)
-
-    for _, page := range pages {
-        queries <- QueryRequest{Page: page, Reply: reply}
-        fmt.Printf("  %-15s %d hits\n", page, <-reply)
-    }
-    fmt.Printf("Notifications sent: %d\n", notifyCount)
-    fmt.Printf("Time: %v\n", elapsed)
+	fmt.Println("=== Channel Version ===")
+	fmt.Printf("Total hits: %d\n", counter.GetTotal())
+	for _, page := range pages {
+		fmt.Printf("  %-15s %d hits\n", page, counter.GetCount(page))
+	}
+	fmt.Printf("Notifications sent: %d\n", notifyCount)
+	fmt.Printf("Time: %v\n", elapsed)
 }
 ```
 
@@ -279,128 +362,160 @@ Run both implementations in the same program to compare behavior and timing.
 package main
 
 import (
-    "fmt"
-    "sync"
-    "time"
+	"fmt"
+	"sync"
+	"time"
 )
+
+const benchmarkHitCount = 10000
+
+// --- Shared interface for both counter implementations ---
+
+// HitCounter defines the common interface for both implementations.
+type HitCounter interface {
+	Record(page string)
+	Snapshot() (counts map[string]int, total int)
+}
 
 // --- Mutex version ---
 
+// MutexCounter guards a map with sync.Mutex.
 type MutexCounter struct {
-    mu     sync.Mutex
-    counts map[string]int
-    events int
+	mu     sync.Mutex
+	counts map[string]int
+	events int
+}
+
+// NewMutexCounter creates a mutex-backed counter.
+func NewMutexCounter() *MutexCounter {
+	return &MutexCounter{counts: make(map[string]int)}
 }
 
 func (c *MutexCounter) Record(page string) {
-    c.mu.Lock()
-    c.counts[page]++
-    c.events++
-    c.mu.Unlock()
+	c.mu.Lock()
+	c.counts[page]++
+	c.events++
+	c.mu.Unlock()
 }
 
 func (c *MutexCounter) Snapshot() (map[string]int, int) {
-    c.mu.Lock()
-    defer c.mu.Unlock()
-    snap := make(map[string]int)
-    for k, v := range c.counts {
-        snap[k] = v
-    }
-    return snap, c.events
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	snap := make(map[string]int)
+	for k, v := range c.counts {
+		snap[k] = v
+	}
+	return snap, c.events
 }
 
 // --- Channel version ---
 
-type ChanCounter struct {
-    hits    chan string
-    snapReq chan chan counterSnapshot
-}
-
+// counterSnapshot is the response payload for a snapshot request.
 type counterSnapshot struct {
-    Counts map[string]int
-    Events int
+	Counts map[string]int
+	Events int
 }
 
+// ChanCounter processes all mutations in a single goroutine via channels.
+type ChanCounter struct {
+	hits    chan string
+	snapReq chan chan counterSnapshot
+}
+
+// NewChanCounter creates and starts a channel-backed counter.
 func NewChanCounter() *ChanCounter {
-    c := &ChanCounter{
-        hits:    make(chan string, 100),
-        snapReq: make(chan chan counterSnapshot),
-    }
-    go c.run()
-    return c
+	c := &ChanCounter{
+		hits:    make(chan string, 100),
+		snapReq: make(chan chan counterSnapshot),
+	}
+	go c.run()
+	return c
 }
 
 func (c *ChanCounter) run() {
-    counts := make(map[string]int)
-    events := 0
-    for {
-        select {
-        case page, ok := <-c.hits:
-            if !ok {
-                return
-            }
-            counts[page]++
-            events++
-        case reply := <-c.snapReq:
-            snap := make(map[string]int)
-            for k, v := range counts {
-                snap[k] = v
-            }
-            reply <- counterSnapshot{Counts: snap, Events: events}
-        }
-    }
+	counts := make(map[string]int)
+	events := 0
+	for {
+		select {
+		case page, ok := <-c.hits:
+			if !ok {
+				return
+			}
+			counts[page]++
+			events++
+		case reply := <-c.snapReq:
+			snap := make(map[string]int)
+			for k, v := range counts {
+				snap[k] = v
+			}
+			reply <- counterSnapshot{Counts: snap, Events: events}
+		}
+	}
 }
 
 func (c *ChanCounter) Record(page string) { c.hits <- page }
+
 func (c *ChanCounter) Snapshot() (map[string]int, int) {
-    reply := make(chan counterSnapshot, 1)
-    c.snapReq <- reply
-    s := <-reply
-    return s.Counts, s.Events
+	reply := make(chan counterSnapshot, 1)
+	c.snapReq <- reply
+	s := <-reply
+	return s.Counts, s.Events
 }
 
-func benchmark(name string, record func(string), snapshot func() (map[string]int, int)) time.Duration {
-    var wg sync.WaitGroup
-    pages := []string{"/home", "/about", "/api/users", "/api/orders", "/health"}
-    start := time.Now()
+// Close shuts down the channel counter's event loop.
+func (c *ChanCounter) Close() { close(c.hits) }
 
-    for i := 0; i < 10000; i++ {
-        wg.Add(1)
-        go func(n int) {
-            defer wg.Done()
-            record(pages[n%len(pages)])
-        }(i)
-    }
+// --- Benchmark infrastructure ---
 
-    wg.Wait()
-    elapsed := time.Since(start)
+// runBenchmark fires hitCount goroutines against the counter, then prints results.
+func runBenchmark(name string, counter HitCounter, pages []string, hitCount int) time.Duration {
+	var wg sync.WaitGroup
+	start := time.Now()
 
-    counts, events := snapshot()
-    fmt.Printf("=== %s ===\n", name)
-    fmt.Printf("  Total events: %d\n", events)
-    for _, page := range pages {
-        fmt.Printf("  %-15s %d\n", page, counts[page])
-    }
-    fmt.Printf("  Time: %v\n\n", elapsed)
-    return elapsed
+	for i := 0; i < hitCount; i++ {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			counter.Record(pages[n%len(pages)])
+		}(i)
+	}
+
+	wg.Wait()
+	elapsed := time.Since(start)
+
+	counts, events := counter.Snapshot()
+	fmt.Printf("=== %s ===\n", name)
+	fmt.Printf("  Total events: %d\n", events)
+	for _, page := range pages {
+		fmt.Printf("  %-15s %d\n", page, counts[page])
+	}
+	fmt.Printf("  Time: %v\n\n", elapsed)
+	return elapsed
+}
+
+// printComparison displays which approach was faster.
+func printComparison(mutexTime, chanTime time.Duration) {
+	fmt.Println("=== Comparison ===")
+	fmt.Printf("  Mutex:   %v\n", mutexTime)
+	fmt.Printf("  Channel: %v\n", chanTime)
+	if mutexTime < chanTime {
+		fmt.Println("  Mutex is faster (expected for simple state guarding)")
+	} else {
+		fmt.Println("  Channel is faster (unusual for this workload)")
+	}
 }
 
 func main() {
-    mc := &MutexCounter{counts: make(map[string]int)}
-    mutexTime := benchmark("Mutex", mc.Record, mc.Snapshot)
+	pages := []string{"/home", "/about", "/api/users", "/api/orders", "/health"}
 
-    cc := NewChanCounter()
-    chanTime := benchmark("Channel", cc.Record, cc.Snapshot)
-    close(cc.hits)
+	mc := NewMutexCounter()
+	mutexTime := runBenchmark("Mutex", mc, pages, benchmarkHitCount)
 
-    fmt.Println("=== Comparison ===")
-    fmt.Printf("  Mutex:   %v\n", mutexTime)
-    fmt.Printf("  Channel: %v\n", chanTime)
-    if mutexTime < chanTime {
-        fmt.Println("  Mutex is faster (expected for simple state guarding)")
-    } else {
-        fmt.Println("  Channel is faster (unusual for this workload)")
-    }
+	cc := NewChanCounter()
+	chanTime := runBenchmark("Channel", cc, pages, benchmarkHitCount)
+	cc.Close()
+
+	printComparison(mutexTime, chanTime)
 }
 ```
 
@@ -481,7 +596,7 @@ for {
 3. What is the real danger of using neither protection for shared state?
 
 ## What's Next
-You have completed the channels section. Continue to the select and multiplexing section to learn how `select` lets you wait on multiple channel operations simultaneously.
+Continue to [11-channel-error-propagation](../11-channel-error-propagation/11-channel-error-propagation.md) to learn how to propagate errors through channel pipelines without silently losing failures.
 
 ## Summary
 - Both channels and mutexes solve concurrency problems; they serve different purposes

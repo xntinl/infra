@@ -36,51 +36,69 @@ import (
 	"time"
 )
 
-func processStage(ctx context.Context, stage string, work time.Duration) error {
+const slaBudget = 500 * time.Millisecond
+
+type PipelineStage struct {
+	Name     string
+	Duration time.Duration
+}
+
+type SLAEnforcer struct {
+	stages []PipelineStage
+}
+
+func NewSLAEnforcer(stages []PipelineStage) *SLAEnforcer {
+	return &SLAEnforcer{stages: stages}
+}
+
+func (e *SLAEnforcer) processStage(ctx context.Context, stage PipelineStage) error {
 	deadline, _ := ctx.Deadline()
 	remaining := time.Until(deadline).Round(time.Millisecond)
 	fmt.Printf("[%-12s] starting (budget remaining: %v, needs: %v)\n",
-		stage, remaining, work)
+		stage.Name, remaining, stage.Duration)
 
-	if remaining < work {
-		fmt.Printf("[%-12s] WARNING: insufficient budget, may timeout\n", stage)
+	if remaining < stage.Duration {
+		fmt.Printf("[%-12s] WARNING: insufficient budget, may timeout\n", stage.Name)
 	}
 
 	select {
-	case <-time.After(work):
-		fmt.Printf("[%-12s] completed\n", stage)
+	case <-time.After(stage.Duration):
+		fmt.Printf("[%-12s] completed\n", stage.Name)
 		return nil
 	case <-ctx.Done():
-		return fmt.Errorf("%s: %w", stage, ctx.Err())
+		return fmt.Errorf("%s: %w", stage.Name, ctx.Err())
 	}
 }
 
+func (e *SLAEnforcer) Execute(ctx context.Context) error {
+	for _, stage := range e.stages {
+		if err := e.processStage(ctx, stage); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func main() {
-	// SLA: this request must complete within 500ms from now.
-	slaDeadline := time.Now().Add(500 * time.Millisecond)
+	slaDeadline := time.Now().Add(slaBudget)
 	ctx, cancel := context.WithDeadline(context.Background(), slaDeadline)
 	defer cancel()
 
 	fmt.Printf("SLA deadline: %v\n", slaDeadline.Format("15:04:05.000"))
 	fmt.Printf("Current time: %v\n\n", time.Now().Format("15:04:05.000"))
 
-	stages := []struct {
-		name string
-		work time.Duration
-	}{
-		{"auth", 80 * time.Millisecond},
-		{"validation", 60 * time.Millisecond},
-		{"processing", 120 * time.Millisecond},
-		{"persistence", 100 * time.Millisecond},
-	}
+	enforcer := NewSLAEnforcer([]PipelineStage{
+		{Name: "auth", Duration: 80 * time.Millisecond},
+		{Name: "validation", Duration: 60 * time.Millisecond},
+		{Name: "processing", Duration: 120 * time.Millisecond},
+		{Name: "persistence", Duration: 100 * time.Millisecond},
+	})
 
-	for _, s := range stages {
-		if err := processStage(ctx, s.name, s.work); err != nil {
-			fmt.Printf("\nSLA VIOLATED: %v\n", err)
-			fmt.Printf("Deadline was: %v\n", slaDeadline.Format("15:04:05.000"))
-			fmt.Printf("Failed at:    %v\n", time.Now().Format("15:04:05.000"))
-			return
-		}
+	if err := enforcer.Execute(ctx); err != nil {
+		fmt.Printf("\nSLA VIOLATED: %v\n", err)
+		fmt.Printf("Deadline was: %v\n", slaDeadline.Format("15:04:05.000"))
+		fmt.Printf("Failed at:    %v\n", time.Now().Format("15:04:05.000"))
+		return
 	}
 
 	fmt.Printf("\nSLA MET: all stages completed before %v\n",
@@ -124,46 +142,64 @@ import (
 	"time"
 )
 
-func processStage(ctx context.Context, stage string, work time.Duration) error {
+const tightSLABudget = 400 * time.Millisecond
+
+type PipelineStage struct {
+	Name     string
+	Duration time.Duration
+}
+
+type SLAEnforcer struct {
+	stages []PipelineStage
+}
+
+func NewSLAEnforcer(stages []PipelineStage) *SLAEnforcer {
+	return &SLAEnforcer{stages: stages}
+}
+
+func (e *SLAEnforcer) processStage(ctx context.Context, stage PipelineStage) error {
 	deadline, _ := ctx.Deadline()
 	remaining := time.Until(deadline).Round(time.Millisecond)
-	fmt.Printf("[%-12s] starting (remaining: %v)\n", stage, remaining)
+	fmt.Printf("[%-12s] starting (remaining: %v)\n", stage.Name, remaining)
 
 	select {
-	case <-time.After(work):
-		fmt.Printf("[%-12s] completed in %v\n", stage, work)
+	case <-time.After(stage.Duration):
+		fmt.Printf("[%-12s] completed in %v\n", stage.Name, stage.Duration)
 		return nil
 	case <-ctx.Done():
-		return fmt.Errorf("%s timed out after %v: %w", stage,
-			work-time.Until(deadline), ctx.Err())
+		return fmt.Errorf("%s timed out after %v: %w", stage.Name,
+			stage.Duration-time.Until(deadline), ctx.Err())
 	}
 }
 
+func (e *SLAEnforcer) Execute(ctx context.Context) error {
+	for _, stage := range e.stages {
+		if err := e.processStage(ctx, stage); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func main() {
-	// SLA: 400ms total budget.
-	slaDeadline := time.Now().Add(400 * time.Millisecond)
+	slaDeadline := time.Now().Add(tightSLABudget)
 	ctx, cancel := context.WithDeadline(context.Background(), slaDeadline)
 	defer cancel()
 
-	fmt.Println("SLA budget: 400ms")
+	fmt.Printf("SLA budget: %v\n", tightSLABudget)
 	fmt.Println("Stages: auth(80ms) + validate(60ms) + process(300ms) + persist(100ms) = 540ms")
 	fmt.Println("Expected: SLA violation during 'process' stage\n")
 
-	stages := []struct {
-		name string
-		work time.Duration
-	}{
-		{"auth", 80 * time.Millisecond},
-		{"validate", 60 * time.Millisecond},
-		{"process", 300 * time.Millisecond},  // This will exceed the remaining budget.
-		{"persist", 100 * time.Millisecond},
-	}
+	enforcer := NewSLAEnforcer([]PipelineStage{
+		{Name: "auth", Duration: 80 * time.Millisecond},
+		{Name: "validate", Duration: 60 * time.Millisecond},
+		{Name: "process", Duration: 300 * time.Millisecond},
+		{Name: "persist", Duration: 100 * time.Millisecond},
+	})
 
-	for _, s := range stages {
-		if err := processStage(ctx, s.name, s.work); err != nil {
-			fmt.Printf("\nSLA VIOLATED: %v\n", err)
-			return
-		}
+	if err := enforcer.Execute(ctx); err != nil {
+		fmt.Printf("\nSLA VIOLATED: %v\n", err)
+		return
 	}
 	fmt.Println("SLA MET")
 }
@@ -203,15 +239,15 @@ import (
 	"time"
 )
 
+const comparisonDuration = 2 * time.Second
+
 func main() {
 	now := time.Now()
-	duration := 2 * time.Second
 
-	// These two are functionally identical.
-	ctxTimeout, cancelTimeout := context.WithTimeout(context.Background(), duration)
+	ctxTimeout, cancelTimeout := context.WithTimeout(context.Background(), comparisonDuration)
 	defer cancelTimeout()
 
-	ctxDeadline, cancelDeadline := context.WithDeadline(context.Background(), now.Add(duration))
+	ctxDeadline, cancelDeadline := context.WithDeadline(context.Background(), now.Add(comparisonDuration))
 	defer cancelDeadline()
 
 	deadlineFromTimeout, _ := ctxTimeout.Deadline()
@@ -276,7 +312,15 @@ import (
 	"time"
 )
 
-func executeQuery(ctx context.Context, query string, estimatedDuration time.Duration) (string, error) {
+const queryBudget = 300 * time.Millisecond
+
+type QueryExecutor struct{}
+
+func NewQueryExecutor() *QueryExecutor {
+	return &QueryExecutor{}
+}
+
+func (qe *QueryExecutor) Execute(ctx context.Context, query string, estimatedDuration time.Duration) (string, error) {
 	deadline, hasDeadline := ctx.Deadline()
 	if hasDeadline {
 		remaining := time.Until(deadline)
@@ -298,19 +342,19 @@ func executeQuery(ctx context.Context, query string, estimatedDuration time.Dura
 }
 
 func main() {
-	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(300*time.Millisecond))
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(queryBudget))
 	defer cancel()
 
-	// Fast query: 100ms, enough budget.
-	result, err := executeQuery(ctx, "SELECT * FROM users LIMIT 10", 100*time.Millisecond)
+	executor := NewQueryExecutor()
+
+	result, err := executor.Execute(ctx, "SELECT * FROM users LIMIT 10", 100*time.Millisecond)
 	if err != nil {
 		fmt.Printf("[error] %v\n", err)
 	} else {
 		fmt.Printf("[ok]    %s\n", result)
 	}
 
-	// Slow query: 500ms, insufficient budget -- should fail fast.
-	result, err = executeQuery(ctx, "SELECT * FROM orders JOIN ...", 500*time.Millisecond)
+	result, err = executor.Execute(ctx, "SELECT * FROM orders JOIN ...", 500*time.Millisecond)
 	if err != nil {
 		fmt.Printf("[error] %v\n", err)
 	} else {
@@ -345,42 +389,56 @@ import (
 	"time"
 )
 
-func gateway(ctx context.Context) (string, error) {
-	logBudget(ctx, "gateway")
-	time.Sleep(50 * time.Millisecond)
-	return service(ctx)
+const (
+	requestBudget     = 500 * time.Millisecond
+	gatewayDelay      = 50 * time.Millisecond
+	serviceDelay      = 80 * time.Millisecond
+	repositoryDelay   = 100 * time.Millisecond
+)
+
+type RequestPipeline struct{}
+
+func NewRequestPipeline() *RequestPipeline {
+	return &RequestPipeline{}
 }
 
-func service(ctx context.Context) (string, error) {
-	logBudget(ctx, "service")
-	time.Sleep(80 * time.Millisecond)
-	return repository(ctx)
+func (p *RequestPipeline) logBudget(ctx context.Context, layer string) {
+	deadline, _ := ctx.Deadline()
+	remaining := time.Until(deadline).Round(time.Millisecond)
+	fmt.Printf("[%-12s] budget remaining: %v\n", layer, remaining)
 }
 
-func repository(ctx context.Context) (string, error) {
-	logBudget(ctx, "repository")
+func (p *RequestPipeline) Gateway(ctx context.Context) (string, error) {
+	p.logBudget(ctx, "gateway")
+	time.Sleep(gatewayDelay)
+	return p.Service(ctx)
+}
+
+func (p *RequestPipeline) Service(ctx context.Context) (string, error) {
+	p.logBudget(ctx, "service")
+	time.Sleep(serviceDelay)
+	return p.Repository(ctx)
+}
+
+func (p *RequestPipeline) Repository(ctx context.Context) (string, error) {
+	p.logBudget(ctx, "repository")
 	select {
-	case <-time.After(100 * time.Millisecond):
+	case <-time.After(repositoryDelay):
 		return "data", nil
 	case <-ctx.Done():
 		return "", fmt.Errorf("repository: %w", ctx.Err())
 	}
 }
 
-func logBudget(ctx context.Context, layer string) {
-	deadline, _ := ctx.Deadline()
-	remaining := time.Until(deadline).Round(time.Millisecond)
-	fmt.Printf("[%-12s] budget remaining: %v\n", layer, remaining)
-}
-
 func main() {
-	deadline := time.Now().Add(500 * time.Millisecond)
+	deadline := time.Now().Add(requestBudget)
 	ctx, cancel := context.WithDeadline(context.Background(), deadline)
 	defer cancel()
 
 	fmt.Printf("Absolute deadline: %v\n\n", deadline.Format("15:04:05.000"))
 
-	result, err := gateway(ctx)
+	pipeline := NewRequestPipeline()
+	result, err := pipeline.Gateway(ctx)
 	if err != nil {
 		fmt.Printf("\nFailed: %v\n", err)
 	} else {
@@ -439,28 +497,32 @@ import (
 	"time"
 )
 
-func runPipeline(label string, budget time.Duration) {
+type PipelineStage struct {
+	Name     string
+	Duration time.Duration
+}
+
+type RequestPipeline struct {
+	stages []PipelineStage
+}
+
+func NewRequestPipeline(stages []PipelineStage) *RequestPipeline {
+	return &RequestPipeline{stages: stages}
+}
+
+func (p *RequestPipeline) Run(label string, budget time.Duration) {
 	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(budget))
 	defer cancel()
 
-	stages := []struct {
-		name string
-		work time.Duration
-	}{
-		{"authenticate", 100 * time.Millisecond},
-		{"authorize", 100 * time.Millisecond},
-		{"execute", 100 * time.Millisecond},
-	}
-
-	for _, s := range stages {
+	for _, s := range p.stages {
 		deadline, _ := ctx.Deadline()
 		remaining := time.Until(deadline).Round(time.Millisecond)
-		fmt.Printf("  [%-13s] remaining: %v\n", s.name, remaining)
+		fmt.Printf("  [%-13s] remaining: %v\n", s.Name, remaining)
 
 		select {
-		case <-time.After(s.work):
+		case <-time.After(s.Duration):
 		case <-ctx.Done():
-			fmt.Printf("  %s: FAILED at %s: %v\n", label, s.name, ctx.Err())
+			fmt.Printf("  %s: FAILED at %s: %v\n", label, s.Name, ctx.Err())
 			return
 		}
 	}
@@ -468,11 +530,18 @@ func runPipeline(label string, budget time.Duration) {
 }
 
 func main() {
+	stages := []PipelineStage{
+		{Name: "authenticate", Duration: 100 * time.Millisecond},
+		{Name: "authorize", Duration: 100 * time.Millisecond},
+		{Name: "execute", Duration: 100 * time.Millisecond},
+	}
+	pipeline := NewRequestPipeline(stages)
+
 	fmt.Println("=== 350ms budget (300ms needed) ===")
-	runPipeline("generous", 350*time.Millisecond)
+	pipeline.Run("generous", 350*time.Millisecond)
 
 	fmt.Println("\n=== 220ms budget (300ms needed) ===")
-	runPipeline("tight", 220*time.Millisecond)
+	pipeline.Run("tight", 220*time.Millisecond)
 }
 ```
 

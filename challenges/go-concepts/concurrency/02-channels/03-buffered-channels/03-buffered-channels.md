@@ -32,25 +32,37 @@ package main
 
 import "fmt"
 
+const logBufferCapacity = 5
+
+// writeLogEntries sends each entry into the buffered channel.
+// None of these block because the buffer has capacity.
+func writeLogEntries(buffer chan<- string, entries []string) {
+	for _, entry := range entries {
+		buffer <- entry
+	}
+}
+
+// drainLogBuffer receives and prints all entries currently in the buffer.
+func drainLogBuffer(buffer chan string) {
+	for len(buffer) > 0 {
+		entry := <-buffer
+		fmt.Println("  Written:", entry)
+	}
+}
+
 func main() {
-    // Buffer can hold 5 log entries before any must be consumed.
-    logBuffer := make(chan string, 5)
+	logBuffer := make(chan string, logBufferCapacity)
 
-    // Application code writes logs. None of these block because
-    // the buffer has capacity. With an unbuffered channel, each
-    // would deadlock (no receiver goroutine).
-    logBuffer <- "[INFO] request received: GET /api/users"
-    logBuffer <- "[INFO] auth token validated"
-    logBuffer <- "[INFO] query executed: SELECT * FROM users"
-    logBuffer <- "[INFO] response sent: 200 OK (12ms)"
+	entries := []string{
+		"[INFO] request received: GET /api/users",
+		"[INFO] auth token validated",
+		"[INFO] query executed: SELECT * FROM users",
+		"[INFO] response sent: 200 OK (12ms)",
+	}
+	writeLogEntries(logBuffer, entries)
 
-    fmt.Printf("Log buffer: %d/%d entries\n", len(logBuffer), cap(logBuffer))
-
-    // Log writer drains entries in FIFO order.
-    for len(logBuffer) > 0 {
-        entry := <-logBuffer
-        fmt.Println("  Written:", entry)
-    }
+	fmt.Printf("Log buffer: %d/%d entries\n", len(logBuffer), cap(logBuffer))
+	drainLogBuffer(logBuffer)
 }
 ```
 
@@ -75,26 +87,31 @@ Fill the log buffer completely, then try to write one more entry. The sender blo
 package main
 
 import (
-    "fmt"
-    "time"
+	"fmt"
+	"time"
 )
 
+const backpressureBufferSize = 2
+const writerDrainDelay = 500 * time.Millisecond
+
+// slowLogWriter simulates a log writer that drains one entry after a delay.
+func slowLogWriter(buffer <-chan string, delay time.Duration) {
+	time.Sleep(delay)
+	entry := <-buffer
+	fmt.Printf("Writer drained: %s\n", entry)
+}
+
 func main() {
-    logBuffer := make(chan string, 2)
-    logBuffer <- "[ERROR] connection timeout"
-    logBuffer <- "[ERROR] retry failed"
-    fmt.Printf("Buffer state: %d/%d (full)\n", len(logBuffer), cap(logBuffer))
+	logBuffer := make(chan string, backpressureBufferSize)
+	logBuffer <- "[ERROR] connection timeout"
+	logBuffer <- "[ERROR] retry failed"
+	fmt.Printf("Buffer state: %d/%d (full)\n", len(logBuffer), cap(logBuffer))
 
-    // Simulate a slow log writer that drains one entry after 500ms.
-    go func() {
-        time.Sleep(500 * time.Millisecond)
-        entry := <-logBuffer
-        fmt.Printf("Writer drained: %s\n", entry)
-    }()
+	go slowLogWriter(logBuffer, writerDrainDelay)
 
-    fmt.Println("App: writing 3rd log entry (will block -- buffer full)...")
-    logBuffer <- "[WARN] circuit breaker tripped"
-    fmt.Println("App: 3rd entry written (writer made room)")
+	fmt.Println("App: writing 3rd log entry (will block -- buffer full)...")
+	logBuffer <- "[WARN] circuit breaker tripped"
+	fmt.Println("App: 3rd entry written (writer made room)")
 }
 ```
 
@@ -119,22 +136,29 @@ package main
 
 import "fmt"
 
+const monitorBufferCapacity = 5
+
+// printBufferState prints the current fill level and total capacity.
+func printBufferState(label string, buffer chan string) {
+	fmt.Printf("%-12s %d/%d\n", label, len(buffer), cap(buffer))
+}
+
 func main() {
-    logBuffer := make(chan string, 5)
-    fmt.Printf("Empty:       %d/%d\n", len(logBuffer), cap(logBuffer))
+	logBuffer := make(chan string, monitorBufferCapacity)
+	printBufferState("Empty:", logBuffer)
 
-    logBuffer <- "[INFO] startup"
-    logBuffer <- "[INFO] ready"
-    fmt.Printf("After 2:     %d/%d\n", len(logBuffer), cap(logBuffer))
+	logBuffer <- "[INFO] startup"
+	logBuffer <- "[INFO] ready"
+	printBufferState("After 2:", logBuffer)
 
-    <-logBuffer
-    fmt.Printf("After drain: %d/%d\n", len(logBuffer), cap(logBuffer))
+	<-logBuffer
+	printBufferState("After drain:", logBuffer)
 
-    logBuffer <- "[WARN] high latency"
-    logBuffer <- "[ERROR] timeout"
-    logBuffer <- "[ERROR] retry"
-    logBuffer <- "[INFO] recovered"
-    fmt.Printf("After burst: %d/%d\n", len(logBuffer), cap(logBuffer))
+	logBuffer <- "[WARN] high latency"
+	logBuffer <- "[ERROR] timeout"
+	logBuffer <- "[ERROR] retry"
+	logBuffer <- "[INFO] recovered"
+	printBufferState("After burst:", logBuffer)
 }
 ```
 
@@ -156,45 +180,62 @@ This comparison demonstrates why buffered channels matter for logging. With an u
 package main
 
 import (
-    "fmt"
-    "time"
+	"fmt"
+	"time"
 )
 
+const (
+	logEntryCount       = 5
+	simulatedDiskWrite  = 100 * time.Millisecond
+)
+
+// slowDiskWriter simulates a log writer that flushes each entry to disk.
+func slowDiskWriter(entries <-chan string, count int) {
+	for i := 0; i < count; i++ {
+		entry := <-entries
+		_ = entry
+		time.Sleep(simulatedDiskWrite)
+	}
+}
+
+// benchmarkUnbuffered measures how long the app is blocked when writing
+// to an unbuffered channel backed by a slow consumer.
+func benchmarkUnbuffered() {
+	fmt.Println("=== Unbuffered (app blocks each time) ===")
+	unbuffered := make(chan string)
+	start := time.Now()
+
+	go slowDiskWriter(unbuffered, logEntryCount)
+
+	for i := 1; i <= logEntryCount; i++ {
+		unbuffered <- fmt.Sprintf("[INFO] request %d", i)
+		fmt.Printf("  Logged request %d at +%v\n", i, time.Since(start).Round(time.Millisecond))
+	}
+	fmt.Printf("  Total: %v (app was blocked by disk)\n\n", time.Since(start).Round(time.Millisecond))
+}
+
+// benchmarkBuffered measures how quickly the app can write all entries
+// when the buffer has enough capacity for the entire burst.
+func benchmarkBuffered() {
+	fmt.Println("=== Buffered (cap=5, app writes instantly) ===")
+	buffered := make(chan string, logEntryCount)
+	start := time.Now()
+
+	for i := 1; i <= logEntryCount; i++ {
+		buffered <- fmt.Sprintf("[INFO] request %d", i)
+		fmt.Printf("  Logged request %d at +%v\n", i, time.Since(start).Round(time.Millisecond))
+	}
+	fmt.Printf("  Total: %v (app continued immediately)\n", time.Since(start).Round(time.Millisecond))
+
+	// Drain buffered entries (log writer catches up later).
+	for len(buffered) > 0 {
+		<-buffered
+	}
+}
+
 func main() {
-    // --- Unbuffered: app blocks on every log call ---
-    fmt.Println("=== Unbuffered (app blocks each time) ===")
-    unbuffered := make(chan string)
-    start := time.Now()
-
-    go func() {
-        for i := 0; i < 5; i++ {
-            entry := <-unbuffered
-            _ = entry
-            time.Sleep(100 * time.Millisecond) // simulate disk write
-        }
-    }()
-
-    for i := 1; i <= 5; i++ {
-        unbuffered <- fmt.Sprintf("[INFO] request %d", i)
-        fmt.Printf("  Logged request %d at +%v\n", i, time.Since(start).Round(time.Millisecond))
-    }
-    fmt.Printf("  Total: %v (app was blocked by disk)\n\n", time.Since(start).Round(time.Millisecond))
-
-    // --- Buffered: app fires all logs and moves on ---
-    fmt.Println("=== Buffered (cap=5, app writes instantly) ===")
-    buffered := make(chan string, 5)
-    start = time.Now()
-
-    for i := 1; i <= 5; i++ {
-        buffered <- fmt.Sprintf("[INFO] request %d", i)
-        fmt.Printf("  Logged request %d at +%v\n", i, time.Since(start).Round(time.Millisecond))
-    }
-    fmt.Printf("  Total: %v (app continued immediately)\n", time.Since(start).Round(time.Millisecond))
-
-    // Drain buffered entries (log writer catches up later).
-    for len(buffered) > 0 {
-        <-buffered
-    }
+	benchmarkUnbuffered()
+	benchmarkBuffered()
 }
 ```
 
@@ -213,40 +254,70 @@ A realistic logging pipeline where the application generates log entries 3x fast
 package main
 
 import (
-    "fmt"
-    "time"
+	"fmt"
+	"time"
 )
 
+const (
+	pipelineBufferSize = 3
+	appProduceRate     = 50 * time.Millisecond
+	writerFlushRate    = 150 * time.Millisecond
+)
+
+// LogPipeline models a log pipeline with a buffered channel between
+// a fast producer and a slow writer.
+type LogPipeline struct {
+	buffer chan string
+	done   chan struct{}
+}
+
+// NewLogPipeline creates a pipeline with the given buffer capacity.
+func NewLogPipeline(capacity int) *LogPipeline {
+	return &LogPipeline{
+		buffer: make(chan string, capacity),
+		done:   make(chan struct{}),
+	}
+}
+
+// ProduceEntries generates log entries at the given rate and closes
+// the buffer when all entries have been queued.
+func (lp *LogPipeline) ProduceEntries(levels []string, rate time.Duration) {
+	for i, level := range levels {
+		entry := fmt.Sprintf("[%s] event-%d", level, i+1)
+		lp.buffer <- entry
+		fmt.Printf("App queued:  %-25s | buffer: %d/%d\n",
+			entry, len(lp.buffer), cap(lp.buffer))
+		time.Sleep(rate)
+	}
+	close(lp.buffer)
+}
+
+// FlushEntries drains the buffer at the given rate, simulating slow disk writes.
+func (lp *LogPipeline) FlushEntries(rate time.Duration) {
+	for entry := range lp.buffer {
+		fmt.Printf("Writer flush: %-25s | buffer: %d/%d\n",
+			entry, len(lp.buffer), cap(lp.buffer))
+		time.Sleep(rate)
+	}
+	lp.done <- struct{}{}
+}
+
+// Wait blocks until the writer finishes flushing all entries.
+func (lp *LogPipeline) Wait() {
+	<-lp.done
+}
+
 func main() {
-    logBuffer := make(chan string, 3)
-    done := make(chan struct{})
+	pipeline := NewLogPipeline(pipelineBufferSize)
 
-    // Application: generates logs every 50ms (fast).
-    go func() {
-        levels := []string{"INFO", "WARN", "ERROR", "DEBUG", "INFO",
-            "ERROR", "INFO", "WARN", "INFO", "INFO"}
-        for i, level := range levels {
-            entry := fmt.Sprintf("[%s] event-%d", level, i+1)
-            logBuffer <- entry
-            fmt.Printf("App queued:  %-25s | buffer: %d/%d\n",
-                entry, len(logBuffer), cap(logBuffer))
-            time.Sleep(50 * time.Millisecond)
-        }
-        close(logBuffer)
-    }()
+	levels := []string{"INFO", "WARN", "ERROR", "DEBUG", "INFO",
+		"ERROR", "INFO", "WARN", "INFO", "INFO"}
 
-    // Writer: flushes to "disk" every 150ms (slow -- 3x slower).
-    go func() {
-        for entry := range logBuffer {
-            fmt.Printf("Writer flush: %-25s | buffer: %d/%d\n",
-                entry, len(logBuffer), cap(logBuffer))
-            time.Sleep(150 * time.Millisecond)
-        }
-        done <- struct{}{}
-    }()
+	go pipeline.ProduceEntries(levels, appProduceRate)
+	go pipeline.FlushEntries(writerFlushRate)
 
-    <-done
-    fmt.Println("All log entries flushed")
+	pipeline.Wait()
+	fmt.Println("All log entries flushed")
 }
 ```
 

@@ -53,20 +53,48 @@ import (
 	"time"
 )
 
+const tickerInterval = 200 * time.Millisecond
+
+// APIRequest represents an incoming HTTP request.
+type APIRequest struct {
+	ID     int
+	Path   string
+	Client string
+}
+
+// BasicRateLimiter uses a ticker to enforce a steady request rate.
+type BasicRateLimiter struct {
+	ticker *time.Ticker
+}
+
+func NewBasicRateLimiter(interval time.Duration) *BasicRateLimiter {
+	return &BasicRateLimiter{ticker: time.NewTicker(interval)}
+}
+
+func (rl *BasicRateLimiter) Wait() {
+	<-rl.ticker.C
+}
+
+func (rl *BasicRateLimiter) Stop() {
+	rl.ticker.Stop()
+}
+
+func (rl *BasicRateLimiter) ServeRequests(requests []APIRequest) {
+	start := time.Now()
+	for _, req := range requests {
+		rl.Wait()
+		elapsed := time.Since(start).Round(time.Millisecond)
+		fmt.Printf("  [%6v] %d %s %s -> 200 OK\n",
+			elapsed, req.ID, req.Client, req.Path)
+	}
+	fmt.Printf("\n  %d requests served in %v (rate: 5/sec)\n", len(requests), time.Since(start))
+}
+
 func main() {
 	fmt.Println("=== Basic API Rate Limiter (5 req/sec) ===")
 	fmt.Println()
 
-	limiter := time.NewTicker(200 * time.Millisecond)
-	defer limiter.Stop()
-
-	type Request struct {
-		ID     int
-		Path   string
-		Client string
-	}
-
-	requests := []Request{
+	requests := []APIRequest{
 		{1, "/api/users/42", "mobile-app"},
 		{2, "/api/orders", "web-client"},
 		{3, "/api/products/search", "mobile-app"},
@@ -77,14 +105,10 @@ func main() {
 		{8, "/api/orders/export", "admin-panel"},
 	}
 
-	start := time.Now()
-	for _, req := range requests {
-		<-limiter.C
-		elapsed := time.Since(start).Round(time.Millisecond)
-		fmt.Printf("  [%6v] %d %s %s -> 200 OK\n",
-			elapsed, req.ID, req.Client, req.Path)
-	}
-	fmt.Printf("\n  8 requests served in %v (rate: 5/sec)\n", time.Since(start))
+	limiter := NewBasicRateLimiter(tickerInterval)
+	defer limiter.Stop()
+
+	limiter.ServeRequests(requests)
 }
 ```
 
@@ -118,36 +142,59 @@ import (
 	"time"
 )
 
+const (
+	tokenRefillRate     = 100 * time.Millisecond
+	burstCapacity       = 3
+	burstDemoRequestCount = 10
+)
+
+// TokenBucket implements rate limiting with burst support.
+type TokenBucket struct {
+	tokens chan struct{}
+	ticker *time.Ticker
+}
+
+func NewTokenBucket(rate time.Duration, burst int) *TokenBucket {
+	tb := &TokenBucket{
+		tokens: make(chan struct{}, burst),
+		ticker: time.NewTicker(rate),
+	}
+
+	for i := 0; i < burst; i++ {
+		tb.tokens <- struct{}{}
+	}
+
+	go tb.refill()
+	return tb
+}
+
+func (tb *TokenBucket) refill() {
+	for range tb.ticker.C {
+		select {
+		case tb.tokens <- struct{}{}:
+		default:
+		}
+	}
+}
+
+func (tb *TokenBucket) Wait() {
+	<-tb.tokens
+}
+
+func (tb *TokenBucket) Stop() {
+	tb.ticker.Stop()
+}
+
 func main() {
 	fmt.Println("=== Token Bucket with Burst (rate=10/sec, burst=3) ===")
 	fmt.Println()
 
-	const rate = 100 * time.Millisecond // 10 per second
-	const burstCapacity = 3
+	bucket := NewTokenBucket(tokenRefillRate, burstCapacity)
+	defer bucket.Stop()
 
-	tokens := make(chan struct{}, burstCapacity)
-
-	// Pre-fill with initial burst capacity
-	for i := 0; i < burstCapacity; i++ {
-		tokens <- struct{}{}
-	}
-
-	// Background refiller
-	ticker := time.NewTicker(rate)
-	defer ticker.Stop()
-	go func() {
-		for range ticker.C {
-			select {
-			case tokens <- struct{}{}: // add token if bucket not full
-			default: // bucket full, discard token
-			}
-		}
-	}()
-
-	// Simulate a burst of 10 API requests arriving at once
 	start := time.Now()
-	for req := 1; req <= 10; req++ {
-		<-tokens
+	for req := 1; req <= burstDemoRequestCount; req++ {
+		bucket.Wait()
 		elapsed := time.Since(start).Round(time.Millisecond)
 		fmt.Printf("  [%6v] request %d -> 200 OK\n", elapsed, req)
 	}
@@ -191,6 +238,13 @@ import (
 	"time"
 )
 
+const (
+	limiterRate  = 100 * time.Millisecond
+	limiterBurst = 3
+	refillPause  = 300 * time.Millisecond
+)
+
+// RateLimiter implements a token bucket with blocking and non-blocking acquire.
 type RateLimiter struct {
 	tokens chan struct{}
 	ticker *time.Ticker
@@ -208,21 +262,22 @@ func NewRateLimiter(rate time.Duration, burst int) *RateLimiter {
 		rl.tokens <- struct{}{}
 	}
 
-	go func() {
-		for {
-			select {
-			case <-rl.ticker.C:
-				select {
-				case rl.tokens <- struct{}{}:
-				default:
-				}
-			case <-rl.stop:
-				return
-			}
-		}
-	}()
-
+	go rl.refill()
 	return rl
+}
+
+func (rl *RateLimiter) refill() {
+	for {
+		select {
+		case <-rl.ticker.C:
+			select {
+			case rl.tokens <- struct{}{}:
+			default:
+			}
+		case <-rl.stop:
+			return
+		}
+	}
 }
 
 func (rl *RateLimiter) Wait() {
@@ -243,13 +298,9 @@ func (rl *RateLimiter) Stop() {
 	close(rl.stop)
 }
 
-func main() {
-	fmt.Println("=== Rate Limiter: Blocking vs Non-Blocking ===")
-	fmt.Println()
-
-	// Blocking mode: queue requests
+func demoBlocking() {
 	fmt.Println("--- Blocking (Wait) ---")
-	rl := NewRateLimiter(100*time.Millisecond, 3)
+	rl := NewRateLimiter(limiterRate, limiterBurst)
 	start := time.Now()
 	for i := 1; i <= 8; i++ {
 		rl.Wait()
@@ -257,13 +308,15 @@ func main() {
 			time.Since(start).Round(time.Millisecond), i)
 	}
 	rl.Stop()
+}
 
-	// Non-blocking mode: reject excess
+func demoNonBlocking() {
 	fmt.Println("\n--- Non-Blocking (TryAcquire) ---")
-	rl2 := NewRateLimiter(100*time.Millisecond, 3)
+	rl := NewRateLimiter(limiterRate, limiterBurst)
+
 	var accepted, rejected int
 	for i := 1; i <= 10; i++ {
-		if rl2.TryAcquire() {
+		if rl.TryAcquire() {
 			accepted++
 			fmt.Printf("  request %d -> 200 OK\n", i)
 		} else {
@@ -273,17 +326,24 @@ func main() {
 	}
 	fmt.Printf("\n  Accepted: %d, Rejected: %d\n", accepted, rejected)
 
-	// Wait for tokens to refill, then try again
-	time.Sleep(300 * time.Millisecond)
+	time.Sleep(refillPause)
 	fmt.Println("\n--- After 300ms idle (tokens refilled) ---")
 	for i := 11; i <= 14; i++ {
-		if rl2.TryAcquire() {
+		if rl.TryAcquire() {
 			fmt.Printf("  request %d -> 200 OK\n", i)
 		} else {
 			fmt.Printf("  request %d -> 429 Too Many Requests\n", i)
 		}
 	}
-	rl2.Stop()
+	rl.Stop()
+}
+
+func main() {
+	fmt.Println("=== Rate Limiter: Blocking vs Non-Blocking ===")
+	fmt.Println()
+
+	demoBlocking()
+	demoNonBlocking()
 }
 ```
 
@@ -333,6 +393,14 @@ import (
 	"time"
 )
 
+const (
+	serverRate         = 100 * time.Millisecond
+	serverBurst        = 3
+	concurrentHandlers = 20
+	handlerWorkTime    = 10 * time.Millisecond
+)
+
+// RateLimiter implements a token bucket shared across concurrent handlers.
 type RateLimiter struct {
 	tokens chan struct{}
 	ticker *time.Ticker
@@ -348,51 +416,70 @@ func NewRateLimiter(rate time.Duration, burst int) *RateLimiter {
 	for i := 0; i < burst; i++ {
 		rl.tokens <- struct{}{}
 	}
-	go func() {
-		for {
-			select {
-			case <-rl.ticker.C:
-				select {
-				case rl.tokens <- struct{}{}:
-				default:
-				}
-			case <-rl.stop:
-				return
-			}
-		}
-	}()
+	go rl.refill()
 	return rl
 }
 
-func (rl *RateLimiter) Wait()        { <-rl.tokens }
-func (rl *RateLimiter) Stop()        { rl.ticker.Stop(); close(rl.stop) }
+func (rl *RateLimiter) refill() {
+	for {
+		select {
+		case <-rl.ticker.C:
+			select {
+			case rl.tokens <- struct{}{}:
+			default:
+			}
+		case <-rl.stop:
+			return
+		}
+	}
+}
 
-func main() {
-	fmt.Println("=== Rate-Limited API Server (10 req/sec, burst=3, 20 handlers) ===")
-	fmt.Println()
+func (rl *RateLimiter) Wait() { <-rl.tokens }
+func (rl *RateLimiter) Stop() { rl.ticker.Stop(); close(rl.stop) }
 
-	rl := NewRateLimiter(100*time.Millisecond, 3)
-	defer rl.Stop()
+// RateLimitedServer simulates concurrent API handlers sharing a rate limiter.
+type RateLimitedServer struct {
+	limiter    *RateLimiter
+	numHandlers int
+}
+
+func NewRateLimitedServer(rate time.Duration, burst, handlers int) *RateLimitedServer {
+	return &RateLimitedServer{
+		limiter:    NewRateLimiter(rate, burst),
+		numHandlers: handlers,
+	}
+}
+
+func (s *RateLimitedServer) handleRequest(reqID int, start time.Time, wg *sync.WaitGroup) {
+	defer wg.Done()
+	s.limiter.Wait()
+	elapsed := time.Since(start).Round(time.Millisecond)
+	fmt.Printf("  [%6v] handler processed request %d\n", elapsed, reqID)
+	time.Sleep(handlerWorkTime)
+}
+
+func (s *RateLimitedServer) Serve() {
+	fmt.Printf("=== Rate-Limited API Server (10 req/sec, burst=%d, %d handlers) ===\n\n",
+		serverBurst, s.numHandlers)
 
 	start := time.Now()
 	var wg sync.WaitGroup
 
-	// Simulate 20 concurrent API requests
-	for i := 1; i <= 20; i++ {
+	for i := 1; i <= s.numHandlers; i++ {
 		wg.Add(1)
-		go func(reqID int) {
-			defer wg.Done()
-			rl.Wait() // all goroutines share the rate limiter
-			elapsed := time.Since(start).Round(time.Millisecond)
-			fmt.Printf("  [%6v] handler processed request %d\n", elapsed, reqID)
-			time.Sleep(10 * time.Millisecond) // simulate response generation
-		}(i)
+		go s.handleRequest(i, start, &wg)
 	}
 
 	wg.Wait()
 	total := time.Since(start)
-	fmt.Printf("\n  20 requests processed in %v\n", total)
-	fmt.Printf("  Effective rate: %.1f req/sec\n", 20.0/total.Seconds())
+	fmt.Printf("\n  %d requests processed in %v\n", s.numHandlers, total)
+	fmt.Printf("  Effective rate: %.1f req/sec\n", float64(s.numHandlers)/total.Seconds())
+	s.limiter.Stop()
+}
+
+func main() {
+	server := NewRateLimitedServer(serverRate, serverBurst, concurrentHandlers)
+	server.Serve()
 }
 ```
 

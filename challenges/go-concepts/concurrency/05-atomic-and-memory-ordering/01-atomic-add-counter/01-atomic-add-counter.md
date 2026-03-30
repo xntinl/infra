@@ -35,31 +35,52 @@ import (
 	"sync"
 )
 
-func main() {
-	var totalRequests int64
-	var totalBytes int64
-	var totalErrors int64
-	var wg sync.WaitGroup
+const (
+	handlerCount       = 100
+	requestsPerHandler = 1000
+	bytesPerRequest    = 256
+	errorEveryN        = 50
+)
 
-	for i := 0; i < 100; i++ {
+type UnsafeMetrics struct {
+	TotalRequests int64
+	TotalBytes    int64
+	TotalErrors   int64
+}
+
+func (m *UnsafeMetrics) RecordRequest(reqIndex int) {
+	m.TotalRequests++ // BUG: load-modify-store, three separate operations
+	m.TotalBytes += bytesPerRequest
+	if reqIndex%errorEveryN == 0 {
+		m.TotalErrors++
+	}
+}
+
+func (m *UnsafeMetrics) Report() {
+	fmt.Println("=== Request Metrics (BROKEN - no synchronization) ===")
+	fmt.Printf("Total requests: %d (expected %d)\n", m.TotalRequests, handlerCount*requestsPerHandler)
+	fmt.Printf("Total bytes:    %d (expected %d)\n", m.TotalBytes, handlerCount*requestsPerHandler*bytesPerRequest)
+	fmt.Printf("Total errors:   %d (expected %d)\n", m.TotalErrors, handlerCount*(requestsPerHandler/errorEveryN))
+}
+
+func simulateHandlers(metrics *UnsafeMetrics) {
+	var wg sync.WaitGroup
+	for i := 0; i < handlerCount; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for req := 0; req < 1000; req++ {
-				totalRequests++ // BUG: load-modify-store, three separate operations
-				totalBytes += 256
-				if req%50 == 0 {
-					totalErrors++
-				}
+			for req := 0; req < requestsPerHandler; req++ {
+				metrics.RecordRequest(req)
 			}
 		}()
 	}
-
 	wg.Wait()
-	fmt.Println("=== Request Metrics (BROKEN - no synchronization) ===")
-	fmt.Printf("Total requests: %d (expected 100000)\n", totalRequests)
-	fmt.Printf("Total bytes:    %d (expected 25600000)\n", totalBytes)
-	fmt.Printf("Total errors:   %d (expected 2000)\n", totalErrors)
+}
+
+func main() {
+	metrics := &UnsafeMetrics{}
+	simulateHandlers(metrics)
+	metrics.Report()
 }
 ```
 
@@ -86,31 +107,52 @@ import (
 	"sync/atomic"
 )
 
-func main() {
-	var totalRequests int64
-	var totalBytes int64
-	var totalErrors int64
-	var wg sync.WaitGroup
+const (
+	handlerCount       = 100
+	requestsPerHandler = 1000
+	bytesPerRequest    = 256
+	errorEveryN        = 50
+)
 
-	for i := 0; i < 100; i++ {
+type AtomicRawMetrics struct {
+	totalRequests int64
+	totalBytes    int64
+	totalErrors   int64
+}
+
+func (m *AtomicRawMetrics) RecordRequest(reqIndex int) {
+	atomic.AddInt64(&m.totalRequests, 1)
+	atomic.AddInt64(&m.totalBytes, bytesPerRequest)
+	if reqIndex%errorEveryN == 0 {
+		atomic.AddInt64(&m.totalErrors, 1)
+	}
+}
+
+func (m *AtomicRawMetrics) Report() {
+	fmt.Println("=== Request Metrics (FIXED - atomic operations) ===")
+	fmt.Printf("Total requests: %d (expected %d)\n", m.totalRequests, handlerCount*requestsPerHandler)
+	fmt.Printf("Total bytes:    %d (expected %d)\n", m.totalBytes, handlerCount*requestsPerHandler*bytesPerRequest)
+	fmt.Printf("Total errors:   %d (expected %d)\n", m.totalErrors, handlerCount*(requestsPerHandler/errorEveryN))
+}
+
+func simulateHandlers(metrics *AtomicRawMetrics) {
+	var wg sync.WaitGroup
+	for i := 0; i < handlerCount; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for req := 0; req < 1000; req++ {
-				atomic.AddInt64(&totalRequests, 1)
-				atomic.AddInt64(&totalBytes, 256)
-				if req%50 == 0 {
-					atomic.AddInt64(&totalErrors, 1)
-				}
+			for req := 0; req < requestsPerHandler; req++ {
+				metrics.RecordRequest(req)
 			}
 		}()
 	}
-
 	wg.Wait()
-	fmt.Println("=== Request Metrics (FIXED - atomic operations) ===")
-	fmt.Printf("Total requests: %d (expected 100000)\n", totalRequests)
-	fmt.Printf("Total bytes:    %d (expected 25600000)\n", totalBytes)
-	fmt.Printf("Total errors:   %d (expected 2000)\n", totalErrors)
+}
+
+func main() {
+	metrics := &AtomicRawMetrics{}
+	simulateHandlers(metrics)
+	metrics.Report()
 }
 ```
 
@@ -133,6 +175,15 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+)
+
+const (
+	concurrentHandlers  = 50
+	requestsPerHandler  = 200
+	minResponseBytes    = 64
+	maxResponseBytes    = 4096
+	errorRatePercent    = 5
+	reportingIntervalMs = 10
 )
 
 type RequestMetrics struct {
@@ -163,45 +214,52 @@ func (m *RequestMetrics) Snapshot() string {
 	)
 }
 
-func main() {
-	metrics := &RequestMetrics{}
-	var wg sync.WaitGroup
+func simulateHandler(metrics *RequestMetrics, wg *sync.WaitGroup) {
+	defer wg.Done()
 
-	for i := 0; i < 50; i++ {
-		wg.Add(1)
-		go func(handlerID int) {
-			defer wg.Done()
+	metrics.ConnOpen()
+	defer metrics.ConnClose()
 
-			metrics.ConnOpen()
-			defer metrics.ConnClose()
-
-			for req := 0; req < 200; req++ {
-				bytes := int64(64 + rand.Intn(4096))
-				isError := rand.Intn(100) < 5
-				metrics.RecordRequest(bytes, isError)
-				time.Sleep(time.Microsecond)
-			}
-		}(i)
+	for req := 0; req < requestsPerHandler; req++ {
+		bytes := int64(minResponseBytes + rand.Intn(maxResponseBytes))
+		isError := rand.Intn(100) < errorRatePercent
+		metrics.RecordRequest(bytes, isError)
+		time.Sleep(time.Microsecond)
 	}
+}
 
-	// Periodic reporting while handlers run
+func startLiveReporter(metrics *RequestMetrics) chan struct{} {
 	done := make(chan struct{})
 	go func() {
+		ticker := time.NewTicker(reportingIntervalMs * time.Millisecond)
+		defer ticker.Stop()
 		for {
 			select {
 			case <-done:
 				return
-			case <-time.After(10 * time.Millisecond):
+			case <-ticker.C:
 				fmt.Printf("[live] %s\n", metrics.Snapshot())
 			}
 		}
 	}()
+	return done
+}
 
+func main() {
+	metrics := &RequestMetrics{}
+	var wg sync.WaitGroup
+
+	for i := 0; i < concurrentHandlers; i++ {
+		wg.Add(1)
+		go simulateHandler(metrics, &wg)
+	}
+
+	done := startLiveReporter(metrics)
 	wg.Wait()
 	close(done)
 
 	fmt.Printf("\n[final] %s\n", metrics.Snapshot())
-	fmt.Printf("Expected total requests: 10000\n")
+	fmt.Printf("Expected total requests: %d\n", concurrentHandlers*requestsPerHandler)
 }
 ```
 
@@ -225,7 +283,22 @@ import (
 	"time"
 )
 
-func benchmarkAtomic(goroutines, iterations int) time.Duration {
+type ContentionScenario struct {
+	Name       string
+	Goroutines int
+	Iterations int
+}
+
+type BenchmarkResult struct {
+	AtomicDuration time.Duration
+	MutexDuration  time.Duration
+}
+
+func (r BenchmarkResult) Ratio() float64 {
+	return float64(r.MutexDuration) / float64(r.AtomicDuration)
+}
+
+func benchmarkAtomicCounter(goroutines, iterations int) time.Duration {
 	var counter atomic.Int64
 	var wg sync.WaitGroup
 
@@ -243,7 +316,7 @@ func benchmarkAtomic(goroutines, iterations int) time.Duration {
 	return time.Since(start)
 }
 
-func benchmarkMutex(goroutines, iterations int) time.Duration {
+func benchmarkMutexCounter(goroutines, iterations int) time.Duration {
 	var mu sync.Mutex
 	var counter int64
 	var wg sync.WaitGroup
@@ -264,12 +337,22 @@ func benchmarkMutex(goroutines, iterations int) time.Duration {
 	return time.Since(start)
 }
 
+func runScenario(s ContentionScenario) BenchmarkResult {
+	return BenchmarkResult{
+		AtomicDuration: benchmarkAtomicCounter(s.Goroutines, s.Iterations),
+		MutexDuration:  benchmarkMutexCounter(s.Goroutines, s.Iterations),
+	}
+}
+
+func printResult(s ContentionScenario, r BenchmarkResult) {
+	fmt.Printf("%s:\n", s.Name)
+	fmt.Printf("  Atomic: %v\n", r.AtomicDuration)
+	fmt.Printf("  Mutex:  %v\n", r.MutexDuration)
+	fmt.Printf("  Mutex/Atomic ratio: %.2fx\n\n", r.Ratio())
+}
+
 func main() {
-	scenarios := []struct {
-		name       string
-		goroutines int
-		iterations int
-	}{
+	scenarios := []ContentionScenario{
 		{"Low contention (4 goroutines)", 4, 100000},
 		{"Medium contention (64 goroutines)", 64, 10000},
 		{"High contention (1000 goroutines)", 1000, 1000},
@@ -277,15 +360,10 @@ func main() {
 
 	fmt.Println("=== Atomic vs Mutex Counter Benchmark ===")
 	fmt.Println()
-	for _, s := range scenarios {
-		atomicTime := benchmarkAtomic(s.goroutines, s.iterations)
-		mutexTime := benchmarkMutex(s.goroutines, s.iterations)
-		ratio := float64(mutexTime) / float64(atomicTime)
 
-		fmt.Printf("%s:\n", s.name)
-		fmt.Printf("  Atomic: %v\n", atomicTime)
-		fmt.Printf("  Mutex:  %v\n", mutexTime)
-		fmt.Printf("  Mutex/Atomic ratio: %.2fx\n\n", ratio)
+	for _, s := range scenarios {
+		result := runScenario(s)
+		printResult(s, result)
 	}
 }
 ```
@@ -318,16 +396,20 @@ import (
 	"sync/atomic"
 )
 
+const workerCount = 100
+
+func incrementWithAtomic(counter *int64, wg *sync.WaitGroup) {
+	defer wg.Done()
+	atomic.AddInt64(counter, 1)
+}
+
 func main() {
 	var requests int64
 	var wg sync.WaitGroup
 
-	for i := 0; i < 100; i++ {
+	for i := 0; i < workerCount; i++ {
 		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			atomic.AddInt64(&requests, 1)
-		}()
+		go incrementWithAtomic(&requests, &wg)
 	}
 
 	wg.Wait()
@@ -350,11 +432,17 @@ import (
 	"sync/atomic"
 )
 
+func printCopied(original atomic.Int64) {
+	// BUG: atomic.Int64 is passed by value, copying internal state
+	fmt.Println(original.Load())
+}
+
 func main() {
 	var a atomic.Int64
 	a.Store(42)
 	b := a // BUG: copies the internal state — undefined behavior
 	fmt.Println(b.Load())
+	printCopied(a)
 }
 ```
 
@@ -374,20 +462,24 @@ import (
 	"sync/atomic"
 )
 
+const workerCount = 100
+
+func incrementLocalCopy(counter int64, wg *sync.WaitGroup) {
+	defer wg.Done()
+	c := counter           // copies value into local variable
+	atomic.AddInt64(&c, 1) // increments LOCAL copy, not the shared counter
+}
+
 func main() {
 	var counter int64
 	var wg sync.WaitGroup
 
-	for i := 0; i < 100; i++ {
+	for i := 0; i < workerCount; i++ {
 		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			c := counter           // copies value into local variable
-			atomic.AddInt64(&c, 1) // increments LOCAL copy
-		}()
+		go incrementLocalCopy(counter, &wg)
 	}
 	wg.Wait()
-	fmt.Printf("Expected: 100, Got: %d\n", counter) // always 0
+	fmt.Printf("Expected: %d, Got: %d\n", workerCount, counter) // always 0
 }
 ```
 

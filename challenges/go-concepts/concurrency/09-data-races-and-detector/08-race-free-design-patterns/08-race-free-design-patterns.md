@@ -392,17 +392,20 @@ import (
 	"time"
 )
 
+const metricsBufferSize = 128
+
 // --- Immutability: deep copy requests ---
 
+// IncomingRequest represents an HTTP request entering the pipeline.
 type IncomingRequest struct {
-	ID       int
-	Method   string
-	Path     string
-	UserID   string
-	Headers  map[string]string
+	ID      int
+	Method  string
+	Path    string
+	UserID  string
+	Headers map[string]string
 }
 
-func copyRequest(r IncomingRequest) IncomingRequest {
+func (r IncomingRequest) DeepCopy() IncomingRequest {
 	headers := make(map[string]string, len(r.Headers))
 	for k, v := range r.Headers {
 		headers[k] = v
@@ -418,11 +421,13 @@ func copyRequest(r IncomingRequest) IncomingRequest {
 
 // --- Ownership Transfer: pipeline stages ---
 
+// ValidatedRequest is an IncomingRequest after authentication check.
 type ValidatedRequest struct {
 	IncomingRequest
 	IsAuthenticated bool
 }
 
+// ProcessedResult is the final outcome of processing a request.
 type ProcessedResult struct {
 	RequestID  int
 	StatusCode int
@@ -430,7 +435,10 @@ type ProcessedResult struct {
 	Duration   time.Duration
 }
 
-func validate(in <-chan IncomingRequest) <-chan ValidatedRequest {
+// RequestPipeline orchestrates validate -> process stages via channels.
+type RequestPipeline struct{}
+
+func (RequestPipeline) Validate(in <-chan IncomingRequest) <-chan ValidatedRequest {
 	out := make(chan ValidatedRequest)
 	go func() {
 		defer close(out)
@@ -445,7 +453,7 @@ func validate(in <-chan IncomingRequest) <-chan ValidatedRequest {
 	return out
 }
 
-func process(in <-chan ValidatedRequest) <-chan ProcessedResult {
+func (RequestPipeline) Process(in <-chan ValidatedRequest) <-chan ProcessedResult {
 	out := make(chan ProcessedResult)
 	go func() {
 		defer close(out)
@@ -475,57 +483,119 @@ type metricsCmd struct {
 	resultCh chan<- map[string]int
 }
 
-func metricsCollector() (record func(string), snapshot func() map[string]int, stop func()) {
-	cmdCh := make(chan metricsCmd, 128)
-	snapCh := make(chan metricsCmd, 1)
-	done := make(chan struct{})
+// ConfinedMetrics owns a counters map via a single goroutine.
+type ConfinedMetrics struct {
+	cmdCh  chan metricsCmd
+	snapCh chan metricsCmd
+	done   chan struct{}
+}
+
+func NewConfinedMetrics() *ConfinedMetrics {
+	m := &ConfinedMetrics{
+		cmdCh:  make(chan metricsCmd, metricsBufferSize),
+		snapCh: make(chan metricsCmd, 1),
+		done:   make(chan struct{}),
+	}
+	go m.run()
+	return m
+}
+
+func (m *ConfinedMetrics) run() {
+	defer close(m.done)
+	counters := make(map[string]int)
+	for {
+		select {
+		case cmd, ok := <-m.cmdCh:
+			if !ok {
+				select {
+				case s := <-m.snapCh:
+					s.resultCh <- m.copyCounters(counters)
+				default:
+				}
+				return
+			}
+			counters[cmd.key]++
+		case s := <-m.snapCh:
+			s.resultCh <- m.copyCounters(counters)
+		}
+	}
+}
+
+func (m *ConfinedMetrics) copyCounters(counters map[string]int) map[string]int {
+	snap := make(map[string]int, len(counters))
+	for k, v := range counters {
+		snap[k] = v
+	}
+	return snap
+}
+
+func (m *ConfinedMetrics) Record(key string) {
+	m.cmdCh <- metricsCmd{key: key}
+}
+
+func (m *ConfinedMetrics) Snapshot() map[string]int {
+	ch := make(chan map[string]int, 1)
+	m.snapCh <- metricsCmd{resultCh: ch}
+	return <-ch
+}
+
+func (m *ConfinedMetrics) Stop() {
+	close(m.cmdCh)
+	<-m.done
+}
+
+// --- Wiring ---
+
+func feedPipeline(requests []IncomingRequest) <-chan IncomingRequest {
+	inputCh := make(chan IncomingRequest, len(requests))
+	var wg sync.WaitGroup
+
+	for _, req := range requests {
+		wg.Add(1)
+		copied := req.DeepCopy()
+		go func(r IncomingRequest) {
+			defer wg.Done()
+			inputCh <- r
+		}(copied)
+	}
 
 	go func() {
-		defer close(done)
-		counters := make(map[string]int)
-		for {
-			select {
-			case cmd, ok := <-cmdCh:
-				if !ok {
-					// Drain any pending snapshot requests.
-					select {
-					case s := <-snapCh:
-						snap := make(map[string]int, len(counters))
-						for k, v := range counters {
-							snap[k] = v
-						}
-						s.resultCh <- snap
-					default:
-					}
-					return
-				}
-				counters[cmd.key]++
-			case s := <-snapCh:
-				snap := make(map[string]int, len(counters))
-				for k, v := range counters {
-					snap[k] = v
-				}
-				s.resultCh <- snap
-			}
-		}
+		wg.Wait()
+		close(inputCh)
 	}()
+	return inputCh
+}
 
-	record = func(key string) {
-		cmdCh <- metricsCmd{key: key}
+func consumeResults(results <-chan ProcessedResult, metrics *ConfinedMetrics) {
+	fmt.Println("Results:")
+	for result := range results {
+		status := "OK"
+		if result.StatusCode != 200 {
+			status = "FAIL"
+		}
+		fmt.Printf("  Request %d: [%d] %s (%v)\n",
+			result.RequestID, result.StatusCode, result.Body, result.Duration)
+		metrics.Record(fmt.Sprintf("status_%d", result.StatusCode))
+		metrics.Record(status)
 	}
+}
 
-	snapshot = func() map[string]int {
-		ch := make(chan map[string]int, 1)
-		snapCh <- metricsCmd{resultCh: ch}
-		return <-ch
+func printMetrics(metrics *ConfinedMetrics) {
+	fmt.Println()
+	fmt.Println("Metrics (confined to single goroutine):")
+	for k, v := range metrics.Snapshot() {
+		fmt.Printf("  %-15s %d\n", k, v)
 	}
+}
 
-	stop = func() {
-		close(cmdCh)
-		<-done
-	}
-
-	return
+func printDesignSummary() {
+	fmt.Println()
+	fmt.Println("--- Design Summary ---")
+	fmt.Println("  Immutability:       deep-copied requests before pipeline entry")
+	fmt.Println("  Ownership Transfer: validate -> process pipeline, each stage owns the data")
+	fmt.Println("  Confinement:        metrics map owned by a single collector goroutine")
+	fmt.Println()
+	fmt.Println("No mutexes. No atomics. Races are impossible by architecture.")
 }
 
 func main() {
@@ -533,7 +603,7 @@ func main() {
 	fmt.Println("Using all three race-free patterns together.")
 	fmt.Println()
 
-	recordMetric, getSnapshot, stopMetrics := metricsCollector()
+	metrics := NewConfinedMetrics()
 
 	requests := []IncomingRequest{
 		{ID: 1, Method: "GET", Path: "/api/users", UserID: "alice",
@@ -548,68 +618,20 @@ func main() {
 			Headers: map[string]string{}},
 	}
 
-	// Immutability: deep-copy each request before sending into the pipeline.
-	inputCh := make(chan IncomingRequest, len(requests))
-	var wg sync.WaitGroup
-	for _, req := range requests {
-		wg.Add(1)
-		copied := copyRequest(req) // immutability
-		go func(r IncomingRequest) {
-			defer wg.Done()
-			inputCh <- r // ownership transfer
-		}(copied)
-	}
-	go func() {
-		wg.Wait()
-		close(inputCh)
-	}()
+	pipeline := RequestPipeline{}
+	inputCh := feedPipeline(requests)
+	validated := pipeline.Validate(inputCh)
+	results := pipeline.Process(validated)
 
-	// Ownership Transfer: pipeline stages.
-	validated := validate(inputCh)
-	results := process(validated)
+	consumeResults(results, metrics)
+	printMetrics(metrics)
+	metrics.Stop()
 
-	// Consume results and record metrics (confinement).
-	fmt.Println("Results:")
-	for result := range results {
-		status := "OK"
-		if result.StatusCode != 200 {
-			status = "FAIL"
-		}
-		fmt.Printf("  Request %d: [%d] %s (%v)\n",
-			result.RequestID, result.StatusCode, result.Body, result.Duration)
-
-		key := fmt.Sprintf("status_%d", result.StatusCode)
-		recordMetric(key)
-		recordMetric(status)
-	}
+	printDesignSummary()
 
 	fmt.Println()
-	fmt.Println("Metrics (confined to single goroutine):")
-	snap := getSnapshot()
-	for k, v := range snap {
-		fmt.Printf("  %-15s %d\n", k, v)
-	}
-
-	stopMetrics()
-
-	fmt.Println()
-	fmt.Println("--- Design Summary ---")
-	fmt.Println("  Immutability:       deep-copied requests before pipeline entry")
-	fmt.Println("  Ownership Transfer: validate -> process pipeline, each stage owns the data")
-	fmt.Println("  Confinement:        metrics map owned by a single collector goroutine")
-	fmt.Println()
-	fmt.Println("No mutexes. No atomics. Races are impossible by architecture.")
-
-	// Verify original data is untouched.
-	fmt.Println()
-	original := requests[0].Headers
 	fmt.Printf("Original request headers untouched: %v\n",
-		!containsKey(original, "X-Processed"))
-}
-
-func containsKey(m map[string]string, key string) bool {
-	_, ok := m[key]
-	return ok
+		requests[0].Headers["Authorization"] == "Bearer abc")
 }
 ```
 

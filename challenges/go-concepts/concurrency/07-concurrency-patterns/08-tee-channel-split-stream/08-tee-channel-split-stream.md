@@ -51,9 +51,11 @@ package main
 import (
 	"fmt"
 	"sync"
-	"time"
 )
 
+const eventTypePurchase = "purchase"
+
+// Event represents a user action in the system.
 type Event struct {
 	ID     int
 	Type   string
@@ -61,7 +63,16 @@ type Event struct {
 	Amount float64
 }
 
-func tee(done <-chan struct{}, in <-chan Event) (<-chan Event, <-chan Event) {
+// EventTee duplicates a single event stream into two independent outputs.
+type EventTee struct {
+	done chan struct{}
+}
+
+func NewEventTee() *EventTee {
+	return &EventTee{done: make(chan struct{})}
+}
+
+func (et *EventTee) Split(in <-chan Event) (<-chan Event, <-chan Event) {
 	out1 := make(chan Event)
 	out2 := make(chan Event)
 
@@ -71,14 +82,13 @@ func tee(done <-chan struct{}, in <-chan Event) (<-chan Event, <-chan Event) {
 
 		for val := range in {
 			o1, o2 := out1, out2
-
 			for count := 0; count < 2; count++ {
 				select {
 				case o1 <- val:
 					o1 = nil
 				case o2 <- val:
 					o2 = nil
-				case <-done:
+				case <-et.done:
 					return
 				}
 			}
@@ -88,54 +98,61 @@ func tee(done <-chan struct{}, in <-chan Event) (<-chan Event, <-chan Event) {
 	return out1, out2
 }
 
-func main() {
-	done := make(chan struct{})
+func (et *EventTee) Close() {
+	close(et.done)
+}
 
-	events := make(chan Event)
+func emitEvents(events []Event) <-chan Event {
+	out := make(chan Event)
 	go func() {
-		defer close(events)
-		data := []Event{
-			{ID: 1, Type: "purchase", UserID: "alice", Amount: 99.99},
-			{ID: 2, Type: "signup", UserID: "bob", Amount: 0},
-			{ID: 3, Type: "purchase", UserID: "charlie", Amount: 249.50},
-			{ID: 4, Type: "click", UserID: "alice", Amount: 0},
-			{ID: 5, Type: "purchase", UserID: "diana", Amount: 15.00},
-		}
-		for _, e := range data {
-			events <- e
+		defer close(out)
+		for _, e := range events {
+			out <- e
 		}
 	}()
+	return out
+}
 
-	auditStream, analyticsStream := tee(done, events)
+func runAuditLogger(stream <-chan Event, wg *sync.WaitGroup) {
+	defer wg.Done()
+	for event := range stream {
+		fmt.Printf("  [AUDIT] event=%d type=%s user=%s\n",
+			event.ID, event.Type, event.UserID)
+	}
+}
+
+func runAnalyticsProcessor(stream <-chan Event, wg *sync.WaitGroup) {
+	defer wg.Done()
+	var totalRevenue float64
+	for event := range stream {
+		if event.Type == eventTypePurchase {
+			totalRevenue += event.Amount
+			fmt.Printf("  [ANALYTICS] purchase: $%.2f from %s (running total: $%.2f)\n",
+				event.Amount, event.UserID, totalRevenue)
+		}
+	}
+	fmt.Printf("  [ANALYTICS] session revenue: $%.2f\n", totalRevenue)
+}
+
+func main() {
+	events := emitEvents([]Event{
+		{ID: 1, Type: "purchase", UserID: "alice", Amount: 99.99},
+		{ID: 2, Type: "signup", UserID: "bob", Amount: 0},
+		{ID: 3, Type: "purchase", UserID: "charlie", Amount: 249.50},
+		{ID: 4, Type: "click", UserID: "alice", Amount: 0},
+		{ID: 5, Type: "purchase", UserID: "diana", Amount: 15.00},
+	})
+
+	tee := NewEventTee()
+	auditStream, analyticsStream := tee.Split(events)
 
 	var wg sync.WaitGroup
 	wg.Add(2)
-
-	// Audit logger: records every event
-	go func() {
-		defer wg.Done()
-		for event := range auditStream {
-			fmt.Printf("  [AUDIT] event=%d type=%s user=%s\n",
-				event.ID, event.Type, event.UserID)
-		}
-	}()
-
-	// Analytics processor: only cares about purchases
-	go func() {
-		defer wg.Done()
-		var totalRevenue float64
-		for event := range analyticsStream {
-			if event.Type == "purchase" {
-				totalRevenue += event.Amount
-				fmt.Printf("  [ANALYTICS] purchase: $%.2f from %s (running total: $%.2f)\n",
-					event.Amount, event.UserID, totalRevenue)
-			}
-		}
-		fmt.Printf("  [ANALYTICS] session revenue: $%.2f\n", totalRevenue)
-	}()
+	go runAuditLogger(auditStream, &wg)
+	go runAnalyticsProcessor(analyticsStream, &wg)
 
 	wg.Wait()
-	close(done)
+	tee.Close()
 	fmt.Println("\n  Both consumers received every event.")
 }
 ```
@@ -172,12 +189,24 @@ import (
 	"time"
 )
 
+const slowConsumerDelay = 200 * time.Millisecond
+
+// Event represents a user action in the system.
 type Event struct {
 	ID   int
 	Type string
 }
 
-func tee(done <-chan struct{}, in <-chan Event) (<-chan Event, <-chan Event) {
+// EventTee duplicates a single event stream into two independent outputs.
+type EventTee struct {
+	done chan struct{}
+}
+
+func NewEventTee() *EventTee {
+	return &EventTee{done: make(chan struct{})}
+}
+
+func (et *EventTee) Split(in <-chan Event) (<-chan Event, <-chan Event) {
 	out1 := make(chan Event)
 	out2 := make(chan Event)
 	go func() {
@@ -191,7 +220,7 @@ func tee(done <-chan struct{}, in <-chan Event) (<-chan Event, <-chan Event) {
 					o1 = nil
 				case o2 <- val:
 					o2 = nil
-				case <-done:
+				case <-et.done:
 					return
 				}
 			}
@@ -200,42 +229,51 @@ func tee(done <-chan struct{}, in <-chan Event) (<-chan Event, <-chan Event) {
 	return out1, out2
 }
 
-func main() {
-	done := make(chan struct{})
-	defer close(done)
+func (et *EventTee) Close() {
+	close(et.done)
+}
 
-	events := make(chan Event)
+func emitTimedEvents(count int) <-chan Event {
+	out := make(chan Event)
 	go func() {
-		defer close(events)
-		for i := 1; i <= 5; i++ {
+		defer close(out)
+		for i := 1; i <= count; i++ {
 			fmt.Printf("  [source] emitting event %d at %v\n",
 				i, time.Now().Format("04:05.000"))
-			events <- Event{ID: i, Type: "purchase"}
+			out <- Event{ID: i, Type: "purchase"}
 		}
 	}()
+	return out
+}
 
-	auditStream, analyticsStream := tee(done, events)
+func runFastConsumer(stream <-chan Event, wg *sync.WaitGroup) {
+	defer wg.Done()
+	for event := range stream {
+		fmt.Printf("  [analytics] got event %d at %v (fast)\n",
+			event.ID, time.Now().Format("04:05.000"))
+	}
+}
+
+func runSlowConsumer(stream <-chan Event, wg *sync.WaitGroup) {
+	defer wg.Done()
+	for event := range stream {
+		fmt.Printf("  [audit]     got event %d at %v (slow - writing to disk...)\n",
+			event.ID, time.Now().Format("04:05.000"))
+		time.Sleep(slowConsumerDelay)
+	}
+}
+
+func main() {
+	tee := NewEventTee()
+	defer tee.Close()
+
+	events := emitTimedEvents(5)
+	auditStream, analyticsStream := tee.Split(events)
+
 	var wg sync.WaitGroup
 	wg.Add(2)
-
-	// Fast consumer: real-time analytics
-	go func() {
-		defer wg.Done()
-		for event := range analyticsStream {
-			fmt.Printf("  [analytics] got event %d at %v (fast)\n",
-				event.ID, time.Now().Format("04:05.000"))
-		}
-	}()
-
-	// Slow consumer: audit logger with disk I/O simulation
-	go func() {
-		defer wg.Done()
-		for event := range auditStream {
-			fmt.Printf("  [audit]     got event %d at %v (slow - writing to disk...)\n",
-				event.ID, time.Now().Format("04:05.000"))
-			time.Sleep(200 * time.Millisecond)
-		}
-	}()
+	go runFastConsumer(analyticsStream, &wg)
+	go runSlowConsumer(auditStream, &wg)
 
 	wg.Wait()
 	fmt.Println("\n  Notice: the fast analytics consumer was slowed down by the slow audit consumer.")
@@ -262,15 +300,30 @@ import (
 	"time"
 )
 
+const (
+	slowAuditDelay  = 100 * time.Millisecond
+	auditBufferSize = 5
+	eventCount      = 8
+)
+
+// Event represents a user action in the system.
 type Event struct {
 	ID   int
 	Type string
 }
 
-func teeBuffered(done <-chan struct{}, in <-chan Event, buf1, buf2 int) (<-chan Event, <-chan Event) {
+// BufferedEventTee splits a stream with buffered intermediate channels.
+type BufferedEventTee struct {
+	done chan struct{}
+}
+
+func NewBufferedEventTee() *BufferedEventTee {
+	return &BufferedEventTee{done: make(chan struct{})}
+}
+
+func (bt *BufferedEventTee) splitRaw(in <-chan Event) (<-chan Event, <-chan Event) {
 	raw1 := make(chan Event)
 	raw2 := make(chan Event)
-
 	go func() {
 		defer close(raw1)
 		defer close(raw2)
@@ -282,50 +335,56 @@ func teeBuffered(done <-chan struct{}, in <-chan Event, buf1, buf2 int) (<-chan 
 					o1 = nil
 				case o2 <- val:
 					o2 = nil
-				case <-done:
+				case <-bt.done:
 					return
 				}
 			}
 		}
 	}()
+	return raw1, raw2
+}
 
-	// Wrap with buffered intermediate channels
-	buffered1 := make(chan Event, buf1)
-	buffered2 := make(chan Event, buf2)
-
+func bufferChannel(in <-chan Event, size int) <-chan Event {
+	buffered := make(chan Event, size)
 	go func() {
-		defer close(buffered1)
-		for v := range raw1 {
-			buffered1 <- v
+		defer close(buffered)
+		for v := range in {
+			buffered <- v
 		}
 	}()
+	return buffered
+}
+
+func (bt *BufferedEventTee) Split(in <-chan Event, buf1, buf2 int) (<-chan Event, <-chan Event) {
+	raw1, raw2 := bt.splitRaw(in)
+	return bufferChannel(raw1, buf1), bufferChannel(raw2, buf2)
+}
+
+func (bt *BufferedEventTee) Close() {
+	close(bt.done)
+}
+
+func emitEvents(count int) <-chan Event {
+	out := make(chan Event)
 	go func() {
-		defer close(buffered2)
-		for v := range raw2 {
-			buffered2 <- v
+		defer close(out)
+		for i := 1; i <= count; i++ {
+			out <- Event{ID: i, Type: "event"}
 		}
 	}()
-
-	return buffered1, buffered2
+	return out
 }
 
 func main() {
-	done := make(chan struct{})
-	defer close(done)
+	tee := NewBufferedEventTee()
+	defer tee.Close()
 
 	fmt.Println("=== Buffered Tee: Decoupling Slow Consumer ===")
 	fmt.Println()
 
-	events := make(chan Event)
-	go func() {
-		defer close(events)
-		for i := 1; i <= 8; i++ {
-			events <- Event{ID: i, Type: "event"}
-		}
-	}()
+	events := emitEvents(eventCount)
+	analyticsStream, auditStream := tee.Split(events, 0, auditBufferSize)
 
-	// Buffer of 5 for the slow consumer
-	analyticsStream, auditStream := teeBuffered(done, events, 0, 5)
 	var wg sync.WaitGroup
 	wg.Add(2)
 
@@ -343,7 +402,7 @@ func main() {
 		for event := range auditStream {
 			fmt.Printf("  [audit]     event %d at %v (writing...)\n",
 				event.ID, time.Now().Format("04:05.000"))
-			time.Sleep(100 * time.Millisecond)
+			time.Sleep(slowAuditDelay)
 		}
 		fmt.Println("  [audit]     done")
 	}()
@@ -389,6 +448,7 @@ import (
 	"time"
 )
 
+// Event represents a user action with financial data.
 type Event struct {
 	ID        int
 	Type      string
@@ -397,7 +457,16 @@ type Event struct {
 	Timestamp time.Time
 }
 
-func tee(done <-chan struct{}, in <-chan Event) (<-chan Event, <-chan Event) {
+// EventTee duplicates a single event stream into two independent outputs.
+type EventTee struct {
+	done chan struct{}
+}
+
+func NewEventTee() *EventTee {
+	return &EventTee{done: make(chan struct{})}
+}
+
+func (et *EventTee) Split(in <-chan Event) (<-chan Event, <-chan Event) {
 	out1 := make(chan Event)
 	out2 := make(chan Event)
 	go func() {
@@ -411,7 +480,7 @@ func tee(done <-chan struct{}, in <-chan Event) (<-chan Event, <-chan Event) {
 					o1 = nil
 				case o2 <- val:
 					o2 = nil
-				case <-done:
+				case <-et.done:
 					return
 				}
 			}
@@ -420,69 +489,80 @@ func tee(done <-chan struct{}, in <-chan Event) (<-chan Event, <-chan Event) {
 	return out1, out2
 }
 
-func main() {
-	done := make(chan struct{})
+func (et *EventTee) Close() {
+	close(et.done)
+}
 
-	events := make(chan Event)
+func buildSampleEvents() []Event {
+	now := time.Now()
+	return []Event{
+		{1, "purchase", "alice", 99.99, now},
+		{2, "signup", "bob", 0, now.Add(time.Second)},
+		{3, "purchase", "charlie", 249.50, now.Add(2 * time.Second)},
+		{4, "purchase", "alice", 35.00, now.Add(3 * time.Second)},
+		{5, "refund", "charlie", -249.50, now.Add(4 * time.Second)},
+		{6, "click", "diana", 0, now.Add(5 * time.Second)},
+		{7, "purchase", "bob", 150.00, now.Add(6 * time.Second)},
+		{8, "purchase", "diana", 75.25, now.Add(7 * time.Second)},
+	}
+}
+
+func emitEvents(data []Event) <-chan Event {
+	out := make(chan Event)
 	go func() {
-		defer close(events)
-		now := time.Now()
-		data := []Event{
-			{1, "purchase", "alice", 99.99, now},
-			{2, "signup", "bob", 0, now.Add(time.Second)},
-			{3, "purchase", "charlie", 249.50, now.Add(2 * time.Second)},
-			{4, "purchase", "alice", 35.00, now.Add(3 * time.Second)},
-			{5, "refund", "charlie", -249.50, now.Add(4 * time.Second)},
-			{6, "click", "diana", 0, now.Add(5 * time.Second)},
-			{7, "purchase", "bob", 150.00, now.Add(6 * time.Second)},
-			{8, "purchase", "diana", 75.25, now.Add(7 * time.Second)},
-		}
+		defer close(out)
 		for _, e := range data {
-			events <- e
+			out <- e
 		}
 	}()
+	return out
+}
 
-	auditStream, analyticsStream := tee(done, events)
+func runAuditLogger(stream <-chan Event, wg *sync.WaitGroup) {
+	defer wg.Done()
+	fmt.Println("=== Audit Log ===")
+	for e := range stream {
+		fmt.Printf("  [%s] id=%d type=%-10s user=%-8s amount=%8.2f\n",
+			e.Timestamp.Format("15:04:05"), e.ID, e.Type, e.UserID, e.Amount)
+	}
+}
+
+func runAnalyticsAggregator(stream <-chan Event, wg *sync.WaitGroup) {
+	defer wg.Done()
+	userSpend := make(map[string]float64)
+	typeCounts := make(map[string]int)
+
+	for e := range stream {
+		typeCounts[e.Type]++
+		if e.Amount != 0 {
+			userSpend[e.UserID] += e.Amount
+		}
+	}
+
+	fmt.Println("\n=== Real-Time Analytics Summary ===")
+	fmt.Println("  Event counts:")
+	for t, c := range typeCounts {
+		fmt.Printf("    %-10s: %d\n", t, c)
+	}
+	fmt.Println("  Revenue by user:")
+	for u, s := range userSpend {
+		fmt.Printf("    %-8s: $%.2f\n", u, s)
+	}
+}
+
+func main() {
+	tee := NewEventTee()
+	events := emitEvents(buildSampleEvents())
+
+	auditStream, analyticsStream := tee.Split(events)
 
 	var wg sync.WaitGroup
 	wg.Add(2)
-
-	// Audit: permanent record of every event
-	go func() {
-		defer wg.Done()
-		fmt.Println("=== Audit Log ===")
-		for e := range auditStream {
-			fmt.Printf("  [%s] id=%d type=%-10s user=%-8s amount=%8.2f\n",
-				e.Timestamp.Format("15:04:05"), e.ID, e.Type, e.UserID, e.Amount)
-		}
-	}()
-
-	// Analytics: real-time aggregation
-	go func() {
-		defer wg.Done()
-		userSpend := make(map[string]float64)
-		typeCounts := make(map[string]int)
-
-		for e := range analyticsStream {
-			typeCounts[e.Type]++
-			if e.Amount != 0 {
-				userSpend[e.UserID] += e.Amount
-			}
-		}
-
-		fmt.Println("\n=== Real-Time Analytics Summary ===")
-		fmt.Println("  Event counts:")
-		for t, c := range typeCounts {
-			fmt.Printf("    %-10s: %d\n", t, c)
-		}
-		fmt.Println("  Revenue by user:")
-		for u, s := range userSpend {
-			fmt.Printf("    %-8s: $%.2f\n", u, s)
-		}
-	}()
+	go runAuditLogger(auditStream, &wg)
+	go runAnalyticsAggregator(analyticsStream, &wg)
 
 	wg.Wait()
-	close(done)
+	tee.Close()
 }
 ```
 

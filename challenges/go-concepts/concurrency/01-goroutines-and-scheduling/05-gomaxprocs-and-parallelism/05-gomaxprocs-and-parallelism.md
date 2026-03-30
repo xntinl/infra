@@ -40,49 +40,65 @@ import (
 	"time"
 )
 
-func applyFilter(imageData []float64) float64 {
-	var result float64
-	for i := 1; i < len(imageData)-1; i++ {
-		// Simulate a convolution kernel (blur-like operation)
-		result += math.Sqrt(imageData[i-1]*imageData[i-1]+
-			imageData[i]*imageData[i]+
-			imageData[i+1]*imageData[i+1]) * 0.333
-	}
-	return result
+const (
+	numImages      = 4
+	pixelsPerImage = 2_000_000
+	kernelWeight   = 0.333
+)
+
+type ImageBatch struct {
+	Images [][]float64
 }
 
-func main() {
-	const numImages = 4
-	const imageSize = 2_000_000 // 2M "pixels" per image
-
-	images := make([][]float64, numImages)
+func NewImageBatch(count, size int) *ImageBatch {
+	images := make([][]float64, count)
 	for i := range images {
-		images[i] = make([]float64, imageSize)
+		images[i] = make([]float64, size)
 		for j := range images[i] {
 			images[i][j] = float64(j%256) / 255.0
 		}
 	}
+	return &ImageBatch{Images: images}
+}
+
+func applyConvolutionFilter(imageData []float64) float64 {
+	var result float64
+	for i := 1; i < len(imageData)-1; i++ {
+		result += math.Sqrt(imageData[i-1]*imageData[i-1]+
+			imageData[i]*imageData[i]+
+			imageData[i+1]*imageData[i+1]) * kernelWeight
+	}
+	return result
+}
+
+func (batch *ImageBatch) FilterAllConcurrently() time.Duration {
+	start := time.Now()
+	var wg sync.WaitGroup
+
+	for i := range batch.Images {
+		wg.Add(1)
+		go func(imgIdx int) {
+			defer wg.Done()
+			imgStart := time.Now()
+			checksum := applyConvolutionFilter(batch.Images[imgIdx])
+			fmt.Printf("  image %d filtered: %v (checksum: %.2f)\n",
+				imgIdx, time.Since(imgStart).Round(time.Millisecond), checksum)
+		}(i)
+	}
+
+	wg.Wait()
+	return time.Since(start)
+}
+
+func main() {
+	batch := NewImageBatch(numImages, pixelsPerImage)
 
 	for _, procs := range []int{1, runtime.NumCPU()} {
 		runtime.GOMAXPROCS(procs)
 		fmt.Printf("GOMAXPROCS=%d:\n", procs)
 
-		start := time.Now()
-		var wg sync.WaitGroup
-
-		for i := 0; i < numImages; i++ {
-			wg.Add(1)
-			go func(imgIdx int) {
-				defer wg.Done()
-				imgStart := time.Now()
-				result := applyFilter(images[imgIdx])
-				fmt.Printf("  image %d filtered: %v (checksum: %.2f)\n",
-					imgIdx, time.Since(imgStart).Round(time.Millisecond), result)
-			}(i)
-		}
-
-		wg.Wait()
-		fmt.Printf("  Total wall-clock: %v\n\n", time.Since(start).Round(time.Millisecond))
+		wallClock := batch.FilterAllConcurrently()
+		fmt.Printf("  Total wall-clock: %v\n\n", wallClock.Round(time.Millisecond))
 	}
 
 	runtime.GOMAXPROCS(runtime.NumCPU())
@@ -132,66 +148,83 @@ import (
 	"time"
 )
 
-func applyFilter(data []float64) float64 {
+const (
+	benchmarkImages    = 8
+	benchmarkPixels    = 1_500_000
+	convolutionWeight  = 0.333
+)
+
+type BenchmarkResult struct {
+	Procs    int
+	Elapsed  time.Duration
+	Speedup  float64
+}
+
+func applyConvolutionFilter(data []float64) float64 {
 	var result float64
 	for i := 1; i < len(data)-1; i++ {
 		result += math.Sqrt(data[i-1]*data[i-1]+
 			data[i]*data[i]+
-			data[i+1]*data[i+1]) * 0.333
+			data[i+1]*data[i+1]) * convolutionWeight
 	}
 	return result
 }
 
-func main() {
-	const numImages = 8
-	const imageSize = 1_500_000
-
-	images := make([][]float64, numImages)
+func generateTestImages(count, size int) [][]float64 {
+	images := make([][]float64, count)
 	for i := range images {
-		images[i] = make([]float64, imageSize)
+		images[i] = make([]float64, size)
 		for j := range images[i] {
 			images[i][j] = float64(j%256) / 255.0
 		}
 	}
+	return images
+}
 
-	// Warm up CPU caches
-	applyFilter(images[0])
+func benchmarkFilterAtProcs(images [][]float64, procs int) time.Duration {
+	runtime.GOMAXPROCS(procs)
+	start := time.Now()
+	var wg sync.WaitGroup
 
-	maxProcs := []int{1, 2, 4}
+	for i := range images {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			applyConvolutionFilter(images[idx])
+		}(i)
+	}
+
+	wg.Wait()
+	return time.Since(start)
+}
+
+func buildProcsRange() []int {
+	procsRange := []int{1, 2, 4}
 	if runtime.NumCPU() >= 8 {
-		maxProcs = append(maxProcs, 8)
+		procsRange = append(procsRange, 8)
 	}
 	if runtime.NumCPU() >= 16 {
-		maxProcs = append(maxProcs, 16)
+		procsRange = append(procsRange, 16)
 	}
+	return procsRange
+}
 
-	fmt.Printf("Filtering %d images (%d pixels each):\n\n", numImages, imageSize)
+func main() {
+	images := generateTestImages(benchmarkImages, benchmarkPixels)
+	applyConvolutionFilter(images[0]) // warm up CPU caches
+
+	procsRange := buildProcsRange()
+
+	fmt.Printf("Filtering %d images (%d pixels each):\n\n", benchmarkImages, benchmarkPixels)
 	fmt.Printf("%-12s %-15s %-10s\n", "GOMAXPROCS", "Wall-Clock", "Speedup")
 	fmt.Println(strings.Repeat("-", 40))
 
 	var baselineTime time.Duration
-
-	for _, procs := range maxProcs {
-		runtime.GOMAXPROCS(procs)
-
-		start := time.Now()
-		var wg sync.WaitGroup
-
-		for i := 0; i < numImages; i++ {
-			wg.Add(1)
-			go func(idx int) {
-				defer wg.Done()
-				applyFilter(images[idx])
-			}(i)
-		}
-
-		wg.Wait()
-		elapsed := time.Since(start)
-
+	for _, procs := range procsRange {
+		elapsed := benchmarkFilterAtProcs(images, procs)
 		if procs == 1 {
 			baselineTime = elapsed
 		}
-
 		speedup := float64(baselineTime) / float64(elapsed)
 		fmt.Printf("%-12d %-15v %-10.2fx\n", procs, elapsed.Round(time.Millisecond), speedup)
 	}
@@ -238,46 +271,41 @@ import (
 	"time"
 )
 
-func main() {
-	queryDB := func(queryName string) string {
-		time.Sleep(50 * time.Millisecond) // simulates database round-trip
-		return queryName + ": 42 rows"
+const dbRoundTripLatency = 50 * time.Millisecond
+
+func simulateDBQuery(queryName string) string {
+	time.Sleep(dbRoundTripLatency)
+	return queryName + ": 42 rows"
+}
+
+func benchmarkQueriesAtProcs(queries []string, procs int) time.Duration {
+	runtime.GOMAXPROCS(procs)
+	start := time.Now()
+	var wg sync.WaitGroup
+
+	for _, query := range queries {
+		wg.Add(1)
+		go func(q string) {
+			defer wg.Done()
+			simulateDBQuery(q)
+		}(query)
 	}
 
-	queries := []string{
-		"SELECT users", "SELECT orders", "SELECT products",
-		"SELECT reviews", "SELECT inventory", "SELECT payments",
-		"SELECT sessions", "SELECT audit_log", "SELECT configs",
-		"SELECT metrics", "SELECT alerts", "SELECT schedules",
-	}
+	wg.Wait()
+	return time.Since(start)
+}
 
-	fmt.Printf("Running %d database queries (50ms each, IO-bound):\n\n", len(queries))
+func printIOBoundBenchmark(queries []string) {
+	fmt.Printf("Running %d database queries (%v each, IO-bound):\n\n", len(queries), dbRoundTripLatency)
 	fmt.Printf("%-12s %-15s %-10s\n", "GOMAXPROCS", "Wall-Clock", "Speedup")
 	fmt.Println(strings.Repeat("-", 40))
 
 	var baselineTime time.Duration
-
 	for _, procs := range []int{1, 2, 4, runtime.NumCPU()} {
-		runtime.GOMAXPROCS(procs)
-
-		start := time.Now()
-		var wg sync.WaitGroup
-
-		for _, q := range queries {
-			wg.Add(1)
-			go func(query string) {
-				defer wg.Done()
-				queryDB(query)
-			}(q)
-		}
-
-		wg.Wait()
-		elapsed := time.Since(start)
-
+		elapsed := benchmarkQueriesAtProcs(queries, procs)
 		if procs == 1 {
 			baselineTime = elapsed
 		}
-
 		speedup := float64(baselineTime) / float64(elapsed)
 		fmt.Printf("%-12d %-15v %-10.2fx\n", procs, elapsed.Round(time.Millisecond), speedup)
 	}
@@ -287,6 +315,16 @@ func main() {
 	fmt.Println("IO-bound queries show ~1.0x speedup regardless of GOMAXPROCS.")
 	fmt.Println("Goroutines park while waiting for the database. Adding cores")
 	fmt.Println("does not make the database respond faster.")
+}
+
+func main() {
+	queries := []string{
+		"SELECT users", "SELECT orders", "SELECT products",
+		"SELECT reviews", "SELECT inventory", "SELECT payments",
+		"SELECT sessions", "SELECT audit_log", "SELECT configs",
+		"SELECT metrics", "SELECT alerts", "SELECT schedules",
+	}
+	printIOBoundBenchmark(queries)
 }
 ```
 
@@ -330,54 +368,67 @@ import (
 	"time"
 )
 
-func handleAPIRequest(id int) {
-	// CPU phase: validate and transform input (~40ms)
+const (
+	validationIterations   = 5_000_000
+	serializationIterations = 1_000_000
+	dbQueryLatency         = 20 * time.Millisecond
+	concurrentRequests     = 8
+)
+
+func validateInput() {
 	result := 0.0
-	for i := 0; i < 5_000_000; i++ {
+	for i := 0; i < validationIterations; i++ {
 		result += math.Sin(float64(i))
 	}
 	_ = result
+}
 
-	// IO phase: query database (~20ms)
-	time.Sleep(20 * time.Millisecond)
+func queryDatabase() {
+	time.Sleep(dbQueryLatency)
+}
 
-	// CPU phase: serialize response (~10ms -- lighter)
-	for i := 0; i < 1_000_000; i++ {
+func serializeResponse() {
+	result := 0.0
+	for i := 0; i < serializationIterations; i++ {
 		result += math.Cos(float64(i))
 	}
 	_ = result
 }
 
-func main() {
-	numRequests := 8
+func handleAPIRequest() {
+	validateInput()
+	queryDatabase()
+	serializeResponse()
+}
 
-	fmt.Printf("Processing %d API requests (CPU validation + DB query + CPU serialization):\n\n", numRequests)
+func benchmarkMixedWorkload(requestCount, procs int) time.Duration {
+	runtime.GOMAXPROCS(procs)
+	start := time.Now()
+	var wg sync.WaitGroup
+
+	for i := 0; i < requestCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			handleAPIRequest()
+		}()
+	}
+
+	wg.Wait()
+	return time.Since(start)
+}
+
+func main() {
+	fmt.Printf("Processing %d API requests (CPU validation + DB query + CPU serialization):\n\n", concurrentRequests)
 	fmt.Printf("%-12s %-15s %-10s\n", "GOMAXPROCS", "Wall-Clock", "Speedup")
 	fmt.Println(strings.Repeat("-", 40))
 
 	var baselineTime time.Duration
-
 	for _, procs := range []int{1, 2, 4, runtime.NumCPU()} {
-		runtime.GOMAXPROCS(procs)
-
-		start := time.Now()
-		var wg sync.WaitGroup
-
-		for i := 0; i < numRequests; i++ {
-			wg.Add(1)
-			go func(id int) {
-				defer wg.Done()
-				handleAPIRequest(id)
-			}(i)
-		}
-
-		wg.Wait()
-		elapsed := time.Since(start)
-
+		elapsed := benchmarkMixedWorkload(concurrentRequests, procs)
 		if procs == 1 {
 			baselineTime = elapsed
 		}
-
 		speedup := float64(baselineTime) / float64(elapsed)
 		fmt.Printf("%-12d %-15v %-10.2fx\n", procs, elapsed.Round(time.Millisecond), speedup)
 	}
@@ -416,8 +467,18 @@ import (
 	"time"
 )
 
+const excessiveProcs = 100
+
+func computeSqrtSum(iterations int) float64 {
+	result := 0.0
+	for j := 0; j < iterations; j++ {
+		result += math.Sqrt(float64(j))
+	}
+	return result
+}
+
 func main() {
-	runtime.GOMAXPROCS(100) // on a 4-core machine
+	runtime.GOMAXPROCS(excessiveProcs) // on a 4-core machine: no benefit
 
 	start := time.Now()
 	var wg sync.WaitGroup
@@ -425,11 +486,7 @@ func main() {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			result := 0.0
-			for j := 0; j < 50_000_000; j++ {
-				result += math.Sqrt(float64(j))
-			}
-			_ = result
+			_ = computeSqrtSum(50_000_000)
 		}()
 	}
 	wg.Wait()

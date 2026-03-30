@@ -42,26 +42,17 @@ import (
 	"time"
 )
 
-func main() {
-	fmt.Println("=== Demonstration: Missing Happens-Before ===")
-	fmt.Println()
+func unsafeCompute(result *string, done *bool) {
+	*result = "computed value" // (1) write result
+	*done = true              // (2) write done flag
+}
 
-	// Scenario: worker writes result, main reads it.
-	// NO synchronization between them.
-	var result string
-	var done bool
-
-	go func() {
-		result = "computed value" // (1) write result
-		done = true              // (2) write done flag
-	}()
-
-	// Wait "long enough" -- but time.Sleep is NOT synchronization!
-	time.Sleep(10 * time.Millisecond)
-
-	// These reads have NO happens-before relationship with the writes above.
-	// The Go memory model says behavior is UNDEFINED.
+func unsafeRead(result string, done bool) {
+	// These reads have NO happens-before relationship with the writes.
 	fmt.Printf("done=%v result=%q\n", done, result)
+}
+
+func explainRisk() {
 	fmt.Println()
 	fmt.Println("This APPEARS to work on x86 because x86 has strong memory ordering.")
 	fmt.Println("On ARM (where your Kubernetes pods likely run), you might see:")
@@ -70,8 +61,24 @@ func main() {
 	fmt.Println()
 	fmt.Println("Run with -race to see the data race:")
 	fmt.Println("  go run -race main.go")
+}
 
-	_ = runtime.GOARCH // suppress unused import
+func main() {
+	fmt.Println("=== Demonstration: Missing Happens-Before ===")
+	fmt.Println()
+
+	var result string
+	var done bool
+
+	go unsafeCompute(&result, &done)
+
+	// time.Sleep is NOT synchronization!
+	time.Sleep(10 * time.Millisecond)
+
+	unsafeRead(result, done)
+	explainRisk()
+
+	_ = runtime.GOARCH
 }
 ```
 
@@ -90,40 +97,51 @@ package main
 
 import "fmt"
 
-func main() {
+const workerCount = 5
+
+func computeWithSignal(result *string, done chan struct{}) {
+	*result = "computed value"
+	close(done) // happens-before receive
+}
+
+func demonstrateSingleProducer() {
 	fmt.Println("=== Fix 1: Channel Synchronization ===")
 	fmt.Println()
 
 	var result string
 	done := make(chan struct{})
 
-	go func() {
-		result = "computed value" // (1) write result
-		close(done)              // (2) close channel -- happens-before receive
-	}()
+	go computeWithSignal(&result, done)
 
-	<-done // (3) receive -- happens-after (2), so (1) is visible here
+	<-done // happens-after close, so result write is visible
 	fmt.Printf("result=%q (guaranteed correct)\n", result)
 	fmt.Println()
+}
 
-	// Demonstrate with multiple producers
+func runWorker(id int, results []string, ch chan int) {
+	results[id] = fmt.Sprintf("worker-%d-done", id)
+	ch <- id // signal completion -- happens-before receive
+}
+
+func demonstrateMultipleProducers() {
 	fmt.Println("=== Multiple Workers, Single Collector ===")
-	results := make([]string, 5)
-	ch := make(chan int, 5)
 
-	for i := 0; i < 5; i++ {
-		go func(id int) {
-			// Write to own slot (no contention between goroutines)
-			results[id] = fmt.Sprintf("worker-%d-done", id)
-			ch <- id // signal completion -- happens-before receive
-		}(i)
+	results := make([]string, workerCount)
+	ch := make(chan int, workerCount)
+
+	for i := 0; i < workerCount; i++ {
+		go runWorker(i, results, ch)
 	}
 
-	// Collect all results
-	for i := 0; i < 5; i++ {
-		id := <-ch // happens-after the corresponding send
+	for i := 0; i < workerCount; i++ {
+		id := <-ch
 		fmt.Printf("  Received from worker %d: %s\n", id, results[id])
 	}
+}
+
+func main() {
+	demonstrateSingleProducer()
+	demonstrateMultipleProducers()
 }
 ```
 
@@ -147,14 +165,14 @@ import (
 	"sync/atomic"
 )
 
-func main() {
+const waitGroupWorkers = 3
+
+func demonstrateMutexVisibility() {
 	fmt.Println("=== Fix 2: Mutex ===")
 	fmt.Println()
 
-	// Mutex Unlock happens-before the next Lock on the same mutex
 	var mu sync.Mutex
 	var sharedState string
-
 	writerDone := make(chan struct{})
 
 	go func() {
@@ -164,17 +182,18 @@ func main() {
 		close(writerDone)
 	}()
 
-	<-writerDone // ensure writer runs first (channel sync)
+	<-writerDone
 
 	mu.Lock()
 	fmt.Printf("  Mutex read: %q (guaranteed visible)\n", sharedState)
 	mu.Unlock()
+}
 
+func demonstrateAtomicVisibility() {
 	fmt.Println()
 	fmt.Println("=== Fix 3: Atomic ===")
 	fmt.Println()
 
-	// Since Go 1.19: atomic store happens-before atomic load that observes the value
 	var data string
 	var ready atomic.Bool
 	var wg sync.WaitGroup
@@ -182,40 +201,48 @@ func main() {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		data = "prepared by writer"  // ordinary write
-		ready.Store(true)            // atomic store -- happens-before...
+		data = "prepared by writer"
+		ready.Store(true) // atomic store -- happens-before load
 	}()
 
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		for !ready.Load() { // ...atomic load that observes true
+		for !ready.Load() {
 			runtime.Gosched()
 		}
-		// data write happened-before ready.Store, which happened-before ready.Load
 		fmt.Printf("  Atomic read: %q (guaranteed visible)\n", data)
 	}()
 
 	wg.Wait()
+}
 
+func demonstrateWaitGroupVisibility() {
 	fmt.Println()
 	fmt.Println("=== WaitGroup Done happens-before Wait returns ===")
 	fmt.Println()
 
-	results := make([]string, 3)
+	var wg sync.WaitGroup
+	results := make([]string, waitGroupWorkers)
 
-	for i := 0; i < 3; i++ {
+	for i := 0; i < waitGroupWorkers; i++ {
 		wg.Add(1)
 		go func(id int) {
-			defer wg.Done() // Done happens-before Wait returns
+			defer wg.Done()
 			results[id] = fmt.Sprintf("result-%d", id)
 		}(i)
 	}
 
-	wg.Wait() // all Done calls happened-before this returns
+	wg.Wait()
 	for i, r := range results {
 		fmt.Printf("  WaitGroup result[%d]: %s\n", i, r)
 	}
+}
+
+func main() {
+	demonstrateMutexVisibility()
+	demonstrateAtomicVisibility()
+	demonstrateWaitGroupVisibility()
 }
 ```
 
@@ -238,11 +265,10 @@ import (
 	"time"
 )
 
-func main() {
+func demonstrateSleepIsNotSync() {
 	fmt.Println("=== DANGEROUS: time.Sleep is NOT Synchronization ===")
 	fmt.Println()
 
-	// This is a data race even though it "works" every time on your machine
 	var config string
 	go func() {
 		config = "database_url=postgres://prod:5432/myapp"
@@ -252,25 +278,28 @@ func main() {
 	fmt.Println("  ^ This is a DATA RACE. go run -race will flag it.")
 	fmt.Println("  time.Sleep provides NO happens-before guarantee.")
 	fmt.Println()
+}
 
+func demonstrateChannelSync() {
 	fmt.Println("=== CORRECT: Use a channel instead ===")
 	fmt.Println()
 
-	var config2 string
+	var config string
 	done := make(chan struct{})
 	go func() {
-		config2 = "database_url=postgres://prod:5432/myapp"
+		config = "database_url=postgres://prod:5432/myapp"
 		close(done)
 	}()
 	<-done
-	fmt.Printf("  config=%q\n", config2)
+	fmt.Printf("  config=%q\n", config)
 	fmt.Println("  ^ No race. Channel provides happens-before.")
 	fmt.Println()
+}
 
+func demonstrateObservationDanger() {
 	fmt.Println("=== DANGEROUS: Observing One Variable to Infer Another ===")
 	fmt.Println()
 
-	// Without synchronization, seeing x=1 does NOT mean y=2 is visible
 	var x, y int
 	var wg sync.WaitGroup
 
@@ -281,12 +310,18 @@ func main() {
 		y = 2
 	}()
 
-	wg.Wait() // WaitGroup provides the happens-before edge here
+	wg.Wait()
 	fmt.Printf("  x=%d y=%d (safe because WaitGroup synchronizes)\n", x, y)
 	fmt.Println()
 	fmt.Println("  WITHOUT the WaitGroup, reading x and y would be a data race")
 	fmt.Println("  even if you observed x=1, y might still be 0")
 	fmt.Println("  (CPU/compiler can reorder the writes)")
+}
+
+func main() {
+	demonstrateSleepIsNotSync()
+	demonstrateChannelSync()
+	demonstrateObservationDanger()
 }
 ```
 
@@ -312,48 +347,34 @@ import (
 	"strings"
 )
 
-func main() {
-	fmt.Println("=== Transitive Happens-Before Pipeline ===")
-	fmt.Println()
+type PipelineState struct {
+	UserID          string
+	ValidatedInput  string
+	ProcessedResult string
+}
 
-	// Simulate a request processing pipeline:
-	// Stage 1 (auth) -> Stage 2 (validate) -> Stage 3 (process) -> Stage 4 (respond)
+func authenticate(state *PipelineState, done chan struct{}) {
+	state.UserID = "user-42"
+	fmt.Println("  [stage 1] Authenticated: user-42")
+	close(done)
+}
 
-	var userID string
-	var validatedInput string
-	var processedResult string
+func validate(state *PipelineState, prev chan struct{}, done chan struct{}) {
+	<-prev
+	state.ValidatedInput = fmt.Sprintf("request from %s: valid", state.UserID)
+	fmt.Printf("  [stage 2] Validated: %s\n", state.ValidatedInput)
+	close(done)
+}
 
-	stage1Done := make(chan struct{})
-	stage2Done := make(chan struct{})
-	stage3Done := make(chan struct{})
+func process(state *PipelineState, prev chan struct{}, done chan struct{}) {
+	<-prev
+	state.ProcessedResult = fmt.Sprintf("PROCESSED(%s)", strings.ToUpper(state.ValidatedInput))
+	fmt.Printf("  [stage 3] Processed: %s\n", state.ProcessedResult)
+	close(done)
+}
 
-	// Stage 1: Authentication
-	go func() {
-		userID = "user-42"
-		fmt.Println("  [stage 1] Authenticated: user-42")
-		close(stage1Done) // happens-before stage2 reads userID
-	}()
-
-	// Stage 2: Validation (depends on stage 1)
-	go func() {
-		<-stage1Done // happens-after stage1
-		validatedInput = fmt.Sprintf("request from %s: valid", userID)
-		fmt.Printf("  [stage 2] Validated: %s\n", validatedInput)
-		close(stage2Done) // happens-before stage3
-	}()
-
-	// Stage 3: Processing (depends on stage 2)
-	go func() {
-		<-stage2Done // happens-after stage2
-		processedResult = fmt.Sprintf("PROCESSED(%s)", strings.ToUpper(validatedInput))
-		fmt.Printf("  [stage 3] Processed: %s\n", processedResult)
-		close(stage3Done) // happens-before main reads result
-	}()
-
-	// Stage 4: Main goroutine collects result
-	<-stage3Done // happens-after stage3
-
-	fmt.Printf("  [stage 4] Final result: %s\n", processedResult)
+func printHappensBeforeChain(finalResult string) {
+	fmt.Printf("  [stage 4] Final result: %s\n", finalResult)
 	fmt.Println()
 	fmt.Println("Happens-before chain:")
 	fmt.Println("  userID write -> close(stage1Done) -> <-stage1Done ->")
@@ -362,6 +383,23 @@ func main() {
 	fmt.Println("  final read")
 	fmt.Println()
 	fmt.Println("Transitivity guarantees the final reader sees ALL previous writes.")
+}
+
+func main() {
+	fmt.Println("=== Transitive Happens-Before Pipeline ===")
+	fmt.Println()
+
+	state := &PipelineState{}
+	stage1Done := make(chan struct{})
+	stage2Done := make(chan struct{})
+	stage3Done := make(chan struct{})
+
+	go authenticate(state, stage1Done)
+	go validate(state, stage1Done, stage2Done)
+	go process(state, stage2Done, stage3Done)
+
+	<-stage3Done
+	printHappensBeforeChain(state.ProcessedResult)
 }
 ```
 
@@ -392,9 +430,13 @@ import (
 	"time"
 )
 
+func writeData(ptr *int) {
+	*ptr = 42
+}
+
 func main() {
 	var data int
-	go func() { data = 42 }()
+	go writeData(&data)
 	time.Sleep(time.Second) // NOT synchronization!
 	fmt.Println(data)       // data race -- undefined behavior
 }

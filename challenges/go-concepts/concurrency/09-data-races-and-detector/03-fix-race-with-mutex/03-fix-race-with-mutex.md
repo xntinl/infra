@@ -39,30 +39,54 @@ import (
 	"sync"
 )
 
-func safeHitCounter() int {
-	hitCount := 0
-	var mu sync.Mutex
+const (
+	handlerCount       = 100
+	requestsPerHandler = 100
+)
+
+// HitCounter protects a shared counter with a mutex.
+type HitCounter struct {
+	mu       sync.Mutex
+	hitCount int
+}
+
+func NewHitCounter() *HitCounter {
+	return &HitCounter{}
+}
+
+func (hc *HitCounter) Increment() {
+	hc.mu.Lock()
+	hc.hitCount++
+	hc.mu.Unlock()
+}
+
+func (hc *HitCounter) Total() int {
+	hc.mu.Lock()
+	defer hc.mu.Unlock()
+	return hc.hitCount
+}
+
+func simulateTraffic(counter *HitCounter, handlers, reqsPerHandler int) {
 	var wg sync.WaitGroup
 
-	for handler := 0; handler < 100; handler++ {
+	for handler := 0; handler < handlers; handler++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for req := 0; req < 100; req++ {
-				mu.Lock()
-				hitCount++
-				mu.Unlock()
+			for req := 0; req < reqsPerHandler; req++ {
+				counter.Increment()
 			}
 		}()
 	}
 
 	wg.Wait()
-	return hitCount
 }
 
 func main() {
-	result := safeHitCounter()
-	fmt.Printf("Hit count: %d (expected 10000)\n", result)
+	counter := NewHitCounter()
+	simulateTraffic(counter, handlerCount, requestsPerHandler)
+	expected := handlerCount * requestsPerHandler
+	fmt.Printf("Hit count: %d (expected %d)\n", counter.Total(), expected)
 }
 ```
 
@@ -250,61 +274,87 @@ import (
 	"time"
 )
 
-func racyCount() int {
-	counter := 0
-	var wg sync.WaitGroup
-	for i := 0; i < 100; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for j := 0; j < 10000; j++ {
-				counter++
-			}
-		}()
-	}
-	wg.Wait()
-	return counter
+const (
+	benchWorkers        = 100
+	benchIncrementsEach = 10000
+)
+
+// BenchmarkResult holds the outcome of a single counter benchmark.
+type BenchmarkResult struct {
+	Label   string
+	Value   int
+	Elapsed time.Duration
 }
 
-func mutexCount() int {
-	counter := 0
-	var mu sync.Mutex
-	var wg sync.WaitGroup
-	for i := 0; i < 100; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for j := 0; j < 10000; j++ {
-				mu.Lock()
-				counter++
-				mu.Unlock()
-			}
-		}()
-	}
-	wg.Wait()
-	return counter
+// RacyCounter increments without synchronization (produces wrong results).
+// BUG: read-modify-write on counter has no synchronization.
+type RacyCounter struct {
+	counter int
 }
 
-func main() {
-	fmt.Println("=== Contention Cost ===")
-
+func (rc *RacyCounter) RunBenchmark(workers, increments int) BenchmarkResult {
+	var wg sync.WaitGroup
 	start := time.Now()
-	racyResult := racyCount()
-	racyTime := time.Since(start)
 
-	start = time.Now()
-	mutexResult := mutexCount()
-	mutexTime := time.Since(start)
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < increments; j++ {
+				rc.counter++ // DATA RACE
+			}
+		}()
+	}
 
-	fmt.Printf("  Racy (WRONG):  %d in %v\n", racyResult, racyTime)
-	fmt.Printf("  Mutex (correct): %d in %v\n", mutexResult, mutexTime)
+	wg.Wait()
+	return BenchmarkResult{"Racy (WRONG)", rc.counter, time.Since(start)}
+}
+
+// MutexCounter increments with mutex protection (correct but slower).
+type MutexCounter struct {
+	mu      sync.Mutex
+	counter int
+}
+
+func (mc *MutexCounter) RunBenchmark(workers, increments int) BenchmarkResult {
+	var wg sync.WaitGroup
+	start := time.Now()
+
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < increments; j++ {
+				mc.mu.Lock()
+				mc.counter++
+				mc.mu.Unlock()
+			}
+		}()
+	}
+
+	wg.Wait()
+	return BenchmarkResult{"Mutex (correct)", mc.counter, time.Since(start)}
+}
+
+func printContentionAnalysis(racy, mutex BenchmarkResult) {
+	fmt.Printf("  %-18s %d in %v\n", racy.Label+":", racy.Value, racy.Elapsed)
+	fmt.Printf("  %-18s %d in %v\n", mutex.Label+":", mutex.Value, mutex.Elapsed)
 	fmt.Printf("  Slowdown: %.1fx (the cost of correctness)\n",
-		float64(mutexTime)/float64(racyTime))
+		float64(mutex.Elapsed)/float64(racy.Elapsed))
 	fmt.Println()
 	fmt.Println("In real code, contention is usually lower because:")
 	fmt.Println("  - Handlers do useful work between lock acquisitions")
 	fmt.Println("  - Lock scope is narrow (microseconds, not the entire request)")
 	fmt.Println("  - Different handlers lock different resources")
+}
+
+func main() {
+	fmt.Println("=== Contention Cost ===")
+
+	racyResult := (&RacyCounter{}).RunBenchmark(benchWorkers, benchIncrementsEach)
+	mutexResult := (&MutexCounter{}).RunBenchmark(benchWorkers, benchIncrementsEach)
+
+	printContentionAnalysis(racyResult, mutexResult)
 }
 ```
 

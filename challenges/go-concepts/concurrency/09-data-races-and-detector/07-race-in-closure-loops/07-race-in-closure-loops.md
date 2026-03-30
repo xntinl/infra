@@ -39,24 +39,39 @@ import (
 	"sync"
 )
 
+// Notification represents a message to be delivered to a user.
 type Notification struct {
 	UserID  string
 	Message string
 }
 
-func buggyNotificationSender() {
-	users := []string{"alice", "bob", "charlie", "diana", "evan"}
+// NotificationSender dispatches notifications to a list of users concurrently.
+// BUG: the shared notification variable causes all goroutines to read the last value.
+type NotificationSender struct {
+	users []string
+}
+
+func NewNotificationSender(users []string) *NotificationSender {
+	return &NotificationSender{users: users}
+}
+
+func (ns *NotificationSender) buildNotification(userID string) Notification {
+	return Notification{
+		UserID:  userID,
+		Message: fmt.Sprintf("Hello %s, your order has shipped!", userID),
+	}
+}
+
+// SendAllBuggy demonstrates the closure capture bug.
+// DATA RACE: notification is written by the loop and read by goroutines concurrently.
+func (ns *NotificationSender) SendAllBuggy() {
 	var wg sync.WaitGroup
 
 	fmt.Println("--- Buggy Sender: all notifications go to the WRONG user ---")
 
-	// Declaring the notification outside the loop means all goroutines share it.
 	var notification Notification
-	for _, userID := range users {
-		notification = Notification{
-			UserID:  userID,
-			Message: fmt.Sprintf("Hello %s, your order has shipped!", userID),
-		}
+	for _, userID := range ns.users {
+		notification = ns.buildNotification(userID)
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -70,7 +85,10 @@ func buggyNotificationSender() {
 }
 
 func main() {
-	buggyNotificationSender()
+	sender := NewNotificationSender(
+		[]string{"alice", "bob", "charlie", "diana", "evan"},
+	)
+	sender.SendAllBuggy()
 }
 ```
 
@@ -107,23 +125,38 @@ import (
 	"sync"
 )
 
+// Notification represents a message to be delivered to a user.
 type Notification struct {
 	UserID  string
 	Message string
 }
 
-func fixedNotificationSender() {
-	users := []string{"alice", "bob", "charlie", "diana", "evan"}
+// NotificationSender dispatches notifications to a list of users concurrently.
+type NotificationSender struct {
+	users []string
+}
+
+func NewNotificationSender(users []string) *NotificationSender {
+	return &NotificationSender{users: users}
+}
+
+func (ns *NotificationSender) buildNotification(userID string) Notification {
+	return Notification{
+		UserID:  userID,
+		Message: fmt.Sprintf("Hello %s, your order has shipped!", userID),
+	}
+}
+
+// SendAllFixed passes the notification as a parameter so each goroutine
+// gets its own independent copy at the call site.
+func (ns *NotificationSender) SendAllFixed() {
 	var wg sync.WaitGroup
 
 	fmt.Println("--- Fixed Sender: each notification goes to the correct user ---")
 
 	var notification Notification
-	for _, userID := range users {
-		notification = Notification{
-			UserID:  userID,
-			Message: fmt.Sprintf("Hello %s, your order has shipped!", userID),
-		}
+	for _, userID := range ns.users {
+		notification = ns.buildNotification(userID)
 		wg.Add(1)
 		// notif is a PARAMETER: Go copies notification's value at the call site.
 		go func(notif Notification) {
@@ -136,7 +169,10 @@ func fixedNotificationSender() {
 }
 
 func main() {
-	fixedNotificationSender()
+	sender := NewNotificationSender(
+		[]string{"alice", "bob", "charlie", "diana", "evan"},
+	)
+	sender.SendAllFixed()
 }
 ```
 
@@ -166,25 +202,30 @@ import (
 	"sync"
 )
 
+// APIRequest represents a fan-out call to a downstream service.
 type APIRequest struct {
 	UserID   string
 	Endpoint string
 }
 
-func buggyAPICaller() {
-	requests := []APIRequest{
-		{UserID: "u-101", Endpoint: "/api/billing"},
-		{UserID: "u-202", Endpoint: "/api/shipping"},
-		{UserID: "u-303", Endpoint: "/api/notifications"},
-		{UserID: "u-404", Endpoint: "/api/analytics"},
-	}
+// RequestProcessor dispatches API requests in parallel.
+type RequestProcessor struct {
+	requests []APIRequest
+}
 
+func NewRequestProcessor(requests []APIRequest) *RequestProcessor {
+	return &RequestProcessor{requests: requests}
+}
+
+// FanOutBuggy demonstrates the closure capture bug: all goroutines see the last request.
+// BUG: req is declared outside the loop and shared by all goroutines.
+func (rp *RequestProcessor) FanOutBuggy() {
 	var wg sync.WaitGroup
 
 	fmt.Println("--- Buggy API Caller ---")
 
 	var req APIRequest
-	for _, r := range requests {
+	for _, r := range rp.requests {
 		req = r
 		wg.Add(1)
 		go func() {
@@ -195,11 +236,16 @@ func buggyAPICaller() {
 	}
 
 	wg.Wait()
+}
 
-	fmt.Println()
+// FanOutFixed passes each request as a parameter so each goroutine gets its own copy.
+func (rp *RequestProcessor) FanOutFixed() {
+	var wg sync.WaitGroup
+
 	fmt.Println("--- Fixed API Caller ---")
 
-	for _, r := range requests {
+	var req APIRequest
+	for _, r := range rp.requests {
 		req = r
 		wg.Add(1)
 		go func(request APIRequest) {
@@ -212,7 +258,16 @@ func buggyAPICaller() {
 }
 
 func main() {
-	buggyAPICaller()
+	processor := NewRequestProcessor([]APIRequest{
+		{UserID: "u-101", Endpoint: "/api/billing"},
+		{UserID: "u-202", Endpoint: "/api/shipping"},
+		{UserID: "u-303", Endpoint: "/api/notifications"},
+		{UserID: "u-404", Endpoint: "/api/analytics"},
+	})
+
+	processor.FanOutBuggy()
+	fmt.Println()
+	processor.FanOutFixed()
 }
 ```
 
@@ -241,19 +296,23 @@ import (
 	"sync"
 )
 
-type Notification struct {
-	UserID  string
-	Message string
+// LoopSemanticDemo illustrates the Go 1.22 per-iteration variable behavior
+// and its limitations with variables declared outside the loop.
+type LoopSemanticDemo struct {
+	users []string
 }
 
-func go122Safe() {
-	users := []string{"alice", "bob", "charlie", "diana", "evan"}
+func NewLoopSemanticDemo(users []string) *LoopSemanticDemo {
+	return &LoopSemanticDemo{users: users}
+}
+
+// RunPerIterationSafe shows that Go 1.22+ creates a new loop variable per iteration.
+func (d *LoopSemanticDemo) RunPerIterationSafe() {
 	var wg sync.WaitGroup
 
 	fmt.Println("--- Go 1.22+: loop variable is per-iteration ---")
 
-	// In Go 1.22+, userID is a new variable per iteration.
-	for _, userID := range users {
+	for _, userID := range d.users {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -262,12 +321,18 @@ func go122Safe() {
 	}
 
 	wg.Wait()
+}
 
-	fmt.Println()
+// RunOuterVariableBuggy shows that variables declared outside the loop
+// are still shared, even in Go 1.22+.
+// BUG: current is declared outside the loop and captured by reference.
+func (d *LoopSemanticDemo) RunOuterVariableBuggy() {
+	var wg sync.WaitGroup
+
 	fmt.Println("--- BUT: variables declared outside the loop are still shared ---")
 
 	var current string
-	for _, userID := range users {
+	for _, userID := range d.users {
 		current = userID // current is declared OUTSIDE the loop
 		wg.Add(1)
 		go func() {
@@ -277,14 +342,23 @@ func go122Safe() {
 	}
 
 	wg.Wait()
+}
 
-	fmt.Println()
+func printRecommendation() {
 	fmt.Println("Recommendation: always pass as parameter for clarity,")
 	fmt.Println("regardless of Go version. It makes the intent explicit.")
 }
 
 func main() {
-	go122Safe()
+	demo := NewLoopSemanticDemo(
+		[]string{"alice", "bob", "charlie", "diana", "evan"},
+	)
+
+	demo.RunPerIterationSafe()
+	fmt.Println()
+	demo.RunOuterVariableBuggy()
+	fmt.Println()
+	printRecommendation()
 }
 ```
 

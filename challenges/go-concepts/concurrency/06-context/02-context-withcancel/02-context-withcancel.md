@@ -37,7 +37,13 @@ import (
 	"time"
 )
 
-func searchDatabase(ctx context.Context, query string, results chan<- string) {
+type SearchAggregator struct{}
+
+func NewSearchAggregator() *SearchAggregator {
+	return &SearchAggregator{}
+}
+
+func (s *SearchAggregator) searchDatabase(ctx context.Context, query string, results chan<- string) {
 	delay := time.Duration(100+rand.Intn(200)) * time.Millisecond
 	select {
 	case <-time.After(delay):
@@ -47,7 +53,7 @@ func searchDatabase(ctx context.Context, query string, results chan<- string) {
 	}
 }
 
-func searchCache(ctx context.Context, query string, results chan<- string) {
+func (s *SearchAggregator) searchCache(ctx context.Context, query string, results chan<- string) {
 	delay := time.Duration(50+rand.Intn(100)) * time.Millisecond
 	select {
 	case <-time.After(delay):
@@ -57,7 +63,7 @@ func searchCache(ctx context.Context, query string, results chan<- string) {
 	}
 }
 
-func searchIndex(ctx context.Context, query string, results chan<- string) {
+func (s *SearchAggregator) searchIndex(ctx context.Context, query string, results chan<- string) {
 	delay := time.Duration(150+rand.Intn(300)) * time.Millisecond
 	select {
 	case <-time.After(delay):
@@ -67,32 +73,37 @@ func searchIndex(ctx context.Context, query string, results chan<- string) {
 	}
 }
 
+func (s *SearchAggregator) SearchAll(ctx context.Context, query string) <-chan string {
+	results := make(chan string, 3)
+	go s.searchDatabase(ctx, query, results)
+	go s.searchCache(ctx, query, results)
+	go s.searchIndex(ctx, query, results)
+	return results
+}
+
+func simulateUserCancel(cancel context.CancelFunc, after time.Duration) {
+	time.Sleep(after)
+	fmt.Println("\n[user] clicked cancel")
+	cancel()
+}
+
 func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	results := make(chan string, 3)
+	aggregator := NewSearchAggregator()
 
 	fmt.Println("Starting user search across 3 sources...")
-	go searchDatabase(ctx, "alice@example.com", results)
-	go searchCache(ctx, "alice@example.com", results)
-	go searchIndex(ctx, "alice@example.com", results)
+	results := aggregator.SearchAll(ctx, "alice@example.com")
 
-	// Simulate user clicking "cancel" after 120ms.
-	go func() {
-		time.Sleep(120 * time.Millisecond)
-		fmt.Println("\n[user] clicked cancel")
-		cancel()
-	}()
+	go simulateUserCancel(cancel, 120*time.Millisecond)
 
-	// Collect results until context is cancelled.
 	for {
 		select {
 		case result := <-results:
 			fmt.Printf("[result] %s\n", result)
 		case <-ctx.Done():
 			fmt.Printf("\nSearch ended: %v\n", ctx.Err())
-			// Give goroutines time to print their cancellation messages.
 			time.Sleep(50 * time.Millisecond)
 			return
 		}
@@ -131,42 +142,44 @@ import (
 	"time"
 )
 
-func leakySearch(query string, results chan<- string) {
-	// This goroutine has no context -- it cannot be cancelled.
+type LeakySearcher struct{}
+
+func (l *LeakySearcher) search(query string, results chan<- string) {
 	time.Sleep(500 * time.Millisecond)
 	select {
 	case results <- fmt.Sprintf("found: %s", query):
 	default:
-		// Nobody is listening, but the goroutine already ran for 500ms.
 	}
 }
 
-func searchWithoutContext(query string) string {
+func (l *LeakySearcher) SearchWithoutContext(query string) string {
 	results := make(chan string, 3)
 
-	// Launch 3 searches with no cancellation mechanism.
-	go leakySearch(query+"-db", results)
-	go leakySearch(query+"-cache", results)
-	go leakySearch(query+"-index", results)
+	go l.search(query+"-db", results)
+	go l.search(query+"-cache", results)
+	go l.search(query+"-index", results)
 
-	// Take only the first result and return.
-	// The other 2 goroutines are now LEAKED.
 	return <-results
 }
 
-func main() {
-	goroutinesBefore := runtime.NumGoroutine()
-	fmt.Printf("Goroutines before: %d\n", goroutinesBefore)
+func reportGoroutines(label string) int {
+	count := runtime.NumGoroutine()
+	fmt.Printf("%s: %d\n", label, count)
+	return count
+}
 
-	// Simulate 5 search requests.
+func main() {
+	searcher := &LeakySearcher{}
+
+	before := reportGoroutines("Goroutines before")
+
 	for i := 0; i < 5; i++ {
-		result := searchWithoutContext(fmt.Sprintf("query-%d", i))
+		result := searcher.SearchWithoutContext(fmt.Sprintf("query-%d", i))
 		fmt.Printf("Request %d: %s\n", i, result)
 	}
 
-	goroutinesAfter := runtime.NumGoroutine()
-	fmt.Printf("\nGoroutines after:  %d\n", goroutinesAfter)
-	fmt.Printf("Leaked goroutines: %d\n", goroutinesAfter-goroutinesBefore)
+	after := reportGoroutines("\nGoroutines after")
+	fmt.Printf("Leaked goroutines: %d\n", after-before)
 	fmt.Println("Each request leaks ~2 goroutines (the 2 slower sources).")
 	fmt.Println("At 10,000 req/s, this exhausts memory in minutes.")
 }
@@ -185,7 +198,7 @@ Request 2: found: query-2-db
 Request 3: found: query-3-db
 Request 4: found: query-4-db
 
-Goroutines after:  11
+Goroutines after: 11
 Leaked goroutines: 10
 Each request leaks ~2 goroutines (the 2 slower sources).
 At 10,000 req/s, this exhausts memory in minutes.
@@ -207,44 +220,62 @@ import (
 	"time"
 )
 
-func searchSource(ctx context.Context, source string, delay time.Duration, results chan<- string) {
-	select {
-	case <-time.After(delay):
-		select {
-		case results <- fmt.Sprintf("[%s] found result in %v", source, delay):
-		case <-ctx.Done():
-		}
-	case <-ctx.Done():
-		fmt.Printf("  [%s] cancelled, releasing resources\n", source)
+type DataSource struct {
+	Name  string
+	Delay time.Duration
+}
+
+type SafeSearcher struct {
+	sources []DataSource
+}
+
+func NewSafeSearcher() *SafeSearcher {
+	return &SafeSearcher{
+		sources: []DataSource{
+			{Name: "database", Delay: 200 * time.Millisecond},
+			{Name: "cache", Delay: 80 * time.Millisecond},
+			{Name: "index", Delay: 350 * time.Millisecond},
+		},
 	}
 }
 
-func searchWithCancel(query string) string {
+func (s *SafeSearcher) querySource(ctx context.Context, source DataSource, results chan<- string) {
+	select {
+	case <-time.After(source.Delay):
+		select {
+		case results <- fmt.Sprintf("[%s] found result in %v", source.Name, source.Delay):
+		case <-ctx.Done():
+		}
+	case <-ctx.Done():
+		fmt.Printf("  [%s] cancelled, releasing resources\n", source.Name)
+	}
+}
+
+func (s *SafeSearcher) FirstResult(query string) string {
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel() // Cancel ALL remaining goroutines when we return.
+	defer cancel()
 
-	results := make(chan string, 3)
+	results := make(chan string, len(s.sources))
+	for _, src := range s.sources {
+		go s.querySource(ctx, src, results)
+	}
 
-	go searchSource(ctx, "database", 200*time.Millisecond, results)
-	go searchSource(ctx, "cache", 80*time.Millisecond, results)
-	go searchSource(ctx, "index", 350*time.Millisecond, results)
-
-	// Take the first result. defer cancel() stops the rest.
 	return <-results
 }
 
 func main() {
+	searcher := NewSafeSearcher()
+
 	goroutinesBefore := runtime.NumGoroutine()
 	fmt.Printf("Goroutines before: %d\n\n", goroutinesBefore)
 
 	for i := 0; i < 5; i++ {
-		result := searchWithCancel(fmt.Sprintf("query-%d", i))
+		result := searcher.FirstResult(fmt.Sprintf("query-%d", i))
 		fmt.Printf("Request %d: %s\n", i, result)
-		time.Sleep(100 * time.Millisecond) // Let cancelled goroutines print.
+		time.Sleep(100 * time.Millisecond)
 		fmt.Println()
 	}
 
-	// Let all goroutines finish cleanup.
 	time.Sleep(200 * time.Millisecond)
 
 	goroutinesAfter := runtime.NumGoroutine()
@@ -290,40 +321,58 @@ import (
 	"time"
 )
 
-func queryReplica(ctx context.Context, name string, done chan<- string) {
+const replicaQueryDelay = 200 * time.Millisecond
+
+type ReplicaQueryResult struct {
+	Name    string
+	Message string
+}
+
+type DatabaseCluster struct{}
+
+func NewDatabaseCluster() *DatabaseCluster {
+	return &DatabaseCluster{}
+}
+
+func (d *DatabaseCluster) QueryReplica(ctx context.Context, name string, done chan<- ReplicaQueryResult) {
 	select {
-	case <-time.After(200 * time.Millisecond):
-		done <- fmt.Sprintf("%s: query complete", name)
+	case <-time.After(replicaQueryDelay):
+		done <- ReplicaQueryResult{Name: name, Message: "query complete"}
 	case <-ctx.Done():
-		done <- fmt.Sprintf("%s: cancelled (%v)", name, ctx.Err())
+		done <- ReplicaQueryResult{Name: name, Message: fmt.Sprintf("cancelled (%v)", ctx.Err())}
 	}
 }
 
-func main() {
+func (d *DatabaseCluster) DemonstrateCancellationScope() {
 	parent, cancelParent := context.WithCancel(context.Background())
 	defer cancelParent()
 
-	// Two independent queries, each with its own cancellable context.
 	primaryCtx, cancelPrimary := context.WithCancel(parent)
 	replicaCtx, cancelReplica := context.WithCancel(parent)
 	defer cancelReplica()
 
-	primaryDone := make(chan string, 1)
-	replicaDone := make(chan string, 1)
+	primaryDone := make(chan ReplicaQueryResult, 1)
+	replicaDone := make(chan ReplicaQueryResult, 1)
 
-	go queryReplica(primaryCtx, "primary-db", primaryDone)
-	go queryReplica(replicaCtx, "replica-db", replicaDone)
+	go d.QueryReplica(primaryCtx, "primary-db", primaryDone)
+	go d.QueryReplica(replicaCtx, "replica-db", replicaDone)
 
-	// Cancel only the primary query (e.g., primary is slow, switch to replica).
 	fmt.Println("Cancelling primary query only...")
 	cancelPrimary()
 
-	fmt.Println(<-primaryDone)
-	fmt.Println(<-replicaDone)
+	primary := <-primaryDone
+	replica := <-replicaDone
+	fmt.Printf("%s: %s\n", primary.Name, primary.Message)
+	fmt.Printf("%s: %s\n", replica.Name, replica.Message)
 
 	fmt.Printf("\nparent.Err():  %v (unaffected)\n", parent.Err())
 	fmt.Printf("primary.Err(): %v (cancelled)\n", primaryCtx.Err())
 	fmt.Printf("replica.Err(): %v (still running)\n", replicaCtx.Err())
+}
+
+func main() {
+	cluster := NewDatabaseCluster()
+	cluster.DemonstrateCancellationScope()
 }
 ```
 
@@ -422,16 +471,43 @@ import (
 	"time"
 )
 
-func searchDirectory(ctx context.Context, dir string, delay time.Duration, results chan<- string) {
+type DirectorySearch struct {
+	Path  string
+	Delay time.Duration
+}
+
+type FileSearcher struct {
+	directories []DirectorySearch
+}
+
+func NewFileSearcher() *FileSearcher {
+	return &FileSearcher{
+		directories: []DirectorySearch{
+			{Path: "/var/log", Delay: 300 * time.Millisecond},
+			{Path: "/tmp", Delay: 100 * time.Millisecond},
+			{Path: "/home", Delay: 500 * time.Millisecond},
+		},
+	}
+}
+
+func (f *FileSearcher) searchDirectory(ctx context.Context, dir DirectorySearch, results chan<- string) {
 	select {
-	case <-time.After(delay):
+	case <-time.After(dir.Delay):
 		select {
-		case results <- fmt.Sprintf("found in %s (took %v)", dir, delay):
+		case results <- fmt.Sprintf("found in %s (took %v)", dir.Path, dir.Delay):
 		case <-ctx.Done():
 		}
 	case <-ctx.Done():
-		fmt.Printf("  [%s] search cancelled\n", dir)
+		fmt.Printf("  [%s] search cancelled\n", dir.Path)
 	}
+}
+
+func (f *FileSearcher) FindFirst(ctx context.Context) string {
+	results := make(chan string, len(f.directories))
+	for _, dir := range f.directories {
+		go f.searchDirectory(ctx, dir, results)
+	}
+	return <-results
 }
 
 func main() {
@@ -439,12 +515,8 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	results := make(chan string, 3)
-	go searchDirectory(ctx, "/var/log", 300*time.Millisecond, results)
-	go searchDirectory(ctx, "/tmp", 100*time.Millisecond, results)
-	go searchDirectory(ctx, "/home", 500*time.Millisecond, results)
-
-	first := <-results
+	searcher := NewFileSearcher()
+	first := searcher.FindFirst(ctx)
 	fmt.Printf("First result: %s\n", first)
 	cancel()
 

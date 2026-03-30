@@ -32,50 +32,79 @@ package main
 
 import "fmt"
 
+// LookupRequest carries the user ID to look up and a reply channel
+// where the service will send back the result.
 type LookupRequest struct {
-    UserID int
-    Reply  chan LookupResponse
+	UserID int
+	Reply  chan LookupResponse
 }
 
+// LookupResponse carries the result of a user lookup.
 type LookupResponse struct {
-    Name  string
-    Email string
-    Found bool
+	Name  string
+	Email string
+	Found bool
 }
 
-func userService(requests <-chan LookupRequest) {
-    // The service owns this data. No mutex needed -- only this goroutine reads/writes it.
-    users := map[int]struct{ Name, Email string }{
-        1: {"Alice", "alice@corp.com"},
-        2: {"Bob", "bob@corp.com"},
-        3: {"Carol", "carol@corp.com"},
-    }
+// UserRecord is a single entry in the user directory.
+type UserRecord struct {
+	Name  string
+	Email string
+}
 
-    for req := range requests {
-        if user, ok := users[req.UserID]; ok {
-            req.Reply <- LookupResponse{Name: user.Name, Email: user.Email, Found: true}
-        } else {
-            req.Reply <- LookupResponse{Found: false}
-        }
-    }
+// UserService processes lookup requests sequentially. It owns the data
+// exclusively -- no mutex needed because only this goroutine reads/writes it.
+type UserService struct {
+	requests chan LookupRequest
+	users    map[int]UserRecord
+}
+
+// NewUserService creates a service with seed data and starts its event loop.
+func NewUserService(users map[int]UserRecord) *UserService {
+	svc := &UserService{
+		requests: make(chan LookupRequest),
+		users:    users,
+	}
+	go svc.run()
+	return svc
+}
+
+func (svc *UserService) run() {
+	for req := range svc.requests {
+		if user, ok := svc.users[req.UserID]; ok {
+			req.Reply <- LookupResponse{Name: user.Name, Email: user.Email, Found: true}
+		} else {
+			req.Reply <- LookupResponse{Found: false}
+		}
+	}
+}
+
+// Lookup sends a request and waits for the response.
+func (svc *UserService) Lookup(userID int) LookupResponse {
+	reply := make(chan LookupResponse, 1)
+	svc.requests <- LookupRequest{UserID: userID, Reply: reply}
+	return <-reply
+}
+
+// Close shuts down the service event loop.
+func (svc *UserService) Close() {
+	close(svc.requests)
 }
 
 func main() {
-    requests := make(chan LookupRequest)
-    go userService(requests)
+	svc := NewUserService(map[int]UserRecord{
+		1: {"Alice", "alice@corp.com"},
+		2: {"Bob", "bob@corp.com"},
+		3: {"Carol", "carol@corp.com"},
+	})
 
-    // Client creates a reply channel, sends a request, waits for the response.
-    reply := make(chan LookupResponse, 1)
+	resp := svc.Lookup(2)
+	fmt.Printf("User 2: %s <%s> (found=%v)\n", resp.Name, resp.Email, resp.Found)
 
-    requests <- LookupRequest{UserID: 2, Reply: reply}
-    resp := <-reply
-    fmt.Printf("User 2: %s <%s> (found=%v)\n", resp.Name, resp.Email, resp.Found)
+	resp = svc.Lookup(99)
+	fmt.Printf("User 99: found=%v\n", resp.Found)
 
-    requests <- LookupRequest{UserID: 99, Reply: reply}
-    resp = <-reply
-    fmt.Printf("User 99: found=%v\n", resp.Found)
-
-    close(requests)
+	svc.Close()
 }
 ```
 
@@ -97,49 +126,61 @@ Multiple goroutines send requests to the same service simultaneously. Each gets 
 package main
 
 import (
-    "fmt"
-    "sync"
+	"fmt"
+	"sync"
 )
 
+// LookupRequest carries a user ID and a private reply channel.
 type LookupRequest struct {
-    UserID int
-    Reply  chan string
+	UserID int
+	Reply  chan string
 }
 
-func userService(requests <-chan LookupRequest) {
-    users := map[int]string{
-        1: "Alice", 2: "Bob", 3: "Carol",
-        4: "Dave", 5: "Eve",
-    }
-    for req := range requests {
-        if name, ok := users[req.UserID]; ok {
-            req.Reply <- name
-        } else {
-            req.Reply <- "unknown"
-        }
-    }
+// runUserService processes lookup requests until the channel is closed.
+func runUserService(requests <-chan LookupRequest) {
+	users := map[int]string{
+		1: "Alice", 2: "Bob", 3: "Carol",
+		4: "Dave", 5: "Eve",
+	}
+	for req := range requests {
+		if name, ok := users[req.UserID]; ok {
+			req.Reply <- name
+		} else {
+			req.Reply <- "unknown"
+		}
+	}
+}
+
+// lookupUser sends a request and returns the resolved name.
+func lookupUser(requests chan<- LookupRequest, userID int) string {
+	reply := make(chan string, 1)
+	requests <- LookupRequest{UserID: userID, Reply: reply}
+	return <-reply
+}
+
+// runConcurrentLookups launches one goroutine per user ID, each performing
+// an independent lookup through the shared request channel.
+func runConcurrentLookups(requests chan<- LookupRequest, userIDs []int) {
+	var wg sync.WaitGroup
+	for _, userID := range userIDs {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			name := lookupUser(requests, id)
+			fmt.Printf("Client looked up user %d: %s\n", id, name)
+		}(userID)
+	}
+	wg.Wait()
 }
 
 func main() {
-    requests := make(chan LookupRequest)
-    go userService(requests)
+	requests := make(chan LookupRequest)
+	go runUserService(requests)
 
-    var wg sync.WaitGroup
-    for id := 1; id <= 5; id++ {
-        wg.Add(1)
-        go func(userID int) {
-            defer wg.Done()
-            // Each goroutine creates its own reply channel.
-            // Responses are routed to the correct caller automatically.
-            reply := make(chan string, 1)
-            requests <- LookupRequest{UserID: userID, Reply: reply}
-            name := <-reply
-            fmt.Printf("Client looked up user %d: %s\n", userID, name)
-        }(id)
-    }
+	userIDs := []int{1, 2, 3, 4, 5}
+	runConcurrentLookups(requests, userIDs)
 
-    wg.Wait()
-    close(requests)
+	close(requests)
 }
 ```
 
@@ -163,75 +204,102 @@ package main
 
 import "fmt"
 
+const (
+	opGet    = "get"
+	opSet    = "set"
+	opDelete = "delete"
+)
+
+// ConfigResponse carries the result of a config operation.
 type ConfigResponse struct {
-    Value string
-    Found bool
+	Value string
+	Found bool
 }
 
+// ConfigRequest describes an operation (get/set/delete) with a reply channel.
 type ConfigRequest struct {
-    Op    string // "get", "set", "delete"
-    Key   string
-    Value string // used by "set"
-    Reply chan ConfigResponse
+	Op    string
+	Key   string
+	Value string
+	Reply chan ConfigResponse
 }
 
-func configService(requests <-chan ConfigRequest) {
-    store := make(map[string]string)
-    for req := range requests {
-        switch req.Op {
-        case "set":
-            store[req.Key] = req.Value
-            req.Reply <- ConfigResponse{Value: req.Value, Found: true}
-        case "get":
-            val, ok := store[req.Key]
-            req.Reply <- ConfigResponse{Value: val, Found: ok}
-        case "delete":
-            delete(store, req.Key)
-            req.Reply <- ConfigResponse{Found: true}
-        }
-    }
+// ConfigService manages an in-memory key-value store, processing all
+// mutations through a single goroutine to avoid data races.
+type ConfigService struct {
+	requests chan ConfigRequest
 }
 
-// Helper functions wrap the channel protocol into clean API calls.
-func configSet(requests chan<- ConfigRequest, key, value string) {
-    reply := make(chan ConfigResponse, 1)
-    requests <- ConfigRequest{Op: "set", Key: key, Value: value, Reply: reply}
-    <-reply
+// NewConfigService creates and starts a config service.
+func NewConfigService() *ConfigService {
+	svc := &ConfigService{requests: make(chan ConfigRequest)}
+	go svc.run()
+	return svc
 }
 
-func configGet(requests chan<- ConfigRequest, key string) (string, bool) {
-    reply := make(chan ConfigResponse, 1)
-    requests <- ConfigRequest{Op: "get", Key: key, Reply: reply}
-    resp := <-reply
-    return resp.Value, resp.Found
+func (svc *ConfigService) run() {
+	store := make(map[string]string)
+	for req := range svc.requests {
+		switch req.Op {
+		case opSet:
+			store[req.Key] = req.Value
+			req.Reply <- ConfigResponse{Value: req.Value, Found: true}
+		case opGet:
+			val, ok := store[req.Key]
+			req.Reply <- ConfigResponse{Value: val, Found: ok}
+		case opDelete:
+			delete(store, req.Key)
+			req.Reply <- ConfigResponse{Found: true}
+		}
+	}
 }
 
-func configDelete(requests chan<- ConfigRequest, key string) {
-    reply := make(chan ConfigResponse, 1)
-    requests <- ConfigRequest{Op: "delete", Key: key, Reply: reply}
-    <-reply
+// Set stores a key-value pair.
+func (svc *ConfigService) Set(key, value string) {
+	reply := make(chan ConfigResponse, 1)
+	svc.requests <- ConfigRequest{Op: opSet, Key: key, Value: value, Reply: reply}
+	<-reply
+}
+
+// Get retrieves a value by key.
+func (svc *ConfigService) Get(key string) (string, bool) {
+	reply := make(chan ConfigResponse, 1)
+	svc.requests <- ConfigRequest{Op: opGet, Key: key, Reply: reply}
+	resp := <-reply
+	return resp.Value, resp.Found
+}
+
+// Delete removes a key from the store.
+func (svc *ConfigService) Delete(key string) {
+	reply := make(chan ConfigResponse, 1)
+	svc.requests <- ConfigRequest{Op: opDelete, Key: key, Reply: reply}
+	<-reply
+}
+
+// Close shuts down the service.
+func (svc *ConfigService) Close() {
+	close(svc.requests)
 }
 
 func main() {
-    requests := make(chan ConfigRequest)
-    go configService(requests)
+	config := NewConfigService()
 
-    configSet(requests, "db.host", "postgres.prod.internal")
-    configSet(requests, "db.port", "5432")
-    configSet(requests, "cache.ttl", "300s")
+	config.Set("db.host", "postgres.prod.internal")
+	config.Set("db.port", "5432")
+	config.Set("cache.ttl", "300s")
 
-    if val, ok := configGet(requests, "db.host"); ok {
-        fmt.Printf("db.host = %s\n", val)
-    }
-    if val, ok := configGet(requests, "cache.ttl"); ok {
-        fmt.Printf("cache.ttl = %s\n", val)
-    }
+	if val, ok := config.Get("db.host"); ok {
+		fmt.Printf("db.host = %s\n", val)
+	}
+	if val, ok := config.Get("cache.ttl"); ok {
+		fmt.Printf("cache.ttl = %s\n", val)
+	}
 
-    configDelete(requests, "cache.ttl")
-    val, ok := configGet(requests, "cache.ttl")
-    fmt.Printf("cache.ttl after delete: %q (found=%v)\n", val, ok)
+	config.Delete("cache.ttl")
+	val, ok := config.Get("cache.ttl")
+	fmt.Printf("cache.ttl after delete: %q (found=%v)\n", val, ok)
 
-    close(requests)
+	config.Close()
 }
 ```
 
@@ -252,69 +320,95 @@ A richer example: a rate limiter that tracks request counts per API key. Multipl
 package main
 
 import (
-    "fmt"
-    "sync"
+	"fmt"
+	"sync"
 )
 
+const maxRequestsPerKey = 3
+
+// RateLimitResponse carries the allow/deny decision and remaining quota.
 type RateLimitResponse struct {
-    Allowed   bool
-    Remaining int
+	Allowed   bool
+	Remaining int
 }
 
+// RateLimitRequest carries an API key and a reply channel for the decision.
 type RateLimitRequest struct {
-    APIKey string
-    Reply  chan RateLimitResponse
+	APIKey string
+	Reply  chan RateLimitResponse
 }
 
-func rateLimiterService(requests <-chan RateLimitRequest, maxPerKey int) {
-    counts := make(map[string]int)
-    for req := range requests {
-        current := counts[req.APIKey]
-        if current < maxPerKey {
-            counts[req.APIKey]++
-            req.Reply <- RateLimitResponse{
-                Allowed:   true,
-                Remaining: maxPerKey - current - 1,
-            }
-        } else {
-            req.Reply <- RateLimitResponse{
-                Allowed:   false,
-                Remaining: 0,
-            }
-        }
-    }
+// RateLimiter tracks request counts per API key through a single goroutine,
+// eliminating the need for mutexes on the counter state.
+type RateLimiter struct {
+	requests  chan RateLimitRequest
+	maxPerKey int
 }
 
-func checkRateLimit(requests chan<- RateLimitRequest, apiKey string) RateLimitResponse {
-    reply := make(chan RateLimitResponse, 1)
-    requests <- RateLimitRequest{APIKey: apiKey, Reply: reply}
-    return <-reply
+// NewRateLimiter creates and starts a rate limiter with the given per-key limit.
+func NewRateLimiter(maxPerKey int) *RateLimiter {
+	rl := &RateLimiter{
+		requests:  make(chan RateLimitRequest),
+		maxPerKey: maxPerKey,
+	}
+	go rl.run()
+	return rl
+}
+
+func (rl *RateLimiter) run() {
+	counts := make(map[string]int)
+	for req := range rl.requests {
+		current := counts[req.APIKey]
+		if current < rl.maxPerKey {
+			counts[req.APIKey]++
+			req.Reply <- RateLimitResponse{
+				Allowed:   true,
+				Remaining: rl.maxPerKey - current - 1,
+			}
+		} else {
+			req.Reply <- RateLimitResponse{Allowed: false, Remaining: 0}
+		}
+	}
+}
+
+// Check sends a rate-limit request and returns the decision.
+func (rl *RateLimiter) Check(apiKey string) RateLimitResponse {
+	reply := make(chan RateLimitResponse, 1)
+	rl.requests <- RateLimitRequest{APIKey: apiKey, Reply: reply}
+	return <-reply
+}
+
+// Close shuts down the rate limiter.
+func (rl *RateLimiter) Close() {
+	close(rl.requests)
+}
+
+// formatStatus returns a human-readable string for the rate limit decision.
+func formatStatus(resp RateLimitResponse) string {
+	if resp.Allowed {
+		return "ALLOWED"
+	}
+	return "BLOCKED"
 }
 
 func main() {
-    requests := make(chan RateLimitRequest)
-    go rateLimiterService(requests, 3) // max 3 requests per key
+	limiter := NewRateLimiter(maxRequestsPerKey)
 
-    // Simulate concurrent API gateway instances checking limits.
-    var wg sync.WaitGroup
-    apiKeys := []string{"key-alice", "key-alice", "key-alice", "key-alice", "key-bob", "key-bob"}
+	var wg sync.WaitGroup
+	apiKeys := []string{"key-alice", "key-alice", "key-alice", "key-alice", "key-bob", "key-bob"}
 
-    for i, key := range apiKeys {
-        wg.Add(1)
-        go func(reqNum int, apiKey string) {
-            defer wg.Done()
-            resp := checkRateLimit(requests, apiKey)
-            status := "ALLOWED"
-            if !resp.Allowed {
-                status = "BLOCKED"
-            }
-            fmt.Printf("Request %d [%s]: %s (remaining: %d)\n",
-                reqNum+1, apiKey, status, resp.Remaining)
-        }(i, key)
-    }
+	for i, key := range apiKeys {
+		wg.Add(1)
+		go func(reqNum int, apiKey string) {
+			defer wg.Done()
+			resp := limiter.Check(apiKey)
+			fmt.Printf("Request %d [%s]: %s (remaining: %d)\n",
+				reqNum+1, apiKey, formatStatus(resp), resp.Remaining)
+		}(i, key)
+	}
 
-    wg.Wait()
-    close(requests)
+	wg.Wait()
+	limiter.Close()
 }
 ```
 
@@ -333,90 +427,133 @@ In production, service operations can fail. Include an error field in the respon
 package main
 
 import (
-    "fmt"
-    "sync"
+	"fmt"
+	"sync"
 )
 
+const (
+	opDeposit  = "deposit"
+	opWithdraw = "withdraw"
+	opBalance  = "balance"
+
+	depositAmount  = 100.0
+	withdrawAmount = 80.0
+	depositorCount = 5
+	withdrawerCount = 5
+)
+
+// AccountResponse carries the result of a bank operation, including
+// an optional error message for failed transactions.
 type AccountResponse struct {
-    Balance float64
-    Error   string
+	Balance float64
+	Error   string
 }
 
+// AccountRequest describes a bank operation with a reply channel.
 type AccountRequest struct {
-    Op     string // "deposit", "withdraw", "balance"
-    Amount float64
-    Reply  chan AccountResponse
+	Op     string
+	Amount float64
+	Reply  chan AccountResponse
 }
 
-func accountService(requests <-chan AccountRequest) {
-    var balance float64
-    for req := range requests {
-        switch req.Op {
-        case "deposit":
-            if req.Amount <= 0 {
-                req.Reply <- AccountResponse{Balance: balance, Error: "deposit amount must be positive"}
-                continue
-            }
-            balance += req.Amount
-            req.Reply <- AccountResponse{Balance: balance}
-        case "withdraw":
-            if req.Amount > balance {
-                req.Reply <- AccountResponse{
-                    Balance: balance,
-                    Error:   fmt.Sprintf("insufficient funds: have $%.2f, want $%.2f", balance, req.Amount),
-                }
-                continue
-            }
-            balance -= req.Amount
-            req.Reply <- AccountResponse{Balance: balance}
-        case "balance":
-            req.Reply <- AccountResponse{Balance: balance}
-        }
-    }
+// AccountService manages a bank account balance through sequential
+// request processing, eliminating race conditions without mutexes.
+type AccountService struct {
+	requests chan AccountRequest
+}
+
+// NewAccountService creates and starts an account service.
+func NewAccountService() *AccountService {
+	svc := &AccountService{requests: make(chan AccountRequest)}
+	go svc.run()
+	return svc
+}
+
+func (svc *AccountService) run() {
+	var balance float64
+	for req := range svc.requests {
+		switch req.Op {
+		case opDeposit:
+			if req.Amount <= 0 {
+				req.Reply <- AccountResponse{Balance: balance, Error: "deposit amount must be positive"}
+				continue
+			}
+			balance += req.Amount
+			req.Reply <- AccountResponse{Balance: balance}
+		case opWithdraw:
+			if req.Amount > balance {
+				req.Reply <- AccountResponse{
+					Balance: balance,
+					Error:   fmt.Sprintf("insufficient funds: have $%.2f, want $%.2f", balance, req.Amount),
+				}
+				continue
+			}
+			balance -= req.Amount
+			req.Reply <- AccountResponse{Balance: balance}
+		case opBalance:
+			req.Reply <- AccountResponse{Balance: balance}
+		}
+	}
+}
+
+func (svc *AccountService) send(op string, amount float64) AccountResponse {
+	reply := make(chan AccountResponse, 1)
+	svc.requests <- AccountRequest{Op: op, Amount: amount, Reply: reply}
+	return <-reply
+}
+
+// Deposit adds funds to the account.
+func (svc *AccountService) Deposit(amount float64) AccountResponse {
+	return svc.send(opDeposit, amount)
+}
+
+// Withdraw removes funds from the account.
+func (svc *AccountService) Withdraw(amount float64) AccountResponse {
+	return svc.send(opWithdraw, amount)
+}
+
+// Balance returns the current balance.
+func (svc *AccountService) Balance() AccountResponse {
+	return svc.send(opBalance, 0)
+}
+
+// Close shuts down the service.
+func (svc *AccountService) Close() {
+	close(svc.requests)
 }
 
 func main() {
-    requests := make(chan AccountRequest)
-    go accountService(requests)
+	account := NewAccountService()
+	var wg sync.WaitGroup
 
-    var wg sync.WaitGroup
+	for i := 0; i < depositorCount; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			resp := account.Deposit(depositAmount)
+			fmt.Printf("Client %d: deposited $%.0f, balance: $%.2f\n",
+				id, depositAmount, resp.Balance)
+		}(i)
+	}
 
-    // 5 goroutines deposit $100 each.
-    for i := 0; i < 5; i++ {
-        wg.Add(1)
-        go func(id int) {
-            defer wg.Done()
-            reply := make(chan AccountResponse, 1)
-            requests <- AccountRequest{Op: "deposit", Amount: 100, Reply: reply}
-            resp := <-reply
-            fmt.Printf("Client %d: deposited $100, balance: $%.2f\n", id, resp.Balance)
-        }(i)
-    }
+	for i := depositorCount; i < depositorCount+withdrawerCount; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			resp := account.Withdraw(withdrawAmount)
+			if resp.Error != "" {
+				fmt.Printf("Client %d: withdraw FAILED: %s\n", id, resp.Error)
+			} else {
+				fmt.Printf("Client %d: withdrew $%.0f, balance: $%.2f\n",
+					id, withdrawAmount, resp.Balance)
+			}
+		}(i)
+	}
 
-    // 5 goroutines try to withdraw $80 each (not all will succeed).
-    for i := 5; i < 10; i++ {
-        wg.Add(1)
-        go func(id int) {
-            defer wg.Done()
-            reply := make(chan AccountResponse, 1)
-            requests <- AccountRequest{Op: "withdraw", Amount: 80, Reply: reply}
-            resp := <-reply
-            if resp.Error != "" {
-                fmt.Printf("Client %d: withdraw FAILED: %s\n", id, resp.Error)
-            } else {
-                fmt.Printf("Client %d: withdrew $80, balance: $%.2f\n", id, resp.Balance)
-            }
-        }(i)
-    }
-
-    wg.Wait()
-
-    reply := make(chan AccountResponse, 1)
-    requests <- AccountRequest{Op: "balance", Reply: reply}
-    resp := <-reply
-    fmt.Printf("Final balance: $%.2f\n", resp.Balance)
-
-    close(requests)
+	wg.Wait()
+	resp := account.Balance()
+	fmt.Printf("Final balance: $%.2f\n", resp.Balance)
+	account.Close()
 }
 ```
 

@@ -33,20 +33,33 @@ import (
 	"time"
 )
 
+const requestTimeout = 500 * time.Millisecond
+
+func simulateSlowService(response chan<- string, latency time.Duration) {
+	go func() {
+		time.Sleep(latency)
+		response <- `{"status": "ok", "data": [1, 2, 3]}`
+	}()
+}
+
+func awaitResponseWithTimeout(response <-chan string, timeout time.Duration) (string, bool) {
+	select {
+	case body := <-response:
+		return body, true
+	case <-time.After(timeout):
+		return "", false
+	}
+}
+
 func main() {
 	response := make(chan string)
 
-	// Simulate a slow downstream service.
-	go func() {
-		time.Sleep(2 * time.Second)
-		response <- `{"status": "ok", "data": [1, 2, 3]}`
-	}()
+	simulateSlowService(response, 2*time.Second)
 
-	select {
-	case body := <-response:
+	if body, ok := awaitResponseWithTimeout(response, requestTimeout); ok {
 		fmt.Println("response:", body)
-	case <-time.After(500 * time.Millisecond):
-		fmt.Println("timeout: downstream service did not respond within 500ms")
+	} else {
+		fmt.Printf("timeout: downstream service did not respond within %v\n", requestTimeout)
 	}
 }
 ```
@@ -74,19 +87,32 @@ import (
 	"time"
 )
 
+const requestTimeout = 500 * time.Millisecond
+
+func simulateService(response chan<- string, latency time.Duration, payload string) {
+	go func() {
+		time.Sleep(latency)
+		response <- payload
+	}()
+}
+
+func awaitResponseWithTimeout(response <-chan string, timeout time.Duration) (string, bool) {
+	select {
+	case body := <-response:
+		return body, true
+	case <-time.After(timeout):
+		return "", false
+	}
+}
+
 func main() {
 	response := make(chan string)
 
-	// Fast downstream service.
-	go func() {
-		time.Sleep(50 * time.Millisecond)
-		response <- `{"user": "alice", "role": "admin"}`
-	}()
+	simulateService(response, 50*time.Millisecond, `{"user": "alice", "role": "admin"}`)
 
-	select {
-	case body := <-response:
+	if body, ok := awaitResponseWithTimeout(response, requestTimeout); ok {
 		fmt.Println("success:", body)
-	case <-time.After(500 * time.Millisecond):
+	} else {
 		fmt.Println("timeout: service too slow")
 	}
 }
@@ -109,25 +135,37 @@ import (
 	"time"
 )
 
-func callService(name string, latency, timeout time.Duration) {
-	response := make(chan string)
+type ServiceCall struct {
+	Name    string
+	Latency time.Duration
+	Timeout time.Duration
+}
+
+func (sc ServiceCall) Execute() {
+	response := make(chan string, 1)
 
 	go func() {
-		time.Sleep(latency)
-		response <- fmt.Sprintf("%s responded", name)
+		time.Sleep(sc.Latency)
+		response <- fmt.Sprintf("%s responded", sc.Name)
 	}()
 
 	select {
 	case body := <-response:
-		fmt.Printf("[%s] success: %s\n", name, body)
-	case <-time.After(timeout):
-		fmt.Printf("[%s] timeout after %v (service latency: %v)\n", name, timeout, latency)
+		fmt.Printf("[%s] success: %s\n", sc.Name, body)
+	case <-time.After(sc.Timeout):
+		fmt.Printf("[%s] timeout after %v (service latency: %v)\n", sc.Name, sc.Timeout, sc.Latency)
 	}
 }
 
 func main() {
-	callService("user-service", 80*time.Millisecond, 200*time.Millisecond)
-	callService("payment-service", 500*time.Millisecond, 200*time.Millisecond)
+	calls := []ServiceCall{
+		{Name: "user-service", Latency: 80 * time.Millisecond, Timeout: 200 * time.Millisecond},
+		{Name: "payment-service", Latency: 500 * time.Millisecond, Timeout: 200 * time.Millisecond},
+	}
+
+	for _, call := range calls {
+		call.Execute()
+	}
 }
 ```
 
@@ -150,32 +188,42 @@ import (
 	"time"
 )
 
-func main() {
-	requests := make(chan string, 1)
+const (
+	totalRequests  = 1000
+	requestDelay   = 1 * time.Millisecond
+	leakyTimeout   = 1 * time.Second
+)
 
+func produceRequests(requests chan<- string, count int) {
 	go func() {
-		for i := 0; i < 1000; i++ {
+		for i := 0; i < count; i++ {
 			requests <- fmt.Sprintf("request-%d", i)
-			time.Sleep(1 * time.Millisecond)
+			time.Sleep(requestDelay)
 		}
 		close(requests)
 	}()
+}
 
-	count := 0
+func main() {
+	requests := make(chan string, 1)
+
+	produceRequests(requests, totalRequests)
+
+	processed := 0
 	for req := range requests {
 		// BAD: Each iteration allocates a 1-second timer.
 		// We process requests every 1ms, so ~1000 timers accumulate,
 		// all scheduled to fire 1 second from now.
 		select {
-		case <-time.After(1 * time.Second):
+		case <-time.After(leakyTimeout):
 			fmt.Println("timeout")
 			return
 		default:
 			_ = req
-			count++
+			processed++
 		}
 	}
-	fmt.Printf("processed %d requests (created ~1000 leaked timers)\n", count)
+	fmt.Printf("processed %d requests (created ~%d leaked timers)\n", processed, totalRequests)
 }
 ```
 
@@ -197,30 +245,39 @@ import (
 	"time"
 )
 
-func main() {
-	responses := make(chan string)
+const (
+	responseInterval = 50 * time.Millisecond
+	responseTimeout  = 200 * time.Millisecond
+	totalResponses   = 10
+)
 
-	// Simulate a stream of API responses arriving every 50ms.
+func produceResponses(responses chan<- string, count int, interval time.Duration) {
 	go func() {
-		for i := 0; i < 10; i++ {
+		for i := 0; i < count; i++ {
 			responses <- fmt.Sprintf("response-%d", i)
-			time.Sleep(50 * time.Millisecond)
+			time.Sleep(interval)
 		}
 		close(responses)
 	}()
+}
 
-	timeout := time.NewTimer(200 * time.Millisecond)
-	defer timeout.Stop()
+func resetTimer(timer *time.Timer, duration time.Duration) {
+	// Stop-drain-reset: prevents a stale timeout from the previous iteration.
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
+		}
+	}
+	timer.Reset(duration)
+}
+
+func consumeWithTimeout(responses <-chan string, timeout time.Duration) {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
 
 	for {
-		// Stop-drain-reset: prevents a stale timeout from the previous iteration.
-		if !timeout.Stop() {
-			select {
-			case <-timeout.C:
-			default:
-			}
-		}
-		timeout.Reset(200 * time.Millisecond)
+		resetTimer(timer, timeout)
 
 		select {
 		case body, ok := <-responses:
@@ -229,11 +286,18 @@ func main() {
 				return
 			}
 			fmt.Println("received:", body)
-		case <-timeout.C:
-			fmt.Println("timeout: no response for 200ms, aborting")
+		case <-timer.C:
+			fmt.Printf("timeout: no response for %v, aborting\n", timeout)
 			return
 		}
 	}
+}
+
+func main() {
+	responses := make(chan string)
+
+	produceResponses(responses, totalResponses, responseInterval)
+	consumeWithTimeout(responses, responseTimeout)
 }
 ```
 

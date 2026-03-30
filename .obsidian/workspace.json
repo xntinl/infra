@@ -13,30 +13,15 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "README.md",
+                "file": "challenges/go-concepts/concurrency/01-goroutines-and-scheduling/02-goroutine-vs-os-thread/02-goroutine-vs-os-thread.md",
                 "mode": "source",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "README"
-            }
-          },
-          {
-            "id": "caa0937ea8cbd901",
-            "type": "leaf",
-            "state": {
-              "type": "markdown",
-              "state": {
-                "file": "challenges/go-concepts/concurrency/02-channels/07-nil-channel-behavior/07-nil-channel-behavior.md",
-                "mode": "source",
-                "source": false
-              },
-              "icon": "lucide-file",
-              "title": "07-nil-channel-behavior"
+              "title": "02-goroutine-vs-os-thread"
             }
           }
-        ],
-        "currentTab": 1
+        ]
       }
     ],
     "direction": "vertical"
@@ -223,44 +208,44 @@
       "open-vscode:VS Code": false
     }
   },
-  "active": "caa0937ea8cbd901",
+  "active": "ce71c186b1594d7a",
   "lastOpenFiles": [
+    "challenges/go-concepts/concurrency/01-goroutines-and-scheduling/12-goroutine-return-values/12-goroutine-return-values.md",
+    "challenges/go-concepts/concurrency/01-goroutines-and-scheduling/01-launching-goroutines/01-launching-goroutines.md",
+    "challenges/go-concepts/concurrency/04-sync-primitives/12-mutex-granularity/12-mutex-granularity.md",
+    "challenges/go-concepts/concurrency/01-goroutines-and-scheduling/11-goroutine-error-handling/11-goroutine-error-handling.md",
+    "README.md",
+    "challenges/go-concepts/concurrency/01-goroutines-and-scheduling/02-goroutine-vs-os-thread/02-goroutine-vs-os-thread.md",
+    "challenges/go-concepts/concurrency/02-channels/14-channel-pipeline-basics/14-channel-pipeline-basics.md",
+    "challenges/go-concepts/concurrency/04-sync-primitives/11-waitgroup-patterns/11-waitgroup-patterns.md",
+    "challenges/go-concepts/concurrency/01-goroutines-and-scheduling/10-goroutine-leak-detection/10-goroutine-leak-detection.md",
+    "challenges/go-concepts/concurrency/02-channels/13-channel-timeout-patterns/13-channel-timeout-patterns.md",
+    "challenges/go-concepts/concurrency/03-select-and-multiplexing/10-select-deadlock-prevention/10-select-deadlock-prevention.md",
+    "challenges/go-concepts/concurrency/02-channels/12-channel-ownership-patterns/12-channel-ownership-patterns.md",
+    "challenges/go-concepts/concurrency/01-goroutines-and-scheduling/09-goroutine-lifecycle/09-goroutine-lifecycle.md",
+    "challenges/go-concepts/concurrency/03-select-and-multiplexing/09-select-with-context/09-select-with-context.md",
+    "challenges/go-concepts/concurrency/02-channels/11-channel-error-propagation/11-channel-error-propagation.md",
+    "challenges/go-concepts/concurrency/04-sync-primitives/12-mutex-granularity",
+    "challenges/go-concepts/concurrency/04-sync-primitives/11-waitgroup-patterns",
+    "challenges/go-concepts/concurrency/03-select-and-multiplexing/10-select-deadlock-prevention",
+    "challenges/go-concepts/concurrency/03-select-and-multiplexing/09-select-with-context",
+    "challenges/go-concepts/concurrency/02-channels/14-channel-pipeline-basics",
+    "challenges/go-concepts/concurrency/02-channels/13-channel-timeout-patterns",
+    "challenges/go-concepts/concurrency/02-channels/12-channel-ownership-patterns",
+    "challenges/go-concepts/concurrency/02-channels/11-channel-error-propagation",
+    "challenges/go-concepts/concurrency/01-goroutines-and-scheduling/12-goroutine-return-values",
+    "challenges/go-concepts/concurrency/01-goroutines-and-scheduling/11-goroutine-error-handling",
+    "challenges/go-concepts/concurrency/02-channels/07-nil-channel-behavior/07-nil-channel-behavior.md",
     "challenges/go-concepts/concurrency/02-channels/04-channel-direction/04-channel-direction.md",
     "challenges/go-concepts/concurrency/02-channels/03-buffered-channels/03-buffered-channels.md",
     "challenges/go-concepts/concurrency/02-channels/02-channel-as-synchronization/02-channel-as-synchronization.md",
-    "challenges/go-concepts/concurrency/02-channels/02-channel-as-synchronization/fragile_sleep.go",
-    "challenges/go-concepts/concurrency/02-channels/02-channel-as-synchronization/go.mod",
     "challenges/go-concepts/concurrency/02-channels/01-unbuffered-channel-basics/01-unbuffered-channel-basics.md",
-    "challenges/go-concepts/concurrency/02-channels/01-unbuffered-channel-basics/channels_typed.go",
-    "challenges/go-concepts/concurrency/02-channels/01-unbuffered-channel-basics/multiple_values.go",
-    "challenges/go-concepts/concurrency/02-channels/01-unbuffered-channel-basics/create_channel.go",
     "challenges/go-concepts/concurrency/01-goroutines-and-scheduling/04-goroutine-stack-growth/04-goroutine-stack-growth.md",
     "challenges/go-concepts/concurrency/01-goroutines-and-scheduling/03-gmp-model-in-action/03-gmp-model-in-action.md",
-    "challenges/go-concepts/concurrency/01-goroutines-and-scheduling/02-goroutine-vs-os-thread/02-goroutine-vs-os-thread.md",
-    "challenges/go-concepts/concurrency/01-goroutines-and-scheduling/02-goroutine-vs-os-thread/counting_active_goroutines.go",
-    "challenges/go-concepts/concurrency/01-goroutines-and-scheduling/01-launching-goroutines/01-launching-goroutines.md",
-    "challenges/go-concepts/concurrency/01-goroutines-and-scheduling/get_return_value.go",
-    "challenges/go-concepts/concurrency/01-goroutines-and-scheduling/fanout_pattern.go",
-    "challenges/go-concepts/concurrency/01-goroutines-and-scheduling/passing_arguments.go",
-    "challenges/go-concepts/concurrency/01-goroutines-and-scheduling/passi_arguments.go",
     "Run code.md",
-    "README.md",
     "challenges/go-concepts/concurrency/concurrency.md",
     "challenges/go-concepts/go-concepts.md",
     "challenges/go-concepts/concurrency/04-sync-primitives/10-build-thread-safe-counter/10-build-thread-safe-counter.md",
-    "challenges/go-concepts/concurrency/07-concurrency-patterns/10-end-to-end-pipeline-with-cancel/10-end-to-end-pipeline-with-cancel.md",
-    "challenges/go-concepts/concurrency/04-sync-primitives/09-sync-map-concurrent-access/09-sync-map-concurrent-access.md",
-    "challenges/go-concepts/concurrency/07-concurrency-patterns/09-rate-limiter-token-bucket/09-rate-limiter-token-bucket.md",
-    "challenges/go-concepts/concurrency/02-channels/10-channel-vs-shared-memory/10-channel-vs-shared-memory.md",
-    "challenges/go-concepts/concurrency/01-goroutines-and-scheduling/08-million-goroutines/08-million-goroutines.md",
-    "challenges/go-concepts/concurrency/09-data-races-and-detector/08-race-free-design-patterns/08-race-free-design-patterns.md",
-    "challenges/go-concepts/concurrency/04-sync-primitives/08-nested-locking-deadlock/08-nested-locking-deadlock.md",
-    "challenges/go-concepts/concurrency/07-concurrency-patterns/08-tee-channel-split-stream/08-tee-channel-split-stream.md",
-    "challenges/go-concepts/concurrency/06-context/08-graceful-shutdown-with-context/08-graceful-shutdown-with-context.md",
-    "challenges/go-concepts/concurrency/02-channels/09-buffered-channel-as-semaphore/09-buffered-channel-as-semaphore.md",
-    "challenges/go-concepts/concurrency/08-errgroup/06-errgroup-parallel-pipeline/06-errgroup-parallel-pipeline.md",
-    "challenges/go-concepts/concurrency/05-atomic-and-memory-ordering/07-atomic-vs-mutex-benchmark/07-atomic-vs-mutex-benchmark.md",
-    "challenges/go-concepts/concurrency/09-data-races-and-detector/07-race-in-closure-loops/07-race-in-closure-loops.md",
     "Presentacion/poc-just/web/node_modules/ordered-binary/assets/powers-dre.png",
     "Presentacion/poc-just/web/node_modules/retry/equation.gif",
     "Untitled.canvas"

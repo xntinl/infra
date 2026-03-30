@@ -40,28 +40,37 @@ Demonstrate that a nil channel blocks on both send and receive. This is not a bu
 package main
 
 import (
-    "fmt"
-    "time"
+	"fmt"
+	"time"
 )
 
+const nilProbeTimeout = 200 * time.Millisecond
+
+// proveReceiveBlocks shows that receiving from a nil channel blocks forever,
+// using a select with a timeout to avoid a deadlock.
+func proveReceiveBlocks(ch <-chan int, timeout time.Duration) {
+	select {
+	case val := <-ch:
+		fmt.Println("received:", val) // never happens
+	case <-time.After(timeout):
+		fmt.Println("receive on nil channel: blocked (timed out as expected)")
+	}
+}
+
+// proveSendBlocks shows that sending on a nil channel blocks forever.
+func proveSendBlocks(ch chan<- int, timeout time.Duration) {
+	select {
+	case ch <- 42:
+		fmt.Println("sent") // never happens
+	case <-time.After(timeout):
+		fmt.Println("send on nil channel: blocked (timed out as expected)")
+	}
+}
+
 func main() {
-    var ch chan int // nil -- not initialized with make()
-
-    // Prove receive blocks by racing against a timeout.
-    select {
-    case val := <-ch:
-        fmt.Println("received:", val) // never happens
-    case <-time.After(200 * time.Millisecond):
-        fmt.Println("receive on nil channel: blocked (timed out as expected)")
-    }
-
-    // Prove send blocks the same way.
-    select {
-    case ch <- 42:
-        fmt.Println("sent") // never happens
-    case <-time.After(200 * time.Millisecond):
-        fmt.Println("send on nil channel: blocked (timed out as expected)")
-    }
+	var ch chan int // nil -- not initialized with make()
+	proveReceiveBlocks(ch, nilProbeTimeout)
+	proveSendBlocks(ch, nilProbeTimeout)
 }
 ```
 
@@ -84,17 +93,23 @@ package main
 
 import "fmt"
 
-func main() {
-    var dbStream chan string    // nil -- this case will be skipped
-    cacheStream := make(chan string, 1)
-    cacheStream <- "user:42:cached"
+// selectFromStreams demonstrates that nil channels are skipped in select.
+// Only non-nil channels with data are eligible for selection.
+func selectFromStreams(dbStream <-chan string, cacheStream <-chan string) {
+	select {
+	case val := <-dbStream:
+		fmt.Println("from database:", val) // never chosen -- dbStream is nil
+	case val := <-cacheStream:
+		fmt.Println("from cache:", val) // always chosen
+	}
+}
 
-    select {
-    case val := <-dbStream:
-        fmt.Println("from database:", val) // never chosen -- dbStream is nil
-    case val := <-cacheStream:
-        fmt.Println("from cache:", val) // always chosen
-    }
+func main() {
+	var dbStream chan string // nil -- this case will be skipped
+	cacheStream := make(chan string, 1)
+	cacheStream <- "user:42:cached"
+
+	selectFromStreams(dbStream, cacheStream)
 }
 ```
 
@@ -115,56 +130,64 @@ package main
 
 import "fmt"
 
+// sortedStream sends each value in order and closes the channel.
 func sortedStream(values []int) <-chan int {
-    ch := make(chan int)
-    go func() {
-        for _, v := range values {
-            ch <- v
-        }
-        close(ch)
-    }()
-    return ch
+	ch := make(chan int)
+	go func() {
+		for _, v := range values {
+			ch <- v
+		}
+		close(ch)
+	}()
+	return ch
 }
 
-func mergeSorted(a, b <-chan int) <-chan int {
-    out := make(chan int)
-    go func() {
-        defer close(out)
-        // Loop while at least one stream is still open (non-nil).
-        for a != nil || b != nil {
-            select {
-            case val, ok := <-a:
-                if !ok {
-                    fmt.Println("  [merge] stream A exhausted -- disabling")
-                    a = nil // disable this case in select
-                    continue
-                }
-                out <- val
-            case val, ok := <-b:
-                if !ok {
-                    fmt.Println("  [merge] stream B exhausted -- disabling")
-                    b = nil // disable this case in select
-                    continue
-                }
-                out <- val
-            }
-        }
-    }()
-    return out
+// mergeSorted merges two channels into one. When a source closes, it is
+// set to nil so select stops considering it. The loop exits when both are nil.
+func mergeSorted(streamA, streamB <-chan int) <-chan int {
+	out := make(chan int)
+	go func() {
+		defer close(out)
+		for streamA != nil || streamB != nil {
+			select {
+			case val, ok := <-streamA:
+				if !ok {
+					fmt.Println("  [merge] stream A exhausted -- disabling")
+					streamA = nil
+					continue
+				}
+				out <- val
+			case val, ok := <-streamB:
+				if !ok {
+					fmt.Println("  [merge] stream B exhausted -- disabling")
+					streamB = nil
+					continue
+				}
+				out <- val
+			}
+		}
+	}()
+	return out
+}
+
+// drainAndCount receives all values from merged, prints them, and returns the count.
+func drainAndCount(merged <-chan int) int {
+	count := 0
+	for val := range merged {
+		fmt.Printf("  %d\n", val)
+		count++
+	}
+	return count
 }
 
 func main() {
-    // Two sorted streams of different lengths.
-    streamA := sortedStream([]int{10, 30, 50})
-    streamB := sortedStream([]int{20, 40, 60, 80, 100})
+	streamA := sortedStream([]int{10, 30, 50})
+	streamB := sortedStream([]int{20, 40, 60, 80, 100})
 
-    fmt.Println("Merged output:")
-    count := 0
-    for val := range mergeSorted(streamA, streamB) {
-        fmt.Printf("  %d\n", val)
-        count++
-    }
-    fmt.Printf("Merge complete: %d values from both streams\n", count)
+	fmt.Println("Merged output:")
+	merged := mergeSorted(streamA, streamB)
+	count := drainAndCount(merged)
+	fmt.Printf("Merge complete: %d values from both streams\n", count)
 }
 ```
 
@@ -185,84 +208,88 @@ Extend the pattern to merge three sources -- a scenario you encounter when aggre
 package main
 
 import (
-    "fmt"
-    "time"
+	"fmt"
+	"time"
 )
 
+// Event represents a message from one of the microservices.
 type Event struct {
-    Source string
-    Data   string
+	Source string
+	Data   string
 }
 
+// eventStream produces events at the given rate, then closes the channel.
 func eventStream(source string, events []string, delay time.Duration) <-chan Event {
-    ch := make(chan Event)
-    go func() {
-        for _, e := range events {
-            time.Sleep(delay)
-            ch <- Event{Source: source, Data: e}
-        }
-        close(ch)
-    }()
-    return ch
+	ch := make(chan Event)
+	go func() {
+		for _, data := range events {
+			time.Sleep(delay)
+			ch <- Event{Source: source, Data: data}
+		}
+		close(ch)
+	}()
+	return ch
 }
 
-func mergeEvents(sources ...<-chan Event) <-chan Event {
-    out := make(chan Event)
-    go func() {
-        defer close(out)
-        active := make([]<-chan Event, len(sources))
-        copy(active, sources)
+// allSourcesExhausted returns true when every channel in the slice is nil.
+func allSourcesExhausted(sources []<-chan Event) bool {
+	for _, ch := range sources {
+		if ch != nil {
+			return false
+		}
+	}
+	return true
+}
 
-        for {
-            allNil := true
-            for _, ch := range active {
-                if ch != nil {
-                    allNil = false
-                    break
-                }
-            }
-            if allNil {
-                return
-            }
+// mergeThreeSources merges exactly three event channels using nil-disabling.
+// For 3 known sources, explicit select is clearer than reflect-based approaches.
+func mergeThreeSources(sources [3]<-chan Event) <-chan Event {
+	out := make(chan Event)
+	go func() {
+		defer close(out)
+		active := sources[:]
+		slice := make([]<-chan Event, len(active))
+		copy(slice, active[:])
 
-            // Build select dynamically using reflect would be complex.
-            // For 3 known sources, explicit select is clearer.
-            select {
-            case ev, ok := <-active[0]:
-                if !ok {
-                    active[0] = nil
-                    continue
-                }
-                out <- ev
-            case ev, ok := <-active[1]:
-                if !ok {
-                    active[1] = nil
-                    continue
-                }
-                out <- ev
-            case ev, ok := <-active[2]:
-                if !ok {
-                    active[2] = nil
-                    continue
-                }
-                out <- ev
-            }
-        }
-    }()
-    return out
+		for !allSourcesExhausted(slice) {
+			select {
+			case ev, ok := <-slice[0]:
+				if !ok {
+					slice[0] = nil
+					continue
+				}
+				out <- ev
+			case ev, ok := <-slice[1]:
+				if !ok {
+					slice[1] = nil
+					continue
+				}
+				out <- ev
+			case ev, ok := <-slice[2]:
+				if !ok {
+					slice[2] = nil
+					continue
+				}
+				out <- ev
+			}
+		}
+	}()
+	return out
 }
 
 func main() {
-    // Three services with different speeds and data volumes.
-    userSvc := eventStream("users", []string{"user-created", "user-updated"}, 30*time.Millisecond)
-    orderSvc := eventStream("orders", []string{"order-placed", "order-shipped", "order-delivered"}, 20*time.Millisecond)
-    paymentSvc := eventStream("payments", []string{"payment-received"}, 50*time.Millisecond)
+	userSvc := eventStream("users", []string{"user-created", "user-updated"}, 30*time.Millisecond)
+	orderSvc := eventStream("orders", []string{"order-placed", "order-shipped", "order-delivered"}, 20*time.Millisecond)
+	paymentSvc := eventStream("payments", []string{"payment-received"}, 50*time.Millisecond)
 
-    fmt.Println("Aggregating events from 3 services:")
-    for ev := range mergeEvents(userSvc, orderSvc, paymentSvc) {
-        fmt.Printf("  [%-8s] %s\n", ev.Source, ev.Data)
-    }
-    fmt.Println("All services exhausted")
+	sources := [3]<-chan Event{userSvc, orderSvc, paymentSvc}
+	merged := mergeThreeSources(sources)
+
+	fmt.Println("Aggregating events from 3 services:")
+	for ev := range merged {
+		fmt.Printf("  [%-8s] %s\n", ev.Source, ev.Data)
+	}
+	fmt.Println("All services exhausted")
 }
 ```
 
@@ -280,53 +307,93 @@ Use nil channels to model a worker with pause/resume capabilities. When paused, 
 package main
 
 import (
-    "fmt"
-    "time"
+	"fmt"
+	"time"
 )
 
+const (
+	taskQueueSize        = 10
+	totalDeployTasks     = 8
+	taskExecDuration     = 40 * time.Millisecond
+	preMaintenanceDelay  = 150 * time.Millisecond
+	maintenanceDuration  = 200 * time.Millisecond
+	postResumeDelay      = 250 * time.Millisecond
+)
+
+// PausableWorker processes tasks from a channel and can be paused/resumed
+// at runtime by setting its active channel to nil or restoring it.
+type PausableWorker struct {
+	tasks    chan string
+	pauseCh  chan struct{}
+	resumeCh chan struct{}
+	done     chan struct{}
+}
+
+// NewPausableWorker creates a worker with the given task queue size.
+func NewPausableWorker(queueSize int) *PausableWorker {
+	return &PausableWorker{
+		tasks:    make(chan string, queueSize),
+		pauseCh:  make(chan struct{}),
+		resumeCh: make(chan struct{}),
+		done:     make(chan struct{}),
+	}
+}
+
+// Run processes tasks until the channel is closed. Pause/resume signals
+// toggle the active channel between the real channel and nil.
+func (pw *PausableWorker) Run() {
+	active := pw.tasks
+	for {
+		select {
+		case task, ok := <-active:
+			if !ok {
+				fmt.Println("Worker: all tasks complete, exiting")
+				pw.done <- struct{}{}
+				return
+			}
+			fmt.Println("Worker: executing", task)
+			time.Sleep(taskExecDuration)
+		case <-pw.pauseCh:
+			fmt.Println("Worker: PAUSED (maintenance window)")
+			active = nil
+		case <-pw.resumeCh:
+			fmt.Println("Worker: RESUMED")
+			active = pw.tasks
+		}
+	}
+}
+
+// Pause signals the worker to stop processing tasks.
+func (pw *PausableWorker) Pause()  { pw.pauseCh <- struct{}{} }
+
+// Resume signals the worker to continue processing.
+func (pw *PausableWorker) Resume() { pw.resumeCh <- struct{}{} }
+
+// Shutdown closes the task channel and waits for the worker to exit.
+func (pw *PausableWorker) Shutdown() {
+	close(pw.tasks)
+	<-pw.done
+}
+
 func main() {
-    tasks := make(chan string, 10)
-    pauseCh := make(chan struct{})
-    resumeCh := make(chan struct{})
-    done := make(chan struct{})
+	worker := NewPausableWorker(taskQueueSize)
 
-    for i := 1; i <= 8; i++ {
-        tasks <- fmt.Sprintf("deploy-service-%d", i)
-    }
+	for i := 1; i <= totalDeployTasks; i++ {
+		worker.tasks <- fmt.Sprintf("deploy-service-%d", i)
+	}
 
-    go func() {
-        active := tasks // start in active state
-        for {
-            select {
-            case task, ok := <-active:
-                if !ok {
-                    fmt.Println("Worker: all tasks complete, exiting")
-                    done <- struct{}{}
-                    return
-                }
-                fmt.Println("Worker: executing", task)
-                time.Sleep(40 * time.Millisecond)
-            case <-pauseCh:
-                fmt.Println("Worker: PAUSED (maintenance window)")
-                active = nil // nil disables the task case in select
-            case <-resumeCh:
-                fmt.Println("Worker: RESUMED")
-                active = tasks // restore to re-enable
-            }
-        }
-    }()
+	go worker.Run()
 
-    time.Sleep(150 * time.Millisecond) // let worker process some tasks
-    pauseCh <- struct{}{}
-    fmt.Println("Main: pause sent -- simulating maintenance window")
+	time.Sleep(preMaintenanceDelay)
+	worker.Pause()
+	fmt.Println("Main: pause sent -- simulating maintenance window")
 
-    time.Sleep(200 * time.Millisecond) // maintenance period
-    resumeCh <- struct{}{}
-    fmt.Println("Main: resume sent -- maintenance complete")
+	time.Sleep(maintenanceDuration)
+	worker.Resume()
+	fmt.Println("Main: resume sent -- maintenance complete")
 
-    time.Sleep(250 * time.Millisecond)
-    close(tasks)
-    <-done
+	time.Sleep(postResumeDelay)
+	worker.Shutdown()
 }
 ```
 

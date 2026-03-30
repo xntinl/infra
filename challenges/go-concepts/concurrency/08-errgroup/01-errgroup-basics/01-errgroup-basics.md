@@ -35,41 +35,64 @@ import (
 	"time"
 )
 
-func main() {
-	services := []string{"postgres", "redis", "rabbitmq", "s3"}
+type ServiceName string
 
-	fmt.Println("=== Sequential Health Check ===")
-	start := time.Now()
+const (
+	Postgres ServiceName = "postgres"
+	Redis    ServiceName = "redis"
+	RabbitMQ ServiceName = "rabbitmq"
+	S3       ServiceName = "s3"
+)
 
-	for _, svc := range services {
-		if err := checkHealth(svc); err != nil {
-			fmt.Printf("FAIL: %v\n", err)
-			fmt.Printf("Total time: %v\n", time.Since(start).Round(time.Millisecond))
-			return
+type HealthChecker struct {
+	services []ServiceName
+}
+
+func NewHealthChecker(services []ServiceName) *HealthChecker {
+	return &HealthChecker{services: services}
+}
+
+func (hc *HealthChecker) RunSequential() error {
+	for _, svc := range hc.services {
+		if err := hc.checkHealth(svc); err != nil {
+			return err
 		}
 		fmt.Printf("  OK: %s\n", svc)
 	}
-
-	fmt.Printf("All services healthy. Total time: %v\n", time.Since(start).Round(time.Millisecond))
+	return nil
 }
 
-func checkHealth(service string) error {
+func (hc *HealthChecker) checkHealth(service ServiceName) error {
 	switch service {
-	case "postgres":
+	case Postgres:
 		time.Sleep(120 * time.Millisecond) // simulates TCP connect + ping
 		return nil
-	case "redis":
+	case Redis:
 		time.Sleep(30 * time.Millisecond)
 		return nil
-	case "rabbitmq":
+	case RabbitMQ:
 		time.Sleep(80 * time.Millisecond)
 		return fmt.Errorf("rabbitmq: connection refused on port 5672")
-	case "s3":
+	case S3:
 		time.Sleep(150 * time.Millisecond)
 		return nil
 	default:
 		return fmt.Errorf("unknown service: %s", service)
 	}
+}
+
+func main() {
+	checker := NewHealthChecker([]ServiceName{Postgres, Redis, RabbitMQ, S3})
+
+	fmt.Println("=== Sequential Health Check ===")
+	start := time.Now()
+
+	if err := checker.RunSequential(); err != nil {
+		fmt.Printf("FAIL: %v\n", err)
+	} else {
+		fmt.Print("All services healthy. ")
+	}
+	fmt.Printf("Total time: %v\n", time.Since(start).Round(time.Millisecond))
 }
 ```
 
@@ -101,26 +124,38 @@ import (
 	"time"
 )
 
-func main() {
-	services := []string{"postgres", "redis", "rabbitmq", "s3"}
+type ServiceName string
 
-	fmt.Println("=== Parallel Health Check (manual errgroup) ===")
+const (
+	Postgres ServiceName = "postgres"
+	Redis    ServiceName = "redis"
+	RabbitMQ ServiceName = "rabbitmq"
+	S3       ServiceName = "s3"
+)
+
+type HealthChecker struct {
+	services []ServiceName
+}
+
+func NewHealthChecker(services []ServiceName) *HealthChecker {
+	return &HealthChecker{services: services}
+}
+
+func (hc *HealthChecker) RunParallel() error {
 	start := time.Now()
 
 	var wg sync.WaitGroup
 	var once sync.Once
 	var firstErr error
 
-	for _, svc := range services {
+	for _, svc := range hc.services {
 		svc := svc
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 
-			if err := checkHealth(svc); err != nil {
-				once.Do(func() {
-					firstErr = err
-				})
+			if err := hc.checkHealth(svc); err != nil {
+				once.Do(func() { firstErr = err })
 				return
 			}
 			fmt.Printf("  OK: %s (%v)\n", svc, time.Since(start).Round(time.Millisecond))
@@ -128,32 +163,39 @@ func main() {
 	}
 
 	wg.Wait()
-	elapsed := time.Since(start).Round(time.Millisecond)
-
-	if firstErr != nil {
-		fmt.Printf("FAIL: %v\n", firstErr)
-		fmt.Printf("Total time: %v (all checks ran in parallel)\n", elapsed)
-	} else {
-		fmt.Printf("All services healthy. Total time: %v\n", elapsed)
-	}
+	return firstErr
 }
 
-func checkHealth(service string) error {
+func (hc *HealthChecker) checkHealth(service ServiceName) error {
 	switch service {
-	case "postgres":
+	case Postgres:
 		time.Sleep(120 * time.Millisecond)
 		return nil
-	case "redis":
+	case Redis:
 		time.Sleep(30 * time.Millisecond)
 		return nil
-	case "rabbitmq":
+	case RabbitMQ:
 		time.Sleep(80 * time.Millisecond)
 		return fmt.Errorf("rabbitmq: connection refused on port 5672")
-	case "s3":
+	case S3:
 		time.Sleep(150 * time.Millisecond)
 		return nil
 	default:
 		return fmt.Errorf("unknown service: %s", service)
+	}
+}
+
+func main() {
+	checker := NewHealthChecker([]ServiceName{Postgres, Redis, RabbitMQ, S3})
+
+	fmt.Println("=== Parallel Health Check (manual errgroup) ===")
+	start := time.Now()
+
+	if err := checker.RunParallel(); err != nil {
+		fmt.Printf("FAIL: %v\n", err)
+		fmt.Printf("Total time: %v (all checks ran in parallel)\n", time.Since(start).Round(time.Millisecond))
+	} else {
+		fmt.Printf("All services healthy. Total time: %v\n", time.Since(start).Round(time.Millisecond))
 	}
 }
 ```
@@ -185,26 +227,38 @@ import (
 	"time"
 )
 
-func main() {
-	services := []string{"postgres", "redis", "rabbitmq", "s3"}
+type ServiceName string
 
-	fmt.Println("=== Multiple Failures ===")
+const (
+	Postgres ServiceName = "postgres"
+	Redis    ServiceName = "redis"
+	RabbitMQ ServiceName = "rabbitmq"
+	S3       ServiceName = "s3"
+)
+
+type HealthChecker struct {
+	services []ServiceName
+}
+
+func NewHealthChecker(services []ServiceName) *HealthChecker {
+	return &HealthChecker{services: services}
+}
+
+func (hc *HealthChecker) RunParallelAllFailing() error {
 	start := time.Now()
 
 	var wg sync.WaitGroup
 	var once sync.Once
 	var firstErr error
 
-	for _, svc := range services {
+	for _, svc := range hc.services {
 		svc := svc
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 
-			if err := checkHealthAllFailing(svc); err != nil {
-				once.Do(func() {
-					firstErr = err
-				})
+			if err := hc.checkHealthMostFailing(svc); err != nil {
+				once.Do(func() { firstErr = err })
 				fmt.Printf("  FAIL: %s (%v)\n", svc, time.Since(start).Round(time.Millisecond))
 				return
 			}
@@ -213,26 +267,35 @@ func main() {
 	}
 
 	wg.Wait()
-	fmt.Printf("\nWait returned: %v (only the first error is kept)\n", firstErr)
+	return firstErr
 }
 
-func checkHealthAllFailing(service string) error {
+func (hc *HealthChecker) checkHealthMostFailing(service ServiceName) error {
 	switch service {
-	case "postgres":
+	case Postgres:
 		time.Sleep(120 * time.Millisecond)
 		return fmt.Errorf("postgres: authentication failed")
-	case "redis":
+	case Redis:
 		time.Sleep(30 * time.Millisecond)
 		return nil // redis is OK
-	case "rabbitmq":
+	case RabbitMQ:
 		time.Sleep(80 * time.Millisecond)
 		return fmt.Errorf("rabbitmq: connection refused")
-	case "s3":
+	case S3:
 		time.Sleep(150 * time.Millisecond)
 		return fmt.Errorf("s3: bucket not found")
 	default:
 		return fmt.Errorf("unknown service: %s", service)
 	}
+}
+
+func main() {
+	checker := NewHealthChecker([]ServiceName{Postgres, Redis, RabbitMQ, S3})
+
+	fmt.Println("=== Multiple Failures ===")
+
+	firstErr := checker.RunParallelAllFailing()
+	fmt.Printf("\nWait returned: %v (only the first error is kept)\n", firstErr)
 }
 ```
 
@@ -262,25 +325,33 @@ import (
 	"time"
 )
 
+type HealthCheckFn func() error
+
 type HealthCheck struct {
 	Name string
-	Fn   func() error
+	Fn   HealthCheckFn
 }
 
-func runChecksParallel(checks []HealthCheck) error {
+type HealthChecker struct {
+	checks []HealthCheck
+}
+
+func NewHealthChecker(checks []HealthCheck) *HealthChecker {
+	return &HealthChecker{checks: checks}
+}
+
+func (hc *HealthChecker) RunAllParallel() error {
 	var wg sync.WaitGroup
 	var once sync.Once
 	var firstErr error
 
-	for _, check := range checks {
+	for _, check := range hc.checks {
 		check := check
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			if err := check.Fn(); err != nil {
-				once.Do(func() {
-					firstErr = err
-				})
+				once.Do(func() { firstErr = err })
 			}
 		}()
 	}
@@ -289,30 +360,28 @@ func runChecksParallel(checks []HealthCheck) error {
 	return firstErr
 }
 
-func main() {
-	checks := []HealthCheck{
-		{Name: "postgres", Fn: func() error {
-			time.Sleep(120 * time.Millisecond)
-			return nil
-		}},
-		{Name: "redis", Fn: func() error {
-			time.Sleep(30 * time.Millisecond)
-			return nil
-		}},
-		{Name: "rabbitmq", Fn: func() error {
-			time.Sleep(80 * time.Millisecond)
-			return fmt.Errorf("rabbitmq: connection refused on port 5672")
-		}},
-		{Name: "s3", Fn: func() error {
-			time.Sleep(150 * time.Millisecond)
-			return nil
-		}},
+func simulateService(latency time.Duration, errMsg string) HealthCheckFn {
+	return func() error {
+		time.Sleep(latency)
+		if errMsg != "" {
+			return fmt.Errorf("%s", errMsg)
+		}
+		return nil
 	}
+}
+
+func main() {
+	checker := NewHealthChecker([]HealthCheck{
+		{Name: "postgres", Fn: simulateService(120*time.Millisecond, "")},
+		{Name: "redis", Fn: simulateService(30*time.Millisecond, "")},
+		{Name: "rabbitmq", Fn: simulateService(80*time.Millisecond, "rabbitmq: connection refused on port 5672")},
+		{Name: "s3", Fn: simulateService(150*time.Millisecond, "")},
+	})
 
 	fmt.Println("=== Reusable Health Checker ===")
 	start := time.Now()
 
-	if err := runChecksParallel(checks); err != nil {
+	if err := checker.RunAllParallel(); err != nil {
 		fmt.Printf("Deployment blocked: %v\n", err)
 	} else {
 		fmt.Println("All services healthy -- deploy!")

@@ -30,26 +30,41 @@ package main
 
 import "fmt"
 
-func main() {
-	urgent := make(chan string, 100)
-	normal := make(chan string, 100)
+const taskCount = 100
 
-	for i := 0; i < 100; i++ {
+type ProcessingStats struct {
+	UrgentProcessed int
+	NormalProcessed int
+}
+
+func fillTaskQueues(urgent, normal chan<- string, count int) {
+	for i := 0; i < count; i++ {
 		urgent <- fmt.Sprintf("URGENT: payment-failure-%d", i)
 		normal <- fmt.Sprintf("normal: generate-report-%d", i)
 	}
+}
 
-	urgentProcessed, normalProcessed := 0, 0
-	for i := 0; i < 100; i++ {
+func processFlatSelect(urgent, normal <-chan string, iterations int) ProcessingStats {
+	var stats ProcessingStats
+	for i := 0; i < iterations; i++ {
 		select {
 		case <-urgent:
-			urgentProcessed++
+			stats.UrgentProcessed++
 		case <-normal:
-			normalProcessed++
+			stats.NormalProcessed++
 		}
 	}
+	return stats
+}
 
-	fmt.Printf("urgent: %d, normal: %d\n", urgentProcessed, normalProcessed)
+func main() {
+	urgent := make(chan string, taskCount)
+	normal := make(chan string, taskCount)
+
+	fillTaskQueues(urgent, normal, taskCount)
+
+	stats := processFlatSelect(urgent, normal, taskCount)
+	fmt.Printf("urgent: %d, normal: %d\n", stats.UrgentProcessed, stats.NormalProcessed)
 	fmt.Println("Problem: urgent tasks get ~50%% of attention, not 100%%")
 }
 ```
@@ -71,35 +86,47 @@ package main
 
 import "fmt"
 
-func main() {
-	urgent := make(chan string, 100)
-	normal := make(chan string, 100)
+const taskCount = 100
 
-	for i := 0; i < 100; i++ {
+type ProcessingStats struct {
+	UrgentProcessed int
+	NormalProcessed int
+}
+
+func fillTaskQueues(urgent, normal chan<- string, count int) {
+	for i := 0; i < count; i++ {
 		urgent <- fmt.Sprintf("URGENT: payment-failure-%d", i)
 		normal <- fmt.Sprintf("normal: generate-report-%d", i)
 	}
+}
 
-	urgentProcessed, normalProcessed := 0, 0
-	for i := 0; i < 200; i++ {
+func processPrioritySelect(urgent, normal <-chan string, iterations int) ProcessingStats {
+	var stats ProcessingStats
+	for i := 0; i < iterations; i++ {
 		select {
-		case task := <-urgent:
-			urgentProcessed++
-			_ = task
+		case <-urgent:
+			stats.UrgentProcessed++
 		default:
 			// Urgent queue empty — check both queues.
 			select {
-			case task := <-urgent:
-				urgentProcessed++
-				_ = task
-			case task := <-normal:
-				normalProcessed++
-				_ = task
+			case <-urgent:
+				stats.UrgentProcessed++
+			case <-normal:
+				stats.NormalProcessed++
 			}
 		}
 	}
+	return stats
+}
 
-	fmt.Printf("urgent: %d, normal: %d\n", urgentProcessed, normalProcessed)
+func main() {
+	urgent := make(chan string, taskCount)
+	normal := make(chan string, taskCount)
+
+	fillTaskQueues(urgent, normal, taskCount)
+
+	stats := processPrioritySelect(urgent, normal, 2*taskCount)
+	fmt.Printf("urgent: %d, normal: %d\n", stats.UrgentProcessed, stats.NormalProcessed)
 	fmt.Println("All urgent tasks processed before normal tasks get attention")
 }
 ```
@@ -125,28 +152,34 @@ import (
 	"time"
 )
 
-func main() {
-	urgentCh := make(chan string, 10)
-	normalCh := make(chan string, 10)
-	done := make(chan struct{})
+const (
+	urgentTaskCount  = 5
+	normalTaskCount  = 20
+	urgentInterval   = 50 * time.Millisecond
+	normalInterval   = 10 * time.Millisecond
+	channelBuffer    = 10
+)
 
-	// Urgent tasks: 5 payment failures, 50ms apart.
+func produceUrgentTasks(urgentCh chan<- string, count int, interval time.Duration) {
 	go func() {
-		for i := 0; i < 5; i++ {
+		for i := 0; i < count; i++ {
 			urgentCh <- fmt.Sprintf("URGENT: payment-failure-%d", i)
-			time.Sleep(50 * time.Millisecond)
+			time.Sleep(interval)
 		}
 	}()
+}
 
-	// Normal tasks: 20 report requests, 10ms apart.
+func produceNormalTasks(normalCh chan<- string, done chan<- struct{}, count int, interval time.Duration) {
 	go func() {
-		for i := 0; i < 20; i++ {
+		for i := 0; i < count; i++ {
 			normalCh <- fmt.Sprintf("normal: report-%d", i)
-			time.Sleep(10 * time.Millisecond)
+			time.Sleep(interval)
 		}
 		close(done)
 	}()
+}
 
+func processWithPriority(urgentCh, normalCh <-chan string, done <-chan struct{}) {
 	for {
 		select {
 		case task := <-urgentCh:
@@ -163,6 +196,17 @@ func main() {
 			}
 		}
 	}
+}
+
+func main() {
+	urgentCh := make(chan string, channelBuffer)
+	normalCh := make(chan string, channelBuffer)
+	done := make(chan struct{})
+
+	produceUrgentTasks(urgentCh, urgentTaskCount, urgentInterval)
+	produceNormalTasks(normalCh, done, normalTaskCount, normalInterval)
+
+	processWithPriority(urgentCh, normalCh, done)
 }
 ```
 
@@ -186,33 +230,47 @@ package main
 
 import "fmt"
 
-func main() {
-	urgent := make(chan string, 50)
-	normal := make(chan string, 50)
+const taskCount = 50
 
-	for i := 0; i < 50; i++ {
+type PriorityStats struct {
+	UrgentWins int
+	NormalWins int
+}
+
+func fillQueues(urgent, normal chan<- string, count int) {
+	for i := 0; i < count; i++ {
 		urgent <- "payment-failure"
 		normal <- "generate-report"
 	}
+}
 
-	urgentWins, normalWins := 0, 0
-
-	for i := 0; i < 50; i++ {
+func measurePriorityBias(urgent, normal <-chan string, iterations int) PriorityStats {
+	var stats PriorityStats
+	for i := 0; i < iterations; i++ {
 		select {
 		case <-urgent:
-			urgentWins++
+			stats.UrgentWins++
 		default:
 			select {
 			case <-urgent:
-				urgentWins++
+				stats.UrgentWins++
 			case <-normal:
-				normalWins++
+				stats.NormalWins++
 			}
 		}
 	}
+	return stats
+}
 
-	fmt.Printf("urgent: %d, normal: %d\n", urgentWins, normalWins)
-	if normalWins > 0 {
+func main() {
+	urgent := make(chan string, taskCount)
+	normal := make(chan string, taskCount)
+
+	fillQueues(urgent, normal, taskCount)
+
+	stats := measurePriorityBias(urgent, normal, taskCount)
+	fmt.Printf("urgent: %d, normal: %d\n", stats.UrgentWins, stats.NormalWins)
+	if stats.NormalWins > 0 {
 		fmt.Println("normalWins > 0 proves priority is best-effort, not absolute")
 		fmt.Println("In practice this is acceptable: urgent tasks get ~95%+ of priority")
 	}
@@ -240,44 +298,69 @@ import (
 	"sync"
 )
 
+type Priority int
+
+const (
+	PriorityCritical Priority = 1
+	PriorityHigh     Priority = 2
+	PriorityNormal   Priority = 3
+)
+
 type Task struct {
-	name     string
-	priority int // lower = higher priority
+	Name     string
+	Priority Priority
 }
 
 type TaskQueue []*Task
 
-func (q TaskQueue) Len() int            { return len(q) }
-func (q TaskQueue) Less(i, j int) bool  { return q[i].priority < q[j].priority }
-func (q TaskQueue) Swap(i, j int)       { q[i], q[j] = q[j], q[i] }
-func (q *TaskQueue) Push(x interface{}) { *q = append(*q, x.(*Task)) }
+func (q TaskQueue) Len() int              { return len(q) }
+func (q TaskQueue) Less(i, j int) bool    { return q[i].Priority < q[j].Priority }
+func (q TaskQueue) Swap(i, j int)         { q[i], q[j] = q[j], q[i] }
+func (q *TaskQueue) Push(x interface{})   { *q = append(*q, x.(*Task)) }
 func (q *TaskQueue) Pop() interface{} {
 	old := *q
-	n := len(old)
-	task := old[n-1]
-	*q = old[:n-1]
+	lastIndex := len(old) - 1
+	task := old[lastIndex]
+	*q = old[:lastIndex]
 	return task
 }
 
-func main() {
-	var mu sync.Mutex
-	pq := &TaskQueue{}
-	heap.Init(pq)
+type PriorityScheduler struct {
+	mu    sync.Mutex
+	queue TaskQueue
+}
 
-	mu.Lock()
-	heap.Push(pq, &Task{name: "generate-report", priority: 3})
-	heap.Push(pq, &Task{name: "payment-failure", priority: 1})
-	heap.Push(pq, &Task{name: "send-email-batch", priority: 2})
-	heap.Push(pq, &Task{name: "security-alert", priority: 1})
-	heap.Push(pq, &Task{name: "update-dashboard", priority: 3})
-	mu.Unlock()
+func NewPriorityScheduler() *PriorityScheduler {
+	scheduler := &PriorityScheduler{}
+	heap.Init(&scheduler.queue)
+	return scheduler
+}
 
-	mu.Lock()
-	for pq.Len() > 0 {
-		task := heap.Pop(pq).(*Task)
-		fmt.Printf("[priority %d] %s\n", task.priority, task.name)
+func (ps *PriorityScheduler) Enqueue(task *Task) {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+	heap.Push(&ps.queue, task)
+}
+
+func (ps *PriorityScheduler) ProcessAll() {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+	for ps.queue.Len() > 0 {
+		task := heap.Pop(&ps.queue).(*Task)
+		fmt.Printf("[priority %d] %s\n", task.Priority, task.Name)
 	}
-	mu.Unlock()
+}
+
+func main() {
+	scheduler := NewPriorityScheduler()
+
+	scheduler.Enqueue(&Task{Name: "generate-report", Priority: PriorityNormal})
+	scheduler.Enqueue(&Task{Name: "payment-failure", Priority: PriorityCritical})
+	scheduler.Enqueue(&Task{Name: "send-email-batch", Priority: PriorityHigh})
+	scheduler.Enqueue(&Task{Name: "security-alert", Priority: PriorityCritical})
+	scheduler.Enqueue(&Task{Name: "update-dashboard", Priority: PriorityNormal})
+
+	scheduler.ProcessAll()
 }
 ```
 

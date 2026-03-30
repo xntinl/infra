@@ -57,6 +57,13 @@ import (
 	"time"
 )
 
+const (
+	healthyThreshold = 0.15
+	statusOK         = 200
+	statusDown       = 503
+)
+
+// HealthResult holds the outcome of a single URL check.
 type HealthResult struct {
 	URL        string
 	StatusCode int
@@ -64,14 +71,23 @@ type HealthResult struct {
 	Healthy    bool
 }
 
-func checkURL(url string) HealthResult {
+// HealthChecker runs health checks against a list of URLs.
+type HealthChecker struct {
+	urls []string
+}
+
+func NewHealthChecker(urls []string) *HealthChecker {
+	return &HealthChecker{urls: urls}
+}
+
+func (hc *HealthChecker) checkSingleURL(url string) HealthResult {
 	latency := time.Duration(50+rand.Intn(150)) * time.Millisecond
 	time.Sleep(latency)
 
-	healthy := rand.Float64() > 0.15
-	status := 200
+	healthy := rand.Float64() > healthyThreshold
+	status := statusOK
 	if !healthy {
-		status = 503
+		status = statusDown
 	}
 
 	return HealthResult{
@@ -80,6 +96,23 @@ func checkURL(url string) HealthResult {
 		Latency:    latency,
 		Healthy:    healthy,
 	}
+}
+
+func (hc *HealthChecker) RunSequential() {
+	fmt.Println("=== Sequential Health Check (20 URLs) ===")
+	start := time.Now()
+
+	var unhealthy int
+	for _, url := range hc.urls {
+		result := hc.checkSingleURL(url)
+		if !result.Healthy {
+			unhealthy++
+			fmt.Printf("  DOWN: %s (status=%d, latency=%v)\n", result.URL, result.StatusCode, result.Latency)
+		}
+	}
+
+	elapsed := time.Since(start)
+	fmt.Printf("  Total: %d URLs checked, %d unhealthy, took %v\n\n", len(hc.urls), unhealthy, elapsed)
 }
 
 func main() {
@@ -106,18 +139,8 @@ func main() {
 		"https://docs.example.com/health",
 	}
 
-	fmt.Println("=== Sequential Health Check (20 URLs) ===")
-	start := time.Now()
-	var unhealthy int
-	for _, url := range urls {
-		result := checkURL(url)
-		if !result.Healthy {
-			unhealthy++
-			fmt.Printf("  DOWN: %s (status=%d, latency=%v)\n", result.URL, result.StatusCode, result.Latency)
-		}
-	}
-	elapsed := time.Since(start)
-	fmt.Printf("  Total: %d URLs checked, %d unhealthy, took %v\n\n", len(urls), unhealthy, elapsed)
+	checker := NewHealthChecker(urls)
+	checker.RunSequential()
 }
 ```
 
@@ -147,6 +170,14 @@ import (
 	"time"
 )
 
+const (
+	defaultWorkerCount = 5
+	healthyThreshold   = 0.15
+	statusOK           = 200
+	statusDown         = 503
+)
+
+// HealthResult holds the outcome of a single URL check.
 type HealthResult struct {
 	URL        string
 	StatusCode int
@@ -155,28 +186,82 @@ type HealthResult struct {
 	WorkerID   int
 }
 
-func checkURL(url string) (int, time.Duration, bool) {
+// HealthChecker distributes URL checks across a pool of workers.
+type HealthChecker struct {
+	urls       []string
+	numWorkers int
+}
+
+func NewHealthChecker(urls []string, numWorkers int) *HealthChecker {
+	return &HealthChecker{urls: urls, numWorkers: numWorkers}
+}
+
+func simulateHTTPCheck(url string) (int, time.Duration, bool) {
 	latency := time.Duration(50+rand.Intn(150)) * time.Millisecond
 	time.Sleep(latency)
-	healthy := rand.Float64() > 0.15
-	status := 200
+	healthy := rand.Float64() > healthyThreshold
+	status := statusOK
 	if !healthy {
-		status = 503
+		status = statusDown
 	}
 	return status, latency, healthy
 }
 
-func healthWorker(id int, urls <-chan string, results chan<- HealthResult, wg *sync.WaitGroup) {
+func (hc *HealthChecker) worker(id int, urls <-chan string, results chan<- HealthResult, wg *sync.WaitGroup) {
 	defer wg.Done()
 	for url := range urls {
-		status, latency, healthy := checkURL(url)
+		status, latency, healthy := simulateHTTPCheck(url)
 		results <- HealthResult{
-			URL:        url,
-			StatusCode: status,
-			Latency:    latency,
-			Healthy:    healthy,
-			WorkerID:   id,
+			URL: url, StatusCode: status,
+			Latency: latency, Healthy: healthy, WorkerID: id,
 		}
+	}
+}
+
+func (hc *HealthChecker) RunFanOut() {
+	fmt.Printf("=== Fan-Out Health Check (%d workers, %d URLs) ===\n", hc.numWorkers, len(hc.urls))
+	start := time.Now()
+
+	jobs := make(chan string, len(hc.urls))
+	results := make(chan HealthResult, len(hc.urls))
+
+	var wg sync.WaitGroup
+	for w := 1; w <= hc.numWorkers; w++ {
+		wg.Add(1)
+		go hc.worker(w, jobs, results, &wg)
+	}
+
+	for _, url := range hc.urls {
+		jobs <- url
+	}
+	close(jobs)
+
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	hc.reportResults(results, start)
+}
+
+func (hc *HealthChecker) reportResults(results <-chan HealthResult, start time.Time) {
+	var unhealthy int
+	workerCounts := make(map[int]int)
+
+	for r := range results {
+		workerCounts[r.WorkerID]++
+		if !r.Healthy {
+			unhealthy++
+			fmt.Printf("  DOWN: %s (status=%d, latency=%v) [worker %d]\n",
+				r.URL, r.StatusCode, r.Latency, r.WorkerID)
+		}
+	}
+
+	elapsed := time.Since(start)
+	fmt.Printf("\n  Total: %d URLs checked, %d unhealthy, took %v\n", len(hc.urls), unhealthy, elapsed)
+	fmt.Println("  Work distribution:")
+	for id := 1; id <= hc.numWorkers; id++ {
+		fmt.Printf("    worker %d: %d URLs\n", id, workerCounts[id])
 	}
 }
 
@@ -204,46 +289,8 @@ func main() {
 		"https://docs.example.com/health",
 	}
 
-	numWorkers := 5
-	fmt.Printf("=== Fan-Out Health Check (%d workers, %d URLs) ===\n", numWorkers, len(urls))
-	start := time.Now()
-
-	jobs := make(chan string, len(urls))
-	results := make(chan HealthResult, len(urls))
-
-	var wg sync.WaitGroup
-	for w := 1; w <= numWorkers; w++ {
-		wg.Add(1)
-		go healthWorker(w, jobs, results, &wg)
-	}
-
-	for _, url := range urls {
-		jobs <- url
-	}
-	close(jobs)
-
-	go func() {
-		wg.Wait()
-		close(results)
-	}()
-
-	var unhealthy int
-	workerCounts := make(map[int]int)
-	for r := range results {
-		workerCounts[r.WorkerID]++
-		if !r.Healthy {
-			unhealthy++
-			fmt.Printf("  DOWN: %s (status=%d, latency=%v) [worker %d]\n",
-				r.URL, r.StatusCode, r.Latency, r.WorkerID)
-		}
-	}
-
-	elapsed := time.Since(start)
-	fmt.Printf("\n  Total: %d URLs checked, %d unhealthy, took %v\n", len(urls), unhealthy, elapsed)
-	fmt.Println("  Work distribution:")
-	for id := 1; id <= numWorkers; id++ {
-		fmt.Printf("    worker %d: %d URLs\n", id, workerCounts[id])
-	}
+	checker := NewHealthChecker(urls, defaultWorkerCount)
+	checker.RunFanOut()
 }
 ```
 
@@ -281,41 +328,61 @@ import (
 	"time"
 )
 
+const totalURLs = 20
+
+// SpeedBenchmark compares fan-out performance across different worker counts.
+type SpeedBenchmark struct {
+	urls         []string
+	workerCounts []int
+}
+
+func NewSpeedBenchmark(workerCounts []int) *SpeedBenchmark {
+	urls := make([]string, totalURLs)
+	for i := range urls {
+		urls[i] = fmt.Sprintf("https://service-%02d.example.com/health", i+1)
+	}
+	return &SpeedBenchmark{urls: urls, workerCounts: workerCounts}
+}
+
 func simulateCheck(url string) {
 	time.Sleep(time.Duration(50+rand.Intn(150)) * time.Millisecond)
 }
 
-func main() {
-	urls := make([]string, 20)
-	for i := range urls {
-		urls[i] = fmt.Sprintf("https://service-%02d.example.com/health", i+1)
+func (sb *SpeedBenchmark) measureWithWorkers(numWorkers int) time.Duration {
+	start := time.Now()
+	jobs := make(chan string, len(sb.urls))
+	var wg sync.WaitGroup
+
+	for w := 0; w < numWorkers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for url := range jobs {
+				simulateCheck(url)
+			}
+		}()
 	}
 
+	for _, url := range sb.urls {
+		jobs <- url
+	}
+	close(jobs)
+	wg.Wait()
+
+	return time.Since(start)
+}
+
+func (sb *SpeedBenchmark) Run() {
 	fmt.Println("=== Speed Comparison ===")
-	for _, numWorkers := range []int{1, 2, 5, 10, 20} {
-		start := time.Now()
-		jobs := make(chan string, len(urls))
-		var wg sync.WaitGroup
-
-		for w := 0; w < numWorkers; w++ {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				for url := range jobs {
-					simulateCheck(url)
-				}
-			}()
-		}
-
-		for _, url := range urls {
-			jobs <- url
-		}
-		close(jobs)
-		wg.Wait()
-
-		elapsed := time.Since(start)
+	for _, numWorkers := range sb.workerCounts {
+		elapsed := sb.measureWithWorkers(numWorkers)
 		fmt.Printf("  %2d workers: %v\n", numWorkers, elapsed)
 	}
+}
+
+func main() {
+	benchmark := NewSpeedBenchmark([]int{1, 2, 5, 10, 20})
+	benchmark.Run()
 }
 ```
 

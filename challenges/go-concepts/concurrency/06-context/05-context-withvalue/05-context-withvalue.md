@@ -38,7 +38,6 @@ import (
 	"time"
 )
 
-// Unexported key types -- only this package can create values of these types.
 type requestIDKey struct{}
 type userIDKey struct{}
 type traceIDKey struct{}
@@ -70,7 +69,13 @@ func traceIDFrom(ctx context.Context) string {
 	return id
 }
 
-func log(ctx context.Context, layer, message string) {
+type RequestLogger struct{}
+
+func NewRequestLogger() *RequestLogger {
+	return &RequestLogger{}
+}
+
+func (l *RequestLogger) Log(ctx context.Context, layer, message string) {
 	fmt.Printf("[%-10s] req=%s user=%s trace=%s | %s\n",
 		layer,
 		requestIDFrom(ctx),
@@ -80,29 +85,42 @@ func log(ctx context.Context, layer, message string) {
 	)
 }
 
-func main() {
-	// Simulate middleware chain adding metadata to context.
-	ctx := context.Background()
+type RequestHandler struct {
+	logger *RequestLogger
+}
 
-	// Middleware 1: generate request ID.
+func NewRequestHandler(logger *RequestLogger) *RequestHandler {
+	return &RequestHandler{logger: logger}
+}
+
+func (h *RequestHandler) buildContext(ctx context.Context) context.Context {
 	ctx = withRequestID(ctx, "req-7f3a-bc21")
 	fmt.Println("Middleware: added request ID")
 
-	// Middleware 2: extract user from auth token.
 	ctx = withUserID(ctx, "user-42")
 	fmt.Println("Middleware: added user ID")
 
-	// Middleware 3: start distributed trace.
 	ctx = withTraceID(ctx, "trace-abc-789")
 	fmt.Println("Middleware: added trace ID")
 	fmt.Println()
 
-	// Every downstream layer sees ALL metadata without explicit parameters.
-	log(ctx, "handler", "received order creation request")
-	log(ctx, "service", "validating order data")
-	log(ctx, "repository", "inserting order into database")
-	log(ctx, "service", "sending confirmation email")
-	log(ctx, "handler", fmt.Sprintf("completed in %v", 150*time.Millisecond))
+	return ctx
+}
+
+func (h *RequestHandler) ProcessOrder(ctx context.Context) {
+	ctx = h.buildContext(ctx)
+
+	h.logger.Log(ctx, "handler", "received order creation request")
+	h.logger.Log(ctx, "service", "validating order data")
+	h.logger.Log(ctx, "repository", "inserting order into database")
+	h.logger.Log(ctx, "service", "sending confirmation email")
+	h.logger.Log(ctx, "handler", fmt.Sprintf("completed in %v", 150*time.Millisecond))
+}
+
+func main() {
+	logger := NewRequestLogger()
+	handler := NewRequestHandler(logger)
+	handler.ProcessOrder(context.Background())
 }
 ```
 
@@ -137,20 +155,21 @@ import (
 	"fmt"
 )
 
-func main() {
+func demonstrateStringKeyCollision() {
 	ctx := context.Background()
 
-	// Imagine this is your auth middleware:
 	ctx = context.WithValue(ctx, "userID", "admin-from-auth")
 	fmt.Printf("After auth middleware:    userID = %s\n", ctx.Value("userID"))
 
-	// Now a logging middleware from a third-party library also uses "userID":
 	ctx = context.WithValue(ctx, "userID", "anonymous-from-logger")
 	fmt.Printf("After logging middleware: userID = %s\n", ctx.Value("userID"))
 
-	// Your auth check now sees the WRONG user. Security vulnerability.
 	fmt.Printf("\nAuth check sees: %s\n", ctx.Value("userID"))
 	fmt.Println("BUG: auth value was silently overwritten by the logger!")
+}
+
+func main() {
+	demonstrateStringKeyCollision()
 }
 ```
 
@@ -177,13 +196,10 @@ import (
 	"fmt"
 )
 
-// Auth package's key -- unexported, impossible to collide.
 type authUserKey struct{}
-
-// Logger package's key -- different type, different key.
 type loggerUserKey struct{}
 
-func main() {
+func demonstrateTypedKeySafety() {
 	ctx := context.Background()
 
 	ctx = context.WithValue(ctx, authUserKey{}, "admin-from-auth")
@@ -195,6 +211,10 @@ func main() {
 	fmt.Printf("Auth user:   %s\n", authUser)
 	fmt.Printf("Logger user: %s\n", loggerUser)
 	fmt.Println("No collision: different types, different keys.")
+}
+
+func main() {
+	demonstrateTypedKeySafety()
 }
 ```
 
@@ -223,9 +243,7 @@ import (
 	"fmt"
 )
 
-// --- This would be in package "auth" ---
-
-type authTokenKey struct{} // unexported -- callers never see it
+type authTokenKey struct{}
 
 func WithAuthToken(ctx context.Context, token string) context.Context {
 	return context.WithValue(ctx, authTokenKey{}, token)
@@ -236,19 +254,23 @@ func AuthTokenFrom(ctx context.Context) (string, bool) {
 	return token, ok
 }
 
-// --- This would be in package "handler" ---
+type OrderHandler struct{}
 
-func handleRequest(ctx context.Context) {
+func NewOrderHandler() *OrderHandler {
+	return &OrderHandler{}
+}
+
+func (h *OrderHandler) HandleRequest(ctx context.Context) {
 	token, ok := AuthTokenFrom(ctx)
 	if !ok {
 		fmt.Println("[handler] 401 Unauthorized: no auth token")
 		return
 	}
 	fmt.Printf("[handler] authenticated, token prefix: %s...\n", token[:20])
-	processOrder(ctx)
+	h.processOrder(ctx)
 }
 
-func processOrder(ctx context.Context) {
+func (h *OrderHandler) processOrder(ctx context.Context) {
 	token, ok := AuthTokenFrom(ctx)
 	if !ok {
 		fmt.Println("[service] ERROR: no auth token in context")
@@ -258,14 +280,15 @@ func processOrder(ctx context.Context) {
 }
 
 func main() {
-	// Middleware adds the auth token.
+	handler := NewOrderHandler()
+
 	ctx := WithAuthToken(context.Background(), "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.payload")
 
 	fmt.Println("=== With auth token ===")
-	handleRequest(ctx)
+	handler.HandleRequest(ctx)
 
 	fmt.Println("\n=== Without auth token ===")
-	handleRequest(context.Background())
+	handler.HandleRequest(context.Background())
 }
 ```
 
@@ -301,23 +324,20 @@ type dbKey struct{}
 type itemsKey struct{}
 type logLevelKey struct{}
 
-func main() {
+func demonstrateAntiPatterns() {
 	fmt.Println("=== ANTI-PATTERN 1: Function Arguments in Context ===")
-	// WRONG: items is a function input, not request metadata.
 	ctx := context.WithValue(context.Background(), itemsKey{}, []string{"item-1", "item-2"})
 	items, _ := ctx.Value(itemsKey{}).([]string)
 	fmt.Printf("  Pulled from context: %v\n", items)
 	fmt.Println("  FIX: pass items as a function parameter: calculateTotal(items []string)")
 
 	fmt.Println("\n=== ANTI-PATTERN 2: Dependency Injection via Context ===")
-	// WRONG: database connection is infrastructure, not request metadata.
 	ctx = context.WithValue(context.Background(), dbKey{}, "postgres://db:5432")
 	dsn, _ := ctx.Value(dbKey{}).(string)
 	fmt.Printf("  Pulled from context: %s\n", dsn)
 	fmt.Println("  FIX: inject the DB connection via struct field or constructor")
 
 	fmt.Println("\n=== ANTI-PATTERN 3: Optional Parameters via Context ===")
-	// WRONG: log level is configuration, not request metadata.
 	ctx = context.WithValue(context.Background(), logLevelKey{}, "debug")
 	level, _ := ctx.Value(logLevelKey{}).(string)
 	fmt.Printf("  Pulled from context: %s\n", level)
@@ -328,6 +348,10 @@ func main() {
 	fmt.Println("  - User ID from authentication (authorization decisions)")
 	fmt.Println("  - Trace/span ID (distributed tracing)")
 	fmt.Println("  - Tenant ID in multi-tenant systems")
+}
+
+func main() {
+	demonstrateAntiPatterns()
 }
 ```
 
@@ -431,6 +455,7 @@ type tenantKey struct{}
 func withReqID(ctx context.Context, id string) context.Context {
 	return context.WithValue(ctx, reqIDKey{}, id)
 }
+
 func reqIDFrom(ctx context.Context) string {
 	id, _ := ctx.Value(reqIDKey{}).(string)
 	return id
@@ -439,27 +464,36 @@ func reqIDFrom(ctx context.Context) string {
 func withTenant(ctx context.Context, t string) context.Context {
 	return context.WithValue(ctx, tenantKey{}, t)
 }
+
 func tenantFrom(ctx context.Context) string {
 	t, _ := ctx.Value(tenantKey{}).(string)
 	return t
 }
 
-func logEntry(ctx context.Context, layer, msg string) {
+type MiddlewareChain struct{}
+
+func NewMiddlewareChain() *MiddlewareChain {
+	return &MiddlewareChain{}
+}
+
+func (m *MiddlewareChain) logEntry(ctx context.Context, layer, msg string) {
 	fmt.Printf("[%-10s] req=%s tenant=%s | %s\n", layer, reqIDFrom(ctx), tenantFrom(ctx), msg)
 }
 
-func main() {
-	// Middleware chain builds context.
-	ctx := context.Background()
+func (m *MiddlewareChain) ProcessRequest(ctx context.Context) {
 	ctx = withReqID(ctx, "req-001")
 	ctx = withTenant(ctx, "acme-corp")
 
-	// All layers see the same metadata.
-	logEntry(ctx, "gateway", "request received")
-	logEntry(ctx, "auth", "user authenticated")
-	logEntry(ctx, "handler", "processing order")
-	logEntry(ctx, "repository", "querying database")
-	logEntry(ctx, "handler", "returning response")
+	m.logEntry(ctx, "gateway", "request received")
+	m.logEntry(ctx, "auth", "user authenticated")
+	m.logEntry(ctx, "handler", "processing order")
+	m.logEntry(ctx, "repository", "querying database")
+	m.logEntry(ctx, "handler", "returning response")
+}
+
+func main() {
+	chain := NewMiddlewareChain()
+	chain.ProcessRequest(context.Background())
 }
 ```
 

@@ -39,27 +39,31 @@ import (
 	"time"
 )
 
+const maxOrderAmount = 10_000
+
+type OrderStatus string
+
+const (
+	StatusCharged   OrderStatus = "charged"
+	StatusFailed    OrderStatus = "failed"
+	StatusCancelled OrderStatus = "cancelled"
+)
+
 type Order struct {
 	ID       int
 	Customer string
 	Amount   float64
-	Status   string
 }
 
-func main() {
-	fmt.Println("=== Batch Order Processing (all-or-nothing) ===")
+type OrderProcessor struct {
+	orders []Order
+}
 
-	orders := []Order{
-		{ID: 1001, Customer: "alice", Amount: 99.99},
-		{ID: 1002, Customer: "bob", Amount: 249.50},
-		{ID: 1003, Customer: "charlie", Amount: -50.00}, // INVALID: negative amount
-		{ID: 1004, Customer: "diana", Amount: 175.00},
-		{ID: 1005, Customer: "eve", Amount: 89.99},
-	}
+func NewOrderProcessor(orders []Order) *OrderProcessor {
+	return &OrderProcessor{orders: orders}
+}
 
-	fmt.Println("\n--- Processing batch (errgroup pattern) ---")
-	start := time.Now()
-
+func (op *OrderProcessor) ProcessBatch() ([]OrderStatus, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -67,51 +71,38 @@ func main() {
 	var once sync.Once
 	var firstErr error
 
-	results := make([]string, len(orders))
+	results := make([]OrderStatus, len(op.orders))
 
-	for i, order := range orders {
+	for i, order := range op.orders {
 		i, order := i, order
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 
-			// Check if another order already failed
 			select {
 			case <-ctx.Done():
-				results[i] = "cancelled"
+				results[i] = StatusCancelled
 				return
 			default:
 			}
 
-			if err := validateAndCharge(ctx, order); err != nil {
+			if err := op.validateAndCharge(ctx, order); err != nil {
 				once.Do(func() {
 					firstErr = err
-					cancel() // STOP: abort the entire batch
+					cancel()
 				})
-				results[i] = "failed"
+				results[i] = StatusFailed
 				return
 			}
-			results[i] = "charged"
+			results[i] = StatusCharged
 		}()
 	}
 
 	wg.Wait()
-	elapsed := time.Since(start).Round(time.Millisecond)
-
-	fmt.Printf("\nBatch results (in %v):\n", elapsed)
-	for i, order := range orders {
-		fmt.Printf("  Order %d (%s, $%.2f): %s\n", order.ID, order.Customer, order.Amount, results[i])
-	}
-
-	if firstErr != nil {
-		fmt.Printf("\nBATCH ABORTED: %v\n", firstErr)
-		fmt.Println("Action: Roll back all charged orders, notify accounting")
-	} else {
-		fmt.Println("\nBatch completed successfully")
-	}
+	return results, firstErr
 }
 
-func validateAndCharge(ctx context.Context, order Order) error {
+func (op *OrderProcessor) validateAndCharge(ctx context.Context, order Order) error {
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
@@ -121,12 +112,46 @@ func validateAndCharge(ctx context.Context, order Order) error {
 	if order.Amount <= 0 {
 		return fmt.Errorf("order %d: invalid amount $%.2f (must be positive)", order.ID, order.Amount)
 	}
-	if order.Amount > 10_000 {
+	if order.Amount > maxOrderAmount {
 		return fmt.Errorf("order %d: amount $%.2f exceeds batch limit", order.ID, order.Amount)
 	}
 
 	fmt.Printf("  Charged order %d: $%.2f from %s\n", order.ID, order.Amount, order.Customer)
 	return nil
+}
+
+func printBatchResults(orders []Order, results []OrderStatus, elapsed time.Duration, err error) {
+	fmt.Printf("\nBatch results (in %v):\n", elapsed)
+	for i, order := range orders {
+		fmt.Printf("  Order %d (%s, $%.2f): %s\n", order.ID, order.Customer, order.Amount, results[i])
+	}
+
+	if err != nil {
+		fmt.Printf("\nBATCH ABORTED: %v\n", err)
+		fmt.Println("Action: Roll back all charged orders, notify accounting")
+	} else {
+		fmt.Println("\nBatch completed successfully")
+	}
+}
+
+func main() {
+	orders := []Order{
+		{ID: 1001, Customer: "alice", Amount: 99.99},
+		{ID: 1002, Customer: "bob", Amount: 249.50},
+		{ID: 1003, Customer: "charlie", Amount: -50.00}, // INVALID: negative amount
+		{ID: 1004, Customer: "diana", Amount: 175.00},
+		{ID: 1005, Customer: "eve", Amount: 89.99},
+	}
+
+	processor := NewOrderProcessor(orders)
+
+	fmt.Println("=== Batch Order Processing (all-or-nothing) ===")
+	fmt.Println("\n--- Processing batch (errgroup pattern) ---")
+	start := time.Now()
+
+	results, err := processor.ProcessBatch()
+
+	printBatchResults(orders, results, time.Since(start).Round(time.Millisecond), err)
 }
 ```
 
@@ -164,6 +189,8 @@ import (
 	"time"
 )
 
+const pushNotificationLatency = 50 * time.Millisecond
+
 type Notification struct {
 	UserID  string
 	Message string
@@ -175,9 +202,78 @@ type SendResult struct {
 	Error  string
 }
 
-func main() {
-	fmt.Println("=== Notification Dispatch (best-effort) ===")
+type NotificationDispatcher struct {
+	notifications []Notification
+	mu            sync.Mutex
+	results       []SendResult
+}
 
+func NewNotificationDispatcher(notifications []Notification) *NotificationDispatcher {
+	return &NotificationDispatcher{notifications: notifications}
+}
+
+func (nd *NotificationDispatcher) SendAll() []SendResult {
+	var wg sync.WaitGroup
+
+	for _, notif := range nd.notifications {
+		notif := notif
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			nd.sendAndCollect(notif)
+		}()
+	}
+
+	wg.Wait()
+	return nd.results
+}
+
+func (nd *NotificationDispatcher) sendAndCollect(notif Notification) {
+	err := nd.sendPushNotification(notif)
+	result := SendResult{UserID: notif.UserID, OK: err == nil}
+	if err != nil {
+		result.Error = err.Error()
+		fmt.Printf("  WARN: %s: %v\n", notif.UserID, err)
+	}
+
+	nd.mu.Lock()
+	nd.results = append(nd.results, result)
+	nd.mu.Unlock()
+}
+
+func (nd *NotificationDispatcher) sendPushNotification(n Notification) error {
+	time.Sleep(pushNotificationLatency)
+
+	switch n.UserID {
+	case "user-003":
+		return fmt.Errorf("expired device token")
+	case "user-007":
+		return fmt.Errorf("no device registered")
+	default:
+		fmt.Printf("  Sent to %s: %s\n", n.UserID, n.Message)
+		return nil
+	}
+}
+
+func printNotificationSummary(results []SendResult, total int, elapsed time.Duration) {
+	succeeded := 0
+	failed := 0
+	for _, r := range results {
+		if r.OK {
+			succeeded++
+		} else {
+			failed++
+		}
+	}
+
+	fmt.Printf("\nNotification results (in %v):\n", elapsed)
+	fmt.Printf("  Sent: %d/%d, Failed: %d/%d\n", succeeded, total, failed, total)
+	if failed > 0 {
+		fmt.Println("  Action: Queue failed notifications for retry via different channel (email, SMS)")
+	}
+}
+
+func main() {
 	notifications := []Notification{
 		{"user-001", "Your order shipped!"},
 		{"user-002", "Your order shipped!"},
@@ -189,65 +285,15 @@ func main() {
 		{"user-008", "Your order shipped!"},
 	}
 
+	dispatcher := NewNotificationDispatcher(notifications)
+
+	fmt.Println("=== Notification Dispatch (best-effort) ===")
 	fmt.Printf("\n--- Sending %d notifications (WaitGroup, best-effort) ---\n", len(notifications))
 	start := time.Now()
 
-	var wg sync.WaitGroup
-	var mu sync.Mutex
-	var sendResults []SendResult
+	results := dispatcher.SendAll()
 
-	for _, notif := range notifications {
-		notif := notif
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-
-			err := sendPushNotification(notif)
-			result := SendResult{UserID: notif.UserID, OK: err == nil}
-			if err != nil {
-				result.Error = err.Error()
-				// Log the error but DO NOT stop other notifications
-				fmt.Printf("  WARN: %s: %v\n", notif.UserID, err)
-			}
-
-			mu.Lock()
-			sendResults = append(sendResults, result)
-			mu.Unlock()
-		}()
-	}
-
-	wg.Wait()
-	elapsed := time.Since(start).Round(time.Millisecond)
-
-	succeeded := 0
-	failed := 0
-	for _, r := range sendResults {
-		if r.OK {
-			succeeded++
-		} else {
-			failed++
-		}
-	}
-
-	fmt.Printf("\nNotification results (in %v):\n", elapsed)
-	fmt.Printf("  Sent: %d/%d, Failed: %d/%d\n", succeeded, len(notifications), failed, len(notifications))
-	if failed > 0 {
-		fmt.Println("  Action: Queue failed notifications for retry via different channel (email, SMS)")
-	}
-}
-
-func sendPushNotification(n Notification) error {
-	time.Sleep(50 * time.Millisecond) // simulate network call
-
-	switch n.UserID {
-	case "user-003":
-		return fmt.Errorf("expired device token")
-	case "user-007":
-		return fmt.Errorf("no device registered")
-	default:
-		fmt.Printf("  Sent to %s: %s\n", n.UserID, n.Message)
-		return nil
-	}
+	printNotificationSummary(results, len(notifications), time.Since(start).Round(time.Millisecond))
 }
 ```
 
@@ -286,17 +332,17 @@ import (
 	"time"
 )
 
-func main() {
-	items := []string{"item-1", "item-2", "INVALID", "item-4", "item-5"}
+const itemProcessingLatency = 50 * time.Millisecond
 
-	fmt.Println("=== Errgroup Pattern: stops on first error ===")
-	errgroupProcess(items)
-
-	fmt.Println("\n=== WaitGroup Pattern: continues despite errors ===")
-	waitgroupProcess(items)
+type AllOrNothingProcessor struct {
+	items []string
 }
 
-func errgroupProcess(items []string) {
+func NewAllOrNothingProcessor(items []string) *AllOrNothingProcessor {
+	return &AllOrNothingProcessor{items: items}
+}
+
+func (p *AllOrNothingProcessor) Process() (int, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -307,7 +353,7 @@ func errgroupProcess(items []string) {
 	processed := 0
 	var mu sync.Mutex
 
-	for _, item := range items {
+	for _, item := range p.items {
 		item := item
 		wg.Add(1)
 		go func() {
@@ -334,16 +380,24 @@ func errgroupProcess(items []string) {
 	}
 
 	wg.Wait()
-	fmt.Printf("  Result: processed=%d, error=%v\n", processed, firstErr)
+	return processed, firstErr
 }
 
-func waitgroupProcess(items []string) {
+type BestEffortProcessor struct {
+	items []string
+}
+
+func NewBestEffortProcessor(items []string) *BestEffortProcessor {
+	return &BestEffortProcessor{items: items}
+}
+
+func (p *BestEffortProcessor) Process() (int, []string) {
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	processed := 0
 	var errors []string
 
-	for _, item := range items {
+	for _, item := range p.items {
 		item := item
 		wg.Add(1)
 		go func() {
@@ -363,15 +417,29 @@ func waitgroupProcess(items []string) {
 	}
 
 	wg.Wait()
-	fmt.Printf("  Result: processed=%d, errors=%d (%v)\n", processed, len(errors), errors)
+	return processed, errors
 }
 
 func processItem(item string) error {
-	time.Sleep(50 * time.Millisecond)
+	time.Sleep(itemProcessingLatency)
 	if item == "INVALID" {
 		return fmt.Errorf("%s: validation failed", item)
 	}
 	return nil
+}
+
+func main() {
+	items := []string{"item-1", "item-2", "INVALID", "item-4", "item-5"}
+
+	fmt.Println("=== Errgroup Pattern: stops on first error ===")
+	allOrNothing := NewAllOrNothingProcessor(items)
+	processed, err := allOrNothing.Process()
+	fmt.Printf("  Result: processed=%d, error=%v\n", processed, err)
+
+	fmt.Println("\n=== WaitGroup Pattern: continues despite errors ===")
+	bestEffort := NewBestEffortProcessor(items)
+	processed, errors := bestEffort.Process()
+	fmt.Printf("  Result: processed=%d, errors=%d (%v)\n", processed, len(errors), errors)
 }
 ```
 
@@ -410,27 +478,20 @@ import (
 	"time"
 )
 
-func main() {
-	fmt.Println("=== Deployment Pipeline ===")
+const (
+	configValidationLatency = 60 * time.Millisecond
+	notificationLatency     = 40 * time.Millisecond
+)
 
-	configs := []string{"api-gateway.yaml", "auth-service.yaml", "payment-service.yaml"}
-	recipients := []string{"#deploys", "ops-team@company.com", "pagerduty-webhook"}
-
-	// Phase 1: Validate configs (all-or-nothing, errgroup pattern)
-	fmt.Println("\n--- Phase 1: Config Validation (all-or-nothing) ---")
-	if err := validateConfigs(configs); err != nil {
-		fmt.Printf("DEPLOY ABORTED: %v\n", err)
-		return
-	}
-	fmt.Println("All configs valid -- proceeding to deploy")
-
-	// Phase 2: Notify stakeholders (best-effort, WaitGroup)
-	fmt.Println("\n--- Phase 2: Deploy Notifications (best-effort) ---")
-	notifyAll(recipients)
-	fmt.Println("\nDeployment complete")
+type ConfigValidator struct {
+	configs []string
 }
 
-func validateConfigs(configs []string) error {
+func NewConfigValidator(configs []string) *ConfigValidator {
+	return &ConfigValidator{configs: configs}
+}
+
+func (cv *ConfigValidator) ValidateAll() error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -438,7 +499,7 @@ func validateConfigs(configs []string) error {
 	var once sync.Once
 	var firstErr error
 
-	for _, cfg := range configs {
+	for _, cfg := range cv.configs {
 		cfg := cfg
 		wg.Add(1)
 		go func() {
@@ -448,7 +509,7 @@ func validateConfigs(configs []string) error {
 				return
 			default:
 			}
-			if err := validateConfig(cfg); err != nil {
+			if err := cv.validateSingle(cfg); err != nil {
 				once.Do(func() {
 					firstErr = err
 					cancel()
@@ -463,20 +524,28 @@ func validateConfigs(configs []string) error {
 	return firstErr
 }
 
-func validateConfig(name string) error {
-	time.Sleep(60 * time.Millisecond)
+func (cv *ConfigValidator) validateSingle(name string) error {
+	time.Sleep(configValidationLatency)
 	return nil // all configs valid in this scenario
 }
 
-func notifyAll(recipients []string) {
+type DeployNotifier struct {
+	recipients []string
+}
+
+func NewDeployNotifier(recipients []string) *DeployNotifier {
+	return &DeployNotifier{recipients: recipients}
+}
+
+func (dn *DeployNotifier) NotifyAll() {
 	var wg sync.WaitGroup
 
-	for _, r := range recipients {
+	for _, r := range dn.recipients {
 		r := r
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			time.Sleep(40 * time.Millisecond)
+			time.Sleep(notificationLatency)
 			if r == "pagerduty-webhook" {
 				fmt.Printf("  WARN: failed to notify %s (timeout)\n", r)
 				return
@@ -486,6 +555,25 @@ func notifyAll(recipients []string) {
 	}
 
 	wg.Wait()
+}
+
+func main() {
+	fmt.Println("=== Deployment Pipeline ===")
+
+	// Phase 1: Validate configs (all-or-nothing, errgroup pattern)
+	fmt.Println("\n--- Phase 1: Config Validation (all-or-nothing) ---")
+	validator := NewConfigValidator([]string{"api-gateway.yaml", "auth-service.yaml", "payment-service.yaml"})
+	if err := validator.ValidateAll(); err != nil {
+		fmt.Printf("DEPLOY ABORTED: %v\n", err)
+		return
+	}
+	fmt.Println("All configs valid -- proceeding to deploy")
+
+	// Phase 2: Notify stakeholders (best-effort, WaitGroup)
+	fmt.Println("\n--- Phase 2: Deploy Notifications (best-effort) ---")
+	notifier := NewDeployNotifier([]string{"#deploys", "ops-team@company.com", "pagerduty-webhook"})
+	notifier.NotifyAll()
+	fmt.Println("\nDeployment complete")
 }
 ```
 

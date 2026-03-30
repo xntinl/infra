@@ -38,6 +38,15 @@ import (
 	"time"
 )
 
+const (
+	parseLatency          = 1 * time.Millisecond
+	formatLatency         = 1 * time.Millisecond
+	minDBLatency          = 20
+	maxExtraDBLatency     = 80
+	dangerPath            = "/admin/danger"
+	avgRequestLatencyMs   = 50
+)
+
 type Request struct {
 	ID     int
 	Path   string
@@ -51,26 +60,16 @@ type Response struct {
 	Latency    time.Duration
 }
 
-func handleRequest(req Request) Response {
+type RequestHandler struct{}
+
+func (h *RequestHandler) Handle(req Request) Response {
 	start := time.Now()
 
-	// Phase 1: Parse request (~1ms)
-	time.Sleep(1 * time.Millisecond)
+	time.Sleep(parseLatency)
+	time.Sleep(time.Duration(rand.Intn(maxExtraDBLatency)+minDBLatency) * time.Millisecond)
+	time.Sleep(formatLatency)
 
-	// Phase 2: Query "database" (variable latency)
-	dbLatency := time.Duration(rand.Intn(80)+20) * time.Millisecond
-	time.Sleep(dbLatency)
-
-	// Phase 3: Format response (~1ms)
-	time.Sleep(1 * time.Millisecond)
-
-	statusCode := 200
-	body := fmt.Sprintf(`{"path": %q, "rows": %d}`, req.Path, rand.Intn(100))
-
-	if req.Path == "/admin/danger" {
-		statusCode = 500
-		body = `{"error": "internal server error"}`
-	}
+	statusCode, body := h.buildResponse(req)
 
 	return Response{
 		RequestID:  req.ID,
@@ -80,42 +79,66 @@ func handleRequest(req Request) Response {
 	}
 }
 
-func main() {
-	// Simulate incoming connections as a channel (like net.Listener.Accept)
-	incoming := make(chan Request, 10)
+func (h *RequestHandler) buildResponse(req Request) (int, string) {
+	if req.Path == dangerPath {
+		return 500, `{"error": "internal server error"}`
+	}
+	return 200, fmt.Sprintf(`{"path": %q, "rows": %d}`, req.Path, rand.Intn(100))
+}
+
+func generateRequests(paths []string) <-chan Request {
+	incoming := make(chan Request, len(paths))
 	go func() {
-		paths := []string{"/api/users", "/api/orders", "/api/products", "/health",
-			"/api/search", "/admin/danger", "/api/metrics", "/api/config"}
 		for i, path := range paths {
 			incoming <- Request{ID: i + 1, Path: path, Method: "GET"}
 		}
 		close(incoming)
 	}()
+	return incoming
+}
 
+func dispatchRequests(incoming <-chan Request, handler *RequestHandler) (<-chan Response, int) {
 	responses := make(chan Response, 10)
-	start := time.Now()
 	requestCount := 0
-
-	// One goroutine per request (the net/http pattern)
 	for req := range incoming {
 		requestCount++
 		go func(r Request) {
-			responses <- handleRequest(r)
+			responses <- handler.Handle(r)
 		}(req)
 	}
+	return responses, requestCount
+}
 
-	// Collect all responses
-	for i := 0; i < requestCount; i++ {
+func collectAndPrintResponses(responses <-chan Response, count int) {
+	for i := 0; i < count; i++ {
 		resp := <-responses
+		bodyPreview := resp.Body
+		if len(bodyPreview) > 30 {
+			bodyPreview = bodyPreview[:30]
+		}
 		fmt.Printf("  req %2d  %-20s  %d  %v\n",
-			resp.RequestID, resp.Body[:min(30, len(resp.Body))], resp.StatusCode,
+			resp.RequestID, bodyPreview, resp.StatusCode,
 			resp.Latency.Round(time.Millisecond))
 	}
+}
+
+func main() {
+	paths := []string{
+		"/api/users", "/api/orders", "/api/products", "/health",
+		"/api/search", dangerPath, "/api/metrics", "/api/config",
+	}
+
+	handler := &RequestHandler{}
+	incoming := generateRequests(paths)
+
+	start := time.Now()
+	responses, requestCount := dispatchRequests(incoming, handler)
+	collectAndPrintResponses(responses, requestCount)
 
 	wallClock := time.Since(start)
 	fmt.Printf("\n  Processed %d requests in %v\n", requestCount, wallClock.Round(time.Millisecond))
 	fmt.Printf("  Sequential would have taken: ~%v\n",
-		time.Duration(requestCount*50)*time.Millisecond)
+		time.Duration(requestCount*avgRequestLatencyMs)*time.Millisecond)
 }
 ```
 
@@ -154,6 +177,13 @@ import (
 	"time"
 )
 
+const (
+	minEndpointLatency   = 20
+	maxExtraEndpointLat  = 80
+	recommendationFailRate = 0.6
+	legacyFailRate         = 0.4
+)
+
 type APIResult struct {
 	Endpoint string
 	Status   int
@@ -162,57 +192,63 @@ type APIResult struct {
 	Latency  time.Duration
 }
 
-func callEndpoint(endpoint string) APIResult {
+type EndpointCaller struct{}
+
+func (ec *EndpointCaller) Call(endpoint string) APIResult {
 	start := time.Now()
-	latency := time.Duration(rand.Intn(80)+20) * time.Millisecond
+	latency := time.Duration(rand.Intn(maxExtraEndpointLat)+minEndpointLatency) * time.Millisecond
 	time.Sleep(latency)
 
-	// Simulate different failure modes
-	switch {
-	case endpoint == "/api/recommendations" && rand.Float32() < 0.6:
-		return APIResult{
-			Endpoint: endpoint,
-			Status:   503,
-			Err:      fmt.Errorf("recommendation engine timeout"),
-			Latency:  time.Since(start),
-		}
-	case endpoint == "/api/legacy" && rand.Float32() < 0.4:
-		return APIResult{
-			Endpoint: endpoint,
-			Status:   502,
-			Err:      fmt.Errorf("bad gateway: legacy service unreachable"),
-			Latency:  time.Since(start),
-		}
-	default:
-		return APIResult{
-			Endpoint: endpoint,
-			Status:   200,
-			Data:     fmt.Sprintf(`{"source": %q, "items": %d}`, endpoint, rand.Intn(50)+1),
-			Latency:  time.Since(start),
-		}
+	elapsed := time.Since(start)
+
+	if err := ec.simulateFailure(endpoint); err != nil {
+		return APIResult{Endpoint: endpoint, Err: err, Latency: elapsed,
+			Status: ec.failureStatusCode(endpoint)}
+	}
+
+	return APIResult{
+		Endpoint: endpoint,
+		Status:   200,
+		Data:     fmt.Sprintf(`{"source": %q, "items": %d}`, endpoint, rand.Intn(50)+1),
+		Latency:  elapsed,
 	}
 }
 
-func main() {
-	endpoints := []string{
-		"/api/user-profile",
-		"/api/order-history",
-		"/api/recommendations",
-		"/api/notifications",
-		"/api/legacy",
-		"/api/settings",
+func (ec *EndpointCaller) simulateFailure(endpoint string) error {
+	switch {
+	case endpoint == "/api/recommendations" && rand.Float32() < recommendationFailRate:
+		return fmt.Errorf("recommendation engine timeout")
+	case endpoint == "/api/legacy" && rand.Float32() < legacyFailRate:
+		return fmt.Errorf("bad gateway: legacy service unreachable")
+	default:
+		return nil
 	}
+}
 
+func (ec *EndpointCaller) failureStatusCode(endpoint string) int {
+	switch endpoint {
+	case "/api/recommendations":
+		return 503
+	case "/api/legacy":
+		return 502
+	default:
+		return 500
+	}
+}
+
+func fanOutEndpointCalls(endpoints []string, caller *EndpointCaller) <-chan APIResult {
 	results := make(chan APIResult, len(endpoints))
-
 	for _, ep := range endpoints {
 		go func(endpoint string) {
-			results <- callEndpoint(endpoint)
+			results <- caller.Call(endpoint)
 		}(ep)
 	}
+	return results
+}
 
+func collectAndSummarize(results <-chan APIResult, count int) {
 	var successes, failures int
-	for i := 0; i < len(endpoints); i++ {
+	for i := 0; i < count; i++ {
 		r := <-results
 		if r.Err != nil {
 			failures++
@@ -220,12 +256,27 @@ func main() {
 				r.Endpoint, r.Status, r.Err, r.Latency.Round(time.Millisecond))
 		} else {
 			successes++
+			dataPreview := r.Data
+			if len(dataPreview) > 40 {
+				dataPreview = dataPreview[:40]
+			}
 			fmt.Printf("  OK    %-25s %d  data=%s (%v)\n",
-				r.Endpoint, r.Status, r.Data[:min(40, len(r.Data))], r.Latency.Round(time.Millisecond))
+				r.Endpoint, r.Status, dataPreview, r.Latency.Round(time.Millisecond))
 		}
 	}
 	fmt.Printf("\n  Summary: %d succeeded, %d failed out of %d endpoints\n",
-		successes, failures, len(endpoints))
+		successes, failures, count)
+}
+
+func main() {
+	endpoints := []string{
+		"/api/user-profile", "/api/order-history", "/api/recommendations",
+		"/api/notifications", "/api/legacy", "/api/settings",
+	}
+
+	caller := &EndpointCaller{}
+	results := fanOutEndpointCalls(endpoints, caller)
+	collectAndSummarize(results, len(endpoints))
 }
 ```
 
@@ -262,6 +313,8 @@ import (
 	"time"
 )
 
+const totalRequests = 10
+
 type HandlerResult struct {
 	RequestID int
 	Status    int
@@ -269,62 +322,68 @@ type HandlerResult struct {
 	Panicked  bool
 }
 
-func main() {
-	safeHandler := func(reqID int, results chan<- HandlerResult) {
-		defer func() {
-			if r := recover(); r != nil {
-				results <- HandlerResult{
-					RequestID: reqID,
-					Status:    500,
-					Body:      fmt.Sprintf("recovered from panic: %v", r),
-					Panicked:  true,
-				}
-			}
-		}()
-
-		// Request 3 has a bug: write to nil map
-		if reqID == 3 {
-			var m map[string]string
-			m["key"] = "value" // panic: assignment to entry in nil map
-		}
-
-		// Request 7 has a different bug: index out of bounds
-		if reqID == 7 {
-			s := []int{1, 2, 3}
-			_ = s[10] // panic: index out of range
-		}
-
-		time.Sleep(time.Duration(rand.Intn(50)+10) * time.Millisecond)
-		results <- HandlerResult{
-			RequestID: reqID,
-			Status:    200,
-			Body:      fmt.Sprintf("request %d processed successfully", reqID),
-		}
+func processRequest(reqID int) HandlerResult {
+	// Request 3 has a bug: write to nil map
+	if reqID == 3 {
+		var m map[string]string
+		m["key"] = "value" // panic: assignment to entry in nil map
 	}
 
-	numRequests := 10
-	results := make(chan HandlerResult, numRequests)
+	// Request 7 has a different bug: index out of bounds
+	if reqID == 7 {
+		s := []int{1, 2, 3}
+		_ = s[10] // panic: index out of range
+	}
 
-	for i := 1; i <= numRequests; i++ {
+	time.Sleep(time.Duration(rand.Intn(50)+10) * time.Millisecond)
+	return HandlerResult{
+		RequestID: reqID,
+		Status:    200,
+		Body:      fmt.Sprintf("request %d processed successfully", reqID),
+	}
+}
+
+func safeHandler(reqID int, results chan<- HandlerResult) {
+	defer func() {
+		if r := recover(); r != nil {
+			results <- HandlerResult{
+				RequestID: reqID,
+				Status:    500,
+				Body:      fmt.Sprintf("recovered from panic: %v", r),
+				Panicked:  true,
+			}
+		}
+	}()
+	results <- processRequest(reqID)
+}
+
+func printResultsSummary(results <-chan HandlerResult, count int) {
+	var okCount, panicCount int
+	for i := 0; i < count; i++ {
+		r := <-results
+		label := "  OK "
+		if r.Panicked {
+			label = "PANIC"
+			panicCount++
+		} else {
+			okCount++
+		}
+		fmt.Printf("  [%s] req %2d  %d  %s\n", label, r.RequestID, r.Status, r.Body)
+	}
+
+	fmt.Printf("\n  Results: %d OK, %d panicked (recovered), %d total\n", okCount, panicCount, count)
+	fmt.Println("  Server stayed up despite handler bugs. In production, each panic")
+	fmt.Println("  would be logged with a stack trace for debugging.")
+}
+
+func main() {
+	results := make(chan HandlerResult, totalRequests)
+
+	for i := 1; i <= totalRequests; i++ {
 		go safeHandler(i, results)
 	}
 
-	var ok, panicked int
-	for i := 0; i < numRequests; i++ {
-		r := <-results
-		status := "  OK "
-		if r.Panicked {
-			status = "PANIC"
-			panicked++
-		} else {
-			ok++
-		}
-		fmt.Printf("  [%s] req %2d  %d  %s\n", status, r.RequestID, r.Status, r.Body)
-	}
-
-	fmt.Printf("\n  Results: %d OK, %d panicked (recovered), %d total\n", ok, panicked, numRequests)
-	fmt.Println("  Server stayed up despite handler bugs. In production, each panic")
-	fmt.Println("  would be logged with a stack trace for debugging.")
+	printResultsSummary(results, totalRequests)
 }
 ```
 
@@ -364,6 +423,8 @@ import (
 	"time"
 )
 
+const simulatedRequestCount = 20
+
 type HTTPRequest struct {
 	ID     int
 	Method string
@@ -376,92 +437,100 @@ type HTTPResponse struct {
 	Latency    time.Duration
 }
 
-func main() {
-	handleHTTP := func(req HTTPRequest) HTTPResponse {
-		start := time.Now()
+type ServerMetrics struct {
+	Responses    []HTTPResponse
+	StatusCounts map[int]int
+	TotalLatency time.Duration
+	WallClock    time.Duration
+}
 
-		// Parse request (~1ms)
-		time.Sleep(1 * time.Millisecond)
+type HTTPServer struct {
+	Paths []string
+}
 
-		// Query database (20-100ms depending on endpoint)
-		switch req.Path {
-		case "/api/search":
-			time.Sleep(time.Duration(rand.Intn(60)+40) * time.Millisecond) // slow
-		case "/health":
-			time.Sleep(2 * time.Millisecond) // fast
-		default:
-			time.Sleep(time.Duration(rand.Intn(40)+15) * time.Millisecond)
-		}
+func NewHTTPServer(paths []string) *HTTPServer {
+	return &HTTPServer{Paths: paths}
+}
 
-		// Format response (~1ms)
-		time.Sleep(1 * time.Millisecond)
-
-		status := 200
-		switch {
-		case req.ID%11 == 0:
-			status = 500
-		case req.ID%7 == 0:
-			status = 404
-		case req.ID%13 == 0:
-			status = 429
-		}
-
-		return HTTPResponse{
-			RequestID:  req.ID,
-			StatusCode: status,
-			Latency:    time.Since(start),
-		}
-	}
-
-	paths := []string{"/api/users", "/api/orders", "/api/products", "/health",
-		"/api/search", "/api/config", "/api/metrics"}
-
-	numRequests := 20
-	responses := make(chan HTTPResponse, numRequests)
+func (s *HTTPServer) HandleRequest(req HTTPRequest) HTTPResponse {
 	start := time.Now()
 
-	// One goroutine per connection
-	for i := 1; i <= numRequests; i++ {
+	time.Sleep(1 * time.Millisecond) // parse request
+
+	switch req.Path {
+	case "/api/search":
+		time.Sleep(time.Duration(rand.Intn(60)+40) * time.Millisecond)
+	case "/health":
+		time.Sleep(2 * time.Millisecond)
+	default:
+		time.Sleep(time.Duration(rand.Intn(40)+15) * time.Millisecond)
+	}
+
+	time.Sleep(1 * time.Millisecond) // format response
+
+	return HTTPResponse{
+		RequestID:  req.ID,
+		StatusCode: s.determineStatusCode(req.ID),
+		Latency:    time.Since(start),
+	}
+}
+
+func (s *HTTPServer) determineStatusCode(reqID int) int {
+	switch {
+	case reqID%11 == 0:
+		return 500
+	case reqID%7 == 0:
+		return 404
+	case reqID%13 == 0:
+		return 429
+	default:
+		return 200
+	}
+}
+
+func (s *HTTPServer) DispatchRequests(count int) <-chan HTTPResponse {
+	responses := make(chan HTTPResponse, count)
+	for i := 1; i <= count; i++ {
 		go func(id int) {
 			req := HTTPRequest{
 				ID:     id,
 				Method: "GET",
-				Path:   paths[id%len(paths)],
+				Path:   s.Paths[id%len(s.Paths)],
 			}
-			responses <- handleHTTP(req)
+			responses <- s.HandleRequest(req)
 		}(i)
 	}
+	return responses
+}
 
-	// Collect all responses and compute metrics
-	statusCounts := map[int]int{}
-	var allResponses []HTTPResponse
-	var totalLatency time.Duration
-
-	for i := 0; i < numRequests; i++ {
+func collectMetrics(responses <-chan HTTPResponse, count int, wallStart time.Time) ServerMetrics {
+	metrics := ServerMetrics{StatusCounts: map[int]int{}}
+	for i := 0; i < count; i++ {
 		resp := <-responses
-		statusCounts[resp.StatusCode]++
-		totalLatency += resp.Latency
-		allResponses = append(allResponses, resp)
+		metrics.StatusCounts[resp.StatusCode]++
+		metrics.TotalLatency += resp.Latency
+		metrics.Responses = append(metrics.Responses, resp)
 	}
+	metrics.WallClock = time.Since(wallStart)
 
-	wallClock := time.Since(start)
-
-	// Sort by latency for percentile calculation
-	sort.Slice(allResponses, func(i, j int) bool {
-		return allResponses[i].Latency < allResponses[j].Latency
+	sort.Slice(metrics.Responses, func(i, j int) bool {
+		return metrics.Responses[i].Latency < metrics.Responses[j].Latency
 	})
+	return metrics
+}
 
-	p50 := allResponses[len(allResponses)/2].Latency
-	p95 := allResponses[int(float64(len(allResponses))*0.95)].Latency
-	p99 := allResponses[len(allResponses)-1].Latency
+func printServerMetrics(metrics ServerMetrics, requestCount int) {
+	p50 := metrics.Responses[len(metrics.Responses)/2].Latency
+	p95 := metrics.Responses[int(float64(len(metrics.Responses))*0.95)].Latency
+	p99 := metrics.Responses[len(metrics.Responses)-1].Latency
 
 	fmt.Println("=== Server Metrics ===")
-	fmt.Printf("  Requests processed:  %d\n", numRequests)
-	fmt.Printf("  Wall-clock time:     %v\n", wallClock.Round(time.Millisecond))
+	fmt.Printf("  Requests processed:  %d\n", requestCount)
+	fmt.Printf("  Wall-clock time:     %v\n", metrics.WallClock.Round(time.Millisecond))
 	fmt.Printf("  Throughput:          %.0f req/sec\n",
-		float64(numRequests)/wallClock.Seconds())
+		float64(requestCount)/metrics.WallClock.Seconds())
 	fmt.Printf("  Concurrency gain:    %.1fx\n",
-		float64(totalLatency)/float64(wallClock))
+		float64(metrics.TotalLatency)/float64(metrics.WallClock))
 	fmt.Println()
 	fmt.Println("  Latency percentiles:")
 	fmt.Printf("    p50: %v\n", p50.Round(time.Millisecond))
@@ -469,7 +538,20 @@ func main() {
 	fmt.Printf("    p99: %v\n", p99.Round(time.Millisecond))
 	fmt.Println()
 	fmt.Printf("  Status codes: 200=%d  404=%d  429=%d  500=%d\n",
-		statusCounts[200], statusCounts[404], statusCounts[429], statusCounts[500])
+		metrics.StatusCounts[200], metrics.StatusCounts[404],
+		metrics.StatusCounts[429], metrics.StatusCounts[500])
+}
+
+func main() {
+	server := NewHTTPServer([]string{
+		"/api/users", "/api/orders", "/api/products", "/health",
+		"/api/search", "/api/config", "/api/metrics",
+	})
+
+	start := time.Now()
+	responses := server.DispatchRequests(simulatedRequestCount)
+	metrics := collectMetrics(responses, simulatedRequestCount, start)
+	printServerMetrics(metrics, simulatedRequestCount)
 }
 ```
 

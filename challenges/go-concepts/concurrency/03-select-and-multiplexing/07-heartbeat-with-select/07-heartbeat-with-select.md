@@ -33,45 +33,61 @@ import (
 	"time"
 )
 
-func main() {
-	done := make(chan struct{})
+const (
+	heartbeatInterval  = 200 * time.Millisecond
+	taskProcessingTime = 100 * time.Millisecond
+	monitoringDuration = 1 * time.Second
+)
+
+type WorkerOutput struct {
+	Heartbeat <-chan struct{}
+	Results   <-chan string
+}
+
+func sendHeartbeat(heartbeat chan<- struct{}) {
+	// Non-blocking heartbeat send.
+	select {
+	case heartbeat <- struct{}{}:
+	default: // Drop if supervisor hasn't consumed the last one.
+	}
+}
+
+func startWorker(done <-chan struct{}, tasks []string) WorkerOutput {
 	heartbeat := make(chan struct{}, 1) // Buffered: don't block the worker.
 	results := make(chan string)
 
-	// Worker goroutine.
 	go func() {
 		defer close(results)
-		ticker := time.NewTicker(200 * time.Millisecond)
+		ticker := time.NewTicker(heartbeatInterval)
 		defer ticker.Stop()
 
-		tasks := []string{"process-order", "send-email", "generate-report", "update-index"}
-		i := 0
+		taskIndex := 0
 		for {
 			select {
 			case <-done:
 				return
 			case <-ticker.C:
-				// Non-blocking heartbeat send.
-				select {
-				case heartbeat <- struct{}{}:
-				default: // Drop if supervisor hasn't consumed the last one.
-				}
-			case results <- tasks[i%len(tasks)]:
-				i++
-				time.Sleep(100 * time.Millisecond) // Simulate task processing.
+				sendHeartbeat(heartbeat)
+			case results <- tasks[taskIndex%len(tasks)]:
+				taskIndex++
+				time.Sleep(taskProcessingTime)
 			}
 		}
 	}()
 
-	timeout := time.After(1 * time.Second)
+	return WorkerOutput{Heartbeat: heartbeat, Results: results}
+}
+
+func monitorWorker(done chan struct{}, worker WorkerOutput, duration time.Duration) {
+	timeout := time.After(duration)
 	for {
 		select {
-		case task, ok := <-results:
+		case task, ok := <-worker.Results:
 			if !ok {
 				return
 			}
 			fmt.Println("completed:", task)
-		case <-heartbeat:
+		case <-worker.Heartbeat:
 			fmt.Println("heartbeat: worker alive")
 		case <-timeout:
 			close(done)
@@ -79,6 +95,14 @@ func main() {
 			return
 		}
 	}
+}
+
+func main() {
+	done := make(chan struct{})
+	tasks := []string{"process-order", "send-email", "generate-report", "update-index"}
+
+	worker := startWorker(done, tasks)
+	monitorWorker(done, worker, monitoringDuration)
 }
 ```
 
@@ -112,19 +136,30 @@ import (
 	"time"
 )
 
-func main() {
-	done := make(chan struct{})
-	heartbeat := make(chan struct{}, 1)
+const (
+	heartbeatInterval    = 100 * time.Millisecond
+	normalWorkDuration   = 50 * time.Millisecond
+	stallDuration        = 5 * time.Second
+	stallAfterHeartbeats = 5
+	deadTimeout          = 500 * time.Millisecond
+)
 
-	// Worker that stalls after 5 heartbeats (simulating a deadlocked DB call).
+func sendHeartbeat(heartbeat chan<- struct{}) {
+	select {
+	case heartbeat <- struct{}{}:
+	default:
+	}
+}
+
+func startStallingWorker(done <-chan struct{}, heartbeat chan<- struct{}, stallAfter int) {
 	go func() {
-		ticker := time.NewTicker(100 * time.Millisecond)
+		ticker := time.NewTicker(heartbeatInterval)
 		defer ticker.Stop()
 
-		for i := 0; ; i++ {
-			if i == 5 {
+		for iteration := 0; ; iteration++ {
+			if iteration == stallAfter {
 				fmt.Println("worker: stuck on database connection (simulated deadlock)")
-				time.Sleep(5 * time.Second) // Simulated stall.
+				time.Sleep(stallDuration)
 			}
 
 			select {
@@ -132,39 +167,47 @@ func main() {
 				fmt.Println("worker: received shutdown")
 				return
 			case <-ticker.C:
-				select {
-				case heartbeat <- struct{}{}:
-				default:
-				}
+				sendHeartbeat(heartbeat)
 			default:
-				time.Sleep(50 * time.Millisecond) // Normal work.
+				time.Sleep(normalWorkDuration)
 			}
 		}
 	}()
+}
 
-	// Supervisor: expects heartbeats every 100ms.
-	// If none arrives for 500ms, the worker is declared dead.
-	const deadTimeout = 500 * time.Millisecond
-	timer := time.NewTimer(deadTimeout)
+func resetTimer(timer *time.Timer, duration time.Duration) {
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
+		}
+	}
+	timer.Reset(duration)
+}
+
+func superviseWorker(heartbeat <-chan struct{}, done chan struct{}, timeout time.Duration) {
+	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 
 	for {
 		select {
 		case <-heartbeat:
 			fmt.Println("supervisor: heartbeat OK")
-			if !timer.Stop() {
-				select {
-				case <-timer.C:
-				default:
-				}
-			}
-			timer.Reset(deadTimeout)
+			resetTimer(timer, timeout)
 		case <-timer.C:
 			fmt.Println("supervisor: ALERT - worker missed heartbeat for 500ms, declaring dead")
 			close(done)
 			return
 		}
 	}
+}
+
+func main() {
+	done := make(chan struct{})
+	heartbeat := make(chan struct{}, 1)
+
+	startStallingWorker(done, heartbeat, stallAfterHeartbeats)
+	superviseWorker(heartbeat, done, deadTimeout)
 }
 ```
 
@@ -194,19 +237,28 @@ import (
 	"time"
 )
 
-func startWorker(id int, done <-chan struct{}, heartbeat chan<- struct{}, stallAfter int) {
-	ticker := time.NewTicker(100 * time.Millisecond)
+const (
+	heartbeatInterval  = 100 * time.Millisecond
+	normalWorkDuration = 50 * time.Millisecond
+	stallDuration      = 5 * time.Second
+	deadTimeout        = 400 * time.Millisecond
+	maxRestarts        = 2
+	stallThreshold     = 3
+)
+
+func runWorker(workerID int, done <-chan struct{}, heartbeat chan<- struct{}, stallAfter int) {
+	ticker := time.NewTicker(heartbeatInterval)
 	defer ticker.Stop()
 
-	for i := 0; ; i++ {
-		if stallAfter > 0 && i == stallAfter {
-			fmt.Printf("worker-%d: stalling (simulated deadlock)\n", id)
-			time.Sleep(5 * time.Second)
+	for iteration := 0; ; iteration++ {
+		if stallAfter > 0 && iteration == stallAfter {
+			fmt.Printf("worker-%d: stalling (simulated deadlock)\n", workerID)
+			time.Sleep(stallDuration)
 		}
 
 		select {
 		case <-done:
-			fmt.Printf("worker-%d: shutdown\n", id)
+			fmt.Printf("worker-%d: shutdown\n", workerID)
 			return
 		case <-ticker.C:
 			select {
@@ -214,65 +266,86 @@ func startWorker(id int, done <-chan struct{}, heartbeat chan<- struct{}, stallA
 			default:
 			}
 		default:
-			time.Sleep(50 * time.Millisecond)
+			time.Sleep(normalWorkDuration)
+		}
+	}
+}
+
+type WorkerHandle struct {
+	ID        int
+	Done      chan struct{}
+	Heartbeat chan struct{}
+}
+
+func launchWorker(workerID int, stallAfter int) WorkerHandle {
+	handle := WorkerHandle{
+		ID:        workerID,
+		Done:      make(chan struct{}),
+		Heartbeat: make(chan struct{}, 1),
+	}
+	go runWorker(workerID, handle.Done, handle.Heartbeat, stallAfter)
+	return handle
+}
+
+func resetTimer(timer *time.Timer, duration time.Duration) {
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
+		}
+	}
+	timer.Reset(duration)
+}
+
+type Supervisor struct {
+	mu       sync.Mutex
+	worker   WorkerHandle
+	restarts int
+}
+
+func NewSupervisor(initialWorker WorkerHandle) *Supervisor {
+	return &Supervisor{worker: initialWorker}
+}
+
+func (s *Supervisor) Run() {
+	timer := time.NewTimer(deadTimeout)
+	defer timer.Stop()
+
+	for {
+		select {
+		case <-s.worker.Heartbeat:
+			fmt.Printf("supervisor: worker-%d heartbeat OK\n", s.worker.ID)
+			resetTimer(timer, deadTimeout)
+
+		case <-timer.C:
+			s.mu.Lock()
+			fmt.Printf("supervisor: worker-%d declared dead\n", s.worker.ID)
+			close(s.worker.Done)
+
+			if s.restarts >= maxRestarts {
+				fmt.Println("supervisor: max restarts reached, giving up")
+				s.mu.Unlock()
+				return
+			}
+
+			s.restarts++
+			stallAfter := 0
+			if s.restarts < maxRestarts {
+				stallAfter = stallThreshold
+			}
+
+			s.worker = launchWorker(s.worker.ID+1, stallAfter)
+			fmt.Printf("supervisor: restarted as worker-%d (restart %d/%d)\n", s.worker.ID, s.restarts, maxRestarts)
+			timer.Reset(deadTimeout)
+			s.mu.Unlock()
 		}
 	}
 }
 
 func main() {
-	const deadTimeout = 400 * time.Millisecond
-	var mu sync.Mutex
-	workerID := 1
-	workerDone := make(chan struct{})
-	heartbeat := make(chan struct{}, 1)
-
-	go startWorker(workerID, workerDone, heartbeat, 3) // Stalls after 3 heartbeats.
-
-	timer := time.NewTimer(deadTimeout)
-	defer timer.Stop()
-
-	maxRestarts := 2
-	restarts := 0
-
-	for {
-		select {
-		case <-heartbeat:
-			fmt.Printf("supervisor: worker-%d heartbeat OK\n", workerID)
-			if !timer.Stop() {
-				select {
-				case <-timer.C:
-				default:
-				}
-			}
-			timer.Reset(deadTimeout)
-
-		case <-timer.C:
-			mu.Lock()
-			fmt.Printf("supervisor: worker-%d declared dead\n", workerID)
-			close(workerDone)
-
-			if restarts >= maxRestarts {
-				fmt.Println("supervisor: max restarts reached, giving up")
-				mu.Unlock()
-				return
-			}
-
-			restarts++
-			workerID++
-			workerDone = make(chan struct{})
-			heartbeat = make(chan struct{}, 1)
-
-			stallAfter := 0 // New workers don't stall.
-			if restarts < maxRestarts {
-				stallAfter = 3 // But first restart still stalls (for demo).
-			}
-
-			go startWorker(workerID, workerDone, heartbeat, stallAfter)
-			fmt.Printf("supervisor: restarted as worker-%d (restart %d/%d)\n", workerID, restarts, maxRestarts)
-			timer.Reset(deadTimeout)
-			mu.Unlock()
-		}
-	}
+	initialWorker := launchWorker(1, stallThreshold)
+	supervisor := NewSupervisor(initialWorker)
+	supervisor.Run()
 }
 ```
 
@@ -307,20 +380,29 @@ import (
 	"time"
 )
 
-func heartbeatWorker(
-	done <-chan struct{},
-	pulseInterval time.Duration,
-	work func(i int) string,
-) (<-chan struct{}, <-chan string) {
+const (
+	pulseInterval      = 200 * time.Millisecond
+	taskWorkDuration   = 80 * time.Millisecond
+	monitoringDuration = 1 * time.Second
+)
+
+type TaskFunc func(sequence int) string
+
+type HeartbeatWorkerOutput struct {
+	Heartbeat <-chan struct{}
+	Results   <-chan string
+}
+
+func startHeartbeatWorker(done <-chan struct{}, interval time.Duration, work TaskFunc) HeartbeatWorkerOutput {
 	heartbeat := make(chan struct{}, 1)
 	results := make(chan string)
 
 	go func() {
 		defer close(results)
-		ticker := time.NewTicker(pulseInterval)
+		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 
-		i := 0
+		sequence := 0
 		for {
 			select {
 			case <-done:
@@ -330,41 +412,46 @@ func heartbeatWorker(
 				case heartbeat <- struct{}{}:
 				default:
 				}
-			case results <- work(i):
-				i++
+			case results <- work(sequence):
+				sequence++
 			}
 		}
 	}()
 
-	return heartbeat, results
+	return HeartbeatWorkerOutput{Heartbeat: heartbeat, Results: results}
 }
 
-func main() {
-	done := make(chan struct{})
-
-	hb, results := heartbeatWorker(done, 200*time.Millisecond, func(i int) string {
-		time.Sleep(80 * time.Millisecond) // Simulate task work.
-		return fmt.Sprintf("task-%d complete", i)
-	})
-
-	timeout := time.After(1 * time.Second)
+func monitorWorker(done chan struct{}, worker HeartbeatWorkerOutput, duration time.Duration) {
+	timeout := time.After(duration)
 	for {
 		select {
-		case <-hb:
+		case <-worker.Heartbeat:
 			fmt.Println("pulse: worker alive")
-		case result, ok := <-results:
+		case result, ok := <-worker.Results:
 			if !ok {
 				return
 			}
 			fmt.Println("result:", result)
 		case <-timeout:
 			close(done)
-			for range results {
-			} // Drain.
+			for range worker.Results {
+			}
 			fmt.Println("monitoring ended")
 			return
 		}
 	}
+}
+
+func main() {
+	done := make(chan struct{})
+
+	processTask := func(sequence int) string {
+		time.Sleep(taskWorkDuration)
+		return fmt.Sprintf("task-%d complete", sequence)
+	}
+
+	worker := startHeartbeatWorker(done, pulseInterval, processTask)
+	monitorWorker(done, worker, monitoringDuration)
 }
 ```
 
@@ -392,20 +479,30 @@ import (
 	"time"
 )
 
-func heartbeatWorker(
-	done <-chan struct{},
-	pulseInterval time.Duration,
-	work func(i int) string,
-) (<-chan struct{}, <-chan string) {
+const (
+	pulseInterval      = 150 * time.Millisecond
+	taskWorkDuration   = 70 * time.Millisecond
+	monitoringDeadline = 500 * time.Millisecond
+)
+
+type TaskFunc func(sequence int) string
+
+type HeartbeatWorkerOutput struct {
+	Label     string
+	Heartbeat <-chan struct{}
+	Results   <-chan string
+}
+
+func startHeartbeatWorker(done <-chan struct{}, label string, interval time.Duration, work TaskFunc) HeartbeatWorkerOutput {
 	heartbeat := make(chan struct{}, 1)
 	results := make(chan string)
 
 	go func() {
 		defer close(results)
-		ticker := time.NewTicker(pulseInterval)
+		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 
-		i := 0
+		sequence := 0
 		for {
 			select {
 			case <-done:
@@ -415,45 +512,49 @@ func heartbeatWorker(
 				case heartbeat <- struct{}{}:
 				default:
 				}
-			case results <- work(i):
-				i++
+			case results <- work(sequence):
+				sequence++
 			}
 		}
 	}()
 
-	return heartbeat, results
+	return HeartbeatWorkerOutput{Label: label, Heartbeat: heartbeat, Results: results}
+}
+
+func drainWorkerResults(workers ...HeartbeatWorkerOutput) {
+	for _, worker := range workers {
+		for range worker.Results {
+		}
+	}
 }
 
 func main() {
 	done := make(chan struct{})
 
-	hb0, res0 := heartbeatWorker(done, 150*time.Millisecond, func(i int) string {
-		time.Sleep(70 * time.Millisecond)
-		return fmt.Sprintf("orders: processed batch-%d", i)
+	ordersWorker := startHeartbeatWorker(done, "orders", pulseInterval, func(sequence int) string {
+		time.Sleep(taskWorkDuration)
+		return fmt.Sprintf("orders: processed batch-%d", sequence)
 	})
-	hb1, res1 := heartbeatWorker(done, 150*time.Millisecond, func(i int) string {
-		time.Sleep(70 * time.Millisecond)
-		return fmt.Sprintf("emails: sent batch-%d", i)
+	emailsWorker := startHeartbeatWorker(done, "emails", pulseInterval, func(sequence int) string {
+		time.Sleep(taskWorkDuration)
+		return fmt.Sprintf("emails: sent batch-%d", sequence)
 	})
 
-	deadline := time.After(500 * time.Millisecond)
+	deadline := time.After(monitoringDeadline)
 	for {
 		select {
-		case <-hb0:
+		case <-ordersWorker.Heartbeat:
 			fmt.Println("[orders] heartbeat OK")
-		case <-hb1:
+		case <-emailsWorker.Heartbeat:
 			fmt.Println("[emails] heartbeat OK")
-		case result := <-res0:
+		case result := <-ordersWorker.Results:
 			fmt.Printf("[orders] %s\n", result)
-		case result := <-res1:
+		case result := <-emailsWorker.Results:
 			fmt.Printf("[emails] %s\n", result)
 		case <-deadline:
 			fmt.Println("monitoring ended")
 			close(done)
-			for range res0 {
-			}
-			for range res1 {
-			}
+			drainWorkerResults(ordersWorker, emailsWorker)
 			return
 		}
 	}

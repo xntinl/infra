@@ -49,6 +49,11 @@ import (
 	"time"
 )
 
+const (
+	initialBalance   = 1000
+	lockAcquireDelay = 50 * time.Millisecond
+)
+
 type Account struct {
 	ID      int
 	Name    string
@@ -56,10 +61,14 @@ type Account struct {
 	balance int
 }
 
+func NewAccount(id int, name string, balance int) *Account {
+	return &Account{ID: id, Name: name, balance: balance}
+}
+
 func transferUnsafe(from, to *Account, amount int) {
 	from.mu.Lock()
 	fmt.Printf("  Transfer %s->%s: locked %s\n", from.Name, to.Name, from.Name)
-	time.Sleep(50 * time.Millisecond) // give the other transfer time to lock
+	time.Sleep(lockAcquireDelay) // give the other transfer time to lock
 	fmt.Printf("  Transfer %s->%s: waiting for %s...\n", from.Name, to.Name, to.Name)
 	to.mu.Lock() // BLOCKED if the other transfer holds this lock
 
@@ -72,9 +81,9 @@ func transferUnsafe(from, to *Account, amount int) {
 	from.mu.Unlock()
 }
 
-func main() {
-	alice := &Account{ID: 1, Name: "Alice", balance: 1000}
-	bob := &Account{ID: 2, Name: "Bob", balance: 1000}
+func demonstrateDeadlock() {
+	alice := NewAccount(1, "Alice", initialBalance)
+	bob := NewAccount(2, "Bob", initialBalance)
 
 	fmt.Println("=== DEADLOCK DEMO (will freeze) ===")
 	fmt.Println("Two transfers locking in opposite order:")
@@ -84,13 +93,11 @@ func main() {
 
 	var wg sync.WaitGroup
 
-	wg.Add(1)
+	wg.Add(2)
 	go func() {
 		defer wg.Done()
 		transferUnsafe(alice, bob, 100) // locks Alice, then Bob
 	}()
-
-	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		transferUnsafe(bob, alice, 50) // locks Bob, then Alice -- OPPOSITE ORDER
@@ -98,6 +105,10 @@ func main() {
 
 	wg.Wait() // never returns -- both goroutines are blocked
 	fmt.Println("This line is never reached")
+}
+
+func main() {
+	demonstrateDeadlock()
 }
 ```
 
@@ -150,6 +161,12 @@ import (
 	"sync"
 )
 
+const (
+	initialBalance       = 1000
+	transfersPerDir      = 100
+	transferAmount       = 10
+)
+
 type Account struct {
 	ID      int
 	Name    string
@@ -157,12 +174,20 @@ type Account struct {
 	balance int
 }
 
-func transferSafe(from, to *Account, amount int) bool {
-	// Always lock the lower-ID account first -- this is the invariant
-	first, second := from, to
-	if from.ID > to.ID {
-		first, second = to, from
+func NewAccount(id int, name string, balance int) *Account {
+	return &Account{ID: id, Name: name, balance: balance}
+}
+
+// lockInOrder acquires locks by ascending account ID to prevent deadlocks.
+func lockInOrder(a, b *Account) (*Account, *Account) {
+	if a.ID > b.ID {
+		return b, a
 	}
+	return a, b
+}
+
+func transferSafe(from, to *Account, amount int) bool {
+	first, second := lockInOrder(from, to)
 
 	first.mu.Lock()
 	defer first.mu.Unlock()
@@ -177,32 +202,36 @@ func transferSafe(from, to *Account, amount int) bool {
 	return true
 }
 
-func main() {
-	alice := &Account{ID: 1, Name: "Alice", balance: 1000}
-	bob := &Account{ID: 2, Name: "Bob", balance: 1000}
-
-	fmt.Println("=== SAFE TRANSFERS (consistent lock ordering) ===")
-	fmt.Printf("Before: Alice=%d, Bob=%d\n\n", alice.balance, bob.balance)
-
+func runBidirectionalTransfers(alice, bob *Account, rounds, amount int) {
 	var wg sync.WaitGroup
 
-	// Run 200 concurrent transfers in both directions
-	for i := 0; i < 100; i++ {
+	for i := 0; i < rounds; i++ {
 		wg.Add(2)
 		go func() {
 			defer wg.Done()
-			transferSafe(alice, bob, 10) // Alice -> Bob
+			transferSafe(alice, bob, amount)
 		}()
 		go func() {
 			defer wg.Done()
-			transferSafe(bob, alice, 10) // Bob -> Alice
+			transferSafe(bob, alice, amount)
 		}()
 	}
 
 	wg.Wait()
+}
 
+func main() {
+	alice := NewAccount(1, "Alice", initialBalance)
+	bob := NewAccount(2, "Bob", initialBalance)
+
+	fmt.Println("=== SAFE TRANSFERS (consistent lock ordering) ===")
+	fmt.Printf("Before: Alice=%d, Bob=%d\n\n", alice.balance, bob.balance)
+
+	runBidirectionalTransfers(alice, bob, transfersPerDir, transferAmount)
+
+	totalMoney := alice.balance + bob.balance
 	fmt.Printf("After:  Alice=%d, Bob=%d\n", alice.balance, bob.balance)
-	fmt.Printf("Total:  %d (must be 2000 -- money is conserved)\n", alice.balance+bob.balance)
+	fmt.Printf("Total:  %d (must be %d -- money is conserved)\n", totalMoney, initialBalance*2)
 	fmt.Println("\nNo deadlock. Consistent lock ordering breaks the circular wait.")
 }
 ```
@@ -235,12 +264,24 @@ import (
 	"fmt"
 	"math/rand"
 	"sync"
+	"sync/atomic"
+)
+
+const (
+	numAccounts      = 5
+	initialBalance   = 10000
+	numTransfers     = 10000
+	maxTransferAmount = 100
 )
 
 type Account struct {
 	ID      int
 	mu      sync.Mutex
 	balance int
+}
+
+func NewAccount(id, balance int) *Account {
+	return &Account{ID: id, balance: balance}
 }
 
 func transfer(from, to *Account, amount int) bool {
@@ -262,57 +303,73 @@ func transfer(from, to *Account, amount int) bool {
 	return true
 }
 
-func main() {
-	const numAccounts = 5
-	accounts := make([]*Account, numAccounts)
+func createAccounts(count, balance int) []*Account {
+	accounts := make([]*Account, count)
 	for i := range accounts {
-		accounts[i] = &Account{ID: i + 1, balance: 10000}
+		accounts[i] = NewAccount(i+1, balance)
 	}
+	return accounts
+}
 
-	fmt.Println("=== Multi-Account Transfer Stress Test ===")
-	fmt.Printf("Accounts: %d, each starting with $10,000\n", numAccounts)
-
-	totalBefore := 0
-	for _, a := range accounts {
-		totalBefore += a.balance
+func pickRandomPair(count int) (int, int) {
+	fromIdx := rand.Intn(count)
+	toIdx := rand.Intn(count)
+	for toIdx == fromIdx {
+		toIdx = rand.Intn(count)
 	}
+	return fromIdx, toIdx
+}
 
+func runStressTest(accounts []*Account, transferCount int) int64 {
 	var wg sync.WaitGroup
-	const numTransfers = 10000
-	successCount := int64(0)
-	var countMu sync.Mutex
+	var successCount atomic.Int64
 
-	for i := 0; i < numTransfers; i++ {
+	for i := 0; i < transferCount; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			fromIdx := rand.Intn(numAccounts)
-			toIdx := rand.Intn(numAccounts)
-			for toIdx == fromIdx {
-				toIdx = rand.Intn(numAccounts)
-			}
-			amount := rand.Intn(100) + 1
+			fromIdx, toIdx := pickRandomPair(len(accounts))
+			amount := rand.Intn(maxTransferAmount) + 1
 			if transfer(accounts[fromIdx], accounts[toIdx], amount) {
-				countMu.Lock()
-				successCount++
-				countMu.Unlock()
+				successCount.Add(1)
 			}
 		}()
 	}
 
 	wg.Wait()
+	return successCount.Load()
+}
 
-	fmt.Printf("\nTransfers attempted: %d\n", numTransfers)
-	fmt.Printf("Transfers succeeded: %d\n", successCount)
-	fmt.Println("\nFinal balances:")
-	totalAfter := 0
-	for _, a := range accounts {
-		fmt.Printf("  Account %d: $%d\n", a.ID, a.balance)
-		totalAfter += a.balance
+func totalBalance(accounts []*Account) int {
+	total := 0
+	for _, acct := range accounts {
+		total += acct.balance
 	}
+	return total
+}
+
+func printStressTestResults(accounts []*Account, totalBefore int, succeeded int64) {
+	fmt.Printf("\nTransfers attempted: %d\n", numTransfers)
+	fmt.Printf("Transfers succeeded: %d\n", succeeded)
+	fmt.Println("\nFinal balances:")
+	for _, acct := range accounts {
+		fmt.Printf("  Account %d: $%d\n", acct.ID, acct.balance)
+	}
+	totalAfter := totalBalance(accounts)
 	fmt.Printf("\nTotal before: $%d\n", totalBefore)
 	fmt.Printf("Total after:  $%d\n", totalAfter)
 	fmt.Printf("Money conserved: %v\n", totalBefore == totalAfter)
+}
+
+func main() {
+	accounts := createAccounts(numAccounts, initialBalance)
+	totalBefore := totalBalance(accounts)
+
+	fmt.Println("=== Multi-Account Transfer Stress Test ===")
+	fmt.Printf("Accounts: %d, each starting with $%d\n", numAccounts, initialBalance)
+
+	succeeded := runStressTest(accounts, numTransfers)
+	printStressTestResults(accounts, totalBefore, succeeded)
 }
 ```
 

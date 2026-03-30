@@ -33,30 +33,32 @@ import (
 	"time"
 )
 
-func main() {
-	dbHealth := make(chan string)
-	cacheHealth := make(chan string)
+func simulateHealthCheck(serviceName string, latency time.Duration, report chan<- string) {
+	time.Sleep(latency)
+	report <- fmt.Sprintf("%s: healthy (%v)", serviceName, latency)
+}
 
-	go func() {
-		time.Sleep(150 * time.Millisecond) // Database is slower
-		dbHealth <- "db: healthy (150ms)"
-	}()
-
-	go func() {
-		time.Sleep(50 * time.Millisecond) // Cache is faster
-		cacheHealth <- "cache: healthy (50ms)"
-	}()
-
+func awaitFirstResponse(dbHealth, cacheHealth <-chan string) string {
 	// select blocks until one service reports.
 	// The cache responds in 50ms, the database in 150ms — cache wins.
 	// Without select, we would block on the database and miss
 	// the fact that the cache responded 100ms earlier.
 	select {
 	case result := <-dbHealth:
-		fmt.Println("first response:", result)
+		return result
 	case result := <-cacheHealth:
-		fmt.Println("first response:", result)
+		return result
 	}
+}
+
+func main() {
+	dbHealth := make(chan string)
+	cacheHealth := make(chan string)
+
+	go simulateHealthCheck("db", 150*time.Millisecond, dbHealth)
+	go simulateHealthCheck("cache", 50*time.Millisecond, cacheHealth)
+
+	fmt.Println("first response:", awaitFirstResponse(dbHealth, cacheHealth))
 }
 ```
 
@@ -81,32 +83,32 @@ import (
 	"time"
 )
 
+func simulateHealthCheck(serviceName string, latency time.Duration, report chan<- string) {
+	time.Sleep(latency)
+	report <- fmt.Sprintf("%s: healthy (%v)", serviceName, latency)
+}
+
+func awaitFirstOfThree(dbHealth, cacheHealth, apiHealth <-chan string) string {
+	select {
+	case result := <-dbHealth:
+		return result
+	case result := <-cacheHealth:
+		return result
+	case result := <-apiHealth:
+		return result
+	}
+}
+
 func main() {
 	dbHealth := make(chan string)
 	cacheHealth := make(chan string)
 	apiHealth := make(chan string)
 
-	go func() {
-		time.Sleep(200 * time.Millisecond)
-		dbHealth <- "db: healthy (200ms)"
-	}()
-	go func() {
-		time.Sleep(80 * time.Millisecond)
-		cacheHealth <- "cache: healthy (80ms)"
-	}()
-	go func() {
-		time.Sleep(120 * time.Millisecond)
-		apiHealth <- "api: healthy (120ms)"
-	}()
+	go simulateHealthCheck("db", 200*time.Millisecond, dbHealth)
+	go simulateHealthCheck("cache", 80*time.Millisecond, cacheHealth)
+	go simulateHealthCheck("api", 120*time.Millisecond, apiHealth)
 
-	select {
-	case result := <-dbHealth:
-		fmt.Println("first response:", result)
-	case result := <-cacheHealth:
-		fmt.Println("first response:", result)
-	case result := <-apiHealth:
-		fmt.Println("first response:", result)
-	}
+	fmt.Println("first response:", awaitFirstOfThree(dbHealth, cacheHealth, apiHealth))
 }
 ```
 
@@ -125,24 +127,38 @@ package main
 
 import "fmt"
 
-func main() {
-	dbWins, cacheWins := 0, 0
+const totalTrials = 10
 
-	for trial := 0; trial < 10; trial++ {
+func pickFromReadyChannels(dbHealth, cacheHealth <-chan string) string {
+	select {
+	case result := <-dbHealth:
+		return result
+	case result := <-cacheHealth:
+		return result
+	}
+}
+
+func runFairnessExperiment(trials int) (dbWins, cacheWins int) {
+	for trial := 0; trial < trials; trial++ {
 		dbHealth := make(chan string, 1)
 		cacheHealth := make(chan string, 1)
 		dbHealth <- "db: healthy"
 		cacheHealth <- "cache: healthy"
 
-		select {
-		case result := <-dbHealth:
-			fmt.Printf("trial %d: %s\n", trial, result)
+		result := pickFromReadyChannels(dbHealth, cacheHealth)
+		fmt.Printf("trial %d: %s\n", trial, result)
+
+		if result == "db: healthy" {
 			dbWins++
-		case result := <-cacheHealth:
-			fmt.Printf("trial %d: %s\n", trial, result)
+		} else {
 			cacheWins++
 		}
 	}
+	return dbWins, cacheWins
+}
+
+func main() {
+	dbWins, cacheWins := runFairnessExperiment(totalTrials)
 	fmt.Printf("db wins: %d, cache wins: %d\n", dbWins, cacheWins)
 }
 ```
@@ -171,25 +187,15 @@ import (
 	"time"
 )
 
-func main() {
-	dbHealth := make(chan string)
-	cacheHealth := make(chan string)
-	apiHealth := make(chan string)
+const serviceCount = 3
 
-	go func() {
-		time.Sleep(100 * time.Millisecond)
-		dbHealth <- "db: healthy (100ms)"
-	}()
-	go func() {
-		time.Sleep(30 * time.Millisecond)
-		cacheHealth <- "cache: healthy (30ms)"
-	}()
-	go func() {
-		time.Sleep(70 * time.Millisecond)
-		apiHealth <- "api: healthy (70ms)"
-	}()
+func simulateHealthCheck(serviceName string, latency time.Duration, report chan<- string) {
+	time.Sleep(latency)
+	report <- fmt.Sprintf("%s: healthy (%v)", serviceName, latency)
+}
 
-	for i := 0; i < 3; i++ {
+func collectAllReports(dbHealth, cacheHealth, apiHealth <-chan string, count int) {
+	for i := 0; i < count; i++ {
 		select {
 		case result := <-dbHealth:
 			fmt.Printf("report %d: %s\n", i+1, result)
@@ -199,6 +205,18 @@ func main() {
 			fmt.Printf("report %d: %s\n", i+1, result)
 		}
 	}
+}
+
+func main() {
+	dbHealth := make(chan string)
+	cacheHealth := make(chan string)
+	apiHealth := make(chan string)
+
+	go simulateHealthCheck("db", 100*time.Millisecond, dbHealth)
+	go simulateHealthCheck("cache", 30*time.Millisecond, cacheHealth)
+	go simulateHealthCheck("api", 70*time.Millisecond, apiHealth)
+
+	collectAllReports(dbHealth, cacheHealth, apiHealth, serviceCount)
 	fmt.Println("all services reported")
 }
 ```
@@ -220,17 +238,21 @@ package main
 
 import "fmt"
 
-func main() {
-	alertCh := make(chan string, 1)  // Buffered — ready to accept
-	logCh := make(chan string)        // Unbuffered — no reader waiting
-
+func routeToFirstAvailable(alertCh chan<- string, logCh chan<- string, message string) string {
 	select {
-	case alertCh <- "db: unhealthy":
-		fmt.Println("sent to alert system")
-	case logCh <- "db: unhealthy":
-		fmt.Println("sent to log system")
+	case alertCh <- message:
+		return "alert system"
+	case logCh <- message:
+		return "log system"
 	}
+}
 
+func main() {
+	alertCh := make(chan string, 1) // Buffered — ready to accept
+	logCh := make(chan string)      // Unbuffered — no reader waiting
+
+	destination := routeToFirstAvailable(alertCh, logCh, "db: unhealthy")
+	fmt.Println("sent to", destination)
 	fmt.Println("alert channel has:", <-alertCh)
 }
 ```
@@ -260,10 +282,10 @@ func main() {
 
 	// Case order does NOT create priority. Both are equally likely.
 	select {
-	case result := <-dbHealth:
-		fmt.Println(result) // NOT guaranteed to run first
-	case result := <-cacheHealth:
-		fmt.Println(result)
+	case report := <-dbHealth:
+		fmt.Println(report) // NOT guaranteed to run first
+	case report := <-cacheHealth:
+		fmt.Println(report)
 	}
 }
 ```

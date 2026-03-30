@@ -35,52 +35,54 @@ import (
 	"time"
 )
 
-func merge(stream1, stream2 <-chan string) <-chan string {
-	out := make(chan string)
+type LogEntry = string
+
+func mergeStreams(stream1, stream2 <-chan LogEntry) <-chan LogEntry {
+	merged := make(chan LogEntry)
 	var wg sync.WaitGroup
 
-	forward := func(ch <-chan string) {
+	forwardEvents := func(source <-chan LogEntry) {
 		defer wg.Done()
-		for event := range ch {
-			out <- event
+		for event := range source {
+			merged <- event
 		}
 	}
 
 	wg.Add(2)
-	go forward(stream1)
-	go forward(stream2)
+	go forwardEvents(stream1)
+	go forwardEvents(stream2)
 
 	go func() {
 		wg.Wait()
-		close(out)
+		close(merged)
 	}()
 
-	return out
+	return merged
+}
+
+func produceLogEntries(entries []LogEntry, interval time.Duration) <-chan LogEntry {
+	stream := make(chan LogEntry)
+	go func() {
+		for _, entry := range entries {
+			stream <- entry
+			time.Sleep(interval)
+		}
+		close(stream)
+	}()
+	return stream
 }
 
 func main() {
-	app1Logs := make(chan string)
-	app2Logs := make(chan string)
+	app1Logs := produceLogEntries(
+		[]LogEntry{"app1: request received", "app1: db query 42ms", "app1: response 200"},
+		30*time.Millisecond,
+	)
+	app2Logs := produceLogEntries(
+		[]LogEntry{"app2: request received", "app2: cache hit", "app2: response 200", "app2: request received", "app2: response 500"},
+		20*time.Millisecond,
+	)
 
-	go func() {
-		entries := []string{"app1: request received", "app1: db query 42ms", "app1: response 200"}
-		for _, entry := range entries {
-			app1Logs <- entry
-			time.Sleep(30 * time.Millisecond)
-		}
-		close(app1Logs)
-	}()
-
-	go func() {
-		entries := []string{"app2: request received", "app2: cache hit", "app2: response 200", "app2: request received", "app2: response 500"}
-		for _, entry := range entries {
-			app2Logs <- entry
-			time.Sleep(20 * time.Millisecond)
-		}
-		close(app2Logs)
-	}()
-
-	for event := range merge(app1Logs, app2Logs) {
+	for event := range mergeStreams(app1Logs, app2Logs) {
 		fmt.Println(event)
 	}
 	fmt.Println("all log streams closed")
@@ -116,44 +118,53 @@ import (
 	"time"
 )
 
+const (
+	instanceCount    = 4
+	eventsPerInstance = 3
+	baseInterval     = 20 * time.Millisecond
+)
+
 func mergeN(streams ...<-chan string) <-chan string {
-	out := make(chan string)
+	merged := make(chan string)
 	var wg sync.WaitGroup
 
-	forward := func(ch <-chan string) {
+	forwardEvents := func(source <-chan string) {
 		defer wg.Done()
-		for event := range ch {
-			out <- event
+		for event := range source {
+			merged <- event
 		}
 	}
 
 	wg.Add(len(streams))
-	for _, ch := range streams {
-		go forward(ch)
+	for _, source := range streams {
+		go forwardEvents(source)
 	}
 
 	go func() {
 		wg.Wait()
-		close(out)
+		close(merged)
 	}()
 
-	return out
+	return merged
+}
+
+func createInstanceStream(instanceID int, eventCount int, interval time.Duration) <-chan string {
+	stream := make(chan string)
+	go func() {
+		for eventSeq := 0; eventSeq < eventCount; eventSeq++ {
+			stream <- fmt.Sprintf("instance-%d: event-%d", instanceID, eventSeq)
+			time.Sleep(interval)
+		}
+		close(stream)
+	}()
+	return stream
 }
 
 func main() {
-	numInstances := 4
-	streams := make([]<-chan string, numInstances)
-
-	for i := 0; i < numInstances; i++ {
-		ch := make(chan string)
-		streams[i] = ch
-		go func(instanceID int, c chan<- string) {
-			for j := 0; j < 3; j++ {
-				c <- fmt.Sprintf("instance-%d: event-%d", instanceID, j)
-				time.Sleep(time.Duration(20*(instanceID+1)) * time.Millisecond)
-			}
-			close(c)
-		}(i, ch)
+	streams := make([]<-chan string, instanceCount)
+	for instanceID := 0; instanceID < instanceCount; instanceID++ {
+		interval := time.Duration(instanceID+1) * baseInterval
+		streams[instanceID] = createInstanceStream(instanceID, eventsPerInstance, interval)
 	}
 
 	for event := range mergeN(streams...) {
@@ -191,62 +202,72 @@ import (
 	"time"
 )
 
-func mergeN(streams ...<-chan string) <-chan string {
-	out := make(chan string)
+type SensorReading = string
+
+func mergeN(streams ...<-chan SensorReading) <-chan SensorReading {
+	merged := make(chan SensorReading)
 	var wg sync.WaitGroup
 
-	forward := func(ch <-chan string) {
+	forwardReadings := func(source <-chan SensorReading) {
 		defer wg.Done()
-		for event := range ch {
-			out <- event
+		for reading := range source {
+			merged <- reading
 		}
 	}
 
 	wg.Add(len(streams))
-	for _, ch := range streams {
-		go forward(ch)
+	for _, source := range streams {
+		go forwardReadings(source)
 	}
 
 	go func() {
 		wg.Wait()
-		close(out)
+		close(merged)
 	}()
 
-	return out
+	return merged
+}
+
+func createSensorStream(name string, readings []SensorReading, interval time.Duration) <-chan SensorReading {
+	stream := make(chan SensorReading)
+	go func() {
+		for _, reading := range readings {
+			stream <- reading
+			time.Sleep(interval)
+		}
+		close(stream)
+		fmt.Printf("--- %s stream ended ---\n", name)
+	}()
+	return stream
+}
+
+func buildTemperatureReadings() []SensorReading {
+	return []SensorReading{
+		"sensor-A: temperature=22.5C",
+		"sensor-A: temperature=22.6C",
+	}
+}
+
+func buildPressureReadings(count int) []SensorReading {
+	readings := make([]SensorReading, count)
+	for i := 0; i < count; i++ {
+		readings[i] = fmt.Sprintf("sensor-B: pressure=%dhPa", 1013+i)
+	}
+	return readings
+}
+
+func buildHumidityReadings(count int) []SensorReading {
+	readings := make([]SensorReading, count)
+	for i := 0; i < count; i++ {
+		readings[i] = fmt.Sprintf("sensor-C: humidity=%d%%", 60+i)
+	}
+	return readings
 }
 
 func main() {
-	// Sensor A: sends 2 readings quickly, then closes.
-	sensorA := make(chan string)
-	go func() {
-		sensorA <- "sensor-A: temperature=22.5C"
-		time.Sleep(20 * time.Millisecond)
-		sensorA <- "sensor-A: temperature=22.6C"
-		close(sensorA)
-		fmt.Println("--- sensor-A stream ended ---")
-	}()
-
-	// Sensor B: sends 5 readings over a longer period.
-	sensorB := make(chan string)
-	go func() {
-		for i := 0; i < 5; i++ {
-			sensorB <- fmt.Sprintf("sensor-B: pressure=%dhPa", 1013+i)
-			time.Sleep(40 * time.Millisecond)
-		}
-		close(sensorB)
-		fmt.Println("--- sensor-B stream ended ---")
-	}()
-
-	// Sensor C: sends 3 readings at medium pace.
-	sensorC := make(chan string)
-	go func() {
-		for i := 0; i < 3; i++ {
-			sensorC <- fmt.Sprintf("sensor-C: humidity=%d%%", 60+i)
-			time.Sleep(50 * time.Millisecond)
-		}
-		close(sensorC)
-		fmt.Println("--- sensor-C stream ended ---")
-	}()
+	sensorA := createSensorStream("sensor-A", buildTemperatureReadings(), 20*time.Millisecond)
+	sensorB := createSensorStream("sensor-B", buildPressureReadings(5), 40*time.Millisecond)
+	sensorC := createSensorStream("sensor-C", buildHumidityReadings(3), 50*time.Millisecond)
 
 	for event := range mergeN(sensorA, sensorB, sensorC) {
 		fmt.Println("aggregated:", event)
@@ -287,62 +308,70 @@ import (
 	"time"
 )
 
-func mergeWithDone(done <-chan struct{}, streams ...<-chan string) <-chan string {
-	out := make(chan string)
+const (
+	serviceCount    = 3
+	eventsToConsume = 10
+	logInterval     = 50 * time.Millisecond
+)
+
+func mergeWithCancellation(done <-chan struct{}, streams ...<-chan string) <-chan string {
+	merged := make(chan string)
 	var wg sync.WaitGroup
 
-	forward := func(ch <-chan string) {
+	forwardEvents := func(source <-chan string) {
 		defer wg.Done()
-		for event := range ch {
+		for event := range source {
 			select {
 			case <-done:
 				return
-			case out <- event:
+			case merged <- event:
 			}
 		}
 	}
 
 	wg.Add(len(streams))
-	for _, ch := range streams {
-		go forward(ch)
+	for _, source := range streams {
+		go forwardEvents(source)
 	}
 
 	go func() {
 		wg.Wait()
-		close(out)
+		close(merged)
 	}()
 
-	return out
+	return merged
+}
+
+func createInfiniteLogStream(done <-chan struct{}, serviceName string, interval time.Duration) <-chan string {
+	stream := make(chan string)
+	go func() {
+		sequence := 0
+		for {
+			select {
+			case <-done:
+				close(stream)
+				return
+			case stream <- fmt.Sprintf("%s: log-entry-%d", serviceName, sequence):
+				sequence++
+				time.Sleep(interval)
+			}
+		}
+	}()
+	return stream
 }
 
 func main() {
 	done := make(chan struct{})
 
-	// Create 3 streams that produce events indefinitely.
-	streams := make([]<-chan string, 3)
-	names := []string{"api-gateway", "auth-service", "payment-service"}
-	for i := 0; i < 3; i++ {
-		ch := make(chan string)
-		streams[i] = ch
-		go func(name string, c chan<- string) {
-			seq := 0
-			for {
-				select {
-				case <-done:
-					close(c)
-					return
-				case c <- fmt.Sprintf("%s: log-entry-%d", name, seq):
-					seq++
-					time.Sleep(50 * time.Millisecond)
-				}
-			}
-		}(names[i], ch)
+	serviceNames := []string{"api-gateway", "auth-service", "payment-service"}
+	streams := make([]<-chan string, len(serviceNames))
+	for i, name := range serviceNames {
+		streams[i] = createInfiniteLogStream(done, name, logInterval)
 	}
 
-	merged := mergeWithDone(done, streams...)
+	merged := mergeWithCancellation(done, streams...)
 
-	// Consume 10 events, then cancel.
-	for i := 0; i < 10; i++ {
+	for i := 0; i < eventsToConsume; i++ {
 		fmt.Println(<-merged)
 	}
 
@@ -384,69 +413,80 @@ import (
 	"time"
 )
 
-type Event struct {
+type TaggedEvent struct {
 	Source  string
 	Payload string
 }
 
-func mergeTagged(done <-chan struct{}, streams ...<-chan Event) <-chan Event {
-	out := make(chan Event)
+type SourceConfig struct {
+	Name     string
+	Count    int
+	Interval time.Duration
+}
+
+func mergeTaggedStreams(done <-chan struct{}, streams ...<-chan TaggedEvent) <-chan TaggedEvent {
+	merged := make(chan TaggedEvent)
 	var wg sync.WaitGroup
 
-	forward := func(ch <-chan Event) {
+	forwardEvents := func(source <-chan TaggedEvent) {
 		defer wg.Done()
-		for event := range ch {
+		for event := range source {
 			select {
 			case <-done:
 				return
-			case out <- event:
+			case merged <- event:
 			}
 		}
 	}
 
 	wg.Add(len(streams))
-	for _, ch := range streams {
-		go forward(ch)
+	for _, source := range streams {
+		go forwardEvents(source)
 	}
 
 	go func() {
 		wg.Wait()
-		close(out)
+		close(merged)
 	}()
 
-	return out
+	return merged
 }
 
-func makeSource(done <-chan struct{}, name string, count int, interval time.Duration) <-chan Event {
-	ch := make(chan Event)
+func createTaggedSource(done <-chan struct{}, config SourceConfig) <-chan TaggedEvent {
+	stream := make(chan TaggedEvent)
 	go func() {
-		defer close(ch)
-		for i := 0; i < count; i++ {
-			event := Event{
-				Source:  name,
-				Payload: fmt.Sprintf("entry-%d", i),
+		defer close(stream)
+		for sequence := 0; sequence < config.Count; sequence++ {
+			event := TaggedEvent{
+				Source:  config.Name,
+				Payload: fmt.Sprintf("entry-%d", sequence),
 			}
 			select {
 			case <-done:
 				return
-			case ch <- event:
+			case stream <- event:
 			}
-			time.Sleep(interval)
+			time.Sleep(config.Interval)
 		}
 	}()
-	return ch
+	return stream
 }
 
 func main() {
 	done := make(chan struct{})
 
-	streams := []<-chan Event{
-		makeSource(done, "nginx-access", 3, 20*time.Millisecond),
-		makeSource(done, "app-errors", 2, 40*time.Millisecond),
-		makeSource(done, "audit-log", 4, 30*time.Millisecond),
+	sources := []SourceConfig{
+		{Name: "nginx-access", Count: 3, Interval: 20 * time.Millisecond},
+		{Name: "app-errors", Count: 2, Interval: 40 * time.Millisecond},
+		{Name: "audit-log", Count: 4, Interval: 30 * time.Millisecond},
 	}
 
-	for event := range mergeTagged(done, streams...) {
+	streams := make([]<-chan TaggedEvent, len(sources))
+	for i, config := range sources {
+		streams[i] = createTaggedSource(done, config)
+	}
+
+	for event := range mergeTaggedStreams(done, streams...) {
 		fmt.Printf("[%s] %s\n", event.Source, event.Payload)
 	}
 	fmt.Println("all sources exhausted")
@@ -520,7 +560,7 @@ for _, ch := range streams {
 - [ ] Can you extend this to merge channels of different types using generics?
 
 ## What's Next
-You have completed the select and multiplexing section. The next section covers sync primitives (`sync.Mutex`, `sync.RWMutex`, `sync.Once`, `sync.Pool`) for shared-state concurrency.
+Continue to [09-select-with-context](../09-select-with-context/) to learn the canonical Go pattern for combining `select` with `context.Done()` for cancellation-aware operations.
 
 ## Summary
 Multiplexing N channels into one uses the fan-in pattern: one goroutine per source forwards events to a shared output channel. A `sync.WaitGroup` tracks forwarders and a separate goroutine closes the output channel when all forwarders are done. In a real-time data aggregator scenario (log streams, sensor feeds, API events), this lets you merge events from a dynamic number of sources into a single ordered stream. Adding a done channel enables cancellation when you need to stop aggregation early. Sources finishing at different times is handled naturally -- the merge keeps reading from active sources.

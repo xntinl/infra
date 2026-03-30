@@ -36,24 +36,37 @@ import (
 	"time"
 )
 
+const (
+	reportTimeout         = 350 * time.Millisecond
+	chunkProcessingDelay  = 100 * time.Millisecond
+	revenuePerRecord      = 49.99
+)
+
 type ReportResult struct {
-	TotalRecords   int
+	TotalRecords    int
 	ProcessedChunks int
-	TotalChunks    int
-	Revenue        float64
-	Complete       bool
-	CancelReason   string
+	TotalChunks     int
+	Revenue         float64
+	Complete        bool
+	CancelReason    string
 }
 
-func generateSalesReport(ctx context.Context, totalRecords int, chunkSize int) ReportResult {
-	totalChunks := (totalRecords + chunkSize - 1) / chunkSize
+type ReportGenerator struct {
+	chunkSize int
+}
+
+func NewReportGenerator(chunkSize int) *ReportGenerator {
+	return &ReportGenerator{chunkSize: chunkSize}
+}
+
+func (g *ReportGenerator) Generate(ctx context.Context, totalRecords int) ReportResult {
+	totalChunks := (totalRecords + g.chunkSize - 1) / g.chunkSize
 	result := ReportResult{TotalChunks: totalChunks}
 
 	fmt.Printf("[report] starting: %d records in %d chunks of %d\n",
-		totalRecords, totalChunks, chunkSize)
+		totalRecords, totalChunks, g.chunkSize)
 
 	for chunk := 0; chunk < totalChunks; chunk++ {
-		// Check context BEFORE processing each chunk.
 		select {
 		case <-ctx.Done():
 			result.CancelReason = ctx.Err().Error()
@@ -63,43 +76,45 @@ func generateSalesReport(ctx context.Context, totalRecords int, chunkSize int) R
 		default:
 		}
 
-		// Process this chunk.
-		recordsInChunk := chunkSize
+		recordsInChunk := g.chunkSize
 		remaining := totalRecords - result.TotalRecords
-		if remaining < chunkSize {
+		if remaining < g.chunkSize {
 			recordsInChunk = remaining
 		}
 
 		fmt.Printf("[report] processing chunk %d/%d (%d records)...\n",
 			chunk+1, totalChunks, recordsInChunk)
-		time.Sleep(100 * time.Millisecond) // Simulate processing.
+		time.Sleep(chunkProcessingDelay)
 
 		result.TotalRecords += recordsInChunk
 		result.ProcessedChunks++
-		result.Revenue += float64(recordsInChunk) * 49.99
+		result.Revenue += float64(recordsInChunk) * revenuePerRecord
 	}
 
 	result.Complete = true
 	return result
 }
 
-func main() {
-	// Cancel after 350ms. With 100ms per chunk, only ~3 chunks will complete.
-	ctx, cancel := context.WithTimeout(context.Background(), 350*time.Millisecond)
-	defer cancel()
-
-	result := generateSalesReport(ctx, 5000, 1000) // 5 chunks of 1000
-
+func printReportResult(result ReportResult, totalRecords int) {
 	fmt.Println("\n=== Report Result ===")
 	fmt.Printf("Complete:   %v\n", result.Complete)
 	fmt.Printf("Processed:  %d/%d chunks\n", result.ProcessedChunks, result.TotalChunks)
-	fmt.Printf("Records:    %d/5000\n", result.TotalRecords)
+	fmt.Printf("Records:    %d/%d\n", result.TotalRecords, totalRecords)
 	fmt.Printf("Revenue:    $%.2f\n", result.Revenue)
 	if result.CancelReason != "" {
 		fmt.Printf("Cancelled:  %s\n", result.CancelReason)
 		fmt.Println("Action:     partial report saved, can resume from chunk",
 			result.ProcessedChunks+1)
 	}
+}
+
+func main() {
+	ctx, cancel := context.WithTimeout(context.Background(), reportTimeout)
+	defer cancel()
+
+	generator := NewReportGenerator(1000)
+	result := generator.Generate(ctx, 5000)
+	printReportResult(result, 5000)
 }
 ```
 
@@ -139,49 +154,62 @@ import (
 	"time"
 )
 
+const (
+	fileBudget        = 350 * time.Millisecond
+	processingRate    = 20 // ms per MB
+)
+
 type FileResult struct {
-	Name    string
-	Size    int
-	Status  string
+	Name   string
+	Size   int
+	Status string
 }
 
-func processFile(ctx context.Context, name string, sizeMB int) FileResult {
-	processTime := time.Duration(sizeMB*20) * time.Millisecond
+type FileSpec struct {
+	Name   string
+	SizeMB int
+}
 
-	// Check deadline before starting. Skip files that cannot finish in time.
+type FileProcessor struct{}
+
+func NewFileProcessor() *FileProcessor {
+	return &FileProcessor{}
+}
+
+func (fp *FileProcessor) processFile(ctx context.Context, spec FileSpec) FileResult {
+	processTime := time.Duration(spec.SizeMB*processingRate) * time.Millisecond
+
 	if deadline, ok := ctx.Deadline(); ok {
 		remaining := time.Until(deadline)
 		if remaining < processTime {
 			return FileResult{
-				Name:   name,
-				Size:   sizeMB,
+				Name:   spec.Name,
+				Size:   spec.SizeMB,
 				Status: fmt.Sprintf("skipped (needs %v, only %v left)", processTime, remaining.Round(time.Millisecond)),
 			}
 		}
 	}
 
-	fmt.Printf("[processor] processing %s (%dMB, ~%v)\n", name, sizeMB, processTime)
+	fmt.Printf("[processor] processing %s (%dMB, ~%v)\n", spec.Name, spec.SizeMB, processTime)
 
 	select {
 	case <-time.After(processTime):
-		return FileResult{Name: name, Size: sizeMB, Status: "completed"}
+		return FileResult{Name: spec.Name, Size: spec.SizeMB, Status: "completed"}
 	case <-ctx.Done():
-		return FileResult{Name: name, Size: sizeMB, Status: fmt.Sprintf("interrupted: %v", ctx.Err())}
+		return FileResult{Name: spec.Name, Size: spec.SizeMB, Status: fmt.Sprintf("interrupted: %v", ctx.Err())}
 	}
 }
 
-func processDirectory(ctx context.Context, files []struct{ name string; sizeMB int }) []FileResult {
+func (fp *FileProcessor) ProcessAll(ctx context.Context, files []FileSpec) []FileResult {
 	var results []FileResult
 
 	for _, f := range files {
-		// Check cancellation between files.
 		select {
 		case <-ctx.Done():
-			// Mark remaining files as skipped.
 			for _, remaining := range files[len(results):] {
 				results = append(results, FileResult{
-					Name:   remaining.name,
-					Size:   remaining.sizeMB,
+					Name:   remaining.Name,
+					Size:   remaining.SizeMB,
 					Status: "not started (context cancelled)",
 				})
 			}
@@ -189,29 +217,14 @@ func processDirectory(ctx context.Context, files []struct{ name string; sizeMB i
 		default:
 		}
 
-		result := processFile(ctx, f.name, f.sizeMB)
+		result := fp.processFile(ctx, f)
 		results = append(results, result)
 	}
 
 	return results
 }
 
-func main() {
-	files := []struct{ name string; sizeMB int }{
-		{"report-2024-01.csv", 5},   // 100ms
-		{"report-2024-02.csv", 3},   // 60ms
-		{"report-2024-03.csv", 8},   // 160ms
-		{"transactions.csv", 15},     // 300ms -- too large for remaining budget
-		{"summary.csv", 2},           // 40ms
-	}
-
-	// 350ms budget for all files.
-	ctx, cancel := context.WithTimeout(context.Background(), 350*time.Millisecond)
-	defer cancel()
-
-	fmt.Println("=== File Processing (budget: 350ms) ===\n")
-	results := processDirectory(ctx, files)
-
+func printFileResults(results []FileResult) {
 	fmt.Println("\n=== Results ===")
 	for _, r := range results {
 		fmt.Printf("  %-25s %3dMB  %s\n", r.Name, r.Size, r.Status)
@@ -223,7 +236,26 @@ func main() {
 			completed++
 		}
 	}
-	fmt.Printf("\nProcessed: %d/%d files\n", completed, len(files))
+	fmt.Printf("\nProcessed: %d/%d files\n", completed, len(results))
+}
+
+func main() {
+	files := []FileSpec{
+		{Name: "report-2024-01.csv", SizeMB: 5},
+		{Name: "report-2024-02.csv", SizeMB: 3},
+		{Name: "report-2024-03.csv", SizeMB: 8},
+		{Name: "transactions.csv", SizeMB: 15},
+		{Name: "summary.csv", SizeMB: 2},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), fileBudget)
+	defer cancel()
+
+	fmt.Printf("=== File Processing (budget: %v) ===\n\n", fileBudget)
+
+	processor := NewFileProcessor()
+	results := processor.ProcessAll(ctx, files)
+	printFileResults(results)
 }
 ```
 
@@ -264,8 +296,14 @@ import (
 	"time"
 )
 
+const (
+	exportTimeout    = 350 * time.Millisecond
+	pageExportDelay  = 80 * time.Millisecond
+	bytesPerPage     = 4096
+)
+
 type ExportProgress struct {
-	Phase       string
+	Phase         string
 	PagesExported int
 	TotalPages    int
 	BytesWritten  int
@@ -273,7 +311,13 @@ type ExportProgress struct {
 	Err           error
 }
 
-func exportUserData(ctx context.Context, totalPages int, progress chan<- ExportProgress) {
+type DataExporter struct{}
+
+func NewDataExporter() *DataExporter {
+	return &DataExporter{}
+}
+
+func (e *DataExporter) Export(ctx context.Context, totalPages int, progress chan<- ExportProgress) {
 	defer close(progress)
 
 	for page := 1; page <= totalPages; page++ {
@@ -283,7 +327,7 @@ func exportUserData(ctx context.Context, totalPages int, progress chan<- ExportP
 				Phase:         "cancelled",
 				PagesExported: page - 1,
 				TotalPages:    totalPages,
-				BytesWritten:  (page - 1) * 4096,
+				BytesWritten:  (page - 1) * bytesPerPage,
 				Done:          true,
 				Err:           ctx.Err(),
 			}
@@ -295,29 +339,22 @@ func exportUserData(ctx context.Context, totalPages int, progress chan<- ExportP
 			Phase:         "exporting",
 			PagesExported: page,
 			TotalPages:    totalPages,
-			BytesWritten:  page * 4096,
+			BytesWritten:  page * bytesPerPage,
 		}
 
-		time.Sleep(80 * time.Millisecond) // Simulate page export.
+		time.Sleep(pageExportDelay)
 	}
 
 	progress <- ExportProgress{
 		Phase:         "complete",
 		PagesExported: totalPages,
 		TotalPages:    totalPages,
-		BytesWritten:  totalPages * 4096,
+		BytesWritten:  totalPages * bytesPerPage,
 		Done:          true,
 	}
 }
 
-func main() {
-	ctx, cancel := context.WithTimeout(context.Background(), 350*time.Millisecond)
-	defer cancel()
-
-	progress := make(chan ExportProgress)
-	go exportUserData(ctx, 10, progress)
-
-	fmt.Println("=== Data Export Progress ===\n")
+func monitorExport(progress <-chan ExportProgress) {
 	for p := range progress {
 		if p.Done {
 			if p.Err != nil {
@@ -335,6 +372,18 @@ func main() {
 		fmt.Printf("  [%3.0f%%] page %d/%d exported (%d bytes)\n",
 			pct, p.PagesExported, p.TotalPages, p.BytesWritten)
 	}
+}
+
+func main() {
+	ctx, cancel := context.WithTimeout(context.Background(), exportTimeout)
+	defer cancel()
+
+	exporter := NewDataExporter()
+	progress := make(chan ExportProgress)
+	go exporter.Export(ctx, 10, progress)
+
+	fmt.Println("=== Data Export Progress ===\n")
+	monitorExport(progress)
 }
 ```
 
@@ -371,26 +420,36 @@ import (
 	"time"
 )
 
+const (
+	migrationTimeout = 250 * time.Millisecond
+	stepDelay        = 30 * time.Millisecond
+)
+
 type MigrationResult struct {
 	Migrated []string
 	Pending  []string
 	Error    error
 }
 
-func migrateRecord(recordID string) {
-	fmt.Printf("    validate %s\n", recordID)
-	time.Sleep(30 * time.Millisecond)
-	fmt.Printf("    transform %s\n", recordID)
-	time.Sleep(30 * time.Millisecond)
-	fmt.Printf("    write %s\n", recordID)
-	time.Sleep(30 * time.Millisecond)
+type DataMigrator struct{}
+
+func NewDataMigrator() *DataMigrator {
+	return &DataMigrator{}
 }
 
-func runMigration(ctx context.Context, records []string) MigrationResult {
+func (m *DataMigrator) migrateRecord(recordID string) {
+	fmt.Printf("    validate %s\n", recordID)
+	time.Sleep(stepDelay)
+	fmt.Printf("    transform %s\n", recordID)
+	time.Sleep(stepDelay)
+	fmt.Printf("    write %s\n", recordID)
+	time.Sleep(stepDelay)
+}
+
+func (m *DataMigrator) Run(ctx context.Context, records []string) MigrationResult {
 	result := MigrationResult{}
 
 	for i, record := range records {
-		// Check cancellation BETWEEN records.
 		select {
 		case <-ctx.Done():
 			result.Pending = records[i:]
@@ -399,9 +458,8 @@ func runMigration(ctx context.Context, records []string) MigrationResult {
 		default:
 		}
 
-		// Once started, a record runs to completion (all 3 steps).
 		fmt.Printf("[migration] record %d/%d: %s\n", i+1, len(records), record)
-		migrateRecord(record)
+		m.migrateRecord(record)
 		result.Migrated = append(result.Migrated, record)
 		fmt.Printf("[migration] record %s committed\n\n", record)
 	}
@@ -409,20 +467,7 @@ func runMigration(ctx context.Context, records []string) MigrationResult {
 	return result
 }
 
-func main() {
-	records := []string{
-		"user-001", "user-002", "user-003",
-		"user-004", "user-005",
-	}
-
-	// 250ms budget. Each record takes ~90ms (3 steps * 30ms).
-	// Should complete 2 records, cancel before 3rd.
-	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
-	defer cancel()
-
-	fmt.Println("=== Data Migration (budget: 250ms, ~90ms per record) ===\n")
-	result := runMigration(ctx, records)
-
+func printMigrationResult(result MigrationResult) {
 	fmt.Println("=== Migration Result ===")
 	fmt.Printf("Migrated: %v\n", result.Migrated)
 	fmt.Printf("Pending:  %v\n", result.Pending)
@@ -431,6 +476,22 @@ func main() {
 		fmt.Println("\nNo data corruption: each migrated record completed all 3 steps.")
 		fmt.Printf("Resume migration from record: %s\n", result.Pending[0])
 	}
+}
+
+func main() {
+	records := []string{
+		"user-001", "user-002", "user-003",
+		"user-004", "user-005",
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), migrationTimeout)
+	defer cancel()
+
+	fmt.Printf("=== Data Migration (budget: %v, ~%v per record) ===\n\n", migrationTimeout, stepDelay*3)
+
+	migrator := NewDataMigrator()
+	result := migrator.Run(ctx, records)
+	printMigrationResult(result)
 }
 ```
 
@@ -532,13 +593,24 @@ import (
 	"time"
 )
 
+const (
+	batchTimeout       = 400 * time.Millisecond
+	recordTransformDelay = 60 * time.Millisecond
+)
+
 type BatchResult struct {
 	Processed []string
 	Skipped   []string
 	Reason    string
 }
 
-func batchTransform(ctx context.Context, records []string) BatchResult {
+type BatchProcessor struct{}
+
+func NewBatchProcessor() *BatchProcessor {
+	return &BatchProcessor{}
+}
+
+func (bp *BatchProcessor) Transform(ctx context.Context, records []string) BatchResult {
 	var processed []string
 	for i, record := range records {
 		select {
@@ -550,7 +622,7 @@ func batchTransform(ctx context.Context, records []string) BatchResult {
 			}
 		default:
 		}
-		time.Sleep(60 * time.Millisecond)
+		time.Sleep(recordTransformDelay)
 		processed = append(processed, fmt.Sprintf("%s:transformed", record))
 	}
 	return BatchResult{Processed: processed, Reason: "completed"}
@@ -559,10 +631,11 @@ func batchTransform(ctx context.Context, records []string) BatchResult {
 func main() {
 	records := []string{"r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10"}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), batchTimeout)
 	defer cancel()
 
-	result := batchTransform(ctx, records)
+	processor := NewBatchProcessor()
+	result := processor.Transform(ctx, records)
 	fmt.Printf("Processed: %v\n", result.Processed)
 	fmt.Printf("Skipped:   %v\n", result.Skipped)
 	fmt.Printf("Reason:    %s\n", result.Reason)

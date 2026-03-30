@@ -41,7 +41,15 @@ import (
 	"sync"
 )
 
-func main() {
+const concurrentUsers = 100
+
+func simulateUnsafeSessionAccess(sessions map[string]string, userID int) {
+	sessionID := fmt.Sprintf("sess-%d", userID)
+	sessions[sessionID] = fmt.Sprintf("user-%d", userID) // concurrent write -- UNSAFE
+	_ = sessions[sessionID]                                // concurrent read -- UNSAFE
+}
+
+func demonstrateMapPanic() {
 	sessions := make(map[string]string)
 	var wg sync.WaitGroup
 
@@ -52,17 +60,19 @@ func main() {
 		}
 	}()
 
-	for i := 0; i < 100; i++ {
+	for i := 0; i < concurrentUsers; i++ {
 		wg.Add(1)
 		go func(userID int) {
 			defer wg.Done()
-			sessionID := fmt.Sprintf("sess-%d", userID)
-			sessions[sessionID] = fmt.Sprintf("user-%d", userID) // concurrent write -- UNSAFE
-			_ = sessions[sessionID]                                // concurrent read -- UNSAFE
+			simulateUnsafeSessionAccess(sessions, userID)
 		}(i)
 	}
 
 	wg.Wait()
+}
+
+func main() {
+	demonstrateMapPanic()
 }
 ```
 
@@ -97,50 +107,77 @@ type Session struct {
 	Data      map[string]string
 }
 
-func main() {
-	var sessions sync.Map
+type SessionStore struct {
+	sessions sync.Map
+}
 
-	// Create sessions
-	sessions.Store("sess-abc123", Session{
-		UserID:    "user-1",
-		CreatedAt: time.Now(),
-		Data:      map[string]string{"role": "admin"},
-	})
-	sessions.Store("sess-def456", Session{
-		UserID:    "user-2",
-		CreatedAt: time.Now(),
-		Data:      map[string]string{"role": "viewer"},
-	})
+func (s *SessionStore) Create(sessionID string, sess Session) {
+	s.sessions.Store(sessionID, sess)
+}
 
-	// Load a session
-	val, ok := sessions.Load("sess-abc123")
-	if ok {
-		sess := val.(Session)
-		fmt.Printf("Found session: user=%s, role=%s\n", sess.UserID, sess.Data["role"])
+func (s *SessionStore) Find(sessionID string) (Session, bool) {
+	val, ok := s.sessions.Load(sessionID)
+	if !ok {
+		return Session{}, false
 	}
+	return val.(Session), true
+}
 
-	// LoadOrStore: create session only if it does not exist (login idempotency)
-	newSession := Session{UserID: "user-2", CreatedAt: time.Now(), Data: map[string]string{"role": "editor"}}
-	actual, loaded := sessions.LoadOrStore("sess-def456", newSession)
-	if loaded {
-		existing := actual.(Session)
-		fmt.Printf("Session already exists: user=%s, role=%s (not overwritten)\n", existing.UserID, existing.Data["role"])
-	}
+func (s *SessionStore) GetOrCreate(sessionID string, newSession Session) (Session, bool) {
+	actual, loaded := s.sessions.LoadOrStore(sessionID, newSession)
+	return actual.(Session), loaded
+}
 
-	// Delete a session (logout)
-	sessions.Delete("sess-abc123")
-	_, ok = sessions.Load("sess-abc123")
-	fmt.Printf("After logout: session found=%v\n", ok)
+func (s *SessionStore) Delete(sessionID string) {
+	s.sessions.Delete(sessionID)
+}
 
-	// Range: count all active sessions
+func (s *SessionStore) CountActive() int {
 	count := 0
-	sessions.Range(func(key, value any) bool {
+	s.sessions.Range(func(key, value any) bool {
 		count++
 		sess := value.(Session)
 		fmt.Printf("  Active: %s -> user=%s\n", key, sess.UserID)
 		return true
 	})
+	return count
+}
+
+func demonstrateSyncMapOperations() {
+	store := &SessionStore{}
+
+	store.Create("sess-abc123", Session{
+		UserID:    "user-1",
+		CreatedAt: time.Now(),
+		Data:      map[string]string{"role": "admin"},
+	})
+	store.Create("sess-def456", Session{
+		UserID:    "user-2",
+		CreatedAt: time.Now(),
+		Data:      map[string]string{"role": "viewer"},
+	})
+
+	if sess, ok := store.Find("sess-abc123"); ok {
+		fmt.Printf("Found session: user=%s, role=%s\n", sess.UserID, sess.Data["role"])
+	}
+
+	// LoadOrStore: create session only if it does not exist (login idempotency)
+	candidate := Session{UserID: "user-2", CreatedAt: time.Now(), Data: map[string]string{"role": "editor"}}
+	existing, alreadyExists := store.GetOrCreate("sess-def456", candidate)
+	if alreadyExists {
+		fmt.Printf("Session already exists: user=%s, role=%s (not overwritten)\n", existing.UserID, existing.Data["role"])
+	}
+
+	store.Delete("sess-abc123")
+	_, found := store.Find("sess-abc123")
+	fmt.Printf("After logout: session found=%v\n", found)
+
+	count := store.CountActive()
 	fmt.Printf("Total active sessions: %d\n", count)
+}
+
+func main() {
+	demonstrateSyncMapOperations()
 }
 ```
 
@@ -173,57 +210,77 @@ import (
 	"time"
 )
 
+const (
+	concurrentUsers     = 50
+	validationsPerUser  = 10
+)
+
 type Session struct {
 	UserID    string
 	CreatedAt time.Time
 }
 
-func main() {
-	var sessions sync.Map
-	var wg sync.WaitGroup
-	var logins, validations, logouts atomic.Int64
+type SessionMetrics struct {
+	Logins      atomic.Int64
+	Validations atomic.Int64
+	Logouts     atomic.Int64
+}
 
-	// Simulate 50 concurrent users
-	for i := 0; i < 50; i++ {
-		wg.Add(1)
-		go func(userID int) {
-			defer wg.Done()
-			sessKey := fmt.Sprintf("sess-%d", userID)
+func simulateUserLifecycle(sessions *sync.Map, userID int, metrics *SessionMetrics) {
+	sessKey := fmt.Sprintf("sess-%d", userID)
 
-			// Login: create session
-			sessions.Store(sessKey, Session{
-				UserID:    fmt.Sprintf("user-%d", userID),
-				CreatedAt: time.Now(),
-			})
-			logins.Add(1)
+	sessions.Store(sessKey, Session{
+		UserID:    fmt.Sprintf("user-%d", userID),
+		CreatedAt: time.Now(),
+	})
+	metrics.Logins.Add(1)
 
-			// Validate: read session 10 times (simulating multiple requests)
-			for j := 0; j < 10; j++ {
-				if val, ok := sessions.Load(sessKey); ok {
-					_ = val.(Session).UserID
-					validations.Add(1)
-				}
-			}
-
-			// Logout: delete session
-			sessions.Delete(sessKey)
-			logouts.Add(1)
-		}(i)
+	for j := 0; j < validationsPerUser; j++ {
+		if val, ok := sessions.Load(sessKey); ok {
+			_ = val.(Session).UserID
+			metrics.Validations.Add(1)
+		}
 	}
 
-	wg.Wait()
+	sessions.Delete(sessKey)
+	metrics.Logouts.Add(1)
+}
 
+func countRemainingSessions(sessions *sync.Map) int {
 	remaining := 0
 	sessions.Range(func(_, _ any) bool {
 		remaining++
 		return true
 	})
+	return remaining
+}
+
+func runConcurrentSessionTest() {
+	var sessions sync.Map
+	var wg sync.WaitGroup
+	metrics := &SessionMetrics{}
+
+	for i := 0; i < concurrentUsers; i++ {
+		wg.Add(1)
+		go func(userID int) {
+			defer wg.Done()
+			simulateUserLifecycle(&sessions, userID, metrics)
+		}(i)
+	}
+
+	wg.Wait()
+
+	remaining := countRemainingSessions(&sessions)
 
 	fmt.Println("=== Session Store Results ===")
-	fmt.Printf("Logins:      %d\n", logins.Load())
-	fmt.Printf("Validations: %d\n", validations.Load())
-	fmt.Printf("Logouts:     %d\n", logouts.Load())
+	fmt.Printf("Logins:      %d\n", metrics.Logins.Load())
+	fmt.Printf("Validations: %d\n", metrics.Validations.Load())
+	fmt.Printf("Logouts:     %d\n", metrics.Logouts.Load())
 	fmt.Printf("Remaining:   %d (should be 0)\n", remaining)
+}
+
+func main() {
+	runConcurrentSessionTest()
 }
 ```
 
@@ -255,12 +312,21 @@ import (
 	"time"
 )
 
-func benchSyncMap(readers, writers int, ops int) time.Duration {
+const (
+	opsPerGoroutine = 5000
+	prePopulateKeys = 1000
+	writeRatio      = 10 // writers do ops/writeRatio operations
+)
+
+func keyForIndex(base, ops, iteration, keySpace int) string {
+	return fmt.Sprintf("key-%d", (base*ops+iteration)%keySpace)
+}
+
+func benchSyncMap(readers, writers, ops int) time.Duration {
 	var m sync.Map
 	var wg sync.WaitGroup
 
-	// Pre-populate
-	for i := 0; i < 1000; i++ {
+	for i := 0; i < prePopulateKeys; i++ {
 		m.Store(fmt.Sprintf("key-%d", i), i)
 	}
 
@@ -268,20 +334,20 @@ func benchSyncMap(readers, writers int, ops int) time.Duration {
 
 	for i := 0; i < readers; i++ {
 		wg.Add(1)
-		go func(id int) {
+		go func(workerID int) {
 			defer wg.Done()
 			for j := 0; j < ops; j++ {
-				m.Load(fmt.Sprintf("key-%d", (id*ops+j)%1000))
+				m.Load(keyForIndex(workerID, ops, j, prePopulateKeys))
 			}
 		}(i)
 	}
 
 	for i := 0; i < writers; i++ {
 		wg.Add(1)
-		go func(id int) {
+		go func(workerID int) {
 			defer wg.Done()
-			for j := 0; j < ops/10; j++ {
-				m.Store(fmt.Sprintf("key-%d", (id*ops+j)%1000), j)
+			for j := 0; j < ops/writeRatio; j++ {
+				m.Store(keyForIndex(workerID, ops, j, prePopulateKeys), j)
 			}
 		}(i)
 	}
@@ -290,12 +356,12 @@ func benchSyncMap(readers, writers int, ops int) time.Duration {
 	return time.Since(start)
 }
 
-func benchMutexMap(readers, writers int, ops int) time.Duration {
+func benchMutexMap(readers, writers, ops int) time.Duration {
 	var mu sync.RWMutex
 	m := make(map[string]int)
 	var wg sync.WaitGroup
 
-	for i := 0; i < 1000; i++ {
+	for i := 0; i < prePopulateKeys; i++ {
 		m[fmt.Sprintf("key-%d", i)] = i
 	}
 
@@ -303,11 +369,11 @@ func benchMutexMap(readers, writers int, ops int) time.Duration {
 
 	for i := 0; i < readers; i++ {
 		wg.Add(1)
-		go func(id int) {
+		go func(workerID int) {
 			defer wg.Done()
 			for j := 0; j < ops; j++ {
 				mu.RLock()
-				_ = m[fmt.Sprintf("key-%d", (id*ops+j)%1000)]
+				_ = m[keyForIndex(workerID, ops, j, prePopulateKeys)]
 				mu.RUnlock()
 			}
 		}(i)
@@ -315,11 +381,11 @@ func benchMutexMap(readers, writers int, ops int) time.Duration {
 
 	for i := 0; i < writers; i++ {
 		wg.Add(1)
-		go func(id int) {
+		go func(workerID int) {
 			defer wg.Done()
-			for j := 0; j < ops/10; j++ {
+			for j := 0; j < ops/writeRatio; j++ {
 				mu.Lock()
-				m[fmt.Sprintf("key-%d", (id*ops+j)%1000)] = j
+				m[keyForIndex(workerID, ops, j, prePopulateKeys)] = j
 				mu.Unlock()
 			}
 		}(i)
@@ -329,20 +395,18 @@ func benchMutexMap(readers, writers int, ops int) time.Duration {
 	return time.Since(start)
 }
 
+func runWorkloadComparison(label string, readers, writers int) {
+	fmt.Printf("=== %s ===\n", label)
+	syncTime := benchSyncMap(readers, writers, opsPerGoroutine)
+	mutexTime := benchMutexMap(readers, writers, opsPerGoroutine)
+	fmt.Printf("  sync.Map:    %v\n", syncTime.Round(time.Millisecond))
+	fmt.Printf("  map+RWMutex: %v\n", mutexTime.Round(time.Millisecond))
+}
+
 func main() {
-	const ops = 5000
-
-	fmt.Println("=== Read-Heavy Workload (90% reads, 10% writes) ===")
-	syncTime := benchSyncMap(90, 10, ops)
-	mutexTime := benchMutexMap(90, 10, ops)
-	fmt.Printf("  sync.Map:    %v\n", syncTime.Round(time.Millisecond))
-	fmt.Printf("  map+RWMutex: %v\n", mutexTime.Round(time.Millisecond))
-
-	fmt.Println("\n=== Write-Heavy Workload (50% reads, 50% writes) ===")
-	syncTime = benchSyncMap(50, 50, ops)
-	mutexTime = benchMutexMap(50, 50, ops)
-	fmt.Printf("  sync.Map:    %v\n", syncTime.Round(time.Millisecond))
-	fmt.Printf("  map+RWMutex: %v\n", mutexTime.Round(time.Millisecond))
+	runWorkloadComparison("Read-Heavy Workload (90% reads, 10% writes)", 90, 10)
+	fmt.Println()
+	runWorkloadComparison("Write-Heavy Workload (50% reads, 50% writes)", 50, 50)
 
 	fmt.Println("\nConclusion:")
 	fmt.Println("  sync.Map can win for read-heavy, disjoint-key workloads.")

@@ -51,17 +51,25 @@ import (
 	"fmt"
 )
 
+const (
+	statusImported = "imported"
+	statusSkipped  = "skipped"
+)
+
+// CSVRecord represents a single row from the CSV file.
 type CSVRecord struct {
 	LineNum int
 	Fields  map[string]string
 }
 
+// ValidatedRecord carries the validation outcome for a CSV row.
 type ValidatedRecord struct {
 	Record CSVRecord
 	Valid  bool
 	Error  string
 }
 
+// EnrichedRecord adds external data to a validated row.
 type EnrichedRecord struct {
 	Record      CSVRecord
 	CompanyInfo string
@@ -70,15 +78,26 @@ type EnrichedRecord struct {
 	WorkerID    int
 }
 
+// ImportResult is the final outcome for each row: imported, skipped, or error.
 type ImportResult struct {
 	LineNum int
-	Status  string // "imported", "skipped", "error"
+	Status  string
 	Detail  string
+}
+
+// DataImporter orchestrates the CSV import pipeline.
+type DataImporter struct {
+	enrichWorkers int
+}
+
+func NewDataImporter(enrichWorkers int) *DataImporter {
+	return &DataImporter{enrichWorkers: enrichWorkers}
 }
 
 func main() {
 	ctx := context.Background()
 	_ = ctx
+	_ = NewDataImporter(3)
 	fmt.Println("Pipeline types defined. Ready to build stages.")
 }
 ```
@@ -97,12 +116,22 @@ import (
 	"fmt"
 )
 
+// CSVRecord represents a single row from the CSV file.
 type CSVRecord struct {
 	LineNum int
 	Fields  map[string]string
 }
 
-func readCSV(ctx context.Context, data []map[string]string) <-chan CSVRecord {
+// DataImporter orchestrates the CSV import pipeline.
+type DataImporter struct {
+	enrichWorkers int
+}
+
+func NewDataImporter(enrichWorkers int) *DataImporter {
+	return &DataImporter{enrichWorkers: enrichWorkers}
+}
+
+func (di *DataImporter) ReadCSV(ctx context.Context, data []map[string]string) <-chan CSVRecord {
 	out := make(chan CSVRecord)
 	go func() {
 		defer close(out)
@@ -127,8 +156,8 @@ func main() {
 		{"name": "Charlie Brown", "email": "charlie@example.com", "company": "Example LLC"},
 	}
 
-	ctx := context.Background()
-	records := readCSV(ctx, data)
+	importer := NewDataImporter(3)
+	records := importer.ReadCSV(context.Background(), data)
 
 	fmt.Println("=== CSV Reader Test ===")
 	for r := range records {
@@ -164,17 +193,22 @@ import (
 	"time"
 )
 
+const enrichAPILatency = 30 * time.Millisecond
+
+// CSVRecord represents a single row from the CSV file.
 type CSVRecord struct {
 	LineNum int
 	Fields  map[string]string
 }
 
+// ValidatedRecord carries the validation outcome for a CSV row.
 type ValidatedRecord struct {
 	Record CSVRecord
 	Valid  bool
 	Error  string
 }
 
+// EnrichedRecord adds external data to a validated row.
 type EnrichedRecord struct {
 	Record      CSVRecord
 	CompanyInfo string
@@ -183,30 +217,38 @@ type EnrichedRecord struct {
 	WorkerID    int
 }
 
-func validate(ctx context.Context, in <-chan CSVRecord) <-chan ValidatedRecord {
+// DataImporter orchestrates the CSV import pipeline.
+type DataImporter struct {
+	enrichWorkers int
+}
+
+func NewDataImporter(enrichWorkers int) *DataImporter {
+	return &DataImporter{enrichWorkers: enrichWorkers}
+}
+
+func validateRecord(record CSVRecord) ValidatedRecord {
+	name := strings.TrimSpace(record.Fields["name"])
+	email := strings.TrimSpace(record.Fields["email"])
+
+	if name == "" {
+		return ValidatedRecord{Record: record, Valid: false, Error: "missing required field: name"}
+	}
+	if email == "" {
+		return ValidatedRecord{Record: record, Valid: false, Error: "missing required field: email"}
+	}
+	if !strings.Contains(email, "@") {
+		return ValidatedRecord{Record: record, Valid: false, Error: fmt.Sprintf("invalid email format: %s", email)}
+	}
+	return ValidatedRecord{Record: record, Valid: true}
+}
+
+func (di *DataImporter) Validate(ctx context.Context, in <-chan CSVRecord) <-chan ValidatedRecord {
 	out := make(chan ValidatedRecord)
 	go func() {
 		defer close(out)
 		for record := range in {
-			result := ValidatedRecord{Record: record, Valid: true}
-
-			// Check required fields
-			name := strings.TrimSpace(record.Fields["name"])
-			email := strings.TrimSpace(record.Fields["email"])
-
-			if name == "" {
-				result.Valid = false
-				result.Error = "missing required field: name"
-			} else if email == "" {
-				result.Valid = false
-				result.Error = "missing required field: email"
-			} else if !strings.Contains(email, "@") {
-				result.Valid = false
-				result.Error = fmt.Sprintf("invalid email format: %s", email)
-			}
-
 			select {
-			case out <- result:
+			case out <- validateRecord(record):
 			case <-ctx.Done():
 				return
 			}
@@ -215,34 +257,25 @@ func validate(ctx context.Context, in <-chan CSVRecord) <-chan ValidatedRecord {
 	return out
 }
 
-func enrich(ctx context.Context, id int, in <-chan ValidatedRecord) <-chan EnrichedRecord {
+func (di *DataImporter) Enrich(ctx context.Context, id int, in <-chan ValidatedRecord) <-chan EnrichedRecord {
 	out := make(chan EnrichedRecord)
 	go func() {
 		defer close(out)
 		for vr := range in {
 			if !vr.Valid {
-				// Forward invalid records without enrichment
 				select {
-				case out <- EnrichedRecord{
-					Record: vr.Record, Valid: false,
-					Error: vr.Error, WorkerID: id,
-				}:
+				case out <- EnrichedRecord{Record: vr.Record, Valid: false, Error: vr.Error, WorkerID: id}:
 				case <-ctx.Done():
 					return
 				}
 				continue
 			}
 
-			// Simulate external API call for company data
-			time.Sleep(30 * time.Millisecond)
-			company := vr.Record.Fields["company"]
-			companyInfo := fmt.Sprintf("%s (verified, 50 employees)", company)
+			time.Sleep(enrichAPILatency)
+			companyInfo := fmt.Sprintf("%s (verified, 50 employees)", vr.Record.Fields["company"])
 
 			select {
-			case out <- EnrichedRecord{
-				Record: vr.Record, CompanyInfo: companyInfo,
-				Valid: true, WorkerID: id,
-			}:
+			case out <- EnrichedRecord{Record: vr.Record, CompanyInfo: companyInfo, Valid: true, WorkerID: id}:
 			case <-ctx.Done():
 				fmt.Printf("  [enricher %d] canceled during enrichment\n", id)
 				return
@@ -252,8 +285,18 @@ func enrich(ctx context.Context, id int, in <-chan ValidatedRecord) <-chan Enric
 	return out
 }
 
+func emitRecords(data []CSVRecord) <-chan CSVRecord {
+	in := make(chan CSVRecord)
+	go func() {
+		defer close(in)
+		for _, r := range data {
+			in <- r
+		}
+	}()
+	return in
+}
+
 func main() {
-	ctx := context.Background()
 	csvData := []CSVRecord{
 		{1, map[string]string{"name": "Alice", "email": "alice@acme.com", "company": "Acme"}},
 		{2, map[string]string{"name": "", "email": "bob@widgets.io", "company": "Widgets"}},
@@ -261,16 +304,12 @@ func main() {
 		{4, map[string]string{"name": "Diana", "email": "diana@corp.com", "company": "Corp"}},
 	}
 
-	in := make(chan CSVRecord)
-	go func() {
-		for _, r := range csvData {
-			in <- r
-		}
-		close(in)
-	}()
+	importer := NewDataImporter(3)
+	ctx := context.Background()
 
-	validated := validate(ctx, in)
-	enriched := enrich(ctx, 1, validated)
+	in := emitRecords(csvData)
+	validated := importer.Validate(ctx, in)
+	enriched := importer.Enrich(ctx, 1, validated)
 
 	fmt.Println("=== Validate + Enrich Test ===")
 	for er := range enriched {
@@ -312,17 +351,25 @@ import (
 	"time"
 )
 
+const (
+	enrichAPILatency   = 50 * time.Millisecond
+	defaultEnrichWorkers = 3
+)
+
+// CSVRecord represents a single row from the CSV file.
 type CSVRecord struct {
 	LineNum int
 	Fields  map[string]string
 }
 
+// ValidatedRecord carries the validation outcome for a CSV row.
 type ValidatedRecord struct {
 	Record CSVRecord
 	Valid  bool
 	Error  string
 }
 
+// EnrichedRecord adds external data to a validated row.
 type EnrichedRecord struct {
 	Record      CSVRecord
 	CompanyInfo string
@@ -331,23 +378,34 @@ type EnrichedRecord struct {
 	WorkerID    int
 }
 
-func validate(ctx context.Context, in <-chan CSVRecord) <-chan ValidatedRecord {
+// DataImporter orchestrates the CSV import pipeline.
+type DataImporter struct {
+	enrichWorkers int
+}
+
+func NewDataImporter(enrichWorkers int) *DataImporter {
+	return &DataImporter{enrichWorkers: enrichWorkers}
+}
+
+func validateRecord(record CSVRecord) ValidatedRecord {
+	name := strings.TrimSpace(record.Fields["name"])
+	email := strings.TrimSpace(record.Fields["email"])
+	if name == "" {
+		return ValidatedRecord{Record: record, Valid: false, Error: "missing required field: name"}
+	}
+	if !strings.Contains(email, "@") {
+		return ValidatedRecord{Record: record, Valid: false, Error: fmt.Sprintf("invalid email: %s", email)}
+	}
+	return ValidatedRecord{Record: record, Valid: true}
+}
+
+func (di *DataImporter) Validate(ctx context.Context, in <-chan CSVRecord) <-chan ValidatedRecord {
 	out := make(chan ValidatedRecord)
 	go func() {
 		defer close(out)
 		for record := range in {
-			result := ValidatedRecord{Record: record, Valid: true}
-			name := strings.TrimSpace(record.Fields["name"])
-			email := strings.TrimSpace(record.Fields["email"])
-			if name == "" {
-				result.Valid = false
-				result.Error = "missing required field: name"
-			} else if !strings.Contains(email, "@") {
-				result.Valid = false
-				result.Error = fmt.Sprintf("invalid email: %s", email)
-			}
 			select {
-			case out <- result:
+			case out <- validateRecord(record):
 			case <-ctx.Done():
 				return
 			}
@@ -356,7 +414,7 @@ func validate(ctx context.Context, in <-chan CSVRecord) <-chan ValidatedRecord {
 	return out
 }
 
-func enrich(ctx context.Context, id int, in <-chan ValidatedRecord) <-chan EnrichedRecord {
+func (di *DataImporter) enrichWorker(ctx context.Context, id int, in <-chan ValidatedRecord) <-chan EnrichedRecord {
 	out := make(chan EnrichedRecord)
 	go func() {
 		defer close(out)
@@ -369,7 +427,7 @@ func enrich(ctx context.Context, id int, in <-chan ValidatedRecord) <-chan Enric
 				}
 				continue
 			}
-			time.Sleep(50 * time.Millisecond) // external API call
+			time.Sleep(enrichAPILatency)
 			select {
 			case out <- EnrichedRecord{
 				Record: vr.Record, Valid: true, WorkerID: id,
@@ -383,10 +441,10 @@ func enrich(ctx context.Context, id int, in <-chan ValidatedRecord) <-chan Enric
 	return out
 }
 
-func fanOutEnrich(ctx context.Context, in <-chan ValidatedRecord, numWorkers int) <-chan EnrichedRecord {
-	workers := make([]<-chan EnrichedRecord, numWorkers)
-	for i := 0; i < numWorkers; i++ {
-		workers[i] = enrich(ctx, i+1, in)
+func (di *DataImporter) FanOutEnrich(ctx context.Context, in <-chan ValidatedRecord) <-chan EnrichedRecord {
+	workers := make([]<-chan EnrichedRecord, di.enrichWorkers)
+	for i := 0; i < di.enrichWorkers; i++ {
+		workers[i] = di.enrichWorker(ctx, i+1, in)
 	}
 
 	out := make(chan EnrichedRecord)
@@ -411,15 +469,10 @@ func fanOutEnrich(ctx context.Context, in <-chan ValidatedRecord, numWorkers int
 	return out
 }
 
-func main() {
-	ctx := context.Background()
-
-	// Generate 15 CSV records
+func generateTestRecords(names []string) <-chan CSVRecord {
 	in := make(chan CSVRecord)
 	go func() {
 		defer close(in)
-		names := []string{"Alice", "Bob", "", "Diana", "Eve", "Frank", "Grace",
-			"Henry", "Ivy", "", "Kate", "Leo", "Mia", "Noah", "Olivia"}
 		for i, name := range names {
 			in <- CSVRecord{
 				LineNum: i + 1,
@@ -431,13 +484,21 @@ func main() {
 			}
 		}
 	}()
+	return in
+}
 
-	fmt.Println("=== Fan-Out Enrichment (3 workers, 15 records) ===")
-	fmt.Println()
+func main() {
+	ctx := context.Background()
+	names := []string{"Alice", "Bob", "", "Diana", "Eve", "Frank", "Grace",
+		"Henry", "Ivy", "", "Kate", "Leo", "Mia", "Noah", "Olivia"}
+
+	fmt.Printf("=== Fan-Out Enrichment (%d workers, %d records) ===\n\n", defaultEnrichWorkers, len(names))
 	start := time.Now()
 
-	validated := validate(ctx, in)
-	enriched := fanOutEnrich(ctx, validated, 3)
+	importer := NewDataImporter(defaultEnrichWorkers)
+	in := generateTestRecords(names)
+	validated := importer.Validate(ctx, in)
+	enriched := importer.FanOutEnrich(ctx, validated)
 
 	var imported, skipped int
 	for er := range enriched {
@@ -477,17 +538,31 @@ import (
 	"time"
 )
 
+const (
+	enrichAPILatency   = 30 * time.Millisecond
+	dbWriteLatency     = 5 * time.Millisecond
+	goroutineSettleMs  = 100 * time.Millisecond
+	cancelTimeout      = 100 * time.Millisecond
+	defaultEnrichWorkers = 3
+	totalCSVRecords    = 30
+	statusImported     = "imported"
+	statusSkipped      = "skipped"
+)
+
+// CSVRecord represents a single row from the CSV file.
 type CSVRecord struct {
 	LineNum int
 	Fields  map[string]string
 }
 
+// ValidatedRecord carries the validation outcome for a CSV row.
 type ValidatedRecord struct {
 	Record CSVRecord
 	Valid  bool
 	Error  string
 }
 
+// EnrichedRecord adds external data to a validated row.
 type EnrichedRecord struct {
 	Record      CSVRecord
 	CompanyInfo string
@@ -496,13 +571,23 @@ type EnrichedRecord struct {
 	WorkerID    int
 }
 
+// ImportResult is the final outcome for each row.
 type ImportResult struct {
 	LineNum int
 	Status  string
 	Detail  string
 }
 
-func readCSV(ctx context.Context, data []map[string]string) <-chan CSVRecord {
+// DataImporter orchestrates the full CSV import pipeline with cancellation.
+type DataImporter struct {
+	enrichWorkers int
+}
+
+func NewDataImporter(enrichWorkers int) *DataImporter {
+	return &DataImporter{enrichWorkers: enrichWorkers}
+}
+
+func (di *DataImporter) ReadCSV(ctx context.Context, data []map[string]string) <-chan CSVRecord {
 	out := make(chan CSVRecord)
 	go func() {
 		defer close(out)
@@ -519,23 +604,25 @@ func readCSV(ctx context.Context, data []map[string]string) <-chan CSVRecord {
 	return out
 }
 
-func validate(ctx context.Context, in <-chan CSVRecord) <-chan ValidatedRecord {
+func validateRecord(record CSVRecord) ValidatedRecord {
+	name := strings.TrimSpace(record.Fields["name"])
+	email := strings.TrimSpace(record.Fields["email"])
+	if name == "" {
+		return ValidatedRecord{Record: record, Valid: false, Error: "missing name"}
+	}
+	if !strings.Contains(email, "@") {
+		return ValidatedRecord{Record: record, Valid: false, Error: "invalid email"}
+	}
+	return ValidatedRecord{Record: record, Valid: true}
+}
+
+func (di *DataImporter) Validate(ctx context.Context, in <-chan CSVRecord) <-chan ValidatedRecord {
 	out := make(chan ValidatedRecord)
 	go func() {
 		defer close(out)
 		for record := range in {
-			result := ValidatedRecord{Record: record, Valid: true}
-			name := strings.TrimSpace(record.Fields["name"])
-			email := strings.TrimSpace(record.Fields["email"])
-			if name == "" {
-				result.Valid = false
-				result.Error = "missing name"
-			} else if !strings.Contains(email, "@") {
-				result.Valid = false
-				result.Error = "invalid email"
-			}
 			select {
-			case out <- result:
+			case out <- validateRecord(record):
 			case <-ctx.Done():
 				return
 			}
@@ -544,7 +631,7 @@ func validate(ctx context.Context, in <-chan CSVRecord) <-chan ValidatedRecord {
 	return out
 }
 
-func enrich(ctx context.Context, id int, in <-chan ValidatedRecord) <-chan EnrichedRecord {
+func (di *DataImporter) enrichWorker(ctx context.Context, id int, in <-chan ValidatedRecord) <-chan EnrichedRecord {
 	out := make(chan EnrichedRecord)
 	go func() {
 		defer close(out)
@@ -558,7 +645,7 @@ func enrich(ctx context.Context, id int, in <-chan ValidatedRecord) <-chan Enric
 				continue
 			}
 			select {
-			case <-time.After(30 * time.Millisecond): // simulate API call
+			case <-time.After(enrichAPILatency):
 			case <-ctx.Done():
 				return
 			}
@@ -575,10 +662,10 @@ func enrich(ctx context.Context, id int, in <-chan ValidatedRecord) <-chan Enric
 	return out
 }
 
-func fanOutEnrich(ctx context.Context, in <-chan ValidatedRecord, n int) <-chan EnrichedRecord {
-	workers := make([]<-chan EnrichedRecord, n)
-	for i := 0; i < n; i++ {
-		workers[i] = enrich(ctx, i+1, in)
+func (di *DataImporter) FanOutEnrich(ctx context.Context, in <-chan ValidatedRecord) <-chan EnrichedRecord {
+	workers := make([]<-chan EnrichedRecord, di.enrichWorkers)
+	for i := 0; i < di.enrichWorkers; i++ {
+		workers[i] = di.enrichWorker(ctx, i+1, in)
 	}
 	out := make(chan EnrichedRecord)
 	var wg sync.WaitGroup
@@ -602,28 +689,24 @@ func fanOutEnrich(ctx context.Context, in <-chan ValidatedRecord, n int) <-chan 
 	return out
 }
 
-func writeToDB(ctx context.Context, in <-chan EnrichedRecord) <-chan ImportResult {
+func (di *DataImporter) WriteToDB(ctx context.Context, in <-chan EnrichedRecord) <-chan ImportResult {
 	out := make(chan ImportResult)
 	go func() {
 		defer close(out)
 		for er := range in {
 			if !er.Valid {
 				select {
-				case out <- ImportResult{
-					LineNum: er.Record.LineNum,
-					Status:  "skipped",
-					Detail:  er.Error,
-				}:
+				case out <- ImportResult{LineNum: er.Record.LineNum, Status: statusSkipped, Detail: er.Error}:
 				case <-ctx.Done():
 					return
 				}
 				continue
 			}
-			time.Sleep(5 * time.Millisecond) // simulate DB write
+			time.Sleep(dbWriteLatency)
 			select {
 			case out <- ImportResult{
 				LineNum: er.Record.LineNum,
-				Status:  "imported",
+				Status:  statusImported,
 				Detail:  fmt.Sprintf("%s -> %s", er.Record.Fields["name"], er.CompanyInfo),
 			}:
 			case <-ctx.Done():
@@ -634,19 +717,16 @@ func writeToDB(ctx context.Context, in <-chan EnrichedRecord) <-chan ImportResul
 	return out
 }
 
-func main() {
-	goroutinesBefore := runtime.NumGoroutine()
+func (di *DataImporter) RunPipeline(ctx context.Context, csvData []map[string]string) <-chan ImportResult {
+	records := di.ReadCSV(ctx, csvData)
+	validated := di.Validate(ctx, records)
+	enriched := di.FanOutEnrich(ctx, validated)
+	return di.WriteToDB(ctx, enriched)
+}
 
-	// Generate test CSV data
-	csvData := make([]map[string]string, 30)
-	names := []string{
-		"Alice", "Bob", "", "Diana", "Eve", "Frank", "Grace", "Henry",
-		"Ivy", "", "Kate", "Leo", "Mia", "Noah", "Olivia", "Pete",
-		"Quinn", "Rose", "", "Sam", "Tina", "Uma", "Vic", "Wendy",
-		"Xander", "Yara", "Zoe", "", "Aaron", "Beth",
-	}
-	for i := 0; i < 30; i++ {
-		name := names[i]
+func buildCSVData(names []string) []map[string]string {
+	csvData := make([]map[string]string, len(names))
+	for i, name := range names {
 		email := ""
 		if name != "" {
 			email = strings.ToLower(name) + "@company.com"
@@ -657,78 +737,67 @@ func main() {
 			"company": fmt.Sprintf("Corp_%d", i+1),
 		}
 	}
+	return csvData
+}
 
-	// ========== Run 1: Complete import (no cancellation) ==========
-	fmt.Println("=== Complete Import (30 records) ===")
-	fmt.Println()
-	ctx1 := context.Background()
-	start := time.Now()
-
-	records := readCSV(ctx1, csvData)
-	validated := validate(ctx1, records)
-	enriched := fanOutEnrich(ctx1, validated, 3)
-	results := writeToDB(ctx1, enriched)
-
-	var imported, skipped int
+func collectResults(results <-chan ImportResult) (imported, skipped int) {
 	for r := range results {
 		switch r.Status {
-		case "imported":
+		case statusImported:
 			imported++
-		case "skipped":
+		case statusSkipped:
 			skipped++
 			fmt.Printf("  Line %2d: SKIP - %s\n", r.LineNum, r.Detail)
 		}
 	}
+	return
+}
+
+func checkGoroutineLeaks(label string, baseline int) {
+	time.Sleep(goroutineSettleMs)
+	current := runtime.NumGoroutine()
+	leaked := current - baseline
+	if leaked > 0 {
+		fmt.Printf("  WARNING: %d goroutine(s) leaked %s\n", leaked, label)
+	} else {
+		fmt.Printf("  Goroutines: OK %s (before=%d, after=%d)\n", label, baseline, current)
+	}
+}
+
+func main() {
+	goroutinesBefore := runtime.NumGoroutine()
+
+	names := []string{
+		"Alice", "Bob", "", "Diana", "Eve", "Frank", "Grace", "Henry",
+		"Ivy", "", "Kate", "Leo", "Mia", "Noah", "Olivia", "Pete",
+		"Quinn", "Rose", "", "Sam", "Tina", "Uma", "Vic", "Wendy",
+		"Xander", "Yara", "Zoe", "", "Aaron", "Beth",
+	}
+	csvData := buildCSVData(names)
+	importer := NewDataImporter(defaultEnrichWorkers)
+
+	// Run 1: Complete import (no cancellation)
+	fmt.Printf("=== Complete Import (%d records) ===\n\n", totalCSVRecords)
+	start := time.Now()
+	results := importer.RunPipeline(context.Background(), csvData)
+	imported, skipped := collectResults(results)
 
 	fmt.Printf("\n  Imported: %d, Skipped: %d\n", imported, skipped)
 	fmt.Printf("  Completed in %v\n", time.Since(start))
+	checkGoroutineLeaks("", goroutinesBefore)
 
-	// Check for goroutine leaks
-	time.Sleep(100 * time.Millisecond)
-	goroutinesAfter := runtime.NumGoroutine()
-	leaked := goroutinesAfter - goroutinesBefore
-	if leaked > 0 {
-		fmt.Printf("  WARNING: %d goroutine(s) leaked\n", leaked)
-	} else {
-		fmt.Printf("  Goroutines: OK (before=%d, after=%d)\n\n", goroutinesBefore, goroutinesAfter)
-	}
-
-	// ========== Run 2: User cancels import after 100ms ==========
-	fmt.Println("=== Canceled Import (user cancels after 100ms) ===")
-	fmt.Println()
-	ctx2, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	// Run 2: User cancels import after 100ms
+	fmt.Printf("\n=== Canceled Import (user cancels after %v) ===\n\n", cancelTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), cancelTimeout)
 	defer cancel()
 	start = time.Now()
-
-	records2 := readCSV(ctx2, csvData)
-	validated2 := validate(ctx2, records2)
-	enriched2 := fanOutEnrich(ctx2, validated2, 3)
-	results2 := writeToDB(ctx2, enriched2)
-
-	var cancelImported, cancelSkipped int
-	for r := range results2 {
-		switch r.Status {
-		case "imported":
-			cancelImported++
-		case "skipped":
-			cancelSkipped++
-		}
-	}
+	results2 := importer.RunPipeline(ctx, csvData)
+	cancelImported, cancelSkipped := collectResults(results2)
 
 	fmt.Printf("  Import canceled after %v\n", time.Since(start))
 	fmt.Printf("  Partial results: %d imported, %d skipped\n", cancelImported, cancelSkipped)
 	fmt.Printf("  (Remaining records were NOT processed -- clean shutdown)\n")
-
-	// Verify cleanup
-	time.Sleep(100 * time.Millisecond)
-	goroutinesAfter = runtime.NumGoroutine()
-	leaked = goroutinesAfter - goroutinesBefore
-	if leaked > 0 {
-		fmt.Printf("  WARNING: %d goroutine(s) leaked after cancel\n", leaked)
-	} else {
-		fmt.Printf("  Goroutines: OK after cancel (before=%d, after=%d)\n",
-			goroutinesBefore, goroutinesAfter)
-	}
+	checkGoroutineLeaks("after cancel", goroutinesBefore)
 }
 ```
 

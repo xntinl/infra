@@ -39,26 +39,31 @@ import (
 	"time"
 )
 
+const querySimulatedLatency = 50 * time.Millisecond
+
 type QueryResult struct {
 	Name  string
 	Value string
 }
 
-func main() {
-	fmt.Println("=== Unsafe Collection (data race) ===")
-	fmt.Println("Run with: go run -race main.go")
+type UnsafeQueryRunner struct {
+	queryNames []string
+}
 
+func NewUnsafeQueryRunner(queryNames []string) *UnsafeQueryRunner {
+	return &UnsafeQueryRunner{queryNames: queryNames}
+}
+
+func (qr *UnsafeQueryRunner) RunAllUnsafe() []QueryResult {
 	var wg sync.WaitGroup
 	var results []QueryResult // shared, unprotected
 
-	queries := []string{"revenue", "active-users", "conversion", "top-products", "error-rate"}
-
-	for _, q := range queries {
+	for _, q := range qr.queryNames {
 		q := q
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			time.Sleep(50 * time.Millisecond)
+			time.Sleep(querySimulatedLatency)
 			// DATA RACE: multiple goroutines call append concurrently.
 			// append modifies the slice header (length, capacity) and may
 			// reallocate the backing array. This corrupts the slice.
@@ -67,6 +72,16 @@ func main() {
 	}
 
 	wg.Wait()
+	return results
+}
+
+func main() {
+	fmt.Println("=== Unsafe Collection (data race) ===")
+	fmt.Println("Run with: go run -race main.go")
+
+	runner := NewUnsafeQueryRunner([]string{"revenue", "active-users", "conversion", "top-products", "error-rate"})
+	results := runner.RunAllUnsafe()
+
 	fmt.Printf("Got %d results (may be wrong or corrupted due to race)\n", len(results))
 }
 ```
@@ -95,58 +110,76 @@ import (
 	"time"
 )
 
+type QuerySpec struct {
+	Name    string
+	Latency time.Duration
+	Value   float64
+}
+
 type QueryResult struct {
 	Name    string
 	Value   float64
 	Latency time.Duration
 }
 
-func main() {
-	fmt.Println("=== Index-Based Collection (no mutex) ===")
-	start := time.Now()
+type QueryRunner struct {
+	queries []QuerySpec
+}
 
-	queries := []struct {
-		name    string
-		latency time.Duration
-		value   float64
-	}{
-		{"total-revenue", 150 * time.Millisecond, 1_247_893.50},
-		{"active-users", 80 * time.Millisecond, 42_381},
-		{"conversion-rate", 120 * time.Millisecond, 3.7},
-		{"top-products", 200 * time.Millisecond, 15},
-		{"error-rate", 60 * time.Millisecond, 0.02},
-	}
+func NewQueryRunner(queries []QuerySpec) *QueryRunner {
+	return &QueryRunner{queries: queries}
+}
 
-	results := make([]QueryResult, len(queries)) // pre-allocate exact size
+func (qr *QueryRunner) RunAllIndexBased() []QueryResult {
+	results := make([]QueryResult, len(qr.queries)) // pre-allocate exact size
 
 	var wg sync.WaitGroup
 
-	for i, q := range queries {
+	for i, q := range qr.queries {
 		i, q := i, q
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 
-			time.Sleep(q.latency) // simulate database query
+			time.Sleep(q.Latency) // simulate database query
 
 			// SAFE: each goroutine writes to a unique index.
 			// Different indices are different memory locations.
 			// The slice header (length, capacity, pointer) is never modified.
 			results[i] = QueryResult{
-				Name:    q.name,
-				Value:   q.value,
-				Latency: q.latency,
+				Name:    q.Name,
+				Value:   q.Value,
+				Latency: q.Latency,
 			}
 		}()
 	}
 
 	wg.Wait()
-	elapsed := time.Since(start).Round(time.Millisecond)
+	return results
+}
 
+func printQueryResults(results []QueryResult, elapsed time.Duration) {
 	fmt.Printf("\nDashboard Data (loaded in %v):\n", elapsed)
 	for _, r := range results {
 		fmt.Printf("  %-20s = %12.2f  (query took %v)\n", r.Name, r.Value, r.Latency)
 	}
+}
+
+func main() {
+	runner := NewQueryRunner([]QuerySpec{
+		{"total-revenue", 150 * time.Millisecond, 1_247_893.50},
+		{"active-users", 80 * time.Millisecond, 42_381},
+		{"conversion-rate", 120 * time.Millisecond, 3.7},
+		{"top-products", 200 * time.Millisecond, 15},
+		{"error-rate", 60 * time.Millisecond, 0.02},
+	})
+
+	fmt.Println("=== Index-Based Collection (no mutex) ===")
+	start := time.Now()
+
+	results := runner.RunAllIndexBased()
+
+	printQueryResults(results, time.Since(start).Round(time.Millisecond))
 }
 ```
 
@@ -185,17 +218,59 @@ type Metric struct {
 	Value  float64
 }
 
-func main() {
-	fmt.Println("=== Mutex-Protected Collection ===")
-	start := time.Now()
+type DataSource struct {
+	Name    string
+	Latency time.Duration
+	Metrics []Metric
+}
 
-	// Simulate querying multiple data sources where each source
-	// may return zero, one, or many metrics
-	sources := []struct {
-		name    string
-		latency time.Duration
-		metrics []Metric
-	}{
+type MetricCollector struct {
+	sources []DataSource
+	mu      sync.Mutex
+	metrics []Metric
+}
+
+func NewMetricCollector(sources []DataSource) *MetricCollector {
+	return &MetricCollector{sources: sources}
+}
+
+func (mc *MetricCollector) CollectAll() []Metric {
+	var wg sync.WaitGroup
+
+	for _, src := range mc.sources {
+		src := src
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			mc.fetchFromSource(src)
+		}()
+	}
+
+	wg.Wait()
+	return mc.metrics
+}
+
+func (mc *MetricCollector) fetchFromSource(src DataSource) {
+	time.Sleep(src.Latency)
+
+	if src.Metrics == nil {
+		return // this source had no data -- nothing to collect
+	}
+
+	mc.mu.Lock()
+	mc.metrics = append(mc.metrics, src.Metrics...)
+	mc.mu.Unlock()
+}
+
+func printMetrics(metrics []Metric, sourceCount int, elapsed time.Duration) {
+	fmt.Printf("Collected %d metrics from %d sources in %v:\n", len(metrics), sourceCount, elapsed)
+	for _, m := range metrics {
+		fmt.Printf("  [%-12s] %-20s = %.2f\n", m.Source, m.Name, m.Value)
+	}
+}
+
+func main() {
+	sources := []DataSource{
 		{"postgres", 100 * time.Millisecond, []Metric{
 			{Source: "postgres", Name: "total-revenue", Value: 1_247_893.50},
 			{Source: "postgres", Name: "order-count", Value: 8_429},
@@ -208,39 +283,17 @@ func main() {
 			{Source: "prometheus", Name: "error-rate", Value: 0.02},
 			{Source: "prometheus", Name: "qps", Value: 12_450},
 		}},
-		{"empty-source", 50 * time.Millisecond, nil}, // returns nothing
+		{"empty-source", 50 * time.Millisecond, nil},
 	}
 
-	var mu sync.Mutex
-	var allMetrics []Metric
+	collector := NewMetricCollector(sources)
 
-	var wg sync.WaitGroup
+	fmt.Println("=== Mutex-Protected Collection ===")
+	start := time.Now()
 
-	for _, src := range sources {
-		src := src
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	metrics := collector.CollectAll()
 
-			time.Sleep(src.latency)
-
-			if src.metrics == nil {
-				return // this source had no data -- nothing to collect
-			}
-
-			mu.Lock()
-			allMetrics = append(allMetrics, src.metrics...)
-			mu.Unlock()
-		}()
-	}
-
-	wg.Wait()
-	elapsed := time.Since(start).Round(time.Millisecond)
-
-	fmt.Printf("Collected %d metrics from %d sources in %v:\n", len(allMetrics), len(sources), elapsed)
-	for _, m := range allMetrics {
-		fmt.Printf("  [%-12s] %-20s = %.2f\n", m.Source, m.Name, m.Value)
-	}
+	printMetrics(metrics, len(sources), time.Since(start).Round(time.Millisecond))
 }
 ```
 
@@ -284,28 +337,25 @@ type DashboardResult struct {
 	OK    bool
 }
 
-func main() {
-	fmt.Println("=== Partial Results on Error ===")
-	start := time.Now()
+type QueryRunner struct {
+	queries []DashboardQuery
+}
 
-	queries := []DashboardQuery{
-		{"revenue", 80 * time.Millisecond, false},
-		{"active-users", 50 * time.Millisecond, false},
-		{"conversion", 120 * time.Millisecond, true}, // THIS QUERY FAILS
-		{"top-products", 200 * time.Millisecond, false},
-		{"error-rate", 40 * time.Millisecond, false},
-	}
+func NewQueryRunner(queries []DashboardQuery) *QueryRunner {
+	return &QueryRunner{queries: queries}
+}
 
+func (qr *QueryRunner) RunWithPartialResults() ([]DashboardResult, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	results := make([]DashboardResult, len(queries))
+	results := make([]DashboardResult, len(qr.queries))
 
 	var wg sync.WaitGroup
 	var once sync.Once
 	var firstErr error
 
-	for i, q := range queries {
+	for i, q := range qr.queries {
 		i, q := i, q
 		wg.Add(1)
 		go func() {
@@ -336,8 +386,10 @@ func main() {
 	}
 
 	wg.Wait()
-	elapsed := time.Since(start).Round(time.Millisecond)
+	return results, firstErr
+}
 
+func printPartialResults(results []DashboardResult, total int, elapsed time.Duration) {
 	fmt.Printf("\nQuery results (in %v):\n", elapsed)
 	succeeded := 0
 	for _, r := range results {
@@ -348,9 +400,26 @@ func main() {
 		}
 		fmt.Printf("  [%s] %-15s %s\n", status, r.Name, r.Value)
 	}
-	fmt.Printf("\nSucceeded: %d/%d\n", succeeded, len(queries))
-	if firstErr != nil {
-		fmt.Printf("Error: %v\n", firstErr)
+	fmt.Printf("\nSucceeded: %d/%d\n", succeeded, total)
+}
+
+func main() {
+	runner := NewQueryRunner([]DashboardQuery{
+		{"revenue", 80 * time.Millisecond, false},
+		{"active-users", 50 * time.Millisecond, false},
+		{"conversion", 120 * time.Millisecond, true}, // THIS QUERY FAILS
+		{"top-products", 200 * time.Millisecond, false},
+		{"error-rate", 40 * time.Millisecond, false},
+	})
+
+	fmt.Println("=== Partial Results on Error ===")
+	start := time.Now()
+
+	results, err := runner.RunWithPartialResults()
+
+	printPartialResults(results, len(results), time.Since(start).Round(time.Millisecond))
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
 	}
 }
 ```
@@ -385,68 +454,96 @@ import (
 	"time"
 )
 
-func main() {
-	fmt.Println("=== Map-Based Collection ===")
-	start := time.Now()
+const regionQueryLatency = 80 * time.Millisecond
 
-	type RegionStats struct {
-		Region   string
-		Revenue  float64
-		Orders   int
-		AvgValue float64
+type RegionStats struct {
+	Region   string
+	Revenue  float64
+	Orders   int
+	AvgValue float64
+}
+
+type RegionQueryRunner struct {
+	regionNames []string
+	mu          sync.Mutex
+	results     map[string]RegionStats
+}
+
+func NewRegionQueryRunner(regionNames []string) *RegionQueryRunner {
+	return &RegionQueryRunner{
+		regionNames: regionNames,
+		results:     make(map[string]RegionStats),
 	}
+}
 
-	regions := []string{"us-east", "us-west", "eu-central", "ap-southeast"}
-
-	var mu sync.Mutex
-	regionData := make(map[string]RegionStats)
-
+func (rqr *RegionQueryRunner) QueryAllRegions() map[string]RegionStats {
 	var wg sync.WaitGroup
 
-	for _, region := range regions {
+	for _, region := range rqr.regionNames {
 		region := region
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-
-			// Simulate querying region-specific database shards
-			time.Sleep(80 * time.Millisecond)
-
-			stats := RegionStats{Region: region}
-			switch region {
-			case "us-east":
-				stats.Revenue, stats.Orders = 523_400, 4_200
-			case "us-west":
-				stats.Revenue, stats.Orders = 312_100, 2_800
-			case "eu-central":
-				stats.Revenue, stats.Orders = 445_700, 3_600
-			case "ap-southeast":
-				stats.Revenue, stats.Orders = 198_300, 1_900
-			}
-			if stats.Orders > 0 {
-				stats.AvgValue = stats.Revenue / float64(stats.Orders)
-			}
-
-			mu.Lock()
-			regionData[region] = stats
-			mu.Unlock()
+			rqr.queryRegionShard(region)
 		}()
 	}
 
 	wg.Wait()
-	elapsed := time.Since(start).Round(time.Millisecond)
+	return rqr.results
+}
 
+func (rqr *RegionQueryRunner) queryRegionShard(region string) {
+	time.Sleep(regionQueryLatency)
+
+	stats := rqr.buildRegionStats(region)
+
+	rqr.mu.Lock()
+	rqr.results[region] = stats
+	rqr.mu.Unlock()
+}
+
+func (rqr *RegionQueryRunner) buildRegionStats(region string) RegionStats {
+	stats := RegionStats{Region: region}
+	switch region {
+	case "us-east":
+		stats.Revenue, stats.Orders = 523_400, 4_200
+	case "us-west":
+		stats.Revenue, stats.Orders = 312_100, 2_800
+	case "eu-central":
+		stats.Revenue, stats.Orders = 445_700, 3_600
+	case "ap-southeast":
+		stats.Revenue, stats.Orders = 198_300, 1_900
+	}
+	if stats.Orders > 0 {
+		stats.AvgValue = stats.Revenue / float64(stats.Orders)
+	}
+	return stats
+}
+
+func printRegionalBreakdown(regionNames []string, data map[string]RegionStats, elapsed time.Duration) {
 	fmt.Printf("Regional breakdown (loaded in %v):\n", elapsed)
 	var totalRevenue float64
 	var totalOrders int
-	for _, region := range regions { // iterate in defined order
-		s := regionData[region]
+	for _, region := range regionNames {
+		s := data[region]
 		fmt.Printf("  %-15s  revenue=$%10.2f  orders=%5d  avg=$%.2f\n",
 			s.Region, s.Revenue, s.Orders, s.AvgValue)
 		totalRevenue += s.Revenue
 		totalOrders += s.Orders
 	}
 	fmt.Printf("  %-15s  revenue=$%10.2f  orders=%5d\n", "TOTAL", totalRevenue, totalOrders)
+}
+
+func main() {
+	regionNames := []string{"us-east", "us-west", "eu-central", "ap-southeast"}
+	runner := NewRegionQueryRunner(regionNames)
+
+	fmt.Println("=== Map-Based Collection ===")
+	start := time.Now()
+
+	data := runner.QueryAllRegions()
+
+	printRegionalBreakdown(regionNames, data, time.Since(start).Round(time.Millisecond))
 }
 ```
 

@@ -41,43 +41,66 @@ import (
 	"time"
 )
 
-func main() {
-	counts := []int{1_000, 10_000, 100_000, 500_000, 1_000_000}
+const (
+	minThinkTimeMs = 1
+	maxThinkTimeMs = 10
+	cleanupDelay   = 100 * time.Millisecond
+)
 
+type LaunchBenchmark struct {
+	UserCount   int
+	LaunchTime  time.Duration
+	PerUser     time.Duration
+	UsersPerSec float64
+}
+
+func simulateUser(ready *int64, done <-chan struct{}) {
+	atomic.AddInt64(ready, 1)
+	time.Sleep(time.Duration(rand.Intn(maxThinkTimeMs)+minThinkTimeMs) * time.Millisecond)
+	<-done
+}
+
+func benchmarkLaunch(userCount int) LaunchBenchmark {
+	done := make(chan struct{})
+	var ready int64
+
+	start := time.Now()
+	for i := 0; i < userCount; i++ {
+		go simulateUser(&ready, done)
+	}
+
+	for atomic.LoadInt64(&ready) < int64(userCount) {
+		runtime.Gosched()
+	}
+	launchTime := time.Since(start)
+
+	close(done)
+	time.Sleep(cleanupDelay)
+	runtime.GC()
+
+	return LaunchBenchmark{
+		UserCount:   userCount,
+		LaunchTime:  launchTime,
+		PerUser:     launchTime / time.Duration(userCount),
+		UsersPerSec: float64(userCount) / launchTime.Seconds(),
+	}
+}
+
+func printLaunchTable(counts []int) {
 	fmt.Println("=== Load Test Simulator: Goroutine Launch Benchmark ===")
 	fmt.Printf("%-12s %-15s %-15s %-15s\n", "Users", "Spin-up Time", "Per User", "Users/sec")
 	fmt.Println(strings.Repeat("-", 60))
 
 	for _, count := range counts {
-		done := make(chan struct{})
-		var ready int64
-
-		start := time.Now()
-		for i := 0; i < count; i++ {
-			go func() {
-				atomic.AddInt64(&ready, 1)
-				// Simulated user: random think time + request
-				time.Sleep(time.Duration(rand.Intn(10)+1) * time.Millisecond)
-				<-done
-			}()
-		}
-
-		// Wait for all goroutines to start
-		for atomic.LoadInt64(&ready) < int64(count) {
-			runtime.Gosched()
-		}
-		launchTime := time.Since(start)
-
-		perUser := launchTime / time.Duration(count)
-		perSecond := float64(count) / launchTime.Seconds()
-
+		b := benchmarkLaunch(count)
 		fmt.Printf("%-12d %-15v %-15v %-15.0f\n",
-			count, launchTime.Round(time.Millisecond), perUser, perSecond)
-
-		close(done)
-		time.Sleep(100 * time.Millisecond)
-		runtime.GC()
+			b.UserCount, b.LaunchTime.Round(time.Millisecond), b.PerUser, b.UsersPerSec)
 	}
+}
+
+func main() {
+	counts := []int{1_000, 10_000, 100_000, 500_000, 1_000_000}
+	printLaunchTable(counts)
 }
 ```
 
@@ -119,6 +142,16 @@ import (
 	"time"
 )
 
+const settleDelay = 50 * time.Millisecond
+
+type MemoryMeasurement struct {
+	UserCount int
+	StackDiff uint64
+	HeapDiff  uint64
+	SysDiff   uint64
+	PerUser   uint64
+}
+
 func formatBytes(b uint64) string {
 	switch {
 	case b >= 1024*1024*1024:
@@ -132,65 +165,77 @@ func formatBytes(b uint64) string {
 	}
 }
 
-func main() {
-	counts := []int{1_000, 10_000, 100_000, 500_000}
+func simulateUserWithState(ready *int64, done <-chan struct{}) {
+	userID := rand.Intn(1_000_000)
+	requestPath := fmt.Sprintf("/api/resource/%d", userID)
+	_ = requestPath
+	atomic.AddInt64(ready, 1)
+	<-done
+}
 
+func measureMemoryAtScale(userCount int) MemoryMeasurement {
+	runtime.GC()
+	runtime.GC()
+	var before runtime.MemStats
+	runtime.ReadMemStats(&before)
+
+	done := make(chan struct{})
+	var ready int64
+	for i := 0; i < userCount; i++ {
+		go simulateUserWithState(&ready, done)
+	}
+
+	for atomic.LoadInt64(&ready) < int64(userCount) {
+		runtime.Gosched()
+	}
+	time.Sleep(settleDelay)
+
+	var after runtime.MemStats
+	runtime.ReadMemStats(&after)
+
+	stackDiff := after.StackInuse - before.StackInuse
+	heapDiff := after.HeapInuse - before.HeapInuse
+	total := stackDiff + heapDiff
+
+	close(done)
+	time.Sleep(200 * time.Millisecond)
+	runtime.GC()
+
+	return MemoryMeasurement{
+		UserCount: userCount,
+		StackDiff: stackDiff,
+		HeapDiff:  heapDiff,
+		SysDiff:   after.Sys - before.Sys,
+		PerUser:   total / uint64(userCount),
+	}
+}
+
+func printMemoryTable(counts []int) {
 	fmt.Println("=== Memory per Simulated User ===")
 	fmt.Printf("%-12s %-15s %-15s %-15s %-15s\n",
 		"Users", "StackInUse", "HeapInUse", "Sys (Total)", "Per User")
 	fmt.Println(strings.Repeat("-", 75))
 
 	for _, count := range counts {
-		runtime.GC()
-		runtime.GC()
-		var before runtime.MemStats
-		runtime.ReadMemStats(&before)
-
-		done := make(chan struct{})
-		var counter int64
-		for i := 0; i < count; i++ {
-			go func() {
-				// Each simulated user has some local state
-				userID := rand.Intn(1_000_000)
-				requestPath := fmt.Sprintf("/api/resource/%d", userID)
-				_ = requestPath
-				atomic.AddInt64(&counter, 1)
-				<-done
-			}()
-		}
-
-		// Wait for all users to be active
-		for atomic.LoadInt64(&counter) < int64(count) {
-			runtime.Gosched()
-		}
-		time.Sleep(50 * time.Millisecond)
-
-		var after runtime.MemStats
-		runtime.ReadMemStats(&after)
-
-		stackDiff := after.StackInuse - before.StackInuse
-		heapDiff := after.HeapInuse - before.HeapInuse
-		sysDiff := after.Sys - before.Sys
-		total := stackDiff + heapDiff
-		perUser := total / uint64(count)
-
+		m := measureMemoryAtScale(count)
 		fmt.Printf("%-12d %-15s %-15s %-15s %-15s\n",
-			count,
-			formatBytes(stackDiff),
-			formatBytes(heapDiff),
-			formatBytes(sysDiff),
-			formatBytes(perUser),
+			m.UserCount,
+			formatBytes(m.StackDiff),
+			formatBytes(m.HeapDiff),
+			formatBytes(m.SysDiff),
+			formatBytes(m.PerUser),
 		)
-
-		close(done)
-		time.Sleep(200 * time.Millisecond)
-		runtime.GC()
 	}
 
 	fmt.Println()
 	fmt.Println("At ~8 KB per user, your load test machine's RAM determines the ceiling.")
 	fmt.Println("A 16 GB machine can sustain ~1M simulated users.")
 	fmt.Println("A 4 GB machine caps out at ~250K users.")
+}
+
+func main() {
+	counts := []int{1_000, 10_000, 100_000, 500_000}
+	printMemoryTable(counts)
 }
 ```
 
@@ -228,9 +273,53 @@ import (
 	"time"
 )
 
-func main() {
-	counts := []int{1_000, 10_000, 100_000, 500_000}
+const gcMeasureSettleDelay = 50 * time.Millisecond
 
+type GCMeasurement struct {
+	GoroutineCount int
+	GCPause        time.Duration
+	NumGC          uint32
+	AllocRateMB    float64
+}
+
+func measureGCImpact(goroutineCount int) GCMeasurement {
+	runtime.GC()
+	var before runtime.MemStats
+	runtime.ReadMemStats(&before)
+
+	done := make(chan struct{})
+	var ready int64
+	for i := 0; i < goroutineCount; i++ {
+		go func() {
+			atomic.AddInt64(&ready, 1)
+			<-done
+		}()
+	}
+	for atomic.LoadInt64(&ready) < int64(goroutineCount) {
+		runtime.Gosched()
+	}
+	time.Sleep(gcMeasureSettleDelay)
+
+	gcStart := time.Now()
+	runtime.GC()
+	gcPause := time.Since(gcStart)
+
+	var after runtime.MemStats
+	runtime.ReadMemStats(&after)
+
+	close(done)
+	time.Sleep(200 * time.Millisecond)
+	runtime.GC()
+
+	return GCMeasurement{
+		GoroutineCount: goroutineCount,
+		GCPause:        gcPause,
+		NumGC:          after.NumGC - before.NumGC,
+		AllocRateMB:    float64(after.TotalAlloc-before.TotalAlloc) / (1024 * 1024),
+	}
+}
+
+func printGCImpactTable(counts []int) {
 	fmt.Println("=== GC Impact at Scale ===")
 	fmt.Println("More goroutines = more stacks for GC to scan = longer pauses")
 	fmt.Println()
@@ -239,45 +328,20 @@ func main() {
 	fmt.Println(strings.Repeat("-", 60))
 
 	for _, count := range counts {
-		runtime.GC()
-		var before runtime.MemStats
-		runtime.ReadMemStats(&before)
-
-		done := make(chan struct{})
-		var ready int64
-		for i := 0; i < count; i++ {
-			go func() {
-				atomic.AddInt64(&ready, 1)
-				<-done
-			}()
-		}
-		for atomic.LoadInt64(&ready) < int64(count) {
-			runtime.Gosched()
-		}
-		time.Sleep(50 * time.Millisecond)
-
-		gcStart := time.Now()
-		runtime.GC()
-		gcDuration := time.Since(gcStart)
-
-		var after runtime.MemStats
-		runtime.ReadMemStats(&after)
-
-		numGC := after.NumGC - before.NumGC
-		allocRate := float64(after.TotalAlloc-before.TotalAlloc) / (1024 * 1024)
-
+		m := measureGCImpact(count)
 		fmt.Printf("%-12d %-15v %-15d %-15.2f MB\n",
-			count, gcDuration.Round(time.Microsecond), numGC, allocRate)
-
-		close(done)
-		time.Sleep(200 * time.Millisecond)
-		runtime.GC()
+			m.GoroutineCount, m.GCPause.Round(time.Microsecond), m.NumGC, m.AllocRateMB)
 	}
 
 	fmt.Println()
 	fmt.Println("GC pauses are the hidden cost of massive goroutine counts.")
 	fmt.Println("For latency-sensitive services (p99 < 10ms), keep goroutine")
 	fmt.Println("counts under the threshold where GC pauses start to matter.")
+}
+
+func main() {
+	counts := []int{1_000, 10_000, 100_000, 500_000}
+	printGCImpactTable(counts)
 }
 ```
 
@@ -317,71 +381,82 @@ import (
 	"time"
 )
 
-func main() {
-	// Simulate processing 10M data points from user requests
-	data := make([]float64, 10_000_000)
+const dataPointCount = 10_000_000
+
+type ChunkResult struct {
+	Sum float64
+}
+
+func generateDataPoints(count int) []float64 {
+	data := make([]float64, count)
 	for i := range data {
 		data[i] = float64(i) * 0.001
 	}
+	return data
+}
 
-	processChunk := func(chunk []float64) float64 {
-		var sum float64
-		for _, v := range chunk {
-			sum += math.Sqrt(v) // CPU-intensive transformation
-		}
-		return sum
+func processChunk(chunk []float64) float64 {
+	var sum float64
+	for _, v := range chunk {
+		sum += math.Sqrt(v)
+	}
+	return sum
+}
+
+func processWithGoroutines(data []float64, goroutineCount int) (float64, time.Duration) {
+	chunkSize := len(data) / goroutineCount
+	if chunkSize == 0 {
+		chunkSize = 1
 	}
 
-	goroutineCounts := []int{1, runtime.NumCPU(), 100, 1_000, 10_000}
+	start := time.Now()
+	results := make(chan float64, goroutineCount)
+	launched := 0
 
+	for i := 0; i < len(data); i += chunkSize {
+		end := i + chunkSize
+		if end > len(data) {
+			end = len(data)
+		}
+		launched++
+		go func(chunk []float64) {
+			results <- processChunk(chunk)
+		}(data[i:end])
+	}
+
+	var total float64
+	for i := 0; i < launched; i++ {
+		total += <-results
+	}
+
+	return total, time.Since(start)
+}
+
+func printOverheadTable(data []float64, goroutineCounts []int) {
 	fmt.Printf("Processing %d data points (CPU-bound work):\n\n", len(data))
 	fmt.Printf("%-15s %-15s %-15s\n", "Goroutines", "Wall-Clock", "vs Baseline")
 	fmt.Println(strings.Repeat("-", 48))
 
 	var baselineTime time.Duration
-
 	for _, numG := range goroutineCounts {
-		chunkSize := len(data) / numG
-		if chunkSize == 0 {
-			chunkSize = 1
-		}
-
-		start := time.Now()
-
-		results := make(chan float64, numG)
-		launched := 0
-
-		for i := 0; i < len(data); i += chunkSize {
-			end := i + chunkSize
-			if end > len(data) {
-				end = len(data)
-			}
-			chunk := data[i:end]
-			launched++
-			go func(s []float64) {
-				results <- processChunk(s)
-			}(chunk)
-		}
-
-		var total float64
-		for i := 0; i < launched; i++ {
-			total += <-results
-		}
-
-		elapsed := time.Since(start)
+		_, elapsed := processWithGoroutines(data, numG)
 		if numG == 1 {
 			baselineTime = elapsed
 		}
-
 		overhead := float64(elapsed) / float64(baselineTime)
 		fmt.Printf("%-15d %-15v %-15.2fx\n", numG, elapsed.Round(time.Microsecond), overhead)
-		_ = total
 	}
 
 	fmt.Println()
 	fmt.Printf("Optimal: %d goroutines (= NumCPU)\n", runtime.NumCPU())
 	fmt.Println("More goroutines add scheduling overhead without additional parallelism.")
 	fmt.Println("For CPU-bound request processing, use a fixed worker pool, not goroutine-per-item.")
+}
+
+func main() {
+	data := generateDataPoints(dataPointCount)
+	goroutineCounts := []int{1, runtime.NumCPU(), 100, 1_000, 10_000}
+	printOverheadTable(data, goroutineCounts)
 }
 ```
 
@@ -425,6 +500,16 @@ import (
 	"time"
 )
 
+const profileSettleDelay = 50 * time.Millisecond
+
+type ScalabilityMeasurement struct {
+	Count      int
+	LaunchTime time.Duration
+	StackMem   uint64
+	HeapMem    uint64
+	GCPause    time.Duration
+}
+
 func formatBytes(b uint64) string {
 	switch {
 	case b >= 1024*1024*1024:
@@ -438,62 +523,56 @@ func formatBytes(b uint64) string {
 	}
 }
 
-func main() {
+func profileAtScale(count int) ScalabilityMeasurement {
+	runtime.GC()
+	runtime.GC()
+	var before runtime.MemStats
+	runtime.ReadMemStats(&before)
+
+	done := make(chan struct{})
+	var ready int64
+
+	launchStart := time.Now()
+	for i := 0; i < count; i++ {
+		go func() {
+			atomic.AddInt64(&ready, 1)
+			<-done
+		}()
+	}
+	for atomic.LoadInt64(&ready) < int64(count) {
+		runtime.Gosched()
+	}
+	launchTime := time.Since(launchStart)
+	time.Sleep(profileSettleDelay)
+
+	gcStart := time.Now()
+	runtime.GC()
+	gcPause := time.Since(gcStart)
+
+	var after runtime.MemStats
+	runtime.ReadMemStats(&after)
+
+	close(done)
+	time.Sleep(200 * time.Millisecond)
+
+	return ScalabilityMeasurement{
+		Count:      count,
+		LaunchTime: launchTime,
+		StackMem:   after.StackInuse - before.StackInuse,
+		HeapMem:    after.HeapInuse - before.HeapInuse,
+		GCPause:    gcPause,
+	}
+}
+
+func printScalabilityProfile(counts []int) {
 	fmt.Println("=== Goroutine Scalability Profile ===")
 	fmt.Println("Use this data for capacity planning: load testing, server limits,")
 	fmt.Println("and worker pool sizing.")
 	fmt.Println()
 
-	type measurement struct {
-		count      int
-		launchTime time.Duration
-		stackMem   uint64
-		heapMem    uint64
-		gcPause    time.Duration
-	}
-
-	counts := []int{100, 1_000, 10_000, 100_000}
-	var measurements []measurement
-
+	var measurements []ScalabilityMeasurement
 	for _, count := range counts {
-		runtime.GC()
-		runtime.GC()
-		var before runtime.MemStats
-		runtime.ReadMemStats(&before)
-
-		done := make(chan struct{})
-		var ready int64
-
-		launchStart := time.Now()
-		for i := 0; i < count; i++ {
-			go func() {
-				atomic.AddInt64(&ready, 1)
-				<-done
-			}()
-		}
-		for atomic.LoadInt64(&ready) < int64(count) {
-			runtime.Gosched()
-		}
-		launchTime := time.Since(launchStart)
-		time.Sleep(50 * time.Millisecond)
-
-		gcStart := time.Now()
-		runtime.GC()
-		gcPause := time.Since(gcStart)
-
-		var after runtime.MemStats
-		runtime.ReadMemStats(&after)
-
-		measurements = append(measurements, measurement{
-			count:      count,
-			launchTime: launchTime,
-			stackMem:   after.StackInuse - before.StackInuse,
-			heapMem:    after.HeapInuse - before.HeapInuse,
-			gcPause:    gcPause,
-		})
-
-		close(done)
-		time.Sleep(200 * time.Millisecond)
+		measurements = append(measurements, profileAtScale(count))
 	}
 
 	fmt.Printf("%-10s %-12s %-12s %-12s %-12s %-12s\n",
@@ -501,17 +580,21 @@ func main() {
 	fmt.Println(strings.Repeat("-", 72))
 
 	for _, m := range measurements {
-		perG := float64(m.stackMem+m.heapMem) / float64(m.count) / 1024
+		perG := float64(m.StackMem+m.HeapMem) / float64(m.Count) / 1024
 		fmt.Printf("%-10d %-12v %-12s %-12s %-12v %-12.1f\n",
-			m.count,
-			m.launchTime.Round(time.Millisecond),
-			formatBytes(m.stackMem),
-			formatBytes(m.heapMem),
-			m.gcPause.Round(time.Microsecond),
+			m.Count,
+			m.LaunchTime.Round(time.Millisecond),
+			formatBytes(m.StackMem),
+			formatBytes(m.HeapMem),
+			m.GCPause.Round(time.Microsecond),
 			perG,
 		)
 	}
 
+	printCapacityGuidelines()
+}
+
+func printCapacityGuidelines() {
 	fmt.Println()
 	fmt.Println("--- Capacity Planning Guidelines ---")
 	fmt.Printf("CPU cores:           %d\n", runtime.NumCPU())
@@ -523,6 +606,11 @@ func main() {
 	fmt.Println("Rule of thumb: if goroutine count can grow unbounded in production,")
 	fmt.Println("add a semaphore. Unbounded goroutine creation is the #1 cause of")
 	fmt.Println("Go service OOM kills under load.")
+}
+
+func main() {
+	counts := []int{100, 1_000, 10_000, 100_000}
+	printScalabilityProfile(counts)
 }
 ```
 
@@ -569,10 +657,21 @@ import (
 	"time"
 )
 
-func main() {
-	totalRequests := 1000
-	maxConcurrent := 50 // at most 50 requests in flight
+const (
+	totalBoundedRequests = 1000
+	maxConcurrentSlots   = 50
+	minRequestLatencyMs  = 1
+	maxRequestLatencyMs  = 10
+)
 
+func simulateBoundedRequest(completed *int64, totalExpected int64, done chan struct{}) {
+	time.Sleep(time.Duration(rand.Intn(maxRequestLatencyMs)+minRequestLatencyMs) * time.Millisecond)
+	if atomic.AddInt64(completed, 1) == totalExpected {
+		close(done)
+	}
+}
+
+func processWithSemaphore(totalRequests, maxConcurrent int) time.Duration {
 	sem := make(chan struct{}, maxConcurrent)
 	done := make(chan struct{})
 	var completed int64
@@ -580,23 +679,21 @@ func main() {
 	start := time.Now()
 
 	for i := 0; i < totalRequests; i++ {
-		sem <- struct{}{} // acquire slot (blocks when 50 are running)
-		go func(id int) {
+		sem <- struct{}{} // acquire slot (blocks when at capacity)
+		go func() {
 			defer func() { <-sem }() // release slot when done
-
-			// Simulate request: random latency 1-10ms
-			time.Sleep(time.Duration(rand.Intn(10)+1) * time.Millisecond)
-			atomic.AddInt64(&completed, 1)
-
-			if atomic.LoadInt64(&completed) == int64(totalRequests) {
-				close(done)
-			}
-		}(i)
+			simulateBoundedRequest(&completed, int64(totalRequests), done)
+		}()
 	}
 
 	<-done
-	fmt.Printf("Processed %d requests in %v\n", totalRequests, time.Since(start).Round(time.Millisecond))
-	fmt.Printf("Max concurrent: %d (bounded by semaphore)\n", maxConcurrent)
+	return time.Since(start)
+}
+
+func main() {
+	elapsed := processWithSemaphore(totalBoundedRequests, maxConcurrentSlots)
+	fmt.Printf("Processed %d requests in %v\n", totalBoundedRequests, elapsed.Round(time.Millisecond))
+	fmt.Printf("Max concurrent: %d (bounded by semaphore)\n", maxConcurrentSlots)
 	fmt.Println()
 	fmt.Println("Without the semaphore, all 1000 goroutines would exist simultaneously.")
 	fmt.Println("With it, at most 50 run at once, keeping memory predictable.")
@@ -645,19 +742,34 @@ import (
 	"net"
 )
 
+const maxConcurrentConnections = 10_000
+
+func handleConnection(conn net.Conn) {
+	defer conn.Close()
+	buf := make([]byte, 1024)
+	if _, err := conn.Read(buf); err != nil {
+		return
+	}
+	fmt.Fprintf(conn, "hello\n")
+}
+
 func main() {
-	ln, _ := net.Listen("tcp", ":8080")
-	sem := make(chan struct{}, 10000) // max 10K concurrent connections
+	ln, err := net.Listen("tcp", ":8080")
+	if err != nil {
+		fmt.Printf("listen failed: %v\n", err)
+		return
+	}
+	sem := make(chan struct{}, maxConcurrentConnections)
 
 	for {
-		conn, _ := ln.Accept()
+		conn, err := ln.Accept()
+		if err != nil {
+			continue
+		}
 		sem <- struct{}{} // blocks when at capacity -- applies backpressure
 		go func(c net.Conn) {
 			defer func() { <-sem }()
-			defer c.Close()
-			buf := make([]byte, 1024)
-			c.Read(buf)
-			fmt.Fprintf(c, "hello\n")
+			handleConnection(c)
 		}(conn)
 	}
 }
@@ -679,33 +791,47 @@ import (
 	"sync"
 )
 
-func main() {
-	data := make([]int, 10_000_000)
-	for i := range data {
-		data[i] = i
-	}
+const (
+	datasetSize   = 10_000_000
+	workQueueSize = 1000
+)
 
-	work := make(chan int, 1000)
+func processItem(item int) int {
+	return item * item
+}
+
+func startWorkerPool(workerCount int, work <-chan int) *sync.WaitGroup {
 	var wg sync.WaitGroup
-
-	// Fixed number of workers: bounded memory
-	for i := 0; i < runtime.NumCPU(); i++ {
+	for i := 0; i < workerCount; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for item := range work {
-				_ = item * item // process item
+				_ = processItem(item)
 			}
 		}()
 	}
+	return &wg
+}
+
+func main() {
+	data := make([]int, datasetSize)
+	for i := range data {
+		data[i] = i
+	}
+
+	work := make(chan int, workQueueSize)
+	workerCount := runtime.NumCPU()
+	wg := startWorkerPool(workerCount, work)
 
 	for _, item := range data {
 		work <- item
 	}
 	close(work)
 	wg.Wait()
+
 	fmt.Printf("Processed %d items with %d workers (bounded memory)\n",
-		len(data), runtime.NumCPU())
+		len(data), workerCount)
 }
 ```
 
@@ -728,7 +854,7 @@ Create a comprehensive load testing benchmark that:
 **Warning:** This may consume significant memory. Save your work before running.
 
 ## What's Next
-You have completed the goroutines and scheduling section. Continue to the next section to learn about channels and synchronization.
+Continue to [09-goroutine-lifecycle](../09-goroutine-lifecycle/09-goroutine-lifecycle.md) to learn how to track goroutine states and understand that goroutines must cooperate to terminate.
 
 ## Summary
 - Creating a goroutine takes approximately 500ns-1us (~1M goroutines per second)

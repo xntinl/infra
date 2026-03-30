@@ -38,33 +38,56 @@ import (
 	"sync/atomic"
 )
 
-func main() {
-	var tickets int64 = 100
-	var sold int64
-	var oversold int64
-	var wg sync.WaitGroup
+const (
+	initialTickets = 100
+	buyerCount     = 500
+)
 
-	for i := 0; i < 500; i++ {
-		wg.Add(1)
-		go func(buyerID int) {
-			defer wg.Done()
-			// BUG: check and decrement are separate operations
-			if tickets > 0 {
-				tickets--
-				atomic.AddInt64(&sold, 1)
-			}
-		}(i)
+type UnsafeTicketBooth struct {
+	tickets int64
+	sold    int64
+}
+
+func NewUnsafeTicketBooth(stock int64) *UnsafeTicketBooth {
+	return &UnsafeTicketBooth{tickets: stock}
+}
+
+func (tb *UnsafeTicketBooth) TryBuy() {
+	// BUG: check and decrement are separate operations
+	if tb.tickets > 0 {
+		tb.tickets--
+		atomic.AddInt64(&tb.sold, 1)
 	}
+}
 
-	wg.Wait()
-	if tickets < 0 {
-		oversold = -tickets
+func (tb *UnsafeTicketBooth) Report() {
+	var oversold int64
+	if tb.tickets < 0 {
+		oversold = -tb.tickets
 	}
 	fmt.Println("=== Ticket Sales (BROKEN - no CAS) ===")
-	fmt.Printf("Starting tickets: 100\n")
-	fmt.Printf("Sold:             %d\n", sold)
-	fmt.Printf("Remaining:        %d\n", tickets)
+	fmt.Printf("Starting tickets: %d\n", initialTickets)
+	fmt.Printf("Sold:             %d\n", tb.sold)
+	fmt.Printf("Remaining:        %d\n", tb.tickets)
 	fmt.Printf("Oversold:         %d\n", oversold)
+}
+
+func simulateBuyers(booth *UnsafeTicketBooth) {
+	var wg sync.WaitGroup
+	for i := 0; i < buyerCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			booth.TryBuy()
+		}()
+	}
+	wg.Wait()
+}
+
+func main() {
+	booth := NewUnsafeTicketBooth(initialTickets)
+	simulateBuyers(booth)
+	booth.Report()
 }
 ```
 
@@ -87,44 +110,70 @@ import (
 	"sync/atomic"
 )
 
-func tryReserve(stock *int64, quantity int64) bool {
+const (
+	initialTickets = 100
+	buyerCount     = 500
+)
+
+type TicketBooth struct {
+	stock        int64
+	successCount atomic.Int64
+	failCount    atomic.Int64
+}
+
+func NewTicketBooth(stock int64) *TicketBooth {
+	return &TicketBooth{stock: stock}
+}
+
+func (tb *TicketBooth) TryReserve(quantity int64) bool {
 	for {
-		current := atomic.LoadInt64(stock)
+		current := atomic.LoadInt64(&tb.stock)
 		if current < quantity {
-			return false // not enough stock
+			return false
 		}
-		newStock := current - quantity
-		if atomic.CompareAndSwapInt64(stock, current, newStock) {
-			return true // reserved successfully
+		if atomic.CompareAndSwapInt64(&tb.stock, current, current-quantity) {
+			return true
 		}
 		// CAS failed: another goroutine modified stock. Retry.
 	}
 }
 
-func main() {
-	var tickets int64 = 100
-	var successCount atomic.Int64
-	var failCount atomic.Int64
-	var wg sync.WaitGroup
-
-	for i := 0; i < 500; i++ {
-		wg.Add(1)
-		go func(buyerID int) {
-			defer wg.Done()
-			if tryReserve(&tickets, 1) {
-				successCount.Add(1)
-			} else {
-				failCount.Add(1)
-			}
-		}(i)
+func (tb *TicketBooth) ProcessBuyer() {
+	if tb.TryReserve(1) {
+		tb.successCount.Add(1)
+	} else {
+		tb.failCount.Add(1)
 	}
+}
 
-	wg.Wait()
+func (tb *TicketBooth) RemainingStock() int64 {
+	return atomic.LoadInt64(&tb.stock)
+}
+
+func (tb *TicketBooth) Report() {
 	fmt.Println("=== Ticket Sales (FIXED - CAS) ===")
-	fmt.Printf("Starting tickets:     100\n")
-	fmt.Printf("Successful purchases: %d\n", successCount.Load())
-	fmt.Printf("Rejected (sold out):  %d\n", failCount.Load())
-	fmt.Printf("Remaining stock:      %d\n", atomic.LoadInt64(&tickets))
+	fmt.Printf("Starting tickets:     %d\n", initialTickets)
+	fmt.Printf("Successful purchases: %d\n", tb.successCount.Load())
+	fmt.Printf("Rejected (sold out):  %d\n", tb.failCount.Load())
+	fmt.Printf("Remaining stock:      %d\n", tb.RemainingStock())
+}
+
+func simulateBuyers(booth *TicketBooth) {
+	var wg sync.WaitGroup
+	for i := 0; i < buyerCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			booth.ProcessBuyer()
+		}()
+	}
+	wg.Wait()
+}
+
+func main() {
+	booth := NewTicketBooth(initialTickets)
+	simulateBuyers(booth)
+	booth.Report()
 }
 ```
 
@@ -148,14 +197,19 @@ import (
 	"sync/atomic"
 )
 
+const (
+	buyerCount     = 2000
+	maxSeatsPerBuy = 4
+)
+
 type EventSection struct {
-	Name      string
-	stock     int64
-	reserved  atomic.Int64
-	rejected  atomic.Int64
+	Name     string
+	stock    int64
+	reserved atomic.Int64
+	rejected atomic.Int64
 }
 
-func NewSection(name string, capacity int64) *EventSection {
+func NewEventSection(name string, capacity int64) *EventSection {
 	return &EventSection{Name: name, stock: capacity}
 }
 
@@ -177,53 +231,70 @@ func (s *EventSection) Available() int64 {
 	return atomic.LoadInt64(&s.stock)
 }
 
-func main() {
-	sections := []*EventSection{
-		NewSection("VIP Front Row", 20),
-		NewSection("Orchestra", 200),
-		NewSection("Balcony", 500),
+type ConcertVenue struct {
+	sections      []*EventSection
+	totalReserved atomic.Int64
+	totalRejected atomic.Int64
+}
+
+func NewConcertVenue() *ConcertVenue {
+	return &ConcertVenue{
+		sections: []*EventSection{
+			NewEventSection("VIP Front Row", 20),
+			NewEventSection("Orchestra", 200),
+			NewEventSection("Balcony", 500),
+		},
 	}
+}
 
-	var wg sync.WaitGroup
-	var totalReserved atomic.Int64
-	var totalRejected atomic.Int64
+func (v *ConcertVenue) ProcessBuyer() {
+	section := v.sections[rand.Intn(len(v.sections))]
+	quantity := int64(1 + rand.Intn(maxSeatsPerBuy))
 
-	// 2000 buyers competing for seats
-	for i := 0; i < 2000; i++ {
-		wg.Add(1)
-		go func(buyerID int) {
-			defer wg.Done()
-
-			// Each buyer picks a random section and quantity (1-4 seats)
-			section := sections[rand.Intn(len(sections))]
-			quantity := int64(1 + rand.Intn(4))
-
-			if section.Reserve(quantity) {
-				totalReserved.Add(1)
-			} else {
-				totalRejected.Add(1)
-			}
-		}(i)
+	if section.Reserve(quantity) {
+		v.totalReserved.Add(1)
+	} else {
+		v.totalRejected.Add(1)
 	}
+}
 
-	wg.Wait()
-
+func (v *ConcertVenue) Report() {
 	fmt.Println("=== Concert Seat Reservation Results ===")
 	fmt.Println()
-	for _, s := range sections {
+	for _, s := range v.sections {
 		fmt.Printf("  %-15s  remaining: %3d  reservations: %3d  rejected: %3d\n",
 			s.Name, s.Available(), s.reserved.Load(), s.rejected.Load())
 	}
 	fmt.Println()
-	fmt.Printf("Total reservations: %d\n", totalReserved.Load())
-	fmt.Printf("Total rejections:   %d\n", totalRejected.Load())
+	fmt.Printf("Total reservations: %d\n", v.totalReserved.Load())
+	fmt.Printf("Total rejections:   %d\n", v.totalRejected.Load())
+}
 
-	// Verify no section went negative
-	for _, s := range sections {
+func (v *ConcertVenue) VerifyIntegrity() {
+	for _, s := range v.sections {
 		if s.Available() < 0 {
 			fmt.Printf("BUG: %s has negative stock: %d\n", s.Name, s.Available())
 		}
 	}
+}
+
+func simulateSale(venue *ConcertVenue) {
+	var wg sync.WaitGroup
+	for i := 0; i < buyerCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			venue.ProcessBuyer()
+		}()
+	}
+	wg.Wait()
+}
+
+func main() {
+	venue := NewConcertVenue()
+	simulateSale(venue)
+	venue.Report()
+	venue.VerifyIntegrity()
 }
 ```
 
@@ -247,37 +318,68 @@ import (
 	"time"
 )
 
-// CAS-based (optimistic)
-func reserveCAS(stock *int64, quantity int64) bool {
+const (
+	totalBuyers  = 5000
+	totalTickets = 500
+)
+
+type CASReservationSystem struct {
+	stock   int64
+	success atomic.Int64
+}
+
+func NewCASReservationSystem(stock int64) *CASReservationSystem {
+	return &CASReservationSystem{stock: stock}
+}
+
+func (s *CASReservationSystem) TryReserve(quantity int64) bool {
 	for {
-		current := atomic.LoadInt64(stock)
+		current := atomic.LoadInt64(&s.stock)
 		if current < quantity {
 			return false
 		}
-		if atomic.CompareAndSwapInt64(stock, current, current-quantity) {
+		if atomic.CompareAndSwapInt64(&s.stock, current, current-quantity) {
+			s.success.Add(1)
 			return true
 		}
 	}
 }
 
-// Mutex-based (pessimistic)
-func reserveMutex(mu *sync.Mutex, stock *int64, quantity int64) bool {
-	mu.Lock()
-	defer mu.Unlock()
-	if *stock < quantity {
+func (s *CASReservationSystem) Remaining() int64 { return atomic.LoadInt64(&s.stock) }
+func (s *CASReservationSystem) Sold() int64      { return s.success.Load() }
+
+type MutexReservationSystem struct {
+	mu      sync.Mutex
+	stock   int64
+	success atomic.Int64
+}
+
+func NewMutexReservationSystem(stock int64) *MutexReservationSystem {
+	return &MutexReservationSystem{stock: stock}
+}
+
+func (s *MutexReservationSystem) TryReserve(quantity int64) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.stock < quantity {
 		return false
 	}
-	*stock -= quantity
+	s.stock -= quantity
+	s.success.Add(1)
 	return true
 }
 
-func main() {
-	const buyers = 5000
-	const tickets int64 = 500
+func (s *MutexReservationSystem) Remaining() int64 { return s.stock }
+func (s *MutexReservationSystem) Sold() int64      { return s.success.Load() }
 
-	// Benchmark CAS approach
-	casStock := tickets
-	var casSuccess atomic.Int64
+type ReservationBenchmark struct {
+	Duration time.Duration
+	Sold     int64
+	Remaining int64
+}
+
+func benchmarkCAS(buyers int, tickets int64) ReservationBenchmark {
+	system := NewCASReservationSystem(tickets)
 	var wg sync.WaitGroup
 
 	start := time.Now()
@@ -285,39 +387,50 @@ func main() {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if reserveCAS(&casStock, 1) {
-				casSuccess.Add(1)
-			}
+			system.TryReserve(1)
 		}()
 	}
 	wg.Wait()
-	casTime := time.Since(start)
 
-	// Benchmark Mutex approach
-	mutexStock := tickets
-	var mu sync.Mutex
-	var mutexSuccess atomic.Int64
+	return ReservationBenchmark{
+		Duration:  time.Since(start),
+		Sold:      system.Sold(),
+		Remaining: system.Remaining(),
+	}
+}
 
-	start = time.Now()
+func benchmarkMutex(buyers int, tickets int64) ReservationBenchmark {
+	system := NewMutexReservationSystem(tickets)
+	var wg sync.WaitGroup
+
+	start := time.Now()
 	for i := 0; i < buyers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if reserveMutex(&mu, &mutexStock, 1) {
-				mutexSuccess.Add(1)
-			}
+			system.TryReserve(1)
 		}()
 	}
 	wg.Wait()
-	mutexTime := time.Since(start)
+
+	return ReservationBenchmark{
+		Duration:  time.Since(start),
+		Sold:      system.Sold(),
+		Remaining: system.Remaining(),
+	}
+}
+
+func main() {
+	casResult := benchmarkCAS(totalBuyers, totalTickets)
+	mutexResult := benchmarkMutex(totalBuyers, totalTickets)
 
 	fmt.Println("=== CAS vs Mutex Reservation ===")
 	fmt.Printf("CAS:   sold=%d remaining=%d time=%v\n",
-		casSuccess.Load(), atomic.LoadInt64(&casStock), casTime)
+		casResult.Sold, casResult.Remaining, casResult.Duration)
 	fmt.Printf("Mutex: sold=%d remaining=%d time=%v\n",
-		mutexSuccess.Load(), mutexStock, mutexTime)
+		mutexResult.Sold, mutexResult.Remaining, mutexResult.Duration)
 	fmt.Printf("Ratio (Mutex/CAS): %.2fx\n",
-		float64(mutexTime)/float64(casTime))
+		float64(mutexResult.Duration)/float64(casResult.Duration))
 }
 ```
 
@@ -345,8 +458,11 @@ package main
 
 import "sync/atomic"
 
+// badReserve loads the stock value only once outside the loop.
+// Under contention, every CAS after the first uses a stale value
+// and fails indefinitely.
 func badReserve(stock *int64) bool {
-	current := atomic.LoadInt64(stock) // loaded once
+	current := atomic.LoadInt64(stock) // loaded once -- never refreshed
 	for {
 		if current <= 0 {
 			return false
@@ -355,7 +471,6 @@ func badReserve(stock *int64) bool {
 			return true
 		}
 		// BUG: current is stale. Every subsequent CAS uses the wrong old value.
-		// Under contention, this becomes an infinite loop.
 	}
 }
 

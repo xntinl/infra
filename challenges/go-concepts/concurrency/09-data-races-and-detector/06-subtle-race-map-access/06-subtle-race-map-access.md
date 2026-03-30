@@ -42,41 +42,68 @@ import (
 	"time"
 )
 
+const (
+	writerHandlers      = 10
+	sessionsPerHandler  = 100
+	sessionDuration     = 1 * time.Hour
+)
+
+// Session represents a user authentication session.
 type Session struct {
 	UserID    string
 	Token     string
 	ExpiresAt time.Time
 }
 
-func racySessionStore() {
-	sessions := make(map[string]Session)
+// RacySessionStore demonstrates a session store WITHOUT synchronization.
+// BUG: concurrent map writes cause a fatal crash.
+type RacySessionStore struct {
+	sessions map[string]Session
+}
+
+func NewRacySessionStore() *RacySessionStore {
+	return &RacySessionStore{sessions: make(map[string]Session)}
+}
+
+// Create writes a session to the unprotected map.
+// FATAL: concurrent calls cause "fatal error: concurrent map writes".
+func (s *RacySessionStore) Create(token string, session Session) {
+	s.sessions[token] = session
+}
+
+func (s *RacySessionStore) Count() int {
+	return len(s.sessions)
+}
+
+func simulateConcurrentLogins(store *RacySessionStore) {
 	var wg sync.WaitGroup
 
-	// Simulate handlers creating sessions (writes).
-	for i := 0; i < 10; i++ {
+	for i := 0; i < writerHandlers; i++ {
 		wg.Add(1)
 		go func(handlerID int) {
 			defer wg.Done()
-			for j := 0; j < 100; j++ {
+			for j := 0; j < sessionsPerHandler; j++ {
 				token := fmt.Sprintf("token-%d-%d", handlerID, j)
-				sessions[token] = Session{
+				store.Create(token, Session{
 					UserID:    fmt.Sprintf("user-%d", handlerID),
 					Token:     token,
-					ExpiresAt: time.Now().Add(1 * time.Hour),
-				}
+					ExpiresAt: time.Now().Add(sessionDuration),
+				})
 			}
 		}(i)
 	}
 
 	wg.Wait()
-	fmt.Printf("Sessions stored: %d\n", len(sessions))
+	fmt.Printf("Sessions stored: %d\n", store.Count())
 }
 
 func main() {
 	fmt.Println("=== Concurrent Map Write Crash ===")
 	fmt.Println("This WILL crash with: fatal error: concurrent map writes")
 	fmt.Println()
-	racySessionStore()
+
+	store := NewRacySessionStore()
+	simulateConcurrentLogins(store)
 }
 ```
 
@@ -105,64 +132,96 @@ package main
 import (
 	"fmt"
 	"sync"
-	"time"
 )
 
+const (
+	prePopulatedSessions = 100
+	concurrentWriters    = 5
+	concurrentReaders    = 5
+	operationsPerWorker  = 200
+)
+
+// Session represents a user authentication session.
 type Session struct {
 	UserID    string
 	Token     string
-	ExpiresAt time.Time
 }
 
-func racySessionReadWrite() {
-	sessions := make(map[string]Session)
-	var wg sync.WaitGroup
+// RacySessionStore demonstrates a session store WITHOUT synchronization.
+// BUG: concurrent reads and writes cause a fatal crash.
+type RacySessionStore struct {
+	sessions map[string]Session
+}
 
-	// Pre-populate some sessions.
-	for i := 0; i < 100; i++ {
+func NewRacySessionStore() *RacySessionStore {
+	return &RacySessionStore{sessions: make(map[string]Session)}
+}
+
+func (s *RacySessionStore) Create(token string, session Session) {
+	s.sessions[token] = session // FATAL when called concurrently with Get
+}
+
+func (s *RacySessionStore) Get(token string) Session {
+	return s.sessions[token] // FATAL when called concurrently with Create
+}
+
+func (s *RacySessionStore) Count() int {
+	return len(s.sessions)
+}
+
+func prePopulate(store *RacySessionStore, count int) {
+	for i := 0; i < count; i++ {
 		token := fmt.Sprintf("token-%d", i)
-		sessions[token] = Session{
+		store.Create(token, Session{
 			UserID: fmt.Sprintf("user-%d", i),
 			Token:  token,
-		}
+		})
 	}
+}
 
-	// Writers: creating new sessions.
-	for i := 0; i < 5; i++ {
+func launchWriters(store *RacySessionStore, wg *sync.WaitGroup) {
+	for i := 0; i < concurrentWriters; i++ {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			for j := 0; j < 200; j++ {
+			for j := 0; j < operationsPerWorker; j++ {
 				token := fmt.Sprintf("new-token-%d-%d", id, j)
-				sessions[token] = Session{
+				store.Create(token, Session{
 					UserID: fmt.Sprintf("user-%d", id),
 					Token:  token,
-				}
+				})
 			}
 		}(i)
 	}
+}
 
-	// Readers: checking if sessions exist (authentication middleware).
-	for i := 0; i < 5; i++ {
+func launchReaders(store *RacySessionStore, wg *sync.WaitGroup) {
+	for i := 0; i < concurrentReaders; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for j := 0; j < 200; j++ {
-				token := fmt.Sprintf("token-%d", j%100)
-				_ = sessions[token] // FATAL: concurrent read + write
+			for j := 0; j < operationsPerWorker; j++ {
+				token := fmt.Sprintf("token-%d", j%prePopulatedSessions)
+				_ = store.Get(token) // FATAL: concurrent read + write
 			}
 		}()
 	}
-
-	wg.Wait()
-	fmt.Printf("Sessions: %d\n", len(sessions))
 }
 
 func main() {
 	fmt.Println("=== Concurrent Map Read + Write Crash ===")
 	fmt.Println("This WILL crash with: fatal error: concurrent map read and map write")
 	fmt.Println()
-	racySessionReadWrite()
+
+	store := NewRacySessionStore()
+	prePopulate(store, prePopulatedSessions)
+
+	var wg sync.WaitGroup
+	launchWriters(store, &wg)
+	launchReaders(store, &wg)
+	wg.Wait()
+
+	fmt.Printf("Sessions: %d\n", store.Count())
 }
 ```
 
@@ -321,13 +380,35 @@ import (
 	"time"
 )
 
-func benchReadHeavyMutex(readers, writers int) time.Duration {
-	var mu sync.Mutex
-	m := make(map[int]int)
-	for i := 0; i < 1000; i++ {
+const (
+	preloadEntries    = 1000
+	writesPerWriter   = 100
+	readsPerReader    = 1000
+	benchReaders      = 50
+	benchWriters      = 2
+)
+
+// LockBenchResult holds the timing outcome of a lock strategy benchmark.
+type LockBenchResult struct {
+	Label   string
+	Elapsed time.Duration
+}
+
+// MutexMapBench benchmarks sync.Mutex on a read-heavy map workload.
+type MutexMapBench struct {
+	mu sync.Mutex
+	m  map[int]int
+}
+
+func NewMutexMapBench() *MutexMapBench {
+	m := make(map[int]int, preloadEntries)
+	for i := 0; i < preloadEntries; i++ {
 		m[i] = i
 	}
+	return &MutexMapBench{m: m}
+}
 
+func (b *MutexMapBench) Run(readers, writers int) LockBenchResult {
 	var wg sync.WaitGroup
 	start := time.Now()
 
@@ -335,10 +416,10 @@ func benchReadHeavyMutex(readers, writers int) time.Duration {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			for j := 0; j < 100; j++ {
-				mu.Lock()
-				m[1000+id*100+j] = j
-				mu.Unlock()
+			for j := 0; j < writesPerWriter; j++ {
+				b.mu.Lock()
+				b.m[preloadEntries+id*writesPerWriter+j] = j
+				b.mu.Unlock()
 			}
 		}(w)
 	}
@@ -347,25 +428,33 @@ func benchReadHeavyMutex(readers, writers int) time.Duration {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for j := 0; j < 1000; j++ {
-				mu.Lock()
-				_ = m[j%1000]
-				mu.Unlock()
+			for j := 0; j < readsPerReader; j++ {
+				b.mu.Lock()
+				_ = b.m[j%preloadEntries]
+				b.mu.Unlock()
 			}
 		}()
 	}
 
 	wg.Wait()
-	return time.Since(start)
+	return LockBenchResult{"Mutex", time.Since(start)}
 }
 
-func benchReadHeavyRWMutex(readers, writers int) time.Duration {
-	var mu sync.RWMutex
-	m := make(map[int]int)
-	for i := 0; i < 1000; i++ {
+// RWMutexMapBench benchmarks sync.RWMutex on a read-heavy map workload.
+type RWMutexMapBench struct {
+	mu sync.RWMutex
+	m  map[int]int
+}
+
+func NewRWMutexMapBench() *RWMutexMapBench {
+	m := make(map[int]int, preloadEntries)
+	for i := 0; i < preloadEntries; i++ {
 		m[i] = i
 	}
+	return &RWMutexMapBench{m: m}
+}
 
+func (b *RWMutexMapBench) Run(readers, writers int) LockBenchResult {
 	var wg sync.WaitGroup
 	start := time.Now()
 
@@ -373,10 +462,10 @@ func benchReadHeavyRWMutex(readers, writers int) time.Duration {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			for j := 0; j < 100; j++ {
-				mu.Lock()
-				m[1000+id*100+j] = j
-				mu.Unlock()
+			for j := 0; j < writesPerWriter; j++ {
+				b.mu.Lock()
+				b.m[preloadEntries+id*writesPerWriter+j] = j
+				b.mu.Unlock()
 			}
 		}(w)
 	}
@@ -385,31 +474,37 @@ func benchReadHeavyRWMutex(readers, writers int) time.Duration {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for j := 0; j < 1000; j++ {
-				mu.RLock()
-				_ = m[j%1000]
-				mu.RUnlock()
+			for j := 0; j < readsPerReader; j++ {
+				b.mu.RLock()
+				_ = b.m[j%preloadEntries]
+				b.mu.RUnlock()
 			}
 		}()
 	}
 
 	wg.Wait()
-	return time.Since(start)
+	return LockBenchResult{"RWMutex", time.Since(start)}
 }
 
-func main() {
-	readers, writers := 50, 2
-
-	fmt.Printf("=== Read-Heavy Workload: %d readers, %d writers ===\n\n", readers, writers)
-
-	mutexTime := benchReadHeavyMutex(readers, writers)
-	rwTime := benchReadHeavyRWMutex(readers, writers)
-
-	fmt.Printf("  Mutex:   %v\n", mutexTime)
-	fmt.Printf("  RWMutex: %v\n", rwTime)
+func printBenchComparison(mutex, rwMutex LockBenchResult) {
+	fmt.Printf("  %-10s %v\n", mutex.Label+":", mutex.Elapsed)
+	fmt.Printf("  %-10s %v\n", rwMutex.Label+":", rwMutex.Elapsed)
 	fmt.Println()
 	fmt.Println("RWMutex wins because 50 readers proceed in parallel,")
 	fmt.Println("while Mutex forces all 50 to take turns.")
+}
+
+func main() {
+	fmt.Printf("=== Read-Heavy Workload: %d readers, %d writers ===\n\n",
+		benchReaders, benchWriters)
+
+	mutexBench := NewMutexMapBench()
+	mutexResult := mutexBench.Run(benchReaders, benchWriters)
+
+	rwBench := NewRWMutexMapBench()
+	rwResult := rwBench.Run(benchReaders, benchWriters)
+
+	printBenchComparison(mutexResult, rwResult)
 }
 ```
 

@@ -32,34 +32,45 @@ package main
 
 import "fmt"
 
+// produceLogLines sends each line into the channel and closes it when done.
+// Closing signals "end of file" -- no more lines will be sent.
+func produceLogLines(lines []string) <-chan string {
+	ch := make(chan string)
+	go func() {
+		for _, line := range lines {
+			ch <- line
+		}
+		close(ch)
+	}()
+	return ch
+}
+
+// countAndPrintLines ranges over the channel, printing each line
+// and returning the total count when the producer closes the channel.
+func countAndPrintLines(lines <-chan string) int {
+	count := 0
+	for line := range lines {
+		fmt.Println(" ", line)
+		count++
+	}
+	return count
+}
+
 func main() {
-    logLines := make(chan string)
+	lines := []string{
+		"[ERROR] database connection timeout",
+		"[INFO] request processed in 45ms",
+		"[WARN] memory usage at 85%",
+		"[ERROR] failed to write to disk",
+		"[INFO] health check passed",
+		"[INFO] cache hit ratio: 94%",
+		"[ERROR] authentication failed for user admin",
+		"[WARN] slow query detected: 2.3s",
+	}
 
-    go func() {
-        lines := []string{
-            "[ERROR] database connection timeout",
-            "[INFO] request processed in 45ms",
-            "[WARN] memory usage at 85%",
-            "[ERROR] failed to write to disk",
-            "[INFO] health check passed",
-            "[INFO] cache hit ratio: 94%",
-            "[ERROR] authentication failed for user admin",
-            "[WARN] slow query detected: 2.3s",
-        }
-        for _, line := range lines {
-            logLines <- line
-        }
-        close(logLines) // signals "end of file" -- no more lines
-    }()
-
-    // for line := range logLines receives values until the channel
-    // is closed AND all buffered values are consumed. Then it exits.
-    lineCount := 0
-    for line := range logLines {
-        fmt.Println(" ", line)
-        lineCount++
-    }
-    fmt.Printf("Scan complete: %d lines processed\n", lineCount)
+	logStream := produceLogLines(lines)
+	lineCount := countAndPrintLines(logStream)
+	fmt.Printf("Scan complete: %d lines processed\n", lineCount)
 }
 ```
 
@@ -80,21 +91,23 @@ package main
 
 import "fmt"
 
+// produceWithoutClose sends lines but forgets to close the channel.
+func produceWithoutClose(ch chan<- string) {
+	ch <- "[ERROR] disk full"
+	ch <- "[WARN] failover activated"
+	ch <- "[INFO] service recovered"
+	// Forgot to close! The range loop will wait forever.
+}
+
 func main() {
-    logLines := make(chan string)
+	logLines := make(chan string)
+	go produceWithoutClose(logLines)
 
-    go func() {
-        logLines <- "[ERROR] disk full"
-        logLines <- "[WARN] failover activated"
-        logLines <- "[INFO] service recovered"
-        // Forgot to close! The range loop will wait forever.
-    }()
-
-    for line := range logLines {
-        fmt.Println(line)
-    }
-    // This line is never reached.
-    fmt.Println("done")
+	for line := range logLines {
+		fmt.Println(line)
+	}
+	// This line is never reached.
+	fmt.Println("done")
 }
 ```
 
@@ -118,50 +131,66 @@ Build a log scanner that categorizes and counts error types. The producer sends 
 package main
 
 import (
-    "fmt"
-    "strings"
+	"fmt"
+	"strings"
 )
 
+const errorPrefix = "[ERROR] "
+
+// scanLogFile streams log lines through a channel, closing it when done.
 func scanLogFile(lines []string) <-chan string {
-    ch := make(chan string)
-    go func() {
-        for _, line := range lines {
-            ch <- line
-        }
-        close(ch)
-    }()
-    return ch
+	ch := make(chan string)
+	go func() {
+		for _, line := range lines {
+			ch <- line
+		}
+		close(ch)
+	}()
+	return ch
+}
+
+// ErrorReport holds the results of scanning a log stream for errors.
+type ErrorReport struct {
+	TotalLines  int
+	ErrorCounts map[string]int
+}
+
+// analyzeErrors ranges over a log stream, counting occurrences of each
+// unique error message. It returns a complete report.
+func analyzeErrors(lines <-chan string) ErrorReport {
+	report := ErrorReport{ErrorCounts: make(map[string]int)}
+
+	for line := range lines {
+		report.TotalLines++
+		if strings.HasPrefix(line, errorPrefix) {
+			errorMsg := strings.TrimPrefix(line, errorPrefix)
+			report.ErrorCounts[errorMsg]++
+		}
+	}
+	return report
 }
 
 func main() {
-    logData := []string{
-        "[ERROR] connection refused: postgres:5432",
-        "[ERROR] connection refused: redis:6379",
-        "[WARN] high memory: 92%",
-        "[ERROR] timeout: api.external.com",
-        "[INFO] health check OK",
-        "[ERROR] connection refused: postgres:5432",
-        "[WARN] disk space low: /var/log 89%",
-        "[ERROR] timeout: api.external.com",
-        "[INFO] cache warmed: 1200 entries",
-        "[ERROR] timeout: api.external.com",
-    }
+	logData := []string{
+		"[ERROR] connection refused: postgres:5432",
+		"[ERROR] connection refused: redis:6379",
+		"[WARN] high memory: 92%",
+		"[ERROR] timeout: api.external.com",
+		"[INFO] health check OK",
+		"[ERROR] connection refused: postgres:5432",
+		"[WARN] disk space low: /var/log 89%",
+		"[ERROR] timeout: api.external.com",
+		"[INFO] cache warmed: 1200 entries",
+		"[ERROR] timeout: api.external.com",
+	}
 
-    errorCounts := make(map[string]int)
-    totalLines := 0
+	report := analyzeErrors(scanLogFile(logData))
 
-    for line := range scanLogFile(logData) {
-        totalLines++
-        if strings.HasPrefix(line, "[ERROR]") {
-            errorMsg := strings.TrimPrefix(line, "[ERROR] ")
-            errorCounts[errorMsg]++
-        }
-    }
-
-    fmt.Printf("Scanned %d lines, found %d error types:\n", totalLines, len(errorCounts))
-    for msg, count := range errorCounts {
-        fmt.Printf("  %dx  %s\n", count, msg)
-    }
+	fmt.Printf("Scanned %d lines, found %d error types:\n",
+		report.TotalLines, len(report.ErrorCounts))
+	for msg, count := range report.ErrorCounts {
+		fmt.Printf("  %dx  %s\n", count, msg)
+	}
 }
 ```
 
@@ -184,24 +213,41 @@ package main
 
 import "fmt"
 
+const batchBufferSize = 5
+
+// loadBatch fills a buffered channel with pre-loaded entries and closes it.
+func loadBatch(entries []string) <-chan string {
+	ch := make(chan string, len(entries))
+	for _, entry := range entries {
+		ch <- entry
+	}
+	close(ch) // close with values still in buffer
+	return ch
+}
+
+// drainAndCount ranges over a closed buffered channel, printing each
+// entry with its sequence number. Returns the total count.
+func drainAndCount(batch <-chan string) int {
+	count := 0
+	for entry := range batch {
+		count++
+		fmt.Printf("  %d. %s\n", count, entry)
+	}
+	return count
+}
+
 func main() {
-    // Simulate a log batch that was pre-loaded into a buffer.
-    logBatch := make(chan string, 5)
+	entries := []string{
+		"[ERROR] 2024-01-15 09:00:01 auth failure",
+		"[ERROR] 2024-01-15 09:00:02 auth failure",
+		"[ERROR] 2024-01-15 09:00:03 auth failure",
+		"[WARN] 2024-01-15 09:00:04 rate limit approaching",
+		"[INFO] 2024-01-15 09:00:05 rate limiter activated",
+	}
 
-    logBatch <- "[ERROR] 2024-01-15 09:00:01 auth failure"
-    logBatch <- "[ERROR] 2024-01-15 09:00:02 auth failure"
-    logBatch <- "[ERROR] 2024-01-15 09:00:03 auth failure"
-    logBatch <- "[WARN] 2024-01-15 09:00:04 rate limit approaching"
-    logBatch <- "[INFO] 2024-01-15 09:00:05 rate limiter activated"
-    close(logBatch) // close with values still in buffer
-
-    // range consumes all five buffered values, then exits.
-    count := 0
-    for entry := range logBatch {
-        count++
-        fmt.Printf("  %d. %s\n", count, entry)
-    }
-    fmt.Printf("Batch drained: %d entries (channel now closed and empty)\n", count)
+	logBatch := loadBatch(entries)
+	count := drainAndCount(logBatch)
+	fmt.Printf("Batch drained: %d entries (channel now closed and empty)\n", count)
 }
 ```
 
@@ -219,76 +265,98 @@ Chain range-based stages into a log analysis pipeline. Each stage reads until it
 package main
 
 import (
-    "fmt"
-    "strings"
+	"fmt"
+	"strings"
 )
 
+// LogEntry is a parsed log line with level and message separated.
 type LogEntry struct {
-    Level   string
-    Message string
+	Level   string
+	Message string
 }
 
+// scanLines streams raw log lines through a channel.
 func scanLines(lines []string) <-chan string {
-    ch := make(chan string)
-    go func() {
-        for _, line := range lines {
-            ch <- line
-        }
-        close(ch)
-    }()
-    return ch
+	ch := make(chan string)
+	go func() {
+		for _, line := range lines {
+			ch <- line
+		}
+		close(ch)
+	}()
+	return ch
 }
 
+// parseBracketedLine extracts the level from "[LEVEL] message" format.
+// Returns the entry and true on success, or zero value and false otherwise.
+func parseBracketedLine(line string) (LogEntry, bool) {
+	idx := strings.Index(line, "]")
+	if idx <= 0 {
+		return LogEntry{}, false
+	}
+	level := line[1:idx]
+	message := strings.TrimSpace(line[idx+1:])
+	return LogEntry{Level: level, Message: message}, true
+}
+
+// parseEntries converts raw lines into structured LogEntry values,
+// skipping any lines that do not match the expected format.
 func parseEntries(lines <-chan string) <-chan LogEntry {
-    ch := make(chan LogEntry)
-    go func() {
-        for line := range lines {
-            // Extract level from bracket prefix.
-            if idx := strings.Index(line, "]"); idx > 0 {
-                level := line[1:idx]
-                message := strings.TrimSpace(line[idx+1:])
-                ch <- LogEntry{Level: level, Message: message}
-            }
-        }
-        close(ch)
-    }()
-    return ch
+	ch := make(chan LogEntry)
+	go func() {
+		for line := range lines {
+			if entry, ok := parseBracketedLine(line); ok {
+				ch <- entry
+			}
+		}
+		close(ch)
+	}()
+	return ch
 }
 
-func filterErrors(entries <-chan LogEntry) <-chan LogEntry {
-    ch := make(chan LogEntry)
-    go func() {
-        for entry := range entries {
-            if entry.Level == "ERROR" || entry.Level == "WARN" {
-                ch <- entry
-            }
-        }
-        close(ch)
-    }()
-    return ch
+// filterByLevels passes through only entries whose level matches
+// one of the target levels.
+func filterByLevels(entries <-chan LogEntry, targetLevels map[string]bool) <-chan LogEntry {
+	ch := make(chan LogEntry)
+	go func() {
+		for entry := range entries {
+			if targetLevels[entry.Level] {
+				ch <- entry
+			}
+		}
+		close(ch)
+	}()
+	return ch
+}
+
+// printReport drains the problems channel and prints each entry.
+func printReport(problems <-chan LogEntry) {
+	fmt.Println("=== Problems Detected ===")
+	for entry := range problems {
+		fmt.Printf("  [%s] %s\n", entry.Level, entry.Message)
+	}
+	fmt.Println("=== End of Report ===")
 }
 
 func main() {
-    logData := []string{
-        "[ERROR] connection refused: postgres:5432",
-        "[INFO] request handled in 12ms",
-        "[WARN] memory usage at 91%",
-        "[ERROR] timeout waiting for response",
-        "[INFO] cache hit",
-        "[WARN] disk I/O latency spike",
-        "[INFO] health check passed",
-    }
+	logData := []string{
+		"[ERROR] connection refused: postgres:5432",
+		"[INFO] request handled in 12ms",
+		"[WARN] memory usage at 91%",
+		"[ERROR] timeout waiting for response",
+		"[INFO] cache hit",
+		"[WARN] disk I/O latency spike",
+		"[INFO] health check passed",
+	}
 
-    // Pipeline: scan -> parse -> filter errors/warnings -> output
-    lines := scanLines(logData)
-    entries := parseEntries(lines)
-    problems := filterErrors(entries)
+	problemLevels := map[string]bool{"ERROR": true, "WARN": true}
 
-    fmt.Println("=== Problems Detected ===")
-    for entry := range problems {
-        fmt.Printf("  [%s] %s\n", entry.Level, entry.Message)
-    }
-    fmt.Println("=== End of Report ===")
+	// Pipeline: scan -> parse -> filter errors/warnings -> output
+	lines := scanLines(logData)
+	entries := parseEntries(lines)
+	problems := filterByLevels(entries, problemLevels)
+
+	printReport(problems)
 }
 ```
 

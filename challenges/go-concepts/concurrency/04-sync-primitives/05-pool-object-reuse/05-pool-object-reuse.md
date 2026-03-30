@@ -43,30 +43,45 @@ import (
 	"sync"
 )
 
-func main() {
-	bufferPool := &sync.Pool{
+func newTrackedBufferPool() *sync.Pool {
+	return &sync.Pool{
 		New: func() any {
 			fmt.Println("[pool] Allocating new bytes.Buffer")
 			return new(bytes.Buffer)
 		},
 	}
+}
+
+func getBuffer(pool *sync.Pool) *bytes.Buffer {
+	return pool.Get().(*bytes.Buffer)
+}
+
+func returnBuffer(pool *sync.Pool, buf *bytes.Buffer) {
+	buf.Reset()
+	pool.Put(buf)
+}
+
+func demonstrateBufferPoolLifecycle() {
+	pool := newTrackedBufferPool()
 
 	// First Get: pool empty, calls New
-	buf := bufferPool.Get().(*bytes.Buffer)
+	buf := getBuffer(pool)
 	fmt.Printf("Got buffer: len=%d\n", buf.Len())
 
 	// Simulate building an HTTP response
 	buf.WriteString(`{"status":"ok","data":[1,2,3]}`)
 	fmt.Printf("After write: len=%d\n", buf.Len())
 
-	// Reset and return to pool
-	buf.Reset()
-	bufferPool.Put(buf)
+	returnBuffer(pool, buf)
 
 	// Second Get: reuses the pooled buffer (no allocation)
-	buf2 := bufferPool.Get().(*bytes.Buffer)
-	fmt.Printf("Recycled buffer: len=%d (reset worked)\n", buf2.Len())
-	bufferPool.Put(buf2)
+	recycled := getBuffer(pool)
+	fmt.Printf("Recycled buffer: len=%d (reset worked)\n", recycled.Len())
+	returnBuffer(pool, recycled)
+}
+
+func main() {
+	demonstrateBufferPoolLifecycle()
 }
 ```
 
@@ -98,45 +113,74 @@ import (
 	"sync/atomic"
 )
 
-func main() {
-	var allocCount atomic.Int64
+const (
+	totalRequests      = 100
+	requestsPerHandler = 5
+)
 
-	bufferPool := &sync.Pool{
-		New: func() any {
-			allocCount.Add(1)
-			return new(bytes.Buffer)
-		},
+type BufferPool struct {
+	pool       sync.Pool
+	allocCount atomic.Int64
+}
+
+func NewBufferPool() *BufferPool {
+	bp := &BufferPool{}
+	bp.pool.New = func() any {
+		bp.allocCount.Add(1)
+		return new(bytes.Buffer)
 	}
+	return bp
+}
 
+func (bp *BufferPool) Get() *bytes.Buffer {
+	buf := bp.pool.Get().(*bytes.Buffer)
+	buf.Reset()
+	return buf
+}
+
+func (bp *BufferPool) Put(buf *bytes.Buffer) {
+	buf.Reset()
+	bp.pool.Put(buf)
+}
+
+func (bp *BufferPool) Allocations() int64 {
+	return bp.allocCount.Load()
+}
+
+func simulateHTTPHandler(bp *BufferPool, requestID int) {
+	for iteration := 0; iteration < requestsPerHandler; iteration++ {
+		buf := bp.Get()
+		fmt.Fprintf(buf, `{"request":%d,"iteration":%d,"status":"ok"}`, requestID, iteration)
+		_ = buf.Bytes() // in real code: write to http.ResponseWriter
+		bp.Put(buf)
+	}
+}
+
+func runConcurrentRequests(bp *BufferPool) {
 	var wg sync.WaitGroup
-	const totalRequests = 100
-	const requestsPerHandler = 5
 
 	for i := 0; i < totalRequests; i++ {
 		wg.Add(1)
 		go func(requestID int) {
 			defer wg.Done()
-			for j := 0; j < requestsPerHandler; j++ {
-				buf := bufferPool.Get().(*bytes.Buffer)
-				buf.Reset() // always reset before use
-
-				// Build response
-				fmt.Fprintf(buf, `{"request":%d,"iteration":%d,"status":"ok"}`, requestID, j)
-
-				// In real code: write buf.Bytes() to http.ResponseWriter
-				_ = buf.Bytes()
-
-				buf.Reset()
-				bufferPool.Put(buf)
-			}
+			simulateHTTPHandler(bp, requestID)
 		}(i)
 	}
 
 	wg.Wait()
-	totalGetCalls := totalRequests * requestsPerHandler
+}
+
+func printPoolStats(totalGetCalls int, allocations int64) {
+	reuseRate := float64(totalGetCalls-int(allocations)) / float64(totalGetCalls) * 100
 	fmt.Printf("Total Get() calls: %d\n", totalGetCalls)
-	fmt.Printf("Actual allocations: %d\n", allocCount.Load())
-	fmt.Printf("Reuse rate: %.1f%%\n", float64(totalGetCalls-int(allocCount.Load()))/float64(totalGetCalls)*100)
+	fmt.Printf("Actual allocations: %d\n", allocations)
+	fmt.Printf("Reuse rate: %.1f%%\n", reuseRate)
+}
+
+func main() {
+	bp := NewBufferPool()
+	runConcurrentRequests(bp)
+	printPoolStats(totalRequests*requestsPerHandler, bp.Allocations())
 }
 ```
 
@@ -166,17 +210,25 @@ import (
 	"sync"
 )
 
-var responsePool = &sync.Pool{
-	New: func() any {
-		return new(bytes.Buffer)
-	},
+type User struct {
+	ID   int
+	Name string
 }
 
-func buildJSONResponse(userID int, name string) []byte {
-	buf := responsePool.Get().(*bytes.Buffer)
+type ResponseBuilder struct {
+	pool sync.Pool
+}
+
+func NewResponseBuilder() *ResponseBuilder {
+	rb := &ResponseBuilder{}
+	rb.pool.New = func() any { return new(bytes.Buffer) }
+	return rb
+}
+
+func (rb *ResponseBuilder) BuildJSON(userID int, name string) []byte {
+	buf := rb.pool.Get().(*bytes.Buffer)
 	buf.Reset()
 
-	// Build the JSON response in the pooled buffer
 	buf.WriteString(`{"user_id":`)
 	fmt.Fprintf(buf, "%d", userID)
 	buf.WriteString(`,"name":"`)
@@ -189,35 +241,41 @@ func buildJSONResponse(userID int, name string) []byte {
 	copy(result, buf.Bytes())
 
 	buf.Reset()
-	responsePool.Put(buf)
+	rb.pool.Put(buf)
 	return result
 }
 
-func main() {
-	users := []struct {
-		ID   int
-		Name string
-	}{
-		{1, "Alice"}, {2, "Bob"}, {3, "Carol"}, {4, "Dave"}, {5, "Eve"},
-	}
-
+func buildAllResponses(builder *ResponseBuilder, users []User) [][]byte {
 	var wg sync.WaitGroup
 	responses := make([][]byte, len(users))
 
-	for i, u := range users {
+	for i, user := range users {
 		wg.Add(1)
-		go func(idx int, id int, name string) {
+		go func(idx int, u User) {
 			defer wg.Done()
-			responses[idx] = buildJSONResponse(id, name)
-		}(i, u.ID, u.Name)
+			responses[idx] = builder.BuildJSON(u.ID, u.Name)
+		}(i, user)
 	}
 
 	wg.Wait()
+	return responses
+}
 
+func printResponses(responses [][]byte) {
 	fmt.Println("=== HTTP Responses ===")
 	for _, resp := range responses {
 		fmt.Printf("  %s\n", resp)
 	}
+}
+
+func main() {
+	users := []User{
+		{1, "Alice"}, {2, "Bob"}, {3, "Carol"}, {4, "Dave"}, {5, "Eve"},
+	}
+
+	builder := NewResponseBuilder()
+	responses := buildAllResponses(builder, users)
+	printResponses(responses)
 }
 ```
 
@@ -252,31 +310,45 @@ import (
 	"time"
 )
 
-func benchWithoutPool(iterations int) (time.Duration, uint64) {
+const benchmarkIterations = 10000
+
+type BenchResult struct {
+	Elapsed    time.Duration
+	AllocBytes uint64
+}
+
+func measureMemory(fn func()) (time.Duration, uint64) {
 	var memBefore runtime.MemStats
 	runtime.GC()
 	runtime.ReadMemStats(&memBefore)
 
 	start := time.Now()
-	var wg sync.WaitGroup
-
-	for i := 0; i < iterations; i++ {
-		wg.Add(1)
-		go func(id int) {
-			defer wg.Done()
-			buf := new(bytes.Buffer) // fresh allocation every time
-			fmt.Fprintf(buf, `{"request":%d,"data":"some payload here for request %d"}`, id, id)
-			_ = buf.Bytes()
-			// buf becomes garbage -- GC must reclaim it
-		}(i)
-	}
-
-	wg.Wait()
+	fn()
 	elapsed := time.Since(start)
 
 	var memAfter runtime.MemStats
 	runtime.ReadMemStats(&memAfter)
 	return elapsed, memAfter.TotalAlloc - memBefore.TotalAlloc
+}
+
+func buildPayload(buf *bytes.Buffer, requestID int) {
+	fmt.Fprintf(buf, `{"request":%d,"data":"some payload here for request %d"}`, requestID, requestID)
+}
+
+func benchWithoutPool(iterations int) (time.Duration, uint64) {
+	return measureMemory(func() {
+		var wg sync.WaitGroup
+		for i := 0; i < iterations; i++ {
+			wg.Add(1)
+			go func(id int) {
+				defer wg.Done()
+				buf := new(bytes.Buffer) // fresh allocation every time
+				buildPayload(buf, id)
+				_ = buf.Bytes()
+			}(i)
+		}
+		wg.Wait()
+	})
 }
 
 func benchWithPool(iterations int) (time.Duration, uint64) {
@@ -284,48 +356,41 @@ func benchWithPool(iterations int) (time.Duration, uint64) {
 		New: func() any { return new(bytes.Buffer) },
 	}
 
-	var memBefore runtime.MemStats
-	runtime.GC()
-	runtime.ReadMemStats(&memBefore)
+	return measureMemory(func() {
+		var wg sync.WaitGroup
+		for i := 0; i < iterations; i++ {
+			wg.Add(1)
+			go func(id int) {
+				defer wg.Done()
+				buf := pool.Get().(*bytes.Buffer)
+				buf.Reset()
+				buildPayload(buf, id)
+				_ = buf.Bytes()
+				buf.Reset()
+				pool.Put(buf)
+			}(i)
+		}
+		wg.Wait()
+	})
+}
 
-	start := time.Now()
-	var wg sync.WaitGroup
+func printBenchComparison(withoutTime time.Duration, withoutAlloc uint64, withTime time.Duration, withAlloc uint64) {
+	fmt.Printf("Without pool: %v, ~%d KB allocated\n", withoutTime.Round(time.Millisecond), withoutAlloc/1024)
+	fmt.Printf("With pool:    %v, ~%d KB allocated\n", withTime.Round(time.Millisecond), withAlloc/1024)
 
-	for i := 0; i < iterations; i++ {
-		wg.Add(1)
-		go func(id int) {
-			defer wg.Done()
-			buf := pool.Get().(*bytes.Buffer)
-			buf.Reset()
-			fmt.Fprintf(buf, `{"request":%d,"data":"some payload here for request %d"}`, id, id)
-			_ = buf.Bytes()
-			buf.Reset()
-			pool.Put(buf) // returned for reuse
-		}(i)
+	if withAlloc < withoutAlloc {
+		reduction := float64(withoutAlloc-withAlloc) / float64(withoutAlloc) * 100
+		fmt.Printf("\nPool reduced allocations by %.0f%%\n", reduction)
 	}
-
-	wg.Wait()
-	elapsed := time.Since(start)
-
-	var memAfter runtime.MemStats
-	runtime.ReadMemStats(&memAfter)
-	return elapsed, memAfter.TotalAlloc - memBefore.TotalAlloc
 }
 
 func main() {
-	const iterations = 10000
+	fmt.Printf("Benchmark: %d simulated HTTP requests\n\n", benchmarkIterations)
 
-	fmt.Printf("Benchmark: %d simulated HTTP requests\n\n", iterations)
+	withoutTime, withoutAlloc := benchWithoutPool(benchmarkIterations)
+	withTime, withAlloc := benchWithPool(benchmarkIterations)
 
-	timeNP, allocNP := benchWithoutPool(iterations)
-	timeP, allocP := benchWithPool(iterations)
-
-	fmt.Printf("Without pool: %v, ~%d KB allocated\n", timeNP.Round(time.Millisecond), allocNP/1024)
-	fmt.Printf("With pool:    %v, ~%d KB allocated\n", timeP.Round(time.Millisecond), allocP/1024)
-
-	if allocP < allocNP {
-		fmt.Printf("\nPool reduced allocations by %.0f%%\n", float64(allocNP-allocP)/float64(allocNP)*100)
-	}
+	printBenchComparison(withoutTime, withoutAlloc, withTime, withAlloc)
 }
 ```
 

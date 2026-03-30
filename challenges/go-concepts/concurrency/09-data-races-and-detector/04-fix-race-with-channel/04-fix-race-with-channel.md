@@ -202,71 +202,98 @@ import (
 	"time"
 )
 
-func benchmarkMutex(handlers, reqs int) time.Duration {
-	var mu sync.Mutex
+const (
+	benchHandlers       = 100
+	benchReqsPerHandler = 1000
+	endpointCount       = 4
+	channelBufferSize   = 256
+)
+
+// BenchmarkResult holds the timing outcome of a synchronization approach.
+type BenchmarkResult struct {
+	Label   string
+	Elapsed time.Duration
+}
+
+// MutexMetricsBench measures mutex-based map protection throughput.
+type MutexMetricsBench struct {
+	mu       sync.Mutex
+	counters map[string]int
+}
+
+func NewMutexMetricsBench() *MutexMetricsBench {
+	return &MutexMetricsBench{counters: make(map[string]int)}
+}
+
+func (b *MutexMetricsBench) Run(handlers, reqs int) BenchmarkResult {
+	var wg sync.WaitGroup
+	start := time.Now()
+
+	for h := 0; h < handlers; h++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			ep := fmt.Sprintf("/api/endpoint-%d", id%endpointCount)
+			for r := 0; r < reqs; r++ {
+				b.mu.Lock()
+				b.counters[ep]++
+				b.mu.Unlock()
+			}
+		}(h)
+	}
+
+	wg.Wait()
+	return BenchmarkResult{"Mutex", time.Since(start)}
+}
+
+// ChannelMetricsBench measures channel-based ownership throughput.
+type ChannelMetricsBench struct {
+	cmdCh chan string
+	done  chan struct{}
+}
+
+func NewChannelMetricsBench() *ChannelMetricsBench {
+	b := &ChannelMetricsBench{
+		cmdCh: make(chan string, channelBufferSize),
+		done:  make(chan struct{}),
+	}
+	go b.ownerLoop()
+	return b
+}
+
+func (b *ChannelMetricsBench) ownerLoop() {
 	counters := make(map[string]int)
-	var wg sync.WaitGroup
+	for ep := range b.cmdCh {
+		counters[ep]++
+	}
+	close(b.done)
+}
 
+func (b *ChannelMetricsBench) Run(handlers, reqs int) BenchmarkResult {
+	var wg sync.WaitGroup
 	start := time.Now()
+
 	for h := 0; h < handlers; h++ {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			ep := fmt.Sprintf("/api/endpoint-%d", id%4)
+			ep := fmt.Sprintf("/api/endpoint-%d", id%endpointCount)
 			for r := 0; r < reqs; r++ {
-				mu.Lock()
-				counters[ep]++
-				mu.Unlock()
+				b.cmdCh <- ep
 			}
 		}(h)
 	}
+
 	wg.Wait()
-	return time.Since(start)
+	close(b.cmdCh)
+	<-b.done
+	return BenchmarkResult{"Channel", time.Since(start)}
 }
 
-func benchmarkChannel(handlers, reqs int) time.Duration {
-	cmdCh := make(chan string, 256)
-	done := make(chan struct{})
-
-	go func() {
-		counters := make(map[string]int)
-		for ep := range cmdCh {
-			counters[ep]++
-		}
-		close(done)
-	}()
-
-	var wg sync.WaitGroup
-	start := time.Now()
-	for h := 0; h < handlers; h++ {
-		wg.Add(1)
-		go func(id int) {
-			defer wg.Done()
-			ep := fmt.Sprintf("/api/endpoint-%d", id%4)
-			for r := 0; r < reqs; r++ {
-				cmdCh <- ep
-			}
-		}(h)
-	}
-	wg.Wait()
-	close(cmdCh)
-	<-done
-	return time.Since(start)
-}
-
-func main() {
-	fmt.Println("=== Mutex vs Channel Comparison ===")
+func printComparisonGuide(mutex, channel BenchmarkResult) {
+	fmt.Printf("  %-10s %v\n", mutex.Label+":", mutex.Elapsed)
+	fmt.Printf("  %-10s %v\n", channel.Label+":", channel.Elapsed)
 	fmt.Println()
-
-	handlers, reqs := 100, 1000
-
-	mutexTime := benchmarkMutex(handlers, reqs)
-	channelTime := benchmarkChannel(handlers, reqs)
-
-	fmt.Printf("  Mutex:   %v\n", mutexTime)
-	fmt.Printf("  Channel: %v\n", channelTime)
-	fmt.Println()
-
 	fmt.Println("When to use Mutex:")
 	fmt.Println("  - Simple state protection (counters, maps)")
 	fmt.Println("  - High-frequency updates where channel overhead matters")
@@ -277,6 +304,19 @@ func main() {
 	fmt.Println("  - When you want clear data ownership")
 	fmt.Println("  - Pipeline architectures with stages")
 	fmt.Println("  - When the command pattern makes the API clearer")
+}
+
+func main() {
+	fmt.Println("=== Mutex vs Channel Comparison ===")
+	fmt.Println()
+
+	mutexBench := NewMutexMetricsBench()
+	mutexResult := mutexBench.Run(benchHandlers, benchReqsPerHandler)
+
+	channelBench := NewChannelMetricsBench()
+	channelResult := channelBench.Run(benchHandlers, benchReqsPerHandler)
+
+	printComparisonGuide(mutexResult, channelResult)
 }
 ```
 

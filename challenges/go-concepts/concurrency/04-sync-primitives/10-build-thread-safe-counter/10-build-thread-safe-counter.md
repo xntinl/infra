@@ -38,6 +38,8 @@ import (
 	"sync"
 )
 
+const incrementGoroutines = 1000
+
 type MutexCounter struct {
 	mu    sync.Mutex
 	value int64
@@ -61,11 +63,10 @@ func (c *MutexCounter) Value() int64 {
 	return c.value
 }
 
-func main() {
-	counter := &MutexCounter{}
+func incrementConcurrently(counter *MutexCounter, goroutines int) {
 	var wg sync.WaitGroup
 
-	for i := 0; i < 1000; i++ {
+	for i := 0; i < goroutines; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -74,7 +75,12 @@ func main() {
 	}
 
 	wg.Wait()
-	fmt.Printf("MutexCounter: %d (expected 1000)\n", counter.Value())
+}
+
+func main() {
+	counter := &MutexCounter{}
+	incrementConcurrently(counter, incrementGoroutines)
+	fmt.Printf("MutexCounter: %d (expected %d)\n", counter.Value(), incrementGoroutines)
 }
 ```
 
@@ -102,6 +108,12 @@ import (
 	"fmt"
 	"sync"
 	"time"
+)
+
+const (
+	simulatedConnections   = 10
+	monitoringReaders      = 50
+	connectionHoldDuration = 50 * time.Millisecond
 )
 
 type RWGauge struct {
@@ -133,29 +145,33 @@ func (g *RWGauge) Value() int64 {
 	return g.value
 }
 
+func simulateConnectionLifecycle(gauge *RWGauge, wg *sync.WaitGroup) {
+	defer wg.Done()
+	gauge.Increment()
+	time.Sleep(connectionHoldDuration)
+	gauge.Decrement()
+}
+
+func simulateMonitoringReads(gauge *RWGauge, readerCount int, wg *sync.WaitGroup) {
+	for i := 0; i < readerCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = gauge.Value()
+		}()
+	}
+}
+
 func main() {
 	gauge := &RWGauge{}
 	var wg sync.WaitGroup
 
-	// Simulate 10 connections opening and closing
-	for i := 0; i < 10; i++ {
+	for i := 0; i < simulatedConnections; i++ {
 		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			gauge.Increment() // connection opened
-			time.Sleep(50 * time.Millisecond)
-			gauge.Decrement() // connection closed
-		}()
+		go simulateConnectionLifecycle(gauge, &wg)
 	}
 
-	// Simulate 50 monitoring reads (dashboards, alerting)
-	for i := 0; i < 50; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			_ = gauge.Value() // concurrent reads do not block each other
-		}()
-	}
+	simulateMonitoringReads(gauge, monitoringReaders, &wg)
 
 	wg.Wait()
 	fmt.Printf("RWGauge (active connections): %d (expected 0 -- all closed)\n", gauge.Value())
@@ -188,6 +204,12 @@ import (
 	"sync/atomic"
 )
 
+const (
+	writerGoroutines     = 100
+	incrementsPerWorker  = 10000
+	expectedTotal        = writerGoroutines * incrementsPerWorker
+)
+
 type AtomicCounter struct {
 	value atomic.Int64
 }
@@ -204,23 +226,26 @@ func (c *AtomicCounter) Value() int64 {
 	return c.value.Load()
 }
 
-func main() {
-	counter := &AtomicCounter{}
+func runHighFrequencyIncrements(counter *AtomicCounter, workers, opsPerWorker int) {
 	var wg sync.WaitGroup
 
-	// Simulate high-frequency increments (like counting bytes on packets)
-	for i := 0; i < 100; i++ {
+	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for j := 0; j < 10000; j++ {
+			for j := 0; j < opsPerWorker; j++ {
 				counter.Increment()
 			}
 		}()
 	}
 
 	wg.Wait()
-	fmt.Printf("AtomicCounter: %d (expected 1000000)\n", counter.Value())
+}
+
+func main() {
+	counter := &AtomicCounter{}
+	runHighFrequencyIncrements(counter, writerGoroutines, incrementsPerWorker)
+	fmt.Printf("AtomicCounter: %d (expected %d)\n", counter.Value(), expectedTotal)
 }
 ```
 
@@ -251,6 +276,14 @@ import (
 	"time"
 )
 
+const (
+	benchGoroutines   = 100
+	benchOpsPerG      = 10000
+	readSampleRate    = 100 // read once per N writes
+	benchWriterCount  = 2
+	benchWriteRatio   = 10
+)
+
 type MutexCounter struct {
 	mu    sync.Mutex
 	value int64
@@ -274,7 +307,13 @@ type AtomicCounter struct {
 func (c *AtomicCounter) Increment() { c.value.Add(1) }
 func (c *AtomicCounter) Value() int64 { return c.value.Load() }
 
-func benchmarkWriteHeavy(name string, inc func(), val func() int64, goroutines, opsPerG int) {
+type CounterOps struct {
+	Name string
+	Inc  func()
+	Val  func() int64
+}
+
+func runWriteHeavyBench(ops CounterOps, goroutines, opsPerG int) {
 	var wg sync.WaitGroup
 	start := time.Now()
 
@@ -283,9 +322,9 @@ func benchmarkWriteHeavy(name string, inc func(), val func() int64, goroutines, 
 		go func() {
 			defer wg.Done()
 			for j := 0; j < opsPerG; j++ {
-				inc()
-				if j%100 == 0 { // read once per 100 writes
-					_ = val()
+				ops.Inc()
+				if j%readSampleRate == 0 {
+					_ = ops.Val()
 				}
 			}
 		}()
@@ -293,65 +332,70 @@ func benchmarkWriteHeavy(name string, inc func(), val func() int64, goroutines, 
 
 	wg.Wait()
 	elapsed := time.Since(start)
-	fmt.Printf("  %-15s %v  (final value: %d)\n", name, elapsed.Round(time.Millisecond), val())
+	fmt.Printf("  %-15s %v  (final value: %d)\n", ops.Name, elapsed.Round(time.Millisecond), ops.Val())
 }
 
-func benchmarkReadHeavy(name string, inc func(), val func() int64, goroutines, opsPerG int) {
+func runReadHeavyBench(ops CounterOps, readers, opsPerG int) {
 	var wg sync.WaitGroup
 	start := time.Now()
 
-	// Few writers
-	for i := 0; i < 2; i++ {
+	for i := 0; i < benchWriterCount; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for j := 0; j < opsPerG/10; j++ {
-				inc()
+			for j := 0; j < opsPerG/benchWriteRatio; j++ {
+				ops.Inc()
 			}
 		}()
 	}
 
-	// Many readers
-	for i := 0; i < goroutines; i++ {
+	for i := 0; i < readers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for j := 0; j < opsPerG; j++ {
-				_ = val()
+				_ = ops.Val()
 			}
 		}()
 	}
 
 	wg.Wait()
 	elapsed := time.Since(start)
-	fmt.Printf("  %-15s %v  (final value: %d)\n", name, elapsed.Round(time.Millisecond), val())
+	fmt.Printf("  %-15s %v  (final value: %d)\n", ops.Name, elapsed.Round(time.Millisecond), ops.Val())
 }
 
 func main() {
-	const goroutines = 100
-	const opsPerG = 10000
-
-	fmt.Printf("=== Write-Heavy Benchmark (%d goroutines x %d ops) ===\n", goroutines, opsPerG)
+	fmt.Printf("=== Write-Heavy Benchmark (%d goroutines x %d ops) ===\n", benchGoroutines, benchOpsPerG)
 	fmt.Println("Scenario: request counter (every handler writes, metrics endpoint reads rarely)")
 
 	mc := &MutexCounter{}
 	rg := &RWGauge{}
 	ac := &AtomicCounter{}
 
-	benchmarkWriteHeavy("Mutex", mc.Increment, mc.Value, goroutines, opsPerG)
-	benchmarkWriteHeavy("RWMutex", rg.Increment, rg.Value, goroutines, opsPerG)
-	benchmarkWriteHeavy("Atomic", ac.Increment, ac.Value, goroutines, opsPerG)
+	writeHeavy := []CounterOps{
+		{"Mutex", mc.Increment, mc.Value},
+		{"RWMutex", rg.Increment, rg.Value},
+		{"Atomic", ac.Increment, ac.Value},
+	}
+	for _, ops := range writeHeavy {
+		runWriteHeavyBench(ops, benchGoroutines, benchOpsPerG)
+	}
 
-	fmt.Printf("\n=== Read-Heavy Benchmark (2 writers, %d readers x %d ops) ===\n", goroutines, opsPerG)
+	fmt.Printf("\n=== Read-Heavy Benchmark (%d writers, %d readers x %d ops) ===\n", benchWriterCount, benchGoroutines, benchOpsPerG)
 	fmt.Println("Scenario: active connections gauge (dashboard reads constantly, few changes)")
 
 	mc2 := &MutexCounter{}
 	rg2 := &RWGauge{}
 	ac2 := &AtomicCounter{}
 
-	benchmarkReadHeavy("Mutex", mc2.Increment, mc2.Value, goroutines, opsPerG)
-	benchmarkReadHeavy("RWMutex", rg2.Increment, rg2.Value, goroutines, opsPerG)
-	benchmarkReadHeavy("Atomic", ac2.Increment, ac2.Value, goroutines, opsPerG)
+	readHeavy := []CounterOps{
+		{"Mutex", mc2.Increment, mc2.Value},
+		{"RWMutex", rg2.Increment, rg2.Value},
+		{"Atomic", ac2.Increment, ac2.Value},
+	}
+	for _, ops := range readHeavy {
+		runReadHeavyBench(ops, benchGoroutines, benchOpsPerG)
+	}
 
 	fmt.Println("\n=== Recommendation ===")
 	fmt.Println("  Request counters (write-heavy):   atomic > mutex > rwmutex")
@@ -400,14 +444,24 @@ import (
 	"time"
 )
 
+const (
+	simulatedRequests  = 200
+	dashboardReaders   = 20
+	baseLatencyMs      = 5
+	latencyRangeMs     = 50
+	latencyScaleFactor = 10
+	dashboardDelay     = 10 * time.Millisecond
+	maxInt64           = int64(1<<63 - 1)
+)
+
 // RequestCounter uses atomic for high-throughput write-heavy counters.
 type RequestCounter struct {
 	value atomic.Int64
 }
 
-func (c *RequestCounter) Inc()          { c.value.Add(1) }
-func (c *RequestCounter) Add(n int64)   { c.value.Add(n) }
-func (c *RequestCounter) Value() int64  { return c.value.Load() }
+func (c *RequestCounter) Inc()         { c.value.Add(1) }
+func (c *RequestCounter) Add(n int64)  { c.value.Add(n) }
+func (c *RequestCounter) Value() int64 { return c.value.Load() }
 
 // ConnectionGauge uses RWMutex for read-heavy gauges.
 type ConnectionGauge struct {
@@ -429,7 +483,7 @@ type LatencyHistogram struct {
 }
 
 func NewLatencyHistogram() *LatencyHistogram {
-	return &LatencyHistogram{min: 1<<63 - 1}
+	return &LatencyHistogram{min: maxInt64}
 }
 
 func (h *LatencyHistogram) Record(latencyMs int64) {
@@ -454,54 +508,77 @@ func (h *LatencyHistogram) Stats() (count, avg, min, max int64) {
 	return h.count, h.sum / h.count, h.min, h.max
 }
 
-func main() {
-	requests := &RequestCounter{}
-	connections := &ConnectionGauge{}
-	latency := NewLatencyHistogram()
+// MetricsRegistry groups all metric types with their optimal sync primitives.
+type MetricsRegistry struct {
+	Requests    *RequestCounter
+	Connections *ConnectionGauge
+	Latency     *LatencyHistogram
+}
 
-	var wg sync.WaitGroup
-
-	// Simulate 200 HTTP requests
-	for i := 0; i < 200; i++ {
-		wg.Add(1)
-		go func(reqID int) {
-			defer wg.Done()
-
-			connections.Inc() // connection opened
-			requests.Inc()    // request counted
-
-			// Simulate variable latency
-			lat := int64(5 + reqID%50) // 5ms to 54ms
-			time.Sleep(time.Duration(lat) * time.Millisecond / 10) // scaled down
-			latency.Record(lat)
-
-			connections.Dec() // connection closed
-		}(i)
+func NewMetricsRegistry() *MetricsRegistry {
+	return &MetricsRegistry{
+		Requests:    &RequestCounter{},
+		Connections: &ConnectionGauge{},
+		Latency:     NewLatencyHistogram(),
 	}
+}
 
-	// Simulate monitoring dashboard reading metrics 20 times
-	for i := 0; i < 20; i++ {
+func simulateHTTPRequest(registry *MetricsRegistry, reqID int) {
+	registry.Connections.Inc()
+	registry.Requests.Inc()
+
+	latencyMs := int64(baseLatencyMs + reqID%latencyRangeMs)
+	time.Sleep(time.Duration(latencyMs) * time.Millisecond / latencyScaleFactor)
+	registry.Latency.Record(latencyMs)
+
+	registry.Connections.Dec()
+}
+
+func simulateDashboardScrapes(registry *MetricsRegistry, scrapeCount int, wg *sync.WaitGroup) {
+	for i := 0; i < scrapeCount; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			time.Sleep(10 * time.Millisecond)
-			_ = requests.Value()
-			_ = connections.Value()
+			time.Sleep(dashboardDelay)
+			_ = registry.Requests.Value()
+			_ = registry.Connections.Value()
 		}()
 	}
+}
+
+func runProductionSimulation(registry *MetricsRegistry) {
+	var wg sync.WaitGroup
+
+	for i := 0; i < simulatedRequests; i++ {
+		wg.Add(1)
+		go func(reqID int) {
+			defer wg.Done()
+			simulateHTTPRequest(registry, reqID)
+		}(i)
+	}
+
+	simulateDashboardScrapes(registry, dashboardReaders, &wg)
 
 	wg.Wait()
+}
 
-	count, avg, min, max := latency.Stats()
+func printMetricsReport(registry *MetricsRegistry) {
+	count, avg, min, max := registry.Latency.Stats()
 
 	fmt.Println("=== Production Metrics Report ===")
-	fmt.Printf("  Total requests:      %d\n", requests.Value())
-	fmt.Printf("  Active connections:   %d (should be 0)\n", connections.Value())
+	fmt.Printf("  Total requests:      %d\n", registry.Requests.Value())
+	fmt.Printf("  Active connections:   %d (should be 0)\n", registry.Connections.Value())
 	fmt.Printf("  Latency (ms):        count=%d avg=%d min=%d max=%d\n", count, avg, min, max)
 	fmt.Println("\nPrimitive choices:")
 	fmt.Println("  RequestCounter:      atomic (write-heavy, simple increment)")
 	fmt.Println("  ConnectionGauge:     RWMutex (read-heavy, concurrent dashboard readers)")
 	fmt.Println("  LatencyHistogram:    Mutex (must update count+sum+min+max atomically)")
+}
+
+func main() {
+	registry := NewMetricsRegistry()
+	runProductionSimulation(registry)
+	printMetricsReport(registry)
 }
 ```
 
@@ -560,7 +637,7 @@ Extend the metrics registry with:
 - Benchmark all five metric types and write a one-paragraph recommendation for which to use when.
 
 ## What's Next
-You have completed the sync primitives section. Continue to [05-atomic-and-memory-ordering](../../05-atomic-and-memory-ordering/) to learn about lock-free programming with the `sync/atomic` package.
+Continue to [11-waitgroup-patterns](../11-waitgroup-patterns/) to learn advanced `sync.WaitGroup` patterns for staged deployments, error collection, and channel-based cancellation.
 
 ## Summary
 - Choose the sync primitive based on the access pattern, not by default

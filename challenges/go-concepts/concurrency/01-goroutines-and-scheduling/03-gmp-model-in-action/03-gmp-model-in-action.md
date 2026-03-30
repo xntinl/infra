@@ -43,39 +43,60 @@ import (
 	"time"
 )
 
-func main() {
-	numCPU := runtime.NumCPU()
-	currentP := runtime.GOMAXPROCS(0) // read without changing
+const (
+	dataBlockSize      = 1024 * 1024 // 1 MB
+	checksumWorkers    = 4
+	checksumsPerWorker = 50
+)
 
-	fmt.Printf("Number of CPUs:    %d\n", numCPU)
-	fmt.Printf("GOMAXPROCS (Ps):   %d\n", currentP)
-	fmt.Printf("Default: GOMAXPROCS == NumCPU (since Go 1.5)\n\n")
-
-	// CPU-bound: computing checksums benefits from more Ps
-	data := make([]byte, 1024*1024) // 1 MB block
+func generateTestData(size int) []byte {
+	data := make([]byte, size)
 	for i := range data {
 		data[i] = byte(i)
 	}
+	return data
+}
+
+func computeChecksums(data []byte, iterations int) {
+	for i := 0; i < iterations; i++ {
+		sha256.Sum256(data)
+	}
+}
+
+func benchmarkChecksumWorkers(data []byte, workerCount, iterations int) time.Duration {
+	start := time.Now()
+	done := make(chan struct{}, workerCount)
+
+	for w := 0; w < workerCount; w++ {
+		go func() {
+			computeChecksums(data, iterations)
+			done <- struct{}{}
+		}()
+	}
+	for w := 0; w < workerCount; w++ {
+		<-done
+	}
+
+	return time.Since(start)
+}
+
+func printSystemInfo() {
+	fmt.Printf("Number of CPUs:    %d\n", runtime.NumCPU())
+	fmt.Printf("GOMAXPROCS (Ps):   %d\n", runtime.GOMAXPROCS(0))
+	fmt.Printf("Default: GOMAXPROCS == NumCPU (since Go 1.5)\n\n")
+}
+
+func main() {
+	printSystemInfo()
+
+	data := generateTestData(dataBlockSize)
+	numCPU := runtime.NumCPU()
 
 	for _, procs := range []int{1, 2, numCPU} {
 		runtime.GOMAXPROCS(procs)
-		start := time.Now()
-
-		done := make(chan struct{})
-		for w := 0; w < 4; w++ {
-			go func() {
-				for i := 0; i < 50; i++ {
-					sha256.Sum256(data)
-				}
-				done <- struct{}{}
-			}()
-		}
-		for w := 0; w < 4; w++ {
-			<-done
-		}
-
-		fmt.Printf("  GOMAXPROCS=%-2d  4 workers x 50 checksums: %v\n",
-			procs, time.Since(start).Round(time.Millisecond))
+		elapsed := benchmarkChecksumWorkers(data, checksumWorkers, checksumsPerWorker)
+		fmt.Printf("  GOMAXPROCS=%-2d  %d workers x %d checksums: %v\n",
+			procs, checksumWorkers, checksumsPerWorker, elapsed.Round(time.Millisecond))
 	}
 
 	runtime.GOMAXPROCS(numCPU)
@@ -121,40 +142,53 @@ import (
 	"time"
 )
 
+const stageSettleDelay = 10 * time.Millisecond
+
+type PipelineStage struct {
+	Name    string
+	Count   int
+	Barrier chan struct{}
+}
+
+func NewPipelineStage(name string, count int) PipelineStage {
+	return PipelineStage{
+		Name:    name,
+		Count:   count,
+		Barrier: make(chan struct{}),
+	}
+}
+
+func (ps PipelineStage) Launch() {
+	for j := 0; j < ps.Count; j++ {
+		go func(barrier <-chan struct{}) {
+			<-barrier
+		}(ps.Barrier)
+	}
+}
+
+func (ps PipelineStage) Complete() {
+	close(ps.Barrier)
+}
+
 func main() {
-	barriers := make([]chan struct{}, 3)
-	for i := range barriers {
-		barriers[i] = make(chan struct{})
+	stages := []PipelineStage{
+		NewPipelineStage("file-readers", 100),
+		NewPipelineStage("checksum-workers", 500),
+		NewPipelineStage("write-uploaders", 200),
 	}
 
-	stages := []struct {
-		name  string
-		count int
-	}{
-		{"file-readers", 100},
-		{"checksum-workers", 500},
-		{"write-uploaders", 200},
-	}
-
-	// Launch pipeline stages: G count grows cumulatively
-	for i, stage := range stages {
-		for j := 0; j < stage.count; j++ {
-			go func(b <-chan struct{}) {
-				<-b
-			}(barriers[i])
-		}
-		time.Sleep(10 * time.Millisecond)
+	for _, stage := range stages {
+		stage.Launch()
+		time.Sleep(stageSettleDelay)
 		fmt.Printf("After launching %-20s (+%d): total G = %d\n",
-			stage.name, stage.count, runtime.NumGoroutine())
+			stage.Name, stage.Count, runtime.NumGoroutine())
 	}
 
-	// Complete stages in reverse: writers finish first, then processors, then readers
-	stageNames := []string{"write-uploaders", "checksum-workers", "file-readers"}
-	for i := len(barriers) - 1; i >= 0; i-- {
-		close(barriers[i])
-		time.Sleep(10 * time.Millisecond)
+	for i := len(stages) - 1; i >= 0; i-- {
+		stages[i].Complete()
+		time.Sleep(stageSettleDelay)
 		fmt.Printf("After completing %-20s:       total G = %d\n",
-			stageNames[len(barriers)-1-i], runtime.NumGoroutine())
+			stages[i].Name, runtime.NumGoroutine())
 	}
 }
 ```
@@ -192,35 +226,58 @@ import (
 	"time"
 )
 
+const (
+	limitedProcs       = 2
+	concurrentReaders  = 20
+	sampleConfigData   = `{"service": "auth", "port": 8080, "timeout": "30s"}` + "\n"
+)
+
+func simulateBlockingFileIO() error {
+	tempFile, err := os.CreateTemp("", "config-reader-*")
+	if err != nil {
+		return fmt.Errorf("creating temp file: %w", err)
+	}
+	tempPath := tempFile.Name()
+
+	if _, err := tempFile.Write([]byte(sampleConfigData)); err != nil {
+		tempFile.Close()
+		os.Remove(tempPath)
+		return fmt.Errorf("writing config data: %w", err)
+	}
+
+	if err := tempFile.Sync(); err != nil { // blocking syscall: forces M into kernel
+		tempFile.Close()
+		os.Remove(tempPath)
+		return fmt.Errorf("syncing file: %w", err)
+	}
+
+	tempFile.Close()
+	os.Remove(tempPath)
+	return nil
+}
+
+func launchBlockingReaders(count int) *sync.WaitGroup {
+	var wg sync.WaitGroup
+	for i := 0; i < count; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := simulateBlockingFileIO(); err != nil {
+				fmt.Printf("  reader error: %v\n", err)
+			}
+		}()
+	}
+	return &wg
+}
+
 func main() {
-	old := runtime.GOMAXPROCS(2)
-	defer runtime.GOMAXPROCS(old)
+	previousProcs := runtime.GOMAXPROCS(limitedProcs)
+	defer runtime.GOMAXPROCS(previousProcs)
 
 	fmt.Printf("GOMAXPROCS (Ps): %d\n", runtime.GOMAXPROCS(0))
 	fmt.Printf("Goroutines before: %d\n\n", runtime.NumGoroutine())
 
-	var wg sync.WaitGroup
-	const numReaders = 20
-
-	// Simulate 20 goroutines reading config files simultaneously.
-	// Each file read is a blocking syscall that causes the M to enter the kernel.
-	for i := 0; i < numReaders; i++ {
-		wg.Add(1)
-		go func(id int) {
-			defer wg.Done()
-			f, err := os.CreateTemp("", "config-reader-*")
-			if err != nil {
-				return
-			}
-			name := f.Name()
-
-			// Write simulated config data
-			f.Write([]byte(`{"service": "auth", "port": 8080, "timeout": "30s"}` + "\n"))
-			f.Sync() // blocking syscall: forces the M into the kernel
-			f.Close()
-			os.Remove(name)
-		}(i)
-	}
+	wg := launchBlockingReaders(concurrentReaders)
 
 	time.Sleep(5 * time.Millisecond)
 	fmt.Printf("During file I/O:   %d goroutines active\n", runtime.NumGoroutine())
@@ -272,61 +329,80 @@ import (
 	"time"
 )
 
-func gmpStatus(label string) {
-	var m runtime.MemStats
-	runtime.ReadMemStats(&m)
+const (
+	ioReadLatency        = 5 * time.Millisecond
+	checksumBlockSize    = 64 * 1024
+	checksumsPerGoroutine = 10
+)
 
-	fmt.Printf("[%-30s] G=%-6d P=%-3d NumCPU=%-3d StackInUse=%.1fKB  Sys=%.1fMB\n",
-		label,
-		runtime.NumGoroutine(),
-		runtime.GOMAXPROCS(0),
-		runtime.NumCPU(),
-		float64(m.StackInuse)/1024,
-		float64(m.Sys)/(1024*1024),
-	)
+type GMPSnapshot struct {
+	Label      string
+	Goroutines int
+	Procs      int
+	NumCPU     int
+	StackKB    float64
+	SysMB      float64
 }
 
-func main() {
-	gmpStatus("startup")
+func captureGMPSnapshot(label string) GMPSnapshot {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	return GMPSnapshot{
+		Label:      label,
+		Goroutines: runtime.NumGoroutine(),
+		Procs:      runtime.GOMAXPROCS(0),
+		NumCPU:     runtime.NumCPU(),
+		StackKB:    float64(m.StackInuse) / 1024,
+		SysMB:      float64(m.Sys) / (1024 * 1024),
+	}
+}
 
-	done := make(chan struct{})
+func (s GMPSnapshot) Print() {
+	fmt.Printf("[%-30s] G=%-6d P=%-3d NumCPU=%-3d StackInUse=%.1fKB  Sys=%.1fMB\n",
+		s.Label, s.Goroutines, s.Procs, s.NumCPU, s.StackKB, s.SysMB)
+}
 
-	// Phase 1: IO-bound goroutines (simulated file reads)
-	for i := 0; i < 200; i++ {
+func launchIOBoundGoroutines(count int, done <-chan struct{}) {
+	for i := 0; i < count; i++ {
 		go func() {
-			time.Sleep(5 * time.Millisecond) // simulated read latency
+			time.Sleep(ioReadLatency)
 			<-done
 		}()
 	}
-	time.Sleep(20 * time.Millisecond)
-	gmpStatus("200 IO-bound goroutines")
+}
 
-	// Phase 2: Add CPU-bound goroutines (checksum computation)
-	data := make([]byte, 64*1024)
-	for i := 0; i < 50; i++ {
+func launchCPUBoundGoroutines(count int, data []byte, done <-chan struct{}) {
+	for i := 0; i < count; i++ {
 		go func() {
-			for j := 0; j < 10; j++ {
+			for j := 0; j < checksumsPerGoroutine; j++ {
 				sha256.Sum256(data)
 			}
 			<-done
 		}()
 	}
-	time.Sleep(50 * time.Millisecond)
-	gmpStatus("200 IO + 50 CPU goroutines")
+}
 
-	// Phase 3: Add more IO-bound goroutines
-	for i := 0; i < 300; i++ {
-		go func() {
-			time.Sleep(5 * time.Millisecond)
-			<-done
-		}()
-	}
+func main() {
+	captureGMPSnapshot("startup").Print()
+
+	done := make(chan struct{})
+
+	launchIOBoundGoroutines(200, done)
 	time.Sleep(20 * time.Millisecond)
-	gmpStatus("500 IO + 50 CPU goroutines")
+	captureGMPSnapshot("200 IO-bound goroutines").Print()
+
+	data := make([]byte, checksumBlockSize)
+	launchCPUBoundGoroutines(50, data, done)
+	time.Sleep(50 * time.Millisecond)
+	captureGMPSnapshot("200 IO + 50 CPU goroutines").Print()
+
+	launchIOBoundGoroutines(300, done)
+	time.Sleep(20 * time.Millisecond)
+	captureGMPSnapshot("500 IO + 50 CPU goroutines").Print()
 
 	close(done)
 	time.Sleep(50 * time.Millisecond)
-	gmpStatus("all released")
+	captureGMPSnapshot("all released").Print()
 }
 ```
 
@@ -389,14 +465,16 @@ import (
 	"runtime"
 )
 
-func handler(w http.ResponseWriter, r *http.Request) {
+func handleGreeting(w http.ResponseWriter, r *http.Request) {
 	runtime.GOMAXPROCS(1) // terrible: affects the ENTIRE process
 	fmt.Fprintf(w, "hello")
 }
 
 func main() {
-	http.HandleFunc("/", handler)
-	http.ListenAndServe(":8080", nil)
+	http.HandleFunc("/", handleGreeting)
+	if err := http.ListenAndServe(":8080", nil); err != nil {
+		fmt.Printf("server failed: %v\n", err)
+	}
 }
 ```
 

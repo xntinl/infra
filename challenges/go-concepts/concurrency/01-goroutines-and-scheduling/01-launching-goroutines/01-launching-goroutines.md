@@ -40,16 +40,44 @@ import (
 	"time"
 )
 
+type ServiceEndpoint struct {
+	Name    string
+	Latency time.Duration
+}
+
 func checkService(name string, latency time.Duration) string {
 	time.Sleep(latency)
 	return fmt.Sprintf("%-18s UP  (%v)", name, latency)
 }
 
+func runSequentialChecks(services []ServiceEndpoint) time.Duration {
+	start := time.Now()
+	for _, svc := range services {
+		result := checkService(svc.Name, svc.Latency)
+		fmt.Printf("  %s\n", result)
+	}
+	return time.Since(start)
+}
+
+func runConcurrentChecks(services []ServiceEndpoint) time.Duration {
+	start := time.Now()
+	var wg sync.WaitGroup
+
+	for _, svc := range services {
+		wg.Add(1)
+		go func(name string, latency time.Duration) {
+			defer wg.Done()
+			result := checkService(name, latency)
+			fmt.Printf("  %s\n", result)
+		}(svc.Name, svc.Latency)
+	}
+	wg.Wait()
+
+	return time.Since(start)
+}
+
 func main() {
-	services := []struct {
-		name    string
-		latency time.Duration
-	}{
+	services := []ServiceEndpoint{
 		{"auth-api", 120 * time.Millisecond},
 		{"payment-gateway", 200 * time.Millisecond},
 		{"notification-svc", 80 * time.Millisecond},
@@ -57,31 +85,13 @@ func main() {
 		{"search-engine", 90 * time.Millisecond},
 	}
 
-	// --- Sequential: each check blocks until complete ---
 	fmt.Println("--- Sequential Health Check ---")
-	start := time.Now()
-	for _, svc := range services {
-		result := checkService(svc.name, svc.latency)
-		fmt.Printf("  %s\n", result)
-	}
-	fmt.Printf("  Sequential total: %v\n\n", time.Since(start).Round(time.Millisecond))
+	seqDuration := runSequentialChecks(services)
+	fmt.Printf("  Sequential total: %v\n\n", seqDuration.Round(time.Millisecond))
 
-	// --- Concurrent: all checks run simultaneously ---
 	fmt.Println("--- Concurrent Health Check ---")
-	start = time.Now()
-
-	var wg sync.WaitGroup
-	for _, svc := range services {
-		wg.Add(1)
-		go func(name string, latency time.Duration) {
-			defer wg.Done()
-			result := checkService(name, latency)
-			fmt.Printf("  %s\n", result)
-		}(svc.name, svc.latency)
-	}
-	wg.Wait()
-
-	fmt.Printf("  Concurrent total: %v\n", time.Since(start).Round(time.Millisecond))
+	concDuration := runConcurrentChecks(services)
+	fmt.Printf("  Concurrent total: %v\n", concDuration.Round(time.Millisecond))
 }
 ```
 
@@ -126,35 +136,38 @@ import (
 	"time"
 )
 
+const degradedService = "payment-gateway"
+
 type HealthResult struct {
 	Service string
 	Healthy bool
 	Latency time.Duration
 }
 
-func main() {
-	services := []string{"auth-api", "payment-gateway", "notification-svc", "inventory-api", "search-engine"}
+func simulateHealthCheck(serviceName string) HealthResult {
+	checkStart := time.Now()
+	simulatedLatency := time.Duration(50+len(serviceName)*10) * time.Millisecond
+	time.Sleep(simulatedLatency)
+
+	return HealthResult{
+		Service: serviceName,
+		Healthy: serviceName != degradedService,
+		Latency: time.Since(checkStart),
+	}
+}
+
+func launchChecks(services []string) <-chan HealthResult {
 	results := make(chan HealthResult, len(services))
-
-	start := time.Now()
-
 	for _, svc := range services {
 		go func(name string) {
-			checkStart := time.Now()
-			// Simulate a network call with variable latency
-			time.Sleep(time.Duration(50+len(name)*10) * time.Millisecond)
-			healthy := name != "payment-gateway" // simulate one service being down
-
-			results <- HealthResult{
-				Service: name,
-				Healthy: healthy,
-				Latency: time.Since(checkStart),
-			}
+			results <- simulateHealthCheck(name)
 		}(svc)
 	}
+	return results
+}
 
-	var downCount int
-	for i := 0; i < len(services); i++ {
+func collectResults(results <-chan HealthResult, count int) (downCount int) {
+	for i := 0; i < count; i++ {
 		r := <-results
 		status := "UP"
 		if !r.Healthy {
@@ -163,6 +176,15 @@ func main() {
 		}
 		fmt.Printf("  %-20s %4s  (%v)\n", r.Service, status, r.Latency.Round(time.Millisecond))
 	}
+	return downCount
+}
+
+func main() {
+	services := []string{"auth-api", "payment-gateway", "notification-svc", "inventory-api", "search-engine"}
+
+	start := time.Now()
+	results := launchChecks(services)
+	downCount := collectResults(results, len(services))
 
 	fmt.Printf("\n  Total: %v | Services down: %d/%d\n",
 		time.Since(start).Round(time.Millisecond), downCount, len(services))
@@ -200,15 +222,7 @@ import (
 	"sync"
 )
 
-func main() {
-	endpoints := []string{
-		"https://auth.internal/health",
-		"https://payments.internal/health",
-		"https://notifications.internal/health",
-		"https://inventory.internal/health",
-	}
-
-	// --- BUG: all goroutines capture the same variable ---
+func demonstrateBuggyCapture(endpoints []string) {
 	fmt.Println("--- BUG: shared variable capture ---")
 	var wg sync.WaitGroup
 	idx := 0
@@ -220,9 +234,11 @@ func main() {
 		}()
 	}
 	wg.Wait()
+}
 
-	// --- FIX: pass by value ---
+func demonstrateCorrectCapture(endpoints []string) {
 	fmt.Println("\n--- FIX: argument passing ---")
+	var wg sync.WaitGroup
 	for i, ep := range endpoints {
 		wg.Add(1)
 		go func(index int, endpoint string) {
@@ -231,6 +247,18 @@ func main() {
 		}(i, ep)
 	}
 	wg.Wait()
+}
+
+func main() {
+	endpoints := []string{
+		"https://auth.internal/health",
+		"https://payments.internal/health",
+		"https://notifications.internal/health",
+		"https://inventory.internal/health",
+	}
+
+	demonstrateBuggyCapture(endpoints)
+	demonstrateCorrectCapture(endpoints)
 }
 ```
 
@@ -271,38 +299,47 @@ import (
 	"time"
 )
 
+const (
+	minLatency       = 30
+	maxExtraLatency  = 150
+	degradedChance   = 0.15
+	avgLatencyPerSvc = 100 // milliseconds, for sequential estimate
+)
+
 type ServiceHealth struct {
 	Name    string
 	Status  string
 	Latency time.Duration
 }
 
-func main() {
-	services := []string{
-		"auth-api", "payment-gateway", "notification-svc",
-		"inventory-api", "search-engine", "user-profile-svc",
-		"order-service", "analytics-api", "cdn-gateway", "cache-cluster",
+type HealthReport struct {
+	Results  []ServiceHealth
+	Healthy  int
+	Degraded int
+}
+
+func checkServiceHealth(name string) ServiceHealth {
+	checkStart := time.Now()
+	latency := time.Duration(rand.Intn(maxExtraLatency)+minLatency) * time.Millisecond
+	time.Sleep(latency)
+
+	status := "UP"
+	if rand.Float32() < degradedChance {
+		status = "DEGRADED"
 	}
 
-	results := make(chan ServiceHealth, len(services))
-	start := time.Now()
+	return ServiceHealth{
+		Name:    name,
+		Status:  status,
+		Latency: time.Since(checkStart),
+	}
+}
 
+func fanOutHealthChecks(services []string) []ServiceHealth {
+	results := make(chan ServiceHealth, len(services))
 	for _, svc := range services {
 		go func(name string) {
-			checkStart := time.Now()
-			latency := time.Duration(rand.Intn(150)+30) * time.Millisecond
-			time.Sleep(latency)
-
-			status := "UP"
-			if rand.Float32() < 0.15 {
-				status = "DEGRADED"
-			}
-
-			results <- ServiceHealth{
-				Name:    name,
-				Status:  status,
-				Latency: time.Since(checkStart),
-			}
+			results <- checkServiceHealth(name)
 		}(svc)
 	}
 
@@ -312,25 +349,51 @@ func main() {
 	}
 
 	sort.Slice(all, func(i, j int) bool { return all[i].Latency < all[j].Latency })
+	return all
+}
 
+func buildReport(results []ServiceHealth) HealthReport {
+	report := HealthReport{Results: results}
+	for _, r := range results {
+		if r.Status == "DEGRADED" {
+			report.Degraded++
+		} else {
+			report.Healthy++
+		}
+	}
+	return report
+}
+
+func printReport(report HealthReport, wallClock time.Duration) {
 	fmt.Println("=== Service Health Report ===")
-	healthy, degraded := 0, 0
-	for _, r := range all {
+	for _, r := range report.Results {
 		marker := "  "
 		if r.Status == "DEGRADED" {
 			marker = "!!"
-			degraded++
-		} else {
-			healthy++
 		}
 		fmt.Printf("  %s %-22s %-10s %v\n", marker, r.Name, r.Status, r.Latency.Round(time.Millisecond))
 	}
 
-	wallClock := time.Since(start)
-	fmt.Printf("\n  Checked %d services in %v\n", len(services), wallClock.Round(time.Millisecond))
-	fmt.Printf("  Healthy: %d | Degraded: %d\n", healthy, degraded)
+	total := len(report.Results)
+	fmt.Printf("\n  Checked %d services in %v\n", total, wallClock.Round(time.Millisecond))
+	fmt.Printf("  Healthy: %d | Degraded: %d\n", report.Healthy, report.Degraded)
 	fmt.Printf("  Sequential would have taken: ~%v\n",
-		time.Duration(len(services)*100)*time.Millisecond)
+		time.Duration(total*avgLatencyPerSvc)*time.Millisecond)
+}
+
+func main() {
+	services := []string{
+		"auth-api", "payment-gateway", "notification-svc",
+		"inventory-api", "search-engine", "user-profile-svc",
+		"order-service", "analytics-api", "cdn-gateway", "cache-cluster",
+	}
+
+	start := time.Now()
+	results := fanOutHealthChecks(services)
+	wallClock := time.Since(start)
+
+	report := buildReport(results)
+	printReport(report, wallClock)
 }
 ```
 
@@ -394,15 +457,17 @@ import (
 	"sync"
 )
 
+func printEndpoint(endpoint string, wg *sync.WaitGroup) {
+	defer wg.Done()
+	fmt.Println(endpoint)
+}
+
 func main() {
 	endpoints := []string{"auth", "payments", "orders", "users"}
 	var wg sync.WaitGroup
-	for i := 0; i < len(endpoints); i++ {
+	for _, ep := range endpoints {
 		wg.Add(1)
-		go func(n int) {
-			defer wg.Done()
-			fmt.Println(endpoints[n])
-		}(i)
+		go printEndpoint(ep, &wg)
 	}
 	wg.Wait()
 }
@@ -432,13 +497,15 @@ import (
 	"sync"
 )
 
+func reportHealthCheck(wg *sync.WaitGroup) {
+	defer wg.Done()
+	fmt.Println("health check complete")
+}
+
 func main() {
 	var wg sync.WaitGroup
 	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		fmt.Println("health check complete")
-	}()
+	go reportHealthCheck(&wg)
 	wg.Wait()
 }
 ```

@@ -31,34 +31,46 @@ Launch 10 downloads simultaneously with no limit. All 10 start at the same time,
 package main
 
 import (
-    "fmt"
-    "sync"
-    "time"
+	"fmt"
+	"sync"
+	"time"
 )
 
+const simulatedDownloadTime = 300 * time.Millisecond
+
+// downloadFile simulates downloading a single file.
+func downloadFile(filename string, startedAt time.Time) {
+	fmt.Printf("[%s] downloading %s...\n",
+		time.Since(startedAt).Round(time.Millisecond), filename)
+	time.Sleep(simulatedDownloadTime)
+}
+
+// downloadAllUnlimited launches one goroutine per file with no concurrency limit.
+func downloadAllUnlimited(files []string) time.Duration {
+	var wg sync.WaitGroup
+	start := time.Now()
+
+	for _, file := range files {
+		wg.Add(1)
+		go func(filename string) {
+			defer wg.Done()
+			downloadFile(filename, start)
+		}(file)
+	}
+
+	wg.Wait()
+	return time.Since(start).Round(time.Millisecond)
+}
+
 func main() {
-    files := []string{
-        "report-q1.pdf", "report-q2.pdf", "report-q3.pdf", "report-q4.pdf",
-        "data-jan.csv", "data-feb.csv", "data-mar.csv",
-        "image-logo.png", "image-banner.png", "image-hero.png",
-    }
+	files := []string{
+		"report-q1.pdf", "report-q2.pdf", "report-q3.pdf", "report-q4.pdf",
+		"data-jan.csv", "data-feb.csv", "data-mar.csv",
+		"image-logo.png", "image-banner.png", "image-hero.png",
+	}
 
-    var wg sync.WaitGroup
-    start := time.Now()
-
-    for _, file := range files {
-        wg.Add(1)
-        go func(f string) {
-            defer wg.Done()
-            fmt.Printf("[%s] downloading %s...\n",
-                time.Since(start).Round(time.Millisecond), f)
-            time.Sleep(300 * time.Millisecond) // simulate download
-        }(file)
-    }
-
-    wg.Wait()
-    fmt.Printf("All done in %v (all 10 ran simultaneously -- too many connections!)\n",
-        time.Since(start).Round(time.Millisecond))
+	elapsed := downloadAllUnlimited(files)
+	fmt.Printf("All done in %v (all 10 ran simultaneously -- too many connections!)\n", elapsed)
 }
 ```
 
@@ -77,42 +89,64 @@ Create a buffered channel of capacity 3. Before downloading, acquire a slot. Aft
 package main
 
 import (
-    "fmt"
-    "sync"
-    "time"
+	"fmt"
+	"sync"
+	"time"
 )
 
+const (
+	concurrencyLimit      = 3
+	semDownloadSimulation = 300 * time.Millisecond
+)
+
+// Semaphore limits the number of concurrent operations using a buffered channel.
+type Semaphore struct {
+	slots chan struct{}
+}
+
+// NewSemaphore creates a semaphore with the given capacity.
+func NewSemaphore(maxConcurrent int) *Semaphore {
+	return &Semaphore{slots: make(chan struct{}, maxConcurrent)}
+}
+
+// Acquire blocks until a slot is available.
+func (s *Semaphore) Acquire() { s.slots <- struct{}{} }
+
+// Release frees a slot. Always defer this after Acquire.
+func (s *Semaphore) Release() { <-s.slots }
+
+// downloadWithSemaphore simulates a download while respecting the semaphore limit.
+func downloadWithSemaphore(sem *Semaphore, filename string, startedAt time.Time) {
+	sem.Acquire()
+	defer sem.Release()
+
+	elapsed := time.Since(startedAt).Round(time.Millisecond)
+	fmt.Printf("[+%6s] downloading %s\n", elapsed, filename)
+	time.Sleep(semDownloadSimulation)
+}
+
 func main() {
-    files := []string{
-        "report-q1.pdf", "report-q2.pdf", "report-q3.pdf", "report-q4.pdf",
-        "data-jan.csv", "data-feb.csv", "data-mar.csv",
-        "image-logo.png", "image-banner.png", "image-hero.png",
-    }
+	files := []string{
+		"report-q1.pdf", "report-q2.pdf", "report-q3.pdf", "report-q4.pdf",
+		"data-jan.csv", "data-feb.csv", "data-mar.csv",
+		"image-logo.png", "image-banner.png", "image-hero.png",
+	}
 
-    // The buffer capacity IS the concurrency limit.
-    sem := make(chan struct{}, 3)
-    var wg sync.WaitGroup
-    start := time.Now()
+	sem := NewSemaphore(concurrencyLimit)
+	var wg sync.WaitGroup
+	start := time.Now()
 
-    for _, file := range files {
-        wg.Add(1)
-        go func(f string) {
-            defer wg.Done()
+	for _, file := range files {
+		wg.Add(1)
+		go func(filename string) {
+			defer wg.Done()
+			downloadWithSemaphore(sem, filename, start)
+		}(file)
+	}
 
-            // Acquire: blocks when 3 downloads are already active.
-            sem <- struct{}{}
-            // Release: ALWAYS defer to guarantee the slot is freed, even on panic.
-            defer func() { <-sem }()
-
-            elapsed := time.Since(start).Round(time.Millisecond)
-            fmt.Printf("[+%6s] downloading %s\n", elapsed, f)
-            time.Sleep(300 * time.Millisecond) // simulate download
-        }(file)
-    }
-
-    wg.Wait()
-    fmt.Printf("All done in %v (max 3 concurrent downloads)\n",
-        time.Since(start).Round(time.Millisecond))
+	wg.Wait()
+	fmt.Printf("All done in %v (max %d concurrent downloads)\n",
+		time.Since(start).Round(time.Millisecond), concurrencyLimit)
 }
 ```
 
@@ -132,57 +166,95 @@ Track the number of active downloads to prove the semaphore works. This is the k
 package main
 
 import (
-    "fmt"
-    "sync"
-    "sync/atomic"
-    "time"
+	"fmt"
+	"sync"
+	"sync/atomic"
+	"time"
 )
 
+const (
+	verifyFileCount      = 15
+	verifyConcurrency    = 3
+	verifyDownloadTime   = 200 * time.Millisecond
+)
+
+// ConcurrencyTracker tracks active and peak concurrent goroutines using atomics.
+type ConcurrencyTracker struct {
+	active atomic.Int32
+	peak   atomic.Int32
+}
+
+// Enter increments the active count and updates the peak if needed.
+func (ct *ConcurrencyTracker) Enter() int32 {
+	current := ct.active.Add(1)
+	for {
+		old := ct.peak.Load()
+		if current <= old || ct.peak.CompareAndSwap(old, current) {
+			break
+		}
+	}
+	return current
+}
+
+// Exit decrements the active count.
+func (ct *ConcurrencyTracker) Exit() { ct.active.Add(-1) }
+
+// Peak returns the highest observed concurrency.
+func (ct *ConcurrencyTracker) Peak() int32 { return ct.peak.Load() }
+
+// trackedDownload simulates a download while recording concurrency metrics.
+func trackedDownload(sem *Semaphore, tracker *ConcurrencyTracker, filename string, startedAt time.Time) {
+	sem.Acquire()
+	defer sem.Release()
+
+	active := tracker.Enter()
+	defer tracker.Exit()
+
+	elapsed := time.Since(startedAt).Round(time.Millisecond)
+	fmt.Printf("[+%6s] downloading %-15s (active: %d)\n", elapsed, filename, active)
+	time.Sleep(verifyDownloadTime)
+}
+
+// Semaphore limits the number of concurrent operations using a buffered channel.
+type Semaphore struct {
+	slots chan struct{}
+}
+
+func NewSemaphore(maxConcurrent int) *Semaphore {
+	return &Semaphore{slots: make(chan struct{}, maxConcurrent)}
+}
+
+func (s *Semaphore) Acquire() { s.slots <- struct{}{} }
+func (s *Semaphore) Release() { <-s.slots }
+
 func main() {
-    files := make([]string, 15)
-    for i := range files {
-        files[i] = fmt.Sprintf("file-%02d.dat", i+1)
-    }
+	files := make([]string, verifyFileCount)
+	for i := range files {
+		files[i] = fmt.Sprintf("file-%02d.dat", i+1)
+	}
 
-    maxConcurrent := 3
-    sem := make(chan struct{}, maxConcurrent)
-    var wg sync.WaitGroup
-    var activeCount atomic.Int32
-    var peakConcurrent atomic.Int32
-    start := time.Now()
+	sem := NewSemaphore(verifyConcurrency)
+	tracker := &ConcurrencyTracker{}
+	var wg sync.WaitGroup
+	start := time.Now()
 
-    for _, file := range files {
-        wg.Add(1)
-        go func(f string) {
-            defer wg.Done()
-            sem <- struct{}{}
-            defer func() { <-sem }()
+	for _, file := range files {
+		wg.Add(1)
+		go func(filename string) {
+			defer wg.Done()
+			trackedDownload(sem, tracker, filename, start)
+		}(file)
+	}
 
-            // Track active downloads.
-            current := activeCount.Add(1)
-            for {
-                old := peakConcurrent.Load()
-                if current <= old || peakConcurrent.CompareAndSwap(old, current) {
-                    break
-                }
-            }
+	wg.Wait()
+	peak := tracker.Peak()
+	fmt.Printf("\nPeak concurrent downloads: %d (limit was %d)\n", peak, verifyConcurrency)
 
-            elapsed := time.Since(start).Round(time.Millisecond)
-            fmt.Printf("[+%6s] downloading %-15s (active: %d)\n", elapsed, f, current)
-            time.Sleep(200 * time.Millisecond)
-            activeCount.Add(-1)
-        }(file)
-    }
-
-    wg.Wait()
-    peak := peakConcurrent.Load()
-    fmt.Printf("\nPeak concurrent downloads: %d (limit was %d)\n", peak, maxConcurrent)
-
-    if peak <= int32(maxConcurrent) {
-        fmt.Println("PASS: concurrency limit respected")
-    } else {
-        fmt.Println("FAIL: concurrency limit exceeded!")
-    }
+	if peak <= int32(verifyConcurrency) {
+		fmt.Println("PASS: concurrency limit respected")
+	} else {
+		fmt.Println("FAIL: concurrency limit exceeded!")
+	}
 }
 ```
 
@@ -200,54 +272,74 @@ Side-by-side comparison showing the real consequence of not using a semaphore: a
 package main
 
 import (
-    "fmt"
-    "sync"
-    "sync/atomic"
-    "time"
+	"fmt"
+	"sync"
+	"sync/atomic"
+	"time"
 )
 
-func download(files []string, maxParallel int) (time.Duration, int32) {
-    sem := make(chan struct{}, maxParallel)
-    var wg sync.WaitGroup
-    var peak atomic.Int32
-    var active atomic.Int32
-    start := time.Now()
+const (
+	comparisonFileCount   = 12
+	comparisonDownloadTime = 200 * time.Millisecond
+	safeLimit             = 3
+)
 
-    for _, f := range files {
-        wg.Add(1)
-        go func(file string) {
-            defer wg.Done()
-            if maxParallel > 0 {
-                sem <- struct{}{}
-                defer func() { <-sem }()
-            }
-            cur := active.Add(1)
-            for {
-                old := peak.Load()
-                if cur <= old || peak.CompareAndSwap(old, cur) {
-                    break
-                }
-            }
-            time.Sleep(200 * time.Millisecond)
-            active.Add(-1)
-        }(f)
-    }
+// DownloadBenchmark runs a batch of downloads with a concurrency limit,
+// returning the elapsed time and peak observed concurrency.
+type DownloadBenchmark struct {
+	files       []string
+	maxParallel int
+}
 
-    wg.Wait()
-    return time.Since(start).Round(time.Millisecond), peak.Load()
+// Run executes the benchmark and returns elapsed time and peak concurrency.
+func (db *DownloadBenchmark) Run() (time.Duration, int32) {
+	sem := make(chan struct{}, db.maxParallel)
+	var wg sync.WaitGroup
+	var peak atomic.Int32
+	var active atomic.Int32
+	start := time.Now()
+
+	for _, file := range db.files {
+		wg.Add(1)
+		go func(filename string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			cur := active.Add(1)
+			for {
+				old := peak.Load()
+				if cur <= old || peak.CompareAndSwap(old, cur) {
+					break
+				}
+			}
+			time.Sleep(comparisonDownloadTime)
+			active.Add(-1)
+		}(file)
+	}
+
+	wg.Wait()
+	return time.Since(start).Round(time.Millisecond), peak.Load()
+}
+
+func generateFileList(count int) []string {
+	files := make([]string, count)
+	for i := range files {
+		files[i] = fmt.Sprintf("file-%02d.dat", i+1)
+	}
+	return files
 }
 
 func main() {
-    files := make([]string, 12)
-    for i := range files {
-        files[i] = fmt.Sprintf("file-%02d.dat", i+1)
-    }
+	files := generateFileList(comparisonFileCount)
 
-    elapsed, peak := download(files, 12) // no effective limit
-    fmt.Printf("Unlimited:  %v, peak connections: %d (server overloaded!)\n", elapsed, peak)
+	unlimited := &DownloadBenchmark{files: files, maxParallel: comparisonFileCount}
+	elapsed, peak := unlimited.Run()
+	fmt.Printf("Unlimited:  %v, peak connections: %d (server overloaded!)\n", elapsed, peak)
 
-    elapsed, peak = download(files, 3) // semaphore at 3
-    fmt.Printf("Limited(3): %v, peak connections: %d (safe)\n", elapsed, peak)
+	limited := &DownloadBenchmark{files: files, maxParallel: safeLimit}
+	elapsed, peak = limited.Run()
+	fmt.Printf("Limited(%d): %v, peak connections: %d (safe)\n", safeLimit, elapsed, peak)
 }
 ```
 
@@ -267,70 +359,115 @@ A production-ready downloader that limits concurrency and reports progress. This
 package main
 
 import (
-    "fmt"
-    "math/rand"
-    "sync"
-    "time"
+	"fmt"
+	"math/rand"
+	"sync"
+	"time"
 )
 
+const (
+	downloaderConcurrency = 3
+	minDownloadLatency    = 100
+	maxExtraLatency       = 300
+	minFileSizeKB         = 1024
+	maxExtraSizeKB        = 10240
+)
+
+// DownloadResult records the outcome of a single file download.
 type DownloadResult struct {
-    File     string
-    Size     int
-    Duration time.Duration
-    Error    string
+	File     string
+	Size     int
+	Duration time.Duration
+}
+
+// FileDownloader manages concurrent downloads with a semaphore.
+type FileDownloader struct {
+	sem     *Semaphore
+	results chan DownloadResult
+	wg      sync.WaitGroup
+}
+
+// Semaphore limits the number of concurrent operations using a buffered channel.
+type Semaphore struct {
+	slots chan struct{}
+}
+
+func NewSemaphore(maxConcurrent int) *Semaphore {
+	return &Semaphore{slots: make(chan struct{}, maxConcurrent)}
+}
+
+func (s *Semaphore) Acquire() { s.slots <- struct{}{} }
+func (s *Semaphore) Release() { <-s.slots }
+
+// NewFileDownloader creates a downloader with the given concurrency limit.
+func NewFileDownloader(maxConcurrent int, fileCount int) *FileDownloader {
+	return &FileDownloader{
+		sem:     NewSemaphore(maxConcurrent),
+		results: make(chan DownloadResult, fileCount),
+	}
+}
+
+// Download simulates downloading a file and sends the result.
+func (fd *FileDownloader) Download(filename string) {
+	fd.wg.Add(1)
+	go func() {
+		defer fd.wg.Done()
+		fd.sem.Acquire()
+		defer fd.sem.Release()
+
+		dlStart := time.Now()
+		latency := time.Duration(minDownloadLatency+rand.Intn(maxExtraLatency)) * time.Millisecond
+		time.Sleep(latency)
+
+		sizeKB := minFileSizeKB + rand.Intn(maxExtraSizeKB)
+		fd.results <- DownloadResult{
+			File:     filename,
+			Size:     sizeKB,
+			Duration: time.Since(dlStart).Round(time.Millisecond),
+		}
+	}()
+}
+
+// CloseResultsWhenDone waits for all downloads and closes the results channel.
+func (fd *FileDownloader) CloseResultsWhenDone() {
+	go func() {
+		fd.wg.Wait()
+		close(fd.results)
+	}()
+}
+
+// Results returns the channel to range over for completed downloads.
+func (fd *FileDownloader) Results() <-chan DownloadResult {
+	return fd.results
 }
 
 func main() {
-    files := []string{
-        "report-2024-q1.pdf", "report-2024-q2.pdf", "report-2024-q3.pdf",
-        "dataset-users.csv", "dataset-orders.csv",
-        "backup-db-full.tar.gz", "backup-db-incremental.tar.gz",
-        "config-prod.yaml", "config-staging.yaml",
-    }
+	files := []string{
+		"report-2024-q1.pdf", "report-2024-q2.pdf", "report-2024-q3.pdf",
+		"dataset-users.csv", "dataset-orders.csv",
+		"backup-db-full.tar.gz", "backup-db-incremental.tar.gz",
+		"config-prod.yaml", "config-staging.yaml",
+	}
 
-    sem := make(chan struct{}, 3)
-    results := make(chan DownloadResult, len(files))
-    var wg sync.WaitGroup
-    start := time.Now()
+	downloader := NewFileDownloader(downloaderConcurrency, len(files))
+	start := time.Now()
 
-    for _, file := range files {
-        wg.Add(1)
-        go func(f string) {
-            defer wg.Done()
-            sem <- struct{}{}
-            defer func() { <-sem }()
+	for _, file := range files {
+		downloader.Download(file)
+	}
+	downloader.CloseResultsWhenDone()
 
-            dlStart := time.Now()
-            duration := time.Duration(100+rand.Intn(300)) * time.Millisecond
-            time.Sleep(duration) // simulate variable download time
+	totalSizeKB := 0
+	downloaded := 0
+	for res := range downloader.Results() {
+		downloaded++
+		totalSizeKB += res.Size
+		fmt.Printf("  [%d/%d] %-35s %5d KB in %v\n",
+			downloaded, len(files), res.File, res.Size, res.Duration)
+	}
 
-            size := 1024 + rand.Intn(10240) // simulate file size in KB
-            results <- DownloadResult{
-                File:     f,
-                Size:     size,
-                Duration: time.Since(dlStart).Round(time.Millisecond),
-            }
-        }(file)
-    }
-
-    // Close results channel after all downloads complete.
-    go func() {
-        wg.Wait()
-        close(results)
-    }()
-
-    // Collect and display results as they arrive.
-    totalSize := 0
-    downloaded := 0
-    for res := range results {
-        downloaded++
-        totalSize += res.Size
-        fmt.Printf("  [%d/%d] %-35s %5d KB in %v\n",
-            downloaded, len(files), res.File, res.Size, res.Duration)
-    }
-
-    fmt.Printf("\nCompleted: %d files, %d KB total, %v elapsed (max 3 concurrent)\n",
-        downloaded, totalSize, time.Since(start).Round(time.Millisecond))
+	fmt.Printf("\nCompleted: %d files, %d KB total, %v elapsed (max %d concurrent)\n",
+		downloaded, totalSizeKB, time.Since(start).Round(time.Millisecond), downloaderConcurrency)
 }
 ```
 

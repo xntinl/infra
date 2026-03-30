@@ -34,38 +34,57 @@ import (
 	"time"
 )
 
-func main() {
-	messages := make(chan string)
-	shutdown := make(chan struct{})
+const messageInterval = 50 * time.Millisecond
 
-	// Simulate a message broker delivering messages.
+type MessageBroker struct {
+	messages chan string
+	shutdown chan struct{}
+}
+
+func NewMessageBroker() *MessageBroker {
+	return &MessageBroker{
+		messages: make(chan string),
+		shutdown: make(chan struct{}),
+	}
+}
+
+func (mb *MessageBroker) ProduceMessages(topics []string) {
 	go func() {
-		topics := []string{
-			"order.created",
-			"user.signup",
-			"payment.processed",
-			"order.shipped",
-			"inventory.updated",
-		}
 		for _, topic := range topics {
-			messages <- fmt.Sprintf("[%s] payload={...}", topic)
-			time.Sleep(50 * time.Millisecond)
+			mb.messages <- fmt.Sprintf("[%s] payload={...}", topic)
+			time.Sleep(messageInterval)
 		}
-		close(shutdown)
+		close(mb.shutdown)
 	}()
+}
 
-	// Consumer event loop.
+func (mb *MessageBroker) StartConsumer() {
 	go func() {
 		for {
 			select {
-			case msg := <-messages:
+			case msg := <-mb.messages:
 				fmt.Println("consumed:", msg)
-			case <-shutdown:
+			case <-mb.shutdown:
 				fmt.Println("consumer: shutting down")
 				return
 			}
 		}
 	}()
+}
+
+func main() {
+	broker := NewMessageBroker()
+
+	topics := []string{
+		"order.created",
+		"user.signup",
+		"payment.processed",
+		"order.shipped",
+		"inventory.updated",
+	}
+
+	broker.ProduceMessages(topics)
+	broker.StartConsumer()
 
 	// Wait for the producer to finish and the consumer to stop.
 	time.Sleep(500 * time.Millisecond)
@@ -96,33 +115,41 @@ import (
 	"time"
 )
 
-func main() {
-	subscription := make(chan string, 5)
-	alerts := make(chan string, 5)
-	shutdown := make(chan struct{})
+const (
+	messageCount    = 5
+	alertCount      = 3
+	messageInterval = 30 * time.Millisecond
+	alertInterval   = 50 * time.Millisecond
+	shutdownDelay   = 300 * time.Millisecond
+	channelBuffer   = 5
+)
 
-	// Message producer.
+func produceMessages(subscription chan<- string, count int, interval time.Duration) {
 	go func() {
-		for i := 0; i < 5; i++ {
+		for i := 0; i < count; i++ {
 			subscription <- fmt.Sprintf("msg-%d", i)
-			time.Sleep(30 * time.Millisecond)
+			time.Sleep(interval)
 		}
 	}()
+}
 
-	// Alert producer.
+func produceAlerts(alerts chan<- string, count int, interval time.Duration) {
 	go func() {
-		for i := 0; i < 3; i++ {
+		for i := 0; i < count; i++ {
 			alerts <- fmt.Sprintf("alert: consumer-lag-%d", i)
-			time.Sleep(50 * time.Millisecond)
+			time.Sleep(interval)
 		}
 	}()
+}
 
-	// Shutdown after 300ms.
+func scheduleShutdown(shutdown chan struct{}, delay time.Duration) {
 	go func() {
-		time.Sleep(300 * time.Millisecond)
+		time.Sleep(delay)
 		close(shutdown)
 	}()
+}
 
+func runEventLoop(subscription, alerts <-chan string, shutdown <-chan struct{}) {
 	for {
 		select {
 		case msg := <-subscription:
@@ -134,6 +161,18 @@ func main() {
 			return
 		}
 	}
+}
+
+func main() {
+	subscription := make(chan string, channelBuffer)
+	alerts := make(chan string, channelBuffer)
+	shutdown := make(chan struct{})
+
+	produceMessages(subscription, messageCount, messageInterval)
+	produceAlerts(alerts, alertCount, alertInterval)
+	scheduleShutdown(shutdown, shutdownDelay)
+
+	runEventLoop(subscription, alerts, shutdown)
 }
 ```
 
@@ -164,36 +203,59 @@ import (
 	"time"
 )
 
-func main() {
-	messages := make(chan string, 10)
-	shutdown := make(chan struct{})
+const (
+	eventCount      = 8
+	eventInterval   = 40 * time.Millisecond
+	cleanupInterval = 100 * time.Millisecond
+	channelBuffer   = 10
+)
 
+func produceEvents(messages chan<- string, shutdown chan struct{}, count int) {
 	go func() {
-		for i := 0; i < 8; i++ {
+		for i := 0; i < count; i++ {
 			messages <- fmt.Sprintf("event-%d", i)
-			time.Sleep(40 * time.Millisecond)
+			time.Sleep(eventInterval)
 		}
 		close(shutdown)
 	}()
+}
 
-	ticker := time.NewTicker(100 * time.Millisecond)
+type EventConsumer struct {
+	messages chan string
+	shutdown chan struct{}
+	consumed int
+}
+
+func NewEventConsumer(bufferSize int) *EventConsumer {
+	return &EventConsumer{
+		messages: make(chan string, bufferSize),
+		shutdown: make(chan struct{}),
+	}
+}
+
+func (ec *EventConsumer) Run() {
+	ticker := time.NewTicker(cleanupInterval)
 	defer ticker.Stop()
-
-	consumed := 0
 
 loop:
 	for {
 		select {
-		case msg := <-messages:
+		case msg := <-ec.messages:
 			fmt.Println("[consume]", msg)
-			consumed++
+			ec.consumed++
 		case <-ticker.C:
-			fmt.Printf("[cleanup] offset commit, %d messages processed\n", consumed)
-		case <-shutdown:
-			fmt.Printf("[shutdown] total: %d messages consumed\n", consumed)
+			fmt.Printf("[cleanup] offset commit, %d messages processed\n", ec.consumed)
+		case <-ec.shutdown:
+			fmt.Printf("[shutdown] total: %d messages consumed\n", ec.consumed)
 			break loop
 		}
 	}
+}
+
+func main() {
+	consumer := NewEventConsumer(channelBuffer)
+	produceEvents(consumer.messages, consumer.shutdown, eventCount)
+	consumer.Run()
 }
 ```
 
@@ -225,34 +287,27 @@ import (
 	"time"
 )
 
-func main() {
-	topicA := make(chan string)
-	topicB := make(chan string)
-
+func produceTopicEvents(name string, count int, interval time.Duration) <-chan string {
+	topic := make(chan string)
 	go func() {
-		for i := 0; i < 3; i++ {
-			topicA <- fmt.Sprintf("topic-a: event-%d", i)
-			time.Sleep(50 * time.Millisecond)
+		for i := 0; i < count; i++ {
+			topic <- fmt.Sprintf("%s: event-%d", name, i)
+			time.Sleep(interval)
 		}
-		close(topicA)
+		close(topic)
 	}()
+	return topic
+}
 
-	go func() {
-		for i := 0; i < 5; i++ {
-			topicB <- fmt.Sprintf("topic-b: event-%d", i)
-			time.Sleep(30 * time.Millisecond)
-		}
-		close(topicB)
-	}()
-
-	aDone, bDone := false, false
+func consumeUntilAllClosed(topicA, topicB <-chan string) {
+	topicADone, topicBDone := false, false
 
 	for {
 		select {
 		case msg, ok := <-topicA:
 			if !ok {
 				topicA = nil // Nil channel is never selected.
-				aDone = true
+				topicADone = true
 				fmt.Println("topic-a: subscription ended")
 			} else {
 				fmt.Println("received:", msg)
@@ -260,18 +315,25 @@ func main() {
 		case msg, ok := <-topicB:
 			if !ok {
 				topicB = nil
-				bDone = true
+				topicBDone = true
 				fmt.Println("topic-b: subscription ended")
 			} else {
 				fmt.Println("received:", msg)
 			}
 		}
 
-		if aDone && bDone {
+		if topicADone && topicBDone {
 			fmt.Println("all subscriptions ended, consumer exiting")
-			break
+			return
 		}
 	}
+}
+
+func main() {
+	topicA := produceTopicEvents("topic-a", 3, 50*time.Millisecond)
+	topicB := produceTopicEvents("topic-b", 5, 30*time.Millisecond)
+
+	consumeUntilAllClosed(topicA, topicB)
 }
 ```
 
@@ -304,19 +366,20 @@ import (
 	"time"
 )
 
-func main() {
-	messages := make(chan string, 5)
-	done := make(chan struct{})
+const messageBuffer = 5
 
+func produceOrderEvents(messages chan<- string, done chan struct{}) {
 	go func() {
-		msgs := []string{"order.created", "order.paid", "order.shipped"}
-		for _, m := range msgs {
-			messages <- m
+		events := []string{"order.created", "order.paid", "order.shipped"}
+		for _, event := range events {
+			messages <- event
 			time.Sleep(30 * time.Millisecond)
 		}
 		close(done)
 	}()
+}
 
+func consumeUntilDone(messages <-chan string, done <-chan struct{}) {
 loop:
 	for {
 		select {
@@ -328,6 +391,14 @@ loop:
 		}
 	}
 	fmt.Println("consumer cleanup complete")
+}
+
+func main() {
+	messages := make(chan string, messageBuffer)
+	done := make(chan struct{})
+
+	produceOrderEvents(messages, done)
+	consumeUntilDone(messages, done)
 }
 ```
 

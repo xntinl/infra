@@ -44,15 +44,31 @@ package main
 
 import "fmt"
 
-func readLogLines(lines []string) <-chan string {
+// LogPipeline orchestrates a multi-stage log processing flow.
+type LogPipeline struct {
+	rawLines []string
+}
+
+func NewLogPipeline(lines []string) *LogPipeline {
+	return &LogPipeline{rawLines: lines}
+}
+
+func (lp *LogPipeline) ReadLines() <-chan string {
 	out := make(chan string)
 	go func() {
-		for _, line := range lines {
+		defer close(out)
+		for _, line := range lp.rawLines {
 			out <- line
 		}
-		close(out)
 	}()
 	return out
+}
+
+func (lp *LogPipeline) PrintAllLines() {
+	fmt.Println("=== Log Reader Stage ===")
+	for line := range lp.ReadLines() {
+		fmt.Printf("  %s\n", line)
+	}
 }
 
 func main() {
@@ -64,10 +80,8 @@ func main() {
 		"2024-03-15T10:00:05Z ERROR [auth] token expired for user=admin",
 	}
 
-	fmt.Println("=== Log Reader Stage ===")
-	for line := range readLogLines(logs) {
-		fmt.Printf("  %s\n", line)
-	}
+	pipeline := NewLogPipeline(logs)
+	pipeline.PrintAllLines()
 }
 ```
 
@@ -99,6 +113,9 @@ import (
 	"strings"
 )
 
+const minLogFieldCount = 4
+
+// LogEntry represents a structured log line.
 type LogEntry struct {
 	Timestamp string
 	Level     string
@@ -106,36 +123,58 @@ type LogEntry struct {
 	Message   string
 }
 
-func readLogLines(lines []string) <-chan string {
+// LogPipeline orchestrates a multi-stage log processing flow.
+type LogPipeline struct {
+	rawLines []string
+}
+
+func NewLogPipeline(lines []string) *LogPipeline {
+	return &LogPipeline{rawLines: lines}
+}
+
+func (lp *LogPipeline) ReadLines() <-chan string {
 	out := make(chan string)
 	go func() {
-		for _, line := range lines {
+		defer close(out)
+		for _, line := range lp.rawLines {
 			out <- line
 		}
-		close(out)
 	}()
 	return out
 }
 
-func parseLogEntries(in <-chan string) <-chan LogEntry {
+func parseLine(line string) (LogEntry, bool) {
+	parts := strings.SplitN(line, " ", minLogFieldCount)
+	if len(parts) < minLogFieldCount {
+		return LogEntry{}, false
+	}
+	return LogEntry{
+		Timestamp: parts[0],
+		Level:     parts[1],
+		Service:   strings.Trim(parts[2], "[]"),
+		Message:   parts[3],
+	}, true
+}
+
+func (lp *LogPipeline) ParseEntries(in <-chan string) <-chan LogEntry {
 	out := make(chan LogEntry)
 	go func() {
+		defer close(out)
 		for line := range in {
-			parts := strings.SplitN(line, " ", 4)
-			if len(parts) < 4 {
-				continue
-			}
-			service := strings.Trim(parts[2], "[]")
-			out <- LogEntry{
-				Timestamp: parts[0],
-				Level:     parts[1],
-				Service:   service,
-				Message:   parts[3],
+			if entry, ok := parseLine(line); ok {
+				out <- entry
 			}
 		}
-		close(out)
 	}()
 	return out
+}
+
+func (lp *LogPipeline) PrintParsedEntries() {
+	fmt.Println("=== Parsed Log Entries ===")
+	raw := lp.ReadLines()
+	for entry := range lp.ParseEntries(raw) {
+		fmt.Printf("  [%s] %-5s %s: %s\n", entry.Timestamp, entry.Level, entry.Service, entry.Message)
+	}
 }
 
 func main() {
@@ -145,10 +184,8 @@ func main() {
 		"2024-03-15T10:00:03Z ERROR [db] connection pool exhausted",
 	}
 
-	fmt.Println("=== Parsed Log Entries ===")
-	for entry := range parseLogEntries(readLogLines(logs)) {
-		fmt.Printf("  [%s] %-5s %s: %s\n", entry.Timestamp, entry.Level, entry.Service, entry.Message)
-	}
+	pipeline := NewLogPipeline(logs)
+	pipeline.PrintParsedEntries()
 }
 ```
 
@@ -178,6 +215,12 @@ import (
 	"strings"
 )
 
+const (
+	minLogFieldCount = 4
+	levelError       = "ERROR"
+)
+
+// LogEntry represents a structured log line.
 type LogEntry struct {
 	Timestamp string
 	Level     string
@@ -185,64 +228,96 @@ type LogEntry struct {
 	Message   string
 }
 
-func readLogLines(lines []string) <-chan string {
+// ServiceSummary holds the error count for a service.
+type ServiceSummary struct {
+	Service string
+	Count   int
+}
+
+// LogPipeline orchestrates a multi-stage log processing flow.
+type LogPipeline struct {
+	rawLines []string
+}
+
+func NewLogPipeline(lines []string) *LogPipeline {
+	return &LogPipeline{rawLines: lines}
+}
+
+func (lp *LogPipeline) ReadLines() <-chan string {
 	out := make(chan string)
 	go func() {
-		for _, line := range lines {
+		defer close(out)
+		for _, line := range lp.rawLines {
 			out <- line
 		}
-		close(out)
 	}()
 	return out
 }
 
-func parseLogEntries(in <-chan string) <-chan LogEntry {
+func parseLine(line string) (LogEntry, bool) {
+	parts := strings.SplitN(line, " ", minLogFieldCount)
+	if len(parts) < minLogFieldCount {
+		return LogEntry{}, false
+	}
+	return LogEntry{
+		Timestamp: parts[0],
+		Level:     parts[1],
+		Service:   strings.Trim(parts[2], "[]"),
+		Message:   parts[3],
+	}, true
+}
+
+func (lp *LogPipeline) ParseEntries(in <-chan string) <-chan LogEntry {
 	out := make(chan LogEntry)
 	go func() {
+		defer close(out)
 		for line := range in {
-			parts := strings.SplitN(line, " ", 4)
-			if len(parts) < 4 {
-				continue
-			}
-			service := strings.Trim(parts[2], "[]")
-			out <- LogEntry{
-				Timestamp: parts[0],
-				Level:     parts[1],
-				Service:   service,
-				Message:   parts[3],
-			}
-		}
-		close(out)
-	}()
-	return out
-}
-
-func filterErrors(in <-chan LogEntry) <-chan LogEntry {
-	out := make(chan LogEntry)
-	go func() {
-		for entry := range in {
-			if entry.Level == "ERROR" {
+			if entry, ok := parseLine(line); ok {
 				out <- entry
 			}
 		}
-		close(out)
 	}()
 	return out
 }
 
-func countByService(in <-chan LogEntry) <-chan string {
-	out := make(chan string)
+func (lp *LogPipeline) FilterByLevel(in <-chan LogEntry, level string) <-chan LogEntry {
+	out := make(chan LogEntry)
 	go func() {
+		defer close(out)
+		for entry := range in {
+			if entry.Level == level {
+				out <- entry
+			}
+		}
+	}()
+	return out
+}
+
+func (lp *LogPipeline) CountByService(in <-chan LogEntry) <-chan ServiceSummary {
+	out := make(chan ServiceSummary)
+	go func() {
+		defer close(out)
 		counts := make(map[string]int)
 		for entry := range in {
 			counts[entry.Service]++
 		}
 		for service, count := range counts {
-			out <- fmt.Sprintf("%s: %d errors", service, count)
+			out <- ServiceSummary{Service: service, Count: count}
 		}
-		close(out)
 	}()
 	return out
+}
+
+func (lp *LogPipeline) PrintErrorSummary() {
+	raw := lp.ReadLines()
+	parsed := lp.ParseEntries(raw)
+	errors := lp.FilterByLevel(parsed, levelError)
+	summary := lp.CountByService(errors)
+
+	fmt.Println("=== Error Summary by Service ===")
+	for s := range summary {
+		fmt.Printf("  %s: %d errors\n", s.Service, s.Count)
+	}
 }
 
 func main() {
@@ -259,16 +334,8 @@ func main() {
 		"2024-03-15T10:00:10Z ERROR [db] replication lag exceeded 5s",
 	}
 
-	// Pipeline: read -> parse -> filter errors -> count by service
-	raw := readLogLines(logs)
-	parsed := parseLogEntries(raw)
-	errors := filterErrors(parsed)
-	summary := countByService(errors)
-
-	fmt.Println("=== Error Summary by Service ===")
-	for line := range summary {
-		fmt.Printf("  %s\n", line)
-	}
+	pipeline := NewLogPipeline(logs)
+	pipeline.PrintErrorSummary()
 }
 ```
 
@@ -298,6 +365,16 @@ import (
 	"strings"
 )
 
+const (
+	minLogFieldCount = 4
+	levelError       = "ERROR"
+	severityNormal   = "NORMAL"
+	severityCritical = "CRITICAL"
+)
+
+var criticalKeywords = []string{"deadlock", "exhausted", "replication"}
+
+// LogEntry represents a structured log line.
 type LogEntry struct {
 	Timestamp string
 	Level     string
@@ -305,69 +382,116 @@ type LogEntry struct {
 	Message   string
 }
 
-func readLogLines(lines []string) <-chan string {
+// EnrichedReport is an error entry annotated with severity.
+type EnrichedReport struct {
+	Severity string
+	Service  string
+	Level    string
+	Message  string
+}
+
+// LogPipeline orchestrates a multi-stage log processing flow.
+type LogPipeline struct {
+	rawLines []string
+}
+
+func NewLogPipeline(lines []string) *LogPipeline {
+	return &LogPipeline{rawLines: lines}
+}
+
+func (lp *LogPipeline) ReadLines() <-chan string {
 	out := make(chan string)
 	go func() {
-		for _, line := range lines {
+		defer close(out)
+		for _, line := range lp.rawLines {
 			out <- line
 		}
-		close(out)
 	}()
 	return out
 }
 
-func parseLogEntries(in <-chan string) <-chan LogEntry {
+func parseLine(line string) (LogEntry, bool) {
+	parts := strings.SplitN(line, " ", minLogFieldCount)
+	if len(parts) < minLogFieldCount {
+		return LogEntry{}, false
+	}
+	return LogEntry{
+		Timestamp: parts[0],
+		Level:     parts[1],
+		Service:   strings.Trim(parts[2], "[]"),
+		Message:   parts[3],
+	}, true
+}
+
+func (lp *LogPipeline) ParseEntries(in <-chan string) <-chan LogEntry {
 	out := make(chan LogEntry)
 	go func() {
+		defer close(out)
 		for line := range in {
-			parts := strings.SplitN(line, " ", 4)
-			if len(parts) < 4 {
-				continue
-			}
-			service := strings.Trim(parts[2], "[]")
-			out <- LogEntry{
-				Timestamp: parts[0],
-				Level:     parts[1],
-				Service:   service,
-				Message:   parts[3],
+			if entry, ok := parseLine(line); ok {
+				out <- entry
 			}
 		}
-		close(out)
 	}()
 	return out
 }
 
-func filterByLevel(in <-chan LogEntry, level string) <-chan LogEntry {
+func (lp *LogPipeline) FilterByLevel(in <-chan LogEntry, level string) <-chan LogEntry {
 	out := make(chan LogEntry)
 	go func() {
+		defer close(out)
 		for entry := range in {
 			if entry.Level == level {
 				out <- entry
 			}
 		}
-		close(out)
 	}()
 	return out
 }
 
-func enrichWithSeverity(in <-chan LogEntry) <-chan string {
-	out := make(chan string)
-	go func() {
-		criticalKeywords := []string{"deadlock", "exhausted", "replication"}
-		for entry := range in {
-			severity := "NORMAL"
-			lower := strings.ToLower(entry.Message)
-			for _, kw := range criticalKeywords {
-				if strings.Contains(lower, kw) {
-					severity = "CRITICAL"
-					break
-				}
-			}
-			out <- fmt.Sprintf("[%s] %s/%s: %s", severity, entry.Service, entry.Level, entry.Message)
+func classifySeverity(message string) string {
+	lower := strings.ToLower(message)
+	for _, kw := range criticalKeywords {
+		if strings.Contains(lower, kw) {
+			return severityCritical
 		}
-		close(out)
+	}
+	return severityNormal
+}
+
+func (lp *LogPipeline) EnrichWithSeverity(in <-chan LogEntry) <-chan EnrichedReport {
+	out := make(chan EnrichedReport)
+	go func() {
+		defer close(out)
+		for entry := range in {
+			out <- EnrichedReport{
+				Severity: classifySeverity(entry.Message),
+				Service:  entry.Service,
+				Level:    entry.Level,
+				Message:  entry.Message,
+			}
+		}
 	}()
 	return out
+}
+
+func (lp *LogPipeline) PrintAllParsedEntries() {
+	fmt.Println("=== All Parsed Entries ===")
+	raw := lp.ReadLines()
+	for entry := range lp.ParseEntries(raw) {
+		fmt.Printf("  %-5s [%s] %s\n", entry.Level, entry.Service, entry.Message)
+	}
+}
+
+func (lp *LogPipeline) PrintErrorReportWithSeverity() {
+	fmt.Println("=== Error Report with Severity ===")
+	raw := lp.ReadLines()
+	parsed := lp.ParseEntries(raw)
+	errorsOnly := lp.FilterByLevel(parsed, levelError)
+	enriched := lp.EnrichWithSeverity(errorsOnly)
+	for report := range enriched {
+		fmt.Printf("  [%s] %s/%s: %s\n", report.Severity, report.Service, report.Level, report.Message)
+	}
 }
 
 func main() {
@@ -384,25 +508,15 @@ func main() {
 		"2024-03-15T10:00:10Z ERROR [db] replication lag exceeded 5s",
 	}
 
+	pipeline := NewLogPipeline(logs)
+
 	fmt.Println("Exercise: Log Processing Pipeline")
 	fmt.Println()
 
-	// Pipeline 1: Show all parsed entries
-	fmt.Println("=== All Parsed Entries ===")
-	for entry := range parseLogEntries(readLogLines(logs)) {
-		fmt.Printf("  %-5s [%s] %s\n", entry.Level, entry.Service, entry.Message)
-	}
+	pipeline.PrintAllParsedEntries()
 
-	// Pipeline 2: Filter -> Enrich -> Output
 	fmt.Println()
-	fmt.Println("=== Error Report with Severity ===")
-	raw := readLogLines(logs)
-	parsed := parseLogEntries(raw)
-	errorsOnly := filterByLevel(parsed, "ERROR")
-	enriched := enrichWithSeverity(errorsOnly)
-	for line := range enriched {
-		fmt.Printf("  %s\n", line)
-	}
+	pipeline.PrintErrorReportWithSeverity()
 }
 ```
 

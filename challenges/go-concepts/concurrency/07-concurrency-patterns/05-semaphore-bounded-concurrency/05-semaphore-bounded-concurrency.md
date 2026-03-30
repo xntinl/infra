@@ -52,20 +52,33 @@ import (
 	"time"
 )
 
+const (
+	apiConnectionLimit  = 5
+	totalUnboundedUsers = 30
+)
+
+// UserProfile represents a user record from the external API.
 type UserProfile struct {
 	UserID int
 	Name   string
 	Status string
 }
 
-var activeConnections int64
+// APIClient simulates a rate-limited external API.
+type APIClient struct {
+	activeConnections int64
+	maxConnections    int64
+}
 
-func fetchProfile(userID int) (UserProfile, error) {
-	current := atomic.AddInt64(&activeConnections, 1)
-	defer atomic.AddInt64(&activeConnections, -1)
+func NewAPIClient(maxConnections int) *APIClient {
+	return &APIClient{maxConnections: int64(maxConnections)}
+}
 
-	// Simulate API rate limit: reject if > 5 concurrent connections
-	if current > 5 {
+func (api *APIClient) FetchProfile(userID int) (UserProfile, error) {
+	current := atomic.AddInt64(&api.activeConnections, 1)
+	defer atomic.AddInt64(&api.activeConnections, -1)
+
+	if current > api.maxConnections {
 		return UserProfile{}, fmt.Errorf("HTTP 429: too many requests (active: %d)", current)
 	}
 
@@ -77,7 +90,7 @@ func fetchProfile(userID int) (UserProfile, error) {
 	}, nil
 }
 
-func main() {
+func runUnbounded(api *APIClient) {
 	fmt.Println("=== Unbounded Concurrency (NO semaphore) ===")
 	fmt.Println("  Launching 30 goroutines with no limit...")
 	fmt.Println()
@@ -85,11 +98,11 @@ func main() {
 	var wg sync.WaitGroup
 	var successes, failures int64
 
-	for i := 1; i <= 30; i++ {
+	for i := 1; i <= totalUnboundedUsers; i++ {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			_, err := fetchProfile(id)
+			_, err := api.FetchProfile(id)
 			if err != nil {
 				atomic.AddInt64(&failures, 1)
 				fmt.Printf("  user %2d: FAILED - %v\n", id, err)
@@ -103,6 +116,11 @@ func main() {
 	fmt.Printf("\n  Results: %d succeeded, %d failed (429 errors)\n",
 		atomic.LoadInt64(&successes), atomic.LoadInt64(&failures))
 	fmt.Println("  The API rejected most requests because we exceeded the concurrent limit.")
+}
+
+func main() {
+	api := NewAPIClient(apiConnectionLimit)
+	runUnbounded(api)
 }
 ```
 
@@ -138,19 +156,33 @@ import (
 	"time"
 )
 
+const (
+	maxConcurrentConnections = 5
+	totalBoundedUsers        = 30
+)
+
+// UserProfile represents a user record from the external API.
 type UserProfile struct {
 	UserID int
 	Name   string
 	Status string
 }
 
-var activeConnections int64
+// APIClient simulates a rate-limited external API.
+type APIClient struct {
+	activeConnections int64
+	maxConnections    int64
+}
 
-func fetchProfile(userID int) (UserProfile, error) {
-	current := atomic.AddInt64(&activeConnections, 1)
-	defer atomic.AddInt64(&activeConnections, -1)
+func NewAPIClient(maxConnections int) *APIClient {
+	return &APIClient{maxConnections: int64(maxConnections)}
+}
 
-	if current > 5 {
+func (api *APIClient) FetchProfile(userID int) (UserProfile, error) {
+	current := atomic.AddInt64(&api.activeConnections, 1)
+	defer atomic.AddInt64(&api.activeConnections, -1)
+
+	if current > api.maxConnections {
 		return UserProfile{}, fmt.Errorf("HTTP 429: too many requests (active: %d)", current)
 	}
 
@@ -162,28 +194,27 @@ func fetchProfile(userID int) (UserProfile, error) {
 	}, nil
 }
 
-func main() {
+func runBounded(api *APIClient) {
 	fmt.Println("=== Bounded Concurrency (semaphore = 5) ===")
 
-	const maxConcurrent = 5
-	sem := make(chan struct{}, maxConcurrent)
+	sem := make(chan struct{}, maxConcurrentConnections)
 	var wg sync.WaitGroup
 	var successes, failures int64
 	var maxActive int64
 
-	for i := 1; i <= 30; i++ {
+	for i := 1; i <= totalBoundedUsers; i++ {
 		wg.Add(1)
-		sem <- struct{}{} // acquire: blocks if 5 goroutines are already running
+		sem <- struct{}{}
 		go func(id int) {
 			defer wg.Done()
-			defer func() { <-sem }() // release
+			defer func() { <-sem }()
 
-			current := atomic.LoadInt64(&activeConnections)
+			current := atomic.LoadInt64(&api.activeConnections)
 			if current > maxActive {
 				atomic.StoreInt64(&maxActive, current)
 			}
 
-			profile, err := fetchProfile(id)
+			profile, err := api.FetchProfile(id)
 			if err != nil {
 				atomic.AddInt64(&failures, 1)
 				fmt.Printf("  user %2d: FAILED - %v\n", id, err)
@@ -198,7 +229,12 @@ func main() {
 	fmt.Printf("\n  Results: %d succeeded, %d failed\n",
 		atomic.LoadInt64(&successes), atomic.LoadInt64(&failures))
 	fmt.Printf("  Max concurrent connections: %d (limit: %d)\n",
-		atomic.LoadInt64(&maxActive), maxConcurrent)
+		atomic.LoadInt64(&maxActive), maxConcurrentConnections)
+}
+
+func main() {
+	api := NewAPIClient(maxConcurrentConnections)
+	runBounded(api)
 }
 ```
 
@@ -234,44 +270,72 @@ import (
 	"time"
 )
 
-func main() {
+const (
+	instrumentMaxConcurrent = 5
+	instrumentTotalRequests = 20
+)
+
+// SemaphoreInstrument tracks active goroutine counts through a semaphore.
+type SemaphoreInstrument struct {
+	maxConcurrent int
+	totalRequests int
+	active        int64
+	peakActive    int64
+}
+
+func NewSemaphoreInstrument(maxConcurrent, totalRequests int) *SemaphoreInstrument {
+	return &SemaphoreInstrument{
+		maxConcurrent: maxConcurrent,
+		totalRequests: totalRequests,
+	}
+}
+
+func (si *SemaphoreInstrument) updatePeak(current int64) {
+	for {
+		old := atomic.LoadInt64(&si.peakActive)
+		if current <= old || atomic.CompareAndSwapInt64(&si.peakActive, old, current) {
+			break
+		}
+	}
+}
+
+func (si *SemaphoreInstrument) handleRequest(id int) {
+	current := atomic.AddInt64(&si.active, 1)
+	si.updatePeak(current)
+
+	if current > int64(si.maxConcurrent) {
+		fmt.Printf("  BUG: active=%d exceeds max=%d\n", current, si.maxConcurrent)
+	}
+
+	fmt.Printf("  request %2d: active=%d\n", id, current)
+	time.Sleep(time.Duration(50+rand.Intn(100)) * time.Millisecond)
+	atomic.AddInt64(&si.active, -1)
+}
+
+func (si *SemaphoreInstrument) Run() {
 	fmt.Println("=== Semaphore Instrumentation ===")
-	const maxConcurrent = 5
-	const totalRequests = 20
 
-	sem := make(chan struct{}, maxConcurrent)
+	sem := make(chan struct{}, si.maxConcurrent)
 	var wg sync.WaitGroup
-	var active int64
-	var peakActive int64
 
-	for i := 1; i <= totalRequests; i++ {
+	for i := 1; i <= si.totalRequests; i++ {
 		wg.Add(1)
 		sem <- struct{}{}
 		go func(id int) {
 			defer wg.Done()
 			defer func() { <-sem }()
-
-			current := atomic.AddInt64(&active, 1)
-			for {
-				old := atomic.LoadInt64(&peakActive)
-				if current <= old || atomic.CompareAndSwapInt64(&peakActive, old, current) {
-					break
-				}
-			}
-
-			if current > int64(maxConcurrent) {
-				fmt.Printf("  BUG: active=%d exceeds max=%d\n", current, maxConcurrent)
-			}
-
-			fmt.Printf("  request %2d: active=%d\n", id, current)
-			time.Sleep(time.Duration(50+rand.Intn(100)) * time.Millisecond)
-			atomic.AddInt64(&active, -1)
+			si.handleRequest(id)
 		}(i)
 	}
 
 	wg.Wait()
 	fmt.Printf("\n  All %d requests completed. Peak active: %d (limit: %d)\n",
-		totalRequests, atomic.LoadInt64(&peakActive), maxConcurrent)
+		si.totalRequests, atomic.LoadInt64(&si.peakActive), si.maxConcurrent)
+}
+
+func main() {
+	instrument := NewSemaphoreInstrument(instrumentMaxConcurrent, instrumentTotalRequests)
+	instrument.Run()
 }
 ```
 
@@ -297,55 +361,86 @@ import (
 	"time"
 )
 
+const (
+	comparisonRequests    = 30
+	comparisonConcurrency = 5
+)
+
+// ConcurrencyComparison benchmarks semaphore vs worker pool approaches.
+type ConcurrencyComparison struct {
+	totalRequests int
+	concurrency   int
+}
+
+func NewConcurrencyComparison() *ConcurrencyComparison {
+	return &ConcurrencyComparison{
+		totalRequests: comparisonRequests,
+		concurrency:   comparisonConcurrency,
+	}
+}
+
 func simulateAPICall(id int) {
 	time.Sleep(time.Duration(50+rand.Intn(100)) * time.Millisecond)
 }
 
-func main() {
-	const totalRequests = 30
-	const concurrency = 5
-
-	// Semaphore approach: one goroutine per request, limited by semaphore
-	fmt.Println("=== Semaphore Approach ===")
+func (cc *ConcurrencyComparison) RunSemaphore() time.Duration {
 	start := time.Now()
-	sem := make(chan struct{}, concurrency)
-	var wg1 sync.WaitGroup
-	for i := 0; i < totalRequests; i++ {
-		wg1.Add(1)
+	sem := make(chan struct{}, cc.concurrency)
+	var wg sync.WaitGroup
+
+	for i := 0; i < cc.totalRequests; i++ {
+		wg.Add(1)
 		sem <- struct{}{}
 		go func(id int) {
-			defer wg1.Done()
+			defer wg.Done()
 			defer func() { <-sem }()
 			simulateAPICall(id)
 		}(i)
 	}
-	wg1.Wait()
-	fmt.Printf("  %d requests, max %d concurrent: %v\n\n", totalRequests, concurrency, time.Since(start))
+	wg.Wait()
+	return time.Since(start)
+}
 
-	// Worker pool approach: fixed goroutines, shared job channel
-	fmt.Println("=== Worker Pool Approach ===")
-	start = time.Now()
-	jobs := make(chan int, totalRequests)
-	var wg2 sync.WaitGroup
-	for w := 0; w < concurrency; w++ {
-		wg2.Add(1)
+func (cc *ConcurrencyComparison) RunWorkerPool() time.Duration {
+	start := time.Now()
+	jobs := make(chan int, cc.totalRequests)
+	var wg sync.WaitGroup
+
+	for w := 0; w < cc.concurrency; w++ {
+		wg.Add(1)
 		go func() {
-			defer wg2.Done()
+			defer wg.Done()
 			for id := range jobs {
 				simulateAPICall(id)
 			}
 		}()
 	}
-	for i := 0; i < totalRequests; i++ {
+
+	for i := 0; i < cc.totalRequests; i++ {
 		jobs <- i
 	}
 	close(jobs)
-	wg2.Wait()
-	fmt.Printf("  %d requests, %d workers: %v\n\n", totalRequests, concurrency, time.Since(start))
+	wg.Wait()
+	return time.Since(start)
+}
+
+func (cc *ConcurrencyComparison) Run() {
+	fmt.Println("=== Semaphore Approach ===")
+	semDuration := cc.RunSemaphore()
+	fmt.Printf("  %d requests, max %d concurrent: %v\n\n", cc.totalRequests, cc.concurrency, semDuration)
+
+	fmt.Println("=== Worker Pool Approach ===")
+	poolDuration := cc.RunWorkerPool()
+	fmt.Printf("  %d requests, %d workers: %v\n\n", cc.totalRequests, cc.concurrency, poolDuration)
 
 	fmt.Println("Both approaches achieve the same bounded concurrency.")
 	fmt.Println("Semaphore: one goroutine per task, simpler for heterogeneous work.")
 	fmt.Println("Worker pool: fixed goroutines, better for homogeneous long-lived processing.")
+}
+
+func main() {
+	comparison := NewConcurrencyComparison()
+	comparison.Run()
 }
 ```
 

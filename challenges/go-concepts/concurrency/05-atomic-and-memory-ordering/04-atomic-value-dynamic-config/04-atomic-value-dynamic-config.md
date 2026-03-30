@@ -45,12 +45,36 @@ type ServiceConfig struct {
 	DatabaseURL    string
 }
 
-func main() {
-	var config atomic.Value
+type ConfigHolder struct {
+	value atomic.Value
+}
 
-	// Store initial config. After this, all subsequent Store calls
-	// MUST use the same concrete type (ServiceConfig).
-	config.Store(ServiceConfig{
+func NewConfigHolder(initial ServiceConfig) *ConfigHolder {
+	ch := &ConfigHolder{}
+	ch.value.Store(initial)
+	return ch
+}
+
+func (ch *ConfigHolder) Get() ServiceConfig {
+	return ch.value.Load().(ServiceConfig)
+}
+
+func (ch *ConfigHolder) Swap(newCfg ServiceConfig) ServiceConfig {
+	return ch.value.Swap(newCfg).(ServiceConfig)
+}
+
+func printConfigSummary(cfg ServiceConfig) {
+	fmt.Printf("Listen: %s, MaxConns: %d, LogLevel: %s\n",
+		cfg.ListenAddr, cfg.MaxConnections, cfg.LogLevel)
+}
+
+func printConfigTransition(old, current ServiceConfig) {
+	fmt.Printf("Old listen: %s -> New listen: %s\n", old.ListenAddr, current.ListenAddr)
+	fmt.Printf("Old maxConns: %d -> New maxConns: %d\n", old.MaxConnections, current.MaxConnections)
+}
+
+func main() {
+	holder := NewConfigHolder(ServiceConfig{
 		ListenAddr:     ":8080",
 		ReadTimeout:    5 * time.Second,
 		WriteTimeout:   10 * time.Second,
@@ -59,24 +83,18 @@ func main() {
 		DatabaseURL:    "postgres://localhost:5432/myapp",
 	})
 
-	// Load returns interface{} -- type assertion recovers the concrete type
-	cfg := config.Load().(ServiceConfig)
-	fmt.Printf("Listen: %s, MaxConns: %d, LogLevel: %s\n",
-		cfg.ListenAddr, cfg.MaxConnections, cfg.LogLevel)
+	printConfigSummary(holder.Get())
 
-	// Swap atomically replaces and returns the old value (Go 1.17+)
-	old := config.Swap(ServiceConfig{
+	old := holder.Swap(ServiceConfig{
 		ListenAddr:     ":9090",
 		ReadTimeout:    3 * time.Second,
 		WriteTimeout:   5 * time.Second,
 		MaxConnections: 500,
 		LogLevel:       "debug",
 		DatabaseURL:    "postgres://primary.db:5432/myapp",
-	}).(ServiceConfig)
+	})
 
-	newCfg := config.Load().(ServiceConfig)
-	fmt.Printf("Old listen: %s -> New listen: %s\n", old.ListenAddr, newCfg.ListenAddr)
-	fmt.Printf("Old maxConns: %d -> New maxConns: %d\n", old.MaxConnections, newCfg.MaxConnections)
+	printConfigTransition(old, holder.Get())
 }
 ```
 
@@ -98,6 +116,13 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+)
+
+const (
+	handlerCount       = 4
+	requestsPerHandler = 12
+	reloadIntervalMs   = 50
+	requestIntervalMs  = 20
 )
 
 type ServiceConfig struct {
@@ -122,8 +147,43 @@ func (cm *ConfigManager) Get() ServiceConfig {
 }
 
 func (cm *ConfigManager) Update(newConfig ServiceConfig) ServiceConfig {
-	old := cm.current.Swap(newConfig).(ServiceConfig)
-	return old
+	return cm.current.Swap(newConfig).(ServiceConfig)
+}
+
+type ConfigWatcher struct {
+	manager *ConfigManager
+	updates []ServiceConfig
+}
+
+func NewConfigWatcher(manager *ConfigManager, updates []ServiceConfig) *ConfigWatcher {
+	return &ConfigWatcher{manager: manager, updates: updates}
+}
+
+func (w *ConfigWatcher) Run(wg *sync.WaitGroup) {
+	defer wg.Done()
+	for i, cfg := range w.updates {
+		time.Sleep(reloadIntervalMs * time.Millisecond)
+		old := w.manager.Update(cfg)
+		fmt.Printf("[watcher] reload %d: rateLimit %d->%d, logLevel %s->%s\n",
+			i+1, old.RateLimit, cfg.RateLimit, old.LogLevel, cfg.LogLevel)
+	}
+}
+
+func routeRequest(handlerID, reqNum int, cfg ServiceConfig) {
+	action := "200 OK"
+	if cfg.MaintenanceMsg != "" {
+		action = fmt.Sprintf("503 %s", cfg.MaintenanceMsg)
+	}
+	fmt.Printf("[handler %d req %02d] rateLimit=%d logLevel=%s -> %s\n",
+		handlerID, reqNum, cfg.RateLimit, cfg.LogLevel, action)
+}
+
+func runHandler(handlerID int, manager *ConfigManager, wg *sync.WaitGroup) {
+	defer wg.Done()
+	for req := 0; req < requestsPerHandler; req++ {
+		routeRequest(handlerID, req, manager.Get())
+		time.Sleep(requestIntervalMs * time.Millisecond)
+	}
 }
 
 func main() {
@@ -134,41 +194,20 @@ func main() {
 		MaintenanceMsg: "",
 	})
 
+	watcher := NewConfigWatcher(manager, []ServiceConfig{
+		{RateLimit: 200, MaxConnections: 100, LogLevel: "info", MaintenanceMsg: ""},
+		{RateLimit: 200, MaxConnections: 100, LogLevel: "debug", MaintenanceMsg: "Deploying v2.1"},
+		{RateLimit: 500, MaxConnections: 200, LogLevel: "info", MaintenanceMsg: ""},
+	})
+
 	var wg sync.WaitGroup
 
-	// Config watcher: simulates detecting file changes and reloading
 	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		updates := []ServiceConfig{
-			{RateLimit: 200, MaxConnections: 100, LogLevel: "info", MaintenanceMsg: ""},
-			{RateLimit: 200, MaxConnections: 100, LogLevel: "debug", MaintenanceMsg: "Deploying v2.1"},
-			{RateLimit: 500, MaxConnections: 200, LogLevel: "info", MaintenanceMsg: ""},
-		}
-		for i, cfg := range updates {
-			time.Sleep(50 * time.Millisecond)
-			old := manager.Update(cfg)
-			fmt.Printf("[watcher] reload %d: rateLimit %d->%d, logLevel %s->%s\n",
-				i+1, old.RateLimit, cfg.RateLimit, old.LogLevel, cfg.LogLevel)
-		}
-	}()
+	go watcher.Run(&wg)
 
-	// Request handlers: load config on each request
-	for i := 0; i < 4; i++ {
+	for i := 0; i < handlerCount; i++ {
 		wg.Add(1)
-		go func(handlerID int) {
-			defer wg.Done()
-			for req := 0; req < 12; req++ {
-				cfg := manager.Get()
-				action := "200 OK"
-				if cfg.MaintenanceMsg != "" {
-					action = fmt.Sprintf("503 %s", cfg.MaintenanceMsg)
-				}
-				fmt.Printf("[handler %d req %02d] rateLimit=%d logLevel=%s -> %s\n",
-					handlerID, req, cfg.RateLimit, cfg.LogLevel, action)
-				time.Sleep(20 * time.Millisecond)
-			}
-		}(i)
+		go runHandler(i, manager, &wg)
 	}
 
 	wg.Wait()
@@ -194,6 +233,8 @@ import (
 	"time"
 )
 
+const minReadTimeout = time.Millisecond
+
 type ServiceConfig struct {
 	ListenAddr     string
 	MaxConnections int
@@ -201,35 +242,41 @@ type ServiceConfig struct {
 	ReadTimeout    time.Duration
 }
 
-type ConfigManager struct {
+func (c ServiceConfig) Validate() error {
+	if c.MaxConnections < 1 {
+		return fmt.Errorf("MaxConnections must be positive, got %d", c.MaxConnections)
+	}
+	if c.RateLimit < 1 {
+		return fmt.Errorf("RateLimit must be positive, got %d", c.RateLimit)
+	}
+	if c.ReadTimeout < minReadTimeout {
+		return fmt.Errorf("ReadTimeout too small: %v", c.ReadTimeout)
+	}
+	if c.ListenAddr == "" {
+		return fmt.Errorf("ListenAddr cannot be empty")
+	}
+	return nil
+}
+
+type ValidatingConfigManager struct {
 	current atomic.Value
 	version int
 }
 
-func NewConfigManager(initial ServiceConfig) *ConfigManager {
-	cm := &ConfigManager{version: 1}
+func NewValidatingConfigManager(initial ServiceConfig) *ValidatingConfigManager {
+	cm := &ValidatingConfigManager{version: 1}
 	cm.current.Store(initial)
 	return cm
 }
 
-func (cm *ConfigManager) Get() ServiceConfig {
+func (cm *ValidatingConfigManager) Get() ServiceConfig {
 	return cm.current.Load().(ServiceConfig)
 }
 
-func (cm *ConfigManager) Reload(cfg ServiceConfig) error {
-	if cfg.MaxConnections < 1 {
-		return fmt.Errorf("MaxConnections must be positive, got %d", cfg.MaxConnections)
+func (cm *ValidatingConfigManager) Reload(cfg ServiceConfig) error {
+	if err := cfg.Validate(); err != nil {
+		return err
 	}
-	if cfg.RateLimit < 1 {
-		return fmt.Errorf("RateLimit must be positive, got %d", cfg.RateLimit)
-	}
-	if cfg.ReadTimeout < time.Millisecond {
-		return fmt.Errorf("ReadTimeout too small: %v", cfg.ReadTimeout)
-	}
-	if cfg.ListenAddr == "" {
-		return fmt.Errorf("ListenAddr cannot be empty")
-	}
-
 	cm.version++
 	cm.current.Store(cfg)
 	fmt.Printf("[config] v%d loaded: listen=%s maxConns=%d rateLimit=%d\n",
@@ -237,8 +284,15 @@ func (cm *ConfigManager) Reload(cfg ServiceConfig) error {
 	return nil
 }
 
+func tryReload(mgr *ValidatingConfigManager, cfg ServiceConfig, label string) {
+	err := mgr.Reload(cfg)
+	fmt.Printf("%s error: %v\n", label, err)
+	current := mgr.Get()
+	fmt.Printf("Current: listen=%s maxConns=%d\n\n", current.ListenAddr, current.MaxConnections)
+}
+
 func main() {
-	mgr := NewConfigManager(ServiceConfig{
+	mgr := NewValidatingConfigManager(ServiceConfig{
 		ListenAddr:     ":8080",
 		MaxConnections: 100,
 		RateLimit:      200,
@@ -247,37 +301,26 @@ func main() {
 
 	fmt.Printf("Initial: %+v\n\n", mgr.Get())
 
-	// Valid reload
-	err := mgr.Reload(ServiceConfig{
+	tryReload(mgr, ServiceConfig{
 		ListenAddr:     ":9090",
 		MaxConnections: 500,
 		RateLimit:      1000,
 		ReadTimeout:    3 * time.Second,
-	})
-	fmt.Printf("Valid reload error: %v\n", err)
-	fmt.Printf("Current: listen=%s maxConns=%d\n\n", mgr.Get().ListenAddr, mgr.Get().MaxConnections)
+	}, "Valid reload")
 
-	// Invalid reload -- rejected, previous config preserved
-	err = mgr.Reload(ServiceConfig{
+	tryReload(mgr, ServiceConfig{
 		ListenAddr:     ":9090",
 		MaxConnections: -1,
 		RateLimit:      1000,
 		ReadTimeout:    3 * time.Second,
-	})
-	fmt.Printf("Invalid reload error: %v\n", err)
-	fmt.Printf("Unchanged: listen=%s maxConns=%d\n\n",
-		mgr.Get().ListenAddr, mgr.Get().MaxConnections)
+	}, "Invalid reload (negative maxConns)")
 
-	// Another invalid reload
-	err = mgr.Reload(ServiceConfig{
+	tryReload(mgr, ServiceConfig{
 		ListenAddr:     "",
 		MaxConnections: 100,
 		RateLimit:      500,
 		ReadTimeout:    3 * time.Second,
-	})
-	fmt.Printf("Invalid reload error: %v\n", err)
-	fmt.Printf("Still unchanged: listen=%s maxConns=%d\n",
-		mgr.Get().ListenAddr, mgr.Get().MaxConnections)
+	}, "Invalid reload (empty addr)")
 }
 ```
 
@@ -301,6 +344,15 @@ import (
 	"time"
 )
 
+const (
+	handlerCount       = 3
+	requestsPerHandler = 10
+	watchIntervalMs    = 40
+	requestIntervalMs  = 15
+)
+
+type ChangeListener func(old, updated AppConfig)
+
 type AppConfig struct {
 	Version       int
 	DatabasePool  int
@@ -316,34 +368,60 @@ func (c AppConfig) String() string {
 		c.CacheTTL, c.RateLimitRPS, c.AllowedOrigin)
 }
 
-type HotConfig struct {
-	config  atomic.Value
-	onChange []func(old, new AppConfig)
+type HotConfigReloader struct {
+	config    atomic.Value
+	listeners []ChangeListener
 }
 
-func NewHotConfig(initial AppConfig) *HotConfig {
-	hc := &HotConfig{}
+func NewHotConfigReloader(initial AppConfig) *HotConfigReloader {
+	hc := &HotConfigReloader{}
 	hc.config.Store(initial)
 	return hc
 }
 
-func (hc *HotConfig) Get() AppConfig {
+func (hc *HotConfigReloader) Get() AppConfig {
 	return hc.config.Load().(AppConfig)
 }
 
-func (hc *HotConfig) OnChange(fn func(old, new AppConfig)) {
-	hc.onChange = append(hc.onChange, fn)
+func (hc *HotConfigReloader) OnChange(fn ChangeListener) {
+	hc.listeners = append(hc.listeners, fn)
 }
 
-func (hc *HotConfig) Swap(newCfg AppConfig) {
+func (hc *HotConfigReloader) Swap(newCfg AppConfig) {
 	old := hc.config.Swap(newCfg).(AppConfig)
-	for _, fn := range hc.onChange {
+	for _, fn := range hc.listeners {
 		fn(old, newCfg)
 	}
 }
 
+func logConfigChanges(old, updated AppConfig) {
+	fmt.Printf("[event] config changed: v%d -> v%d\n", old.Version, updated.Version)
+	if old.DatabasePool != updated.DatabasePool {
+		fmt.Printf("[event]   pool size: %d -> %d\n", old.DatabasePool, updated.DatabasePool)
+	}
+	if old.CacheEnabled != updated.CacheEnabled {
+		fmt.Printf("[event]   cache: %v -> %v\n", old.CacheEnabled, updated.CacheEnabled)
+	}
+}
+
+func runConfigWatcher(reloader *HotConfigReloader, revisions []AppConfig, wg *sync.WaitGroup) {
+	defer wg.Done()
+	for _, rev := range revisions {
+		time.Sleep(watchIntervalMs * time.Millisecond)
+		reloader.Swap(rev)
+	}
+}
+
+func runRequestHandler(handlerID int, reloader *HotConfigReloader, wg *sync.WaitGroup) {
+	defer wg.Done()
+	for req := 0; req < requestsPerHandler; req++ {
+		fmt.Printf("[handler %d req %02d] %s\n", handlerID, req, reloader.Get())
+		time.Sleep(requestIntervalMs * time.Millisecond)
+	}
+}
+
 func main() {
-	cfg := NewHotConfig(AppConfig{
+	reloader := NewHotConfigReloader(AppConfig{
 		Version:       1,
 		DatabasePool:  10,
 		CacheEnabled:  false,
@@ -352,51 +430,29 @@ func main() {
 		AllowedOrigin: "https://app.example.com",
 	})
 
-	cfg.OnChange(func(old, new AppConfig) {
-		fmt.Printf("[event] config changed: v%d -> v%d\n", old.Version, new.Version)
-		if old.DatabasePool != new.DatabasePool {
-			fmt.Printf("[event]   pool size: %d -> %d\n", old.DatabasePool, new.DatabasePool)
-		}
-		if old.CacheEnabled != new.CacheEnabled {
-			fmt.Printf("[event]   cache: %v -> %v\n", old.CacheEnabled, new.CacheEnabled)
-		}
-	})
+	reloader.OnChange(logConfigChanges)
+
+	revisions := []AppConfig{
+		{Version: 2, DatabasePool: 20, CacheEnabled: true, CacheTTL: 5 * time.Minute,
+			RateLimitRPS: 100, AllowedOrigin: "https://app.example.com"},
+		{Version: 3, DatabasePool: 20, CacheEnabled: true, CacheTTL: 10 * time.Minute,
+			RateLimitRPS: 500, AllowedOrigin: "https://app.example.com"},
+		{Version: 4, DatabasePool: 50, CacheEnabled: true, CacheTTL: 10 * time.Minute,
+			RateLimitRPS: 500, AllowedOrigin: "https://v2.example.com"},
+	}
 
 	var wg sync.WaitGroup
 
-	// Config file watcher
 	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		revisions := []AppConfig{
-			{Version: 2, DatabasePool: 20, CacheEnabled: true, CacheTTL: 5 * time.Minute,
-				RateLimitRPS: 100, AllowedOrigin: "https://app.example.com"},
-			{Version: 3, DatabasePool: 20, CacheEnabled: true, CacheTTL: 10 * time.Minute,
-				RateLimitRPS: 500, AllowedOrigin: "https://app.example.com"},
-			{Version: 4, DatabasePool: 50, CacheEnabled: true, CacheTTL: 10 * time.Minute,
-				RateLimitRPS: 500, AllowedOrigin: "https://v2.example.com"},
-		}
-		for _, rev := range revisions {
-			time.Sleep(40 * time.Millisecond)
-			cfg.Swap(rev)
-		}
-	}()
+	go runConfigWatcher(reloader, revisions, &wg)
 
-	// Request handlers
-	for i := 0; i < 3; i++ {
+	for i := 0; i < handlerCount; i++ {
 		wg.Add(1)
-		go func(id int) {
-			defer wg.Done()
-			for req := 0; req < 10; req++ {
-				c := cfg.Get()
-				fmt.Printf("[handler %d req %02d] %s\n", id, req, c)
-				time.Sleep(15 * time.Millisecond)
-			}
-		}(i)
+		go runRequestHandler(i, reloader, &wg)
 	}
 
 	wg.Wait()
-	fmt.Printf("\n[final] %s\n", cfg.Get())
+	fmt.Printf("\n[final] %s\n", reloader.Get())
 }
 ```
 
@@ -432,12 +488,15 @@ type Config struct {
 	Host string
 }
 
-func main() {
+func storeAndMutate(v *atomic.Value) {
 	cfg := &Config{Port: 8080, Host: "localhost"}
-	var v atomic.Value
 	v.Store(cfg)
-
 	cfg.Port = 9090 // BUG: mutates the stored value -- data race!
+}
+
+func main() {
+	var v atomic.Value
+	storeAndMutate(&v)
 	fmt.Println(v.Load().(*Config).Port) // readers may see 8080 or 9090
 }
 ```
@@ -457,10 +516,14 @@ package main
 
 import "sync/atomic"
 
-func main() {
-	var v atomic.Value
+func storeInconsistentTypes(v *atomic.Value) {
 	v.Store("hello")
 	v.Store(42) // PANIC: store of inconsistently typed value
+}
+
+func main() {
+	var v atomic.Value
+	storeInconsistentTypes(&v)
 }
 ```
 
@@ -476,10 +539,14 @@ import "sync/atomic"
 
 type Config struct{ Port int }
 
+func loadBeforeStore(v *atomic.Value) Config {
+	cfg := v.Load()    // returns nil -- no value stored yet
+	return cfg.(Config) // PANIC: type assertion on nil
+}
+
 func main() {
 	var config atomic.Value
-	cfg := config.Load()   // returns nil -- no value stored yet
-	_ = cfg.(Config)       // PANIC: type assertion on nil
+	_ = loadBeforeStore(&config)
 }
 ```
 
@@ -498,9 +565,13 @@ package main
 
 import "sync/atomic"
 
+func storeNilValue(v *atomic.Value) {
+	v.Store(nil) // PANIC: store of nil value
+}
+
 func main() {
 	var v atomic.Value
-	v.Store(nil) // PANIC: store of nil value
+	storeNilValue(&v)
 }
 ```
 

@@ -51,6 +51,9 @@ import (
 	"time"
 )
 
+const thumbnailScaleFactor = 4
+
+// ImageJob represents an image resize request.
 type ImageJob struct {
 	ID       int
 	Filename string
@@ -58,6 +61,7 @@ type ImageJob struct {
 	Height   int
 }
 
+// ThumbnailResult holds the outcome of processing a single image.
 type ThumbnailResult struct {
 	Job      ImageJob
 	Output   string
@@ -66,41 +70,48 @@ type ThumbnailResult struct {
 	Error    error
 }
 
-func thumbnailWorker(id int, jobs <-chan ImageJob, results chan<- ThumbnailResult) {
+// ThumbnailPool manages a pool of thumbnail workers.
+type ThumbnailPool struct {
+	numWorkers int
+}
+
+func NewThumbnailPool(numWorkers int) *ThumbnailPool {
+	return &ThumbnailPool{numWorkers: numWorkers}
+}
+
+func generateOutputName(job ImageJob) string {
+	return fmt.Sprintf("thumb_%dx%d_%s",
+		job.Width/thumbnailScaleFactor,
+		job.Height/thumbnailScaleFactor,
+		job.Filename)
+}
+
+func (tp *ThumbnailPool) worker(id int, jobs <-chan ImageJob, results chan<- ThumbnailResult) {
 	for job := range jobs {
 		start := time.Now()
-
-		// Simulate CPU-intensive resize (varies by image size)
 		workTime := time.Duration(50+rand.Intn(100)) * time.Millisecond
 		time.Sleep(workTime)
 
-		output := fmt.Sprintf("thumb_%dx%d_%s", job.Width/4, job.Height/4, job.Filename)
-
 		results <- ThumbnailResult{
 			Job:      job,
-			Output:   output,
+			Output:   generateOutputName(job),
 			Duration: time.Since(start),
 			WorkerID: id,
 		}
 	}
 }
 
-func main() {
-	jobs := make(chan ImageJob, 3)
-	results := make(chan ThumbnailResult, 3)
+func (tp *ThumbnailPool) ProcessImages(images []ImageJob) []ThumbnailResult {
+	jobs := make(chan ImageJob, len(images))
+	results := make(chan ThumbnailResult, len(images))
 
 	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		thumbnailWorker(1, jobs, results)
-	}()
-
-	// Submit 3 jobs to a single worker
-	images := []ImageJob{
-		{ID: 1, Filename: "vacation.jpg", Width: 4000, Height: 3000},
-		{ID: 2, Filename: "profile.png", Width: 2000, Height: 2000},
-		{ID: 3, Filename: "banner.jpg", Width: 6000, Height: 2000},
+	for w := 1; w <= tp.numWorkers; w++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			tp.worker(id, jobs, results)
+		}(w)
 	}
 
 	for _, img := range images {
@@ -111,8 +122,25 @@ func main() {
 	wg.Wait()
 	close(results)
 
-	fmt.Println("=== Single Worker Test ===")
+	var collected []ThumbnailResult
 	for r := range results {
+		collected = append(collected, r)
+	}
+	return collected
+}
+
+func main() {
+	images := []ImageJob{
+		{ID: 1, Filename: "vacation.jpg", Width: 4000, Height: 3000},
+		{ID: 2, Filename: "profile.png", Width: 2000, Height: 2000},
+		{ID: 3, Filename: "banner.jpg", Width: 6000, Height: 2000},
+	}
+
+	pool := NewThumbnailPool(1)
+	results := pool.ProcessImages(images)
+
+	fmt.Println("=== Single Worker Test ===")
+	for _, r := range results {
 		fmt.Printf("  %s -> %s (%v)\n", r.Job.Filename, r.Output, r.Duration)
 	}
 }
@@ -146,6 +174,13 @@ import (
 	"time"
 )
 
+const (
+	poolWorkerCount    = 4
+	poolImageCount     = 12
+	thumbnailScaleFactor = 4
+)
+
+// ImageJob represents an image resize request.
 type ImageJob struct {
 	ID       int
 	Filename string
@@ -153,6 +188,7 @@ type ImageJob struct {
 	Height   int
 }
 
+// ThumbnailResult holds the outcome of processing a single image.
 type ThumbnailResult struct {
 	Job      ImageJob
 	Output   string
@@ -160,29 +196,43 @@ type ThumbnailResult struct {
 	WorkerID int
 }
 
-func thumbnailWorker(id int, jobs <-chan ImageJob, results chan<- ThumbnailResult) {
+// ThumbnailPool manages a fixed set of thumbnail workers.
+type ThumbnailPool struct {
+	numWorkers int
+}
+
+func NewThumbnailPool(numWorkers int) *ThumbnailPool {
+	return &ThumbnailPool{numWorkers: numWorkers}
+}
+
+func generateOutputName(job ImageJob) string {
+	return fmt.Sprintf("thumb_%dx%d_%s",
+		job.Width/thumbnailScaleFactor,
+		job.Height/thumbnailScaleFactor,
+		job.Filename)
+}
+
+func (tp *ThumbnailPool) worker(id int, jobs <-chan ImageJob, results chan<- ThumbnailResult) {
 	for job := range jobs {
 		start := time.Now()
-		workTime := time.Duration(50+rand.Intn(100)) * time.Millisecond
-		time.Sleep(workTime)
-		output := fmt.Sprintf("thumb_%dx%d_%s", job.Width/4, job.Height/4, job.Filename)
+		time.Sleep(time.Duration(50+rand.Intn(100)) * time.Millisecond)
 		results <- ThumbnailResult{
-			Job: job, Output: output,
+			Job: job, Output: generateOutputName(job),
 			Duration: time.Since(start), WorkerID: id,
 		}
 	}
 }
 
-func runPool(numWorkers int, images []ImageJob) {
+func (tp *ThumbnailPool) Run(images []ImageJob) {
 	jobs := make(chan ImageJob, len(images))
 	results := make(chan ThumbnailResult, len(images))
 
 	var wg sync.WaitGroup
-	for w := 1; w <= numWorkers; w++ {
+	for w := 1; w <= tp.numWorkers; w++ {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			thumbnailWorker(id, jobs, results)
+			tp.worker(id, jobs, results)
 		}(w)
 	}
 
@@ -202,8 +252,8 @@ func runPool(numWorkers int, images []ImageJob) {
 	}
 }
 
-func main() {
-	images := make([]ImageJob, 12)
+func buildTestImages(count int) []ImageJob {
+	images := make([]ImageJob, count)
 	for i := range images {
 		images[i] = ImageJob{
 			ID:       i + 1,
@@ -212,10 +262,18 @@ func main() {
 			Height:   1500 + rand.Intn(3000),
 		}
 	}
+	return images
+}
 
-	fmt.Println("=== Thumbnail Pool (4 workers, 12 images) ===")
+func main() {
+	images := buildTestImages(poolImageCount)
+
+	fmt.Printf("=== Thumbnail Pool (%d workers, %d images) ===\n", poolWorkerCount, poolImageCount)
 	start := time.Now()
-	runPool(4, images)
+
+	pool := NewThumbnailPool(poolWorkerCount)
+	pool.Run(images)
+
 	fmt.Printf("  Completed in %v\n", time.Since(start))
 }
 ```
@@ -247,6 +305,9 @@ import (
 	"time"
 )
 
+const benchmarkImageCount = 24
+
+// ImageJob represents an image resize request.
 type ImageJob struct {
 	ID       int
 	Filename string
@@ -254,13 +315,27 @@ type ImageJob struct {
 	Height   int
 }
 
+// ThumbnailResult holds the outcome of processing a single image.
 type ThumbnailResult struct {
 	Job      ImageJob
 	Duration time.Duration
 	WorkerID int
 }
 
-func thumbnailWorker(id int, jobs <-chan ImageJob, results chan<- ThumbnailResult) {
+// PoolBenchmark measures throughput at different pool sizes.
+type PoolBenchmark struct {
+	imageCount int
+	poolSizes  []int
+}
+
+func NewPoolBenchmark(poolSizes []int) *PoolBenchmark {
+	return &PoolBenchmark{
+		imageCount: benchmarkImageCount,
+		poolSizes:  poolSizes,
+	}
+}
+
+func (pb *PoolBenchmark) worker(id int, jobs <-chan ImageJob, results chan<- ThumbnailResult) {
 	for job := range jobs {
 		start := time.Now()
 		time.Sleep(time.Duration(50+rand.Intn(100)) * time.Millisecond)
@@ -268,55 +343,65 @@ func thumbnailWorker(id int, jobs <-chan ImageJob, results chan<- ThumbnailResul
 	}
 }
 
-func main() {
-	numImages := 24
-
-	fmt.Println("=== Pool Size vs Throughput ===")
-	fmt.Printf("  Processing %d images\n\n", numImages)
-
-	for _, poolSize := range []int{1, 2, 4, 8, 12, 24} {
-		images := make([]ImageJob, numImages)
-		for i := range images {
-			images[i] = ImageJob{
-				ID: i + 1, Filename: fmt.Sprintf("img_%02d.jpg", i+1),
-				Width: 3000, Height: 2000,
-			}
+func (pb *PoolBenchmark) buildImages() []ImageJob {
+	images := make([]ImageJob, pb.imageCount)
+	for i := range images {
+		images[i] = ImageJob{
+			ID: i + 1, Filename: fmt.Sprintf("img_%02d.jpg", i+1),
+			Width: 3000, Height: 2000,
 		}
-
-		start := time.Now()
-		jobs := make(chan ImageJob, numImages)
-		results := make(chan ThumbnailResult, numImages)
-
-		var wg sync.WaitGroup
-		for w := 0; w < poolSize; w++ {
-			wg.Add(1)
-			go func(id int) {
-				defer wg.Done()
-				thumbnailWorker(id, jobs, results)
-			}(w)
-		}
-
-		for _, img := range images {
-			jobs <- img
-		}
-		close(jobs)
-
-		go func() {
-			wg.Wait()
-			close(results)
-		}()
-
-		var totalWork time.Duration
-		workerCounts := make(map[int]int)
-		for r := range results {
-			totalWork += r.Duration
-			workerCounts[r.WorkerID]++
-		}
-
-		elapsed := time.Since(start)
-		fmt.Printf("  %2d workers: %v (total CPU work: %v, efficiency: %.0f%%)\n",
-			poolSize, elapsed, totalWork, float64(totalWork)/float64(elapsed*time.Duration(poolSize))*100)
 	}
+	return images
+}
+
+func (pb *PoolBenchmark) measurePoolSize(poolSize int, images []ImageJob) (time.Duration, time.Duration) {
+	start := time.Now()
+	jobs := make(chan ImageJob, len(images))
+	results := make(chan ThumbnailResult, len(images))
+
+	var wg sync.WaitGroup
+	for w := 0; w < poolSize; w++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			pb.worker(id, jobs, results)
+		}(w)
+	}
+
+	for _, img := range images {
+		jobs <- img
+	}
+	close(jobs)
+
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	var totalWork time.Duration
+	for r := range results {
+		totalWork += r.Duration
+	}
+
+	return time.Since(start), totalWork
+}
+
+func (pb *PoolBenchmark) Run() {
+	fmt.Println("=== Pool Size vs Throughput ===")
+	fmt.Printf("  Processing %d images\n\n", pb.imageCount)
+
+	for _, poolSize := range pb.poolSizes {
+		images := pb.buildImages()
+		elapsed, totalWork := pb.measurePoolSize(poolSize, images)
+		efficiency := float64(totalWork) / float64(elapsed*time.Duration(poolSize)) * 100
+		fmt.Printf("  %2d workers: %v (total CPU work: %v, efficiency: %.0f%%)\n",
+			poolSize, elapsed, totalWork, efficiency)
+	}
+}
+
+func main() {
+	benchmark := NewPoolBenchmark([]int{1, 2, 4, 8, 12, 24})
+	benchmark.Run()
 }
 ```
 
@@ -351,12 +436,35 @@ import (
 	"time"
 )
 
+const (
+	backpressureWorkers   = 2
+	backpressureBuffer    = 1
+	backpressureJobCount  = 8
+	backpressureThreshold = 5 * time.Millisecond
+)
+
+// ImageJob represents an image resize request.
 type ImageJob struct {
 	ID       int
 	Filename string
 }
 
-func thumbnailWorker(id int, jobs <-chan ImageJob, wg *sync.WaitGroup) {
+// BackpressureDemo shows how a tiny buffer causes the producer to block.
+type BackpressureDemo struct {
+	numWorkers int
+	bufferSize int
+	jobCount   int
+}
+
+func NewBackpressureDemo() *BackpressureDemo {
+	return &BackpressureDemo{
+		numWorkers: backpressureWorkers,
+		bufferSize: backpressureBuffer,
+		jobCount:   backpressureJobCount,
+	}
+}
+
+func (bd *BackpressureDemo) worker(id int, jobs <-chan ImageJob, wg *sync.WaitGroup) {
 	defer wg.Done()
 	for job := range jobs {
 		fmt.Printf("  [worker %d] processing %s\n", id, job.Filename)
@@ -365,31 +473,40 @@ func thumbnailWorker(id int, jobs <-chan ImageJob, wg *sync.WaitGroup) {
 	}
 }
 
-func main() {
-	fmt.Println("=== Backpressure Demo (2 workers, buffer=1) ===")
-	fmt.Println("  Producer blocks when both workers are busy and buffer is full")
-	fmt.Println()
-
-	jobs := make(chan ImageJob, 1) // tiny buffer
-	var wg sync.WaitGroup
-
-	for w := 1; w <= 2; w++ {
-		wg.Add(1)
-		go thumbnailWorker(w, jobs, &wg)
-	}
-
-	for i := 1; i <= 8; i++ {
+func (bd *BackpressureDemo) submitJobs(jobs chan<- ImageJob) {
+	for i := 1; i <= bd.jobCount; i++ {
 		job := ImageJob{ID: i, Filename: fmt.Sprintf("upload_%02d.jpg", i)}
 		fmt.Printf("  [producer] submitting %s...\n", job.Filename)
 		submitStart := time.Now()
 		jobs <- job
-		if wait := time.Since(submitStart); wait > 5*time.Millisecond {
+		if wait := time.Since(submitStart); wait > backpressureThreshold {
 			fmt.Printf("  [producer] blocked for %v (backpressure!)\n", wait)
 		}
 	}
 	close(jobs)
+}
+
+func (bd *BackpressureDemo) Run() {
+	fmt.Printf("=== Backpressure Demo (%d workers, buffer=%d) ===\n", bd.numWorkers, bd.bufferSize)
+	fmt.Println("  Producer blocks when both workers are busy and buffer is full")
+	fmt.Println()
+
+	jobs := make(chan ImageJob, bd.bufferSize)
+	var wg sync.WaitGroup
+
+	for w := 1; w <= bd.numWorkers; w++ {
+		wg.Add(1)
+		go bd.worker(w, jobs, &wg)
+	}
+
+	bd.submitJobs(jobs)
 	wg.Wait()
 	fmt.Println("\n  All images processed")
+}
+
+func main() {
+	demo := NewBackpressureDemo()
+	demo.Run()
 }
 ```
 

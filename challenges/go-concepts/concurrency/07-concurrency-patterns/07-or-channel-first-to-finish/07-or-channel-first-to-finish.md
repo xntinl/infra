@@ -47,38 +47,57 @@ import (
 	"time"
 )
 
+const slowReplicaProbability = 0.3
+
+// QueryResult holds the response from a database replica.
 type QueryResult struct {
 	Data    string
 	Replica string
 	Latency time.Duration
 }
 
+// ReplicaRacer sends the same query to multiple replicas and takes the fastest.
+type ReplicaRacer struct {
+	replicas []string
+}
+
+func NewReplicaRacer(replicas []string) *ReplicaRacer {
+	return &ReplicaRacer{replicas: replicas}
+}
+
+func simulateReplicaLatency() time.Duration {
+	latency := time.Duration(5+rand.Intn(15)) * time.Millisecond
+	if rand.Float64() < slowReplicaProbability {
+		latency = time.Duration(200+rand.Intn(300)) * time.Millisecond
+	}
+	return latency
+}
+
+func (rr *ReplicaRacer) queryReplica(name string, ch chan<- QueryResult) {
+	latency := simulateReplicaLatency()
+	time.Sleep(latency)
+	ch <- QueryResult{
+		Data:    "user_profile{name:alice,id:42}",
+		Replica: name,
+		Latency: latency,
+	}
+}
+
+func (rr *ReplicaRacer) RaceQuery() QueryResult {
+	ch := make(chan QueryResult, len(rr.replicas))
+	for _, replica := range rr.replicas {
+		go rr.queryReplica(replica, ch)
+	}
+	return <-ch
+}
+
 func main() {
 	fmt.Println("=== Database Replica Race ===")
 	fmt.Println()
 
-	replicas := []string{"us-east-1", "us-west-2", "eu-west-1"}
-	ch := make(chan QueryResult, len(replicas))
+	racer := NewReplicaRacer([]string{"us-east-1", "us-west-2", "eu-west-1"})
+	winner := racer.RaceQuery()
 
-	for _, replica := range replicas {
-		go func(name string) {
-			// Simulate variable latency: usually fast, occasionally slow (GC pause)
-			latency := time.Duration(5+rand.Intn(15)) * time.Millisecond
-			if rand.Float64() < 0.3 { // 30% chance of slow response
-				latency = time.Duration(200+rand.Intn(300)) * time.Millisecond
-			}
-
-			time.Sleep(latency)
-			ch <- QueryResult{
-				Data:    fmt.Sprintf("user_profile{name:alice,id:42}"),
-				Replica: name,
-				Latency: latency,
-			}
-		}(replica)
-	}
-
-	// Take the first response
-	winner := <-ch
 	fmt.Printf("  Winner: %s responded in %v\n", winner.Replica, winner.Latency)
 	fmt.Printf("  Data: %s\n", winner.Data)
 }
@@ -112,17 +131,37 @@ import (
 	"time"
 )
 
+const (
+	slowReplicaProbability = 0.3
+	cancelSettleDelay      = 20 * time.Millisecond
+)
+
+// QueryResult holds the response from a database replica.
 type QueryResult struct {
 	Data    string
 	Replica string
 	Latency time.Duration
 }
 
-func queryReplica(ctx context.Context, replica string) (QueryResult, error) {
+// ReplicaRacer sends the same query to multiple replicas, takes the fastest, and cancels the rest.
+type ReplicaRacer struct {
+	replicas []string
+}
+
+func NewReplicaRacer(replicas []string) *ReplicaRacer {
+	return &ReplicaRacer{replicas: replicas}
+}
+
+func simulateReplicaLatency() time.Duration {
 	latency := time.Duration(5+rand.Intn(15)) * time.Millisecond
-	if rand.Float64() < 0.3 {
+	if rand.Float64() < slowReplicaProbability {
 		latency = time.Duration(200+rand.Intn(300)) * time.Millisecond
 	}
+	return latency
+}
+
+func (rr *ReplicaRacer) queryWithContext(ctx context.Context, replica string) (QueryResult, error) {
+	latency := simulateReplicaLatency()
 
 	select {
 	case <-time.After(latency):
@@ -132,25 +171,20 @@ func queryReplica(ctx context.Context, replica string) (QueryResult, error) {
 			Latency: latency,
 		}, nil
 	case <-ctx.Done():
-		fmt.Printf("  [%s] canceled after %v (was going to take %v)\n",
-			replica, time.Since(time.Now()), latency)
+		fmt.Printf("  [%s] canceled (was going to take %v)\n", replica, latency)
 		return QueryResult{}, ctx.Err()
 	}
 }
 
-func main() {
-	fmt.Println("=== Replica Race with Cancellation ===")
-	fmt.Println()
-
-	replicas := []string{"us-east-1", "us-west-2", "eu-west-1"}
+func (rr *ReplicaRacer) RaceWithCancellation() QueryResult {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	ch := make(chan QueryResult, 1)
 
-	for _, replica := range replicas {
+	for _, replica := range rr.replicas {
 		go func(name string) {
-			result, err := queryReplica(ctx, name)
+			result, err := rr.queryWithContext(ctx, name)
 			if err != nil {
 				return
 			}
@@ -162,11 +196,21 @@ func main() {
 	}
 
 	winner := <-ch
-	cancel() // cancel all remaining replicas
+	cancel()
+	return winner
+}
+
+func main() {
+	fmt.Println("=== Replica Race with Cancellation ===")
+	fmt.Println()
+
+	racer := NewReplicaRacer([]string{"us-east-1", "us-west-2", "eu-west-1"})
+	winner := racer.RaceWithCancellation()
+
 	fmt.Printf("  Winner: %s in %v\n", winner.Replica, winner.Latency)
 	fmt.Printf("  Data: %s\n\n", winner.Data)
 
-	time.Sleep(20 * time.Millisecond) // let cancel messages print
+	time.Sleep(cancelSettleDelay)
 	fmt.Println("  Losing replicas were canceled and their goroutines exited cleanly.")
 }
 ```
@@ -203,9 +247,28 @@ import (
 	"time"
 )
 
-func queryWithLatency(ctx context.Context) time.Duration {
+const (
+	benchmarkIterations    = 100
+	replicaCount           = 3
+	slowQueryProbability   = 0.2
+)
+
+// LatencyBenchmark measures tail latency with and without replica racing.
+type LatencyBenchmark struct {
+	iterations   int
+	replicaCount int
+}
+
+func NewLatencyBenchmark() *LatencyBenchmark {
+	return &LatencyBenchmark{
+		iterations:   benchmarkIterations,
+		replicaCount: replicaCount,
+	}
+}
+
+func simulateQuery(ctx context.Context) time.Duration {
 	latency := time.Duration(5+rand.Intn(15)) * time.Millisecond
-	if rand.Float64() < 0.2 {
+	if rand.Float64() < slowQueryProbability {
 		latency = time.Duration(200+rand.Intn(300)) * time.Millisecond
 	}
 	select {
@@ -225,49 +288,56 @@ func percentile(latencies []time.Duration, p float64) time.Duration {
 	return latencies[idx]
 }
 
-func main() {
-	const iterations = 100
-
-	// Single replica: take whatever latency you get
-	fmt.Println("=== Tail Latency Comparison (100 queries) ===")
-	fmt.Println()
-	singleLatencies := make([]time.Duration, iterations)
-	for i := 0; i < iterations; i++ {
-		ctx := context.Background()
-		singleLatencies[i] = queryWithLatency(ctx)
+func (lb *LatencyBenchmark) measureSingleReplica() []time.Duration {
+	latencies := make([]time.Duration, lb.iterations)
+	for i := 0; i < lb.iterations; i++ {
+		latencies[i] = simulateQuery(context.Background())
 	}
+	return latencies
+}
 
-	// Three replicas: race and take the fastest
-	racedLatencies := make([]time.Duration, iterations)
-	for i := 0; i < iterations; i++ {
+func (lb *LatencyBenchmark) measureRacedReplicas() []time.Duration {
+	latencies := make([]time.Duration, lb.iterations)
+	for i := 0; i < lb.iterations; i++ {
 		ctx, cancel := context.WithCancel(context.Background())
-		ch := make(chan time.Duration, 3)
-		for r := 0; r < 3; r++ {
+		ch := make(chan time.Duration, lb.replicaCount)
+		for r := 0; r < lb.replicaCount; r++ {
 			go func() {
-				lat := queryWithLatency(ctx)
-				if lat > 0 {
+				if lat := simulateQuery(ctx); lat > 0 {
 					ch <- lat
 				}
 			}()
 		}
-		racedLatencies[i] = <-ch
+		latencies[i] = <-ch
 		cancel()
 	}
+	return latencies
+}
 
-	fmt.Println("  Single replica:")
-	fmt.Printf("    p50:  %v\n", percentile(singleLatencies, 0.50))
-	fmt.Printf("    p90:  %v\n", percentile(singleLatencies, 0.90))
-	fmt.Printf("    p99:  %v\n", percentile(singleLatencies, 0.99))
-	fmt.Printf("    max:  %v\n\n", percentile(singleLatencies, 1.0))
+func printLatencyStats(label string, latencies []time.Duration) {
+	fmt.Printf("  %s:\n", label)
+	fmt.Printf("    p50:  %v\n", percentile(latencies, 0.50))
+	fmt.Printf("    p90:  %v\n", percentile(latencies, 0.90))
+	fmt.Printf("    p99:  %v\n", percentile(latencies, 0.99))
+	fmt.Printf("    max:  %v\n\n", percentile(latencies, 1.0))
+}
 
-	fmt.Println("  Three replicas (raced):")
-	fmt.Printf("    p50:  %v\n", percentile(racedLatencies, 0.50))
-	fmt.Printf("    p90:  %v\n", percentile(racedLatencies, 0.90))
-	fmt.Printf("    p99:  %v\n", percentile(racedLatencies, 0.99))
-	fmt.Printf("    max:  %v\n\n", percentile(racedLatencies, 1.0))
+func (lb *LatencyBenchmark) Run() {
+	fmt.Printf("=== Tail Latency Comparison (%d queries) ===\n\n", lb.iterations)
+
+	singleLatencies := lb.measureSingleReplica()
+	racedLatencies := lb.measureRacedReplicas()
+
+	printLatencyStats("Single replica", singleLatencies)
+	printLatencyStats("Three replicas (raced)", racedLatencies)
 
 	fmt.Println("  Racing replicas dramatically reduces tail latency (p90, p99).")
 	fmt.Println("  The cost is 3x the queries, but user-facing latency improves significantly.")
+}
+
+func main() {
+	benchmark := NewLatencyBenchmark()
+	benchmark.Run()
 }
 ```
 
@@ -307,7 +377,14 @@ import (
 	"time"
 )
 
-func or(channels ...<-chan struct{}) <-chan struct{} {
+// ReplicaSignal represents a replica with a known response time.
+type ReplicaSignal struct {
+	Name    string
+	Latency time.Duration
+}
+
+// orChannel combines multiple signal channels; closes when any input closes.
+func orChannel(channels ...<-chan struct{}) <-chan struct{} {
 	switch len(channels) {
 	case 0:
 		return nil
@@ -329,19 +406,19 @@ func or(channels ...<-chan struct{}) <-chan struct{} {
 			case <-channels[0]:
 			case <-channels[1]:
 			case <-channels[2]:
-			case <-or(append(channels[3:], orDone)...):
+			case <-orChannel(append(channels[3:], orDone)...):
 			}
 		}
 	}()
 	return orDone
 }
 
-func replicaSignal(replica string, latency time.Duration) <-chan struct{} {
+func makeReplicaSignal(rs ReplicaSignal) <-chan struct{} {
 	ch := make(chan struct{})
 	go func() {
 		defer close(ch)
-		time.Sleep(latency)
-		fmt.Printf("  [%s] responded in %v\n", replica, latency)
+		time.Sleep(rs.Latency)
+		fmt.Printf("  [%s] responded in %v\n", rs.Name, rs.Latency)
 	}()
 	return ch
 }
@@ -350,12 +427,19 @@ func main() {
 	fmt.Println("=== Or-Channel: First Replica Wins ===")
 	fmt.Println()
 
+	replicas := []ReplicaSignal{
+		{"us-east-1", 300 * time.Millisecond},
+		{"us-west-2", 50 * time.Millisecond},
+		{"eu-west-1", 150 * time.Millisecond},
+	}
+
+	signals := make([]<-chan struct{}, len(replicas))
+	for i, rs := range replicas {
+		signals[i] = makeReplicaSignal(rs)
+	}
+
 	start := time.Now()
-	<-or(
-		replicaSignal("us-east-1", 300*time.Millisecond),
-		replicaSignal("us-west-2", 50*time.Millisecond),  // fastest
-		replicaSignal("eu-west-1", 150*time.Millisecond),
-	)
+	<-orChannel(signals...)
 	fmt.Printf("\n  First response received after %v\n",
 		time.Since(start).Round(time.Millisecond))
 }

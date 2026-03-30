@@ -61,28 +61,38 @@ import (
 	"time"
 )
 
+const readerLatencyPerRecord = 20 * time.Millisecond
+
 type Record struct {
-	ID       int
-	Name     string
-	Email    string
-	Country  string
-	Amount   float64
+	ID      int
+	Name    string
+	Email   string
+	Country string
+	Amount  float64
 }
 
-func reader(ctx context.Context, records []Record, out chan<- Record) error {
+type PipelineReader struct {
+	records []Record
+}
+
+func NewPipelineReader(records []Record) *PipelineReader {
+	return &PipelineReader{records: records}
+}
+
+func (pr *PipelineReader) ReadAll(ctx context.Context, out chan<- Record) error {
 	defer close(out) // CRITICAL: signals workers that no more records are coming
 
-	for _, rec := range records {
+	for _, rec := range pr.records {
 		select {
 		case <-ctx.Done():
-			fmt.Printf("  [reader]  stopped: %v (sent %d/%d records)\n", ctx.Err(), rec.ID-1, len(records))
+			fmt.Printf("  [reader]  stopped: %v (sent %d/%d records)\n", ctx.Err(), rec.ID-1, len(pr.records))
 			return ctx.Err()
 		case out <- rec:
 			fmt.Printf("  [reader]  sent record %d (%s)\n", rec.ID, rec.Name)
-			time.Sleep(20 * time.Millisecond) // simulate reading from source
+			time.Sleep(readerLatencyPerRecord)
 		}
 	}
-	fmt.Printf("  [reader]  done: sent all %d records\n", len(records))
+	fmt.Printf("  [reader]  done: sent all %d records\n", len(pr.records))
 	return nil
 }
 ```
@@ -106,39 +116,47 @@ import (
 	"time"
 )
 
+const enrichmentLatency = 60 * time.Millisecond
+
 type EnrichedRecord struct {
 	Record
-	TaxRate    float64
+	TaxRate      float64
 	TotalWithTax float64
-	Region     string
-	Valid      bool
+	Region       string
+	Valid        bool
 }
 
-func workerPool(ctx context.Context, numWorkers int, in <-chan Record, out chan<- EnrichedRecord) error {
+type PipelineWorkerPool struct {
+	numWorkers int
+}
+
+func NewPipelineWorkerPool(numWorkers int) *PipelineWorkerPool {
+	return &PipelineWorkerPool{numWorkers: numWorkers}
+}
+
+func (wp *PipelineWorkerPool) Process(ctx context.Context, in <-chan Record, out chan<- EnrichedRecord) error {
 	var wg sync.WaitGroup
 	var once sync.Once
 	var firstErr error
 
-	sem := make(chan struct{}, numWorkers) // semaphore limits concurrent workers
+	sem := make(chan struct{}, wp.numWorkers)
 
 	for rec := range in {
 		rec := rec
 
-		// Check context before acquiring semaphore
 		select {
 		case <-ctx.Done():
-			// Drain remaining input to unblock the reader's send
 			go func() { for range in {} }()
 			wg.Wait()
 			close(out)
 			return ctx.Err()
-		case sem <- struct{}{}: // acquire worker slot
+		case sem <- struct{}{}:
 		}
 
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			defer func() { <-sem }() // release worker slot
+			defer func() { <-sem }()
 
 			select {
 			case <-ctx.Done():
@@ -146,7 +164,7 @@ func workerPool(ctx context.Context, numWorkers int, in <-chan Record, out chan<
 			default:
 			}
 
-			enriched, err := validateAndEnrich(rec)
+			enriched, err := wp.validateAndEnrich(rec)
 			if err != nil {
 				once.Do(func() {
 					firstErr = fmt.Errorf("worker: record %d: %w", rec.ID, err)
@@ -164,14 +182,13 @@ func workerPool(ctx context.Context, numWorkers int, in <-chan Record, out chan<
 		}()
 	}
 
-	// Wait for ALL workers to finish, THEN close the output channel
 	wg.Wait()
 	close(out) // SAFE: all workers are done -- no more sends
 	return firstErr
 }
 
-func validateAndEnrich(rec Record) (EnrichedRecord, error) {
-	time.Sleep(60 * time.Millisecond) // simulate enrichment API call
+func (wp *PipelineWorkerPool) validateAndEnrich(rec Record) (EnrichedRecord, error) {
+	time.Sleep(enrichmentLatency)
 
 	if rec.Amount <= 0 {
 		return EnrichedRecord{}, fmt.Errorf("invalid amount: $%.2f", rec.Amount)
@@ -180,18 +197,7 @@ func validateAndEnrich(rec Record) (EnrichedRecord, error) {
 		return EnrichedRecord{}, fmt.Errorf("missing email for %s", rec.Name)
 	}
 
-	var taxRate float64
-	var region string
-	switch rec.Country {
-	case "US":
-		taxRate, region = 0.08, "North America"
-	case "DE", "FR":
-		taxRate, region = 0.19, "Europe"
-	case "JP":
-		taxRate, region = 0.10, "Asia-Pacific"
-	default:
-		taxRate, region = 0.15, "International"
-	}
+	taxRate, region := wp.resolveTaxInfo(rec.Country)
 
 	return EnrichedRecord{
 		Record:       rec,
@@ -200,6 +206,19 @@ func validateAndEnrich(rec Record) (EnrichedRecord, error) {
 		Region:       region,
 		Valid:        true,
 	}, nil
+}
+
+func (wp *PipelineWorkerPool) resolveTaxInfo(country string) (float64, string) {
+	switch country {
+	case "US":
+		return 0.08, "North America"
+	case "DE", "FR":
+		return 0.19, "Europe"
+	case "JP":
+		return 0.10, "Asia-Pacific"
+	default:
+		return 0.15, "International"
+	}
 }
 ```
 
@@ -228,7 +247,17 @@ type PipelineStats struct {
 	Revenue   float64
 }
 
-func writer(ctx context.Context, in <-chan EnrichedRecord, mu *sync.Mutex, results *[]EnrichedRecord, stats *PipelineStats) error {
+type PipelineWriter struct {
+	mu      *sync.Mutex
+	results *[]EnrichedRecord
+	stats   *PipelineStats
+}
+
+func NewPipelineWriter(mu *sync.Mutex, results *[]EnrichedRecord, stats *PipelineStats) *PipelineWriter {
+	return &PipelineWriter{mu: mu, results: results, stats: stats}
+}
+
+func (pw *PipelineWriter) WriteAll(ctx context.Context, in <-chan EnrichedRecord) error {
 	for {
 		select {
 		case <-ctx.Done():
@@ -236,17 +265,21 @@ func writer(ctx context.Context, in <-chan EnrichedRecord, mu *sync.Mutex, resul
 		case rec, ok := <-in:
 			if !ok {
 				fmt.Printf("  [writer]  done: received all results\n")
-				return nil // channel closed -- all workers finished
+				return nil
 			}
-			mu.Lock()
-			*results = append(*results, rec)
-			stats.Processed++
-			stats.Revenue += rec.Amount
-			stats.TotalTax += rec.TotalWithTax - rec.Amount
-			mu.Unlock()
+			pw.collectResult(rec)
 			fmt.Printf("  [writer]  wrote record %d (%s, %s)\n", rec.ID, rec.Name, rec.Region)
 		}
 	}
+}
+
+func (pw *PipelineWriter) collectResult(rec EnrichedRecord) {
+	pw.mu.Lock()
+	defer pw.mu.Unlock()
+	*pw.results = append(*pw.results, rec)
+	pw.stats.Processed++
+	pw.stats.Revenue += rec.Amount
+	pw.stats.TotalTax += rec.TotalWithTax - rec.Amount
 }
 ```
 
@@ -264,6 +297,12 @@ import (
 	"fmt"
 	"sync"
 	"time"
+)
+
+const (
+	readerLatencyPerRecord = 20 * time.Millisecond
+	enrichmentLatency      = 60 * time.Millisecond
+	defaultWorkerCount     = 3
 )
 
 type Record struct {
@@ -288,35 +327,16 @@ type PipelineStats struct {
 	Revenue   float64
 }
 
-func main() {
-	records := []Record{
-		{1, "Alice Johnson", "alice@example.com", "US", 299.99},
-		{2, "Hans Mueller", "hans@example.de", "DE", 449.50},
-		{3, "Yuki Tanaka", "yuki@example.jp", "JP", 189.00},
-		{4, "Marie Dupont", "marie@example.fr", "FR", 520.00},
-		{5, "Bob Smith", "bob@example.com", "US", 75.00},
-		{6, "Chen Wei", "chen@example.cn", "CN", 330.00},
-		{7, "Sara Lopez", "sara@example.mx", "MX", 210.50},
-		{8, "James Brown", "james@example.com", "US", 155.00},
-	}
-
-	numWorkers := 3
-
-	fmt.Printf("=== Data Processing Pipeline (%d records, %d workers) ===\n\n", len(records), numWorkers)
-
-	fmt.Println("--- Scenario 1: All records valid ---")
-	results, stats, err := runPipeline(records, numWorkers)
-	printResults(results, stats, err)
-
-	fmt.Println("\n--- Scenario 2: Record 4 has invalid amount ---")
-	badRecords := make([]Record, len(records))
-	copy(badRecords, records)
-	badRecords[3].Amount = -50.00 // Marie's record is now invalid
-	results, stats, err = runPipeline(badRecords, numWorkers)
-	printResults(results, stats, err)
+type PipelineRunner struct {
+	records    []Record
+	numWorkers int
 }
 
-func runPipeline(records []Record, numWorkers int) ([]EnrichedRecord, PipelineStats, error) {
+func NewPipelineRunner(records []Record, numWorkers int) *PipelineRunner {
+	return &PipelineRunner{records: records, numWorkers: numWorkers}
+}
+
+func (pr *PipelineRunner) Run() ([]EnrichedRecord, PipelineStats, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -326,7 +346,6 @@ func runPipeline(records []Record, numWorkers int) ([]EnrichedRecord, PipelineSt
 	var results []EnrichedRecord
 	var stats PipelineStats
 
-	// Track errors from all stages
 	var pipelineWg sync.WaitGroup
 	var pipelineOnce sync.Once
 	var pipelineErr error
@@ -335,54 +354,51 @@ func runPipeline(records []Record, numWorkers int) ([]EnrichedRecord, PipelineSt
 		if err != nil {
 			pipelineOnce.Do(func() {
 				pipelineErr = err
-				cancel() // cancel ALL stages
+				cancel()
 			})
 		}
 	}
 
-	// Stage 1: Reader
 	pipelineWg.Add(1)
 	go func() {
 		defer pipelineWg.Done()
-		captureError(reader(ctx, records, recordsCh))
+		captureError(pr.readRecords(ctx, recordsCh))
 	}()
 
-	// Stage 2: Worker Pool
 	pipelineWg.Add(1)
 	go func() {
 		defer pipelineWg.Done()
-		captureError(workerPool(ctx, numWorkers, recordsCh, resultsCh))
+		captureError(pr.processRecords(ctx, recordsCh, resultsCh))
 	}()
 
-	// Stage 3: Writer
 	pipelineWg.Add(1)
 	go func() {
 		defer pipelineWg.Done()
-		captureError(writer(ctx, resultsCh, &mu, &results, &stats))
+		captureError(pr.writeResults(ctx, resultsCh, &mu, &results, &stats))
 	}()
 
 	pipelineWg.Wait()
 	return results, stats, pipelineErr
 }
 
-func reader(ctx context.Context, records []Record, out chan<- Record) error {
+func (pr *PipelineRunner) readRecords(ctx context.Context, out chan<- Record) error {
 	defer close(out)
-	for _, rec := range records {
+	for _, rec := range pr.records {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case out <- rec:
-			time.Sleep(20 * time.Millisecond)
+			time.Sleep(readerLatencyPerRecord)
 		}
 	}
 	return nil
 }
 
-func workerPool(ctx context.Context, numWorkers int, in <-chan Record, out chan<- EnrichedRecord) error {
+func (pr *PipelineRunner) processRecords(ctx context.Context, in <-chan Record, out chan<- EnrichedRecord) error {
 	var wg sync.WaitGroup
 	var once sync.Once
 	var firstErr error
-	sem := make(chan struct{}, numWorkers)
+	sem := make(chan struct{}, pr.numWorkers)
 
 	for rec := range in {
 		rec := rec
@@ -406,7 +422,7 @@ func workerPool(ctx context.Context, numWorkers int, in <-chan Record, out chan<
 			default:
 			}
 
-			enriched, err := validateAndEnrich(rec)
+			enriched, err := pr.validateAndEnrich(rec)
 			if err != nil {
 				once.Do(func() {
 					firstErr = fmt.Errorf("record %d (%s): %w", rec.ID, rec.Name, err)
@@ -427,7 +443,41 @@ func workerPool(ctx context.Context, numWorkers int, in <-chan Record, out chan<
 	return firstErr
 }
 
-func writer(ctx context.Context, in <-chan EnrichedRecord, mu *sync.Mutex, results *[]EnrichedRecord, stats *PipelineStats) error {
+func (pr *PipelineRunner) validateAndEnrich(rec Record) (EnrichedRecord, error) {
+	time.Sleep(enrichmentLatency)
+
+	if rec.Amount <= 0 {
+		return EnrichedRecord{}, fmt.Errorf("invalid amount: $%.2f", rec.Amount)
+	}
+	if rec.Email == "" {
+		return EnrichedRecord{}, fmt.Errorf("missing email")
+	}
+
+	taxRate, region := pr.resolveTaxInfo(rec.Country)
+
+	return EnrichedRecord{
+		Record:       rec,
+		TaxRate:      taxRate,
+		TotalWithTax: rec.Amount * (1 + taxRate),
+		Region:       region,
+		Valid:        true,
+	}, nil
+}
+
+func (pr *PipelineRunner) resolveTaxInfo(country string) (float64, string) {
+	switch country {
+	case "US":
+		return 0.08, "North America"
+	case "DE", "FR":
+		return 0.19, "Europe"
+	case "JP":
+		return 0.10, "Asia-Pacific"
+	default:
+		return 0.15, "International"
+	}
+}
+
+func (pr *PipelineRunner) writeResults(ctx context.Context, in <-chan EnrichedRecord, mu *sync.Mutex, results *[]EnrichedRecord, stats *PipelineStats) error {
 	for {
 		select {
 		case <-ctx.Done():
@@ -446,38 +496,6 @@ func writer(ctx context.Context, in <-chan EnrichedRecord, mu *sync.Mutex, resul
 	}
 }
 
-func validateAndEnrich(rec Record) (EnrichedRecord, error) {
-	time.Sleep(60 * time.Millisecond)
-
-	if rec.Amount <= 0 {
-		return EnrichedRecord{}, fmt.Errorf("invalid amount: $%.2f", rec.Amount)
-	}
-	if rec.Email == "" {
-		return EnrichedRecord{}, fmt.Errorf("missing email")
-	}
-
-	var taxRate float64
-	var region string
-	switch rec.Country {
-	case "US":
-		taxRate, region = 0.08, "North America"
-	case "DE", "FR":
-		taxRate, region = 0.19, "Europe"
-	case "JP":
-		taxRate, region = 0.10, "Asia-Pacific"
-	default:
-		taxRate, region = 0.15, "International"
-	}
-
-	return EnrichedRecord{
-		Record:       rec,
-		TaxRate:      taxRate,
-		TotalWithTax: rec.Amount * (1 + taxRate),
-		Region:       region,
-		Valid:        true,
-	}, nil
-}
-
 func printResults(results []EnrichedRecord, stats PipelineStats, err error) {
 	if err != nil {
 		fmt.Printf("\nPipeline ERROR: %v\n", err)
@@ -490,6 +508,34 @@ func printResults(results []EnrichedRecord, stats PipelineStats, err error) {
 	}
 	fmt.Printf("\nRevenue: $%.2f | Tax: $%.2f | Total: $%.2f\n",
 		stats.Revenue, stats.TotalTax, stats.Revenue+stats.TotalTax)
+}
+
+func main() {
+	records := []Record{
+		{1, "Alice Johnson", "alice@example.com", "US", 299.99},
+		{2, "Hans Mueller", "hans@example.de", "DE", 449.50},
+		{3, "Yuki Tanaka", "yuki@example.jp", "JP", 189.00},
+		{4, "Marie Dupont", "marie@example.fr", "FR", 520.00},
+		{5, "Bob Smith", "bob@example.com", "US", 75.00},
+		{6, "Chen Wei", "chen@example.cn", "CN", 330.00},
+		{7, "Sara Lopez", "sara@example.mx", "MX", 210.50},
+		{8, "James Brown", "james@example.com", "US", 155.00},
+	}
+
+	fmt.Printf("=== Data Processing Pipeline (%d records, %d workers) ===\n\n", len(records), defaultWorkerCount)
+
+	fmt.Println("--- Scenario 1: All records valid ---")
+	pipeline := NewPipelineRunner(records, defaultWorkerCount)
+	results, stats, err := pipeline.Run()
+	printResults(results, stats, err)
+
+	fmt.Println("\n--- Scenario 2: Record 4 has invalid amount ---")
+	badRecords := make([]Record, len(records))
+	copy(badRecords, records)
+	badRecords[3].Amount = -50.00
+	pipeline = NewPipelineRunner(badRecords, defaultWorkerCount)
+	results, stats, err = pipeline.Run()
+	printResults(results, stats, err)
 }
 ```
 

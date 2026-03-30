@@ -36,52 +36,76 @@ import (
 	"time"
 )
 
-func main() {
-	files := generateFileList(20)
+const (
+	fileValidationLatency = 100 * time.Millisecond
+	invalidFilePath       = "config/service-07.json"
+)
 
-	fmt.Println("=== Unbounded Concurrency ===")
+type FileValidator struct {
+	files          []string
+	peakConcurrent int
+	mu             sync.Mutex
+	activeCount    int
+}
+
+func NewFileValidator(files []string) *FileValidator {
+	return &FileValidator{files: files}
+}
+
+func (fv *FileValidator) RunUnbounded() error {
 	start := time.Now()
 
 	var wg sync.WaitGroup
 	var once sync.Once
 	var firstErr error
-	activeCount := 0
-	var mu sync.Mutex
-	peakConcurrent := 0
 
-	for _, f := range files {
+	for _, f := range fv.files {
 		f := f
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 
-			mu.Lock()
-			activeCount++
-			if activeCount > peakConcurrent {
-				peakConcurrent = activeCount
-			}
-			current := activeCount
-			mu.Unlock()
+			current := fv.trackStart()
 
 			fmt.Printf("  [%v] validating %s (concurrent: %d)\n",
 				time.Since(start).Round(time.Millisecond), f, current)
 
-			if err := validateFile(f); err != nil {
+			if err := fv.validate(f); err != nil {
 				once.Do(func() { firstErr = err })
 			}
 
-			mu.Lock()
-			activeCount--
-			mu.Unlock()
+			fv.trackEnd()
 		}()
 	}
 
 	wg.Wait()
-	fmt.Printf("\nPeak concurrent goroutines: %d\n", peakConcurrent)
+	fmt.Printf("\nPeak concurrent goroutines: %d\n", fv.peakConcurrent)
 	fmt.Printf("Total time: %v\n", time.Since(start).Round(time.Millisecond))
-	if firstErr != nil {
-		fmt.Printf("First error: %v\n", firstErr)
+	return firstErr
+}
+
+func (fv *FileValidator) trackStart() int {
+	fv.mu.Lock()
+	defer fv.mu.Unlock()
+	fv.activeCount++
+	if fv.activeCount > fv.peakConcurrent {
+		fv.peakConcurrent = fv.activeCount
 	}
+	return fv.activeCount
+}
+
+func (fv *FileValidator) trackEnd() {
+	fv.mu.Lock()
+	defer fv.mu.Unlock()
+	fv.activeCount--
+}
+
+func (fv *FileValidator) validate(path string) error {
+	time.Sleep(fileValidationLatency)
+	if path == invalidFilePath {
+		return fmt.Errorf("validate %s: missing required field 'port'", path)
+	}
+	return nil
 }
 
 func generateFileList(n int) []string {
@@ -92,12 +116,13 @@ func generateFileList(n int) []string {
 	return files
 }
 
-func validateFile(path string) error {
-	time.Sleep(100 * time.Millisecond) // simulate file I/O + parsing
-	if path == "config/service-07.json" {
-		return fmt.Errorf("validate %s: missing required field 'port'", path)
+func main() {
+	validator := NewFileValidator(generateFileList(20))
+
+	fmt.Println("=== Unbounded Concurrency ===")
+	if err := validator.RunUnbounded(); err != nil {
+		fmt.Printf("First error: %v\n", err)
 	}
-	return nil
 }
 ```
 
@@ -129,59 +154,87 @@ import (
 	"time"
 )
 
-func main() {
-	files := generateFileList(20)
+const (
+	defaultMaxConcurrent  = 5
+	fileValidationLatency = 100 * time.Millisecond
+	invalidFilePath       = "config/service-07.json"
+)
 
-	fmt.Println("=== Bounded Concurrency (semaphore, limit=5) ===")
+type FileValidator struct {
+	files          []string
+	maxConcurrent  int
+	peakConcurrent int
+	activeCount    int
+	mu             sync.Mutex
+}
+
+func NewFileValidator(files []string, maxConcurrent int) *FileValidator {
+	return &FileValidator{
+		files:         files,
+		maxConcurrent: maxConcurrent,
+	}
+}
+
+func (fv *FileValidator) RunBounded() error {
 	start := time.Now()
 
-	const maxConcurrent = 5
-	sem := make(chan struct{}, maxConcurrent)
+	sem := make(chan struct{}, fv.maxConcurrent)
 
 	var wg sync.WaitGroup
 	var once sync.Once
 	var firstErr error
-	var mu sync.Mutex
-	activeCount := 0
-	peakConcurrent := 0
 
-	for _, f := range files {
+	for _, f := range fv.files {
 		f := f
 
-		sem <- struct{}{} // ACQUIRE: blocks if 5 goroutines are already running
+		sem <- struct{}{} // ACQUIRE: blocks if maxConcurrent goroutines are already running
 
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			defer func() { <-sem }() // RELEASE: free the slot when done
 
-			mu.Lock()
-			activeCount++
-			if activeCount > peakConcurrent {
-				peakConcurrent = activeCount
-			}
-			mu.Unlock()
+			fv.trackStart()
 
-			if err := validateFile(f); err != nil {
+			if err := fv.validate(f); err != nil {
 				once.Do(func() { firstErr = err })
 			} else {
 				fmt.Printf("  [%v] validated %s\n",
 					time.Since(start).Round(time.Millisecond), f)
 			}
 
-			mu.Lock()
-			activeCount--
-			mu.Unlock()
+			fv.trackEnd()
 		}()
 	}
 
 	wg.Wait()
-	fmt.Printf("\nPeak concurrent goroutines: %d\n", peakConcurrent)
+	fmt.Printf("\nPeak concurrent goroutines: %d\n", fv.peakConcurrent)
 	fmt.Printf("Total time: %v (ceil(20/5) batches of ~100ms)\n",
 		time.Since(start).Round(time.Millisecond))
-	if firstErr != nil {
-		fmt.Printf("First error: %v\n", firstErr)
+	return firstErr
+}
+
+func (fv *FileValidator) trackStart() {
+	fv.mu.Lock()
+	defer fv.mu.Unlock()
+	fv.activeCount++
+	if fv.activeCount > fv.peakConcurrent {
+		fv.peakConcurrent = fv.activeCount
 	}
+}
+
+func (fv *FileValidator) trackEnd() {
+	fv.mu.Lock()
+	defer fv.mu.Unlock()
+	fv.activeCount--
+}
+
+func (fv *FileValidator) validate(path string) error {
+	time.Sleep(fileValidationLatency)
+	if path == invalidFilePath {
+		return fmt.Errorf("validate %s: missing required field 'port'", path)
+	}
+	return nil
 }
 
 func generateFileList(n int) []string {
@@ -192,12 +245,13 @@ func generateFileList(n int) []string {
 	return files
 }
 
-func validateFile(path string) error {
-	time.Sleep(100 * time.Millisecond)
-	if path == "config/service-07.json" {
-		return fmt.Errorf("validate %s: missing required field 'port'", path)
+func main() {
+	validator := NewFileValidator(generateFileList(20), defaultMaxConcurrent)
+
+	fmt.Println("=== Bounded Concurrency (semaphore, limit=5) ===")
+	if err := validator.RunBounded(); err != nil {
+		fmt.Printf("First error: %v\n", err)
 	}
-	return nil
 }
 ```
 
@@ -235,35 +289,51 @@ import (
 	"time"
 )
 
-func main() {
-	files := generateFileList(20)
+const (
+	defaultMaxConcurrent  = 5
+	fileValidationLatency = 100 * time.Millisecond
+	invalidFilePath       = "config/service-07.json"
+)
 
-	fmt.Println("=== Bounded + Cancellation (limit=5) ===")
-	start := time.Now()
+type ValidationStats struct {
+	Validated int
+	Cancelled int
+	Total     int
+}
 
+type FileValidator struct {
+	files         []string
+	maxConcurrent int
+}
+
+func NewFileValidator(files []string, maxConcurrent int) *FileValidator {
+	return &FileValidator{
+		files:         files,
+		maxConcurrent: maxConcurrent,
+	}
+}
+
+func (fv *FileValidator) RunBoundedWithCancellation() (ValidationStats, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	const maxConcurrent = 5
-	sem := make(chan struct{}, maxConcurrent)
+	sem := make(chan struct{}, fv.maxConcurrent)
 
 	var wg sync.WaitGroup
 	var once sync.Once
 	var firstErr error
 
-	validated := 0
-	cancelled := 0
+	var stats ValidationStats
+	stats.Total = len(fv.files)
 	var mu sync.Mutex
 
-	for _, f := range files {
+	for _, f := range fv.files {
 		f := f
 
-		// Check context before acquiring semaphore to avoid blocking
-		// on the semaphore when we already know we should stop
 		select {
 		case <-ctx.Done():
 			mu.Lock()
-			cancelled++
+			stats.Cancelled++
 			mu.Unlock()
 			continue
 		case sem <- struct{}{}:
@@ -277,13 +347,13 @@ func main() {
 			select {
 			case <-ctx.Done():
 				mu.Lock()
-				cancelled++
+				stats.Cancelled++
 				mu.Unlock()
 				return
 			default:
 			}
 
-			if err := validateFile(f); err != nil {
+			if err := fv.validate(f); err != nil {
 				once.Do(func() {
 					firstErr = err
 					cancel()
@@ -292,17 +362,21 @@ func main() {
 			}
 
 			mu.Lock()
-			validated++
+			stats.Validated++
 			mu.Unlock()
 		}()
 	}
 
 	wg.Wait()
-	fmt.Printf("\nValidated: %d, Cancelled: %d, Total: %d\n", validated, cancelled, len(files))
-	fmt.Printf("Total time: %v\n", time.Since(start).Round(time.Millisecond))
-	if firstErr != nil {
-		fmt.Printf("First error: %v\n", firstErr)
+	return stats, firstErr
+}
+
+func (fv *FileValidator) validate(path string) error {
+	time.Sleep(fileValidationLatency)
+	if path == invalidFilePath {
+		return fmt.Errorf("validate %s: missing required field 'port'", path)
 	}
+	return nil
 }
 
 func generateFileList(n int) []string {
@@ -313,12 +387,19 @@ func generateFileList(n int) []string {
 	return files
 }
 
-func validateFile(path string) error {
-	time.Sleep(100 * time.Millisecond)
-	if path == "config/service-07.json" {
-		return fmt.Errorf("validate %s: missing required field 'port'", path)
+func main() {
+	validator := NewFileValidator(generateFileList(20), defaultMaxConcurrent)
+
+	fmt.Println("=== Bounded + Cancellation (limit=5) ===")
+	start := time.Now()
+
+	stats, err := validator.RunBoundedWithCancellation()
+
+	fmt.Printf("\nValidated: %d, Cancelled: %d, Total: %d\n", stats.Validated, stats.Cancelled, stats.Total)
+	fmt.Printf("Total time: %v\n", time.Since(start).Round(time.Millisecond))
+	if err != nil {
+		fmt.Printf("First error: %v\n", err)
 	}
-	return nil
 }
 ```
 
@@ -369,15 +450,14 @@ import (
 	"runtime"
 )
 
-func main() {
-	fmt.Println("=== Choosing Concurrency Limits ===")
-	fmt.Printf("CPU cores: %d\n\n", runtime.NumCPU())
+type ConcurrencyGuideline struct {
+	Scenario string
+	Limit    int
+	Reason   string
+}
 
-	limits := []struct {
-		scenario string
-		limit    int
-		reason   string
-	}{
+func buildConcurrencyGuidelines() []ConcurrencyGuideline {
+	return []ConcurrencyGuideline{
 		{
 			"File validation (disk I/O)",
 			10,
@@ -404,10 +484,19 @@ func main() {
 			"Limited by API rate limit (e.g., 100 req/sec = small bursts)",
 		},
 	}
+}
 
-	for _, l := range limits {
-		fmt.Printf("  %-45s limit=%d  (%s)\n", l.scenario, l.limit, l.reason)
+func printGuidelines(guidelines []ConcurrencyGuideline) {
+	for _, g := range guidelines {
+		fmt.Printf("  %-45s limit=%d  (%s)\n", g.Scenario, g.Limit, g.Reason)
 	}
+}
+
+func main() {
+	fmt.Println("=== Choosing Concurrency Limits ===")
+	fmt.Printf("CPU cores: %d\n\n", runtime.NumCPU())
+
+	printGuidelines(buildConcurrencyGuidelines())
 }
 ```
 

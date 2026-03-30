@@ -51,6 +51,14 @@ import (
 	"time"
 )
 
+const (
+	queueCapacity     = 5
+	jobCount          = 5
+	workerProcessTime = 50 * time.Millisecond
+	producerDelay     = 30 * time.Millisecond
+	shutdownDelay     = 200 * time.Millisecond
+)
+
 type Job struct {
 	ID      int
 	Payload string
@@ -73,51 +81,69 @@ func NewJobQueue(maxSize int) *JobQueue {
 	return jq
 }
 
+func (jq *JobQueue) Dequeue() (Job, bool) {
+	jq.cond.L.Lock()
+	for len(jq.jobs) == 0 && !jq.shutdown {
+		fmt.Println("Worker: queue empty, waiting...")
+		jq.cond.Wait()
+	}
+	if len(jq.jobs) == 0 && jq.shutdown {
+		jq.cond.L.Unlock()
+		return Job{}, false
+	}
+	job := jq.jobs[0]
+	jq.jobs = jq.jobs[1:]
+	jq.cond.L.Unlock()
+	jq.cond.Signal() // notify producer that space is available
+	return job, true
+}
+
+func (jq *JobQueue) Enqueue(job Job) {
+	jq.cond.L.Lock()
+	jq.jobs = append(jq.jobs, job)
+	fmt.Printf("Producer: enqueued job %d\n", job.ID)
+	jq.cond.L.Unlock()
+	jq.cond.Signal()
+}
+
+func (jq *JobQueue) Shutdown() {
+	jq.cond.L.Lock()
+	jq.shutdown = true
+	jq.cond.L.Unlock()
+	jq.cond.Signal()
+}
+
+func runWorker(queue *JobQueue, wg *sync.WaitGroup) {
+	defer wg.Done()
+	for {
+		job, ok := queue.Dequeue()
+		if !ok {
+			fmt.Println("Worker: shutdown received, exiting.")
+			return
+		}
+		fmt.Printf("Worker: processing job %d (%s)\n", job.ID, job.Payload)
+		time.Sleep(workerProcessTime)
+	}
+}
+
+func produceJobs(queue *JobQueue, count int) {
+	for i := 1; i <= count; i++ {
+		queue.Enqueue(Job{ID: i, Payload: fmt.Sprintf("task-%d", i)})
+		time.Sleep(producerDelay)
+	}
+}
+
 func main() {
-	queue := NewJobQueue(5)
+	queue := NewJobQueue(queueCapacity)
 	var wg sync.WaitGroup
 
-	// Start one consumer
 	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for {
-			queue.cond.L.Lock()
-			for len(queue.jobs) == 0 && !queue.shutdown {
-				fmt.Println("Worker: queue empty, waiting...")
-				queue.cond.Wait() // atomically releases lock and suspends
-			}
-			if len(queue.jobs) == 0 && queue.shutdown {
-				queue.cond.L.Unlock()
-				fmt.Println("Worker: shutdown received, exiting.")
-				return
-			}
-			job := queue.jobs[0]
-			queue.jobs = queue.jobs[1:]
-			queue.cond.L.Unlock()
-			queue.cond.Signal() // notify producer that space is available
+	go runWorker(queue, &wg)
 
-			fmt.Printf("Worker: processing job %d (%s)\n", job.ID, job.Payload)
-			time.Sleep(50 * time.Millisecond) // simulate work
-		}
-	}()
+	produceJobs(queue, jobCount)
 
-	// Producer: enqueue 5 jobs
-	for i := 1; i <= 5; i++ {
-		queue.cond.L.Lock()
-		queue.jobs = append(queue.jobs, Job{ID: i, Payload: fmt.Sprintf("task-%d", i)})
-		fmt.Printf("Producer: enqueued job %d\n", i)
-		queue.cond.L.Unlock()
-		queue.cond.Signal() // wake one waiting consumer
-		time.Sleep(30 * time.Millisecond)
-	}
-
-	// Shutdown
-	time.Sleep(200 * time.Millisecond)
-	queue.cond.L.Lock()
-	queue.shutdown = true
-	queue.cond.L.Unlock()
-	queue.cond.Signal()
+	time.Sleep(shutdownDelay)
+	queue.Shutdown()
 	wg.Wait()
 	fmt.Println("All jobs processed.")
 }
@@ -275,6 +301,15 @@ import (
 	"time"
 )
 
+const (
+	workerCount        = 4
+	jobsToEnqueue      = 6
+	workerProcessDelay = 40 * time.Millisecond
+	workerStartDelay   = 50 * time.Millisecond
+	processingWait     = 300 * time.Millisecond
+	initialCapacity    = 10
+)
+
 type Job struct {
 	ID int
 }
@@ -287,62 +322,84 @@ type WorkerPool struct {
 }
 
 func NewWorkerPool() *WorkerPool {
-	wp := &WorkerPool{jobs: make([]Job, 0, 10)}
+	wp := &WorkerPool{jobs: make([]Job, 0, initialCapacity)}
 	wp.cond = sync.NewCond(&wp.mu)
 	return wp
 }
 
-func (wp *WorkerPool) worker(id int, wg *sync.WaitGroup) {
+func (wp *WorkerPool) TakeJob() (Job, bool) {
+	wp.cond.L.Lock()
+	for len(wp.jobs) == 0 && !wp.shutdown {
+		wp.cond.Wait()
+	}
+	if len(wp.jobs) == 0 && wp.shutdown {
+		wp.cond.L.Unlock()
+		return Job{}, false
+	}
+	job := wp.jobs[0]
+	wp.jobs = wp.jobs[1:]
+	wp.cond.L.Unlock()
+	return job, true
+}
+
+func (wp *WorkerPool) SubmitBatch(jobs []Job) {
+	wp.cond.L.Lock()
+	wp.jobs = append(wp.jobs, jobs...)
+	wp.cond.L.Unlock()
+	wp.cond.Broadcast() // wake ALL workers to grab jobs
+}
+
+func (wp *WorkerPool) Shutdown() {
+	wp.cond.L.Lock()
+	wp.shutdown = true
+	wp.cond.L.Unlock()
+	wp.cond.Broadcast() // wake ALL workers so they can exit
+}
+
+func (wp *WorkerPool) RunWorker(workerID int, wg *sync.WaitGroup) {
 	defer wg.Done()
 	for {
-		wp.cond.L.Lock()
-		for len(wp.jobs) == 0 && !wp.shutdown {
-			wp.cond.Wait()
-		}
-		if len(wp.jobs) == 0 && wp.shutdown {
-			wp.cond.L.Unlock()
-			fmt.Printf("  Worker %d: shutdown, exiting.\n", id)
+		job, ok := wp.TakeJob()
+		if !ok {
+			fmt.Printf("  Worker %d: shutdown, exiting.\n", workerID)
 			return
 		}
-		job := wp.jobs[0]
-		wp.jobs = wp.jobs[1:]
-		wp.cond.L.Unlock()
-
-		fmt.Printf("  Worker %d: processing job %d\n", id, job.ID)
-		time.Sleep(40 * time.Millisecond)
+		fmt.Printf("  Worker %d: processing job %d\n", workerID, job.ID)
+		time.Sleep(workerProcessDelay)
 	}
+}
+
+func startWorkers(pool *WorkerPool, count int, wg *sync.WaitGroup) {
+	for i := 0; i < count; i++ {
+		wg.Add(1)
+		go pool.RunWorker(i, wg)
+	}
+}
+
+func buildJobBatch(count int) []Job {
+	jobs := make([]Job, count)
+	for i := range jobs {
+		jobs[i] = Job{ID: i + 1}
+	}
+	return jobs
 }
 
 func main() {
 	pool := NewWorkerPool()
 	var wg sync.WaitGroup
 
-	// Start 4 workers
-	fmt.Println("Starting 4 workers...")
-	for i := 0; i < 4; i++ {
-		wg.Add(1)
-		go pool.worker(i, &wg)
-	}
+	fmt.Printf("Starting %d workers...\n", workerCount)
+	startWorkers(pool, workerCount, &wg)
 
-	time.Sleep(50 * time.Millisecond) // let workers start waiting
+	time.Sleep(workerStartDelay)
 
-	// Enqueue some jobs
-	fmt.Println("\nEnqueuing 6 jobs...")
-	pool.cond.L.Lock()
-	for i := 1; i <= 6; i++ {
-		pool.jobs = append(pool.jobs, Job{ID: i})
-	}
-	pool.cond.L.Unlock()
-	pool.cond.Broadcast() // wake ALL workers to grab jobs
+	fmt.Printf("\nEnqueuing %d jobs...\n", jobsToEnqueue)
+	pool.SubmitBatch(buildJobBatch(jobsToEnqueue))
 
-	time.Sleep(300 * time.Millisecond) // let workers process
+	time.Sleep(processingWait)
 
-	// Graceful shutdown: broadcast to all waiting workers
 	fmt.Println("\nShutting down all workers...")
-	pool.cond.L.Lock()
-	pool.shutdown = true
-	pool.cond.L.Unlock()
-	pool.cond.Broadcast() // wake ALL workers so they can exit
+	pool.Shutdown()
 
 	wg.Wait()
 	fmt.Println("\nAll workers stopped. Clean shutdown complete.")
@@ -389,41 +446,74 @@ import (
 	"time"
 )
 
+const (
+	competingConsumers = 2
+	jobsPerConsumer    = 3
+	totalJobs          = competingConsumers * jobsPerConsumer
+	producerInterval   = 30 * time.Millisecond
+)
+
+type JobCounter struct {
+	mu    sync.Mutex
+	cond  *sync.Cond
+	count int
+}
+
+func NewJobCounter() *JobCounter {
+	jc := &JobCounter{}
+	jc.cond = sync.NewCond(&jc.mu)
+	return jc
+}
+
+func (jc *JobCounter) WaitAndTake() int {
+	jc.cond.L.Lock()
+	for jc.count == 0 { // FOR, not IF -- re-check after wakeup
+		jc.cond.Wait()
+	}
+	jc.count--
+	remaining := jc.count
+	jc.cond.L.Unlock()
+	return remaining
+}
+
+func (jc *JobCounter) Add() int {
+	jc.cond.L.Lock()
+	jc.count++
+	current := jc.count
+	jc.cond.L.Unlock()
+	jc.cond.Signal()
+	return current
+}
+
+func runCompetingConsumer(counter *JobCounter, workerID, jobsToConsume int, wg *sync.WaitGroup) {
+	defer wg.Done()
+	for j := 0; j < jobsToConsume; j++ {
+		remaining := counter.WaitAndTake()
+		fmt.Printf("Worker %d: took job (remaining: %d)\n", workerID, remaining)
+	}
+}
+
+func produceOneAtATime(counter *JobCounter, count int) {
+	for i := 0; i < count; i++ {
+		time.Sleep(producerInterval)
+		current := counter.Add()
+		fmt.Printf("Producer: added job (count: %d)\n", current)
+	}
+}
+
 func main() {
-	var mu sync.Mutex
-	cond := sync.NewCond(&mu)
-	jobCount := 0
+	counter := NewJobCounter()
 	var wg sync.WaitGroup
 
-	// Two competing consumers
-	for i := 0; i < 2; i++ {
+	for i := 0; i < competingConsumers; i++ {
 		wg.Add(1)
-		go func(workerID int) {
-			defer wg.Done()
-			for j := 0; j < 3; j++ {
-				cond.L.Lock()
-				for jobCount == 0 { // FOR, not IF -- re-check after wakeup
-					cond.Wait()
-				}
-				jobCount--
-				fmt.Printf("Worker %d: took job (remaining: %d)\n", workerID, jobCount)
-				cond.L.Unlock()
-			}
-		}(i)
+		go runCompetingConsumer(counter, i, jobsPerConsumer, &wg)
 	}
 
-	// Producer sends 6 jobs one at a time
-	for i := 0; i < 6; i++ {
-		time.Sleep(30 * time.Millisecond)
-		cond.L.Lock()
-		jobCount++
-		fmt.Printf("Producer: added job (count: %d)\n", jobCount)
-		cond.L.Unlock()
-		cond.Signal() // wake one consumer
-	}
+	produceOneAtATime(counter, totalJobs)
 
 	wg.Wait()
-	fmt.Println("Both workers processed 3 jobs each.")
+	fmt.Printf("Both workers processed %d jobs each.\n", jobsPerConsumer)
 }
 ```
 

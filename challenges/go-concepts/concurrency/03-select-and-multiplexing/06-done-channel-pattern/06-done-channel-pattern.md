@@ -35,40 +35,61 @@ import (
 	"time"
 )
 
-func main() {
-	done := make(chan struct{})
-	refreshed := make(chan string)
+const (
+	refreshInterval = 100 * time.Millisecond
+	cyclesToConsume = 5
+)
 
-	// Background cache refresher.
+type CacheRefresher struct {
+	done      chan struct{}
+	refreshed chan string
+}
+
+func NewCacheRefresher() *CacheRefresher {
+	return &CacheRefresher{
+		done:      make(chan struct{}),
+		refreshed: make(chan string),
+	}
+}
+
+func (cr *CacheRefresher) Start() {
 	go func() {
-		defer close(refreshed)
-		ticker := time.NewTicker(100 * time.Millisecond)
+		defer close(cr.refreshed)
+		ticker := time.NewTicker(refreshInterval)
 		defer ticker.Stop()
 
 		cycle := 0
 		for {
 			select {
-			case <-done:
+			case <-cr.done:
 				fmt.Println("refresher: received cancellation, stopping")
 				return
 			case <-ticker.C:
 				cycle++
 				result := fmt.Sprintf("cache refreshed (cycle %d)", cycle)
 				select {
-				case <-done:
+				case <-cr.done:
 					return
-				case refreshed <- result:
+				case cr.refreshed <- result:
 				}
 			}
 		}
 	}()
+}
 
-	// Consume 5 refresh cycles, then cancel.
-	for i := 0; i < 5; i++ {
-		fmt.Println("main:", <-refreshed)
+func (cr *CacheRefresher) Stop() {
+	close(cr.done)
+}
+
+func main() {
+	refresher := NewCacheRefresher()
+	refresher.Start()
+
+	for i := 0; i < cyclesToConsume; i++ {
+		fmt.Println("main:", <-refresher.refreshed)
 	}
 
-	close(done)
+	refresher.Stop()
 	time.Sleep(50 * time.Millisecond)
 	fmt.Println("main: cache refresher stopped")
 }
@@ -100,32 +121,43 @@ import (
 	"time"
 )
 
-func cacheRefresher(id int, done <-chan struct{}, wg *sync.WaitGroup) {
+const (
+	refreshInterval = 100 * time.Millisecond
+	workerCount     = 3
+	runDuration     = 350 * time.Millisecond
+)
+
+func runCacheRefresher(workerID int, done <-chan struct{}, wg *sync.WaitGroup) {
 	defer wg.Done()
-	ticker := time.NewTicker(100 * time.Millisecond)
+	ticker := time.NewTicker(refreshInterval)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-done:
-			fmt.Printf("worker-%d: flushing pending writes and stopping\n", id)
+			fmt.Printf("worker-%d: flushing pending writes and stopping\n", workerID)
 			return
 		case <-ticker.C:
-			fmt.Printf("worker-%d: refreshed cache partition\n", id)
+			fmt.Printf("worker-%d: refreshed cache partition\n", workerID)
 		}
 	}
 }
 
+func launchWorkerPool(done <-chan struct{}, count int) *sync.WaitGroup {
+	var wg sync.WaitGroup
+	for workerID := 1; workerID <= count; workerID++ {
+		wg.Add(1)
+		go runCacheRefresher(workerID, done, &wg)
+	}
+	return &wg
+}
+
 func main() {
 	done := make(chan struct{})
-	var wg sync.WaitGroup
 
-	for i := 1; i <= 3; i++ {
-		wg.Add(1)
-		go cacheRefresher(i, done, &wg)
-	}
+	wg := launchWorkerPool(done, workerCount)
 
-	time.Sleep(350 * time.Millisecond)
+	time.Sleep(runDuration)
 	fmt.Println("main: shutting down all workers")
 	close(done) // One close stops all three.
 	wg.Wait()
@@ -161,31 +193,34 @@ import (
 	"time"
 )
 
-func main() {
-	done := make(chan struct{})
-	var wg sync.WaitGroup
+const (
+	fetchInterval  = 50 * time.Millisecond
+	recordsToStore = 5
+)
 
-	// Stage 1: Fetches records from "database".
+func startFetcher(done <-chan struct{}, wg *sync.WaitGroup) <-chan string {
 	fetchOut := make(chan string)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		defer close(fetchOut)
-		i := 0
+		sequence := 0
 		for {
-			record := fmt.Sprintf("record-%d", i)
+			record := fmt.Sprintf("record-%d", sequence)
 			select {
 			case <-done:
 				fmt.Println("fetcher: cancelled, closing connection")
 				return
 			case fetchOut <- record:
-				i++
-				time.Sleep(50 * time.Millisecond)
+				sequence++
+				time.Sleep(fetchInterval)
 			}
 		}
 	}()
+	return fetchOut
+}
 
-	// Stage 2: Transforms records (e.g., enrichment, formatting).
+func startTransformer(done <-chan struct{}, input <-chan string, wg *sync.WaitGroup) <-chan string {
 	transformOut := make(chan string)
 	wg.Add(1)
 	go func() {
@@ -196,7 +231,7 @@ func main() {
 			case <-done:
 				fmt.Println("transformer: cancelled, flushing buffer")
 				return
-			case record, ok := <-fetchOut:
+			case record, ok := <-input:
 				if !ok {
 					return
 				}
@@ -209,9 +244,17 @@ func main() {
 			}
 		}
 	}()
+	return transformOut
+}
 
-	// Consumer: take 5 records, then cancel the pipeline.
-	for i := 0; i < 5; i++ {
+func main() {
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+
+	fetchOut := startFetcher(done, &wg)
+	transformOut := startTransformer(done, fetchOut, &wg)
+
+	for i := 0; i < recordsToStore; i++ {
 		fmt.Println("stored:", <-transformOut)
 	}
 
@@ -247,38 +290,64 @@ import (
 	"time"
 )
 
-func main() {
-	done := make(chan struct{})
-	finished := make(chan struct{})
+const (
+	cacheInterval = 60 * time.Millisecond
+	runDuration   = 300 * time.Millisecond
+)
 
+type SessionCache struct {
+	done     chan struct{}
+	finished chan struct{}
+	items    []string
+}
+
+func NewSessionCache() *SessionCache {
+	return &SessionCache{
+		done:     make(chan struct{}),
+		finished: make(chan struct{}),
+	}
+}
+
+func (sc *SessionCache) Start() {
 	go func() {
-		defer close(finished)
-
-		var cachedItems []string
-		ticker := time.NewTicker(60 * time.Millisecond)
+		defer close(sc.finished)
+		ticker := time.NewTicker(cacheInterval)
 		defer ticker.Stop()
 
 		for {
 			select {
-			case <-done:
-				fmt.Printf("worker: cancellation received, flushing %d items\n", len(cachedItems))
-				for _, item := range cachedItems {
-					fmt.Printf("  flushed to disk: %s\n", item)
-				}
-				fmt.Println("worker: connections closed, cleanup complete")
+			case <-sc.done:
+				sc.flushToDisk()
 				return
 			case <-ticker.C:
-				item := fmt.Sprintf("user-session-%d", len(cachedItems)+1)
-				cachedItems = append(cachedItems, item)
+				item := fmt.Sprintf("user-session-%d", len(sc.items)+1)
+				sc.items = append(sc.items, item)
 				fmt.Printf("worker: cached %s\n", item)
 			}
 		}
 	}()
+}
 
-	time.Sleep(300 * time.Millisecond)
+func (sc *SessionCache) flushToDisk() {
+	fmt.Printf("worker: cancellation received, flushing %d items\n", len(sc.items))
+	for _, item := range sc.items {
+		fmt.Printf("  flushed to disk: %s\n", item)
+	}
+	fmt.Println("worker: connections closed, cleanup complete")
+}
+
+func (sc *SessionCache) Stop() {
+	close(sc.done)
+	<-sc.finished
+}
+
+func main() {
+	cache := NewSessionCache()
+	cache.Start()
+
+	time.Sleep(runDuration)
 	fmt.Println("main: sending shutdown signal")
-	close(done)
-	<-finished
+	cache.Stop()
 	fmt.Println("main: worker exited after cleanup")
 }
 ```

@@ -31,27 +31,38 @@ package main
 
 import "fmt"
 
+func tryReadCache(cache <-chan string) (string, bool) {
+	select {
+	case value := <-cache:
+		return value, true
+	default:
+		return "", false
+	}
+}
+
+func computeValue() string {
+	return "computed-result-42"
+}
+
 func main() {
 	cache := make(chan string, 1)
 
 	// Cache miss: channel is empty, so we compute.
-	select {
-	case value := <-cache:
+	if value, hit := tryReadCache(cache); hit {
 		fmt.Println("cache hit:", value)
-	default:
+	} else {
 		fmt.Println("cache miss: computing value...")
-		value := "computed-result-42"
-		fmt.Println("computed:", value)
+		computed := computeValue()
+		fmt.Println("computed:", computed)
 	}
 
 	// Simulate a background worker that fills the cache.
 	cache <- "precomputed-result-42"
 
 	// Cache hit: channel has a value.
-	select {
-	case value := <-cache:
+	if value, hit := tryReadCache(cache); hit {
 		fmt.Println("cache hit:", value)
-	default:
+	} else {
 		fmt.Println("cache miss: computing value...")
 	}
 }
@@ -75,28 +86,35 @@ package main
 
 import "fmt"
 
-func trySendMetric(ch chan<- string, metric string) bool {
+const metricsBufferSize = 2
+
+func trySendMetric(buffer chan<- string, metric string) bool {
 	select {
-	case ch <- metric:
+	case buffer <- metric:
 		return true
 	default:
 		return false
 	}
 }
 
+func drainMetrics(buffer <-chan string, count int) {
+	for i := 0; i < count; i++ {
+		fmt.Println("collected:", <-buffer)
+	}
+}
+
 func main() {
-	metrics := make(chan string, 2)
+	metricsBuffer := make(chan string, metricsBufferSize)
 
 	// Buffer has room: both sends succeed.
-	fmt.Println("sent:", trySendMetric(metrics, "cpu_usage=72%"))
-	fmt.Println("sent:", trySendMetric(metrics, "mem_usage=85%"))
+	fmt.Println("sent:", trySendMetric(metricsBuffer, "cpu_usage=72%"))
+	fmt.Println("sent:", trySendMetric(metricsBuffer, "mem_usage=85%"))
 
 	// Buffer is full: this metric is dropped.
-	fmt.Println("sent:", trySendMetric(metrics, "disk_io=40%"))
+	fmt.Println("sent:", trySendMetric(metricsBuffer, "disk_io=40%"))
 
 	// Drain what was buffered.
-	fmt.Println("collected:", <-metrics)
-	fmt.Println("collected:", <-metrics)
+	drainMetrics(metricsBuffer, metricsBufferSize)
 }
 ```
 
@@ -123,26 +141,41 @@ import (
 	"time"
 )
 
-func main() {
-	dataFeed := make(chan string, 1)
+const (
+	maxPollAttempts   = 5
+	pollWorkInterval  = 100 * time.Millisecond
+	externalDataDelay = 250 * time.Millisecond
+)
 
-	// Simulate an external system that sends data after 250ms.
+func startExternalProducer(dataFeed chan<- string) {
 	go func() {
-		time.Sleep(250 * time.Millisecond)
+		time.Sleep(externalDataDelay)
 		dataFeed <- "metric_batch_ready"
 	}()
+}
 
-	for i := 0; i < 5; i++ {
+func pollForData(dataFeed <-chan string, maxAttempts int) bool {
+	for attempt := 0; attempt < maxAttempts; attempt++ {
 		select {
 		case data := <-dataFeed:
 			fmt.Println("received:", data)
-			return
+			return true
 		default:
-			fmt.Printf("poll %d: no data yet, processing backlog...\n", i)
-			time.Sleep(100 * time.Millisecond) // Simulate useful work
+			fmt.Printf("poll %d: no data yet, processing backlog...\n", attempt)
+			time.Sleep(pollWorkInterval)
 		}
 	}
-	fmt.Println("gave up waiting")
+	return false
+}
+
+func main() {
+	dataFeed := make(chan string, 1)
+
+	startExternalProducer(dataFeed)
+
+	if !pollForData(dataFeed, maxPollAttempts) {
+		fmt.Println("gave up waiting")
+	}
 }
 ```
 
@@ -165,34 +198,46 @@ package main
 
 import "fmt"
 
+type CacheLayer struct {
+	Name    string
+	Channel chan string
+}
+
+func probeCaches(layers []CacheLayer) (value string, hitLayer string, found bool) {
+	// Build a select dynamically is not possible, so we probe with a
+	// three-layer select. For a real N-layer cache, iterate sequentially.
+	select {
+	case val := <-layers[0].Channel:
+		return val, layers[0].Name, true
+	case val := <-layers[1].Channel:
+		return val, layers[1].Name, true
+	case val := <-layers[2].Channel:
+		return val, layers[2].Name, true
+	default:
+		return "", "", false
+	}
+}
+
 func main() {
-	l1Cache := make(chan string, 1)
-	l2Cache := make(chan string, 1)
-	dbCache := make(chan string, 1)
+	layers := []CacheLayer{
+		{Name: "L1", Channel: make(chan string, 1)},
+		{Name: "L2", Channel: make(chan string, 1)},
+		{Name: "DB cache", Channel: make(chan string, 1)},
+	}
 
 	// All caches empty: full miss.
-	select {
-	case val := <-l1Cache:
-		fmt.Println("L1 hit:", val)
-	case val := <-l2Cache:
-		fmt.Println("L2 hit:", val)
-	case val := <-dbCache:
-		fmt.Println("DB cache hit:", val)
-	default:
+	if value, layer, found := probeCaches(layers); found {
+		fmt.Printf("%s hit: %s\n", layer, value)
+	} else {
 		fmt.Println("all caches empty, querying database directly")
 	}
 
 	// Populate L2 and try again.
-	l2Cache <- "user:1234:profile"
+	layers[1].Channel <- "user:1234:profile"
 
-	select {
-	case val := <-l1Cache:
-		fmt.Println("L1 hit:", val)
-	case val := <-l2Cache:
-		fmt.Println("L2 hit:", val)
-	case val := <-dbCache:
-		fmt.Println("DB cache hit:", val)
-	default:
+	if value, layer, found := probeCaches(layers); found {
+		fmt.Printf("%s hit: %s\n", layer, value)
+	} else {
 		fmt.Println("all caches empty, querying database directly")
 	}
 }
@@ -213,24 +258,30 @@ package main
 
 import "fmt"
 
-func main() {
-	metricsBuf := make(chan string, 10)
-	metricsBuf <- "request_count=142"
-	metricsBuf <- "error_rate=0.02"
-	metricsBuf <- "p99_latency=230ms"
-	metricsBuf <- "active_connections=84"
+const metricsBufferCapacity = 10
 
+func flushMetricsBuffer(buffer <-chan string) int {
 	flushed := 0
 	for {
 		select {
-		case metric := <-metricsBuf:
+		case metric := <-buffer:
 			fmt.Println("flushed:", metric)
 			flushed++
 		default:
-			fmt.Printf("flush complete: %d metrics sent to aggregator\n", flushed)
-			return
+			return flushed
 		}
 	}
+}
+
+func main() {
+	metricsBuffer := make(chan string, metricsBufferCapacity)
+	metricsBuffer <- "request_count=142"
+	metricsBuffer <- "error_rate=0.02"
+	metricsBuffer <- "p99_latency=230ms"
+	metricsBuffer <- "active_connections=84"
+
+	flushed := flushMetricsBuffer(metricsBuffer)
+	fmt.Printf("flush complete: %d metrics sent to aggregator\n", flushed)
 }
 ```
 
@@ -253,16 +304,18 @@ package main
 
 import "fmt"
 
+const busySpinLimit = 1000000
+
 func main() {
-	ch := make(chan int)
+	work := make(chan int)
 
 	// BAD: this spins at 100% CPU doing nothing useful.
 	// Without the iteration limit, this would run forever.
 	spins := 0
-	for i := 0; i < 1000000; i++ {
+	for i := 0; i < busySpinLimit; i++ {
 		select {
-		case v := <-ch:
-			fmt.Println(v)
+		case value := <-work:
+			fmt.Println(value)
 			return
 		default:
 			spins++

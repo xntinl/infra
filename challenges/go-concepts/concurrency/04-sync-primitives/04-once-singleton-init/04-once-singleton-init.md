@@ -49,40 +49,54 @@ import (
 	"time"
 )
 
+const (
+	concurrentHandlers   = 20
+	connectionSetupDelay = 50 * time.Millisecond
+	defaultDBHost        = "postgres:5432"
+	defaultMaxConns      = 25
+)
+
 type DBPool struct {
 	Host        string
 	MaxConns    int
 	Initialized bool
 }
 
-func main() {
-	var pool *DBPool
-	var initCount atomic.Int64
+type UnsafePoolFactory struct {
+	pool      *DBPool
+	initCount atomic.Int64
+}
+
+func (f *UnsafePoolFactory) GetDB() *DBPool {
+	if f.pool == nil { // UNSAFE: multiple goroutines can pass this check
+		f.initCount.Add(1)
+		fmt.Printf("  Initializing DB pool... (goroutine #%d to reach this point)\n", f.initCount.Load())
+		time.Sleep(connectionSetupDelay)
+		f.pool = &DBPool{Host: defaultDBHost, MaxConns: defaultMaxConns, Initialized: true}
+	}
+	return f.pool
+}
+
+func demonstrateUnsafeInit() {
+	factory := &UnsafePoolFactory{}
 	var wg sync.WaitGroup
 
-	getDB := func() *DBPool {
-		if pool == nil { // UNSAFE: multiple goroutines can pass this check
-			initCount.Add(1)
-			fmt.Printf("  Initializing DB pool... (goroutine #%d to reach this point)\n", initCount.Load())
-			time.Sleep(50 * time.Millisecond) // simulate connection setup
-			pool = &DBPool{Host: "postgres:5432", MaxConns: 25, Initialized: true}
-		}
-		return pool
-	}
-
 	fmt.Println("=== Unsafe Initialization (race condition) ===")
-	for i := 0; i < 20; i++ {
+	for i := 0; i < concurrentHandlers; i++ {
 		wg.Add(1)
 		go func(handlerID int) {
 			defer wg.Done()
-			db := getDB()
-			_ = db
+			_ = factory.GetDB()
 		}(i)
 	}
 
 	wg.Wait()
-	fmt.Printf("DB pool created %d times (should be 1)\n", initCount.Load())
+	fmt.Printf("DB pool created %d times (should be 1)\n", factory.initCount.Load())
 	fmt.Println("Wasted connections, possible corruption, resource leak.")
+}
+
+func main() {
+	demonstrateUnsafeInit()
 }
 ```
 
@@ -113,40 +127,50 @@ import (
 	"time"
 )
 
+const (
+	concurrentHandlers = 20
+	tcpHandshakeDelay  = 100 * time.Millisecond
+	migrationDelay     = 50 * time.Millisecond
+)
+
 type DBPool struct {
-	Host        string
-	MaxConns    int
-	Connected   bool
+	Host      string
+	MaxConns  int
+	Connected bool
 }
 
-func main() {
+func createDBPool() *DBPool {
+	fmt.Println("  Connecting to database...")
+	time.Sleep(tcpHandshakeDelay)
+	fmt.Println("  Running migration check...")
+	time.Sleep(migrationDelay)
+	pool := &DBPool{Host: "postgres:5432", MaxConns: 25, Connected: true}
+	fmt.Println("  DB pool ready.")
+	return pool
+}
+
+func demonstrateSafeInit() {
 	var once sync.Once
 	var pool *DBPool
 	var wg sync.WaitGroup
-
-	initPool := func() {
-		fmt.Println("  Connecting to database...")
-		time.Sleep(100 * time.Millisecond) // simulate TCP handshake + auth
-		fmt.Println("  Running migration check...")
-		time.Sleep(50 * time.Millisecond) // simulate migration
-		pool = &DBPool{Host: "postgres:5432", MaxConns: 25, Connected: true}
-		fmt.Println("  DB pool ready.")
-	}
-
-	fmt.Println("=== Safe Initialization with sync.Once ===")
 	start := time.Now()
 
-	for i := 0; i < 20; i++ {
+	for i := 0; i < concurrentHandlers; i++ {
 		wg.Add(1)
 		go func(handlerID int) {
 			defer wg.Done()
-			once.Do(initPool) // only the first caller executes initPool
+			once.Do(func() { pool = createDBPool() }) // only the first caller executes
 			fmt.Printf("  Handler %d: using pool (connected=%v) at %v\n",
 				handlerID, pool.Connected, time.Since(start).Round(time.Millisecond))
 		}(i)
 	}
 
 	wg.Wait()
+}
+
+func main() {
+	fmt.Println("=== Safe Initialization with sync.Once ===")
+	demonstrateSafeInit()
 	fmt.Println("\nAll 20 handlers share the same pool. Initialization happened exactly once.")
 }
 ```
@@ -183,27 +207,34 @@ import (
 	"time"
 )
 
+const (
+	poolEstablishDelay = 80 * time.Millisecond
+	handlerCount       = 10
+)
+
 type DBPool struct {
 	Host     string
 	MaxConns int
 	PingOK   bool
 }
 
+func establishConnectionPool() *DBPool {
+	fmt.Println("  [init] Establishing connection pool...")
+	time.Sleep(poolEstablishDelay)
+	pool := &DBPool{
+		Host:     "postgres.internal:5432",
+		MaxConns: 25,
+		PingOK:   true,
+	}
+	fmt.Println("  [init] Pool ready.")
+	return pool
+}
+
 func main() {
-	getPool := sync.OnceValue(func() *DBPool {
-		fmt.Println("  [init] Establishing connection pool...")
-		time.Sleep(80 * time.Millisecond)
-		pool := &DBPool{
-			Host:     "postgres.internal:5432",
-			MaxConns: 25,
-			PingOK:   true,
-		}
-		fmt.Println("  [init] Pool ready.")
-		return pool
-	})
+	getPool := sync.OnceValue(establishConnectionPool)
 
 	var wg sync.WaitGroup
-	for i := 0; i < 10; i++ {
+	for i := 0; i < handlerCount; i++ {
 		wg.Add(1)
 		go func(handlerID int) {
 			defer wg.Done()
@@ -246,19 +277,23 @@ import (
 	"time"
 )
 
+const handlerCount = 5
+
+func applyDatabaseMigrations() {
+	fmt.Println("  [migrate] Checking schema version...")
+	time.Sleep(50 * time.Millisecond)
+	fmt.Println("  [migrate] Applying migration 001_create_users...")
+	time.Sleep(30 * time.Millisecond)
+	fmt.Println("  [migrate] Applying migration 002_add_sessions...")
+	time.Sleep(30 * time.Millisecond)
+	fmt.Println("  [migrate] All migrations applied.")
+}
+
 func main() {
-	runMigrations := sync.OnceFunc(func() {
-		fmt.Println("  [migrate] Checking schema version...")
-		time.Sleep(50 * time.Millisecond)
-		fmt.Println("  [migrate] Applying migration 001_create_users...")
-		time.Sleep(30 * time.Millisecond)
-		fmt.Println("  [migrate] Applying migration 002_add_sessions...")
-		time.Sleep(30 * time.Millisecond)
-		fmt.Println("  [migrate] All migrations applied.")
-	})
+	runMigrations := sync.OnceFunc(applyDatabaseMigrations)
 
 	var wg sync.WaitGroup
-	for i := 0; i < 5; i++ {
+	for i := 0; i < handlerCount; i++ {
 		wg.Add(1)
 		go func(handlerID int) {
 			defer wg.Done()

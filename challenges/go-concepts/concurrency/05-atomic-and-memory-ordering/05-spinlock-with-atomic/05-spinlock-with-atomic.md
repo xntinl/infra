@@ -39,52 +39,67 @@ import (
 	"sync/atomic"
 )
 
-type SpinLock struct {
-	state int32 // 0 = unlocked, 1 = locked
+const (
+	spinUnlocked int32 = 0
+	spinLocked   int32 = 1
+
+	goroutineCount   = 100
+	incrementsPerG   = 1000
+	expectedTotal    = goroutineCount * incrementsPerG
+)
+
+type Spinlock struct {
+	state int32
 }
 
-func (s *SpinLock) Lock() {
-	for !atomic.CompareAndSwapInt32(&s.state, 0, 1) {
-		// CAS failed: lock is held by another goroutine.
-		// Yield so the lock holder can run and eventually Unlock.
+func (s *Spinlock) Lock() {
+	for !atomic.CompareAndSwapInt32(&s.state, spinUnlocked, spinLocked) {
 		runtime.Gosched()
 	}
 }
 
-func (s *SpinLock) Unlock() {
-	atomic.StoreInt32(&s.state, 0)
+func (s *Spinlock) Unlock() {
+	atomic.StoreInt32(&s.state, spinUnlocked)
 }
 
-func (s *SpinLock) TryLock() bool {
-	return atomic.CompareAndSwapInt32(&s.state, 0, 1)
+func (s *Spinlock) TryLock() bool {
+	return atomic.CompareAndSwapInt32(&s.state, spinUnlocked, spinLocked)
 }
 
-func main() {
-	var lock SpinLock
+func incrementWithSpinlock(lock *Spinlock, counter *int64, wg *sync.WaitGroup) {
+	defer wg.Done()
+	for j := 0; j < incrementsPerG; j++ {
+		lock.Lock()
+		*counter++
+		lock.Unlock()
+	}
+}
+
+func verifySpinlockCorrectness(lock *Spinlock) {
 	var counter int64
 	var wg sync.WaitGroup
 
-	for i := 0; i < 100; i++ {
+	for i := 0; i < goroutineCount; i++ {
 		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for j := 0; j < 1000; j++ {
-				lock.Lock()
-				counter++
-				lock.Unlock()
-			}
-		}()
+		go incrementWithSpinlock(lock, &counter, &wg)
 	}
 
 	wg.Wait()
-	fmt.Printf("Expected: 100000, Got: %d\n", counter)
+	fmt.Printf("Expected: %d, Got: %d\n", expectedTotal, counter)
+}
 
-	// Demonstrate TryLock
+func demonstrateTryLock(lock *Spinlock) {
 	lock.Lock()
 	fmt.Printf("TryLock while held: %v (expected false)\n", lock.TryLock())
 	lock.Unlock()
 	fmt.Printf("TryLock while free: %v (expected true)\n", lock.TryLock())
 	lock.Unlock()
+}
+
+func main() {
+	var lock Spinlock
+	verifySpinlockCorrectness(&lock)
+	demonstrateTryLock(&lock)
 }
 ```
 
@@ -109,22 +124,56 @@ import (
 	"time"
 )
 
-type SpinLock struct {
+const (
+	spinUnlocked int32 = 0
+	spinLocked   int32 = 1
+)
+
+type Spinlock struct {
 	state int32
 }
 
-func (s *SpinLock) Lock() {
-	for !atomic.CompareAndSwapInt32(&s.state, 0, 1) {
+func (s *Spinlock) Lock() {
+	for !atomic.CompareAndSwapInt32(&s.state, spinUnlocked, spinLocked) {
 		runtime.Gosched()
 	}
 }
 
-func (s *SpinLock) Unlock() {
-	atomic.StoreInt32(&s.state, 0)
+func (s *Spinlock) Unlock() {
+	atomic.StoreInt32(&s.state, spinUnlocked)
 }
 
-func benchmarkSpinLock(goroutines, iterations int, workNanos int) time.Duration {
-	var lock SpinLock
+type ContentionScenario struct {
+	Name       string
+	Goroutines int
+	Iterations int
+	WorkNanos  int
+}
+
+type ComparisonResult struct {
+	SpinlockTime time.Duration
+	MutexTime    time.Duration
+}
+
+func (r ComparisonResult) Winner() string {
+	if float64(r.SpinlockTime)/float64(r.MutexTime) < 1 {
+		return "Spinlock"
+	}
+	return "Mutex"
+}
+
+func (r ComparisonResult) Ratio() float64 {
+	return float64(r.SpinlockTime) / float64(r.MutexTime)
+}
+
+func simulateCriticalSection(workNanos int) {
+	deadline := time.Now().Add(time.Duration(workNanos))
+	for time.Now().Before(deadline) {
+	}
+}
+
+func benchmarkSpinlock(goroutines, iterations, workNanos int) time.Duration {
+	var lock Spinlock
 	var counter int64
 	var wg sync.WaitGroup
 
@@ -135,11 +184,8 @@ func benchmarkSpinLock(goroutines, iterations int, workNanos int) time.Duration 
 			defer wg.Done()
 			for j := 0; j < iterations; j++ {
 				lock.Lock()
-				// Simulate work inside critical section
 				counter++
-				deadline := time.Now().Add(time.Duration(workNanos))
-				for time.Now().Before(deadline) {
-				}
+				simulateCriticalSection(workNanos)
 				lock.Unlock()
 			}
 		}()
@@ -148,7 +194,7 @@ func benchmarkSpinLock(goroutines, iterations int, workNanos int) time.Duration 
 	return time.Since(start)
 }
 
-func benchmarkMutex(goroutines, iterations int, workNanos int) time.Duration {
+func benchmarkMutex(goroutines, iterations, workNanos int) time.Duration {
 	var mu sync.Mutex
 	var counter int64
 	var wg sync.WaitGroup
@@ -161,9 +207,7 @@ func benchmarkMutex(goroutines, iterations int, workNanos int) time.Duration {
 			for j := 0; j < iterations; j++ {
 				mu.Lock()
 				counter++
-				deadline := time.Now().Add(time.Duration(workNanos))
-				for time.Now().Before(deadline) {
-				}
+				simulateCriticalSection(workNanos)
 				mu.Unlock()
 			}
 		}()
@@ -172,38 +216,32 @@ func benchmarkMutex(goroutines, iterations int, workNanos int) time.Duration {
 	return time.Since(start)
 }
 
-func main() {
-	cpus := runtime.GOMAXPROCS(0)
-	fmt.Printf("GOMAXPROCS: %d\n\n", cpus)
+func runComparison(s ContentionScenario) ComparisonResult {
+	return ComparisonResult{
+		SpinlockTime: benchmarkSpinlock(s.Goroutines, s.Iterations, s.WorkNanos),
+		MutexTime:    benchmarkMutex(s.Goroutines, s.Iterations, s.WorkNanos),
+	}
+}
 
-	scenarios := []struct {
-		name       string
-		goroutines int
-		iterations int
-		workNanos  int
-	}{
+func printComparison(s ContentionScenario, r ComparisonResult) {
+	fmt.Printf("%s:\n", s.Name)
+	fmt.Printf("  Spinlock: %v\n", r.SpinlockTime)
+	fmt.Printf("  Mutex:    %v\n", r.MutexTime)
+	fmt.Printf("  Winner:   %s (spin/mutex ratio: %.2f)\n\n", r.Winner(), r.Ratio())
+}
+
+func main() {
+	fmt.Printf("GOMAXPROCS: %d\n\n", runtime.GOMAXPROCS(0))
+
+	scenarios := []ContentionScenario{
 		{"Tiny critical section (no work)", 100, 1000, 0},
 		{"Short critical section (100ns)", 100, 100, 100},
 		{"Medium critical section (1us)", 50, 100, 1000},
 	}
 
 	for _, s := range scenarios {
-		spinTime := benchmarkSpinLock(s.goroutines, s.iterations, s.workNanos)
-		mutexTime := benchmarkMutex(s.goroutines, s.iterations, s.workNanos)
-
-		fmt.Printf("%s:\n", s.name)
-		fmt.Printf("  SpinLock: %v\n", spinTime)
-		fmt.Printf("  Mutex:    %v\n", mutexTime)
-
-		if mutexTime > 0 {
-			ratio := float64(spinTime) / float64(mutexTime)
-			winner := "Mutex"
-			if ratio < 1 {
-				winner = "SpinLock"
-			}
-			fmt.Printf("  Winner:   %s (spin/mutex ratio: %.2f)\n", winner, ratio)
-		}
-		fmt.Println()
+		result := runComparison(s)
+		printComparison(s, result)
 	}
 }
 ```
@@ -229,105 +267,111 @@ import (
 	"time"
 )
 
-type BadSpinLock struct {
+const (
+	spinUnlocked   int32 = 0
+	spinLocked     int32 = 1
+	testGoroutines       = 10
+	testIterations       = 100
+	deadlockTimeout      = 500 * time.Millisecond
+)
+
+type NoYieldSpinlock struct {
 	state int32
 }
 
-func (s *BadSpinLock) Lock() {
-	for !atomic.CompareAndSwapInt32(&s.state, 0, 1) {
+func (s *NoYieldSpinlock) Lock() {
+	for !atomic.CompareAndSwapInt32(&s.state, spinUnlocked, spinLocked) {
 		// NO Gosched! Tight spin holds the OS thread.
 	}
 }
 
-func (s *BadSpinLock) Unlock() {
-	atomic.StoreInt32(&s.state, 0)
+func (s *NoYieldSpinlock) Unlock() {
+	atomic.StoreInt32(&s.state, spinUnlocked)
 }
 
-type GoodSpinLock struct {
+type YieldingSpinlock struct {
 	state int32
 }
 
-func (s *GoodSpinLock) Lock() {
-	for !atomic.CompareAndSwapInt32(&s.state, 0, 1) {
-		runtime.Gosched() // yield so lock holder can run
+func (s *YieldingSpinlock) Lock() {
+	for !atomic.CompareAndSwapInt32(&s.state, spinUnlocked, spinLocked) {
+		runtime.Gosched()
 	}
 }
 
-func (s *GoodSpinLock) Unlock() {
-	atomic.StoreInt32(&s.state, 0)
+func (s *YieldingSpinlock) Unlock() {
+	atomic.StoreInt32(&s.state, spinUnlocked)
 }
 
-func main() {
-	// Test with GOMAXPROCS=1 to make the problem visible
-	runtime.GOMAXPROCS(1)
-	fmt.Println("Running with GOMAXPROCS=1")
-	fmt.Println()
-
-	// Good spinlock: works because Gosched yields to the lock holder
-	fmt.Println("Testing GoodSpinLock...")
-	var good GoodSpinLock
+func testYieldingSpinlock() {
+	fmt.Println("Testing YieldingSpinlock...")
+	var lock YieldingSpinlock
 	var wg sync.WaitGroup
 	var counter int64
 
 	start := time.Now()
-	for i := 0; i < 10; i++ {
+	for i := 0; i < testGoroutines; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for j := 0; j < 100; j++ {
-				good.Lock()
+			for j := 0; j < testIterations; j++ {
+				lock.Lock()
 				counter++
-				good.Unlock()
+				lock.Unlock()
 			}
 		}()
 	}
 	wg.Wait()
-	fmt.Printf("GoodSpinLock: counter=%d, time=%v\n", counter, time.Since(start))
-	fmt.Println()
+	fmt.Printf("YieldingSpinlock: counter=%d, time=%v\n\n", counter, time.Since(start))
+}
 
-	// Bad spinlock: with GOMAXPROCS=1, this would deadlock.
-	// We demonstrate the concept with a timeout instead of actually deadlocking.
-	fmt.Println("Testing BadSpinLock with timeout protection...")
-	var bad BadSpinLock
+func testNoYieldDeadlock() {
+	fmt.Println("Testing NoYieldSpinlock with timeout protection...")
+	var lock NoYieldSpinlock
 	done := make(chan bool, 1)
 
 	go func() {
-		bad.Lock()
-		var wg2 sync.WaitGroup
-		wg2.Add(1)
+		lock.Lock()
+		var wg sync.WaitGroup
+		wg.Add(1)
 		go func() {
-			defer wg2.Done()
-			bad.Lock() // with GOMAXPROCS=1, this spins forever
-			bad.Unlock()
+			defer wg.Done()
+			lock.Lock() // with GOMAXPROCS=1, this spins forever
+			lock.Unlock()
 		}()
 
-		// Give it a moment to show the problem
 		time.Sleep(100 * time.Millisecond)
-		bad.Unlock()
+		lock.Unlock()
 
-		// Check if the other goroutine completed
 		ch := make(chan struct{})
 		go func() {
-			wg2.Wait()
+			wg.Wait()
 			close(ch)
 		}()
 
 		select {
 		case <-ch:
 			done <- true
-		case <-time.After(500 * time.Millisecond):
+		case <-time.After(deadlockTimeout):
 			done <- false
 		}
 	}()
 
-	result := <-done
-	if result {
-		fmt.Println("BadSpinLock: completed (got lucky with scheduling)")
+	if <-done {
+		fmt.Println("NoYieldSpinlock: completed (got lucky with scheduling)")
 	} else {
-		fmt.Println("BadSpinLock: TIMED OUT - spinning goroutine starved the lock holder")
+		fmt.Println("NoYieldSpinlock: TIMED OUT - spinning goroutine starved the lock holder")
 	}
+}
 
-	// Restore GOMAXPROCS
+func main() {
+	runtime.GOMAXPROCS(1)
+	fmt.Println("Running with GOMAXPROCS=1")
+	fmt.Println()
+
+	testYieldingSpinlock()
+	testNoYieldDeadlock()
+
 	runtime.GOMAXPROCS(runtime.NumCPU())
 	fmt.Printf("\nRestored GOMAXPROCS=%d\n", runtime.GOMAXPROCS(0))
 }
@@ -354,27 +398,39 @@ import (
 	"time"
 )
 
-type SpinLock struct {
+const (
+	spinUnlocked int32 = 0
+	spinLocked   int32 = 1
+	goroutines         = 4
+	iterations         = 100000
+)
+
+type Spinlock struct {
 	state int32
 }
 
-func (s *SpinLock) Lock() {
-	for !atomic.CompareAndSwapInt32(&s.state, 0, 1) {
+func (s *Spinlock) Lock() {
+	for !atomic.CompareAndSwapInt32(&s.state, spinUnlocked, spinLocked) {
 		runtime.Gosched()
 	}
 }
 
-func (s *SpinLock) Unlock() {
-	atomic.StoreInt32(&s.state, 0)
+func (s *Spinlock) Unlock() {
+	atomic.StoreInt32(&s.state, spinUnlocked)
 }
 
-func main() {
-	const goroutines = 4
-	const iterations = 100000
+type ThreeWayResult struct {
+	SpinlockTime  time.Duration
+	SpinlockCount int64
+	MutexTime     time.Duration
+	MutexCount    int64
+	AtomicTime    time.Duration
+	AtomicCount   int64
+}
 
-	// 1. SpinLock protecting a counter
-	var spinLock SpinLock
-	var spinCounter int64
+func benchmarkSpinlockCounter() (time.Duration, int64) {
+	var lock Spinlock
+	var counter int64
 	var wg sync.WaitGroup
 
 	start := time.Now()
@@ -383,54 +439,74 @@ func main() {
 		go func() {
 			defer wg.Done()
 			for j := 0; j < iterations; j++ {
-				spinLock.Lock()
-				spinCounter++
-				spinLock.Unlock()
+				lock.Lock()
+				counter++
+				lock.Unlock()
 			}
 		}()
 	}
 	wg.Wait()
-	spinTime := time.Since(start)
+	return time.Since(start), counter
+}
 
-	// 2. sync.Mutex protecting a counter
+func benchmarkMutexCounter() (time.Duration, int64) {
 	var mu sync.Mutex
-	var mutexCounter int64
+	var counter int64
+	var wg sync.WaitGroup
 
-	start = time.Now()
+	start := time.Now()
 	for i := 0; i < goroutines; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for j := 0; j < iterations; j++ {
 				mu.Lock()
-				mutexCounter++
+				counter++
 				mu.Unlock()
 			}
 		}()
 	}
 	wg.Wait()
-	mutexTime := time.Since(start)
+	return time.Since(start), counter
+}
 
-	// 3. Atomic (no lock at all)
-	var atomicCounter atomic.Int64
+func benchmarkAtomicCounter() (time.Duration, int64) {
+	var counter atomic.Int64
+	var wg sync.WaitGroup
 
-	start = time.Now()
+	start := time.Now()
 	for i := 0; i < goroutines; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for j := 0; j < iterations; j++ {
-				atomicCounter.Add(1)
+				counter.Add(1)
 			}
 		}()
 	}
 	wg.Wait()
-	atomicTime := time.Since(start)
+	return time.Since(start), counter.Load()
+}
 
+func runThreeWayComparison() ThreeWayResult {
+	spinT, spinC := benchmarkSpinlockCounter()
+	mutexT, mutexC := benchmarkMutexCounter()
+	atomicT, atomicC := benchmarkAtomicCounter()
+	return ThreeWayResult{
+		SpinlockTime: spinT, SpinlockCount: spinC,
+		MutexTime: mutexT, MutexCount: mutexC,
+		AtomicTime: atomicT, AtomicCount: atomicC,
+	}
+}
+
+func printResults(r ThreeWayResult) {
 	fmt.Printf("=== Single Counter, %d goroutines x %d iterations ===\n\n", goroutines, iterations)
-	fmt.Printf("SpinLock: %v (counter=%d)\n", spinTime, spinCounter)
-	fmt.Printf("Mutex:    %v (counter=%d)\n", mutexTime, mutexCounter)
-	fmt.Printf("Atomic:   %v (counter=%d)\n", atomicTime, atomicCounter.Load())
+	fmt.Printf("Spinlock: %v (counter=%d)\n", r.SpinlockTime, r.SpinlockCount)
+	fmt.Printf("Mutex:    %v (counter=%d)\n", r.MutexTime, r.MutexCount)
+	fmt.Printf("Atomic:   %v (counter=%d)\n", r.AtomicTime, r.AtomicCount)
+}
+
+func printInsights() {
 	fmt.Println()
 	fmt.Println("Key insight: if your critical section is just a counter increment,")
 	fmt.Println("use atomic.Add -- it is faster than any lock, spinlock or otherwise.")
@@ -440,6 +516,12 @@ func main() {
 	fmt.Println("  2. Contention is very low (few goroutines, short hold times)")
 	fmt.Println("  3. Goroutine parking overhead is unacceptable (real-time constraints)")
 	fmt.Println("  4. You have measured and proven it is actually faster for YOUR case")
+}
+
+func main() {
+	result := runThreeWayComparison()
+	printResults(result)
+	printInsights()
 }
 ```
 
@@ -467,20 +549,20 @@ package main
 
 import "sync/atomic"
 
-type SpinLock struct{ state int32 }
+type TightSpinlock struct{ state int32 }
 
-func (s *SpinLock) Lock() {
+func (s *TightSpinlock) Lock() {
 	for !atomic.CompareAndSwapInt32(&s.state, 0, 1) {
 		// tight spin -- holds OS thread, starves other goroutines
 	}
 }
 
-func (s *SpinLock) Unlock() {
+func (s *TightSpinlock) Unlock() {
 	atomic.StoreInt32(&s.state, 0)
 }
 
 func main() {
-	var lock SpinLock
+	var lock TightSpinlock
 	lock.Lock()
 	lock.Unlock()
 }

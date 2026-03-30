@@ -45,58 +45,62 @@ import (
 	"time"
 )
 
+const backendCount = 3
+
+// SearchResult holds the response from a single backend query.
 type SearchResult struct {
 	Backend string
 	Items   []string
 	Latency time.Duration
 }
 
-func queryUserDB(query string) <-chan SearchResult {
+// BackendQuery defines a simulated backend with its latency and items.
+type BackendQuery struct {
+	Name    string
+	Latency time.Duration
+	Items   []string
+}
+
+// SearchAggregator queries multiple backends and merges results.
+type SearchAggregator struct {
+	backends []BackendQuery
+}
+
+func NewSearchAggregator(query string) *SearchAggregator {
+	return &SearchAggregator{
+		backends: []BackendQuery{
+			{
+				Name: "users", Latency: 120 * time.Millisecond,
+				Items: []string{"user:alice (matches '" + query + "')", "user:bob (matches '" + query + "')"},
+			},
+			{
+				Name: "products", Latency: 80 * time.Millisecond,
+				Items: []string{"product:Laptop Pro", "product:Laptop Air", "product:Laptop Stand"},
+			},
+			{
+				Name: "orders", Latency: 150 * time.Millisecond,
+				Items: []string{"order:#1042 Laptop Pro", "order:#1099 Laptop Air"},
+			},
+		},
+	}
+}
+
+func (sa *SearchAggregator) queryBackend(bq BackendQuery) <-chan SearchResult {
 	out := make(chan SearchResult)
 	go func() {
+		defer close(out)
 		start := time.Now()
-		time.Sleep(120 * time.Millisecond)
+		time.Sleep(bq.Latency)
 		out <- SearchResult{
-			Backend: "users",
-			Items:   []string{"user:alice (matches '" + query + "')", "user:bob (matches '" + query + "')"},
+			Backend: bq.Name,
+			Items:   bq.Items,
 			Latency: time.Since(start),
 		}
-		close(out)
 	}()
 	return out
 }
 
-func queryProductDB(query string) <-chan SearchResult {
-	out := make(chan SearchResult)
-	go func() {
-		start := time.Now()
-		time.Sleep(80 * time.Millisecond)
-		out <- SearchResult{
-			Backend: "products",
-			Items:   []string{"product:Laptop Pro", "product:Laptop Air", "product:Laptop Stand"},
-			Latency: time.Since(start),
-		}
-		close(out)
-	}()
-	return out
-}
-
-func queryOrderDB(query string) <-chan SearchResult {
-	out := make(chan SearchResult)
-	go func() {
-		start := time.Now()
-		time.Sleep(150 * time.Millisecond)
-		out <- SearchResult{
-			Backend: "orders",
-			Items:   []string{"order:#1042 Laptop Pro", "order:#1099 Laptop Air"},
-			Latency: time.Since(start),
-		}
-		close(out)
-	}()
-	return out
-}
-
-func merge(channels ...<-chan SearchResult) <-chan SearchResult {
+func mergeResults(channels ...<-chan SearchResult) <-chan SearchResult {
 	out := make(chan SearchResult)
 	var wg sync.WaitGroup
 
@@ -118,19 +122,19 @@ func merge(channels ...<-chan SearchResult) <-chan SearchResult {
 	return out
 }
 
-func main() {
-	query := "laptop"
+func (sa *SearchAggregator) Search(query string) {
 	fmt.Printf("=== Search Aggregator for '%s' ===\n\n", query)
-
 	start := time.Now()
-	results := merge(
-		queryUserDB(query),
-		queryProductDB(query),
-		queryOrderDB(query),
-	)
+
+	channels := make([]<-chan SearchResult, len(sa.backends))
+	for i, bq := range sa.backends {
+		channels[i] = sa.queryBackend(bq)
+	}
+
+	merged := mergeResults(channels...)
 
 	var totalItems int
-	for r := range results {
+	for r := range merged {
 		fmt.Printf("  [%s] %d results (latency: %v)\n", r.Backend, len(r.Items), r.Latency)
 		for _, item := range r.Items {
 			fmt.Printf("    - %s\n", item)
@@ -138,7 +142,13 @@ func main() {
 		totalItems += len(r.Items)
 	}
 
-	fmt.Printf("\n  Total: %d items from 3 backends in %v\n", totalItems, time.Since(start))
+	fmt.Printf("\n  Total: %d items from %d backends in %v\n", totalItems, backendCount, time.Since(start))
+}
+
+func main() {
+	query := "laptop"
+	aggregator := NewSearchAggregator(query)
+	aggregator.Search(query)
 }
 ```
 
@@ -179,24 +189,49 @@ import (
 	"time"
 )
 
+// SearchResult holds the response from a single backend query.
 type SearchResult struct {
 	Backend string
 	Count   int
 	Latency time.Duration
 }
 
-func queryBackend(name string, latency time.Duration, count int) <-chan SearchResult {
+// BackendSpec defines a simulated backend with its expected latency and result count.
+type BackendSpec struct {
+	Name    string
+	Latency time.Duration
+	Count   int
+}
+
+// SearchAggregator compares sequential vs fan-in query strategies.
+type SearchAggregator struct {
+	backends []BackendSpec
+}
+
+func NewSearchAggregator() *SearchAggregator {
+	return &SearchAggregator{
+		backends: []BackendSpec{
+			{"users", 120 * time.Millisecond, 15},
+			{"products", 80 * time.Millisecond, 42},
+			{"orders", 150 * time.Millisecond, 8},
+			{"inventory", 100 * time.Millisecond, 23},
+			{"reviews", 200 * time.Millisecond, 31},
+		},
+	}
+}
+
+func (sa *SearchAggregator) queryBackend(spec BackendSpec) <-chan SearchResult {
 	out := make(chan SearchResult)
 	go func() {
+		defer close(out)
 		start := time.Now()
-		time.Sleep(latency)
-		out <- SearchResult{Backend: name, Count: count, Latency: time.Since(start)}
-		close(out)
+		time.Sleep(spec.Latency)
+		out <- SearchResult{Backend: spec.Name, Count: spec.Count, Latency: time.Since(start)}
 	}()
 	return out
 }
 
-func merge(channels ...<-chan SearchResult) <-chan SearchResult {
+func mergeResults(channels ...<-chan SearchResult) <-chan SearchResult {
 	out := make(chan SearchResult)
 	var wg sync.WaitGroup
 	for _, ch := range channels {
@@ -215,45 +250,41 @@ func merge(channels ...<-chan SearchResult) <-chan SearchResult {
 	return out
 }
 
-func main() {
-	backends := []struct {
-		name    string
-		latency time.Duration
-		count   int
-	}{
-		{"users", 120 * time.Millisecond, 15},
-		{"products", 80 * time.Millisecond, 42},
-		{"orders", 150 * time.Millisecond, 8},
-		{"inventory", 100 * time.Millisecond, 23},
-		{"reviews", 200 * time.Millisecond, 31},
-	}
-
-	// Sequential
+func (sa *SearchAggregator) RunSequential() {
 	fmt.Println("=== Sequential Queries ===")
 	start := time.Now()
-	var seqTotal int
-	for _, b := range backends {
-		time.Sleep(b.latency)
-		seqTotal += b.count
-		fmt.Printf("  [%s] %d results (%v)\n", b.name, b.count, b.latency)
+	var total int
+	for _, b := range sa.backends {
+		time.Sleep(b.Latency)
+		total += b.Count
+		fmt.Printf("  [%s] %d results (%v)\n", b.Name, b.Count, b.Latency)
 	}
-	fmt.Printf("  Total: %d results in %v\n\n", seqTotal, time.Since(start))
+	fmt.Printf("  Total: %d results in %v\n\n", total, time.Since(start))
+}
 
-	// Fan-in
+func (sa *SearchAggregator) RunFanIn() {
 	fmt.Println("=== Fan-In Queries ===")
-	start = time.Now()
-	channels := make([]<-chan SearchResult, len(backends))
-	for i, b := range backends {
-		channels[i] = queryBackend(b.name, b.latency, b.count)
-	}
-	merged := merge(channels...)
+	start := time.Now()
 
-	var fanInTotal int
+	channels := make([]<-chan SearchResult, len(sa.backends))
+	for i, b := range sa.backends {
+		channels[i] = sa.queryBackend(b)
+	}
+	merged := mergeResults(channels...)
+
+	var total int
 	for r := range merged {
-		fanInTotal += r.Count
+		total += r.Count
 		fmt.Printf("  [%s] %d results (%v)\n", r.Backend, r.Count, r.Latency)
 	}
-	fmt.Printf("  Total: %d results in %v\n\n", fanInTotal, time.Since(start))
+	fmt.Printf("  Total: %d results in %v\n\n", total, time.Since(start))
+}
+
+func main() {
+	aggregator := NewSearchAggregator()
+
+	aggregator.RunSequential()
+	aggregator.RunFanIn()
 
 	fmt.Println("Fan-in latency = max(all backend latencies) instead of sum(all)")
 }
@@ -298,21 +329,35 @@ import (
 	"time"
 )
 
+const (
+	rankingWorkerCount = 3
+	laptopBonus        = 5.0
+	lengthFactor       = 0.1
+)
+
+// RawResult is an unranked item from a backend.
 type RawResult struct {
 	Backend string
 	Item    string
 }
 
+// RankedResult is an item scored by a ranking worker.
 type RankedResult struct {
 	Item     string
 	Score    float64
 	WorkerID int
 }
 
-func generateResults() <-chan RawResult {
-	out := make(chan RawResult)
-	go func() {
-		items := []RawResult{
+// SearchRankingPipeline fans out raw results to ranking workers, then merges.
+type SearchRankingPipeline struct {
+	items      []RawResult
+	numWorkers int
+}
+
+func NewSearchRankingPipeline(numWorkers int) *SearchRankingPipeline {
+	return &SearchRankingPipeline{
+		numWorkers: numWorkers,
+		items: []RawResult{
 			{"users", "alice@company.com"},
 			{"users", "bob@company.com"},
 			{"products", "Laptop Pro 16"},
@@ -323,31 +368,41 @@ func generateResults() <-chan RawResult {
 			{"products", "Laptop Stand"},
 			{"users", "charlie@company.com"},
 			{"orders", "Order #1150"},
-		}
-		for _, item := range items {
+		},
+	}
+}
+
+func (srp *SearchRankingPipeline) generateResults() <-chan RawResult {
+	out := make(chan RawResult)
+	go func() {
+		defer close(out)
+		for _, item := range srp.items {
 			out <- item
 		}
-		close(out)
 	}()
 	return out
+}
+
+func computeScore(item string) float64 {
+	score := float64(len(item)) * lengthFactor
+	if strings.Contains(strings.ToLower(item), "laptop") {
+		score += laptopBonus
+	}
+	return score
 }
 
 func rankWorker(id int, in <-chan RawResult) <-chan RankedResult {
 	out := make(chan RankedResult)
 	go func() {
+		defer close(out)
 		for raw := range in {
 			time.Sleep(30 * time.Millisecond)
-			score := float64(len(raw.Item)) * 0.1
-			if strings.Contains(strings.ToLower(raw.Item), "laptop") {
-				score += 5.0
-			}
 			out <- RankedResult{
 				Item:     fmt.Sprintf("[%s] %s", raw.Backend, raw.Item),
-				Score:    score,
+				Score:    computeScore(raw.Item),
 				WorkerID: id,
 			}
 		}
-		close(out)
 	}()
 	return out
 }
@@ -371,21 +426,18 @@ func mergeRanked(channels ...<-chan RankedResult) <-chan RankedResult {
 	return out
 }
 
-func main() {
+func (srp *SearchRankingPipeline) Run() {
 	fmt.Println("=== Fan-Out/Fan-In: Search Ranking Pipeline ===")
 	fmt.Println()
 
 	start := time.Now()
-	input := generateResults()
+	input := srp.generateResults()
 
-	// Fan-out: 3 ranking workers share the input
-	numWorkers := 3
-	workers := make([]<-chan RankedResult, numWorkers)
-	for i := 0; i < numWorkers; i++ {
+	workers := make([]<-chan RankedResult, srp.numWorkers)
+	for i := 0; i < srp.numWorkers; i++ {
 		workers[i] = rankWorker(i+1, input)
 	}
 
-	// Fan-in: merge all worker outputs
 	merged := mergeRanked(workers...)
 
 	fmt.Println("  Ranked results:")
@@ -394,7 +446,12 @@ func main() {
 		count++
 		fmt.Printf("    %.1f  %s  (worker %d)\n", r.Score, r.Item, r.WorkerID)
 	}
-	fmt.Printf("\n  %d results ranked by %d workers in %v\n", count, numWorkers, time.Since(start))
+	fmt.Printf("\n  %d results ranked by %d workers in %v\n", count, srp.numWorkers, time.Since(start))
+}
+
+func main() {
+	pipeline := NewSearchRankingPipeline(rankingWorkerCount)
+	pipeline.Run()
 }
 ```
 

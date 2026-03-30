@@ -38,32 +38,41 @@ import (
 	"time"
 )
 
-func handleConnection(id int, done <-chan struct{}) {
-	// Phase 1: Read request
-	time.Sleep(1 * time.Millisecond)
-	// Phase 2: Process
-	time.Sleep(1 * time.Millisecond)
-	// Phase 3: Send response
-	time.Sleep(1 * time.Millisecond)
-	<-done
+const (
+	simulatedConnections = 10_000
+	phaseDelay           = 1 * time.Millisecond
+	settleDelay          = 50 * time.Millisecond
+)
+
+func handleConnection(done <-chan struct{}) {
+	time.Sleep(phaseDelay) // Phase 1: Read request
+	time.Sleep(phaseDelay) // Phase 2: Process
+	time.Sleep(phaseDelay) // Phase 3: Send response
+	<-done                 // Keep-alive: wait for disconnect signal
+}
+
+func launchConnections(count int, done <-chan struct{}) {
+	for i := 0; i < count; i++ {
+		go handleConnection(done)
+	}
+}
+
+func printGoroutineCount(label string) {
+	fmt.Printf("%-20s %d goroutines\n", label, runtime.NumGoroutine())
 }
 
 func main() {
-	fmt.Printf("Goroutines at start: %d\n", runtime.NumGoroutine())
+	printGoroutineCount("Goroutines at start:")
 
-	const connections = 10_000
 	done := make(chan struct{})
+	launchConnections(simulatedConnections, done)
 
-	for i := 0; i < connections; i++ {
-		go handleConnection(i, done)
-	}
-
-	time.Sleep(50 * time.Millisecond)
-	fmt.Printf("Active connections:  %d goroutines\n", runtime.NumGoroutine())
+	time.Sleep(settleDelay)
+	printGoroutineCount("Active connections:")
 
 	close(done)
-	time.Sleep(50 * time.Millisecond)
-	fmt.Printf("After disconnect:    %d goroutines\n", runtime.NumGoroutine())
+	time.Sleep(settleDelay)
+	printGoroutineCount("After disconnect:")
 }
 ```
 
@@ -97,29 +106,38 @@ import (
 	"time"
 )
 
-func main() {
-	var before, after runtime.MemStats
+const (
+	connectionCount     = 100_000
+	osThreadStackBytes  = 8 * 1024 * 1024 // 8 MB per OS thread
+	connectionSettleMs  = 200
+)
 
+type MemorySnapshot struct {
+	Before runtime.MemStats
+	After  runtime.MemStats
+}
+
+func captureBaseline() runtime.MemStats {
 	runtime.GC()
-	runtime.ReadMemStats(&before)
+	var stats runtime.MemStats
+	runtime.ReadMemStats(&stats)
+	return stats
+}
 
-	const count = 100_000
-	done := make(chan struct{})
+func simulateConnectionHandler(done <-chan struct{}) {
+	time.Sleep(1 * time.Millisecond)
+	<-done
+}
 
+func launchConnectionHandlers(count int, done <-chan struct{}) {
 	for i := 0; i < count; i++ {
-		go func() {
-			// Simulate a connection handler: read, process, respond, wait
-			time.Sleep(1 * time.Millisecond)
-			<-done
-		}()
+		go simulateConnectionHandler(done)
 	}
-	time.Sleep(200 * time.Millisecond)
+}
 
-	runtime.GC()
-	runtime.ReadMemStats(&after)
-
+func printMemoryComparison(before, after runtime.MemStats, count int) {
 	totalBytes := after.Sys - before.Sys
-	perGoroutine := totalBytes / count
+	perGoroutine := totalBytes / uint64(count)
 
 	fmt.Printf("Simulated connections:  %d\n", count)
 	fmt.Printf("Active goroutines:     %d\n", runtime.NumGoroutine())
@@ -127,13 +145,27 @@ func main() {
 	fmt.Printf("Per connection:        ~%d bytes (~%.1f KB)\n", perGoroutine, float64(perGoroutine)/1024)
 
 	fmt.Println()
-	osThreadMem := uint64(count) * 8 * 1024 * 1024
+	osThreadMem := uint64(count) * osThreadStackBytes
 	fmt.Printf("Same connections as OS threads (8MB stack each):\n")
 	fmt.Printf("  Would require:       %.2f GB\n", float64(osThreadMem)/(1024*1024*1024))
 	fmt.Printf("  Goroutine advantage: ~%dx less memory\n", osThreadMem/totalBytes)
+}
+
+func main() {
+	before := captureBaseline()
+
+	done := make(chan struct{})
+	launchConnectionHandlers(connectionCount, done)
+	time.Sleep(connectionSettleMs * time.Millisecond)
+
+	runtime.GC()
+	var after runtime.MemStats
+	runtime.ReadMemStats(&after)
+
+	printMemoryComparison(before, after, connectionCount)
 
 	close(done)
-	time.Sleep(200 * time.Millisecond)
+	time.Sleep(connectionSettleMs * time.Millisecond)
 }
 ```
 
@@ -171,6 +203,19 @@ import (
 	"strings"
 )
 
+const (
+	goroutineStackCost = 8 * 1024       // 8 KB per goroutine
+	osThreadStackCost  = 8 * 1024 * 1024 // 8 MB per OS thread
+	ramUsableFraction  = 2               // use 50% of RAM for stacks
+)
+
+type CapacityRow struct {
+	RAMLabel       string
+	GoConnections  int
+	ThreadConns    int
+	Advantage      int
+}
+
 func formatCount(n int) string {
 	switch {
 	case n >= 1_000_000:
@@ -182,12 +227,20 @@ func formatCount(n int) string {
 	}
 }
 
-func main() {
-	goroutineCost := 8 * 1024       // 8 KB per goroutine
-	osThreadCost := 8 * 1024 * 1024 // 8 MB per OS thread
+func calculateCapacity(ramGB int) CapacityRow {
+	availableBytes := ramGB * 1024 * 1024 * 1024 / ramUsableFraction
+	goConns := availableBytes / goroutineStackCost
+	threadConns := availableBytes / osThreadStackCost
 
-	serverRAMs := []int{1, 4, 8, 16, 32, 64} // GB
+	return CapacityRow{
+		RAMLabel:      fmt.Sprintf("%d GB", ramGB),
+		GoConnections: goConns,
+		ThreadConns:   threadConns,
+		Advantage:     goConns / threadConns,
+	}
+}
 
+func printCapacityTable(serverRAMs []int) {
 	fmt.Println("=== Maximum Concurrent Connections by Server RAM ===")
 	fmt.Println("(assuming 50% of RAM available for connection stacks)")
 	fmt.Println()
@@ -195,22 +248,23 @@ func main() {
 	fmt.Println(strings.Repeat("-", 68))
 
 	for _, gb := range serverRAMs {
-		availableBytes := gb * 1024 * 1024 * 1024 / 2 // 50% for stacks
-		goConns := availableBytes / goroutineCost
-		threadConns := availableBytes / osThreadCost
-		advantage := goConns / threadConns
-
+		row := calculateCapacity(gb)
 		fmt.Printf("%-10s %-22s %-22s %-10s\n",
-			fmt.Sprintf("%d GB", gb),
-			formatCount(goConns),
-			formatCount(threadConns),
-			fmt.Sprintf("%dx", advantage),
+			row.RAMLabel,
+			formatCount(row.GoConnections),
+			formatCount(row.ThreadConns),
+			fmt.Sprintf("%dx", row.Advantage),
 		)
 	}
 
 	fmt.Println()
 	fmt.Println("This is why Go servers use goroutine-per-connection while")
 	fmt.Println("Java/C++ servers need thread pools with connection queuing.")
+}
+
+func main() {
+	serverRAMs := []int{1, 4, 8, 16, 32, 64}
+	printCapacityTable(serverRAMs)
 }
 ```
 
@@ -251,48 +305,72 @@ import (
 	"time"
 )
 
-func main() {
-	scales := []int{1_000, 5_000, 10_000, 50_000}
+const (
+	osThreadStackSize   = 8 * 1024 * 1024
+	measureSettleDelay  = 100 * time.Millisecond
+	cleanupDelay        = 200 * time.Millisecond
+)
 
+type StackMeasurement struct {
+	Count        int
+	StackInUse   uint64
+	PerGoroutine uint64
+	OSEquivalent uint64
+}
+
+func measureStackAtScale(count int) StackMeasurement {
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+
+	done := make(chan struct{})
+	for i := 0; i < count; i++ {
+		go func() {
+			<-done
+		}()
+	}
+	time.Sleep(measureSettleDelay)
+
+	runtime.ReadMemStats(&after)
+
+	stackInUse := after.StackInuse - before.StackInuse
+
+	close(done)
+	time.Sleep(cleanupDelay)
+	runtime.GC()
+
+	return StackMeasurement{
+		Count:        count,
+		StackInUse:   stackInUse,
+		PerGoroutine: stackInUse / uint64(count),
+		OSEquivalent: uint64(count) * osThreadStackSize,
+	}
+}
+
+func printStackTable(scales []int) {
 	fmt.Println("=== Goroutine Stack Memory at Different Connection Scales ===")
 	fmt.Printf("%-12s %-15s %-18s %-15s\n",
 		"Connections", "Stack/conn", "Total Stack", "OS Thread Equiv")
 	fmt.Println(strings.Repeat("-", 65))
 
 	for _, count := range scales {
-		var before, after runtime.MemStats
-		runtime.GC()
-		runtime.ReadMemStats(&before)
-
-		done := make(chan struct{})
-		for i := 0; i < count; i++ {
-			go func() {
-				<-done
-			}()
-		}
-		time.Sleep(100 * time.Millisecond)
-
-		runtime.ReadMemStats(&after)
-
-		stackInUse := after.StackInuse - before.StackInuse
-		perGoroutine := stackInUse / uint64(count)
-		osEquiv := uint64(count) * 8 * 1024 * 1024
-
+		m := measureStackAtScale(count)
 		fmt.Printf("%-12d %-15s %-18s %-15s\n",
-			count,
-			fmt.Sprintf("%d B (%.1f KB)", perGoroutine, float64(perGoroutine)/1024),
-			fmt.Sprintf("%.2f MB", float64(stackInUse)/(1024*1024)),
-			fmt.Sprintf("%.2f GB", float64(osEquiv)/(1024*1024*1024)),
+			m.Count,
+			fmt.Sprintf("%d B (%.1f KB)", m.PerGoroutine, float64(m.PerGoroutine)/1024),
+			fmt.Sprintf("%.2f MB", float64(m.StackInUse)/(1024*1024)),
+			fmt.Sprintf("%.2f GB", float64(m.OSEquivalent)/(1024*1024*1024)),
 		)
-
-		close(done)
-		time.Sleep(200 * time.Millisecond)
-		runtime.GC()
 	}
 
 	fmt.Println()
 	fmt.Println("StackInuse measures ONLY stack memory, not heap or runtime overhead.")
 	fmt.Println("This is the most accurate metric for goroutine stack consumption.")
+}
+
+func main() {
+	scales := []int{1_000, 5_000, 10_000, 50_000}
+	printStackTable(scales)
 }
 ```
 
@@ -338,9 +416,11 @@ import (
 	"runtime"
 )
 
+const leakedHandlerCount = 10_000
+
 func main() {
 	done := make(chan struct{})
-	for i := 0; i < 10000; i++ {
+	for i := 0; i < leakedHandlerCount; i++ {
 		go func() {
 			<-done // blocks forever if done is never closed
 		}()
@@ -362,17 +442,24 @@ import (
 	"time"
 )
 
-func main() {
-	done := make(chan struct{})
-	for i := 0; i < 10000; i++ {
+const handlerCount = 10_000
+
+func launchBlockingHandlers(count int, done <-chan struct{}) {
+	for i := 0; i < count; i++ {
 		go func() {
 			<-done
 		}()
 	}
+}
+
+func main() {
+	done := make(chan struct{})
+	launchBlockingHandlers(handlerCount, done)
+
 	time.Sleep(10 * time.Millisecond)
 	fmt.Printf("Before cleanup: %d goroutines\n", runtime.NumGoroutine())
 
-	close(done) // release all goroutines
+	close(done)
 	time.Sleep(10 * time.Millisecond)
 	fmt.Printf("After cleanup:  %d goroutines\n", runtime.NumGoroutine())
 }

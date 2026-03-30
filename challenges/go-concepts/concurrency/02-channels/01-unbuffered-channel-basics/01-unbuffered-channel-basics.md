@@ -31,20 +31,23 @@ package main
 
 import "fmt"
 
+// processJob receives a single print job from the queue and prints it.
+// The queue parameter is receive-only: this function can only consume jobs.
+func processJob(queue <-chan string) {
+	job := <-queue
+	fmt.Println("Printer: processing", job)
+}
+
 func main() {
-    // make(chan T) creates an unbuffered channel of type T.
-    // Zero capacity means every send blocks until a receiver is ready.
-    printQueue := make(chan string)
+	// make(chan T) creates an unbuffered channel of type T.
+	// Zero capacity means every send blocks until a receiver is ready.
+	printQueue := make(chan string)
 
-    // Launch the print worker. It receives one job at a time.
-    go func() {
-        job := <-printQueue
-        fmt.Println("Printer: processing", job)
-    }()
+	go processJob(printQueue)
 
-    // Send a print job. This blocks until the worker calls <-printQueue.
-    printQueue <- "invoice-2024.pdf"
-    fmt.Println("Main: job accepted by printer")
+	// Send a print job. This blocks until the worker calls <-printQueue.
+	printQueue <- "invoice-2024.pdf"
+	fmt.Println("Main: job accepted by printer")
 }
 ```
 
@@ -70,28 +73,38 @@ The rendezvous property means the sender is suspended until a receiver is ready.
 package main
 
 import (
-    "fmt"
-    "time"
+	"fmt"
+	"time"
 )
 
+const printerBusyDelay = 500 * time.Millisecond
+const drainDelay = 50 * time.Millisecond
+
+// submitJob sends a document into the print queue, blocking until
+// the printer is ready to accept it.
+func submitJob(queue chan<- string, document string) {
+	fmt.Println("Worker: ready to send job to printer (will block here)")
+	queue <- document
+	fmt.Println("Worker: job handed off to printer successfully")
+}
+
+// acceptJob simulates a busy printer that becomes ready after a delay,
+// then receives the next job from the queue.
+func acceptJob(queue <-chan string, busyDuration time.Duration) string {
+	time.Sleep(busyDuration)
+	fmt.Println("Printer: now ready to accept job")
+	return <-queue
+}
+
 func main() {
-    printQueue := make(chan string)
+	printQueue := make(chan string)
 
-    go func() {
-        fmt.Println("Worker: ready to send job to printer (will block here)")
-        printQueue <- "quarterly-report.pdf"
-        fmt.Println("Worker: job handed off to printer successfully")
-    }()
+	go submitJob(printQueue, "quarterly-report.pdf")
 
-    // Simulate the printer being busy for 500ms.
-    // The worker goroutine is blocked on send the entire time.
-    time.Sleep(500 * time.Millisecond)
-    fmt.Println("Printer: now ready to accept job")
+	job := acceptJob(printQueue, printerBusyDelay)
+	fmt.Printf("Printer: received %q\n", job)
 
-    job := <-printQueue
-    fmt.Printf("Printer: received %q\n", job)
-
-    time.Sleep(50 * time.Millisecond)
+	time.Sleep(drainDelay)
 }
 ```
 
@@ -115,31 +128,41 @@ Each send/receive pair is a separate synchronization point. Three print jobs flo
 package main
 
 import (
-    "fmt"
-    "time"
+	"fmt"
+	"time"
 )
 
+const printDuration = 100 * time.Millisecond
+const finalDrainDelay = 150 * time.Millisecond
+
+// printWorker receives exactly jobCount jobs from the queue,
+// simulating a print operation for each one.
+func printWorker(queue <-chan string, jobCount int) {
+	for i := 0; i < jobCount; i++ {
+		job := <-queue
+		fmt.Printf("Printer: printing %s...\n", job)
+		time.Sleep(printDuration)
+		fmt.Printf("Printer: finished %s\n", job)
+	}
+}
+
+// submitJobs sends each job to the print queue. Each send blocks
+// until the worker receives, proving the synchronous handoff.
+func submitJobs(queue chan<- string, jobs []string) {
+	for _, job := range jobs {
+		queue <- job
+		fmt.Printf("Main: %s accepted by printer\n", job)
+	}
+}
+
 func main() {
-    printQueue := make(chan string)
+	printQueue := make(chan string)
+	jobs := []string{"invoice.pdf", "contract.pdf", "memo.pdf"}
 
-    // Worker goroutine: receives and "prints" each document.
-    go func() {
-        for i := 0; i < 3; i++ {
-            job := <-printQueue
-            fmt.Printf("Printer: printing %s...\n", job)
-            time.Sleep(100 * time.Millisecond)
-            fmt.Printf("Printer: finished %s\n", job)
-        }
-    }()
+	go printWorker(printQueue, len(jobs))
+	submitJobs(printQueue, jobs)
 
-    // Main sends three jobs. Each send blocks until the worker receives.
-    jobs := []string{"invoice.pdf", "contract.pdf", "memo.pdf"}
-    for _, job := range jobs {
-        printQueue <- job
-        fmt.Printf("Main: %s accepted by printer\n", job)
-    }
-
-    time.Sleep(150 * time.Millisecond)
+	time.Sleep(finalDrainDelay)
 }
 ```
 
@@ -182,34 +205,42 @@ package main
 
 import "fmt"
 
+// PrintJob represents a document queued for printing.
 type PrintJob struct {
-    Document string
-    Pages    int
-    Priority string
+	Document string
+	Pages    int
+	Priority string
+}
+
+// processPrintJob receives a single PrintJob and displays its details.
+func processPrintJob(queue <-chan PrintJob) {
+	job := <-queue
+	fmt.Printf("Printer: %s (%d pages, priority: %s)\n",
+		job.Document, job.Pages, job.Priority)
+}
+
+// sendError simulates an asynchronous error report by sending
+// an error value through the provided channel.
+func sendError(errCh chan<- error, msg string) {
+	errCh <- fmt.Errorf("%s", msg)
 }
 
 func main() {
-    printQueue := make(chan PrintJob)
+	printQueue := make(chan PrintJob)
+	go processPrintJob(printQueue)
 
-    go func() {
-        job := <-printQueue
-        fmt.Printf("Printer: %s (%d pages, priority: %s)\n",
-            job.Document, job.Pages, job.Priority)
-    }()
+	printQueue <- PrintJob{
+		Document: "annual-report.pdf",
+		Pages:    42,
+		Priority: "high",
+	}
 
-    printQueue <- PrintJob{
-        Document: "annual-report.pdf",
-        Pages:    42,
-        Priority: "high",
-    }
+	// Error channels are equally common in production code.
+	errCh := make(chan error)
+	go sendError(errCh, "printer offline: paper tray empty")
 
-    // Error channels are equally common in production code.
-    errCh := make(chan error)
-    go func() {
-        errCh <- fmt.Errorf("printer offline: paper tray empty")
-    }()
-    err := <-errCh
-    fmt.Println("Error received:", err)
+	err := <-errCh
+	fmt.Println("Error received:", err)
 }
 ```
 
@@ -245,13 +276,15 @@ package main
 
 import "fmt"
 
+func sendDocument(queue chan<- string, document string) {
+	queue <- document
+}
+
 func main() {
-    ch := make(chan string)
-    go func() {
-        ch <- "job.pdf"
-    }()
-    job := <-ch
-    fmt.Println("Received:", job)
+	ch := make(chan string)
+	go sendDocument(ch, "job.pdf")
+	job := <-ch
+	fmt.Println("Received:", job)
 }
 ```
 
@@ -275,10 +308,14 @@ package main
 
 import "fmt"
 
+func sendDocument(queue chan<- string, document string) {
+	queue <- document
+}
+
 func main() {
-    ch := make(chan string) // always initialize with make
-    go func() { ch <- "job.pdf" }()
-    fmt.Println(<-ch)
+	ch := make(chan string) // always initialize with make
+	go sendDocument(ch, "job.pdf")
+	fmt.Println(<-ch)
 }
 ```
 

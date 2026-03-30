@@ -40,40 +40,42 @@ import (
 	"time"
 )
 
-func main() {
-	fmt.Println("=== Without Cancellation ===")
+type APIEndpoint struct {
+	Name    string
+	Latency time.Duration
+	Fail    bool
+}
+
+type DashboardLoader struct {
+	endpoints []APIEndpoint
+}
+
+func NewDashboardLoader(endpoints []APIEndpoint) *DashboardLoader {
+	return &DashboardLoader{endpoints: endpoints}
+}
+
+func (dl *DashboardLoader) LoadWithoutCancellation() error {
 	start := time.Now()
 
 	var wg sync.WaitGroup
 	var once sync.Once
 	var firstErr error
 
-	apis := []struct {
-		name    string
-		latency time.Duration
-		fail    bool
-	}{
-		{"user-profile", 200 * time.Millisecond, false},
-		{"recent-orders", 50 * time.Millisecond, true},
-		{"notifications", 300 * time.Millisecond, false},
-		{"recommendations", 400 * time.Millisecond, false},
-	}
-
-	for _, api := range apis {
+	for _, api := range dl.endpoints {
 		api := api
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 
-			time.Sleep(api.latency)
-			if api.fail {
+			time.Sleep(api.Latency)
+			if api.Fail {
 				once.Do(func() {
-					firstErr = fmt.Errorf("%s: 503 service unavailable", api.name)
+					firstErr = fmt.Errorf("%s: 503 service unavailable", api.Name)
 				})
-				fmt.Printf("  [%v] %s: FAILED\n", time.Since(start).Round(time.Millisecond), api.name)
+				fmt.Printf("  [%v] %s: FAILED\n", time.Since(start).Round(time.Millisecond), api.Name)
 				return
 			}
-			fmt.Printf("  [%v] %s: completed (wasted work!)\n", time.Since(start).Round(time.Millisecond), api.name)
+			fmt.Printf("  [%v] %s: completed (wasted work!)\n", time.Since(start).Round(time.Millisecond), api.Name)
 		}()
 	}
 
@@ -81,6 +83,19 @@ func main() {
 	elapsed := time.Since(start).Round(time.Millisecond)
 	fmt.Printf("\nError: %v\n", firstErr)
 	fmt.Printf("Total time: %v -- waited for ALL goroutines despite knowing error at 50ms\n", elapsed)
+	return firstErr
+}
+
+func main() {
+	loader := NewDashboardLoader([]APIEndpoint{
+		{"user-profile", 200 * time.Millisecond, false},
+		{"recent-orders", 50 * time.Millisecond, true},
+		{"notifications", 300 * time.Millisecond, false},
+		{"recommendations", 400 * time.Millisecond, false},
+	})
+
+	fmt.Println("=== Without Cancellation ===")
+	_ = loader.LoadWithoutCancellation()
 }
 ```
 
@@ -112,8 +127,21 @@ import (
 	"time"
 )
 
-func main() {
-	fmt.Println("=== With Context Cancellation ===")
+type APIEndpoint struct {
+	Name    string
+	Latency time.Duration
+	Fail    bool
+}
+
+type DashboardLoader struct {
+	endpoints []APIEndpoint
+}
+
+func NewDashboardLoader(endpoints []APIEndpoint) *DashboardLoader {
+	return &DashboardLoader{endpoints: endpoints}
+}
+
+func (dl *DashboardLoader) LoadWithCancellation() error {
 	start := time.Now()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -123,18 +151,7 @@ func main() {
 	var once sync.Once
 	var firstErr error
 
-	apis := []struct {
-		name    string
-		latency time.Duration
-		fail    bool
-	}{
-		{"user-profile", 200 * time.Millisecond, false},
-		{"recent-orders", 50 * time.Millisecond, true},
-		{"notifications", 300 * time.Millisecond, false},
-		{"recommendations", 400 * time.Millisecond, false},
-	}
-
-	for _, api := range apis {
+	for _, api := range dl.endpoints {
 		api := api
 		wg.Add(1)
 		go func() {
@@ -143,7 +160,7 @@ func main() {
 			select {
 			case <-ctx.Done():
 				fmt.Printf("  [%v] %s: cancelled before starting\n",
-					time.Since(start).Round(time.Millisecond), api.name)
+					time.Since(start).Round(time.Millisecond), api.Name)
 				return
 			default:
 			}
@@ -151,23 +168,23 @@ func main() {
 			select {
 			case <-ctx.Done():
 				fmt.Printf("  [%v] %s: cancelled while waiting\n",
-					time.Since(start).Round(time.Millisecond), api.name)
+					time.Since(start).Round(time.Millisecond), api.Name)
 				return
-			case <-time.After(api.latency):
+			case <-time.After(api.Latency):
 			}
 
-			if api.fail {
+			if api.Fail {
 				once.Do(func() {
-					firstErr = fmt.Errorf("%s: 503 service unavailable", api.name)
-					cancel() // cancel the context for all siblings
+					firstErr = fmt.Errorf("%s: 503 service unavailable", api.Name)
+					cancel()
 				})
 				fmt.Printf("  [%v] %s: FAILED -- cancelling siblings\n",
-					time.Since(start).Round(time.Millisecond), api.name)
+					time.Since(start).Round(time.Millisecond), api.Name)
 				return
 			}
 
 			fmt.Printf("  [%v] %s: completed\n",
-				time.Since(start).Round(time.Millisecond), api.name)
+				time.Since(start).Round(time.Millisecond), api.Name)
 		}()
 	}
 
@@ -175,6 +192,19 @@ func main() {
 	elapsed := time.Since(start).Round(time.Millisecond)
 	fmt.Printf("\nError: %v\n", firstErr)
 	fmt.Printf("Total time: %v -- siblings cancelled shortly after the failure\n", elapsed)
+	return firstErr
+}
+
+func main() {
+	loader := NewDashboardLoader([]APIEndpoint{
+		{"user-profile", 200 * time.Millisecond, false},
+		{"recent-orders", 50 * time.Millisecond, true},
+		{"notifications", 300 * time.Millisecond, false},
+		{"recommendations", 400 * time.Millisecond, false},
+	})
+
+	fmt.Println("=== With Context Cancellation ===")
+	_ = loader.LoadWithCancellation()
 }
 ```
 
@@ -206,40 +236,37 @@ import (
 	"time"
 )
 
-func main() {
-	fmt.Println("=== Goroutine Leak Demo ===")
-	fmt.Printf("Goroutines before: %d\n", runtime.NumGoroutine())
+const (
+	apiSimulatedLatency = 200 * time.Millisecond
+	leakCheckDelay      = 50 * time.Millisecond
+	abortWaitDuration   = 300 * time.Millisecond
+)
 
-	leakyDashboardLoad()
-
-	time.Sleep(50 * time.Millisecond)
-	fmt.Printf("Goroutines after (leaky): %d -- leaked goroutines are still alive!\n", runtime.NumGoroutine())
-
-	// In a real server, this happens on every request.
-	// 1000 requests/sec * 3 leaked goroutines = 3000 leaked goroutines/sec.
-	// The process eventually runs out of memory and crashes.
+type LeakyLoader struct {
+	apis []string
 }
 
-func leakyDashboardLoad() {
+func NewLeakyLoader(apis []string) *LeakyLoader {
+	return &LeakyLoader{apis: apis}
+}
+
+func (ll *LeakyLoader) LoadAndLeak() {
 	var wg sync.WaitGroup
 	var once sync.Once
 	var firstErr error
 
 	results := make(chan string) // unbuffered channel -- receivers might never read
 
-	apis := []string{"user-profile", "recent-orders", "notifications"}
-
-	for _, api := range apis {
+	for _, api := range ll.apis {
 		api := api
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			time.Sleep(200 * time.Millisecond) // simulate API call
+			time.Sleep(apiSimulatedLatency)
 			results <- fmt.Sprintf("data from %s", api) // BLOCKS if nobody reads
 		}()
 	}
 
-	// Only read one result, then "give up" due to an error
 	go func() {
 		firstResult := <-results
 		fmt.Printf("  Got: %s\n", firstResult)
@@ -248,10 +275,25 @@ func leakyDashboardLoad() {
 		})
 	}()
 
-	time.Sleep(300 * time.Millisecond) // simulate waiting
+	time.Sleep(abortWaitDuration)
 	_ = firstErr
 	// The other 2 goroutines are stuck on `results <- ...` forever.
 	// They cannot be garbage collected because the channel is still referenced.
+}
+
+func main() {
+	fmt.Println("=== Goroutine Leak Demo ===")
+	fmt.Printf("Goroutines before: %d\n", runtime.NumGoroutine())
+
+	loader := NewLeakyLoader([]string{"user-profile", "recent-orders", "notifications"})
+	loader.LoadAndLeak()
+
+	time.Sleep(leakCheckDelay)
+	fmt.Printf("Goroutines after (leaky): %d -- leaked goroutines are still alive!\n", runtime.NumGoroutine())
+
+	// In a real server, this happens on every request.
+	// 1000 requests/sec * 3 leaked goroutines = 3000 leaked goroutines/sec.
+	// The process eventually runs out of memory and crashes.
 }
 ```
 
@@ -280,36 +322,23 @@ import (
 )
 
 type DashboardData struct {
-	UserName       string
-	OrderCount     int
-	Notifications  int
+	UserName        string
+	OrderCount      int
+	Notifications   int
 	Recommendations []string
 }
 
-func main() {
-	fmt.Println("=== Dashboard Data Loader ===")
+type APICallFn func(context.Context) error
 
-	fmt.Println("\n--- Scenario 1: All APIs healthy ---")
-	start := time.Now()
-	data, err := loadDashboard(false)
-	if err != nil {
-		fmt.Printf("Error: %v\n", err)
-	} else {
-		fmt.Printf("Dashboard: user=%s, orders=%d, notifications=%d, recs=%d\n",
-			data.UserName, data.OrderCount, data.Notifications, len(data.Recommendations))
-	}
-	fmt.Printf("Time: %v\n", time.Since(start).Round(time.Millisecond))
-
-	fmt.Println("\n--- Scenario 2: Orders API failing ---")
-	start = time.Now()
-	data, err = loadDashboard(true)
-	if err != nil {
-		fmt.Printf("Error: %v\n", err)
-	}
-	fmt.Printf("Time: %v (fast failure, no wasted work)\n", time.Since(start).Round(time.Millisecond))
+type DashboardLoader struct {
+	ordersDown bool
 }
 
-func loadDashboard(ordersDown bool) (*DashboardData, error) {
+func NewDashboardLoader(ordersDown bool) *DashboardLoader {
+	return &DashboardLoader{ordersDown: ordersDown}
+}
+
+func (dl *DashboardLoader) Load() (*DashboardData, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -320,60 +349,14 @@ func loadDashboard(ordersDown bool) (*DashboardData, error) {
 	var data DashboardData
 	var mu sync.Mutex
 
-	type apiCall struct {
-		name string
-		fn   func(context.Context) error
-	}
-
-	calls := []apiCall{
-		{"user-profile", func(ctx context.Context) error {
-			if err := simulateAPI(ctx, 100*time.Millisecond); err != nil {
-				return fmt.Errorf("user-profile: %w", err)
-			}
-			mu.Lock()
-			data.UserName = "alice"
-			mu.Unlock()
-			return nil
-		}},
-		{"recent-orders", func(ctx context.Context) error {
-			if ordersDown {
-				time.Sleep(40 * time.Millisecond)
-				return fmt.Errorf("recent-orders: 503 service unavailable")
-			}
-			if err := simulateAPI(ctx, 80*time.Millisecond); err != nil {
-				return fmt.Errorf("recent-orders: %w", err)
-			}
-			mu.Lock()
-			data.OrderCount = 42
-			mu.Unlock()
-			return nil
-		}},
-		{"notifications", func(ctx context.Context) error {
-			if err := simulateAPI(ctx, 120*time.Millisecond); err != nil {
-				return fmt.Errorf("notifications: %w", err)
-			}
-			mu.Lock()
-			data.Notifications = 7
-			mu.Unlock()
-			return nil
-		}},
-		{"recommendations", func(ctx context.Context) error {
-			if err := simulateAPI(ctx, 150*time.Millisecond); err != nil {
-				return fmt.Errorf("recommendations: %w", err)
-			}
-			mu.Lock()
-			data.Recommendations = []string{"item-1", "item-2", "item-3"}
-			mu.Unlock()
-			return nil
-		}},
-	}
+	calls := dl.buildAPICalls(&data, &mu)
 
 	for _, call := range calls {
 		call := call
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if err := call.fn(ctx); err != nil {
+			if err := call(ctx); err != nil {
 				once.Do(func() {
 					firstErr = err
 					cancel()
@@ -390,6 +373,67 @@ func loadDashboard(ordersDown bool) (*DashboardData, error) {
 	return &data, nil
 }
 
+func (dl *DashboardLoader) buildAPICalls(data *DashboardData, mu *sync.Mutex) []APICallFn {
+	return []APICallFn{
+		dl.fetchUserProfile(data, mu),
+		dl.fetchRecentOrders(data, mu),
+		dl.fetchNotifications(data, mu),
+		dl.fetchRecommendations(data, mu),
+	}
+}
+
+func (dl *DashboardLoader) fetchUserProfile(data *DashboardData, mu *sync.Mutex) APICallFn {
+	return func(ctx context.Context) error {
+		if err := simulateAPI(ctx, 100*time.Millisecond); err != nil {
+			return fmt.Errorf("user-profile: %w", err)
+		}
+		mu.Lock()
+		data.UserName = "alice"
+		mu.Unlock()
+		return nil
+	}
+}
+
+func (dl *DashboardLoader) fetchRecentOrders(data *DashboardData, mu *sync.Mutex) APICallFn {
+	return func(ctx context.Context) error {
+		if dl.ordersDown {
+			time.Sleep(40 * time.Millisecond)
+			return fmt.Errorf("recent-orders: 503 service unavailable")
+		}
+		if err := simulateAPI(ctx, 80*time.Millisecond); err != nil {
+			return fmt.Errorf("recent-orders: %w", err)
+		}
+		mu.Lock()
+		data.OrderCount = 42
+		mu.Unlock()
+		return nil
+	}
+}
+
+func (dl *DashboardLoader) fetchNotifications(data *DashboardData, mu *sync.Mutex) APICallFn {
+	return func(ctx context.Context) error {
+		if err := simulateAPI(ctx, 120*time.Millisecond); err != nil {
+			return fmt.Errorf("notifications: %w", err)
+		}
+		mu.Lock()
+		data.Notifications = 7
+		mu.Unlock()
+		return nil
+	}
+}
+
+func (dl *DashboardLoader) fetchRecommendations(data *DashboardData, mu *sync.Mutex) APICallFn {
+	return func(ctx context.Context) error {
+		if err := simulateAPI(ctx, 150*time.Millisecond); err != nil {
+			return fmt.Errorf("recommendations: %w", err)
+		}
+		mu.Lock()
+		data.Recommendations = []string{"item-1", "item-2", "item-3"}
+		mu.Unlock()
+		return nil
+	}
+}
+
 func simulateAPI(ctx context.Context, latency time.Duration) error {
 	select {
 	case <-ctx.Done():
@@ -397,6 +441,35 @@ func simulateAPI(ctx context.Context, latency time.Duration) error {
 	case <-time.After(latency):
 		return nil
 	}
+}
+
+func printDashboardResult(data *DashboardData, err error, start time.Time) {
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+	} else {
+		fmt.Printf("Dashboard: user=%s, orders=%d, notifications=%d, recs=%d\n",
+			data.UserName, data.OrderCount, data.Notifications, len(data.Recommendations))
+	}
+	fmt.Printf("Time: %v\n", time.Since(start).Round(time.Millisecond))
+}
+
+func main() {
+	fmt.Println("=== Dashboard Data Loader ===")
+
+	fmt.Println("\n--- Scenario 1: All APIs healthy ---")
+	start := time.Now()
+	loader := NewDashboardLoader(false)
+	data, err := loader.Load()
+	printDashboardResult(data, err, start)
+
+	fmt.Println("\n--- Scenario 2: Orders API failing ---")
+	start = time.Now()
+	loader = NewDashboardLoader(true)
+	data, err = loader.Load()
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+	}
+	fmt.Printf("Time: %v (fast failure, no wasted work)\n", time.Since(start).Round(time.Millisecond))
 }
 ```
 

@@ -40,18 +40,43 @@ import (
 	"sync"
 )
 
-func racyHitCounter() int {
+const (
+	handlerCount  = 100
+	requestsPerHandler = 100
+)
+
+// HitCounter simulates a web server's page-view tracker.
+// BUG: hitCount is shared across goroutines without synchronization.
+type HitCounter struct {
+	handlers       int
+	reqsPerHandler int
+}
+
+func NewHitCounter(handlers, reqsPerHandler int) *HitCounter {
+	return &HitCounter{
+		handlers:       handlers,
+		reqsPerHandler: reqsPerHandler,
+	}
+}
+
+func (hc *HitCounter) Expected() int {
+	return hc.handlers * hc.reqsPerHandler
+}
+
+// CountHits launches concurrent handlers that all increment the same variable.
+// DATA RACE: the read-modify-write on hitCount has no synchronization.
+func (hc *HitCounter) CountHits() int {
 	hitCount := 0
 	var wg sync.WaitGroup
 
-	for handler := 0; handler < 100; handler++ {
+	for handler := 0; handler < hc.handlers; handler++ {
 		wg.Add(1)
-		go func(id int) {
+		go func() {
 			defer wg.Done()
-			for req := 0; req < 100; req++ {
+			for req := 0; req < hc.reqsPerHandler; req++ {
 				hitCount++
 			}
-		}(handler)
+		}()
 	}
 
 	wg.Wait()
@@ -60,8 +85,9 @@ func racyHitCounter() int {
 
 func main() {
 	fmt.Println("=== Race Detector Demo ===")
-	result := racyHitCounter()
-	fmt.Printf("Hit count: %d (expected 10000)\n", result)
+	counter := NewHitCounter(handlerCount, requestsPerHandler)
+	result := counter.CountHits()
+	fmt.Printf("Hit count: %d (expected %d)\n", result, counter.Expected())
 }
 ```
 
@@ -132,23 +158,40 @@ package main
 
 import "fmt"
 
-func main() {
+// CIGuide holds the reference commands for race detection in CI pipelines.
+type CIGuide struct {
+	Commands []CICommand
+}
+
+// CICommand represents a single CI pipeline command with its description.
+type CICommand struct {
+	Description string
+	Command     string
+}
+
+func NewCIGuide() *CIGuide {
+	return &CIGuide{
+		Commands: []CICommand{
+			{"Run all tests with race detection", "go test -race ./..."},
+			{"Build an instrumented binary for integration tests", "go build -race -o myservice ./cmd/server"},
+			{"Log race reports to a file", `GORACE="log_path=race.log" go test -race ./...`},
+		},
+	}
+}
+
+func (g *CIGuide) Print() {
 	fmt.Println("=== Race Detection in CI ===")
 	fmt.Println()
 	fmt.Println("Add to your CI pipeline (GitHub Actions, GitLab CI, etc.):")
 	fmt.Println()
-	fmt.Println("  # Run all tests with race detection")
-	fmt.Println("  go test -race ./...")
-	fmt.Println()
-	fmt.Println("  # Build an instrumented binary for integration tests")
-	fmt.Println("  go build -race -o myservice ./cmd/server")
-	fmt.Println("  ./myservice &")
-	fmt.Println("  # run integration tests against it")
-	fmt.Println("  # any race during the test run will be reported")
-	fmt.Println()
-	fmt.Println("  # Log race reports to a file")
-	fmt.Println("  GORACE=\"log_path=race.log\" go test -race ./...")
-	fmt.Println()
+	for _, cmd := range g.Commands {
+		fmt.Printf("  # %s\n", cmd.Description)
+		fmt.Printf("  %s\n\n", cmd.Command)
+	}
+	printOverheadWarning()
+}
+
+func printOverheadWarning() {
 	fmt.Println("Performance overhead:")
 	fmt.Println("  - CPU:    ~10x slower")
 	fmt.Println("  - Memory: ~5-10x more")
@@ -156,6 +199,11 @@ func main() {
 	fmt.Println()
 	fmt.Println("NEVER deploy a -race binary to production.")
 	fmt.Println("Use it in dev, test, and CI only.")
+}
+
+func main() {
+	guide := NewCIGuide()
+	guide.Print()
 }
 ```
 
@@ -180,11 +228,25 @@ import (
 	"sync"
 )
 
-func racyCounter() int {
+const racyWorkers = 10
+
+// RacyCounter demonstrates a data race the detector WILL catch.
+// BUG: hitCount is shared across goroutines without synchronization.
+type RacyCounter struct {
+	workers int
+}
+
+func NewRacyCounter(workers int) *RacyCounter {
+	return &RacyCounter{workers: workers}
+}
+
+// Count increments a shared variable from multiple goroutines.
+// DATA RACE: hitCount has no synchronization.
+func (rc *RacyCounter) Count() int {
 	hitCount := 0
 	var wg sync.WaitGroup
 
-	for i := 0; i < 10; i++ {
+	for i := 0; i < rc.workers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -196,27 +258,30 @@ func racyCounter() int {
 	return hitCount
 }
 
-func synchronizedCounter() int {
-	hitCount := 0
+// SynchronizedCounter demonstrates a write that the detector will NOT flag,
+// because the channel close establishes a happens-before edge.
+type SynchronizedCounter struct {
+	value int
+}
+
+func NewSynchronizedCounter() *SynchronizedCounter {
+	return &SynchronizedCounter{}
+}
+
+// Set writes a value in a goroutine and waits via channel synchronization.
+func (sc *SynchronizedCounter) Set(val int) int {
 	done := make(chan struct{})
 
 	go func() {
-		hitCount = 42 // write
-		close(done)   // synchronization point
+		sc.value = val // write
+		close(done)    // synchronization point
 	}()
 
 	<-done // happens-after close(done)
-	return hitCount
+	return sc.value
 }
 
-func main() {
-	fmt.Println("=== What the Detector Finds ===")
-	fmt.Println()
-
-	fmt.Printf("Racy counter: %d (WILL trigger race warning)\n", racyCounter())
-	fmt.Printf("Synchronized: %d (NO race warning)\n", synchronizedCounter())
-
-	fmt.Println()
+func printDetectorLimitations() {
 	fmt.Println("The detector uses happens-before analysis, not timing.")
 	fmt.Println("Channel close -> receive establishes a happens-before edge.")
 	fmt.Println()
@@ -226,6 +291,20 @@ func main() {
 	fmt.Println("  - Goroutine leaks")
 	fmt.Println("  - Logical race conditions (timing-dependent behavior that is technically race-free)")
 	fmt.Println("  - Races in code paths that were not exercised during the run")
+}
+
+func main() {
+	fmt.Println("=== What the Detector Finds ===")
+	fmt.Println()
+
+	racy := NewRacyCounter(racyWorkers)
+	fmt.Printf("Racy counter: %d (WILL trigger race warning)\n", racy.Count())
+
+	synced := NewSynchronizedCounter()
+	fmt.Printf("Synchronized: %d (NO race warning)\n", synced.Set(42))
+
+	fmt.Println()
+	printDetectorLimitations()
 }
 ```
 

@@ -30,34 +30,34 @@ Start with a web server startup that uses `time.Sleep` to wait for initializatio
 package main
 
 import (
-    "fmt"
-    "time"
+	"fmt"
+	"time"
 )
 
+const (
+	configLoadTime   = 100 * time.Millisecond
+	cacheWarmTime    = 200 * time.Millisecond
+	dbConnectTime    = 400 * time.Millisecond
+	fragileWaitGuess = 300 * time.Millisecond
+)
+
+// simulateInit pretends to initialize a component for the given duration.
+func simulateInit(name string, duration time.Duration) {
+	fmt.Printf("  [%s] loading...\n", name)
+	time.Sleep(duration)
+	fmt.Printf("  [%s] done\n", name)
+}
+
 func main() {
-    fmt.Println("Server: starting initialization...")
+	fmt.Println("Server: starting initialization...")
 
-    go func() {
-        fmt.Println("  [config] loading configuration...")
-        time.Sleep(100 * time.Millisecond)
-        fmt.Println("  [config] done")
-    }()
+	go simulateInit("config", configLoadTime)
+	go simulateInit("cache", cacheWarmTime)
+	go simulateInit("db", dbConnectTime)
 
-    go func() {
-        fmt.Println("  [cache] warming cache...")
-        time.Sleep(200 * time.Millisecond)
-        fmt.Println("  [cache] done")
-    }()
-
-    go func() {
-        fmt.Println("  [db] connecting to database...")
-        time.Sleep(400 * time.Millisecond) // slow connection
-        fmt.Println("  [db] done")
-    }()
-
-    // Hope that 300ms is enough... but database needs 400ms.
-    time.Sleep(300 * time.Millisecond)
-    fmt.Println("Server: listening on :8080 (database NOT ready!)")
+	// Hope that 300ms is enough... but database needs 400ms.
+	time.Sleep(fragileWaitGuess)
+	fmt.Println("Server: listening on :8080 (database NOT ready!)")
 }
 ```
 
@@ -77,39 +77,39 @@ Replace `time.Sleep` with a done channel. Each initialization task signals compl
 package main
 
 import (
-    "fmt"
-    "time"
+	"fmt"
+	"time"
 )
 
+const componentCount = 3
+
+// initComponent simulates initialization work and signals completion
+// by sending its name on the done channel.
+func initComponent(name string, duration time.Duration, done chan<- string) {
+	fmt.Printf("  [%s] loading...\n", name)
+	time.Sleep(duration)
+	done <- name
+}
+
+// waitForComponents receives exactly count signals from the done
+// channel, printing each component as it becomes ready.
+func waitForComponents(done <-chan string, count int) {
+	for i := 0; i < count; i++ {
+		component := <-done
+		fmt.Printf("  [%s] ready\n", component)
+	}
+}
+
 func main() {
-    fmt.Println("Server: starting initialization...")
-    done := make(chan string)
+	fmt.Println("Server: starting initialization...")
+	done := make(chan string)
 
-    go func() {
-        fmt.Println("  [config] loading configuration...")
-        time.Sleep(100 * time.Millisecond)
-        done <- "config"
-    }()
+	go initComponent("config", 100*time.Millisecond, done)
+	go initComponent("cache", 200*time.Millisecond, done)
+	go initComponent("db", 400*time.Millisecond, done)
 
-    go func() {
-        fmt.Println("  [cache] warming cache...")
-        time.Sleep(200 * time.Millisecond)
-        done <- "cache"
-    }()
-
-    go func() {
-        fmt.Println("  [db] connecting to database...")
-        time.Sleep(400 * time.Millisecond)
-        done <- "db"
-    }()
-
-    // Receive once per task. Blocks until ALL three have sent.
-    // It does not matter if a task takes 1ms or 10s -- we wait exactly as needed.
-    for i := 0; i < 3; i++ {
-        component := <-done
-        fmt.Printf("  [%s] ready\n", component)
-    }
-    fmt.Println("Server: all components initialized -- listening on :8080")
+	waitForComponents(done, componentCount)
+	fmt.Println("Server: all components initialized -- listening on :8080")
 }
 ```
 
@@ -135,40 +135,34 @@ When a channel is used purely for signaling (the value itself does not matter), 
 package main
 
 import (
-    "fmt"
-    "time"
+	"fmt"
+	"time"
 )
 
+// signalWhenReady simulates initialization work and closes the signal
+// channel when complete. Closing (instead of sending) makes the intent
+// unambiguous: this is purely a synchronization signal.
+func signalWhenReady(name string, duration time.Duration, signal chan struct{}) {
+	time.Sleep(duration)
+	fmt.Printf("  [%s] ready\n", name)
+	signal <- struct{}{}
+}
+
 func main() {
-    fmt.Println("Server: starting initialization...")
-    configReady := make(chan struct{})
-    cacheReady := make(chan struct{})
-    dbReady := make(chan struct{})
+	fmt.Println("Server: starting initialization...")
+	configReady := make(chan struct{})
+	cacheReady := make(chan struct{})
+	dbReady := make(chan struct{})
 
-    go func() {
-        time.Sleep(100 * time.Millisecond)
-        fmt.Println("  [config] loaded")
-        configReady <- struct{}{}
-    }()
+	go signalWhenReady("config", 100*time.Millisecond, configReady)
+	go signalWhenReady("cache", 200*time.Millisecond, cacheReady)
+	go signalWhenReady("db", 400*time.Millisecond, dbReady)
 
-    go func() {
-        time.Sleep(200 * time.Millisecond)
-        fmt.Println("  [cache] warmed")
-        cacheReady <- struct{}{}
-    }()
-
-    go func() {
-        time.Sleep(400 * time.Millisecond)
-        fmt.Println("  [db] connected")
-        dbReady <- struct{}{}
-    }()
-
-    // Wait for each component individually.
-    // struct{}{} carries no data -- the synchronization IS the message.
-    <-configReady
-    <-cacheReady
-    <-dbReady
-    fmt.Println("Server: all systems go -- listening on :8080")
+	// struct{}{} carries no data -- the synchronization IS the message.
+	<-configReady
+	<-cacheReady
+	<-dbReady
+	fmt.Println("Server: all systems go -- listening on :8080")
 }
 ```
 
@@ -191,55 +185,48 @@ In practice, initialization tasks produce results -- a config object, a cache ha
 package main
 
 import (
-    "fmt"
-    "time"
+	"fmt"
+	"time"
 )
 
+// InitResult carries both the outcome and timing of an initialization task.
 type InitResult struct {
-    Component string
-    Status    string
-    Duration  time.Duration
+	Component string
+	Status    string
+	Duration  time.Duration
+}
+
+// runInitTask simulates initialization work and reports the result
+// (including elapsed time) on the results channel.
+func runInitTask(component string, status string, workDuration time.Duration, results chan<- InitResult) {
+	start := time.Now()
+	time.Sleep(workDuration)
+	results <- InitResult{
+		Component: component,
+		Status:    status,
+		Duration:  time.Since(start),
+	}
+}
+
+// collectResults receives exactly count results and prints each one.
+func collectResults(results <-chan InitResult, count int) {
+	for i := 0; i < count; i++ {
+		r := <-results
+		fmt.Printf("  [%s] %s (took %v)\n",
+			r.Component, r.Status, r.Duration.Round(time.Millisecond))
+	}
 }
 
 func main() {
-    fmt.Println("Server: starting initialization...")
-    results := make(chan InitResult)
+	fmt.Println("Server: starting initialization...")
+	results := make(chan InitResult)
 
-    go func() {
-        start := time.Now()
-        time.Sleep(100 * time.Millisecond) // simulate config loading
-        results <- InitResult{
-            Component: "config",
-            Status:    "loaded 47 settings",
-            Duration:  time.Since(start),
-        }
-    }()
+	go runInitTask("config", "loaded 47 settings", 100*time.Millisecond, results)
+	go runInitTask("cache", "warmed 1200 entries", 200*time.Millisecond, results)
+	go runInitTask("database", "connected to postgres://prod:5432", 400*time.Millisecond, results)
 
-    go func() {
-        start := time.Now()
-        time.Sleep(200 * time.Millisecond) // simulate cache warming
-        results <- InitResult{
-            Component: "cache",
-            Status:    "warmed 1200 entries",
-            Duration:  time.Since(start),
-        }
-    }()
-
-    go func() {
-        start := time.Now()
-        time.Sleep(400 * time.Millisecond) // simulate DB connection
-        results <- InitResult{
-            Component: "database",
-            Status:    "connected to postgres://prod:5432",
-            Duration:  time.Since(start),
-        }
-    }()
-
-    for i := 0; i < 3; i++ {
-        r := <-results
-        fmt.Printf("  [%s] %s (took %v)\n", r.Component, r.Status, r.Duration.Round(time.Millisecond))
-    }
-    fmt.Println("Server: ready to accept traffic")
+	collectResults(results, 3)
+	fmt.Println("Server: ready to accept traffic")
 }
 ```
 
@@ -257,40 +244,53 @@ The power of concurrent initialization: total elapsed time equals the slowest ta
 package main
 
 import (
-    "fmt"
-    "time"
+	"fmt"
+	"time"
 )
 
+const expectedSequentialTime = 780 * time.Millisecond
+
+// StartupTask defines a named initialization task with its expected duration.
+type StartupTask struct {
+	Name     string
+	Duration time.Duration
+}
+
+// runTask simulates an initialization task and signals completion on the done channel.
+func runTask(task StartupTask, done chan<- struct{}) {
+	fmt.Printf("  [init] %s (%v)\n", task.Name, task.Duration)
+	time.Sleep(task.Duration)
+	done <- struct{}{}
+}
+
+// launchAllTasks starts every task concurrently and waits for all to finish.
+func launchAllTasks(tasks []StartupTask) {
+	done := make(chan struct{})
+
+	for _, task := range tasks {
+		go runTask(task, done)
+	}
+
+	for range tasks {
+		<-done
+	}
+}
+
 func main() {
-    start := time.Now()
-    done := make(chan struct{})
+	tasks := []StartupTask{
+		{"load TLS certs", 100 * time.Millisecond},
+		{"parse config", 50 * time.Millisecond},
+		{"warm cache", 200 * time.Millisecond},
+		{"connect to database", 400 * time.Millisecond},
+		{"register health check", 30 * time.Millisecond},
+	}
 
-    tasks := []struct {
-        name     string
-        duration time.Duration
-    }{
-        {"load TLS certs", 100 * time.Millisecond},
-        {"parse config", 50 * time.Millisecond},
-        {"warm cache", 200 * time.Millisecond},
-        {"connect to database", 400 * time.Millisecond},
-        {"register health check", 30 * time.Millisecond},
-    }
+	start := time.Now()
+	launchAllTasks(tasks)
+	elapsed := time.Since(start).Round(10 * time.Millisecond)
 
-    for _, t := range tasks {
-        go func(name string, d time.Duration) {
-            fmt.Printf("  [init] %s (%v)\n", name, d)
-            time.Sleep(d)
-            done <- struct{}{}
-        }(t.name, t.duration)
-    }
-
-    for range tasks {
-        <-done
-    }
-
-    elapsed := time.Since(start).Round(10 * time.Millisecond)
-    fmt.Printf("Total startup time: %v (parallel -- not %v sequential)\n",
-        elapsed, 780*time.Millisecond)
+	fmt.Printf("Total startup time: %v (parallel -- not %v sequential)\n",
+		elapsed, expectedSequentialTime)
 }
 ```
 

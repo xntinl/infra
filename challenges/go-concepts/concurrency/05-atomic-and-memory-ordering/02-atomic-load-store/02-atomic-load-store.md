@@ -37,46 +37,61 @@ import (
 	"time"
 )
 
-var (
-	darkModeEnabled  int32
-	betaAPIEnabled   int32
-	rateLimitPerSec  int32
+const (
+	handlerCount    = 4
+	requestsPerRun  = 20
+	reloadDelayMs   = 50
+	requestDelayMs  = 5
 )
 
+type UnsafeFlags struct {
+	DarkModeEnabled int32
+	BetaAPIEnabled  int32
+	RateLimitPerSec int32
+}
+
+func (f *UnsafeFlags) ApplyUpdate() {
+	// BUG: plain writes -- no visibility guarantee to other goroutines
+	f.DarkModeEnabled = 1
+	f.BetaAPIEnabled = 1
+	f.RateLimitPerSec = 500
+	fmt.Println("[reloader] Flags updated: darkMode=1, betaAPI=1, rateLimit=500")
+}
+
+func (f *UnsafeFlags) ReadFlags() (dm, ba, rl int32) {
+	// BUG: plain reads -- may see stale values
+	return f.DarkModeEnabled, f.BetaAPIEnabled, f.RateLimitPerSec
+}
+
+func runUnsafeReloader(flags *UnsafeFlags, wg *sync.WaitGroup) {
+	defer wg.Done()
+	time.Sleep(reloadDelayMs * time.Millisecond)
+	flags.ApplyUpdate()
+}
+
+func runUnsafeHandler(handlerID int, flags *UnsafeFlags, wg *sync.WaitGroup) {
+	defer wg.Done()
+	for req := 0; req < requestsPerRun; req++ {
+		dm, ba, rl := flags.ReadFlags()
+		if req == requestsPerRun-1 {
+			fmt.Printf("[handler %d] final read: darkMode=%d betaAPI=%d rateLimit=%d\n",
+				handlerID, dm, ba, rl)
+		}
+		runtime.Gosched()
+		time.Sleep(requestDelayMs * time.Millisecond)
+	}
+}
+
 func main() {
+	flags := &UnsafeFlags{}
 	var wg sync.WaitGroup
 
-	// Config reloader: updates flags every 50ms
 	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		time.Sleep(50 * time.Millisecond)
+	go runUnsafeReloader(flags, &wg)
 
-		// BUG: plain writes -- no visibility guarantee to other goroutines
-		darkModeEnabled = 1
-		betaAPIEnabled = 1
-		rateLimitPerSec = 500
-		fmt.Println("[reloader] Flags updated: darkMode=1, betaAPI=1, rateLimit=500")
-	}()
-
-	// Request handlers: read flags on every "request"
-	for i := 0; i < 4; i++ {
+	for i := 0; i < handlerCount; i++ {
 		wg.Add(1)
-		go func(handlerID int) {
-			defer wg.Done()
-			for req := 0; req < 20; req++ {
-				// BUG: plain reads -- may see stale values
-				dm := darkModeEnabled
-				ba := betaAPIEnabled
-				rl := rateLimitPerSec
-				if req == 19 {
-					fmt.Printf("[handler %d] final read: darkMode=%d betaAPI=%d rateLimit=%d\n",
-						handlerID, dm, ba, rl)
-				}
-				runtime.Gosched()
-				time.Sleep(5 * time.Millisecond)
-			}
-		}(i)
+		go runUnsafeHandler(i, flags, &wg)
 	}
 
 	wg.Wait()
@@ -103,52 +118,65 @@ import (
 	"time"
 )
 
-var (
+const (
+	handlerCount   = 4
+	requestsPerRun = 20
+	reloadDelayMs  = 50
+	requestDelayMs = 5
+)
+
+type AtomicFlagStore struct {
 	darkModeEnabled int32
 	betaAPIEnabled  int32
 	rateLimitPerSec int32
-)
-
-func setFlag(addr *int32, val int32) {
-	atomic.StoreInt32(addr, val)
 }
 
-func getFlag(addr *int32) int32 {
-	return atomic.LoadInt32(addr)
+func (s *AtomicFlagStore) SetDarkMode(val int32)  { atomic.StoreInt32(&s.darkModeEnabled, val) }
+func (s *AtomicFlagStore) SetBetaAPI(val int32)   { atomic.StoreInt32(&s.betaAPIEnabled, val) }
+func (s *AtomicFlagStore) SetRateLimit(val int32)  { atomic.StoreInt32(&s.rateLimitPerSec, val) }
+
+func (s *AtomicFlagStore) DarkMode() int32  { return atomic.LoadInt32(&s.darkModeEnabled) }
+func (s *AtomicFlagStore) BetaAPI() int32   { return atomic.LoadInt32(&s.betaAPIEnabled) }
+func (s *AtomicFlagStore) RateLimit() int32 { return atomic.LoadInt32(&s.rateLimitPerSec) }
+
+func (s *AtomicFlagStore) ApplyUpdate() {
+	s.SetDarkMode(1)
+	s.SetBetaAPI(1)
+	s.SetRateLimit(500)
+	fmt.Println("[reloader] Flags updated: darkMode=1, betaAPI=1, rateLimit=500")
+}
+
+func runReloader(store *AtomicFlagStore, wg *sync.WaitGroup) {
+	defer wg.Done()
+	time.Sleep(reloadDelayMs * time.Millisecond)
+	store.ApplyUpdate()
+}
+
+func runHandler(handlerID int, store *AtomicFlagStore, wg *sync.WaitGroup) {
+	defer wg.Done()
+	for req := 0; req < requestsPerRun; req++ {
+		dm := store.DarkMode()
+		ba := store.BetaAPI()
+		rl := store.RateLimit()
+
+		if req == requestsPerRun-1 {
+			fmt.Printf("[handler %d] final read: darkMode=%d betaAPI=%d rateLimit=%d\n",
+				handlerID, dm, ba, rl)
+		}
+		time.Sleep(requestDelayMs * time.Millisecond)
+	}
 }
 
 func main() {
+	store := &AtomicFlagStore{}
 	var wg sync.WaitGroup
 
-	// Config reloader
 	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		time.Sleep(50 * time.Millisecond)
+	go runReloader(store, &wg)
 
-		setFlag(&darkModeEnabled, 1)
-		setFlag(&betaAPIEnabled, 1)
-		setFlag(&rateLimitPerSec, 500)
-		fmt.Println("[reloader] Flags updated: darkMode=1, betaAPI=1, rateLimit=500")
-	}()
-
-	// Request handlers
-	for i := 0; i < 4; i++ {
+	for i := 0; i < handlerCount; i++ {
 		wg.Add(1)
-		go func(handlerID int) {
-			defer wg.Done()
-			for req := 0; req < 20; req++ {
-				dm := getFlag(&darkModeEnabled)
-				ba := getFlag(&betaAPIEnabled)
-				rl := getFlag(&rateLimitPerSec)
-
-				if req == 19 {
-					fmt.Printf("[handler %d] final read: darkMode=%d betaAPI=%d rateLimit=%d\n",
-						handlerID, dm, ba, rl)
-				}
-				time.Sleep(5 * time.Millisecond)
-			}
-		}(i)
+		go runHandler(i, store, &wg)
 	}
 
 	wg.Wait()
@@ -175,6 +203,15 @@ import (
 	"time"
 )
 
+const (
+	defaultRateLimit  int32 = 100
+	handlerCount            = 3
+	requestsPerHandler      = 15
+	reloadCycles            = 4
+	reloadIntervalMs        = 40
+	requestIntervalMs       = 15
+)
+
 type FeatureFlags struct {
 	DarkMode    atomic.Bool
 	BetaAPI     atomic.Bool
@@ -184,12 +221,22 @@ type FeatureFlags struct {
 
 func NewFeatureFlags() *FeatureFlags {
 	ff := &FeatureFlags{}
-	ff.RateLimit.Store(100) // default rate limit
+	ff.RateLimit.Store(defaultRateLimit)
 	return ff
+}
+
+func (ff *FeatureFlags) Snapshot() string {
+	return fmt.Sprintf("darkMode=%-5v betaAPI=%-5v newCheckout=%-5v rateLimit=%d",
+		ff.DarkMode.Load(), ff.BetaAPI.Load(),
+		ff.NewCheckout.Load(), ff.RateLimit.Load())
 }
 
 type FlagReloader struct {
 	flags *FeatureFlags
+}
+
+func NewFlagReloader(flags *FeatureFlags) *FlagReloader {
+	return &FlagReloader{flags: flags}
 }
 
 func (r *FlagReloader) ApplyUpdate(cycle int) {
@@ -206,53 +253,46 @@ func (r *FlagReloader) ApplyUpdate(cycle int) {
 		fmt.Println("[reloader] Enabled: new checkout flow")
 	case 4:
 		r.flags.BetaAPI.Store(false)
-		r.flags.RateLimit.Store(100)
+		r.flags.RateLimit.Store(defaultRateLimit)
 		fmt.Println("[reloader] Disabled: beta API, rate limit -> 100")
 	}
 }
 
-func handleRequest(id int, reqNum int, flags *FeatureFlags) {
-	dm := flags.DarkMode.Load()
-	beta := flags.BetaAPI.Load()
-	newCO := flags.NewCheckout.Load()
-	rl := flags.RateLimit.Load()
+func (r *FlagReloader) RunReloadLoop(wg *sync.WaitGroup) {
+	defer wg.Done()
+	for cycle := 1; cycle <= reloadCycles; cycle++ {
+		time.Sleep(reloadIntervalMs * time.Millisecond)
+		r.ApplyUpdate(cycle)
+	}
+}
 
-	fmt.Printf("[handler %d req %02d] darkMode=%-5v betaAPI=%-5v newCheckout=%-5v rateLimit=%d\n",
-		id, reqNum, dm, beta, newCO, rl)
+func handleRequest(handlerID, reqNum int, flags *FeatureFlags) {
+	fmt.Printf("[handler %d req %02d] %s\n", handlerID, reqNum, flags.Snapshot())
+}
+
+func runRequestHandler(handlerID int, flags *FeatureFlags, wg *sync.WaitGroup) {
+	defer wg.Done()
+	for req := 0; req < requestsPerHandler; req++ {
+		handleRequest(handlerID, req, flags)
+		time.Sleep(requestIntervalMs * time.Millisecond)
+	}
 }
 
 func main() {
 	flags := NewFeatureFlags()
-	reloader := &FlagReloader{flags: flags}
+	reloader := NewFlagReloader(flags)
 	var wg sync.WaitGroup
 
-	// Config reloader: updates flags periodically
 	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for cycle := 1; cycle <= 4; cycle++ {
-			time.Sleep(40 * time.Millisecond)
-			reloader.ApplyUpdate(cycle)
-		}
-	}()
+	go reloader.RunReloadLoop(&wg)
 
-	// Request handlers: read flags on each request
-	for i := 0; i < 3; i++ {
+	for i := 0; i < handlerCount; i++ {
 		wg.Add(1)
-		go func(handlerID int) {
-			defer wg.Done()
-			for req := 0; req < 15; req++ {
-				handleRequest(handlerID, req, flags)
-				time.Sleep(15 * time.Millisecond)
-			}
-		}(i)
+		go runRequestHandler(i, flags, &wg)
 	}
 
 	wg.Wait()
-	fmt.Println("\n[final state]")
-	fmt.Printf("  darkMode=%v betaAPI=%v newCheckout=%v rateLimit=%d\n",
-		flags.DarkMode.Load(), flags.BetaAPI.Load(),
-		flags.NewCheckout.Load(), flags.RateLimit.Load())
+	fmt.Printf("\n[final state] %s\n", flags.Snapshot())
 }
 ```
 
@@ -276,6 +316,16 @@ import (
 	"time"
 )
 
+const (
+	initialBackendURL     = "https://api-v1.example.com"
+	upgradedBackendURL    = "https://api-v2.example.com"
+	maintenanceStartDelay = 30 * time.Millisecond
+	maintenanceDuration   = 80 * time.Millisecond
+	handlerCount          = 3
+	requestsPerHandler    = 20
+	requestInterval       = 10 * time.Millisecond
+)
+
 type GatewayConfig struct {
 	maintenanceMode atomic.Bool
 	backendURL      atomic.Value // stores string
@@ -283,48 +333,64 @@ type GatewayConfig struct {
 
 func NewGatewayConfig() *GatewayConfig {
 	gc := &GatewayConfig{}
-	gc.backendURL.Store("https://api-v1.example.com")
+	gc.backendURL.Store(initialBackendURL)
 	return gc
+}
+
+func (gc *GatewayConfig) EnableMaintenance(newBackend string) {
+	// Order matters: set the backend URL BEFORE enabling maintenance mode
+	gc.backendURL.Store(newBackend)
+	gc.maintenanceMode.Store(true)
+	fmt.Println("[ops] Maintenance mode ON, backend switched to v2")
+}
+
+func (gc *GatewayConfig) DisableMaintenance() {
+	gc.maintenanceMode.Store(false)
+	fmt.Println("[ops] Maintenance mode OFF")
+}
+
+func (gc *GatewayConfig) IsMaintenanceMode() bool {
+	return gc.maintenanceMode.Load()
+}
+
+func (gc *GatewayConfig) BackendURL() string {
+	return gc.backendURL.Load().(string)
+}
+
+func runOpsWorkflow(config *GatewayConfig, wg *sync.WaitGroup) {
+	defer wg.Done()
+	time.Sleep(maintenanceStartDelay)
+	config.EnableMaintenance(upgradedBackendURL)
+	time.Sleep(maintenanceDuration)
+	config.DisableMaintenance()
+}
+
+func routeRequest(handlerID, reqNum int, config *GatewayConfig) {
+	if config.IsMaintenanceMode() {
+		fmt.Printf("[handler %d req %02d] 503 Service Unavailable (maintenance)\n", handlerID, reqNum)
+	} else {
+		fmt.Printf("[handler %d req %02d] 200 OK -> %s\n", handlerID, reqNum, config.BackendURL())
+	}
+}
+
+func runRequestHandler(handlerID int, config *GatewayConfig, wg *sync.WaitGroup) {
+	defer wg.Done()
+	for req := 0; req < requestsPerHandler; req++ {
+		routeRequest(handlerID, req, config)
+		time.Sleep(requestInterval)
+	}
 }
 
 func main() {
 	config := NewGatewayConfig()
 	var wg sync.WaitGroup
 
-	// Operations team enables maintenance mode and switches backend
 	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		time.Sleep(30 * time.Millisecond)
+	go runOpsWorkflow(config, &wg)
 
-		// Order matters: set the backend URL BEFORE enabling maintenance mode
-		config.backendURL.Store("https://api-v2.example.com")
-		config.maintenanceMode.Store(true)
-		fmt.Println("[ops] Maintenance mode ON, backend switched to v2")
-
-		time.Sleep(80 * time.Millisecond)
-
-		config.maintenanceMode.Store(false)
-		fmt.Println("[ops] Maintenance mode OFF")
-	}()
-
-	// Request handlers route based on flags
-	for i := 0; i < 3; i++ {
+	for i := 0; i < handlerCount; i++ {
 		wg.Add(1)
-		go func(id int) {
-			defer wg.Done()
-			for req := 0; req < 20; req++ {
-				maintenance := config.maintenanceMode.Load()
-				backend := config.backendURL.Load().(string)
-
-				if maintenance {
-					fmt.Printf("[handler %d req %02d] 503 Service Unavailable (maintenance)\n", id, req)
-				} else {
-					fmt.Printf("[handler %d req %02d] 200 OK -> %s\n", id, req, backend)
-				}
-				time.Sleep(10 * time.Millisecond)
-			}
-		}(i)
+		go runRequestHandler(i, config, &wg)
 	}
 
 	wg.Wait()
@@ -358,15 +424,20 @@ import (
 	"sync/atomic"
 )
 
-func main() {
-	var enabled int32
-	go func() {
-		atomic.StoreInt32(&enabled, 1)
-	}()
-	// In another goroutine:
-	if enabled == 1 { // BUG: non-atomic read -- data race
+func enableFeature(flag *int32) {
+	atomic.StoreInt32(flag, 1)
+}
+
+func checkFeatureUnsafe(flag int32) {
+	if flag == 1 { // BUG: non-atomic read -- data race
 		fmt.Println("feature enabled")
 	}
+}
+
+func main() {
+	var enabled int32
+	go enableFeature(&enabled)
+	checkFeatureUnsafe(enabled)
 }
 ```
 
