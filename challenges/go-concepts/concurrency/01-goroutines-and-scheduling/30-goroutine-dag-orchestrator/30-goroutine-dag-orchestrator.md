@@ -792,7 +792,8 @@ func main() {
 
 	criticalPath, criticalTime := computeCriticalPath(orch.tasks)
 
-	fmt.Println("=== DAG Orchestrator with Critical Path ===\n")
+	fmt.Println("=== DAG Orchestrator with Critical Path ===")
+	fmt.Println()
 	fmt.Printf("Critical path: %v\n", criticalPath)
 	fmt.Printf("Critical path time: %v\n\n", criticalTime)
 
