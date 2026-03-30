@@ -225,6 +225,7 @@
   },
   "active": "caa0937ea8cbd901",
   "lastOpenFiles": [
+    "challenges/go-concepts/concurrency/01-goroutines-and-scheduling/02-goroutine-vs-os-thread/counting_active_goroutines.go",
     "challenges/go-concepts/concurrency/01-goroutines-and-scheduling/01-launching-goroutines/01-launching-goroutines.md",
     "challenges/go-concepts/concurrency/01-goroutines-and-scheduling/get_return_value.go",
     "challenges/go-concepts/concurrency/01-goroutines-and-scheduling/fanout_pattern.go",
