@@ -1,8 +1,8 @@
 # Concurrency
 
-Go's concurrency model -- built on goroutines, channels, and the select statement -- is one of the language's defining features. These 87 exercises take you from spawning your first goroutine through production-grade patterns like pipelines, rate limiters, and graceful shutdown.
+Go's concurrency model -- built on goroutines, channels, and the select statement -- is one of the language's defining features. These 103 exercises take you from spawning your first goroutine through production-grade patterns like pipelines, rate limiters, and graceful shutdown.
 
-> 87 exercises | 9 sections | basic to advanced
+> 103 exercises | 9 sections | basic to advanced
 
 ---
 
@@ -24,6 +24,14 @@ Understand how Go's runtime manages lightweight threads: the GMP model, stack gr
 | 10 | [Goroutine Leak Detection](01-goroutines-and-scheduling/10-goroutine-leak-detection/10-goroutine-leak-detection.md) | intermediate | 35m |
 | 11 | [Goroutine Error Handling](01-goroutines-and-scheduling/11-goroutine-error-handling/11-goroutine-error-handling.md) | intermediate | 30m |
 | 12 | [Goroutine Return Values](01-goroutines-and-scheduling/12-goroutine-return-values/12-goroutine-return-values.md) | intermediate | 25m |
+| 13 | [Concurrent API Calls](01-goroutines-and-scheduling/13-concurrent-api-calls/13-concurrent-api-calls.md) | intermediate | 30m |
+| 14 | [Background Job Processor](01-goroutines-and-scheduling/14-background-job-processor/14-background-job-processor.md) | intermediate | 35m |
+| 15 | [Concurrent File Processing](01-goroutines-and-scheduling/15-concurrent-file-processing/15-concurrent-file-processing.md) | intermediate | 30m |
+| 16 | [Goroutine Supervision](01-goroutines-and-scheduling/16-goroutine-supervision/16-goroutine-supervision.md) | advanced | 40m |
+| 17 | [Concurrent Map-Reduce](01-goroutines-and-scheduling/17-concurrent-map-reduce/17-concurrent-map-reduce.md) | advanced | 40m |
+| 18 | [Connection Pool](01-goroutines-and-scheduling/18-connection-pool/18-connection-pool.md) | advanced | 45m |
+| 19 | [Parallel Validation](01-goroutines-and-scheduling/19-parallel-validation/19-parallel-validation.md) | intermediate | 30m |
+| 20 | [Goroutine-Safe Cache with TTL](01-goroutines-and-scheduling/20-goroutine-safe-cache/20-goroutine-safe-cache.md) | advanced | 45m |
 
 ---
 
@@ -47,6 +55,14 @@ Master Go's primary communication mechanism: unbuffered and buffered channels, d
 | 12 | [Channel Ownership Patterns](02-channels/12-channel-ownership-patterns/12-channel-ownership-patterns.md) | intermediate | 30m |
 | 13 | [Channel Timeout Patterns](02-channels/13-channel-timeout-patterns/13-channel-timeout-patterns.md) | intermediate | 30m |
 | 14 | [Channel Pipeline Basics](02-channels/14-channel-pipeline-basics/14-channel-pipeline-basics.md) | intermediate | 30m |
+| 15 | [Channel Event Bus](02-channels/15-channel-event-bus/15-channel-event-bus.md) | intermediate | 35m |
+| 16 | [Channel State Machine](02-channels/16-channel-state-machine/16-channel-state-machine.md) | advanced | 40m |
+| 17 | [Streaming Backpressure](02-channels/17-channel-streaming-backpressure/17-channel-streaming-backpressure.md) | advanced | 40m |
+| 18 | [Multi-Producer Single-Consumer](02-channels/18-multi-producer-single-consumer/18-multi-producer-single-consumer.md) | intermediate | 30m |
+| 19 | [Channel Orchestration](02-channels/19-channel-orchestration/19-channel-orchestration.md) | intermediate | 35m |
+| 20 | [Bounded Work Queue](02-channels/20-bounded-work-queue/20-bounded-work-queue.md) | intermediate | 30m |
+| 21 | [Channel Circuit Breaker](02-channels/21-channel-circuit-breaker/21-channel-circuit-breaker.md) | advanced | 40m |
+| 22 | [Channel Request Multiplexer](02-channels/22-channel-request-multiplexer/22-channel-request-multiplexer.md) | advanced | 40m |
 
 ---
 

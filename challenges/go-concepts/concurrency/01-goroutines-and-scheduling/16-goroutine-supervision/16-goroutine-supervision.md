@@ -1152,7 +1152,7 @@ Build a "service mesh monitor" supervisor that:
 
 
 ## What's Next
-You have completed the goroutines and scheduling section. Continue to section [02-channels](../../02-channels/01-unbuffered-channel-basics/01-unbuffered-channel-basics.md) to learn how channels work in depth -- from unbuffered synchronization to buffered queues, channel direction, and advanced patterns.
+Continue to [17-concurrent-map-reduce](../17-concurrent-map-reduce/17-concurrent-map-reduce.md) to apply goroutine patterns to a map-reduce pipeline that distributes work across multiple goroutines and aggregates results.
 
 
 ## Summary
