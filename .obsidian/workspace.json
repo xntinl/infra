@@ -27,12 +27,12 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "challenges/go-concepts/concurrency/02-channels/03-buffered-channels/03-buffered-channels.md",
+                "file": "challenges/go-concepts/concurrency/02-channels/07-nil-channel-behavior/07-nil-channel-behavior.md",
                 "mode": "source",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "03-buffered-channels"
+              "title": "07-nil-channel-behavior"
             }
           }
         ],
@@ -225,6 +225,8 @@
   },
   "active": "caa0937ea8cbd901",
   "lastOpenFiles": [
+    "challenges/go-concepts/concurrency/02-channels/04-channel-direction/04-channel-direction.md",
+    "challenges/go-concepts/concurrency/02-channels/03-buffered-channels/03-buffered-channels.md",
     "challenges/go-concepts/concurrency/02-channels/02-channel-as-synchronization/02-channel-as-synchronization.md",
     "challenges/go-concepts/concurrency/02-channels/02-channel-as-synchronization/fragile_sleep.go",
     "challenges/go-concepts/concurrency/02-channels/02-channel-as-synchronization/go.mod",
@@ -259,7 +261,6 @@
     "challenges/go-concepts/concurrency/08-errgroup/06-errgroup-parallel-pipeline/06-errgroup-parallel-pipeline.md",
     "challenges/go-concepts/concurrency/05-atomic-and-memory-ordering/07-atomic-vs-mutex-benchmark/07-atomic-vs-mutex-benchmark.md",
     "challenges/go-concepts/concurrency/09-data-races-and-detector/07-race-in-closure-loops/07-race-in-closure-loops.md",
-    "challenges/go-concepts/concurrency/01-goroutines-and-scheduling/07-goroutine-per-request/07-goroutine-per-request.md",
     "Presentacion/poc-just/web/node_modules/ordered-binary/assets/powers-dre.png",
     "Presentacion/poc-just/web/node_modules/retry/equation.gif",
     "Untitled.canvas"
