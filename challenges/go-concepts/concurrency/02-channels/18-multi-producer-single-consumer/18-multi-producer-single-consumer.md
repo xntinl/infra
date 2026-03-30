@@ -604,7 +604,7 @@ close(ch) // double close -> panic!
 4. What happens to the consumer's `range` loop if nobody ever closes the channel?
 
 ## What's Next
-You have completed the channels section. Continue to section [03-select-and-multiplexing](../../03-select-and-multiplexing/01-select-basics/01-select-basics.md) to learn how `select` lets you wait on multiple channel operations simultaneously.
+Continue to [19-channel-orchestration](../19-channel-orchestration/19-channel-orchestration.md) to coordinate tasks with dependencies using "done" channels -- the pattern that makes deployment pipelines and build systems possible.
 
 ## Summary
 - Multiple goroutines can safely send to the same channel -- the runtime serializes sends
