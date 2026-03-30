@@ -22,14 +22,13 @@ Go provides two fundamental mechanisms for concurrent coordination: mutexes and 
 
 The Go proverb says: **"Do not communicate by sharing memory; share memory by communicating."** This does not mean "never use mutexes." It means: when goroutines need to exchange information or coordinate work, channels are usually clearer. When goroutines need to protect a piece of shared state from concurrent access, mutexes are usually simpler.
 
-The decision framework:
-- **Mutex** when you are protecting internal state (a counter, a cache, a configuration map). The state belongs to a struct; the mutex guards access.
-- **Channel** when you are transferring ownership of data, coordinating phases of work, or signaling events between goroutines.
-- **Guideline**: if your channel is used as a mutex (e.g., buffered channel of size 1 used as a semaphore with no data flow), consider an actual mutex. If your mutex is being locked and unlocked across multiple goroutines to coordinate steps, consider a channel.
+This exercise presents two real scenarios from production systems and implements each with both approaches, so you can see which fits naturally and which feels forced.
 
-## Step 1 -- Mutex-Based Bank Account
+## Step 1 -- Scenario 1: Shared Metrics Map (Better with Mutex)
 
-Run `main.go`. The mutex version protects the balance as a struct field:
+An HTTP server tracks request counts per endpoint. Multiple handler goroutines increment counters concurrently. A metrics endpoint reads the totals.
+
+**Mutex approach -- natural fit:**
 
 ```go
 package main
@@ -39,64 +38,80 @@ import (
 	"sync"
 )
 
-type MutexAccount struct {
-	mu      sync.Mutex
-	balance int
+type MetricsStore struct {
+	mu       sync.Mutex
+	counters map[string]int64
 }
 
-func (a *MutexAccount) Deposit(amount int) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	a.balance += amount
+func NewMetricsStore() *MetricsStore {
+	return &MetricsStore{counters: make(map[string]int64)}
 }
 
-func (a *MutexAccount) Withdraw(amount int) bool {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.balance < amount {
-		return false
+func (m *MetricsStore) Increment(endpoint string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.counters[endpoint]++
+}
+
+func (m *MetricsStore) Snapshot() map[string]int64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	result := make(map[string]int64, len(m.counters))
+	for k, v := range m.counters {
+		result[k] = v
 	}
-	a.balance -= amount
-	return true
-}
-
-func (a *MutexAccount) Balance() int {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return a.balance
+	return result
 }
 
 func main() {
-	ma := &MutexAccount{balance: 1000}
+	metrics := NewMetricsStore()
 	var wg sync.WaitGroup
 
-	for i := 0; i < 100; i++ {
+	endpoints := []string{"/api/users", "/api/orders", "/api/products", "/healthz"}
+
+	for i := 0; i < 1000; i++ {
 		wg.Add(1)
-		go func() {
+		go func(reqID int) {
 			defer wg.Done()
-			ma.Deposit(10)
-			ma.Withdraw(5)
-		}()
+			ep := endpoints[reqID%len(endpoints)]
+			metrics.Increment(ep)
+		}(i)
 	}
+
 	wg.Wait()
-	fmt.Printf("Balance: %d (expected: 1500)\n", ma.Balance())
+
+	fmt.Println("=== Request Metrics (mutex approach) ===")
+	snap := metrics.Snapshot()
+	total := int64(0)
+	for ep, count := range snap {
+		fmt.Printf("  %-20s %d requests\n", ep, count)
+		total += count
+	}
+	fmt.Printf("  %-20s %d requests\n", "TOTAL", total)
 }
 ```
 
 Expected output:
 ```
-Balance: 1500 (expected: 1500)
+=== Request Metrics (mutex approach) ===
+  /api/users           250 requests
+  /api/orders          250 requests
+  /api/products        250 requests
+  /healthz             250 requests
+  TOTAL                1000 requests
 ```
+
+This is clean: the mutex protects the map, each method is short, and the API is intuitive.
 
 ### Intermediate Verification
 ```bash
 go run -race main.go
 ```
-No race conditions. Balance is exactly 1500 (1000 + 100*5).
+Total should be exactly 1000, no race conditions.
 
-## Step 2 -- Channel-Based Bank Account
+## Step 2 -- Scenario 1 with Channels (Forced Fit)
 
-The channel version uses a single goroutine as the exclusive owner of the balance:
+Now implement the same metrics store using a channel-based goroutine owner:
 
 ```go
 package main
@@ -106,136 +121,325 @@ import (
 	"sync"
 )
 
-type accountOp struct {
+type metricsOp struct {
 	kind     string
-	amount   int
-	response chan accountResult
+	endpoint string
+	response chan map[string]int64
 }
 
-type accountResult struct {
-	balance int
-	ok      bool
-}
-
-type ChannelAccount struct {
-	ops  chan accountOp
+type ChannelMetrics struct {
+	ops  chan metricsOp
 	done chan struct{}
 }
 
-func NewChannelAccount(initialBalance int) *ChannelAccount {
-	a := &ChannelAccount{
-		ops:  make(chan accountOp),
+func NewChannelMetrics() *ChannelMetrics {
+	m := &ChannelMetrics{
+		ops:  make(chan metricsOp),
 		done: make(chan struct{}),
 	}
-	go a.run(initialBalance)
-	return a
+	go m.run()
+	return m
 }
 
-func (a *ChannelAccount) run(balance int) {
-	for op := range a.ops {
+func (m *ChannelMetrics) run() {
+	counters := make(map[string]int64)
+	for op := range m.ops {
 		switch op.kind {
-		case "deposit":
-			balance += op.amount
-			op.response <- accountResult{balance: balance, ok: true}
-		case "withdraw":
-			if balance >= op.amount {
-				balance -= op.amount
-				op.response <- accountResult{balance: balance, ok: true}
-			} else {
-				op.response <- accountResult{balance: balance, ok: false}
+		case "inc":
+			counters[op.endpoint]++
+		case "snapshot":
+			result := make(map[string]int64, len(counters))
+			for k, v := range counters {
+				result[k] = v
 			}
-		case "balance":
-			op.response <- accountResult{balance: balance, ok: true}
+			op.response <- result
 		}
 	}
-	close(a.done)
+	close(m.done)
 }
 
-func (a *ChannelAccount) Deposit(amount int) {
-	resp := make(chan accountResult)
-	a.ops <- accountOp{kind: "deposit", amount: amount, response: resp}
-	<-resp
+func (m *ChannelMetrics) Increment(endpoint string) {
+	m.ops <- metricsOp{kind: "inc", endpoint: endpoint}
 }
 
-func (a *ChannelAccount) Withdraw(amount int) bool {
-	resp := make(chan accountResult)
-	a.ops <- accountOp{kind: "withdraw", amount: amount, response: resp}
-	return (<-resp).ok
+func (m *ChannelMetrics) Snapshot() map[string]int64 {
+	resp := make(chan map[string]int64)
+	m.ops <- metricsOp{kind: "snapshot", response: resp}
+	return <-resp
 }
 
-func (a *ChannelAccount) Balance() int {
-	resp := make(chan accountResult)
-	a.ops <- accountOp{kind: "balance", response: resp}
-	return (<-resp).balance
-}
-
-func (a *ChannelAccount) Close() {
-	close(a.ops)
-	<-a.done
+func (m *ChannelMetrics) Close() {
+	close(m.ops)
+	<-m.done
 }
 
 func main() {
-	ca := NewChannelAccount(1000)
+	metrics := NewChannelMetrics()
 	var wg sync.WaitGroup
 
-	for i := 0; i < 100; i++ {
+	endpoints := []string{"/api/users", "/api/orders", "/api/products", "/healthz"}
+
+	for i := 0; i < 1000; i++ {
 		wg.Add(1)
-		go func() {
+		go func(reqID int) {
 			defer wg.Done()
-			ca.Deposit(10)
-			ca.Withdraw(5)
-		}()
+			ep := endpoints[reqID%len(endpoints)]
+			metrics.Increment(ep)
+		}(i)
 	}
+
 	wg.Wait()
-	fmt.Printf("Balance: %d (expected: 1500)\n", ca.Balance())
-	ca.Close()
+
+	fmt.Println("=== Request Metrics (channel approach) ===")
+	snap := metrics.Snapshot()
+	total := int64(0)
+	for ep, count := range snap {
+		fmt.Printf("  %-20s %d requests\n", ep, count)
+		total += count
+	}
+	fmt.Printf("  %-20s %d requests\n", "TOTAL", total)
+	metrics.Close()
 }
 ```
 
-Expected output:
-```
-Balance: 1500 (expected: 1500)
-```
+This works but requires more code: an operation struct, a response channel, a background goroutine, and a Close method. For simple state protection, the channel approach adds complexity without clarity.
 
 ### Intermediate Verification
 ```bash
 go run -race main.go
 ```
-Both accounts produce identical results for the same operations.
+Same result, but more ceremony to achieve it.
 
-## Step 3 -- Compare Performance
+## Step 3 -- Scenario 2: Processing Pipeline (Better with Channels)
 
-The program benchmarks 100 goroutines doing 1000 random operations each:
+An image processing pipeline: fetch URLs, download images, resize them, and write to disk. Each stage runs independently and passes work to the next.
 
-```bash
-go run main.go
+**Channel approach -- natural fit:**
+
+```go
+package main
+
+import (
+	"fmt"
+	"sync"
+	"time"
+)
+
+type ImageJob struct {
+	URL       string
+	Stage     string
+	Data      string
+}
+
+func fetcher(urls []string, out chan<- ImageJob) {
+	for _, url := range urls {
+		time.Sleep(20 * time.Millisecond) // simulate HTTP fetch
+		out <- ImageJob{URL: url, Stage: "fetched", Data: "raw-bytes"}
+		fmt.Printf("  [fetch]  %s\n", url)
+	}
+	close(out)
+}
+
+func resizer(in <-chan ImageJob, out chan<- ImageJob) {
+	for job := range in {
+		time.Sleep(30 * time.Millisecond) // simulate resize
+		job.Stage = "resized"
+		job.Data = "resized-bytes"
+		out <- job
+		fmt.Printf("  [resize] %s\n", job.URL)
+	}
+	close(out)
+}
+
+func writer(in <-chan ImageJob, done chan<- struct{}) {
+	for job := range in {
+		time.Sleep(10 * time.Millisecond) // simulate disk write
+		fmt.Printf("  [write]  %s -> saved\n", job.URL)
+	}
+	close(done)
+}
+
+func main() {
+	urls := []string{
+		"cdn.example.com/img/001.jpg",
+		"cdn.example.com/img/002.jpg",
+		"cdn.example.com/img/003.jpg",
+		"cdn.example.com/img/004.jpg",
+		"cdn.example.com/img/005.jpg",
+	}
+
+	fmt.Println("=== Image Processing Pipeline (channels) ===")
+	start := time.Now()
+
+	fetchCh := make(chan ImageJob, 2)
+	resizeCh := make(chan ImageJob, 2)
+	done := make(chan struct{})
+
+	go fetcher(urls, fetchCh)
+	go resizer(fetchCh, resizeCh)
+	go writer(resizeCh, done)
+
+	<-done
+	fmt.Printf("\nPipeline complete: %d images in %v\n", len(urls), time.Since(start).Round(time.Millisecond))
+}
 ```
 
 Expected output:
 ```
-Mutex:   balance=XXXX, time=15ms
-Channel: balance=XXXX, time=85ms
-Mutex is typically faster for simple state protection.
+=== Image Processing Pipeline (channels) ===
+  [fetch]  cdn.example.com/img/001.jpg
+  [resize] cdn.example.com/img/001.jpg
+  [fetch]  cdn.example.com/img/002.jpg
+  [write]  cdn.example.com/img/001.jpg -> saved
+  ...
+
+Pipeline complete: 5 images in ~180ms
 ```
 
-The mutex version is faster because each operation is a simple lock/unlock. The channel version requires channel send, goroutine scheduling, channel receive -- more overhead per operation. The channel version's advantage is clarity of ownership, not speed.
+The pipeline stages are naturally connected by channels. Each stage runs independently, processes items as they arrive, and the entire pipeline overlaps fetch/resize/write for maximum throughput.
 
-## Step 4 -- Decision Guide
+### Intermediate Verification
+```bash
+go run main.go
+```
+All 5 images should flow through the pipeline. Total time should be less than doing all stages sequentially.
 
-The program prints a decision framework:
+## Step 4 -- Scenario 2 with Mutex (Forced Fit)
+
+Now try the same pipeline with mutexes. You end up polling shared state:
+
+```go
+package main
+
+import (
+	"fmt"
+	"sync"
+	"time"
+)
+
+type ImageJob struct {
+	URL   string
+	Stage string
+}
+
+func main() {
+	fmt.Println("=== Image Processing Pipeline (mutex -- awkward) ===")
+
+	var mu sync.Mutex
+	fetchedQueue := make([]ImageJob, 0)
+	resizedQueue := make([]ImageJob, 0)
+	fetchDone := false
+	resizeDone := false
+
+	urls := []string{
+		"cdn.example.com/img/001.jpg",
+		"cdn.example.com/img/002.jpg",
+		"cdn.example.com/img/003.jpg",
+	}
+
+	var wg sync.WaitGroup
+
+	// Fetcher
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for _, url := range urls {
+			time.Sleep(20 * time.Millisecond)
+			mu.Lock()
+			fetchedQueue = append(fetchedQueue, ImageJob{URL: url, Stage: "fetched"})
+			mu.Unlock()
+			fmt.Printf("  [fetch] %s\n", url)
+		}
+		mu.Lock()
+		fetchDone = true
+		mu.Unlock()
+	}()
+
+	// Resizer: must POLL the fetchedQueue
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			mu.Lock()
+			if len(fetchedQueue) > 0 {
+				job := fetchedQueue[0]
+				fetchedQueue = fetchedQueue[1:]
+				mu.Unlock()
+				time.Sleep(30 * time.Millisecond)
+				mu.Lock()
+				job.Stage = "resized"
+				resizedQueue = append(resizedQueue, job)
+				mu.Unlock()
+				fmt.Printf("  [resize] %s\n", job.URL)
+			} else if fetchDone {
+				mu.Unlock()
+				mu.Lock()
+				resizeDone = true
+				mu.Unlock()
+				return
+			} else {
+				mu.Unlock()
+				time.Sleep(5 * time.Millisecond) // POLLING -- wasteful
+			}
+		}
+	}()
+
+	// Writer: must POLL the resizedQueue
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			mu.Lock()
+			if len(resizedQueue) > 0 {
+				job := resizedQueue[0]
+				resizedQueue = resizedQueue[1:]
+				mu.Unlock()
+				time.Sleep(10 * time.Millisecond)
+				fmt.Printf("  [write] %s -> saved\n", job.URL)
+			} else if resizeDone {
+				mu.Unlock()
+				return
+			} else {
+				mu.Unlock()
+				time.Sleep(5 * time.Millisecond) // POLLING -- wasteful
+			}
+		}
+	}()
+
+	wg.Wait()
+	fmt.Println("\nThis works, but the polling loops are ugly, wasteful, and error-prone.")
+	fmt.Println("Channels are the natural fit for pipeline coordination.")
+}
+```
+
+The mutex version works but requires polling loops, manual "done" flags, and careful lock ordering. The channel version is half the code and clearly communicates intent.
+
+### Intermediate Verification
+```bash
+go run main.go
+```
+Same functional result, but the code is noticeably more complex and harder to reason about.
+
+## Step 5 -- Decision Guide
 
 ```
 Use MUTEX when:
-  - Protecting internal state of a struct
+  - Protecting internal state of a struct (counters, caches, config maps)
   - Simple read/write access patterns
-  - Performance is critical (lower overhead)
-  - The protected data has a clear owner
+  - Performance is critical (lower per-operation overhead)
+  - The protected data has a clear owner (a single struct)
 
 Use CHANNELS when:
-  - Transferring data ownership between goroutines
-  - Coordinating sequential phases of work (pipelines)
+  - Transferring data ownership between goroutines (pipelines)
+  - Coordinating sequential phases of work
   - Fan-out/fan-in patterns
-  - Select-based multiplexing with timeouts/cancellation
+  - Select-based multiplexing with timeouts or cancellation
+  - Signaling events (done, shutdown, ready)
+
+Code smell indicators:
+  - Using a buffered channel of size 1 as a lock -> use a mutex
+  - Polling a mutex-protected flag in a loop -> use a channel
+  - Channel with no data (chan struct{}) only for signaling -> consider sync.Once or context
 ```
 
 ## Common Mistakes
@@ -298,23 +502,23 @@ go func() {
 ```
 
 ### Over-Channeling Simple State
-Not every shared variable needs a channel. A cache miss counter, a request count, a configuration flag -- these are naturally protected by a mutex or even `sync/atomic`.
+Not every shared variable needs a channel. A cache miss counter, a request count, a configuration flag -- these are naturally protected by a mutex or even `sync/atomic`. Using channels for them adds unnecessary goroutines and complexity.
 
 ## Verify What You Learned
 
-Implement a concurrent rate limiter two ways:
-1. With a mutex: track timestamps of recent requests, reject if rate exceeded
-2. With a channel: use a buffered channel as a token bucket
+Implement a concurrent log aggregator two ways:
+1. **Mutex approach**: multiple goroutines write log entries to a shared slice protected by a mutex. A flush goroutine periodically reads and clears the slice.
+2. **Channel approach**: goroutines send log entries through a channel to a single writer goroutine that batches and flushes them.
 
-Compare code clarity and correctness under concurrent access from 50 goroutines.
+Compare code clarity, correctness, and which approach feels more natural for this specific problem.
 
 ## What's Next
 Continue to [08-nested-locking-deadlock](../08-nested-locking-deadlock/08-nested-locking-deadlock.md) to learn how nested lock acquisition leads to deadlocks and how to prevent them.
 
 ## Summary
 - Both mutexes and channels are valid concurrency tools; neither is universally better
-- Mutex excels at protecting internal state of a struct (counter, cache, map)
-- Channels excel at transferring data, coordinating work phases, and signaling events
+- Mutex excels at protecting internal state of a struct (counter, cache, config map)
+- Channels excel at transferring data between pipeline stages, coordinating work phases, and signaling events
 - Using a channel as a mutex or a mutex for coordination are code smells
 - The Go proverb is guidance, not dogma: choose the tool that makes the code clearest
 - When in doubt: if a struct owns the data, use a mutex; if goroutines pass data, use a channel

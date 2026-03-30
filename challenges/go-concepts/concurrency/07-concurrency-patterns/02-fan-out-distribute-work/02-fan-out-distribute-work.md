@@ -9,7 +9,6 @@ prerequisites: [goroutines, channels, sync.WaitGroup, pipeline pattern]
 
 # 2. Fan-Out: Distribute Work
 
-
 ## Learning Objectives
 After completing this exercise, you will be able to:
 - **Distribute** work from a single channel to multiple concurrent workers
@@ -18,211 +17,305 @@ After completing this exercise, you will be able to:
 - **Coordinate** worker completion with `sync.WaitGroup`
 
 ## Why Fan-Out
+
 Fan-out is the pattern of distributing work from a single source to multiple goroutines. It is one of the most natural patterns in Go because of how channels work: when multiple goroutines receive from the same channel, the runtime guarantees that each value is delivered to exactly one receiver. There is no duplication, no need for external coordination -- the channel itself acts as a thread-safe work queue.
 
-This pattern is critical for parallelizing CPU-bound or I/O-bound stages in a pipeline. If one stage is a bottleneck, you can fan it out to N workers, each pulling from the same input channel, processing independently, and feeding results downstream. The key mental model is a single funnel (the channel) feeding multiple workers.
+Consider a real scenario: you maintain an infrastructure monitoring system that checks the health of 20+ service URLs every minute. Checking them sequentially takes 20 seconds (1 second per URL with timeouts). By fanning out to 5 workers, each checking URLs concurrently, you reduce the total time to roughly 4 seconds. The difference between 20 seconds and 4 seconds determines whether your alerts fire within your SLA.
 
 ```
-              Fan-Out Data Flow
+              URL Health Checker - Fan-Out
+
   +----------+
-  | producer |
+  | URL list |
   +----+-----+
        |
-    jobs channel
+    jobs channel (20 URLs)
        |
-  +----+----+----+
-  |    |    |    |
-  w1   w2   w3   w4   (workers compete for values)
-  |    |    |    |
-  +----+----+----+
+  +----+----+----+----+----+
+  |    |    |    |    |    |
+  w1   w2   w3   w4   w5   (workers compete for URLs)
+  |    |    |    |    |
+  +----+----+----+----+
        |
   results channel
+       |
+  +----------+
+  | reporter |
+  +----------+
 ```
 
-## Step 1 -- Single-Channel Work Distribution
+## Step 1 -- Sequential URL Checking (The Problem)
 
-Create a work channel and launch multiple workers that all read from it. Observe how Go distributes the values.
+First, see how slow sequential checking is. This establishes the baseline that fan-out will improve.
 
 ```go
 package main
 
 import (
-    "fmt"
-    "sync"
-    "time"
+	"fmt"
+	"math/rand"
+	"time"
 )
 
-func basicFanOut() {
-    fmt.Println("=== Basic Fan-Out ===")
-    jobs := make(chan int, 10)
+type HealthResult struct {
+	URL        string
+	StatusCode int
+	Latency    time.Duration
+	Healthy    bool
+}
 
-    var wg sync.WaitGroup
-    for w := 1; w <= 3; w++ {
-        wg.Add(1)
-        go func(id int) {
-            defer wg.Done()
-            for job := range jobs {
-                fmt.Printf("  worker %d processing job %d\n", id, job)
-                time.Sleep(50 * time.Millisecond)
-            }
-        }(w)
-    }
+func checkURL(url string) HealthResult {
+	latency := time.Duration(50+rand.Intn(150)) * time.Millisecond
+	time.Sleep(latency)
 
-    for j := 1; j <= 9; j++ {
-        jobs <- j
-    }
-    close(jobs)
+	healthy := rand.Float64() > 0.15
+	status := 200
+	if !healthy {
+		status = 503
+	}
 
-    wg.Wait()
-    fmt.Println()
+	return HealthResult{
+		URL:        url,
+		StatusCode: status,
+		Latency:    latency,
+		Healthy:    healthy,
+	}
 }
 
 func main() {
-    basicFanOut()
+	urls := []string{
+		"https://api.example.com/health",
+		"https://auth.example.com/health",
+		"https://payments.example.com/health",
+		"https://notifications.example.com/health",
+		"https://search.example.com/health",
+		"https://analytics.example.com/health",
+		"https://cdn.example.com/health",
+		"https://db-primary.example.com/health",
+		"https://db-replica.example.com/health",
+		"https://cache.example.com/health",
+		"https://queue.example.com/health",
+		"https://storage.example.com/health",
+		"https://gateway.example.com/health",
+		"https://logging.example.com/health",
+		"https://metrics.example.com/health",
+		"https://scheduler.example.com/health",
+		"https://email.example.com/health",
+		"https://webhook.example.com/health",
+		"https://admin.example.com/health",
+		"https://docs.example.com/health",
+	}
+
+	fmt.Println("=== Sequential Health Check (20 URLs) ===")
+	start := time.Now()
+	var unhealthy int
+	for _, url := range urls {
+		result := checkURL(url)
+		if !result.Healthy {
+			unhealthy++
+			fmt.Printf("  DOWN: %s (status=%d, latency=%v)\n", result.URL, result.StatusCode, result.Latency)
+		}
+	}
+	elapsed := time.Since(start)
+	fmt.Printf("  Total: %d URLs checked, %d unhealthy, took %v\n\n", len(urls), unhealthy, elapsed)
 }
 ```
-
-Three workers compete for 9 jobs. Each job goes to exactly one worker. The distribution is non-deterministic.
 
 ### Intermediate Verification
 ```bash
 go run main.go
 ```
-Expected: all 9 jobs processed, roughly 3 per worker (order varies):
+Expected: all 20 URLs checked, taking roughly 2-3 seconds total (sequential):
 ```
-=== Basic Fan-Out ===
-  worker 1 processing job 1
-  worker 2 processing job 2
-  worker 3 processing job 3
+=== Sequential Health Check (20 URLs) ===
+  DOWN: https://payments.example.com/health (status=503, latency=120ms)
   ...
+  Total: 20 URLs checked, 3 unhealthy, took 2.4s
 ```
 
-## Step 2 -- Fan-Out a Pipeline Stage
+## Step 2 -- Fan-Out with Worker Pool
 
-Integrate fan-out into a pipeline. Create a generator stage, then fan out the processing stage to multiple workers.
+Now distribute the same URLs to N workers that all read from a shared jobs channel. Observe the speed improvement.
 
 ```go
 package main
 
 import (
-    "fmt"
-    "sync"
-    "time"
+	"fmt"
+	"math/rand"
+	"sync"
+	"time"
 )
 
-func generate(start, end int) <-chan int {
-    out := make(chan int)
-    go func() {
-        for i := start; i <= end; i++ {
-            out <- i
-        }
-        close(out)
-    }()
-    return out
+type HealthResult struct {
+	URL        string
+	StatusCode int
+	Latency    time.Duration
+	Healthy    bool
+	WorkerID   int
 }
 
-func fanOutSquare(in <-chan int, numWorkers int) <-chan int {
-    results := make(chan int, numWorkers)
-    var wg sync.WaitGroup
+func checkURL(url string) (int, time.Duration, bool) {
+	latency := time.Duration(50+rand.Intn(150)) * time.Millisecond
+	time.Sleep(latency)
+	healthy := rand.Float64() > 0.15
+	status := 200
+	if !healthy {
+		status = 503
+	}
+	return status, latency, healthy
+}
 
-    for w := 0; w < numWorkers; w++ {
-        wg.Add(1)
-        go func(id int) {
-            defer wg.Done()
-            for n := range in {
-                result := n * n
-                fmt.Printf("  worker %d: %d^2 = %d\n", id, n, result)
-                results <- result
-                time.Sleep(30 * time.Millisecond)
-            }
-        }(w)
-    }
-
-    go func() {
-        wg.Wait()
-        close(results)
-    }()
-
-    return results
+func healthWorker(id int, urls <-chan string, results chan<- HealthResult, wg *sync.WaitGroup) {
+	defer wg.Done()
+	for url := range urls {
+		status, latency, healthy := checkURL(url)
+		results <- HealthResult{
+			URL:        url,
+			StatusCode: status,
+			Latency:    latency,
+			Healthy:    healthy,
+			WorkerID:   id,
+		}
+	}
 }
 
 func main() {
-    nums := generate(1, 12)
-    squared := fanOutSquare(nums, 3)
-    fmt.Print("Results: ")
-    for r := range squared {
-        fmt.Printf("%d ", r)
-    }
-    fmt.Println()
+	urls := []string{
+		"https://api.example.com/health",
+		"https://auth.example.com/health",
+		"https://payments.example.com/health",
+		"https://notifications.example.com/health",
+		"https://search.example.com/health",
+		"https://analytics.example.com/health",
+		"https://cdn.example.com/health",
+		"https://db-primary.example.com/health",
+		"https://db-replica.example.com/health",
+		"https://cache.example.com/health",
+		"https://queue.example.com/health",
+		"https://storage.example.com/health",
+		"https://gateway.example.com/health",
+		"https://logging.example.com/health",
+		"https://metrics.example.com/health",
+		"https://scheduler.example.com/health",
+		"https://email.example.com/health",
+		"https://webhook.example.com/health",
+		"https://admin.example.com/health",
+		"https://docs.example.com/health",
+	}
+
+	numWorkers := 5
+	fmt.Printf("=== Fan-Out Health Check (%d workers, %d URLs) ===\n", numWorkers, len(urls))
+	start := time.Now()
+
+	jobs := make(chan string, len(urls))
+	results := make(chan HealthResult, len(urls))
+
+	var wg sync.WaitGroup
+	for w := 1; w <= numWorkers; w++ {
+		wg.Add(1)
+		go healthWorker(w, jobs, results, &wg)
+	}
+
+	for _, url := range urls {
+		jobs <- url
+	}
+	close(jobs)
+
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	var unhealthy int
+	workerCounts := make(map[int]int)
+	for r := range results {
+		workerCounts[r.WorkerID]++
+		if !r.Healthy {
+			unhealthy++
+			fmt.Printf("  DOWN: %s (status=%d, latency=%v) [worker %d]\n",
+				r.URL, r.StatusCode, r.Latency, r.WorkerID)
+		}
+	}
+
+	elapsed := time.Since(start)
+	fmt.Printf("\n  Total: %d URLs checked, %d unhealthy, took %v\n", len(urls), unhealthy, elapsed)
+	fmt.Println("  Work distribution:")
+	for id := 1; id <= numWorkers; id++ {
+		fmt.Printf("    worker %d: %d URLs\n", id, workerCounts[id])
+	}
 }
 ```
 
-The `fanOutSquare` function launches N workers that all read from the same input channel. A separate goroutine waits for all workers to finish and then closes the results channel.
+Five workers compete for 20 URLs. Each URL goes to exactly one worker. The distribution is non-deterministic -- Go's scheduler does not guarantee round-robin.
 
 ### Intermediate Verification
 ```bash
 go run main.go
 ```
-Expected: each number 1-12 squared, distributed across workers:
+Expected: same 20 URLs checked, but roughly 4-5x faster:
 ```
-  worker 0: 1^2 = 1
-  worker 1: 2^2 = 4
+=== Fan-Out Health Check (5 workers, 20 URLs) ===
+  DOWN: https://payments.example.com/health (status=503, latency=95ms) [worker 3]
   ...
-Results: 1 4 9 16 ...
+  Total: 20 URLs checked, 3 unhealthy, took 520ms
+  Work distribution:
+    worker 1: 4 URLs
+    worker 2: 4 URLs
+    worker 3: 4 URLs
+    worker 4: 4 URLs
+    worker 5: 4 URLs
 ```
 
-## Step 3 -- Observe Distribution Under Load
+## Step 3 -- Compare Sequential vs Fan-Out
 
-Implement a function that shows how distribution changes with different worker counts and workload characteristics.
+Measure the actual speedup with different worker counts to see diminishing returns.
 
 ```go
 package main
 
 import (
-    "fmt"
-    "sync"
-    "time"
+	"fmt"
+	"math/rand"
+	"sync"
+	"time"
 )
 
-func distributionAnalysis() {
-    fmt.Println("=== Distribution Analysis ===")
-    const totalJobs = 20
-
-    for _, numWorkers := range []int{1, 3, 5} {
-        fmt.Printf("\n  Workers: %d\n", numWorkers)
-        counts := make(map[int]int)
-        var mu sync.Mutex
-        var wg sync.WaitGroup
-
-        jobs := make(chan int, totalJobs)
-        for w := 0; w < numWorkers; w++ {
-            wg.Add(1)
-            go func(id int) {
-                defer wg.Done()
-                for range jobs {
-                    mu.Lock()
-                    counts[id]++
-                    mu.Unlock()
-                    time.Sleep(10 * time.Millisecond)
-                }
-            }(w)
-        }
-
-        for j := 0; j < totalJobs; j++ {
-            jobs <- j
-        }
-        close(jobs)
-        wg.Wait()
-
-        for id := 0; id < numWorkers; id++ {
-            fmt.Printf("    worker %d handled %d jobs\n", id, counts[id])
-        }
-    }
-    fmt.Println()
+func simulateCheck(url string) {
+	time.Sleep(time.Duration(50+rand.Intn(150)) * time.Millisecond)
 }
 
 func main() {
-    distributionAnalysis()
+	urls := make([]string, 20)
+	for i := range urls {
+		urls[i] = fmt.Sprintf("https://service-%02d.example.com/health", i+1)
+	}
+
+	fmt.Println("=== Speed Comparison ===")
+	for _, numWorkers := range []int{1, 2, 5, 10, 20} {
+		start := time.Now()
+		jobs := make(chan string, len(urls))
+		var wg sync.WaitGroup
+
+		for w := 0; w < numWorkers; w++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for url := range jobs {
+					simulateCheck(url)
+				}
+			}()
+		}
+
+		for _, url := range urls {
+			jobs <- url
+		}
+		close(jobs)
+		wg.Wait()
+
+		elapsed := time.Since(start)
+		fmt.Printf("  %2d workers: %v\n", numWorkers, elapsed)
+	}
 }
 ```
 
@@ -230,7 +323,15 @@ func main() {
 ```bash
 go run main.go
 ```
-With 1 worker, it handles all 20. With 3 and 5, the work distributes roughly evenly.
+Expected: clear improvement up to the number of URLs, then diminishing returns:
+```
+=== Speed Comparison ===
+   1 workers: 2.4s
+   2 workers: 1.2s
+   5 workers: 520ms
+  10 workers: 280ms
+  20 workers: 180ms
+```
 
 ## Common Mistakes
 
@@ -240,25 +341,24 @@ With 1 worker, it handles all 20. With 3 and 5, the work distributes roughly eve
 package main
 
 import (
-    "fmt"
-    "sync"
+	"fmt"
+	"sync"
 )
 
 func main() {
-    jobs := make(chan int, 10)
-    var wg sync.WaitGroup
-    wg.Add(1)
-    go func() {
-        defer wg.Done()
-        for j := range jobs { // blocks forever
-            fmt.Println(j)
-        }
-    }()
-    for j := 0; j < 10; j++ {
-        jobs <- j
-    }
-    // forgot close(jobs) -- worker blocks on range forever
-    wg.Wait() // deadlock
+	jobs := make(chan string, 10)
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for url := range jobs { // blocks forever
+			fmt.Println("checking", url)
+		}
+	}()
+	jobs <- "https://api.example.com/health"
+	jobs <- "https://auth.example.com/health"
+	// forgot close(jobs) -- worker blocks on range forever
+	wg.Wait() // deadlock
 }
 ```
 **What happens:** Workers block on `range jobs` forever after all values are consumed. The program deadlocks.
@@ -268,8 +368,8 @@ func main() {
 ### Closing the Results Channel Too Early
 **Wrong:**
 ```go
-for w := 0; w < 3; w++ {
-    go worker(in, results)
+for w := 0; w < 5; w++ {
+	go healthWorker(w, jobs, results, &wg)
 }
 close(results) // workers haven't finished yet!
 ```
@@ -278,15 +378,15 @@ close(results) // workers haven't finished yet!
 **Fix:** Use a separate goroutine with `WaitGroup` to close the results channel only after all workers complete.
 
 ### Assuming Even Distribution
-Go's scheduler does not guarantee round-robin distribution. If one worker is slightly faster, it may grab more jobs. The guarantee is only that each value goes to exactly one receiver.
+Go's scheduler does not guarantee round-robin distribution. If one worker is slightly faster (its URL responded quickly), it may grab more jobs. The guarantee is only that each value goes to exactly one receiver.
 
 ## Verify What You Learned
 
 Run `go run main.go` and verify the output includes:
-- Basic fan-out: all 9 jobs processed across 3 workers
-- Fan-out pipeline: all 12 values squared
-- Distribution analysis: work distributes roughly evenly
-- Speedup comparison: 5 workers noticeably faster than 1
+- Sequential check: all 20 URLs checked, taking 2+ seconds
+- Fan-out with 5 workers: same 20 URLs, roughly 5x faster
+- Speed comparison: clear improvement from 1 to 5 workers, diminishing returns beyond that
+- Work distribution: roughly even across workers (not exact)
 
 ## What's Next
 Continue to [03-fan-in-merge-results](../03-fan-in-merge-results/03-fan-in-merge-results.md) to learn the complementary pattern: merging multiple channels into one.
@@ -297,7 +397,7 @@ Continue to [03-fan-in-merge-results](../03-fan-in-merge-results/03-fan-in-merge
 - Workers compete for values -- distribution is natural and non-deterministic
 - Use `sync.WaitGroup` to know when all workers have finished
 - Close the results channel only after all workers are done (use a separate goroutine)
-- Fan-out turns a sequential bottleneck into parallel processing
+- Fan-out turns a sequential bottleneck into parallel processing -- critical for I/O-bound work like health checks
 
 ## Reference
 - [Go Blog: Pipelines and Cancellation](https://go.dev/blog/pipelines)

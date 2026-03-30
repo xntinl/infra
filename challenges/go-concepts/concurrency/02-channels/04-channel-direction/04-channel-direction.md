@@ -4,29 +4,28 @@ concepts: [directional-channels, send-only, receive-only, type-safety, function-
 tools: [go]
 estimated_time: 25m
 bloom_level: apply
-prerequisites: [goroutines, unbuffered-channels, buffered-channels]
 ---
 
 # 4. Channel Direction
-
 
 ## Learning Objectives
 After completing this exercise, you will be able to:
 - **Declare** send-only (`chan<- T`) and receive-only (`<-chan T`) channel parameters
 - **Write** producer and consumer functions with directional channel constraints
+- **Build** a multi-stage data processing pipeline with enforced data flow
 - **Explain** how directional channels prevent bugs at compile time
 
 ## Why Channel Direction
 
-A bidirectional channel (`chan T`) lets any code both send and receive. In a real program, this is too permissive. A producer should only send, and a consumer should only receive. If a producer accidentally receives from its output channel, or a consumer sends into its input, you have a subtle bug that's hard to find at runtime.
+In a data processing pipeline, data flows in one direction: source produces records, a filter removes invalid ones, a transformer reshapes the data, and an output stage writes the results. If a filter stage accidentally *sends* data back into its input channel instead of reading from it, you have a subtle bug that is hard to find at runtime.
 
-Go's type system lets you restrict channels to send-only (`chan<- T`) or receive-only (`<-chan T`). The compiler enforces these restrictions, turning potential runtime bugs into compile errors. You get the restriction for free: a bidirectional channel automatically converts to a directional one when passed to a function that expects it.
+Go's type system lets you restrict channels to send-only (`chan<- T`) or receive-only (`<-chan T`). The compiler enforces these restrictions, turning potential runtime bugs into compile errors. A producer function that accepts `chan<- Record` cannot accidentally receive from that channel. A consumer that accepts `<-chan Record` cannot accidentally send.
 
-This is a core principle of Go's design philosophy: use the type system to make illegal states unrepresentable.
+This is how you make data flow explicit in function signatures. When you read `func filter(in <-chan Record, out chan<- Record)`, you instantly know: data flows from `in` to `out`. The compiler guarantees it.
 
-## Step 1 -- Send-Only and Receive-Only Syntax
+## Step 1 -- Understand the Syntax
 
-Understand the syntax by reading the arrow's direction relative to `chan`:
+Read the arrow's direction relative to `chan`:
 
 ```
 chan T      // bidirectional: can send and receive
@@ -36,173 +35,9 @@ chan<- T    // send-only: can only send (arrow points INTO chan)
 
 Mnemonic: the arrow `<-` always represents data flow. `chan<- T` means data flows into the channel (send). `<-chan T` means data flows out of the channel (receive).
 
-## Step 2 -- Write a Producer with Send-Only Channel
+## Step 2 -- CSV Record Producer
 
-A producer function takes a send-only channel and writes values to it.
-
-```go
-package main
-
-import "fmt"
-
-// produce can only SEND to out. Attempting to receive would be a compile error.
-func produce(out chan<- int, count int) {
-    for i := 1; i <= count; i++ {
-        out <- i
-    }
-    close(out) // producers close when done
-}
-
-func main() {
-    ch := make(chan int)  // bidirectional
-    go produce(ch, 5)    // auto-narrows to send-only
-
-    for val := range ch {
-        fmt.Println(val)
-    }
-}
-```
-
-Try adding `val := <-out` inside `produce`. The compiler rejects it:
-```
-invalid operation: cannot receive from send-only channel out
-```
-
-### Verification
-```bash
-go run main.go
-# Expected: 1 2 3 4 5 (one per line)
-```
-
-## Step 3 -- Write a Consumer with Receive-Only Channel
-
-A consumer takes a receive-only channel and processes incoming values.
-
-```go
-package main
-
-import "fmt"
-
-func consume(in <-chan int) {
-    for val := range in {
-        fmt.Println("Received:", val)
-    }
-    // close(in)  -- compile error! Can't close a receive-only channel.
-    // in <- 99   -- compile error! Can't send to a receive-only channel.
-}
-
-func main() {
-    ch := make(chan int)
-    go func() {
-        for _, v := range []int{10, 20, 30} {
-            ch <- v
-        }
-        close(ch)
-    }()
-
-    consume(ch) // auto-narrows to receive-only
-}
-```
-
-### Verification
-```bash
-go run main.go
-# Expected:
-#   Received: 10
-#   Received: 20
-#   Received: 30
-```
-
-## Step 4 -- Build a Pipeline
-
-Connect producer and consumer through a transformer. Each stage uses directional channels to enforce data flow.
-
-```go
-package main
-
-import "fmt"
-
-func produce(out chan<- int, count int) {
-    for i := 1; i <= count; i++ {
-        out <- i
-    }
-    close(out)
-}
-
-// double reads from in (receive-only) and writes to out (send-only).
-// The signature enforces the data flow direction.
-func double(in <-chan int, out chan<- int) {
-    for val := range in {
-        out <- val * 2
-    }
-    close(out)
-}
-
-func main() {
-    raw := make(chan int)
-    doubled := make(chan int)
-
-    go produce(raw, 5)        // sends 1..5 to raw
-    go double(raw, doubled)   // reads raw, writes *2 to doubled
-
-    for val := range doubled {
-        fmt.Println("Doubled:", val)
-    }
-}
-```
-
-Each function only has access to the direction it needs. `double` can read from `in` and write to `out`, but not the reverse.
-
-### Verification
-```bash
-go run main.go
-# Expected:
-#   Doubled: 2
-#   Doubled: 4
-#   Doubled: 6
-#   Doubled: 8
-#   Doubled: 10
-```
-
-## Step 5 -- Return Receive-Only Channel from Function
-
-A common pattern is a generator function that creates a channel internally and returns it as receive-only.
-
-```go
-package main
-
-import "fmt"
-
-func generateNumbers(n int) <-chan int {
-    ch := make(chan int)  // bidirectional inside the function
-    go func() {
-        for i := 1; i <= n; i++ {
-            ch <- i
-        }
-        close(ch)
-    }()
-    // Returning chan int as <-chan int is an automatic narrowing conversion.
-    // The caller can only receive. The goroutine holds the only send reference.
-    return ch
-}
-
-func main() {
-    nums := generateNumbers(5)
-    for val := range nums {
-        fmt.Println(val)
-    }
-}
-```
-
-### Verification
-```bash
-go run main.go
-# Expected: 1 2 3 4 5 (one per line)
-```
-
-## Step 6 -- Three-Stage Word Pipeline
-
-Wire three string-processing stages together. Each stage only has the direction it needs, enforced by the compiler.
+Build a producer that reads CSV records and sends them through a channel. The function returns a `<-chan` (receive-only for the caller). Only the internal goroutine can send.
 
 ```go
 package main
@@ -212,41 +47,42 @@ import (
     "strings"
 )
 
-func generateWords(words []string) <-chan string {
-    ch := make(chan string)
+type Record struct {
+    Name   string
+    Email  string
+    Amount float64
+}
+
+// readCSV returns a receive-only channel. The caller can only consume records.
+// The goroutine inside owns the send side -- no one else can write to it.
+func readCSV(csvData string) <-chan Record {
+    ch := make(chan Record) // bidirectional inside the function
     go func() {
-        for _, w := range words {
-            ch <- w
+        for _, line := range strings.Split(csvData, "\n") {
+            fields := strings.Split(line, ",")
+            if len(fields) != 3 {
+                continue
+            }
+            var amount float64
+            fmt.Sscanf(fields[2], "%f", &amount)
+            ch <- Record{
+                Name:   strings.TrimSpace(fields[0]),
+                Email:  strings.TrimSpace(fields[1]),
+                Amount: amount,
+            }
         }
         close(ch)
     }()
-    return ch
-}
-
-func toUpper(in <-chan string, out chan<- string) {
-    for word := range in {
-        out <- strings.ToUpper(word)
-    }
-    close(out)
-}
-
-func addPrefix(in <-chan string, out chan<- string) {
-    for word := range in {
-        out <- "PROCESSED: " + word
-    }
-    close(out)
+    return ch // auto-narrows from chan Record to <-chan Record
 }
 
 func main() {
-    words := generateWords([]string{"go", "channels", "are", "typed"})
-    uppered := make(chan string)
-    prefixed := make(chan string)
+    csv := `Alice,alice@corp.com,150.00
+Bob,bob@corp.com,75.50
+Carol,carol@corp.com,200.00`
 
-    go toUpper(words, uppered)
-    go addPrefix(uppered, prefixed)
-
-    for result := range prefixed {
-        fmt.Println(result)
+    for rec := range readCSV(csv) {
+        fmt.Printf("Record: %s <%s> $%.2f\n", rec.Name, rec.Email, rec.Amount)
     }
 }
 ```
@@ -255,11 +91,234 @@ func main() {
 ```bash
 go run main.go
 # Expected:
-#   PROCESSED: GO
-#   PROCESSED: CHANNELS
-#   PROCESSED: ARE
-#   PROCESSED: TYPED
+#   Record: Alice <alice@corp.com> $150.00
+#   Record: Bob <bob@corp.com> $75.50
+#   Record: Carol <carol@corp.com> $200.00
 ```
+
+## Step 3 -- Filter Stage with Directional Channels
+
+A filter reads records from `<-chan` (receive-only) and writes passing records to `chan<-` (send-only). The signature enforces the data flow direction: data can only move from `in` to `out`.
+
+```go
+package main
+
+import (
+    "fmt"
+    "strings"
+)
+
+type Record struct {
+    Name   string
+    Email  string
+    Amount float64
+}
+
+func readCSV(csvData string) <-chan Record {
+    ch := make(chan Record)
+    go func() {
+        for _, line := range strings.Split(csvData, "\n") {
+            fields := strings.Split(line, ",")
+            if len(fields) != 3 {
+                continue
+            }
+            var amount float64
+            fmt.Sscanf(fields[2], "%f", &amount)
+            ch <- Record{
+                Name:   strings.TrimSpace(fields[0]),
+                Email:  strings.TrimSpace(fields[1]),
+                Amount: amount,
+            }
+        }
+        close(ch)
+    }()
+    return ch
+}
+
+// filterHighValue reads from in (receive-only) and writes to out (send-only).
+// Only records with Amount >= minAmount pass through.
+// Try adding `val := <-out` inside this function -- the compiler rejects it.
+func filterHighValue(in <-chan Record, out chan<- Record, minAmount float64) {
+    for rec := range in {
+        if rec.Amount >= minAmount {
+            out <- rec
+        }
+    }
+    close(out)
+}
+
+func main() {
+    csv := `Alice,alice@corp.com,150.00
+Bob,bob@corp.com,75.50
+Carol,carol@corp.com,200.00
+Dave,dave@corp.com,50.00
+Eve,eve@corp.com,300.00`
+
+    raw := readCSV(csv)
+    filtered := make(chan Record)
+    go filterHighValue(raw, filtered, 100.00)
+
+    for rec := range filtered {
+        fmt.Printf("High-value: %s $%.2f\n", rec.Name, rec.Amount)
+    }
+}
+```
+
+### Verification
+```bash
+go run main.go
+# Expected:
+#   High-value: Alice $150.00
+#   High-value: Carol $200.00
+#   High-value: Eve $300.00
+```
+
+## Step 4 -- Full Pipeline: Filter, Transform, Output
+
+Connect three stages into a complete data processing pipeline. Each stage uses directional channels to enforce data flow. The compiler guarantees no stage can accidentally read from its output or write to its input.
+
+```go
+package main
+
+import (
+    "fmt"
+    "strings"
+)
+
+type Record struct {
+    Name   string
+    Email  string
+    Amount float64
+}
+
+type OutputRecord struct {
+    Label string
+    Total string
+}
+
+func readCSV(csvData string) <-chan Record {
+    ch := make(chan Record)
+    go func() {
+        for _, line := range strings.Split(csvData, "\n") {
+            fields := strings.Split(line, ",")
+            if len(fields) != 3 {
+                continue
+            }
+            var amount float64
+            fmt.Sscanf(fields[2], "%f", &amount)
+            ch <- Record{
+                Name:   strings.TrimSpace(fields[0]),
+                Email:  strings.TrimSpace(fields[1]),
+                Amount: amount,
+            }
+        }
+        close(ch)
+    }()
+    return ch
+}
+
+func filterHighValue(in <-chan Record, out chan<- Record, minAmount float64) {
+    for rec := range in {
+        if rec.Amount >= minAmount {
+            out <- rec
+        }
+    }
+    close(out)
+}
+
+// transform reads Records and produces OutputRecords.
+// in is receive-only, out is send-only -- data flows one direction.
+func transform(in <-chan Record, out chan<- OutputRecord) {
+    for rec := range in {
+        out <- OutputRecord{
+            Label: fmt.Sprintf("%s (%s)", rec.Name, rec.Email),
+            Total: fmt.Sprintf("$%.2f", rec.Amount*1.1), // apply 10% tax
+        }
+    }
+    close(out)
+}
+
+func main() {
+    csv := `Alice,alice@corp.com,150.00
+Bob,bob@corp.com,75.50
+Carol,carol@corp.com,200.00
+Dave,dave@corp.com,50.00
+Eve,eve@corp.com,300.00`
+
+    // Pipeline: readCSV -> filter (>= $100) -> transform (add tax) -> output
+    raw := readCSV(csv)
+    filtered := make(chan Record)
+    transformed := make(chan OutputRecord)
+
+    go filterHighValue(raw, filtered, 100.00)
+    go transform(filtered, transformed)
+
+    fmt.Println("=== Invoice Report (High-Value Clients, +10% Tax) ===")
+    for out := range transformed {
+        fmt.Printf("  %s => %s\n", out.Label, out.Total)
+    }
+}
+```
+
+### Verification
+```bash
+go run main.go
+# Expected:
+#   === Invoice Report (High-Value Clients, +10% Tax) ===
+#     Alice (alice@corp.com) => $165.00
+#     Carol (carol@corp.com) => $220.00
+#     Eve (eve@corp.com) => $330.00
+```
+
+## Step 5 -- Compile-Time Protection in Action
+
+This step demonstrates the compile-time errors you get when you violate channel direction. Try each mistake and observe the compiler error.
+
+```go
+package main
+
+import "fmt"
+
+// This function can ONLY send.
+func producerBroken(out chan<- int) {
+    // Uncomment to see compile error:
+    // val := <-out  // invalid operation: cannot receive from send-only channel
+    out <- 42
+}
+
+// This function can ONLY receive.
+func consumerBroken(in <-chan int) {
+    val := <-in
+    fmt.Println(val)
+    // Uncomment to see compile error:
+    // in <- 99      // invalid operation: cannot send to receive-only channel
+    // close(in)     // invalid operation: cannot close receive-only channel
+}
+
+func main() {
+    ch := make(chan int)
+    go producerBroken(ch) // auto-narrows to chan<- int
+    consumerBroken(ch)    // auto-narrows to <-chan int
+
+    // You CANNOT widen permissions:
+    // var readOnly <-chan int = make(chan int)
+    // producerBroken(readOnly) // compile error: cannot use readOnly as chan<- int
+}
+```
+
+### Verification
+```bash
+go run main.go
+# Expected: 42
+# Uncomment the broken lines to see compile errors
+```
+
+## Intermediate Verification
+
+Review your pipeline and confirm:
+1. Each stage function clearly declares its data flow via `<-chan` and `chan<-`
+2. The compiler rejects any attempt to read from an output or write to an input
+3. Each stage closes its output channel when its input is exhausted
 
 ## Common Mistakes
 
@@ -293,6 +352,11 @@ needsBidirectional(readOnly) // compile error!
 
 **Fix:** Pass the bidirectional channel, or change the function signature to accept the narrower type.
 
+## Verify What You Learned
+1. What does `chan<- Record` mean versus `<-chan Record`?
+2. Why should the filter stage accept `<-chan` for input and `chan<-` for output instead of using bidirectional channels?
+3. Who should close the channel in a pipeline -- the sender or the receiver?
+
 ## What's Next
 Continue to [05-ranging-over-channels](../05-ranging-over-channels/05-ranging-over-channels.md) to learn the `for range` pattern for consuming all values from a channel.
 
@@ -302,7 +366,7 @@ Continue to [05-ranging-over-channels](../05-ranging-over-channels/05-ranging-ov
 - The reverse is not true -- you cannot widen a directional channel to bidirectional
 - Only send-side code can `close()` a channel; receive-only channels prevent closing
 - Directional channels make data flow explicit in function signatures
-- Use directional types to catch direction bugs at compile time, not runtime
+- Use directional types in pipeline stages to catch direction bugs at compile time, not runtime
 
 ## Reference
 - [A Tour of Go: Channel Directions](https://go.dev/tour/concurrency/4)

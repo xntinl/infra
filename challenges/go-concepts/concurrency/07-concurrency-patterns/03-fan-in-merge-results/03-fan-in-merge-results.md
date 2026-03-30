@@ -9,7 +9,6 @@ prerequisites: [goroutines, channels, sync.WaitGroup, fan-out pattern]
 
 # 3. Fan-In: Merge Results
 
-
 ## Learning Objectives
 After completing this exercise, you will be able to:
 - **Merge** multiple channels into a single output channel
@@ -18,239 +17,383 @@ After completing this exercise, you will be able to:
 - **Recognize** when fan-in is the right pattern for aggregating concurrent results
 
 ## Why Fan-In
+
 Fan-in is the complement of fan-out. Where fan-out distributes work across multiple workers, fan-in collects results from multiple producers into a single channel. Together, they form the classic scatter-gather pattern: split work, process in parallel, merge results.
 
-The merge function is the core of fan-in. It takes N input channels, launches a goroutine per channel to forward values to a single output, and uses a WaitGroup to close the output when all inputs are drained. This is a recurring building block in Go systems -- from aggregating results of parallel API calls to combining log streams from multiple services.
+Consider a real scenario: a user types a search query in your application. To return comprehensive results, you need to query the user database, the product catalog, and the order history -- three separate backends. Querying them sequentially takes 900ms (300ms each). By querying all three concurrently and merging their results with fan-in, the total latency drops to 300ms -- the time of the slowest backend. Your API response time just improved by 3x.
 
 ```
-         Fan-In Data Flow
-  ch-A ---+
-           |
-  ch-B ---+--> merged output --> consumer
-           |
-  ch-C ---+
+         Search Aggregator - Fan-In
 
-  Each input gets a forwarding goroutine.
-  A WaitGroup + closer goroutine closes
-  the output after ALL inputs are drained.
+  "laptop" --> userDB (300ms)   ---+
+           --> productDB (200ms) --+--> merged results --> API response
+           --> orderDB (250ms)  ---+
+
+  Total latency: max(300, 200, 250) = 300ms instead of 750ms
 ```
 
-## Step 1 -- Merge Two Channels
+## Step 1 -- Query Multiple Backends Concurrently
 
-Start with the simplest case: merging exactly two channels into one.
+Start by defining the backend queries as functions that return channels, then merge two of them.
 
 ```go
 package main
 
 import (
-    "fmt"
-    "sync"
-    "time"
+	"fmt"
+	"sync"
+	"time"
 )
 
-func producer(name string, values ...int) <-chan int {
-    out := make(chan int)
-    go func() {
-        for _, v := range values {
-            fmt.Printf("  %s sending %d\n", name, v)
-            out <- v
-            time.Sleep(20 * time.Millisecond)
-        }
-        close(out)
-    }()
-    return out
+type SearchResult struct {
+	Backend string
+	Items   []string
+	Latency time.Duration
 }
 
-func mergeTwo(a, b <-chan int) <-chan int {
-    out := make(chan int)
-    var wg sync.WaitGroup
-    wg.Add(2)
+func queryUserDB(query string) <-chan SearchResult {
+	out := make(chan SearchResult)
+	go func() {
+		start := time.Now()
+		time.Sleep(120 * time.Millisecond)
+		out <- SearchResult{
+			Backend: "users",
+			Items:   []string{"user:alice (matches '" + query + "')", "user:bob (matches '" + query + "')"},
+			Latency: time.Since(start),
+		}
+		close(out)
+	}()
+	return out
+}
 
-    forward := func(ch <-chan int) {
-        defer wg.Done()
-        for v := range ch {
-            out <- v
-        }
-    }
+func queryProductDB(query string) <-chan SearchResult {
+	out := make(chan SearchResult)
+	go func() {
+		start := time.Now()
+		time.Sleep(80 * time.Millisecond)
+		out <- SearchResult{
+			Backend: "products",
+			Items:   []string{"product:Laptop Pro", "product:Laptop Air", "product:Laptop Stand"},
+			Latency: time.Since(start),
+		}
+		close(out)
+	}()
+	return out
+}
 
-    go forward(a)
-    go forward(b)
+func queryOrderDB(query string) <-chan SearchResult {
+	out := make(chan SearchResult)
+	go func() {
+		start := time.Now()
+		time.Sleep(150 * time.Millisecond)
+		out <- SearchResult{
+			Backend: "orders",
+			Items:   []string{"order:#1042 Laptop Pro", "order:#1099 Laptop Air"},
+			Latency: time.Since(start),
+		}
+		close(out)
+	}()
+	return out
+}
 
-    go func() {
-        wg.Wait()
-        close(out)
-    }()
+func merge(channels ...<-chan SearchResult) <-chan SearchResult {
+	out := make(chan SearchResult)
+	var wg sync.WaitGroup
 
-    return out
+	for _, ch := range channels {
+		wg.Add(1)
+		go func(c <-chan SearchResult) {
+			defer wg.Done()
+			for v := range c {
+				out <- v
+			}
+		}(ch)
+	}
+
+	go func() {
+		wg.Wait()
+		close(out)
+	}()
+
+	return out
 }
 
 func main() {
-    a := producer("A", 1, 2, 3)
-    b := producer("B", 10, 20, 30)
-    fmt.Print("Merged: ")
-    for v := range mergeTwo(a, b) {
-        fmt.Printf("%d ", v)
-    }
-    fmt.Println()
+	query := "laptop"
+	fmt.Printf("=== Search Aggregator for '%s' ===\n\n", query)
+
+	start := time.Now()
+	results := merge(
+		queryUserDB(query),
+		queryProductDB(query),
+		queryOrderDB(query),
+	)
+
+	var totalItems int
+	for r := range results {
+		fmt.Printf("  [%s] %d results (latency: %v)\n", r.Backend, len(r.Items), r.Latency)
+		for _, item := range r.Items {
+			fmt.Printf("    - %s\n", item)
+		}
+		totalItems += len(r.Items)
+	}
+
+	fmt.Printf("\n  Total: %d items from 3 backends in %v\n", totalItems, time.Since(start))
 }
 ```
 
-Each input channel gets its own forwarding goroutine. A third goroutine waits for both to finish and closes the output.
+Each backend gets its own forwarding goroutine in the `merge` function. A separate goroutine waits for all to finish and closes the output.
 
 ### Intermediate Verification
 ```bash
 go run main.go
 ```
-Expected: all values from both channels appear (order varies):
+Expected: results from all three backends, total time around 150ms (the slowest backend):
 ```
-Merged: 1 10 2 20 3 30
+=== Search Aggregator for 'laptop' ===
+
+  [products] 3 results (latency: 80ms)
+    - product:Laptop Pro
+    - product:Laptop Air
+    - product:Laptop Stand
+  [users] 2 results (latency: 120ms)
+    - user:alice (matches 'laptop')
+    - user:bob (matches 'laptop')
+  [orders] 2 results (latency: 150ms)
+    - order:#1042 Laptop Pro
+    - order:#1099 Laptop Air
+
+  Total: 7 items from 3 backends in 152ms
 ```
 
-## Step 2 -- Generalize to N Channels
+## Step 2 -- Compare Sequential vs Fan-In
 
-Now implement a variadic `merge` that accepts any number of input channels:
+Show the real cost of NOT using fan-in by implementing both approaches and measuring the difference.
 
 ```go
 package main
 
 import (
-    "fmt"
-    "sync"
-    "time"
+	"fmt"
+	"sync"
+	"time"
 )
 
-func producer(name string, values ...int) <-chan int {
-    out := make(chan int)
-    go func() {
-        for _, v := range values {
-            out <- v
-            time.Sleep(20 * time.Millisecond)
-        }
-        close(out)
-    }()
-    return out
+type SearchResult struct {
+	Backend string
+	Count   int
+	Latency time.Duration
 }
 
-func merge(channels ...<-chan int) <-chan int {
-    out := make(chan int)
-    var wg sync.WaitGroup
+func queryBackend(name string, latency time.Duration, count int) <-chan SearchResult {
+	out := make(chan SearchResult)
+	go func() {
+		start := time.Now()
+		time.Sleep(latency)
+		out <- SearchResult{Backend: name, Count: count, Latency: time.Since(start)}
+		close(out)
+	}()
+	return out
+}
 
-    for _, ch := range channels {
-        wg.Add(1)
-        go func(c <-chan int) {
-            defer wg.Done()
-            for v := range c {
-                out <- v
-            }
-        }(ch)
-    }
-
-    go func() {
-        wg.Wait()
-        close(out)
-    }()
-
-    return out
+func merge(channels ...<-chan SearchResult) <-chan SearchResult {
+	out := make(chan SearchResult)
+	var wg sync.WaitGroup
+	for _, ch := range channels {
+		wg.Add(1)
+		go func(c <-chan SearchResult) {
+			defer wg.Done()
+			for v := range c {
+				out <- v
+			}
+		}(ch)
+	}
+	go func() {
+		wg.Wait()
+		close(out)
+	}()
+	return out
 }
 
 func main() {
-    x := producer("X", 1, 2, 3)
-    y := producer("Y", 10, 20, 30)
-    z := producer("Z", 100, 200, 300)
-    fmt.Print("Merged (N): ")
-    for v := range merge(x, y, z) {
-        fmt.Printf("%d ", v)
-    }
-    fmt.Println()
+	backends := []struct {
+		name    string
+		latency time.Duration
+		count   int
+	}{
+		{"users", 120 * time.Millisecond, 15},
+		{"products", 80 * time.Millisecond, 42},
+		{"orders", 150 * time.Millisecond, 8},
+		{"inventory", 100 * time.Millisecond, 23},
+		{"reviews", 200 * time.Millisecond, 31},
+	}
+
+	// Sequential
+	fmt.Println("=== Sequential Queries ===")
+	start := time.Now()
+	var seqTotal int
+	for _, b := range backends {
+		time.Sleep(b.latency)
+		seqTotal += b.count
+		fmt.Printf("  [%s] %d results (%v)\n", b.name, b.count, b.latency)
+	}
+	fmt.Printf("  Total: %d results in %v\n\n", seqTotal, time.Since(start))
+
+	// Fan-in
+	fmt.Println("=== Fan-In Queries ===")
+	start = time.Now()
+	channels := make([]<-chan SearchResult, len(backends))
+	for i, b := range backends {
+		channels[i] = queryBackend(b.name, b.latency, b.count)
+	}
+	merged := merge(channels...)
+
+	var fanInTotal int
+	for r := range merged {
+		fanInTotal += r.Count
+		fmt.Printf("  [%s] %d results (%v)\n", r.Backend, r.Count, r.Latency)
+	}
+	fmt.Printf("  Total: %d results in %v\n\n", fanInTotal, time.Since(start))
+
+	fmt.Println("Fan-in latency = max(all backend latencies) instead of sum(all)")
 }
 ```
-
-The pattern is identical to `mergeTwo` but works with a slice of channels. Each channel gets its own forwarding goroutine.
 
 ### Intermediate Verification
 ```bash
 go run main.go
 ```
-Expected: all values from three channels merged:
+Expected: sequential takes ~650ms (sum), fan-in takes ~200ms (max):
 ```
-Merged (N): 1 10 100 2 20 200 3 30 300
+=== Sequential Queries ===
+  [users] 15 results (120ms)
+  [products] 42 results (80ms)
+  [orders] 8 results (150ms)
+  [inventory] 23 results (100ms)
+  [reviews] 31 results (200ms)
+  Total: 119 results in 652ms
+
+=== Fan-In Queries ===
+  [products] 42 results (80ms)
+  [inventory] 23 results (100ms)
+  [users] 15 results (120ms)
+  [orders] 8 results (150ms)
+  [reviews] 31 results (200ms)
+  Total: 119 results in 201ms
+
+Fan-in latency = max(all backend latencies) instead of sum(all)
 ```
 
-## Step 3 -- Fan-Out + Fan-In Pipeline
+## Step 3 -- Fan-Out Workers + Fan-In Results
 
-Combine fan-out and fan-in into a complete parallel processing pipeline. Generate values, fan-out to multiple workers, and fan-in the results.
+Combine fan-out and fan-in into a complete parallel processing pipeline. Multiple workers process search results and their outputs are merged into a single stream.
 
 ```go
 package main
 
 import (
-    "fmt"
-    "sync"
-    "time"
+	"fmt"
+	"strings"
+	"sync"
+	"time"
 )
 
-func merge(channels ...<-chan int) <-chan int {
-    out := make(chan int)
-    var wg sync.WaitGroup
-    for _, ch := range channels {
-        wg.Add(1)
-        go func(c <-chan int) {
-            defer wg.Done()
-            for v := range c {
-                out <- v
-            }
-        }(ch)
-    }
-    go func() {
-        wg.Wait()
-        close(out)
-    }()
-    return out
+type RawResult struct {
+	Backend string
+	Item    string
 }
 
-func squareWorker(id int, in <-chan int) <-chan int {
-    out := make(chan int)
-    go func() {
-        for n := range in {
-            result := n * n
-            fmt.Printf("  worker %d: %d^2 = %d\n", id, n, result)
-            out <- result
-            time.Sleep(10 * time.Millisecond)
-        }
-        close(out)
-    }()
-    return out
+type RankedResult struct {
+	Item     string
+	Score    float64
+	WorkerID int
+}
+
+func generateResults() <-chan RawResult {
+	out := make(chan RawResult)
+	go func() {
+		items := []RawResult{
+			{"users", "alice@company.com"},
+			{"users", "bob@company.com"},
+			{"products", "Laptop Pro 16"},
+			{"products", "Laptop Air 13"},
+			{"products", "USB-C Adapter"},
+			{"orders", "Order #1042"},
+			{"orders", "Order #1099"},
+			{"products", "Laptop Stand"},
+			{"users", "charlie@company.com"},
+			{"orders", "Order #1150"},
+		}
+		for _, item := range items {
+			out <- item
+		}
+		close(out)
+	}()
+	return out
+}
+
+func rankWorker(id int, in <-chan RawResult) <-chan RankedResult {
+	out := make(chan RankedResult)
+	go func() {
+		for raw := range in {
+			time.Sleep(30 * time.Millisecond)
+			score := float64(len(raw.Item)) * 0.1
+			if strings.Contains(strings.ToLower(raw.Item), "laptop") {
+				score += 5.0
+			}
+			out <- RankedResult{
+				Item:     fmt.Sprintf("[%s] %s", raw.Backend, raw.Item),
+				Score:    score,
+				WorkerID: id,
+			}
+		}
+		close(out)
+	}()
+	return out
+}
+
+func mergeRanked(channels ...<-chan RankedResult) <-chan RankedResult {
+	out := make(chan RankedResult)
+	var wg sync.WaitGroup
+	for _, ch := range channels {
+		wg.Add(1)
+		go func(c <-chan RankedResult) {
+			defer wg.Done()
+			for v := range c {
+				out <- v
+			}
+		}(ch)
+	}
+	go func() {
+		wg.Wait()
+		close(out)
+	}()
+	return out
 }
 
 func main() {
-    gen := func(nums ...int) <-chan int {
-        out := make(chan int)
-        go func() {
-            for _, n := range nums {
-                out <- n
-            }
-            close(out)
-        }()
-        return out
-    }
+	fmt.Println("=== Fan-Out/Fan-In: Search Ranking Pipeline ===\n")
 
-    input := gen(1, 2, 3, 4, 5, 6, 7, 8, 9, 10)
+	start := time.Now()
+	input := generateResults()
 
-    // Fan-out: 3 workers share the input channel
-    numWorkers := 3
-    workers := make([]<-chan int, numWorkers)
-    for i := 0; i < numWorkers; i++ {
-        workers[i] = squareWorker(i, input)
-    }
+	// Fan-out: 3 ranking workers share the input
+	numWorkers := 3
+	workers := make([]<-chan RankedResult, numWorkers)
+	for i := 0; i < numWorkers; i++ {
+		workers[i] = rankWorker(i+1, input)
+	}
 
-    // Fan-in: merge all worker outputs
-    results := merge(workers...)
+	// Fan-in: merge all worker outputs
+	merged := mergeRanked(workers...)
 
-    var total int
-    for r := range results {
-        total += r
-    }
-    fmt.Printf("Sum of squares 1-10: %d\n", total) // 385
+	fmt.Println("  Ranked results:")
+	var count int
+	for r := range merged {
+		count++
+		fmt.Printf("    %.1f  %s  (worker %d)\n", r.Score, r.Item, r.WorkerID)
+	}
+	fmt.Printf("\n  %d results ranked by %d workers in %v\n", count, numWorkers, time.Since(start))
 }
 ```
 
@@ -258,11 +401,16 @@ func main() {
 ```bash
 go run main.go
 ```
-Expected: sum of squares of 1-10 = 385
+Expected: all 10 items ranked, distributed across 3 workers:
 ```
-  worker 0: 1^2 = 1
-  ...
-Sum of squares 1-10: 385
+=== Fan-Out/Fan-In: Search Ranking Pipeline ===
+
+  Ranked results:
+    1.7  [users] alice@company.com  (worker 1)
+    6.6  [products] Laptop Pro 16  (worker 2)
+    ...
+
+  10 results ranked by 3 workers in 130ms
 ```
 
 ## Common Mistakes
@@ -270,11 +418,11 @@ Sum of squares 1-10: 385
 ### Closing Output Channel Inside the Forwarding Goroutine
 **Wrong:**
 ```go
-go func(c <-chan int) {
-    for v := range c {
-        out <- v
-    }
-    close(out) // other goroutines still sending!
+go func(c <-chan SearchResult) {
+	for v := range c {
+		out <- v
+	}
+	close(out) // other goroutines still sending!
 }(ch)
 ```
 **What happens:** The first goroutine to finish closes the channel, causing other goroutines to panic on send.
@@ -285,18 +433,18 @@ go func(c <-chan int) {
 **Wrong:**
 ```go
 for _, ch := range channels {
-    wg.Add(1)
-    go func() {
-        defer wg.Done()
-        for v := range ch { // captures loop variable
-            out <- v
-        }
-    }()
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for v := range ch { // captures loop variable
+			out <- v
+		}
+	}()
 }
 ```
 **What happens:** All goroutines may read from the same (last) channel due to the closure capturing the loop variable.
 
-**Fix:** Pass `ch` as a function argument: `go func(c <-chan int) { ... }(ch)`.
+**Fix:** Pass `ch` as a function argument: `go func(c <-chan SearchResult) { ... }(ch)`.
 
 ### Not Buffering the Output Channel When Needed
 If all producers send simultaneously and the consumer is slow, an unbuffered output channel creates contention. Consider buffering if throughput matters, but remember that unbuffered channels provide natural backpressure.
@@ -304,10 +452,9 @@ If all producers send simultaneously and the consumer is slow, an unbuffered out
 ## Verify What You Learned
 
 Run `go run main.go` and verify the output includes:
-- Merge two: all 6 values from both channels
-- Merge N: all 9 values from three channels
-- Parallel pipeline: sum of squares 1-10 = 385
-- Merge + double: 15 values doubled
+- Search aggregator: results from all 3 backends merged into a single stream
+- Sequential vs fan-in comparison: fan-in latency equals the slowest backend, not the sum
+- Fan-out/fan-in pipeline: all items ranked and merged from multiple workers
 
 ## What's Next
 Continue to [04-worker-pool-fixed](../04-worker-pool-fixed/04-worker-pool-fixed.md) to build a fixed worker pool -- a structured combination of fan-out and fan-in.
@@ -318,7 +465,7 @@ Continue to [04-worker-pool-fixed](../04-worker-pool-fixed/04-worker-pool-fixed.
 - Fan-out + fan-in together form the scatter-gather pattern for parallel processing
 - Always close the merged output in a separate goroutine that waits for all forwarders
 - Pass channel variables explicitly to goroutines to avoid closure capture bugs
-- The generalized `merge` function is a reusable building block for concurrent pipelines
+- Real-world use: querying multiple backends concurrently reduces API latency from sum to max
 
 ## Reference
 - [Go Blog: Pipelines and Cancellation](https://go.dev/blog/pipelines)

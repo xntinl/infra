@@ -4,7 +4,6 @@ concepts: [data race, shared variable, concurrent write, non-determinism, lost u
 tools: [go]
 estimated_time: 20m
 bloom_level: understand
-prerequisites: [goroutines, sync.WaitGroup]
 ---
 
 # 1. Your First Data Race
@@ -13,9 +12,9 @@ prerequisites: [goroutines, sync.WaitGroup]
 ## Learning Objectives
 After completing this exercise, you will be able to:
 - **Define** what a data race is in terms of concurrent unsynchronized memory access
-- **Reproduce** a data race using multiple goroutines writing to a shared variable
+- **Reproduce** a data race using multiple goroutines writing to a shared counter
 - **Observe** non-deterministic behavior caused by a data race
-- **Explain** why the final result differs between runs
+- **Explain** the real production impact: lost analytics, wrong billing, incorrect metrics
 
 ## Why Data Races Matter
 
@@ -25,59 +24,74 @@ A data race occurs when three conditions are ALL true simultaneously:
 2. At least one of the accesses is a write
 3. There is no synchronization between the accesses
 
-Data races are one of the most insidious bugs in concurrent programming because they produce **non-deterministic** results: the program may appear correct most of the time, then fail unpredictably under load or on different hardware.
+Data races are the **number one concurrency bug** in production Go code. They are insidious because the program may appear correct most of the time, then fail unpredictably under load or on different hardware.
 
-The Go memory model explicitly states that a data race results in **undefined behavior**. This means the compiler and runtime make no guarantees about the outcome -- you cannot reason about the program's correctness when races exist.
+The Go memory model explicitly states that a data race results in **undefined behavior**. The compiler and runtime make no guarantees about the outcome.
 
-In this exercise and the next four, we use the SAME counter problem (1000 goroutines x 1000 increments = expected 1,000,000) to demonstrate the progression from detecting races to fixing them.
+Consider a web application that tracks page hits. Every HTTP handler increments a shared counter. Under light traffic, the counter looks correct. Under production load with hundreds of concurrent requests, increments silently disappear. Your analytics dashboard shows 50,000 daily visitors when the real number is 80,000. Your billing system undercharges because it counted fewer API calls than actually occurred. Your alerting thresholds never trigger because the error counter is perpetually low.
 
-## The Counter Problem
+This is not a hypothetical scenario. It is the direct consequence of an unprotected shared counter.
 
-We launch 1000 goroutines, each incrementing a shared counter 1000 times. The expected result is 1,000,000. But without synchronization, the actual result is far less -- and different every time.
+## Step 1 -- Build the Hit Counter
 
-## Step 1 -- Understand the Code
-
-Open `main.go`. The core function is `racyCounter`:
+Create a file called `main.go`. This simulates a web server where multiple HTTP handlers increment a shared hit counter concurrently. Each goroutine represents a request handler processing incoming traffic:
 
 ```go
 package main
 
 import (
-    "fmt"
-    "sync"
+	"fmt"
+	"sync"
+	"time"
 )
 
-const (
-    numGoroutines   = 1000
-    incrementsPerGR = 1000
-    expectedTotal   = numGoroutines * incrementsPerGR
-)
+func racyHitCounter() int {
+	hitCount := 0
+	var wg sync.WaitGroup
 
-func racyCounter() int {
-    counter := 0
-    var wg sync.WaitGroup
+	// Simulate 100 concurrent HTTP handlers, each processing 100 requests.
+	for handler := 0; handler < 100; handler++ {
+		wg.Add(1)
+		go func(handlerID int) {
+			defer wg.Done()
+			for req := 0; req < 100; req++ {
+				hitCount++ // DATA RACE: read-modify-write without synchronization
+			}
+		}(handler)
+	}
 
-    for i := 0; i < numGoroutines; i++ {
-        wg.Add(1)
-        go func() {
-            defer wg.Done()
-            for j := 0; j < incrementsPerGR; j++ {
-                counter++ // DATA RACE: read-modify-write without synchronization
-            }
-        }()
-    }
+	wg.Wait()
+	return hitCount
+}
 
-    wg.Wait()
-    return counter
+func main() {
+	fmt.Println("=== Web Hit Counter Data Race ===")
+	fmt.Println("Expected: 10000 hits (100 handlers x 100 requests each)")
+	fmt.Println()
+
+	results := make([]int, 5)
+	for run := 0; run < 5; run++ {
+		start := time.Now()
+		result := racyHitCounter()
+		elapsed := time.Since(start)
+		lost := 10000 - result
+		results[run] = result
+		fmt.Printf("Run %d: %d hits recorded, %d lost (%v)\n",
+			run+1, result, lost, elapsed)
+	}
+
+	fmt.Println()
+	fmt.Println("--- Production Impact ---")
+	fmt.Printf("Results across 5 runs: %v\n", results)
+	fmt.Println("Every run produces a different number. None reach 10000.")
+	fmt.Println()
+	fmt.Println("If this were real:")
+	fmt.Println("  - Analytics: dashboard shows 6000 visitors instead of 10000")
+	fmt.Println("  - Billing:   customer charged for 7000 API calls instead of 10000")
+	fmt.Println("  - Alerting:  error counter shows 50 errors instead of 80, threshold never triggers")
+	fmt.Println("  - Capacity:  load balancer thinks server handles fewer requests than it does")
 }
 ```
-
-The operation `counter++` is **not atomic**. It consists of three CPU-level steps:
-1. **READ** the current value of counter from memory
-2. **ADD** one to the value
-3. **WRITE** the new value back to memory
-
-When multiple goroutines do this simultaneously, some increments are lost because goroutines read the same value before any of them writes back.
 
 ## Step 2 -- Run and Observe
 
@@ -88,59 +102,113 @@ go run main.go
 
 Sample output (your numbers WILL differ):
 ```
-=== Your First Data Race ===
-Expected result: 1000000 (1000 goroutines x 1000 increments)
+=== Web Hit Counter Data Race ===
+Expected: 10000 hits (100 handlers x 100 requests each)
 
---- Run 1 ---
-Result: 547832     WRONG (lost 452168 increments)
---- Run 2 ---
-Result: 611204     WRONG (lost 388796 increments)
---- Run 3 ---
-Result: 503019     WRONG (lost 496981 increments)
---- Run 4 ---
-Result: 589412     WRONG (lost 410588 increments)
---- Run 5 ---
-Result: 528741     WRONG (lost 471259 increments)
+Run 1: 6482 hits recorded, 3518 lost (1.2ms)
+Run 2: 7201 hits recorded, 2799 lost (1.1ms)
+Run 3: 5893 hits recorded, 4107 lost (1.3ms)
+Run 4: 6819 hits recorded, 3181 lost (1.1ms)
+Run 5: 7044 hits recorded, 2956 lost (1.2ms)
 
-Results across 5 runs: [547832 611204 503019 589412 528741]
-All different! This non-determinism is the hallmark of a data race.
+--- Production Impact ---
+Results across 5 runs: [6482 7201 5893 6819 7044]
+Every run produces a different number. None reach 10000.
 ```
 
 Run it several times. Each execution produces different results. This non-determinism is the unmistakable signature of a data race.
 
-## Step 3 -- Understand Why the Race Happens
+## Step 3 -- Understand Why Increments Are Lost
 
-Think through this scenario with two goroutines accessing counter simultaneously:
+The operation `hitCount++` is **not atomic**. It consists of three CPU-level steps:
+1. **READ** the current value of hitCount from memory
+2. **ADD** one to the value
+3. **WRITE** the new value back to memory
+
+When two request handlers execute simultaneously:
 
 ```
-Time    Goroutine A          Goroutine B          counter (memory)
-----    -----------          -----------          ----------------
- 1      READ counter (= 42)                       42
- 2                           READ counter (= 42)  42
- 3      WRITE counter (= 43)                      43
- 4                           WRITE counter (= 43) 43  <-- increment LOST!
+Time    Handler A              Handler B              hitCount (memory)
+----    ---------              ---------              -----------------
+ 1      READ hitCount (= 42)                          42
+ 2                             READ hitCount (= 42)   42
+ 3      WRITE hitCount (= 43)                         43
+ 4                             WRITE hitCount (= 43)  43  <-- increment LOST!
 ```
 
-Both goroutines read 42, both compute 43, both write 43. Two increments happened, but the counter only went up by one. This is called a **lost update** and is the direct consequence of a data race.
+Both handlers read 42, both compute 43, both write 43. Two requests were processed, but the counter only went up by one. This is called a **lost update**. With 100 goroutines competing, thousands of increments vanish per second.
 
-With 1000 goroutines competing, thousands of increments are lost per second.
+## Step 4 -- Measure How Bad It Gets
 
-## Step 4 -- How Bad Can It Get?
+Add this function to see the relationship between concurrency level and data loss:
 
-The range of possible results:
-- **Minimum**: 1000 (if every goroutine's entire 1000-increment loop overlaps with others)
-- **Maximum**: 1,000,000 (if all goroutines happen to run sequentially -- extremely unlikely with 1000 goroutines)
-- **Typical**: 400,000 - 700,000 depending on hardware and system load
+```go
+package main
 
-The exact number depends on CPU architecture, number of cores, OS scheduler behavior, and current system load. This unpredictability is why data races are **undefined behavior** -- you cannot predict or control the outcome.
+import (
+	"fmt"
+	"sync"
+)
+
+func measureLoss(numHandlers, reqsPerHandler int) (expected, actual int) {
+	hitCount := 0
+	var wg sync.WaitGroup
+
+	for h := 0; h < numHandlers; h++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for r := 0; r < reqsPerHandler; r++ {
+				hitCount++
+			}
+		}()
+	}
+
+	wg.Wait()
+	return numHandlers * reqsPerHandler, hitCount
+}
+
+func main() {
+	fmt.Println("=== Data Loss vs Concurrency Level ===")
+	fmt.Println()
+
+	scenarios := []struct {
+		handlers    int
+		reqsPerHandler int
+		label       string
+	}{
+		{10, 1000, "Light traffic (10 handlers)"},
+		{50, 1000, "Moderate traffic (50 handlers)"},
+		{200, 1000, "Heavy traffic (200 handlers)"},
+		{500, 1000, "Peak traffic (500 handlers)"},
+	}
+
+	for _, s := range scenarios {
+		expected, actual := measureLoss(s.handlers, s.reqsPerHandler)
+		lossPercent := float64(expected-actual) / float64(expected) * 100
+		fmt.Printf("%-35s expected=%d actual=%d lost=%.1f%%\n",
+			s.label, expected, actual, lossPercent)
+	}
+
+	fmt.Println()
+	fmt.Println("More concurrency = more lost updates = worse data corruption")
+}
+```
+
+### Verification
+```bash
+go run main.go
+```
+
+More goroutines means more contention, which means more lost updates. Under peak traffic (when accuracy matters most), the data is least reliable.
 
 ## Common Mistakes
 
 ### Thinking "It Worked Once, So It's Fine"
-A data race may produce the correct result on some runs, especially on single-core machines or with few goroutines. The absence of symptoms does NOT prove the absence of the bug. Data races are undefined behavior -- they must be eliminated, not tolerated.
+A data race may produce the correct result on some runs, especially on single-core machines or with few goroutines. The absence of symptoms does NOT prove the absence of the bug. Data races are undefined behavior: they must be eliminated, not tolerated.
 
 ### Assuming Small Operations Are Atomic
-Even `counter++` (or `counter += 1`) is NOT atomic in Go. It compiles to multiple machine instructions. Only operations from the `sync/atomic` package are guaranteed to be atomic (see exercise 05).
+Even `hitCount++` (or `hitCount += 1`) is NOT atomic in Go. It compiles to multiple machine instructions. Only operations from the `sync/atomic` package are guaranteed to be atomic (see exercise 05).
 
 ### Using time.Sleep as Synchronization
 Sleeping does not synchronize memory. Even if you sleep "long enough," the compiler and CPU may reorder memory operations. Only proper synchronization primitives (`sync.Mutex`, channels, `sync/atomic`) establish happens-before relationships.
@@ -149,9 +217,9 @@ Sleeping does not synchronize memory. Even if you sleep "long enough," the compi
 
 Answer these questions:
 1. What three conditions must be true for a data race to exist?
-2. Why does `counter++` produce wrong results when called from multiple goroutines?
-3. If you run the program and get 1,000,000, does that prove there is no race? Why or why not?
-4. Why is a data race worse than a regular bug?
+2. Why does `hitCount++` produce wrong results when called from multiple goroutines?
+3. If you run the program and get 10000, does that prove there is no race? Why or why not?
+4. Why does data loss get worse as traffic increases, which is exactly when accuracy matters most?
 
 ## What's Next
 Continue to [02-race-detector-flag](../02-race-detector-flag/02-race-detector-flag.md) to learn how Go's built-in race detector can automatically find this bug.
@@ -161,8 +229,8 @@ Continue to [02-race-detector-flag](../02-race-detector-flag/02-race-detector-fl
 - `counter++` is not atomic: it is read-modify-write, and concurrent execution causes **lost updates**
 - Data race results are non-deterministic: the program produces different results on different runs
 - Correct output on one run does NOT prove the absence of a data race
-- Data races are **undefined behavior** in Go and must be eliminated
-- Exercises 01-05 use the same counter problem (1000 goroutines x 1000 increments = 1,000,000 expected) to show progression from detection to fix
+- In production, data races cause wrong analytics, incorrect billing, missed alerts, and flawed capacity planning
+- The problem gets worse under heavy load, which is exactly when you need accuracy the most
 
 ## Reference
 - [Go Memory Model](https://go.dev/ref/mem)

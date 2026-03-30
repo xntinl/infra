@@ -4,11 +4,9 @@ concepts: [select, default-case, non-blocking-operations, polling]
 tools: [go]
 estimated_time: 20m
 bloom_level: apply
-prerequisites: [select-basics, channels, goroutines]
 ---
 
 # 2. Select with Default
-
 
 ## Learning Objectives
 - **Use** the `default` case to make channel operations non-blocking
@@ -18,55 +16,15 @@ prerequisites: [select-basics, channels, goroutines]
 
 ## Why Default in Select
 
-A plain `select` blocks until one of its channel operations can proceed. This is usually what you want, but sometimes blocking is unacceptable. You might need to check a channel without waiting, attempt a send that should be dropped if the receiver is not ready, or do useful work between channel checks.
+A plain `select` blocks until one of its channel operations can proceed. This is usually what you want, but sometimes blocking is unacceptable. Consider a cache layer in your application: you want to check if a precomputed value is available in the cache, but if nothing is there, you need to compute the value immediately instead of waiting. You cannot afford to block.
 
 The `default` case transforms `select` from a blocking multiplexer into a non-blocking probe. When present, `default` executes immediately if no other case is ready. This gives you a try-operation: "receive if there is something, otherwise continue."
 
-This pattern appears in rate limiters (try to acquire a token, skip if none available), logging pipelines (send the log entry, drop it if the buffer is full), and polling loops where the goroutine must remain responsive.
+This pattern appears in rate limiters (try to acquire a token, skip if none available), logging pipelines (send the log entry, drop it if the buffer is full), metrics collectors (poll for new data without stalling), and any situation where blocking would compromise responsiveness.
 
-## Example 1 -- Non-Blocking Receive
+## Step 1 -- Non-Blocking Cache Read
 
-Try to receive from a channel without blocking. If nothing is available, the `default` case runs.
-
-```go
-package main
-
-import "fmt"
-
-func main() {
-	ch := make(chan string, 1)
-
-	// Channel is empty — select hits default immediately.
-	select {
-	case msg := <-ch:
-		fmt.Println("received:", msg)
-	default:
-		fmt.Println("no message available")
-	}
-
-	ch <- "hello"
-
-	// Channel has a value — select receives it.
-	select {
-	case msg := <-ch:
-		fmt.Println("received:", msg)
-	default:
-		fmt.Println("no message available")
-	}
-}
-```
-
-The first `select` hits `default` because the channel is empty. The second `select` receives "hello" because the buffer contains a value.
-
-### Verification
-```
-no message available
-received: hello
-```
-
-## Example 2 -- Non-Blocking Send
-
-Attempt to send on a channel without blocking. If the buffer is full (or no receiver is waiting), the value is dropped.
+Try to read from a cache channel. If a precomputed value is available, use it. If not, fall through to compute the value on the spot.
 
 ```go
 package main
@@ -74,40 +32,88 @@ package main
 import "fmt"
 
 func main() {
-	ch := make(chan int, 1)
+	cache := make(chan string, 1)
 
-	// First send — buffer has space.
+	// Cache miss: channel is empty, so we compute.
 	select {
-	case ch <- 1:
-		fmt.Println("sent 1")
+	case value := <-cache:
+		fmt.Println("cache hit:", value)
 	default:
-		fmt.Println("channel full, dropped")
+		fmt.Println("cache miss: computing value...")
+		value := "computed-result-42"
+		fmt.Println("computed:", value)
 	}
 
-	// Second send — buffer is full, value is dropped.
-	select {
-	case ch <- 2:
-		fmt.Println("sent 2")
-	default:
-		fmt.Println("channel full, dropped")
-	}
+	// Simulate a background worker that fills the cache.
+	cache <- "precomputed-result-42"
 
-	fmt.Println("buffered value:", <-ch)
+	// Cache hit: channel has a value.
+	select {
+	case value := <-cache:
+		fmt.Println("cache hit:", value)
+	default:
+		fmt.Println("cache miss: computing value...")
+	}
 }
 ```
 
-This is the "fire and forget" pattern. It is useful when dropping a message is acceptable, such as non-critical metrics or overflow logs.
+The first `select` hits `default` because the cache channel is empty -- this is a cache miss. The second `select` receives the precomputed value -- a cache hit. The caller never blocks in either case.
 
 ### Verification
 ```
-sent 1
-channel full, dropped
-buffered value: 1
+cache miss: computing value...
+computed: computed-result-42
+cache hit: precomputed-result-42
 ```
 
-## Example 3 -- Polling Pattern
+## Step 2 -- Non-Blocking Metrics Send (Try-Send Pattern)
 
-Combine `select` + `default` inside a loop to poll a channel while doing other work. This creates a cooperative multitasking loop.
+A metrics collector produces data points that should be sent to an aggregation channel. If the aggregator is overwhelmed (buffer full), the metric is dropped rather than stalling the collector. This is the "try-send" pattern.
+
+```go
+package main
+
+import "fmt"
+
+func trySendMetric(ch chan<- string, metric string) bool {
+	select {
+	case ch <- metric:
+		return true
+	default:
+		return false
+	}
+}
+
+func main() {
+	metrics := make(chan string, 2)
+
+	// Buffer has room: both sends succeed.
+	fmt.Println("sent:", trySendMetric(metrics, "cpu_usage=72%"))
+	fmt.Println("sent:", trySendMetric(metrics, "mem_usage=85%"))
+
+	// Buffer is full: this metric is dropped.
+	fmt.Println("sent:", trySendMetric(metrics, "disk_io=40%"))
+
+	// Drain what was buffered.
+	fmt.Println("collected:", <-metrics)
+	fmt.Println("collected:", <-metrics)
+}
+```
+
+This is the "fire and forget" pattern. It is used when dropping a data point is acceptable -- non-critical metrics, overflow logs, or sampled telemetry. The alternative (blocking) would cause the entire collector to stall when the aggregator falls behind.
+
+### Verification
+```
+sent: true
+sent: true
+sent: false
+collected: cpu_usage=72%
+collected: mem_usage=85%
+```
+
+## Step 3 -- Polling Metrics Collector
+
+Build a metrics collector that periodically polls a data channel without blocking. Between polls, it does useful work (processing the backlog, running calculations). This creates a cooperative multitasking loop.
 
 ```go
 package main
@@ -118,40 +124,41 @@ import (
 )
 
 func main() {
-	messages := make(chan string, 1)
+	dataFeed := make(chan string, 1)
 
+	// Simulate an external system that sends data after 250ms.
 	go func() {
-		time.Sleep(200 * time.Millisecond)
-		messages <- "data ready"
+		time.Sleep(250 * time.Millisecond)
+		dataFeed <- "metric_batch_ready"
 	}()
 
 	for i := 0; i < 5; i++ {
 		select {
-		case msg := <-messages:
-			fmt.Println("got:", msg)
+		case data := <-dataFeed:
+			fmt.Println("received:", data)
 			return
 		default:
-			fmt.Printf("no data yet, doing work... (iteration %d)\n", i)
-			time.Sleep(100 * time.Millisecond)
+			fmt.Printf("poll %d: no data yet, processing backlog...\n", i)
+			time.Sleep(100 * time.Millisecond) // Simulate useful work
 		}
 	}
 	fmt.Println("gave up waiting")
 }
 ```
 
-Each loop iteration checks the channel. If nothing is there, it does other work (simulated by sleep) and checks again. After ~200ms the goroutine delivers data.
+Each iteration checks the data channel. If nothing is there, the collector does useful work and checks again. After ~250ms the external system delivers data.
 
 ### Verification
 ```
-no data yet, doing work... (iteration 0)
-no data yet, doing work... (iteration 1)
-got: data ready
+poll 0: no data yet, processing backlog...
+poll 1: no data yet, processing backlog...
+received: metric_batch_ready
 ```
-The exact iteration count depends on scheduling, but you should see 2-3 "no data yet" lines followed by the message.
+The exact iteration count depends on scheduling, but you should see 2-3 "no data yet" lines followed by the received message.
 
-## Example 4 -- Probing Multiple Channels
+## Step 4 -- Probing Multiple Caches
 
-Combine `default` with multiple channel cases to check several sources without blocking.
+Combine `default` with multiple channel cases to check several cache layers without blocking on any of them.
 
 ```go
 package main
@@ -159,47 +166,47 @@ package main
 import "fmt"
 
 func main() {
-	apiCh := make(chan string, 1)
-	dbCh := make(chan string, 1)
-	cacheCh := make(chan string, 1)
+	l1Cache := make(chan string, 1)
+	l2Cache := make(chan string, 1)
+	dbCache := make(chan string, 1)
 
-	// All channels are empty — default fires.
+	// All caches empty: full miss.
 	select {
-	case msg := <-apiCh:
-		fmt.Println("api:", msg)
-	case msg := <-dbCh:
-		fmt.Println("db:", msg)
-	case msg := <-cacheCh:
-		fmt.Println("cache:", msg)
+	case val := <-l1Cache:
+		fmt.Println("L1 hit:", val)
+	case val := <-l2Cache:
+		fmt.Println("L2 hit:", val)
+	case val := <-dbCache:
+		fmt.Println("DB cache hit:", val)
 	default:
-		fmt.Println("nothing ready on any channel")
+		fmt.Println("all caches empty, querying database directly")
 	}
 
-	// Now send on one and try again.
-	apiCh <- "response-200"
+	// Populate L2 and try again.
+	l2Cache <- "user:1234:profile"
 
 	select {
-	case msg := <-apiCh:
-		fmt.Println("api:", msg)
-	case msg := <-dbCh:
-		fmt.Println("db:", msg)
-	case msg := <-cacheCh:
-		fmt.Println("cache:", msg)
+	case val := <-l1Cache:
+		fmt.Println("L1 hit:", val)
+	case val := <-l2Cache:
+		fmt.Println("L2 hit:", val)
+	case val := <-dbCache:
+		fmt.Println("DB cache hit:", val)
 	default:
-		fmt.Println("nothing ready on any channel")
+		fmt.Println("all caches empty, querying database directly")
 	}
 }
 ```
 
 ### Verification
 ```
-nothing ready on any channel
-api: response-200
+all caches empty, querying database directly
+L2 hit: user:1234:profile
 ```
 
-## Example 5 -- Draining a Channel Without Blocking
+## Step 5 -- Draining a Metrics Buffer
 
-Use `select` + `default` in a loop to consume all buffered values and stop as soon as the channel is empty.
+Use `select` + `default` in a loop to flush all buffered metrics without blocking when the buffer is empty.
 
 ```go
 package main
@@ -207,20 +214,20 @@ package main
 import "fmt"
 
 func main() {
-	events := make(chan string, 10)
-	events <- "click"
-	events <- "scroll"
-	events <- "keypress"
+	metricsBuf := make(chan string, 10)
+	metricsBuf <- "request_count=142"
+	metricsBuf <- "error_rate=0.02"
+	metricsBuf <- "p99_latency=230ms"
+	metricsBuf <- "active_connections=84"
 
-	drained := 0
+	flushed := 0
 	for {
 		select {
-		case ev := <-events:
-			fmt.Println("drained:", ev)
-			drained++
+		case metric := <-metricsBuf:
+			fmt.Println("flushed:", metric)
+			flushed++
 		default:
-			// Channel empty — stop draining.
-			fmt.Printf("total drained: %d\n", drained)
+			fmt.Printf("flush complete: %d metrics sent to aggregator\n", flushed)
 			return
 		}
 	}
@@ -229,10 +236,11 @@ func main() {
 
 ### Verification
 ```
-drained: click
-drained: scroll
-drained: keypress
-total drained: 3
+flushed: request_count=142
+flushed: error_rate=0.02
+flushed: p99_latency=230ms
+flushed: active_connections=84
+flush complete: 4 metrics sent to aggregator
 ```
 
 ## Common Mistakes
@@ -287,7 +295,7 @@ The `default` case makes the `select` non-blocking, but the goroutine still take
 In the next exercise, you will learn how to use `time.After` and `time.NewTimer` to add timeout behavior to `select` statements.
 
 ## Summary
-The `default` case in `select` makes channel operations non-blocking. A non-blocking receive checks a channel and continues immediately if empty. A non-blocking send drops the value if the channel is full. Combined with a loop, `select` + `default` creates a polling pattern. Use it deliberately -- unnecessary `default` cases turn efficient blocking into wasteful spinning.
+The `default` case in `select` makes channel operations non-blocking. A non-blocking receive checks a cache channel and continues immediately if empty -- the cache miss path. A non-blocking send drops the metric if the aggregator buffer is full -- the try-send pattern. Combined with a loop, `select` + `default` creates a polling pattern for metrics collection. Use it deliberately -- unnecessary `default` cases turn efficient blocking into wasteful CPU spinning.
 
 ## Reference
 - [Go Spec: Select statements](https://go.dev/ref/spec#Select_statements)

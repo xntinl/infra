@@ -4,7 +4,6 @@ concepts: [sync.Mutex, Lock, Unlock, defer, critical section, contention, encaps
 tools: [go]
 estimated_time: 25m
 bloom_level: apply
-prerequisites: [goroutines, sync.WaitGroup, data race concept, race detector]
 ---
 
 # 3. Fix Race with Mutex
@@ -14,203 +13,307 @@ prerequisites: [goroutines, sync.WaitGroup, data race concept, race detector]
 After completing this exercise, you will be able to:
 - **Fix** a data race by protecting shared state with `sync.Mutex`
 - **Apply** the `Lock()`/`defer Unlock()` idiom correctly
-- **Encapsulate** locking inside a struct for production-quality code
-- **Measure** the contention cost of mutex-based synchronization
+- **Encapsulate** locking inside a MetricsCollector struct
+- **Protect** a map of counters (request counts per endpoint)
 - **Verify** the fix using the `-race` flag
 
 ## Why Mutex
 
-A `sync.Mutex` provides **mutual exclusion**: only one goroutine can hold the lock at a time. All others block until the lock is released. This is the most straightforward way to protect shared state.
+A `sync.Mutex` provides **mutual exclusion**: only one goroutine can hold the lock at a time. All others block until the lock is released. This is the most straightforward way to protect shared state in Go.
 
 How it works:
 - `Lock()`: acquire the lock. If another goroutine holds it, block until it releases.
 - `Unlock()`: release the lock. The next waiting goroutine can now proceed.
 
-The tradeoff is **contention**: when many goroutines compete for the same lock, they serialize their access, reducing parallelism. For a simple counter this is acceptable. For high-throughput scenarios with mostly reads, consider `sync.RWMutex`. For simple numeric operations, consider `sync/atomic` (exercise 05).
+In a real web service, you need to track metrics: total requests, requests per endpoint, error counts, response times. Multiple HTTP handlers update these metrics concurrently. A mutex ensures no updates are lost.
 
-This exercise uses the same counter problem from exercises 01-02.
+## Step 1 -- Fix the Hit Counter with Mutex
 
-## Step 1 -- Basic Mutex
-
-The simplest fix wraps `counter++` in `Lock()`/`Unlock()`:
+Start by fixing the racy hit counter from exercises 01-02 with a simple mutex:
 
 ```go
 package main
 
 import (
-    "fmt"
-    "sync"
+	"fmt"
+	"sync"
 )
 
-func safeCounterMutex() int {
-    counter := 0
-    var mu sync.Mutex
-    var wg sync.WaitGroup
+func safeHitCounter() int {
+	hitCount := 0
+	var mu sync.Mutex
+	var wg sync.WaitGroup
 
-    for i := 0; i < 1000; i++ {
-        wg.Add(1)
-        go func() {
-            defer wg.Done()
-            for j := 0; j < 1000; j++ {
-                mu.Lock()
-                counter++ // only one goroutine at a time reaches this line
-                mu.Unlock()
-            }
-        }()
-    }
+	for handler := 0; handler < 100; handler++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for req := 0; req < 100; req++ {
+				mu.Lock()
+				hitCount++
+				mu.Unlock()
+			}
+		}()
+	}
 
-    wg.Wait()
-    return counter
+	wg.Wait()
+	return hitCount
 }
 
 func main() {
-    result := safeCounterMutex()
-    fmt.Printf("Result: %d (expected 1000000)\n", result)
+	result := safeHitCounter()
+	fmt.Printf("Hit count: %d (expected 10000)\n", result)
 }
 ```
 
 ### Verification
 ```bash
-go run main.go
+go run -race main.go
 ```
 Expected:
 ```
-Result: 1000000 (expected 1000000) -- CORRECT
+Hit count: 10000 (expected 10000)
 ```
+No `DATA RACE` warning. The mutex establishes a happens-before relationship: each `Unlock()` happens-before the next `Lock()`.
 
-```bash
-go run -race main.go
-```
-Expected: NO `DATA RACE` warning from `safeCounterMutex`. The mutex establishes a happens-before relationship: each `Unlock()` happens-before the next `Lock()`.
+## Step 2 -- Build a MetricsCollector Struct
 
-## Step 2 -- Defer Pattern
-
-The `defer` pattern ensures the mutex is always released, even if a panic occurs inside the critical section:
+In production code, the mutex should be an implementation detail, not something callers must remember to use. Build a proper `MetricsCollector` that tracks request counts per endpoint, like a real HTTP service would need:
 
 ```go
 package main
 
 import (
-    "fmt"
-    "sync"
+	"fmt"
+	"sync"
 )
 
-func safeCounterDefer() int {
-    counter := 0
-    var mu sync.Mutex
-    var wg sync.WaitGroup
+type MetricsCollector struct {
+	mu       sync.Mutex
+	counters map[string]int
+}
 
-    // Extract the critical section into a named closure.
-    // This makes the locking scope explicit and limits it to the minimum.
-    increment := func() {
-        mu.Lock()
-        defer mu.Unlock() // guaranteed to execute even on panic
-        counter++
-    }
+func NewMetricsCollector() *MetricsCollector {
+	return &MetricsCollector{
+		counters: make(map[string]int),
+	}
+}
 
-    for i := 0; i < 1000; i++ {
-        wg.Add(1)
-        go func() {
-            defer wg.Done()
-            for j := 0; j < 1000; j++ {
-                increment()
-            }
-        }()
-    }
+func (m *MetricsCollector) RecordRequest(endpoint string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.counters[endpoint]++
+}
 
-    wg.Wait()
-    return counter
+func (m *MetricsCollector) GetCount(endpoint string) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.counters[endpoint]
+}
+
+func (m *MetricsCollector) Snapshot() map[string]int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	// Return a copy so the caller cannot cause races by reading the original map.
+	snapshot := make(map[string]int, len(m.counters))
+	for k, v := range m.counters {
+		snapshot[k] = v
+	}
+	return snapshot
 }
 
 func main() {
-    result := safeCounterDefer()
-    fmt.Printf("Result: %d (expected 1000000)\n", result)
+	metrics := NewMetricsCollector()
+	var wg sync.WaitGroup
+
+	endpoints := []string{"/api/users", "/api/orders", "/api/products", "/healthz"}
+
+	// Simulate 50 handlers per endpoint, each processing 100 requests.
+	for _, ep := range endpoints {
+		for handler := 0; handler < 50; handler++ {
+			wg.Add(1)
+			go func(endpoint string) {
+				defer wg.Done()
+				for req := 0; req < 100; req++ {
+					metrics.RecordRequest(endpoint)
+				}
+			}(ep)
+		}
+	}
+
+	wg.Wait()
+
+	fmt.Println("=== Metrics Collector Results ===")
+	snapshot := metrics.Snapshot()
+	total := 0
+	for endpoint, count := range snapshot {
+		fmt.Printf("  %-20s %d requests\n", endpoint, count)
+		total += count
+	}
+	fmt.Printf("  %-20s %d requests\n", "TOTAL", total)
+	fmt.Printf("\nExpected: 5000 per endpoint, 20000 total\n")
 }
 ```
+
+Key patterns:
+- The mutex is an unexported field: callers never see it
+- Every public method acquires the lock with `defer Unlock()` for safety
+- `Snapshot()` returns a copy of the map, not a reference, preventing races on the returned data
+- `defer mu.Unlock()` guarantees the lock is released even if a panic occurs inside the method
 
 ### Verification
 ```bash
 go run -race main.go
 ```
-Expected: 1,000,000 with zero race warnings.
+Expected: 5000 requests per endpoint, 20000 total, zero race warnings.
 
-## Step 3 -- Encapsulated Counter
+## Step 3 -- The Defer Pattern for Panic Safety
 
-In production code, the mutex should be an implementation detail, not something callers must remember to use:
+The `defer` pattern is not just about convenience. It guarantees the lock is released even in failure cases:
 
 ```go
 package main
 
 import (
-    "fmt"
-    "sync"
+	"fmt"
+	"sync"
 )
 
-type SafeCounter struct {
-    mu    sync.Mutex
-    value int
+type SafeRegistry struct {
+	mu    sync.Mutex
+	items map[string]string
 }
 
-func (c *SafeCounter) Increment() {
-    c.mu.Lock()
-    defer c.mu.Unlock()
-    c.value++
+func NewSafeRegistry() *SafeRegistry {
+	return &SafeRegistry{items: make(map[string]string)}
 }
 
-func (c *SafeCounter) Value() int {
-    c.mu.Lock()
-    defer c.mu.Unlock()
-    return c.value
+func (r *SafeRegistry) Register(key, value string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if key == "" {
+		panic("empty key") // defer ensures Unlock() still runs
+	}
+	r.items[key] = value
+}
+
+func (r *SafeRegistry) Get(key string) (string, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	v, ok := r.items[key]
+	return v, ok
 }
 
 func main() {
-    c := &SafeCounter{}
-    var wg sync.WaitGroup
+	reg := NewSafeRegistry()
+	var wg sync.WaitGroup
 
-    for i := 0; i < 1000; i++ {
-        wg.Add(1)
-        go func() {
-            defer wg.Done()
-            for j := 0; j < 1000; j++ {
-                c.Increment()
-            }
-        }()
-    }
+	// Writers
+	keys := []string{"service-a", "service-b", "service-c"}
+	for _, k := range keys {
+		wg.Add(1)
+		go func(key string) {
+			defer wg.Done()
+			reg.Register(key, fmt.Sprintf("http://%s:8080", key))
+		}(k)
+	}
 
-    wg.Wait()
-    fmt.Printf("Result: %d (expected 1000000)\n", c.Value())
+	wg.Wait()
+
+	// Safe to read after all writers are done.
+	for _, k := range keys {
+		if v, ok := reg.Get(k); ok {
+			fmt.Printf("  %s -> %s\n", k, v)
+		}
+	}
 }
 ```
+
+Without `defer`, forgetting to call `Unlock()` on any code path (early return, error, panic) causes a **permanent deadlock**: all other goroutines waiting for that lock will block forever.
 
 ### Verification
 ```bash
 go run -race main.go
 ```
-Expected: 1,000,000 with zero race warnings.
-
-This pattern prevents forgetting to lock because callers never access `value` directly.
+Expected: all three services registered, zero race warnings.
 
 ## Step 4 -- Measure Contention Cost
 
-The full `main.go` includes a timing comparison. The mutex version is slower because goroutines must wait for each other:
+The mutex serializes access, which means goroutines wait for each other. Measure the overhead:
+
+```go
+package main
+
+import (
+	"fmt"
+	"sync"
+	"time"
+)
+
+func racyCount() int {
+	counter := 0
+	var wg sync.WaitGroup
+	for i := 0; i < 100; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 10000; j++ {
+				counter++
+			}
+		}()
+	}
+	wg.Wait()
+	return counter
+}
+
+func mutexCount() int {
+	counter := 0
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	for i := 0; i < 100; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 10000; j++ {
+				mu.Lock()
+				counter++
+				mu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+	return counter
+}
+
+func main() {
+	fmt.Println("=== Contention Cost ===")
+
+	start := time.Now()
+	racyResult := racyCount()
+	racyTime := time.Since(start)
+
+	start = time.Now()
+	mutexResult := mutexCount()
+	mutexTime := time.Since(start)
+
+	fmt.Printf("  Racy (WRONG):  %d in %v\n", racyResult, racyTime)
+	fmt.Printf("  Mutex (correct): %d in %v\n", mutexResult, mutexTime)
+	fmt.Printf("  Slowdown: %.1fx (the cost of correctness)\n",
+		float64(mutexTime)/float64(racyTime))
+	fmt.Println()
+	fmt.Println("In real code, contention is usually lower because:")
+	fmt.Println("  - Handlers do useful work between lock acquisitions")
+	fmt.Println("  - Lock scope is narrow (microseconds, not the entire request)")
+	fmt.Println("  - Different handlers lock different resources")
+}
+```
 
 ### Verification
 ```bash
 go run main.go
 ```
-Sample output:
-```
-=== Timing Comparison ===
-  Racy (wrong):        12.3ms
-  Mutex (basic):       245.6ms
-  Mutex (defer):       251.2ms
-  Slowdown: ~20x (the cost of correctness under high contention)
-```
 
-This is the worst case: 1000 goroutines competing for a single lock on a single integer. In real code, contention is usually lower because:
-- Goroutines do useful work between lock acquisitions
-- Lock scope is narrow
-- Different goroutines lock different resources
+The mutex version is slower because goroutines must wait for each other. This is the worst case: 100 goroutines competing for a single lock on a single integer. In real web services, the lock is held for microseconds per request, and the work between requests (database queries, network calls) dominates the total time.
 
 ## Common Mistakes
 
@@ -218,7 +321,7 @@ This is the worst case: 1000 goroutines competing for a single lock on a single 
 ```go
 mu.Lock()
 counter++
-// forgot mu.Unlock() -- all other goroutines are now blocked forever (deadlock)
+// forgot mu.Unlock() -- all other goroutines blocked forever (deadlock)
 ```
 **Fix:** Always use `defer mu.Unlock()` immediately after `Lock()`.
 
@@ -230,7 +333,7 @@ for j := 0; j < 1000; j++ {
 }
 mu.Unlock()
 ```
-This locks the entire loop, eliminating all parallelism. Each goroutine holds the lock for 1000 iterations.
+This locks the entire loop, eliminating all parallelism. Each goroutine holds the lock for 1000 iterations while others wait.
 
 **Better:** Lock only the specific operation that needs protection:
 ```go
@@ -246,7 +349,7 @@ for j := 0; j < 1000; j++ {
 var mu sync.Mutex
 mu2 := mu // BUG: mu2 is a copy, not the same mutex
 ```
-Never copy a `sync.Mutex` after first use. Pass mutexes by pointer, or embed them in a struct.
+Never copy a `sync.Mutex` after first use. Pass mutexes by pointer, or embed them in a struct (the struct itself must then be passed by pointer).
 
 ### Double-Locking from the Same Goroutine
 ```go
@@ -258,25 +361,22 @@ mu.Lock() // DEADLOCK: same goroutine already holds the lock
 
 ## Verify What You Learned
 
-```bash
-go run -race main.go
-```
-
-1. Confirm zero race warnings for all mutex-protected functions
+1. Confirm zero race warnings for all mutex-protected functions with `go run -race main.go`
 2. What happens if you call `Lock()` twice from the same goroutine without `Unlock()`?
 3. Why is `defer mu.Unlock()` preferred over calling `mu.Unlock()` explicitly?
-4. What is the tradeoff of using a mutex for this counter problem?
+4. Why does `Snapshot()` return a copy of the map instead of the original?
 
 ## What's Next
-Continue to [04-fix-race-with-channel](../04-fix-race-with-channel/04-fix-race-with-channel.md) to fix the same race using channels instead of a mutex.
+Continue to [04-fix-race-with-channel](../04-fix-race-with-channel/04-fix-race-with-channel.md) to fix the same metrics problem using channels instead of a mutex.
 
 ## Summary
 - `sync.Mutex` provides mutual exclusion: only one goroutine enters the critical section at a time
 - Always pair `Lock()` with `Unlock()`; prefer `defer mu.Unlock()` for safety
-- Extract critical sections into small functions to make the locking scope explicit
-- Encapsulate the mutex inside a struct to prevent callers from forgetting to lock
+- Encapsulate the mutex inside a struct (like `MetricsCollector`) so callers cannot forget to lock
+- Protect maps with mutex: both reads and writes must be locked
+- Return copies from getters (like `Snapshot()`) to prevent races on returned data
 - The mutex establishes happens-before relationships that satisfy the race detector
-- Tradeoff: mutexes add contention, reducing parallelism, but guarantee correctness
+- Tradeoff: mutexes add contention, but in real services the overhead is negligible compared to I/O
 - Verify with `go run -race main.go` to confirm the race is eliminated
 
 ## Reference

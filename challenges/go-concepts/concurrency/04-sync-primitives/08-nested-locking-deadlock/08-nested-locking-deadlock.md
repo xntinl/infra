@@ -20,11 +20,13 @@ After completing this exercise, you will be able to:
 ## Why Deadlock Prevention Matters
 A deadlock occurs when two or more goroutines are each waiting for the other to release a lock, creating a circular dependency where no goroutine can proceed. The program freezes permanently with no error message beyond Go's runtime detection of "all goroutines are asleep."
 
+The most common real-world scenario: bank account transfers. Two accounts each have their own mutex. Transferring money from A to B requires locking both accounts. If two concurrent transfers lock in opposite order -- transfer(A,B) locks A then B, while transfer(B,A) locks B then A -- you get a deadlock.
+
 Deadlocks from nested locking are particularly dangerous because:
 - They may not manifest during testing if the timing is just right
 - They require specific interleaving of goroutine execution to trigger
 - They are invisible at compile time
-- Once triggered, the only recovery is killing the process
+- Once triggered in production, the affected goroutines hang forever while the rest of the server continues, creating a partial freeze that is extremely hard to diagnose
 
 The four conditions for deadlock (Coffman conditions):
 1. **Mutual exclusion**: at least one resource is non-shareable (mutex)
@@ -34,9 +36,9 @@ The four conditions for deadlock (Coffman conditions):
 
 Breaking any one condition prevents deadlock. The most practical approach in Go is to break the **circular wait** by establishing a **consistent lock ordering**: always acquire locks in the same order, regardless of which goroutine is executing.
 
-## Step 1 -- Understand the Deadlock
+## Step 1 -- The Deadlock: Bank Transfer Gone Wrong
 
-The `createDeadlock` function (commented out in main) demonstrates a classic two-mutex deadlock:
+Two concurrent transfers lock accounts in opposite order, creating a classic deadlock:
 
 ```go
 package main
@@ -47,135 +49,98 @@ import (
 	"time"
 )
 
+type Account struct {
+	ID      int
+	Name    string
+	mu      sync.Mutex
+	balance int
+}
+
+func transferUnsafe(from, to *Account, amount int) {
+	from.mu.Lock()
+	fmt.Printf("  Transfer %s->%s: locked %s\n", from.Name, to.Name, from.Name)
+	time.Sleep(50 * time.Millisecond) // give the other transfer time to lock
+	fmt.Printf("  Transfer %s->%s: waiting for %s...\n", from.Name, to.Name, to.Name)
+	to.mu.Lock() // BLOCKED if the other transfer holds this lock
+
+	if from.balance >= amount {
+		from.balance -= amount
+		to.balance += amount
+	}
+
+	to.mu.Unlock()
+	from.mu.Unlock()
+}
+
 func main() {
-	var muA, muB sync.Mutex
+	alice := &Account{ID: 1, Name: "Alice", balance: 1000}
+	bob := &Account{ID: 2, Name: "Bob", balance: 1000}
+
+	fmt.Println("=== DEADLOCK DEMO (will freeze) ===")
+	fmt.Println("Two transfers locking in opposite order:")
+	fmt.Println("  Transfer 1: Alice -> Bob (locks Alice first)")
+	fmt.Println("  Transfer 2: Bob -> Alice (locks Bob first)")
+	fmt.Println()
+
 	var wg sync.WaitGroup
 
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		muA.Lock()
-		fmt.Println("G1: locked A")
-		time.Sleep(50 * time.Millisecond) // give G2 time to lock B
-		fmt.Println("G1: waiting for B...")
-		muB.Lock() // BLOCKED: G2 holds B
-		muB.Unlock()
-		muA.Unlock()
+		transferUnsafe(alice, bob, 100) // locks Alice, then Bob
 	}()
 
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		muB.Lock()
-		fmt.Println("G2: locked B")
-		time.Sleep(50 * time.Millisecond) // give G1 time to lock A
-		fmt.Println("G2: waiting for A...")
-		muA.Lock() // BLOCKED: G1 holds A
-		muA.Unlock()
-		muB.Unlock()
+		transferUnsafe(bob, alice, 50) // locks Bob, then Alice -- OPPOSITE ORDER
 	}()
 
-	wg.Wait() // never returns
+	wg.Wait() // never returns -- both goroutines are blocked
+	fmt.Println("This line is never reached")
 }
 ```
 
 Expected output (then freeze):
 ```
-G1: locked A
-G2: locked B
-G1: waiting for B...
-G2: waiting for A...
+=== DEADLOCK DEMO (will freeze) ===
+Two transfers locking in opposite order:
+  Transfer 1: Alice -> Bob (locks Alice first)
+  Transfer 2: Bob -> Alice (locks Bob first)
+
+  Transfer Alice->Bob: locked Alice
+  Transfer Bob->Alice: locked Bob
+  Transfer Alice->Bob: waiting for Bob...
+  Transfer Bob->Alice: waiting for Alice...
 fatal error: all goroutines are asleep - deadlock!
 ```
 
+**WARNING:** This program will hang. Press Ctrl+C to kill it. Go's runtime detects the deadlock only because ALL goroutines are blocked.
+
 ### Intermediate Verification
-Uncomment `createDeadlock()` in `main.go` to see it. Press Ctrl+C to kill. Go's runtime detects the deadlock because ALL goroutines are blocked.
+Run it and observe the freeze. The two transfers each hold one lock and wait for the other.
 
 ## Step 2 -- Analyze the Circular Wait
 
 ```
 Timeline:
-  T0: G1 locks A, G2 locks B         (both succeed)
-  T1: G1 wants B (held by G2)        -- G1 BLOCKED
-      G2 wants A (held by G1)        -- G2 BLOCKED
+  T0: Transfer 1 locks Alice,  Transfer 2 locks Bob        (both succeed)
+  T1: Transfer 1 wants Bob     (held by Transfer 2)       -- BLOCKED
+      Transfer 2 wants Alice   (held by Transfer 1)       -- BLOCKED
 
-  G1 --> waits for B --> held by G2
-  G2 --> waits for A --> held by G1
+  Transfer 1 --> waits for Bob   --> held by Transfer 2
+  Transfer 2 --> waits for Alice --> held by Transfer 1
 
-  Circular dependency! Neither can proceed.
+  Circular dependency. Neither can proceed.
 ```
 
-The root cause: G1 acquires locks in order `A, B` while G2 acquires them in order `B, A`. This inconsistency creates the possibility of circular wait.
+The root cause: Transfer 1 acquires locks in order `Alice, Bob` while Transfer 2 acquires them in order `Bob, Alice`. This inconsistency creates the possibility of circular wait.
+
+In production, this deadlock is far worse than it looks. If your server has a listening goroutine (which it always does), Go's runtime deadlock detector does NOT trigger. The transfers hang silently while the server appears to be running. Users see timeouts. No error is logged. The only symptom is that transfer-related requests stop completing.
 
 ## Step 3 -- Fix with Consistent Lock Ordering
 
-Both goroutines must acquire locks in the SAME order:
-
-```go
-package main
-
-import (
-	"fmt"
-	"sync"
-	"time"
-)
-
-func main() {
-	var muA, muB sync.Mutex
-	var wg sync.WaitGroup
-
-	// Both goroutines: always A first, then B
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		muA.Lock()
-		fmt.Println("G1: locked A")
-		time.Sleep(50 * time.Millisecond)
-		muB.Lock()
-		fmt.Println("G1: locked B")
-		muB.Unlock()
-		muA.Unlock()
-		fmt.Println("G1: released both")
-	}()
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		muA.Lock() // same order as G1
-		fmt.Println("G2: locked A")
-		time.Sleep(50 * time.Millisecond)
-		muB.Lock()
-		fmt.Println("G2: locked B")
-		muB.Unlock()
-		muA.Unlock()
-		fmt.Println("G2: released both")
-	}()
-
-	wg.Wait()
-	fmt.Println("No deadlock!")
-}
-```
-
-Expected output:
-```
-G1: locked A
-G1: locked B
-G1: released both
-G2: locked A
-G2: locked B
-G2: released both
-No deadlock!
-```
-
-### Intermediate Verification
-```bash
-go run main.go
-```
-Both goroutines complete. One runs first (holding A then B), then the other.
-
-## Step 4 -- Realistic Example: Safe Account Transfers
-
-Transfer money between accounts by always locking the lower-ID account first:
+Always lock the account with the lower ID first, regardless of which is "from" and which is "to":
 
 ```go
 package main
@@ -186,15 +151,16 @@ import (
 )
 
 type Account struct {
-	id      int
+	ID      int
+	Name    string
 	mu      sync.Mutex
 	balance int
 }
 
 func transferSafe(from, to *Account, amount int) bool {
-	// Always lock the lower-ID account first
+	// Always lock the lower-ID account first -- this is the invariant
 	first, second := from, to
-	if from.id > to.id {
+	if from.ID > to.ID {
 		first, second = to, from
 	}
 
@@ -212,51 +178,173 @@ func transferSafe(from, to *Account, amount int) bool {
 }
 
 func main() {
-	accounts := []*Account{
-		{id: 1, balance: 1000},
-		{id: 2, balance: 1000},
-		{id: 3, balance: 1000},
-	}
+	alice := &Account{ID: 1, Name: "Alice", balance: 1000}
+	bob := &Account{ID: 2, Name: "Bob", balance: 1000}
+
+	fmt.Println("=== SAFE TRANSFERS (consistent lock ordering) ===")
+	fmt.Printf("Before: Alice=%d, Bob=%d\n\n", alice.balance, bob.balance)
 
 	var wg sync.WaitGroup
-	for i := 0; i < 200; i++ {
-		wg.Add(1)
-		go func(i int) {
+
+	// Run 200 concurrent transfers in both directions
+	for i := 0; i < 100; i++ {
+		wg.Add(2)
+		go func() {
 			defer wg.Done()
-			from := accounts[i%3]
-			to := accounts[(i+1)%3]
-			transferSafe(from, to, 10)
-		}(i)
+			transferSafe(alice, bob, 10) // Alice -> Bob
+		}()
+		go func() {
+			defer wg.Done()
+			transferSafe(bob, alice, 10) // Bob -> Alice
+		}()
 	}
 
 	wg.Wait()
 
-	total := 0
-	for _, a := range accounts {
-		fmt.Printf("Account %d: %d\n", a.id, a.balance)
-		total += a.balance
-	}
-	fmt.Printf("Total: %d (should be 3000)\n", total)
+	fmt.Printf("After:  Alice=%d, Bob=%d\n", alice.balance, bob.balance)
+	fmt.Printf("Total:  %d (must be 2000 -- money is conserved)\n", alice.balance+bob.balance)
+	fmt.Println("\nNo deadlock. Consistent lock ordering breaks the circular wait.")
 }
 ```
 
 Expected output:
 ```
-Account 1: XXX
-Account 2: XXX
-Account 3: XXX
-Total: 3000 (should be 3000)
+=== SAFE TRANSFERS (consistent lock ordering) ===
+Before: Alice=1000, Bob=1000
+
+After:  Alice=1000, Bob=1000
+Total:  2000 (must be 2000 -- money is conserved)
+
+No deadlock. Consistent lock ordering breaks the circular wait.
 ```
 
 ### Intermediate Verification
 ```bash
 go run -race main.go
 ```
-No deadlocks, no data races. Total money is conserved.
+No deadlocks, no data races. Total money is conserved. Run it multiple times -- it never hangs.
+
+## Step 4 -- Multi-Account Transfers at Scale
+
+A realistic banking system has many accounts. The same principle applies -- always lock by ascending ID:
+
+```go
+package main
+
+import (
+	"fmt"
+	"math/rand"
+	"sync"
+)
+
+type Account struct {
+	ID      int
+	mu      sync.Mutex
+	balance int
+}
+
+func transfer(from, to *Account, amount int) bool {
+	first, second := from, to
+	if from.ID > to.ID {
+		first, second = to, from
+	}
+
+	first.mu.Lock()
+	defer first.mu.Unlock()
+	second.mu.Lock()
+	defer second.mu.Unlock()
+
+	if from.balance < amount {
+		return false
+	}
+	from.balance -= amount
+	to.balance += amount
+	return true
+}
+
+func main() {
+	const numAccounts = 5
+	accounts := make([]*Account, numAccounts)
+	for i := range accounts {
+		accounts[i] = &Account{ID: i + 1, balance: 10000}
+	}
+
+	fmt.Println("=== Multi-Account Transfer Stress Test ===")
+	fmt.Printf("Accounts: %d, each starting with $10,000\n", numAccounts)
+
+	totalBefore := 0
+	for _, a := range accounts {
+		totalBefore += a.balance
+	}
+
+	var wg sync.WaitGroup
+	const numTransfers = 10000
+	successCount := int64(0)
+	var countMu sync.Mutex
+
+	for i := 0; i < numTransfers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			fromIdx := rand.Intn(numAccounts)
+			toIdx := rand.Intn(numAccounts)
+			for toIdx == fromIdx {
+				toIdx = rand.Intn(numAccounts)
+			}
+			amount := rand.Intn(100) + 1
+			if transfer(accounts[fromIdx], accounts[toIdx], amount) {
+				countMu.Lock()
+				successCount++
+				countMu.Unlock()
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	fmt.Printf("\nTransfers attempted: %d\n", numTransfers)
+	fmt.Printf("Transfers succeeded: %d\n", successCount)
+	fmt.Println("\nFinal balances:")
+	totalAfter := 0
+	for _, a := range accounts {
+		fmt.Printf("  Account %d: $%d\n", a.ID, a.balance)
+		totalAfter += a.balance
+	}
+	fmt.Printf("\nTotal before: $%d\n", totalBefore)
+	fmt.Printf("Total after:  $%d\n", totalAfter)
+	fmt.Printf("Money conserved: %v\n", totalBefore == totalAfter)
+}
+```
+
+Expected output:
+```
+=== Multi-Account Transfer Stress Test ===
+Accounts: 5, each starting with $10,000
+
+Transfers attempted: 10000
+Transfers succeeded: 8547
+
+Final balances:
+  Account 1: $11234
+  Account 2: $8765
+  Account 3: $12098
+  Account 4: $7654
+  Account 5: $10249
+
+Total before: $50000
+Total after:  $50000
+Money conserved: true
+```
+
+### Intermediate Verification
+```bash
+go run -race main.go
+```
+No deadlocks, no data races. Total money across all accounts is always conserved at $50,000.
 
 ## Common Mistakes
 
-### Locking Based on Caller Order
+### Locking Based on Parameter Order
 
 ```go
 func transfer(from, to *Account, amount int) {
@@ -268,13 +356,19 @@ func transfer(from, to *Account, amount int) {
 
 **What happens:** `transfer(A, B, 100)` and `transfer(B, A, 50)` running concurrently create a deadlock.
 
-**Fix:** Lock based on a stable ordering (ID, address, etc.), not the parameter names.
+**Fix:** Lock based on a stable ordering (ID, address, name), not the parameter position.
 
 ### Assuming the Runtime Always Detects Deadlocks
-Go's deadlock detector only triggers when ALL goroutines are blocked. In a real server with a listening goroutine, deadlocks between other goroutines go undetected. The program hangs partially, which is even worse than a full deadlock.
+Go's deadlock detector only triggers when ALL goroutines are blocked. In a real server with a listening goroutine, HTTP handler goroutine, or ticker, deadlocks between other goroutines go completely undetected. The program hangs partially: some requests complete, others never do. This is harder to diagnose than a full crash.
 
 ### Lock Escalation
-Acquiring more locks while already holding one is inherently risky. Minimize nested locking. If you must, document the lock ordering invariant clearly.
+Acquiring more locks while already holding one is inherently risky. Minimize nested locking. If you must hold two locks, document the lock ordering invariant clearly:
+
+```go
+// lockOrdering documents the required lock acquisition order.
+// Always lock the lower-ID account first to prevent deadlocks.
+// Invariant: for any pair (A, B) where A.ID < B.ID, lock A before B.
+```
 
 ### Trying to Detect Deadlocks with Timeouts
 
@@ -286,23 +380,24 @@ case <-time.After(5 * time.Second):
 }
 ```
 
-This hides the real problem. Fix the lock ordering instead.
+This hides the real problem. Fix the lock ordering instead. Timeouts for deadlock detection are a band-aid that makes debugging harder.
 
 ## Verify What You Learned
 
-Implement a dining philosophers problem with 5 philosophers and 5 forks. First, show the deadlock when each philosopher picks up their left fork then their right. Then fix it using consistent lock ordering (pick up the lower-numbered fork first).
+Implement a dining philosophers problem with 5 philosophers and 5 forks (mutexes). First, show the deadlock when each philosopher picks up their left fork then their right. Then fix it using consistent lock ordering (always pick up the lower-numbered fork first). Run 1000 iterations and verify no deadlock occurs.
 
 ## What's Next
 Continue to [09-sync-map-concurrent-access](../09-sync-map-concurrent-access/09-sync-map-concurrent-access.md) to learn how `sync.Map` provides a concurrent-safe map without external locking.
 
 ## Summary
 - Deadlock occurs when goroutines form a circular dependency waiting for locks
-- Go's runtime detects deadlocks only when ALL goroutines are blocked
+- The most common real-world cause: transferring between two resources, each with its own lock, in inconsistent order
+- Go's runtime detects deadlocks only when ALL goroutines are blocked -- partial deadlocks are invisible
 - The primary fix is consistent lock ordering: always acquire locks in the same global order
-- Use a stable key (ID, memory address) to determine lock order, not parameter position
+- Use a stable key (ID, address) to determine lock order, not parameter position
 - Minimize nested locking: if you can avoid holding two locks at once, do so
 - Document lock ordering invariants for any code that acquires multiple locks
-- Test with `-race` and high concurrency to surface timing-dependent deadlocks
+- In production servers, partial deadlocks are worse than crashes because they are silent
 
 ## Reference
 - [Go Runtime Deadlock Detection](https://pkg.go.dev/runtime#hdr-Detecting_Deadlocks)

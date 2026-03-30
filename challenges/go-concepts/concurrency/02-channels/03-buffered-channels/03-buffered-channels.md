@@ -4,11 +4,9 @@ concepts: [buffered-channels, capacity, blocking, len, cap, channel-semantics]
 tools: [go]
 estimated_time: 20m
 bloom_level: understand
-prerequisites: [goroutines, unbuffered-channels]
 ---
 
 # 3. Buffered Channels
-
 
 ## Learning Objectives
 After completing this exercise, you will be able to:
@@ -19,15 +17,15 @@ After completing this exercise, you will be able to:
 
 ## Why Buffered Channels
 
-Unbuffered channels require both sender and receiver to be ready at the same time. This is perfect for synchronization, but sometimes you want to decouple the sender from the receiver. A producer might generate values in bursts, or you might want to allow some goroutines to complete their sends without waiting.
+Consider a logging pipeline. Your application goroutines generate log entries in bursts -- a single HTTP request might produce 5 log lines in quick succession. The log writer, however, flushes to disk slowly (I/O is orders of magnitude slower than in-memory operations). With an unbuffered channel, every goroutine blocks on each log call until the writer finishes the previous entry. Your application slows to the speed of your disk.
 
-Buffered channels have an internal queue. A send only blocks when the buffer is full, and a receive only blocks when the buffer is empty. This lets the sender "drop off" values without waiting for the receiver, up to the buffer's capacity.
+Buffered channels solve this. They have an internal queue: a send only blocks when the buffer is full, and a receive only blocks when the buffer is empty. Application goroutines "drop off" log entries and continue immediately, as long as the buffer has space. When the writer falls behind and the buffer fills up, senders block -- this is called *backpressure*, and it prevents memory from growing without bound.
 
-Think of it like a mailbox: you can drop off letters (send) without the recipient being home, as long as the mailbox isn't full. The recipient can pick up letters (receive) whenever they're ready. But if the mailbox overflows, you have to wait.
+This is the fundamental tradeoff: buffered channels decouple the timing of producers and consumers, absorbing bursts while still applying backpressure when the consumer is overwhelmed.
 
-## Step 1 -- Create a Buffered Channel
+## Step 1 -- A Logging Buffer
 
-Create a buffered channel with capacity 3 and send values without a receiver goroutine.
+Create a buffered channel to model a log buffer. Application code can write several log entries without blocking, and the log writer consumes them at its own pace.
 
 ```go
 package main
@@ -35,36 +33,43 @@ package main
 import "fmt"
 
 func main() {
-    ch := make(chan int, 3) // buffer can hold 3 ints
+    // Buffer can hold 5 log entries before any must be consumed.
+    logBuffer := make(chan string, 5)
 
-    // All three sends succeed immediately -- no goroutine needed.
-    // With an unbuffered channel, these would deadlock.
-    ch <- 10
-    ch <- 20
-    ch <- 30
-    // ch <- 40 would block here -- buffer is full!
+    // Application code writes logs. None of these block because
+    // the buffer has capacity. With an unbuffered channel, each
+    // would deadlock (no receiver goroutine).
+    logBuffer <- "[INFO] request received: GET /api/users"
+    logBuffer <- "[INFO] auth token validated"
+    logBuffer <- "[INFO] query executed: SELECT * FROM users"
+    logBuffer <- "[INFO] response sent: 200 OK (12ms)"
 
-    // Receives drain the buffer in FIFO order.
-    fmt.Println(<-ch) // 10
-    fmt.Println(<-ch) // 20
-    fmt.Println(<-ch) // 30
+    fmt.Printf("Log buffer: %d/%d entries\n", len(logBuffer), cap(logBuffer))
+
+    // Log writer drains entries in FIFO order.
+    for len(logBuffer) > 0 {
+        entry := <-logBuffer
+        fmt.Println("  Written:", entry)
+    }
 }
 ```
 
-Key difference from unbuffered: you can send three values *without* any goroutine receiving them. The buffer holds the values until they're consumed.
+Key difference from unbuffered: you can send four values *without* any goroutine receiving them. The buffer holds the values until they are consumed.
 
 ### Verification
 ```bash
 go run main.go
 # Expected:
-#   10
-#   20
-#   30
+#   Log buffer: 4/5 entries
+#   Written: [INFO] request received: GET /api/users
+#   Written: [INFO] auth token validated
+#   Written: [INFO] query executed: SELECT * FROM users
+#   Written: [INFO] response sent: 200 OK (12ms)
 ```
 
-## Step 2 -- Observe Blocking When Full
+## Step 2 -- Backpressure: What Happens When the Buffer Is Full
 
-Fill the buffer completely, then try to send one more value. This blocks until someone receives.
+Fill the log buffer completely, then try to write one more entry. The sender blocks until the writer drains at least one entry -- this is backpressure protecting you from unbounded memory growth.
 
 ```go
 package main
@@ -75,38 +80,39 @@ import (
 )
 
 func main() {
-    ch := make(chan int, 2)
-    ch <- 1
-    ch <- 2
-    fmt.Printf("Buffer state: len=%d, cap=%d (full)\n", len(ch), cap(ch))
+    logBuffer := make(chan string, 2)
+    logBuffer <- "[ERROR] connection timeout"
+    logBuffer <- "[ERROR] retry failed"
+    fmt.Printf("Buffer state: %d/%d (full)\n", len(logBuffer), cap(logBuffer))
 
+    // Simulate a slow log writer that drains one entry after 500ms.
     go func() {
         time.Sleep(500 * time.Millisecond)
-        val := <-ch
-        fmt.Printf("Drained one: %d -- made room\n", val)
+        entry := <-logBuffer
+        fmt.Printf("Writer drained: %s\n", entry)
     }()
 
-    fmt.Println("Sending 3rd value (will block)...")
-    ch <- 3  // blocks until the goroutine receives
-    fmt.Println("3rd value sent successfully!")
+    fmt.Println("App: writing 3rd log entry (will block -- buffer full)...")
+    logBuffer <- "[WARN] circuit breaker tripped"
+    fmt.Println("App: 3rd entry written (writer made room)")
 }
 ```
 
-The send on line `ch <- 3` blocks for ~500ms because the buffer is full. Once the goroutine receives a value and makes room, the send completes.
+The send blocks for ~500ms because the buffer is full. Once the writer receives a value and makes room, the send completes. Without this backpressure, the application would silently drop logs or consume memory without bound.
 
 ### Verification
 ```bash
 go run main.go
 # Expected:
-#   Buffer state: len=2, cap=2 (full)
-#   Sending 3rd value (will block)...
-#   Drained one: 1 -- made room
-#   3rd value sent successfully!
+#   Buffer state: 2/2 (full)
+#   App: writing 3rd log entry (will block -- buffer full)...
+#   Writer drained: [ERROR] connection timeout
+#   App: 3rd entry written (writer made room)
 ```
 
-## Step 3 -- Inspect with len() and cap()
+## Step 3 -- Monitoring the Buffer with len() and cap()
 
-`len(ch)` returns the number of values currently in the buffer. `cap(ch)` returns the total capacity. These are useful for diagnostics but should NOT be used for synchronization (the values can change between checking and acting).
+`len(ch)` returns the number of values currently in the buffer. `cap(ch)` returns the total capacity. These are useful for diagnostics (dashboards, metrics) but should NOT be used for synchronization -- the values change between checking and acting in concurrent code.
 
 ```go
 package main
@@ -114,23 +120,21 @@ package main
 import "fmt"
 
 func main() {
-    ch := make(chan string, 5)
-    fmt.Printf("Empty:      len=%d  cap=%d\n", len(ch), cap(ch))
+    logBuffer := make(chan string, 5)
+    fmt.Printf("Empty:       %d/%d\n", len(logBuffer), cap(logBuffer))
 
-    ch <- "a"
-    ch <- "b"
-    fmt.Printf("After 2:    len=%d  cap=%d\n", len(ch), cap(ch))
+    logBuffer <- "[INFO] startup"
+    logBuffer <- "[INFO] ready"
+    fmt.Printf("After 2:     %d/%d\n", len(logBuffer), cap(logBuffer))
 
-    <-ch
-    fmt.Printf("After recv: len=%d  cap=%d\n", len(ch), cap(ch))
+    <-logBuffer
+    fmt.Printf("After drain: %d/%d\n", len(logBuffer), cap(logBuffer))
 
-    ch <- "c"
-    ch <- "d"
-    ch <- "e"
-    fmt.Printf("After 3:    len=%d  cap=%d\n", len(ch), cap(ch))
-
-    ch <- "f"
-    fmt.Printf("Full:       len=%d  cap=%d\n", len(ch), cap(ch))
+    logBuffer <- "[WARN] high latency"
+    logBuffer <- "[ERROR] timeout"
+    logBuffer <- "[ERROR] retry"
+    logBuffer <- "[INFO] recovered"
+    fmt.Printf("After burst: %d/%d\n", len(logBuffer), cap(logBuffer))
 }
 ```
 
@@ -138,16 +142,15 @@ func main() {
 ```bash
 go run main.go
 # Expected:
-#   Empty:      len=0  cap=5
-#   After 2:    len=2  cap=5
-#   After recv: len=1  cap=5
-#   After 3:    len=4  cap=5
-#   Full:       len=5  cap=5
+#   Empty:       0/5
+#   After 2:     2/5
+#   After drain: 1/5
+#   After burst: 5/5
 ```
 
-## Step 4 -- Unbuffered vs Buffered Timing
+## Step 4 -- Unbuffered vs Buffered: The Timing Difference
 
-This comparison demonstrates the timing difference. With an unbuffered channel, the producer must wait for each receive. With a buffered channel, the producer sends all values instantly.
+This comparison demonstrates why buffered channels matter for logging. With an unbuffered channel, the application waits for each log write. With a buffered channel, the application writes all logs instantly and continues its work.
 
 ```go
 package main
@@ -158,55 +161,53 @@ import (
 )
 
 func main() {
-    // --- Unbuffered: producer waits for each receive ---
-    fmt.Println("Unbuffered (producer waits each time):")
-    unbuffered := make(chan int)
+    // --- Unbuffered: app blocks on every log call ---
+    fmt.Println("=== Unbuffered (app blocks each time) ===")
+    unbuffered := make(chan string)
     start := time.Now()
 
     go func() {
-        for i := 1; i <= 5; i++ {
-            unbuffered <- i
-            fmt.Printf("  Sent %d at +%v\n", i, time.Since(start).Round(time.Millisecond))
+        for i := 0; i < 5; i++ {
+            entry := <-unbuffered
+            _ = entry
+            time.Sleep(100 * time.Millisecond) // simulate disk write
         }
     }()
 
-    for i := 0; i < 5; i++ {
-        time.Sleep(100 * time.Millisecond)
-        <-unbuffered
+    for i := 1; i <= 5; i++ {
+        unbuffered <- fmt.Sprintf("[INFO] request %d", i)
+        fmt.Printf("  Logged request %d at +%v\n", i, time.Since(start).Round(time.Millisecond))
     }
-    fmt.Printf("Unbuffered total: %v\n\n", time.Since(start).Round(time.Millisecond))
+    fmt.Printf("  Total: %v (app was blocked by disk)\n\n", time.Since(start).Round(time.Millisecond))
 
-    // --- Buffered: producer sends all 5 almost instantly ---
-    fmt.Println("Buffered (cap=5, producer sends instantly):")
-    buffered := make(chan int, 5)
+    // --- Buffered: app fires all logs and moves on ---
+    fmt.Println("=== Buffered (cap=5, app writes instantly) ===")
+    buffered := make(chan string, 5)
     start = time.Now()
 
-    go func() {
-        for i := 1; i <= 5; i++ {
-            buffered <- i
-            fmt.Printf("  Sent %d at +%v\n", i, time.Since(start).Round(time.Millisecond))
-        }
-    }()
+    for i := 1; i <= 5; i++ {
+        buffered <- fmt.Sprintf("[INFO] request %d", i)
+        fmt.Printf("  Logged request %d at +%v\n", i, time.Since(start).Round(time.Millisecond))
+    }
+    fmt.Printf("  Total: %v (app continued immediately)\n", time.Since(start).Round(time.Millisecond))
 
-    time.Sleep(10 * time.Millisecond) // let producer fill buffer
-    for i := 0; i < 5; i++ {
-        time.Sleep(100 * time.Millisecond)
+    // Drain buffered entries (log writer catches up later).
+    for len(buffered) > 0 {
         <-buffered
     }
-    fmt.Printf("Buffered total: %v\n", time.Since(start).Round(time.Millisecond))
 }
 ```
 
 ### Verification
 ```bash
 go run main.go
-# The unbuffered sends are spaced ~100ms apart (waiting for consumer)
-# The buffered sends complete in <1ms (all 5 fit in buffer)
+# Unbuffered logs are spaced ~100ms apart (blocked by disk write)
+# Buffered logs complete in <1ms (all 5 fit in buffer)
 ```
 
-## Step 5 -- Producer-Consumer with Buffer Monitoring
+## Step 5 -- Full Logging Pipeline with Backpressure
 
-A realistic producer-consumer where the producer is 3x faster than the consumer. Watch the buffer fill up, block the producer, then drain as the consumer catches up.
+A realistic logging pipeline where the application generates log entries 3x faster than the writer can flush them. Watch the buffer fill up, block the fast producer, then drain as the writer catches up.
 
 ```go
 package main
@@ -217,73 +218,90 @@ import (
 )
 
 func main() {
-    ch := make(chan int, 3)
+    logBuffer := make(chan string, 3)
     done := make(chan struct{})
 
-    // Producer: fast (50ms per item)
+    // Application: generates logs every 50ms (fast).
     go func() {
-        for i := 1; i <= 10; i++ {
-            ch <- i
-            fmt.Printf("Produced: %2d | buffer: %d/%d\n", i, len(ch), cap(ch))
+        levels := []string{"INFO", "WARN", "ERROR", "DEBUG", "INFO",
+            "ERROR", "INFO", "WARN", "INFO", "INFO"}
+        for i, level := range levels {
+            entry := fmt.Sprintf("[%s] event-%d", level, i+1)
+            logBuffer <- entry
+            fmt.Printf("App queued:  %-25s | buffer: %d/%d\n",
+                entry, len(logBuffer), cap(logBuffer))
             time.Sleep(50 * time.Millisecond)
         }
-        close(ch)
+        close(logBuffer)
     }()
 
-    // Consumer: slow (150ms per item) -- buffer will fill up
+    // Writer: flushes to "disk" every 150ms (slow -- 3x slower).
     go func() {
-        for val := range ch {
-            fmt.Printf("Consumed: %2d | buffer: %d/%d\n", val, len(ch), cap(ch))
+        for entry := range logBuffer {
+            fmt.Printf("Writer flush: %-25s | buffer: %d/%d\n",
+                entry, len(logBuffer), cap(logBuffer))
             time.Sleep(150 * time.Millisecond)
         }
         done <- struct{}{}
     }()
 
     <-done
-    fmt.Println("All items processed")
+    fmt.Println("All log entries flushed")
 }
 ```
 
 ### Verification
 ```bash
 go run main.go
-# You'll see the buffer fill to 3/3, then the producer blocks until the consumer drains
+# You will see the buffer fill to 3/3, then the app blocks until the writer drains
 ```
+
+## Intermediate Verification
+
+Run the programs and confirm:
+1. Buffered sends succeed without a receiver (up to capacity)
+2. A full buffer blocks the sender until the consumer makes room
+3. The unbuffered version is significantly slower for the application than the buffered version
 
 ## Common Mistakes
 
-### Using Buffer Size as a Synchronization Mechanism
+### Using Buffer Size as a Replacement for Proper Design
 
 **Wrong:**
 ```go
 package main
 
 func main() {
-    ch := make(chan int, 100)
-    // "I'll just make the buffer big enough"
-    for i := 0; i < 200; i++ {
-        ch <- i // blocks at item 101!
+    ch := make(chan string, 10000)
+    // "I'll just make the buffer huge so it never fills"
+    for i := 0; i < 20000; i++ {
+        ch <- "log entry" // blocks at entry 10001!
     }
 }
 ```
 
-**What happens:** If you produce more than the buffer holds, you block. A large buffer hides the problem temporarily but doesn't solve it.
+**What happens:** If you produce more than the buffer holds, you block. A large buffer hides the problem temporarily but does not solve it. In production, the burst will eventually exceed your buffer and the application stalls anyway.
 
-**Fix:** Use appropriate buffer sizes based on your throughput needs, not as a replacement for proper synchronization.
+**Fix:** Size the buffer based on expected burst sizes and consumer throughput, not as a substitute for backpressure handling.
 
 ### Checking len() Before Sending
 
 **Wrong:**
 ```go
 // In concurrent code:
-if len(ch) < cap(ch) {
-    ch <- value // RACE: another goroutine might have filled it
+if len(logBuffer) < cap(logBuffer) {
+    logBuffer <- entry // RACE: another goroutine might have filled it
 }
 ```
 
 **What happens:** Between checking `len()` and sending, another goroutine might fill the buffer. The send still blocks.
 
 **Fix:** Just send. If you need non-blocking behavior, use `select` with a `default` case (covered in the select section).
+
+## Verify What You Learned
+1. What is the difference between `make(chan string)` and `make(chan string, 10)`?
+2. What happens when you send to a full buffered channel?
+3. When would you choose a buffered channel over an unbuffered one in a logging system?
 
 ## What's Next
 Continue to [04-channel-direction](../04-channel-direction/04-channel-direction.md) to learn how directional channel types enforce correct usage at compile time.
@@ -292,9 +310,10 @@ Continue to [04-channel-direction](../04-channel-direction/04-channel-direction.
 - `make(chan T, n)` creates a channel with buffer capacity `n`
 - Sends block only when the buffer is full; receives block only when empty
 - `len(ch)` returns current items in buffer; `cap(ch)` returns total capacity
-- Buffered channels decouple producer and consumer timing
-- Buffer size is not a synchronization mechanism -- choose it based on throughput needs
-- Unbuffered = synchronization point; Buffered = async queue
+- Buffered channels absorb bursts between fast producers and slow consumers
+- Backpressure (blocking when full) prevents unbounded memory growth
+- Buffer size is not a synchronization mechanism -- choose it based on burst size and throughput
+- Unbuffered = synchronization point; Buffered = async queue with backpressure
 
 ## Reference
 - [A Tour of Go: Buffered Channels](https://go.dev/tour/concurrency/3)

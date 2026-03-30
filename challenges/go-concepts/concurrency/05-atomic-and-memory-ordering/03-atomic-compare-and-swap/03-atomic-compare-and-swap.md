@@ -1,35 +1,33 @@
 ---
 difficulty: intermediate
-concepts: [CompareAndSwapInt64, CAS loop, optimistic concurrency, lock-free increment]
+concepts: [CompareAndSwapInt64, CAS loop, optimistic concurrency, lock-free, inventory reservation]
 tools: [go]
 estimated_time: 30m
 bloom_level: apply
-prerequisites: [goroutines, sync.WaitGroup, atomic.LoadInt64, atomic.StoreInt64]
 ---
 
 # 3. Atomic Compare-And-Swap
 
-
 ## Learning Objectives
 After completing this exercise, you will be able to:
-- **Explain** the compare-and-swap (CAS) operation and why it is the foundation of lock-free algorithms
-- **Implement** a CAS retry loop for lock-free increment
-- **Build** a lock-free max tracker and clamped-add using CAS
-- **Compare** CAS-based code with mutex-based code in terms of correctness and complexity
+- **Explain** compare-and-swap (CAS) and why it is the foundation of lock-free algorithms
+- **Implement** a CAS retry loop for lock-free inventory reservation
+- **Build** a ticket/seat reservation system where multiple goroutines compete for limited stock
+- **Compare** CAS (optimistic concurrency) with mutex (pessimistic locking) and explain the trade-offs
 
-## Why Compare-And-Swap
+## Why Compare-And-Swap for Inventory Reservation
 
-`atomic.AddInt64` works for simple addition, but what if you need a more complex read-modify-write? For example, updating a maximum value, conditionally setting a flag, or implementing a custom accumulator.
+Imagine a flash sale: 500 concert tickets go live, and 10,000 users hit the "Buy" button simultaneously. Each purchase must atomically check if tickets remain and decrement the count. If two requests both see "1 ticket left," both decrement, and the count goes to -1 -- you just oversold.
 
-Compare-And-Swap (CAS) is the universal atomic primitive. `CompareAndSwapInt64(&addr, old, new)` atomically checks if `*addr == old` and, if so, sets `*addr = new` and returns `true`. If `*addr != old`, it does nothing and returns `false`. The entire check-and-set is one indivisible operation.
+`atomic.AddInt64` cannot help because it does not check a condition before modifying. You need check-then-act as a single indivisible operation. That is exactly what Compare-And-Swap (CAS) provides.
 
-CAS is the building block of all lock-free data structures. Mutexes themselves are typically built on top of CAS. Understanding CAS gives you the ability to build custom atomic operations for cases where `Add` is not enough.
+`CompareAndSwapInt64(&addr, old, new)` atomically checks if `*addr == old`, and if so, sets `*addr = new` and returns `true`. If `*addr != old`, it does nothing and returns `false`. The entire operation is one indivisible CPU instruction.
 
-The trade-off: CAS-based code is harder to reason about than mutex-based code. A CAS may fail, requiring a retry loop. Under high contention, many goroutines may repeatedly fail and retry, wasting CPU. For most applications, mutexes are simpler and fast enough. CAS shines in performance-critical, low-contention scenarios.
+The CAS retry loop is the core pattern of optimistic concurrency: load the current value, compute the desired new value, attempt the swap. If another goroutine changed the value between your load and your swap, CAS fails and you retry. No locks, no blocking, no goroutine parking. Under low contention, most CAS attempts succeed on the first try. Under high contention, retries increase but the system never deadlocks.
 
-## Example 1 -- Lock-Free Increment with CAS
+## Step 1 -- The Overselling Bug Without CAS
 
-The CAS retry loop is the canonical pattern for building custom atomic operations:
+Multiple goroutines try to buy tickets using a naive check-then-decrement. The check and the decrement are separate operations, creating a race window:
 
 ```go
 package main
@@ -40,50 +38,105 @@ import (
 	"sync/atomic"
 )
 
-func casIncrement(addr *int64) {
-	for {
-		old := atomic.LoadInt64(addr)      // 1. load current value
-		next := old + 1                     // 2. compute new value
-		if atomic.CompareAndSwapInt64(addr, old, next) {
-			return // 3. CAS succeeded — we atomically changed old -> old+1
-		}
-		// 4. CAS failed — another goroutine changed the value.
-		//    Loop back, reload, try again.
-	}
-}
-
 func main() {
-	var counter int64
+	var tickets int64 = 100
+	var sold int64
+	var oversold int64
 	var wg sync.WaitGroup
 
-	for i := 0; i < 1000; i++ {
+	for i := 0; i < 500; i++ {
 		wg.Add(1)
-		go func() {
+		go func(buyerID int) {
 			defer wg.Done()
-			for j := 0; j < 1000; j++ {
-				casIncrement(&counter)
+			// BUG: check and decrement are separate operations
+			if tickets > 0 {
+				tickets--
+				atomic.AddInt64(&sold, 1)
 			}
-		}()
+		}(i)
 	}
 
 	wg.Wait()
-	fmt.Printf("Expected: 1000000\n")
-	fmt.Printf("Got:      %d\n", counter)
+	if tickets < 0 {
+		oversold = -tickets
+	}
+	fmt.Println("=== Ticket Sales (BROKEN - no CAS) ===")
+	fmt.Printf("Starting tickets: 100\n")
+	fmt.Printf("Sold:             %d\n", sold)
+	fmt.Printf("Remaining:        %d\n", tickets)
+	fmt.Printf("Oversold:         %d\n", oversold)
 }
 ```
 
 ### Verification
 ```bash
-go run main.go
+go run -race main.go
 ```
-The result is exactly 1,000,000. Run with `-race` to confirm no data races:
+The race detector reports `DATA RACE`. Run without `-race` multiple times: the ticket count may go negative, meaning you sold tickets that do not exist.
+
+## Step 2 -- Fix with CAS: Lock-Free Reservation
+
+Use `CompareAndSwapInt64` to atomically check-and-decrement. Each buyer loads the current stock, checks if positive, and attempts a CAS to decrement. If the CAS fails (another buyer got there first), retry:
+
+```go
+package main
+
+import (
+	"fmt"
+	"sync"
+	"sync/atomic"
+)
+
+func tryReserve(stock *int64, quantity int64) bool {
+	for {
+		current := atomic.LoadInt64(stock)
+		if current < quantity {
+			return false // not enough stock
+		}
+		newStock := current - quantity
+		if atomic.CompareAndSwapInt64(stock, current, newStock) {
+			return true // reserved successfully
+		}
+		// CAS failed: another goroutine modified stock. Retry.
+	}
+}
+
+func main() {
+	var tickets int64 = 100
+	var successCount atomic.Int64
+	var failCount atomic.Int64
+	var wg sync.WaitGroup
+
+	for i := 0; i < 500; i++ {
+		wg.Add(1)
+		go func(buyerID int) {
+			defer wg.Done()
+			if tryReserve(&tickets, 1) {
+				successCount.Add(1)
+			} else {
+				failCount.Add(1)
+			}
+		}(i)
+	}
+
+	wg.Wait()
+	fmt.Println("=== Ticket Sales (FIXED - CAS) ===")
+	fmt.Printf("Starting tickets:     100\n")
+	fmt.Printf("Successful purchases: %d\n", successCount.Load())
+	fmt.Printf("Rejected (sold out):  %d\n", failCount.Load())
+	fmt.Printf("Remaining stock:      %d\n", atomic.LoadInt64(&tickets))
+}
+```
+
+### Verification
 ```bash
 go run -race main.go
 ```
+Exactly 100 purchases succeed, 400 are rejected, remaining stock is 0. No overselling. No race warnings.
 
-## Example 2 -- Lock-Free Maximum Tracker
+## Step 3 -- Full Seat Reservation System with Multiple Event Sections
 
-CAS enables operations that `AddInt64` cannot express. Here, we atomically update a maximum value -- only writing if the new value is larger than the current one:
+Build a realistic event reservation system with multiple sections, each managed by a CAS-based counter. Buyers can request specific sections and quantities:
 
 ```go
 package main
@@ -95,37 +148,82 @@ import (
 	"sync/atomic"
 )
 
-func casUpdateMax(addr *int64, val int64) {
+type EventSection struct {
+	Name      string
+	stock     int64
+	reserved  atomic.Int64
+	rejected  atomic.Int64
+}
+
+func NewSection(name string, capacity int64) *EventSection {
+	return &EventSection{Name: name, stock: capacity}
+}
+
+func (s *EventSection) Reserve(quantity int64) bool {
 	for {
-		old := atomic.LoadInt64(addr)
-		if val <= old {
-			return // nothing to update — current max is >= val
+		current := atomic.LoadInt64(&s.stock)
+		if current < quantity {
+			s.rejected.Add(1)
+			return false
 		}
-		if atomic.CompareAndSwapInt64(addr, old, val) {
-			return // successfully updated the max
+		if atomic.CompareAndSwapInt64(&s.stock, current, current-quantity) {
+			s.reserved.Add(1)
+			return true
 		}
-		// CAS failed: another goroutine updated concurrently. Retry.
 	}
 }
 
-func main() {
-	var maxVal int64
-	var wg sync.WaitGroup
+func (s *EventSection) Available() int64 {
+	return atomic.LoadInt64(&s.stock)
+}
 
-	for i := 0; i < 100; i++ {
+func main() {
+	sections := []*EventSection{
+		NewSection("VIP Front Row", 20),
+		NewSection("Orchestra", 200),
+		NewSection("Balcony", 500),
+	}
+
+	var wg sync.WaitGroup
+	var totalReserved atomic.Int64
+	var totalRejected atomic.Int64
+
+	// 2000 buyers competing for seats
+	for i := 0; i < 2000; i++ {
 		wg.Add(1)
-		go func() {
+		go func(buyerID int) {
 			defer wg.Done()
-			for j := 0; j < 1000; j++ {
-				val := rand.Int63n(1_000_000)
-				casUpdateMax(&maxVal, val)
+
+			// Each buyer picks a random section and quantity (1-4 seats)
+			section := sections[rand.Intn(len(sections))]
+			quantity := int64(1 + rand.Intn(4))
+
+			if section.Reserve(quantity) {
+				totalReserved.Add(1)
+			} else {
+				totalRejected.Add(1)
 			}
-		}()
+		}(i)
 	}
 
 	wg.Wait()
-	fmt.Printf("Maximum (100k random samples from 0-999999): %d\n",
-		atomic.LoadInt64(&maxVal))
+
+	fmt.Println("=== Concert Seat Reservation Results ===")
+	fmt.Println()
+	for _, s := range sections {
+		fmt.Printf("  %-15s  remaining: %3d  reservations: %3d  rejected: %3d\n",
+			s.Name, s.Available(), s.reserved.Load(), s.rejected.Load())
+	}
+	fmt.Println()
+	fmt.Printf("Total reservations: %d\n", totalReserved.Load())
+	fmt.Printf("Total rejections:   %d\n", totalRejected.Load())
+
+	// Verify no section went negative
+	for _, s := range sections {
+		if s.Available() < 0 {
+			fmt.Printf("BUG: %s has negative stock: %d\n", s.Name, s.Available())
+		}
+	}
 }
 ```
 
@@ -133,147 +231,93 @@ func main() {
 ```bash
 go run -race main.go
 ```
-Expected: a value close to 999,999. With 100,000 random samples from [0, 999999), the maximum will be very high. No race warnings.
+No section ever goes negative. Total reservations + rejections = 2000. No race warnings.
 
-## Example 3 -- Compare with Mutex Approach
+## Step 4 -- Compare CAS vs Mutex: Pessimistic Locking
 
-The same max tracker using `sync.Mutex`. Structurally simpler but with locking overhead:
+The same reservation system using `sync.Mutex`. Compare the approaches structurally:
 
 ```go
 package main
 
 import (
 	"fmt"
-	"math/rand"
 	"sync"
+	"sync/atomic"
+	"time"
 )
 
+// CAS-based (optimistic)
+func reserveCAS(stock *int64, quantity int64) bool {
+	for {
+		current := atomic.LoadInt64(stock)
+		if current < quantity {
+			return false
+		}
+		if atomic.CompareAndSwapInt64(stock, current, current-quantity) {
+			return true
+		}
+	}
+}
+
+// Mutex-based (pessimistic)
+func reserveMutex(mu *sync.Mutex, stock *int64, quantity int64) bool {
+	mu.Lock()
+	defer mu.Unlock()
+	if *stock < quantity {
+		return false
+	}
+	*stock -= quantity
+	return true
+}
+
 func main() {
-	var maxVal int64
+	const buyers = 5000
+	const tickets int64 = 500
+
+	// Benchmark CAS approach
+	casStock := tickets
+	var casSuccess atomic.Int64
+	var wg sync.WaitGroup
+
+	start := time.Now()
+	for i := 0; i < buyers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if reserveCAS(&casStock, 1) {
+				casSuccess.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+	casTime := time.Since(start)
+
+	// Benchmark Mutex approach
+	mutexStock := tickets
 	var mu sync.Mutex
-	var wg sync.WaitGroup
+	var mutexSuccess atomic.Int64
 
-	for i := 0; i < 100; i++ {
+	start = time.Now()
+	for i := 0; i < buyers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for j := 0; j < 1000; j++ {
-				val := rand.Int63n(1_000_000)
-				mu.Lock()
-				if val > maxVal {
-					maxVal = val
-				}
-				mu.Unlock()
+			if reserveMutex(&mu, &mutexStock, 1) {
+				mutexSuccess.Add(1)
 			}
 		}()
 	}
-
 	wg.Wait()
-	fmt.Printf("Maximum (mutex): %d\n", maxVal)
-}
-```
+	mutexTime := time.Since(start)
 
-Both approaches are correct. The mutex version is arguably clearer: lock, check, update, unlock. The CAS version avoids locking overhead but introduces the retry loop. For a single int64, the performance difference is small. CAS wins when contention is very low; mutexes win when the critical section is longer or contention is high (blocked goroutines sleep instead of spinning).
-
-### Verification
-```bash
-go run -race main.go
-```
-Both versions produce similar maximums. Both pass `-race`.
-
-## Example 4 -- Clamped Add (Conditional Atomic Update)
-
-A real-world CAS pattern: atomically add a delta but reject the operation if the result would exceed a ceiling. This is used in rate limiters, connection pool limits, and resource quotas.
-
-```go
-package main
-
-import (
-	"fmt"
-	"sync"
-	"sync/atomic"
-)
-
-func casClampedAdd(addr *int64, delta int64, ceiling int64) bool {
-	for {
-		old := atomic.LoadInt64(addr)
-		next := old + delta
-		if next > ceiling {
-			return false // would exceed ceiling — reject
-		}
-		if atomic.CompareAndSwapInt64(addr, old, next) {
-			return true // applied successfully
-		}
-		// CAS failed — another goroutine modified the value. Retry.
-	}
-}
-
-func main() {
-	var counter int64
-	var wg sync.WaitGroup
-
-	// 100 goroutines x 100 attempts = 10,000 potential adds
-	// but ceiling is 1000, so most will be rejected
-	for i := 0; i < 100; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for j := 0; j < 100; j++ {
-				casClampedAdd(&counter, 1, 1000)
-			}
-		}()
-	}
-
-	wg.Wait()
-	result := atomic.LoadInt64(&counter)
-	fmt.Printf("Counter (ceiling 1000): %d\n", result)
-	if result <= 1000 {
-		fmt.Println("PASS: counter did not exceed ceiling")
-	} else {
-		fmt.Println("FAIL: counter exceeded ceiling!")
-	}
-}
-```
-
-### Verification
-```bash
-go run -race main.go
-```
-Expected: counter is exactly 1000 (all 1000 slots claimed, remaining 9000 attempts rejected). No race warnings.
-
-## Example 5 -- Lock-Free State Machine
-
-CAS naturally enforces valid state transitions. A transition from state A to state B only succeeds if the current state is exactly A:
-
-```go
-package main
-
-import (
-	"fmt"
-	"sync/atomic"
-)
-
-const (
-	stateIdle     int64 = 0
-	stateRunning  int64 = 1
-	stateStopping int64 = 2
-	stateStopped  int64 = 3
-)
-
-func transition(state *int64, from, to int64) bool {
-	return atomic.CompareAndSwapInt64(state, from, to)
-}
-
-func main() {
-	var state int64 // starts at stateIdle (0)
-
-	// Valid transitions: idle -> running -> stopping -> stopped
-	fmt.Println(transition(&state, stateIdle, stateRunning))     // true
-	fmt.Println(transition(&state, stateRunning, stateStopping))  // true
-	fmt.Println(transition(&state, stateStopping, stateStopped))  // true
-
-	// Invalid: cannot go from stopped back to running
-	fmt.Println(transition(&state, stateRunning, stateStopped))   // false
+	fmt.Println("=== CAS vs Mutex Reservation ===")
+	fmt.Printf("CAS:   sold=%d remaining=%d time=%v\n",
+		casSuccess.Load(), atomic.LoadInt64(&casStock), casTime)
+	fmt.Printf("Mutex: sold=%d remaining=%d time=%v\n",
+		mutexSuccess.Load(), mutexStock, mutexTime)
+	fmt.Printf("Ratio (Mutex/CAS): %.2fx\n",
+		float64(mutexTime)/float64(casTime))
 }
 ```
 
@@ -281,7 +325,15 @@ func main() {
 ```bash
 go run main.go
 ```
-Expected: `true`, `true`, `true`, `false`.
+Both approaches sell exactly 500 tickets with 0 remaining. CAS is typically faster for this simple check-and-decrement. Under higher contention with longer critical sections, mutex may win because it parks goroutines instead of spinning.
+
+## Intermediate Verification
+
+Run the race detector on Steps 2-4:
+```bash
+go run -race main.go
+```
+All should pass with zero warnings. Step 1 should show `DATA RACE`.
 
 ## Common Mistakes
 
@@ -291,73 +343,75 @@ Expected: `true`, `true`, `true`, `false`.
 ```go
 package main
 
-import (
-	"sync/atomic"
-)
+import "sync/atomic"
 
-func badIncrement(addr *int64) {
-	old := atomic.LoadInt64(addr) // loaded once
+func badReserve(stock *int64) bool {
+	current := atomic.LoadInt64(stock) // loaded once
 	for {
-		next := old + 1
-		if atomic.CompareAndSwapInt64(addr, old, next) {
-			return
+		if current <= 0 {
+			return false
 		}
-		// BUG: old is stale — we never reloaded it.
-		// Every subsequent CAS compares against the wrong value.
-		// This becomes an infinite loop under contention.
+		if atomic.CompareAndSwapInt64(stock, current, current-1) {
+			return true
+		}
+		// BUG: current is stale. Every subsequent CAS uses the wrong old value.
+		// Under contention, this becomes an infinite loop.
 	}
 }
 
 func main() {
-	var x int64
-	badIncrement(&x) // works once, infinite-loops under contention
+	var s int64 = 10
+	badReserve(&s) // works once, infinite-loops under contention
 }
 ```
 
-**Fix:** Reload `old` at the start of each loop iteration:
+**Fix:** Reload `current` at the start of each loop iteration:
 ```go
 for {
-    old := atomic.LoadInt64(addr)
-    if atomic.CompareAndSwapInt64(addr, old, old+1) {
-        return
-    }
+    current := atomic.LoadInt64(stock)
+    if current <= 0 { return false }
+    if atomic.CompareAndSwapInt64(stock, current, current-1) { return true }
 }
 ```
 
-### Using CAS Where Add Suffices
+### Using CAS Where AddInt64 Suffices
 
 **Wrong (not broken, but wasteful):**
 ```go
 func increment(addr *int64) {
     for {
         old := atomic.LoadInt64(addr)
-        if atomic.CompareAndSwapInt64(addr, old, old+1) {
-            return
-        }
+        if atomic.CompareAndSwapInt64(addr, old, old+1) { return }
     }
 }
 ```
 
-This works but is `atomic.AddInt64` with extra steps. More code, more CAS retries under contention, same result.
-
-**Fix:** Use `atomic.AddInt64(addr, 1)` for simple addition. Reserve CAS for operations that cannot be expressed as an add.
+This is `atomic.AddInt64` with extra steps: more code, more retries under contention, same result. Reserve CAS for operations that need a condition check before the update.
 
 ### Ignoring the ABA Problem
 
-The ABA problem: a value changes from A to B and back to A. A CAS checking for A succeeds even though the value was modified. For simple counters and maximums this is harmless, but for pointer-based lock-free data structures it can cause corruption. Go's `sync/atomic` does not provide tagged pointers or double-word CAS. If you encounter ABA concerns, use a mutex.
+The ABA problem: a value changes from A to B and back to A. A CAS checking for A succeeds even though the value was modified in between. For simple counters and inventory this is harmless (stock going from 5 to 4 to 5 is fine -- the final state is valid). For pointer-based lock-free data structures, ABA can cause corruption. Go does not provide tagged pointers or double-word CAS. If you encounter ABA concerns, use a mutex.
+
+## Verify What You Learned
+
+1. Why can't `atomic.AddInt64` solve the inventory reservation problem?
+2. What happens when a CAS fails? What should the goroutine do next?
+3. Under what contention levels does CAS outperform mutex? When does mutex win?
+4. In the retry loop, why is it critical to reload the current value inside the loop?
 
 ## What's Next
-Continue to [04-atomic-value-dynamic-config](../04-atomic-value-dynamic-config/04-atomic-value-dynamic-config.md) to learn how `atomic.Value` stores and loads arbitrary types -- enabling lock-free configuration hot-reload.
+Continue to [04-atomic-value-dynamic-config](../04-atomic-value-dynamic-config/04-atomic-value-dynamic-config.md) to build a hot-reloadable configuration system using `atomic.Value` for swapping entire config structs atomically.
 
 ## Summary
 - CAS (`CompareAndSwapInt64`) atomically checks and sets a value in one indivisible operation
-- The CAS loop pattern: load, compute, CAS, retry on failure
-- CAS enables custom atomic operations beyond simple add (max, min, conditional update, state transitions)
-- Always reload the current value inside the retry loop after a failed CAS
-- Use `atomic.AddInt64` when simple addition suffices; reserve CAS for complex operations
-- Mutex-based code is simpler and often fast enough; CAS shines in low-contention scenarios
+- The CAS retry loop: load current value, check condition, compute new value, attempt CAS, retry on failure
+- CAS is the right tool for "check-then-act" patterns like inventory reservation, rate limiting, and seat booking
+- Always reload the current value inside the retry loop -- stale values cause infinite loops under contention
+- CAS (optimistic) avoids lock overhead but retries under contention; mutex (pessimistic) blocks but parks goroutines efficiently
+- For simple addition, use `atomic.AddInt64`; reserve CAS for conditional operations that Add cannot express
+- CAS shines in low-to-medium contention; mutex wins when contention is very high or critical sections are long
 
 ## Reference
 - [atomic.CompareAndSwapInt64](https://pkg.go.dev/sync/atomic#CompareAndSwapInt64)
-- [Lock-Free Programming (Wikipedia)](https://en.wikipedia.org/wiki/Non-blocking_algorithm)
+- [Optimistic Concurrency Control (Wikipedia)](https://en.wikipedia.org/wiki/Optimistic_concurrency_control)
 - [ABA Problem (Wikipedia)](https://en.wikipedia.org/wiki/ABA_problem)

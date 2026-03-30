@@ -1,334 +1,566 @@
 ---
 difficulty: intermediate
-concepts: [errgroup.Group, sync.WaitGroup, error handling patterns, decision criteria]
+concepts: [errgroup pattern, sync.WaitGroup, error handling patterns, decision criteria, order processing, notifications]
 tools: [go]
 estimated_time: 25m
 bloom_level: analyze
-prerequisites: [errgroup basics, sync.WaitGroup, error handling, channels]
 ---
 
-# 5. Errgroup vs WaitGroup
-
+# 5. Errgroup vs WaitGroup -- Order Processing vs Notification Dispatch
 
 ## Learning Objectives
 After completing this exercise, you will be able to:
-- **Solve** the same concurrent problem with both WaitGroup and errgroup
-- **Compare** the code complexity, safety, and ergonomics of each approach
+- **Solve** the same concurrent problem with both WaitGroup and the errgroup pattern
+- **Compare** when failure should stop everything (errgroup) versus when individual failures should be tolerated (WaitGroup)
 - **Formulate** clear decision criteria for choosing between them
-- **Identify** scenarios where WaitGroup is more appropriate than errgroup
+- **Identify** real scenarios where WaitGroup is more appropriate than the errgroup pattern
 
 ## Why This Comparison Matters
 
-Developers who learn errgroup often ask: "Should I always use errgroup instead of WaitGroup?" The answer is no. Each tool has its sweet spot:
+Developers who learn the errgroup pattern often default to using it everywhere. But there are two fundamentally different concurrency models:
 
-- **errgroup**: When goroutines can fail and you need to propagate errors. The common case for I/O, network calls, and any fallible operation.
-- **WaitGroup**: When goroutines are fire-and-forget or when you need manual control over goroutine lifecycle.
+1. **All-or-nothing**: Processing a batch of orders where any invalid order should abort the entire batch (database transaction semantics). If order 3 out of 10 fails validation, you do not want to process orders 4-10 because the batch is already broken.
 
-By solving the same problem with both approaches, you develop an intuition for which tool fits naturally and where the other creates friction.
+2. **Best-effort**: Sending push notifications to 1000 users where one user's failed notification should not prevent the other 999 from receiving theirs. Each notification is independent.
 
-## Step 1 -- The Problem: Parallel File Processing
+Using the wrong model leads to real business impact: the errgroup pattern for notifications means one bad device token blocks all notifications. WaitGroup for batch orders means partial processing with inconsistent state.
 
-Process 5 files concurrently. Some succeed, some fail. Report a summary of successes and the first error.
+## Step 1 -- All-or-Nothing: Batch Order Processing (Errgroup Pattern)
 
-```bash
-go mod tidy
-go run main.go
-```
-
-## Step 2 -- WaitGroup Solution (Manual Error Handling)
-
-The WaitGroup approach requires four primitives wired together:
+A payment processor validates and charges a batch of orders. If any order fails validation (insufficient funds, expired card, fraud flag), the entire batch must be aborted because the accounting system expects atomic batches:
 
 ```go
 package main
 
 import (
-    "fmt"
-    "math/rand"
-    "sync"
-    "time"
+	"context"
+	"fmt"
+	"sync"
+	"time"
 )
 
-func main() {
-    files := []string{"config.yaml", "data.csv", "CORRUPT", "readme.md", "MISSING"}
-
-    var wg sync.WaitGroup
-    var mu sync.Mutex
-    var firstErr error
-    successCount := 0
-
-    for _, file := range files {
-        file := file
-        wg.Add(1)
-        go func() {
-            defer wg.Done()
-            if err := processFile(file); err != nil {
-                mu.Lock()
-                if firstErr == nil {
-                    firstErr = err
-                }
-                mu.Unlock()
-                return
-            }
-            mu.Lock()
-            successCount++
-            mu.Unlock()
-        }()
-    }
-
-    wg.Wait()
-
-    fmt.Printf("Processed: %d/%d succeeded\n", successCount, len(files))
-    if firstErr != nil {
-        fmt.Printf("First error: %v\n", firstErr)
-    }
+type Order struct {
+	ID       int
+	Customer string
+	Amount   float64
+	Status   string
 }
 
-func processFile(name string) error {
-    time.Sleep(time.Duration(50+rand.Intn(100)) * time.Millisecond)
-    switch name {
-    case "CORRUPT":
-        return fmt.Errorf("file %q is corrupted", name)
-    case "MISSING":
-        return fmt.Errorf("file %q not found", name)
-    default:
-        fmt.Printf("  Processed: %s\n", name)
-        return nil
-    }
+func main() {
+	fmt.Println("=== Batch Order Processing (all-or-nothing) ===")
+
+	orders := []Order{
+		{ID: 1001, Customer: "alice", Amount: 99.99},
+		{ID: 1002, Customer: "bob", Amount: 249.50},
+		{ID: 1003, Customer: "charlie", Amount: -50.00}, // INVALID: negative amount
+		{ID: 1004, Customer: "diana", Amount: 175.00},
+		{ID: 1005, Customer: "eve", Amount: 89.99},
+	}
+
+	fmt.Println("\n--- Processing batch (errgroup pattern) ---")
+	start := time.Now()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var wg sync.WaitGroup
+	var once sync.Once
+	var firstErr error
+
+	results := make([]string, len(orders))
+
+	for i, order := range orders {
+		i, order := i, order
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
+			// Check if another order already failed
+			select {
+			case <-ctx.Done():
+				results[i] = "cancelled"
+				return
+			default:
+			}
+
+			if err := validateAndCharge(ctx, order); err != nil {
+				once.Do(func() {
+					firstErr = err
+					cancel() // STOP: abort the entire batch
+				})
+				results[i] = "failed"
+				return
+			}
+			results[i] = "charged"
+		}()
+	}
+
+	wg.Wait()
+	elapsed := time.Since(start).Round(time.Millisecond)
+
+	fmt.Printf("\nBatch results (in %v):\n", elapsed)
+	for i, order := range orders {
+		fmt.Printf("  Order %d (%s, $%.2f): %s\n", order.ID, order.Customer, order.Amount, results[i])
+	}
+
+	if firstErr != nil {
+		fmt.Printf("\nBATCH ABORTED: %v\n", firstErr)
+		fmt.Println("Action: Roll back all charged orders, notify accounting")
+	} else {
+		fmt.Println("\nBatch completed successfully")
+	}
+}
+
+func validateAndCharge(ctx context.Context, order Order) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(time.Duration(30+order.ID%5*20) * time.Millisecond):
+	}
+
+	if order.Amount <= 0 {
+		return fmt.Errorf("order %d: invalid amount $%.2f (must be positive)", order.ID, order.Amount)
+	}
+	if order.Amount > 10_000 {
+		return fmt.Errorf("order %d: amount $%.2f exceeds batch limit", order.ID, order.Amount)
+	}
+
+	fmt.Printf("  Charged order %d: $%.2f from %s\n", order.ID, order.Amount, order.Customer)
+	return nil
 }
 ```
 
 **Expected output:**
 ```
-  Processed: config.yaml
-  Processed: data.csv
-  Processed: readme.md
-Processed: 3/5 succeeded
-First error: file "CORRUPT" is corrupted
+=== Batch Order Processing (all-or-nothing) ===
+
+--- Processing batch (errgroup pattern) ---
+  Charged order 1001: $99.99 from alice
+  Charged order 1002: $249.50 from bob
+
+Batch results (in ~90ms):
+  Order 1001 (alice, $99.99): charged
+  Order 1002 (bob, $249.50): charged
+  Order 1003 (charlie, $-50.00): failed
+  Order 1004 (diana, $175.00): cancelled
+  Order 1005 (eve, $89.99): cancelled
+
+BATCH ABORTED: order 1003: invalid amount $-50.00 (must be positive)
+Action: Roll back all charged orders, notify accounting
 ```
 
-Five interleaved concerns: WaitGroup (Add, Done, Wait), mutex (Lock, Unlock x2), error variable (check-then-set), success counter (increment). Easy to forget Add before the goroutine, forget Done with defer, or forget to lock the mutex.
+Order 1003 fails validation, which cancels the context. Orders 1004 and 1005 see the cancelled context and stop immediately. The batch is aborted as a unit. This is the correct behavior for financial transactions.
 
-## Step 3 -- Errgroup Solution (Built-in Error Handling)
+## Step 2 -- Best-Effort: Notification Dispatch (WaitGroup)
 
-The same problem with errgroup -- no WaitGroup, no mutex for errors:
+A notification system sends push notifications to all users. One user's expired device token must NOT prevent other users from receiving their notifications. Each notification is independent:
 
 ```go
 package main
 
 import (
-    "fmt"
-    "math/rand"
-    "time"
-
-    "golang.org/x/sync/errgroup"
+	"fmt"
+	"sync"
+	"time"
 )
 
-func main() {
-    files := []string{"config.yaml", "data.csv", "CORRUPT", "readme.md", "MISSING"}
-    results := make([]bool, len(files))
-
-    var g errgroup.Group
-    for i, file := range files {
-        i, file := i, file
-        g.Go(func() error {
-            if err := processFile(file); err != nil {
-                return err
-            }
-            results[i] = true
-            return nil
-        })
-    }
-
-    err := g.Wait()
-
-    successCount := 0
-    for _, ok := range results {
-        if ok {
-            successCount++
-        }
-    }
-
-    fmt.Printf("Processed: %d/%d succeeded\n", successCount, len(files))
-    if err != nil {
-        fmt.Printf("First error: %v\n", err)
-    }
+type Notification struct {
+	UserID  string
+	Message string
 }
 
-func processFile(name string) error {
-    time.Sleep(time.Duration(50+rand.Intn(100)) * time.Millisecond)
-    switch name {
-    case "CORRUPT":
-        return fmt.Errorf("file %q is corrupted", name)
-    case "MISSING":
-        return fmt.Errorf("file %q not found", name)
-    default:
-        fmt.Printf("  Processed: %s\n", name)
-        return nil
-    }
+type SendResult struct {
+	UserID string
+	OK     bool
+	Error  string
+}
+
+func main() {
+	fmt.Println("=== Notification Dispatch (best-effort) ===")
+
+	notifications := []Notification{
+		{"user-001", "Your order shipped!"},
+		{"user-002", "Your order shipped!"},
+		{"user-003", "Your order shipped!"}, // this user has an expired token
+		{"user-004", "Your order shipped!"},
+		{"user-005", "Your order shipped!"},
+		{"user-006", "Your order shipped!"},
+		{"user-007", "Your order shipped!"}, // this user has no device registered
+		{"user-008", "Your order shipped!"},
+	}
+
+	fmt.Printf("\n--- Sending %d notifications (WaitGroup, best-effort) ---\n", len(notifications))
+	start := time.Now()
+
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var sendResults []SendResult
+
+	for _, notif := range notifications {
+		notif := notif
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
+			err := sendPushNotification(notif)
+			result := SendResult{UserID: notif.UserID, OK: err == nil}
+			if err != nil {
+				result.Error = err.Error()
+				// Log the error but DO NOT stop other notifications
+				fmt.Printf("  WARN: %s: %v\n", notif.UserID, err)
+			}
+
+			mu.Lock()
+			sendResults = append(sendResults, result)
+			mu.Unlock()
+		}()
+	}
+
+	wg.Wait()
+	elapsed := time.Since(start).Round(time.Millisecond)
+
+	succeeded := 0
+	failed := 0
+	for _, r := range sendResults {
+		if r.OK {
+			succeeded++
+		} else {
+			failed++
+		}
+	}
+
+	fmt.Printf("\nNotification results (in %v):\n", elapsed)
+	fmt.Printf("  Sent: %d/%d, Failed: %d/%d\n", succeeded, len(notifications), failed, len(notifications))
+	if failed > 0 {
+		fmt.Println("  Action: Queue failed notifications for retry via different channel (email, SMS)")
+	}
+}
+
+func sendPushNotification(n Notification) error {
+	time.Sleep(50 * time.Millisecond) // simulate network call
+
+	switch n.UserID {
+	case "user-003":
+		return fmt.Errorf("expired device token")
+	case "user-007":
+		return fmt.Errorf("no device registered")
+	default:
+		fmt.Printf("  Sent to %s: %s\n", n.UserID, n.Message)
+		return nil
+	}
 }
 ```
 
 **Expected output:**
 ```
-  Processed: config.yaml
-  Processed: data.csv
-  Processed: readme.md
-Processed: 3/5 succeeded
-First error: file "CORRUPT" is corrupted
+=== Notification Dispatch (best-effort) ===
+
+--- Sending 8 notifications (WaitGroup, best-effort) ---
+  Sent to user-001: Your order shipped!
+  Sent to user-002: Your order shipped!
+  WARN: user-003: expired device token
+  Sent to user-004: Your order shipped!
+  Sent to user-005: Your order shipped!
+  Sent to user-006: Your order shipped!
+  WARN: user-007: no device registered
+  Sent to user-008: Your order shipped!
+
+Notification results (in 50ms):
+  Sent: 6/8, Failed: 2/8
+  Action: Queue failed notifications for retry via different channel (email, SMS)
 ```
 
-Same result, but: no Add/Done, no mutex for error collection (errgroup handles it), and success tracking uses the index-based pattern (no mutex needed for that either).
+Two notifications failed, but the other 6 were delivered successfully. Using the errgroup pattern here would have been wrong: user-003's expired token would have cancelled all remaining notifications, leaving users 4-8 without their shipping update.
 
-## Step 4 -- When WaitGroup Wins
+## Step 3 -- Side-by-Side Comparison
 
-Fire-and-forget work where errors are meaningless:
+Both patterns in one program to see the difference clearly:
 
 ```go
 package main
 
 import (
-    "fmt"
-    "sync"
-    "time"
+	"context"
+	"fmt"
+	"sync"
+	"time"
 )
 
 func main() {
-    var wg sync.WaitGroup
+	items := []string{"item-1", "item-2", "INVALID", "item-4", "item-5"}
 
-    for i := 0; i < 5; i++ {
-        i := i
-        wg.Add(1)
-        go func() {
-            defer wg.Done()
-            time.Sleep(time.Duration(i*30) * time.Millisecond)
-            fmt.Printf("  Worker %d: sent notification\n", i)
-        }()
-    }
+	fmt.Println("=== Errgroup Pattern: stops on first error ===")
+	errgroupProcess(items)
 
-    wg.Wait()
-    fmt.Println("All 5 notifications sent")
+	fmt.Println("\n=== WaitGroup Pattern: continues despite errors ===")
+	waitgroupProcess(items)
+}
+
+func errgroupProcess(items []string) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var wg sync.WaitGroup
+	var once sync.Once
+	var firstErr error
+
+	processed := 0
+	var mu sync.Mutex
+
+	for _, item := range items {
+		item := item
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			select {
+			case <-ctx.Done():
+				fmt.Printf("  %s: SKIPPED (cancelled)\n", item)
+				return
+			default:
+			}
+			if err := processItem(item); err != nil {
+				once.Do(func() {
+					firstErr = err
+					cancel()
+				})
+				fmt.Printf("  %s: FAILED\n", item)
+				return
+			}
+			mu.Lock()
+			processed++
+			mu.Unlock()
+			fmt.Printf("  %s: OK\n", item)
+		}()
+	}
+
+	wg.Wait()
+	fmt.Printf("  Result: processed=%d, error=%v\n", processed, firstErr)
+}
+
+func waitgroupProcess(items []string) {
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	processed := 0
+	var errors []string
+
+	for _, item := range items {
+		item := item
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := processItem(item); err != nil {
+				mu.Lock()
+				errors = append(errors, err.Error())
+				mu.Unlock()
+				fmt.Printf("  %s: FAILED (logged, continuing)\n", item)
+				return
+			}
+			mu.Lock()
+			processed++
+			mu.Unlock()
+			fmt.Printf("  %s: OK\n", item)
+		}()
+	}
+
+	wg.Wait()
+	fmt.Printf("  Result: processed=%d, errors=%d (%v)\n", processed, len(errors), errors)
+}
+
+func processItem(item string) error {
+	time.Sleep(50 * time.Millisecond)
+	if item == "INVALID" {
+		return fmt.Errorf("%s: validation failed", item)
+	}
+	return nil
 }
 ```
 
 **Expected output:**
 ```
-  Worker 0: sent notification
-  Worker 1: sent notification
-  Worker 2: sent notification
-  Worker 3: sent notification
-  Worker 4: sent notification
-All 5 notifications sent
+=== Errgroup Pattern: stops on first error ===
+  item-1: OK
+  item-2: OK
+  INVALID: FAILED
+  item-4: SKIPPED (cancelled)
+  item-5: SKIPPED (cancelled)
+  Result: processed=2, error=INVALID: validation failed
+
+=== WaitGroup Pattern: continues despite errors ===
+  item-1: OK
+  item-2: OK
+  INVALID: FAILED (logged, continuing)
+  item-4: OK
+  item-5: OK
+  Result: processed=4, errors=1 ([INVALID: validation failed])
 ```
 
-Using errgroup here would force every closure to return `nil` -- noise with no benefit. WaitGroup is the natural fit for infallible side-effects: logging, metrics emission, best-effort notifications.
+Same input, different behavior. The errgroup pattern processed 2 items and stopped. The WaitGroup pattern processed 4 items and logged the error.
 
-## Step 5 -- Both Tools in One Program
+## Step 4 -- Both Patterns in One System
 
-In real programs, fallible and infallible work coexist. Use each tool where it fits:
+Real systems use both patterns together. A deployment pipeline validates configs (all-or-nothing) and then sends deploy notifications (best-effort):
 
 ```go
 package main
 
 import (
-    "fmt"
-    "math/rand"
-    "sync"
-    "time"
-
-    "golang.org/x/sync/errgroup"
+	"context"
+	"fmt"
+	"sync"
+	"time"
 )
 
 func main() {
-    // Fallible: errgroup for HTTP fetches
-    var g errgroup.Group
-    urls := []string{"https://api.example.com/users", "https://api.example.com/orders", "https://api.example.com/BROKEN"}
-    for _, url := range urls {
-        url := url
-        g.Go(func() error {
-            time.Sleep(time.Duration(50+rand.Intn(50)) * time.Millisecond)
-            if url == "https://api.example.com/BROKEN" {
-                return fmt.Errorf("fetch %s: 500", url)
-            }
-            fmt.Printf("  Fetched: %s\n", url)
-            return nil
-        })
-    }
+	fmt.Println("=== Deployment Pipeline ===")
 
-    // Infallible: WaitGroup for background logging
-    var wg sync.WaitGroup
-    for i := 0; i < 3; i++ {
-        i := i
-        wg.Add(1)
-        go func() {
-            defer wg.Done()
-            time.Sleep(time.Duration(30+i*20) * time.Millisecond)
-            fmt.Printf("  Logger %d: wrote audit log\n", i)
-        }()
-    }
+	configs := []string{"api-gateway.yaml", "auth-service.yaml", "payment-service.yaml"}
+	recipients := []string{"#deploys", "ops-team@company.com", "pagerduty-webhook"}
 
-    if err := g.Wait(); err != nil {
-        fmt.Printf("Fetch error: %v\n", err)
-    }
-    wg.Wait()
-    fmt.Println("Background logging complete")
+	// Phase 1: Validate configs (all-or-nothing, errgroup pattern)
+	fmt.Println("\n--- Phase 1: Config Validation (all-or-nothing) ---")
+	if err := validateConfigs(configs); err != nil {
+		fmt.Printf("DEPLOY ABORTED: %v\n", err)
+		return
+	}
+	fmt.Println("All configs valid -- proceeding to deploy")
+
+	// Phase 2: Notify stakeholders (best-effort, WaitGroup)
+	fmt.Println("\n--- Phase 2: Deploy Notifications (best-effort) ---")
+	notifyAll(recipients)
+	fmt.Println("\nDeployment complete")
+}
+
+func validateConfigs(configs []string) error {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var wg sync.WaitGroup
+	var once sync.Once
+	var firstErr error
+
+	for _, cfg := range configs {
+		cfg := cfg
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+			time.Sleep(60 * time.Millisecond)
+			fmt.Printf("  Validated: %s\n", cfg)
+		}()
+	}
+
+	wg.Wait()
+	_ = once
+	return firstErr
+}
+
+func notifyAll(recipients []string) {
+	var wg sync.WaitGroup
+
+	for _, r := range recipients {
+		r := r
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			time.Sleep(40 * time.Millisecond)
+			if r == "pagerduty-webhook" {
+				fmt.Printf("  WARN: failed to notify %s (timeout)\n", r)
+				return
+			}
+			fmt.Printf("  Notified: %s\n", r)
+		}()
+	}
+
+	wg.Wait()
 }
 ```
 
 **Expected output:**
 ```
-  Fetched: https://api.example.com/users
-  Fetched: https://api.example.com/orders
-  Logger 0: wrote audit log
-  Logger 1: wrote audit log
-Fetch error: fetch https://api.example.com/BROKEN: 500
-  Logger 2: wrote audit log
-Background logging complete
+=== Deployment Pipeline ===
+
+--- Phase 1: Config Validation (all-or-nothing) ---
+  Validated: api-gateway.yaml
+  Validated: auth-service.yaml
+  Validated: payment-service.yaml
+All configs valid -- proceeding to deploy
+
+--- Phase 2: Deploy Notifications (best-effort) ---
+  Notified: #deploys
+  Notified: ops-team@company.com
+  WARN: failed to notify pagerduty-webhook (timeout)
+
+Deployment complete
 ```
+
+Phase 1 uses the errgroup pattern because a broken config should block deployment. Phase 2 uses WaitGroup because a failed Slack notification should not block the deploy.
 
 ## Decision Table
 
-| Criterion | sync.WaitGroup | errgroup.Group |
-|-----------|---------------|----------------|
-| Error propagation | Manual (mutex + variable) | Built-in (Wait returns first error) |
-| Cancellation | Manual (context + plumbing) | Built-in with WithContext |
-| Concurrency limit | Manual (semaphore channel) | Built-in with SetLimit |
-| Add/Done tracking | Manual (easy to misuse) | Automatic (Go handles it) |
+| Criterion | sync.WaitGroup | Errgroup Pattern |
+|-----------|---------------|------------------|
+| Error propagation | Manual (you log/collect errors) | Built-in (first error returned) |
+| Sibling cancellation | Not built-in | Via context.WithCancel |
+| Concurrency limit | Manual (semaphore channel) | Manual (semaphore) or errgroup.SetLimit |
+| Add/Done tracking | Manual (easy to misuse) | Manual, or automatic with errgroup.Go |
 | Fire-and-forget | Natural fit | Unnecessary overhead |
-| Best for | Infallible goroutines | Fallible goroutines |
+| **Best for** | **Independent tasks, best-effort** | **Dependent tasks, all-or-nothing** |
 
-**Rule of thumb:** If the goroutine can return an error, use errgroup. If it cannot, use WaitGroup.
+**Rule of thumb:**
+- If one goroutine's failure means the whole operation is invalid: **errgroup pattern**
+- If each goroutine's success/failure is independent: **WaitGroup with error logging**
+
+## Intermediate Verification
+
+At this point, verify:
+1. The errgroup pattern stops processing when INVALID is encountered
+2. The WaitGroup pattern processes all items despite the INVALID one
+3. Both patterns coexist naturally in the deployment pipeline
+4. The decision table matches the behavior you observed
 
 ## Common Mistakes
 
-### Using WaitGroup when tasks can fail
+### Using errgroup pattern when tasks are independent
 
 **Wrong:**
 ```go
-var wg sync.WaitGroup
-wg.Add(1)
-go func() {
-    defer wg.Done()
-    if err := riskyOperation(); err != nil {
-        log.Println(err) // logged and forgotten
-    }
-}()
-wg.Wait()
-// caller has no idea if riskyOperation failed
+// Sending notifications with errgroup pattern -- one failure stops all
+ctx, cancel := context.WithCancel(context.Background())
+defer cancel()
+// ... errgroup pattern for notifications
+// Result: user-003's expired token blocks notifications to users 4-8
 ```
 
-**What happens:** Errors are silently swallowed. The caller proceeds as if everything succeeded.
+**Business impact:** Thousands of users miss their notifications because one device token expired.
 
-**Fix:** Use errgroup:
+**Fix:** Use WaitGroup for independent, best-effort work.
+
+### Using WaitGroup when task failure should stop the batch
+
+**Wrong:**
 ```go
-var g errgroup.Group
-g.Go(func() error {
-    return riskyOperation()
-})
-if err := g.Wait(); err != nil {
-    // caller can handle the error properly
+// Processing orders with WaitGroup -- failures are logged and ignored
+var wg sync.WaitGroup
+for _, order := range orders {
+    wg.Add(1)
+    go func() {
+        defer wg.Done()
+        if err := processOrder(order); err != nil {
+            log.Println(err) // logged but batch continues
+        }
+    }()
 }
+wg.Wait()
+// Result: 7 of 10 orders processed, 3 failed silently, accounting is now inconsistent
 ```
+
+**Business impact:** Partial batch processing leads to inconsistent state in the accounting system.
+
+**Fix:** Use the errgroup pattern with context cancellation for atomic batch operations.
 
 ### Forgetting wg.Add before launching the goroutine
 
@@ -341,43 +573,33 @@ go func() {
 wg.Wait() // might return before Add is called
 ```
 
-**What happens:** `Wait()` can return before the goroutine even calls `Add(1)`. Errgroup avoids this entirely because `g.Go()` handles both launching and tracking atomically.
-
-### Wrapping infallible work in errgroup
-
-**Not wrong, but noisy:**
-```go
-g.Go(func() error {
-    log.Println("sent metric")
-    return nil // always nil -- errgroup adds nothing here
-})
-```
-
-**Better:** Use WaitGroup for fire-and-forget work. Reserve errgroup for fallible operations.
+**What happens:** `Wait()` can return before the goroutine calls `Add(1)`. The goroutine runs without being tracked. The errgroup pattern avoids this because `g.Go()` handles both launching and tracking atomically.
 
 ## Verify What You Learned
 
 Run the full program and confirm:
-1. WaitGroup and errgroup solutions produce equivalent results for the same problem
-2. WaitGroup requires more boilerplate for error handling
-3. WaitGroup is cleaner for fire-and-forget work
-4. Both tools coexist naturally in the same program
+1. Errgroup pattern aborts the batch when one order fails
+2. WaitGroup sends all notifications despite individual failures
+3. The side-by-side comparison shows different item counts processed
+4. The deployment pipeline uses both patterns appropriately
 
 ```bash
 go run main.go
 ```
 
 ## What's Next
-Continue to [06-errgroup-parallel-pipeline](../06-errgroup-parallel-pipeline/06-errgroup-parallel-pipeline.md) for a comprehensive exercise building a multi-stage parallel pipeline with errgroup.
+Continue to [06-errgroup-parallel-pipeline](../06-errgroup-parallel-pipeline/06-errgroup-parallel-pipeline.md) for a comprehensive exercise building a multi-stage data processing pipeline with coordinated shutdown.
 
 ## Summary
-- Use **errgroup** when goroutines can fail and errors matter
-- Use **WaitGroup** for fire-and-forget goroutines with no meaningful errors
-- Errgroup eliminates the WaitGroup + mutex + error channel boilerplate
+- **Errgroup pattern** (WaitGroup + Once + cancel): use when goroutines can fail and one failure should stop everything
+- **WaitGroup alone**: use for fire-and-forget or best-effort goroutines where individual failures are tolerable
+- The errgroup pattern eliminates the WaitGroup + mutex + error channel boilerplate
 - Both can coexist in the same program -- use each where it fits
-- The rule of thumb: if the goroutine returns `error`, use errgroup
+- Rule of thumb: if one failure invalidates the whole operation, use errgroup; if tasks are independent, use WaitGroup
+- `golang.org/x/sync/errgroup` provides the errgroup pattern as a ready-made package
 
 ## Reference
 - [sync.WaitGroup documentation](https://pkg.go.dev/sync#WaitGroup)
+- [sync.Once documentation](https://pkg.go.dev/sync#Once)
 - [errgroup package documentation](https://pkg.go.dev/golang.org/x/sync/errgroup)
 - [Go Proverbs: Don't just check errors, handle them gracefully](https://go-proverbs.github.io/)

@@ -4,11 +4,9 @@ concepts: [select, timeout, time.After, time.NewTimer, timer-cleanup]
 tools: [go]
 estimated_time: 25m
 bloom_level: apply
-prerequisites: [select-basics, select-with-default, channels, goroutines]
 ---
 
 # 3. Select with Timeout
-
 
 ## Learning Objectives
 - **Implement** a timeout on a channel operation using `time.After`
@@ -17,15 +15,15 @@ prerequisites: [select-basics, select-with-default, channels, goroutines]
 
 ## Why Timeouts
 
-Blocking forever on a channel is rarely acceptable in production systems. Network calls fail, downstream services hang, and goroutines can deadlock. Timeouts provide a safety valve: if the expected event does not happen within a deadline, the program recovers gracefully instead of hanging indefinitely.
+Blocking forever on a channel is rarely acceptable in production systems. When your service calls a downstream API, that API might hang, the network might stall, or the service might be overloaded. Without a timeout, your goroutine blocks indefinitely, holding resources, filling up connection pools, and eventually cascading failures upstream.
 
-Go does not have a built-in timeout keyword. Instead, it composes timeouts from two primitives: `time.After` (which returns a channel that receives after a delay) and `select` (which can listen on that channel alongside the main work channel). This composability is elegant but has a subtle trap: `time.After` allocates a timer that is not garbage collected until it fires. In a loop, this creates a leak.
+Go does not have a built-in timeout keyword. Instead, it composes timeouts from two primitives: `time.After` (which returns a channel that receives after a delay) and `select` (which can listen on that channel alongside the work channel). This composability is elegant but has a subtle trap: `time.After` allocates a timer that is not garbage collected until it fires. In a loop, this creates a leak.
 
 The `time.NewTimer` type offers explicit control. You can stop it, reset it, and drain it. In any code path where timeouts happen repeatedly, `time.NewTimer` is the safe choice.
 
-## Example 1 -- Basic Timeout with time.After
+## Step 1 -- Basic Request Timeout with time.After
 
-Use `time.After` inside a `select` to set a deadline on a channel receive.
+Simulate an HTTP-style client that makes a request to a downstream service and gives up after a deadline. The downstream service is slow (2 seconds), but our timeout is 500ms.
 
 ```go
 package main
@@ -36,36 +34,37 @@ import (
 )
 
 func main() {
-	result := make(chan string)
+	response := make(chan string)
 
+	// Simulate a slow downstream service.
 	go func() {
-		time.Sleep(2 * time.Second) // Simulate slow work
-		result <- "done"
+		time.Sleep(2 * time.Second)
+		response <- `{"status": "ok", "data": [1, 2, 3]}`
 	}()
 
 	select {
-	case res := <-result:
-		fmt.Println("result:", res)
+	case body := <-response:
+		fmt.Println("response:", body)
 	case <-time.After(500 * time.Millisecond):
-		fmt.Println("timeout: operation took too long")
+		fmt.Println("timeout: downstream service did not respond within 500ms")
 	}
 }
 ```
 
-`time.After(500ms)` returns a `<-chan time.Time` that receives a value after 500ms. The goroutine takes 2 seconds, so the timeout case wins.
+`time.After(500ms)` returns a `<-chan time.Time` that receives a value after 500ms. The goroutine takes 2 seconds, so the timeout case wins. Without this timeout, the goroutine would block for the full 2 seconds -- and in production, potentially forever.
 
 ### Verification
 ```
-timeout: operation took too long
+timeout: downstream service did not respond within 500ms
 ```
 Change the goroutine sleep to 100ms and run again:
 ```
-result: done
+response: {"status": "ok", "data": [1, 2, 3]}
 ```
 
-## Example 2 -- Successful Result Before Timeout
+## Step 2 -- Fast Response Beats the Timeout
 
-When work finishes before the deadline, the result case is selected. The timer from `time.After` still exists in memory until it fires, but for one-shot operations this is acceptable.
+When the downstream service responds quickly, the response case is selected. The timer from `time.After` still exists in memory until it fires, but for one-shot operations this overhead is negligible.
 
 ```go
 package main
@@ -76,30 +75,72 @@ import (
 )
 
 func main() {
-	result := make(chan string)
+	response := make(chan string)
 
+	// Fast downstream service.
 	go func() {
 		time.Sleep(50 * time.Millisecond)
-		result <- "fast computation done"
+		response <- `{"user": "alice", "role": "admin"}`
 	}()
 
 	select {
-	case res := <-result:
-		fmt.Println("result:", res)
+	case body := <-response:
+		fmt.Println("success:", body)
 	case <-time.After(500 * time.Millisecond):
-		fmt.Println("timeout: too slow")
+		fmt.Println("timeout: service too slow")
 	}
 }
 ```
 
 ### Verification
 ```
-result: fast computation done
+success: {"user": "alice", "role": "admin"}
 ```
 
-## Example 3 -- The time.After Leak in Loops
+## Step 3 -- The Cascade: Showing Both Outcomes
 
-When `time.After` is called inside a loop, each iteration creates a new timer. If the main case resolves before the timeout, the timer still exists in memory until it fires.
+Build a function that calls a downstream service with a configurable delay and a fixed timeout. Run it twice to show the fast path (success) and the slow path (timeout).
+
+```go
+package main
+
+import (
+	"fmt"
+	"time"
+)
+
+func callService(name string, latency, timeout time.Duration) {
+	response := make(chan string)
+
+	go func() {
+		time.Sleep(latency)
+		response <- fmt.Sprintf("%s responded", name)
+	}()
+
+	select {
+	case body := <-response:
+		fmt.Printf("[%s] success: %s\n", name, body)
+	case <-time.After(timeout):
+		fmt.Printf("[%s] timeout after %v (service latency: %v)\n", name, timeout, latency)
+	}
+}
+
+func main() {
+	callService("user-service", 80*time.Millisecond, 200*time.Millisecond)
+	callService("payment-service", 500*time.Millisecond, 200*time.Millisecond)
+}
+```
+
+### Verification
+```
+[user-service] success: user-service responded
+[payment-service] timeout after 200ms (service latency: 500ms)
+```
+The user-service responds within the deadline. The payment-service is too slow -- without the timeout, our caller would block for the full 500ms.
+
+## Step 4 -- The time.After Leak in Loops
+
+When `time.After` is called inside a loop, each iteration creates a new timer. If the main case resolves before the timeout, the timer still exists in memory until it fires. In a high-throughput request loop, this wastes significant memory.
 
 ```go
 package main
@@ -110,43 +151,43 @@ import (
 )
 
 func main() {
-	ch := make(chan int, 1)
+	requests := make(chan string, 1)
 
 	go func() {
 		for i := 0; i < 1000; i++ {
-			ch <- i
+			requests <- fmt.Sprintf("request-%d", i)
 			time.Sleep(1 * time.Millisecond)
 		}
-		close(ch)
+		close(requests)
 	}()
 
 	count := 0
-	for val := range ch {
+	for req := range requests {
 		// BAD: Each iteration allocates a 1-second timer.
-		// We process data every 1ms, so ~1000 timers accumulate,
+		// We process requests every 1ms, so ~1000 timers accumulate,
 		// all scheduled to fire 1 second from now.
 		select {
 		case <-time.After(1 * time.Second):
 			fmt.Println("timeout")
 			return
 		default:
-			_ = val
+			_ = req
 			count++
 		}
 	}
-	fmt.Printf("processed %d items (created ~1000 leaked timers)\n", count)
+	fmt.Printf("processed %d requests (created ~1000 leaked timers)\n", count)
 }
 ```
 
 ### Verification
 ```
-processed 1000 items (created ~1000 leaked timers)
+processed 1000 requests (created ~1000 leaked timers)
 ```
-This code creates ~1000 timers. In a high-throughput loop (millions of iterations), this wastes significant memory and puts pressure on the runtime's timer heap.
+In a real server processing millions of requests, this timer leak puts heavy pressure on the runtime's timer heap and wastes memory.
 
-## Example 4 -- Safe Timeouts with time.NewTimer
+## Step 5 -- Safe Timeouts with time.NewTimer
 
-Replace `time.After` with `time.NewTimer`. Stop the timer when it is no longer needed, and reset it between iterations.
+Replace `time.After` with `time.NewTimer`. Stop the timer when it is no longer needed, and reset it between iterations. This is what production HTTP servers use internally.
 
 ```go
 package main
@@ -157,38 +198,39 @@ import (
 )
 
 func main() {
-	ch := make(chan int)
+	responses := make(chan string)
 
+	// Simulate a stream of API responses arriving every 50ms.
 	go func() {
 		for i := 0; i < 10; i++ {
-			ch <- i
+			responses <- fmt.Sprintf("response-%d", i)
 			time.Sleep(50 * time.Millisecond)
 		}
-		close(ch)
+		close(responses)
 	}()
 
-	timeout := time.NewTimer(500 * time.Millisecond)
-	defer timeout.Stop() // Always stop when done.
+	timeout := time.NewTimer(200 * time.Millisecond)
+	defer timeout.Stop()
 
 	for {
-		// Stop-drain-reset pattern: prevents stale timeout on next iteration.
+		// Stop-drain-reset: prevents a stale timeout from the previous iteration.
 		if !timeout.Stop() {
 			select {
 			case <-timeout.C:
 			default:
 			}
 		}
-		timeout.Reset(500 * time.Millisecond)
+		timeout.Reset(200 * time.Millisecond)
 
 		select {
-		case val, ok := <-ch:
+		case body, ok := <-responses:
 			if !ok {
-				fmt.Println("channel closed, all received")
+				fmt.Println("all responses received")
 				return
 			}
-			fmt.Println("received:", val)
+			fmt.Println("received:", body)
 		case <-timeout.C:
-			fmt.Println("timeout: no data for 500ms")
+			fmt.Println("timeout: no response for 200ms, aborting")
 			return
 		}
 	}
@@ -202,80 +244,28 @@ Key points:
 
 ### Verification
 ```
-received: 0
-received: 1
-received: 2
-received: 3
-received: 4
-received: 5
-received: 6
-received: 7
-received: 8
-received: 9
-channel closed, all received
+received: response-0
+received: response-1
+received: response-2
+received: response-3
+received: response-4
+received: response-5
+received: response-6
+received: response-7
+received: response-8
+received: response-9
+all responses received
 ```
-Change the producer sleep to 600ms to verify the timeout fires after the first value:
+Change the producer sleep to 300ms to verify the timeout fires:
 ```
-received: 0
-timeout: no data for 500ms
-```
-
-## Example 5 -- Detecting a Stalled Producer
-
-A producer sends one value quickly, then stalls. The timer detects the gap.
-
-```go
-package main
-
-import (
-	"fmt"
-	"time"
-)
-
-func main() {
-	ch := make(chan int)
-
-	go func() {
-		ch <- 0
-		time.Sleep(50 * time.Millisecond)
-		// Stall: next value takes 2 seconds.
-		time.Sleep(2 * time.Second)
-		ch <- 1
-	}()
-
-	timer := time.NewTimer(200 * time.Millisecond)
-	defer timer.Stop()
-
-	for {
-		if !timer.Stop() {
-			select {
-			case <-timer.C:
-			default:
-			}
-		}
-		timer.Reset(200 * time.Millisecond)
-
-		select {
-		case val := <-ch:
-			fmt.Println("received:", val)
-		case <-timer.C:
-			fmt.Println("timeout: no data for 200ms, stopping")
-			return
-		}
-	}
-}
-```
-
-### Verification
-```
-received: 0
-timeout: no data for 200ms, stopping
+received: response-0
+timeout: no response for 200ms, aborting
 ```
 
 ## Common Mistakes
 
 ### 1. Using time.After in Hot Loops
-Every call allocates a new timer that lives until it fires. In a loop processing thousands of events per second, this leaks memory rapidly. Always use `time.NewTimer` in loops.
+Every call allocates a new timer that lives until it fires. In a loop processing thousands of requests per second, this leaks memory rapidly. Always use `time.NewTimer` in loops.
 
 ### 2. Not Draining the Timer Channel Before Reset
 If the timer fired between `Stop()` and `Reset()`, the channel has a pending value. The next `select` will immediately see the old timeout. The drain pattern prevents this:
@@ -293,8 +283,8 @@ timer.Reset(duration)
 ### 3. Forgetting defer Stop()
 If you return from the function without stopping the timer, it remains in the runtime's timer heap until it fires. Always `defer timer.Stop()`.
 
-### 4. Using Too-Short Timeouts in Tests
-CI environments are slower than local machines. Use generous timeouts in tests and tight ones only when testing the timeout mechanism itself.
+### 4. Goroutine Leak from Slow Dependencies
+When a timeout fires, the goroutine making the slow call still exists. It is blocked on `response <- result`, but nobody is reading from `response` anymore. Using a buffered channel (`make(chan string, 1)`) lets the goroutine send and exit even after the caller moves on.
 
 ## Verify What You Learned
 
@@ -307,7 +297,7 @@ CI environments are slower than local machines. Use generous timeouts in tests a
 In the next exercise, you will learn how to simulate priority in `select` using nested selects, since Go's `select` has no built-in priority mechanism.
 
 ## Summary
-`time.After` is convenient for one-shot timeouts: it returns a channel that fires after a delay. Inside loops, it leaks because each call creates a timer that lives until it fires. `time.NewTimer` provides explicit control: you can `Stop()`, drain, and `Reset()` a single timer across iterations. Always use `time.NewTimer` for repeated timeout operations, and always call `Stop()` on timers you no longer need.
+`time.After` is convenient for one-shot timeouts: it returns a channel that fires after a delay. Inside loops, it leaks because each call creates a timer that lives until it fires. `time.NewTimer` provides explicit control: you can `Stop()`, drain, and `Reset()` a single timer across iterations. In HTTP-style client scenarios, timeouts prevent goroutines from blocking forever on slow downstream services, avoiding cascading failures. Always use `time.NewTimer` for repeated timeout operations, and always call `Stop()` on timers you no longer need.
 
 ## Reference
 - [time.After](https://pkg.go.dev/time#After)

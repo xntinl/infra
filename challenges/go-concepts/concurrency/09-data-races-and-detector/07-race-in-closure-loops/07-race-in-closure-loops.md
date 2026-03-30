@@ -1,10 +1,9 @@
 ---
 difficulty: intermediate
-concepts: [closure capture, loop variable, goroutine scheduling, Go 1.22 loop semantics]
+concepts: [closure capture, loop variable, goroutine scheduling, Go 1.22 loop semantics, notification sender]
 tools: [go]
 estimated_time: 25m
 bloom_level: analyze
-prerequisites: [goroutines, closures, data race concept, race detector]
 ---
 
 # 7. Race in Closure Loops
@@ -12,60 +11,66 @@ prerequisites: [goroutines, closures, data race concept, race detector]
 
 ## Learning Objectives
 After completing this exercise, you will be able to:
-- **Identify** the classic closure-in-loop race bug
+- **Identify** the classic closure-in-loop race bug in production code
 - **Explain** why closures capture variables by reference, not by value
-- **Fix** the bug using two different techniques (parameter passing, local variable)
-- **Understand** how Go 1.22 changed loop variable semantics and why the concept still matters
+- **Fix** the bug using parameter passing
+- **Understand** Go 1.22's fix and why explicit passing is still the clearest approach
 
 ## Why Closure Races Matter
 
 One of the most common concurrency bugs in Go is launching goroutines inside a loop where the goroutine closure captures the loop variable. Because closures capture variables **by reference**, all goroutines share the same variable. By the time the goroutines execute, the loop has often finished, and they all see the final value.
 
-This bug is subtle because:
-- It is not always a data race in the strict sense (it can also be a logic bug)
-- The program compiles and runs without errors
-- It sometimes appears to work (if goroutines execute fast enough)
-- The fix is simple once you know the pattern
+In a real system, this bug means your batch notification sender emails ALL notifications to the LAST user in the list. Your parallel API caller sends every request with the wrong user ID. Your batch processor processes the same item 100 times and skips the rest.
 
 Starting with **Go 1.22**, the `for` loop creates a new variable for each iteration, which fixes the most common manifestation. However, understanding the underlying mechanism is essential because:
 1. The same pattern appears with non-loop variables
 2. Much existing code was written before Go 1.22
 3. The concept of "capture by reference" applies everywhere closures are used
 
-## Step 1 -- The Classic Bug
+## Step 1 -- The Batch Notification Bug
 
-The `main.go` demonstrates the bug using a variable declared outside the loop (simulating pre-1.22 behavior):
+Build a batch notification sender that processes user IDs in a loop, launching a goroutine per user. This is the kind of code you write when sending emails, push notifications, or webhook callbacks in parallel:
 
 ```go
 package main
 
 import (
-    "fmt"
-    "sync"
+	"fmt"
+	"sync"
 )
 
-func closureBugSimulated() {
-    var wg sync.WaitGroup
-    values := []string{"alpha", "beta", "gamma", "delta", "epsilon"}
+type Notification struct {
+	UserID  string
+	Message string
+}
 
-    // Declaring current OUTSIDE the loop means all goroutines share it.
-    var current string
-    for _, v := range values {
-        current = v // all goroutines point to this single variable
-        wg.Add(1)
-        go func() {
-            defer wg.Done()
-            // DATA RACE: current is written by the loop and read by this
-            // goroutine concurrently.
-            fmt.Printf("  goroutine sees: %s\n", current)
-        }()
-    }
+func buggyNotificationSender() {
+	users := []string{"alice", "bob", "charlie", "diana", "evan"}
+	var wg sync.WaitGroup
 
-    wg.Wait()
+	fmt.Println("--- Buggy Sender: all notifications go to the WRONG user ---")
+
+	// Declaring the notification outside the loop means all goroutines share it.
+	var notification Notification
+	for _, userID := range users {
+		notification = Notification{
+			UserID:  userID,
+			Message: fmt.Sprintf("Hello %s, your order has shipped!", userID),
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// DATA RACE: notification is written by the loop and read by
+			// this goroutine concurrently.
+			fmt.Printf("  Sending to %-10s: %s\n", notification.UserID, notification.Message)
+		}()
+	}
+
+	wg.Wait()
 }
 
 func main() {
-    closureBugSimulated()
+	buggyNotificationSender()
 }
 ```
 
@@ -73,66 +78,65 @@ func main() {
 ```bash
 go run main.go
 ```
-Expected: most or all goroutines print "epsilon" (the last value):
+Expected: most or all goroutines send to "evan" (the last user):
 ```
---- Demo 1: The Classic Bug (simulated pre-1.22) ---
-All goroutines see the LAST value because they capture a shared variable:
-  goroutine sees: epsilon
-  goroutine sees: epsilon
-  goroutine sees: epsilon
-  goroutine sees: epsilon
-  goroutine sees: epsilon
+--- Buggy Sender: all notifications go to the WRONG user ---
+  Sending to evan      : Hello evan, your order has shipped!
+  Sending to evan      : Hello evan, your order has shipped!
+  Sending to evan      : Hello evan, your order has shipped!
+  Sending to evan      : Hello evan, your order has shipped!
+  Sending to evan      : Hello evan, your order has shipped!
 ```
+
+Alice, Bob, Charlie, and Diana never receive their notifications. Evan gets five. In a real system, this means four customers never learn their order shipped, and one customer gets five duplicate emails.
 
 ```bash
 go run -race main.go
 ```
-Expected: `WARNING: DATA RACE` because `current` is written by the loop and read by goroutines concurrently:
-```
-==================
-WARNING: DATA RACE
-Read at 0x00c00011c120 by goroutine 7:
-  main.closureBugSimulated.func1()
-      /path/to/main.go:76 +0x7c
-
-Previous write at 0x00c00011c120 by main goroutine:
-  main.closureBugSimulated()
-      /path/to/main.go:69 +0x230
-==================
-```
+Expected: `WARNING: DATA RACE` because `notification` is written by the loop and read by goroutines concurrently.
 
 ## Step 2 -- Fix by Passing as Parameter
 
-Pass the value as a function parameter. Go copies the argument at the call site:
+Pass the notification as a function parameter. Go copies the argument at the call site, giving each goroutine its own independent copy:
 
 ```go
 package main
 
 import (
-    "fmt"
-    "sync"
+	"fmt"
+	"sync"
 )
 
-func closureFixParameter() {
-    var wg sync.WaitGroup
-    values := []string{"alpha", "beta", "gamma", "delta", "epsilon"}
+type Notification struct {
+	UserID  string
+	Message string
+}
 
-    var current string
-    for _, v := range values {
-        current = v
-        wg.Add(1)
-        // val is a PARAMETER: Go copies current's value into val here.
-        go func(val string) {
-            defer wg.Done()
-            fmt.Printf("  goroutine sees: %s\n", val)
-        }(current) // copy happens at the go call
-    }
+func fixedNotificationSender() {
+	users := []string{"alice", "bob", "charlie", "diana", "evan"}
+	var wg sync.WaitGroup
 
-    wg.Wait()
+	fmt.Println("--- Fixed Sender: each notification goes to the correct user ---")
+
+	var notification Notification
+	for _, userID := range users {
+		notification = Notification{
+			UserID:  userID,
+			Message: fmt.Sprintf("Hello %s, your order has shipped!", userID),
+		}
+		wg.Add(1)
+		// notif is a PARAMETER: Go copies notification's value at the call site.
+		go func(notif Notification) {
+			defer wg.Done()
+			fmt.Printf("  Sending to %-10s: %s\n", notif.UserID, notif.Message)
+		}(notification)
+	}
+
+	wg.Wait()
 }
 
 func main() {
-    closureFixParameter()
+	fixedNotificationSender()
 }
 ```
 
@@ -140,112 +144,162 @@ func main() {
 ```bash
 go run -race main.go
 ```
-Expected: all five values appear (in any order), each exactly once, with zero race warnings:
+Expected: all five users receive their correct notification (in any order), zero race warnings:
 ```
---- Demo 2: Fix with Function Parameter ---
-  goroutine sees: gamma
-  goroutine sees: alpha
-  goroutine sees: beta
-  goroutine sees: epsilon
-  goroutine sees: delta
+--- Fixed Sender: each notification goes to the correct user ---
+  Sending to charlie   : Hello charlie, your order has shipped!
+  Sending to alice     : Hello alice, your order has shipped!
+  Sending to bob       : Hello bob, your order has shipped!
+  Sending to evan      : Hello evan, your order has shipped!
+  Sending to diana     : Hello diana, your order has shipped!
 ```
 
-## Step 3 -- Fix by Local Variable
+## Step 3 -- The Parallel API Caller Bug
 
-Create a new local variable inside each loop iteration:
+The same bug appears when making parallel API calls. This is extremely common in microservice architectures where you fan out requests to multiple services:
 
 ```go
 package main
 
 import (
-    "fmt"
-    "sync"
+	"fmt"
+	"sync"
 )
 
-func closureFixLocalVar() {
-    var wg sync.WaitGroup
-    values := []string{"alpha", "beta", "gamma", "delta", "epsilon"}
+type APIRequest struct {
+	UserID   string
+	Endpoint string
+}
 
-    var current string
-    for _, v := range values {
-        current = v
-        val := current // NEW variable per iteration
-        wg.Add(1)
-        go func() {
-            defer wg.Done()
-            fmt.Printf("  goroutine sees: %s\n", val)
-        }()
-    }
+func buggyAPICaller() {
+	requests := []APIRequest{
+		{UserID: "u-101", Endpoint: "/api/billing"},
+		{UserID: "u-202", Endpoint: "/api/shipping"},
+		{UserID: "u-303", Endpoint: "/api/notifications"},
+		{UserID: "u-404", Endpoint: "/api/analytics"},
+	}
 
-    wg.Wait()
+	var wg sync.WaitGroup
+
+	fmt.Println("--- Buggy API Caller ---")
+
+	var req APIRequest
+	for _, r := range requests {
+		req = r
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// BUG: all goroutines see the last request.
+			fmt.Printf("  Calling %s for user %s\n", req.Endpoint, req.UserID)
+		}()
+	}
+
+	wg.Wait()
+
+	fmt.Println()
+	fmt.Println("--- Fixed API Caller ---")
+
+	for _, r := range requests {
+		req = r
+		wg.Add(1)
+		go func(request APIRequest) {
+			defer wg.Done()
+			fmt.Printf("  Calling %s for user %s\n", request.Endpoint, request.UserID)
+		}(req)
+	}
+
+	wg.Wait()
 }
 
 func main() {
-    closureFixLocalVar()
+	buggyAPICaller()
 }
 ```
-
-`val := current` creates a new variable on each iteration. The closure captures this new variable, which does not change after creation.
 
 ### Verification
 ```bash
 go run -race main.go
 ```
-Expected: same correct output, zero race warnings.
 
-## Step 4 -- Go 1.22 Loop Variable Change
+The buggy version calls `/api/analytics` for `u-404` four times. The fixed version calls each endpoint for the correct user.
 
-In Go 1.22+, each iteration of a `for` loop creates a new loop variable:
+In production, this means:
+- Billing charges the wrong customer
+- Shipping sends to the wrong address
+- Notifications go to the wrong person
+- Analytics records wrong user activity
 
-```go
-// Go 1.22+: this is now safe (each iteration has its own v)
-for _, v := range values {
-    go func() {
-        fmt.Println(v) // v is unique per iteration in Go 1.22+
-    }()
-}
-```
+## Step 4 -- Go 1.22 and Why Explicit Passing Is Still Best
 
-**However**, variables declared OUTSIDE the loop are NOT affected by this change:
+Go 1.22 changed loop variable semantics: each iteration creates a new variable. Using the loop variable directly in a closure is now safe:
 
 ```go
-var current string // declared outside -- still shared
-for _, v := range values {
-    current = v // still a single shared variable
-    go func() {
-        fmt.Println(current) // STILL A BUG even in Go 1.22+
-    }()
+package main
+
+import (
+	"fmt"
+	"sync"
+)
+
+type Notification struct {
+	UserID  string
+	Message string
+}
+
+func go122Safe() {
+	users := []string{"alice", "bob", "charlie", "diana", "evan"}
+	var wg sync.WaitGroup
+
+	fmt.Println("--- Go 1.22+: loop variable is per-iteration ---")
+
+	// In Go 1.22+, userID is a new variable per iteration.
+	for _, userID := range users {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			fmt.Printf("  Notifying: %s\n", userID)
+		}()
+	}
+
+	wg.Wait()
+
+	fmt.Println()
+	fmt.Println("--- BUT: variables declared outside the loop are still shared ---")
+
+	var current string
+	for _, userID := range users {
+		current = userID // current is declared OUTSIDE the loop
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			fmt.Printf("  Notifying: %s\n", current) // STILL A BUG even in Go 1.22+
+		}()
+	}
+
+	wg.Wait()
+
+	fmt.Println()
+	fmt.Println("Recommendation: always pass as parameter for clarity,")
+	fmt.Println("regardless of Go version. It makes the intent explicit.")
+}
+
+func main() {
+	go122Safe()
 }
 ```
-
-The underlying lesson -- closures capture references, not values -- remains critical regardless of Go version.
-
-## Step 5 -- Index Capture Bug
-
-The same bug applies to integer indices, not just string values. The `main.go` demonstrates both the bug and the fix for integer loop variables:
 
 ### Verification
 ```bash
 go run -race main.go
 ```
-Expected:
-```
---- Demo 5: Index Capture Bug ---
-  BUG (shared index):
-    goroutine sees index 4
-    goroutine sees index 4
-    goroutine sees index 4
-    goroutine sees index 4
-    goroutine sees index 4
-  FIX (parameter copy):
-    goroutine sees index 0
-    goroutine sees index 3
-    goroutine sees index 1
-    goroutine sees index 4
-    goroutine sees index 2
-```
 
-The BUG version shows all goroutines seeing index 4 (the last value). The FIX version shows all unique indices.
+The first block works correctly in Go 1.22+. The second block still has the bug because `current` is declared outside the loop.
+
+**Why explicit parameter passing is still the best practice:**
+1. It works in ALL Go versions
+2. It makes the intent unmistakably clear: "this goroutine gets its own copy"
+3. It catches bugs that Go 1.22 does NOT fix (variables declared outside the loop)
+4. It is self-documenting: readers immediately see what data the goroutine receives
 
 ## Common Mistakes
 
@@ -253,37 +307,38 @@ The BUG version shows all goroutines seeing index 4 (the last value). The FIX ve
 Only the loop variables declared in the `for` statement itself get per-iteration semantics in Go 1.22. Variables declared before the loop and modified inside it are still shared.
 
 ### Race Detector Not Catching All Closure Bugs
-If all goroutines happen to read the variable after the loop finishes (no concurrent write), the race detector may not report it. The bug (all goroutines seeing the same value) still exists -- it is a **logic bug**, not just a data race.
+If all goroutines happen to read the variable after the loop finishes (no concurrent write), the race detector may not report it. The bug (all goroutines seeing the same value) still exists: it is a **logic bug**, not just a data race.
 
 ### Thinking time.Sleep Fixes It
 Adding sleep between goroutine launches does not fix the problem. The goroutine captures a **reference** to the variable, not a snapshot. Even if the goroutine starts immediately, the next loop iteration can change the variable before the goroutine reads it.
 
-### Forgetting Integer Indices
-The bug is not limited to range values. Integer loop counters (`for i := 0; i < n; i++`) declared outside the loop are equally affected.
+### Passing Pointers Instead of Values
+```go
+go func(notif *Notification) {
+    // BUG: still shares the underlying data
+}(&notification)
+```
+Passing a pointer copies the pointer, not the data. All goroutines still share the same `Notification`. Pass by value to get a true copy.
 
 ## Verify What You Learned
 
-```bash
-go run -race main.go
-```
-
-1. Confirm which functions trigger race warnings (Demo 1 and Demo 5 BUG only)
+1. Confirm which functions trigger race warnings with `go run -race main.go`
 2. Why does the closure capture a reference and not a value?
 3. What changed in Go 1.22 regarding loop variables?
-4. Is the "pass as parameter" fix still useful in Go 1.22+? When?
+4. Why is parameter passing still recommended even in Go 1.22+?
 
 ## What's Next
 Continue to [08-race-free-design-patterns](../08-race-free-design-patterns/08-race-free-design-patterns.md) to learn design patterns that make races impossible by construction.
 
 ## Summary
 - Closures capture variables **by reference**, not by value
-- In a loop, all goroutine closures share the same outer variable (always true for non-loop variables, pre-1.22 for loop variables)
-- **Fix 1**: pass the variable as a function parameter (creates a copy at the go call)
-- **Fix 2**: declare a new local variable inside the loop body (`val := current`)
-- Go 1.22 creates a new variable per loop iteration, fixing the most common case
-- The underlying concept (capture by reference) still matters for non-loop variables
-- The race detector catches concurrent read/write, but may not flag the logic bug if timing aligns
-- The bug applies equally to string values and integer indices
+- In a loop, all goroutine closures share the same outer variable
+- The consequence: all goroutines process the LAST item (wrong user, wrong request, wrong notification)
+- **Fix**: pass the variable as a function parameter, which copies the value at the call site
+- Go 1.22 creates a new loop variable per iteration, but only for variables declared in the `for` statement
+- Variables declared OUTSIDE the loop are still shared even in Go 1.22+
+- Always pass as parameter for clarity and correctness across all Go versions
+- The bug applies to structs, strings, integers, and any other type
 
 ## Reference
 - [Go Wiki: Common Mistakes -- Using Goroutines on Loop Iterator Variables](https://go.dev/wiki/CommonMistakes)

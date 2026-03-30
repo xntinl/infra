@@ -4,11 +4,9 @@ concepts: [channels-vs-mutex, share-by-communicating, sync.Mutex, design-tradeof
 tools: [go]
 estimated_time: 35m
 bloom_level: analyze
-prerequisites: [goroutines, unbuffered-channels, buffered-channels, channel-direction, close]
 ---
 
 # 10. Channel vs Shared Memory
-
 
 ## Learning Objectives
 After completing this exercise, you will be able to:
@@ -19,15 +17,15 @@ After completing this exercise, you will be able to:
 
 ## Why This Comparison Matters
 
-Go's most famous concurrency proverb is: "Don't communicate by sharing memory; share memory by communicating." But this doesn't mean mutexes are bad or channels are always better. It means you should prefer communicating between goroutines (channels) over sharing data structures that require locking (mutexes).
+Go's most famous concurrency proverb is: "Don't communicate by sharing memory; share memory by communicating." But this does not mean mutexes are bad or channels are always better. It means you should prefer communicating between goroutines (channels) over sharing data structures that require locking (mutexes).
 
 Both tools have their place. Channels excel when goroutines need to pass data, coordinate workflows, or signal events. Mutexes excel when you just need to protect a data structure from concurrent access with minimal overhead.
 
-This exercise puts both approaches side by side for the same problem, so you can develop an intuition for the tradeoffs.
+This exercise implements the same feature -- a concurrent page hit counter with event notification -- both ways, so you can develop an intuition for the tradeoffs.
 
 ## Step 1 -- The Problem: Data Race
 
-Multiple goroutines increment a shared counter without protection. This is a data race.
+Multiple goroutines increment a shared counter and notify listeners about page hits. Without protection, this is a data race.
 
 ```go
 package main
@@ -53,7 +51,7 @@ func main() {
     }
 
     wg.Wait()
-    fmt.Printf("Counter: %d (expected 1000, may be wrong)\n", counter)
+    fmt.Printf("Counter: %d (expected 1000, likely wrong)\n", counter)
 }
 ```
 
@@ -65,9 +63,9 @@ go run -race main.go
 
 The `-race` flag enables Go's race detector -- essential for finding data races during development.
 
-## Step 2 -- Solution A: Mutex
+## Step 2 -- Solution A: Mutex (Shared Memory)
 
-Protect the counter with `sync.Mutex`. Lock before reading/writing, unlock after.
+Protect the hit counter and event notification with `sync.Mutex`. Lock before reading/writing, unlock after. This is the shared-memory approach.
 
 ```go
 package main
@@ -78,40 +76,92 @@ import (
     "time"
 )
 
+type MutexHitCounter struct {
+    mu       sync.RWMutex
+    counts   map[string]int
+    total    int
+    onChange func(page string, count int) // event callback
+}
+
+func NewMutexHitCounter(onChange func(string, int)) *MutexHitCounter {
+    return &MutexHitCounter{
+        counts:   make(map[string]int),
+        onChange: onChange,
+    }
+}
+
+func (h *MutexHitCounter) RecordHit(page string) {
+    h.mu.Lock()
+    h.counts[page]++
+    h.total++
+    count := h.counts[page]
+    h.mu.Unlock()
+
+    if h.onChange != nil {
+        h.onChange(page, count)
+    }
+}
+
+func (h *MutexHitCounter) GetCount(page string) int {
+    h.mu.RLock()
+    defer h.mu.RUnlock()
+    return h.counts[page]
+}
+
+func (h *MutexHitCounter) GetTotal() int {
+    h.mu.RLock()
+    defer h.mu.RUnlock()
+    return h.total
+}
+
 func main() {
-    counter := 0
-    var mu sync.Mutex
+    var notifyMu sync.Mutex
+    notifications := 0
+
+    counter := NewMutexHitCounter(func(page string, count int) {
+        notifyMu.Lock()
+        notifications++
+        notifyMu.Unlock()
+    })
+
     var wg sync.WaitGroup
+    pages := []string{"/home", "/about", "/api/users", "/api/orders", "/health"}
     start := time.Now()
 
     for i := 0; i < 1000; i++ {
         wg.Add(1)
-        go func() {
+        go func(n int) {
             defer wg.Done()
-            mu.Lock()
-            counter++
-            mu.Unlock()
-        }()
+            page := pages[n%len(pages)]
+            counter.RecordHit(page)
+        }(i)
     }
 
     wg.Wait()
     elapsed := time.Since(start)
-    fmt.Printf("Counter: %d (took %v)\n", counter, elapsed)
+
+    fmt.Println("=== Mutex Version ===")
+    fmt.Printf("Total hits: %d\n", counter.GetTotal())
+    for _, page := range pages {
+        fmt.Printf("  %-15s %d hits\n", page, counter.GetCount(page))
+    }
+    fmt.Printf("Notifications sent: %d\n", notifications)
+    fmt.Printf("Time: %v\n", elapsed)
 }
 ```
 
-**Pros:** Simple, low overhead, directly protects the data.
-**Cons:** Easy to forget the lock, can deadlock with multiple mutexes, doesn't compose well.
+**Pros:** Direct, low overhead, familiar pattern. `RWMutex` allows concurrent reads.
+**Cons:** Easy to forget the lock. Callback (`onChange`) runs under the caller's goroutine, which could cause issues if it is slow. Must protect the notification counter with a separate mutex.
 
 ### Verification
 ```bash
 go run -race main.go
-# Expected: Counter: 1000, no race warnings
+# Expected: Total hits: 1000, no race warnings
 ```
 
-## Step 3 -- Solution B: Channel
+## Step 3 -- Solution B: Channels (Share Memory by Communicating)
 
-Send increment requests to a single goroutine that owns the counter. No shared memory.
+Send hit events to a single goroutine that owns the counter state. Notifications flow through a separate channel. No shared memory, no mutexes.
 
 ```go
 package main
@@ -122,54 +172,108 @@ import (
     "time"
 )
 
-func main() {
-    start := time.Now()
+type HitEvent struct {
+    Page string
+}
 
-    increments := make(chan struct{}, 100)
-    result := make(chan int)
+type QueryRequest struct {
+    Page  string
+    Reply chan int
+}
 
-    // Counter goroutine: the ONLY goroutine that touches the counter.
-    go func() {
-        counter := 0
-        for range increments {
-            counter++
+type TotalRequest struct {
+    Reply chan int
+}
+
+func hitCounterService(
+    hits <-chan HitEvent,
+    queries <-chan QueryRequest,
+    totals <-chan TotalRequest,
+    notifications chan<- HitEvent,
+) {
+    counts := make(map[string]int)
+    total := 0
+
+    for {
+        select {
+        case hit, ok := <-hits:
+            if !ok {
+                close(notifications)
+                return
+            }
+            counts[hit.Page]++
+            total++
+            notifications <- hit
+        case q := <-queries:
+            q.Reply <- counts[q.Page]
+        case t := <-totals:
+            t.Reply <- total
         }
-        result <- counter
+    }
+}
+
+func main() {
+    hits := make(chan HitEvent, 100)
+    queries := make(chan QueryRequest)
+    totals := make(chan TotalRequest)
+    notifications := make(chan HitEvent, 100)
+
+    go hitCounterService(hits, queries, totals, notifications)
+
+    // Notification consumer.
+    var notifyCount int
+    notifyDone := make(chan struct{})
+    go func() {
+        for range notifications {
+            notifyCount++
+        }
+        notifyDone <- struct{}{}
     }()
 
-    // 1000 goroutines send increment signals.
     var wg sync.WaitGroup
+    pages := []string{"/home", "/about", "/api/users", "/api/orders", "/health"}
+    start := time.Now()
+
     for i := 0; i < 1000; i++ {
         wg.Add(1)
-        go func() {
+        go func(n int) {
             defer wg.Done()
-            increments <- struct{}{}
-        }()
+            page := pages[n%len(pages)]
+            hits <- HitEvent{Page: page}
+        }(i)
     }
 
     wg.Wait()
-    close(increments)
-    total := <-result
-
+    close(hits)
+    <-notifyDone
     elapsed := time.Since(start)
-    fmt.Printf("Counter: %d (took %v, no shared state)\n", total, elapsed)
+
+    fmt.Println("=== Channel Version ===")
+    reply := make(chan int, 1)
+    totals <- TotalRequest{Reply: reply}
+    fmt.Printf("Total hits: %d\n", <-reply)
+
+    for _, page := range pages {
+        queries <- QueryRequest{Page: page, Reply: reply}
+        fmt.Printf("  %-15s %d hits\n", page, <-reply)
+    }
+    fmt.Printf("Notifications sent: %d\n", notifyCount)
+    fmt.Printf("Time: %v\n", elapsed)
 }
 ```
 
-**Pros:** No shared state, impossible to forget locking, counter goroutine is self-contained.
-**Cons:** More boilerplate, overhead of channel operations.
+**Pros:** No shared state, impossible to forget locking, notifications flow naturally as a channel stream. The counter goroutine is fully self-contained.
+**Cons:** More boilerplate, channel operations have overhead, queries require request-response pattern.
 
 ### Verification
 ```bash
 go run -race main.go
-# Expected: Counter: 1000, no race warnings
+# Expected: Total hits: 1000, no race warnings
 ```
 
-## Step 4 -- A Richer Problem: Concurrent Cache
+## Step 4 -- Side-by-Side: Same Feature, Both Approaches
 
-A simple counter is biased toward mutexes. Now try a richer problem where both approaches are more balanced.
-
-### Mutex Version
+Run both implementations in the same program to compare behavior and timing.
 
 ```go
 package main
@@ -177,107 +281,134 @@ package main
 import (
     "fmt"
     "sync"
+    "time"
 )
 
-type MutexCache struct {
-    mu    sync.RWMutex
-    items map[string]string
+// --- Mutex version ---
+
+type MutexCounter struct {
+    mu     sync.Mutex
+    counts map[string]int
+    events int
 }
 
-func NewMutexCache() *MutexCache {
-    return &MutexCache{items: make(map[string]string)}
+func (c *MutexCounter) Record(page string) {
+    c.mu.Lock()
+    c.counts[page]++
+    c.events++
+    c.mu.Unlock()
 }
 
-func (c *MutexCache) Set(key, value string) {
+func (c *MutexCounter) Snapshot() (map[string]int, int) {
     c.mu.Lock()
     defer c.mu.Unlock()
-    c.items[key] = value
-}
-
-func (c *MutexCache) Get(key string) (string, bool) {
-    c.mu.RLock()
-    defer c.mu.RUnlock()
-    val, ok := c.items[key]
-    return val, ok
-}
-
-func main() {
-    mc := NewMutexCache()
-    mc.Set("language", "Go")
-    mc.Set("creator", "Rob Pike")
-
-    if val, ok := mc.Get("language"); ok {
-        fmt.Printf("language = %s\n", val)
+    snap := make(map[string]int)
+    for k, v := range c.counts {
+        snap[k] = v
     }
-    if val, ok := mc.Get("creator"); ok {
-        fmt.Printf("creator = %s\n", val)
+    return snap, c.events
+}
+
+// --- Channel version ---
+
+type ChanCounter struct {
+    hits    chan string
+    snapReq chan chan counterSnapshot
+}
+
+type counterSnapshot struct {
+    Counts map[string]int
+    Events int
+}
+
+func NewChanCounter() *ChanCounter {
+    c := &ChanCounter{
+        hits:    make(chan string, 100),
+        snapReq: make(chan chan counterSnapshot),
     }
-}
-```
-
-### Channel Version
-
-```go
-package main
-
-import "fmt"
-
-type CacheResponse struct {
-    Value string
-    Found bool
+    go c.run()
+    return c
 }
 
-type CacheRequest struct {
-    Op    string
-    Key   string
-    Value string
-    Reply chan CacheResponse
-}
-
-func cacheService(requests <-chan CacheRequest) {
-    items := make(map[string]string)
-    for req := range requests {
-        switch req.Op {
-        case "set":
-            items[req.Key] = req.Value
-            req.Reply <- CacheResponse{Value: req.Value, Found: true}
-        case "get":
-            val, ok := items[req.Key]
-            req.Reply <- CacheResponse{Value: val, Found: ok}
+func (c *ChanCounter) run() {
+    counts := make(map[string]int)
+    events := 0
+    for {
+        select {
+        case page, ok := <-c.hits:
+            if !ok {
+                return
+            }
+            counts[page]++
+            events++
+        case reply := <-c.snapReq:
+            snap := make(map[string]int)
+            for k, v := range counts {
+                snap[k] = v
+            }
+            reply <- counterSnapshot{Counts: snap, Events: events}
         }
     }
 }
 
+func (c *ChanCounter) Record(page string) { c.hits <- page }
+func (c *ChanCounter) Snapshot() (map[string]int, int) {
+    reply := make(chan counterSnapshot, 1)
+    c.snapReq <- reply
+    s := <-reply
+    return s.Counts, s.Events
+}
+
+func benchmark(name string, record func(string), snapshot func() (map[string]int, int)) time.Duration {
+    var wg sync.WaitGroup
+    pages := []string{"/home", "/about", "/api/users", "/api/orders", "/health"}
+    start := time.Now()
+
+    for i := 0; i < 10000; i++ {
+        wg.Add(1)
+        go func(n int) {
+            defer wg.Done()
+            record(pages[n%len(pages)])
+        }(i)
+    }
+
+    wg.Wait()
+    elapsed := time.Since(start)
+
+    counts, events := snapshot()
+    fmt.Printf("=== %s ===\n", name)
+    fmt.Printf("  Total events: %d\n", events)
+    for _, page := range pages {
+        fmt.Printf("  %-15s %d\n", page, counts[page])
+    }
+    fmt.Printf("  Time: %v\n\n", elapsed)
+    return elapsed
+}
+
 func main() {
-    requests := make(chan CacheRequest)
-    go cacheService(requests)
+    mc := &MutexCounter{counts: make(map[string]int)}
+    mutexTime := benchmark("Mutex", mc.Record, mc.Snapshot)
 
-    reply := make(chan CacheResponse, 1)
+    cc := NewChanCounter()
+    chanTime := benchmark("Channel", cc.Record, cc.Snapshot)
+    close(cc.hits)
 
-    requests <- CacheRequest{Op: "set", Key: "language", Value: "Go", Reply: reply}
-    <-reply
-    requests <- CacheRequest{Op: "set", Key: "creator", Value: "Rob Pike", Reply: reply}
-    <-reply
-
-    requests <- CacheRequest{Op: "get", Key: "language", Reply: reply}
-    resp := <-reply
-    fmt.Printf("language = %s\n", resp.Value)
-
-    requests <- CacheRequest{Op: "get", Key: "creator", Reply: reply}
-    resp = <-reply
-    fmt.Printf("creator = %s\n", resp.Value)
-
-    close(requests)
+    fmt.Println("=== Comparison ===")
+    fmt.Printf("  Mutex:   %v\n", mutexTime)
+    fmt.Printf("  Channel: %v\n", chanTime)
+    if mutexTime < chanTime {
+        fmt.Println("  Mutex is faster (expected for simple state guarding)")
+    } else {
+        fmt.Println("  Channel is faster (unusual for this workload)")
+    }
 }
 ```
 
 ### Verification
 ```bash
-go run main.go
-# Both produce: language = Go, creator = Rob Pike
+go run -race main.go
+# Expected: both produce 10000 total events, mutex is typically faster
 ```
-
-The mutex version is shorter. The channel version makes the data flow explicit. Which is "better" depends on context. For a simple cache, mutex is often clearer. For a cache that also needs to emit events, maintain history, or coordinate with other services, the channel version extends more naturally.
 
 ## Step 5 -- When to Use Which
 
@@ -288,134 +419,44 @@ The mutex version is shorter. The channel version makes the data flow explicit. 
 | Signaling events (done, quit, ready) | Performance-critical hot paths |
 | The "server" pattern (request-response) | You need RWMutex for read-heavy workloads |
 | You want to compose concurrency operations | The protected section is small and self-contained |
+| Event notification streams need to flow naturally | You only guard access, not coordinate workflow |
 
-**Rule of thumb:** If you're transferring data or coordinating work, use channels. If you're guarding access to a shared data structure, use a mutex.
+**Rule of thumb:** If you are transferring data or coordinating work, use channels. If you are guarding access to a shared data structure, use a mutex. Most real Go programs use both tools where each is most appropriate.
 
-## Step 6 -- Hit Counter Benchmark
+### The Real Consequence
 
-Run 10,000 operations on both implementations and compare.
+**Without either protection:** Data races corrupt your counters. You report wrong analytics, bill customers incorrectly, or lose events. The `-race` flag catches this in development, but in production it is silent data corruption.
 
-```go
-package main
+**With mutex when channels are better:** You end up with polling loops, condition variables for notifications, and complex lock ordering. The code becomes fragile and hard to extend.
 
-import (
-    "fmt"
-    "math/rand"
-    "sort"
-    "sync"
-    "time"
-)
+**With channels when mutex is simpler:** You write 50 lines of channel plumbing for what a 3-line mutex block would handle. Over-engineering.
 
-type PageCount struct {
-    Page  string
-    Count int
-}
+## Intermediate Verification
 
-var pages = []string{
-    "/home", "/about", "/products", "/blog", "/contact",
-    "/faq", "/pricing", "/docs", "/login", "/signup",
-}
-
-// --- Mutex version ---
-
-type MutexHitCounter struct {
-    mu   sync.Mutex
-    hits map[string]int
-}
-
-func NewMutexHitCounter() *MutexHitCounter {
-    return &MutexHitCounter{hits: make(map[string]int)}
-}
-
-func (h *MutexHitCounter) Record(page string) {
-    h.mu.Lock()
-    h.hits[page]++
-    h.mu.Unlock()
-}
-
-func (h *MutexHitCounter) Total() int {
-    h.mu.Lock()
-    defer h.mu.Unlock()
-    total := 0
-    for _, c := range h.hits {
-        total += c
-    }
-    return total
-}
-
-func (h *MutexHitCounter) TopPages(n int) []PageCount {
-    h.mu.Lock()
-    defer h.mu.Unlock()
-    var entries []PageCount
-    for page, count := range h.hits {
-        entries = append(entries, PageCount{page, count})
-    }
-    sort.Slice(entries, func(i, j int) bool {
-        return entries[i].Count > entries[j].Count
-    })
-    if n < len(entries) {
-        entries = entries[:n]
-    }
-    return entries
-}
-
-func main() {
-    // Mutex version
-    mhc := NewMutexHitCounter()
-    var wg1 sync.WaitGroup
-
-    start1 := time.Now()
-    for g := 0; g < 100; g++ {
-        wg1.Add(1)
-        go func() {
-            defer wg1.Done()
-            for i := 0; i < 100; i++ {
-                page := pages[rand.Intn(len(pages))]
-                mhc.Record(page)
-            }
-        }()
-    }
-    wg1.Wait()
-    elapsed1 := time.Since(start1)
-
-    fmt.Printf("Mutex:   total=%d, time=%v\n", mhc.Total(), elapsed1)
-    fmt.Println("Top 3:")
-    for _, p := range mhc.TopPages(3) {
-        fmt.Printf("  %s: %d\n", p.Page, p.Count)
-    }
-
-    // Channel version (shown in main.go for full implementation)
-    fmt.Println("\nChannel version: see main.go for full benchmark comparison")
-    fmt.Println("\nKey insight:")
-    fmt.Println("  Mutex is faster for simple state guarding")
-    fmt.Println("  Channels shine for coordination and complex workflows")
-}
-```
-
-### Verification
-```bash
-go run main.go
-# Expected: both versions produce total=10000, mutex is typically faster
-```
+Run both versions with `-race` and confirm:
+1. Both produce correct counts (no races)
+2. The mutex version is typically faster for pure state guarding
+3. The channel version handles event notification more naturally
+4. Neither has data races
 
 ## Common Mistakes
 
 ### Using Channels Where a Mutex Is Simpler
 
-**Wrong:** 50 lines of channel plumbing just to increment a counter.
+**Wrong:** 50 lines of channel plumbing just to increment a counter with no event notification.
 
-**Fix:** Use `sync.Mutex` or `sync/atomic` for simple state protection. Don't over-engineer.
+**Fix:** Use `sync.Mutex` or `sync/atomic` for simple state protection. Do not over-engineer.
 
 ### Using Mutex Where Channels Communicate Better
 
 **Wrong:**
 ```go
 var mu sync.Mutex
-var buffer []int
+var buffer []string
 
 // Producer:
 mu.Lock()
-buffer = append(buffer, value)
+buffer = append(buffer, entry)
 mu.Unlock()
 
 // Consumer (must poll in a loop):
@@ -432,17 +473,22 @@ for {
 }
 ```
 
-**Fix:** Use a channel. It's a built-in thread-safe queue with blocking semantics -- no polling needed.
+**Fix:** Use a channel. It is a built-in thread-safe queue with blocking semantics -- no polling needed.
+
+## Verify What You Learned
+1. For a simple in-memory cache (get/set), which approach would you choose and why?
+2. For a pipeline that processes log entries through filter/transform/output stages, which approach and why?
+3. What is the real danger of using neither protection for shared state?
 
 ## What's Next
-You've completed the channels section. Continue to the select and multiplexing section to learn how `select` lets you wait on multiple channel operations simultaneously.
+You have completed the channels section. Continue to the select and multiplexing section to learn how `select` lets you wait on multiple channel operations simultaneously.
 
 ## Summary
 - Both channels and mutexes solve concurrency problems; they serve different purposes
 - Channels are for communication and coordination between goroutines
 - Mutexes are for protecting shared state within a goroutine or struct
 - For simple state (counters, caches), mutexes are often clearer and faster
-- For workflows (pipelines, fan-out, request-response), channels are cleaner
+- For workflows (pipelines, fan-out, request-response, event notification), channels are cleaner
 - "Share memory by communicating" is a design preference, not an absolute rule
 - Most real Go programs use both tools where each is most appropriate
 

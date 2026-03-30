@@ -9,7 +9,6 @@ prerequisites: [goroutines, channels, select, context, done channel pattern]
 
 # 7. Or-Channel: First to Finish
 
-
 ## Learning Objectives
 After completing this exercise, you will be able to:
 - **Implement** the or-channel pattern to race multiple goroutines
@@ -18,56 +17,69 @@ After completing this exercise, you will be able to:
 - **Analyze** the trade-offs of redundant work vs lower tail latency
 
 ## Why Or-Channel (First to Finish)
+
 The or-channel pattern runs the same (or equivalent) work in multiple goroutines and takes whichever result comes first, canceling the rest. This is speculative execution: you trade extra CPU for lower latency by hedging your bets.
 
-Real-world use cases include: sending the same request to multiple replicas and using the fastest response; trying multiple algorithms for the same problem; racing a cache lookup against a database query. Google famously uses this pattern to reduce tail latency -- if one server is slow, the redundant request to another server saves the user from waiting.
+Consider a real scenario: your service reads user profiles from a database with 3 replicas. Most of the time, any replica responds in 5ms. But occasionally, one replica experiences a garbage collection pause or disk contention, causing a 500ms spike. If you query just one replica, your p99 latency is 500ms. If you query all 3 replicas and take the fastest response, your p99 drops dramatically -- the probability that ALL 3 replicas are slow simultaneously is extremely low. Google famously uses this pattern to reduce tail latency at scale.
 
 The pattern has three parts: launch N goroutines doing equivalent work, select the first result from any of them, and cancel the rest immediately. Without proper cancellation, the losing goroutines waste resources running to completion.
 
 ```
-  Or-Channel Data Flow
+  Database Replica Racing
 
-  request ---> server 1 (slow)     --+
-           --> server 2 (fast) ------+--> take first, cancel rest
-           --> server 3 (medium)  --+
+  query ---> replica 1 (5ms)       --+
+         --> replica 2 (500ms GC!) --+--> take first (5ms), cancel rest
+         --> replica 3 (8ms)       --+
 
-  The fastest response wins. Others are canceled via context.
+  User sees 5ms instead of 500ms. Tail latency reduced by 100x.
 ```
 
-## Step 1 -- Basic First-Result Race
+## Step 1 -- Basic Replica Race
 
-Create multiple goroutines that simulate work with different durations and take the fastest result.
+Create multiple goroutines that query database replicas with different simulated latencies and take the fastest.
 
 ```go
 package main
 
 import (
-    "fmt"
-    "math/rand"
-    "time"
+	"fmt"
+	"math/rand"
+	"time"
 )
 
+type QueryResult struct {
+	Data    string
+	Replica string
+	Latency time.Duration
+}
+
 func main() {
-    type result struct {
-        value  string
-        source int
-    }
+	fmt.Println("=== Database Replica Race ===\n")
 
-    ch := make(chan result, 3) // buffered to avoid goroutine leak on losers
+	replicas := []string{"us-east-1", "us-west-2", "eu-west-1"}
+	ch := make(chan QueryResult, len(replicas))
 
-    for i := 1; i <= 3; i++ {
-        go func(id int) {
-            duration := time.Duration(rand.Intn(200)+50) * time.Millisecond
-            time.Sleep(duration)
-            ch <- result{
-                value:  fmt.Sprintf("result from worker %d (took %v)", id, duration),
-                source: id,
-            }
-        }(i)
-    }
+	for _, replica := range replicas {
+		go func(name string) {
+			// Simulate variable latency: usually fast, occasionally slow (GC pause)
+			latency := time.Duration(5+rand.Intn(15)) * time.Millisecond
+			if rand.Float64() < 0.3 { // 30% chance of slow response
+				latency = time.Duration(200+rand.Intn(300)) * time.Millisecond
+			}
 
-    winner := <-ch
-    fmt.Printf("Winner: %s\n", winner.value)
+			time.Sleep(latency)
+			ch <- QueryResult{
+				Data:    fmt.Sprintf("user_profile{name:alice,id:42}"),
+				Replica: name,
+				Latency: latency,
+			}
+		}(replica)
+	}
+
+	// Take the first response
+	winner := <-ch
+	fmt.Printf("  Winner: %s responded in %v\n", winner.Replica, winner.Latency)
+	fmt.Printf("  Data: %s\n", winner.Data)
 }
 ```
 
@@ -77,59 +89,83 @@ The channel is buffered so that losing goroutines can send their results without
 ```bash
 go run main.go
 ```
-Expected: one winner, which worker wins varies between runs:
+Expected: the fastest replica wins, varying between runs:
 ```
-Winner: result from worker 2 (took 73ms)
+=== Database Replica Race ===
+
+  Winner: us-west-2 responded in 8ms
+  Data: user_profile{name:alice,id:42}
 ```
 
 ## Step 2 -- Race with Cancellation
 
-Use `context.WithCancel` to properly cancel losing goroutines:
+Use `context.WithCancel` to properly cancel losing replicas and free their resources.
 
 ```go
 package main
 
 import (
-    "context"
-    "fmt"
-    "math/rand"
-    "time"
+	"context"
+	"fmt"
+	"math/rand"
+	"time"
 )
 
+type QueryResult struct {
+	Data    string
+	Replica string
+	Latency time.Duration
+}
+
+func queryReplica(ctx context.Context, replica string) (QueryResult, error) {
+	latency := time.Duration(5+rand.Intn(15)) * time.Millisecond
+	if rand.Float64() < 0.3 {
+		latency = time.Duration(200+rand.Intn(300)) * time.Millisecond
+	}
+
+	select {
+	case <-time.After(latency):
+		return QueryResult{
+			Data:    "user_profile{name:alice,id:42}",
+			Replica: replica,
+			Latency: latency,
+		}, nil
+	case <-ctx.Done():
+		fmt.Printf("  [%s] canceled after %v (was going to take %v)\n",
+			replica, time.Since(time.Now()), latency)
+		return QueryResult{}, ctx.Err()
+	}
+}
+
 func main() {
-    type result struct {
-        value  int
-        worker int
-    }
+	fmt.Println("=== Replica Race with Cancellation ===\n")
 
-    ctx, cancel := context.WithCancel(context.Background())
-    defer cancel()
+	replicas := []string{"us-east-1", "us-west-2", "eu-west-1"}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-    ch := make(chan result, 1)
+	ch := make(chan QueryResult, 1)
 
-    for i := 1; i <= 5; i++ {
-        go func(id int) {
-            duration := time.Duration(rand.Intn(300)+100) * time.Millisecond
-            select {
-            case <-time.After(duration):
-                select {
-                case ch <- result{value: id * 100, worker: id}:
-                case <-ctx.Done():
-                    fmt.Printf("  worker %d: canceled before sending\n", id)
-                    return
-                }
-            case <-ctx.Done():
-                fmt.Printf("  worker %d: canceled during work\n", id)
-                return
-            }
-        }(i)
-    }
+	for _, replica := range replicas {
+		go func(name string) {
+			result, err := queryReplica(ctx, name)
+			if err != nil {
+				return
+			}
+			select {
+			case ch <- result:
+			case <-ctx.Done():
+			}
+		}(replica)
+	}
 
-    winner := <-ch
-    cancel() // cancel all remaining workers
-    fmt.Printf("Winner: worker %d with value %d\n", winner.worker, winner.value)
+	winner := <-ch
+	cancel() // cancel all remaining replicas
+	fmt.Printf("  Winner: %s in %v\n", winner.Replica, winner.Latency)
+	fmt.Printf("  Data: %s\n\n", winner.Data)
 
-    time.Sleep(50 * time.Millisecond) // let cancel messages print
+	time.Sleep(20 * time.Millisecond) // let cancel messages print
+	fmt.Println("  Losing replicas were canceled and their goroutines exited cleanly.")
 }
 ```
 
@@ -139,134 +175,185 @@ After receiving the first result, `cancel()` triggers `ctx.Done()` in all gorout
 ```bash
 go run main.go
 ```
-Expected: one winner, other workers report cancellation:
+Expected: one winner, other replicas report cancellation:
 ```
-  worker 3: canceled during work
-  Winner: worker 1 with value 100
-  worker 4: canceled during work
+=== Replica Race with Cancellation ===
+
+  Winner: eu-west-1 in 7ms
+  Data: user_profile{name:alice,id:42}
+
+  [us-east-1] canceled (was going to take 245ms)
+  Losing replicas were canceled and their goroutines exited cleanly.
 ```
 
-## Step 3 -- The Or-Channel Function
+## Step 3 -- Measure Tail Latency Improvement
 
-Implement a reusable `or` function that takes multiple `<-chan struct{}` channels and returns a channel that closes when any of them closes. This is the general-purpose "first signal wins" combiner.
+Run multiple queries to show the statistical improvement from racing replicas.
 
 ```go
 package main
 
 import (
-    "fmt"
-    "time"
+	"context"
+	"fmt"
+	"math/rand"
+	"sort"
+	"time"
+)
+
+func queryWithLatency(ctx context.Context) time.Duration {
+	latency := time.Duration(5+rand.Intn(15)) * time.Millisecond
+	if rand.Float64() < 0.2 {
+		latency = time.Duration(200+rand.Intn(300)) * time.Millisecond
+	}
+	select {
+	case <-time.After(latency):
+		return latency
+	case <-ctx.Done():
+		return 0
+	}
+}
+
+func percentile(latencies []time.Duration, p float64) time.Duration {
+	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
+	idx := int(float64(len(latencies)) * p)
+	if idx >= len(latencies) {
+		idx = len(latencies) - 1
+	}
+	return latencies[idx]
+}
+
+func main() {
+	const iterations = 100
+
+	// Single replica: take whatever latency you get
+	fmt.Println("=== Tail Latency Comparison (100 queries) ===\n")
+	singleLatencies := make([]time.Duration, iterations)
+	for i := 0; i < iterations; i++ {
+		ctx := context.Background()
+		singleLatencies[i] = queryWithLatency(ctx)
+	}
+
+	// Three replicas: race and take the fastest
+	racedLatencies := make([]time.Duration, iterations)
+	for i := 0; i < iterations; i++ {
+		ctx, cancel := context.WithCancel(context.Background())
+		ch := make(chan time.Duration, 3)
+		for r := 0; r < 3; r++ {
+			go func() {
+				lat := queryWithLatency(ctx)
+				if lat > 0 {
+					ch <- lat
+				}
+			}()
+		}
+		racedLatencies[i] = <-ch
+		cancel()
+	}
+
+	fmt.Println("  Single replica:")
+	fmt.Printf("    p50:  %v\n", percentile(singleLatencies, 0.50))
+	fmt.Printf("    p90:  %v\n", percentile(singleLatencies, 0.90))
+	fmt.Printf("    p99:  %v\n", percentile(singleLatencies, 0.99))
+	fmt.Printf("    max:  %v\n\n", percentile(singleLatencies, 1.0))
+
+	fmt.Println("  Three replicas (raced):")
+	fmt.Printf("    p50:  %v\n", percentile(racedLatencies, 0.50))
+	fmt.Printf("    p90:  %v\n", percentile(racedLatencies, 0.90))
+	fmt.Printf("    p99:  %v\n", percentile(racedLatencies, 0.99))
+	fmt.Printf("    max:  %v\n\n", percentile(racedLatencies, 1.0))
+
+	fmt.Println("  Racing replicas dramatically reduces tail latency (p90, p99).")
+	fmt.Println("  The cost is 3x the queries, but user-facing latency improves significantly.")
+}
+```
+
+### Intermediate Verification
+```bash
+go run main.go
+```
+Expected: p50 similar, but p90/p99 dramatically lower with racing:
+```
+=== Tail Latency Comparison (100 queries) ===
+
+  Single replica:
+    p50:  12ms
+    p90:  298ms
+    p99:  467ms
+    max:  489ms
+
+  Three replicas (raced):
+    p50:  8ms
+    p90:  14ms
+    p99:  18ms
+    max:  22ms
+
+  Racing replicas dramatically reduces tail latency (p90, p99).
+  The cost is 3x the queries, but user-facing latency improves significantly.
+```
+
+## Step 4 -- Reusable Or-Channel Function
+
+Implement a reusable `or` function that takes multiple `<-chan struct{}` channels and returns a channel that closes when any of them closes. This is the general-purpose "first signal wins" combiner, useful for combining multiple cancellation signals.
+
+```go
+package main
+
+import (
+	"fmt"
+	"time"
 )
 
 func or(channels ...<-chan struct{}) <-chan struct{} {
-    switch len(channels) {
-    case 0:
-        return nil
-    case 1:
-        return channels[0]
-    }
+	switch len(channels) {
+	case 0:
+		return nil
+	case 1:
+		return channels[0]
+	}
 
-    orDone := make(chan struct{})
-    go func() {
-        defer close(orDone)
-        switch len(channels) {
-        case 2:
-            select {
-            case <-channels[0]:
-            case <-channels[1]:
-            }
-        default:
-            select {
-            case <-channels[0]:
-            case <-channels[1]:
-            case <-channels[2]:
-            case <-or(append(channels[3:], orDone)...):
-            }
-        }
-    }()
-    return orDone
+	orDone := make(chan struct{})
+	go func() {
+		defer close(orDone)
+		switch len(channels) {
+		case 2:
+			select {
+			case <-channels[0]:
+			case <-channels[1]:
+			}
+		default:
+			select {
+			case <-channels[0]:
+			case <-channels[1]:
+			case <-channels[2]:
+			case <-or(append(channels[3:], orDone)...):
+			}
+		}
+	}()
+	return orDone
 }
 
-func sig(after time.Duration) <-chan struct{} {
-    ch := make(chan struct{})
-    go func() {
-        defer close(ch)
-        time.Sleep(after)
-    }()
-    return ch
+func replicaSignal(replica string, latency time.Duration) <-chan struct{} {
+	ch := make(chan struct{})
+	go func() {
+		defer close(ch)
+		time.Sleep(latency)
+		fmt.Printf("  [%s] responded in %v\n", replica, latency)
+	}()
+	return ch
 }
 
 func main() {
-    start := time.Now()
-    <-or(
-        sig(2*time.Second),
-        sig(500*time.Millisecond),
-        sig(1*time.Second),
-        sig(100*time.Millisecond), // fastest
-        sig(3*time.Second),
-    )
-    fmt.Printf("Signal received after %v (fastest was 100ms)\n",
-        time.Since(start).Round(time.Millisecond))
-}
-```
+	fmt.Println("=== Or-Channel: First Replica Wins ===\n")
 
-This recursive implementation handles any number of channels. The `orDone` channel is passed into the recursive call so that when one branch triggers, the entire tree collapses.
-
-### Intermediate Verification
-```bash
-go run main.go
-```
-```
-Signal received after 100ms (fastest was 100ms)
-```
-
-## Step 4 -- Practical Application: Redundant Requests
-
-Simulate sending the same request to multiple backend servers and using the fastest response:
-
-```go
-package main
-
-import (
-    "context"
-    "fmt"
-    "math/rand"
-    "time"
-)
-
-func main() {
-    queryServer := func(ctx context.Context, serverID int) (string, error) {
-        latency := time.Duration(rand.Intn(400)+100) * time.Millisecond
-        select {
-        case <-time.After(latency):
-            return fmt.Sprintf("data from server %d (%v)", serverID, latency), nil
-        case <-ctx.Done():
-            return "", ctx.Err()
-        }
-    }
-
-    type response struct {
-        data string
-        err  error
-    }
-
-    ctx, cancel := context.WithCancel(context.Background())
-    defer cancel()
-
-    ch := make(chan response, 3)
-    for _, id := range []int{1, 2, 3} {
-        go func(serverID int) {
-            data, err := queryServer(ctx, serverID)
-            select {
-            case ch <- response{data, err}:
-            case <-ctx.Done():
-            }
-        }(id)
-    }
-
-    resp := <-ch
-    cancel()
-    fmt.Printf("Fastest: %s\n", resp.data)
+	start := time.Now()
+	<-or(
+		replicaSignal("us-east-1", 300*time.Millisecond),
+		replicaSignal("us-west-2", 50*time.Millisecond),  // fastest
+		replicaSignal("eu-west-1", 150*time.Millisecond),
+	)
+	fmt.Printf("\n  First response received after %v\n",
+		time.Since(start).Round(time.Millisecond))
 }
 ```
 
@@ -274,7 +361,13 @@ func main() {
 ```bash
 go run main.go
 ```
-Expected: the fastest server's response, varying between runs.
+```
+=== Or-Channel: First Replica Wins ===
+
+  [us-west-2] responded in 50ms
+
+  First response received after 50ms
+```
 
 ## Common Mistakes
 
@@ -286,14 +379,16 @@ package main
 import "fmt"
 
 func main() {
-    type result struct{ v int }
-    ch := make(chan result) // unbuffered
-    for i := 0; i < 3; i++ {
-        go func(id int) { ch <- result{id} }(i)
-    }
-    winner := <-ch
-    fmt.Println(winner)
-    // two goroutines are stuck trying to send forever
+	type result struct{ replica string }
+	ch := make(chan result) // unbuffered
+	for i := 0; i < 3; i++ {
+		go func(id int) {
+			ch <- result{fmt.Sprintf("replica-%d", id)}
+		}(i)
+	}
+	winner := <-ch
+	fmt.Println(winner)
+	// two goroutines are stuck trying to send forever
 }
 ```
 **What happens:** The losing goroutines block on send forever because nobody reads their values.
@@ -306,7 +401,7 @@ func main() {
 winner := <-ch
 // forget to cancel -- losing goroutines run to completion
 ```
-**What happens:** Losing goroutines waste CPU and memory completing work whose result is discarded.
+**What happens:** Losing goroutines waste CPU, memory, and database connections completing work whose result is discarded.
 
 **Fix:** Use `context.WithCancel` and call `cancel()` after receiving the first result.
 
@@ -316,11 +411,10 @@ If multiple goroutines finish at the same instant, only one value is read. The o
 ## Verify What You Learned
 
 Run `go run main.go` and verify:
-- Simple race: one winner reported
-- Race with cancellation: winner plus cancellation messages from losers
-- Or-channel: signal received in ~100ms (the fastest)
-- Redundant requests: fastest server responds
-- Fetch with timeout: some succeed, some time out (200ms limit)
+- Basic race: one winning replica reported
+- Race with cancellation: winner selected, losers canceled cleanly
+- Tail latency: p90/p99 dramatically lower with 3 replicas vs 1
+- Or-channel function: first signal received in ~50ms
 
 ## What's Next
 Continue to [08-tee-channel-split-stream](../08-tee-channel-split-stream/08-tee-channel-split-stream.md) to learn how to duplicate a channel stream for parallel processing.
@@ -330,10 +424,10 @@ Continue to [08-tee-channel-split-stream](../08-tee-channel-split-stream/08-tee-
 - Buffer result channels or use cancellation to prevent goroutine leaks from losers
 - `context.WithCancel` provides clean cancellation of losing goroutines
 - The recursive `or` function combines N signal channels into one
-- Speculative execution trades CPU for lower tail latency
+- Racing replicas trades CPU for dramatically lower tail latency (p90, p99)
 - Always cancel remaining work after receiving the winning result
 
 ## Reference
 - [Go Concurrency Patterns (Rob Pike)](https://www.youtube.com/watch?v=f6kdp27TYZs)
 - [Advanced Go Concurrency Patterns](https://www.youtube.com/watch?v=QDDwwePbDtw)
-- [The tail at scale (Google)](https://research.google/pubs/pub40801/) -- the paper motivating redundant requests
+- [The Tail at Scale (Google)](https://research.google/pubs/pub40801/) -- the paper motivating redundant requests

@@ -1,33 +1,31 @@
 ---
 difficulty: advanced
-concepts: [cancellation in loops, select with ctx.Done and work channel, partial work handling, cooperative cancellation]
+concepts: [cancellation in loops, partial results, cooperative cancellation, chunked processing, progress reporting]
 tools: [go]
 estimated_time: 35m
 bloom_level: analyze
-prerequisites: [context.WithCancel, context.WithTimeout, select, channels, goroutines]
 ---
 
 # 7. Context-Aware Long Worker
 
-
 ## Learning Objectives
 After completing this exercise, you will be able to:
-- **Build** a long-running worker that checks `ctx.Done()` between iterations
-- **Use** the `select` pattern with both `ctx.Done()` and a work channel
-- **Handle** partial work gracefully when cancellation occurs mid-processing
-- **Design** workers that respond promptly to cancellation without data loss
+- **Build** a report generator that processes large datasets in chunks with cancellation support
+- **Check** context between chunks to support graceful mid-operation cancellation
+- **Return** partial results when a long-running operation is cancelled
+- **Design** a file processing task that respects context deadlines
 
 ## Why Context-Aware Workers
 
-Real systems have workers that process items from queues, scan databases, generate reports, or run ETL pipelines. These workers loop continuously, and without context awareness, they cannot be stopped cleanly. Killing them abruptly risks leaving data in an inconsistent state.
+Real systems have long-running operations that process thousands or millions of records: generating monthly revenue reports, processing uploaded CSV files, running data migrations, exporting analytics. These operations can take minutes or hours. Without context awareness, they cannot be stopped cleanly -- killing them abruptly risks leaving data in an inconsistent state.
 
-A context-aware worker checks `ctx.Done()` at natural checkpoints -- between iterations, before starting a new item, after completing a unit of work. This gives the worker a chance to finish its current item, save progress, and exit cleanly. The pattern is simple but essential: in a `select` statement, combine `ctx.Done()` with the work channel. The runtime picks whichever is ready first.
+A context-aware worker checks `ctx.Done()` at natural checkpoints: between chunks of records, between files, after each page of results. This gives the worker a chance to finish its current unit of work, save progress, and exit cleanly. When a deployment rolls out (SIGTERM), when an admin cancels a report, or when a deadline approaches, the worker responds promptly without data corruption.
 
-The advanced challenge is handling partial work. If a worker is halfway through processing an item when cancellation arrives, it needs to decide: finish the current item (if fast enough), or abandon it and record where it stopped. This decision depends on the domain, but the mechanism is always the same context check.
+The key design decision: what happens to partial results? A report generator might return the 3,000 rows it processed before cancellation. A file processor might commit the chunks it completed. The mechanism is always the same -- check context between units -- but the partial result strategy depends on your domain.
 
-## Step 1 -- Basic Loop with Context Check
+## Step 1 -- Report Generator with Chunked Processing
 
-The simplest pattern: check `ctx.Done()` at the top of each loop iteration using a non-blocking select:
+Build a report generator that processes sales records in chunks. Between each chunk, it checks whether it should stop:
 
 ```go
 package main
@@ -38,20 +36,69 @@ import (
 	"time"
 )
 
-func main() {
-	ctx, cancel := context.WithTimeout(context.Background(), 350*time.Millisecond)
-	defer cancel()
+type ReportResult struct {
+	TotalRecords   int
+	ProcessedChunks int
+	TotalChunks    int
+	Revenue        float64
+	Complete       bool
+	CancelReason   string
+}
 
-	for i := 1; ; i++ {
+func generateSalesReport(ctx context.Context, totalRecords int, chunkSize int) ReportResult {
+	totalChunks := (totalRecords + chunkSize - 1) / chunkSize
+	result := ReportResult{TotalChunks: totalChunks}
+
+	fmt.Printf("[report] starting: %d records in %d chunks of %d\n",
+		totalRecords, totalChunks, chunkSize)
+
+	for chunk := 0; chunk < totalChunks; chunk++ {
+		// Check context BEFORE processing each chunk.
 		select {
 		case <-ctx.Done():
-			fmt.Printf("worker: stopped after %d items (%v)\n", i-1, ctx.Err())
-			return
+			result.CancelReason = ctx.Err().Error()
+			fmt.Printf("[report] cancelled at chunk %d/%d: %v\n",
+				chunk, totalChunks, ctx.Err())
+			return result
 		default:
 		}
 
-		fmt.Printf("worker: processing item %d\n", i)
-		time.Sleep(100 * time.Millisecond)
+		// Process this chunk.
+		recordsInChunk := chunkSize
+		remaining := totalRecords - result.TotalRecords
+		if remaining < chunkSize {
+			recordsInChunk = remaining
+		}
+
+		fmt.Printf("[report] processing chunk %d/%d (%d records)...\n",
+			chunk+1, totalChunks, recordsInChunk)
+		time.Sleep(100 * time.Millisecond) // Simulate processing.
+
+		result.TotalRecords += recordsInChunk
+		result.ProcessedChunks++
+		result.Revenue += float64(recordsInChunk) * 49.99
+	}
+
+	result.Complete = true
+	return result
+}
+
+func main() {
+	// Cancel after 350ms. With 100ms per chunk, only ~3 chunks will complete.
+	ctx, cancel := context.WithTimeout(context.Background(), 350*time.Millisecond)
+	defer cancel()
+
+	result := generateSalesReport(ctx, 5000, 1000) // 5 chunks of 1000
+
+	fmt.Println("\n=== Report Result ===")
+	fmt.Printf("Complete:   %v\n", result.Complete)
+	fmt.Printf("Processed:  %d/%d chunks\n", result.ProcessedChunks, result.TotalChunks)
+	fmt.Printf("Records:    %d/5000\n", result.TotalRecords)
+	fmt.Printf("Revenue:    $%.2f\n", result.Revenue)
+	if result.CancelReason != "" {
+		fmt.Printf("Cancelled:  %s\n", result.CancelReason)
+		fmt.Println("Action:     partial report saved, can resume from chunk",
+			result.ProcessedChunks+1)
 	}
 }
 ```
@@ -62,17 +109,26 @@ go run main.go
 ```
 Expected output:
 ```
-worker: processing item 1
-worker: processing item 2
-worker: processing item 3
-worker: stopped after 3 items (context deadline exceeded)
+[report] starting: 5000 records in 5 chunks of 1000
+[report] processing chunk 1/5 (1000 records)...
+[report] processing chunk 2/5 (1000 records)...
+[report] processing chunk 3/5 (1000 records)...
+[report] cancelled at chunk 3/5: context deadline exceeded
+
+=== Report Result ===
+Complete:   false
+Processed:  3/5 chunks
+Records:    3000/5000
+Revenue:    $149970.00
+Cancelled:  context deadline exceeded
+Action:     partial report saved, can resume from chunk 4
 ```
 
-The worker processes items until the 350ms timeout fires. It checks `ctx.Done()` at the top of each iteration, so it never starts a new item after cancellation. The `default` case in the select makes it non-blocking -- if Done is not ready, execution falls through to the work.
+The report processed 3 chunks before the deadline. The result contains the partial data (3000 records, partial revenue), and the caller knows exactly where to resume. No data is corrupted because the check happens between complete chunks.
 
-## Step 2 -- Select with Work Channel
+## Step 2 -- File Processor that Respects Deadlines
 
-When reading from a channel, combine `ctx.Done()` and the job channel in the SAME select:
+Build a processor that reads and transforms files from a directory. Each file is a complete unit of work -- cancellation happens between files, not mid-file:
 
 ```go
 package main
@@ -83,107 +139,91 @@ import (
 	"time"
 )
 
-func main() {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+type FileResult struct {
+	Name    string
+	Size    int
+	Status  string
+}
 
-	jobs := make(chan int, 10)
-	done := make(chan []int)
+func processFile(ctx context.Context, name string, sizeMB int) FileResult {
+	processTime := time.Duration(sizeMB*20) * time.Millisecond
 
-	// Producer: sends 20 jobs.
-	go func() {
-		for i := 1; i <= 20; i++ {
-			jobs <- i
-		}
-		close(jobs)
-	}()
-
-	// Worker: processes jobs until cancelled or channel is drained.
-	go func() {
-		var processed []int
-		for {
-			select {
-			case <-ctx.Done():
-				fmt.Printf("worker: cancelled, processed %d items\n", len(processed))
-				done <- processed
-				return
-			case job, ok := <-jobs:
-				if !ok {
-					fmt.Printf("worker: all jobs done, processed %d items\n", len(processed))
-					done <- processed
-					return
-				}
-				fmt.Printf("worker: processing job %d\n", job)
-				time.Sleep(50 * time.Millisecond)
-				processed = append(processed, job)
+	// Check deadline before starting. Skip files that cannot finish in time.
+	if deadline, ok := ctx.Deadline(); ok {
+		remaining := time.Until(deadline)
+		if remaining < processTime {
+			return FileResult{
+				Name:   name,
+				Size:   sizeMB,
+				Status: fmt.Sprintf("skipped (needs %v, only %v left)", processTime, remaining.Round(time.Millisecond)),
 			}
 		}
-	}()
+	}
 
-	// Cancel after 300ms.
-	time.Sleep(300 * time.Millisecond)
-	fmt.Println("main: cancelling worker")
-	cancel()
+	fmt.Printf("[processor] processing %s (%dMB, ~%v)\n", name, sizeMB, processTime)
 
-	result := <-done
-	fmt.Printf("main: worker completed %d items: %v\n", len(result), result)
+	select {
+	case <-time.After(processTime):
+		return FileResult{Name: name, Size: sizeMB, Status: "completed"}
+	case <-ctx.Done():
+		return FileResult{Name: name, Size: sizeMB, Status: fmt.Sprintf("interrupted: %v", ctx.Err())}
+	}
 }
-```
 
-### Verification
-```bash
-go run main.go
-```
-Expected output (approximately):
-```
-worker: processing job 1
-worker: processing job 2
-worker: processing job 3
-worker: processing job 4
-worker: processing job 5
-main: cancelling worker
-worker: cancelled, processed 5 items
-main: worker completed 5 items: [1 2 3 4 5]
-```
+func processDirectory(ctx context.Context, files []struct{ name string; sizeMB int }) []FileResult {
+	var results []FileResult
 
-The `select` statement picks between `ctx.Done()` and a new job from the channel. When cancellation arrives, the worker reports what it processed. This is the standard pattern for cancellable consumers.
-
-## Step 3 -- Finish Current Item Before Stopping
-
-Sometimes each item has multiple sub-steps that must complete together. Check cancellation BETWEEN items, but once an item starts, run all its sub-steps to completion:
-
-```go
-package main
-
-import (
-	"context"
-	"fmt"
-	"time"
-)
-
-func main() {
-	ctx, cancel := context.WithTimeout(context.Background(), 450*time.Millisecond)
-	defer cancel()
-
-	for item := 1; ; item++ {
-		// Check cancellation BEFORE starting a new item.
+	for _, f := range files {
+		// Check cancellation between files.
 		select {
 		case <-ctx.Done():
-			fmt.Printf("worker: stopped before item %d (%v)\n", item, ctx.Err())
-			return
+			// Mark remaining files as skipped.
+			for _, remaining := range files[len(results):] {
+				results = append(results, FileResult{
+					Name:   remaining.name,
+					Size:   remaining.sizeMB,
+					Status: "not started (context cancelled)",
+				})
+			}
+			return results
 		default:
 		}
 
-		fmt.Printf("worker: starting item %d\n", item)
-
-		// Once started, the item runs to completion regardless of cancellation.
-		for step := 1; step <= 3; step++ {
-			fmt.Printf("  step %d/%d\n", step, 3)
-			time.Sleep(50 * time.Millisecond)
-		}
-
-		fmt.Printf("worker: item %d complete\n", item)
+		result := processFile(ctx, f.name, f.sizeMB)
+		results = append(results, result)
 	}
+
+	return results
+}
+
+func main() {
+	files := []struct{ name string; sizeMB int }{
+		{"report-2024-01.csv", 5},   // 100ms
+		{"report-2024-02.csv", 3},   // 60ms
+		{"report-2024-03.csv", 8},   // 160ms
+		{"transactions.csv", 15},     // 300ms -- too large for remaining budget
+		{"summary.csv", 2},           // 40ms
+	}
+
+	// 350ms budget for all files.
+	ctx, cancel := context.WithTimeout(context.Background(), 350*time.Millisecond)
+	defer cancel()
+
+	fmt.Println("=== File Processing (budget: 350ms) ===\n")
+	results := processDirectory(ctx, files)
+
+	fmt.Println("\n=== Results ===")
+	for _, r := range results {
+		fmt.Printf("  %-25s %3dMB  %s\n", r.Name, r.Size, r.Status)
+	}
+
+	completed := 0
+	for _, r := range results {
+		if r.Status == "completed" {
+			completed++
+		}
+	}
+	fmt.Printf("\nProcessed: %d/%d files\n", completed, len(files))
 }
 ```
 
@@ -193,24 +233,27 @@ go run main.go
 ```
 Expected output:
 ```
-worker: starting item 1
-  step 1/3
-  step 2/3
-  step 3/3
-worker: item 1 complete
-worker: starting item 2
-  step 1/3
-  step 2/3
-  step 3/3
-worker: item 2 complete
-worker: stopped before item 3 (context deadline exceeded)
+=== File Processing (budget: 350ms) ===
+
+[processor] processing report-2024-01.csv (5MB, ~100ms)
+[processor] processing report-2024-02.csv (3MB, ~60ms)
+[processor] processing report-2024-03.csv (8MB, ~160ms)
+
+=== Results ===
+  report-2024-01.csv        5MB  completed
+  report-2024-02.csv        3MB  completed
+  report-2024-03.csv        8MB  completed
+  transactions.csv          15MB  skipped (needs 300ms, only 29ms left)
+  summary.csv                2MB  not started (context cancelled)
+
+Processed: 3/5 files
 ```
 
-The worker finishes each item's sub-steps atomically. It only checks for cancellation between items, never in the middle of one. This ensures data consistency -- no partially processed items.
+The processor completed 3 files, then detected that the 4th file (15MB, needs 300ms) could not finish within the remaining budget and skipped it proactively. The 5th file was never started because the context expired.
 
-## Step 4 -- Progress Reporting
+## Step 3 -- Progress Reporting for Long Operations
 
-Build a worker that reports progress through a channel, letting the caller monitor how far along it is:
+Build a data export that reports progress, allowing the caller to monitor completion or cancel when they have enough data:
 
 ```go
 package main
@@ -221,64 +264,76 @@ import (
 	"time"
 )
 
-type Progress struct {
-	ItemsProcessed int
-	TotalItems     int
-	CurrentItem    string
-	Done           bool
-	Err            error
+type ExportProgress struct {
+	Phase       string
+	PagesExported int
+	TotalPages    int
+	BytesWritten  int
+	Done          bool
+	Err           error
+}
+
+func exportUserData(ctx context.Context, totalPages int, progress chan<- ExportProgress) {
+	defer close(progress)
+
+	for page := 1; page <= totalPages; page++ {
+		select {
+		case <-ctx.Done():
+			progress <- ExportProgress{
+				Phase:         "cancelled",
+				PagesExported: page - 1,
+				TotalPages:    totalPages,
+				BytesWritten:  (page - 1) * 4096,
+				Done:          true,
+				Err:           ctx.Err(),
+			}
+			return
+		default:
+		}
+
+		progress <- ExportProgress{
+			Phase:         "exporting",
+			PagesExported: page,
+			TotalPages:    totalPages,
+			BytesWritten:  page * 4096,
+		}
+
+		time.Sleep(80 * time.Millisecond) // Simulate page export.
+	}
+
+	progress <- ExportProgress{
+		Phase:         "complete",
+		PagesExported: totalPages,
+		TotalPages:    totalPages,
+		BytesWritten:  totalPages * 4096,
+		Done:          true,
+	}
 }
 
 func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 350*time.Millisecond)
 	defer cancel()
 
-	progress := make(chan Progress)
+	progress := make(chan ExportProgress)
+	go exportUserData(ctx, 10, progress)
 
-	go func() {
-		defer close(progress)
-
-		items := []string{"alpha", "beta", "gamma", "delta", "epsilon"}
-		for i, item := range items {
-			select {
-			case <-ctx.Done():
-				progress <- Progress{
-					ItemsProcessed: i,
-					TotalItems:     len(items),
-					Done:           true,
-					Err:            ctx.Err(),
-				}
-				return
-			default:
-			}
-
-			progress <- Progress{
-				ItemsProcessed: i,
-				TotalItems:     len(items),
-				CurrentItem:    item,
-			}
-			time.Sleep(100 * time.Millisecond)
-		}
-
-		progress <- Progress{
-			ItemsProcessed: len(items),
-			TotalItems:     len(items),
-			Done:           true,
-		}
-	}()
-
+	fmt.Println("=== Data Export Progress ===\n")
 	for p := range progress {
 		if p.Done {
 			if p.Err != nil {
-				fmt.Printf("progress: stopped at %d/%d items (%v)\n",
-					p.ItemsProcessed, p.TotalItems, p.Err)
+				fmt.Printf("\nExport cancelled at page %d/%d (%d bytes written)\n",
+					p.PagesExported, p.TotalPages, p.BytesWritten)
+				fmt.Printf("Reason: %v\n", p.Err)
+				fmt.Println("Partial export file is valid and can be downloaded.")
 			} else {
-				fmt.Printf("progress: completed all %d/%d items\n",
-					p.ItemsProcessed, p.TotalItems)
+				fmt.Printf("\nExport complete: %d pages, %d bytes\n",
+					p.PagesExported, p.BytesWritten)
 			}
 			break
 		}
-		fmt.Printf("progress: [%d] processing %q\n", p.ItemsProcessed, p.CurrentItem)
+		pct := float64(p.PagesExported) / float64(p.TotalPages) * 100
+		fmt.Printf("  [%3.0f%%] page %d/%d exported (%d bytes)\n",
+			pct, p.PagesExported, p.TotalPages, p.BytesWritten)
 	}
 }
 ```
@@ -289,49 +344,156 @@ go run main.go
 ```
 Expected output:
 ```
-progress: [0] processing "alpha"
-progress: [1] processing "beta"
-progress: [2] processing "gamma"
-progress: stopped at 3/5 items (context deadline exceeded)
+=== Data Export Progress ===
+
+  [ 10%] page 1/10 exported (4096 bytes)
+  [ 20%] page 2/10 exported (8192 bytes)
+  [ 30%] page 3/10 exported (12288 bytes)
+  [ 40%] page 4/10 exported (16384 bytes)
+
+Export cancelled at page 4/10 (16384 bytes written)
+Reason: context deadline exceeded
+Partial export file is valid and can be downloaded.
 ```
 
-This pattern is useful for UI progress bars, health checks, or partial result collection.
+The progress channel lets the caller show a progress bar, log completion status, or decide to cancel early if partial data is sufficient.
+
+## Step 4 -- Atomic Units: Finish Current Record Before Stopping
+
+Sometimes each record has multiple steps that must complete together (like a database transaction). Check cancellation between records, but once a record starts, run all its steps to completion:
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"time"
+)
+
+type MigrationResult struct {
+	Migrated []string
+	Pending  []string
+	Error    error
+}
+
+func migrateRecord(recordID string) {
+	fmt.Printf("    validate %s\n", recordID)
+	time.Sleep(30 * time.Millisecond)
+	fmt.Printf("    transform %s\n", recordID)
+	time.Sleep(30 * time.Millisecond)
+	fmt.Printf("    write %s\n", recordID)
+	time.Sleep(30 * time.Millisecond)
+}
+
+func runMigration(ctx context.Context, records []string) MigrationResult {
+	result := MigrationResult{}
+
+	for i, record := range records {
+		// Check cancellation BETWEEN records.
+		select {
+		case <-ctx.Done():
+			result.Pending = records[i:]
+			result.Error = ctx.Err()
+			return result
+		default:
+		}
+
+		// Once started, a record runs to completion (all 3 steps).
+		fmt.Printf("[migration] record %d/%d: %s\n", i+1, len(records), record)
+		migrateRecord(record)
+		result.Migrated = append(result.Migrated, record)
+		fmt.Printf("[migration] record %s committed\n\n", record)
+	}
+
+	return result
+}
+
+func main() {
+	records := []string{
+		"user-001", "user-002", "user-003",
+		"user-004", "user-005",
+	}
+
+	// 250ms budget. Each record takes ~90ms (3 steps * 30ms).
+	// Should complete 2 records, cancel before 3rd.
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+
+	fmt.Println("=== Data Migration (budget: 250ms, ~90ms per record) ===\n")
+	result := runMigration(ctx, records)
+
+	fmt.Println("=== Migration Result ===")
+	fmt.Printf("Migrated: %v\n", result.Migrated)
+	fmt.Printf("Pending:  %v\n", result.Pending)
+	if result.Error != nil {
+		fmt.Printf("Stopped:  %v\n", result.Error)
+		fmt.Println("\nNo data corruption: each migrated record completed all 3 steps.")
+		fmt.Printf("Resume migration from record: %s\n", result.Pending[0])
+	}
+}
+```
+
+### Verification
+```bash
+go run main.go
+```
+Expected output:
+```
+=== Data Migration (budget: 250ms, ~90ms per record) ===
+
+[migration] record 1/5: user-001
+    validate user-001
+    transform user-001
+    write user-001
+[migration] record user-001 committed
+
+[migration] record 2/5: user-002
+    validate user-002
+    transform user-002
+    write user-002
+[migration] record user-002 committed
+
+=== Migration Result ===
+Migrated: [user-001 user-002]
+Pending:  [user-003 user-004 user-005]
+Stopped:  context deadline exceeded
+
+No data corruption: each migrated record completed all 3 steps.
+Resume migration from record: user-003
+```
+
+Each migrated record completed all three steps (validate, transform, write) atomically. No record is left half-processed. The caller knows exactly which records were migrated and where to resume.
 
 ## Common Mistakes
 
 ### Checking ctx.Done() Only at the Start
 **Wrong:**
 ```go
-for {
+for _, item := range items {
     select {
     case <-ctx.Done():
         return
     default:
     }
-    veryLongOperation() // runs for minutes -- no cancellation check inside
+    veryLongOperation(item) // runs for minutes -- no cancellation check inside
 }
 ```
-**Fix:** Check `ctx.Done()` at multiple points within long operations, or break them into smaller steps. A worker that only checks at the start of each iteration is effectively unresponsive to cancellation during the work phase.
+**Fix:** Check `ctx.Done()` at multiple points within long operations, or break them into smaller steps. A worker that only checks at the top of each iteration is unresponsive to cancellation during the work phase.
 
 ### Blocking on Channel Send After Cancellation
 **Wrong:**
 ```go
-select {
 case <-ctx.Done():
-    results <- partialResult // blocks forever if nobody is reading results!
-    return
-}
+    results <- partialResult // blocks forever if nobody is reading!
 ```
-**Fix:** Use a select for the send too:
+**Fix:**
 ```go
-select {
 case <-ctx.Done():
     select {
     case results <- partialResult:
     default: // drop if nobody is listening
     }
-    return
-}
 ```
 
 ### Not Returning After Cancellation
@@ -344,25 +506,22 @@ case <-ctx.Done():
 }
 doMoreWork() // this still runs
 ```
-**Fix:** Always `return` after handling cancellation. The `select` case does not break out of the surrounding loop or function -- you must explicitly return.
+**Fix:** Always `return` after handling cancellation. The `select` case does not break out of the surrounding loop or function.
 
 ### Using default in a Select with ctx.Done() and a Channel
-**Caution:** When you have both `ctx.Done()` and a work channel in a select, adding a `default` case creates a busy loop:
+**Caution:** When you have both `ctx.Done()` and a work channel in a select, adding a `default` case creates a busy loop that wastes CPU:
 ```go
 select {
-case <-ctx.Done():
-    return
-case job := <-jobs:
-    process(job)
-default:
-    // THIS SPINS THE CPU when both channels are empty!
+case <-ctx.Done(): return
+case job := <-jobs: process(job)
+default: // THIS SPINS THE CPU when both channels are empty!
 }
 ```
-Only use `default` when you intentionally want a non-blocking check (like the top-of-loop pattern in Step 1).
+Only use `default` in the non-blocking check pattern (the top-of-loop check in Step 1).
 
 ## Verify What You Learned
 
-Build a batch processor that receives a slice of 10 strings. Each takes 80ms. Use a 500ms timeout. Track which items were processed and which were skipped:
+Build a batch processor that transforms 10 records, each taking 60ms. Use a 400ms timeout. Track which records were processed and which were skipped:
 
 ```go
 package main
@@ -379,34 +538,31 @@ type BatchResult struct {
 	Reason    string
 }
 
-func batchProcessor(ctx context.Context, items []string) BatchResult {
+func batchTransform(ctx context.Context, records []string) BatchResult {
 	var processed []string
-	for i, item := range items {
+	for i, record := range records {
 		select {
 		case <-ctx.Done():
 			return BatchResult{
 				Processed: processed,
-				Skipped:   items[i:],
+				Skipped:   records[i:],
 				Reason:    ctx.Err().Error(),
 			}
 		default:
 		}
-		time.Sleep(80 * time.Millisecond)
-		processed = append(processed, item)
+		time.Sleep(60 * time.Millisecond)
+		processed = append(processed, fmt.Sprintf("%s:transformed", record))
 	}
-	return BatchResult{
-		Processed: processed,
-		Reason:    "completed",
-	}
+	return BatchResult{Processed: processed, Reason: "completed"}
 }
 
 func main() {
-	items := []string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"}
+	records := []string{"r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10"}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
 	defer cancel()
 
-	result := batchProcessor(ctx, items)
+	result := batchTransform(ctx, records)
 	fmt.Printf("Processed: %v\n", result.Processed)
 	fmt.Printf("Skipped:   %v\n", result.Skipped)
 	fmt.Printf("Reason:    %s\n", result.Reason)
@@ -417,23 +573,23 @@ func main() {
 ```bash
 go run main.go
 ```
-Expected output (approximately):
+Expected output:
 ```
-Processed: [a b c d e f]
-Skipped:   [g h i j]
+Processed: [r1:transformed r2:transformed r3:transformed r4:transformed r5:transformed r6:transformed]
+Skipped:   [r7 r8 r9 r10]
 Reason:    context deadline exceeded
 ```
 
 ## What's Next
-Continue to [08-graceful-shutdown-with-context](../08-graceful-shutdown-with-context/08-graceful-shutdown-with-context.md) to build a complete graceful shutdown system using context, signals, and WaitGroup.
+Continue to [08-graceful-shutdown-with-context](../08-graceful-shutdown-with-context/08-graceful-shutdown-with-context.md) to build a complete server shutdown sequence that drains in-flight requests, closes connections, and flushes logs.
 
 ## Summary
-- Check `ctx.Done()` at natural checkpoints: between iterations, before starting new work
-- Use `select` with `ctx.Done()` and work channels to handle both cancellation and new items
-- Decide whether to finish the current item on cancellation (domain-specific decision)
+- Check `ctx.Done()` at natural checkpoints: between chunks, between files, between records
+- Return partial results with enough information for the caller to resume
+- For multi-step records, check cancellation between records but finish steps atomically
+- Use the fail-fast pattern: check deadline before starting work that cannot finish in time
 - Report progress through a channel so callers can monitor long-running operations
 - Always `return` after handling cancellation -- do not fall through to more work
-- For multi-step items, check cancellation between items but finish sub-steps atomically
 - Avoid `default` in selects with work channels -- it creates busy loops
 
 ## Reference

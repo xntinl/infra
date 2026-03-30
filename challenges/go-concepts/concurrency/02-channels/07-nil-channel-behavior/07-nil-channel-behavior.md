@@ -4,11 +4,9 @@ concepts: [nil-channel, select, dynamic-disable, channel-state-machine]
 tools: [go]
 estimated_time: 30m
 bloom_level: analyze
-prerequisites: [goroutines, unbuffered-channels, buffered-channels, close, select-basics]
 ---
 
 # 7. Nil Channel Behavior
-
 
 ## Learning Objectives
 After completing this exercise, you will be able to:
@@ -19,9 +17,9 @@ After completing this exercise, you will be able to:
 
 ## Why Nil Channels
 
-At first, nil channels seem like a bug -- they block forever on both send and receive. Why would you ever want that? The answer lies in `select`. When a channel is nil, its `select` case is never chosen. This lets you dynamically enable and disable cases at runtime.
+Consider a system that merges sorted data from multiple sources -- a database query stream and a cache stream, for example. Each stream finishes at a different time. When the cache stream is exhausted, you need to stop reading from it but continue reading from the database stream until it also finishes.
 
-Consider merging two channels: you read from both until both are closed. Without nil channels, you'd need complex boolean flags. With nil channels, when one source closes, you set its variable to nil. The `select` naturally stops considering that case. The code is cleaner, shorter, and harder to get wrong.
+Without nil channels, you would need complex boolean flags, nested if-statements, and careful coordination. With nil channels, when one source closes, you set its variable to nil. The `select` naturally stops considering that case. The code is cleaner, shorter, and harder to get wrong.
 
 This pattern appears in production code for merging event streams, implementing timeouts that can be canceled, and building state machines where available operations change over time.
 
@@ -36,7 +34,7 @@ This pattern appears in production code for merging event streams, implementing 
 
 ## Step 1 -- Nil Channel Blocks Forever
 
-Demonstrate that a nil channel blocks on both send and receive.
+Demonstrate that a nil channel blocks on both send and receive. This is not a bug -- it is a property we will exploit in `select`.
 
 ```go
 package main
@@ -54,7 +52,7 @@ func main() {
     case val := <-ch:
         fmt.Println("received:", val) // never happens
     case <-time.After(200 * time.Millisecond):
-        fmt.Println("receive on nil: timed out (as expected)")
+        fmt.Println("receive on nil channel: blocked (timed out as expected)")
     }
 
     // Prove send blocks the same way.
@@ -62,7 +60,7 @@ func main() {
     case ch <- 42:
         fmt.Println("sent") // never happens
     case <-time.After(200 * time.Millisecond):
-        fmt.Println("send on nil: timed out (as expected)")
+        fmt.Println("send on nil channel: blocked (timed out as expected)")
     }
 }
 ```
@@ -71,15 +69,15 @@ func main() {
 ```bash
 go run main.go
 # Expected:
-#   receive on nil: timed out (as expected)
-#   send on nil: timed out (as expected)
+#   receive on nil channel: blocked (timed out as expected)
+#   send on nil channel: blocked (timed out as expected)
 ```
 
 Without the `select` + timeout, `<-ch` on a nil channel would deadlock (or block the goroutine forever if other goroutines exist).
 
 ## Step 2 -- Nil Channel in Select Is Skipped
 
-When a channel variable is nil, its `select` case is permanently skipped -- as if it doesn't exist.
+When a channel variable is nil, its `select` case is never chosen -- as if it does not exist. This is the key insight that makes nil channels useful.
 
 ```go
 package main
@@ -87,52 +85,65 @@ package main
 import "fmt"
 
 func main() {
-    var disabled chan int // nil -- this case will be skipped
-    backup := make(chan int, 1)
-    backup <- 99
+    var dbStream chan string    // nil -- this case will be skipped
+    cacheStream := make(chan string, 1)
+    cacheStream <- "user:42:cached"
 
     select {
-    case val := <-disabled:
-        fmt.Println("disabled:", val) // never chosen -- disabled is nil
-    case val := <-backup:
-        fmt.Println("backup channel selected:", val) // always chosen
+    case val := <-dbStream:
+        fmt.Println("from database:", val) // never chosen -- dbStream is nil
+    case val := <-cacheStream:
+        fmt.Println("from cache:", val) // always chosen
     }
 }
 ```
 
-This is the key insight that makes nil channels useful. You can dynamically control which select cases are active by assigning channel variables to nil or to a real channel.
+You can dynamically control which select cases are active by assigning channel variables to nil or to a real channel.
 
 ### Verification
 ```bash
 go run main.go
-# Expected: backup channel selected: 99
+# Expected: from cache: user:42:cached
 ```
 
-## Step 3 -- Merge Two Channels with Nil Disabling
+## Step 3 -- Merging Sorted Streams
 
-The core pattern: merge values from two channels until both are closed. When one closes, set it to nil so `select` stops trying to read from it.
+The core pattern: merge values from two sorted streams until both are exhausted. When one stream closes, set it to nil so `select` stops trying to read from it. The other stream continues until it also closes.
 
 ```go
 package main
 
 import "fmt"
 
-func merge(a, b <-chan int) <-chan int {
+func sortedStream(values []int) <-chan int {
+    ch := make(chan int)
+    go func() {
+        for _, v := range values {
+            ch <- v
+        }
+        close(ch)
+    }()
+    return ch
+}
+
+func mergeSorted(a, b <-chan int) <-chan int {
     out := make(chan int)
     go func() {
         defer close(out)
-        // Loop while at least one channel is still open (non-nil).
+        // Loop while at least one stream is still open (non-nil).
         for a != nil || b != nil {
             select {
             case val, ok := <-a:
                 if !ok {
-                    a = nil // disable this case
+                    fmt.Println("  [merge] stream A exhausted -- disabling")
+                    a = nil // disable this case in select
                     continue
                 }
                 out <- val
             case val, ok := <-b:
                 if !ok {
-                    b = nil // disable this case
+                    fmt.Println("  [merge] stream B exhausted -- disabling")
+                    b = nil // disable this case in select
                     continue
                 }
                 out <- val
@@ -143,29 +154,17 @@ func merge(a, b <-chan int) <-chan int {
 }
 
 func main() {
-    evens := make(chan int)
-    odds := make(chan int)
+    // Two sorted streams of different lengths.
+    streamA := sortedStream([]int{10, 30, 50})
+    streamB := sortedStream([]int{20, 40, 60, 80, 100})
 
-    go func() {
-        for _, v := range []int{2, 4, 6} {
-            evens <- v
-        }
-        close(evens)
-    }()
-
-    go func() {
-        for _, v := range []int{1, 3, 5, 7} {
-            odds <- v
-        }
-        close(odds)
-    }()
-
+    fmt.Println("Merged output:")
     count := 0
-    for val := range merge(evens, odds) {
-        fmt.Println(val)
+    for val := range mergeSorted(streamA, streamB) {
+        fmt.Printf("  %d\n", val)
         count++
     }
-    fmt.Printf("Merge complete: received %d values\n", count)
+    fmt.Printf("Merge complete: %d values from both streams\n", count)
 }
 ```
 
@@ -174,12 +173,13 @@ When `a` is closed, we set `a = nil`. The next iteration still enters `select`, 
 ### Verification
 ```bash
 go run main.go
-# Expected: all 7 values from both channels (order may vary), then "Merge complete: received 7 values"
+# Expected: all 8 values from both streams (interleaved order may vary),
+# then "Merge complete: 8 values from both streams"
 ```
 
-## Step 4 -- Dynamic Enable/Disable in a State Machine
+## Step 4 -- Merging Three Data Sources with Dynamic Disabling
 
-Use nil channels to model a worker with pause/resume capabilities. When paused, the jobs channel variable is set to nil, disabling job processing. When resumed, it's restored.
+Extend the pattern to merge three sources -- a scenario you encounter when aggregating data from multiple microservices. Each service responds at a different speed and produces a different number of results.
 
 ```go
 package main
@@ -189,88 +189,63 @@ import (
     "time"
 )
 
-func main() {
-    jobs := make(chan string, 10)
-    pauseCh := make(chan struct{})
-    resumeCh := make(chan struct{})
-    done := make(chan struct{})
-
-    for i := 1; i <= 8; i++ {
-        jobs <- fmt.Sprintf("job-%d", i)
-    }
-
-    go func() {
-        active := jobs // start in active state
-        for {
-            select {
-            case job, ok := <-active:
-                if !ok {
-                    fmt.Println("Worker: jobs channel closed, exiting")
-                    done <- struct{}{}
-                    return
-                }
-                fmt.Println("Worker: processing", job)
-                time.Sleep(40 * time.Millisecond)
-            case <-pauseCh:
-                fmt.Println("Worker: PAUSED")
-                active = nil // nil disables the job case
-            case <-resumeCh:
-                fmt.Println("Worker: RESUMED")
-                active = jobs // restore to re-enable
-            }
-        }
-    }()
-
-    time.Sleep(150 * time.Millisecond)
-    pauseCh <- struct{}{}
-    fmt.Println("Main: pause sent")
-
-    time.Sleep(200 * time.Millisecond)
-    resumeCh <- struct{}{}
-    fmt.Println("Main: resume sent")
-
-    time.Sleep(200 * time.Millisecond)
-    close(jobs)
-    <-done
+type Event struct {
+    Source string
+    Data   string
 }
-```
 
-### Verification
-```bash
-go run main.go
-# Expected: worker processes some jobs, pauses (stops processing), resumes, processes remaining, exits
-```
+func eventStream(source string, events []string, delay time.Duration) <-chan Event {
+    ch := make(chan Event)
+    go func() {
+        for _, e := range events {
+            time.Sleep(delay)
+            ch <- Event{Source: source, Data: e}
+        }
+        close(ch)
+    }()
+    return ch
+}
 
-## Step 5 -- Priority Merger
-
-A practical application: merging event streams with different priority levels.
-
-```go
-package main
-
-import (
-    "fmt"
-    "time"
-)
-
-func priorityMerge(high, low <-chan string) <-chan string {
-    out := make(chan string)
+func mergeEvents(sources ...<-chan Event) <-chan Event {
+    out := make(chan Event)
     go func() {
         defer close(out)
-        for high != nil || low != nil {
+        active := make([]<-chan Event, len(sources))
+        copy(active, sources)
+
+        for {
+            allNil := true
+            for _, ch := range active {
+                if ch != nil {
+                    allNil = false
+                    break
+                }
+            }
+            if allNil {
+                return
+            }
+
+            // Build select dynamically using reflect would be complex.
+            // For 3 known sources, explicit select is clearer.
             select {
-            case msg, ok := <-high:
+            case ev, ok := <-active[0]:
                 if !ok {
-                    high = nil
+                    active[0] = nil
                     continue
                 }
-                out <- "[HIGH] " + msg
-            case msg, ok := <-low:
+                out <- ev
+            case ev, ok := <-active[1]:
                 if !ok {
-                    low = nil
+                    active[1] = nil
                     continue
                 }
-                out <- "[LOW] " + msg
+                out <- ev
+            case ev, ok := <-active[2]:
+                if !ok {
+                    active[2] = nil
+                    continue
+                }
+                out <- ev
             }
         }
     }()
@@ -278,36 +253,96 @@ func priorityMerge(high, low <-chan string) <-chan string {
 }
 
 func main() {
-    high := make(chan string)
-    low := make(chan string)
+    // Three services with different speeds and data volumes.
+    userSvc := eventStream("users", []string{"user-created", "user-updated"}, 30*time.Millisecond)
+    orderSvc := eventStream("orders", []string{"order-placed", "order-shipped", "order-delivered"}, 20*time.Millisecond)
+    paymentSvc := eventStream("payments", []string{"payment-received"}, 50*time.Millisecond)
 
-    go func() {
-        for _, msg := range []string{"alert", "critical", "urgent"} {
-            high <- msg
-            time.Sleep(30 * time.Millisecond)
-        }
-        close(high)
-    }()
-
-    go func() {
-        for _, msg := range []string{"info-1", "info-2", "info-3", "info-4", "info-5"} {
-            low <- msg
-            time.Sleep(20 * time.Millisecond)
-        }
-        close(low)
-    }()
-
-    for msg := range priorityMerge(high, low) {
-        fmt.Println(msg)
+    fmt.Println("Aggregating events from 3 services:")
+    for ev := range mergeEvents(userSvc, orderSvc, paymentSvc) {
+        fmt.Printf("  [%-8s] %s\n", ev.Source, ev.Data)
     }
+    fmt.Println("All services exhausted")
 }
 ```
 
 ### Verification
 ```bash
 go run main.go
-# Expected: all 8 messages with [HIGH] or [LOW] prefix, high-priority source eventually closes, only low messages remain
+# Expected: all 6 events from 3 services, interleaved by timing, then "All services exhausted"
 ```
+
+## Step 5 -- Dynamic Enable/Disable: Pausable Worker
+
+Use nil channels to model a worker with pause/resume capabilities. When paused, the task channel variable is set to nil, disabling task processing in the select. When resumed, it is restored.
+
+```go
+package main
+
+import (
+    "fmt"
+    "time"
+)
+
+func main() {
+    tasks := make(chan string, 10)
+    pauseCh := make(chan struct{})
+    resumeCh := make(chan struct{})
+    done := make(chan struct{})
+
+    for i := 1; i <= 8; i++ {
+        tasks <- fmt.Sprintf("deploy-service-%d", i)
+    }
+
+    go func() {
+        active := tasks // start in active state
+        for {
+            select {
+            case task, ok := <-active:
+                if !ok {
+                    fmt.Println("Worker: all tasks complete, exiting")
+                    done <- struct{}{}
+                    return
+                }
+                fmt.Println("Worker: executing", task)
+                time.Sleep(40 * time.Millisecond)
+            case <-pauseCh:
+                fmt.Println("Worker: PAUSED (maintenance window)")
+                active = nil // nil disables the task case in select
+            case <-resumeCh:
+                fmt.Println("Worker: RESUMED")
+                active = tasks // restore to re-enable
+            }
+        }
+    }()
+
+    time.Sleep(150 * time.Millisecond) // let worker process some tasks
+    pauseCh <- struct{}{}
+    fmt.Println("Main: pause sent -- simulating maintenance window")
+
+    time.Sleep(200 * time.Millisecond) // maintenance period
+    resumeCh <- struct{}{}
+    fmt.Println("Main: resume sent -- maintenance complete")
+
+    time.Sleep(250 * time.Millisecond)
+    close(tasks)
+    <-done
+}
+```
+
+### Verification
+```bash
+go run main.go
+# Expected: worker processes some tasks, pauses, resumes, processes remaining, exits
+```
+
+## Intermediate Verification
+
+Run the programs and confirm:
+1. Nil channels block forever on send and receive
+2. Nil channels are skipped in select statements
+3. Setting a channel to nil after close prevents select from spinning on zero values
+4. The merge pattern correctly handles sources that close at different times
 
 ## Common Mistakes
 
@@ -330,7 +365,7 @@ func main() {
 
 **Fix:** Always use `make(chan int)` to create a usable channel.
 
-### Not Checking Both Channels Are Nil Before Exiting
+### Not Checking All Channels Are Nil Before Exiting
 
 **Wrong:**
 ```go
@@ -359,6 +394,11 @@ for a != nil || b != nil {
     }
 }
 ```
+
+## Verify What You Learned
+1. What happens when you read from a nil channel outside of a select?
+2. Why is setting a closed channel to nil better than just checking `ok` each time?
+3. How would you merge 10 channels using the nil pattern without writing 10 select cases?
 
 ## What's Next
 Continue to [08-channel-of-channels](../08-channel-of-channels/08-channel-of-channels.md) to learn how to pass channels through channels for request-response patterns.

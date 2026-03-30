@@ -4,11 +4,9 @@ concepts: [fan-in, merge, variadic-channels, WaitGroup, goroutine-per-channel, d
 tools: [go]
 estimated_time: 40m
 bloom_level: create
-prerequisites: [select-basics, select-in-for-loop, done-channel-pattern, goroutines, WaitGroup]
 ---
 
 # 8. Multiplexing N Sources
-
 
 ## Learning Objectives
 - **Build** a merge function that combines N channels into one output channel
@@ -18,15 +16,15 @@ prerequisites: [select-basics, select-in-for-loop, done-channel-pattern, gorouti
 
 ## Why Multiplexing N Sources
 
-Earlier exercises used `select` with a fixed number of channels. This works when the number of sources is known at compile time: two producers, three event streams, one quit signal. But many real systems have a dynamic number of sources: N microservice connections, a variable number of file watchers, or a pool of workers all reporting results.
+Earlier exercises used `select` with a fixed number of channels. This works when the number of sources is known at compile time. But many real systems have a dynamic number of sources: you might aggregate logs from N application instances, collect metrics from a variable number of sensor feeds, or merge events from multiple API streams. The number of sources is only known at runtime.
 
-You cannot write a `select` with a variable number of cases (Go's `select` requires cases to be lexically present at compile time). The solution is the fan-in pattern: spawn one goroutine per source channel, each forwarding its values to a single shared output channel. A `sync.WaitGroup` tracks when all source goroutines have finished, at which point the output channel is closed.
+You cannot write a `select` with a variable number of cases -- Go's `select` requires cases to be lexically present at compile time. The solution is the fan-in pattern: spawn one goroutine per source channel, each forwarding its values to a single shared output channel. A `sync.WaitGroup` tracks when all source goroutines have finished, at which point the output channel is closed.
 
 This is the general-purpose channel multiplexer. It appears in Go's standard patterns, in the `x/sync/errgroup` package, and in virtually every pipeline-based architecture. Mastering it gives you the ability to compose arbitrary channel topologies.
 
-## Example 1 -- Merge Two Channels
+## Step 1 -- Merge Two Log Streams
 
-Start with the simplest case: merge two channels into one.
+Start with the simplest case: merge log events from two application instances into a single ordered stream.
 
 ```go
 package main
@@ -37,20 +35,20 @@ import (
 	"time"
 )
 
-func merge(ch1, ch2 <-chan int) <-chan int {
-	out := make(chan int)
+func merge(stream1, stream2 <-chan string) <-chan string {
+	out := make(chan string)
 	var wg sync.WaitGroup
 
-	forward := func(ch <-chan int) {
+	forward := func(ch <-chan string) {
 		defer wg.Done()
-		for val := range ch {
-			out <- val
+		for event := range ch {
+			out <- event
 		}
 	}
 
 	wg.Add(2)
-	go forward(ch1)
-	go forward(ch2)
+	go forward(stream1)
+	go forward(stream2)
 
 	go func() {
 		wg.Wait()
@@ -61,53 +59,53 @@ func merge(ch1, ch2 <-chan int) <-chan int {
 }
 
 func main() {
-	ch1 := make(chan int)
-	ch2 := make(chan int)
+	app1Logs := make(chan string)
+	app2Logs := make(chan string)
 
 	go func() {
-		for i := 0; i < 5; i++ {
-			ch1 <- i
+		entries := []string{"app1: request received", "app1: db query 42ms", "app1: response 200"}
+		for _, entry := range entries {
+			app1Logs <- entry
 			time.Sleep(30 * time.Millisecond)
 		}
-		close(ch1)
+		close(app1Logs)
 	}()
 
 	go func() {
-		for i := 100; i < 105; i++ {
-			ch2 <- i
-			time.Sleep(50 * time.Millisecond)
+		entries := []string{"app2: request received", "app2: cache hit", "app2: response 200", "app2: request received", "app2: response 500"}
+		for _, entry := range entries {
+			app2Logs <- entry
+			time.Sleep(20 * time.Millisecond)
 		}
-		close(ch2)
+		close(app2Logs)
 	}()
 
-	for val := range merge(ch1, ch2) {
-		fmt.Println("merged:", val)
+	for event := range merge(app1Logs, app2Logs) {
+		fmt.Println(event)
 	}
-	fmt.Println("all sources closed")
+	fmt.Println("all log streams closed")
 }
 ```
 
-Each source gets its own goroutine that forwards values to `out`. When a source closes, `range` exits and `wg.Done()` is called. After all sources finish, the WaitGroup goroutine closes `out`, which terminates the consumer's `range`.
+Each source gets its own goroutine that forwards events to `out`. When a source closes, `range` exits and `wg.Done()` is called. After all sources finish, the WaitGroup goroutine closes `out`, which terminates the consumer's `range`.
 
 ### Verification
 ```
-merged: 0
-merged: 100
-merged: 1
-merged: 101
-merged: 2
-merged: 3
-merged: 102
-merged: 4
-merged: 103
-merged: 104
-all sources closed
+app1: request received
+app2: request received
+app2: cache hit
+app1: db query 42ms
+app2: response 200
+app2: request received
+app1: response 200
+app2: response 500
+all log streams closed
 ```
-The exact interleaving varies, but all 10 values appear.
+The exact interleaving varies, but all 8 events appear and both streams are fully consumed.
 
-## Example 2 -- Generalize to N Channels
+## Step 2 -- Generalize to N Streams
 
-Replace the two-channel merge with a variadic version that accepts any number of channels.
+Replace the two-stream merge with a variadic version that accepts any number of channels. This is what you need when the number of application instances is only known at runtime.
 
 ```go
 package main
@@ -118,19 +116,19 @@ import (
 	"time"
 )
 
-func mergeN(channels ...<-chan int) <-chan int {
-	out := make(chan int)
+func mergeN(streams ...<-chan string) <-chan string {
+	out := make(chan string)
 	var wg sync.WaitGroup
 
-	forward := func(ch <-chan int) {
+	forward := func(ch <-chan string) {
 		defer wg.Done()
-		for val := range ch {
-			out <- val
+		for event := range ch {
+			out <- event
 		}
 	}
 
-	wg.Add(len(channels))
-	for _, ch := range channels {
+	wg.Add(len(streams))
+	for _, ch := range streams {
 		go forward(ch)
 	}
 
@@ -143,46 +141,46 @@ func mergeN(channels ...<-chan int) <-chan int {
 }
 
 func main() {
-	n := 4
-	sources := make([]<-chan int, n)
+	numInstances := 4
+	streams := make([]<-chan string, numInstances)
 
-	for i := 0; i < n; i++ {
-		ch := make(chan int)
-		sources[i] = ch
-		go func(id int, c chan<- int) {
+	for i := 0; i < numInstances; i++ {
+		ch := make(chan string)
+		streams[i] = ch
+		go func(instanceID int, c chan<- string) {
 			for j := 0; j < 3; j++ {
-				c <- id*100 + j
-				time.Sleep(time.Duration(20*(id+1)) * time.Millisecond)
+				c <- fmt.Sprintf("instance-%d: event-%d", instanceID, j)
+				time.Sleep(time.Duration(20*(instanceID+1)) * time.Millisecond)
 			}
 			close(c)
 		}(i, ch)
 	}
 
-	for val := range mergeN(sources...) {
-		fmt.Printf("received: %d\n", val)
+	for event := range mergeN(streams...) {
+		fmt.Println(event)
 	}
-	fmt.Println("all done")
+	fmt.Println("all instances reported, aggregation complete")
 }
 ```
 
-The pattern is identical to the two-channel version. The only change is iterating over the variadic slice instead of hardcoding two goroutines.
+The pattern is identical to the two-stream version. The only change is iterating over the variadic slice instead of hardcoding two goroutines.
 
 ### Verification
 ```
-received: 0
-received: 100
-received: 200
-received: 300
-received: 1
-received: 101
+instance-0: event-0
+instance-1: event-0
+instance-2: event-0
+instance-3: event-0
+instance-0: event-1
+instance-1: event-1
 ...
-all done
+all instances reported, aggregation complete
 ```
-You should see 12 values (4 sources x 3 values each) in interleaved order.
+You should see 12 events (4 instances x 3 events each) in interleaved order.
 
-## Example 3 -- Merge with Cancellation
+## Step 3 -- Handle Sources Finishing at Different Times
 
-Add a done channel so the consumer can cancel all forwarding goroutines without waiting for sources to close.
+In real systems, some sources produce data for minutes while others finish in seconds. The merge function must handle this gracefully: keep reading from active sources even after others close.
 
 ```go
 package main
@@ -193,23 +191,119 @@ import (
 	"time"
 )
 
-func mergeWithDone(done <-chan struct{}, channels ...<-chan int) <-chan int {
-	out := make(chan int)
+func mergeN(streams ...<-chan string) <-chan string {
+	out := make(chan string)
 	var wg sync.WaitGroup
 
-	forward := func(ch <-chan int) {
+	forward := func(ch <-chan string) {
 		defer wg.Done()
-		for val := range ch {
+		for event := range ch {
+			out <- event
+		}
+	}
+
+	wg.Add(len(streams))
+	for _, ch := range streams {
+		go forward(ch)
+	}
+
+	go func() {
+		wg.Wait()
+		close(out)
+	}()
+
+	return out
+}
+
+func main() {
+	// Sensor A: sends 2 readings quickly, then closes.
+	sensorA := make(chan string)
+	go func() {
+		sensorA <- "sensor-A: temperature=22.5C"
+		time.Sleep(20 * time.Millisecond)
+		sensorA <- "sensor-A: temperature=22.6C"
+		close(sensorA)
+		fmt.Println("--- sensor-A stream ended ---")
+	}()
+
+	// Sensor B: sends 5 readings over a longer period.
+	sensorB := make(chan string)
+	go func() {
+		for i := 0; i < 5; i++ {
+			sensorB <- fmt.Sprintf("sensor-B: pressure=%dhPa", 1013+i)
+			time.Sleep(40 * time.Millisecond)
+		}
+		close(sensorB)
+		fmt.Println("--- sensor-B stream ended ---")
+	}()
+
+	// Sensor C: sends 3 readings at medium pace.
+	sensorC := make(chan string)
+	go func() {
+		for i := 0; i < 3; i++ {
+			sensorC <- fmt.Sprintf("sensor-C: humidity=%d%%", 60+i)
+			time.Sleep(50 * time.Millisecond)
+		}
+		close(sensorC)
+		fmt.Println("--- sensor-C stream ended ---")
+	}()
+
+	for event := range mergeN(sensorA, sensorB, sensorC) {
+		fmt.Println("aggregated:", event)
+	}
+	fmt.Println("all sensor streams closed")
+}
+```
+
+### Verification
+```
+aggregated: sensor-A: temperature=22.5C
+aggregated: sensor-B: pressure=1013hPa
+aggregated: sensor-C: humidity=60%
+aggregated: sensor-A: temperature=22.6C
+--- sensor-A stream ended ---
+aggregated: sensor-B: pressure=1014hPa
+aggregated: sensor-C: humidity=61%
+aggregated: sensor-B: pressure=1015hPa
+aggregated: sensor-C: humidity=62%
+--- sensor-C stream ended ---
+aggregated: sensor-B: pressure=1016hPa
+aggregated: sensor-B: pressure=1017hPa
+--- sensor-B stream ended ---
+all sensor streams closed
+```
+Sensor A finishes first, but the aggregator keeps reading from B and C until they also close.
+
+## Step 4 -- Merge with Cancellation
+
+Add a done channel so the consumer can cancel all forwarding goroutines without waiting for sources to close. This is essential when you want to stop aggregation early (e.g., after collecting enough data or on shutdown).
+
+```go
+package main
+
+import (
+	"fmt"
+	"sync"
+	"time"
+)
+
+func mergeWithDone(done <-chan struct{}, streams ...<-chan string) <-chan string {
+	out := make(chan string)
+	var wg sync.WaitGroup
+
+	forward := func(ch <-chan string) {
+		defer wg.Done()
+		for event := range ch {
 			select {
 			case <-done:
 				return
-			case out <- val:
+			case out <- event:
 			}
 		}
 	}
 
-	wg.Add(len(channels))
-	for _, ch := range channels {
+	wg.Add(len(streams))
+	for _, ch := range streams {
 		go forward(ch)
 	}
 
@@ -224,38 +318,38 @@ func mergeWithDone(done <-chan struct{}, channels ...<-chan int) <-chan int {
 func main() {
 	done := make(chan struct{})
 
-	// Create sources that produce indefinitely.
-	sources := make([]<-chan int, 3)
+	// Create 3 streams that produce events indefinitely.
+	streams := make([]<-chan string, 3)
+	names := []string{"api-gateway", "auth-service", "payment-service"}
 	for i := 0; i < 3; i++ {
-		ch := make(chan int)
-		sources[i] = ch
-		go func(id int, c chan<- int) {
-			val := 0
+		ch := make(chan string)
+		streams[i] = ch
+		go func(name string, c chan<- string) {
+			seq := 0
 			for {
 				select {
 				case <-done:
 					close(c)
 					return
-				case c <- val:
-					val++
+				case c <- fmt.Sprintf("%s: log-entry-%d", name, seq):
+					seq++
 					time.Sleep(50 * time.Millisecond)
 				}
 			}
-		}(i, ch)
+		}(names[i], ch)
 	}
 
-	merged := mergeWithDone(done, sources...)
+	merged := mergeWithDone(done, streams...)
 
-	// Consume 10 values, then cancel.
+	// Consume 10 events, then cancel.
 	for i := 0; i < 10; i++ {
-		fmt.Println("value:", <-merged)
+		fmt.Println(<-merged)
 	}
 
 	close(done)
-	// Drain remaining in-flight values so goroutines can exit.
 	for range merged {
-	}
-	fmt.Println("cancelled and cleaned up")
+	} // Drain in-flight events.
+	fmt.Println("aggregation cancelled and cleaned up")
 }
 ```
 
@@ -263,23 +357,23 @@ The forward goroutines check `done` on every send to `out`. When `done` is close
 
 ### Verification
 ```
-value: 0
-value: 0
-value: 0
-value: 1
-value: 1
-value: 1
-value: 2
-value: 2
-value: 2
-value: 3
-cancelled and cleaned up
+api-gateway: log-entry-0
+auth-service: log-entry-0
+payment-service: log-entry-0
+api-gateway: log-entry-1
+auth-service: log-entry-1
+payment-service: log-entry-1
+api-gateway: log-entry-2
+auth-service: log-entry-2
+payment-service: log-entry-2
+api-gateway: log-entry-3
+aggregation cancelled and cleaned up
 ```
-Exactly 10 values appear, then clean shutdown. No goroutine leaks.
+Exactly 10 events appear, then clean shutdown. No goroutine leaks.
 
-## Example 4 -- Merge Channels of Different Types
+## Step 5 -- Tagged Events for Source Identification
 
-The same pattern works for any channel type. Here is a string version.
+In a real aggregator, you need to know which source produced each event. Wrap events in a struct that carries the source identifier.
 
 ```go
 package main
@@ -290,19 +384,28 @@ import (
 	"time"
 )
 
-func mergeStrings(channels ...<-chan string) <-chan string {
-	out := make(chan string)
+type Event struct {
+	Source  string
+	Payload string
+}
+
+func mergeTagged(done <-chan struct{}, streams ...<-chan Event) <-chan Event {
+	out := make(chan Event)
 	var wg sync.WaitGroup
 
-	forward := func(ch <-chan string) {
+	forward := func(ch <-chan Event) {
 		defer wg.Done()
-		for val := range ch {
-			out <- val
+		for event := range ch {
+			select {
+			case <-done:
+				return
+			case out <- event:
+			}
 		}
 	}
 
-	wg.Add(len(channels))
-	for _, ch := range channels {
+	wg.Add(len(streams))
+	for _, ch := range streams {
 		go forward(ch)
 	}
 
@@ -314,43 +417,56 @@ func mergeStrings(channels ...<-chan string) <-chan string {
 	return out
 }
 
+func makeSource(done <-chan struct{}, name string, count int, interval time.Duration) <-chan Event {
+	ch := make(chan Event)
+	go func() {
+		defer close(ch)
+		for i := 0; i < count; i++ {
+			event := Event{
+				Source:  name,
+				Payload: fmt.Sprintf("entry-%d", i),
+			}
+			select {
+			case <-done:
+				return
+			case ch <- event:
+			}
+			time.Sleep(interval)
+		}
+	}()
+	return ch
+}
+
 func main() {
-	ch1 := make(chan string)
-	ch2 := make(chan string)
+	done := make(chan struct{})
 
-	go func() {
-		for i := 0; i < 3; i++ {
-			ch1 <- fmt.Sprintf("hello-%d", i)
-			time.Sleep(40 * time.Millisecond)
-		}
-		close(ch1)
-	}()
-
-	go func() {
-		for i := 0; i < 3; i++ {
-			ch2 <- fmt.Sprintf("world-%d", i)
-			time.Sleep(60 * time.Millisecond)
-		}
-		close(ch2)
-	}()
-
-	for val := range mergeStrings(ch1, ch2) {
-		fmt.Println("merged:", val)
+	streams := []<-chan Event{
+		makeSource(done, "nginx-access", 3, 20*time.Millisecond),
+		makeSource(done, "app-errors", 2, 40*time.Millisecond),
+		makeSource(done, "audit-log", 4, 30*time.Millisecond),
 	}
-	fmt.Println("complete")
+
+	for event := range mergeTagged(done, streams...) {
+		fmt.Printf("[%s] %s\n", event.Source, event.Payload)
+	}
+	fmt.Println("all sources exhausted")
 }
 ```
 
 ### Verification
 ```
-merged: hello-0
-merged: world-0
-merged: hello-1
-merged: world-1
-merged: hello-2
-merged: world-2
-complete
+[nginx-access] entry-0
+[app-errors] entry-0
+[audit-log] entry-0
+[nginx-access] entry-1
+[audit-log] entry-1
+[nginx-access] entry-2
+[app-errors] entry-1
+[audit-log] entry-2
+[audit-log] entry-3
+all sources exhausted
 ```
+Each event carries its source name, making it easy to filter, route, or aggregate by origin.
 
 ## Common Mistakes
 
@@ -359,9 +475,9 @@ Only one goroutine should close `out`, and only after ALL forwarders have finish
 
 ```go
 // BAD: multiple goroutines might close out.
-forward := func(ch <-chan int) {
-    for val := range ch {
-        out <- val
+forward := func(ch <-chan string) {
+    for event := range ch {
+        out <- event
     }
     close(out) // PANIC if another forwarder is still sending.
 }
@@ -391,7 +507,7 @@ In Go versions before 1.22, the loop variable in a `for range` is shared across 
 
 ```go
 // SAFE: ch is a function parameter, not a closure capture.
-for _, ch := range channels {
+for _, ch := range streams {
     go forward(ch) // ch is passed by value.
 }
 ```
@@ -407,7 +523,7 @@ for _, ch := range channels {
 You have completed the select and multiplexing section. The next section covers sync primitives (`sync.Mutex`, `sync.RWMutex`, `sync.Once`, `sync.Pool`) for shared-state concurrency.
 
 ## Summary
-Multiplexing N channels into one uses the fan-in pattern: one goroutine per source forwards values to a shared output channel. A `sync.WaitGroup` tracks forwarders and a separate goroutine closes the output channel when all forwarders are done. Adding a done channel enables cancellation. This pattern is the general-purpose solution for dynamic channel composition and appears throughout production Go code.
+Multiplexing N channels into one uses the fan-in pattern: one goroutine per source forwards events to a shared output channel. A `sync.WaitGroup` tracks forwarders and a separate goroutine closes the output channel when all forwarders are done. In a real-time data aggregator scenario (log streams, sensor feeds, API events), this lets you merge events from a dynamic number of sources into a single ordered stream. Adding a done channel enables cancellation when you need to stop aggregation early. Sources finishing at different times is handled naturally -- the merge keeps reading from active sources.
 
 ## Reference
 - [Go Concurrency Patterns: Fan-in](https://go.dev/blog/pipelines)

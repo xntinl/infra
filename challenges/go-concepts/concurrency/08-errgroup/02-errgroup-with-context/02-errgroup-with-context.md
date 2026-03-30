@@ -1,304 +1,442 @@
 ---
 difficulty: intermediate
-concepts: [errgroup.WithContext, context.Context, automatic cancellation, ctx.Done, ctx.Err]
+concepts: [context.WithCancel, cooperative cancellation, goroutine leak, fail-fast, concurrent API calls]
 tools: [go]
 estimated_time: 30m
 bloom_level: apply
-prerequisites: [errgroup basics, context.Context, context.WithCancel]
 ---
 
-# 2. Errgroup with Context
-
+# 2. Errgroup with Context -- Dashboard Data Loader
 
 ## Learning Objectives
 After completing this exercise, you will be able to:
-- **Create** an errgroup with `errgroup.WithContext` to get automatic cancellation
-- **Implement** goroutines that respect context cancellation via `ctx.Done()`
-- **Explain** the cancellation semantics: when one task fails, siblings are notified
-- **Design** cooperative cancellation where goroutines check context before proceeding
+- **Build** a dashboard data loader that fetches from multiple APIs concurrently with cancellation
+- **Implement** context-based cancellation so one failed API call stops all remaining requests
+- **Detect** goroutine leaks caused by missing cancellation
+- **Explain** why cooperative cancellation requires goroutines to actively check `ctx.Done()`
 
-## Why Errgroup with Context
+## Why Context Cancellation Matters
 
-A plain `errgroup.Group` runs all goroutines to completion even when one fails. If you launch 100 HTTP requests and the first one returns a 500 error, the other 99 still run -- wasting time, bandwidth, and server resources.
+Your dashboard page loads data from 4 internal APIs concurrently: user profile, recent orders, notifications, and recommendations. If the orders API is down and returns an error after 50ms, the naive approach keeps the other 3 requests running for another 2 seconds -- even though you already know the dashboard cannot render completely.
 
-`errgroup.WithContext` solves this by associating a `context.Context` with the group. When any goroutine returns a non-nil error, the context is automatically cancelled. Sibling goroutines that check `ctx.Done()` can detect this and bail out early. The derived context is cancelled when the first error occurs OR when `Wait()` returns -- whichever happens first.
+In production, this means:
+- Wasted HTTP connections to services that are under load
+- Goroutines stuck waiting for responses that nobody will use
+- Memory held by those goroutines until they eventually finish
+- If the failing service is slow instead of fast, you get goroutine leaks that accumulate over time
 
-This is the standard pattern for "fail fast" concurrent operations: launch N tasks, cancel the rest as soon as one fails, collect the error.
+The fix: when any API fails, cancel all remaining requests immediately. This is what `context.WithCancel` provides. The errgroup-with-context pattern automatically cancels a derived context when the first goroutine returns an error.
 
-## Step 1 -- Observe Without Context (Wasted Work)
+## Step 1 -- Without Cancellation (Wasted Resources)
 
-Run the program:
-
-```bash
-go mod tidy
-go run main.go
-```
-
-The `withoutContext` function launches 4 tasks. Task 1 fails immediately, but tasks 0, 2, and 3 run all three steps to completion:
+First, observe the problem. Four API calls run concurrently. The orders API fails at 50ms, but the other three keep running until they finish:
 
 ```go
 package main
 
 import (
-    "fmt"
-    "time"
-
-    "golang.org/x/sync/errgroup"
+	"fmt"
+	"sync"
+	"time"
 )
 
 func main() {
-    fmt.Println("=== Without Context ===")
-    var g errgroup.Group
+	fmt.Println("=== Without Cancellation ===")
+	start := time.Now()
 
-    for i := 0; i < 4; i++ {
-        i := i
-        g.Go(func() error {
-            if i == 1 {
-                fmt.Printf("  Task %d: failing immediately\n", i)
-                return fmt.Errorf("task %d failed", i)
-            }
-            for step := 0; step < 3; step++ {
-                time.Sleep(80 * time.Millisecond)
-                fmt.Printf("  Task %d: step %d (still working despite failure)\n", i, step)
-            }
-            return nil
-        })
-    }
+	var wg sync.WaitGroup
+	var once sync.Once
+	var firstErr error
 
-    if err := g.Wait(); err != nil {
-        fmt.Printf("Group error: %v\n", err)
-    }
+	apis := []struct {
+		name    string
+		latency time.Duration
+		fail    bool
+	}{
+		{"user-profile", 200 * time.Millisecond, false},
+		{"recent-orders", 50 * time.Millisecond, true},
+		{"notifications", 300 * time.Millisecond, false},
+		{"recommendations", 400 * time.Millisecond, false},
+	}
+
+	for _, api := range apis {
+		api := api
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
+			time.Sleep(api.latency)
+			if api.fail {
+				once.Do(func() {
+					firstErr = fmt.Errorf("%s: 503 service unavailable", api.name)
+				})
+				fmt.Printf("  [%v] %s: FAILED\n", time.Since(start).Round(time.Millisecond), api.name)
+				return
+			}
+			fmt.Printf("  [%v] %s: completed (wasted work!)\n", time.Since(start).Round(time.Millisecond), api.name)
+		}()
+	}
+
+	wg.Wait()
+	elapsed := time.Since(start).Round(time.Millisecond)
+	fmt.Printf("\nError: %v\n", firstErr)
+	fmt.Printf("Total time: %v -- waited for ALL goroutines despite knowing error at 50ms\n", elapsed)
 }
 ```
 
 **Expected output:**
 ```
-=== Without Context ===
-  Task 1: failing immediately
-  Task 0: step 0 (still working despite failure)
-  Task 2: step 0 (still working despite failure)
-  Task 3: step 0 (still working despite failure)
-  ...all tasks complete all 3 steps...
-Group error: task 1 failed
+=== Without Cancellation ===
+  [50ms] recent-orders: FAILED
+  [200ms] user-profile: completed (wasted work!)
+  [300ms] notifications: completed (wasted work!)
+  [400ms] recommendations: completed (wasted work!)
+
+Error: recent-orders: 503 service unavailable
+Total time: 400ms -- waited for ALL goroutines despite knowing error at 50ms
 ```
 
-The problem: tasks 0, 2, and 3 perform 240ms of useless work after task 1 has already failed. In production, this could be 100 HTTP requests hitting a server that is already returning errors.
+The error was known at 50ms, but the program waited 400ms for all goroutines to finish. Those 350ms of extra work are pure waste -- the dashboard will show an error page regardless.
 
-## Step 2 -- Add WithContext for Automatic Cancellation
+## Step 2 -- With Context Cancellation (Fail Fast)
 
-Replace the plain errgroup with `errgroup.WithContext`. Make goroutines check `ctx.Done()` between work steps:
+Now add `context.WithCancel`. When the first error occurs, cancel the context. All other goroutines check `ctx.Done()` and bail out early:
 
 ```go
 package main
 
 import (
-    "context"
-    "fmt"
-    "time"
-
-    "golang.org/x/sync/errgroup"
+	"context"
+	"fmt"
+	"sync"
+	"time"
 )
 
 func main() {
-    fmt.Println("=== With Context ===")
-    g, ctx := errgroup.WithContext(context.Background())
+	fmt.Println("=== With Context Cancellation ===")
+	start := time.Now()
 
-    for i := 0; i < 4; i++ {
-        i := i
-        g.Go(func() error {
-            // Check if context is already cancelled before starting
-            select {
-            case <-ctx.Done():
-                fmt.Printf("  Task %d: cancelled before starting\n", i)
-                return ctx.Err()
-            default:
-            }
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-            if i == 1 {
-                fmt.Printf("  Task %d: failing -- this cancels the context\n", i)
-                return fmt.Errorf("task %d failed", i)
-            }
+	var wg sync.WaitGroup
+	var once sync.Once
+	var firstErr error
 
-            for step := 0; step < 3; step++ {
-                select {
-                case <-ctx.Done():
-                    fmt.Printf("  Task %d: cancelled at step %d\n", i, step)
-                    return ctx.Err()
-                case <-time.After(80 * time.Millisecond):
-                    fmt.Printf("  Task %d: step %d done\n", i, step)
-                }
-            }
-            return nil
-        })
-    }
+	apis := []struct {
+		name    string
+		latency time.Duration
+		fail    bool
+	}{
+		{"user-profile", 200 * time.Millisecond, false},
+		{"recent-orders", 50 * time.Millisecond, true},
+		{"notifications", 300 * time.Millisecond, false},
+		{"recommendations", 400 * time.Millisecond, false},
+	}
 
-    if err := g.Wait(); err != nil {
-        fmt.Printf("Group error: %v\n", err)
-    }
+	for _, api := range apis {
+		api := api
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
+			select {
+			case <-ctx.Done():
+				fmt.Printf("  [%v] %s: cancelled before starting\n",
+					time.Since(start).Round(time.Millisecond), api.name)
+				return
+			default:
+			}
+
+			select {
+			case <-ctx.Done():
+				fmt.Printf("  [%v] %s: cancelled while waiting\n",
+					time.Since(start).Round(time.Millisecond), api.name)
+				return
+			case <-time.After(api.latency):
+			}
+
+			if api.fail {
+				once.Do(func() {
+					firstErr = fmt.Errorf("%s: 503 service unavailable", api.name)
+					cancel() // cancel the context for all siblings
+				})
+				fmt.Printf("  [%v] %s: FAILED -- cancelling siblings\n",
+					time.Since(start).Round(time.Millisecond), api.name)
+				return
+			}
+
+			fmt.Printf("  [%v] %s: completed\n",
+				time.Since(start).Round(time.Millisecond), api.name)
+		}()
+	}
+
+	wg.Wait()
+	elapsed := time.Since(start).Round(time.Millisecond)
+	fmt.Printf("\nError: %v\n", firstErr)
+	fmt.Printf("Total time: %v -- siblings cancelled shortly after the failure\n", elapsed)
 }
 ```
 
 **Expected output:**
 ```
-=== With Context ===
-  Task 1: failing -- this cancels the context
-  Task 0: cancelled at step 0
-  Task 2: cancelled at step 0
-  Task 3: cancelled at step 0
-Group error: task 1 failed
+=== With Context Cancellation ===
+  [50ms] recent-orders: FAILED -- cancelling siblings
+  [50ms] user-profile: cancelled while waiting
+  [50ms] notifications: cancelled while waiting
+  [50ms] recommendations: cancelled while waiting
+
+Error: recent-orders: 503 service unavailable
+Total time: 50ms -- siblings cancelled shortly after the failure
 ```
 
-The key points:
-1. `errgroup.WithContext` returns both a group and a derived context
-2. When task 1 returns an error, the context is cancelled automatically
-3. Other tasks detect cancellation via `select` on `ctx.Done()`
-4. Cancellation is **cooperative** -- tasks must check the context themselves
+Total time dropped from 400ms to 50ms. The moment `recent-orders` fails and calls `cancel()`, the `select` statement in every other goroutine detects `ctx.Done()` and exits. No wasted connections, no lingering goroutines.
 
-## Step 3 -- Observe the Cancellation Timeline
+## Step 3 -- Goroutine Leak Without Cancellation
 
-This example shows precise timing. A fast task fails at ~100ms; a slow task (checking every ~50ms) detects the cancellation shortly after:
+Goroutine leaks are a real production problem. When a goroutine blocks on a channel send or sleep and nobody cancels it, it stays alive forever, consuming memory:
 
 ```go
 package main
 
 import (
-    "context"
-    "fmt"
-    "time"
-
-    "golang.org/x/sync/errgroup"
+	"fmt"
+	"runtime"
+	"sync"
+	"time"
 )
 
 func main() {
-    fmt.Println("=== Cancellation Timeline ===")
-    start := time.Now()
-    g, ctx := errgroup.WithContext(context.Background())
+	fmt.Println("=== Goroutine Leak Demo ===")
+	fmt.Printf("Goroutines before: %d\n", runtime.NumGoroutine())
 
-    g.Go(func() error {
-        time.Sleep(100 * time.Millisecond)
-        fmt.Printf("  [%v] Fast task: returning error\n", time.Since(start).Round(time.Millisecond))
-        return fmt.Errorf("fast task failed")
-    })
+	leakyDashboardLoad()
 
-    g.Go(func() error {
-        for i := 0; i < 10; i++ {
-            select {
-            case <-ctx.Done():
-                fmt.Printf("  [%v] Slow task: cancelled at iteration %d\n", time.Since(start).Round(time.Millisecond), i)
-                return ctx.Err()
-            case <-time.After(50 * time.Millisecond):
-                fmt.Printf("  [%v] Slow task: iteration %d\n", time.Since(start).Round(time.Millisecond), i)
-            }
-        }
-        return nil
-    })
+	time.Sleep(50 * time.Millisecond)
+	fmt.Printf("Goroutines after (leaky): %d -- leaked goroutines are still alive!\n", runtime.NumGoroutine())
 
-    if err := g.Wait(); err != nil {
-        fmt.Printf("  [%v] Wait returned: %v\n", time.Since(start).Round(time.Millisecond), err)
-    }
+	// In a real server, this happens on every request.
+	// 1000 requests/sec * 3 leaked goroutines = 3000 leaked goroutines/sec.
+	// The process eventually runs out of memory and crashes.
+}
+
+func leakyDashboardLoad() {
+	var wg sync.WaitGroup
+	var once sync.Once
+	var firstErr error
+
+	results := make(chan string) // unbuffered channel -- receivers might never read
+
+	apis := []string{"user-profile", "recent-orders", "notifications"}
+
+	for _, api := range apis {
+		api := api
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			time.Sleep(200 * time.Millisecond) // simulate API call
+			results <- fmt.Sprintf("data from %s", api) // BLOCKS if nobody reads
+		}()
+	}
+
+	// Only read one result, then "give up" due to an error
+	go func() {
+		firstResult := <-results
+		fmt.Printf("  Got: %s\n", firstResult)
+		once.Do(func() {
+			firstErr = fmt.Errorf("decided to abort after first result")
+		})
+	}()
+
+	time.Sleep(300 * time.Millisecond) // simulate waiting
+	_ = firstErr
+	// The other 2 goroutines are stuck on `results <- ...` forever.
+	// They cannot be garbage collected because the channel is still referenced.
 }
 ```
 
 **Expected output:**
 ```
-=== Cancellation Timeline ===
-  [50ms]  Slow task: iteration 0
-  [100ms] Fast task: returning error
-  [100ms] Slow task: cancelled at iteration 1
-  [100ms] Wait returned: fast task failed
+=== Goroutine Leak Demo ===
+Goroutines before: 1
+  Got: data from user-profile
+Goroutines after (leaky): 4 -- leaked goroutines are still alive!
 ```
 
-Without context, the slow task would run for 500ms. With context, it stops at ~100ms.
+The goroutine count increased by 3 (the API goroutines) and 2 of them are stuck forever trying to send on a channel that nobody reads. With context cancellation, each goroutine would check `ctx.Done()` before the channel send and exit cleanly.
 
-## Step 4 -- Context Is Also Cancelled on Success
+## Step 4 -- Complete Dashboard Loader with Cancellation
 
-An important detail: the derived context is **always** cancelled when `Wait()` returns, even if all tasks succeeded. Do not use the derived context for work that outlives the group:
+Put it all together into a production-style dashboard loader. Each API fetch respects context cancellation. Pass `ctx` to any function that accepts it (like `http.NewRequestWithContext` in real code):
 
 ```go
 package main
 
 import (
-    "context"
-    "fmt"
-
-    "golang.org/x/sync/errgroup"
+	"context"
+	"fmt"
+	"sync"
+	"time"
 )
 
+type DashboardData struct {
+	UserName       string
+	OrderCount     int
+	Notifications  int
+	Recommendations []string
+}
+
 func main() {
-    g, ctx := errgroup.WithContext(context.Background())
+	fmt.Println("=== Dashboard Data Loader ===")
 
-    g.Go(func() error {
-        return nil // succeeds
-    })
+	fmt.Println("\n--- Scenario 1: All APIs healthy ---")
+	start := time.Now()
+	data, err := loadDashboard(false)
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+	} else {
+		fmt.Printf("Dashboard: user=%s, orders=%d, notifications=%d, recs=%d\n",
+			data.UserName, data.OrderCount, data.Notifications, len(data.Recommendations))
+	}
+	fmt.Printf("Time: %v\n", time.Since(start).Round(time.Millisecond))
 
-    _ = g.Wait()
-    fmt.Printf("ctx.Err() after Wait: %v\n", ctx.Err())
+	fmt.Println("\n--- Scenario 2: Orders API failing ---")
+	start = time.Now()
+	data, err = loadDashboard(true)
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+	}
+	fmt.Printf("Time: %v (fast failure, no wasted work)\n", time.Since(start).Round(time.Millisecond))
+}
+
+func loadDashboard(ordersDown bool) (*DashboardData, error) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var wg sync.WaitGroup
+	var once sync.Once
+	var firstErr error
+
+	var data DashboardData
+	var mu sync.Mutex
+
+	type apiCall struct {
+		name string
+		fn   func(context.Context) error
+	}
+
+	calls := []apiCall{
+		{"user-profile", func(ctx context.Context) error {
+			if err := simulateAPI(ctx, 100*time.Millisecond); err != nil {
+				return fmt.Errorf("user-profile: %w", err)
+			}
+			mu.Lock()
+			data.UserName = "alice"
+			mu.Unlock()
+			return nil
+		}},
+		{"recent-orders", func(ctx context.Context) error {
+			if ordersDown {
+				time.Sleep(40 * time.Millisecond)
+				return fmt.Errorf("recent-orders: 503 service unavailable")
+			}
+			if err := simulateAPI(ctx, 80*time.Millisecond); err != nil {
+				return fmt.Errorf("recent-orders: %w", err)
+			}
+			mu.Lock()
+			data.OrderCount = 42
+			mu.Unlock()
+			return nil
+		}},
+		{"notifications", func(ctx context.Context) error {
+			if err := simulateAPI(ctx, 120*time.Millisecond); err != nil {
+				return fmt.Errorf("notifications: %w", err)
+			}
+			mu.Lock()
+			data.Notifications = 7
+			mu.Unlock()
+			return nil
+		}},
+		{"recommendations", func(ctx context.Context) error {
+			if err := simulateAPI(ctx, 150*time.Millisecond); err != nil {
+				return fmt.Errorf("recommendations: %w", err)
+			}
+			mu.Lock()
+			data.Recommendations = []string{"item-1", "item-2", "item-3"}
+			mu.Unlock()
+			return nil
+		}},
+	}
+
+	for _, call := range calls {
+		call := call
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := call.fn(ctx); err != nil {
+				once.Do(func() {
+					firstErr = err
+					cancel()
+				})
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	if firstErr != nil {
+		return nil, firstErr
+	}
+	return &data, nil
+}
+
+func simulateAPI(ctx context.Context, latency time.Duration) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(latency):
+		return nil
+	}
 }
 ```
 
 **Expected output:**
 ```
-ctx.Err() after Wait: context canceled
+=== Dashboard Data Loader ===
+
+--- Scenario 1: All APIs healthy ---
+Dashboard: user=alice, orders=42, notifications=7, recs=3
+Time: 150ms
+
+--- Scenario 2: Orders API failing ---
+Error: recent-orders: 503 service unavailable
+Time: 40ms (fast failure, no wasted work)
 ```
 
-## Step 5 -- Passing the Context to Library Functions
+The `simulateAPI` function uses the same `select` pattern you would use with `http.NewRequestWithContext` in real code. When the context is cancelled, the simulated API call returns immediately with `context.Canceled`.
 
-The real power of errgroup+context: pass `ctx` to standard library functions that accept `context.Context`. When a sibling fails, HTTP requests, database queries, and other I/O get cancelled automatically:
+The `golang.org/x/sync/errgroup` package provides exactly this pattern via `errgroup.WithContext`:
 
 ```go
-package main
-
-import (
-    "context"
-    "fmt"
-    "time"
-
-    "golang.org/x/sync/errgroup"
-)
-
-func main() {
-    g, ctx := errgroup.WithContext(context.Background())
-
-    for i := 0; i < 3; i++ {
-        i := i
-        g.Go(func() error {
-            if i == 1 {
-                time.Sleep(50 * time.Millisecond)
-                return fmt.Errorf("task %d deliberate failure", i)
-            }
-            // In real code: http.NewRequestWithContext(ctx, ...)
-            err := simulateHTTPFetch(ctx, 200*time.Millisecond)
-            if err != nil {
-                fmt.Printf("  Task %d: fetch cancelled: %v\n", i, err)
-                return err
-            }
-            fmt.Printf("  Task %d: fetch completed\n", i)
-            return nil
-        })
-    }
-
-    if err := g.Wait(); err != nil {
-        fmt.Printf("Group error: %v\n", err)
-    }
-}
-
-func simulateHTTPFetch(ctx context.Context, duration time.Duration) error {
-    select {
-    case <-ctx.Done():
-        return ctx.Err()
-    case <-time.After(duration):
-        return nil
-    }
-}
+// With errgroup.WithContext, the same code becomes:
+//   g, ctx := errgroup.WithContext(context.Background())
+//   g.Go(func() error { return fetchUserProfile(ctx) })
+//   g.Go(func() error { return fetchOrders(ctx) })
+//   g.Go(func() error { return fetchNotifications(ctx) })
+//   g.Go(func() error { return fetchRecommendations(ctx) })
+//   err := g.Wait()
+//
+// No WaitGroup, no Once, no manual cancel(), no mutex for error capture.
+// The context is automatically cancelled when the first Go() returns an error.
 ```
 
-**Expected output:**
-```
-  Task 1: deliberate failure
-  Task 0: fetch cancelled: context canceled
-  Task 2: fetch cancelled: context canceled
-Group error: task 1 deliberate failure
-```
+## Intermediate Verification
+
+At this point, verify:
+1. Without cancellation, total time equals the slowest API (~400ms)
+2. With cancellation, total time equals the time to first failure (~50ms)
+3. The goroutine leak demo shows goroutine count increasing
+4. The complete dashboard loader returns in ~40ms when an API is down
 
 ## Common Mistakes
 
@@ -306,99 +444,86 @@ Group error: task 1 deliberate failure
 
 **Wrong:**
 ```go
-g, ctx := errgroup.WithContext(context.Background())
-_ = ctx // created but never used
-g.Go(func() error {
+go func() {
+    defer wg.Done()
     time.Sleep(10 * time.Second) // blocks regardless of cancellation
-    return nil
-})
+    results <- data
+}()
 ```
 
-**What happens:** The context is cancelled but goroutines do not notice. You get no benefit from `WithContext`.
+**What happens:** The context is cancelled but the goroutine does not notice. It runs the full 10 seconds, then tries to send on a channel that may already be abandoned. Context cancellation is cooperative -- goroutines must check.
 
-**Fix:** Always use `select` with `ctx.Done()` inside long-running goroutines:
+**Fix:** Use `select` with `ctx.Done()`:
 ```go
-g.Go(func() error {
+go func() {
+    defer wg.Done()
     select {
     case <-ctx.Done():
-        return ctx.Err()
+        return
     case <-time.After(10 * time.Second):
-        return nil
+        results <- data
     }
-})
+}()
 ```
 
-### Using the parent context instead of the derived one
+### Returning ctx.Err() when your task is the first to fail
 
 **Wrong:**
 ```go
-parentCtx := context.Background()
-g, _ := errgroup.WithContext(parentCtx)
-g.Go(func() error {
-    <-parentCtx.Done() // parentCtx is NEVER cancelled by errgroup
-    return nil
-})
+if somethingFailed {
+    return ctx.Err() // might be nil if you are the first to fail!
+}
 ```
 
-**What happens:** `parentCtx` is never cancelled. The goroutine blocks forever.
+**What happens:** If your goroutine is the first to fail, the context has not been cancelled yet. `ctx.Err()` returns nil. Your error is silently lost.
 
-**Fix:** Always use the context returned by `WithContext`:
+**Fix:** Return your own descriptive error. Only return `ctx.Err()` when reacting to a sibling's cancellation:
 ```go
-g, ctx := errgroup.WithContext(parentCtx)
-g.Go(func() error {
-    <-ctx.Done() // this IS cancelled when a sibling fails
-    return ctx.Err()
-})
+if somethingFailed {
+    return fmt.Errorf("orders API returned 503")
+}
 ```
 
-### Returning ctx.Err() for your own failure
+### Forgetting defer cancel() on the parent
 
 **Wrong:**
 ```go
-g.Go(func() error {
-    if somethingFailed {
-        return ctx.Err() // might be nil if you are the first to fail!
-    }
-    return nil
-})
+ctx, cancel := context.WithCancel(context.Background())
+// no defer cancel()
+// if loadDashboard returns early on error, cancel is never called
 ```
 
-**What happens:** If your task is the first to fail, the context has not been cancelled yet, so `ctx.Err()` returns nil. Your error is lost.
+**What happens:** The context and its resources are never freed. The Go vet tool will warn about this.
 
-**Fix:** Return your own error. Only return `ctx.Err()` when reacting to cancellation by a sibling:
-```go
-g.Go(func() error {
-    if somethingFailed {
-        return fmt.Errorf("my task failed: %w", err) // your own error
-    }
-    return nil
-})
-```
+**Fix:** Always `defer cancel()` immediately after creating the context.
 
 ## Verify What You Learned
 
 Run the full program and confirm:
-1. Without context, all tasks complete despite the failure
-2. With context, sibling tasks cancel early
-3. The timeline shows cancellation propagating within one check interval
-4. The derived context is cancelled even on success
+1. Without cancellation, all API calls complete even after a failure
+2. With cancellation, sibling goroutines exit within milliseconds of the first failure
+3. Goroutine leaks are visible in the goroutine count
+4. The dashboard loader handles both success and failure scenarios correctly
 
 ```bash
 go run main.go
 ```
 
 ## What's Next
-Continue to [03-errgroup-setlimit](../03-errgroup-setlimit/03-errgroup-setlimit.md) to learn how `g.SetLimit(n)` controls the maximum number of concurrent goroutines.
+Continue to [03-errgroup-setlimit](../03-errgroup-setlimit/03-errgroup-setlimit.md) to learn how to limit concurrency -- because checking 1000 services simultaneously would overwhelm your network.
 
 ## Summary
-- `errgroup.WithContext` returns a group and a derived context that is cancelled on first error
-- Goroutines must cooperatively check `ctx.Done()` to respond to cancellation
-- Use `select` with `ctx.Done()` in loops and before long operations
-- The derived context is also cancelled when `Wait()` returns (even without errors)
-- Return your own descriptive error when your task fails; return `ctx.Err()` only when reacting to sibling cancellation
-- Pass the derived context to library functions (`http.NewRequestWithContext`, etc.) for automatic cancellation
+- Context cancellation prevents wasted work when one concurrent task fails
+- Without cancellation, all goroutines run to completion even if the result is already known to be an error
+- Cancellation is cooperative: goroutines must check `ctx.Done()` via `select` to respond
+- Goroutine leaks happen when goroutines block on channel operations without context checks
+- The pattern: `context.WithCancel` + `cancel()` in the error handler + `select` on `ctx.Done()` in each goroutine
+- `golang.org/x/sync/errgroup.WithContext` provides this pattern built-in: the context is automatically cancelled when the first `Go()` returns a non-nil error
+- Always `defer cancel()` to release context resources
+- Return your own error for failures; return `ctx.Err()` only when reacting to sibling cancellation
 
 ## Reference
-- [errgroup.WithContext documentation](https://pkg.go.dev/golang.org/x/sync/errgroup#WithContext)
+- [context.WithCancel documentation](https://pkg.go.dev/context#WithCancel)
 - [Go Blog: Context](https://go.dev/blog/context)
-- [Context and Cancellation patterns](https://pkg.go.dev/context)
+- [errgroup.WithContext documentation](https://pkg.go.dev/golang.org/x/sync/errgroup#WithContext)
+- [Go Concurrency Patterns: Context](https://go.dev/blog/context)

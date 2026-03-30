@@ -4,11 +4,9 @@ concepts: [select, priority, nested-select, fairness, starvation]
 tools: [go]
 estimated_time: 30m
 bloom_level: analyze
-prerequisites: [select-basics, select-with-default, channels, goroutines]
 ---
 
 # 4. Select Priority Trick
-
 
 ## Learning Objectives
 - **Demonstrate** that `select` picks randomly among ready cases
@@ -17,15 +15,15 @@ prerequisites: [select-basics, select-with-default, channels, goroutines]
 
 ## Why Priority
 
-Go's `select` is fair by design: when multiple cases are ready, it picks one uniformly at random. This prevents starvation but creates a problem when some messages genuinely matter more than others. A shutdown signal should take precedence over a work item. A high-priority queue should drain before low-priority messages.
+Go's `select` is fair by design: when multiple cases are ready, it picks one uniformly at random. This prevents starvation but creates a problem in task processing systems. Consider a task queue with urgent tasks (payment failures, security alerts) and normal tasks (report generation, email sending). If both queues have items and `select` picks randomly, an urgent payment failure might sit in the queue while a low-priority report generates.
 
 Go has no built-in priority `select`. The language designers intentionally avoided it because priority inversion and starvation are hard to reason about. But real systems need priority, so the community developed a pattern: the nested select trick. It is not perfect -- it trades fairness for priority in a best-effort manner -- but it is the standard idiom when one channel must be checked first.
 
 Understanding this pattern also highlights a deeper truth: `select` is a building block, not a complete solution. Complex scheduling requires deliberate design above the language primitives.
 
-## Example 1 -- Demonstrating Random Selection
+## Step 1 -- Prove That a Single Select Ignores Priority
 
-First, prove that `select` is truly random when both channels are ready.
+First, demonstrate the problem. Fill both an urgent and a normal task queue, then process items with a flat `select`. Both queues get roughly equal attention regardless of urgency.
 
 ```go
 package main
@@ -33,37 +31,40 @@ package main
 import "fmt"
 
 func main() {
-	high := make(chan string, 100)
-	low := make(chan string, 100)
+	urgent := make(chan string, 100)
+	normal := make(chan string, 100)
 
 	for i := 0; i < 100; i++ {
-		high <- "high"
-		low <- "low"
+		urgent <- fmt.Sprintf("URGENT: payment-failure-%d", i)
+		normal <- fmt.Sprintf("normal: generate-report-%d", i)
 	}
 
-	highCount, lowCount := 0, 0
+	urgentProcessed, normalProcessed := 0, 0
 	for i := 0; i < 100; i++ {
 		select {
-		case <-high:
-			highCount++
-		case <-low:
-			lowCount++
+		case <-urgent:
+			urgentProcessed++
+		case <-normal:
+			normalProcessed++
 		}
 	}
 
-	fmt.Printf("high: %d, low: %d\n", highCount, lowCount)
+	fmt.Printf("urgent: %d, normal: %d\n", urgentProcessed, normalProcessed)
+	fmt.Println("Problem: urgent tasks get ~50%% of attention, not 100%%")
 }
 ```
 
 ### Verification
 Run multiple times. Both counts should hover around 50, varying by ~10:
 ```
-high: 47, low: 53
+urgent: 47, normal: 53
+Problem: urgent tasks get ~50% of attention, not 100%
 ```
+A payment failure waiting while reports generate is unacceptable.
 
-## Example 2 -- The Nested Select Trick
+## Step 2 -- The Double-Select Trick
 
-To prioritize the high channel, check it first in an outer `select` with a `default` case. Only fall through to the inner `select` (which listens on both) if the high channel is empty.
+To prioritize urgent tasks, check the urgent queue first in an outer `select` with a `default` case. Only fall through to the inner `select` (which listens on both) if the urgent queue is empty.
 
 ```go
 package main
@@ -71,45 +72,50 @@ package main
 import "fmt"
 
 func main() {
-	high := make(chan string, 100)
-	low := make(chan string, 100)
+	urgent := make(chan string, 100)
+	normal := make(chan string, 100)
 
 	for i := 0; i < 100; i++ {
-		high <- "high"
-		low <- "low"
+		urgent <- fmt.Sprintf("URGENT: payment-failure-%d", i)
+		normal <- fmt.Sprintf("normal: generate-report-%d", i)
 	}
 
-	highCount, lowCount := 0, 0
+	urgentProcessed, normalProcessed := 0, 0
 	for i := 0; i < 200; i++ {
 		select {
-		case <-high:
-			highCount++
+		case task := <-urgent:
+			urgentProcessed++
+			_ = task
 		default:
-			// High channel empty — fall through to inner select.
+			// Urgent queue empty — check both queues.
 			select {
-			case <-high:
-				highCount++
-			case <-low:
-				lowCount++
+			case task := <-urgent:
+				urgentProcessed++
+				_ = task
+			case task := <-normal:
+				normalProcessed++
+				_ = task
 			}
 		}
 	}
 
-	fmt.Printf("high: %d, low: %d\n", highCount, lowCount)
+	fmt.Printf("urgent: %d, normal: %d\n", urgentProcessed, normalProcessed)
+	fmt.Println("All urgent tasks processed before normal tasks get attention")
 }
 ```
 
-The outer `select` first tries to receive from `high` only. If `high` is empty (hits `default`), the inner `select` listens on both channels. This ensures high-priority messages are drained before low-priority ones get attention.
+The outer `select` tries to receive from `urgent` only. If `urgent` is empty (hits `default`), the inner `select` listens on both channels. This drains all urgent tasks before normal tasks get attention.
 
 ### Verification
 ```
-high: 100, low: 100
+urgent: 100, normal: 100
+All urgent tasks processed before normal tasks get attention
 ```
-All 100 high messages are consumed first, then all 100 low messages. Add print statements inside the cases to verify ordering.
+All 100 urgent tasks are consumed first, then all 100 normal tasks.
 
-## Example 3 -- Priority with Live Producers
+## Step 3 -- Priority with Live Producers
 
-Apply the pattern to goroutines that produce messages at different rates.
+Apply the pattern to goroutines producing tasks at different rates. Urgent tasks arrive in bursts (every 50ms), normal tasks flow continuously (every 10ms).
 
 ```go
 package main
@@ -120,22 +126,22 @@ import (
 )
 
 func main() {
-	highCh := make(chan string, 10)
-	lowCh := make(chan string, 10)
+	urgentCh := make(chan string, 10)
+	normalCh := make(chan string, 10)
 	done := make(chan struct{})
 
-	// High-priority: 5 messages, 50ms apart.
+	// Urgent tasks: 5 payment failures, 50ms apart.
 	go func() {
 		for i := 0; i < 5; i++ {
-			highCh <- fmt.Sprintf("URGENT-%d", i)
+			urgentCh <- fmt.Sprintf("URGENT: payment-failure-%d", i)
 			time.Sleep(50 * time.Millisecond)
 		}
 	}()
 
-	// Low-priority: 20 messages, 10ms apart.
+	// Normal tasks: 20 report requests, 10ms apart.
 	go func() {
 		for i := 0; i < 20; i++ {
-			lowCh <- fmt.Sprintf("normal-%d", i)
+			normalCh <- fmt.Sprintf("normal: report-%d", i)
 			time.Sleep(10 * time.Millisecond)
 		}
 		close(done)
@@ -143,14 +149,14 @@ func main() {
 
 	for {
 		select {
-		case msg := <-highCh:
-			fmt.Println("[HIGH]", msg)
+		case task := <-urgentCh:
+			fmt.Println("[URGENT]", task)
 		default:
 			select {
-			case msg := <-highCh:
-				fmt.Println("[HIGH]", msg)
-			case msg := <-lowCh:
-				fmt.Println("[LOW]", msg)
+			case task := <-urgentCh:
+				fmt.Println("[URGENT]", task)
+			case task := <-normalCh:
+				fmt.Println("[NORMAL]", task)
 			case <-done:
 				fmt.Println("all producers finished")
 				return
@@ -161,19 +167,19 @@ func main() {
 ```
 
 ### Verification
-URGENT messages appear as soon as they arrive, interleaved with normal messages during gaps:
+Urgent tasks appear as soon as they arrive, taking precedence over normal tasks:
 ```
-[LOW]  normal-0
-[LOW]  normal-1
-[HIGH] URGENT-0
-[LOW]  normal-2
+[NORMAL] normal: report-0
+[NORMAL] normal: report-1
+[URGENT] URGENT: payment-failure-0
+[NORMAL] normal: report-2
 ...
 all producers finished
 ```
 
-## Example 4 -- Understanding the Limitation
+## Step 4 -- Understanding the Limitation: Best-Effort Priority
 
-The nested select is best-effort, not absolute. Between the outer `default` and the inner `select`, a high-priority message can arrive. The inner `select` then sees both channels ready and picks randomly.
+The nested select is best-effort, not absolute. Between the outer `default` and the inner `select`, an urgent task can arrive. The inner `select` then sees both channels ready and picks randomly. This means a small percentage of normal tasks slip through even when urgent tasks are available.
 
 ```go
 package main
@@ -181,53 +187,49 @@ package main
 import "fmt"
 
 func main() {
-	hi := make(chan string, 50)
-	lo := make(chan string, 50)
+	urgent := make(chan string, 50)
+	normal := make(chan string, 50)
 
 	for i := 0; i < 50; i++ {
-		hi <- "hi"
-		lo <- "lo"
+		urgent <- "payment-failure"
+		normal <- "generate-report"
 	}
 
-	hiWins, loWins := 0, 0
+	urgentWins, normalWins := 0, 0
 
 	for i := 0; i < 50; i++ {
 		select {
-		case <-hi:
-			hiWins++
+		case <-urgent:
+			urgentWins++
 		default:
 			select {
-			case <-hi:
-				hiWins++
-			case <-lo:
-				loWins++
+			case <-urgent:
+				urgentWins++
+			case <-normal:
+				normalWins++
 			}
 		}
 	}
 
-	fmt.Printf("hi: %d, lo: %d\n", hiWins, loWins)
-	if loWins > 0 {
-		fmt.Println("lo > 0 proves priority is best-effort, not absolute")
+	fmt.Printf("urgent: %d, normal: %d\n", urgentWins, normalWins)
+	if normalWins > 0 {
+		fmt.Println("normalWins > 0 proves priority is best-effort, not absolute")
+		fmt.Println("In practice this is acceptable: urgent tasks get ~95%+ of priority")
 	}
 }
 ```
 
 ### Verification
 ```
-hi: 48, lo: 2
+urgent: 48, normal: 2
+normalWins > 0 proves priority is best-effort, not absolute
+In practice this is acceptable: urgent tasks get ~95%+ of priority
 ```
-The exact split varies, but `lo` is almost always > 0. The outer select consumes most high messages, but occasionally the default fires when `hi` has data (race between evaluation and availability).
+The exact split varies, but `normal` is almost always > 0. The outer select captures most urgent tasks, but occasionally the default fires when `urgent` has data (race between evaluation and availability).
 
-## Common Mistakes
+## Step 5 -- Scaling Beyond Two Priority Levels
 
-### 1. Assuming Perfect Priority
-The nested select trick is best-effort. Between the outer `default` and the inner `select`, a high-priority message might arrive. The inner `select` then sees both channels ready and picks randomly. Priority is strongly biased, not absolute.
-
-### 2. Starving Low-Priority Channels
-If the high-priority channel always has data, the low-priority channel is never read. This is by design for priority, but if the low-priority channel has a bounded buffer, its senders will block and potentially deadlock. Monitor queue depths.
-
-### 3. Nesting Too Deeply
-More than two priority levels with nested selects becomes unreadable and error-prone. For three or more levels, use a priority queue data structure protected by a mutex:
+For three or more priority levels (critical, high, normal), nested selects become unreadable. Use a priority queue protected by a mutex instead.
 
 ```go
 package main
@@ -238,46 +240,66 @@ import (
 	"sync"
 )
 
-// Item represents a prioritized message.
-type Item struct {
-	value    string
+type Task struct {
+	name     string
 	priority int // lower = higher priority
 }
 
-// PriorityQueue implements heap.Interface.
-type PriorityQueue []*Item
+type TaskQueue []*Task
 
-func (pq PriorityQueue) Len() int            { return len(pq) }
-func (pq PriorityQueue) Less(i, j int) bool   { return pq[i].priority < pq[j].priority }
-func (pq PriorityQueue) Swap(i, j int)        { pq[i], pq[j] = pq[j], pq[i] }
-func (pq *PriorityQueue) Push(x interface{})  { *pq = append(*pq, x.(*Item)) }
-func (pq *PriorityQueue) Pop() interface{} {
-	old := *pq
+func (q TaskQueue) Len() int            { return len(q) }
+func (q TaskQueue) Less(i, j int) bool  { return q[i].priority < q[j].priority }
+func (q TaskQueue) Swap(i, j int)       { q[i], q[j] = q[j], q[i] }
+func (q *TaskQueue) Push(x interface{}) { *q = append(*q, x.(*Task)) }
+func (q *TaskQueue) Pop() interface{} {
+	old := *q
 	n := len(old)
-	item := old[n-1]
-	*pq = old[:n-1]
-	return item
+	task := old[n-1]
+	*q = old[:n-1]
+	return task
 }
 
 func main() {
 	var mu sync.Mutex
-	pq := &PriorityQueue{}
+	pq := &TaskQueue{}
 	heap.Init(pq)
 
 	mu.Lock()
-	heap.Push(pq, &Item{value: "low task", priority: 3})
-	heap.Push(pq, &Item{value: "critical task", priority: 1})
-	heap.Push(pq, &Item{value: "medium task", priority: 2})
+	heap.Push(pq, &Task{name: "generate-report", priority: 3})
+	heap.Push(pq, &Task{name: "payment-failure", priority: 1})
+	heap.Push(pq, &Task{name: "send-email-batch", priority: 2})
+	heap.Push(pq, &Task{name: "security-alert", priority: 1})
+	heap.Push(pq, &Task{name: "update-dashboard", priority: 3})
 	mu.Unlock()
 
 	mu.Lock()
 	for pq.Len() > 0 {
-		item := heap.Pop(pq).(*Item)
-		fmt.Printf("priority %d: %s\n", item.priority, item.value)
+		task := heap.Pop(pq).(*Task)
+		fmt.Printf("[priority %d] %s\n", task.priority, task.name)
 	}
 	mu.Unlock()
 }
 ```
+
+### Verification
+```
+[priority 1] payment-failure
+[priority 1] security-alert
+[priority 2] send-email-batch
+[priority 3] generate-report
+[priority 3] update-dashboard
+```
+
+## Common Mistakes
+
+### 1. Assuming Perfect Priority
+The nested select trick is best-effort. Between the outer `default` and the inner `select`, an urgent message might arrive. The inner `select` then sees both channels ready and picks randomly. Priority is strongly biased, not absolute.
+
+### 2. Starving Normal Tasks Indefinitely
+If the urgent channel always has data, normal tasks are never processed. This is by design for priority, but if the normal channel has a bounded buffer, its senders will block and potentially deadlock. Monitor queue depths and consider rate-limiting the urgent producer.
+
+### 3. Nesting Too Deeply
+More than two priority levels with nested selects becomes unreadable and error-prone. For three or more levels, use a priority queue with a mutex (Step 5).
 
 ### 4. Forgetting the Done Channel in the Inner Select
 If `done` is only in the outer select, the goroutine can get stuck in the inner select waiting on low-priority messages after shutdown was signaled. Always include the done/quit channel in the inner select too.
@@ -293,7 +315,7 @@ If `done` is only in the outer select, the goroutine can get stuck in the inner 
 In the next exercise, you will combine `select` with `for` loops to build continuous event loops -- the standard pattern for long-running goroutines.
 
 ## Summary
-Go's `select` is intentionally fair. To simulate priority, use a nested select: the outer `select` tries the high-priority channel with a `default`, and the inner `select` listens on all channels. This drains high-priority messages first but is best-effort, not absolute. For more than two priority levels, prefer a priority queue with explicit locking.
+Go's `select` is intentionally fair. To simulate priority in a task processor, use a nested select: the outer `select` tries the urgent channel with a `default`, and the inner `select` listens on all channels. This drains urgent tasks (payment failures, security alerts) before normal tasks (reports, emails) get attention. The pattern is best-effort, not absolute. For more than two priority levels, prefer a priority queue with explicit locking.
 
 ## Reference
 - [Go Spec: Select statements](https://go.dev/ref/spec#Select_statements)

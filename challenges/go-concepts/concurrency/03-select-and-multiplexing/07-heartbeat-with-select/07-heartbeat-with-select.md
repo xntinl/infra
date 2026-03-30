@@ -4,11 +4,9 @@ concepts: [select, time.Ticker, heartbeat, health-monitoring, stall-detection]
 tools: [go]
 estimated_time: 35m
 bloom_level: create
-prerequisites: [select-basics, select-in-for-loop, done-channel-pattern, time.Ticker]
 ---
 
 # 7. Heartbeat with Select
-
 
 ## Learning Objectives
 - **Create** a heartbeat signal using `time.Ticker` inside a select loop
@@ -17,15 +15,15 @@ prerequisites: [select-basics, select-in-for-loop, done-channel-pattern, time.Ti
 
 ## Why Heartbeats
 
-In distributed systems, silence is ambiguous. If a component stops sending data, is it dead, blocked, or just idle? Without a heartbeat, you cannot tell. A heartbeat is a periodic "I am alive" signal that lets a supervisor distinguish between "no work to do" and "something is wrong."
+In production systems, silence is ambiguous. If a background worker stops sending results, is it dead, blocked, or just idle? Without a heartbeat, you cannot tell. A heartbeat is a periodic "I am alive" signal that lets a supervisor distinguish between "no work to do" and "something is wrong."
 
-In Go concurrency, the same problem exists at the goroutine level. A worker goroutine might deadlock on a channel, get stuck in an infinite loop, or block on a slow external call. The supervisor goroutine needs a way to detect this. The heartbeat pattern solves it: the worker sends a periodic signal on a dedicated channel. If the supervisor does not receive a heartbeat within the expected interval, it knows the worker is stalled.
+Consider a pool of workers processing tasks from a queue. One worker silently deadlocks on a database connection. It holds a slot in the pool, consumes memory, and processes zero tasks. The other workers pick up the slack, but you have lost capacity without knowing it. With heartbeats, the supervisor detects the missing pulse within seconds and can restart the stalled worker.
 
-This pattern is the foundation for circuit breakers, watchdog timers, and health check endpoints. It uses `time.Ticker` for periodic timing and `select` for multiplexing the heartbeat alongside work channels.
+This pattern is the goroutine-level equivalent of TCP keepalive, Kubernetes liveness probes, and consul health checks. It uses `time.Ticker` for periodic timing and `select` for multiplexing the heartbeat alongside work channels.
 
-## Example 1 -- Basic Heartbeat with time.Ticker
+## Step 1 -- Worker Sends Heartbeats Alongside Work
 
-Create a worker that sends a heartbeat on a dedicated channel at regular intervals, alongside doing work.
+Create a worker that sends a heartbeat on a dedicated channel at regular intervals while processing tasks. The supervisor listens for both heartbeats and results.
 
 ```go
 package main
@@ -37,14 +35,16 @@ import (
 
 func main() {
 	done := make(chan struct{})
-	heartbeat := make(chan struct{}, 1) // Buffered: don't block worker.
-	workResults := make(chan int)
+	heartbeat := make(chan struct{}, 1) // Buffered: don't block the worker.
+	results := make(chan string)
 
+	// Worker goroutine.
 	go func() {
-		defer close(workResults)
+		defer close(results)
 		ticker := time.NewTicker(200 * time.Millisecond)
 		defer ticker.Stop()
 
+		tasks := []string{"process-order", "send-email", "generate-report", "update-index"}
 		i := 0
 		for {
 			select {
@@ -56,9 +56,9 @@ func main() {
 				case heartbeat <- struct{}{}:
 				default: // Drop if supervisor hasn't consumed the last one.
 				}
-			case workResults <- i:
+			case results <- tasks[i%len(tasks)]:
 				i++
-				time.Sleep(100 * time.Millisecond) // Simulate work.
+				time.Sleep(100 * time.Millisecond) // Simulate task processing.
 			}
 		}
 	}()
@@ -66,16 +66,16 @@ func main() {
 	timeout := time.After(1 * time.Second)
 	for {
 		select {
-		case val, ok := <-workResults:
+		case task, ok := <-results:
 			if !ok {
 				return
 			}
-			fmt.Println("result:", val)
+			fmt.Println("completed:", task)
 		case <-heartbeat:
-			fmt.Println("heartbeat received")
+			fmt.Println("heartbeat: worker alive")
 		case <-timeout:
 			close(done)
-			fmt.Println("stopping")
+			fmt.Println("supervisor: monitoring period ended")
 			return
 		}
 	}
@@ -85,21 +85,24 @@ func main() {
 The heartbeat channel is buffered with capacity 1. If the supervisor has not consumed the last heartbeat, the worker drops the new one instead of blocking. This prevents the heartbeat mechanism from interfering with actual work.
 
 ### Verification
-You should see interleaved result and heartbeat messages for about 1 second:
+You should see interleaved task completions and heartbeat messages for about 1 second:
 ```
-result: 0
-result: 1
-heartbeat received
-result: 2
-result: 3
-heartbeat received
+completed: process-order
+completed: send-email
+heartbeat: worker alive
+completed: generate-report
+completed: update-index
+heartbeat: worker alive
+completed: process-order
+completed: send-email
+heartbeat: worker alive
 ...
-stopping
+supervisor: monitoring period ended
 ```
 
-## Example 2 -- Detecting a Stalled Worker
+## Step 2 -- Detecting a Stalled Worker
 
-Build a supervisor that triggers an alert when heartbeats stop arriving. Simulate a stall by having the worker block.
+Build a supervisor that declares a worker dead when heartbeats stop arriving. Simulate a stall by having the worker block on a slow operation.
 
 ```go
 package main
@@ -113,20 +116,20 @@ func main() {
 	done := make(chan struct{})
 	heartbeat := make(chan struct{}, 1)
 
+	// Worker that stalls after 5 heartbeats (simulating a deadlocked DB call).
 	go func() {
 		ticker := time.NewTicker(100 * time.Millisecond)
 		defer ticker.Stop()
 
 		for i := 0; ; i++ {
-			// Simulate a stall after 5 iterations.
 			if i == 5 {
-				fmt.Println("worker: entering stall")
-				time.Sleep(5 * time.Second)
+				fmt.Println("worker: stuck on database connection (simulated deadlock)")
+				time.Sleep(5 * time.Second) // Simulated stall.
 			}
 
 			select {
 			case <-done:
-				fmt.Println("worker: shutting down")
+				fmt.Println("worker: received shutdown")
 				return
 			case <-ticker.C:
 				select {
@@ -139,9 +142,10 @@ func main() {
 		}
 	}()
 
-	// Supervisor: reset timer on every heartbeat.
-	const heartbeatTimeout = 500 * time.Millisecond
-	timer := time.NewTimer(heartbeatTimeout)
+	// Supervisor: expects heartbeats every 100ms.
+	// If none arrives for 500ms, the worker is declared dead.
+	const deadTimeout = 500 * time.Millisecond
+	timer := time.NewTimer(deadTimeout)
 	defer timer.Stop()
 
 	for {
@@ -154,9 +158,9 @@ func main() {
 				default:
 				}
 			}
-			timer.Reset(heartbeatTimeout)
+			timer.Reset(deadTimeout)
 		case <-timer.C:
-			fmt.Println("supervisor: ALERT — worker stalled!")
+			fmt.Println("supervisor: ALERT - worker missed heartbeat for 500ms, declaring dead")
 			close(done)
 			return
 		}
@@ -164,21 +168,136 @@ func main() {
 }
 ```
 
-The supervisor resets its timer every time it receives a heartbeat. If no heartbeat arrives within 500ms, the timer fires and the supervisor declares the worker stalled.
+The supervisor resets its timer every time it receives a heartbeat. If no heartbeat arrives within 500ms, the timer fires and the supervisor declares the worker dead.
 
 ### Verification
 ```
 supervisor: heartbeat OK
 supervisor: heartbeat OK
 supervisor: heartbeat OK
-...
-worker: entering stall
-supervisor: ALERT — worker stalled!
+supervisor: heartbeat OK
+supervisor: heartbeat OK
+worker: stuck on database connection (simulated deadlock)
+supervisor: ALERT - worker missed heartbeat for 500ms, declaring dead
 ```
 
-## Example 3 -- Reusable Heartbeat Worker Function
+## Step 3 -- Restart a Dead Worker
 
-Encapsulate the pattern into a function that returns read-only channels.
+Extend the supervisor to restart the worker when it detects a stall. This is the watchdog pattern used in production process managers.
+
+```go
+package main
+
+import (
+	"fmt"
+	"sync"
+	"time"
+)
+
+func startWorker(id int, done <-chan struct{}, heartbeat chan<- struct{}, stallAfter int) {
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	for i := 0; ; i++ {
+		if stallAfter > 0 && i == stallAfter {
+			fmt.Printf("worker-%d: stalling (simulated deadlock)\n", id)
+			time.Sleep(5 * time.Second)
+		}
+
+		select {
+		case <-done:
+			fmt.Printf("worker-%d: shutdown\n", id)
+			return
+		case <-ticker.C:
+			select {
+			case heartbeat <- struct{}{}:
+			default:
+			}
+		default:
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+}
+
+func main() {
+	const deadTimeout = 400 * time.Millisecond
+	var mu sync.Mutex
+	workerID := 1
+	workerDone := make(chan struct{})
+	heartbeat := make(chan struct{}, 1)
+
+	go startWorker(workerID, workerDone, heartbeat, 3) // Stalls after 3 heartbeats.
+
+	timer := time.NewTimer(deadTimeout)
+	defer timer.Stop()
+
+	maxRestarts := 2
+	restarts := 0
+
+	for {
+		select {
+		case <-heartbeat:
+			fmt.Printf("supervisor: worker-%d heartbeat OK\n", workerID)
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			timer.Reset(deadTimeout)
+
+		case <-timer.C:
+			mu.Lock()
+			fmt.Printf("supervisor: worker-%d declared dead\n", workerID)
+			close(workerDone)
+
+			if restarts >= maxRestarts {
+				fmt.Println("supervisor: max restarts reached, giving up")
+				mu.Unlock()
+				return
+			}
+
+			restarts++
+			workerID++
+			workerDone = make(chan struct{})
+			heartbeat = make(chan struct{}, 1)
+
+			stallAfter := 0 // New workers don't stall.
+			if restarts < maxRestarts {
+				stallAfter = 3 // But first restart still stalls (for demo).
+			}
+
+			go startWorker(workerID, workerDone, heartbeat, stallAfter)
+			fmt.Printf("supervisor: restarted as worker-%d (restart %d/%d)\n", workerID, restarts, maxRestarts)
+			timer.Reset(deadTimeout)
+			mu.Unlock()
+		}
+	}
+}
+```
+
+### Verification
+```
+supervisor: worker-1 heartbeat OK
+supervisor: worker-1 heartbeat OK
+supervisor: worker-1 heartbeat OK
+worker-1: stalling (simulated deadlock)
+supervisor: worker-1 declared dead
+supervisor: restarted as worker-2 (restart 1/2)
+supervisor: worker-2 heartbeat OK
+supervisor: worker-2 heartbeat OK
+supervisor: worker-2 heartbeat OK
+worker-2: stalling (simulated deadlock)
+supervisor: worker-2 declared dead
+supervisor: restarted as worker-3 (restart 2/2)
+supervisor: worker-3 heartbeat OK
+supervisor: worker-3 heartbeat OK
+...
+```
+
+## Step 4 -- Reusable Heartbeat Worker Function
+
+Encapsulate the heartbeat pattern into a function that returns read-only channels. The caller only sees heartbeats and results -- the internal ticker and goroutine are hidden.
 
 ```go
 package main
@@ -191,10 +310,10 @@ import (
 func heartbeatWorker(
 	done <-chan struct{},
 	pulseInterval time.Duration,
-	work func(i int) int,
-) (<-chan struct{}, <-chan int) {
+	work func(i int) string,
+) (<-chan struct{}, <-chan string) {
 	heartbeat := make(chan struct{}, 1)
-	results := make(chan int)
+	results := make(chan string)
 
 	go func() {
 		defer close(results)
@@ -223,49 +342,47 @@ func heartbeatWorker(
 func main() {
 	done := make(chan struct{})
 
-	hb, results := heartbeatWorker(done, 200*time.Millisecond, func(i int) int {
-		time.Sleep(80 * time.Millisecond)
-		return i * i
+	hb, results := heartbeatWorker(done, 200*time.Millisecond, func(i int) string {
+		time.Sleep(80 * time.Millisecond) // Simulate task work.
+		return fmt.Sprintf("task-%d complete", i)
 	})
 
 	timeout := time.After(1 * time.Second)
 	for {
 		select {
 		case <-hb:
-			fmt.Println("pulse")
-		case val, ok := <-results:
+			fmt.Println("pulse: worker alive")
+		case result, ok := <-results:
 			if !ok {
 				return
 			}
-			fmt.Println("result:", val)
+			fmt.Println("result:", result)
 		case <-timeout:
 			close(done)
 			for range results {
-			}
-			fmt.Println("done")
+			} // Drain.
+			fmt.Println("monitoring ended")
 			return
 		}
 	}
 }
 ```
 
-The function returns read-only channels, encapsulating the heartbeat machinery. The caller only listens for pulses and results.
-
 ### Verification
 ```
-result: 0
-result: 1
-pulse
-result: 4
-result: 9
-pulse
+result: task-0 complete
+result: task-1 complete
+pulse: worker alive
+result: task-2 complete
+result: task-3 complete
+pulse: worker alive
 ...
-done
+monitoring ended
 ```
 
-## Example 4 -- Monitoring Multiple Workers
+## Step 5 -- Monitoring Multiple Workers
 
-Launch several heartbeat workers and monitor all of them from a single supervisor.
+Launch several heartbeat workers and monitor all of them from a single supervisor. Each worker processes different tasks.
 
 ```go
 package main
@@ -278,10 +395,10 @@ import (
 func heartbeatWorker(
 	done <-chan struct{},
 	pulseInterval time.Duration,
-	work func(i int) int,
-) (<-chan struct{}, <-chan int) {
+	work func(i int) string,
+) (<-chan struct{}, <-chan string) {
 	heartbeat := make(chan struct{}, 1)
-	results := make(chan int)
+	results := make(chan string)
 
 	go func() {
 		defer close(results)
@@ -310,26 +427,26 @@ func heartbeatWorker(
 func main() {
 	done := make(chan struct{})
 
-	hb0, res0 := heartbeatWorker(done, 150*time.Millisecond, func(i int) int {
+	hb0, res0 := heartbeatWorker(done, 150*time.Millisecond, func(i int) string {
 		time.Sleep(70 * time.Millisecond)
-		return i
+		return fmt.Sprintf("orders: processed batch-%d", i)
 	})
-	hb1, res1 := heartbeatWorker(done, 150*time.Millisecond, func(i int) int {
+	hb1, res1 := heartbeatWorker(done, 150*time.Millisecond, func(i int) string {
 		time.Sleep(70 * time.Millisecond)
-		return 100 + i
+		return fmt.Sprintf("emails: sent batch-%d", i)
 	})
 
 	deadline := time.After(500 * time.Millisecond)
 	for {
 		select {
 		case <-hb0:
-			fmt.Println("[worker-0] heartbeat")
+			fmt.Println("[orders] heartbeat OK")
 		case <-hb1:
-			fmt.Println("[worker-1] heartbeat")
-		case val := <-res0:
-			fmt.Printf("[worker-0] result: %d\n", val)
-		case val := <-res1:
-			fmt.Printf("[worker-1] result: %d\n", val)
+			fmt.Println("[emails] heartbeat OK")
+		case result := <-res0:
+			fmt.Printf("[orders] %s\n", result)
+		case result := <-res1:
+			fmt.Printf("[emails] %s\n", result)
 		case <-deadline:
 			fmt.Println("monitoring ended")
 			close(done)
@@ -345,12 +462,12 @@ func main() {
 
 ### Verification
 ```
-[worker-0] result: 0
-[worker-1] result: 100
-[worker-0] heartbeat
-[worker-1] heartbeat
-[worker-0] result: 1
-[worker-1] result: 101
+[orders] orders: processed batch-0
+[emails] emails: sent batch-0
+[orders] heartbeat OK
+[emails] heartbeat OK
+[orders] orders: processed batch-1
+[emails] emails: sent batch-1
 ...
 monitoring ended
 ```
@@ -382,13 +499,13 @@ default: // Drop if buffer is full.
 - [ ] Can you explain why the heartbeat channel should be buffered?
 - [ ] Can you describe the relationship between heartbeat interval and detection timeout?
 - [ ] Can you implement a supervisor that restarts a stalled worker?
-- [ ] Can you explain how this pattern relates to TCP keepalive or HTTP health checks?
+- [ ] Can you explain how this pattern relates to Kubernetes liveness probes or TCP keepalive?
 
 ## What's Next
 In the next exercise, you will build a general-purpose channel multiplexer that merges N channels into one, combining fan-in with the select patterns you have learned.
 
 ## Summary
-The heartbeat pattern uses a `time.Ticker` inside a for-select loop to send periodic "alive" signals on a dedicated channel. The supervisor monitors this channel and triggers alerts when heartbeats stop arriving. The heartbeat channel must be buffered to prevent blocking the worker. The detection timeout should be significantly larger than the heartbeat interval to avoid false positives. This pattern is the goroutine-level equivalent of health checks in distributed systems.
+The heartbeat pattern uses a `time.Ticker` inside a for-select loop to send periodic "alive" signals on a dedicated channel. The supervisor monitors this channel with a `time.NewTimer` and triggers alerts when heartbeats stop arriving. If a worker stalls (deadlocked DB connection, infinite loop, blocked I/O), the supervisor detects it within the timeout window and can restart the worker. The heartbeat channel must be buffered to prevent blocking the worker. The detection timeout should be 2-3x the heartbeat interval to avoid false positives.
 
 ## Reference
 - [time.NewTicker](https://pkg.go.dev/time#NewTicker)

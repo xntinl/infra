@@ -1,33 +1,31 @@
 ---
 difficulty: basic
-concepts: [context.WithCancel, cancel function, ctx.Done channel, cancellation propagation]
+concepts: [context.WithCancel, cancel function, ctx.Done channel, cancellation propagation, goroutine leaks]
 tools: [go]
 estimated_time: 25m
 bloom_level: apply
-prerequisites: [context.Background, goroutines, channels basics]
 ---
 
 # 2. Context WithCancel
 
-
 ## Learning Objectives
 After completing this exercise, you will be able to:
 - **Create** a cancellable context using `context.WithCancel`
-- **Signal** goroutines to stop by calling the cancel function
-- **Listen** for cancellation via the `ctx.Done()` channel
-- **Observe** that cancellation propagates from parent to child contexts
+- **Propagate** cancellation to multiple concurrent data source queries
+- **Detect** goroutine leaks caused by missing cancellation
+- **Implement** a "first result wins, cancel the rest" pattern
 
 ## Why WithCancel
 
-In real programs, goroutines must be stoppable. A goroutine that runs forever leaks memory and CPU. The `context.WithCancel` function creates a derived context paired with a `cancel` function. When you call `cancel()`, the context's `Done()` channel is closed, and every goroutine listening on that channel receives the signal simultaneously.
+In real services, a single user action often triggers multiple concurrent operations. A search might query a database, a cache, and a full-text index simultaneously. When the user cancels the search -- or when one source returns a result -- all other queries should stop immediately. Without cancellation, those goroutines keep running, holding connections, consuming CPU, and leaking memory.
 
-This is the most fundamental cancellation mechanism in Go. HTTP servers use it to cancel request processing when the client disconnects. CLI tools use it to stop background work when the user presses Ctrl+C. Pipelines use it to tear down all stages when one stage fails.
+`context.WithCancel` creates a derived context paired with a `cancel` function. When you call `cancel()`, the context's `Done()` channel closes, and every goroutine listening on that channel receives the signal simultaneously. This is cooperative cancellation: the goroutine must explicitly check `ctx.Done()` and choose to stop. The context does not forcibly kill anything -- it sends a signal that the goroutine must honor.
 
-The key insight: cancellation is cooperative. The goroutine must explicitly check `ctx.Done()` and choose to stop. The context does not forcibly kill anything -- it sends a signal that the goroutine must honor.
+The real consequence of not using cancellation: in a service handling 10,000 requests per second, each leaking one goroutine, you will exhaust memory in minutes. This is not hypothetical -- it is one of the most common production incidents in Go services.
 
-## Step 1 -- Basic Cancel and Done
+## Step 1 -- Multi-Source User Search with Cancellation
 
-Create a cancellable context, pass it to a goroutine that loops until cancelled, then cancel from main:
+Build a user search that queries three data sources concurrently. When the user clicks "cancel" (simulated), all ongoing queries stop:
 
 ```go
 package main
@@ -35,34 +33,70 @@ package main
 import (
 	"context"
 	"fmt"
+	"math/rand"
 	"time"
 )
+
+func searchDatabase(ctx context.Context, query string, results chan<- string) {
+	delay := time.Duration(100+rand.Intn(200)) * time.Millisecond
+	select {
+	case <-time.After(delay):
+		results <- fmt.Sprintf("database: found user %q in %v", query, delay)
+	case <-ctx.Done():
+		fmt.Printf("[database]    search cancelled: %v\n", ctx.Err())
+	}
+}
+
+func searchCache(ctx context.Context, query string, results chan<- string) {
+	delay := time.Duration(50+rand.Intn(100)) * time.Millisecond
+	select {
+	case <-time.After(delay):
+		results <- fmt.Sprintf("cache: found user %q in %v", query, delay)
+	case <-ctx.Done():
+		fmt.Printf("[cache]       search cancelled: %v\n", ctx.Err())
+	}
+}
+
+func searchIndex(ctx context.Context, query string, results chan<- string) {
+	delay := time.Duration(150+rand.Intn(300)) * time.Millisecond
+	select {
+	case <-time.After(delay):
+		results <- fmt.Sprintf("index: found user %q in %v", query, delay)
+	case <-ctx.Done():
+		fmt.Printf("[full-index]  search cancelled: %v\n", ctx.Err())
+	}
+}
 
 func main() {
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel() // always defer cancel to avoid resource leaks
+	defer cancel()
 
-	go func(ctx context.Context) {
-		for i := 0; ; i++ {
-			select {
-			case <-ctx.Done():
-				fmt.Printf("goroutine: stopped (reason: %v)\n", ctx.Err())
-				return
-			default:
-				fmt.Printf("goroutine: working... iteration %d\n", i)
-				time.Sleep(100 * time.Millisecond)
-			}
+	results := make(chan string, 3)
+
+	fmt.Println("Starting user search across 3 sources...")
+	go searchDatabase(ctx, "alice@example.com", results)
+	go searchCache(ctx, "alice@example.com", results)
+	go searchIndex(ctx, "alice@example.com", results)
+
+	// Simulate user clicking "cancel" after 120ms.
+	go func() {
+		time.Sleep(120 * time.Millisecond)
+		fmt.Println("\n[user] clicked cancel")
+		cancel()
+	}()
+
+	// Collect results until context is cancelled.
+	for {
+		select {
+		case result := <-results:
+			fmt.Printf("[result] %s\n", result)
+		case <-ctx.Done():
+			fmt.Printf("\nSearch ended: %v\n", ctx.Err())
+			// Give goroutines time to print their cancellation messages.
+			time.Sleep(50 * time.Millisecond)
+			return
 		}
-	}(ctx)
-
-	// Let the goroutine work for a bit.
-	time.Sleep(350 * time.Millisecond)
-
-	fmt.Println("main: calling cancel()")
-	cancel()
-
-	// Give goroutine time to receive the signal and print.
-	time.Sleep(50 * time.Millisecond)
+	}
 }
 ```
 
@@ -70,49 +104,71 @@ func main() {
 ```bash
 go run main.go
 ```
-Expected output (approximately):
+Expected output (timing varies, some sources may return before cancel):
 ```
-goroutine: working... iteration 0
-goroutine: working... iteration 1
-goroutine: working... iteration 2
-main: calling cancel()
-goroutine: stopped (reason: context canceled)
+Starting user search across 3 sources...
+[result] cache: found user "alice@example.com" in 73ms
+
+[user] clicked cancel
+[database]    search cancelled: context canceled
+[full-index]  search cancelled: context canceled
+
+Search ended: context canceled
 ```
 
-The goroutine runs 3 iterations (~300ms), then main calls `cancel()`, closing the `Done()` channel. The goroutine's `select` picks up the signal and exits. Note that `ctx.Err()` returns `context.Canceled` -- this is how you know cancellation happened (as opposed to a timeout).
+When cancel is called, all goroutines listening on `ctx.Done()` receive the signal. Sources that finished before the cancel return results; sources still running get cancelled. No goroutine is left behind.
 
-## Step 2 -- Cancellation Propagates to Children
+## Step 2 -- Goroutine Leak: What Happens Without Cancellation
 
-Create a parent context, derive two child contexts from it, and show that cancelling the parent stops both children:
+This is the critical anti-pattern. When you launch goroutines without a cancellable context, they keep running even after nobody cares about their results. Run this example and observe the leak:
 
 ```go
 package main
 
 import (
-	"context"
 	"fmt"
+	"runtime"
 	"time"
 )
+
+func leakySearch(query string, results chan<- string) {
+	// This goroutine has no context -- it cannot be cancelled.
+	time.Sleep(500 * time.Millisecond)
+	select {
+	case results <- fmt.Sprintf("found: %s", query):
+	default:
+		// Nobody is listening, but the goroutine already ran for 500ms.
+	}
+}
+
+func searchWithoutContext(query string) string {
+	results := make(chan string, 3)
+
+	// Launch 3 searches with no cancellation mechanism.
+	go leakySearch(query+"-db", results)
+	go leakySearch(query+"-cache", results)
+	go leakySearch(query+"-index", results)
+
+	// Take only the first result and return.
+	// The other 2 goroutines are now LEAKED.
+	return <-results
+}
 
 func main() {
-	parent, cancelParent := context.WithCancel(context.Background())
-	child1, cancelChild1 := context.WithCancel(parent)
-	child2, cancelChild2 := context.WithCancel(parent)
-	defer cancelChild1()
-	defer cancelChild2()
+	goroutinesBefore := runtime.NumGoroutine()
+	fmt.Printf("Goroutines before: %d\n", goroutinesBefore)
 
-	worker := func(name string, ctx context.Context) {
-		<-ctx.Done()
-		fmt.Printf("%s: stopped (reason: %v)\n", name, ctx.Err())
+	// Simulate 5 search requests.
+	for i := 0; i < 5; i++ {
+		result := searchWithoutContext(fmt.Sprintf("query-%d", i))
+		fmt.Printf("Request %d: %s\n", i, result)
 	}
 
-	go worker("child1", child1)
-	go worker("child2", child2)
-
-	fmt.Println("Cancelling parent context...")
-	cancelParent()
-
-	time.Sleep(50 * time.Millisecond)
+	goroutinesAfter := runtime.NumGoroutine()
+	fmt.Printf("\nGoroutines after:  %d\n", goroutinesAfter)
+	fmt.Printf("Leaked goroutines: %d\n", goroutinesAfter-goroutinesBefore)
+	fmt.Println("Each request leaks ~2 goroutines (the 2 slower sources).")
+	fmt.Println("At 10,000 req/s, this exhausts memory in minutes.")
 }
 ```
 
@@ -120,18 +176,110 @@ func main() {
 ```bash
 go run main.go
 ```
-Expected output (order of children may vary):
+Expected output:
 ```
-Cancelling parent context...
-child1: stopped (reason: context canceled)
-child2: stopped (reason: context canceled)
+Goroutines before: 1
+Request 0: found: query-0-db
+Request 1: found: query-1-db
+Request 2: found: query-2-db
+Request 3: found: query-3-db
+Request 4: found: query-4-db
+
+Goroutines after:  11
+Leaked goroutines: 10
+Each request leaks ~2 goroutines (the 2 slower sources).
+At 10,000 req/s, this exhausts memory in minutes.
 ```
 
-Both children are cancelled when the parent is cancelled. This is the tree structure of contexts in action: cancellation flows downward through the entire subtree.
+Each request launches 3 goroutines but only consumes 1 result. The other 2 goroutines have no way to know they should stop. This is the most common goroutine leak in production Go code.
 
-## Step 3 -- Cancel Only a Child
+## Step 3 -- First Result Wins with Proper Cancellation
 
-Show that cancelling a child does not affect the parent or siblings:
+Fix the leak from Step 2. Use `WithCancel` to stop all remaining queries as soon as the first result arrives:
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"runtime"
+	"time"
+)
+
+func searchSource(ctx context.Context, source string, delay time.Duration, results chan<- string) {
+	select {
+	case <-time.After(delay):
+		select {
+		case results <- fmt.Sprintf("[%s] found result in %v", source, delay):
+		case <-ctx.Done():
+		}
+	case <-ctx.Done():
+		fmt.Printf("  [%s] cancelled, releasing resources\n", source)
+	}
+}
+
+func searchWithCancel(query string) string {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel() // Cancel ALL remaining goroutines when we return.
+
+	results := make(chan string, 3)
+
+	go searchSource(ctx, "database", 200*time.Millisecond, results)
+	go searchSource(ctx, "cache", 80*time.Millisecond, results)
+	go searchSource(ctx, "index", 350*time.Millisecond, results)
+
+	// Take the first result. defer cancel() stops the rest.
+	return <-results
+}
+
+func main() {
+	goroutinesBefore := runtime.NumGoroutine()
+	fmt.Printf("Goroutines before: %d\n\n", goroutinesBefore)
+
+	for i := 0; i < 5; i++ {
+		result := searchWithCancel(fmt.Sprintf("query-%d", i))
+		fmt.Printf("Request %d: %s\n", i, result)
+		time.Sleep(100 * time.Millisecond) // Let cancelled goroutines print.
+		fmt.Println()
+	}
+
+	// Let all goroutines finish cleanup.
+	time.Sleep(200 * time.Millisecond)
+
+	goroutinesAfter := runtime.NumGoroutine()
+	fmt.Printf("Goroutines after:  %d\n", goroutinesAfter)
+	fmt.Printf("Leaked goroutines: %d (should be 0)\n", goroutinesAfter-goroutinesBefore)
+}
+```
+
+### Verification
+```bash
+go run main.go
+```
+Expected output:
+```
+Goroutines before: 1
+
+Request 0: [cache] found result in 80ms
+  [database] cancelled, releasing resources
+  [index] cancelled, releasing resources
+
+Request 1: [cache] found result in 80ms
+  [database] cancelled, releasing resources
+  [index] cancelled, releasing resources
+
+...
+
+Goroutines after:  1
+Leaked goroutines: 0 (should be 0)
+```
+
+When `defer cancel()` runs on return, it closes the `Done()` channel, and the remaining goroutines detect this and exit. Zero goroutine leaks, no matter how many requests you handle.
+
+## Step 4 -- Cancellation Propagates Down, Never Up
+
+In a real system, you might cancel a sub-operation without affecting the parent. Cancelling a child context leaves the parent and siblings unaffected:
 
 ```go
 package main
@@ -141,23 +289,41 @@ import (
 	"fmt"
 	"time"
 )
+
+func queryReplica(ctx context.Context, name string, done chan<- string) {
+	select {
+	case <-time.After(200 * time.Millisecond):
+		done <- fmt.Sprintf("%s: query complete", name)
+	case <-ctx.Done():
+		done <- fmt.Sprintf("%s: cancelled (%v)", name, ctx.Err())
+	}
+}
 
 func main() {
 	parent, cancelParent := context.WithCancel(context.Background())
 	defer cancelParent()
 
-	child1, cancelChild1 := context.WithCancel(parent)
-	child2, cancelChild2 := context.WithCancel(parent)
-	defer cancelChild2()
+	// Two independent queries, each with its own cancellable context.
+	primaryCtx, cancelPrimary := context.WithCancel(parent)
+	replicaCtx, cancelReplica := context.WithCancel(parent)
+	defer cancelReplica()
 
-	fmt.Println("Cancelling child1 only...")
-	cancelChild1()
+	primaryDone := make(chan string, 1)
+	replicaDone := make(chan string, 1)
 
-	time.Sleep(10 * time.Millisecond)
+	go queryReplica(primaryCtx, "primary-db", primaryDone)
+	go queryReplica(replicaCtx, "replica-db", replicaDone)
 
-	fmt.Printf("parent.Err(): %v\n", parent.Err())
-	fmt.Printf("child1.Err(): %v\n", child1.Err())
-	fmt.Printf("child2.Err(): %v\n", child2.Err())
+	// Cancel only the primary query (e.g., primary is slow, switch to replica).
+	fmt.Println("Cancelling primary query only...")
+	cancelPrimary()
+
+	fmt.Println(<-primaryDone)
+	fmt.Println(<-replicaDone)
+
+	fmt.Printf("\nparent.Err():  %v (unaffected)\n", parent.Err())
+	fmt.Printf("primary.Err(): %v (cancelled)\n", primaryCtx.Err())
+	fmt.Printf("replica.Err(): %v (still running)\n", replicaCtx.Err())
 }
 ```
 
@@ -167,54 +333,20 @@ go run main.go
 ```
 Expected output:
 ```
-Cancelling child1 only...
-parent.Err(): <nil>
-child1.Err(): context canceled
-child2.Err(): <nil>
+Cancelling primary query only...
+primary-db: cancelled (context canceled)
+replica-db: query complete
+
+parent.Err():  <nil> (unaffected)
+primary.Err(): context canceled (cancelled)
+replica.Err(): <nil> (still running)
 ```
 
-Cancellation flows down, never up. The parent and sibling remain active. This is critical: a failing sub-operation should not tear down unrelated parts of the system.
-
-## Step 4 -- Cancel Is Idempotent
-
-Calling `cancel()` more than once is safe. The Go documentation explicitly states this. This matters because `defer cancel()` and an explicit `cancel()` call may both execute:
-
-```go
-package main
-
-import (
-	"context"
-	"fmt"
-)
-
-func main() {
-	ctx, cancel := context.WithCancel(context.Background())
-
-	cancel()
-	fmt.Printf("First cancel:  %v\n", ctx.Err())
-
-	cancel() // no panic
-	fmt.Printf("Second cancel: %v  (no panic, same error)\n", ctx.Err())
-
-	cancel() // still safe
-	fmt.Printf("Third cancel:  %v  (still safe)\n", ctx.Err())
-}
-```
-
-### Verification
-```bash
-go run main.go
-```
-Expected output:
-```
-First cancel:  context canceled
-Second cancel: context canceled  (no panic, same error)
-Third cancel:  context canceled  (still safe)
-```
+Cancellation flows down, never up. This is critical: a failing sub-operation should not tear down unrelated parts of the system. The replica query continues undisturbed.
 
 ## Common Mistakes
 
-### Forgetting to Call Cancel
+### Forgetting to Call Cancel (Goroutine Leak)
 **Wrong:**
 ```go
 package main
@@ -230,7 +362,7 @@ func main() {
 	fmt.Printf("ctx.Err(): %v\n", ctx.Err())
 }
 ```
-**What happens:** The derived context and its internal goroutine are never cleaned up, causing a resource leak. The Go runtime cannot garbage-collect the context's internal resources until cancel is called.
+**What happens:** The derived context and its internal goroutine are never cleaned up. The Go runtime cannot garbage-collect the context's internal resources until cancel is called.
 
 **Fix:** Always `defer cancel()` immediately after creating the context:
 ```go
@@ -251,79 +383,34 @@ func main() {
 ### Not Checking ctx.Done() in the Goroutine
 **Wrong:**
 ```go
-package main
-
-import (
-	"context"
-	"fmt"
-	"time"
-)
-
-func doWork() {
-	time.Sleep(100 * time.Millisecond)
-	fmt.Println("working...")
-}
-
-func main() {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	go func(ctx context.Context) {
-		for {
-			doWork() // never checks ctx.Done() -- goroutine runs forever
-		}
-	}(ctx)
-
-	time.Sleep(300 * time.Millisecond)
-	cancel()
-	time.Sleep(200 * time.Millisecond) // goroutine is STILL running
+func processQueue(ctx context.Context, items []string) {
+    for _, item := range items {
+        heavyProcessing(item) // never checks ctx.Done() -- runs forever
+    }
 }
 ```
-**What happens:** The goroutine ignores the cancellation signal and continues consuming CPU and memory.
+**What happens:** The goroutine ignores the cancellation signal and continues consuming CPU and memory. Calling `cancel()` has no effect because nobody is listening.
 
-**Fix:**
+**Fix:** Check cancellation between units of work:
 ```go
-package main
-
-import (
-	"context"
-	"fmt"
-	"time"
-)
-
-func doWork() {
-	time.Sleep(100 * time.Millisecond)
-	fmt.Println("working...")
-}
-
-func main() {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	go func(ctx context.Context) {
-		for {
-			select {
-			case <-ctx.Done():
-				fmt.Println("stopped")
-				return
-			default:
-				doWork()
-			}
-		}
-	}(ctx)
-
-	time.Sleep(300 * time.Millisecond)
-	cancel()
-	time.Sleep(200 * time.Millisecond)
+func processQueue(ctx context.Context, items []string) {
+    for _, item := range items {
+        select {
+        case <-ctx.Done():
+            return // stop processing
+        default:
+        }
+        heavyProcessing(item)
+    }
 }
 ```
 
-### Passing cancel Function to Other Goroutines
-Prefer keeping the cancel function close to where the context was created. Passing it to multiple goroutines makes it unclear who is responsible for cancellation, leading to premature or accidental cancellation. If a goroutine needs to stop the operation, signal through a separate channel and let the owner call cancel.
+### Passing the Cancel Function to Other Goroutines
+Prefer keeping the cancel function close to where the context was created. Passing it to multiple goroutines makes it unclear who is responsible for cancellation, leading to premature or accidental cancellation. If a goroutine needs to signal that an operation should stop, use a separate channel and let the owner call cancel.
 
 ## Verify What You Learned
 
-Create a context tree with branching: root -> branch1, branch2, and leaf under branch1. Cancel branch1 and verify that root and branch2 are unaffected while branch1 and leaf are cancelled:
+Build a concurrent file search that checks three directories. Use `WithCancel` so that when the first directory finds the file, the other searches stop. Verify zero goroutine leaks:
 
 ```go
 package main
@@ -331,40 +418,40 @@ package main
 import (
 	"context"
 	"fmt"
+	"runtime"
 	"time"
 )
 
+func searchDirectory(ctx context.Context, dir string, delay time.Duration, results chan<- string) {
+	select {
+	case <-time.After(delay):
+		select {
+		case results <- fmt.Sprintf("found in %s (took %v)", dir, delay):
+		case <-ctx.Done():
+		}
+	case <-ctx.Done():
+		fmt.Printf("  [%s] search cancelled\n", dir)
+	}
+}
+
 func main() {
-	//         root
-	//        /    \
-	//   branch1  branch2
-	//      |
-	//     leaf
+	before := runtime.NumGoroutine()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	root, cancelRoot := context.WithCancel(context.Background())
-	defer cancelRoot()
+	results := make(chan string, 3)
+	go searchDirectory(ctx, "/var/log", 300*time.Millisecond, results)
+	go searchDirectory(ctx, "/tmp", 100*time.Millisecond, results)
+	go searchDirectory(ctx, "/home", 500*time.Millisecond, results)
 
-	branch1, cancelBranch1 := context.WithCancel(root)
-	branch2, cancelBranch2 := context.WithCancel(root)
-	defer cancelBranch2()
+	first := <-results
+	fmt.Printf("First result: %s\n", first)
+	cancel()
 
-	leaf, cancelLeaf := context.WithCancel(branch1)
-	defer cancelLeaf()
+	time.Sleep(100 * time.Millisecond)
 
-	fmt.Println("Before any cancellation:")
-	fmt.Printf("  root.Err():    %v\n", root.Err())
-	fmt.Printf("  branch1.Err(): %v\n", branch1.Err())
-	fmt.Printf("  branch2.Err(): %v\n", branch2.Err())
-	fmt.Printf("  leaf.Err():    %v\n", leaf.Err())
-
-	cancelBranch1()
-	time.Sleep(10 * time.Millisecond)
-
-	fmt.Println("After cancelling branch1:")
-	fmt.Printf("  root.Err():    %v\n", root.Err())
-	fmt.Printf("  branch1.Err(): %v\n", branch1.Err())
-	fmt.Printf("  branch2.Err(): %v\n", branch2.Err())
-	fmt.Printf("  leaf.Err():    %v\n", leaf.Err())
+	after := runtime.NumGoroutine()
+	fmt.Printf("\nGoroutines before: %d, after: %d, leaked: %d\n", before, after, after-before)
 }
 ```
 
@@ -374,26 +461,22 @@ go run main.go
 ```
 Expected output:
 ```
-Before any cancellation:
-  root.Err():    <nil>
-  branch1.Err(): <nil>
-  branch2.Err(): <nil>
-  leaf.Err():    <nil>
-After cancelling branch1:
-  root.Err():    <nil>
-  branch1.Err(): context canceled
-  branch2.Err(): <nil>
-  leaf.Err():    context canceled
+First result: found in /tmp (took 100ms)
+  [/var/log] search cancelled
+  [/home] search cancelled
+
+Goroutines before: 1, after: 1, leaked: 0
 ```
 
 ## What's Next
-Continue to [03-context-withtimeout](../03-context-withtimeout/03-context-withtimeout.md) to learn how to automatically cancel a context after a specified duration.
+Continue to [03-context-withtimeout](../03-context-withtimeout/03-context-withtimeout.md) to learn how to automatically cancel operations that take too long, protecting your service from slow dependencies.
 
 ## Summary
 - `context.WithCancel` returns a derived context and a `cancel` function
 - Calling `cancel()` closes the `Done()` channel, signaling all listeners simultaneously
-- Cancellation propagates from parent to all descendant contexts (the entire subtree)
-- Cancellation never propagates upward -- parent and siblings are unaffected
+- The "first result wins" pattern: launch concurrent queries, take the first result, cancel the rest
+- Without cancellation, goroutines leak -- each leaked goroutine holds memory and potentially a connection
+- Cancellation propagates from parent to all descendants but never upward to parent or siblings
 - Always `defer cancel()` to prevent resource leaks
 - Calling cancel multiple times is safe (idempotent)
 - Goroutines must cooperatively check `ctx.Done()` to respond to cancellation

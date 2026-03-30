@@ -1,298 +1,521 @@
 ---
 difficulty: intermediate
-concepts: [errgroup.SetLimit, bounded concurrency, semaphore pattern, backpressure]
+concepts: [semaphore channel, bounded concurrency, backpressure, file descriptor limits, resource exhaustion]
 tools: [go]
 estimated_time: 25m
 bloom_level: apply
-prerequisites: [errgroup basics, goroutines, channels as semaphores]
 ---
 
-# 3. Errgroup SetLimit
-
+# 3. Errgroup SetLimit -- Bulk File Validator
 
 ## Learning Objectives
 After completing this exercise, you will be able to:
-- **Apply** `g.SetLimit(n)` to control maximum concurrent goroutines in an errgroup
-- **Observe** that `g.Go()` blocks when the limit is reached, providing backpressure
-- **Compare** the SetLimit approach with the manual semaphore pattern
-- **Combine** SetLimit with WithContext for bounded concurrency with cancellation
+- **Build** a bulk file validator that limits concurrency to avoid exhausting file descriptors
+- **Implement** the semaphore pattern using a buffered channel to cap concurrent goroutines
+- **Explain** what backpressure is and why `g.Go()` blocking is desirable behavior
+- **Combine** bounded concurrency with context cancellation for production-grade file processing
 
-## Why SetLimit
+## Why Bounded Concurrency
 
-Launching one goroutine per task is fine when you have 10 tasks. When you have 10,000 tasks, you risk exhausting memory, file descriptors, or overwhelming a downstream service. The traditional solution is a semaphore pattern: a buffered channel of capacity N that goroutines acquire before starting and release when done.
+Your CI pipeline validates configuration files before deployment: check JSON syntax, verify required fields, ensure values are within bounds. You have 100+ config files. Launching 100 goroutines that each open a file simultaneously can exceed the OS file descriptor limit (often 1024 on Linux). The result: `open /path/to/file: too many open files`.
 
-`g.SetLimit(n)` encapsulates this pattern directly in errgroup. When the limit is set, `g.Go()` blocks if N goroutines are already running, waiting until one finishes before launching the next. This provides natural backpressure without any additional channels or synchronization code.
+Even without hitting OS limits, unbounded concurrency wastes resources. If you are validating files on a shared NFS mount, 100 concurrent reads may saturate the I/O bus and slow everything down. Limiting to 5-10 concurrent validations keeps throughput high without resource exhaustion.
 
-Available since `golang.org/x/sync v0.1.0`, SetLimit turns errgroup into a bounded worker pool with built-in error propagation.
+The semaphore pattern solves this: a buffered channel of capacity N acts as a token bucket. A goroutine acquires a token before starting work and releases it when done. If all tokens are taken, the next goroutine blocks until one becomes available. This is natural backpressure.
 
-## Step 1 -- Observe Unbounded Concurrency
+## Step 1 -- Unbounded Concurrency (The Problem)
 
-Run the program:
-
-```bash
-go mod tidy
-go run main.go
-```
-
-The `unboundedConcurrency` function launches 10 tasks simultaneously. All start at roughly the same time:
+Observe what happens when 20 file validations run simultaneously with no limit:
 
 ```go
 package main
 
 import (
-    "fmt"
-    "time"
-
-    "golang.org/x/sync/errgroup"
+	"fmt"
+	"sync"
+	"time"
 )
 
 func main() {
-    start := time.Now()
-    var g errgroup.Group
+	files := generateFileList(20)
 
-    for i := 0; i < 10; i++ {
-        i := i
-        g.Go(func() error {
-            fmt.Printf("  [%v] Task %2d: started\n", time.Since(start).Round(time.Millisecond), i)
-            time.Sleep(200 * time.Millisecond)
-            return nil
-        })
-    }
+	fmt.Println("=== Unbounded Concurrency ===")
+	start := time.Now()
 
-    _ = g.Wait()
-    fmt.Printf("Total: %v (all ran in parallel)\n", time.Since(start).Round(time.Millisecond))
+	var wg sync.WaitGroup
+	var once sync.Once
+	var firstErr error
+	activeCount := 0
+	var mu sync.Mutex
+	peakConcurrent := 0
+
+	for _, f := range files {
+		f := f
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
+			mu.Lock()
+			activeCount++
+			if activeCount > peakConcurrent {
+				peakConcurrent = activeCount
+			}
+			current := activeCount
+			mu.Unlock()
+
+			fmt.Printf("  [%v] validating %s (concurrent: %d)\n",
+				time.Since(start).Round(time.Millisecond), f, current)
+
+			if err := validateFile(f); err != nil {
+				once.Do(func() { firstErr = err })
+			}
+
+			mu.Lock()
+			activeCount--
+			mu.Unlock()
+		}()
+	}
+
+	wg.Wait()
+	fmt.Printf("\nPeak concurrent goroutines: %d\n", peakConcurrent)
+	fmt.Printf("Total time: %v\n", time.Since(start).Round(time.Millisecond))
+	if firstErr != nil {
+		fmt.Printf("First error: %v\n", firstErr)
+	}
+}
+
+func generateFileList(n int) []string {
+	files := make([]string, n)
+	for i := 0; i < n; i++ {
+		files[i] = fmt.Sprintf("config/service-%02d.json", i)
+	}
+	return files
+}
+
+func validateFile(path string) error {
+	time.Sleep(100 * time.Millisecond) // simulate file I/O + parsing
+	if path == "config/service-07.json" {
+		return fmt.Errorf("validate %s: missing required field 'port'", path)
+	}
+	return nil
 }
 ```
 
 **Expected output:**
 ```
-  [0ms] Task  0: started
-  [0ms] Task  1: started
-  ...all 10 at ~0ms...
-Total: ~200ms (all ran in parallel)
+=== Unbounded Concurrency ===
+  [0ms] validating config/service-00.json (concurrent: 1)
+  [0ms] validating config/service-01.json (concurrent: 2)
+  ...all 20 start at ~0ms...
+  [0ms] validating config/service-19.json (concurrent: 20)
+
+Peak concurrent goroutines: 20
+Total time: 100ms
+First error: validate config/service-07.json: missing required field 'port'
 ```
 
-With real resources (HTTP connections, database queries), launching 10,000 of these simultaneously would be catastrophic.
+All 20 goroutines start simultaneously. With real file I/O on 1000 files, this would open 1000 file descriptors at once. On most systems, `ulimit -n` is 1024 -- you would get `too many open files` errors.
 
-## Step 2 -- Apply SetLimit
+## Step 2 -- Semaphore Channel (The Solution)
 
-Add `g.SetLimit(3)` so at most 3 goroutines run at once:
+Add a buffered channel as a semaphore. Each goroutine must acquire a token (send to the channel) before starting and release it (receive from the channel) when done:
 
 ```go
 package main
 
 import (
-    "fmt"
-    "time"
-
-    "golang.org/x/sync/errgroup"
+	"fmt"
+	"sync"
+	"time"
 )
 
 func main() {
-    start := time.Now()
+	files := generateFileList(20)
 
-    var g errgroup.Group
-    g.SetLimit(3) // MUST be called before any Go() call
+	fmt.Println("=== Bounded Concurrency (semaphore, limit=5) ===")
+	start := time.Now()
 
-    for i := 0; i < 10; i++ {
-        i := i
-        g.Go(func() error { // blocks if 3 are already running
-            fmt.Printf("  [%v] Task %2d: started\n", time.Since(start).Round(time.Millisecond), i)
-            time.Sleep(200 * time.Millisecond)
-            fmt.Printf("  [%v] Task %2d: done\n", time.Since(start).Round(time.Millisecond), i)
-            return nil
-        })
-    }
+	const maxConcurrent = 5
+	sem := make(chan struct{}, maxConcurrent)
 
-    _ = g.Wait()
-    fmt.Printf("Total: %v (ceil(10/3) batches of ~200ms)\n", time.Since(start).Round(time.Millisecond))
+	var wg sync.WaitGroup
+	var once sync.Once
+	var firstErr error
+	var mu sync.Mutex
+	activeCount := 0
+	peakConcurrent := 0
+
+	for _, f := range files {
+		f := f
+
+		sem <- struct{}{} // ACQUIRE: blocks if 5 goroutines are already running
+
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }() // RELEASE: free the slot when done
+
+			mu.Lock()
+			activeCount++
+			if activeCount > peakConcurrent {
+				peakConcurrent = activeCount
+			}
+			mu.Unlock()
+
+			if err := validateFile(f); err != nil {
+				once.Do(func() { firstErr = err })
+			} else {
+				fmt.Printf("  [%v] validated %s\n",
+					time.Since(start).Round(time.Millisecond), f)
+			}
+
+			mu.Lock()
+			activeCount--
+			mu.Unlock()
+		}()
+	}
+
+	wg.Wait()
+	fmt.Printf("\nPeak concurrent goroutines: %d\n", peakConcurrent)
+	fmt.Printf("Total time: %v (ceil(20/5) batches of ~100ms)\n",
+		time.Since(start).Round(time.Millisecond))
+	if firstErr != nil {
+		fmt.Printf("First error: %v\n", firstErr)
+	}
+}
+
+func generateFileList(n int) []string {
+	files := make([]string, n)
+	for i := 0; i < n; i++ {
+		files[i] = fmt.Sprintf("config/service-%02d.json", i)
+	}
+	return files
+}
+
+func validateFile(path string) error {
+	time.Sleep(100 * time.Millisecond)
+	if path == "config/service-07.json" {
+		return fmt.Errorf("validate %s: missing required field 'port'", path)
+	}
+	return nil
 }
 ```
 
 **Expected output:**
 ```
-  [0ms]   Task  0: started
-  [0ms]   Task  1: started
-  [0ms]   Task  2: started
-  [200ms] Task  0: done
-  [200ms] Task  3: started
-  ...batches of 3...
-Total: ~800ms (ceil(10/3) batches of ~200ms)
+=== Bounded Concurrency (semaphore, limit=5) ===
+  [100ms] validated config/service-00.json
+  [100ms] validated config/service-01.json
+  [100ms] validated config/service-02.json
+  [100ms] validated config/service-03.json
+  [100ms] validated config/service-04.json
+  [200ms] validated config/service-05.json
+  [200ms] validated config/service-06.json
+  ...
+  [400ms] validated config/service-19.json
+
+Peak concurrent goroutines: 5
+Total time: 400ms (ceil(20/5) batches of ~100ms)
+First error: validate config/service-07.json: missing required field 'port'
 ```
 
-With limit 3 and 10 tasks of 200ms each: `ceil(10/3) * 200ms = 800ms`. The backpressure is automatic -- `g.Go()` blocks the calling goroutine until a slot opens.
+With limit 5 and 20 files of 100ms each: `ceil(20/5) * 100ms = 400ms`. Peak concurrency never exceeds 5. The key is that `sem <- struct{}{}` happens BEFORE the goroutine launch -- this means the semaphore limits goroutine creation, not just goroutine execution.
 
-## Step 3 -- Compare with the Manual Semaphore
+## Step 3 -- Semaphore + Context Cancellation
 
-The manual semaphore pattern that SetLimit replaces:
+In production, you want both: bounded concurrency AND stop-on-first-error. Combine the semaphore with `context.WithCancel`:
 
 ```go
 package main
 
 import (
-    "fmt"
-    "time"
-
-    "golang.org/x/sync/errgroup"
+	"context"
+	"fmt"
+	"sync"
+	"time"
 )
 
 func main() {
-    start := time.Now()
+	files := generateFileList(20)
 
-    var g errgroup.Group
-    sem := make(chan struct{}, 3) // buffered channel = semaphore
+	fmt.Println("=== Bounded + Cancellation (limit=5) ===")
+	start := time.Now()
 
-    for i := 0; i < 10; i++ {
-        i := i
-        sem <- struct{}{} // acquire: blocks if channel is full
-        g.Go(func() error {
-            defer func() { <-sem }() // release when done
-            fmt.Printf("  [%v] Task %2d: started\n", time.Since(start).Round(time.Millisecond), i)
-            time.Sleep(200 * time.Millisecond)
-            fmt.Printf("  [%v] Task %2d: done\n", time.Since(start).Round(time.Millisecond), i)
-            return nil
-        })
-    }
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-    _ = g.Wait()
-    fmt.Printf("Total: %v (same behavior as SetLimit)\n", time.Since(start).Round(time.Millisecond))
+	const maxConcurrent = 5
+	sem := make(chan struct{}, maxConcurrent)
+
+	var wg sync.WaitGroup
+	var once sync.Once
+	var firstErr error
+
+	validated := 0
+	cancelled := 0
+	var mu sync.Mutex
+
+	for _, f := range files {
+		f := f
+
+		// Check context before acquiring semaphore to avoid blocking
+		// on the semaphore when we already know we should stop
+		select {
+		case <-ctx.Done():
+			mu.Lock()
+			cancelled++
+			mu.Unlock()
+			continue
+		case sem <- struct{}{}:
+		}
+
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			select {
+			case <-ctx.Done():
+				mu.Lock()
+				cancelled++
+				mu.Unlock()
+				return
+			default:
+			}
+
+			if err := validateFile(f); err != nil {
+				once.Do(func() {
+					firstErr = err
+					cancel()
+				})
+				return
+			}
+
+			mu.Lock()
+			validated++
+			mu.Unlock()
+		}()
+	}
+
+	wg.Wait()
+	fmt.Printf("\nValidated: %d, Cancelled: %d, Total: %d\n", validated, cancelled, len(files))
+	fmt.Printf("Total time: %v\n", time.Since(start).Round(time.Millisecond))
+	if firstErr != nil {
+		fmt.Printf("First error: %v\n", firstErr)
+	}
 }
-```
 
-**Expected output:** Same timing and batching as SetLimit. But the code requires: creating a channel, sending before `Go()`, deferring a receive inside the goroutine. `SetLimit(3)` replaces all of it with one line.
+func generateFileList(n int) []string {
+	files := make([]string, n)
+	for i := 0; i < n; i++ {
+		files[i] = fmt.Sprintf("config/service-%02d.json", i)
+	}
+	return files
+}
 
-## Step 4 -- SetLimit + WithContext
-
-The production pattern: bounded concurrency AND automatic cancellation on error. Combine `SetLimit` with `WithContext`:
-
-```go
-package main
-
-import (
-    "context"
-    "fmt"
-    "time"
-
-    "golang.org/x/sync/errgroup"
-)
-
-func main() {
-    g, ctx := errgroup.WithContext(context.Background())
-    g.SetLimit(3)
-
-    for i := 0; i < 10; i++ {
-        i := i
-        g.Go(func() error {
-            select {
-            case <-ctx.Done():
-                fmt.Printf("  Task %d: cancelled\n", i)
-                return ctx.Err()
-            default:
-            }
-
-            time.Sleep(100 * time.Millisecond)
-            if i == 5 {
-                fmt.Printf("  Task %d: returning error\n", i)
-                return fmt.Errorf("task %d failed", i)
-            }
-            fmt.Printf("  Task %d: done\n", i)
-            return nil
-        })
-    }
-
-    if err := g.Wait(); err != nil {
-        fmt.Printf("Error: %v\n", err)
-    }
+func validateFile(path string) error {
+	time.Sleep(100 * time.Millisecond)
+	if path == "config/service-07.json" {
+		return fmt.Errorf("validate %s: missing required field 'port'", path)
+	}
+	return nil
 }
 ```
 
 **Expected output:**
 ```
-  Task 0: done
-  Task 1: done
-  Task 2: done
-  Task 5: returning error
-  Task 6: cancelled
-  Task 7: cancelled
-  ...remaining tasks cancelled...
-Error: task 5 failed
+=== Bounded + Cancellation (limit=5) ===
+
+Validated: 6, Cancelled: 13, Total: 20
+Total time: 200ms
+First error: validate config/service-07.json: missing required field 'port'
 ```
 
-Tasks 0-4 run (in batches of 3). Task 5 fails, the context is cancelled, and tasks 6-9 detect the cancellation immediately without doing work.
+The critical addition is checking `ctx.Done()` BEFORE acquiring the semaphore in the for loop. Without this check, the loop would block on `sem <- struct{}{}` even after the context is cancelled. The `select` on `ctx.Done()` allows the loop to skip remaining files immediately.
+
+The `golang.org/x/sync/errgroup` package provides this exact behavior via `SetLimit`:
+
+```go
+// With errgroup, the same code becomes:
+//   g, ctx := errgroup.WithContext(context.Background())
+//   g.SetLimit(5)
+//   for _, f := range files {
+//       f := f
+//       g.Go(func() error {
+//           select {
+//           case <-ctx.Done():
+//               return ctx.Err()
+//           default:
+//           }
+//           return validateFile(f)
+//       })
+//   }
+//   err := g.Wait()
+//
+// SetLimit(5) replaces the semaphore channel.
+// WithContext replaces the manual cancel.
+// g.Go() blocks when 5 goroutines are running (backpressure built-in).
+```
+
+## Step 4 -- Choosing the Right Concurrency Limit
+
+The limit depends on your bottleneck. Here is a practical guide:
+
+```go
+package main
+
+import (
+	"fmt"
+	"runtime"
+)
+
+func main() {
+	fmt.Println("=== Choosing Concurrency Limits ===")
+	fmt.Printf("CPU cores: %d\n\n", runtime.NumCPU())
+
+	limits := []struct {
+		scenario string
+		limit    int
+		reason   string
+	}{
+		{
+			"File validation (disk I/O)",
+			10,
+			"Limited by file descriptors and disk throughput, not CPU",
+		},
+		{
+			"HTTP health checks",
+			20,
+			"Limited by connection pool size and target server capacity",
+		},
+		{
+			"CPU-heavy parsing (JSON schema validation)",
+			runtime.NumCPU(),
+			"Limited by CPU cores -- more goroutines just cause context switching",
+		},
+		{
+			"Database queries",
+			5,
+			"Limited by connection pool size (typically 5-20 connections)",
+		},
+		{
+			"External API calls (rate-limited)",
+			3,
+			"Limited by API rate limit (e.g., 100 req/sec = small bursts)",
+		},
+	}
+
+	for _, l := range limits {
+		fmt.Printf("  %-45s limit=%d  (%s)\n", l.scenario, l.limit, l.reason)
+	}
+}
+```
+
+**Expected output:**
+```
+=== Choosing Concurrency Limits ===
+CPU cores: 8
+
+  File validation (disk I/O)                    limit=10   (Limited by file descriptors and disk throughput, not CPU)
+  HTTP health checks                            limit=20   (Limited by connection pool size and target server capacity)
+  CPU-heavy parsing (JSON schema validation)    limit=8    (Limited by CPU cores -- more goroutines just cause context switching)
+  Database queries                              limit=5    (Limited by connection pool size (typically 5-20 connections))
+  External API calls (rate-limited)             limit=3    (Limited by API rate limit (e.g., 100 req/sec = small bursts))
+```
+
+## Intermediate Verification
+
+At this point, verify:
+1. Unbounded concurrency shows all 20 goroutines starting simultaneously
+2. Semaphore limits peak concurrency to exactly 5
+3. With cancellation, files after the error are skipped
+4. Total time follows `ceil(files/limit) * duration_per_file`
 
 ## Common Mistakes
 
-### Setting the limit after calling Go
+### Acquiring the semaphore inside the goroutine
 
 **Wrong:**
 ```go
-var g errgroup.Group
-g.Go(func() error { return nil }) // launched before limit is set
-g.SetLimit(3) // PANICS at runtime
+wg.Add(1)
+go func() {
+    defer wg.Done()
+    sem <- struct{}{} // acquire INSIDE the goroutine
+    defer func() { <-sem }()
+    validateFile(f)
+}()
 ```
 
-**What happens:** `SetLimit` panics if called after `Go`. The limit must be set before any work is launched.
+**What happens:** The goroutine is already launched before acquiring the semaphore. You get unbounded goroutine creation -- 1000 goroutines are created immediately, they just block on the semaphore. Memory usage spikes because each goroutine allocates a stack (at least 2KB, often grows to 8KB+).
 
-**Fix:** Always call `SetLimit` immediately after creating the group:
+**Fix:** Acquire BEFORE launching the goroutine:
 ```go
-var g errgroup.Group
-g.SetLimit(3)
-g.Go(func() error { return nil })
+sem <- struct{}{} // acquire OUTSIDE -- blocks goroutine creation
+wg.Add(1)
+go func() {
+    defer wg.Done()
+    defer func() { <-sem }()
+    validateFile(f)
+}()
+```
+
+### Not checking context before the semaphore acquire
+
+**Wrong:**
+```go
+for _, f := range files {
+    sem <- struct{}{} // blocks even if context is cancelled!
+    go func() { ... }()
+}
+```
+
+**What happens:** After a failure cancels the context, the loop still blocks on `sem <- struct{}{}` waiting for a goroutine to finish and release a token. The loop does not exit until all semaphore slots are freed.
+
+**Fix:** Use `select` to check context first:
+```go
+select {
+case <-ctx.Done():
+    continue // skip remaining files
+case sem <- struct{}{}:
+}
 ```
 
 ### Setting limit to 0
 
 **Wrong:**
 ```go
-g.SetLimit(0) // no goroutines can ever run
-g.Go(func() error { return nil }) // blocks forever
+sem := make(chan struct{}, 0) // unbuffered -- send blocks until receive
 ```
 
-**What happens:** With a limit of 0, `g.Go()` blocks forever because no goroutine slot is available. The program deadlocks.
+**What happens:** `sem <- struct{}{}` blocks until some goroutine does `<-sem`. But no goroutine is running yet. Deadlock on the first iteration.
 
-**Fix:** Use a positive integer. A limit of -1 removes the restriction (equivalent to no SetLimit call).
-
-### Acquiring the semaphore inside the goroutine (manual pattern)
-
-**Wrong:**
-```go
-g.Go(func() error {
-    sem <- struct{}{} // acquire INSIDE the goroutine
-    defer func() { <-sem }()
-    // work
-    return nil
-})
-```
-
-**What happens:** The goroutine is already launched before acquiring the semaphore. You get unbounded goroutine creation -- the semaphore only limits concurrent execution of the work, not goroutine count. Memory usage spikes.
-
-**Fix:** Acquire BEFORE `g.Go()`, or use `SetLimit` which handles this correctly.
+**Fix:** Always use a positive buffer size.
 
 ## Verify What You Learned
 
 Run the full program and confirm:
-1. Unbounded runs all tasks in parallel (~200ms total)
-2. SetLimit(3) processes in batches of 3 (~800ms total)
-3. The manual semaphore produces identical timing
-4. SetLimit + WithContext cancels remaining tasks when one fails
+1. Unbounded concurrency processes all files in ~100ms with 20 concurrent goroutines
+2. Semaphore limits peak concurrency to exactly 5 and takes ~400ms
+3. Semaphore + cancellation skips files after the first error
+4. The concurrency limit guide matches your system's core count
 
 ```bash
 go run main.go
 ```
 
 ## What's Next
-Continue to [04-errgroup-collect-results](../04-errgroup-collect-results/04-errgroup-collect-results.md) to learn how to safely collect results from parallel errgroup tasks.
+Continue to [04-errgroup-collect-results](../04-errgroup-collect-results/04-errgroup-collect-results.md) to learn how to safely collect results from parallel goroutines into a shared data structure.
 
 ## Summary
-- `g.SetLimit(n)` limits the number of concurrently running goroutines in an errgroup
-- `g.Go()` blocks when the limit is reached, providing natural backpressure
-- Always call `SetLimit` before the first `Go()` call -- calling it after panics
-- SetLimit replaces the manual semaphore (buffered channel) pattern with a single line
-- Combine SetLimit with WithContext for bounded concurrency + automatic cancellation
-- Choose the limit based on your bottleneck: CPU cores, connection pool size, API rate limits
-- A limit of -1 removes the restriction (equivalent to no limit)
+- Unbounded concurrency can exhaust file descriptors, connections, or memory
+- A buffered channel acts as a semaphore: `make(chan struct{}, N)` limits to N concurrent operations
+- Acquire the semaphore BEFORE launching the goroutine (not inside it) to limit goroutine creation
+- Combine semaphore + `context.WithCancel` for bounded concurrency with fail-fast behavior
+- Check `ctx.Done()` before the semaphore acquire to avoid blocking when cancellation is already triggered
+- `golang.org/x/sync/errgroup.SetLimit(N)` provides this exact pattern in one line
+- Choose the limit based on your bottleneck: file descriptors, connection pools, CPU cores, or API rate limits
 
 ## Reference
+- [Go Effective Go: Channels as semaphores](https://go.dev/doc/effective_go#channels)
 - [errgroup.Group.SetLimit documentation](https://pkg.go.dev/golang.org/x/sync/errgroup#Group.SetLimit)
-- [Semaphore pattern in Go](https://go.dev/doc/effective_go#channels)
-- [golang.org/x/sync release notes](https://github.com/golang/sync)
+- [Linux file descriptor limits](https://man7.org/linux/man-pages/man2/getrlimit.2.html)

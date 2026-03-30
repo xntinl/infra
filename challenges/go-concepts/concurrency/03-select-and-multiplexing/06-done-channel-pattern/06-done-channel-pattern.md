@@ -4,11 +4,9 @@ concepts: [done-channel, cancellation, close-broadcast, goroutine-lifecycle, con
 tools: [go]
 estimated_time: 25m
 bloom_level: apply
-prerequisites: [select-basics, select-in-for-loop, channels, goroutines, channel-close]
 ---
 
 # 6. Done Channel Pattern
-
 
 ## Learning Objectives
 - **Implement** a done channel to signal cancellation to one or more goroutines
@@ -19,13 +17,15 @@ prerequisites: [select-basics, select-in-for-loop, channels, goroutines, channel
 
 Goroutines are not preemptible in the traditional OS sense. You cannot kill a goroutine from outside. The only way to stop a goroutine is to make it stop itself by giving it a signal it checks voluntarily. The done channel is that signal.
 
+Consider a background worker that periodically refreshes a cache -- fetching data from a database every 30 seconds and updating an in-memory cache. When the application shuts down, this worker must stop cleanly: finish its current refresh, close database connections, and flush any pending writes. If you just exit `main`, the goroutine is killed mid-operation, potentially leaving corrupted state.
+
 When you close a channel, every receiver waiting on it unblocks immediately. This makes close a broadcast operation: one close wakes up an unlimited number of listeners. A done channel exploits this property. You create a `chan struct{}` (zero-size, carries no data), pass it to all goroutines, and close it when you want them to stop. Every goroutine that checks this channel in its `select` will see the close and can exit cleanly.
 
 This pattern is so fundamental that it was formalized into `context.Context` in Go 1.7. The `ctx.Done()` method returns exactly this kind of channel. Understanding the raw done channel pattern gives you deep intuition for how context cancellation works under the hood.
 
-## Example 1 -- Single Goroutine Cancellation
+## Step 1 -- Stop a Background Cache Refresher
 
-Create a worker goroutine that runs until a done channel is closed.
+Create a background worker that periodically refreshes a cache. Main signals cancellation by closing a done channel. The worker stops cleanly.
 
 ```go
 package main
@@ -37,50 +37,59 @@ import (
 
 func main() {
 	done := make(chan struct{})
-	results := make(chan int)
+	refreshed := make(chan string)
 
+	// Background cache refresher.
 	go func() {
-		defer close(results)
-		i := 0
+		defer close(refreshed)
+		ticker := time.NewTicker(100 * time.Millisecond)
+		defer ticker.Stop()
+
+		cycle := 0
 		for {
 			select {
 			case <-done:
-				fmt.Println("worker: received cancellation")
+				fmt.Println("refresher: received cancellation, stopping")
 				return
-			case results <- i:
-				i++
-				time.Sleep(50 * time.Millisecond)
+			case <-ticker.C:
+				cycle++
+				result := fmt.Sprintf("cache refreshed (cycle %d)", cycle)
+				select {
+				case <-done:
+					return
+				case refreshed <- result:
+				}
 			}
 		}
 	}()
 
-	// Consume 5 values, then cancel.
+	// Consume 5 refresh cycles, then cancel.
 	for i := 0; i < 5; i++ {
-		fmt.Println("received:", <-results)
+		fmt.Println("main:", <-refreshed)
 	}
 
 	close(done)
-	time.Sleep(100 * time.Millisecond)
-	fmt.Println("main: worker stopped")
+	time.Sleep(50 * time.Millisecond)
+	fmt.Println("main: cache refresher stopped")
 }
 ```
 
-The worker produces values until the done channel is closed. The main goroutine consumes 5 values, then signals cancellation.
+The worker produces refresh results until the done channel is closed. The main goroutine consumes 5 cycles, then signals cancellation.
 
 ### Verification
 ```
-received: 0
-received: 1
-received: 2
-received: 3
-received: 4
-worker: received cancellation
-main: worker stopped
+main: cache refreshed (cycle 1)
+main: cache refreshed (cycle 2)
+main: cache refreshed (cycle 3)
+main: cache refreshed (cycle 4)
+main: cache refreshed (cycle 5)
+refresher: received cancellation, stopping
+main: cache refresher stopped
 ```
 
-## Example 2 -- Broadcasting Cancellation to Multiple Goroutines
+## Step 2 -- Broadcasting Cancellation to Multiple Workers
 
-Close one channel to stop multiple goroutines simultaneously.
+Close one channel to stop multiple cache refreshers simultaneously. This is how a microservice shuts down its background workers on SIGTERM.
 
 ```go
 package main
@@ -91,34 +100,36 @@ import (
 	"time"
 )
 
+func cacheRefresher(id int, done <-chan struct{}, wg *sync.WaitGroup) {
+	defer wg.Done()
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-done:
+			fmt.Printf("worker-%d: flushing pending writes and stopping\n", id)
+			return
+		case <-ticker.C:
+			fmt.Printf("worker-%d: refreshed cache partition\n", id)
+		}
+	}
+}
+
 func main() {
 	done := make(chan struct{})
 	var wg sync.WaitGroup
 
-	worker := func(id int) {
-		defer wg.Done()
-		for {
-			select {
-			case <-done:
-				fmt.Printf("worker %d: stopping\n", id)
-				return
-			default:
-				fmt.Printf("worker %d: working\n", id)
-				time.Sleep(100 * time.Millisecond)
-			}
-		}
-	}
-
 	for i := 1; i <= 3; i++ {
 		wg.Add(1)
-		go worker(i)
+		go cacheRefresher(i, done, &wg)
 	}
 
 	time.Sleep(350 * time.Millisecond)
-	fmt.Println("main: cancelling all workers")
+	fmt.Println("main: shutting down all workers")
 	close(done) // One close stops all three.
 	wg.Wait()
-	fmt.Println("main: all workers stopped")
+	fmt.Println("main: all workers stopped cleanly")
 }
 ```
 
@@ -126,20 +137,20 @@ One `close(done)` stops all three workers. You do not need to track or signal ea
 
 ### Verification
 ```
-worker 1: working
-worker 2: working
-worker 3: working
+worker-1: refreshed cache partition
+worker-2: refreshed cache partition
+worker-3: refreshed cache partition
 ...
-main: cancelling all workers
-worker 2: stopping
-worker 1: stopping
-worker 3: stopping
-main: all workers stopped
+main: shutting down all workers
+worker-2: flushing pending writes and stopping
+worker-1: flushing pending writes and stopping
+worker-3: flushing pending writes and stopping
+main: all workers stopped cleanly
 ```
 
-## Example 3 -- Pipeline Cancellation
+## Step 3 -- Pipeline Cancellation (Fetch -> Transform -> Store)
 
-Build a two-stage pipeline where cancellation flows from the consumer through all stages.
+Build a two-stage data pipeline where cancellation flows from the consumer through all stages. Stage 1 fetches data, Stage 2 transforms it. Both must stop cleanly when the consumer has enough.
 
 ```go
 package main
@@ -154,54 +165,54 @@ func main() {
 	done := make(chan struct{})
 	var wg sync.WaitGroup
 
-	// Stage 1: generates numbers.
-	stage1Out := make(chan int)
+	// Stage 1: Fetches records from "database".
+	fetchOut := make(chan string)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		defer close(stage1Out)
+		defer close(fetchOut)
 		i := 0
 		for {
+			record := fmt.Sprintf("record-%d", i)
 			select {
 			case <-done:
-				fmt.Println("stage1: cancelled")
+				fmt.Println("fetcher: cancelled, closing connection")
 				return
-			case stage1Out <- i:
+			case fetchOut <- record:
 				i++
 				time.Sleep(50 * time.Millisecond)
 			}
 		}
 	}()
 
-	// Stage 2: doubles numbers.
-	stage2Out := make(chan int)
+	// Stage 2: Transforms records (e.g., enrichment, formatting).
+	transformOut := make(chan string)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		defer close(stage2Out)
+		defer close(transformOut)
 		for {
 			select {
 			case <-done:
-				fmt.Println("stage2: cancelled")
+				fmt.Println("transformer: cancelled, flushing buffer")
 				return
-			case val, ok := <-stage1Out:
+			case record, ok := <-fetchOut:
 				if !ok {
 					return
 				}
-				// Check done on the send side too — prevents blocking
-				// on a write after cancellation was signaled.
+				transformed := fmt.Sprintf("transformed(%s)", record)
 				select {
 				case <-done:
 					return
-				case stage2Out <- val * 2:
+				case transformOut <- transformed:
 				}
 			}
 		}
 	}()
 
-	// Consumer: take 5 values, then cancel.
+	// Consumer: take 5 records, then cancel the pipeline.
 	for i := 0; i < 5; i++ {
-		fmt.Println("consumed:", <-stage2Out)
+		fmt.Println("stored:", <-transformOut)
 	}
 
 	close(done)
@@ -210,23 +221,23 @@ func main() {
 }
 ```
 
-Both stages check the same done channel. The `sync.WaitGroup` ensures main waits for all stages to finish cleanup.
+Both stages check the same done channel. The `sync.WaitGroup` ensures main waits for all stages to finish cleanup before exiting.
 
 ### Verification
 ```
-consumed: 0
-consumed: 2
-consumed: 4
-consumed: 6
-consumed: 8
-stage1: cancelled
-stage2: cancelled
+stored: transformed(record-0)
+stored: transformed(record-1)
+stored: transformed(record-2)
+stored: transformed(record-3)
+stored: transformed(record-4)
+fetcher: cancelled, closing connection
+transformer: cancelled, flushing buffer
 pipeline shut down cleanly
 ```
 
-## Example 4 -- Done Channel with Graceful Cleanup
+## Step 4 -- Graceful Cleanup After Cancellation
 
-The worker drains its internal buffer before exiting. This demonstrates that done is a signal, not a kill.
+The worker performs cleanup work after receiving the done signal: flushing in-memory data to disk, closing connections, and reporting final statistics. This demonstrates that done is a signal, not a kill.
 
 ```go
 package main
@@ -242,51 +253,56 @@ func main() {
 
 	go func() {
 		defer close(finished)
-		var buffer []int
 
-		for i := 0; i < 5; i++ {
-			buffer = append(buffer, i)
-			fmt.Printf("worker: buffered item %d\n", i)
-			time.Sleep(50 * time.Millisecond)
+		var cachedItems []string
+		ticker := time.NewTicker(60 * time.Millisecond)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-done:
+				fmt.Printf("worker: cancellation received, flushing %d items\n", len(cachedItems))
+				for _, item := range cachedItems {
+					fmt.Printf("  flushed to disk: %s\n", item)
+				}
+				fmt.Println("worker: connections closed, cleanup complete")
+				return
+			case <-ticker.C:
+				item := fmt.Sprintf("user-session-%d", len(cachedItems)+1)
+				cachedItems = append(cachedItems, item)
+				fmt.Printf("worker: cached %s\n", item)
+			}
 		}
-
-		// Wait for cancellation signal.
-		<-done
-
-		// Graceful shutdown: flush before exiting.
-		fmt.Printf("worker: flushing %d items\n", len(buffer))
-		for _, item := range buffer {
-			fmt.Printf("  flushed: %d\n", item)
-		}
-		fmt.Println("worker: cleanup complete")
 	}()
 
 	time.Sleep(300 * time.Millisecond)
+	fmt.Println("main: sending shutdown signal")
 	close(done)
 	<-finished
+	fmt.Println("main: worker exited after cleanup")
 }
 ```
 
 ### Verification
 ```
-worker: buffered item 0
-worker: buffered item 1
-worker: buffered item 2
-worker: buffered item 3
-worker: buffered item 4
-worker: flushing 5 items
-  flushed: 0
-  flushed: 1
-  flushed: 2
-  flushed: 3
-  flushed: 4
-worker: cleanup complete
+worker: cached user-session-1
+worker: cached user-session-2
+worker: cached user-session-3
+worker: cached user-session-4
+main: sending shutdown signal
+worker: cancellation received, flushing 4 items
+  flushed to disk: user-session-1
+  flushed to disk: user-session-2
+  flushed to disk: user-session-3
+  flushed to disk: user-session-4
+worker: connections closed, cleanup complete
+main: worker exited after cleanup
 ```
 
 ## Common Mistakes
 
 ### 1. Sending a Value Instead of Closing
-Sending a value on the done channel only wakes one receiver. If you have 5 goroutines, you need to send 5 values. Closing wakes ALL receivers:
+Sending a value on the done channel only wakes one receiver. If you have 5 workers, you need to send 5 values. Closing wakes ALL receivers:
 
 ```go
 // BAD: only wakes one goroutine.
@@ -327,18 +343,18 @@ A stage that reads from input and writes to output needs done checks on BOTH ope
 
 ```go
 // BAD: can block on the send after done is closed.
-case val := <-input:
-    output <- val * 2
+case record := <-input:
+    output <- transform(record)
 
 // GOOD: checks done on the send.
-case val, ok := <-input:
+case record, ok := <-input:
     if !ok {
         return
     }
     select {
     case <-done:
         return
-    case output <- val * 2:
+    case output <- transform(record):
     }
 ```
 
@@ -353,7 +369,7 @@ case val, ok := <-input:
 In the next exercise, you will build a heartbeat mechanism using `select` and `time.Ticker` to monitor whether goroutines are alive and responsive.
 
 ## Summary
-The done channel pattern uses a closed `chan struct{}` as a broadcast cancellation signal. Closing the channel wakes all goroutines that check it in their `select` loops. This is the manual implementation of what `context.Context` provides. Every goroutine should check a done channel alongside its work channels to remain responsive to cancellation. Use `sync.WaitGroup` to wait for all goroutines to finish cleanup.
+The done channel pattern uses a closed `chan struct{}` as a broadcast cancellation signal. Closing the channel wakes all goroutines that check it in their `select` loops. In a cache refresher scenario, this lets you stop background workers cleanly: they finish their current operation, flush pending data, close connections, and exit. This is the manual implementation of what `context.Context` provides. Use `sync.WaitGroup` to wait for all goroutines to finish cleanup before the application exits.
 
 ## Reference
 - [Go Concurrency Patterns: Pipelines and cancellation](https://go.dev/blog/pipelines)

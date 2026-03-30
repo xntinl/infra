@@ -9,7 +9,6 @@ prerequisites: [goroutines, channels, select, done channel pattern, pipeline]
 
 # 8. Tee-Channel: Split Stream
 
-
 ## Learning Objectives
 After completing this exercise, you will be able to:
 - **Implement** a tee function that duplicates a channel stream into two outputs
@@ -18,26 +17,27 @@ After completing this exercise, you will be able to:
 - **Apply** stream splitting for parallel processing of the same data
 
 ## Why Tee-Channel
+
 The tee-channel pattern takes one input stream and duplicates it into two output streams. Every value from the input appears in both outputs. This is analogous to the Unix `tee` command, which reads from stdin and writes to both stdout and a file simultaneously.
 
-Use cases include: logging a data stream while also processing it; feeding the same data to two different analysis pipelines; duplicating events for both real-time processing and archival; splitting a stream for comparison (sending the same input through two different algorithms).
+Consider a real scenario: your application processes a stream of user events (purchases, clicks, signups). Every event must go to two destinations: an audit log (for compliance -- every event must be recorded permanently) and a real-time analytics processor (for live dashboards). You cannot lose events from either stream. The tee pattern guarantees that both consumers receive every single event, even if one consumer is slower than the other.
 
-The challenge is backpressure. Since both output channels must receive every value, the tee runs at the speed of the slowest consumer. If one consumer is slow, the fast consumer also slows down because the tee cannot send the next value until both consumers have received the current one.
+The challenge is backpressure. Since both output channels must receive every value, the tee runs at the speed of the slowest consumer. If the analytics processor is slow, the audit logger also slows down because the tee cannot send the next value until both consumers have received the current one.
 
 ```
-  Tee-Channel Data Flow
+  Event Processor with Tee
 
-              +---> out1 (consumer A)
-  input ----> |
-              +---> out2 (consumer B)
+               +---> auditLog (every event, persistent)
+  events ----> |
+               +---> analytics (every event, real-time)
 
-  Every value goes to BOTH outputs.
-  Speed = min(consumer A speed, consumer B speed)
+  Every event goes to BOTH outputs.
+  Speed = min(auditLog speed, analytics speed)
 ```
 
 ## Step 1 -- Basic Tee Function with Nil-Channel Select
 
-The nil-channel select pattern is the key technique. Here is how it works:
+The nil-channel select pattern is the key technique for ensuring both outputs receive each value:
 
 1. For each value from input, set `o1 = out1, o2 = out2` (both "armed")
 2. Select: send to whichever consumer is ready first
@@ -49,64 +49,94 @@ The nil-channel select pattern is the key technique. Here is how it works:
 package main
 
 import (
-    "fmt"
-    "sync"
+	"fmt"
+	"sync"
+	"time"
 )
 
-func tee(done <-chan struct{}, in <-chan int) (<-chan int, <-chan int) {
-    out1 := make(chan int)
-    out2 := make(chan int)
+type Event struct {
+	ID     int
+	Type   string
+	UserID string
+	Amount float64
+}
 
-    go func() {
-        defer close(out1)
-        defer close(out2)
+func tee(done <-chan struct{}, in <-chan Event) (<-chan Event, <-chan Event) {
+	out1 := make(chan Event)
+	out2 := make(chan Event)
 
-        for val := range in {
-            o1, o2 := out1, out2
+	go func() {
+		defer close(out1)
+		defer close(out2)
 
-            for count := 0; count < 2; count++ {
-                select {
-                case o1 <- val:
-                    o1 = nil // sent to out1, nil it so next select goes to out2
-                case o2 <- val:
-                    o2 = nil // sent to out2, nil it so next select goes to out1
-                case <-done:
-                    return
-                }
-            }
-        }
-    }()
+		for val := range in {
+			o1, o2 := out1, out2
 
-    return out1, out2
+			for count := 0; count < 2; count++ {
+				select {
+				case o1 <- val:
+					o1 = nil
+				case o2 <- val:
+					o2 = nil
+				case <-done:
+					return
+				}
+			}
+		}
+	}()
+
+	return out1, out2
 }
 
 func main() {
-    done := make(chan struct{})
-    gen := make(chan int)
-    go func() {
-        defer close(gen)
-        for i := 1; i <= 5; i++ {
-            gen <- i
-        }
-    }()
+	done := make(chan struct{})
 
-    out1, out2 := tee(done, gen)
-    var wg sync.WaitGroup
-    wg.Add(2)
-    go func() {
-        defer wg.Done()
-        for v := range out1 {
-            fmt.Printf("  Consumer 1: %d\n", v)
-        }
-    }()
-    go func() {
-        defer wg.Done()
-        for v := range out2 {
-            fmt.Printf("  Consumer 2: %d\n", v)
-        }
-    }()
-    wg.Wait()
-    close(done)
+	events := make(chan Event)
+	go func() {
+		defer close(events)
+		data := []Event{
+			{ID: 1, Type: "purchase", UserID: "alice", Amount: 99.99},
+			{ID: 2, Type: "signup", UserID: "bob", Amount: 0},
+			{ID: 3, Type: "purchase", UserID: "charlie", Amount: 249.50},
+			{ID: 4, Type: "click", UserID: "alice", Amount: 0},
+			{ID: 5, Type: "purchase", UserID: "diana", Amount: 15.00},
+		}
+		for _, e := range data {
+			events <- e
+		}
+	}()
+
+	auditStream, analyticsStream := tee(done, events)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// Audit logger: records every event
+	go func() {
+		defer wg.Done()
+		for event := range auditStream {
+			fmt.Printf("  [AUDIT] event=%d type=%s user=%s\n",
+				event.ID, event.Type, event.UserID)
+		}
+	}()
+
+	// Analytics processor: only cares about purchases
+	go func() {
+		defer wg.Done()
+		var totalRevenue float64
+		for event := range analyticsStream {
+			if event.Type == "purchase" {
+				totalRevenue += event.Amount
+				fmt.Printf("  [ANALYTICS] purchase: $%.2f from %s (running total: $%.2f)\n",
+					event.Amount, event.UserID, totalRevenue)
+			}
+		}
+		fmt.Printf("  [ANALYTICS] session revenue: $%.2f\n", totalRevenue)
+	}()
+
+	wg.Wait()
+	close(done)
+	fmt.Println("\n  Both consumers received every event.")
 }
 ```
 
@@ -114,84 +144,102 @@ func main() {
 ```bash
 go run main.go
 ```
-Expected: both consumers receive the same values:
+Expected: audit logs all 5 events, analytics processes only purchases:
 ```
-  Consumer 1: 1
-  Consumer 2: 1
-  Consumer 1: 2
-  Consumer 2: 2
-  ...
+  [AUDIT] event=1 type=purchase user=alice
+  [ANALYTICS] purchase: $99.99 from alice (running total: $99.99)
+  [AUDIT] event=2 type=signup user=bob
+  [AUDIT] event=3 type=purchase user=charlie
+  [ANALYTICS] purchase: $249.50 from charlie (running total: $349.49)
+  [AUDIT] event=4 type=click user=alice
+  [AUDIT] event=5 type=purchase user=diana
+  [ANALYTICS] purchase: $15.00 from diana (running total: $364.49)
+  [ANALYTICS] session revenue: $364.49
+
+  Both consumers received every event.
 ```
 
 ## Step 2 -- Backpressure Demonstration
 
-Show how a slow consumer affects the entire tee:
+Show how a slow consumer (e.g., a slow audit logger writing to disk) affects the fast consumer (real-time analytics).
 
 ```go
 package main
 
 import (
-    "fmt"
-    "sync"
-    "time"
+	"fmt"
+	"sync"
+	"time"
 )
 
-func tee(done <-chan struct{}, in <-chan int) (<-chan int, <-chan int) {
-    out1 := make(chan int)
-    out2 := make(chan int)
-    go func() {
-        defer close(out1)
-        defer close(out2)
-        for val := range in {
-            o1, o2 := out1, out2
-            for count := 0; count < 2; count++ {
-                select {
-                case o1 <- val:
-                    o1 = nil
-                case o2 <- val:
-                    o2 = nil
-                case <-done:
-                    return
-                }
-            }
-        }
-    }()
-    return out1, out2
+type Event struct {
+	ID   int
+	Type string
+}
+
+func tee(done <-chan struct{}, in <-chan Event) (<-chan Event, <-chan Event) {
+	out1 := make(chan Event)
+	out2 := make(chan Event)
+	go func() {
+		defer close(out1)
+		defer close(out2)
+		for val := range in {
+			o1, o2 := out1, out2
+			for count := 0; count < 2; count++ {
+				select {
+				case o1 <- val:
+					o1 = nil
+				case o2 <- val:
+					o2 = nil
+				case <-done:
+					return
+				}
+			}
+		}
+	}()
+	return out1, out2
 }
 
 func main() {
-    done := make(chan struct{})
-    defer close(done)
+	done := make(chan struct{})
+	defer close(done)
 
-    gen := make(chan int)
-    go func() {
-        defer close(gen)
-        for i := 1; i <= 5; i++ {
-            fmt.Printf("  generator: sending %d at %v\n", i, time.Now().Format("04:05.000"))
-            gen <- i
-        }
-    }()
+	events := make(chan Event)
+	go func() {
+		defer close(events)
+		for i := 1; i <= 5; i++ {
+			fmt.Printf("  [source] emitting event %d at %v\n",
+				i, time.Now().Format("04:05.000"))
+			events <- Event{ID: i, Type: "purchase"}
+		}
+	}()
 
-    out1, out2 := tee(done, gen)
-    var wg sync.WaitGroup
-    wg.Add(2)
+	auditStream, analyticsStream := tee(done, events)
+	var wg sync.WaitGroup
+	wg.Add(2)
 
-    go func() {
-        defer wg.Done()
-        for v := range out1 {
-            fmt.Printf("  fast: got %d at %v\n", v, time.Now().Format("04:05.000"))
-        }
-    }()
+	// Fast consumer: real-time analytics
+	go func() {
+		defer wg.Done()
+		for event := range analyticsStream {
+			fmt.Printf("  [analytics] got event %d at %v (fast)\n",
+				event.ID, time.Now().Format("04:05.000"))
+		}
+	}()
 
-    go func() {
-        defer wg.Done()
-        for v := range out2 {
-            fmt.Printf("  slow: got %d at %v\n", v, time.Now().Format("04:05.000"))
-            time.Sleep(200 * time.Millisecond) // slow consumer
-        }
-    }()
+	// Slow consumer: audit logger with disk I/O simulation
+	go func() {
+		defer wg.Done()
+		for event := range auditStream {
+			fmt.Printf("  [audit]     got event %d at %v (slow - writing to disk...)\n",
+				event.ID, time.Now().Format("04:05.000"))
+			time.Sleep(200 * time.Millisecond)
+		}
+	}()
 
-    wg.Wait()
+	wg.Wait()
+	fmt.Println("\n  Notice: the fast analytics consumer was slowed down by the slow audit consumer.")
+	fmt.Println("  The tee runs at the speed of the slowest consumer.")
 }
 ```
 
@@ -201,76 +249,107 @@ go run main.go
 ```
 Observe that the fast consumer receives values at the same pace as the slow one. The timestamps reveal the bottleneck.
 
-## Step 3 -- Practical Application: Log and Process
+## Step 3 -- Buffered Tee for Slow Consumer Decoupling
 
-Build a pipeline that tees a stream for both logging and processing:
+Mitigate backpressure by adding a buffer between the tee and the slow consumer. This decouples the two consumers up to the buffer capacity.
 
 ```go
 package main
 
 import (
-    "fmt"
-    "sync"
+	"fmt"
+	"sync"
+	"time"
 )
 
-func tee(done <-chan struct{}, in <-chan int) (<-chan int, <-chan int) {
-    out1 := make(chan int)
-    out2 := make(chan int)
-    go func() {
-        defer close(out1)
-        defer close(out2)
-        for val := range in {
-            o1, o2 := out1, out2
-            for count := 0; count < 2; count++ {
-                select {
-                case o1 <- val:
-                    o1 = nil
-                case o2 <- val:
-                    o2 = nil
-                case <-done:
-                    return
-                }
-            }
-        }
-    }()
-    return out1, out2
+type Event struct {
+	ID   int
+	Type string
+}
+
+func teeBuffered(done <-chan struct{}, in <-chan Event, buf1, buf2 int) (<-chan Event, <-chan Event) {
+	raw1 := make(chan Event)
+	raw2 := make(chan Event)
+
+	go func() {
+		defer close(raw1)
+		defer close(raw2)
+		for val := range in {
+			o1, o2 := raw1, raw2
+			for count := 0; count < 2; count++ {
+				select {
+				case o1 <- val:
+					o1 = nil
+				case o2 <- val:
+					o2 = nil
+				case <-done:
+					return
+				}
+			}
+		}
+	}()
+
+	// Wrap with buffered intermediate channels
+	buffered1 := make(chan Event, buf1)
+	buffered2 := make(chan Event, buf2)
+
+	go func() {
+		defer close(buffered1)
+		for v := range raw1 {
+			buffered1 <- v
+		}
+	}()
+	go func() {
+		defer close(buffered2)
+		for v := range raw2 {
+			buffered2 <- v
+		}
+	}()
+
+	return buffered1, buffered2
 }
 
 func main() {
-    done := make(chan struct{})
-    defer close(done)
+	done := make(chan struct{})
+	defer close(done)
 
-    events := make(chan int)
-    go func() {
-        defer close(events)
-        for i := 1; i <= 8; i++ {
-            events <- i
-        }
-    }()
+	fmt.Println("=== Buffered Tee: Decoupling Slow Consumer ===\n")
 
-    logStream, processStream := tee(done, events)
-    var wg sync.WaitGroup
-    wg.Add(2)
+	events := make(chan Event)
+	go func() {
+		defer close(events)
+		for i := 1; i <= 8; i++ {
+			events <- Event{ID: i, Type: "event"}
+		}
+	}()
 
-    // Logger: records every event
-    go func() {
-        defer wg.Done()
-        for event := range logStream {
-            fmt.Printf("  [LOG] event=%d\n", event)
-        }
-    }()
+	// Buffer of 5 for the slow consumer
+	analyticsStream, auditStream := teeBuffered(done, events, 0, 5)
+	var wg sync.WaitGroup
+	wg.Add(2)
 
-    // Processor: only processes even events
-    go func() {
-        defer wg.Done()
-        for event := range processStream {
-            if event%2 == 0 {
-                fmt.Printf("  [PROCESS] event=%d -> result=%d\n", event, event*event)
-            }
-        }
-    }()
+	go func() {
+		defer wg.Done()
+		for event := range analyticsStream {
+			fmt.Printf("  [analytics] event %d at %v\n",
+				event.ID, time.Now().Format("04:05.000"))
+		}
+		fmt.Println("  [analytics] done")
+	}()
 
-    wg.Wait()
+	go func() {
+		defer wg.Done()
+		for event := range auditStream {
+			fmt.Printf("  [audit]     event %d at %v (writing...)\n",
+				event.ID, time.Now().Format("04:05.000"))
+			time.Sleep(100 * time.Millisecond)
+		}
+		fmt.Println("  [audit]     done")
+	}()
+
+	wg.Wait()
+	fmt.Println("\n  With buffering, the fast consumer finishes early.")
+	fmt.Println("  The slow consumer continues processing from its buffer.")
 }
 ```
 
@@ -278,45 +357,162 @@ func main() {
 ```bash
 go run main.go
 ```
-Expected: all events logged, only even events processed.
+Expected: analytics finishes faster than audit, decoupled by the buffer:
+```
+=== Buffered Tee: Decoupling Slow Consumer ===
 
-## Step 4 -- Three-Way Split (tee3)
+  [analytics] event 1 at 00:01.000
+  [audit]     event 1 at 00:01.000 (writing...)
+  [analytics] event 2 at 00:01.000
+  [analytics] event 3 at 00:01.001
+  ...
+  [analytics] done
+  [audit]     event 5 at 00:01.400 (writing...)
+  ...
+  [audit]     done
 
-Extend the pattern to split one input into three outputs:
+  With buffering, the fast consumer finishes early.
+  The slow consumer continues processing from its buffer.
+```
+
+## Step 4 -- Full Event Processing System
+
+Build a complete event processor that tees events to both audit and analytics, with the analytics stream doing aggregation.
 
 ```go
-func tee3(done <-chan struct{}, in <-chan int) (<-chan int, <-chan int, <-chan int) {
-    out1 := make(chan int)
-    out2 := make(chan int)
-    out3 := make(chan int)
+package main
 
-    go func() {
-        defer close(out1)
-        defer close(out2)
-        defer close(out3)
+import (
+	"fmt"
+	"sync"
+	"time"
+)
 
-        for val := range in {
-            o1, o2, o3 := out1, out2, out3
-            for count := 0; count < 3; count++ {
-                select {
-                case o1 <- val:
-                    o1 = nil
-                case o2 <- val:
-                    o2 = nil
-                case o3 <- val:
-                    o3 = nil
-                case <-done:
-                    return
-                }
-            }
-        }
-    }()
+type Event struct {
+	ID        int
+	Type      string
+	UserID    string
+	Amount    float64
+	Timestamp time.Time
+}
 
-    return out1, out2, out3
+func tee(done <-chan struct{}, in <-chan Event) (<-chan Event, <-chan Event) {
+	out1 := make(chan Event)
+	out2 := make(chan Event)
+	go func() {
+		defer close(out1)
+		defer close(out2)
+		for val := range in {
+			o1, o2 := out1, out2
+			for count := 0; count < 2; count++ {
+				select {
+				case o1 <- val:
+					o1 = nil
+				case o2 <- val:
+					o2 = nil
+				case <-done:
+					return
+				}
+			}
+		}
+	}()
+	return out1, out2
+}
+
+func main() {
+	done := make(chan struct{})
+
+	events := make(chan Event)
+	go func() {
+		defer close(events)
+		now := time.Now()
+		data := []Event{
+			{1, "purchase", "alice", 99.99, now},
+			{2, "signup", "bob", 0, now.Add(time.Second)},
+			{3, "purchase", "charlie", 249.50, now.Add(2 * time.Second)},
+			{4, "purchase", "alice", 35.00, now.Add(3 * time.Second)},
+			{5, "refund", "charlie", -249.50, now.Add(4 * time.Second)},
+			{6, "click", "diana", 0, now.Add(5 * time.Second)},
+			{7, "purchase", "bob", 150.00, now.Add(6 * time.Second)},
+			{8, "purchase", "diana", 75.25, now.Add(7 * time.Second)},
+		}
+		for _, e := range data {
+			events <- e
+		}
+	}()
+
+	auditStream, analyticsStream := tee(done, events)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// Audit: permanent record of every event
+	go func() {
+		defer wg.Done()
+		fmt.Println("=== Audit Log ===")
+		for e := range auditStream {
+			fmt.Printf("  [%s] id=%d type=%-10s user=%-8s amount=%8.2f\n",
+				e.Timestamp.Format("15:04:05"), e.ID, e.Type, e.UserID, e.Amount)
+		}
+	}()
+
+	// Analytics: real-time aggregation
+	go func() {
+		defer wg.Done()
+		userSpend := make(map[string]float64)
+		typeCounts := make(map[string]int)
+
+		for e := range analyticsStream {
+			typeCounts[e.Type]++
+			if e.Amount != 0 {
+				userSpend[e.UserID] += e.Amount
+			}
+		}
+
+		fmt.Println("\n=== Real-Time Analytics Summary ===")
+		fmt.Println("  Event counts:")
+		for t, c := range typeCounts {
+			fmt.Printf("    %-10s: %d\n", t, c)
+		}
+		fmt.Println("  Revenue by user:")
+		for u, s := range userSpend {
+			fmt.Printf("    %-8s: $%.2f\n", u, s)
+		}
+	}()
+
+	wg.Wait()
+	close(done)
 }
 ```
 
-Same nil-channel technique but with `count < 3` and three channels.
+### Intermediate Verification
+```bash
+go run main.go
+```
+Expected: complete audit log and analytics summary:
+```
+=== Audit Log ===
+  [10:00:00] id=1 type=purchase   user=alice    amount=   99.99
+  [10:00:01] id=2 type=signup     user=bob      amount=    0.00
+  [10:00:02] id=3 type=purchase   user=charlie  amount=  249.50
+  [10:00:03] id=4 type=purchase   user=alice    amount=   35.00
+  [10:00:04] id=5 type=refund     user=charlie  amount= -249.50
+  [10:00:05] id=6 type=click      user=diana    amount=    0.00
+  [10:00:06] id=7 type=purchase   user=bob      amount=  150.00
+  [10:00:07] id=8 type=purchase   user=diana    amount=   75.25
+
+=== Real-Time Analytics Summary ===
+  Event counts:
+    purchase  : 5
+    signup    : 1
+    refund    : 1
+    click     : 1
+  Revenue by user:
+    alice   : $134.99
+    charlie : $0.00
+    bob     : $150.00
+    diana   : $75.25
+```
 
 ## Common Mistakes
 
@@ -324,8 +520,8 @@ Same nil-channel technique but with `count < 3` and three channels.
 **Wrong:**
 ```go
 for val := range in {
-    out1 <- val
-    out2 <- val // blocks if out2 consumer is not ready
+	out1 <- val
+	out2 <- val // blocks if out2 consumer is not ready
 }
 ```
 **What happens:** If `out2`'s consumer blocks, the send to `out1` in the next iteration also blocks, even if `out1`'s consumer is ready. Worse, there is no cancellation path.
@@ -336,10 +532,10 @@ for val := range in {
 **Wrong:**
 ```go
 go func() {
-    for val := range in {
-        out1 <- val
-        out2 <- val
-    }
+	for val := range in {
+		out1 <- val
+		out2 <- val
+	}
 }()
 ```
 **What happens:** If a consumer stops reading (context canceled, error, etc.), the tee goroutine blocks forever.
@@ -352,11 +548,10 @@ Channels should be closed by the sender, not the receiver. The tee owns the outp
 ## Verify What You Learned
 
 Run `go run main.go` and verify:
-- Basic tee: both consumers receive values 1-5
+- Basic tee: both audit and analytics receive all events
 - Backpressure demo: fast consumer paced by slow consumer (timestamps prove it)
-- Log and process: all events logged, only even events processed
-- Tee3: all three consumers receive values 1-4
-- Buffered tee: partial decoupling of consumer speeds
+- Buffered tee: fast consumer finishes before slow consumer
+- Full system: audit log has all 8 events, analytics summary matches expected aggregations
 
 ## What's Next
 Continue to [09-rate-limiter-token-bucket](../09-rate-limiter-token-bucket/09-rate-limiter-token-bucket.md) to learn how to control the rate of work processing.
@@ -367,7 +562,7 @@ Continue to [09-rate-limiter-token-bucket](../09-rate-limiter-token-bucket/09-ra
 - The tee runs at the speed of the slowest consumer (backpressure)
 - Add buffered intermediate channels to decouple fast and slow consumers
 - Always include a `done` channel for cancellation to prevent goroutine leaks
-- Common use cases: logging + processing, feeding parallel analysis, stream duplication
+- Real-world use: sending events to both audit logging and real-time analytics simultaneously
 
 ## Reference
 - [Go Concurrency Patterns (Rob Pike)](https://www.youtube.com/watch?v=f6kdp27TYZs)

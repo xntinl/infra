@@ -4,11 +4,9 @@ concepts: [select, for-select, event-loop, quit-channel, goroutine-lifecycle]
 tools: [go]
 estimated_time: 25m
 bloom_level: apply
-prerequisites: [select-basics, select-with-default, channels, goroutines]
 ---
 
 # 5. Select in For Loop
-
 
 ## Learning Objectives
 - **Build** a continuous event loop with `for` + `select`
@@ -18,15 +16,15 @@ prerequisites: [select-basics, select-with-default, channels, goroutines]
 
 ## Why For-Select
 
-A single `select` handles one event and returns. Most goroutines need to handle events continuously: a server processes requests until shutdown, a worker reads tasks until the queue closes, a monitor checks health until told to stop.
+A single `select` handles one event and returns. But a message broker consumer needs to process messages continuously: receive messages from a subscription, handle periodic cleanup with a ticker, and respond to a shutdown signal -- all at the same time, indefinitely.
 
-The `for` + `select` combination is the standard Go event loop. It is the idiomatic way to write a goroutine that reacts to multiple channels over its entire lifetime. Nearly every long-running goroutine in production Go code follows this pattern.
+The `for` + `select` combination is the standard Go event loop. It is the idiomatic way to write a goroutine that reacts to multiple channels over its entire lifetime. Nearly every long-running goroutine in production Go code follows this pattern: HTTP servers, queue consumers, connection managers, background workers.
 
-The quit channel is the clean shutdown mechanism. Instead of killing a goroutine externally (which Go intentionally does not support), you send a signal on a channel that the goroutine checks in its `select`. This gives the goroutine a chance to clean up resources before exiting. This pattern is so common that it was formalized into `context.Context`, which you will learn in a later section.
+The quit channel is the clean shutdown mechanism. Instead of killing a goroutine externally (which Go intentionally does not support), you signal on a channel that the goroutine checks in its `select`. This gives the goroutine a chance to clean up resources before exiting. This pattern is so common that it was formalized into `context.Context`, which you will learn in a later section.
 
-## Example 1 -- Basic Event Loop
+## Step 1 -- Basic Message Consumer
 
-Build a goroutine that listens on a work channel and a quit channel in a loop.
+Build a message broker consumer that receives messages from a subscription channel and shuts down cleanly when signaled.
 
 ```go
 package main
@@ -37,43 +35,58 @@ import (
 )
 
 func main() {
-	work := make(chan string)
-	quit := make(chan struct{})
+	messages := make(chan string)
+	shutdown := make(chan struct{})
 
+	// Simulate a message broker delivering messages.
+	go func() {
+		topics := []string{
+			"order.created",
+			"user.signup",
+			"payment.processed",
+			"order.shipped",
+			"inventory.updated",
+		}
+		for _, topic := range topics {
+			messages <- fmt.Sprintf("[%s] payload={...}", topic)
+			time.Sleep(50 * time.Millisecond)
+		}
+		close(shutdown)
+	}()
+
+	// Consumer event loop.
 	go func() {
 		for {
 			select {
-			case task := <-work:
-				fmt.Println("processing:", task)
-			case <-quit:
-				fmt.Println("shutting down")
+			case msg := <-messages:
+				fmt.Println("consumed:", msg)
+			case <-shutdown:
+				fmt.Println("consumer: shutting down")
 				return
 			}
 		}
 	}()
 
-	work <- "task-1"
-	work <- "task-2"
-	work <- "task-3"
-	close(quit)
-
-	time.Sleep(50 * time.Millisecond) // Let goroutine finish.
+	// Wait for the producer to finish and the consumer to stop.
+	time.Sleep(500 * time.Millisecond)
 }
 ```
 
-The goroutine loops forever, processing tasks as they arrive. When `quit` is closed, the `<-quit` case succeeds (closed channels return the zero value immediately), and the goroutine returns.
+The consumer loops forever, processing messages as they arrive. When `shutdown` is closed, the `<-shutdown` case succeeds (closed channels return the zero value immediately), and the consumer returns.
 
 ### Verification
 ```
-processing: task-1
-processing: task-2
-processing: task-3
-shutting down
+consumed: [order.created] payload={...}
+consumed: [user.signup] payload={...}
+consumed: [payment.processed] payload={...}
+consumed: [order.shipped] payload={...}
+consumed: [inventory.updated] payload={...}
+consumer: shutting down
 ```
 
-## Example 2 -- Multiple Event Sources
+## Step 2 -- Consumer with Multiple Event Sources
 
-Extend the event loop to handle different types of events from different channels.
+Extend the consumer to handle messages from a subscription, alerts from a monitoring channel, and a shutdown signal. This is the canonical event loop: one goroutine, multiple concerns.
 
 ```go
 package main
@@ -84,36 +97,39 @@ import (
 )
 
 func main() {
-	orders := make(chan string, 5)
+	subscription := make(chan string, 5)
 	alerts := make(chan string, 5)
-	quit := make(chan struct{})
+	shutdown := make(chan struct{})
 
+	// Message producer.
 	go func() {
 		for i := 0; i < 5; i++ {
-			orders <- fmt.Sprintf("order-%d", i)
+			subscription <- fmt.Sprintf("msg-%d", i)
 			time.Sleep(30 * time.Millisecond)
 		}
 	}()
 
+	// Alert producer.
 	go func() {
 		for i := 0; i < 3; i++ {
-			alerts <- fmt.Sprintf("alert-%d", i)
+			alerts <- fmt.Sprintf("alert: consumer-lag-%d", i)
 			time.Sleep(50 * time.Millisecond)
 		}
 	}()
 
+	// Shutdown after 300ms.
 	go func() {
 		time.Sleep(300 * time.Millisecond)
-		close(quit)
+		close(shutdown)
 	}()
 
 	for {
 		select {
-		case order := <-orders:
-			fmt.Println("[ORDER]", order)
+		case msg := <-subscription:
+			fmt.Println("[MSG]", msg)
 		case alert := <-alerts:
 			fmt.Println("[ALERT]", alert)
-		case <-quit:
+		case <-shutdown:
 			fmt.Println("event loop stopped")
 			return
 		}
@@ -124,22 +140,21 @@ func main() {
 A single `select` cleanly multiplexes two event streams plus a shutdown signal. Adding a new event source is as simple as adding a new case.
 
 ### Verification
-You should see interleaved order and alert messages, ending with:
 ```
-[ORDER] order-0
-[ALERT] alert-0
-[ORDER] order-1
-[ORDER] order-2
-[ALERT] alert-1
-[ORDER] order-3
-[ALERT] alert-2
-[ORDER] order-4
+[MSG] msg-0
+[ALERT] alert: consumer-lag-0
+[MSG] msg-1
+[MSG] msg-2
+[ALERT] alert: consumer-lag-1
+[MSG] msg-3
+[ALERT] alert: consumer-lag-2
+[MSG] msg-4
 event loop stopped
 ```
 
-## Example 3 -- Nil Channel Trick for Close Detection
+## Step 3 -- Periodic Cleanup with a Ticker
 
-Use the two-value receive form `val, ok := <-ch` to detect when a producer closes its channel. Set closed channels to `nil` to prevent spinning.
+Add a `time.Ticker` for periodic maintenance tasks: flushing commit offsets, cleaning up expired sessions, or logging consumer lag. This is the canonical Go service event loop.
 
 ```go
 package main
@@ -150,47 +165,110 @@ import (
 )
 
 func main() {
-	source1 := make(chan int)
-	source2 := make(chan int)
+	messages := make(chan string, 10)
+	shutdown := make(chan struct{})
+
+	go func() {
+		for i := 0; i < 8; i++ {
+			messages <- fmt.Sprintf("event-%d", i)
+			time.Sleep(40 * time.Millisecond)
+		}
+		close(shutdown)
+	}()
+
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	consumed := 0
+
+loop:
+	for {
+		select {
+		case msg := <-messages:
+			fmt.Println("[consume]", msg)
+			consumed++
+		case <-ticker.C:
+			fmt.Printf("[cleanup] offset commit, %d messages processed\n", consumed)
+		case <-shutdown:
+			fmt.Printf("[shutdown] total: %d messages consumed\n", consumed)
+			break loop
+		}
+	}
+}
+```
+
+### Verification
+```
+[consume] event-0
+[consume] event-1
+[cleanup] offset commit, 2 messages processed
+[consume] event-2
+[consume] event-3
+[cleanup] offset commit, 4 messages processed
+[consume] event-4
+[consume] event-5
+[cleanup] offset commit, 6 messages processed
+[consume] event-6
+[consume] event-7
+[shutdown] total: 8 messages consumed
+```
+
+## Step 4 -- Nil Channel Trick for Sources That Close
+
+When a producer closes its channel, a `select` case on that channel returns the zero value instantly, forever. Set closed channels to `nil` to exclude them from the `select`. This is essential when consuming from multiple sources that finish at different times.
+
+```go
+package main
+
+import (
+	"fmt"
+	"time"
+)
+
+func main() {
+	topicA := make(chan string)
+	topicB := make(chan string)
 
 	go func() {
 		for i := 0; i < 3; i++ {
-			source1 <- i
+			topicA <- fmt.Sprintf("topic-a: event-%d", i)
 			time.Sleep(50 * time.Millisecond)
 		}
-		close(source1)
+		close(topicA)
 	}()
 
 	go func() {
-		for i := 10; i < 14; i++ {
-			source2 <- i
+		for i := 0; i < 5; i++ {
+			topicB <- fmt.Sprintf("topic-b: event-%d", i)
 			time.Sleep(30 * time.Millisecond)
 		}
-		close(source2)
+		close(topicB)
 	}()
 
-	s1Done, s2Done := false, false
+	aDone, bDone := false, false
 
 	for {
 		select {
-		case val, ok := <-source1:
+		case msg, ok := <-topicA:
 			if !ok {
-				source1 = nil // Nil channel is never selected.
-				s1Done = true
+				topicA = nil // Nil channel is never selected.
+				aDone = true
+				fmt.Println("topic-a: subscription ended")
 			} else {
-				fmt.Println("source1:", val)
+				fmt.Println("received:", msg)
 			}
-		case val, ok := <-source2:
+		case msg, ok := <-topicB:
 			if !ok {
-				source2 = nil
-				s2Done = true
+				topicB = nil
+				bDone = true
+				fmt.Println("topic-b: subscription ended")
 			} else {
-				fmt.Println("source2:", val)
+				fmt.Println("received:", msg)
 			}
 		}
 
-		if s1Done && s2Done {
-			fmt.Println("all sources closed")
+		if aDone && bDone {
+			fmt.Println("all subscriptions ended, consumer exiting")
 			break
 		}
 	}
@@ -201,20 +279,22 @@ Key technique: setting a channel to `nil` after it closes. A `nil` channel in a 
 
 ### Verification
 ```
-source2: 10
-source1: 0
-source2: 11
-source1: 1
-source2: 12
-source2: 13
-source1: 2
-all sources closed
+received: topic-b: event-0
+received: topic-a: event-0
+received: topic-b: event-1
+received: topic-a: event-1
+received: topic-b: event-2
+received: topic-b: event-3
+received: topic-a: event-2
+topic-a: subscription ended
+received: topic-b: event-4
+topic-b: subscription ended
+all subscriptions ended, consumer exiting
 ```
-The ordering varies, but no zero values appear and the program terminates cleanly.
 
-## Example 4 -- Labeled Break to Exit For-Select
+## Step 5 -- Labeled Break to Exit For-Select
 
-A bare `break` inside `select` breaks the select, NOT the for loop. Use a labeled break or `return` to exit the loop.
+A bare `break` inside `select` breaks the select, NOT the for loop. Use a labeled break or `return` to exit the loop. This is a frequent source of bugs.
 
 ```go
 package main
@@ -225,99 +305,39 @@ import (
 )
 
 func main() {
-	ch := make(chan int, 5)
+	messages := make(chan string, 5)
 	done := make(chan struct{})
 
 	go func() {
-		for i := 0; i < 3; i++ {
-			ch <- i
+		msgs := []string{"order.created", "order.paid", "order.shipped"}
+		for _, m := range msgs {
+			messages <- m
 			time.Sleep(30 * time.Millisecond)
 		}
 		close(done)
 	}()
 
-loop: // Label for the for loop.
+loop:
 	for {
 		select {
-		case val := <-ch:
-			fmt.Println("received:", val)
+		case msg := <-messages:
+			fmt.Println("processed:", msg)
 		case <-done:
 			fmt.Println("done signal received")
 			break loop // Exits the for loop, not just the select.
 		}
 	}
-	fmt.Println("after the loop")
+	fmt.Println("consumer cleanup complete")
 }
 ```
 
 ### Verification
 ```
-received: 0
-received: 1
-received: 2
+processed: order.created
+processed: order.paid
+processed: order.shipped
 done signal received
-after the loop
-```
-
-## Example 5 -- Event Loop with Periodic Maintenance
-
-Combine event handling with a `time.Ticker` for periodic tasks like flushing buffers, logging stats, or running health checks.
-
-```go
-package main
-
-import (
-	"fmt"
-	"time"
-)
-
-func main() {
-	events := make(chan string, 10)
-	stop := make(chan struct{})
-
-	go func() {
-		for i := 0; i < 8; i++ {
-			events <- fmt.Sprintf("item-%d", i)
-			time.Sleep(40 * time.Millisecond)
-		}
-		close(stop)
-	}()
-
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
-
-	count := 0
-
-loop:
-	for {
-		select {
-		case ev := <-events:
-			fmt.Println("[event]", ev)
-			count++
-		case <-ticker.C:
-			fmt.Printf("[maintenance] %d events processed\n", count)
-		case <-stop:
-			fmt.Printf("[shutdown] total: %d events\n", count)
-			break loop
-		}
-	}
-}
-```
-
-### Verification
-```
-[event] item-0
-[event] item-1
-[maintenance] 2 events processed
-[event] item-2
-[event] item-3
-[maintenance] 4 events processed
-[event] item-4
-[event] item-5
-[maintenance] 6 events processed
-[event] item-6
-[event] item-7
-[shutdown] total: 8 events
+consumer cleanup complete
 ```
 
 ## Common Mistakes
@@ -326,11 +346,11 @@ loop:
 A closed channel returns the zero value immediately, forever. Without setting it to `nil`, the `select` spins on the closed channel case:
 
 ```go
-// BAD: after ch closes, this prints 0 forever.
+// BAD: after ch closes, this prints "" forever.
 for {
     select {
-    case val := <-ch: // ch is closed — returns 0 every iteration
-        fmt.Println(val)
+    case msg := <-ch: // ch is closed — returns "" every iteration
+        fmt.Println(msg)
     }
 }
 ```
@@ -338,8 +358,8 @@ for {
 ### 2. Breaking Out of Select vs. For Loop
 A `break` inside a `select` breaks out of the `select`, not the enclosing `for` loop. Use `return`, a labeled break (`break loop`), or a flag variable to exit the loop.
 
-### 3. Goroutine Leak: Forgetting the Quit Channel
-If the for-select loop has no exit condition, the goroutine runs forever. Every for-select must have a way to terminate: a quit channel, context cancellation, or detection of all sources closing.
+### 3. Goroutine Leak: Forgetting the Shutdown Channel
+If the for-select loop has no exit condition, the goroutine runs forever. Every for-select must have a way to terminate: a shutdown channel, context cancellation, or detection of all sources closing.
 
 ### 4. Sending on a Closed Channel
 Closing a channel signals all receivers, but sending on a closed channel panics. The producer closes, the consumer detects.
@@ -355,7 +375,7 @@ Closing a channel signals all receivers, but sending on a closed channel panics.
 In the next exercise, you will learn the done channel pattern -- a formalization of the quit channel concept that enables cancellation propagation across goroutine trees.
 
 ## Summary
-The `for` + `select` combination is Go's event loop idiom. A goroutine loops forever, using `select` to multiplex across work channels, event streams, and a quit/done channel. When a channel closes, set it to `nil` to prevent the select from spinning on zero values. Every for-select loop must have an exit path to prevent goroutine leaks.
+The `for` + `select` combination is Go's event loop idiom. A message broker consumer loops forever, using `select` to multiplex across subscription channels, alerts, periodic cleanup (ticker), and a shutdown signal. When a channel closes, set it to `nil` to prevent the select from spinning on zero values. Every for-select loop must have an exit path to prevent goroutine leaks.
 
 ## Reference
 - [Go Spec: Select statements](https://go.dev/ref/spec#Select_statements)

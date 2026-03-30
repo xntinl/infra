@@ -1,33 +1,31 @@
 ---
 difficulty: basic
-concepts: [sync/atomic, AddInt64, AddUint64, atomic.Int64, data race]
+concepts: [sync/atomic, AddInt64, atomic.Int64, data race, lock-free counters]
 tools: [go]
-estimated_time: 20m
+estimated_time: 25m
 bloom_level: apply
-prerequisites: [goroutines, sync.WaitGroup, data races]
 ---
 
 # 1. Atomic Add Counter
 
-
 ## Learning Objectives
 After completing this exercise, you will be able to:
-- **Identify** why non-atomic increments produce incorrect results under concurrency
-- **Fix** data races using `atomic.AddInt64` and `atomic.AddUint64`
-- **Use** the typed `atomic.Int64` wrapper introduced in Go 1.19
-- **Verify** correctness with the race detector (`go run -race`)
+- **Identify** why non-atomic increments produce incorrect request metrics under concurrency
+- **Fix** data races in web server counters using `atomic.AddInt64` and `atomic.Int64`
+- **Track** multiple independent metrics (requests, bytes, errors) with lock-free counters
+- **Compare** atomic vs mutex performance with benchmarks and explain when each wins
 
-## Why Atomic Operations
+## Why Atomic Operations for Request Metrics
 
-When multiple goroutines increment a shared counter without synchronization, the result is a data race. A simple `counter++` compiles to load-modify-store -- three separate operations that can interleave across goroutines. The result? Lost updates and unpredictable final values.
+Every production web server needs request metrics: total requests handled, bytes transferred, errors encountered. These counters are incremented by every handler goroutine on every request. A busy server handles thousands of requests per second across dozens of goroutines.
 
-The `sync/atomic` package provides functions that perform read-modify-write as a single, indivisible CPU instruction. No goroutine can observe an intermediate state. Atomic operations are the lowest-level synchronization primitive in Go -- faster than mutexes for simple counters, but limited to operations on individual values.
+A simple `counter++` compiles to three operations -- load, add, store. When two goroutines execute this simultaneously, both may load the same value, both add 1, and both store the same result. One increment is lost. At 10,000 requests per second, you lose hundreds of increments per second. Your monitoring dashboards show fewer requests than actually occurred, your error rates look artificially low, and your capacity planning is based on lies.
 
-Understanding atomics is essential because they form the building blocks of higher-level constructs: mutexes, channels, and lock-free data structures all rely on atomic operations internally.
+`sync/atomic` provides functions that perform read-modify-write as a single, indivisible CPU instruction. No goroutine can observe an intermediate state. For simple counters, atomics are faster than mutexes because they avoid the overhead of lock acquisition and goroutine parking.
 
-## Example 1 -- Observe the Race
+## Step 1 -- Observe Lost Request Counts Without Atomics
 
-A non-atomic `counter++` is three operations: load the value, add 1, store the result. When two goroutines execute this simultaneously, both may load the same value (say, 42), both add 1 (getting 43), and both store 43. One increment is lost.
+Simulate a web server where 100 handler goroutines each process 1,000 requests. Each handler increments a shared request counter. Without atomic operations, the final count is wrong:
 
 ```go
 package main
@@ -38,22 +36,30 @@ import (
 )
 
 func main() {
-	var counter int64
+	var totalRequests int64
+	var totalBytes int64
+	var totalErrors int64
 	var wg sync.WaitGroup
 
-	for i := 0; i < 1000; i++ {
+	for i := 0; i < 100; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for j := 0; j < 1000; j++ {
-				counter++ // BUG: load-modify-store, three separate operations
+			for req := 0; req < 1000; req++ {
+				totalRequests++ // BUG: load-modify-store, three separate operations
+				totalBytes += 256
+				if req%50 == 0 {
+					totalErrors++
+				}
 			}
 		}()
 	}
 
 	wg.Wait()
-	fmt.Printf("Expected: 1000000\n")
-	fmt.Printf("Got:      %d (almost certainly less)\n", counter)
+	fmt.Println("=== Request Metrics (BROKEN - no synchronization) ===")
+	fmt.Printf("Total requests: %d (expected 100000)\n", totalRequests)
+	fmt.Printf("Total bytes:    %d (expected 25600000)\n", totalBytes)
+	fmt.Printf("Total errors:   %d (expected 2000)\n", totalErrors)
 }
 ```
 
@@ -61,15 +67,15 @@ func main() {
 ```bash
 go run main.go
 ```
-Run it several times. The final value varies and almost never reaches 1,000,000. Confirm the race:
+Run it several times. The counts vary and never reach the expected values. Confirm the data race:
 ```bash
 go run -race main.go
 ```
-Expected output includes `DATA RACE` warnings pointing to the `counter++` line.
+The race detector reports `DATA RACE` warnings pointing to the `counter++` lines.
 
-## Example 2 -- Fix with atomic.AddInt64
+## Step 2 -- Fix with atomic.AddInt64
 
-`atomic.AddInt64` takes a pointer to the value and the delta. The entire read-add-write happens as one CPU instruction (e.g., `LOCK XADD` on x86). No goroutine can see a half-updated value.
+Replace every `counter++` with `atomic.AddInt64`. The entire read-add-store happens as one CPU instruction (e.g., `LOCK XADD` on x86). No goroutine can see a half-updated value:
 
 ```go
 package main
@@ -81,38 +87,133 @@ import (
 )
 
 func main() {
-	var counter int64
+	var totalRequests int64
+	var totalBytes int64
+	var totalErrors int64
 	var wg sync.WaitGroup
 
-	for i := 0; i < 1000; i++ {
+	for i := 0; i < 100; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for j := 0; j < 1000; j++ {
-				atomic.AddInt64(&counter, 1)
+			for req := 0; req < 1000; req++ {
+				atomic.AddInt64(&totalRequests, 1)
+				atomic.AddInt64(&totalBytes, 256)
+				if req%50 == 0 {
+					atomic.AddInt64(&totalErrors, 1)
+				}
 			}
 		}()
 	}
 
 	wg.Wait()
-	fmt.Printf("Expected: 1000000\n")
-	fmt.Printf("Got:      %d\n", counter)
+	fmt.Println("=== Request Metrics (FIXED - atomic operations) ===")
+	fmt.Printf("Total requests: %d (expected 100000)\n", totalRequests)
+	fmt.Printf("Total bytes:    %d (expected 25600000)\n", totalBytes)
+	fmt.Printf("Total errors:   %d (expected 2000)\n", totalErrors)
 }
 ```
 
 ### Verification
 ```bash
-go run main.go
+go run -race main.go
 ```
-The result is exactly 1,000,000 every time. Confirm no races:
+All counts are exact every run. No race warnings.
+
+## Step 3 -- Use Typed atomic.Int64 for a Metrics Struct
+
+Go 1.19 introduced typed wrappers like `atomic.Int64`. These are method-based and harder to misuse because the underlying value is unexported -- you cannot accidentally access it non-atomically. Build a proper metrics collector:
+
+```go
+package main
+
+import (
+	"fmt"
+	"math/rand"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+type RequestMetrics struct {
+	TotalRequests atomic.Int64
+	TotalBytes    atomic.Int64
+	TotalErrors   atomic.Int64
+	ActiveConns   atomic.Int64
+}
+
+func (m *RequestMetrics) RecordRequest(bytes int64, isError bool) {
+	m.TotalRequests.Add(1)
+	m.TotalBytes.Add(bytes)
+	if isError {
+		m.TotalErrors.Add(1)
+	}
+}
+
+func (m *RequestMetrics) ConnOpen()  { m.ActiveConns.Add(1) }
+func (m *RequestMetrics) ConnClose() { m.ActiveConns.Add(-1) }
+
+func (m *RequestMetrics) Snapshot() string {
+	return fmt.Sprintf(
+		"requests=%d bytes=%d errors=%d active_conns=%d",
+		m.TotalRequests.Load(),
+		m.TotalBytes.Load(),
+		m.TotalErrors.Load(),
+		m.ActiveConns.Load(),
+	)
+}
+
+func main() {
+	metrics := &RequestMetrics{}
+	var wg sync.WaitGroup
+
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func(handlerID int) {
+			defer wg.Done()
+
+			metrics.ConnOpen()
+			defer metrics.ConnClose()
+
+			for req := 0; req < 200; req++ {
+				bytes := int64(64 + rand.Intn(4096))
+				isError := rand.Intn(100) < 5
+				metrics.RecordRequest(bytes, isError)
+				time.Sleep(time.Microsecond)
+			}
+		}(i)
+	}
+
+	// Periodic reporting while handlers run
+	done := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case <-done:
+				return
+			case <-time.After(10 * time.Millisecond):
+				fmt.Printf("[live] %s\n", metrics.Snapshot())
+			}
+		}
+	}()
+
+	wg.Wait()
+	close(done)
+
+	fmt.Printf("\n[final] %s\n", metrics.Snapshot())
+	fmt.Printf("Expected total requests: 10000\n")
+}
+```
+
+### Verification
 ```bash
 go run -race main.go
 ```
-Expected: clean output, no warnings.
+Live metrics update while handlers run. Final request count is exactly 10,000. Active connections end at 0. No race warnings.
 
-## Example 3 -- Use the Typed atomic.Int64 Wrapper
+## Step 4 -- Benchmark: Atomic vs Mutex Counters
 
-Go 1.19 introduced typed wrappers like `atomic.Int64`, `atomic.Uint64`, `atomic.Bool`, and `atomic.Pointer[T]`. These are method-based and harder to misuse because the underlying value is unexported -- you cannot accidentally access it non-atomically.
+Measure the real performance difference. This program runs both approaches with the same workload and reports elapsed time:
 
 ```go
 package main
@@ -121,25 +222,71 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
-func main() {
+func benchmarkAtomic(goroutines, iterations int) time.Duration {
 	var counter atomic.Int64
 	var wg sync.WaitGroup
 
-	for i := 0; i < 1000; i++ {
+	start := time.Now()
+	for i := 0; i < goroutines; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for j := 0; j < 1000; j++ {
+			for j := 0; j < iterations; j++ {
 				counter.Add(1)
 			}
 		}()
 	}
-
 	wg.Wait()
-	fmt.Printf("Expected: 1000000\n")
-	fmt.Printf("Got:      %d\n", counter.Load())
+	return time.Since(start)
+}
+
+func benchmarkMutex(goroutines, iterations int) time.Duration {
+	var mu sync.Mutex
+	var counter int64
+	var wg sync.WaitGroup
+
+	start := time.Now()
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < iterations; j++ {
+				mu.Lock()
+				counter++
+				mu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+	return time.Since(start)
+}
+
+func main() {
+	scenarios := []struct {
+		name       string
+		goroutines int
+		iterations int
+	}{
+		{"Low contention (4 goroutines)", 4, 100000},
+		{"Medium contention (64 goroutines)", 64, 10000},
+		{"High contention (1000 goroutines)", 1000, 1000},
+	}
+
+	fmt.Println("=== Atomic vs Mutex Counter Benchmark ===")
+	fmt.Println()
+	for _, s := range scenarios {
+		atomicTime := benchmarkAtomic(s.goroutines, s.iterations)
+		mutexTime := benchmarkMutex(s.goroutines, s.iterations)
+		ratio := float64(mutexTime) / float64(atomicTime)
+
+		fmt.Printf("%s:\n", s.name)
+		fmt.Printf("  Atomic: %v\n", atomicTime)
+		fmt.Printf("  Mutex:  %v\n", mutexTime)
+		fmt.Printf("  Mutex/Atomic ratio: %.2fx\n\n", ratio)
+	}
 }
 ```
 
@@ -147,12 +294,21 @@ func main() {
 ```bash
 go run main.go
 ```
-Same result: exactly 1,000,000. The typed wrapper is functionally equivalent but cleaner. Prefer this style in new code.
+Under all contention levels, atomic is faster for simple counter increments. The gap widens under high contention because mutex must park and wake goroutines while atomic uses a single CPU instruction.
 
-## Example 4 -- Bidirectional Counter
+## Intermediate Verification
 
-`atomic.AddInt64` accepts negative deltas. This is useful for counters that track both increments and decrements -- for example, active connections or in-flight requests.
+Run the race detector on each step to confirm correctness:
+```bash
+go run -race main.go
+```
+All versions except Step 1 should produce zero race warnings and exact expected counts.
 
+## Common Mistakes
+
+### Mixing Atomic and Non-Atomic Access on the Same Variable
+
+**Wrong:**
 ```go
 package main
 
@@ -163,46 +319,50 @@ import (
 )
 
 func main() {
-	var counter int64
+	var requests int64
 	var wg sync.WaitGroup
 
-	// 500 goroutines increment 1000 times each: +500,000
-	for i := 0; i < 500; i++ {
+	for i := 0; i < 100; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for j := 0; j < 1000; j++ {
-				atomic.AddInt64(&counter, 1)
-			}
-		}()
-	}
-
-	// 500 goroutines decrement 1000 times each: -500,000
-	for i := 0; i < 500; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for j := 0; j < 1000; j++ {
-				atomic.AddInt64(&counter, -1)
-			}
+			atomic.AddInt64(&requests, 1)
 		}()
 	}
 
 	wg.Wait()
-	fmt.Printf("Expected: 0\n")
-	fmt.Printf("Got:      %d\n", counter)
+	fmt.Println(requests) // BUG: direct read while other goroutines may use atomic writes
 }
 ```
 
-### Verification
-```bash
-go run -race main.go
+**What happens:** Reading `requests` directly is a data race. ALL access must be atomic if ANY access is atomic.
+
+**Fix:** Use `atomic.LoadInt64(&requests)` to read, or in this specific case the read is safe only because `wg.Wait()` guarantees all writers finished. The rule: after full synchronization (WaitGroup, channel), a direct read is safe. Before that, always use atomic reads.
+
+### Copying an atomic.Int64
+
+**Wrong:**
+```go
+package main
+
+import (
+	"fmt"
+	"sync/atomic"
+)
+
+func main() {
+	var a atomic.Int64
+	a.Store(42)
+	b := a // BUG: copies the internal state — undefined behavior
+	fmt.Println(b.Load())
+}
 ```
-Expected: `Got: 0` with no race warnings.
 
-## Common Mistakes
+**What happens:** `atomic.Int64` contains internal state that must not be copied. The compiler may warn, and the behavior is undefined.
 
-### Using the Wrong Address
+**Fix:** Always use pointers to atomic types, or embed them in structs that are never copied.
+
+### Using the Wrong Address with atomic.AddInt64
 
 **Wrong:**
 ```go
@@ -222,67 +382,35 @@ func main() {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			c := counter                // copies the value into a local variable
-			atomic.AddInt64(&c, 1)      // increments the LOCAL copy, not the shared counter
+			c := counter           // copies value into local variable
+			atomic.AddInt64(&c, 1) // increments LOCAL copy
 		}()
 	}
-
 	wg.Wait()
 	fmt.Printf("Expected: 100, Got: %d\n", counter) // always 0
 }
 ```
 
-**What happens:** Each goroutine modifies its own copy. The original `counter` stays at 0.
+**Fix:** Always pass the address of the original shared variable: `atomic.AddInt64(&counter, 1)`.
 
-**Fix:** Always pass the address of the original variable: `atomic.AddInt64(&counter, 1)`.
+## Verify What You Learned
 
-### Mixing Atomic and Non-Atomic Access
-
-**Wrong:**
-```go
-package main
-
-import (
-	"fmt"
-	"sync"
-	"sync/atomic"
-)
-
-func main() {
-	var counter int64
-	var wg sync.WaitGroup
-
-	for i := 0; i < 100; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			atomic.AddInt64(&counter, 1)
-		}()
-	}
-
-	wg.Wait()
-	fmt.Println(counter) // BUG: non-atomic read while other goroutines may still write
-}
-```
-
-**What happens:** Reading `counter` directly while other goroutines write atomically is still a race. ALL access to a shared variable must be atomic if ANY access is atomic.
-
-**Fix:** Use `atomic.LoadInt64(&counter)` or, in this example, the read is safe only because `wg.Wait()` has returned and all goroutines are done. The rule: after synchronization (WaitGroup, channel receive), a direct read is safe because there are no concurrent writers. Before synchronization, always use atomic reads.
-
-### Assuming Atomic Operations Provide Ordering
-
-Atomic operations guarantee indivisibility of a single read-modify-write, but they do not by themselves create happens-before relationships for OTHER variables. You will explore this in exercise 06.
+1. Why does `counter++` produce wrong results when called from multiple goroutines?
+2. What CPU instruction does `atomic.AddInt64` compile to on x86?
+3. When should you prefer `atomic.Int64` (Go 1.19+) over `atomic.AddInt64`?
+4. If atomic is always faster for counters, why does `sync.Mutex` exist at all?
 
 ## What's Next
-Continue to [02-atomic-load-store](../02-atomic-load-store/02-atomic-load-store.md) to learn how `atomic.LoadInt64` and `atomic.StoreInt64` provide visibility guarantees for published data.
+Continue to [02-atomic-load-store](../02-atomic-load-store/02-atomic-load-store.md) to build a feature flag system using atomic load and store operations for safe cross-goroutine visibility.
 
 ## Summary
-- Non-atomic `counter++` is a load-modify-store -- three operations that can interleave
-- `atomic.AddInt64(&counter, delta)` performs the increment as a single indivisible operation
-- `atomic.Int64` (Go 1.19+) is the preferred typed wrapper: `counter.Add(1)`, `counter.Load()`
-- All access to a shared variable must be atomic if any access is atomic -- no mixing
-- Negative deltas work with `AddInt64` for bidirectional counters
-- Atomic add is ideal for simple counters; for complex state, consider mutexes
+- Non-atomic `counter++` is three operations (load-modify-store) that interleave under concurrency, losing increments
+- `atomic.AddInt64(&counter, delta)` performs the increment as one indivisible CPU instruction
+- `atomic.Int64` (Go 1.19+) is the preferred typed wrapper -- method-based, unexported internals prevent accidental non-atomic access
+- For web server metrics (requests, bytes, errors), atomic counters are the right tool: lock-free, fast, zero allocation
+- Atomic counters outperform mutex-protected counters by 2-10x depending on contention level
+- ALL access to a shared variable must be atomic if ANY access is atomic -- no mixing
+- Atomic add is ideal for independent counters; for multi-field state that must update together, use a mutex
 
 ## Reference
 - [sync/atomic package](https://pkg.go.dev/sync/atomic)

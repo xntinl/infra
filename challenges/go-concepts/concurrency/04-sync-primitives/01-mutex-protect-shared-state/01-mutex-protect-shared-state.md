@@ -20,39 +20,15 @@ After completing this exercise, you will be able to:
 ## Why Mutex
 When multiple goroutines read and write the same variable without synchronization, the result is a data race -- one of the most insidious classes of bugs in concurrent programming. The outcome depends on the precise interleaving of goroutine execution, making the bug non-deterministic: your program might appear correct in testing and fail silently in production.
 
+In a real API server, multiple HTTP handlers run concurrently as goroutines. When these handlers share an in-memory cache, every read and write to that cache is a potential data race. Without synchronization, cached responses get corrupted, entries vanish, or the entire process panics from a concurrent map write.
+
 A `sync.Mutex` (mutual exclusion lock) solves this by ensuring that only one goroutine at a time can execute a critical section of code. When a goroutine calls `Lock()`, any other goroutine that also calls `Lock()` will block until the first goroutine calls `Unlock()`. This serializes access to shared state, eliminating the race.
 
 The idiomatic Go pattern is to call `defer mu.Unlock()` immediately after `Lock()`. This guarantees the lock is released even if the critical section panics, preventing deadlocks caused by forgotten unlocks.
 
-## Step 1 -- Observe the Race Condition
+## Step 1 -- Observe the Race Condition in a Shared Cache
 
-Run `main.go` and observe the unsafe counter produces an incorrect result:
-
-```bash
-go run main.go
-```
-
-You should see output like:
-```
-=== 1. Unsafe Counter (no mutex) ===
-Expected: 1000000, Got: 547832
-Race condition detected! Lost 452168 increments.
-```
-
-The exact number will vary between runs. Now run with Go's race detector to confirm:
-
-```bash
-go run -race main.go
-```
-
-The race detector will report `DATA RACE` warnings with stack traces showing the conflicting accesses.
-
-### Intermediate Verification
-You should see `WARNING: DATA RACE` output from the race detector pointing to the `counter++` line.
-
-## Step 2 -- Understand the Fix with sync.Mutex
-
-Read the `safeIncrement` function. It wraps the counter increment in a Lock/Unlock pair:
+Imagine an API server that caches responses in memory. Multiple HTTP handler goroutines write to the same map concurrently. Without protection, the cache is corrupted:
 
 ```go
 package main
@@ -63,41 +39,110 @@ import (
 )
 
 func main() {
-	counter := 0
-	var mu sync.Mutex
+	cache := make(map[string]string)
 	var wg sync.WaitGroup
 
-	for i := 0; i < 1000; i++ {
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Printf("PANIC: %v\n", r)
+			fmt.Println("This is what happens when concurrent goroutines write to an unprotected map.")
+		}
+	}()
+
+	for i := 0; i < 100; i++ {
 		wg.Add(1)
-		go func() {
+		go func(handlerID int) {
 			defer wg.Done()
-			for j := 0; j < 1000; j++ {
-				mu.Lock()
-				counter++
-				mu.Unlock()
-			}
-		}()
+			key := fmt.Sprintf("endpoint-%d", handlerID%10)
+			cache[key] = fmt.Sprintf(`{"handler":%d,"status":"ok"}`, handlerID)
+			_ = cache[key]
+		}(i)
 	}
 
 	wg.Wait()
-	fmt.Printf("Expected: 1000000, Got: %d\n", counter)
+	fmt.Printf("Cache has %d entries\n", len(cache))
 }
 ```
 
-### Intermediate Verification
+Run it:
+
 ```bash
 go run main.go
 ```
-The safe counter should always print exactly `1000000`.
+
+You should see a fatal panic:
+```
+PANIC: concurrent map writes
+This is what happens when concurrent goroutines write to an unprotected map.
+```
+
+Now run with the race detector to get detailed diagnostics:
 
 ```bash
 go run -race main.go
 ```
-No `DATA RACE` warnings should appear for the safe version.
+
+The race detector reports `DATA RACE` warnings with stack traces showing the conflicting accesses.
+
+### Intermediate Verification
+You should see a panic from concurrent map writes, or `WARNING: DATA RACE` output from the race detector. This is the real consequence of sharing a cache without synchronization in a production server.
+
+## Step 2 -- Protect the Cache with sync.Mutex
+
+Wrap every cache access in a Lock/Unlock pair. Every goroutine must acquire the mutex before touching the map:
+
+```go
+package main
+
+import (
+	"fmt"
+	"sync"
+)
+
+func main() {
+	cache := make(map[string]string)
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+
+	for i := 0; i < 100; i++ {
+		wg.Add(1)
+		go func(handlerID int) {
+			defer wg.Done()
+			key := fmt.Sprintf("endpoint-%d", handlerID%10)
+			response := fmt.Sprintf(`{"handler":%d,"status":"ok"}`, handlerID)
+
+			mu.Lock()
+			cache[key] = response
+			mu.Unlock()
+
+			mu.Lock()
+			_ = cache[key]
+			mu.Unlock()
+		}(i)
+	}
+
+	wg.Wait()
+	fmt.Printf("Cache has %d entries (expected 10)\n", len(cache))
+}
+```
+
+```bash
+go run -race main.go
+```
+
+Expected output:
+```
+Cache has 10 entries (expected 10)
+```
+
+No panics, no race warnings. The mutex serializes access so only one goroutine touches the map at a time.
+
+### Intermediate Verification
+Run `go run -race main.go`. The program completes cleanly with exactly 10 cache entries and no `DATA RACE` warnings.
 
 ## Step 3 -- The defer Unlock Pattern
 
-The `safeIncrementWithDefer` function extracts the critical section into a helper closure using `defer`:
+In production code, critical sections often contain logic that can return early or panic. Using `defer mu.Unlock()` immediately after `Lock()` guarantees the lock is always released:
 
 ```go
 package main
@@ -105,45 +150,57 @@ package main
 import (
 	"fmt"
 	"sync"
+	"time"
 )
 
 func main() {
-	counter := 0
+	cache := make(map[string]string)
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 
-	increment := func() {
+	cacheSet := func(key, value string) {
 		mu.Lock()
-		defer mu.Unlock() // runs when increment() returns
-		counter++
+		defer mu.Unlock()
+		cache[key] = value
 	}
 
-	for i := 0; i < 1000; i++ {
+	cacheGet := func(key string) (string, bool) {
+		mu.Lock()
+		defer mu.Unlock()
+		val, ok := cache[key]
+		return val, ok
+	}
+
+	for i := 0; i < 50; i++ {
 		wg.Add(1)
-		go func() {
+		go func(handlerID int) {
 			defer wg.Done()
-			for j := 0; j < 1000; j++ {
-				increment()
-			}
-		}()
+			key := fmt.Sprintf("user-%d", handlerID%5)
+			cacheSet(key, fmt.Sprintf(`{"id":%d,"ts":"%s"}`, handlerID, time.Now().Format(time.RFC3339Nano)))
+		}(i)
 	}
 
 	wg.Wait()
-	fmt.Printf("Expected: 1000000, Got: %d\n", counter)
+
+	for i := 0; i < 5; i++ {
+		key := fmt.Sprintf("user-%d", i)
+		val, ok := cacheGet(key)
+		fmt.Printf("  %s: found=%v value=%s\n", key, ok, val)
+	}
 }
 ```
 
-The `defer mu.Unlock()` line executes when `increment()` returns, guaranteeing the lock is always released. This is especially important when the critical section might return early or panic.
+The `defer mu.Unlock()` line executes when the enclosing function returns, guaranteeing the lock is always released. This is especially important when the critical section might return early or panic.
 
 ### Intermediate Verification
 ```bash
 go run -race main.go
 ```
-All three functions should run. The unsafe version shows an incorrect count; both safe versions show exactly `1000000`.
+All 5 user keys should be present, no race warnings.
 
-## Step 4 -- Struct with Embedded Mutex
+## Step 4 -- Struct-Embedded Mutex: The Cache Type
 
-The idiomatic Go pattern places the mutex alongside the data it protects inside a struct:
+The idiomatic Go pattern places the mutex alongside the data it protects inside a struct. This is how you would build a real API cache:
 
 ```go
 package main
@@ -151,98 +208,102 @@ package main
 import (
 	"fmt"
 	"sync"
+	"time"
 )
 
-type ScoreBoard struct {
-	mu     sync.Mutex
-	scores map[string]int
+type APICache struct {
+	mu      sync.Mutex
+	entries map[string]CacheEntry
 }
 
-func NewScoreBoard() *ScoreBoard {
-	return &ScoreBoard{scores: make(map[string]int)}
+type CacheEntry struct {
+	Body      string
+	CachedAt  time.Time
 }
 
-func (sb *ScoreBoard) AddPoint(player string) {
-	sb.mu.Lock()
-	defer sb.mu.Unlock()
-	sb.scores[player]++
+func NewAPICache() *APICache {
+	return &APICache{entries: make(map[string]CacheEntry)}
 }
 
-// Returns a COPY so callers cannot bypass the mutex.
-func (sb *ScoreBoard) Scores() map[string]int {
-	sb.mu.Lock()
-	defer sb.mu.Unlock()
-	result := make(map[string]int, len(sb.scores))
-	for k, v := range sb.scores {
+func (c *APICache) Set(endpoint string, body string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.entries[endpoint] = CacheEntry{Body: body, CachedAt: time.Now()}
+}
+
+func (c *APICache) Get(endpoint string) (CacheEntry, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry, ok := c.entries[endpoint]
+	return entry, ok
+}
+
+func (c *APICache) Size() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.entries)
+}
+
+// Snapshot returns a COPY so callers cannot bypass the mutex.
+func (c *APICache) Snapshot() map[string]CacheEntry {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	result := make(map[string]CacheEntry, len(c.entries))
+	for k, v := range c.entries {
 		result[k] = v
 	}
 	return result
 }
 
 func main() {
-	board := NewScoreBoard()
+	cache := NewAPICache()
 	var wg sync.WaitGroup
 
-	for i := 0; i < 1000; i++ {
+	endpoints := []string{"/api/users", "/api/orders", "/api/products", "/api/health", "/api/config"}
+
+	for i := 0; i < 200; i++ {
 		wg.Add(1)
-		go func() {
+		go func(handlerID int) {
 			defer wg.Done()
-			board.AddPoint("alice")
-		}()
-	}
+			ep := endpoints[handlerID%len(endpoints)]
+			cache.Set(ep, fmt.Sprintf(`{"handler":%d,"status":"ok"}`, handlerID))
 
-	wg.Wait()
-	fmt.Printf("Alice's score: %d\n", board.Scores()["alice"])
-}
-```
-
-Expected output:
-```
-Alice's score: 1000
-```
-
-### Intermediate Verification
-Run `go run -race main.go` on the full program. All five demos should complete without any race warnings.
-
-## Step 5 -- Protecting a Shared Map
-
-Maps in Go are NOT safe for concurrent access. Writing from multiple goroutines without a mutex causes a fatal runtime panic. The `protectSharedMap` function demonstrates the fix:
-
-```go
-package main
-
-import (
-	"fmt"
-	"sync"
-)
-
-func main() {
-	var mu sync.Mutex
-	m := make(map[int]int)
-	var wg sync.WaitGroup
-
-	for i := 0; i < 100; i++ {
-		wg.Add(1)
-		go func(base int) {
-			defer wg.Done()
-			for j := 0; j < 10; j++ {
-				key := base*10 + j
-				mu.Lock()
-				m[key] = key * key
-				mu.Unlock()
+			if entry, ok := cache.Get(ep); ok {
+				_ = entry.Body
 			}
 		}(i)
 	}
 
 	wg.Wait()
-	fmt.Printf("Map has %d entries (expected 1000).\n", len(m))
+
+	snap := cache.Snapshot()
+	fmt.Printf("Cache has %d endpoints:\n", len(snap))
+	for ep, entry := range snap {
+		fmt.Printf("  %s -> cached at %s\n", ep, entry.CachedAt.Format("15:04:05.000"))
+	}
 }
 ```
 
 Expected output:
 ```
-Map has 1000 entries (expected 1000).
+Cache has 5 endpoints:
+  /api/users -> cached at 14:23:01.123
+  /api/orders -> cached at 14:23:01.124
+  /api/products -> cached at 14:23:01.123
+  /api/health -> cached at 14:23:01.124
+  /api/config -> cached at 14:23:01.123
 ```
+
+The key design points:
+- The mutex is unexported (`mu`), preventing external code from locking it incorrectly.
+- `Snapshot()` returns a copy of the map, so callers cannot mutate internal state without the mutex.
+- Every method that touches `entries` acquires the lock first.
+
+### Intermediate Verification
+```bash
+go run -race main.go
+```
+All 5 endpoints cached, no race warnings.
 
 ## Common Mistakes
 
@@ -281,38 +342,38 @@ import (
 	"sync"
 )
 
-func doWork(mu sync.Mutex, counter *int) { // receives a COPY of the mutex
+func cacheSet(mu sync.Mutex, cache map[string]string, key, val string) {
 	mu.Lock()
 	defer mu.Unlock()
-	*counter++ // this lock is independent of the original -- no protection!
+	cache[key] = val // this lock is independent of the original -- no protection!
 }
 
 func main() {
 	var mu sync.Mutex
-	counter := 0
+	cache := make(map[string]string)
 	var wg sync.WaitGroup
 
-	for i := 0; i < 1000; i++ {
+	for i := 0; i < 100; i++ {
 		wg.Add(1)
-		go func() {
+		go func(id int) {
 			defer wg.Done()
-			doWork(mu, &counter) // each goroutine gets its own mutex copy!
-		}()
+			cacheSet(mu, cache, fmt.Sprintf("k%d", id), "v") // each goroutine gets its own mutex copy!
+		}(i)
 	}
 
 	wg.Wait()
-	fmt.Printf("Counter: %d (likely != 1000 due to copied mutex)\n", counter)
+	fmt.Printf("Entries: %d (likely panic or wrong count due to copied mutex)\n", len(cache))
 }
 ```
 
-**What happens:** Each goroutine locks its own copy -- no mutual exclusion at all.
+**What happens:** Each goroutine locks its own copy -- no mutual exclusion at all. Concurrent map writes will panic.
 
-**Fix:** Always pass `*sync.Mutex` (a pointer):
+**Fix:** Always pass `*sync.Mutex` (a pointer), or better, embed the mutex in a struct:
 ```go
-func doWork(mu *sync.Mutex, counter *int) {
+func cacheSet(mu *sync.Mutex, cache map[string]string, key, val string) {
 	mu.Lock()
 	defer mu.Unlock()
-	*counter++
+	cache[key] = val
 }
 ```
 
@@ -320,34 +381,35 @@ func doWork(mu *sync.Mutex, counter *int) {
 
 ```go
 mu.Lock()
-result := expensiveComputation() // holds the lock during slow work
-counter += result
+result := fetchFromDatabase(userID) // holds the lock during slow I/O
+cache[userID] = result
 mu.Unlock()
 ```
 
-**What happens:** All goroutines are serialized through the expensive computation, eliminating concurrency benefits.
+**What happens:** All goroutines are serialized through the database call, eliminating concurrency benefits. Your API server handles one request at a time.
 
 **Fix:** Only hold the lock for the shared state access:
 ```go
-result := expensiveComputation() // no lock needed here
+result := fetchFromDatabase(userID) // no lock needed here
 mu.Lock()
-counter += result
+cache[userID] = result
 mu.Unlock()
 ```
 
 ## Verify What You Learned
 
-Modify the program to protect a shared `map[string]int` instead of a simple counter. Launch 100 goroutines that each insert 100 key-value pairs into the map. Confirm with `-race` that there are no data races, and that the map contains all expected entries.
+Extend the `APICache` to support a `Delete(endpoint string)` method and a `SetWithTTL(endpoint, body string, ttl time.Duration)` that records an expiration time. Add a `CleanExpired()` method that removes all entries past their TTL. Launch 100 goroutines that randomly set, get, and delete entries, and run with `-race` to confirm there are no data races.
 
 ## What's Next
 Continue to [02-rwmutex-readers-writers](../02-rwmutex-readers-writers/02-rwmutex-readers-writers.md) to learn how `sync.RWMutex` allows multiple concurrent readers while still protecting writes.
 
 ## Summary
 - A data race occurs when multiple goroutines access shared state without synchronization and at least one writes
+- In API servers, shared in-memory caches are the most common source of data races
 - `sync.Mutex` provides mutual exclusion: only one goroutine holds the lock at a time
 - Always use `defer mu.Unlock()` immediately after `mu.Lock()` for safety
 - Never copy a mutex -- pass it by pointer or embed it in a struct
-- Minimize the critical section: hold the lock only while accessing shared state
+- Minimize the critical section: hold the lock only while accessing shared state, not during I/O
 - Return copies from locked methods to prevent callers from bypassing the mutex
 - Use `go run -race` to detect data races during development
 

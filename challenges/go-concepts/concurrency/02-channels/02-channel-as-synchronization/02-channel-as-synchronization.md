@@ -4,11 +4,9 @@ concepts: [channels, synchronization, done-channel, signaling, goroutine-coordin
 tools: [go]
 estimated_time: 20m
 bloom_level: apply
-prerequisites: [goroutines, unbuffered-channels]
 ---
 
 # 2. Channel as Synchronization
-
 
 ## Learning Objectives
 After completing this exercise, you will be able to:
@@ -18,15 +16,15 @@ After completing this exercise, you will be able to:
 
 ## Why Channel Synchronization
 
-When you first learn goroutines, `time.Sleep` seems like a quick way to "wait" for goroutines to finish. But `time.Sleep` is a guess -- you're betting that the goroutine finishes within the sleep duration. On a slow machine, under heavy load, or with network calls, that bet fails silently. Your program exits before the goroutine finishes, and you lose results with no error message.
+When a web server starts, it needs to complete several initialization tasks before it can accept traffic: load configuration from disk, warm up the cache, and establish a database connection. Each of these tasks runs concurrently, but the server must not start listening until all of them are done.
 
-Channels give you a guarantee instead of a guess. When you receive from a done channel, you know the goroutine has completed because it sent the signal. It doesn't matter if the work took 1ms or 10 seconds -- the receiver waits exactly as long as needed.
+A naive approach uses `time.Sleep` -- "wait 2 seconds and hope everything finishes." This is a guess, not a guarantee. On a slow machine, under heavy load, or when the database is remote, that guess fails silently. The server starts accepting requests before the database is connected, and users get 500 errors.
 
-This pattern is so fundamental that it appears in virtually every production Go program. It's the building block for more sophisticated patterns like fan-out/fan-in, pipelines, and graceful shutdown.
+Channels give you a guarantee instead of a guess. When you receive from a done channel, you know the goroutine has completed because it sent the signal. Whether the work took 1ms or 10 seconds, the receiver waits exactly as long as needed.
 
 ## Step 1 -- The Fragile Sleep Version
 
-Start with code that uses `time.Sleep` to wait for goroutines. Observe how it breaks when the work takes longer than expected.
+Start with a web server startup that uses `time.Sleep` to wait for initialization. Observe how it breaks when a task takes longer than expected.
 
 ```go
 package main
@@ -37,33 +35,43 @@ import (
 )
 
 func main() {
-    worker := func(id int) {
-        fmt.Printf("Worker %d: starting\n", id)
-        time.Sleep(time.Duration(id*100) * time.Millisecond)
-        fmt.Printf("Worker %d: done\n", id)
-    }
+    fmt.Println("Server: starting initialization...")
 
-    for i := 1; i <= 3; i++ {
-        go worker(i)
-    }
+    go func() {
+        fmt.Println("  [config] loading configuration...")
+        time.Sleep(100 * time.Millisecond)
+        fmt.Println("  [config] done")
+    }()
 
-    // Hope that 200ms is enough... it's not for worker 3 (needs 300ms)
-    time.Sleep(200 * time.Millisecond)
-    fmt.Println("main: exiting (worker 3 lost!)")
+    go func() {
+        fmt.Println("  [cache] warming cache...")
+        time.Sleep(200 * time.Millisecond)
+        fmt.Println("  [cache] done")
+    }()
+
+    go func() {
+        fmt.Println("  [db] connecting to database...")
+        time.Sleep(400 * time.Millisecond) // slow connection
+        fmt.Println("  [db] done")
+    }()
+
+    // Hope that 300ms is enough... but database needs 400ms.
+    time.Sleep(300 * time.Millisecond)
+    fmt.Println("Server: listening on :8080 (database NOT ready!)")
 }
 ```
 
-Worker 3 needs 300ms but main only waits 200ms. Worker 3's completion message is lost.
+The database connection needs 400ms but main only waits 300ms. The server starts accepting requests before the database is ready -- a real bug that causes errors in production.
 
 ### Verification
 ```bash
 go run main.go
-# You'll see worker 3 is missing its "done" message
+# You will see the database "done" message is missing or appears after "listening"
 ```
 
-## Step 2 -- Convert to Done Channel
+## Step 2 -- Convert to Done Channels
 
-Replace `time.Sleep` with a done channel. Each goroutine signals completion by sending on the channel. Main receives once per worker, guaranteeing all finish.
+Replace `time.Sleep` with a done channel. Each initialization task signals completion by sending on the channel. Main receives once per task, guaranteeing all finish before the server starts listening.
 
 ```go
 package main
@@ -74,44 +82,54 @@ import (
 )
 
 func main() {
-    done := make(chan bool)
+    fmt.Println("Server: starting initialization...")
+    done := make(chan string)
 
-    worker := func(id int) {
-        fmt.Printf("Worker %d: starting\n", id)
-        time.Sleep(time.Duration(id*100) * time.Millisecond)
-        fmt.Printf("Worker %d: done\n", id)
-        done <- true // signal completion
-    }
+    go func() {
+        fmt.Println("  [config] loading configuration...")
+        time.Sleep(100 * time.Millisecond)
+        done <- "config"
+    }()
 
-    for i := 1; i <= 3; i++ {
-        go worker(i)
-    }
+    go func() {
+        fmt.Println("  [cache] warming cache...")
+        time.Sleep(200 * time.Millisecond)
+        done <- "cache"
+    }()
 
-    // Receive once per worker. Blocks until ALL three have sent.
-    // It doesn't matter if a worker takes 1ms or 10s -- we wait exactly as needed.
+    go func() {
+        fmt.Println("  [db] connecting to database...")
+        time.Sleep(400 * time.Millisecond)
+        done <- "db"
+    }()
+
+    // Receive once per task. Blocks until ALL three have sent.
+    // It does not matter if a task takes 1ms or 10s -- we wait exactly as needed.
     for i := 0; i < 3; i++ {
-        <-done
+        component := <-done
+        fmt.Printf("  [%s] ready\n", component)
     }
-    fmt.Println("main: all workers completed")
+    fmt.Println("Server: all components initialized -- listening on :8080")
 }
 ```
 
 ### Verification
 ```bash
 go run main.go
-# Expected: all three workers print "done" messages, then main exits
-# Worker 1: starting
-# Worker 2: starting
-# Worker 3: starting
-# Worker 1: done
-# Worker 2: done
-# Worker 3: done
-# main: all workers completed
+# Expected: all three components print "ready", then the server starts listening
+#   Server: starting initialization...
+#   [config] loading configuration...
+#   [cache] warming cache...
+#   [db] connecting to database...
+#   [config] ready
+#   [cache] ready
+#   [db] ready
+#   Server: all components initialized -- listening on :8080
 ```
 
 ## Step 3 -- Signal Without Data: struct{}
 
-When a channel is used purely for signaling (the value itself doesn't matter), use `chan struct{}` instead of `chan bool`. It communicates intent clearly and uses zero memory per value.
+When a channel is used purely for signaling (the value itself does not matter), use `chan struct{}` instead of `chan bool`. It communicates intent clearly and uses zero memory per value.
 
 ```go
 package main
@@ -122,21 +140,35 @@ import (
 )
 
 func main() {
-    done := make(chan struct{})
+    fmt.Println("Server: starting initialization...")
+    configReady := make(chan struct{})
+    cacheReady := make(chan struct{})
+    dbReady := make(chan struct{})
 
-    for i := 1; i <= 3; i++ {
-        go func(id int) {
-            time.Sleep(time.Duration(id*50) * time.Millisecond)
-            fmt.Printf("Worker %d: finished task\n", id)
-            // struct{}{} carries no data -- the synchronization IS the message.
-            done <- struct{}{}
-        }(i)
-    }
+    go func() {
+        time.Sleep(100 * time.Millisecond)
+        fmt.Println("  [config] loaded")
+        configReady <- struct{}{}
+    }()
 
-    for i := 0; i < 3; i++ {
-        <-done
-    }
-    fmt.Println("all 3 workers confirmed done")
+    go func() {
+        time.Sleep(200 * time.Millisecond)
+        fmt.Println("  [cache] warmed")
+        cacheReady <- struct{}{}
+    }()
+
+    go func() {
+        time.Sleep(400 * time.Millisecond)
+        fmt.Println("  [db] connected")
+        dbReady <- struct{}{}
+    }()
+
+    // Wait for each component individually.
+    // struct{}{} carries no data -- the synchronization IS the message.
+    <-configReady
+    <-cacheReady
+    <-dbReady
+    fmt.Println("Server: all systems go -- listening on :8080")
 }
 ```
 
@@ -148,12 +180,12 @@ Why `struct{}` over `bool`? Three reasons:
 ### Verification
 ```bash
 go run main.go
-# Same behavior as step 2, but with clearer intent
+# Same deterministic behavior, but with clearer intent in the code
 ```
 
-## Step 4 -- Collecting Results (Not Just Signals)
+## Step 4 -- Collecting Initialization Results
 
-In practice, goroutines often produce results. The channel carries both the data AND the synchronization in one operation.
+In practice, initialization tasks produce results -- a config object, a cache handle, a database connection. The channel carries both the data AND the synchronization in one operation.
 
 ```go
 package main
@@ -163,43 +195,63 @@ import (
     "time"
 )
 
-type Result struct {
-    WorkerID int
-    Data     string
+type InitResult struct {
+    Component string
+    Status    string
+    Duration  time.Duration
 }
 
 func main() {
-    results := make(chan Result)
+    fmt.Println("Server: starting initialization...")
+    results := make(chan InitResult)
 
-    for i := 1; i <= 3; i++ {
-        go func(id int) {
-            time.Sleep(time.Duration(id*50) * time.Millisecond)
-            results <- Result{
-                WorkerID: id,
-                Data:     fmt.Sprintf("data-from-%d", id),
-            }
-        }(i)
-    }
+    go func() {
+        start := time.Now()
+        time.Sleep(100 * time.Millisecond) // simulate config loading
+        results <- InitResult{
+            Component: "config",
+            Status:    "loaded 47 settings",
+            Duration:  time.Since(start),
+        }
+    }()
+
+    go func() {
+        start := time.Now()
+        time.Sleep(200 * time.Millisecond) // simulate cache warming
+        results <- InitResult{
+            Component: "cache",
+            Status:    "warmed 1200 entries",
+            Duration:  time.Since(start),
+        }
+    }()
+
+    go func() {
+        start := time.Now()
+        time.Sleep(400 * time.Millisecond) // simulate DB connection
+        results <- InitResult{
+            Component: "database",
+            Status:    "connected to postgres://prod:5432",
+            Duration:  time.Since(start),
+        }
+    }()
 
     for i := 0; i < 3; i++ {
         r := <-results
-        fmt.Printf("Worker %d result: %s\n", r.WorkerID, r.Data)
+        fmt.Printf("  [%s] %s (took %v)\n", r.Component, r.Status, r.Duration.Round(time.Millisecond))
     }
+    fmt.Println("Server: ready to accept traffic")
 }
 ```
 
 ### Verification
 ```bash
 go run main.go
-# Expected:
-#   Worker 1 result: data-from-1
-#   Worker 2 result: data-from-2
-#   Worker 3 result: data-from-3
+# Expected: each component reports its status and timing, then server starts
 ```
 
-## Step 5 -- Total Time Equals Slowest Worker
+## Step 5 -- Total Time Equals the Slowest Task
 
-The power of concurrent synchronization: total elapsed time equals the slowest worker, not the sum of all workers. This program proves it.
+The power of concurrent initialization: total elapsed time equals the slowest task, not the sum. With channels, you wait exactly as long as the slowest component -- no more, no less.
 
 ```go
 package main
@@ -212,34 +264,50 @@ import (
 func main() {
     start := time.Now()
     done := make(chan struct{})
-    numTasks := 5
 
-    for i := 1; i <= numTasks; i++ {
-        go func(id int) {
-            duration := time.Duration(id*200) * time.Millisecond
-            fmt.Printf("Task %d: working for %v\n", id, duration)
-            time.Sleep(duration)
-            fmt.Printf("Task %d: complete\n", id)
-            done <- struct{}{}
-        }(i)
+    tasks := []struct {
+        name     string
+        duration time.Duration
+    }{
+        {"load TLS certs", 100 * time.Millisecond},
+        {"parse config", 50 * time.Millisecond},
+        {"warm cache", 200 * time.Millisecond},
+        {"connect to database", 400 * time.Millisecond},
+        {"register health check", 30 * time.Millisecond},
     }
 
-    for i := 0; i < numTasks; i++ {
+    for _, t := range tasks {
+        go func(name string, d time.Duration) {
+            fmt.Printf("  [init] %s (%v)\n", name, d)
+            time.Sleep(d)
+            done <- struct{}{}
+        }(t.name, t.duration)
+    }
+
+    for range tasks {
         <-done
     }
 
-    elapsed := time.Since(start).Round(100 * time.Millisecond)
-    fmt.Printf("Total time: %v (parallel -- not the sum)\n", elapsed)
+    elapsed := time.Since(start).Round(10 * time.Millisecond)
+    fmt.Printf("Total startup time: %v (parallel -- not %v sequential)\n",
+        elapsed, 780*time.Millisecond)
 }
 ```
 
 ### Verification
 ```bash
 go run main.go
-# Expected: Total time ~1s (slowest task), NOT ~3s (sum of all)
+# Expected: Total startup time ~400ms (slowest task), NOT ~780ms (sum of all)
 ```
 
-If you added `time.Sleep` instead of channels, you'd have to guess the maximum. With channels, you wait exactly as long as the slowest worker -- no more, no less.
+With `time.Sleep` you would have to guess the maximum. With channels, the wait is exactly as long as the slowest task requires.
+
+## Intermediate Verification
+
+Run your programs and confirm:
+1. The sleep-based version misses the database initialization
+2. The channel-based version always waits for all components
+3. The total time is determined by the slowest task, not the sum
 
 ## Common Mistakes
 
@@ -287,17 +355,22 @@ func main() {
     done := make(chan struct{})
     go func() {
         done <- struct{}{} // signal sent BEFORE work!
-        time.Sleep(1 * time.Second) // "expensive work"
-        fmt.Println("work complete")
+        time.Sleep(1 * time.Second)
+        fmt.Println("database connected")
     }()
     <-done
-    fmt.Println("main continues") // goroutine is still working!
+    fmt.Println("server: accepting traffic") // database is NOT connected yet!
 }
 ```
 
-**What happens:** The signal arrives before the work completes. Main proceeds with incomplete results.
+**What happens:** The signal arrives before the work completes. The server starts accepting traffic with no database connection.
 
 **Correct:** Always send the done signal as the LAST operation in the goroutine.
+
+## Verify What You Learned
+1. Why does `time.Sleep` fail as a synchronization mechanism?
+2. What happens if a goroutine sends on the done channel before completing its work?
+3. When would you use `chan struct{}` instead of `chan string` for signaling?
 
 ## What's Next
 Continue to [03-buffered-channels](../03-buffered-channels/03-buffered-channels.md) to learn how buffered channels decouple senders from receivers.
@@ -305,10 +378,11 @@ Continue to [03-buffered-channels](../03-buffered-channels/03-buffered-channels.
 ## Summary
 - `time.Sleep` for synchronization is fragile -- it guesses instead of guaranteeing
 - Done channels provide deterministic synchronization: receive blocks until the sender signals
-- Use `chan struct{}` for pure signaling where the value doesn't matter
+- Use `chan struct{}` for pure signaling where the value does not matter
 - To wait for N goroutines, perform N receives on the done channel
 - Always send the done signal as the last operation in the goroutine
 - Result channels combine synchronization with data transfer
+- Total concurrent time equals the slowest task, not the sum of all tasks
 
 ## Reference
 - [Go Blog: Share Memory By Communicating](https://go.dev/blog/codelab-share)

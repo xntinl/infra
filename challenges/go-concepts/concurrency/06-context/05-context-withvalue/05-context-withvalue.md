@@ -1,33 +1,33 @@
 ---
 difficulty: intermediate
-concepts: [context.WithValue, type-safe keys, request-scoped data, key collision avoidance]
+concepts: [context.WithValue, type-safe keys, request-scoped data, middleware, key collision avoidance]
 tools: [go]
 estimated_time: 30m
 bloom_level: apply
-prerequisites: [context.Background, context.WithCancel, custom types]
 ---
 
 # 5. Context WithValue
 
-
 ## Learning Objectives
 After completing this exercise, you will be able to:
-- **Store** request-scoped data in a context using `context.WithValue`
-- **Define** type-safe context keys to avoid collisions
-- **Retrieve** values from context using type assertions
-- **Distinguish** appropriate uses of context values from anti-patterns
+- **Propagate** request-scoped data (request ID, user ID, trace ID) through middleware, handlers, and services
+- **Define** type-safe context keys using unexported struct types to prevent collisions
+- **Build** helper functions (`WithX` / `XFrom`) as the public API for context values
+- **Identify** anti-patterns: using WithValue for optional parameters, dependency injection, or function arguments
 
 ## Why WithValue
 
-Contexts carry more than cancellation signals. The `context.WithValue` function attaches a key-value pair to a context, creating a new derived context. This is designed for request-scoped data that crosses API boundaries: request IDs, authentication tokens, tracing spans, and similar metadata.
+In a real service, every request needs metadata that follows it through every layer: a request ID for correlating log lines across microservices, a user ID for authorization checks deep in the call stack, a trace ID for distributed tracing. This metadata crosses API boundaries -- from HTTP middleware to business logic to database queries to external API calls.
 
-The critical rule: context values are for data that transits processes and APIs, not for passing optional function parameters. If a function needs data to operate, it should accept it as an explicit parameter. Context values are for metadata that the function does not directly use but needs to propagate downstream (logging correlation IDs, for example).
+`context.WithValue` attaches a key-value pair to a context, creating a new derived context. Every function that receives this context can read the value. This is designed specifically for request-scoped metadata that transits process boundaries.
 
-Keys must be carefully chosen to avoid collisions. Using bare strings or integers as keys is dangerous because two independent packages might use the same key. The idiomatic Go approach is to define an unexported type as the key, making it impossible for code outside your package to collide.
+The critical rule: context values are for data that crosses API boundaries (request IDs, trace spans, auth tokens), not for passing function arguments. If a function needs data to operate, it should accept it as an explicit parameter. A function that pulls its inputs from context is impossible to understand without reading the entire call chain.
 
-## Step 1 -- Store and Retrieve a Value
+Keys must be carefully chosen. Using bare strings as keys is dangerous because two independent packages might use the same string key, silently overwriting each other's values. The Go idiom is to define an unexported struct type as the key, making cross-package collisions impossible.
 
-Store a request ID in the context and retrieve it in a downstream function:
+## Step 1 -- Request Metadata Flowing Through Middleware
+
+Build a request processing pipeline where middleware attaches a request ID and user ID, and every downstream layer can access them for logging:
 
 ```go
 package main
@@ -35,29 +35,74 @@ package main
 import (
 	"context"
 	"fmt"
+	"time"
 )
 
-type contextKey string
+// Unexported key types -- only this package can create values of these types.
+type requestIDKey struct{}
+type userIDKey struct{}
+type traceIDKey struct{}
 
-const requestIDKey contextKey = "requestID"
+func withRequestID(ctx context.Context, id string) context.Context {
+	return context.WithValue(ctx, requestIDKey{}, id)
+}
 
-func processRequest(ctx context.Context) {
-	reqID, ok := ctx.Value(requestIDKey).(string)
-	if !ok {
-		fmt.Println("no request ID found in context")
-		return
-	}
-	fmt.Printf("Processing request: %s\n", reqID)
+func requestIDFrom(ctx context.Context) string {
+	id, _ := ctx.Value(requestIDKey{}).(string)
+	return id
+}
+
+func withUserID(ctx context.Context, id string) context.Context {
+	return context.WithValue(ctx, userIDKey{}, id)
+}
+
+func userIDFrom(ctx context.Context) string {
+	id, _ := ctx.Value(userIDKey{}).(string)
+	return id
+}
+
+func withTraceID(ctx context.Context, id string) context.Context {
+	return context.WithValue(ctx, traceIDKey{}, id)
+}
+
+func traceIDFrom(ctx context.Context) string {
+	id, _ := ctx.Value(traceIDKey{}).(string)
+	return id
+}
+
+func log(ctx context.Context, layer, message string) {
+	fmt.Printf("[%-10s] req=%s user=%s trace=%s | %s\n",
+		layer,
+		requestIDFrom(ctx),
+		userIDFrom(ctx),
+		traceIDFrom(ctx),
+		message,
+	)
 }
 
 func main() {
+	// Simulate middleware chain adding metadata to context.
 	ctx := context.Background()
-	ctx = context.WithValue(ctx, requestIDKey, "req-abc-123")
 
-	processRequest(ctx)
+	// Middleware 1: generate request ID.
+	ctx = withRequestID(ctx, "req-7f3a-bc21")
+	fmt.Println("Middleware: added request ID")
 
-	// A key that was never set returns nil.
-	fmt.Printf("Missing key: %v\n", ctx.Value(contextKey("nonexistent")))
+	// Middleware 2: extract user from auth token.
+	ctx = withUserID(ctx, "user-42")
+	fmt.Println("Middleware: added user ID")
+
+	// Middleware 3: start distributed trace.
+	ctx = withTraceID(ctx, "trace-abc-789")
+	fmt.Println("Middleware: added trace ID")
+	fmt.Println()
+
+	// Every downstream layer sees ALL metadata without explicit parameters.
+	log(ctx, "handler", "received order creation request")
+	log(ctx, "service", "validating order data")
+	log(ctx, "repository", "inserting order into database")
+	log(ctx, "service", "sending confirmation email")
+	log(ctx, "handler", fmt.Sprintf("completed in %v", 150*time.Millisecond))
 }
 ```
 
@@ -67,61 +112,22 @@ go run main.go
 ```
 Expected output:
 ```
-Processing request: req-abc-123
-Missing key: <nil>
+Middleware: added request ID
+Middleware: added user ID
+Middleware: added trace ID
+
+[handler   ] req=req-7f3a-bc21 user=user-42 trace=trace-abc-789 | received order creation request
+[service   ] req=req-7f3a-bc21 user=user-42 trace=trace-abc-789 | validating order data
+[repository] req=req-7f3a-bc21 user=user-42 trace=trace-abc-789 | inserting order into database
+[service   ] req=req-7f3a-bc21 user=user-42 trace=trace-abc-789 | sending confirmation email
+[handler   ] req=req-7f3a-bc21 user=user-42 trace=trace-abc-789 | completed in 150ms
 ```
 
-Note the comma-ok idiom for the type assertion: `reqID, ok := ctx.Value(key).(string)`. This safely distinguishes "key not found" (ok=false) from "key found with zero value."
+The request ID, user ID, and trace ID flow through every layer without being passed as explicit parameters. Every log line from every layer contains the same correlation IDs, making it trivial to trace a single request across a distributed system.
 
-## Step 2 -- Type-Safe Keys (The Right Way)
+## Step 2 -- Why Unexported Struct Keys (Not Strings)
 
-Unexported custom types are essential for key safety. Different struct types are never equal, even if their structure is identical, so they can never collide:
-
-```go
-package main
-
-import (
-	"context"
-	"fmt"
-)
-
-// Unexported types -- only this package can create values of these types.
-type userKey struct{}
-type traceKey struct{}
-
-func main() {
-	ctx := context.Background()
-	ctx = context.WithValue(ctx, userKey{}, "alice")
-	ctx = context.WithValue(ctx, traceKey{}, "trace-xyz-789")
-
-	user, _ := ctx.Value(userKey{}).(string)
-	trace, _ := ctx.Value(traceKey{}).(string)
-
-	fmt.Printf("User:  %s\n", user)
-	fmt.Printf("Trace: %s\n", trace)
-
-	// Using the wrong key type returns nil, which type-asserts to zero value.
-	wrongType, _ := ctx.Value(struct{}{}).(string)
-	fmt.Printf("Wrong key type: %q (empty, not a collision)\n", wrongType)
-}
-```
-
-### Verification
-```bash
-go run main.go
-```
-Expected output:
-```
-User:  alice
-Trace: trace-xyz-789
-Wrong key type: "" (empty, not a collision)
-```
-
-Each key type retrieves only its own value. There is no collision even though both values are strings. The struct{} approach uses zero bytes of memory.
-
-## Step 3 -- String Key Collision Problem
-
-Why using plain strings as keys is dangerous:
+Using plain strings as context keys is a production bug waiting to happen. Two independent packages that use the same string key silently overwrite each other's values:
 
 ```go
 package main
@@ -134,16 +140,17 @@ import (
 func main() {
 	ctx := context.Background()
 
-	// "Package A" stores a value.
-	ctx = context.WithValue(ctx, "userID", "user-from-package-A")
+	// Imagine this is your auth middleware:
+	ctx = context.WithValue(ctx, "userID", "admin-from-auth")
+	fmt.Printf("After auth middleware:    userID = %s\n", ctx.Value("userID"))
 
-	// "Package B" independently stores a value with the same key.
-	ctx = context.WithValue(ctx, "userID", "user-from-package-B")
+	// Now a logging middleware from a third-party library also uses "userID":
+	ctx = context.WithValue(ctx, "userID", "anonymous-from-logger")
+	fmt.Printf("After logging middleware: userID = %s\n", ctx.Value("userID"))
 
-	// "Package A" tries to read its value -- gets B's instead.
-	value := ctx.Value("userID")
-	fmt.Printf("Value for 'userID': %s\n", value)
-	fmt.Println("Package A's value was silently overwritten!")
+	// Your auth check now sees the WRONG user. Security vulnerability.
+	fmt.Printf("\nAuth check sees: %s\n", ctx.Value("userID"))
+	fmt.Println("BUG: auth value was silently overwritten by the logger!")
 }
 ```
 
@@ -153,15 +160,14 @@ go run main.go
 ```
 Expected output:
 ```
-Value for 'userID': user-from-package-B
-Package A's value was silently overwritten!
+After auth middleware:    userID = admin-from-auth
+After logging middleware: userID = anonymous-from-logger
+
+Auth check sees: anonymous-from-logger
+BUG: auth value was silently overwritten by the logger!
 ```
 
-With typed keys (Step 2), this collision is impossible because each package defines its own unexported type. The `go vet` tool even warns about using string or integer keys.
-
-## Step 4 -- Helper Functions Pattern
-
-The production idiom: the key type is unexported, and two exported functions provide the public API. This is the pattern used by gRPC metadata, OpenTelemetry spans, and most Go libraries:
+Now the safe version with typed keys:
 
 ```go
 package main
@@ -171,35 +177,94 @@ import (
 	"fmt"
 )
 
-// Unexported key -- callers never see it.
-type authTokenKey struct{}
+// Auth package's key -- unexported, impossible to collide.
+type authUserKey struct{}
 
-// Public API: store a token.
-func withAuthToken(ctx context.Context, token string) context.Context {
+// Logger package's key -- different type, different key.
+type loggerUserKey struct{}
+
+func main() {
+	ctx := context.Background()
+
+	ctx = context.WithValue(ctx, authUserKey{}, "admin-from-auth")
+	ctx = context.WithValue(ctx, loggerUserKey{}, "anonymous-from-logger")
+
+	authUser, _ := ctx.Value(authUserKey{}).(string)
+	loggerUser, _ := ctx.Value(loggerUserKey{}).(string)
+
+	fmt.Printf("Auth user:   %s\n", authUser)
+	fmt.Printf("Logger user: %s\n", loggerUser)
+	fmt.Println("No collision: different types, different keys.")
+}
+```
+
+### Verification
+```bash
+go run main.go
+```
+Expected output:
+```
+Auth user:   admin-from-auth
+Logger user: anonymous-from-logger
+No collision: different types, different keys.
+```
+
+Each key type retrieves only its own value. The `go vet` tool warns about using string or integer keys. In production code, always use unexported struct types.
+
+## Step 3 -- The Helper Functions Pattern
+
+The production idiom used by gRPC, OpenTelemetry, and most Go libraries: the key type is unexported, and two exported functions provide the public API. This encapsulates the key completely:
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+)
+
+// --- This would be in package "auth" ---
+
+type authTokenKey struct{} // unexported -- callers never see it
+
+func WithAuthToken(ctx context.Context, token string) context.Context {
 	return context.WithValue(ctx, authTokenKey{}, token)
 }
 
-// Public API: retrieve a token.
-func authTokenFrom(ctx context.Context) (string, bool) {
+func AuthTokenFrom(ctx context.Context) (string, bool) {
 	token, ok := ctx.Value(authTokenKey{}).(string)
 	return token, ok
 }
 
+// --- This would be in package "handler" ---
+
 func handleRequest(ctx context.Context) {
-	token, ok := authTokenFrom(ctx)
+	token, ok := AuthTokenFrom(ctx)
 	if !ok {
-		fmt.Println("No auth token -- rejecting request")
+		fmt.Println("[handler] 401 Unauthorized: no auth token")
 		return
 	}
-	// Only show a prefix to avoid leaking the full token.
-	fmt.Printf("Authenticated with token: %s...\n", token[:15])
+	fmt.Printf("[handler] authenticated, token prefix: %s...\n", token[:20])
+	processOrder(ctx)
+}
+
+func processOrder(ctx context.Context) {
+	token, ok := AuthTokenFrom(ctx)
+	if !ok {
+		fmt.Println("[service] ERROR: no auth token in context")
+		return
+	}
+	fmt.Printf("[service] processing order for token: %s...\n", token[:20])
 }
 
 func main() {
-	ctx := withAuthToken(context.Background(), "Bearer eyJhbGciOiJIUzI1NiJ9.payload.signature")
+	// Middleware adds the auth token.
+	ctx := WithAuthToken(context.Background(), "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.payload")
+
+	fmt.Println("=== With auth token ===")
 	handleRequest(ctx)
 
-	// Call without a token to see the rejection.
+	fmt.Println("\n=== Without auth token ===")
 	handleRequest(context.Background())
 }
 ```
@@ -210,15 +275,19 @@ go run main.go
 ```
 Expected output:
 ```
-Authenticated with token: Bearer eyJhbGciO...
-No auth token -- rejecting request
+=== With auth token ===
+[handler] authenticated, token prefix: Bearer eyJhbGciOiJIU...
+[service] processing order for token: Bearer eyJhbGciOiJIU...
+
+=== Without auth token ===
+[handler] 401 Unauthorized: no auth token
 ```
 
-This pattern keeps the key type unexported while providing a clean, documented API. Callers never need to know the key type exists.
+Callers never need to know the key type exists. They interact only with `WithAuthToken` and `AuthTokenFrom`. This is the pattern you should follow for every context value in production.
 
-## Step 5 -- Values Are Inherited Down the Tree
+## Step 4 -- Anti-Patterns: What NOT to Put in Context
 
-A child context sees all values from its ancestors, but a parent does NOT see values added by its children. Values flow downward:
+Context values have specific, narrow use cases. Here are the three most common misuses:
 
 ```go
 package main
@@ -228,28 +297,37 @@ import (
 	"fmt"
 )
 
-type reqIDKey struct{}
-type uidKey struct{}
+type dbKey struct{}
+type itemsKey struct{}
+type logLevelKey struct{}
 
 func main() {
-	root := context.WithValue(context.Background(), reqIDKey{}, "req-001")
-	child := context.WithValue(root, uidKey{}, "alice")
+	fmt.Println("=== ANTI-PATTERN 1: Function Arguments in Context ===")
+	// WRONG: items is a function input, not request metadata.
+	ctx := context.WithValue(context.Background(), itemsKey{}, []string{"item-1", "item-2"})
+	items, _ := ctx.Value(itemsKey{}).([]string)
+	fmt.Printf("  Pulled from context: %v\n", items)
+	fmt.Println("  FIX: pass items as a function parameter: calculateTotal(items []string)")
 
-	// Root's value is visible from root.
-	rootReqID, _ := root.Value(reqIDKey{}).(string)
-	fmt.Printf("root: requestID=%s\n", rootReqID)
+	fmt.Println("\n=== ANTI-PATTERN 2: Dependency Injection via Context ===")
+	// WRONG: database connection is infrastructure, not request metadata.
+	ctx = context.WithValue(context.Background(), dbKey{}, "postgres://db:5432")
+	dsn, _ := ctx.Value(dbKey{}).(string)
+	fmt.Printf("  Pulled from context: %s\n", dsn)
+	fmt.Println("  FIX: inject the DB connection via struct field or constructor")
 
-	// Child sees root's value (inherited).
-	childReqID, _ := child.Value(reqIDKey{}).(string)
-	fmt.Printf("child sees parent's value: requestID=%s\n", childReqID)
+	fmt.Println("\n=== ANTI-PATTERN 3: Optional Parameters via Context ===")
+	// WRONG: log level is configuration, not request metadata.
+	ctx = context.WithValue(context.Background(), logLevelKey{}, "debug")
+	level, _ := ctx.Value(logLevelKey{}).(string)
+	fmt.Printf("  Pulled from context: %s\n", level)
+	fmt.Println("  FIX: pass as a parameter or use a logger configuration struct")
 
-	// Child's own value.
-	childUID, _ := child.Value(uidKey{}).(string)
-	fmt.Printf("child's own value: userID=%s\n", childUID)
-
-	// Root does NOT see child's value.
-	rootUID, _ := root.Value(uidKey{}).(string)
-	fmt.Printf("root does NOT see child's value: userID=%q\n", rootUID)
+	fmt.Println("\n=== CORRECT USES OF WithValue ===")
+	fmt.Println("  - Request ID (correlation across services)")
+	fmt.Println("  - User ID from authentication (authorization decisions)")
+	fmt.Println("  - Trace/span ID (distributed tracing)")
+	fmt.Println("  - Tenant ID in multi-tenant systems")
 }
 ```
 
@@ -259,13 +337,26 @@ go run main.go
 ```
 Expected output:
 ```
-root: requestID=req-001
-child sees parent's value: requestID=req-001
-child's own value: userID=alice
-root does NOT see child's value: userID=""
+=== ANTI-PATTERN 1: Function Arguments in Context ===
+  Pulled from context: [item-1 item-2]
+  FIX: pass items as a function parameter: calculateTotal(items []string)
+
+=== ANTI-PATTERN 2: Dependency Injection via Context ===
+  Pulled from context: postgres://db:5432
+  FIX: inject the DB connection via struct field or constructor
+
+=== ANTI-PATTERN 3: Optional Parameters via Context ===
+  Pulled from context: debug
+  FIX: pass as a parameter or use a logger configuration struct
+
+=== CORRECT USES OF WithValue ===
+  - Request ID (correlation across services)
+  - User ID from authentication (authorization decisions)
+  - Trace/span ID (distributed tracing)
+  - Tenant ID in multi-tenant systems
 ```
 
-This is consistent with the context tree model: information flows down from parent to child, never up.
+The rule of thumb: if a function would break or produce wrong results without the value, it should be an explicit parameter. Context values are for metadata that enriches behavior (logging, tracing, authorization) but is not strictly required to compute the result.
 
 ## Common Mistakes
 
@@ -275,29 +366,11 @@ This is consistent with the context tree model: information flows down from pare
 ctx = context.WithValue(ctx, "requestID", "abc")     // string key -- collision risk
 ctx = context.WithValue(ctx, 42, "some value")        // integer key -- collision risk
 ```
-**What happens:** Any package can accidentally use the same string or integer, silently overwriting your value.
-
 **Fix:** Define an unexported struct type as the key:
 ```go
 type requestIDKey struct{}
 ctx = context.WithValue(ctx, requestIDKey{}, "abc")
 ```
-
-### Using Context Values Instead of Function Parameters
-**Wrong:**
-```go
-func calculateTotal(ctx context.Context) float64 {
-    items := ctx.Value(itemsKey{}).([]Item) // this should be a parameter!
-    return sum(items)
-}
-```
-**Fix:**
-```go
-func calculateTotal(items []Item) float64 {
-    return sum(items)
-}
-```
-Context values are for metadata (request IDs, trace spans, auth tokens) that crosses API boundaries -- not for function inputs. If a function *needs* data to operate, it should accept it as an explicit parameter.
 
 ### Forgetting That WithValue Creates a New Context
 **Wrong:**
@@ -335,14 +408,14 @@ func main() {
 }
 ```
 
-Contexts are immutable. `WithValue` returns a *new* context -- always capture the return value.
+Contexts are immutable. `WithValue` returns a new context -- always capture the return value.
 
 ### Storing Large Objects in Context
-Context values are looked up by walking the parent chain. Storing many values or large objects degrades performance. Keep context values small and few.
+Context values are looked up by walking the parent chain linearly. Storing many values or large objects degrades performance. Keep context values small (strings, IDs) and few (3-5 values is typical).
 
 ## Verify What You Learned
 
-Define a `correlationID` key type and helper functions. Build a three-function chain (entry -> middleware -> handler) where the correlation ID flows through every layer:
+Build a complete middleware chain that adds request metadata, then verify the metadata is accessible at every layer:
 
 ```go
 package main
@@ -352,28 +425,41 @@ import (
 	"fmt"
 )
 
-type correlationIDKey struct{}
+type reqIDKey struct{}
+type tenantKey struct{}
 
-func withCorrelationID(ctx context.Context, id string) context.Context {
-	return context.WithValue(ctx, correlationIDKey{}, id)
+func withReqID(ctx context.Context, id string) context.Context {
+	return context.WithValue(ctx, reqIDKey{}, id)
 }
-
-func correlationIDFrom(ctx context.Context) string {
-	id, _ := ctx.Value(correlationIDKey{}).(string)
+func reqIDFrom(ctx context.Context) string {
+	id, _ := ctx.Value(reqIDKey{}).(string)
 	return id
 }
 
-func logWithCorrelation(ctx context.Context, layer, message string) {
-	corrID := correlationIDFrom(ctx)
-	fmt.Printf("[%-10s] corrID=%s: %s\n", layer, corrID, message)
+func withTenant(ctx context.Context, t string) context.Context {
+	return context.WithValue(ctx, tenantKey{}, t)
+}
+func tenantFrom(ctx context.Context) string {
+	t, _ := ctx.Value(tenantKey{}).(string)
+	return t
+}
+
+func logEntry(ctx context.Context, layer, msg string) {
+	fmt.Printf("[%-10s] req=%s tenant=%s | %s\n", layer, reqIDFrom(ctx), tenantFrom(ctx), msg)
 }
 
 func main() {
-	ctx := withCorrelationID(context.Background(), "corr-98765")
+	// Middleware chain builds context.
+	ctx := context.Background()
+	ctx = withReqID(ctx, "req-001")
+	ctx = withTenant(ctx, "acme-corp")
 
-	logWithCorrelation(ctx, "gateway", "received request")
-	logWithCorrelation(ctx, "middleware", "validating auth")
-	logWithCorrelation(ctx, "handler", "processing business logic")
+	// All layers see the same metadata.
+	logEntry(ctx, "gateway", "request received")
+	logEntry(ctx, "auth", "user authenticated")
+	logEntry(ctx, "handler", "processing order")
+	logEntry(ctx, "repository", "querying database")
+	logEntry(ctx, "handler", "returning response")
 }
 ```
 
@@ -383,22 +469,24 @@ go run main.go
 ```
 Expected output:
 ```
-[gateway   ] corrID=corr-98765: received request
-[middleware] corrID=corr-98765: validating auth
-[handler   ] corrID=corr-98765: processing business logic
+[gateway   ] req=req-001 tenant=acme-corp | request received
+[auth      ] req=req-001 tenant=acme-corp | user authenticated
+[handler   ] req=req-001 tenant=acme-corp | processing order
+[repository] req=req-001 tenant=acme-corp | querying database
+[handler   ] req=req-001 tenant=acme-corp | returning response
 ```
 
 ## What's Next
-Continue to [06-context-propagation-chain](../06-context-propagation-chain/06-context-propagation-chain.md) to see how context flows through a realistic multi-layer application.
+Continue to [06-context-propagation-chain](../06-context-propagation-chain/06-context-propagation-chain.md) to see how context flows through a complete request lifecycle with middleware, rate limiting, and database queries.
 
 ## Summary
 - `context.WithValue(parent, key, val)` returns a new context carrying the key-value pair
 - Use unexported struct types as keys to prevent cross-package collisions
 - Provide exported helper functions (`WithX` / `XFrom`) as the public API for your context values
-- Context values are for request-scoped metadata, not function parameters
+- Context values are for request-scoped metadata: request IDs, user IDs, trace IDs, tenant IDs
+- Do NOT use context values for function arguments, dependency injection, or optional parameters
 - `WithValue` creates a new context -- always capture the return value
 - Keep context values small and few; lookup is a linear walk up the parent chain
-- Values are inherited downward: children see parent values, parents do not see child values
 
 ## Reference
 - [Package context: WithValue](https://pkg.go.dev/context#WithValue)

@@ -25,59 +25,75 @@ With `GOMAXPROCS=1`, all goroutines share a single logical processor. They are c
 
 The practical impact depends on the workload. CPU-bound work (computation, hashing, sorting) benefits enormously from parallelism because more Ps mean more work happening simultaneously. IO-bound work (network calls, disk reads, database queries) benefits less because goroutines spend most of their time waiting, not computing. Understanding this distinction is essential for tuning real Go applications.
 
-## Step 1 -- Concurrency vs Parallelism Visualization
+## Step 1 -- Image Filter Simulation: Concurrency vs Parallelism
 
-Run 4 CPU-bound workers under GOMAXPROCS=1 (concurrent only) and GOMAXPROCS=NumCPU (concurrent + parallel).
+Imagine a service that applies a CPU-intensive filter (e.g., blur, edge detection) to a batch of uploaded images. Each image is a large slice of data. With GOMAXPROCS=1, the filters run one at a time. With GOMAXPROCS=NumCPU, they run on separate cores simultaneously.
 
 ```go
 package main
 
 import (
 	"fmt"
+	"math"
 	"runtime"
 	"sync"
 	"time"
 )
 
+func applyFilter(imageData []float64) float64 {
+	var result float64
+	for i := 1; i < len(imageData)-1; i++ {
+		// Simulate a convolution kernel (blur-like operation)
+		result += math.Sqrt(imageData[i-1]*imageData[i-1]+
+			imageData[i]*imageData[i]+
+			imageData[i+1]*imageData[i+1]) * 0.333
+	}
+	return result
+}
+
 func main() {
-	work := func(id int) {
-		start := time.Now()
-		result := 0
-		for i := 0; i < 50_000_000; i++ {
-			result += i
+	const numImages = 4
+	const imageSize = 2_000_000 // 2M "pixels" per image
+
+	images := make([][]float64, numImages)
+	for i := range images {
+		images[i] = make([]float64, imageSize)
+		for j := range images[i] {
+			images[i][j] = float64(j%256) / 255.0
 		}
-		elapsed := time.Since(start)
-		fmt.Printf("  worker %d: %v (result: %d)\n", id, elapsed.Round(time.Millisecond), result%1000)
 	}
 
 	for _, procs := range []int{1, runtime.NumCPU()} {
 		runtime.GOMAXPROCS(procs)
-		fmt.Printf("\nGOMAXPROCS=%d:\n", procs)
+		fmt.Printf("GOMAXPROCS=%d:\n", procs)
 
 		start := time.Now()
 		var wg sync.WaitGroup
 
-		for i := 0; i < 4; i++ {
+		for i := 0; i < numImages; i++ {
 			wg.Add(1)
-			go func(id int) {
+			go func(imgIdx int) {
 				defer wg.Done()
-				work(id)
+				imgStart := time.Now()
+				result := applyFilter(images[imgIdx])
+				fmt.Printf("  image %d filtered: %v (checksum: %.2f)\n",
+					imgIdx, time.Since(imgStart).Round(time.Millisecond), result)
 			}(i)
 		}
 
 		wg.Wait()
-		fmt.Printf("  Total wall-clock: %v\n", time.Since(start).Round(time.Millisecond))
+		fmt.Printf("  Total wall-clock: %v\n\n", time.Since(start).Round(time.Millisecond))
 	}
 
 	runtime.GOMAXPROCS(runtime.NumCPU())
 }
 ```
 
-**What's happening here:** Four workers each do ~45ms of CPU work. With GOMAXPROCS=1, they share one P, so they run one at a time: total is ~180ms. With GOMAXPROCS=NumCPU (e.g., 8), all four run simultaneously on different cores: total is ~48ms.
+**What's happening here:** Four workers each apply a mathematical filter to a 2M-element slice (simulating image processing). With GOMAXPROCS=1, they share one P, so they run sequentially: total time is ~4x one image. With GOMAXPROCS=NumCPU, all four run simultaneously on different cores: total time approaches 1x one image.
 
-**Key insight:** The `go` keyword gives you concurrency. GOMAXPROCS gives you parallelism. Without multiple Ps, goroutines take turns.
+**Key insight:** The `go` keyword gives you concurrency (structure). GOMAXPROCS gives you parallelism (simultaneous execution). Without multiple Ps, goroutines take turns -- your image processing pipeline is no faster than sequential code.
 
-**What would happen with GOMAXPROCS=2?** Two workers would run simultaneously, then the other two. Total would be ~90ms (2 batches of 2).
+**What would happen with GOMAXPROCS=2?** Two images would be processed simultaneously, then the other two. Total time would be ~2x one image instead of ~4x.
 
 ### Intermediate Verification
 ```bash
@@ -86,45 +102,60 @@ go run main.go
 Expected output pattern:
 ```
 GOMAXPROCS=1:
-  worker 0: 45ms
-  worker 1: 44ms
-  worker 2: 45ms
-  worker 3: 44ms
-  Total wall-clock: 180ms
+  image 0 filtered: 85ms (checksum: 123456.78)
+  image 1 filtered: 84ms (checksum: 123456.78)
+  image 2 filtered: 85ms (checksum: 123456.78)
+  image 3 filtered: 84ms (checksum: 123456.78)
+  Total wall-clock: 340ms
 
 GOMAXPROCS=8:
-  worker 0: 45ms
-  worker 3: 46ms
-  worker 1: 46ms
-  worker 2: 47ms
-  Total wall-clock: 48ms
+  image 1 filtered: 86ms (checksum: 123456.78)
+  image 3 filtered: 87ms (checksum: 123456.78)
+  image 0 filtered: 87ms (checksum: 123456.78)
+  image 2 filtered: 88ms (checksum: 123456.78)
+  Total wall-clock: 90ms
 ```
 
-## Step 2 -- CPU-Bound Benchmark
+## Step 2 -- Image Processing Benchmark Across GOMAXPROCS Values
 
-Measure speedup across different GOMAXPROCS values for pure CPU work.
+Measure the exact speedup you get at each GOMAXPROCS level for the image filter workload.
 
 ```go
 package main
 
 import (
 	"fmt"
+	"math"
 	"runtime"
 	"strings"
 	"sync"
 	"time"
 )
 
+func applyFilter(data []float64) float64 {
+	var result float64
+	for i := 1; i < len(data)-1; i++ {
+		result += math.Sqrt(data[i-1]*data[i-1]+
+			data[i]*data[i]+
+			data[i+1]*data[i+1]) * 0.333
+	}
+	return result
+}
+
 func main() {
-	cpuWork := func() int {
-		result := 0
-		for i := 0; i < 100_000_000; i++ {
-			result ^= i
+	const numImages = 8
+	const imageSize = 1_500_000
+
+	images := make([][]float64, numImages)
+	for i := range images {
+		images[i] = make([]float64, imageSize)
+		for j := range images[i] {
+			images[i][j] = float64(j%256) / 255.0
 		}
-		return result
 	}
 
-	numWorkers := runtime.NumCPU()
+	// Warm up CPU caches
+	applyFilter(images[0])
 
 	maxProcs := []int{1, 2, 4}
 	if runtime.NumCPU() >= 8 {
@@ -134,7 +165,7 @@ func main() {
 		maxProcs = append(maxProcs, 16)
 	}
 
-	fmt.Printf("Workers: %d (one per CPU)\n", numWorkers)
+	fmt.Printf("Filtering %d images (%d pixels each):\n\n", numImages, imageSize)
 	fmt.Printf("%-12s %-15s %-10s\n", "GOMAXPROCS", "Wall-Clock", "Speedup")
 	fmt.Println(strings.Repeat("-", 40))
 
@@ -146,12 +177,12 @@ func main() {
 		start := time.Now()
 		var wg sync.WaitGroup
 
-		for i := 0; i < numWorkers; i++ {
+		for i := 0; i < numImages; i++ {
 			wg.Add(1)
-			go func() {
+			go func(idx int) {
 				defer wg.Done()
-				cpuWork()
-			}()
+				applyFilter(images[idx])
+			}(i)
 		}
 
 		wg.Wait()
@@ -166,14 +197,15 @@ func main() {
 	}
 
 	runtime.GOMAXPROCS(runtime.NumCPU())
+	fmt.Println()
+	fmt.Println("Speedup is roughly linear because image filtering is pure CPU work.")
+	fmt.Println("Each core processes one image independently with no shared state.")
 }
 ```
 
-**What's happening here:** Each worker does 100M XOR operations (pure CPU work). With GOMAXPROCS=1, all workers share one core. Doubling Ps roughly halves the wall-clock time because the work distributes across more cores.
+**What's happening here:** Eight images are filtered using different GOMAXPROCS values. Doubling Ps roughly halves the wall-clock time because the filter work distributes across more cores.
 
-**Key insight:** Speedup is roughly linear for CPU-bound work until you hit the physical core count. Beyond that, adding Ps provides no benefit because there are no more cores to use.
-
-**What would happen with 2x NumCPU workers?** Wall-clock time would approximately double at GOMAXPROCS=1, but the speedup ratio at GOMAXPROCS=NumCPU would remain similar because each core just runs two workers sequentially.
+**Key insight:** Speedup is roughly linear for CPU-bound work until you hit the physical core count. Beyond that, adding Ps provides no benefit because there are no more cores to use. This is why your image processing service should set worker count to match available CPUs, not an arbitrary large number.
 
 ### Intermediate Verification
 ```bash
@@ -181,18 +213,19 @@ go run main.go
 ```
 Expected output pattern:
 ```
-Workers: 8 (one per CPU)
+Filtering 8 images (1500000 pixels each):
+
 GOMAXPROCS   Wall-Clock      Speedup
 ----------------------------------------
-1            800ms           1.00x
-2            410ms           1.95x
-4            205ms           3.90x
-8            105ms           7.62x
+1            520ms           1.00x
+2            265ms           1.96x
+4            135ms           3.85x
+8            70ms            7.43x
 ```
 
-## Step 3 -- IO-Bound Comparison
+## Step 3 -- IO-Bound Workload: Database Query Simulation
 
-Show that IO-bound work benefits minimally from additional Ps.
+Show that simulated database queries (IO-bound work) benefit minimally from additional Ps. In a real service, this is why adding CPU cores does not speed up a database-heavy endpoint.
 
 ```go
 package main
@@ -206,13 +239,19 @@ import (
 )
 
 func main() {
-	ioWork := func() {
-		time.Sleep(50 * time.Millisecond) // simulates IO: waiting, not computing
+	queryDB := func(queryName string) string {
+		time.Sleep(50 * time.Millisecond) // simulates database round-trip
+		return queryName + ": 42 rows"
 	}
 
-	numWorkers := 20
+	queries := []string{
+		"SELECT users", "SELECT orders", "SELECT products",
+		"SELECT reviews", "SELECT inventory", "SELECT payments",
+		"SELECT sessions", "SELECT audit_log", "SELECT configs",
+		"SELECT metrics", "SELECT alerts", "SELECT schedules",
+	}
 
-	fmt.Printf("Workers: %d (IO-bound, 50ms sleep each)\n", numWorkers)
+	fmt.Printf("Running %d database queries (50ms each, IO-bound):\n\n", len(queries))
 	fmt.Printf("%-12s %-15s %-10s\n", "GOMAXPROCS", "Wall-Clock", "Speedup")
 	fmt.Println(strings.Repeat("-", 40))
 
@@ -224,12 +263,12 @@ func main() {
 		start := time.Now()
 		var wg sync.WaitGroup
 
-		for i := 0; i < numWorkers; i++ {
+		for _, q := range queries {
 			wg.Add(1)
-			go func() {
+			go func(query string) {
 				defer wg.Done()
-				ioWork()
-			}()
+				queryDB(query)
+			}(q)
 		}
 
 		wg.Wait()
@@ -244,14 +283,16 @@ func main() {
 	}
 
 	runtime.GOMAXPROCS(runtime.NumCPU())
+	fmt.Println()
+	fmt.Println("IO-bound queries show ~1.0x speedup regardless of GOMAXPROCS.")
+	fmt.Println("Goroutines park while waiting for the database. Adding cores")
+	fmt.Println("does not make the database respond faster.")
 }
 ```
 
-**What's happening here:** 20 workers each sleep for 50ms. Sleeping goroutines do NOT occupy a P -- they are parked by the runtime and the P is free to run other goroutines. So all 20 can sleep concurrently even with GOMAXPROCS=1.
+**What's happening here:** Twelve simulated database queries each take 50ms. Sleeping goroutines do NOT occupy a P -- they are parked by the runtime and the P is free to run other goroutines. So all twelve can sleep concurrently even with GOMAXPROCS=1.
 
-**Key insight:** IO-bound work shows ~1.0x speedup regardless of GOMAXPROCS because the goroutines spend almost no time on the CPU. They are waiting, not computing. Adding more Ps does not speed up waiting.
-
-**What would happen if ioWork did real network I/O instead of sleep?** The result would be similar. Network I/O goroutines park while waiting for data, freeing the P for other goroutines.
+**Key insight:** IO-bound work shows ~1.0x speedup regardless of GOMAXPROCS because the goroutines spend almost no time on the CPU. They are waiting for the database, not computing. In production, if your service is slow because of database latency, adding more CPU cores will not help. You need to optimize queries, add caching, or scale the database.
 
 ### Intermediate Verification
 ```bash
@@ -259,44 +300,58 @@ go run main.go
 ```
 Expected output:
 ```
-Workers: 20 (IO-bound, 50ms sleep each)
+Running 12 database queries (50ms each, IO-bound):
+
 GOMAXPROCS   Wall-Clock      Speedup
 ----------------------------------------
 1            52ms            1.00x
 2            51ms            1.02x
 4            51ms            1.02x
 8            51ms            1.02x
+
+IO-bound queries show ~1.0x speedup regardless of GOMAXPROCS.
+Goroutines park while waiting for the database. Adding cores
+does not make the database respond faster.
 ```
 
-## Step 4 -- Mixed Workload Analysis
+## Step 4 -- Mixed Workload: API Handler with Compute + IO
 
-Real workloads mix CPU and IO. The speedup is between pure CPU (linear) and pure IO (flat).
+Real API handlers mix CPU and IO. A request might validate input (CPU), query the database (IO), then serialize a response (CPU). The speedup from GOMAXPROCS is proportional to the CPU fraction.
 
 ```go
 package main
 
 import (
 	"fmt"
+	"math"
 	"runtime"
 	"strings"
 	"sync"
 	"time"
 )
 
-func main() {
-	mixedWork := func() {
-		// CPU phase: ~40ms of computation
-		result := 0
-		for i := 0; i < 50_000_000; i++ {
-			result ^= i
-		}
-		// IO phase: 20ms of waiting
-		time.Sleep(20 * time.Millisecond)
+func handleAPIRequest(id int) {
+	// CPU phase: validate and transform input (~40ms)
+	result := 0.0
+	for i := 0; i < 5_000_000; i++ {
+		result += math.Sin(float64(i))
 	}
+	_ = result
 
-	numWorkers := 8
+	// IO phase: query database (~20ms)
+	time.Sleep(20 * time.Millisecond)
 
-	fmt.Printf("Workers: %d (CPU work + 20ms IO wait each)\n", numWorkers)
+	// CPU phase: serialize response (~10ms -- lighter)
+	for i := 0; i < 1_000_000; i++ {
+		result += math.Cos(float64(i))
+	}
+	_ = result
+}
+
+func main() {
+	numRequests := 8
+
+	fmt.Printf("Processing %d API requests (CPU validation + DB query + CPU serialization):\n\n", numRequests)
 	fmt.Printf("%-12s %-15s %-10s\n", "GOMAXPROCS", "Wall-Clock", "Speedup")
 	fmt.Println(strings.Repeat("-", 40))
 
@@ -308,12 +363,12 @@ func main() {
 		start := time.Now()
 		var wg sync.WaitGroup
 
-		for i := 0; i < numWorkers; i++ {
+		for i := 0; i < numRequests; i++ {
 			wg.Add(1)
-			go func() {
+			go func(id int) {
 				defer wg.Done()
-				mixedWork()
-			}()
+				handleAPIRequest(id)
+			}(i)
 		}
 
 		wg.Wait()
@@ -328,14 +383,16 @@ func main() {
 	}
 
 	runtime.GOMAXPROCS(runtime.NumCPU())
+	fmt.Println()
+	fmt.Println("Mixed workload: speedup is between pure-CPU (linear) and pure-IO (flat).")
+	fmt.Println("The CPU phases parallelize, but the IO phase does not benefit from more Ps.")
+	fmt.Println("This is Amdahl's Law: speedup is limited by the sequential fraction.")
 }
 ```
 
-**What's happening here:** Each worker does ~40ms of CPU work, then 20ms of IO wait. With GOMAXPROCS=1, the CPU portions serialize (8 * 40ms = 320ms) plus 20ms IO = ~340ms. With GOMAXPROCS=8, the CPU portions parallelize (~40ms) plus 20ms IO = ~60ms.
+**What's happening here:** Each API request handler does ~50ms of CPU work (validation + serialization) plus ~20ms of IO wait (database query). With GOMAXPROCS=1, the CPU portions serialize (8 * 50ms = 400ms) plus 20ms IO = ~420ms. With GOMAXPROCS=8, the CPU portions parallelize (~50ms) plus 20ms IO = ~70ms.
 
-**Key insight:** Speedup is proportional to the CPU fraction of the workload. If 70% of the time is CPU-bound, you can speed that part up linearly. The IO fraction does not benefit from more Ps. This is Amdahl's Law in practice.
-
-**What would happen if the IO portion were 90% of the total?** Speedup would be minimal even at GOMAXPROCS=NumCPU, because parallelizing 10% of the work has limited impact.
+**Key insight:** Speedup is proportional to the CPU fraction of the workload. If 70% of the time is CPU-bound, you can speed that part up linearly. The IO fraction does not benefit from more Ps. This is Amdahl's Law in practice. When profiling a slow endpoint, first determine the CPU/IO split before throwing hardware at it.
 
 ### Intermediate Verification
 ```bash
@@ -353,6 +410,7 @@ package main
 
 import (
 	"fmt"
+	"math"
 	"runtime"
 	"sync"
 	"time"
@@ -361,35 +419,35 @@ import (
 func main() {
 	runtime.GOMAXPROCS(100) // on a 4-core machine
 
-	work := func() {
-		result := 0
-		for i := 0; i < 100_000_000; i++ {
-			result ^= i
-		}
-	}
-
 	start := time.Now()
 	var wg sync.WaitGroup
 	for i := 0; i < 4; i++ {
 		wg.Add(1)
-		go func() { defer wg.Done(); work() }()
+		go func() {
+			defer wg.Done()
+			result := 0.0
+			for j := 0; j < 50_000_000; j++ {
+				result += math.Sqrt(float64(j))
+			}
+			_ = result
+		}()
 	}
 	wg.Wait()
 	fmt.Printf("Wall-clock: %v\n", time.Since(start))
 }
 ```
 
-**What happens:** For CPU-bound work, GOMAXPROCS > NumCPU provides no benefit and may slightly hurt performance due to context switching overhead. The hardware has only NumCPU physical execution units.
+**What happens:** For CPU-bound work, GOMAXPROCS > NumCPU provides no benefit and may slightly hurt performance due to context switching overhead. The hardware has only NumCPU physical execution units. Your image filters will not run faster on 100 Ps if you only have 8 cores.
 
 **Fix:** Leave GOMAXPROCS at its default (`runtime.NumCPU()`). Only tune it when benchmarks prove a different value is better.
 
 ### Assuming More Goroutines Means More Parallelism
 
-**Wrong thinking:** "If I create 1000 goroutines, they'll all run in parallel."
+**Wrong thinking:** "If I create 1000 goroutines for 1000 images, they'll all filter in parallel."
 
-**What happens:** Only GOMAXPROCS goroutines can execute Go code simultaneously. The rest wait in run queues.
+**What happens:** Only GOMAXPROCS goroutines can execute Go code simultaneously. The rest wait in run queues. With 8 cores, only 8 images are filtered at once; the other 992 wait their turn.
 
-**Fix:** For CPU-bound work, creating more goroutines than Ps increases scheduling overhead without improving throughput. Match goroutine count to GOMAXPROCS for CPU-bound tasks.
+**Fix:** For CPU-bound work, creating more goroutines than Ps increases scheduling overhead without improving throughput. Match worker count to GOMAXPROCS for CPU-bound image processing.
 
 ### Benchmarking Without Warming Up
 
@@ -399,22 +457,18 @@ package main
 
 import (
 	"fmt"
+	"math"
 	"time"
 )
 
-func doWork() int {
-	result := 0
-	for i := 0; i < 100_000_000; i++ {
-		result ^= i
-	}
-	return result
-}
-
 func main() {
-	// First run includes GC, runtime initialization, cache warming
+	// First run includes GC, CPU cache cold starts
 	start := time.Now()
-	doWork()
-	fmt.Printf("Time: %v\n", time.Since(start))
+	result := 0.0
+	for i := 0; i < 50_000_000; i++ {
+		result += math.Sqrt(float64(i))
+	}
+	fmt.Printf("Time: %v (result: %.0f)\n", time.Since(start), result)
 }
 ```
 
@@ -426,30 +480,31 @@ package main
 
 import (
 	"fmt"
+	"math"
 	"time"
 )
 
-func doWork() int {
-	result := 0
-	for i := 0; i < 100_000_000; i++ {
-		result ^= i
+func doFilter() float64 {
+	result := 0.0
+	for i := 0; i < 50_000_000; i++ {
+		result += math.Sqrt(float64(i))
 	}
 	return result
 }
 
 func main() {
-	doWork() // warmup run (discard result)
+	doFilter() // warmup run: fill CPU caches
 
 	start := time.Now()
-	doWork()
-	fmt.Printf("Time: %v\n", time.Since(start))
+	result := doFilter()
+	fmt.Printf("Time: %v (result: %.0f)\n", time.Since(start), result)
 }
 ```
 
 ## Verify What You Learned
 
 Create a program that:
-1. Defines three workload types: "cpu" (100M iterations), "io" (50ms sleep), and "mixed" (50M iterations + 20ms sleep)
+1. Defines three workload types: "image-filter" (CPU-bound mathematical transformation), "db-queries" (IO-bound 50ms sleep), and "api-handler" (CPU + IO mix)
 2. Runs each workload with GOMAXPROCS from 1 to NumCPU
 3. Prints a summary table for each workload showing GOMAXPROCS, wall-clock, and speedup
 4. Adds a comment explaining why the optimal GOMAXPROCS differs between workload types
@@ -460,8 +515,8 @@ Continue to [06-cooperative-scheduling](../06-cooperative-scheduling/06-cooperat
 ## Summary
 - **Concurrency** is structure (multiple tasks in flight); **parallelism** is execution (multiple tasks running simultaneously)
 - `GOMAXPROCS` controls the number of Ps, which limits true parallelism
-- CPU-bound work shows roughly linear speedup up to the physical core count
-- IO-bound work benefits minimally from additional Ps because goroutines spend most time waiting
+- CPU-bound work (image processing, checksums) shows roughly linear speedup up to the physical core count
+- IO-bound work (database queries, API calls) benefits minimally from additional Ps
 - Mixed workloads show intermediate speedup proportional to their CPU fraction (Amdahl's Law)
 - Default `GOMAXPROCS=NumCPU()` is correct for most applications
 - Creating more goroutines than Ps does not increase parallelism for CPU-bound work
