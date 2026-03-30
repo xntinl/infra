@@ -225,6 +225,8 @@
   },
   "active": "caa0937ea8cbd901",
   "lastOpenFiles": [
+    "challenges/go-concepts/concurrency/01-goroutines-and-scheduling/passing_arguments.go",
+    "challenges/go-concepts/concurrency/01-goroutines-and-scheduling/passi_arguments.go",
     "challenges/go-concepts/concurrency/01-goroutines-and-scheduling/03-gmp-model-in-action/03-gmp-model-in-action.md",
     "challenges/go-concepts/concurrency/01-goroutines-and-scheduling/02-goroutine-vs-os-thread/02-goroutine-vs-os-thread.md",
     "challenges/go-concepts/concurrency/01-goroutines-and-scheduling/01-launching-goroutines/01-launching-goroutines.md",
@@ -242,7 +244,6 @@
     "challenges/go-concepts/concurrency/02-channels/01-unbuffered-channel-basics/01-unbuffered-channel-basics.md",
     "challenges/go-concepts/concurrency/04-sync-primitives/10-build-thread-safe-counter/go.mod",
     "challenges/go-concepts/concurrency/04-sync-primitives/10-build-thread-safe-counter/main.go",
-    "challenges/go-concepts/concurrency/07-concurrency-patterns/10-end-to-end-pipeline-with-cancel/go.mod",
     "challenges/go-concepts/concurrency/04-sync-primitives/10-build-thread-safe-counter/10-build-thread-safe-counter.md",
     "challenges/go-concepts/concurrency/07-concurrency-patterns/10-end-to-end-pipeline-with-cancel/10-end-to-end-pipeline-with-cancel.md",
     "challenges/go-concepts/concurrency/04-sync-primitives/09-sync-map-concurrent-access/09-sync-map-concurrent-access.md",
