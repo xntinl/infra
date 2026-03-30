@@ -845,7 +845,7 @@ Build a "multi-source product search" that:
 **Hint:** Use a seed for `rand` to make the marketplace responses deterministic, so all three patterns produce identical results that you can compare programmatically.
 
 ## What's Next
-You have completed the goroutines and scheduling section. Continue to section [02-channels](../../02-channels/01-unbuffered-channel-basics/01-unbuffered-channel-basics.md) to learn how channels work in depth -- from unbuffered synchronization to buffered queues, channel direction, and advanced patterns.
+Continue to [13-concurrent-api-calls](../13-concurrent-api-calls/13-concurrent-api-calls.md) to apply goroutine patterns to a realistic scenario: querying multiple supplier APIs simultaneously and handling partial failures.
 
 ## Summary
 - `go func()` cannot return values -- this is by design, since the caller does not wait
