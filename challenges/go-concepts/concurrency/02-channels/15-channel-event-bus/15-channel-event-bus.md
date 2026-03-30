@@ -374,7 +374,7 @@ go run main.go
 
 ## Step 4 -- Clean Shutdown: Closing Bus Closes All Subscribers
 
-This step demonstrates the full lifecycle: start the bus, subscribe services, publish events, then shut down cleanly. It also shows what happens if you add a subscriber after the bus is closed (panic from sending on a closed channel).
+This step demonstrates the full lifecycle: start the bus, subscribe services, publish events, then shut down cleanly. It also shows what happens if you publish after the bus is closed (panic from sending on a closed channel).
 
 ```go
 package main
@@ -439,34 +439,19 @@ func (bus *EventBus) Close() {
 	}
 }
 
-// ServiceStats tracks what a subscriber processed.
-type ServiceStats struct {
-	name     string
-	received int
-	filtered int
-}
-
 // runFilteredService processes events matching allowedTypes and counts the rest.
-func runFilteredService(name string, events <-chan Event, allowedTypes map[string]bool, wg *sync.WaitGroup) ServiceStats {
-	stats := ServiceStats{name: name}
-	done := make(chan ServiceStats, 1)
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for event := range events {
-			stats.received++
-			if allowedTypes[event.Type] {
-				stats.filtered++
-				fmt.Printf("[%-12s] processed %s: %s\n", name, event.Type, event.Payload)
-			}
+func runFilteredService(name string, events <-chan Event, allowedTypes map[string]bool, wg *sync.WaitGroup) {
+	defer wg.Done()
+	received, filtered := 0, 0
+	for event := range events {
+		received++
+		if allowedTypes[event.Type] {
+			filtered++
+			fmt.Printf("[%-12s] processed %s: %s\n", name, event.Type, event.Payload)
 		}
-		fmt.Printf("[%-12s] shut down: %d received, %d processed\n",
-			name, stats.received, stats.filtered)
-		done <- stats
-	}()
-
-	return <-done
+	}
+	fmt.Printf("[%-12s] shut down: %d received, %d processed\n",
+		name, received, filtered)
 }
 
 func main() {
@@ -477,7 +462,8 @@ func main() {
 	notCh := bus.Subscribe(shutdownBuffer)
 	anaCh := bus.Subscribe(shutdownBuffer)
 
-	// Launch subscribers. Each goroutine processes until its channel closes.
+	// Launch subscribers. wg.Add before go -- never inside the goroutine.
+	wg.Add(3)
 	go runFilteredService("inventory", invCh, map[string]bool{
 		EventOrderPlaced:    true,
 		EventOrderCancelled: true,
@@ -538,12 +524,12 @@ The shutdown sequence:
 
 ### Verification
 ```bash
-go run main.go
+go run -race main.go
 # Expected:
 #   6 events published to 3 subscribers
 #   Each subscriber prints its processed count on shutdown
 #   Post-close Publish panics with "cannot publish to a closed bus"
-#   Clean exit
+#   Clean exit, no race warnings
 ```
 
 ## Common Mistakes

@@ -73,6 +73,7 @@ func NewCSVProcessor(jobID string, rows []string) *CSVProcessor {
 }
 
 func (cp *CSVProcessor) Process(progress chan<- ProgressUpdate) {
+	defer close(progress)
 	total := len(cp.Rows)
 	progress <- ProgressUpdate{
 		JobID: cp.JobID, Processed: 0, Total: total, Status: statusRunning,
@@ -133,7 +134,6 @@ func main() {
 		if update.Status == statusDone {
 			fmt.Printf("\r  %s  %s\n", update.JobID, renderProgressBar(update.Processed, update.Total))
 			fmt.Printf("\n  Job %s completed successfully.\n", update.JobID)
-			close(progress)
 			break
 		}
 		fmt.Printf("\r  %s  %s", update.JobID, renderProgressBar(update.Processed, update.Total))
@@ -143,7 +143,7 @@ func main() {
 
 **What's happening here:** The main goroutine submits a job and then enters a receive loop, printing a progress bar each time a new update arrives. The `CSVProcessor.Process` method runs in a background goroutine, sending one update per processed row. When it sends the final `DONE` update, the main goroutine prints the completion message and exits.
 
-**Key insight:** The buffered channel with capacity `len(rows)+2` ensures the background goroutine never blocks. The `+2` accounts for the initial RUNNING update and the final DONE update. In a real server, the progress channel would feed into a WebSocket or polling endpoint instead of a terminal progress bar.
+**Key insight:** The buffered channel with capacity `len(rows)+2` ensures the background goroutine never blocks. The `+2` accounts for the initial RUNNING update and the final DONE update. The sender (the `Process` goroutine) closes the channel with `defer close(progress)` -- this follows Go's convention that the producer closes the channel, not the consumer. In a real server, the progress channel would feed into a WebSocket or polling endpoint instead of a terminal progress bar.
 
 ### Intermediate Verification
 ```bash

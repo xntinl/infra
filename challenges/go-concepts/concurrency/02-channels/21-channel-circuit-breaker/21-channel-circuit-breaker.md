@@ -31,7 +31,6 @@ Build the core circuit breaker with two states: Closed (allow all calls) and Ope
 package main
 
 import (
-	"errors"
 	"fmt"
 	"time"
 )

@@ -35,7 +35,6 @@ package main
 import (
 	"errors"
 	"fmt"
-	"time"
 )
 
 const queueCapacity = 5
@@ -108,8 +107,6 @@ func main() {
 		job := queue.Process()
 		fmt.Printf("  processed: job %d (%s)\n", job.ID, job.Description)
 	}
-
-	_ = time.Now() // anchor: standard library only
 }
 ```
 

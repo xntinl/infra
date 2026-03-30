@@ -251,7 +251,6 @@ Real suppliers go down. The `FetchInventory` method now returns an error for som
 package main
 
 import (
-	"errors"
 	"fmt"
 	"math/rand"
 	"time"
@@ -365,8 +364,6 @@ func main() {
 		NewSupplierClient("TechSource Inc.", 120*time.Millisecond, 88, 1.0),
 		NewSupplierClient("MegaStock Corp.", 300*time.Millisecond, 23, 0.0),
 	}
-
-	_ = errors.New // ensure errors package is used
 
 	fmt.Println("=== Concurrent Query with Partial Failures ===")
 	start := time.Now()

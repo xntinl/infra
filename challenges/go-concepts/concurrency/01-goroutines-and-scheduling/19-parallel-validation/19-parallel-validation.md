@@ -412,12 +412,12 @@ func main() {
 ```bash
 go run main.go
 ```
-Expected output (order varies):
+Expected output (order varies -- results arrive fastest first):
 ```
 === Kubernetes Pre-Flight Validation ===
   Running 8 checks concurrently...
 
-    [PASS] image-tag-pinned               60ms  image 'api-server:latest' uses mutable tag -- pin to SHA or semver
+  ! [FAIL] image-tag-pinned               60ms  image 'api-server:latest' uses mutable tag -- pin to SHA or semver
     [PASS] required-labels-present         70ms  labels: app, team, environment all present
     [PASS] namespace-exists                80ms  namespace 'production' exists in cluster
     [PASS] replicas-in-range               90ms  replicas=3, within allowed range [2, 10]
@@ -638,7 +638,7 @@ Expected output:
 
      CHECK                          TIME  DETAILS
   --- -----                         ----  -------
-  [OK] image-tag-pinned              60ms  image 'api-server:latest' uses mutable tag
+  [!!] image-tag-pinned              60ms  image 'api-server:latest' uses mutable tag
   [OK] required-labels               70ms  app, team, environment present
   [OK] namespace-exists              80ms  namespace 'production' exists
   [OK] replicas-in-range             90ms  replicas=3, allowed [2, 10]
