@@ -210,6 +210,8 @@
   },
   "active": "ce71c186b1594d7a",
   "lastOpenFiles": [
+    "challenges/go-concepts/concurrency/01-goroutines-and-scheduling/19-parallel-validation/19-parallel-validation.md",
+    "challenges/go-concepts/concurrency/02-channels/21-channel-circuit-breaker/21-channel-circuit-breaker.md",
     "challenges/go-concepts/concurrency/02-channels/17-channel-streaming-backpressure/17-channel-streaming-backpressure.md",
     "challenges/go-concepts/concurrency/01-goroutines-and-scheduling/14-background-job-processor/14-background-job-processor.md",
     "challenges/go-concepts/concurrency/01-goroutines-and-scheduling/18-connection-pool/18-connection-pool.md",
@@ -244,8 +246,6 @@
     "challenges/go-concepts/concurrency/01-goroutines-and-scheduling/09-goroutine-lifecycle/09-goroutine-lifecycle.md",
     "challenges/go-concepts/concurrency/03-select-and-multiplexing/09-select-with-context/09-select-with-context.md",
     "challenges/go-concepts/concurrency/02-channels/11-channel-error-propagation/11-channel-error-propagation.md",
-    "challenges/go-concepts/concurrency/02-channels/07-nil-channel-behavior/07-nil-channel-behavior.md",
-    "challenges/go-concepts/concurrency/02-channels/04-channel-direction/04-channel-direction.md",
     "Presentacion/poc-just/web/node_modules/ordered-binary/assets/powers-dre.png",
     "Presentacion/poc-just/web/node_modules/retry/equation.gif",
     "Untitled.canvas"
