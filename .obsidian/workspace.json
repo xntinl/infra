@@ -225,7 +225,9 @@
   },
   "active": "caa0937ea8cbd901",
   "lastOpenFiles": [
+    "challenges/go-concepts/concurrency/02-channels/02-channel-as-synchronization/go.mod",
     "challenges/go-concepts/concurrency/02-channels/01-unbuffered-channel-basics/01-unbuffered-channel-basics.md",
+    "challenges/go-concepts/concurrency/02-channels/02-channel-as-synchronization/02-channel-as-synchronization.md",
     "challenges/go-concepts/concurrency/02-channels/01-unbuffered-channel-basics/channels_typed.go",
     "challenges/go-concepts/concurrency/02-channels/01-unbuffered-channel-basics/multiple_values.go",
     "challenges/go-concepts/concurrency/02-channels/01-unbuffered-channel-basics/create_channel.go",
@@ -259,7 +261,6 @@
     "challenges/go-concepts/concurrency/05-atomic-and-memory-ordering/07-atomic-vs-mutex-benchmark/07-atomic-vs-mutex-benchmark.md",
     "challenges/go-concepts/concurrency/09-data-races-and-detector/07-race-in-closure-loops/07-race-in-closure-loops.md",
     "challenges/go-concepts/concurrency/01-goroutines-and-scheduling/07-goroutine-per-request/07-goroutine-per-request.md",
-    "challenges/go-concepts/concurrency/07-concurrency-patterns/07-or-channel-first-to-finish/07-or-channel-first-to-finish.md",
     "Presentacion/poc-just/web/node_modules/ordered-binary/assets/powers-dre.png",
     "Presentacion/poc-just/web/node_modules/retry/equation.gif",
     "Untitled.canvas"
