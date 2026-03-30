@@ -897,7 +897,7 @@ Build a "rate limiter cache" that:
 
 
 ## What's Next
-Continue to [Channels: Unbuffered Channel Basics](../../02-channels/01-unbuffered-channel-basics/01-unbuffered-channel-basics.md) to learn how unbuffered channels provide synchronous communication between goroutines.
+Continue to [21-Goroutine Profiling with pprof](../21-goroutine-profiling-pprof/21-goroutine-profiling-pprof.md) to learn how to diagnose goroutine issues in production using runtime profiling tools.
 
 
 ## Summary

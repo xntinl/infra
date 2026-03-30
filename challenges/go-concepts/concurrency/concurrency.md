@@ -1,8 +1,8 @@
 # Concurrency
 
-Go's concurrency model -- built on goroutines, channels, and the select statement -- is one of the language's defining features. These 103 exercises take you from spawning your first goroutine through production-grade patterns like pipelines, rate limiters, and graceful shutdown.
+Go's concurrency model -- built on goroutines, channels, and the select statement -- is one of the language's defining features. These 123 exercises take you from spawning your first goroutine through production-grade patterns like pipelines, rate limiters, and graceful shutdown.
 
-> 103 exercises | 9 sections | basic to advanced
+> 123 exercises | 9 sections | basic to advanced
 
 ---
 
@@ -32,6 +32,16 @@ Understand how Go's runtime manages lightweight threads: the GMP model, stack gr
 | 18 | [Connection Pool](01-goroutines-and-scheduling/18-connection-pool/18-connection-pool.md) | advanced | 45m |
 | 19 | [Parallel Validation](01-goroutines-and-scheduling/19-parallel-validation/19-parallel-validation.md) | intermediate | 30m |
 | 20 | [Goroutine-Safe Cache with TTL](01-goroutines-and-scheduling/20-goroutine-safe-cache/20-goroutine-safe-cache.md) | advanced | 45m |
+| 21 | [Goroutine Profiling with pprof](01-goroutines-and-scheduling/21-goroutine-profiling-pprof/21-goroutine-profiling-pprof.md) | advanced | 45m |
+| 22 | [Testing Concurrent Code](01-goroutines-and-scheduling/22-testing-concurrent-code/22-testing-concurrent-code.md) | advanced | 45m |
+| 23 | [Dynamic Goroutine Scaling](01-goroutines-and-scheduling/23-dynamic-goroutine-scaling/23-dynamic-goroutine-scaling.md) | advanced | 50m |
+| 24 | [Goroutine-Per-Connection TCP Server](01-goroutines-and-scheduling/24-goroutine-per-connection-tcp/24-goroutine-per-connection-tcp.md) | advanced | 50m |
+| 25 | [Goroutine Coordination Barrier](01-goroutines-and-scheduling/25-goroutine-coordination-barrier/25-goroutine-coordination-barrier.md) | intermediate | 35m |
+| 26 | [Goroutine-Safe Service Registry](01-goroutines-and-scheduling/26-goroutine-safe-service-registry/26-goroutine-safe-service-registry.md) | advanced | 45m |
+| 27 | [Scatter-Gather with Partial Results](01-goroutines-and-scheduling/27-scatter-gather-partial-results/27-scatter-gather-partial-results.md) | intermediate | 35m |
+| 28 | [Goroutine Starvation and Fairness](01-goroutines-and-scheduling/28-goroutine-starvation-fairness/28-goroutine-starvation-fairness.md) | advanced | 45m |
+| 29 | [Goroutine Work Stealing](01-goroutines-and-scheduling/29-goroutine-work-stealing/29-goroutine-work-stealing.md) | advanced | 50m |
+| 30 | [Goroutine DAG Orchestrator](01-goroutines-and-scheduling/30-goroutine-dag-orchestrator/30-goroutine-dag-orchestrator.md) | advanced | 55m |
 
 ---
 
@@ -63,6 +73,16 @@ Master Go's primary communication mechanism: unbuffered and buffered channels, d
 | 20 | [Bounded Work Queue](02-channels/20-bounded-work-queue/20-bounded-work-queue.md) | intermediate | 30m |
 | 21 | [Channel Circuit Breaker](02-channels/21-channel-circuit-breaker/21-channel-circuit-breaker.md) | advanced | 40m |
 | 22 | [Channel Request Multiplexer](02-channels/22-channel-request-multiplexer/22-channel-request-multiplexer.md) | advanced | 40m |
+| 23 | [Channel Request-Response (RPC)](02-channels/23-channel-request-response/23-channel-request-response.md) | advanced | 40m |
+| 24 | [Channel Retry with Backoff](02-channels/24-channel-retry-backoff/24-channel-retry-backoff.md) | advanced | 40m |
+| 25 | [Ordered Fan-Out Results](02-channels/25-ordered-fan-out-results/25-ordered-fan-out-results.md) | advanced | 45m |
+| 26 | [Channel Saga / Compensation](02-channels/26-channel-saga-compensation/26-channel-saga-compensation.md) | advanced | 45m |
+| 27 | [Channel Priority Queue](02-channels/27-channel-priority-queue/27-channel-priority-queue.md) | advanced | 40m |
+| 28 | [Bridge Channel Pattern](02-channels/28-channel-bridge-pattern/28-channel-bridge-pattern.md) | intermediate | 35m |
+| 29 | [Channel Load Balancer](02-channels/29-channel-load-balancer/29-channel-load-balancer.md) | advanced | 45m |
+| 30 | [Channel Broadcast](02-channels/30-channel-broadcast/30-channel-broadcast.md) | advanced | 40m |
+| 31 | [Channel Resource Pool](02-channels/31-channel-resource-pool/31-channel-resource-pool.md) | advanced | 45m |
+| 32 | [Channel Request Coalescing](02-channels/32-channel-request-coalescing/32-channel-request-coalescing.md) | advanced | 40m |
 
 ---
 

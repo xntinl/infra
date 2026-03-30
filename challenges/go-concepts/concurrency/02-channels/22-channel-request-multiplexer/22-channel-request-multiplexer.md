@@ -721,7 +721,7 @@ if ch, ok := routes[req.Type]; ok {
 3. How would you add per-handler concurrency limits (e.g., max 5 concurrent order lookups)?
 
 ## What's Next
-You have completed the channels section. Continue to section [03-select-and-multiplexing](../../03-select-and-multiplexing/01-select-basics/01-select-basics.md) to learn how `select` lets you wait on multiple channel operations simultaneously -- enabling timeout control, cancellation, and dynamic multiplexing patterns that build on everything you have learned here.
+Continue to [23-Channel Request-Response (RPC)](../23-channel-request-response/23-channel-request-response.md) to learn the fundamental channel-based RPC pattern for serializing access to shared state.
 
 ## Summary
 - A multiplexer routes requests from a single intake channel to type-specific handler goroutines
