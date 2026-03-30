@@ -210,6 +210,7 @@
   },
   "active": "ce71c186b1594d7a",
   "lastOpenFiles": [
+    "challenges/go-concepts/concurrency/02-channels/17-channel-streaming-backpressure/17-channel-streaming-backpressure.md",
     "challenges/go-concepts/concurrency/01-goroutines-and-scheduling/14-background-job-processor/14-background-job-processor.md",
     "challenges/go-concepts/concurrency/01-goroutines-and-scheduling/18-connection-pool/18-connection-pool.md",
     "challenges/go-concepts/concurrency/02-channels/20-bounded-work-queue/20-bounded-work-queue.md",
@@ -245,7 +246,6 @@
     "challenges/go-concepts/concurrency/02-channels/11-channel-error-propagation/11-channel-error-propagation.md",
     "challenges/go-concepts/concurrency/02-channels/07-nil-channel-behavior/07-nil-channel-behavior.md",
     "challenges/go-concepts/concurrency/02-channels/04-channel-direction/04-channel-direction.md",
-    "challenges/go-concepts/concurrency/02-channels/03-buffered-channels/03-buffered-channels.md",
     "Presentacion/poc-just/web/node_modules/ordered-binary/assets/powers-dre.png",
     "Presentacion/poc-just/web/node_modules/retry/equation.gif",
     "Untitled.canvas"
