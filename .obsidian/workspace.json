@@ -225,6 +225,7 @@
   },
   "active": "caa0937ea8cbd901",
   "lastOpenFiles": [
+    "challenges/go-concepts/concurrency/01-goroutines-and-scheduling/get_return_value.go",
     "challenges/go-concepts/concurrency/01-goroutines-and-scheduling/fanout_pattern.go",
     "challenges/go-concepts/concurrency/01-goroutines-and-scheduling/passing_arguments.go",
     "challenges/go-concepts/concurrency/01-goroutines-and-scheduling/passi_arguments.go",
@@ -243,7 +244,6 @@
     "challenges/go-concepts/concurrency/concurrency.md",
     "challenges/go-concepts/go-concepts.md",
     "challenges/go-concepts/concurrency/02-channels/01-unbuffered-channel-basics/01-unbuffered-channel-basics.md",
-    "challenges/go-concepts/concurrency/04-sync-primitives/10-build-thread-safe-counter/go.mod",
     "challenges/go-concepts/concurrency/04-sync-primitives/10-build-thread-safe-counter/10-build-thread-safe-counter.md",
     "challenges/go-concepts/concurrency/07-concurrency-patterns/10-end-to-end-pipeline-with-cancel/10-end-to-end-pipeline-with-cancel.md",
     "challenges/go-concepts/concurrency/04-sync-primitives/09-sync-map-concurrent-access/09-sync-map-concurrent-access.md",
