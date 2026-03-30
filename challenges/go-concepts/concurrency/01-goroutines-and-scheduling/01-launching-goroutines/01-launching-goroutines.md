@@ -7,6 +7,7 @@ bloom_level: apply
 prerequisites: [Go basics, functions, closures]
 ---
 
+
 # 1. Launching Goroutines
 
 
