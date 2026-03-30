@@ -27,12 +27,12 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "challenges/go-concepts/concurrency/02-channels/01-unbuffered-channel-basics/01-unbuffered-channel-basics.md",
+                "file": "challenges/go-concepts/concurrency/02-channels/02-channel-as-synchronization/02-channel-as-synchronization.md",
                 "mode": "source",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "01-unbuffered-channel-basics"
+              "title": "02-channel-as-synchronization"
             }
           }
         ],
@@ -225,6 +225,7 @@
   },
   "active": "caa0937ea8cbd901",
   "lastOpenFiles": [
+    "challenges/go-concepts/concurrency/02-channels/01-unbuffered-channel-basics/01-unbuffered-channel-basics.md",
     "challenges/go-concepts/concurrency/02-channels/01-unbuffered-channel-basics/channels_typed.go",
     "challenges/go-concepts/concurrency/02-channels/01-unbuffered-channel-basics/multiple_values.go",
     "challenges/go-concepts/concurrency/02-channels/01-unbuffered-channel-basics/create_channel.go",
@@ -241,10 +242,8 @@
     "Run code.md",
     "README.md",
     "vim",
-    "Untitled 1",
     "challenges/go-concepts/concurrency/concurrency.md",
     "challenges/go-concepts/go-concepts.md",
-    "challenges/go-concepts/concurrency/02-channels/01-unbuffered-channel-basics/01-unbuffered-channel-basics.md",
     "challenges/go-concepts/concurrency/04-sync-primitives/10-build-thread-safe-counter/10-build-thread-safe-counter.md",
     "challenges/go-concepts/concurrency/07-concurrency-patterns/10-end-to-end-pipeline-with-cancel/10-end-to-end-pipeline-with-cancel.md",
     "challenges/go-concepts/concurrency/04-sync-primitives/09-sync-map-concurrent-access/09-sync-map-concurrent-access.md",

@@ -9,7 +9,7 @@ func main(){
 	pointCh := make(chan Point)
 	go func(){
 		pointCh <- Point{3,4}
-	}
+	}()
 	
 	p:=<-pointCh
 	fmt.Println("Point received:",p)
