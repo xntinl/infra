@@ -529,9 +529,9 @@ import (
 
 const (
 	starvationDuration = 300 * time.Millisecond
-	starvationDelay    = 5 * time.Millisecond
-	criticalInterval   = 8 * time.Millisecond
-	infoInterval       = 15 * time.Millisecond
+	starvationDelay    = 10 * time.Millisecond
+	criticalInterval   = 4 * time.Millisecond
+	infoInterval       = 20 * time.Millisecond
 )
 
 type Priority int
@@ -780,15 +780,15 @@ Expected output (values vary):
 ```
 === Starvation Analysis ===
 Duration:         300ms
-Critical sent:    37
-Critical handled: 35
-Info sent:        20
+Critical sent:    75
+Critical handled: 29
+Info sent:        15
 Info handled:     0
 
 STARVATION DETECTED: zero info alerts processed
 Critical traffic saturated the dispatcher entirely
 
-Avg critical latency: 12ms
+Avg critical latency: 98ms
 
 This is the fundamental priority tradeoff:
 strict priority guarantees critical-first, but starves lower priorities

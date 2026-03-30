@@ -15,7 +15,7 @@ type ServiceEndpoint struct{
 
 func checkService(name string, latency time.Duration) string{
 	time.Sleep(latency)
-	return fmt.Sprintf("%-18s UP (%v",name,latency)
+	return fmt.Sprintf("%-18s UP (%v)",name,latency)
 }
 
 
@@ -57,11 +57,11 @@ func main() {
 
 	fmt.Println("--- sequential health check")
 	seqDuration := runSequentialChecks(services)
-	fmt.Println("Sequential total: %v\n\n",seqDuration.Round(time.Millisecond))
+	fmt.Printf("Sequential total: %v\n",seqDuration.Round(time.Millisecond))
 
 
 	fmt.Println("--- concurrent health check")
 	concDuration := runConcurrentChecks(services)
-	fmt.Println("concurrent total: %v\n\n",concDuration.Round(time.Millisecond))
+	fmt.Printf("concurrent total: %v\n",concDuration.Round(time.Millisecond))
 
 }

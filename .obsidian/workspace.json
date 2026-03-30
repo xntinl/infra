@@ -210,6 +210,9 @@
   },
   "active": "ce71c186b1594d7a",
   "lastOpenFiles": [
+    "challenges/go-concepts/concurrency/01-goroutines-and-scheduling/30-goroutine-dag-orchestrator/30-goroutine-dag-orchestrator.md",
+    "challenges/go-concepts/concurrency/01-goroutines-and-scheduling/24-goroutine-per-connection-tcp/24-goroutine-per-connection-tcp.md",
+    "challenges/go-concepts/concurrency/02-channels/32-channel-request-coalescing/32-channel-request-coalescing.md",
     "challenges/go-concepts/concurrency/01-goroutines-and-scheduling/29-goroutine-work-stealing/29-goroutine-work-stealing.md",
     "challenges/go-concepts/concurrency/02-channels/27-channel-priority-queue/27-channel-priority-queue.md",
     "challenges/go-concepts/concurrency/02-channels/31-channel-resource-pool/31-channel-resource-pool.md",
@@ -243,9 +246,6 @@
     "challenges/go-concepts/concurrency/01-goroutines-and-scheduling/02-goroutine-vs-os-thread/02-goroutine-vs-os-thread.md",
     "challenges/go-concepts/concurrency/01-goroutines-and-scheduling/01-launching-goroutines/01-launching-goroutines.md",
     "challenges/go-concepts/concurrency/01-goroutines-and-scheduling/16-goroutine-supervision/16-goroutine-supervision.md",
-    "challenges/go-concepts/concurrency/01-goroutines-and-scheduling/20-goroutine-safe-cache/20-goroutine-safe-cache.md",
-    "challenges/go-concepts/concurrency/02-channels/22-channel-request-multiplexer/22-channel-request-multiplexer.md",
-    "challenges/go-concepts/concurrency/01-goroutines-and-scheduling/15-concurrent-file-processing/15-concurrent-file-processing.md",
     "Presentacion/poc-just/web/node_modules/ordered-binary/assets/powers-dre.png",
     "Presentacion/poc-just/web/node_modules/retry/equation.gif",
     "Untitled.canvas"
