@@ -210,6 +210,8 @@
   },
   "active": "ce71c186b1594d7a",
   "lastOpenFiles": [
+    "challenges/go-concepts/concurrency/01-goroutines-and-scheduling/20-goroutine-safe-cache/20-goroutine-safe-cache.md",
+    "challenges/go-concepts/concurrency/02-channels/22-channel-request-multiplexer/22-channel-request-multiplexer.md",
     "challenges/go-concepts/concurrency/01-goroutines-and-scheduling/15-concurrent-file-processing/15-concurrent-file-processing.md",
     "challenges/go-concepts/concurrency/02-channels/18-multi-producer-single-consumer/18-multi-producer-single-consumer.md",
     "challenges/go-concepts/concurrency/01-goroutines-and-scheduling/19-parallel-validation/19-parallel-validation.md",
@@ -244,8 +246,6 @@
     "challenges/go-concepts/concurrency/01-goroutines-and-scheduling/10-goroutine-leak-detection/10-goroutine-leak-detection.md",
     "challenges/go-concepts/concurrency/02-channels/13-channel-timeout-patterns/13-channel-timeout-patterns.md",
     "challenges/go-concepts/concurrency/03-select-and-multiplexing/10-select-deadlock-prevention/10-select-deadlock-prevention.md",
-    "challenges/go-concepts/concurrency/02-channels/12-channel-ownership-patterns/12-channel-ownership-patterns.md",
-    "challenges/go-concepts/concurrency/01-goroutines-and-scheduling/09-goroutine-lifecycle/09-goroutine-lifecycle.md",
     "Presentacion/poc-just/web/node_modules/ordered-binary/assets/powers-dre.png",
     "Presentacion/poc-just/web/node_modules/retry/equation.gif",
     "Untitled.canvas"
