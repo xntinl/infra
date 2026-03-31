@@ -13,12 +13,12 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "challenges/go-concepts/concurrency/01-goroutines-and-scheduling/16-goroutine-supervision/16-goroutine-supervision.md",
+                "file": "Run code.md",
                 "mode": "source",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "16-goroutine-supervision"
+              "title": "Run code"
             }
           }
         ]
@@ -210,6 +210,8 @@
   },
   "active": "ce71c186b1594d7a",
   "lastOpenFiles": [
+    "Presentacion/Just Ejemplos.md",
+    "challenges/go-concepts/concurrency/01-goroutines-and-scheduling/16-goroutine-supervision/16-goroutine-supervision.md",
     "challenges/go-concepts/concurrency/01-goroutines-and-scheduling/09-goroutine-lifecycle/09-goroutine-lifecycle.md",
     "challenges/go-concepts/concurrency/02-channels/32-channel-request-coalescing/32-channel-request-coalescing.md",
     "challenges/go-concepts/concurrency/03-select-and-multiplexing/01-select-basics/01-select-basics.md",
@@ -244,8 +246,6 @@
     "challenges/go-concepts/concurrency/02-channels/26-channel-saga-compensation",
     "challenges/go-concepts/concurrency/02-channels/25-ordered-fan-out-results",
     "challenges/go-concepts/concurrency/02-channels/24-channel-retry-backoff",
-    "challenges/go-concepts/concurrency/01-goroutines-and-scheduling/13-concurrent-api-calls/13-concurrent-api-calls.md",
-    "challenges/go-concepts/concurrency/01-goroutines-and-scheduling/12-goroutine-return-values/12-goroutine-return-values.md",
     "Presentacion/poc-just/web/node_modules/ordered-binary/assets/powers-dre.png",
     "Presentacion/poc-just/web/node_modules/retry/equation.gif",
     "Untitled.canvas"
