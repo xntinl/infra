@@ -8,91 +8,20 @@
         "type": "tabs",
         "children": [
           {
-            "id": "ce71c186b1594d7a",
-            "type": "leaf",
-            "state": {
-              "type": "markdown",
-              "state": {
-                "file": "Run code.md",
-                "mode": "source",
-                "source": false
-              },
-              "icon": "lucide-file",
-              "title": "Run code"
-            }
-          },
-          {
-            "id": "5c163ff53bb191a8",
-            "type": "leaf",
-            "state": {
-              "type": "markdown",
-              "state": {
-                "file": "Claude code/Introducción.md",
-                "mode": "source",
-                "source": false
-              },
-              "icon": "lucide-file",
-              "title": "Introducción"
-            }
-          },
-          {
-            "id": "43b2ef4f30a86e4c",
-            "type": "leaf",
-            "state": {
-              "type": "markdown",
-              "state": {
-                "file": "Claude code/SDD — Spec-Driven Development.md",
-                "mode": "source",
-                "source": false
-              },
-              "icon": "lucide-file",
-              "title": "SDD — Spec-Driven Development"
-            }
-          },
-          {
-            "id": "4cc2b03c719aec2f",
-            "type": "leaf",
-            "state": {
-              "type": "markdown",
-              "state": {
-                "file": "Claude code/SDD — Spec-Driven Development.md",
-                "mode": "source",
-                "source": false
-              },
-              "icon": "lucide-file",
-              "title": "SDD — Spec-Driven Development"
-            }
-          },
-          {
             "id": "80db5d002a546a52",
             "type": "leaf",
             "state": {
               "type": "markdown",
               "state": {
-                "file": "Claude code/Introducción.md",
+                "file": "ClaudeCode/Introducción.md",
                 "mode": "source",
                 "source": false
               },
               "icon": "lucide-file",
               "title": "Introducción"
             }
-          },
-          {
-            "id": "d0a45af840a45632",
-            "type": "leaf",
-            "state": {
-              "type": "markdown",
-              "state": {
-                "file": "Claude code/SDD — Spec-Driven Development.md",
-                "mode": "source",
-                "source": false
-              },
-              "icon": "lucide-file",
-              "title": "SDD — Spec-Driven Development"
-            }
           }
-        ],
-        "currentTab": 4
+        ]
       }
     ],
     "direction": "vertical"
@@ -281,12 +210,12 @@
   },
   "active": "80db5d002a546a52",
   "lastOpenFiles": [
+    "ClaudeCode/SDD — Spec-Driven Development.md",
+    "ClaudeCode/Introducción.md",
+    "ClaudeCode/GGA — Gentleman Guardian Angel.md",
     "Claude code/Mejoras.md",
-    "Claude code/Introducción.md",
-    "Claude code/GGA — Gentleman Guardian Angel.md",
-    "Claude code/Engram.md",
-    "Claude code/SDD — Spec-Driven Development.md",
-    "Claude code",
+    "ClaudeCode/Engram.md",
+    "ClaudeCode",
     "Run code.md",
     "challenges/advanced-topics/12-type-theory-and-fp/01-type-inference-and-hindley-milner/01-type-inference-and-hindley-milner.md",
     "challenges/elixir/03-avanzado/20-ets-counter-and-atomics/20-ets-counter-and-atomics.md",

@@ -1,3 +1,5 @@
+# GGA
+
 Code review automático con IA en cada git commit.
 
 ## Qué hace

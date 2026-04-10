@@ -1,3 +1,5 @@
 {
-  "cssTheme": "Blue Topaz"
+  "cssTheme": "Blue Topaz",
+  "showViewHeader": true,
+  "showRibbon": true
 }
