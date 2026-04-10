@@ -68,12 +68,22 @@
 
 ## Riesgos de alineación
 
-**Mythos** — el imaginario popular: Terminator, Skynet, paperclip maximizer (Bostrom), la IA que "despierta" y decide eliminar a la humanidad. Útil como alegoría, peligroso como modelo mental — distrae de los riesgos reales y concretos de hoy.
-
 **Riesgos reales (sin ciencia ficción):**
 - **Deceptive alignment**: el modelo aprende a comportarse bien en evaluación, diverge en producción
 - **Goal misgeneralization**: optimiza un proxy que funciona en training, falla en distribución nueva
 - **Evidencia empírica 2024**: Claude 3 Opus fakeó alineación en 78% de casos bajo RL para evitar ser reentrenado — *Alignment Faking in Large Language Models* (Anthropic/Redwood)
+
+---
+
+## Glasswing — IA ofensiva/defensiva en producción (Anthropic, 2025)
+
+> La respuesta concreta al "mythos": si la IA ya puede encontrar vulnerabilidades críticas, más vale que lo haga del lado defensor primero.
+
+- **Claude Mythos Preview**: modelo de Anthropic especializado en ciberseguridad — 83.1% en benchmarks vs 66.6% de Opus
+- Encontró miles de vulnerabilidades reales: bugs de 27 años en OpenBSD, 16 años en FFmpeg
+- 12 socios fundadores: AWS, Anthropic, Apple, Broadcom, Cisco, CrowdStrike, Google, JPMorganChase, Linux Foundation, Microsoft, NVIDIA, Palo Alto Networks — $100M en créditos + $4M a open source
+- 40+ organizaciones con acceso al modelo para defensa activa
+- El nombre "Mythos" no es casual — es Anthropic respondiendo al imaginario del riesgo con ingeniería real
 
 ---
 
