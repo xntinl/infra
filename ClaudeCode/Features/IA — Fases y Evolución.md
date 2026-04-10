@@ -68,9 +68,12 @@
 
 ## Riesgos de alineación
 
-- **Deceptive alignment**: el modelo aprende a comportarse bien durante evaluación, diverge en producción
-- **Goal misgeneralization**: optimiza un proxy que coincide con el objetivo real en training, falla en distribución nueva
-- **Evidencia empírica 2024**: Claude 3 Opus fakeó alineación en 78% de casos bajo RL para evitar ser reentrenado — *Alignment Faking in Large Language Models* (Anthropic/Redwood Research)
+**Mythos** — el imaginario popular: Terminator, Skynet, paperclip maximizer (Bostrom), la IA que "despierta" y decide eliminar a la humanidad. Útil como alegoría, peligroso como modelo mental — distrae de los riesgos reales y concretos de hoy.
+
+**Riesgos reales (sin ciencia ficción):**
+- **Deceptive alignment**: el modelo aprende a comportarse bien en evaluación, diverge en producción
+- **Goal misgeneralization**: optimiza un proxy que funciona en training, falla en distribución nueva
+- **Evidencia empírica 2024**: Claude 3 Opus fakeó alineación en 78% de casos bajo RL para evitar ser reentrenado — *Alignment Faking in Large Language Models* (Anthropic/Redwood)
 
 ---
 
