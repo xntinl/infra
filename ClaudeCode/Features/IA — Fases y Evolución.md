@@ -13,7 +13,7 @@
 - **2022 feb** — AlphaCode (DeepMind): top 54% en Codeforces, primera IA competitiva en programación
 - **2022 nov** — ChatGPT (GPT-3.5 + RLHF): 100M usuarios en 2 meses, mayor adopción tecnológica de la historia
 - **2023 mar** — GPT-4: multimodal (texto + imagen), razonamiento cuantitativo notablemente superior
-- **2023 mar** — Claude 1 (Anthropic): primero entrenado con Constitutional AI, comportamiento más predecible
+- **2023 mar** — Claude 1 (Anthropic): fundada en 2021 por **Dario Amodei** (CEO) y su hermana **Daniela Amodei** (Presidenta), ambos ex-OpenAI — primer modelo entrenado con Constitutional AI, comportamiento más predecible
 - **2023 jun** — Function Calling (OpenAI): modelos aprenden a emitir JSON estructurado para invocar herramientas externas
 - **2023** — AlphaDev (DeepMind): descubre algoritmos de sorting más rápidos que los escritos por humanos en 50 años
 
