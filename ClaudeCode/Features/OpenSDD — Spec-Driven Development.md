@@ -45,8 +45,6 @@ Las fases tienen dependencias duras: no podés implementar sin design, no podés
 - Dependencias entre tareas marcadas explícitamente
 - Criterio de done por tarea (qué test o assertion la cierra)
 
----
-
 ## OpenSpec — el framework open source
 
 - **Repo**: [github.com/Fission-AI/OpenSpec](https://github.com/Fission-AI/OpenSpec)
