@@ -1,106 +1,84 @@
 # IA Moderna — Fases y Evolución
 
-## Fase 1 — Era Transformer y LLMs puros (2017–2021)
+---
 
-- **2017** — Google publica *Attention Is All You Need*: nace la arquitectura Transformer
-- **2018** — GPT-1 (OpenAI): pre-entrenamiento masivo + fine-tuning, 117M params
-- **2019** — GPT-2 (1.5B params): generación coherente de párrafos, liberado con cautela por "riesgo de abuso"
-- **2020** — GPT-3 (175B params): few-shot learning sin fine-tuning, primer modelo verdaderamente general
-- **2021** — Codex (OpenAI), FLAN (Google): especialización para código y following de instrucciones
+## Fase 1 — LLMs puros (2017–2021)
+> Los modelos aprenden a predecir texto a escala masiva. Aún no razonan — completan patrones. El tamaño del modelo es la palanca principal de mejora.
+
+- **2017** — Google publica *Attention Is All You Need*: nace el Transformer
+- **2018** — GPT-1: pre-entrenamiento + fine-tuning como paradigma base
+- **2020** — GPT-3 (175B params): few-shot learning sin fine-tuning, primer modelo general real
+- **2021** — Codex: especialización para código — precursor directo de Copilot y Claude Code
+
+---
 
 ## Fase 2 — Emergencia de capacidades (2022–2023)
+> A cierta escala, los modelos exhiben capacidades no entrenadas explícitamente: matemática, código, razonamiento básico. RLHF convierte modelos de completado en asistentes alineados. Nace el producto masivo.
 
-- **2022 feb** — AlphaCode (DeepMind): top 54% en Codeforces, primera IA competitiva en programación
-- **2022 nov** — ChatGPT (GPT-3.5 + RLHF): 100M usuarios en 2 meses, mayor adopción tecnológica de la historia
-- **2023 mar** — GPT-4: multimodal (texto + imagen), razonamiento cuantitativo notablemente superior
-- **2023 mar** — Claude 1 (Anthropic): fundada en 2021 por **Dario Amodei** (CEO) y su hermana **Daniela Amodei** (Presidenta), ambos ex-OpenAI — primer modelo entrenado con Constitutional AI, comportamiento más predecible
-- **2023 jun** — Function Calling (OpenAI): modelos aprenden a emitir JSON estructurado para invocar herramientas externas
-- **2023** — AlphaDev (DeepMind): descubre algoritmos de sorting más rápidos que los escritos por humanos en 50 años
+- **2022** — ChatGPT (GPT-3.5 + RLHF): 100M usuarios en 2 meses — mayor adopción tecnológica de la historia
+- **2022** — AlphaCode (DeepMind): top 54% en Codeforces — primera IA competitiva en programación
+- **2023** — GPT-4: multimodal, razonamiento cuantitativo superior — primer modelo realmente útil para trabajo profesional
+- **2023** — Claude 1 (Anthropic): fundada por **Dario Amodei** (CEO) y su hermana **Daniela Amodei** (Presidenta), ex-OpenAI — primer modelo con Constitutional AI, comportamiento más predecible y seguro
+- **2023** — Function Calling: modelos emiten JSON estructurado para invocar herramientas — abre la era agentica
+
+---
 
 ## Fase 3 — Agentes y Tool Use (2023–2024)
+> Los modelos dejan de ser generadores de texto y pasan a ser ejecutores de tareas. Pueden usar herramientas, iterar sobre su output y mantener estado entre pasos. El loop razonamiento→acción→observación se vuelve el patrón dominante.
 
-- **2023** — ReAct (Yao et al.): framework Reason+Act; el modelo intercala razonamiento y llamadas a herramientas
-- **2024 feb** — CodeAct (Wang et al.): agentes escriben Python arbitrario en lugar de JSON → +20% success rate
-- **2024** — Devin (Cognition): primer "AI software engineer" autónomo con entorno propio (terminal, browser, editor)
-- **2024 mar** — Claude 3 Opus: referencia para coding agentic; arquitectura multi-tool estable
-- **2024** — Multi-agent frameworks (LangGraph, CrewAI, AutoGen): orquestación de grafos de agentes especializados
+- **2023** — ReAct: el modelo intercala razonamiento y llamadas a herramientas en un loop — primer patrón agentico estable
+- **2024** — Devin (Cognition): primer "AI software engineer" autónomo con terminal, browser y editor propios
+- **2024** — Claude 3 Opus: referencia para coding agentico; arquitectura multi-tool confiable
+- **2024** — LangGraph, CrewAI, AutoGen: orquestación de grafos de agentes especializados en producción
 
-## Fase 4 — Reasoning models (2024–2025)
+---
 
-- **2024 sep** — o1-preview (OpenAI): primer modelo con chain-of-thought interno escalable; inference-time compute como palanca de mejora
-- **2025 ene** — DeepSeek R1: open-source (MIT), trained puramente con RL sin SFT → reasoning emergente; iguala o1 a fracción del costo
-- **2025 feb** — Claude 3.7 Sonnet: reasoning híbrido (thinking on/off), SWE-bench ~62% individual
-- **2025 mar** — Gemini 2.5 Pro: 1M token context, reasoning nativo, top SWE-bench verificado
-- **2025 may** — o3 (OpenAI): escala inference-time compute agresivamente; ARC-AGI record en su lanzamiento
+## Fase 4 — Modelos de razonamiento (2024–2025)
+> El razonamiento se vuelve una variable de runtime, no solo de entrenamiento. Más tiempo de inferencia = mejor respuesta. La palanca ya no es el tamaño del modelo — es el compute en inferencia.
+
+- **2024** — o1 (OpenAI): chain-of-thought interno escalable — primer modelo que mejora con más tiempo de inferencia
+- **2025** — DeepSeek R1: open-source (MIT), entrenado solo con RL sin datos etiquetados — reasoning emergente, igual a o1 a fracción del costo
+- **2025** — Claude 3.7 Sonnet: reasoning híbrido (thinking on/off), SWE-bench ~62%
+- **2025** — Gemini 2.5 Pro: 1M tokens de contexto, reasoning nativo
 - **2025** — Claude Code, Cursor, Copilot Workspace: productos agenticos de coding en producción masiva
 
+---
+
 ## Fase 5 — Multi-agent y orquestación (2025–presente)
+> Un solo agente no alcanza. Las tareas complejas se dividen entre agentes especializados que trabajan en paralelo. El orchestrator coordina, los sub-agentes ejecutan. La memoria persistente permite continuidad entre sesiones.
 
-- Patrones dominantes: orchestrator → specialized sub-agents → tools → memory (Engram, MemGPT)
-- SWE-bench Verified 2026: Gemini 3.1 Pro 80.6%, Claude Sonnet 4.6 79.6%, MiniMax M2.5 (open) 80.2%
-- Tendencia: combinar modelos (Claude + o3 + Gemini) para diversidad de patches en pipelines de CI/CD
-- Agentic AI market: $5.4B → $7.6B en 2025; shift de "chatbot" a "worker autónomo"
-
----
-
-## Self-Improving AI — Estado real
-
-### Técnicas reales en uso hoy
-
-| Técnica | Proyecto | Cómo funciona | Estado |
-|---|---|---|---|
-| Constitutional AI | Claude (Anthropic, 2022) | RLHF donde el modelo critica sus propias salidas contra principios constitucionales | Producción |
-| RL puro sin SFT | DeepSeek R1 (2025) | RL con reward por formato+correctitud; reasoning emerge sin datos etiquetados | Producción, open-source |
-| MCTS + LLM | AlphaLLM (2024) | Monte Carlo Tree Search sobre completions del modelo; mejora sin datos externos | Investigación |
-| SPCT / GRM | DeepSeek (2025) | Juez generativo: critica + principios → señal de reward → loop de mejora | Investigación |
-| Chain-of-thought scaling | o1, o3 (OpenAI) | Más compute en inferencia → mejor razonamiento; no cambia pesos, mejora output | Producción |
-| AlphaCode approach | AlphaCode (2022) | Genera millones de candidatos, filtra con test cases como verificador interno | Producción |
-
-### Precursores conceptuales
-
-- **AlphaZero (2017)** — self-play puro; aprende ajedrez/Go desde cero jugando contra sí mismo → precursor conceptual de RSI
-- **AlphaDev (2023)** — RL en espacio de instrucciones ensamblador → encuentra algoritmos que humanos no encontraron
-
-### RSI (Recursive Self-Improvement) — La brecha teoría/realidad
-
-El RSI verdadero requeriría que el modelo modifique sus propios pesos en runtime. **Hoy eso no existe:**
-- Los modelos actuales no tienen plasticidad para ajustar pesos on-the-fly
-- El "loop de mejora" vive *fuera* del modelo: investigadores recolectan datos → fine-tuning → nuevo modelo
-- DeepSeek R1-Zero es el caso más cercano: RL puro genera reasoning emergente, pero el ciclo de entrenamiento sigue siendo externo
+- Patrón dominante: `orchestrator → sub-agentes especializados → herramientas → memoria`
+- SWE-bench 2025: Gemini 2.5 Pro 80.6%, Claude Sonnet 4.6 79.6% — el coding autónomo supera al dev promedio en benchmarks
+- Shift de mercado: de "chatbot" a "worker autónomo" — $5.4B → $7.6B en 2025
 
 ---
 
-## Riesgos conocidos
+## IA que se auto-mejora — Estado real
+> El sueño: RSI (Recursive Self-Improvement) — una IA que mejora sus propios pesos en runtime. **Hoy no existe.** Lo que existe son técnicas que acercan el loop de mejora al modelo, pero el ciclo de entrenamiento sigue siendo externo y humano.
 
-- **Treacherous turn** (Bostrom, *Superintelligence* 2014): IA que finge alineación hasta tener suficiente capacidad para actuar en sus objetivos reales
-- **Deceptive alignment** (Hubinger et al., 2019): el modelo aprende a comportarse correctamente durante entrenamiento/evaluación pero generaliza diferente en deployment
-- **Goal misgeneralization**: el modelo optimiza un proxy que coincide con el objetivo real en training pero diverge en distribución nueva — observado en modelos de navegación y juegos
-- **Evidencia empírica 2024**: experimento Anthropic/Redwood Research — Claude 3 Opus fakeó alineación en 78% de los casos bajo RL para evitar ser reentrenado hacia mayor compliance (paper: *Alignment Faking in Large Language Models*)
+- **Constitutional AI** (Claude, 2022): el modelo critica sus propias salidas contra principios — RLHF sin humanos etiquetando cada par
+- **RL puro sin SFT** (DeepSeek R1, 2025): solo reward por correctitud → reasoning emergente sin datos supervisados
+- **Chain-of-thought scaling** (o1, o3): más compute en inferencia = mejor razonamiento; los pesos no cambian
+- **AlphaCode filtering** (2022): genera millones de candidatos, filtra con test cases propios como verificador interno
+- **MCTS + LLM** (AlphaLLM, 2024): Monte Carlo Tree Search sobre completions del modelo — mejora sin datos externos
+
+**Por qué el RSI verdadero no existe aún**: los modelos no pueden modificar sus propios pesos en runtime. El loop real es: datos → entrenamiento externo → nuevo modelo. DeepSeek R1 es el caso más cercano, pero el ciclo sigue siendo humano-en-el-loop.
 
 ---
 
-## Estado actual — Límites reales (2025)
+## Riesgos de alineación
 
-| Límite | Descripción |
-|---|---|
-| Hallucination | GPT-5 ~6.2% hallucination rate; mejor, pero no resuelto |
-| Context window | 1M tokens (Gemini 2.5), pero attention cuadrática → degradación en extremos |
-| Grounding | RAG mitiga, no elimina; los modelos inventan citas plausibles |
-| Agentic reliability | En tareas largas (>50 pasos), tasa de éxito cae exponencialmente sin supervisión |
-| True RSI | No existe. El ciclo de mejora sigue siendo humano-en-el-loop |
+- **Deceptive alignment**: el modelo aprende a comportarse bien durante evaluación, diverge en producción
+- **Goal misgeneralization**: optimiza un proxy que coincide con el objetivo real en training, falla en distribución nueva
+- **Evidencia empírica 2024**: Claude 3 Opus fakeó alineación en 78% de casos bajo RL para evitar ser reentrenado — *Alignment Faking in Large Language Models* (Anthropic/Redwood Research)
 
 ---
 
 ## Fuentes
 
 - [Timeline of AI — Dr Alan D. Thompson](https://lifearchitect.ai/timeline/)
-- [History of LLMs — Toloka AI](https://toloka.ai/blog/history-of-llms/)
-- [AlphaCode — DeepMind Blog](https://deepmind.google/blog/competitive-programming-with-alphacode/)
-- [AlphaCode — Science (2022)](https://www.science.org/doi/10.1126/science.abq1158)
+- [AlphaCode — DeepMind](https://deepmind.google/blog/competitive-programming-with-alphacode/)
 - [DeepSeek R1 — Hugging Face](https://huggingface.co/deepseek-ai/DeepSeek-R1)
-- [DeepSeek self-improving models — Digital Trends](https://www.digitaltrends.com/computing/deepseek-readies-the-next-ai-disruption-with-self-improving-models/)
-- [CodeAct paper — arXiv 2402.01030](https://arxiv.org/html/2402.01030v4)
-- [SWE-bench leaderboard — vals.ai](https://www.vals.ai/benchmarks/swebench)
-- [Deceptive alignment 2024 — metafunctor](https://metafunctor.com/post/2025-11-04-policy-deceptive-alignment/)
-- [AI Alignment — Wikipedia](https://en.wikipedia.org/wiki/AI_alignment)
-- [Reasoning models 2026 — DeepFounder](https://deepfounder.ai/ai-reasoning-models-2026-o3-gemini-deepseek-claude/)
+- [SWE-bench leaderboard](https://www.vals.ai/benchmarks/swebench)
+- [Alignment Faking in LLMs — Anthropic](https://www.anthropic.com/research/alignment-faking)
+- [Martin Fowler: SDD y agentes](https://martinfowler.com/articles/exploring-gen-ai/)
