@@ -13,12 +13,12 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "ClaudeCode/Skills/Dead Code Skill — Ejemplo.md",
+                "file": "ClaudeCode/IA — Fases y Evolución.md",
                 "mode": "source",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "Dead Code Skill — Ejemplo"
+              "title": "IA — Fases y Evolución"
             }
           }
         ]
@@ -208,13 +208,14 @@
       "open-vscode:VS Code": false
     }
   },
-  "active": "80db5d002a546a52",
+  "active": "cda3cf7535287934",
   "lastOpenFiles": [
+    "ClaudeCode/Introducción.md",
+    "ClaudeCode/Skills/Dead Code Skill — Ejemplo.md",
+    "ClaudeCode/IA — Fases y Evolución.md",
     "ClaudeCode/Features/OpenSDD — Spec-Driven Development.md",
     "ClaudeCode/Features/SDD — Spec-Driven Development.md",
-    "ClaudeCode/Skills/Dead Code Skill — Ejemplo.md",
     "ClaudeCode/Config/settings.json.md",
-    "ClaudeCode/Introducción.md",
     "ClaudeCode/Dead Code Skill — Ejemplo.md",
     "ClaudeCode/Config",
     "ClaudeCode/Skills",
@@ -239,7 +240,6 @@
     "challenges/elixir/02-intermedio/11-streams-lazy-evaluation/11-streams-lazy-evaluation.md",
     "challenges/elixir/02-intermedio/01-procesos-spawn-send-receive/01-procesos-spawn-send-receive.md",
     "challenges/elixir/02-intermedio/32-string-chars-inspect-protocol/32-string-chars-inspect-protocol.md",
-    "challenges/elixir/02-intermedio/14-registry-dinamico/14-registry-dinamico.md",
     "challenges/elixir/04-insane/55-build-distributed-saga-orchestrator",
     "challenges/elixir/04-insane/54-build-ai-agents-framework",
     "challenges/elixir/04-insane/53-build-real-time-collaboration-engine",
