@@ -13,12 +13,12 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "ClaudeCode/Features/IA — Fases y Evolución.md",
+                "file": "ClaudeCode/Skills/Dead Code Skill — Ejemplo.md",
                 "mode": "source",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "IA — Fases y Evolución"
+              "title": "Dead Code Skill — Ejemplo"
             }
           }
         ]
@@ -210,13 +210,14 @@
   },
   "active": "80db5d002a546a52",
   "lastOpenFiles": [
+    "challenges/advanced-topics/tendencias-tecnologicas-2020-2026.md",
+    "ClaudeCode/Config/settings.json.md",
+    "ClaudeCode/Features/IA — Fases y Evolución.md",
     "ClaudeCode/Introducción.md",
     "ClaudeCode/IA — Fases y Evolución.md",
-    "ClaudeCode/Features/IA — Fases y Evolución.md",
     "ClaudeCode/Skills/Dead Code Skill — Ejemplo.md",
     "ClaudeCode/Features/OpenSDD — Spec-Driven Development.md",
     "ClaudeCode/Features/SDD — Spec-Driven Development.md",
-    "ClaudeCode/Config/settings.json.md",
     "ClaudeCode/Dead Code Skill — Ejemplo.md",
     "ClaudeCode/Config",
     "ClaudeCode/Skills",
@@ -239,7 +240,6 @@
     "challenges/elixir/03-avanzado/18-mnesia-basics/18-mnesia-basics.md",
     "challenges/elixir/03-avanzado/14-phoenix-pubsub-advanced/14-phoenix-pubsub-advanced.md",
     "challenges/elixir/02-intermedio/11-streams-lazy-evaluation/11-streams-lazy-evaluation.md",
-    "challenges/elixir/02-intermedio/01-procesos-spawn-send-receive/01-procesos-spawn-send-receive.md",
     "challenges/elixir/04-insane/55-build-distributed-saga-orchestrator",
     "challenges/elixir/04-insane/54-build-ai-agents-framework",
     "challenges/elixir/04-insane/53-build-real-time-collaboration-engine",
