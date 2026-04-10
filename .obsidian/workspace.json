@@ -13,12 +13,12 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "challenges/advanced-topics/01-advanced-data-structures/02-bloom-filter-and-variants/02-bloom-filter-and-variants.md",
+                "file": "challenges/advanced-topics/12-type-theory-and-fp/01-type-inference-and-hindley-milner/01-type-inference-and-hindley-milner.md",
                 "mode": "source",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "02-bloom-filter-and-variants"
+              "title": "01-type-inference-and-hindley-milner"
             }
           }
         ]
@@ -210,6 +210,9 @@
   },
   "active": "ce71c186b1594d7a",
   "lastOpenFiles": [
+    "challenges/advanced-topics/01-advanced-data-structures/02-bloom-filter-and-variants/02-bloom-filter-and-variants.md",
+    "challenges/elixir/03-avanzado/19-cache-patterns-ets/19-cache-patterns-ets.md",
+    "challenges/elixir/03-avanzado/15-rpc-and-remote-calls/15-rpc-and-remote-calls.md",
     "challenges/advanced-topics/01-advanced-data-structures/01-skip-list-probabilistic-indexing/01-skip-list-probabilistic-indexing.md",
     "challenges/elixir/03-avanzado/18-mnesia-basics/18-mnesia-basics.md",
     "challenges/elixir/03-avanzado/14-phoenix-pubsub-advanced/14-phoenix-pubsub-advanced.md",
@@ -233,9 +236,6 @@
     "challenges/elixir/02-intermedio/09-pattern-matching-avanzado/09-pattern-matching-avanzado.md",
     "challenges/elixir/03-avanzado/16-ets-advanced-concurrent/16-ets-advanced-concurrent.md",
     "challenges/elixir/02-intermedio/33-access-behaviour/33-access-behaviour.md",
-    "challenges/elixir/03-avanzado/11-distributed-erlang-clustering/11-distributed-erlang-clustering.md",
-    "challenges/elixir/02-intermedio/12-macros-y-quote-unquote/12-macros-y-quote-unquote.md",
-    "challenges/elixir/02-intermedio/29-ecto-basico/29-ecto-basico.md",
     "challenges/elixir/04-insane/55-build-distributed-saga-orchestrator",
     "challenges/elixir/04-insane/54-build-ai-agents-framework",
     "challenges/elixir/04-insane/53-build-real-time-collaboration-engine",
