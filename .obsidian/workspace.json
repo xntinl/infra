@@ -13,30 +13,15 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "ClaudeCode/Introducción.md",
+                "file": "ClaudeCode/Features/SDD — Spec-Driven Development.md",
                 "mode": "source",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "Introducción"
-            }
-          },
-          {
-            "id": "49fc02599d707556",
-            "type": "leaf",
-            "state": {
-              "type": "markdown",
-              "state": {
-                "file": "ClaudeCode/Dead Code Skill — Ejemplo.md",
-                "mode": "source",
-                "source": false
-              },
-              "icon": "lucide-file",
-              "title": "Dead Code Skill — Ejemplo"
+              "title": "SDD — Spec-Driven Development"
             }
           }
-        ],
-        "currentTab": 1
+        ]
       }
     ],
     "direction": "vertical"
@@ -223,15 +208,23 @@
       "open-vscode:VS Code": false
     }
   },
-  "active": "49fc02599d707556",
+  "active": "80db5d002a546a52",
   "lastOpenFiles": [
+    "ClaudeCode/Skills/Dead Code Skill — Ejemplo.md",
+    "ClaudeCode/Config/settings.json.md",
     "ClaudeCode/Introducción.md",
     "ClaudeCode/Dead Code Skill — Ejemplo.md",
-    "ClaudeCode/SDD — Spec-Driven Development.md",
-    "ClaudeCode/settings.json.md",
+    "ClaudeCode/Config",
+    "ClaudeCode/Skills",
+    "ClaudeCode/Features/SDD — Spec-Driven Development.md",
+    "ClaudeCode/Features/GGA — Gentleman Guardian Angel.md",
+    "ClaudeCode/Features/Engram.md",
+    "ClaudeCode/Features",
     "ClaudeCode/GGA — Gentleman Guardian Angel.md",
-    "Claude code/Mejoras.md",
+    "ClaudeCode/SDD — Spec-Driven Development.md",
     "ClaudeCode/Engram.md",
+    "ClaudeCode/settings.json.md",
+    "Claude code/Mejoras.md",
     "ClaudeCode",
     "Run code.md",
     "challenges/advanced-topics/12-type-theory-and-fp/01-type-inference-and-hindley-milner/01-type-inference-and-hindley-milner.md",
@@ -247,20 +240,12 @@
     "challenges/elixir/02-intermedio/32-string-chars-inspect-protocol/32-string-chars-inspect-protocol.md",
     "challenges/elixir/02-intermedio/14-registry-dinamico/14-registry-dinamico.md",
     "challenges/elixir/02-intermedio/35-nimbleparsec-csv-basico/35-nimbleparsec-csv-basico.md",
-    "challenges/elixir/04-insane/01-build-distributed-raft-consensus/01-build-distributed-raft-consensus.md",
-    "challenges/elixir/03-avanzado/13-horde-distributed-registry/13-horde-distributed-registry.md",
-    "challenges/elixir/elixir.md",
-    "challenges/challenges.md",
-    "challenges/elixir/03-avanzado/17-dets-persistent-storage/17-dets-persistent-storage.md",
     "challenges/elixir/04-insane/55-build-distributed-saga-orchestrator",
     "challenges/elixir/04-insane/54-build-ai-agents-framework",
     "challenges/elixir/04-insane/53-build-real-time-collaboration-engine",
     "challenges/elixir/04-insane/52-build-multi-tenant-saas-framework",
     "challenges/elixir/04-insane/46-build-liveview-clone/README.md.tmp.4607.1775822221702",
     "challenges/elixir/04-insane/51-build-production-job-queue",
-    "challenges/elixir/04-insane/50-build-distributed-lock-service",
-    "challenges/elixir/04-insane/49-build-reactive-streams",
-    "challenges/elixir/04-insane/48-build-compile-time-type-system",
     "Presentacion/poc-just/web/node_modules/ordered-binary/assets/powers-dre.png",
     "Presentacion/poc-just/web/node_modules/retry/equation.gif",
     "Untitled.canvas"
