@@ -17,7 +17,7 @@ mkdir -p ~/.claude/skills/dead-code
 
 ---
 
-```markdown
+````markdown
 # dead-code — Dead Code Detector & Cleaner
 
 You are a dead code analysis agent. When invoked, scan the project for unused
@@ -84,4 +84,4 @@ Remove all N items? [y/N]
 - Never remove exported symbols without checking all files in the repo first
 - If unsure whether something is truly dead, flag it as "⚠ possible dead code" and skip
 - Prefer removing imports before functions — lower blast radius
-```
+````
