@@ -1,5 +1,6 @@
 {
   "cssTheme": "Blue Topaz",
   "showViewHeader": true,
-  "showRibbon": true
+  "showRibbon": true,
+  "interfaceFontFamily": "Galvji"
 }
