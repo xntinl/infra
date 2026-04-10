@@ -41,12 +41,40 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "Claude code/Mejoras.md",
+                "file": "Claude code/SDD — Spec-Driven Development.md",
                 "mode": "source",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "Mejoras"
+              "title": "SDD — Spec-Driven Development"
+            }
+          },
+          {
+            "id": "4cc2b03c719aec2f",
+            "type": "leaf",
+            "state": {
+              "type": "markdown",
+              "state": {
+                "file": "Claude code/SDD — Spec-Driven Development.md",
+                "mode": "source",
+                "source": false
+              },
+              "icon": "lucide-file",
+              "title": "SDD — Spec-Driven Development"
+            }
+          },
+          {
+            "id": "80db5d002a546a52",
+            "type": "leaf",
+            "state": {
+              "type": "markdown",
+              "state": {
+                "file": "Claude code/Introducción.md",
+                "mode": "source",
+                "source": false
+              },
+              "icon": "lucide-file",
+              "title": "Introducción"
             }
           },
           {
@@ -55,16 +83,16 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "Claude code/SDD.md",
+                "file": "Claude code/SDD — Spec-Driven Development.md",
                 "mode": "source",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "SDD"
+              "title": "SDD — Spec-Driven Development"
             }
           }
         ],
-        "currentTab": 2
+        "currentTab": 4
       }
     ],
     "direction": "vertical"
@@ -251,11 +279,13 @@
       "open-vscode:VS Code": false
     }
   },
-  "active": "43b2ef4f30a86e4c",
+  "active": "80db5d002a546a52",
   "lastOpenFiles": [
-    "Claude code/SDD.md",
     "Claude code/Mejoras.md",
     "Claude code/Introducción.md",
+    "Claude code/GGA — Gentleman Guardian Angel.md",
+    "Claude code/Engram.md",
+    "Claude code/SDD — Spec-Driven Development.md",
     "Claude code",
     "Run code.md",
     "challenges/advanced-topics/12-type-theory-and-fp/01-type-inference-and-hindley-milner/01-type-inference-and-hindley-milner.md",
@@ -278,8 +308,6 @@
     "challenges/elixir/03-avanzado/17-dets-persistent-storage/17-dets-persistent-storage.md",
     "challenges/elixir/02-intermedio/10-comprehensions-avanzadas/10-comprehensions-avanzadas.md",
     "challenges/elixir/02-intermedio/31-concurrency-patterns-fan-out/31-concurrency-patterns-fan-out.md",
-    "challenges/elixir/02-intermedio/34-collectable-enumerable/34-collectable-enumerable.md",
-    "challenges/elixir/02-intermedio/13-ets-basico/13-ets-basico.md",
     "challenges/elixir/04-insane/55-build-distributed-saga-orchestrator",
     "challenges/elixir/04-insane/54-build-ai-agents-framework",
     "challenges/elixir/04-insane/53-build-real-time-collaboration-engine",
