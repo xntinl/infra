@@ -13,15 +13,58 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "challenges/advanced-topics/12-type-theory-and-fp/01-type-inference-and-hindley-milner/01-type-inference-and-hindley-milner.md",
+                "file": "Run code.md",
                 "mode": "source",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "01-type-inference-and-hindley-milner"
+              "title": "Run code"
+            }
+          },
+          {
+            "id": "5c163ff53bb191a8",
+            "type": "leaf",
+            "state": {
+              "type": "markdown",
+              "state": {
+                "file": "Claude code/Introducción.md",
+                "mode": "source",
+                "source": false
+              },
+              "icon": "lucide-file",
+              "title": "Introducción"
+            }
+          },
+          {
+            "id": "43b2ef4f30a86e4c",
+            "type": "leaf",
+            "state": {
+              "type": "markdown",
+              "state": {
+                "file": "Claude code/Mejoras.md",
+                "mode": "source",
+                "source": false
+              },
+              "icon": "lucide-file",
+              "title": "Mejoras"
+            }
+          },
+          {
+            "id": "d0a45af840a45632",
+            "type": "leaf",
+            "state": {
+              "type": "markdown",
+              "state": {
+                "file": "Claude code/SDD.md",
+                "mode": "source",
+                "source": false
+              },
+              "icon": "lucide-file",
+              "title": "SDD"
             }
           }
-        ]
+        ],
+        "currentTab": 2
       }
     ],
     "direction": "vertical"
@@ -208,8 +251,14 @@
       "open-vscode:VS Code": false
     }
   },
-  "active": "ce71c186b1594d7a",
+  "active": "43b2ef4f30a86e4c",
   "lastOpenFiles": [
+    "Claude code/SDD.md",
+    "Claude code/Mejoras.md",
+    "Claude code/Introducción.md",
+    "Claude code",
+    "Run code.md",
+    "challenges/advanced-topics/12-type-theory-and-fp/01-type-inference-and-hindley-milner/01-type-inference-and-hindley-milner.md",
     "challenges/elixir/03-avanzado/20-ets-counter-and-atomics/20-ets-counter-and-atomics.md",
     "challenges/advanced-topics/01-advanced-data-structures/02-bloom-filter-and-variants/02-bloom-filter-and-variants.md",
     "challenges/elixir/03-avanzado/19-cache-patterns-ets/19-cache-patterns-ets.md",
@@ -227,15 +276,10 @@
     "challenges/elixir/elixir.md",
     "challenges/challenges.md",
     "challenges/elixir/03-avanzado/17-dets-persistent-storage/17-dets-persistent-storage.md",
-    "Run code.md",
     "challenges/elixir/02-intermedio/10-comprehensions-avanzadas/10-comprehensions-avanzadas.md",
     "challenges/elixir/02-intermedio/31-concurrency-patterns-fan-out/31-concurrency-patterns-fan-out.md",
     "challenges/elixir/02-intermedio/34-collectable-enumerable/34-collectable-enumerable.md",
     "challenges/elixir/02-intermedio/13-ets-basico/13-ets-basico.md",
-    "challenges/elixir/03-avanzado/12-global-process-registry/12-global-process-registry.md",
-    "challenges/elixir/02-intermedio/30-process-dictionary-erlang/30-process-dictionary-erlang.md",
-    "challenges/elixir/02-intermedio/09-pattern-matching-avanzado/09-pattern-matching-avanzado.md",
-    "challenges/elixir/03-avanzado/16-ets-advanced-concurrent/16-ets-advanced-concurrent.md",
     "challenges/elixir/04-insane/55-build-distributed-saga-orchestrator",
     "challenges/elixir/04-insane/54-build-ai-agents-framework",
     "challenges/elixir/04-insane/53-build-real-time-collaboration-engine",
@@ -245,7 +289,6 @@
     "challenges/elixir/04-insane/50-build-distributed-lock-service",
     "challenges/elixir/04-insane/49-build-reactive-streams",
     "challenges/elixir/04-insane/48-build-compile-time-type-system",
-    "challenges/elixir/04-insane/47-build-workflow-engine-temporal-like",
     "Presentacion/poc-just/web/node_modules/ordered-binary/assets/powers-dre.png",
     "Presentacion/poc-just/web/node_modules/retry/equation.gif",
     "Untitled.canvas"
