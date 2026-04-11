@@ -1,208 +1,268 @@
-# Enum and Immutability: Transaction Analytics
+# Enum and Immutability: Building a Data Analytics Pipeline
 
-**Project**: `payments_cli` — a CLI tool that processes payment transactions
-
----
-
-## Project context
-
-You are building `payments_cli`, a CLI tool that processes payment transactions from CSV
-files, validates them, applies business rules, and produces ledger reports.
-
-This exercise implements an `Analytics` module that computes analytics over transaction
-lists: revenue statistics, top merchants by volume, daily summaries, and suspicious
-pattern detection. The focus is on why immutability and eager evaluation have concrete
-consequences in a production system, and how the `Enum` module is the primary tool for
-all these operations.
+**Project**: `analytics` — an event log processor that groups, reduces, sorts, and filters using Enum
 
 ---
 
-## Why immutability matters for analytics — not just correctness
+## Why immutability changes how you think about data
 
-In a mutable language, this code is dangerous:
+In Java or Python, you mutate objects in place: `list.sort()`, `map.put(k, v)`,
+`user.setName("Alice")`. In Elixir, every operation returns a new value. The
+original is never modified.
 
-```python
-# Python — dangerous
-def top_merchants(transactions):
-    transactions.sort(key=lambda t: t['amount'], reverse=True)  # mutates input!
-    return [t['merchant'] for t in transactions[:5]]
-```
+This is not a limitation — it is a guarantee:
 
-Calling `top_merchants(txs)` changes the order of `txs` for every subsequent caller.
-In Elixir, `Enum.sort/2` returns a new list. The original `txs` is never touched.
+1. **No defensive copying**: you can pass data to any function without fear of mutation
+2. **Concurrent safety**: immutable data can be shared across processes without locks
+3. **Time travel debugging**: every intermediate value still exists until GC collects it
 
-This is not just a correctness guarantee — it enables safe concurrency. Multiple
-processes can read the same transaction list simultaneously without locks because
-no process can modify the data. This is the foundation of Elixir's concurrency model.
-
-The practical implication for analytics: you can pass the same transaction list through
-ten different `Enum` pipelines in parallel and each produces its own result without
-interfering with the others.
+The `Enum` module is the primary tool for transforming immutable collections. It
+provides 70+ functions that cover virtually every collection operation. Understanding
+when to use `map`, `reduce`, `filter`, `group_by`, and `flat_map` — and how to
+compose them — is essential for writing production Elixir.
 
 ---
 
 ## The business problem
 
-The `Analytics` module needs to:
+Your analytics system receives event logs as lists of maps. You need to:
 
-1. Compute revenue statistics (total, average, percentiles)
-2. Find the top N merchants by transaction volume
-3. Build a per-day summary grouped by date
-4. Identify suspicious patterns (multiple large transactions from same merchant)
+1. Filter events by type, date range, and custom predicates
+2. Group events by user, action, or time bucket
+3. Aggregate metrics (counts, sums, averages) per group
+4. Sort results by various criteria
+5. Build summary reports combining multiple transformations
 
 ---
 
 ## Implementation
 
-### `lib/payments_cli/analytics.ex`
-
-Each function follows the same pattern: filter to approved transactions, transform
-the data, aggregate. The filtering step is repeated in each function because each
-function is independent and pure — it does not depend on shared state or a pre-filtered
-list. This is the trade-off of immutability: slight redundancy in exchange for
-complete independence between functions.
+### `lib/analytics.ex`
 
 ```elixir
-defmodule PaymentsCli.Analytics do
+defmodule Analytics do
   @moduledoc """
-  Computes analytics and reports over transaction lists.
+  Event log analytics using Enum transformations on immutable data.
 
-  All functions are pure — no side effects, no mutation. The same transaction
-  list can be passed to multiple functions and each produces independent results.
-
-  Uses Enum (eager) throughout. Switch to Stream for datasets > 1M transactions
-  where intermediate list allocations become a memory concern.
+  All functions are pure — they take data in and return data out.
+  No state mutation, no side effects, no database calls.
   """
 
-  @doc """
-  Computes revenue statistics for a list of approved transactions.
+  @type event :: %{
+          id: String.t(),
+          user_id: String.t(),
+          action: String.t(),
+          timestamp: DateTime.t(),
+          metadata: map()
+        }
 
-  Returns a map with :total, :count, :average, :min, :max.
-  Returns {:error, :no_approved_transactions} if no approved transactions exist.
+  @type metric :: %{
+          group: term(),
+          count: non_neg_integer(),
+          events: [event()]
+        }
+
+  @doc """
+  Filters events by a predicate function.
+
+  The predicate receives an event and returns a boolean.
 
   ## Examples
 
-      iex> txs = [
-      ...>   %{status: :approved, amount_cents: 1000},
-      ...>   %{status: :approved, amount_cents: 3000},
-      ...>   %{status: :declined, amount_cents: 500}
-      ...> ]
-      iex> PaymentsCli.Analytics.revenue_stats(txs)
-      {:ok, %{total: 4000, count: 2, average: 2000, min: 1000, max: 3000}}
+      iex> events = [%{action: "click", user_id: "u1"}, %{action: "view", user_id: "u2"}]
+      iex> Analytics.filter_by(events, fn e -> e.action == "click" end)
+      [%{action: "click", user_id: "u1"}]
 
   """
-  @spec revenue_stats([map()]) :: {:ok, map()} | {:error, :no_approved_transactions}
-  def revenue_stats(transactions) when is_list(transactions) do
-    amounts =
-      transactions
-      |> Enum.filter(fn tx -> tx.status == :approved end)
-      |> Enum.map(fn tx -> tx.amount_cents end)
-
-    case amounts do
-      [] ->
-        {:error, :no_approved_transactions}
-
-      _ ->
-        total = Enum.sum(amounts)
-        count = length(amounts)
-
-        {:ok, %{
-          total: total,
-          count: count,
-          average: div(total, count),
-          min: Enum.min(amounts),
-          max: Enum.max(amounts)
-        }}
-    end
+  @spec filter_by([event()], (event() -> boolean())) :: [event()]
+  def filter_by(events, predicate) when is_list(events) and is_function(predicate, 1) do
+    Enum.filter(events, predicate)
   end
 
   @doc """
-  Returns the top N merchants by total transaction amount (approved only).
-
-  Sorted descending by total amount. Ties broken alphabetically by merchant name.
+  Groups events by a key function and returns a map of group => events.
 
   ## Examples
 
-      iex> txs = [
-      ...>   %{status: :approved, merchant: "Shop A", amount_cents: 1000},
-      ...>   %{status: :approved, merchant: "Shop B", amount_cents: 3000},
-      ...>   %{status: :approved, merchant: "Shop A", amount_cents: 500}
+      iex> events = [
+      ...>   %{action: "click", user_id: "u1"},
+      ...>   %{action: "view", user_id: "u1"},
+      ...>   %{action: "click", user_id: "u2"}
       ...> ]
-      iex> PaymentsCli.Analytics.top_merchants(txs, 2)
-      [{"Shop B", 3000}, {"Shop A", 1500}]
+      iex> groups = Analytics.group_by_key(events, fn e -> e.action end)
+      iex> length(groups["click"])
+      2
+      iex> length(groups["view"])
+      1
 
   """
-  @spec top_merchants([map()], pos_integer()) :: [{String.t(), integer()}]
-  def top_merchants(transactions, n) when is_list(transactions) and is_integer(n) and n > 0 do
-    transactions
-    |> Enum.filter(fn tx -> tx.status == :approved end)
-    |> Enum.group_by(fn tx -> tx.merchant end)
-    |> Enum.map(fn {merchant, txs} ->
-      {merchant, txs |> Enum.map(& &1.amount_cents) |> Enum.sum()}
+  @spec group_by_key([event()], (event() -> term())) :: %{term() => [event()]}
+  def group_by_key(events, key_fn) when is_list(events) and is_function(key_fn, 1) do
+    Enum.group_by(events, key_fn)
+  end
+
+  @doc """
+  Counts events per group.
+
+  Returns a list of {group_key, count} tuples sorted by count descending.
+
+  ## Examples
+
+      iex> events = [
+      ...>   %{action: "click", user_id: "u1"},
+      ...>   %{action: "click", user_id: "u2"},
+      ...>   %{action: "view", user_id: "u1"}
+      ...> ]
+      iex> Analytics.count_by(events, fn e -> e.action end)
+      [{"click", 2}, {"view", 1}]
+
+  """
+  @spec count_by([event()], (event() -> term())) :: [{term(), non_neg_integer()}]
+  def count_by(events, key_fn) when is_list(events) and is_function(key_fn, 1) do
+    events
+    |> Enum.group_by(key_fn)
+    |> Enum.map(fn {key, group} -> {key, length(group)} end)
+    |> Enum.sort_by(fn {_key, count} -> count end, :desc)
+  end
+
+  @doc """
+  Computes aggregate metrics per group.
+
+  For each group, returns the count, and the list of events.
+
+  ## Examples
+
+      iex> events = [
+      ...>   %{action: "purchase", user_id: "u1", metadata: %{amount: 100}},
+      ...>   %{action: "purchase", user_id: "u1", metadata: %{amount: 200}},
+      ...>   %{action: "purchase", user_id: "u2", metadata: %{amount: 50}}
+      ...> ]
+      iex> metrics = Analytics.aggregate(events, fn e -> e.user_id end)
+      iex> Enum.find(metrics, fn m -> m.group == "u1" end).count
+      2
+
+  """
+  @spec aggregate([event()], (event() -> term())) :: [metric()]
+  def aggregate(events, group_fn) when is_list(events) and is_function(group_fn, 1) do
+    events
+    |> Enum.group_by(group_fn)
+    |> Enum.map(fn {group, group_events} ->
+      %{
+        group: group,
+        count: length(group_events),
+        events: group_events
+      }
     end)
-    |> Enum.sort_by(fn {merchant, total} -> {-total, merchant} end)
+    |> Enum.sort_by(fn m -> m.count end, :desc)
+  end
+
+  @doc """
+  Sums a numeric field from event metadata across all events.
+
+  Uses Enum.reduce/3 — the most general Enum function. Any Enum
+  operation can be expressed as a reduce.
+
+  ## Examples
+
+      iex> events = [
+      ...>   %{metadata: %{amount: 100}},
+      ...>   %{metadata: %{amount: 200}},
+      ...>   %{metadata: %{amount: 50}}
+      ...> ]
+      iex> Analytics.sum_field(events, [:metadata, :amount])
+      350
+
+  """
+  @spec sum_field([map()], [atom()]) :: number()
+  def sum_field(events, field_path) when is_list(events) and is_list(field_path) do
+    Enum.reduce(events, 0, fn event, acc ->
+      value = get_in(event, field_path) || 0
+      acc + value
+    end)
+  end
+
+  @doc """
+  Returns the top N events sorted by a comparator function.
+
+  ## Examples
+
+      iex> events = [
+      ...>   %{metadata: %{amount: 50}},
+      ...>   %{metadata: %{amount: 300}},
+      ...>   %{metadata: %{amount: 100}}
+      ...> ]
+      iex> top = Analytics.top_n(events, 2, fn e -> e.metadata.amount end)
+      iex> length(top)
+      2
+      iex> hd(top).metadata.amount
+      300
+
+  """
+  @spec top_n([event()], non_neg_integer(), (event() -> term())) :: [event()]
+  def top_n(events, n, sort_fn) when is_list(events) and is_integer(n) do
+    events
+    |> Enum.sort_by(sort_fn, :desc)
     |> Enum.take(n)
   end
 
   @doc """
-  Groups transactions by date string and sums amounts per day.
+  Builds a full analytics report from raw events.
 
-  Transactions must have a :date field (string "YYYY-MM-DD").
-  Returns a map %{date_string => total_cents}.
+  Demonstrates composing multiple Enum operations into a single
+  data transformation pipeline.
+
+  Returns a map with:
+    - `:total_events` — total event count
+    - `:by_action` — count per action type
+    - `:by_user` — count per user
+    - `:total_amount` — sum of metadata.amount across all events
 
   ## Examples
 
-      iex> txs = [
-      ...>   %{date: "2024-01-15", amount_cents: 1000, status: :approved},
-      ...>   %{date: "2024-01-15", amount_cents: 500,  status: :approved},
-      ...>   %{date: "2024-01-16", amount_cents: 2000, status: :approved}
+      iex> events = [
+      ...>   %{id: "1", action: "purchase", user_id: "u1", timestamp: ~U[2024-01-01 00:00:00Z], metadata: %{amount: 100}},
+      ...>   %{id: "2", action: "purchase", user_id: "u2", timestamp: ~U[2024-01-01 01:00:00Z], metadata: %{amount: 200}},
+      ...>   %{id: "3", action: "view", user_id: "u1", timestamp: ~U[2024-01-01 02:00:00Z], metadata: %{}}
       ...> ]
-      iex> PaymentsCli.Analytics.daily_totals(txs)
-      %{"2024-01-15" => 1500, "2024-01-16" => 2000}
+      iex> report = Analytics.build_report(events)
+      iex> report.total_events
+      3
+      iex> report.total_amount
+      300
 
   """
-  @spec daily_totals([map()]) :: %{String.t() => integer()}
-  def daily_totals(transactions) when is_list(transactions) do
-    transactions
-    |> Enum.filter(fn tx -> tx.status == :approved end)
-    |> Enum.group_by(fn tx -> tx.date end)
-    |> Enum.map(fn {date, txs} ->
-      {date, txs |> Enum.map(& &1.amount_cents) |> Enum.sum()}
-    end)
-    |> Map.new()
+  @spec build_report([event()]) :: map()
+  def build_report(events) when is_list(events) do
+    %{
+      total_events: length(events),
+      by_action: count_by(events, fn e -> e.action end),
+      by_user: count_by(events, fn e -> e.user_id end),
+      total_amount: sum_field(events, [:metadata, :amount])
+    }
   end
 
   @doc """
-  Finds merchants with suspiciously many large transactions.
+  Demonstrates the difference between Enum (eager) and Stream (lazy).
 
-  "Suspicious" means: same merchant has >= threshold_count transactions
-  where each transaction amount_cents > large_amount_threshold.
+  For small datasets, Enum is faster (no overhead from lazy evaluation).
+  For large datasets or when you only need the first N results,
+  Stream avoids building intermediate collections.
 
-  Returns a list of suspicious merchant names.
-
-  ## Examples
-
-      iex> txs = [
-      ...>   %{merchant: "Casino", amount_cents: 50_000, status: :approved},
-      ...>   %{merchant: "Casino", amount_cents: 60_000, status: :approved},
-      ...>   %{merchant: "Casino", amount_cents: 55_000, status: :approved},
-      ...>   %{merchant: "Coffee", amount_cents: 500,    status: :approved}
-      ...> ]
-      iex> PaymentsCli.Analytics.suspicious_merchants(txs, 3, 10_000)
-      ["Casino"]
-
+  This function shows both approaches for comparison.
   """
-  @spec suspicious_merchants([map()], pos_integer(), pos_integer()) :: [String.t()]
-  def suspicious_merchants(transactions, threshold_count, large_amount_threshold)
-      when is_list(transactions) and is_integer(threshold_count) and
-             is_integer(large_amount_threshold) do
-    transactions
-    |> Enum.filter(fn tx ->
-      tx.status == :approved and tx.amount_cents > large_amount_threshold
-    end)
-    |> Enum.group_by(fn tx -> tx.merchant end)
-    |> Enum.filter(fn {_merchant, txs} -> length(txs) >= threshold_count end)
-    |> Enum.map(fn {merchant, _txs} -> merchant end)
+  @spec unique_users_eager([event()]) :: [String.t()]
+  def unique_users_eager(events) do
+    events
+    |> Enum.map(fn e -> e.user_id end)
+    |> Enum.uniq()
+    |> Enum.sort()
+  end
+
+  @spec unique_users_lazy([event()]) :: [String.t()]
+  def unique_users_lazy(events) do
+    events
+    |> Stream.map(fn e -> e.user_id end)
+    |> Stream.uniq()
     |> Enum.sort()
   end
 end
@@ -210,124 +270,120 @@ end
 
 **Why this works:**
 
-- `revenue_stats/1` filters to approved transactions, extracts amounts, then computes
-  all statistics in a single scope. The empty case is handled explicitly — calling
-  `Enum.min/1` on an empty list raises, so we check first. `div(total, count)` gives
-  integer division for the average, which is appropriate for cent-denominated amounts.
-
-- `top_merchants/2` chains filter -> group -> map -> sort -> take. The sort key
-  `{-total, merchant}` sorts by total descending (negative for descending) and
-  alphabetically by name for ties. `Enum.take/2` returns at most `n` elements,
-  handling the case where fewer merchants exist.
-
-- `daily_totals/1` filters to approved, groups by date, maps each group to a
-  `{date, sum}` tuple, then builds a map with `Map.new/1`. The result is a flat
-  `%{date => total}` map.
-
-- `suspicious_merchants/3` filters on two conditions (approved AND large amount),
-  groups by merchant, filters groups by count threshold, extracts names, and sorts
-  for deterministic output. The sort ensures test assertions work regardless of
-  map iteration order.
+- Every function takes data in and returns data out. No mutation. The original
+  `events` list is never modified — each transformation creates a new list.
+- `count_by/2` composes `Enum.group_by/2` -> `Enum.map/2` -> `Enum.sort_by/3`.
+  Each step transforms the data shape without mutating the previous result.
+- `sum_field/2` uses `Enum.reduce/3`, which is the Swiss army knife of Enum.
+  Any Enum operation can be expressed as a reduce. When none of the specialized
+  functions (`map`, `filter`, `group_by`) fit, reach for `reduce`.
+- `build_report/1` calls multiple analytics functions on the same input. Because
+  the input is immutable, there is no risk of one function's result affecting
+  another's input.
 
 ### Tests
 
 ```elixir
-# test/payments_cli/analytics_test.exs
-defmodule PaymentsCli.AnalyticsTest do
+# test/analytics_test.exs
+defmodule AnalyticsTest do
   use ExUnit.Case, async: true
 
-  alias PaymentsCli.Analytics
+  doctest Analytics
 
-  @transactions [
-    %{id: "T1", status: :approved, merchant: "Coffee Co",  amount_cents: 450,    date: "2024-01-15"},
-    %{id: "T2", status: :approved, merchant: "Gas Station", amount_cents: 8000,   date: "2024-01-15"},
-    %{id: "T3", status: :declined, merchant: "Coffee Co",  amount_cents: 300,    date: "2024-01-15"},
-    %{id: "T4", status: :approved, merchant: "Coffee Co",  amount_cents: 520,    date: "2024-01-16"},
-    %{id: "T5", status: :approved, merchant: "Gas Station", amount_cents: 7500,   date: "2024-01-16"},
-    %{id: "T6", status: :approved, merchant: "Supermarket", amount_cents: 15000,  date: "2024-01-16"}
+  @events [
+    %{id: "1", action: "purchase", user_id: "u1", timestamp: ~U[2024-01-01 10:00:00Z], metadata: %{amount: 100}},
+    %{id: "2", action: "purchase", user_id: "u2", timestamp: ~U[2024-01-01 11:00:00Z], metadata: %{amount: 250}},
+    %{id: "3", action: "view", user_id: "u1", timestamp: ~U[2024-01-01 12:00:00Z], metadata: %{}},
+    %{id: "4", action: "click", user_id: "u3", timestamp: ~U[2024-01-01 13:00:00Z], metadata: %{}},
+    %{id: "5", action: "purchase", user_id: "u1", timestamp: ~U[2024-01-01 14:00:00Z], metadata: %{amount: 75}}
   ]
 
-  describe "revenue_stats/1" do
-    test "computes stats for approved transactions only" do
-      assert {:ok, stats} = Analytics.revenue_stats(@transactions)
-      # T3 is declined — excluded
-      assert stats.count == 5
-      # 450 + 8000 + 520 + 7500 + 15000 = 31470
-      assert stats.total == 31_470
-      assert stats.min == 450
-      assert stats.max == 15_000
-    end
-
-    test "returns error for empty list" do
-      assert {:error, :no_approved_transactions} = Analytics.revenue_stats([])
-    end
-
-    test "returns error when all transactions are declined" do
-      declined = [%{status: :declined, amount_cents: 100}]
-      assert {:error, :no_approved_transactions} = Analytics.revenue_stats(declined)
-    end
-
-    test "does not mutate the original list" do
-      original_count = length(@transactions)
-      Analytics.revenue_stats(@transactions)
-      assert length(@transactions) == original_count
-    end
-  end
-
-  describe "top_merchants/2" do
-    test "returns top N merchants by total amount" do
-      result = Analytics.top_merchants(@transactions, 2)
-      assert length(result) == 2
-      # Gas Station: 8000 + 7500 = 15500
-      # Supermarket: 15000
-      # Coffee Co: 450 + 520 = 970
-      [{top_merchant, top_total} | _] = result
-      # Either Gas Station or Supermarket could be first — check both candidates
-      assert top_total >= 15_000
-    end
-
-    test "excludes declined transactions" do
-      declined_only = [%{status: :declined, merchant: "Evil Co", amount_cents: 999_999}]
-      result = Analytics.top_merchants(declined_only, 5)
-      assert result == []
-    end
-
-    test "returns fewer than N when not enough merchants" do
-      result = Analytics.top_merchants(@transactions, 100)
-      # Only 3 unique merchants with approved transactions
+  describe "filter_by/2" do
+    test "filters events by predicate" do
+      result = Analytics.filter_by(@events, fn e -> e.action == "purchase" end)
       assert length(result) == 3
     end
-  end
 
-  describe "daily_totals/1" do
-    test "groups and sums by date" do
-      totals = Analytics.daily_totals(@transactions)
-      # 2024-01-15: 450 + 8000 = 8450 (T3 declined)
-      assert totals["2024-01-15"] == 8_450
-      # 2024-01-16: 520 + 7500 + 15000 = 23020
-      assert totals["2024-01-16"] == 23_020
-    end
-
-    test "returns empty map for empty input" do
-      assert Analytics.daily_totals([]) == %{}
-    end
-  end
-
-  describe "suspicious_merchants/3" do
-    test "finds merchants with many large transactions" do
-      txs = [
-        %{merchant: "Casino", amount_cents: 50_000, status: :approved},
-        %{merchant: "Casino", amount_cents: 60_000, status: :approved},
-        %{merchant: "Casino", amount_cents: 55_000, status: :approved},
-        %{merchant: "Coffee", amount_cents: 500,    status: :approved}
-      ]
-      result = Analytics.suspicious_merchants(txs, 3, 10_000)
-      assert result == ["Casino"]
-    end
-
-    test "returns empty list when no merchants meet threshold" do
-      result = Analytics.suspicious_merchants(@transactions, 10, 1_000)
+    test "returns empty list when nothing matches" do
+      result = Analytics.filter_by(@events, fn e -> e.action == "nonexistent" end)
       assert result == []
+    end
+  end
+
+  describe "group_by_key/2" do
+    test "groups by action" do
+      groups = Analytics.group_by_key(@events, fn e -> e.action end)
+      assert length(groups["purchase"]) == 3
+      assert length(groups["view"]) == 1
+      assert length(groups["click"]) == 1
+    end
+
+    test "groups by user" do
+      groups = Analytics.group_by_key(@events, fn e -> e.user_id end)
+      assert length(groups["u1"]) == 3
+      assert length(groups["u2"]) == 1
+    end
+  end
+
+  describe "count_by/2" do
+    test "counts and sorts descending" do
+      result = Analytics.count_by(@events, fn e -> e.action end)
+      assert [{"purchase", 3}, {"click", 1}, {"view", 1}] = result
+    end
+  end
+
+  describe "aggregate/2" do
+    test "returns metrics per group" do
+      metrics = Analytics.aggregate(@events, fn e -> e.user_id end)
+      u1 = Enum.find(metrics, fn m -> m.group == "u1" end)
+      assert u1.count == 3
+    end
+  end
+
+  describe "sum_field/2" do
+    test "sums nested field" do
+      assert Analytics.sum_field(@events, [:metadata, :amount]) == 425
+    end
+
+    test "handles missing values as zero" do
+      events = [%{metadata: %{}}, %{metadata: %{amount: 100}}]
+      assert Analytics.sum_field(events, [:metadata, :amount]) == 100
+    end
+  end
+
+  describe "top_n/3" do
+    test "returns top N by sort function" do
+      top = Analytics.top_n(@events, 2, fn e -> e.metadata[:amount] || 0 end)
+      assert length(top) == 2
+      amounts = Enum.map(top, fn e -> e.metadata[:amount] || 0 end)
+      assert hd(amounts) >= List.last(amounts)
+    end
+  end
+
+  describe "build_report/1" do
+    test "builds complete report" do
+      report = Analytics.build_report(@events)
+      assert report.total_events == 5
+      assert report.total_amount == 425
+      assert is_list(report.by_action)
+      assert is_list(report.by_user)
+    end
+  end
+
+  describe "immutability" do
+    test "original data is not modified by operations" do
+      original = @events
+      _filtered = Analytics.filter_by(@events, fn e -> e.action == "purchase" end)
+      _sorted = Analytics.top_n(@events, 2, fn e -> e.metadata[:amount] || 0 end)
+      assert original == @events
+    end
+  end
+
+  describe "lazy vs eager" do
+    test "both approaches return same result" do
+      eager = Analytics.unique_users_eager(@events)
+      lazy = Analytics.unique_users_lazy(@events)
+      assert eager == lazy
     end
   end
 end
@@ -336,68 +392,73 @@ end
 ### Run the tests
 
 ```bash
-mix test test/payments_cli/analytics_test.exs --trace
+mix test --trace
 ```
 
 ---
 
-## Trade-off analysis
+## Lazy vs eager: when to use Stream
 
-| Aspect | Enum (eager, your impl) | Stream (lazy) | Manual recursion |
-|--------|------------------------|---------------|-----------------|
-| Memory | Intermediate lists allocated | No intermediate lists | Controlled by accumulator |
-| When to prefer | Datasets < 1M rows, simple pipelines | Very large datasets, IO-bound | Complex custom logic |
-| Debugging | `IO.inspect/2` after any step | Need to materialize first | Trace in function head |
-| Parallelism | `Task.async_stream` wraps Enum | `Stream` + `Task` | Explicit |
-| Code clarity | Most readable | Good for generators | Most control |
+```elixir
+# Eager (Enum) — builds a new list at each step
+result =
+  huge_list
+  |> Enum.map(&transform/1)      # Allocates new list
+  |> Enum.filter(&valid?/1)      # Allocates new list
+  |> Enum.take(10)               # Only needed 10!
 
-Reflection question: `revenue_stats/1` makes three passes over the approved transactions
-list (filter, then map, then multiple Enum calls). Could you compute total, min, max,
-and count in a single `Enum.reduce/3`? Write it. When would the single-pass version
-be meaningfully faster?
+# Lazy (Stream) — builds computation, runs once at the end
+result =
+  huge_list
+  |> Stream.map(&transform/1)    # No allocation yet
+  |> Stream.filter(&valid?/1)    # No allocation yet
+  |> Enum.take(10)               # Processes only until 10 found
+```
+
+Use `Stream` when:
+- The input is very large (millions of elements)
+- You only need a subset of results (`.take(n)`)
+- You want to compose transformations without intermediate allocations
+
+Use `Enum` when:
+- The dataset fits comfortably in memory
+- You need the full result
+- Performance is not critical (Enum has less overhead per operation)
 
 ---
 
 ## Common production mistakes
 
-**1. `Enum.each/2` when you want `Enum.map/2`**
-`Enum.each/2` always returns `:ok` — the transformed values are discarded.
-If you compute `Enum.each(txs, fn tx -> tx.amount_cents * 2 end)`, the doubled
-amounts are lost. Use `Enum.map/2` when you need the results.
-
-**2. `Enum.sort/1` on maps sorts by key/value tuples, not by a field**
+**1. Multiple passes when one reduce suffices**
 ```elixir
-# WRONG — sorts maps by {key, value} tuple order, not by :amount_cents
-Enum.sort(transactions)
+# Bad — three passes over the data
+count = Enum.count(events)
+sum = Enum.sum(Enum.map(events, & &1.amount))
+max = Enum.max_by(events, & &1.amount)
 
-# CORRECT — sort by a specific field
-Enum.sort_by(transactions, fn tx -> tx.amount_cents end, :desc)
+# Good — one pass
+{count, sum, max} = Enum.reduce(events, {0, 0, nil}, fn e, {c, s, m} ->
+  {c + 1, s + e.amount, if(m == nil or e.amount > m.amount, do: e, else: m)}
+end)
 ```
 
-**3. Chained `Enum` on very large datasets**
-Five `Enum` operations on a 1M-element list creates five intermediate lists,
-each 1M elements. Switch to `Stream` for lazy evaluation when intermediate
-allocations become a memory concern. The change is mechanical: replace `Enum.`
-with `Stream.` and add `|> Enum.to_list()` at the end.
+**2. Using `Enum.count/1` to check emptiness**
+`Enum.count(list) > 0` is O(n). `list != []` or `match?([_ | _], list)` is O(1).
 
-**4. `Enum.group_by/2` and expecting sorted keys**
-`Enum.group_by/2` returns a map. Maps do not guarantee key order. Always sort
-the keys explicitly when the order matters for output: `Map.keys(groups) |> Enum.sort()`.
+**3. Forgetting that `Enum.sort/1` is not stable in all cases**
+Elixir's sort is stable (preserves relative order of equal elements), but
+`Enum.sort_by/3` with a key function that maps multiple elements to the same
+key preserves their original relative order.
 
-**5. Using `Enum.count/1` when pattern already filters**
-```elixir
-# Inefficient: builds filtered list then counts it
-Enum.count(Enum.filter(txs, &(&1.status == :approved)))
-
-# Efficient: Enum.count/2 with predicate — single pass
-Enum.count(txs, fn tx -> tx.status == :approved end)
-```
+**4. Mutating accumulators in reduce (impossible but attempted)**
+Coming from JavaScript, you might write `Map.put(acc, key, value)` thinking
+you are mutating `acc`. You are not — `Map.put` returns a new map. This is
+correct but sometimes confusing.
 
 ---
 
 ## Resources
 
-- [Enum — HexDocs](https://hexdocs.pm/elixir/Enum.html) — especially `group_by/2`, `sort_by/3`, `reduce/3`
-- [Stream — HexDocs](https://hexdocs.pm/elixir/Stream.html) — when to switch from Enum
-- [Elixir School — Enum](https://elixirschool.com/en/lessons/basics/enum)
-- [Elixir in Action — Chapter 4: data abstractions](https://www.manning.com/books/elixir-in-action-third-edition)
+- [Enum — HexDocs](https://hexdocs.pm/elixir/Enum.html)
+- [Stream — HexDocs](https://hexdocs.pm/elixir/Stream.html)
+- [Enumerables and Streams — Elixir Getting Started](https://elixir-lang.org/getting-started/enumerables-and-streams.html)
