@@ -1,458 +1,496 @@
-# Structs and Basic Validation: Formalizing the Transaction Type
+# Structs and Validation: Building a Type-Safe Domain Model
 
-**Project**: `payments_cli` — a CLI tool that processes payment transactions
-
----
-
-## Project context
-
-You are building `payments_cli`, a CLI tool that processes payment transactions from CSV
-files, validates them, applies business rules, and produces ledger reports.
-
-This exercise implements a `Transaction` struct with a validated constructor, status
-management, and formatting. Instead of passing transaction data as plain maps
-(`%{id: "T1", status: :approved, amount_cents: 1000}`), a struct declares the exact
-fields at compile time, provides defaults, and enables pattern matching by type. This
-gives the entire project a stable, documented contract for what a transaction is.
+**Project**: `user_schema` — a domain model with enforced keys, custom constructors, and Ecto-changeset-style validation without Ecto
 
 ---
 
 ## Why structs are an architectural decision, not syntax sugar
 
 Plain maps work for passing data around, but they have a critical weakness: nothing
-prevents a caller from passing `%{id: "T1", amount: 1000}` (forgetting `amount_cents`)
-or `%{status: "approved"}` (wrong type for status). The compiler cannot help — it has
-no idea what shape a "transaction" should have.
+prevents a caller from passing `%{nme: "Alice"}` (typo in key) or `%{age: "thirty"}`
+(wrong type). The compiler cannot help — it has no idea what shape a "user" should have.
 
 A struct changes that:
 
-1. **Compile-time field enforcement**: `%PaymentsCli.Transaction{nonexistent: 1}` is a
-   compile error. With maps, `%{nonexistent: 1}` silently creates an unintended key.
-
-2. **Pattern matching by type**: `def process(%Transaction{} = tx)` will raise at
-   runtime if the caller passes a plain map. The function signature becomes a contract
-   enforced at the call boundary.
-
-3. **`@spec` alignment**: type specs can reference `%Transaction{}` rather than `map()`,
+1. **Compile-time field enforcement**: `%User{nonexistent: 1}` is a compile error.
+   With maps, `%{nonexistent: 1}` silently creates an unintended key.
+2. **Pattern matching by type**: `def process(%User{} = user)` will raise at runtime
+   if the caller passes a plain map. The function signature becomes a contract.
+3. **@spec alignment**: type specs can reference `%User{}` rather than `map()`,
    enabling Dialyzer to catch misuse.
+4. **Defaults are documented in the code**: `defstruct role: :user` documents the
+   default at the definition site.
 
-4. **Defaults are documented in the code**: `defstruct amount_cents: 0` documents the
-   default at the definition site, not scattered across callers.
-
-The trade-off: structs are more rigid. If you need a general key-value bag (arbitrary
-keys, flexible shape), a map is correct. When the shape is known and fixed — a domain
-entity like a transaction — a struct is the right tool.
+The trade-off: structs are more rigid. If you need a general key-value bag, a map
+is correct. When the shape is known and fixed — a domain entity — a struct is right.
 
 ---
 
 ## The business problem
 
-The `Transaction` module needs:
+Build a user domain model that:
 
-1. A `defstruct` that declares all transaction fields with appropriate defaults
-2. A validated `new/1` constructor that checks required fields and value constraints
-3. Functions that leverage pattern matching by struct type (`approved?/1`, `set_status/2`)
-4. A formatting function that extracts data from the struct
+1. Declares all fields with `defstruct` and `@enforce_keys`
+2. Provides a validated `new/1` constructor (like Ecto changesets, without Ecto)
+3. Supports field-level validation with custom error messages
+4. Provides an `update/2` function that re-validates after changes
+5. Implements a changeset-style API: apply changes, collect errors, accept or reject
 
 ---
 
 ## Implementation
 
-### `lib/payments_cli/transaction.ex`
-
-The struct uses `@enforce_keys` for required fields and provides defaults for
-optional fields. The `new/1` constructor validates required fields are present
-before building the struct, then runs validation on the built struct. This two-step
-approach catches both missing fields and invalid values.
-
-`approved?/1` and `set_status/2` pattern-match on `%__MODULE__{}` in their function
-heads — they only accept Transaction structs, not plain maps. This is type safety
-enforced at the function boundary.
+### `lib/user_schema.ex`
 
 ```elixir
-defmodule PaymentsCli.Transaction do
+defmodule UserSchema do
   @moduledoc """
-  Typed representation of a payment transaction.
+  Type-safe user domain model with validated construction.
 
-  Use `new/1` to create validated transactions.
-  All processing functions in payments_cli accept `%Transaction{}` structs.
-
-  ## Examples
-
-      iex> {:ok, tx} = PaymentsCli.Transaction.new(id: "T1", amount_cents: 1000, currency: "USD")
-      iex> tx.status
-      :pending
-
+  Uses @enforce_keys for required fields, a custom new/1 constructor
+  with validation, and an update/2 function that re-validates.
+  This is the pattern used in production Elixir code before you
+  introduce Ecto — and sometimes instead of it.
   """
 
-  @enforce_keys [:id, :amount_cents, :currency]
+  @enforce_keys [:email, :name]
   defstruct [
-    :id,
-    :amount_cents,
-    :currency,
-    status: :pending,
-    merchant: nil,
-    date: nil,
-    reference: nil
+    :email,
+    :name,
+    :phone,
+    age: nil,
+    role: :user,
+    active: true,
+    metadata: %{}
   ]
 
   @type t :: %__MODULE__{
-    id: String.t(),
-    amount_cents: non_neg_integer(),
-    currency: String.t(),
-    status: :pending | :approved | :declined | :flagged,
-    merchant: String.t() | nil,
-    date: String.t() | nil,
-    reference: String.t() | nil
-  }
+          email: String.t(),
+          name: String.t(),
+          phone: String.t() | nil,
+          age: pos_integer() | nil,
+          role: :user | :admin | :moderator,
+          active: boolean(),
+          metadata: map()
+        }
 
-  @valid_statuses [:pending, :approved, :declined, :reversed, :flagged]
-
-  @doc """
-  Returns the list of valid transaction statuses.
-  """
-  @spec valid_statuses() :: [atom()]
-  def valid_statuses, do: @valid_statuses
+  @valid_roles [:user, :admin, :moderator]
 
   @doc """
-  Classifies a transaction status atom into a reporting category string.
+  Creates a validated User struct from a keyword list or map.
+
+  Returns {:ok, %UserSchema{}} on success, {:error, errors} on failure.
+  Errors is a map of field => [error_messages].
 
   ## Examples
 
-      iex> PaymentsCli.Transaction.classify_status(:approved)
-      "successful"
+      iex> {:ok, user} = UserSchema.new(email: "alice@example.com", name: "Alice")
+      iex> user.role
+      :user
 
-      iex> PaymentsCli.Transaction.classify_status(:declined)
-      "failed"
-
-      iex> PaymentsCli.Transaction.classify_status(:flagged)
-      "under_review"
-
-  """
-  @spec classify_status(atom()) :: String.t()
-  def classify_status(:approved), do: "successful"
-  def classify_status(:reversed), do: "successful"
-  def classify_status(:declined), do: "failed"
-  def classify_status(:flagged), do: "under_review"
-  def classify_status(:pending), do: "pending"
-  def classify_status(_unknown), do: "unknown"
-
-  @doc """
-  Parses a status string from external input into a status atom.
-
-  ## Examples
-
-      iex> PaymentsCli.Transaction.parse_status("approved")
-      {:ok, :approved}
-
-      iex> PaymentsCli.Transaction.parse_status("hacked_value")
-      {:error, :unknown_status}
-
-  """
-  @spec parse_status(String.t()) :: {:ok, atom()} | {:error, :unknown_status}
-  def parse_status(string) when is_binary(string) do
-    atom =
-      try do
-        String.to_existing_atom(string)
-      rescue
-        ArgumentError -> nil
-      end
-
-    if atom in @valid_statuses do
-      {:ok, atom}
-    else
-      {:error, :unknown_status}
-    end
-  end
-
-  @doc """
-  Creates a validated Transaction struct from a keyword list.
-
-  Required fields: `:id`, `:amount_cents`, `:currency`
-  Optional fields (with defaults): `:status` (`:pending`), `:merchant`, `:date`, `:reference`
-
-  Returns `{:ok, %Transaction{}}` on success, `{:error, reason}` on failure.
-
-  ## Examples
-
-      iex> PaymentsCli.Transaction.new(id: "T1", amount_cents: 500, currency: "USD")
-      {:ok, %PaymentsCli.Transaction{id: "T1", amount_cents: 500, currency: "USD", status: :pending, merchant: nil, date: nil, reference: nil}}
-
-      iex> PaymentsCli.Transaction.new(id: "T1", amount_cents: -1, currency: "USD")
-      {:error, "amount_cents must be >= 0"}
-
-      iex> PaymentsCli.Transaction.new(amount_cents: 500, currency: "USD")
-      {:error, "id is required"}
-
-  """
-  @spec new(keyword()) :: {:ok, t()} | {:error, String.t()}
-  def new(fields) when is_list(fields) do
-    with :ok <- check_required(fields, :id),
-         :ok <- check_required(fields, :amount_cents),
-         :ok <- check_required(fields, :currency) do
-      tx = struct(__MODULE__, fields)
-
-      case validate(tx) do
-        :ok -> {:ok, tx}
-        {:error, reason} -> {:error, reason}
-      end
-    end
-  end
-
-  @doc """
-  Returns true if the transaction has been approved.
-
-  ## Examples
-
-      iex> {:ok, tx} = PaymentsCli.Transaction.new(id: "T1", amount_cents: 100, currency: "USD", status: :approved)
-      iex> PaymentsCli.Transaction.approved?(tx)
+      iex> {:error, errors} = UserSchema.new(email: "", name: "")
+      iex> Map.has_key?(errors, :email)
       true
 
-      iex> {:ok, tx} = PaymentsCli.Transaction.new(id: "T2", amount_cents: 100, currency: "USD")
-      iex> PaymentsCli.Transaction.approved?(tx)
+      iex> {:error, errors} = UserSchema.new([])
+      iex> Map.has_key?(errors, :email)
+      true
+
+  """
+  @spec new(keyword() | map()) :: {:ok, t()} | {:error, map()}
+  def new(attrs) when is_list(attrs) do
+    attrs |> Map.new() |> new()
+  end
+
+  def new(attrs) when is_map(attrs) do
+    changeset = %{
+      email: attrs[:email] || attrs["email"],
+      name: attrs[:name] || attrs["name"],
+      phone: attrs[:phone] || attrs["phone"],
+      age: attrs[:age] || attrs["age"],
+      role: attrs[:role] || attrs["role"] || :user,
+      active: if(Map.has_key?(attrs, :active), do: attrs[:active], else: true),
+      metadata: attrs[:metadata] || attrs["metadata"] || %{}
+    }
+
+    case validate(changeset) do
+      :ok ->
+        {:ok, struct!(__MODULE__, changeset)}
+
+      {:error, errors} ->
+        {:error, errors}
+    end
+  end
+
+  @doc """
+  Updates an existing user with new attributes and re-validates.
+
+  Only the provided fields are updated; others remain unchanged.
+
+  ## Examples
+
+      iex> {:ok, user} = UserSchema.new(email: "alice@example.com", name: "Alice")
+      iex> {:ok, updated} = UserSchema.update(user, name: "Alice Smith")
+      iex> updated.name
+      "Alice Smith"
+      iex> updated.email
+      "alice@example.com"
+
+      iex> {:ok, user} = UserSchema.new(email: "alice@example.com", name: "Alice")
+      iex> {:error, errors} = UserSchema.update(user, email: "")
+      iex> Map.has_key?(errors, :email)
+      true
+
+  """
+  @spec update(t(), keyword() | map()) :: {:ok, t()} | {:error, map()}
+  def update(%__MODULE__{} = user, attrs) when is_list(attrs) do
+    update(user, Map.new(attrs))
+  end
+
+  def update(%__MODULE__{} = user, attrs) when is_map(attrs) do
+    merged = user |> Map.from_struct() |> Map.merge(attrs)
+
+    case validate(merged) do
+      :ok ->
+        {:ok, struct!(__MODULE__, merged)}
+
+      {:error, errors} ->
+        {:error, errors}
+    end
+  end
+
+  @doc """
+  Returns true if the user has admin privileges.
+
+  Pattern matches on the struct in the function head — only accepts
+  UserSchema structs, not plain maps.
+
+  ## Examples
+
+      iex> {:ok, user} = UserSchema.new(email: "a@b.com", name: "A", role: :admin)
+      iex> UserSchema.admin?(user)
+      true
+
+      iex> {:ok, user} = UserSchema.new(email: "a@b.com", name: "A")
+      iex> UserSchema.admin?(user)
       false
 
   """
-  @spec approved?(t()) :: boolean()
-  def approved?(%__MODULE__{status: :approved}), do: true
-  def approved?(%__MODULE__{}), do: false
+  @spec admin?(t()) :: boolean()
+  def admin?(%__MODULE__{role: :admin}), do: true
+  def admin?(%__MODULE__{}), do: false
 
   @doc """
-  Updates the status of a transaction, returning a new struct.
+  Returns true if the user account is active.
+  """
+  @spec active?(t()) :: boolean()
+  def active?(%__MODULE__{active: true}), do: true
+  def active?(%__MODULE__{}), do: false
 
-  Returns `{:error, :invalid_status}` if the status is not a known atom.
+  @doc """
+  Deactivates a user account. Returns a new struct (immutable).
 
   ## Examples
 
-      iex> {:ok, tx} = PaymentsCli.Transaction.new(id: "T1", amount_cents: 100, currency: "USD")
-      iex> {:ok, approved} = PaymentsCli.Transaction.set_status(tx, :approved)
-      iex> approved.status
-      :approved
-
-      iex> {:ok, tx} = PaymentsCli.Transaction.new(id: "T1", amount_cents: 100, currency: "USD")
-      iex> PaymentsCli.Transaction.set_status(tx, :unknown)
-      {:error, :invalid_status}
+      iex> {:ok, user} = UserSchema.new(email: "a@b.com", name: "A")
+      iex> deactivated = UserSchema.deactivate(user)
+      iex> deactivated.active
+      false
 
   """
-  @spec set_status(t(), atom()) :: {:ok, t()} | {:error, :invalid_status}
-  def set_status(%__MODULE__{} = tx, status)
-      when status in [:pending, :approved, :declined, :flagged] do
-    {:ok, %__MODULE__{tx | status: status}}
+  @spec deactivate(t()) :: t()
+  def deactivate(%__MODULE__{} = user) do
+    %__MODULE__{user | active: false}
   end
 
-  def set_status(%__MODULE__{}, _status), do: {:error, :invalid_status}
-
   @doc """
-  Formats the transaction amount as a human-readable dollar string.
+  Adds metadata to a user without overwriting existing keys.
 
   ## Examples
 
-      iex> {:ok, tx} = PaymentsCli.Transaction.new(id: "T1", amount_cents: 15099, currency: "USD")
-      iex> PaymentsCli.Transaction.format_amount(tx)
-      "$150.99"
+      iex> {:ok, user} = UserSchema.new(email: "a@b.com", name: "A", metadata: %{source: "web"})
+      iex> updated = UserSchema.add_metadata(user, %{campaign: "q1"})
+      iex> updated.metadata
+      %{source: "web", campaign: "q1"}
 
   """
-  @spec format_amount(t()) :: String.t()
-  def format_amount(%__MODULE__{amount_cents: cents}) do
-    major = div(cents, 100)
-    minor = rem(cents, 100)
-    "$#{major}.#{minor |> Integer.to_string() |> String.pad_leading(2, "0")}"
+  @spec add_metadata(t(), map()) :: t()
+  def add_metadata(%__MODULE__{metadata: existing} = user, new_meta) when is_map(new_meta) do
+    %__MODULE__{user | metadata: Map.merge(existing, new_meta)}
   end
 
   # ---------------------------------------------------------------------------
-  # Private — validation details are implementation, not public contract
+  # Private — validation
   # ---------------------------------------------------------------------------
 
-  @spec check_required(keyword(), atom()) :: :ok | {:error, String.t()}
-  defp check_required(fields, key) do
-    if Keyword.has_key?(fields, key) do
-      :ok
-    else
-      {:error, "#{key} is required"}
+  @spec validate(map()) :: :ok | {:error, map()}
+  defp validate(changeset) do
+    errors =
+      %{}
+      |> validate_required(changeset, :email)
+      |> validate_required(changeset, :name)
+      |> validate_email_format(changeset)
+      |> validate_age(changeset)
+      |> validate_role(changeset)
+      |> validate_name_length(changeset)
+
+    case errors do
+      empty when map_size(empty) == 0 -> :ok
+      errors -> {:error, errors}
     end
   end
 
-  @spec validate(t()) :: :ok | {:error, String.t()}
-  defp validate(%__MODULE__{amount_cents: cents}) when cents < 0 do
-    {:error, "amount_cents must be >= 0"}
+  @spec validate_required(map(), map(), atom()) :: map()
+  defp validate_required(errors, changeset, field) do
+    value = changeset[field]
+
+    if is_nil(value) or (is_binary(value) and String.trim(value) == "") do
+      add_error(errors, field, "is required")
+    else
+      errors
+    end
   end
 
-  defp validate(%__MODULE__{currency: currency})
-       when not is_binary(currency) or byte_size(currency) == 0 do
-    {:error, "currency must be a non-empty string"}
+  @spec validate_email_format(map(), map()) :: map()
+  defp validate_email_format(errors, %{email: email}) when is_binary(email) do
+    if String.contains?(email, "@") and String.contains?(email, ".") do
+      errors
+    else
+      add_error(errors, :email, "must be a valid email address")
+    end
   end
 
-  defp validate(%__MODULE__{id: id}) when not is_binary(id) or byte_size(id) == 0 do
-    {:error, "id must be a non-empty string"}
+  defp validate_email_format(errors, _changeset), do: errors
+
+  @spec validate_age(map(), map()) :: map()
+  defp validate_age(errors, %{age: nil}), do: errors
+
+  defp validate_age(errors, %{age: age}) when is_integer(age) and age > 0 and age < 150 do
+    errors
   end
 
-  defp validate(%__MODULE__{}), do: :ok
+  defp validate_age(errors, %{age: _age}) do
+    add_error(errors, :age, "must be a positive integer less than 150")
+  end
+
+  @spec validate_role(map(), map()) :: map()
+  defp validate_role(errors, %{role: role}) when role in @valid_roles, do: errors
+
+  defp validate_role(errors, %{role: _role}) do
+    add_error(errors, :role, "must be one of: #{inspect(@valid_roles)}")
+  end
+
+  @spec validate_name_length(map(), map()) :: map()
+  defp validate_name_length(errors, %{name: name}) when is_binary(name) do
+    len = String.length(name)
+
+    cond do
+      len < 1 -> add_error(errors, :name, "is too short")
+      len > 100 -> add_error(errors, :name, "is too long (max 100 characters)")
+      true -> errors
+    end
+  end
+
+  defp validate_name_length(errors, _), do: errors
+
+  @spec add_error(map(), atom(), String.t()) :: map()
+  defp add_error(errors, field, message) do
+    Map.update(errors, field, [message], fn existing -> [message | existing] end)
+  end
 end
 ```
 
 **Why this works:**
 
-- `@enforce_keys [:id, :amount_cents, :currency]` makes `%Transaction{}` raise
-  `ArgumentError` if any of these fields is missing when the struct is created directly.
-  However, `struct/2` (used in `new/1`) does not enforce these keys — it silently
-  defaults missing keys to `nil`. That is why `new/1` checks required fields explicitly
-  with `check_required/2` before calling `struct/2`.
-
-- `new/1` uses `with` to chain three required-field checks. If any check fails,
-  `with` returns `{:error, "field is required"}` immediately. After building the struct,
-  `validate/1` checks value constraints (non-negative amount, non-empty strings).
-
-- `approved?/1` and `set_status/2` pattern-match on `%__MODULE__{}` — they only accept
-  Transaction structs. A plain map `%{status: :approved}` will not match, producing
-  a `FunctionClauseError`. This is type safety at the function boundary.
-
-- `set_status/2` uses a guard `when status in [:pending, :approved, :declined, :flagged]`
-  to restrict valid statuses. The catch-all clause returns `{:error, :invalid_status}`.
-
-- `format_amount/1` extracts `amount_cents` from the struct in the function head,
-  splits into dollars and cents, and formats with a leading zero on the cents part.
+- `@enforce_keys [:email, :name]` means `%UserSchema{}` raises `ArgumentError` if
+  these keys are missing when the struct is created directly. However, `struct!/2`
+  also enforces this — it raises on missing enforced keys.
+- `new/1` accepts both keyword lists and maps. It normalizes to a map, validates,
+  and only then creates the struct. This means invalid data never becomes a struct.
+- Validation collects ALL errors into a map (`%{email: ["is required"], name: ["is too short"]}`).
+  This is the same pattern Ecto changesets use — show every problem at once.
+- `update/2` merges new attributes into the existing struct's fields and re-validates
+  the entire result. This ensures invariants are maintained after updates.
+- `admin?/1` and `active?/1` pattern match on `%__MODULE__{}` — they only accept
+  UserSchema structs. A plain map with the same keys would raise `FunctionClauseError`.
+- `add_metadata/2` uses `%__MODULE__{user | metadata: ...}` to create a new struct
+  with one field changed. The original struct is not modified.
 
 ### Tests
 
 ```elixir
-# test/payments_cli/transaction_struct_test.exs
-defmodule PaymentsCli.TransactionStructTest do
+# test/user_schema_test.exs
+defmodule UserSchemaTest do
   use ExUnit.Case, async: true
 
-  alias PaymentsCli.Transaction
-
-  doctest PaymentsCli.Transaction
+  doctest UserSchema
 
   describe "new/1" do
-    test "creates a transaction with required fields" do
-      assert {:ok, tx} = Transaction.new(id: "T1", amount_cents: 1000, currency: "USD")
-      assert tx.id == "T1"
-      assert tx.amount_cents == 1000
-      assert tx.currency == "USD"
+    test "creates user with required fields" do
+      assert {:ok, user} = UserSchema.new(email: "alice@example.com", name: "Alice")
+      assert user.email == "alice@example.com"
+      assert user.name == "Alice"
+      assert user.role == :user
+      assert user.active == true
     end
 
-    test "applies default status of :pending" do
-      assert {:ok, tx} = Transaction.new(id: "T1", amount_cents: 500, currency: "USD")
-      assert tx.status == :pending
-    end
-
-    test "accepts optional fields" do
-      assert {:ok, tx} =
-               Transaction.new(
-                 id: "T1",
-                 amount_cents: 500,
-                 currency: "USD",
-                 merchant: "Coffee Co",
-                 date: "2024-01-15",
-                 reference: "REF-001"
+    test "accepts all optional fields" do
+      assert {:ok, user} =
+               UserSchema.new(
+                 email: "a@b.com",
+                 name: "Alice",
+                 phone: "+1234567890",
+                 age: 30,
+                 role: :admin,
+                 active: false,
+                 metadata: %{source: "web"}
                )
 
-      assert tx.merchant == "Coffee Co"
-      assert tx.date == "2024-01-15"
-      assert tx.reference == "REF-001"
+      assert user.phone == "+1234567890"
+      assert user.age == 30
+      assert user.role == :admin
+      assert user.active == false
+      assert user.metadata == %{source: "web"}
     end
 
-    test "returns error when id is missing" do
-      assert {:error, message} = Transaction.new(amount_cents: 500, currency: "USD")
-      assert is_binary(message)
+    test "accepts map with string keys" do
+      assert {:ok, user} = UserSchema.new(%{"email" => "a@b.com", "name" => "Alice"})
+      assert user.email == "a@b.com"
     end
 
-    test "returns error when amount_cents is missing" do
-      assert {:error, message} = Transaction.new(id: "T1", currency: "USD")
-      assert is_binary(message)
+    test "returns errors for missing email" do
+      assert {:error, errors} = UserSchema.new(name: "Alice")
+      assert Map.has_key?(errors, :email)
     end
 
-    test "returns error when currency is missing" do
-      assert {:error, message} = Transaction.new(id: "T1", amount_cents: 500)
-      assert is_binary(message)
+    test "returns errors for missing name" do
+      assert {:error, errors} = UserSchema.new(email: "a@b.com")
+      assert Map.has_key?(errors, :name)
     end
 
-    test "returns error for negative amount_cents" do
-      assert {:error, message} = Transaction.new(id: "T1", amount_cents: -1, currency: "USD")
-      assert is_binary(message)
+    test "returns errors for empty email" do
+      assert {:error, errors} = UserSchema.new(email: "", name: "Alice")
+      assert Map.has_key?(errors, :email)
     end
 
-    test "returns error for empty id" do
-      assert {:error, _} = Transaction.new(id: "", amount_cents: 500, currency: "USD")
+    test "returns errors for invalid email format" do
+      assert {:error, errors} = UserSchema.new(email: "noatsign", name: "Alice")
+      assert Map.has_key?(errors, :email)
     end
 
-    test "returns error for empty currency" do
-      assert {:error, _} = Transaction.new(id: "T1", amount_cents: 500, currency: "")
-    end
-  end
-
-  describe "approved?/1" do
-    test "returns true for approved transaction" do
-      {:ok, tx} = Transaction.new(id: "T1", amount_cents: 100, currency: "USD", status: :approved)
-      assert Transaction.approved?(tx) == true
+    test "returns errors for invalid age" do
+      assert {:error, errors} = UserSchema.new(email: "a@b.com", name: "Alice", age: -5)
+      assert Map.has_key?(errors, :age)
     end
 
-    test "returns false for pending transaction" do
-      {:ok, tx} = Transaction.new(id: "T1", amount_cents: 100, currency: "USD")
-      assert Transaction.approved?(tx) == false
+    test "returns errors for invalid role" do
+      assert {:error, errors} = UserSchema.new(email: "a@b.com", name: "Alice", role: :superadmin)
+      assert Map.has_key?(errors, :role)
     end
 
-    test "returns false for declined transaction" do
-      {:ok, tx} = Transaction.new(id: "T1", amount_cents: 100, currency: "USD", status: :declined)
-      assert Transaction.approved?(tx) == false
+    test "collects multiple errors" do
+      assert {:error, errors} = UserSchema.new(email: "", name: "", role: :invalid)
+      assert map_size(errors) >= 2
     end
   end
 
-  describe "set_status/2" do
+  describe "update/2" do
     setup do
-      {:ok, tx} = Transaction.new(id: "T1", amount_cents: 100, currency: "USD")
-      {:ok, tx: tx}
+      {:ok, user} = UserSchema.new(email: "alice@example.com", name: "Alice")
+      {:ok, user: user}
     end
 
-    test "updates status to approved", %{tx: tx} do
-      assert {:ok, updated} = Transaction.set_status(tx, :approved)
-      assert updated.status == :approved
+    test "updates specified fields only", %{user: user} do
+      assert {:ok, updated} = UserSchema.update(user, name: "Alice Smith")
+      assert updated.name == "Alice Smith"
+      assert updated.email == "alice@example.com"
     end
 
-    test "does not mutate the original struct", %{tx: tx} do
-      {:ok, _updated} = Transaction.set_status(tx, :approved)
-      assert tx.status == :pending
+    test "re-validates after update", %{user: user} do
+      assert {:error, errors} = UserSchema.update(user, email: "")
+      assert Map.has_key?(errors, :email)
     end
 
-    test "returns error for unknown status", %{tx: tx} do
-      assert {:error, :invalid_status} = Transaction.set_status(tx, :unknown)
+    test "does not modify original struct", %{user: user} do
+      {:ok, _updated} = UserSchema.update(user, name: "New Name")
+      assert user.name == "Alice"
     end
   end
 
-  describe "format_amount/1" do
-    test "formats cents as dollar string" do
-      {:ok, tx} = Transaction.new(id: "T1", amount_cents: 15099, currency: "USD")
-      assert Transaction.format_amount(tx) == "$150.99"
+  describe "admin?/1" do
+    test "returns true for admin role" do
+      {:ok, user} = UserSchema.new(email: "a@b.com", name: "A", role: :admin)
+      assert UserSchema.admin?(user)
     end
 
-    test "pads single-digit cents" do
-      {:ok, tx} = Transaction.new(id: "T1", amount_cents: 100, currency: "USD")
-      assert Transaction.format_amount(tx) == "$1.00"
+    test "returns false for user role" do
+      {:ok, user} = UserSchema.new(email: "a@b.com", name: "A")
+      refute UserSchema.admin?(user)
+    end
+  end
+
+  describe "active?/1" do
+    test "returns true for active user" do
+      {:ok, user} = UserSchema.new(email: "a@b.com", name: "A")
+      assert UserSchema.active?(user)
     end
 
-    test "handles zero" do
-      {:ok, tx} = Transaction.new(id: "T1", amount_cents: 0, currency: "USD")
-      assert Transaction.format_amount(tx) == "$0.00"
+    test "returns false for inactive user" do
+      {:ok, user} = UserSchema.new(email: "a@b.com", name: "A", active: false)
+      refute UserSchema.active?(user)
+    end
+  end
+
+  describe "deactivate/1" do
+    test "sets active to false" do
+      {:ok, user} = UserSchema.new(email: "a@b.com", name: "A")
+      deactivated = UserSchema.deactivate(user)
+      assert deactivated.active == false
+    end
+
+    test "original remains unchanged" do
+      {:ok, user} = UserSchema.new(email: "a@b.com", name: "A")
+      _deactivated = UserSchema.deactivate(user)
+      assert user.active == true
+    end
+  end
+
+  describe "add_metadata/2" do
+    test "merges new metadata" do
+      {:ok, user} = UserSchema.new(email: "a@b.com", name: "A", metadata: %{source: "web"})
+      updated = UserSchema.add_metadata(user, %{campaign: "q1"})
+      assert updated.metadata == %{source: "web", campaign: "q1"}
+    end
+
+    test "does not overwrite existing keys" do
+      {:ok, user} = UserSchema.new(email: "a@b.com", name: "A", metadata: %{source: "web"})
+      updated = UserSchema.add_metadata(user, %{source: "mobile"})
+      assert updated.metadata.source == "mobile"
     end
   end
 
   describe "struct type safety" do
     test "is_struct/2 verifies module type" do
-      {:ok, tx} = Transaction.new(id: "T1", amount_cents: 100, currency: "USD")
-      assert is_struct(tx, Transaction)
-      refute is_struct(%{id: "T1", amount_cents: 100, currency: "USD"}, Transaction)
+      {:ok, user} = UserSchema.new(email: "a@b.com", name: "A")
+      assert is_struct(user, UserSchema)
+    end
+
+    test "plain map does not match struct pattern" do
+      plain_map = %{email: "a@b.com", name: "A", role: :user}
+      refute is_struct(plain_map, UserSchema)
     end
 
     test "struct is also a map" do
-      {:ok, tx} = Transaction.new(id: "T1", amount_cents: 100, currency: "USD")
-      assert is_map(tx)
+      {:ok, user} = UserSchema.new(email: "a@b.com", name: "A")
+      assert is_map(user)
     end
 
-    test "immutable update creates new struct" do
-      {:ok, tx} = Transaction.new(id: "T1", amount_cents: 100, currency: "USD")
-      updated = %Transaction{tx | amount_cents: 200}
-      assert tx.amount_cents == 100
-      assert updated.amount_cents == 200
+    test "update syntax only works on existing fields" do
+      {:ok, user} = UserSchema.new(email: "a@b.com", name: "A")
+
+      assert_raise KeyError, fn ->
+        %UserSchema{user | nonexistent: "value"}
+      end
     end
   end
 end
@@ -461,87 +499,53 @@ end
 ### Run the tests
 
 ```bash
-mix test test/payments_cli/transaction_struct_test.exs --trace
+mix test --trace
 ```
-
-Note: `doctest PaymentsCli.Transaction` runs the examples in `@doc` blocks as tests.
-Your `@doc` examples must produce the exact output shown.
 
 ---
 
-## Trade-off analysis
+## Structs vs maps vs Ecto schemas
 
-| Aspect | Plain map `%{...}` | Struct `%Transaction{}` | Ecto.Schema |
-|--------|-------------------|------------------------|-------------|
-| Compile-time field check | No | Yes (with `@enforce_keys`) | Yes |
-| Pattern match by type | No | Yes | Yes |
-| Can add arbitrary keys | Yes | No (`KeyError`) | No |
-| Type spec support | `map()` only | `%Transaction{}` | `%Transaction{}` |
-| Changeset / validation | Manual | Manual (`new/1`) | Built-in |
-| Appropriate for | Exploratory code, flexible shapes | Domain entities with known fields | Database-backed entities |
+| Aspect | Plain map | Struct | Ecto.Schema |
+|--------|-----------|--------|-------------|
+| Compile-time field check | No | Yes (`@enforce_keys`) | Yes |
+| Pattern match by type | No | Yes (`%User{}`) | Yes |
+| Arbitrary keys | Yes | No (`KeyError`) | No |
+| Type spec support | `map()` only | `%User{}` | `%User{}` |
+| Validation | Manual | Manual (`new/1`) | Built-in changesets |
+| Database integration | No | No | Yes |
+| When to use | Flexible data, external input | Domain entities, internal state | DB-backed entities |
 
-Reflection question: `new/1` uses `struct/2` to build the transaction, which silently
-ignores unknown keys. An alternative is to check for unknown keys and return
-`{:error, "unknown field: #{key}"}` — rejecting unexpected input explicitly.
-When would that stricter approach prevent real bugs? When would it make the API
-unnecessarily fragile?
+The pattern in this exercise (validated constructor + error collection) is exactly
+what Ecto changesets do internally. Understanding it without Ecto makes you better
+at using Ecto when you adopt it.
 
 ---
 
 ## Common production mistakes
 
-**1. `@enforce_keys` without handling the `ArgumentError`**
-```elixir
-@enforce_keys [:id]
-defstruct [:id, name: ""]
-```
-If you create `%MyStruct{}` without `:id`, Elixir raises `ArgumentError` at compile
-time (in `defstruct` context) or at runtime (when `struct!` is called directly).
-Always provide `:id` or use your `new/1` constructor which validates before creating.
+**1. `@enforce_keys` without a validated constructor**
+`@enforce_keys` only prevents direct `%MyStruct{}` without the key. `struct/2`
+(without the bang) silently sets missing enforced keys to `nil`. Always use
+`struct!/2` or a `new/1` constructor that validates before creating.
 
-**2. Updating a field that does not exist**
-```elixir
-tx = %Transaction{id: "T1", amount_cents: 100, currency: "USD"}
-%Transaction{tx | fee: 25}  # KeyError — :fee is not a defined field
-```
-The update syntax `%Struct{original | key: val}` can only modify existing fields.
-Adding a new field requires changing `defstruct`. This is intentional — it prevents
-accidental schema drift.
+**2. Using `Map.put/3` to modify structs**
+`Map.put(user, :extra_field, "value")` bypasses struct validation and adds a
+field that `defstruct` did not declare. The result is technically a map with an
+extra key — no longer a valid struct instance. Use `%Struct{s | field: value}`.
 
-**3. Pattern matching structs from different modules**
-```elixir
-# Two modules, both with a :name field
-defmodule Cat do defstruct name: "" end
-defmodule Dog do defstruct name: "" end
+**3. Forgetting that struct equality includes `__struct__`**
+`%User{name: "Alice"} == %Admin{name: "Alice"}` is `false` even if all visible
+fields match — the hidden `__struct__` key differs.
 
-def pet_name(%Cat{name: n}), do: n  # only matches Cat structs
-def pet_name(%Dog{name: n}), do: n  # only matches Dog structs
-```
-The `%ModuleName{}` pattern checks the `__struct__` key of the map, which stores
-the module atom. A `%Cat{}` will never match `%Dog{name: n}` even though both have
-`:name`. This type-safety is the main advantage of structs over maps.
+**4. Pattern matching structs from different modules**
+`def greet(%User{name: name})` only matches `User` structs. A `%Admin{name: name}`
+will not match. This is intentional — structs provide type-safe dispatching.
 
-**4. Assuming struct equality is field equality**
-```elixir
-%Transaction{id: "T1", amount_cents: 100, currency: "USD"} ==
-%Transaction{id: "T1", amount_cents: 100, currency: "USD"}
-# => true — struct equality IS field equality (including __struct__ key)
-```
-This actually works correctly — struct equality compares all fields including the
-hidden `__struct__` field. But be careful: a struct and a map with the same visible
-fields are NOT equal, because the map lacks `__struct__`.
-
-**5. Using `Map.put/3` to add fields to structs**
-```elixir
-tx = %Transaction{id: "T1", amount_cents: 100, currency: "USD"}
-Map.put(tx, :extra_field, "value")
-# => %{__struct__: PaymentsCli.Transaction, id: "T1", ..., extra_field: "value"}
-```
-`Map.put/3` bypasses struct validation and adds the field anyway (it treats the
-struct as a plain map). The result is no longer a valid struct — it has an extra
-key that `defstruct` did not declare. Pattern matching `%Transaction{}` on it still
-works (the `__struct__` key is present), but the extra field is invisible to struct
-operations and may confuse the next reader. Never use `Map.put/3` to modify structs.
+**5. Not handling `@enforce_keys` with `struct/2`**
+`struct(MyStruct, fields)` does NOT enforce `@enforce_keys` — it silently defaults
+missing keys to `nil`. Use `struct!(MyStruct, fields)` to get the enforcement, or
+validate in your constructor before creating.
 
 ---
 
@@ -550,6 +554,5 @@ operations and may confuse the next reader. Never use `Map.put/3` to modify stru
 - [Structs — Elixir Getting Started](https://elixir-lang.org/getting-started/structs.html)
 - [defstruct — Kernel docs](https://hexdocs.pm/elixir/Kernel.html#defstruct/1)
 - [@enforce_keys — Kernel docs](https://hexdocs.pm/elixir/Kernel.html#module-enforcing-keys)
-- [struct/2 — Kernel docs](https://hexdocs.pm/elixir/Kernel.html#struct/2)
-- [Elixir School — Structs](https://elixirschool.com/en/lessons/basics/structs)
-- [Typespec for structs — Elixir Getting Started](https://elixir-lang.org/getting-started/typespecs-and-behaviours.html)
+- [Ecto.Changeset — HexDocs](https://hexdocs.pm/ecto/Ecto.Changeset.html) (for comparison)
+- [Typespecs for structs](https://elixir-lang.org/getting-started/typespecs-and-behaviours.html)
