@@ -210,6 +210,7 @@
   },
   "active": "e170d91267f0c529",
   "lastOpenFiles": [
+    "challenges/elixir/01-basico/01-setup-and-mix/payments_cli/lib/payments_cli/cli.ex",
     "challenges/elixir/01-basico/01-setup-and-mix/payments_cli/test/payments_cli",
     "challenges/elixir/01-basico/01-setup-and-mix/payments_cli/lib/payments_cli",
     "challenges/elixir/01-basico/01-setup-and-mix/payments_cli/test/test_helper.exs",
@@ -245,7 +246,6 @@
     "challenges/elixir/es/01-basico/12-pipe-operator-and-composition/12-pipe-operator-and-composition.md",
     "challenges/elixir/en/01-basico/12-pipe-operator-and-composition/12-pipe-operator-and-composition.md",
     "challenges/elixir/es/01-basico/15-structs-and-basic-validation",
-    "challenges/elixir/es/01-basico/14-modules-and-function-visibility",
     "Presentacion/poc-just/web/node_modules/ordered-binary/assets/powers-dre.png",
     "Presentacion/poc-just/web/node_modules/retry/equation.gif",
     "Untitled.canvas"
