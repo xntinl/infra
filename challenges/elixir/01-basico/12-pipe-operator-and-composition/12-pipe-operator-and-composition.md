@@ -1,364 +1,413 @@
-# Pipe Operator: Transaction Processing Pipelines
+# Pipe Operator and Composition: Building an ETL Pipeline
 
-**Project**: `payments_cli` — a CLI tool that processes payment transactions
-
----
-
-## Project context
-
-You are building `payments_cli`, a CLI tool that processes payment transactions from CSV
-files, validates them, applies business rules, and produces ledger reports.
-
-This exercise implements a `Report` module that generates formatted transaction reports
-by composing transformation pipelines with the `|>` operator. Each report type is a
-pipeline from raw transactions to a formatted string. The module is completely
-self-contained — it defines all analytics, formatting, and report generation functions
-it needs.
+**Project**: `etl` — an Extract-Transform-Load pipeline that reads CSV, transforms data, and outputs JSON
 
 ---
 
-## Why `|>` is more than syntactic sugar
+## Why the pipe operator changes how you design functions
 
-`data |> f(a) |> g(b)` is exactly `g(f(data, a), b)`. The semantics are identical.
-The difference is cognitive: the pipe version reads in execution order, the nested
-version reads inside-out.
+The pipe operator `|>` passes the result of the left expression as the first
+argument to the function on the right. This is not syntactic sugar — it is a
+design constraint that shapes how you write functions in Elixir.
 
-For payment reporting, this matters because:
+```elixir
+# Without pipes — read inside-out
+String.trim(String.downcase(String.replace(input, "\t", " ")))
 
-1. A report pipeline has 5-8 steps in a fixed order
-2. Each step receives the result of the previous step
-3. The data type changes through the pipeline (list -> grouped map -> sorted list -> string)
+# With pipes — read top-to-bottom
+input
+|> String.replace("\t", " ")
+|> String.downcase()
+|> String.trim()
+```
 
-The pipe expresses the **intent** of the transformation as a sequence of steps,
-not as a composition of functions. Intent-revealing code is maintainable code.
+The pipe operator enforces a convention: the primary data being transformed is
+always the first argument. This is why every Elixir standard library function
+puts the "subject" first: `Enum.map(list, fun)`, `String.split(string, sep)`,
+`Map.put(map, key, value)`.
 
-The constraint that every piped function must accept the previous result as its
-**first argument** is a design pressure: it pushes you to design functions that
-work well with the data they transform, not functions that take configuration first.
+When you design your own functions, following this convention makes them
+pipe-friendly. Breaking it makes them awkward to use in pipelines.
 
 ---
 
 ## The business problem
 
-The `Report` module generates formatted transaction reports. Each report type is
-a pipeline from raw transactions to a formatted string.
+Build an ETL system that:
+
+1. Reads raw CSV text
+2. Parses it into maps (rows with headers as keys)
+3. Transforms values (type casting, normalization, enrichment)
+4. Filters invalid records
+5. Outputs the result as a JSON-serializable structure
+
+The entire flow should be a single pipe chain from input to output.
 
 ---
 
 ## Implementation
 
-### `lib/payments_cli/report.ex`
-
-Each public function is a pipeline: transactions in, formatted string out. Private
-helpers handle the individual transformation steps. The key discipline: each step
-transforms data, returns a value, and is independently testable. No step has side
-effects. The pipe makes the data flow visible.
+### `lib/etl.ex`
 
 ```elixir
-defmodule PaymentsCli.Report do
+defmodule Etl do
   @moduledoc """
-  Generates formatted transaction reports by composing transformation pipelines.
+  Extract-Transform-Load pipeline using the pipe operator.
 
-  Each public function is a pipeline: transactions in, formatted string out.
-  The pipe operator makes each step explicit and independently testable.
+  Each step in the ETL process is a function that takes data as its
+  first argument and returns transformed data. This makes the entire
+  pipeline expressible as a single pipe chain.
   """
 
   @doc """
-  Generates a summary report for a list of transactions.
-
-  Format:
-    === Transaction Summary ===
-    Total transactions: N
-    Approved: N (total: $X.XX)
-    Declined: N
-    Under review: N
+  Runs the complete ETL pipeline from raw CSV to structured output.
 
   ## Examples
 
-      iex> txs = [%{status: :approved, amount_cents: 1000, currency: "USD"}]
-      iex> report = PaymentsCli.Report.summary(txs)
-      iex> String.contains?(report, "Total transactions:")
+      iex> csv = "name,age,email\\nAlice,30,alice@example.com\\nBob,invalid,bob@example.com"
+      iex> {:ok, result} = Etl.run(csv)
+      iex> length(result.valid_records)
+      1
+      iex> hd(result.valid_records)["name"]
+      "alice"
+
+  """
+  @spec run(String.t()) :: {:ok, map()} | {:error, String.t()}
+  def run(csv_text) when is_binary(csv_text) do
+    csv_text
+    |> extract()
+    |> transform()
+    |> load()
+  end
+
+  @doc """
+  Extracts data: parses CSV text into a list of maps.
+
+  The first row is used as headers. Each subsequent row becomes a
+  map with header keys.
+
+  ## Examples
+
+      iex> Etl.extract("name,age\\nAlice,30\\nBob,25")
+      [%{"name" => "Alice", "age" => "30"}, %{"name" => "Bob", "age" => "25"}]
+
+      iex> Etl.extract("")
+      []
+
+  """
+  @spec extract(String.t()) :: [map()]
+  def extract(csv_text) when is_binary(csv_text) do
+    csv_text
+    |> String.trim()
+    |> String.split("\n", trim: true)
+    |> parse_csv()
+  end
+
+  @doc """
+  Transforms data: normalizes values, casts types, and marks validity.
+
+  Each record gets:
+    - String fields trimmed and lowercased
+    - "age" field cast to integer
+    - "email" field validated
+    - A "_valid" boolean field
+
+  ## Examples
+
+      iex> records = [%{"name" => " Alice ", "age" => "30", "email" => "a@b.com"}]
+      iex> [transformed] = Etl.transform(records)
+      iex> transformed["name"]
+      "alice"
+      iex> transformed["age"]
+      30
+
+  """
+  @spec transform([map()]) :: [map()]
+  def transform(records) when is_list(records) do
+    records
+    |> Enum.map(&normalize_strings/1)
+    |> Enum.map(&cast_age/1)
+    |> Enum.map(&validate_email/1)
+    |> Enum.map(&mark_validity/1)
+  end
+
+  @doc """
+  Loads data: separates valid from invalid records and builds output.
+
+  ## Examples
+
+      iex> records = [
+      ...>   %{"name" => "alice", "age" => 30, "email" => "a@b.com", "_valid" => true},
+      ...>   %{"name" => "bob", "age" => nil, "email" => "b@c.com", "_valid" => false}
+      ...> ]
+      iex> {:ok, result} = Etl.load(records)
+      iex> length(result.valid_records)
+      1
+      iex> length(result.invalid_records)
+      1
+
+  """
+  @spec load([map()]) :: {:ok, map()}
+  def load(records) when is_list(records) do
+    {valid, invalid} =
+      records
+      |> Enum.split_with(fn record -> record["_valid"] == true end)
+
+    output = %{
+      valid_records: Enum.map(valid, &strip_internal_fields/1),
+      invalid_records: Enum.map(invalid, &strip_internal_fields/1),
+      stats: %{
+        total: length(records),
+        valid: length(valid),
+        invalid: length(invalid)
+      }
+    }
+
+    {:ok, output}
+  end
+
+  @doc """
+  Converts the output to a JSON string.
+
+  ## Examples
+
+      iex> data = %{valid_records: [%{"name" => "alice"}], invalid_records: [], stats: %{total: 1, valid: 1, invalid: 0}}
+      iex> {:ok, json} = Etl.to_json(data)
+      iex> is_binary(json)
       true
 
   """
-  @spec summary([map()]) :: String.t()
-  def summary(transactions) when is_list(transactions) do
-    transactions
-    |> compute_summary_stats()
-    |> format_summary()
-  end
-
-  @doc """
-  Generates a per-merchant breakdown report.
-
-  Format: one line per merchant, sorted by total descending.
-    === Merchant Report ===
-    Gas Station: $155.00 total
-    Supermarket: $150.00 total
-
-  """
-  @spec merchant_report([map()], pos_integer()) :: String.t()
-  def merchant_report(transactions, top_n \\ 10) when is_list(transactions) do
-    transactions
-    |> top_merchants(top_n)
-    |> Enum.map(fn {merchant, total_cents} -> format_merchant_line(merchant, total_cents) end)
-    |> then(fn lines -> ["=== Merchant Report ===" | lines] end)
-    |> Enum.join("\n")
-  end
-
-  @doc """
-  Generates a CSV export of approved transactions.
-
-  Columns: id, date, merchant, amount, currency, status
-  """
-  @spec to_csv_report([map()]) :: String.t()
-  def to_csv_report(transactions) when is_list(transactions) do
-    header = "id,date,merchant,amount_cents,currency,status"
-
-    body =
-      transactions
-      |> Enum.filter(fn tx -> tx.status == :approved end)
-      |> Enum.sort_by(fn tx -> tx.id end)
-      |> Enum.map(&transaction_to_csv_line/1)
-      |> Enum.join("\n")
-
-    header <> "\n" <> body
-  end
-
-  @doc """
-  Generates a daily totals report with trend indication.
-
-  Format:
-    === Daily Report ===
-    2024-01-15: $84.50
-    2024-01-16: $230.20 (up 172% from prior day)
-
-  For the first day, omit the trend indicator.
-  """
-  @spec daily_report([map()]) :: String.t()
-  def daily_report(transactions) when is_list(transactions) do
-    transactions
-    |> daily_totals()
-    |> Enum.sort_by(fn {date, _} -> date end)
-    |> add_trend_indicators()
-    |> Enum.map(&format_daily_line/1)
-    |> then(fn lines -> ["=== Daily Report ===" | lines] end)
-    |> Enum.join("\n")
-  end
-
-  # ---------------------------------------------------------------------------
-  # Private helpers — each one does one thing
-  # ---------------------------------------------------------------------------
-
-  @spec top_merchants([map()], pos_integer()) :: [{String.t(), integer()}]
-  defp top_merchants(transactions, n) do
-    transactions
-    |> Enum.filter(fn tx -> tx.status == :approved end)
-    |> Enum.group_by(fn tx -> tx.merchant end)
-    |> Enum.map(fn {merchant, txs} ->
-      {merchant, txs |> Enum.map(& &1.amount_cents) |> Enum.sum()}
-    end)
-    |> Enum.sort_by(fn {merchant, total} -> {-total, merchant} end)
-    |> Enum.take(n)
-  end
-
-  @spec daily_totals([map()]) :: [{String.t(), integer()}]
-  defp daily_totals(transactions) do
-    transactions
-    |> Enum.filter(fn tx -> tx.status == :approved end)
-    |> Enum.group_by(fn tx -> tx.date end)
-    |> Enum.map(fn {date, txs} ->
-      {date, txs |> Enum.map(& &1.amount_cents) |> Enum.sum()}
-    end)
-  end
-
-  @spec transaction_to_csv_line(map()) :: String.t()
-  defp transaction_to_csv_line(%{id: id, amount_cents: a, currency: c, status: s} = tx) do
-    date = Map.get(tx, :date, "")
-    merchant = Map.get(tx, :merchant, "")
-    "#{id},#{date},#{merchant},#{a},#{c},#{s}"
-  end
-
-  @spec add_trend_indicators([{String.t(), integer()}]) :: [{String.t(), integer(), String.t()}]
-  defp add_trend_indicators([]), do: []
-
-  defp add_trend_indicators([{first_date, first_total} | rest]) do
-    first_entry = {first_date, first_total, ""}
-
-    {_, result} =
-      Enum.reduce(rest, {first_total, [first_entry]}, fn {date, total}, {prev, acc} ->
-        trend = compute_trend(prev, total)
-        {total, [{date, total, trend} | acc]}
-      end)
-
-    Enum.reverse(result)
-  end
-
-  @spec compute_trend(integer(), integer()) :: String.t()
-  defp compute_trend(prev, _current) when prev == 0, do: ""
-
-  defp compute_trend(prev, current) do
-    pct = round((current - prev) / prev * 100)
-
-    if pct >= 0 do
-      "\u2191 #{pct}%"
-    else
-      "\u2193 #{abs(pct)}%"
+  @spec to_json(map()) :: {:ok, String.t()} | {:error, String.t()}
+  def to_json(data) when is_map(data) do
+    case Jason.encode(data, pretty: true) do
+      {:ok, json} -> {:ok, json}
+      {:error, reason} -> {:error, "JSON encoding failed: #{inspect(reason)}"}
     end
   end
 
-  @spec format_daily_line({String.t(), integer(), String.t()}) :: String.t()
-  defp format_daily_line({date, total_cents, ""}) do
-    "#{date}: #{format_dollars(total_cents)}"
+  # --- Private: CSV parsing ---
+
+  @spec parse_csv([String.t()]) :: [map()]
+  defp parse_csv([]), do: []
+  defp parse_csv([_header_only]), do: []
+
+  defp parse_csv([header_line | data_lines]) do
+    headers =
+      header_line
+      |> String.split(",")
+      |> Enum.map(&String.trim/1)
+
+    data_lines
+    |> Enum.map(fn line ->
+      values =
+        line
+        |> String.split(",")
+        |> Enum.map(&String.trim/1)
+
+      headers
+      |> Enum.zip(values)
+      |> Map.new()
+    end)
   end
 
-  defp format_daily_line({date, total_cents, trend}) do
-    base = format_daily_line({date, total_cents, ""})
-    "#{base} (#{trend} from prior day)"
+  # --- Private: transformation steps ---
+
+  @spec normalize_strings(map()) :: map()
+  defp normalize_strings(record) do
+    record
+    |> Enum.map(fn
+      {key, value} when is_binary(value) ->
+        {key, value |> String.trim() |> String.downcase()}
+
+      pair ->
+        pair
+    end)
+    |> Map.new()
   end
 
-  defp format_merchant_line(merchant, total_cents) do
-    "#{merchant}: #{format_dollars(total_cents)} total"
+  @spec cast_age(map()) :: map()
+  defp cast_age(%{"age" => age_str} = record) when is_binary(age_str) do
+    case Integer.parse(age_str) do
+      {age, ""} when age > 0 and age < 150 -> Map.put(record, "age", age)
+      _ -> Map.put(record, "age", nil)
+    end
   end
 
-  defp compute_summary_stats(transactions) do
-    approved = Enum.filter(transactions, fn tx -> tx.status == :approved end)
-    declined = Enum.filter(transactions, fn tx -> tx.status == :declined end)
-    flagged  = Enum.filter(transactions, fn tx -> tx.status == :flagged end)
+  defp cast_age(record), do: record
 
-    %{
-      total: length(transactions),
-      approved: length(approved),
-      approved_total: approved |> Enum.map(& &1.amount_cents) |> Enum.sum(),
-      declined: length(declined),
-      flagged: length(flagged)
-    }
+  @spec validate_email(map()) :: map()
+  defp validate_email(%{"email" => email} = record) when is_binary(email) do
+    valid =
+      String.contains?(email, "@") and
+        String.contains?(email, ".") and
+        byte_size(email) > 5
+
+    Map.put(record, "_email_valid", valid)
   end
 
-  defp format_summary(%{total: t, approved: a, approved_total: at, declined: d, flagged: f}) do
-    amount_str = format_dollars(at)
-
-    """
-    === Transaction Summary ===
-    Total transactions: #{t}
-    Approved: #{a} (total: #{amount_str})
-    Declined: #{d}
-    Under review: #{f}
-    """
-    |> String.trim_trailing()
+  defp validate_email(record) do
+    Map.put(record, "_email_valid", false)
   end
 
-  defp format_dollars(cents) do
-    dollars = div(cents, 100)
-    minor = rem(cents, 100)
-    "$#{dollars}.#{String.pad_leading(Integer.to_string(minor), 2, "0")}"
+  @spec mark_validity(map()) :: map()
+  defp mark_validity(record) do
+    valid =
+      record["age"] != nil and
+        record["name"] != nil and
+        byte_size(record["name"] || "") > 0 and
+        record["_email_valid"] == true
+
+    record
+    |> Map.put("_valid", valid)
+    |> Map.delete("_email_valid")
+  end
+
+  @spec strip_internal_fields(map()) :: map()
+  defp strip_internal_fields(record) do
+    record
+    |> Map.reject(fn {key, _val} -> String.starts_with?(key, "_") end)
   end
 end
 ```
 
 **Why this works:**
 
-- `summary/1` is a two-step pipeline: compute stats, then format. Each step is a
-  named private function, making the pipeline self-documenting.
-
-- `merchant_report/2` chains `top_merchants/2` (which returns `[{name, total}]`),
-  maps each to a formatted line, prepends the header using `then/2`, and joins with
-  newlines. `then/2` is used because the transformation (prepending a header) does not
-  fit the pipe pattern — the header is not an argument to a function that takes the
-  list first.
-
-- `to_csv_report/1` filters, sorts, maps to CSV lines, and joins. The header is
-  concatenated separately because it is not derived from the transaction data.
-
-- `daily_report/1` computes daily totals, sorts by date, adds trend indicators (percent
-  change from prior day), formats each line, and joins. The `add_trend_indicators/1`
-  helper tracks the previous day's total to compute percent change.
+- `run/1` is a single pipe chain: `extract |> transform |> load`. Each function
+  takes the primary data as its first argument and returns transformed data.
+- `extract/1` pipes through `String.trim -> String.split -> parse_csv`. Each step
+  transforms the data shape: string -> list of strings -> list of maps.
+- `transform/1` pipes through four `Enum.map` calls. Each map applies one
+  transformation to every record. This is clear and composable, though slightly
+  less efficient than a single pass (see trade-offs below).
+- Every private function is pipe-friendly: the data being transformed is the first
+  (or only) argument.
 
 ### Tests
 
 ```elixir
-# test/payments_cli/report_test.exs
-defmodule PaymentsCli.ReportTest do
+# test/etl_test.exs
+defmodule EtlTest do
   use ExUnit.Case, async: true
 
-  alias PaymentsCli.Report
+  doctest Etl
 
-  @transactions [
-    %{id: "T1", status: :approved,  merchant: "Gas Station", amount_cents: 8000,  currency: "USD", date: "2024-01-15"},
-    %{id: "T2", status: :approved,  merchant: "Coffee Co",   amount_cents: 450,   currency: "USD", date: "2024-01-15"},
-    %{id: "T3", status: :declined,  merchant: "Coffee Co",   amount_cents: 300,   currency: "USD", date: "2024-01-15"},
-    %{id: "T4", status: :approved,  merchant: "Supermarket", amount_cents: 15000, currency: "USD", date: "2024-01-16"},
-    %{id: "T5", status: :flagged,   merchant: "Casino",      amount_cents: 50000, currency: "USD", date: "2024-01-16"}
-  ]
+  @sample_csv """
+  name,age,email
+  Alice,30,alice@example.com
+  Bob,invalid,bob@example.com
+  Charlie,25,charlie@example.com
+   Diana , 28 , diana@example.com
+  """
 
-  describe "summary/1" do
-    test "includes total count" do
-      result = Report.summary(@transactions)
-      assert String.contains?(result, "Total transactions: 5")
+  describe "run/1" do
+    test "full pipeline produces valid and invalid records" do
+      assert {:ok, result} = Etl.run(@sample_csv)
+      assert result.stats.total == 4
+      assert result.stats.valid == 3
+      assert result.stats.invalid == 1
     end
 
-    test "includes approved count" do
-      result = Report.summary(@transactions)
-      assert String.contains?(result, "Approved: 3")
-    end
-
-    test "includes declined count" do
-      result = Report.summary(@transactions)
-      assert String.contains?(result, "Declined: 1")
-    end
-
-    test "returns a string" do
-      assert is_binary(Report.summary(@transactions))
+    test "invalid age makes record invalid" do
+      csv = "name,age,email\nAlice,xyz,alice@example.com"
+      assert {:ok, result} = Etl.run(csv)
+      assert result.stats.invalid == 1
     end
   end
 
-  describe "merchant_report/2" do
-    test "includes report header" do
-      result = Report.merchant_report(@transactions)
-      assert String.contains?(result, "=== Merchant Report ===")
+  describe "extract/1" do
+    test "parses CSV into list of maps" do
+      records = Etl.extract("name,age\nAlice,30\nBob,25")
+      assert length(records) == 2
+      assert hd(records) == %{"name" => "Alice", "age" => "30"}
     end
 
-    test "includes merchant names" do
-      result = Report.merchant_report(@transactions)
-      assert String.contains?(result, "Gas Station")
-      assert String.contains?(result, "Supermarket")
+    test "handles empty input" do
+      assert Etl.extract("") == []
     end
 
-    test "excludes declined and flagged transactions from totals" do
-      result = Report.merchant_report(@transactions)
-      # Coffee Co only has 1 approved transaction (T2, $4.50)
-      # The declined T3 should not appear in the total
-      assert String.contains?(result, "Coffee Co")
-    end
-  end
-
-  describe "to_csv_report/1" do
-    test "includes CSV header" do
-      result = Report.to_csv_report(@transactions)
-      assert String.starts_with?(result, "id,date,merchant,amount_cents,currency,status")
+    test "handles header-only input" do
+      assert Etl.extract("name,age") == []
     end
 
-    test "includes approved transactions only" do
-      result = Report.to_csv_report(@transactions)
-      assert String.contains?(result, "T1")
-      assert String.contains?(result, "T2")
-      assert String.contains?(result, "T4")
-      # T3 is declined, T5 is flagged
-      refute String.contains?(result, "T3")
-      refute String.contains?(result, "T5")
+    test "trims whitespace from values" do
+      records = Etl.extract("name,age\n Alice , 30 ")
+      assert hd(records)["name"] == "Alice"
+      assert hd(records)["age"] == "30"
     end
   end
 
-  describe "daily_report/1" do
-    test "includes daily report header" do
-      result = Report.daily_report(@transactions)
-      assert String.contains?(result, "=== Daily Report ===")
+  describe "transform/1" do
+    test "normalizes strings to lowercase" do
+      records = [%{"name" => "ALICE", "age" => "30", "email" => "A@B.COM"}]
+      [result] = Etl.transform(records)
+      assert result["name"] == "alice"
+      assert result["email"] == "a@b.com"
     end
 
-    test "includes both dates" do
-      result = Report.daily_report(@transactions)
-      assert String.contains?(result, "2024-01-15")
-      assert String.contains?(result, "2024-01-16")
+    test "casts valid age to integer" do
+      records = [%{"name" => "alice", "age" => "30", "email" => "a@b.com"}]
+      [result] = Etl.transform(records)
+      assert result["age"] == 30
+    end
+
+    test "sets nil for invalid age" do
+      records = [%{"name" => "alice", "age" => "xyz", "email" => "a@b.com"}]
+      [result] = Etl.transform(records)
+      assert result["age"] == nil
+    end
+
+    test "marks validity" do
+      records = [
+        %{"name" => "alice", "age" => "30", "email" => "a@b.com"},
+        %{"name" => "bob", "age" => "invalid", "email" => "b@c.com"}
+      ]
+
+      results = Etl.transform(records)
+      assert Enum.at(results, 0)["_valid"] == true
+      assert Enum.at(results, 1)["_valid"] == false
+    end
+  end
+
+  describe "load/1" do
+    test "separates valid from invalid" do
+      records = [
+        %{"name" => "alice", "age" => 30, "_valid" => true},
+        %{"name" => "bob", "age" => nil, "_valid" => false}
+      ]
+
+      assert {:ok, result} = Etl.load(records)
+      assert length(result.valid_records) == 1
+      assert length(result.invalid_records) == 1
+    end
+
+    test "strips internal fields from output" do
+      records = [%{"name" => "alice", "_valid" => true, "_temp" => "x"}]
+      {:ok, result} = Etl.load(records)
+      record = hd(result.valid_records)
+      refute Map.has_key?(record, "_valid")
+      refute Map.has_key?(record, "_temp")
+    end
+  end
+
+  describe "to_json/1" do
+    test "converts output to JSON string" do
+      data = %{records: [%{"name" => "alice"}]}
+      assert {:ok, json} = Etl.to_json(data)
+      assert json =~ "alice"
+    end
+  end
+
+  describe "pipe composition" do
+    test "end-to-end with to_json" do
+      csv = "name,age,email\nAlice,30,alice@example.com"
+
+      result =
+        csv
+        |> Etl.run()
+        |> then(fn {:ok, data} -> Etl.to_json(data) end)
+
+      assert {:ok, json} = result
+      assert json =~ "alice"
     end
   end
 end
@@ -367,69 +416,102 @@ end
 ### Run the tests
 
 ```bash
-mix test test/payments_cli/report_test.exs --trace
+mix test --trace
 ```
 
 ---
 
-## Trade-off analysis
+## Designing pipe-friendly functions
 
-| Aspect | Pipe chains (your impl) | Nested function calls | Intermediate variables |
-|--------|------------------------|-----------------------|----------------------|
-| Readability | Execution order matches code order | Read inside-out | Clear names, more lines |
-| Debuggability | Insert `IO.inspect` at any step | Must break apart | Inspect any variable |
-| Refactoring | Add/remove steps trivially | Rewrite nesting | Update both sides |
-| Performance | No difference at runtime | No difference | No difference |
-| When to prefer | Transformations with clear data flow | Single expression needed | When intermediate values need names |
+The rule: the primary data being transformed goes in the first argument position.
 
-Reflection question: `merchant_report/1` uses `then/2` to prepend the header.
-What does `then/2` do, and why is it useful in a pipeline? When would you prefer
-a different approach (like computing the header outside the pipe)?
+```elixir
+# Pipe-friendly — data is first argument
+def normalize(record), do: ...
+def cast_type(record, field, type), do: ...
+def filter_valid(records), do: ...
+
+# Pipeline reads naturally
+records
+|> Enum.map(&normalize/1)
+|> Enum.map(&cast_type(&1, :age, :integer))
+|> filter_valid()
+
+# NOT pipe-friendly — data is last argument
+def transform(options, record), do: ...
+# Forces awkward usage:
+records |> Enum.map(&transform(options, &1))
+```
+
+When wrapping third-party functions that do not follow this convention, create
+a thin wrapper:
+
+```elixir
+# Jason.encode takes data first — pipe-friendly
+data |> Jason.encode!()
+
+# But if a library puts options first, wrap it:
+def encode(data, opts \\ []), do: ThirdParty.encode(opts, data)
+```
+
+---
+
+## When pipes hurt readability
+
+Pipes are not always better. Avoid:
+
+```elixir
+# Bad — single-step pipe adds noise
+result = input |> String.trim()
+# Just write: result = String.trim(input)
+
+# Bad — pipe with anonymous function is awkward
+result = input |> (fn x -> x * 2 end).()
+# Just write: result = input * 2
+
+# Bad — pipe into a conditional
+input
+|> validate()
+|> case do
+  :ok -> process()      # Valid but unusual, prefer `with`
+  {:error, _} -> halt()
+end
+```
+
+Use pipes when you have 2+ transformations that flow naturally from input to output.
+Use regular function calls for single operations or conditional logic.
 
 ---
 
 ## Common production mistakes
 
-**1. Piping to functions where the data is not the first argument**
-`transactions |> Enum.member?(target)` works because `member?` takes the
-enumerable first. But `transactions |> String.contains?("search")` does not
-work — `String.contains?` expects the string first, then the pattern.
-Use a wrapper lambda: `|> then(fn txs -> String.contains?(format(txs), "search") end)`.
+**1. Breaking the "data first" convention**
+If your function signature is `process(options, data)`, it cannot be piped into
+naturally. Always put the subject first.
 
-**2. Pipes without parentheses fail**
+**2. Side effects in the middle of a pipe**
 ```elixir
-# WRONG — length without () is not a function call in pipe position
-[1, 2, 3] |> length
-# ** (CompileError) undefined function length/0
-
-# CORRECT
-[1, 2, 3] |> length()
+data
+|> transform()
+|> IO.inspect(label: "debug")  # OK for debugging
+|> save_to_database()          # Side effect — harder to test
+|> notify_user()               # Another side effect
 ```
-Always use parentheses on the right side of `|>`.
+Keep side effects at the end of the pipeline or in a separate step.
 
-**3. Overly long pipelines lose context**
-A pipeline with 15 steps is as hard to read as deeply nested calls. When a pipeline
-grows beyond 6-8 steps, extract named private functions for sub-pipelines.
-`compute_summary_stats/1` and `format_summary/1` are good examples — they give
-names to what would otherwise be anonymous sections of a long pipeline.
+**3. Piping into `case` or `if`**
+While syntactically valid, piping into `case` or `if` is unusual and confusing.
+Use `with` for conditional pipelines.
 
-**4. `IO.inspect/2` left in production code**
-Inserting `|> IO.inspect(label: "debug")` into a pipeline is the correct debugging
-technique. But `IO.inspect` has a return value (it returns its argument), so it
-is invisible to the pipeline. This makes it easy to forget to remove before merging.
-Enable `--warnings-as-errors` and treat `IO.inspect` calls as lint warnings in CI.
-
-**5. Pipelines that change the data type unexpectedly**
-A pipeline that starts with `[map()]` and ends with a `String.t()` is correct —
-but if an intermediate step returns `{:ok, list}` instead of `list`, the next
-step receives a tuple instead of a list and crashes. Make the type flow explicit
-through `@spec` annotations.
+**4. Too many transformations in one pipe**
+A 20-step pipe is hard to debug. Break it into named functions that each represent
+a meaningful transformation step.
 
 ---
 
 ## Resources
 
-- [Pipe operator — Kernel docs](https://hexdocs.pm/elixir/Kernel.html#%7C%3E/2)
-- [then/2 — Kernel docs](https://hexdocs.pm/elixir/Kernel.html#then/2)
-- [IO.inspect/2 — HexDocs](https://hexdocs.pm/elixir/IO.html#inspect/2)
-- [Elixir School — Pipe Operator](https://elixirschool.com/en/lessons/basics/pipe_operator)
+- [Pipe operator — Elixir Getting Started](https://elixir-lang.org/getting-started/enumerables-and-streams.html#the-pipe-operator)
+- [Enum — HexDocs](https://hexdocs.pm/elixir/Enum.html)
+- [Stream — HexDocs](https://hexdocs.pm/elixir/Stream.html)
+- [Jason — HexDocs](https://hexdocs.pm/jason/Jason.html)
