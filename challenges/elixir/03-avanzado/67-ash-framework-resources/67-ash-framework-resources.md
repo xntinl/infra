@@ -1,20 +1,8 @@
 # Ash Framework — Resources and Actions
 
-**Project**: `api_gateway` — built incrementally across the advanced level
-
----
-
 ## Project context
 
-You're building `api_gateway`. The configuration management subsystem is currently
-a collection of ETS lookups and hand-written Ecto changesets. The platform team
-wants to expose service configuration — registered services, route rules, access
-policies — through a structured domain API that is queryable, paginatable, and
-generates its own database migrations.
-
-Ash Framework replaces imperative Ecto + hand-written action logic with a declarative
-resource DSL. Instead of writing `Repo.insert` + changeset + validation functions
-separately, you declare what a resource is and Ash generates the behaviour.
+You are building `api_gateway`, an internal HTTP gateway. The configuration management subsystem needs to expose service configuration — registered services, route rules, access policies — through a structured domain API that is queryable, paginatable, and generates its own database migrations. Ash Framework replaces imperative Ecto + hand-written action logic with a declarative resource DSL. All modules are defined from scratch.
 
 Project structure:
 
@@ -22,15 +10,15 @@ Project structure:
 api_gateway/
 ├── lib/
 │   └── api_gateway/
-│       ├── config/
-│       │   ├── config.ex                       # Ash.Domain
-│       │   └── resources/
-│       │       ├── service.ex                  # Service resource
-│       │       ├── route_rule.ex               # RouteRule resource
-│       │       └── route_rule/
-│       │           └── validations/
-│       │               └── path_format.ex      # custom validation
+│       ├── repo.ex                             # Ecto.Repo
 │       └── config/
+│           ├── config.ex                       # Ash.Domain
+│           ├── resources/
+│           │   ├── service.ex                  # Service resource
+│           │   ├── route_rule.ex               # RouteRule resource
+│           │   └── route_rule/
+│           │       └── validations/
+│           │           └── path_format.ex      # custom validation
 │           └── queries.ex                      # composable Ash.Query helpers
 ├── test/
 │   └── api_gateway/
@@ -45,36 +33,19 @@ api_gateway/
 
 Three read-side operations the platform team needs constantly:
 
-1. **Service registry**: list active services with their upstream URLs and health status —
-   filtered, sorted, paginated. Currently requires three different ETS lookups and a
-   manual sort in application code.
+1. **Service registry**: list active services with their upstream URLs — filtered, sorted, paginated.
 2. **Route matching**: given an inbound path, find the first matching `RouteRule`.
-   Currently a linear scan of a list loaded fresh from ETS on every request.
-3. **Audit trail**: when a route rule changes (path added, priority shifted), record who
-   changed it and when. Currently nothing — changes are silent.
+3. **Audit trail**: when a route rule changes, record who changed it and when.
 
-Ash gives you a queryable, filterable, paginatable domain with validations enforced
-at the resource level, migrations auto-generated from your declarations, and a uniform
-API (`Config.create!/2`, `Config.read!/1`, `Config.update!/2`) that works identically
-whether backed by PostgreSQL (production) or the in-memory data layer (tests).
+Ash gives you a queryable, filterable, paginatable domain with validations enforced at the resource level, migrations auto-generated from your declarations, and a uniform API (`Config.create!/2`, `Config.read!/1`, `Config.update!/2`).
 
 ---
 
 ## Why declare resources instead of writing Ecto schemas manually
 
-When you write an Ecto schema by hand, you also write: the changeset function, the
-validation logic, the query helpers, the CRUD functions in a context module, and the
-migration. Each of those is a separate file. Adding a field means touching all five.
+When you write an Ecto schema by hand, you also write: the changeset function, the validation logic, the query helpers, the CRUD functions in a context module, and the migration. Each of those is a separate file. Ash collapses all five into one resource declaration. The constraints on an attribute are both the migration column constraint and the runtime validation.
 
-Ash collapses all five into one resource declaration. The constraints on an attribute
-are both the migration column constraint and the runtime validation. The `actions` block
-is both the public API and the changeset logic. When you add a field, you add one
-`attribute` line and run `mix ash_postgres.generate_migrations`.
-
-The tradeoff: you give up direct Ecto query control. Ash translates its expression DSL
-to Ecto queries, and that translation is occasionally surprising. For complex analytical
-queries (aggregations over joins with window functions), dropping down to raw Ecto or
-raw SQL is still the right call.
+The tradeoff: you give up direct Ecto query control. For complex analytical queries, dropping down to raw Ecto or raw SQL is still the right call.
 
 ---
 
@@ -83,10 +54,14 @@ raw SQL is still the right call.
 ### Step 1: `mix.exs` additions
 
 ```elixir
-{:ash, "~> 3.0"},
-{:ash_postgres, "~> 2.0"},
-{:ecto_sql, "~> 3.11"},
-{:postgrex, "~> 0.18"}
+defp deps do
+  [
+    {:ash, "~> 3.0"},
+    {:ash_postgres, "~> 2.0"},
+    {:ecto_sql, "~> 3.11"},
+    {:postgrex, "~> 0.18"}
+  ]
+end
 ```
 
 ### Step 2: Domain — `lib/api_gateway/config/config.ex`
@@ -95,9 +70,7 @@ raw SQL is still the right call.
 defmodule ApiGateway.Config do
   @moduledoc """
   Ash domain for gateway configuration resources.
-
   All external code calls Config.create!/2, Config.read!/1, etc.
-  Direct access to resource modules is an internal detail.
   """
 
   use Ash.Domain
@@ -205,9 +178,7 @@ defmodule ApiGateway.Config.Resources.Service do
 end
 ```
 
-The `drain`, `take_offline`, and `activate` actions use `change set_attribute/2` — a
-built-in Ash change that sets the attribute to a fixed value. No custom change module
-is needed. The caller invokes these as:
+The `drain`, `take_offline`, and `activate` actions use `change set_attribute/2` — a built-in Ash change that sets the attribute to a fixed value. The caller invokes these as:
 
 ```elixir
 service
@@ -215,13 +186,7 @@ service
 |> Config.update!()
 ```
 
-The `:active` and `:routable` read actions use `filter expr(...)` to apply server-side
-filters. The `:routable` action also enables keyset pagination with a default limit of
-50, which is suitable for dashboard table views.
-
-The `identity :unique_name, [:name]` generates both a database unique index and a
-runtime uniqueness check. The database constraint is the true guard against race
-conditions; the Ash-level check provides a friendlier error message.
+The `:active` and `:routable` read actions use `filter expr(...)` to apply server-side filters. The `identity :unique_name, [:name]` generates both a database unique index and a runtime uniqueness check.
 
 ### Step 4: RouteRule resource — `lib/api_gateway/config/resources/route_rule.ex`
 
@@ -229,10 +194,7 @@ conditions; the Ash-level check provides a friendlier error message.
 defmodule ApiGateway.Config.Resources.RouteRule do
   @moduledoc """
   A routing rule: maps an inbound path prefix to a registered Service.
-
   Priority determines match order — lower number = higher priority.
-  The gateway evaluates rules in ascending priority order and routes
-  to the first matching service.
   """
 
   use Ash.Resource,
@@ -310,29 +272,12 @@ defmodule ApiGateway.Config.Resources.RouteRule do
 end
 ```
 
-The `:ordered` read action combines a filter and a sort using `prepare build(...)`.
-The `build` preparation is a built-in Ash preparation that applies query modifiers
-at the action level.
-
-The `:for_path` action takes a `:path` argument and uses `contains/2` in the filter
-expression to find rules whose `path_prefix` is contained within the requested path.
-The `limit: 1` ensures only the highest-priority match is returned.
-
-The `:reprioritize` action demonstrates a custom change function. It reads the
-`:new_priority` argument from the changeset and applies it to the `:priority` attribute.
-This pattern keeps the action's intent explicit in the DSL while allowing computed
-attribute changes.
-
 ### Step 5: PathFormat validation — `lib/api_gateway/config/resources/route_rule/validations/path_format.ex`
 
 ```elixir
 defmodule ApiGateway.Config.Resources.RouteRule.Validations.PathFormat do
   @moduledoc """
   Validates that path_prefix starts with "/" and contains no whitespace.
-
-  A route rule with path_prefix "/api/v1" matches requests to "/api/v1/users"
-  but not to "api/v1/users" (missing leading slash). Whitespace in a path prefix
-  would never match real HTTP requests.
   """
 
   use Ash.Resource.Validation
@@ -358,22 +303,11 @@ defmodule ApiGateway.Config.Resources.RouteRule.Validations.PathFormat do
 end
 ```
 
-The validation runs on every create and update action. The `cond` handles three cases:
-
-1. **nil path**: allowed through — the `allow_nil? false` constraint on the attribute
-   will catch this separately with its own error message.
-2. **Missing leading slash**: returns a field-level error that Ash formats into the
-   standard error structure.
-3. **Contains whitespace**: `~r/\s/` matches any whitespace character (space, tab,
-   newline). HTTP paths never contain whitespace, so this is always a mistake.
-
 ### Step 6: Query helpers — `lib/api_gateway/config/queries.ex`
 
 ```elixir
 defmodule ApiGateway.Config.Queries do
-  @moduledoc """
-  Composable Ash.Query helpers for common gateway configuration reads.
-  """
+  @moduledoc "Composable Ash.Query helpers for common gateway configuration reads."
 
   import Ash.Query
 
@@ -381,6 +315,7 @@ defmodule ApiGateway.Config.Queries do
   alias ApiGateway.Config
 
   @doc "Returns active services ordered by name ascending."
+  @spec active_services() :: Ash.Query.t()
   def active_services do
     Service
     |> filter(status == :active)
@@ -388,23 +323,15 @@ defmodule ApiGateway.Config.Queries do
   end
 
   @doc "Returns all services for a given status."
+  @spec services_by_status(atom()) :: Ash.Query.t()
   def services_by_status(status) do
     Service
     |> filter(status == ^status)
     |> sort(name: :asc)
   end
 
-  @doc "Returns active route rules sorted by priority ascending."
-  def ordered_rules do
-    RouteRule
-    |> filter(active == true)
-    |> sort(priority: :asc)
-  end
-
-  @doc """
-  Returns the highest-priority active rule whose path_prefix is a prefix of `path`.
-  Returns nil if no rule matches.
-  """
+  @doc "Returns the highest-priority active rule matching `path`, or nil."
+  @spec match_rule(String.t()) :: struct() | nil
   def match_rule(path) when is_binary(path) do
     result =
       RouteRule
@@ -422,15 +349,7 @@ defmodule ApiGateway.Config.Queries do
 end
 ```
 
-`match_rule/1` demonstrates a complete query composition: filter, sort, limit, and
-relationship loading. The `contains/2` expression in Ash translates to a SQL `LIKE`
-or `POSITION` check depending on the backend. The `load([:service])` preloads the
-associated service in the same query, avoiding an N+1 if multiple rules are fetched.
-
 ### Step 7: Migration
-
-Run `mix ash_postgres.generate_migrations --name create_gateway_config` to let Ash
-generate this from the resource declarations. The output should be equivalent to:
 
 ```elixir
 defmodule ApiGateway.Repo.Migrations.CreateGatewayConfig do
@@ -588,43 +507,25 @@ mix test test/api_gateway/config/ --trace
 | Query composability | Ash.Query DSL | Ecto.Query DSL | Raw string |
 | Generated migrations | `mix ash_postgres.generate_migrations` | `mix ecto.gen.migration` (manual) | Manual |
 | Complex joins/windows | Drops to raw Ecto | Native | Native |
-| Learning curve | High (new DSL, new mental model) | Medium | Low |
-| Multi-tenancy support | Built-in | Manual | Manual |
-| Policy/authorisation | Built-in (`Ash.Policy.Authorizer`) | Manual | Manual |
+| Learning curve | High (new DSL) | Medium | Low |
 
-Reflection question: `identities do identity :unique_name, [:name] end` generates both
-a database unique index and a runtime uniqueness validation. If two processes call
-`Config.create!/2` with the same name at the same millisecond, what happens? Does Ash
-prevent the race or does the database constraint prevent it? What error does the caller
-receive, and how does it differ from the error returned when validation fails at the
-Ash layer before touching the database?
+Reflection question: `identities do identity :unique_name, [:name] end` generates both a database unique index and a runtime uniqueness validation. If two processes call `Config.create!/2` with the same name at the same millisecond, what happens? Does Ash prevent the race or does the database constraint prevent it?
 
 ---
 
 ## Common production mistakes
 
 **1. Calling resource modules directly instead of through the domain**
-`ApiGateway.Config.Resources.Service.create!(attrs)` bypasses the domain. Policies,
-hooks, and domain-level configuration do not apply. Always call `Config.create!/2`.
+`ApiGateway.Config.Resources.Service.create!(attrs)` bypasses the domain. Always call `Config.create!/2`.
 
 **2. Forgetting `public?: true` on attributes**
 Attributes without `public?: true` are not exposed through AshJsonApi or AshGraphql.
-The attribute exists in the database but is invisible to API consumers with no error
-message to explain why.
 
 **3. Using `mix ecto.gen.migration` for Ash resources**
-Ash tracks its own resource schema separately from Ecto migrations. If you write a
-migration by hand that Ash did not generate, `mix ash_postgres.generate_migrations`
-will detect a drift and generate a conflicting migration.
+Ash tracks its own resource schema separately. Use `mix ash_postgres.generate_migrations`.
 
 **4. `constraints min: 0` does not mean optional**
-`constraints min: 0` sets a lower bound on the value. `allow_nil?: false` controls
-whether the attribute can be absent. You need both to express "required integer >= 0".
-
-**5. Replaying actions in tests without resetting the domain**
-If you use `async: true` with `DataCase` and multiple tests insert services with the
-same name, the unique constraint fails. Use randomized names in test fixtures (as shown
-above) or wrap each test in a transaction that is rolled back.
+`constraints min: 0` sets a lower bound on the value. `allow_nil?: false` controls whether the attribute can be absent. You need both.
 
 ---
 

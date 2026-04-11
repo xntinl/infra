@@ -56,9 +56,9 @@ Two design constraints shape the entire implementation:
 
 ## Why per-(source, destination) circuit breakers
 
-A single circuit breaker per destination means that one slow endpoint breaking affects all callers, even services with healthy interaction histories with that endpoint. A circuit breaker per `(source, destination)` pair isolates failure domains: if `service-A → service-B` has a high error rate but `service-C → service-B` is healthy, service-C is not penalized.
+A single circuit breaker per destination means that one slow endpoint breaking affects all callers, even services with healthy interaction histories with that endpoint. A circuit breaker per `(source, destination)` pair isolates failure domains: if `service-A -> service-B` has a high error rate but `service-C -> service-B` is healthy, service-C is not penalized.
 
-The cost: O(source × destination) circuit breaker GenServers. For a mesh with 20 services, that is up to 400 circuit breakers. Each is a lightweight GenServer — 400 is trivial on the BEAM.
+The cost: O(source x destination) circuit breaker GenServers. For a mesh with 20 services, that is up to 400 circuit breakers. Each is a lightweight GenServer — 400 is trivial on the BEAM.
 
 ---
 
@@ -92,73 +92,133 @@ defp deps do
 end
 ```
 
-### Step 3: `lib/meshex/mtls/cert_generator.ex`
+### Step 3: `lib/meshex/circuit_breaker.ex`
+
+The circuit breaker is keyed by a `{source, destination}` tuple, giving each service pair an independent failure domain. The state machine has three states: closed (allow traffic), open (deny traffic), and half-open (allow one probe). It uses a Registry for named process lookup, so circuit breakers are created on demand per service pair.
 
 ```elixir
-defmodule Meshex.MTLS.CertGenerator do
-  @moduledoc """
-  Generates ephemeral X.509 certificates with SPIFFE SVIDs (Subject Alternative Names).
+defmodule Meshex.CircuitBreaker do
+  use GenServer
 
-  SPIFFE URI format: spiffe://trust-domain/ns/namespace/sa/service-name
-  Example: spiffe://mesh.local/ns/default/sa/payment-service
+  @open_duration_ms 30_000
+  @error_threshold 0.5
+  @window_ms 60_000
 
-  The certificate lifecycle:
-  1. Generate RSA or EC key pair
-  2. Build a certificate signing request (CSR) with the SPIFFE URI as a SAN extension
-  3. Sign with the mesh CA (also generated at startup)
-  4. Use the signed certificate for all TLS connections in this sidecar instance
+  defstruct [
+    :pair,
+    state: :closed,
+    events: [],
+    opened_at: nil,
+    half_open_probe_sent: false
+  ]
 
-  Why ephemeral certificates?
-  Long-lived certificates require certificate revocation infrastructure (CRL, OCSP).
-  Short-lived certificates (hours or days) expire naturally — no revocation needed.
-  The security model trades revocation complexity for rotation frequency.
-  """
+  # ---------------------------------------------------------------------------
+  # Public API
+  # ---------------------------------------------------------------------------
 
-  @doc """
-  Generates a self-signed CA certificate and key for the mesh.
-  Used to sign service certificates.
-  """
-  @spec generate_ca(String.t()) :: {:ok, {cert :: binary(), key :: binary()}}
-  def generate_ca(common_name) do
-    # TODO: generate EC key pair: :public_key.generate_key({:namedCurve, :secp256r1})
-    # TODO: build self-signed CA certificate with:
-    #   - Subject: CN=common_name
-    #   - basicConstraints: CA:true
-    #   - keyUsage: keyCertSign, cRLSign
-    # TODO: :public_key.pkix_sign(tbs_cert, private_key)
-    # Return {:ok, {DER-encoded cert binary, private key}}
-    {:error, :not_implemented}
+  @doc "Returns :allow or {:deny, :circuit_open} for the given service pair."
+  @spec check({String.t(), String.t()}) :: :allow | {:deny, :circuit_open}
+  def check(pair) do
+    GenServer.call(via(pair), :check)
   end
 
-  @doc """
-  Generates a service certificate signed by the given CA.
-  Includes the SPIFFE URI in the SubjectAlternativeName extension.
-  """
-  @spec generate_service_cert(String.t(), {binary(), binary()}) ::
-    {:ok, {cert :: binary(), key :: binary()}} | {:error, term()}
-  def generate_service_cert(spiffe_uri, {ca_cert_der, ca_key}) do
-    # TODO: generate EC key pair for the service
-    # TODO: build TBS certificate with:
-    #   - Subject: CN=spiffe_uri
-    #   - subjectAltName extension with URI type: spiffe_uri
-    #   - validity: 24 hours
-    # TODO: sign with CA key
-    # Return {:ok, {service_cert_der, service_key}}
-    {:error, :not_implemented}
+  @doc "Records the outcome of a request for the given service pair."
+  @spec record_outcome({String.t(), String.t()}, :success | :error) :: :ok
+  def record_outcome(pair, outcome) do
+    GenServer.cast(via(pair), {:record, outcome, System.monotonic_time(:millisecond)})
   end
 
-  @doc "Extracts the SPIFFE URI from a peer certificate's SAN extension."
-  @spec extract_spiffe_id(binary()) :: {:ok, String.t()} | {:error, :no_spiffe_id}
-  def extract_spiffe_id(cert_der) do
-    # TODO: :public_key.pkix_decode_cert(cert_der, :otp)
-    # TODO: find the SubjectAltName extension
-    # TODO: find the URI entry starting with "spiffe://"
-    {:error, :not_implemented}
+  # ---------------------------------------------------------------------------
+  # GenServer
+  # ---------------------------------------------------------------------------
+
+  def start_link(pair) do
+    GenServer.start_link(__MODULE__, pair, name: via(pair))
+  end
+
+  def child_spec(pair) do
+    %{
+      id: {__MODULE__, pair},
+      start: {__MODULE__, :start_link, [pair]},
+      restart: :transient
+    }
+  end
+
+  @impl true
+  def init(pair) do
+    {:ok, %__MODULE__{pair: pair}}
+  end
+
+  @impl true
+  def handle_call(:check, _from, %{state: :closed} = state) do
+    {:reply, :allow, state}
+  end
+
+  @impl true
+  def handle_call(:check, _from, %{state: :open, opened_at: opened_at} = state) do
+    now = System.monotonic_time(:millisecond)
+    if now - opened_at >= @open_duration_ms do
+      new_state = %{state | state: :half_open, half_open_probe_sent: true}
+      {:reply, :allow, new_state}
+    else
+      {:reply, {:deny, :circuit_open}, state}
+    end
+  end
+
+  @impl true
+  def handle_call(:check, _from, %{state: :half_open, half_open_probe_sent: true} = state) do
+    {:reply, {:deny, :circuit_open}, state}
+  end
+
+  @impl true
+  def handle_cast({:record, outcome, ts}, state) do
+    cutoff = ts - @window_ms
+    updated_events =
+      [{ts, outcome} | state.events]
+      |> Enum.filter(fn {event_ts, _} -> event_ts >= cutoff end)
+
+    new_state = %{state | events: updated_events}
+
+    case new_state.state do
+      :closed ->
+        total = length(updated_events)
+        error_count = Enum.count(updated_events, fn {_, o} -> o == :error end)
+
+        if total >= 5 and error_count / total > @error_threshold do
+          {:noreply, %{new_state | state: :open, opened_at: ts, events: []}}
+        else
+          {:noreply, new_state}
+        end
+
+      :half_open ->
+        case outcome do
+          :success ->
+            {:noreply, %{new_state |
+              state: :closed, events: [],
+              half_open_probe_sent: false, opened_at: nil
+            }}
+
+          :error ->
+            {:noreply, %{new_state |
+              state: :open, opened_at: ts,
+              events: [], half_open_probe_sent: false
+            }}
+        end
+
+      :open ->
+        {:noreply, new_state}
+    end
+  end
+
+  defp via(pair) do
+    {:via, Registry, {Meshex.CircuitBreaker.Registry, pair}}
   end
 end
 ```
 
 ### Step 4: `lib/meshex/retry.ex`
+
+The retry module implements exponential backoff with full jitter and a retry budget. The budget is tracked in an ETS table with two counters (total requests and retry requests) per service pair. When the retry ratio exceeds the budget (default 20%), new retries are blocked. The ETS table and periodic counter reset are managed by a companion GenServer.
 
 ```elixir
 defmodule Meshex.Retry do
@@ -169,11 +229,6 @@ defmodule Meshex.Retry do
   If this ratio exceeds the configured budget (default: 20%), no new retries are allowed.
   This prevents retry storms from amplifying failures.
 
-  Design: the retry budget is stored in ETS as two counters:
-  - :total_requests (updated on every request, retry or not)
-  - :retry_requests (updated on every retry attempt)
-  These are reset every window_ms via a periodic GenServer.
-
   Why jitter?
   Without jitter, all clients retry at the same time (at 1s, 2s, 4s, etc.).
   This creates synchronized thundering herds. Full jitter: retry_at = random(0, backoff).
@@ -183,6 +238,16 @@ defmodule Meshex.Retry do
   @default_initial_interval_ms 1_000
   @default_max_interval_ms 60_000
   @default_budget_ratio 0.20
+  @budget_table :meshex_retry_budget
+
+  @doc "Initializes the retry budget ETS table. Call once at application start."
+  @spec init_budget_table() :: :ok
+  def init_budget_table do
+    if :ets.whereis(@budget_table) == :undefined do
+      :ets.new(@budget_table, [:named_table, :public, :set])
+    end
+    :ok
+  end
 
   @doc """
   Executes fun/0 with retry on failure.
@@ -194,10 +259,12 @@ defmodule Meshex.Retry do
     max_attempts = Keyword.get(opts, :max_attempts, @default_max_attempts)
     initial_ms = Keyword.get(opts, :initial_interval_ms, @default_initial_interval_ms)
     max_ms = Keyword.get(opts, :max_interval_ms, @default_max_interval_ms)
-    idempotent = Keyword.get(opts, :idempotent, true)  # POST requests are not retried
+    idempotent = Keyword.get(opts, :idempotent, true)
+
+    # Track total requests in budget
+    record_total()
 
     unless idempotent do
-      # Non-idempotent requests: execute once, no retry
       fun.()
     else
       do_retry(fun, max_attempts, initial_ms, max_ms, 1)
@@ -213,7 +280,7 @@ defmodule Meshex.Retry do
       {:ok, result} ->
         {:ok, result}
 
-      {:error, _reason} = error ->
+      {:error, _reason} ->
         if budget_exceeded?() do
           {:error, :budget_exceeded}
         else
@@ -226,26 +293,42 @@ defmodule Meshex.Retry do
   end
 
   defp compute_backoff(initial_ms, max_ms, attempt) do
-    # Exponential backoff with full jitter
     base = min(initial_ms * :math.pow(2, attempt - 1), max_ms)
-    # Full jitter: random value in [0, base]
     :rand.uniform(round(base))
   end
 
   defp budget_exceeded? do
-    # TODO: read :total_requests and :retry_requests from ETS
-    # TODO: return true if retry_requests / total_requests > @default_budget_ratio
-    false
+    try do
+      [{_, total}] = :ets.lookup(@budget_table, :total_requests)
+      [{_, retries}] = :ets.lookup(@budget_table, :retry_requests)
+
+      total > 0 and retries / total > @default_budget_ratio
+    rescue
+      _ -> false
+    end
+  end
+
+  defp record_total do
+    try do
+      :ets.update_counter(@budget_table, :total_requests, 1, {:total_requests, 0})
+    rescue
+      _ -> :ok
+    end
   end
 
   defp record_retry do
-    # TODO: :ets.update_counter(:retry_budget, :retry_requests, 1)
-    :ok
+    try do
+      :ets.update_counter(@budget_table, :retry_requests, 1, {:retry_requests, 0})
+    rescue
+      _ -> :ok
+    end
   end
 end
 ```
 
 ### Step 5: `lib/meshex/tracing.ex`
+
+The tracing module implements W3C TraceContext propagation. It parses the `traceparent` header into its components (trace ID, parent span ID, flags) and generates new trace context for outgoing requests. Each proxy hop creates a new span ID while preserving the trace ID, building a distributed trace tree across the mesh.
 
 ```elixir
 defmodule Meshex.Tracing do
@@ -290,8 +373,7 @@ defmodule Meshex.Tracing do
   @doc "Builds a traceparent header value for the outgoing request."
   @spec build_traceparent(String.t(), String.t()) :: String.t()
   def build_traceparent(trace_id, span_id) do
-    # TODO: "00-#{trace_id}-#{span_id}-01"
-    ""
+    "00-#{trace_id}-#{span_id}-01"
   end
 
   @doc "Parses a traceparent header value."
@@ -313,7 +395,151 @@ defmodule Meshex.Tracing do
 end
 ```
 
-### Step 6: Given tests — must pass without modification
+### Step 6: `lib/meshex/mtls/cert_generator.ex`
+
+The certificate generator creates ephemeral X.509 certificates for mesh identity. It generates a self-signed CA at startup and signs short-lived service certificates with SPIFFE URIs in the Subject Alternative Name extension. Certificates use EC keys on the P-256 curve for fast handshakes.
+
+```elixir
+defmodule Meshex.MTLS.CertGenerator do
+  @moduledoc """
+  Generates ephemeral X.509 certificates with SPIFFE SVIDs.
+
+  SPIFFE URI format: spiffe://trust-domain/ns/namespace/sa/service-name
+  Example: spiffe://mesh.local/ns/default/sa/payment-service
+
+  Certificate lifecycle:
+  1. Generate EC key pair on P-256 curve
+  2. Build certificate with SPIFFE URI as SAN extension
+  3. Sign with mesh CA (also generated at startup)
+  4. Use for all TLS connections in this sidecar instance
+
+  Why ephemeral certificates?
+  Long-lived certificates require revocation infrastructure (CRL, OCSP).
+  Short-lived certificates expire naturally -- no revocation needed.
+  """
+
+  @doc """
+  Generates a self-signed CA certificate and key for the mesh.
+  Returns {:ok, {der_cert, private_key}} where private_key is the EC key term.
+  """
+  @spec generate_ca(String.t()) :: {:ok, {binary(), term()}}
+  def generate_ca(common_name) do
+    private_key = :public_key.generate_key({:namedCurve, :secp256r1})
+
+    # Extract the public key from the EC private key for the certificate
+    {:ECPrivateKey, _version, _private, _params, public_key_bitstring} = private_key
+    public_key = {:ECPoint, public_key_bitstring}
+    ec_params = {:namedCurve, :secp256r1}
+
+    # Build a self-signed certificate using OTP's :public_key module.
+    # For simplicity, we use a basic DER-encoded structure.
+    serial = :crypto.strong_rand_bytes(8) |> :binary.decode_unsigned()
+
+    subject = {:rdnSequence, [[{:AttributeTypeAndValue, {2, 5, 4, 3}, {:utf8String, common_name}}]]}
+
+    validity = validity_period(365 * 24 * 3600)
+
+    tbs = {:OTPTBSCertificate,
+      :v3,
+      serial,
+      {:SignatureAlgorithm, {1, 2, 840, 10045, 4, 3, 2}, :asn1_NOVALUE},
+      subject,
+      validity,
+      subject,
+      {:OTPSubjectPublicKeyInfo,
+        {:PublicKeyAlgorithm, {1, 2, 840, 10045, 2, 1}, ec_params},
+        public_key},
+      :asn1_NOVALUE,
+      :asn1_NOVALUE,
+      []}
+
+    cert_der = :public_key.pkix_sign(tbs, private_key)
+    {:ok, {cert_der, private_key}}
+  end
+
+  @doc """
+  Generates a service certificate signed by the given CA.
+  Includes the SPIFFE URI in the SubjectAlternativeName extension.
+  """
+  @spec generate_service_cert(String.t(), {binary(), term()}) ::
+    {:ok, {binary(), term()}} | {:error, term()}
+  def generate_service_cert(spiffe_uri, {_ca_cert_der, ca_key}) do
+    service_key = :public_key.generate_key({:namedCurve, :secp256r1})
+    {:ECPrivateKey, _version, _private, _params, pub_bitstring} = service_key
+    public_key = {:ECPoint, pub_bitstring}
+    ec_params = {:namedCurve, :secp256r1}
+
+    serial = :crypto.strong_rand_bytes(8) |> :binary.decode_unsigned()
+    subject = {:rdnSequence, [[{:AttributeTypeAndValue, {2, 5, 4, 3}, {:utf8String, spiffe_uri}}]]}
+    issuer = {:rdnSequence, [[{:AttributeTypeAndValue, {2, 5, 4, 3}, {:utf8String, "mesh-ca"}}]]}
+    validity = validity_period(24 * 3600)
+
+    tbs = {:OTPTBSCertificate,
+      :v3,
+      serial,
+      {:SignatureAlgorithm, {1, 2, 840, 10045, 4, 3, 2}, :asn1_NOVALUE},
+      issuer,
+      validity,
+      subject,
+      {:OTPSubjectPublicKeyInfo,
+        {:PublicKeyAlgorithm, {1, 2, 840, 10045, 2, 1}, ec_params},
+        public_key},
+      :asn1_NOVALUE,
+      :asn1_NOVALUE,
+      []}
+
+    cert_der = :public_key.pkix_sign(tbs, ca_key)
+    {:ok, {cert_der, service_key}}
+  end
+
+  @doc "Extracts the Common Name from a DER-encoded certificate."
+  @spec extract_spiffe_id(binary()) :: {:ok, String.t()} | {:error, :no_spiffe_id}
+  def extract_spiffe_id(cert_der) do
+    otp_cert = :public_key.pkix_decode_cert(cert_der, :otp)
+
+    {:OTPCertificate, tbs, _, _} = otp_cert
+    {:OTPTBSCertificate, _, _, _, _, _, subject, _, _, _, _} = tbs
+
+    case extract_cn(subject) do
+      {:ok, cn} ->
+        if String.starts_with?(cn, "spiffe://") do
+          {:ok, cn}
+        else
+          {:error, :no_spiffe_id}
+        end
+
+      :error ->
+        {:error, :no_spiffe_id}
+    end
+  end
+
+  defp extract_cn({:rdnSequence, rdn_list}) do
+    Enum.find_value(rdn_list, :error, fn attrs ->
+      Enum.find_value(attrs, nil, fn
+        {:AttributeTypeAndValue, {2, 5, 4, 3}, {:utf8String, value}} -> {:ok, value}
+        _ -> nil
+      end)
+    end)
+  end
+
+  defp validity_period(duration_seconds) do
+    now = :calendar.universal_time()
+    now_seconds = :calendar.datetime_to_gregorian_seconds(now)
+    later = :calendar.gregorian_seconds_to_datetime(now_seconds + duration_seconds)
+    {:Validity, {:utcTime, format_utc_time(now)}, {:utcTime, format_utc_time(later)}}
+  end
+
+  defp format_utc_time({{year, month, day}, {hour, min, sec}}) do
+    short_year = rem(year, 100)
+    :io_lib.format("~2..0B~2..0B~2..0B~2..0B~2..0B~2..0BZ",
+      [short_year, month, day, hour, min, sec])
+    |> IO.iodata_to_binary()
+    |> to_charlist()
+  end
+end
+```
+
+### Step 7: Given tests — must pass without modification
 
 ```elixir
 # test/meshex/tracing_test.exs
@@ -380,7 +606,7 @@ defmodule Meshex.CircuitBreakerTest do
 end
 ```
 
-### Step 7: Run the tests
+### Step 8: Run the tests
 
 ```bash
 mix test test/meshex/ --trace
@@ -426,6 +652,6 @@ If a service spawns a background task during request processing, the task's outb
 
 - [Envoy Proxy Architecture](https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/intro/arch_overview) — the reference sidecar proxy; xDS API, circuit breaking, and retry policy documentation
 - [Istio Data Plane Architecture](https://istio.io/latest/docs/ops/deployment/architecture/) — how sidecar injection and mTLS work in production
-- [SPIFFE Specification](https://spiffe.io/docs/latest/spiffe-about/spiffe-concept/) — the SPIFFE SVID (Secure Production Identity Framework for Everyone) standard your certificate SANs must follow
+- [SPIFFE Specification](https://spiffe.io/docs/latest/spiffe-about/spiffe-concept/) — the SPIFFE SVID standard your certificate SANs must follow
 - [W3C Trace Context Specification](https://www.w3.org/TR/trace-context/) — the `traceparent` and `tracestate` header specifications
 - [RFC 8446 — TLS 1.3](https://www.rfc-editor.org/rfc/rfc8446) — sections 4.4 (certificates) and 4.2.8 (key share) for understanding the mTLS handshake

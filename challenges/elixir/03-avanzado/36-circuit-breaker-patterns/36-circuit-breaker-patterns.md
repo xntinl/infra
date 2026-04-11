@@ -1,18 +1,18 @@
 # Circuit Breaker Patterns
 
-**Project**: `api_gateway` — built incrementally across the advanced level
+**Project**: `api_gateway` — a standalone HTTP gateway exercise
 
 ---
 
 ## Project context
 
-`api_gateway` already has a raw `:gen_statem` circuit breaker for the payments service
-(exercise 33). Now the operations team wants two additions: a second breaker for the
-fraud-scoring service backed by the battle-tested `Fuse` library (less code, telemetry
-built-in), and a bulkhead to cap concurrent in-flight calls to any downstream service
-so a slow dependency cannot exhaust the gateway's connection pool.
+You are building `api_gateway`, an HTTP gateway that routes traffic to microservices. The
+operations team wants two resilience mechanisms: a circuit breaker backed by the `Fuse`
+library for the fraud-scoring service (less custom code, telemetry built-in), and a bulkhead
+to cap concurrent in-flight calls to any downstream service so a slow dependency cannot
+exhaust the gateway's connection pool.
 
-Project structure at this point:
+Project structure:
 
 ```
 api_gateway/
@@ -20,12 +20,9 @@ api_gateway/
 │   └── api_gateway/
 │       ├── application.ex
 │       ├── router.ex
-│       ├── rate_limiter/
 │       └── circuit_breaker/
-│           ├── breaker.ex          # ← from exercise 33 (gen_statem, keep as-is)
-│           ├── fuse_breaker.ex     # ← you implement this (Exercise 1)
-│           ├── bulkhead.ex         # ← you implement this (Exercise 2)
-│           └── supervisor.ex       # already exists
+│           ├── fuse_breaker.ex     # ← Fuse-backed circuit breaker
+│           └── bulkhead.ex         # ← concurrency limiter
 ├── test/
 │   └── api_gateway/
 │       └── circuit_breaker/
@@ -38,19 +35,15 @@ api_gateway/
 
 ## The business problem
 
-Two downstream services are now protected:
+Two downstream services need protection:
 
-1. **Payments service** — already guarded by the raw `:gen_statem` breaker from
-   exercise 33. Production deployments need better observability without adding code.
-   The `Fuse` library ships with telemetry events out of the box.
+1. **Fraud-scoring service** — moderate failure rate, needs three-state circuit breaker
+   protection (closed / open / half_open). The `Fuse` library manages the state machine
+   internally and ships with telemetry events for monitoring dashboards.
 
-2. **Fraud-scoring service** — moderate failure rate, needs the same three-state
-   protection. The team does not want to maintain a second hand-rolled state machine.
-
-3. **Connection pool exhaustion** — both payment and fraud services can be slow under
-   load. Even with circuit breakers, a burst of concurrent calls can fill the gateway's
-   connection pool before the breaker opens. The bulkhead limits how many calls can be
-   in-flight at the same time.
+2. **Connection pool exhaustion** — even with circuit breakers, a burst of concurrent calls
+   can fill the gateway's connection pool before the breaker opens. The bulkhead limits how
+   many calls can be in-flight at the same time, providing immediate rejection when full.
 
 ---
 
@@ -58,7 +51,7 @@ Two downstream services are now protected:
 
 Both approaches implement the same state machine. The trade-off:
 
-| Aspect | Raw `:gen_statem` (exercise 33) | Fuse library |
+| Aspect | Raw `:gen_statem` | Fuse library |
 |--------|--------------------------------|--------------|
 | Code to maintain | ~80 lines | ~0 (library) |
 | Telemetry events | Manual | Built-in (`[:fuse, :circuit_breaker, :open]` etc.) |
@@ -451,7 +444,7 @@ mix test test/api_gateway/circuit_breaker/bulkhead_test.exs --trace
 
 ## Trade-off analysis
 
-| Aspect | Fuse library | Raw `:gen_statem` (exercise 33) |
+| Aspect | Fuse library | Raw `:gen_statem` |
 |--------|-------------|--------------------------------|
 | Lines of circuit-breaker code | ~15 | ~80 |
 | Telemetry events | Built-in | Manual |

@@ -1,19 +1,19 @@
 # Mock-Based Testing with Mox
 
-**Project**: `api_gateway` — built incrementally across the advanced level
+**Project**: `api_gateway` — a standalone HTTP gateway exercise
 
 ---
 
 ## Project context
 
-`api_gateway` now calls three external services: a payment provider HTTP API, a fraud
-scorer (the Python Port from exercise 31), and a Slack webhook for ops notifications.
-Testing gateway logic without hitting live external services requires replacing these
-dependencies with controllable fakes. Mox provides mock modules that implement the
-same behaviour contract as the real module, making the fake indistinguishable from the
-real thing at the type level.
+You are building `api_gateway`, an HTTP gateway that routes traffic to microservices. The
+gateway calls external services: a payment provider HTTP API, a fraud scorer, and a Slack
+webhook for ops notifications. Testing gateway logic without hitting live external services
+requires replacing these dependencies with controllable fakes. Mox provides mock modules
+that implement the same behaviour contract as the real module, making the fake
+indistinguishable from the real thing at the type level.
 
-Project structure at this point:
+Project structure:
 
 ```
 api_gateway/
@@ -22,9 +22,9 @@ api_gateway/
 │       ├── application.ex
 │       ├── router.ex
 │       └── notifications/
-│           ├── slack_behaviour.ex      # ← you implement this
-│           ├── slack_client.ex         # ← and this (real implementation)
-│           └── ops_notifier.ex         # ← and this (business logic)
+│           ├── slack_behaviour.ex      # ← behaviour contract
+│           ├── slack_client.ex         # ← real implementation
+│           └── ops_notifier.ex         # ← business logic under test
 ├── test/
 │   ├── test_helper.exs                 # ← defmock calls go here
 │   └── api_gateway/

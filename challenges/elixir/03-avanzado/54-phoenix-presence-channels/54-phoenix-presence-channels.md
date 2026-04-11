@@ -1,29 +1,25 @@
 # Phoenix Presence: Connected Client Tracking
 
-**Project**: `api_gateway` — built incrementally across the advanced level
+## Overview
 
----
+Implement distributed, conflict-free tracking of connected clients for an API gateway
+using Phoenix Presence. Track who is connected, how long they've been connected, and enforce
+per-room limits on concurrent debug sessions -- all with automatic cleanup when sockets die.
 
-## Project context
-
-The `api_gateway` now has a Channel layer (exercise 53). Clients connect via WebSocket and
-receive real-time events. The operations team wants to know, at any moment: which clients
-are connected, how long they've been connected, and what they're doing. The gateway also
-needs to enforce per-room limits on concurrent debug sessions.
-
-Phoenix Presence provides distributed, conflict-free tracking of who is connected where.
-
-Project structure for this exercise:
+Project structure:
 
 ```
-api_gateway_umbrella/apps/gateway_api/
-├── lib/gateway_api_web/
-│   ├── presence.ex                      # ← you implement this
-│   └── channels/
-│       ├── debug_session_channel.ex     # ← and this
-│       └── client_monitor_channel.ex    # ← and this
-└── test/gateway_api_web/channels/
-    └── debug_session_channel_test.exs   # given tests
+api_gateway/
+├── lib/
+│   └── api_gateway_web/
+│       ├── presence.ex
+│       └── channels/
+│           ├── user_socket.ex
+│           ├── debug_session_channel.ex
+│           └── client_monitor_channel.ex
+└── test/
+    └── api_gateway_web/channels/
+        └── debug_session_channel_test.exs
 ```
 
 ---
@@ -32,16 +28,12 @@ api_gateway_umbrella/apps/gateway_api/
 
 When you track connected clients in ETS directly, you get a race condition: between `join/3`
 checking the count and `track/3` inserting the new entry, another connection can slip in.
-You also get stale entries when a node crashes — ETS is in-memory and lost.
+You also get stale entries when a node crashes -- ETS is in-memory and lost.
 
 Phoenix Presence is built on `Phoenix.Tracker`, a CRDTs-based distributed tracker. It:
 - Automatically removes entries when a socket process dies (via monitoring)
-- Synchronizes across nodes using delta CRDTs — no centralized coordinator
+- Synchronizes across nodes using delta CRDTs -- no centralized coordinator
 - Broadcasts `presence_diff` events to all subscribers when membership changes
-
-The cost: Presence state is eventually consistent across nodes. For connection tracking
-where a few milliseconds of lag is acceptable, this is fine. For strict capacity limits,
-the exercise shows how to mitigate the inherent race condition.
 
 ---
 
@@ -52,7 +44,7 @@ is not yet fully initialized. The correct pattern:
 
 ```elixir
 def join("room:x", params, socket) do
-  send(self(), :after_join)   # schedule track for AFTER join returns
+  send(self(), :after_join)
   {:ok, socket}
 end
 
@@ -63,42 +55,62 @@ def handle_info(:after_join, socket) do
 end
 ```
 
-`send(self(), :after_join)` enqueues the message in the channel process's mailbox. It will
-be processed after `join/3` has returned and the socket is fully registered.
-
 ---
 
 ## Implementation
 
-### Step 1: `lib/gateway_api_web/presence.ex`
+### Step 1: `lib/api_gateway_web/presence.ex`
 
 ```elixir
-defmodule GatewayApiWeb.Presence do
+defmodule ApiGatewayWeb.Presence do
   use Phoenix.Presence,
-    otp_app: :gateway_api,
-    pubsub_server: GatewayApi.PubSub
+    otp_app: :api_gateway,
+    pubsub_server: ApiGateway.PubSub
 end
 ```
 
 Add to `application.ex`:
 
 ```elixir
-# apps/gateway_api/lib/gateway_api/application.ex
 children = [
-  GatewayApiWeb.Endpoint,
-  GatewayApiWeb.Presence   # must be supervised explicitly
+  ApiGatewayWeb.Endpoint,
+  ApiGatewayWeb.Presence
 ]
 ```
 
-### Step 2: `lib/gateway_api_web/channels/debug_session_channel.ex`
+### Step 2: `lib/api_gateway_web/channels/user_socket.ex`
+
+```elixir
+defmodule ApiGatewayWeb.UserSocket do
+  use Phoenix.Socket
+
+  channel "debug:*",    ApiGatewayWeb.DebugSessionChannel
+  channel "ops:monitor", ApiGatewayWeb.ClientMonitorChannel
+
+  @impl true
+  def connect(%{"token" => token}, socket, _connect_info) do
+    case Phoenix.Token.verify(ApiGatewayWeb.Endpoint, "socket", token, max_age: 86_400) do
+      {:ok, client_id} ->
+        {:ok, assign(socket, :client_id, client_id)}
+      {:error, _reason} ->
+        :error
+    end
+  end
+
+  @impl true
+  def id(socket), do: "client_socket:#{socket.assigns.client_id}"
+end
+```
+
+### Step 3: `lib/api_gateway_web/channels/debug_session_channel.ex`
 
 Debug sessions allow clients to receive detailed trace logs for their requests. The gateway
 limits each debug room to 5 concurrent sessions to prevent resource exhaustion.
 
 ```elixir
-defmodule GatewayApiWeb.DebugSessionChannel do
+defmodule ApiGatewayWeb.DebugSessionChannel do
   use Phoenix.Channel
-  alias GatewayApiWeb.Presence
+  alias ApiGatewayWeb.Presence
 
   @max_sessions 5
 
@@ -108,7 +120,6 @@ defmodule GatewayApiWeb.DebugSessionChannel do
 
     cond do
       Map.has_key?(presences, socket.assigns.client_id) ->
-        # Reconnect — this client is already tracked, allow re-join
         socket = socket
         |> assign(:room_id, room_id)
         |> assign(:trace_level, level)
@@ -133,18 +144,28 @@ defmodule GatewayApiWeb.DebugSessionChannel do
 
   @impl true
   def handle_info(:after_join, socket) do
-    # TODO:
-    # 1. Presence.track/3 with metadata: client_id, trace_level, joined_at
-    # 2. push "presence_state" with current presences to this socket
-    # 3. broadcast! "session_joined" to all others in the room
+    {:ok, _} = Presence.track(socket, socket.assigns.client_id, %{
+      trace_level: socket.assigns.trace_level,
+      joined_at: DateTime.utc_now()
+    })
+
+    push(socket, "presence_state", Presence.list(socket))
+
+    broadcast_from!(socket, "session_joined", %{
+      client_id: socket.assigns.client_id,
+      trace_level: socket.assigns.trace_level
+    })
+
     {:noreply, socket}
   end
 
   @impl true
   def handle_in("set_trace_level", %{"level" => level}, socket)
       when level in ["debug", "info", "warn", "error"] do
-    # Update presence metadata with new trace level without reconnecting
-    # TODO: Presence.update/3 to change the :trace_level field
+    {:ok, _} = Presence.update(socket, socket.assigns.client_id, fn meta ->
+      Map.put(meta, :trace_level, level)
+    end)
+
     {:reply, :ok, assign(socket, :trace_level, level)}
   end
 
@@ -163,21 +184,19 @@ defmodule GatewayApiWeb.DebugSessionChannel do
 end
 ```
 
-### Step 3: `lib/gateway_api_web/channels/client_monitor_channel.ex`
+### Step 4: `lib/api_gateway_web/channels/client_monitor_channel.ex`
 
 This channel gives the ops team a live view of all connected clients.
 
 ```elixir
-defmodule GatewayApiWeb.ClientMonitorChannel do
+defmodule ApiGatewayWeb.ClientMonitorChannel do
   use Phoenix.Channel
-  alias GatewayApiWeb.Presence
+  alias ApiGatewayWeb.Presence
 
   @topic "ops:clients"
 
   @impl true
   def join("ops:monitor", _params, socket) do
-    # Only ops-role clients can join this channel
-    # Assume the socket assigns :role from the token verification in UserSocket
     if socket.assigns[:role] == :ops do
       send(self(), :after_join)
       {:ok, socket}
@@ -188,24 +207,25 @@ defmodule GatewayApiWeb.ClientMonitorChannel do
 
   @impl true
   def handle_info(:after_join, socket) do
-    # TODO:
-    # 1. Track this ops client in Presence with metadata: role, connected_at
-    # 2. Push "presence_state" with ALL connected clients (not just ops ones)
-    #    HINT: Presence.list(@topic) where @topic tracks all gateway clients
+    {:ok, _} = Presence.track(socket, socket.assigns.client_id, %{
+      role: :ops,
+      connected_at: DateTime.utc_now()
+    })
+
+    push(socket, "presence_state", Presence.list(@topic))
+
     {:noreply, socket}
   end
 
   @impl true
   def handle_in("disconnect_client", %{"client_id" => client_id}, socket) do
-    # Force-disconnect a misbehaving client
-    # TODO: GatewayApiWeb.Endpoint.broadcast("client_socket:#{client_id}", "disconnect", %{})
-    # This triggers the UserSocket's id/1 — matches "client_socket:{id}"
+    ApiGatewayWeb.Endpoint.broadcast("client_socket:#{client_id}", "disconnect", %{})
     {:reply, :ok, socket}
   end
 end
 ```
 
-### Step 4: JavaScript client
+### Step 5: JavaScript client
 
 ```javascript
 import { Socket, Presence } from "phoenix"
@@ -213,7 +233,6 @@ import { Socket, Presence } from "phoenix"
 const socket = new Socket("/socket", { params: { token: authToken } })
 socket.connect()
 
-// Join a debug session room
 const channel = socket.channel("debug:payments-service", {
   trace_level: "debug"
 })
@@ -228,7 +247,6 @@ channel.join()
     }
   })
 
-// Track who else is in the debug session
 presence.onSync(() => {
   const sessions = presence.list((id, { metas: [first] }) => ({
     clientId: id,
@@ -248,7 +266,6 @@ presence.onLeave((id, current) => {
   }
 })
 
-// Update trace level without reconnecting
 function setTraceLevel(level) {
   channel.push("set_trace_level", { level })
     .receive("ok", () => console.log("Trace level updated"))
@@ -256,17 +273,17 @@ function setTraceLevel(level) {
 }
 ```
 
-### Step 5: Given tests — must pass without modification
+### Step 6: Tests
 
 ```elixir
-# test/gateway_api_web/channels/debug_session_channel_test.exs
-defmodule GatewayApiWeb.DebugSessionChannelTest do
-  use GatewayApiWeb.ChannelCase
+# test/api_gateway_web/channels/debug_session_channel_test.exs
+defmodule ApiGatewayWeb.DebugSessionChannelTest do
+  use ApiGatewayWeb.ChannelCase
 
-  alias GatewayApiWeb.Presence
+  alias ApiGatewayWeb.Presence
 
   defp make_socket(client_id) do
-    GatewayApiWeb.UserSocket
+    ApiGatewayWeb.UserSocket
     |> socket(client_id, %{client_id: client_id})
   end
 
@@ -274,7 +291,7 @@ defmodule GatewayApiWeb.DebugSessionChannelTest do
     {:ok, _, _socket} =
       make_socket("c1")
       |> subscribe_and_join(
-        GatewayApiWeb.DebugSessionChannel,
+        ApiGatewayWeb.DebugSessionChannel,
         "debug:test-room",
         %{"trace_level" => "debug"}
       )
@@ -283,12 +300,11 @@ defmodule GatewayApiWeb.DebugSessionChannelTest do
   end
 
   test "rejects when room is at max capacity" do
-    # Fill the room to @max_sessions
     Enum.each(1..5, fn i ->
       {:ok, _, _} =
         make_socket("client-#{i}")
         |> subscribe_and_join(
-          GatewayApiWeb.DebugSessionChannel,
+          ApiGatewayWeb.DebugSessionChannel,
           "debug:full-room",
           %{"trace_level" => "info"}
         )
@@ -297,7 +313,7 @@ defmodule GatewayApiWeb.DebugSessionChannelTest do
     assert {:error, %{reason: "room_full", max: 5}} =
       make_socket("client-6")
       |> subscribe_and_join(
-        GatewayApiWeb.DebugSessionChannel,
+        ApiGatewayWeb.DebugSessionChannel,
         "debug:full-room",
         %{"trace_level" => "info"}
       )
@@ -307,16 +323,14 @@ defmodule GatewayApiWeb.DebugSessionChannelTest do
     {:ok, _, socket} =
       make_socket("dc-client")
       |> subscribe_and_join(
-        GatewayApiWeb.DebugSessionChannel,
+        ApiGatewayWeb.DebugSessionChannel,
         "debug:dc-room",
         %{"trace_level" => "warn"}
       )
 
-    # Give Presence time to register
     Process.sleep(50)
     assert 1 == Presence.list("debug:dc-room") |> map_size()
 
-    # Simulate disconnect
     Process.exit(socket.channel_pid, :normal)
     Process.sleep(50)
 
@@ -327,7 +341,7 @@ defmodule GatewayApiWeb.DebugSessionChannelTest do
     {:ok, _, socket} =
       make_socket("level-client")
       |> subscribe_and_join(
-        GatewayApiWeb.DebugSessionChannel,
+        ApiGatewayWeb.DebugSessionChannel,
         "debug:level-room",
         %{"trace_level" => "info"}
       )
@@ -345,7 +359,7 @@ defmodule GatewayApiWeb.DebugSessionChannelTest do
     {:ok, _, socket} =
       make_socket("inv-client")
       |> subscribe_and_join(
-        GatewayApiWeb.DebugSessionChannel,
+        ApiGatewayWeb.DebugSessionChannel,
         "debug:inv-room",
         %{"trace_level" => "info"}
       )
@@ -356,10 +370,10 @@ defmodule GatewayApiWeb.DebugSessionChannelTest do
 end
 ```
 
-### Step 6: Run the tests
+### Step 7: Run the tests
 
 ```bash
-mix test test/gateway_api_web/channels/ --trace
+mix test test/api_gateway_web/channels/ --trace
 ```
 
 ---
@@ -375,11 +389,6 @@ mix test test/gateway_api_web/channels/ --trace
 | Metadata updates | Presence.update/3 | :ets.insert | HSET |
 | Overhead | PubSub broadcast per change | ETS write | network round-trip |
 
-Reflection: the capacity check in `join/3` is not atomic — two clients can both read
-`map_size(presences) == 4` and both pass the check, resulting in 6 sessions in a room
-capped at 5. How would you tighten this without introducing a serializing GenServer?
-(Hint: `handle_info(:after_join, ...)` can check again and kick itself out.)
-
 ---
 
 ## Common production mistakes
@@ -390,17 +399,17 @@ raises `no process`. Add it explicitly to `application.ex` children.
 
 **2. Calling `Presence.track/3` directly in `join/3`**
 The socket is not fully initialized when `join/3` runs. The `send(self(), :after_join)`
-pattern defers tracking until after `join/3` has returned and the socket is registered.
+pattern defers tracking until after `join/3` has returned.
 
 **3. Not canceling timers before creating new ones**
-If you add timer-based metadata (e.g., "typing" indicator that clears after 3s), calling
-`Process.send_after` on every keystroke without canceling the previous timer accumulates
-timers. Store the `timer_ref` in socket assigns and call `Process.cancel_timer/1` first.
+If you add timer-based metadata (e.g., "typing" indicator), calling `Process.send_after`
+on every keystroke without canceling the previous timer accumulates timers. Store the
+`timer_ref` in socket assigns and call `Process.cancel_timer/1` first.
 
 **4. Using `map_size(Presence.list(...))` for strict capacity enforcement**
 `Presence.list` reflects the CRDT state at query time. Under concurrent joins, this is
-eventually consistent. For hard capacity limits on critical resources, a GenServer with
-serialized join logic is more appropriate than Presence alone.
+eventually consistent. For hard capacity limits, a GenServer with serialized join logic
+is more appropriate.
 
 **5. Sending `presence_state` before `Presence.track/3`**
 If you push `presence_state` before tracking yourself, the joining client sees the list
@@ -410,7 +419,7 @@ without themselves. Always track first, then push the state.
 
 ## Resources
 
-- [`Phoenix.Presence`](https://hexdocs.pm/phoenix/Phoenix.Presence.html) — API reference and CRDTs explanation
-- [`Phoenix.Tracker`](https://hexdocs.pm/phoenix_pubsub/Phoenix.Tracker.html) — the underlying distributed tracker
-- [phoenix.js `Presence` class](https://hexdocs.pm/phoenix/js/) — `onSync`, `onJoin`, `onLeave` callbacks
-- [CRDTs explained](https://crdt.tech/) — the theory behind conflict-free replicated data types
+- [`Phoenix.Presence`](https://hexdocs.pm/phoenix/Phoenix.Presence.html) -- API reference and CRDTs explanation
+- [`Phoenix.Tracker`](https://hexdocs.pm/phoenix_pubsub/Phoenix.Tracker.html) -- the underlying distributed tracker
+- [phoenix.js `Presence` class](https://hexdocs.pm/phoenix/js/) -- `onSync`, `onJoin`, `onLeave` callbacks
+- [CRDTs explained](https://crdt.tech/) -- the theory behind conflict-free replicated data types

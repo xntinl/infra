@@ -1,17 +1,17 @@
 # Binary Matching Performance
 
-**Project**: `api_gateway` — built incrementally across the advanced level
+**Project**: `api_gateway` — a standalone HTTP gateway exercise
 
 ---
 
 ## Project context
 
-You're building `api_gateway`, an HTTP gateway that routes traffic to microservices. The gateway
+You are building `api_gateway`, an HTTP gateway that routes traffic to microservices. The gateway
 receives raw HTTP/1.1 request lines over TCP and must parse them at high throughput. The infra
 team measured that the current parser (using `String.split` and `Regex`) becomes the bottleneck
 above 5,000 req/s on a single node.
 
-Project structure at this point:
+Project structure:
 
 ```
 api_gateway/
@@ -20,8 +20,8 @@ api_gateway/
 │       ├── application.ex
 │       ├── router.ex
 │       └── middleware/
-│           ├── parser.ex           # ← you implement this
-│           └── parser_bench.exs    # ← benchmark — run at the end
+│           ├── parser.ex           # ← main implementation
+│           └── parser_bench.exs    # ← benchmark
 ├── test/
 │   └── api_gateway/
 │       └── middleware/

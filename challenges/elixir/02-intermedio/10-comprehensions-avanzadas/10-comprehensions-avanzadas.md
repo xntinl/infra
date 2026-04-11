@@ -1,35 +1,8 @@
 # Advanced Comprehensions
 
-**Project**: `task_queue` — built incrementally across the intermediate level
-
----
-
-## Project context
-
-The task_queue system accumulates job results, stats, and configuration from multiple
-sources. Transforming, filtering, and reshaping these collections is a constant need.
-`for` comprehensions — with filters, multiple generators, `:into`, `:uniq`, and `:reduce`
-— produce cleaner, more declarative code than chained `Enum` calls for many of these cases.
-
-Project structure at this point:
-
-```
-task_queue/
-├── lib/
-│   └── task_queue/
-│       └── report_builder.ex
-├── test/
-│   └── task_queue/
-│       └── comprehensions_test.exs   # given tests — must pass without modification
-└── mix.exs
-```
-
----
-
 ## Why comprehensions over Enum chains
 
-A comprehension makes the **source, filter, and transformation** visible in one expression.
-Compare:
+A comprehension makes the **source, filter, and transformation** visible in one expression:
 
 ```elixir
 # Enum chain — three passes over the data
@@ -43,26 +16,40 @@ for %{status: :ok, job_id: id, duration_ms: ms} <- results, into: %{}, do: {id, 
 ```
 
 The comprehension's filter also **pattern-matches** — it skips non-matching shapes silently
-instead of crashing. This is important when processing data from external sources where
-shape is not guaranteed.
+instead of crashing. This is important when processing data from external sources.
 
 When Enum wins: when you need `Enum.reduce` with complex accumulation, `Enum.sort`, or
-chained operations where each step depends on the previous result. Comprehensions are not
-a universal replacement — they are the right tool for map/filter/collect patterns.
+chained operations where each step depends on the previous result.
 
 ---
 
 ## The business problem
 
-`TaskQueue.ReportBuilder` transforms raw collections of job results and queue stats into
-report-friendly structures. It uses comprehensions throughout to keep transformation logic
-readable.
+Build a `TaskQueue.ReportBuilder` that transforms raw collections of job results and
+queue stats into report-friendly structures using comprehensions throughout.
+
+All modules are defined completely in this exercise.
+
+---
+
+## Project setup
+
+```
+task_queue/
+├── lib/
+│   └── task_queue/
+│       └── report_builder.ex
+├── test/
+│   └── task_queue/
+│       └── comprehensions_test.exs
+└── mix.exs
+```
 
 ---
 
 ## Implementation
 
-### Step 1: `lib/task_queue/report_builder.ex`
+### `lib/task_queue/report_builder.ex`
 
 ```elixir
 defmodule TaskQueue.ReportBuilder do
@@ -149,31 +136,14 @@ end
 Each function demonstrates a different comprehension feature:
 
 - **`success_durations/1`** uses `into: %{}` to collect directly into a map. The generator
-  pattern `%{status: :ok, job_id: id, duration_ms: ms}` both filters (only `:ok` status)
-  and destructures (extracts `id` and `ms`) in one expression. Entries that do not match
-  the pattern (like entries with `:error` status or missing keys) are silently skipped.
+  pattern both filters (only `:ok` status) and destructures in one expression.
+- **`unique_errors/1`** uses `uniq: true` to deduplicate results.
+- **`worker_type_matrix/2`** uses two generators to produce a cartesian product.
+- **`group_by_status/1`** uses `:reduce` to build a map accumulator.
+- **`slow_jobs/1`** combines a comprehension with `Enum.sort_by/3`.
+- **`worker_summary/1`** uses `:reduce` with a nested map structure.
 
-- **`unique_errors/1`** uses `uniq: true` to deduplicate results. This is equivalent to
-  piping through `Enum.uniq/1` at the end, but expressed declaratively.
-
-- **`worker_type_matrix/2`** uses two generators to produce a cartesian product. For each
-  `worker_id` and each successful job, a `{worker_id, type}` tuple is emitted. The pattern
-  `%{type: type, status: :ok}` in the second generator acts as both a filter and a
-  destructure.
-
-- **`group_by_status/1`** uses `:reduce` to build a map accumulator. Each iteration updates
-  the map by prepending the job ID to the appropriate status list. The `Map.update/4`
-  function handles both initial insertion and subsequent updates.
-
-- **`slow_jobs/1`** combines a comprehension (for filtering and extracting) with
-  `Enum.sort_by/3` (for ordering). Comprehensions do not support sorting, so post-processing
-  with `Enum` is the right approach.
-
-- **`worker_summary/1`** uses `:reduce` with a nested map structure. The `default` map
-  provides zero-value initialization for each new worker. `Map.update!/3` increments the
-  counter for the matching status.
-
-### Step 2: Given tests — must pass without modification
+### Tests
 
 ```elixir
 # test/task_queue/comprehensions_test.exs
@@ -189,7 +159,6 @@ defmodule TaskQueue.ComprehensionsTest do
     %{job_id: "j4", status: :error, duration_ms: 100, type: :webhook, worker_id: "w2", error: :network},
     %{job_id: "j5", status: :ok, duration_ms: 500, type: :pipeline, worker_id: "w1", error: nil},
     %{job_id: "j6", status: :error, duration_ms: 80, type: :cron, worker_id: "w3", error: :timeout},
-    # Entry with missing fields — should be silently skipped by comprehension filters
     %{job_id: "j7", status: :unknown}
   ]
 
@@ -207,7 +176,6 @@ defmodule TaskQueue.ComprehensionsTest do
 
   test "worker_type_matrix produces cross-product of workers and successful job types" do
     pairs = ReportBuilder.worker_type_matrix(@results, ["w1", "w2"])
-    # 2 workers x 3 ok jobs = 6 pairs
     assert length(pairs) == 6
     assert {"w1", :webhook} in pairs
     assert {"w2", :pipeline} in pairs
@@ -223,7 +191,6 @@ defmodule TaskQueue.ComprehensionsTest do
 
   test "slow_jobs returns IDs exceeding threshold, sorted desc by duration" do
     slow = ReportBuilder.slow_jobs(@results, 100)
-    # j5 (500ms) and j2 (200ms) exceed 100ms; j4 is exactly 100 so not included
     assert ["j5", "j2"] == slow
   end
 
@@ -232,21 +199,20 @@ defmodule TaskQueue.ComprehensionsTest do
 
     assert summary["w1"].ok == 2
     assert summary["w1"].error == 1
-    assert summary["w1"].total_ms == 750  # 50 + 200 + 500
+    assert summary["w1"].total_ms == 750
 
     assert summary["w2"].ok == 1
     assert summary["w2"].error == 1
   end
 
   test "comprehension silently skips entries with missing fields" do
-    # j7 has :unknown status and no duration_ms — should not cause KeyError
     assert is_map(ReportBuilder.group_by_status(@results))
     assert is_map(ReportBuilder.worker_summary(@results))
   end
 end
 ```
 
-### Step 3: Run the tests
+### Run the tests
 
 ```bash
 mix test test/task_queue/comprehensions_test.exs --trace
@@ -254,52 +220,22 @@ mix test test/task_queue/comprehensions_test.exs --trace
 
 ---
 
-## Trade-off analysis
-
-| Aspect | Comprehension | Enum.map + Enum.filter | Enum.reduce |
-|--------|--------------|----------------------|-------------|
-| Multiple generators (cartesian product) | Yes — `for a <- x, b <- y` | No — manual nesting needed | Manual |
-| Pattern filter (skips non-matching) | Yes — built into generator | No — must use `Enum.filter` first | Manual guard |
-| :into — direct collection target | Yes | `Enum.into` at the end | Manual |
-| :reduce — arbitrary accumulator | Yes (Elixir 1.8+) | No | Yes |
-| :uniq deduplication | Yes — `:uniq: true` | `Enum.uniq` at the end | Manual |
-| Readable for simple map/filter? | Yes | Yes | No |
-| Readable for complex multi-step transforms? | Moderate | Better | Best |
-
-Reflection question: `worker_type_matrix/2` uses two generators and produces a cartesian
-product of workers x ok jobs. If your system has 100 workers and 10,000 results, the
-product has 1,000,000 tuples. What alternative data structure or query approach would you
-use instead, and when would the cartesian product actually be the correct choice?
-
----
-
 ## Common production mistakes
 
 **1. Using comprehension filters for side effects**
-A `for` filter (`for x <- list, condition(x), do: ...`) must be a pure boolean expression.
-Using `IO.puts` or `Agent.update` inside the filter will cause unexpected behaviour because
-filters are not for side effects.
+A `for` filter must be a pure boolean expression. Using `IO.puts` inside the filter
+causes unexpected behaviour.
 
 **2. Expecting comprehension to behave like `Enum.filter` alone**
-The comprehension generator with a pattern **silently skips non-matching entries**. This is
-usually what you want (resilient to bad data), but if you need to know which entries were
-skipped, you cannot detect them from inside the comprehension. Use `Enum.split_with` first.
+The generator with a pattern silently skips non-matching entries. If you need to know
+which entries were skipped, use `Enum.split_with` first.
 
 **3. Forgetting that `:reduce` replaces `:into`**
-You cannot use both `:reduce` and `:into` in the same comprehension. If you need to produce
-a map with complex accumulation, use `:reduce`. If you just need `Enum.into`, use `:into`.
+You cannot use both `:reduce` and `:into` in the same comprehension.
 
 **4. Mutable-style thinking with `:reduce`**
-The accumulator in `:reduce` is immutable. You must return the updated accumulator from each
-iteration:
-```elixir
-# WRONG — returns nothing, acc is not updated
-for x <- list, reduce: %{} do
-  acc -> Map.put(acc, x.key, x.value)  # must be the last expression
-end
-
-# CORRECT — the last expression in the block is the new accumulator value
-```
+The accumulator is immutable. The last expression in each iteration becomes the new
+accumulator value.
 
 ---
 
@@ -307,4 +243,4 @@ end
 
 - [for — Elixir Getting Started](https://elixir-lang.org/getting-started/comprehensions.html)
 - [Kernel.SpecialForms.for/1 — HexDocs](https://hexdocs.pm/elixir/Kernel.SpecialForms.html#for/1)
-- [Enum — HexDocs](https://hexdocs.pm/elixir/Enum.html) — compare with comprehension capabilities
+- [Enum — HexDocs](https://hexdocs.pm/elixir/Enum.html)

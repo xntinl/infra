@@ -1,63 +1,26 @@
 # Behaviours: Module Contracts
 
-**Project**: `task_queue` — built incrementally across the intermediate level
+## Why behaviours
 
----
+Behaviours let you define a contract that every implementation module must follow. They
+add value when:
 
-## Project context
-
-The task_queue system currently has a single Worker that executes job payloads directly.
-In practice, different job types need different execution strategies: some jobs should be
-retried on failure, others should time out after a deadline, others should emit metrics.
-Rather than a monolithic Worker with growing conditional logic, you define a behaviour:
-a contract that every job handler must implement.
-
-This is the same mechanism OTP uses for GenServer, Supervisor, and Application — you have
-been using behaviours since exercise 04 without realising it.
-
-Project structure at this point:
-
-```
-task_queue/
-├── lib/
-│   └── task_queue/
-│       ├── job_handler.ex           # the behaviour definition
-│       ├── handlers/
-│       │   ├── default_handler.ex
-│       │   └── retrying_handler.ex
-│       └── worker.ex                # updated to accept a configurable handler
-├── test/
-│   └── task_queue/
-│       └── job_handler_test.exs     # given tests — must pass without modification
-└── mix.exs
-```
-
----
-
-## Why behaviours and not plain functions
-
-You could pass a handler as an anonymous function: `Worker.start_link(handler: &my_fn/1)`.
-That works for a single callback. Behaviours add value when:
-
-1. The contract has **multiple callbacks** that must work together — a handler needs both
-   `execute/2` and `on_failure/3`.
+1. The contract has **multiple callbacks** that must work together.
 2. You want **compile-time verification** — missing a callback is caught before runtime.
-3. You want **documentation at the callsite** — `@impl TaskQueue.JobHandler` tells the
-   reader exactly which contract this function satisfies.
-4. The handler module has **its own state or configuration** beyond what can be captured
-   in a closure.
+3. You want **documentation at the callsite** — `@impl MyBehaviour` tells the reader
+   exactly which contract this function satisfies.
 
 The distinction between behaviours and protocols: behaviours dispatch on the **module**
 (you call `handler_module.execute(job, ctx)`). Protocols dispatch on the **type of a
-value** (you call `MyProtocol.some_fn(value)` and the dispatch is automatic based on
-`value`'s type). Use behaviours for pluggable strategy modules; use protocols when you
-want to add capabilities to existing data types.
+value** (you call `MyProtocol.some_fn(value)` and dispatch is automatic based on the
+value's type). Use behaviours for pluggable strategy modules; use protocols for adding
+capabilities to existing data types.
 
 ---
 
 ## The business problem
 
-`TaskQueue.JobHandler` is a behaviour that every job handler must implement:
+Build a `TaskQueue.JobHandler` behaviour that every job handler must implement:
 
 - `execute/2` — runs the job. Returns `{:ok, result}` or `{:error, reason}`.
 - `on_failure/3` — called after a failed execution. Returns `:retry | :abort`.
@@ -68,11 +31,31 @@ Two implementations:
 - `DefaultHandler` — one attempt, no retry, 10s timeout.
 - `RetryingHandler` — three attempts with exponential backoff, 5s timeout per attempt.
 
+All modules are defined completely in this exercise.
+
+---
+
+## Project setup
+
+```
+task_queue/
+├── lib/
+│   └── task_queue/
+│       ├── job_handler.ex
+│       └── handlers/
+│           ├── default_handler.ex
+│           └── retrying_handler.ex
+├── test/
+│   └── task_queue/
+│       └── job_handler_test.exs
+└── mix.exs
+```
+
 ---
 
 ## Implementation
 
-### Step 1: `lib/task_queue/job_handler.ex`
+### `lib/task_queue/job_handler.ex`
 
 ```elixir
 defmodule TaskQueue.JobHandler do
@@ -88,27 +71,10 @@ defmodule TaskQueue.JobHandler do
   @type result :: {:ok, any()} | {:error, any()}
   @type failure_action :: :retry | :abort
 
-  @doc """
-  Executes the job. May be called multiple times if max_attempts > 1.
-  Receives the job map and a context with current attempt number.
-  """
   @callback execute(job(), context()) :: result()
-
-  @doc """
-  Called after each failed attempt. Returns :retry to try again or :abort to give up.
-  Receives the job, the failure reason, and the current attempt context.
-  """
   @callback on_failure(job(), reason :: any(), context()) :: failure_action()
-
-  @doc "Maximum number of execution attempts before the job is marked :failed."
   @callback max_attempts() :: pos_integer()
-
-  @doc "Timeout in milliseconds for a single execution attempt."
   @callback timeout_ms() :: pos_integer()
-
-  # ---------------------------------------------------------------------------
-  # Provided helper — dispatches through the behaviour
-  # ---------------------------------------------------------------------------
 
   @doc """
   Runs a job through the given handler module, respecting retry and timeout policy.
@@ -150,17 +116,13 @@ defmodule TaskQueue.JobHandler do
 end
 ```
 
-The `run/2` function is the behavior's dispatch engine. It orchestrates the retry loop
-by calling the handler module's callbacks at each step. Each attempt runs inside a
-`Task.async/await` pair to enforce the timeout. If the task exceeds `timeout_ms`, the
-catch clause returns `{:error, :timeout}` and the handler's `on_failure/3` decides
-whether to retry or abort.
-
+The `run/2` function orchestrates the retry loop by calling the handler module's callbacks
+at each step. Each attempt runs inside a `Task.async/await` pair to enforce the timeout.
 The recursive `do_run/3` increments the attempt counter on each retry. When `attempt`
-reaches `max_attempts`, the function returns `{:error, {:max_attempts_exceeded, reason}}`
-regardless of what `on_failure/3` returns — the handler cannot override the maximum.
+reaches `max_attempts`, the function returns the final error regardless of what
+`on_failure/3` returns.
 
-### Step 2: `lib/task_queue/handlers/default_handler.ex`
+### `lib/task_queue/handlers/default_handler.ex`
 
 ```elixir
 defmodule TaskQueue.Handlers.DefaultHandler do
@@ -187,13 +149,7 @@ defmodule TaskQueue.Handlers.DefaultHandler do
 end
 ```
 
-The DefaultHandler calls `job.payload.()` directly and wraps the return value in
-`{:ok, result}`. If the payload raises an exception, the raise propagates out of
-`execute/2`, and the `Task.async/await` in `JobHandler.run/2` catches it as an exit
-signal. Since `max_attempts` is 1, the error is immediately returned as
-`{:error, {:max_attempts_exceeded, reason}}` — `on_failure/3` is never called.
-
-### Step 3: `lib/task_queue/handlers/retrying_handler.ex`
+### `lib/task_queue/handlers/retrying_handler.ex`
 
 ```elixir
 defmodule TaskQueue.Handlers.RetryingHandler do
@@ -234,14 +190,10 @@ end
 ```
 
 The RetryingHandler uses exponential backoff: 100ms after the first failure, 200ms after
-the second. `Process.sleep/1` in `on_failure/3` blocks the Worker process during backoff.
-In a production system with many concurrent jobs, this blocking is a throughput concern —
-you would move the retry scheduling to a separate timer or use `Process.send_after/3`.
+the second. `on_failure/3` always returns `:retry` — the `JobHandler.run/2` engine
+enforces the `max_attempts` limit independently.
 
-The `on_failure/3` always returns `:retry` — the `JobHandler.run/2` engine enforces the
-`max_attempts` limit independently, so the handler does not need to track attempt counts.
-
-### Step 4: Given tests — must pass without modification
+### Tests
 
 ```elixir
 # test/task_queue/job_handler_test.exs
@@ -325,7 +277,7 @@ defmodule TaskQueue.JobHandlerTest do
 end
 ```
 
-### Step 5: Run the tests
+### Run the tests
 
 ```bash
 mix test test/task_queue/job_handler_test.exs --trace
@@ -333,50 +285,29 @@ mix test test/task_queue/job_handler_test.exs --trace
 
 ---
 
-## Trade-off analysis
-
-| Aspect | Behaviour (this exercise) | Anonymous function | Protocol |
-|--------|--------------------------|-------------------|---------|
-| Multiple related callbacks | Yes — all grouped in one contract | No — one function per argument | Yes, but for data types |
-| Compile-time verification | Yes — missing @impl -> warning | No | Yes |
-| Module-level state/config | Yes — module attributes, compile_env | Via closure capture | No |
-| Dispatch | Static — you pass the module | Static — you pass the function | Dynamic — based on value type |
-| When to use | Pluggable strategy modules | Simple, single-function plug | Extending behaviour of data types |
-
-Reflection question: `RetryingHandler.on_failure/3` sleeps inside the handler module,
-blocking the Worker process. What is the consequence for the Worker's throughput, and how
-would you redesign the retry mechanism to avoid blocking?
-
----
-
 ## Common production mistakes
 
 **1. `@behaviour` without `@impl` on each callback**
-Declaring `@behaviour TaskQueue.JobHandler` without `@impl` on each function means the
-compiler does not verify completeness. A missing callback surfaces only at runtime when
-`handler_module.on_failure/3` is called.
+Without `@impl`, the compiler does not verify completeness. A missing callback surfaces
+only at runtime.
 
 **2. Confusing behaviour dispatch with protocol dispatch**
 Behaviours: you call `handler_module.execute(job, ctx)` explicitly.
 Protocols: you call `MyProtocol.fn(value)` and Elixir dispatches automatically based on
-`value`'s type. If you find yourself writing `if is_struct(value, Foo), do: ...`, a
-protocol is probably the right tool.
+the value's type.
 
 **3. Putting business logic in the behaviour module**
-The behaviour module (JobHandler) should define the contract and at most provide
-helpers that work with any implementation. Business logic belongs in the concrete
-handler modules. Mixing them makes the contract harder to implement.
+The behaviour module should define the contract and helpers. Business logic belongs in
+the concrete handler modules.
 
 **4. Optional callbacks without `@optional_callbacks`**
-If you add `@callback maybe_log/2` but some handlers should not need it, declare it:
-`@optional_callbacks [maybe_log: 2]`. Without this, every implementor gets a compiler
-warning for not implementing it.
+If some handlers should not need a callback, declare it:
+`@optional_callbacks [maybe_log: 2]`.
 
 ---
 
 ## Resources
 
 - [Behaviours — Elixir official docs](https://hexdocs.pm/elixir/behaviours.html)
-- [Module @callback — HexDocs](https://hexdocs.pm/elixir/Module.html#module-behaviour)
 - [Typespecs and behaviours — HexDocs](https://hexdocs.pm/elixir/typespecs.html)
 - [Elixir School: Behaviours](https://elixirschool.com/en/lessons/advanced/behaviours)

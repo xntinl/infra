@@ -1,62 +1,57 @@
 # Advanced Ecto Schemas
 
-**Project**: `api_gateway` — built incrementally across the advanced level
+## Overview
 
----
-
-## Project context
-
-The `api_gateway` umbrella now has data flowing through it: request logs, billing records,
-client configurations. Over time, the schema layer accumulates patterns the basics don't
-cover: audit events that point to multiple entity types, request metadata that lives inside
-its row rather than a joined table, per-client data that must never leak across boundaries,
-and preload chains that generate hundreds of queries if left unchecked.
-
-All schema work in this exercise lives in `gateway_core`.
+Implement advanced Ecto schema patterns for an API gateway: polymorphic audit events,
+embedded schemas stored as JSONB, multi-tenant query scoping with `put_query_prefix/2`,
+preload optimization to prevent N+1 queries, and transactional side effects with
+`prepare_changes/1`.
 
 Project structure:
 
 ```
-api_gateway_umbrella/apps/gateway_core/
-├── lib/gateway_core/
-│   ├── audit/
-│   │   ├── event.ex           # ← you implement this
-│   │   └── events.ex          # ← and this
-│   ├── request_log.ex         # ← embedded metadata
-│   ├── tenant/
-│   │   └── scope.ex           # ← multi-tenancy helpers
-│   └── analytics/
-│       └── preloader.ex       # ← N+1 prevention for the dashboard
-└── test/gateway_core/
-    ├── audit_event_test.exs   # given tests
-    ├── request_log_test.exs   # given tests
-    └── tenant_scope_test.exs  # given tests
+api_gateway/
+├── lib/
+│   └── api_gateway/
+│       ├── repo.ex
+│       ├── schemas/
+│       │   ├── client.ex
+│       │   ├── request_log.ex
+│       │   ├── request_metadata.ex
+│       │   ├── request_header.ex
+│       │   └── billing_entry.ex
+│       ├── audit/
+│       │   ├── event.ex
+│       │   └── events.ex
+│       ├── tenant/
+│       │   └── scope.ex
+│       └── analytics/
+│           └── preloader.ex
+└── test/
+    └── api_gateway/
+        ├── audit_event_test.exs
+        ├── request_log_test.exs
+        └── tenant_scope_test.exs
 ```
 
 ---
 
 ## Why these patterns matter in production
 
-- **Polymorphic associations**: gateway audit events need to reference clients, workers,
-  and webhook endpoints — all different tables. Creating `client_audit_events`,
-  `worker_audit_events`, `webhook_audit_events` triples the schema for no semantic gain.
-  One `audit_events` table with `auditable_type` / `auditable_id` handles all three.
+- **Polymorphic associations**: audit events reference clients, workers, and webhook
+  endpoints -- all different tables. One `audit_events` table with `auditable_type` /
+  `auditable_id` handles all three without tripling the schema.
 
 - **`embeds_one` / `embeds_many`**: request metadata (headers, query params, TLS info)
-  changes shape frequently. A separate `request_metadata` table means every request log
-  read needs a JOIN. Storing it as JSONB with an `embedded_schema` gives full Ecto
-  validation without the join — and preserves a historical snapshot that won't shift if the
-  schema evolves.
+  changes shape frequently. Storing it as JSONB with an `embedded_schema` gives full Ecto
+  validation without a JOIN.
 
-- **`put_query_prefix/2`**: enterprise clients on the gateway get isolated PostgreSQL
-  schemas (`tenant_acme`, `tenant_globex`). A missing prefix on any query reads or writes
-  the wrong tenant's data — silently. The `Scope` module wraps every repo call with the
-  correct prefix, making accidental cross-tenant reads structurally impossible.
+- **`put_query_prefix/2`**: enterprise clients get isolated PostgreSQL schemas. A missing
+  prefix silently reads the wrong tenant's data. The `Scope` module makes accidental
+  cross-tenant reads structurally impossible.
 
-- **Preload optimization**: the admin dashboard loads clients, their last 5 request logs,
-  and their billing entries. Without explicit preloads, Ecto issues one query per client to
-  fetch logs (N+1). With `join` + named preload, it's two queries total regardless of
-  client count.
+- **Preload optimization**: the admin dashboard loads clients with their last 5 request
+  logs. Without explicit preloads, Ecto issues one query per client (N+1).
 
 ---
 
@@ -64,31 +59,28 @@ api_gateway_umbrella/apps/gateway_core/
 
 ### Part 1: Polymorphic audit events
 
-The gateway needs to audit: who acted, on what, and when. "What" can be a `Client`, a
-`Worker`, or a `WebhookEndpoint`. Ecto does not expose polymorphic associations as a
-first-class concept — implement it with two fields and a query module.
-
 ```elixir
-# lib/gateway_core/audit/event.ex
-defmodule GatewayCore.Audit.Event do
+# lib/api_gateway/audit/event.ex
+defmodule ApiGateway.Audit.Event do
   use Ecto.Schema
   import Ecto.Changeset
 
   @auditable_types ["Client", "Worker", "WebhookEndpoint"]
 
   schema "audit_events" do
-    field :action,         :string         # "created" | "updated" | "deleted" | "rate_limited"
-    field :actor_id,       :integer        # who triggered the action (client or internal worker)
-    field :actor_type,     :string         # "Client" | "system"
-    field :auditable_id,   :integer        # the entity being audited
-    field :auditable_type, :string         # "Client" | "Worker" | "WebhookEndpoint"
-    field :metadata,       :map, default: %{}   # arbitrary context (e.g., %{old_plan: "free"})
-    timestamps(updated_at: false)          # audit events are immutable — no updated_at
+    field :action,         :string
+    field :actor_id,       :integer
+    field :actor_type,     :string
+    field :auditable_id,   :integer
+    field :auditable_type, :string
+    field :metadata,       :map, default: %{}
+    timestamps(updated_at: false)
   end
 
   @required_fields ~w(action auditable_id auditable_type)a
   @optional_fields ~w(actor_id actor_type metadata)a
 
+  @spec changeset(t(), map()) :: Ecto.Changeset.t()
   def changeset(event, attrs) do
     event
     |> cast(attrs, @required_fields ++ @optional_fields)
@@ -112,19 +104,17 @@ CREATE TABLE audit_events (
   inserted_at     TIMESTAMP NOT NULL
 );
 
--- Composite index: most queries filter by entity
 CREATE INDEX audit_events_on_auditable ON audit_events (auditable_type, auditable_id);
--- Time-range queries for the dashboard
 CREATE INDEX audit_events_on_inserted_at ON audit_events (inserted_at DESC);
 ```
 
-#### Query module — never let callers build raw polymorphic queries
+#### Query module
 
 ```elixir
-# lib/gateway_core/audit/events.ex
-defmodule GatewayCore.Audit.Events do
+# lib/api_gateway/audit/events.ex
+defmodule ApiGateway.Audit.Events do
   import Ecto.Query
-  alias GatewayCore.{Repo, Audit.Event}
+  alias ApiGateway.{Repo, Audit.Event}
 
   @doc """
   Returns audit events for a given entity struct.
@@ -139,40 +129,44 @@ defmodule GatewayCore.Audit.Events do
     type = auditable.__struct__ |> Module.split() |> List.last()
     limit = Keyword.get(opts, :limit, 50)
 
-    # TODO: query Event where auditable_type == type and auditable_id == auditable.id
-    # Order by inserted_at DESC, apply limit
-    # HINT: from(e in Event, where: e.auditable_type == ^type and e.auditable_id == ^auditable.id,
-    #             order_by: [desc: e.inserted_at], limit: ^limit)
-    # |> Repo.all()
+    from(e in Event,
+      where: e.auditable_type == ^type and e.auditable_id == ^auditable.id,
+      order_by: [desc: e.inserted_at],
+      limit: ^limit
+    )
+    |> Repo.all()
   end
 
   @doc """
   Records a new audit event. Raises on validation failure.
-  Audit events are fire-and-forget — use `record!/4` so failures are loud, not silent.
   """
   @spec record!(struct(), String.t(), map()) :: Event.t()
   def record!(auditable, action, metadata \\ %{}) do
     type = auditable.__struct__ |> Module.split() |> List.last()
 
-    # TODO: build an Event changeset with auditable_type, auditable_id, action, metadata
-    # HINT: %Event{}
-    #       |> Event.changeset(%{auditable_type: type, auditable_id: auditable.id, action: action, metadata: metadata})
-    #       |> Repo.insert!()
+    %Event{}
+    |> Event.changeset(%{
+      auditable_type: type,
+      auditable_id: auditable.id,
+      action: action,
+      metadata: metadata
+    })
+    |> Repo.insert!()
   end
 
   @doc """
-  Returns the count of events per action for a given entity (used in the dashboard).
+  Returns the count of events per action for a given entity.
   """
   @spec action_summary(struct()) :: [%{action: String.t(), count: integer()}]
   def action_summary(auditable) do
     type = auditable.__struct__ |> Module.split() |> List.last()
 
-    # TODO: group_by :action, select %{action: e.action, count: count(e.id)}
-    # HINT: from(e in Event,
-    #         where: e.auditable_type == ^type and e.auditable_id == ^auditable.id,
-    #         group_by: e.action,
-    #         select: %{action: e.action, count: count(e.id)})
-    # |> Repo.all()
+    from(e in Event,
+      where: e.auditable_type == ^type and e.auditable_id == ^auditable.id,
+      group_by: e.action,
+      select: %{action: e.action, count: count(e.id)}
+    )
+    |> Repo.all()
   end
 end
 ```
@@ -181,13 +175,58 @@ end
 
 ### Part 2: Embedded request metadata
 
-Each request log stores HTTP metadata alongside the row. This metadata is queried only
-when the full request detail is needed — never filtered or joined. It does not deserve a
-table of its own.
+Each request log stores HTTP metadata as JSONB alongside the row.
 
 ```elixir
-# lib/gateway_core/request_log.ex
-defmodule GatewayCore.RequestLog do
+# lib/api_gateway/schemas/request_header.ex
+defmodule ApiGateway.RequestHeader do
+  use Ecto.Schema
+  import Ecto.Changeset
+
+  embedded_schema do
+    field :name,  :string
+    field :value, :string
+  end
+
+  @spec changeset(t(), map()) :: Ecto.Changeset.t()
+  def changeset(header, attrs) do
+    header
+    |> cast(attrs, [:name, :value])
+    |> validate_required([:name, :value])
+    |> validate_format(:name, ~r/^[a-z][a-z0-9-]*$/)
+  end
+end
+```
+
+```elixir
+# lib/api_gateway/schemas/request_metadata.ex
+defmodule ApiGateway.RequestMetadata do
+  use Ecto.Schema
+  import Ecto.Changeset
+
+  embedded_schema do
+    field :user_agent,   :string
+    field :remote_ip,    :string
+    field :tls_version,  :string
+    field :request_id,   :string
+    field :referer,      :string
+    embeds_many :custom_headers, ApiGateway.RequestHeader, on_replace: :delete
+  end
+
+  @spec changeset(t(), map()) :: Ecto.Changeset.t()
+  def changeset(meta, attrs) do
+    meta
+    |> cast(attrs, [:user_agent, :remote_ip, :tls_version, :request_id, :referer])
+    |> cast_embed(:custom_headers)
+    |> validate_format(:remote_ip, ~r/^\d{1,3}(\.\d{1,3}){3}$|^[0-9a-f:]+$/i)
+    |> validate_inclusion(:tls_version, ["TLSv1.2", "TLSv1.3", nil])
+  end
+end
+```
+
+```elixir
+# lib/api_gateway/schemas/request_log.ex
+defmodule ApiGateway.RequestLog do
   use Ecto.Schema
   import Ecto.Changeset
 
@@ -200,76 +239,31 @@ defmodule GatewayCore.RequestLog do
     field :bytes_transferred, :integer
     field :billing_processed, :boolean, default: false
 
-    # Stored as JSONB — no join needed to read full request context
-    embeds_one :metadata, GatewayCore.RequestMetadata, on_replace: :update
+    embeds_one :metadata, ApiGateway.RequestMetadata, on_replace: :update
 
     timestamps()
   end
 
+  @spec changeset(t(), map()) :: Ecto.Changeset.t()
   def changeset(log, attrs) do
     log
     |> cast(attrs, [:client_id, :method, :path, :status, :duration_ms, :bytes_transferred])
     |> validate_required([:client_id, :method, :path, :status])
     |> validate_inclusion(:method, ~w(GET POST PUT PATCH DELETE HEAD OPTIONS))
     |> validate_number(:status, greater_than_or_equal_to: 100, less_than: 600)
-    |> cast_embed(:metadata)  # delegates to RequestMetadata.changeset/2
-  end
-end
-
-defmodule GatewayCore.RequestMetadata do
-  use Ecto.Schema
-  import Ecto.Changeset
-
-  # embedded_schema: no table — lives as JSONB in request_logs.metadata
-  embedded_schema do
-    field :user_agent,   :string
-    field :remote_ip,    :string
-    field :tls_version,  :string
-    field :request_id,   :string
-    field :referer,      :string
-    # Headers that matter for rate limiting and billing
-    embeds_many :custom_headers, GatewayCore.RequestHeader, on_replace: :delete
-  end
-
-  def changeset(meta, attrs) do
-    meta
-    |> cast(attrs, [:user_agent, :remote_ip, :tls_version, :request_id, :referer])
-    |> cast_embed(:custom_headers)
-    |> validate_format(:remote_ip, ~r/^\d{1,3}(\.\d{1,3}){3}$|^[0-9a-f:]+$/i)
-    |> validate_inclusion(:tls_version, ["TLSv1.2", "TLSv1.3", nil])
-  end
-end
-
-defmodule GatewayCore.RequestHeader do
-  use Ecto.Schema
-  import Ecto.Changeset
-
-  embedded_schema do
-    field :name,  :string
-    field :value, :string
-  end
-
-  def changeset(header, attrs) do
-    header
-    |> cast(attrs, [:name, :value])
-    |> validate_required([:name, :value])
-    # TODO: validate :name is lowercase (HTTP/2 header convention)
-    # HINT: validate_format(:name, ~r/^[a-z][a-z0-9-]*$/)
+    |> cast_embed(:metadata)
   end
 end
 ```
 
 ```sql
--- Migration: metadata column is JSONB, not a separate table
 ALTER TABLE request_logs ADD COLUMN metadata JSONB;
--- GIN index enables efficient filtering inside the JSONB (e.g., by remote_ip)
 CREATE INDEX request_logs_metadata_gin ON request_logs USING GIN (metadata);
 ```
 
-The embedded schema provides full Ecto validation without a table join:
+Usage:
 
 ```elixir
-# iex -S mix
 attrs = %{
   client_id: 1, method: "GET", path: "/api/v1/users", status: 200,
   duration_ms: 45, bytes_transferred: 1_024,
@@ -280,68 +274,67 @@ attrs = %{
   }
 }
 
-changeset = GatewayCore.RequestLog.changeset(%GatewayCore.RequestLog{}, attrs)
-changeset.valid?   # true — metadata validated recursively
-
-# Invalid TLS version surfaces in the embedded changeset:
-bad = put_in(attrs, [:metadata, :tls_version], "SSLv3")
-bad_cs = GatewayCore.RequestLog.changeset(%GatewayCore.RequestLog{}, bad)
-bad_cs.changes.metadata.errors
-# [tls_version: {"is invalid", [validation: :inclusion, ...]}]
+changeset = ApiGateway.RequestLog.changeset(%ApiGateway.RequestLog{}, attrs)
+changeset.valid?   # true -- metadata validated recursively
 ```
 
 ---
 
 ### Part 3: Multi-tenancy with `put_query_prefix/2`
 
-Enterprise clients on the gateway get their own PostgreSQL schema. All queries for a
-tenant must target their schema — a query missing the prefix silently reads the wrong data.
+Enterprise clients get their own PostgreSQL schema. All queries for a tenant must target
+their schema -- a query missing the prefix silently reads the wrong data.
 
 ```elixir
-# lib/gateway_core/tenant/scope.ex
-defmodule GatewayCore.Tenant.Scope do
+# lib/api_gateway/tenant/scope.ex
+defmodule ApiGateway.Tenant.Scope do
   import Ecto.Query
-  alias GatewayCore.Repo
+  alias ApiGateway.Repo
 
   @valid_tenant_pattern ~r/^[a-z][a-z0-9_]{0,62}$/
 
   @doc """
   Applies the tenant prefix to an Ecto query.
   Raises ArgumentError if the tenant ID does not match the safe pattern.
-  Never pass user input directly — validate at the controller/socket boundary first.
   """
   @spec scope(Ecto.Queryable.t(), String.t()) :: Ecto.Query.t()
   def scope(query, tenant_id) do
-    # TODO: validate tenant_id matches @valid_tenant_pattern (prevent injection)
-    # HINT: unless Regex.match?(@valid_tenant_pattern, tenant_id) do
-    #         raise ArgumentError, "unsafe tenant_id: #{inspect(tenant_id)}"
-    #       end
-    # Then: put_query_prefix(query, "tenant_#{tenant_id}")
+    validate_tenant_id!(tenant_id)
+    query |> Ecto.Queryable.to_query() |> put_query_prefix("tenant_#{tenant_id}")
   end
 
   @doc "Repo.all scoped to a tenant."
   @spec all(Ecto.Queryable.t(), String.t()) :: [struct()]
   def all(query, tenant_id) do
-    # TODO: scope(query, tenant_id) |> Repo.all()
+    validate_tenant_id!(tenant_id)
+    scope(query, tenant_id) |> Repo.all()
   end
 
   @doc "Repo.get scoped to a tenant."
   @spec get(module(), integer(), String.t()) :: struct() | nil
   def get(schema, id, tenant_id) do
-    # TODO: Repo.get(schema, id, prefix: "tenant_#{tenant_id}")
-    # NOTE: validate tenant_id here too — prefix: option is not validated by Ecto
+    validate_tenant_id!(tenant_id)
+    Repo.get(schema, id, prefix: "tenant_#{tenant_id}")
   end
 
   @doc "Repo.insert scoped to a tenant."
   @spec insert(Ecto.Changeset.t(), String.t()) :: {:ok, struct()} | {:error, Ecto.Changeset.t()}
   def insert(changeset, tenant_id) do
-    # TODO: Repo.insert(changeset, prefix: "tenant_#{tenant_id}")
+    validate_tenant_id!(tenant_id)
+    Repo.insert(changeset, prefix: "tenant_#{tenant_id}")
   end
 
   @doc "Repo.update scoped to a tenant."
   @spec update(Ecto.Changeset.t(), String.t()) :: {:ok, struct()} | {:error, Ecto.Changeset.t()}
   def update(changeset, tenant_id) do
-    # TODO: Repo.update(changeset, prefix: "tenant_#{tenant_id}")
+    validate_tenant_id!(tenant_id)
+    Repo.update(changeset, prefix: "tenant_#{tenant_id}")
+  end
+
+  defp validate_tenant_id!(tenant_id) do
+    unless Regex.match?(@valid_tenant_pattern, tenant_id) do
+      raise ArgumentError, "unsafe tenant_id: #{inspect(tenant_id)}"
+    end
   end
 end
 ```
@@ -359,10 +352,9 @@ SELECT c0."id", c0."name" FROM "tenant_globex"."clients" AS c0
 A Plug injects the tenant at the request boundary:
 
 ```elixir
-# lib/gateway_api_web/plugs/tenant_plug.ex
-defmodule GatewayApiWeb.TenantPlug do
+# lib/api_gateway_web/plugs/tenant_plug.ex
+defmodule ApiGatewayWeb.TenantPlug do
   import Plug.Conn
-  alias GatewayCore.Tenant.Scope
 
   def init(opts), do: opts
 
@@ -373,8 +365,6 @@ defmodule GatewayApiWeb.TenantPlug do
       is_nil(tenant_id) ->
         conn |> send_resp(400, "Missing X-Tenant-Id header") |> halt()
 
-      # TODO: validate tenant exists in the tenants registry table
-      # HINT: GatewayCore.Tenants.exists?(tenant_id) — prevents schema enumeration
       not Regex.match?(~r/^[a-z][a-z0-9_]{0,62}$/, tenant_id) ->
         conn |> send_resp(400, "Invalid tenant identifier") |> halt()
 
@@ -389,65 +379,58 @@ end
 
 ### Part 4: Preload optimization for the admin dashboard
 
-The dashboard loads all clients with their last 5 request logs and current billing summary.
-Without explicit preloads, Ecto issues N+1 queries — one per client to fetch logs, one per
-client to fetch billing. With named preloads, it's three queries regardless of client count.
-
 ```elixir
-# lib/gateway_core/analytics/preloader.ex
-defmodule GatewayCore.Analytics.Preloader do
+# lib/api_gateway/analytics/preloader.ex
+defmodule ApiGateway.Analytics.Preloader do
   import Ecto.Query
-  alias GatewayCore.{Repo, Client, RequestLog, BillingEntry}
+  alias ApiGateway.{Repo, Client, RequestLog}
 
   @doc """
   Loads all clients for the dashboard with their recent request logs preloaded.
 
-  Uses two queries total:
+  Uses two queries total (not N+1):
     1. SELECT * FROM clients ORDER BY name
     2. SELECT * FROM request_logs WHERE client_id IN (...) ORDER BY inserted_at DESC
-
-  Without preload, the template iterating over clients.request_logs triggers
-  one query per client — the classic N+1.
   """
   @spec clients_with_recent_logs(integer()) :: [Client.t()]
   def clients_with_recent_logs(log_limit \\ 5) do
-    # The preload query is scoped per-client via Ecto's batch preload mechanism.
-    # Ecto fetches all client IDs in one query, then runs one query for all logs
-    # filtered by those IDs — not one query per client.
     recent_logs =
       from(r in RequestLog,
-        # TODO: order by inserted_at DESC, limit ^log_limit
-        # IMPORTANT: Ecto's preload with a query applies the limit PER CLIENT when
-        # the preload is a keyword list: preload: [request_logs: ^recent_logs]
-        # This uses a window function internally — verify with Repo.to_sql/2
         order_by: [desc: r.inserted_at],
         limit: ^log_limit
       )
 
-    # TODO: from(c in Client, order_by: c.name, preload: [request_logs: ^recent_logs])
-    # |> Repo.all()
+    from(c in Client,
+      order_by: c.name,
+      preload: [request_logs: ^recent_logs]
+    )
+    |> Repo.all()
   end
 
   @doc """
   Loads a single client with all associations needed for the detail page.
 
   Uses a JOIN for billing (needed for the WHERE clause) and a separate
-  preload for request_logs (no filter needed — 2-query approach is more efficient).
+  preload for request_logs.
   """
   @spec client_detail(integer()) :: Client.t() | nil
   def client_detail(client_id) do
-    # TODO:
-    # 1. join billing_entries (needed to filter/sort by billing data)
-    # 2. preload request_logs separately (no filter on request_logs needed)
-    # HINT: from(c in Client,
-    #         left_join: b in assoc(c, :billing_entries), as: :billing,
-    #         where: c.id == ^client_id,
-    #         preload: [billing_entries: :billing, request_logs: ^recent_logs_query])
-    # |> Repo.one()
+    recent_logs =
+      from(r in RequestLog,
+        order_by: [desc: r.inserted_at],
+        limit: 10
+      )
+
+    from(c in Client,
+      left_join: b in assoc(c, :billing_entries), as: :billing,
+      where: c.id == ^client_id,
+      preload: [billing_entries: b, request_logs: ^recent_logs]
+    )
+    |> Repo.one()
   end
 
   @doc """
-  Detects potential N+1: returns true if the struct has an unloaded association.
+  Detects potential N+1: returns true if the struct has a loaded association.
   Use in tests to catch missing preloads before they hit production.
   """
   @spec loaded?(struct(), atom()) :: boolean()
@@ -464,27 +447,26 @@ end
 
 ### Part 5: `prepare_changes/1` for transactional side effects
 
-When a client's plan changes in the gateway, the rate limiter ETS table must be updated
-atomically — if the DB write fails, the ETS write must not happen, and vice versa.
-`prepare_changes/1` runs inside the changeset's transaction.
+When a client's plan changes, the rate limiter ETS table must be updated atomically
+with the DB write.
 
 ```elixir
-# lib/gateway_core/client.ex (addition to existing schema)
-defmodule GatewayCore.Client do
+# lib/api_gateway/schemas/client.ex
+defmodule ApiGateway.Client do
   use Ecto.Schema
   import Ecto.Changeset
-  import Ecto.Query
 
   schema "clients" do
     field :name,             :string
     field :plan,             Ecto.Enum, values: [:free, :pro, :enterprise]
     field :active,           :boolean, default: true
     field :quota_remaining,  :integer
-    has_many :request_logs,   GatewayCore.RequestLog
-    has_many :billing_entries, GatewayCore.BillingEntry
+    has_many :request_logs,   ApiGateway.RequestLog
+    has_many :billing_entries, ApiGateway.BillingEntry
     timestamps()
   end
 
+  @spec changeset(t(), map()) :: Ecto.Changeset.t()
   def changeset(client, attrs) do
     client
     |> cast(attrs, [:name, :plan, :active, :quota_remaining])
@@ -496,8 +478,8 @@ defmodule GatewayCore.Client do
   rate limiter ETS table inside the same transaction.
 
   prepare_changes/1 runs ONLY if the changeset is valid AND inside the DB transaction.
-  If Repo.update fails (e.g., unique constraint), the side effects never execute.
   """
+  @spec plan_upgrade_changeset(t(), map()) :: Ecto.Changeset.t()
   def plan_upgrade_changeset(client, attrs) do
     client
     |> cast(attrs, [:plan, :quota_remaining])
@@ -511,30 +493,29 @@ defmodule GatewayCore.Client do
     |> prepare_changes(&refresh_rate_limiter/1)
   end
 
-  # TODO: implement record_plan_change_audit/1
-  # Must use changeset.repo (the repo is injected during the transaction)
-  # HINT: defp record_plan_change_audit(changeset) do
-  #         old_plan = changeset.data.plan
-  #         new_plan = get_change(changeset, :plan)
-  #         if new_plan && new_plan != old_plan do
-  #           changeset.repo.insert!(%GatewayCore.Audit.Event{
-  #             auditable_type: "Client",
-  #             auditable_id: changeset.data.id,
-  #             action: "plan_upgraded",
-  #             metadata: %{from: old_plan, to: new_plan}
-  #           })
-  #         end
-  #         changeset  # ALWAYS return the changeset
-  #       end
+  defp record_plan_change_audit(changeset) do
+    old_plan = changeset.data.plan
+    new_plan = get_change(changeset, :plan)
 
-  # TODO: implement refresh_rate_limiter/1
-  # Updates the in-memory ETS rate limiter with the new plan's quota
-  # HINT: defp refresh_rate_limiter(changeset) do
-  #         if new_plan = get_change(changeset, :plan) do
-  #           :ets.insert(:rate_limiter_config, {changeset.data.id, quota_for(new_plan)})
-  #         end
-  #         changeset
-  #       end
+    if new_plan && new_plan != old_plan do
+      changeset.repo.insert!(%ApiGateway.Audit.Event{
+        auditable_type: "Client",
+        auditable_id: changeset.data.id,
+        action: "plan_upgraded",
+        metadata: %{from: old_plan, to: new_plan}
+      })
+    end
+
+    changeset
+  end
+
+  defp refresh_rate_limiter(changeset) do
+    if new_plan = get_change(changeset, :plan) do
+      :ets.insert(:rate_limiter_config, {changeset.data.id, quota_for(new_plan)})
+    end
+
+    changeset
+  end
 
   defp plan_rank(:free),       do: 1
   defp plan_rank(:pro),        do: 2
@@ -548,14 +529,14 @@ end
 
 ---
 
-### Step 6: Given tests — must pass without modification
+### Step 6: Tests
 
 ```elixir
-# test/gateway_core/audit_event_test.exs
-defmodule GatewayCore.Audit.EventTest do
-  use GatewayCore.DataCase
+# test/api_gateway/audit_event_test.exs
+defmodule ApiGateway.Audit.EventTest do
+  use ApiGateway.DataCase
 
-  alias GatewayCore.Audit.{Event, Events}
+  alias ApiGateway.Audit.{Event, Events}
 
   test "record! creates an audit event for a client" do
     client = insert(:client)
@@ -611,11 +592,11 @@ end
 ```
 
 ```elixir
-# test/gateway_core/request_log_test.exs
-defmodule GatewayCore.RequestLogTest do
-  use GatewayCore.DataCase
+# test/api_gateway/request_log_test.exs
+defmodule ApiGateway.RequestLogTest do
+  use ApiGateway.DataCase
 
-  alias GatewayCore.RequestLog
+  alias ApiGateway.RequestLog
 
   @valid_attrs %{
     client_id: 1, method: "GET", path: "/api/v1/resources", status: 200,
@@ -648,9 +629,9 @@ defmodule GatewayCore.RequestLogTest do
   test "metadata is preserved as JSONB on insert" do
     {:ok, log} = %RequestLog{}
     |> RequestLog.changeset(@valid_attrs)
-    |> GatewayCore.Repo.insert()
+    |> ApiGateway.Repo.insert()
 
-    loaded = GatewayCore.Repo.get!(RequestLog, log.id)
+    loaded = ApiGateway.Repo.get!(RequestLog, log.id)
     assert loaded.metadata.remote_ip == "10.0.0.1"
     assert loaded.metadata.tls_version == "TLSv1.3"
     assert hd(loaded.metadata.custom_headers).name == "x-trace-id"
@@ -665,34 +646,32 @@ end
 ```
 
 ```elixir
-# test/gateway_core/tenant_scope_test.exs
-defmodule GatewayCore.Tenant.ScopeTest do
-  use GatewayCore.DataCase
+# test/api_gateway/tenant_scope_test.exs
+defmodule ApiGateway.Tenant.ScopeTest do
+  use ApiGateway.DataCase
 
-  alias GatewayCore.Tenant.Scope
-  alias GatewayCore.Client
+  alias ApiGateway.Tenant.Scope
+  alias ApiGateway.Client
 
   setup do
-    # Create the tenant schema for tests
-    GatewayCore.Repo.query!("CREATE SCHEMA IF NOT EXISTS tenant_test_co")
-    GatewayCore.Repo.query!("""
+    ApiGateway.Repo.query!("CREATE SCHEMA IF NOT EXISTS tenant_test_co")
+    ApiGateway.Repo.query!("""
       CREATE TABLE IF NOT EXISTS tenant_test_co.clients
         (LIKE public.clients INCLUDING ALL)
     """)
     on_exit(fn ->
-      GatewayCore.Repo.query!("DROP SCHEMA tenant_test_co CASCADE")
+      ApiGateway.Repo.query!("DROP SCHEMA tenant_test_co CASCADE")
     end)
     :ok
   end
 
   test "scope/2 applies the correct PostgreSQL schema prefix" do
-    {sql, _} = GatewayCore.Repo.to_sql(:all, Scope.scope(Client, "test_co"))
+    {sql, _} = ApiGateway.Repo.to_sql(:all, Scope.scope(Client, "test_co"))
     assert sql =~ ~s("tenant_test_co"."clients")
   end
 
   test "all/2 reads from the tenant schema" do
-    # Insert directly into tenant schema
-    GatewayCore.Repo.insert!(%Client{name: "Tenant Client", plan: :pro}, prefix: "tenant_test_co")
+    ApiGateway.Repo.insert!(%Client{name: "Tenant Client", plan: :pro}, prefix: "tenant_test_co")
 
     results = Scope.all(Client, "test_co")
     assert length(results) == 1
@@ -723,9 +702,8 @@ defmodule GatewayCore.Tenant.ScopeTest do
       |> Scope.insert("test_co")
 
     assert client.name == "New Tenant Client"
-    # Verify it's in the tenant schema, not the default
     assert Scope.all(Client, "test_co") |> length() == 1
-    assert GatewayCore.Repo.all(Client) |> length() == 0
+    assert ApiGateway.Repo.all(Client) |> length() == 0
   end
 end
 ```
@@ -733,25 +711,10 @@ end
 ### Step 7: Run the tests
 
 ```bash
-mix test test/gateway_core/audit_event_test.exs \
-         test/gateway_core/request_log_test.exs \
-         test/gateway_core/tenant_scope_test.exs \
+mix test test/api_gateway/audit_event_test.exs \
+         test/api_gateway/request_log_test.exs \
+         test/api_gateway/tenant_scope_test.exs \
          --trace
-```
-
-Debug the SQL generated for any query:
-
-```elixir
-# In iex -S mix:
-alias GatewayCore.{Client, Tenant.Scope}
-
-# Verify prefix is applied:
-{sql, _} = GatewayCore.Repo.to_sql(:all, Scope.scope(Client, "acme_corp"))
-IO.puts(sql)
-# SELECT c0."id", ... FROM "tenant_acme_corp"."clients" AS c0
-
-# Verify preload doesn't generate N+1:
-# Enable query logging and count queries during a Preloader.clients_with_recent_logs() call
 ```
 
 ---
@@ -760,52 +723,46 @@ IO.puts(sql)
 
 | Pattern | When to use | When NOT to use |
 |---------|-------------|-----------------|
-| Polymorphic `auditable_type/id` | One event type targets many entity types | When referential integrity is critical — use separate tables with FK constraints |
+| Polymorphic `auditable_type/id` | One event type targets many entity types | When referential integrity is critical -- use separate tables with FK constraints |
 | `embeds_one` / `embeds_many` | Data queried only with parent; schema changes frequently | Data queried independently; needs FK constraints or its own indexes |
 | `put_query_prefix/2` | Hard isolation between tenants; different data retention policies | Shared data across tenants; schema-per-tenant migration overhead is unacceptable |
-| `preload:` keyword in query | Need to filter/order by the association | No filter needed — use `preload/2` call for cleaner separation |
-| `prepare_changes/1` | Single side effect tightly coupled to the DB write | Multiple independent side effects — use `Ecto.Multi` for explicitness |
+| `preload:` keyword in query | Need to filter/order by the association | No filter needed -- use `preload/2` call for cleaner separation |
+| `prepare_changes/1` | Single side effect tightly coupled to the DB write | Multiple independent side effects -- use `Ecto.Multi` for explicitness |
 
 ---
 
 ## Common production mistakes
 
 **1. No composite index on `(auditable_type, auditable_id)`**
-Every `Events.for/1` call does a full table scan without this index. Audit tables grow fast
-(every API call can produce an event). Add the composite index at migration time — adding
-it after millions of rows requires a concurrent index build (`CONCURRENTLY`) to avoid locking.
+Every `Events.for/1` call does a full table scan without this index. Add the composite
+index at migration time.
 
 **2. `embeds_many` without `on_replace: :delete`**
-The default `on_replace` behavior for embeds is `:raise` — Ecto raises if you try to
-replace the embedded list without specifying. Use `on_replace: :delete` to allow the
-embedded list to be replaced wholesale via `cast_embed/3`.
+The default `on_replace` behavior for embeds is `:raise`. Use `on_replace: :delete` to
+allow the embedded list to be replaced via `cast_embed/3`.
 
 **3. Building the tenant prefix from raw user input**
 `put_query_prefix(query, "tenant_" <> conn.params["tenant"])` allows any string as a
-prefix. A malicious user passes `public` to read the main schema. Always validate the
-tenant ID against an allowlist or a strict regex before building the prefix.
+prefix. Always validate the tenant ID against a strict regex before building the prefix.
 
 **4. `preload: [request_logs: ^query]` with `limit` applies globally, not per-parent**
-A common mistake: adding `limit: 5` to the preload query expecting 5 logs per client. Ecto
-fetches all clients' logs in one `WHERE id IN (...)` query — `LIMIT 5` applies to the
-whole result set, not per client. To get N rows per parent, use a window function:
-`ROW_NUMBER() OVER (PARTITION BY client_id ORDER BY inserted_at DESC)` and filter
-`row_number <= 5` in a subquery.
+Adding `limit: 5` to a preload query applies `LIMIT 5` to the whole result set, not per
+client. To get N rows per parent, use a window function: `ROW_NUMBER() OVER (PARTITION BY
+client_id ORDER BY inserted_at DESC)` and filter `row_number <= 5` in a subquery.
 
 **5. `prepare_changes/1` for ETS writes is not fully atomic**
 `prepare_changes/1` runs inside the PostgreSQL transaction, but ETS writes are not
-transactional. If the ETS write succeeds and then the DB transaction rolls back (due to a
-constraint violation in a subsequent changeset), the ETS state is now inconsistent. For
-ETS state derived from DB state, prefer updating ETS *after* the `{:ok, result}` from
-`Repo.update/1` — not inside `prepare_changes/1`.
+transactional. If the ETS write succeeds and then the DB transaction rolls back, the ETS
+state is inconsistent. For ETS state derived from DB state, prefer updating ETS *after*
+the `{:ok, result}` from `Repo.update/1`.
 
 ---
 
 ## Resources
 
-- [`Ecto.Schema.embeds_one/3`](https://hexdocs.pm/ecto/Ecto.Schema.html#embeds_one/3) — embedded schemas and JSONB storage
-- [`Ecto.Query.put_query_prefix/2`](https://hexdocs.pm/ecto/Ecto.Query.html#put_query_prefix/2) — schema-per-tenant queries
-- [`Ecto.Changeset.prepare_changes/2`](https://hexdocs.pm/ecto/Ecto.Changeset.html#prepare_changes/2) — transactional side effects
-- [`Ecto.Repo.preload/3`](https://hexdocs.pm/ecto/Ecto.Repo.html#c:preload/3) — batch preloading with custom queries
-- [PostgreSQL schemas (multi-tenancy)](https://www.postgresql.org/docs/current/ddl-schemas.html) — `search_path` and schema isolation
-- [Triplex](https://hexdocs.pm/triplex/readme.html) — library that automates schema-per-tenant migrations in Ecto
+- [`Ecto.Schema.embeds_one/3`](https://hexdocs.pm/ecto/Ecto.Schema.html#embeds_one/3) -- embedded schemas and JSONB
+- [`Ecto.Query.put_query_prefix/2`](https://hexdocs.pm/ecto/Ecto.Query.html#put_query_prefix/2) -- schema-per-tenant queries
+- [`Ecto.Changeset.prepare_changes/2`](https://hexdocs.pm/ecto/Ecto.Changeset.html#prepare_changes/2) -- transactional side effects
+- [`Ecto.Repo.preload/3`](https://hexdocs.pm/ecto/Ecto.Repo.html#c:preload/3) -- batch preloading with custom queries
+- [PostgreSQL schemas](https://www.postgresql.org/docs/current/ddl-schemas.html) -- multi-tenancy isolation
+- [Triplex](https://hexdocs.pm/triplex/readme.html) -- library for schema-per-tenant migrations

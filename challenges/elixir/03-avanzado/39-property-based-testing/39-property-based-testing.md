@@ -1,27 +1,27 @@
 # Property-Based Testing with StreamData
 
-**Project**: `api_gateway` — built incrementally across the advanced level
+**Project**: `api_gateway` — a standalone HTTP gateway exercise
 
 ---
 
 ## Project context
 
-`api_gateway` has two modules with non-trivial pure logic: the binary parser from
-exercise 29 (`ApiGateway.Middleware.Parser`) and the topic matcher from the event bus
-capstone (`ApiGateway.EventBus.TopicMatcher`). Both are good candidates for
-property-based testing: the parser must be a perfect roundtrip with a serializer, and
-the topic matcher has rules that hold for all possible topic strings.
+You are building `api_gateway`, an HTTP gateway that routes traffic to microservices. The
+gateway has two modules with non-trivial pure logic: a binary parser for HTTP request lines
+and a topic matcher for the event bus. Both are good candidates for property-based testing:
+the parser must produce consistent results for all valid inputs, and the topic matcher has
+rules that hold for all possible topic strings.
 
-Project structure at this point:
+Project structure:
 
 ```
 api_gateway/
 ├── lib/
 │   └── api_gateway/
 │       ├── middleware/
-│       │   └── parser.ex            # from exercise 29
+│       │   └── parser.ex            # HTTP request line parser (defined below)
 │       └── event_bus/
-│           └── topic_matcher.ex     # from exercise 42 (or implement stub below)
+│           └── topic_matcher.ex     # wildcard topic matcher (defined below)
 ├── test/
 │   └── api_gateway/
 │       ├── middleware/
@@ -69,20 +69,22 @@ defp deps do
 end
 ```
 
-### Step 2: Topic matcher stub (if exercise 42 is not done yet)
+### Step 2: Topic matcher module
 
-The properties work with any module implementing the same interface. This minimal
-implementation handles `*` (single-segment wildcard), `#` (multi-segment wildcard),
-and literal segments.
+This module handles `*` (single-segment wildcard), `#` (multi-segment wildcard),
+and literal segments. It is used by the property tests below.
 
 ```elixir
 defmodule ApiGateway.EventBus.TopicMatcher do
   @moduledoc "Wildcard topic matching for the event bus."
 
+  @type compiled :: list(:single | :multi | String.t())
+
   @doc """
   Compile a pattern to a list of segment tokens.
   Call once at subscribe time, not on every publish.
   """
+  @spec compile(String.t()) :: compiled()
   def compile(pattern) do
     pattern
     |> String.split(".")
@@ -94,6 +96,7 @@ defmodule ApiGateway.EventBus.TopicMatcher do
   end
 
   @doc "Return true if `topic` matches the compiled pattern."
+  @spec matches?(compiled(), String.t()) :: boolean()
   def matches?(compiled_pattern, topic) do
     segments = String.split(topic, ".")
     do_match(compiled_pattern, segments)

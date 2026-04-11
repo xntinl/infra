@@ -123,6 +123,12 @@ defmodule Swimlane.Membership do
     end
   end
 
+  @doc "Merges a list of membership updates into the local view."
+  @spec merge_all(map(), [%__MODULE__{}]) :: map()
+  def merge_all(local_view, updates) do
+    Enum.reduce(updates, local_view, fn update, acc -> merge(acc, update) end)
+  end
+
   @doc "Returns nodes that should receive the next probe."
   @spec probe_candidates(map(), [term()]) :: [%__MODULE__{}]
   def probe_candidates(view, exclude \\ []) do
@@ -226,7 +232,297 @@ defmodule Swimlane.Disseminator do
 end
 ```
 
-### Step 6: Given tests — must pass without modification
+### Step 6: Transport stub
+
+```elixir
+# lib/swimlane/transport.ex
+defmodule Swimlane.Transport do
+  @moduledoc """
+  UDP transport layer for SWIM protocol messages.
+  In production, this sends and receives over UDP sockets.
+  For testing and simulation, this module is replaced by a stub
+  that uses process messages instead of real UDP.
+  """
+
+  @spec ping(term(), non_neg_integer()) :: :ok | :timeout
+  def ping(node_id, timeout_ms) do
+    ref = make_ref()
+    send(node_id, {:ping, self(), ref})
+
+    receive do
+      {:pong, ^ref} -> :ok
+    after
+      timeout_ms -> :timeout
+    end
+  end
+
+  @spec indirect_ping(term(), term(), non_neg_integer()) :: :ok | :timeout
+  def indirect_ping(proxy_id, target_id, timeout_ms) do
+    ref = make_ref()
+    send(proxy_id, {:indirect_ping, target_id, self(), ref})
+
+    receive do
+      {:indirect_pong, ^ref} -> :ok
+    after
+      timeout_ms -> :timeout
+    end
+  end
+end
+```
+
+### Step 7: Simulation harness
+
+```elixir
+# lib/swimlane/simulation.ex
+defmodule Swimlane.Simulation do
+  @moduledoc """
+  In-process simulation of a SWIM cluster. Each simulated node is a GenServer
+  that maintains its own membership view and participates in gossip rounds.
+  No real UDP — all communication is via process messages.
+  """
+
+  use GenServer
+
+  defstruct [:nodes, :fanout, :round_interval_ms, :round_count, :node_views]
+
+  @spec start(keyword()) :: pid()
+  def start(opts) do
+    {:ok, pid} = GenServer.start_link(__MODULE__, opts)
+    pid
+  end
+
+  @spec stop(pid()) :: :ok
+  def stop(pid), do: GenServer.stop(pid)
+
+  @spec inject_join(pid(), atom()) :: :ok
+  def inject_join(pid, node_id), do: GenServer.call(pid, {:inject_join, node_id})
+
+  @spec inject_rumor(pid(), atom(), tuple()) :: :ok
+  def inject_rumor(pid, target_node, rumor), do: GenServer.call(pid, {:inject_rumor, target_node, rumor})
+
+  @spec kill_node(pid(), atom()) :: :ok
+  def kill_node(pid, node_id), do: GenServer.call(pid, {:kill_node, node_id})
+
+  @spec random_node(pid()) :: atom()
+  def random_node(pid), do: GenServer.call(pid, :random_node)
+
+  @spec all_views(pid(), atom()) :: [{atom(), atom()}]
+  def all_views(pid, target), do: GenServer.call(pid, {:all_views, target})
+
+  @spec measure_convergence(pid(), term(), keyword()) :: non_neg_integer()
+  def measure_convergence(pid, event, opts) do
+    timeout_ms = Keyword.get(opts, :timeout_ms, 5_000)
+    GenServer.call(pid, {:measure_convergence, event, timeout_ms}, timeout_ms + 5_000)
+  end
+
+  @spec run_round(pid()) :: :ok
+  def run_round(pid), do: GenServer.call(pid, :run_round)
+
+  @spec random_events(pid(), pos_integer()) :: [%Swimlane.Membership{}]
+  def random_events(pid, count), do: GenServer.call(pid, {:random_events, count})
+
+  @impl true
+  def init(opts) do
+    node_count = Keyword.fetch!(opts, :node_count)
+    fanout = Keyword.fetch!(opts, :fanout)
+    round_interval_ms = Keyword.get(opts, :round_interval_ms, 50)
+
+    node_ids = for i <- 1..node_count, do: :"sim_node_#{i}"
+
+    node_views =
+      Map.new(node_ids, fn id ->
+        view = Map.new(node_ids, fn nid ->
+          {nid, %Swimlane.Membership{
+            node_id: nid,
+            state: :alive,
+            incarnation: 1,
+            address: nid,
+            last_updated_at: System.monotonic_time(:millisecond)
+          }}
+        end)
+        {id, view}
+      end)
+
+    state = %__MODULE__{
+      nodes: MapSet.new(node_ids),
+      fanout: fanout,
+      round_interval_ms: round_interval_ms,
+      round_count: 0,
+      node_views: node_views
+    }
+
+    if round_interval_ms > 0 do
+      Process.send_after(self(), :gossip_round, round_interval_ms)
+    end
+
+    {:ok, state}
+  end
+
+  @impl true
+  def handle_call({:inject_join, node_id}, _from, state) do
+    entry = %Swimlane.Membership{
+      node_id: node_id,
+      state: :alive,
+      incarnation: 1,
+      address: node_id,
+      last_updated_at: System.monotonic_time(:millisecond)
+    }
+
+    first_node = state.nodes |> MapSet.to_list() |> List.first()
+    updated_view = Swimlane.Membership.merge(state.node_views[first_node], entry)
+    node_views = Map.put(state.node_views, first_node, updated_view)
+    {:reply, :ok, %{state | node_views: node_views}}
+  end
+
+  def handle_call({:inject_rumor, target_node, {:suspect, victim, opts}}, _from, state) do
+    incarnation = Keyword.get(opts, :incarnation, 1)
+    entry = %Swimlane.Membership{
+      node_id: victim,
+      state: :suspect,
+      incarnation: incarnation,
+      address: victim,
+      last_updated_at: System.monotonic_time(:millisecond)
+    }
+    updated_view = Swimlane.Membership.merge(state.node_views[target_node], entry)
+    node_views = Map.put(state.node_views, target_node, updated_view)
+    {:reply, :ok, %{state | node_views: node_views}}
+  end
+
+  def handle_call({:kill_node, node_id}, _from, state) do
+    nodes = MapSet.delete(state.nodes, node_id)
+    node_views = Map.delete(state.node_views, node_id)
+
+    node_views =
+      Map.new(node_views, fn {nid, view} ->
+        entry = %Swimlane.Membership{
+          node_id: node_id,
+          state: :dead,
+          incarnation: 99,
+          address: node_id,
+          last_updated_at: System.monotonic_time(:millisecond)
+        }
+        {nid, Map.put(view, node_id, entry)}
+      end)
+
+    {:reply, :ok, %{state | nodes: nodes, node_views: node_views}}
+  end
+
+  def handle_call(:random_node, _from, state) do
+    node = state.nodes |> MapSet.to_list() |> Enum.random()
+    {:reply, node, state}
+  end
+
+  def handle_call({:all_views, target}, _from, state) do
+    views =
+      state.node_views
+      |> Enum.map(fn {node_id, view} ->
+        member_state = case Map.get(view, target) do
+          nil -> :unknown
+          member -> member.state
+        end
+        {node_id, member_state}
+      end)
+    {:reply, views, state}
+  end
+
+  def handle_call({:measure_convergence, event, timeout_ms}, _from, state) do
+    deadline = System.monotonic_time(:millisecond) + timeout_ms
+    {rounds, new_state} = converge_loop(state, event, 0, deadline)
+    {:reply, rounds, new_state}
+  end
+
+  def handle_call(:run_round, _from, state) do
+    {:reply, :ok, do_gossip_round(state)}
+  end
+
+  def handle_call({:random_events, count}, _from, state) do
+    events =
+      state.node_views
+      |> Map.values()
+      |> Enum.flat_map(&Map.values/1)
+      |> Enum.take_random(count)
+    {:reply, events, state}
+  end
+
+  @impl true
+  def handle_info(:gossip_round, state) do
+    new_state = do_gossip_round(state)
+    if state.round_interval_ms > 0 do
+      Process.send_after(self(), :gossip_round, state.round_interval_ms)
+    end
+    {:noreply, new_state}
+  end
+
+  defp do_gossip_round(state) do
+    alive_nodes = MapSet.to_list(state.nodes)
+
+    updated_views =
+      Enum.reduce(alive_nodes, state.node_views, fn node_id, views ->
+        my_view = views[node_id]
+        {peers, events} = Swimlane.Disseminator.next_round(my_view, node_id, state.fanout)
+
+        Enum.reduce(peers, views, fn peer_id, acc_views ->
+          if Map.has_key?(acc_views, peer_id) do
+            peer_view =
+              Enum.reduce(events, acc_views[peer_id], fn event, pv ->
+                Swimlane.Membership.merge(pv, event)
+              end)
+            Map.put(acc_views, peer_id, peer_view)
+          else
+            acc_views
+          end
+        end)
+      end)
+
+    # Refutation: alive nodes seeing themselves as suspect bump incarnation
+    refuted_views =
+      Enum.reduce(alive_nodes, updated_views, fn node_id, views ->
+        my_view = views[node_id]
+        case Map.get(my_view, node_id) do
+          %{state: :suspect} = entry ->
+            refuted = %{entry | state: :alive, incarnation: entry.incarnation + 1,
+                        last_updated_at: System.monotonic_time(:millisecond)}
+            new_view = Map.put(my_view, node_id, refuted)
+            Map.put(views, node_id, new_view)
+          _ -> views
+        end
+      end)
+
+    %{state | node_views: refuted_views, round_count: state.round_count + 1}
+  end
+
+  defp converge_loop(state, event, rounds, deadline) do
+    if System.monotonic_time(:millisecond) >= deadline do
+      {rounds, state}
+    else
+      if converged?(state, event) do
+        {rounds, state}
+      else
+        new_state = do_gossip_round(state)
+        converge_loop(new_state, event, rounds + 1, deadline)
+      end
+    end
+  end
+
+  defp converged?(state, node_id) when is_atom(node_id) do
+    Enum.all?(state.node_views, fn {_nid, view} ->
+      Map.has_key?(view, node_id)
+    end)
+  end
+
+  defp converged?(state, {:dead, node_id}) do
+    alive_nodes = MapSet.to_list(state.nodes)
+    Enum.all?(alive_nodes, fn nid ->
+      case get_in(state.node_views, [nid, node_id]) do
+        %{state: :dead} -> true
+        _ -> false
+      end
+    end)
+  end
+end
+```
+
+### Step 8: Given tests — must pass without modification
 
 ```elixir
 # test/swimlane/propagation_test.exs
@@ -291,13 +587,13 @@ defmodule Swimlane.RefutationTest do
 end
 ```
 
-### Step 7: Run the tests
+### Step 9: Run the tests
 
 ```bash
 mix test test/swimlane/ --trace
 ```
 
-### Step 8: Benchmark
+### Step 10: Benchmark
 
 ```elixir
 # bench/gossip_bench.exs

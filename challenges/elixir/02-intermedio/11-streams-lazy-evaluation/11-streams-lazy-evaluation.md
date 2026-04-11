@@ -1,20 +1,32 @@
 # Streams and Lazy Evaluation
 
-**Project**: `task_queue` — built incrementally across the intermediate level
+## Eager vs lazy — the memory model
+
+`Enum` is eager: it processes the entire collection and materializes the result before
+returning. `Stream` is lazy: each element passes through the entire pipeline before the
+next element enters. No intermediate collection is allocated.
+
+This matters when:
+- The input is larger than available memory (file, network stream).
+- You only need the first N results — lazy evaluation stops early.
+- The collection is conceptually infinite (sequence generators).
 
 ---
 
-## Project context
+## The business problem
 
-The task_queue system writes job results to a log file and needs to read them back for
-reporting. A log file with 10 million entries cannot be loaded into memory with
-`File.read!`. The system also needs to generate scheduling sequences (cron trigger times)
-that are conceptually infinite — you stop when you have enough, not when the sequence ends.
+Build a `TaskQueue.LogReader` that processes task queue log files:
 
-Streams solve both problems: they produce values on demand, one at a time, without
-materializing the entire sequence in memory.
+1. Read a large log file line by line, parsing each line into a structured map.
+2. Filter, transform, and aggregate without loading the file into memory.
+3. Generate infinite cron trigger time streams using `Stream.iterate`.
+4. Implement a bounded retry stream with backoff.
 
-Project structure at this point:
+All modules are defined completely in this exercise.
+
+---
+
+## Project setup
 
 ```
 task_queue/
@@ -23,59 +35,15 @@ task_queue/
 │       └── log_reader.ex
 ├── test/
 │   └── task_queue/
-│       └── streams_test.exs     # given tests — must pass without modification
+│       └── streams_test.exs
 └── mix.exs
 ```
 
 ---
 
-## Eager vs lazy — the memory model
-
-`Enum` is eager: it processes the entire collection and materializes the result before
-returning. Pipelines like `list |> Enum.filter(...) |> Enum.map(...)` allocate two
-intermediate lists.
-
-`Stream` is lazy: each element passes through the entire pipeline before the next element
-enters. No intermediate collection is allocated. The pipeline does not execute at all until
-a terminal function (`Enum.to_list`, `Enum.take`, `Stream.run`) consumes it.
-
-```
-Enum (eager):
-  input -> [filter -> intermediate list] -> [map -> final list]
-
-Stream (lazy):
-  element_1 -> filter -> map -> consumer
-  element_2 -> filter -> map -> consumer
-  element_3 -> filter (dropped)
-  element_4 -> filter -> map -> consumer
-```
-
-This matters when:
-- The input is larger than available memory (file, network stream, paginated API).
-- You only need the first N results — lazy evaluation stops early.
-- The collection is conceptually infinite (sequence generators).
-
-This does not matter when:
-- The full result is needed and it fits in memory — `Enum` is simpler.
-- The collection is small — lazy overhead (function calls per element) exceeds the savings.
-
----
-
-## The business problem
-
-`TaskQueue.LogReader` processes task_queue log files:
-
-1. Read a large log file line by line, parsing each line into a structured map.
-2. Filter, transform, and aggregate without loading the file into memory.
-3. Generate a stream of scheduled cron trigger times using `Stream.iterate`.
-4. Implement a bounded retry stream: given a failing operation, retry with backoff until
-   success or max attempts reached.
-
----
-
 ## Implementation
 
-### Step 1: `lib/task_queue/log_reader.ex`
+### `lib/task_queue/log_reader.ex`
 
 ```elixir
 defmodule TaskQueue.LogReader do
@@ -89,8 +57,7 @@ defmodule TaskQueue.LogReader do
 
   @doc """
   Returns a lazy stream of parsed log entries from a file.
-  Each element is a map: %{timestamp: integer, job_id: string, status: atom,
-                            duration_ms: integer, worker_id: string}
+  Each element is a map with :timestamp, :job_id, :status, :duration_ms, :worker_id.
   Lines that do not match the expected format are silently skipped.
   """
   @spec stream_file(Path.t()) :: Enumerable.t()
@@ -121,7 +88,7 @@ defmodule TaskQueue.LogReader do
 
   @doc """
   Returns the first `n` failed entries from the log file.
-  Stops reading the file after finding n failures — does not scan the whole file.
+  Stops reading the file after finding n failures.
   """
   @spec first_failures(Path.t(), pos_integer()) :: [map()]
   def first_failures(path, n) do
@@ -134,9 +101,6 @@ defmodule TaskQueue.LogReader do
   @doc """
   Generates an infinite stream of cron trigger timestamps starting from `start_ms`,
   with each trigger `interval_ms` apart.
-
-  Returns a Stream that yields integers (Unix millisecond timestamps).
-  The caller controls how many to take.
   """
   @spec cron_schedule_stream(pos_integer(), pos_integer()) :: Enumerable.t()
   def cron_schedule_stream(start_ms, interval_ms) do
@@ -154,11 +118,9 @@ defmodule TaskQueue.LogReader do
   end
 
   @doc """
-  Retries `operation` (a zero-arg function) up to `max_attempts` times with
-  exponential backoff between attempts.
+  Retries `operation` up to `max_attempts` times with exponential backoff.
 
   Returns {:ok, result} on first success or {:error, :max_attempts} on final failure.
-  Uses Stream.map and Stream.drop_while to model the retry sequence as a lazy stream.
   """
   @spec retry_stream((() -> {:ok, any()} | {:error, any()}), pos_integer()) ::
           {:ok, any()} | {:error, :max_attempts}
@@ -178,10 +140,6 @@ defmodule TaskQueue.LogReader do
       _ -> {:error, :max_attempts}
     end
   end
-
-  # ---------------------------------------------------------------------------
-  # Private
-  # ---------------------------------------------------------------------------
 
   @spec parse_line(String.t()) :: {:ok, map()} | :error
   defp parse_line(line) do
@@ -209,30 +167,14 @@ defmodule TaskQueue.LogReader do
 end
 ```
 
-The `stream_file/1` function builds a pipeline of lazy transformations:
-
-1. `File.stream!/1` opens the file and returns a stream that yields one line at a time.
-   The file is only read as the stream is consumed — no upfront allocation.
-2. `Stream.map(&String.trim/1)` strips trailing newlines from each line.
-3. `Stream.reject(&(&1 == ""))` drops blank lines.
-4. `Stream.map(&parse_line/1)` parses each line into `{:ok, map}` or `:error`.
-5. `Stream.filter` keeps only successfully parsed lines.
-6. `Stream.map` unwraps the `{:ok, entry}` tuple.
-
-None of these transformations execute until a terminal function like `Enum.to_list`,
-`Enum.count`, or `Enum.take` consumes the stream.
+The `stream_file/1` function builds a pipeline of lazy transformations. None execute
+until a terminal function (`Enum.to_list`, `Enum.count`, `Enum.take`) consumes the stream.
 
 The `retry_stream/2` function uses `Stream.drop_while/2` to skip failed attempts. As
-soon as the first success is found, `Enum.take(1)` stops the stream — no further attempts
-are made. If all attempts fail, `Enum.take(1)` returns an empty list, and the `case`
-returns `{:error, :max_attempts}`.
+soon as the first success is found, `Enum.take(1)` stops the stream — no further
+attempts are made.
 
-The `cron_schedule_stream/2` function uses `Stream.iterate/2` to produce an infinite
-sequence. Each element is the previous value plus the interval. Since the stream is lazy,
-it never materializes more than one element at a time — but calling `Enum.to_list/1` on
-it would run forever.
-
-### Step 2: Given tests — must pass without modification
+### Tests
 
 ```elixir
 # test/task_queue/streams_test.exs
@@ -336,7 +278,7 @@ defmodule TaskQueue.StreamsTest do
 end
 ```
 
-### Step 3: Run the tests
+### Run the tests
 
 ```bash
 mix test test/task_queue/streams_test.exs --trace
@@ -344,48 +286,26 @@ mix test test/task_queue/streams_test.exs --trace
 
 ---
 
-## Trade-off analysis
-
-| Aspect | Stream (lazy) | Enum (eager) | File.read! + String.split |
-|--------|--------------|-------------|--------------------------|
-| Memory for 1 GB file | O(1) — one line at a time | O(n) — full file in memory | Crashes on large files |
-| Time to first result | Immediate | After full processing | After full file read |
-| Composability | High — pipeline of transformations | High | Low |
-| Can stop early? | Yes — `Enum.take` stops processing | No — entire collection is traversed | No |
-| Overhead per element | Higher — function call chain | Lower — direct traversal | Lowest |
-| Infinite sequences | Yes — `Stream.iterate`, `Stream.cycle` | No | No |
-
-Reflection question: `retry_stream/2` uses `Stream.drop_while` to skip failed attempts
-and `Enum.take(1)` to get the first success. What happens if you replace `Enum.take(1)`
-with `Enum.to_list()`? Why does the backoff `Process.sleep` still happen for all attempts
-even though only the successful one is returned?
-
----
-
 ## Common production mistakes
 
 **1. Calling `Enum.to_list` on an infinite stream**
-`Stream.iterate(0, &(&1 + 1)) |> Enum.to_list()` will run forever, consuming all memory.
-Always pair infinite streams with `Enum.take/2` or `Stream.take/2`.
+`Stream.iterate(0, &(&1 + 1)) |> Enum.to_list()` will run forever. Always pair infinite
+streams with `Enum.take/2`.
 
 **2. Side effects in `Stream.map` without a terminal function**
 ```elixir
-# This does NOTHING — the stream is defined but never consumed
+# Does NOTHING — the stream is defined but never consumed
 File.stream!("big.log") |> Stream.map(&IO.puts/1)
 
-# Correct — Stream.run/1 consumes the stream for side effects
+# Correct — Stream.run/1 consumes the stream
 File.stream!("big.log") |> Stream.map(&IO.puts/1) |> Stream.run()
 ```
 
-**3. Forgetting that `Stream.map` is not `Enum.map`**
-`Stream.map(collection, fn)` returns a lazy stream description, not a list.
-`Enum.map(collection, fn)` executes immediately and returns a list.
+**3. Forgetting that `Stream.map` returns a stream, not a list**
 Use `Stream.map` in pipelines; use `Enum.map` when you need the result immediately.
 
 **4. Using streams for small in-memory collections**
-Streams have per-element overhead from the function call chain. For a list of 100
-items, `Enum.map` is faster than `Stream.map`. Streams pay off at thousands of items
-or when memory is the constraint.
+Streams have per-element overhead. For a list of 100 items, `Enum.map` is faster.
 
 ---
 
@@ -393,5 +313,4 @@ or when memory is the constraint.
 
 - [Stream — HexDocs](https://hexdocs.pm/elixir/Stream.html)
 - [File.stream!/1 — HexDocs](https://hexdocs.pm/elixir/File.html#stream!/1)
-- [Stream.resource/3 — HexDocs](https://hexdocs.pm/elixir/Stream.html#resource/3) — for wrapping stateful external resources
 - [Enum vs Stream — Elixir School](https://elixirschool.com/en/lessons/basics/enum#lazy-evaluation-2)

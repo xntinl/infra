@@ -1,17 +1,12 @@
 # ETS Advanced: Concurrency Patterns
 
-**Project**: `api_gateway` — built incrementally across the advanced level
-
----
-
 ## Project context
 
-You're building `api_gateway`. The rate limiter (previous exercise) uses a basic ETS
-`:bag` table. Now you need to push further: the gateway must track per-route request
-statistics under heavy concurrent load, and the ops team wants real-time range queries
-on request timestamps without full table scans.
+You are building `api_gateway`, an internal HTTP gateway that routes traffic to microservices.
+This exercise focuses on tracking per-route request statistics under heavy concurrent load,
+and enabling real-time range queries on request timestamps without full table scans.
 
-Project structure at this point:
+Project structure:
 
 ```
 api_gateway/
@@ -19,8 +14,6 @@ api_gateway/
 │   └── api_gateway/
 │       ├── application.ex
 │       ├── router.ex
-│       ├── rate_limiter/
-│       │   └── server.ex
 │       └── metrics/
 │           ├── counter.ex
 │           └── event_log.ex
@@ -81,14 +74,14 @@ The right combination for the gateway counters:
 
 ## Why `:ordered_set` for time-range queries
 
-`:set` uses a hash table — O(1) lookup but no ordering. To query events between T1 and T2
+`:set` uses a hash table -- O(1) lookup but no ordering. To query events between T1 and T2
 on a `:set`, you must read every record and filter. That is O(n) and copies the entire table.
 
-`:ordered_set` uses an AVL tree — O(log n) lookup and guaranteed key ordering. Range queries
+`:ordered_set` uses an AVL tree -- O(log n) lookup and guaranteed key ordering. Range queries
 use `:ets.select/2` with guards on the key field: the tree traversal starts at T1 and stops
 at T2. No full scan, no copy.
 
-The cost: 30–40% more memory per entry and O(log n) for individual lookups vs O(1).
+The cost: 30-40% more memory per entry and O(log n) for individual lookups vs O(1).
 Use `:ordered_set` only when your access patterns are temporal or require ordered iteration.
 
 ---
@@ -116,7 +109,7 @@ defmodule ApiGateway.Metrics.Counter do
   @table :route_metrics
 
   # ---------------------------------------------------------------------------
-  # Public API — reads go directly to ETS, never through the GenServer
+  # Public API -- reads go directly to ETS, never through the GenServer
   # ---------------------------------------------------------------------------
 
   @doc """
@@ -125,7 +118,7 @@ defmodule ApiGateway.Metrics.Counter do
 
   Uses update_counter/4 with a list of {position, increment} tuples to atomically
   update multiple fields in a single call. The fourth argument provides the default
-  record to insert if the key doesn't exist yet — this avoids a separate insert_new
+  record to insert if the key doesn't exist yet -- this avoids a separate insert_new
   call and the race condition that would come with it.
   """
   @spec record(String.t(), non_neg_integer(), 200..599) :: :ok
@@ -144,7 +137,7 @@ defmodule ApiGateway.Metrics.Counter do
 
   @doc """
   Returns current stats for a route.
-  Direct ETS read — no GenServer call.
+  Direct ETS read -- no GenServer call.
   """
   @spec get(String.t()) :: %{requests: integer(), errors: integer(), bytes: integer()}
   def get(route) do
@@ -169,7 +162,7 @@ defmodule ApiGateway.Metrics.Counter do
   end
 
   # ---------------------------------------------------------------------------
-  # GenServer — only responsible for table creation
+  # GenServer -- only responsible for table creation
   # ---------------------------------------------------------------------------
 
   def start_link(opts \\ []) do
@@ -197,10 +190,10 @@ end
 defmodule ApiGateway.Metrics.EventLog do
   @moduledoc """
   Append-only event log for gateway requests, backed by ETS :ordered_set.
-  Key: {timestamp_microsecond, unique_id} — ensures uniqueness without losing ordering.
+  Key: {timestamp_microsecond, unique_id} -- ensures uniqueness without losing ordering.
 
   GenServer owns the table. Writes go through the GenServer to serialize inserts.
-  Reads use :ets.select directly — no GenServer bottleneck.
+  Reads use :ets.select directly -- no GenServer bottleneck.
 
   The :ordered_set type enables efficient range queries: the AVL tree traversal
   starts at the lower bound key and stops at the upper bound, avoiding a full
@@ -225,7 +218,7 @@ defmodule ApiGateway.Metrics.EventLog do
 
   @doc """
   Returns all events in the time range [from_us, to_us] (microseconds).
-  Direct ETS select — no GenServer bottleneck.
+  Direct ETS select -- no GenServer bottleneck.
 
   The match spec is built manually at runtime because :ets.fun2ms is a compile-time
   macro and cannot capture the from_us/to_us function arguments. The pattern matches
@@ -267,7 +260,7 @@ defmodule ApiGateway.Metrics.EventLog do
 
   @doc """
   Deletes events older than max_age_seconds.
-  Uses :ets.select_delete — operates directly in ETS, no memory copy.
+  Uses :ets.select_delete -- operates directly in ETS, no memory copy.
   """
   @spec purge_older_than(pos_integer()) :: {:purged, non_neg_integer()}
   def purge_older_than(max_age_seconds) do
@@ -311,7 +304,7 @@ defmodule ApiGateway.Metrics.EventLog do
 end
 ```
 
-### Step 3: Given tests — must pass without modification
+### Step 3: Tests
 
 ```elixir
 # test/api_gateway/metrics/counter_test.exs
@@ -442,7 +435,7 @@ end
 mix test test/api_gateway/metrics/ --trace
 ```
 
-### Step 5: Benchmark — GenServer vs ETS for concurrent reads
+### Step 5: Benchmark -- GenServer vs ETS for concurrent reads
 
 ```elixir
 # bench/metrics_bench.exs
@@ -455,10 +448,10 @@ end
 
 Benchee.run(
   %{
-    "Counter.get — direct ETS read" => fn ->
+    "Counter.get -- direct ETS read" => fn ->
       Counter.get("/api/route_#{:rand.uniform(50)}")
     end,
-    "Counter.all — full table scan" => fn ->
+    "Counter.all -- full table scan" => fn ->
       Counter.all()
     end
   },
@@ -473,15 +466,13 @@ Benchee.run(
 mix run bench/metrics_bench.exs
 ```
 
-**Expected**: `Counter.get` should complete in under 5µs at p99 under 50 concurrent readers.
+**Expected**: `Counter.get` should complete in under 5us at p99 under 50 concurrent readers.
 If you see serialization (latency growing with concurrency), verify that `record/3`
-does NOT call `GenServer.call` — it must write directly to ETS.
+does NOT call `GenServer.call` -- it must write directly to ETS.
 
 ---
 
 ## Trade-off analysis
-
-Fill in this table based on your implementation and benchmark results:
 
 | Aspect | `:set` + `write_concurrency` | `:ordered_set` | GenServer map |
 |--------|------------------------------|---------------|--------------|
@@ -505,11 +496,11 @@ If your workload mixes point lookups with full scans, benchmark both flag combin
 
 **2. Applying `decentralized_counters` when reads are frequent**
 With `decentralized_counters`, reading the current counter value requires summing
-scheduler-local copies — O(schedulers). For a dashboard polling every 5 seconds
+scheduler-local copies -- O(schedulers). For a dashboard polling every 5 seconds
 this is fine. For a rate limiter checking every request, it adds up.
 
 **3. Using `:ordered_set` for point lookups that don't need ordering**
-O(log n) vs O(1) is a 3–5x difference at 1M entries. Only use `:ordered_set` when
+O(log n) vs O(1) is a 3-5x difference at 1M entries. Only use `:ordered_set` when
 range queries or ordered iteration are part of the actual access pattern.
 
 **4. Writing match specs by hand instead of building them programmatically**
@@ -526,7 +517,7 @@ GenServer in the supervision tree).
 
 ## Resources
 
-- [`:ets` documentation — Erlang/OTP](https://www.erlang.org/doc/man/ets.html) — read the `type`, `access`, and `write_concurrency` sections
-- [Erlang efficiency guide — ETS](https://www.erlang.org/doc/efficiency_guide/tablesDatabases.html) — when to use each table type
-- [`:ets.fun2ms` / ms_transform](https://www.erlang.org/doc/man/ms_transform.html) — compile-time match spec generation
-- [Erlang in Anger — Fred Hebert](https://www.erlang-in-anger.com/) — production ETS patterns (free PDF)
+- [`:ets` documentation -- Erlang/OTP](https://www.erlang.org/doc/man/ets.html) -- read the `type`, `access`, and `write_concurrency` sections
+- [Erlang efficiency guide -- ETS](https://www.erlang.org/doc/efficiency_guide/tablesDatabases.html) -- when to use each table type
+- [`:ets.fun2ms` / ms_transform](https://www.erlang.org/doc/man/ms_transform.html) -- compile-time match spec generation
+- [Erlang in Anger -- Fred Hebert](https://www.erlang-in-anger.com/) -- production ETS patterns (free PDF)

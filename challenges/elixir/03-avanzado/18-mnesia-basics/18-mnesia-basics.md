@@ -1,21 +1,14 @@
 # Mnesia Basics
 
-**Project**: `api_gateway` — built incrementally across the advanced level
-
----
-
 ## Project context
 
-You're building `api_gateway`. The gateway handles authentication and session management
-for the platform. Sessions must:
-- Survive individual node restarts (DETS is per-node and doesn't replicate)
-- Be readable from any node in the cluster (a client may hit any node)
-- Support transactional operations — renewing a session and invalidating old ones
-  must be atomic
+You are building `api_gateway`, an internal HTTP gateway that routes traffic to microservices.
+This exercise focuses on session management and atomic credit transfers using Mnesia --
+sessions must survive individual node restarts, be readable from any node in the cluster,
+and support transactional operations where renewing a session and invalidating old ones
+must be atomic.
 
-DETS answered the durability question. Mnesia answers the distributed consistency question.
-
-Project structure at this point:
+Project structure:
 
 ```
 api_gateway/
@@ -23,9 +16,6 @@ api_gateway/
 │   └── api_gateway/
 │       ├── application.ex
 │       ├── router.ex
-│       ├── rate_limiter/
-│       ├── metrics/
-│       ├── config/
 │       └── auth/
 │           ├── session_store.ex
 │           └── account_system.ex
@@ -65,10 +55,10 @@ distributed locks, and recovers consistently after node failures.
 Mnesia has a strict initialization sequence that cannot be skipped:
 
 ```
-1. :mnesia.create_schema([node()]) — once per node, persists to disk
-2. :mnesia.start()                 — start the Mnesia application
-3. :mnesia.create_table(...)       — define tables (idempotent with {:aborted, {:already_exists, T}})
-4. :mnesia.wait_for_tables(...)    — ALWAYS wait before making queries
+1. :mnesia.create_schema([node()]) -- once per node, persists to disk
+2. :mnesia.start()                 -- start the Mnesia application
+3. :mnesia.create_table(...)       -- define tables (idempotent with {:aborted, {:already_exists, T}})
+4. :mnesia.wait_for_tables(...)    -- ALWAYS wait before making queries
 ```
 
 Skipping step 4 causes `{:aborted, {no_exists, TableName}}` errors on the first query
@@ -92,7 +82,7 @@ end)
 
 Use dirty operations for reads of data that changes infrequently (cached config,
 active session lookups where stale data is acceptable). Use transactions for any
-operation that reads and then writes — without a write lock, two concurrent processes
+operation that reads and then writes -- without a write lock, two concurrent processes
 can read the same value and both write conflicting updates.
 
 ---
@@ -120,7 +110,7 @@ defmodule ApiGateway.Auth.SessionStore do
   defstruct [:id, :user_id, :token, :expires_at, :metadata]
 
   # ---------------------------------------------------------------------------
-  # Schema and table setup — call once at startup
+  # Schema and table setup -- call once at startup
   # ---------------------------------------------------------------------------
 
   @spec setup() :: :ok
@@ -202,7 +192,7 @@ defmodule ApiGateway.Auth.SessionStore do
   @doc """
   Renews a session by extending its expiry. Uses a transaction with a :write lock
   to prevent two concurrent renew calls from reading the same old expiry and both
-  writing updates — the write lock serializes access to this specific session record.
+  writing updates -- the write lock serializes access to this specific session record.
   """
   @spec renew(String.t()) :: {:ok, t()} | {:error, :not_found}
   def renew(session_id) do
@@ -236,7 +226,7 @@ defmodule ApiGateway.Auth.SessionStore do
 
   @doc """
   Invalidates all sessions for a given user. Uses a transaction to ensure
-  atomicity — either all sessions are deleted or none are (on abort/retry).
+  atomicity -- either all sessions are deleted or none are (on abort/retry).
   Returns the count of deleted sessions for operational visibility.
   """
   @spec invalidate_all_for_user(pos_integer()) :: {:ok, non_neg_integer()}
@@ -404,7 +394,7 @@ defmodule ApiGateway.Auth.AccountSystem do
 end
 ```
 
-### Step 3: Given tests — must pass without modification
+### Step 3: Tests
 
 ```elixir
 # test/api_gateway/auth/session_store_test.exs
@@ -491,7 +481,7 @@ defmodule ApiGateway.Auth.AccountSystemTest do
       result = AccountSystem.transfer(alice.id, bob.id, 500)
       assert {:error, {:insufficient_funds, 100, 500}} = result
 
-      # Balances must be unchanged — rollback verified
+      # Balances must be unchanged -- rollback verified
       assert {:ok, 100, "USD"} = AccountSystem.get_balance(alice.id)
       assert {:ok, 100, "USD"} = AccountSystem.get_balance(bob.id)
     end
@@ -546,11 +536,11 @@ a reasonable timeout (10s) in your application startup sequence.
 
 **2. Using dirty ops for read-modify-write**
 ```elixir
-# WRONG — race condition when two processes run concurrently
+# WRONG -- race condition when two processes run concurrently
 [account] = :mnesia.dirty_read(Account, id)
 :mnesia.dirty_write(%{account | balance: account.balance - amount})
 
-# CORRECT — write lock prevents concurrent modification
+# CORRECT -- write lock prevents concurrent modification
 :mnesia.transaction(fn ->
   [account] = :mnesia.read({Account, id}, :write)
   :mnesia.write(%{account | balance: account.balance - amount})
@@ -577,7 +567,7 @@ or ephemeral session tokens that don't need to survive a cluster-wide crash,
 
 ## Resources
 
-- [Erlang Mnesia user guide](https://www.erlang.org/doc/apps/mnesia/mnesia_chap1.html) — official guide with replication examples
-- [Mnesia reference manual](https://www.erlang.org/doc/man/mnesia.html) — full API reference
-- [Learn You Some Erlang — Mnesia chapter](https://learnyousomeerlang.com/mnesia) — clear tutorial with transaction examples
-- [Elixir in Action 2nd ed. — Saša Juric](https://www.manning.com/books/elixir-in-action-second-edition) — persistence patterns chapter
+- [Erlang Mnesia user guide](https://www.erlang.org/doc/apps/mnesia/mnesia_chap1.html) -- official guide with replication examples
+- [Mnesia reference manual](https://www.erlang.org/doc/man/mnesia.html) -- full API reference
+- [Learn You Some Erlang -- Mnesia chapter](https://learnyousomeerlang.com/mnesia) -- clear tutorial with transaction examples
+- [Elixir in Action 2nd ed. -- Sasa Juric](https://www.manning.com/books/elixir-in-action-second-edition) -- persistence patterns chapter

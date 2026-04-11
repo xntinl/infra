@@ -1,21 +1,18 @@
 # Tracing in Production: :sys, :dbg, and :recon_trace
 
-**Project**: `api_gateway` — built incrementally across the advanced level
-
----
-
 ## Project context
 
-You're building `api_gateway`. A request type is intermittently slow — p99
-latency at 800ms while median is 5ms. The slow requests appear in production
-only; the behavior disappears when the node is restarted. You cannot add logging
-and deploy because the problem is intermittent and you need to observe it *live*.
+You are building `api_gateway`, an internal HTTP gateway that routes traffic to microservices.
+A request type is intermittently slow -- p99 latency at 800ms while median is 5ms. The slow
+requests appear in production only; the behavior disappears when the node is restarted.
+You cannot add logging and deploy because the problem is intermittent and you need to
+observe it *live*.
 
 Elixir/Erlang has three production-safe tracing tools built into the runtime,
 each with different scope, overhead, and safety guarantees. This exercise covers
 all three applied to diagnosing slow requests in a live gateway node.
 
-Project structure at this point:
+Project structure:
 
 ```
 api_gateway/
@@ -23,18 +20,23 @@ api_gateway/
 │   └── api_gateway/
 │       ├── application.ex
 │       ├── router.ex
-│       ├── middleware/
-│       │   ├── pipeline.ex
-│       │   └── ...
 │       └── dev/
-│           ├── ast_tools.ex
-│           ├── memory_snapshot.ex
-│           └── tracer.ex           # ← you implement this
+│           └── tracer.ex
 ├── test/
 │   └── api_gateway/
 │       └── dev/
 │           └── tracer_test.exs
 └── mix.exs
+```
+
+Add `:recon` to `mix.exs`:
+```elixir
+defp deps do
+  [
+    # ...
+    {:recon, "~> 2.5"}
+  ]
+end
 ```
 
 ---
@@ -44,13 +46,11 @@ api_gateway/
 Two requirements:
 
 1. **GenServer-level tracing**: observe the state transitions and message queue
-   of the `ApiGateway.RateLimit.Server` GenServer in real time to determine if
-   the slow requests are caused by a backed-up message queue or a slow
-   `handle_call` handler.
+   of a GenServer in real time to determine if slow requests are caused by a
+   backed-up message queue or a slow `handle_call` handler.
 
-2. **Function call tracing**: trace all calls to
-   `ApiGateway.Middleware.Pipeline.call/2` and `ApiGateway.Router.dispatch/1`
-   on a live node, with a call count limit to avoid flooding the system.
+2. **Function call tracing**: trace all calls to specific functions on a live node,
+   with a call count limit to avoid flooding the system.
 
 ---
 
@@ -58,7 +58,7 @@ Two requirements:
 
 ```
 Tool            Scope               Overhead          Production safe
-──────────────────────────────────────────────────────────────────────
+----------------------------------------------------------------------
 :sys.trace      One GenServer        Low               Yes
 :sys.log        One GenServer        Minimal           Yes (ring buffer)
 :sys.get_state  One GenServer        Zero              Yes (snapshot)
@@ -72,7 +72,7 @@ the tracing process.
 
 ---
 
-## `:sys` — safe OTP process inspection
+## `:sys` -- safe OTP process inspection
 
 Any process implementing an OTP behaviour (GenServer, GenStateMachine, Supervisor)
 automatically implements the `:sys` protocol.
@@ -83,14 +83,14 @@ automatically implements the `:sys` protocol.
 
 # Log the last N system messages (calls, casts, info) into a ring buffer
 :sys.log(pid_or_name, {true, 20})   # enable, keep last 20
-:sys.log(pid_or_name, get)          # retrieve the log
+:sys.log(pid_or_name, :get)         # retrieve the log
 :sys.log(pid_or_name, false)        # disable
 
 # Print each incoming message to the console
 :sys.trace(pid_or_name, true)       # enable
 :sys.trace(pid_or_name, false)      # disable
 
-# Suspend a process (freezes it — use only in emergencies)
+# Suspend a process (freezes it -- use only in emergencies)
 :sys.suspend(pid_or_name)
 :sys.resume(pid_or_name)
 ```
@@ -101,7 +101,7 @@ captures only OTP messages, not raw `send/receive`.
 
 ---
 
-## `:recon_trace` — safe function tracing
+## `:recon_trace` -- safe function tracing
 
 `:recon_trace.calls/3` traces function calls across the live system with a
 mandatory message limit. When the limit is reached, tracing stops automatically.
@@ -110,7 +110,7 @@ mandatory message limit. When the limit is reached, tracing stops automatically.
 # Trace up to 100 calls to Router.dispatch/1
 :recon_trace.calls({ApiGateway.Router, :dispatch, 1}, 100)
 
-# Trace with a match spec — only trace calls where first arg matches a pattern
+# Trace with a match spec -- only trace calls where first arg matches a pattern
 ms = [{{:_, :_, :"GET"}, [], [{:return_trace}]}]
 :recon_trace.calls({ApiGateway.Router, :dispatch, 1}, 50, [{:scope, :local}])
 
@@ -123,7 +123,7 @@ wrappers. Always use `:recon_trace` instead of raw `:dbg` in production.
 
 ---
 
-## `:dbg` match specs — filtering what gets traced
+## `:dbg` match specs -- filtering what gets traced
 
 Match specs are the Erlang equivalent of a pattern-match filter for the tracing
 system. They specify which calls to trace based on argument patterns:
@@ -132,7 +132,7 @@ system. They specify which calls to trace based on argument patterns:
 # Trace only when first argument is a map with method "POST"
 ms = :dbg.fun2ms(fn [%{method: "POST"} | _] -> true end)
 
-# Return trace — also trace the return value
+# Return trace -- also trace the return value
 ms = :dbg.fun2ms(fn [_conn, _opts] -> {:return_trace} end)
 ```
 
@@ -151,19 +151,19 @@ defmodule ApiGateway.Dev.Tracer do
   Production-safe tracing utilities wrapping :sys and :recon_trace.
 
   All functions are safe to call on a live node.
-  :recon_trace.calls always has a message limit — tracing stops automatically.
+  :recon_trace.calls always has a message limit -- tracing stops automatically.
 
   Usage:
     # Inspect a GenServer state without restarting
-    ApiGateway.Dev.Tracer.get_state(ApiGateway.RateLimit.Server)
+    ApiGateway.Dev.Tracer.get_state(MyServer)
 
     # Log the last 20 messages received by a GenServer
-    ApiGateway.Dev.Tracer.start_log(ApiGateway.RateLimit.Server, 20)
+    ApiGateway.Dev.Tracer.start_log(MyServer, 20)
     # ... wait for slow request ...
-    ApiGateway.Dev.Tracer.read_log(ApiGateway.RateLimit.Server)
+    ApiGateway.Dev.Tracer.read_log(MyServer)
 
     # Trace up to 50 calls to Pipeline.call/2
-    ApiGateway.Dev.Tracer.trace_calls(ApiGateway.Middleware.Pipeline, :call, 2, 50)
+    ApiGateway.Dev.Tracer.trace_calls(MyModule, :call, 2, 50)
   """
 
   @doc """
@@ -179,45 +179,58 @@ defmodule ApiGateway.Dev.Tracer do
   Enables the :sys message log ring buffer on `server`, keeping the last `n` messages.
   Call read_log/1 to retrieve the captured messages.
   Call stop_log/1 to disable.
+
+  The ring buffer captures OTP system messages (calls, casts, info) as they arrive.
+  It overwrites oldest entries when the buffer is full, so only the last N messages
+  are retained at any point.
   """
   @spec start_log(GenServer.server(), pos_integer()) :: :ok
   def start_log(server, n \\ 20) do
-    # HINT: use :sys.log(server, {true, n})
-    # TODO: implement
+    :sys.log(server, {true, n})
     :ok
   end
 
   @doc """
   Returns the list of OTP messages captured by the ring buffer.
   Format: [{:in, msg} | {:out, reply}] per OTP message.
+
+  :sys.log/2 with :get returns {:ok, messages}. We extract just the messages list.
   """
   @spec read_log(GenServer.server()) :: list()
   def read_log(server) do
-    # HINT: use :sys.log(server, :get)
-    # HINT: the return is {:ok, messages} — extract messages
-    # TODO: implement
-    []
+    {:ok, messages} = :sys.log(server, :get)
+    messages
   end
 
   @doc """
-  Disables the :sys log buffer.
+  Disables the :sys log buffer. Always call this after diagnosis is complete
+  to free the ring buffer memory.
   """
   @spec stop_log(GenServer.server()) :: :ok
   def stop_log(server) do
-    # HINT: use :sys.log(server, false)
-    # TODO: implement
+    :sys.log(server, false)
     :ok
   end
 
   @doc """
-  Returns statistics about a GenServer: start time, message queue length, reductions.
+  Returns statistics about a GenServer: start time, message counts, reductions.
+
+  Enables statistics collection, immediately retrieves the stats, then disables
+  collection. Returns a map with all available statistics data.
   """
   @spec stats(GenServer.server()) :: map()
   def stats(server) do
-    # HINT: use :sys.statistics(server, :get)
-    # HINT: must first enable statistics with :sys.statistics(server, true)
-    # TODO: implement — enable, get, disable, return as map
-    %{}
+    :sys.statistics(server, true)
+
+    case :sys.statistics(server, :get) do
+      {:ok, stats_list} ->
+        :sys.statistics(server, false)
+        Map.new(stats_list)
+
+      _ ->
+        :sys.statistics(server, false)
+        %{}
+    end
   end
 
   @doc """
@@ -225,12 +238,12 @@ defmodule ApiGateway.Dev.Tracer do
   Prints each call to the calling process's group leader.
 
   Tracing stops automatically after max_messages calls or when clear/0 is called.
+  Uses :recon_trace which wraps :dbg with safety limits -- never use raw :dbg
+  in production without these limits.
   """
   @spec trace_calls(module(), atom(), arity(), pos_integer()) :: :ok
   def trace_calls(module, function, arity, max_messages \\ 50) do
-    # HINT: use :recon_trace.calls({module, function, arity}, max_messages)
-    # HINT: returns :ok — tracing happens asynchronously
-    # TODO: implement
+    :recon_trace.calls({module, function, arity}, max_messages)
     :ok
   end
 
@@ -240,12 +253,12 @@ defmodule ApiGateway.Dev.Tracer do
 
   Example match spec for calls where the first arg has method "GET":
     ms = :dbg.fun2ms(fn [%{method: "GET"} | _] -> true end)
+
+  When a match spec is provided, the arity is embedded in the spec itself.
   """
   @spec trace_calls_with_spec(module(), atom(), arity(), list(), pos_integer()) :: :ok
   def trace_calls_with_spec(module, function, _arity, match_spec, max_messages \\ 50) do
-    # HINT: use :recon_trace.calls({module, function, match_spec}, max_messages)
-    # Note: when a match spec is provided, arity is embedded in the spec
-    # TODO: implement
+    :recon_trace.calls({module, function, match_spec}, max_messages)
     :ok
   end
 
@@ -280,7 +293,7 @@ defmodule ApiGateway.Dev.Tracer do
 end
 ```
 
-### Step 2: Given tests — must pass without modification
+### Step 2: Tests
 
 ```elixir
 # test/api_gateway/dev/tracer_test.exs
@@ -389,14 +402,14 @@ mix test test/api_gateway/dev/tracer_test.exs --trace
 | Tool | Scope | Overhead | Stops automatically | Production safe |
 |------|-------|----------|---------------------|-----------------|
 | `:sys.get_state` | One process | Zero | N/A | Yes |
-| `:sys.log` | One process | Minimal (ring buffer) | No — must call `false` | Yes |
+| `:sys.log` | One process | Minimal (ring buffer) | No -- must call `false` | Yes |
 | `:sys.trace` | One process | Low | No | Yes (single process) |
-| `:recon_trace.calls` | Any function | Controlled | Yes — message limit | Yes |
+| `:recon_trace.calls` | Any function | Controlled | Yes -- message limit | Yes |
 | `:dbg` raw | Any function | HIGH | No | No without limits |
 
 **Decision rule**:
-- If the issue is in one known GenServer → start with `:sys.log` and `:sys.get_state`
-- If the issue is spread across function calls → use `:recon_trace.calls` with a low limit
+- If the issue is in one known GenServer -> start with `:sys.log` and `:sys.get_state`
+- If the issue is spread across function calls -> use `:recon_trace.calls` with a low limit
 - Never use raw `:dbg` without `:recon_trace` wrapper on a production node
 
 ---
@@ -416,7 +429,7 @@ it stops after the message limit but leaves trace flags on the tracing target.
 Always clean up after diagnosis.
 
 **3. Using `:sys.suspend/1` on a critical GenServer in production**
-`:sys.suspend` freezes the process — all messages queue up. On a GenServer that
+`:sys.suspend` freezes the process -- all messages queue up. On a GenServer that
 handles requests, this causes request timeouts. Use `:sys.get_state` (read-only)
 instead of suspend for observation.
 
@@ -434,8 +447,8 @@ for diagnosis, not as a precise call counter.
 
 ## Resources
 
-- [`:sys` module — Erlang docs](https://www.erlang.org/doc/man/sys.html) — complete API for OTP process inspection
-- [`:recon_trace` — Recon docs](https://ferd.github.io/recon/recon_trace.html) — safe function tracing with examples
-- [Erlang in Anger — Fred Hébert](https://www.erlang-in-anger.com/) — chapter 9 covers production tracing strategies
-- [`:dbg` module — Erlang docs](https://www.erlang.org/doc/man/dbg.html) — raw trace API (understand before using)
-- [Match specs — Erlang docs](https://www.erlang.org/doc/apps/erts/match_spec.html) — match specification language for tracing filters
+- [`:sys` module -- Erlang docs](https://www.erlang.org/doc/man/sys.html) -- complete API for OTP process inspection
+- [`:recon_trace` -- Recon docs](https://ferd.github.io/recon/recon_trace.html) -- safe function tracing with examples
+- [Erlang in Anger -- Fred Hebert](https://www.erlang-in-anger.com/) -- chapter 9 covers production tracing strategies
+- [`:dbg` module -- Erlang docs](https://www.erlang.org/doc/man/dbg.html) -- raw trace API (understand before using)
+- [Match specs -- Erlang docs](https://www.erlang.org/doc/apps/erts/match_spec.html) -- match specification language for tracing filters

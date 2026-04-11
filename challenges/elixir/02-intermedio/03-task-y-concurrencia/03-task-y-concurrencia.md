@@ -1,44 +1,12 @@
 # Task: Structured Concurrency
 
-**Project**: `task_queue` — built incrementally across the intermediate level
-
----
-
-## Project context
-
-The task_queue system now has a registry (exercise 02) and a primitive worker (exercise 01).
-The scheduler needs to **execute batches of jobs in parallel** and collect all results before
-moving on. It also needs to process an incoming stream of job payloads concurrently without
-spawning an unbounded number of processes.
-
-`Task` is the right abstraction: it provides structured concurrency for one-shot parallel
-work without requiring a full GenServer lifecycle.
-
-Project structure at this point:
-
-```
-task_queue/
-├── lib/
-│   └── task_queue/
-│       ├── worker_process.ex    # exercise 01
-│       ├── task_registry.ex     # exercise 02
-│       └── batch_runner.ex
-├── test/
-│   └── task_queue/
-│       └── batch_runner_test.exs   # given tests — must pass without modification
-└── mix.exs
-```
-
----
-
 ## Why Task and not spawn
 
 `spawn` is a primitive: you launch a process, lose the reference, and if you want results
-you must build a manual reply protocol (as in exercise 01). `Task` solves that:
+you must build a manual reply protocol. `Task` solves that:
 
 - `Task.async/1` returns a `%Task{}` struct that carries the PID and a unique reference.
-- `Task.await/2` uses that reference to match exactly the reply from that task — not
-  from any random process.
+- `Task.await/2` uses that reference to match exactly the reply from that task.
 - `Task.async_stream/3` bounds parallelism automatically via `max_concurrency`, preventing
   the system from spawning 10,000 processes for a 10,000-item batch.
 
@@ -49,19 +17,33 @@ long-running processes that maintain state, use GenServer.
 
 ## The business problem
 
-`TaskQueue.BatchRunner` receives a list of job functions and must:
+Build a `TaskQueue.BatchRunner` that receives a list of job functions and:
 
-1. Run them all in parallel, collecting `{:ok, result} | {:error, reason}` for each.
-2. Enforce a per-job timeout — jobs that take too long yield `{:error, :timeout}`.
-3. Provide a `run_stream/3` variant that processes jobs with bounded concurrency (for
-   large batches where spawning all at once would exhaust memory).
-4. Report aggregate stats: how many succeeded, how many timed out, how many errored.
+1. Runs them all in parallel, collecting `{:ok, result} | {:error, reason}` for each.
+2. Enforces a per-job timeout — jobs that take too long yield `{:error, :timeout}`.
+3. Provides a `run_stream/3` variant that processes jobs with bounded concurrency.
+4. Reports aggregate stats: how many succeeded, how many timed out, how many errored.
+
+---
+
+## Project setup
+
+```
+task_queue/
+├── lib/
+│   └── task_queue/
+│       └── batch_runner.ex
+├── test/
+│   └── task_queue/
+│       └── batch_runner_test.exs
+└── mix.exs
+```
 
 ---
 
 ## Implementation
 
-### Step 1: `lib/task_queue/batch_runner.ex`
+### `lib/task_queue/batch_runner.ex`
 
 ```elixir
 defmodule TaskQueue.BatchRunner do
@@ -74,10 +56,6 @@ defmodule TaskQueue.BatchRunner do
 
   @type job :: (-> any())
   @type job_result :: {:ok, any()} | {:error, any()}
-
-  # ---------------------------------------------------------------------------
-  # Public API
-  # ---------------------------------------------------------------------------
 
   @doc """
   Runs all jobs in parallel and waits for all to complete.
@@ -175,10 +153,6 @@ defmodule TaskQueue.BatchRunner do
     end)
   end
 
-  # ---------------------------------------------------------------------------
-  # Private
-  # ---------------------------------------------------------------------------
-
   defp normalize_stream_result({:ok, value}), do: {:ok, value}
   defp normalize_stream_result({:exit, :timeout}), do: {:error, :timeout}
   defp normalize_stream_result({:exit, reason}), do: {:error, reason}
@@ -191,15 +165,13 @@ wraps successful results in `{:ok, value}` and failures in `{:exit, reason}`. Th
 `:timeout` atom is a special exit reason produced by `on_timeout: :kill_task`.
 
 `run_with_callback/2` uses `ordered: false` so that results are delivered to the callback
-as soon as each task finishes, rather than waiting for earlier tasks to complete first. This
-enables real-time progress tracking. The index is threaded through the task so the callback
-knows which job produced each result.
+as soon as each task finishes, enabling real-time progress tracking.
 
 `fire_and_forget/1` uses `Task.start/1` instead of `Task.async/1` because no result
 collection is needed. `Task.start` creates an unlinked task — if it crashes, the caller
-is not affected. This is appropriate for truly background work like sending notifications.
+is not affected.
 
-### Step 2: Given tests — must pass without modification
+### Tests
 
 ```elixir
 # test/task_queue/batch_runner_test.exs
@@ -241,7 +213,6 @@ defmodule TaskQueue.BatchRunnerTest do
 
   describe "run_stream/3" do
     test "processes all jobs with bounded concurrency" do
-      # 20 jobs, max 4 at once
       jobs = Enum.map(1..20, fn n -> fn -> n * 2 end end)
       results = BatchRunner.run_stream(jobs, 4)
       expected = Enum.map(1..20, fn n -> {:ok, n * 2} end)
@@ -249,7 +220,6 @@ defmodule TaskQueue.BatchRunnerTest do
     end
 
     test "never exceeds max_concurrency" do
-      # Track peak concurrency via an agent
       {:ok, counter} = Agent.start_link(fn -> {0, 0} end)
 
       jobs =
@@ -302,7 +272,7 @@ defmodule TaskQueue.BatchRunnerTest do
 end
 ```
 
-### Step 3: Run the tests
+### Run the tests
 
 ```bash
 mix test test/task_queue/batch_runner_test.exs --trace
@@ -312,39 +282,29 @@ mix test test/task_queue/batch_runner_test.exs --trace
 
 ## Trade-off analysis
 
-| Aspect | Task.async + await_many | Task.async_stream | spawn (exercise 01) |
-|--------|------------------------|-------------------|---------------------|
+| Aspect | Task.async + await_many | Task.async_stream | spawn |
+|--------|------------------------|-------------------|-------|
 | Result ordering | Guaranteed (by position) | Configurable (ordered:) | Manual |
 | Memory for 10k jobs | 10k processes at once | Bounded by max_concurrency | 10k processes at once |
 | Backpressure | None | max_concurrency provides it | None |
 | Error handling | Propagates via exit signals | :kill_task or :exit_task | Manual try/rescue |
 | When to use | Small, bounded batches | Large batches, I/O-heavy work | When you need full control |
 
-Reflection question: `run_all/2` uses `Task.async_stream` with `ordered: true`. If you
-set `ordered: false`, results arrive as each task finishes. What use cases does `ordered:
-false` enable, and what does it break?
-
 ---
 
 ## Common production mistakes
 
 **1. Forgetting max_concurrency on large inputs**
-`Task.async_stream` without `max_concurrency` defaults to `System.schedulers_online/0`
-(the number of online BEAM schedulers, typically equal to the CPU core count). This means
-on a batch of 100,000 items, the stream processes only `schedulers_online` items
-concurrently at any point — but it still schedules work for all 100,000 eagerly as the
-stream is consumed. Pair with `Enum.take` or a bounded consumer to avoid unbounded
-scheduling. Always set `max_concurrency` explicitly based on your resource constraints.
+`Task.async_stream` without `max_concurrency` defaults to `System.schedulers_online/0`.
+Always set `max_concurrency` explicitly based on your resource constraints.
 
 **2. Ignoring `on_timeout: :kill_task`**
 Without this option, a timed-out task is still running after `async_stream` considers
-it done. The process accumulates. Use `:kill_task` to ensure termination, but note that
-it may leave external resources (DB connections, file handles) unclosed.
+it done. Use `:kill_task` to ensure termination.
 
 **3. Using Task.async/Task.await in a GenServer callback**
 If you `Task.async` inside `handle_call` and then `Task.await`, you block the GenServer
-for the full duration. The mailbox grows. Use `Task.start` + `GenServer.reply/2` pattern
-instead (send the reply asynchronously when the Task finishes).
+for the full duration. Use `Task.start` + `GenServer.reply/2` pattern instead.
 
 **4. Swallowing exit reasons in async_stream**
 ```elixir
@@ -363,4 +323,3 @@ instead (send the reply asynchronously when the Task finishes).
 - [Task — HexDocs](https://hexdocs.pm/elixir/Task.html)
 - [Task.async_stream/3 — HexDocs](https://hexdocs.pm/elixir/Task.html#async_stream/5)
 - [Task.Supervisor — HexDocs](https://hexdocs.pm/elixir/Task.Supervisor.html)
-- [Elixir Getting Started: Task](https://elixir-lang.org/getting-started/processes.html#tasks)

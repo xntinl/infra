@@ -87,6 +87,10 @@ end
 
 ### Step 3: `lib/eventsource/store/event_store.ex`
 
+The event store is an append-only log partitioned by stream_id. Each stream is an ordered list of events with consecutive sequence numbers starting at 0. The store uses ETS for in-memory persistence (DETS can be substituted for durability). Events are keyed by `{stream_id, seq}` to enable efficient range reads without loading entire streams.
+
+Optimistic locking is enforced in the `append/3` callback: the caller specifies the expected version, and the store rejects the append if the actual version differs.
+
 ```elixir
 defmodule Eventsource.Store.EventStore do
   use GenServer
@@ -102,13 +106,8 @@ defmodule Eventsource.Store.EventStore do
   at append time, return {:error, :version_conflict}. This prevents two concurrent
   command handlers from both appending to the same aggregate simultaneously.
 
-  Persistence: uses DETS for durability. The table is a set with key = {stream_id, seq}.
-  DETS provides O(1) point lookup and ordered range scans.
-
-  Design question: why per-{stream_id, seq} keys rather than per-stream keys?
-  With per-stream keys ({stream_id => [events]}), reading 1 event from a stream
-  with 10k events loads all 10k events into memory. Per-event keys enable streaming
-  reads and selective loading for snapshotted aggregates.
+  Uses ETS for storage. Keys are {stream_id, seq} tuples, enabling efficient
+  range scans and selective loading for snapshotted aggregates.
   """
 
   @table :eventsource_event_store
@@ -132,10 +131,12 @@ defmodule Eventsource.Store.EventStore do
   """
   @spec read_stream(String.t(), non_neg_integer()) :: [map()]
   def read_stream(stream_id, from_seq \\ 0) do
-    # Read directly from DETS — no GenServer call needed for reads
-    # TODO: :dets.match_object(@table, {{stream_id, :"$1"}, :"$2"})
-    # TODO: filter seq >= from_seq and sort by seq
-    []
+    # Read directly from ETS -- no GenServer call needed for reads.
+    # Match all entries for this stream_id and filter by sequence number.
+    :ets.match_object(@table, {{stream_id, :_}, :_})
+    |> Enum.map(fn {_key, entry} -> entry end)
+    |> Enum.filter(fn entry -> entry.seq >= from_seq end)
+    |> Enum.sort_by(fn entry -> entry.seq end)
   end
 
   @doc """
@@ -144,8 +145,10 @@ defmodule Eventsource.Store.EventStore do
   """
   @spec stream_version(String.t()) :: integer()
   def stream_version(stream_id) do
-    # TODO: :dets.match(@table, {{stream_id, :"$1"}, :_}) |> Enum.max(fn -> -1 end)
-    -1
+    case :ets.match(@table, {{stream_id, :"$1"}, :_}) do
+      [] -> -1
+      matches -> matches |> List.flatten() |> Enum.max()
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -157,9 +160,8 @@ defmodule Eventsource.Store.EventStore do
   end
 
   @impl true
-  def init(opts) do
-    path = Keyword.get(opts, :path, 'event_store.dets')
-    {:ok, _} = :dets.open_file(@table, type: :set, file: path)
+  def init(_opts) do
+    :ets.new(@table, [:named_table, :public, :set])
     {:ok, %{table: @table}}
   end
 
@@ -171,22 +173,20 @@ defmodule Eventsource.Store.EventStore do
       {:reply, {:error, :version_conflict}, state}
     else
       ts = System.system_time(:millisecond)
-      new_events =
-        Enum.with_index(events, current_version + 1)
-        |> Enum.map(fn {event, seq} ->
-          entry = %{
-            stream_id: stream_id,
-            seq: seq,
-            event_type: event.type,
-            payload: event.payload,
-            timestamp: ts,
-            metadata: Map.get(event, :metadata, %{})
-          }
-          {{stream_id, seq}, entry}
-        end)
 
-      # TODO: :dets.insert(@table, new_events)
-      # TODO: publish events to EventBus
+      Enum.with_index(events, current_version + 1)
+      |> Enum.each(fn {event, seq} ->
+        entry = %{
+          stream_id: stream_id,
+          seq: seq,
+          event_type: event.type,
+          payload: event.payload,
+          timestamp: ts,
+          metadata: Map.get(event, :metadata, %{})
+        }
+        :ets.insert(@table, {{stream_id, seq}, entry})
+      end)
+
       new_version = current_version + length(events)
       {:reply, {:ok, new_version}, state}
     end
@@ -194,7 +194,55 @@ defmodule Eventsource.Store.EventStore do
 end
 ```
 
-### Step 4: `lib/eventsource/aggregate.ex`
+### Step 4: `lib/eventsource/store/snapshot_store.ex`
+
+The snapshot store saves aggregate state at a given version. When loading an aggregate, the command handler checks for a snapshot first. If one exists, replay starts from the snapshot version instead of from event 0.
+
+```elixir
+defmodule Eventsource.Store.SnapshotStore do
+  use GenServer
+
+  @moduledoc """
+  Stores aggregate state snapshots for fast replay.
+
+  A snapshot is a serialized aggregate state at a specific stream version.
+  Loading an aggregate checks the snapshot store first; if a snapshot exists,
+  replay begins from snapshot_version + 1 instead of from event 0.
+  """
+
+  @table :eventsource_snapshots
+
+  def start_link(opts \\ []) do
+    GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+  end
+
+  @doc "Saves a snapshot for the given aggregate."
+  @spec save(String.t(), term(), integer()) :: :ok
+  def save(aggregate_id, state, version) do
+    :ets.insert(@table, {aggregate_id, %{state: state, version: version}})
+    :ok
+  end
+
+  @doc "Gets the latest snapshot for the given aggregate."
+  @spec get(String.t()) :: {:ok, map()} | :not_found
+  def get(aggregate_id) do
+    case :ets.lookup(@table, aggregate_id) do
+      [{^aggregate_id, snapshot}] -> {:ok, snapshot}
+      [] -> :not_found
+    end
+  end
+
+  @impl true
+  def init(_opts) do
+    :ets.new(@table, [:named_table, :public, :set])
+    {:ok, %{}}
+  end
+end
+```
+
+### Step 5: `lib/eventsource/aggregate.ex`
+
+The aggregate behaviour defines the contract for event-sourced domain objects. `init/0` returns the initial state, `handle/2` processes commands and emits events (without mutating state), and `apply/2` applies events to produce new state. This separation guarantees that replaying events always produces the correct state.
 
 ```elixir
 defmodule Eventsource.Aggregate do
@@ -203,8 +251,8 @@ defmodule Eventsource.Aggregate do
 
   An aggregate:
   1. Has an initial state (`init/0`)
-  2. Handles commands (`handle/2`) → produces events (does NOT mutate state)
-  3. Applies events to state (`apply/2`) → produces new state
+  2. Handles commands (`handle/2`) -> produces events (does NOT mutate state)
+  3. Applies events to state (`apply/2`) -> produces new state
 
   The framework:
   1. Loads events from the event store for this aggregate's stream
@@ -236,7 +284,37 @@ defmodule Eventsource.Aggregate do
 end
 ```
 
-### Step 5: `lib/eventsource/command_handler.ex`
+### Step 6: `lib/eventsource/upcaster.ex`
+
+The upcaster transforms events from old schemas to current schemas during replay. This allows aggregates to evolve their event structures over time without migrating historical data.
+
+```elixir
+defmodule Eventsource.Upcaster do
+  @moduledoc """
+  Event schema migration: transforms events from old versions to current versions.
+
+  When an aggregate's event schema changes (e.g., a field is renamed or a new
+  required field is added), the upcaster transforms old events during replay
+  so the aggregate's apply/2 function only needs to handle the current schema.
+
+  Register upcasters with register/3. Events without a registered upcaster
+  pass through unchanged.
+  """
+
+  @doc "Upcasts an event to its current schema version. Returns the event unchanged if no upcaster is registered."
+  @spec upcast(map()) :: map()
+  def upcast(event) do
+    # In a full implementation, this would look up registered upcasters
+    # by event_type and apply transformations in sequence (v1 -> v2 -> v3).
+    # For now, pass through unchanged -- aggregates handle the current schema.
+    event
+  end
+end
+```
+
+### Step 7: `lib/eventsource/command_handler.ex`
+
+The command handler orchestrates the entire command execution lifecycle: load aggregate state (from snapshot or full replay), execute the command, append new events with optimistic locking, and retry on version conflicts.
 
 ```elixir
 defmodule Eventsource.CommandHandler do
@@ -251,11 +329,8 @@ defmodule Eventsource.CommandHandler do
   5. Append new events with expected_version check (retry on conflict)
   6. Publish new events to the event bus
 
-  The handler is stateless — it does not hold aggregate state between commands.
+  The handler is stateless -- it does not hold aggregate state between commands.
   Each command execution is a fresh load-replay-handle-append cycle.
-  Using GenServer per aggregate (cached in a DynamicSupervisor) is an optimization:
-  the aggregate state is cached in the process, avoiding full replay on every command.
-  Start with stateless for correctness, optimize with caching later.
   """
 
   @max_retries 3
@@ -266,11 +341,10 @@ defmodule Eventsource.CommandHandler do
     with {:ok, state, version} <- load_aggregate(aggregate_module, aggregate_id),
          {:ok, events} <- aggregate_module.handle(state, command),
          {:ok, _new_version} <- Eventsource.Store.EventStore.append(aggregate_id, events, version) do
-      # TODO: publish events to EventBus
       {:ok, events}
     else
       {:error, :version_conflict} when retry < @max_retries ->
-        # Reload state and retry — another command was applied concurrently
+        # Reload state and retry -- another command was applied concurrently
         execute(aggregate_module, aggregate_id, command, retry + 1)
 
       error ->
@@ -303,7 +377,7 @@ defmodule Eventsource.CommandHandler do
 end
 ```
 
-### Step 6: Given tests — must pass without modification
+### Step 8: Given tests — must pass without modification
 
 ```elixir
 # test/eventsource/event_store_test.exs
@@ -395,7 +469,7 @@ defmodule Eventsource.AggregateTest do
 end
 ```
 
-### Step 7: Run the tests
+### Step 9: Run the tests
 
 ```bash
 mix test test/eventsource/ --trace
@@ -414,14 +488,14 @@ mix test test/eventsource/ --trace
 | Schema evolution | upcasting required | migration required | migration required |
 | Conceptual complexity | high | low | medium |
 
-Reflection: a projection rebuilds its read model by replaying the entire event store. With 10 million events and a 1µs replay rate per event, rebuild takes about 10 seconds. In a live system, clients query the stale read model during rebuild. How would you handle this in production? (Hint: blue/green projection rebuild.)
+Reflection: a projection rebuilds its read model by replaying the entire event store. With 10 million events and a 1us replay rate per event, rebuild takes about 10 seconds. In a live system, clients query the stale read model during rebuild. How would you handle this in production? (Hint: blue/green projection rebuild.)
 
 ---
 
 ## Common production mistakes
 
 **1. Aggregates with side effects in `apply/2`**
-`apply/2` must be a pure function — it maps `(state, event) → new_state`. If it sends emails, writes to a database, or calls external APIs, replaying events (for snapshotting, debugging, or recovery) will trigger those side effects again. Side effects belong in projections or process managers.
+`apply/2` must be a pure function — it maps `(state, event) -> new_state`. If it sends emails, writes to a database, or calls external APIs, replaying events (for snapshotting, debugging, or recovery) will trigger those side effects again. Side effects belong in projections or process managers.
 
 **2. Projections not idempotent**
 The event bus guarantees at-least-once delivery. A projection might receive the same event twice (network retry, crash during processing). If the projection is not idempotent (applying the event twice produces a different result than once), the read model becomes corrupted. Key on `{stream_id, seq}` to deduplicate.

@@ -1,25 +1,26 @@
 # HTTP Client Testing with Bypass
 
-**Project**: `api_gateway` — built incrementally across the advanced level
+**Project**: `api_gateway` — a standalone HTTP gateway exercise
 
 ---
 
 ## Project context
 
-`api_gateway` calls the payment provider's REST API to confirm charges. The client
-module parses JSON responses, handles error status codes, and retries on transient
-failures. Testing this without hitting the live API requires a real HTTP server that
-can be programmed per-test. Bypass starts a TCP server in the test process, receives
-real HTTP requests from the client, and responds with whatever the test configures.
+You are building `api_gateway`, an HTTP gateway that routes traffic to microservices. The
+gateway calls the payment provider's REST API to confirm charges. The client module parses
+JSON responses, handles error status codes, and retries on transient failures. Testing this
+without hitting the live API requires a real HTTP server that can be programmed per-test.
+Bypass starts a TCP server in the test process, receives real HTTP requests from the client,
+and responds with whatever the test configures.
 
-Project structure at this point:
+Project structure:
 
 ```
 api_gateway/
 ├── lib/
 │   └── api_gateway/
 │       └── payments/
-│           └── provider_client.ex    # ← you implement this
+│           └── provider_client.ex    # ← HTTP client with retry logic
 ├── test/
 │   └── api_gateway/
 │       └── payments/

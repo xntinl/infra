@@ -1,38 +1,36 @@
 # Rigorous Benchmarking with Benchee
 
-**Project**: `api_gateway` — built incrementally across the advanced level
-
----
-
 ## Project context
 
-You're building `api_gateway`. Three architectural decisions need data to resolve:
+You are building `api_gateway`, an internal HTTP gateway that routes traffic to microservices.
+Three architectural decisions need data to resolve:
 
 1. The router currently uses a linear scan through route patterns. A radix tree
    alternative was proposed. Which is faster for the gateway's actual route set?
 2. The cache uses ETS direct lookup. A two-level L1/L2 design was added. What is
    the actual hit-rate vs latency trade-off under realistic access patterns?
-3. The rate limiter has three counter implementations from exercise 20. Which
-   performs best under the gateway's actual concurrency level (50 workers)?
+3. The rate limiter has three counter implementations (ETS `update_counter`,
+   `:atomics.add`, and `:counters.add`). Which performs best under the gateway's
+   actual concurrency level (50 workers)?
 
 All three need rigorous benchmarks — not "I ran it once and it seemed faster."
 
-Project structure at this point:
+Project structure:
 
 ```
 api_gateway/
 ├── lib/
 │   └── api_gateway/
 │       ├── router.ex
-│       ├── cache/
-│       │   └── store.ex
-│       ├── metrics/
-│       │   └── sliding_window.ex
-│       └── ...
+│       └── cache/
+│           └── store.ex
 ├── bench/
-│   ├── router_bench.exs            # ← you implement this
-│   ├── cache_bench.exs             # ← and this
-│   └── counter_bench.exs           # (from exercise 20, extend here)
+│   ├── router_bench.exs
+│   └── cache_bench.exs
+├── test/
+│   └── api_gateway/
+│       └── bench/
+│           └── benchee_integration_test.exs
 └── mix.exs
 ```
 

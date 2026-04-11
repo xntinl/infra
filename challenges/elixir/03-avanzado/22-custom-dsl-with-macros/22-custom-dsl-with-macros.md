@@ -1,12 +1,9 @@
 # Custom DSL with Macros
 
-**Project**: `api_gateway` — built incrementally across the advanced level
-
----
-
 ## Project context
 
-You're building `api_gateway`. The gateway needs two declarative subsystems:
+You are building `api_gateway`, an internal HTTP gateway that routes traffic to microservices.
+The gateway needs two declarative subsystems:
 
 1. A **middleware pipeline DSL** so that route handlers declare their middleware chain
    at compile time instead of calling `Plug.Builder.plug/2` imperatively — giving the
@@ -19,7 +16,7 @@ Both systems rely on the same three macro building blocks: `__using__/1` to inje
 infrastructure, module attributes as LIFO accumulators, and `@before_compile` to
 synthesize generated code from the accumulated data.
 
-Project structure at this point:
+Project structure:
 
 ```
 api_gateway/
@@ -31,10 +28,8 @@ api_gateway/
 │       │   ├── pipeline.ex
 │       │   ├── instrumentation.ex
 │       │   └── dsl.ex
-│       ├── validation/
-│       │   └── dsl.ex
-│       └── dev/
-│           └── ast_tools.ex
+│       └── validation/
+│           └── dsl.ex
 ├── test/
 │   └── api_gateway/
 │       └── dsl/

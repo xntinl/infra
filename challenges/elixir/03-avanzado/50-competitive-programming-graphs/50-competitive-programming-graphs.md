@@ -1,39 +1,34 @@
 # Graph Algorithms in Elixir
 
-**Project**: `api_gateway` — built incrementally across the advanced level
+## Overview
 
----
+Implement fundamental graph algorithms from scratch in Elixir: BFS, DFS-based cycle detection,
+topological sort (Kahn's algorithm), and Dijkstra's shortest path. These solve two practical
+problems for an API gateway: resolving service dependency order and finding the lowest-latency
+route to a downstream service.
 
-## Project context
-
-The `api_gateway` umbrella needs two graph-shaped problems solved:
-
-1. **Dependency resolution**: when a client requests service `X`, the gateway must determine
-   the correct order to call upstream services (some services depend on others). Circular
-   dependencies must be detected and rejected at configuration load time.
-2. **Route optimization**: the gateway has a weighted graph of upstream service endpoints
-   (latency measurements). Dijkstra finds the lowest-latency path to a destination.
-
-You'll implement the required graph algorithms from scratch in `gateway_core`, understand
-their functional representation, and benchmark them.
-
-Project structure for this exercise:
+Project structure:
 
 ```
-api_gateway_umbrella/apps/gateway_core/
-├── lib/gateway_core/
-│   └── graph/
-│       ├── graph.ex                  # graph representation and helpers
-│       ├── bfs.ex                    # breadth-first search
-│       ├── dfs.ex                    # depth-first search
-│       ├── dijkstra.ex               # weighted shortest paths
-│       ├── topological_sort.ex       # dependency ordering
-│       └── cycle_detector.ex         # circular dependency detection
-├── test/gateway_core/graph/
-│   ├── bfs_test.exs                  # given tests
-│   ├── dijkstra_test.exs             # given tests
-│   └── topological_sort_test.exs     # given tests
-└── bench/graph_bench.exs
+api_gateway/
+├── lib/
+│   └── api_gateway/
+│       └── graph/
+│           ├── graph.ex                  # graph representation and helpers
+│           ├── bfs.ex                    # breadth-first search
+│           ├── dijkstra.ex               # weighted shortest paths
+│           ├── topological_sort.ex       # dependency ordering
+│           ├── cycle_detector.ex         # circular dependency detection
+│           └── service_dependency_resolver.ex
+├── test/
+│   └── api_gateway/
+│       └── graph/
+│           ├── bfs_test.exs
+│           ├── dijkstra_test.exs
+│           └── topological_sort_test.exs
+├── bench/
+│   └── graph_bench.exs
+└── mix.exs
 ```
 
 ---
@@ -49,7 +44,7 @@ api_gateway_umbrella/apps/gateway_core/
   "audit"    => ["payments"]
 }
 
-# Weighted adjacency list (directed — for Dijkstra)
+# Weighted adjacency list (directed -- for Dijkstra)
 %{
   "gateway"  => [{"payments", 12}, {"auth", 5}],
   "payments" => [{"audit", 3}],
@@ -67,10 +62,10 @@ nodes), this is fine. For graphs with millions of nodes, you'd reach for a NIF.
 
 ## Implementation
 
-### Step 1: `lib/gateway_core/graph/graph.ex`
+### Step 1: `lib/api_gateway/graph/graph.ex`
 
 ```elixir
-defmodule GatewayCore.Graph do
+defmodule ApiGateway.Graph do
   @moduledoc "Functional graph representation and construction helpers."
 
   @type node_id :: term()
@@ -81,6 +76,7 @@ defmodule GatewayCore.Graph do
   def new, do: %{}
 
   @doc "Add an undirected edge between u and v."
+  @spec add_edge(t(), node_id(), node_id()) :: t()
   def add_edge(g, u, v) do
     g
     |> Map.update(u, [v], &[v | &1])
@@ -88,24 +84,30 @@ defmodule GatewayCore.Graph do
   end
 
   @doc "Add a directed edge from u to v with optional weight."
+  @spec add_directed_edge(weighted_t(), node_id(), node_id(), weight()) :: weighted_t()
   def add_directed_edge(g, u, v, weight \\ 1) do
     Map.update(g, u, [{v, weight}], &[{v, weight} | &1])
   end
 
+  @spec neighbors(t() | weighted_t(), node_id()) :: list()
   def neighbors(g, node), do: Map.get(g, node, [])
+
+  @spec nodes(t() | weighted_t()) :: [node_id()]
   def nodes(g), do: Map.keys(g)
+
+  @spec size(t() | weighted_t()) :: non_neg_integer()
   def size(g), do: map_size(g)
 end
 ```
 
-### Step 2: `lib/gateway_core/graph/bfs.ex`
+### Step 2: `lib/api_gateway/graph/bfs.ex`
 
 BFS uses Erlang's `:queue` for O(1) enqueue/dequeue. It visits all reachable nodes
 layer by layer, computing hop-count distances from the start node.
 
 ```elixir
-defmodule GatewayCore.Graph.BFS do
-  alias GatewayCore.Graph
+defmodule ApiGateway.Graph.BFS do
+  alias ApiGateway.Graph
 
   @doc """
   BFS from `start`. Returns {visit_order, distance_map}.
@@ -187,8 +189,6 @@ defmodule GatewayCore.Graph.BFS do
     end
   end
 
-  # Backtrack from target to start: at each step, find a neighbor whose distance
-  # is exactly one less than the current node's distance.
   defp reconstruct_path(graph, distances, start, target) do
     do_reconstruct(graph, distances, start, target, [target])
   end
@@ -203,23 +203,20 @@ defmodule GatewayCore.Graph.BFS do
 end
 ```
 
-### Step 3: `lib/gateway_core/graph/topological_sort.ex`
+### Step 3: `lib/api_gateway/graph/topological_sort.ex`
 
 Kahn's algorithm: BFS-based topological sort. Starts from nodes with no incoming edges
 (in-degree 0) and progressively removes them, adding newly zero-degree nodes to the queue.
 If the result is shorter than the node count, the graph contains a cycle.
 
 ```elixir
-defmodule GatewayCore.Graph.TopologicalSort do
-  alias GatewayCore.Graph
+defmodule ApiGateway.Graph.TopologicalSort do
+  alias ApiGateway.Graph
 
   @doc """
   Kahn's algorithm: BFS-based topological sort for directed graphs.
 
   Returns {:ok, order} or {:error, :has_cycle}.
-
-  Gateway application: determine the call order for service dependencies.
-  `mix deps.get` uses topological sort to install packages in dependency order.
   """
   @spec sort(Graph.t()) :: {:ok, [Graph.node_id()]} | {:error, :has_cycle}
   def sort(graph) do
@@ -236,7 +233,7 @@ defmodule GatewayCore.Graph.TopologicalSort do
     do_kahn(graph, queue, in_degrees, [], node_count)
   end
 
-  defp do_kahn(_graph, queue, _in_degrees, result, node_count) do
+  defp do_kahn(graph, queue, in_degrees, result, node_count) do
     case :queue.out(queue) do
       {:empty, _} ->
         if length(result) == node_count do
@@ -248,14 +245,13 @@ defmodule GatewayCore.Graph.TopologicalSort do
       {{:value, node}, rest_queue} ->
         neighbors = Map.get(graph, node, [])
 
-        # For directed graphs, neighbors might be plain values or {node, weight} tuples
         neighbor_ids = Enum.map(neighbors, fn
           {n, _weight} -> n
           n -> n
         end)
 
         {updated_queue, updated_degrees} =
-          Enum.reduce(neighbor_ids, {rest_queue, _in_degrees}, fn neighbor, {q, deg} ->
+          Enum.reduce(neighbor_ids, {rest_queue, in_degrees}, fn neighbor, {q, deg} ->
             new_deg = Map.update!(deg, neighbor, &(&1 - 1))
 
             if new_deg[neighbor] == 0 do
@@ -265,17 +261,15 @@ defmodule GatewayCore.Graph.TopologicalSort do
             end
           end)
 
-        do_kahn(_graph, updated_queue, updated_degrees, [node | result], node_count)
+        do_kahn(graph, updated_queue, updated_degrees, [node | result], node_count)
     end
   end
 
   defp calculate_in_degrees(graph) do
-    # Initialize all known nodes to 0
     base = Map.new(Graph.nodes(graph), fn n -> {n, 0} end)
 
     Enum.reduce(graph, base, fn {_node, neighbors}, acc ->
       Enum.reduce(neighbors, acc, fn neighbor, d ->
-        # Handle both plain nodes and {node, weight} tuples
         neighbor_id = case neighbor do
           {n, _weight} -> n
           n -> n
@@ -288,22 +282,22 @@ defmodule GatewayCore.Graph.TopologicalSort do
 end
 ```
 
-### Step 4: `lib/gateway_core/graph/cycle_detector.ex`
+### Step 4: `lib/api_gateway/graph/cycle_detector.ex`
 
 Three-color DFS for cycle detection. White = unvisited, gray = in current DFS path,
 black = fully processed. A back edge (encountering a gray node) proves a cycle exists.
 
 ```elixir
-defmodule GatewayCore.Graph.CycleDetector do
-  alias GatewayCore.Graph
+defmodule ApiGateway.Graph.CycleDetector do
+  alias ApiGateway.Graph
 
   @doc """
   Detects cycles in a directed graph using 3-color DFS.
 
   Colors:
-    :white — not yet visited
-    :gray  — currently in the DFS stack (ancestor)
-    :black — fully processed
+    :white -- not yet visited
+    :gray  -- currently in the DFS stack (ancestor)
+    :black -- fully processed
 
   A back edge (gray -> gray) indicates a cycle.
   """
@@ -390,7 +384,6 @@ defmodule GatewayCore.Graph.CycleDetector do
     result = Enum.reduce_while(neighbor_ids, {:ok, colors}, fn neighbor, {:ok, c} ->
       case c[neighbor] do
         :gray ->
-          # Found a cycle — extract the cycle from the path
           cycle_start_idx = Enum.find_index(path, &(&1 == neighbor))
           cycle_path = Enum.slice(path, cycle_start_idx..-1//1) ++ [neighbor]
           {:halt, {:cycle, c, cycle_path}}
@@ -412,14 +405,14 @@ defmodule GatewayCore.Graph.CycleDetector do
 end
 ```
 
-### Step 5: `lib/gateway_core/graph/dijkstra.ex`
+### Step 5: `lib/api_gateway/graph/dijkstra.ex`
 
 Dijkstra's algorithm finds shortest paths in weighted graphs. Uses `:gb_sets` as a
 min-heap priority queue for O(log n) extraction of the minimum-distance node.
 
 ```elixir
-defmodule GatewayCore.Graph.Dijkstra do
-  alias GatewayCore.Graph
+defmodule ApiGateway.Graph.Dijkstra do
+  alias ApiGateway.Graph
 
   @infinity :infinity
 
@@ -455,7 +448,6 @@ defmodule GatewayCore.Graph.Dijkstra do
     end
   end
 
-  # Core Dijkstra loop: extract minimum, relax neighbors, repeat.
   defp do_dijkstra(graph, pq, dist, visited) do
     if :gb_sets.is_empty(pq) do
       dist
@@ -480,7 +472,6 @@ defmodule GatewayCore.Graph.Dijkstra do
     end
   end
 
-  # Same as do_dijkstra but also tracks the predecessor map for path reconstruction.
   defp do_dijkstra_with_prev(graph, pq, dist, prev, visited) do
     if :gb_sets.is_empty(pq) do
       {dist, prev}
@@ -520,16 +511,16 @@ defmodule GatewayCore.Graph.Dijkstra do
 end
 ```
 
-### Step 6: Gateway application — dependency resolver
+### Step 6: Service dependency resolver
 
 Wraps the graph algorithms into a domain-specific interface for resolving service
-call order and detecting circular dependencies at configuration time.
+call order and detecting circular dependencies.
 
 ```elixir
-# lib/gateway_core/service_dependency_resolver.ex
-defmodule GatewayCore.ServiceDependencyResolver do
-  alias GatewayCore.Graph
-  alias GatewayCore.Graph.{TopologicalSort, CycleDetector}
+# lib/api_gateway/graph/service_dependency_resolver.ex
+defmodule ApiGateway.ServiceDependencyResolver do
+  alias ApiGateway.Graph
+  alias ApiGateway.Graph.{TopologicalSort, CycleDetector}
 
   @doc """
   Given a map of service_name => [dependency_names], returns the correct
@@ -560,7 +551,6 @@ defmodule GatewayCore.ServiceDependencyResolver do
 
   defp build_graph(service_deps) do
     Enum.reduce(service_deps, Graph.new(), fn {service, deps}, g ->
-      # Ensure service node exists even with no deps
       g = Map.put_new(g, service, [])
       Enum.reduce(deps, g, fn dep, g ->
         Graph.add_directed_edge(g, dep, service)
@@ -570,21 +560,21 @@ defmodule GatewayCore.ServiceDependencyResolver do
 end
 ```
 
-### Step 7: Given tests — must pass without modification
+### Step 7: Tests
 
 ```elixir
-# test/gateway_core/graph/bfs_test.exs
-defmodule GatewayCore.Graph.BFSTest do
+# test/api_gateway/graph/bfs_test.exs
+defmodule ApiGateway.Graph.BFSTest do
   use ExUnit.Case
 
-  alias GatewayCore.Graph
-  alias GatewayCore.Graph.BFS
+  alias ApiGateway.Graph
+  alias ApiGateway.Graph.BFS
 
   test "visits all reachable nodes" do
     g = Graph.new()
     |> Graph.add_edge("a", "b")
     |> Graph.add_edge("b", "c")
-    |> Graph.add_edge("d", "e")   # separate component
+    |> Graph.add_edge("d", "e")
 
     {order, _} = BFS.traverse(g, "a")
     assert Enum.sort(order) == ["a", "b", "c"]
@@ -594,7 +584,7 @@ defmodule GatewayCore.Graph.BFSTest do
     g = Graph.new()
     |> Graph.add_edge("a", "b")
     |> Graph.add_edge("c", "d")
-    |> Map.put("e", [])           # isolated node
+    |> Map.put("e", [])
 
     components = BFS.connected_components(g)
     assert length(components) == 3
@@ -604,7 +594,7 @@ defmodule GatewayCore.Graph.BFSTest do
     g = Graph.new()
     |> Graph.add_edge("a", "b")
     |> Graph.add_edge("b", "c")
-    |> Graph.add_edge("a", "c")   # shortcut: a->c in 1 hop
+    |> Graph.add_edge("a", "c")
 
     assert {:ok, ["a", "c"], 1} = BFS.shortest_path(g, "a", "c")
   end
@@ -620,12 +610,12 @@ end
 ```
 
 ```elixir
-# test/gateway_core/graph/topological_sort_test.exs
-defmodule GatewayCore.Graph.TopologicalSortTest do
+# test/api_gateway/graph/topological_sort_test.exs
+defmodule ApiGateway.Graph.TopologicalSortTest do
   use ExUnit.Case
 
-  alias GatewayCore.Graph
-  alias GatewayCore.Graph.TopologicalSort
+  alias ApiGateway.Graph
+  alias ApiGateway.Graph.TopologicalSort
 
   test "returns valid topological order for acyclic graph" do
     g = %{
@@ -650,7 +640,7 @@ defmodule GatewayCore.Graph.TopologicalSortTest do
       "users"          => [],
       "exchange_rates" => []
     }
-    {:ok, order} = GatewayCore.ServiceDependencyResolver.resolve(deps)
+    {:ok, order} = ApiGateway.ServiceDependencyResolver.resolve(deps)
     assert Enum.find_index(order, &(&1 == "users")) <
            Enum.find_index(order, &(&1 == "auth"))
     assert Enum.find_index(order, &(&1 == "auth")) <
@@ -659,17 +649,17 @@ defmodule GatewayCore.Graph.TopologicalSortTest do
 
   test "resolver detects circular dependency" do
     deps = %{"a" => ["b"], "b" => ["c"], "c" => ["a"]}
-    assert {:error, {:circular, _}} = GatewayCore.ServiceDependencyResolver.resolve(deps)
+    assert {:error, {:circular, _}} = ApiGateway.ServiceDependencyResolver.resolve(deps)
   end
 end
 ```
 
 ```elixir
-# test/gateway_core/graph/dijkstra_test.exs
-defmodule GatewayCore.Graph.DijkstraTest do
+# test/api_gateway/graph/dijkstra_test.exs
+defmodule ApiGateway.Graph.DijkstraTest do
   use ExUnit.Case
 
-  alias GatewayCore.Graph.Dijkstra
+  alias ApiGateway.Graph.Dijkstra
 
   @graph %{
     "a" => [{"b", 4}, {"c", 2}],
@@ -679,7 +669,6 @@ defmodule GatewayCore.Graph.DijkstraTest do
   }
 
   test "finds shortest path" do
-    # a->c (2) + c->b (1) + b->d (3) = 6  vs  a->b (4) + b->d (3) = 7
     assert {:ok, 6, ["a", "c", "b", "d"]} = Dijkstra.shortest_path(@graph, "a", "d")
   end
 
@@ -696,8 +685,8 @@ end
 # bench/graph_bench.exs
 Mix.install([{:benchee, "~> 1.3"}])
 
-alias GatewayCore.Graph
-alias GatewayCore.Graph.{BFS, Dijkstra}
+alias ApiGateway.Graph
+alias ApiGateway.Graph.BFS
 
 defmodule GraphBench do
   def random_graph(n) do
@@ -725,9 +714,7 @@ Benchee.run(%{
 mix run bench/graph_bench.exs
 ```
 
-**Expected result**: BFS on 1k nodes < 2ms; on 10k nodes < 30ms. If your BFS is 10x slower,
-check whether you're accidentally copying the entire visited set on every iteration instead
-of using `MapSet` accumulation inside `reduce`.
+**Expected result**: BFS on 1k nodes < 2ms; on 10k nodes < 30ms.
 
 ---
 
@@ -741,37 +728,32 @@ of using `MapSet` accumulation inside `reduce`.
 | Parallelism | multiple readers, functional | concurrent ETS reads | unsafe without care |
 | Code simplicity | high | medium | low |
 
-Reflection: the functional graph creates a new `MapSet` on every BFS step. Where does the
-GC pressure show up in the Benchee memory_time output? At what graph size would you switch
-to an ETS-backed representation?
-
 ---
 
 ## Common production mistakes
 
 **1. Recursive DFS without tail-call optimization**
 The cycle detector uses recursive DFS. For graphs with deep paths (thousands of nodes),
-recursive DFS overflows the process stack. Elixir's default process stack is ~1MB.
-Iterative DFS with an explicit stack is the correct approach for large graphs.
+recursive DFS overflows the process stack. Iterative DFS with an explicit stack is the
+correct approach for large graphs.
 
 **2. Not handling disconnected graphs in topological sort**
-Kahn's algorithm initializes from nodes with in-degree 0. If your graph has isolated nodes
-not reachable from any zero-degree node (shouldn't happen, but defensive code matters),
-they'll be missing from the result. Always compare `length(result)` with `map_size(graph)`.
+Kahn's algorithm initializes from nodes with in-degree 0. Always compare `length(result)`
+with `map_size(graph)` to detect cycles.
 
 **3. Using `List.last/1` for priority queue minimum**
-`List.last/1` is O(n). For Dijkstra's priority queue, use `:gb_sets` (balanced BST) or
-`:gb_trees` — both provide O(log n) minimum extraction.
+`List.last/1` is O(n). For Dijkstra's priority queue, use `:gb_sets` (balanced BST) --
+both provide O(log n) minimum extraction.
 
 **4. Forgetting that BFS distances are hop counts, not weights**
-`BFS.shortest_path` gives the minimum number of hops. For weighted graphs, this is wrong —
-use Dijkstra. Mixing them up produces silently incorrect results.
+`BFS.shortest_path` gives the minimum number of hops. For weighted graphs, use Dijkstra.
+Mixing them up produces silently incorrect results.
 
 ---
 
 ## Resources
 
-- [`:queue` module — Erlang/OTP](https://www.erlang.org/doc/man/queue.html) — functional FIFO queue
-- [`:gb_sets` module — Erlang/OTP](https://www.erlang.org/doc/man/gb_sets.html) — balanced BST used as priority queue
-- [Introduction to Algorithms — CLRS](https://mitpress.mit.edu/9780262046305/introduction-to-algorithms/) — BFS, DFS, Dijkstra (chapters 22-24)
-- [libgraph](https://github.com/bitwalker/libgraph) — production-grade graph library for Elixir (study after implementing yourself)
+- [`:queue` module -- Erlang/OTP](https://www.erlang.org/doc/man/queue.html) -- functional FIFO queue
+- [`:gb_sets` module -- Erlang/OTP](https://www.erlang.org/doc/man/gb_sets.html) -- balanced BST used as priority queue
+- [Introduction to Algorithms -- CLRS](https://mitpress.mit.edu/9780262046305/introduction-to-algorithms/) -- BFS, DFS, Dijkstra (chapters 22-24)
+- [libgraph](https://github.com/bitwalker/libgraph) -- production-grade graph library for Elixir

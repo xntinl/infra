@@ -1,71 +1,57 @@
 # Application: The OTP Entry Point
 
-**Project**: `task_queue` — built incrementally across the intermediate level
-
----
-
-## Project context
-
-The task_queue system has a Supervisor that manages its components (exercise 05). But how
-does the Supervisor start in the first place? Who reads the configuration? Who decides
-whether to boot in `:dev` mode or `:prod` mode? That is the `Application` behaviour's job.
+## Why Application matters
 
 `Application` is the topmost layer of an OTP release. It is the contract between your code
 and the BEAM runtime: OTP calls `start/2` when the VM boots, and your code returns the root
 Supervisor PID. Everything else in the system hangs from that PID.
 
-Project structure at this point:
+Without a registered Application module, your Supervisor is never started. You would have
+to manually call your supervisor's `start_link/0` every time. More importantly:
+
+- OTP guarantees dependency ordering for your application's dependencies.
+- `Application.get_env/3` is the standard runtime configuration API.
+- `stop/1` gives you a hook to flush logs and release resources before the VM exits.
+
+---
+
+## The business problem
+
+Build a `TaskQueue.Application` that:
+
+1. Reads configuration: max queue size, job TTL, worker count, and log level.
+2. Starts the root Supervisor with TaskRegistry, QueueServer, and Worker children.
+3. Logs the startup configuration for observability.
+4. In `stop/1`, logs the shutdown event.
+
+All modules are defined completely in this exercise.
+
+---
+
+## Project setup
 
 ```
 task_queue/
 ├── lib/
 │   └── task_queue/
 │       ├── application.ex
-│       ├── supervisor.ex        # exercise 05
-│       ├── queue_server.ex      # exercise 04
-│       ├── task_registry.ex     # exercise 02
-│       └── worker.ex            # exercise 05
+│       ├── task_registry.ex
+│       ├── queue_server.ex
+│       └── worker.ex
 ├── config/
 │   ├── config.exs
 │   └── dev.exs
 ├── test/
 │   └── task_queue/
-│       └── application_test.exs # given tests — must pass without modification
-└── mix.exs                      # ← the :mod key registers the Application
+│       └── application_test.exs
+└── mix.exs
 ```
-
----
-
-## Why Application matters
-
-Without a registered Application module, your Supervisor is never started. You would have
-to manually call `TaskQueue.Supervisor.start_link()` every time. More importantly:
-
-- OTP guarantees dependency ordering: if `:logger` or `:crypto` is listed in your
-  `mix.exs` dependencies, they are fully started before your `start/2` is called.
-- `Application.get_env/3` is the standard runtime configuration API. It reads from
-  `config/config.exs` (and its environment overrides) without hardcoding values.
-- `stop/1` gives you a hook to flush logs, close connections, and release resources before
-  the VM exits — crucial for production deployments with graceful drain.
-
----
-
-## The business problem
-
-`TaskQueue.Application` must:
-
-1. Read configuration: max queue size, job TTL, worker count, and log level.
-2. Start the root Supervisor.
-3. Log the startup configuration for observability.
-4. In `stop/1`, log the shutdown event.
-
-The configuration must come from `config/config.exs`, not hardcoded in the module.
 
 ---
 
 ## Implementation
 
-### Step 1: `config/config.exs`
+### `config/config.exs`
 
 ```elixir
 import Config
@@ -79,7 +65,7 @@ config :task_queue,
 import_config "#{config_env()}.exs"
 ```
 
-### Step 2: `config/dev.exs`
+### `config/dev.exs`
 
 ```elixir
 import Config
@@ -90,7 +76,7 @@ config :task_queue,
   log_level: :debug
 ```
 
-### Step 3: `mix.exs` — register the Application module
+### `mix.exs` — register the Application module
 
 ```elixir
 def application do
@@ -102,10 +88,101 @@ end
 ```
 
 Without the `mod:` key, OTP never calls `start/2`. The application compiles fine,
-`mix test` runs, but in production `mix run --no-halt` starts nothing. This is the
-single most common OTP configuration bug.
+but in production `mix run --no-halt` starts nothing.
 
-### Step 4: `lib/task_queue/application.ex`
+### `lib/task_queue/task_registry.ex`
+
+```elixir
+defmodule TaskQueue.TaskRegistry do
+  use Agent
+
+  def start_link(initial \\ %{}) do
+    Agent.start_link(fn -> initial end, name: __MODULE__)
+  end
+
+  def register(task_id) do
+    entry = %{status: :pending, updated_at: System.monotonic_time(:millisecond)}
+    Agent.update(__MODULE__, fn state -> Map.put(state, task_id, entry) end)
+  end
+
+  def get(task_id) do
+    Agent.get(__MODULE__, fn state -> Map.get(state, task_id) end)
+  end
+
+  def stats do
+    Agent.get(__MODULE__, fn state ->
+      Enum.reduce(state, %{pending: 0, running: 0, done: 0, failed: 0}, fn {_id, entry}, acc ->
+        Map.update(acc, entry.status, 1, &(&1 + 1))
+      end)
+    end)
+  end
+end
+```
+
+### `lib/task_queue/queue_server.ex`
+
+```elixir
+defmodule TaskQueue.QueueServer do
+  use GenServer
+  require Logger
+
+  def start_link(opts \\ []) do
+    GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+  end
+
+  def push(payload) do
+    job = %{
+      id: :crypto.strong_rand_bytes(8) |> Base.url_encode64(padding: false),
+      payload: payload,
+      queued_at: System.monotonic_time(:millisecond)
+    }
+    GenServer.cast(__MODULE__, {:push, job})
+  end
+
+  def pop, do: GenServer.call(__MODULE__, :pop)
+  def size, do: GenServer.call(__MODULE__, :size)
+
+  @impl GenServer
+  def init(_opts), do: {:ok, []}
+
+  @impl GenServer
+  def handle_cast({:push, job}, state), do: {:noreply, state ++ [job]}
+
+  @impl GenServer
+  def handle_call(:pop, _from, []), do: {:reply, {:error, :empty}, []}
+  def handle_call(:pop, _from, [job | rest]), do: {:reply, {:ok, job}, rest}
+
+  @impl GenServer
+  def handle_call(:size, _from, state), do: {:reply, length(state), state}
+
+  @impl GenServer
+  def handle_info(_, state), do: {:noreply, state}
+end
+```
+
+### `lib/task_queue/worker.ex`
+
+```elixir
+defmodule TaskQueue.Worker do
+  use GenServer
+  require Logger
+
+  def start_link(opts \\ []) do
+    GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+  end
+
+  @impl GenServer
+  def init(_opts) do
+    Logger.info("Worker started")
+    {:ok, %{jobs_processed: 0}}
+  end
+
+  @impl GenServer
+  def handle_info(_, state), do: {:noreply, state}
+end
+```
+
+### `lib/task_queue/application.ex`
 
 ```elixir
 defmodule TaskQueue.Application do
@@ -129,10 +206,13 @@ defmodule TaskQueue.Application do
       log_level:      #{log_level}
     """)
 
-    children = build_children(worker_count)
+    children = [
+      TaskQueue.TaskRegistry,
+      TaskQueue.QueueServer,
+      TaskQueue.Worker
+    ]
 
     opts = [strategy: :one_for_one, name: TaskQueue.RootSupervisor]
-
     Supervisor.start_link(children, opts)
   end
 
@@ -141,37 +221,14 @@ defmodule TaskQueue.Application do
     Logger.info("TaskQueue stopped")
     :ok
   end
-
-  # ---------------------------------------------------------------------------
-  # Private
-  # ---------------------------------------------------------------------------
-
-  defp build_children(_worker_count) do
-    # For now, a single worker. Exercise 14 (Registry) adds dynamic workers.
-    [
-      TaskQueue.TaskRegistry,
-      TaskQueue.QueueServer,
-      TaskQueue.Worker
-    ]
-  end
 end
 ```
 
-The `start/2` function reads configuration with `Application.get_env/3`, configures the
-Logger level, logs the startup parameters, and starts the root Supervisor. The return
-value of `Supervisor.start_link/2` is `{:ok, pid}` — exactly what OTP requires from
-`start/2`. Returning `:ok` or any other value causes OTP to mark the application as
-failed to start.
-
-The `stop/1` callback is called by OTP when the application is shutting down (either
-via `Application.stop/1` or during VM termination). Here we log the event; in production
-you would flush log buffers, close database connections, and drain pending work.
-
 Configuration is read at runtime with `Application.get_env/3`, not at compile time
-with module attributes. This means the config values can be changed between compilations
-(e.g., via `config/runtime.exs` in production) without recompiling the module.
+with module attributes. This means config values can be changed between compilations
+(e.g., via `config/runtime.exs` in production) without recompiling.
 
-### Step 5: Given tests — must pass without modification
+### Tests
 
 ```elixir
 # test/task_queue/application_test.exs
@@ -179,7 +236,6 @@ defmodule TaskQueue.ApplicationTest do
   use ExUnit.Case, async: false
 
   test "Application is listed in started_applications after mix start" do
-    # In a mix test run, the Application starts automatically via mix.exs :mod
     started = Application.started_applications() |> Enum.map(&elem(&1, 0))
     assert :task_queue in started
   end
@@ -197,7 +253,6 @@ defmodule TaskQueue.ApplicationTest do
   end
 
   test "Application.get_env reads task_queue config" do
-    # Verify config.exs values are accessible at runtime
     assert is_integer(Application.get_env(:task_queue, :max_queue_size))
     assert is_integer(Application.get_env(:task_queue, :job_ttl_ms))
   end
@@ -220,7 +275,7 @@ defmodule TaskQueue.ApplicationTest do
 end
 ```
 
-### Step 6: Run the tests
+### Run the tests
 
 ```bash
 mix test test/task_queue/application_test.exs --trace
@@ -228,55 +283,31 @@ mix test test/task_queue/application_test.exs --trace
 
 ---
 
-## Trade-off analysis
-
-| Aspect | `Application.get_env` (runtime) | `Application.compile_env` | Hardcoded constant |
-|--------|--------------------------------|--------------------------|-------------------|
-| When resolved | At call time (runtime) | At compile time | At compile time |
-| Survives hot code reload | Yes | No — requires recompile | No |
-| Suitable for secrets | Yes (from env vars via `runtime.exs`) | No | Never |
-| Suitable for feature flags | Yes | Only if stable | No |
-| Type safety | None out of the box | None | N/A |
-
-Reflection question: `start/2` logs the configuration. In a production deployment where
-`config/runtime.exs` reads from environment variables, what happens if a required
-environment variable is not set? Where should you validate that — in `start/2` or in
-`runtime.exs` itself?
-
----
-
 ## Common production mistakes
 
 **1. Forgetting `mod:` in mix.exs**
-Without `mod: {TaskQueue.Application, []}`, OTP never calls `start/2`. The application
-compiles fine, `mix test` runs, but in production `mix run --no-halt` starts nothing.
-This is the single most common OTP configuration bug.
+Without `mod: {TaskQueue.Application, []}`, OTP never calls `start/2`.
 
 **2. Not returning `{:ok, pid}` from `start/2`**
-`start/2` must return `{:ok, pid}` — the value from `Supervisor.start_link`. Returning
-`:ok` or any other value causes OTP to mark the application as failed to start.
+`start/2` must return `{:ok, pid}` — the value from `Supervisor.start_link`.
 
 **3. Reading `Application.get_env` at compile time**
 ```elixir
-# WRONG — resolved at compile time, before config.exs is loaded
+# WRONG — resolved at compile time
 @max_size Application.get_env(:task_queue, :max_queue_size, 1_000)
 
 # CORRECT — resolved at runtime
 def max_size, do: Application.get_env(:task_queue, :max_queue_size, 1_000)
-# Or for truly stable compile-time values:
-@max_size Application.compile_env(:task_queue, :max_queue_size, 1_000)
 ```
 
 **4. Doing slow initialization in `start/2`**
-OTP has a startup timeout. If `start/2` blocks for more than a few seconds, OTP considers
-the start failed. Slow initialization (loading a large data file, warming a cache) should
-happen in the `init/1` of a dedicated GenServer child — not in `start/2`.
+OTP has a startup timeout. Slow initialization should happen in a dedicated GenServer's
+`init/1` — not in `start/2`.
 
 ---
 
 ## Resources
 
 - [Application — HexDocs](https://hexdocs.pm/elixir/Application.html)
-- [Application.get_env/3 — HexDocs](https://hexdocs.pm/elixir/Application.html#get_env/3)
 - [Config — HexDocs](https://hexdocs.pm/elixir/Config.html)
 - [Mix and OTP: Application](https://elixir-lang.org/getting-started/mix-otp/supervisor-and-application.html)

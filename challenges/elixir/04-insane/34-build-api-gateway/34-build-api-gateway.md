@@ -450,8 +450,6 @@ defmodule Apigw.Cache do
   @impl true
   def handle_info(:cleanup, state) do
     # Delete all entries where expires_at is in the past.
-    # The match spec selects entries where the expires_at field (element 2 of the
-    # value tuple, which is a map) is less than the current monotonic time.
     # Because the value is a map stored as element 2 of the {key, value} tuple,
     # we iterate and delete manually for clarity and correctness.
     now = System.monotonic_time(:second)

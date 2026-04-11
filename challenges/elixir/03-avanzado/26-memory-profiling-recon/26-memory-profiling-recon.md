@@ -1,21 +1,18 @@
 # Memory Profiling and Leak Detection with Recon
 
-**Project**: `api_gateway` — built incrementally across the advanced level
-
----
-
 ## Project context
 
-You're building `api_gateway`. After two weeks in production, the gateway node's
-memory climbs from 400 MB at startup to 1.8 GB over 48 hours before triggering
-an OOM restart. The team suspects a leak but has no visibility: the application
-logs show nothing abnormal, and adding more logging would require a deploy. The
-fix must be diagnosable and applied to a live node without restarting it.
+You are building `api_gateway`, an internal HTTP gateway that routes traffic to microservices.
+After two weeks in production, the gateway node's memory climbs from 400 MB at startup
+to 1.8 GB over 48 hours before triggering an OOM restart. The team suspects a leak but
+has no visibility: the application logs show nothing abnormal, and adding more logging
+would require a deploy. The fix must be diagnosable and applied to a live node without
+restarting it.
 
 This exercise covers BEAM's memory model, binary leak patterns, the `:recon`
 library for live diagnosis, and GenServer design changes that reduce GC pressure.
 
-Project structure at this point:
+Project structure:
 
 ```
 api_gateway/
@@ -23,14 +20,22 @@ api_gateway/
 │   └── api_gateway/
 │       ├── application.ex
 │       ├── router.ex
-│       ├── middleware/
-│       │   └── body_reader.ex      # ← you implement this (the leaky version + fix)
-│       └── ...
+│       └── middleware/
+│           └── body_reader.ex
 ├── test/
 │   └── api_gateway/
 │       └── middleware/
 │           └── body_reader_test.exs
 └── mix.exs
+```
+
+The `ApiGateway.Conn` struct used by this exercise is defined as:
+
+```elixir
+defmodule ApiGateway.Conn do
+  @moduledoc "Represents an in-flight HTTP connection through the gateway."
+  defstruct [:method, :path, :status, :remote_ip, :assigns, :raw_body]
+end
 ```
 
 Add `:recon` to `mix.exs`:
@@ -57,50 +62,50 @@ Two requirements:
 
 2. **Memory snapshot tooling**: a `ApiGateway.Dev.MemorySnapshot` module that
    wraps `:recon` to produce a structured memory report without a running
-   `:observer` GUI — usable from `iex -S mix` on the production node.
+   `:observer` GUI -- usable from `iex -S mix` on the production node.
 
 ---
 
-## BEAM's memory model — why binaries leak
+## BEAM's memory model -- why binaries leak
 
 BEAM has two binary storage locations:
 
-### Heap binaries (≤ 64 bytes)
+### Heap binaries (<= 64 bytes)
 Stored directly in the process heap. Garbage collected with the process heap.
 When the process dies, the binary is freed immediately.
 
-### Reference-counted binaries — ProcBin (> 64 bytes)
+### Reference-counted binaries -- ProcBin (> 64 bytes)
 Stored in a shared binary heap outside process memory. The process heap holds
 a `ProcBin` pointer (16 bytes). Multiple processes can reference the same binary
 without copying it.
 
 **The leak pattern**:
 ```
-Request process reads body (10 KB binary) → stored in shared binary heap
+Request process reads body (10 KB binary) -> stored in shared binary heap
 Process creates a sub-binary: String.slice(body, 0, 100)
 Sub-binary holds a ProcBin reference to the original 10 KB binary
 Request process completes, its heap is GC'd
-BUT: the ProcBin reference count is still > 0 — the 10 KB binary survives
+BUT: the ProcBin reference count is still > 0 -- the 10 KB binary survives
 ```
 
 Sub-binaries and pattern-match results from large binaries keep the original
 ProcBin alive. This is the most common BEAM memory leak pattern.
 
 **The fix**: copy the sub-binary with `:binary.copy/1` to create an independent
-heap binary (if ≤ 64 bytes) or a new ProcBin (if > 64 bytes) that does not
+heap binary (if <= 64 bytes) or a new ProcBin (if > 64 bytes) that does not
 reference the original:
 
 ```elixir
-# LEAKS — sub_binary holds a ProcBin reference to the 10 KB body
+# LEAKS -- sub_binary holds a ProcBin reference to the 10 KB body
 sub = binary_part(body, 0, 50)
 
-# SAFE — independent copy, original ProcBin can be collected
+# SAFE -- independent copy, original ProcBin can be collected
 sub = :binary.copy(binary_part(body, 0, 50))
 ```
 
 ---
 
-## `:recon` — safe production diagnosis
+## `:recon` -- safe production diagnosis
 
 `:recon` is designed for use on live production nodes. Its functions are
 rate-limited and safe; they do not crash the node or cause significant overhead.
@@ -144,11 +149,11 @@ defmodule ApiGateway.Middleware.BodyReader do
   The call/2 function delegates to read_body_safe/2.
   """
 
-  alias ApiGateway.Conn
-
-  use ApiGateway.Middleware.Behaviour
-
-  @impl true
+  @doc """
+  Processes a connection by reading the body safely.
+  Delegates to read_body_safe/2 to avoid binary leaks.
+  """
+  @spec call(map(), keyword()) :: map()
   def call(conn, opts) do
     read_body_safe(conn, opts)
   end
@@ -158,9 +163,8 @@ defmodule ApiGateway.Middleware.BodyReader do
   The sub-binary references keep the original body ProcBin alive after the
   request completes.
   """
-  @spec read_body_leaky(Conn.t(), keyword()) :: Conn.t()
+  @spec read_body_leaky(map(), keyword()) :: map()
   def read_body_leaky(conn, _opts) do
-    # Simulate reading a large body (in production this comes from the socket)
     body = Map.get(conn, :raw_body, "")
 
     # These sub-binaries hold ProcBin references to `body`
@@ -178,17 +182,18 @@ defmodule ApiGateway.Middleware.BodyReader do
   @doc """
   SAFE: uses :binary.copy/1 to break ProcBin references.
   After this function returns, the original body binary can be GC'd.
+
+  Each extracted sub-binary is wrapped with :binary.copy/1. This creates
+  an independent binary that does not reference the original body. After
+  the function returns, `body` has no surviving references and becomes
+  eligible for garbage collection.
   """
-  @spec read_body_safe(Conn.t(), keyword()) :: Conn.t()
+  @spec read_body_safe(map(), keyword()) :: map()
   def read_body_safe(conn, _opts) do
     body = Map.get(conn, :raw_body, "")
 
-    # HINT: wrap each extracted sub-binary with :binary.copy/1
-    # HINT: :binary.copy creates an independent binary that does not reference body
-    # HINT: after the function returns, `body` has no surviving references → GC eligible
-    # TODO: implement — same logic as read_body_leaky but with :binary.copy/1 on each result
-    content_type = extract_content_type(body)
-    first_line = extract_first_line(body)
+    content_type = body |> extract_content_type() |> copy_binary()
+    first_line = body |> extract_first_line() |> copy_binary()
 
     %{conn | assigns: Map.merge(conn.assigns || %{}, %{
       content_type: content_type,
@@ -197,9 +202,15 @@ defmodule ApiGateway.Middleware.BodyReader do
     })}
   end
 
+  # Creates an independent copy of a binary, breaking any sub-binary reference
+  # to a larger parent binary. For empty binaries, returns as-is to avoid
+  # unnecessary allocation.
+  defp copy_binary(""), do: ""
+  defp copy_binary(bin), do: :binary.copy(bin)
+
   # Private helpers that produce sub-binaries
   defp extract_content_type(body) when byte_size(body) > 12 do
-    # Returns a sub-binary reference — caller must :binary.copy if needed
+    # Returns a sub-binary reference -- caller must :binary.copy if needed
     binary_part(body, 0, min(50, byte_size(body)))
   end
   defp extract_content_type(_), do: ""
@@ -250,12 +261,13 @@ defmodule ApiGateway.Dev.MemorySnapshot do
   @doc """
   Returns the top `n` processes by binary memory usage.
   Each entry: {pid, binary_bytes, process_info_keyword_list}
+
+  Uses :recon.proc_count/2 which safely inspects all processes and returns
+  the top N sorted by the given attribute. Safe for production use.
   """
   @spec top_binary_consumers(pos_integer()) :: list()
   def top_binary_consumers(n \\ 10) do
-    # HINT: use :recon.proc_count(:binary_memory, n)
-    # TODO: implement
-    []
+    :recon.proc_count(:binary_memory, n)
   end
 
   @doc """
@@ -263,16 +275,14 @@ defmodule ApiGateway.Dev.MemorySnapshot do
   """
   @spec top_memory_consumers(pos_integer()) :: list()
   def top_memory_consumers(n \\ 10) do
-    # HINT: use :recon.proc_count(:memory, n)
-    # TODO: implement
-    []
+    :recon.proc_count(:memory, n)
   end
 
   @doc """
   Forces GC on the top `n` processes by binary memory.
   Returns the total binary memory freed (before - after).
 
-  Use this as a diagnostic tool — not a production fix.
+  Use this as a diagnostic tool -- not a production fix.
   Frequent forced GC indicates a binary leak that must be fixed at the source.
   """
   @spec force_gc_top_consumers(pos_integer()) :: non_neg_integer()
@@ -281,10 +291,13 @@ defmodule ApiGateway.Dev.MemorySnapshot do
 
     top_binary_consumers(n)
     |> Enum.each(fn {pid, _bytes, _info} ->
-      # HINT: use :erlang.garbage_collect(pid) — safe to call on any pid
-      # HINT: it returns false if the pid no longer exists — handle gracefully
-      # TODO: implement
-      _ = pid
+      # :erlang.garbage_collect/1 returns true on success, false if pid is dead.
+      # We ignore the return value because dead pids are harmless here.
+      try do
+        :erlang.garbage_collect(pid)
+      catch
+        _, _ -> :ok
+      end
     end)
 
     after_total = :erlang.memory(:binary)
@@ -293,6 +306,7 @@ defmodule ApiGateway.Dev.MemorySnapshot do
 
   @doc """
   Returns process info for a specific pid as a map.
+  Uses :recon.info/2 which is safe for production and does not crash on dead pids.
   """
   @spec process_info(pid()) :: map()
   def process_info(pid) do
@@ -306,7 +320,7 @@ defmodule ApiGateway.Dev.MemorySnapshot do
 end
 ```
 
-### Step 3: Given tests — must pass without modification
+### Step 3: Tests
 
 ```elixir
 # test/api_gateway/middleware/body_reader_test.exs
@@ -349,7 +363,7 @@ defmodule ApiGateway.Middleware.BodyReaderTest do
       ct = result.assigns.content_type
       if byte_size(ct) > 0 do
         assert :binary.referenced_byte_size(ct) == byte_size(ct),
-               "content_type is a sub-binary reference — use :binary.copy/1"
+               "content_type is a sub-binary reference -- use :binary.copy/1"
       end
     end
   end
@@ -400,7 +414,7 @@ mix test test/api_gateway/middleware/body_reader_test.exs --trace
 
 | Approach | Binary leak risk | Memory overhead | GC pressure | Throughput |
 |----------|-----------------|-----------------|-------------|------------|
-| Return sub-binary directly | High — original ProcBin survives | Low (16-byte ProcBin ptr) | Low (no copy) | Highest |
+| Return sub-binary directly | High -- original ProcBin survives | Low (16-byte ProcBin ptr) | Low (no copy) | Highest |
 | `:binary.copy/1` always | None | Medium (extra allocation) | Medium (triggers GC sooner) | Lower |
 | Avoid large binary creation | None | Lowest | Lowest | Highest |
 | Stream body (don't accumulate) | None | Constant | None | Best for large bodies |
@@ -429,11 +443,11 @@ to find which process owns the growing binaries.
 GenServer's state, the original binary is pinned in memory until the GenServer
 restarts. Always apply `:binary.copy/1` to list elements before storing.
 
-**4. Not calling `:recon` — using `:observer` instead in production**
+**4. Not calling `:recon` -- using `:observer` instead in production**
 `:observer.start/0` over a remote shell is fine for development. In production,
 the Observer GUI connects over distribution and streams all process state to your
 laptop. This creates significant network and CPU overhead. Use `:recon` functions
-instead — they compute summaries on the node and return compact results.
+instead -- they compute summaries on the node and return compact results.
 
 **5. Adding `:recon` only to `:dev` deps**
 `:recon` is a diagnostic library that must be present in the production release.
@@ -445,8 +459,8 @@ useless for production diagnosis.
 
 ## Resources
 
-- [`:recon` documentation](https://ferd.github.io/recon/) — Fred Hébert's production diagnostic library
-- [Erlang in Anger — Fred Hébert](https://www.erlang-in-anger.com/) — free book, chapter 7 covers memory analysis
-- [BEAM book: binaries and memory](https://happi.github.io/theBeamBook/#_binaries) — ProcBin vs heap binary internals
-- [`:binary.referenced_byte_size/1` — Erlang docs](https://www.erlang.org/doc/man/binary.html#referenced_byte_size-1) — diagnosing sub-binary references
-- [`:recon_alloc` — memory allocator stats](https://ferd.github.io/recon/recon_alloc.html) — allocator-level memory analysis
+- [`:recon` documentation](https://ferd.github.io/recon/) -- Fred Hebert's production diagnostic library
+- [Erlang in Anger -- Fred Hebert](https://www.erlang-in-anger.com/) -- free book, chapter 7 covers memory analysis
+- [BEAM book: binaries and memory](https://happi.github.io/theBeamBook/#_binaries) -- ProcBin vs heap binary internals
+- [`:binary.referenced_byte_size/1` -- Erlang docs](https://www.erlang.org/doc/man/binary.html#referenced_byte_size-1) -- diagnosing sub-binary references
+- [`:recon_alloc` -- memory allocator stats](https://ferd.github.io/recon/recon_alloc.html) -- allocator-level memory analysis

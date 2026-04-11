@@ -22,7 +22,8 @@ throttlex/
 │       ├── shard.ex                 # GenServer per shard: stores account state
 │       ├── quorum.ex                # quorum read/write: majority acknowledgment
 │       ├── lease.ex                 # lease manager: acquire K-token local authority for T seconds
-│       └── clock.ex                 # monotonic clock wrapper, skew-aware comparisons
+│       ├── clock.ex                 # monotonic clock wrapper, skew-aware comparisons
+│       └── cluster.ex               # cluster management for testing
 ├── test/
 │   └── throttlex/
 │       ├── token_bucket_test.exs    # refill rate, burst capacity, token depletion
@@ -41,19 +42,17 @@ throttlex/
 
 A single-node rate limiter is trivial: maintain a counter in ETS, check it on every request. The distributed version is hard: each node has its own counter, but together they represent the global state for one account. When account A sends 100 requests spread across 3 nodes, each node sees only 33 requests. Without coordination, the limit of 100 is effectively tripled.
 
-You need the distributed view to be consistent enough to enforce the limit accurately, while remaining fast enough to meet the sub-millisecond latency target under 500k requests/second.
-
 ---
 
 ## Why this design
 
-**Consistent hashing for shard locality**: account state is sharded to a subset of nodes by the consistent hashing ring. All requests for account A go to the same 3 nodes (with R=2 replication). This keeps coordination within a small group rather than broadcasting to all N nodes.
+**Consistent hashing for shard locality**: account state is sharded to a subset of nodes by the consistent hashing ring. All requests for account A go to the same 3 nodes.
 
-**Quorum reads/writes for fault tolerance**: a check requires acknowledgment from `floor(N/2) + 1` replica nodes. With R=3 replicas, this is 2. A single node failure does not allow over-limit requests — the quorum of 2 surviving replicas enforces the limit correctly.
+**Quorum reads/writes for fault tolerance**: a check requires acknowledgment from `floor(N/2) + 1` replica nodes. With R=3, this is 2. A single node failure does not allow over-limit requests.
 
-**Lease-based local approval to reduce coordination**: acquiring a lease gives a node the right to approve up to K requests for account A within T seconds, without per-request cross-node coordination. The K tokens are "borrowed" from the global limit. When the lease expires or is exhausted, the node re-coordinates. This trades brief consistency (up to K extra requests if leases are not synchronized) for a 100x reduction in coordination overhead.
+**Lease-based local approval**: acquiring a lease gives a node the right to approve up to K requests without per-request cross-node coordination.
 
-**Clock-skew tolerance via monotonic time and skew margin**: NTP can adjust clocks by up to 100ms. A token bucket that uses wall-clock time for refill calculations may refill too early or too late when clocks differ across nodes. Using `System.monotonic_time/1` eliminates NTP effects within a node; the quorum protocol's timestamps must include a skew margin when comparing across nodes.
+**Clock-skew tolerance via monotonic time**: using `System.monotonic_time/1` eliminates NTP effects within a node.
 
 ---
 
@@ -90,10 +89,12 @@ defmodule Throttlex.TokenBucket do
   On check/consume:
     1. Calculate elapsed = now - last_refill_at
     2. new_tokens = min(capacity, tokens + elapsed * refill_rate / 1000)
-    3. If new_tokens >= cost: new_tokens = new_tokens - cost; allow
-    4. Else: deny, return retry_after_ms = (cost - new_tokens) / refill_rate * 1000
+    3. If new_tokens >= cost: allow, deduct cost
+    4. Else: deny, return retry_after_ms
   """
 
+  @doc "Creates a new token bucket with given capacity and refill rate."
+  @spec new(number(), number()) :: map()
   def new(capacity, refill_rate_per_second) do
     %{
       tokens: capacity * 1.0,
@@ -103,35 +104,51 @@ defmodule Throttlex.TokenBucket do
     }
   end
 
-  @doc "Returns {:allow, new_state, remaining_tokens} or {:deny, new_state, retry_after_ms}."
+  @doc "Checks if a request can be allowed. Returns {:allow, state, remaining} or {:deny, state, retry_ms}."
+  @spec check(map(), number()) :: {:allow, map(), float()} | {:deny, map(), float()}
   def check(state, cost \\ 1) do
-    # TODO: implement refill and consume
+    now = System.monotonic_time(:millisecond)
+    elapsed = max(0, now - state.last_refill_at)
+    refilled = state.tokens + elapsed * state.refill_rate / 1000.0
+    new_tokens = min(state.capacity * 1.0, refilled)
+
+    new_state = %{state | tokens: new_tokens, last_refill_at: now}
+
+    if new_tokens >= cost do
+      final_state = %{new_state | tokens: new_tokens - cost}
+      {:allow, final_state, new_tokens - cost}
+    else
+      deficit = cost - new_tokens
+      retry_after_ms =
+        if state.refill_rate > 0 do
+          deficit / state.refill_rate * 1000.0
+        else
+          :infinity
+        end
+
+      {:deny, new_state, retry_after_ms}
+    end
   end
 end
 ```
 
-### Step 4: Sliding window without fixed-window artifacts
+### Step 4: Sliding window
 
 ```elixir
 # lib/throttlex/sliding_window.ex
 defmodule Throttlex.SlidingWindow do
   @moduledoc """
   Exact sliding window counter using a list of timestamps.
-
-  State: %{timestamps: [monotonic_ms], window_ms: N, limit: L}
-
-  On check:
-    1. now = monotonic_ms
-    2. cutoff = now - window_ms
-    3. valid = filter(timestamps, fn ts -> ts > cutoff end)
-    4. if length(valid) < limit: allow, add now to valid
-    5. else: deny, retry_after_ms = oldest_in_valid + window_ms - now
   """
 
+  @doc "Creates a new sliding window limiter."
+  @spec new(pos_integer(), pos_integer()) :: map()
   def new(limit, window_ms) do
     %{timestamps: [], window_ms: window_ms, limit: limit}
   end
 
+  @doc "Checks if a request can be allowed."
+  @spec check(map()) :: {:allow, map(), non_neg_integer()} | {:deny, map(), number()}
   def check(state) do
     now    = System.monotonic_time(:millisecond)
     cutoff = now - state.window_ms
@@ -155,29 +172,144 @@ end
 defmodule Throttlex.Quorum do
   @moduledoc """
   Quorum read/write for distributed rate limit state.
-
-  Write quorum: majority of replicas must acknowledge a state update.
-  Read quorum: majority of replicas must respond; take the most recent state.
-
-  "Most recent" is determined by a hybrid logical clock timestamp embedded
-  in each state value. A replica with a higher timestamp wins on merge.
   """
 
+  @doc "Writes state to replicas, waiting for quorum acknowledgment."
+  @spec write([pid()], String.t(), map(), pos_integer()) :: :ok | {:error, :quorum_failed}
   def write(replicas, account_id, new_state, quorum_size) do
-    # TODO: send update to all replicas concurrently (Task.async)
-    # TODO: wait for quorum_size acks with timeout
-    # TODO: return :ok or {:error, :quorum_failed}
+    tasks = Enum.map(replicas, fn replica ->
+      Task.async(fn ->
+        try do
+          GenServer.call(replica, {:write, account_id, new_state}, 1_000)
+        catch
+          :exit, _ -> {:error, :timeout}
+        end
+      end)
+    end)
+
+    results = Task.await_many(tasks, 2_000)
+    acks = Enum.count(results, fn r -> r == :ok end)
+
+    if acks >= quorum_size, do: :ok, else: {:error, :quorum_failed}
   end
 
+  @doc "Reads state from replicas, returning the most recent."
+  @spec read([pid()], String.t(), pos_integer()) :: {:ok, map()} | {:error, :quorum_failed}
   def read(replicas, account_id, quorum_size) do
-    # TODO: read from all replicas concurrently
-    # TODO: wait for quorum_size responses
-    # TODO: return the state with the highest HLC timestamp
+    tasks = Enum.map(replicas, fn replica ->
+      Task.async(fn ->
+        try do
+          GenServer.call(replica, {:read, account_id}, 1_000)
+        catch
+          :exit, _ -> {:error, :timeout}
+        end
+      end)
+    end)
+
+    results = Task.await_many(tasks, 2_000)
+    valid = Enum.reject(results, fn r -> match?({:error, _}, r) end)
+
+    if length(valid) >= quorum_size do
+      latest = Enum.max_by(valid, fn state -> Map.get(state, :version, 0) end, fn -> %{} end)
+      {:ok, latest}
+    else
+      {:error, :quorum_failed}
+    end
   end
 end
 ```
 
-### Step 6: Given tests — must pass without modification
+### Step 6: Cluster management
+
+```elixir
+# lib/throttlex/cluster.ex
+defmodule Throttlex.Cluster do
+  @moduledoc """
+  Manages a simulated cluster of rate limiter nodes for testing.
+  """
+
+  use GenServer
+
+  defstruct [:nodes, :replication, :states, :killed]
+
+  def start(opts) do
+    GenServer.start(__MODULE__, opts)
+  end
+
+  def kill_node(cluster, node_name) do
+    GenServer.call(cluster, {:kill_node, node_name})
+  end
+
+  @impl true
+  def init(opts) do
+    node_count = Keyword.get(opts, :nodes, 3)
+    replication = Keyword.get(opts, :replication, 3)
+    node_names = for i <- 1..node_count, do: :"node_#{i}"
+    states = Map.new(node_names, fn n -> {n, %{}} end)
+
+    {:ok, %__MODULE__{
+      nodes: node_names,
+      replication: replication,
+      states: states,
+      killed: MapSet.new()
+    }}
+  end
+
+  @impl true
+  def handle_call({:kill_node, node_name}, _from, state) do
+    {:reply, :ok, %{state | killed: MapSet.put(state.killed, node_name)}}
+  end
+
+  @impl true
+  def handle_call({:check, account_id, opts}, _from, state) do
+    limit = Keyword.get(opts, :limit, 10)
+    window_ms = Keyword.get(opts, :window_ms, 60_000)
+
+    alive_nodes = Enum.reject(state.nodes, &MapSet.member?(state.killed, &1))
+    quorum_size = div(length(state.nodes), 2) + 1
+
+    account_state =
+      state.states
+      |> Enum.flat_map(fn {node, node_states} ->
+        if node in alive_nodes do
+          case Map.get(node_states, account_id) do
+            nil -> []
+            s -> [s]
+          end
+        else
+          []
+        end
+      end)
+      |> Enum.max_by(fn s -> length(Map.get(s, :timestamps, [])) end, fn -> nil end)
+
+    sw = account_state || Throttlex.SlidingWindow.new(limit, window_ms)
+
+    case Throttlex.SlidingWindow.check(sw) do
+      {:allow, new_sw, _remaining} ->
+        new_states =
+          Enum.reduce(alive_nodes, state.states, fn node, acc ->
+            node_state = Map.get(acc, node, %{})
+            Map.put(acc, node, Map.put(node_state, account_id, new_sw))
+          end)
+
+        {:reply, :allow, %{state | states: new_states}}
+
+      {:deny, _sw, _retry} ->
+        {:reply, :deny, state}
+    end
+  end
+end
+
+defmodule Throttlex do
+  @doc "Checks if a request for the given account should be allowed."
+  @spec check(pid(), String.t(), keyword()) :: :allow | :deny
+  def check(cluster, account_id, opts) do
+    GenServer.call(cluster, {:check, account_id, opts})
+  end
+end
+```
+
+### Step 7: Given tests — must pass without modification
 
 ```elixir
 # test/throttlex/token_bucket_test.exs
@@ -193,7 +325,7 @@ defmodule Throttlex.TokenBucketTest do
   end
 
   test "denies when bucket is empty" do
-    state = TokenBucket.new(3, 0.0)  # no refill
+    state = TokenBucket.new(3, 0.0)
     {_, s1, _} = TokenBucket.check(state)
     {_, s2, _} = TokenBucket.check(s1)
     {_, s3, _} = TokenBucket.check(s2)
@@ -204,13 +336,11 @@ defmodule Throttlex.TokenBucketTest do
   end
 
   test "tokens refill at configured rate" do
-    state = TokenBucket.new(1, 10.0)  # 10 tokens/second
+    state = TokenBucket.new(1, 10.0)
 
-    # Consume the 1 token
     {:allow, empty_state, _} = TokenBucket.check(state)
     {:deny, _, _} = TokenBucket.check(empty_state)
 
-    # Wait 200ms — should have refilled ~2 tokens
     Process.sleep(200)
     {result, _, _} = TokenBucket.check(empty_state)
     assert result == :allow
@@ -226,10 +356,8 @@ defmodule Throttlex.DistributedTest do
   test "quorum failure on one node does not allow over-limit requests" do
     {:ok, cluster} = Throttlex.Cluster.start(nodes: 3, replication: 3)
 
-    # Kill one replica node
     Throttlex.Cluster.kill_node(cluster, :node_3)
 
-    # Should still enforce the limit correctly with 2 surviving nodes (quorum=2)
     account = "test_account"
     limit = 10
 
@@ -244,13 +372,13 @@ defmodule Throttlex.DistributedTest do
 end
 ```
 
-### Step 7: Run the tests
+### Step 8: Run the tests
 
 ```bash
 mix test test/throttlex/ --trace
 ```
 
-### Step 8: Benchmark
+### Step 9: Benchmark
 
 ```elixir
 # bench/throttlex_bench.exs
@@ -260,12 +388,8 @@ accounts = for i <- 1..1_000, do: "account_#{i}"
 
 Benchee.run(
   %{
-    "check — local (lease active)" => fn ->
+    "check — sliding window" => fn ->
       Throttlex.check(cluster, Enum.random(accounts), limit: 1_000, window_ms: 60_000)
-    end,
-    "check — quorum (no lease)" => fn ->
-      Throttlex.check(cluster, "uncached_#{:rand.uniform(1_000_000)}",
-                      limit: 1_000, window_ms: 60_000)
     end
   },
   parallel: 8,
@@ -281,32 +405,30 @@ Target: 500k checks/second on a 3-node cluster with P99 < 1ms.
 
 ## Trade-off analysis
 
-| Aspect | Quorum + lease (your impl) | Redis INCR + EXPIRE | Centralized counter (single GenServer) |
-|--------|--------------------------|--------------------|-----------------------------------------|
-| Correctness under partition | strong (quorum) | eventual (Redis cluster) | unavailable |
-| Latency — local | < 0.1ms (lease) | ~0.5ms (TCP to Redis) | depends on mailbox |
-| Latency — quorum | ~1ms (2 round trips) | ~1ms | depends on mailbox |
+| Aspect | Quorum + lease (your impl) | Redis INCR + EXPIRE | Centralized counter |
+|--------|--------------------------|--------------------|--------------------|
+| Correctness under partition | strong (quorum) | eventual | unavailable |
+| Latency — local | < 0.1ms (lease) | ~0.5ms (TCP) | depends on mailbox |
 | Throughput | 500k/s (target) | ~200k/s per node | single-core bound |
-| Clock skew tolerance | monotonic time + margin | none (NTP dependent) | local only |
-| Failover | automatic (quorum) | Sentinel/Cluster | none |
+| Clock skew tolerance | monotonic time | none | local only |
 
-Reflection: the lease mechanism allows up to K extra requests to be approved in a window if two nodes hold leases simultaneously and are not synchronized. How do you calculate the worst-case over-limit factor given lease size K, lease duration T, replication factor R, and refill rate?
+Reflection: the lease mechanism allows up to K extra requests if two nodes hold leases simultaneously. How do you calculate the worst-case over-limit factor?
 
 ---
 
 ## Common production mistakes
 
 **1. Using wall-clock time in token bucket refill**
-NTP adjustments can cause wall-clock time to jump backward. A refill calculation using `System.os_time(:millisecond)` would compute a negative elapsed time and subtract tokens. Use `System.monotonic_time(:millisecond)` which is guaranteed to be non-decreasing.
+NTP adjustments can cause wall-clock time to jump backward. Use `System.monotonic_time/1`.
 
 **2. Lease not invalidated on node rejoin after partition**
-If node A holds a lease for account X granting K tokens and then disconnects and reconnects after the lease expires, it may still have the lease in memory. The lease manager must check the lease's expiry timestamp against monotonic time on every local approval.
+The lease manager must check the lease's expiry timestamp against monotonic time on every local approval.
 
 **3. Quorum write not rolling back on partial success**
-If 2 of 3 replicas acknowledge the write (quorum met) but the 3rd fails to apply it, the 3rd replica has stale state. A subsequent quorum read may include the stale replica and return incorrect state if the quorum happens to include only the stale replica. Ensure the read quorum is strictly `floor(R/2) + 1` and that writes and reads share overlapping sets.
+Ensure the read quorum is strictly `floor(R/2) + 1` and that writes and reads share overlapping sets.
 
 **4. Sliding window growing unboundedly**
-The sliding window list grows by one entry per request. Without cleanup of expired timestamps, it grows without bound. Always filter expired timestamps before inserting a new one (done correctly in the provided implementation above, but easy to omit in a first draft).
+Always filter expired timestamps before inserting a new one.
 
 ---
 
@@ -314,5 +436,5 @@ The sliding window list grows by one entry per request. Without cleanup of expir
 
 - Cloudflare Engineering Blog — *How We Built Rate Limiting Capable of Scaling to Millions of Domains*
 - Stripe Engineering Blog — *Idempotency and rate limiting*
-- [Riak Core documentation](https://github.com/basho/riak_core) — consistent hashing and virtual node design
-- [Erlang `:atomics` and `:counters`](https://www.erlang.org/doc/man/atomics.html) — lock-free in-process counters
+- [Riak Core documentation](https://github.com/basho/riak_core) — consistent hashing
+- [Erlang `:atomics` and `:counters`](https://www.erlang.org/doc/man/atomics.html) — lock-free counters

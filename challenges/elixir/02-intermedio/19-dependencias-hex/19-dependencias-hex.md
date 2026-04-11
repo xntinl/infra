@@ -1,54 +1,21 @@
 # Hex Dependencies and mix.lock
 
-**Project**: `task_queue` — built incrementally across the intermediate level
+## Goal
 
----
-
-## Project context
-
-You're working on `task_queue`, a background job processing system. As it grows, it needs external libraries: JSON encoding for job payloads, HTTP for webhook notifications, and dev-only tooling for static analysis and documentation.
-
-Project structure at this point:
-
-```
-task_queue/
-├── lib/
-│   └── task_queue/
-│       ├── application.ex          # already exists — starts the supervision tree
-│       ├── worker.ex               # already exists — processes jobs
-│       ├── queue_server.ex         # already exists — GenServer holding the queue
-│       ├── scheduler.ex            # already exists — dispatches jobs to workers
-│       └── registry.ex             # already exists — tracks running workers
-├── test/
-│   └── task_queue/
-│       └── queue_server_test.exs   # given tests — must pass without modification
-└── mix.exs                         # ← you configure dependencies here
-```
-
----
-
-## The business problem
-
-The team needs to add three capabilities to `task_queue`:
-
-1. **JSON serialization** — job payloads are encoded as JSON before enqueueing and decoded when processed
-2. **HTTP webhook notifications** — workers call an external URL when a job completes
-3. **Static analysis and docs** — Dialyxir and ExDoc for dev workflow, never deployed
-
-These map directly to different dependency scopes in `mix.exs`.
+Build a `task_queue` project that uses external Hex dependencies for JSON encoding, HTTP requests, and dev tooling. Learn how `mix.exs` manages dependencies by environment, why `mix.lock` matters, and how the `~>` operator controls version ranges.
 
 ---
 
 ## Why the lockfile is a production concern
 
-`mix.lock` records exact resolved versions — including transitive dependencies. Without committing it, two developers running `mix deps.get` on the same `mix.exs` may resolve different transitive versions. A bug that only reproduces on the CI server often traces back to a missing or inconsistent lockfile.
+`mix.lock` records exact resolved versions including transitive dependencies. Without committing it, two developers running `mix deps.get` on the same `mix.exs` may resolve different transitive versions. A bug that only reproduces on CI often traces back to a missing or inconsistent lockfile.
 
 The lockfile also records SHA hashes of downloaded tarballs, making supply-chain tampering detectable.
 
 ```
 mix.lock entry anatomy:
 "jason": {:hex, :jason, "1.4.4",
-  "b9226785a9aa77b6857ca22832cffa5d5150298a",   ← tarball SHA
+  "b9226785a9aa77b6857ca22832cffa5d5150298a",   <- tarball SHA
   [:mix], [{:decimal, "~> 1.0 or ~> 2.0", [hex: :decimal, optional: true]}],
   "hexpm", "..."}
 ```
@@ -61,9 +28,9 @@ Rule: `mix.lock` is always committed alongside `mix.exs`. It is never in `.gitig
 
 `~>` (the optimistic operator) pins the upper bound to the next breaking version:
 
-- `~> 1.4` means `>= 1.4.0 and < 2.0.0` — allows minor and patch bumps
-- `~> 1.4.2` means `>= 1.4.2 and < 1.5.0` — only allows patch bumps
-- `>= 1.4.0` has no upper bound — could resolve `2.0.0` with breaking changes
+- `~> 1.4` means `>= 1.4.0 and < 2.0.0` -- allows minor and patch bumps
+- `~> 1.4.2` means `>= 1.4.2 and < 1.5.0` -- only allows patch bumps
+- `>= 1.4.0` has no upper bound -- could resolve `2.0.0` with breaking changes
 
 For stable, widely-used libraries like Jason, `~> 1.4` is idiomatic. For less stable APIs, `~> 1.4.2` gives tighter control.
 
@@ -78,7 +45,7 @@ mix new task_queue --sup
 cd task_queue
 ```
 
-### Step 2: `mix.exs` — configure dependencies by environment
+### Step 2: `mix.exs` -- configure dependencies by environment
 
 ```elixir
 # mix.exs
@@ -104,27 +71,46 @@ defmodule TaskQueue.MixProject do
 
   defp deps do
     [
-      # Production dependencies — available in all environments
+      # Production dependencies -- available in all environments
       {:jason, "~> 1.4"},
       {:req, "~> 0.5"},
 
-      # Dev-only — static analysis, never included in a release
+      # Dev-only -- static analysis, never included in a release
       {:dialyxir, "~> 1.0", only: :dev, runtime: false},
 
-      # Dev-only — documentation generation
+      # Dev-only -- documentation generation
       {:ex_doc, "~> 0.31", only: :dev, runtime: false},
 
-      # Test-only — mocking for external HTTP calls
+      # Test-only -- mocking for external HTTP calls
       {:mox, "~> 1.0", only: :test},
 
-      # Dev + test — seed data generation
+      # Dev + test -- seed data generation
       {:faker, "~> 0.18", only: [:dev, :test]}
     ]
   end
 end
 ```
 
-### Step 3: `lib/task_queue/worker.ex` — use Jason for payload encoding
+The `only:` option restricts in which environments a dependency is fetched and compiled. `runtime: false` prevents the dependency's OTP application from being started at boot -- important for CLI tools like Dialyxir that should never start as an application.
+
+### Step 3: `lib/task_queue/application.ex`
+
+```elixir
+defmodule TaskQueue.Application do
+  use Application
+
+  @impl true
+  def start(_type, _args) do
+    children = []
+    opts = [strategy: :one_for_one, name: TaskQueue.Supervisor]
+    Supervisor.start_link(children, opts)
+  end
+end
+```
+
+### Step 4: `lib/task_queue/worker.ex` -- use Jason for payload encoding
+
+Jason is a production dependency declared in `mix.exs`. The Worker uses `Jason.encode/1` and `Jason.decode/1` for round-tripping job payloads through JSON. This is the most common pattern for Hex dependencies: declare in `mix.exs`, call in application code.
 
 ```elixir
 defmodule TaskQueue.Worker do
@@ -162,7 +148,6 @@ defmodule TaskQueue.Worker do
   end
 
   defp do_work(%{"type" => type, "args" => args}) do
-    # Simulate work — in production this dispatches by job type
     {:ok, %{type: type, args: args, processed_at: DateTime.utc_now()}}
   end
 
@@ -170,7 +155,7 @@ defmodule TaskQueue.Worker do
 end
 ```
 
-### Step 4: Given tests — must pass without modification
+### Step 5: Tests
 
 ```elixir
 # test/task_queue/worker_test.exs
@@ -202,19 +187,19 @@ defmodule TaskQueue.WorkerTest do
 end
 ```
 
-### Step 5: Run the tests
+### Step 6: Run
 
 ```bash
 mix deps.get
 mix test test/task_queue/worker_test.exs --trace
 ```
 
-All 3 tests should pass. The `execute/1` function decodes JSON via `Jason.decode/1`, pattern-matches on the decoded map to extract `"type"` and `"args"`, and delegates to `do_work/1`. The `encode_job/1` function delegates directly to `Jason.encode/1`.
+All 3 tests pass. `execute/1` decodes JSON via `Jason.decode/1`, pattern-matches on the decoded map to extract `"type"` and `"args"`, and delegates to `do_work/1`. `encode_job/1` delegates directly to `Jason.encode/1`.
 
-### Step 6: Verify environment isolation
+### Step 7: Verify environment isolation
 
 ```bash
-# Only jason, req appear — no dialyxir, ex_doc, mox, faker
+# Only jason, req appear -- no dialyxir, ex_doc, mox, faker
 MIX_ENV=prod mix deps
 
 # All deps appear
@@ -235,9 +220,7 @@ ls -la mix.lock
 | Typical use | stable public APIs | unstable minor releases | almost never appropriate |
 | lock needed? | yes | yes | especially yes |
 
-Reflection question: why does `runtime: false` on `dialyxir` matter for releases, even though `only: :dev` already excludes it from production builds?
-
-Answer: `only: :dev` prevents the dependency from being fetched and compiled in prod. `runtime: false` prevents the dependency's OTP application from being started when the app boots in dev. Without `runtime: false`, `dialyxir` registers itself as a started application, adding startup overhead and potentially interfering with the dev supervision tree. Both options serve different purposes and should be used together for CLI tools.
+Why does `runtime: false` on `dialyxir` matter for releases, even though `only: :dev` already excludes it from production builds? `only: :dev` prevents the dependency from being fetched and compiled in prod. `runtime: false` prevents the dependency's OTP application from being started when the app boots in dev. Without `runtime: false`, `dialyxir` registers itself as a started application, adding startup overhead and potentially interfering with the dev supervision tree. Both options serve different purposes and should be used together for CLI tools.
 
 ---
 
@@ -247,13 +230,13 @@ Answer: `only: :dev` prevents the dependency from being fetched and compiled in 
 Two developers resolve different transitive versions. Bug appears in CI but not locally. Always commit `mix.lock`.
 
 **2. `mix compile` without `mix deps.get` first**
-After editing `mix.exs`, you must run `mix deps.get`. The compiler uses whatever is in `deps/` — it does not auto-fetch.
+After editing `mix.exs`, you must run `mix deps.get`. The compiler uses whatever is in `deps/` -- it does not auto-fetch.
 
 **3. `~>` with the wrong precision**
 `{:plug, "~> 1.14"}` allows `1.15`, `1.16`, etc. `{:plug, "~> 1.14.2"}` locks to `1.14.x`. Using two-digit `~>` for well-maintained libraries is idiomatic; three-digit when you want strict patch stability.
 
 **4. Forgetting `runtime: false` on CLI tools**
-Without it, `dialyxir` starts as an OTP application at runtime — adding startup overhead and potentially conflicting with your app's process tree.
+Without it, `dialyxir` starts as an OTP application at runtime -- adding startup overhead and potentially conflicting with your app's process tree.
 
 **5. `path:` dependencies left in production**
 `{:my_lib, path: "../my_lib"}` is useful during local development but must never be deployed. Use it only in dev, with the Hex version commented out alongside it.
@@ -263,7 +246,7 @@ Without it, `dialyxir` starts as an OTP application at runtime — adding startu
 ## Resources
 
 - [Hex Package Manager](https://hex.pm)
-- [Mix.Tasks.Deps — official docs](https://hexdocs.pm/mix/Mix.Tasks.Deps.html)
+- [Mix.Tasks.Deps -- official docs](https://hexdocs.pm/mix/Mix.Tasks.Deps.html)
 - [Version constraints in Elixir](https://hexdocs.pm/elixir/Version.html)
-- [Jason — JSON library](https://hexdocs.pm/jason/Jason.html)
-- [Req — HTTP client](https://hexdocs.pm/req/Req.html)
+- [Jason -- JSON library](https://hexdocs.pm/jason/Jason.html)
+- [Req -- HTTP client](https://hexdocs.pm/req/Req.html)

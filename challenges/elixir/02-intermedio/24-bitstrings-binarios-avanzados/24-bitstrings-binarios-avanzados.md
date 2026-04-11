@@ -1,48 +1,24 @@
 # Bitstrings and Advanced Binaries
 
-**Project**: `task_queue` — built incrementally across the intermediate level
+## Goal
+
+Build a `task_queue` binary protocol encoder/decoder using Elixir's `<<>>` syntax. Learn to define fixed-format binary frames with explicit field sizes and endianness, parse them with pattern matching, and handle UTF-8 codepoints vs raw bytes.
 
 ---
 
-## Project context
+## The binary frame format
 
-`task_queue` needs to communicate over a custom binary protocol with external worker agents — lightweight processes that cannot run the full Erlang VM. The protocol must be compact, deterministic, and parseable without a schema library.
-
-Project structure at this point:
-
-```
-task_queue/
-├── lib/
-│   └── task_queue/
-│       ├── application.ex
-│       ├── worker.ex
-│       ├── queue_server.ex
-│       ├── scheduler.ex
-│       ├── registry.ex
-│       └── protocol.ex         # ← you implement this
-├── test/
-│   └── task_queue/
-│       └── protocol_test.exs   # given tests — must pass without modification
-└── mix.exs
-```
-
----
-
-## The business problem
-
-The external agents communicate over TCP using a fixed-format binary frame:
+External agents communicate over TCP using a fixed-format binary frame:
 
 ```
 | magic (4 bytes: "TSKQ") | version (1 byte) | type (1 byte) | length (2 bytes) | payload |
 ```
 
-- `magic` — used to detect frame boundaries and reject misaligned data
-- `version` — protocol version, currently `1`
-- `type` — `0x01` = job_request, `0x02` = job_result, `0x03` = heartbeat, `0xFF` = error
-- `length` — byte size of the payload, big-endian 16-bit
-- `payload` — JSON-encoded job data, up to 65535 bytes
-
-The key insight: Elixir's `<<>>` syntax lets you build and parse this format with the same pattern syntax used for regular data structures.
+- `magic` -- detects frame boundaries and rejects misaligned data
+- `version` -- protocol version, currently `1`
+- `type` -- `0x01` = job_request, `0x02` = job_result, `0x03` = heartbeat, `0xFF` = error
+- `length` -- byte size of the payload, big-endian 16-bit
+- `payload` -- UTF-8 binary (JSON-encoded job data), up to 65535 bytes
 
 ---
 
@@ -51,42 +27,60 @@ The key insight: Elixir's `<<>>` syntax lets you build and parse this format wit
 String concatenation for binary protocols is error-prone: byte order, alignment, and field sizes are invisible. `<<>>` makes them explicit:
 
 ```elixir
-# String concatenation — opaque, order-dependent
+# String concatenation -- opaque, order-dependent
 <<0xDE, 0xAD>> <> <<1>> <> <<byte_size(payload)::16>> <> payload
 
-# Binary syntax — field names, sizes, and endianness are all visible
+# Binary syntax -- field names, sizes, and endianness are all visible
 <<0xDE, 0xAD, version::8, byte_size(payload)::big-16, payload::binary>>
 ```
 
-Pattern matching on the same syntax makes encode/decode symmetric — the parser is literally the inverse of the encoder.
+Pattern matching on the same syntax makes encode/decode symmetric -- the parser is literally the inverse of the encoder.
 
 ---
 
 ## Why `::utf8` for strings
 
-Strings in Elixir are UTF-8 binaries. A character like `e` occupies 2 bytes (`<<195, 169>>`). Using `::8` for character-by-character iteration treats multibyte characters as two separate bytes, producing corrupt output. The `::utf8` specifier extracts complete codepoints:
+Strings in Elixir are UTF-8 binaries. A multibyte character like `e` occupies 2 bytes. Using `::8` for character iteration treats multibyte characters as separate bytes, producing corrupt output. The `::utf8` specifier extracts complete codepoints:
 
 ```elixir
-<<head::utf8, rest::binary>> = "cafe"
-# head => 99 ('c'), rest => "afe"  — correct
-
-<<head::8, rest::binary>> = "cafe"
-# head => 99 ('c'), rest => "afe"  — happens to work for ASCII prefix
-# But for "elan":
-<<head::8, rest::binary>> = "elan"
-# head => 195 (first byte of 'e'), rest => <<169, 108, 97, 110>>  — wrong
+<<head::utf8, rest::binary>> = "hello"
+# head => 104 ('h'), rest => "ello"  -- correct for any character
 ```
 
 ---
 
 ## Implementation
 
-### Step 1: `lib/task_queue/protocol.ex` — binary frame encoder/decoder
+### Step 1: `mix.exs`
+
+```elixir
+defmodule TaskQueue.MixProject do
+  use Mix.Project
+
+  def project do
+    [
+      app: :task_queue,
+      version: "0.1.0",
+      elixir: "~> 1.15",
+      start_permanent: Mix.env() == :prod,
+      deps: deps()
+    ]
+  end
+
+  def application do
+    [extra_applications: [:logger]]
+  end
+
+  defp deps, do: []
+end
+```
+
+### Step 2: `lib/task_queue/protocol.ex` -- binary frame encoder/decoder
 
 ```elixir
 defmodule TaskQueue.Protocol do
   @moduledoc """
-  Binary framing protocol for communication between `task_queue` and external agents.
+  Binary framing protocol for communication between task_queue and external agents.
 
   Frame format:
       | magic (4 bytes) | version (1 byte) | type (1 byte) | length (2 bytes) | payload |
@@ -128,6 +122,11 @@ defmodule TaskQueue.Protocol do
   @doc """
   Decodes a binary frame into `{:ok, %{type: atom, payload: binary}}` or
   `{:error, :invalid_frame}`.
+
+  The decoder pattern-matches on the magic bytes first, rejecting any frame that
+  does not start with "TSKQ". The `binary-size(length)` constraint ensures the
+  payload field matches exactly the declared length -- if the frame is truncated,
+  the pattern match fails and returns `{:error, :invalid_frame}`.
 
   ## Examples
 
@@ -188,8 +187,6 @@ defmodule TaskQueue.Protocol do
     {head, rest}
   end
 
-  # Private helpers
-
   defp type_to_byte(:job_request), do: @type_job_request
   defp type_to_byte(:job_result),  do: @type_job_result
   defp type_to_byte(:heartbeat),   do: @type_heartbeat
@@ -203,7 +200,7 @@ defmodule TaskQueue.Protocol do
 end
 ```
 
-### Step 2: Given tests — must pass without modification
+### Step 3: Tests
 
 ```elixir
 # test/task_queue/protocol_test.exs
@@ -245,14 +242,13 @@ defmodule TaskQueue.ProtocolTest do
 
     test "rejects truncated frame" do
       frame = Protocol.encode(:job_request, "data")
-      # Remove the last byte — makes payload shorter than declared length
       truncated = binary_part(frame, 0, byte_size(frame) - 1)
       assert {:error, :invalid_frame} = Protocol.decode(truncated)
     end
   end
 
-  describe "codepoint_count/1 — UTF-8 awareness" do
-    test "ASCII string — bytes equal codepoints" do
+  describe "codepoint_count/1 -- UTF-8 awareness" do
+    test "ASCII string -- bytes equal codepoints" do
       assert Protocol.codepoint_count("hello") == 5
     end
 
@@ -278,7 +274,7 @@ defmodule TaskQueue.ProtocolTest do
 end
 ```
 
-### Step 3: Run the tests
+### Step 4: Run
 
 ```bash
 mix test test/task_queue/protocol_test.exs --trace
@@ -296,25 +292,21 @@ mix test test/task_queue/protocol_test.exs --trace
 | Compile-time validation | yes (match spec errors) | no | no |
 | Performance | zero allocation for pattern match | allocates intermediates | varies |
 
-Reflection question: why is `System.monotonic_time` preferred over `System.os_time` for the timestamp field in a binary frame header? Consider NTP clock adjustments and monotonicity guarantees.
-
-Answer: `System.monotonic_time/0` is guaranteed to never go backwards — even if the system clock is adjusted by NTP (which can jump forward or backward). `System.os_time/0` reflects wall-clock time that NTP can adjust mid-operation, meaning two consecutive calls might return t2 < t1. For protocol frames, where timestamps are used to compute durations or detect ordering, a backwards jump would produce negative durations or incorrect ordering decisions. Monotonic time guarantees that later events always have greater timestamps.
-
 ---
 
 ## Common production mistakes
 
 **1. `byte_size` vs `String.length` confusion**
-`byte_size("cafe")` returns `5` (bytes). `String.length("cafe")` returns `4` (codepoints). For the `length` field in a binary protocol, you always want `byte_size` — the receiver reads bytes, not codepoints.
+`byte_size("cafe")` may differ from `String.length("cafe")` for multibyte strings. For the `length` field in a binary protocol, you always want `byte_size`.
 
 **2. No `binary-size(length)` in payload pattern**
-Without the size constraint, the `payload::binary` match captures everything remaining in the buffer — including bytes from the next frame in a TCP stream. Always bound the payload: `payload::binary-size(length)`.
+Without the size constraint, `payload::binary` captures everything remaining -- including bytes from the next frame in a TCP stream.
 
 **3. `::8` for UTF-8 strings**
-`<<head::8, rest::binary>>` splits on byte boundaries, not codepoint boundaries. Multibyte characters are silently corrupted. Use `::utf8` when iterating over string contents character by character.
+`<<head::8, rest::binary>>` splits on byte boundaries. Multibyte characters are silently corrupted. Use `::utf8` for character iteration.
 
 **4. Endianness mismatch**
-The default in `<<>>` is big-endian. If your counterpart uses little-endian (common in x86 binary formats), you must specify `::little-16` explicitly. Mixing is a silent bug — both sides parse valid numbers, just different ones.
+The default in `<<>>` is big-endian. If the counterpart uses little-endian, specify `::little-16` explicitly.
 
 **5. Building frames with string concatenation**
 `"TSKQ" <> <<version>> <> <<length::16>> <> payload` works but obscures endianness. The `<<>>` form is explicit and preferred.
@@ -323,7 +315,6 @@ The default in `<<>>` is big-endian. If your counterpart uses little-endian (com
 
 ## Resources
 
-- [Binaries, strings, and charlists — Elixir official guide](https://elixir-lang.org/getting-started/binaries-strings-and-char-lists.html)
-- [Bitstring syntax — Erlang reference manual](https://www.erlang.org/doc/reference_manual/expressions.html#bit-strings-and-bitstrings)
-- [String vs Binary in Elixir — DockYard blog](https://dockyard.com/blog/2015/07/17/understanding-elixir-types)
-- [`:binary` module — Erlang standard library](https://www.erlang.org/doc/man/binary.html)
+- [Binaries, strings, and charlists -- Elixir official guide](https://elixir-lang.org/getting-started/binaries-strings-and-char-lists.html)
+- [Bitstring syntax -- Erlang reference manual](https://www.erlang.org/doc/reference_manual/expressions.html#bit-strings-and-bitstrings)
+- [`:binary` module -- Erlang standard library](https://www.erlang.org/doc/man/binary.html)

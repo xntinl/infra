@@ -1,38 +1,5 @@
 # Supervisor: Fault Tolerance
 
-**Project**: `task_queue` — built incrementally across the intermediate level
-
----
-
-## Project context
-
-The task_queue system now has a QueueServer (exercise 04) and a TaskRegistry (exercise 02).
-Both are named GenServers that must stay alive for the lifetime of the application. When
-either crashes — due to a bug, a bad message, or a resource exhaustion — it should restart
-automatically in a clean state. That is the Supervisor's job.
-
-This exercise also introduces the `worker.ex` module: the actual job executor that the
-scheduler dispatches work to.
-
-Project structure at this point:
-
-```
-task_queue/
-├── lib/
-│   └── task_queue/
-│       ├── application.ex       # ← you wire this (exercise 06 completes it)
-│       ├── queue_server.ex      # exercise 04
-│       ├── task_registry.ex     # exercise 02
-│       ├── worker.ex
-│       └── supervisor.ex
-├── test/
-│   └── task_queue/
-│       └── supervisor_test.exs  # given tests — must pass without modification
-└── mix.exs
-```
-
----
-
 ## Why Supervisor exists
 
 The naive fix for a crashing process is to catch every possible error. The OTP philosophy
@@ -43,55 +10,199 @@ There are two reasons this is better in practice:
 1. **Transient failures** (network hiccup, temporary memory spike, race condition under
    load) are handled automatically without any defensive code.
 2. **Persistent failures** are detected by the restart rate limiter (`max_restarts /
-   max_seconds`) and escalated upward — the Supervisor itself stops, which triggers its
-   parent Supervisor, eventually reaching the Application level where the error is logged
-   and an alert is triggered.
-
-Trying to catch every error is whack-a-mole. Supervisors give you a structural guarantee.
+   max_seconds`) and escalated upward.
 
 ---
 
-## Restart strategies — when each applies in task_queue
+## Restart strategies
 
-| Strategy | Behavior | Use in task_queue |
-|----------|----------|------------------|
-| `:one_for_one` | Only the crashed child restarts | QueueServer and TaskRegistry — independent |
-| `:one_for_all` | All children restart when one crashes | If QueueServer and TaskRegistry shared state that must stay in sync |
-| `:rest_for_one` | Crashed child + all children started after it | If Worker depends on QueueServer being initialized first |
-
-For task_queue, `:one_for_one` is correct: the queue and the registry are independent.
-A crash in QueueServer should not reset the TaskRegistry.
+| Strategy | Behavior | Use case |
+|----------|----------|----------|
+| `:one_for_one` | Only the crashed child restarts | Independent children |
+| `:one_for_all` | All children restart when one crashes | Tightly coupled children |
+| `:rest_for_one` | Crashed child + all children started after it | Linear dependency chain |
 
 ---
 
 ## The business problem
 
-`TaskQueue.Supervisor` must supervise:
+Build a `TaskQueue.Supervisor` that supervises three independent processes:
 
-1. `TaskQueue.TaskRegistry` — the task metadata store (exercise 02)
-2. `TaskQueue.QueueServer` — the job FIFO queue (exercise 04)
-3. `TaskQueue.Worker` — the job executor
+1. `TaskQueue.TaskRegistry` — a task metadata store (Agent-based)
+2. `TaskQueue.QueueServer` — a FIFO job queue (GenServer-based)
+3. `TaskQueue.Worker` — a job executor (GenServer-based)
 
-`TaskQueue.Worker` is new: it pulls a job from QueueServer, updates status in TaskRegistry,
-executes the job, and records the result.
+All three modules are defined completely in this exercise.
+
+---
+
+## Project setup
+
+```
+task_queue/
+├── lib/
+│   └── task_queue/
+│       ├── task_registry.ex
+│       ├── queue_server.ex
+│       ├── worker.ex
+│       └── supervisor.ex
+├── test/
+│   └── task_queue/
+│       └── supervisor_test.exs
+└── mix.exs
+```
 
 ---
 
 ## Implementation
 
-### Step 1: `lib/task_queue/worker.ex`
+### `lib/task_queue/task_registry.ex`
 
 ```elixir
-defmodule TaskQueue.Worker do
+defmodule TaskQueue.TaskRegistry do
+  @moduledoc """
+  Agent-based task metadata store. Tracks task status transitions.
+  """
+  use Agent
+
+  @spec start_link(map()) :: Agent.on_start()
+  def start_link(initial \\ %{}) do
+    Agent.start_link(fn -> initial end, name: __MODULE__)
+  end
+
+  @spec register(String.t()) :: :ok
+  def register(task_id) do
+    entry = %{status: :pending, updated_at: System.monotonic_time(:millisecond)}
+    Agent.update(__MODULE__, fn state -> Map.put(state, task_id, entry) end)
+  end
+
+  @spec transition(String.t(), atom()) :: :ok | {:error, :not_found}
+  def transition(task_id, new_status) do
+    Agent.get_and_update(__MODULE__, fn state ->
+      case Map.get(state, task_id) do
+        nil ->
+          {{:error, :not_found}, state}
+
+        entry ->
+          updated = %{entry | status: new_status, updated_at: System.monotonic_time(:millisecond)}
+          {:ok, Map.put(state, task_id, updated)}
+      end
+    end)
+  end
+
+  @spec get(String.t()) :: map() | nil
+  def get(task_id) do
+    Agent.get(__MODULE__, fn state -> Map.get(state, task_id) end)
+  end
+
+  @spec stats() :: %{atom() => non_neg_integer()}
+  def stats do
+    Agent.get(__MODULE__, fn state ->
+      Enum.reduce(state, %{pending: 0, running: 0, done: 0, failed: 0}, fn {_id, entry}, acc ->
+        Map.update(acc, entry.status, 1, &(&1 + 1))
+      end)
+    end)
+  end
+end
+```
+
+### `lib/task_queue/queue_server.ex`
+
+```elixir
+defmodule TaskQueue.QueueServer do
+  @moduledoc """
+  GenServer-based FIFO job queue with periodic cleanup.
+  """
   use GenServer
   require Logger
 
-  @doc "Starts a worker registered under its module name."
+  @cleanup_interval_ms 30_000
+  @job_ttl_ms 300_000
+
   def start_link(opts \\ []) do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
   end
 
-  @doc "Requests the worker to process the next available job."
+  @spec push(any()) :: :ok
+  def push(payload) do
+    job = %{
+      id: :crypto.strong_rand_bytes(8) |> Base.url_encode64(padding: false),
+      payload: payload,
+      queued_at: System.monotonic_time(:millisecond)
+    }
+
+    GenServer.cast(__MODULE__, {:push, job})
+  end
+
+  @spec pop() :: {:ok, map()} | {:error, :empty}
+  def pop, do: GenServer.call(__MODULE__, :pop)
+
+  @spec peek() :: {:ok, map()} | {:error, :empty}
+  def peek, do: GenServer.call(__MODULE__, :peek)
+
+  @spec size() :: non_neg_integer()
+  def size, do: GenServer.call(__MODULE__, :size)
+
+  @spec flush() :: non_neg_integer()
+  def flush, do: GenServer.call(__MODULE__, :flush)
+
+  @impl GenServer
+  def init(_opts) do
+    Process.send_after(self(), :cleanup, @cleanup_interval_ms)
+    {:ok, []}
+  end
+
+  @impl GenServer
+  def handle_cast({:push, job}, state), do: {:noreply, state ++ [job]}
+
+  @impl GenServer
+  def handle_call(:pop, _from, []), do: {:reply, {:error, :empty}, []}
+  def handle_call(:pop, _from, [job | rest]), do: {:reply, {:ok, job}, rest}
+
+  @impl GenServer
+  def handle_call(:peek, _from, []), do: {:reply, {:error, :empty}, []}
+  def handle_call(:peek, _from, [job | _] = state), do: {:reply, {:ok, job}, state}
+
+  @impl GenServer
+  def handle_call(:size, _from, state), do: {:reply, length(state), state}
+
+  @impl GenServer
+  def handle_call(:flush, _from, state) do
+    cutoff = System.monotonic_time(:millisecond) - @job_ttl_ms
+    remaining = Enum.filter(state, fn job -> job.queued_at > cutoff end)
+    removed = length(state) - length(remaining)
+    if removed > 0, do: Logger.info("QueueServer cleanup: removed #{removed} stale jobs")
+    {:reply, removed, remaining}
+  end
+
+  @impl GenServer
+  def handle_info(:cleanup, state) do
+    cutoff = System.monotonic_time(:millisecond) - @job_ttl_ms
+    remaining = Enum.filter(state, fn job -> job.queued_at > cutoff end)
+    Process.send_after(self(), :cleanup, @cleanup_interval_ms)
+    {:noreply, remaining}
+  end
+
+  @impl GenServer
+  def handle_info(_, state), do: {:noreply, state}
+end
+```
+
+### `lib/task_queue/worker.ex`
+
+```elixir
+defmodule TaskQueue.Worker do
+  @moduledoc """
+  GenServer-based job executor. Pulls jobs from the queue,
+  updates the registry, and executes payloads.
+  """
+  use GenServer
+  require Logger
+
+  def start_link(opts \\ []) do
+    GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+  end
+
   @spec process_next() :: :ok | {:error, :empty}
   def process_next do
     GenServer.call(__MODULE__, :process_next, 30_000)
@@ -112,26 +223,17 @@ defmodule TaskQueue.Worker do
       {:ok, job} ->
         TaskQueue.TaskRegistry.transition(job.id, :running)
 
-        result =
-          try do
-            value = if is_function(job.payload), do: job.payload.(), else: job.payload
-            TaskQueue.TaskRegistry.transition(job.id, :done)
-            {:ok, value}
-          rescue
-            e ->
-              TaskQueue.TaskRegistry.transition(job.id, :failed)
-              {:error, e}
-          end
-
-        case result do
-          {:ok, _} ->
-            Logger.debug("Worker processed job #{job.id} successfully")
-
-          {:error, reason} ->
-            Logger.warning("Worker job #{job.id} failed: #{inspect(reason)}")
+        try do
+          value = if is_function(job.payload), do: job.payload.(), else: job.payload
+          TaskQueue.TaskRegistry.transition(job.id, :done)
+          Logger.debug("Worker processed job #{job.id} successfully")
+          {:reply, :ok, %{state | jobs_processed: state.jobs_processed + 1}}
+        rescue
+          e ->
+            TaskQueue.TaskRegistry.transition(job.id, :failed)
+            Logger.warning("Worker job #{job.id} failed: #{inspect(e)}")
+            {:reply, :ok, %{state | jobs_processed: state.jobs_processed + 1}}
         end
-
-        {:reply, :ok, %{state | jobs_processed: state.jobs_processed + 1}}
     end
   end
 
@@ -140,16 +242,7 @@ defmodule TaskQueue.Worker do
 end
 ```
 
-The Worker first calls `TaskQueue.TaskRegistry.transition/2` to mark the job as `:running`,
-then executes the payload. If execution succeeds, the job transitions to `:done`; if it
-raises, the job transitions to `:failed`. The `try/rescue` ensures the Worker process
-itself never crashes due to a bad payload — it reports the error and continues.
-
-The payload check `is_function(job.payload)` handles both callable payloads (from the
-batch runner) and data payloads (from manual pushes in tests). In production, you would
-enforce a consistent payload contract.
-
-### Step 2: `lib/task_queue/supervisor.ex`
+### `lib/task_queue/supervisor.ex`
 
 ```elixir
 defmodule TaskQueue.Supervisor do
@@ -172,16 +265,11 @@ defmodule TaskQueue.Supervisor do
 end
 ```
 
-The children are listed in dependency order: TaskRegistry and QueueServer have no
-dependencies and start first. Worker depends on both — it is listed last so that by
-the time it starts, the processes it calls are already running.
+The children are listed in dependency order: TaskRegistry and QueueServer start first.
+Worker depends on both — it is listed last so that by the time it starts, the processes
+it calls are already running.
 
-`Supervisor.init/2` with `strategy: :one_for_one` means each child is independent:
-if QueueServer crashes, only QueueServer restarts. TaskRegistry and Worker continue
-running with their existing state. This matches the task_queue architecture where the
-queue and registry are independent stores.
-
-### Step 3: Given tests — must pass without modification
+### Tests
 
 ```elixir
 # test/task_queue/supervisor_test.exs
@@ -191,7 +279,6 @@ defmodule TaskQueue.SupervisorTest do
   alias TaskQueue.Supervisor, as: TQSupervisor
 
   setup do
-    # Stop any running supervisor tree before each test
     case Process.whereis(TQSupervisor) do
       nil -> :ok
       pid -> Supervisor.stop(pid, :normal)
@@ -211,20 +298,16 @@ defmodule TaskQueue.SupervisorTest do
   end
 
   test "QueueServer restarts after crash and preserves registry state" do
-    # Register a task before crash
     TaskQueue.TaskRegistry.register("crash_test")
     assert %{status: :pending} = TaskQueue.TaskRegistry.get("crash_test")
 
-    # Crash the QueueServer
     queue_pid = Process.whereis(TaskQueue.QueueServer)
     ref = Process.monitor(queue_pid)
     Process.exit(queue_pid, :kill)
     assert_receive {:DOWN, ^ref, :process, ^queue_pid, :killed}, 1_000
 
-    # Wait for restart
     Process.sleep(100)
 
-    # QueueServer restarted (new PID)
     new_queue_pid = Process.whereis(TaskQueue.QueueServer)
     assert new_queue_pid != nil
     assert new_queue_pid != queue_pid
@@ -234,12 +317,10 @@ defmodule TaskQueue.SupervisorTest do
   end
 
   test "TaskRegistry restarts after crash independently of QueueServer" do
-    # Push a job before crash
     TaskQueue.QueueServer.push("job_payload")
     Process.sleep(10)
     assert 1 = TaskQueue.QueueServer.size()
 
-    # Crash the TaskRegistry
     reg_pid = Process.whereis(TaskQueue.TaskRegistry)
     ref = Process.monitor(reg_pid)
     Process.exit(reg_pid, :kill)
@@ -262,7 +343,7 @@ defmodule TaskQueue.SupervisorTest do
 end
 ```
 
-### Step 4: Run the tests
+### Run the tests
 
 ```bash
 mix test test/task_queue/supervisor_test.exs --trace
@@ -270,48 +351,25 @@ mix test test/task_queue/supervisor_test.exs --trace
 
 ---
 
-## Trade-off analysis
-
-| Aspect | `:one_for_one` | `:one_for_all` | `:rest_for_one` |
-|--------|---------------|---------------|----------------|
-| Impact of one crash | Minimal — only that child restarts | Maximum — all children restart | Medium — crashed + later children |
-| Use case | Independent workers | Tightly coupled children | Linear dependency chain |
-| In task_queue | Registry <-> QueueServer independent | N/A | Worker depends on Queue + Registry |
-| max_restarts default | 3 in 5 seconds | Same | Same |
-
-Reflection question: the Supervisor uses `max_restarts: 3, max_seconds: 5` by default. If
-a bug causes QueueServer to crash every time it receives a specific message pattern, after
-3 restarts the Supervisor itself stops. What happens to the Application then, and how
-does OTP communicate this to the operator?
-
----
-
 ## Common production mistakes
 
 **1. Duplicate child IDs for the same module**
 If you add two workers of the same module without explicit `:id` keys, the Supervisor
-refuses to start with `{:error, {:duplicate_child, ...}}`. Always set unique IDs when
-supervising multiple instances of the same module.
+refuses to start.
 
 **2. Choosing `:one_for_all` when children are independent**
-With `:one_for_all`, a crash in the Worker causes TaskRegistry and QueueServer to restart
-too, losing all in-flight state. Reserve `:one_for_all` for children that share a
-logical transaction boundary.
+A crash in one child causes all others to restart, losing their in-flight state.
 
 **3. Overly aggressive `max_restarts`**
-Setting `max_restarts: 100` means a buggy process loops for 100 crashes before the
-Supervisor escalates. In development, keep the default (3/5s) so bugs surface fast.
+Setting `max_restarts: 100` means a buggy process loops for 100 crashes before escalation.
 
 **4. Not testing crash recovery explicitly**
-The test above uses `Process.exit(pid, :kill)` and `assert_receive {:DOWN, ...}`.
-Without this pattern, you cannot verify that your Supervisor actually restarts children —
-it might look correct but have a silent configuration error.
+Use `Process.exit(pid, :kill)` and `assert_receive {:DOWN, ...}` to verify restart behavior.
 
 ---
 
 ## Resources
 
 - [Supervisor — HexDocs](https://hexdocs.pm/elixir/Supervisor.html)
-- [Supervisor.init/2 — HexDocs](https://hexdocs.pm/elixir/Supervisor.html#init/2)
 - [Mix and OTP: Supervisor](https://elixir-lang.org/getting-started/mix-otp/supervisor-and-application.html)
 - [OTP Design Principles: Supervision Trees](https://www.erlang.org/doc/design_principles/sup_princ.html)

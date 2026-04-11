@@ -92,26 +92,204 @@ defmodule Chronos.Gorilla do
       if DoD in [-63, 64]:   2-bit header 10, 7-bit value
       if DoD in [-255, 256]: 3-bit header 110, 9-bit value
       otherwise:             4-bit header 1110, 12-bit value
-      full 64-bit:           5-bit header 11110, 64-bit value
 
   Float encoding (XOR):
     First value: stored as full 64-bit IEEE 754.
     XOR with previous value:
       if XOR == 0:           1-bit code: 0
-      if leading/trailing zeros same as previous: 1-bit header 1 0, M significant bits
-      otherwise: 1-bit header 1 1, 5-bit leading zeros, 6-bit M, M significant bits
+      otherwise:             1-bit header 1, 6-bit leading zeros, 6-bit significant bits length, significant bits
   """
 
+  use Bitwise
+
   @doc "Encodes a list of {timestamp_ms, float_value} pairs into a compressed binary."
-  def encode(samples) do
-    # TODO: implement as a bitstring accumulator using << existing :: bitstring, new_bits :: size(n) >>
-    # HINT: represent state as {prev_ts, prev_delta, prev_xor_state, bitstring}
+  @spec encode([{integer(), float()}]) :: binary()
+  def encode([]), do: <<>>
+
+  def encode([{first_ts, first_val} | rest]) do
+    first_val_bits = float_to_bits(first_val)
+    init_bits = <<first_ts::64, first_val_bits::64>>
+
+    case rest do
+      [] ->
+        pad_to_bytes(init_bits)
+
+      [{second_ts, second_val} | tail] ->
+        delta = second_ts - first_ts
+        second_val_bits = float_to_bits(second_val)
+        xor = bxor(first_val_bits, second_val_bits)
+
+        acc = <<init_bits::bitstring, delta::signed-32>>
+        acc = encode_xor_value(acc, xor, 0, 0)
+
+        {final_bits, _prev_ts, _prev_delta, _prev_val_bits, _prev_leading, _prev_trailing} =
+          Enum.reduce(tail, {acc, second_ts, delta, second_val_bits, 0, 0}, fn {ts, val}, {bits, prev_ts, prev_delta, prev_val_bits, prev_leading, prev_trailing} ->
+            current_delta = ts - prev_ts
+            dod = current_delta - prev_delta
+
+            new_bits = encode_dod(bits, dod)
+
+            val_bits = float_to_bits(val)
+            xor = bxor(prev_val_bits, val_bits)
+            new_bits = encode_xor_value(new_bits, xor, prev_leading, prev_trailing)
+
+            {leading, trailing} =
+              if xor == 0 do
+                {prev_leading, prev_trailing}
+              else
+                l = count_leading_zeros_64(xor)
+                t = count_trailing_zeros_64(xor)
+                {l, t}
+              end
+
+            {new_bits, ts, current_delta, val_bits, leading, trailing}
+          end)
+
+        pad_to_bytes(final_bits)
+    end
   end
 
   @doc "Decodes a compressed binary back to [{timestamp_ms, float_value}]."
+  @spec decode(binary()) :: [{integer(), float()}]
+  def decode(<<>>), do: []
+
   def decode(binary) do
-    # TODO
+    bits = binary_to_bitstring(binary)
+
+    case bits do
+      <<first_ts::64, first_val_bits::64, rest::bitstring>> ->
+        first_val = bits_to_float(first_val_bits)
+
+        case rest do
+          <<>> ->
+            [{first_ts, first_val}]
+
+          <<delta::signed-32, rest2::bitstring>> ->
+            second_ts = first_ts + delta
+            {second_val_bits, rest3, leading, trailing} = decode_xor_value(rest2, first_val_bits, 0, 0)
+            second_val = bits_to_float(second_val_bits)
+
+            decode_loop(rest3, [{second_ts, second_val}, {first_ts, first_val}],
+                       second_ts, delta, second_val_bits, leading, trailing)
+        end
+
+      _ ->
+        []
+    end
   end
+
+  defp decode_loop(<<>>, acc, _prev_ts, _prev_delta, _prev_val_bits, _pl, _pt) do
+    Enum.reverse(acc)
+  end
+
+  defp decode_loop(bits, acc, prev_ts, prev_delta, prev_val_bits, prev_leading, prev_trailing) do
+    case decode_dod(bits) do
+      :eof ->
+        Enum.reverse(acc)
+
+      {dod, rest} ->
+        current_delta = prev_delta + dod
+        current_ts = prev_ts + current_delta
+
+        {current_val_bits, rest2, new_leading, new_trailing} =
+          decode_xor_value(rest, prev_val_bits, prev_leading, prev_trailing)
+        current_val = bits_to_float(current_val_bits)
+
+        decode_loop(rest2, [{current_ts, current_val} | acc],
+                   current_ts, current_delta, current_val_bits, new_leading, new_trailing)
+    end
+  end
+
+  defp encode_dod(bits, 0), do: <<bits::bitstring, 0::1>>
+
+  defp encode_dod(bits, dod) when dod >= -63 and dod <= 64 do
+    <<bits::bitstring, 0b10::2, dod::signed-7>>
+  end
+
+  defp encode_dod(bits, dod) when dod >= -255 and dod <= 256 do
+    <<bits::bitstring, 0b110::3, dod::signed-9>>
+  end
+
+  defp encode_dod(bits, dod) do
+    <<bits::bitstring, 0b1110::4, dod::signed-32>>
+  end
+
+  defp decode_dod(<<0::1, rest::bitstring>>), do: {0, rest}
+  defp decode_dod(<<0b10::2, dod::signed-7, rest::bitstring>>), do: {dod, rest}
+  defp decode_dod(<<0b110::3, dod::signed-9, rest::bitstring>>), do: {dod, rest}
+  defp decode_dod(<<0b1110::4, dod::signed-32, rest::bitstring>>), do: {dod, rest}
+  defp decode_dod(_), do: :eof
+
+  defp encode_xor_value(bits, 0, _prev_leading, _prev_trailing) do
+    <<bits::bitstring, 0::1>>
+  end
+
+  defp encode_xor_value(bits, xor, _prev_leading, _prev_trailing) do
+    leading = count_leading_zeros_64(xor)
+    trailing = count_trailing_zeros_64(xor)
+    significant_bits = 64 - leading - trailing
+    significant = (xor >>> trailing) &&& ((1 <<< significant_bits) - 1)
+
+    <<bits::bitstring, 1::1, leading::6, significant_bits::6, significant::size(significant_bits)>>
+  end
+
+  defp decode_xor_value(<<0::1, rest::bitstring>>, prev_val_bits, prev_leading, prev_trailing) do
+    {prev_val_bits, rest, prev_leading, prev_trailing}
+  end
+
+  defp decode_xor_value(<<1::1, leading::6, sig_len::6, rest::bitstring>>, prev_val_bits, _prev_leading, _prev_trailing) do
+    <<significant::size(sig_len), rest2::bitstring>> = rest
+    trailing = 64 - leading - sig_len
+    xor = significant <<< trailing
+    val_bits = bxor(prev_val_bits, xor)
+    {val_bits, rest2, leading, trailing}
+  end
+
+  defp decode_xor_value(<<>>, prev_val_bits, prev_leading, prev_trailing) do
+    {prev_val_bits, <<>>, prev_leading, prev_trailing}
+  end
+
+  defp float_to_bits(f) do
+    <<bits::64>> = <<f::float-64>>
+    bits
+  end
+
+  defp bits_to_float(bits) do
+    <<f::float-64>> = <<bits::64>>
+    f
+  end
+
+  defp count_leading_zeros_64(0), do: 64
+  defp count_leading_zeros_64(n), do: do_clz(n, 63, 0)
+
+  defp do_clz(_n, -1, count), do: count
+  defp do_clz(n, bit, count) do
+    if (n >>> bit &&& 1) == 0 do
+      do_clz(n, bit - 1, count + 1)
+    else
+      count
+    end
+  end
+
+  defp count_trailing_zeros_64(0), do: 64
+  defp count_trailing_zeros_64(n), do: do_ctz(n, 0)
+
+  defp do_ctz(n, bit) do
+    if (n >>> bit &&& 1) == 0 do
+      do_ctz(n, bit + 1)
+    else
+      bit
+    end
+  end
+
+  defp pad_to_bytes(bits) do
+    bit_size = bit_size(bits)
+    padding = rem(8 - rem(bit_size, 8), 8)
+    padded = <<bits::bitstring, 0::size(padding)>>
+    :erlang.bitstring_to_list(padded) |> :erlang.list_to_binary()
+  end
+
+  defp binary_to_bitstring(bin), do: bin
 end
 ```
 
@@ -122,26 +300,250 @@ end
 defmodule Chronos.Series do
   @moduledoc """
   Maps (metric_name, labels_map) to a stable series_id integer.
-  Maintains an inverted index: label_key=value → MapSet(series_id).
+  Maintains an inverted index: label_key=value -> MapSet(series_id).
   """
 
+  @doc "Returns a stable integer series_id for the given metric and label combination."
+  @spec series_id(String.t(), map()) :: non_neg_integer()
   def series_id(metric, labels) do
-    # TODO: hash {metric, :erlang.phash2(:lists.sort(Map.to_list(labels)))}
-    # HINT: use :erlang.phash2/2 with a large max value for stable 32-bit ID
+    sorted_labels = labels |> Map.to_list() |> Enum.sort()
+    :erlang.phash2({metric, sorted_labels}, 1_000_000_000)
   end
 
-  def index_labels(series_id, labels) do
-    # TODO: for each {k, v} in labels, add series_id to the inverted index
-    # HINT: :ets.insert(:label_index, {{k, v}, series_id}) with :bag type
+  @doc "Indexes the labels for a given series_id in the inverted index ETS table."
+  @spec index_labels(non_neg_integer(), map()) :: :ok
+  def index_labels(sid, labels) do
+    ensure_table()
+    Enum.each(labels, fn {k, v} ->
+      :ets.insert(:chronos_label_index, {{k, v}, sid})
+    end)
+    :ok
   end
 
+  @doc "Looks up all series_ids matching a label key=value pair."
+  @spec lookup_by_label(atom() | String.t(), term()) :: [non_neg_integer()]
   def lookup_by_label(key, value) do
-    # TODO: :ets.lookup(:label_index, {key, value}) → [series_id]
+    ensure_table()
+    :ets.lookup(:chronos_label_index, {key, value})
+    |> Enum.map(fn {_key, sid} -> sid end)
+    |> Enum.uniq()
+  end
+
+  @doc "Looks up series_ids matching all provided labels (intersection)."
+  @spec lookup_by_labels(map()) :: [non_neg_integer()]
+  def lookup_by_labels(labels) do
+    labels
+    |> Enum.map(fn {k, v} -> lookup_by_label(k, v) |> MapSet.new() end)
+    |> Enum.reduce(fn set, acc -> MapSet.intersection(acc, set) end)
+    |> MapSet.to_list()
+  end
+
+  defp ensure_table do
+    case :ets.whereis(:chronos_label_index) do
+      :undefined -> :ets.new(:chronos_label_index, [:named_table, :public, :bag])
+      _ -> :ok
+    end
   end
 end
 ```
 
-### Step 5: Given tests — must pass without modification
+### Step 5: Chunk storage and query engine
+
+```elixir
+# lib/chronos/chunk.ex
+defmodule Chronos.Chunk do
+  @moduledoc """
+  Stores compressed chunks keyed by {series_id, hour_bucket}.
+  Each chunk holds a Gorilla-compressed binary of samples for that hour.
+  """
+
+  @bucket_ms 3_600_000
+
+  def ensure_table do
+    case :ets.whereis(:chronos_chunks) do
+      :undefined -> :ets.new(:chronos_chunks, [:named_table, :public, :set])
+      _ -> :ok
+    end
+  end
+
+  @doc "Returns the hour bucket for a given timestamp in milliseconds."
+  @spec bucket_for(integer()) :: integer()
+  def bucket_for(ts_ms), do: div(ts_ms, @bucket_ms) * @bucket_ms
+
+  @doc "Appends a sample to the chunk for the given series and timestamp."
+  @spec append(non_neg_integer(), integer(), float()) :: :ok
+  def append(series_id, ts_ms, value) do
+    ensure_table()
+    bucket = bucket_for(ts_ms)
+    key = {series_id, bucket}
+
+    existing =
+      case :ets.lookup(:chronos_chunks, key) do
+        [{^key, samples}] -> samples
+        [] -> []
+      end
+
+    :ets.insert(:chronos_chunks, {key, existing ++ [{ts_ms, value}]})
+    :ok
+  end
+
+  @doc "Reads and returns raw samples for a series within the given time range."
+  @spec read(non_neg_integer(), integer(), integer()) :: [{integer(), float()}]
+  def read(series_id, from_ms, to_ms) do
+    ensure_table()
+    start_bucket = bucket_for(from_ms)
+    end_bucket = bucket_for(to_ms)
+
+    buckets = Stream.iterate(start_bucket, &(&1 + @bucket_ms))
+              |> Enum.take_while(&(&1 <= end_bucket))
+
+    Enum.flat_map(buckets, fn bucket ->
+      key = {series_id, bucket}
+      case :ets.lookup(:chronos_chunks, key) do
+        [{^key, samples}] ->
+          Enum.filter(samples, fn {ts, _v} -> ts >= from_ms and ts < to_ms end)
+        [] -> []
+      end
+    end)
+  end
+end
+```
+
+```elixir
+# lib/chronos/query_engine.ex
+defmodule Chronos.QueryEngine do
+  @moduledoc """
+  Executes range queries with aggregation and gap-fill support.
+  """
+
+  @doc "Queries a metric with label filter, time range, aggregation, step, and optional gap-fill."
+  @spec query(String.t(), map(), keyword()) :: [{integer(), float()}]
+  def query(metric, labels, opts) do
+    from = Keyword.fetch!(opts, :from)
+    to = Keyword.fetch!(opts, :to)
+    aggregate = Keyword.get(opts, :aggregate, :avg)
+    step_str = Keyword.get(opts, :step, "1m")
+    gap_fill = Keyword.get(opts, :gap_fill)
+
+    step_ms = parse_step(step_str)
+
+    series_ids = Chronos.Series.lookup_by_labels(labels)
+
+    all_samples =
+      Enum.flat_map(series_ids, fn sid ->
+        Chronos.Chunk.read(sid, from, to)
+      end)
+      |> Enum.sort_by(fn {ts, _v} -> ts end)
+
+    windows = build_windows(from, to, step_ms)
+
+    results =
+      Enum.map(windows, fn {win_start, win_end} ->
+        window_samples =
+          Enum.filter(all_samples, fn {ts, _v} -> ts >= win_start and ts < win_end end)
+          |> Enum.map(fn {_ts, v} -> v end)
+
+        agg_value =
+          case window_samples do
+            [] -> nil
+            vals -> aggregate_values(vals, aggregate)
+          end
+
+        {win_start, agg_value}
+      end)
+
+    case gap_fill do
+      :fill_previous -> fill_previous(results)
+      _ -> Enum.reject(results, fn {_ts, v} -> is_nil(v) end)
+    end
+  end
+
+  defp build_windows(from, to, step_ms) do
+    Stream.iterate(from, &(&1 + step_ms))
+    |> Enum.take_while(&(&1 < to))
+    |> Enum.map(fn start -> {start, start + step_ms} end)
+  end
+
+  defp aggregate_values(values, :avg), do: Enum.sum(values) / length(values)
+  defp aggregate_values(values, :sum), do: Enum.sum(values)
+  defp aggregate_values(values, :min), do: Enum.min(values)
+  defp aggregate_values(values, :max), do: Enum.max(values)
+  defp aggregate_values(values, :last), do: List.last(values)
+  defp aggregate_values(values, :count), do: length(values) * 1.0
+
+  defp fill_previous(results) do
+    {filled, _} =
+      Enum.map_reduce(results, nil, fn {ts, val}, prev ->
+        if is_nil(val) do
+          {{ts, prev}, prev}
+        else
+          {{ts, val}, val}
+        end
+      end)
+
+    Enum.reject(filled, fn {_ts, v} -> is_nil(v) end)
+  end
+
+  defp parse_step("1m"), do: 60_000
+  defp parse_step("5m"), do: 300_000
+  defp parse_step("15m"), do: 900_000
+  defp parse_step("1h"), do: 3_600_000
+  defp parse_step(str) do
+    cond do
+      String.ends_with?(str, "m") ->
+        str |> String.trim_trailing("m") |> String.to_integer() |> Kernel.*(60_000)
+      String.ends_with?(str, "h") ->
+        str |> String.trim_trailing("h") |> String.to_integer() |> Kernel.*(3_600_000)
+      true ->
+        String.to_integer(str)
+    end
+  end
+end
+```
+
+### Step 6: Database — public API
+
+```elixir
+# lib/chronos/database.ex
+defmodule Chronos.Database do
+  use GenServer
+
+  @moduledoc """
+  Public API for the time-series database.
+  """
+
+  def start_link(opts \\ []) do
+    GenServer.start_link(__MODULE__, opts)
+  end
+
+  @impl true
+  def init(_opts) do
+    Chronos.Chunk.ensure_table()
+    {:ok, %{}}
+  end
+end
+
+defmodule Chronos do
+  @moduledoc "Top-level convenience API for the time-series database."
+
+  @doc "Ingests a single data point."
+  @spec ingest(GenServer.server(), String.t(), map(), float(), integer()) :: :ok
+  def ingest(_db, metric, labels, value, timestamp_ms) do
+    sid = Chronos.Series.series_id(metric, labels)
+    Chronos.Series.index_labels(sid, labels)
+    Chronos.Chunk.append(sid, timestamp_ms, value)
+    :ok
+  end
+
+  @doc "Queries a metric with filters and aggregation."
+  @spec query(GenServer.server(), String.t(), map(), keyword()) :: [{integer(), float()}]
+  def query(_db, metric, labels, opts) do
+    Chronos.QueryEngine.query(metric, labels, opts)
+  end
+end
+```
+
+### Step 7: Given tests — must pass without modification
 
 ```elixir
 # test/chronos/gorilla_test.exs
@@ -232,13 +634,13 @@ defmodule Chronos.QueryTest do
 end
 ```
 
-### Step 6: Run the tests
+### Step 8: Run the tests
 
 ```bash
 mix test test/chronos/ --trace
 ```
 
-### Step 7: Benchmark
+### Step 9: Benchmark
 
 ```elixir
 # bench/chronos_bench.exs

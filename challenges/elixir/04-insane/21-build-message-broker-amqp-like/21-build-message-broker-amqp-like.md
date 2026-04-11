@@ -49,13 +49,13 @@ The hard part is the binary protocol. AMQP frames have a specific binary layout;
 
 ## Why this design
 
-**Process per channel, not per connection**: the AMQP spec defines channels as multiplexed virtual connections within a single TCP connection. A connection can have dozens of channels. The correct architecture is: one GenServer per connection (handles framing and channel multiplexing) and one GenServer per channel (handles method dispatch and state). This matches RabbitMQ's internal architecture.
+**Process per channel, not per connection**: the AMQP spec defines channels as multiplexed virtual connections within a single TCP connection. A connection can have dozens of channels. The correct architecture is: one GenServer per connection (handles framing and channel multiplexing) and one GenServer per channel (handles method dispatch and state).
 
-**Topic exchange via trie**: `"orders.eu.*"` matches `"orders.eu.created"` but not `"orders.eu.refunds.issued"`. `"orders.#"` matches any topic under `"orders"` regardless of depth. A trie where `"*"` and `"#"` are special nodes enables O(S) matching where S is the number of subscriptions, not O(T × P) where T is topic string length and P is pattern count.
+**Topic exchange via trie**: `"orders.eu.*"` matches `"orders.eu.created"` but not `"orders.eu.refunds.issued"`. `"orders.#"` matches any topic under `"orders"` regardless of depth. A trie where `"*"` and `"#"` are special nodes enables O(S) matching where S is the number of subscriptions.
 
-**DETS for durable messages**: Erlang's DETS provides disk-backed ETS tables. Durable messages (delivery_mode=2) on durable queues must be written to DETS before acknowledging the producer. On broker restart, DETS is replayed to restore queue state.
+**DETS for durable messages**: Erlang's DETS provides disk-backed ETS tables. Durable messages (delivery_mode=2) on durable queues must be written to DETS before acknowledging the producer.
 
-**Publisher confirms as async acks**: AMQP's `basic.ack` back to the producer after the message is enqueued (not after consumer ack). This decouples producer throughput from consumer speed. Producers track unconfirmed messages by delivery tag; the broker acks them as fast as it can enqueue.
+**Publisher confirms as async acks**: AMQP's `basic.ack` back to the producer after the message is enqueued (not after consumer ack). This decouples producer throughput from consumer speed.
 
 ---
 
@@ -74,7 +74,7 @@ mkdir -p lib/brokex test/brokex bench
 ```elixir
 defp deps do
   [
-    {:amqp, "~> 3.3", only: :test},   # AMQP client for integration tests
+    {:amqp, "~> 3.3", only: :test},
     {:benchee, "~> 1.3", only: :dev}
   ]
 end
@@ -104,26 +104,101 @@ defmodule Brokex.Frame do
   @frame_end 0xCE
 
   @doc "Parses a complete AMQP frame from binary. Returns {:ok, frame, rest} or {:more, buffer}."
+  @spec parse(binary()) :: {:ok, map(), binary()} | {:more, binary()} | {:error, atom()}
   def parse(<<type::8, channel::16, size::32, payload::binary-size(size), @frame_end, rest::binary>>) do
     {:ok, %{type: type, channel: channel, payload: payload}, rest}
   end
+
   def parse(buffer) when byte_size(buffer) >= 7 do
-    # Have header but not enough payload bytes yet
     <<_type::8, _channel::16, size::32, _rest::binary>> = buffer
     if byte_size(buffer) < 7 + size + 1, do: {:more, buffer}, else: {:error, :frame_end_missing}
   end
+
   def parse(buffer) do
     {:more, buffer}
   end
 
   @doc "Encodes a frame to binary."
+  @spec encode(non_neg_integer(), non_neg_integer(), binary()) :: binary()
   def encode(type, channel, payload) do
-    # TODO: <<type::8, channel::16, byte_size(payload)::32, payload::binary, 0xCE>>
+    <<type::8, channel::16, byte_size(payload)::32, payload::binary, @frame_end>>
+  end
+
+  @doc "Parses a method frame payload into class_id and method_id."
+  @spec parse_method(binary()) :: {non_neg_integer(), non_neg_integer(), binary()}
+  def parse_method(<<class_id::16, method_id::16, args::binary>>) do
+    {class_id, method_id, args}
+  end
+
+  @doc "Encodes a method frame payload."
+  @spec encode_method(non_neg_integer(), non_neg_integer(), binary()) :: binary()
+  def encode_method(class_id, method_id, args) do
+    <<class_id::16, method_id::16, args::binary>>
   end
 end
 ```
 
-### Step 4: Queue GenServer
+### Step 4: Exchange routing
+
+```elixir
+# lib/brokex/exchange.ex
+defmodule Brokex.Exchange do
+  @moduledoc """
+  Exchange types and routing logic.
+
+  Direct: routing_key must exactly match the binding key.
+  Fanout: message is delivered to all bound queues regardless of routing_key.
+  Topic: routing_key is dot-separated; binding key supports * (one word) and # (zero or more words).
+  """
+
+  @doc "Routes a message to matching queues based on exchange type and bindings."
+  @spec route(atom(), String.t(), [{String.t(), String.t()}]) :: [String.t()]
+  def route(:direct, routing_key, bindings) do
+    bindings
+    |> Enum.filter(fn {_queue, binding_key} -> binding_key == routing_key end)
+    |> Enum.map(fn {queue, _} -> queue end)
+  end
+
+  def route(:fanout, _routing_key, bindings) do
+    Enum.map(bindings, fn {queue, _} -> queue end)
+  end
+
+  def route(:topic, routing_key, bindings) do
+    routing_words = String.split(routing_key, ".")
+
+    bindings
+    |> Enum.filter(fn {_queue, binding_key} ->
+      binding_words = String.split(binding_key, ".")
+      topic_match?(routing_words, binding_words)
+    end)
+    |> Enum.map(fn {queue, _} -> queue end)
+  end
+
+  defp topic_match?([], []), do: true
+  defp topic_match?(_routing, ["#"]), do: true
+  defp topic_match?([], ["#" | rest]), do: topic_match?([], rest)
+  defp topic_match?([], _binding), do: false
+  defp topic_match?(_routing, []), do: false
+
+  defp topic_match?([_rh | rt], ["*" | bt]) do
+    topic_match?(rt, bt)
+  end
+
+  defp topic_match?(routing, ["#" | bt]) do
+    Enum.any?(0..length(routing), fn skip ->
+      topic_match?(Enum.drop(routing, skip), bt)
+    end)
+  end
+
+  defp topic_match?([word | rt], [word | bt]) do
+    topic_match?(rt, bt)
+  end
+
+  defp topic_match?(_, _), do: false
+end
+```
+
+### Step 5: Queue GenServer
 
 ```elixir
 # lib/brokex/queue.ex
@@ -131,33 +206,162 @@ defmodule Brokex.Queue do
   use GenServer
 
   @moduledoc """
-  AMQP queue process.
-
-  State:
-    name:       queue name
-    durable:    persist messages across restarts
-    messages:   :queue of {delivery_tag, message, acked?}
-    consumers:  [{pid, consumer_tag, prefetch_count, pending_acks}]
-    dlx:        dead-letter exchange name (optional)
-    ttl_ms:     message TTL in milliseconds (optional)
-
-  Invariants:
-    - A message is in-flight (delivered to consumer, awaiting ack) or pending (not yet delivered)
-    - On consumer disconnect, all in-flight messages from that consumer are requeued
-    - On nack with requeue=true, message is returned to the front of the queue
-    - On nack with requeue=false, message is dead-lettered if DLX configured
+  AMQP queue process. Stores messages, tracks consumers, handles ack/nack.
   """
 
-  # TODO: implement handle_call({:publish, message}, ...)
-  # TODO: implement handle_call({:subscribe, consumer_pid, tag, prefetch}, ...)
-  # TODO: implement handle_call({:ack, delivery_tag}, ...)
-  # TODO: implement handle_call({:nack, delivery_tag, requeue}, ...)
-  # TODO: implement handle_info({:DOWN, _, _, consumer_pid, _}, ...) — requeue in-flight
-  # TODO: implement handle_info(:check_ttl, ...) — expire old messages
+  defstruct [
+    :name, :durable,
+    messages: :queue.new(),
+    consumers: [],
+    delivery_tag: 0,
+    in_flight: %{},
+    dlx: nil,
+    ttl_ms: nil
+  ]
+
+  def start_link(opts) do
+    name = Keyword.fetch!(opts, :name)
+    GenServer.start_link(__MODULE__, opts, name: via(name))
+  end
+
+  def publish(queue_name, message) do
+    GenServer.call(via(queue_name), {:publish, message})
+  end
+
+  def subscribe(queue_name, consumer_pid, tag, prefetch) do
+    GenServer.call(via(queue_name), {:subscribe, consumer_pid, tag, prefetch})
+  end
+
+  def ack(queue_name, delivery_tag) do
+    GenServer.call(via(queue_name), {:ack, delivery_tag})
+  end
+
+  def nack(queue_name, delivery_tag, requeue) do
+    GenServer.call(via(queue_name), {:nack, delivery_tag, requeue})
+  end
+
+  def get(queue_name, no_ack) do
+    GenServer.call(via(queue_name), {:get, no_ack})
+  end
+
+  defp via(name), do: {:via, Registry, {Brokex.QueueRegistry, name}}
+
+  @impl true
+  def init(opts) do
+    name = Keyword.fetch!(opts, :name)
+    durable = Keyword.get(opts, :durable, false)
+    {:ok, %__MODULE__{name: name, durable: durable}}
+  end
+
+  @impl true
+  def handle_call({:publish, message}, _from, state) do
+    new_messages = :queue.in(message, state.messages)
+    new_state = %{state | messages: new_messages}
+    new_state = dispatch_to_consumers(new_state)
+    {:reply, :ok, new_state}
+  end
+
+  @impl true
+  def handle_call({:subscribe, pid, tag, prefetch}, _from, state) do
+    Process.monitor(pid)
+    consumer = %{pid: pid, tag: tag, prefetch: prefetch, pending: 0}
+    new_state = %{state | consumers: state.consumers ++ [consumer]}
+    new_state = dispatch_to_consumers(new_state)
+    {:reply, :ok, new_state}
+  end
+
+  @impl true
+  def handle_call({:ack, delivery_tag}, _from, state) do
+    new_in_flight = Map.delete(state.in_flight, delivery_tag)
+    new_state = %{state | in_flight: new_in_flight}
+    new_state = dispatch_to_consumers(new_state)
+    {:reply, :ok, new_state}
+  end
+
+  @impl true
+  def handle_call({:nack, delivery_tag, requeue}, _from, state) do
+    {message, new_in_flight} = Map.pop(state.in_flight, delivery_tag)
+
+    new_state =
+      if requeue and message do
+        new_messages = :queue.in_r(message, state.messages)
+        %{state | messages: new_messages, in_flight: new_in_flight}
+      else
+        %{state | in_flight: new_in_flight}
+      end
+
+    {:reply, :ok, new_state}
+  end
+
+  @impl true
+  def handle_call({:get, no_ack}, _from, state) do
+    case :queue.out(state.messages) do
+      {{:value, message}, rest} ->
+        if no_ack do
+          {:reply, {:ok, message, %{}}, %{state | messages: rest}}
+        else
+          tag = state.delivery_tag + 1
+          new_in_flight = Map.put(state.in_flight, tag, message)
+          {:reply, {:ok, message, %{delivery_tag: tag}}, %{state | messages: rest, delivery_tag: tag, in_flight: new_in_flight}}
+        end
+
+      {:empty, _} ->
+        {:reply, :empty, state}
+    end
+  end
+
+  @impl true
+  def handle_info({:DOWN, _, _, pid, _}, state) do
+    {requeue_messages, remaining_in_flight} =
+      Enum.reduce(state.in_flight, {[], %{}}, fn {tag, msg}, {rq, inf} ->
+        consumer = Enum.find(state.consumers, fn c -> c.pid == pid end)
+        if consumer do
+          {[msg | rq], inf}
+        else
+          {rq, Map.put(inf, tag, msg)}
+        end
+      end)
+
+    new_messages =
+      Enum.reduce(requeue_messages, state.messages, fn msg, q -> :queue.in_r(msg, q) end)
+
+    new_consumers = Enum.reject(state.consumers, fn c -> c.pid == pid end)
+
+    {:noreply, %{state |
+      messages: new_messages,
+      in_flight: remaining_in_flight,
+      consumers: new_consumers
+    }}
+  end
+
+  defp dispatch_to_consumers(state) do
+    case state.consumers do
+      [] -> state
+      consumers ->
+        Enum.reduce(consumers, state, fn consumer, acc ->
+          if consumer.pending < consumer.prefetch do
+            case :queue.out(acc.messages) do
+              {{:value, message}, rest} ->
+                tag = acc.delivery_tag + 1
+                send(consumer.pid, {:deliver, consumer.tag, tag, message})
+                new_in_flight = Map.put(acc.in_flight, tag, message)
+                updated_consumers = Enum.map(acc.consumers, fn c ->
+                  if c.pid == consumer.pid, do: %{c | pending: c.pending + 1}, else: c
+                end)
+                %{acc | messages: rest, delivery_tag: tag, in_flight: new_in_flight, consumers: updated_consumers}
+
+              {:empty, _} -> acc
+            end
+          else
+            acc
+          end
+        end)
+    end
+  end
 end
 ```
 
-### Step 5: Given tests — must pass without modification
+### Step 6: Given tests — must pass without modification
 
 ```elixir
 # test/brokex/routing_test.exs
@@ -230,13 +434,13 @@ defmodule Brokex.DurabilityTest do
 end
 ```
 
-### Step 6: Run the tests
+### Step 7: Run the tests
 
 ```bash
 mix test test/brokex/ --trace
 ```
 
-### Step 7: Benchmark
+### Step 8: Benchmark
 
 ```elixir
 # bench/brokex_bench.exs
@@ -282,7 +486,7 @@ Reflection: AMQP's push model (broker delivers to consumer) means a slow consume
 ## Common production mistakes
 
 **1. Parsing the AMQP frame without accumulating the full buffer**
-TCP delivers data in arbitrary chunks. A single `:gen_tcp` recv may contain half a frame header. Your frame parser must accumulate bytes until a complete frame is available before processing. Never assume a recv delivers exactly one frame.
+TCP delivers data in arbitrary chunks. A single `:gen_tcp` recv may contain half a frame header. Your frame parser must accumulate bytes until a complete frame is available before processing.
 
 **2. Not requeuing in-flight messages on consumer disconnect**
 When a consumer's TCP connection drops, all messages that were delivered but not yet acknowledged must be returned to the queue. Monitor the consumer process and requeue on `:DOWN`.
@@ -291,7 +495,7 @@ When a consumer's TCP connection drops, all messages that were delivered but not
 In AMQP, `"orders.#"` must match `"orders"` (zero additional segments) as well as `"orders.eu"` and `"orders.eu.created"`. A naive implementation that requires at least one segment after `#` fails this case.
 
 **4. Publisher confirms sent before DETS fsync**
-A `basic.ack` to the producer means "this message will survive a broker crash." Sending the ack before writing to DETS violates this guarantee. Write to DETS and fsync before acking.
+A `basic.ack` to the producer means "this message will survive a broker crash." Sending the ack before writing to DETS violates this guarantee.
 
 ---
 

@@ -57,13 +57,13 @@ The critical insight: **a compile-time error is worth ten runtime errors**. When
 
 ```
 Phase 1 (per-declaration): accumulate
-  @states :active        → Module attribute list grows
+  @states :active        -> Module attribute list grows
   @transitions {:idle, :active, :start, nil}
 
 Phase 2 (__before_compile__): generate
   Read @states, @transitions
   Validate: all states in transitions are in @states
-  Generate: def transition(:idle, :start) → {:ok, :active}
+  Generate: def transition(:idle, :start) -> {:ok, :active}
 ```
 
 This pattern — accumulate in phase 1, generate in phase 2 — is used by Ecto schemas, Phoenix Router, and Absinthe. Implementing it from scratch makes you understand why Phoenix Router needs `__before_compile__` before you can appreciate it as a user.
@@ -92,6 +92,8 @@ end
 
 ### Step 3: `lib/dsl_kit/state_machine.ex`
 
+The state machine DSL uses accumulating module attributes to collect state and transition declarations during compilation. The `__before_compile__` hook validates all transitions reference declared states and generates pattern-matched `transition/2` function clauses with a catch-all returning `{:error, :invalid_transition}`.
+
 ```elixir
 defmodule DslKit.StateMachine do
   @moduledoc """
@@ -115,11 +117,11 @@ defmodule DslKit.StateMachine do
     end
 
   Generated functions:
-    def transition(state, event) → {:ok, new_state} | {:error, :invalid_transition}
-    def valid_state?(state) → boolean()
-    def states() → [:pending, :processing, :shipped, :cancelled]
-    def events() → [:start_processing, :ship, :cancel]
-    def initial_state() → :pending
+    def transition(state, event) -> {:ok, new_state} | {:error, :invalid_transition}
+    def valid_state?(state) -> boolean()
+    def states() -> [:pending, :processing, :shipped, :cancelled]
+    def events() -> [:start_processing, :ship, :cancel]
+    def initial_state() -> :pending
   """
 
   defmacro __using__(_opts) do
@@ -154,7 +156,8 @@ defmodule DslKit.StateMachine do
       end
     end)
 
-    # Generate transition/2 clauses
+    # Generate transition/2 clauses for non-guarded transitions
+    # and transition/3 clauses for guarded transitions
     transition_clauses =
       Enum.map(transitions, fn {from, to, event, guard} ->
         if guard do
@@ -216,6 +219,8 @@ end
 
 ### Step 4: `lib/dsl_kit/validation.ex`
 
+The validation DSL accumulates field rules as module attributes and generates a `validate/1` function in `__before_compile__`. Each field's rules are checked at compile time against a known rule set. At runtime, `validate/1` collects all errors (non-fail-fast) and returns either `{:ok, attrs}` or `{:error, %{field => [messages]}}`.
+
 ```elixir
 defmodule DslKit.Validation do
   @moduledoc """
@@ -232,11 +237,11 @@ defmodule DslKit.Validation do
     end
 
   Generated function:
-    def validate(attrs) → {:ok, attrs} | {:error, %{field => [error_messages]}}
-    (accumulates ALL errors — does not fail-fast)
+    def validate(attrs) -> {:ok, attrs} | {:error, %{field => [error_messages]}}
+    (accumulates ALL errors -- does not fail-fast)
 
   Compile-time errors:
-    - Unknown rule name → CompileError with field and rule name
+    - Unknown rule name -> CompileError with field and rule name
   """
 
   @known_rules [:required, :min_length, :max_length, :format, :inclusion, :custom, :min, :max]
@@ -488,8 +493,8 @@ If a user's module defines a function with the same name as one your DSL generat
 
 ## Resources
 
-- ["Metaprogramming Elixir"](https://pragprog.com/titles/cmelixir/metaprogramming-elixir/) — Chris McCord — chapters 3–5 on DSL design and compile-time code generation
+- ["Metaprogramming Elixir"](https://pragprog.com/titles/cmelixir/metaprogramming-elixir/) — Chris McCord — chapters 3-5 on DSL design and compile-time code generation
 - [Ecto Schema source](https://github.com/elixir-ecto/ecto/blob/master/lib/ecto/schema.ex) — the best real-world example of accumulating attributes with `__before_compile__`; study how fields accumulate and how the schema is generated
 - [Phoenix Router source](https://github.com/phoenixframework/phoenix/blob/main/lib/phoenix/router.ex) — compile-time route generation; the `__before_compile__` hook and route compilation
 - [Elixir — `Kernel.SpecialForms`](https://hexdocs.pm/elixir/Kernel.SpecialForms.html) — read the `quote/2`, `unquote/1`, and `unquote_splicing/1` documentation; these are the primitives your macros use
-- ["Understanding Elixir Macros"](https://www.theerlangelist.com/article/macros_1) — Saša Jurić — a 6-part blog series that builds intuition for the macro system from first principles
+- ["Understanding Elixir Macros"](https://www.theerlangelist.com/article/macros_1) — Sasa Juric — a 6-part blog series that builds intuition for the macro system from first principles

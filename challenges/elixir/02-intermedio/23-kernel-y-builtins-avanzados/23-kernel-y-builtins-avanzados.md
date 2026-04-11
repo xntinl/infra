@@ -1,56 +1,23 @@
 # Kernel and Advanced Builtins
 
-**Project**: `task_queue` — built incrementally across the intermediate level
+## Goal
 
----
-
-## Project context
-
-`task_queue` needs utilities for dynamic job dispatch, deeply nested configuration access, and portable module references. These use cases are perfect for `apply/3`, `get_in/2`, `put_in/3`, `update_in/3`, and `__MODULE__`.
-
-Project structure at this point:
-
-```
-task_queue/
-├── lib/
-│   └── task_queue/
-│       ├── application.ex
-│       ├── worker.ex
-│       ├── queue_server.ex
-│       ├── scheduler.ex            # ← you add dynamic dispatch here
-│       └── registry.ex
-├── test/
-│   └── task_queue/
-│       └── kernel_builtins_test.exs   # given tests — must pass
-└── mix.exs
-```
-
----
-
-## The business problem
-
-Three concrete problems in `task_queue`:
-
-1. **Dynamic dispatch** — job handlers are determined at runtime from job payloads. `apply/3` lets the scheduler call `MyHandler.execute(args)` without knowing the handler at compile time.
-
-2. **Nested config access** — the job registry stores deeply nested metadata: `%{job_id => %{status: :running, meta: %{retries: 2, last_error: nil}}}`. Reading and updating individual fields without pattern-matching boilerplate requires `get_in` and `update_in`.
-
-3. **Portable module references** — every GenServer in `task_queue` uses `__MODULE__` in `start_link` and `child_spec` so that renaming a module never requires hunting down hardcoded references.
+Build a `task_queue` project that uses `apply/3` for dynamic job dispatch, `get_in/2` / `put_in/3` / `update_in/3` for nested config access, and `__MODULE__` for portable module references. These Kernel builtins solve real problems: dispatching to handler modules determined at runtime, reading deeply nested state, and referencing the current module without hardcoding names.
 
 ---
 
 ## Why `apply/3` and not anonymous functions
 
-```
+```elixir
 job_handler = "TaskQueue.Handlers.Email"   # from job payload
-# You cannot write: job_handler.execute(args)  ← syntax error
+# You cannot write: job_handler.execute(args)  <- syntax error
 # apply/3 bridges the gap:
 apply(String.to_existing_atom("Elixir.#{job_handler}"), :execute, [args])
 ```
 
 This is the foundation of plugin systems, command dispatchers, and any architecture where the module to call is determined from data rather than code.
 
-The risk: `String.to_atom/1` creates atoms permanently. Use `String.to_existing_atom/1` — it only succeeds if the atom was already compiled into the VM, preventing atom table exhaustion from untrusted input.
+The risk: `String.to_atom/1` creates atoms permanently. Use `String.to_existing_atom/1` -- it only succeeds if the atom was already compiled into the VM, preventing atom table exhaustion from untrusted input.
 
 ---
 
@@ -59,41 +26,92 @@ The risk: `String.to_atom/1` creates atoms permanently. Use `String.to_existing_
 Pattern matching to read three levels deep is verbose and breaks when the structure changes:
 
 ```elixir
-# Pattern matching — verbose, fragile
+# Pattern matching -- verbose, fragile
 %{^job_id => %{meta: %{retries: retries}}} = registry
-# update is even worse
 
-# get_in/update_in — concise, composable
+# get_in/update_in -- concise, composable
 retries = get_in(registry, [job_id, :meta, :retries])
 new_registry = update_in(registry, [job_id, :meta, :retries], &(&1 + 1))
 ```
-
-When the registry is a list, `Access.all()` lets you batch-update every entry in one expression.
-For a map-based registry, use `Map.new/2` to iterate and rebuild with updated values.
 
 ---
 
 ## Implementation
 
-### Step 1: `lib/task_queue/scheduler.ex` — dynamic dispatch with apply/3
+### Step 1: `mix.exs`
+
+```elixir
+defmodule TaskQueue.MixProject do
+  use Mix.Project
+
+  def project do
+    [
+      app: :task_queue,
+      version: "0.1.0",
+      elixir: "~> 1.15",
+      start_permanent: Mix.env() == :prod,
+      deps: deps()
+    ]
+  end
+
+  def application do
+    [
+      extra_applications: [:logger],
+      mod: {TaskQueue.Application, []}
+    ]
+  end
+
+  defp deps, do: []
+end
+```
+
+### Step 2: `lib/task_queue/application.ex`
+
+```elixir
+defmodule TaskQueue.Application do
+  use Application
+
+  @impl true
+  def start(_type, _args) do
+    children = [
+      TaskQueue.Registry
+    ]
+
+    opts = [strategy: :one_for_one, name: TaskQueue.Supervisor]
+    Supervisor.start_link(children, opts)
+  end
+end
+```
+
+### Step 3: `lib/task_queue/worker.ex` -- handler for dispatch tests
+
+The Worker module implements `execute/1` so that the Scheduler's dynamic dispatch has a known target module to call during tests.
+
+```elixir
+defmodule TaskQueue.Worker do
+  @moduledoc """
+  Processes a single job. Implements execute/1 for dynamic dispatch.
+  """
+
+  @spec execute(map()) :: {:ok, term()} | {:error, term()}
+  def execute(%{type: "noop"}), do: {:ok, :noop}
+  def execute(%{type: "echo", args: args}), do: {:ok, args}
+  def execute(%{}), do: {:error, :missing_required_fields}
+  def execute(_), do: {:error, :invalid_job}
+end
+```
+
+### Step 4: `lib/task_queue/scheduler.ex` -- dynamic dispatch with apply/3
+
+`apply/3` calls a module and function determined at runtime. When the handler name comes from external data (a job payload), `String.to_existing_atom/1` ensures only compiled modules can be invoked. An attacker cannot create new atoms by submitting arbitrary handler names.
 
 ```elixir
 defmodule TaskQueue.Scheduler do
   @moduledoc """
   Dispatches jobs to handler modules determined at runtime.
-
   Handler modules must implement `execute/1`.
-  The handler name is read from the job's `:handler` field.
   """
 
-  @doc """
-  Dispatches a job to its handler module using `apply/3`.
-
-  Returns `{:ok, result}` or `{:error, reason}`.
-
-  The handler is resolved from the job's `:handler` key as a module atom.
-  Only atoms that are already compiled into the VM are accepted.
-  """
   @spec dispatch(map()) :: {:ok, term()} | {:error, term()}
   def dispatch(%{handler: handler_name, args: args}) when is_atom(handler_name) do
     try do
@@ -118,7 +136,7 @@ defmodule TaskQueue.Scheduler do
   def dispatch(_), do: {:error, :invalid_job_format}
 
   @doc """
-  Returns the module name as an atom — useful for logging and child specs.
+  Returns the module name as an atom -- useful for logging and child specs.
 
   ## Examples
 
@@ -130,7 +148,9 @@ defmodule TaskQueue.Scheduler do
 end
 ```
 
-### Step 2: `lib/task_queue/registry.ex` — nested access patterns
+### Step 5: `lib/task_queue/registry.ex` -- nested access patterns
+
+The Registry stores job metadata in a deeply nested map. `get_in/2` reads values at arbitrary depth without pattern matching boilerplate. `update_in/3` and `put_in/3` modify nested values and return the updated structure. `Map.new/2` is used for batch operations across all entries (since `Access.all()` works only on lists, not maps).
 
 ```elixir
 defmodule TaskQueue.Registry do
@@ -164,7 +184,6 @@ defmodule TaskQueue.Registry do
 
   @doc """
   Increments the retry counter for a job and records the error.
-  Returns the updated registry state.
   """
   def record_retry(job_id, error) do
     GenServer.call(__MODULE__, {:record_retry, job_id, error})
@@ -224,7 +243,7 @@ defmodule TaskQueue.Registry do
 end
 ```
 
-### Step 3: Given tests — must pass without modification
+### Step 6: Tests
 
 ```elixir
 # test/task_queue/kernel_builtins_test.exs
@@ -234,7 +253,6 @@ defmodule TaskQueue.KernelBuiltinsTest do
   alias TaskQueue.{Scheduler, Registry}
 
   setup do
-    # Reset registry state between tests
     try do
       GenServer.call(Registry, :reset)
     rescue
@@ -244,9 +262,8 @@ defmodule TaskQueue.KernelBuiltinsTest do
     :ok
   end
 
-  describe "Scheduler.dispatch/1 — apply/3 dispatch" do
+  describe "Scheduler.dispatch/1 -- apply/3 dispatch" do
     test "dispatches to a known handler atom" do
-      # TaskQueue.Worker implements execute/1 for testing
       result = Scheduler.dispatch(%{handler: TaskQueue.Worker, args: %{}})
       assert match?({:ok, _} | {:error, :missing_required_fields}, result)
     end
@@ -261,7 +278,7 @@ defmodule TaskQueue.KernelBuiltinsTest do
     end
   end
 
-  describe "Registry — nested get_in / update_in" do
+  describe "Registry -- nested get_in / update_in" do
     test "get_retries returns 0 for new job" do
       Registry.register("job-1")
       assert Registry.get_retries("job-1") == 0
@@ -292,7 +309,7 @@ defmodule TaskQueue.KernelBuiltinsTest do
 end
 ```
 
-### Step 4: Run the tests
+### Step 7: Run
 
 ```bash
 mix test test/task_queue/kernel_builtins_test.exs --trace
@@ -308,37 +325,35 @@ mix test test/task_queue/kernel_builtins_test.exs --trace
 | `get_in/2` | read nested path | returns `nil` silently if path is missing |
 | `put_in/3` | write nested path | raises if intermediate key is missing |
 | `update_in/3` | transform nested value | same as `put_in` for missing paths |
-| `Access.all()` | batch update elements in a **list** | works on lists only — use `Map.new/2` for maps |
+| `Access.all()` | batch update elements in a **list** | works on lists only -- use `Map.new/2` for maps |
 | `__MODULE__` | self-reference in GenServers | expands at compile time per module scope |
 
-Reflection question: `put_in(user, [:address, :city], "Madrid")` raises if `:address` does not exist. When is this behavior the right default, and when would silent nil insertion be preferable?
-
-Answer: Raising is the right default when you expect the path to exist and a missing intermediate key signals a programming error (e.g., the struct was not initialized correctly). Silent insertion would be preferable when building structures from partial data (like API responses where nested objects may be absent). In that case, use `Map.put_new/3` to create intermediates, or build the nested structure explicitly before calling `put_in`.
+`put_in(user, [:address, :city], "Madrid")` raises if `:address` does not exist. Raising is the right default when you expect the path to exist and a missing intermediate key signals a programming error. Silent insertion would be preferable when building structures from partial data (like API responses where nested objects may be absent).
 
 ---
 
 ## Common production mistakes
 
 **1. `apply/3` with `String.to_atom/1`**
-Atoms are never garbage collected. A job payload from an external source can create unbounded atoms, exhausting the atom table and crashing the VM. Always use `String.to_existing_atom/1`.
+Atoms are never garbage collected. External payloads can exhaust the atom table.
 
 **2. `get_in` with atom keys on a map with string keys**
-`get_in(data, [:name])` returns `nil` on `%{"name" => "Alice"}`. String-keyed maps (typical after JSON decode) require string keys: `get_in(data, ["name"])`.
+`get_in(data, [:name])` returns `nil` on `%{"name" => "Alice"}`. After JSON decode, use string keys.
 
 **3. `put_in` on a path with missing intermediate keys**
-`put_in(%{}, [:a, :b], 1)` raises `KeyError`. Create the intermediate levels first or use `Map.put` for the top level.
+`put_in(%{}, [:a, :b], 1)` raises `KeyError`. Create intermediate levels first.
 
 **4. `__MODULE__` in nested modules**
-Inside `defmodule Outer.Inner`, `__MODULE__` expands to `Outer.Inner`, not `Outer`. This trips developers who copy a GenServer pattern into a nested module expecting the outer name.
+Inside `defmodule Outer.Inner`, `__MODULE__` expands to `Outer.Inner`, not `Outer`.
 
 **5. `update_in` with `Access.all()` on maps**
-`Access.all()` works on lists. On maps, use `Enum.map/2` and rebuild the map, or iterate with `Map.new/2`.
+`Access.all()` works on lists. On maps, use `Map.new/2`.
 
 ---
 
 ## Resources
 
-- [Kernel module — official docs](https://hexdocs.pm/elixir/Kernel.html)
-- [Access module — official docs](https://hexdocs.pm/elixir/Access.html)
-- [apply/3 — Erlang docs](https://www.erlang.org/doc/man/erlang.html#apply-3)
+- [Kernel module -- official docs](https://hexdocs.pm/elixir/Kernel.html)
+- [Access module -- official docs](https://hexdocs.pm/elixir/Access.html)
+- [apply/3 -- Erlang docs](https://www.erlang.org/doc/man/erlang.html#apply-3)
 - [get_in/put_in/update_in guide](https://hexdocs.pm/elixir/Kernel.html#get_in/2)

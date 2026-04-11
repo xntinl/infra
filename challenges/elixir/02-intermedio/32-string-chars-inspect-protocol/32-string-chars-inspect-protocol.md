@@ -1,66 +1,16 @@
 # String.Chars and Inspect Protocols
 
-**Project**: `task_queue` — built incrementally across the intermediate level
+## Goal
 
----
-
-## Project context
-
-`task_queue` logs job execution details, renders job summaries in CLI output, and includes job context in error messages. Currently every log line calls `inspect/1` or manually extracts fields — the resulting strings are verbose, contain internal implementation details, and are inconsistent across modules.
-
-Project structure at this point:
-
-```
-task_queue/
-├── lib/
-│   └── task_queue/
-│       ├── application.ex
-│       ├── job.ex                  # ← you implement String.Chars and Inspect here
-│       ├── worker.ex
-│       ├── queue_server.ex
-│       ├── scheduler.ex
-│       └── registry.ex
-├── test/
-│   └── task_queue/
-│       └── protocol_impl_test.exs  # given tests — must pass without modification
-└─�� mix.exs
-```
-
----
-
-## The business problem
-
-Current log output for a failed job looks like this:
-
-```
-[error] Job failed: %TaskQueue.Job{id: "abc-123", type: "send_email",
-  args: %{to: "user@example.com", subject: "Welcome"}, status: :failed,
-  retry_count: 2, last_error: "timeout", inserted_at: ~U[2024-01-15 10:30:00Z]}
-```
-
-The ops team needs:
-1. **String interpolation** — `"Processing #{job}"` should produce `"Processing send_email:abc-123"` — a compact identifier, not the full struct dump
-2. **Inspectable output** — `inspect(job, pretty: true)` should show only fields relevant for debugging, hiding internal implementation details like raw timestamps
-3. **Consistent format** — job references in logs, error messages, and CLI output must look the same everywhere without manual field extraction
-
----
-
-## Why `String.Chars` and `Inspect` and not `to_string/1` or custom functions
-
-You could define `def job_to_string(job)` in `TaskQueue.Job` and call it everywhere. The problem is that:
-- String interpolation `"#{job}"` calls `to_string(job)` which calls `String.Chars.to_string/1` — if not implemented, it raises `Protocol.UndefinedError`
-- `IO.puts(job)` and `Logger.info(job)` both invoke `String.Chars`
-- `IO.inspect(job)` and `dbg(job)` both invoke `Inspect`
-
-Implementing these protocols means your struct works naturally everywhere strings and inspection are needed — no special function calls required.
+Build a `task_queue` Job struct that implements the `String.Chars` protocol for human-readable string interpolation and the `Inspect` protocol for developer-friendly debug output. Learn why these protocols control how your structs appear in logs, IEx, and error messages.
 
 ---
 
 ## The two protocols
 
-**`String.Chars`** controls what `to_string(value)` and string interpolation `"#{value}"` produce. It should return a human-readable representation suitable for end-user output — not debug output. For `TaskQueue.Job`, this is a compact identifier like `"send_email:abc-123 [failed]"`.
+**`String.Chars`** controls what `to_string(value)` and string interpolation `"#{value}"` produce. It should return a human-readable representation for end-user output. For a Job, this is a compact identifier like `"send_email:abc-123 [failed]"`.
 
-**`Inspect`** controls what `inspect(value)` produces. It is used by IEx, `IO.inspect/2`, and the `dbg/1` macro. It should return a string that could be pasted back into Elixir code and evaluated, or at minimum a clear debug representation. For `TaskQueue.Job`, this is `#TaskQueue.Job<id: "abc-123", type: "send_email", status: :failed>`.
+**`Inspect`** controls what `inspect(value)` produces. It is used by IEx, `IO.inspect/2`, and `dbg/1`. It should return a developer-friendly debug representation. For a Job, this is `#TaskQueue.Job<id: "abc-123", type: "send_email", status: :failed, retries: 2>`.
 
 The key difference: `String.Chars` is for users; `Inspect` is for developers.
 
@@ -68,7 +18,37 @@ The key difference: `String.Chars` is for users; `Inspect` is for developers.
 
 ## Implementation
 
-### Step 1: `lib/task_queue/job.ex` — struct with protocol implementations
+### Step 1: `mix.exs`
+
+```elixir
+defmodule TaskQueue.MixProject do
+  use Mix.Project
+
+  def project do
+    [
+      app: :task_queue,
+      version: "0.1.0",
+      elixir: "~> 1.15",
+      start_permanent: Mix.env() == :prod,
+      deps: deps()
+    ]
+  end
+
+  def application do
+    [extra_applications: [:logger, :crypto]]
+  end
+
+  defp deps, do: []
+end
+```
+
+### Step 2: `lib/task_queue/job.ex` -- struct with protocol implementations
+
+The struct uses `@enforce_keys [:type]` to catch missing required fields at compile time. The `new/2` function generates a random hex ID using `:crypto.strong_rand_bytes/1`.
+
+The `String.Chars` implementation returns a compact `"type:id [status]"` format. If `id` is nil (not yet persisted), it renders as `"new"`.
+
+The `Inspect` implementation uses `Inspect.Algebra.concat/1` to build the output. It deliberately hides `args` (potentially large, may contain secrets) and `scheduled_at` (implementation detail). The field `retry_count` is renamed to `retries` for brevity in debug output.
 
 ```elixir
 defmodule TaskQueue.Job do
@@ -128,12 +108,6 @@ defmodule TaskQueue.Job do
 end
 
 defimpl String.Chars, for: TaskQueue.Job do
-  @doc """
-  Returns a compact human-readable string for the job.
-
-  Format: "{type}:{id} [{status}]"
-  If id is nil, uses "new" as the id placeholder.
-  """
   def to_string(%TaskQueue.Job{id: id, type: type, status: status}) do
     "#{type}:#{id || "new"} [#{status}]"
   end
@@ -142,14 +116,6 @@ end
 defimpl Inspect, for: TaskQueue.Job do
   import Inspect.Algebra
 
-  @doc """
-  Returns a developer-friendly debug representation.
-
-  Shows id, type, status, and retry_count. Hides args (potentially large)
-  and scheduled_at (implementation detail).
-
-  Format: #TaskQueue.Job<id: "abc-123", type: "send_email", status: :failed, retries: 2>
-  """
   def inspect(%TaskQueue.Job{id: id, type: type, status: status, retry_count: retries}, opts) do
     inner =
       Enum.join(
@@ -167,7 +133,7 @@ defimpl Inspect, for: TaskQueue.Job do
 end
 ```
 
-### Step 2: Given tests — must pass without modification
+### Step 3: Tests
 
 ```elixir
 # test/task_queue/protocol_impl_test.exs
@@ -199,7 +165,6 @@ defmodule TaskQueue.ProtocolImplTest do
 
     test "IO.puts does not raise" do
       job = %Job{id: "j2", type: "noop", status: :completed, retry_count: 0}
-      # If String.Chars is not implemented, this raises Protocol.UndefinedError
       assert capture_io(fn -> IO.puts(job) end) =~ "noop:j2"
     end
   end
@@ -242,7 +207,6 @@ defmodule TaskQueue.ProtocolImplTest do
 
     test "IO.inspect returns the job unchanged" do
       job = %Job{id: "j5", type: "noop", status: :pending, retry_count: 0}
-      # IO.inspect returns its argument — this verifies the Inspect protocol works
       assert IO.inspect(job) == job
     end
   end
@@ -265,14 +229,13 @@ defmodule TaskQueue.ProtocolImplTest do
     end
   end
 
-  # Helper for testing IO.puts output
   defp capture_io(fun) do
     ExUnit.CaptureIO.capture_io(fun)
   end
 end
 ```
 
-### Step 3: Run the tests
+### Step 4: Run
 
 ```bash
 mix test test/task_queue/protocol_impl_test.exs --trace
@@ -285,60 +248,36 @@ mix test test/task_queue/protocol_impl_test.exs --trace
 | Approach | String interpolation | Debug output | Hides sensitive fields | Location |
 |----------|---------------------|--------------|----------------------|----------|
 | `String.Chars` + `Inspect` | automatic via `#{}` | automatic via `inspect/1` | yes (Inspect) | protocol implementations |
-| Custom `to_string_job/1` function | must call explicitly | N/A | yes | module function |
-| Default struct inspect | N/A | yes but verbose | no — shows all fields | automatic |
+| Custom `to_string_job/1` | must call explicitly | N/A | yes | module function |
+| Default struct inspect | N/A | yes but verbose | no -- shows all fields | automatic |
 | `@derive [Inspect]` with except | N/A | yes, filtered | yes | module attribute |
 
-Reflection question: `@derive [Inspect, except: [:args, :scheduled_at]]` would hide those fields automatically without a custom implementation. When would you write a full `defimpl Inspect` instead of using `@derive`?
-
-Answer: When you need a custom format that `@derive` cannot produce — for example, the `#TaskQueue.Job<...>` format with `retries:` instead of `retry_count:`, or computing derived fields (like duration from timestamps), or conditionally showing fields based on status. `@derive` only supports `:only` and `:except` for filtering fields; it cannot rename, transform, or conditionally display them.
+`@derive [Inspect, except: [:args, :scheduled_at]]` would hide those fields automatically. Write a full `defimpl Inspect` when you need a custom format that `@derive` cannot produce -- like `#TaskQueue.Job<...>` with `retries:` instead of `retry_count:`, or computing derived fields.
 
 ---
 
 ## Common production mistakes
 
 **1. `String.Chars` returning a binary that includes secrets**
-
-If `args` contains API keys or passwords and your `to_string` includes all args, every log line in production leaks credentials. The `String.Chars` implementation should include only identifier fields.
+If `args` contains API keys, every log line leaks credentials. Only include identifier fields.
 
 **2. Calling `to_string` in `defimpl Inspect`**
-
-The `Inspect` protocol expects a string formatted for developer inspection, not user display. Using `to_string(value)` inside `inspect/2` breaks `IO.inspect` formatting and `dbg` output:
-
-```elixir
-# Wrong — uses String.Chars in Inspect, loses developer context
-def inspect(job, _opts) do
-  to_string(job)
-end
-
-# Right — returns a developer-readable representation
-def inspect(job, opts) do
-  "#TaskQueue.Job<id: #{Kernel.inspect(job.id, opts)}, ...>"
-end
-```
+The `Inspect` protocol expects developer context. Using `to_string(value)` inside `inspect/2` loses developer context.
 
 **3. Raising in `String.Chars` for nil fields**
-
-`to_string/1` is called in string interpolation inside `rescue` clauses and log handlers. If it raises, you lose the original error and see a confusing `Protocol.UndefinedError` or pattern match failure instead.
+`to_string/1` is called in string interpolation inside `rescue` clauses and log handlers. If it raises, you lose the original error.
 
 **4. Not testing with `IO.inspect`**
-
-Your `Inspect` implementation must return the struct unchanged from `IO.inspect/2`. If `inspect/2` returns a string instead of an `Inspect.Algebra` document, `IO.inspect` may not return the original value:
-
-```elixir
-# Test that IO.inspect is identity on your struct
-assert IO.inspect(job) == job
-```
+Your `Inspect` implementation must return the struct unchanged from `IO.inspect/2`.
 
 **5. `@derive Inspect` with `:only` ignoring the `:id` field**
-
-If you use `@derive [Inspect, only: [:type, :status]]` and omit `:id`, debug output is ambiguous — you cannot distinguish two different jobs of the same type and status in IEx.
+Debug output becomes ambiguous -- you cannot distinguish two different jobs of the same type and status.
 
 ---
 
 ## Resources
 
-- [String.Chars protocol — official docs](https://hexdocs.pm/elixir/String.Chars.html)
-- [Inspect protocol — official docs](https://hexdocs.pm/elixir/Inspect.html)
-- [Inspect.Algebra — building custom inspect output](https://hexdocs.pm/elixir/Inspect.Algebra.html)
-- [Implementing protocols — Elixir official guide](https://elixir-lang.org/getting-started/protocols.html)
+- [String.Chars protocol -- official docs](https://hexdocs.pm/elixir/String.Chars.html)
+- [Inspect protocol -- official docs](https://hexdocs.pm/elixir/Inspect.html)
+- [Inspect.Algebra -- building custom inspect output](https://hexdocs.pm/elixir/Inspect.Algebra.html)
+- [Implementing protocols -- Elixir official guide](https://elixir-lang.org/getting-started/protocols.html)

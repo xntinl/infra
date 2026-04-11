@@ -1,37 +1,18 @@
 # Modules and Function Visibility: The payments_cli API Surface
 
-**Project**: `payments_cli` — built incrementally across the basic level
+**Project**: `payments_cli` — a CLI tool that processes payment transactions
 
 ---
 
 ## Project context
 
-You're building `payments_cli`. The system has grown to eight modules. This exercise
-focuses on designing the module boundaries — what is public, what is private, how
-modules reference each other, and how documentation becomes a first-class artifact.
+You are building `payments_cli`, a CLI tool that processes payment transactions from CSV
+files, validates them, applies business rules, and produces ledger reports.
 
-Project structure at this point:
-
-```
-payments_cli/
-├── lib/
-│   └── payments_cli/
-│       ├── cli.ex          # public API: main/1
-│       ├── transaction.ex  # public API: classify_status/1, parse_status/1, etc.
-│       ├── ledger.ex       # public API: sum_amounts/1, calculate_fee/2, etc.
-│       ├── formatter.ex    # public API: parse_csv_line/1, truncate_merchant/2, etc.
-│       ├── pipeline.ex     # public API: process_line/1, process_batch/1
-│       ├── processor.ex    # public API: apply_rules/2, update_transaction/2
-│       ├── router.ex       # public API: route/1, validate/1, process/1
-│       ├── analytics.ex    # public API: revenue_stats/1, top_merchants/2, etc.
-│       ├── report.ex       # public API: summary/1, merchant_report/2, etc.
-│       ├── rules.ex        # public API: make_fee_calculator/2, etc.
-│       └── config.ex       # ← you implement this
-├── test/
-│   └── payments_cli/
-│       └── config_test.exs  # given tests — must pass without modification
-└── mix.exs
-```
+This exercise implements a `Config` module that demonstrates module design decisions:
+what is public vs private, how module attributes work as compile-time constants, how
+documentation becomes a first-class artifact with doctests, and how validated constructors
+enforce configuration invariants. The module is completely self-contained.
 
 ---
 
@@ -44,15 +25,15 @@ Every `defp` is an implementation detail you can change freely.
 The decision "should this be `def` or `defp`?" is not about access control in the
 OO sense. It is about: **what is the stable interface, and what is the implementation?**
 
-In payments_cli, the modules expose different surfaces:
-- `CLI` exposes `main/1` — the entire public API is one function
-- `Ledger` exposes arithmetic functions — a stable math library
-- `Pipeline` exposes `process_line/1` and `process_batch/1` — the entry points
-- `Router` exposes routing and validation — business logic contracts
+In a payments CLI, modules expose different surfaces:
+- A `CLI` module might expose only `main/1` — the entire public API is one function
+- A `Ledger` module exposes arithmetic functions — a stable math library
+- A `Pipeline` module exposes `process_line/1` and `process_batch/1` — the entry points
+- A `Router` module exposes routing and validation — business logic contracts
 
-The internal helpers (`validate_transaction/1` in `Pipeline`, `build_csv_lines/2`
-in `Ledger`) should be `defp`. If you make them `def` "just in case", you've created
-accidental contracts that you cannot change without checking all callers.
+Internal helpers (like validation or CSV line building) should be `defp`. If you make
+them `def` "just in case", you've created accidental contracts that you cannot change
+without checking all callers.
 
 Module attributes (`@`) are compile-time constants — not runtime variables. They are
 ideal for configuration constants, version strings, and magic numbers that should
@@ -66,8 +47,8 @@ Implement a `Config` module that:
 
 1. Exposes typed access to processing configuration (module attributes + public functions)
 2. Documents all configuration options with `@doc` and doctests
-3. Uses `alias` to cleanly reference other `payments_cli` modules
-4. Provides a validation function for configuration correctness
+3. Provides a validated constructor for configuration maps
+4. Keeps validation logic private — it is an implementation detail
 
 ---
 
@@ -87,8 +68,7 @@ defmodule PaymentsCli.Config do
   Central configuration for the payments_cli processing system.
 
   All configuration values have documented defaults and validation.
-  Use `PaymentsCli.Config.new/1` to create validated configurations,
-  then pass the config struct (exercise 15) or map to processing functions.
+  Use `PaymentsCli.Config.new/1` to create validated configurations.
 
   ## Usage
 
@@ -247,7 +227,7 @@ end
   in the function head and uses `in` to check membership. The `in` operator works
   on lists and is O(n), but for a short list of 5 currencies, this is negligible.
 
-### Given tests — must pass without modification
+### Tests
 
 ```elixir
 # test/payments_cli/config_test.exs

@@ -1,43 +1,34 @@
 # Umbrella Application with Domain Separation
 
-**Project**: `api_gateway` — built incrementally across the advanced level
+## Overview
 
----
+Restructure an API gateway codebase into an umbrella application with three sub-applications
+and enforced unidirectional dependencies. The core domain logic, the HTTP API layer, and the
+background workers are separated into independent apps that compile with enforced boundaries.
 
-## Project context
-
-The `api_gateway` project has grown. The same codebase now contains routing logic,
-rate-limiting, circuit breakers, authentication, and background jobs. The boundaries between
-layers are becoming unclear — a worker is importing from the router, the router has Ecto
-queries inline. You need to restructure as an umbrella application with enforced separation.
-
-This exercise extracts the existing code into three sub-applications with unidirectional
-dependencies.
-
-Project structure after this exercise:
+Project structure:
 
 ```
 api_gateway_umbrella/
 ├── apps/
 │   ├── gateway_core/               # domain + Ecto + business logic
 │   │   ├── lib/gateway_core/
-│   │   │   ├── clients/            # Client schema, context
-│   │   │   ├── rate_limiter/       # ETS rate limiter (from exercise 71)
-│   │   │   ├── cache/              # ETS cache (from exercise 43)
-│   │   │   └── repo.ex
+│   │   │   ├── clients/
+│   │   │   ├── repo.ex
+│   │   │   └── release.ex
 │   │   └── test/
-│   ├── gateway_api/                # Phoenix HTTP API — depends on core
+│   ├── gateway_api/                # Phoenix HTTP API -- depends on core
 │   │   ├── lib/gateway_api_web/
 │   │   │   ├── router.ex
 │   │   │   ├── controllers/
 │   │   │   └── plugs/
 │   │   └── test/
-│   └── gateway_workers/            # Oban workers — depends on core
+│   └── gateway_workers/            # Oban workers -- depends on core
 │       ├── lib/gateway_workers/
 │       │   └── workers/
 │       └── test/
 ├── config/
-│   ├── config.exs                  # shared config for all apps
+│   ├── config.exs
 │   ├── dev.exs
 │   ├── test.exs
 │   └── runtime.exs
@@ -48,10 +39,11 @@ api_gateway_umbrella/
 
 ## The business problem
 
-Two teams now contribute to `api_gateway`: the platform team (routing, auth, rate limiting)
-and the analytics team (audit logs, usage reports). Their code keeps colliding. You need:
+Two teams contribute to the gateway: the platform team (routing, auth, rate limiting)
+and the analytics team (audit logs, usage reports). Their code keeps colliding. The project
+needs:
 
-1. Enforced compilation boundaries — `gateway_api` cannot import from `gateway_workers`
+1. Enforced compilation boundaries -- `gateway_api` cannot import from `gateway_workers`
 2. A single shared database configuration without duplication
 3. One `mix test` from the root that runs all three test suites in dependency order
 4. One `mix release` that produces a single deployable artifact
@@ -60,24 +52,24 @@ and the analytics team (audit logs, usage reports). Their code keeps colliding. 
 
 ## Why umbrella and not microservices
 
-Microservices communicate over the network — every call serializes, deserializes, and
+Microservices communicate over the network -- every call serializes, deserializes, and
 traverses TCP. For components that call each other hundreds of times per request, this
 is unacceptable latency. Umbrella apps share the same BEAM VM: a call from `gateway_api`
 to `gateway_core` is a local function call with no serialization overhead.
 
 The boundary enforcement is architectural (dependency declarations in `mix.exs`), not
 physical. If you later need independent scaling, you can split the umbrella into separate
-releases or separate repositories with minimal changes to the code.
+releases or repositories with minimal changes.
 
 ---
 
-## Dependency graph — unidirectional
+## Dependency graph -- unidirectional
 
 ```
 gateway_api     ──depends on──> gateway_core
 gateway_workers ──depends on──> gateway_core
                                       ^
-                  (NO reverse dependency — core never imports from api or workers)
+                  (NO reverse dependency -- core never imports from api or workers)
 ```
 
 `mix deps.tree` must show no cycles. Violating this rule (core importing from api) is a
@@ -160,7 +152,7 @@ defmodule GatewayCore.MixProject do
 end
 ```
 
-### Step 4: `gateway_api/mix.exs` — depends on core
+### Step 4: `gateway_api/mix.exs` -- depends on core
 
 ```elixir
 defmodule GatewayApi.MixProject do
@@ -184,13 +176,13 @@ defmodule GatewayApi.MixProject do
     [
       {:phoenix, "~> 1.7"},
       {:phoenix_live_view, "~> 0.20"},
-      {:gateway_core, in_umbrella: true}   # intra-umbrella dep
+      {:gateway_core, in_umbrella: true}
     ]
   end
 end
 ```
 
-### Step 5: `gateway_workers/mix.exs` — depends on core
+### Step 5: `gateway_workers/mix.exs` -- depends on core
 
 ```elixir
 defmodule GatewayWorkers.MixProject do
@@ -212,7 +204,7 @@ defmodule GatewayWorkers.MixProject do
 
   defp deps do
     [
-      {:gateway_core, in_umbrella: true}   # intra-umbrella dep
+      {:gateway_core, in_umbrella: true}
     ]
   end
 end
@@ -257,7 +249,7 @@ if config_env() == :prod do
 end
 ```
 
-### Step 7: Domain — `gateway_core`
+### Step 7: Domain -- `gateway_core`
 
 ```elixir
 # apps/gateway_core/lib/gateway_core/clients/client.ex
@@ -287,8 +279,10 @@ end
 defmodule GatewayCore.Clients do
   alias GatewayCore.{Repo, Clients.Client}
 
+  @spec get_by_api_key(String.t()) :: Client.t() | nil
   def get_by_api_key(key), do: Repo.get_by(Client, api_key: key, active: true)
 
+  @spec create(map()) :: {:ok, Client.t()} | {:error, Ecto.Changeset.t()}
   def create(attrs) do
     %Client{}
     |> Client.changeset(attrs)
@@ -302,6 +296,7 @@ end
 defmodule GatewayCore.Release do
   @app :gateway_core
 
+  @doc "Run pending migrations. Called via eval in deployment scripts."
   def migrate do
     load_app()
     for repo <- repos() do
@@ -309,6 +304,7 @@ defmodule GatewayCore.Release do
     end
   end
 
+  @doc "Roll back to a specific migration version."
   def rollback(version) do
     load_app()
     {:ok, _, _} = Ecto.Migrator.with_repo(hd(repos()), &Ecto.Migrator.run(&1, :down, to: version))
@@ -319,7 +315,7 @@ defmodule GatewayCore.Release do
 end
 ```
 
-### Step 8: API layer — `gateway_api`
+### Step 8: API layer -- `gateway_api`
 
 ```elixir
 # apps/gateway_api/lib/gateway_api_web/plugs/authenticate.ex
@@ -356,14 +352,11 @@ defmodule GatewayApiWeb.Router do
     get  "/clients/me",      ClientController, :show
   end
 
-  # Health check — no auth
   get "/health", GatewayApiWeb.HealthController, :index
 end
 ```
 
-### Step 9: Workers — `gateway_workers`
-
-The workers from exercise 46 move here unchanged. Their only dependency is `gateway_core`.
+### Step 9: Workers -- `gateway_workers`
 
 ```elixir
 # apps/gateway_workers/lib/gateway_workers/workers/audit_worker.ex
@@ -411,7 +404,6 @@ defmodule ApiGatewayUmbrella.ClientRequestFlowTest do
 
     assert conn.status == 200
 
-    # Verify audit job was enqueued
     use Oban.Testing, repo: GatewayCore.Repo
     assert_enqueued(worker: GatewayWorkers.Workers.AuditWorker,
                     args: %{"client_id" => client.id})
@@ -422,7 +414,6 @@ end
 ### Step 11: Run everything
 
 ```bash
-# From the umbrella root:
 mix deps.get
 mix ecto.setup
 mix test
@@ -433,8 +424,6 @@ mix deps.tree    # verify: no cycles
 
 ## Trade-off analysis
 
-Fill in this table.
-
 | Aspect | Umbrella | Monolith (single app) | Separate repos (microservices) |
 |--------|---------|-----------------------|-------------------------------|
 | Compile boundary enforcement | mix.exs deps | none | network contract |
@@ -443,10 +432,6 @@ Fill in this table.
 | Shared DB transactions | yes | yes | no (distributed transactions) |
 | Test isolation | per-app ExUnit suites | single suite | separate CI pipelines |
 | Code sharing | in_umbrella dep | implicit | versioned package |
-
-Reflection: `gateway_core` contains Oban as a dependency so that workers can use
-`GatewayCore.Repo`. But `gateway_api` doesn't need Oban — it's an indirect transitive dep.
-How would you restructure to avoid that? (Hint: what if workers declared the Repo themselves?)
 
 ---
 
@@ -457,22 +442,22 @@ Each sub-app's `mix.exs` points to `config_path: "../../config/config.exs"`. If 
 DB config in `apps/gateway_core/config/config.exs`, it won't be visible to `gateway_api`.
 
 **2. Forgetting `build_path`, `deps_path`, `lockfile` in sub-app `mix.exs`**
-Without these, each sub-app uses its own `_build`, `deps`, and `mix.lock` — defeating the
+Without these, each sub-app uses its own `_build`, `deps`, and `mix.lock` -- defeating the
 purpose of the umbrella. All four paths must point to the umbrella root.
 
 **3. Circular dependencies**
 `gateway_core` importing `GatewayApiWeb.Endpoint` to broadcast PubSub events is a cycle.
-Use Phoenix.PubSub directly (it's a shared dep) — `gateway_api` subscribes, `gateway_core`
-publishes via the PubSub server name.
+Use Phoenix.PubSub directly -- `gateway_api` subscribes, `gateway_core` publishes via the
+PubSub server name.
 
 **4. Running `mix test` inside a sub-app without proper DataCase**
 The `GatewayCore.Repo` sandbox must be started for integration tests. Run `mix test` from
-the umbrella root — it sets up the full application before running any test suite.
+the umbrella root -- it sets up the full application before running any test suite.
 
 ---
 
 ## Resources
 
-- [Mix Umbrella projects](https://hexdocs.pm/mix/Mix.html#module-umbrella-projects) — official docs
-- [Boundary library](https://github.com/sasa1977/boundary) — compile-time enforcement of cross-app deps
-- [Programming Phoenix — Pragprog](https://pragprog.com/titles/phoenix14/programming-phoenix-1-4/) — umbrella chapter
+- [Mix Umbrella projects](https://hexdocs.pm/mix/Mix.html#module-umbrella-projects) -- official docs
+- [Boundary library](https://github.com/sasa1977/boundary) -- compile-time enforcement of cross-app deps
+- [Programming Phoenix -- Pragprog](https://pragprog.com/titles/phoenix14/programming-phoenix-1-4/) -- umbrella chapter

@@ -395,7 +395,6 @@ defmodule Locksmith.Quorum do
       epoch = System.monotonic_time(:millisecond)
       results = broadcast({:try_acquire, name, holder, ttl_ms, epoch}, nodes)
 
-      # Pair each result with the node that produced it for targeted rollback
       node_results = Enum.zip(nodes, results)
 
       granted =
@@ -406,12 +405,6 @@ defmodule Locksmith.Quorum do
         end)
 
       if length(granted) >= quorum_size do
-        {_node, {:granted, lease}} =
-          Enum.find(granted, fn
-            {_, {:granted, _}} -> true
-            {_, {:reentrant, _}} -> true
-          end)
-
         lease_to_return =
           case Enum.find(granted, fn {_, {tag, _}} -> tag == :granted end) do
             {_, {:granted, l}} -> l
@@ -600,7 +593,6 @@ defmodule Locksmith.Election do
 
   @impl true
   def handle_info(:heartbeat, state) do
-    # Not leader anymore, ignore stale heartbeat
     {:noreply, state}
   end
 
@@ -741,7 +733,6 @@ defmodule Locksmith.ConcurrentTest do
   test "lock is released when holder process dies" do
     lock_name = "test-expire-#{System.unique_integer()}"
 
-    # Acquire lock in a spawned process, then kill it
     holder = spawn(fn ->
       {:ok, lease} = Quorum.acquire(lock_name, self(), 30_000)
       receive do
@@ -750,12 +741,10 @@ defmodule Locksmith.ConcurrentTest do
     end)
 
     Process.sleep(50)
-    # Verify lock is held
     assert {:error, :locked} = Quorum.acquire(lock_name, self(), 5_000)
 
-    # Kill holder — TTL expiry or monitor should release
     Process.exit(holder, :kill)
-    Process.sleep(1_100)  # Wait for expiry check (1s interval)
+    Process.sleep(1_100)
 
     assert {:ok, _lease} = Quorum.acquire(lock_name, self(), 5_000)
   end
@@ -765,12 +754,9 @@ defmodule Locksmith.ConcurrentTest do
     {:ok, lease1} = Quorum.acquire(lock_name, self(), 30_000)
     {:ok, lease2} = Quorum.acquire(lock_name, self(), 30_000)
 
-    # First release decrements count
     assert :ok = Quorum.release(lease2)
-    # Lock still held (count == 1)
     assert {:error, :locked} = Task.async(fn -> Quorum.acquire(lock_name, self(), 1_000) end) |> Task.await()
 
-    # Second release frees the lock
     assert :ok = Quorum.release(lease1)
     Process.sleep(50)
     assert {:ok, _} = Quorum.acquire(lock_name, self(), 5_000)
@@ -799,7 +785,7 @@ defmodule Locksmith.WatchTest do
   test "watch receives :expired event when TTL passes" do
     lock_name = "watch-expire-#{System.unique_integer()}"
     Locksmith.LockManager.watch(lock_name, self(), [:expired])
-    Locksmith.Quorum.acquire(lock_name, self(), 500)  # 500ms TTL
+    Locksmith.Quorum.acquire(lock_name, self(), 500)
     assert_receive {:lock_event, ^lock_name, :expired, _}, 2_000
   end
 end
@@ -809,8 +795,6 @@ defmodule Locksmith.QuorumTest do
   use ExUnit.Case, async: false
 
   test "acquire fails if quorum cannot be reached (insufficient nodes)" do
-    # Simulate a 1-node cluster (only self, no peers)
-    # With quorum_size=2, this should fail
     assert {:error, :insufficient_nodes} =
       Locksmith.Quorum.test_acquire_with_nodes("test-quorum", self(), [], 2)
   end

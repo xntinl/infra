@@ -1,36 +1,19 @@
 # Pipe Operator: Transaction Processing Pipelines
 
-**Project**: `payments_cli` — built incrementally across the basic level
+**Project**: `payments_cli` — a CLI tool that processes payment transactions
 
 ---
 
 ## Project context
 
-You're building `payments_cli`. The reporting system chains many transformation
-steps: parse, validate, enrich, filter, aggregate, format. Without `|>`, each step
-becomes a nested function call. The pipe operator makes the data flow explicit and
-readable — but only when used with discipline.
+You are building `payments_cli`, a CLI tool that processes payment transactions from CSV
+files, validates them, applies business rules, and produces ledger reports.
 
-Project structure at this point:
-
-```
-payments_cli/
-├── lib/
-│   └── payments_cli/
-│       ├── cli.ex
-│       ├── transaction.ex
-│       ├── ledger.ex
-│       ├── formatter.ex
-│       ├── pipeline.ex
-│       ├── processor.ex
-│       ├── router.ex
-│       ├── analytics.ex
-│       └── report.ex       # ← you implement this
-├── test/
-│   └── payments_cli/
-│       └── report_test.exs  # given tests — must pass without modification
-└── mix.exs
-```
+This exercise implements a `Report` module that generates formatted transaction reports
+by composing transformation pipelines with the `|>` operator. Each report type is a
+pipeline from raw transactions to a formatted string. The module is completely
+self-contained — it defines all analytics, formatting, and report generation functions
+it needs.
 
 ---
 
@@ -67,11 +50,9 @@ a pipeline from raw transactions to a formatted string.
 ### `lib/payments_cli/report.ex`
 
 Each public function is a pipeline: transactions in, formatted string out. Private
-helpers handle the individual transformation steps. `compute_summary_stats/1` and
-`format_summary/1` are given — they demonstrate how to name sub-pipelines for clarity.
-
-The key discipline: each step transforms data, returns a value, and is independently
-testable. No step has side effects. The pipe makes the data flow visible.
+helpers handle the individual transformation steps. The key discipline: each step
+transforms data, returns a value, and is independently testable. No step has side
+effects. The pipe makes the data flow visible.
 
 ```elixir
 defmodule PaymentsCli.Report do
@@ -81,8 +62,6 @@ defmodule PaymentsCli.Report do
   Each public function is a pipeline: transactions in, formatted string out.
   The pipe operator makes each step explicit and independently testable.
   """
-
-  alias PaymentsCli.Analytics
 
   @doc """
   Generates a summary report for a list of transactions.
@@ -121,7 +100,7 @@ defmodule PaymentsCli.Report do
   @spec merchant_report([map()], pos_integer()) :: String.t()
   def merchant_report(transactions, top_n \\ 10) when is_list(transactions) do
     transactions
-    |> Analytics.top_merchants(top_n)
+    |> top_merchants(top_n)
     |> Enum.map(fn {merchant, total_cents} -> format_merchant_line(merchant, total_cents) end)
     |> then(fn lines -> ["=== Merchant Report ===" | lines] end)
     |> Enum.join("\n")
@@ -159,7 +138,7 @@ defmodule PaymentsCli.Report do
   @spec daily_report([map()]) :: String.t()
   def daily_report(transactions) when is_list(transactions) do
     transactions
-    |> Analytics.daily_totals()
+    |> daily_totals()
     |> Enum.sort_by(fn {date, _} -> date end)
     |> add_trend_indicators()
     |> Enum.map(&format_daily_line/1)
@@ -170,6 +149,28 @@ defmodule PaymentsCli.Report do
   # ---------------------------------------------------------------------------
   # Private helpers — each one does one thing
   # ---------------------------------------------------------------------------
+
+  @spec top_merchants([map()], pos_integer()) :: [{String.t(), integer()}]
+  defp top_merchants(transactions, n) do
+    transactions
+    |> Enum.filter(fn tx -> tx.status == :approved end)
+    |> Enum.group_by(fn tx -> tx.merchant end)
+    |> Enum.map(fn {merchant, txs} ->
+      {merchant, txs |> Enum.map(& &1.amount_cents) |> Enum.sum()}
+    end)
+    |> Enum.sort_by(fn {merchant, total} -> {-total, merchant} end)
+    |> Enum.take(n)
+  end
+
+  @spec daily_totals([map()]) :: [{String.t(), integer()}]
+  defp daily_totals(transactions) do
+    transactions
+    |> Enum.filter(fn tx -> tx.status == :approved end)
+    |> Enum.group_by(fn tx -> tx.date end)
+    |> Enum.map(fn {date, txs} ->
+      {date, txs |> Enum.map(& &1.amount_cents) |> Enum.sum()}
+    end)
+  end
 
   @spec transaction_to_csv_line(map()) :: String.t()
   defp transaction_to_csv_line(%{id: id, amount_cents: a, currency: c, status: s} = tx) do
@@ -200,17 +201,15 @@ defmodule PaymentsCli.Report do
     pct = round((current - prev) / prev * 100)
 
     if pct >= 0 do
-      "↑ #{pct}%"
+      "\u2191 #{pct}%"
     else
-      "↓ #{abs(pct)}%"
+      "\u2193 #{abs(pct)}%"
     end
   end
 
   @spec format_daily_line({String.t(), integer(), String.t()}) :: String.t()
   defp format_daily_line({date, total_cents, ""}) do
-    dollars = div(total_cents, 100)
-    cents = rem(total_cents, 100)
-    "#{date}: $#{dollars}.#{String.pad_leading(Integer.to_string(cents), 2, "0")}"
+    "#{date}: #{format_dollars(total_cents)}"
   end
 
   defp format_daily_line({date, total_cents, trend}) do
@@ -219,9 +218,7 @@ defmodule PaymentsCli.Report do
   end
 
   defp format_merchant_line(merchant, total_cents) do
-    dollars = div(total_cents, 100)
-    cents = rem(total_cents, 100)
-    "#{merchant}: $#{dollars}.#{String.pad_leading(Integer.to_string(cents), 2, "0")} total"
+    "#{merchant}: #{format_dollars(total_cents)} total"
   end
 
   defp compute_summary_stats(transactions) do
@@ -239,9 +236,7 @@ defmodule PaymentsCli.Report do
   end
 
   defp format_summary(%{total: t, approved: a, approved_total: at, declined: d, flagged: f}) do
-    dollars = div(at, 100)
-    cents = rem(at, 100)
-    amount_str = "$#{dollars}.#{String.pad_leading(Integer.to_string(cents), 2, "0")}"
+    amount_str = format_dollars(at)
 
     """
     === Transaction Summary ===
@@ -252,6 +247,12 @@ defmodule PaymentsCli.Report do
     """
     |> String.trim_trailing()
   end
+
+  defp format_dollars(cents) do
+    dollars = div(cents, 100)
+    minor = rem(cents, 100)
+    "$#{dollars}.#{String.pad_leading(Integer.to_string(minor), 2, "0")}"
+  end
 end
 ```
 
@@ -260,7 +261,7 @@ end
 - `summary/1` is a two-step pipeline: compute stats, then format. Each step is a
   named private function, making the pipeline self-documenting.
 
-- `merchant_report/2` chains `Analytics.top_merchants/2` (which returns `[{name, total}]`),
+- `merchant_report/2` chains `top_merchants/2` (which returns `[{name, total}]`),
   maps each to a formatted line, prepends the header using `then/2`, and joins with
   newlines. `then/2` is used because the transformation (prepending a header) does not
   fit the pipe pattern — the header is not an argument to a function that takes the
@@ -273,7 +274,7 @@ end
   change from prior day), formats each line, and joins. The `add_trend_indicators/1`
   helper tracks the previous day's total to compute percent change.
 
-### Given tests — must pass without modification
+### Tests
 
 ```elixir
 # test/payments_cli/report_test.exs

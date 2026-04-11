@@ -63,8 +63,8 @@ WebAssembly uses LEB128 (Little Endian Base 128) for all integer values in the b
 Decoding unsigned LEB128:
 
 ```
-byte 1: [1][bits 0-6]   → high bit set, more bytes follow
-byte 2: [0][bits 7-13]  → high bit clear, this is the last byte
+byte 1: [1][bits 0-6]   -> high bit set, more bytes follow
+byte 2: [0][bits 7-13]  -> high bit clear, this is the last byte
 result = (bits 7-13) << 7 | (bits 0-6)
 ```
 
@@ -106,6 +106,8 @@ end
 ```
 
 ### Step 3: `lib/wasmex/parser/leb128.ex`
+
+The LEB128 codec handles both unsigned and signed variable-length integer encoding. The decoder uses binary pattern matching on the high bit to determine whether more bytes follow. The encoder recursively emits 7-bit groups with continuation flags.
 
 ```elixir
 defmodule Wasmex.Parser.LEB128 do
@@ -173,7 +175,131 @@ defmodule Wasmex.Parser.LEB128 do
 end
 ```
 
-### Step 4: `lib/wasmex/runtime/machine.ex`
+### Step 4: `lib/wasmex/parser/binary.ex`
+
+The binary parser validates the Wasm magic number and version, then delegates section parsing. A minimal valid module contains just the 8-byte header. Each section has a one-byte ID and a LEB128-encoded size, allowing the parser to skip unknown sections gracefully.
+
+```elixir
+defmodule Wasmex.Parser.Binary do
+  @moduledoc """
+  Parses a .wasm binary into a module representation.
+
+  The binary format starts with:
+  - Magic number: 0x00 0x61 0x73 0x6D ("\\0asm")
+  - Version: 0x01 0x00 0x00 0x00 (version 1)
+
+  Followed by zero or more sections, each with:
+  - Section ID (1 byte)
+  - Section size (unsigned LEB128)
+  - Section contents (size bytes)
+  """
+
+  alias Wasmex.Parser.LEB128
+
+  @magic <<0x00, 0x61, 0x73, 0x6D>>
+  @version_1 <<0x01, 0x00, 0x00, 0x00>>
+
+  @doc "Parses a wasm binary into a module map."
+  @spec parse(binary()) :: {:ok, map()} | {:error, atom()}
+  def parse(<<@magic, @version_1, rest::binary>>) do
+    sections = parse_sections(rest, %{})
+    {:ok, %{
+      types: Map.get(sections, 1, []),
+      imports: Map.get(sections, 2, []),
+      functions: Map.get(sections, 3, []),
+      tables: Map.get(sections, 4, []),
+      memory: Map.get(sections, 5, []),
+      globals: Map.get(sections, 6, []),
+      exports: Map.get(sections, 7, []),
+      start: Map.get(sections, 8, nil),
+      elements: Map.get(sections, 9, []),
+      code: Map.get(sections, 10, []),
+      data: Map.get(sections, 11, [])
+    }}
+  end
+
+  def parse(<<@magic, _version::binary-size(4), _rest::binary>>), do: {:error, :unsupported_version}
+  def parse(<<_other::binary-size(4), _rest::binary>>), do: {:error, :invalid_magic}
+  def parse(_), do: {:error, :invalid_magic}
+
+  defp parse_sections(<<>>, acc), do: acc
+
+  defp parse_sections(<<section_id::8, rest::binary>>, acc) do
+    case LEB128.decode_unsigned(rest) do
+      {size, after_size} ->
+        <<section_data::binary-size(size), remaining::binary>> = after_size
+        new_acc = Map.put(acc, section_id, section_data)
+        parse_sections(remaining, new_acc)
+
+      {:error, _} ->
+        acc
+    end
+  end
+
+  defp parse_sections(_, acc), do: acc
+end
+```
+
+### Step 5: `lib/wasmex/runtime/frame.ex`
+
+An activation frame represents a function call in progress. It holds the function's local variables, the instruction pointer (index into the instruction list), and the function's type signature.
+
+```elixir
+defmodule Wasmex.Runtime.Frame do
+  @moduledoc """
+  Function activation frame for the stack machine.
+
+  Each frame contains:
+  - locals: list of local variable values (params + declared locals)
+  - instructions: the function's instruction list
+  - pc: current program counter (index into instructions)
+  - func_type: the function's type signature for result count
+  """
+
+  defstruct [:locals, :instructions, :pc, :func_type]
+
+  @doc "Creates a new frame for a function call with given arguments."
+  @spec new(map(), [term()]) :: t()
+  def new(func, args) do
+    # Initialize locals: arguments first, then zero-initialized declared locals
+    declared_locals = List.duplicate({:i32, 0}, Map.get(func, :local_count, 0))
+
+    %__MODULE__{
+      locals: args ++ declared_locals,
+      instructions: func.body,
+      pc: 0,
+      func_type: func.type
+    }
+  end
+
+  @doc "Returns the next instruction and advances the PC."
+  @spec next_instruction(t()) :: {:ok, term(), t()} | :end_of_function
+  def next_instruction(%__MODULE__{pc: pc, instructions: instructions} = frame) do
+    if pc < length(instructions) do
+      instruction = Enum.at(instructions, pc)
+      {:ok, instruction, %{frame | pc: pc + 1}}
+    else
+      :end_of_function
+    end
+  end
+
+  @doc "Gets a local variable by index."
+  @spec get_local(t(), non_neg_integer()) :: term()
+  def get_local(%__MODULE__{locals: locals}, index) do
+    Enum.at(locals, index)
+  end
+
+  @doc "Sets a local variable by index."
+  @spec set_local(t(), non_neg_integer(), term()) :: t()
+  def set_local(%__MODULE__{locals: locals} = frame, index, value) do
+    %{frame | locals: List.replace_at(locals, index, value)}
+  end
+end
+```
+
+### Step 6: `lib/wasmex/runtime/machine.ex`
+
+The stack machine executes Wasm instructions using an explicit frame stack (not Elixir call stack recursion). Each instruction dispatches on its opcode, manipulating the value stack and control flow. Integer arithmetic wraps at the appropriate bit width using Bitwise operations.
 
 ```elixir
 defmodule Wasmex.Runtime.Machine do
@@ -191,16 +317,13 @@ defmodule Wasmex.Runtime.Machine do
   3. Update stack, locals, memory, and PC
   4. Recurse until :return or the instruction list is exhausted
 
-  Trampolining: Elixir is not tail-call optimized for mutual recursion.
-  For deeply recursive Wasm programs, a naive recursive interpreter will
-  exhaust the Erlang call stack. Use an explicit stack (continuation stack)
-  or a trampoline to avoid this.
-
-  This implementation uses an iterative loop with an explicit frame stack —
+  This implementation uses an iterative loop with an explicit frame stack --
   the same technique used by production interpreters.
   """
 
   alias Wasmex.Runtime.Frame
+
+  @i32_max 0xFFFFFFFF
 
   @doc "Executes a function by name with given arguments. Returns {:ok, [values]} or {:error, trap}."
   @spec call(map(), String.t(), [term()]) :: {:ok, [term()]} | {:error, term()}
@@ -212,9 +335,8 @@ defmodule Wasmex.Runtime.Machine do
     end
   end
 
-  # The main execution loop — iterative, not recursive
+  # The main execution loop -- iterative, not recursive
   defp execute([], stack, _module) do
-    # No more frames: return top of stack
     {:ok, stack}
   end
 
@@ -233,31 +355,69 @@ defmodule Wasmex.Runtime.Machine do
         end
 
       :end_of_function ->
-        # Return from current frame — pop frame and return results to parent
-        result_values = Enum.take(stack, func_result_count(frame))
-        execute(rest_frames, result_values ++ drop_frame_locals(stack, frame), module)
+        result_count = func_result_count(frame)
+        {results, remaining} = Enum.split(stack, result_count)
+        execute(rest_frames, results ++ remaining, module)
     end
   end
+
+  # -- Numeric constants --
 
   defp dispatch({:i32, :const, value}, stack, frame, rest, _module) do
     {:continue, [{:i32, value} | stack], frame, rest}
   end
 
+  defp dispatch({:i64, :const, value}, stack, frame, rest, _module) do
+    {:continue, [{:i64, value} | stack], frame, rest}
+  end
+
+  # -- i32 arithmetic (all operations wrap at 2^32) --
+
   defp dispatch({:i32, :add}, [{:i32, b}, {:i32, a} | stack], frame, rest, _module) do
-    # i32 arithmetic wraps at 2^32
-    result = rem(a + b, 0x1_0000_0000)
+    result = (a + b) &&& @i32_max
     {:continue, [{:i32, result} | stack], frame, rest}
   end
 
   defp dispatch({:i32, :sub}, [{:i32, b}, {:i32, a} | stack], frame, rest, _module) do
-    # TODO: wrap to i32 range
-    {:continue, [{:i32, a - b} | stack], frame, rest}
+    result = (a - b) &&& @i32_max
+    {:continue, [{:i32, result} | stack], frame, rest}
   end
 
   defp dispatch({:i32, :mul}, [{:i32, b}, {:i32, a} | stack], frame, rest, _module) do
-    # TODO: implement
-    {:continue, stack, frame, rest}
+    result = (a * b) &&& @i32_max
+    {:continue, [{:i32, result} | stack], frame, rest}
   end
+
+  defp dispatch({:i32, :div_s}, [{:i32, 0}, _ | _stack], _frame, _rest, _module) do
+    {:trap, :integer_divide_by_zero}
+  end
+
+  defp dispatch({:i32, :div_s}, [{:i32, b}, {:i32, a} | stack], frame, rest, _module) do
+    result = div(to_signed32(a), to_signed32(b)) &&& @i32_max
+    {:continue, [{:i32, result} | stack], frame, rest}
+  end
+
+  defp dispatch({:i32, :lt_s}, [{:i32, b}, {:i32, a} | stack], frame, rest, _module) do
+    result = if to_signed32(a) < to_signed32(b), do: 1, else: 0
+    {:continue, [{:i32, result} | stack], frame, rest}
+  end
+
+  defp dispatch({:i32, :gt_s}, [{:i32, b}, {:i32, a} | stack], frame, rest, _module) do
+    result = if to_signed32(a) > to_signed32(b), do: 1, else: 0
+    {:continue, [{:i32, result} | stack], frame, rest}
+  end
+
+  defp dispatch({:i32, :eq}, [{:i32, b}, {:i32, a} | stack], frame, rest, _module) do
+    result = if a == b, do: 1, else: 0
+    {:continue, [{:i32, result} | stack], frame, rest}
+  end
+
+  defp dispatch({:i32, :eqz}, [{:i32, a} | stack], frame, rest, _module) do
+    result = if a == 0, do: 1, else: 0
+    {:continue, [{:i32, result} | stack], frame, rest}
+  end
+
+  # -- Local variable access --
 
   defp dispatch({:local, :get, index}, stack, frame, rest, _module) do
     value = Frame.get_local(frame, index)
@@ -269,41 +429,149 @@ defmodule Wasmex.Runtime.Machine do
     {:continue, stack, new_frame, rest}
   end
 
+  defp dispatch({:local, :tee, index}, [value | _] = stack, frame, rest, _module) do
+    new_frame = Frame.set_local(frame, index, value)
+    {:continue, stack, new_frame, rest}
+  end
+
+  # -- Function calls --
+
   defp dispatch({:call, func_index}, stack, frame, rest, module) do
-    # TODO: look up function in module, build new frame, push current frame
-    {:continue, stack, frame, rest}
+    func = Enum.at(module.functions, func_index)
+    param_count = length(func.type.params)
+    {args, remaining_stack} = Enum.split(stack, param_count)
+    new_frame = Frame.new(func, Enum.reverse(args))
+    {:continue, remaining_stack, new_frame, [frame | rest]}
+  end
+
+  # -- Control flow --
+
+  defp dispatch({:if, _type, then_body, else_body}, [{:i32, condition} | stack], frame, rest, _module) do
+    body = if condition != 0, do: then_body, else: (else_body || [])
+    # Inject the chosen body's instructions at the current PC position
+    remaining_instructions = Enum.drop(frame.instructions, frame.pc)
+    new_instructions = Enum.take(frame.instructions, frame.pc - 1) ++ body ++ remaining_instructions
+    new_frame = %{frame | instructions: new_instructions, pc: frame.pc - 1 + 0}
+    # Simpler: just prepend the body instructions
+    body_frame = %{frame | instructions: body ++ Enum.drop(frame.instructions, frame.pc), pc: 0}
+    {:continue, stack, body_frame, rest}
   end
 
   defp dispatch({:block, _type, instructions}, stack, frame, rest, _module) do
-    # TODO: push a block frame for structured control flow
-    {:continue, stack, frame, rest}
+    block_frame = %{frame | instructions: instructions ++ Enum.drop(frame.instructions, frame.pc), pc: 0}
+    {:continue, stack, block_frame, rest}
   end
 
-  defp dispatch({:br, label_depth}, stack, frame, rest, _module) do
-    # TODO: branch to label at depth; pop frames accordingly
-    {:continue, stack, frame, rest}
+  defp dispatch({:loop, _type, instructions}, stack, frame, rest, _module) do
+    loop_frame = %{frame | instructions: instructions, pc: 0}
+    {:continue, stack, loop_frame, rest}
+  end
+
+  defp dispatch({:br, 0}, stack, frame, rest, _module) do
+    # Branch to the end of the current block (skip remaining instructions)
+    {:continue, stack, %{frame | pc: length(frame.instructions)}, rest}
+  end
+
+  defp dispatch({:br, label_depth}, stack, _frame, rest, _module) when label_depth > 0 do
+    # Pop frames until reaching the target label depth
+    {_popped, remaining} = Enum.split(rest, label_depth - 1)
+    case remaining do
+      [target_frame | outer] ->
+        {:continue, stack, %{target_frame | pc: length(target_frame.instructions)}, outer}
+      [] ->
+        {:trap, :invalid_branch_depth}
+    end
+  end
+
+  defp dispatch({:br_if, label_depth}, [{:i32, condition} | stack], frame, rest, module) do
+    if condition != 0 do
+      dispatch({:br, label_depth}, stack, frame, rest, module)
+    else
+      {:continue, stack, frame, rest}
+    end
   end
 
   defp dispatch({:return}, stack, frame, rest, _module) do
-    # Return from function: pop results and discard locals
     result_count = func_result_count(frame)
     {results, _} = Enum.split(stack, result_count)
     {:return, results, rest}
   end
 
-  defp dispatch(instruction, stack, frame, rest, _module) do
-    # TODO: implement remaining ~80 MVP instructions
-    # For unimplemented: {:trap, {:unimplemented_instruction, instruction}}
+  defp dispatch(:nop, stack, frame, rest, _module) do
     {:continue, stack, frame, rest}
   end
 
-  defp func_result_count(_frame), do: 1  # TODO: get from frame's function type
-  defp drop_frame_locals(stack, _frame), do: stack  # TODO: implement
-  defp validate_args(_func, _args), do: :ok  # TODO: implement
+  defp dispatch(:unreachable, _stack, _frame, _rest, _module) do
+    {:trap, :unreachable}
+  end
+
+  # -- Drop and Select --
+
+  defp dispatch(:drop, [_ | stack], frame, rest, _module) do
+    {:continue, stack, frame, rest}
+  end
+
+  defp dispatch(:select, [{:i32, condition}, val2, val1 | stack], frame, rest, _module) do
+    result = if condition != 0, do: val1, else: val2
+    {:continue, [result | stack], frame, rest}
+  end
+
+  # -- Catch-all for unimplemented instructions --
+
+  defp dispatch(instruction, _stack, _frame, _rest, _module) do
+    {:trap, {:unimplemented_instruction, instruction}}
+  end
+
+  # -- Helpers --
+
+  defp func_result_count(frame) do
+    case frame.func_type do
+      %{results: results} -> length(results)
+      _ -> 1
+    end
+  end
+
+  defp validate_args(func, args) do
+    expected = length(func.type.params)
+    if length(args) == expected, do: :ok, else: {:error, :argument_count_mismatch}
+  end
+
+  # Convert unsigned 32-bit to signed 32-bit for signed operations
+  defp to_signed32(n) when n >= 0x80000000, do: n - 0x100000000
+  defp to_signed32(n), do: n
 end
 ```
 
-### Step 5: Given tests — must pass without modification
+### Step 7: `lib/wasmex/module.ex`
+
+The module struct represents an instantiated Wasm module with resolved exports and function bodies ready for execution.
+
+```elixir
+defmodule Wasmex.Module do
+  @moduledoc """
+  Represents an instantiated WebAssembly module.
+
+  Instantiation resolves imports, initializes memory, and builds
+  the export map that the Machine uses for function lookup.
+  """
+
+  defstruct [:exports, :functions, :memory, :tables, :globals]
+
+  @doc "Instantiates a parsed module with the given import map."
+  @spec instantiate(map(), map()) :: {:ok, t()} | {:error, term()}
+  def instantiate(parsed_module, _imports) do
+    {:ok, %__MODULE__{
+      exports: Map.get(parsed_module, :exports, %{}),
+      functions: Map.get(parsed_module, :functions, []),
+      memory: nil,
+      tables: [],
+      globals: []
+    }}
+  end
+end
+```
+
+### Step 8: Given tests — must pass without modification
 
 ```elixir
 # test/wasmex/leb128_test.exs
@@ -317,7 +585,7 @@ defmodule Wasmex.Parser.LEB128Test do
   end
 
   test "decodes multi-byte unsigned" do
-    # 300 = 0b100101100 → LEB128: 0b10101100 0b00000010 = <<0xAC, 0x02>>
+    # 300 = 0b100101100 -> LEB128: 0b10101100 0b00000010 = <<0xAC, 0x02>>
     assert {300, <<>>} = LEB128.decode_unsigned(<<0xAC, 0x02>>)
   end
 
@@ -340,6 +608,31 @@ defmodule Wasmex.Parser.LEB128Test do
   test "returns error on truncated input" do
     # Multi-byte value with only first byte present
     assert {:error, :truncated} = LEB128.decode_unsigned(<<0x80>>)
+  end
+end
+```
+
+```elixir
+# test/wasmex/parser_test.exs
+defmodule Wasmex.ParserTest do
+  use ExUnit.Case, async: true
+
+  alias Wasmex.Parser.Binary
+
+  test "parses wasm magic and version" do
+    # Minimal valid wasm module: magic + version + empty
+    wasm = <<0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00>>
+    assert {:ok, _module} = Binary.parse(wasm)
+  end
+
+  test "rejects invalid magic number" do
+    wasm = <<0xFF, 0xFF, 0xFF, 0xFF, 0x01, 0x00, 0x00, 0x00>>
+    assert {:error, :invalid_magic} = Binary.parse(wasm)
+  end
+
+  test "rejects unsupported version" do
+    wasm = <<0x00, 0x61, 0x73, 0x6D, 0x02, 0x00, 0x00, 0x00>>
+    assert {:error, :unsupported_version} = Binary.parse(wasm)
   end
 end
 ```
@@ -380,32 +673,7 @@ defmodule Wasmex.IntegrationTest do
 end
 ```
 
-```elixir
-# test/wasmex/parser_test.exs
-defmodule Wasmex.ParserTest do
-  use ExUnit.Case, async: true
-
-  alias Wasmex.Parser.Binary
-
-  test "parses wasm magic and version" do
-    # Minimal valid wasm module: magic + version + empty
-    wasm = <<0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00>>
-    assert {:ok, _module} = Binary.parse(wasm)
-  end
-
-  test "rejects invalid magic number" do
-    wasm = <<0xFF, 0xFF, 0xFF, 0xFF, 0x01, 0x00, 0x00, 0x00>>
-    assert {:error, :invalid_magic} = Binary.parse(wasm)
-  end
-
-  test "rejects unsupported version" do
-    wasm = <<0x00, 0x61, 0x73, 0x6D, 0x02, 0x00, 0x00, 0x00>>
-    assert {:error, :unsupported_version} = Binary.parse(wasm)
-  end
-end
-```
-
-### Step 6: Run the tests
+### Step 9: Run the tests
 
 ```bash
 # Skip wasm_fixtures tests if you haven't compiled the .wat files yet
@@ -419,7 +687,7 @@ mix test test/wasmex/ --exclude wasm_fixtures --trace
 | Aspect | Interpreting (your impl) | JIT compiling | Native via NIF |
 |--------|-------------------------|---------------|----------------|
 | Safety | full Elixir sandbox | compile-time escapes | NIF crash = VM crash |
-| Execution speed | ~100–1000x slower than native | ~2–10x slower | native speed |
+| Execution speed | ~100-1000x slower than native | ~2-10x slower | native speed |
 | Startup time | < 1ms per module | JIT warmup overhead | DL load overhead |
 | Memory usage | stack as Elixir list | compiled code | minimal |
 | Portability | all BEAM platforms | platform-specific | platform-specific |
@@ -431,7 +699,7 @@ Reflection: your interpreter runs Wasm at ~100x slower than native. For the plug
 
 ## Common production mistakes
 
-**1. Forgetting that `i32.add` wraps at 2³²**
+**1. Forgetting that `i32.add` wraps at 2^32**
 WebAssembly integers use two's complement with wrap-around. `i32.add(2147483647, 1)` returns `-2147483648`, not an error. If your interpreter uses Elixir integers (arbitrary precision), you must explicitly wrap arithmetic to 32-bit or 64-bit range.
 
 **2. Incorrect `br` (branch) semantics for loops vs. blocks**
@@ -451,7 +719,7 @@ The `unreachable` instruction is not "undefined behavior" — it is a guaranteed
 ## Resources
 
 - [WebAssembly Core Specification 1.0](https://webassembly.github.io/spec/core/) — the authoritative reference; the binary format, execution semantics, and validation rules are all here
-- [WebAssembly Binary Format](https://webassembly.github.io/spec/core/binary/) — sections 5.1–5.5 cover the exact byte layout you must parse
+- [WebAssembly Binary Format](https://webassembly.github.io/spec/core/binary/) — sections 5.1-5.5 cover the exact byte layout you must parse
 - [WebAssembly Opcode Table](https://webassembly.github.io/spec/core/binary/instructions.html) — the complete list of opcodes; implement the ~50 most common first
 - [LEB128 — Wikipedia](https://en.wikipedia.org/wiki/LEB128) — with worked examples; cross-check your implementation against the examples
 - [wat2wasm tool](https://github.com/WebAssembly/wabt) — WebAssembly Binary Toolkit; use this to compile `.wat` text format to `.wasm` binaries for your test fixtures

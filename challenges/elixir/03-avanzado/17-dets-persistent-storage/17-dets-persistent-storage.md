@@ -1,17 +1,13 @@
 # DETS: Persistent Storage
 
-**Project**: `api_gateway` — built incrementally across the advanced level
-
----
-
 ## Project context
 
-You're building `api_gateway`. The gateway now has in-memory rate limits and caches,
-but every restart loses all configuration. The platform team needs route-level config
-(custom rate limits, backend URLs, feature flags) to survive node restarts without
-requiring an external database.
+You are building `api_gateway`, an internal HTTP gateway that routes traffic to microservices.
+This exercise focuses on making route-level configuration (custom rate limits, backend URLs,
+feature flags) survive node restarts without requiring an external database, and on building
+a two-level cache with a persistent L2 layer.
 
-Project structure at this point:
+Project structure:
 
 ```
 api_gateway/
@@ -19,8 +15,6 @@ api_gateway/
 │   └── api_gateway/
 │       ├── application.ex
 │       ├── router.ex
-│       ├── rate_limiter/
-│       ├── metrics/
 │       └── config/
 │           ├── store.ex
 │           └── persistent_cache.ex
@@ -62,10 +56,10 @@ the whole file, and updates are in-place. The API is nearly identical to ETS.
 
 DETS has hard limits that make it unsuitable as a primary data store:
 
-- **2 GB per file** — no workaround, it's a format constraint
-- **No `:ordered_set` type** — no range queries
-- **No concurrent writers** — file-level lock serializes all writes
-- **`insert/2` does not guarantee durability** — data goes to an OS buffer first;
+- **2 GB per file** -- no workaround, it's a format constraint
+- **No `:ordered_set` type** -- no range queries
+- **No concurrent writers** -- file-level lock serializes all writes
+- **`insert/2` does not guarantee durability** -- data goes to an OS buffer first;
   only `sync/1` or the `auto_save` timer writes to disk. A crash between insert and
   sync loses the data.
 
@@ -84,10 +78,10 @@ defmodule ApiGateway.Config.Store do
   Persistent key-value store for gateway route configuration.
 
   Backed by DETS for durability. All writes go through the GenServer to
-  serialize access. Reads go directly to DETS — DETS has its own file lock
+  serialize access. Reads go directly to DETS -- DETS has its own file lock
   and is safe for concurrent reads.
 
-  Key format: {namespace, key} — e.g., {:rate_limits, "/api/users"}
+  Key format: {namespace, key} -- e.g., {:rate_limits, "/api/users"}
   This namespacing allows querying all entries for a given domain
   (all rate limits, all backends) without a full table scan.
   """
@@ -210,16 +204,16 @@ defmodule ApiGateway.Config.PersistentCache do
   @moduledoc """
   Two-level cache for upstream responses.
 
-  L1: ETS (:public, read_concurrency: true) — nanosecond reads, lost on restart
-  L2: DETS — microsecond reads, survives restart
+  L1: ETS (:public, read_concurrency: true) -- nanosecond reads, lost on restart
+  L2: DETS -- microsecond reads, survives restart
 
-  Read path: L1 hit → return. L1 miss → L2 lookup → warm L1 → return.
+  Read path: L1 hit -> return. L1 miss -> L2 lookup -> warm L1 -> return.
   Write path: write both L1 and L2 simultaneously.
   Expiry: stored as {value, expires_at_ms} in both layers. Lazy eviction on read.
 
   L1 uses System.monotonic_time because it only needs to measure duration within
   a single process lifetime. L2 uses System.os_time because monotonic_time resets
-  on restart — a value stored before restart would appear expired immediately if
+  on restart -- a value stored before restart would appear expired immediately if
   compared against the new monotonic clock.
   """
 
@@ -252,7 +246,7 @@ defmodule ApiGateway.Config.PersistentCache do
   end
 
   # ---------------------------------------------------------------------------
-  # Private read helpers — bypass GenServer entirely
+  # Private read helpers -- bypass GenServer entirely
   # ---------------------------------------------------------------------------
 
   defp l1_get(key) do
@@ -272,14 +266,14 @@ defmodule ApiGateway.Config.PersistentCache do
 
     case :dets.lookup(@l2_table, key) do
       [{^key, value, expires_at}] when expires_at > now_os ->
-        # L2 hit and not expired — warm L1 with remaining TTL
+        # L2 hit and not expired -- warm L1 with remaining TTL
         remaining_ttl = expires_at - now_os
         l1_expires = System.monotonic_time(:millisecond) + remaining_ttl
         :ets.insert(@l1_table, {key, value, l1_expires})
         {:ok, value}
 
       [{^key, _value, _expired}] ->
-        # L2 hit but expired — lazy evict from L2
+        # L2 hit but expired -- lazy evict from L2
         :dets.delete(@l2_table, key)
         :miss
 
@@ -355,7 +349,7 @@ defmodule ApiGateway.Config.PersistentCache do
 end
 ```
 
-### Step 3: Given tests — must pass without modification
+### Step 3: Tests
 
 ```elixir
 # test/api_gateway/config/store_test.exs
@@ -495,7 +489,7 @@ mix test test/api_gateway/config/ --trace
 | Aspect | DETS | ETS + DETS (L1/L2) | Mnesia (disc_copies) | PostgreSQL |
 |--------|------|-------------------|---------------------|------------|
 | Durability | Per auto_save or explicit sync | L2 durable, L1 lost on crash | Per transaction | Per commit |
-| Read latency | µs (disk I/O) | ns for L1 hit, µs for L2 miss | µs (RAM copy) | ms (network + disk) |
+| Read latency | us (disk I/O) | ns for L1 hit, us for L2 miss | us (RAM copy) | ms (network + disk) |
 | Max size | 2 GB per file | 2 GB for L2 | RAM + disk (no hard limit) | Unlimited |
 | Concurrent writes | Serialized (file lock) | GenServer serializes | Transactional | Transactional |
 | Range queries | No (no `:ordered_set`) | No | Yes (QLC) | Yes (SQL) |
@@ -511,7 +505,7 @@ Reflection: the `PersistentCache` uses `System.monotonic_time` for L1 TTL and
 
 **1. Not calling `terminate/2` before the process dies**
 If the GenServer dies without calling `:dets.close/1`, DETS marks the file as needing
-repair. On the next startup, repair runs automatically — and it can take 10–30 seconds
+repair. On the next startup, repair runs automatically -- and it can take 10-30 seconds
 for large files. Always implement `terminate/2`.
 
 **2. Treating `insert/2` as durable**
@@ -537,6 +531,6 @@ or an external store well before hitting the limit.
 
 ## Resources
 
-- [Erlang DETS documentation](https://www.erlang.org/doc/man/dets.html) — `open_file`, `auto_save`, `repair` options
-- [DETS vs ETS comparison — Erlang efficiency guide](https://www.erlang.org/doc/efficiency_guide/tablesDatabases.html)
-- [Erlang in Anger — Fred Hebert](https://www.erlang-in-anger.com/) — storage patterns in production (free PDF)
+- [Erlang DETS documentation](https://www.erlang.org/doc/man/dets.html) -- `open_file`, `auto_save`, `repair` options
+- [DETS vs ETS comparison -- Erlang efficiency guide](https://www.erlang.org/doc/efficiency_guide/tablesDatabases.html)
+- [Erlang in Anger -- Fred Hebert](https://www.erlang-in-anger.com/) -- storage patterns in production (free PDF)

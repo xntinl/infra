@@ -1,33 +1,18 @@
 # Functions and Arity: The Transaction Module API
 
-**Project**: `payments_cli` — built incrementally across the basic level
+**Project**: `payments_cli` — a CLI tool that processes payment transactions
 
 ---
 
 ## Project context
 
-You're building `payments_cli`. The `Transaction` module needs a well-designed
-public API: functions that clearly express their intent through multiple clauses,
-guards, and arity conventions. This exercise is about what makes a function
-interface good in Elixir.
+You are building `payments_cli`, a CLI tool that processes payment transactions from CSV
+files, validates them, applies business rules, and produces ledger reports.
 
-Project structure at this point:
-
-```
-payments_cli/
-├── lib/
-│   └── payments_cli/
-│       ├── cli.ex
-│       ├── transaction.ex   # ← you extend this
-│       ├── ledger.ex
-│       ├── formatter.ex
-│       ├── pipeline.ex
-│       └── processor.ex
-├── test/
-│   └── payments_cli/
-│       └── transaction_api_test.exs  # given tests — must pass without modification
-└── mix.exs
-```
+This exercise implements a `Transaction` module with a well-designed public API that
+demonstrates multiple function clauses, guards, arity conventions, and default arguments.
+The module is completely self-contained — it defines all status classification, comparison,
+description, and formatting functions from scratch.
 
 ---
 
@@ -61,7 +46,7 @@ than as a long `cond` block.
 
 ## The business problem
 
-Extend the `Transaction` module with a complete API:
+The `Transaction` module needs a complete API:
 
 1. Describe a transaction for logging (multiple clauses by status)
 2. Determine if a transaction is reversible (guard-based business rule)
@@ -72,7 +57,7 @@ Extend the `Transaction` module with a complete API:
 
 ## Implementation
 
-### Extend `lib/payments_cli/transaction.ex`
+### `lib/payments_cli/transaction.ex`
 
 Each function demonstrates a different aspect of Elixir's function design.
 `describe/1` uses one clause per status — each case is isolated, testable, and
@@ -82,153 +67,207 @@ and `compare/3` show arity-based differentiation. `label/1` and `label/2` use a
 default argument with a header declaration required by multiple clauses.
 
 ```elixir
-# Add to PaymentsCli.Transaction
+defmodule PaymentsCli.Transaction do
+  @moduledoc """
+  Represents a payment transaction and provides a rich API for
+  status classification, comparison, description, and formatting.
 
-@doc """
-Returns a human-readable log description for a transaction.
+  Status atoms are the canonical representation internally.
+  """
 
-Uses multiple clauses — one per status — so each case is explicit.
-A catch-all handles statuses added in the future without breaking existing code.
+  @valid_statuses [:pending, :approved, :declined, :reversed, :flagged]
 
-## Examples
+  @doc """
+  Returns the list of valid transaction statuses.
+  """
+  @spec valid_statuses() :: [atom()]
+  def valid_statuses, do: @valid_statuses
 
-    iex> PaymentsCli.Transaction.describe(%{id: "T1", status: :approved, amount_cents: 1000, currency: "USD"})
-    "T1: approved USD 10.00"
+  @doc """
+  Classifies a transaction status atom into a reporting category string.
 
-    iex> PaymentsCli.Transaction.describe(%{id: "T2", status: :declined, amount_cents: 500, currency: "USD"})
-    "T2: DECLINED (amount: USD 5.00)"
+  ## Examples
 
-"""
-@spec describe(map()) :: String.t()
-def describe(%{id: id, status: :approved, amount_cents: cents, currency: currency}) do
-  "#{id}: approved #{format_display(cents, currency)}"
-end
+      iex> PaymentsCli.Transaction.classify_status(:approved)
+      "successful"
 
-def describe(%{id: id, status: :declined, amount_cents: cents, currency: currency}) do
-  "#{id}: DECLINED (amount: #{format_display(cents, currency)})"
-end
+      iex> PaymentsCli.Transaction.classify_status(:declined)
+      "failed"
 
-def describe(%{id: id, status: :flagged, amount_cents: cents, currency: currency}) do
-  "#{id}: FLAGGED FOR REVIEW — #{format_display(cents, currency)}"
-end
+  """
+  @spec classify_status(atom()) :: String.t()
+  def classify_status(:approved), do: "successful"
+  def classify_status(:reversed), do: "successful"
+  def classify_status(:declined), do: "failed"
+  def classify_status(:flagged), do: "under_review"
+  def classify_status(:pending), do: "pending"
+  def classify_status(_unknown), do: "unknown"
 
-def describe(%{id: id, status: :reversed, amount_cents: cents, currency: currency}) do
-  "#{id}: reversed #{format_display(cents, currency)}"
-end
+  @doc """
+  Parses a status string from external input into a status atom.
 
-def describe(%{id: id, status: status}) do
-  "#{id}: #{status}"
-end
+  Returns {:ok, atom} for known statuses, {:error, :unknown_status} for anything else.
+  Uses String.to_existing_atom/1 so it NEVER creates new atoms from external input.
+  """
+  @spec parse_status(String.t()) :: {:ok, atom()} | {:error, :unknown_status}
+  def parse_status(string) when is_binary(string) do
+    atom =
+      try do
+        String.to_existing_atom(string)
+      rescue
+        ArgumentError -> nil
+      end
 
-@doc """
-Returns true if a transaction can be reversed.
-
-Business rules:
-- Only :approved transactions can be reversed
-- Amount must be positive (> 0)
-- Uses guards so the rule is enforced at the function head, not in the body
-
-## Examples
-
-    iex> PaymentsCli.Transaction.reversible?(%{status: :approved, amount_cents: 1000})
-    true
-
-    iex> PaymentsCli.Transaction.reversible?(%{status: :declined, amount_cents: 1000})
-    false
-
-"""
-@spec reversible?(map()) :: boolean()
-def reversible?(%{status: :approved, amount_cents: cents}) when cents > 0, do: true
-def reversible?(_), do: false
-
-@doc """
-Compares two transactions by amount.
-
-Returns :gt, :lt, or :eq.
-
-reversible?/1 and compare/2 demonstrate arity-based differentiation:
-compare/2 takes two transactions; compare/3 takes two transactions and a field.
-
-## Examples
-
-    iex> t1 = %{amount_cents: 1000}
-    iex> t2 = %{amount_cents: 500}
-    iex> PaymentsCli.Transaction.compare(t1, t2)
-    :gt
-
-"""
-@spec compare(map(), map()) :: :gt | :lt | :eq
-def compare(%{amount_cents: a}, %{amount_cents: b}) do
-  cond do
-    a > b -> :gt
-    a < b -> :lt
-    true  -> :eq
+    if atom in @valid_statuses do
+      {:ok, atom}
+    else
+      {:error, :unknown_status}
+    end
   end
-end
 
-@doc """
-Compares two transactions by a specified field.
+  @doc """
+  Returns a human-readable log description for a transaction.
 
-The field must exist in both transactions and must be comparable.
+  Uses multiple clauses — one per status — so each case is explicit.
+  A catch-all handles statuses added in the future without breaking existing code.
 
-## Examples
+  ## Examples
 
-    iex> t1 = %{amount_cents: 1000, id: "TXN002"}
-    iex> t2 = %{amount_cents: 500,  id: "TXN001"}
-    iex> PaymentsCli.Transaction.compare(t1, t2, :id)
-    :gt
+      iex> PaymentsCli.Transaction.describe(%{id: "T1", status: :approved, amount_cents: 1000, currency: "USD"})
+      "T1: approved USD 10.00"
 
-"""
-@spec compare(map(), map(), atom()) :: :gt | :lt | :eq
-def compare(tx1, tx2, field) when is_atom(field) do
-  v1 = Map.get(tx1, field)
-  v2 = Map.get(tx2, field)
+      iex> PaymentsCli.Transaction.describe(%{id: "T2", status: :declined, amount_cents: 500, currency: "USD"})
+      "T2: DECLINED (amount: USD 5.00)"
 
-  cond do
-    v1 > v2 -> :gt
-    v1 < v2 -> :lt
-    true    -> :eq
+  """
+  @spec describe(map()) :: String.t()
+  def describe(%{id: id, status: :approved, amount_cents: cents, currency: currency}) do
+    "#{id}: approved #{format_display(cents, currency)}"
   end
-end
 
-@doc """
-Builds a short display label for a transaction.
+  def describe(%{id: id, status: :declined, amount_cents: cents, currency: currency}) do
+    "#{id}: DECLINED (amount: #{format_display(cents, currency)})"
+  end
 
-`symbol` is optional — defaults to the currency code when not provided.
+  def describe(%{id: id, status: :flagged, amount_cents: cents, currency: currency}) do
+    "#{id}: FLAGGED FOR REVIEW — #{format_display(cents, currency)}"
+  end
 
-## Examples
+  def describe(%{id: id, status: :reversed, amount_cents: cents, currency: currency}) do
+    "#{id}: reversed #{format_display(cents, currency)}"
+  end
 
-    iex> tx = %{id: "T1", amount_cents: 1234, currency: "USD"}
-    iex> PaymentsCli.Transaction.label(tx)
-    "T1 [USD 12.34]"
+  def describe(%{id: id, status: status}) do
+    "#{id}: #{status}"
+  end
 
-    iex> PaymentsCli.Transaction.label(tx, "$")
-    "T1 [$12.34]"
+  @doc """
+  Returns true if a transaction can be reversed.
 
-"""
-@spec label(map(), String.t()) :: String.t()
-def label(tx, symbol \\ nil)
+  Business rules:
+  - Only :approved transactions can be reversed
+  - Amount must be positive (> 0)
+  - Uses guards so the rule is enforced at the function head, not in the body
 
-def label(%{id: id, amount_cents: cents, currency: currency}, nil) do
-  "#{id} [#{currency} #{format_cents(cents)}]"
-end
+  ## Examples
 
-def label(%{id: id, amount_cents: cents}, symbol) when is_binary(symbol) do
-  "#{id} [#{symbol}#{format_cents(cents)}]"
-end
+      iex> PaymentsCli.Transaction.reversible?(%{status: :approved, amount_cents: 1000})
+      true
 
-# ---------------------------------------------------------------------------
-# Private helpers
-# ---------------------------------------------------------------------------
+      iex> PaymentsCli.Transaction.reversible?(%{status: :declined, amount_cents: 1000})
+      false
 
-defp format_cents(cents) do
-  major = div(cents, 100)
-  minor = rem(cents, 100)
-  "#{major}.#{minor |> Integer.to_string() |> String.pad_leading(2, "0")}"
-end
+  """
+  @spec reversible?(map()) :: boolean()
+  def reversible?(%{status: :approved, amount_cents: cents}) when cents > 0, do: true
+  def reversible?(_), do: false
 
-defp format_display(cents, currency) do
-  "#{currency} #{format_cents(cents)}"
+  @doc """
+  Compares two transactions by amount.
+
+  Returns :gt, :lt, or :eq.
+
+  ## Examples
+
+      iex> t1 = %{amount_cents: 1000}
+      iex> t2 = %{amount_cents: 500}
+      iex> PaymentsCli.Transaction.compare(t1, t2)
+      :gt
+
+  """
+  @spec compare(map(), map()) :: :gt | :lt | :eq
+  def compare(%{amount_cents: a}, %{amount_cents: b}) do
+    cond do
+      a > b -> :gt
+      a < b -> :lt
+      true  -> :eq
+    end
+  end
+
+  @doc """
+  Compares two transactions by a specified field.
+
+  The field must exist in both transactions and must be comparable.
+
+  ## Examples
+
+      iex> t1 = %{amount_cents: 1000, id: "TXN002"}
+      iex> t2 = %{amount_cents: 500,  id: "TXN001"}
+      iex> PaymentsCli.Transaction.compare(t1, t2, :id)
+      :gt
+
+  """
+  @spec compare(map(), map(), atom()) :: :gt | :lt | :eq
+  def compare(tx1, tx2, field) when is_atom(field) do
+    v1 = Map.get(tx1, field)
+    v2 = Map.get(tx2, field)
+
+    cond do
+      v1 > v2 -> :gt
+      v1 < v2 -> :lt
+      true    -> :eq
+    end
+  end
+
+  @doc """
+  Builds a short display label for a transaction.
+
+  `symbol` is optional — defaults to the currency code when not provided.
+
+  ## Examples
+
+      iex> tx = %{id: "T1", amount_cents: 1234, currency: "USD"}
+      iex> PaymentsCli.Transaction.label(tx)
+      "T1 [USD 12.34]"
+
+      iex> PaymentsCli.Transaction.label(tx, "$")
+      "T1 [$12.34]"
+
+  """
+  @spec label(map(), String.t()) :: String.t()
+  def label(tx, symbol \\ nil)
+
+  def label(%{id: id, amount_cents: cents, currency: currency}, nil) do
+    "#{id} [#{currency} #{format_cents(cents)}]"
+  end
+
+  def label(%{id: id, amount_cents: cents}, symbol) when is_binary(symbol) do
+    "#{id} [#{symbol}#{format_cents(cents)}]"
+  end
+
+  # ---------------------------------------------------------------------------
+  # Private helpers
+  # ---------------------------------------------------------------------------
+
+  defp format_cents(cents) do
+    major = div(cents, 100)
+    minor = rem(cents, 100)
+    "#{major}.#{minor |> Integer.to_string() |> String.pad_leading(2, "0")}"
+  end
+
+  defp format_display(cents, currency) do
+    "#{currency} #{format_cents(cents)}"
+  end
 end
 ```
 
@@ -256,7 +295,7 @@ end
   `rem/2`, then pads the minor unit to two digits. `format_display/2` prepends the
   currency code.
 
-### Given tests — must pass without modification
+### Tests
 
 ```elixir
 # test/payments_cli/transaction_api_test.exs

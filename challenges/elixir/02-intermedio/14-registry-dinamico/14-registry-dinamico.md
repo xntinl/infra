@@ -1,98 +1,80 @@
 # Dynamic Registry
 
-**Project**: `task_queue` — built incrementally across the intermediate level
-
----
-
-## Project context
-
-The task_queue system currently runs a single Worker (exercise 05). The scheduler needs
-to spin up and tear down workers dynamically — the number of workers changes based on
-queue depth. When a worker finishes or crashes, it must be discovered by the scheduler
-without the scheduler holding stale PIDs.
+## Why Registry
 
 `Registry` is the OTP solution for dynamic process naming: it maps arbitrary names to
-PIDs and cleans up automatically when a registered process dies.
-
-Project structure at this point:
-
-```
-task_queue/
-├── lib/
-│   └── task_queue/
-│       ├── application.ex           # updated to start Registry and DynamicSupervisor
-│       ├── dynamic_worker.ex
-│       └── worker_pool.ex
-├── test/
-│   └── task_queue/
-│       └── registry_test.exs        # given tests — must pass without modification
-└── mix.exs
-```
-
----
-
-## Why Registry and not a map of {worker_name => pid}
-
-A `%{name => pid}` map in an Agent has a lifecycle problem: when a worker crashes and its
-Supervisor restarts it with a new PID, the Agent still holds the old PID. Every lookup
-requires checking `Process.alive?/1` and refreshing the stale entry. That is manual bookkeeping
-that Registry handles automatically.
-
-Registry's key property: when a registered process exits (normally or abnormally), its
-entry is automatically removed. The next lookup for that name returns `[]`. No stale PIDs,
-no manual cleanup.
+PIDs and cleans up automatically when a registered process dies. Unlike a manual map of
+`{name => pid}` in an Agent, Registry has no stale PID problem — when a worker exits,
+its entry is automatically removed.
 
 ---
 
 ## Registry vs ETS directly
 
-Both Registry and ETS store associations. The difference:
-
 | | Registry | ETS |
 |--|---------|-----|
-| Automatic cleanup on process exit | Yes — linked to registered process | No — manual cleanup required |
-| Multiple registrations per name | Configurable (`:keys :unique` or `:duplicate`) | Manual — multiple inserts |
-| Dispatch (broadcast to all) | `Registry.dispatch/3` | Manual iteration |
-| PubSub | Yes — canonical use case | Possible but manual |
+| Automatic cleanup on process exit | Yes | No |
+| Multiple registrations per name | Configurable (`:unique` or `:duplicate`) | Manual |
+| Dispatch (broadcast) | `Registry.dispatch/3` | Manual iteration |
 | Process discovery | Primary use case | Secondary use case |
 
 Use Registry when: the values are process PIDs and you need automatic cleanup.
-Use ETS when: the values are arbitrary data, or when you need maximum read throughput.
+Use ETS when: the values are arbitrary data, or you need maximum read throughput.
 
 ---
 
 ## The business problem
 
-`TaskQueue.WorkerPool` manages a dynamic pool of workers:
+Build a `TaskQueue.WorkerPool` that manages a dynamic pool of workers:
 
-- Workers are started with `DynamicSupervisor`, not a static Supervisor.
+- Workers are started with `DynamicSupervisor`.
 - Each worker registers itself under a `{:worker, worker_id}` key in Registry.
-- The pool manager can look up any worker by ID, broadcast a message to all workers,
-  and list active worker IDs.
+- The pool manager can look up any worker by ID, broadcast to all, and list active IDs.
 - When a worker exits, its Registry entry disappears automatically.
+
+All modules are defined completely in this exercise.
+
+---
+
+## Project setup
+
+```
+task_queue/
+├── lib/
+│   └── task_queue/
+│       ├── application.ex
+│       ├── dynamic_worker.ex
+│       └── worker_pool.ex
+├── test/
+│   └── task_queue/
+│       └── registry_test.exs
+└── mix.exs
+```
 
 ---
 
 ## Implementation
 
-### Step 1: Update `lib/task_queue/application.ex`
-
-Add `Registry` and `DynamicSupervisor` to the supervision tree:
+### `lib/task_queue/application.ex`
 
 ```elixir
-defp build_children(_worker_count) do
-  [
-    TaskQueue.TaskRegistry,
-    TaskQueue.QueueServer,
-    # Registry for dynamic worker discovery
-    {Registry, keys: :unique, name: TaskQueue.WorkerRegistry},
-    # DynamicSupervisor for on-demand worker lifecycle
-    {DynamicSupervisor, strategy: :one_for_one, name: TaskQueue.WorkerSupervisor}
-  ]
+defmodule TaskQueue.Application do
+  use Application
+
+  @impl Application
+  def start(_type, _args) do
+    children = [
+      {Registry, keys: :unique, name: TaskQueue.WorkerRegistry},
+      {DynamicSupervisor, strategy: :one_for_one, name: TaskQueue.WorkerSupervisor}
+    ]
+
+    opts = [strategy: :one_for_one, name: TaskQueue.RootSupervisor]
+    Supervisor.start_link(children, opts)
+  end
 end
 ```
 
-### Step 2: `lib/task_queue/dynamic_worker.ex`
+### `lib/task_queue/dynamic_worker.ex`
 
 ```elixir
 defmodule TaskQueue.DynamicWorker do
@@ -100,10 +82,6 @@ defmodule TaskQueue.DynamicWorker do
   require Logger
 
   @registry TaskQueue.WorkerRegistry
-
-  # ---------------------------------------------------------------------------
-  # Public API
-  # ---------------------------------------------------------------------------
 
   def start_link(worker_id) when is_binary(worker_id) do
     GenServer.start_link(__MODULE__, worker_id, name: via(worker_id))
@@ -132,7 +110,7 @@ defmodule TaskQueue.DynamicWorker do
     |> Enum.map(fn {:worker, id} -> id end)
   end
 
-  @doc "Sends a message to all registered workers via Registry.dispatch."
+  @doc "Sends a message to all registered workers."
   @spec broadcast(any()) :: :ok
   def broadcast(message) do
     for id <- list_ids() do
@@ -144,7 +122,7 @@ defmodule TaskQueue.DynamicWorker do
     :ok
   end
 
-  @doc "Requests a worker to process the next available job. Returns result."
+  @doc "Requests a worker to process a job. Returns result."
   @spec process_job(String.t()) :: {:ok, any()} | {:error, any()}
   def process_job(worker_id) do
     GenServer.call(via(worker_id), :process_job, 30_000)
@@ -158,10 +136,6 @@ defmodule TaskQueue.DynamicWorker do
       _pid -> GenServer.call(via(worker_id), :stats)
     end
   end
-
-  # ---------------------------------------------------------------------------
-  # GenServer callbacks
-  # ---------------------------------------------------------------------------
 
   @impl GenServer
   def init(worker_id) do
@@ -177,26 +151,20 @@ defmodule TaskQueue.DynamicWorker do
 
   @impl GenServer
   def handle_call(:process_job, _from, state) do
-    case TaskQueue.QueueServer.pop() do
-      {:error, :empty} ->
-        {:reply, {:error, :empty}, state}
+    result =
+      try do
+        {:ok, :processed}
+      rescue
+        e -> {:error, e}
+      end
 
-      {:ok, job} ->
-        result =
-          try do
-            {:ok, job.payload}
-          rescue
-            e -> {:error, e}
-          end
+    new_state =
+      case result do
+        {:ok, _} -> %{state | jobs_processed: state.jobs_processed + 1}
+        {:error, _} -> %{state | jobs_failed: state.jobs_failed + 1}
+      end
 
-        new_state =
-          case result do
-            {:ok, _} -> %{state | jobs_processed: state.jobs_processed + 1}
-            {:error, _} -> %{state | jobs_failed: state.jobs_failed + 1}
-          end
-
-        {:reply, result, new_state}
-    end
+    {:reply, result, new_state}
   end
 
   @impl GenServer
@@ -211,32 +179,24 @@ defmodule TaskQueue.DynamicWorker do
 end
 ```
 
-The `via/1` function returns a `:via` tuple that Registry understands. When passed as the
-`name:` option to `GenServer.start_link/3`, the GenServer registers itself in the Registry
-under `{:worker, worker_id}`. The same tuple can be used anywhere a process name is
-accepted — `GenServer.call(via(worker_id), :stats)` routes through the Registry to the
-correct PID.
+The `via/1` function returns a `:via` tuple that Registry understands. When passed as
+`name:` to `GenServer.start_link/3`, the GenServer registers itself in the Registry.
+The same tuple routes `GenServer.call` through the Registry to the correct PID.
 
-The `list_ids/0` function uses `Registry.select/2` with a match specification to extract
-all registered keys. The specification `[{{:"$1", :"$2", :"$3"}, [], [:"$1"]}]` means
-"match any entry, return the key". The result is a list of `{:worker, id}` tuples, which
-we map to extract just the string IDs.
-
-### Step 3: `lib/task_queue/worker_pool.ex`
+### `lib/task_queue/worker_pool.ex`
 
 ```elixir
 defmodule TaskQueue.WorkerPool do
   @moduledoc """
   Manages a dynamic pool of DynamicWorker processes.
   Workers are started on demand and supervised by DynamicSupervisor.
-  Registry handles discovery and automatic cleanup on exit.
   """
 
   alias TaskQueue.DynamicWorker
 
   @supervisor TaskQueue.WorkerSupervisor
 
-  @doc "Starts a new worker with the given ID. Returns {:ok, pid} or {:error, reason}."
+  @doc "Starts a new worker with the given ID."
   @spec start_worker(String.t()) :: {:ok, pid()} | {:error, any()}
   def start_worker(worker_id) do
     DynamicSupervisor.start_child(@supervisor, {DynamicWorker, worker_id})
@@ -259,7 +219,7 @@ defmodule TaskQueue.WorkerPool do
     DynamicWorker.list_ids() |> length()
   end
 
-  @doc "Ensures at least `n` workers are running. Starts new ones if needed."
+  @doc "Ensures at least `n` workers are running."
   @spec ensure_min_workers(pos_integer()) :: :ok
   def ensure_min_workers(n) do
     current = count()
@@ -283,16 +243,7 @@ defmodule TaskQueue.WorkerPool do
 end
 ```
 
-The `start_worker/1` function uses `DynamicSupervisor.start_child/2` to launch a new
-worker under supervision. The child spec `{DynamicWorker, worker_id}` tells the
-DynamicSupervisor to call `DynamicWorker.start_link(worker_id)`.
-
-The `all_stats/1` function collects stats from all workers. The `Enum.filter(&is_map/1)`
-at the end handles the race condition where a worker exits between `list_ids()` and
-`stats/1` — the stats call returns `{:error, :not_found}`, which is not a map and gets
-filtered out.
-
-### Step 4: Given tests — must pass without modification
+### Tests
 
 ```elixir
 # test/task_queue/registry_test.exs
@@ -303,7 +254,6 @@ defmodule TaskQueue.RegistryTest do
   alias TaskQueue.WorkerPool
 
   setup do
-    # Stop all running workers
     for id <- DynamicWorker.list_ids(), do: WorkerPool.stop_worker(id)
     Process.sleep(50)
     :ok
@@ -376,12 +326,10 @@ defmodule TaskQueue.RegistryTest do
       pid1 = DynamicWorker.lookup("w_crash_test")
       assert pid1 != nil
 
-      # Kill the process (not graceful stop — supervisor restarts it)
       Process.exit(pid1, :kill)
       Process.sleep(200)
 
       pid2 = DynamicWorker.lookup("w_crash_test")
-      # The worker name was re-registered after restart
       assert pid2 != nil
       assert pid2 != pid1
       WorkerPool.stop_worker("w_crash_test")
@@ -390,7 +338,7 @@ defmodule TaskQueue.RegistryTest do
 end
 ```
 
-### Step 5: Run the tests
+### Run the tests
 
 ```bash
 mix test test/task_queue/registry_test.exs --trace
@@ -398,44 +346,18 @@ mix test test/task_queue/registry_test.exs --trace
 
 ---
 
-## Trade-off analysis
-
-| Aspect | Registry | ETS manual map | Agent of {name => pid} |
-|--------|---------|---------------|----------------------|
-| Automatic cleanup on exit | Yes | No — must monitor/cleanup | No — stale PIDs |
-| Lookup performance | O(1) — ETS-backed | O(1) | O(1) but mailbox round-trip |
-| PubSub / dispatch | Built-in | Manual | Manual |
-| Multiple pids per name | Via `:keys :duplicate` | Manual | Manual |
-| Supervisor integration | Standard `via` tuple | Manual | Manual |
-
-Reflection question: `broadcast/1` in `DynamicWorker` iterates all worker IDs and sends
-a message to each. Between `list_ids()` and `send`, a worker may have exited. The `send`
-to a dead PID succeeds silently in Elixir — no error. Is this acceptable in a broadcast
-use case? What would you change if you needed delivery guarantees?
-
----
-
 ## Common production mistakes
 
 **1. Forgetting to start Registry before workers that register**
-If `DynamicWorker` starts before `Registry` in the supervision tree, registration fails
-with `(ArgumentError) unknown registry`. Always list Registry before the processes that
-use it in the children list.
+If workers start before Registry, registration fails with `(ArgumentError) unknown registry`.
 
-**2. Using module name as Registry name when using multiple Registries**
-Each Registry must have a unique name. If you use `Registry` (the module) as the name,
-a second Registry in the same application will conflict. Use namespaced atoms:
-`TaskQueue.WorkerRegistry`.
-
-**3. Not accounting for the race in lookup + call**
+**2. Not accounting for the race in lookup + call**
 Between `Registry.lookup` returning a PID and `GenServer.call(pid, ...)`, the process
-may have exited. The call will fail with `{:exit, :noproc}`. Either use the `via` tuple
-(which handles this internally) or catch the exit in a try/rescue.
+may have exited. Use the `via` tuple which handles this internally.
 
-**4. Using Registry for non-process values**
+**3. Using Registry for non-process values**
 Registry entries are tied to the process that called `Registry.register/3`. When that
-process exits, the entry is gone. If you want to store arbitrary data (not PIDs), use
-ETS instead.
+process exits, the entry is gone.
 
 ---
 
@@ -443,5 +365,3 @@ ETS instead.
 
 - [Registry — HexDocs](https://hexdocs.pm/elixir/Registry.html)
 - [DynamicSupervisor — HexDocs](https://hexdocs.pm/elixir/DynamicSupervisor.html)
-- [Registry source code](https://github.com/elixir-lang/elixir/blob/main/lib/elixir/lib/registry.ex) — well-documented, worth reading
-- [Elixir in Action — Sasa Juric](https://www.manning.com/books/elixir-in-action-third-edition) — Chapter 12: Building a fault-tolerant system

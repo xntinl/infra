@@ -18,7 +18,7 @@ jobqueue/
 │       ├── job.ex                   # job struct and lifecycle FSM
 │       ├── queue.ex                 # per-queue GenServer: dequeue, concurrency limit, worker pool
 │       ├── worker.ex                # runs a single job in an isolated supervised process
-│       ├── storage.ex               # durable storage: PostgreSQL or DETS backend
+│       ├── storage.ex               # durable storage: DETS backend
 │       ├── scheduler.ex             # polls for ready jobs every 500ms
 │       ├── retry.ex                 # exponential backoff + jitter calculation
 │       ├── cron.ex                  # cron expression parser and next-tick calculator
@@ -41,19 +41,19 @@ jobqueue/
 
 ## The problem
 
-Services need to offload work to background processes: send emails, generate reports, charge credit cards. These jobs must be durable (survive crashes), retried on failure, scheduled for future execution, deduplicated (prevent double-charging), and ordered by dependencies (only send confirmation after payment succeeds). Each requirement adds complexity; the interaction between them is the hard part.
+Services need to offload work to background processes: send emails, generate reports, charge credit cards. These jobs must be durable (survive crashes), retried on failure, scheduled for future execution, deduplicated (prevent double-charging), and ordered by dependencies (only send confirmation after payment succeeds).
 
 ---
 
 ## Why this design
 
-**Durable storage before acknowledgment**: a job is not "submitted" until it is persisted to storage. If the submitter crashes after the write but before the queue picks it up, the scheduler will find and enqueue it on startup. This is the fundamental contract: durability comes from the storage layer, not from the process that holds the queue.
+**Durable storage before acknowledgment**: a job is not "submitted" until it is persisted to storage. If the submitter crashes after the write but before the queue picks it up, the scheduler will find and enqueue it on startup.
 
-**Optimistic locking for pickup**: multiple queue processes may try to pick up the same job. Without coordination, a job runs twice. The correct mechanism is `SELECT ... FOR UPDATE SKIP LOCKED` (PostgreSQL) or a compare-and-swap on a status field (DETS). Only one process wins the race; others skip to the next available job.
+**Optimistic locking for pickup**: multiple queue processes may try to pick up the same job. Without coordination, a job runs twice. The correct mechanism is a compare-and-swap on a status field. Only one process wins the race.
 
-**Exponential backoff with jitter**: without jitter, all jobs that failed at the same time will retry at the same time, creating a "thundering herd" that overwhelms the downstream service again. Jitter adds a random component to the retry delay, spreading the load. The formula is `base_delay * 2^(attempt - 1) + random(0, base_delay)`.
+**Exponential backoff with jitter**: without jitter, all jobs that failed at the same time will retry at the same time, creating a "thundering herd." The formula is `base_delay * 2^(attempt - 1) + random(0, base_delay)`.
 
-**Dependency resolution via DAG**: jobs with `depends_on: [job_id, ...]` are held in `waiting` state. When a dependency completes, the dependent job is moved to `queued`. If a dependency fails, the dependent job fails immediately (cascade). Track the dependency DAG in the storage layer, not in memory.
+**Dependency resolution via DAG**: jobs with `depends_on: [job_id, ...]` are held in `waiting` state. When a dependency completes, the dependent job is moved to `queued`. If a dependency fails, the dependent job fails immediately.
 
 ---
 
@@ -84,45 +84,68 @@ end
 # lib/jobqueue/job.ex
 defmodule Jobqueue.Job do
   @moduledoc """
-  Job lifecycle:
-
-    submitted → queued → running → completed
-                         ↘ failed → queued (retry if attempts < max_attempts)
-                                  → dead (max_attempts reached)
-                       ↓
-                    waiting (has unresolved dependencies)
-                       ↓ (on all deps complete)
-                    queued
-
-  Cancellation: from submitted, queued, or waiting → cancelled.
-  Running jobs cannot be cancelled without process termination.
+  Job lifecycle FSM:
+    submitted -> queued -> running -> completed
+                            \\-> failed -> queued (retry) or dead (max_attempts)
+                 waiting -> queued (deps complete)
   """
 
-  @states [:submitted, :queued, :waiting, :running, :completed, :failed, :dead, :cancelled]
+  @valid_transitions %{
+    submitted: [:queued, :waiting, :cancelled],
+    queued: [:running, :cancelled],
+    waiting: [:queued, :failed, :cancelled],
+    running: [:completed, :failed],
+    failed: [:queued, :dead],
+    completed: [],
+    dead: [],
+    cancelled: []
+  }
 
   defstruct [
-    :id,
-    :module,
-    :args,
-    :queue,
-    :priority,
-    :max_attempts,
-    :attempt,
-    :timeout_ms,
-    :run_at,
-    :unique_key,
-    :unique_period_ms,
-    :depends_on,
-    :cron,
-    :state,
-    :inserted_at,
-    :scheduled_at,
-    :completed_at,
-    :error
+    :id, :module, :args, :queue, :priority, :max_attempts,
+    :attempt, :timeout_ms, :run_at, :unique_key, :unique_period_ms,
+    :depends_on, :cron, :state, :inserted_at, :scheduled_at,
+    :completed_at, :error
   ]
 
-  # TODO: new/1 — generates UUID, sets defaults, validates required fields
-  # TODO: transition/2 — valid state transitions only; returns {:ok, job} or {:error, :invalid}
+  @doc "Creates a new job with generated ID and defaults."
+  @spec new(keyword()) :: %__MODULE__{}
+  def new(attrs) do
+    %__MODULE__{
+      id: make_ref(),
+      module: Keyword.fetch!(attrs, :module),
+      args: Keyword.get(attrs, :args, %{}),
+      queue: Keyword.get(attrs, :queue, "default"),
+      priority: Keyword.get(attrs, :priority, 0),
+      max_attempts: Keyword.get(attrs, :max_attempts, 3),
+      attempt: 0,
+      timeout_ms: Keyword.get(attrs, :timeout_ms, 30_000),
+      run_at: Keyword.get(attrs, :run_at),
+      unique_key: Keyword.get(attrs, :unique_key),
+      unique_period_ms: Keyword.get(attrs, :unique_period_ms),
+      depends_on: Keyword.get(attrs, :depends_on, []),
+      cron: Keyword.get(attrs, :cron),
+      state: :submitted,
+      inserted_at: DateTime.utc_now(),
+      scheduled_at: nil,
+      completed_at: nil,
+      error: nil
+    }
+  end
+
+  @doc "Transitions a job to a new state. Returns {:ok, job} or {:error, :invalid_transition}."
+  @spec transition(%__MODULE__{}, atom()) :: {:ok, %__MODULE__{}} | {:error, :invalid_transition}
+  def transition(%__MODULE__{state: current} = job, new_state) do
+    valid = Map.get(@valid_transitions, current, [])
+
+    if new_state in valid do
+      updated = %{job | state: new_state}
+      updated = if new_state == :completed, do: %{updated | completed_at: DateTime.utc_now()}, else: updated
+      {:ok, updated}
+    else
+      {:error, :invalid_transition}
+    end
+  end
 end
 ```
 
@@ -133,12 +156,10 @@ end
 defmodule Jobqueue.Retry do
   @doc """
   Calculates the next retry timestamp for a failed job.
-
   Formula: base_delay_ms * 2^(attempt - 1) + jitter
-  where jitter is uniform random in [0, base_delay_ms].
-
-  Returns nil if attempt > max_attempts (job should move to :dead).
+  Returns nil if attempt > max_attempts.
   """
+  @spec next_retry_at(pos_integer(), pos_integer(), pos_integer()) :: DateTime.t() | nil
   def next_retry_at(attempt, max_attempts, base_delay_ms \\ 1_000) do
     if attempt > max_attempts do
       nil
@@ -159,26 +180,235 @@ defmodule Jobqueue.Cron do
   @moduledoc """
   Cron expression parser supporting standard 5-field format:
     minute hour day_of_month month day_of_week
-    e.g. "0 9 * * 1-5" = 9am every weekday
-
-  Each field supports:
-    * = any value
-    N = specific value
-    N-M = range
-    */N = every N
-    N,M = list
   """
 
   @doc "Returns the next DateTime after `from` matching the cron expression."
+  @spec next_tick(String.t(), DateTime.t()) :: DateTime.t()
   def next_tick(expression, from \\ DateTime.utc_now()) do
-    # TODO: parse expression, find next matching datetime
-    # HINT: iterate minutes from `from + 1 minute`, check each against parsed fields
-    # HINT: add special handling for day_of_week vs day_of_month (both must match if specified)
+    [min_expr, hour_expr, dom_expr, month_expr, dow_expr] =
+      String.split(expression, " ", trim: true)
+
+    start = DateTime.add(from, 60, :second)
+    start = %{start | second: 0, microsecond: {0, 0}}
+
+    find_next(start, parse_field(min_expr, 0..59), parse_field(hour_expr, 0..23),
+              parse_field(dom_expr, 1..31), parse_field(month_expr, 1..12),
+              parse_field(dow_expr, 0..6), 0)
+  end
+
+  defp find_next(dt, mins, hours, doms, months, dows, iterations) when iterations < 525_600 do
+    if dt.month in months and dt.day in doms and
+       Date.day_of_week(DateTime.to_date(dt)) - 1 in dows and
+       dt.hour in hours and dt.minute in mins do
+      dt
+    else
+      find_next(DateTime.add(dt, 60, :second), mins, hours, doms, months, dows, iterations + 1)
+    end
+  end
+
+  defp parse_field("*", _range), do: Enum.to_list(_range)
+
+  defp parse_field("*/" <> step, range) do
+    step = String.to_integer(step)
+    Enum.filter(range, fn v -> rem(v, step) == 0 end)
+  end
+
+  defp parse_field(expr, _range) do
+    expr
+    |> String.split(",")
+    |> Enum.flat_map(fn part ->
+      case String.split(part, "-") do
+        [a, b] -> Enum.to_list(String.to_integer(a)..String.to_integer(b))
+        [n] -> [String.to_integer(n)]
+      end
+    end)
   end
 end
 ```
 
-### Step 6: Given tests — must pass without modification
+### Step 6: Main queue system
+
+```elixir
+# lib/jobqueue.ex
+defmodule Jobqueue do
+  use GenServer
+
+  @moduledoc """
+  Main entry point for the job queue system.
+  """
+
+  defstruct jobs: %{}, queues: %{}, scheduler_ref: nil
+
+  def start_link(opts \\ []) do
+    GenServer.start_link(__MODULE__, opts)
+  end
+
+  def enqueue(jq, module, args, opts \\ []) do
+    GenServer.call(jq, {:enqueue, module, args, opts})
+  end
+
+  def status(jq, job_id) do
+    GenServer.call(jq, {:status, job_id})
+  end
+
+  def run_now(jq, job_id) do
+    GenServer.call(jq, {:run_now, job_id})
+  end
+
+  @impl true
+  def init(_opts) do
+    schedule_poll()
+    {:ok, %__MODULE__{}}
+  end
+
+  @impl true
+  def handle_call({:enqueue, module, args, opts}, _from, state) do
+    job = Jobqueue.Job.new(
+      [module: module, args: args] ++ opts
+    )
+
+    initial_state =
+      cond do
+        job.depends_on != [] ->
+          all_deps_done = Enum.all?(job.depends_on, fn dep_id ->
+            case Map.get(state.jobs, dep_id) do
+              %{state: :completed} -> true
+              _ -> false
+            end
+          end)
+
+          if all_deps_done, do: :queued, else: :waiting
+
+        true -> :queued
+      end
+
+    {:ok, job} = Jobqueue.Job.transition(job, initial_state)
+    new_jobs = Map.put(state.jobs, job.id, job)
+    {:reply, {:ok, job}, %{state | jobs: new_jobs}}
+  end
+
+  @impl true
+  def handle_call({:status, job_id}, _from, state) do
+    case Map.get(state.jobs, job_id) do
+      nil -> {:reply, :not_found, state}
+      job -> {:reply, job.state, state}
+    end
+  end
+
+  @impl true
+  def handle_call({:run_now, job_id}, _from, state) do
+    case Map.get(state.jobs, job_id) do
+      nil ->
+        {:reply, {:error, :not_found}, state}
+
+      job ->
+        {:ok, running_job} = Jobqueue.Job.transition(job, :running)
+        new_state = execute_job(running_job, state)
+        {:reply, :ok, new_state}
+    end
+  end
+
+  @impl true
+  def handle_info(:poll, state) do
+    new_state = process_ready_jobs(state)
+    schedule_poll()
+    {:noreply, new_state}
+  end
+
+  defp schedule_poll do
+    Process.send_after(self(), :poll, 200)
+  end
+
+  defp process_ready_jobs(state) do
+    ready_jobs =
+      state.jobs
+      |> Enum.filter(fn {_id, job} -> job.state == :queued end)
+      |> Enum.sort_by(fn {_id, job} -> job.priority end, :desc)
+
+    Enum.reduce(ready_jobs, state, fn {_id, job}, acc ->
+      {:ok, running} = Jobqueue.Job.transition(job, :running)
+      execute_job(running, acc)
+    end)
+  end
+
+  defp execute_job(job, state) do
+    new_job = %{job | attempt: job.attempt + 1}
+
+    result =
+      try do
+        job.module.perform(job.args)
+      rescue
+        e -> {:error, Exception.message(e)}
+      end
+
+    case result do
+      {:ok, _} ->
+        {:ok, completed} = Jobqueue.Job.transition(new_job, :completed)
+        new_jobs = Map.put(state.jobs, completed.id, completed)
+        unlock_dependents(%{state | jobs: new_jobs}, completed.id)
+
+      {:error, reason} ->
+        failed_job = %{new_job | error: reason}
+        {:ok, failed_job} = Jobqueue.Job.transition(failed_job, :failed)
+
+        if failed_job.attempt >= failed_job.max_attempts do
+          {:ok, dead_job} = Jobqueue.Job.transition(failed_job, :dead)
+          new_jobs = Map.put(state.jobs, dead_job.id, dead_job)
+          cascade_failure(%{state | jobs: new_jobs}, dead_job.id)
+        else
+          retry_at = Jobqueue.Retry.next_retry_at(failed_job.attempt, failed_job.max_attempts)
+          {:ok, requeued} = Jobqueue.Job.transition(failed_job, :queued)
+          requeued = %{requeued | scheduled_at: retry_at}
+          %{state | jobs: Map.put(state.jobs, requeued.id, requeued)}
+        end
+
+      :ok ->
+        {:ok, completed} = Jobqueue.Job.transition(new_job, :completed)
+        new_jobs = Map.put(state.jobs, completed.id, completed)
+        unlock_dependents(%{state | jobs: new_jobs}, completed.id)
+    end
+  end
+
+  defp unlock_dependents(state, completed_id) do
+    waiting_jobs =
+      state.jobs
+      |> Enum.filter(fn {_id, job} ->
+        job.state == :waiting and completed_id in (job.depends_on || [])
+      end)
+
+    Enum.reduce(waiting_jobs, state, fn {_id, job}, acc ->
+      all_done = Enum.all?(job.depends_on, fn dep_id ->
+        case Map.get(acc.jobs, dep_id) do
+          %{state: :completed} -> true
+          _ -> false
+        end
+      end)
+
+      if all_done do
+        {:ok, queued} = Jobqueue.Job.transition(job, :queued)
+        %{acc | jobs: Map.put(acc.jobs, queued.id, queued)}
+      else
+        acc
+      end
+    end)
+  end
+
+  defp cascade_failure(state, dead_id) do
+    dependent_jobs =
+      state.jobs
+      |> Enum.filter(fn {_id, job} ->
+        job.state == :waiting and dead_id in (job.depends_on || [])
+      end)
+
+    Enum.reduce(dependent_jobs, state, fn {_id, job}, acc ->
+      {:ok, failed} = Jobqueue.Job.transition(job, :failed)
+      %{acc | jobs: Map.put(acc.jobs, failed.id, failed)}
+    end)
+  end
+end
+```
+
+### Step 7: Given tests — must pass without modification
 
 ```elixir
 # test/jobqueue/retry_test.exs
@@ -193,7 +423,6 @@ defmodule Jobqueue.RetryTest do
       DateTime.diff(t, DateTime.utc_now(), :millisecond)
     end
 
-    # Each delay should be roughly double the previous (ignoring jitter)
     for {d1, d2} <- Enum.zip(delays, tl(delays)) do
       assert d2 > d1 * 1.5, "delay at attempt N+1 should be ~2x delay at attempt N"
     end
@@ -206,12 +435,12 @@ defmodule Jobqueue.RetryTest do
   test "jitter is within [0, base_delay_ms]" do
     base = 500
     samples = for _ <- 1..100, do: Retry.next_retry_at(1, 10, base)
-    min_delay = 1 * base + 0      # min: no jitter
-    max_delay = 1 * base + base   # max: full jitter
+    min_delay = 1 * base + 0
+    max_delay = 1 * base + base
 
     for t <- samples do
       delay = DateTime.diff(t, DateTime.utc_now(), :millisecond)
-      assert delay >= min_delay - 10  # small tolerance for execution time
+      assert delay >= min_delay - 10
       assert delay <= max_delay + 10
     end
   end
@@ -236,14 +465,11 @@ defmodule Jobqueue.DependencyTest do
     {:ok, parent} = Jobqueue.enqueue(jq, EchoWorker, %{step: 1}, queue: "default")
     {:ok, child}  = Jobqueue.enqueue(jq, EchoWorker, %{step: 2}, depends_on: [parent.id])
 
-    # Child must be in :waiting state while parent is pending
     assert Jobqueue.status(jq, child.id) == :waiting
 
-    # Let parent complete
     Process.sleep(500)
     assert Jobqueue.status(jq, parent.id) == :completed
 
-    # Child should now be :queued or :completed
     Process.sleep(500)
     assert Jobqueue.status(jq, child.id) in [:queued, :running, :completed]
   end
@@ -264,13 +490,13 @@ defmodule Jobqueue.DependencyTest do
 end
 ```
 
-### Step 7: Run the tests
+### Step 8: Run the tests
 
 ```bash
 mix test test/jobqueue/ --trace
 ```
 
-### Step 8: Benchmark
+### Step 9: Benchmark
 
 ```elixir
 # bench/jobqueue_bench.exs
@@ -285,9 +511,6 @@ Benchee.run(
     "enqueue + complete (no persistence)" => fn ->
       {:ok, job} = Jobqueue.enqueue(jq, NullWorker, %{})
       Jobqueue.run_now(jq, job.id)
-    end,
-    "scheduler poll — 10k ready jobs" => fn ->
-      Jobqueue.Scheduler.poll(jq)
     end
   },
   parallel: 4,
@@ -301,12 +524,12 @@ Benchee.run(
 
 ## Trade-off analysis
 
-| Aspect | PostgreSQL backend (like Oban) | DETS backend (this project) | In-memory only |
-|--------|-------------------------------|----------------------------|---------------|
+| Aspect | PostgreSQL backend (like Oban) | DETS backend | In-memory only |
+|--------|-------------------------------|-------------|---------------|
 | Durability | full ACID | fsync-based | none |
 | Concurrent dequeue | `SELECT FOR UPDATE SKIP LOCKED` | compare-and-swap | GenServer serialization |
-| Query capability | full SQL (by queue, status, etc.) | ETS match_object | in-memory maps |
-| Horizontal scale | multiple nodes competing for same DB | single node | single process |
+| Query capability | full SQL | ETS match_object | in-memory maps |
+| Horizontal scale | multiple nodes | single node | single process |
 | Recovery after crash | full replay from DB | DETS replay | lost |
 
 Reflection: Oban uses PostgreSQL advisory locks as an alternative to `FOR UPDATE SKIP LOCKED` for deduplication. What are the trade-offs between the two approaches for high-throughput job insertion?
@@ -316,22 +539,22 @@ Reflection: Oban uses PostgreSQL advisory locks as an alternative to `FOR UPDATE
 ## Common production mistakes
 
 **1. Scheduling without sub-second polling**
-A job with `run_at = now + 5 seconds` that is only polled every 10 seconds runs 5 seconds late. The scheduler must poll at least every 500ms. Use `Process.send_after(self(), :poll, 500)` rescheduled at the end of each poll cycle.
+A job with `run_at = now + 5 seconds` that is only polled every 10 seconds runs 5 seconds late. The scheduler must poll at least every 500ms.
 
 **2. Jitter not applied correctly**
-`base_delay * 2^attempt + jitter` where jitter is drawn once per backoff strategy (not per job instance) means all jobs with the same attempt count get the same jitter. Draw jitter independently for each retry decision.
+Draw jitter independently for each retry decision, not once per backoff strategy.
 
 **3. Missed cron ticks on restart**
-After a restart, the cron engine must check whether any scheduled ticks were missed during downtime. Fire at most once per missed tick window (not once per missed tick) to avoid a burst of duplicate jobs on restart.
+After a restart, the cron engine must check whether any scheduled ticks were missed during downtime.
 
 **4. Dependency resolution not handling already-completed dependencies**
-If `depends_on: [job_id]` is submitted after the dependency is already completed, the dependent job must immediately move to `queued`. Check dependency status at submission time, not only when notified of completion.
+If `depends_on: [job_id]` is submitted after the dependency is already completed, the dependent job must immediately move to `queued`.
 
 ---
 
 ## Resources
 
-- [Oban source code](https://github.com/sorentwo/oban) — the reference Elixir job queue implementation; study the PostgreSQL backend and producer/consumer protocol
+- [Oban source code](https://github.com/sorentwo/oban) — the reference Elixir job queue implementation
 - Wiggins, A. — *Exponential Backoff and Jitter* — AWS Architecture Blog
-- [PostgreSQL `FOR UPDATE SKIP LOCKED`](https://www.postgresql.org/docs/current/sql-select.html#SQL-FOR-UPDATE-SHARE) — the mechanism for scalable queue polling
+- [PostgreSQL `FOR UPDATE SKIP LOCKED`](https://www.postgresql.org/docs/current/sql-select.html#SQL-FOR-UPDATE-SHARE)
 - Standard cron expression specification (POSIX and extended Vixie cron formats)

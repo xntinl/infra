@@ -1,30 +1,31 @@
 # Concurrent Testing in ExUnit
 
-**Project**: `api_gateway` — built incrementally across the advanced level
+**Project**: `api_gateway` — a standalone HTTP gateway exercise
 
 ---
 
 ## Project context
 
-`api_gateway`'s test suite has grown to 200+ tests across rate limiter, circuit
-breaker, event bus, and middleware modules. CI runs in about 90 seconds because most
-tests are `async: false`. The root cause: several modules use named ETS tables and
-named GenServers that conflict when tests run in parallel. This exercise migrates the
-suite to `async: true` by identifying sources of shared state and isolating each test.
+You are building `api_gateway`, an HTTP gateway that routes traffic to microservices. The
+gateway's test suite has grown to 200+ tests across rate limiter, circuit breaker, event
+bus, and middleware modules. CI runs in about 90 seconds because most tests are
+`async: false`. The root cause: several modules use named ETS tables and named GenServers
+that conflict when tests run in parallel. This exercise migrates the suite to `async: true`
+by identifying sources of shared state and isolating each test.
 
-Project structure at this point:
+Project structure:
 
 ```
 api_gateway/
 ├── lib/
 │   └── api_gateway/
 │       └── rate_limiter/
-│           └── sliding_window.ex       # uses named ETS :request_log
+│           └── sliding_window.ex       # sliding window rate limiter
 ├── test/
 │   └── api_gateway/
 │       └── rate_limiter/
-│           ├── sliding_window_test.exs    # ← async: false currently — you fix this
-│           └── isolated_server_test.exs   # ← you implement (Exercise 2)
+│           ├── sliding_window_test.exs    # ← async: true with isolated ETS
+│           └── isolated_server_test.exs   # ← GenServer isolation patterns
 └── mix.exs
 ```
 

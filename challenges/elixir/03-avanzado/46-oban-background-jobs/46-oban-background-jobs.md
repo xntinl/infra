@@ -1,34 +1,27 @@
 # Background Jobs with Oban
 
-**Project**: `api_gateway` — built incrementally across the advanced level
+## Overview
 
----
+Build a durable background job system for an HTTP API gateway using Oban, the standard
+library for background processing in the Elixir ecosystem. The gateway generates events --
+client registrations, billing threshold alerts, audit log entries -- that must be processed
+asynchronously without coupling request latency to email delivery or external API calls.
 
-## Project context
-
-You're building `api_gateway`, an internal HTTP gateway that now handles authentication and
-request routing. The gateway generates events — new client registrations, billing threshold
-alerts, audit log entries — that must be processed asynchronously. Inline processing inside
-request handlers is unacceptable: it couples request latency to email delivery and external
-API calls.
-
-You need a durable background job system. You'll use Oban, the standard library for this
-in the Elixir ecosystem.
-
-Project structure at this point:
+Project structure:
 
 ```
 api_gateway/
 ├── lib/
 │   └── api_gateway/
-│       ├── application.ex              # already exists — starts Oban
+│       ├── application.ex
+│       ├── repo.ex
 │       ├── workers/
 │       │   ├── notification_worker.ex  # welcome emails, threshold alerts
 │       │   ├── audit_worker.ex         # fire-and-forget audit log writes
 │       │   └── report_worker.ex        # slow report generation with chaining
 │       └── oban_logger.ex             # telemetry-based structured logging
 ├── priv/repo/migrations/
-│   └── *_add_oban_jobs_table.exs      # Oban migration
+│   └── *_add_oban_jobs_table.exs
 ├── test/
 │   └── api_gateway/
 │       └── workers/
@@ -44,19 +37,19 @@ api_gateway/
 
 Three event types need background processing:
 
-1. **Client registration** — send welcome notification (email + push); must not duplicate
+1. **Client registration** -- send welcome notification (email + push); must not duplicate
    if the job is enqueued twice by accident
-2. **API request** — write an audit log entry to a separate analytics store; fire-and-forget,
+2. **API request** -- write an audit log entry to a separate analytics store; fire-and-forget,
    high volume
-3. **Billing threshold** — generate a usage report and deliver it; slow (5 min), must chain
+3. **Billing threshold** -- generate a usage report and deliver it; slow (5 min), must chain
    a notification when complete
 
 ---
 
-## Why Oban over a custom scheduler
+## Why Oban over a custom in-memory scheduler
 
-The scheduler you built in exercise 44 runs jobs in-memory. If the node restarts, all
-pending jobs are lost. Oban uses PostgreSQL as a durable queue:
+An in-memory scheduler loses all pending jobs if the node restarts. Oban uses PostgreSQL as
+a durable queue:
 
 - Jobs survive node crashes (persisted before enqueue returns)
 - At-least-once delivery: Oban's Lifeline plugin re-enqueues jobs that were executing
@@ -64,9 +57,8 @@ pending jobs are lost. Oban uses PostgreSQL as a durable queue:
 - Unique jobs: PostgreSQL-level deduplication prevents duplicate processing
 - Distributed: multiple nodes share the same queue without coordination code
 
-The cost: a PostgreSQL dependency and the overhead of a DB round-trip per enqueue. For
-a gateway processing thousands of events per second, that's a real cost. For the event
-volumes in this system (registrations, threshold alerts), it's acceptable.
+The cost: a PostgreSQL dependency and the overhead of a DB round-trip per enqueue. For the
+event volumes in this system (registrations, threshold alerts), it's acceptable.
 
 ---
 
@@ -74,20 +66,17 @@ volumes in this system (registrations, threshold alerts), it's acceptable.
 
 Oban distinguishes permanent failures from transient ones:
 
-- `{:error, reason}` — transient. Oban retries with exponential backoff up to `max_attempts`.
+- `{:error, reason}` -- transient. Oban retries with exponential backoff up to `max_attempts`.
   Use this when the downstream might recover (DB temporarily unavailable, rate limit).
-- `{:cancel, reason}` — permanent. Oban marks the job as cancelled, no retries.
+- `{:cancel, reason}` -- permanent. Oban marks the job as cancelled, no retries.
   Use this when retrying is pointless (user not found, invalid input).
-- Raising an exception — Oban treats this as `{:error, ...}` with the exception as the reason.
-
-Choosing the wrong type leads to either infinite retries on impossible jobs or no retries
-on recoverable failures.
+- Raising an exception -- Oban treats this as `{:error, ...}` with the exception as the reason.
 
 ---
 
 ## Implementation
 
-### Step 1: `mix.exs` — add Oban
+### Step 1: `mix.exs` -- add Oban
 
 ```elixir
 defp deps do
@@ -124,9 +113,9 @@ config :api_gateway, Oban,
     Oban.Plugins.Stager
   ],
   queues: [
-    notifications: [limit: 10],  # welcome emails, push alerts
-    audit:         [limit: 50],  # high-volume, low-criticality
-    reports:       [limit: 2]    # slow, CPU-bound
+    notifications: [limit: 10],
+    audit:         [limit: 50],
+    reports:       [limit: 2]
   ]
 
 # config/test.exs
@@ -136,11 +125,10 @@ config :api_gateway, Oban, testing: :inline
 ### Step 4: Application setup
 
 ```elixir
-# lib/api_gateway/application.ex — add Oban to children
+# lib/api_gateway/application.ex -- add Oban to children
 children = [
   ApiGateway.Repo,
   {Oban, Application.fetch_env!(:api_gateway, Oban)}
-  # ... other children
 ]
 ```
 
@@ -148,7 +136,7 @@ children = [
 
 The notification worker handles welcome emails and threshold alerts. It uses Oban's
 `unique` option to prevent duplicate welcome notifications for the same client within
-a 5-minute window — protecting against double-enqueue from retried HTTP requests.
+a 5-minute window.
 
 ```elixir
 defmodule ApiGateway.Workers.NotificationWorker do
@@ -161,7 +149,6 @@ defmodule ApiGateway.Workers.NotificationWorker do
   def perform(%Oban.Job{args: %{"type" => "welcome", "client_id" => client_id}}) do
     case ApiGateway.Clients.get(client_id) do
       nil ->
-        # Client was deleted between enqueue and execution — retrying is pointless.
         {:cancel, "client #{client_id} not found"}
 
       client ->
@@ -170,7 +157,6 @@ defmodule ApiGateway.Workers.NotificationWorker do
           :ok
         else
           {:error, :service_unavailable} ->
-            # Email service is temporarily down — Oban will retry with backoff.
             {:error, "email service unavailable"}
 
           {:error, reason} ->
@@ -207,7 +193,6 @@ defmodule ApiGateway.Workers.NotificationWorker do
   end
 
   def perform(%Oban.Job{args: %{"type" => type}}) do
-    # Unknown notification type — retrying will never help
     {:cancel, "unknown notification type: #{type}"}
   end
 end
@@ -216,8 +201,7 @@ end
 ### Step 6: `lib/api_gateway/workers/audit_worker.ex`
 
 The audit worker writes event logs to the analytics store. It runs at high volume
-on a dedicated queue with 50 concurrent slots. Failed writes retry up to 3 times;
-unknown event types are cancelled immediately.
+on a dedicated queue with 50 concurrent slots.
 
 ```elixir
 defmodule ApiGateway.Workers.AuditWorker do
@@ -245,7 +229,6 @@ defmodule ApiGateway.Workers.AuditWorker do
         :ok
 
       {:error, :connection_refused} ->
-        # Analytics store is temporarily down — retry with backoff.
         {:error, "analytics store unavailable"}
 
       {:error, reason} ->
@@ -262,8 +245,7 @@ end
 ### Step 7: `lib/api_gateway/workers/report_worker.ex`
 
 The report worker handles slow, CPU-bound report generation. It chains a notification
-job upon completion so the client is informed when their report is ready. The `unique`
-option prevents duplicate reports for the same client+period within an hour.
+job upon completion so the client is informed when their report is ready.
 
 ```elixir
 defmodule ApiGateway.Workers.ReportWorker do
@@ -279,11 +261,8 @@ defmodule ApiGateway.Workers.ReportWorker do
         {:cancel, "client #{client_id} not found"}
 
       client ->
-        # Generate the usage report (slow operation — may take minutes)
         with {:ok, report} <- ApiGateway.Reports.generate(client, period),
              {:ok, _stored} <- ApiGateway.Reports.store(report) do
-          # Chain a notification to inform the client their report is ready.
-          # This runs as a separate Oban job on the notifications queue.
           %{"type" => "report_ready", "client_id" => client_id}
           |> ApiGateway.Workers.NotificationWorker.new()
           |> Oban.insert()
@@ -291,7 +270,6 @@ defmodule ApiGateway.Workers.ReportWorker do
           :ok
         else
           {:error, :timeout} ->
-            # External service timed out — transient, Oban will retry.
             {:error, "report generation timed out"}
 
           {:error, reason} ->
@@ -300,15 +278,13 @@ defmodule ApiGateway.Workers.ReportWorker do
     end
   end
 
-  # Kill the job if it takes more than 10 minutes
   def timeout(_job), do: :timer.minutes(10)
 end
 ```
 
 ### Step 8: `lib/api_gateway/oban_logger.ex`
 
-Structured logging for all Oban job lifecycle events. Attach this in `Application.start/2`
-to get visibility into job execution times, failures, and retries.
+Structured logging for all Oban job lifecycle events.
 
 ```elixir
 defmodule ApiGateway.ObanLogger do
@@ -342,7 +318,7 @@ defmodule ApiGateway.ObanLogger do
 end
 ```
 
-### Step 9: Given tests — must pass without modification
+### Step 9: Tests
 
 ```elixir
 # test/api_gateway/workers/notification_worker_test.exs
@@ -353,7 +329,7 @@ defmodule ApiGateway.Workers.NotificationWorkerTest do
   alias ApiGateway.Workers.NotificationWorker
 
   test "welcome job succeeds for existing client" do
-    client = insert(:client)  # factory — adapt to your setup
+    client = insert(:client)
 
     assert :ok = perform_job(NotificationWorker, %{
       "type"      => "welcome",
@@ -420,8 +396,6 @@ mix test test/api_gateway/workers/ --trace
 
 ## Trade-off analysis
 
-Fill in this table based on your implementation.
-
 | Aspect | Oban (PostgreSQL) | Custom in-memory scheduler | Raw `Task.async` |
 |--------|-------------------|---------------------------|-----------------|
 | Durability on crash | yes (DB-persisted) | no | no |
@@ -431,10 +405,6 @@ Fill in this table based on your implementation.
 | Latency to enqueue | DB round-trip (~5ms) | none | none |
 | Dependencies | Oban + Ecto + Postgres | none | none |
 | Observability | Oban Web dashboard | custom | none |
-
-Reflection: the audit queue runs at high volume (every API request). What is the DB write
-throughput limit for Oban? At what request rate would you move audit logs to a different
-mechanism (e.g., Kafka, direct ClickHouse inserts)?
 
 ---
 
@@ -466,7 +436,7 @@ crashes the request. Use `insert/1` and handle the `{:error, changeset}` case.
 
 ## Resources
 
-- [Oban documentation](https://hexdocs.pm/oban/Oban.html) — complete API reference
-- [Oban.Testing](https://hexdocs.pm/oban/Oban.Testing.html) — `perform_job/2`, `assert_enqueued/1`
-- [Oban plugins](https://hexdocs.pm/oban/Oban.Plugins.Pruner.html) — Pruner, Lifeline, Stager
-- [Oban Web](https://getoban.pro/oban-web) — commercial dashboard for monitoring queues
+- [Oban documentation](https://hexdocs.pm/oban/Oban.html) -- complete API reference
+- [Oban.Testing](https://hexdocs.pm/oban/Oban.Testing.html) -- `perform_job/2`, `assert_enqueued/1`
+- [Oban plugins](https://hexdocs.pm/oban/Oban.Plugins.Pruner.html) -- Pruner, Lifeline, Stager
+- [Oban Web](https://getoban.pro/oban-web) -- commercial dashboard for monitoring queues

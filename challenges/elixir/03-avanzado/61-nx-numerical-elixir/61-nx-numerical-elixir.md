@@ -1,32 +1,20 @@
 # Nx — Numerical Computation for Gateway Metrics
 
-**Project**: `api_gateway` — built incrementally across the advanced level
-
----
-
 ## Project context
 
-You're building `api_gateway`. The gateway is accumulating request metrics — latency
-samples, error rates, payload sizes — stored as lists of floats in ETS. The ops team
-wants anomaly detection: flag services whose p99 latency deviates significantly from
-their rolling mean, and project future load based on recent trends. You will use `Nx`
-for the tensor operations and `defn` for the compiled hot path.
+You are building `api_gateway`, an internal HTTP gateway. The gateway accumulates request metrics — latency samples, error rates, payload sizes — stored as lists of floats. The ops team wants anomaly detection: flag services whose p99 latency deviates significantly from their rolling mean, and project future load based on recent trends. You will use `Nx` for the tensor operations and `defn` for the compiled hot path. All modules are defined from scratch.
 
-Project structure at this point:
+Project structure:
 
 ```
 api_gateway/
 ├── lib/
 │   └── api_gateway/
-│       ├── metrics/
-│       │   ├── store.ex            # already exists — ETS-backed metric collector
-│       │   ├── analyzer.ex         # statistical analysis with Nx
-│       │   └── anomaly_detector.ex # flags anomalous services
+│       └── metrics/
+│           └── analyzer.ex         # statistical analysis with Nx
 ├── test/
 │   └── api_gateway/
 │       └── metrics_analyzer_test.exs # given tests — must pass without modification
-├── bench/
-│   └── metrics_bench.exs           # benchmark — run at the end
 └── mix.exs
 ```
 
@@ -34,43 +22,20 @@ api_gateway/
 
 ## The business problem
 
-The metrics store collects latency samples per service: `[12.3, 14.1, 11.8, 98.4, 13.2, ...]`.
-The anomaly detector needs to:
+The metrics store collects latency samples per service: `[12.3, 14.1, 11.8, 98.4, 13.2, ...]`. The anomaly detector needs to:
 
 1. Compute rolling statistics (mean, std dev) over a sliding window of samples
 2. Flag samples more than N standard deviations from the mean as anomalies
 3. Fit a linear trend to the last 60 minutes of request counts to project the next 15 minutes
 4. Process batches of samples at maximum throughput — compiled with `defn`
 
-The computations must be fast enough to run on every request flush (every 10 seconds)
-without blocking the main request path.
-
 ---
 
 ## Why Nx instead of plain Elixir math
 
-The naive approach — `Enum.sum(samples) / length(samples)` — copies data, allocates
-intermediate lists, and runs in O(n) interpreted Elixir. For 10,000 samples across
-50 services (500,000 values), this is measurably slow.
+The naive approach — `Enum.sum(samples) / length(samples)` — copies data, allocates intermediate lists, and runs in O(n) interpreted Elixir. Nx tensors are contiguous binary arrays. Operations run in native code. The key difference is `defn`: Nx macros that compile the entire function into a single native kernel. The BEAM calls the compiled kernel once per invocation instead of dispatching each arithmetic operation through the VM.
 
-Nx tensors are contiguous binary arrays. Operations run in native code (C, XLA). The
-key difference is `defn`: Nx macros that compile the entire function — including loops
-and conditionals — into a single native kernel. The BEAM calls the compiled kernel once
-per invocation instead of dispatching each arithmetic operation through the VM.
-
-The trade-off: `defn` functions can only call other `defn` functions and Nx operations.
-They cannot call arbitrary Elixir code. The boundary between `defn` and regular Elixir
-is the performance-vs-expressiveness trade-off you will feel in this exercise.
-
----
-
-## Why `defn` improves performance over `Nx.*` calls from regular Elixir
-
-Each `Nx.*` call from regular Elixir code dispatches to the backend, transfers control,
-and returns a tensor. A chain of 10 operations is 10 round-trips. `defn` traces the
-entire function and compiles it into a single native kernel — the 10 operations execute
-as one, with no intermediate dispatch overhead and with opportunities for backend-level
-fusion (e.g., EXLA can fuse `add + multiply` into a single GPU kernel).
+The trade-off: `defn` functions can only call other `defn` functions and Nx operations. They cannot call arbitrary Elixir code.
 
 ---
 
@@ -81,9 +46,8 @@ fusion (e.g., EXLA can fuse `add + multiply` into a single GPU kernel).
 ```elixir
 defp deps do
   [
-    # existing deps...
     {:nx, "~> 0.7"},
-    {:exla, "~> 0.7", only: [:dev, :prod]},  # optional — CPU/GPU acceleration
+    {:exla, "~> 0.7", only: [:dev, :prod]},
     {:benchee, "~> 1.3", only: :dev}
   ]
 end
@@ -201,87 +165,15 @@ defmodule ApiGateway.Metrics.Analyzer do
 end
 ```
 
-The `stats/1` function converts a plain Elixir list to an `:f32` tensor, computes
-mean and standard deviation with single Nx calls, and converts back to floats.
-The Nx boundary is fully encapsulated — callers never see tensors.
+The `stats/1` function converts a plain Elixir list to an `:f32` tensor, computes mean and standard deviation with single Nx calls, and converts back to floats. The Nx boundary is fully encapsulated — callers never see tensors.
 
-`anomaly_indices/2` computes a z-score for each sample: `|sample - mean| / std_dev`.
-The result is a boolean mask tensor where `1` means the z-score exceeds the threshold.
-`Nx.to_flat_list/1` converts the mask back to Elixir, and `Enum.with_index` filters
-for the anomalous indices. When `std_dev` is zero (all samples identical), no anomalies
-are possible, so it short-circuits to an empty list.
+`anomaly_indices/2` computes a z-score for each sample: `|sample - mean| / std_dev`. The result is a boolean mask tensor where `1` means the z-score exceeds the threshold. When `std_dev` is zero (all samples identical), no anomalies are possible, so it short-circuits to an empty list.
 
-`linear_trend/1` implements ordinary least squares regression in closed form.
-The slope formula `cov(x,y) / var(x)` avoids matrix inversion and works correctly
-for the 1D case. The x-axis is simply `[0, 1, 2, ..., n-1]` — the sample index.
+`linear_trend/1` implements ordinary least squares regression in closed form. The slope formula `cov(x,y) / var(x)` avoids matrix inversion and works correctly for the 1D case.
 
-`rolling_zscore/1` is the `defn` hot path. It operates on a 2D tensor where each row
-is a window of samples. Per-row mean and standard deviation use `axes: [1]` with
-`keep_axes: true` so broadcasting works automatically. The epsilon prevents division
-by zero when all values in a window are identical.
+`rolling_zscore/1` is the `defn` hot path. It operates on a 2D tensor where each row is a window of samples. The epsilon prevents division by zero when all values in a window are identical.
 
-### Step 3: `lib/api_gateway/metrics/anomaly_detector.ex`
-
-```elixir
-defmodule ApiGateway.Metrics.AnomalyDetector do
-  @moduledoc """
-  Flags services with anomalous latency patterns.
-
-  Reads from MetricsStore, runs statistical analysis, and returns
-  a list of services that require attention.
-  """
-  alias ApiGateway.Metrics.{Store, Analyzer}
-
-  @threshold_stddev 3.0
-  @min_samples 10
-
-  @doc """
-  Returns a list of `%{service: name, anomalies: count, p99: float}` maps
-  for services with at least one anomalous sample in their recent window.
-  """
-  def detect_anomalies do
-    Store.all_services()
-    |> Enum.map(fn service_name ->
-      samples = Store.get_samples(service_name, limit: 100)
-      analyze_service(service_name, samples)
-    end)
-    |> Enum.reject(&is_nil/1)
-  end
-
-  # -- private --
-
-  defp analyze_service(_name, samples) when length(samples) < @min_samples, do: nil
-
-  defp analyze_service(name, samples) do
-    indices = Analyzer.anomaly_indices(samples, @threshold_stddev)
-
-    if indices == [] do
-      nil
-    else
-      sorted = Enum.sort(samples)
-      p99_index = trunc(length(sorted) * 0.99)
-      p99_value = Enum.at(sorted, min(p99_index, length(sorted) - 1))
-
-      %{
-        service: name,
-        anomalies: length(indices),
-        p99: p99_value
-      }
-    end
-  end
-end
-```
-
-The `detect_anomalies/0` function iterates over all services, retrieves their recent
-samples, and runs the anomaly analysis. Services with fewer than 10 samples are
-skipped — statistical analysis on tiny samples produces unreliable results.
-
-For each qualifying service, it computes the p99 latency by sorting the samples and
-taking the value at the 99th percentile index. The result includes the service name,
-the count of anomalous samples, and the p99 value — enough for the ops team to
-prioritize investigation.
-
-### Step 4: Given tests — must pass without modification
+### Step 3: Given tests — must pass without modification
 
 ```elixir
 # test/api_gateway/metrics_analyzer_test.exs
@@ -357,36 +249,10 @@ defmodule ApiGateway.Metrics.AnalyzerTest do
 end
 ```
 
-### Step 5: Run the tests
+### Step 4: Run the tests
 
 ```bash
 mix test test/api_gateway/metrics_analyzer_test.exs --trace
-```
-
-### Step 6: Benchmark
-
-```elixir
-# bench/metrics_bench.exs
-samples_1k  = Enum.map(1..1_000, fn _ -> :rand.uniform() * 100 end)
-samples_10k = Enum.map(1..10_000, fn _ -> :rand.uniform() * 100 end)
-
-windows = Nx.random_uniform({100, 60}, type: :f32)
-
-Benchee.run(
-  %{
-    "stats — 1k samples"  => fn -> ApiGateway.Metrics.Analyzer.stats(samples_1k) end,
-    "stats — 10k samples" => fn -> ApiGateway.Metrics.Analyzer.stats(samples_10k) end,
-    "rolling_zscore — 100 windows of 60" =>
-      fn -> ApiGateway.Metrics.Analyzer.rolling_zscore(windows) end
-  },
-  time: 5,
-  warmup: 2,
-  formatters: [Benchee.Formatters.Console]
-)
-```
-
-```bash
-mix run bench/metrics_bench.exs
 ```
 
 ---
@@ -400,36 +266,24 @@ mix run bench/metrics_bench.exs
 | Arbitrary Elixir in hot path | No (defn only) | Yes | Yes |
 | GPU acceleration | EXLA backend | No | No |
 | Type safety | Explicit tensor types | None | None |
-| Debugging | Hard (compiled) | Easy | Medium |
 
-Reflection question: `defn` functions cannot call arbitrary Elixir. What does this mean
-for error handling inside a `defn`? What happens if a division by zero occurs at the Nx
-level versus at the Elixir level?
+Reflection question: `defn` functions cannot call arbitrary Elixir. What does this mean for error handling inside a `defn`? What happens if a division by zero occurs at the Nx level versus at the Elixir level?
 
 ---
 
 ## Common production mistakes
 
 **1. Converting tensors to lists inside `defn`**
-`Nx.to_flat_list/1` is not available in `defn` — it crosses the Nx/Elixir boundary.
-Move all tensor-to-Elixir conversions outside `defn` functions.
+`Nx.to_flat_list/1` is not available in `defn` — it crosses the Nx/Elixir boundary. Move all tensor-to-Elixir conversions outside `defn` functions.
 
-**2. Using `System.os_time` for time-based sliding windows**
-If the BEAM node experiences an NTP adjustment, `os_time` can jump backwards. Use
-`System.monotonic_time` for any comparison where ordering matters.
+**2. Not specifying tensor types explicitly**
+Default type depends on the backend. Always pass `type: :f32` or `type: :s64` explicitly when creating tensors from user data.
 
-**3. Not specifying tensor types explicitly**
-Default type depends on the backend. On EXLA, integers may become `:s64`; on BinaryBackend,
-`:f32`. Code that works on one backend silently breaks on another. Always pass `type: :f32`
-or `type: :s64` explicitly when creating tensors from user data.
+**3. Building tensors inside a loop**
+`Nx.tensor([])` in a loop rebuilds the tensor each iteration. Build the tensor once from the full list, then operate on it with batch operations.
 
-**4. Building tensors inside a loop**
-`Nx.tensor([])` in a loop rebuilds the tensor each iteration, allocating memory each time.
-Build the tensor once from the full list, then operate on it with batch operations.
-
-**5. Forgetting EXLA is optional**
-EXLA requires XLA to be compiled on the first run (can take minutes). In CI, use the
-default `Nx.BinaryBackend` unless you are specifically benchmarking backend differences.
+**4. Forgetting EXLA is optional**
+EXLA requires XLA to be compiled on the first run. In CI, use the default `Nx.BinaryBackend` unless you are specifically benchmarking backend differences.
 
 ---
 
@@ -438,4 +292,4 @@ default `Nx.BinaryBackend` unless you are specifically benchmarking backend diff
 - [Nx HexDocs](https://hexdocs.pm/nx/Nx.html) — tensor operations reference
 - [Nx.Defn](https://hexdocs.pm/nx/Nx.Defn.html) — `defn` semantics and limitations
 - [EXLA Backend](https://hexdocs.pm/exla/EXLA.html) — XLA compilation and GPU support
-- [Machine Learning in Elixir — Sean Moriarity](https://pragprog.com/titles/smelixir/machine-learning-in-elixir/) — chapters on Nx fundamentals
+- [Machine Learning in Elixir — Sean Moriarity](https://pragprog.com/titles/smelixir/machine-learning-in-elixir/)

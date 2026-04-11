@@ -1,23 +1,16 @@
 # Absinthe GraphQL — Schema and Resolvers
 
-**Project**: `api_gateway` — built incrementally across the advanced level
-
----
-
 ## Project context
 
-You're building `api_gateway`. The gateway now needs to expose an internal GraphQL API
-so the platform's dashboard can query service status, route configurations, and request
-metrics from a single endpoint — without the N separate REST calls it would need today.
+You are building `api_gateway`, an internal HTTP gateway. The gateway needs to expose an internal GraphQL API so the platform's dashboard can query service status and manage the service registry from a single endpoint. All modules are defined from scratch in this exercise.
 
-Project structure at this point:
+Project structure:
 
 ```
 api_gateway/
 ├── lib/
 │   └── api_gateway/
-│       ├── application.ex
-│       ├── router.ex               # already exists — REST routes
+│       ├── service_store.ex        # Agent-backed service registry (defined here)
 │       └── graphql/
 │           ├── schema.ex           # root schema
 │           ├── types/
@@ -43,35 +36,23 @@ The dashboard team needs a single endpoint to:
 4. Deregister a service via mutation
 5. Subscribe to service registration events in real time
 
-REST forces the dashboard to make separate calls and join the data client-side.
-GraphQL lets the client declare exactly what it needs — one request, one response.
+REST forces the dashboard to make separate calls and join the data client-side. GraphQL lets the client declare exactly what it needs — one request, one response.
 
 ---
 
 ## Why GraphQL over REST here
 
-REST exposes resources. The client gets what the server decided. For the dashboard —
-which has three different views (overview table, service detail, metrics panel) each
-needing different fields — this means either overfetching (GET /services returns 20
-fields when the table only needs 3) or adding custom endpoints per view.
+REST exposes resources. The client gets what the server decided. For the dashboard — which has three different views (overview table, service detail, metrics panel) each needing different fields — this means either overfetching (GET /services returns 20 fields when the table only needs 3) or adding custom endpoints per view.
 
-GraphQL inverts the contract: the client declares the shape. The server returns exactly
-that shape. For multi-view dashboards with varying data needs, this eliminates both
-overfetching and endpoint proliferation.
+GraphQL inverts the contract: the client declares the shape. The server returns exactly that shape. For multi-view dashboards with varying data needs, this eliminates both overfetching and endpoint proliferation.
 
-The trade-off: REST has transparent HTTP caching (ETags, CDN by URL). GraphQL queries
-all go to the same URL with POST, so HTTP cache is useless. You need application-level
-caching (persisted queries, DataLoader) explicitly.
+The trade-off: REST has transparent HTTP caching (ETags, CDN by URL). GraphQL queries all go to the same URL with POST, so HTTP cache is useless. You need application-level caching explicitly.
 
 ---
 
 ## Why resolvers always return `{:ok, value}` or `{:error, reason}`
 
-Absinthe executes the entire query tree and collects all errors. A resolver returning
-`{:error, "not found"}` does not crash the query — it puts a null in that field and
-adds the error to the `errors` array in the response. The client receives a partial
-result with error context, not a 500. This is intentional GraphQL semantics: partial
-responses are valid.
+Absinthe executes the entire query tree and collects all errors. A resolver returning `{:error, "not found"}` does not crash the query — it puts a null in that field and adds the error to the `errors` array in the response. The client receives a partial result with error context, not a 500.
 
 ---
 
@@ -82,23 +63,68 @@ responses are valid.
 ```elixir
 defp deps do
   [
-    # existing deps...
+    {:jason, "~> 1.4"},
     {:absinthe, "~> 1.7"},
     {:absinthe_plug, "~> 1.5"},
-    {:absinthe_phoenix, "~> 2.0"}  # for subscriptions via Phoenix Channels
+    {:absinthe_phoenix, "~> 2.0"}
   ]
 end
 ```
 
-### Step 2: `lib/api_gateway/graphql/types/scalars.ex`
+### Step 2: `lib/api_gateway/service_store.ex`
+
+This Agent-backed store provides the data layer for the GraphQL resolvers.
+
+```elixir
+defmodule ApiGateway.ServiceStore do
+  @moduledoc """
+  In-memory registry of backend services.
+  Stores `%{name => %{name, url, health_path, registered_at}}`.
+  """
+  use Agent
+
+  @spec start_link(keyword()) :: Agent.on_start()
+  def start_link(_opts), do: Agent.start_link(fn -> %{} end, name: __MODULE__)
+
+  @spec list() :: [map()]
+  def list, do: Agent.get(__MODULE__, &Map.values/1)
+
+  @spec get(String.t()) :: map() | nil
+  def get(name), do: Agent.get(__MODULE__, &Map.get(&1, name))
+
+  @spec register(map()) :: map()
+  def register(attrs) do
+    Agent.get_and_update(__MODULE__, fn services ->
+      entry = Map.merge(attrs, %{"registered_at" => DateTime.utc_now() |> DateTime.to_iso8601()})
+      {entry, Map.put(services, attrs["name"], entry)}
+    end)
+  end
+
+  @spec deregister(String.t()) :: :ok | :error
+  def deregister(name) do
+    Agent.get_and_update(__MODULE__, fn services ->
+      case Map.pop(services, name) do
+        {nil, _} -> {:error, services}
+        {_entry, rest} -> {:ok, rest}
+      end
+    end)
+  end
+end
+```
+
+### Step 3: `lib/api_gateway/graphql/types/scalars.ex`
 
 ```elixir
 defmodule ApiGateway.GraphQL.Types.Scalars do
+  @moduledoc """
+  Custom scalar types for the GraphQL schema.
+  """
   use Absinthe.Schema.Notation
 
   scalar :datetime, description: "ISO 8601 datetime string" do
     serialize fn
       %DateTime{} = dt -> DateTime.to_iso8601(dt)
+      iso when is_binary(iso) -> iso
     end
 
     parse fn
@@ -113,10 +139,13 @@ defmodule ApiGateway.GraphQL.Types.Scalars do
 end
 ```
 
-### Step 3: `lib/api_gateway/graphql/types/service.ex`
+### Step 4: `lib/api_gateway/graphql/types/service.ex`
 
 ```elixir
 defmodule ApiGateway.GraphQL.Types.Service do
+  @moduledoc """
+  GraphQL types for backend services: object, input, queries, mutations.
+  """
   use Absinthe.Schema.Notation
 
   @desc "A backend service registered in the gateway"
@@ -124,7 +153,7 @@ defmodule ApiGateway.GraphQL.Types.Service do
     field :name,            :string
     field :url,             :string
     field :health_path,     :string
-    field :registered_at,   :datetime
+    field :registered_at,   :string
 
     field :status, :string do
       resolve fn service, _, _ ->
@@ -178,13 +207,7 @@ defmodule ApiGateway.GraphQL.Types.Service do
 end
 ```
 
-The `:status` field uses an inline resolver. The resolver receives the service map
-(which has string keys from the `ServiceStore`), checks if a `health_path` is set,
-and returns a status string. In a production system this would make an HTTP health
-check; here we return `"healthy"` as a default since health checking is covered by
-the DataLoader exercise.
-
-### Step 4: `lib/api_gateway/graphql/resolvers/service.ex`
+### Step 5: `lib/api_gateway/graphql/resolvers/service.ex`
 
 ```elixir
 defmodule ApiGateway.GraphQL.Resolvers.Service do
@@ -200,10 +223,13 @@ defmodule ApiGateway.GraphQL.Resolvers.Service do
   """
   alias ApiGateway.ServiceStore
 
+  @spec list_services(any(), map(), Absinthe.Resolution.t()) :: {:ok, [map()]}
   def list_services(_, _, _) do
     {:ok, ServiceStore.list()}
   end
 
+  @spec get_service(any(), %{name: String.t()}, Absinthe.Resolution.t()) ::
+          {:ok, map()} | {:error, String.t()}
   def get_service(_, %{name: name}, _) do
     case ServiceStore.get(name) do
       nil -> {:error, "service #{name} not found"}
@@ -211,26 +237,21 @@ defmodule ApiGateway.GraphQL.Resolvers.Service do
     end
   end
 
+  @spec register_service(any(), %{input: map()}, Absinthe.Resolution.t()) :: {:ok, map()}
   def register_service(_, %{input: input}, _) do
     # Absinthe delivers input as an atom-keyed map: %{name: "x", url: "y"}.
     # ServiceStore expects string keys. Convert at the resolver boundary.
     string_keyed =
       input
-      |> Map.from_struct_or_map()
+      |> convert_to_map()
       |> Enum.into(%{}, fn {k, v} -> {to_string(k), v} end)
 
     service = ServiceStore.register(string_keyed)
-
-    # Publish to subscription topic so connected subscribers are notified
-    Absinthe.Subscription.publish(
-      ApiGateway.Endpoint,
-      service,
-      service_registered: "services:registered"
-    )
-
     {:ok, service}
   end
 
+  @spec deregister_service(any(), %{name: String.t()}, Absinthe.Resolution.t()) ::
+          {:ok, boolean()} | {:error, String.t()}
   def deregister_service(_, %{name: name}, _) do
     case ServiceStore.deregister(name) do
       :ok -> {:ok, true}
@@ -239,25 +260,19 @@ defmodule ApiGateway.GraphQL.Resolvers.Service do
   end
 
   # Handles both plain maps and structs uniformly
-  defp map_from_struct_or_map(%_{} = struct), do: Map.from_struct(struct)
-  defp map_from_struct_or_map(map) when is_map(map), do: map
+  defp convert_to_map(%_{} = struct), do: Map.from_struct(struct)
+  defp convert_to_map(map) when is_map(map), do: map
 end
 ```
 
-The `register_service/3` resolver converts atom-keyed input from Absinthe to
-string-keyed maps for the `ServiceStore`. This conversion happens at the resolver
-boundary — the domain layer (ServiceStore) should not need to know about Absinthe's
-conventions. After registration, `Absinthe.Subscription.publish/3` notifies any
-connected WebSocket subscribers on the `"services:registered"` topic.
-
-The `deregister_service/3` resolver maps `ServiceStore.deregister/1` results to the
-GraphQL contract: `:ok` becomes `{:ok, true}` and `:error` becomes an error tuple
-with a descriptive message that appears in the response's `errors` array.
-
-### Step 5: `lib/api_gateway/graphql/schema.ex`
+### Step 6: `lib/api_gateway/graphql/schema.ex`
 
 ```elixir
 defmodule ApiGateway.GraphQL.Schema do
+  @moduledoc """
+  Root GraphQL schema for the api_gateway.
+  Imports all type modules and wires query, mutation, and subscription roots.
+  """
   use Absinthe.Schema
 
   import_types ApiGateway.GraphQL.Types.Scalars
@@ -274,20 +289,6 @@ defmodule ApiGateway.GraphQL.Schema do
   subscription do
     import_fields :service_subscriptions
   end
-end
-```
-
-### Step 6: Mount the GraphQL endpoint in the router
-
-```elixir
-# In ApiGateway.Router (add after existing routes)
-forward "/graphql", Absinthe.Plug,
-  schema: ApiGateway.GraphQL.Schema
-
-# Development only — interactive query editor
-if Mix.env() == :dev do
-  forward "/graphiql", Absinthe.Plug.GraphiQL,
-    schema: ApiGateway.GraphQL.Schema
 end
 ```
 
@@ -396,40 +397,27 @@ mix test test/api_gateway/graphql_schema_test.exs --trace
 | Client control | Client chooses fields | Server decides shape |
 | HTTP caching | None (POST /graphql) | ETags, CDN by URL |
 | Type safety | Schema is the contract | OpenAPI optional |
-| N+1 risk | High (mitigated by DataLoader, next exercise) | Explicit per endpoint |
+| N+1 risk | High (mitigated by DataLoader) | Explicit per endpoint |
 | Subscriptions | Built-in via WebSocket | SSE or polling |
 | Learning curve | Higher | Lower |
 
-Reflection question: the schema has both a `list_services` query and the `register_service`
-mutation publishes to a subscription. What happens if a subscriber is connected when a new
-service registers — and what happens if no subscriber is connected? Is data lost?
+Reflection question: the schema has both a `list_services` query and the `register_service` mutation publishes to a subscription. What happens if a subscriber is connected when a new service registers — and what happens if no subscriber is connected? Is data lost?
 
 ---
 
 ## Common production mistakes
 
 **1. Resolvers returning raw values instead of `{:ok, value}`**
-A resolver that returns `service` (not `{:ok, service}`) will produce an error like
-`"Expected {:ok, _} or {:error, _} from resolver"`. Absinthe is strict about this contract.
+A resolver that returns `service` (not `{:ok, service}`) will produce an error like `"Expected {:ok, _} or {:error, _} from resolver"`. Absinthe is strict about this contract.
 
-**2. Subscriptions without the `Absinthe.Middleware.Dataloader` plugin**
-If you add DataLoader later (next exercise) but forget to add it to `plugins/0` in the
-schema, batching silently does not happen and you get N+1 queries.
+**2. `input_object` fields with atom keys in resolvers**
+Absinthe converts input arguments to atom-keyed maps. `input.name` works; `input["name"]` does not. The confusion arises because the ServiceStore uses string keys. Always convert at the resolver boundary, not deeper in the domain.
 
-**3. `input_object` fields with atom keys in resolvers**
-Absinthe converts input arguments to atom-keyed maps. `input.name` works; `input["name"]`
-does not. The confusion arises because the ServiceStore uses string keys. Always convert
-at the resolver boundary, not deeper in the domain.
+**3. Mutations without auth middleware**
+Any mutation that changes state must be gated behind the gateway's auth. The cleanest place is Absinthe middleware — `middleware MyApp.Middleware.Authenticate` before `resolve`. If you add it field by field you will inevitably miss one.
 
-**4. Mutations without auth middleware**
-Any mutation that changes state must be gated behind the gateway's auth. The cleanest
-place is Absinthe middleware — `middleware MyApp.Middleware.Authenticate` before
-`resolve`. If you add it field by field you will inevitably miss one.
-
-**5. Large schemas in a single file**
-`import_types` lets you split types into modules. A 1000-line `schema.ex` is a maintenance
-problem. Split by domain concept from the start: `Types.Service`, `Types.Metrics`,
-`Resolvers.Service`, etc.
+**4. Large schemas in a single file**
+`import_types` lets you split types into modules. A 1000-line `schema.ex` is a maintenance problem. Split by domain concept from the start.
 
 ---
 

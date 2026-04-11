@@ -1,32 +1,19 @@
 # Tuples and Pattern Matching: Transaction Result Handling
 
-**Project**: `payments_cli` — built incrementally across the basic level
+**Project**: `payments_cli` — a CLI tool that processes payment transactions
 
 ---
 
 ## Project context
 
-You're building `payments_cli`. Every operation in the payments pipeline — parsing,
-validation, processing — can fail. Elixir's pattern matching and the `{:ok, value}` /
-`{:error, reason}` convention are the mechanism for expressing and handling these
-failures explicitly.
+You are building `payments_cli`, a CLI tool that processes payment transactions from CSV
+files, validates them, applies business rules, and produces ledger reports.
 
-Project structure at this point:
-
-```
-payments_cli/
-├── lib/
-│   └── payments_cli/
-│       ├── cli.ex
-│       ├── transaction.ex
-│       ├── ledger.ex
-│       ├── formatter.ex
-│       └── pipeline.ex     # ← you implement this
-├── test/
-│   └── payments_cli/
-│       └── pipeline_test.exs  # given tests — must pass without modification
-└── mix.exs
-```
+This exercise implements a `Pipeline` module that processes CSV lines through a
+parse-validate-classify pipeline. Every operation can fail, and Elixir's pattern matching
+with the `{:ok, value}` / `{:error, reason}` convention handles these failures explicitly.
+The module is completely self-contained — it defines all the helper functions it needs
+for CSV parsing, validation, and status conversion.
 
 ---
 
@@ -58,7 +45,7 @@ is better than silently continuing with corrupted data.
 
 The `Pipeline` module needs to:
 
-1. Process a single CSV line through parse → validate → classify
+1. Process a single CSV line through parse -> validate -> classify
 2. Return `{:ok, transaction_map}` on success
 3. Return `{:error, reason}` on any failure, identifying which step failed
 4. Process a batch of lines and separate successes from failures
@@ -88,7 +75,7 @@ defmodule PaymentsCli.Pipeline do
   This is the explicit error handling model — no exceptions, no nil checks.
   """
 
-  alias PaymentsCli.{Formatter, Transaction}
+  @valid_statuses [:pending, :approved, :declined, :reversed, :flagged]
 
   @doc """
   Processes a single CSV line through the full pipeline.
@@ -107,7 +94,7 @@ defmodule PaymentsCli.Pipeline do
   """
   @spec process_line(String.t()) :: {:ok, map()} | {:error, {atom(), term()}}
   def process_line(line) when is_binary(line) do
-    case Formatter.parse_csv_line(line) do
+    case parse_csv_line(line) do
       {:error, reason} ->
         {:error, {:parse, reason}}
 
@@ -117,7 +104,7 @@ defmodule PaymentsCli.Pipeline do
             {:error, {:validate, reason}}
 
           {:ok, validated} ->
-            case Transaction.parse_status(validated.status) do
+            case convert_status(validated.status) do
               {:error, reason} ->
                 {:error, {:status, reason}}
 
@@ -161,8 +148,33 @@ defmodule PaymentsCli.Pipeline do
   end
 
   # ---------------------------------------------------------------------------
-  # Private helpers
+  # Private helpers — CSV parsing, validation, and status conversion
   # ---------------------------------------------------------------------------
+
+  @spec parse_csv_line(String.t()) :: {:ok, map()} | {:error, String.t()}
+  defp parse_csv_line(line) do
+    fields = line |> String.split(",") |> Enum.map(&String.trim/1)
+
+    case fields do
+      [id, amount_str, currency, merchant, status] ->
+        case Integer.parse(amount_str) do
+          {amount, ""} ->
+            {:ok, %{
+              id: id,
+              amount_cents: amount,
+              currency: currency,
+              merchant: merchant,
+              status: status
+            }}
+
+          _ ->
+            {:error, "invalid amount: #{amount_str}"}
+        end
+
+      _ ->
+        {:error, "expected 5 fields, got #{length(fields)}"}
+    end
+  end
 
   @spec validate_transaction(map()) :: {:ok, map()} | {:error, String.t()}
   defp validate_transaction(%{amount_cents: amount, currency: currency} = tx) do
@@ -177,6 +189,22 @@ defmodule PaymentsCli.Pipeline do
         {:ok, tx}
     end
   end
+
+  @spec convert_status(String.t()) :: {:ok, atom()} | {:error, :unknown_status}
+  defp convert_status(status_string) when is_binary(status_string) do
+    atom =
+      try do
+        String.to_existing_atom(status_string)
+      rescue
+        ArgumentError -> nil
+      end
+
+    if atom in @valid_statuses do
+      {:ok, atom}
+    else
+      {:error, :unknown_status}
+    end
+  end
 end
 ```
 
@@ -185,19 +213,26 @@ end
 - `process_line/1` uses nested `case` expressions to chain three fallible steps. Each
   `case` pattern-matches on the result tuple: `{:ok, data}` continues to the next step,
   `{:error, reason}` wraps the reason with a step tag and returns immediately. The
-  nesting is intentional — in exercise 09 you will learn `with` which flattens this
-  pattern, but understanding the explicit `case` chain first is essential.
+  nesting is intentional — understanding the explicit `case` chain is essential before
+  learning the `with` macro that flattens this pattern.
 
 - `process_batch/1` uses `Enum.with_index(lines, 1)` to pair each line with its 1-based
   line number, then reduces into two accumulators. Each result is prepended to the
   appropriate accumulator (O(1) per step), then both lists are reversed at the end
-  (O(n) total). This is O(n) overall, not O(n²).
+  (O(n) total). This is O(n) overall, not O(n^2).
 
 - `validate_transaction/1` uses `cond` because the checks are independent boolean
   conditions, not pattern matches on a value's shape. `cond` is the right tool when
   you have "check this, then that, then the other" logic.
 
-### Given tests — must pass without modification
+- `parse_csv_line/1` splits on commas, trims whitespace, and validates the field count.
+  `Integer.parse/1` returns `{integer, rest}` on success — matching on `{amount, ""}`
+  ensures the entire string was consumed.
+
+- `convert_status/1` safely converts string status to atom using `String.to_existing_atom/1`
+  with a rescue, then verifies membership in the valid statuses list.
+
+### Tests
 
 ```elixir
 # test/payments_cli/pipeline_test.exs
@@ -281,8 +316,8 @@ mix test test/payments_cli/pipeline_test.exs --trace
 | Code structure | `case` / `with` chains | `try/rescue` | `if x != nil` chains |
 | Testing | Test each branch explicitly | Rescue in tests | Check for nil |
 
-Reflection question: `process_line/1` uses nested `case` expressions. In exercise 09
-you will learn the `with` macro. Compare the two approaches — what does `with` add
+Reflection question: `process_line/1` uses nested `case` expressions. The `with` macro
+can flatten this pattern. Compare the two approaches — what does `with` add
 beyond syntactic convenience?
 
 ---

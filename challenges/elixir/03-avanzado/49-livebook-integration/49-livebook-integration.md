@@ -1,15 +1,11 @@
 # Livebook: Operational Notebooks for api_gateway
 
-**Project**: `api_gateway` — built incrementally across the advanced level
+## Overview
 
----
-
-## Project context
-
-The `api_gateway` umbrella is deployed to production. The ops team needs visibility into
-the running system: which upstream services are circuit-broken, how the ETS rate-limiter
-table looks under load, and whether the Oban queues are keeping up. You'll build Livebook
-notebooks that connect to the running node and provide this visibility interactively.
+Build interactive Livebook notebooks for monitoring and diagnosing a running Elixir
+application. The notebooks connect to a live BEAM node and provide real-time visibility
+into process state, telemetry metrics, ETS tables, and background job health -- all
+without deploying any additional infrastructure.
 
 Notebooks to create:
 
@@ -25,7 +21,7 @@ notebooks/
 
 ## Why Livebook over a custom dashboard
 
-Dashboards require deployment infrastructure — a web server, authentication, a frontend.
+Dashboards require deployment infrastructure -- a web server, authentication, a frontend.
 Livebook notebooks run on demand, connect to existing nodes, and require no additional
 deployment. When production is on fire at 2am, a notebook that reads ETS tables and
 renders charts is faster to build and easier to trust than a dashboard that might itself be
@@ -39,7 +35,6 @@ code cells. Pull request review for diagnostic notebooks is straightforward.
 ## Setup
 
 ```bash
-# Install Livebook globally
 mix escript.install hex livebook
 livebook server
 
@@ -54,7 +49,7 @@ docker run -p 8080:8080 -p 8081:8081 --pull always ghcr.io/livebook-dev/livebook
 
 ---
 
-## Notebook 1 — Process Inspector (`01_process_inspector.livemd`)
+## Notebook 1 -- Process Inspector (`01_process_inspector.livemd`)
 
 This notebook must pass as-is when opened in Livebook and executed top-to-bottom.
 
@@ -69,14 +64,11 @@ Mix.install([
 
 ```elixir
 # Cell: Top 20 processes by memory
-# Iterates all processes, collects memory and message queue info,
-# and renders a sortable table of the top 20 memory consumers.
 process_data =
   Process.list()
   |> Enum.map(fn pid ->
     case Process.info(pid, [:registered_name, :memory, :message_queue_len, :reductions]) do
       nil ->
-        # Process died between listing and inspection — skip it
         nil
 
       info ->
@@ -103,9 +95,9 @@ Kino.DataTable.new(process_data, name: "Top 20 Processes by Memory")
 ```
 
 ```elixir
-# Cell: api_gateway supervisor tree
-# Recursively walks the supervisor tree and renders it as an interactive tree widget.
+# Cell: Supervisor tree inspector
 defmodule TreeInspector do
+  @doc "Recursively walks a supervisor tree and builds an inspectable map."
   def build(sup_pid) do
     children = Supervisor.which_children(sup_pid)
     %{
@@ -135,12 +127,13 @@ defmodule TreeInspector do
   end
 end
 
+# Replace with the actual supervisor name of your application
 tree = TreeInspector.build(Process.whereis(ApiGateway.Supervisor))
 Kino.Tree.new(tree)
 ```
 
 ```elixir
-# Cell: ETS tables — view all tables with size and memory usage
+# Cell: ETS tables -- view all tables with size and memory usage
 ets_data =
   :ets.all()
   |> Enum.map(fn table ->
@@ -159,7 +152,6 @@ Kino.DataTable.new(ets_data, name: "ETS Tables")
 
 ```elixir
 # Cell: Auto-refresh process table every 5 seconds
-# Uses Kino.animate to re-execute the process inspection on a timer.
 Kino.animate(5_000, fn _iteration ->
   data =
     Process.list()
@@ -184,7 +176,7 @@ end)
 
 ---
 
-## Notebook 2 — Gateway Metrics (`02_gateway_metrics.livemd`)
+## Notebook 2 -- Gateway Metrics (`02_gateway_metrics.livemd`)
 
 ```elixir
 # Cell: Setup
@@ -199,8 +191,6 @@ alias VegaLite, as: Vl
 
 ```elixir
 # Cell: Telemetry collector GenServer
-# A notebook-local process that attaches to gateway telemetry events
-# and stores the last 1000 samples for charting.
 defmodule MetricsCollector do
   use GenServer
 
@@ -249,7 +239,6 @@ Kino.Markdown.new("MetricsCollector started. Collecting telemetry samples...")
 
 ```elixir
 # Cell: Real-time HTTP request latency chart (line chart)
-# Creates a live-updating line chart that shows request latency over time.
 chart =
   Vl.new(width: 600, height: 300, title: "HTTP Request Latency (ms)")
   |> Vl.mark(:line)
@@ -258,7 +247,6 @@ chart =
   |> Vl.encode_field(:color, "host", type: :nominal)
   |> Kino.VegaLite.new()
 
-# Push new data every 2 seconds
 Kino.animate(2_000, fn _i ->
   samples = MetricsCollector.get_samples() |> Enum.take(50)
 
@@ -277,7 +265,6 @@ end)
 
 ```elixir
 # Cell: Circuit breaker status per host
-# Reads from the :circuit_breaker ETS table and displays current state per host.
 cb_data =
   case :ets.whereis(:circuit_breaker) do
     :undefined ->
@@ -300,7 +287,6 @@ Kino.DataTable.new(cb_data, name: "Circuit Breaker Status")
 
 ```elixir
 # Cell: HTTP status distribution (pie chart)
-# Groups collected samples by status code bucket and renders a pie chart.
 samples = MetricsCollector.get_samples()
 
 status_groups =
@@ -325,11 +311,10 @@ Vl.new(width: 300, height: 300, title: "Status Distribution")
 
 ---
 
-## Notebook 3 — Oban Analysis (`03_oban_analysis.livemd`)
+## Notebook 3 -- Oban Analysis (`03_oban_analysis.livemd`)
 
-**Note**: This notebook requires a live DB connection. It queries Oban job history directly
-from PostgreSQL via `GatewayCore.Repo`. When running in Livebook, attach to a node that
-has the Repo started, or configure a standalone Repo connection.
+**Note**: This notebook requires a live DB connection. Attach to a node that has the Repo
+started, or configure a standalone Repo connection.
 
 ```elixir
 # Cell: Setup
@@ -381,7 +366,6 @@ Kino.DataTable.new(df, name: "Oban Jobs (last 7 days)")
 
 ```elixir
 # Cell: Worker performance summary table
-# Groups jobs by worker and state, computes count, average duration, and p95 duration.
 summary =
   df
   |> DataFrame.group_by(["worker", "state"])
@@ -397,7 +381,6 @@ Kino.DataTable.new(summary, name: "Worker Performance (last 7 days)")
 
 ```elixir
 # Cell: Failed jobs bar chart
-# Filters discarded jobs and renders a bar chart of failure counts per worker.
 failed =
   df
   |> DataFrame.filter(col("state") == "discarded")
@@ -415,7 +398,6 @@ Vl.new(width: 500, height: 300, title: "Failed Jobs by Worker")
 
 ```elixir
 # Cell: Job throughput heatmap (hour of day x day of week)
-# Extracts hour and weekday from inserted_at, groups, and renders a heatmap.
 heatmap_data =
   df
   |> DataFrame.mutate(
@@ -443,7 +425,7 @@ Kino.Markdown.new("Saved to `#{filename}`")
 
 ---
 
-## Notebook 4 — Diagnostic Dashboard (`04_diagnostic_dashboard.livemd`)
+## Notebook 4 -- Diagnostic Dashboard (`04_diagnostic_dashboard.livemd`)
 
 ```elixir
 # Cell: Setup
@@ -452,7 +434,6 @@ Mix.install([{:kino, "~> 0.12"}])
 
 ```elixir
 # Cell: GenServer state inspector form
-# Interactive form to inspect any named GenServer's process info and optionally its state.
 form = Kino.Control.form(
   [
     module: Kino.Input.text("Module name", default: "ApiGateway.Cache.Server"),
@@ -500,32 +481,32 @@ form
 ```
 
 ```elixir
-# Cell: Rate limiter — inspect entries for a specific client
+# Cell: ETS table inspector
 form = Kino.Control.form(
-  [client_id: Kino.Input.text("Client ID")],
+  [table_name: Kino.Input.text("ETS Table Name", default: "rate_limiter_windows")],
   submit: "Inspect"
 )
 
-Kino.listen(form, fn %{data: %{client_id: client_id}} ->
-  case :ets.whereis(:rate_limiter_windows) do
-    :undefined ->
-      Kino.Markdown.new("**:rate_limiter_windows table not found**")
+Kino.listen(form, fn %{data: %{table_name: table_name}} ->
+  try do
+    table_atom = String.to_existing_atom(table_name)
 
-    _ref ->
-      entries = :ets.lookup(:rate_limiter_windows, client_id)
+    case :ets.whereis(table_atom) do
+      :undefined ->
+        Kino.Markdown.new("**Table `:#{table_name}` not found**")
 
-      if entries == [] do
-        Kino.Markdown.new("No entries found for client `#{client_id}`")
-      else
-        timestamps =
-          Enum.flat_map(entries, fn {_key, ts_list} ->
-            Enum.map(List.wrap(ts_list), fn ts ->
-              %{client_id: client_id, timestamp: ts}
-            end)
-          end)
+      _ref ->
+        entries = :ets.tab2list(table_atom) |> Enum.take(100)
 
-        Kino.DataTable.new(timestamps, name: "Rate Limiter Entries for #{client_id}")
-      end
+        data = Enum.map(entries, fn entry ->
+          %{entry: inspect(entry, limit: 200)}
+        end)
+
+        Kino.DataTable.new(data, name: "First 100 entries from :#{table_name}")
+    end
+  rescue
+    ArgumentError ->
+      Kino.Markdown.new("**Atom `:#{table_name}` does not exist**")
   end
 end)
 
@@ -534,7 +515,6 @@ form
 
 ```elixir
 # Cell: System health snapshot (refresh button)
-# One-click button that collects BEAM-level health metrics and renders them.
 button = Kino.Control.button("Refresh")
 
 Kino.listen(button, fn _event ->
@@ -564,15 +544,15 @@ button
 
 ---
 
-## Given tests
+## Verification
 
-Livebook notebooks don't use ExUnit, but each notebook must satisfy these manual checks:
+Livebook notebooks don't use ExUnit, but each notebook must satisfy these checks:
 
 - Opening the notebook in Livebook and pressing "Run all cells" completes without errors
 - `Kino.DataTable` renders a visible, sortable table with at least one row of data
 - `Kino.animate/2` cells update visibly after the configured interval
 - The form in Notebook 4 responds to input within 500ms
-- Notebook 3's DataFrame cells require a live DB connection — documented in a Markdown cell
+- Notebook 3's DataFrame cells require a live DB connection -- documented in a Markdown cell
 
 ---
 
@@ -587,10 +567,6 @@ Livebook notebooks don't use ExUnit, but each notebook must satisfy these manual
 | Security surface | manual session management | Phoenix auth | custom |
 | Reproducibility | cells are executable docs | static dashboard | varies |
 
-Reflection: Livebook connects to production nodes using the Erlang distribution protocol.
-What are the security implications? What controls would you put in place before doing this
-in a PCI-DSS or SOC 2 environment?
-
 ---
 
 ## Common production mistakes
@@ -601,8 +577,8 @@ flooding it with arbitrary strings is a denial-of-service vector.
 
 **2. Calling `:sys.get_state/1` on a high-traffic GenServer**
 `:sys.get_state/1` sends a synchronous message to the GenServer, pausing it while it
-serializes state. On a GenServer processing thousands of messages per second, this call can
-block for seconds. Use it only on GenServers with light load, or read ETS directly.
+serializes state. On a busy GenServer, this can block for seconds. Use only on light-load
+GenServers, or read ETS directly.
 
 **3. Accumulating telemetry samples without a size limit**
 The MetricsCollector keeps the last 1000 samples. Without this limit, running the notebook
@@ -613,15 +589,15 @@ Between `Process.list()` and `Process.info(pid, ...)`, a process can die. `Proce
 returns `nil` for dead processes. Filter nils before mapping.
 
 **5. Connecting Livebook to production without a read-only constraint**
-Livebook code cells can call any function on the connected node — including destructive ones.
+Livebook code cells can call any function on the connected node -- including destructive ones.
 Use a separate read-only user or restrict Livebook to a staging node for exploratory work.
 
 ---
 
 ## Resources
 
-- [Livebook documentation](https://livebook.dev) — setup, runtime connections, smart cells
-- [Kino](https://hexdocs.pm/kino/Kino.html) — interactive widgets, DataTable, VegaLite integration
-- [Explorer](https://hexdocs.pm/explorer/Explorer.html) — DataFrame API reference
-- [VegaLite](https://hexdocs.pm/vega_lite/VegaLite.html) — chart specification DSL
-- [Connecting Livebook to a remote node](https://news.livebook.dev/announcing-livebook-0.6-2RnYHg) — secure attachment guide
+- [Livebook documentation](https://livebook.dev) -- setup, runtime connections, smart cells
+- [Kino](https://hexdocs.pm/kino/Kino.html) -- interactive widgets, DataTable, VegaLite integration
+- [Explorer](https://hexdocs.pm/explorer/Explorer.html) -- DataFrame API reference
+- [VegaLite](https://hexdocs.pm/vega_lite/VegaLite.html) -- chart specification DSL
+- [Connecting Livebook to a remote node](https://news.livebook.dev/announcing-livebook-0.6-2RnYHg) -- secure attachment guide

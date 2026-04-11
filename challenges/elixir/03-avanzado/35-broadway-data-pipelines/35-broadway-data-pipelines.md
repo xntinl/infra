@@ -1,18 +1,19 @@
 # Broadway Data Pipelines
 
-**Project**: `api_gateway` — built incrementally across the advanced level
+**Project**: `api_gateway` — a standalone HTTP gateway exercise
 
 ---
 
 ## Project context
 
-`api_gateway` receives webhook events from payment providers and must process them
-reliably: parse, validate, route to priority consumers, and persist to the database in
-bulk — all while guaranteeing that no event is silently lost even if a processor crashes.
-GenStage gave you the back-pressure model; Broadway adds acknowledgment, batching, and
+You are building `api_gateway`, an HTTP gateway that routes traffic to microservices. The
+gateway receives webhook events from payment providers and must process them reliably:
+parse, validate, route to priority consumers, and persist to the database in bulk — all
+while guaranteeing that no event is silently lost even if a processor crashes. GenStage
+provides the back-pressure model; Broadway adds acknowledgment, batching, and
 production-grade observability on top.
 
-Project structure at this point:
+Project structure:
 
 ```
 api_gateway/
@@ -20,8 +21,8 @@ api_gateway/
 │   └── api_gateway/
 │       ├── application.ex
 │       └── middleware/
-│           ├── webhook_pipeline.ex     # ← you implement this
-│           └── simulated_producer.ex   # ← and this helper
+│           ├── webhook_pipeline.ex     # ← Broadway pipeline
+│           └── simulated_producer.ex   # ← in-memory producer for testing
 ├── test/
 │   └── api_gateway/
 │       └── middleware/

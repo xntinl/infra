@@ -1,17 +1,35 @@
 # Advanced Pattern Matching
 
-**Project**: `task_queue` — built incrementally across the intermediate level
+## Why advanced pattern matching matters in production code
+
+Pattern matching in Elixir is not just destructuring. It is:
+
+- **Guards** (`when`) that express constraints impossible to encode in structural patterns
+  alone — numeric ranges, type checks, string lengths.
+- **The pin operator** (`^`) that distinguishes "bind this variable" from "assert this
+  variable has the value it already has".
+- **Multi-clause functions** ordered from most to least specific — the compiler calls the
+  first matching clause.
+- **Nested matching** that decodes deeply nested structures in a single `case` arm.
+
+The cost of getting this wrong: a function that matches the wrong branch runs silently —
+no exception is raised.
 
 ---
 
-## Project context
+## The business problem
 
-The task_queue system receives diverse job payloads and must route them to the correct
-handler, validate their shape, and decode nested structures from external sources (webhook
-events, cron definitions, pipeline steps). All of this routing and decoding logic is cleaner,
-safer, and faster with advanced pattern matching than with conditional logic.
+Build a `TaskQueue.JobRouter` that takes an incoming job map and routes it to a handler
+module based on type, priority, and payload shape.
 
-Project structure at this point:
+Build a `TaskQueue.PayloadDecoder` that takes raw maps from external sources and decodes
+them into typed job payload structs, validating shape and constraints.
+
+All modules are defined completely in this exercise.
+
+---
+
+## Project setup
 
 ```
 task_queue/
@@ -21,45 +39,15 @@ task_queue/
 │       └── payload_decoder.ex
 ├── test/
 │   └── task_queue/
-│       └── pattern_matching_test.exs   # given tests — must pass without modification
+│       └── pattern_matching_test.exs
 └── mix.exs
 ```
 
 ---
 
-## Why advanced pattern matching matters in production code
-
-Pattern matching in Elixir is not just destructuring. It is:
-
-- **Guards** (`when`) that express constraints impossible to encode in structural patterns
-  alone — numeric ranges, type checks, string lengths.
-- **The pin operator** (`^`) that distinguishes "bind this variable" from "assert this
-  variable has the value it already has" — critical in message receive loops and ETS lookups.
-- **Multi-clause functions** ordered from most to least specific — the compiler calls the
-  first matching clause, making exhaustiveness and precedence explicit.
-- **Nested matching** that decodes deeply nested structures in a single `case` arm instead
-  of multiple nested conditionals.
-
-The cost of getting this wrong: a function that matches a `:done` job and processes it as
-`:pending` because the clause order was wrong. Pattern matching bugs are logic bugs — no
-exception is raised, the wrong branch just runs silently.
-
----
-
-## The business problem
-
-`TaskQueue.JobRouter` takes an incoming job map (from an external webhook or internal
-source) and routes it to one of several handlers based on its type, priority, and payload
-shape.
-
-`TaskQueue.PayloadDecoder` takes raw maps from external sources (JSON decoded, no struct
-guarantees) and decodes them into typed job structs, validating shape and constraints.
-
----
-
 ## Implementation
 
-### Step 1: `lib/task_queue/job_router.ex`
+### `lib/task_queue/job_router.ex`
 
 ```elixir
 defmodule TaskQueue.JobRouter do
@@ -79,8 +67,8 @@ defmodule TaskQueue.JobRouter do
   Returns the handler module for the given job.
 
   Routing rules (in order of priority):
-  1. Critical-priority jobs always go to CriticalHandler, regardless of type.
-  2. Jobs that have been retried 3+ times go to DeadLetterHandler.
+  1. Critical-priority jobs always go to CriticalHandler.
+  2. Jobs retried 3+ times go to DeadLetterHandler.
   3. :webhook jobs with a URL payload go to WebhookHandler.
   4. :cron jobs go to CronHandler.
   5. :pipeline jobs with a list of steps go to PipelineHandler.
@@ -88,44 +76,32 @@ defmodule TaskQueue.JobRouter do
   """
   @spec route(job_map()) :: module()
 
-  # Rule 1: critical priority — always wins
   def route(%{priority: :critical}) do
     TaskQueue.Handlers.CriticalHandler
   end
 
-  # Rule 2: dead letter — too many retries
   def route(%{retry_count: retry_count}) when retry_count >= 3 do
     TaskQueue.Handlers.DeadLetterHandler
   end
 
-  # Rule 3: webhook jobs with a URL payload
   def route(%{type: :webhook, payload: %{url: url}}) when is_binary(url) do
     TaskQueue.Handlers.WebhookHandler
   end
 
-  # Rule 4: cron jobs
   def route(%{type: :cron}) do
     TaskQueue.Handlers.CronHandler
   end
 
-  # Rule 5: pipeline jobs with a list of steps
   def route(%{type: :pipeline, payload: steps}) when is_list(steps) do
     TaskQueue.Handlers.PipelineHandler
   end
 
-  # Rule 6: default fallback
   def route(_job) do
     TaskQueue.Handlers.DefaultHandler
   end
 
   @doc """
   Validates a job map and returns {:ok, job} or {:error, reason}.
-
-  Validation rules:
-  - :type must be one of :webhook, :cron, :pipeline, :batch, or :adhoc
-  - :priority must be one of :low, :normal, :high, :critical
-  - :payload must not be nil
-  - :retry_count must be a non-negative integer
   """
   @spec validate(map()) :: {:ok, job_map()} | {:error, atom()}
   def validate(%{type: type, priority: priority, payload: payload, retry_count: rc})
@@ -153,18 +129,13 @@ defmodule TaskQueue.JobRouter do
 end
 ```
 
-The `route/1` function clauses are ordered from most specific to least specific. Clause
-order matters: if the default fallback were listed first, it would match every job and
-none of the specific handlers would ever be reached. The compiler warns about unreachable
-clauses when `@impl` annotations are used, but multi-clause module functions require
-manual ordering discipline.
+The `route/1` clauses are ordered from most specific to least specific. Clause order
+matters: if the default fallback were listed first, it would match every job.
 
 The `validate/1` function uses a single guard clause with `and` to check all constraints
-at once. If the full validation passes, `{:ok, job}` is returned. The subsequent clauses
-catch specific failures and return descriptive error atoms. This pattern gives precise
-error messages without nested `if/cond` chains.
+at once. Subsequent clauses catch specific failures with descriptive error atoms.
 
-### Step 2: `lib/task_queue/payload_decoder.ex`
+### `lib/task_queue/payload_decoder.ex`
 
 ```elixir
 defmodule TaskQueue.PayloadDecoder do
@@ -191,7 +162,6 @@ defmodule TaskQueue.PayloadDecoder do
   """
   @spec decode(map()) :: {:ok, struct()} | {:error, {atom(), atom()}}
 
-  # Webhook — must have url (binary) and method (one of the known HTTP verbs)
   def decode(%{"url" => url, "method" => method} = raw)
       when is_binary(url)
       and method in ["GET", "POST", "PUT", "PATCH", "DELETE"] do
@@ -200,7 +170,6 @@ defmodule TaskQueue.PayloadDecoder do
     {:ok, %WebhookPayload{url: url, method: method, headers: headers, body: body}}
   end
 
-  # Cron — must have schedule (cron string) and command
   def decode(%{"schedule" => schedule, "command" => command} = raw)
       when is_binary(schedule)
       and is_binary(command) do
@@ -208,16 +177,12 @@ defmodule TaskQueue.PayloadDecoder do
     {:ok, %CronPayload{schedule: schedule, command: command, timezone: timezone}}
   end
 
-  # Pipeline — must have "steps" as a non-empty list
   def decode(%{"steps" => [_ | _] = steps} = raw) do
     on_failure = Map.get(raw, "on_failure", "abort") |> String.to_existing_atom()
     {:ok, %PipelinePayload{steps: steps, on_failure: on_failure}}
   end
 
-  # Empty steps list is invalid
   def decode(%{"steps" => []}), do: {:error, {:steps, :empty}}
-
-  # Missing required fields
   def decode(%{"url" => _}), do: {:error, {:method, :missing}}
   def decode(%{"method" => _}), do: {:error, {:url, :missing}}
   def decode(%{"schedule" => _}), do: {:error, {:command, :missing}}
@@ -238,20 +203,18 @@ defmodule TaskQueue.PayloadDecoder do
 end
 ```
 
-The `decode/1` function demonstrates several pattern matching techniques working together:
+Key techniques demonstrated:
 
 - **Nested map matching**: `%{"url" => url, "method" => method}` extracts multiple keys
-  in a single pattern. If either key is missing, the clause does not match and the next
-  one is tried.
+  in one pattern. Missing keys cause the clause to not match.
 - **Guard constraints**: `when is_binary(url) and method in [...]` adds type and value
-  constraints that cannot be expressed in structural patterns alone.
-- **Non-empty list matching**: `[_ | _] = steps` matches lists with at least one element.
-  This is more concise than `when length(steps) > 0` and does not traverse the list.
-- **The pin operator** in `decode_as/2`: `%^expected_type{}` pins the `expected_type`
-  variable so it is used as a match assertion, not a new binding. Without the pin, `expected_type`
-  would rebind to whatever struct module the decoded result has, always matching.
+  constraints beyond structural patterns.
+- **Non-empty list matching**: `[_ | _] = steps` matches lists with at least one element
+  without traversing the list.
+- **The pin operator** in `decode_as/2`: `%^expected_type{}` pins the variable so it is
+  used as a match assertion, not a new binding.
 
-### Step 3: Given tests — must pass without modification
+### Tests
 
 ```elixir
 # test/task_queue/pattern_matching_test.exs
@@ -351,7 +314,7 @@ defmodule TaskQueue.PatternMatchingTest do
 end
 ```
 
-### Step 4: Run the tests
+### Run the tests
 
 ```bash
 mix test test/task_queue/pattern_matching_test.exs --trace
@@ -359,57 +322,34 @@ mix test test/task_queue/pattern_matching_test.exs --trace
 
 ---
 
-## Trade-off analysis
-
-| Aspect | Multi-clause + guards | `cond` chain | `case` with nested `if` |
-|--------|----------------------|-------------|------------------------|
-| Exhaustiveness check | Compiler warns on unreachable clauses | No check | No check |
-| Clause ordering | Explicit — first match wins | Explicit | Explicit |
-| Readability | High — each clause is self-contained | Medium | Low |
-| Performance | Equal — all compile to pattern match bytecode | Equal | Equal |
-| Error on no match | `FunctionClauseError` | Falls through `cond` to nil | Depends on else clause |
-
-Reflection question: the `validate/1` function in `JobRouter` has multiple clauses that
-each check one field. What happens when a job is missing both `type` and `priority`?
-Which clause matches? How would you reorder or restructure to give a more precise error?
-
----
-
 ## Common production mistakes
 
 **1. Wrong clause order — less specific before more specific**
 ```elixir
-# WRONG — the catch-all fires first, specific clauses are unreachable
+# WRONG — catch-all fires first
 def route(_job), do: DefaultHandler
 def route(%{priority: :critical}), do: CriticalHandler  # never reached
-
-# CORRECT — most specific first
-def route(%{priority: :critical}), do: CriticalHandler
-def route(_job), do: DefaultHandler
 ```
 
 **2. Forgetting the pin operator in receive loops**
 ```elixir
-# WRONG — rebinds `ref` to whatever reference arrives
+# WRONG — rebinds ref
 receive do
   {:reply, ref, result} -> result
 end
 
-# CORRECT — only matches the reply for the specific ref you sent
-ref = make_ref()
-send(pid, {:call, ref, :get})
+# CORRECT — asserts ref matches
 receive do
   {:reply, ^ref, result} -> result
 end
 ```
 
 **3. Guards with functions that can raise**
-Guard expressions must be pure and cannot raise. `is_integer/1`, `is_binary/1`, and
-arithmetic are safe. Calling arbitrary functions in a guard is a compile error.
+Guard expressions must be pure. `is_integer/1`, `is_binary/1`, and arithmetic are safe.
+Calling arbitrary functions in a guard is a compile error.
 
 **4. Pattern matching on string content with `=~`**
-`=~` is not valid in a guard. Use `String.starts_with?/2` inside the function body, or
-use binary pattern matching for prefix checks:
+`=~` is not valid in a guard. Use binary pattern matching for prefix checks:
 ```elixir
 def route(%{payload: %{url: "https://" <> _rest}}), do: SecureHandler
 ```
@@ -421,4 +361,3 @@ def route(%{payload: %{url: "https://" <> _rest}}), do: SecureHandler
 - [Pattern Matching — Elixir Getting Started](https://elixir-lang.org/getting-started/pattern-matching.html)
 - [Guards — HexDocs](https://hexdocs.pm/elixir/patterns-and-guards.html)
 - [Kernel — Guard expressions](https://hexdocs.pm/elixir/Kernel.html#module-guards)
-- [Elixir in Action — Sasa Juric](https://www.manning.com/books/elixir-in-action-third-edition) — Chapter 4: Data abstractions

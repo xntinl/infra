@@ -1,29 +1,18 @@
 # Numbers and Arithmetic: Transaction Amount Calculations
 
-**Project**: `payments_cli` — built incrementally across the basic level
+**Project**: `payments_cli` — a CLI tool that processes payment transactions
 
 ---
 
 ## Project context
 
-You're building `payments_cli`. The `Transaction` module needs arithmetic to compute
-fees, totals, and exchange-rate conversions. This is where Elixir's numeric types
-and their gotchas directly affect correctness.
+You are building `payments_cli`, a CLI tool that processes payment transactions from CSV
+files, validates them, applies business rules, and produces ledger reports.
 
-Project structure at this point:
-
-```
-payments_cli/
-├── lib/
-│   └── payments_cli/
-│       ├── cli.ex              # from exercise 01
-│       ├── transaction.ex      # from exercise 02
-│       └── ledger.ex           # ← you implement this
-├── test/
-│   └── payments_cli/
-│       └── ledger_test.exs     # given tests — must pass without modification
-└── mix.exs
-```
+This exercise implements a `Ledger` module that performs financial calculations: summing
+transaction amounts, computing processing fees, converting currencies, and formatting
+amounts for display. All amounts are stored as integers in the smallest currency unit
+(cents) to avoid floating-point precision errors.
 
 ---
 
@@ -56,7 +45,7 @@ The `Ledger` module needs to:
 1. Sum transaction amounts (stored in cents as integers)
 2. Calculate a processing fee (percentage of amount)
 3. Convert amounts between currencies using exchange rates
-4. Format amounts for display (`1234` → `"$12.34"`)
+4. Format amounts for display (`1234` -> `"$12.34"`)
 
 ---
 
@@ -199,7 +188,7 @@ end
   then pads the minor unit with a leading zero. The currency symbol is looked up via
   a private helper with pattern-matched clauses.
 
-### Given tests — must pass without modification
+### Tests
 
 ```elixir
 # test/payments_cli/ledger_test.exs

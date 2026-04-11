@@ -1,28 +1,17 @@
 # Atoms: The Transaction Status Type System
 
-**Project**: `payments_cli` — built incrementally across the basic level
+**Project**: `payments_cli` — a CLI tool that processes payment transactions
 
 ---
 
 ## Project context
 
-You're building `payments_cli`. The `Transaction` module needs a type system for
-payment statuses and error codes. In a language without enums, Elixir uses atoms
-for exactly this purpose.
+You are building `payments_cli`, a CLI tool that processes payment transactions from CSV
+files, validates them, applies business rules, and produces ledger reports.
 
-Project structure at this point:
-
-```
-payments_cli/
-├── lib/
-│   └── payments_cli/
-│       ├── cli.ex              # from exercise 01
-│       └── transaction.ex      # ← you implement this
-├── test/
-│   └── payments_cli/
-│       └── transaction_test.exs  # given tests — must pass without modification
-└── mix.exs
-```
+This exercise implements a `Transaction` module that uses atoms as a type system for
+payment statuses and error codes. The module provides status classification for reporting
+and safe parsing of external string input into validated status atoms.
 
 ---
 
@@ -170,7 +159,7 @@ end
      in `@valid_statuses`. This prevents accepting `:ok`, `:true`, or any other existing
      atom that is not a valid transaction status.
 
-### Given tests — must pass without modification
+### Tests
 
 ```elixir
 # test/payments_cli/transaction_test.exs

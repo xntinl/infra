@@ -1,51 +1,17 @@
 # Documentation with ExDoc
 
-**Project**: `task_queue` — built incrementally across the intermediate level
+## Goal
 
----
-
-## Project context
-
-`task_queue` is used by multiple teams. Without documentation, every integration requires reading source code. You need to document the public API so that `mix docs` generates a navigable HTML site and `h/1` in IEx works for every public function.
-
-Project structure at this point:
-
-```
-task_queue/
-├── lib/
-│   └── task_queue/
-│       ├── application.ex
-│       ├── worker.ex               # ← you document this
-│       ├── queue_server.ex         # ← and this
-│       ├── scheduler.ex            # ← and this
-│       └── registry.ex             # ← and this
-├── test/
-│   └── task_queue/
-│       └── doc_test.exs            # given tests — doctests must pass
-└── mix.exs                         # ← add ExDoc config here
-```
-
----
-
-## The business problem
-
-The platform team has asked for:
-
-1. A self-hosted HTML documentation site generated with `mix docs`
-2. All public functions documented with at least one verifiable `iex>` example
-3. Internal helpers hidden from the HTML (`@doc false`)
-4. A README that appears as the landing page
-
-The goal is not just to write text — it is to write documentation that can be tested and that consumers can trust is accurate.
+Build a `task_queue` project with comprehensive documentation using `@moduledoc`, `@doc`, doctests (`iex>` examples), and ExDoc HTML generation. Learn why documentation is first-class in Elixir and how to write testable examples.
 
 ---
 
 ## Why documentation is first-class in Elixir
 
-`@doc` and `@moduledoc` are not comments — they are module attributes that are compiled into the BEAM binary and accessible at runtime via `h/1` in IEx. This means:
+`@doc` and `@moduledoc` are not comments -- they are module attributes compiled into the BEAM binary and accessible at runtime via `h/1` in IEx. This means:
 
 - Documentation is introspectable without reading source code
-- `doctest` runs the `iex>` examples as ExUnit tests — stale examples fail CI
+- `doctest` runs the `iex>` examples as ExUnit tests -- stale examples fail CI
 - Libraries published on Hex are rated by HexDocs coverage
 
 The cultural norm in the Elixir ecosystem is that an undocumented public function is incomplete code, not a style choice.
@@ -54,10 +20,9 @@ The cultural norm in the Elixir ecosystem is that an undocumented public functio
 
 ## Implementation
 
-### Step 1: `mix.exs` — add ExDoc configuration
+### Step 1: `mix.exs` -- add ExDoc configuration
 
 ```elixir
-# mix.exs
 defmodule TaskQueue.MixProject do
   use Mix.Project
 
@@ -73,26 +38,51 @@ defmodule TaskQueue.MixProject do
         extras: ["README.md"],
         groups_for_modules: [
           "Core": [TaskQueue, TaskQueue.QueueServer, TaskQueue.Worker],
-          "Infrastructure": [TaskQueue.Scheduler, TaskQueue.Registry]
+          "Infrastructure": [TaskQueue.Scheduler]
         ]
       ],
       start_permanent: Mix.env() == :prod,
-      deps: deps(),
-      releases: releases()
+      deps: deps()
+    ]
+  end
+
+  def application do
+    [
+      extra_applications: [:logger],
+      mod: {TaskQueue.Application, []}
     ]
   end
 
   defp deps do
     [
       {:jason, "~> 1.4"},
-      {:req, "~> 0.5"},
       {:ex_doc, "~> 0.31", only: :dev, runtime: false}
     ]
   end
 end
 ```
 
-### Step 2: `lib/task_queue/queue_server.ex` — document the public API
+### Step 2: `lib/task_queue/application.ex`
+
+```elixir
+defmodule TaskQueue.Application do
+  use Application
+
+  @impl true
+  def start(_type, _args) do
+    children = [
+      TaskQueue.QueueServer
+    ]
+
+    opts = [strategy: :one_for_one, name: TaskQueue.Supervisor]
+    Supervisor.start_link(children, opts)
+  end
+end
+```
+
+### Step 3: `lib/task_queue/queue_server.ex` -- documented GenServer
+
+The `@moduledoc` goes immediately after `defmodule`. The `@doc` before each public function includes `iex>` examples that `doctest` can verify. `@doc false` hides internal functions from the generated HTML while keeping them `def` (public) so they can be called from tests or other modules.
 
 ```elixir
 defmodule TaskQueue.QueueServer do
@@ -101,8 +91,8 @@ defmodule TaskQueue.QueueServer do
   @moduledoc """
   Manages the in-memory job queue for `task_queue`.
 
-  Jobs are enqueued as maps and processed in FIFO order by `TaskQueue.Scheduler`.
-  The queue is bounded — enqueueing to a full queue returns `{:error, :queue_full}`.
+  Jobs are enqueued as maps and processed in FIFO order.
+  The queue is bounded -- enqueueing to a full queue returns `{:error, :queue_full}`.
 
   ## Usage
 
@@ -113,7 +103,7 @@ defmodule TaskQueue.QueueServer do
   ## Notes
 
   All public functions return `{:ok, value}` or `{:error, reason}`.
-  The queue is not persistent — it is lost when the process restarts.
+  The queue is not persistent -- it is lost when the process restarts.
   """
 
   @default_max_size 1_000
@@ -224,9 +214,9 @@ defmodule TaskQueue.QueueServer do
 end
 ```
 
-### Step 3: `lib/task_queue/worker.ex` — fixed doctests
+### Step 4: `lib/task_queue/worker.ex` -- documented with tested doctests
 
-The original module had three bugs in its `@doc` examples. Here is the corrected version with all doctests passing:
+Jason sorts keys alphabetically, so `%{b: 2, a: 1}` encodes to `{"a":1,"b":2}`, not `{"b":2,"a":1}`. Doctests must match the actual output exactly.
 
 ```elixir
 defmodule TaskQueue.Worker do
@@ -278,24 +268,16 @@ defmodule TaskQueue.Worker do
 end
 ```
 
-The three bugs in the original were:
-
-1. **Result on the same line as the expression** — `iex> expr result` must be on separate lines. Fixed by placing `{:ok, ...}` on the line below.
-2. **Wrong expected result for map key ordering** — Jason sorts keys alphabetically, so `%{b: 2, a: 1}` encodes to `{"a":1,"b":2}`, not `{"b":2,"a":1}`.
-3. **Missing `iex>` prefix** — every expression in a doctest must start with `iex>` or `...>`.
-
-### Step 4: Given tests — must pass without modification
+### Step 5: Tests -- doctests verified automatically
 
 ```elixir
 # test/task_queue/doc_test.exs
 defmodule TaskQueue.DocTest do
   use ExUnit.Case, async: true
 
-  # Run all iex> examples from the module's @doc and @moduledoc
   doctest TaskQueue.QueueServer
   doctest TaskQueue.Worker
 
-  # Verify that @doc false functions are not documented
   test "__reset__/0 has no public documentation" do
     docs = Code.fetch_docs(TaskQueue.QueueServer)
     {:docs_v1, _, _, _, _, _, fn_docs} = docs
@@ -305,22 +287,19 @@ defmodule TaskQueue.DocTest do
         type == :function and name == :__reset__
       end)
 
-    # @doc false means the doc entry is :hidden, not a string
     assert elem(reset_doc, 3) == :hidden
   end
 end
 ```
 
-### Step 5: Run doctests and generate docs
+The `doctest` macro extracts every `iex>` example from `@doc` and `@moduledoc`, runs it as an ExUnit assertion, and fails CI if the output does not match. This is why doctests must be precise -- including map key ordering and exact return values.
+
+### Step 6: Run doctests and generate docs
 
 ```bash
 mix deps.get
 mix test test/task_queue/doc_test.exs --trace
-
-# Generate HTML documentation
 mix docs
-
-# Open in browser
 open doc/index.html
 ```
 
@@ -330,14 +309,12 @@ open doc/index.html
 
 | Aspect | `@doc` with `iex>` examples | `@doc` prose only | No `@doc` |
 |--------|----------------------------|-------------------|-----------|
-| Testable | yes — `doctest` catches staleness | no | no |
+| Testable | yes -- `doctest` catches staleness | no | no |
 | IEx `h/1` support | full | full | shows "No documentation" |
 | HexDocs coverage | high | medium | zero |
 | Maintenance cost | must keep examples accurate | lower | none |
 
-Reflection question: when would `@doc false` be preferable to `defp`? Name a real scenario where a function must be `def` but should not appear in the public API.
-
-Answer: When the function is public by necessity — for example, callbacks invoked by macros (`__using__/1`), functions called by test helpers (`__reset__/0` for resetting GenServer state), or functions required by behaviours that are implementation details rather than user-facing API. The ExUnit framework itself calls public functions generated by `use ExUnit.Case` that are marked `@doc false` because they must be callable across modules but are not part of the user-facing API.
+When would `@doc false` be preferable to `defp`? When the function is public by necessity -- for example, callbacks invoked by macros (`__using__/1`), functions called by test helpers (`__reset__/0` for resetting GenServer state), or functions required by behaviours that are implementation details rather than user-facing API.
 
 ---
 
@@ -357,19 +334,19 @@ iex> String.upcase("hello")
 ExDoc ignores or misplaces `@moduledoc` when it is not immediately after `defmodule`. Always place it first.
 
 **3. Map key order in doctests**
-Maps are unordered. `%{a: 1, b: 2}` and `%{b: 2, a: 1}` are the same map but print differently. Pin the representation or test with `assert Map.equal?/2` instead.
+Maps are unordered. `%{a: 1, b: 2}` and `%{b: 2, a: 1}` are the same map but print differently. Pin the representation or test with `assert`.
 
 **4. `@doc false` on `defp` functions**
-Private functions are already excluded from documentation. `@doc false` has no effect on `defp` and is misleading.
+Private functions are already excluded from documentation. `@doc false` has no effect on `defp`.
 
 **5. ExDoc without `runtime: false`**
-Without `runtime: false`, ExDoc starts as an OTP application. It adds startup overhead to every `iex -S mix` session and may conflict with your application.
+Without `runtime: false`, ExDoc starts as an OTP application, adding startup overhead to every `iex -S mix` session.
 
 ---
 
 ## Resources
 
-- [Writing Documentation — Elixir official guide](https://hexdocs.pm/elixir/writing-documentation.html)
-- [ExDoc — hex package](https://hexdocs.pm/ex_doc/readme.html)
-- [ExUnit doctest — docs](https://hexdocs.pm/ex_unit/ExUnit.DocTest.html)
-- [h/1 in IEx — Kernel.SpecialForms](https://hexdocs.pm/iex/IEx.Helpers.html#h/1)
+- [Writing Documentation -- Elixir official guide](https://hexdocs.pm/elixir/writing-documentation.html)
+- [ExDoc -- hex package](https://hexdocs.pm/ex_doc/readme.html)
+- [ExUnit doctest -- docs](https://hexdocs.pm/ex_unit/ExUnit.DocTest.html)
+- [h/1 in IEx -- Kernel.SpecialForms](https://hexdocs.pm/iex/IEx.Helpers.html#h/1)

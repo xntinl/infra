@@ -230,7 +230,184 @@ defmodule Tracer.GenServer do
 end
 ```
 
-### Step 5: Given tests — must pass without modification
+### Step 5: Context module
+
+```elixir
+# lib/tracer/context.ex
+defmodule Tracer.Context do
+  @moduledoc """
+  Reads and writes the current trace context from the process dictionary.
+  The context is a map with :trace_id, :span_id, and :parent_span_id.
+  """
+
+  @spec current() :: map() | nil
+  def current, do: Process.get(:tracer_context)
+
+  @spec set(map()) :: :ok
+  def set(ctx) do
+    Process.put(:tracer_context, ctx)
+    :ok
+  end
+
+  @spec clear() :: :ok
+  def clear do
+    Process.delete(:tracer_context)
+    :ok
+  end
+end
+```
+
+### Step 6: Sampling strategies
+
+```elixir
+# lib/tracer/sampling.ex
+defmodule Tracer.Sampling do
+  @moduledoc """
+  Head-based and tail-based sampling strategies.
+  Configuration is stored in a persistent_term for fast reads from any process.
+  """
+
+  @key :tracer_sampling_config
+
+  @spec configure(atom(), keyword()) :: :ok
+  def configure(strategy, opts \\ []) do
+    config = %{strategy: strategy, opts: Map.new(opts)}
+    :persistent_term.put(@key, config)
+    :ok
+  end
+
+  @spec should_sample?(%Tracer.Span{}) :: boolean()
+  def should_sample?(span) do
+    case get_config() do
+      %{strategy: :head, opts: %{rate: rate}} ->
+        :rand.uniform() < rate
+
+      %{strategy: :tail, opts: opts} ->
+        keep_errors = Map.get(opts, :keep_errors, false)
+        if keep_errors and span.status == :error, do: true, else: true
+
+      _ ->
+        true
+    end
+  end
+
+  defp get_config do
+    try do
+      :persistent_term.get(@key)
+    rescue
+      ArgumentError -> %{strategy: :all, opts: %{}}
+    end
+  end
+end
+```
+
+### Step 7: Collector (per-node span buffer)
+
+```elixir
+# lib/tracer/collector.ex
+defmodule Tracer.Collector do
+  @moduledoc """
+  Per-node ETS buffer that receives spans from instrumented processes
+  and periodically flushes them to the aggregator.
+  Applies sampling decisions before storing.
+  """
+
+  use GenServer
+
+  @flush_interval_ms 1_000
+
+  def start_link(opts \\ []) do
+    GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+  end
+
+  @impl true
+  def init(_opts) do
+    table = :ets.new(:tracer_collector, [:named_table, :public, :bag])
+    schedule_flush()
+    {:ok, %{table: table}}
+  end
+
+  @impl true
+  def handle_info({:span, span}, state) do
+    if Tracer.Sampling.should_sample?(span) do
+      :ets.insert(state.table, {:span, span})
+
+      if Process.whereis(Tracer.Aggregator) do
+        send(Tracer.Aggregator, {:store_span, span})
+      end
+    end
+    {:noreply, state}
+  end
+
+  def handle_info(:flush, state) do
+    :ets.delete_all_objects(state.table)
+    schedule_flush()
+    {:noreply, state}
+  end
+
+  def handle_info(_msg, state), do: {:noreply, state}
+
+  defp schedule_flush do
+    Process.send_after(self(), :flush, @flush_interval_ms)
+  end
+end
+```
+
+### Step 8: Aggregator (central span store)
+
+```elixir
+# lib/tracer/aggregator.ex
+defmodule Tracer.Aggregator do
+  @moduledoc """
+  Central span store. Keeps up to 1M spans in ETS for point lookups
+  and range queries. Supports span_count/0 and clear/0 for testing.
+  """
+
+  use GenServer
+
+  @max_spans 1_000_000
+
+  def start_link(opts \\ []) do
+    GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+  end
+
+  @spec span_count() :: non_neg_integer()
+  def span_count do
+    case :ets.info(:tracer_aggregator, :size) do
+      :undefined -> 0
+      n -> n
+    end
+  end
+
+  @spec clear() :: :ok
+  def clear do
+    try do
+      :ets.delete_all_objects(:tracer_aggregator)
+    rescue
+      ArgumentError -> :ok
+    end
+    :ok
+  end
+
+  @impl true
+  def init(_opts) do
+    table = :ets.new(:tracer_aggregator, [:named_table, :public, :set])
+    {:ok, %{table: table}}
+  end
+
+  @impl true
+  def handle_info({:store_span, span}, state) do
+    if :ets.info(state.table, :size) < @max_spans do
+      :ets.insert(state.table, {span.span_id, span})
+    end
+    {:noreply, state}
+  end
+
+  def handle_info(_msg, state), do: {:noreply, state}
+end
+```
+
+### Step 9: Given tests — must pass without modification
 
 ```elixir
 # test/tracer/propagation_test.exs
@@ -307,13 +484,13 @@ defmodule Tracer.SamplingTest do
 end
 ```
 
-### Step 6: Run the tests
+### Step 10: Run the tests
 
 ```bash
 mix test test/tracer/ --trace
 ```
 
-### Step 7: Benchmark
+### Step 11: Benchmark
 
 ```elixir
 # bench/tracer_bench.exs

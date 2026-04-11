@@ -1,12 +1,9 @@
 # BEAM Schedulers and Reductions
 
-**Project**: `api_gateway` — built incrementally across the advanced level
-
----
-
 ## Project context
 
-You're building `api_gateway`. Under load testing, the SRE team reports that p99
+You are building `api_gateway`, an internal HTTP gateway that routes traffic to microservices.
+Under load testing, the SRE team reports that p99
 latency spikes from 5ms to 800ms intermittently. Profiling shows CPU-bound request
 handlers (JWT validation, response body compression, route regex matching) running
 on normal BEAM schedulers and starving I/O-bound handlers. A second issue: a
@@ -17,7 +14,7 @@ This exercise covers how BEAM schedules processes, what "reductions" are, why
 CPU-bound code on normal schedulers hurts latency, and how dirty schedulers and
 `:erlang.yield/0` provide the escape hatches.
 
-Project structure at this point:
+Project structure:
 
 ```
 api_gateway/
@@ -25,11 +22,8 @@ api_gateway/
 │   └── api_gateway/
 │       ├── application.ex
 │       ├── router.ex
-│       ├── metrics/
-│       │   ├── counter.ex
-│       │   ├── event_log.ex
-│       │   └── aggregator.ex
-│       └── ...
+│       └── metrics/
+│           └── aggregator.ex
 ├── test/
 │   └── api_gateway/
 │       └── metrics/

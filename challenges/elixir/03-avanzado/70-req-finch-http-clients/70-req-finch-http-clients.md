@@ -1,17 +1,8 @@
 # Req + Finch — HTTP Clients for Upstream Calls
 
-**Project**: `api_gateway` — built incrementally across the advanced level
-
----
-
 ## Project context
 
-You're building `api_gateway`. The gateway proxies requests to upstream services.
-Until now, upstream calls were fire-and-forget with no connection pooling, no retry,
-and no timeout enforcement. The SRE team reported three production incidents caused
-by upstream services returning 503s: the gateway exhausted OS file descriptors
-(no connection pool), requests hung indefinitely (no timeout), and a thundering herd
-of retries made the upstream recovery slower (no backoff).
+You are building `api_gateway`, an internal HTTP gateway. The gateway proxies requests to upstream services. Until now, upstream calls had no connection pooling, no retry, and no timeout enforcement. This exercise builds the upstream HTTP client with named Finch pools, Req middleware for retry and telemetry, and streaming support. All modules are defined from scratch.
 
 Project structure:
 
@@ -19,11 +10,10 @@ Project structure:
 api_gateway/
 ├── lib/
 │   └── api_gateway/
-│       ├── upstream/
-│       │   ├── client.ex           # ← you implement this
-│       │   ├── req_steps.ex        # ← you implement this (Req middleware steps)
-│       │   └── pool_supervisor.ex  # ← you implement this (Finch pool config)
-│       └── application.ex         # already exists — add Finch to supervision tree
+│       └── upstream/
+│           ├── client.ex           # HTTP client with retry and telemetry
+│           ├── req_steps.ex        # custom Req middleware steps
+│           └── pool_supervisor.ex  # Finch pool configuration
 ├── test/
 │   └── api_gateway/
 │       └── upstream/
@@ -37,57 +27,22 @@ api_gateway/
 
 The upstream client needs to satisfy four requirements:
 
-1. **Connection pooling**: limit the number of open TCP connections per upstream host
-   so the OS does not exhaust file descriptors under burst load.
-2. **Retry with backoff**: transient upstream errors (502, 503, 504, connection refused)
-   should be retried automatically with exponential backoff, without burdening the
-   caller with retry logic.
-3. **Request tracing**: every upstream call must emit a telemetry event with duration,
-   status code, and upstream host so the metrics pipeline can track latency per service.
-4. **Streaming**: some upstreams return large response bodies (audit log exports,
-   metrics dumps). The client must stream the response to disk without loading the
-   full body into the BEAM process heap.
+1. **Connection pooling**: limit TCP connections per upstream host so the OS does not exhaust file descriptors under burst load.
+2. **Retry with backoff**: transient upstream errors (502, 503, 504) should be retried automatically with exponential backoff.
+3. **Request tracing**: every upstream call must emit a telemetry event with duration, status code, and upstream host.
+4. **Streaming**: some upstreams return large response bodies. The client must stream the response to disk without loading the full body into the BEAM process heap.
 
 ---
 
 ## Why Finch manages pools instead of letting Hackney or httpc do it
 
-`httpc` (Erlang stdlib) creates a new TCP connection for every request unless you
-configure persistent connections manually — which is undocumented and brittle.
-`hackney` has a connection pool but it is global and shared across all callers.
-There is no way to give the billing service a separate pool from the auth service.
-
-Finch is designed around named pools. You start one `{Finch, name: BillingFinch, pools: ...}`
-per upstream domain with explicit `size` and `count` parameters. The pool is
-supervised independently. If the billing upstream's pool is exhausted, auth
-requests continue unaffected.
-
-`Req` is built on top of Finch and adds the request/response middleware layer:
-composable steps for retry, authentication, JSON encode/decode, telemetry, and caching.
-Req and Finch are separate concerns: Finch manages TCP connections; Req manages
-the request lifecycle.
+`httpc` creates a new TCP connection for every request unless you configure persistent connections manually. `hackney` has a global pool shared across all callers. Finch is designed around named pools: you start one `{Finch, name: ..., pools: ...}` per upstream domain with explicit `size` and `count` parameters. The pool is supervised independently. If one upstream's pool is exhausted, other upstream requests continue unaffected.
 
 ---
 
 ## Why retry belongs in a Req step and not in the caller
 
-If the caller handles retries:
-
-```elixir
-# caller code — retry logic leaks everywhere
-case Client.get("/health") do
-  {:error, :service_unavailable} -> Client.get("/health")  # retry once
-  other -> other
-end
-```
-
-Every caller duplicates the retry logic, and each caller may choose different
-retry counts, backoff strategies, or retryable status codes. When the SRE team
-wants to change the retry policy, they touch every call site.
-
-A Req step centralises the retry policy. The caller calls `Client.get/1` and receives
-either a successful response or `{:error, :max_retries_exceeded}`. The retry
-strategy is declared once in `client/0` and applies uniformly.
+If the caller handles retries, every call site duplicates the retry logic with potentially different strategies. A Req step centralizes the retry policy. The caller calls `Client.get/1` and receives either a successful response or an error. The retry strategy is declared once.
 
 ---
 
@@ -96,8 +51,13 @@ strategy is declared once in `client/0` and applies uniformly.
 ### Step 1: `mix.exs` additions
 
 ```elixir
-{:req, "~> 0.5"},
-{:finch, "~> 0.19"}
+defp deps do
+  [
+    {:req, "~> 0.5"},
+    {:finch, "~> 0.19"},
+    {:jason, "~> 1.4"}
+  ]
+end
 ```
 
 ### Step 2: Pool supervisor — `lib/api_gateway/upstream/pool_supervisor.ex`
@@ -116,6 +76,7 @@ defmodule ApiGateway.Upstream.PoolSupervisor do
   HTTP/1.1 upstreams: size: N, count: 1 (N connections, each serves one request)
   """
 
+  @spec child_spec(keyword()) :: Supervisor.child_spec()
   def child_spec(_opts) do
     upstreams = Application.get_env(:api_gateway, :upstreams, [])
 
@@ -150,13 +111,7 @@ defmodule ApiGateway.Upstream.ReqSteps do
 
   A Req step is a function that receives a `Req.Request` struct and returns
   either the request (to continue the pipeline) or a `{request, response}` tuple
-  (to short-circuit the pipeline — used for caching and retries).
-
-  Steps are composed with:
-    Req.Request.prepend_request_steps/2 — runs before sending
-    Req.Request.append_response_steps/2 — runs after receiving
-
-  Or the shorthand Req.new(steps: [...]) accepts {name, fun} pairs.
+  (to short-circuit the pipeline).
   """
 
   require Logger
@@ -164,10 +119,8 @@ defmodule ApiGateway.Upstream.ReqSteps do
   @doc """
   Telemetry step: emits [:api_gateway, :upstream, :request, :start/:stop]
   events around every upstream HTTP request.
-
-  Attaches upstream host and HTTP method to the event metadata so the
-  metrics pipeline can aggregate latency per service.
   """
+  @spec telemetry(Req.Request.t()) :: {Req.Request.t(), (({Req.Request.t(), Req.Response.t()}) -> {Req.Request.t(), Req.Response.t()})}
   def telemetry(request) do
     start_time = System.monotonic_time()
 
@@ -183,8 +136,6 @@ defmodule ApiGateway.Upstream.ReqSteps do
       metadata
     )
 
-    # Return {request, response_step_fn}
-    # The response_step_fn is called after the response arrives.
     {request,
      fn {req, resp} ->
        duration = System.monotonic_time() - start_time
@@ -201,27 +152,22 @@ defmodule ApiGateway.Upstream.ReqSteps do
 
   @doc """
   Request ID propagation step: attaches the current request's X-Request-ID
-  (from the process dictionary or generates a new one) to the upstream call.
-
-  This allows distributed tracing across gateway → upstream service boundaries.
+  to the upstream call for distributed tracing.
   """
+  @spec propagate_request_id(Req.Request.t()) :: Req.Request.t()
   def propagate_request_id(request) do
-    # TODO: get the current request ID from Process.get(:request_id)
-    # If nil, generate one with :crypto.strong_rand_bytes(8) |> Base.encode16()
-    # Add it as a header: {"x-request-id", request_id}
-    # Return the modified request struct using Req.Request.put_header/3
-    request
+    request_id =
+      Process.get(:request_id) ||
+        (:crypto.strong_rand_bytes(8) |> Base.encode16(case: :lower))
+
+    Req.Request.put_header(request, "x-request-id", request_id)
   end
 
   @doc """
-  ETS response cache step: caches GET responses for `cache_ttl` seconds.
-
-  Cache key: the full URI string.
-  Cache table: :upstream_response_cache (must be created at application start).
-
-  A cache hit short-circuits the pipeline — the upstream is not called.
-  A cache miss stores the response after a successful (status 200) upstream call.
+  ETS response cache step: caches GET responses for configurable TTL.
+  Cache key is the full URI string. Only 200 responses are cached.
   """
+  @spec ets_cache(Req.Request.t()) :: Req.Request.t() | {Req.Request.t(), Req.Response.t()}
   def ets_cache(request) do
     if request.method == :get do
       key = URI.to_string(request.url)
@@ -229,9 +175,7 @@ defmodule ApiGateway.Upstream.ReqSteps do
       case :ets.lookup(:upstream_response_cache, key) do
         [{^key, cached_response, expires_at}]
         when expires_at > System.monotonic_time(:second) ->
-          # TODO: short-circuit with Req.Request.halt(request) and return the cached response
-          # Return {Req.Request.halt(request), cached_response}
-          request
+          {Req.Request.halt(request), cached_response}
 
         _ ->
           {request,
@@ -239,15 +183,13 @@ defmodule ApiGateway.Upstream.ReqSteps do
              if resp.status == 200 do
                ttl = Map.get(req.options, :cache_ttl, 30)
                expires = System.monotonic_time(:second) + ttl
-
-               # TODO: insert {key, resp, expires} into :upstream_response_cache
+               :ets.insert(:upstream_response_cache, {key, resp, expires})
              end
 
              {req, resp}
            end}
       end
     else
-      # Non-GET requests are never cached
       request
     end
   end
@@ -268,9 +210,6 @@ defmodule ApiGateway.Upstream.Client do
   - Telemetry step for latency tracking
   - Request ID propagation for distributed tracing
   - 5 second connect timeout, 30 second read timeout
-
-  All upstream calls go through `request/3`. Callers do not interact with
-  Req or Finch directly.
   """
 
   alias ApiGateway.Upstream.ReqSteps
@@ -279,51 +218,67 @@ defmodule ApiGateway.Upstream.Client do
   @receive_timeout_ms 30_000
   @max_retries 3
 
-  # Backoff: 500ms → 1s → 2s
-  defp backoff(attempt), do: :timer.seconds(1) * Integer.pow(2, attempt - 1) |> div(2)
-
   defp client(base_url) do
-    # TODO: build a Req.Request with:
-    #   base_url: base_url
-    #   finch: ApiGateway.Upstream.Finch
-    #   connect_options: [timeout: @connect_timeout_ms]
-    #   receive_timeout: @receive_timeout_ms
-    #   retry: :transient
-    #   max_retries: @max_retries
-    #   retry_delay: &backoff/1
-    #   decode_body: true
+    Req.new(
+      base_url: base_url,
+      finch: ApiGateway.Upstream.Finch,
+      connect_options: [timeout: @connect_timeout_ms],
+      receive_timeout: @receive_timeout_ms,
+      retry: :transient,
+      max_retries: @max_retries,
+      retry_delay: &backoff/1
+    )
+    |> Req.Request.prepend_request_steps(
+      telemetry: &ReqSteps.telemetry/1,
+      request_id: &ReqSteps.propagate_request_id/1
+    )
+  end
 
-    # TODO: prepend the telemetry step using Req.Request.prepend_request_steps/2
-    # Step name: :telemetry, function: &ReqSteps.telemetry/1
-
-    # TODO: prepend the propagate_request_id step
-    # Step name: :request_id, function: &ReqSteps.propagate_request_id/1
-
-    Req.new(base_url: base_url)
+  # Backoff: 500ms -> 1s -> 2s
+  defp backoff(attempt) do
+    :timer.seconds(1) * Integer.pow(2, attempt - 1) |> div(2)
   end
 
   @doc """
   Makes a GET request to `path` on the given upstream `base_url`.
   Returns `{:ok, body}` on HTTP 2xx or `{:error, reason}` otherwise.
   """
+  @spec get(String.t(), String.t(), keyword()) :: {:ok, term()} | {:error, term()}
   def get(base_url, path, opts \\ []) do
-    # TODO: call Req.get(client(base_url), url: path, params: Keyword.get(opts, :params, []))
-    # Map the result:
-    #   {:ok, %{status: s, body: body}} when s in 200..299 → {:ok, body}
-    #   {:ok, %{status: 404}} → {:error, :not_found}
-    #   {:ok, %{status: s, body: body}} → {:error, {:upstream_error, s, body}}
-    #   {:error, exception} → {:error, {:network, exception}}
-    {:error, :not_implemented}
+    case Req.get(client(base_url), url: path, params: Keyword.get(opts, :params, [])) do
+      {:ok, %{status: status, body: body}} when status in 200..299 ->
+        {:ok, body}
+
+      {:ok, %{status: 404}} ->
+        {:error, :not_found}
+
+      {:ok, %{status: status, body: body}} ->
+        {:error, {:upstream_error, status, body}}
+
+      {:error, exception} ->
+        {:error, {:network, exception}}
+    end
   end
 
   @doc """
   Makes a POST request with a JSON body.
   Returns `{:ok, body}` on HTTP 2xx or `{:error, reason}`.
   """
+  @spec post(String.t(), String.t(), map(), keyword()) :: {:ok, term()} | {:error, term()}
   def post(base_url, path, body, opts \\ []) do
-    # TODO: call Req.post(client(base_url), url: path, json: body)
-    # Same response mapping as get/3
-    {:error, :not_implemented}
+    case Req.post(client(base_url), url: path, json: body) do
+      {:ok, %{status: status, body: resp_body}} when status in 200..299 ->
+        {:ok, resp_body}
+
+      {:ok, %{status: 404}} ->
+        {:error, :not_found}
+
+      {:ok, %{status: status, body: resp_body}} ->
+        {:error, {:upstream_error, status, resp_body}}
+
+      {:error, exception} ->
+        {:error, {:network, exception}}
+    end
   end
 
   @doc """
@@ -333,30 +288,29 @@ defmodule ApiGateway.Upstream.Client do
   The response body is never loaded into the BEAM heap: Req writes each
   chunk directly to the file descriptor as it arrives from the socket.
   """
+  @spec stream_to_file(String.t(), String.t(), String.t()) ::
+          {:ok, non_neg_integer()} | {:error, term()}
   def stream_to_file(base_url, path, dest_path) do
-    # TODO: open dest_path with File.stream!(dest_path, [:write, :binary])
-    # TODO: call Req.get(client(base_url), url: path, decode_body: false, into: file_stream)
-    # Count bytes written using an Agent accumulator and return {:ok, bytes_written}
-    # or {:error, reason} on failure.
-    # Clean up (File.rm/1) if the request fails after partially writing the file.
-    {:error, :not_implemented}
+    file_stream = File.stream!(dest_path, [:write, :binary])
+
+    case Req.get(client(base_url), url: path, decode_body: false, into: file_stream) do
+      {:ok, %{status: status}} when status in 200..299 ->
+        %{size: bytes} = File.stat!(dest_path)
+        {:ok, bytes}
+
+      {:ok, %{status: status, body: body}} ->
+        File.rm(dest_path)
+        {:error, {:upstream_error, status, body}}
+
+      {:error, exception} ->
+        File.rm(dest_path)
+        {:error, {:network, exception}}
+    end
   end
 end
 ```
 
-### Step 5: Application supervision — `lib/api_gateway/application.ex`
-
-Add Finch and the ETS cache table to the supervision tree:
-
-```elixir
-# In ApiGateway.Application.start/2, add to children before the endpoint:
-ApiGateway.Upstream.PoolSupervisor
-
-# Also create the ETS cache table during application start (before supervision tree):
-:ets.new(:upstream_response_cache, [:named_table, :public, :set, read_concurrency: true])
-```
-
-### Step 6: Config — `config/config.exs`
+### Step 5: Config — `config/config.exs`
 
 ```elixir
 config :api_gateway, :upstreams, [
@@ -366,7 +320,7 @@ config :api_gateway, :upstreams, [
 ]
 ```
 
-### Step 7: Given tests — must pass without modification
+### Step 6: Given tests — must pass without modification
 
 ```elixir
 # test/api_gateway/upstream/client_test.exs
@@ -374,9 +328,6 @@ defmodule ApiGateway.Upstream.ClientTest do
   use ExUnit.Case, async: true
 
   alias ApiGateway.Upstream.Client
-
-  # Req.Test stubs intercept Finch calls in tests — no real HTTP needed.
-  # See https://hexdocs.pm/req/Req.Test.html
 
   setup do
     Req.Test.stub(ApiGateway.Upstream.Finch, fn conn ->
@@ -424,7 +375,7 @@ defmodule ApiGateway.Upstream.ClientTest do
 end
 ```
 
-### Step 8: Run the tests
+### Step 7: Run the tests
 
 ```bash
 mix test test/api_gateway/upstream/ --trace
@@ -436,50 +387,33 @@ mix test test/api_gateway/upstream/ --trace
 
 | Aspect | Req + Finch (named pools) | Hackney (global pool) | httpc (no pool) |
 |--------|--------------------------|-----------------------|-----------------|
-| Per-upstream pool isolation | Yes — each service has its own pool | No — shared global pool | No pools |
+| Per-upstream pool isolation | Yes | No — shared global pool | No pools |
 | HTTP/2 multiplexing | Yes (`protocol: :http2`) | Limited | No |
 | Retry middleware | Built-in (`retry: :transient`) | Manual | Manual |
 | Test stubbing | `Req.Test.stub/2` | Bypass or mock | Bypass or mock |
-| Connection leak on crash | Pool supervised — connections cleaned up | Risk | Risk |
-| Backpressure on pool exhaustion | Queue + timeout | Queue + timeout | Unbounded |
+| Connection leak on crash | Pool supervised — cleaned up | Risk | Risk |
 | Config per host | Yes (pools map) | Limited | No |
 
-Reflection question: `Client.stream_to_file/3` writes response chunks directly
-to disk as they arrive. The gateway process that owns the download call is blocked
-on the Finch receive loop until the download completes. For a 10GB file over a
-slow upstream, this process is tied up for minutes. What are the implications for
-the gateway's supervisor? How would you restructure the download to avoid blocking
-the caller process while maintaining back-pressure on the Finch pool?
+Reflection question: `Client.stream_to_file/3` writes response chunks directly to disk. The gateway process is blocked on the Finch receive loop until the download completes. For a 10GB file over a slow upstream, this process is tied up for minutes. How would you restructure the download to avoid blocking the caller?
 
 ---
 
 ## Common production mistakes
 
 **1. One global Finch instance for all upstreams**
-If all upstream calls share one pool and a slow upstream exhausts it, every other
-upstream call queues behind it. Pool isolation is the entire point of named Finch
-instances. One instance per upstream base URL.
+If all upstream calls share one pool and a slow upstream exhausts it, every other upstream call queues behind it. One pool per upstream base URL.
 
 **2. `retry: :transient` on POST without an idempotency key**
-`retry: :transient` retries on 503. If a POST creates a resource and the upstream
-returns 503 after committing (before responding), a retry creates a duplicate.
-Always include an idempotency key in POST headers when enabling retry.
+A retry on 503 after the upstream committed but before responding creates a duplicate. Always include an idempotency key in POST headers when enabling retry.
 
 **3. Not propagating `X-Request-ID` downstream**
-Without request ID propagation, a failed upstream call is invisible in distributed
-traces. The gateway logs show `503 from billing` but the billing service logs show
-nothing — the request IDs do not match. Always propagate.
+Without request ID propagation, a failed upstream call is invisible in distributed traces.
 
 **4. Using `receive_timeout` as wall-clock SLA**
-`receive_timeout` is the timeout for receiving the first byte of the response.
-A slow upstream that streams a 10GB response at 1KB/s will not hit
-`receive_timeout` — each chunk arrives quickly. Use stream chunk timeouts
-or implement an overall transfer deadline with a `Task` and `Process.exit/2`.
+`receive_timeout` is for receiving the first byte. A slow stream will not trigger it.
 
 **5. Starting Finch outside the supervision tree**
-If you start Finch in `Application.start/2` with `Finch.start_link/1` instead of
-adding it as a supervised child, it is not restarted when it crashes. Pool workers
-that fail due to TLS errors or network partitions are never recovered.
+If started with `Finch.start_link/1` instead of as a supervised child, pool workers that fail are never recovered.
 
 ---
 
@@ -489,4 +423,3 @@ that fail due to TLS errors or network partitions are never recovered.
 - [Finch](https://hexdocs.pm/finch) — pool configuration, HTTP/2, telemetry events
 - [Req.Test — HTTP stubs](https://hexdocs.pm/req/Req.Test.html) — stub/2, allow/3 for async tests
 - [Finch Telemetry](https://hexdocs.pm/finch/Finch.html#module-telemetry) — request/connect/send/recv events
-- [RFC 7540 — HTTP/2 Multiplexing](https://httpwg.org/specs/rfc7540.html#StreamsLayer) — why `count: 1` for HTTP/2 pools

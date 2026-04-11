@@ -44,7 +44,7 @@ swarm/
 
 ## The business problem
 
-The distributed systems team needs to transfer large datasets (10–100GB model files) between datacenter nodes without relying on a central file server. A central server is both a bottleneck and a single point of failure. With P2P, every node that has completed a download becomes an upload source, and aggregate bandwidth scales with the number of participants.
+The distributed systems team needs to transfer large datasets (10-100GB model files) between datacenter nodes without relying on a central file server. A central server is both a bottleneck and a single point of failure. With P2P, every node that has completed a download becomes an upload source, and aggregate bandwidth scales with the number of participants.
 
 Three algorithms drive the design:
 
@@ -89,12 +89,14 @@ end
 
 ### Step 3: `lib/swarm/metadata.ex`
 
+The metadata module represents a shared file's identity. It splits the file into fixed-size pieces, computes the SHA-256 hash of each piece for integrity verification, and derives a unique `info_hash` that identifies the file across the network. The `split_into_pieces/2` function uses `:binary.part/3` for zero-copy slicing of large binaries.
+
 ```elixir
 defmodule Swarm.Metadata do
   @moduledoc """
   File metadata for a shared file.
 
-  The info_hash identifies the file uniquely: it is the SHA-1 of the "info dict"
+  The info_hash identifies the file uniquely: it is the SHA-256 of the "info dict"
   (a map of name, piece_length, length, pieces). This allows peers to verify they
   are talking about the same file before exchanging piece data.
 
@@ -148,14 +150,25 @@ defmodule Swarm.Metadata do
   end
 
   defp split_into_pieces(data, piece_length) do
-    # TODO: split data into chunks of piece_length bytes
-    # HINT: use recursive :binary.part/3 — do not use binary matching that copies
-    []
+    total = byte_size(data)
+    split_into_pieces(data, piece_length, 0, total, [])
+  end
+
+  defp split_into_pieces(_data, _piece_length, offset, total, acc) when offset >= total do
+    Enum.reverse(acc)
+  end
+
+  defp split_into_pieces(data, piece_length, offset, total, acc) do
+    length = min(piece_length, total - offset)
+    piece = :binary.part(data, offset, length)
+    split_into_pieces(data, piece_length, offset + length, total, [piece | acc])
   end
 end
 ```
 
 ### Step 4: `lib/swarm/piece_manager.ex`
+
+The piece manager tracks which pieces each peer has, which pieces we have received, and which pieces are currently requested. The rarest-first selection algorithm chooses the piece with the lowest availability count among the pieces a given peer can provide and we still need. This maximizes piece diversity across the swarm.
 
 ```elixir
 defmodule Swarm.PieceManager do
@@ -221,7 +234,6 @@ defmodule Swarm.PieceManager do
     state = %{
       have: MapSet.new(),
       requested: MapSet.new(),
-      # Start with 0 availability for all pieces
       availability: Map.new(0..(num_pieces - 1), &{&1, 0}),
       peer_pieces: %{}
     }
@@ -231,16 +243,28 @@ defmodule Swarm.PieceManager do
 
   @impl true
   def handle_cast({:bitfield, peer_id, pieces}, state) do
-    # TODO: store peer_pieces[peer_id] = pieces
-    # TODO: increment availability count for each piece in the bitfield
-    {:noreply, state}
+    # Store which pieces this peer has
+    new_peer_pieces = Map.put(state.peer_pieces, peer_id, pieces)
+
+    # Increment availability count for each piece in the bitfield
+    new_availability =
+      Enum.reduce(pieces, state.availability, fn index, avail ->
+        Map.update(avail, index, 1, &(&1 + 1))
+      end)
+
+    {:noreply, %{state | peer_pieces: new_peer_pieces, availability: new_availability}}
   end
 
   @impl true
   def handle_cast({:have, peer_id, index}, state) do
-    # TODO: add index to peer_pieces[peer_id]
-    # TODO: increment availability[index]
-    {:noreply, state}
+    # Add this piece to the peer's set
+    current_pieces = Map.get(state.peer_pieces, peer_id, MapSet.new())
+    new_peer_pieces = Map.put(state.peer_pieces, peer_id, MapSet.put(current_pieces, index))
+
+    # Increment availability for this piece
+    new_availability = Map.update(state.availability, index, 1, &(&1 + 1))
+
+    {:noreply, %{state | peer_pieces: new_peer_pieces, availability: new_availability}}
   end
 
   @impl true
@@ -255,25 +279,40 @@ defmodule Swarm.PieceManager do
   @impl true
   def handle_call({:select, peer_id}, _from, state) do
     peer_has = Map.get(state.peer_pieces, peer_id, MapSet.new())
-    needed = MapSet.difference(peer_has, MapSet.union(state.have, state.requested))
+    already_obtained = MapSet.union(state.have, state.requested)
+    needed = MapSet.difference(peer_has, already_obtained)
 
     result =
       if MapSet.size(needed) == 0 do
         :none
       else
-        # TODO: find piece in `needed` with minimum availability count
-        # HINT: Enum.min_by(MapSet.to_list(needed), &Map.get(state.availability, &1, 0))
-        # On tie: Enum.shuffle first, then min_by
-        {:ok, MapSet.to_list(needed) |> hd()}
+        # Rarest-first: find piece in `needed` with minimum availability count.
+        # Shuffle first so that ties are broken randomly, preventing all peers
+        # from requesting the same rare piece from the same source.
+        selected =
+          needed
+          |> MapSet.to_list()
+          |> Enum.shuffle()
+          |> Enum.min_by(&Map.get(state.availability, &1, 0))
+
+        {:ok, selected}
       end
 
-    # TODO: mark selected piece as requested to avoid duplicate requests
-    {:reply, result, state}
+    # Mark selected piece as requested to avoid duplicate requests
+    new_state =
+      case result do
+        {:ok, index} -> %{state | requested: MapSet.put(state.requested, index)}
+        :none -> state
+      end
+
+    {:reply, result, new_state}
   end
 end
 ```
 
 ### Step 5: `lib/swarm/rate_limiter.ex`
+
+The rate limiter implements the token bucket algorithm. Each peer has an independent bucket with a capacity (burst size) and a refill rate (sustained throughput). Tokens are computed lazily on each `consume` call by calculating how many tokens have accumulated since the last refill. Float arithmetic preserves sub-integer token accumulation.
 
 ```elixir
 defmodule Swarm.RateLimiter do
@@ -292,7 +331,7 @@ defmodule Swarm.RateLimiter do
   1. Compute tokens to add: (now - last_refill) * rate
   2. current_tokens = min(capacity, current_tokens + new_tokens)
   3. If current_tokens >= n: subtract n, return :ok
-  4. Else: return {:wait, (n - current_tokens) / rate} — time in ms to wait
+  4. Else: return {:wait, (n - current_tokens) / rate} -- time in ms to wait
 
   Why float tokens?
   If rate is 10KB/s and we call consume(1KB) every 50ms, the refill adds
@@ -462,6 +501,6 @@ The choker re-evaluates every 10 seconds which peers to unchoke. Using `Process.
 
 - [BitTorrent Protocol Specification BEP-3](http://www.bittorrent.org/beps/bep_0003.html) — the handshake, messages (`bitfield`, `have`, `request`, `piece`, `choke`, `unchoke`), and endgame algorithm
 - [BEP-5 — DHT Protocol](http://www.bittorrent.org/beps/bep_0005.html) — Kademlia implementation details including k-bucket structure and iterative lookup
-- [Kademlia: A Peer-to-peer Information System Based on the XOR Metric](https://pdos.csail.mit.edu/~petar/papers/maymounkov-kademlia-lncs.pdf) — Maymounkov & Mazières (2002) — the original paper; short and readable
+- [Kademlia: A Peer-to-peer Information System Based on the XOR Metric](https://pdos.csail.mit.edu/~petar/papers/maymounkov-kademlia-lncs.pdf) — Maymounkov and Mazieres (2002) — the original paper; short and readable
 - [BitTorrent Economics Paper](http://bittorrent.org/bittorrentecon.pdf) — Bram Cohen's tit-for-tat analysis; explains why unchoke incentivizes uploading
 - [Erlang `:crypto` documentation](https://www.erlang.org/doc/man/crypto.html) — for SHA-1 and SHA-256 piece hashing

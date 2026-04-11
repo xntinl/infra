@@ -223,7 +223,154 @@ defmodule ChordRing.Migration do
 end
 ```
 
-### Step 5: Given tests — must pass without modification
+### Step 5: Shard GenServer
+
+```elixir
+# lib/chord_ring/shard.ex
+defmodule ChordRing.Shard do
+  @moduledoc """
+  GenServer per shard that stores key-value data in ETS.
+  Each shard owns a range of tokens on the consistent hashing ring.
+  """
+
+  use GenServer
+
+  def start_link(opts) do
+    id = Keyword.fetch!(opts, :id)
+    GenServer.start_link(__MODULE__, opts, name: id)
+  end
+
+  @impl true
+  def init(opts) do
+    id = Keyword.fetch!(opts, :id)
+    table = :ets.new(:"shard_#{id}", [:set, :public])
+    {:ok, %{id: id, table: table}}
+  end
+
+  @impl true
+  def handle_call({:get, key}, _from, state) do
+    case :ets.lookup(state.table, key) do
+      [{^key, value}] -> {:reply, {:ok, value}, state}
+      [] -> {:reply, {:error, :not_found}, state}
+    end
+  end
+
+  def handle_call({:put, key, value}, _from, state) do
+    :ets.insert(state.table, {key, value})
+    {:reply, :ok, state}
+  end
+end
+```
+
+### Step 6: Top-level ChordRing API
+
+```elixir
+# lib/chord_ring.ex
+defmodule ChordRing do
+  @moduledoc """
+  Public API for the consistent hashing ring.
+  Manages shard processes, routes reads/writes, and handles node additions.
+  """
+
+  use GenServer
+
+  defstruct [:ring, :shards, :migrations, :supervisor]
+
+  @spec start(keyword()) :: pid()
+  def start(opts) do
+    {:ok, pid} = GenServer.start_link(__MODULE__, opts)
+    pid
+  end
+
+  @spec put(pid(), binary(), term()) :: :ok
+  def put(ring_pid, key, value), do: GenServer.call(ring_pid, {:put, key, value})
+
+  @spec get(pid(), binary()) :: {:ok, term()} | {:error, :not_found}
+  def get(ring_pid, key), do: GenServer.call(ring_pid, {:get, key})
+
+  @spec add_node(pid(), atom()) :: :ok
+  def add_node(ring_pid, node_id), do: GenServer.call(ring_pid, {:add_node, node_id})
+
+  @impl true
+  def init(opts) do
+    nodes = Keyword.get(opts, :nodes, [:n1, :n2, :n3])
+
+    children = Enum.map(nodes, fn id ->
+      %{id: id, start: {ChordRing.Shard, :start_link, [[id: id]]}}
+    end)
+    {:ok, sup} = Supervisor.start_link(children, strategy: :one_for_one)
+
+    ring = ChordRing.Ring.new(nodes, 150)
+
+    {:ok, %__MODULE__{
+      ring: ring,
+      shards: nodes,
+      migrations: %{},
+      supervisor: sup
+    }}
+  end
+
+  @impl true
+  def handle_call({:put, key, value}, _from, state) do
+    node = ChordRing.Ring.lookup(state.ring, key)
+
+    case Map.get(state.migrations, key) do
+      nil ->
+        GenServer.call(node, {:put, key, value})
+        {:reply, :ok, state}
+      migration ->
+        {:ok, new_migration} = ChordRing.Migration.write(key, value, migration)
+        {:reply, :ok, %{state | migrations: Map.put(state.migrations, key, new_migration)}}
+    end
+  end
+
+  def handle_call({:get, key}, _from, state) do
+    node = ChordRing.Ring.lookup(state.ring, key)
+
+    result = case Map.get(state.migrations, key) do
+      nil -> GenServer.call(node, {:get, key})
+      migration -> ChordRing.Migration.read(key, migration)
+    end
+
+    {:reply, result, state}
+  end
+
+  def handle_call({:add_node, node_id}, _from, state) do
+    Supervisor.start_child(state.supervisor, %{
+      id: node_id, start: {ChordRing.Shard, :start_link, [[id: node_id]]}
+    })
+
+    new_ring = ChordRing.Ring.add_node(state.ring, node_id, 150)
+    new_shards = [node_id | state.shards]
+
+    spawn(fn -> background_migrate(state.ring, new_ring, state.shards, node_id) end)
+
+    {:reply, :ok, %{state | ring: new_ring, shards: new_shards}}
+  end
+
+  defp background_migrate(old_ring, new_ring, existing_shards, _new_node) do
+    for shard_id <- existing_shards do
+      try do
+        table = GenServer.call(shard_id, :get_table)
+        if table do
+          :ets.tab2list(table)
+          |> Enum.each(fn {key, value} ->
+            old_owner = ChordRing.Ring.lookup(old_ring, to_string(key))
+            new_owner = ChordRing.Ring.lookup(new_ring, to_string(key))
+            if old_owner != new_owner do
+              GenServer.call(new_owner, {:put, key, value})
+            end
+          end)
+        end
+      catch
+        _, _ -> :ok
+      end
+    end
+  end
+end
+```
+
+### Step 7: Given tests — must pass without modification
 
 ```elixir
 # test/chord_ring/ring_test.exs
@@ -305,13 +452,13 @@ defmodule ChordRing.MigrationTest do
 end
 ```
 
-### Step 6: Run the tests
+### Step 8: Run the tests
 
 ```bash
 mix test test/chord_ring/ --trace
 ```
 
-### Step 7: Benchmark
+### Step 9: Benchmark
 
 ```elixir
 # bench/ring_bench.exs

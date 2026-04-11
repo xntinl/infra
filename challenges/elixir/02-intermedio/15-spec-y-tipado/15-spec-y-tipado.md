@@ -1,71 +1,50 @@
 # Typespecs and Dialyzer
 
-**Project**: `task_queue` — built incrementally across the intermediate level
-
----
-
-## Project context
-
-The task_queue system has grown to a dozen modules. The scheduler calls the worker pool,
-the worker pool calls the registry, the registry is called from batch runners. At this
-scale, a mismatched argument type (passing a worker_id atom where a string is expected,
-or calling a function with the wrong arity) becomes harder to catch by inspection alone.
-
-`@spec`, `@type`, `@typep`, and Dialyzer give you machine-readable documentation that
-doubles as a static analysis tool. This exercise adds typespecs throughout the existing
-modules and configures Dialyzer to run as part of the CI pipeline.
-
-Project structure at this point:
-
-```
-task_queue/
-├── lib/
-│   └── task_queue/
-│       ├── scheduler.ex         # new module with full specs
-│       └── [all previous modules]
-├── test/
-│   └── task_queue/
-│       └── typespecs_test.exs   # given tests — must pass without modification
-└── mix.exs                      # ← add dialyxir
-```
-
----
-
 ## Why typespecs matter beyond documentation
 
-`@spec` documents what types a function accepts and returns. Alone, it has no runtime
-effect — Elixir does not enforce types at runtime. Its value comes from:
+`@spec` documents what types a function accepts and returns. Its value comes from:
 
 1. **Reader communication**: `@spec route(job_map()) :: module()` tells the caller exactly
-   what to pass and what to expect. No need to read the implementation.
-
-2. **Dialyzer analysis**: Dialyzer performs success-typing analysis — it determines what
-   types a function can actually produce and detects when callers pass impossible arguments
-   or ignore possible error returns. It finds real bugs that tests often miss.
-
+   what to pass and what to expect.
+2. **Dialyzer analysis**: Dialyzer performs success-typing analysis — it finds real bugs
+   that tests often miss.
 3. **IDE tooling**: ElixirLS uses specs for completion and inline type hints.
-
-The key insight: Dialyzer finds bugs without running the code. It found the bug in your
-`route/1` function where you forgot to handle `nil` payloads before you wrote a test for it.
 
 ---
 
 ## The business problem
 
-`TaskQueue.Scheduler` is the top-level coordinator. It:
+Build a `TaskQueue.Scheduler` — the top-level coordinator that:
 1. Checks the queue depth.
 2. Decides whether to scale workers up or down.
 3. Dispatches the next batch of jobs to available workers.
-4. Returns a structured `%SchedulerResult{}` with the outcome.
+4. Returns a structured result with the outcome.
 
-The module must be fully specced: all public functions with `@spec`, all types with
-`@type`, and all opaque types with `@opaque`. Dialyzer must pass clean.
+The module must be fully specced. Additionally, build the supporting modules
+(`WorkerPool`, `DynamicWorker`, `QueueServer`) that the scheduler depends on.
+
+All modules are defined completely in this exercise.
 
 ---
 
-## Implementation
+## Project setup
 
-### Step 1: Add `dialyxir` to `mix.exs`
+```
+task_queue/
+├── lib/
+│   └── task_queue/
+│       ├── application.ex
+│       ├── queue_server.ex
+│       ├── dynamic_worker.ex
+│       ├── worker_pool.ex
+│       └── scheduler.ex
+├── test/
+│   └── task_queue/
+│       └── typespecs_test.exs
+└── mix.exs
+```
+
+Add `dialyxir` to `mix.exs`:
 
 ```elixir
 defp deps do
@@ -75,12 +54,157 @@ defp deps do
 end
 ```
 
-```bash
-mix deps.get
-mix dialyzer  # First run builds the PLT — takes a few minutes
+---
+
+## Implementation
+
+### `lib/task_queue/application.ex`
+
+```elixir
+defmodule TaskQueue.Application do
+  use Application
+
+  @impl Application
+  def start(_type, _args) do
+    children = [
+      TaskQueue.QueueServer,
+      {Registry, keys: :unique, name: TaskQueue.WorkerRegistry},
+      {DynamicSupervisor, strategy: :one_for_one, name: TaskQueue.WorkerSupervisor}
+    ]
+
+    opts = [strategy: :one_for_one, name: TaskQueue.RootSupervisor]
+    Supervisor.start_link(children, opts)
+  end
+end
 ```
 
-### Step 2: `lib/task_queue/scheduler.ex`
+### `lib/task_queue/queue_server.ex`
+
+```elixir
+defmodule TaskQueue.QueueServer do
+  use GenServer
+
+  def start_link(opts \\ []) do
+    GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+  end
+
+  @spec push(any()) :: :ok
+  def push(payload) do
+    job = %{
+      id: :crypto.strong_rand_bytes(8) |> Base.url_encode64(padding: false),
+      payload: payload,
+      queued_at: System.monotonic_time(:millisecond)
+    }
+    GenServer.cast(__MODULE__, {:push, job})
+  end
+
+  @spec pop() :: {:ok, map()} | {:error, :empty}
+  def pop, do: GenServer.call(__MODULE__, :pop)
+
+  @spec size() :: non_neg_integer()
+  def size, do: GenServer.call(__MODULE__, :size)
+
+  @impl GenServer
+  def init(_opts), do: {:ok, []}
+
+  @impl GenServer
+  def handle_cast({:push, job}, state), do: {:noreply, state ++ [job]}
+
+  @impl GenServer
+  def handle_call(:pop, _from, []), do: {:reply, {:error, :empty}, []}
+  def handle_call(:pop, _from, [job | rest]), do: {:reply, {:ok, job}, rest}
+
+  @impl GenServer
+  def handle_call(:size, _from, state), do: {:reply, length(state), state}
+
+  @impl GenServer
+  def handle_info(_, state), do: {:noreply, state}
+end
+```
+
+### `lib/task_queue/dynamic_worker.ex`
+
+```elixir
+defmodule TaskQueue.DynamicWorker do
+  use GenServer
+  require Logger
+
+  @registry TaskQueue.WorkerRegistry
+
+  def start_link(worker_id) when is_binary(worker_id) do
+    GenServer.start_link(__MODULE__, worker_id, name: via(worker_id))
+  end
+
+  @spec via(String.t()) :: {:via, Registry, {module(), {atom(), String.t()}}}
+  def via(worker_id), do: {:via, Registry, {@registry, {:worker, worker_id}}}
+
+  @spec lookup(String.t()) :: pid() | nil
+  def lookup(worker_id) do
+    case Registry.lookup(@registry, {:worker, worker_id}) do
+      [{pid, _}] -> pid
+      [] -> nil
+    end
+  end
+
+  @spec list_ids() :: [String.t()]
+  def list_ids do
+    @registry
+    |> Registry.select([{{:"$1", :"$2", :"$3"}, [], [:"$1"]}])
+    |> Enum.map(fn {:worker, id} -> id end)
+  end
+
+  @spec process_job(String.t()) :: {:ok, any()} | {:error, any()}
+  def process_job(worker_id) do
+    GenServer.call(via(worker_id), :process_job, 30_000)
+  end
+
+  @impl GenServer
+  def init(worker_id) do
+    {:ok, %{worker_id: worker_id, jobs_processed: 0, started_at: System.monotonic_time(:millisecond)}}
+  end
+
+  @impl GenServer
+  def handle_call(:process_job, _from, state) do
+    case TaskQueue.QueueServer.pop() do
+      {:error, :empty} -> {:reply, {:error, :empty}, state}
+      {:ok, _job} -> {:reply, {:ok, :processed}, %{state | jobs_processed: state.jobs_processed + 1}}
+    end
+  end
+
+  @impl GenServer
+  def handle_info(_, state), do: {:noreply, state}
+end
+```
+
+### `lib/task_queue/worker_pool.ex`
+
+```elixir
+defmodule TaskQueue.WorkerPool do
+  alias TaskQueue.DynamicWorker
+
+  @supervisor TaskQueue.WorkerSupervisor
+
+  @spec start_worker(String.t()) :: {:ok, pid()} | {:error, any()}
+  def start_worker(worker_id) do
+    DynamicSupervisor.start_child(@supervisor, {DynamicWorker, worker_id})
+  end
+
+  @spec stop_worker(String.t()) :: :ok | {:error, :not_found}
+  def stop_worker(worker_id) do
+    case DynamicWorker.lookup(worker_id) do
+      nil -> {:error, :not_found}
+      pid ->
+        DynamicSupervisor.terminate_child(@supervisor, pid)
+        :ok
+    end
+  end
+
+  @spec count() :: non_neg_integer()
+  def count, do: DynamicWorker.list_ids() |> length()
+end
+```
+
+### `lib/task_queue/scheduler.ex`
 
 ```elixir
 defmodule TaskQueue.Scheduler do
@@ -91,13 +215,8 @@ defmodule TaskQueue.Scheduler do
 
   require Logger
 
-  # ---------------------------------------------------------------------------
-  # Type definitions — must be precise enough for Dialyzer to find real bugs
-  # ---------------------------------------------------------------------------
-
   @type worker_id :: String.t()
   @type job_id :: String.t()
-
   @type scaling_decision :: :scale_up | :scale_down | :hold
 
   @type dispatch_outcome :: %{
@@ -113,20 +232,12 @@ defmodule TaskQueue.Scheduler do
     required(:dispatched) => [dispatch_outcome()]
   }
 
-  # Module attribute constants — not types, but affect type inference
   @min_workers 1
   @max_workers 10
   @scale_up_threshold 5
   @scale_down_threshold 1
 
-  # ---------------------------------------------------------------------------
-  # Public API
-  # ---------------------------------------------------------------------------
-
-  @doc """
-  Runs one scheduling cycle: inspect, scale, dispatch.
-  Returns a complete summary of what happened.
-  """
+  @doc "Runs one scheduling cycle: inspect, scale, dispatch."
   @spec run_cycle() :: scheduler_result()
   def run_cycle do
     queue_depth = TaskQueue.QueueServer.size()
@@ -145,10 +256,6 @@ defmodule TaskQueue.Scheduler do
     }
   end
 
-  @doc """
-  Determines whether to scale up, scale down, or hold based on queue depth
-  and current worker count.
-  """
   @spec decide_scaling(non_neg_integer(), non_neg_integer()) :: scaling_decision()
   def decide_scaling(queue_depth, active_workers)
       when queue_depth > @scale_up_threshold and active_workers < @max_workers do
@@ -162,43 +269,27 @@ defmodule TaskQueue.Scheduler do
 
   def decide_scaling(_queue_depth, _active_workers), do: :hold
 
-  @doc """
-  Applies the scaling decision. Returns the number of workers started or stopped.
-  """
   @spec apply_scaling(scaling_decision(), non_neg_integer()) :: integer()
   def apply_scaling(:scale_up, _current) do
-    worker_id = generate_worker_id()
+    worker_id = "auto_#{:crypto.strong_rand_bytes(4) |> Base.url_encode64(padding: false)}"
     case TaskQueue.WorkerPool.start_worker(worker_id) do
-      {:ok, _pid} ->
-        Logger.info("Scheduler: scaled up, started worker #{worker_id}")
-        1
-      {:error, reason} ->
-        Logger.error("Scheduler: scale up failed: #{inspect(reason)}")
-        0
+      {:ok, _pid} -> 1
+      {:error, _} -> 0
     end
   end
 
   def apply_scaling(:scale_down, current) when current > @min_workers do
     case TaskQueue.DynamicWorker.list_ids() do
-      [] ->
-        0
-
+      [] -> 0
       [first_id | _] ->
         TaskQueue.WorkerPool.stop_worker(first_id)
-        Logger.info("Scheduler: scaled down, stopped worker #{first_id}")
         -1
     end
   end
 
   def apply_scaling(:hold, _current), do: 0
-
-  # Required for exhaustiveness — Dialyzer enforces this
   def apply_scaling(_, _), do: 0
 
-  @doc """
-  Dispatches up to `batch_size` jobs to available workers.
-  Returns a list of dispatch outcomes.
-  """
   @spec dispatch_batch(non_neg_integer()) :: [dispatch_outcome()]
   def dispatch_batch(0), do: []
 
@@ -214,48 +305,19 @@ defmodule TaskQueue.Scheduler do
       |> Enum.take(limit)
       |> Enum.map(fn worker_id ->
         result = TaskQueue.DynamicWorker.process_job(worker_id)
-
         case result do
-          {:ok, _value} ->
-            %{job_id: "dispatched", worker_id: worker_id, result: result}
-
-          {:error, :empty} ->
-            nil
-
-          {:error, _reason} ->
-            %{job_id: "dispatched", worker_id: worker_id, result: result}
+          {:ok, _} -> %{job_id: "dispatched", worker_id: worker_id, result: result}
+          {:error, :empty} -> nil
+          {:error, _} -> %{job_id: "dispatched", worker_id: worker_id, result: result}
         end
       end)
       |> Enum.reject(&is_nil/1)
     end
   end
-
-  # ---------------------------------------------------------------------------
-  # Private
-  # ---------------------------------------------------------------------------
-
-  @spec generate_worker_id() :: worker_id()
-  defp generate_worker_id do
-    "auto_worker_#{:crypto.strong_rand_bytes(4) |> Base.url_encode64(padding: false)}"
-  end
 end
 ```
 
-The type definitions at the top of the module serve two purposes: they document the
-data shapes for human readers, and they provide Dialyzer with precise enough information
-to detect mismatches. Using `required(:key)` in map types tells Dialyzer that these keys
-must always be present — accessing a missing key would be a type error.
-
-The `decide_scaling/2` function uses guards with module attributes (`@scale_up_threshold`,
-`@max_workers`) to encode the scaling policy. Each clause handles a specific condition,
-and the catch-all returns `:hold`. Dialyzer verifies that all possible combinations of
-`non_neg_integer()` arguments are handled.
-
-The `apply_scaling/2` function for `:scale_down` checks `list_ids()` to find a worker
-to stop, handling the edge case where no workers are registered despite `current > @min_workers`
-(which can happen due to race conditions between the count and the list operation).
-
-### Step 3: Given tests — must pass without modification
+### Tests
 
 ```elixir
 # test/task_queue/typespecs_test.exs
@@ -265,12 +327,7 @@ defmodule TaskQueue.TypespecsTest do
   alias TaskQueue.Scheduler
 
   setup do
-    # Ensure a clean system state
-    case Process.whereis(TaskQueue.WorkerPool) do
-      nil -> :ok
-      _ ->
-        for id <- TaskQueue.DynamicWorker.list_ids(), do: TaskQueue.WorkerPool.stop_worker(id)
-    end
+    for id <- TaskQueue.DynamicWorker.list_ids(), do: TaskQueue.WorkerPool.stop_worker(id)
     Process.sleep(50)
     :ok
   end
@@ -328,75 +385,37 @@ defmodule TaskQueue.TypespecsTest do
       result = Scheduler.apply_scaling(:scale_up, initial)
       Process.sleep(50)
       assert result in [0, 1]
-      # Clean up
       for id <- TaskQueue.DynamicWorker.list_ids(), do: TaskQueue.WorkerPool.stop_worker(id)
     end
   end
 end
 ```
 
-### Step 4: Run Dialyzer
+### Run the tests
 
 ```bash
 mix dialyzer
-```
-
-Dialyzer should pass with zero warnings. If it reports a warning, fix the code rather
-than adding `# dialyzer:ignore` suppressions — suppressions hide real bugs.
-
-### Step 5: Run the tests
-
-```bash
 mix test test/task_queue/typespecs_test.exs --trace
 ```
-
----
-
-## Trade-off analysis
-
-| Aspect | `@spec` + Dialyzer | Runtime type validation | No type annotations |
-|--------|-------------------|-----------------------|---------------------|
-| Bug detection | Before tests run | At runtime | Only when test covers the path |
-| Performance overhead | None — compile-time only | Non-trivial per call | None |
-| Maintenance cost | Medium — keep specs in sync | High | Low initially |
-| Finds unreachable clauses | Yes | No | No |
-| Finds wrong return type usage | Yes | No — only catches current call | No |
-| IDE support | Full — completion, hover | None | Partial |
-
-Reflection question: Dialyzer uses **success typing** — it infers what types a function
-can successfully return and flags callers that would never succeed. This means Dialyzer
-does **not** catch all type errors — only provably wrong ones. What kinds of bugs will
-Dialyzer find that tests miss, and what kinds will Dialyzer miss that tests catch?
 
 ---
 
 ## Common production mistakes
 
 **1. Writing `@spec` after the fact as documentation only**
-A `@spec` that says `@spec get(String.t()) :: map()` when the function can actually
-return `nil` is a lie. Dialyzer will find this — the spec says one thing, the
-implementation does another.
+A `@spec` that says `:: map()` when the function can return `nil` is a lie. Dialyzer
+will find this.
 
 **2. Using `any()` everywhere to silence Dialyzer**
-`@spec my_fn(any()) :: any()` defeats the purpose. Be as precise as possible. Use
-union types (`atom() | binary()`) instead of `any()` when you know the possible values.
+`@spec my_fn(any()) :: any()` defeats the purpose. Be as precise as possible.
 
-**3. Forgetting to re-run Dialyzer after refactoring**
-The PLT (Persistent Lookup Table) Dialyzer builds caches type information. After major
-refactoring, run `mix dialyzer --no-check` to force a full reanalysis. Stale PLT data
-produces false negatives.
-
-**4. Overly broad `@type` definitions**
+**3. Overly broad `@type` definitions**
 ```elixir
-# Too broad — does not help Dialyzer
+# Too broad
 @type job :: map()
 
 # Specific — Dialyzer can find mismatches
-@type job :: %{
-  required(:id) => String.t(),
-  required(:type) => atom(),
-  required(:payload) => any()
-}
+@type job :: %{required(:id) => String.t(), required(:type) => atom()}
 ```
 
 ---
@@ -404,6 +423,5 @@ produces false negatives.
 ## Resources
 
 - [Typespecs — HexDocs](https://hexdocs.pm/elixir/typespecs.html)
-- [Dialyxir — GitHub](https://github.com/jeremyjh/dialyxir) — the Mix wrapper for Dialyzer
-- [Dialyzer — Erlang/OTP](https://www.erlang.org/doc/man/dialyzer.html) — the underlying tool documentation
-- [Learn You Some Erlang: Type Specifications](https://learnyousomeerlang.com/dialyzer) — the best explanation of success typing
+- [Dialyxir — GitHub](https://github.com/jeremyjh/dialyxir)
+- [Learn You Some Erlang: Type Specifications](https://learnyousomeerlang.com/dialyzer)

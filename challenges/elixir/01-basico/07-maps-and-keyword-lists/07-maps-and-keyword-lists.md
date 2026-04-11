@@ -1,33 +1,18 @@
 # Maps and Keyword Lists: Transaction Configuration
 
-**Project**: `payments_cli` — built incrementally across the basic level
+**Project**: `payments_cli` — a CLI tool that processes payment transactions
 
 ---
 
 ## Project context
 
-You're building `payments_cli`. Transaction maps represent in-flight data.
-Configuration for processing rules (fee rates, currency limits, retry policies)
-uses keyword lists because order and optionality matter. Understanding when to use
-each is a design decision, not a syntax question.
+You are building `payments_cli`, a CLI tool that processes payment transactions from CSV
+files, validates them, applies business rules, and produces ledger reports.
 
-Project structure at this point:
-
-```
-payments_cli/
-├── lib/
-│   └── payments_cli/
-│       ├── cli.ex
-│       ├── transaction.ex
-│       ├── ledger.ex
-│       ├── formatter.ex
-│       ├── pipeline.ex
-│       └── processor.ex    # ← you implement this
-├── test/
-│   └── payments_cli/
-│       └── processor_test.exs  # given tests — must pass without modification
-└── mix.exs
-```
+This exercise implements a `Processor` module that applies configurable processing rules
+to transactions using keyword lists for options, merges transaction updates immutably,
+extracts summary data, and validates field presence. Understanding when to use maps vs
+keyword lists is a design decision, not a syntax question.
 
 ---
 
@@ -39,7 +24,7 @@ is determined by requirements, not preference:
 **Use maps when:**
 - Keys are unique (each transaction has one `amount_cents`)
 - Access is O(1) by key
-- Structure is fixed and known at compile time (or modeled with a struct in exercise 15)
+- Structure is fixed and known at compile time (or modeled with a struct)
 - Data crosses module boundaries as the primary data type
 
 **Use keyword lists when:**
@@ -201,7 +186,7 @@ end
   map is missing any of these keys, the match fails with a `FunctionClauseError` — this
   is fail-fast behavior that immediately surfaces schema mismatches.
 
-### Given tests — must pass without modification
+### Tests
 
 ```elixir
 # test/payments_cli/processor_test.exs
@@ -285,7 +270,7 @@ mix test test/payments_cli/processor_test.exs --trace
 
 ## Trade-off analysis
 
-| Aspect | Maps (transactions) | Keyword lists (opts) | Structs (exercise 15) |
+| Aspect | Maps (transactions) | Keyword lists (opts) | Structs |
 |--------|--------------------|--------------------|----------------------|
 | Key uniqueness | Enforced | Not enforced | Enforced at compile time |
 | Access speed | O(1) | O(n) — linear scan | O(1) — same as map |
@@ -317,7 +302,7 @@ unless you call `Enum.sort/1` explicitly.
 
 **4. Keyword list with `[]` access vs `Keyword.get/3`**
 `opts[:missing_key]` returns `nil`. `Keyword.get(opts, :missing_key, default)` returns
-`default`. If your default is not `nil`, use `Keyword.get/3` explicitly — silence nil
+`default`. If your default is not `nil`, use `Keyword.get/3` explicitly — silent nil
 returns are hard to debug.
 
 **5. Mutating a map with `Map.put/3` and discarding the result**

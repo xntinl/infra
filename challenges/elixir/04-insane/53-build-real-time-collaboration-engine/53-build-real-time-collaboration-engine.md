@@ -62,11 +62,11 @@ collab/
 ```elixir
 defmodule Collab.OT.Operation do
   @enforce_keys [:type, :pos, :clock, :user_id]
-  defstruct [:type, :pos, :text, :len, :clock, :user_id]
+  defstruct [:type, :pos, :text, :len, :clock, :user_id, :deleted_text]
 
   @type t ::
     %__MODULE__{type: :insert, pos: non_neg_integer(), text: String.t(), clock: non_neg_integer(), user_id: String.t()} |
-    %__MODULE__{type: :delete, pos: non_neg_integer(), len: pos_integer(), clock: non_neg_integer(), user_id: String.t()}
+    %__MODULE__{type: :delete, pos: non_neg_integer(), len: pos_integer(), clock: non_neg_integer(), user_id: String.t(), deleted_text: String.t() | nil}
 end
 
 defmodule Collab.OT.Apply do
@@ -100,17 +100,14 @@ defmodule Collab.OT.Transform do
   def transform(%Operation{type: :insert} = op1, %Operation{type: :insert} = op2) do
     cond do
       op2.pos < op1.pos ->
-        # op2 inserted before op1's position; shift op1 right by op2's length
         %{op1 | pos: op1.pos + String.length(op2.text)}
       op2.pos == op1.pos ->
-        # Tie-break: deterministic by user_id
         if op2.user_id < op1.user_id do
           %{op1 | pos: op1.pos + String.length(op2.text)}
         else
           op1
         end
       true ->
-        # op2 inserted after op1's position; op1 is unaffected
         op1
     end
   end
@@ -118,13 +115,10 @@ defmodule Collab.OT.Transform do
   def transform(%Operation{type: :insert} = op1, %Operation{type: :delete} = op2) do
     cond do
       op2.pos + op2.len <= op1.pos ->
-        # op2 deleted entirely before op1's position; shift op1 left
         %{op1 | pos: op1.pos - op2.len}
       op2.pos >= op1.pos ->
-        # op2 deleted entirely after op1's position; unaffected
         op1
       true ->
-        # op2 deletion overlaps op1's position; place op1 at deletion start
         %{op1 | pos: op2.pos}
     end
   end
@@ -132,36 +126,49 @@ defmodule Collab.OT.Transform do
   def transform(%Operation{type: :delete} = op1, %Operation{type: :insert} = op2) do
     cond do
       op2.pos <= op1.pos ->
-        # op2 inserted before op1; shift op1 right
         %{op1 | pos: op1.pos + String.length(op2.text)}
       op2.pos < op1.pos + op1.len ->
-        # op2 inserted within op1's deleted range; extend delete range
         %{op1 | len: op1.len + String.length(op2.text)}
       true ->
         op1
     end
   end
 
+  @doc """
+  Transform delete vs delete: handle all four overlap cases.
+  - op2 fully covers op1: result is a no-op (len 0)
+  - op2 covers the start of op1: shrink from the left
+  - op2 covers the end of op1: shrink from the right
+  - op2 is inside op1: shrink op1's len by op2's overlap
+  """
   def transform(%Operation{type: :delete} = op1, %Operation{type: :delete} = op2) do
     cond do
       op2.pos + op2.len <= op1.pos ->
         # op2 deleted entirely before op1; shift op1 left
         %{op1 | pos: op1.pos - op2.len}
+
       op2.pos >= op1.pos + op1.len ->
         # op2 deleted entirely after op1; unaffected
         op1
+
       true ->
-        # Overlapping deletes: compute the remaining range
-        # TODO: handle the four overlap cases:
-        # - op2 fully covers op1: result is a no-op delete (len 0)
-        # - op2 covers the start of op1: shrink op1 from the left
-        # - op2 covers the end of op1: shrink op1 from the right
-        # - op2 is inside op1: shrink op1's len by op2's len
+        # Overlapping deletes: compute remaining range after op2 is applied
+        op1_end = op1.pos + op1.len
+        op2_end = op2.pos + op2.len
+
+        # The overlap region that both ops delete
         overlap_start = max(op1.pos, op2.pos)
-        overlap_end = min(op1.pos + op1.len, op2.pos + op2.len)
+        overlap_end = min(op1_end, op2_end)
         overlap = max(0, overlap_end - overlap_start)
-        new_pos = if op2.pos < op1.pos, do: op2.pos, else: op1.pos
-        %{op1 | pos: new_pos, len: max(0, op1.len - overlap)}
+
+        # After op2 is applied, characters before op2.pos are unchanged,
+        # characters from op2.pos to op2_end are removed.
+        # op1's new position: if op1 starts before op2, it stays;
+        # if op1 starts within or after op2, it shifts left
+        new_pos = if op1.pos <= op2.pos, do: op1.pos, else: op1.pos - min(op1.pos - op2.pos, op2.len)
+        new_len = max(0, op1.len - overlap)
+
+        %{op1 | pos: new_pos, len: new_len}
     end
   end
 end
@@ -183,7 +190,7 @@ defmodule Collab.Document do
     {:ok, %{
       doc_id: doc_id,
       content: "",
-      operations: [],  # [{clock, op}] in order
+      operations: [],
       clock: 0,
       version: 0,
       pending_snapshot: 0
@@ -196,7 +203,6 @@ defmodule Collab.Document do
   end
 
   def handle_call({:apply_op, op}, _from, state) do
-    # Check permissions before applying
     case Collab.Permissions.check(op, state.doc_id) do
       :ok ->
         new_clock = state.clock + 1
@@ -212,11 +218,13 @@ defmodule Collab.Document do
           pending_snapshot: new_pending
         }
 
-        # Trigger snapshot every N operations
-        if new_pending >= @snapshot_interval do
-          GenServer.cast(self(), :snapshot)
-          new_state = %{new_state | pending_snapshot: 0}
-        end
+        new_state =
+          if new_pending >= @snapshot_interval do
+            GenServer.cast(self(), :snapshot)
+            %{new_state | pending_snapshot: 0}
+          else
+            new_state
+          end
 
         {:reply, {:ok, tagged_op, new_clock}, new_state}
       {:error, reason} ->
@@ -248,7 +256,7 @@ defmodule Collab.Presence do
   def init(doc_id) do
     {:ok, %{
       doc_id: doc_id,
-      cursors: %{},         # %{user_id => %{line, col, selection}}
+      cursors: %{},
       pending_broadcast: false
     }}
   end
@@ -299,7 +307,6 @@ defmodule Collab.UndoManager do
   use GenServer
   alias Collab.OT.{Transform, Apply, Operation}
 
-  # State per user: %{user_id => %{undo_stack: [op], redo_stack: [op]}}
   def start_link(doc_id) do
     GenServer.start_link(__MODULE__, doc_id)
   end
@@ -313,6 +320,12 @@ defmodule Collab.UndoManager do
     GenServer.cast(pid, {:record, user_id, op})
   end
 
+  def handle_cast({:record, user_id, op}, state) do
+    stacks = Map.get(state.stacks, user_id, %{undo_stack: [], redo_stack: []})
+    updated = %{stacks | undo_stack: [op | stacks.undo_stack], redo_stack: []}
+    {:noreply, %{state | stacks: Map.put(state.stacks, user_id, updated)}}
+  end
+
   @doc "Undo the last operation for user. Returns {:ok, inverse_op} or {:error, :empty}"
   def undo(pid, user_id, ops_since) do
     GenServer.call(pid, {:undo, user_id, ops_since})
@@ -323,9 +336,7 @@ defmodule Collab.UndoManager do
       [] -> {:reply, {:error, :empty}, state}
       nil -> {:reply, {:error, :empty}, state}
       [last_op | rest] ->
-        # Build inverse: insert → delete, delete → insert
         inverse = invert(last_op)
-        # Transform inverse through all operations applied since last_op
         transformed_inverse = Enum.reduce(ops_since, inverse, fn other_op, acc ->
           if other_op.user_id != user_id do
             Transform.transform(acc, other_op)
@@ -344,7 +355,6 @@ defmodule Collab.UndoManager do
   end
 
   defp invert(%Operation{type: :delete, pos: pos, len: len} = op) do
-    # For delete inversion, we need the original text — store it in the op
     %Operation{op | type: :insert, len: nil, text: op.deleted_text || ""}
   end
 end
@@ -365,9 +375,7 @@ defmodule Collab.OfflineMerge do
     catch_up_ops: server_ops_since, transformed to be safe to apply on top of client state
   """
   def merge(client_ops, server_ops_since) do
-    # Transform each client op against all server ops that it was concurrent with
     merged_ops = Enum.map(client_ops, fn {client_clock, client_op} ->
-      # Server ops applied while this client op was "in flight"
       concurrent_server_ops = Enum.filter(server_ops_since, fn {server_clock, _} ->
         server_clock > client_clock
       end)
@@ -377,7 +385,6 @@ defmodule Collab.OfflineMerge do
       transformed
     end)
 
-    # The client also needs catch-up: server ops transformed against client's offline ops
     catch_up_ops = Enum.map(server_ops_since, fn {_, server_op} ->
       Enum.reduce(merged_ops, server_op, fn client_op, acc ->
         Transform.transform(acc, client_op)
@@ -403,12 +410,10 @@ defmodule Collab.OT.TransformTest do
     op_a = %Operation{type: :insert, pos: 0, text: "A", clock: 1, user_id: "user_a"}
     op_b = %Operation{type: :insert, pos: 0, text: "B", clock: 1, user_id: "user_b"}
 
-    # Client A path: apply op_a, then transform op_b and apply
     doc_a = Apply.apply(doc, op_a)
     op_b_transformed = Transform.transform(op_b, op_a)
     result_a = Apply.apply(doc_a, op_b_transformed)
 
-    # Client B path: apply op_b, then transform op_a and apply
     doc_b = Apply.apply(doc, op_b)
     op_a_transformed = Transform.transform(op_a, op_b)
     result_b = Apply.apply(doc_b, op_a_transformed)
@@ -421,12 +426,10 @@ defmodule Collab.OT.TransformTest do
     delete = %Operation{type: :delete, pos: 0, len: 6, clock: 1, user_id: "u1"}
     insert = %Operation{type: :insert, pos: 3, text: "X", clock: 1, user_id: "u2"}
 
-    # Path 1: delete then transform-insert
     doc1 = Apply.apply(doc, delete)
     insert_t = Transform.transform(insert, delete)
     result1 = Apply.apply(doc1, insert_t)
 
-    # Path 2: insert then transform-delete
     doc2 = Apply.apply(doc, insert)
     delete_t = Transform.transform(delete, insert)
     result2 = Apply.apply(doc2, delete_t)
@@ -456,12 +459,10 @@ defmodule Collab.OT.ConvergencePropertyTest do
       op1 = %Operation{type: :insert, pos: p1, text: text1, clock: 1, user_id: "u1"}
       op2 = %Operation{type: :insert, pos: p2, text: text2, clock: 1, user_id: "u2"}
 
-      # Path 1
       d1 = Apply.apply(doc, op1)
       op2t = Transform.transform(op2, op1)
       result1 = Apply.apply(d1, op2t)
 
-      # Path 2
       d2 = Apply.apply(doc, op2)
       op1t = Transform.transform(op1, op2)
       result2 = Apply.apply(d2, op1t)
@@ -479,21 +480,15 @@ defmodule Collab.OfflineMergeTest do
   test "offline ops merge correctly with concurrent server ops" do
     doc = "hello"
 
-    # Client goes offline at clock 1
-    # While offline, client inserts " world" at end (pos 5)
     offline_op = %Operation{type: :insert, pos: 5, text: " world", clock: 1, user_id: "client"}
-
-    # Server meanwhile inserted "!" at position 5 (clock 2)
     server_op = %Operation{type: :insert, pos: 5, text: "!", clock: 2, user_id: "server"}
 
     {[merged_client_op], [catch_up_server_op]} =
       OfflineMerge.merge([{1, offline_op}], [{2, server_op}])
 
-    # Apply server op first, then merged client op
     doc_after_server = Apply.apply(doc, server_op)
     final = Apply.apply(doc_after_server, merged_client_op)
 
-    # Client applies offline op, then catch-up server op
     doc_after_client = Apply.apply(doc, offline_op)
     final_client = Apply.apply(doc_after_client, catch_up_server_op)
 
@@ -538,7 +533,7 @@ end
 | Transform function | Required; O(N) pairs for N concurrent ops | Not required | OT: simpler network protocol; CRDT: simpler algorithm, harder to explain |
 | Server requirement | Central server for operation ordering | Peer-to-peer capable | OT: requires server as arbiter; CRDT: works P2P, but larger per-character metadata |
 | Undo complexity | Must transform inverse through history | Similar complexity | Both require transforming undo operations |
-| Character overhead | No per-character metadata | Position identifiers per character | CRDT: documents can be 3–10× larger in memory due to position IDs |
+| Character overhead | No per-character metadata | Position identifiers per character | CRDT: documents can be 3-10x larger in memory due to position IDs |
 | Implementation correctness | Hard; many published OT algorithms are wrong | Easier to verify | CRDT invariants are simpler to test; OT transform function has subtle cases |
 
 ## Common production mistakes

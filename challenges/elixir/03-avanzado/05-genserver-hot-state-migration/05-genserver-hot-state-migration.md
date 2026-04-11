@@ -1,210 +1,214 @@
 # GenServer Hot State Migration & Code Upgrades
 
-**Project**: `api_gateway` — built incrementally across the advanced level
+## Goal
 
----
-
-## Project context
-
-You're building `api_gateway`. The circuit breaker worker (exercise 01) has been
-running in production for six months. You need to add per-service SLA tiers
-(`:critical`, `:standard`, `:best_effort`) that affect failure thresholds and recovery
-windows. This is a state schema change — the existing `:closed | :open | :half_open`
-state needs new fields.
-
-You cannot restart the workers: each one holds in-memory failure history that takes
-30+ seconds to rebuild. A rolling restart would temporarily blind the gateway's
-circuit detection. You need a hot upgrade.
-
-Project structure at this point:
-
-```
-api_gateway/
-├── lib/
-│   └── api_gateway/
-│       ├── application.ex
-│       └── circuit_breaker/
-│           ├── worker.ex          # ← add code_change/3 here
-│           └── supervisor.ex
-├── test/
-│   └── api_gateway/
-│       └── circuit_breaker/
-│           └── migration_test.exs # given tests — must pass without modification
-└── mix.exs
-```
+Add `code_change/3` to a circuit breaker worker so its state can be upgraded from v1 to v2 (adding SLA tier fields) without restarting the process. This preserves in-memory failure history that takes 30+ seconds to rebuild. The implementation includes both the upgrade path (v1 -> v2) and the downgrade path (v2 -> v1) for safe rollbacks.
 
 ---
 
 ## How hot code upgrades work in OTP
 
-The BEAM supports replacing a module's code while the system is running — without
-stopping processes. The upgrade flow:
+The BEAM supports replacing a module's code while the system is running. The upgrade flow:
 
 ```
 v1 code running
-  → load v2 module (beam file replaced in memory)
-  → :sys.change_code(pid, Module, "1", extra)
-      └─ GenServer suspends message processing
-           └─ code_change("1", v1_state, extra) → {:ok, v2_state}
-                └─ GenServer resumes with v2_state and v2 callbacks
+  -> load v2 module
+  -> :sys.change_code(pid, Module, "1", extra)
+      -> GenServer suspends message processing
+           -> code_change("1", v1_state, extra) -> {:ok, v2_state}
+                -> GenServer resumes with v2_state and v2 callbacks
 ```
 
-Without `code_change/3`, a hot upgrade would crash the GenServer the moment any
-v2 callback tries to pattern-match on a field that was renamed or added.
+Without `code_change/3`, a hot upgrade would crash the GenServer the moment any v2 callback tries to pattern-match on a field that was renamed or added.
 
 ---
 
-## `code_change/3` signature
+## State versioning
+
+Embedding a version tag in state makes migration chains explicit:
 
 ```elixir
-@impl true
-def code_change(old_vsn, state, extra) do
-  # old_vsn: version string of the OLD code being replaced
-  #          {:down, vsn} for a downgrade
-  # state:   current process state in the OLD format
-  # extra:   arbitrary term passed to :sys.change_code/4
-  # Returns: {:ok, new_state} | {:error, reason}
-end
-```
-
-The function receives state in its **old format** and must return it in the format
-expected by the **new callbacks**. This is where data migration happens.
-
----
-
-## State versioning: the right way
-
-Embedding a version tag in state makes migration chains explicit and unambiguous:
-
-```elixir
-# v1 state — no version tag
+# v1 state -- no version tag
 %{service: "payments", status: :closed, failures: 0}
 
-# v2 state — version tag added
+# v2 state -- version tag added
 %{version: 2, service: "payments", status: :closed, failures: 0, sla_tier: :standard}
-
-# v3 state — renamed field, added metadata
-%{version: 3, service: "payments", circuit: :closed, failures: 0,
-  sla_tier: :standard, metadata: %{}}
 ```
 
-The migration chain pattern:
-
-```elixir
-defp migrate(%{version: 3} = state), do: {:ok, state}
-
-defp migrate(%{version: 2} = state) do
-  migrate(%{version: 3, circuit: state.status, ...})
-end
-
-defp migrate(state) when not is_map_key(state, :version) do
-  # v1: no version key — add defaults
-  migrate(%{version: 2, sla_tier: :standard} |> Map.merge(state))
-end
-```
-
-This means a v1 state can reach v3 in a single `code_change/3` call by traversing
-the chain.
+The migration chain pattern allows a v1 state to reach any future version in a single `code_change/3` call by traversing the chain.
 
 ---
 
-## Implementation
+## Full implementation
 
-### Step 1: Version 1 state (current production state)
+### `lib/api_gateway/circuit_breaker/worker.ex`
 
-The current `CircuitBreaker.Worker` produces this state:
-
-```elixir
-# v1 state (no version key)
-%{
-  service:     "payments",
-  status:      :closed,          # :closed | :open | :half_open
-  failures:    0,
-  opened_at:   nil,
-  hibernations: 0,
-  timer_ref:   reference()
-}
-```
-
-### Step 2: Version 2 state (target after upgrade)
+The worker implements a circuit breaker state machine with `code_change/3` for hot upgrades. It includes the full state machine (`:closed`, `:open`, `:half_open`), heartbeat via `:timer.send_interval`, and migration logic.
 
 ```elixir
-# v2 state
-%{
-  version:     2,
-  service:     "payments",
-  status:      :closed,
-  failures:    0,
-  opened_at:   nil,
-  hibernations: 0,
-  timer_ref:   reference(),
-  sla_tier:    :standard,        # new field — :critical | :standard | :best_effort
-  upgraded_at: integer()         # monotonic ms when migration ran
-}
+defmodule ApiGateway.CircuitBreaker.Worker do
+  use GenServer
+  require Logger
+
+  @vsn "2"
+  @failure_threshold   5
+  @recovery_window_ms  30_000
+  @heartbeat_ms        30_000
+
+  # ---------------------------------------------------------------------------
+  # Public API
+  # ---------------------------------------------------------------------------
+
+  def start_link(service_name) do
+    GenServer.start_link(__MODULE__, service_name)
+  end
+
+  @spec record_success(pid()) :: :ok
+  def record_success(pid), do: GenServer.cast(pid, :success)
+
+  @spec record_failure(pid()) :: :ok
+  def record_failure(pid), do: GenServer.cast(pid, :failure)
+
+  @spec status(pid()) :: :closed | :open | :half_open
+  def status(pid), do: GenServer.call(pid, :status)
+
+  @spec ping(pid()) :: :pong
+  def ping(pid), do: GenServer.call(pid, :ping, 1_000)
+
+  # ---------------------------------------------------------------------------
+  # GenServer lifecycle
+  # ---------------------------------------------------------------------------
+
+  @impl true
+  def init(service_name) do
+    {:ok, timer_ref} = :timer.send_interval(@heartbeat_ms, :heartbeat)
+
+    state = %{
+      version: 2,
+      service: service_name,
+      status: :closed,
+      failures: 0,
+      opened_at: nil,
+      hibernations: 0,
+      timer_ref: timer_ref,
+      sla_tier: :standard,
+      upgraded_at: nil
+    }
+
+    {:ok, state}
+  end
+
+  # ---------------------------------------------------------------------------
+  # Callbacks
+  # ---------------------------------------------------------------------------
+
+  @impl true
+  def handle_call(:status, _from, state) do
+    {:reply, state.status, state}
+  end
+
+  @impl true
+  def handle_call(:ping, _from, state) do
+    {:reply, :pong, state}
+  end
+
+  @impl true
+  def handle_cast(:success, state) do
+    new_status =
+      case state.status do
+        :half_open -> :closed
+        other -> other
+      end
+
+    {:noreply, %{state | failures: 0, status: new_status}}
+  end
+
+  @impl true
+  def handle_cast(:failure, state) do
+    new_failures = state.failures + 1
+
+    new_state =
+      case state.status do
+        :closed when new_failures >= @failure_threshold ->
+          %{state | failures: new_failures, status: :open, opened_at: System.monotonic_time(:millisecond)}
+
+        :half_open ->
+          %{state | failures: new_failures, status: :open, opened_at: System.monotonic_time(:millisecond)}
+
+        _ ->
+          %{state | failures: new_failures}
+      end
+
+    {:noreply, new_state}
+  end
+
+  @impl true
+  def handle_info(:heartbeat, %{status: :open} = state) do
+    elapsed = System.monotonic_time(:millisecond) - state.opened_at
+
+    if elapsed >= @recovery_window_ms do
+      {:noreply, %{state | status: :half_open}}
+    else
+      {:noreply, state}
+    end
+  end
+
+  @impl true
+  def handle_info(:heartbeat, state) do
+    {:noreply, state}
+  end
+
+  @impl true
+  def terminate(_reason, state) do
+    if Map.has_key?(state, :timer_ref) and state.timer_ref != nil do
+      :timer.cancel(state.timer_ref)
+    end
+    :ok
+  end
+
+  # ---------------------------------------------------------------------------
+  # Hot code upgrade -- code_change/3
+  # ---------------------------------------------------------------------------
+
+  @impl true
+  def code_change("1", state, _extra) do
+    migrate(state)
+  end
+
+  @impl true
+  def code_change({:down, "2"}, state, _extra) do
+    # Downgrade v2 -> v1: strip fields that v1 does not expect.
+    v1_state = Map.drop(state, [:version, :sla_tier, :upgraded_at])
+    {:ok, v1_state}
+  end
+
+  @impl true
+  def code_change(unknown, _state, _extra) do
+    {:error, {:unknown_version, unknown}}
+  end
+
+  # ---------------------------------------------------------------------------
+  # Private migration chain
+  # ---------------------------------------------------------------------------
+
+  # Terminal case: state is already at target version.
+  defp migrate(%{version: 2} = state), do: {:ok, state}
+
+  # v1 -> v2: add version tag, SLA tier, and upgrade timestamp.
+  # v1 state has no :version key.
+  defp migrate(v1_state) when not is_map_key(v1_state, :version) do
+    v2_state = Map.merge(v1_state, %{
+      version: 2,
+      sla_tier: :standard,
+      upgraded_at: System.monotonic_time(:millisecond)
+    })
+
+    migrate(v2_state)
+  end
+end
 ```
 
-### Step 3: Add `code_change/3` to `CircuitBreaker.Worker`
-
-The `code_change/3` callback receives state in the old format and transforms it to the
-new format. The migration is implemented as a recursive chain: each step advances the
-state by one version, so a v1 state reaches v2 by traversing `migrate/1` once. If a
-future v3 is added, the chain extends naturally — v1 reaches v3 by passing through v2.
-
-The downgrade path (`{:down, "2"}`) strips the new fields to restore v1 compatibility.
-This is critical for rollbacks: if a deployment is reverted under production pressure,
-the downgrade path must produce valid v1 state without data loss in the fields that v1
-expects.
-
-```elixir
-# In lib/api_gateway/circuit_breaker/worker.ex
-# Add after the existing callbacks
-
-@vsn "2"
-
-@impl true
-def code_change("1", state, _extra) do
-  # Migrate v1 → v2 via the migration chain.
-  # The chain is recursive: each step advances one version.
-  migrate(state)
-end
-
-@impl true
-def code_change({:down, "2"}, state, _extra) do
-  # Downgrade v2 → v1: strip fields that v1 does not expect.
-  # The core fields (:service, :status, :failures, :opened_at, :hibernations, :timer_ref)
-  # are preserved — they are the same in both versions.
-  v1_state = Map.drop(state, [:version, :sla_tier, :upgraded_at])
-  {:ok, v1_state}
-end
-
-@impl true
-def code_change(unknown, _state, _extra) do
-  {:error, {:unknown_version, unknown}}
-end
-
-# ---------------------------------------------------------------------------
-# Private migration chain
-# ---------------------------------------------------------------------------
-
-# Terminal case: state is already at target version — no transformation needed.
-defp migrate(%{version: 2} = state), do: {:ok, state}
-
-# v1 → v2: add version tag, SLA tier, and upgrade timestamp.
-# v1 state has no :version key — we detect it by the absence of that key.
-defp migrate(v1_state) when not is_map_key(v1_state, :version) do
-  v2_state = Map.merge(v1_state, %{
-    version: 2,
-    sla_tier: :standard,
-    upgraded_at: System.monotonic_time(:millisecond)
-  })
-
-  # Recurse to handle future multi-step migrations (v1 → v2 → v3 → ...).
-  # Currently this terminates at the v2 clause above.
-  migrate(v2_state)
-end
-```
-
-### Step 4: Given tests — must pass without modification
+### Tests
 
 ```elixir
 # test/api_gateway/circuit_breaker/migration_test.exs
@@ -213,11 +217,10 @@ defmodule ApiGateway.CircuitBreaker.MigrationTest do
 
   alias ApiGateway.CircuitBreaker.Worker
 
-  describe "code_change/3 — v1 to v2 upgrade" do
+  describe "code_change/3 -- v1 to v2 upgrade" do
     test "adds sla_tier and version tag to v1 state" do
       {:ok, pid} = Worker.start_link("test-svc")
 
-      # Inject v1 state (no version key, no sla_tier)
       v1_state = %{
         service:      "test-svc",
         status:       :closed,
@@ -228,7 +231,6 @@ defmodule ApiGateway.CircuitBreaker.MigrationTest do
       }
       :sys.replace_state(pid, fn _ -> v1_state end)
 
-      # Simulate hot upgrade
       :ok = :sys.change_code(pid, Worker, "1", [])
 
       v2_state = :sys.get_state(pid)
@@ -236,7 +238,6 @@ defmodule ApiGateway.CircuitBreaker.MigrationTest do
       assert v2_state.version == 2
       assert v2_state.sla_tier == :standard
       assert is_integer(v2_state.upgraded_at)
-      # Existing fields must be preserved
       assert v2_state.failures == 3
       assert v2_state.service == "test-svc"
       assert v2_state.status == :closed
@@ -247,7 +248,6 @@ defmodule ApiGateway.CircuitBreaker.MigrationTest do
       :sys.replace_state(pid, fn s -> Map.delete(s, :version) end)
       :ok = :sys.change_code(pid, Worker, "1", [])
 
-      # Worker must still handle normal calls
       assert Worker.status(pid) == :closed
       Worker.record_failure(pid)
       Process.sleep(10)
@@ -262,11 +262,10 @@ defmodule ApiGateway.CircuitBreaker.MigrationTest do
     end
   end
 
-  describe "code_change/3 — v2 downgrade" do
+  describe "code_change/3 -- v2 downgrade" do
     test "removes version tag and sla_tier on downgrade" do
       {:ok, pid} = Worker.start_link("downgrade-svc")
 
-      # Start with v2 state
       v2_state = %{
         version:      2,
         service:      "downgrade-svc",
@@ -280,7 +279,6 @@ defmodule ApiGateway.CircuitBreaker.MigrationTest do
       }
       :sys.replace_state(pid, fn _ -> v2_state end)
 
-      # Simulate downgrade
       :ok = :sys.change_code(pid, Worker, {:down, "2"}, [])
 
       v1_state = :sys.get_state(pid)
@@ -288,13 +286,12 @@ defmodule ApiGateway.CircuitBreaker.MigrationTest do
       refute Map.has_key?(v1_state, :version)
       refute Map.has_key?(v1_state, :sla_tier)
       refute Map.has_key?(v1_state, :upgraded_at)
-      # Critical fields must survive
       assert v1_state.failures == 5
       assert v1_state.status == :open
     end
   end
 
-  describe "code_change/3 — unknown version" do
+  describe "code_change/3 -- unknown version" do
     test "returns error for unknown old_vsn" do
       {:ok, pid} = Worker.start_link("unknown-svc")
       assert {:error, {:unknown_version, "99"}} =
@@ -304,98 +301,38 @@ defmodule ApiGateway.CircuitBreaker.MigrationTest do
 end
 ```
 
-### Step 5: Run the tests
-
-```bash
-mix test test/api_gateway/circuit_breaker/migration_test.exs --trace
-```
-
-### Step 6: Simulate a full upgrade cycle in IEx
-
-```elixir
-# In iex -S mix
-
-alias ApiGateway.CircuitBreaker.Worker
-
-# 1. Start a worker, record some state
-{:ok, pid} = Worker.start_link("payments")
-Worker.record_failure(pid)
-Worker.record_failure(pid)
-Worker.record_failure(pid)
-:sys.get_state(pid)    # inspect current state
-
-# 2. Inject v1 state (no version tag)
-:sys.replace_state(pid, fn s -> Map.drop(s, [:version, :sla_tier, :upgraded_at]) end)
-:sys.get_state(pid)    # confirm v1 shape
-
-# 3. Hot upgrade
-:ok = :sys.change_code(pid, Worker, "1", [])
-:sys.get_state(pid)    # confirm v2 shape, failures preserved
-
-# 4. Use the worker normally
-Worker.record_failure(pid)
-Worker.record_failure(pid)
-Worker.status(pid)     # should be :open (5 failures total)
-
-# 5. Downgrade
-:ok = :sys.change_code(pid, Worker, {:down, "2"}, [])
-:sys.get_state(pid)    # confirm v1 shape, failures still 5
-```
-
 ---
 
-## Trade-off analysis
+## How it works
 
-| Approach | Downtime | Risk | Complexity |
-|----------|----------|------|------------|
-| Rolling restart | Brief per pod | Low | Low |
-| Hot upgrade without `code_change` | None | High — crash on state mismatch | Medium |
-| Hot upgrade with `code_change` | None | Medium — migration bugs | High |
-| Blue/green deployment | None | Low | Infrastructure-heavy |
-| Versioned state + migration chain | None | Low-medium | Medium |
+1. **`@vsn "2"`**: declares the current module version. OTP uses this to determine the `old_vsn` argument passed to `code_change/3`.
 
-Reflection question: `code_change/3` runs synchronously inside the suspended
-GenServer. What happens if the migration takes 2 seconds (e.g., transforming a
-100,000-entry request log)? How would you use the lazy migration pattern to avoid
-blocking the process during the upgrade window?
+2. **Migration chain**: `migrate/1` is recursive. Each step advances the state by one version. v1 (no `:version` key) -> v2 (adds `:version`, `:sla_tier`, `:upgraded_at`). Future v3 would extend the chain naturally.
+
+3. **Downgrade path**: `code_change({:down, "2"}, state, _extra)` strips v2-specific fields to restore v1 compatibility. Critical for safe rollbacks under production pressure.
+
+4. **`:sys.change_code/4`**: suspends the GenServer, calls `code_change/3`, and resumes with the new state. The process keeps its PID, mailbox, and all linked/monitored relationships.
 
 ---
 
 ## Common production mistakes
 
 **1. Pattern-matching on state shape instead of version tag**
-Matching `%{count: c, updated_at: ts}` to detect "v2 state" works until someone adds
-`updated_at` to v1 for an unrelated reason, or until v3 also has those fields. Explicit
-version tags make migration unambiguous. If legacy state lacks a version field, add one
-in the very first migration and carry it forward in all subsequent versions.
+Using `%{count: c, updated_at: ts}` to detect "v2 state" breaks when unrelated changes add the same fields. Explicit version tags make migration unambiguous.
 
 **2. Doing expensive work in `code_change/3`**
-`code_change/3` runs synchronously and suspends the GenServer. If your state has 1 million
-entries and migration transforms each one, you may block the process for seconds — during
-which all callers wait with their timeouts counting down. Measure migration time in
-staging. If it exceeds ~100 ms, use the lazy pattern: tag state as `migration_pending: true`,
-complete migration in `handle_continue` on the first call after upgrade.
+`code_change/3` runs synchronously and suspends the GenServer. If migration transforms 1 million entries, you may block the process for seconds. Use the lazy pattern: tag state as `migration_pending: true`, complete migration in `handle_continue`.
 
 **3. Not testing the downgrade path**
-Downgrade is triggered when a deployment is rolled back under production pressure.
-Teams routinely discover that `code_change({:down, vsn}, ...)` was never implemented
-or returns incorrect state, making the rollback worse than the original problem.
-Always implement AND test both directions. Include downgrade tests in your normal
-test suite, not just integration tests.
+Downgrade is triggered when a deployment is rolled back under production pressure. Teams routinely discover that `code_change({:down, vsn}, ...)` was never implemented.
 
 **4. Assuming `:sys.change_code` updates all processes**
-`:sys.change_code/4` affects a single process. In a cluster with 50,000 GenServer
-instances, you need to call it on each one. OTP release tools (via `.appup` files)
-automate this for supervised processes. For manually managed processes, you must
-iterate and call `:sys.change_code` yourself, or design your supervisor to restart
-workers when new code is loaded.
+`:sys.change_code/4` affects a single process. In a cluster with 50,000 GenServer instances, you must call it on each one.
 
 ---
 
 ## Resources
 
-- [OTP docs — `gen_server:code_change/3`](https://www.erlang.org/doc/man/gen_server.html#Module:code_change-3)
-- [Erlang — `:sys` module](https://www.erlang.org/doc/man/sys.html)
-- [OTP Design Principles — Release Handling](https://www.erlang.org/doc/design_principles/release_handling.html)
-- [Saša Jurić — Elixir in Action, 2nd ed.](https://www.manning.com/books/elixir-in-action-second-edition) — ch. 13, running a system
-- [Mix.Release — HexDocs](https://hexdocs.pm/mix/Mix.Tasks.Release.html)
+- [OTP docs -- `gen_server:code_change/3`](https://www.erlang.org/doc/man/gen_server.html#Module:code_change-3)
+- [Erlang -- `:sys` module](https://www.erlang.org/doc/man/sys.html)
+- [OTP Design Principles -- Release Handling](https://www.erlang.org/doc/design_principles/release_handling.html)

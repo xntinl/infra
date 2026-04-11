@@ -1,112 +1,81 @@
 # Ecto: Schemas, Changesets, and Queries
 
-**Project**: `task_queue` — built incrementally across the intermediate level
+## Goal
 
----
-
-## Project context
-
-`task_queue` has been persisting jobs only in memory. When the node restarts, all pending and completed jobs are lost. The ops team needs a persistent job store so that completed job history is queryable, failed jobs can be retried after a restart, and auditors can reconstruct what happened.
-
-Project structure at this point:
-
-```
-task_queue/
-├── lib/
-│   └── task_queue/
-│       ├── application.ex
-│       ├── jobs/
-│       │   ├── job.ex              # ← you implement the schema
-│       │   └── job_store.ex        # ← you implement the query interface
-│       ├── worker.ex
-│       ├── queue_server.ex
-│       ├── scheduler.ex
-│       └── registry.ex
-├── priv/
-│   └── repo/
-│       └── migrations/
-│           └── 20240101000000_create_jobs.exs  # ← you implement this
-├── test/
-│   └── task_queue/
-│       └── ecto_test.exs           # given tests — must pass without modification
-├── config/
-│   └── test.exs                    # ← add Repo config
-└── mix.exs                         # ← add Ecto and Postgrex/SQLite
-```
-
-Add to `mix.exs`:
-
-```elixir
-{:ecto_sql, "~> 3.11"},
-{:postgrex, ">= 0.0.0"}            # or {:ecto_sqlite3, "~> 0.15"} for SQLite
-```
-
----
-
-## The business problem
-
-The product team wants to:
-1. Query all jobs of type `"send_email"` that failed in the last 24 hours
-2. Retry all jobs with status `:failed` and `retry_count < 3`
-3. Show job completion history for a given customer ID
-
-These queries require a structured schema, validated changesets, and composable query fragments. The in-memory `QueueServer` cannot support any of this.
+Build a `task_queue` persistent job store using Ecto with schemas, changesets for validation, and composable queries. Learn why changesets intercept writes before they reach the database, and why `Ecto.Query` is safer and more composable than raw SQL.
 
 ---
 
 ## Why Ecto changesets and not direct struct construction
 
-You could insert a job into the database using a bare struct:
-
-```elixir
-%TaskQueue.Jobs.Job{type: "send_email", status: :pending}
-|> Repo.insert()
-```
-
-This bypasses all validation. If `type` is nil, the database constraint catches it — but the error message is a raw Postgres constraint violation, not a user-friendly validation error. If `status` is `:invalid_status`, it reaches the database as-is.
-
-Changesets intercept writes and validate data before it reaches the database:
-
-```elixir
-Job.changeset(%Job{}, %{type: "send_email", status: :pending})
-# Returns a changeset struct with :valid? field and :errors list
-# Only insert if changeset.valid? == true
-```
-
-This separates three concerns:
-- **Structure**: the schema defines columns and their types
-- **Validation**: the changeset defines business rules (required fields, valid values)
+You could insert a job using a bare struct, bypassing all validation. If `type` is nil, the database constraint catches it -- but the error message is a raw Postgres constraint violation. Changesets intercept writes and validate data before it reaches the database, separating three concerns:
+- **Structure**: the schema defines columns and types
+- **Validation**: the changeset defines business rules
 - **Persistence**: `Repo.insert/2` writes a valid changeset
 
 ---
 
-## Why `Ecto.Query` and not raw SQL strings
+## Why `Ecto.Query` and not raw SQL
 
-Raw SQL is untyped, injection-prone, and database-specific:
-
-```elixir
-# Wrong — SQL injection risk, PostgreSQL-specific syntax, no type checking
-Repo.query!("SELECT * FROM jobs WHERE type = '#{type}' AND status = 'failed'")
-```
-
-`Ecto.Query` is composable, type-safe, and database-agnostic:
-
-```elixir
-# Right — composable, parameterized, portable
-from(j in Job, where: j.type == ^type and j.status == :failed)
-|> Repo.all()
-```
-
-Queries can be built incrementally and reused across functions without string manipulation.
+Raw SQL is untyped, injection-prone, and database-specific. `Ecto.Query` is composable, type-safe, and parameterized. Queries can be built incrementally and reused across functions.
 
 ---
 
 ## Implementation
 
-### Step 1: Repo module and configuration
+### Step 1: `mix.exs`
 
 ```elixir
-# lib/task_queue/repo.ex
+defmodule TaskQueue.MixProject do
+  use Mix.Project
+
+  def project do
+    [
+      app: :task_queue,
+      version: "0.1.0",
+      elixir: "~> 1.15",
+      start_permanent: Mix.env() == :prod,
+      deps: deps()
+    ]
+  end
+
+  def application do
+    [
+      extra_applications: [:logger],
+      mod: {TaskQueue.Application, []}
+    ]
+  end
+
+  defp deps do
+    [
+      {:ecto_sql, "~> 3.11"},
+      {:postgrex, ">= 0.0.0"}
+    ]
+  end
+end
+```
+
+### Step 2: `lib/task_queue/application.ex`
+
+```elixir
+defmodule TaskQueue.Application do
+  use Application
+
+  @impl true
+  def start(_type, _args) do
+    children = [
+      TaskQueue.Repo
+    ]
+
+    opts = [strategy: :one_for_one, name: TaskQueue.Supervisor]
+    Supervisor.start_link(children, opts)
+  end
+end
+```
+
+### Step 3: `lib/task_queue/repo.ex`
+
+```elixir
 defmodule TaskQueue.Repo do
   use Ecto.Repo,
     otp_app: :task_queue,
@@ -114,30 +83,25 @@ defmodule TaskQueue.Repo do
 end
 ```
 
-Add the Repo to the supervision tree in `lib/task_queue/application.ex`:
-
-```elixir
-children = [
-  TaskQueue.Repo,
-  # ... rest of children
-]
-```
-
-Add Repo configuration to `config/config.exs`:
+### Step 4: Configuration
 
 ```elixir
 # config/config.exs
+import Config
+
 config :task_queue, TaskQueue.Repo,
   database: "task_queue_dev",
   username: "postgres",
   password: "postgres",
   hostname: "localhost"
-```
 
-Add test configuration to `config/test.exs` (required for `Ecto.Adapters.SQL.Sandbox`):
+import_config "#{config_env()}.exs"
+```
 
 ```elixir
 # config/test.exs
+import Config
+
 config :task_queue, TaskQueue.Repo,
   username: "postgres",
   password: "postgres",
@@ -147,16 +111,15 @@ config :task_queue, TaskQueue.Repo,
   pool_size: 10
 ```
 
-Add to `test/test_helper.exs`:
-
 ```elixir
+# test/test_helper.exs
 Ecto.Adapters.SQL.Sandbox.mode(TaskQueue.Repo, :manual)
 ```
 
-### Step 2: Migration — `priv/repo/migrations/20240101000000_create_jobs.exs`
-
+### Step 5: Migration
 
 ```elixir
+# priv/repo/migrations/20240101000000_create_jobs.exs
 defmodule TaskQueue.Repo.Migrations.CreateJobs do
   use Ecto.Migration
 
@@ -177,14 +140,16 @@ defmodule TaskQueue.Repo.Migrations.CreateJobs do
 end
 ```
 
-### Step 3: `lib/task_queue/jobs/job.ex` — schema and changeset
+### Step 6: `lib/task_queue/jobs/job.ex` -- schema and changeset
+
+The `changeset/2` function uses `cast/3` to whitelist allowed fields, `validate_required/2` to enforce mandatory fields, `validate_inclusion/3` to restrict status to known values, and `validate_number/3` to ensure retry_count is non-negative. Without `validate_required`, a nil `type` would reach the database and trigger a cryptic NOT NULL constraint error instead of a clean `{:error, changeset}`.
 
 ```elixir
 defmodule TaskQueue.Jobs.Job do
   @moduledoc """
   Ecto schema for a persisted job.
 
-  Status values: :pending, :running, :completed, :failed
+  Status values: pending, running, completed, failed
   """
 
   use Ecto.Schema
@@ -208,15 +173,6 @@ defmodule TaskQueue.Jobs.Job do
 
   Required: `:type`
   Optional: `:args`, `:status`, `:retry_count`, `:scheduled_at`
-
-  ## Examples
-
-      iex> TaskQueue.Jobs.Job.changeset(%TaskQueue.Jobs.Job{}, %{type: "send_email"})
-      #Ecto.Changeset<valid?: true, ...>
-
-      iex> TaskQueue.Jobs.Job.changeset(%TaskQueue.Jobs.Job{}, %{})
-      #Ecto.Changeset<valid?: false, errors: [type: {"can't be blank", ...}], ...>
-
   """
   @spec changeset(t(), map()) :: Ecto.Changeset.t()
   def changeset(job, attrs) do
@@ -240,15 +196,15 @@ defmodule TaskQueue.Jobs.Job do
 end
 ```
 
-### Step 4: `lib/task_queue/jobs/job_store.ex` — query interface
+### Step 7: `lib/task_queue/jobs/job_store.ex` -- query interface
+
+The `filter/1` function demonstrates composable queries: it starts with `from(j in Job)` and reduces over the filter map, adding `where` clauses dynamically. Each filter key adds a parameterized clause (`^type`), preventing SQL injection.
 
 ```elixir
 defmodule TaskQueue.Jobs.JobStore do
   @moduledoc """
   Query interface for persisted jobs.
-
   All public functions return `{:ok, result}` or `{:error, reason}`.
-  Queries are composable — filter functions return queryable fragments.
   """
 
   import Ecto.Query
@@ -256,12 +212,6 @@ defmodule TaskQueue.Jobs.JobStore do
 
   @doc """
   Inserts a new job. Returns `{:ok, job}` or `{:error, changeset}`.
-
-  ## Examples
-
-      iex> TaskQueue.Jobs.JobStore.insert(%{type: "send_email", args: %{to: "user@example.com"}})
-      {:ok, %TaskQueue.Jobs.Job{type: "send_email", status: "pending"}}
-
   """
   @spec insert(map()) :: {:ok, Job.t()} | {:error, Ecto.Changeset.t()}
   def insert(attrs) do
@@ -309,14 +259,7 @@ defmodule TaskQueue.Jobs.JobStore do
 
   @doc """
   Returns jobs matching a dynamic filter map.
-
   Supported filter keys: `:type`, `:status`
-
-  ## Examples
-
-      iex> TaskQueue.Jobs.JobStore.filter(%{type: "send_email", status: "pending"})
-      [%Job{type: "send_email", status: "pending"}, ...]
-
   """
   @spec filter(map()) :: [Job.t()]
   def filter(filters) when is_map(filters) do
@@ -330,7 +273,9 @@ defmodule TaskQueue.Jobs.JobStore do
 end
 ```
 
-### Step 5: Given tests — must pass without modification
+### Step 8: Tests
+
+The tests use `Ecto.Adapters.SQL.Sandbox` for isolation. Each test checks out a database connection in sandbox mode, and all changes are rolled back when the test exits. This means tests can run in any order without contaminating each other.
 
 ```elixir
 # test/task_queue/ecto_test.exs
@@ -340,7 +285,6 @@ defmodule TaskQueue.EctoTest do
   alias TaskQueue.Jobs.{Job, JobStore}
 
   setup do
-    # Using Ecto Sandbox for test isolation
     :ok = Ecto.Adapters.SQL.Sandbox.checkout(TaskQueue.Repo)
   end
 
@@ -405,7 +349,6 @@ defmodule TaskQueue.EctoTest do
 
     test "excludes jobs at or above max_retries" do
       {:ok, job} = JobStore.insert(%{type: "send_email"})
-      # Exhaust retries
       {:ok, j1} = JobStore.mark_failed(job.id, "e1")
       {:ok, j2} = JobStore.mark_failed(j1.id, "e2")
       {:ok, _}  = JobStore.mark_failed(j2.id, "e3")
@@ -444,7 +387,7 @@ defmodule TaskQueue.EctoTest do
 end
 ```
 
-### Step 6: Run migrations and tests
+### Step 9: Run
 
 ```bash
 mix deps.get
@@ -461,56 +404,36 @@ mix test test/task_queue/ecto_test.exs --trace
 |--------|---------------|----------------------|---------|
 | Validation before DB | yes | no | no |
 | Error messages | structured `{field, {msg, opts}}` | database constraint error | raw driver error |
-| Composable queries | yes — `Ecto.Query` | N/A | limited — string concat |
-| SQL injection safety | yes — parameterized | N/A | manual |
+| Composable queries | yes -- `Ecto.Query` | N/A | limited -- string concat |
+| SQL injection safety | yes -- parameterized | N/A | manual |
 | Schema evolution | migrations | manual `ALTER TABLE` | manual |
 
-Reflection question: `Repo.get!/2` raises on not found. `Repo.get/2` returns `nil`. When would you prefer `get!` in production code, and when would `nil` be the safer return?
-
-Answer: Use `get!/2` when absence is a programming error — for example, loading a job by ID that was just returned from an insert. The raise gives a clear stack trace. Use `get/2` when absence is expected — for example, looking up a user by email that may not exist. Returning `nil` lets you handle the missing case with a `case`/`with` clause instead of a rescue block.
+Use `Repo.get!/2` when absence is a programming error (e.g., loading a job by ID just returned from an insert). Use `Repo.get/2` when absence is expected (e.g., looking up a user by email that may not exist).
 
 ---
 
 ## Common production mistakes
 
 **1. Using `cast/3` without `validate_required/2`**
-
-`cast/3` silently drops fields not in the allowed list and sets missing fields to `nil`. Without `validate_required/2`, a changeset with a nil required field is marked valid and reaches the database — where the `NOT NULL` constraint fires with a cryptic error.
+`cast/3` silently drops missing fields. Without `validate_required`, a nil required field reaches the database.
 
 **2. N+1 queries when loading associations**
-
-```elixir
-# Wrong — runs one query per job to load its worker
-jobs = Repo.all(Job)
-Enum.map(jobs, fn job -> Repo.preload(job, :worker) end)
-
-# Right — single query with JOIN
-Repo.all(from j in Job, preload: [:worker])
-```
+Use `Repo.all(from j in Job, preload: [:worker])` instead of preloading one-by-one.
 
 **3. `Repo.update/1` on a struct instead of a changeset**
-
-`Repo.update` requires a changeset, not a struct. Passing a struct directly updates ALL fields including `inserted_at`, which bypasses `updated_at` tracking.
+`Repo.update` requires a changeset. Passing a struct updates ALL fields.
 
 **4. Not using `Ecto.Adapters.SQL.Sandbox` in tests**
-
-Without sandbox mode, each test writes to the real database and leaves data behind, contaminating subsequent tests. Configure the repo with `pool: Ecto.Adapters.SQL.Sandbox` in `config/test.exs`.
+Without sandbox mode, each test writes to the real database and leaves data behind.
 
 **5. Building WHERE clauses with string interpolation**
-
-```elixir
-# Wrong — SQL injection
-Repo.query!("SELECT * FROM jobs WHERE type = '#{type}'")
-
-# Right — parameterized
-from(j in Job, where: j.type == ^type) |> Repo.all()
-```
+Use parameterized queries: `where: j.type == ^type`.
 
 ---
 
 ## Resources
 
-- [Ecto documentation — official hex](https://hexdocs.pm/ecto/Ecto.html)
-- [Ecto.Changeset — validation and casting](https://hexdocs.pm/ecto/Ecto.Changeset.html)
-- [Ecto.Query — composable queries](https://hexdocs.pm/ecto/Ecto.Query.html)
-- [Ecto.Adapters.SQL.Sandbox — test isolation](https://hexdocs.pm/ecto_sql/Ecto.Adapters.SQL.Sandbox.html)
+- [Ecto documentation -- official hex](https://hexdocs.pm/ecto/Ecto.html)
+- [Ecto.Changeset -- validation and casting](https://hexdocs.pm/ecto/Ecto.Changeset.html)
+- [Ecto.Query -- composable queries](https://hexdocs.pm/ecto/Ecto.Query.html)
+- [Ecto.Adapters.SQL.Sandbox -- test isolation](https://hexdocs.pm/ecto_sql/Ecto.Adapters.SQL.Sandbox.html)

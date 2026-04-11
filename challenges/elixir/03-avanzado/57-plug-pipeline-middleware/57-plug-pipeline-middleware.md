@@ -1,27 +1,19 @@
 # Plug Pipeline and Middleware
 
-**Project**: `api_gateway` — built incrementally across the advanced level
-
----
-
 ## Project context
 
-You're building `api_gateway`, an internal HTTP gateway that routes traffic to microservices.
-The gateway needs a middleware pipeline that runs on every inbound request before it reaches
-the router: request ID propagation, authentication, and rate limiting — in that order.
+You are building `api_gateway`, an internal HTTP gateway that routes traffic to microservices. The gateway needs a middleware pipeline that runs on every inbound request before it reaches the router: request ID propagation, authentication, and rate limiting — in that order.
 
-Project structure at this point:
+Project structure:
 
 ```
 api_gateway/
 ├── lib/
 │   └── api_gateway/
-│       ├── application.ex          # already exists — supervises the pipeline
-│       ├── router.ex               # already exists — downstream of the pipeline
 │       └── middleware/
 │           ├── request_id.ex       # propagates or generates X-Request-ID
 │           ├── auth.ex             # validates X-Client-ID header
-│           ├── rate_limit.ex       # checks per-client rate limit
+│           ├── rate_limit.ex       # checks per-client rate limit via ETS
 │           └── pipeline.ex         # declares the plug chain
 ├── test/
 │   └── api_gateway/
@@ -35,15 +27,11 @@ api_gateway/
 
 Every request hitting the gateway needs three things before reaching the router:
 
-1. A **request ID** — either propagated from `X-Request-ID` or generated fresh. Used to
-   correlate log lines across the entire request lifecycle and returned to the caller.
-2. **Authentication** — the `X-Client-ID` header must be present and non-empty. The
-   gateway trusts it (downstream services do their own authz); if missing, 401 immediately.
-3. **Rate limiting** — the `RateLimiter.Server` from the previous exercise is already
-   running. The middleware calls `check/3` and either allows the request or returns 429.
+1. A **request ID** — either propagated from `X-Request-ID` or generated fresh. Used to correlate log lines across the entire request lifecycle and returned to the caller.
+2. **Authentication** — the `X-Client-ID` header must be present and non-empty. The gateway trusts it (downstream services do their own authz); if missing, 401 immediately.
+3. **Rate limiting** — an ETS-backed counter checks per-client request count within a sliding window. If the limit is exceeded, the middleware returns 429.
 
-The pipeline must run these in order. If any plug calls `halt/1`, the downstream plugs
-must not execute.
+The pipeline must run these in order. If any plug calls `halt/1`, the downstream plugs must not execute.
 
 ---
 
@@ -58,9 +46,7 @@ conn
 |> RateLimit.call(RateLimit.init([]))
 ```
 
-`Plug.Builder` generates this chain at compile time from a declarative list. More
-importantly, it checks `conn.halted` between each plug — if `Auth` halts, `RateLimit`
-never runs. With manual chaining you must implement that check yourself.
+`Plug.Builder` generates this chain at compile time from a declarative list. More importantly, it checks `conn.halted` between each plug — if `Auth` halts, `RateLimit` never runs. With manual chaining you must implement that check yourself.
 
 The pattern:
 
@@ -74,9 +60,7 @@ request → RequestId → Auth → RateLimit → router → 200
 
 ## Why `halt/1` is cooperative, not an exception
 
-`halt/1` sets `conn.halted = true` and returns the conn unchanged otherwise. It does
-NOT raise. `Plug.Builder` checks the flag between plugs and skips the rest of the chain.
-This design means:
+`halt/1` sets `conn.halted = true` and returns the conn unchanged otherwise. It does NOT raise. `Plug.Builder` checks the flag between plugs and skips the rest of the chain. This design means:
 
 - A plug that calls `send_resp` + `halt` has full control over what the client receives.
 - No exception handling needed for early exits — it is a first-class value.
@@ -112,8 +96,10 @@ defmodule ApiGateway.Middleware.RequestId do
 
   @header "x-request-id"
 
+  @spec init(keyword()) :: keyword()
   def init(opts), do: opts
 
+  @spec call(Plug.Conn.t(), keyword()) :: Plug.Conn.t()
   def call(conn, _opts) do
     request_id = get_or_generate(conn)
 
@@ -167,8 +153,10 @@ defmodule ApiGateway.Middleware.Auth do
 
   @header "x-client-id"
 
+  @spec init(keyword()) :: keyword()
   def init(opts), do: opts
 
+  @spec call(Plug.Conn.t(), keyword()) :: Plug.Conn.t()
   def call(conn, _opts) do
     case get_req_header(conn, @header) do
       [id | _] when id != "" ->
@@ -184,66 +172,75 @@ defmodule ApiGateway.Middleware.Auth do
 end
 ```
 
-The pattern match `[id | _] when id != ""` covers both the case where the header is
-present with a non-empty value and the case where multiple values are sent (it takes
-the first). The guard `id != ""` rejects explicitly empty strings. When neither clause
-matches — the header is absent (empty list) or all values are empty — the `_` clause
-sends a 401 JSON response and halts the pipeline. `halt/1` must always be the last
-call in the chain because it returns the conn with `halted: true`, signalling
-`Plug.Builder` to skip all subsequent plugs.
+The pattern match `[id | _] when id != ""` covers both the case where the header is present with a non-empty value and the case where multiple values are sent (it takes the first). The guard `id != ""` rejects explicitly empty strings. When neither clause matches — the header is absent (empty list) or all values are empty — the `_` clause sends a 401 JSON response and halts the pipeline. `halt/1` must always be the last call in the chain because it returns the conn with `halted: true`, signalling `Plug.Builder` to skip all subsequent plugs.
 
 ### Step 4: `lib/api_gateway/middleware/rate_limit.ex`
 
 ```elixir
 defmodule ApiGateway.Middleware.RateLimit do
   @moduledoc """
-  Connects the Plug pipeline to the RateLimiter.Server built in the previous exercise.
+  ETS-backed sliding-window rate limiter as a Plug.
 
-  Reads client_id from conn.assigns (set by Auth). Calls RateLimiter.Server.check/3
-  directly from ETS — no GenServer call, no serialization bottleneck.
+  Uses an ETS table to track per-client request timestamps within a
+  configurable window. Each request inserts a timestamp; the count of
+  timestamps within the window determines whether the request is allowed.
+
+  This module is entirely self-contained — it creates and manages its own
+  ETS table. No external GenServer dependency is required.
   """
   import Plug.Conn
 
+  @table :rate_limit_table
+
+  @spec init(keyword()) :: {pos_integer(), pos_integer()}
   def init(opts) do
     limit = Keyword.get(opts, :limit, 100)
     window_ms = Keyword.get(opts, :window_ms, 60_000)
+
+    unless :ets.whereis(@table) != :undefined do
+      :ets.new(@table, [:named_table, :public, :bag])
+    end
+
     {limit, window_ms}
   end
 
+  @spec call(Plug.Conn.t(), {pos_integer(), pos_integer()}) :: Plug.Conn.t()
   def call(conn, {limit, window_ms}) do
     client_id = conn.assigns[:client_id]
+    now = System.monotonic_time(:millisecond)
+    cutoff = now - window_ms
 
-    case ApiGateway.RateLimiter.Server.check(client_id, limit, window_ms) do
-      {:allow, remaining} ->
-        ApiGateway.RateLimiter.Server.record(client_id)
+    # Remove expired entries for this client
+    :ets.select_delete(@table, [{{client_id, :"$1"}, [{:<, :"$1", cutoff}], [true]}])
 
-        conn
-        |> put_resp_header("x-ratelimit-remaining", Integer.to_string(remaining))
+    # Count current entries
+    count = length(:ets.lookup(@table, client_id))
 
-      {:deny, retry_after_ms} ->
-        retry_after_seconds = ceil(retry_after_ms / 1_000)
+    if count < limit do
+      :ets.insert(@table, {client_id, now})
+      remaining = limit - count - 1
 
-        conn
-        |> put_resp_content_type("application/json")
-        |> put_resp_header("retry-after", Integer.to_string(retry_after_seconds))
-        |> send_resp(429, Jason.encode!(%{
-          error: "rate limit exceeded",
-          retry_after_seconds: retry_after_seconds
-        }))
-        |> halt()
+      conn
+      |> put_resp_header("x-ratelimit-remaining", Integer.to_string(remaining))
+    else
+      retry_after_seconds = ceil(window_ms / 1_000)
+
+      conn
+      |> put_resp_content_type("application/json")
+      |> put_resp_header("retry-after", Integer.to_string(retry_after_seconds))
+      |> send_resp(429, Jason.encode!(%{
+        error: "rate limit exceeded",
+        retry_after_seconds: retry_after_seconds
+      }))
+      |> halt()
     end
   end
 end
 ```
 
-`init/1` extracts configuration options with sensible defaults and returns them as a
-tuple. Plug.Builder calls `init/1` once at compile time and caches the result; `call/2`
-receives it on every request. Keeping `init/1` fast and deterministic is important
-because it runs during compilation.
+`init/1` extracts configuration options with sensible defaults and returns them as a tuple. It also ensures the ETS table exists. Plug.Builder calls `init/1` once at compile time and caches the result; `call/2` receives it on every request.
 
-In `call/2`, the `:allow` branch records the hit and adds the remaining count as a
-response header so callers can self-throttle. The `:deny` branch converts milliseconds
-to seconds for the standard `Retry-After` header, sends a 429 JSON body, and halts.
+In `call/2`, expired entries are cleaned up via `select_delete`, and then the current count is checked. The allow branch inserts a new timestamp and adds the remaining count as a response header. The deny branch sends a 429 JSON body and halts.
 
 ### Step 5: `lib/api_gateway/middleware/pipeline.ex`
 
@@ -265,13 +262,9 @@ defmodule ApiGateway.Middleware.Pipeline do
 end
 ```
 
-`Plug.Builder` compiles these three `plug` declarations into a single `call/2` function
-at compile time. Between each plug it inserts a `conn.halted` check. If `Auth` halts
-(because `X-Client-ID` is missing), `RateLimit` never executes — the conn flows directly
-to the caller with the 401 response already set.
+`Plug.Builder` compiles these three `plug` declarations into a single `call/2` function at compile time. Between each plug it inserts a `conn.halted` check. If `Auth` halts (because `X-Client-ID` is missing), `RateLimit` never executes — the conn flows directly to the caller with the 401 response already set.
 
-The `limit: 100, window_ms: 60_000` options are passed to `RateLimit.init/1` at compile
-time. Changing them requires recompilation.
+The `limit: 100, window_ms: 60_000` options are passed to `RateLimit.init/1` at compile time. Changing them requires recompilation.
 
 ### Step 6: Given tests — must pass without modification
 
@@ -361,36 +354,26 @@ mix test test/api_gateway/middleware_test.exs --trace
 | Visibility | Declarative list | Scattered function calls | Phoenix-specific config |
 | When to use | Gateways, microservices | One-off transforms | Full Phoenix apps |
 
-Reflection question: `register_before_send/2` runs the callback after the pipeline
-finishes but before Cowboy flushes the socket. What does this make possible that
-logging directly in `call/2` cannot do?
+Reflection question: `register_before_send/2` runs the callback after the pipeline finishes but before Cowboy flushes the socket. What does this make possible that logging directly in `call/2` cannot do?
 
 ---
 
 ## Common production mistakes
 
 **1. Wrong plug order**
-Rate limiting before auth means the rate limiter has no client identity to key on.
-It would rate limit by IP instead, which breaks when clients share a NAT gateway.
+Rate limiting before auth means the rate limiter has no client identity to key on. It would rate limit by IP instead, which breaks when clients share a NAT gateway.
 
 **2. Forgetting `halt/1` after `send_resp/3`**
-`send_resp/3` writes the response. Without `halt/1`, subsequent plugs see a conn
-that already has a response sent and may try to send another one — Cowboy will crash
-with a "response already sent" error.
+`send_resp/3` writes the response. Without `halt/1`, subsequent plugs see a conn that already has a response sent and may try to send another one — Cowboy will crash with a "response already sent" error.
 
 **3. `Logger.metadata/1` leaks across requests**
-It doesn't — each request runs in its own Cowboy process. The metadata is local to
-the process and disappears when the process ends.
+It does not — each request runs in its own Cowboy process. The metadata is local to the process and disappears when the process ends.
 
 **4. `init/1` called at runtime instead of compile time**
-`Plug.Builder` calls `init/1` once at compile time and caches the result. Putting
-expensive work (DB connections, API calls) in `init/1` runs it only once — which is
-usually what you want for configuration, but a bug if you expect fresh values per request.
+`Plug.Builder` calls `init/1` once at compile time and caches the result. Putting expensive work (DB connections, API calls) in `init/1` runs it only once — which is usually what you want for configuration, but a bug if you expect fresh values per request.
 
 **5. Reading `conn.assigns` before the plug that sets it**
-If `RateLimit` runs before `Auth`, `conn.assigns[:client_id]` is nil. The pipeline
-declaration is the contract — plugs lower in the list can depend on assigns from plugs
-higher up.
+If `RateLimit` runs before `Auth`, `conn.assigns[:client_id]` is nil. The pipeline declaration is the contract — plugs lower in the list can depend on assigns from plugs higher up.
 
 ---
 

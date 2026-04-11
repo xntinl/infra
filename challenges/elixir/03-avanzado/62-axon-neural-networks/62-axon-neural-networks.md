@@ -1,26 +1,19 @@
 # Axon — Neural Networks for Request Classification
 
-**Project**: `api_gateway` — built incrementally across the advanced level
-
----
-
 ## Project context
 
-You're building `api_gateway`. The metrics analyzer (previous exercise) can detect
-anomalies statistically. Now the security team wants something smarter: classify
-incoming requests as `normal`, `suspicious`, or `abusive` based on a feature vector
-extracted from each request (rate, payload size, endpoint pattern, time-of-day).
+You are building `api_gateway`, an internal HTTP gateway. The security team wants to classify incoming requests as `normal`, `suspicious`, or `abusive` based on a feature vector extracted from each request (rate, payload size, endpoint pattern, time-of-day). All modules — feature extractor, classifier model, and training pipeline — are defined from scratch.
 
-Project structure at this point:
+Project structure:
 
 ```
 api_gateway/
 ├── lib/
 │   └── api_gateway/
-│       ├── ml/
-│       │   ├── feature_extractor.ex  # converts raw request stats to tensors
-│       │   ├── classifier.ex         # neural network model definition
-│       │   └── training.ex           # training pipeline
+│       └── ml/
+│           ├── feature_extractor.ex  # converts raw request stats to tensors
+│           ├── classifier.ex         # neural network model definition
+│           └── training.ex           # training pipeline
 ├── test/
 │   └── api_gateway/
 │       └── ml_classifier_test.exs    # given tests — must pass without modification
@@ -31,43 +24,19 @@ api_gateway/
 
 ## The business problem
 
-Statistical anomaly detection (z-score) triggers on any deviation from the mean —
-including legitimate traffic spikes during business hours. The security team wants a
-model trained on labeled examples of past attacks to distinguish malicious patterns
-from legitimate load. The model must be:
+Statistical anomaly detection (z-score) triggers on any deviation from the mean — including legitimate traffic spikes during business hours. The security team wants a model trained on labeled examples of past attacks to distinguish malicious patterns from legitimate load. The model must be:
 
 1. Small enough to run inference in < 1ms per request
 2. Retrained periodically as new attack patterns emerge
 3. Serializable — the trained model persists across gateway restarts
 
-This is a classification problem with a fixed 8-feature input and 3-class output.
-A two-layer dense network is sufficient — no need for transformers or CNNs.
+This is a classification problem with a fixed 8-feature input and 3-class output. A two-layer dense network is sufficient.
 
 ---
 
 ## Why Axon over raw Nx
 
-Raw Nx gives you tensors and `defn`. Building a neural network with raw Nx means:
-implementing weight initialization, forward pass, loss functions, optimizer state,
-gradient computation, training loop, and serialization manually. Axon provides all
-of these. The difference is not convenience — it is correctness. Weight initialization
-strategies (Glorot, He) and optimizers (Adam momentum terms) have subtle numerical
-properties that are easy to get wrong from scratch.
-
-Axon's `%Axon{}` struct is a description of the computation graph — not a running
-process. `Axon.build/2` compiles it to init/predict functions. `Axon.Loop.trainer/3`
-constructs the training loop. This separation makes the model definition readable and
-the training logic independent.
-
----
-
-## How `Axon.freeze/1` works
-
-`Axon.freeze/1` marks layers so that their parameters are excluded from gradient
-computation. Mathematically, it inserts a `stop_gradient` operation at the boundary —
-gradients flow forward (for inference) but not backward through frozen layers (for
-training). This is equivalent to TensorFlow's `trainable=False` or PyTorch's
-`requires_grad=False`.
+Raw Nx gives you tensors and `defn`. Building a neural network with raw Nx means: implementing weight initialization, forward pass, loss functions, optimizer state, gradient computation, training loop, and serialization manually. Axon provides all of these. The difference is not convenience — it is correctness. Weight initialization strategies (Glorot, He) and optimizers (Adam momentum terms) have subtle numerical properties that are easy to get wrong from scratch.
 
 ---
 
@@ -78,7 +47,6 @@ training). This is equivalent to TensorFlow's `trainable=False` or PyTorch's
 ```elixir
 defp deps do
   [
-    # existing deps...
     {:nx,   "~> 0.7"},
     {:axon, "~> 0.6"},
     {:exla, "~> 0.7", only: [:dev, :prod]}
@@ -93,7 +61,7 @@ defmodule ApiGateway.ML.FeatureExtractor do
   @moduledoc """
   Converts raw request metadata into a normalized 8-element feature vector.
 
-  Features (all normalized to [0, 1] or z-scored):
+  Features (all normalized to [0, 1]):
     0: requests_per_minute / 1000  (rate, normalized)
     1: payload_bytes / 65536       (size, normalized)
     2: unique_endpoints / 100      (diversity)
@@ -132,6 +100,7 @@ defmodule ApiGateway.ML.FeatureExtractor do
     Nx.tensor([features], type: :f32)
   end
 
+  @spec feature_count() :: pos_integer()
   def feature_count, do: @feature_count
 end
 ```
@@ -147,14 +116,12 @@ defmodule ApiGateway.ML.Classifier do
   Output classes: 0=normal, 1=suspicious, 2=abusive
   """
 
-  alias ApiGateway.ML.FeatureExtractor
-
-  @model_path "priv/ml/classifier.axon"
   @classes [:normal, :suspicious, :abusive]
 
   @doc """
   Builds and returns the model architecture. Does not initialize weights.
   """
+  @spec build() :: Axon.t()
   def build do
     Axon.input("request_features", shape: {nil, 8})
     |> Axon.dense(16, activation: :relu)
@@ -163,60 +130,17 @@ defmodule ApiGateway.ML.Classifier do
     |> Axon.dense(3, activation: :softmax)
   end
 
-  @doc """
-  Classifies a request stats map. Returns `{class_atom, confidence_float}`.
-  Loads the saved model state from disk. Raises if model not trained yet.
-  """
-  def classify(stats) do
-    model = build()
-    model_state = load_state!()
-    features = FeatureExtractor.extract(stats)
-
-    predictions = Axon.predict(model, model_state, %{"request_features" => features})
-    # predictions shape: {1, 3}
-    class_idx = predictions[0] |> Nx.argmax() |> Nx.to_number()
-    confidence = predictions[0][class_idx] |> Nx.to_number()
-
-    {Enum.at(@classes, class_idx), confidence}
-  end
-
-  @doc """
-  Saves the model state to disk.
-  """
-  def save_state(model, state) do
-    File.mkdir_p!(Path.dirname(@model_path))
-    serialized = Axon.serialize(model, state)
-    File.write!(@model_path, serialized)
-    :ok
-  end
-
-  @doc """
-  Loads the model state from disk. Returns `{model, state}`.
-  """
-  def load_state! do
-    @model_path
-    |> File.read!()
-    |> Axon.deserialize()
-    |> elem(1)
-  end
-
+  @spec classes() :: [:normal | :suspicious | :abusive]
   def classes, do: @classes
 end
 ```
 
 The `build/0` function defines a sequential network:
 - Input layer: `{nil, 8}` — the `nil` dimension is the batch size, determined at runtime.
-- Dense(16, relu): 16 neurons with ReLU activation. This is the first hidden layer.
-- Dropout(0.3): randomly deactivates 30% of neurons during training to prevent
-  overfitting. During inference (`Axon.predict/4`), dropout is automatically disabled.
+- Dense(16, relu): 16 neurons with ReLU activation. First hidden layer.
+- Dropout(0.3): randomly deactivates 30% of neurons during training to prevent overfitting. During inference (`Axon.predict/4`), dropout is automatically disabled.
 - Dense(8, relu): second hidden layer narrows the representation.
-- Dense(3, softmax): output layer with 3 neurons, one per class. Softmax ensures
-  outputs sum to 1.0, making them interpretable as probabilities.
-
-`classify/1` is the inference entry point. It builds the model graph, loads trained
-weights from disk, extracts features from the stats map, and runs a forward pass.
-`Nx.argmax` finds the highest-probability class index, and the class atom is looked
-up from the `@classes` list.
+- Dense(3, softmax): output layer with 3 neurons, one per class. Softmax ensures outputs sum to 1.0, making them interpretable as probabilities.
 
 ### Step 4: `lib/api_gateway/ml/training.ex`
 
@@ -232,13 +156,14 @@ defmodule ApiGateway.ML.Training do
   alias ApiGateway.ML.{Classifier, FeatureExtractor}
 
   @doc """
-  Trains the classifier on labeled examples and saves the model.
+  Trains the classifier on labeled examples.
 
   `data` is a list of `{stats_map, label_integer}` tuples.
   `label_integer` is 0, 1, or 2.
 
   Returns `{model, model_state}`.
   """
+  @spec train(list({map(), 0 | 1 | 2}), keyword()) :: {Axon.t(), map()}
   def train(data, opts \\ []) do
     epochs        = Keyword.get(opts, :epochs, 20)
     learning_rate = Keyword.get(opts, :learning_rate, 0.001)
@@ -282,9 +207,9 @@ defmodule ApiGateway.ML.Training do
 
   @doc """
   Generates synthetic labeled training data for testing.
-
   In production this comes from labeled incident logs.
   """
+  @spec synthetic_data(pos_integer()) :: list({map(), 0 | 1 | 2})
   def synthetic_data(n \\ 1_000) do
     Enum.map(1..n, fn _ ->
       label = :rand.uniform(3) - 1
@@ -341,21 +266,6 @@ defmodule ApiGateway.ML.Training do
   end
 end
 ```
-
-The `train/2` function converts labeled data to tensors and runs the Axon training loop:
-
-1. Each `{stats_map, label}` pair is converted to a feature tensor (shape `{8}`)
-   and a one-hot label tensor (shape `{3}`).
-2. All features and labels are stacked into batch tensors using `Nx.stack/1`.
-3. `Nx.to_batched/2` splits the data into mini-batches of `batch_size`.
-4. `Axon.Loop.trainer/3` creates the training loop with categorical cross-entropy
-   loss and Adam optimizer.
-5. `Axon.Loop.metric/2` adds accuracy tracking printed at each epoch.
-6. `Axon.Loop.run/4` executes the training and returns the learned model state.
-
-The one-hot encoding is critical: `Axon.Loop.trainer/3` with `:categorical_cross_entropy`
-expects labels as `{batch, num_classes}` tensors, not integer indices. Passing raw
-integers produces incorrect gradients silently.
 
 ### Step 5: Given tests — must pass without modification
 
@@ -453,38 +363,24 @@ mix test test/api_gateway/ml_classifier_test.exs --trace
 | Training data required | Yes (labeled) | No | No |
 | Inference latency | <1ms (dense, small) | <0.1ms | <0.01ms |
 | False positives | Tunable via threshold | High on traffic spikes | Binary |
-| Maintenance | Retrain on new attacks | Adjust threshold | Update rules |
 
-Reflection question: the `Dropout` layer in `Classifier.build/0` deactivates neurons
-randomly during training. What does `Axon.predict/4` do with the dropout layer by default
-during inference? What argument would change this behavior?
+Reflection question: the `Dropout` layer in `Classifier.build/0` deactivates neurons randomly during training. What does `Axon.predict/4` do with the dropout layer by default during inference?
 
 ---
 
 ## Common production mistakes
 
 **1. Using `Axon.Loop.run/4` return value incorrectly**
-`Axon.Loop.run/4` returns the model state directly (not `{model, state}`). The model
-definition is separate from the state. You need both to call `Axon.predict/4`.
+`Axon.Loop.run/4` returns the model state directly (not `{model, state}`). The model definition is separate from the state.
 
 **2. Not seeding randomness in tests**
-Synthetic training data with `:rand.uniform()` produces different results each run.
-Tests that check accuracy after training may pass or fail non-deterministically.
-Use `Nx.Random` with an explicit key in test fixtures.
+Synthetic training data with `:rand.uniform()` produces different results each run. Tests that check accuracy may pass or fail non-deterministically.
 
-**3. Saving state without the model**
-`Axon.serialize/2` takes both model and state. `Axon.deserialize/1` returns `{model, state}`.
-If you serialize only the state and lose the model definition, you cannot deserialize.
+**3. Training in the request path**
+`Axon.Loop.run/4` is synchronous and CPU/GPU intensive. Never call it in a request handler. Train in a background task.
 
-**4. Training in the request path**
-`Axon.Loop.run/4` is synchronous and CPU/GPU intensive. Never call it in a request
-handler. Train in a background task or scheduled job, then swap the loaded model state
-atomically (e.g., via an Agent).
-
-**5. One-hot encoding mismatch**
-`Axon.Loop.trainer/3` with `:categorical_cross_entropy` expects one-hot encoded labels
-`{batch, num_classes}`. Passing integer class indices `{batch}` produces wrong gradients
-silently — the loss decreases but the model does not learn.
+**4. One-hot encoding mismatch**
+`Axon.Loop.trainer/3` with `:categorical_cross_entropy` expects one-hot encoded labels `{batch, num_classes}`. Passing integer class indices produces wrong gradients silently.
 
 ---
 
@@ -492,5 +388,4 @@ silently — the loss decreases but the model does not learn.
 
 - [Axon HexDocs](https://hexdocs.pm/axon/Axon.html) — layers, build, predict
 - [Axon.Loop](https://hexdocs.pm/axon/Axon.Loop.html) — trainer, metric, run
-- [Bumblebee](https://hexdocs.pm/bumblebee) — pre-trained Hugging Face models in Elixir
 - [Machine Learning in Elixir — Sean Moriarity](https://pragprog.com/titles/smelixir/machine-learning-in-elixir/)

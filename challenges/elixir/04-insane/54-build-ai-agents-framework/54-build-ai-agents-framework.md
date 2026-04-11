@@ -16,7 +16,7 @@ An agent must hold state across multiple turns: conversation history, tool regis
 
 ## Why the ReAct loop must be a recursive function, not multiple GenServer callbacks
 
-The ReAct loop is: call LLM → if tool calls, execute tools → call LLM again → repeat until final response. If implemented as `handle_call` → `handle_cast` → `handle_call` (multiple rounds), the agent's `GenServer` mailbox queues incoming messages from other processes between each LLM call. This causes ordering problems: a `stop` signal from the supervisor arrives between two LLM calls but is not processed until the loop completes. A private recursive function holds the control flow without yielding the GenServer between iterations.
+The ReAct loop is: call LLM -> if tool calls, execute tools -> call LLM again -> repeat until final response. If implemented as `handle_call` -> `handle_cast` -> `handle_call` (multiple rounds), the agent's `GenServer` mailbox queues incoming messages from other processes between each LLM call. This causes ordering problems: a `stop` signal from the supervisor arrives between two LLM calls but is not processed until the loop completes. A private recursive function holds the control flow without yielding the GenServer between iterations.
 
 ## Why sandbox code execution requires AST analysis before evaluation
 
@@ -71,12 +71,16 @@ agent_framework/
 defmodule AgentFramework.Tool do
   @callback name() :: String.t()
   @callback description() :: String.t()
-  @callback parameters_schema() :: map()  # JSON Schema
+  @callback parameters_schema() :: map()
   @callback execute(params :: map()) :: {:ok, term()} | {:error, term()}
 
   @optional_callbacks []
 
-  @doc "Validate parameters against schema before calling execute/1"
+  @doc """
+  Validate parameters against schema before calling execute/1.
+  Checks required fields and type constraints. Runs the tool in
+  a Task with a configurable timeout to prevent hangs.
+  """
   def call(tool_module, raw_params) do
     schema = tool_module.parameters_schema()
     case validate_schema(raw_params, schema) do
@@ -92,22 +96,29 @@ defmodule AgentFramework.Tool do
     end
   end
 
+  @doc """
+  Validate parameters against a JSON Schema definition.
+  Checks that all required fields are present and that value types
+  match the declared types (string, integer, number, boolean).
+  """
   defp validate_schema(params, schema) do
-    # TODO: validate params against JSON Schema
-    # HINT: check required fields, type constraints
-    # For simplicity: verify required keys are present and types match
     required = Map.get(schema, "required", [])
     properties = Map.get(schema, "properties", %{})
     missing = Enum.filter(required, fn k -> not Map.has_key?(params, k) end)
+
     if missing != [] do
       {:error, "missing required fields: #{inspect(missing)}"}
     else
-      type_errors = Enum.filter(properties, fn {k, prop} ->
-        val = Map.get(params, k)
-        val != nil and not type_matches?(val, prop["type"])
-      end)
+      type_errors =
+        properties
+        |> Enum.filter(fn {k, prop} ->
+          val = Map.get(params, k)
+          val != nil and not type_matches?(val, prop["type"])
+        end)
+        |> Enum.map(&elem(&1, 0))
+
       if type_errors != [] do
-        {:error, "type mismatch: #{inspect(Enum.map(type_errors, &elem(&1, 0)))}"}
+        {:error, "type mismatch: #{inspect(type_errors)}"}
       else
         :ok
       end
@@ -179,7 +190,16 @@ defmodule AgentFramework.Agent do
     end
   end
 
-  defp react_loop(_history, _state, max_iter) when max_iter >= 0 and max_iter >= 10 do
+  def handle_cast({:stream, user_message, caller_pid}, state) do
+    new_history = state.history ++ [%{role: "user", content: user_message}]
+    case state.llm_module do
+      mod ->
+        mod.stream(new_history, state, caller_pid)
+    end
+    {:noreply, state}
+  end
+
+  defp react_loop(_history, state, iteration) when iteration >= 10 do
     {:error, :max_iterations_exceeded, []}
   end
 
@@ -218,7 +238,6 @@ defmodule AgentFramework.Agent do
   end
 
   defp execute_tool_calls(tool_calls, state) do
-    # Execute all tool calls; concurrent for independent tools
     Enum.map(tool_calls, fn %{name: tool_name, input: input, id: call_id} ->
       tool_module = find_tool(state.tools, tool_name)
 
@@ -248,9 +267,21 @@ defmodule AgentFramework.Agent do
     Enum.find(tools, fn mod -> mod.name() == name end)
   end
 
+  @doc """
+  Check if a tool module requires human-in-the-loop approval.
+  Uses module attributes: if the tool defines `@requires_approval true`,
+  this returns true.
+  """
   defp hitl_required?(tool_module) do
-    # TODO: check if tool_module has @requires_approval true attribute
-    false
+    if function_exported?(tool_module, :__info__, 1) do
+      attrs = tool_module.__info__(:attributes)
+      case Keyword.get(attrs, :requires_approval) do
+        [true] -> true
+        _ -> false
+      end
+    else
+      false
+    end
   end
 
   defp request_approval(state, tool_module, input, call_id) do
@@ -319,7 +350,6 @@ defmodule AgentFramework.Tools.CodeExecution do
   defp find_violations(ast) do
     {_ast, violations} = Macro.prewalk(ast, [], fn node, acc ->
       case node do
-        # Detect Module.function calls
         {{:., _, [{:__aliases__, _, mod_parts}, _func]}, _, _} ->
           mod = Module.concat(mod_parts)
           if mod in @forbidden_modules do
@@ -327,7 +357,6 @@ defmodule AgentFramework.Tools.CodeExecution do
           else
             {node, acc}
           end
-        # Detect :erlang_module.function calls
         {{:., _, [mod, _func]}, _, _} when is_atom(mod) ->
           if mod in @forbidden_modules do
             {node, [mod | acc]}
@@ -341,13 +370,16 @@ defmodule AgentFramework.Tools.CodeExecution do
     violations
   end
 
+  @doc """
+  Run code in a sandboxed Task with a 5-second timeout.
+  Captures stdout by redirecting the group leader to a StringIO process
+  and evaluates the code with a clean binding to prevent variable leakage.
+  """
   defp run_sandboxed(code) do
-    parent = self()
     task = Task.Supervisor.async_nolink(AgentFramework.TaskSupervisor, fn ->
-      # Capture output and return value
       {result, output} = capture_output(fn ->
         try do
-          {value, _bindings} = Code.eval_string(code)
+          {value, _bindings} = Code.eval_string(code, [], __ENV__)
           {:ok, value}
         rescue
           e -> {:error, Exception.message(e)}
@@ -363,10 +395,24 @@ defmodule AgentFramework.Tools.CodeExecution do
     end
   end
 
+  @doc """
+  Capture stdout by temporarily replacing the group leader with a StringIO.
+  After the function executes, restore the original group leader and
+  return the captured output alongside the function result.
+  """
   defp capture_output(fun) do
-    # TODO: use ExUnit.CaptureIO or redirect :stdio to capture output
-    result = fun.()
-    {result, ""}
+    original_gl = Process.group_leader()
+    {:ok, string_io} = StringIO.open("")
+
+    try do
+      Process.group_leader(self(), string_io)
+      result = fun.()
+      {_input, output} = StringIO.contents(string_io)
+      {result, output}
+    after
+      Process.group_leader(self(), original_gl)
+      StringIO.close(string_io)
+    end
   end
 end
 ```
@@ -386,6 +432,11 @@ defmodule AgentFramework.LLM.Retry do
   @max_retries 3
   @initial_backoff_ms 1_000
 
+  @doc """
+  Retry an LLM call with exponential backoff and jitter.
+  Retries on transient HTTP errors (429, 500, 502, 503).
+  Falls back to a secondary model/function if primary exhausts retries.
+  """
   def with_retry(fun, opts \\ []) do
     max_retries = Keyword.get(opts, :max_retries, @max_retries)
     initial_backoff = Keyword.get(opts, :initial_backoff_ms, @initial_backoff_ms)
@@ -397,7 +448,8 @@ defmodule AgentFramework.LLM.Retry do
     case fun.() do
       {:error, {:http, status}} when status in [429, 500, 502, 503] ->
         if attempt < max_retries do
-          Process.sleep(backoff + :rand.uniform(div(backoff, 5)))
+          jitter = :rand.uniform(div(backoff, 5))
+          Process.sleep(backoff + jitter)
           do_retry(fun, attempt + 1, max_retries, min(backoff * 2, 60_000), fallback)
         else
           if fallback do
@@ -420,7 +472,12 @@ defmodule AgentFramework.Memory.ShortTerm do
   @summarize_threshold 0.80
   @chars_per_token 4
 
-  @doc "Check if history needs summarization; if so, call LLM to summarize oldest half"
+  @doc """
+  Check if history needs summarization; if so, call LLM to summarize oldest half.
+  When the token count exceeds 80% of the context window, the oldest half of
+  the conversation is compressed into a summary message, preserving key facts
+  while freeing context space for new interactions.
+  """
   def maybe_summarize(history, context_window, llm_module, state) do
     tokens = estimate_tokens(history)
     if tokens > context_window * @summarize_threshold do
@@ -498,7 +555,6 @@ defmodule AgentFramework.AgentTest do
 
     def complete(history, _state) do
       last = List.last(history)
-      # Simple mock: echo the user's message back
       {:ok, %{
         content: "Echo: #{last.content}",
         tool_calls: [],
@@ -531,7 +587,7 @@ defmodule AgentFramework.AgentTest do
     AgentFramework.Agent.run(pid, "First message")
     AgentFramework.Agent.run(pid, "Second message")
     state = :sys.get_state(pid)
-    assert length(state.history) >= 4  # 2 user + 2 assistant messages
+    assert length(state.history) >= 4
   end
 
   test "stream delivers chunks then done" do
@@ -556,14 +612,11 @@ defmodule AgentFramework.PoolTest do
   use ExUnit.Case, async: false
 
   test "pool returns pool_full when queue capacity exceeded" do
-    # Pool: 2 workers, queue capacity 3
     pool_opts = [workers: 2, queue_capacity: 3, worker_mod: AgentFramework.Agent]
     {:ok, pool} = AgentFramework.Pool.start_link(pool_opts)
 
-    # Fill all workers and queue
     for _ <- 1..5, do: AgentFramework.Pool.submit(pool, :run, ["test"])
 
-    # 6th should be rejected
     assert {:error, :pool_full} = AgentFramework.Pool.submit(pool, :run, ["overflow"])
   end
 end

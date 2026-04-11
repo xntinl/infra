@@ -1,17 +1,18 @@
 # Ports and External Processes
 
-**Project**: `api_gateway` — built incrementally across the advanced level
+**Project**: `api_gateway` — a standalone HTTP gateway exercise
 
 ---
 
 ## Project context
 
-`api_gateway` needs two integrations with external processes: a Python-based ML scoring
-service that cannot be rewritten in Elixir, and a live log tailer that streams gateway
-access logs to monitoring subscribers. Both require bidirectional, long-lived communication
-with OS processes.
+You are building `api_gateway`, an HTTP gateway that routes traffic to microservices. The
+gateway needs two integrations with external processes: a Python-based ML scoring service
+that cannot be rewritten in Elixir, and a live log tailer that streams gateway access logs
+to monitoring subscribers. Both require bidirectional, long-lived communication with OS
+processes.
 
-Project structure at this point:
+Project structure:
 
 ```
 api_gateway/
@@ -19,10 +20,9 @@ api_gateway/
 │   └── api_gateway/
 │       ├── application.ex
 │       ├── router.ex
-│       ├── rate_limiter/
 │       └── middleware/
-│           ├── ml_scorer.ex        # ← you implement this
-│           └── log_tailer.ex       # ← and this
+│           ├── ml_scorer.ex        # ← GenServer wrapping a Python Port
+│           └── log_tailer.ex       # ← tail -f fanout to subscribers
 ├── test/
 │   └── api_gateway/
 │       └── middleware/

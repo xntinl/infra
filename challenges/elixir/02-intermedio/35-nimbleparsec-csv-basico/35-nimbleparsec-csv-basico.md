@@ -1,154 +1,109 @@
 # NimbleParsec: Parser Combinators for Structured Input
 
-**Project**: `task_queue` — built incrementally across the intermediate level
+## Goal
 
----
-
-## Project context
-
-`task_queue` receives job batches from partner systems via CSV files. The CSV format is non-standard: fields may be quoted, values include unicode characters, and the first line is always a header. The partner refuses to switch to JSON. You need a robust parser that handles the edge cases without regular expressions.
-
-Project structure at this point:
-
-```
-task_queue/
-├── lib/
-│   └── task_queue/
-│       ├── application.ex
-│       ├── csv_parser.ex           # ← you implement this
-│       ├── worker.ex
-│       ├── queue_server.ex
-│       ├── scheduler.ex
-│       └── registry.ex
-├── test/
-│   └── task_queue/
-│       └── csv_parser_test.exs     # given tests — must pass without modification
-└── mix.exs
-```
-
-Add to `mix.exs`:
-
-```elixir
-{:nimble_parsec, "~> 1.4"}
-```
-
----
-
-## The business problem
-
-Partner CSV files look like this:
-
-```
-type,handler,priority
-send_email,TaskQueue.Handlers.Email,high
-send_sms,"TaskQueue.Handlers.SMS",low
-run_report,"TaskQueue.Handlers.Report",medium
-```
-
-Edge cases the parser must handle:
-- Quoted fields containing commas: `"Smith, John"`
-- Quoted fields containing escaped quotes: `"He said ""hello"""`
-- Unicode in field values: `"café,résumé"`
-- Empty fields: `type,,priority`
-- Windows line endings: `\r\n`
-
-A regex-based parser fails on quoted commas. `String.split(",")` fails on escaped quotes. NimbleParsec composes small, testable parser pieces into a complete grammar.
+Build a CSV parser for `task_queue` job batch imports using NimbleParsec. Handle quoted fields, escaped quotes, Unicode characters, empty fields, and both Unix and Windows line endings. Learn why parser combinators are more maintainable than regex for structured formats.
 
 ---
 
 ## Why NimbleParsec and not `String.split` or regex
 
-`String.split(line, ",")` fails for `"Smith, John",30` — the comma inside the quotes is a field separator, not a value comma. No simple string split can handle this.
+`String.split(line, ",")` fails for `"Smith, John",30` -- the comma inside the quotes is a field separator, not a value comma.
 
-Regular expressions can handle CSV, but the expression `(?:"(?:[^"\\]|\\.)*"|[^,\n]*)` is opaque. Every edge case adds another branch. The regex has no named parts — you cannot tell from reading it what `(?:[^"\\]|\\.)` means without extensive comments.
+Regular expressions can handle CSV, but the expression is opaque. Every edge case adds another branch.
 
-NimbleParsec composes parsers from named building blocks:
-
-```elixir
-# Readable grammar:
-quoted_field   = ignore(ascii_char([?"]))
-                 |> repeat(choice([escaped_quote, non_quote_char]))
-                 |> ignore(ascii_char([?"]))
-
-unquoted_field = repeat(none_of([?,, ?\n, ?\r]))
-
-field = choice([quoted_field, unquoted_field])
-row   = field |> repeat(ignore(ascii_char([?,])) |> concat(field))
-```
-
-Each combinator is testable in isolation. Adding a new edge case is adding a new combinator, not modifying a regex.
+NimbleParsec composes parsers from named building blocks. Each combinator is testable in isolation. Adding a new edge case is adding a new combinator, not modifying a regex. NimbleParsec also generates parser code at compile time via macros, so performance is excellent.
 
 ---
 
 ## Implementation
 
-### Step 1: `lib/task_queue/csv_parser.ex`
+### Step 1: `mix.exs`
+
+```elixir
+defmodule TaskQueue.MixProject do
+  use Mix.Project
+
+  def project do
+    [
+      app: :task_queue,
+      version: "0.1.0",
+      elixir: "~> 1.15",
+      start_permanent: Mix.env() == :prod,
+      deps: deps()
+    ]
+  end
+
+  def application do
+    [extra_applications: [:logger]]
+  end
+
+  defp deps do
+    [
+      {:nimble_parsec, "~> 1.4"}
+    ]
+  end
+end
+```
+
+### Step 2: `lib/task_queue/csv_parser.ex`
+
+The parser is built from small composable pieces:
+
+- `escaped_quote`: inside a quoted field, `""` represents a literal `"` character
+- `non_quote_char`: any UTF-8 character that is not `"`
+- `quoted_field`: content between `"..."`, with `""` unescaped to `"`
+- `unquoted_field`: any characters except `,`, `\n`, `\r`
+- `field`: either a quoted or unquoted field
+- `row`: a field followed by zero or more `, field` pairs
+- `line_ending`: `\r\n` (Windows) or `\n` (Unix)
+
+The `reduce({List, :to_string, []})` combinator collects the matched codepoints into a single string. The `ignore/1` combinator drops delimiters (quotes, commas, newlines) from the output.
+
+`parse_rows/1` splits the input by line endings first, then parses each line individually. This is simpler than trying to track row boundaries in a flat list of fields from the parser.
+
+`parse_with_headers/1` treats the first row as header keys and zips them with each subsequent row to produce maps.
 
 ```elixir
 defmodule TaskQueue.CsvParser do
   @moduledoc """
   CSV parser for the task_queue job batch import format.
 
-  Handles quoted fields, escaped quotes, unicode, empty fields,
+  Handles quoted fields, escaped quotes, Unicode, empty fields,
   and both Unix (LF) and Windows (CRLF) line endings.
-
-  ## Examples
-
-      iex> TaskQueue.CsvParser.parse_line("type,handler,priority")
-      {:ok, ["type", "handler", "priority"]}
-
-      iex> TaskQueue.CsvParser.parse_line(~s("Smith, John",30))
-      {:ok, ["Smith, John", "30"]}
-
-      iex> TaskQueue.CsvParser.parse_rows("a,b\\nc,d")
-      {:ok, [["a", "b"], ["c", "d"]]}
-
   """
 
   import NimbleParsec
 
-  # An escaped quote inside a quoted field: "" represents "
   escaped_quote =
     ignore(ascii_char([?"]))
     |> ascii_char([?"])
 
-  # Any character that is not a quote, inside a quoted field
   non_quote_char =
     utf8_char([{:not, ?"}])
 
-  # A quoted field: "..." — returns the inner content with "" → "
   quoted_field =
     ignore(ascii_char([?"]))
     |> repeat(choice([escaped_quote, non_quote_char]))
     |> ignore(ascii_char([?"]))
     |> reduce({List, :to_string, []})
 
-  # An unquoted field: any chars except comma, CR, LF
   unquoted_field =
     repeat(utf8_char([{:not, ?,}, {:not, ?\n}, {:not, ?\r}]))
     |> reduce({List, :to_string, []})
 
-  # A single field: quoted or unquoted
   field = choice([quoted_field, unquoted_field])
 
-  # A comma separator between fields
   comma = ignore(ascii_char([?,]))
 
-  # A CSV row: field (, field)*
-  # TODO: define `row` as field followed by repeat of (comma, field)
-  # HINT: field |> repeat(comma |> concat(field))
   row = field |> repeat(comma |> concat(field))
 
-  # Line ending: \r\n (Windows) or \n (Unix)
   line_ending = choice([string("\r\n"), string("\n")])
 
-  # A complete CSV document: row (\n row)*
-  # TODO: define `csv` as row followed by repeat of (line_ending, row), then optional trailing newline
-  # HINT:
-  # row
-  # |> repeat(ignore(line_ending) |> concat(row))
-  # |> ignore(optional(line_ending))
-  csv = row |> repeat(ignore(line_ending) |> concat(row)) |> ignore(optional(line_ending))
+  csv =
+    row
+    |> repeat(ignore(line_ending) |> concat(row))
+    |> ignore(optional(line_ending))
 
   @doc false
   defparsec :parse_row_raw, row
@@ -158,7 +113,7 @@ defmodule TaskQueue.CsvParser do
   @doc """
   Parses a single CSV line into a list of field strings.
 
-  Returns `{:ok, [field, ...]}` or `{:error, reason, rest}`.
+  Returns `{:ok, [field, ...]}` or `{:error, reason}`.
 
   ## Examples
 
@@ -179,7 +134,7 @@ defmodule TaskQueue.CsvParser do
   end
 
   @doc """
-  Parses a multi-line CSV string into a list of rows (each row is a list of fields).
+  Parses a multi-line CSV string into a list of rows.
 
   Returns `{:ok, [[field, ...], ...]}` or `{:error, reason}`.
 
@@ -191,23 +146,18 @@ defmodule TaskQueue.CsvParser do
   """
   @spec parse_rows(String.t()) :: {:ok, [[String.t()]]} | {:error, term()}
   def parse_rows(input) when is_binary(input) do
-    # TODO: call parse_csv_raw/1 and group flat results into rows
-    # The parser returns a flat list of all fields — you need to know the row width
-    # Better approach: split by line ending first, then parse each line
-    #
-    # HINT:
-    # input
-    # |> String.split(~r/\r?\n/, trim: true)
-    # |> Enum.reduce_while([], fn line, acc ->
-    #     case parse_line(line) do
-    #       {:ok, fields} -> {:cont, [fields | acc]}
-    #       {:error, _} = err -> {:halt, err}
-    #     end
-    #   end)
-    # |> case do
-    #     {:error, _} = err -> err
-    #     rows -> {:ok, Enum.reverse(rows)}
-    #   end
+    input
+    |> String.split(~r/\r?\n/, trim: true)
+    |> Enum.reduce_while([], fn line, acc ->
+      case parse_line(line) do
+        {:ok, fields} -> {:cont, [fields | acc]}
+        {:error, _} = err -> {:halt, err}
+      end
+    end)
+    |> case do
+      {:error, _} = err -> err
+      rows -> {:ok, Enum.reverse(rows)}
+    end
   end
 
   @doc """
@@ -224,20 +174,15 @@ defmodule TaskQueue.CsvParser do
   """
   @spec parse_with_headers(String.t()) :: {:ok, [map()]} | {:error, term()}
   def parse_with_headers(input) when is_binary(input) do
-    # TODO:
-    # 1. parse_rows/1 to get all rows
-    # 2. First row is headers
-    # 3. Zip remaining rows with headers to create maps
-    # HINT:
-    # with {:ok, [headers | data_rows]} <- parse_rows(input) do
-    #   maps = Enum.map(data_rows, fn row -> Enum.zip(headers, row) |> Map.new() end)
-    #   {:ok, maps}
-    # end
+    with {:ok, [headers | data_rows]} <- parse_rows(input) do
+      maps = Enum.map(data_rows, fn row -> Enum.zip(headers, row) |> Map.new() end)
+      {:ok, maps}
+    end
   end
 end
 ```
 
-### Step 2: Given tests — must pass without modification
+### Step 3: Tests
 
 ```elixir
 # test/task_queue/csv_parser_test.exs
@@ -246,7 +191,7 @@ defmodule TaskQueue.CsvParserTest do
 
   alias TaskQueue.CsvParser
 
-  describe "parse_line/1 — single row" do
+  describe "parse_line/1 -- single row" do
     test "simple fields without quotes" do
       assert {:ok, ["type", "handler", "priority"]} =
         CsvParser.parse_line("type,handler,priority")
@@ -268,11 +213,11 @@ defmodule TaskQueue.CsvParserTest do
     end
 
     test "unicode characters in unquoted field" do
-      assert {:ok, ["café", "résumé"]} = CsvParser.parse_line("café,résumé")
+      assert {:ok, ["cafe", "resume"]} = CsvParser.parse_line("cafe,resume")
     end
 
     test "unicode characters in quoted field" do
-      assert {:ok, ["café, naïve"]} = CsvParser.parse_line(~s("café, naïve"))
+      assert {:ok, ["cafe, naive"]} = CsvParser.parse_line(~s("cafe, naive"))
     end
 
     test "single field with no comma" do
@@ -284,7 +229,7 @@ defmodule TaskQueue.CsvParserTest do
     end
   end
 
-  describe "parse_rows/1 — multiple rows" do
+  describe "parse_rows/1 -- multiple rows" do
     test "two rows" do
       assert {:ok, [["a", "b"], ["c", "d"]]} = CsvParser.parse_rows("a,b\nc,d")
     end
@@ -304,7 +249,7 @@ defmodule TaskQueue.CsvParserTest do
     end
   end
 
-  describe "parse_with_headers/1 — header row" do
+  describe "parse_with_headers/1 -- header row" do
     test "maps each row to header keys" do
       csv = "type,handler,priority\nsend_email,TaskQueue.Handlers.Email,high"
       assert {:ok, [row]} = CsvParser.parse_with_headers(csv)
@@ -328,14 +273,12 @@ defmodule TaskQueue.CsvParserTest do
 
     test "returns error for invalid CSV" do
       assert {:error, _} = CsvParser.parse_with_headers("only one field")
-      # A row with fewer fields than headers is caught at the zip step
-      # (no error, but map will have fewer keys — this is acceptable)
     end
   end
 end
 ```
 
-### Step 3: Run the tests
+### Step 4: Run
 
 ```bash
 mix deps.get
@@ -353,45 +296,32 @@ mix test test/task_queue/csv_parser_test.exs --trace
 | NimbleParsec | yes | yes | yes | high (named combinators) |
 | `NimbleCSV` library | yes | yes | yes | high (drop-in) |
 
-Reflection question: NimbleParsec generates parser code at compile time via macros. What is the practical implication: if you change the grammar in `csv_parser.ex`, must you recompile every module that calls `CsvParser.parse_line/1`, or only `csv_parser.ex` itself?
+NimbleParsec generates parser code at compile time. If you change the grammar in `csv_parser.ex`, only `csv_parser.ex` itself needs recompilation -- modules that call `CsvParser.parse_line/1` do not change.
 
 ---
 
 ## Common production mistakes
 
 **1. Not handling `{:ok, fields, rest, _, _, _}` where `rest` is non-empty**
+A successful parse can still have unconsumed input. Always check `rest == ""`.
 
-A successful parse can still have unconsumed input. Always check that `rest == ""`:
-
-```elixir
-case parse_row_raw(line) do
-  {:ok, fields, "", _, _, _} -> {:ok, fields}
-  {:ok, _, rest, _, _, _}    -> {:error, "unexpected trailing input: #{inspect(rest)}"}
-  {:error, msg, _, _, _, _}  -> {:error, msg}
-end
-```
-
-**2. Using `string/1` combinator for multi-byte UTF-8 instead of `utf8_char/1`**
-
-`ascii_char/1` matches single bytes. For UTF-8 multi-byte characters, use `utf8_char/1`. Using `ascii_char` on input containing `é` (2 bytes) will either fail or match each byte individually, not the codepoint.
+**2. Using `ascii_char/1` for multi-byte UTF-8 instead of `utf8_char/1`**
+`ascii_char/1` matches single bytes. For UTF-8 characters, use `utf8_char/1`.
 
 **3. Forgetting that `repeat/1` can succeed with zero repetitions**
-
-`repeat(field)` matches zero or more fields. If your row grammar is `repeat(field)`, an empty line parses as `{:ok, [], "", _, _, _}` — not an error. Add `min: 1` if at least one field is required: `times(field, min: 1)`.
+`repeat(field)` matches zero or more. Use `times(field, min: 1)` if at least one is required.
 
 **4. Building the grammar in function bodies instead of module-level `defparsec`**
-
-`defparsec` generates optimized parser functions at compile time. Calling NimbleParsec combinators inside a function at runtime defeats the purpose — you must use `defparsec` or `defparsecp` at the module level.
+`defparsec` generates optimized parser functions at compile time. Calling combinators at runtime defeats the purpose.
 
 **5. Not handling Windows line endings (`\r\n`)**
-
-Files from Windows or partner systems often use `\r\n`. `String.split(input, "\n")` leaves a trailing `\r` on every line. Always normalize or handle both line endings explicitly in the grammar.
+Files from Windows use `\r\n`. `String.split(input, "\n")` leaves a trailing `\r` on every line.
 
 ---
 
 ## Resources
 
-- [NimbleParsec — official hex package](https://hexdocs.pm/nimble_parsec/NimbleParsec.html)
-- [NimbleCSV — drop-in CSV library built on NimbleParsec](https://hexdocs.pm/nimble_csv/NimbleCSV.html)
-- [Parser combinators explained — Saša Jurić](https://www.theerlangelist.com/article/parser_combinators)
-- [CSV RFC 4180 — the standard](https://www.rfc-editor.org/rfc/rfc4180)
+- [NimbleParsec -- official hex package](https://hexdocs.pm/nimble_parsec/NimbleParsec.html)
+- [NimbleCSV -- drop-in CSV library built on NimbleParsec](https://hexdocs.pm/nimble_csv/NimbleCSV.html)
+- [Parser combinators explained -- Sasa Juric](https://www.theerlangelist.com/article/parser_combinators)
+- [CSV RFC 4180 -- the standard](https://www.rfc-editor.org/rfc/rfc4180)

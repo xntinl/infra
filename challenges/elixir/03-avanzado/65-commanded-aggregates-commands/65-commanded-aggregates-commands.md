@@ -1,18 +1,8 @@
 # Commanded — Aggregates and Commands
 
-**Project**: `api_gateway` — audit and billing subsystem using Event Sourcing
-
----
-
 ## Project context
 
-You're building `api_gateway`. The billing team needs an exact, immutable record of
-every API usage event: when a client registered, how much capacity they provisioned,
-every overage. The ops team needs a full audit trail of gateway configuration changes.
-
-Event Sourcing is the right model here: instead of updating a row in a database, you
-append an event to a stream. The current state is always derivable by replaying the
-stream. Commanded is the Elixir framework for Event Sourcing and CQRS.
+You are building `api_gateway`, an internal HTTP gateway. The billing team needs an exact, immutable record of every API usage event: when a client registered, how much capacity they provisioned, every overage. Event Sourcing is the right model: instead of updating a row, you append an event to a stream. The current state is always derivable by replaying the stream. Commanded is the Elixir framework for Event Sourcing and CQRS. All modules are defined from scratch.
 
 Project structure:
 
@@ -20,19 +10,19 @@ Project structure:
 api_gateway/
 ├── lib/
 │   └── api_gateway/
-│       ├── billing/
-│       │   ├── application.ex          # Commanded.Application
-│       │   ├── router.ex               # Commands -> Aggregates
-│       │   ├── commands/
-│       │   │   ├── provision_client.ex
-│       │   │   ├── record_usage.ex
-│       │   │   └── suspend_client.ex
-│       │   ├── events/
-│       │   │   ├── client_provisioned.ex
-│       │   │   ├── usage_recorded.ex
-│       │   │   └── client_suspended.ex
-│       │   └── aggregates/
-│       │       └── client_account.ex   # aggregate root
+│       └── billing/
+│           ├── application.ex          # Commanded.Application
+│           ├── router.ex               # Commands -> Aggregates
+│           ├── commands/
+│           │   ├── provision_client.ex
+│           │   ├── record_usage.ex
+│           │   └── suspend_client.ex
+│           ├── events/
+│           │   ├── client_provisioned.ex
+│           │   ├── usage_recorded.ex
+│           │   └── client_suspended.ex
+│           └── aggregates/
+│               └── client_account.ex   # aggregate root
 ├── test/
 │   └── api_gateway/
 │       └── billing/
@@ -48,40 +38,20 @@ A `ClientAccount` aggregate tracks:
 
 1. **Provisioning** — a client registers with a monthly quota (requests/month)
 2. **Usage recording** — every request batch records how many requests were used
-3. **Suspension** — when a client exceeds quota or is manually suspended, no more
-   usage can be recorded
-4. **Optimistic concurrency** — two concurrent usage-recording commands for the same
-   client must not silently overwrite each other
+3. **Suspension** — when a client exceeds quota or is manually suspended, no more usage can be recorded
+4. **Optimistic concurrency** — two concurrent usage-recording commands for the same client must not silently overwrite each other
 
-The aggregate enforces all business rules. If a command violates a rule, `execute/2`
-returns `{:error, reason}`. No event is emitted. No state changes. The event store is
-not touched.
+The aggregate enforces all business rules. If a command violates a rule, `execute/2` returns `{:error, reason}`. No event is emitted.
 
 ---
 
 ## Why `execute/2` and `apply/2` are separate functions
 
-`execute/2` contains business logic — it can fail. It receives the current aggregate
-state and a command. It either returns an event (or list of events) or `{:error, reason}`.
+`execute/2` contains business logic — it can fail. It receives the current aggregate state and a command. It either returns an event (or list of events) or `{:error, reason}`.
 
-`apply/2` is purely a state reducer. It takes the aggregate state and an event and
-returns the new state. It must never fail and must have no side effects. If it could
-fail, replaying 10,000 events to reconstruct an aggregate would be unpredictable.
+`apply/2` is purely a state reducer. It takes the aggregate state and an event and returns the new state. It must never fail and must have no side effects. If it could fail, replaying 10,000 events to reconstruct an aggregate would be unpredictable.
 
-This separation is not a Commanded convention — it is derived from the fundamental
-constraint of Event Sourcing: an event that has been persisted represents something
-that already happened. You cannot "undo" it by failing the apply.
-
----
-
-## Why `apply/2` must never query the database
-
-During aggregate reconstruction (replay), Commanded calls `apply/2` for every event
-in the stream, potentially thousands of times. If `apply/2` made a database query,
-reconstruction would be N database calls. Beyond performance, it would create a
-temporal paradox: you are reconstructing past state from events, but you are querying
-the current state of the database (which may have been updated by events that haven't
-been replayed yet in this reconstruction).
+This separation is derived from the fundamental constraint of Event Sourcing: an event that has been persisted represents something that already happened. You cannot "undo" it by failing the apply.
 
 ---
 
@@ -104,16 +74,19 @@ end
 ```elixir
 # lib/api_gateway/billing/commands/provision_client.ex
 defmodule ApiGateway.Billing.Commands.ProvisionClient do
+  @moduledoc "Command to provision a new client billing account."
   defstruct [:client_id, :monthly_quota, :plan]
 end
 
 # lib/api_gateway/billing/commands/record_usage.ex
 defmodule ApiGateway.Billing.Commands.RecordUsage do
+  @moduledoc "Command to record a batch of API usage for a client."
   defstruct [:client_id, :request_count, :period]
 end
 
 # lib/api_gateway/billing/commands/suspend_client.ex
 defmodule ApiGateway.Billing.Commands.SuspendClient do
+  @moduledoc "Command to suspend a client account."
   defstruct [:client_id, :reason]
 end
 ```
@@ -123,16 +96,19 @@ end
 ```elixir
 # lib/api_gateway/billing/events/client_provisioned.ex
 defmodule ApiGateway.Billing.Events.ClientProvisioned do
+  @moduledoc "Event emitted when a client account is provisioned."
   defstruct [:client_id, :monthly_quota, :plan, :provisioned_at]
 end
 
 # lib/api_gateway/billing/events/usage_recorded.ex
 defmodule ApiGateway.Billing.Events.UsageRecorded do
+  @moduledoc "Event emitted when API usage is recorded for a client."
   defstruct [:client_id, :request_count, :period, :cumulative_usage]
 end
 
 # lib/api_gateway/billing/events/client_suspended.ex
 defmodule ApiGateway.Billing.Events.ClientSuspended do
+  @moduledoc "Event emitted when a client account is suspended."
   defstruct [:client_id, :reason, :suspended_at]
 end
 ```
@@ -147,9 +123,8 @@ defmodule ApiGateway.Billing.Aggregates.ClientAccount do
   Business rules:
   - A client can only be provisioned once (status :new -> :active)
   - Usage can only be recorded on :active or :over_quota accounts
-  - A suspended account rejects all commands except re-provisioning (not in scope here)
-  - Usage that would exceed monthly_quota emits UsageRecorded BUT sets status :over_quota
-    (soft limit — we record the usage, alert separately)
+  - A suspended account rejects all commands except re-provisioning
+  - Usage that exceeds monthly_quota sets status :over_quota (soft limit)
   """
 
   defstruct client_id:       nil,
@@ -163,6 +138,7 @@ defmodule ApiGateway.Billing.Aggregates.ClientAccount do
 
   # -- Command handlers --
 
+  @spec execute(%__MODULE__{}, struct()) :: struct() | {:error, atom()}
   def execute(%__MODULE__{status: :new}, %ProvisionClient{} = cmd) do
     cond do
       is_nil(cmd.monthly_quota) or cmd.monthly_quota <= 0 ->
@@ -245,6 +221,7 @@ defmodule ApiGateway.Billing.Aggregates.ClientAccount do
 
   # -- State mutators --
 
+  @spec apply(%__MODULE__{}, struct()) :: %__MODULE__{}
   def apply(%__MODULE__{} = account, %ClientProvisioned{} = event) do
     %__MODULE__{account |
       client_id: event.client_id,
@@ -274,37 +251,12 @@ defmodule ApiGateway.Billing.Aggregates.ClientAccount do
 end
 ```
 
-The `execute/2` functions enforce business rules:
-
-- **ProvisionClient**: validates that `monthly_quota > 0` and `plan` is non-nil.
-  Returns a `ClientProvisioned` event with a `provisioned_at` timestamp. The
-  timestamp is set here (in `execute/2`, not in `apply/2`) because it captures the
-  moment the decision was made — not the moment of replay.
-
-- **RecordUsage** on `:active` or `:over_quota`: computes `new_cumulative` by adding
-  the request count to the current cumulative usage. The event carries the computed
-  cumulative, not just the delta — this makes `apply/2` simpler and the event
-  self-contained for debugging.
-
-- **RecordUsage** on `:suspended` or `:new`: rejected with a descriptive error atom.
-
-- **SuspendClient** on `:active` or `:over_quota`: emits `ClientSuspended`. Both
-  states can transition to suspended. Suspending an already-suspended account is
-  rejected.
-
-The `apply/2` functions are pure state reducers:
-
-- **ClientProvisioned**: sets all fields and transitions status to `:active`.
-- **UsageRecorded**: updates `cumulative_usage` and derives `status` by comparing
-  the new cumulative to the monthly quota. This comparison happens during replay too,
-  so the status is always consistent with the event data.
-- **ClientSuspended**: sets status to `:suspended`.
-
 ### Step 5: Router and Application
 
 ```elixir
 # lib/api_gateway/billing/router.ex
 defmodule ApiGateway.Billing.Router do
+  @moduledoc "Routes commands to the ClientAccount aggregate."
   use Commanded.Commands.Router
 
   alias ApiGateway.Billing.Aggregates.ClientAccount
@@ -320,6 +272,7 @@ end
 ```elixir
 # lib/api_gateway/billing/application.ex
 defmodule ApiGateway.Billing.Application do
+  @moduledoc "Commanded application for the billing subsystem."
   use Commanded.Application, otp_app: :api_gateway
 
   router ApiGateway.Billing.Router
@@ -445,45 +398,29 @@ mix test test/api_gateway/billing/client_account_test.exs --trace
 
 | Aspect | Event Sourcing (Commanded) | CRUD with Ecto | Audit log table |
 |--------|---------------------------|----------------|-----------------|
-| Historical state | Full replay from events | Lost on update | Append-only, query-able |
+| Historical state | Full replay from events | Lost on update | Append-only |
 | Temporal queries | Replay to any point in time | Not possible | Only logged fields |
-| Concurrency conflicts | `expected_version` in event store | DB locks or optimistic lock | No protection |
-| Read performance | Requires projection (exercise 66) | Direct query | Direct query |
-| Debugging past bugs | Replay with fixed `apply/2` | Impossible | Partial |
+| Concurrency conflicts | `expected_version` in event store | DB locks | No protection |
+| Read performance | Requires projection | Direct query | Direct query |
 | Schema changes | Migrate events (upcasting) | `ALTER TABLE` | `ALTER TABLE` |
 
-Reflection question: the `apply/2` function derives `status: :over_quota` from
-`event.cumulative_usage > account.monthly_quota`. This comparison happens during
-replay. What happens if you change the quota threshold in a future business rule
-and replay historical events? Are past state reconstructions still correct?
+Reflection question: the `apply/2` function derives `status: :over_quota` from `event.cumulative_usage > account.monthly_quota`. This comparison happens during replay. What happens if you change the quota threshold in a future business rule and replay historical events?
 
 ---
 
 ## Common production mistakes
 
 **1. Side effects in `apply/2`**
-Sending emails, calling HTTP endpoints, or querying the database in `apply/2` will
-fire those effects on every replay. A 10,000-event stream would send 10,000 emails.
-All side effects belong in event handlers (exercise 66), not in `apply/2`.
+Sending emails or calling HTTP endpoints in `apply/2` fires those effects on every replay. All side effects belong in event handlers, not in `apply/2`.
 
-**2. `execute/2` not covering all state combinations**
-If `execute(%__MODULE__{status: :over_quota}, %SuspendClient{})` falls through to a
-non-matching clause, Commanded raises `FunctionClauseError` at runtime. Add explicit
-clauses for every `{status, command}` combination your domain allows.
+**2. Using `DateTime.utc_now()` in `apply/2`**
+`apply/2` is called during replay. Using `DateTime.utc_now()` means reconstructed state has different timestamps depending on when you replay. Use the timestamp from the event.
 
-**3. Large aggregate state causing slow replay**
-An aggregate with 100,000 events takes significant time to replay on each command.
-The solution is snapshots (exercise 66): persist the aggregate state every N events
-and replay only from the last snapshot.
+**3. Forgetting `identify` in the router**
+Without `identify ClientAccount, by: :client_id`, Commanded cannot route commands to the correct aggregate instance.
 
-**4. Using `DateTime.utc_now()` in `apply/2`**
-`apply/2` is called during replay. Using `DateTime.utc_now()` in `apply/2` means the
-reconstructed state has different timestamps depending on when you replay. Use the
-timestamp from the event (set by `execute/2` when the event was first created).
-
-**5. Forgetting `identify` in the router**
-Without `identify ClientAccount, by: :client_id`, Commanded cannot route commands to
-the correct aggregate instance. Every dispatch will fail with a routing error.
+**4. Large aggregate state causing slow replay**
+An aggregate with 100,000 events takes significant time to replay. Use snapshots to persist the aggregate state every N events and replay only from the last snapshot.
 
 ---
 

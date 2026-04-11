@@ -1,24 +1,18 @@
 # Job Scheduler with Cron, Retry, and Backoff
 
-**Project**: `api_gateway` — built incrementally across the advanced level
+## Overview
 
----
+Build an in-memory job scheduler for an HTTP API gateway using only BEAM runtime primitives.
+The scheduler supports fixed-interval and cron-based scheduling, retry with exponential
+backoff and jitter, concurrency limits, and execution history.
 
-## Project context
-
-You're building `api_gateway`, an internal HTTP gateway. The cache layer is in place
-(previous exercise). The infrastructure team now needs scheduled maintenance tasks:
-purge stale rate-limiter entries, refresh upstream service configs, and send hourly
-health digests. You need a job scheduler — without Oban or Quantum, using only the
-BEAM runtime.
-
-Project structure at this point:
+Project structure:
 
 ```
 api_gateway/
 ├── lib/
 │   └── api_gateway/
-│       ├── application.ex              # already exists — supervises Scheduler
+│       ├── application.ex
 │       └── scheduler/
 │           ├── server.ex               # scheduler GenServer
 │           ├── job.ex                  # job and execution structs
@@ -27,8 +21,8 @@ api_gateway/
 ├── test/
 │   └── api_gateway/
 │       └── scheduler/
-│           ├── server_test.exs         # given tests — must pass without modification
-│           └── cron_parser_test.exs    # given tests — must pass without modification
+│           ├── server_test.exs
+│           └── cron_parser_test.exs
 └── mix.exs
 ```
 
@@ -36,10 +30,10 @@ api_gateway/
 
 ## The business problem
 
-The infra team needs three recurring tasks:
+An internal API gateway needs three recurring maintenance tasks:
 
 1. Every 60 seconds: purge expired rate-limiter entries from ETS
-2. Every 5 minutes: fetch the current list of upstream service URLs from Consul
+2. Every 5 minutes: fetch the current list of upstream service URLs from a service registry
 3. `0 * * * *` (every hour on the hour): emit a health digest to the logging pipeline
 
 Each task must retry on failure with exponential backoff, never run more than N instances
@@ -49,13 +43,13 @@ concurrently, and expose a history of recent executions for debugging.
 
 ## Why build this instead of using Quantum
 
-Quantum is production-grade but pulls in 6 transitive dependencies and runs a Postgres
-or ETS-backed persistence layer. For an embedded scheduler that runs 3-5 tasks, the overhead
-is unjustified. Building it yourself also means you understand exactly what happens when a
-job crashes, times out, or runs long.
+Quantum is production-grade but pulls in 6 transitive dependencies and runs a persistence
+layer. For an embedded scheduler that runs 3-5 tasks, the overhead is unjustified. Building
+it yourself also means you understand exactly what happens when a job crashes, times out,
+or runs long.
 
-The patterns here — `Process.send_after` for self-scheduling, `Task.Supervisor` for isolated
-execution, exponential backoff with jitter — are the same ones Quantum uses internally.
+The patterns here -- `Process.send_after` for self-scheduling, `Task.Supervisor` for isolated
+execution, exponential backoff with jitter -- are the same ones Quantum uses internally.
 
 ---
 
@@ -64,7 +58,7 @@ execution, exponential backoff with jitter — are the same ones Quantum uses in
 A failing job that retries immediately creates load storms: if the downstream is down, 20
 concurrent jobs all retry at second intervals and hammer the recovering service. Exponential
 backoff spreads retries out geometrically. Jitter (randomized delay) prevents multiple
-independent job instances from synchronizing their retry times — the thundering herd problem.
+independent job instances from synchronizing their retry times -- the thundering herd problem.
 
 ```
 Attempt 1: fails -> wait 1s + jitter(250ms) = ~1.2s
@@ -83,10 +77,10 @@ Attempt 4: fails -> dead letter queue
 defmodule ApiGateway.Scheduler.Job do
   @enforce_keys [:id, :name, :fun, :schedule]
   defstruct [
-    :id,           # String.t() — unique identifier
-    :name,         # String.t() — human-readable description
-    :fun,          # (-> any()) — zero-arity function to execute
-    :schedule,     # {:every, ms} | {:cron, String.t()}
+    :id,
+    :name,
+    :fun,
+    :schedule,
     max_retries: 3,
     timeout_ms: 30_000,
     enabled: true
@@ -99,8 +93,8 @@ defmodule ApiGateway.Scheduler.Execution do
     :started_at,
     :finished_at,
     :duration_ms,
-    :result,    # :ok | {:error, reason}
-    :attempt    # 1..max_retries
+    :result,
+    :attempt
   ]
 end
 ```
@@ -152,11 +146,11 @@ defmodule ApiGateway.Scheduler.CronParser do
   Parses cron expressions and calculates milliseconds until the next execution.
 
   Supported syntax per field:
-    *       — any value
-    */n     — every n units
-    n       — exact value
-    a-b     — inclusive range
-    a,b,c   — list of values
+    *       -- any value
+    */n     -- every n units
+    n       -- exact value
+    a-b     -- inclusive range
+    a,b,c   -- list of values
 
   Fields: minute hour day-of-month month day-of-week
   """
@@ -192,12 +186,11 @@ defmodule ApiGateway.Scheduler.CronParser do
 
   @doc """
   Returns milliseconds from now until the next time this cron fires.
-  Always returns a positive value — even if the cron should have fired moments ago.
+  Always returns a positive value.
   """
   @spec next_run_in_ms(t()) :: pos_integer()
   def next_run_in_ms(%__MODULE__{} = parsed) do
     now  = DateTime.utc_now()
-    # Start searching from the next full minute
     next = find_next(parsed, DateTime.add(now, 60, :second) |> truncate_to_minute())
     DateTime.diff(next, now, :millisecond)
   end
@@ -217,12 +210,9 @@ defmodule ApiGateway.Scheduler.CronParser do
     end
   end
 
-  # Advance minute-by-minute from `from` until a DateTime matches all fields.
-  # Cap search at 1 year (525_600 minutes) to avoid infinite loops on impossible expressions.
   defp find_next(parsed, from, iterations \\ 0)
 
   defp find_next(_parsed, from, iterations) when iterations > 525_600 do
-    # Safety valve — if no match in a year, return the current candidate
     from
   end
 
@@ -235,8 +225,6 @@ defmodule ApiGateway.Scheduler.CronParser do
   end
 
   defp matches_all?(parsed, dt) do
-    # Date.day_of_week/1 returns 1 (Monday) through 7 (Sunday).
-    # Cron convention: 0 = Sunday, 1 = Monday, ..., 6 = Saturday, 7 = Sunday.
     dow = Date.day_of_week(dt) |> rem(7)
 
     field_matches?(parsed.minute, dt.minute) and
@@ -279,11 +267,11 @@ defmodule ApiGateway.Scheduler.Server do
   Registers a job and schedules its first execution.
 
   ## Options
-    - `every: ms`       — fixed interval in milliseconds
-    - `cron: expr`      — cron expression string
-    - `name: string`    — human-readable label
-    - `max_retries: n`  — default 3
-    - `timeout_ms: ms`  — default 30_000
+    - `every: ms`       -- fixed interval in milliseconds
+    - `cron: expr`      -- cron expression string
+    - `name: string`    -- human-readable label
+    - `max_retries: n`  -- default 3
+    - `timeout_ms: ms`  -- default 30_000
   """
   @spec schedule((-> any()), keyword()) :: String.t()
   def schedule(fun, opts) do
@@ -326,11 +314,11 @@ defmodule ApiGateway.Scheduler.Server do
     {:ok, task_sup} = Task.Supervisor.start_link()
 
     state = %{
-      jobs:           %{},    # job_id => %Job{}
-      timers:         %{},    # job_id => timer_ref
-      history:        %{},    # job_id => [%Execution{}, ...]
+      jobs:           %{},
+      timers:         %{},
+      history:        %{},
       running:        MapSet.new(),
-      task_refs:      %{},    # ref => {job_id, attempt}
+      task_refs:      %{},
       max_concurrent: max_concurrent,
       task_supervisor: task_sup
     }
@@ -360,7 +348,6 @@ defmodule ApiGateway.Scheduler.Server do
       timeout_ms:  Keyword.get(opts, :timeout_ms, 30_000)
     }
 
-    # Calculate the first interval and schedule
     interval_ms = case schedule_type do
       {:every, ms}  -> ms
       {:cron, expr} -> CronParser.parse(expr) |> CronParser.next_run_in_ms()
@@ -383,7 +370,6 @@ defmodule ApiGateway.Scheduler.Server do
         {:reply, {:error, :not_found}, state}
 
       _job ->
-        # Cancel the pending timer
         if timer = state.timers[job_id] do
           Process.cancel_timer(timer)
         end
@@ -403,12 +389,10 @@ defmodule ApiGateway.Scheduler.Server do
         {:reply, {:error, :not_found}, state}
 
       _job ->
-        # Cancel the existing timer to avoid double-execution
         if timer = state.timers[job_id] do
           Process.cancel_timer(timer)
         end
 
-        # Send the run message immediately
         send(self(), {:run_job, job_id})
         {:reply, :ok, state}
     end
@@ -424,7 +408,6 @@ defmodule ApiGateway.Scheduler.Server do
         updated_job = %{job | enabled: enabled}
         state = put_in(state.jobs[job_id], updated_job)
 
-        # If resuming, reschedule the next run
         state =
           if enabled do
             schedule_next(updated_job, state)
@@ -460,19 +443,16 @@ defmodule ApiGateway.Scheduler.Server do
         state = schedule_next(job, state)
         {:noreply, state}
       else
-        # Execute the job in an isolated task
         started_at = DateTime.utc_now()
 
         task = Task.Supervisor.async_nolink(state.task_supervisor, fn ->
           job.fun.()
         end)
 
-        # Track the task reference to the job
         state = state
         |> update_in([:running], &MapSet.put(&1, job_id))
         |> put_in([:task_refs, task.ref], {job_id, 1, started_at})
 
-        # Reschedule the next run
         state = schedule_next(job, state)
 
         {:noreply, state}
@@ -484,7 +464,6 @@ defmodule ApiGateway.Scheduler.Server do
 
   @impl true
   def handle_info({ref, result}, state) when is_reference(ref) do
-    # Task completed successfully — result is the return value of fun.()
     Process.demonitor(ref, [:flush])
 
     case Map.pop(state.task_refs, ref) do
@@ -515,7 +494,6 @@ defmodule ApiGateway.Scheduler.Server do
 
   @impl true
   def handle_info({:DOWN, ref, :process, _pid, reason}, state) when reason != :normal do
-    # Task crashed — implement retry with backoff
     Process.demonitor(ref, [:flush])
 
     case Map.pop(state.task_refs, ref) do
@@ -524,28 +502,12 @@ defmodule ApiGateway.Scheduler.Server do
         job = state.jobs[job_id]
 
         if job && attempt < job.max_retries do
-          # Schedule a retry with exponential backoff + jitter
           delay = Backoff.delay_for(attempt) |> Backoff.with_jitter()
-
-          retry_task_fn = fn ->
-            new_started_at = DateTime.utc_now()
-
-            task = Task.Supervisor.async_nolink(state.task_supervisor, fn ->
-              job.fun.()
-            end)
-
-            # We need to send ourselves a message to update state since we can't
-            # modify state from inside Process.send_after callback
-            {task, new_started_at}
-          end
-
-          # Schedule retry: send a message to ourselves after the backoff delay
           Process.send_after(self(), {:retry_job, job_id, attempt + 1}, delay)
 
           state = update_in(state.running, &MapSet.delete(&1, job_id))
           {:noreply, state}
         else
-          # Max retries exhausted — record as failed
           finished_at = DateTime.utc_now()
           duration_ms = DateTime.diff(finished_at, started_at, :millisecond)
 
@@ -570,7 +532,6 @@ defmodule ApiGateway.Scheduler.Server do
     end
   end
 
-  # Handle :DOWN for normal exits (task finished normally but we already handled via {ref, result})
   def handle_info({:DOWN, _ref, :process, _pid, :normal}, state) do
     {:noreply, state}
   end
@@ -622,7 +583,7 @@ defmodule ApiGateway.Scheduler.Server do
 end
 ```
 
-### Step 5: Given tests — must pass without modification
+### Step 5: Tests
 
 ```elixir
 # test/api_gateway/scheduler/server_test.exs
@@ -632,7 +593,6 @@ defmodule ApiGateway.Scheduler.ServerTest do
   alias ApiGateway.Scheduler.Server
 
   setup do
-    # Restart with a clean state
     if Process.whereis(Server), do: GenServer.stop(Server)
     {:ok, _} = Server.start_link(max_concurrent: 5)
     :ok
@@ -740,8 +700,6 @@ mix test test/api_gateway/scheduler/ --trace
 
 ## Trade-off analysis
 
-Fill in this table based on your implementation.
-
 | Aspect | This scheduler | Oban | Quantum |
 |--------|---------------|------|---------|
 | Persistence after crash | none (in-memory) | PostgreSQL | configurable |
@@ -750,9 +708,6 @@ Fill in this table based on your implementation.
 | Retry semantics | exponential backoff | at-least-once via DB | configurable |
 | Observability | in-memory history | full DB queryable | dashboard |
 | Dependencies | none | ~6 | ~4 |
-
-Reflection: when would you reach for Oban over this scheduler? (Hint: what happens to
-scheduled jobs when the node restarts?)
 
 ---
 
@@ -768,7 +723,7 @@ the job runs twice in quick succession (once immediately and once when the timer
 
 **3. No jitter on retry**
 Without jitter, all retries for all failing jobs fire at exact multiples of the base delay.
-If 10 jobs fail simultaneously, they all retry at t+1s, t+2s, t+4s — correlated spikes.
+If 10 jobs fail simultaneously, they all retry at t+1s, t+2s, t+4s -- correlated spikes.
 
 **4. Blocking the GenServer during job execution**
 Running `job.fun.()` inside `handle_info` blocks the entire scheduler for the duration of
@@ -782,7 +737,7 @@ job. After a week, the history map becomes the dominant memory consumer.
 
 ## Resources
 
-- [`Process.send_after/3`](https://hexdocs.pm/elixir/Process.html#send_after/3) — scheduling without external deps
-- [`Task.Supervisor`](https://hexdocs.pm/elixir/Task.Supervisor.html) — isolated async execution
-- [Oban source — scheduler](https://github.com/sorentwo/oban) — how production-grade scheduling works
-- [Exponential backoff and jitter — AWS blog](https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/) — the jitter argument
+- [`Process.send_after/3`](https://hexdocs.pm/elixir/Process.html#send_after/3) -- scheduling without external deps
+- [`Task.Supervisor`](https://hexdocs.pm/elixir/Task.Supervisor.html) -- isolated async execution
+- [Oban source -- scheduler](https://github.com/sorentwo/oban) -- how production-grade scheduling works
+- [Exponential backoff and jitter -- AWS blog](https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/) -- the jitter argument

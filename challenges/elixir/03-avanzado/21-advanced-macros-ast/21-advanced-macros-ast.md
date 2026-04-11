@@ -1,21 +1,12 @@
 # Advanced Macros and AST Manipulation
 
-**Project**: `api_gateway` — built incrementally across the advanced level
-
----
-
 ## Project context
 
-You're building `api_gateway`. The gateway has middleware functions that validate,
-transform, and log requests. The engineering team wants tooling to:
-1. Inspect what any middleware does at compile time without running it
-2. Automatically instrument middleware with timing and logging by transforming its AST
-3. Analyze which variables a middleware function reads from the connection struct
+You are building `api_gateway`, an internal HTTP gateway that routes traffic to microservices.
+This exercise focuses on compile-time AST inspection, automatic middleware instrumentation
+via macro-based code transformation, and static variable analysis.
 
-These requirements push you into AST manipulation — reading, traversing, and
-transforming the abstract syntax tree before code is compiled.
-
-Project structure at this point:
+Project structure:
 
 ```
 api_gateway/
@@ -24,7 +15,6 @@ api_gateway/
 │       ├── application.ex
 │       ├── router.ex
 │       ├── middleware/
-│       │   ├── pipeline.ex
 │       │   └── instrumentation.ex
 │       └── dev/
 │           └── ast_tools.ex
@@ -50,7 +40,7 @@ Three tooling requirements:
    add `System.monotonic_time` measurements and emit a telemetry event.
 
 3. **Variable analysis**: a static analysis tool that lists all variables referenced
-   in a block of code — useful for dead code analysis and security audits.
+   in a block of code -- useful for dead code analysis and security audits.
 
 ---
 
@@ -65,7 +55,7 @@ quote do: 1 + 2
 quote do: foo(bar)
 #=> {:foo, [line: 1], [{:bar, [line: 1], Elixir}]}
 
-# Variables vs function calls — distinguished by the third element:
+# Variables vs function calls -- distinguished by the third element:
 quote do: x         #=> {:x, [], Elixir}       # variable: atom context
 quote do: x()       #=> {:x, [], []}            # call: empty list args
 quote do: x(1)      #=> {:x, [], [1]}           # call with args: non-empty list
@@ -87,11 +77,11 @@ expr = quote do: 1 + 2   # => {:+, [], [1, 2]}
 
 # Without Macro.escape:
 quote do: IO.inspect(unquote(expr))
-# expands to: IO.inspect(1 + 2)  ← evaluates to IO.inspect(3)
+# expands to: IO.inspect(1 + 2)  <- evaluates to IO.inspect(3)
 
 # With Macro.escape:
 quote do: IO.inspect(unquote(Macro.escape(expr)))
-# expands to: IO.inspect({:+, [], [1, 2]})  ← prints the AST tuple
+# expands to: IO.inspect({:+, [], [1, 2]})  <- prints the AST tuple
 ```
 
 ---
@@ -104,7 +94,7 @@ quote do: IO.inspect(unquote(Macro.escape(expr)))
 defmodule ApiGateway.Dev.ASTTools do
   @moduledoc """
   Compile-time AST inspection and analysis utilities.
-  These macros operate at compile time — all output is produced during compilation,
+  These macros operate at compile time -- all output is produced during compilation,
   not during test or production runtime.
   """
 
@@ -203,7 +193,7 @@ defmodule ApiGateway.Middleware.Instrumentation do
 
   @doc """
   Wraps a function definition with automatic timing instrumentation.
-  Transforms the function body at compile time — no runtime overhead
+  Transforms the function body at compile time -- no runtime overhead
   beyond the timing calls themselves.
   """
   defmacro instrument({:def, meta, [{name, fun_meta, args}, [do: body]]}) do
@@ -262,7 +252,7 @@ defmodule ApiGateway.Middleware.Instrumentation do
 end
 ```
 
-### Step 3: Given tests — must pass without modification
+### Step 3: Tests
 
 ```elixir
 # test/api_gateway/middleware/instrumentation_test.exs
@@ -286,7 +276,7 @@ defmodule ApiGateway.Middleware.InstrumentationTest do
           _ignored = "not counted"
         end
 
-      # conn, method, path, result — conn appears multiple times but deduped
+      # conn, method, path, result -- conn appears multiple times but deduped
       assert :conn in vars
       assert :method in vars
       assert :path in vars
@@ -381,13 +371,13 @@ mix test test/api_gateway/middleware/instrumentation_test.exs --trace
 
 | Technique | Compile-time cost | Runtime overhead | Debuggability |
 |-----------|------------------|-----------------|---------------|
-| `Macro.prewalk` | O(n) AST nodes | Zero | Hard — errors show AST positions |
-| `Macro.postwalk` | O(n) AST nodes | Zero | Hard — same as prewalk |
-| `Macro.traverse` | O(n) AST nodes | Zero | Hardest — pre+post in one pass |
-| `Code.eval_quoted` | O(n) | Runtime eval cost | Worst — no compiler optimizations |
+| `Macro.prewalk` | O(n) AST nodes | Zero | Hard -- errors show AST positions |
+| `Macro.postwalk` | O(n) AST nodes | Zero | Hard -- same as prewalk |
+| `Macro.traverse` | O(n) AST nodes | Zero | Hardest -- pre+post in one pass |
+| `Code.eval_quoted` | O(n) | Runtime eval cost | Worst -- no compiler optimizations |
 | Regular function | None | Normal | Best |
 
-Reflection: `referenced_vars` is a compile-time macro — the list of variables
+Reflection: `referenced_vars` is a compile-time macro -- the list of variables
 is a literal in the compiled beam file. What happens if you call it with a block
 that references variables that don't exist yet? Does the macro care? Why?
 
@@ -396,7 +386,7 @@ that references variables that don't exist yet? Does the macro care? Why?
 ## Common production mistakes
 
 **1. Using `Code.eval_quoted` in production hot paths**
-`Code.eval_quoted` bypasses the compiler — no type checking, no optimization, no
+`Code.eval_quoted` bypasses the compiler -- no type checking, no optimization, no
 dialyzer analysis. Use it only for developer tooling or one-time startup operations.
 
 **2. Not using `Macro.escape` when passing AST as data**
@@ -423,7 +413,7 @@ accumulator in `@before_compile`.
 
 ## Resources
 
-- [Elixir `Macro` module documentation](https://hexdocs.pm/elixir/Macro.html) — `prewalk`, `postwalk`, `traverse`, `escape`
-- [Metaprogramming Elixir — Chris McCord](https://pragprog.com/titles/cmelixir/metaprogramming-elixir/) — the definitive book on Elixir macros
-- [Quote and unquote — Elixir guides](https://elixir-lang.org/getting-started/meta/quote-and-unquote.html)
-- [`:telemetry` library](https://hexdocs.pm/telemetry/readme.html) — the instrumentation standard in the Elixir ecosystem
+- [Elixir `Macro` module documentation](https://hexdocs.pm/elixir/Macro.html) -- `prewalk`, `postwalk`, `traverse`, `escape`
+- [Metaprogramming Elixir -- Chris McCord](https://pragprog.com/titles/cmelixir/metaprogramming-elixir/) -- the definitive book on Elixir macros
+- [Quote and unquote -- Elixir guides](https://elixir-lang.org/getting-started/meta/quote-and-unquote.html)
+- [`:telemetry` library](https://hexdocs.pm/telemetry/readme.html) -- the instrumentation standard in the Elixir ecosystem

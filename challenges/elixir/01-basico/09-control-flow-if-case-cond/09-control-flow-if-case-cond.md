@@ -1,34 +1,19 @@
 # Control Flow: Transaction Routing and Validation Rules
 
-**Project**: `payments_cli` — built incrementally across the basic level
+**Project**: `payments_cli` — a CLI tool that processes payment transactions
 
 ---
 
 ## Project context
 
-You're building `payments_cli`. The system needs to make routing decisions
-(which processor handles which transaction), apply validation rules with multiple
-conditions, and chain steps that can each fail. The choice between `if`, `case`,
-`cond`, and `with` determines code readability and correctness.
+You are building `payments_cli`, a CLI tool that processes payment transactions from CSV
+files, validates them, applies business rules, and produces ledger reports.
 
-Project structure at this point:
-
-```
-payments_cli/
-├── lib/
-│   └── payments_cli/
-│       ├── cli.ex
-│       ├── transaction.ex
-│       ├── ledger.ex
-│       ├── formatter.ex
-│       ├── pipeline.ex
-│       ├── processor.ex
-│       └── router.ex       # ← you implement this
-├── test/
-│   └── payments_cli/
-│       └── router_test.exs  # given tests — must pass without modification
-└── mix.exs
-```
+This exercise implements a `Router` module that makes routing decisions (which processor
+handles which transaction), applies validation rules with multiple conditions, chains
+steps that can each fail using `with`, and decides whether to retry failed transactions.
+The module is completely self-contained — it defines all routing, validation, processing,
+and retry logic from scratch.
 
 ---
 
@@ -259,7 +244,7 @@ end
 - `retryable?/1` uses `case` because it matches on the shape of a value (a tuple
   with a specific atom). This is pattern matching, not boolean evaluation.
 
-### Given tests — must pass without modification
+### Tests
 
 ```elixir
 # test/payments_cli/router_test.exs
@@ -435,4 +420,4 @@ always include a catch-all clause in `case`.
 - [case, cond, and if — Elixir Getting Started](https://elixir-lang.org/getting-started/case-cond-and-if.html)
 - [with — Kernel.SpecialForms](https://hexdocs.pm/elixir/Kernel.SpecialForms.html#with/1)
 - [Elixir School — Control Structures](https://elixirschool.com/en/lessons/basics/control_structures)
-- [Elixir in Action — Saša Jurić — Chapter 3 (control flow)](https://www.manning.com/books/elixir-in-action-third-edition)
+- [Elixir in Action — Sasa Juric — Chapter 3 (control flow)](https://www.manning.com/books/elixir-in-action-third-edition)

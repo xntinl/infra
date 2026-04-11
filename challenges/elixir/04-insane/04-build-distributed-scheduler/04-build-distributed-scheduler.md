@@ -274,6 +274,11 @@ defmodule Helios.Scheduler do
     {:noreply, updated_state}
   end
 
+  def handle_info({:node_dead, node_id}, state) do
+    updated_state = requeue_jobs_on_node(state, node_id)
+    {:noreply, updated_state}
+  end
+
   def handle_info({:heartbeat, node_id}, state) do
     nodes = Map.update(state.nodes, node_id, nil, fn node ->
       %{node | last_heartbeat: System.monotonic_time(:millisecond), status: :alive}
@@ -507,7 +512,7 @@ Benchee.run(
 | Preemption frequency | lower (fits more) | moderate | higher |
 | Implementation complexity | moderate | simple | trivial |
 
-Fill in measured placement latency from the benchmark.
+After running the benchmark, record your measured placement latency (p50, p99) for direct comparison across strategies.
 
 Architectural question: the Omega paper (Schwarzkopf et al.) proposes optimistic scheduling with conflict detection instead of pessimistic locking of the cluster state. Under what workload conditions does optimistic scheduling outperform the pessimistic approach you built?
 

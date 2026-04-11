@@ -839,8 +839,6 @@ end
 mix test test/raft_consensus/ --trace
 ```
 
-Tests fail initially. Implement each milestone until all pass.
-
 ### Step 11: Throughput benchmark
 
 ```elixir
@@ -883,7 +881,7 @@ Target: 10,000 linearizable writes/second on a 3-node cluster on localhost.
 | Snapshot protocol | InstallSnapshot RPC | implementation-defined | recovery RPC |
 | Understandability | designed for clarity | historically harder | comparable to Raft |
 
-Fill in the latency and throughput columns after running the benchmark.
+After running the benchmark, record your measured latency (p50, p99) and throughput (ops/sec) in each column for direct comparison.
 
 Architectural question: Raft forbids committing entries from previous terms by index alone. Why? Construct a 3-node scenario where doing so would violate safety. Draw the log state on each node step by step.
 

@@ -22,7 +22,8 @@ crdts/
 │       ├── rga.ex                   # replicated growable array for collaborative text editing
 │       ├── dvv.ex                   # dotted version vectors for causal context tracking
 │       ├── hlc.ex                   # hybrid logical clock: physical + logical component
-│       └── gossip.ex                # state-based gossip: periodic random-peer merge
+│       ├── gossip.ex                # state-based gossip: periodic random-peer merge
+│       └── simulation.ex            # multi-node simulation for testing convergence
 ├── test/
 │   └── crdts/
 │       ├── g_counter_test.exs       # value, merge, idempotency, commutativity
@@ -51,9 +52,9 @@ In a distributed system where network partitions are possible, you have two choi
 
 **OR-Set via dots**: each `add(element)` operation generates a unique "dot" `{actor_id, sequence_number}`. The element's presence in the set is represented by the set of its dots. `remove(element)` removes all observed dots. If node A adds with dot `{A,1}` and node B concurrently adds with dot `{B,1}`, a merge that removes A's add still contains B's add — add-wins semantics arise naturally.
 
-**Hybrid Logical Clocks for LWW registers**: pure physical clocks cannot determine which of two concurrent writes happened "last" because clocks on different machines are not synchronized. Logical clocks (Lamport timestamps) are monotonic but lose wall-clock ordering information. HLC combines both: `{physical_time_ms, logical_counter, node_id}`. On receive, the physical time is set to `max(local, received)`, and the logical counter breaks ties. Clock skew up to 500ms is tolerated.
+**Hybrid Logical Clocks for LWW registers**: pure physical clocks cannot determine which of two concurrent writes happened "last" because clocks on different machines are not synchronized. HLC combines physical time and a logical counter: `{physical_time_ms, logical_counter, node_id}`. On receive, the physical time is set to `max(local, received)`, and the logical counter breaks ties.
 
-**RGA for collaborative text editing**: each character has a unique ID `{actor, counter}`. Insertions use the ID of the preceding character as an anchor. Concurrent insertions at the same position are ordered by ID, deterministically. This avoids the interleaving anomaly that plagues operational transformation (OT) approaches.
+**RGA for collaborative text editing**: each character has a unique ID `{actor, counter}`. Insertions use the ID of the preceding character as an anchor. Concurrent insertions at the same position are ordered by ID, deterministically.
 
 ---
 
@@ -89,21 +90,65 @@ defmodule CRDTs.GCounter do
   merge/2 = slot-wise max.
   """
 
+  @doc "Creates a new empty G-Counter."
+  @spec new() :: map()
   def new(), do: %{}
 
+  @doc "Increments the counter for the given node."
+  @spec increment(map(), atom()) :: map()
   def increment(%{} = counter, node_id) do
     Map.update(counter, node_id, 1, &(&1 + 1))
   end
 
+  @doc "Returns the total value across all nodes."
+  @spec value(map()) :: non_neg_integer()
   def value(%{} = counter) do
     counter |> Map.values() |> Enum.sum()
   end
 
+  @doc "Merges two counters by taking the max per slot."
+  @spec merge(map(), map()) :: map()
   def merge(%{} = c1, %{} = c2) do
-    # TODO: Map.merge(c1, c2, fn _k, v1, v2 -> max(v1, v2) end)
+    Map.merge(c1, c2, fn _k, v1, v2 -> max(v1, v2) end)
   end
 end
 ```
+
+```elixir
+# lib/crdts/pn_counter.ex
+defmodule CRDTs.PNCounter do
+  @moduledoc """
+  Positive-Negative counter built from two G-Counters.
+  value = sum(positive) - sum(negative).
+  """
+
+  alias CRDTs.GCounter
+
+  @doc "Creates a new PN-Counter."
+  @spec new() :: {map(), map()}
+  def new(), do: {GCounter.new(), GCounter.new()}
+
+  @doc "Increments the counter."
+  @spec increment({map(), map()}, atom()) :: {map(), map()}
+  def increment({pos, neg}, node_id), do: {GCounter.increment(pos, node_id), neg}
+
+  @doc "Decrements the counter."
+  @spec decrement({map(), map()}, atom()) :: {map(), map()}
+  def decrement({pos, neg}, node_id), do: {pos, GCounter.increment(neg, node_id)}
+
+  @doc "Returns the current value."
+  @spec value({map(), map()}) :: integer()
+  def value({pos, neg}), do: GCounter.value(pos) - GCounter.value(neg)
+
+  @doc "Merges two PN-Counters."
+  @spec merge({map(), map()}, {map(), map()}) :: {map(), map()}
+  def merge({p1, n1}, {p2, n2}) do
+    {GCounter.merge(p1, p2), GCounter.merge(n1, n2)}
+  end
+end
+```
+
+### Step 4: OR-Set
 
 ```elixir
 # lib/crdts/or_set.ex
@@ -113,39 +158,50 @@ defmodule CRDTs.ORSet do
 
   State: %{element => MapSet.t({actor, sequence})}
   A "dot" is {actor, sequence}.
-
-  add(set, element, actor): generate a new dot, add to element's dot set
-  remove(set, element):     remove all current dots for element
-  member?(set, element):    true if element has at least one dot
-  merge(s1, s2):            union of dot sets per element; concurrent adds always win
   """
 
+  @doc "Creates a new empty OR-Set."
+  @spec new() :: map()
   def new(), do: %{}
 
+  @doc "Adds an element with a new unique dot."
+  @spec add(map(), term(), atom()) :: map()
   def add(set, element, actor) do
     current_dots = Map.get(set, element, MapSet.new())
-    seq = MapSet.size(current_dots) + 1  # simple sequence; in production use a vector clock
+    seq = MapSet.size(current_dots) + 1
     new_dot = {actor, seq}
     Map.put(set, element, MapSet.put(current_dots, new_dot))
   end
 
+  @doc "Removes an element by clearing all its dots."
+  @spec remove(map(), term()) :: map()
   def remove(set, element) do
-    # TODO: remove all dots for element; the element effectively disappears
-    # HINT: Map.delete(set, element)
+    Map.delete(set, element)
   end
 
+  @doc "Checks if an element is in the set (has at least one dot)."
+  @spec member?(map(), term()) :: boolean()
   def member?(set, element) do
     set |> Map.get(element, MapSet.new()) |> MapSet.size() > 0
   end
 
+  @doc "Returns all elements currently in the set."
+  @spec elements(map()) :: [term()]
+  def elements(set) do
+    set
+    |> Enum.filter(fn {_elem, dots} -> MapSet.size(dots) > 0 end)
+    |> Enum.map(fn {elem, _dots} -> elem end)
+  end
+
+  @doc "Merges two OR-Sets by taking the union of dot sets per element."
+  @spec merge(map(), map()) :: map()
   def merge(s1, s2) do
-    # TODO: for each element in either set, union the dot sets
-    # HINT: Map.merge(s1, s2, fn _k, d1, d2 -> MapSet.union(d1, d2) end)
+    Map.merge(s1, s2, fn _k, d1, d2 -> MapSet.union(d1, d2) end)
   end
 end
 ```
 
-### Step 4: Hybrid Logical Clock
+### Step 5: Hybrid Logical Clock
 
 ```elixir
 # lib/crdts/hlc.ex
@@ -153,17 +209,16 @@ defmodule CRDTs.HLC do
   @moduledoc """
   Hybrid Logical Clock.
   State: {physical_ms, logical_counter, node_id}
-
-  On send: l' = max(l, physical_ms); if l' == l, c' = c + 1; else c' = 0
-  On receive: l' = max(l, recv_l, physical_ms); if l' == recv_l, c' = max(c, recv_c) + 1
-                                                 if l' == l, c' = c + 1
-                                                 else c' = 0
   """
 
+  @doc "Creates a new HLC for the given node."
+  @spec new(atom()) :: {integer(), non_neg_integer(), atom()}
   def new(node_id) do
     {System.system_time(:millisecond), 0, node_id}
   end
 
+  @doc "Advances the clock on a local event."
+  @spec tick({integer(), non_neg_integer(), atom()}) :: {integer(), non_neg_integer(), atom()}
   def tick({l, c, node_id}) do
     now = System.system_time(:millisecond)
     l_new = max(l, now)
@@ -171,17 +226,224 @@ defmodule CRDTs.HLC do
     {l_new, c_new, node_id}
   end
 
+  @doc "Advances the clock upon receiving a remote event."
+  @spec receive_event(
+          {integer(), non_neg_integer(), atom()},
+          {integer(), non_neg_integer(), atom()}
+        ) :: {integer(), non_neg_integer(), atom()}
   def receive_event({l, c, node_id}, {recv_l, recv_c, _recv_node}) do
-    # TODO
+    now = System.system_time(:millisecond)
+    l_new = Enum.max([l, recv_l, now])
+
+    c_new =
+      cond do
+        l_new == l and l_new == recv_l -> max(c, recv_c) + 1
+        l_new == l -> c + 1
+        l_new == recv_l -> recv_c + 1
+        true -> 0
+      end
+
+    {l_new, c_new, node_id}
   end
 
+  @doc "Compares two HLC timestamps. Returns :lt, :eq, or :gt."
+  @spec compare(
+          {integer(), non_neg_integer(), atom()},
+          {integer(), non_neg_integer(), atom()}
+        ) :: :lt | :eq | :gt
   def compare({l1, c1, n1}, {l2, c2, n2}) do
-    # TODO: total order: first by l, then c, then node_id (for tie-breaking)
+    cond do
+      l1 < l2 -> :lt
+      l1 > l2 -> :gt
+      c1 < c2 -> :lt
+      c1 > c2 -> :gt
+      n1 < n2 -> :lt
+      n1 > n2 -> :gt
+      true -> :eq
+    end
   end
 end
 ```
 
-### Step 5: Given tests — must pass without modification
+### Step 6: LWW Register
+
+```elixir
+# lib/crdts/lww_register.ex
+defmodule CRDTs.LWWRegister do
+  @moduledoc """
+  Last-Write-Wins Register using HLC for ordering.
+  """
+
+  @doc "Creates a new register with an initial value."
+  @spec new(term(), atom()) :: {term(), {integer(), non_neg_integer(), atom()}}
+  def new(value, node_id) do
+    clock = CRDTs.HLC.new(node_id)
+    {value, clock}
+  end
+
+  @doc "Updates the register value."
+  @spec update({term(), tuple()}, term()) :: {term(), tuple()}
+  def update({_old_value, clock}, new_value) do
+    new_clock = CRDTs.HLC.tick(clock)
+    {new_value, new_clock}
+  end
+
+  @doc "Returns the current value."
+  @spec value({term(), tuple()}) :: term()
+  def value({val, _clock}), do: val
+
+  @doc "Merges two registers — the one with the later timestamp wins."
+  @spec merge({term(), tuple()}, {term(), tuple()}) :: {term(), tuple()}
+  def merge({v1, c1} = r1, {v2, c2} = r2) do
+    case CRDTs.HLC.compare(c1, c2) do
+      :gt -> r1
+      :lt -> r2
+      :eq -> if v1 >= v2, do: r1, else: r2
+    end
+  end
+end
+```
+
+### Step 7: Cluster simulation for convergence testing
+
+```elixir
+# lib/crdts/simulation.ex
+defmodule CRDTs.Simulation do
+  use GenServer
+
+  @moduledoc """
+  Simulates a cluster of nodes with gossip-based CRDT convergence.
+  Supports network partitions and healing for testing.
+  """
+
+  defstruct [:nodes, :partitions, :states, :gossip_interval]
+
+  @doc "Starts a simulation with the given node names."
+  @spec start([atom()]) :: {:ok, pid()}
+  def start(node_names) do
+    GenServer.start(__MODULE__, node_names)
+  end
+
+  @doc "Creates a network partition between two groups."
+  @spec partition(pid(), keyword()) :: :ok
+  def partition(sim, opts) do
+    GenServer.call(sim, {:partition, opts})
+  end
+
+  @doc "Heals all network partitions."
+  @spec heal(pid()) :: :ok
+  def heal(sim), do: GenServer.call(sim, :heal)
+
+  @doc "Increments a counter on the given node."
+  @spec increment(pid(), atom(), atom()) :: :ok
+  def increment(sim, node, counter_name) do
+    GenServer.call(sim, {:increment, node, counter_name})
+  end
+
+  @doc "Reads the counter value from the given node."
+  @spec value(pid(), atom(), atom()) :: non_neg_integer()
+  def value(sim, node, counter_name) do
+    GenServer.call(sim, {:value, node, counter_name})
+  end
+
+  @doc "Stops the simulation."
+  @spec stop(pid()) :: :ok
+  def stop(sim), do: GenServer.stop(sim)
+
+  @impl true
+  def init(node_names) do
+    states = Map.new(node_names, fn name -> {name, %{}} end)
+    schedule_gossip()
+    {:ok, %__MODULE__{
+      nodes: node_names,
+      partitions: nil,
+      states: states,
+      gossip_interval: 50
+    }}
+  end
+
+  @impl true
+  def handle_call({:partition, opts}, _from, state) do
+    {:reply, :ok, %{state | partitions: opts}}
+  end
+
+  @impl true
+  def handle_call(:heal, _from, state) do
+    {:reply, :ok, %{state | partitions: nil}}
+  end
+
+  @impl true
+  def handle_call({:increment, node, counter_name}, _from, state) do
+    node_state = Map.get(state.states, node, %{})
+    counter = Map.get(node_state, counter_name, CRDTs.GCounter.new())
+    updated_counter = CRDTs.GCounter.increment(counter, node)
+    updated_node_state = Map.put(node_state, counter_name, updated_counter)
+    new_states = Map.put(state.states, node, updated_node_state)
+    {:reply, :ok, %{state | states: new_states}}
+  end
+
+  @impl true
+  def handle_call({:value, node, counter_name}, _from, state) do
+    node_state = Map.get(state.states, node, %{})
+    counter = Map.get(node_state, counter_name, CRDTs.GCounter.new())
+    {:reply, CRDTs.GCounter.value(counter), state}
+  end
+
+  @impl true
+  def handle_info(:gossip, state) do
+    new_states = do_gossip_round(state)
+    schedule_gossip()
+    {:noreply, %{state | states: new_states}}
+  end
+
+  defp schedule_gossip do
+    Process.send_after(self(), :gossip, 50)
+  end
+
+  defp do_gossip_round(state) do
+    Enum.reduce(state.nodes, state.states, fn node, states ->
+      peers = reachable_peers(node, state.nodes, state.partitions)
+
+      case peers do
+        [] -> states
+        _ ->
+          peer = Enum.random(peers)
+          node_state = Map.get(states, node, %{})
+          peer_state = Map.get(states, peer, %{})
+
+          merged_state =
+            Map.merge(node_state, peer_state, fn _key, local, remote ->
+              CRDTs.GCounter.merge(local, remote)
+            end)
+
+          states
+          |> Map.put(node, merged_state)
+          |> Map.put(peer, merged_state)
+      end
+    end)
+  end
+
+  defp reachable_peers(node, all_nodes, nil) do
+    Enum.reject(all_nodes, &(&1 == node))
+  end
+
+  defp reachable_peers(node, _all_nodes, partitions) do
+    group_a = Keyword.get(partitions, :group_a, [])
+    group_b = Keyword.get(partitions, :group_b, [])
+
+    my_group =
+      cond do
+        node in group_a -> group_a
+        node in group_b -> group_b
+        true -> []
+      end
+
+    Enum.reject(my_group, &(&1 == node))
+  end
+end
+```
+
+### Step 8: Given tests — must pass without modification
 
 ```elixir
 # test/crdts/lattice_laws_test.exs
@@ -255,13 +517,13 @@ defmodule CRDTs.ConvergenceTest do
 end
 ```
 
-### Step 6: Run the tests
+### Step 9: Run the tests
 
 ```bash
 mix test test/crdts/ --trace
 ```
 
-### Step 7: Benchmark
+### Step 10: Benchmark
 
 ```elixir
 # bench/crdts_bench.exs
@@ -301,7 +563,7 @@ Benchee.run(
 |------|-----------|------------|-----------|-------------|
 | G-Counter | O(N) per-node slots | O(N) | monotonic increment | view counts, likes |
 | PN-Counter | O(N) | O(2N) | increment and decrement | inventory, balances |
-| OR-Set | O(elements × dots) | O(elements × dots) | add-wins | shopping cart, tag sets |
+| OR-Set | O(elements x dots) | O(elements x dots) | add-wins | shopping cart, tag sets |
 | LWW-Register | O(1) | O(1) | last-write-wins | settings, config |
 | RGA | O(sequence length) | O(sequence length) | insertion order | collaborative text |
 
@@ -315,21 +577,20 @@ Reflection: OR-Set has add-wins semantics. Design a remove-wins variant. What ch
 Physical clocks can go backward. An NTP adjustment on node A might make its timestamp earlier than node B's, causing node B's older write to "win." HLC prevents this by advancing the logical component when physical time is tied.
 
 **2. OR-Set dots not unique across nodes**
-If two nodes use the same sequence generator (e.g., a simple integer counter starting at 1), they can generate the same dot `{A, 1}` and `{B, 1}` is not a collision, but `{A, 1}` on two different nodes is. The actor component of the dot must be unique per node.
+If two nodes use the same sequence generator, they can generate the same dot. The actor component of the dot must be unique per node.
 
 **3. RGA not handling concurrent inserts at the same anchor**
-Two nodes insert at the same position concurrently. Without a deterministic tie-breaking rule (e.g., higher actor ID wins), the two nodes produce different orderings after merge. The tie-breaking rule must be total and deterministic.
+Two nodes insert at the same position concurrently. Without a deterministic tie-breaking rule (e.g., higher actor ID wins), the two nodes produce different orderings after merge.
 
 **4. Gossip not accounting for partial state exchange**
-State-based gossip sends the full CRDT state to a random peer. For a large ORSet with millions of elements, this is expensive. Delta-CRDT gossip sends only the changes since the last exchange. Design the gossip protocol with delta-state in mind from the start.
+State-based gossip sends the full CRDT state to a random peer. For a large ORSet with millions of elements, this is expensive. Delta-CRDT gossip sends only the changes since the last exchange.
 
 ---
 
 ## Resources
 
-- Shapiro, M. et al. (2011). *A Comprehensive Study of Convergent and Commutative Replicated Data Types* — INRIA RR-7506 — the primary survey
-- Preguiça, N. et al. (2010). *Dotted Version Vectors: Logical Clocks for Optimistic Replication*
+- Shapiro, M. et al. (2011). *A Comprehensive Study of Convergent and Commutative Replicated Data Types* — INRIA RR-7506
+- Preguica, N. et al. (2010). *Dotted Version Vectors: Logical Clocks for Optimistic Replication*
 - Kulkarni, S. et al. (2014). *Logical Physical Clocks and Consistent Snapshots in Globally Distributed Databases*
-- Roh, H.G. et al. (2011). *Replicated abstract data types: Building blocks for collaborative applications* — JSS
 - [Automerge](https://github.com/automerge/automerge) — JavaScript CRDT library with RGA implementation
 - [riak_dt](https://github.com/basho/riak_dt) — Erlang/Elixir CRDT reference

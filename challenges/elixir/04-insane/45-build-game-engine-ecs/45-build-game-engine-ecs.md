@@ -4,7 +4,7 @@
 
 ## Project context
 
-Your team is prototyping a game for an internal hackathon. The game runs in a terminal — no browser, no GUI library. The first attempt used a simple loop with a big map of game state, and adding a second moving enemy required forking the entire update logic. Adding a power-up broke the renderer. The code became an inheritance tree six levels deep.
+Your team is prototyping a game for an internal hackathon. The game runs in a terminal — no browser, no GUI library. The first attempt used a simple loop with a big map of game state, and adding a second moving enemy required forking the entire update logic. Adding a power-up broke the renderer.
 
 The team switches to an Entity-Component-System (ECS) architecture. After the refactor: adding a new enemy type is two lines of component registration, adding a power-up is a new system with no changes to existing code, and the renderer is completely decoupled from game logic.
 
@@ -12,19 +12,17 @@ You will build `GameEngine`: an ECS engine with a fixed-timestep game loop, ETS-
 
 ## Why ECS and not OOP inheritance for game objects
 
-OOP inheritance for game objects produces a diamond-inheritance problem within three levels. An entity that is "a flying enemy that is also a projectile collector" either requires multiple inheritance (not available in Elixir) or a deeply nested struct with duplicated fields.
+OOP inheritance for game objects produces a diamond-inheritance problem within three levels. An entity that is "a flying enemy that is also a projectile collector" either requires multiple inheritance or a deeply nested struct with duplicated fields.
 
-ECS separates data (Components) from identity (Entities) from logic (Systems). A "flying enemy" is an entity with `%Position{}`, `%Velocity{}`, `%Gravity{}`, `%Sprite{}`, and `%EnemyAI{}` components. A "projectile collector" adds `%Collider{on_collision: &collect/2}`. No inheritance. No coupling. Systems operate on archetypes (sets of component types), not on specific entity types.
+ECS separates data (Components) from identity (Entities) from logic (Systems). A "flying enemy" is an entity with `%Position{}`, `%Velocity{}`, `%Gravity{}`, `%Sprite{}`, and `%EnemyAI{}` components. Systems operate on archetypes (sets of component types), not on specific entity types.
 
 ## Why ETS and not a GenServer for World state
 
-At 60 updates/second with dozens of entities and multiple systems each reading and writing components, a GenServer becomes a serialization bottleneck. Every `:ets.lookup` and `:ets.insert` takes ~100–500ns and does not require a process context switch. A GenServer call at 60 FPS with 10 systems and 100 entities would serialize ~600 calls/second through a single mailbox.
-
-ETS with `:public` access allows all system processes to read and write concurrently. The trade-off is that ETS transactions are per-key, not multi-key atomic — but game state updates are naturally idempotent within a single frame.
+At 60 updates/second with dozens of entities and multiple systems each reading and writing components, a GenServer becomes a serialization bottleneck. Every `:ets.lookup` and `:ets.insert` takes ~100-500ns without a process context switch. ETS with `:public` access allows all system processes to read and write concurrently.
 
 ## Why fixed timestep and not variable delta time
 
-Variable delta time (use elapsed since last frame) leads to non-deterministic physics: slow frames apply larger time steps, which can tunnel through thin colliders or cause energy gain in spring simulations. Fixed timestep (always update by 16.67ms, catch up if behind) produces deterministic, reproducible physics. The standard algorithm is Glenn Fiedler's accumulator: accumulate real elapsed time, consume in fixed chunks, interpolate remaining alpha for rendering.
+Variable delta time leads to non-deterministic physics: slow frames apply larger time steps, which can tunnel through thin colliders. Fixed timestep (always update by 16.67ms, catch up if behind) produces deterministic, reproducible physics. The standard algorithm is Glenn Fiedler's accumulator: accumulate real elapsed time, consume in fixed chunks, interpolate remaining alpha for rendering.
 
 ## Project Structure
 
@@ -33,22 +31,22 @@ game_engine/
 ├── mix.exs
 ├── lib/
 │   ├── game_engine/
-│   │   ├── world.ex           # ETS-backed entity-component store
-│   │   ├── query.ex           # Archetype queries with component-type index
-│   │   ├── engine.ex          # Game loop: fixed timestep, accumulator
+│   │   ├── world.ex
+│   │   ├── query.ex
+│   │   ├── engine.ex
 │   │   ├── systems/
-│   │   │   ├── physics.ex     # Velocity integration, gravity, AABB collision
-│   │   │   ├── render.ex      # ANSI terminal renderer, dirty tracking
-│   │   │   └── input.ex       # Raw terminal input, arrow keys, buffering
+│   │   │   ├── physics.ex
+│   │   │   ├── render.ex
+│   │   │   └── input.ex
 │   │   └── components/
-│   │       ├── position.ex    # %Position{x, y}
-│   │       ├── velocity.ex    # %Velocity{vx, vy}
-│   │       ├── sprite.ex      # %Sprite{char, fg, bg}
-│   │       ├── collider.ex    # %Collider{w, h, on_collision}
-│   │       ├── gravity.ex     # %Gravity{g}
-│   │       └── input_listener.ex  # %InputListener{keys}
+│   │       ├── position.ex
+│   │       ├── velocity.ex
+│   │       ├── sprite.ex
+│   │       ├── collider.ex
+│   │       ├── gravity.ex
+│   │       └── input_listener.ex
 │   └── games/
-│       └── snake.ex           # Snake game built on top of GameEngine
+│       └── snake.ex
 ├── test/
 │   ├── world_test.exs
 │   ├── query_test.exs
@@ -56,40 +54,42 @@ game_engine/
 │   ├── render_test.exs
 │   └── engine_test.exs
 └── lib/mix/tasks/
-    └── game.ex                # mix game.snake
+    └── game.ex
 ```
 
 ### Step 1: Components
 
 ```elixir
 defmodule GameEngine.Components.Position do
+  @moduledoc "2D position component."
   defstruct x: 0.0, y: 0.0
 end
 
 defmodule GameEngine.Components.Velocity do
+  @moduledoc "2D velocity component."
   defstruct vx: 0.0, vy: 0.0
 end
 
 defmodule GameEngine.Components.Sprite do
+  @moduledoc "Visual representation: a single character with ANSI foreground/background colors."
   @enforce_keys [:char]
   defstruct [:char, fg: 7, bg: 0]
-  # fg/bg: ANSI color codes 0-7 (0=black, 1=red, 2=green, 7=white)
 end
 
 defmodule GameEngine.Components.Collider do
+  @moduledoc "Axis-aligned bounding box collider with optional collision callback."
   defstruct w: 1, h: 1, on_collision: nil
-  # on_collision: fn(self_entity_id, other_entity_id, world) -> world
 end
 
 defmodule GameEngine.Components.Gravity do
+  @moduledoc "Gravity component: applies downward acceleration each tick."
   defstruct g: 9.8
 end
 
 defmodule GameEngine.Components.InputListener do
+  @moduledoc "Marks an entity as responsive to keyboard input."
   @enforce_keys [:keys]
   defstruct [:keys, :handler]
-  # keys: list of atoms like [:arrow_up, :arrow_down, :space]
-  # handler: fn(entity_id, key, world) -> world
 end
 ```
 
@@ -97,46 +97,67 @@ end
 
 ```elixir
 defmodule GameEngine.World do
+  @moduledoc """
+  ETS-backed entity-component store.
+  Components are stored as {entity_id, component_type} => component.
+  A secondary index table maps component_type => entity_id (bag).
+  """
+
   @components_table :ecs_components
   @index_table :ecs_index
 
   defstruct next_id: 1, systems: []
 
+  @doc "Create a new world, initializing ETS tables."
+  @spec new([module()]) :: %__MODULE__{}
   def new(systems \\ []) do
+    if :ets.whereis(@components_table) != :undefined, do: :ets.delete(@components_table)
+    if :ets.whereis(@index_table) != :undefined, do: :ets.delete(@index_table)
     :ets.new(@components_table, [:named_table, :public, :set])
     :ets.new(@index_table, [:named_table, :public, :bag])
     %__MODULE__{systems: systems}
   end
 
-  @doc "Spawn a new entity, returning {world, entity_id}"
+  @doc "Spawn a new entity, returning {world, entity_id}."
+  @spec spawn_entity(%__MODULE__{}) :: {%__MODULE__{}, pos_integer()}
   def spawn_entity(%__MODULE__{next_id: id} = world) do
     {%{world | next_id: id + 1}, id}
   end
 
-  @doc "Destroy an entity and all its components"
+  @doc "Destroy an entity and all its components."
+  @spec despawn(%__MODULE__{}, pos_integer()) :: %__MODULE__{}
   def despawn(%__MODULE__{} = world, entity_id) do
-    # TODO: find all component types for entity_id using @index_table
-    # TODO: delete from @components_table: {entity_id, component_type}
-    # TODO: delete from @index_table: {component_type, entity_id}
+    component_types =
+      :ets.match(@index_table, {:"$1", entity_id})
+      |> Enum.map(fn [type] -> type end)
+
+    Enum.each(component_types, fn type ->
+      :ets.delete(@components_table, {entity_id, type})
+      :ets.match_delete(@index_table, {type, entity_id})
+    end)
+
     world
   end
 
-  @doc "Add a component to an entity"
+  @doc "Add a component to an entity."
+  @spec add_component(%__MODULE__{}, pos_integer(), struct()) :: %__MODULE__{}
   def add_component(%__MODULE__{} = world, entity_id, component) do
     component_type = component.__struct__
-    # TODO: insert {entity_id, component_type} => component into @components_table
-    # TODO: insert {component_type, entity_id} into @index_table (bag allows duplicates)
+    :ets.insert(@components_table, {{entity_id, component_type}, component})
+    :ets.insert(@index_table, {component_type, entity_id})
     world
   end
 
-  @doc "Remove a component type from an entity"
+  @doc "Remove a component type from an entity."
+  @spec remove_component(%__MODULE__{}, pos_integer(), module()) :: %__MODULE__{}
   def remove_component(%__MODULE__{} = world, entity_id, component_type) do
-    # TODO: delete {entity_id, component_type} from @components_table
-    # TODO: delete {component_type, entity_id} from @index_table
+    :ets.delete(@components_table, {entity_id, component_type})
+    :ets.match_delete(@index_table, {component_type, entity_id})
     world
   end
 
-  @doc "Get a single component for an entity"
+  @doc "Get a single component for an entity."
+  @spec get_component(pos_integer(), module()) :: {:ok, struct()} | :not_found
   def get_component(entity_id, component_type) do
     case :ets.lookup(@components_table, {entity_id, component_type}) do
       [{_, component}] -> {:ok, component}
@@ -144,7 +165,8 @@ defmodule GameEngine.World do
     end
   end
 
-  @doc "Update a component for an entity in-place"
+  @doc "Update a component for an entity in-place."
+  @spec update_component(%__MODULE__{}, pos_integer(), struct()) :: %__MODULE__{}
   def update_component(%__MODULE__{} = world, entity_id, component) do
     :ets.insert(@components_table, {{entity_id, component.__struct__}, component})
     world
@@ -156,28 +178,61 @@ end
 
 ```elixir
 defmodule GameEngine.Query do
+  @moduledoc """
+  Archetype queries: find all entities that have ALL the given component types.
+  Uses the index table to intersect entity sets per component type.
+  """
+
   @index_table :ecs_index
   @components_table :ecs_components
 
   @doc """
-  Return all entity_ids that have ALL the given component types.
+  Return all entities that have ALL the given component types.
   Returns: [{entity_id, %{component_type => component_value}}]
   """
+  @spec query([module()]) :: [{pos_integer(), map()}]
   def query(component_types) when is_list(component_types) do
-    # TODO: for each component_type, get set of entity_ids from @index_table
-    # HINT: :ets.match(@index_table, {component_type, :"$1"}) |> Enum.map(fn [id] -> id end)
-    # TODO: intersect all sets (entities that have ALL component types)
-    # HINT: first_set = MapSet.new(ids_for_first_type)
-    #       Enum.reduce(rest, first_set, fn ids, acc -> MapSet.intersection(acc, MapSet.new(ids)) end)
-    # TODO: for each entity_id in result, fetch all requested components
-    # TODO: return [{entity_id, %{ComponentType => value, ...}}]
+    sets =
+      Enum.map(component_types, fn type ->
+        :ets.match(@index_table, {type, :"$1"})
+        |> Enum.map(fn [id] -> id end)
+        |> MapSet.new()
+      end)
+
+    case sets do
+      [] ->
+        []
+
+      [first | rest] ->
+        entity_ids = Enum.reduce(rest, first, &MapSet.intersection(&2, &1))
+
+        Enum.map(entity_ids, fn eid ->
+          components =
+            Map.new(component_types, fn type ->
+              [{_, comp}] = :ets.lookup(@components_table, {eid, type})
+              {type, comp}
+            end)
+
+          {eid, components}
+        end)
+    end
   end
 
-  @doc "Get all components for a specific entity (only the requested types)"
+  @doc "Get specific components for a single entity."
+  @spec query_one(pos_integer(), [module()]) :: {:ok, map()} | :not_found
   def query_one(entity_id, component_types) do
-    # TODO: for each type in component_types, do :ets.lookup(@components_table, {entity_id, type})
-    # TODO: if any component is missing, return :not_found
-    # TODO: else return {:ok, %{type => value}}
+    results =
+      Enum.reduce_while(component_types, %{}, fn type, acc ->
+        case :ets.lookup(@components_table, {entity_id, type}) do
+          [{_, comp}] -> {:cont, Map.put(acc, type, comp)}
+          [] -> {:halt, :not_found}
+        end
+      end)
+
+    case results do
+      :not_found -> :not_found
+      map -> {:ok, map}
+    end
   end
 end
 ```
@@ -186,10 +241,16 @@ end
 
 ```elixir
 defmodule GameEngine.Systems.Physics do
+  @moduledoc """
+  Physics system: velocity integration, gravity application,
+  and AABB collision detection.
+  """
+
   alias GameEngine.{World, Query}
   alias GameEngine.Components.{Position, Velocity, Gravity, Collider}
 
-  @doc "Update positions and apply gravity. delta_time in seconds."
+  @doc "Update positions, apply gravity, and detect collisions."
+  @spec update(%World{}, float()) :: %World{}
   def update(world, delta_time) do
     world
     |> integrate_velocity(delta_time)
@@ -198,27 +259,46 @@ defmodule GameEngine.Systems.Physics do
   end
 
   defp integrate_velocity(world, dt) do
-    # TODO: query entities with [Position, Velocity]
-    # TODO: for each: new_x = pos.x + vel.vx * dt, new_y = pos.y + vel.vy * dt
-    # TODO: World.update_component(world, id, %Position{x: new_x, y: new_y})
-    world
+    Query.query([Position, Velocity])
+    |> Enum.reduce(world, fn {id, %{Position => pos, Velocity => vel}}, w ->
+      new_pos = %Position{x: pos.x + vel.vx * dt, y: pos.y + vel.vy * dt}
+      World.update_component(w, id, new_pos)
+    end)
   end
 
   defp apply_gravity(world, dt) do
-    # TODO: query entities with [Velocity, Gravity]
-    # TODO: for each: new_vy = vel.vy + gravity.g * dt
-    # TODO: World.update_component with updated Velocity
-    world
+    Query.query([Velocity, Gravity])
+    |> Enum.reduce(world, fn {id, %{Velocity => vel, Gravity => grav}}, w ->
+      new_vel = %Velocity{vx: vel.vx, vy: vel.vy + grav.g * dt}
+      World.update_component(w, id, new_vel)
+    end)
   end
 
   defp detect_collisions(world) do
-    # TODO: query entities with [Position, Collider]
-    # TODO: for each pair (i, j), check AABB overlap:
-    #   overlap_x = abs(pos_i.x - pos_j.x) < (col_i.w + col_j.w) / 2
-    #   overlap_y = abs(pos_i.y - pos_j.y) < (col_i.h + col_j.h) / 2
-    # TODO: if both overlap: call on_collision callback if present
-    # HINT: use combination Enum.reduce to avoid checking (i,j) and (j,i)
-    world
+    entities = Query.query([Position, Collider])
+
+    pairs =
+      for {id_a, comps_a} <- entities,
+          {id_b, comps_b} <- entities,
+          id_a < id_b,
+          do: {id_a, comps_a, id_b, comps_b}
+
+    Enum.reduce(pairs, world, fn {id_a, comps_a, id_b, comps_b}, w ->
+      pos_a = comps_a[Position]
+      col_a = comps_a[Collider]
+      pos_b = comps_b[Position]
+      col_b = comps_b[Collider]
+
+      overlap_x = abs(pos_a.x - pos_b.x) < (col_a.w + col_b.w) / 2
+      overlap_y = abs(pos_a.y - pos_b.y) < (col_a.h + col_b.h) / 2
+
+      if overlap_x and overlap_y do
+        w = if col_a.on_collision, do: col_a.on_collision.(id_a, id_b, w), else: w
+        if col_b.on_collision, do: col_b.on_collision.(id_b, id_a, w), else: w
+      else
+        w
+      end
+    end)
   end
 end
 ```
@@ -227,44 +307,71 @@ end
 
 ```elixir
 defmodule GameEngine.Systems.Render do
+  @moduledoc """
+  ANSI terminal renderer with dirty tracking.
+  Only emits ANSI escape codes for cells that changed since the last frame.
+  Batches all output into a single IO.write call per frame.
+  """
+
   alias GameEngine.Query
   alias GameEngine.Components.{Position, Sprite}
 
-  # Double buffer: previous frame's {col, row} => {char, fg, bg}
   @buffer_table :render_buffer
 
+  @doc "Initialize the render buffer ETS table."
+  @spec init() :: :ok
   def init do
+    if :ets.whereis(@buffer_table) != :undefined, do: :ets.delete(@buffer_table)
     :ets.new(@buffer_table, [:named_table, :public, :set])
+    :ok
   end
 
   @doc "Render current frame. Only emit ANSI for changed cells."
+  @spec update(%GameEngine.World{}, float()) :: %GameEngine.World{}
   def update(world, _dt) do
     entities = Query.query([Position, Sprite])
-    new_buffer = Map.new(entities, fn {id, %{Position => pos, Sprite => sprite}} ->
-      {{trunc(pos.x), trunc(pos.y)}, {sprite.char, sprite.fg, sprite.bg}}
-    end)
+
+    new_buffer =
+      Map.new(entities, fn {_id, %{Position => pos, Sprite => sprite}} ->
+        {{trunc(pos.x), trunc(pos.y)}, {sprite.char, sprite.fg, sprite.bg}}
+      end)
 
     old_buffer = :ets.tab2list(@buffer_table) |> Map.new()
 
-    # TODO: find cells in old_buffer not in new_buffer → erase them (print space)
-    # TODO: find cells in new_buffer different from old_buffer → print with ANSI color
-    # TODO: build one IO string and call IO.write/1 ONCE (minimize syscalls)
-    # TODO: update @buffer_table with new_buffer
+    erased =
+      old_buffer
+      |> Map.keys()
+      |> Enum.reject(&Map.has_key?(new_buffer, &1))
+      |> Enum.map(fn {col, row} -> ansi_cell(col, row, " ", 7, 0) end)
+
+    drawn =
+      new_buffer
+      |> Enum.reject(fn {pos, cell} -> Map.get(old_buffer, pos) == cell end)
+      |> Enum.map(fn {{col, row}, {char, fg, bg}} -> ansi_cell(col, row, char, fg, bg) end)
+
+    output = IO.iodata_to_binary(erased ++ drawn)
+    if byte_size(output) > 0, do: IO.write(output)
+
+    :ets.delete_all_objects(@buffer_table)
+    Enum.each(new_buffer, fn {pos, cell} -> :ets.insert(@buffer_table, {pos, cell}) end)
 
     world
   end
 
-  @doc "Move cursor and set color; return ANSI escape string"
+  @doc "Move cursor and set color; return ANSI escape string."
+  @spec ansi_cell(integer(), integer(), String.t(), integer(), integer()) :: String.t()
   def ansi_cell(col, row, char, fg, bg) do
-    # TODO: "\e[#{row};#{col}H\e[3#{fg}m\e[4#{bg}m#{char}\e[0m"
+    "\e[#{row};#{col}H\e[3#{fg}m\e[4#{bg}m#{char}\e[0m"
   end
 
-  @doc "Clear the terminal and hide cursor"
+  @doc "Clear the terminal and hide cursor."
+  @spec clear_screen() :: :ok
   def clear_screen do
     IO.write("\e[2J\e[?25l")
   end
 
-  @doc "Show cursor and reset terminal on exit"
+  @doc "Show cursor and reset terminal on exit."
+  @spec restore_terminal() :: :ok
   def restore_terminal do
     IO.write("\e[?25h\e[0m\e[2J\e[H")
   end
@@ -275,27 +382,44 @@ end
 
 ```elixir
 defmodule GameEngine.Systems.Input do
+  @moduledoc """
+  Keyboard input system. Runs in a separate process, polling stdin
+  in raw mode and sending {:input, key} messages to the engine process.
+  """
   use GenServer
   alias GameEngine.Components.InputListener
 
-  # Runs in a separate process; reads from stdin in raw mode
-  # Sends {:key, atom} messages to the engine process
-
+  @spec start_link(pid()) :: GenServer.on_start()
   def start_link(engine_pid) do
     GenServer.start_link(__MODULE__, engine_pid, name: __MODULE__)
   end
 
+  @impl true
   def init(engine_pid) do
-    # TODO: set terminal to raw mode (platform-specific)
-    # HINT: System.cmd("stty", ["-icanon", "-echo", "min", "0", "time", "0"])
+    try do
+      System.cmd("stty", ["-icanon", "-echo", "min", "0", "time", "0"])
+    rescue
+      _ -> :ok
+    end
+
     schedule_poll()
     {:ok, %{engine: engine_pid}}
   end
 
+  @impl true
   def handle_info(:poll, state) do
     case :io.get_chars("", 3) do
-      :eof -> {:noreply, state}
-      chars ->
+      :eof ->
+        schedule_poll()
+        {:noreply, state}
+
+      chars when is_list(chars) ->
+        key = parse_key(List.to_string(chars))
+        if key, do: send(state.engine, {:input, key})
+        schedule_poll()
+        {:noreply, state}
+
+      chars when is_binary(chars) ->
         key = parse_key(chars)
         if key, do: send(state.engine, {:input, key})
         schedule_poll()
@@ -307,9 +431,9 @@ defmodule GameEngine.Systems.Input do
   defp parse_key("\e[B"), do: :arrow_down
   defp parse_key("\e[C"), do: :arrow_right
   defp parse_key("\e[D"), do: :arrow_left
-  defp parse_key(" "), do: :space
-  defp parse_key("q"), do: :quit
-  defp parse_key("\r"), do: :enter
+  defp parse_key(" " <> _), do: :space
+  defp parse_key("q" <> _), do: :quit
+  defp parse_key("\r" <> _), do: :enter
   defp parse_key(_), do: nil
 
   defp schedule_poll, do: Process.send_after(self(), :poll, 16)
@@ -320,19 +444,31 @@ end
 
 ```elixir
 defmodule GameEngine.Engine do
+  @moduledoc """
+  Fixed-timestep game loop using Glenn Fiedler's accumulator pattern.
+  Updates in fixed 16.67ms steps; renders after all steps are consumed.
+  """
+
+  alias GameEngine.{World, Query}
+  alias GameEngine.Systems.{Physics, Render}
+  alias GameEngine.Components.InputListener
+
   @fixed_step_ms 16.67
   @fixed_step_s @fixed_step_ms / 1000.0
 
+  @doc "Start the game loop."
+  @spec run(%World{}) :: :ok
   def run(world) do
-    GameEngine.Systems.Render.clear_screen()
+    Render.clear_screen()
     loop(world, 0.0, System.monotonic_time(:millisecond))
   end
 
   defp loop(world, accumulator, last_time) do
     receive do
       {:input, :quit} ->
-        GameEngine.Systems.Render.restore_terminal()
+        Render.restore_terminal()
         :ok
+
       {:input, key} ->
         new_world = handle_input(world, key)
         loop(new_world, accumulator, last_time)
@@ -342,21 +478,29 @@ defmodule GameEngine.Engine do
         elapsed = now - last_time
         new_accumulator = accumulator + elapsed
 
-        # TODO: fixed-timestep update loop
-        # while accumulator >= @fixed_step_ms:
-        #   world = run all systems with @fixed_step_s
-        #   accumulator -= @fixed_step_ms
+        {updated_world, remaining_acc} = consume_steps(world, new_accumulator)
+        _final_world = Render.update(updated_world, remaining_acc / @fixed_step_ms)
 
-        # TODO: render with alpha = accumulator / @fixed_step_ms (for interpolation)
-
-        loop(world, new_accumulator, now)
+        loop(updated_world, remaining_acc, now)
     end
   end
 
+  defp consume_steps(world, accumulator) when accumulator >= @fixed_step_ms do
+    updated_world = Physics.update(world, @fixed_step_s)
+    consume_steps(updated_world, accumulator - @fixed_step_ms)
+  end
+
+  defp consume_steps(world, accumulator), do: {world, accumulator}
+
   defp handle_input(world, key) do
-    # TODO: query entities with InputListener component
-    # TODO: for each entity, if key in listener.keys: call listener.handler.(entity_id, key, world)
-    world
+    Query.query([InputListener])
+    |> Enum.reduce(world, fn {entity_id, %{InputListener => listener}}, w ->
+      if key in listener.keys and listener.handler do
+        listener.handler.(entity_id, key, w)
+      else
+        w
+      end
+    end)
   end
 end
 ```
@@ -365,44 +509,88 @@ end
 
 ```elixir
 defmodule Games.Snake do
+  @moduledoc """
+  Snake game built on top of GameEngine ECS.
+  Demonstrates the engine with a playable terminal game.
+  """
+
   alias GameEngine.{World, Engine}
   alias GameEngine.Components.{Position, Sprite, InputListener}
 
   @board_w 40
   @board_h 20
 
+  @doc "Start the Snake game."
+  @spec start() :: :ok
   def start do
+    GameEngine.Systems.Render.init()
     world = World.new([])
     world = setup_board(world)
     {world, snake_head_id} = spawn_snake(world)
     {world, _food_id} = spawn_food(world)
-    world = World.add_component(world, snake_head_id, %InputListener{
-      keys: [:arrow_up, :arrow_down, :arrow_left, :arrow_right],
-      handler: &handle_input/3
-    })
+
+    world =
+      World.add_component(world, snake_head_id, %InputListener{
+        keys: [:arrow_up, :arrow_down, :arrow_left, :arrow_right],
+        handler: &handle_input/3
+      })
+
     Engine.run(world)
   end
 
   defp spawn_snake(world) do
-    # TODO: spawn an entity with Position at center, Sprite of "@" in green
-    # TODO: store snake body positions in process dictionary or a dedicated component
-    # Snake state: direction (dx, dy), body list [{x, y}]
+    {world, id} = World.spawn_entity(world)
+    center_x = div(@board_w, 2) * 1.0
+    center_y = div(@board_h, 2) * 1.0
+    world = World.add_component(world, id, %Position{x: center_x, y: center_y})
+    world = World.add_component(world, id, %Sprite{char: "@", fg: 2, bg: 0})
+
+    Process.put(:snake_direction, {1.0, 0.0})
+    Process.put(:snake_body, [{center_x, center_y}])
+    Process.put(:snake_length, 3)
+
+    {world, id}
   end
 
   defp spawn_food(world) do
-    # TODO: spawn entity with Position at random, Sprite of "*" in red
-    {world, nil}
+    {world, id} = World.spawn_entity(world)
+    food_x = (:rand.uniform(@board_w - 2) + 1) * 1.0
+    food_y = (:rand.uniform(@board_h - 2) + 1) * 1.0
+    world = World.add_component(world, id, %Position{x: food_x, y: food_y})
+    world = World.add_component(world, id, %Sprite{char: "*", fg: 1, bg: 0})
+    {world, id}
   end
 
-  defp handle_input(entity_id, key, world) do
-    # TODO: change snake direction based on key (prevent reversing)
-    # TODO: store new direction in a component or process state
+  defp handle_input(_entity_id, key, world) do
+    {dx, dy} = Process.get(:snake_direction, {1.0, 0.0})
+
+    new_dir =
+      case key do
+        :arrow_up when dy != 1.0 -> {0.0, -1.0}
+        :arrow_down when dy != -1.0 -> {0.0, 1.0}
+        :arrow_left when dx != 1.0 -> {-1.0, 0.0}
+        :arrow_right when dx != -1.0 -> {1.0, 0.0}
+        _ -> {dx, dy}
+      end
+
+    Process.put(:snake_direction, new_dir)
     world
   end
 
   defp setup_board(world) do
-    # TODO: spawn border entities (walls) as Sprite "#" in white around @board_w x @board_h
-    world
+    positions =
+      for col <- 0..(@board_w - 1), row <- [0, @board_h - 1] do
+        {col * 1.0, row * 1.0}
+      end ++
+        for row <- 1..(@board_h - 2), col <- [0, @board_w - 1] do
+          {col * 1.0, row * 1.0}
+        end
+
+    Enum.reduce(positions, world, fn {x, y}, w ->
+      {w, id} = World.spawn_entity(w)
+      w = World.add_component(w, id, %Position{x: x, y: y})
+      World.add_component(w, id, %Sprite{char: "#", fg: 7, bg: 0})
+    end)
   end
 end
 ```
@@ -417,7 +605,6 @@ defmodule GameEngine.WorldTest do
   alias GameEngine.Components.{Position, Velocity}
 
   setup do
-    # Clean up ETS tables between tests
     try do :ets.delete(:ecs_components) rescue _ -> :ok end
     try do :ets.delete(:ecs_index) rescue _ -> :ok end
     :ok
@@ -478,9 +665,7 @@ defmodule GameEngine.QueryTest do
     world = World.add_component(world, id1, %Position{x: 1.0, y: 0.0})
     world = World.add_component(world, id1, %Velocity{vx: 1.0, vy: 0.0})
     world = World.add_component(world, id2, %Position{x: 2.0, y: 0.0})
-    # id2 has no Velocity
     world = World.add_component(world, id3, %Velocity{vx: 0.0, vy: 1.0})
-    # id3 has no Position
 
     results = Query.query([Position, Velocity])
     ids = Enum.map(results, fn {id, _} -> id end)
@@ -549,29 +734,28 @@ end
 | Design | Selected | Alternative | Trade-off |
 |---|---|---|---|
 | World storage | ETS public set | GenServer state | ETS ~100ns/lookup; GenServer adds process context switch per read |
-| Component index | ETS bag per type | Linear scan | Index intersection O(min entity count); scan O(total entities × systems) |
+| Component index | ETS bag per type | Linear scan | Index intersection O(min entity count); scan O(total entities x systems) |
 | Render strategy | Dirty tracking (diff frames) | Full clear per frame | Full clear flickers; dirty tracking draws only changed cells |
-| Input reading | Separate process polling 16ms | Blocking `:io.gets` | Blocking `:io.gets` stalls the game loop; separate process keeps loop unblocked |
-| Fixed timestep | Fiedler accumulator | Variable delta | Variable delta: different hardware → different physics; fixed: deterministic |
+| Input reading | Separate process polling 16ms | Blocking `:io.gets` | Blocking stalls the game loop; separate process keeps loop unblocked |
+| Fixed timestep | Fiedler accumulator | Variable delta | Variable delta: different hardware = different physics; fixed: deterministic |
 | ANSI output | Single `IO.write` per frame | One write per cell | Batching reduces syscalls from N_changed to 1 per frame |
 
 ## Common production mistakes
 
-**Forgetting to restore terminal on crash.** If the game crashes with the terminal in raw mode, the user's shell becomes unusable (no echo, no line buffering). Always use `Process.flag(:trap_exit, true)` and restore in `terminate/2`. Also catch `System.stop/1` signals.
+**Forgetting to restore terminal on crash.** If the game crashes with the terminal in raw mode, the user's shell becomes unusable. Always use `Process.flag(:trap_exit, true)` and restore in `terminate/2`.
 
-**Not batching ANSI output.** Calling `IO.write` for each changed cell at 60 FPS with 100 entities generates 6000 syscalls per second. Buffer all changes into a single string with `IO.iodata_to_binary/1` and write once per frame.
+**Not batching ANSI output.** Calling `IO.write` for each changed cell at 60 FPS with 100 entities generates 6000 syscalls per second. Buffer all changes into a single string and write once per frame.
 
-**ETS dirty reads in physics.** When the PhysicsSystem reads a Position, updates it, reads another entity's Position, updates it, the second entity may be reading a position that the first entity's collision callback just modified. For game-speed ECS this is acceptable but document the behavior: systems observe a mix of pre-update and post-update state within a single tick. Truly consistent reads require double-buffering the component state (read from buffer A, write to buffer B, swap at tick end).
+**ETS dirty reads in physics.** When the PhysicsSystem reads a Position, updates it, reads another entity's Position, the second may see partially updated state. For game-speed ECS this is acceptable but document the behavior.
 
-**Ignoring BEAM scheduler preemption in the game loop.** The BEAM preempts processes at reduction boundaries (~2000 reductions). A compute-heavy physics system may be preempted mid-tick, causing the next `render` call to use partially updated state. This manifests as occasional visual glitches. Mitigate by keeping system update functions short and using `:erlang.yield/0` at safe checkpoints.
+**Ignoring BEAM scheduler preemption in the game loop.** The BEAM preempts processes at reduction boundaries (~2000 reductions). A compute-heavy physics system may be preempted mid-tick, causing visual glitches. Keep system update functions short.
 
-**Not randomizing food spawn position using a seeded generator.** `:rand.uniform/1` in tests produces different food positions on every run, making snapshot tests flaky. Pass an explicit seed via `Application.get_env` or a system argument for reproducible test runs.
+**Not randomizing food spawn using a seeded generator.** `:rand.uniform/1` in tests produces different positions on every run, making snapshot tests flaky. Pass an explicit seed for reproducible test runs.
 
 ## Resources
 
-- Nystrom — "Game Programming Patterns" — https://gameprogrammingpatterns.com/ (free online; Chapter 12: Component)
-- Fiedler — "Fix Your Timestep!" — https://gafferongames.com/post/fix_your_timestep/ (definitive accumulator algorithm)
-- ANSI Escape Codes — https://en.wikipedia.org/wiki/ANSI_escape_code (cursor positioning, color codes)
-- Stoyan Nikolov — "OOP Is Dead, Long Live Data-Oriented Design" (CppCon 2018) — applies to ECS design reasoning
-- Erlang `:ets` documentation — https://www.erlang.org/doc/man/ets.html (`:bag`, `match`, `select`)
-- Erlang `:io` documentation — https://www.erlang.org/doc/man/io.html (`get_chars`, `setopts`)
+- Nystrom -- "Game Programming Patterns" -- https://gameprogrammingpatterns.com/ (Chapter 12: Component)
+- Fiedler -- "Fix Your Timestep!" -- https://gafferongames.com/post/fix_your_timestep/
+- ANSI Escape Codes -- https://en.wikipedia.org/wiki/ANSI_escape_code
+- Erlang `:ets` documentation -- https://www.erlang.org/doc/man/ets.html
+- Erlang `:io` documentation -- https://www.erlang.org/doc/man/io.html

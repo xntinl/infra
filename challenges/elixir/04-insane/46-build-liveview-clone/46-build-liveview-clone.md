@@ -4,23 +4,23 @@
 
 ## Project context
 
-Your team is building a dashboard that shows live telemetry from a fleet of IoT sensors — thousands of readings per second. The first iteration used a React SPA polling an API every second. The result: 10,000 concurrent browser clients × 1 API call/second = 10k HTTP requests/second sustained, each requiring auth, serialization, and full state transfer.
+Your team is building a dashboard that shows live telemetry from a fleet of IoT sensors — thousands of readings per second. The first iteration used a React SPA polling an API every second. The result: 10,000 concurrent browser clients x 1 API call/second = 10k HTTP requests/second sustained, each requiring auth, serialization, and full state transfer.
 
-The team proposes a server-driven UI model: each browser holds one WebSocket connection to a stateful server process. When a sensor reading changes, the server computes a DOM diff and sends only the delta. The browser applies the patch. No polling. No full state transfer. Client JavaScript is a runtime of ~5KB.
+The team proposes a server-driven UI model: each browser holds one WebSocket connection to a stateful server process. When a sensor reading changes, the server computes a DOM diff and sends only the delta. No polling. No full state transfer. Client JavaScript is a runtime of ~5KB.
 
 You will build `Vivo`: a Phoenix LiveView-equivalent framework. One GenServer per connection holds view state. A compile-time template DSL separates static HTML (sent once) from dynamic expressions (diffed per update). The benchmark target is 10,000 concurrent connections with memory overhead under 10MB above baseline.
 
 ## Why a GenServer per connection and not a single shared process
 
-LiveView's process-per-connection model maps naturally to the BEAM's cheap process model. A minimal GenServer with no heap data costs ~3KB of memory. 10,000 connections × 3KB = 30MB, well within limits. The advantage: failure isolation. A crash in one user's view process does not affect any other user. A shared process would serialize all view updates through one mailbox, capping throughput at ~1M msg/s on one core, and a bug affecting one user's state corrupts everyone.
+LiveView's process-per-connection model maps to the BEAM's cheap process model. A minimal GenServer with no heap data costs ~3KB of memory. 10,000 connections x 3KB = 30MB. The advantage: failure isolation. A crash in one user's view process does not affect any other user.
 
 ## Why compile-time template parsing matters for diffing
 
-If you render templates as strings, diffing requires parsing HTML at runtime on every update — O(HTML size) per diff. LiveView's insight: at compile time, separate the template into static parts (never change) and dynamic slots (expressions that may change). The render function returns a struct like `{static: ["<div>", "</div>"], dynamic: [expr1, expr2]}`. The diff is O(dynamic slots), not O(HTML size). Static parts are sent once on connect; subsequent updates send only changed dynamic values.
+If you render templates as strings, diffing requires parsing HTML at runtime on every update — O(HTML size) per diff. At compile time, separate the template into static parts (never change) and dynamic slots (expressions that may change). The diff is O(dynamic slots), not O(HTML size). Static parts are sent once on connect; subsequent updates send only changed dynamic values.
 
 ## Why structural tree diffing and not string diff
 
-String diff (Myers' algorithm) finds the minimum edit distance between two strings. For HTML, a one-character change in an attribute might require inserting and deleting many bytes across the string diff. Structural diff operates on the parsed DOM tree: if the tag, attributes, and children are unchanged, the node is identical regardless of its position in the string. This produces semantically correct patches (no attribute-order artifacts) and enables keyed list reordering.
+String diff (Myers' algorithm) finds minimum edit distance between two strings. Structural diff operates on the parsed DOM tree: if the tag, attributes, and children are unchanged, the node is identical. This produces semantically correct patches and enables keyed list reordering.
 
 ## Project Structure
 
@@ -29,33 +29,33 @@ vivo/
 ├── mix.exs
 ├── lib/
 │   ├── vivo/
-│   │   ├── socket.ex          # WebSocket handshake (RFC 6455) + channel multiplexing
-│   │   ├── channel.ex         # Topic routing, join/leave, push/reply protocol
-│   │   ├── live_view.ex       # Behaviour: mount/3, render/1, handle_event/3, handle_info/2
-│   │   ├── live_component.ex  # Behaviour: mount/1, update/2, render/1, handle_event/3
-│   │   ├── process.ex         # GenServer per connection: assigns, lifecycle
+│   │   ├── socket.ex
+│   │   ├── channel.ex
+│   │   ├── live_view.ex
+│   │   ├── live_component.ex
+│   │   ├── process.ex
 │   │   ├── template/
-│   │   │   ├── compiler.ex    # Compile-time parser: static/dynamic split
-│   │   │   ├── engine.ex      # EEx engine extension for ~LV sigil
-│   │   │   └── rendered.ex    # %Rendered{static: [...], dynamic: [...]} struct
+│   │   │   ├── compiler.ex
+│   │   │   ├── engine.ex
+│   │   │   └── rendered.ex
 │   │   ├── diff/
-│   │   │   ├── tree.ex        # DOM tree struct: tag, attrs, children
-│   │   │   ├── diff.ex        # Structural tree diff: compute patch
-│   │   │   └── patch.ex       # Patch serialization to JSON/binary
-│   │   └── js_bridge.ex       # push_event/3, phx-* event routing
+│   │   │   ├── tree.ex
+│   │   │   ├── diff.ex
+│   │   │   └── patch.ex
+│   │   └── js_bridge.ex
 │   ├── vivo.ex
 │   └── vivo_web/
 │       └── static/
-│           └── vivo.js        # Thin client runtime (~5KB)
+│           └── vivo.js
 ├── test/
 │   ├── socket_test.exs
 │   ├── diff_test.exs
 │   ├── template_test.exs
 │   ├── live_view_test.exs
 │   └── property/
-│       └── diff_property_test.exs   # StreamData-based diff correctness
+│       └── diff_property_test.exs
 └── bench/
-    └── connections.exs        # 10k concurrent connection benchmark
+    └── connections.exs
 ```
 
 ### Step 1: WebSocket channel protocol
@@ -63,50 +63,142 @@ vivo/
 ```elixir
 defmodule Vivo.Socket do
   @moduledoc """
-  Manages a single WebSocket connection.
+  WebSocket connection manager.
   Handles: handshake upgrade, framing (RFC 6455), channel multiplexing.
   """
 
   @magic_guid "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
-  @doc "Compute WebSocket accept key from Sec-WebSocket-Key header"
+  @doc "Compute WebSocket accept key from Sec-WebSocket-Key header."
+  @spec accept_key(String.t()) :: String.t()
   def accept_key(client_key) do
-    # TODO: client_key <> @magic_guid |> then(&:crypto.hash(:sha, &1)) |> Base.encode64()
+    (client_key <> @magic_guid)
+    |> then(&:crypto.hash(:sha, &1))
+    |> Base.encode64()
   end
 
-  @doc "Parse a WebSocket frame from binary. Returns {opcode, payload, rest}."
-  def parse_frame(<<fin::1, _rsv::3, opcode::4, mask::1, payload_len::7, rest::binary>>) do
-    # TODO: handle payload_len == 126 (next 2 bytes) and 127 (next 8 bytes)
-    # TODO: if mask == 1, read 4-byte masking key, unmask payload
-    # TODO: return {:ok, opcode, payload, remaining_binary}
-    # Opcodes: 0x1 = text, 0x2 = binary, 0x8 = close, 0x9 = ping, 0xA = pong
+  @doc """
+  Parse a WebSocket frame from binary.
+  Returns {:ok, opcode, payload, rest} or {:error, reason}.
+  Opcodes: 0x1 = text, 0x2 = binary, 0x8 = close, 0x9 = ping, 0xA = pong.
+  """
+  @spec parse_frame(binary()) :: {:ok, integer(), binary(), binary()} | {:error, atom()}
+  def parse_frame(<<_fin::1, _rsv::3, opcode::4, 1::1, 126::7, len::16, mask::binary-size(4), rest::binary>>) do
+    <<payload::binary-size(len), remaining::binary>> = rest
+    {:ok, opcode, unmask(payload, mask), remaining}
   end
 
-  @doc "Build a server-to-client WebSocket frame (no masking for server frames)"
+  def parse_frame(<<_fin::1, _rsv::3, opcode::4, 1::1, 127::7, len::64, mask::binary-size(4), rest::binary>>) do
+    <<payload::binary-size(len), remaining::binary>> = rest
+    {:ok, opcode, unmask(payload, mask), remaining}
+  end
+
+  def parse_frame(<<_fin::1, _rsv::3, opcode::4, 1::1, len::7, mask::binary-size(4), rest::binary>>)
+      when len < 126 do
+    <<payload::binary-size(len), remaining::binary>> = rest
+    {:ok, opcode, unmask(payload, mask), remaining}
+  end
+
+  def parse_frame(<<_fin::1, _rsv::3, opcode::4, 0::1, 126::7, len::16, rest::binary>>) do
+    <<payload::binary-size(len), remaining::binary>> = rest
+    {:ok, opcode, payload, remaining}
+  end
+
+  def parse_frame(<<_fin::1, _rsv::3, opcode::4, 0::1, 127::7, len::64, rest::binary>>) do
+    <<payload::binary-size(len), remaining::binary>> = rest
+    {:ok, opcode, payload, remaining}
+  end
+
+  def parse_frame(<<_fin::1, _rsv::3, opcode::4, 0::1, len::7, rest::binary>>)
+      when len < 126 do
+    <<payload::binary-size(len), remaining::binary>> = rest
+    {:ok, opcode, payload, remaining}
+  end
+
+  def parse_frame(_), do: {:error, :incomplete}
+
+  @doc "Build a server-to-client WebSocket frame (no masking for server frames)."
+  @spec build_frame(integer(), binary()) :: binary()
   def build_frame(opcode, payload) when is_binary(payload) do
-    # TODO: encode as <<1::1, 0::3, opcode::4, 0::1, byte_size(payload)::7, payload::binary>>
-    # TODO: handle lengths > 125 (use extended length fields)
+    len = byte_size(payload)
+
+    cond do
+      len < 126 ->
+        <<1::1, 0::3, opcode::4, 0::1, len::7, payload::binary>>
+
+      len < 65536 ->
+        <<1::1, 0::3, opcode::4, 0::1, 126::7, len::16, payload::binary>>
+
+      true ->
+        <<1::1, 0::3, opcode::4, 0::1, 127::7, len::64, payload::binary>>
+    end
+  end
+
+  defp unmask(payload, mask_key) do
+    mask_bytes = :binary.bin_to_list(mask_key)
+
+    payload
+    |> :binary.bin_to_list()
+    |> Enum.with_index()
+    |> Enum.map(fn {byte, i} -> Bitwise.bxor(byte, Enum.at(mask_bytes, rem(i, 4))) end)
+    |> :binary.list_to_bin()
+  end
+end
+
+defmodule Vivo.Socket.Helpers do
+  @moduledoc "Helper functions available inside LiveView modules."
+
+  @doc "Assign one or more key-value pairs to the socket."
+  @spec assign(map(), keyword() | map()) :: map()
+  def assign(socket, key_values) when is_list(key_values) or is_map(key_values) do
+    new_assigns = Enum.into(key_values, socket.assigns)
+    %{socket | assigns: new_assigns}
+  end
+
+  @doc "Assign a single key-value pair."
+  @spec assign(map(), atom(), term()) :: map()
+  def assign(socket, key, value) do
+    %{socket | assigns: Map.put(socket.assigns, key, value)}
+  end
+
+  @doc "Push a client-side event."
+  @spec push_event(map(), String.t(), map()) :: map()
+  def push_event(socket, event, payload) do
+    events = Map.get(socket, :push_events, [])
+    Map.put(socket, :push_events, [{event, payload} | events])
   end
 end
 
 defmodule Vivo.Channel do
-  @doc """
-  Phoenix channel protocol:
+  @moduledoc """
+  Phoenix channel protocol implementation.
   Client sends: [join_ref, message_ref, topic, event, payload]
   Server sends: [join_ref, message_ref, topic, event, payload]
-  Events: "phx_join", "phx_leave", "phx_reply", "phx_error", "phx_heartbeat"
   """
 
+  @doc "Handle an incoming channel message and route it appropriately."
+  @spec handle_message(pid(), list()) :: :ok
   def handle_message(conn_pid, [join_ref, msg_ref, topic, event, payload]) do
-    # TODO: route to appropriate LiveView process based on topic
-    # TODO: "phx_join" → spawn LiveView process, call mount/3
-    # TODO: "phx_heartbeat" → reply with {nil, msg_ref, "phoenix", "phx_reply", %{status: "ok"}}
-    # TODO: other events → forward to LiveView process
+    case event do
+      "phx_join" ->
+        send(conn_pid, {:send_frame, Jason.encode!([join_ref, msg_ref, topic, "phx_reply", %{status: "ok"}])})
+
+      "phx_heartbeat" ->
+        send(conn_pid, {:send_frame, Jason.encode!([nil, msg_ref, "phoenix", "phx_reply", %{status: "ok"}])})
+
+      other_event ->
+        send(conn_pid, {:channel_event, topic, other_event, payload})
+    end
+
+    :ok
   end
 
+  @doc "Push an event to the client on the given topic."
+  @spec push(pid(), String.t(), String.t(), map()) :: :ok
   def push(conn_pid, topic, event, payload) do
-    # TODO: encode as JSON: [nil, nil, topic, event, payload]
-    # TODO: send as WebSocket text frame
+    frame = Jason.encode!([nil, nil, topic, event, payload])
+    send(conn_pid, {:send_frame, frame})
+    :ok
   end
 end
 ```
@@ -115,19 +207,21 @@ end
 
 ```elixir
 defmodule Vivo.LiveView do
+  @moduledoc "Behaviour for server-rendered live views."
+
   @callback mount(params :: map(), session :: map(), socket :: map()) ::
-    {:ok, socket :: map()} | {:error, reason :: term()}
+              {:ok, socket :: map()} | {:error, reason :: term()}
 
   @callback render(assigns :: map()) :: Vivo.Template.Rendered.t()
 
   @callback handle_event(event :: String.t(), payload :: map(), socket :: map()) ::
-    {:noreply, socket :: map()} | {:reply, map(), socket :: map()}
+              {:noreply, socket :: map()} | {:reply, map(), socket :: map()}
 
   @callback handle_info(msg :: term(), socket :: map()) ::
-    {:noreply, socket :: map()}
+              {:noreply, socket :: map()}
 
   @callback handle_params(params :: map(), uri :: String.t(), socket :: map()) ::
-    {:noreply, socket :: map()}
+              {:noreply, socket :: map()}
 
   @optional_callbacks [handle_event: 3, handle_info: 2, handle_params: 3]
 
@@ -135,6 +229,7 @@ defmodule Vivo.LiveView do
     quote do
       @behaviour Vivo.LiveView
       import Vivo.Socket.Helpers, only: [assign: 2, assign: 3, push_event: 3]
+
       def handle_event(_event, _params, socket), do: {:noreply, socket}
       def handle_info(_msg, socket), do: {:noreply, socket}
       def handle_params(_params, _uri, socket), do: {:noreply, socket}
@@ -144,14 +239,21 @@ defmodule Vivo.LiveView do
 end
 
 defmodule Vivo.Process do
+  @moduledoc """
+  GenServer per connection. Holds assigns, manages lifecycle,
+  computes diffs on state change, and pushes updates to the socket.
+  """
   use GenServer
 
-  # State: %{module, assigns, rendered, socket_pid, topic}
+  alias Vivo.Template.Rendered
+  alias Vivo.Diff.Diff
 
+  @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts) do
     GenServer.start_link(__MODULE__, opts)
   end
 
+  @impl true
   def init(opts) do
     module = Keyword.fetch!(opts, :module)
     socket_pid = Keyword.fetch!(opts, :socket_pid)
@@ -159,27 +261,41 @@ defmodule Vivo.Process do
     session = Keyword.get(opts, :session, %{})
 
     socket = %{assigns: %{}, module: module, pid: self()}
+
     case module.mount(params, session, socket) do
       {:ok, new_socket} ->
         rendered = module.render(new_socket.assigns)
-        # TODO: send initial render to client (full static + dynamic)
-        {:ok, %{module: module, assigns: new_socket.assigns, rendered: rendered, socket_pid: socket_pid}}
+        html = Rendered.to_html(rendered)
+        send(socket_pid, {:initial_render, html})
+
+        {:ok,
+         %{
+           module: module,
+           assigns: new_socket.assigns,
+           rendered: rendered,
+           socket_pid: socket_pid
+         }}
+
       {:error, reason} ->
         {:stop, reason}
     end
   end
 
+  @impl true
   def handle_cast({:event, event, payload}, state) do
     socket = %{assigns: state.assigns, module: state.module, pid: self()}
+
     case state.module.handle_event(event, payload, socket) do
       {:noreply, new_socket} ->
         maybe_diff_and_push(state, new_socket)
+
       {:reply, reply_payload, new_socket} ->
-        # TODO: send reply to client
+        send(state.socket_pid, {:reply, reply_payload})
         maybe_diff_and_push(state, new_socket)
     end
   end
 
+  @impl true
   def handle_info(msg, state) do
     socket = %{assigns: state.assigns, module: state.module, pid: self()}
     {:noreply, new_socket} = state.module.handle_info(msg, socket)
@@ -188,9 +304,12 @@ defmodule Vivo.Process do
 
   defp maybe_diff_and_push(state, new_socket) do
     new_rendered = state.module.render(new_socket.assigns)
-    # TODO: compute diff between state.rendered and new_rendered
-    # TODO: if diff is non-empty, push to socket_pid
-    # TODO: update state with new assigns and rendered
+    diff = Diff.compute(state.rendered, new_rendered)
+
+    if map_size(diff) > 0 do
+      send(state.socket_pid, {:diff, diff})
+    end
+
     {:noreply, %{state | assigns: new_socket.assigns, rendered: new_rendered}}
   end
 end
@@ -199,40 +318,103 @@ end
 ### Step 3: Compile-time template DSL
 
 ```elixir
-defmodule Vivo.Template.Engine do
+defmodule Vivo.Template.Rendered do
   @moduledoc """
-  EEx engine that separates static HTML from dynamic expressions.
-  Produces a %Rendered{static: [binary], dynamic: [expr]} struct.
+  Struct representing a pre-split template: static parts that never change
+  and dynamic parts that are diffed on each re-render.
   """
 
-  # At compile time, the template "<div><%= @name %></div>" becomes:
-  # %Rendered{static: ["<div>", "</div>"], dynamic: [assigns.name]}
-  # This means only the dynamic parts need to be diffed on re-render.
-
-  @doc "Compile a template string into a %Rendered{} AST at compile time"
-  defmacro sigil_LV({:<<>>, _meta, [template]}, _modifiers) do
-    # TODO: parse template string at compile time
-    # TODO: split into static segments and dynamic expression ASTs
-    # TODO: generate code that constructs %Rendered{static: [...], dynamic: [...]}
-    # HINT: use EEx.compile_string/2 with custom engine module
-    # HINT: custom engine accumulates {static_parts, dynamic_exprs} instead of concat string
-  end
-end
-
-defmodule Vivo.Template.Rendered do
   @enforce_keys [:static, :dynamic]
   defstruct [:static, :dynamic, :components]
 
   @type t :: %__MODULE__{
-    static: [binary()],
-    dynamic: [binary() | t()],    # nested for components
-    components: map() | nil
-  }
+          static: [binary()],
+          dynamic: [binary() | t()],
+          components: map() | nil
+        }
 
-  @doc "Render to full HTML string (for initial page load)"
+  @doc """
+  Render to full HTML string by interleaving static and dynamic parts.
+  static: ["<div>", "</div>"], dynamic: ["Alice"] => "<div>Alice</div>"
+  """
+  @spec to_html(t()) :: String.t()
   def to_html(%__MODULE__{static: static, dynamic: dynamic}) do
-    # TODO: interleave static and dynamic parts into one string
-    # static: ["<div>", "</div>"], dynamic: ["Alice"] → "<div>Alice</div>"
+    interleave(static, dynamic, [])
+    |> IO.iodata_to_binary()
+  end
+
+  defp interleave([s], [], acc), do: Enum.reverse([s | acc])
+  defp interleave([s | ss], [d | ds], acc) do
+    d_str =
+      case d do
+        %__MODULE__{} = nested -> to_html(nested)
+        other -> to_string(other)
+      end
+
+    interleave(ss, ds, [d_str, s | acc])
+  end
+
+  defp interleave([], _, acc), do: Enum.reverse(acc)
+end
+
+defmodule Vivo.Template.Engine do
+  @moduledoc """
+  Compile-time template engine. The ~LV sigil splits a template string
+  into static HTML parts and dynamic expression parts, producing a
+  %Rendered{} struct. Only dynamic parts are diffed on re-render.
+  """
+
+  @doc """
+  Sigil that compiles a template string into a %Rendered{} struct at compile time.
+  Static parts are literal strings; dynamic parts are EEx expressions (<%= ... %>).
+  """
+  defmacro sigil_LV({:<<>>, _meta, [template]}, _modifiers) do
+    {static_parts, dynamic_exprs} = parse_template(template)
+
+    dynamic_ast =
+      Enum.map(dynamic_exprs, fn expr_str ->
+        Code.string_to_quoted!(expr_str)
+      end)
+
+    quote do
+      %Vivo.Template.Rendered{
+        static: unquote(static_parts),
+        dynamic: unquote(dynamic_ast)
+      }
+    end
+  end
+
+  defp parse_template(template) do
+    parse_template(template, [], [], "")
+  end
+
+  defp parse_template("", static_parts, dynamic_exprs, current_static) do
+    {Enum.reverse([current_static | static_parts]), Enum.reverse(dynamic_exprs)}
+  end
+
+  defp parse_template("<%=" <> rest, static_parts, dynamic_exprs, current_static) do
+    case String.split(rest, "%>", parts: 2) do
+      [expr, remaining] ->
+        expr = String.trim(expr)
+        expr = String.replace(expr, "@", "assigns.")
+
+        parse_template(
+          remaining,
+          [current_static | static_parts],
+          [expr | dynamic_exprs],
+          ""
+        )
+
+      [_no_closing] ->
+        raise CompileError,
+          description: "unclosed EEx expression at line 1",
+          line: 1,
+          file: "template"
+    end
+  end
+
+  defp parse_template(<<char::utf8, rest::binary>>, static_parts, dynamic_exprs, current_static) do
+    parse_template(rest, static_parts, dynamic_exprs, current_static <> <<char::utf8>>)
   end
 end
 ```
@@ -241,25 +423,126 @@ end
 
 ```elixir
 defmodule Vivo.Diff.Tree do
+  @moduledoc "Minimal HTML tree representation for structural diffing."
+
   defstruct tag: nil, attrs: %{}, children: [], text: nil, key: nil
 
-  @doc "Parse an HTML string into a tree. Minimal: supports tag, attributes, text, nesting."
+  @doc "Parse an HTML string into a tree of nodes."
+  @spec parse(String.t()) :: %__MODULE__{} | nil
   def parse(html) when is_binary(html) do
-    # TODO: tokenize html into [{:open_tag, tag, attrs}, {:text, content}, {:close_tag, tag}]
-    # TODO: build tree recursively from token stream
-    # HINT: use a stack-based approach; push on open_tag, pop and add child on close_tag
+    tokens = tokenize(html, [])
+    {tree, _rest} = build_tree(tokens)
+    tree
+  end
+
+  defp tokenize("", acc), do: Enum.reverse(acc)
+
+  defp tokenize("</" <> rest, acc) do
+    case String.split(rest, ">", parts: 2) do
+      [tag_name, remaining] ->
+        tokenize(remaining, [{:close_tag, String.trim(tag_name)} | acc])
+
+      _ ->
+        Enum.reverse(acc)
+    end
+  end
+
+  defp tokenize("<" <> rest, acc) do
+    case String.split(rest, ">", parts: 2) do
+      [tag_content, remaining] ->
+        {tag_name, attrs} = parse_tag_content(String.trim(tag_content))
+        tokenize(remaining, [{:open_tag, tag_name, attrs} | acc])
+
+      _ ->
+        Enum.reverse(acc)
+    end
+  end
+
+  defp tokenize(html, acc) do
+    case String.split(html, "<", parts: 2) do
+      [text, rest] ->
+        trimmed = String.trim(text)
+
+        if trimmed != "" do
+          tokenize("<" <> rest, [{:text, trimmed} | acc])
+        else
+          tokenize("<" <> rest, acc)
+        end
+
+      [text] ->
+        trimmed = String.trim(text)
+
+        if trimmed != "" do
+          Enum.reverse([{:text, trimmed} | acc])
+        else
+          Enum.reverse(acc)
+        end
+    end
+  end
+
+  defp parse_tag_content(content) do
+    [tag_name | attr_parts] = String.split(content, ~r/\s+/, trim: true)
+
+    attrs =
+      Enum.reduce(attr_parts, %{}, fn part, acc ->
+        case String.split(part, "=", parts: 2) do
+          [key, value] -> Map.put(acc, key, String.trim(value, "\""))
+          [key] -> Map.put(acc, key, "true")
+        end
+      end)
+
+    {tag_name, attrs}
+  end
+
+  defp build_tree([{:open_tag, tag, attrs} | rest]) do
+    {children, rest2} = build_children(rest, tag, [])
+    key = Map.get(attrs, "key")
+    node = %__MODULE__{tag: tag, attrs: attrs, children: children, key: key}
+    {node, rest2}
+  end
+
+  defp build_tree([{:text, text} | rest]) do
+    {%__MODULE__{text: text}, rest}
+  end
+
+  defp build_tree([]) do
+    {nil, []}
+  end
+
+  defp build_children([{:close_tag, tag} | rest], tag, acc) do
+    {Enum.reverse(acc), rest}
+  end
+
+  defp build_children([], _tag, acc) do
+    {Enum.reverse(acc), []}
+  end
+
+  defp build_children(tokens, tag, acc) do
+    {child, rest} = build_tree(tokens)
+
+    if child do
+      build_children(rest, tag, [child | acc])
+    else
+      {Enum.reverse(acc), rest}
+    end
   end
 end
 
 defmodule Vivo.Diff.Diff do
+  @moduledoc """
+  Diff engine for the template system. Operates on %Rendered{} structs,
+  comparing dynamic slots by index. Returns a patch map of changed indices.
+  Also supports structural tree diffing for DOM-level changes.
+  """
+
   alias Vivo.Diff.Tree
   alias Vivo.Template.Rendered
 
   @doc """
   Compute a diff between two %Rendered{} structs.
   Returns a patch map: %{slot_index => new_value} for changed dynamic slots.
-  Nested components tracked separately.
   """
+  @spec compute(%Rendered{}, %Rendered{}) :: map()
   def compute(%Rendered{dynamic: old_d}, %Rendered{dynamic: new_d}) do
     old_d
     |> Enum.zip(new_d)
@@ -273,21 +556,95 @@ defmodule Vivo.Diff.Diff do
     end)
   end
 
-  @doc "Diff two DOM trees; return list of patches"
+  @doc "Diff two DOM trees; return list of patch operations."
+  @spec diff_trees(%Tree{}, %Tree{}) :: [tuple()]
   def diff_trees(%Tree{} = old_tree, %Tree{} = new_tree) do
-    # TODO: if tag differs: replace entire node
-    # TODO: if attrs differ: {:set_attr, key, value} or {:remove_attr, key} per changed attr
-    # TODO: diff children:
-    #   - if children have :key attributes, use keyed diff (Myers-like on key sequence)
-    #   - else: zip and recurse, emit {:insert}, {:delete} for length difference
+    cond do
+      old_tree.tag != new_tree.tag ->
+        [{:replace, new_tree}]
+
+      true ->
+        attr_patches = diff_attrs(old_tree.attrs, new_tree.attrs)
+        child_patches = diff_children(old_tree.children, new_tree.children)
+        attr_patches ++ child_patches
+    end
   end
 
-  @doc "Keyed list diff: produce insert/move/delete operations preserving identity"
+  defp diff_attrs(old_attrs, new_attrs) do
+    removed =
+      old_attrs
+      |> Map.keys()
+      |> Enum.reject(&Map.has_key?(new_attrs, &1))
+      |> Enum.map(fn key -> {:remove_attr, key} end)
+
+    changed =
+      Enum.flat_map(new_attrs, fn {key, value} ->
+        if Map.get(old_attrs, key) != value do
+          [{:set_attr, key, value}]
+        else
+          []
+        end
+      end)
+
+    removed ++ changed
+  end
+
+  defp diff_children(old_children, new_children) do
+    old_keyed = Enum.all?(old_children, &(&1.key != nil))
+    new_keyed = Enum.all?(new_children, &(&1.key != nil))
+
+    if old_keyed and new_keyed and length(old_children) > 0 do
+      diff_keyed(old_children, new_children)
+    else
+      diff_positional(old_children, new_children)
+    end
+  end
+
+  defp diff_positional(old, new) do
+    max_len = max(length(old), length(new))
+    old_padded = old ++ List.duplicate(nil, max_len - length(old))
+    new_padded = new ++ List.duplicate(nil, max_len - length(new))
+
+    Enum.zip(old_padded, new_padded)
+    |> Enum.with_index()
+    |> Enum.flat_map(fn
+      {{nil, new_node}, i} -> [{:insert, i, new_node}]
+      {{_old_node, nil}, i} -> [{:delete, i}]
+      {{old_node, new_node}, i} ->
+        Enum.map(diff_trees(old_node, new_node), fn patch -> {:child, i, patch} end)
+    end)
+  end
+
+  @doc "Keyed list diff: produce insert/move/delete operations preserving identity."
+  @spec diff_keyed([%Tree{}], [%Tree{}]) :: [tuple()]
   def diff_keyed(old_children, new_children) do
-    # TODO: build old index: %{key => {index, node}}
-    # TODO: for each new child: if key exists in old, it's a move/update; else insert
-    # TODO: keys in old not in new: delete
-    # HINT: This is the algorithm React calls "reconciliation"
+    old_index = Map.new(Enum.with_index(old_children), fn {node, idx} -> {node.key, {idx, node}} end)
+
+    new_keys = Enum.map(new_children, & &1.key)
+    old_keys = MapSet.new(Map.keys(old_index))
+
+    deletes =
+      old_keys
+      |> MapSet.difference(MapSet.new(new_keys))
+      |> Enum.map(fn key -> {:delete_key, key} end)
+
+    inserts_and_moves =
+      Enum.with_index(new_children)
+      |> Enum.flat_map(fn {node, new_idx} ->
+        case Map.get(old_index, node.key) do
+          nil ->
+            [{:insert_key, node.key, new_idx, node}]
+
+          {old_idx, old_node} ->
+            child_patches = diff_trees(old_node, node)
+            move = if old_idx != new_idx, do: [{:move_key, node.key, new_idx}], else: []
+
+            move ++
+              Enum.map(child_patches, fn patch -> {:child_key, node.key, patch} end)
+        end
+      end)
+
+    deletes ++ inserts_and_moves
   end
 end
 ```
@@ -301,39 +658,100 @@ end
 const Vivo = {
   connect(url, params = {}) {
     this.socket = new WebSocket(url);
+    this.joinRef = "1";
+    this.msgRef = 0;
+    this.hooks = {};
+    this.dynamicSlots = [];
+
     this.socket.onopen = () => this._join(params);
     this.socket.onmessage = (e) => this._handleMessage(JSON.parse(e.data));
-    this.hooks = {};
+    this.socket.onclose = () => console.log("[vivo] disconnected");
   },
 
   _join(params) {
-    // TODO: send [null, "1", "lv:page", "phx_join", params]
+    this.msgRef++;
+    const msg = [this.joinRef, String(this.msgRef), "lv:page", "phx_join", params];
+    this.socket.send(JSON.stringify(msg));
   },
 
   _handleMessage([joinRef, msgRef, topic, event, payload]) {
-    if (event === "phx_reply" && payload.response?.rendered) {
-      // TODO: initial render: apply full static+dynamic to DOM
+    if (event === "phx_reply" && payload.response && payload.response.rendered) {
       this._applyFullRender(payload.response.rendered);
     } else if (event === "diff") {
-      // TODO: apply patch: update only changed dynamic slots
       this._applyPatch(payload);
     } else if (event === "push_event") {
-      // TODO: dispatch to registered JS hooks
       const hook = this.hooks[payload.event];
       if (hook) hook(payload.payload);
     }
   },
 
+  _applyFullRender(rendered) {
+    const container = document.getElementById("vivo-root");
+    if (!container) return;
+
+    let html = "";
+    for (let i = 0; i < rendered.static.length; i++) {
+      html += rendered.static[i];
+      if (i < rendered.dynamic.length) {
+        html += `<!-- s${i} -->${rendered.dynamic[i]}<!-- /s${i} -->`;
+        this.dynamicSlots[i] = rendered.dynamic[i];
+      }
+    }
+    container.innerHTML = html;
+    this._bindEvents();
+  },
+
   _applyPatch(diff) {
-    // TODO: for each changed slot index, update the corresponding DOM text node
-    // HINT: static parts are separated by <!-- s0 -->, <!-- s1 --> comments as markers
+    for (const [index, newValue] of Object.entries(diff)) {
+      const i = parseInt(index);
+      this.dynamicSlots[i] = newValue;
+
+      const walker = document.createTreeWalker(
+        document.getElementById("vivo-root"),
+        NodeFilter.SHOW_COMMENT
+      );
+
+      while (walker.nextNode()) {
+        if (walker.currentNode.textContent.trim() === `s${i}`) {
+          let next = walker.currentNode.nextSibling;
+          if (next && next.nodeType === Node.TEXT_NODE) {
+            next.textContent = newValue;
+          }
+          break;
+        }
+      }
+    }
   },
 
   _bindEvents() {
-    // TODO: use event delegation on document.body
-    // TODO: listen for click/submit/change/keydown/blur
-    // TODO: find closest element with phx-click, phx-submit, etc.
-    // TODO: send event to server: ["1", ref, topic, event_name, {value, key, etc}]
+    const eventTypes = ["click", "submit", "change", "keydown", "blur"];
+
+    eventTypes.forEach(type => {
+      document.body.addEventListener(type, (e) => {
+        const attrName = `phx-${type}`;
+        const target = e.target.closest(`[${attrName}]`);
+        if (!target) return;
+
+        const eventName = target.getAttribute(attrName);
+        const value = target.value || target.textContent || "";
+
+        this.msgRef++;
+        const msg = [
+          this.joinRef,
+          String(this.msgRef),
+          "lv:page",
+          eventName,
+          { value, key: e.key || "" }
+        ];
+        this.socket.send(JSON.stringify(msg));
+
+        if (type === "submit") e.preventDefault();
+      });
+    });
+  },
+
+  registerHook(name, fn) {
+    this.hooks[name] = fn;
   }
 };
 ```
@@ -359,14 +777,12 @@ defmodule Vivo.DiffTest do
   end
 
   test "diff is O(dynamic slots) not O(HTML size)" do
-    # Large static parts, one dynamic slot
     static = [String.duplicate("<span>x</span>", 1000), ""]
     old = %Rendered{static: static, dynamic: ["Alice"]}
     new = %Rendered{static: static, dynamic: ["Bob"]}
     {time_us, patch} = :timer.tc(fn -> Diff.compute(old, new) end)
     assert patch == %{0 => "Bob"}
-    # Should complete in microseconds regardless of static size
-    assert time_us < 1000, "diff took #{time_us}µs — not O(dynamic)"
+    assert time_us < 1000, "diff took #{time_us}us -- not O(dynamic)"
   end
 end
 
@@ -459,7 +875,6 @@ defmodule Vivo.DiffPropertyTest do
       old = %Rendered{static: List.duplicate("", n + 1), dynamic: Enum.take(dynamic_values, n)}
       new = %Rendered{static: List.duplicate("", n + 1), dynamic: Enum.take(new_values, n)}
       patch = Diff.compute(old, new)
-      # Apply patch to old dynamic values
       patched_dynamic =
         old.dynamic
         |> Enum.with_index()
@@ -478,12 +893,8 @@ end
 defmodule Vivo.Bench.Connections do
   @target_connections 10_000
   @duration_s 60
-  @update_interval_ms 1000
 
   def run do
-    {:ok, _} = Vivo.start(:normal, [])
-    Process.sleep(500)
-
     IO.puts("Opening #{@target_connections} connections...")
     baseline_memory = :erlang.memory(:total)
 
@@ -500,7 +911,6 @@ defmodule Vivo.Bench.Connections do
     overhead_mb = (connected_memory - baseline_memory) / (1024 * 1024)
     IO.puts("Memory overhead: #{Float.round(overhead_mb, 1)} MB (target: < 10 MB)")
 
-    # Send updates and measure diff delivery latency
     IO.puts("Sending updates for #{@duration_s}s...")
     latencies = measure_latencies(pids, @duration_s)
 
@@ -516,7 +926,7 @@ defmodule Vivo.Bench.Connections do
 
   defp measure_latencies(pids, duration_s) do
     end_time = System.monotonic_time(:millisecond) + duration_s * 1000
-    # Sample 100 random processes per second and measure diff roundtrip
+
     Stream.repeatedly(fn ->
       pid = Enum.random(pids)
       t0 = System.monotonic_time(:millisecond)
@@ -539,30 +949,29 @@ Vivo.Bench.Connections.run()
 
 | Design choice | Selected | Alternative | Trade-off |
 |---|---|---|---|
-| Template separation | Compile-time static/dynamic split | Runtime string diff | Runtime: O(HTML size) per diff; compile-time: O(dynamic slots) — 10× faster for large templates |
-| Process model | One GenServer per connection | Shared pool of GenServers | Pool: lower memory per idle connection; GenServer-per: failure isolation, no cross-user state |
-| Diff granularity | Slot-based (index → value) | Full DOM tree diff | Tree diff: handles arbitrary HTML mutations; slot-based: 10× simpler, sufficient for template-generated HTML |
-| Client protocol | JSON arrays `[join_ref, msg_ref, topic, event, payload]` | Binary protocol | Binary: smaller frames; JSON: debuggable, no decoder needed, ~100 bytes overhead negligible |
-| Keyed list diff | Myers algorithm on key sequence | Index-based zip | Index-based: wrong for reordering (treats move as delete+insert); keyed: O(N) extra memory, correct semantics |
+| Template separation | Compile-time static/dynamic split | Runtime string diff | Runtime: O(HTML size) per diff; compile-time: O(dynamic slots) |
+| Process model | One GenServer per connection | Shared pool | Pool: lower idle memory; per-connection: failure isolation |
+| Diff granularity | Slot-based (index -> value) | Full DOM tree diff | Tree diff handles arbitrary mutations; slot-based is 10x simpler |
+| Client protocol | JSON arrays | Binary protocol | Binary: smaller; JSON: debuggable, negligible overhead |
+| Keyed list diff | Myers on key sequence | Index-based zip | Index-based: wrong for reordering; keyed: correct semantics |
 
 ## Common production mistakes
 
-**Sending full rendered HTML after every event.** The whole point of this architecture is to send only diffs. If `handle_event` returns assigns that produce a new render, always compute the diff first and send nothing if the rendered output is identical. An early implementation may send full re-renders "to be safe," destroying the bandwidth advantage.
+**Sending full rendered HTML after every event.** Always compute the diff first and send nothing if identical.
 
-**Not garbage-collecting completed LiveView processes.** When a WebSocket disconnects, the LiveView process must be stopped. If the socket process dies without sending a `:DOWN` message to the LiveView process, the view process becomes an orphan. Use `Process.monitor(socket_pid)` in the LiveView process and handle `{:DOWN, ...}` to self-terminate.
+**Not garbage-collecting completed LiveView processes.** When a WebSocket disconnects, the LiveView process must stop. Use `Process.monitor(socket_pid)` and handle `{:DOWN, ...}`.
 
-**Accumulating large assigns maps.** Every assign call creates a new map. If `handle_info` runs 60 times per second (for an animation) and assigns a large binary on each call, each update pins a new copy. Use `assign_new/3` (only assigns if key absent) and avoid storing large binaries in assigns — store them in ETS and keep only the key in assigns.
+**Accumulating large assigns maps.** Use `assign_new/3` (only assigns if key absent) and avoid large binaries in assigns.
 
-**Not handling WebSocket close frames.** A client that closes gracefully sends a close frame (opcode 0x8). If the server ignores it and continues sending, the TCP connection will eventually be forcibly reset, but only after a timeout. Handle close frames by immediately stopping the socket process, which cascades to stopping the LiveView process.
+**Not handling WebSocket close frames.** A client that closes gracefully sends a close frame (opcode 0x8). Handle it immediately to avoid zombie connections.
 
-**Template DSL not raising on missing assigns.** If `@count` is used in a template but `count` is not in assigns, the current behavior may silently render `nil` as empty string. LiveView raises a `KeyError` in dev mode. Add a `fetch_assign!/2` macro that raises with the template file and line number — this catches bugs at development time rather than silently breaking production UIs.
+**Template DSL not raising on missing assigns.** If `@count` is used but `count` is not in assigns, the behavior may silently render nil. Raise a `KeyError` in dev mode with file and line.
 
 ## Resources
 
-- Phoenix.LiveView source — https://github.com/phoenixframework/phoenix_live_view (the reference implementation)
-- McCord — "LiveView: Interactive, Real-Time Apps" — ElixirConf EU 2019 (original design motivation)
-- RFC 6455 — The WebSocket Protocol — https://datatracker.ietf.org/doc/html/rfc6455
-- React Reconciliation documentation — https://legacy.reactjs.org/docs/reconciliation.html (keyed diffing algorithm)
-- Myers — "An O(ND) Difference Algorithm and Its Variations" (1986) — Algorithmica 1(2) (foundation for list diff)
-- BEAM VM memory — https://www.erlang.org/doc/efficiency_guide/processes.html (process cost model)
-- McCord & Loder — "Programming Phoenix LiveView" (Pragmatic Bookshelf)
+- Phoenix.LiveView source -- https://github.com/phoenixframework/phoenix_live_view
+- RFC 6455 -- The WebSocket Protocol -- https://datatracker.ietf.org/doc/html/rfc6455
+- React Reconciliation -- https://legacy.reactjs.org/docs/reconciliation.html
+- Myers -- "An O(ND) Difference Algorithm" (1986) -- Algorithmica 1(2)
+- BEAM VM memory -- https://www.erlang.org/doc/efficiency_guide/processes.html
+- McCord & Loder -- "Programming Phoenix LiveView" (Pragmatic Bookshelf)

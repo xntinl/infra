@@ -78,11 +78,31 @@ defp deps do
 end
 ```
 
-### Step 3: Process registry
+### Step 3: Application
+
+```elixir
+# lib/nexus/application.ex
+defmodule Nexus.Application do
+  use Application
+
+  @impl true
+  def start(_type, _args) do
+    children = [
+      Nexus.Registry
+    ]
+    opts = [strategy: :one_for_one, name: Nexus.Supervisor]
+    Supervisor.start_link(children, opts)
+  end
+end
+```
+
+### Step 4: Process registry
 
 ```elixir
 # lib/nexus/registry.ex
 defmodule Nexus.Registry do
+  use GenServer
+
   @moduledoc """
   ETS-backed name-to-PID registry.
 
@@ -149,7 +169,7 @@ defmodule Nexus.Registry do
 end
 ```
 
-### Step 4: Wildcard trie
+### Step 5: Wildcard trie
 
 ```elixir
 # lib/nexus/trie.ex
@@ -238,7 +258,117 @@ defmodule Nexus.Trie do
 end
 ```
 
-### Step 5: Given tests — must pass without modification
+### Step 6: Event bus
+
+```elixir
+# lib/nexus/event_bus.ex
+defmodule Nexus.EventBus do
+  @moduledoc """
+  Hierarchical event bus with AMQP-style topic wildcards.
+  Supports three QoS levels: :at_most_once, :at_least_once, :exactly_once.
+  Uses the Trie for subscription matching.
+  """
+
+  use GenServer
+
+  defstruct [:trie, :subscriptions, :pending_acks, :event_counter]
+
+  def start_link(opts \\ []) do
+    GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+  end
+
+  @doc "Subscribes the given pid to a topic pattern."
+  @spec subscribe(String.t(), pid(), keyword()) :: :ok
+  def subscribe(pattern, subscriber, opts \\ []) do
+    GenServer.call(__MODULE__, {:subscribe, pattern, subscriber, opts})
+  end
+
+  @doc "Publishes an event to a topic."
+  @spec publish(String.t(), term()) :: :ok
+  def publish(topic, payload) do
+    GenServer.call(__MODULE__, {:publish, topic, payload})
+  end
+
+  @doc "Acknowledges receipt of an event (for :at_least_once QoS)."
+  @spec ack(term()) :: :ok
+  def ack(event_id) do
+    GenServer.cast(__MODULE__, {:ack, event_id})
+  end
+
+  @doc "Returns the current trie for benchmarking."
+  @spec trie() :: map()
+  def trie, do: GenServer.call(__MODULE__, :get_trie)
+
+  @impl true
+  def init(_opts) do
+    {:ok, %__MODULE__{
+      trie: %{},
+      subscriptions: %{},
+      pending_acks: %{},
+      event_counter: 0
+    }}
+  end
+
+  @impl true
+  def handle_call({:subscribe, pattern, subscriber, opts}, _from, state) do
+    qos = Keyword.get(opts, :qos, :at_most_once)
+    sub_info = %{pid: subscriber, qos: qos, pattern: pattern}
+    new_trie = Nexus.Trie.insert(state.trie, pattern, sub_info)
+    subs = Map.put(state.subscriptions, {pattern, subscriber}, sub_info)
+    {:reply, :ok, %{state | trie: new_trie, subscriptions: subs}}
+  end
+
+  def handle_call({:publish, topic, payload}, _from, state) do
+    event_id = state.event_counter + 1
+    matching = Nexus.Trie.match(state.trie, topic)
+
+    new_pending =
+      Enum.reduce(matching, state.pending_acks, fn sub_info, acc ->
+        send(sub_info.pid, {:event, event_id, payload})
+
+        case sub_info.qos do
+          :at_least_once ->
+            retry_ref = Process.send_after(self(), {:retry, event_id, sub_info, payload}, 1_000)
+            Map.put(acc, event_id, %{sub: sub_info, payload: payload, retry_ref: retry_ref})
+          _ ->
+            acc
+        end
+      end)
+
+    {:reply, :ok, %{state | event_counter: event_id, pending_acks: new_pending}}
+  end
+
+  def handle_call(:get_trie, _from, state), do: {:reply, state.trie, state}
+
+  @impl true
+  def handle_cast({:ack, event_id}, state) do
+    case Map.pop(state.pending_acks, event_id) do
+      {nil, _} -> {:noreply, state}
+      {%{retry_ref: ref}, new_pending} ->
+        Process.cancel_timer(ref)
+        {:noreply, %{state | pending_acks: new_pending}}
+    end
+  end
+
+  @impl true
+  def handle_info({:retry, event_id, sub_info, payload}, state) do
+    if Map.has_key?(state.pending_acks, event_id) do
+      send(sub_info.pid, {:event, event_id, payload})
+      retry_ref = Process.send_after(self(), {:retry, event_id, sub_info, payload}, 1_000)
+      new_pending = Map.put(state.pending_acks, event_id, %{
+        sub: sub_info, payload: payload, retry_ref: retry_ref
+      })
+      {:noreply, %{state | pending_acks: new_pending}}
+    else
+      {:noreply, state}
+    end
+  end
+
+  def handle_info(_msg, state), do: {:noreply, state}
+end
+```
+
+### Step 7: Given tests — must pass without modification
 
 ```elixir
 # test/nexus/registry_test.exs
@@ -323,13 +453,13 @@ defmodule Nexus.DeliveryTest do
 end
 ```
 
-### Step 6: Run the tests
+### Step 8: Run the tests
 
 ```bash
 mix test test/nexus/ --trace
 ```
 
-### Step 7: Benchmark
+### Step 9: Benchmark
 
 ```elixir
 # bench/nexus_bench.exs

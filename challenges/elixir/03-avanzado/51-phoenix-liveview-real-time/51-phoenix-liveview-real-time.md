@@ -1,29 +1,26 @@
 # Phoenix LiveView: Real-Time Gateway Dashboard
 
-**Project**: `api_gateway` — built incrementally across the advanced level
+## Overview
 
----
+Build a real-time web dashboard for an API gateway using Phoenix LiveView. The dashboard
+displays request rates, circuit breaker states, and rate-limiter queue depths -- all
+server-rendered HTML with WebSocket-pushed diffs. No JavaScript SPA, no REST polling loop.
 
-## Project context
-
-The `api_gateway` umbrella is in production. The ops team needs a web dashboard to monitor
-the gateway in real time: request rates, circuit breaker states, rate-limiter queue depths.
-Instead of building a React SPA with a REST polling loop, you'll build it with Phoenix
-LiveView — the entire dashboard is server-rendered HTML with WebSocket-pushed diffs.
-
-Project structure for this exercise:
+Project structure:
 
 ```
-api_gateway_umbrella/apps/gateway_api/
-├── lib/gateway_api_web/
-│   ├── live/
-│   │   ├── dashboard_live.ex         # main dashboard with metrics + history
-│   │   ├── dashboard_live.html.heex  # template
-│   │   ├── circuit_breaker_live.ex   # circuit breaker management
-│   │   └── config_live.ex            # gateway configuration form
-│   └── presence.ex                   # Phoenix Presence module
-└── test/gateway_api_web/live/
-    └── dashboard_live_test.exs       # given tests
+api_gateway/
+├── lib/
+│   └── api_gateway_web/
+│       ├── live/
+│       │   ├── dashboard_live.ex
+│       │   ├── dashboard_live.html.heex
+│       │   ├── circuit_breaker_live.ex
+│       │   └── config_live.ex
+│       └── router.ex
+└── test/
+    └── api_gateway_web/live/
+        └── dashboard_live_test.exs
 ```
 
 ---
@@ -31,8 +28,7 @@ api_gateway_umbrella/apps/gateway_api/
 ## Why LiveView over a JavaScript SPA
 
 A React dashboard requires: a REST or GraphQL API, JSON serialization, a client-side state
-manager, and a polling or WebSocket layer. Each layer has failure modes and deployment
-concerns. LiveView collapses all of this:
+manager, and a polling or WebSocket layer. LiveView collapses all of this:
 
 ```
 Browser                    Server
@@ -45,45 +41,42 @@ User click ---- handle_event/3 --> update state
 ```
 
 The server computes diffs; the browser applies them. No JSON. No client state sync. The
-tradeoff: all users' state lives in server memory (one LiveView process per connection),
-and the server must be reachable via WebSocket.
+tradeoff: all users' state lives in server memory (one LiveView process per connection).
 
 ---
 
 ## LiveView lifecycle
 
 ```
-mount/3         — called once when the LiveView mounts
+mount/3         -- called once when the LiveView mounts
                   initialize assigns; start PubSub subscriptions; schedule ticks
-render/1        — called after every assign change; returns HEEx template
-handle_event/3  — called when user interacts (phx-click, phx-submit, phx-change)
-handle_info/2   — called when a message arrives (PubSub, Process.send_after, GenServer)
+render/1        -- called after every assign change; returns HEEx template
+handle_event/3  -- called when user interacts (phx-click, phx-submit, phx-change)
+handle_info/2   -- called when a message arrives (PubSub, Process.send_after, GenServer)
 ```
 
 The key insight: **the socket is the state, the template is a pure function of the state**.
-Phoenix computes the diff between the previous and current render and sends only the changed
-HTML fragments over WebSocket.
 
 ---
 
 ## Implementation
 
-### Step 1: `lib/gateway_api_web/live/dashboard_live.ex`
+### Step 1: `lib/api_gateway_web/live/dashboard_live.ex`
 
 The dashboard LiveView subscribes to PubSub for real-time metrics and uses a timer tick
-to periodically refresh ETS-backed data (circuit breakers, rate limiter state).
+to periodically refresh ETS-backed data.
 
 ```elixir
-defmodule GatewayApiWeb.DashboardLive do
-  use GatewayApiWeb, :live_view
+defmodule ApiGatewayWeb.DashboardLive do
+  use ApiGatewayWeb, :live_view
 
   @tick_ms 1_000
-  @history_limit 60   # 60 seconds of history
+  @history_limit 60
 
   @impl true
   def mount(_params, _session, socket) do
     if connected?(socket) do
-      Phoenix.PubSub.subscribe(GatewayApi.PubSub, "gateway:metrics")
+      Phoenix.PubSub.subscribe(ApiGateway.PubSub, "gateway:metrics")
       Process.send_after(self(), :tick, @tick_ms)
     end
 
@@ -101,7 +94,6 @@ defmodule GatewayApiWeb.DashboardLive do
 
   @impl true
   def handle_info(:tick, socket) do
-    # Re-schedule the next tick immediately so it fires even if the rest errors
     Process.send_after(self(), :tick, @tick_ms)
 
     metrics = fetch_current_metrics()
@@ -122,13 +114,7 @@ defmodule GatewayApiWeb.DashboardLive do
     {:noreply, socket}
   end
 
-  # ---------------------------------------------------------------------------
-  # Private helpers
-  # ---------------------------------------------------------------------------
-
   defp fetch_current_metrics do
-    # Reads from ETS tables or GenServer state to build the current metrics snapshot.
-    # In production, these values come from telemetry aggregation stored in ETS.
     %{request_rate: 0.0, error_rate: 0.0, p99_ms: 0.0, ts: DateTime.utc_now()}
   end
 
@@ -156,7 +142,7 @@ end
 ```
 
 ```heex
-<%# lib/gateway_api_web/live/dashboard_live.html.heex %>
+<%# lib/api_gateway_web/live/dashboard_live.html.heex %>
 <div class="font-mono p-6 bg-gray-950 text-green-400 min-h-screen">
   <h1 class="text-2xl mb-6">api_gateway dashboard</h1>
 
@@ -199,7 +185,7 @@ end
     </tbody>
   </table>
 
-  <%# History table — last 60 samples %>
+  <%# History table -- last 60 samples %>
   <h2 class="text-lg mb-3">Last 60s</h2>
   <div class="overflow-y-auto max-h-64">
     <table class="w-full">
@@ -218,17 +204,17 @@ end
 </div>
 ```
 
-### Step 2: `lib/gateway_api_web/live/circuit_breaker_live.ex`
+### Step 2: `lib/api_gateway_web/live/circuit_breaker_live.ex`
 
 Allows ops to view circuit breaker states and reset them manually via a button.
 
 ```elixir
-defmodule GatewayApiWeb.CircuitBreakerLive do
-  use GatewayApiWeb, :live_view
+defmodule ApiGatewayWeb.CircuitBreakerLive do
+  use ApiGatewayWeb, :live_view
 
   @impl true
   def mount(_params, _session, socket) do
-    if connected?(socket), do: Phoenix.PubSub.subscribe(GatewayApi.PubSub, "circuit_breaker:events")
+    if connected?(socket), do: Phoenix.PubSub.subscribe(ApiGateway.PubSub, "circuit_breaker:events")
     {:ok, assign(socket, events: [], states: load_states())}
   end
 
@@ -260,15 +246,15 @@ defmodule GatewayApiWeb.CircuitBreakerLive do
 end
 ```
 
-### Step 3: `lib/gateway_api_web/live/config_live.ex`
+### Step 3: `lib/api_gateway_web/live/config_live.ex`
 
 A form-based LiveView for updating gateway configuration with inline validation.
 
 ```elixir
-defmodule GatewayApiWeb.ConfigLive do
-  use GatewayApiWeb, :live_view
+defmodule ApiGatewayWeb.ConfigLive do
+  use ApiGatewayWeb, :live_view
 
-  alias GatewayCore.GatewayConfig
+  alias ApiGateway.GatewayConfig
 
   @impl true
   def mount(_params, _session, socket) do
@@ -302,8 +288,7 @@ end
 ### Step 4: Add routes to `router.ex`
 
 ```elixir
-# In gateway_api_web/router.ex
-scope "/admin", GatewayApiWeb do
+scope "/admin", ApiGatewayWeb do
   pipe_through [:browser, :admin_auth]
 
   live "/dashboard",       DashboardLive
@@ -312,12 +297,12 @@ scope "/admin", GatewayApiWeb do
 end
 ```
 
-### Step 5: Given tests — must pass without modification
+### Step 5: Tests
 
 ```elixir
-# test/gateway_api_web/live/dashboard_live_test.exs
-defmodule GatewayApiWeb.DashboardLiveTest do
-  use GatewayApiWeb.ConnCase
+# test/api_gateway_web/live/dashboard_live_test.exs
+defmodule ApiGatewayWeb.DashboardLiveTest do
+  use ApiGatewayWeb.ConnCase
   import Phoenix.LiveViewTest
 
   test "renders dashboard with metrics", %{conn: conn} do
@@ -329,15 +314,12 @@ defmodule GatewayApiWeb.DashboardLiveTest do
 
   test "updates when tick fires", %{conn: conn} do
     {:ok, view, _html} = live(conn, ~p"/admin/dashboard")
-    # Trigger a tick manually
     send(view.pid, :tick)
-    # Wait for re-render
     html = render(view)
     assert html =~ "req/s"
   end
 
   test "circuit reset button clears ETS state", %{conn: conn} do
-    # Seed a broken circuit
     :ets.insert(:circuit_breaker, {"test-host", :open, System.monotonic_time(:millisecond)})
 
     {:ok, view, _html} = live(conn, ~p"/admin/circuit-breakers")
@@ -362,7 +344,7 @@ end
 ### Step 6: Run the tests
 
 ```bash
-mix test test/gateway_api_web/live/ --trace
+mix test test/api_gateway_web/live/ --trace
 ```
 
 ---
@@ -378,42 +360,36 @@ mix test test/gateway_api_web/live/ --trace
 | Server memory | 1 process per connection | none | connection overhead |
 | Testability | `Phoenix.LiveViewTest` | Cypress / RTL | Cypress / RTL |
 
-Reflection: the DashboardLive process holds the last 60 seconds of history. With 500
-concurrent ops users, how much memory does this consume? How would you change the design
-if the history window needed to be 24 hours?
-
 ---
 
 ## Common production mistakes
 
 **1. Not re-enqueuing the tick in `handle_info(:tick, ...)`**
 The pattern is: `Process.send_after(self(), :tick, @tick_ms)` at the start of the handler,
-not in `mount/3`. If you only send it in `mount/3`, the tick fires once and stops.
+not only in `mount/3`. If you only send it in `mount/3`, the tick fires once and stops.
 
 **2. Subscribing to PubSub without the `connected?/1` guard**
 LiveView renders twice: once server-side (SSR, no WebSocket) and once after the WebSocket
-connects. Without the guard, you subscribe during SSR — the process receives broadcasts but
+connects. Without the guard, you subscribe during SSR -- the process receives broadcasts but
 has no way to push diffs. Always guard PubSub subscriptions with `if connected?(socket)`.
 
 **3. Setting `action: :validate` on `phx-submit` event**
 `action: :validate` activates error display. It should be set in the `"validate"` handler
-(`phx-change`). In the `"save"` handler, the changeset should attempt the real operation —
-not be forced into validate-only mode.
+(`phx-change`). In the `"save"` handler, the changeset should attempt the real operation.
 
 **4. Unbounded history list**
 Every tick appends to `:history`. Without `Enum.take/2`, after a day of uptime the list
 has 86,400 entries. Always cap it: `Enum.take([new | h], @history_limit)`.
 
 **5. Reading ETS directly in the template**
-ETS reads inside HEEx templates run on every render, including diffs. Put ETS reads in
-`handle_info(:tick, ...)` and store results as assigns. The template should be a pure
-function of assigns — no side effects, no external reads.
+ETS reads inside HEEx templates run on every render. Put ETS reads in `handle_info(:tick, ...)`
+and store results as assigns. The template should be a pure function of assigns.
 
 ---
 
 ## Resources
 
-- [Phoenix LiveView documentation](https://hexdocs.pm/phoenix_live_view/Phoenix.LiveView.html) — lifecycle callbacks
-- [Phoenix.LiveViewTest](https://hexdocs.pm/phoenix_live_view/Phoenix.LiveViewTest.html) — `live/2`, `render_click/2`, `form/3`
-- [LiveView security model](https://hexdocs.pm/phoenix_live_view/security-model.html) — why `connected?` matters
-- [Streams in LiveView](https://hexdocs.pm/phoenix_live_view/Phoenix.LiveView.html#stream/3) — efficient rendering for large lists
+- [Phoenix LiveView documentation](https://hexdocs.pm/phoenix_live_view/Phoenix.LiveView.html) -- lifecycle callbacks
+- [Phoenix.LiveViewTest](https://hexdocs.pm/phoenix_live_view/Phoenix.LiveViewTest.html) -- `live/2`, `render_click/2`, `form/3`
+- [LiveView security model](https://hexdocs.pm/phoenix_live_view/security-model.html) -- why `connected?` matters
+- [Streams in LiveView](https://hexdocs.pm/phoenix_live_view/Phoenix.LiveView.html#stream/3) -- efficient rendering for large lists

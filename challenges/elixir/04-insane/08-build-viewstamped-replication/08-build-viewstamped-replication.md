@@ -208,6 +208,10 @@ defmodule VrReplica.Replica do
     end
   end
 
+  def handle_info({:set_peers, peers}, state) do
+    {:noreply, %{state | peers: peers}}
+  end
+
   def handle_info(_msg, state), do: {:noreply, state}
 
   defp primary?(state) do
@@ -308,7 +312,190 @@ defmodule VrReplica.ViewChange do
 end
 ```
 
-### Step 5: Given tests — must pass without modification
+### Step 5: State machine
+
+```elixir
+# lib/vr_replica/state_machine.ex
+defmodule VrReplica.StateMachine do
+  @moduledoc """
+  Pure key-value state machine. Applies operations deterministically
+  to produce a reply and updated state.
+  """
+
+  @spec apply_op(term(), map()) :: {term(), map()}
+  def apply_op({:put, key, value}, state) do
+    {:ok, Map.put(state, key, value)}
+  end
+
+  def apply_op({:get, key}, state) do
+    {{:ok, Map.get(state, key)}, state}
+  end
+
+  def apply_op({:delete, key}, state) do
+    {:ok, Map.delete(state, key)}
+  end
+
+  def apply_op(_unknown, state) do
+    {{:error, :unknown_op}, state}
+  end
+end
+```
+
+### Step 6: Cluster API
+
+```elixir
+# lib/vr_replica/cluster.ex
+defmodule VrReplica.Cluster do
+  @moduledoc """
+  Public API for managing a VR replica cluster. Starts replicas,
+  routes client requests to the primary, and provides inspection.
+  """
+
+  use GenServer
+
+  defstruct [:replicas, :replica_pids, :num_replicas]
+
+  def start_link(opts) do
+    GenServer.start_link(__MODULE__, opts)
+  end
+
+  @impl true
+  def init(opts) do
+    num_replicas = Keyword.get(opts, :replicas, 5)
+
+    pids =
+      for i <- 0..(num_replicas - 1) do
+        {:ok, pid} = GenServer.start_link(VrReplica.Replica, [
+          replica_number: i,
+          num_replicas: num_replicas,
+          peers: []
+        ])
+        {i, pid}
+      end
+      |> Map.new()
+
+    peer_pids = Map.values(pids)
+    Enum.each(pids, fn {_i, pid} ->
+      others = List.delete(peer_pids, pid)
+      send(pid, {:set_peers, others})
+    end)
+
+    {:ok, %__MODULE__{
+      replicas: pids,
+      replica_pids: pids,
+      num_replicas: num_replicas
+    }}
+  end
+
+  @spec current_primary(pid()) :: non_neg_integer()
+  def current_primary(cluster), do: GenServer.call(cluster, :current_primary)
+
+  @spec current_view(pid()) :: non_neg_integer()
+  def current_view(cluster), do: GenServer.call(cluster, :current_view)
+
+  @spec kill_replica(pid(), non_neg_integer()) :: :ok
+  def kill_replica(cluster, replica_num), do: GenServer.call(cluster, {:kill_replica, replica_num})
+
+  @spec put(pid(), term(), term(), keyword()) :: {:ok, term()}
+  def put(cluster, key, value, opts \\ []) do
+    GenServer.call(cluster, {:put, key, value, opts}, 10_000)
+  end
+
+  @spec get(pid(), term()) :: {:ok, term()} | {:error, term()}
+  def get(cluster, key), do: GenServer.call(cluster, {:get, key}, 10_000)
+
+  @impl true
+  def handle_call(:current_primary, _from, state) do
+    view = get_max_view(state)
+    primary_idx = rem(view, state.num_replicas)
+    {:reply, primary_idx, state}
+  end
+
+  def handle_call(:current_view, _from, state) do
+    {:reply, get_max_view(state), state}
+  end
+
+  def handle_call({:kill_replica, replica_num}, _from, state) do
+    case Map.get(state.replica_pids, replica_num) do
+      nil -> {:reply, :ok, state}
+      pid ->
+        Process.exit(pid, :kill)
+        new_pids = Map.delete(state.replica_pids, replica_num)
+        {:reply, :ok, %{state | replica_pids: new_pids}}
+    end
+  end
+
+  def handle_call({:put, key, value, _opts}, _from, state) do
+    result = route_to_primary(state, {:put, key, value})
+    {:reply, result, state}
+  end
+
+  def handle_call({:get, key}, _from, state) do
+    result = route_to_primary(state, {:get, key})
+    {:reply, result, state}
+  end
+
+  defp route_to_primary(state, op) do
+    view = get_max_view(state)
+    primary_idx = rem(view, state.num_replicas)
+    case Map.get(state.replica_pids, primary_idx) do
+      nil -> {:error, :no_primary}
+      pid ->
+        client_id = :erlang.unique_integer([:positive])
+        nonce = :erlang.unique_integer([:positive, :monotonic])
+        try do
+          GenServer.call(pid, {:request, client_id, nonce, op}, 5_000)
+        catch
+          :exit, _ -> {:error, :timeout}
+        end
+    end
+  end
+
+  defp get_max_view(state) do
+    state.replica_pids
+    |> Map.values()
+    |> Enum.map(fn pid ->
+      try do
+        :sys.get_state(pid).view_number
+      catch
+        _, _ -> 0
+      end
+    end)
+    |> Enum.max(fn -> 0 end)
+  end
+end
+```
+
+### Step 7: Client (with nonce-based exactly-once)
+
+```elixir
+# lib/vr_replica/client.ex
+defmodule VrReplica.Client do
+  @moduledoc """
+  Client session for VR cluster. Maintains a client_id and tracks
+  nonces for exactly-once delivery semantics.
+  """
+
+  defstruct [:cluster, :client_id, :next_nonce]
+
+  @spec new(pid(), keyword()) :: %__MODULE__{}
+  def new(cluster, opts \\ []) do
+    %__MODULE__{
+      cluster: cluster,
+      client_id: Keyword.get(opts, :id, "client_#{:erlang.unique_integer([:positive])}"),
+      next_nonce: 1
+    }
+  end
+
+  @spec put(%__MODULE__{}, term(), term(), keyword()) :: {:ok, term()}
+  def put(client, key, value, opts \\ []) do
+    nonce = Keyword.get(opts, :nonce, client.next_nonce)
+    VrReplica.Cluster.put(client.cluster, key, value, nonce: nonce, client_id: client.client_id)
+  end
+end
+```
+
+### Step 8: Given tests — must pass without modification
 
 ```elixir
 # test/vr_replica/view_change_test.exs
@@ -376,13 +563,13 @@ defmodule VrReplica.ExactlyOnceTest do
 end
 ```
 
-### Step 6: Run the tests
+### Step 9: Run the tests
 
 ```bash
 mix test test/vr_replica/ --trace
 ```
 
-### Step 7: Benchmark
+### Step 10: Benchmark
 
 ```elixir
 # bench/vr_bench.exs
@@ -420,7 +607,7 @@ Target: 5,000 linearizable operations/second on a 5-replica cluster on localhost
 | Nonce/session protocol | built-in (client table) | application-level | application-level |
 | Persistence requirement | none in original design | WAL required | WAL required |
 
-Compare your latency and throughput numbers with Exercise 01 (Raft) on the same hardware.
+After running the benchmark, record your measured latency (p50, p99) and throughput (ops/sec). Compare these numbers against the theoretical analysis: VR's deterministic primary selection avoids election overhead, but the view-change protocol may introduce higher latency during failover.
 
 Reflection: VR's recovery protocol requires at least `f+1` surviving replicas to be able to respond to a RECOVERY request. What happens if only `f` replicas survive after a partition? Is this a safety violation or a liveness violation?
 

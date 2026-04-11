@@ -1,58 +1,16 @@
 # Telemetry: Instrumentation and Observability
 
-**Project**: `task_queue` — built incrementally across the intermediate level
+## Goal
+
+Build a `task_queue` project instrumented with `:telemetry` events for job execution (start/stop/exception) and queue operations (enqueue/dequeue). Learn why telemetry decouples measurement from collection, enabling you to swap backends (stdout, Datadog, Prometheus) without changing instrumentation code.
 
 ---
 
-## Project context
+## Why `:telemetry` and not manual logging or custom metrics
 
-`task_queue` is running in production and the ops team has no visibility into what is happening. How many jobs are being processed per minute? What is the average execution time? Which job types are failing? Without instrumentation, the answers are "we don't know" and the first sign of a problem is a customer complaint.
+Manual logging is not structured. `Logger.info("job completed in 42ms")` is a string -- a metrics backend cannot parse it reliably.
 
-Project structure at this point:
-
-```
-task_queue/
-├── lib/
-│   └── task_queue/
-│       ├── application.ex
-│       ├── telemetry.ex            # ← you implement this
-│       ├── worker.ex               # ← you instrument this
-│       ├── queue_server.ex         # ← you instrument this
-│       ├── scheduler.ex
-│       └── registry.ex
-├── test/
-│   └── task_queue/
-│       └── telemetry_test.exs      # given tests — must pass without modification
-└── mix.exs
-```
-
-Add to `mix.exs`:
-
-```elixir
-{:telemetry, "~> 1.2"}
-```
-
----
-
-## The business problem
-
-The SRE team needs three dashboards:
-
-1. **Throughput** — jobs processed per minute, broken down by type
-2. **Latency** — p50/p95/p99 job execution time
-3. **Error rate** — job failures per minute, with error reason
-
-These metrics must be emitted in a way that is decoupled from the collection mechanism. Today they want to log to stdout. Next month they may want to ship to Datadog. The instrumentation code must not change when the backend changes.
-
-That is exactly what `:telemetry` provides: a publish-subscribe system for measurements. The code that generates the measurement (`execute/3`) is decoupled from the code that handles it (`attach/4`).
-
----
-
-## Why `:telemetry` and not manual logging or custom `GenServer` metrics
-
-Manual logging is not structured. `Logger.info("job completed in 42ms")` is a string — a metrics backend cannot parse it reliably.
-
-A custom `GenServer` that accumulates counters creates tight coupling: every component that wants to emit a metric must know the GenServer's name and call format. If you want to add a new handler (Prometheus, StatsD, a test assertion), you modify the GenServer.
+A custom `GenServer` that accumulates counters creates tight coupling: every component must know the GenServer's name and call format.
 
 `:telemetry` is a convention:
 - **Emitters** call `:telemetry.execute/3` with an event name, measurements map, and metadata map
@@ -63,30 +21,66 @@ The BEAM ecosystem (Phoenix, Ecto, Oban, Broadway) all instrument via `:telemetr
 
 ---
 
-## Event naming convention
-
-Telemetry event names are lists of atoms, following the pattern `[:app, :component, :action]`:
-
-```elixir
-[:task_queue, :job, :start]    # when a job begins execution
-[:task_queue, :job, :stop]     # when a job completes successfully
-[:task_queue, :job, :exception] # when a job raises
-[:task_queue, :queue, :enqueue] # when a job is added to the queue
-[:task_queue, :queue, :dequeue] # when a job is removed from the queue
-```
-
-The `:start`/`:stop`/`:exception` trio is a convention from `telemetry`'s `span` helper — it makes it easy to compute duration and error rates.
-
----
-
 ## Implementation
 
-### Step 1: `lib/task_queue/telemetry.ex` — handler setup
+### Step 1: `mix.exs`
+
+```elixir
+defmodule TaskQueue.MixProject do
+  use Mix.Project
+
+  def project do
+    [
+      app: :task_queue,
+      version: "0.1.0",
+      elixir: "~> 1.15",
+      start_permanent: Mix.env() == :prod,
+      deps: deps()
+    ]
+  end
+
+  def application do
+    [
+      extra_applications: [:logger],
+      mod: {TaskQueue.Application, []}
+    ]
+  end
+
+  defp deps do
+    [
+      {:telemetry, "~> 1.2"}
+    ]
+  end
+end
+```
+
+### Step 2: `lib/task_queue/application.ex`
+
+```elixir
+defmodule TaskQueue.Application do
+  use Application
+
+  @impl true
+  def start(_type, _args) do
+    TaskQueue.Telemetry.setup()
+
+    children = []
+    opts = [strategy: :one_for_one, name: TaskQueue.Supervisor]
+    Supervisor.start_link(children, opts)
+  end
+end
+```
+
+### Step 3: `lib/task_queue/telemetry.ex` -- handler setup
+
+The `setup/0` function attaches a single handler function to all five event types using `attach_many/4`. The handler ID `"task-queue-telemetry"` must be unique -- calling `attach` twice with the same ID raises. The detach-before-attach pattern makes `setup/0` idempotent.
+
+Telemetry handlers are called synchronously in the process that called `:telemetry.execute/3`. A slow handler (HTTP call to a metrics backend) blocks the worker. For production, send to a dedicated reporter process instead.
 
 ```elixir
 defmodule TaskQueue.Telemetry do
   @moduledoc """
-  Attaches telemetry handlers for `task_queue` events.
+  Attaches telemetry handlers for task_queue events.
 
   Call `TaskQueue.Telemetry.setup/0` during application startup.
   All handlers log structured events to stdout. Replace or extend
@@ -138,7 +132,9 @@ defmodule TaskQueue.Telemetry do
 end
 ```
 
-### Step 2: `lib/task_queue/worker.ex` — emit telemetry from job execution
+### Step 4: `lib/task_queue/worker.ex` -- emit telemetry from job execution
+
+The Worker emits a `:start` event before execution (with empty measurements -- no timing yet), then either a `:stop` event (with duration) on success or an `:exception` event (with duration and error reason) on failure. Duration is computed using `System.monotonic_time/0` which guarantees monotonicity even across NTP clock adjustments.
 
 ```elixir
 defmodule TaskQueue.Worker do
@@ -151,15 +147,6 @@ defmodule TaskQueue.Worker do
   - `[:task_queue, :job, :exception]` if execution raises
   """
 
-  @doc """
-  Executes a job and emits telemetry events around execution.
-
-  ## Examples
-
-      iex> TaskQueue.Worker.execute(%{id: "j1", type: "noop", args: %{}})
-      {:ok, :noop}
-
-  """
   @spec execute(map()) :: {:ok, term()} | {:error, term()}
   def execute(%{type: type, args: args} = job) do
     job_id   = Map.get(job, :id, "unknown")
@@ -201,51 +188,9 @@ defmodule TaskQueue.Worker do
 end
 ```
 
-### Step 3: `lib/task_queue/queue_server.ex` — emit telemetry from queue operations
+### Step 5: Tests
 
-```elixir
-# In QueueServer, add telemetry to enqueue and dequeue:
-
-# In handle_call({:enqueue, job}, ...):
-# After successfully enqueuing:
-# :telemetry.execute(
-#   [:task_queue, :queue, :enqueue],
-#   %{},
-#   %{queue_size: :queue.len(new_q)}
-# )
-
-# In handle_call(:dequeue, ...):
-# After successfully dequeuing:
-# :telemetry.execute(
-#   [:task_queue, :queue, :dequeue],
-#   %{},
-#   %{queue_size: :queue.len(new_q)}
-# )
-```
-
-### Step 4: `lib/task_queue/application.ex` — call `Telemetry.setup/0`
-
-```elixir
-defmodule TaskQueue.Application do
-  use Application
-
-  @impl true
-  def start(_type, _args) do
-    TaskQueue.Telemetry.setup()
-
-    children = [
-      TaskQueue.QueueServer,
-      TaskQueue.Scheduler,
-      TaskQueue.Registry
-    ]
-
-    opts = [strategy: :one_for_one, name: TaskQueue.Supervisor]
-    Supervisor.start_link(children, opts)
-  end
-end
-```
-
-### Step 5: Given tests — must pass without modification
+The test handler captures telemetry events by sending them as messages to the test process. The unique handler ID per test process (`"test-handler-#{inspect(self())}"`) avoids ID collisions if tests run concurrently. The `on_exit` callback detaches the handler to prevent leaks across tests.
 
 ```elixir
 # test/task_queue/telemetry_test.exs
@@ -255,7 +200,6 @@ defmodule TaskQueue.TelemetryTest do
   alias TaskQueue.Worker
 
   setup do
-    # Attach a test handler that captures events into the test process
     test_pid = self()
 
     :telemetry.attach_many(
@@ -280,7 +224,7 @@ defmodule TaskQueue.TelemetryTest do
     :ok
   end
 
-  describe "Worker.execute/1 — telemetry events" do
+  describe "Worker.execute/1 -- telemetry events" do
     test "emits :start event before execution" do
       Worker.execute(%{id: "j1", type: "noop", args: %{}})
       assert_receive {:telemetry, [:task_queue, :job, :start], _measurements, metadata}
@@ -312,9 +256,8 @@ defmodule TaskQueue.TelemetryTest do
     end
   end
 
-  describe "Telemetry.setup/0 — handler attachment" do
+  describe "Telemetry.setup/0 -- handler attachment" do
     test "setup attaches handlers without error" do
-      # Detach first to avoid duplicate ID error
       :telemetry.detach("task-queue-telemetry")
       assert :ok = TaskQueue.Telemetry.setup()
     end
@@ -322,7 +265,6 @@ defmodule TaskQueue.TelemetryTest do
     test "attached handlers survive a re-setup if detached first" do
       :telemetry.detach("task-queue-telemetry")
       TaskQueue.Telemetry.setup()
-      # If handlers were attached, execute will not raise
       Worker.execute(%{id: "j5", type: "noop", args: %{}})
       assert_receive {:telemetry, [:task_queue, :job, :start], _, _}
     end
@@ -330,7 +272,7 @@ defmodule TaskQueue.TelemetryTest do
 end
 ```
 
-### Step 6: Run the tests
+### Step 6: Run
 
 ```bash
 mix deps.get
@@ -343,79 +285,35 @@ mix test test/task_queue/telemetry_test.exs --trace
 
 | Approach | Decoupled from backend | Structured data | BEAM ecosystem compatible |
 |----------|------------------------|-----------------|--------------------------|
-| `:telemetry.execute/3` | yes — handlers are separate | yes — maps | yes — standard |
-| `Logger.info/1` | no — format is a string | no | no |
-| Custom metrics GenServer | no — callers coupled to it | yes | no |
-| `:statsix` / `:prometheus_ex` directly | no — backend embedded in code | yes | no |
-
-Reflection question: `:telemetry.attach/4` takes a handler ID. What happens if you call `setup/0` twice without detaching first? How would you make `setup/0` idempotent?
-
-Answer: `:telemetry.attach/4` raises if the handler ID already exists. To make `setup/0` idempotent, detach before attaching: `:telemetry.detach("task-queue-telemetry")` followed by the attach call. The detach returns `:ok` if the ID exists or `{:error, :not_found}` if it does not — either way, the subsequent attach succeeds.
+| `:telemetry.execute/3` | yes -- handlers are separate | yes -- maps | yes -- standard |
+| `Logger.info/1` | no -- format is a string | no | no |
+| Custom metrics GenServer | no -- callers coupled to it | yes | no |
+| `:statsix` / `:prometheus_ex` directly | no -- backend embedded in code | yes | no |
 
 ---
 
 ## Common production mistakes
 
 **1. Calling `setup/0` multiple times without detaching**
-
-`:telemetry.attach/4` raises if the handler ID is already registered. Always detach before reattaching, or check with `:telemetry.list_handlers/1`:
-
-```elixir
-def setup do
-  :telemetry.detach("task-queue-telemetry")
-  :telemetry.attach_many("task-queue-telemetry", events, &handle_event/4, nil)
-end
-```
+`:telemetry.attach/4` raises if the handler ID is already registered. Detach before reattaching.
 
 **2. Doing heavy work inside the handler**
-
-Telemetry handlers are called synchronously in the process that called `:telemetry.execute/3`. A slow handler (HTTP call to a metrics backend) blocks the worker:
-
-```elixir
-# Wrong — HTTP call inside the handler blocks the worker
-def handle_event(event, measurements, metadata, _config) do
-  HTTPClient.post("https://metrics.example.com", body: Jason.encode!(%{...}))
-end
-
-# Right — send to a dedicated reporter process; worker continues immediately
-def handle_event(event, measurements, metadata, _config) do
-  send(TaskQueue.MetricsReporter, {:telemetry_event, event, measurements, metadata})
-end
-```
+Telemetry handlers are called synchronously in the caller's process. A slow handler blocks the worker. Send to a dedicated reporter process.
 
 **3. Using raw integers for duration without unit conversion**
-
-`System.monotonic_time()` returns native time units that vary by OS. Always convert:
-
-```elixir
-# Wrong — unit is platform-dependent
-measurements.duration  # could be nanoseconds, microseconds, or native ticks
-
-# Right
-System.convert_time_unit(measurements.duration, :native, :millisecond)
-```
+`System.monotonic_time()` returns native time units that vary by OS. Always convert with `System.convert_time_unit/3`.
 
 **4. Forgetting to detach handlers in test cleanup**
+Test handlers persist for the lifetime of the test suite unless explicitly detached. Use `on_exit/1`.
 
-Test handlers attached with `attach/4` persist for the lifetime of the test suite unless explicitly detached. Use `on_exit/1` in the test `setup` block to detach after each test.
-
-**5. Using atoms for handler IDs in tests**
-
-If tests run concurrently (`async: true`), multiple test processes attach handlers with the same ID:
-
-```elixir
-# Wrong — ID collision in async tests
-:telemetry.attach(:test_handler, events, handler, nil)
-
-# Right — use a unique ID per test process
-:telemetry.attach("test-handler-#{inspect(self())}", events, handler, nil)
-```
+**5. Using atoms for handler IDs in concurrent tests**
+Multiple test processes attach handlers with the same ID. Use `"test-handler-#{inspect(self())}"` for unique IDs.
 
 ---
 
 ## Resources
 
-- [Telemetry — official hex package](https://hexdocs.pm/telemetry/readme.html)
-- [Telemetry.Metrics — higher-level aggregation](https://hexdocs.pm/telemetry_metrics/TelemetryMetrics.html)
-- [Instrumenting Elixir with Telemetry — Elixir School](https://elixirschool.com/en/lessons/advanced/telemetry)
-- [OpenTelemetry for Elixir — open-telemetry](https://github.com/open-telemetry/opentelemetry-erlang)
+- [Telemetry -- official hex package](https://hexdocs.pm/telemetry/readme.html)
+- [Telemetry.Metrics -- higher-level aggregation](https://hexdocs.pm/telemetry_metrics/TelemetryMetrics.html)
+- [Instrumenting Elixir with Telemetry -- Elixir School](https://elixirschool.com/en/lessons/advanced/telemetry)
+- [OpenTelemetry for Elixir](https://github.com/open-telemetry/opentelemetry-erlang)

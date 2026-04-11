@@ -1,34 +1,5 @@
 # Processes: spawn, send, and receive
 
-**Project**: `task_queue` — built incrementally across the intermediate level
-
----
-
-## Project context
-
-You are building `task_queue`, an OTP-based task management system. At this point the
-project is brand new. The first concrete need is a **worker process** that can receive
-job descriptions, execute them, and report results back to a coordinator.
-
-Before reaching GenServer, you need to understand the raw primitives underneath it:
-`spawn`, `send`, and `receive`. Every OTP abstraction is built on exactly these three.
-
-Project structure at this point:
-
-```
-task_queue/
-├── lib/
-│   └── task_queue/
-│       ├── worker_process.ex
-│       └── accumulator.ex
-├── test/
-│   └── task_queue/
-│       └── worker_process_test.exs   # given tests — must pass without modification
-└── mix.exs
-```
-
----
-
 ## Why learn raw processes before GenServer
 
 GenServer is the right tool for production workers. But if you do not understand `spawn`,
@@ -56,16 +27,17 @@ accumulate — a real production problem if not designed carefully.
 
 ## The business problem
 
-The task_queue system needs a primitive worker loop: a process that receives a `{:run, job_fn,
-reply_to}` message, executes `job_fn.()`, and sends the result back to `reply_to`. The process
-must also handle a `:stop` message for graceful shutdown. It should not crash if `job_fn`
-raises — instead it should send `{:error, reason}` back to the caller.
+Build a primitive worker loop: a process that receives a `{:run, job_fn, reply_to}` message,
+executes `job_fn.()`, and sends the result back to `reply_to`. The process must also handle
+a `:stop` message for graceful shutdown. It should not crash if `job_fn` raises — instead
+it should send `{:error, reason}` back to the caller.
+
+Also build an accumulator: a stateful process that holds a list of completed task results.
+This demonstrates stateful receive loops — the same pattern GenServer uses internally.
 
 ---
 
-## Implementation
-
-### Step 1: Create the project
+## Project setup
 
 ```bash
 mix new task_queue --sup
@@ -74,20 +46,32 @@ mkdir -p lib/task_queue
 mkdir -p test/task_queue
 ```
 
-### Step 2: `lib/task_queue/worker_process.ex`
+```
+task_queue/
+├── lib/
+│   └── task_queue/
+│       ├── worker_process.ex
+│       └── accumulator.ex
+├── test/
+│   └── task_queue/
+│       └── worker_process_test.exs
+└── mix.exs
+```
+
+---
+
+## Implementation
+
+### `lib/task_queue/worker_process.ex`
 
 ```elixir
 defmodule TaskQueue.WorkerProcess do
   @moduledoc """
   A raw-process worker built with spawn, send, and receive.
 
-  This is the conceptual predecessor to TaskQueue.Worker (which uses GenServer).
   Understanding this module makes GenServer internals transparent.
+  Every OTP abstraction is built on exactly these three primitives.
   """
-
-  # ---------------------------------------------------------------------------
-  # Public API
-  # ---------------------------------------------------------------------------
 
   @doc """
   Spawns a worker process and returns its PID.
@@ -135,10 +119,6 @@ defmodule TaskQueue.WorkerProcess do
     :ok
   end
 
-  # ---------------------------------------------------------------------------
-  # Private — the receive loop
-  # ---------------------------------------------------------------------------
-
   defp loop do
     receive do
       {:run, job_fn, reply_to} ->
@@ -171,10 +151,10 @@ Why call `loop()` inside each branch rather than after the `receive` block? Beca
 pattern matching is exhaustive — if `:stop` arrives and we called `loop()` unconditionally
 after the receive, the process would loop forever instead of terminating.
 
-### Step 3: `lib/task_queue/accumulator.ex`
+### `lib/task_queue/accumulator.ex`
 
-A process that holds a list of completed task results. This demonstrates stateful
-receive loops — the same pattern GenServer uses internally.
+A process that holds a list of completed task results. State is carried as a recursive
+function argument — no shared memory, no locks.
 
 ```elixir
 defmodule TaskQueue.Accumulator do
@@ -219,10 +199,6 @@ defmodule TaskQueue.Accumulator do
     :ok
   end
 
-  # ---------------------------------------------------------------------------
-  # Private
-  # ---------------------------------------------------------------------------
-
   defp loop(results) do
     receive do
       {:record, result} ->
@@ -252,7 +228,7 @@ Each branch decides independently whether to recurse (`:record`, `:fetch`, `:cle
 or terminate (`:stop`). This is exactly what GenServer does internally with its
 `{:noreply, new_state}` and `{:stop, reason, state}` return tuples.
 
-### Step 4: Given tests — must pass without modification
+### Tests
 
 ```elixir
 # test/task_queue/worker_process_test.exs
@@ -323,7 +299,7 @@ defmodule TaskQueue.WorkerProcessTest do
 end
 ```
 
-### Step 5: Run the tests
+### Run the tests
 
 ```bash
 mix test test/task_queue/worker_process_test.exs --trace
@@ -341,10 +317,6 @@ mix test test/task_queue/worker_process_test.exs --trace
 | Supervision | Manual monitor/link wiring | Works with Supervisor directly | Task.Supervisor |
 | When to use | Learning / extreme control | Production servers with state | Concurrent one-shot work |
 
-Reflection question: the accumulator uses a list prepended with `[result | results]` and
-reversed on `fetch`. Why not append with `results ++ [result]`? What is the time complexity
-of each, and when does it matter in a task queue with 10,000 entries per minute?
-
 ---
 
 ## Common production mistakes
@@ -356,8 +328,7 @@ will consume gigabytes of memory. Add a `_other -> :ok` clause and log unexpecte
 
 **2. Missing `after` in receive for external calls**
 A receive without `after` blocks forever if the expected message never arrives. Any receive
-that depends on a message from another process should have a timeout. The standard is 5,000ms
-for interactive calls.
+that depends on a message from another process should have a timeout.
 
 **3. Forgetting to capture `self()` before spawn**
 Inside a `spawn` closure, `self()` returns the PID of the spawned process, not the parent.
@@ -365,7 +336,7 @@ Capture the parent PID in a variable before `spawn` if the child needs to reply.
 
 **4. Using spawn where spawn_link belongs**
 Bare `spawn` creates an isolated process. If it crashes, the parent never knows. In an OTP
-tree, workers should be linked (via GenServer + Supervisor) so failures propagate correctly.
+tree, workers should be linked so failures propagate correctly.
 
 **5. Calling loop() after every receive branch unconditionally**
 If the `:stop` branch also calls `loop()`, the process never terminates. Each branch must
@@ -378,4 +349,4 @@ decide explicitly whether to continue the loop.
 - [Process module — HexDocs](https://hexdocs.pm/elixir/Process.html)
 - [Kernel.spawn_link/1 — HexDocs](https://hexdocs.pm/elixir/Kernel.html#spawn_link/1)
 - [Elixir Getting Started: Processes](https://elixir-lang.org/getting-started/processes.html)
-- [The BEAM Book — Erik Stenman](https://github.com/happi/theBeamBook) — chapters on process structure and mailboxes
+- [The BEAM Book — Erik Stenman](https://github.com/happi/theBeamBook)

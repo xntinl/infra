@@ -79,7 +79,73 @@ defp deps do
 end
 ```
 
-### Step 3: Write-ahead log
+### Step 3: Bloom filter
+
+```elixir
+# lib/lsmex/bloom.ex
+defmodule Lsmex.Bloom do
+  @moduledoc """
+  Bloom filter backed by a bitstring.
+
+  A Bloom filter is a probabilistic data structure that can tell you
+  "definitely not in set" or "probably in set." It uses multiple hash
+  functions to set bits in a bit array. The false positive rate is
+  controlled by the ratio of bits to elements and the number of hash
+  functions.
+
+  Optimal parameters for target false positive rate `fp`:
+    bits_per_element = -1.44 * log2(fp)
+    num_hashes       = round(bits_per_element * ln(2))
+  """
+
+  defstruct [:bits, :size, :num_hashes]
+
+  @doc "Builds a Bloom filter from a list of keys with the given target false positive rate."
+  @spec build([binary()], keyword()) :: %__MODULE__{}
+  def build(keys, opts \\ []) do
+    target_fp = Keyword.get(opts, :target_fp, 0.01)
+    n = max(length(keys), 1)
+
+    bits_per_element = -1.44 * :math.log2(target_fp)
+    total_bits = trunc(n * bits_per_element) |> max(64)
+    num_hashes = round(bits_per_element * :math.log(2)) |> max(1)
+
+    bit_array = :atomics.new(div(total_bits, 64) + 1, signed: false)
+
+    Enum.each(keys, fn key ->
+      for i <- 0..(num_hashes - 1) do
+        bit_index = hash(key, i, total_bits)
+        word_index = div(bit_index, 64) + 1
+        bit_offset = rem(bit_index, 64)
+        current = :atomics.get(bit_array, word_index)
+        :atomics.put(bit_array, word_index, Bitwise.bor(current, Bitwise.bsl(1, bit_offset)))
+      end
+    end)
+
+    %__MODULE__{bits: bit_array, size: total_bits, num_hashes: num_hashes}
+  end
+
+  @doc "Checks if a key is probably in the set. False means definitely not."
+  @spec member?(%__MODULE__{}, binary()) :: boolean()
+  def member?(%__MODULE__{bits: bit_array, size: total_bits, num_hashes: num_hashes}, key) do
+    Enum.all?(0..(num_hashes - 1), fn i ->
+      bit_index = hash(key, i, total_bits)
+      word_index = div(bit_index, 64) + 1
+      bit_offset = rem(bit_index, 64)
+      current = :atomics.get(bit_array, word_index)
+      Bitwise.band(current, Bitwise.bsl(1, bit_offset)) != 0
+    end)
+  end
+
+  defp hash(key, seed, total_bits) do
+    h1 = :erlang.phash2({key, 0}, 1_000_000_000)
+    h2 = :erlang.phash2({key, 1}, 1_000_000_000)
+    rem(abs(h1 + seed * h2), total_bits)
+  end
+end
+```
+
+### Step 4: Write-ahead log
 
 ```elixir
 # lib/lsmex/wal.ex
@@ -138,7 +204,7 @@ defmodule Lsmex.WAL do
 end
 ```
 
-### Step 4: SSTable
+### Step 5: SSTable
 
 ```elixir
 # lib/lsmex/sstable.ex
@@ -150,11 +216,11 @@ defmodule Lsmex.SSTable do
     [data block 1] [data block 2] ... [footer]
 
   Each data block:
-    <<block_len::32, crc32::32, N × (key_len::32, val_len::32, key::binary, val::binary)>>
+    <<block_len::32, crc32::32, N x (key_len::32, val_len::32, key::binary, val::binary)>>
 
   Footer (at end of file):
     <<index_offset::64>> followed by:
-    index: N × (key::binary, byte_offset::64) for binary search
+    index: N x (key::binary, byte_offset::64) for binary search
 
   Bloom filter is stored in a separate .bloom file alongside the .sst file.
   """
@@ -162,7 +228,6 @@ defmodule Lsmex.SSTable do
   @doc "Writes a sorted list of {key, value} pairs to a new SSTable file."
   @spec write(Path.t(), [{binary(), binary()}]) :: :ok
   def write(path, entries) do
-    index = []
     {:ok, fd} = :file.open(path, [:write, :binary, :raw])
 
     {_offset, index} =
@@ -212,7 +277,7 @@ defmodule Lsmex.SSTable do
       case Enum.find(index, fn {k, _off} -> k == key_bin end) do
         nil -> {:error, :not_found}
         {_k, offset} ->
-          <<_before::binary-size(offset), block_len::32, _crc::32,
+          <<_before::binary-size(offset), _block_len::32, _crc::32,
             klen::32, vlen::32, _key::binary-size(klen), val::binary-size(vlen),
             _rest::binary>> = content
           {:ok, val}
@@ -222,7 +287,243 @@ defmodule Lsmex.SSTable do
 end
 ```
 
-### Step 5: Given tests — must pass without modification
+### Step 6: MemTable
+
+```elixir
+# lib/lsmex/memtable.ex
+defmodule Lsmex.Memtable do
+  @moduledoc """
+  In-memory sorted table backed by ETS ordered_set.
+
+  Stores {key, value} pairs where value is nil for tombstones (deletes).
+  The ordered_set guarantees iteration in sorted key order, which is
+  required for flushing to an SSTable.
+  """
+
+  @doc "Creates a new MemTable ETS table. Returns the table reference."
+  @spec new() :: :ets.tid()
+  def new do
+    :ets.new(:memtable, [:ordered_set, :public])
+  end
+
+  @doc "Inserts or updates a key-value pair in the MemTable."
+  @spec put(:ets.tid(), binary(), binary() | nil) :: true
+  def put(table, key, value) do
+    :ets.insert(table, {key, value})
+  end
+
+  @doc "Retrieves a value by key. Returns {:ok, value} | {:error, :not_found}."
+  @spec get(:ets.tid(), binary()) :: {:ok, binary() | nil} | {:error, :not_found}
+  def get(table, key) do
+    case :ets.lookup(table, key) do
+      [{^key, value}] -> {:ok, value}
+      [] -> {:error, :not_found}
+    end
+  end
+
+  @doc "Returns all entries as a sorted list of {key, value} tuples."
+  @spec to_sorted_list(:ets.tid()) :: [{binary(), binary() | nil}]
+  def to_sorted_list(table) do
+    :ets.tab2list(table)
+  end
+
+  @doc "Returns the number of entries in the MemTable."
+  @spec size(:ets.tid()) :: non_neg_integer()
+  def size(table) do
+    :ets.info(table, :size)
+  end
+
+  @doc "Deletes the MemTable ETS table."
+  @spec destroy(:ets.tid()) :: true
+  def destroy(table) do
+    :ets.delete(table)
+  end
+end
+```
+
+### Step 7: Engine — public API
+
+```elixir
+# lib/lsmex/engine.ex
+defmodule Lsmex.Engine do
+  use GenServer
+
+  @moduledoc """
+  Public API for the LSM-tree storage engine.
+
+  Provides put/get/delete/scan operations. Writes go to the WAL first
+  (for durability), then to the in-memory MemTable. When the MemTable
+  exceeds a size threshold, it is flushed to disk as an SSTable.
+
+  Reads check the MemTable first, then SSTables in reverse chronological
+  order (newest first). The first match wins.
+  """
+
+  @memtable_flush_threshold 1_000
+  @tombstone :__tombstone__
+
+  defstruct [:data_dir, :wal_path, :memtable, :sstables, :seq]
+
+  @doc "Starts the engine with the given data directory."
+  @spec start_link(keyword()) :: GenServer.on_start()
+  def start_link(opts) do
+    GenServer.start_link(__MODULE__, opts)
+  end
+
+  @doc "Stores a key-value pair."
+  @spec put(GenServer.server(), binary(), binary()) :: :ok
+  def put(engine, key, value), do: GenServer.call(engine, {:put, key, value})
+
+  @doc "Retrieves a value by key."
+  @spec get(GenServer.server(), binary()) :: {:ok, binary()} | {:error, :not_found}
+  def get(engine, key), do: GenServer.call(engine, {:get, key})
+
+  @doc "Deletes a key by inserting a tombstone."
+  @spec delete(GenServer.server(), binary()) :: :ok
+  def delete(engine, key), do: GenServer.call(engine, {:delete, key})
+
+  @doc "Scans keys in [from, to) range. Returns a list of {key, value} pairs."
+  @spec scan(GenServer.server(), binary(), binary()) :: Enumerable.t()
+  def scan(engine, from, to), do: GenServer.call(engine, {:scan, from, to})
+
+  @impl true
+  def init(opts) do
+    data_dir = Keyword.fetch!(opts, :data_dir)
+    File.mkdir_p!(data_dir)
+    wal_path = Path.join(data_dir, "wal.log")
+    memtable = Lsmex.Memtable.new()
+
+    sstables = discover_sstables(data_dir)
+
+    Lsmex.WAL.replay(wal_path, fn {key, value} ->
+      Lsmex.Memtable.put(memtable, key, value)
+    end)
+
+    seq = length(sstables)
+
+    {:ok, %__MODULE__{
+      data_dir: data_dir,
+      wal_path: wal_path,
+      memtable: memtable,
+      sstables: sstables,
+      seq: seq
+    }}
+  end
+
+  @impl true
+  def handle_call({:put, key, value}, _from, state) do
+    key_bin = ensure_binary(key)
+    val_bin = ensure_binary(value)
+
+    :ok = Lsmex.WAL.append(state.wal_path, key_bin, val_bin)
+    Lsmex.Memtable.put(state.memtable, key_bin, val_bin)
+
+    state = maybe_flush(state)
+    {:reply, :ok, state}
+  end
+
+  @impl true
+  def handle_call({:get, key}, _from, state) do
+    key_bin = ensure_binary(key)
+
+    result =
+      case Lsmex.Memtable.get(state.memtable, key_bin) do
+        {:ok, nil} -> {:error, :not_found}
+        {:ok, value} -> {:ok, value}
+        {:error, :not_found} -> search_sstables(state.sstables, key_bin)
+      end
+
+    {:reply, result, state}
+  end
+
+  @impl true
+  def handle_call({:delete, key}, _from, state) do
+    key_bin = ensure_binary(key)
+
+    :ok = Lsmex.WAL.append(state.wal_path, key_bin, nil)
+    Lsmex.Memtable.put(state.memtable, key_bin, nil)
+
+    state = maybe_flush(state)
+    {:reply, :ok, state}
+  end
+
+  @impl true
+  def handle_call({:scan, from, to}, _from, state) do
+    mem_entries =
+      state.memtable
+      |> Lsmex.Memtable.to_sorted_list()
+      |> Enum.filter(fn {k, v} -> k >= from and k < to and v != nil end)
+
+    {:reply, mem_entries, state}
+  end
+
+  defp maybe_flush(state) do
+    if Lsmex.Memtable.size(state.memtable) >= @memtable_flush_threshold do
+      flush_memtable(state)
+    else
+      state
+    end
+  end
+
+  defp flush_memtable(state) do
+    entries =
+      state.memtable
+      |> Lsmex.Memtable.to_sorted_list()
+      |> Enum.reject(fn {_k, v} -> is_nil(v) end)
+
+    sst_path = Path.join(state.data_dir, "sst_#{state.seq}.sst")
+    Lsmex.SSTable.write(sst_path, entries)
+
+    Lsmex.Memtable.destroy(state.memtable)
+    new_memtable = Lsmex.Memtable.new()
+
+    File.rm(state.wal_path)
+
+    %{state |
+      memtable: new_memtable,
+      sstables: [sst_path | state.sstables],
+      seq: state.seq + 1
+    }
+  end
+
+  defp search_sstables([], _key), do: {:error, :not_found}
+  defp search_sstables([sst_path | rest], key) do
+    case Lsmex.SSTable.get(sst_path, key) do
+      {:ok, value} -> {:ok, value}
+      {:error, :not_found} -> search_sstables(rest, key)
+    end
+  end
+
+  defp discover_sstables(data_dir) do
+    data_dir
+    |> File.ls!()
+    |> Enum.filter(&String.ends_with?(&1, ".sst"))
+    |> Enum.sort(:desc)
+    |> Enum.map(&Path.join(data_dir, &1))
+  end
+
+  defp ensure_binary(val) when is_binary(val), do: val
+  defp ensure_binary(val), do: :erlang.term_to_binary(val)
+end
+```
+
+### Step 8: Application supervisor
+
+```elixir
+# lib/lsmex/application.ex
+defmodule Lsmex.Application do
+  use Application
+
+  @impl true
+  def start(_type, _args) do
+    children = []
+    opts = [strategy: :one_for_one, name: Lsmex.Supervisor]
+    Supervisor.start_link(children, opts)
+  end
+end
+```
+
+### Step 9: Given tests — must pass without modification
 
 ```elixir
 # test/lsmex/engine_test.exs
@@ -299,13 +600,13 @@ defmodule Lsmex.BloomTest do
 end
 ```
 
-### Step 6: Run the tests
+### Step 10: Run the tests
 
 ```bash
 mix test test/lsmex/ --trace
 ```
 
-### Step 7: Benchmark
+### Step 11: Benchmark
 
 ```elixir
 # bench/lsmex_bench.exs

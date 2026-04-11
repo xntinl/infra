@@ -1,12 +1,9 @@
 # Protocol Consolidation and Dispatch Performance
 
-**Project**: `api_gateway` — built incrementally across the advanced level
-
----
-
 ## Project context
 
-You're building `api_gateway`. The gateway serializes request and response data
+You are building `api_gateway`, an internal HTTP gateway that routes traffic to microservices.
+The gateway serializes request and response data
 to multiple formats (JSON body, log lines, telemetry metadata) depending on the
 context. Different parts of the codebase produce different struct types: `Conn`,
 `Route`, `RateLimitResult`, `AuthToken`, `ErrorResponse`. All need to be serializable
@@ -20,7 +17,7 @@ As the number of protocol implementations grows, the protocol dispatch path show
 up in profiling. This exercise covers how Elixir dispatches protocols, what
 consolidation does, and how to design protocols for zero-overhead dispatch in prod.
 
-Project structure at this point:
+Project structure:
 
 ```
 api_gateway/
@@ -28,14 +25,9 @@ api_gateway/
 │   └── api_gateway/
 │       ├── application.ex
 │       ├── router.ex
-│       ├── protocols/
-│       │   ├── serializable.ex
-│       │   └── loggable.ex
-│       ├── middleware/
-│       │   ├── pipeline.ex
-│       │   ├── instrumentation.ex
-│       │   └── dsl.ex
-│       └── ...
+│       └── protocols/
+│           ├── serializable.ex
+│           └── loggable.ex
 ├── test/
 │   └── api_gateway/
 │       └── protocols/

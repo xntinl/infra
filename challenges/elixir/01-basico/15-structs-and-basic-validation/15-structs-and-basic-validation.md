@@ -1,53 +1,28 @@
 # Structs and Basic Validation: Formalizing the Transaction Type
 
-**Project**: `payments_cli` — built incrementally across the basic level
+**Project**: `payments_cli` — a CLI tool that processes payment transactions
 
 ---
 
 ## Project context
 
-You're building `payments_cli`. After fourteen exercises, the transaction data has
-been passed around as plain maps: `%{id: "T1", status: :approved, amount_cents: 1000, ...}`.
-That works, but it has a critical weakness: nothing prevents a caller from passing
-`%{id: "T1", amount: 1000}` (forgetting `amount_cents`) or `%{status: "approved"}`
-(wrong type for status). The compiler cannot help — it has no idea what shape a
-"transaction" should have.
+You are building `payments_cli`, a CLI tool that processes payment transactions from CSV
+files, validates them, applies business rules, and produces ledger reports.
 
-Structs fix this. A `%PaymentsCli.Transaction{}` struct declares the exact fields
-at compile time, provides defaults, and enables pattern matching by type. This exercise
-replaces the ad-hoc map convention with a proper typed struct, giving the entire
-project a stable, documented contract for what a transaction is.
-
-Project structure at this point:
-
-```
-payments_cli/
-├── lib/
-│   └── payments_cli/
-│       ├── cli.ex
-│       ├── transaction.ex      # ← you extend this (add defstruct)
-│       ├── ledger.ex
-│       ├── formatter.ex
-│       ├── pipeline.ex
-│       ├── processor.ex
-│       ├── router.ex
-│       ├── analytics.ex
-│       ├── report.ex
-│       ├── rules.ex
-│       └── config.ex
-├── test/
-│   └── payments_cli/
-│       └── transaction_struct_test.exs  # given tests — must pass without modification
-└── mix.exs
-```
+This exercise implements a `Transaction` struct with a validated constructor, status
+management, and formatting. Instead of passing transaction data as plain maps
+(`%{id: "T1", status: :approved, amount_cents: 1000}`), a struct declares the exact
+fields at compile time, provides defaults, and enables pattern matching by type. This
+gives the entire project a stable, documented contract for what a transaction is.
 
 ---
 
 ## Why structs are an architectural decision, not syntax sugar
 
-Up to this point, the project has used convention to communicate what a transaction
-looks like. Every module has a comment like `# transactions are maps with :id, :status,
-:amount_cents, :currency`. This is documentation — invisible to the compiler.
+Plain maps work for passing data around, but they have a critical weakness: nothing
+prevents a caller from passing `%{id: "T1", amount: 1000}` (forgetting `amount_cents`)
+or `%{status: "approved"}` (wrong type for status). The compiler cannot help — it has
+no idea what shape a "transaction" should have.
 
 A struct changes that:
 
@@ -72,20 +47,18 @@ entity like a transaction — a struct is the right tool.
 
 ## The business problem
 
-The `PaymentsCli.Transaction` module already has functions (`classify_status/1`,
-`parse_status/1`, etc.) that work on maps. This exercise adds a `defstruct` to that
-module, a validated `new/1` constructor, and functions that leverage pattern matching
-by struct type.
+The `Transaction` module needs:
 
-The new `%Transaction{}` struct captures all the fields that the rest of the project
-has been using by convention: `:id`, `:status`, `:amount_cents`, `:currency`,
-`:merchant`, `:date`, and `:reference`.
+1. A `defstruct` that declares all transaction fields with appropriate defaults
+2. A validated `new/1` constructor that checks required fields and value constraints
+3. Functions that leverage pattern matching by struct type (`approved?/1`, `set_status/2`)
+4. A formatting function that extracts data from the struct
 
 ---
 
 ## Implementation
 
-### Extend `lib/payments_cli/transaction.ex`
+### `lib/payments_cli/transaction.ex`
 
 The struct uses `@enforce_keys` for required fields and provides defaults for
 optional fields. The `new/1` constructor validates required fields are present
@@ -339,7 +312,7 @@ end
 - `format_amount/1` extracts `amount_cents` from the struct in the function head,
   splits into dollars and cents, and formats with a leading zero on the cents part.
 
-### Given tests — must pass without modification
+### Tests
 
 ```elixir
 # test/payments_cli/transaction_struct_test.exs

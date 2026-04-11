@@ -1,36 +1,18 @@
 # Anonymous Functions and Closures: Configurable Processing Rules
 
-**Project**: `payments_cli` — built incrementally across the basic level
+**Project**: `payments_cli` — a CLI tool that processes payment transactions
 
 ---
 
 ## Project context
 
-You're building `payments_cli`. The system needs configurable processing rules —
-fee calculators, formatters, and validators that can be swapped at runtime without
-changing module APIs. Anonymous functions and closures are the mechanism.
+You are building `payments_cli`, a CLI tool that processes payment transactions from CSV
+files, validates them, applies business rules, and produces ledger reports.
 
-Project structure at this point:
-
-```
-payments_cli/
-├── lib/
-│   └── payments_cli/
-│       ├── cli.ex
-│       ├── transaction.ex
-│       ├── ledger.ex
-│       ├── formatter.ex
-│       ├── pipeline.ex
-│       ├── processor.ex
-│       ├── router.ex
-│       ├── analytics.ex
-│       ├── report.ex
-│       └── rules.ex        # ← you implement this
-├── test/
-│   └── payments_cli/
-│       └── rules_test.exs  # given tests — must pass without modification
-└── mix.exs
-```
+This exercise implements a `Rules` module that provides factory functions returning
+configured closures: fee calculators, transaction filters, formatters, and validators
+that can be swapped at runtime without changing module APIs. Anonymous functions and
+closures are the mechanism that enables this runtime configurability.
 
 ---
 
@@ -279,7 +261,7 @@ end
   If no errors, return `:ok`. If errors, return them in order (reversed back from
   accumulation order).
 
-### Given tests — must pass without modification
+### Tests
 
 ```elixir
 # test/payments_cli/rules_test.exs

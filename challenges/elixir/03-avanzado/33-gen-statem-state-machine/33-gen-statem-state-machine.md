@@ -1,18 +1,19 @@
 # State Machines with `:gen_statem`
 
-**Project**: `api_gateway` — built incrementally across the advanced level
+**Project**: `api_gateway` — a standalone HTTP gateway exercise
 
 ---
 
 ## Project context
 
-`api_gateway` needs a circuit breaker to protect downstream microservices. The circuit
-breaker has exactly three states (`:closed`, `:open`, `:half_open`) whose behavior is
-radically different. Modeling this as a GenServer with `if state == :open do ...` guards
-scattered across handlers is error-prone and hard to reason about. You will use `:gen_statem`
-to make state explicit and transitions first-class.
+You are building `api_gateway`, an HTTP gateway that routes traffic to microservices. The
+gateway needs a circuit breaker to protect downstream microservices. The circuit breaker
+has exactly three states (`:closed`, `:open`, `:half_open`) whose behavior is radically
+different. Modeling this as a GenServer with `if state == :open do ...` guards scattered
+across handlers is error-prone and hard to reason about. You will use `:gen_statem` to
+make state explicit and transitions first-class.
 
-Project structure at this point:
+Project structure:
 
 ```
 api_gateway/
@@ -20,10 +21,8 @@ api_gateway/
 │   └── api_gateway/
 │       ├── application.ex
 │       ├── router.ex
-│       ├── rate_limiter/
 │       └── circuit_breaker/
-│           ├── breaker.ex          # ← you implement this
-│           └── supervisor.ex       # already exists
+│           └── breaker.ex          # ← circuit breaker state machine
 ├── test/
 │   └── api_gateway/
 │       └── circuit_breaker/
@@ -402,7 +401,6 @@ mix test test/api_gateway/circuit_breaker/breaker_test.exs --trace
 | Adding a new state | New function | New match clause |
 | Adding a shared event | One clause per state (duplication risk) | One clause with guard |
 | Dialyzer support | Cleaner typespecs per state | Harder to specify |
-| `:gen_statem` docs example style | Yes | Yes |
 
 For `CircuitBreaker.Breaker`, `state_functions` is the right choice: `:closed`, `:open`,
 and `:half_open` respond to `{:execute, fun}` in fundamentally different ways with no

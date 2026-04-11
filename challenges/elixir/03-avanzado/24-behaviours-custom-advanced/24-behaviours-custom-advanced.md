@@ -1,12 +1,9 @@
 # Advanced Behaviours with Compile-Time Validation
 
-**Project**: `api_gateway` — built incrementally across the advanced level
-
----
-
 ## Project context
 
-You're building `api_gateway`. The gateway supports pluggable middleware components,
+You are building `api_gateway`, an internal HTTP gateway that routes traffic to microservices.
+The gateway supports pluggable middleware components,
 and teams contribute new middleware constantly. Without a formal contract, middleware
 modules vary in their function signatures, miss required callbacks, or skip optional
 lifecycle hooks — causing runtime crashes that only appear when a specific request
@@ -18,7 +15,7 @@ The solution is a formal `ApiGateway.Middleware.Behaviour` that:
    is implemented — catching missing implementations at `mix compile`, not in prod
 3. Provides default implementations for optional callbacks via `__using__/1`
 
-Project structure at this point:
+Project structure:
 
 ```
 api_gateway/
@@ -26,17 +23,22 @@ api_gateway/
 │   └── api_gateway/
 │       ├── application.ex
 │       ├── router.ex
-│       ├── middleware/
-│       │   ├── pipeline.ex
-│       │   ├── instrumentation.ex
-│       │   ├── dsl.ex
-│       │   └── behaviour.ex
-│       └── ...
+│       └── middleware/
+│           └── behaviour.ex
 ├── test/
 │   └── api_gateway/
 │       └── middleware/
 │           └── behaviour_test.exs
 └── mix.exs
+```
+
+The `ApiGateway.Conn` struct used by the behaviour is defined as:
+
+```elixir
+defmodule ApiGateway.Conn do
+  @moduledoc "Represents an in-flight HTTP connection through the gateway."
+  defstruct [:method, :path, :status, :remote_ip, :assigns]
+end
 ```
 
 ---

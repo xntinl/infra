@@ -1,85 +1,64 @@
 # Error Handling: try/rescue/else/after and Custom Exceptions
 
-**Project**: `task_queue` — built incrementally across the intermediate level
+## Goal
 
----
-
-## Project context
-
-`task_queue` executes arbitrary jobs: send emails, call webhooks, write to S3, run database migrations. These operations fail in many ways — network timeouts, invalid payloads, external service errors. Without structured error handling, a single bad job can crash the worker process and halt the entire queue.
-
-Project structure at this point:
-
-```
-task_queue/
-├── lib/
-│   └── task_queue/
-│       ├── application.ex
-│       ├── worker.ex               # ← you add error handling here
-│       ├── queue_server.ex
-│       ├── scheduler.ex
-│       └── registry.ex
-├── test/
-│   └── task_queue/
-│       └── error_handling_test.exs # given tests — must pass without modification
-└── mix.exs
-```
-
----
-
-## The business problem
-
-The ops team reported two failure modes in production:
-
-1. **Silent crashes** — a worker raises, the supervisor restarts it, but the job is lost with no record of what failed or why
-2. **Resource leaks** — a worker opens a TCP connection to an external agent, crashes mid-job, and the connection is never closed
-
-You need:
-- Custom exception types that carry structured context (job ID, error code, agent address)
-- `try/rescue` boundaries in `Worker.execute/1` that turn exceptions into `{:error, reason}` tuples without losing diagnostic information
-- `after` clauses that guarantee connection cleanup regardless of outcome
-- `reraise` for cases where you need to log and then propagate (letting the supervisor handle the crash)
+Build a `task_queue` worker with structured error handling using custom exceptions (`defexception`), `try/rescue` boundaries that convert exceptions into `{:error, reason}` tuples, `after` clauses for resource cleanup, and `reraise` for log-and-propagate patterns.
 
 ---
 
 ## Why `try/rescue` and not just `{:ok, _} | {:error, _}`
 
-The functional `{:ok, value} | {:error, reason}` style is preferred for expected error paths — validation failures, resource not found, rate limit exceeded. These are not exceptional — they are part of the normal control flow.
+The functional `{:ok, value} | {:error, reason}` style is preferred for expected error paths -- validation failures, resource not found, rate limit exceeded. These are not exceptional.
 
-`try/rescue` is for truly exceptional conditions: bugs in job handler code, unexpected raises from third-party libraries, protocol violations from external agents. You cannot pattern-match your way out of a `RuntimeError` raised inside a `Jason.decode!` call; you need `rescue`.
+`try/rescue` is for truly exceptional conditions: bugs in job handler code, unexpected raises from third-party libraries, protocol violations from external agents. You cannot pattern-match your way out of a `RuntimeError` raised inside a `Jason.decode!` call.
 
-The practical rule for `task_queue`:
+The practical rule:
 - Job validation failure -> `{:error, :invalid_job}`
 - External HTTP call returns 404 -> `{:error, :not_found}`
-- External HTTP call raises `Req.TransportError` -> `rescue` it and return `{:error, {:transport, reason}}`
-- Bug in job handler code -> `rescue`, log with full stacktrace, `reraise` to let the supervisor restart the worker
+- External HTTP call raises a transport error -> `rescue` and return `{:error, {:transport, reason}}`
+- Bug in job handler code -> `rescue`, log with full stacktrace, `reraise` to let the supervisor restart
 
 ---
 
-## Why `defexception` and not plain maps or atoms
+## Why `defexception` and not plain atoms
 
-Atoms like `:timeout` or `:invalid_payload` are too coarse for diagnosis. A `:timeout` on which job? From which agent? At which retry?
-
-`defexception` lets you define structured exception types with named fields:
-
-```elixir
-defmodule TaskQueue.JobError do
-  defexception [:message, :job_id, :reason]
-end
-
-raise TaskQueue.JobError,
-  job_id: "abc-123",
-  reason: :payload_too_large,
-  message: "Job abc-123 rejected: payload exceeds 64KB limit"
-```
-
-When this exception is rescued, `e.job_id` and `e.reason` are available for structured logging — not just a string message.
+Atoms like `:timeout` are too coarse for diagnosis. `defexception` defines structured exception types with named fields. When rescued, `e.job_id` and `e.reason` are available for structured logging -- not just a string message.
 
 ---
 
 ## Implementation
 
-### Step 1: `lib/task_queue/worker.ex` — custom exceptions and error handling
+### Step 1: `mix.exs`
+
+```elixir
+defmodule TaskQueue.MixProject do
+  use Mix.Project
+
+  def project do
+    [
+      app: :task_queue,
+      version: "0.1.0",
+      elixir: "~> 1.15",
+      start_permanent: Mix.env() == :prod,
+      deps: deps()
+    ]
+  end
+
+  def application do
+    [extra_applications: [:logger]]
+  end
+
+  defp deps, do: []
+end
+```
+
+### Step 2: `lib/task_queue/worker.ex` -- custom exceptions and error handling
+
+The Worker defines two custom exception types as nested modules. `JobError` carries a `job_id` and `reason` for domain-level failures. `AgentError` carries an `agent_address` and `status_code` for communication failures. The `exception/1` callback customizes how the exception is built from keyword options.
+
+`execute/1` wraps all work in `try/rescue` so it never raises -- callers always get `{:ok, result}` or `{:error, reason}`.
+
+`execute_with_agent/2` demonstrates the `after` clause: the connection is opened *before* the try block (so it is always bound), and `close_agent_connection/1` runs regardless of success or failure. The `reraise` in the rescue clause preserves the original stacktrace with `__STACKTRACE__` -- using an empty list `[]` instead would point to the rescue clause, losing the original origin.
 
 ```elixir
 defmodule TaskQueue.Worker do
@@ -129,8 +108,7 @@ defmodule TaskQueue.Worker do
   @doc """
   Executes a job map, returning `{:ok, result}` or `{:error, reason}`.
 
-  Never raises — all exceptions are caught and converted to error tuples.
-  Logs the full exception and stacktrace before converting.
+  Never raises -- all exceptions are caught and converted to error tuples.
 
   ## Examples
 
@@ -167,7 +145,6 @@ defmodule TaskQueue.Worker do
   Executes a job that requires a connection to an external worker agent.
 
   Guarantees the connection is closed even if execution raises.
-
   The `agent_address` is a string like `"tcp://agent-1.internal:9000"`.
   """
   @spec execute_with_agent(map(), String.t()) :: {:ok, term()} | {:error, term()}
@@ -186,8 +163,6 @@ defmodule TaskQueue.Worker do
       close_agent_connection(conn)
     end
   end
-
-  # Private helpers — dispatch based on job type
 
   defp do_execute("noop", _args, _job_id), do: :noop
   defp do_execute("echo", args, _job_id), do: args
@@ -219,7 +194,7 @@ defmodule TaskQueue.Worker do
 end
 ```
 
-### Step 2: Given tests — must pass without modification
+### Step 3: Tests
 
 ```elixir
 # test/task_queue/error_handling_test.exs
@@ -229,7 +204,7 @@ defmodule TaskQueue.ErrorHandlingTest do
   alias TaskQueue.Worker
   alias TaskQueue.Worker.{JobError, AgentError}
 
-  describe "Worker.execute/1 — error handling" do
+  describe "Worker.execute/1 -- error handling" do
     test "noop job returns :ok" do
       assert {:ok, :noop} = Worker.execute(%{type: "noop", args: %{}})
     end
@@ -254,7 +229,7 @@ defmodule TaskQueue.ErrorHandlingTest do
     end
   end
 
-  describe "Worker.execute_with_agent/2 — after cleanup" do
+  describe "Worker.execute_with_agent/2 -- after cleanup" do
     test "good agent returns :ok" do
       job = %{type: "noop", args: %{}}
       assert {:ok, :delivered} = Worker.execute_with_agent(job, "tcp://good-agent:9000")
@@ -267,7 +242,7 @@ defmodule TaskQueue.ErrorHandlingTest do
     end
   end
 
-  describe "JobError — custom exception" do
+  describe "JobError -- custom exception" do
     test "carries job_id and reason" do
       error = JobError.exception(job_id: "abc-123", reason: :timeout)
       assert error.job_id == "abc-123"
@@ -287,7 +262,7 @@ defmodule TaskQueue.ErrorHandlingTest do
     end
   end
 
-  describe "AgentError — custom exception" do
+  describe "AgentError -- custom exception" do
     test "carries agent_address and status_code" do
       error = AgentError.exception(agent_address: "tcp://agent-1:9000", status_code: 503)
       assert error.agent_address == "tcp://agent-1:9000"
@@ -306,7 +281,6 @@ defmodule TaskQueue.ErrorHandlingTest do
     test "unexpected exception is reraised" do
       assert_raise RuntimeError, "boom", fn ->
         Worker.execute_with_agent(%{type: "noop", args: %{}}, "tcp://good-agent:9000")
-        # This won't raise with a good agent, so force one:
         try do
           raise "boom"
         rescue
@@ -318,7 +292,7 @@ defmodule TaskQueue.ErrorHandlingTest do
 end
 ```
 
-### Step 3: Run the tests
+### Step 4: Run
 
 ```bash
 mix test test/task_queue/error_handling_test.exs --trace
@@ -332,102 +306,34 @@ mix test test/task_queue/error_handling_test.exs --trace
 |----------|----------|------|
 | `{:ok, _} / {:error, _}` | Expected failures in normal flow | Not composable with code that raises |
 | `try/rescue` | Unexpected raises from libraries | Overuse turns normal flow into exception-driven code |
-| `defexception` | Structured error context | Requires discipline — don't add fields you never read |
+| `defexception` | Structured error context | Requires discipline -- don't add fields you never read |
 | `reraise e, __STACKTRACE__` | Log-and-propagate pattern | Forgetting `__STACKTRACE__` loses the original origin |
-| `after` clause | Resource cleanup | Value of `after` is discarded — do not rely on its return |
-
-Reflection question: `Task.async/1` + `Task.await/1` raises if the task crashes. What does `try/rescue` around `Task.await` give you that `Task.yield/2` does not?
-
-Answer: `try/rescue` around `Task.await/1` catches the exit and converts it to a value you can handle. However, `Task.yield/2` achieves the same goal without exceptions: it returns `{:ok, result}` or `nil` (timeout) without raising. The key difference is that `Task.await/1` kills the task on timeout and raises, while `Task.yield/2` returns `nil` but leaves the task running — you must call `Task.shutdown/2` explicitly. Use `yield` when you want non-destructive timeout checks; use `await` when timeout is a hard deadline.
+| `after` clause | Resource cleanup | Value of `after` is discarded -- do not rely on its return |
 
 ---
 
 ## Common production mistakes
 
-**1. Rescuing `Exception` — catching everything including bugs**
-
-```elixir
-# Wrong — catches ArgumentError from your own bad code, masking bugs
-rescue
-  e in Exception -> {:error, e.message}
-
-# Right — rescue only what you know how to handle
-rescue
-  e in [Req.TransportError, Jason.DecodeError] -> {:error, {:external, e.message}}
-```
+**1. Rescuing `Exception` -- catching everything including bugs**
+Rescue only what you know how to handle. Catching `Exception` masks bugs in your own code.
 
 **2. `reraise` without `__STACKTRACE__`**
-
-```elixir
-# Wrong — stacktrace points to the rescue clause, not the original raise
-rescue
-  e -> reraise e, []
-
-# Right — __STACKTRACE__ is a special variable available only inside rescue
-rescue
-  e -> reraise e, __STACKTRACE__
-```
+Using `reraise e, []` points the stacktrace to the rescue clause, not the original raise.
 
 **3. Using `try/rescue` for control flow that should use `with`**
+`Map.fetch!/2` + rescue is slower and semantically misleading vs `Map.fetch/2` + case.
 
-```elixir
-# Wrong — exceptions as control flow is slow and semantically misleading
-def process(id) do
-  try do
-    job = Map.fetch!(jobs, id)
-    {:ok, job}
-  rescue
-    KeyError -> {:error, :not_found}
-  end
-end
-
-# Right — Map.fetch/2 returns {:ok, v} | :error, no exception needed
-def process(id) do
-  case Map.fetch(jobs, id) do
-    {:ok, job} -> {:ok, job}
-    :error     -> {:error, :not_found}
-  end
-end
-```
-
-**4. Putting side effects in `after` that depend on variables from `try`**
-
-```elixir
-# Wrong — if try raises before `conn` is bound, after will NameError
-try do
-  conn = open_connection()
-  do_work(conn)
-after
-  close_connection(conn)  # conn may not be bound if open_connection raised
-end
-
-# Right — bind conn before try
-conn = open_connection()
-try do
-  do_work(conn)
-after
-  close_connection(conn)
-end
-```
+**4. Binding variables inside `try` that `after` depends on**
+If `try` raises before the binding, `after` gets a `NameError`. Bind resources *before* `try`.
 
 **5. Expecting `after` to change the return value**
-
-```elixir
-# Wrong assumption — after's return value is ALWAYS discarded
-result = try do
-  42
-after
-  99   # this does NOT become the result
-end
-# result == 42, not 99
-```
+The `after` clause's return value is always discarded.
 
 ---
 
 ## Resources
 
-- [try, catch, and rescue — Elixir official guide](https://elixir-lang.org/getting-started/try-catch-and-rescue.html)
-- [Exception module — official docs](https://hexdocs.pm/elixir/Exception.html)
-- [defexception — Elixir macro docs](https://hexdocs.pm/elixir/Kernel.html#defexception/1)
-- [reraise/2 — Kernel docs](https://hexdocs.pm/elixir/Kernel.SpecialForms.html#try/1)
-- [Error handling patterns — Sasa Juric's blog](https://www.theerlangelist.com/article/exceptions)
+- [try, catch, and rescue -- Elixir official guide](https://elixir-lang.org/getting-started/try-catch-and-rescue.html)
+- [Exception module -- official docs](https://hexdocs.pm/elixir/Exception.html)
+- [defexception -- Kernel docs](https://hexdocs.pm/elixir/Kernel.html#defexception/1)
+- [reraise/2 -- Kernel.SpecialForms](https://hexdocs.pm/elixir/Kernel.SpecialForms.html#try/1)

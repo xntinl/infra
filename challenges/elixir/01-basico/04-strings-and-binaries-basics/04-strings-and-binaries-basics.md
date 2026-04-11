@@ -1,45 +1,33 @@
 # Strings and Binaries: Parsing CSV Transaction Lines
 
-**Project**: `payments_cli` — built incrementally across the basic level
+**Project**: `payments_cli` — a CLI tool that processes payment transactions
 
 ---
 
 ## Project context
 
-You're building `payments_cli`. The system reads transaction data from CSV files
-exported by the bank. CSV parsing requires splitting, trimming, validating, and
-formatting strings correctly — including merchant names with non-ASCII characters.
+You are building `payments_cli`, a CLI tool that processes payment transactions from CSV
+files, validates them, applies business rules, and produces ledger reports.
 
-Project structure at this point:
-
-```
-payments_cli/
-├── lib/
-│   └── payments_cli/
-│       ├── cli.ex              # from exercise 01
-│       ├── transaction.ex      # from exercise 02
-│       ├── ledger.ex           # from exercise 03
-│       └── formatter.ex        # ← you implement this
-├── test/
-│   └── payments_cli/
-│       └── formatter_test.exs  # given tests — must pass without modification
-└── mix.exs
-```
+This exercise implements a `Formatter` module that parses raw CSV lines into structured
+data, truncates merchant names respecting UTF-8 grapheme boundaries, normalizes reference
+IDs, and validates string integrity. These operations are fundamental to processing
+bank-exported CSV files that may contain non-ASCII merchant names.
 
 ---
 
 ## Why strings as binaries matters in a payments context
 
 A CSV file exported by a European bank may contain merchant names like
-`"Café München GmbH"`. If you treat strings as byte arrays (as C does),
+`"Cafe Munchen GmbH"`. If you treat strings as byte arrays (as C does),
 the length of that name is 19 bytes but only 16 visible characters.
-Truncating to 15 "characters" by bytes splits `ü` in the middle and
+Truncating to 15 "characters" by bytes splits `u` in the middle and
 produces invalid UTF-8 — data corruption.
 
 Elixir strings are UTF-8 encoded binaries. The distinction matters:
-- `byte_size("Café")` → `5` (bytes, O(1), used for binary protocol headers)
-- `String.length("Café")` → `4` (graphemes, O(n), used for display truncation)
-- `String.valid?/1` → validates UTF-8 before storing or forwarding data
+- `byte_size("Cafe")` -> `5` (bytes, O(1), used for binary protocol headers)
+- `String.length("Cafe")` -> `4` (graphemes, O(n), used for display truncation)
+- `String.valid?/1` -> validates UTF-8 before storing or forwarding data
 
 The other gotcha: bank-exported CSVs often arrive with Erlang charlists from
 old Erlang library integrations. A senior developer recognizes `'hello'` (charlist)
@@ -54,7 +42,7 @@ The `Formatter` module needs to:
 1. Parse a raw CSV line into a map of field values
 2. Truncate merchant names to a display length (respecting UTF-8 graphemes)
 3. Normalize reference IDs (uppercase, trim, remove internal spaces)
-4. Format an amount in cents as a human-readable string (builds on Ledger.format_amount/2)
+4. Validate that a string is non-empty and valid UTF-8
 
 ---
 
@@ -68,7 +56,7 @@ latter raises on invalid input — dangerous in a parser that processes thousand
 
 Truncation uses `String.length/1` and `String.slice/3` (grapheme-aware operations)
 instead of `byte_size` and binary slicing. This ensures multi-byte characters like
-`é` and `ü` are never split mid-byte.
+`e` and `u` are never split mid-byte.
 
 ```elixir
 defmodule PaymentsCli.Formatter do
@@ -121,10 +109,10 @@ defmodule PaymentsCli.Formatter do
   end
 
   @doc """
-  Truncates a merchant name to max_length graphemes, adding "…" if truncated.
+  Truncates a merchant name to max_length graphemes, adding "..." if truncated.
 
   Uses String.length/1 and String.slice/3 — NOT byte_size — so UTF-8 merchant
-  names like "Café München" are truncated at grapheme boundaries.
+  names like "Cafe Munchen" are truncated at grapheme boundaries.
 
   ## Examples
 
@@ -132,10 +120,10 @@ defmodule PaymentsCli.Formatter do
       "Coffee Shop"
 
       iex> PaymentsCli.Formatter.truncate_merchant("A Very Long Merchant Name Here", 15)
-      "A Very Long Mer…"
+      "A Very Long Mer..."
 
-      iex> PaymentsCli.Formatter.truncate_merchant("Café München GmbH", 10)
-      "Café Münch…"
+      iex> PaymentsCli.Formatter.truncate_merchant("Cafe Munchen GmbH", 10)
+      "Cafe Munch..."
 
   """
   @spec truncate_merchant(String.t(), pos_integer()) :: String.t()
@@ -144,7 +132,7 @@ defmodule PaymentsCli.Formatter do
     if String.length(name) <= max_length do
       name
     else
-      String.slice(name, 0, max_length - 1) <> "…"
+      String.slice(name, 0, max_length - 1) <> "\u2026"
     end
   end
 
@@ -207,10 +195,10 @@ end
 
 - `truncate_merchant/2` checks `String.length/1` (grapheme count, not byte count) before
   deciding to truncate. If truncation is needed, it slices to `max_length - 1` graphemes
-  and appends the ellipsis `"…"` (a single grapheme, 3 bytes in UTF-8). The total
+  and appends the ellipsis `"\u2026"` (a single grapheme, 3 bytes in UTF-8). The total
   grapheme count of the result equals `max_length`.
 
-- `normalize_reference/1` is a natural pipeline: trim → upcase → remove spaces. Each
+- `normalize_reference/1` is a natural pipeline: trim -> upcase -> remove spaces. Each
   step transforms the string and passes the result to the next via `|>`.
 
 - `validate_string/1` checks UTF-8 validity first with `String.valid?/1`, then checks
@@ -218,7 +206,7 @@ end
   We use `byte_size(value) == 0` for the empty check because it is O(1) and safe
   even on invalid binaries.
 
-### Given tests — must pass without modification
+### Tests
 
 ```elixir
 # test/payments_cli/formatter_test.exs
@@ -238,10 +226,10 @@ defmodule PaymentsCli.FormatterTest do
     end
 
     test "trims whitespace from fields" do
-      assert {:ok, tx} = Formatter.parse_csv_line(" TXN002 , 500 , EUR , Café , pending ")
+      assert {:ok, tx} = Formatter.parse_csv_line(" TXN002 , 500 , EUR , Cafe , pending ")
       assert tx.id == "TXN002"
       assert tx.amount_cents == 500
-      assert tx.merchant == "Café"
+      assert tx.merchant == "Cafe"
     end
 
     test "returns error for wrong field count" do
@@ -262,12 +250,12 @@ defmodule PaymentsCli.FormatterTest do
     test "truncates at grapheme boundary and adds ellipsis" do
       result = Formatter.truncate_merchant("A Very Long Merchant Name Here", 15)
       assert String.length(result) == 15
-      assert String.ends_with?(result, "…")
+      assert String.ends_with?(result, "\u2026")
     end
 
     test "handles UTF-8 merchant names correctly" do
-      # "Café München" has 12 graphemes but 14 bytes
-      result = Formatter.truncate_merchant("Café München GmbH", 10)
+      # "Cafe Munchen" has 12 graphemes but 14 bytes
+      result = Formatter.truncate_merchant("Cafe Munchen GmbH", 10)
       assert String.length(result) == 10
       # Verify UTF-8 is still valid after truncation
       assert String.valid?(result)
@@ -326,7 +314,7 @@ the parser to handle quoted CSV fields?
 ## Common production mistakes
 
 **1. Using `byte_size` for display truncation**
-`byte_size("Café München")` returns `14`, not `12`. Truncating by bytes
+`byte_size("Cafe Munchen")` returns `14`, not `12`. Truncating by bytes
 instead of `String.length` + `String.slice` corrupts multi-byte characters
 and produces invalid UTF-8 that downstream systems reject.
 
@@ -341,7 +329,7 @@ thousands of rows, one bad row kills the process. Use `Integer.parse/1` which
 returns `:error` instead of raising.
 
 **4. String concatenation in a loop with `<>`**
-Building a report string with `acc <> line` in each iteration is O(n²) — each
+Building a report string with `acc <> line` in each iteration is O(n^2) — each
 `<>` creates a new binary by copying. Use `IO.iodata_to_binary/1` with an iolist,
 or `Enum.join/2`, to build strings efficiently.
 
@@ -355,5 +343,5 @@ Always trim fields after splitting. `"approved\r"` does not match `"approved"`.
 
 - [String — HexDocs](https://hexdocs.pm/elixir/String.html) — read the Unicode section
 - [Elixir Getting Started — Binaries, strings, and charlists](https://elixir-lang.org/getting-started/binaries-strings-and-char-lists.html)
-- [Unicode in Elixir — José Valim's blog](https://elixir-lang.org/blog/2013/04/17/elixir-v0-8-0-released/)
+- [Unicode in Elixir — Jose Valim's blog](https://elixir-lang.org/blog/2013/04/17/elixir-v0-8-0-released/)
 - [IO.iodata_to_binary/1 — efficient string building](https://hexdocs.pm/elixir/IO.html#iodata_to_binary/1)

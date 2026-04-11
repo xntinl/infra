@@ -258,6 +258,9 @@ defmodule Poolex.PriorityQueue do
 
   defstruct high: :queue.new(), normal: :queue.new(), low: :queue.new()
 
+  @spec new() :: %__MODULE__{}
+  def new, do: %__MODULE__{}
+
   def push(%__MODULE__{} = pq, item, :high),   do: %{pq | high:   :queue.in(item, pq.high)}
   def push(%__MODULE__{} = pq, item, :normal), do: %{pq | normal: :queue.in(item, pq.normal)}
   def push(%__MODULE__{} = pq, item, :low),    do: %{pq | low:    :queue.in(item, pq.low)}
@@ -282,19 +285,23 @@ defmodule Poolex.PriorityQueue do
     end
   end
 
-  @spec remove(%__MODULE__{}, term()) :: %__MODULE__{}
-  def remove(%__MODULE__{} = pq, item) do
+  @spec remove(%__MODULE__{}, (term() -> boolean()) | term()) :: %__MODULE__{}
+  def remove(%__MODULE__{} = pq, predicate) when is_function(predicate, 1) do
     %{pq |
-      high: queue_remove(pq.high, item),
-      normal: queue_remove(pq.normal, item),
-      low: queue_remove(pq.low, item)
+      high: queue_reject(pq.high, predicate),
+      normal: queue_reject(pq.normal, predicate),
+      low: queue_reject(pq.low, predicate)
     }
   end
 
-  defp queue_remove(queue, item) do
+  def remove(%__MODULE__{} = pq, item) do
+    remove(pq, fn x -> x == item end)
+  end
+
+  defp queue_reject(queue, predicate) do
     queue
     |> :queue.to_list()
-    |> Enum.reject(&(&1 == item))
+    |> Enum.reject(predicate)
     |> :queue.from_list()
   end
 
@@ -304,7 +311,41 @@ defmodule Poolex.PriorityQueue do
 end
 ```
 
-### Step 5: Given tests — must pass without modification
+### Step 5: Pool public API
+
+```elixir
+# lib/poolex/pool.ex
+defmodule Poolex.Pool do
+  @moduledoc """
+  Public API for the Poolex worker pool.
+  Wraps the PoolServer GenServer with a clean interface.
+  """
+
+  @spec start_link(module(), term(), keyword()) :: {:ok, pid()}
+  def start_link(worker_module, worker_args, opts \\ []) do
+    Poolex.PoolServer.start_link(worker_module, worker_args, opts)
+  end
+
+  @spec checkout(pid(), keyword()) :: {:ok, pid()} | {:error, :timeout}
+  def checkout(pool, opts \\ []) do
+    priority = Keyword.get(opts, :priority, :normal)
+    timeout = Keyword.get(opts, :timeout, 5_000)
+    GenServer.call(pool, {:checkout, priority, timeout}, timeout + 1_000)
+  end
+
+  @spec checkin(pid(), pid()) :: :ok
+  def checkin(pool, worker_pid) do
+    GenServer.cast(pool, {:checkin, worker_pid})
+  end
+
+  @spec metrics(pid()) :: map()
+  def metrics(pool) do
+    GenServer.call(pool, :metrics)
+  end
+end
+```
+
+### Step 6: Given tests — must pass without modification
 
 ```elixir
 # test/poolex/pool_test.exs
@@ -388,13 +429,13 @@ defmodule Poolex.CrashTest do
 end
 ```
 
-### Step 6: Run the tests
+### Step 7: Run the tests
 
 ```bash
 mix test test/poolex/ --trace
 ```
 
-### Step 7: Benchmark
+### Step 8: Benchmark
 
 ```elixir
 # bench/poolex_bench.exs
@@ -435,7 +476,7 @@ Benchee.run(
 | State | GenServer | Gen FSM | GenServer |
 | Idle shrink | yes | yes | no |
 
-Fill in measured throughput from the benchmark.
+After running the benchmark, record your measured throughput (checkout+call+checkin ops/sec) for comparison.
 
 Architectural question: Little's Law states `L = λW` (mean queue length = arrival rate × mean wait time). Given a pool of 10 workers and an arrival rate of 200 req/second with mean worker hold time of 40ms, what is the expected queue depth? What does that imply about checkout timeout configuration?
 

@@ -1,206 +1,61 @@
-# Phoenix.PubSub: Cluster-Wide Event Broadcasting in `api_gateway`
+# Phoenix.PubSub: Cluster-Wide Event Broadcasting
 
-**Project**: `api_gateway` — built incrementally across the advanced level
+## Goal
 
----
-
-## Project context
-
-You're building `api_gateway`. The cluster is connected, circuit breakers are distributed,
-and route tables are coordinated. One capability is still missing: when something happens
-on one node (a circuit breaker trips, a route is updated, a rate limit threshold is
-crossed), the other nodes need to know about it immediately.
-
-Three concrete requirements from the product team:
-
-1. **Circuit breaker state sync**: when gateway_a trips the breaker for `payment-service`,
-   gateway_b and gateway_c should stop routing to it within milliseconds — not after they
-   independently accumulate 5 failures.
-
-2. **Route table invalidation**: when an operator pushes a route update, all nodes must
-   clear their local route caches so the next request picks up the new config.
-
-3. **Audit event fan-out**: the audit writer on each node buffers and flushes to storage.
-   A separate compliance service subscribes to real-time audit events across the cluster
-   for anomaly detection. It needs all events from all nodes.
-
-All three problems are publish-subscribe fan-out. `Phoenix.PubSub` solves them with one
-consistent API, without requiring a message broker outside the Erlang cluster.
-
-Project structure at this point:
-
-```
-api_gateway/
-├── lib/
-│   └── api_gateway/
-│       ├── application.ex
-│       ├── circuit_breaker/
-│       │   └── worker.ex           # ← extend with PubSub broadcast on state change
-│       ├── route_table/
-│       │   └── server.ex           # ← extend with cache invalidation via PubSub
-│       ├── middleware/
-│       │   └── audit_writer.ex     # ← extend with PubSub fan-out
-│       └── events/
-│           └── subscriber.ex       # ← you implement (cross-cutting event consumer)
-├── test/
-│   └── api_gateway/
-│       └── events/
-│           └── pubsub_test.exs     # given tests — must pass
-└── mix.exs
-```
-
----
-
-## The business problem
-
-Before this exercise, each `api_gateway` node is event-silent: it changes its own state
-but never tells the other nodes. The consequences:
-
-- `payment-service` is tripped on gateway_a. gateway_b routes to it — the very next
-  request causes another failure. The user sees errors despite the cluster "protecting" them.
-- A route is updated on gateway_a. Requests load-balanced to gateway_b still use the old
-  route for up to 60 seconds (TTL of the local cache).
-- The compliance service polls each node's API every 30 seconds to collect audit events.
-  Events that happened between polls are missed.
-
-The fix is a single, well-typed event bus: processes subscribe to named topics, and
-anything that changes state broadcasts an event. The change propagates to all subscribers
-on all nodes within milliseconds.
+Build a cluster-wide event bus using `Phoenix.PubSub` for an API gateway. Circuit breaker state changes are broadcast to all nodes immediately, route table invalidation uses `local_broadcast` for efficiency, and a cross-cutting `Events.Subscriber` GenServer collects all events in a bounded log for monitoring.
 
 ---
 
 ## Why `Phoenix.PubSub` and not direct `send` to remote processes
 
-You could implement fan-out manually:
-
-```elixir
-Node.list()
-|> Enum.each(fn node ->
-  send({:route_table_server, node}, {:invalidate, route_id})
-end)
-```
-
-This works for two nodes. At scale it breaks:
-
-- You must know every subscriber's registered name — coupling publisher to consumer
-- Adding a new subscriber (e.g., the compliance service) requires changing the publisher
-- There is no backpressure or delivery guarantee API
-- Monitoring node reachability and skipping dead nodes is manual boilerplate
-
-`Phoenix.PubSub` decouples publishers from subscribers completely. The publisher calls
-`broadcast/3` without knowing how many subscribers exist or on which nodes they run.
-New subscribers self-register by calling `subscribe/2`. The publisher code never changes.
+Manual fan-out via `Node.list()` couples publishers to subscribers, requires knowing every subscriber's registered name, and breaks when adding new consumers. `Phoenix.PubSub` decouples completely: publishers call `broadcast/3` without knowing subscribers; new subscribers self-register by calling `subscribe/2`. The publisher code never changes.
 
 ---
 
 ## How `Phoenix.PubSub` works
 
-### The subscription model
+### Subscription model
 
-Topics are arbitrary strings. Processes subscribe with `Phoenix.PubSub.subscribe/2`:
+Topics are arbitrary strings. Processes subscribe with `Phoenix.PubSub.subscribe/2`. Messages arrive in `handle_info`. PubSub monitors the subscribing process and removes subscriptions automatically on death.
 
-```elixir
-# In your GenServer's init/1:
-Phoenix.PubSub.subscribe(ApiGateway.PubSub, "circuit_breaker:events")
-
-# Messages arrive in handle_info:
-def handle_info({:circuit_breaker, :tripped, service, node}, state) do ...
-```
-
-Phoenix.PubSub monitors the subscribing process. When it dies (for any reason), the
-subscription is removed automatically. No cleanup needed.
-
-### Broadcasting — three variants
+### Broadcasting variants
 
 ```elixir
-# Send to ALL subscribers on ALL nodes (the common case)
-Phoenix.PubSub.broadcast(
-  ApiGateway.PubSub,
-  "circuit_breaker:events",
-  {:circuit_breaker, :tripped, "payment-service", node()}
-)
+# ALL subscribers on ALL nodes
+Phoenix.PubSub.broadcast(ApiGateway.PubSub, "topic", message)
 
-# Send only to subscribers on THIS node (efficient for local cache invalidation)
-Phoenix.PubSub.local_broadcast(
-  ApiGateway.PubSub,
-  "route_table:invalidate",
-  {:invalidate, route_id}
-)
+# Only subscribers on THIS node (efficient for local cache invalidation)
+Phoenix.PubSub.local_broadcast(ApiGateway.PubSub, "topic", message)
 
-# Send only to subscribers on a SPECIFIC node (rare — explicit routing)
-Phoenix.PubSub.direct_broadcast(
-  :"gateway_b@10.0.1.6",
-  ApiGateway.PubSub,
-  "audit:events",
-  {:audit_batch, events}
-)
+# Only subscribers on a SPECIFIC node
+Phoenix.PubSub.direct_broadcast(:"gateway_b@10.0.1.6", ApiGateway.PubSub, "topic", message)
 ```
 
-**Which to use**: `broadcast` is correct for the vast majority of cases. Use
-`local_broadcast` only when you are certain the effect is local (e.g., invalidating
-a per-node in-memory cache). Use `direct_broadcast` when you have explicit routing
-requirements — it is rare.
-
-### The `Phoenix.PubSub.PG2` adapter
-
-Under the hood, PubSub topics are `:pg` process groups. When you call `subscribe/2`,
-your PID joins the `:pg` group for that topic. When you call `broadcast/3`, PubSub
-sends the message to every PID in the group across all nodes.
-
-This means `Phoenix.PubSub` works immediately across any Erlang cluster — no additional
-configuration beyond starting the `Phoenix.PubSub` child in `application.ex`.
-
-### `Phoenix.Presence` — distributed subscriber tracking
-
-Presence builds on PubSub to answer "who is subscribed to this topic right now?"
-with eventual consistency guarantees. It uses delta CRDTs (same mechanism as Horde)
-to reconcile presence state after netsplits.
-
-```elixir
-# Track that this process is "present" on a topic
-ApiGateway.Presence.track(self(), "audit:subscribers", "compliance-service", %{
-  node: node(),
-  subscribed_at: DateTime.utc_now()
-})
-
-# Query who is currently subscribed — from any node
-ApiGateway.Presence.list("audit:subscribers")
-#=> %{
-#     "compliance-service" => %{metas: [%{node: :"gateway_a@...", subscribed_at: ...}]}
-#   }
-```
+Under the hood, PubSub topics are `:pg` process groups. It works across any Erlang cluster with no additional configuration beyond starting the `Phoenix.PubSub` child.
 
 ---
 
-## Implementation
+## Full implementation
 
-### Step 1: Add `Phoenix.PubSub` to `mix.exs` and `application.ex`
+### `mix.exs` dependency
 
 ```elixir
-# mix.exs
 defp deps do
-  [
-    {:phoenix_pubsub, "~> 2.1"},
-    # ...existing deps...
-  ]
+  [{:phoenix_pubsub, "~> 2.1"}]
 end
 ```
 
+### `application.ex` setup
+
 ```elixir
-# In lib/api_gateway/application.ex start/2, add before CoreSupervisor:
+# In children list:
 {Phoenix.PubSub, name: ApiGateway.PubSub}
 ```
 
-### Step 2: Extend `CircuitBreaker.Worker` to broadcast state changes
-
-When the circuit breaker transitions to a new state (:open, :closed, :half_open),
-it broadcasts an event to the `"circuit_breaker:events"` topic. All subscribers
-on all nodes receive the event within milliseconds.
+### Broadcasting from circuit breaker worker
 
 ```elixir
-# In lib/api_gateway/circuit_breaker/worker.ex
-
-# Add this private function:
+# Add this function to your circuit breaker worker module:
 defp broadcast_state_change(service_name, new_status) do
   Phoenix.PubSub.broadcast(
     ApiGateway.PubSub,
@@ -212,21 +67,28 @@ defp broadcast_state_change(service_name, new_status) do
   )
 end
 
-# Call from the state transition points in handle_cast(:failure, ...) and handle_cast(:success, ...):
-# After transitioning to :open:
+# Call after transitioning to :open:
 #   broadcast_state_change(state.service, :open)
-# After transitioning from :half_open to :closed:
+# Call after transitioning from :half_open to :closed:
 #   broadcast_state_change(state.service, :closed)
 ```
 
-### Step 3: `lib/api_gateway/events/subscriber.ex`
+### Route table cache invalidation with `local_broadcast`
 
-The Subscriber is a cross-cutting event consumer that subscribes to all event topics
-and maintains a bounded event log. It demonstrates the subscriber pattern: subscribe
-in `init/1`, handle events in `handle_info/2`, and let PubSub manage cleanup on death.
+```elixir
+# In route table server -- only local node needs to invalidate:
+defp invalidate_local_caches(route_id) do
+  Phoenix.PubSub.local_broadcast(
+    ApiGateway.PubSub,
+    "route_table:events",
+    {:route_table_updated, %{route_id: route_id, at: DateTime.utc_now()}}
+  )
+end
+```
 
-The `@max_events` cap prevents unbounded memory growth under high event rates. Events
-are prepended (newest first) and the list is truncated after each insertion.
+### `lib/api_gateway/events/subscriber.ex`
+
+Cross-cutting event consumer that subscribes to all event topics and maintains a bounded event log.
 
 ```elixir
 defmodule ApiGateway.Events.Subscriber do
@@ -261,10 +123,7 @@ defmodule ApiGateway.Events.Subscriber do
 
   @impl true
   def init(_opts) do
-    # Subscribe to all event topics. PubSub monitors this process and
-    # automatically removes subscriptions when it dies.
     Enum.each(@topics, &Phoenix.PubSub.subscribe(ApiGateway.PubSub, &1))
-
     {:ok, %{events: []}}
   end
 
@@ -275,7 +134,7 @@ defmodule ApiGateway.Events.Subscriber do
   @impl true
   def handle_info({:circuit_breaker_state_changed, payload}, state) do
     level = if payload.status == :open, do: :warning, else: :info
-    Logger.log(level, "Circuit breaker #{payload.service} → #{payload.status} on #{payload.node}")
+    Logger.log(level, "Circuit breaker #{payload.service} -> #{payload.status} on #{payload.node}")
 
     new_events = [{:circuit_breaker, payload} | state.events] |> Enum.take(@max_events)
     {:noreply, %{state | events: new_events}}
@@ -304,52 +163,7 @@ defmodule ApiGateway.Events.Subscriber do
 end
 ```
 
-### Step 4: Route table cache invalidation with `local_broadcast`
-
-When a route is updated, only the local node's caches need to be invalidated. Other
-nodes manage their own route caches independently. `local_broadcast` avoids unnecessary
-cross-node traffic.
-
-```elixir
-# In lib/api_gateway/route_table/server.ex
-
-defp invalidate_local_caches(route_id) do
-  Phoenix.PubSub.local_broadcast(
-    ApiGateway.PubSub,
-    "route_table:events",
-    {:route_table_updated, %{route_id: route_id, at: DateTime.utc_now()}}
-  )
-end
-```
-
-### Step 5: `Phoenix.Presence` for audit subscriber tracking
-
-```elixir
-# lib/api_gateway/presence.ex
-defmodule ApiGateway.Presence do
-  use Phoenix.Presence,
-    otp_app: :api_gateway,
-    pubsub_server: ApiGateway.PubSub
-end
-```
-
-```elixir
-# In lib/api_gateway/application.ex, add after Phoenix.PubSub:
-ApiGateway.Presence
-```
-
-Usage in `Events.Subscriber.init/1`:
-
-```elixir
-# After subscribing to topics:
-ApiGateway.Presence.track(self(), "audit:subscribers", "gateway-subscriber", %{
-  node: node(),
-  topics: @topics,
-  started_at: DateTime.utc_now()
-})
-```
-
-### Step 6: Given tests — must pass without modification
+### Tests
 
 ```elixir
 # test/api_gateway/events/pubsub_test.exs
@@ -400,12 +214,10 @@ defmodule ApiGateway.Events.PubSubTest do
 
       assert_receive :subscribed, 500
 
-      # Kill the subscriber
       ref = Process.monitor(pid)
       send(pid, :stop)
       assert_receive {:DOWN, ^ref, :process, _, _}, 500
 
-      # Broadcast should not crash even with dead subscriber cleaned up
       assert :ok = Phoenix.PubSub.broadcast(TestPubSub, "transient:topic", :any)
     end
   end
@@ -477,71 +289,33 @@ defmodule ApiGateway.Events.PubSubTest do
 end
 ```
 
-### Step 7: Run the tests
-
-```bash
-mix test test/api_gateway/events/pubsub_test.exs --trace
-```
-
 ---
 
-## Trade-off analysis
+## How it works
 
-| Design choice | Benefit | Risk |
-|---------------|---------|------|
-| `Phoenix.PubSub` over manual `Node.list` fan-out | Publishers do not need to know subscribers; adding consumers requires no publisher changes | Messages are fire-and-forget — no delivery guarantee; a subscriber with a full mailbox silently drops messages |
-| `local_broadcast` for route cache invalidation | No cross-node overhead for events that only affect local state | If a node misses the invalidation (process restarted after broadcast), its cache stays stale until TTL |
-| Capping `Events.Subscriber` history at 500 | Prevents unbounded memory growth under high event rate | Historical events beyond 500 are lost; long debugging sessions may miss early events |
-| `Phoenix.Presence` for subscriber tracking | AP semantics — survives netsplits; auto-cleanup on process death | Brief inconsistency window during netsplit means subscriber counts may be wrong by 1–2 |
-| Decoupled subscriber (no direct call to CircuitBreaker.Worker) | Zero coupling between event producer and consumer | If the subscriber crashes or is slow, it silently falls behind; no back-pressure to the producer |
+1. **Subscribe in `init/1`**: the Subscriber subscribes to all event topics during initialization. PubSub monitors the process and auto-removes subscriptions on death.
 
-Reflection question: `Phoenix.PubSub.broadcast/3` is fire-and-forget — if the receiving
-process's mailbox is full, the message is dropped silently. The `Events.Subscriber` receives
-audit events at potentially high rates. How would you detect that the subscriber is falling
-behind? What architectural change would you make if the audit event volume exceeds what one
-GenServer can process?
+2. **Events in `handle_info`**: each event type has its own `handle_info` clause. Events are prepended (newest first) and the list is truncated to `@max_events`.
+
+3. **`broadcast` vs `local_broadcast`**: circuit breaker state changes use `broadcast` (all nodes need to know). Route cache invalidation uses `local_broadcast` (only the local node's caches need clearing).
+
+4. **Fire-and-forget**: `broadcast/3` returns `:ok` immediately. If a subscriber's mailbox is full, the message is dropped silently. There is no delivery guarantee or back-pressure.
 
 ---
 
 ## Common production mistakes
 
 **1. Using `broadcast` when `local_broadcast` is correct**
-`Phoenix.PubSub.broadcast/3` sends to all nodes. For events that only matter locally
-(clearing a per-node in-memory cache, updating a local ETS table), this generates
-unnecessary network traffic. Use `local_broadcast` for events whose effect is local.
-The distinction matters most at scale: 10 nodes × N subscribers per node vs 1 node × N
-subscribers for the same logical event.
+For events whose effect is local (clearing a per-node cache), `broadcast` generates unnecessary cross-node traffic.
 
 **2. Publishing high-frequency events on a single topic**
-If every HTTP request publishes `{:request_received, metadata}` to `"gateway:requests"`,
-and 10,000 subscribers exist across the cluster, every request fan-outs to 10,000 message
-sends. Topics should be scoped: `"gateway:requests:payment-service"` instead of
-`"gateway:requests"`. Subscribers that care about all services can subscribe to a summary
-topic that receives aggregated events at a lower frequency.
+10,000 subscribers on one topic means every event triggers 10,000 message sends. Scope topics: `"gateway:requests:payment-service"` instead of `"gateway:requests"`.
 
-**3. Confusing `Presence.track` with `PubSub.subscribe`**
-`Presence.track/4` registers that a process is "present" in a topic — it does NOT
-subscribe that process to messages on the topic. These are two separate operations.
-A process can be tracked in Presence without receiving messages, and vice versa.
-Both calls are needed if you want both presence tracking and message delivery.
+**3. Blocking in `handle_info` for PubSub messages**
+Synchronous work (DB writes, HTTP calls) in `handle_info` causes the message queue to grow faster than it drains. Delegate I/O-bound processing to `Task.Supervisor`.
 
-**4. Blocking in `handle_info` for PubSub messages**
-If a GenServer subscribes to a high-volume topic and does synchronous work in
-`handle_info` (database write, HTTP call), the message queue grows faster than it
-drains. The process falls behind and eventually the node runs out of memory.
-For I/O-bound event processing, delegate to `Task.Supervisor` from `handle_info` and
-return `{:noreply, state}` immediately.
-
-**5. Not starting `Phoenix.Presence` in the supervision tree**
-`Phoenix.Presence` is an OTP process. If you call `MyApp.Presence.track/4` before
-`MyApp.Presence` has been started, you get `{:noproc, ...}`. In tests, this often
-manifests as mysterious crashes unrelated to the test logic.
-
-**6. Publishing `node()` in events but not using it**
-Including `node: node()` in event payloads is good practice for observability.
-But if the subscriber never logs or stores the node field, debugging "why did this
-event come from the wrong node" becomes impossible post-hoc. Log the full payload
-at `debug` level on event receipt, not just the fields you think you need.
+**4. Confusing `Presence.track` with `PubSub.subscribe`**
+`Presence.track/4` registers presence -- it does NOT subscribe to messages. These are two separate operations.
 
 ---
 
@@ -549,7 +323,5 @@ at `debug` level on event receipt, not just the fields you think you need.
 
 - [Phoenix.PubSub documentation](https://hexdocs.pm/phoenix_pubsub/Phoenix.PubSub.html)
 - [Phoenix.Presence documentation](https://hexdocs.pm/phoenix/Phoenix.Presence.html)
-- [Phoenix PubSub source — github.com/phoenixframework/phoenix_pubsub](https://github.com/phoenixframework/phoenix_pubsub)
-- [HexDocs — Erlang :pg (PubSub's underlying primitive)](https://www.erlang.org/doc/man/pg.html)
-- [Phoenix Presence — how it uses CRDTs (DockYard blog)](https://dockyard.com/blog/2016/03/25/what-makes-phoenix-presence-special-sneak-peek)
-- [Elixir in Action, 3rd ed. — Saša Jurić](https://www.manning.com/books/elixir-in-action-third-edition) — ch. 13, distributed systems
+- [Erlang :pg (PubSub's underlying primitive)](https://www.erlang.org/doc/man/pg.html)
+- [Phoenix PubSub source](https://github.com/phoenixframework/phoenix_pubsub)

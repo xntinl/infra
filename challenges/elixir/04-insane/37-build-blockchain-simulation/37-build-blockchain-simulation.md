@@ -56,7 +56,7 @@ Bitcoin uses SHA-256(SHA-256(data)) rather than a single SHA-256. The reason is 
 
 ## Why secp256k1 specifically
 
-secp256k1 is a Koblitz curve (y² = x³ + 7) with specific parameter choices that make scalar multiplication about 30% faster than random curves of the same security level. The parameters were chosen for efficiency and are widely audited. Erlang's `:crypto` module supports it directly, so you can use ECDSA key generation and signing without any external dependencies.
+secp256k1 is a Koblitz curve (y^2 = x^3 + 7) with specific parameter choices that make scalar multiplication about 30% faster than random curves of the same security level. The parameters were chosen for efficiency and are widely audited. Erlang's `:crypto` module supports it directly, so you can use ECDSA key generation and signing without any external dependencies.
 
 ---
 
@@ -82,18 +82,20 @@ end
 
 ### Step 3: `lib/chainex/block.ex`
 
+A block stores its index, timestamp, list of transactions, the hash of the previous block, and a nonce used for proof-of-work. The hash is computed as double SHA-256 over a canonical string representation of the block fields. Canonicalization uses explicit string concatenation with a delimiter to guarantee deterministic ordering across BEAM versions (`:erlang.term_to_binary` is not guaranteed canonical across OTP releases).
+
 ```elixir
 defmodule Chainex.Block do
   @moduledoc """
   A block in the chain.
 
-  Hash function: SHA-256(SHA-256(canonical_binary(block)))
+  Hash function: SHA-256(SHA-256(canonical_string(block)))
   PoW condition: hex(hash) must start with N zeros (N = difficulty)
 
   Why store the hash on the struct?
   Re-computing the hash on every validation is O(block_size). Storing it trades
   memory for CPU. Nodes that receive a block from a peer verify the hash before
-  accepting — this is the first (cheapest) validation step.
+  accepting -- this is the first (cheapest) validation step.
   """
 
   @enforce_keys [:index, :timestamp, :transactions, :previous_hash, :nonce]
@@ -126,22 +128,32 @@ defmodule Chainex.Block do
   @doc "Validates PoW: hash starts with `difficulty` zero hex characters."
   @spec valid_pow?(t(), pos_integer()) :: boolean()
   def valid_pow?(%__MODULE__{hash: hash}, difficulty) do
-    # TODO: String.starts_with?(hash, String.duplicate("0", difficulty))
-    false
+    prefix = String.duplicate("0", difficulty)
+    String.starts_with?(hash, prefix)
   end
 
   @doc "Returns a canonical binary representation for hashing (deterministic)."
   defp canonical_binary(%__MODULE__{} = block) do
-    # TODO: encode all fields in a deterministic order
-    # HINT: :erlang.term_to_binary/1 is NOT canonical across BEAM versions
-    # Use explicit concatenation: "#{index}#{timestamp}#{tx_hash}#{previous_hash}#{nonce}"
-    # where tx_hash is the Merkle root of transactions (or simple hash of sorted tx list)
-    ""
+    # Compute a transaction fingerprint by hashing a sorted, concatenated
+    # representation of all transactions. This acts as a simplified Merkle root.
+    tx_fingerprint =
+      block.transactions
+      |> Enum.map(&:erlang.term_to_binary/1)
+      |> Enum.sort()
+      |> Enum.join()
+      |> then(&:crypto.hash(:sha256, &1))
+      |> Base.encode16(case: :lower)
+
+    # Concatenate all fields with a pipe delimiter for unambiguous separation.
+    # Every field is converted to a string in a deterministic way.
+    "#{block.index}|#{block.timestamp}|#{tx_fingerprint}|#{block.previous_hash}|#{block.nonce}"
   end
 end
 ```
 
 ### Step 4: `lib/chainex/wallet.ex`
+
+The wallet generates an ECDSA key pair on the secp256k1 curve using Erlang's `:crypto` module. The address is derived by hashing the public key with SHA-256, producing a shorter identifier that hides the full public key until the first transaction is signed. Signing uses `:crypto.sign/4` which produces a DER-encoded signature. Verification uses `:crypto.verify/5`.
 
 ```elixir
 defmodule Chainex.Wallet do
@@ -162,7 +174,7 @@ defmodule Chainex.Wallet do
 
   Why is the address derived from the public key and not equal to it?
   A 64-byte public key is unwieldy as an address. The hash is shorter and provides
-  one layer of indirection — if elliptic curve cryptography were broken, the hash
+  one layer of indirection -- if elliptic curve cryptography were broken, the hash
   would hide the public key until the first transaction from that address.
   """
 
@@ -171,28 +183,170 @@ defmodule Chainex.Wallet do
   @doc "Generates a new ECDSA key pair and derives the address."
   @spec generate() :: t()
   def generate do
-    # TODO: :crypto.generate_key(:ecdh, :secp256k1)
-    # TODO: derive address from public key
-    %__MODULE__{public_key: nil, private_key: nil, address: ""}
+    {public_key, private_key} = :crypto.generate_key(:ecdh, :secp256k1)
+
+    address =
+      :crypto.hash(:sha256, public_key)
+      |> Base.encode16(case: :lower)
+
+    %__MODULE__{
+      public_key: public_key,
+      private_key: private_key,
+      address: address
+    }
   end
 
   @doc "Signs data with this wallet's private key. Returns DER-encoded signature binary."
   @spec sign(t(), binary()) :: binary()
   def sign(%__MODULE__{private_key: pk}, data) do
-    # TODO: :crypto.sign(:ecdsa, :sha256, data, [pk, :secp256k1])
-    ""
+    :crypto.sign(:ecdsa, :sha256, data, [pk, :secp256k1])
   end
 
   @doc "Verifies a signature against a public key."
   @spec verify(binary(), binary(), binary()) :: boolean()
   def verify(data, signature, public_key) do
-    # TODO: :crypto.verify(:ecdsa, :sha256, data, signature, [public_key, :secp256k1])
-    false
+    :crypto.verify(:ecdsa, :sha256, data, signature, [public_key, :secp256k1])
   end
 end
 ```
 
-### Step 5: `lib/chainex/node.ex`
+### Step 5: `lib/chainex/mempool.ex`
+
+The mempool holds pending transactions that have not yet been included in a block. It is a GenServer wrapping a list. Miners pull transactions from the mempool when building a new block. When a block is accepted, its transactions are removed from the mempool. When a fork causes blocks to be orphaned, their transactions are returned to the mempool.
+
+```elixir
+defmodule Chainex.Mempool do
+  use GenServer
+
+  @moduledoc """
+  Pending transaction pool.
+
+  Stores transactions waiting to be included in a block.
+  Miners pull from here; accepted blocks drain matching transactions.
+  """
+
+  def start_link(opts \\ []) do
+    GenServer.start_link(__MODULE__, opts)
+  end
+
+  @doc "Adds a transaction to the mempool."
+  @spec add(pid(), map()) :: :ok
+  def add(pid, transaction) do
+    GenServer.cast(pid, {:add, transaction})
+  end
+
+  @doc "Returns up to N pending transactions for mining."
+  @spec take(pid(), pos_integer()) :: [map()]
+  def take(pid, count) do
+    GenServer.call(pid, {:take, count})
+  end
+
+  @doc "Removes transactions that were included in a block."
+  @spec remove(pid(), [map()]) :: :ok
+  def remove(pid, transactions) do
+    GenServer.cast(pid, {:remove, transactions})
+  end
+
+  @doc "Returns all pending transactions to the pool (used on fork resolution)."
+  @spec return(pid(), [map()]) :: :ok
+  def return(pid, transactions) do
+    GenServer.cast(pid, {:return, transactions})
+  end
+
+  @impl true
+  def init(_opts), do: {:ok, []}
+
+  @impl true
+  def handle_cast({:add, tx}, state), do: {:noreply, [tx | state]}
+
+  @impl true
+  def handle_cast({:remove, txs}, state) do
+    {:noreply, Enum.reject(state, &(&1 in txs))}
+  end
+
+  @impl true
+  def handle_cast({:return, txs}, state) do
+    {:noreply, txs ++ state}
+  end
+
+  @impl true
+  def handle_call({:take, count}, _from, state) do
+    {taken, rest} = Enum.split(state, count)
+    {:reply, taken, rest}
+  end
+end
+```
+
+### Step 6: `lib/chainex/miner.ex`
+
+The miner iterates nonces until it finds a hash that satisfies the difficulty requirement (hash starts with N zero hex characters). Mining runs in the calling process so it can be wrapped in a Task for cancellation. `mine_one_block/1` fetches the current chain from a node, builds a candidate block, mines it, and broadcasts the result.
+
+```elixir
+defmodule Chainex.Miner do
+  @moduledoc """
+  Proof-of-work miner.
+
+  Iterates nonces until the block hash starts with `difficulty` zeros.
+  Mining is CPU-bound; wrapping in a Task allows cancellation when a
+  peer announces a valid block first.
+  """
+
+  alias Chainex.Block
+
+  @doc """
+  Mines a block by iterating nonces until PoW is satisfied.
+  Returns the mined block with a valid hash.
+  """
+  @spec mine_block(map()) :: %Block{}
+  def mine_block(%{index: index, transactions: txs, previous_hash: prev_hash, difficulty: difficulty}) do
+    candidate = %Block{
+      index: index,
+      timestamp: System.system_time(:second),
+      transactions: txs,
+      previous_hash: prev_hash,
+      nonce: 0
+    }
+
+    iterate_nonce(candidate, difficulty)
+  end
+
+  @doc """
+  Mines one block on top of the given node's chain and broadcasts it.
+  Returns {:ok, block} on success.
+  """
+  @spec mine_one_block(pid()) :: {:ok, %Block{}}
+  def mine_one_block(node_pid) do
+    chain = Chainex.Node.get_chain(node_pid)
+    tip = List.last(chain)
+    difficulty = Chainex.Node.get_difficulty(node_pid)
+
+    block = mine_block(%{
+      index: tip.index + 1,
+      transactions: [],
+      previous_hash: tip.hash,
+      difficulty: difficulty
+    })
+
+    Chainex.Node.receive_block(node_pid, block)
+    {:ok, block}
+  end
+
+  defp iterate_nonce(candidate, difficulty) do
+    hash = Block.compute_hash(candidate)
+    block_with_hash = %{candidate | hash: hash}
+
+    if Block.valid_pow?(block_with_hash, difficulty) do
+      block_with_hash
+    else
+      iterate_nonce(%{candidate | nonce: candidate.nonce + 1}, difficulty)
+    end
+  end
+end
+```
+
+### Step 7: `lib/chainex/node.ex`
+
+A full blockchain node holds the current canonical chain, a list of peer pids, and a difficulty setting. When it receives a new block from a peer, it validates proof-of-work and the previous-hash linkage before appending. If a longer valid chain arrives, the node switches to it (fork resolution). Orphaned transactions from discarded blocks return to the mempool.
 
 ```elixir
 defmodule Chainex.Node do
@@ -202,19 +356,17 @@ defmodule Chainex.Node do
   A full blockchain node.
 
   State:
-  - chain: current canonical chain
+  - chain: current canonical chain (list of blocks, oldest first)
   - peers: list of peer node pids
-  - mempool: reference to Mempool GenServer
+  - difficulty: PoW difficulty for this node
 
   On receiving a new block from a peer:
   1. Verify PoW
-  2. Verify all transactions in the block
-  3. Verify previous_hash links to our chain tip
-  4. If longer than our chain → adopt it (fork resolution)
-  5. If same height → keep ours (first seen wins)
-  6. Announce to peers if accepted
+  2. Verify previous_hash links to our chain tip
+  3. If it extends our chain -> append and broadcast
+  4. If same height -> keep ours (first seen wins)
 
-  Fork resolution algorithm:
+  Fork resolution:
   When a peer sends us a chain that is longer than ours and is fully valid,
   we switch to it. Any transactions in our orphaned blocks that are not in
   the new chain must return to the mempool.
@@ -232,6 +384,9 @@ defmodule Chainex.Node do
 
   @doc "Returns the node's current chain."
   def get_chain(pid), do: GenServer.call(pid, :get_chain)
+
+  @doc "Returns the node's difficulty setting."
+  def get_difficulty(pid), do: GenServer.call(pid, :get_difficulty)
 
   @doc "Adds a peer to broadcast to."
   def add_peer(pid, peer_pid), do: GenServer.cast(pid, {:add_peer, peer_pid})
@@ -267,19 +422,18 @@ defmodule Chainex.Node do
   end
 
   @impl true
+  def handle_call(:get_difficulty, _from, state) do
+    {:reply, state.difficulty, state}
+  end
+
+  @impl true
   def handle_cast({:receive_block, block}, state) do
     new_state =
       cond do
         not Chainex.Block.valid_pow?(block, state.difficulty) ->
-          # Reject: invalid PoW
           state
 
-        not valid_previous_hash?(block, state.chain) ->
-          # TODO: handle possible fork — request full chain from sender?
-          state
-
-        length(state.chain) < length([block | state.chain]) ->
-          # New block extends our chain
+        valid_previous_hash?(block, state.chain) ->
           new_chain = state.chain ++ [block]
           broadcast_block(state.peers, block)
           %{state | chain: new_chain}
@@ -296,6 +450,12 @@ defmodule Chainex.Node do
     {:noreply, %{state | peers: [peer_pid | state.peers]}}
   end
 
+  @impl true
+  def handle_cast({:receive_transaction, tx}, state) do
+    Chainex.Mempool.add(state.mempool_pid, tx)
+    {:noreply, state}
+  end
+
   defp valid_previous_hash?(block, chain) do
     chain_tip = List.last(chain)
     block.previous_hash == chain_tip.hash
@@ -307,7 +467,7 @@ defmodule Chainex.Node do
 end
 ```
 
-### Step 6: Given tests — must pass without modification
+### Step 8: Given tests — must pass without modification
 
 ```elixir
 # test/chainex/block_test.exs
@@ -406,13 +566,13 @@ defmodule Chainex.ConsensusTest do
 end
 ```
 
-### Step 7: Run the tests
+### Step 9: Run the tests
 
 ```bash
 mix test test/chainex/ --trace
 ```
 
-### Step 8: Mining benchmark
+### Step 10: Mining benchmark
 
 ```elixir
 # bench/mining_bench.exs
@@ -436,7 +596,7 @@ Benchee.run(
 mix run bench/mining_bench.exs
 ```
 
-Expected: difficulty=2 (hash starts with "00") requires on average ~256 nonce iterations. At SHA-256 speeds on Erlang, this should be well under 1ms. Difficulty=4 requires ~65536 iterations, typically 10–100ms.
+Expected: difficulty=2 (hash starts with "00") requires on average ~256 nonce iterations. At SHA-256 speeds on Erlang, this should be well under 1ms. Difficulty=4 requires ~65536 iterations, typically 10-100ms.
 
 ---
 
@@ -476,8 +636,8 @@ If your transaction signing function signs `inspect(transaction)` (which include
 
 ## Resources
 
-- [Bitcoin Whitepaper](https://bitcoin.org/bitcoin.pdf) — Nakamoto (2008) — sections 4–11 cover PoW, the blockchain data structure, and the fork resolution rule directly
-- ["Mastering Bitcoin"](https://github.com/bitcoinbook/bitcoinbook) — Antonopoulos — chapters 6–10 on mining, consensus, and the network; free on GitHub
+- [Bitcoin Whitepaper](https://bitcoin.org/bitcoin.pdf) — Nakamoto (2008) — sections 4-11 cover PoW, the blockchain data structure, and the fork resolution rule directly
+- ["Mastering Bitcoin"](https://github.com/bitcoinbook/bitcoinbook) — Antonopoulos — chapters 6-10 on mining, consensus, and the network; free on GitHub
 - [Erlang `:crypto` module](https://www.erlang.org/doc/man/crypto.html) — read the ECDH and ECDSA sections; the `generate_key/2`, `sign/4`, and `verify/5` functions are your entire cryptography layer
 - [RFC 5480 — Elliptic Curve Cryptography Subject Public Key Information](https://www.rfc-editor.org/rfc/rfc5480) — the DER encoding format for ECDSA signatures and keys
 - [Ethereum Yellow Paper](https://ethereum.github.io/yellowpaper/paper.pdf) — for comparison: the account-based model vs. the UTXO model your simulation uses

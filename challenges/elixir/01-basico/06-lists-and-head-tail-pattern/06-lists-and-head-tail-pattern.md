@@ -1,32 +1,19 @@
 # Lists and Head/Tail: Processing Transaction Batches
 
-**Project**: `payments_cli` — built incrementally across the basic level
+**Project**: `payments_cli` — a CLI tool that processes payment transactions
 
 ---
 
 ## Project context
 
-You're building `payments_cli`. The `Ledger` module needs to process lists of
-transactions — filtering by status, summing amounts, finding the largest transaction.
-This requires understanding lists as linked structures and knowing when O(1) prepend
-vs O(n) append changes everything at scale.
+You are building `payments_cli`, a CLI tool that processes payment transactions from CSV
+files, validates them, applies business rules, and produces ledger reports.
 
-Project structure at this point:
-
-```
-payments_cli/
-├── lib/
-│   └── payments_cli/
-│       ├── cli.ex
-│       ├── transaction.ex
-│       ├── ledger.ex           # ← you extend this
-│       ├── formatter.ex
-│       └── pipeline.ex
-├── test/
-│   └── payments_cli/
-│       └── ledger_list_test.exs  # given tests — must pass without modification
-└── mix.exs
-```
+This exercise implements list-processing functions in a `Ledger` module: filtering
+transactions by status, finding the transaction with the highest amount, grouping
+transactions by currency, and computing running balances. These operations require
+understanding lists as linked structures and knowing when O(1) prepend vs O(n)
+append changes everything at scale.
 
 ---
 
@@ -44,9 +31,9 @@ has concrete performance consequences for payments processing:
 - **`[tx | accumulator]`** — O(1). Creates one cons cell. Use this inside
   `Enum.reduce` to build result lists.
 - **`accumulator ++ [tx]`** — O(n). Traverses the entire `accumulator` to append.
-  With 100,000 transactions, this turns O(n) processing into O(n²).
+  With 100,000 transactions, this turns O(n) processing into O(n^2).
 - **`Enum.reverse/1` at the end** — O(n) once. Add this after the reduce to
-  restore order. Total cost: O(n). Contrast with repeated append: O(n²).
+  restore order. Total cost: O(n). Contrast with repeated append: O(n^2).
 
 The canonical pattern for building lists in Elixir:
 
@@ -64,7 +51,7 @@ write a custom `Enum.reduce/3` that builds a list, you must apply this pattern.
 
 ## The business problem
 
-Extend the `Ledger` module with list-processing functions:
+The `Ledger` module needs list-processing functions:
 
 1. Filter transactions by status
 2. Find the transaction with the highest amount
@@ -75,103 +62,110 @@ Extend the `Ledger` module with list-processing functions:
 
 ## Implementation
 
-### Extend `lib/payments_cli/ledger.ex`
+### `lib/payments_cli/ledger.ex`
 
-Add these functions to the existing `Ledger` module from exercise 03. Each function
-uses the appropriate `Enum` function for the task. `filter_by_status/2` delegates to
-`Enum.filter/2`. `max_transaction/1` uses `Enum.reduce/3` with the first element as
-the initial accumulator — this avoids the "what is the initial max?" problem.
+Each function uses the appropriate `Enum` function for the task. `filter_by_status/2`
+delegates to `Enum.filter/2`. `max_transaction/1` uses `Enum.reduce/3` with the first
+element as the initial accumulator — this avoids the "what is the initial max?" problem.
 `group_by_currency/1` delegates to `Enum.group_by/2`, which preserves order within
 each group. `running_balance/1` uses `Enum.reduce/3` with a tuple accumulator to
 track both the running total and the result list.
 
 ```elixir
-# Add to PaymentsCli.Ledger
+defmodule PaymentsCli.Ledger do
+  @moduledoc """
+  List-processing functions for the payments ledger.
 
-@doc """
-Filters transactions to those matching the given status atom.
+  Provides filtering, grouping, aggregation, and running balance
+  computations over transaction lists. All functions are pure — they
+  return new lists without modifying the input.
+  """
 
-Returns a list of matching transaction maps, preserving order.
+  @doc """
+  Filters transactions to those matching the given status atom.
 
-## Examples
+  Returns a list of matching transaction maps, preserving order.
 
-    iex> txs = [%{status: :approved, amount_cents: 100}, %{status: :declined, amount_cents: 50}]
-    iex> PaymentsCli.Ledger.filter_by_status(txs, :approved)
-    [%{status: :approved, amount_cents: 100}]
+  ## Examples
 
-"""
-@spec filter_by_status([map()], atom()) :: [map()]
-def filter_by_status(transactions, status) when is_list(transactions) and is_atom(status) do
-  Enum.filter(transactions, fn tx -> tx.status == status end)
-end
+      iex> txs = [%{status: :approved, amount_cents: 100}, %{status: :declined, amount_cents: 50}]
+      iex> PaymentsCli.Ledger.filter_by_status(txs, :approved)
+      [%{status: :approved, amount_cents: 100}]
 
-@doc """
-Returns the transaction with the highest amount_cents.
+  """
+  @spec filter_by_status([map()], atom()) :: [map()]
+  def filter_by_status(transactions, status) when is_list(transactions) and is_atom(status) do
+    Enum.filter(transactions, fn tx -> tx.status == status end)
+  end
 
-Returns {:ok, transaction} or {:error, :empty_list} for an empty list.
+  @doc """
+  Returns the transaction with the highest amount_cents.
 
-## Examples
+  Returns {:ok, transaction} or {:error, :empty_list} for an empty list.
 
-    iex> txs = [%{id: "A", amount_cents: 500}, %{id: "B", amount_cents: 1200}, %{id: "C", amount_cents: 300}]
-    iex> PaymentsCli.Ledger.max_transaction(txs)
-    {:ok, %{id: "B", amount_cents: 1200}}
+  ## Examples
 
-"""
-@spec max_transaction([map()]) :: {:ok, map()} | {:error, :empty_list}
-def max_transaction([]), do: {:error, :empty_list}
+      iex> txs = [%{id: "A", amount_cents: 500}, %{id: "B", amount_cents: 1200}, %{id: "C", amount_cents: 300}]
+      iex> PaymentsCli.Ledger.max_transaction(txs)
+      {:ok, %{id: "B", amount_cents: 1200}}
 
-def max_transaction([first | rest]) do
-  winner =
-    Enum.reduce(rest, first, fn tx, current_max ->
-      if tx.amount_cents > current_max.amount_cents, do: tx, else: current_max
+  """
+  @spec max_transaction([map()]) :: {:ok, map()} | {:error, :empty_list}
+  def max_transaction([]), do: {:error, :empty_list}
+
+  def max_transaction([first | rest]) do
+    winner =
+      Enum.reduce(rest, first, fn tx, current_max ->
+        if tx.amount_cents > current_max.amount_cents, do: tx, else: current_max
+      end)
+
+    {:ok, winner}
+  end
+
+  @doc """
+  Groups transactions by currency into a map of %{currency => [transactions]}.
+
+  Enum.group_by/2 preserves the order of elements within each group.
+
+  ## Examples
+
+      iex> txs = [
+      ...>   %{currency: "USD", amount_cents: 100},
+      ...>   %{currency: "EUR", amount_cents: 200},
+      ...>   %{currency: "USD", amount_cents: 150}
+      ...> ]
+      iex> PaymentsCli.Ledger.group_by_currency(txs)
+      %{"EUR" => [%{currency: "EUR", amount_cents: 200}], "USD" => [%{currency: "USD", amount_cents: 100}, %{currency: "USD", amount_cents: 150}]}
+
+  """
+  @spec group_by_currency([map()]) :: %{String.t() => [map()]}
+  def group_by_currency(transactions) when is_list(transactions) do
+    Enum.group_by(transactions, fn tx -> tx.currency end)
+  end
+
+  @doc """
+  Builds a running balance list from a list of approved transaction amounts.
+
+  Each element is the cumulative sum up to and including that transaction.
+
+  ## Examples
+
+      iex> PaymentsCli.Ledger.running_balance([100, 200, 50])
+      [100, 300, 350]
+
+      iex> PaymentsCli.Ledger.running_balance([])
+      []
+
+  """
+  @spec running_balance([integer()]) :: [integer()]
+  def running_balance(amounts) when is_list(amounts) do
+    amounts
+    |> Enum.reduce({0, []}, fn amount, {total, acc} ->
+      new_total = total + amount
+      {new_total, [new_total | acc]}
     end)
-
-  {:ok, winner}
-end
-
-@doc """
-Groups transactions by currency into a map of %{currency => [transactions]}.
-
-Enum.group_by/2 preserves the order of elements within each group.
-
-## Examples
-
-    iex> txs = [
-    ...>   %{currency: "USD", amount_cents: 100},
-    ...>   %{currency: "EUR", amount_cents: 200},
-    ...>   %{currency: "USD", amount_cents: 150}
-    ...> ]
-    iex> PaymentsCli.Ledger.group_by_currency(txs)
-    %{"EUR" => [%{currency: "EUR", amount_cents: 200}], "USD" => [%{currency: "USD", amount_cents: 100}, %{currency: "USD", amount_cents: 150}]}
-
-"""
-@spec group_by_currency([map()]) :: %{String.t() => [map()]}
-def group_by_currency(transactions) when is_list(transactions) do
-  Enum.group_by(transactions, fn tx -> tx.currency end)
-end
-
-@doc """
-Builds a running balance list from a list of approved transaction amounts.
-
-Each element is the cumulative sum up to and including that transaction.
-
-## Examples
-
-    iex> PaymentsCli.Ledger.running_balance([100, 200, 50])
-    [100, 300, 350]
-
-    iex> PaymentsCli.Ledger.running_balance([])
-    []
-
-"""
-@spec running_balance([integer()]) :: [integer()]
-def running_balance(amounts) when is_list(amounts) do
-  amounts
-  |> Enum.reduce({0, []}, fn amount, {total, acc} ->
-    new_total = total + amount
-    {new_total, [new_total | acc]}
-  end)
-  |> then(fn {_total, list} -> Enum.reverse(list) end)
+    |> then(fn {_total, list} -> Enum.reverse(list) end)
+  end
 end
 ```
 
@@ -195,7 +189,7 @@ end
   the new total to the result list (O(1)). After the reduce, `Enum.reverse/1` restores
   the original order (O(n) once). The `then/2` function unwraps the tuple.
 
-### Given tests — must pass without modification
+### Tests
 
 ```elixir
 # test/payments_cli/ledger_list_test.exs
@@ -288,7 +282,7 @@ mix test test/payments_cli/ledger_list_test.exs --trace
 
 | Aspect | Prepend + reverse (your impl) | `++` append per step | `Enum.map` / `Enum.filter` |
 |--------|-------------------------------|---------------------|--------------------------|
-| Time complexity | O(n) | O(n²) | O(n) — preferred for simple transforms |
+| Time complexity | O(n) | O(n^2) | O(n) — preferred for simple transforms |
 | Memory per step | One cons cell | Copies entire list | One cons cell |
 | Code clarity | Requires knowing the pattern | Looks natural but slow | Most readable |
 | When to use | Custom accumulation logic | Never in reduce | Standard transforms |
@@ -301,7 +295,7 @@ using `Enum.reduce/3`? Write the equivalent manually as a mental exercise.
 
 ## Common production mistakes
 
-**1. `++` in reduce builds O(n²) pipelines**
+**1. `++` in reduce builds O(n^2) pipelines**
 The most common performance bug in new Elixir code. With 100,000 transactions,
 `accumulator ++ [tx]` turns a 100ms operation into minutes. Profile with
 `:timer.tc/1` before and after fixing.
@@ -318,7 +312,7 @@ end
 
 **3. Using `Enum.at/2` in a loop**
 `Enum.at(list, n)` traverses the list to index `n` — it is O(n). Calling it
-inside a loop over the list is O(n²). Use pattern matching or `Enum.each_with_index/2`
+inside a loop over the list is O(n^2). Use pattern matching or `Enum.with_index/2`
 instead.
 
 **4. List `--` removes only the first occurrence**

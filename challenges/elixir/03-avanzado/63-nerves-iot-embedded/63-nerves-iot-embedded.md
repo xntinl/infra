@@ -1,28 +1,15 @@
 # Nerves — IoT Gateway on Embedded Hardware
 
-**Project**: `api_gateway` — a variant deployed to a Raspberry Pi 4 as an
-edge IoT gateway
-
----
-
 ## Project context
 
-The `api_gateway` runs in the cloud, but the infrastructure team needs an edge
-variant: a physically deployed Raspberry Pi 4 at each data center rack that reads
-environmental sensors (temperature, humidity, power), exposes a local HTTP API, and
-forwards metrics to the cloud gateway via MQTT. This exercise builds that device.
+You are building `api_gateway`. This exercise creates an edge variant: a physically deployed Raspberry Pi 4 at each data center rack that reads environmental sensors (temperature, humidity, power), exposes a local HTTP API, and stores readings in an ETS-backed circular buffer. All modules are defined from scratch.
 
-Nerves compiles your Elixir application into a complete Linux firmware image that
-boots directly into the BEAM VM. The same OTP supervision tree, GenServer patterns,
-and ETS stores you use in the cloud gateway work identically on the device.
+Nerves compiles your Elixir application into a complete Linux firmware image that boots directly into the BEAM VM. The same OTP supervision tree, GenServer patterns, and ETS stores you use in the cloud gateway work identically on the device.
 
 Project structure:
 
 ```
 api_gateway/
-├── config/
-│   ├── config.exs          # shared config
-│   └── target.exs          # device-only config (GPIO, WiFi, MQTT)
 ├── lib/
 │   └── api_gateway/
 │       ├── application.ex          # target-aware supervision tree
@@ -54,41 +41,21 @@ Each rack unit needs:
 
 ## Why BEAM on embedded hardware
 
-Most embedded systems run a RTOS or bare metal C. BEAM brings three things those lack:
-supervisor trees that restart individual components without rebooting the device,
-hot code loading so you can update business logic without touching the OS, and
-distributed clustering (multiple Nerves devices can form a cluster with `libcluster`).
+Most embedded systems run a RTOS or bare metal C. BEAM brings three things those lack: supervisor trees that restart individual components without rebooting the device, hot code loading so you can update business logic without touching the OS, and distributed clustering (multiple Nerves devices can form a cluster with `libcluster`).
 
-The trade-off: BEAM has a higher memory floor (~30 MB for the VM itself) compared to a
-C program. For a Raspberry Pi 4 with 4 GB RAM, this is irrelevant. For a microcontroller
-with 256 KB, Nerves is the wrong choice.
+The trade-off: BEAM has a higher memory floor (~30 MB for the VM itself). For a Raspberry Pi 4 with 4 GB RAM, this is irrelevant. For a microcontroller with 256 KB, Nerves is the wrong choice.
 
 ---
 
 ## Why the target-aware `children/1` pattern
 
-Nerves projects must run tests on your development machine (`:host` target) without
-GPIO hardware. The `children(target())` pattern keeps the supervisor tree identical in
-structure — same OTP design, same restart strategies — but substitutes stub
-implementations for hardware-dependent modules when running on the host.
-
-This means: all business logic is testable without a Raspberry Pi. Only the hardware
-I/O modules (`Circuits.GPIO`, `Circuits.I2C`) require the actual device.
+Nerves projects must run tests on your development machine (`:host` target) without GPIO hardware. The `children(target())` pattern keeps the supervisor tree identical in structure but substitutes stub implementations for hardware-dependent modules when running on the host. All business logic is testable without a Raspberry Pi.
 
 ---
 
 ## Implementation
 
-### Step 1: Create the Nerves project
-
-```bash
-mix archive.install hex nerves_bootstrap
-mix nerves.new api_gateway_edge --target rpi4
-cd api_gateway_edge
-mkdir -p lib/api_gateway/sensor lib/api_gateway/indicator
-```
-
-### Step 2: `mix.exs`
+### Step 1: `mix.exs`
 
 ```elixir
 defp deps do
@@ -105,7 +72,7 @@ defp deps do
 end
 ```
 
-### Step 3: `lib/api_gateway/sensor/store.ex`
+### Step 2: `lib/api_gateway/sensor/store.ex`
 
 ```elixir
 defmodule ApiGateway.Sensor.Store do
@@ -120,9 +87,11 @@ defmodule ApiGateway.Sensor.Store do
   @table    :sensor_readings
   @max_size 100
 
+  @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(_opts), do: GenServer.start_link(__MODULE__, [], name: __MODULE__)
 
   @doc "Inserts a new reading. Evicts the oldest if over capacity."
+  @spec insert(map()) :: :ok
   def insert(reading) do
     ts = System.monotonic_time(:millisecond)
     :ets.insert(@table, {ts, reading})
@@ -130,6 +99,7 @@ defmodule ApiGateway.Sensor.Store do
   end
 
   @doc "Returns the most recent reading, or nil."
+  @spec latest() :: map() | nil
   def latest do
     case :ets.last(@table) do
       :"$end_of_table" -> nil
@@ -138,6 +108,7 @@ defmodule ApiGateway.Sensor.Store do
   end
 
   @doc "Returns the last N readings, newest first."
+  @spec history(pos_integer()) :: [map()]
   def history(n \\ 10) do
     :ets.tab2list(@table)
     |> Enum.sort_by(fn {ts, _} -> ts end, :desc)
@@ -162,18 +133,11 @@ defmodule ApiGateway.Sensor.Store do
 end
 ```
 
-The store uses `System.monotonic_time(:millisecond)` as the ETS key — monotonic time
-is strictly increasing and never goes backwards (unlike wall-clock time which can
-jump due to NTP adjustments). The `:ordered_set` table type keeps entries sorted by
-key, so `:ets.last/1` always returns the most recent reading in O(log n).
+The store uses `System.monotonic_time(:millisecond)` as the ETS key — monotonic time is strictly increasing and never goes backwards (unlike wall-clock time which can jump due to NTP adjustments). The `:ordered_set` table type keeps entries sorted by key, so `:ets.last/1` always returns the most recent reading in O(log n).
 
-Eviction is handled asynchronously via `GenServer.cast/2`. This means `insert/1`
-returns immediately after the ETS write. The cast runs in the GenServer process,
-checking the table size and removing the oldest entry if over capacity. The small
-window where the table has 101 entries is acceptable — it is bounded and resolved
-on the next message.
+Eviction is handled asynchronously via `GenServer.cast/2`. This means `insert/1` returns immediately after the ETS write. The small window where the table has 101 entries is acceptable — it is bounded and resolved on the next message.
 
-### Step 4: `lib/api_gateway/sensor/bme280.ex`
+### Step 3: `lib/api_gateway/sensor/bme280.ex`
 
 ```elixir
 defmodule ApiGateway.Sensor.BME280 do
@@ -181,8 +145,7 @@ defmodule ApiGateway.Sensor.BME280 do
   Reads temperature, humidity, and pressure from a BME280 sensor over I2C.
   Polls every @poll_interval_ms. On read errors, applies exponential backoff.
 
-  The GenServer owns the I2C bus reference. It opens at init and closes at terminate,
-  following the same lifecycle pattern as the ETS table owner in RateLimiter.Server.
+  The GenServer owns the I2C bus reference. It opens at init and closes at terminate.
   """
   use GenServer
   require Logger
@@ -192,24 +155,20 @@ defmodule ApiGateway.Sensor.BME280 do
   @poll_interval_ms 5_000
   @max_backoff_ms   60_000
 
-  # Public API
-
+  @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts) do
     bus     = Keyword.get(opts, :bus, "i2c-1")
     address = Keyword.get(opts, :address, @bme280_addr)
     GenServer.start_link(__MODULE__, {bus, address}, name: __MODULE__)
   end
 
+  @spec current_reading() :: map() | nil
   def current_reading, do: ApiGateway.Sensor.Store.latest()
-
-  # Callbacks
 
   @impl true
   def init({bus, address}) do
     {:ok, bus_ref} = I2C.open(bus)
 
-    # Initialize BME280: write 0x27 to ctrl_hum (oversampling x1),
-    # then 0x27 to ctrl_meas (temp x1, pressure x1, normal mode)
     I2C.write(bus_ref, address, <<0xF2, 0x01>>)
     I2C.write(bus_ref, address, <<0xF4, 0x27>>)
 
@@ -239,8 +198,6 @@ defmodule ApiGateway.Sensor.BME280 do
     I2C.close(state.bus_ref)
   end
 
-  # Private
-
   defp schedule_poll(ms), do: Process.send_after(self(), :poll, ms)
 
   defp read_sensor(bus_ref, address) do
@@ -257,31 +214,18 @@ defmodule ApiGateway.Sensor.BME280 do
     end
   end
 
-  defp decode_temp(<<msb, lsb, xlsb>>) do
-    ((msb <<< 12) ||| (lsb <<< 4) ||| (xlsb >>> 4)) / 5120.0
-  end
+  defp decode_temp(<<msb, lsb, xlsb>>),
+    do: ((msb <<< 12) ||| (lsb <<< 4) ||| (xlsb >>> 4)) / 5120.0
 
-  defp decode_hum(<<msb, lsb>>) do
-    ((msb <<< 8) ||| lsb) / 1024.0
-  end
+  defp decode_hum(<<msb, lsb>>),
+    do: ((msb <<< 8) ||| lsb) / 1024.0
 
-  defp decode_press(<<msb, lsb, xlsb>>) do
-    ((msb <<< 12) ||| (lsb <<< 4) ||| (xlsb >>> 4)) / 25_600.0
-  end
+  defp decode_press(<<msb, lsb, xlsb>>),
+    do: ((msb <<< 12) ||| (lsb <<< 4) ||| (xlsb >>> 4)) / 25_600.0
 end
 ```
 
-The `init/1` callback opens the I2C bus, writes initialization registers to the BME280
-sensor, and schedules the first poll. On successful reads, the reading is inserted into
-the `Store` and the next poll is scheduled at the normal interval. On failures, the
-error count increments and the backoff grows exponentially up to `@max_backoff_ms`.
-This prevents the GenServer from hammering a failing sensor bus.
-
-`terminate/2` closes the I2C bus reference, releasing the OS file descriptor. Without
-this, a crashed-and-restarted process would fail with `{:error, :resource_busy}` when
-trying to reopen the same bus.
-
-### Step 5: `lib/api_gateway/indicator/led.ex`
+### Step 4: `lib/api_gateway/indicator/led.ex`
 
 ```elixir
 defmodule ApiGateway.Indicator.LED do
@@ -294,22 +238,20 @@ defmodule ApiGateway.Indicator.LED do
     :off      — solid off
   """
   use GenServer
-  require Logger
   alias Circuits.GPIO
 
   @pin 18
 
-  # Public API
-
+  @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
 
+  @spec set_mode(:healthy | :warning | :off) :: :ok
   def set_mode(mode) when mode in [:healthy, :warning, :off] do
     GenServer.cast(__MODULE__, {:set_mode, mode})
   end
 
+  @spec status() :: map()
   def status, do: GenServer.call(__MODULE__, :status)
-
-  # Callbacks
 
   @impl true
   def init(_opts) do
@@ -350,11 +292,9 @@ defmodule ApiGateway.Indicator.LED do
     GPIO.close(state.gpio)
   end
 
-  # Private
-
   defp interval(:healthy), do: 500
-  defp interval(:warning),  do: 100
-  defp interval(:off),      do: 60_000
+  defp interval(:warning), do: 100
+  defp interval(:off),     do: 60_000
 
   defp schedule_blink(state) do
     timer = Process.send_after(self(), :blink, interval(state.mode))
@@ -362,14 +302,18 @@ defmodule ApiGateway.Indicator.LED do
   end
 
   defp cancel_timer(nil), do: :ok
-  defp cancel_timer(ref),  do: Process.cancel_timer(ref)
+  defp cancel_timer(ref), do: Process.cancel_timer(ref)
 end
 ```
 
-### Step 6: `lib/api_gateway/device_api.ex`
+### Step 5: `lib/api_gateway/device_api.ex`
 
 ```elixir
 defmodule ApiGateway.DeviceAPI do
+  @moduledoc """
+  Local HTTP API for the edge gateway device.
+  Exposes sensor readings and device system info.
+  """
   use Plug.Router
   import Plug.Conn
 
@@ -390,16 +334,6 @@ defmodule ApiGateway.DeviceAPI do
     json(conn, 200, ApiGateway.Sensor.Store.history(n))
   end
 
-  get "/system" do
-    info = %{
-      firmware_version: Nerves.Runtime.firmware_metadata()["nerves_fw_version"] || "unknown",
-      uptime_seconds: Nerves.Runtime.uptime() |> elem(0),
-      memory_mb: :erlang.memory(:total) |> div(1_048_576)
-    }
-
-    json(conn, 200, info)
-  end
-
   match _ do
     json(conn, 404, %{error: "not found"})
   end
@@ -407,12 +341,14 @@ defmodule ApiGateway.DeviceAPI do
   defp json(conn, status, body) do
     conn
     |> put_resp_content_type("application/json")
-    |> send_resp(status, Jason.encode!(reading_to_json(body)))
+    |> send_resp(status, Jason.encode!(normalize_for_json(body)))
   end
 
-  defp reading_to_json(%DateTime{} = dt), do: DateTime.to_iso8601(dt)
-  defp reading_to_json(%{timestamp: ts} = r), do: Map.put(r, :timestamp, DateTime.to_iso8601(ts))
-  defp reading_to_json(other), do: other
+  defp normalize_for_json(%DateTime{} = dt), do: DateTime.to_iso8601(dt)
+  defp normalize_for_json(%{timestamp: %DateTime{} = ts} = r),
+    do: Map.put(r, :timestamp, DateTime.to_iso8601(ts))
+  defp normalize_for_json(list) when is_list(list), do: Enum.map(list, &normalize_for_json/1)
+  defp normalize_for_json(other), do: other
 
   defp parse_int(nil, default), do: default
   defp parse_int(s, default) do
@@ -424,15 +360,14 @@ defmodule ApiGateway.DeviceAPI do
 end
 ```
 
-The `/system` endpoint returns firmware metadata, uptime, and memory usage. These
-values come from Nerves runtime functions that read from the Linux procfs and firmware
-metadata stored in the firmware image. On the host target these functions may not be
-available, which is why this endpoint is only included in the device supervision tree.
-
-### Step 7: `lib/api_gateway/application.ex` — target-aware tree
+### Step 6: `lib/api_gateway/application.ex` — target-aware tree
 
 ```elixir
 defmodule ApiGateway.Application do
+  @moduledoc """
+  Target-aware application that starts hardware-dependent children
+  only when running on a Nerves device, not during host-based tests.
+  """
   use Application
   require Logger
 
@@ -443,11 +378,11 @@ defmodule ApiGateway.Application do
   end
 
   # On the host (dev/test): no GPIO, no I2C — business logic only
-  def children(:host) do
+  defp children(:host) do
     [ApiGateway.Sensor.Store]
   end
 
-  def children(_target) do
+  defp children(_target) do
     Logger.info("Starting edge gateway on #{target()}")
     [
       ApiGateway.Sensor.Store,
@@ -457,13 +392,13 @@ defmodule ApiGateway.Application do
     ]
   end
 
-  def target do
+  defp target do
     Application.get_env(:api_gateway, :target, Mix.target())
   end
 end
 ```
 
-### Step 8: Given tests — must pass without modification
+### Step 7: Given tests — must pass without modification
 
 ```elixir
 # test/api_gateway/sensor_store_test.exs
@@ -507,18 +442,10 @@ defmodule ApiGateway.Sensor.StoreTest do
 end
 ```
 
-### Step 9: Run tests on host (no hardware needed)
+### Step 8: Run tests on host (no hardware needed)
 
 ```bash
 MIX_TARGET=host mix test test/api_gateway/sensor_store_test.exs --trace
-```
-
-### Step 10: Build and flash (with Raspberry Pi 4 connected)
-
-```bash
-MIX_TARGET=rpi4 mix deps.get
-MIX_TARGET=rpi4 mix firmware
-MIX_TARGET=rpi4 mix burn
 ```
 
 ---
@@ -531,39 +458,26 @@ MIX_TARGET=rpi4 mix burn
 | OTA updates | NervesHub (atomic, signed) | Vendor toolchain | Manual flash |
 | Memory floor | ~30 MB | <1 MB | <1 KB |
 | Clustering | Distributed Erlang | No | No |
-| Language | Elixir/Erlang | C | C |
 | Boot time | ~2 seconds | <100ms | <10ms |
 | When to choose | Raspberry Pi, BeagleBone | Low-power MCU | Bare MCU |
 
-Reflection question: the `children(:host)` clause omits `LED` and `BME280`. What
-would happen to the supervision strategy if you included them with stub implementations
-that always return `{:ok, nil}`? Is there a case where you want stubs in the tree?
+Reflection question: the `children(:host)` clause omits `LED` and `BME280`. What would happen to the supervision strategy if you included them with stub implementations that always return `{:ok, nil}`?
 
 ---
 
 ## Common production mistakes
 
 **1. Not closing GPIO and I2C in `terminate/2`**
-If the process crashes and restarts, `GPIO.open/2` on the same pin fails with
-`{:error, :resource_busy}`. Always release hardware resources in `terminate/2`.
+If the process crashes and restarts, `GPIO.open/2` on the same pin fails with `{:error, :resource_busy}`. Always release hardware resources in `terminate/2`.
 
 **2. Not using `System.monotonic_time` as ETS key**
-Using `DateTime.utc_now()` as a key causes collisions if two inserts happen within
-the same microsecond (NTP step can also cause duplicates). Monotonic time is unique
-and never goes backwards.
+Using `DateTime.utc_now()` as a key causes collisions if two inserts happen within the same microsecond. Monotonic time is unique and never goes backwards.
 
-**3. OTA update applied during a sensor write**
-If the device reboots mid-write, the sensor store (ETS, RAM) is lost. This is expected —
-the store is a cache, not a source of truth. The cloud gateway holds the durable record.
-If durability is needed, use DETS (disk-backed ETS) before applying OTA.
+**3. Hardcoding GPIO pin numbers**
+Pin numbers change between hardware revisions. Store pin assignments in `config/target.exs` and read them with `Application.get_env/3`.
 
-**4. Hardcoding GPIO pin numbers**
-Pin numbers change between Raspberry Pi hardware revisions. Store pin assignments in
-`config/target.exs` and read them with `Application.get_env/3` in `start_link/1`.
-
-**5. Testing with `async: true` when using a named ETS table**
-`sensor_store_test.exs` uses `async: false` because the `:sensor_readings` table is
-global. Parallel tests that insert different data to the same table will interfere.
+**4. Testing with `async: true` when using a named ETS table**
+The `:sensor_readings` table is global. Parallel tests that insert different data to the same table will interfere.
 
 ---
 

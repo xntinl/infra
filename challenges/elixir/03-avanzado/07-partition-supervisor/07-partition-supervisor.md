@@ -1,122 +1,41 @@
 # PartitionSupervisor: Eliminating GenServer Serialization Points
 
-**Project**: `api_gateway` — built incrementally across the advanced level
+## Goal
 
----
-
-## Project context
-
-You're building `api_gateway`. The rate limiter (exercise — ETS + sliding window)
-is fast for reads, but all writes still go through a single `RateLimiter.Server`
-GenServer. Under load testing at 50,000 req/s with 10,000 distinct clients,
-`:erlang.process_info(pid, :message_queue_len)` on the server shows a backlog of
-8,000+ messages. The GenServer is the bottleneck.
-
-The fix: shard the rate limiter across N processes using `PartitionSupervisor`
-(introduced in Elixir 1.14). Each client is deterministically routed to one shard
-by hashing `client_id`. Reads and writes within a shard are serialized only against
-each other, not against all other clients.
-
-Project structure at this point:
-
-```
-api_gateway/
-├── lib/
-│   └── api_gateway/
-│       ├── application.ex
-│       ├── router.ex
-│       └── rate_limiter/
-│           ├── server.ex          # ← rewrite to support sharding
-│           ├── window.ex
-│           └── partition_counter.ex  # ← you implement this (exercise 2)
-├── test/
-│   └── api_gateway/
-│       └── rate_limiter/
-│           ├── server_test.exs         # given tests — must pass
-│           └── partition_bench_test.exs # benchmark test — run last
-├── bench/
-│   └── partition_bench.exs
-└── mix.exs
-```
+Replace a single-process rate limiter bottleneck with a `PartitionSupervisor` that shards the workload across N processes (one per scheduler). Each client is deterministically routed to one shard by hashing `client_id`. Operations within a shard are serialized only against each other, not against all other clients.
 
 ---
 
 ## How `PartitionSupervisor` works
 
-`PartitionSupervisor` creates N identical copies of a child spec and registers them
-as `{supervisor_name, 0}` through `{supervisor_name, N-1}`. Routing uses
-`:erlang.phash2(key, n_partitions)` to map any Elixir term to a partition index.
+`PartitionSupervisor` (Elixir 1.14+) creates N identical copies of a child spec and registers them as `{supervisor_name, 0}` through `{supervisor_name, N-1}`. Routing uses `:erlang.phash2(key, n_partitions)` to map any term to a partition index.
 
 ```elixir
-# In application.ex
 {PartitionSupervisor,
   child_spec: ApiGateway.RateLimiter.Server,
   name:       ApiGateway.RateLimiter.Partitions,
   partitions: System.schedulers_online()
 }
 
-# Routing from a client call:
+# Routing:
 GenServer.call(
   {:via, PartitionSupervisor, {ApiGateway.RateLimiter.Partitions, client_id}},
   {:check, client_id, limit, window_ms}
 )
 ```
 
-The same `client_id` always hashes to the same partition — this is the key property.
-All operations for a single client are serialized within one process, preserving
-correctness. Operations for different clients in different partitions run in parallel.
+The same `client_id` always hashes to the same partition -- all operations for a single client are serialized within one process.
 
 ---
 
-## When to use `PartitionSupervisor`
+## Full implementation
 
-The decisive question: does the workload have a **natural sharding key** where all
-operations for a given key can safely be isolated to one process?
+### `lib/api_gateway/rate_limiter/server.ex`
 
-| Workload | Good fit? | Reason |
-|----------|-----------|--------|
-| Rate limiting per client_id | Yes | Each client's state is independent |
-| Global request counter | No | Requires cross-shard coordination |
-| Cache by cache_key | Yes | Locality of reference per key |
-| Circuit breaker per service | Yes | State is per-service |
-| Distributed lock (one mutex) | No | Cannot shard a single mutex |
-| Session state per user_id | Yes | State is per-user |
-
-Anti-pattern: using `PartitionSupervisor` when keys have low cardinality (e.g.,
-only 3 possible values). With 8 partitions and 3 distinct keys, 5 partitions receive
-zero traffic. The overhead of extra processes exceeds the benefit.
-
----
-
-## Implementation
-
-### Step 1: Update `application.ex`
-
-Replace the single `RateLimiter.Server` with a `PartitionSupervisor` that creates
-N copies (one per scheduler). Each partition is an independent GenServer with its own
-ETS table.
-
-```elixir
-# In lib/api_gateway/application.ex, inside CoreSupervisor children:
-
-# Replace the single RateLimiter.Server with a PartitionSupervisor:
-{PartitionSupervisor,
-  child_spec: ApiGateway.RateLimiter.Server,
-  name:       ApiGateway.RateLimiter.Partitions,
-  partitions: System.schedulers_online()
-}
-```
-
-### Step 2: Rewrite `lib/api_gateway/rate_limiter/server.ex`
-
-The key changes from the original single-process server:
-
-1. **No fixed name registration**: each partition gets its own name from the
-   PartitionSupervisor, so `start_link` must NOT register with a fixed `name:`.
-2. **Unnamed ETS tables**: each partition creates its own private ETS table. Using
-   `:named_table` would crash the second partition because the name is already taken.
-3. **Via-tuple routing**: public API functions route through the PartitionSupervisor
-   using `{:via, PartitionSupervisor, {supervisor_name, routing_key}}`.
+Key changes from a single-process server:
+1. No fixed name registration -- each partition gets its own name from the PartitionSupervisor.
+2. Unnamed ETS tables -- each partition creates its own private ETS table.
+3. Via-tuple routing -- public API functions route through the PartitionSupervisor.
 
 ```elixir
 defmodule ApiGateway.RateLimiter.Server do
@@ -130,7 +49,7 @@ defmodule ApiGateway.RateLimiter.Server do
 
   @doc """
   Checks whether client_id is within its rate limit.
-  Routes to the correct partition automatically via PartitionSupervisor.
+  Routes to the correct partition via PartitionSupervisor.
   Returns {:allow, remaining} or {:deny, retry_after_ms}.
   """
   @spec check(String.t(), pos_integer(), pos_integer()) ::
@@ -142,10 +61,7 @@ defmodule ApiGateway.RateLimiter.Server do
     )
   end
 
-  @doc """
-  Records a request for client_id. Cast — fire and forget.
-  Routes to the same partition as check/3.
-  """
+  @doc "Records a request for client_id. Cast -- fire and forget."
   @spec record(String.t()) :: :ok
   def record(client_id) do
     GenServer.cast(
@@ -157,20 +73,16 @@ defmodule ApiGateway.RateLimiter.Server do
 
   # ---------------------------------------------------------------------------
   # GenServer lifecycle
-  # Each partition manages state for the clients that hash to it.
   # ---------------------------------------------------------------------------
 
   def start_link(opts \\ []) do
-    # Do NOT register with a fixed name here.
-    # PartitionSupervisor manages the naming via the partition index.
     GenServer.start_link(__MODULE__, opts)
   end
 
   @impl true
   def init(_opts) do
     # Each partition creates its own unnamed ETS table.
-    # Using :named_table would crash the second partition because the
-    # name would already be taken by the first.
+    # Using :named_table would crash the second partition.
     table = :ets.new(:rate_limiter_shard, [:bag, :public])
     Process.send_after(self(), :cleanup, @cleanup_interval_ms)
     {:ok, %{table: table}}
@@ -185,14 +97,12 @@ defmodule ApiGateway.RateLimiter.Server do
     now = System.monotonic_time(:millisecond)
     cutoff = now - window_ms
 
-    # Count only timestamps within the current window
     count =
       :ets.lookup(state.table, client_id)
       |> Enum.count(fn {_id, ts} -> ts > cutoff end)
 
     result =
       if count >= limit do
-        # Find the oldest timestamp in the window to calculate retry_after
         oldest_in_window =
           :ets.lookup(state.table, client_id)
           |> Enum.filter(fn {_id, ts} -> ts > cutoff end)
@@ -219,29 +129,20 @@ defmodule ApiGateway.RateLimiter.Server do
   @impl true
   def handle_info(:cleanup, state) do
     cutoff = System.monotonic_time(:millisecond) - 3_600_000
-
-    # Delete entries older than 1 hour. :ets.select_delete with a match spec
-    # efficiently removes matching entries without building an intermediate list.
     :ets.select_delete(state.table, [{{:_, :"$1"}, [{:<, :"$1", cutoff}], [true]}])
-
     Process.send_after(self(), :cleanup, @cleanup_interval_ms)
     {:noreply, state}
   end
 end
 ```
 
-### Step 3: `lib/api_gateway/rate_limiter/partition_counter.ex`
+### `lib/api_gateway/rate_limiter/partition_counter.ex`
 
-The gateway dashboard needs aggregate stats across all partitions. This module
-collects per-partition data in parallel using `Task.async_stream`.
+Collects aggregate stats across all partitions in parallel.
 
 ```elixir
 defmodule ApiGateway.RateLimiter.PartitionCounter do
-  @doc """
-  Returns the total number of active window entries across all partitions.
-  Each partition contributes its local ETS table size.
-  Uses Task.async_stream for parallel collection.
-  """
+  @doc "Returns the total number of active window entries across all partitions."
   @spec total_entries() :: non_neg_integer()
   def total_entries do
     n = PartitionSupervisor.partitions(ApiGateway.RateLimiter.Partitions)
@@ -257,10 +158,8 @@ defmodule ApiGateway.RateLimiter.PartitionCounter do
     |> Enum.reduce(0, fn {:ok, count}, acc -> acc + count end)
   end
 
-  @doc """
-  Returns partition-level stats for observability/debugging.
-  """
-  @spec partition_stats() :: [%{partition: integer(), entries: integer(), pid: pid(), queue_len: integer()}]
+  @doc "Returns partition-level stats for observability."
+  @spec partition_stats() :: [map()]
   def partition_stats do
     n = PartitionSupervisor.partitions(ApiGateway.RateLimiter.Partitions)
 
@@ -278,7 +177,18 @@ defmodule ApiGateway.RateLimiter.PartitionCounter do
 end
 ```
 
-### Step 4: Given tests — must pass without modification
+### `application.ex` setup
+
+```elixir
+# In children list:
+{PartitionSupervisor,
+  child_spec: ApiGateway.RateLimiter.Server,
+  name:       ApiGateway.RateLimiter.Partitions,
+  partitions: System.schedulers_online()
+}
+```
+
+### Tests
 
 ```elixir
 # test/api_gateway/rate_limiter/server_test.exs
@@ -288,7 +198,6 @@ defmodule ApiGateway.RateLimiter.ServerTest do
   alias ApiGateway.RateLimiter.Server
 
   setup do
-    # Clear all partition tables between tests
     n = PartitionSupervisor.partitions(ApiGateway.RateLimiter.Partitions)
     for i <- 0..(n - 1) do
       pid = GenServer.whereis(
@@ -302,7 +211,6 @@ defmodule ApiGateway.RateLimiter.ServerTest do
 
   describe "routing" do
     test "same client_id always routes to same partition" do
-      # Record on one call path, check on another — must find the records
       for _ <- 1..5, do: Server.record("routing-test")
       Process.sleep(20)
       assert {:allow, 5} = Server.check("routing-test", 10, 60_000)
@@ -356,103 +264,35 @@ defmodule ApiGateway.RateLimiter.ServerTest do
 end
 ```
 
-### Step 5: Run the tests
-
-```bash
-mix test test/api_gateway/rate_limiter/server_test.exs --trace
-```
-
-### Step 6: Benchmark single vs partitioned
-
-```elixir
-# bench/partition_bench.exs
-alias ApiGateway.RateLimiter.Server
-
-n_clients  = 1_000
-n_requests = 200
-
-clients = for i <- 1..n_clients, do: "bench-client-#{i}"
-
-{time_us, _} =
-  :timer.tc(fn ->
-    clients
-    |> Task.async_stream(
-      fn client ->
-        for _ <- 1..n_requests do
-          Server.record(client)
-          Server.check(client, 10_000, 60_000)
-        end
-      end,
-      max_concurrency: n_clients,
-      timeout: 60_000
-    )
-    |> Stream.run()
-  end)
-
-total_ops = n_clients * n_requests * 2
-throughput = total_ops / (time_us / 1_000_000)
-
-IO.puts("Partitions:  #{PartitionSupervisor.partitions(ApiGateway.RateLimiter.Partitions)}")
-IO.puts("Total ops:   #{total_ops}")
-IO.puts("Duration:    #{Float.round(time_us / 1_000, 1)} ms")
-IO.puts("Throughput:  #{Float.round(throughput, 0)} ops/s")
-```
-
-```bash
-mix run bench/partition_bench.exs
-```
-
-**Expected result**: throughput scales roughly linearly with partition count up to
-`System.schedulers_online()`. Beyond that, scheduling overhead dominates.
-
 ---
 
-## Trade-off analysis
+## How it works
 
-| Aspect | Single GenServer | N Partitions | Notes |
-|--------|-----------------|--------------|-------|
-| Max throughput | 1× (serialized) | ~N× (parallel) | Measured with benchmark |
-| Consistency | Strong per-client | Strong per-client | Same key → same shard |
-| Global state | Trivial | Requires aggregation | See `PartitionCounter` |
-| Observability | One process to inspect | N processes to inspect | Use `partition_stats/0` |
-| Changing N partitions | N/A | Requires state migration | Hash changes on resize |
-| Memory | One ETS table | N ETS tables | Pro-rated per partition |
+1. **Deterministic routing**: `:erlang.phash2(client_id, n_partitions)` always maps the same client to the same partition. All operations for a single client are serialized within one process.
 
-Reflection question: if you change `partitions: 8` to `partitions: 16` in a running
-system, what happens to the existing window entries in each partition's ETS table?
-Why is this a problem, and how would you safely resize in production?
+2. **Unnamed ETS tables**: each partition creates its own ETS table without `:named_table` (which would crash the second partition).
+
+3. **Via-tuple**: `{:via, PartitionSupervisor, {supervisor_name, routing_key}}` transparently routes calls to the correct partition. Application code does not need to know the partition count.
+
+4. **Parallel aggregation**: `PartitionCounter` collects per-partition data using `Task.async_stream` for dashboard/monitoring use.
 
 ---
 
 ## Common production mistakes
 
 **1. Using `:named_table` in each partition**
-Each partition is a separate process. If `init/1` calls `:ets.new(:rate_limiter, [:named_table, ...])`,
-the second partition to start crashes with `{:badarg, ...}` because the name is already
-taken. Use unnamed tables and store the ref in state.
+The second partition crashes because the name is already taken by the first.
 
 **2. Assuming uniform hash distribution with small key spaces**
-`:erlang.phash2/2` distributes evenly over large key sets. With only 5 distinct clients
-and 8 partitions, some partitions will receive 0 traffic. The bottleneck simply moves
-to the 2–3 hot partitions. Measure actual distribution before declaring victory.
+With 5 distinct clients and 8 partitions, some partitions will receive 0 traffic.
 
-**3. Forgetting that changing partition count is a breaking change**
-`:erlang.phash2("client-x", 8)` and `:erlang.phash2("client-x", 16)` return different
-values. After a resize, all clients route to different partitions. Their existing window
-entries are in the old partitions and will not be found. For stateful sharding, treat
-a partition count change as a data migration.
-
-**4. Using the routing key as the process identity**
-The routing key (e.g., `client_id`) determines *which* partition receives the message.
-The partition process does not "know" its routing key — it handles all clients that
-hash to its index. The client_id must be in the message payload, not inferred from
-how the process was started.
+**3. Changing partition count is a breaking change**
+`:erlang.phash2("client-x", 8)` and `:erlang.phash2("client-x", 16)` return different values. Existing window entries are in the old partitions.
 
 ---
 
 ## Resources
 
-- [HexDocs — PartitionSupervisor](https://hexdocs.pm/elixir/PartitionSupervisor.html)
-- [Elixir 1.14 release notes — PartitionSupervisor introduction](https://elixir-lang.org/blog/2022/09/01/elixir-v1-14-0-released/)
-- [`:erlang.phash2/2` — Erlang docs](https://www.erlang.org/doc/man/erlang.html#phash2-2)
-- [Process.info/2 — HexDocs](https://hexdocs.pm/elixir/Process.html#info/2) — message queue inspection
+- [HexDocs -- PartitionSupervisor](https://hexdocs.pm/elixir/PartitionSupervisor.html)
+- [Elixir 1.14 release notes](https://elixir-lang.org/blog/2022/09/01/elixir-v1-14-0-released/)
+- [`:erlang.phash2/2` -- Erlang docs](https://www.erlang.org/doc/man/erlang.html#phash2-2)

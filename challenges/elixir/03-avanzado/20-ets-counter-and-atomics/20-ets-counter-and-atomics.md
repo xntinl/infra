@@ -1,18 +1,13 @@
 # ETS Counters and Atomics
 
-**Project**: `api_gateway` — built incrementally across the advanced level
-
----
-
 ## Project context
 
-You're building `api_gateway`. The gateway has per-route ETS counters and a periodic
-metrics flush. But the dashboard team reports that counter reads are lagging under
-50k req/s load — the ETS update path is showing up in profiling. And a new requirement
-arrives: a sliding window rate limiter that counts requests per second with sub-microsecond
-overhead per request.
+You are building `api_gateway`, an internal HTTP gateway that routes traffic to microservices.
+This exercise focuses on building a sliding window rate limiter with sub-microsecond overhead
+per request, and comparing counter mechanisms (ETS `update_counter`, `:atomics`, `:counters`)
+for throughput under high concurrency.
 
-Project structure at this point:
+Project structure:
 
 ```
 api_gateway/
@@ -20,13 +15,8 @@ api_gateway/
 │   └── api_gateway/
 │       ├── application.ex
 │       ├── router.ex
-│       ├── rate_limiter/
-│       ├── metrics/
-│       │   ├── counter.ex       # existing
-│       │   ├── event_log.ex     # existing
-│       │   └── sliding_window.ex
-│       ├── cache/
-│       └── config/
+│       └── metrics/
+│           └── sliding_window.ex
 ├── test/
 │   └── api_gateway/
 │       └── metrics/
@@ -45,10 +35,10 @@ Two requirements:
 1. **Sliding window rate limiting**: the existing rate limiter uses a fixed window.
    The security team wants a sliding window at per-second granularity: "no more than
    N requests in the last 60 seconds." The check happens on every request, so overhead
-   must be under 1µs per call at p99.
+   must be under 1us per call at p99.
 
 2. **Counter throughput comparison**: the engineering team wants a definitive answer to
-   "which counter mechanism should we standardize on?" — with actual benchmark numbers
+   "which counter mechanism should we standardize on?" -- with actual benchmark numbers
    for the three candidates: ETS `update_counter`, `:atomics.add`, and `:counters.add`.
 
 ---
@@ -61,10 +51,10 @@ For a rate limiter that fires on every single request, that overhead accumulates
 
 `:atomics` (OTP 21.2+) is a raw array of 64-bit integers with hardware-level CAS
 operations. There is no hash table, no key lookup, no per-element lock. Access is
-array-index based: `O(1)` with a constant that is 5–10x smaller than ETS.
+array-index based: `O(1)` with a constant that is 5-10x smaller than ETS.
 
 `:counters` (OTP 23+) extends `:atomics` with an optional `write_concurrency` mode
-that keeps one counter copy per scheduler. Writes are local — no cache coherency traffic.
+that keeps one counter copy per scheduler. Writes are local -- no cache coherency traffic.
 The cost: reading the current total requires summing all scheduler-local copies, making
 reads more expensive than writes.
 
@@ -94,11 +84,11 @@ current time: unix second 123
 bucket index = rem(123, 60) = 3
 
 arrays: counts[1..60], timestamps[1..60]
-  counts[3] = 42       ← from second 63 (previous minute)
-  timestamps[3] = 63   ← 63 ≠ 123 → bucket is stale → reset
+  counts[3] = 42       <- from second 63 (previous minute)
+  timestamps[3] = 63   <- 63 != 123 -> bucket is stale -> reset
 
-reset: CAS(timestamps[3], 63, 123) → if wins: counts[3] = 1
-       if loses CAS: another process reset it → just add 1
+reset: CAS(timestamps[3], 63, 123) -> if wins: counts[3] = 1
+       if loses CAS: another process reset it -> just add 1
 ```
 
 This design requires two `:atomics` arrays (counts + timestamps) and uses
@@ -154,14 +144,14 @@ defmodule ApiGateway.Metrics.SlidingWindow do
     stored_ts = :atomics.get(timestamps, idx)
 
     if stored_ts != now do
-      # Bucket belongs to a previous cycle — reset it.
+      # Bucket belongs to a previous cycle -- reset it.
       # CAS ensures only one process wins the reset; others just add.
       case :atomics.compare_exchange(timestamps, idx, stored_ts, now) do
         :ok ->
-          # Won the reset — set count to 1
+          # Won the reset -- set count to 1
           :atomics.put(counts, idx, 1)
         _current ->
-          # Lost the reset — another process already reset this bucket
+          # Lost the reset -- another process already reset this bucket
           :atomics.add(counts, idx, 1)
       end
     else
@@ -176,7 +166,7 @@ defmodule ApiGateway.Metrics.SlidingWindow do
 
   Iterates backwards from the current second, checking each bucket's timestamp
   to verify it belongs to the current window. Only buckets with a matching
-  timestamp are included in the sum — stale buckets from a previous cycle
+  timestamp are included in the sum -- stale buckets from a previous cycle
   are excluded even though their count slot may still hold old data.
   """
   @spec count({reference(), reference()}, pos_integer()) :: non_neg_integer()
@@ -204,7 +194,7 @@ defmodule ApiGateway.Metrics.SlidingWindow do
 end
 ```
 
-### Step 2: Given tests — must pass without modification
+### Step 2: Tests
 
 ```elixir
 # test/api_gateway/metrics/sliding_window_test.exs
@@ -222,7 +212,7 @@ defmodule ApiGateway.Metrics.SlidingWindowTest do
       end
 
       total = SlidingWindow.count(counter, 60)
-      # All 100 events were in the current second — should be counted
+      # All 100 events were in the current second -- should be counted
       assert total == 100
     end
 
@@ -257,7 +247,7 @@ defmodule ApiGateway.Metrics.SlidingWindowTest do
       Task.await_many(tasks, 10_000)
 
       total = SlidingWindow.count(counter, 60)
-      # 100 tasks × 100 events = 10_000, all within the current second
+      # 100 tasks x 100 events = 10_000, all within the current second
       assert total == 10_000
     end
   end
@@ -322,23 +312,21 @@ mix run bench/counter_bench.exs
 ```
 
 **Expected on modern hardware** (varies by core count and OTP version):
-- `:atomics.add`: ~200–400ns per op
-- `:counters.add` with `write_concurrency`: ~50–150ns per op  
-- ETS `update_counter` with `decentralized_counters`: ~300–600ns per op
-- `SlidingWindow.record`: ~400–800ns per op (adds CAS for bucket reset)
+- `:atomics.add`: ~200-400ns per op
+- `:counters.add` with `write_concurrency`: ~50-150ns per op
+- ETS `update_counter` with `decentralized_counters`: ~300-600ns per op
+- `SlidingWindow.record`: ~400-800ns per op (adds CAS for bucket reset)
 
 ---
 
 ## Trade-off analysis
 
-Fill in this table based on your benchmark results:
-
 | Mechanism | Write throughput | Read cost | CAS available | Use in gateway |
 |-----------|-----------------|-----------|---------------|---------------|
-| ETS `update_counter` | measure | O(1) | No | Route stats (per-key) |
-| `:atomics.add` | measure | O(1) | Yes | Sliding window buckets |
-| `:counters.add` (`write_concurrency`) | measure | O(schedulers) | No | High-frequency per-app metrics |
-| GenServer `cast` + map | measure | O(1) via call | No | Low-frequency admin counters |
+| ETS `update_counter` | Medium | O(1) | No | Route stats (per-key) |
+| `:atomics.add` | High | O(1) | Yes | Sliding window buckets |
+| `:counters.add` (`write_concurrency`) | Highest | O(schedulers) | No | High-frequency per-app metrics |
+| GenServer `cast` + map | Low | O(1) via call | No | Low-frequency admin counters |
 
 Reflection: `SlidingWindow` resets buckets via CAS inside `record/1`. What happens
 if a process calls `record/1`, wins the CAS, sets `counts[idx] = 1`, then the process
@@ -349,15 +337,15 @@ Is this a correctness problem or an acceptable approximation?
 
 ## Common production mistakes
 
-**1. Using `update_counter/4` without a default — crashes on first call**
+**1. Using `update_counter/4` without a default -- crashes on first call**
 If the key does not exist and you omit the fourth argument (the default record),
 `update_counter` raises `ArgumentError`. Always provide a default:
 
 ```elixir
-# WRONG — crashes if :route not in table
+# WRONG -- crashes if :route not in table
 :ets.update_counter(table, route, {2, 1})
 
-# CORRECT — inserts {route, 0} if key absent, then increments
+# CORRECT -- inserts {route, 0} if key absent, then increments
 :ets.update_counter(table, route, {2, 1}, {route, 0})
 ```
 
@@ -385,8 +373,8 @@ persist to DETS or ETS + DETS before shutdown.
 
 ## Resources
 
-- [`:atomics` — Erlang documentation](https://www.erlang.org/doc/man/atomics.html)
-- [`:counters` — Erlang documentation](https://www.erlang.org/doc/man/counters.html)
-- [ETS `update_counter/4` — Erlang documentation](https://www.erlang.org/doc/man/ets.html#update_counter-4)
-- [Lukas Larsson — "Lock-free data structures in Erlang", EUC 2019](https://www.youtube.com/watch?v=3VGYAevO9E4) — internals of `:atomics`
-- [The Erlang Runtime System — Erik Stenman](https://www.oreilly.com/library/view/the-erlang-runtime/9781800560818/) — shared memory chapter
+- [`:atomics` -- Erlang documentation](https://www.erlang.org/doc/man/atomics.html)
+- [`:counters` -- Erlang documentation](https://www.erlang.org/doc/man/counters.html)
+- [ETS `update_counter/4` -- Erlang documentation](https://www.erlang.org/doc/man/ets.html#update_counter-4)
+- [Lukas Larsson -- "Lock-free data structures in Erlang", EUC 2019](https://www.youtube.com/watch?v=3VGYAevO9E4) -- internals of `:atomics`
+- [The Erlang Runtime System -- Erik Stenman](https://www.oreilly.com/library/view/the-erlang-runtime/9781800560818/) -- shared memory chapter

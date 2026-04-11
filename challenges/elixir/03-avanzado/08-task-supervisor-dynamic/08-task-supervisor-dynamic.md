@@ -1,188 +1,144 @@
 # Task.Supervisor: Supervised Concurrency in the Gateway
 
-**Project**: `api_gateway` — built incrementally across the advanced level
+## Goal
+
+Build three components demonstrating different `Task.Supervisor` patterns: a watchdog that health-checks workers in parallel via `async_stream`, a webhook notifier using fire-and-forget `start_child`, and an upstream prober using `async_nolink` with `Task.yield_many` for fault-isolated partial results.
 
 ---
 
-## Project context
+## Task, Task.Supervisor, and the link model
 
-You're building `api_gateway`. Three use cases have emerged that require concurrent
-work with proper supervision:
-
-1. **Fan-out health checks**: the watchdog (exercise 03) must ping up to 100 circuit
-   breaker workers in parallel. Sequential pings with a 1-second timeout each would
-   take up to 100 seconds — unacceptable for a 10-second check interval.
-
-2. **Async webhook delivery**: when a circuit breaker opens or closes, the gateway
-   fires a webhook to an alerting system. This must not block the circuit breaker
-   worker's main loop.
-
-3. **Upstream probe batch**: before routing a request, the gateway sometimes probes
-   a list of candidate upstreams and picks the fastest to respond. Partial failures
-   (one upstream slow/down) must not abort the entire batch.
-
-Project structure at this point:
-
-```
-api_gateway/
-├── lib/
-│   └── api_gateway/
-│       ├── application.ex
-│       └── circuit_breaker/
-│           ├── worker.ex
-│           └── watchdog.ex            # ← extend with async_stream health checks
-│       └── middleware/
-│           └── webhook_notifier.ex    # ← you implement this (async_nolink)
-│       └── router/
-│           └── upstream_prober.ex     # ← you implement this (yield_many)
-├── test/
-│   └── api_gateway/
-│       ├── circuit_breaker/
-│       │   └── watchdog_test.exs      # given tests — must pass
-│       └── router/
-│           └── upstream_prober_test.exs # given tests — must pass
-└── mix.exs
-```
+| API | Link? | Caller survives crash? | Result delivery |
+|-----|-------|------------------------|-----------------|
+| `Task.async/1` | Yes | No (propagates) | `Task.await/yield` |
+| `Task.Supervisor.async/3` | Yes | No (propagates) | `Task.await/yield` |
+| `Task.Supervisor.async_nolink/3` | No | Yes | `receive` pattern |
+| `Task.Supervisor.start_child/2` | No | Yes | None (fire-and-forget) |
+| `Task.Supervisor.async_stream` | No | Yes | Stream |
 
 ---
 
-## `Task`, `Task.Supervisor`, and the link model
+## Full implementation
 
-**`Task.async/1`** — creates a task linked to the calling process. If the task crashes,
-the caller crashes too (unless it has `trap_exit`). Use when the caller depends on the
-task's result and a crash should propagate.
-
-**`Task.Supervisor.async/3`** — same link semantics, but the task is also under a
-supervisor. The supervisor does not prevent the caller from crashing — the link still
-exists. Use when you want supervision AND you own the result.
-
-**`Task.Supervisor.async_nolink/3`** — supervised but **no link to the caller**. A
-task crash does NOT kill the caller. The caller receives `{ref, result}` and
-`{:DOWN, ref, :process, pid, reason}` messages. Use for fire-and-forget work, or when
-you want fault isolation between the task and its launcher.
-
-**`Task.Supervisor.start_child/2`** — truly fire-and-forget. No result message, no
-DOWN notification. The task runs and dies silently. Use when you neither need the
-result nor want to handle the completion message.
-
-```
-                 Link?  Caller survives   Result delivery
-                         task crash?
-async              Yes    No (propagates)  Task.await/yield
-Supervisor.async   Yes    No (propagates)  Task.await/yield
-async_nolink       No     Yes              receive pattern
-start_child        No     Yes              None
-```
-
----
-
-## `Task.Supervisor.async_stream` back-pressure
-
-`async_stream` processes an enumerable concurrently with a bounded concurrency limit.
-It will not launch the next task until a slot frees up — this is true back-pressure.
+### Circuit breaker worker (needed by watchdog)
 
 ```elixir
-Task.Supervisor.async_stream(
-  MyApp.TaskSupervisor,
-  items,
-  fn item -> work(item) end,
-  max_concurrency: 10,        # at most 10 concurrent tasks
-  timeout: 5_000,             # each task gets 5 seconds
-  on_timeout: :kill_task      # kill timeout tasks (not :ignore — that leaks)
-)
-# Returns a stream of {:ok, result} | {:exit, reason}
-```
+defmodule ApiGateway.CircuitBreaker.Worker do
+  use GenServer
 
-`on_timeout: :kill_task` terminates the timed-out task. The result is `{:exit, :timeout}`.
-`on_timeout: :ignore` returns `{:exit, :timeout}` but leaves the task alive — this
-leaks processes and, for I/O-bound work, leaks connections.
+  def start_link(service_name) do
+    GenServer.start_link(__MODULE__, service_name)
+  end
 
----
+  @impl true
+  def init(service_name) do
+    {:ok, %{service: service_name, status: :closed, failures: 0}}
+  end
 
-## Implementation
+  @impl true
+  def handle_call(:ping, _from, state) do
+    {:reply, :pong, state}
+  end
 
-### Step 1: Add `Task.Supervisor` to the supervision tree
-
-```elixir
-# In lib/api_gateway/application.ex (or CoreSupervisor):
-{Task.Supervisor, name: ApiGateway.TaskSupervisor}
-```
-
-### Step 2: Extend `CircuitBreaker.Watchdog` with async health checks
-
-The watchdog now uses `Task.async_stream` (via the `Task.Supervisor`) to check all
-workers in parallel. Each check runs in its own supervised task with a bounded timeout.
-If a worker is unresponsive, the task times out and the watchdog restarts the worker.
-
-```elixir
-# In lib/api_gateway/circuit_breaker/watchdog.ex
-
-@impl true
-def handle_info(:health_check, state) do
-  updated_registry =
-    state.registry
-    |> Task.async_stream(
-      fn {name, pid} -> {name, pid, check_worker(pid)} end,
-      max_concurrency: max(map_size(state.registry), 1),
-      timeout: @ping_timeout_ms + 500,
-      on_timeout: :kill_task
-    )
-    |> Enum.reduce(state.registry, fn result, reg ->
-      handle_check_result(result, reg, state.supervisor)
-    end)
-
-  {:noreply, %{state | registry: updated_registry}}
-end
-
-defp check_worker(pid) do
-  try do
-    GenServer.call(pid, :ping, @ping_timeout_ms)
-    :healthy
-  catch
-    :exit, _ -> :unresponsive
+  @impl true
+  def handle_call(:status, _from, state) do
+    {:reply, state.status, state}
   end
 end
+```
 
-defp handle_check_result({:ok, {_name, _pid, :healthy}}, registry, _sup) do
-  registry
-end
+### `lib/api_gateway/circuit_breaker/watchdog.ex`
 
-defp handle_check_result({:ok, {name, pid, :unresponsive}}, registry, sup) do
+Uses `Task.async_stream` to check all workers in parallel with bounded concurrency.
+
+```elixir
+defmodule ApiGateway.CircuitBreaker.Watchdog do
+  use GenServer
   require Logger
-  Logger.warning("Watchdog: #{name} unresponsive — restarting")
-  Process.exit(pid, :kill)
 
-  case DynamicSupervisor.start_child(sup, {ApiGateway.CircuitBreaker.Worker, name}) do
-    {:ok, new_pid} ->
-      Logger.info("Watchdog: #{name} restarted as #{inspect(new_pid)}")
-      Map.put(registry, name, new_pid)
+  @check_interval_ms 10_000
+  @ping_timeout_ms   1_000
 
-    {:error, reason} ->
-      Logger.error("Watchdog: failed to restart #{name}: #{inspect(reason)}")
-      Map.delete(registry, name)
+  # ---------------------------------------------------------------------------
+  # Public API
+  # ---------------------------------------------------------------------------
+
+  def start_link(opts) do
+    GenServer.start_link(__MODULE__, opts, name: __MODULE__)
   end
-end
 
-defp handle_check_result({:exit, reason}, registry, _sup) do
-  require Logger
-  Logger.error("Watchdog: health check task crashed: #{inspect(reason)}")
-  registry
+  @spec registry() :: %{String.t() => pid()}
+  def registry, do: GenServer.call(__MODULE__, :registry)
+
+  # ---------------------------------------------------------------------------
+  # GenServer lifecycle
+  # ---------------------------------------------------------------------------
+
+  @impl true
+  def init(opts) do
+    supervisor = Keyword.fetch!(opts, :supervisor)
+    registry   = Keyword.get(opts, :registry, %{})
+
+    {:ok, _ref} = :timer.send_interval(@check_interval_ms, :health_check)
+    {:ok, %{supervisor: supervisor, registry: registry}}
+  end
+
+  @impl true
+  def handle_call(:registry, _from, state) do
+    {:reply, state.registry, state}
+  end
+
+  @impl true
+  def handle_info(:health_check, state) do
+    updated_registry =
+      state.registry
+      |> Task.async_stream(
+        fn {name, pid} -> {name, pid, check_worker(pid)} end,
+        max_concurrency: max(map_size(state.registry), 1),
+        timeout: @ping_timeout_ms + 500,
+        on_timeout: :kill_task
+      )
+      |> Enum.reduce(state.registry, fn result, reg ->
+        handle_check_result(result, reg, state.supervisor)
+      end)
+
+    {:noreply, %{state | registry: updated_registry}}
+  end
+
+  defp check_worker(pid) do
+    try do
+      GenServer.call(pid, :ping, @ping_timeout_ms)
+      :healthy
+    catch
+      :exit, _ -> :unresponsive
+    end
+  end
+
+  defp handle_check_result({:ok, {_name, _pid, :healthy}}, registry, _sup) do
+    registry
+  end
+
+  defp handle_check_result({:ok, {name, pid, :unresponsive}}, registry, sup) do
+    Logger.warning("Watchdog: #{name} unresponsive -- restarting")
+    Process.exit(pid, :kill)
+
+    case DynamicSupervisor.start_child(sup, {ApiGateway.CircuitBreaker.Worker, name}) do
+      {:ok, new_pid} ->
+        Map.put(registry, name, new_pid)
+      {:error, _reason} ->
+        Map.delete(registry, name)
+    end
+  end
+
+  defp handle_check_result({:exit, _reason}, registry, _sup) do
+    registry
+  end
 end
 ```
 
-### Step 3: `lib/api_gateway/middleware/webhook_notifier.ex`
+### `lib/api_gateway/middleware/webhook_notifier.ex`
 
-The WebhookNotifier demonstrates two Task.Supervisor patterns:
-
-1. `start_child/2` for true fire-and-forget (circuit breaker state change notifications)
-2. `async_stream` for fan-out with result collection (batch webhook delivery)
-
-The key design choice: `start_child` is used for `notify_async/2` because the circuit
-breaker worker should not be burdened with webhook delivery results or failure handling.
-The webhook fires and the worker immediately continues processing requests.
-
-For `deliver_to_all/2`, we use `async_stream` because the caller needs to know which
-URLs succeeded and which failed — partial failures are expected and must be reported.
+Demonstrates `start_child` for fire-and-forget and `async_stream` for fan-out with result collection.
 
 ```elixir
 defmodule ApiGateway.Middleware.WebhookNotifier do
@@ -192,15 +148,13 @@ defmodule ApiGateway.Middleware.WebhookNotifier do
 
   @doc """
   Fires a webhook for a circuit breaker state change.
-  Returns :ok immediately — delivery happens asynchronously.
-  The caller (circuit breaker worker) is not affected if delivery fails.
+  Returns :ok immediately -- delivery happens asynchronously.
   """
   @spec notify_async(String.t(), :open | :closed | :half_open) :: :ok
   def notify_async(service_name, new_state) do
-    # start_child is truly fire-and-forget: no result message, no DOWN notification.
-    # The task runs under the TaskSupervisor and logs its own success/failure.
     Task.Supervisor.start_child(ApiGateway.TaskSupervisor, fn ->
-      deliver_webhook(service_name, new_state)
+      Logger.info("Webhook: #{service_name} circuit #{new_state}")
+      Process.sleep(:rand.uniform(200))
     end)
     :ok
   end
@@ -208,10 +162,8 @@ defmodule ApiGateway.Middleware.WebhookNotifier do
   @doc """
   Delivers webhooks to a list of URLs in parallel.
   Returns %{ok: [url], errors: [{url, reason}]}.
-  Partial failures do not abort other deliveries.
   """
-  @spec deliver_to_all([String.t()], map()) ::
-          %{ok: [String.t()], errors: [{String.t(), term()}]}
+  @spec deliver_to_all([String.t()], map()) :: %{ok: [String.t()], errors: [{String.t(), term()}]}
   def deliver_to_all(urls, payload) do
     results =
       Task.Supervisor.async_stream(
@@ -229,48 +181,26 @@ defmodule ApiGateway.Middleware.WebhookNotifier do
       case task_result do
         {:ok, {^url, :ok}} ->
           %{acc | ok: [url | acc.ok]}
-
         {:ok, {^url, {:error, reason}}} ->
           %{acc | errors: [{url, reason} | acc.errors]}
-
         {:exit, :timeout} ->
           %{acc | errors: [{url, :timeout} | acc.errors]}
-
         {:exit, reason} ->
           %{acc | errors: [{url, reason} | acc.errors]}
       end
     end)
   end
 
-  # ---------------------------------------------------------------------------
-  # Private helpers
-  # ---------------------------------------------------------------------------
-
-  defp deliver_webhook(service_name, new_state) do
-    Logger.info("Webhook: #{service_name} circuit #{new_state}")
-    # Simulate HTTP delivery
-    Process.sleep(:rand.uniform(200))
-    if :rand.uniform(10) > 8, do: raise("SMTP unavailable"), else: :ok
-  end
-
-  defp deliver_one(url, payload) do
-    Logger.debug("Delivering webhook to #{url}: #{inspect(payload)}")
+  defp deliver_one(url, _payload) do
     Process.sleep(:rand.uniform(100))
     if String.starts_with?(url, "http://"), do: :ok, else: {:error, :invalid_url}
   end
 end
 ```
 
-### Step 4: `lib/api_gateway/router/upstream_prober.ex`
+### `lib/api_gateway/router/upstream_prober.ex`
 
-The UpstreamProber uses `Task.Supervisor.async_nolink` with `Task.yield_many` to probe
-multiple upstreams concurrently. The key pattern:
-
-1. Launch all probes simultaneously with `async_nolink` (no link to caller — a probe
-   crash does not kill the router)
-2. Wait up to `@probe_timeout_ms` for all results using `Task.yield_many`
-3. Shut down any tasks that did not finish (preventing leaked connections)
-4. Categorize results: responsive (succeeded), slow (timed out), down (crashed)
+Uses `async_nolink` with `Task.yield_many` to probe multiple upstreams concurrently with fault isolation.
 
 ```elixir
 defmodule ApiGateway.Router.UpstreamProber do
@@ -280,7 +210,7 @@ defmodule ApiGateway.Router.UpstreamProber do
 
   @doc """
   Probes a list of upstream URLs and returns results categorized by outcome.
-  {:ok, results} where results = %{responsive: [url], slow: [url], down: [url]}
+  {:ok, %{responsive: [url], slow: [url], down: [url]}}
   """
   @spec probe_all([String.t()]) ::
           {:ok, %{responsive: [String.t()], slow: [String.t()], down: [String.t()]}}
@@ -292,33 +222,24 @@ defmodule ApiGateway.Router.UpstreamProber do
         end)
       end)
 
-    # Wait for all tasks up to the probe timeout. Task.yield_many returns a list
-    # of {task, result} tuples where result is {:ok, value}, {:exit, reason}, or nil.
     raw_results = Task.yield_many(tasks, @probe_timeout_ms)
 
-    # Shut down any tasks that did not finish within the timeout.
-    # :brutal_kill ensures they don't leak connections or keep running.
+    # Shut down tasks that did not finish within the timeout
     Enum.each(raw_results, fn
       {task, nil} -> Task.shutdown(task, :brutal_kill)
       _ -> :ok
     end)
 
-    # Categorize results into responsive, slow, and down.
     categorized =
       Enum.zip(urls, raw_results)
       |> Enum.reduce(%{responsive: [], slow: [], down: []}, fn {url, {_task, result}}, acc ->
         case result do
           {:ok, {^url, :ok}} ->
             %{acc | responsive: [url | acc.responsive]}
-
           nil ->
-            # Task did not finish within timeout — upstream is slow
             %{acc | slow: [url | acc.slow]}
-
           {:exit, _reason} ->
-            # Task crashed — upstream is down
             %{acc | down: [url | acc.down]}
-
           _ ->
             %{acc | down: [url | acc.down]}
         end
@@ -327,12 +248,7 @@ defmodule ApiGateway.Router.UpstreamProber do
     {:ok, categorized}
   end
 
-  # ---------------------------------------------------------------------------
-  # Private helpers
-  # ---------------------------------------------------------------------------
-
-  defp probe_one(url) do
-    # Simulate upstream probe — some are fast, some slow, some fail
+  defp probe_one(_url) do
     delay = :rand.uniform(3_000)
     Process.sleep(delay)
     if delay > 2_500, do: raise("upstream timeout"), else: :ok
@@ -340,7 +256,7 @@ defmodule ApiGateway.Router.UpstreamProber do
 end
 ```
 
-### Step 5: Given tests — must pass without modification
+### Tests
 
 ```elixir
 # test/api_gateway/circuit_breaker/watchdog_test.exs
@@ -363,12 +279,10 @@ defmodule ApiGateway.CircuitBreaker.WatchdogTest do
   end
 
   test "health check completes within 2x single-ping timeout for 5 workers" do
-    # With parallel checks, 5 workers × 1s should finish in ~1s, not ~5s
     {elapsed_us, _} = :timer.tc(fn ->
       send(Process.whereis(Watchdog), :health_check)
-      Process.sleep(1_500)   # give it time to complete
+      Process.sleep(1_500)
     end)
-    # Check that it didn't take 5+ seconds (serial would)
     assert elapsed_us < 4_000_000
   end
 
@@ -414,61 +328,35 @@ defmodule ApiGateway.Router.UpstreamProberTest do
 end
 ```
 
-### Step 6: Run the tests
-
-```bash
-mix test test/api_gateway/circuit_breaker/watchdog_test.exs \
-         test/api_gateway/router/upstream_prober_test.exs --trace
-```
-
 ---
 
-## Trade-off analysis
+## How it works
 
-| API | Link? | Result delivery | Use case |
-|-----|-------|-----------------|----------|
-| `Task.async` | Yes | `Task.await/yield` | Caller must have result; crash propagates |
-| `Task.Supervisor.async` | Yes | `Task.await/yield` | Supervised; crash still propagates |
-| `Task.Supervisor.async_nolink` | No | `receive` pattern | Fault-isolated; partial failure OK |
-| `Task.Supervisor.start_child` | No | None | True fire-and-forget |
-| `Task.Supervisor.async_stream` | No | Stream | Bounded fan-out over collections |
+1. **`async_stream` for health checks**: bounded concurrency ensures at most N tasks run simultaneously. Total time is `1 * timeout` regardless of worker count, not `N * timeout`.
 
-Reflection question: `async_nolink` sends `{ref, result}` and `{:DOWN, ref, ...}`
-messages to the calling process even if you never read them. In a GenServer that calls
-`async_nolink` frequently but never handles those messages, what happens to the mailbox
-over time? What is the correct API to use instead?
+2. **`start_child` for fire-and-forget**: webhook delivery does not block the circuit breaker worker. No result message, no DOWN notification.
+
+3. **`async_nolink` for fault isolation**: a probe crash does NOT kill the router process. Results come as `{ref, result}` and `{:DOWN, ref, ...}` messages. `Task.yield_many` collects them with a timeout.
+
+4. **Shutdown of orphan tasks**: after `yield_many`, any task that returned `nil` (timed out) is explicitly shut down with `Task.shutdown(task, :brutal_kill)` to prevent leaked connections.
 
 ---
 
 ## Common production mistakes
 
 **1. Not cancelling orphan tasks**
-If you launch tasks with `Task.Supervisor.async/3` or `async_nolink/3` and never call
-`Task.await`, `Task.yield`, or `Task.shutdown`, the task runs to completion and sends
-its result into your process mailbox where it accumulates forever. Always match what
-you start: `async` → `await`; `async_nolink` → `receive` or `Task.shutdown`.
+If you launch tasks with `async_nolink` and never call `yield` or `shutdown`, the task result accumulates in the mailbox forever.
 
 **2. `async_stream` without `max_concurrency`**
-`Task.Supervisor.async_stream(sup, 100_000_urls, &fetch/1)` launches 100,000 tasks
-simultaneously. Each opens a connection, exhausts the OS file descriptor limit, and
-the node crashes. Always set `max_concurrency` based on the limiting resource.
+Launching 100,000 tasks simultaneously exhausts OS file descriptors.
 
 **3. `on_timeout: :ignore` in `async_stream`**
-With `:ignore`, a timed-out task continues running in the background after `async_stream`
-moves on. If it holds an HTTP connection, that connection is never returned to the pool.
-Always use `:kill_task` for I/O-bound work.
-
-**4. Using `Task.Supervisor` for long-running processes**
-`Task` is designed for bounded computation. Starting a GenServer-like process via
-`Task.Supervisor.start_child` creates a process that runs indefinitely without proper
-lifecycle management. Long-running processes belong under a `Supervisor`, not a
-`Task.Supervisor`.
+Timed-out tasks continue running in the background, leaking connections. Always use `:kill_task`.
 
 ---
 
 ## Resources
 
-- [HexDocs — Task.Supervisor](https://hexdocs.pm/elixir/Task.Supervisor.html)
-- [HexDocs — Task](https://hexdocs.pm/elixir/Task.html) — `yield_many/2`, `shutdown/2`
-- [Concurrent Data Processing in Elixir — Saša Jurić](https://pragprog.com/titles/sgdpelixir/)
-- [HexDocs — Task.yield_many/2](https://hexdocs.pm/elixir/Task.html#yield_many/2)
+- [HexDocs -- Task.Supervisor](https://hexdocs.pm/elixir/Task.Supervisor.html)
+- [HexDocs -- Task.yield_many/2](https://hexdocs.pm/elixir/Task.html#yield_many/2)
+- [Concurrent Data Processing in Elixir -- Sasa Juric](https://pragprog.com/titles/sgdpelixir/)

@@ -278,7 +278,7 @@ defmodule Dtx.Coordinator do
 
     # Phase 2: Decision
     decision = if all_yes, do: :commit, else: :abort
-    WAL.append(state.wal_path, {:decision, txn_id, decision, participants})
+    Dtx.WAL.append(state.wal_path, {:decision, txn_id, decision, participants})
 
     Enum.each(participants, fn part ->
       Task.start(fn ->
@@ -548,8 +548,8 @@ defmodule Dtx.TwoPhaseCommitTest do
 
   test "happy path: transaction commits atomically across 3 partitions", %{db: db} do
     txn = Dtx.Transaction.begin(db)
-    :ok = Dtx.Transaction.write(txn, :partition_1, "account:alice", 900)
-    :ok = Dtx.Transaction.write(txn, :partition_2, "account:bob", 1100)
+    {:ok, txn} = Dtx.Transaction.write(txn, :partition_1, "account:alice", 900)
+    {:ok, txn} = Dtx.Transaction.write(txn, :partition_2, "account:bob", 1100)
     :ok = Dtx.Transaction.commit(txn)
 
     assert {:ok, 900}  = Dtx.read(db, :partition_1, "account:alice")
@@ -558,7 +558,7 @@ defmodule Dtx.TwoPhaseCommitTest do
 
   test "coordinator crash after prepare re-commits on restart", %{db: db} do
     txn = Dtx.Transaction.begin(db)
-    :ok = Dtx.Transaction.write(txn, :partition_1, "crash_key", "value")
+    {:ok, txn} = Dtx.Transaction.write(txn, :partition_1, "crash_key", "value")
 
     # Simulate coordinator crash after prepare phase
     Dtx.TestHelpers.crash_coordinator_after_prepare(db, txn.id)
@@ -575,8 +575,8 @@ defmodule Dtx.TwoPhaseCommitTest do
     Dtx.TestHelpers.kill_partition(db, :partition_2)
 
     txn = Dtx.Transaction.begin(db)
-    :ok = Dtx.Transaction.write(txn, :partition_1, "no_commit", "x")
-    :ok = Dtx.Transaction.write(txn, :partition_2, "no_commit", "x")
+    {:ok, txn} = Dtx.Transaction.write(txn, :partition_1, "no_commit", "x")
+    {:ok, txn} = Dtx.Transaction.write(txn, :partition_2, "no_commit", "x")
 
     assert {:error, :aborted} = Dtx.Transaction.commit(txn)
     assert {:error, :not_found} = Dtx.read(db, :partition_1, "no_commit")
@@ -675,7 +675,7 @@ Target: 1,000 cross-partition transactions/second on a 3-node cluster on localho
 | Failure tolerance | coordinator WAL required | f+1 failures tolerated | globally distributed |
 | Implementation complexity | moderate | high | impractical without atomic clocks |
 
-Fill in measured latency and throughput from your benchmark.
+After running the benchmark, record your measured latency (p50, p99) and throughput (txn/sec) for direct comparison across protocols.
 
 Architectural question: 3PC was proposed to solve 2PC's blocking problem. Explain why 3PC still blocks under network partitions. Why does the industry still use 2PC despite this?
 

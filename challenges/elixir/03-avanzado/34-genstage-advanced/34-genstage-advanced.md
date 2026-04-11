@@ -1,18 +1,19 @@
 # GenStage — Dispatchers, ConsumerSupervisor, and Demand Buffering
 
-**Project**: `api_gateway` — built incrementally across the advanced level
+**Project**: `api_gateway` — a standalone HTTP gateway exercise
 
 ---
 
 ## Project context
 
-`api_gateway` needs an internal event processing pipeline. The gateway emits three event
-types (`payment`, `signup`, `click`) that must be routed to specialized consumers. Some
-events require CPU-bound work (fraud scoring) that should run in parallel. The event
-source is an external webhook receiver that delivers events in bursts — the producer does
-not always have data ready when consumers ask for it.
+You are building `api_gateway`, an HTTP gateway that routes traffic to microservices. The
+gateway needs an internal event processing pipeline. The gateway emits three event types
+(`payment`, `signup`, `click`) that must be routed to specialized consumers. Some events
+require CPU-bound work (fraud scoring) that should run in parallel. The event source is
+an external webhook receiver that delivers events in bursts — the producer does not always
+have data ready when consumers ask for it.
 
-Project structure at this point:
+Project structure:
 
 ```
 api_gateway/
@@ -20,9 +21,9 @@ api_gateway/
 │   └── api_gateway/
 │       ├── application.ex
 │       └── middleware/
-│           ├── event_router.ex         # ← you implement this (Exercise 1)
-│           ├── parallel_processor.ex   # ← and this (Exercise 2)
-│           └── async_producer.ex       # ← and this (Exercise 3)
+│           ├── event_router.ex         # ← PartitionDispatcher routing
+│           ├── parallel_processor.ex   # ← ConsumerSupervisor for parallel work
+│           └── async_producer.ex       # ← demand buffering for async data
 ├── test/
 │   └── api_gateway/
 │       └── middleware/

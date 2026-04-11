@@ -1,29 +1,17 @@
 # Setup and Mix: Bootstrapping payments_cli
 
-**Project**: `payments_cli` — built incrementally across the basic level
+**Project**: `payments_cli` — a CLI tool that processes payment transactions
 
 ---
 
 ## Project context
 
-You're building `payments_cli`, a CLI tool that processes payment transactions from CSV
+You are building `payments_cli`, a CLI tool that processes payment transactions from CSV
 files, validates them, applies business rules, and produces ledger reports.
 
-This first exercise sets up the project from scratch. Every subsequent exercise adds a
-module to this same project.
-
-Project structure at this point:
-
-```
-payments_cli/
-├── lib/
-│   └── payments_cli/
-│       └── cli.ex          # ← you create this
-├── test/
-│   └── payments_cli/
-│       └── cli_test.exs    # given tests — must pass without modification
-└── mix.exs
-```
+This exercise sets up the project from scratch and implements a minimal CLI entry point
+that accepts a file path argument, prints a message, and returns typed results for
+success and failure.
 
 ---
 
@@ -52,8 +40,6 @@ The first version just needs to:
 1. Accept a file path as a command-line argument
 2. Print the number of transactions found
 3. Exit with code 0 on success, 1 on error
-
-This is Exercise 1 of 15. The full `payments_cli` system emerges incrementally.
 
 ---
 
@@ -167,9 +153,7 @@ end
   error messages go to stderr and program output goes to stdout. This matters when
   the CLI output is piped to another program.
 
-### Step 4: Given tests — must pass without modification
-
-Copy this file exactly. Your implementation must make all tests pass.
+### Step 4: Tests
 
 ```elixir
 # test/payments_cli/cli_test.exs

@@ -232,7 +232,126 @@ defmodule Klog.Replication do
 end
 ```
 
-### Step 5: Given tests — must pass without modification
+### Step 5: Broker (topic and partition management)
+
+```elixir
+# lib/klog/broker.ex
+defmodule Klog.Broker do
+  @moduledoc """
+  Entry point for the Klog system. Manages topics, their partitions,
+  and routes produce/consume requests to the correct partition.
+  """
+
+  use GenServer
+
+  defstruct [:data_dir, :topics]
+
+  def start_link(opts) do
+    GenServer.start_link(__MODULE__, opts)
+  end
+
+  @impl true
+  def init(opts) do
+    data_dir = Keyword.fetch!(opts, :data_dir)
+    {:ok, %__MODULE__{data_dir: data_dir, topics: %{}}}
+  end
+
+  @impl true
+  def handle_call({:create_topic, name, partition_count, replication}, _from, state) do
+    partitions =
+      for p <- 0..(partition_count - 1), into: %{} do
+        dir = Path.join([state.data_dir, "klog_#{name}_#{p}"])
+        segment = Klog.Segment.open(dir, 0)
+        {p, %{segment: segment, dir: dir}}
+      end
+
+    topics = Map.put(state.topics, name, %{partitions: partitions, replication: replication})
+    {:reply, :ok, %{state | topics: topics}}
+  end
+
+  def handle_call({:produce, topic_name, partition, key, value, _opts}, _from, state) do
+    topic = Map.fetch!(state.topics, topic_name)
+    part = Map.fetch!(topic.partitions, partition)
+    {offset, new_segment} = Klog.Segment.append(part.segment, key, value)
+
+    new_partitions = Map.put(topic.partitions, partition, %{part | segment: new_segment})
+    new_topics = Map.put(state.topics, topic_name, %{topic | partitions: new_partitions})
+    {:reply, {:ok, offset}, %{state | topics: new_topics}}
+  end
+
+  def handle_call({:consume, topic_name, partition, from_offset, max_messages}, _from, state) do
+    topic = Map.fetch!(state.topics, topic_name)
+    part = Map.fetch!(topic.partitions, partition)
+    messages = Klog.Segment.read(part.segment, from_offset, max_messages)
+    {:reply, messages, state}
+  end
+end
+```
+
+### Step 6: Top-level Klog API
+
+```elixir
+# lib/klog.ex
+defmodule Klog do
+  @moduledoc """
+  Public API for the Klog distributed event log.
+  Routes all operations through the broker GenServer.
+  """
+
+  @spec create_topic(pid(), String.t(), keyword()) :: :ok
+  def create_topic(broker, name, opts \\ []) do
+    partitions = Keyword.get(opts, :partitions, 1)
+    replication = Keyword.get(opts, :replication, 1)
+    GenServer.call(broker, {:create_topic, name, partitions, replication})
+  end
+
+  @doc "Produces a message to a topic partition. Returns {:ok, offset}."
+  @spec produce(pid(), String.t(), non_neg_integer(), binary(), term(), keyword()) :: {:ok, non_neg_integer()}
+  def produce(broker, topic, partition, key, value, opts \\ []) do
+    GenServer.call(broker, {:produce, topic, partition, key, value, opts})
+  end
+
+  @spec consume(pid(), String.t(), non_neg_integer(), keyword()) :: [{non_neg_integer(), binary(), term()}]
+  def consume(broker, topic, partition, opts \\ []) do
+    from_offset = Keyword.get(opts, :from_offset, 0)
+    max_messages = Keyword.get(opts, :max_messages, 100)
+    GenServer.call(broker, {:consume, topic, partition, from_offset, max_messages})
+  end
+end
+```
+
+### Step 7: Test cluster helper
+
+```elixir
+# lib/klog/test_cluster.ex
+defmodule Klog.TestCluster do
+  @moduledoc """
+  Test helper that simulates a multi-node Klog cluster using
+  multiple broker processes. Supports leader failover simulation.
+  """
+
+  def start(opts) do
+    node_count = Keyword.get(opts, :nodes, 3)
+    data_dir = System.tmp_dir!()
+
+    brokers =
+      for i <- 1..node_count do
+        {:ok, pid} = Klog.Broker.start_link(data_dir: Path.join(data_dir, "klog_node_#{i}"))
+        {:"node_#{i}", pid}
+      end
+
+    {:ok, %{brokers: Map.new(brokers), leader: elem(List.first(brokers), 1)}}
+  end
+
+  def kill_leader(cluster, _topic, _partition) do
+    Process.exit(cluster.leader, :kill)
+    remaining = cluster.brokers |> Map.values() |> Enum.filter(&Process.alive?/1)
+    %{cluster | leader: List.first(remaining)}
+  end
+end
+```
+
+### Step 8: Given tests — must pass without modification
 
 ```elixir
 # test/klog/produce_consume_test.exs
@@ -247,7 +366,7 @@ defmodule Klog.ProduceConsumeTest do
 
   test "1000 messages produced and consumed in order", %{broker: broker} do
     for i <- 1..1_000 do
-      :ok = Klog.produce(broker, "orders", 0, "key_#{i}", "value_#{i}")
+      {:ok, _offset} = Klog.produce(broker, "orders", 0, "key_#{i}", "value_#{i}")
     end
 
     messages = Klog.consume(broker, "orders", 0, from_offset: 0, max_messages: 1_000)
@@ -283,7 +402,7 @@ defmodule Klog.ReplicationTest do
     :ok = Klog.create_topic(cluster, "failover_test", partitions: 1, replication: 2)
 
     for i <- 1..100 do
-      :ok = Klog.produce(cluster, "failover_test", 0, "", i, acks: :all)
+      {:ok, _} = Klog.produce(cluster, "failover_test", 0, "", i, acks: :all)
     end
 
     Klog.TestCluster.kill_leader(cluster, "failover_test", 0)
@@ -295,13 +414,13 @@ defmodule Klog.ReplicationTest do
 end
 ```
 
-### Step 6: Run the tests
+### Step 9: Run the tests
 
 ```bash
 mix test test/klog/ --trace
 ```
 
-### Step 7: Benchmark
+### Step 10: Benchmark
 
 ```elixir
 # bench/klog_bench.exs

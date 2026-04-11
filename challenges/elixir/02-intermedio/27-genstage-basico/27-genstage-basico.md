@@ -1,59 +1,14 @@
 # GenStage: Backpressure and Demand-Driven Pipelines
 
-**Project**: `task_queue` — built incrementally across the intermediate level
+## Goal
 
----
-
-## Project context
-
-`task_queue` is now receiving jobs faster than workers can process them. Without flow control, the queue grows unbounded and the system runs out of memory. The ops team needs a pipeline where producers only emit jobs that consumers are ready to handle — no more, no less.
-
-Project structure at this point:
-
-```
-task_queue/
-├── lib/
-│   └── task_queue/
-│       ├── application.ex
-│       ├── pipeline/
-│       │   ├── job_producer.ex         # ← you implement this
-│       │   ├── job_validator.ex        # ← and this (producer_consumer)
-│       │   └── job_consumer.ex         # ← and this
-│       ├── worker.ex
-│       ├── queue_server.ex
-│       ├── scheduler.ex
-│       └── registry.ex
-├── test/
-│   └── task_queue/
-│       └── genstage_test.exs           # given tests — must pass without modification
-└── mix.exs
-```
-
-Add to `mix.exs`:
-
-```elixir
-{:gen_stage, "~> 1.2"}
-```
-
----
-
-## The business problem
-
-The scheduler dequeues jobs as fast as the queue produces them and fans them out to workers. Under normal load this is fine. Under burst load — 10,000 jobs in 5 seconds — the scheduler overwhelms workers, jobs pile up in GenServer mailboxes, and the VM's memory climbs until OOM.
-
-GenStage solves this with **demand-driven flow**:
-
-1. Consumers declare how many events they can handle right now
-2. Producers emit exactly that many — no more
-3. If consumers are slow, the producer backs off automatically
-
-The result: memory usage is bounded by the in-flight batch sizes. The pipeline processes at the rate of its slowest stage, not the rate of its fastest producer.
+Build a `task_queue` processing pipeline with GenStage where a producer emits jobs from a queue, a producer_consumer validates them, and a consumer executes them. The pipeline provides built-in backpressure: consumers declare how many events they can handle, and producers emit exactly that many.
 
 ---
 
 ## Why GenStage and not `Task.async_stream` or a simple `send`
 
-`Task.async_stream` processes a bounded collection concurrently. It has no concept of a producer that continuously generates events. When new jobs arrive while workers are busy, there is no built-in mechanism to pause the producer.
+`Task.async_stream` processes a bounded collection concurrently. It has no concept of a continuous producer. When new jobs arrive while workers are busy, there is no built-in mechanism to pause the producer.
 
 A direct `send` from producer to consumer creates unbounded mailboxes:
 
@@ -83,26 +38,125 @@ The producer never sends more than what was requested. Mailboxes stay small.
 |------|------------------------|----------|-------|
 | `:producer` | `handle_demand/2` | demand count | events |
 | `:consumer` | `handle_events/3` | events | nothing |
-| `:producer_consumer` | `handle_events/3` + `handle_demand/2` | events + demand | transformed events |
-
-A pipeline must start with a producer and end with a consumer. Stages in between are producer_consumers. Subscriptions connect stages: `GenStage.sync_subscribe(consumer, to: producer)`.
+| `:producer_consumer` | `handle_events/3` | events | transformed events |
 
 ---
 
 ## Implementation
 
-### Step 1: `lib/task_queue/pipeline/job_producer.ex`
+### Step 1: `mix.exs`
+
+```elixir
+defmodule TaskQueue.MixProject do
+  use Mix.Project
+
+  def project do
+    [
+      app: :task_queue,
+      version: "0.1.0",
+      elixir: "~> 1.15",
+      start_permanent: Mix.env() == :prod,
+      deps: deps()
+    ]
+  end
+
+  def application do
+    [
+      extra_applications: [:logger],
+      mod: {TaskQueue.Application, []}
+    ]
+  end
+
+  defp deps do
+    [
+      {:gen_stage, "~> 1.2"}
+    ]
+  end
+end
+```
+
+### Step 2: `lib/task_queue/application.ex`
+
+```elixir
+defmodule TaskQueue.Application do
+  use Application
+
+  @impl true
+  def start(_type, _args) do
+    children = [
+      TaskQueue.QueueServer
+    ]
+
+    opts = [strategy: :one_for_one, name: TaskQueue.Supervisor]
+    Supervisor.start_link(children, opts)
+  end
+end
+```
+
+### Step 3: `lib/task_queue/queue_server.ex` -- in-memory queue
+
+The QueueServer is a simple GenServer holding an Erlang `:queue`. The GenStage producer dequeues from it when demand arrives.
+
+```elixir
+defmodule TaskQueue.QueueServer do
+  use GenServer
+
+  def start_link(opts \\ []) do
+    GenServer.start_link(__MODULE__, :queue.new(), name: __MODULE__)
+  end
+
+  def enqueue(job) when is_map(job) do
+    GenServer.call(__MODULE__, {:enqueue, job})
+  end
+
+  def dequeue do
+    GenServer.call(__MODULE__, :dequeue)
+  end
+
+  @impl true
+  def init(queue), do: {:ok, queue}
+
+  @impl true
+  def handle_call({:enqueue, job}, _from, queue) do
+    new_q = :queue.in(job, queue)
+    {:reply, {:ok, :queue.len(new_q)}, new_q}
+  end
+
+  @impl true
+  def handle_call(:dequeue, _from, queue) do
+    case :queue.out(queue) do
+      {{:value, job}, new_q} -> {:reply, {:ok, job}, new_q}
+      {:empty, _} -> {:reply, {:error, :empty}, queue}
+    end
+  end
+end
+```
+
+### Step 4: `lib/task_queue/worker.ex` -- job executor
+
+```elixir
+defmodule TaskQueue.Worker do
+  @moduledoc """
+  Executes individual jobs. Used by the GenStage consumer.
+  """
+
+  @spec execute(map()) :: {:ok, term()} | {:error, term()}
+  def execute(%{type: "noop", args: _}), do: {:ok, :noop}
+  def execute(%{type: "echo", args: args}), do: {:ok, args}
+  def execute(%{type: "fail", args: %{reason: reason}}), do: {:error, {:job_failed, reason}}
+  def execute(%{type: type}), do: {:error, {:unknown_type, type}}
+  def execute(_), do: {:error, :invalid_job}
+end
+```
+
+### Step 5: `lib/task_queue/pipeline/job_producer.ex`
+
+The producer responds to demand by dequeuing up to `demand` jobs from the QueueServer. If fewer jobs are available, it emits only what exists and tracks unmet demand in its state. GenStage retries demand automatically on the next tick.
 
 ```elixir
 defmodule TaskQueue.Pipeline.JobProducer do
   @moduledoc """
   GenStage producer that emits jobs from the task queue.
-
-  Responds to demand by dequeuing up to `demand` jobs from
-  `TaskQueue.QueueServer`. If fewer jobs are available than demanded,
-  emits only what is available — GenStage retries demand on next tick.
-
-  State: `%{pending_demand: integer}` — accumulated unmet demand.
   """
 
   use GenStage
@@ -135,15 +189,15 @@ defmodule TaskQueue.Pipeline.JobProducer do
 end
 ```
 
-### Step 2: `lib/task_queue/pipeline/job_validator.ex`
+### Step 6: `lib/task_queue/pipeline/job_validator.ex`
+
+The validator is a producer_consumer -- it receives events from the producer, filters invalid ones, annotates valid ones with a `:validated_at` timestamp, and passes them downstream. Invalid jobs are silently dropped (in production you would log them).
 
 ```elixir
 defmodule TaskQueue.Pipeline.JobValidator do
   @moduledoc """
   GenStage producer_consumer that validates jobs from the producer.
-
-  Valid jobs are passed downstream. Invalid jobs are dropped and
-  logged. This stage adds a `:validated_at` timestamp to each job.
+  Valid jobs are passed downstream. Invalid jobs are dropped.
   """
 
   use GenStage
@@ -172,15 +226,14 @@ defmodule TaskQueue.Pipeline.JobValidator do
 end
 ```
 
-### Step 3: `lib/task_queue/pipeline/job_consumer.ex`
+### Step 7: `lib/task_queue/pipeline/job_consumer.ex`
+
+The consumer executes validated jobs. It must return an empty event list `[]` -- consumers do not emit events downstream. The `subscribe_to` option in `init/1` wires the consumer to the validator with a `max_demand` that limits in-flight events.
 
 ```elixir
 defmodule TaskQueue.Pipeline.JobConsumer do
   @moduledoc """
   GenStage consumer that executes validated jobs.
-
-  Subscribes to `JobValidator` with a max_demand that limits
-  how many jobs are in-flight at once, providing backpressure.
   """
 
   use GenStage
@@ -210,7 +263,9 @@ defmodule TaskQueue.Pipeline.JobConsumer do
 end
 ```
 
-### Step 4: Given tests — must pass without modification
+### Step 8: Tests
+
+The tests call `handle_demand/2` and `handle_events/3` directly to verify behavior without starting the full GenStage subscription pipeline. This is the idiomatic way to unit-test GenStage stages.
 
 ```elixir
 # test/task_queue/genstage_test.exs
@@ -294,7 +349,7 @@ defmodule TaskQueue.GenStageTest do
 end
 ```
 
-### Step 5: Run the tests
+### Step 9: Run
 
 ```bash
 mix deps.get
@@ -308,63 +363,34 @@ mix test test/task_queue/genstage_test.exs --trace
 | Aspect | GenStage pipeline | Plain `send/2` | `Task.async_stream` |
 |--------|-------------------|----------------|---------------------|
 | Backpressure | built-in via demand | none | bounded by collection size |
-| Continuous event streams | yes | yes (unbounded) | no — requires known collection |
+| Continuous event streams | yes | yes (unbounded) | no -- requires known collection |
 | Memory under burst | bounded by `max_demand` | unbounded mailbox | bounded by stream chunk |
 | Complexity | high (3 modules, subscriptions) | low | low |
 | Best for | long-running pipelines | low-volume messaging | batch processing |
-
-Reflection question: a `JobValidator` with `max_demand: 10` subscribing to a `JobProducer` means the validator requests 10 events at a time. What happens if the validator is slow — does it block the producer from accepting new work from the queue? Trace the demand flow.
-
-Answer: The validator only sends new demand after processing its current batch. If it is slow, it does not request more events, so the producer's `handle_demand` is not called. The producer is not blocked — it simply has no pending demand to fulfill. Jobs remain in the QueueServer until the validator finishes, requests more, and the producer dequeues a new batch. This is precisely the backpressure mechanism: the slowest stage determines the pipeline throughput, and no mailbox grows unbounded.
 
 ---
 
 ## Common production mistakes
 
 **1. Forgetting to subscribe stages to each other**
-
-`use GenStage` defines the callbacks, but does not wire the pipeline. Stages must be connected via `GenStage.sync_subscribe/3` or via the `subscribe_to:` option in `init/1`. Without subscriptions, no events flow.
+`use GenStage` defines callbacks but does not wire the pipeline. Use `subscribe_to:` in `init/1` or `GenStage.sync_subscribe/3`.
 
 **2. Returning events from a consumer**
-
-```elixir
-# Wrong — consumers must return an empty list
-def handle_events(events, _from, state) do
-  processed = Enum.map(events, &process/1)
-  {:noreply, processed, state}  # GenStage will raise
-end
-
-# Right
-def handle_events(events, _from, state) do
-  Enum.each(events, &process/1)
-  {:noreply, [], state}
-end
-```
+Consumers must return `{:noreply, [], state}`. Returning events raises.
 
 **3. Setting `max_demand: 1` expecting sequential processing**
-
-`max_demand: 1` processes one event at a time per consumer, but does not guarantee wall-clock ordering across multiple consumers subscribed to the same producer. For guaranteed ordering, use a single consumer.
+It processes one event at a time per consumer but does not guarantee ordering across multiple consumers.
 
 **4. Not tracking unmet demand in the producer**
-
-If `handle_demand` is called with demand 10 but only 3 items are available, return 3 items and store the unmet 7. When new items arrive (via `handle_info` from the queue), fulfill the pending demand:
-
-```elixir
-def handle_info({:new_jobs, jobs}, %{pending_demand: demand} = state) do
-  to_emit = Enum.take(jobs, demand)
-  {:noreply, to_emit, %{state | pending_demand: demand - length(to_emit)}}
-end
-```
+If `handle_demand` returns fewer events than demanded, store the unmet demand and fulfill it when new items arrive via `handle_info`.
 
 **5. Using `GenStage.call/2` on a stage from within its own callbacks**
-
-A GenStage stage is a GenServer. Calling `GenServer.call/2` on itself causes a deadlock. Use `GenStage.cast/2` or accumulate state in `handle_events` callbacks.
+A GenStage stage is a GenServer. Calling itself causes a deadlock.
 
 ---
 
 ## Resources
 
-- [GenStage — official hex package](https://hexdocs.pm/gen_stage/GenStage.html)
-- [Introduction to GenStage — Jose Valim](https://elixir-lang.org/blog/2016/07/14/announcing-genstage/)
+- [GenStage -- official hex package](https://hexdocs.pm/gen_stage/GenStage.html)
+- [Introduction to GenStage -- Jose Valim](https://elixir-lang.org/blog/2016/07/14/announcing-genstage/)
 - [Flow: built on GenStage for parallel data processing](https://hexdocs.pm/flow/Flow.html)
-- [Backpressure explained — Sasa Juric](https://www.theerlangelist.com/article/gen_stage)

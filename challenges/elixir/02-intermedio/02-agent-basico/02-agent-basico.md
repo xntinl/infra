@@ -1,54 +1,21 @@
 # Agent: Managed Mutable State
 
-**Project**: `task_queue` — built incrementally across the intermediate level
+## Why Agent
 
----
+Agent wraps the receive-loop-with-state pattern into a well-behaved OTP citizen: supervised,
+named, and with a clean API. It provides a supervised `start_link/1`, atomic
+`get_and_update` that eliminates race conditions between separate get and update, and
+consistent error semantics with timeout handling.
 
-## Project context
-
-The task_queue system needs a place to track **task metadata**: which tasks have been
-submitted, what their current status is, and when each status changed. This is read-heavy
-shared state that multiple processes need to query.
-
-The previous exercise used a raw receive loop with manual state. `Agent` is that same
-pattern as a well-behaved OTP citizen: supervised, named, and with a clean API.
-
-Project structure at this point:
-
-```
-task_queue/
-├── lib/
-│   └── task_queue/
-│       ├── worker_process.ex    # previous exercise
-│       ├── accumulator.ex       # previous exercise
-│       └── task_registry.ex
-├── test/
-│   └── task_queue/
-│       └── task_registry_test.exs   # given tests — must pass without modification
-└── mix.exs
-```
-
----
-
-## Why Agent and not a raw process
-
-The accumulator from the previous exercise already is an Agent — it just does not know it.
-`Agent` wraps the exact same receive loop pattern, but provides:
-
-- A supervised `start_link/1` with the signature Supervisor expects
-- Atomic `get_and_update` that eliminates the race condition between separate get and update
-- Consistent error semantics and timeout handling
-
-The key limitation you must understand: the function you pass to `Agent.get/2` or
-`Agent.update/2` executes **inside the Agent process**. If that function is slow, every
-caller blocks waiting for the Agent to finish. Never do I/O or expensive computation inside
-an Agent callback — compute first, pass the result to `update`.
+The key limitation: the function you pass to `Agent.get/2` or `Agent.update/2` executes
+**inside the Agent process**. If that function is slow, every caller blocks. Never do I/O
+or expensive computation inside an Agent callback.
 
 ---
 
 ## The business problem
 
-`TaskQueue.TaskRegistry` tracks every task submitted to the system:
+Build a `TaskQueue.TaskRegistry` that tracks every task submitted to a task queue system:
 
 - A task has an ID (string), a status (`:pending | :running | :done | :failed`), and a
   timestamp for the last status change.
@@ -58,9 +25,24 @@ an Agent callback — compute first, pass the result to `update`.
 
 ---
 
+## Project setup
+
+```
+task_queue/
+├── lib/
+│   └── task_queue/
+│       └── task_registry.ex
+├── test/
+│   └── task_queue/
+│       └── task_registry_test.exs
+└── mix.exs
+```
+
+---
+
 ## Implementation
 
-### Step 1: `lib/task_queue/task_registry.ex`
+### `lib/task_queue/task_registry.ex`
 
 ```elixir
 defmodule TaskQueue.TaskRegistry do
@@ -74,10 +56,6 @@ defmodule TaskQueue.TaskRegistry do
   @type task_id :: String.t()
   @type status :: :pending | :running | :done | :failed
   @type task_entry :: %{status: status(), updated_at: integer()}
-
-  # ---------------------------------------------------------------------------
-  # Public API — entry points for workers, scheduler, and tests
-  # ---------------------------------------------------------------------------
 
   @doc """
   Starts the registry and registers it under its module name.
@@ -128,7 +106,7 @@ defmodule TaskQueue.TaskRegistry do
 
   @doc """
   Returns task IDs that have been in :running status for longer than `threshold_ms`.
-  Used by the scheduler to detect stuck workers.
+  Used by a scheduler to detect stuck workers.
   """
   @spec stale_running(pos_integer()) :: [task_id()]
   def stale_running(threshold_ms) do
@@ -159,10 +137,6 @@ defmodule TaskQueue.TaskRegistry do
     end)
   end
 
-  # ---------------------------------------------------------------------------
-  # Private
-  # ---------------------------------------------------------------------------
-
   defp now, do: System.monotonic_time(:millisecond)
 end
 ```
@@ -173,12 +147,11 @@ returns an error. This is critical: if you separated this into a `get` followed 
 `update`, another process could modify the state between the two calls, leading to
 a race condition where you overwrite their changes.
 
-The `stats/0` function uses `Enum.reduce` to count tasks by status in a single pass
-through the state map. Starting with the default map `%{pending: 0, running: 0, done: 0,
-failed: 0}` ensures that all statuses appear in the result even when no tasks have that
-status.
+The `stats/0` function uses `Enum.reduce` to count tasks by status in a single pass.
+Starting with the default map `%{pending: 0, running: 0, done: 0, failed: 0}` ensures
+that all statuses appear in the result even when no tasks have that status.
 
-### Step 2: Given tests — must pass without modification
+### Tests
 
 ```elixir
 # test/task_queue/task_registry_test.exs
@@ -189,7 +162,6 @@ defmodule TaskQueue.TaskRegistryTest do
   alias TaskQueue.TaskRegistry
 
   setup do
-    # Start a fresh registry for each test by stopping any existing one
     case Process.whereis(TaskRegistry) do
       nil -> :ok
       pid -> Agent.stop(pid)
@@ -229,7 +201,6 @@ defmodule TaskQueue.TaskRegistryTest do
       Process.sleep(2)
       TaskRegistry.transition("task_003", :running)
       entry = TaskRegistry.get("task_003")
-      # updated_at must be strictly greater than the registration timestamp
       assert entry.updated_at > registered_at
     end
   end
@@ -253,7 +224,6 @@ defmodule TaskQueue.TaskRegistryTest do
     test "returns tasks running longer than threshold" do
       TaskRegistry.register("slow_task")
       TaskRegistry.transition("slow_task", :running)
-      # Simulate passage of time by updating the entry directly
       Agent.update(TaskQueue.TaskRegistry, fn state ->
         Map.update!(state, "slow_task", fn e -> %{e | updated_at: e.updated_at - 10_000} end)
       end)
@@ -288,7 +258,7 @@ defmodule TaskQueue.TaskRegistryTest do
 end
 ```
 
-### Step 3: Run the tests
+### Run the tests
 
 ```bash
 mix test test/task_queue/task_registry_test.exs --trace
@@ -298,18 +268,13 @@ mix test test/task_queue/task_registry_test.exs --trace
 
 ## Trade-off analysis
 
-| Aspect | Agent (this exercise) | GenServer | ETS (exercise 13) |
-|--------|----------------------|-----------|--------------------|
+| Aspect | Agent | GenServer | ETS |
+|--------|-------|-----------|-----|
 | Boilerplate | Minimal | Medium | Low (no process overhead) |
 | Concurrent reads | Serialized through Agent process | Serialized through GenServer | True parallel reads |
 | Atomicity | Single get_and_update is atomic | Full control in callbacks | ets:update_counter is atomic; multi-op is not |
 | Observability | :sys.get_state/1 | :sys.get_state/1 | :ets.tab2list/1 |
 | Supervised restart | Yes — name survives restart | Yes | Table destroyed on owner crash |
-| Code complexity | Low — just pass functions | Higher — explicit message handling | Low but raw Erlang API |
-
-Reflection question: `stale_running/1` scans all tasks on every call. In a system with
-50,000 active tasks, this is O(n) on each scheduler tick. What data structure change to
-the Agent state would make this O(1), and what is the tradeoff?
 
 ---
 
@@ -317,8 +282,7 @@ the Agent state would make this O(1), and what is the tradeoff?
 
 **1. Doing I/O inside Agent callbacks**
 The function passed to `Agent.get/update/get_and_update` executes inside the Agent process.
-A slow HTTP call there blocks every other caller for the duration. Compute outside the Agent,
-then update with the result.
+A slow HTTP call there blocks every other caller.
 
 **2. Non-atomic read-then-update pattern**
 ```elixir
@@ -337,7 +301,7 @@ end)
 
 **3. Using Agent when reads vastly outnumber writes at high concurrency**
 At 10,000 req/s with 90% reads, the Agent process becomes the bottleneck. Every read goes
-through the process mailbox. This is the correct migration path to ETS (exercise 13).
+through the process mailbox. This is the correct migration path to ETS.
 
 **4. Forgetting that `start_link` must have the standard signature**
 Supervisors call `start_link(init_arg)` with exactly one argument. If your `start_link`
@@ -350,4 +314,3 @@ expects zero arguments, the Supervisor cannot start your Agent.
 - [Agent — HexDocs](https://hexdocs.pm/elixir/Agent.html)
 - [Agent.get_and_update/3 — HexDocs](https://hexdocs.pm/elixir/Agent.html#get_and_update/3)
 - [Mix and OTP: Agent](https://elixir-lang.org/getting-started/mix-otp/agent.html)
-- [Erlang in Anger — Fred Hebert](https://www.erlang-in-anger.com/) — chapter on process bottlenecks (free PDF)

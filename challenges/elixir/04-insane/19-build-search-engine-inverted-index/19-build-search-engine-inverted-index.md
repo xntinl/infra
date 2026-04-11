@@ -40,7 +40,7 @@ searcher/
 
 ## The problem
 
-Given a corpus of 1 million documents, you need to answer queries like "machine learning" and return the 10 most relevant documents in under 50ms. A full table scan that compares every document against the query is O(N × Q), which is too slow. An inverted index reduces this to O(|postings list|) — you fetch only the documents that contain the query terms.
+Given a corpus of 1 million documents, you need to answer queries like "machine learning" and return the 10 most relevant documents in under 50ms. A full table scan that compares every document against the query is O(N x Q), which is too slow. An inverted index reduces this to O(|postings list|) — you fetch only the documents that contain the query terms.
 
 Ranking is the second problem. A document that mentions "machine" 100 times is not necessarily more relevant than one that mentions it 5 times in a 50-word abstract. BM25 normalizes for document length and uses a diminishing-returns model for term frequency.
 
@@ -48,13 +48,13 @@ Ranking is the second problem. A document that mentions "machine" 100 times is n
 
 ## Why this design
 
-**Inverted index for sub-linear query time**: instead of "for each document, does it contain term X?", the index stores "for term X, here are all documents that contain it." Querying is O(|posting list for X|) instead of O(N). For a corpus of 1M documents with a 10,000-document average posting list, this is a 100x speedup.
+**Inverted index for sub-linear query time**: instead of "for each document, does it contain term X?", the index stores "for term X, here are all documents that contain it." Querying is O(|posting list for X|) instead of O(N).
 
-**Porter stemmer for morphological normalization**: "running", "runs", and "ran" all stem to the same token. Without stemming, a query for "run" misses documents that say "running." The Porter algorithm applies five phases of suffix-stripping rules deterministically. It is not linguistically perfect but is fast and works well for English information retrieval.
+**Porter stemmer for morphological normalization**: "running", "runs", and "ran" all stem to the same token. Without stemming, a query for "run" misses documents that say "running."
 
-**BM25 over TF-IDF for length normalization**: TF-IDF gives higher scores to longer documents simply because they have more term occurrences. BM25 saturates the term frequency contribution (controlled by k1) and penalizes documents longer than the corpus average (controlled by b). The parameters k1=1.5, b=0.75 are empirically validated defaults.
+**BM25 over TF-IDF for length normalization**: TF-IDF gives higher scores to longer documents simply because they have more term occurrences. BM25 saturates the term frequency contribution (controlled by k1) and penalizes documents longer than the corpus average (controlled by b).
 
-**Positional index for phrase queries**: a basic inverted index stores (doc_id, term_frequency). A positional index also stores the word offset of each occurrence. To answer "machine learning", you find documents where "machine" occurs at position P and "learning" at position P+1. Without positions, you cannot distinguish "machine learning" from two unrelated occurrences.
+**Positional index for phrase queries**: a basic inverted index stores (doc_id, term_frequency). A positional index also stores the word offset of each occurrence. To answer "machine learning", you find documents where "machine" occurs at position P and "learning" at position P+1.
 
 ---
 
@@ -78,11 +78,233 @@ defp deps do
 end
 ```
 
-### Step 3: NLP pipeline
+### Step 3: Porter stemmer
+
+```elixir
+# lib/searcher/stemmer.ex
+defmodule Searcher.Stemmer do
+  @moduledoc """
+  Simplified Porter stemmer for English.
+
+  Implements the core suffix-stripping rules across multiple phases
+  to reduce words to their morphological root. This is not a complete
+  Porter implementation but handles the most common English suffixes.
+  """
+
+  @doc "Stems an English word to its root form."
+  @spec stem(String.t()) :: String.t()
+  def stem(word) when byte_size(word) <= 2, do: word
+
+  def stem(word) do
+    word
+    |> String.downcase()
+    |> step_1a()
+    |> step_1b()
+    |> step_1c()
+    |> step_2()
+    |> step_3()
+    |> step_4()
+    |> step_5()
+  end
+
+  defp step_1a(word) do
+    cond do
+      String.ends_with?(word, "sses") -> String.replace_suffix(word, "sses", "ss")
+      String.ends_with?(word, "ies") -> String.replace_suffix(word, "ies", "i")
+      String.ends_with?(word, "ss") -> word
+      String.ends_with?(word, "s") -> String.replace_suffix(word, "s", "")
+      true -> word
+    end
+  end
+
+  defp step_1b(word) do
+    cond do
+      String.ends_with?(word, "eed") ->
+        stem_part = String.replace_suffix(word, "eed", "")
+        if measure(stem_part) > 0, do: String.replace_suffix(word, "eed", "ee"), else: word
+
+      String.ends_with?(word, "ed") ->
+        stem_part = String.replace_suffix(word, "ed", "")
+        if has_vowel?(stem_part), do: step_1b_cleanup(stem_part), else: word
+
+      String.ends_with?(word, "ing") ->
+        stem_part = String.replace_suffix(word, "ing", "")
+        if has_vowel?(stem_part), do: step_1b_cleanup(stem_part), else: word
+
+      true -> word
+    end
+  end
+
+  defp step_1b_cleanup(word) do
+    cond do
+      String.ends_with?(word, "at") -> word <> "e"
+      String.ends_with?(word, "bl") -> word <> "e"
+      String.ends_with?(word, "iz") -> word <> "e"
+      double_consonant?(word) and not String.ends_with?(word, "l") and
+        not String.ends_with?(word, "s") and not String.ends_with?(word, "z") ->
+          String.slice(word, 0..-2//1)
+      measure(word) == 1 and cvc?(word) -> word <> "e"
+      true -> word
+    end
+  end
+
+  defp step_1c(word) do
+    if String.ends_with?(word, "y") do
+      stem_part = String.replace_suffix(word, "y", "")
+      if has_vowel?(stem_part), do: stem_part <> "i", else: word
+    else
+      word
+    end
+  end
+
+  defp step_2(word) do
+    replacements = [
+      {"ational", "ate"}, {"tional", "tion"}, {"enci", "ence"}, {"anci", "ance"},
+      {"izer", "ize"}, {"abli", "able"}, {"alli", "al"}, {"entli", "ent"},
+      {"eli", "e"}, {"ousli", "ous"}, {"ization", "ize"}, {"ation", "ate"},
+      {"ator", "ate"}, {"alism", "al"}, {"iveness", "ive"}, {"fulness", "ful"},
+      {"ousness", "ous"}, {"aliti", "al"}, {"iviti", "ive"}, {"biliti", "ble"}
+    ]
+
+    apply_suffix_rules(word, replacements, 0)
+  end
+
+  defp step_3(word) do
+    replacements = [
+      {"icate", "ic"}, {"ative", ""}, {"alize", "al"},
+      {"iciti", "ic"}, {"ical", "ic"}, {"ful", ""}, {"ness", ""}
+    ]
+
+    apply_suffix_rules(word, replacements, 0)
+  end
+
+  defp step_4(word) do
+    suffixes = ["al", "ance", "ence", "er", "ic", "able", "ible", "ant",
+                "ement", "ment", "ent", "ion", "ou", "ism", "ate", "iti",
+                "ous", "ive", "ize"]
+
+    result =
+      Enum.find_value(suffixes, word, fn suffix ->
+        if String.ends_with?(word, suffix) do
+          stem_part = String.replace_suffix(word, suffix, "")
+          if measure(stem_part) > 1 do
+            if suffix == "ion" do
+              if String.ends_with?(stem_part, "s") or String.ends_with?(stem_part, "t") do
+                stem_part
+              else
+                nil
+              end
+            else
+              stem_part
+            end
+          else
+            nil
+          end
+        else
+          nil
+        end
+      end)
+
+    result || word
+  end
+
+  defp step_5(word) do
+    word = step_5a(word)
+    step_5b(word)
+  end
+
+  defp step_5a(word) do
+    if String.ends_with?(word, "e") do
+      stem_part = String.replace_suffix(word, "e", "")
+      cond do
+        measure(stem_part) > 1 -> stem_part
+        measure(stem_part) == 1 and not cvc?(stem_part) -> stem_part
+        true -> word
+      end
+    else
+      word
+    end
+  end
+
+  defp step_5b(word) do
+    if measure(word) > 1 and double_consonant?(word) and String.ends_with?(word, "l") do
+      String.slice(word, 0..-2//1)
+    else
+      word
+    end
+  end
+
+  defp apply_suffix_rules(word, [], _min_measure), do: word
+
+  defp apply_suffix_rules(word, [{suffix, replacement} | rest], min_measure) do
+    if String.ends_with?(word, suffix) do
+      stem_part = String.replace_suffix(word, suffix, "")
+      if measure(stem_part) > min_measure do
+        stem_part <> replacement
+      else
+        word
+      end
+    else
+      apply_suffix_rules(word, rest, min_measure)
+    end
+  end
+
+  defp measure(word) do
+    word
+    |> String.graphemes()
+    |> Enum.map(&vowel?/1)
+    |> Enum.chunk_while(nil, fn
+      is_v, nil -> {:cont, is_v}
+      is_v, prev when is_v == prev -> {:cont, is_v}
+      is_v, prev -> {:cont, prev, is_v}
+    end, fn acc -> {:cont, acc, nil} end)
+    |> Enum.reject(&is_nil/1)
+    |> then(fn chunks ->
+      vc_pairs = div(length(chunks), 2)
+      if length(chunks) > 0 and hd(chunks) == true, do: vc_pairs, else: max(0, vc_pairs)
+    end)
+  end
+
+  defp has_vowel?(word) do
+    word |> String.graphemes() |> Enum.any?(&vowel?/1)
+  end
+
+  defp vowel?(char), do: char in ~w(a e i o u)
+
+  defp double_consonant?(word) do
+    len = String.length(word)
+    if len >= 2 do
+      last = String.at(word, len - 1)
+      second_last = String.at(word, len - 2)
+      last == second_last and not vowel?(last)
+    else
+      false
+    end
+  end
+
+  defp cvc?(word) do
+    len = String.length(word)
+    if len >= 3 do
+      c1 = String.at(word, len - 3)
+      v = String.at(word, len - 2)
+      c2 = String.at(word, len - 1)
+      not vowel?(c1) and vowel?(v) and not vowel?(c2) and c2 not in ~w(w x y)
+    else
+      false
+    end
+  end
+end
+```
+
+### Step 4: NLP pipeline
 
 ```elixir
 # lib/searcher/pipeline.ex
 defmodule Searcher.Pipeline do
+  @moduledoc """
+  Text processing pipeline: tokenize, lowercase, remove stop words, stem.
+  """
+
   @stop_words MapSet.new(~w[
     a an the and or not is are was were be been being have has had
     do does did will would shall should may might must can could
@@ -93,6 +315,7 @@ defmodule Searcher.Pipeline do
   ])
 
   @doc "Runs the full pipeline on text. Returns [{stemmed_token, original_position}]."
+  @spec process(String.t()) :: [{String.t(), non_neg_integer()}]
   def process(text) do
     text
     |> tokenize()
@@ -111,7 +334,7 @@ defmodule Searcher.Pipeline do
 end
 ```
 
-### Step 4: BM25 scorer
+### Step 5: BM25 scorer
 
 ```elixir
 # lib/searcher/scorer.ex
@@ -119,32 +342,247 @@ defmodule Searcher.Scorer do
   @moduledoc """
   BM25 scoring.
 
-  score(d, q) = Σ_t [ IDF(t) × (tf(t,d) × (k1 + 1)) / (tf(t,d) + k1 × (1 - b + b × len(d)/avg_len)) ]
+  score(d, q) = sum_t [ IDF(t) x (tf(t,d) x (k1 + 1)) / (tf(t,d) + k1 x (1 - b + b x len(d)/avg_len)) ]
 
   IDF(t) = log((N - df(t) + 0.5) / (df(t) + 0.5) + 1)
-
-  where:
-    N     = total number of documents
-    df(t) = number of documents containing term t
-    tf    = term frequency in document d
-    len(d) = length of document d (in tokens)
-    avg_len = average document length across corpus
   """
 
   @k1 1.5
   @b  0.75
 
+  @doc "Computes the BM25 score for a single term in a document."
+  @spec bm25(number(), number(), number(), number(), number()) :: float()
   def bm25(tf, df, doc_len, avg_len, total_docs) do
-    # TODO: implement the formula above
+    idf_val = idf(df, total_docs)
+    numerator = tf * (@k1 + 1)
+    denominator = tf + @k1 * (1 - @b + @b * doc_len / avg_len)
+    idf_val * numerator / denominator
   end
 
+  @doc "Computes the inverse document frequency for a term."
+  @spec idf(number(), number()) :: float()
   def idf(df, total_docs) do
-    # TODO: :math.log((total_docs - df + 0.5) / (df + 0.5) + 1)
+    :math.log((total_docs - df + 0.5) / (df + 0.5) + 1)
   end
 end
 ```
 
-### Step 5: Given tests — must pass without modification
+### Step 6: Inverted index
+
+```elixir
+# lib/searcher/inverted_index.ex
+defmodule Searcher.InvertedIndex do
+  @moduledoc """
+  ETS-backed inverted index with positional information.
+
+  Structure: term -> [{doc_id, tf, [positions]}]
+  """
+
+  def ensure_tables do
+    for name <- [:searcher_index, :searcher_docs, :searcher_meta] do
+      case :ets.whereis(name) do
+        :undefined -> :ets.new(name, [:named_table, :public, :set])
+        _ -> :ok
+      end
+    end
+    :ok
+  end
+
+  @doc "Indexes a document with the given doc_id and text content."
+  @spec index(String.t(), String.t()) :: :ok
+  def index(doc_id, text) do
+    ensure_tables()
+    tokens = Searcher.Pipeline.process(text)
+    doc_len = length(tokens)
+
+    :ets.insert(:searcher_docs, {doc_id, doc_len, text})
+
+    term_positions =
+      Enum.group_by(tokens, fn {stem, _pos} -> stem end, fn {_stem, pos} -> pos end)
+
+    Enum.each(term_positions, fn {term, positions} ->
+      tf = length(positions)
+      entry = {doc_id, tf, Enum.sort(positions)}
+
+      case :ets.lookup(:searcher_index, term) do
+        [{^term, postings}] ->
+          updated = [entry | Enum.reject(postings, fn {id, _, _} -> id == doc_id end)]
+          :ets.insert(:searcher_index, {term, updated})
+        [] ->
+          :ets.insert(:searcher_index, {term, [entry]})
+      end
+    end)
+
+    update_meta()
+    :ok
+  end
+
+  @doc "Retrieves the posting list for a term."
+  @spec postings(String.t()) :: [{String.t(), non_neg_integer(), [non_neg_integer()]}]
+  def postings(term) do
+    ensure_tables()
+    case :ets.lookup(:searcher_index, term) do
+      [{^term, list}] -> list
+      [] -> []
+    end
+  end
+
+  @doc "Returns {total_docs, avg_doc_len}."
+  @spec stats() :: {non_neg_integer(), float()}
+  def stats do
+    ensure_tables()
+    case :ets.lookup(:searcher_meta, :stats) do
+      [{:stats, total, avg}] -> {total, avg}
+      [] -> {0, 0.0}
+    end
+  end
+
+  @doc "Returns the doc length for a specific document."
+  @spec doc_length(String.t()) :: non_neg_integer()
+  def doc_length(doc_id) do
+    case :ets.lookup(:searcher_docs, doc_id) do
+      [{^doc_id, len, _text}] -> len
+      [] -> 0
+    end
+  end
+
+  defp update_meta do
+    docs = :ets.tab2list(:searcher_docs)
+    total = length(docs)
+    avg_len = if total > 0, do: Enum.sum(Enum.map(docs, fn {_, l, _} -> l end)) / total, else: 0.0
+    :ets.insert(:searcher_meta, {:stats, total, avg_len})
+  end
+end
+```
+
+### Step 7: Engine — public API
+
+```elixir
+# lib/searcher/engine.ex
+defmodule Searcher.Engine do
+  use GenServer
+
+  @moduledoc """
+  Public API for the search engine.
+  """
+
+  def start_link(opts \\ []) do
+    GenServer.start_link(__MODULE__, opts)
+  end
+
+  @doc "Indexes a document."
+  @spec index(GenServer.server(), String.t(), String.t()) :: :ok
+  def index(_engine, doc_id, text) do
+    Searcher.InvertedIndex.index(doc_id, text)
+  end
+
+  @doc "Searches for documents matching the query. Returns [{doc_id, score}] sorted by score desc."
+  @spec search(GenServer.server(), String.t(), keyword()) :: [{String.t(), float()}]
+  def search(_engine, query, opts \\ []) do
+    top_k = Keyword.get(opts, :top_k, 10)
+    _scorer = Keyword.get(opts, :scorer, :bm25)
+
+    query_terms =
+      Searcher.Pipeline.process(query)
+      |> Enum.map(fn {stem, _pos} -> stem end)
+      |> Enum.uniq()
+
+    {total_docs, avg_len} = Searcher.InvertedIndex.stats()
+
+    if total_docs == 0 do
+      []
+    else
+      doc_scores =
+        Enum.flat_map(query_terms, fn term ->
+          postings = Searcher.InvertedIndex.postings(term)
+          df = length(postings)
+
+          Enum.map(postings, fn {doc_id, tf, _positions} ->
+            doc_len = Searcher.InvertedIndex.doc_length(doc_id)
+            score = Searcher.Scorer.bm25(tf, df, doc_len, avg_len, total_docs)
+            {doc_id, score}
+          end)
+        end)
+        |> Enum.group_by(fn {doc_id, _score} -> doc_id end, fn {_doc_id, score} -> score end)
+        |> Enum.map(fn {doc_id, scores} -> {doc_id, Enum.sum(scores)} end)
+        |> Enum.sort_by(fn {_id, score} -> score end, :desc)
+        |> Enum.take(top_k)
+
+      doc_scores
+    end
+  end
+
+  @doc "Searches for an exact phrase in documents."
+  @spec phrase_search(GenServer.server(), String.t()) :: [{String.t(), [{non_neg_integer(), non_neg_integer()}]}]
+  def phrase_search(_engine, phrase) do
+    terms =
+      Searcher.Pipeline.process(phrase)
+      |> Enum.map(fn {stem, _pos} -> stem end)
+
+    case terms do
+      [] -> []
+      [single_term] ->
+        Searcher.InvertedIndex.postings(single_term)
+        |> Enum.map(fn {doc_id, _tf, positions} -> {doc_id, Enum.map(positions, &{&1, &1})} end)
+
+      _ ->
+        posting_lists = Enum.map(terms, &Searcher.InvertedIndex.postings/1)
+
+        doc_ids_per_term =
+          Enum.map(posting_lists, fn postings ->
+            MapSet.new(Enum.map(postings, fn {doc_id, _, _} -> doc_id end))
+          end)
+
+        common_docs = Enum.reduce(doc_ids_per_term, &MapSet.intersection/2)
+
+        Enum.flat_map(MapSet.to_list(common_docs), fn doc_id ->
+          positions_per_term =
+            Enum.map(posting_lists, fn postings ->
+              case Enum.find(postings, fn {id, _, _} -> id == doc_id end) do
+                {_, _, pos} -> pos
+                nil -> []
+              end
+            end)
+
+          phrase_positions = find_phrase_positions(positions_per_term)
+
+          if phrase_positions != [] do
+            [{doc_id, phrase_positions}]
+          else
+            []
+          end
+        end)
+    end
+  end
+
+  defp find_phrase_positions(positions_per_term) do
+    [first_positions | rest_positions] = positions_per_term
+
+    Enum.flat_map(first_positions, fn start_pos ->
+      matches? =
+        rest_positions
+        |> Enum.with_index(1)
+        |> Enum.all?(fn {positions, offset} ->
+          (start_pos + offset) in positions
+        end)
+
+      if matches? do
+        [{start_pos, start_pos + length(positions_per_term) - 1}]
+      else
+        []
+      end
+    end)
+  end
+
+  @impl true
+  def init(_opts) do
+    Searcher.InvertedIndex.ensure_tables()
+    {:ok, %{}}
+  end
+end
+```
+
+### Step 8: Given tests — must pass without modification
 
 ```elixir
 # test/searcher/pipeline_test.exs
@@ -185,8 +623,6 @@ defmodule Searcher.StemmerTest do
   end
 
   test "agreed -> agre" do
-    # Porter phase 1a: "eed" → "ee"... verify against Porter reference
-    # The exact stem depends on your phase implementation; match the reference
     result = Searcher.Stemmer.stem("agreed")
     assert is_binary(result) and byte_size(result) > 0
   end
@@ -219,13 +655,13 @@ defmodule Searcher.BM25Test do
 end
 ```
 
-### Step 6: Run the tests
+### Step 9: Run the tests
 
 ```bash
 mix test test/searcher/ --trace
 ```
 
-### Step 7: Benchmark
+### Step 10: Benchmark
 
 ```elixir
 # bench/searcher_bench.exs
@@ -293,7 +729,7 @@ Positional intersection for phrases must check consecutive positions per documen
 
 ## Resources
 
-- Manning, C., Raghavan, P. & Schütze, H. — *Introduction to Information Retrieval* — [free online](https://nlp.stanford.edu/IR-book/)
+- Manning, C., Raghavan, P. & Schutze, H. — *Introduction to Information Retrieval* — [free online](https://nlp.stanford.edu/IR-book/)
 - Porter, M.F. (1980). *An algorithm for suffix stripping* — the original stemmer paper
 - Robertson, S. & Zaragoza, H. (2009). *The Probabilistic Relevance Framework: BM25 and Beyond*
 - [Okapi BM25 on Wikipedia](https://en.wikipedia.org/wiki/Okapi_BM25) — formula and parameter guidance

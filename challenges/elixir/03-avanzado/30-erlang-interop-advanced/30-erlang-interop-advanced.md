@@ -1,16 +1,18 @@
 # Erlang Interop — Advanced Data Structures
 
-**Project**: `api_gateway` — built incrementally across the advanced level
+**Project**: `api_gateway` — a standalone HTTP gateway exercise
 
 ---
 
 ## Project context
 
-You're extending `api_gateway` with two subsystems that cannot be built efficiently using
-Elixir's standard library alone: a job dispatch queue and a request-priority scheduler.
-Both require data structures with semantics that `List` and `Map` do not provide.
+You are building `api_gateway`, an HTTP gateway that routes traffic to microservices. The gateway
+needs two subsystems that cannot be built efficiently using Elixir's standard library alone:
+a job dispatch queue and a request-priority scheduler. Both require data structures with
+semantics that `List` and `Map` do not provide. Additionally, a legacy Erlang auth service
+returns user records as Erlang tuples and proplists that must be normalized to Elixir maps.
 
-Project structure at this point:
+Project structure:
 
 ```
 api_gateway/
@@ -18,11 +20,10 @@ api_gateway/
 │   └── api_gateway/
 │       ├── application.ex
 │       ├── router.ex
-│       ├── rate_limiter/
 │       └── middleware/
-│           ├── job_queue.ex            # ← you implement this
-│           ├── priority_scheduler.ex   # ← and this
-│           └── erlang_adapter.ex       # ← and this
+│           ├── job_queue.ex            # ← FIFO queue backed by :queue
+│           ├── priority_scheduler.ex   # ← priority queue backed by :gb_trees
+│           └── erlang_adapter.ex       # ← Erlang data normalization
 ├── test/
 │   └── api_gateway/
 │       └── middleware/

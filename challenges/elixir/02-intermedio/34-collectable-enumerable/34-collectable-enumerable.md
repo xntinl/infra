@@ -1,88 +1,52 @@
 # Enumerable and Collectable Protocols
 
-**Project**: `task_queue` — built incrementally across the intermediate level
+## Goal
 
----
-
-## Project context
-
-`task_queue` manages a job queue and a job registry. Both are custom data structures that contain multiple items. The ops team wants to use standard `Enum` functions — `Enum.count/1`, `Enum.filter/2`, `Enum.map/2` — directly on these structures, and use `Enum.into/2` to copy jobs from one queue to another or from a list into a queue.
-
-Project structure at this point:
-
-```
-task_queue/
-├── lib/
-│   └── task_queue/
-│       ├── application.ex
-│       ├── job_queue.ex            # ← you implement Enumerable and Collectable
-│       ├── worker.ex
-│       ├── queue_server.ex
-│       ├── scheduler.ex
-│       └── registry.ex
-├── test/
-│   └── task_queue/
-│       └── protocols_test.exs      # given tests — must pass without modification
-└── mix.exs
-```
-
----
-
-## The business problem
-
-The analytics team needs to query the in-memory job queue:
-
-```elixir
-# How many pending jobs of type "send_email" are waiting?
-Enum.count(queue, fn job -> job.type == "send_email" end)
-
-# Get all failed jobs for the dashboard
-Enum.filter(queue, fn job -> job.status == :failed end)
-
-# Copy jobs matching a filter into a new queue for retry
-Enum.into(retryable_jobs, %JobQueue{})
-```
-
-None of this works with a custom `%JobQueue{}` struct unless it implements `Enumerable` and `Collectable`.
+Build a `task_queue` FIFO job queue struct that implements `Enumerable` (enabling all `Enum.*` and `Stream.*` functions) and `Collectable` (enabling `Enum.into/2` and `for ... into:`). Learn how these protocols work internally and how to implement them for custom data structures.
 
 ---
 
 ## The two protocols
 
-**`Enumerable`** enables all `Enum` and `Stream` functions. It requires one callback:
+**`Enumerable`** enables all `Enum` and `Stream` functions. It requires four callbacks: `reduce/3`, `count/1`, `member?/2`, and `slice/1`. The simplest approach: convert to a list and delegate to `Enumerable.List`.
 
-```elixir
-@callback reduce(t, acc, (element, acc -> acc | {:suspend, acc} | {:halt, acc})) ::
-  {:done, acc} | {:halted, acc} | {:suspended, acc, continuation}
-```
-
-The simplest implementation converts the struct to a list and delegates to the list's `Enumerable`:
-
-```elixir
-defimpl Enumerable, for: MyStruct do
-  def reduce(struct, acc, fun), do: Enumerable.List.reduce(to_list(struct), acc, fun)
-  def count(struct), do: {:ok, length(to_list(struct))}
-  def member?(struct, element), do: {:ok, element in to_list(struct)}
-  def slice(struct), do: {:ok, length(to_list(struct)), &Enumerable.List.slice(to_list(struct), &1, &2, length(to_list(struct)))}
-end
-```
-
-**`Collectable`** enables `Enum.into/2` and `for ... into:` comprehensions. It requires one callback:
-
-```elixir
-@callback into(t) :: {initial_acc, collector_fun}
-# collector_fun.(accumulator, command) -> new_accumulator
-# Commands:
-#   {:cont, element} — add element; return updated accumulator
-#   :done            — finalize; return the finished collection
-#   :halt            — abort; return :ok (accumulator is discarded)
-```
+**`Collectable`** enables `Enum.into/2` and `for ... into:` comprehensions. It requires one callback: `into/1` which returns `{initial_acc, collector_fun}`. The collector function receives `(accumulator, command)` where command is `{:cont, element}`, `:done`, or `:halt`.
 
 ---
 
 ## Implementation
 
-### Step 1: `lib/task_queue/job_queue.ex` — custom queue with protocol implementations
+### Step 1: `mix.exs`
+
+```elixir
+defmodule TaskQueue.MixProject do
+  use Mix.Project
+
+  def project do
+    [
+      app: :task_queue,
+      version: "0.1.0",
+      elixir: "~> 1.15",
+      start_permanent: Mix.env() == :prod,
+      deps: deps()
+    ]
+  end
+
+  def application do
+    [extra_applications: [:logger]]
+  end
+
+  defp deps, do: []
+end
+```
+
+### Step 2: `lib/task_queue/job_queue.ex` -- custom queue with protocol implementations
+
+The `JobQueue` struct wraps an Erlang `:queue` (a double-ended queue with O(1) amortized push/pop). The `to_list/1` function converts it to a list for the `Enumerable` implementation.
+
+The `Enumerable` implementation delegates to `Enumerable.List.reduce/3` which correctly handles all three accumulator signals (`{:cont, acc}`, `{:halt, acc}`, `{:suspend, acc}`). This means `Enum.take(queue, 2)` stops after two elements instead of traversing the entire queue. `count/1` returns `{:ok, size}` for O(1) counting.
+
+The `Collectable` implementation's collector function takes `(accumulator, command)` -- note that accumulator is first and the command tuple is second. This is a common source of bugs when the arguments are swapped.
 
 ```elixir
 defmodule TaskQueue.JobQueue do
@@ -91,16 +55,6 @@ defmodule TaskQueue.JobQueue do
 
   Implements `Enumerable` to support all `Enum.*` and `Stream.*` operations.
   Implements `Collectable` to support `Enum.into/2` and `for ... into:`.
-
-  ## Examples
-
-      iex> queue = %TaskQueue.JobQueue{}
-      iex> queue = Enum.into([%{type: "noop"}, %{type: "echo"}], queue)
-      iex> Enum.count(queue)
-      2
-      iex> Enum.map(queue, & &1.type)
-      ["noop", "echo"]
-
   """
 
   defstruct jobs: :queue.new()
@@ -143,61 +97,31 @@ defmodule TaskQueue.JobQueue do
 end
 
 defimpl Enumerable, for: TaskQueue.JobQueue do
-  @doc """
-  Implements reduction over the queue by converting to a list.
-
-  This enables all Enum and Stream operations on a JobQueue.
-  """
   def reduce(queue, acc, fun) do
-    # TODO: convert queue to a list and delegate to Enumerable.List.reduce/3
-    # HINT: Enumerable.List.reduce(TaskQueue.JobQueue.to_list(queue), acc, fun)
+    Enumerable.List.reduce(TaskQueue.JobQueue.to_list(queue), acc, fun)
   end
 
   def count(queue) do
-    # TODO: return {:ok, size} using JobQueue.size/1
-    # HINT: {:ok, TaskQueue.JobQueue.size(queue)}
+    {:ok, TaskQueue.JobQueue.size(queue)}
   end
 
   def member?(queue, element) do
-    # TODO: check if element is in the queue's list
-    # HINT: {:ok, element in TaskQueue.JobQueue.to_list(queue)}
+    {:ok, element in TaskQueue.JobQueue.to_list(queue)}
   end
 
   def slice(queue) do
-    # TODO: return {:ok, size, slicer_fun}
-    # The slicer_fun takes (start, length, size) and returns a sublist
-    # Simplest approach: delegate to Enumerable.List.slice/4
-    # HINT:
-    # list = TaskQueue.JobQueue.to_list(queue)
-    # size = length(list)
-    # {:ok, size, &Enumerable.List.slice(list, &1, &2, size)}
+    list = TaskQueue.JobQueue.to_list(queue)
+    size = length(list)
+    {:ok, size, &Enumerable.List.slice(list, &1, &2, size)}
   end
 end
 
 defimpl Collectable, for: TaskQueue.JobQueue do
-  @doc """
-  Implements collection into a JobQueue, enabling `Enum.into/2`.
-
-  ## Examples
-
-      iex> jobs = [%{type: "noop"}, %{type: "echo"}]
-      iex> queue = Enum.into(jobs, %TaskQueue.JobQueue{})
-      iex> TaskQueue.JobQueue.size(queue)
-      2
-
-  """
   def into(initial_queue) do
     collector_fun = fn
-      # TODO: implement the three clauses.
-      # The collector receives (accumulator, command):
-      # queue_acc, {:cont, job_map} -> push job_map into queue_acc, return new queue
-      # queue_acc, :done            -> return the final queue
-      # _queue_acc, :halt           -> return :ok (discard accumulator)
-      #
-      # HINT:
-      # queue, {:cont, job} -> TaskQueue.JobQueue.push(queue, job)
-      # queue, :done        -> queue
-      # _, :halt            -> :ok
+      queue, {:cont, job} -> TaskQueue.JobQueue.push(queue, job)
+      queue, :done        -> queue
+      _, :halt            -> :ok
     end
 
     {initial_queue, collector_fun}
@@ -205,7 +129,7 @@ defimpl Collectable, for: TaskQueue.JobQueue do
 end
 ```
 
-### Step 2: Given tests — must pass without modification
+### Step 3: Tests
 
 ```elixir
 # test/task_queue/protocols_test.exs
@@ -214,7 +138,7 @@ defmodule TaskQueue.ProtocolsTest do
 
   alias TaskQueue.JobQueue
 
-  describe "Enumerable — basic operations" do
+  describe "Enumerable -- basic operations" do
     setup do
       queue =
         JobQueue.new()
@@ -267,14 +191,13 @@ defmodule TaskQueue.ProtocolsTest do
     end
 
     test "Stream.filter works (lazy evaluation)", %{queue: queue} do
-      # Stream doesn't evaluate until Enum.to_list is called
       stream = Stream.filter(queue, fn j -> j.type == "send_email" end)
       result = Enum.to_list(stream)
       assert length(result) == 2
     end
   end
 
-  describe "Collectable — Enum.into" do
+  describe "Collectable -- Enum.into" do
     test "Enum.into/2 collects a list of jobs into a queue" do
       jobs = [
         %{type: "noop", status: :pending},
@@ -299,7 +222,7 @@ defmodule TaskQueue.ProtocolsTest do
       assert Enum.all?(queue, fn j -> Map.get(j, :processed) == true end)
     end
 
-    test "Enum.into with filter — only passing jobs collected" do
+    test "Enum.into with filter -- only passing jobs collected" do
       all_jobs = [
         %{type: "send_email", status: :pending},
         %{type: "send_email", status: :failed},
@@ -326,7 +249,7 @@ defmodule TaskQueue.ProtocolsTest do
     end
   end
 
-  describe "Enumerable — empty queue" do
+  describe "Enumerable -- empty queue" do
     test "Enum.count on empty queue returns 0" do
       assert Enum.count(JobQueue.new()) == 0
     end
@@ -342,7 +265,7 @@ defmodule TaskQueue.ProtocolsTest do
 end
 ```
 
-### Step 3: Run the tests
+### Step 4: Run
 
 ```bash
 mix test test/task_queue/protocols_test.exs --trace
@@ -354,64 +277,35 @@ mix test test/task_queue/protocols_test.exs --trace
 
 | Approach | Supports `Enum.*` | Supports `Enum.into` | Lazy streams | Implementation effort |
 |----------|------------------|---------------------|--------------|----------------------|
-| `defimpl Enumerable` | yes | no | yes (via Stream) | medium — 4 callbacks |
-| `defimpl Collectable` | no | yes | N/A | low — 1 callback |
+| `defimpl Enumerable` | yes | no | yes (via Stream) | medium -- 4 callbacks |
+| `defimpl Collectable` | no | yes | N/A | low -- 1 callback |
 | Both | yes | yes | yes | medium |
-| Convert to list first | only after conversion | no | no | none — but loses struct type |
-
-Reflection question: the `reduce/3` callback for `Enumerable` must handle three accumulator values: `{:cont, acc}`, `{:halt, acc}`, and `{:suspend, acc}`. When does `Stream.take(queue, 2)` produce a `{:halt, acc}` signal, and why is it important that the implementation stops iterating immediately when this signal arrives?
+| Convert to list first | only after conversion | no | no | none -- but loses struct type |
 
 ---
 
 ## Common production mistakes
 
 **1. Not handling `{:halt, acc}` in the `reduce` callback**
-
-`Enum.take/2` and `Stream.take_while/2` send a halt signal after collecting enough elements. If your `reduce` ignores it and keeps iterating, `Enum.take(queue, 1)` processes the entire queue instead of stopping after the first element.
-
-Delegating to `Enumerable.List.reduce/3` handles this correctly — which is why the list-delegation approach is the right starting point.
+`Enum.take/2` sends a halt signal. If your `reduce` ignores it, `Enum.take(queue, 1)` processes the entire queue. Delegating to `Enumerable.List.reduce/3` handles this correctly.
 
 **2. Returning the wrong shape from the `Collectable` collector**
-
-The collector function signature is `fn accumulator, command -> new_accumulator`.
-The command is `{:cont, element}`, `:done`, or `:halt` — it is the **second** argument.
-
-```elixir
-# Wrong — element and command are swapped; this will raise a FunctionClauseError
-collector_fun = fn
-  {:cont, job}, queue -> TaskQueue.JobQueue.push(queue, job)
-  :done, queue        -> queue
-  :halt, _            -> :ok
-end
-
-# Right — accumulator is first, command tuple is second
-collector_fun = fn
-  queue, {:cont, job} -> TaskQueue.JobQueue.push(queue, job)
-  queue, :done        -> queue
-  _, :halt            -> :ok
-end
-```
-
-`Enum.into/2` calls `collector_fun.(accumulator, {:cont, element})` for each element,
-then `collector_fun.(accumulator, :done)` to finalize.
+The collector receives `(accumulator, command)`. The accumulator is first, the command tuple is second. Swapping them causes a `FunctionClauseError`.
 
 **3. `count/1` returning `{:error, __MODULE__}` instead of `{:ok, n}`**
-
-If `count/1` returns `{:error, __MODULE__}`, `Enum.count/1` falls back to a full traversal via `reduce/3`. This is correct but slower. Returning `{:ok, n}` gives O(1) count.
+If `count/1` returns `{:error, __MODULE__}`, `Enum.count/1` falls back to a full traversal via `reduce/3`. Returning `{:ok, n}` gives O(1) count.
 
 **4. `member?/2` returning `{:error, __MODULE__}` causing unnecessary traversals**
-
-Similarly, if `member?/2` returns `{:error, __MODULE__}`, `Enum.member?/2` traverses the entire collection. For a FIFO queue where O(n) membership checks are expected, this is acceptable — but document it.
+If `member?/2` returns `{:error, __MODULE__}`, `Enum.member?/2` traverses the entire collection.
 
 **5. Mutable state in the `Collectable` collector closure**
-
-The collector function receives the accumulator as an argument and must return the new accumulator. Do not use captured mutable state — the `{:halt, _}` clause discards the accumulator and the collector must be side-effect free.
+The collector function receives the accumulator as an argument and returns the new accumulator. Do not use captured mutable state.
 
 ---
 
 ## Resources
 
-- [Enumerable protocol — official docs](https://hexdocs.pm/elixir/Enumerable.html)
-- [Collectable protocol — official docs](https://hexdocs.pm/elixir/Collectable.html)
-- [Implementing Enumerable — Elixir School](https://elixirschool.com/en/lessons/advanced/protocols)
-- [Stream module — lazy enumeration](https://hexdocs.pm/elixir/Stream.html)
+- [Enumerable protocol -- official docs](https://hexdocs.pm/elixir/Enumerable.html)
+- [Collectable protocol -- official docs](https://hexdocs.pm/elixir/Collectable.html)
+- [Implementing Enumerable -- Elixir School](https://elixirschool.com/en/lessons/advanced/protocols)
+- [Stream module -- lazy enumeration](https://hexdocs.pm/elixir/Stream.html)

@@ -20,7 +20,7 @@ typed_actors/
 │       ├── dispatch.ex              # message dispatch: struct-based routing
 │       ├── supervisor.ex            # ActorSupervisor: one_for_one, one_for_all, rest_for_one
 │       ├── hot_update.ex            # runtime behavior swap via :sys protocol
-│       └── registry.ex              # name → ActorRef mapping (leverages Nexus.Registry)
+│       └── registry.ex              # name → ActorRef mapping (ETS-backed, self-contained)
 ├── test/
 │   └── typed_actors/
 │       ├── protocol_test.exs        # typed dispatch, UnknownMessageError
@@ -101,20 +101,37 @@ defmodule TypedActors.Actor do
   Sending a message of any other type raises Actor.UnknownMessageError.
   """
 
+  defmodule UnknownMessageError do
+    @moduledoc "Raised when an actor receives a message type it does not declare."
+    defexception [:message, :declared_types]
+  end
+
   defmacro __using__(_opts) do
     quote do
       use GenServer
       import TypedActors.Actor, only: [receive_message: 2]
-      @declared_messages []
+      Module.register_attribute(__MODULE__, :declared_messages, accumulate: true)
+      Module.register_attribute(__MODULE__, :handler_clauses, accumulate: true)
       @before_compile TypedActors.Actor
     end
+  end
+
+  @doc """
+  Swaps the dispatch behavior of a running actor at runtime.
+  The actor's state is preserved; subsequent messages use the new module's dispatch/2.
+  Sends a message to the GenServer to swap its dispatch module.
+  """
+  @spec update_behavior(pid(), module()) :: :ok
+  def update_behavior(pid, new_module) do
+    GenServer.cast(pid, {:__swap_dispatch__, new_module})
+    :ok
   end
 
   defmacro receive_message(pattern, do: body) do
     msg_type = extract_struct_type(pattern)
 
     quote do
-      @declared_messages [unquote(msg_type) | @declared_messages]
+      @declared_messages unquote(msg_type)
       @handler_clauses {unquote(Macro.escape(pattern)), unquote(Macro.escape(body))}
     end
   end
@@ -145,17 +162,37 @@ defmodule TypedActors.Actor do
           declared_types: unquote(declared)
       end
 
-      def handle_call(msg, _from, state) when is_struct(msg) do
-        case dispatch(msg, state) do
-          {:reply, reply, new_state} -> {:reply, reply, new_state}
-          {:noreply, new_state} -> {:noreply, new_state}
+      @doc false
+      def init(args) do
+        case super(args) do
+          {:ok, user_state} -> {:ok, %{dispatch_module: __MODULE__, user_state: user_state}}
+          other -> other
         end
       end
 
-      def handle_cast(msg, state) when is_struct(msg) do
-        case dispatch(msg, state) do
-          {:reply, _reply, new_state} -> {:noreply, new_state}
-          {:noreply, new_state} -> {:noreply, new_state}
+      defoverridable init: 1
+
+      def handle_call(msg, _from, %{dispatch_module: mod, user_state: user_state} = wrapper)
+          when is_struct(msg) do
+        case mod.dispatch(msg, user_state) do
+          {:reply, reply, new_user_state} ->
+            {:reply, reply, %{wrapper | user_state: new_user_state}}
+          {:noreply, new_user_state} ->
+            {:noreply, %{wrapper | user_state: new_user_state}}
+        end
+      end
+
+      def handle_cast({:__swap_dispatch__, new_module}, wrapper) do
+        {:noreply, %{wrapper | dispatch_module: new_module}}
+      end
+
+      def handle_cast(msg, %{dispatch_module: mod, user_state: user_state} = wrapper)
+          when is_struct(msg) do
+        case mod.dispatch(msg, user_state) do
+          {:reply, _reply, new_user_state} ->
+            {:noreply, %{wrapper | user_state: new_user_state}}
+          {:noreply, new_user_state} ->
+            {:noreply, %{wrapper | user_state: new_user_state}}
         end
       end
     end

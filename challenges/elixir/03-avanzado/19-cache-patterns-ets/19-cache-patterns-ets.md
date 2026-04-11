@@ -1,17 +1,12 @@
 # Cache Patterns with ETS
 
-**Project**: `api_gateway` — built incrementally across the advanced level
-
----
-
 ## Project context
 
-You're building `api_gateway`. The gateway proxies requests to upstream services.
-Some upstream responses are expensive — they hit a database, aggregate multiple services,
-or require cryptographic verification. You need a cache layer between the router and the
-upstream clients.
+You are building `api_gateway`, an internal HTTP gateway that routes traffic to microservices.
+This exercise focuses on building a cache layer between the router and the upstream clients,
+with TTL-based expiry, periodic cleanup, and stampede prevention.
 
-Project structure at this point:
+Project structure:
 
 ```
 api_gateway/
@@ -19,9 +14,6 @@ api_gateway/
 │   └── api_gateway/
 │       ├── application.ex
 │       ├── router.ex
-│       ├── rate_limiter/
-│       ├── metrics/
-│       ├── config/
 │       └── cache/
 │           ├── store.ex
 │           └── stampede_guard.ex
@@ -63,9 +55,9 @@ by 5 seconds while an entry has a 60-second TTL, that entry will appear valid fo
 
 `System.monotonic_time` only ever increases. It is the correct clock for TTL comparisons.
 
-The exception: `PersistentCache` (exercise 17) uses `os_time` for L2 entries because
-monotonic time resets to zero on restart — a value stored before restart would appear
-expired immediately after restart if compared against the new monotonic clock.
+The exception: persistent caches that must survive restarts use `os_time` for L2 entries
+because monotonic time resets to zero on restart -- a value stored before restart would
+appear expired immediately after restart if compared against the new monotonic clock.
 
 ---
 
@@ -82,11 +74,11 @@ implemented with `:ets.insert_new/2` as a lightweight mutex.
 The double-check inside the lock is not optional:
 
 ```
-Process A: cache miss → try to acquire lock → wins
-Process B: cache miss → try to acquire lock → waits (polling)
-Process A: fetches from upstream → populates cache → releases lock
-Process B: polling loop → checks cache → HIT (populated by A)
-  without double-check → B would fetch again despite the cache being warm
+Process A: cache miss -> try to acquire lock -> wins
+Process B: cache miss -> try to acquire lock -> waits (polling)
+Process A: fetches from upstream -> populates cache -> releases lock
+Process B: polling loop -> checks cache -> HIT (populated by A)
+  without double-check -> B would fetch again despite the cache being warm
 ```
 
 ---
@@ -103,7 +95,7 @@ defmodule ApiGateway.Cache.Store do
   Design:
   - Reads bypass the GenServer entirely (direct :ets.lookup)
   - Writes go directly to ETS (:ets.insert is atomic for a single record)
-  - Cleanup runs periodically via handle_info — no separate supervisor needed
+  - Cleanup runs periodically via handle_info -- no separate supervisor needed
   - Lazy eviction on read removes expired entries on access
   - Periodic cleanup removes entries that expire without being accessed
   """
@@ -114,7 +106,7 @@ defmodule ApiGateway.Cache.Store do
   @cleanup_interval_ms 30_000
 
   # ---------------------------------------------------------------------------
-  # Public API — reads do not go through the GenServer
+  # Public API -- reads do not go through the GenServer
   # ---------------------------------------------------------------------------
 
   @doc """
@@ -141,7 +133,7 @@ defmodule ApiGateway.Cache.Store do
 
   @doc """
   Stores a value with the given TTL in milliseconds.
-  Direct ETS write — no GenServer serialization needed for writes
+  Direct ETS write -- no GenServer serialization needed for writes
   because :ets.insert is atomic for a single record.
   """
   @spec put(term(), term(), pos_integer()) :: :ok
@@ -154,7 +146,7 @@ defmodule ApiGateway.Cache.Store do
   @doc """
   Returns the value if cached and fresh.
   On miss: calls fetch_fn/0, caches the result, returns it.
-  NOT stampede-safe — use StampedeGuard.get_or_fetch/3 for hot keys.
+  NOT stampede-safe -- use StampedeGuard.get_or_fetch/3 for hot keys.
   """
   @spec get_or_put(term(), (-> term()), pos_integer()) :: {:ok, term(), :hit | :miss}
   def get_or_put(key, fetch_fn, ttl_ms \\ 60_000) do
@@ -177,13 +169,13 @@ defmodule ApiGateway.Cache.Store do
 
   @doc """
   Returns %{total: N, expired: N, fresh: N} without removing any entries.
-  Uses :ets.select_count — no full table copy.
+  Uses :ets.select_count -- no full table copy.
   """
   @spec stats() :: %{total: non_neg_integer(), expired: non_neg_integer(), fresh: non_neg_integer()}
   def stats do
     now = System.monotonic_time(:millisecond)
     total = :ets.info(@table, :size)
-    # :ets.fun2ms generates compile-time match specs — valid here because
+    # :ets.fun2ms generates compile-time match specs -- valid here because
     # `now` is bound at call time and captured in the closure correctly
     expired_ms = :ets.fun2ms(fn {_k, _v, expires_at} when expires_at =< now -> true end)
     expired = :ets.select_count(@table, expired_ms)
@@ -197,7 +189,7 @@ defmodule ApiGateway.Cache.Store do
   end
 
   # ---------------------------------------------------------------------------
-  # GenServer — owns the table and runs periodic cleanup
+  # GenServer -- owns the table and runs periodic cleanup
   # ---------------------------------------------------------------------------
 
   def start_link(opts \\ []) do
@@ -250,7 +242,7 @@ defmodule ApiGateway.Cache.StampedeGuard do
   a lightweight mutex. The process that wins the lock fetches; the rest poll
   with exponential backoff until the key appears in the cache.
 
-  insert_new/2 is atomic — it returns true only for the first process that inserts
+  insert_new/2 is atomic -- it returns true only for the first process that inserts
   the lock key, and false for all subsequent attempts. This makes it a perfect
   lightweight mutex without requiring a GenServer serialization point.
   """
@@ -282,7 +274,7 @@ defmodule ApiGateway.Cache.StampedeGuard do
   end
 
   # ---------------------------------------------------------------------------
-  # Private — direct ETS reads, no GenServer
+  # Private -- direct ETS reads, no GenServer
   # ---------------------------------------------------------------------------
 
   defp direct_get(key) do
@@ -301,7 +293,7 @@ defmodule ApiGateway.Cache.StampedeGuard do
     lock_key = {:lock, key}
 
     if :ets.insert_new(@lock_table, {lock_key, self()}) do
-      # This process wins the lock — responsible for fetching
+      # This process wins the lock -- responsible for fetching
       GenServer.cast(__MODULE__, :increment_fetch)
 
       try do
@@ -317,7 +309,7 @@ defmodule ApiGateway.Cache.StampedeGuard do
         :ets.delete(@lock_table, lock_key)
       end
     else
-      # Another process is fetching — wait with polling
+      # Another process is fetching -- wait with polling
       GenServer.cast(__MODULE__, :increment_wait)
       deadline = System.monotonic_time(:millisecond) + @lock_timeout_ms
       wait_for_key(key, deadline)
@@ -371,7 +363,7 @@ defmodule ApiGateway.Cache.StampedeGuard do
 end
 ```
 
-### Step 3: Given tests — must pass without modification
+### Step 3: Tests
 
 ```elixir
 # test/api_gateway/cache/store_test.exs
@@ -542,10 +534,10 @@ end
 
 Benchee.run(
   %{
-    "cache hit — direct ETS read" => fn ->
+    "cache hit -- direct ETS read" => fn ->
       Store.get("key:#{:rand.uniform(1_000)}")
     end,
-    "cache miss — key not found" => fn ->
+    "cache miss -- key not found" => fn ->
       Store.get("nonexistent:#{:rand.uniform(1_000_000)}")
     end
   },
@@ -560,8 +552,8 @@ Benchee.run(
 mix run bench/cache_bench.exs
 ```
 
-**Expected**: cache hit < 5µs at p99 under 100 parallel readers. If you see higher latency,
-verify that `get/1` does NOT use `GenServer.call` — it must read directly from ETS.
+**Expected**: cache hit < 5us at p99 under 100 parallel readers. If you see higher latency,
+verify that `get/1` does NOT use `GenServer.call` -- it must read directly from ETS.
 
 ---
 
@@ -595,7 +587,7 @@ have already populated the cache. Without a re-check inside the lock, both proce
 fetch. The second fetch is wasted and may cause a double-write race:
 
 ```elixir
-# WRONG — no double-check
+# WRONG -- no double-check
 if :ets.insert_new(locks, {key, self()}) do
   value = fetch_fn.()  # another process may have already done this
   cache_put(key, value)
@@ -604,10 +596,10 @@ end
 
 **3. Cleanup that deletes while iterating**
 Never call `:ets.delete` inside a `first/next` iteration loop. The iterator is
-invalidated. Use `:ets.select_delete` with a match spec — it is atomic and safe.
+invalidated. Use `:ets.select_delete` with a match spec -- it is atomic and safe.
 
 **4. Using `get_or_put/3` for stampede-sensitive keys**
-`get_or_put` has no stampede protection — all concurrent misses fetch independently.
+`get_or_put` has no stampede protection -- all concurrent misses fetch independently.
 Use `StampedeGuard.get_or_fetch/3` for keys that are frequently accessed and expensive
 to recompute.
 
@@ -620,7 +612,7 @@ Do not add ETS complexity unless you have actual concurrent access.
 
 ## Resources
 
-- [ETS documentation — Erlang/OTP](https://www.erlang.org/doc/man/ets.html)
-- [`System.monotonic_time/1` — Elixir docs](https://hexdocs.pm/elixir/System.html#monotonic_time/1)
-- [Cachex — production ETS cache library](https://hexdocs.pm/cachex/Cachex.html) — reference implementation of all patterns discussed here
-- [Designing Data-Intensive Applications — Martin Kleppmann](https://www.oreilly.com/library/view/designing-data-intensive-applications/9781491903063/) — Chapter 11: cache patterns and consistency
+- [ETS documentation -- Erlang/OTP](https://www.erlang.org/doc/man/ets.html)
+- [`System.monotonic_time/1` -- Elixir docs](https://hexdocs.pm/elixir/System.html#monotonic_time/1)
+- [Cachex -- production ETS cache library](https://hexdocs.pm/cachex/Cachex.html) -- reference implementation of all patterns discussed here
+- [Designing Data-Intensive Applications -- Martin Kleppmann](https://www.oreilly.com/library/view/designing-data-intensive-applications/9781491903063/) -- Chapter 11: cache patterns and consistency

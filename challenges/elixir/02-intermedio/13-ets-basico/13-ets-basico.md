@@ -1,21 +1,34 @@
 # ETS: In-Process Shared State
 
-**Project**: `task_queue` — built incrementally across the intermediate level
+## Why ETS is not just a faster Agent
+
+ETS and Agent have different consistency models:
+
+- **Agent**: every operation is serialized through the process mailbox. All reads and
+  writes see a consistent, sequential view.
+- **ETS `:public`**: multiple processes read and write concurrently. Individual operations
+  are atomic, but sequences of operations are not.
+
+Choose ETS when: reads vastly outnumber writes, individual operation atomicity is
+sufficient, and you do not need cross-operation transactions.
+
+Choose Agent when: you need atomic multi-step operations (read-then-write).
 
 ---
 
-## Project context
+## The business problem
 
-The task_queue system's `TaskRegistry` (exercise 02) uses an Agent. Under high concurrency,
-every status read goes through the Agent's mailbox — serialized access. In exercise 03
-you measured that batch runners can push hundreds of concurrent status updates. At some
-point the Agent becomes the bottleneck.
+Build a `TaskQueue.EtsRegistry` — a GenServer that **owns** an ETS table, but allows all
+reads to bypass the GenServer process (reads go straight to ETS).
 
-ETS (Erlang Term Storage) removes that bottleneck for the read path: reads go directly to
-the table without messaging any process. This exercise replaces the Agent-based registry
-with an ETS-backed one, following the read-heavy owner pattern.
+Build a `TaskQueue.JobCounter` that uses `:ets.update_counter/4` for atomic increments,
+demonstrating the one ETS operation that is truly atomic for concurrent writers.
 
-Project structure at this point:
+All modules are defined completely in this exercise.
+
+---
+
+## Project setup
 
 ```
 task_queue/
@@ -25,61 +38,15 @@ task_queue/
 │       └── job_counter.ex
 ├── test/
 │   └── task_queue/
-│       └── ets_test.exs         # given tests — must pass without modification
-├── bench/
-│   └── ets_bench.exs            # benchmark — run at the end
+│       └── ets_test.exs
 └── mix.exs
 ```
 
 ---
 
-## Why ETS is not just a faster Agent
-
-ETS and Agent have different consistency models:
-
-- **Agent**: every operation is serialized through the process mailbox. All reads and
-  writes see a consistent, sequential view of the state. Reads and writes can interleave
-  in a defined order.
-- **ETS `:public`**: multiple processes read and write concurrently without a central
-  serializer. Individual operations are atomic, but sequences of operations are not.
-  A process can read a value, another writes a new value, and the first process writes
-  based on stale data.
-
-Choose ETS when: reads vastly outnumber writes, individual operation atomicity is
-sufficient, and you do not need cross-operation transactions.
-
-Choose Agent when: you need atomic multi-step operations (read-then-write where the write
-depends on the read), or when the consistency model of "one operation at a time" is a
-feature.
-
----
-
-## ETS table types
-
-| Type | Keys | Use case |
-|------|------|----------|
-| `:set` | Unique | Default. One value per key. |
-| `:ordered_set` | Unique, sorted | Range queries, leaderboards. |
-| `:bag` | Non-unique | Multiple values per key (see exercise 71, rate limiter). |
-| `:duplicate_bag` | Non-unique + duplicate values | Rarely needed. |
-
-For a task registry where each task has exactly one status: `:set`.
-
----
-
-## The business problem
-
-`TaskQueue.EtsRegistry` is a GenServer that **owns** an ETS table, but allows all reads
-to bypass the GenServer process — reads go straight to ETS.
-
-`TaskQueue.JobCounter` uses `:ets.update_counter/3` for atomic increment-on-write,
-demonstrating the one ETS operation that is truly atomic for concurrent writers.
-
----
-
 ## Implementation
 
-### Step 1: `lib/task_queue/ets_registry.ex`
+### `lib/task_queue/ets_registry.ex`
 
 ```elixir
 defmodule TaskQueue.EtsRegistry do
@@ -88,18 +55,11 @@ defmodule TaskQueue.EtsRegistry do
 
   @table :tq_registry
 
-  # ---------------------------------------------------------------------------
-  # Public API
-  # ---------------------------------------------------------------------------
-
   def start_link(opts \\ []) do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
   end
 
-  @doc """
-  Reads a task entry directly from ETS — no GenServer roundtrip.
-  Returns the entry map or nil.
-  """
+  @doc "Reads a task entry directly from ETS — no GenServer roundtrip."
   @spec get(String.t()) :: map() | nil
   def get(task_id) do
     case :ets.lookup(@table, task_id) do
@@ -108,19 +68,14 @@ defmodule TaskQueue.EtsRegistry do
     end
   end
 
-  @doc """
-  Registers a new task. Goes through GenServer to ensure the table exists.
-  """
+  @doc "Registers a new task. Goes through GenServer to ensure the table exists."
   @spec register(String.t(), atom()) :: :ok
   def register(task_id, status \\ :pending) do
     entry = %{status: status, updated_at: now()}
     GenServer.cast(__MODULE__, {:put, task_id, entry})
   end
 
-  @doc """
-  Updates the status of an existing task. Reads current entry from ETS, writes back.
-  This is NOT atomic across read + write — acceptable for our use case.
-  """
+  @doc "Updates the status of an existing task via GenServer (serialized write)."
   @spec update_status(String.t(), atom()) :: :ok | {:error, :not_found}
   def update_status(task_id, new_status) do
     GenServer.call(__MODULE__, {:update_status, task_id, new_status})
@@ -139,10 +94,6 @@ defmodule TaskQueue.EtsRegistry do
   def count do
     :ets.info(@table, :size)
   end
-
-  # ---------------------------------------------------------------------------
-  # GenServer callbacks
-  # ---------------------------------------------------------------------------
 
   @impl GenServer
   def init(_opts) do
@@ -170,29 +121,19 @@ defmodule TaskQueue.EtsRegistry do
   end
 
   @impl GenServer
-  def terminate(_reason, _state) do
-    :ok
-  end
+  def terminate(_reason, _state), do: :ok
 
   defp now, do: System.monotonic_time(:millisecond)
 end
 ```
 
 The key design: `get/1`, `by_status/1`, and `count/0` read directly from ETS without
-going through the GenServer. This means 100 concurrent readers do not contend with each
-other — they all read the ETS table in parallel. The `read_concurrency: true` option
-tells ETS to use multiple read locks, further improving parallel read throughput.
+going through the GenServer. 100 concurrent readers do not contend with each other.
+The `read_concurrency: true` option uses multiple read locks for parallel read throughput.
 
-Writes go through the GenServer (`register/2` via cast, `update_status/2` via call).
-The GenServer serializes writes to prevent two processes from reading the same entry,
-both modifying it, and one overwriting the other's change. For `register/2`, we use cast
-because there is no read-before-write concern — it is a simple insert.
+Writes go through the GenServer to prevent concurrent read-modify-write races.
 
-The `by_status/1` function uses `:ets.match_object/2` with a pattern that matches tuples
-where the entry map has the requested status. The `:"$1"` and `:"$2"` are match
-specification variables that match any value — they act as wildcards in the pattern.
-
-### Step 2: `lib/task_queue/job_counter.ex`
+### `lib/task_queue/job_counter.ex`
 
 ```elixir
 defmodule TaskQueue.JobCounter do
@@ -208,7 +149,6 @@ defmodule TaskQueue.JobCounter do
   @doc """
   Atomically increments counter `key` by `amount`.
   Uses :ets.update_counter which is atomic even with concurrent callers.
-  Direct ETS write — no GenServer roundtrip.
   """
   @spec increment(atom(), pos_integer()) :: non_neg_integer()
   def increment(key, amount \\ 1) do
@@ -254,20 +194,14 @@ end
 
 The `increment/2` function uses `:ets.update_counter/4` — the 4-argument form that
 accepts a default tuple. If the key does not exist, ETS inserts `{key, 0}` first, then
-applies the increment. The `{2, amount}` argument means "increment element at position 2
-of the tuple by `amount`". This entire operation is atomic: even with 100 concurrent
-callers incrementing the same key, no updates are lost.
+applies the increment. This entire operation is atomic.
 
-The table uses `write_concurrency: true` because counters are written frequently from
-many processes. This option uses finer-grained locks to reduce write contention.
-
-### Step 3: Given tests — must pass without modification
+### Tests
 
 ```elixir
 # test/task_queue/ets_test.exs
 defmodule TaskQueue.EtsTest do
   use ExUnit.Case, async: false
-  # async: false — tests share named ETS tables
 
   alias TaskQueue.EtsRegistry
   alias TaskQueue.JobCounter
@@ -384,88 +318,34 @@ defmodule TaskQueue.EtsTest do
 end
 ```
 
-### Step 4: Benchmark — run after tests pass
-
-```elixir
-# bench/ets_bench.exs
-alias TaskQueue.EtsRegistry
-
-# Seed data
-for i <- 1..1_000 do
-  EtsRegistry.register("bench_task_#{i}", :running)
-end
-
-Process.sleep(100)
-
-Benchee.run(
-  %{
-    "EtsRegistry.get — direct ETS read" => fn ->
-      EtsRegistry.get("bench_task_500")
-    end,
-    "EtsRegistry.count — ETS info" => fn ->
-      EtsRegistry.count()
-    end
-  },
-  parallel: 8,
-  time: 5,
-  warmup: 2
-)
-```
+### Run the tests
 
 ```bash
-mix run bench/ets_bench.exs
+mix test test/task_queue/ets_test.exs --trace
 ```
-
-Expected: `get` < 5us at p99 with 8 parallel readers. If you see > 50us, `get/1` is
-routing through the GenServer instead of reading ETS directly.
-
----
-
-## Trade-off analysis
-
-| Aspect | ETS `:public` (this exercise) | Agent (exercise 02) | GenServer state |
-|--------|------------------------------|---------------------|----------------|
-| Concurrent reads | True parallel — no bottleneck | Serialized through mailbox | Serialized through mailbox |
-| Atomic multi-step operations | No — read + write is not atomic | Yes — get_and_update is atomic | Yes — any handle_call is atomic |
-| Memory | Off-heap (not GC'd by owner) | Part of owner heap | Part of GenServer heap |
-| Survives owner crash | No — table destroyed | No — agent state lost | No |
-| Native TTL | No | No | No |
-| `update_counter` atomicity | Yes — single-operation atomic increment | No equivalent | Via handle_cast |
-
-Reflection question: `update_status/2` in `EtsRegistry` routes through `GenServer.call`
-to serialize the read-then-write. If two processes call `update_status("task_a", :running)`
-and `update_status("task_a", :failed)` simultaneously, what is the possible ordering of
-outcomes? Is this acceptable for a task queue, and if not, what would you change?
 
 ---
 
 ## Common production mistakes
 
 **1. Reading ETS from the GenServer instead of directly**
-If `get/1` calls `GenServer.call(__MODULE__, {:get, task_id})`, you have eliminated the
-entire concurrency benefit. The `:public` access mode exists precisely so reads bypass
-the owner process. Read directly with `:ets.lookup/2`.
+If `get/1` calls `GenServer.call`, you have eliminated the entire concurrency benefit.
 
 **2. Table destroyed when owner crashes**
-ETS tables are owned by the process that created them. If the owner crashes, the table
-is gone. Mitigation: use `:ets.give_away/3` to transfer ownership to a more stable process
-(like a long-lived Supervisor child), or recreate the table in the GenServer's `init/1`.
+ETS tables are owned by the creating process. If the owner crashes, the table is gone.
+Mitigate with `:ets.give_away/3` or recreate in `init/1`.
 
 **3. Forgetting `read_concurrency: true` on read-heavy tables**
-Without this option, ETS uses a single lock per table for reads. With `read_concurrency:
-true`, ETS uses multiple locks, allowing true parallel reads. The tradeoff is slightly
-higher write overhead, which is negligible in a read-heavy scenario.
+Without it, ETS uses a single lock per table for reads.
 
 **4. `:ets.update_counter` on a missing key without a default**
-`:ets.update_counter/3` raises `ArgumentError` if the key does not exist. Use the 4-argument
-form `:ets.update_counter(table, key, increment_spec, default_tuple)` which inserts the
-default and then increments atomically.
+The 3-argument form raises `ArgumentError` if the key does not exist. Use the 4-argument
+form with a default tuple.
 
 ---
 
 ## Resources
 
-- [`:ets` — Erlang/OTP documentation](https://www.erlang.org/doc/man/ets.html) — read the sections on type, access, and concurrency
+- [`:ets` — Erlang/OTP documentation](https://www.erlang.org/doc/man/ets.html)
 - [ETS — Elixir School](https://elixirschool.com/en/lessons/storage/ets)
-- [Plug.Session.ETS](https://github.com/elixir-plug/plug/blob/main/lib/plug/session/ets.ex) — production example of the read-heavy owner pattern
-- [Benchee](https://github.com/bencheeorg/benchee) — used for the benchmark above
+- [Benchee](https://github.com/bencheeorg/benchee)

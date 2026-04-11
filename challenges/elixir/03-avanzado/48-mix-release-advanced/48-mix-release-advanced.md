@@ -1,20 +1,13 @@
 # Production Deployment with Mix Release
 
-**Project**: `api_gateway` — built incrementally across the advanced level
+## Overview
 
----
+Ship an Elixir umbrella application to production using Mix releases. This exercise covers
+the complete production lifecycle: runtime configuration with secrets, startup validation,
+health checks for Kubernetes probes, graceful shutdown with drain support, and Docker
+multi-stage builds.
 
-## Project context
-
-The `api_gateway` umbrella is feature-complete (previous exercises). You need to ship it to
-production. `mix run` is not a deployment strategy — it requires Elixir installed on the
-target machine, doesn't handle secrets, and has no lifecycle management. Mix releases
-solve all of this: they produce a self-contained artifact that requires only the OS.
-
-This exercise covers the complete production lifecycle: configuration, health checks,
-graceful shutdown, and Docker packaging.
-
-Project structure after this exercise:
+Project structure:
 
 ```
 api_gateway_umbrella/
@@ -22,29 +15,28 @@ api_gateway_umbrella/
 │   ├── config.exs
 │   ├── dev.exs
 │   ├── test.exs
-│   └── runtime.exs         # runtime secrets and env-specific config
+│   └── runtime.exs
 ├── rel/
-│   ├── vm.args.eex          # Erlang VM arguments
+│   ├── vm.args.eex
 │   └── env.sh.eex
 ├── lib/gateway_core/
-│   ├── release.ex           # migration runner for releases
-│   └── config_validator.ex  # startup validation for required config
+│   ├── release.ex
+│   ├── config_validator.ex
+│   └── shutdown_handler.ex
 ├── lib/gateway_api_web/
-│   └── plugs/health_check.ex # K8s liveness and readiness probes
-├── Dockerfile               # multi-stage build
+│   └── plugs/health_check.ex
+├── Dockerfile
 └── k8s/
-    └── deployment.yaml      # Kubernetes manifest
+    └── deployment.yaml
 ```
 
 ---
 
 ## The business problem
 
-The ops team is deploying `api_gateway` on Kubernetes with rolling updates. Three
-requirements drive this exercise:
+The ops team deploys the gateway on Kubernetes with rolling updates. Three requirements:
 
-1. The release must fail fast at startup if required secrets are missing — not silently
-   run with empty strings
+1. The release must fail fast at startup if required secrets are missing
 2. Kubernetes must know when the pod is ready to receive traffic (readiness probe) and
    when it is still alive but not ready (liveness probe)
 3. During rolling deploys, in-flight requests must complete before the pod shuts down
@@ -53,13 +45,13 @@ requirements drive this exercise:
 
 ## Why `runtime.exs` and not `config.exs`
 
-`config.exs` and `prod.exs` are evaluated at **compile time** — when building the release.
+`config.exs` and `prod.exs` are evaluated at **compile time** -- when building the release.
 If you read `System.get_env("DATABASE_URL")` there, it reads the developer's machine
 environment, not the production server's. The value is baked into the binary.
 
-`runtime.exs` is evaluated at **startup time** — after the release is shipped to the
-production server, every time the process starts. Environment variables are read from
-the server's environment. This is where secrets belong.
+`runtime.exs` is evaluated at **startup time** -- after the release is shipped to the
+production server. Environment variables are read from the server's environment. This is
+where secrets belong.
 
 ```
 compile time                              runtime
@@ -75,9 +67,8 @@ prod.exs                                  |
 
 ### Step 1: `config/runtime.exs`
 
-All production secrets are read at startup from environment variables. The `fetch_env!/1`
-helper raises immediately with a descriptive message if a required variable is missing —
-preventing the app from starting in a misconfigured state.
+All production secrets are read at startup from environment variables. Missing required
+variables raise immediately with a descriptive message.
 
 ```elixir
 import Config
@@ -134,14 +125,13 @@ end
 ### Step 2: `lib/gateway_core/config_validator.ex`
 
 Validates that all required configuration is present before the application accepts
-traffic. Called in `Application.start/2` — crashes the boot if anything is missing.
-This catches misconfiguration at startup, not at the first request.
+traffic. Called in `Application.start/2`.
 
 ```elixir
 defmodule GatewayCore.ConfigValidator do
   @moduledoc """
   Validates required configuration is present before the application accepts traffic.
-  Called in Application.start/2 — crashes the boot if anything is missing.
+  Called in Application.start/2 -- crashes the boot if anything is missing.
   """
 
   @required [
@@ -185,17 +175,16 @@ end
 ### Step 3: `lib/gateway_api_web/plugs/health_check.ex`
 
 Health check plug registered BEFORE the Phoenix router. Kubernetes uses `/health/live`
-to determine if the process is alive, and `/health/ready` to determine if it should
-receive traffic. During graceful shutdown, `/health/ready` returns 503 so Kubernetes
-stops routing new requests to this pod.
+for liveness and `/health/ready` for readiness. During graceful shutdown, `/health/ready`
+returns 503 so Kubernetes stops routing new requests.
 
 ```elixir
 defmodule GatewayApiWeb.Plugs.HealthCheck do
   @moduledoc """
   Health check plug registered BEFORE the Phoenix router.
 
-  /health/live  — liveness: always 200 if the BEAM is running
-  /health/ready — readiness: 200 only when DB and dependencies are healthy,
+  /health/live  -- liveness: always 200 if the BEAM is running
+  /health/ready -- readiness: 200 only when DB and dependencies are healthy,
                   503 when draining (SIGTERM received)
   """
   @behaviour Plug
@@ -250,9 +239,7 @@ end
 
 ### Step 4: `lib/gateway_core/shutdown_handler.ex`
 
-Handles SIGTERM for graceful shutdown. When Kubernetes sends SIGTERM during a rolling
-deploy, this handler marks the app as draining (health check returns 503), pauses Oban
-queues, and waits for in-flight requests to complete before shutting down.
+Handles SIGTERM for graceful shutdown during rolling deploys.
 
 ```elixir
 defmodule GatewayCore.ShutdownHandler do
@@ -273,16 +260,12 @@ defmodule GatewayCore.ShutdownHandler do
   def handle_info({:signal, :sigterm}, state) do
     Logger.info("SIGTERM received -- starting graceful drain")
 
-    # Mark the app as draining — health check /ready will return 503.
-    # Kubernetes will stop routing new traffic here within ~5s.
     :persistent_term.put(:app_draining, true)
 
-    # Pause Oban queues — don't start new jobs, let running ones finish
     Oban.pause_queue(queue: :notifications)
     Oban.pause_queue(queue: :audit)
     Oban.pause_queue(queue: :reports)
 
-    # Force shutdown after drain timeout
     Process.send_after(self(), :force_shutdown, @drain_timeout_ms)
 
     {:noreply, %{state | draining: true}}
@@ -299,8 +282,7 @@ end
 
 ### Step 5: `lib/gateway_core/release.ex`
 
-Migration runner for releases. Called via `eval` in deployment scripts before starting
-the application. This avoids requiring Mix on the production server.
+Migration runner for releases. Called via `eval` in deployment scripts.
 
 ```elixir
 defmodule GatewayCore.Release do
@@ -333,37 +315,27 @@ end
 
 ### Step 6: `rel/vm.args.eex`
 
-Erlang VM arguments control process limits, crash dump behavior, and distributed
-Erlang naming. These are evaluated at release start time using EEx.
+Erlang VM arguments control process limits, crash dump behavior, and distributed Erlang.
 
 ```
-## Erlang VM arguments — evaluated at release start
+## Erlang VM arguments -- evaluated at release start
 
-# Node name for distributed Erlang (clustering)
 -name api_gateway@<%= System.get_env("HOSTNAME", "localhost") %>
-
-# Cluster cookie — override with RELEASE_COOKIE env var in production
 -setcookie <%= System.get_env("RELEASE_COOKIE", "dev-insecure-cookie") %>
 
-# Max concurrent processes (default 262144; increase for high-connection gateways)
 +P 524288
-
-# Max ports (network connections + file descriptors)
 +Q 65536
 
-# Crash dump location — keep out of the app directory
 -env ERL_CRASH_DUMP /tmp/erl_crash.dump
 -env ERL_CRASH_DUMP_SECONDS 5
 
-# Suppress SASL progress reports (use Logger instead)
 -logger sasl_error_logger false
 ```
 
 ### Step 7: Dockerfile (multi-stage)
 
 The multi-stage build separates compilation from the runtime image. The first stage
-installs Elixir and compiles the release; the second stage copies only the compiled
-release into a minimal Debian image. This produces a ~100MB image instead of ~1GB.
+compiles the release; the second copies only the compiled release into a minimal image.
 
 ```dockerfile
 # -- Stage 1: Build --
@@ -375,7 +347,6 @@ WORKDIR /app
 
 RUN mix local.hex --force && mix local.rebar --force
 
-# Copy dependency manifests first — Docker layer cache
 COPY mix.exs mix.lock ./
 COPY apps/gateway_core/mix.exs      apps/gateway_core/
 COPY apps/gateway_api/mix.exs       apps/gateway_api/
@@ -384,7 +355,6 @@ COPY apps/gateway_workers/mix.exs   apps/gateway_workers/
 RUN MIX_ENV=prod mix deps.get --only prod
 RUN MIX_ENV=prod mix deps.compile
 
-# Copy source
 COPY config config
 COPY apps apps
 COPY rel rel
@@ -414,7 +384,6 @@ ENV HOME=/app MIX_ENV=prod
 
 EXPOSE 4000
 
-# Migrations run first; app starts after
 ENTRYPOINT ["./bin/api_gateway_umbrella"]
 CMD ["start"]
 ```
@@ -432,7 +401,7 @@ spec:
     type: RollingUpdate
     rollingUpdate:
       maxSurge: 1
-      maxUnavailable: 0          # zero-downtime rolling update
+      maxUnavailable: 0
   template:
     spec:
       containers:
@@ -467,7 +436,7 @@ spec:
         lifecycle:
           preStop:
             exec:
-              command: ["sleep", "5"]  # allow k8s to update endpoints before drain
+              command: ["sleep", "5"]
         resources:
           requests:
             memory: "256Mi"
@@ -477,7 +446,7 @@ spec:
             cpu: "1000m"
 ```
 
-### Step 9: Given tests — must pass without modification
+### Step 9: Tests
 
 ```elixir
 # test/gateway_core/config_validator_test.exs
@@ -487,7 +456,6 @@ defmodule GatewayCore.ConfigValidatorTest do
   alias GatewayCore.ConfigValidator
 
   test "validate! passes with all required config present" do
-    # All required keys are set in test.exs
     assert :ok = ConfigValidator.validate!()
   end
 
@@ -532,17 +500,13 @@ end
 ### Step 10: Build and run the release
 
 ```bash
-# Build
 MIX_ENV=prod mix release
 
-# Run migrations before first start
 ./_build/prod/rel/api_gateway_umbrella/bin/api_gateway_umbrella \
   eval "GatewayCore.Release.migrate()"
 
-# Start
 ./_build/prod/rel/api_gateway_umbrella/bin/api_gateway_umbrella start
 
-# Connect an IEx remote shell
 ./_build/prod/rel/api_gateway_umbrella/bin/api_gateway_umbrella remote
 ```
 
@@ -557,10 +521,6 @@ MIX_ENV=prod mix release
 | Config at compile time | no (runtime.exs) | no | no |
 | Startup validation | explicit (ConfigValidator) | manual | manual |
 | Health check integration | explicit Plug | must add | must add |
-
-Reflection: the `preStop: sleep 5` in the Kubernetes manifest adds 5 seconds to every
-pod shutdown. Why is this necessary? What happens without it when Kubernetes is doing a
-rolling update? (Hint: endpoint controller propagation delay.)
 
 ---
 
@@ -577,12 +537,10 @@ An app that starts with `jwt_secret: nil` accepts all tokens (or crashes on firs
 **3. `/health/ready` returning 200 during drain**
 Kubernetes uses the readiness probe to decide whether to send traffic to a pod. If it
 returns 200 during drain, the pod continues receiving new requests while shutting down.
-`persistent_term` is the right mechanism — it's readable without any process hop.
 
 **4. Not running `migrate/0` before starting the app**
 Rolling out a new release with DB schema changes before running migrations causes
-Ecto query failures on the new code. The Dockerfile `ENTRYPOINT` should run
-`eval "GatewayCore.Release.migrate()"` before `start`.
+Ecto query failures. The Dockerfile `ENTRYPOINT` should run migrations before `start`.
 
 **5. Multi-stage Dockerfile skipping layer cache for deps**
 Copying all source files before `mix deps.get` means every code change rebuilds
@@ -593,7 +551,6 @@ then copy source.
 
 ## Resources
 
-- [Mix Release docs](https://hexdocs.pm/mix/Mix.Tasks.Release.html) — comprehensive release configuration
-- [Distillery to Mix Release migration guide](https://elixirforum.com/t/distillery-to-mix-releases/26904)
-- [Kubernetes probes](https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/) — liveness vs readiness
-- [hexpm/elixir Docker images](https://hub.docker.com/r/hexpm/elixir) — official multi-arch images
+- [Mix Release docs](https://hexdocs.pm/mix/Mix.Tasks.Release.html) -- comprehensive release configuration
+- [Kubernetes probes](https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/) -- liveness vs readiness
+- [hexpm/elixir Docker images](https://hub.docker.com/r/hexpm/elixir) -- official multi-arch images

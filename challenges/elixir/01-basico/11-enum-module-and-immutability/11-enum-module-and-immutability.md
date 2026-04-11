@@ -1,35 +1,19 @@
 # Enum and Immutability: Transaction Analytics
 
-**Project**: `payments_cli` — built incrementally across the basic level
+**Project**: `payments_cli` — a CLI tool that processes payment transactions
 
 ---
 
 ## Project context
 
-You're building `payments_cli`. The reporting system needs to compute analytics
-over transaction lists: totals by category, top merchants, daily summaries.
-The `Enum` module is the primary tool. This exercise focuses on WHY immutability
-and eager evaluation have concrete consequences in a production system.
+You are building `payments_cli`, a CLI tool that processes payment transactions from CSV
+files, validates them, applies business rules, and produces ledger reports.
 
-Project structure at this point:
-
-```
-payments_cli/
-├── lib/
-│   └── payments_cli/
-│       ├── cli.ex
-│       ├── transaction.ex
-│       ├── ledger.ex
-│       ├── formatter.ex
-│       ├── pipeline.ex
-│       ├── processor.ex
-│       ├── router.ex
-│       └── analytics.ex    # ← you implement this
-├── test/
-│   └── payments_cli/
-│       └── analytics_test.exs  # given tests — must pass without modification
-└── mix.exs
-```
+This exercise implements an `Analytics` module that computes analytics over transaction
+lists: revenue statistics, top merchants by volume, daily summaries, and suspicious
+pattern detection. The focus is on why immutability and eager evaluation have concrete
+consequences in a production system, and how the `Enum` module is the primary tool for
+all these operations.
 
 ---
 
@@ -231,7 +215,7 @@ end
   `Enum.min/1` on an empty list raises, so we check first. `div(total, count)` gives
   integer division for the average, which is appropriate for cent-denominated amounts.
 
-- `top_merchants/2` chains filter → group → map → sort → take. The sort key
+- `top_merchants/2` chains filter -> group -> map -> sort -> take. The sort key
   `{-total, merchant}` sorts by total descending (negative for descending) and
   alphabetically by name for ties. `Enum.take/2` returns at most `n` elements,
   handling the case where fewer merchants exist.
@@ -245,7 +229,7 @@ end
   for deterministic output. The sort ensures test assertions work regardless of
   map iteration order.
 
-### Given tests — must pass without modification
+### Tests
 
 ```elixir
 # test/payments_cli/analytics_test.exs

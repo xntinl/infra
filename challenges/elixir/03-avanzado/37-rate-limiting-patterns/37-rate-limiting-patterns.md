@@ -1,18 +1,17 @@
 # Rate Limiting Patterns
 
-**Project**: `api_gateway` — built incrementally across the advanced level
+**Project**: `api_gateway` — a standalone HTTP gateway exercise
 
 ---
 
 ## Project context
 
-`api_gateway` already has a sliding-window rate limiter from the intermediate level
-(exercise 71). The operations team now needs two additional algorithms for different
-traffic shapes: a token bucket for APIs that tolerate controlled bursts, and a sliding
-window counter that scales to high traffic without memory growing proportionally to
-requests-per-window.
+You are building `api_gateway`, an HTTP gateway that routes traffic to microservices. The
+operations team needs two rate limiting algorithms for different traffic shapes: a token
+bucket for APIs that tolerate controlled bursts, and a sliding window counter that scales
+to high traffic without memory growing proportionally to requests-per-window.
 
-Project structure at this point:
+Project structure:
 
 ```
 api_gateway/
@@ -21,13 +20,12 @@ api_gateway/
 │       ├── application.ex
 │       ├── router.ex
 │       └── rate_limiter/
-│           ├── sliding_window.ex         # from exercise 71 (keep as-is)
-│           ├── token_bucket.ex           # ← you implement this (Exercise 1)
-│           └── sliding_window_counter.ex # ← you implement this (Exercise 2)
+│           ├── token_bucket.ex           # ← token bucket with lazy refill
+│           └── sliding_window_counter.ex # ← O(1) memory sliding window
 ├── test/
 │   └── api_gateway/
 │       └── rate_limiter/
-│           ├── token_bucket_test.exs      # given tests
+│           ├── token_bucket_test.exs
 │           └── sliding_window_counter_test.exs
 └── mix.exs
 ```

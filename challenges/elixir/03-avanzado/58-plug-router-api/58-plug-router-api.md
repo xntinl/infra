@@ -1,28 +1,17 @@
 # Plug.Router — API Layer without Phoenix
 
-**Project**: `api_gateway` — built incrementally across the advanced level
-
----
-
 ## Project context
 
-You're building `api_gateway`. The middleware pipeline is working (previous exercise).
-Now you need the router layer that handles the actual HTTP routes the gateway exposes
-to internal callers: a service registry, health checks, and a chunked streaming endpoint
-for log tailing.
+You are building `api_gateway`, an internal HTTP gateway. This exercise builds the router layer that handles the actual HTTP routes the gateway exposes to internal callers: a service registry, health checks, and a chunked streaming endpoint for log tailing. All modules are defined from scratch.
 
-Project structure at this point:
+Project structure:
 
 ```
 api_gateway/
 ├── lib/
 │   └── api_gateway/
-│       ├── application.ex          # already exists
-│       ├── router.ex               # routes for the management API
 │       ├── service_store.ex        # Agent-backed service registry
-│       ├── endpoint.ex             # error wrapper
-│       └── middleware/
-│           └── pipeline.ex         # already exists
+│       └── router.ex               # routes for the management API
 ├── test/
 │   └── api_gateway/
 │       └── router_test.exs         # given tests — must pass without modification
@@ -42,42 +31,45 @@ The gateway needs to expose its own management API so operators can:
 5. **Health check** — `GET /health` — always returns 200 so load balancers can probe it
 6. **Stream gateway logs** — `GET /logs/stream` — chunked response, one line per chunk
 
-The backend data store is an `Agent` holding a map — simple enough. The same pattern
-applies when you swap it for Ecto later.
+The backend data store is an `Agent` holding a map — simple enough. The same pattern applies when you swap it for Ecto later.
 
 ---
 
 ## Why learn Plug.Router before Phoenix
 
-Phoenix.Router is `Plug.Router` with extra macros. Every concept here — path params,
-body parsing, the dispatch plug, catch-all routes — appears verbatim in Phoenix. When
-something breaks in a Phoenix app, the debugger lands you in Plug.Router code. If you
-have never read it, you cannot diagnose it.
+Phoenix.Router is `Plug.Router` with extra macros. Every concept here — path params, body parsing, the dispatch plug, catch-all routes — appears verbatim in Phoenix. When something breaks in a Phoenix app, the debugger lands you in Plug.Router code. If you have never read it, you cannot diagnose it.
 
-Additionally, the gateway itself is a service. It should be as thin as possible. Pulling
-in Phoenix for a 6-route internal API adds 40+ transitive dependencies and a supervisor
-tree you don't need.
+Additionally, the gateway itself is a service. It should be as thin as possible. Pulling in Phoenix for a 6-route internal API adds 40+ transitive dependencies and a supervisor tree you don't need.
 
 ---
 
 ## Why route order matters in `Plug.Router`
 
-`Plug.Router` compiles routes into a function with pattern-matched clauses in declaration
-order. The first matching clause wins. This means:
+`Plug.Router` compiles routes into a function with pattern-matched clauses in declaration order. The first matching clause wins. This means:
 
 ```elixir
 get "/services/health"  # specific — must come before the dynamic route
 get "/services/:name"   # matches anything, including "health"
 ```
 
-If you declare the dynamic route first, `GET /services/health` will be captured by
-`get "/services/:name"` with `conn.path_params["name"] == "health"`.
+If you declare the dynamic route first, `GET /services/health` will be captured by `get "/services/:name"` with `conn.path_params["name"] == "health"`.
 
 ---
 
 ## Implementation
 
-### Step 1: `lib/api_gateway/service_store.ex`
+### Step 1: `mix.exs` — dependencies
+
+```elixir
+defp deps do
+  [
+    {:plug_cowboy, "~> 2.7"},
+    {:jason, "~> 1.4"}
+  ]
+end
+```
+
+### Step 2: `lib/api_gateway/service_store.ex`
 
 ```elixir
 defmodule ApiGateway.ServiceStore do
@@ -89,12 +81,16 @@ defmodule ApiGateway.ServiceStore do
   """
   use Agent
 
+  @spec start_link(keyword()) :: Agent.on_start()
   def start_link(_opts), do: Agent.start_link(fn -> %{} end, name: __MODULE__)
 
+  @spec list() :: [map()]
   def list, do: Agent.get(__MODULE__, &Map.values/1)
 
+  @spec get(String.t()) :: map() | nil
   def get(name), do: Agent.get(__MODULE__, &Map.get(&1, name))
 
+  @spec register(map()) :: map()
   def register(attrs) do
     Agent.get_and_update(__MODULE__, fn services ->
       entry = Map.merge(attrs, %{"registered_at" => DateTime.utc_now() |> DateTime.to_iso8601()})
@@ -102,6 +98,7 @@ defmodule ApiGateway.ServiceStore do
     end)
   end
 
+  @spec deregister(String.t()) :: :ok | :error
   def deregister(name) do
     Agent.get_and_update(__MODULE__, fn services ->
       case Map.pop(services, name) do
@@ -113,10 +110,16 @@ defmodule ApiGateway.ServiceStore do
 end
 ```
 
-### Step 2: `lib/api_gateway/router.ex`
+### Step 3: `lib/api_gateway/router.ex`
 
 ```elixir
 defmodule ApiGateway.Router do
+  @moduledoc """
+  HTTP router for the api_gateway management API.
+
+  Uses Plug.Router to define routes for service registration,
+  health checks, and log streaming. All routes return JSON.
+  """
   use Plug.Router
   import Plug.Conn
 
@@ -124,11 +127,6 @@ defmodule ApiGateway.Router do
   # :match   — finds the matching route clause
   # Parsers  — parses the JSON body (only after :match, so non-JSON routes skip it)
   # :dispatch — runs the matched route handler
-  #
-  # Design question: why put Plug.Parsers between :match and :dispatch?
-  # If you put it before :match, every request pays the JSON parse cost —
-  # including GET requests that have no body. After :match, only matched
-  # routes that need a body will have it parsed.
   plug :match
 
   plug Plug.Parsers,
@@ -214,64 +212,11 @@ defmodule ApiGateway.Router do
 end
 ```
 
-The `post "/services"` route validates that both `name` and `url` are present and
-non-empty strings before registering. `conn.body_params` is populated by `Plug.Parsers`
-after the `:match` plug runs, so it is available in the route handler. The `cond`
-validates each field and returns a 422 with a specific error message for the first
-violation found.
+The `post "/services"` route validates that both `name` and `url` are present and non-empty strings before registering. `conn.body_params` is populated by `Plug.Parsers` after the `:match` plug runs, so it is available in the route handler.
 
-The `get "/logs/stream"` route demonstrates chunked transfer encoding.
-`send_chunked/2` flushes the HTTP headers immediately with `Transfer-Encoding: chunked`.
-Each `chunk/2` call writes one frame to the wire. `Enum.reduce_while/3` provides a
-clean way to stop early if the client disconnects: `chunk/2` returns
-`{:error, :closed}` when the TCP connection is gone, and the reducer halts.
+The `get "/logs/stream"` route demonstrates chunked transfer encoding. `send_chunked/2` flushes the HTTP headers immediately with `Transfer-Encoding: chunked`. Each `chunk/2` call writes one frame to the wire. `Enum.reduce_while/3` provides a clean way to stop early if the client disconnects.
 
-The 50ms sleep between chunks simulates real-time log tailing. Without it, all 20
-lines would arrive in a burst and the streaming behaviour would be indistinguishable
-from a regular buffered response.
-
-### Step 3: `lib/api_gateway/endpoint.ex`
-
-```elixir
-defmodule ApiGateway.Endpoint do
-  @moduledoc """
-  The outermost plug. Wraps the middleware pipeline + router with a rescue
-  clause so unhandled exceptions return a structured 500 instead of a raw
-  Cowboy error page.
-  """
-  use Plug.Builder
-  import Plug.Conn
-
-  plug ApiGateway.Middleware.Pipeline
-  plug ApiGateway.Router
-
-  @impl true
-  def call(conn, opts) do
-    super(conn, opts)
-  rescue
-    e ->
-      conn
-      |> put_resp_content_type("application/json")
-      |> send_resp(500, Jason.encode!(%{
-        error: "internal server error",
-        message: Exception.message(e)
-      }))
-  end
-end
-```
-
-### Step 4: `lib/api_gateway/application.ex` additions
-
-```elixir
-# In the children list — add ServiceStore and Cowboy
-children = [
-  ApiGateway.ServiceStore,
-  ApiGateway.RateLimiter.Server,
-  {Plug.Cowboy, scheme: :http, plug: ApiGateway.Endpoint, options: [port: 4000]}
-]
-```
-
-### Step 5: Given tests — must pass without modification
+### Step 4: Given tests — must pass without modification
 
 ```elixir
 # test/api_gateway/router_test.exs
@@ -358,24 +303,11 @@ defmodule ApiGateway.RouterTest do
 end
 ```
 
-### Step 6: Run tests
+### Step 5: Run tests
 
 ```bash
 mix test test/api_gateway/router_test.exs --trace
 ```
-
-### Step 7: Manual test of chunked streaming
-
-```bash
-mix run --no-halt
-
-# Watch log lines arrive in real time
-curl -N http://localhost:4000/logs/stream
-```
-
-The `-N` flag disables curl's output buffering so you see chunks as they arrive.
-If you see all lines at once at the end, the server is buffering — verify your
-implementation calls `chunk/2` for each line and not `send_resp/3` at the end.
 
 ---
 
@@ -385,43 +317,31 @@ implementation calls `chunk/2` for each line and not `send_resp/3` at the end.
 |--------|---------------|----------------|------------|
 | Body parsing | Manual `Plug.Parsers` | Auto in Endpoint | Manual |
 | Path params | `conn.path_params` | Same | Manual matching |
-| Error handling | `rescue` in Endpoint | `ErrorView` | Manual |
+| Error handling | `rescue` in wrapper | `ErrorView` | Manual |
 | Streaming | `send_chunked` + `chunk` | Same | `:cowboy_req.stream_body` |
 | WebSockets | Not built-in | Phoenix.Channel | `:cowboy_websocket` |
 | When to use | Thin gateways, sidecars | Full apps | Protocol-level control |
 
-Reflection question: `conn.body_params` is only populated after `Plug.Parsers` runs.
-What happens if a client sends `Content-Type: text/plain` and your `Plug.Parsers` config
-only lists `[:json]`? What does `conn.body_params` contain? Test it.
+Reflection question: `conn.body_params` is only populated after `Plug.Parsers` runs. What happens if a client sends `Content-Type: text/plain` and your `Plug.Parsers` config only lists `[:json]`? What does `conn.body_params` contain? Test it.
 
 ---
 
 ## Common production mistakes
 
 **1. `Plug.Parsers` before `:match`**
-Every request — including GET /health — would pay the JSON parse cost. For a gateway
-handling thousands of requests per second, this adds measurable latency on routes that
-need no body at all.
+Every request — including GET /health — would pay the JSON parse cost. For a gateway handling thousands of requests per second, this adds measurable latency on routes that need no body at all.
 
 **2. Dynamic route before specific route**
-`get "/services/:name"` declared before `get "/services/health"` will capture the
-literal path `/services/health` as a dynamic match. Your explicit route never fires.
-Plug.Router does not reorder routes — declaration order is execution order.
+`get "/services/:name"` declared before `get "/services/health"` will capture the literal path `/services/health` as a dynamic match. Your explicit route never fires. Plug.Router does not reorder routes — declaration order is execution order.
 
 **3. `send_chunked/2` then modifying headers**
-`send_chunked/2` flushes the HTTP response headers immediately. Any `put_resp_header/3`
-call after it is silently ignored — the headers are already on the wire. Set all headers
-before calling `send_chunked/2`.
+`send_chunked/2` flushes the HTTP response headers immediately. Any `put_resp_header/3` call after it is silently ignored — the headers are already on the wire. Set all headers before calling `send_chunked/2`.
 
 **4. Missing catch-all**
-Without `match _`, Plug.Router raises `Plug.Router.NoRouteError` for unmatched paths.
-Cowboy converts this to a 500. Your callers receive "internal server error" instead of
-"route not found" — confusing and hard to debug.
+Without `match _`, Plug.Router raises `Plug.Router.NoRouteError` for unmatched paths. Cowboy converts this to a 500. Your callers receive "internal server error" instead of "route not found" — confusing and hard to debug.
 
 **5. Not handling `{:error, :closed}` in chunked responses**
-If the client disconnects mid-stream, `chunk/2` returns `{:error, :closed}`. Ignoring
-this causes a crash in the process handling that request. Use `Enum.reduce_while/3` to
-stop cleanly on the first `:closed` error.
+If the client disconnects mid-stream, `chunk/2` returns `{:error, :closed}`. Ignoring this causes a crash in the process handling that request. Use `Enum.reduce_while/3` to stop cleanly on the first `:closed` error.
 
 ---
 

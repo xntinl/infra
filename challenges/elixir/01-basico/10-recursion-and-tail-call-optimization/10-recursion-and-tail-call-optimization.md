@@ -1,34 +1,18 @@
 # Recursion and TCO: Building the Transaction Report
 
-**Project**: `payments_cli` — built incrementally across the basic level
+**Project**: `payments_cli` — a CLI tool that processes payment transactions
 
 ---
 
 ## Project context
 
-You're building `payments_cli`. The `Ledger` module needs functions that walk a
-list of transactions to compute reports. This exercise explores recursion as the
-fundamental loop mechanism in Elixir, and why tail-call optimization (TCO) determines
-whether your code handles 1,000 transactions or 1,000,000.
+You are building `payments_cli`, a CLI tool that processes payment transactions from CSV
+files, validates them, applies business rules, and produces ledger reports.
 
-Project structure at this point:
-
-```
-payments_cli/
-├── lib/
-│   └── payments_cli/
-│       ├── cli.ex
-│       ├── transaction.ex
-│       ├── ledger.ex           # ← you extend this
-│       ├── formatter.ex
-│       ├── pipeline.ex
-│       ├── processor.ex
-│       └── router.ex
-├── test/
-│   └── payments_cli/
-│       └── ledger_recursion_test.exs  # given tests — must pass without modification
-└── mix.exs
-```
+This exercise implements report-building functions in a `Ledger` module using tail-recursive
+algorithms. These functions walk lists of transactions to count by status, filter by
+threshold, and build CSV report strings. Understanding tail-call optimization (TCO)
+determines whether your code handles 1,000 transactions or 1,000,000.
 
 ---
 
@@ -64,7 +48,7 @@ by moving the "work in progress" into an argument.
 
 ## The business problem
 
-Extend the `Ledger` module with report-building functions that must handle large
+The `Ledger` module needs report-building functions that must handle large
 transaction lists without stack overflow:
 
 1. Count transactions by status (tail-recursive counter)
@@ -76,7 +60,7 @@ transaction lists without stack overflow:
 
 ## Implementation
 
-### Extend `lib/payments_cli/ledger.ex`
+### `lib/payments_cli/ledger.ex`
 
 Each function uses the accumulator pattern for tail recursion. The public function
 accepts the user-facing arguments and delegates to a private helper that adds the
@@ -84,95 +68,103 @@ accumulator. The private helper has three clauses: base case (empty list), match
 case (element qualifies), and non-matching case (skip and continue).
 
 ```elixir
-# Add to PaymentsCli.Ledger
+defmodule PaymentsCli.Ledger do
+  @moduledoc """
+  Report-building functions for the payments ledger.
 
-@doc """
-Counts the number of transactions matching the given status.
+  All list-processing functions use tail-recursive implementations
+  with the accumulator pattern, ensuring constant stack usage
+  regardless of input size. Safe for million-row transaction exports.
+  """
 
-Implemented with TCO — safe for arbitrarily long transaction lists.
+  @doc """
+  Counts the number of transactions matching the given status.
 
-## Examples
+  Implemented with TCO — safe for arbitrarily long transaction lists.
 
-    iex> txs = [%{status: :approved}, %{status: :declined}, %{status: :approved}]
-    iex> PaymentsCli.Ledger.count_by_status(txs, :approved)
-    2
+  ## Examples
 
-"""
-@spec count_by_status([map()], atom()) :: non_neg_integer()
-def count_by_status(transactions, status) when is_list(transactions) and is_atom(status) do
-  count_by_status(transactions, status, 0)
-end
+      iex> txs = [%{status: :approved}, %{status: :declined}, %{status: :approved}]
+      iex> PaymentsCli.Ledger.count_by_status(txs, :approved)
+      2
 
-defp count_by_status([], _status, acc), do: acc
+  """
+  @spec count_by_status([map()], atom()) :: non_neg_integer()
+  def count_by_status(transactions, status) when is_list(transactions) and is_atom(status) do
+    count_by_status(transactions, status, 0)
+  end
 
-defp count_by_status([%{status: s} | rest], status, acc) when s == status do
-  count_by_status(rest, status, acc + 1)
-end
+  defp count_by_status([], _status, acc), do: acc
 
-defp count_by_status([_ | rest], status, acc) do
-  count_by_status(rest, status, acc)
-end
+  defp count_by_status([%{status: s} | rest], status, acc) when s == status do
+    count_by_status(rest, status, acc + 1)
+  end
 
-@doc """
-Returns all transactions where amount_cents exceeds the threshold.
+  defp count_by_status([_ | rest], status, acc) do
+    count_by_status(rest, status, acc)
+  end
 
-Tail-recursive. Preserves order of the original list.
+  @doc """
+  Returns all transactions where amount_cents exceeds the threshold.
 
-## Examples
+  Tail-recursive. Preserves order of the original list.
 
-    iex> txs = [%{id: "A", amount_cents: 100}, %{id: "B", amount_cents: 500}, %{id: "C", amount_cents: 50}]
-    iex> PaymentsCli.Ledger.above_threshold(txs, 200)
-    [%{id: "B", amount_cents: 500}]
+  ## Examples
 
-"""
-@spec above_threshold([map()], integer()) :: [map()]
-def above_threshold(transactions, threshold_cents)
-    when is_list(transactions) and is_integer(threshold_cents) do
-  do_above_threshold(transactions, threshold_cents, [])
-end
+      iex> txs = [%{id: "A", amount_cents: 100}, %{id: "B", amount_cents: 500}, %{id: "C", amount_cents: 50}]
+      iex> PaymentsCli.Ledger.above_threshold(txs, 200)
+      [%{id: "B", amount_cents: 500}]
 
-defp do_above_threshold([], _threshold, acc), do: Enum.reverse(acc)
+  """
+  @spec above_threshold([map()], integer()) :: [map()]
+  def above_threshold(transactions, threshold_cents)
+      when is_list(transactions) and is_integer(threshold_cents) do
+    do_above_threshold(transactions, threshold_cents, [])
+  end
 
-defp do_above_threshold([%{amount_cents: amount} = tx | rest], threshold, acc)
-     when amount > threshold do
-  do_above_threshold(rest, threshold, [tx | acc])
-end
+  defp do_above_threshold([], _threshold, acc), do: Enum.reverse(acc)
 
-defp do_above_threshold([_ | rest], threshold, acc) do
-  do_above_threshold(rest, threshold, acc)
-end
+  defp do_above_threshold([%{amount_cents: amount} = tx | rest], threshold, acc)
+       when amount > threshold do
+    do_above_threshold(rest, threshold, [tx | acc])
+  end
 
-@doc """
-Builds a CSV report string from a list of transactions.
+  defp do_above_threshold([_ | rest], threshold, acc) do
+    do_above_threshold(rest, threshold, acc)
+  end
 
-Format: one line per transaction, comma-separated, with header row.
-"id,amount_cents,currency,status\n" + one line per transaction.
+  @doc """
+  Builds a CSV report string from a list of transactions.
 
-Tail-recursive — builds the line list with prepend, then joins at the end.
+  Format: one line per transaction, comma-separated, with header row.
+  "id,amount_cents,currency,status\\n" + one line per transaction.
 
-## Examples
+  Tail-recursive — builds the line list with prepend, then joins at the end.
 
-    iex> txs = [%{id: "T1", amount_cents: 1000, currency: "USD", status: :approved}]
-    iex> report = PaymentsCli.Ledger.to_csv(txs)
-    iex> String.starts_with?(report, "id,amount_cents,currency,status")
-    true
-    iex> String.contains?(report, "T1,1000,USD,approved")
-    true
+  ## Examples
 
-"""
-@spec to_csv([map()]) :: String.t()
-def to_csv(transactions) when is_list(transactions) do
-  header = "id,amount_cents,currency,status"
-  lines = build_csv_lines(transactions, [])
-  all_lines = [header | Enum.reverse(lines)]
-  Enum.join(all_lines, "\n")
-end
+      iex> txs = [%{id: "T1", amount_cents: 1000, currency: "USD", status: :approved}]
+      iex> report = PaymentsCli.Ledger.to_csv(txs)
+      iex> String.starts_with?(report, "id,amount_cents,currency,status")
+      true
+      iex> String.contains?(report, "T1,1000,USD,approved")
+      true
 
-defp build_csv_lines([], acc), do: acc
+  """
+  @spec to_csv([map()]) :: String.t()
+  def to_csv(transactions) when is_list(transactions) do
+    header = "id,amount_cents,currency,status"
+    lines = build_csv_lines(transactions, [])
+    all_lines = [header | Enum.reverse(lines)]
+    Enum.join(all_lines, "\n")
+  end
 
-defp build_csv_lines([tx | rest], acc) do
-  line = "#{tx.id},#{tx.amount_cents},#{tx.currency},#{tx.status}"
-  build_csv_lines(rest, [line | acc])
+  defp build_csv_lines([], acc), do: acc
+
+  defp build_csv_lines([tx | rest], acc) do
+    line = "#{tx.id},#{tx.amount_cents},#{tx.currency},#{tx.status}"
+    build_csv_lines(rest, [line | acc])
+  end
 end
 ```
 
@@ -194,7 +186,7 @@ end
 - All three functions are safe for 100k+ elements because every recursive call is a
   tail call — the BEAM reuses the current stack frame.
 
-### Given tests — must pass without modification
+### Tests
 
 ```elixir
 # test/payments_cli/ledger_recursion_test.exs
@@ -339,7 +331,7 @@ The accumulator reverses the order because `[new_item | acc]` prepends. Without
 bugs in ordered reports that are hard to catch without a large test dataset.
 
 **4. Using `++` in the accumulator**
-`acc ++ [new_item]` in every recursive step is O(n²). Use `[new_item | acc]` then
+`acc ++ [new_item]` in every recursive step is O(n^2). Use `[new_item | acc]` then
 reverse once. With 100k transactions, the difference is milliseconds vs minutes.
 
 **5. Reinventing `Enum` in production code**
@@ -355,4 +347,4 @@ the Enum API (tree traversal, state machines, non-linear accumulation).
 - [Recursion — Elixir Getting Started](https://elixir-lang.org/getting-started/recursion.html)
 - [Erlang Efficiency Guide — Tail Recursion](https://www.erlang.org/doc/efficiency_guide/eff_guide.html)
 - [Enum — HexDocs](https://hexdocs.pm/elixir/Enum.html)
-- [Elixir in Action — Saša Jurić — Chapter 3 (recursion and loops)](https://www.manning.com/books/elixir-in-action-third-edition)
+- [Elixir in Action — Sasa Juric — Chapter 3 (recursion and loops)](https://www.manning.com/books/elixir-in-action-third-edition)

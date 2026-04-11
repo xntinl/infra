@@ -1,18 +1,19 @@
 # NIFs with Rustler
 
-**Project**: `api_gateway` — built incrementally across the advanced level
+**Project**: `api_gateway` — a standalone HTTP gateway exercise
 
 ---
 
 ## Project context
 
-`api_gateway` hashes request signatures for cache keys and idempotency checks. The current
+You are building `api_gateway`, an HTTP gateway that routes traffic to microservices. The
+gateway hashes request signatures for cache keys and idempotency checks. The current
 Elixir implementation of SHA-256 uses `:crypto`, which is adequate for low throughput.
 Under sustained load (10,000 req/s), profiling shows `:crypto.hash/2` accounts for 8% of
 CPU time. The team wants to explore whether a Rust NIF can improve this, and to understand
 the risks before committing.
 
-Project structure at this point:
+Project structure:
 
 ```
 api_gateway/
@@ -20,15 +21,14 @@ api_gateway/
 │   └── api_gateway/
 │       ├── application.ex
 │       ├── router.ex
-│       ├── rate_limiter/
 │       └── cache/
-│           ├── hasher.ex               # ← you implement this (Elixir wrapper)
+│           ├── hasher.ex               # ← Elixir wrapper
 │           └── hasher_bench.exs
 ├── native/
 │   └── gateway_hasher/
-│       ├── Cargo.toml                  # ← you create this
+│       ├── Cargo.toml
 │       └── src/
-│           └── lib.rs                  # ← and this
+│           └── lib.rs
 ├── test/
 │   └── api_gateway/
 │       └── cache/

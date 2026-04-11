@@ -1,48 +1,11 @@
 # GenServer: Stateful Process with a Clear API
 
-**Project**: `task_queue` — built incrementally across the intermediate level
+## Why GenServer
 
----
-
-## Project context
-
-The task_queue system needs a **queue server**: a process that accepts incoming job
-submissions from multiple clients, maintains an ordered list of pending jobs, and dispenses
-them to workers on demand. The raw process from exercise 01 worked, but GenServer brings
-two things that matter in production: a structured callback model that separates the
-public API from internal state management, and built-in integration with Supervisor.
-
-Project structure at this point:
-
-```
-task_queue/
-├── lib/
-│   └── task_queue/
-│       ├── worker_process.ex    # exercise 01
-│       ├── task_registry.ex     # exercise 02
-│       ├── batch_runner.ex      # exercise 03
-│       └── queue_server.ex
-├── test/
-│   └── task_queue/
-│       └── queue_server_test.exs   # given tests — must pass without modification
-└── mix.exs
-```
-
----
-
-## Why GenServer and not Agent
-
-Agent works when you only need to read and transform a value. The queue server has
-richer needs:
-
-- `push/1` is fire-and-forget: the caller does not wait for confirmation.
-- `pop/0` is synchronous: the caller blocks until a job is returned.
-- `pop/0` when the queue is empty should return `{:error, :empty}` — not crash.
-- A periodic cleanup timer must remove jobs that have been queued longer than a deadline.
-
-Agent only exposes `get/update/get_and_update`. GenServer exposes `call` (synchronous),
-`cast` (asynchronous), and `handle_info` (timer messages and raw sends). The queue server
-needs all three.
+GenServer brings two things that matter in production: a structured callback model that
+separates the public API from internal state management, and built-in integration with
+Supervisor. Agent only exposes `get/update/get_and_update`. GenServer exposes `call`
+(synchronous), `cast` (asynchronous), and `handle_info` (timer messages and raw sends).
 
 ---
 
@@ -58,16 +21,15 @@ pop/0           ──call──▶  handle_call   (runs here, returns reply)
                            handle_info   (runs here, receives timer)
 ```
 
-The public functions (`push/1`, `pop/0`) run **in the caller's process**. The callbacks
-(`handle_call`, `handle_cast`, `handle_info`) run **in the GenServer process**. `self()`
-inside a callback is the GenServer's PID, not the caller's. Mixing these up is the most
-common GenServer bug.
+The public functions run **in the caller's process**. The callbacks run **in the GenServer
+process**. `self()` inside a callback is the GenServer's PID, not the caller's. Mixing
+these up is the most common GenServer bug.
 
 ---
 
 ## The business problem
 
-`TaskQueue.QueueServer` manages a FIFO queue of pending jobs:
+Build a `TaskQueue.QueueServer` that manages a FIFO queue of pending jobs:
 
 - `push/1` — adds a job to the back of the queue. Fire-and-forget.
 - `pop/0` — takes the front job off the queue. Synchronous. Returns `{:ok, job}` or
@@ -79,9 +41,24 @@ common GenServer bug.
 
 ---
 
+## Project setup
+
+```
+task_queue/
+├── lib/
+│   └── task_queue/
+│       └── queue_server.ex
+├── test/
+│   └── task_queue/
+│       └── queue_server_test.exs
+└── mix.exs
+```
+
+---
+
 ## Implementation
 
-### Step 1: `lib/task_queue/queue_server.ex`
+### `lib/task_queue/queue_server.ex`
 
 ```elixir
 defmodule TaskQueue.QueueServer do
@@ -89,14 +66,9 @@ defmodule TaskQueue.QueueServer do
   require Logger
 
   @cleanup_interval_ms 30_000
-  # Jobs queued for longer than this are considered stale and removed by cleanup
   @job_ttl_ms 300_000
 
   @type job :: %{id: String.t(), payload: any(), queued_at: integer()}
-
-  # ---------------------------------------------------------------------------
-  # Public API — runs in the CALLER's process
-  # ---------------------------------------------------------------------------
 
   def start_link(opts \\ []) do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
@@ -138,16 +110,12 @@ defmodule TaskQueue.QueueServer do
     GenServer.call(__MODULE__, :flush)
   end
 
-  # ---------------------------------------------------------------------------
-  # GenServer callbacks — runs in the SERVER's process
-  # ---------------------------------------------------------------------------
+  # --- GenServer callbacks ---
 
   @impl GenServer
   def init(_opts) do
-    # Schedule the first cleanup
     Process.send_after(self(), :cleanup, @cleanup_interval_ms)
     Logger.info("QueueServer started")
-    # State: a list of jobs in FIFO order (head = front of queue)
     {:ok, []}
   end
 
@@ -203,7 +171,6 @@ defmodule TaskQueue.QueueServer do
       Logger.info("QueueServer cleanup: removed #{removed} stale jobs")
     end
 
-    # Reschedule next cleanup
     Process.send_after(self(), :cleanup, @cleanup_interval_ms)
     {:noreply, remaining}
   end
@@ -220,10 +187,6 @@ defmodule TaskQueue.QueueServer do
     :ok
   end
 
-  # ---------------------------------------------------------------------------
-  # Private
-  # ---------------------------------------------------------------------------
-
   defp generate_id do
     :crypto.strong_rand_bytes(8) |> Base.url_encode64(padding: false)
   end
@@ -232,24 +195,17 @@ end
 
 The `handle_cast({:push, job}, state)` appends the job to the end of the list with
 `state ++ [job]`. This is O(n), which is acceptable for moderate queue sizes. For
-high-throughput queues, a `:queue` (Erlang's double-ended queue) provides O(1)
-enqueue/dequeue — that optimization is explored in exercise 13 with ETS.
-
-The `handle_call(:flush, ...)` uses the same cleanup logic as `handle_info(:cleanup, ...)`.
-The difference: `:flush` is triggered manually and returns the count of removed jobs
-to the caller. `:cleanup` is triggered by the timer and returns nothing — it is
-internal housekeeping.
+high-throughput queues, Erlang's `:queue` provides O(1) enqueue/dequeue.
 
 The `handle_info` catch-all clause logs unexpected messages at warning level. Without
-this, an unexpected message would crash the GenServer with a `{:EXIT, ...}` signal.
+this, an unexpected message would crash the GenServer.
 
-### Step 2: Given tests — must pass without modification
+### Tests
 
 ```elixir
 # test/task_queue/queue_server_test.exs
 defmodule TaskQueue.QueueServerTest do
   use ExUnit.Case, async: false
-  # async: false — tests share the named GenServer
 
   alias TaskQueue.QueueServer
 
@@ -268,7 +224,6 @@ defmodule TaskQueue.QueueServerTest do
       QueueServer.push("job_a")
       QueueServer.push("job_b")
       QueueServer.push("job_c")
-      # Give the server time to process the casts
       Process.sleep(10)
 
       assert {:ok, %{payload: "job_a"}} = QueueServer.pop()
@@ -306,7 +261,6 @@ defmodule TaskQueue.QueueServerTest do
 
   describe "flush/0" do
     test "removes stale jobs and returns the count" do
-      # Insert jobs with a manipulated queued_at via direct state access
       stale_job = %{id: "stale", payload: :stale, queued_at: 0}
       fresh_job = %{id: "fresh", payload: :fresh, queued_at: System.monotonic_time(:millisecond)}
       :sys.replace_state(QueueServer, fn _state -> [stale_job, fresh_job] end)
@@ -329,7 +283,7 @@ defmodule TaskQueue.QueueServerTest do
 end
 ```
 
-### Step 3: Run the tests
+### Run the tests
 
 ```bash
 mix test test/task_queue/queue_server_test.exs --trace
@@ -346,40 +300,30 @@ mix test test/task_queue/queue_server_test.exs --trace
 | Failure visibility | Caller never knows if cast failed | Caller gets exit signal on crash | Lost silently |
 | When to use | Fire-and-forget writes | Reads that need a result | Timers, monitor signals |
 
-Reflection question: `push/1` uses `cast` so the caller does not wait. But what if the
-queue is full and you want to apply backpressure? What would you change, and what is
-the cost in terms of caller throughput?
-
 ---
 
 ## Common production mistakes
 
 **1. `@impl GenServer` missing on callbacks**
 Without `@impl`, the compiler cannot warn you when a callback name is misspelled.
-`handle_csat` instead of `handle_cast` compiles silently — the message is never handled.
 
 **2. Slow work inside `handle_call`**
-`handle_call` blocks the GenServer for its entire duration. If your `:pop` callback
-does a database read, all other callers wait. Extract slow work to a Task and use
-`GenServer.reply/2` to respond asynchronously.
+`handle_call` blocks the GenServer for its entire duration. Extract slow work to a Task.
 
 **3. Forgetting `handle_info` for unexpected messages**
-Process monitors, `:DOWN` messages, and stray `send` calls all arrive as `handle_info`.
 Without a catch-all clause, the GenServer crashes on the first unexpected message.
 
 **4. Using `call` for fire-and-forget writes**
-`push/1` uses `cast` because the caller does not need confirmation. Using `call` here
-would halve throughput for no benefit — every push would wait for the server to ack.
+Using `call` where `cast` suffices halves throughput for no benefit.
 
 **5. State mutation outside callbacks**
-State is only valid inside callbacks. Never store the state in a module attribute or
-ETS outside the GenServer — that defeats the entire point of process isolation.
+State is only valid inside callbacks. Never store state in a module attribute or ETS
+outside the GenServer.
 
 ---
 
 ## Resources
 
 - [GenServer — HexDocs](https://hexdocs.pm/elixir/GenServer.html)
-- [GenServer.call/3 — HexDocs](https://hexdocs.pm/elixir/GenServer.html#call/3)
 - [Mix and OTP: GenServer](https://elixir-lang.org/getting-started/mix-otp/genserver.html)
-- [Saša Jurić — The Soul of Erlang](https://www.youtube.com/watch?v=JvBT4XBdoUE) — 45-minute talk on why the process model exists
+- [Saša Jurić — The Soul of Erlang](https://www.youtube.com/watch?v=JvBT4XBdoUE)

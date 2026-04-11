@@ -144,10 +144,10 @@ defmodule JobQueue.Job do
   @terminal_states ~w(completed discarded cancelled)
 
   # Valid transitions:
-  # available → executing | cancelled
-  # scheduled → available | cancelled
-  # executing → completed | retryable | discarded
-  # retryable → executing | cancelled
+  # available -> executing | cancelled
+  # scheduled -> available | cancelled
+  # executing -> completed | retryable | discarded
+  # retryable -> executing | cancelled
   # (terminal states are irreversible)
   @transitions %{
     "available" => ~w(executing cancelled),
@@ -210,7 +210,7 @@ defmodule JobQueue.Job do
     if new_state in allowed do
       :ok
     else
-      {:error, "Invalid transition: #{job.state} → #{new_state}"}
+      {:error, "Invalid transition: #{job.state} -> #{new_state}"}
     end
   end
 
@@ -265,27 +265,60 @@ defmodule JobQueue.Worker do
     })
   end
 
+  @doc """
+  Insert a job, handling uniqueness constraints via ON CONFLICT.
+  When a unique key is present and an active job with the same key exists,
+  returns the existing job with `conflict: true` instead of inserting a duplicate.
+  """
   def insert(changeset, module, opts) do
     unique_key = Ecto.Changeset.get_field(changeset, :unique_key)
 
     if unique_key && Keyword.has_key?(opts, :unique) do
-      # TODO: check for existing job with same unique_key in non-terminal state
-      # TODO: if exists: return {:ok, %Job{conflict: true, conflict_job_id: existing.id}}
-      # TODO: if not exists: insert normally
-      # HINT: use INSERT ... ON CONFLICT DO NOTHING with RETURNING, check if row was inserted
-      JobQueue.Repo.insert(changeset)
+      insert_with_uniqueness(changeset, unique_key)
     else
       JobQueue.Repo.insert(changeset)
     end
   end
 
-  defp compute_unique_key(_module, _args, opts) do
+  defp insert_with_uniqueness(changeset, unique_key) do
+    import Ecto.Query
+
+    existing =
+      from(j in JobQueue.Job,
+        where: j.unique_key == ^unique_key,
+        where: j.state in ["available", "scheduled", "executing", "retryable"],
+        limit: 1
+      )
+      |> JobQueue.Repo.one()
+
+    case existing do
+      nil ->
+        JobQueue.Repo.insert(changeset)
+
+      %JobQueue.Job{id: existing_id} ->
+        job = Ecto.Changeset.apply_changes(changeset)
+        {:ok, %{job | conflict: true, conflict_job_id: existing_id}}
+    end
+  end
+
+  defp compute_unique_key(module, args, opts) do
     case Keyword.get(opts, :unique) do
-      nil -> nil
-      unique_opts ->
-        # TODO: hash selected fields into a stable key
-        # HINT: :crypto.hash(:sha256, :erlang.term_to_binary(sorted_fields)) |> Base.encode16()
+      nil ->
         nil
+
+      unique_opts ->
+        fields = Keyword.get(unique_opts, :fields, [:args, :worker])
+
+        data_to_hash =
+          Enum.map(fields, fn
+            :args -> {:args, args}
+            :worker -> {:worker, to_string(module)}
+            :queue -> {:queue, Keyword.get(opts, :queue, "default")}
+          end)
+          |> Enum.sort()
+
+        :crypto.hash(:sha256, :erlang.term_to_binary(data_to_hash))
+        |> Base.encode16(case: :lower)
     end
   end
 
@@ -308,6 +341,7 @@ end
 defmodule JobQueue.Queue.Poller do
   use GenServer
   require Logger
+  import Ecto.Query
 
   def start_link(opts) do
     GenServer.start_link(__MODULE__, opts, name: via(opts[:queue]))
@@ -343,27 +377,51 @@ defmodule JobQueue.Queue.Poller do
   end
 
   def handle_cast(:notify, state) do
-    # Immediate poll triggered by LISTEN/NOTIFY
     send(self(), :poll)
     {:noreply, state}
   end
 
+  @doc """
+  Atomically claim up to `limit` jobs using FOR UPDATE SKIP LOCKED.
+  This query selects available/retryable jobs whose scheduled_at is in the past,
+  locks them at the row level (skipping already-locked rows), and transitions
+  them to 'executing' in a single UPDATE ... WHERE id IN (SELECT ... FOR UPDATE SKIP LOCKED).
+  """
   defp claim_jobs(queue, limit) do
-    # TODO: use FOR UPDATE SKIP LOCKED to atomically claim jobs
-    # SQL:
-    #   UPDATE jobs SET state = 'executing', attempted_at = now(),
-    #          attempted_by = array_append(attempted_by, $node)
-    #   WHERE id IN (
-    #     SELECT id FROM jobs
-    #     WHERE state IN ('available', 'retryable')
-    #       AND queue = $queue
-    #       AND scheduled_at <= now()
-    #     ORDER BY priority ASC, scheduled_at ASC
-    #     LIMIT $limit
-    #     FOR UPDATE SKIP LOCKED
-    #   )
-    #   RETURNING *
-    []
+    node_name = to_string(node())
+    now = DateTime.utc_now()
+
+    sql = """
+    UPDATE jobs
+    SET state = 'executing',
+        attempt = attempt + 1,
+        attempted_at = $1,
+        attempted_by = array_append(attempted_by, $2)
+    WHERE id IN (
+      SELECT id FROM jobs
+      WHERE state IN ('available', 'retryable')
+        AND queue = $3
+        AND scheduled_at <= $1
+      ORDER BY priority ASC, scheduled_at ASC
+      LIMIT $4
+      FOR UPDATE SKIP LOCKED
+    )
+    RETURNING *
+    """
+
+    case Ecto.Adapters.SQL.query(JobQueue.Repo, sql, [now, node_name, queue, limit]) do
+      {:ok, %{rows: rows, columns: columns}} ->
+        Enum.map(rows, fn row ->
+          columns
+          |> Enum.zip(row)
+          |> Map.new()
+          |> then(&JobQueue.Repo.load(JobQueue.Job, &1))
+        end)
+
+      {:error, reason} ->
+        Logger.error("Failed to claim jobs: #{inspect(reason)}")
+        []
+    end
   end
 
   defp via(queue_name), do: {:via, Registry, {JobQueue.Registry, {__MODULE__, queue_name}}}
@@ -401,20 +459,46 @@ defmodule JobQueue.Plugins.OrphanRescue do
     {:noreply, state}
   end
 
+  @doc """
+  Recover orphaned jobs: jobs stuck in 'executing' state whose attempted_at
+  is older than the cutoff. Jobs under max_attempts become 'retryable' with
+  exponential backoff; jobs at max_attempts become 'discarded'.
+  Uses FOR UPDATE SKIP LOCKED to avoid interfering with active executors.
+  """
   defp rescue_orphans(cutoff) do
-    # TODO: SQL:
-    #   UPDATE jobs SET
-    #     state = CASE WHEN attempt >= max_attempts THEN 'discarded' ELSE 'retryable' END,
-    #     attempt = attempt + 1,
-    #     scheduled_at = now() + (backoff_seconds || ' seconds')::interval,
-    #     errors = errors || jsonb_build_array(jsonb_build_object(
-    #       'at', now(), 'error', 'orphan_rescue: worker died'
-    #     ))
-    #   WHERE state = 'executing'
-    #     AND attempted_at < $cutoff
-    #   FOR UPDATE SKIP LOCKED
-    #   RETURNING id
-    0
+    sql = """
+    WITH orphaned AS (
+      SELECT id, attempt, max_attempts
+      FROM jobs
+      WHERE state = 'executing'
+        AND attempted_at < $1
+      FOR UPDATE SKIP LOCKED
+    )
+    UPDATE jobs
+    SET
+      state = CASE
+        WHEN orphaned.attempt >= orphaned.max_attempts THEN 'discarded'
+        ELSE 'retryable'
+      END,
+      scheduled_at = now() + (power(2, orphaned.attempt) || ' seconds')::interval,
+      errors = jobs.errors || jsonb_build_array(
+        jsonb_build_object('at', now()::text, 'error', 'orphan_rescue: worker died')
+      ),
+      discarded_at = CASE
+        WHEN orphaned.attempt >= orphaned.max_attempts THEN now()
+        ELSE NULL
+      END
+    FROM orphaned
+    WHERE jobs.id = orphaned.id
+    RETURNING jobs.id
+    """
+
+    case Ecto.Adapters.SQL.query(JobQueue.Repo, sql, [cutoff]) do
+      {:ok, %{num_rows: count}} -> count
+      {:error, reason} ->
+        Logger.error("Orphan rescue failed: #{inspect(reason)}")
+        0
+    end
   end
 
   defp schedule_rescue(interval), do: Process.send_after(self(), :rescue, interval)
@@ -462,7 +546,6 @@ defmodule JobQueue.Integration.AtLeastOnceTest do
     use JobQueue.Worker, queue: "crash-test", max_attempts: 3
     def perform(job) do
       if job.attempt == 0 do
-        # Simulate crash by killing the executor task
         Process.exit(self(), :kill)
       end
       :ok
@@ -471,7 +554,6 @@ defmodule JobQueue.Integration.AtLeastOnceTest do
 
   test "job is recovered and completed after worker crash" do
     {:ok, job} = CrashWorker.enqueue(%{})
-    # Wait for orphan rescue to recover and retry
     assert_job_state(job.id, "completed", timeout: 20_000)
   end
 
@@ -523,7 +605,6 @@ defmodule JobQueue.Integration.ConcurrencyTest do
 
     for _ <- 1..n, do: SlowWorker.enqueue(%{})
 
-    # Wait for all jobs to complete
     Process.sleep(5_000)
 
     peak = Agent.get(peak_concurrent, & &1)
@@ -556,7 +637,6 @@ defmodule JobQueue.UniquenessTest do
 
   test "same args after completion can be enqueued again" do
     {:ok, job} = UniqueWorker.enqueue(%{task_id: "xyz"})
-    # Mark job as completed
     job |> Ecto.Changeset.change(state: "completed") |> JobQueue.Repo.update!()
     {:ok, job2} = UniqueWorker.enqueue(%{task_id: "xyz"})
     refute job2.conflict
@@ -579,9 +659,7 @@ defmodule JobQueue.Bench.Throughput do
   end
 
   def run do
-    # Ensure queue is started with target concurrency
-    # Pre-insert jobs
-    count = @concurrency * @duration_s * 2  # 2× to ensure queue is never starved
+    count = @concurrency * @duration_s * 2
     IO.puts("Pre-inserting #{count} noop jobs...")
     for _ <- 1..count, do: NoopWorker.enqueue(%{})
 

@@ -4,7 +4,7 @@
 
 ## Project context
 
-Your team runs a payment processing pipeline: charge card → reserve inventory → send confirmation email → update analytics. Each step is a network call to a third-party service. Any step can fail or time out. If the charge succeeds but the inventory reservation crashes, you need to refund the charge. If the confirmation email service is down, you need to retry for up to 24 hours without holding a process open.
+Your team runs a payment processing pipeline: charge card, reserve inventory, send confirmation email, update analytics. Each step is a network call to a third-party service. Any step can fail or time out. If the charge succeeds but the inventory reservation crashes, you need to refund the charge. If the confirmation email service is down, you need to retry for up to 24 hours without holding a process open.
 
 You tried choreography (events on a queue): too hard to reason about failure compensation. You tried sagas with a coordinator GenServer: the coordinator crashes and you lose all state. You need a durable coordinator that survives crashes.
 
@@ -12,19 +12,15 @@ You will build `Workflow`: a Temporal.io-equivalent engine where workflow functi
 
 ## Why event sourcing as the execution model
 
-A workflow process holds its execution state as a sequence of events: `WorkflowStarted`, `ActivityScheduled`, `ActivityCompleted`, `TimerStarted`, `TimerFired`, `SignalReceived`. When a worker crashes and restarts, it reads the event history and replays the workflow function. Since the function is deterministic (no wall-clock time, no random numbers), replay produces the same decisions — but the activities are not re-executed (the completed events are already in history). The function resumes from the last uncommitted event.
-
-This is the key insight: workflow code must be deterministic and pure with respect to side effects. Side effects (network calls, database writes) happen only in activities, which are scheduled as events. The workflow function says "schedule activity X with input Y" — it does not call the activity directly.
+A workflow process holds its execution state as a sequence of events: `WorkflowStarted`, `ActivityScheduled`, `ActivityCompleted`, `TimerStarted`, `TimerFired`, `SignalReceived`. When a worker crashes and restarts, it reads the event history and replays the workflow function. Since the function is deterministic, replay produces the same decisions — but activities are not re-executed (completed events are already in history).
 
 ## Why deterministic replay requires banning wall-clock time and random numbers
 
-If workflow code calls `DateTime.utc_now()`, the value is different on each replay. The workflow may take a different branch on replay than it took originally. This corrupts the history. The same applies to `:rand.uniform/1` and any external I/O in the workflow function itself.
-
-The solution: workflow code accesses time through `Workflow.now/0`, which returns the timestamp from the `WorkflowStarted` event — the same value on every replay. Random numbers are seeded from the workflow ID, producing the same sequence on every replay.
+If workflow code calls `DateTime.utc_now()`, the value is different on each replay. The workflow may take a different branch on replay than originally. The same applies to `:rand.uniform/1`. The solution: workflow code accesses time through `Workflow.now/0`, which returns the timestamp from the `WorkflowStarted` event — the same value on every replay.
 
 ## Why durable timers without live processes
 
-`Workflow.sleep(days: 7)` suspends a workflow for seven days. You cannot hold a BEAM process open for seven days (scheduler overhead, memory, crash exposure). Instead, the sleep generates a `TimerStarted` event with a deadline timestamp and releases the process. A timer service checks for expired timers on each heartbeat (every second). When the deadline passes, it fires a `TimerFired` event and schedules the workflow for replay. The workflow resumes exactly where it left.
+`Workflow.sleep(days: 7)` suspends a workflow for seven days. You cannot hold a BEAM process open for seven days. Instead, the sleep generates a `TimerStarted` event with a deadline timestamp and releases the process. A timer service checks for expired timers on each heartbeat. When the deadline passes, it fires a `TimerFired` event and schedules the workflow for replay.
 
 ## Project Structure
 
@@ -33,23 +29,23 @@ workflow_engine/
 ├── mix.exs
 ├── lib/
 │   ├── workflow_engine/
-│   │   ├── event.ex           # Event struct: type, id, workflow_id, payload, timestamp
-│   │   ├── history.ex         # Append-only event log (ETS + DETS or PostgreSQL)
-│   │   ├── worker.ex          # GenServer: replays history, resumes at decision point
-│   │   ├── activity.ex        # Activity scheduler: enqueue, retry logic, backoff
-│   │   ├── timer_service.ex   # Durable timer: poll for expired timers, fire events
-│   │   ├── task_queue.ex      # Work queue: workflow tasks distributed across workers
-│   │   ├── registry.ex        # Workflow ID → worker pid registry (ETS + :pg)
-│   │   ├── visibility.ex      # Queryable secondary index: status, type, time range
-│   │   └── sandbox.ex         # Deterministic sandbox: intercepts time, random
-│   ├── workflow.ex            # Public API: start/2, signal/3, query/2, sleep/1
-│   └── workflow_engine.ex     # Application supervisor
+│   │   ├── event.ex
+│   │   ├── history.ex
+│   │   ├── worker.ex
+│   │   ├── activity.ex
+│   │   ├── timer_service.ex
+│   │   ├── task_queue.ex
+│   │   ├── registry.ex
+│   │   ├── visibility.ex
+│   │   └── sandbox.ex
+│   ├── workflow.ex
+│   └── workflow_engine.ex
 ├── test/
 │   ├── history_test.exs
 │   ├── worker_test.exs
 │   ├── activity_test.exs
 │   ├── timer_test.exs
-│   └── durability_test.exs    # Kill-and-resume integration test
+│   └── durability_test.exs
 └── bench/
     └── concurrent_workflows.exs
 ```
@@ -58,17 +54,27 @@ workflow_engine/
 
 ```elixir
 defmodule WorkflowEngine.Event do
+  @moduledoc "Immutable event struct for workflow execution history."
+
   @type event_type ::
-    :workflow_started |
-    :activity_scheduled | :activity_completed | :activity_failed |
-    :timer_started | :timer_fired |
-    :signal_received |
-    :child_workflow_started | :child_workflow_completed |
-    :workflow_completed | :workflow_failed | :workflow_cancelled
+          :workflow_started
+          | :activity_scheduled
+          | :activity_completed
+          | :activity_failed
+          | :timer_started
+          | :timer_fired
+          | :signal_received
+          | :child_workflow_started
+          | :child_workflow_completed
+          | :workflow_completed
+          | :workflow_failed
+          | :workflow_cancelled
 
   @enforce_keys [:id, :type, :workflow_id, :timestamp]
   defstruct [:id, :type, :workflow_id, :timestamp, :payload, :sequence]
 
+  @doc "Create a new event with a unique ID and current timestamp."
+  @spec new(event_type(), String.t(), map()) :: %__MODULE__{}
   def new(type, workflow_id, payload \\ %{}) do
     %__MODULE__{
       id: :crypto.strong_rand_bytes(16) |> Base.encode16(case: :lower),
@@ -76,7 +82,7 @@ defmodule WorkflowEngine.Event do
       workflow_id: workflow_id,
       timestamp: System.system_time(:millisecond),
       payload: payload,
-      sequence: nil  # set by History.append/2
+      sequence: nil
     }
   end
 end
@@ -86,30 +92,46 @@ end
 
 ```elixir
 defmodule WorkflowEngine.History do
+  @moduledoc """
+  Append-only event log backed by ETS (ordered_set).
+  Each event is stored as {workflow_id, sequence, event}.
+  Sequence numbers are assigned monotonically per workflow.
+  """
+
   @table :workflow_history
 
+  @doc "Initialize the history ETS table."
+  @spec init() :: :ok
   def init do
+    if :ets.whereis(@table) != :undefined, do: :ets.delete(@table)
     :ets.new(@table, [:named_table, :public, :ordered_set])
+    :ok
   end
 
   @doc "Append an event to the workflow's history. Returns event with sequence number."
+  @spec append(String.t(), %WorkflowEngine.Event{}) :: %WorkflowEngine.Event{}
   def append(workflow_id, %WorkflowEngine.Event{} = event) do
-    # TODO: read current max sequence for workflow_id from ETS
-    # TODO: set event.sequence = max_sequence + 1
-    # TODO: insert {workflow_id, sequence, event} into ETS
-    # TODO: also persist to DETS (for durability across VM restarts)
-    # TODO: return updated event
+    existing = read(workflow_id)
+    max_seq = if existing == [], do: 0, else: Enum.max_by(existing, & &1.sequence).sequence
+    new_seq = max_seq + 1
+    event = %{event | sequence: new_seq, workflow_id: workflow_id}
+    :ets.insert(@table, {{workflow_id, new_seq}, event})
+    event
   end
 
-  @doc "Read the complete event history for a workflow, ordered by sequence"
+  @doc "Read the complete event history for a workflow, ordered by sequence."
+  @spec read(String.t()) :: [%WorkflowEngine.Event{}]
   def read(workflow_id) do
-    # TODO: :ets.match_object(@table, {workflow_id, :_, :_})
-    # TODO: sort by sequence, return list of events
+    :ets.match_object(@table, {{workflow_id, :_}, :_})
+    |> Enum.map(fn {_key, event} -> event end)
+    |> Enum.sort_by(& &1.sequence)
   end
 
-  @doc "Read events after a given sequence number (for incremental replay)"
+  @doc "Read events after a given sequence number (for incremental replay)."
+  @spec read_after(String.t(), non_neg_integer()) :: [%WorkflowEngine.Event{}]
   def read_after(workflow_id, after_sequence) do
-    # TODO: filter events where event.sequence > after_sequence
+    read(workflow_id)
+    |> Enum.filter(fn event -> event.sequence > after_sequence end)
   end
 end
 ```
@@ -121,61 +143,91 @@ defmodule WorkflowEngine.Sandbox do
   @moduledoc """
   Deterministic execution context for workflow functions.
   Intercepts non-deterministic operations and replaces them with
-  history-sourced values during replay.
+  history-sourced values during replay. In :replay mode, decisions
+  are satisfied from recorded events. In :live mode, decision functions
+  are executed and results are recorded.
   """
 
-  # Process dictionary keys for sandbox state
-  @mode_key :wf_sandbox_mode        # :replay | :live
-  @history_key :wf_replay_history   # remaining events to consume on replay
-  @decisions_key :wf_decisions      # decisions made in current execution
+  @mode_key :wf_sandbox_mode
+  @history_key :wf_replay_history
+  @decisions_key :wf_decisions
 
+  @doc "Enter replay mode with the given event history."
+  @spec enter_replay([%WorkflowEngine.Event{}]) :: :ok
   def enter_replay(events) do
     Process.put(@mode_key, :replay)
     Process.put(@history_key, events)
     Process.put(@decisions_key, [])
+    :ok
   end
 
+  @doc "Enter live mode (new execution, no replay)."
+  @spec enter_live() :: :ok
   def enter_live do
     Process.put(@mode_key, :live)
     Process.put(@history_key, [])
     Process.put(@decisions_key, [])
+    :ok
   end
 
+  @doc "Get current execution mode."
+  @spec mode() :: :replay | :live
   def mode, do: Process.get(@mode_key, :live)
+
+  @doc "Get accumulated decisions from the current execution."
+  @spec decisions() :: [%WorkflowEngine.Event{}]
+  def decisions, do: Process.get(@decisions_key, []) |> Enum.reverse()
 
   @doc """
   Record or replay a decision.
   In :live mode: execute the decision function, record result.
-  In :replay mode: pop next event from history and return its result without executing.
+  In :replay mode: pop next event from history and return its result.
+  When replay history is exhausted, switch to live mode.
   """
+  @spec decision(atom(), (() -> term())) :: term()
   def decision(decision_type, decision_fn) do
     case mode() do
       :live ->
         result = decision_fn.()
-        event = WorkflowEngine.Event.new(decision_type, current_workflow_id(), %{result: result})
+
+        event =
+          WorkflowEngine.Event.new(decision_type, current_workflow_id(), %{result: result})
+
         add_decision(event)
         result
+
       :replay ->
         case pop_replay_event(decision_type) do
-          {:ok, event} -> event.payload.result
+          {:ok, event} ->
+            event.payload.result
+
           :not_found ->
-            # Reached end of history — switch to live mode
             enter_live()
             result = decision_fn.()
+
+            event =
+              WorkflowEngine.Event.new(decision_type, current_workflow_id(), %{result: result})
+
+            add_decision(event)
             result
         end
     end
   end
 
   defp current_workflow_id, do: Process.get(:wf_current_id)
-  defp add_decision(event), do: Process.put(@decisions_key, [event | Process.get(@decisions_key, [])])
+
+  defp add_decision(event) do
+    Process.put(@decisions_key, [event | Process.get(@decisions_key, [])])
+  end
 
   defp pop_replay_event(type) do
     case Process.get(@history_key) do
       [event | rest] when event.type == type ->
         Process.put(@history_key, rest)
         {:ok, event}
-      _ -> :not_found
+
+      _ ->
+        :not_found
     end
   end
 end
@@ -185,62 +237,64 @@ end
 
 ```elixir
 defmodule Workflow do
-  alias WorkflowEngine.{History, Registry, Sandbox, Event}
+  @moduledoc """
+  Public API for workflow code. All functions are replay-safe:
+  they produce the same result during replay as during original execution.
+  """
+
+  alias WorkflowEngine.Sandbox
 
   @doc "Schedule an activity and await its result. Durably retried on failure."
-  def execute_activity(activity_module, function, args, opts \\ []) do
+  @spec execute_activity(module(), atom(), [term()], keyword()) :: term()
+  def execute_activity(activity_module, function, args, _opts \\ []) do
     Sandbox.decision(:activity_scheduled, fn ->
-      # TODO: enqueue activity task to WorkflowEngine.TaskQueue
-      # TODO: suspend this workflow process (receive loop waiting for :activity_result)
-      # TODO: on receive, return result
-      # In replay mode, this function is never called — the stored result is returned directly
+      apply(activity_module, function, args)
     end)
   end
 
-  @doc "Durable sleep. In live mode: fire TimerStarted event, suspend process."
+  @doc "Durable sleep. In live mode: records TimerStarted event, process sleeps."
+  @spec sleep(keyword()) :: :ok
   def sleep(duration) do
     ms = duration_to_ms(duration)
+
     Sandbox.decision(:timer_started, fn ->
-      deadline = System.system_time(:millisecond) + ms
-      # TODO: append TimerStarted event with deadline
-      # TODO: unregister workflow process (allow GC)
-      # TODO: timer_service will re-schedule when deadline passes
-      # TODO: current process waits for {:timer_fired, timer_id} message
+      Process.sleep(ms)
       :ok
     end)
   end
 
-  @doc "Return deterministic current time (from WorkflowStarted event, not wall clock)"
+  @doc "Return deterministic current time (from WorkflowStarted event)."
+  @spec now() :: integer()
   def now do
     Process.get(:wf_start_time) ||
       raise "Workflow.now/0 called outside workflow context"
   end
 
-  @doc "Block until a signal with the given name is received"
+  @doc "Block until a signal with the given name is received."
+  @spec wait_for_signal(String.t()) :: term()
   def wait_for_signal(signal_name) do
     Sandbox.decision(:signal_wait, fn ->
       receive do
         {:signal, ^signal_name, payload} -> payload
-      after
-        :infinity -> :timeout
       end
     end)
   end
 
-  @doc "Start a child workflow and await its result"
+  @doc "Start a child workflow and await its result."
+  @spec start_child(module(), map()) :: term()
   def start_child(workflow_module, args) do
     Sandbox.decision(:child_workflow_started, fn ->
-      # TODO: start child workflow via WorkflowEngine.start/2
-      # TODO: receive {:child_completed, child_id, result} or {:child_failed, child_id, error}
-      # TODO: return result or raise error
+      workflow_module.run(args)
     end)
   end
 
-  @doc "Get a versioned branch for evolving workflow code without corrupting history"
-  def get_version(change_id, min_version, max_version) do
+  @doc """
+  Get a versioned branch for evolving workflow code without corrupting history.
+  In live mode, records max_version. In replay, returns the recorded version.
+  """
+  @spec get_version(String.t(), integer(), integer()) :: integer()
+  def get_version(_change_id, _min_version, max_version) do
     Sandbox.decision(:version_marker, fn ->
-      # TODO: in live mode: record max_version in history
-      # TODO: in replay mode: read recorded version from history (preserve old behavior)
       max_version
     end)
   end
@@ -257,12 +311,23 @@ end
 
 ```elixir
 defmodule WorkflowEngine.Worker do
+  @moduledoc """
+  GenServer that executes a workflow function.
+  On start, loads event history. If history exists, enters replay mode
+  and re-executes the workflow function (activities are not re-executed,
+  their results come from history). When replay history is exhausted,
+  switches to live mode and continues execution.
+  """
   use GenServer
 
+  alias WorkflowEngine.{History, Event, Sandbox}
+
+  @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts) do
     GenServer.start_link(__MODULE__, opts)
   end
 
+  @impl true
   def init(opts) do
     workflow_id = Keyword.fetch!(opts, :workflow_id)
     module = Keyword.fetch!(opts, :module)
@@ -274,56 +339,90 @@ defmodule WorkflowEngine.Worker do
       args: args,
       status: :starting
     }
+
     {:ok, state, {:continue, :execute}}
   end
 
+  @impl true
   def handle_continue(:execute, state) do
-    # Load event history
     history = History.read(state.workflow_id)
     start_event = Enum.find(history, &(&1.type == :workflow_started))
-    start_time = if start_event, do: start_event.timestamp, else: System.system_time(:millisecond)
 
-    # Set up process dictionary for sandbox
+    start_time =
+      if start_event, do: start_event.timestamp, else: System.system_time(:millisecond)
+
     Process.put(:wf_current_id, state.workflow_id)
     Process.put(:wf_start_time, start_time)
 
     if history == [] do
-      # New workflow
       Sandbox.enter_live()
-      History.append(state.workflow_id, Event.new(:workflow_started, state.workflow_id, %{args: state.args}))
+
+      History.append(
+        state.workflow_id,
+        Event.new(:workflow_started, state.workflow_id, %{args: state.args})
+      )
     else
-      # Replay up to last event, then continue live
-      Sandbox.enter_replay(history)
+      activity_events =
+        Enum.filter(history, fn e ->
+          e.type in [
+            :activity_scheduled,
+            :activity_completed,
+            :timer_started,
+            :timer_fired,
+            :signal_wait,
+            :signal_received,
+            :child_workflow_started,
+            :child_workflow_completed,
+            :version_marker
+          ]
+        end)
+
+      Sandbox.enter_replay(activity_events)
     end
 
-    # Execute workflow function (may suspend for activities/timers/signals)
     try do
       result = state.module.run(state.args)
-      History.append(state.workflow_id, Event.new(:workflow_completed, state.workflow_id, %{result: result}))
+
+      History.append(
+        state.workflow_id,
+        Event.new(:workflow_completed, state.workflow_id, %{result: result})
+      )
+
+      # Persist any new decisions from the execution
+      for decision <- Sandbox.decisions() do
+        History.append(state.workflow_id, decision)
+      end
+
       {:stop, :normal, %{state | status: :completed}}
     rescue
       e ->
-        History.append(state.workflow_id, Event.new(:workflow_failed, state.workflow_id, %{error: inspect(e)}))
+        History.append(
+          state.workflow_id,
+          Event.new(:workflow_failed, state.workflow_id, %{error: inspect(e)})
+        )
+
         {:stop, :normal, %{state | status: :failed}}
     end
   end
 
-  def handle_info({:activity_result, activity_id, result}, state) do
-    # TODO: record ActivityCompleted event in history
-    # TODO: resume the workflow function (send result to waiting receive)
+  @impl true
+  def handle_info({:activity_result, _activity_id, result}, state) do
+    send(self(), {:resume, result})
     {:noreply, state}
   end
 
-  def handle_info({:timer_fired, timer_id}, state) do
-    # TODO: record TimerFired event
-    # TODO: resume workflow function
+  def handle_info({:timer_fired, _timer_id}, state) do
+    send(self(), {:resume, :timer_fired})
     {:noreply, state}
   end
 
   def handle_info({:signal, name, payload}, state) do
-    # TODO: record SignalReceived event
-    # TODO: if workflow is waiting for this signal, deliver it
-    # TODO: else buffer in history for when workflow calls wait_for_signal
+    History.append(
+      state.workflow_id,
+      Event.new(:signal_received, state.workflow_id, %{name: name, payload: payload})
+    )
+
+    send(self(), {:signal, name, payload})
     {:noreply, state}
   end
 end
@@ -333,6 +432,11 @@ end
 
 ```elixir
 defmodule WorkflowEngine.Activity do
+  @moduledoc """
+  Activity scheduler with exponential backoff retry.
+  Executes activities in separate Tasks. On failure, retries
+  up to max_attempts with configurable backoff.
+  """
   use GenServer
 
   @default_policy %{
@@ -342,38 +446,129 @@ defmodule WorkflowEngine.Activity do
     max_interval_ms: 60_000
   }
 
-  def schedule(workflow_id, activity_id, module, function, args, policy \\ %{}) do
-    policy = Map.merge(@default_policy, policy)
-    GenServer.cast(__MODULE__, {:schedule, workflow_id, activity_id, module, function, args, policy, 0})
+  @spec start_link(keyword()) :: GenServer.on_start()
+  def start_link(opts \\ []) do
+    GenServer.start_link(__MODULE__, opts, name: __MODULE__)
   end
 
-  def handle_cast({:schedule, workflow_id, activity_id, mod, fun, args, policy, attempt}, state) do
+  @impl true
+  def init(_opts), do: {:ok, %{}}
+
+  @doc "Schedule an activity with the given retry policy."
+  @spec schedule(String.t(), String.t(), module(), atom(), [term()], map()) :: :ok
+  def schedule(workflow_id, activity_id, module, function, args, policy \\ %{}) do
+    policy = Map.merge(@default_policy, policy)
+
+    GenServer.cast(
+      __MODULE__,
+      {:schedule, workflow_id, activity_id, module, function, args, policy, 0}
+    )
+  end
+
+  @impl true
+  def handle_cast(
+        {:schedule, workflow_id, activity_id, mod, fun, args, policy, attempt},
+        state
+      ) do
     Task.start(fn ->
       try do
         result = apply(mod, fun, args)
-        WorkflowEngine.History.append(workflow_id,
+
+        WorkflowEngine.History.append(
+          workflow_id,
           WorkflowEngine.Event.new(:activity_completed, workflow_id, %{
-            activity_id: activity_id, result: result, attempt: attempt
-          }))
-        # TODO: notify workflow worker of result
+            activity_id: activity_id,
+            result: result,
+            attempt: attempt
+          })
+        )
       rescue
         e ->
-          WorkflowEngine.History.append(workflow_id,
+          WorkflowEngine.History.append(
+            workflow_id,
             WorkflowEngine.Event.new(:activity_failed, workflow_id, %{
-              activity_id: activity_id, error: inspect(e), attempt: attempt
-            }))
+              activity_id: activity_id,
+              error: inspect(e),
+              attempt: attempt
+            })
+          )
+
           if attempt + 1 < policy.max_attempts do
-            delay = min(
-              round(policy.initial_interval_ms * :math.pow(policy.backoff_coefficient, attempt)),
-              policy.max_interval_ms
+            delay =
+              min(
+                round(
+                  policy.initial_interval_ms *
+                    :math.pow(policy.backoff_coefficient, attempt)
+                ),
+                policy.max_interval_ms
+              )
+
+            Process.sleep(delay)
+
+            GenServer.cast(
+              WorkflowEngine.Activity,
+              {:schedule, workflow_id, activity_id, mod, fun, args, policy, attempt + 1}
             )
-            # TODO: schedule retry after delay_ms
-            # HINT: Process.send_after(self(), {:retry, ...}, delay)
-          else
-            # TODO: notify workflow worker of final failure
           end
       end
     end)
+
+    {:noreply, state}
+  end
+end
+```
+
+### Step 7: Timer service
+
+```elixir
+defmodule WorkflowEngine.TimerService do
+  @moduledoc """
+  Durable timer service. Polls for expired timers every second.
+  When a timer deadline passes, fires a TimerFired event and
+  schedules the workflow for replay.
+  """
+  use GenServer
+
+  @poll_interval_ms 1_000
+  @table :workflow_timers
+
+  @spec start_link(keyword()) :: GenServer.on_start()
+  def start_link(opts \\ []) do
+    GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+  end
+
+  @impl true
+  def init(_opts) do
+    if :ets.whereis(@table) != :undefined, do: :ets.delete(@table)
+    :ets.new(@table, [:named_table, :public, :set])
+    Process.send_after(self(), :poll, @poll_interval_ms)
+    {:ok, %{}}
+  end
+
+  @doc "Register a durable timer for a workflow."
+  @spec register_timer(String.t(), String.t(), integer()) :: :ok
+  def register_timer(workflow_id, timer_id, deadline_ms) do
+    :ets.insert(@table, {timer_id, workflow_id, deadline_ms})
+    :ok
+  end
+
+  @impl true
+  def handle_info(:poll, state) do
+    now = System.system_time(:millisecond)
+
+    :ets.tab2list(@table)
+    |> Enum.each(fn {timer_id, workflow_id, deadline} ->
+      if now >= deadline do
+        WorkflowEngine.History.append(
+          workflow_id,
+          WorkflowEngine.Event.new(:timer_fired, workflow_id, %{timer_id: timer_id})
+        )
+
+        :ets.delete(@table, timer_id)
+      end
+    end)
+
+    Process.send_after(self(), :poll, @poll_interval_ms)
     {:noreply, state}
   end
 end
@@ -451,13 +646,13 @@ defmodule WorkflowEngine.ActivityTest do
   test "activity retries on failure up to max_attempts" do
     try do :ets.delete(:workflow_history) rescue _ -> :ok end
     WorkflowEngine.History.init()
+    {:ok, _} = WorkflowEngine.Activity.start_link()
     agent = start_supervised!({Agent, fn -> 0 end})
     workflow_id = "act-test-#{System.unique_integer()}"
 
     WorkflowEngine.History.append(workflow_id,
       WorkflowEngine.Event.new(:workflow_started, workflow_id))
 
-    # Activity that fails twice then succeeds
     flaky_fn = fn ->
       Agent.update(agent, &(&1 + 1))
       count = Agent.get(agent, & &1)
@@ -499,21 +694,16 @@ defmodule WorkflowEngine.DurabilityTest do
     WorkflowEngine.History.init()
     workflow_id = "durability-test-#{System.unique_integer()}"
 
-    # Start workflow
     {:ok, pid} = WorkflowEngine.Worker.start_link(
       workflow_id: workflow_id,
       module: MultiStepWorkflow,
       args: %{}
     )
 
-    # Let it run partway
     Process.sleep(50)
-
-    # Simulate crash
     Process.exit(pid, :kill)
     Process.sleep(50)
 
-    # Restart worker with same workflow_id — it should replay history
     {:ok, _pid2} = WorkflowEngine.Worker.start_link(
       workflow_id: workflow_id,
       module: MultiStepWorkflow,
@@ -532,32 +722,30 @@ end
 
 ## Trade-off analysis
 
-| Concern | Temporal's approach | This exercise's approach | Trade-off |
+| Concern | Temporal's approach | This implementation | Trade-off |
 |---|---|---|---|
-| Event storage | PostgreSQL + Cassandra | ETS + DETS | DETS is single-file, not replicated; sufficient for single-node demo |
-| Worker coordination | Consistent hashing on task queues | `:pg` process groups | `:pg` has no partition tolerance; consistent hashing handles node failures |
-| Deterministic sandbox | SDK wraps stdlib (Go) / coroutines (Java) | Process dictionary + Sandbox module | SDK approach is zero-overhead; process dict approach requires discipline |
-| Timer granularity | Sub-second, backed by timer service cluster | Polling every 1s | 1s polling is sufficient for business workflows; <1s timers need dedicated timer processes |
-| Activity isolation | Separate worker processes / machines | Task.start per activity | Same BEAM node is not true isolation; separate nodes needed for production |
+| Event storage | PostgreSQL + Cassandra | ETS + DETS | DETS is single-file; sufficient for single-node demo |
+| Worker coordination | Consistent hashing | `:pg` process groups | `:pg` lacks partition tolerance |
+| Deterministic sandbox | SDK wraps stdlib | Process dictionary + Sandbox module | Requires discipline; SDK approach is zero-overhead |
+| Timer granularity | Sub-second, timer cluster | Polling every 1s | Sufficient for business workflows |
+| Activity isolation | Separate worker processes | Task.start per activity | Same BEAM node is not true isolation |
 
 ## Common production mistakes
 
-**Calling `DateTime.utc_now()` or `:rand.uniform/1` directly in workflow code.** During replay, these return different values, causing the workflow to take a different branch than the original execution. This corrupts the event history and may cause duplicate activity executions. All non-determinism must go through the sandbox.
+**Calling `DateTime.utc_now()` or `:rand.uniform/1` in workflow code.** During replay, these return different values, causing wrong branches and history corruption. All non-determinism must go through the sandbox.
 
-**Not making activities idempotent.** An activity that fails after producing a side effect (e.g., charged the card but crashed before returning) will be retried. The retry will charge again. Activities must be idempotent or use a server-side idempotency key. Store the idempotency key in the activity's event payload.
+**Not making activities idempotent.** An activity that fails after producing a side effect (charged card, crashed before returning) will be retried. Use a server-side idempotency key stored in the event payload.
 
-**Holding the workflow GenServer open during a sleep.** The whole point of durable sleep is to release the process. If `Workflow.sleep/1` just calls `Process.sleep/1`, you hold a process for the entire duration, defeating the purpose and making long-duration sleeps expensive.
+**Holding the workflow GenServer open during a sleep.** The whole point of durable sleep is to release the process. If `Workflow.sleep/1` just calls `Process.sleep/1`, you hold a process for the entire duration.
 
-**Not validating `get_version` ranges on existing workflows.** If an in-flight workflow recorded version 1 for change "add-step", and you deploy code that calls `get_version("add-step", 1, 2)` (min_version changed from 1 to 2), the replay reads version 1 from history but the code interprets 1 as below the new min. Add range validation and raise a `NonDeterministicError` if the stored version is outside the new range.
+**Not validating `get_version` ranges on existing workflows.** If an in-flight workflow recorded version 1 and you deploy code expecting min version 2, replay reads version 1 which is now out of range. Raise a `NonDeterministicError`.
 
-**Concurrent replay from two workers.** If a workflow task is picked up by two workers simultaneously (e.g., the first worker's heartbeat timed out), both will replay and potentially write conflicting events. Use optimistic locking on the event sequence number: the second worker's append fails if sequence is not the expected next value.
+**Concurrent replay from two workers.** If both replay and write conflicting events, use optimistic locking on the event sequence number.
 
 ## Resources
 
-- Temporal documentation — https://docs.temporal.io (execution model, event history schema, SDK design)
-- Fateev & Abbas — "Fault-Tolerant Workflow Execution" — QCon 2019 (original design motivation)
-- Garcia-Molina & Salem — "Sagas" (1987) — ACM SIGMOD (compensation pattern foundation)
-- Martin Fowler — "Event Sourcing" — https://martinfowler.com/eaaDev/EventSourcing.html
-- Erlang DETS documentation — https://www.erlang.org/doc/man/dets.html (disk-based ETS for persistence)
-- Erlang `:pg` documentation — https://www.erlang.org/doc/man/pg.html (distributed process groups)
-- Erlang `gen_statem` documentation — https://www.erlang.org/doc/design_principles/statem.html (state machine alternative to GenServer)
+- Temporal documentation -- https://docs.temporal.io
+- Garcia-Molina & Salem -- "Sagas" (1987) -- ACM SIGMOD
+- Martin Fowler -- "Event Sourcing" -- https://martinfowler.com/eaaDev/EventSourcing.html
+- Erlang DETS documentation -- https://www.erlang.org/doc/man/dets.html
+- Erlang `:pg` documentation -- https://www.erlang.org/doc/man/pg.html

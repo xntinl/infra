@@ -1,17 +1,12 @@
 # RPC and Remote Calls
 
-**Project**: `api_gateway` — built incrementally across the advanced level
-
----
-
 ## Project context
 
-You're building `api_gateway`, an internal HTTP gateway that routes traffic to microservices.
-Routing, rate limiting, and caching are already working. Now you need to distribute
-administrative operations — configuration reloads, health checks, and stats collection —
-across a cluster of gateway nodes.
+You are building `api_gateway`, an internal HTTP gateway that routes traffic to microservices.
+This exercise focuses on distributing administrative operations -- configuration reloads,
+health checks, and stats collection -- across a cluster of gateway nodes.
 
-Project structure at this point:
+Project structure:
 
 ```
 api_gateway/
@@ -19,10 +14,6 @@ api_gateway/
 │   └── api_gateway/
 │       ├── application.ex
 │       ├── router.ex
-│       ├── rate_limiter/
-│       │   └── server.ex
-│       ├── cache/
-│       │   └── store.ex
 │       └── cluster/
 │           ├── rpc_client.ex
 │           └── health_check.ex
@@ -45,8 +36,8 @@ They also need periodic health checks across the cluster to detect nodes with de
 cache hit rates before they impact traffic. Both operations must:
 
 1. Fan out to all connected nodes **in parallel**, not sequentially
-2. Handle node failures gracefully — a slow or dead node must not block the others
-3. Distinguish between `:node_down`, `:timeout`, and `:remote_exception` — each has a
+2. Handle node failures gracefully -- a slow or dead node must not block the others
+3. Distinguish between `:node_down`, `:timeout`, and `:remote_exception` -- each has a
    different operational response
 
 ---
@@ -80,9 +71,9 @@ raises exceptions. Each requires a different error-handling pattern.
 When calling a named GenServer on a remote node, `GenServer.call({MyServer, node}, msg)`
 has an important advantage over `:rpc.call(node, Module, :function, [])`:
 
-- **Automatic 5s timeout** — built into GenServer, not something you manage
-- **Automatic monitor** — if the remote process dies mid-call, you get `{:exit, :noproc}` instead of hanging
-- **Supervisor-awareness** — the call respects the GenServer's message queue ordering
+- **Automatic 5s timeout** -- built into GenServer, not something you manage
+- **Automatic monitor** -- if the remote process dies mid-call, you get `{:exit, :noproc}` instead of hanging
+- **Supervisor-awareness** -- the call respects the GenServer's message queue ordering
 
 Use `:rpc`/`:erpc` for stateless function invocations. Use `GenServer.call` for
 calls to specific supervised processes.
@@ -106,9 +97,9 @@ defmodule ApiGateway.Cluster.RPCClient do
   Safe RPC wrapper for inter-node calls in the api_gateway cluster.
 
   Design decisions:
-  - Uses :erpc for all calls (OTP 23+) — no :rex bottleneck
-  - All public functions return tagged tuples — never raise to the caller
-  - Fanout is always parallel — never sequential with multiplied timeouts
+  - Uses :erpc for all calls (OTP 23+) -- no :rex bottleneck
+  - All public functions return tagged tuples -- never raise to the caller
+  - Fanout is always parallel -- never sequential with multiplied timeouts
   """
 
   @default_timeout_ms 5_000
@@ -193,7 +184,7 @@ defmodule ApiGateway.Cluster.RPCClient do
 
   @doc """
   Calls the same named GenServer on every node in the cluster.
-  Uses GenServer.call({name, node}, message) — not RPC.
+  Uses GenServer.call({name, node}, message) -- not RPC.
   Returns %{node => {:ok, reply} | {:error, reason}}.
 
   GenServer.call is preferred over :erpc for named processes because it provides
@@ -292,7 +283,7 @@ defmodule ApiGateway.Cluster.HealthCheck do
   end
 
   @doc """
-  Local diagnostics — runs on whatever node calls this function.
+  Local diagnostics -- runs on whatever node calls this function.
   Used by fanout as the remote target.
   """
   @spec collect() :: map()
@@ -308,7 +299,7 @@ defmodule ApiGateway.Cluster.HealthCheck do
 end
 ```
 
-### Step 4: Given tests — must pass without modification
+### Step 4: Tests
 
 ```elixir
 # test/api_gateway/cluster/rpc_client_test.exs
@@ -319,7 +310,6 @@ defmodule ApiGateway.Cluster.RPCClientTest do
 
   describe "call/5" do
     test "calls a function on the local node" do
-      # Calling node() itself with :erpc is valid
       assert {:ok, result} = RPCClient.call(node(), String, :upcase, ["hello"])
       assert result == "HELLO"
     end
@@ -338,8 +328,6 @@ defmodule ApiGateway.Cluster.RPCClientTest do
   describe "fanout/4" do
     test "returns a map with at least the local node entry" do
       results = RPCClient.fanout(String, :upcase, ["ping"])
-      # In a single-node test environment, Node.list() is empty.
-      # The implementation must handle this gracefully.
       assert is_map(results)
     end
 
@@ -426,15 +414,11 @@ mix test test/api_gateway/cluster/ --trace
 
 Benchee.run(
   %{
-    ":erpc.call — local node (baseline)" => fn ->
+    ":erpc.call -- local node (baseline)" => fn ->
       :erpc.call(node(), String, :upcase, ["benchmark"])
     end,
-    "RPCClient.call — wraps :erpc" => fn ->
+    "RPCClient.call -- wraps :erpc" => fn ->
       ApiGateway.Cluster.RPCClient.call(node(), String, :upcase, ["benchmark"])
-    end,
-    "GenServer.call — local named server" => fn ->
-      # Replace with an actual named GenServer in your app
-      GenServer.call(ApiGateway.Cache.Store, :stats)
     end
   },
   warmup: 2,
@@ -447,9 +431,7 @@ Benchee.run(
 mix run bench/rpc_bench.exs
 ```
 
-**Expected**: `RPCClient.call` overhead over raw `:erpc.call` should be < 5µs.
-The GenServer path will be faster for local named processes because it skips
-the `:erpc` spawn overhead.
+**Expected**: `RPCClient.call` overhead over raw `:erpc.call` should be < 5us.
 
 ---
 
@@ -459,7 +441,7 @@ the `:erpc` spawn overhead.
 |--------|------------|-------------|-------------------------------|------------------------|
 | Concurrency bottleneck | `:rex` process on remote | None | None | None |
 | Error format | `{:badrpc, reason}` | Raises exception | Raises on exit | None (fire and forget) |
-| Automatic timeout | Via 5th arg | Via 5th arg | Via 3rd arg (default 5s) | No — must implement |
+| Automatic timeout | Via 5th arg | Via 5th arg | Via 3rd arg (default 5s) | No -- must implement |
 | Automatic monitor | No | No | Yes (GenServer built-in) | No |
 | OTP version | Always | OTP 23+ | Always | Always |
 | Use case | Stateless admin ops | Stateless, high concurrency | Named supervised processes | Known PID, max throughput |
@@ -497,7 +479,7 @@ Only pass plain data (strings, atoms, maps, lists) as RPC arguments.
 
 ## Resources
 
-- [`:erpc` documentation — OTP 23+](https://www.erlang.org/doc/man/erpc.html) — read the error semantics section
-- [`:rpc` documentation](https://www.erlang.org/doc/man/rpc.html) — specifically the `:rex` architecture note
-- [Erlang in Anger — Fred Hebert](https://www.erlang-in-anger.com/) — chapter on distributed systems pitfalls (free PDF)
-- [Distributed Elixir — The Little Elixir and OTP Guidebook](https://www.manning.com/books/the-little-elixir-and-otp-guidebook) — chapter on distribution
+- [`:erpc` documentation -- OTP 23+](https://www.erlang.org/doc/man/erpc.html) -- read the error semantics section
+- [`:rpc` documentation](https://www.erlang.org/doc/man/rpc.html) -- specifically the `:rex` architecture note
+- [Erlang in Anger -- Fred Hebert](https://www.erlang-in-anger.com/) -- chapter on distributed systems pitfalls (free PDF)
+- [Distributed Elixir -- The Little Elixir and OTP Guidebook](https://www.manning.com/books/the-little-elixir-and-otp-guidebook) -- chapter on distribution

@@ -1,32 +1,32 @@
 # Advanced Ecto Queries
 
-**Project**: `api_gateway` — built incrementally across the advanced level
+## Overview
 
----
-
-## Project context
-
-The `api_gateway` umbrella has accumulated months of production data: request logs, client
-usage records, rate-limiting events, billing entries. The analytics team now needs queries
-that go beyond `Repo.all(Client)`: ranked usage reports, dynamic filters from the admin
-dashboard, atomic multi-table updates, and batch processing of millions of rows without
-loading them all into memory.
-
-All queries in this exercise live in `gateway_core`.
+Build advanced query patterns for an API gateway's analytics and billing system: window
+functions via `fragment/1`, dynamic filters with `dynamic/2`, atomic multi-table operations
+with `Ecto.Multi`, and streaming millions of rows with `Repo.stream`. All code lives in
+the gateway's core domain layer.
 
 Project structure:
 
 ```
-api_gateway_umbrella/apps/gateway_core/
-├── lib/gateway_core/
-│   ├── analytics.ex            # ← you implement this
-│   ├── billing/
-│   │   └── transfers.ex        # ← and this
-│   └── client_filters.ex       # ← and this
-└── test/gateway_core/
-    ├── analytics_test.exs      # given tests
-    ├── billing_transfers_test.exs
-    └── client_filters_test.exs
+api_gateway/
+├── lib/
+│   └── api_gateway/
+│       ├── repo.ex
+│       ├── schemas/
+│       │   ├── client.ex
+│       │   ├── request_log.ex
+│       │   └── billing_audit.ex
+│       ├── analytics.ex
+│       ├── billing/
+│       │   └── transfers.ex
+│       └── client_filters.ex
+└── test/
+    └── api_gateway/
+        ├── analytics_test.exs
+        ├── billing_transfers_test.exs
+        └── client_filters_test.exs
 ```
 
 ---
@@ -35,18 +35,16 @@ api_gateway_umbrella/apps/gateway_core/
 
 - **Window functions with `fragment`**: analytics dashboards need ranked data per category.
   Doing the ranking in Elixir requires loading all rows first. Doing it in SQL means the DB
-  returns only the ranked results — orders of magnitude less data over the wire.
+  returns only the ranked results.
 
-- **`dynamic/2` for optional filters**: building SQL strings by concatenation is an
-  injection risk and produces inconsistent query plans. `dynamic/2` composes boolean
-  expressions at the Ecto layer — a single consistent WHERE clause, never string manipulation.
+- **`dynamic/2` for optional filters**: building SQL strings by concatenation is an injection
+  risk. `dynamic/2` composes boolean expressions at the Ecto layer safely.
 
 - **`Ecto.Multi`**: any operation that modifies more than one table must be atomic. Without
-  `Multi`, a process crash between two `Repo.update` calls leaves the database inconsistent.
+  `Multi`, a crash between two `Repo.update` calls leaves the database inconsistent.
 
 - **`Repo.stream`**: loading 5 million billing records with `Repo.all` allocates gigabytes
-  of heap. `Repo.stream` uses PostgreSQL server-side cursors — it fetches rows in chunks
-  and processes them before fetching the next batch.
+  of heap. `Repo.stream` uses PostgreSQL server-side cursors -- fetching rows in chunks.
 
 ---
 
@@ -54,20 +52,19 @@ api_gateway_umbrella/apps/gateway_core/
 
 ### Part 1: Window functions with `fragment/1`
 
-The analytics team needs, per client, their request count and rank within their plan tier.
-
 ```elixir
-# lib/gateway_core/analytics.ex
-defmodule GatewayCore.Analytics do
+# lib/api_gateway/analytics.ex
+defmodule ApiGateway.Analytics do
   import Ecto.Query
-  alias GatewayCore.{Repo, RequestLog}
+  alias ApiGateway.{Repo, RequestLog, BillingEntry}
 
   @doc """
   Returns request counts per client with rank within their plan tier.
 
   Uses PostgreSQL `rank() OVER (PARTITION BY ...)` via fragment.
-  Ecto does not expose window functions as macros — fragment is the correct tool.
+  Ecto does not expose window functions as macros -- fragment is the correct tool.
   """
+  @spec client_usage_ranking() :: [map()]
   def client_usage_ranking do
     from(r in RequestLog,
       join: c in assoc(r, :client),
@@ -90,6 +87,7 @@ defmodule GatewayCore.Analytics do
   Running total of requests per client, ordered by time.
   Demonstrates cumulative window function.
   """
+  @spec client_request_running_totals(integer()) :: [map()]
   def client_request_running_totals(client_id) do
     from(r in RequestLog,
       where: r.client_id == ^client_id,
@@ -107,10 +105,11 @@ defmodule GatewayCore.Analytics do
   end
 
   @doc """
-  Clients whose total requests exceed the average across all clients.
+  Clients whose average request duration exceeds the global average.
 
-  Uses subquery/1 — the average is computed in the DB, no Elixir round-trip.
+  Uses subquery/1 -- the average is computed in the DB, no Elixir round-trip.
   """
+  @spec above_average_clients() :: [map()]
   def above_average_clients do
     avg_subquery =
       from(r in RequestLog,
@@ -125,6 +124,46 @@ defmodule GatewayCore.Analytics do
     )
     |> Repo.all()
   end
+
+  @doc """
+  Recalculates billing for all unprocessed request logs.
+
+  Uses Repo.stream to process rows in chunks without loading all into memory.
+  Must run inside a transaction -- PostgreSQL server-side cursors require it.
+  """
+  @spec recalculate_billing() :: {:ok, any()} | {:error, any()}
+  def recalculate_billing do
+    query = from(r in RequestLog,
+      where: r.billing_processed == false,
+      select: r
+    )
+
+    Repo.transaction(fn ->
+      query
+      |> Repo.stream(max_rows: 500)
+      |> Stream.map(&compute_billing_entry/1)
+      |> Stream.chunk_every(200)
+      |> Enum.each(fn batch ->
+        Repo.insert_all(BillingEntry, batch, on_conflict: :nothing)
+      end)
+    end, timeout: :infinity)
+  end
+
+  defp compute_billing_entry(%RequestLog{} = log) do
+    %{
+      client_id:    log.client_id,
+      request_id:   log.id,
+      cost:         calculate_cost(log.duration_ms, log.bytes_transferred),
+      computed_at:  DateTime.utc_now()
+    }
+  end
+
+  defp calculate_cost(duration_ms, bytes) do
+    base = Decimal.new("0.0001")
+    dur  = Decimal.mult(base, Decimal.new(div(duration_ms, 100)))
+    bw   = Decimal.mult(Decimal.new("0.00001"), Decimal.new(div(bytes, 1024)))
+    Decimal.add(dur, bw)
+  end
 end
 ```
 
@@ -133,28 +172,29 @@ end
 The admin dashboard has 6 optional filter fields. Never concatenate SQL strings.
 
 ```elixir
-# lib/gateway_core/client_filters.ex
-defmodule GatewayCore.ClientFilters do
+# lib/api_gateway/client_filters.ex
+defmodule ApiGateway.ClientFilters do
   import Ecto.Query
-  alias GatewayCore.{Repo, Client}
+  alias ApiGateway.{Repo, Client}
 
   @doc """
   Searches clients with optional filters from the admin dashboard.
 
   Accepted params (all optional, string-keyed):
-    "plan"         — "free" | "pro" | "enterprise"
-    "active"       — "true" | "false"
-    "min_requests" — integer
-    "max_requests" — integer
-    "name_like"    — substring match (case-insensitive)
-    "created_after" — ISO date string
+    "plan"         -- "free" | "pro" | "enterprise"
+    "active"       -- "true" | "false"
+    "min_requests" -- integer
+    "max_requests" -- integer
+    "name_like"    -- substring match (case-insensitive)
+    "created_after" -- ISO date string
   """
-  @spec search(map()) :: [Client.t()]
+  @spec search(map()) :: [map()]
   def search(params) when is_map(params) do
     Client
     |> where(^build_filters(params))
     |> join(:left, [c], r in assoc(c, :request_logs), as: :logs)
     |> group_by([c], c.id)
+    |> maybe_having(params)
     |> select([c, logs: r], %{client: c, request_count: count(r.id)})
     |> order_by([c], asc: c.name)
     |> Repo.all()
@@ -171,11 +211,6 @@ defmodule GatewayCore.ClientFilters do
       {"active", "false"}, acc ->
         dynamic([c], ^acc and c.active == false)
 
-      {"min_requests", n}, acc ->
-        # TODO: requires a subquery or join — this is a hint, not a complete solution
-        # HINT: dynamic/2 can reference joins by name: dynamic([logs: r], count(r.id) >= ^n)
-        acc
-
       {"name_like", q}, acc ->
         dynamic([c], ^acc and ilike(c.name, ^"%#{q}%"))
 
@@ -189,6 +224,16 @@ defmodule GatewayCore.ClientFilters do
         acc
     end)
   end
+
+  defp maybe_having(query, %{"min_requests" => n}) when is_integer(n) do
+    having(query, [c, logs: r], count(r.id) >= ^n)
+  end
+
+  defp maybe_having(query, %{"max_requests" => n}) when is_integer(n) do
+    having(query, [c, logs: r], count(r.id) <= ^n)
+  end
+
+  defp maybe_having(query, _params), do: query
 end
 ```
 
@@ -198,10 +243,10 @@ The billing system debits a client's quota and inserts an audit record. Both mus
 or both must fail.
 
 ```elixir
-# lib/gateway_core/billing/transfers.ex
-defmodule GatewayCore.Billing.Transfers do
+# lib/api_gateway/billing/transfers.ex
+defmodule ApiGateway.Billing.Transfers do
   import Ecto.Query
-  alias GatewayCore.{Repo, Client, BillingAudit}
+  alias ApiGateway.{Repo, Client, BillingAudit}
   alias Ecto.Multi
 
   @doc """
@@ -248,7 +293,7 @@ end
 Usage pattern:
 
 ```elixir
-case GatewayCore.Billing.Transfers.deduct_quota(client_id, 1_000, "api_batch_request") do
+case ApiGateway.Billing.Transfers.deduct_quota(client_id, 1_000, "api_batch_request") do
   {:ok, %{client: client, audit: _}} ->
     Logger.info("Quota deducted: client=#{client.id} remaining=#{client.quota_remaining}")
 
@@ -264,66 +309,14 @@ case GatewayCore.Billing.Transfers.deduct_quota(client_id, 1_000, "api_batch_req
 end
 ```
 
-### Part 4: `Repo.stream` for large datasets
-
-The compliance team runs monthly recalculations over all request logs. Loading everything
-into memory is not viable.
+### Step 4: Tests
 
 ```elixir
-# lib/gateway_core/analytics.ex (continued)
-defmodule GatewayCore.Analytics do
-  # ... (previous functions)
+# test/api_gateway/client_filters_test.exs
+defmodule ApiGateway.ClientFiltersTest do
+  use ApiGateway.DataCase
 
-  @doc """
-  Recalculates billing for all unprocessed request logs.
-
-  Uses Repo.stream to process rows in chunks without loading all into memory.
-  Must run inside a transaction — PostgreSQL server-side cursors require it.
-  """
-  def recalculate_billing do
-    query = from(r in RequestLog,
-      where: r.billing_processed == false,
-      select: r
-    )
-
-    Repo.transaction(fn ->
-      query
-      |> Repo.stream(max_rows: 500)       # PostgreSQL cursor: 500 rows per fetch
-      |> Stream.map(&compute_billing_entry/1)
-      |> Stream.chunk_every(200)           # batch inserts of 200 rows
-      |> Enum.each(fn batch ->
-        Repo.insert_all(BillingEntry, batch, on_conflict: :nothing)
-      end)
-    end, timeout: :infinity)
-  end
-
-  defp compute_billing_entry(%RequestLog{} = log) do
-    %{
-      client_id:    log.client_id,
-      request_id:   log.id,
-      cost:         calculate_cost(log.duration_ms, log.bytes_transferred),
-      computed_at:  DateTime.utc_now()
-    }
-  end
-
-  defp calculate_cost(duration_ms, bytes) do
-    # Billing formula: base rate + duration factor + bandwidth factor
-    base = Decimal.new("0.0001")
-    dur  = Decimal.mult(base, Decimal.new(div(duration_ms, 100)))
-    bw   = Decimal.mult(Decimal.new("0.00001"), Decimal.new(div(bytes, 1024)))
-    Decimal.add(dur, bw)
-  end
-end
-```
-
-### Step 5: Given tests — must pass without modification
-
-```elixir
-# test/gateway_core/client_filters_test.exs
-defmodule GatewayCore.ClientFiltersTest do
-  use GatewayCore.DataCase
-
-  alias GatewayCore.ClientFilters
+  alias ApiGateway.ClientFilters
 
   test "empty params returns all clients" do
     insert_list(3, :client)
@@ -372,12 +365,12 @@ end
 ```
 
 ```elixir
-# test/gateway_core/billing_transfers_test.exs
-defmodule GatewayCore.Billing.TransfersTest do
-  use GatewayCore.DataCase
+# test/api_gateway/billing_transfers_test.exs
+defmodule ApiGateway.Billing.TransfersTest do
+  use ApiGateway.DataCase
 
-  alias GatewayCore.Billing.Transfers
-  alias GatewayCore.Client
+  alias ApiGateway.Billing.Transfers
+  alias ApiGateway.Client
 
   test "deducts quota and creates audit entry" do
     client = insert(:client, quota_remaining: 10_000)
@@ -396,8 +389,7 @@ defmodule GatewayCore.Billing.TransfersTest do
     assert {:error, :check_quota, :insufficient_quota, _} =
       Transfers.deduct_quota(client.id, 1_000, "too_much")
 
-    # Verify quota was NOT changed (transaction rolled back)
-    assert GatewayCore.Repo.get!(Client, client.id).quota_remaining == 500
+    assert ApiGateway.Repo.get!(Client, client.id).quota_remaining == 500
   end
 
   test "fails with :client_not_found for unknown client" do
@@ -407,12 +399,11 @@ defmodule GatewayCore.Billing.TransfersTest do
 end
 ```
 
-### Step 6: Run the tests
+### Step 5: Run the tests
 
 ```bash
-mix test test/gateway_core/analytics_test.exs \
-         test/gateway_core/client_filters_test.exs \
-         test/gateway_core/billing_transfers_test.exs \
+mix test test/api_gateway/client_filters_test.exs \
+         test/api_gateway/billing_transfers_test.exs \
          --trace
 ```
 
@@ -420,7 +411,7 @@ Debug any query with:
 
 ```elixir
 # In iex -S mix:
-{sql, params} = GatewayCore.Repo.to_sql(:all, GatewayCore.ClientFilters.search(%{"plan" => "pro"}))
+{sql, params} = ApiGateway.Repo.to_sql(:all, ApiGateway.ClientFilters.search(%{"plan" => "pro"}))
 IO.puts(sql)
 ```
 
@@ -430,15 +421,11 @@ IO.puts(sql)
 
 | Technique | When to use | When NOT to use |
 |-----------|-------------|-----------------|
-| `fragment/1` for window functions | SQL-level aggregation that Ecto macros don't support | Simple counts, sums — use Ecto macros |
-| `dynamic/2` | Optional filters from user input | Fixed WHERE clauses — use `where/3` directly |
+| `fragment/1` for window functions | SQL-level aggregation that Ecto macros don't support | Simple counts, sums -- use Ecto macros |
+| `dynamic/2` | Optional filters from user input | Fixed WHERE clauses -- use `where/3` directly |
 | `Ecto.Multi` | Any change touching > 1 table | Single-table operations |
-| `Repo.stream` | > 100k rows; batch processing | Small result sets — overhead of cursor outweighs benefit |
-| `subquery/1` | Value depends on same DB | External computation — fetch separately |
-
-Reflection: `Repo.stream` requires `timeout: :infinity` on the wrapping transaction. In a
-web request context, this is dangerous — a slow stream blocks the DB connection indefinitely.
-Where should `recalculate_billing/0` be called? (Hint: Oban worker with `timeout/1` set.)
+| `Repo.stream` | > 100k rows; batch processing | Small result sets -- cursor overhead outweighs benefit |
+| `subquery/1` | Value depends on same DB | External computation -- fetch separately |
 
 ---
 
@@ -449,29 +436,27 @@ A table with 10 million rows loaded via `Repo.all` allocates the entire dataset 
 process heap. Always add `limit/2` for user-facing queries; use `Repo.stream` for batch jobs.
 
 **2. `dynamic/2` with user-controlled field names**
-`dynamic([c], ^acc and field(c, ^String.to_atom(user_input)) == ^value)` is safe for values
-but dangerous for field names if not validated against a whitelist. Always validate field
-names explicitly before converting to atoms.
+`dynamic([c], field(c, ^String.to_atom(user_input)) == ^value)` is dangerous for field names
+if not validated against a whitelist. Always validate field names before converting to atoms.
 
 **3. `Ecto.Multi` step returning `{:error, reason}` vs raising**
-If a Multi step raises, Ecto rolls back the transaction and re-raises. If it returns
-`{:error, reason}`, Ecto rolls back and returns `{:error, step_name, reason, changes}`.
-Decide which pattern you want and be consistent — mixing both makes error handling confusing.
+If a Multi step raises, Ecto rolls back and re-raises. If it returns `{:error, reason}`,
+Ecto rolls back and returns `{:error, step_name, reason, changes}`. Be consistent.
 
 **4. `Repo.stream` outside a transaction**
 PostgreSQL server-side cursors require an active transaction. Calling `Repo.stream` without
-wrapping in `Repo.transaction` raises `DBConnection.ConnectionError` at runtime.
+wrapping in `Repo.transaction` raises `DBConnection.ConnectionError`.
 
 **5. Window functions in `having/2`**
-Window functions are not allowed in `HAVING` clauses (only aggregate functions are). Wrap
-the window function result in a subquery if you need to filter on it.
+Window functions are not allowed in `HAVING` clauses. Wrap the window function result in a
+subquery if you need to filter on it.
 
 ---
 
 ## Resources
 
-- [`fragment/1`](https://hexdocs.pm/ecto/Ecto.Query.API.html#fragment/1) — inject raw SQL safely
-- [`dynamic/2`](https://hexdocs.pm/ecto/Ecto.Query.html#dynamic/2) — composable boolean expressions
-- [`Ecto.Multi`](https://hexdocs.pm/ecto/Ecto.Multi.html) — named, composable transactions
-- [`Repo.stream/2`](https://hexdocs.pm/ecto/Ecto.Repo.html#c:stream/2) — cursor-based streaming
-- [PostgreSQL window functions](https://www.postgresql.org/docs/current/tutorial-window.html) — complete reference
+- [`fragment/1`](https://hexdocs.pm/ecto/Ecto.Query.API.html#fragment/1) -- inject raw SQL safely
+- [`dynamic/2`](https://hexdocs.pm/ecto/Ecto.Query.html#dynamic/2) -- composable boolean expressions
+- [`Ecto.Multi`](https://hexdocs.pm/ecto/Ecto.Multi.html) -- named, composable transactions
+- [`Repo.stream/2`](https://hexdocs.pm/ecto/Ecto.Repo.html#c:stream/2) -- cursor-based streaming
+- [PostgreSQL window functions](https://www.postgresql.org/docs/current/tutorial-window.html) -- complete reference

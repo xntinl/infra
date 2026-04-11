@@ -1,32 +1,29 @@
 # Absinthe DataLoader and Auth Middleware
 
-**Project**: `api_gateway` — built incrementally across the advanced level
-
----
-
 ## Project context
 
-You're building `api_gateway`. The GraphQL schema is working (previous exercise).
-Under load the dashboard team reports slow queries: listing 50 services with their
-health status takes 50 individual HTTP checks instead of 1 batched call. You also
-need to gate mutations behind the gateway's existing auth middleware.
+You are building `api_gateway`, an internal HTTP gateway with a GraphQL API. This exercise adds DataLoader-based batching for the service health check field and authentication middleware that gates mutations. All modules — including the service store, schema, types, and resolvers — are defined from scratch here.
 
-Project structure at this point:
+Project structure:
 
 ```
 api_gateway/
 ├── lib/
 │   └── api_gateway/
-│       ├── graphql/
-│       │   ├── schema.ex           # already exists — add plugins/0 and middleware/3
-│       │   ├── middleware/
-│       │   │   ├── authenticate.ex # gates mutations behind auth
-│       │   │   └── handle_errors.ex # normalizes error formats
-│       │   └── loader.ex           # DataLoader KV source for health checks
-│       └── ...
+│       ├── service_store.ex                # Agent-backed service registry (defined here)
+│       └── graphql/
+│           ├── schema.ex                   # root schema with plugins/0 and middleware/3
+│           ├── types/
+│           │   └── service.ex              # service types with DataLoader status field
+│           ├── resolvers/
+│           │   └── service.ex              # resolver functions
+│           ├── middleware/
+│           │   ├── authenticate.ex         # gates mutations behind auth
+│           │   └── handle_errors.ex        # normalizes error formats
+│           └── loader.ex                   # DataLoader KV source for health checks
 ├── test/
 │   └── api_gateway/
-│       └── graphql_auth_test.exs   # given tests — must pass without modification
+│       └── graphql_auth_test.exs           # given tests — must pass without modification
 └── mix.exs
 ```
 
@@ -36,73 +33,89 @@ api_gateway/
 
 Two problems compound each other:
 
-**N+1 health checks**: the `status` field on each service calls an HTTP health endpoint.
-When the dashboard lists 50 services, that is 50 sequential HTTP calls. Each takes ~50ms.
-The query takes 2.5 seconds. DataLoader batches them: collect all health check URLs during
-the resolution of one GraphQL level, fire them concurrently, resolve all 50 fields from
-the single batched result.
+**N+1 health checks**: the `status` field on each service calls an HTTP health endpoint. When the dashboard lists 50 services, that is 50 sequential HTTP calls. DataLoader batches them: collect all health check URLs during the resolution of one GraphQL level, fire them concurrently, resolve all 50 fields from the single batched result.
 
-**Unauthenticated mutations**: `registerService` and `deregisterService` have no auth.
-Any caller can deregister production services. The auth middleware reads `current_client`
-from the Absinthe context (set by the Plug pipeline's `Auth` middleware) and aborts
-before the resolver runs if it is missing.
+**Unauthenticated mutations**: `registerService` and `deregisterService` have no auth. Any caller can deregister production services. The auth middleware reads `current_client` from the Absinthe context and aborts before the resolver runs if it is missing.
 
 ---
 
 ## Why DataLoader and not `Task.async_stream`
 
-You could batch health checks with `Task.async_stream` in the list resolver. But this
-couples batching logic to the list resolver — the detail resolver does not benefit, and
-any future field that needs health status re-implements the same pattern.
-
-DataLoader is a protocol-level solution: it operates at the GraphQL execution level,
-collecting all pending loads across the entire query tree (not just one resolver), then
-dispatching them before moving to the next resolution level. It works for any source:
-HTTP calls, database queries, external APIs.
+You could batch health checks with `Task.async_stream` in the list resolver. But this couples batching logic to the list resolver — the detail resolver does not benefit. DataLoader operates at the GraphQL execution level, collecting all pending loads across the entire query tree, then dispatching them before moving to the next resolution level.
 
 ---
 
 ## Why middleware instead of resolver-level auth checks
 
-Without middleware:
-
-```elixir
-def register_service(_, %{input: input}, %{context: %{current_client: client}})
-    when not is_nil(client) do
-  # actual logic
-end
-
-def register_service(_, _, _), do: {:error, "authentication required"}
-```
-
-Every mutation needs this guard. Add 10 mutations and you have 10 copies of the same
-pattern — and 10 places where a developer can forget the `when not is_nil(client)` guard.
-
-With `middleware MyApp.Middleware.Authenticate` in the schema's `middleware/3` callback,
-auth is applied to every mutation automatically at schema definition time. Forget it in
-one place, the schema enforces it everywhere.
+Without middleware, every mutation needs a guard clause. Add 10 mutations and you have 10 copies of the same pattern. With `middleware/3` in the schema, auth is applied to every mutation automatically at schema definition time.
 
 ---
 
 ## Implementation
 
-### Step 1: `mix.exs` — add dataloader
+### Step 1: `mix.exs`
 
 ```elixir
-{:dataloader, "~> 2.0"}
+defp deps do
+  [
+    {:jason, "~> 1.4"},
+    {:absinthe, "~> 1.7"},
+    {:absinthe_plug, "~> 1.5"},
+    {:dataloader, "~> 2.0"}
+  ]
+end
 ```
 
-### Step 2: `lib/api_gateway/graphql/loader.ex`
+### Step 2: `lib/api_gateway/service_store.ex`
+
+```elixir
+defmodule ApiGateway.ServiceStore do
+  @moduledoc """
+  In-memory registry of backend services.
+  Stores `%{name => %{name, url, health_path, registered_at}}`.
+  """
+  use Agent
+
+  @spec start_link(keyword()) :: Agent.on_start()
+  def start_link(_opts), do: Agent.start_link(fn -> %{} end, name: __MODULE__)
+
+  @spec list() :: [map()]
+  def list, do: Agent.get(__MODULE__, &Map.values/1)
+
+  @spec get(String.t()) :: map() | nil
+  def get(name), do: Agent.get(__MODULE__, &Map.get(&1, name))
+
+  @spec register(map()) :: map()
+  def register(attrs) do
+    Agent.get_and_update(__MODULE__, fn services ->
+      entry = Map.merge(attrs, %{"registered_at" => DateTime.utc_now() |> DateTime.to_iso8601()})
+      {entry, Map.put(services, attrs["name"], entry)}
+    end)
+  end
+
+  @spec deregister(String.t()) :: :ok | :error
+  def deregister(name) do
+    Agent.get_and_update(__MODULE__, fn services ->
+      case Map.pop(services, name) do
+        {nil, _} -> {:error, services}
+        {_entry, rest} -> {:ok, rest}
+      end
+    end)
+  end
+end
+```
+
+### Step 3: `lib/api_gateway/graphql/loader.ex`
 
 ```elixir
 defmodule ApiGateway.GraphQL.Loader do
   @moduledoc """
   DataLoader sources for api_gateway.
-
   Uses KV source (not Ecto) because the gateway's data lives in ETS and
   external HTTP endpoints, not a relational database.
   """
 
+  @spec health_source() :: Dataloader.KV.t()
   def health_source do
     Dataloader.KV.new(&fetch_health/2)
   end
@@ -139,17 +152,7 @@ defmodule ApiGateway.GraphQL.Loader do
 end
 ```
 
-The `fetch_health/2` function receives a batch key (`:health`) and a `MapSet` of URLs.
-It fans out concurrent HTTP checks using `Task.async_stream/3` with a limit of 20
-concurrent connections and a 5-second timeout per task. Each task attempts an HTTP GET
-and classifies the response: 2xx means `"healthy"`, anything else means `"unreachable"`.
-The try/catch/rescue block handles network errors, DNS failures, and timeouts
-uniformly — a health check failure should never crash the DataLoader.
-
-The results are collected into a `%{url => status}` map that DataLoader uses to resolve
-individual fields.
-
-### Step 3: `lib/api_gateway/graphql/middleware/authenticate.ex`
+### Step 4: `lib/api_gateway/graphql/middleware/authenticate.ex`
 
 ```elixir
 defmodule ApiGateway.GraphQL.Middleware.Authenticate do
@@ -157,9 +160,8 @@ defmodule ApiGateway.GraphQL.Middleware.Authenticate do
   Absinthe middleware that aborts resolution if no authenticated client
   is present in the context.
 
-  The Plug pipeline's Auth middleware sets conn.assigns[:client_id].
-  The schema's build_context/1 copies it into the Absinthe context as :current_client.
-  This middleware reads it.
+  The context key :current_client must be set by the caller (e.g., from
+  a Plug pipeline that validates X-Client-ID). This middleware reads it.
   """
   @behaviour Absinthe.Middleware
 
@@ -176,24 +178,14 @@ defmodule ApiGateway.GraphQL.Middleware.Authenticate do
 end
 ```
 
-The first clause matches when `current_client` is present and non-nil in the context.
-It passes the resolution through unchanged — the resolver will run normally.
-
-The second clause is the catch-all: no `current_client` in context, or it is nil.
-`Absinthe.Resolution.put_result/2` sets the field result to an error without running
-the resolver. The field resolves to `null` in the response, and the error message
-appears in the `errors` array. The query does not crash — other fields that do not
-require auth continue resolving normally.
-
-### Step 4: `lib/api_gateway/graphql/middleware/handle_errors.ex`
+### Step 5: `lib/api_gateway/graphql/middleware/handle_errors.ex`
 
 ```elixir
 defmodule ApiGateway.GraphQL.Middleware.HandleErrors do
   @moduledoc """
   Post-resolver middleware that normalizes error formats.
-
-  Runs after the resolver. Converts raw strings and Exception structs
-  to the map format Absinthe uses for the `errors` array in the response.
+  Converts raw strings and Exception structs to the map format
+  Absinthe uses for the `errors` array in the response.
   """
   @behaviour Absinthe.Middleware
 
@@ -211,13 +203,129 @@ defmodule ApiGateway.GraphQL.Middleware.HandleErrors do
 end
 ```
 
-### Step 5: Update `lib/api_gateway/graphql/schema.ex`
+### Step 6: `lib/api_gateway/graphql/types/service.ex`
+
+```elixir
+defmodule ApiGateway.GraphQL.Types.Service do
+  @moduledoc """
+  GraphQL types for backend services: object, input, queries, mutations.
+  The :status field uses DataLoader to batch health checks across services.
+  """
+  use Absinthe.Schema.Notation
+
+  @desc "A backend service registered in the gateway"
+  object :service do
+    field :name,          :string
+    field :url,           :string
+    field :health_path,   :string
+    field :registered_at, :string
+
+    field :status, :string do
+      resolve fn service, _, %{context: %{loader: loader}} ->
+        url = service["url"]
+
+        if url do
+          loader
+          |> Dataloader.load(:health, :health, url)
+          |> Absinthe.Resolution.Helpers.on_load(fn loader ->
+            status = Dataloader.get(loader, :health, :health, url)
+            {:ok, status || "unknown"}
+          end)
+        else
+          {:ok, "unknown"}
+        end
+      end
+    end
+  end
+
+  input_object :service_input do
+    field :name,        non_null(:string)
+    field :url,         non_null(:string)
+    field :health_path, :string
+  end
+
+  object :service_queries do
+    @desc "List all registered services"
+    field :services, list_of(:service) do
+      resolve &ApiGateway.GraphQL.Resolvers.Service.list_services/3
+    end
+
+    @desc "Get a service by name"
+    field :service, :service do
+      arg :name, non_null(:string)
+      resolve &ApiGateway.GraphQL.Resolvers.Service.get_service/3
+    end
+  end
+
+  object :service_mutations do
+    field :register_service, :service do
+      arg :input, non_null(:service_input)
+      resolve &ApiGateway.GraphQL.Resolvers.Service.register_service/3
+    end
+
+    field :deregister_service, :boolean do
+      arg :name, non_null(:string)
+      resolve &ApiGateway.GraphQL.Resolvers.Service.deregister_service/3
+    end
+  end
+end
+```
+
+### Step 7: `lib/api_gateway/graphql/resolvers/service.ex`
+
+```elixir
+defmodule ApiGateway.GraphQL.Resolvers.Service do
+  @moduledoc """
+  Resolver functions for the service queries and mutations.
+  """
+  alias ApiGateway.ServiceStore
+
+  @spec list_services(any(), map(), Absinthe.Resolution.t()) :: {:ok, [map()]}
+  def list_services(_, _, _), do: {:ok, ServiceStore.list()}
+
+  @spec get_service(any(), %{name: String.t()}, Absinthe.Resolution.t()) ::
+          {:ok, map()} | {:error, String.t()}
+  def get_service(_, %{name: name}, _) do
+    case ServiceStore.get(name) do
+      nil -> {:error, "service #{name} not found"}
+      service -> {:ok, service}
+    end
+  end
+
+  @spec register_service(any(), %{input: map()}, Absinthe.Resolution.t()) :: {:ok, map()}
+  def register_service(_, %{input: input}, _) do
+    string_keyed =
+      input
+      |> convert_to_map()
+      |> Enum.into(%{}, fn {k, v} -> {to_string(k), v} end)
+
+    service = ServiceStore.register(string_keyed)
+    {:ok, service}
+  end
+
+  @spec deregister_service(any(), %{name: String.t()}, Absinthe.Resolution.t()) ::
+          {:ok, boolean()} | {:error, String.t()}
+  def deregister_service(_, %{name: name}, _) do
+    case ServiceStore.deregister(name) do
+      :ok -> {:ok, true}
+      :error -> {:error, "service #{name} not found"}
+    end
+  end
+
+  defp convert_to_map(%_{} = struct), do: Map.from_struct(struct)
+  defp convert_to_map(map) when is_map(map), do: map
+end
+```
+
+### Step 8: `lib/api_gateway/graphql/schema.ex`
 
 ```elixir
 defmodule ApiGateway.GraphQL.Schema do
+  @moduledoc """
+  Root GraphQL schema for the api_gateway with DataLoader and auth middleware.
+  """
   use Absinthe.Schema
 
-  import_types ApiGateway.GraphQL.Types.Scalars
   import_types ApiGateway.GraphQL.Types.Service
 
   query do
@@ -228,12 +336,10 @@ defmodule ApiGateway.GraphQL.Schema do
     import_fields :service_mutations
   end
 
-  subscription do
-    import_fields :service_subscriptions
-  end
-
-  # Called once per request to build the Absinthe context.
-  # Copies the client_id from Plug assigns into the GraphQL context.
+  @doc """
+  Called once per request to build the Absinthe context.
+  Initializes DataLoader with the health check source.
+  """
   def context(ctx) do
     loader =
       Dataloader.new()
@@ -243,14 +349,18 @@ defmodule ApiGateway.GraphQL.Schema do
     |> Map.put(:loader, loader)
   end
 
-  # Required to activate DataLoader batching. Without this declaration,
-  # DataLoader fields silently resolve to nil — no error is raised.
+  @doc """
+  Required to activate DataLoader batching. Without this declaration,
+  DataLoader fields silently resolve to nil.
+  """
   def plugins do
     [Absinthe.Middleware.Dataloader | Absinthe.Plugin.defaults()]
   end
 
-  # Called for every field in the schema. Applies Authenticate to all
-  # mutations and HandleErrors to everything.
+  @doc """
+  Called for every field in the schema. Applies Authenticate to all
+  mutations and HandleErrors to everything.
+  """
   def middleware(middleware, _field, %Absinthe.Type.Object{identifier: :mutation}) do
     [ApiGateway.GraphQL.Middleware.Authenticate | middleware] ++
       [ApiGateway.GraphQL.Middleware.HandleErrors]
@@ -262,46 +372,9 @@ defmodule ApiGateway.GraphQL.Schema do
 end
 ```
 
-The `middleware/3` callback is invoked at schema compilation time for every field.
-It receives the current middleware stack, the field definition, and the parent object
-type. The implementation pattern-matches on `%Absinthe.Type.Object{identifier: :mutation}`
-to add `Authenticate` only to mutation fields. Read queries remain accessible without
-auth — appropriate for a dashboard that shows public service status.
+The `middleware/3` callback is invoked at schema compilation time for every field. It pattern-matches on `%Absinthe.Type.Object{identifier: :mutation}` to add `Authenticate` only to mutation fields. Read queries remain accessible without auth.
 
-`HandleErrors` is appended to every field so error normalization applies uniformly.
-
-### Step 6: Use DataLoader in the `status` field
-
-```elixir
-# In ApiGateway.GraphQL.Types.Service — update the :service object
-object :service do
-  field :name,          :string
-  field :url,           :string
-  field :health_path,   :string
-  field :registered_at, :datetime
-
-  # DataLoader batches all status checks for a list of services into one call
-  field :status, :string do
-    resolve fn service, _, %{context: %{loader: loader}} ->
-      loader
-      |> Dataloader.load(:health, :health, service["url"])
-      |> Absinthe.Resolution.Helpers.on_load(fn loader ->
-        status = Dataloader.get(loader, :health, :health, service["url"])
-        {:ok, status}
-      end)
-    end
-  end
-end
-```
-
-The `status` field resolver uses the deferred resolution pattern. Instead of making
-an HTTP call immediately, it calls `Dataloader.load/4` to register a pending load
-and `on_load/2` to provide a callback that runs after all pending loads at this
-resolution level are batched together. When Absinthe moves to the next resolution
-level, it calls `fetch_health/2` once with all collected URLs, then invokes each
-field's `on_load` callback with the populated loader.
-
-### Step 7: Given tests — must pass without modification
+### Step 9: Given tests — must pass without modification
 
 ```elixir
 # test/api_gateway/graphql_auth_test.exs
@@ -377,7 +450,7 @@ defmodule ApiGateway.GraphQL.AuthTest do
 end
 ```
 
-### Step 8: Run the tests
+### Step 10: Run the tests
 
 ```bash
 mix test test/api_gateway/graphql_auth_test.exs --trace
@@ -393,39 +466,24 @@ mix test test/api_gateway/graphql_auth_test.exs --trace
 | Scope | Entire query tree | One resolver | — |
 | Code location | Field resolver | List resolver | Field resolver |
 | Testability | Source tested in isolation | Resolver test | Field test |
-| Overhead | Deferred resolution | None | None |
 
-Reflection question: `plugins/0` in the schema must include `Absinthe.Middleware.Dataloader`.
-What happens if you add DataLoader to the loader but forget the plugin? Do you get an error,
-wrong results, or correct results? Run the test and find out.
+Reflection question: `plugins/0` in the schema must include `Absinthe.Middleware.Dataloader`. What happens if you add DataLoader to the loader but forget the plugin?
 
 ---
 
 ## Common production mistakes
 
 **1. Missing `plugins/0` declaration**
-DataLoader uses a deferred execution model that requires Absinthe's plugin infrastructure.
-Without `Absinthe.Middleware.Dataloader` in `plugins/0`, DataLoader fields resolve to nil
-silently. No error is raised.
+DataLoader fields resolve to nil silently. No error is raised.
 
 **2. `middleware/3` arity confusion**
-Absinthe's `middleware/3` callback receives `(middleware_list, field, object)`. Returning
-just a list replaces the entire middleware chain — including the built-in resolver middleware.
-Always manipulate the incoming `middleware` list, don't replace it with a bare new list.
+Always manipulate the incoming `middleware` list, don't replace it with a bare new list — that removes the built-in resolver middleware.
 
 **3. Context not propagated from Plug to Absinthe**
-`Absinthe.Plug` accepts a `context:` option that receives the conn and returns a map.
-Without it, `conn.assigns[:client_id]` never reaches the Absinthe context and the
-Authenticate middleware always denies requests.
+Without configuring `Absinthe.Plug` with a `context:` option, `conn.assigns[:client_id]` never reaches the Absinthe context and the Authenticate middleware always denies requests.
 
 **4. Authenticate middleware on queries**
-Read-only queries often should be accessible without auth (public dashboards, health
-checks). The `middleware/3` callback targets `%Absinthe.Type.Object{identifier: :mutation}`
-specifically so queries are not blocked.
-
-**5. DataLoader sources not added to the context**
-If `context/1` does not add the DataLoader source, the `loader` key is nil in the context
-and any field using `dataloader/1` raises a `KeyError` at runtime.
+Read-only queries often should be accessible without auth. The `middleware/3` callback targets mutations specifically so queries are not blocked.
 
 ---
 
