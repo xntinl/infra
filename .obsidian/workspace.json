@@ -210,6 +210,7 @@
   },
   "active": "80db5d002a546a52",
   "lastOpenFiles": [
+    "challenges/elixir/03-avanzado/71-rate-limiter-ets",
     "challenges/elixir/01-basico/04-strings-and-binaries-basics/04-strings-and-binaries-basics.md",
     "challenges/elixir/01-basico/01-setup-and-mix/test/lib/example.ex",
     "challenges/elixir/01-basico/01-setup-and-mix/test/scripts/main.exs",
@@ -245,7 +246,6 @@
     "challenges/advanced-topics/12-type-theory-and-fp/01-type-inference-and-hindley-milner/01-type-inference-and-hindley-milner.md",
     "challenges/elixir/03-avanzado/20-ets-counter-and-atomics/20-ets-counter-and-atomics.md",
     "challenges/advanced-topics/01-advanced-data-structures/02-bloom-filter-and-variants/02-bloom-filter-and-variants.md",
-    "challenges/elixir/03-avanzado/19-cache-patterns-ets/19-cache-patterns-ets.md",
     "Presentacion/poc-just/web/node_modules/ordered-binary/assets/powers-dre.png",
     "Presentacion/poc-just/web/node_modules/retry/equation.gif",
     "Untitled.canvas"
