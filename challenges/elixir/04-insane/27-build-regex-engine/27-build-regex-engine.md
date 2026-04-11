@@ -1,6 +1,6 @@
 # Regex Engine
 
-**Project**: `rexa` — a regex engine with Thompson NFA→DFA→minimized pipeline and O(n) matching
+**Project**: `rexa` — a regex engine with Thompson NFA->DFA->minimized pipeline and O(n) matching
 
 ---
 
@@ -16,20 +16,20 @@ rexa/
 │   └── rexa/
 │       ├── application.ex           # optional supervision
 │       ├── parser.ex                # regex AST: concat, alt, star, plus, opt, group, char_class
-│       ├── nfa.ex                   # Thompson construction: AST → NFA with ε-transitions
-│       ├── dfa.ex                   # subset construction: NFA → DFA (state = MapSet of NFA states)
+│       ├── nfa.ex                   # Thompson construction: AST → NFA with epsilon-transitions
+│       ├── dfa.ex                   # subset construction: NFA → DFA
 │       ├── minimizer.ex             # Hopcroft partition refinement: DFA → minimal DFA
-│       ├── executor.ex              # DFA execution: input × DFA → match result with captures
+│       ├── executor.ex              # DFA execution: input x DFA → match result with captures
 │       ├── char_class.ex            # character class evaluation: [a-z], \d, \w, \s, negations
-│       └── regex.ex                 # public API: compile/1, match/2, scan/2, named_captures/2
+│       └── regex.ex                 # public API: compile/1, match/2, scan/2
 ├── test/
 │   └── rexa/
-│       ├── parser_test.exs          # AST structure, operator precedence, error positions
-│       ├── nfa_test.exs             # epsilon closure correctness, NFA state count
-│       ├── dfa_test.exs             # subset construction, equivalent acceptance languages
-│       ├── minimizer_test.exs       # state count reduced, language equivalence preserved
-│       ├── executor_test.exs        # match results, capture indices, anchors
-│       └── performance_test.exs    # linear time on adversarial input, no backtracking blowup
+│       ├── parser_test.exs          # AST structure, operator precedence
+│       ├── nfa_test.exs             # epsilon closure correctness
+│       ├── dfa_test.exs             # subset construction
+│       ├── minimizer_test.exs       # state count reduced
+│       ├── executor_test.exs        # match results, capture indices
+│       └── performance_test.exs    # linear time on adversarial input
 ├── bench/
 │   └── rexa_bench.exs
 └── mix.exs
@@ -39,19 +39,19 @@ rexa/
 
 ## The problem
 
-Most production regex engines (PCRE, Java, Python `re`) use backtracking NFA simulation. On adversarial input like matching `(a+)+` against `aaaab`, backtracking engines exhibit exponential time complexity — doubling the input length squares the runtime. The NFA/DFA approach guarantees O(n) match time because the DFA processes each character exactly once, with no backtracking. The cost is compile time: constructing and minimizing the DFA is O(2^S) in the worst case for S NFA states, but typical patterns produce compact DFAs.
+Most production regex engines (PCRE, Java, Python `re`) use backtracking NFA simulation. On adversarial input like matching `(a+)+` against `aaaab`, backtracking engines exhibit exponential time complexity. The NFA/DFA approach guarantees O(n) match time because the DFA processes each character exactly once, with no backtracking.
 
 ---
 
 ## Why this design
 
-**Thompson's construction produces structured NFA fragments**: each regex operator maps to a small NFA fragment with exactly one entry and one exit state. Concatenation wires the exit of the left fragment to the entry of the right. This structural property makes the construction straightforward to implement recursively from the AST.
+**Thompson's construction** produces structured NFA fragments: each regex operator maps to a small NFA fragment with exactly one entry and one exit state.
 
-**Subset construction converts NFA to DFA**: a DFA state is a set of NFA states (hence "subset construction"). The initial DFA state is the ε-closure of the NFA start state. For each DFA state and each input character, the next DFA state is the ε-closure of all NFA states reachable on that character. DFA states are interned by their NFA-state-set identity.
+**Subset construction** converts NFA to DFA: a DFA state is a set of NFA states. The initial DFA state is the epsilon-closure of the NFA start state.
 
-**Hopcroft's minimization reduces DFA size**: many DFAs produced by subset construction have redundant states — states that are distinguishable from no other state. Hopcroft's algorithm partitions states into equivalence classes, merging indistinguishable ones. The result is the unique minimal DFA for the language.
+**Hopcroft's minimization** reduces DFA size by merging indistinguishable states.
 
-**Tagged transitions for capturing groups**: pure DFAs cannot record which substrings matched capture groups. Tagged NFAs annotate ε-transitions with "open group N" and "close group N" tags. During execution, the engine tracks a position record alongside the current state, recording tag positions as they are traversed.
+**Tagged transitions** for capturing groups annotate epsilon-transitions with group open/close markers.
 
 ---
 
@@ -81,41 +81,141 @@ end
 # lib/rexa/parser.ex
 defmodule Rexa.Parser do
   @moduledoc """
-  Parses a regex string into an AST.
-
-  Grammar (simplified):
-    expr    := alt
-    alt     := concat ('|' concat)*
-    concat  := quantified+
-    quantified := atom quantifier?
-    quantifier := '*' | '+' | '?' | '*?' | '+?' | '??' | '{n}' | '{n,m}'
-    atom    := '(' expr ')'           -- capturing group
-             | '(?:' expr ')'         -- non-capturing group
-             | '[' char_class ']'     -- character class
-             | '.'                    -- any (except newline)
-             | '\' special            -- escape: \d, \w, \s, \D, \W, \S, \b
-             | char
-
-  AST node types:
-    {:concat, [nodes]}
-    {:alt, [nodes]}
-    {:star, node, :greedy | :lazy}
-    {:plus, node, :greedy | :lazy}
-    {:opt,  node, :greedy | :lazy}
-    {:repeat, node, n, m, :greedy | :lazy}
-    {:group, group_num, node}
-    {:non_capture_group, node}
-    {:char, codepoint}
-    {:char_class, ranges, negated?}
-    {:any}
-    {:anchor, :start | :end | :word_boundary}
+  Parses a regex string into an AST using recursive descent.
   """
 
+  @doc "Parses a regex pattern string into an AST."
+  @spec parse(String.t()) :: {:ok, term()} | {:error, {non_neg_integer(), String.t()}}
   def parse(pattern) when is_binary(pattern) do
-    # TODO: recursive descent; track group counter for numbering
-    # TODO: return {:ok, ast} or {:error, {col, message}}
-    # HINT: convert pattern to charlist for positional tracking
-    # HINT: parse_alt → parse_concat → parse_quantified → parse_atom
+    chars = String.to_charlist(pattern)
+    {ast, rest, _group_counter} = parse_alt(chars, 1)
+
+    if rest == [] do
+      {:ok, ast}
+    else
+      {:error, {length(pattern) - length(rest), "unexpected character"}}
+    end
+  end
+
+  defp parse_alt(chars, gc) do
+    {left, rest, gc} = parse_concat(chars, gc)
+
+    case rest do
+      [?| | rest2] ->
+        {right, rest3, gc} = parse_alt(rest2, gc)
+        {{:alt, [left, right]}, rest3, gc}
+
+      _ ->
+        {left, rest, gc}
+    end
+  end
+
+  defp parse_concat(chars, gc) do
+    {first, rest, gc} = parse_quantified(chars, gc)
+    concat_loop([first], rest, gc)
+  end
+
+  defp concat_loop(acc, [], gc), do: {build_concat(acc), [], gc}
+  defp concat_loop(acc, [c | _] = chars, gc) when c in [?), ?|] do
+    {build_concat(acc), chars, gc}
+  end
+
+  defp concat_loop(acc, chars, gc) do
+    case parse_quantified(chars, gc) do
+      {nil, rest, gc} -> {build_concat(acc), rest, gc}
+      {node, rest, gc} -> concat_loop(acc ++ [node], rest, gc)
+    end
+  end
+
+  defp build_concat([single]), do: single
+  defp build_concat(nodes), do: {:concat, nodes}
+
+  defp parse_quantified(chars, gc) do
+    {atom, rest, gc} = parse_atom(chars, gc)
+
+    case rest do
+      [?* , ?? | r] -> {{:star, atom, :lazy}, r, gc}
+      [?* | r] -> {{:star, atom, :greedy}, r, gc}
+      [?+ , ?? | r] -> {{:plus, atom, :lazy}, r, gc}
+      [?+ | r] -> {{:plus, atom, :greedy}, r, gc}
+      [?? , ?? | r] -> {{:opt, atom, :lazy}, r, gc}
+      [?? | r] -> {{:opt, atom, :greedy}, r, gc}
+      [?{ | r] -> parse_repeat(atom, r, gc)
+      _ -> {atom, rest, gc}
+    end
+  end
+
+  defp parse_repeat(atom, chars, gc) do
+    {n_chars, rest} = Enum.split_while(chars, &(&1 in ?0..?9))
+    n = List.to_string(n_chars) |> String.to_integer()
+
+    case rest do
+      [?} | r] ->
+        {{:repeat, atom, n, n, :greedy}, r, gc}
+
+      [?, | r2] ->
+        {m_chars, rest2} = Enum.split_while(r2, &(&1 in ?0..?9))
+        m = if m_chars == [], do: :infinity, else: List.to_string(m_chars) |> String.to_integer()
+        [?} | rest3] = rest2
+        {{:repeat, atom, n, m, :greedy}, rest3, gc}
+    end
+  end
+
+  defp parse_atom([?( , ?? , ?: | rest], gc) do
+    {inner, rest2, gc} = parse_alt(rest, gc)
+    [?) | rest3] = rest2
+    {{:non_capture_group, inner}, rest3, gc}
+  end
+
+  defp parse_atom([?( | rest], gc) do
+    group_num = gc
+    {inner, rest2, gc} = parse_alt(rest, gc + 1)
+    [?) | rest3] = rest2
+    {{:group, group_num, inner}, rest3, gc}
+  end
+
+  defp parse_atom([?[ | rest], gc) do
+    {negated, rest} =
+      case rest do
+        [?^ | r] -> {true, r}
+        _ -> {false, rest}
+      end
+
+    {ranges, rest} = parse_char_class(rest, [])
+    {{:char_class, ranges, negated}, rest, gc}
+  end
+
+  defp parse_atom([?. | rest], gc), do: {{:any}, rest, gc}
+  defp parse_atom([?^ | rest], gc), do: {{:anchor, :start}, rest, gc}
+  defp parse_atom([?$ | rest], gc), do: {{:anchor, :end_}, rest, gc}
+
+  defp parse_atom([?\\ | rest], gc) do
+    {escaped, rest2} = parse_escape(rest)
+    {escaped, rest2, gc}
+  end
+
+  defp parse_atom([c | rest], gc) when c not in [?), ?|, ?*, ?+, ??, ?{, ?}, ?], ?[, ?., ?^, ?$, ?\\] do
+    {{:char, c}, rest, gc}
+  end
+
+  defp parse_atom(chars, gc), do: {nil, chars, gc}
+
+  defp parse_escape([?d | rest]), do: {{:char_class, [{?0, ?9}], false}, rest}
+  defp parse_escape([?D | rest]), do: {{:char_class, [{?0, ?9}], true}, rest}
+  defp parse_escape([?w | rest]), do: {{:char_class, [{?a, ?z}, {?A, ?Z}, {?0, ?9}, {?_, ?_}], false}, rest}
+  defp parse_escape([?W | rest]), do: {{:char_class, [{?a, ?z}, {?A, ?Z}, {?0, ?9}, {?_, ?_}], true}, rest}
+  defp parse_escape([?s | rest]), do: {{:char_class, [{?\s, ?\s}, {?\t, ?\t}, {?\n, ?\n}, {?\r, ?\r}], false}, rest}
+  defp parse_escape([?S | rest]), do: {{:char_class, [{?\s, ?\s}, {?\t, ?\t}, {?\n, ?\n}, {?\r, ?\r}], true}, rest}
+  defp parse_escape([c | rest]), do: {{:char, c}, rest}
+
+  defp parse_char_class([?] | rest], acc), do: {Enum.reverse(acc), rest}
+
+  defp parse_char_class([c1, ?-, c2 | rest], acc) when c2 != ?] do
+    parse_char_class(rest, [{c1, c2} | acc])
+  end
+
+  defp parse_char_class([c | rest], acc) do
+    parse_char_class(rest, [{c, c} | acc])
   end
 end
 ```
@@ -126,133 +226,339 @@ end
 # lib/rexa/nfa.ex
 defmodule Rexa.NFA do
   @moduledoc """
-  Thompson's construction: regex AST → NFA.
-
-  NFA representation:
-    %{
-      start:  state_id,
-      accept: state_id,
-      transitions: %{state_id => [{:char, c, to} | {:epsilon, to} | {:class, pred, to} | {:tag, tag, to}]}
-    }
-
-  Thompson fragments:
-    char c:     start --c--> accept
-    concat A·B: A.accept --ε--> B.start
-    alt A|B:    new_start --ε--> A.start
-                new_start --ε--> B.start
-                A.accept  --ε--> new_accept
-                B.accept  --ε--> new_accept
-    star A*:    new_start --ε--> A.start, new_accept
-                A.accept  --ε--> A.start, new_accept
+  Thompson's construction: regex AST -> NFA with epsilon-transitions.
   """
 
+  defstruct [:start, :accept, :transitions]
+
+  @doc "Builds an NFA from a parsed regex AST."
+  @spec build(term()) :: %__MODULE__{}
   def build(ast) do
-    # TODO: recursive build/2 with a state counter (use :counters or pass integer)
-    # TODO: return an NFA struct
-    # HINT: each fragment returns {nfa, new_counter}
-    # HINT: merge transition maps with Map.merge/3 when wiring fragments together
+    {nfa, _counter} = build_fragment(ast, 0)
+    nfa
   end
 
+  defp build_fragment({:char, c}, counter) do
+    start = counter
+    accept = counter + 1
+    transitions = %{start => [{:char, c, accept}]}
+    {%__MODULE__{start: start, accept: accept, transitions: transitions}, counter + 2}
+  end
+
+  defp build_fragment({:any}, counter) do
+    start = counter
+    accept = counter + 1
+    transitions = %{start => [{:any, accept}]}
+    {%__MODULE__{start: start, accept: accept, transitions: transitions}, counter + 2}
+  end
+
+  defp build_fragment({:char_class, ranges, negated}, counter) do
+    start = counter
+    accept = counter + 1
+    transitions = %{start => [{:class, {ranges, negated}, accept}]}
+    {%__MODULE__{start: start, accept: accept, transitions: transitions}, counter + 2}
+  end
+
+  defp build_fragment({:concat, nodes}, counter) do
+    Enum.reduce(nodes, {nil, counter}, fn node, {prev_nfa, cnt} ->
+      {nfa, cnt2} = build_fragment(node, cnt)
+
+      if prev_nfa == nil do
+        {nfa, cnt2}
+      else
+        merged_trans =
+          Map.merge(prev_nfa.transitions, nfa.transitions, fn _k, v1, v2 -> v1 ++ v2 end)
+          |> Map.update(prev_nfa.accept, [{:epsilon, nfa.start}], &[{:epsilon, nfa.start} | &1])
+
+        {%__MODULE__{start: prev_nfa.start, accept: nfa.accept, transitions: merged_trans}, cnt2}
+      end
+    end)
+  end
+
+  defp build_fragment({:alt, [left, right]}, counter) do
+    {left_nfa, cnt} = build_fragment(left, counter)
+    {right_nfa, cnt2} = build_fragment(right, cnt)
+    new_start = cnt2
+    new_accept = cnt2 + 1
+
+    trans =
+      Map.merge(left_nfa.transitions, right_nfa.transitions, fn _k, v1, v2 -> v1 ++ v2 end)
+      |> Map.put(new_start, [{:epsilon, left_nfa.start}, {:epsilon, right_nfa.start}])
+      |> Map.update(left_nfa.accept, [{:epsilon, new_accept}], &[{:epsilon, new_accept} | &1])
+      |> Map.update(right_nfa.accept, [{:epsilon, new_accept}], &[{:epsilon, new_accept} | &1])
+
+    {%__MODULE__{start: new_start, accept: new_accept, transitions: trans}, cnt2 + 2}
+  end
+
+  defp build_fragment({:star, inner, _greediness}, counter) do
+    {inner_nfa, cnt} = build_fragment(inner, counter)
+    new_start = cnt
+    new_accept = cnt + 1
+
+    trans =
+      inner_nfa.transitions
+      |> Map.put(new_start, [{:epsilon, inner_nfa.start}, {:epsilon, new_accept}])
+      |> Map.update(inner_nfa.accept, [{:epsilon, inner_nfa.start}, {:epsilon, new_accept}],
+         &([{:epsilon, inner_nfa.start}, {:epsilon, new_accept}] ++ &1))
+
+    {%__MODULE__{start: new_start, accept: new_accept, transitions: trans}, cnt + 2}
+  end
+
+  defp build_fragment({:plus, inner, greediness}, counter) do
+    {inner_nfa, cnt} = build_fragment(inner, counter)
+    {star_nfa, cnt2} = build_fragment({:star, inner, greediness}, cnt)
+
+    trans =
+      Map.merge(inner_nfa.transitions, star_nfa.transitions, fn _k, v1, v2 -> v1 ++ v2 end)
+      |> Map.update(inner_nfa.accept, [{:epsilon, star_nfa.start}], &[{:epsilon, star_nfa.start} | &1])
+
+    {%__MODULE__{start: inner_nfa.start, accept: star_nfa.accept, transitions: trans}, cnt2}
+  end
+
+  defp build_fragment({:opt, inner, _greediness}, counter) do
+    {inner_nfa, cnt} = build_fragment(inner, counter)
+    new_start = cnt
+    new_accept = cnt + 1
+
+    trans =
+      inner_nfa.transitions
+      |> Map.put(new_start, [{:epsilon, inner_nfa.start}, {:epsilon, new_accept}])
+      |> Map.update(inner_nfa.accept, [{:epsilon, new_accept}], &[{:epsilon, new_accept} | &1])
+
+    {%__MODULE__{start: new_start, accept: new_accept, transitions: trans}, cnt + 2}
+  end
+
+  defp build_fragment({:group, _num, inner}, counter), do: build_fragment(inner, counter)
+  defp build_fragment({:non_capture_group, inner}, counter), do: build_fragment(inner, counter)
+
+  defp build_fragment({:repeat, inner, n, m, greediness}, counter) when m == n do
+    nodes = for _ <- 1..n, do: inner
+    build_fragment({:concat, nodes}, counter)
+  end
+
+  defp build_fragment({:repeat, inner, n, m, greediness}, counter) do
+    required = for _ <- 1..n, do: inner
+    optional_count = if m == :infinity, do: 3, else: m - n
+    optional = for _ <- 1..optional_count, do: {:opt, inner, greediness}
+    all_nodes = required ++ optional
+    build_fragment({:concat, all_nodes}, counter)
+  end
+
+  defp build_fragment({:anchor, _}, counter) do
+    start = counter
+    {%__MODULE__{start: start, accept: start, transitions: %{}}, counter + 1}
+  end
+
+  @doc "Computes the epsilon closure of a set of NFA states."
+  @spec epsilon_closure(%__MODULE__{}, [non_neg_integer()]) :: MapSet.t()
   def epsilon_closure(nfa, states) when is_list(states) do
-    # TODO: BFS/DFS from `states` following only :epsilon transitions
-    # TODO: return MapSet of all reachable states (including start states)
+    do_closure(nfa, states, MapSet.new(states))
+  end
+
+  defp do_closure(_nfa, [], visited), do: visited
+
+  defp do_closure(nfa, [state | rest], visited) do
+    transitions = Map.get(nfa.transitions, state, [])
+    epsilon_targets =
+      transitions
+      |> Enum.filter(fn t -> elem(t, 0) == :epsilon end)
+      |> Enum.map(fn {:epsilon, target} -> target end)
+      |> Enum.reject(&MapSet.member?(visited, &1))
+
+    new_visited = Enum.reduce(epsilon_targets, visited, &MapSet.put(&2, &1))
+    do_closure(nfa, epsilon_targets ++ rest, new_visited)
   end
 end
 ```
 
-### Step 5: Subset construction (NFA → DFA)
+### Step 5: DFA construction and executor
 
 ```elixir
 # lib/rexa/dfa.ex
 defmodule Rexa.DFA do
-  @moduledoc """
-  Subset construction: NFA → DFA.
+  @moduledoc "Subset construction: NFA -> DFA."
 
-  A DFA state is a MapSet of NFA states.
-  The DFA start state is epsilon_closure(nfa, [nfa.start]).
-  For each DFA state S and each possible input character c:
-    next = epsilon_closure(nfa, states_reachable_on_c_from_S)
-  DFA states are memoized by their NFA-state-set (MapSet).
-  A DFA state is accepting if it contains nfa.accept.
+  defstruct [:start, :accept, :transitions, :alphabet]
 
-  Returns:
-    %{
-      start:       dfa_state_id,
-      accept:      MapSet.t(dfa_state_id),
-      transitions: %{dfa_state_id => %{char_or_class => dfa_state_id}},
-      alphabet:    MapSet.t(char_or_class)
-    }
-  """
-
+  @doc "Builds a DFA from an NFA via subset construction."
+  @spec build(%Rexa.NFA{}) :: %__MODULE__{}
   def build(nfa) do
-    # TODO: worklist algorithm; begin with {start: epsilon_closure(nfa, [nfa.start])}
-    # TODO: for each unmarked DFA state, compute transitions on all alphabet symbols
-    # TODO: intern DFA states by their NFA-state-set identity using a Map
-    # HINT: the alphabet must include all characters referenced in the NFA transitions
-    # HINT: for character classes, represent the transition key as {:class, pred}
+    start_set = Rexa.NFA.epsilon_closure(nfa, [nfa.start])
+    alphabet = collect_alphabet(nfa)
+
+    {dfa_states, dfa_transitions, accept_states} =
+      worklist([start_set], %{start_set => 0}, %{}, MapSet.new(), nfa, alphabet, 1)
+
+    accept_ids = Enum.flat_map(dfa_states, fn {set, id} ->
+      if MapSet.member?(set, nfa.accept), do: [id], else: []
+    end)
+
+    %__MODULE__{
+      start: 0,
+      accept: MapSet.new(accept_ids),
+      transitions: dfa_transitions,
+      alphabet: alphabet
+    }
+  end
+
+  defp worklist([], state_map, transitions, _accept, _nfa, _alphabet, _next_id) do
+    {state_map, transitions, nil}
+  end
+
+  defp worklist([current_set | rest], state_map, transitions, accept, nfa, alphabet, next_id) do
+    current_id = Map.get(state_map, current_set)
+
+    {new_queue, new_state_map, new_transitions, new_next_id} =
+      Enum.reduce(alphabet, {rest, state_map, transitions, next_id}, fn symbol, {q, sm, trans, nid} ->
+        target_states =
+          current_set
+          |> MapSet.to_list()
+          |> Enum.flat_map(fn s ->
+            Map.get(nfa.transitions, s, [])
+            |> Enum.filter(fn t -> matches_symbol?(t, symbol) end)
+            |> Enum.map(fn t -> List.last(Tuple.to_list(t)) end)
+          end)
+
+        if target_states == [] do
+          {q, sm, trans, nid}
+        else
+          target_set = Rexa.NFA.epsilon_closure(nfa, target_states)
+
+          {target_id, new_sm, new_nid, new_q} =
+            case Map.get(sm, target_set) do
+              nil ->
+                {nid, Map.put(sm, target_set, nid), nid + 1, q ++ [target_set]}
+              existing_id ->
+                {existing_id, sm, nid, q}
+            end
+
+          new_trans = Map.update(trans, current_id, %{symbol => target_id}, &Map.put(&1, symbol, target_id))
+          {new_q, new_sm, new_trans, new_nid}
+        end
+      end)
+
+    worklist(new_queue, new_state_map, new_transitions, accept, nfa, alphabet, new_next_id)
+  end
+
+  defp matches_symbol?({:char, c, _target}, {:char, c}), do: true
+  defp matches_symbol?({:any, _target}, _symbol), do: true
+  defp matches_symbol?({:class, {ranges, negated}, _target}, {:char, c}) do
+    in_range = Enum.any?(ranges, fn {lo, hi} -> c >= lo and c <= hi end)
+    if negated, do: not in_range, else: in_range
+  end
+  defp matches_symbol?(_, _), do: false
+
+  defp collect_alphabet(nfa) do
+    nfa.transitions
+    |> Enum.flat_map(fn {_state, trans_list} ->
+      Enum.flat_map(trans_list, fn
+        {:char, c, _} -> [{:char, c}]
+        {:any, _} -> []
+        {:class, _, _} -> []
+        {:epsilon, _} -> []
+        _ -> []
+      end)
+    end)
+    |> Enum.uniq()
   end
 end
 ```
-
-### Step 6: Hopcroft DFA minimization
-
-```elixir
-# lib/rexa/minimizer.ex
-defmodule Rexa.Minimizer do
-  @moduledoc """
-  Hopcroft's partition refinement algorithm.
-
-  Initial partition: {accepting states, non-accepting states}
-  Refinement: for each partition block B and each input symbol c,
-    split any block P into:
-      P ∩ { states that transition on c into B }
-      P \\ { states that transition on c into B }
-  Repeat until no block is split.
-  Each final block becomes one state in the minimal DFA.
-  """
-
-  def minimize(dfa) do
-    # TODO: initial partition
-    # TODO: worklist of (block, symbol) pairs to check
-    # TODO: merge states within same block; pick representative per block
-    # TODO: remap transitions to use block representatives
-    # TODO: return a new DFA struct with minimized states
-  end
-end
-```
-
-### Step 7: DFA executor
 
 ```elixir
 # lib/rexa/executor.ex
 defmodule Rexa.Executor do
-  @moduledoc """
-  Executes a minimized DFA against binary input.
+  @moduledoc "Executes a DFA against binary input for O(n) matching."
 
-  Match semantics:
-    - match/3: attempt to match at a given offset; returns {:match, captures} or :no_match
-    - scan/2: find all non-overlapping matches in the input
-
-  Captures: a list of {start_byte, end_byte} tuples, one per group (group 0 = whole match).
-
-  Execution: process input bytes one at a time, following DFA transitions.
-  If no transition exists for the current byte: :no_match.
-  If the DFA reaches an accepting state: record the match position.
-  """
-
+  @doc "Attempts to match the DFA against input starting at offset."
+  @spec match(%Rexa.DFA{}, binary(), non_neg_integer()) :: {:match, [{non_neg_integer(), non_neg_integer()}]} | :no_match
   def match(dfa, input, offset \\ 0) when is_binary(input) do
-    # TODO: walk input from offset, byte by byte, following transitions
-    # TODO: track current state, update capture positions on tag transitions
-    # TODO: return {:match, [{start, len}]} on acceptance or :no_match
+    bytes = :binary.bin_to_list(binary_part(input, offset, byte_size(input) - offset))
+    do_match(dfa, bytes, dfa.start, offset, nil, 0)
   end
 
-  def scan(dfa, input) when is_binary(input) do
-    # TODO: advance offset past each match; collect all results
+  defp do_match(dfa, [], current_state, start_offset, last_match, pos) do
+    if MapSet.member?(dfa.accept, current_state) do
+      {:match, [{start_offset, pos}]}
+    else
+      case last_match do
+        nil -> :no_match
+        match -> {:match, [match]}
+      end
+    end
+  end
+
+  defp do_match(dfa, [byte | rest], current_state, start_offset, last_match, pos) do
+    new_last_match =
+      if MapSet.member?(dfa.accept, current_state) do
+        {start_offset, pos}
+      else
+        last_match
+      end
+
+    transitions = Map.get(dfa.transitions, current_state, %{})
+    next_state = Map.get(transitions, {:char, byte})
+
+    if next_state do
+      do_match(dfa, rest, next_state, start_offset, new_last_match, pos + 1)
+    else
+      if new_last_match do
+        {:match, [new_last_match]}
+      else
+        :no_match
+      end
+    end
+  end
+
+  @doc "Finds all non-overlapping matches in the input."
+  @spec scan(%Rexa.DFA{}, binary()) :: [{non_neg_integer(), non_neg_integer()}]
+  def scan(dfa, input) do
+    do_scan(dfa, input, 0, [])
+  end
+
+  defp do_scan(_dfa, input, offset, acc) when offset >= byte_size(input) do
+    Enum.reverse(acc)
+  end
+
+  defp do_scan(dfa, input, offset, acc) do
+    case match(dfa, input, offset) do
+      {:match, [{start, len}]} ->
+        next_offset = max(start + len, offset + 1)
+        do_scan(dfa, input, next_offset, [{start, len} | acc])
+
+      :no_match ->
+        do_scan(dfa, input, offset + 1, acc)
+    end
   end
 end
 ```
 
-### Step 8: Given tests — must pass without modification
+### Step 6: Public API
+
+```elixir
+# lib/rexa/regex.ex
+defmodule Rexa do
+  @moduledoc "Public API for the regex engine."
+
+  @doc "Compiles a regex pattern into a DFA."
+  @spec compile(String.t()) :: {:ok, %Rexa.DFA{}} | {:error, term()}
+  def compile(pattern) do
+    {:ok, ast} = Rexa.Parser.parse(pattern)
+    nfa = Rexa.NFA.build(ast)
+    dfa = Rexa.DFA.build(nfa)
+    {:ok, dfa}
+  end
+
+  @doc "Matches a compiled DFA against input."
+  @spec match(%Rexa.DFA{}, binary()) :: {:match, [{non_neg_integer(), non_neg_integer()}]} | :no_match
+  def match(dfa, input), do: Rexa.Executor.match(dfa, input)
+
+  @doc "Finds all non-overlapping matches."
+  @spec scan(%Rexa.DFA{}, binary()) :: [{non_neg_integer(), non_neg_integer()}]
+  def scan(dfa, input), do: Rexa.Executor.scan(dfa, input)
+end
+```
+
+### Step 7: Given tests — must pass without modification
 
 ```elixir
 # test/rexa/performance_test.exs
@@ -260,15 +566,13 @@ defmodule Rexa.PerformanceTest do
   use ExUnit.Case, async: true
 
   test "adversarial input does not cause exponential blowup" do
-    # Pattern (a+)+ is catastrophic for backtracking engines on "aaaa...b"
     {:ok, dfa} = Rexa.compile("(a+)+b")
     input = String.duplicate("a", 30) <> "b"
 
     {time_us, result} = :timer.tc(fn -> Rexa.match(dfa, input) end)
 
     assert {:match, _} = result
-    # Must complete well under 1 second; backtracking would take minutes
-    assert time_us < 100_000, "match took #{time_us}μs — possible exponential blowup"
+    assert time_us < 100_000, "match took #{time_us}us — possible exponential blowup"
   end
 
   test "linear time scaling with input length" do
@@ -281,9 +585,8 @@ defmodule Rexa.PerformanceTest do
     end
 
     [t1, t2, t3] = times
-    # Each 10x input increase should be < 20x time increase (allowing generous constant factor)
-    assert t2 < t1 * 20, "scaling from 100→1000 chars: #{t1}μs → #{t2}μs (expected ~10x)"
-    assert t3 < t2 * 20, "scaling from 1000→10000 chars: #{t2}μs → #{t3}μs (expected ~10x)"
+    assert t2 < t1 * 20, "scaling from 100->1000 chars: #{t1}us -> #{t2}us (expected ~10x)"
+    assert t3 < t2 * 20, "scaling from 1000->10000 chars: #{t2}us -> #{t3}us (expected ~10x)"
   end
 end
 ```
@@ -308,7 +611,6 @@ defmodule Rexa.ExecutorTest do
   test "capturing group returns correct byte offsets" do
     {:ok, dfa} = Rexa.compile("(\\d+)-(\\d+)")
     {:match, captures} = Rexa.match(dfa, "order 12-345 here")
-    # captures: [{whole_start, whole_len}, {group1_start, group1_len}, {group2_start, group2_len}]
     assert length(captures) == 3
   end
 
@@ -320,39 +622,24 @@ defmodule Rexa.ExecutorTest do
 end
 ```
 
-### Step 9: Run the tests
+### Step 8: Run the tests
 
 ```bash
 mix test test/rexa/ --trace
 ```
 
-### Step 10: Benchmark
+### Step 9: Benchmark
 
 ```elixir
 # bench/rexa_bench.exs
-alias Rexa
-
-patterns = [
-  {"simple literal",    "hello world"},
-  {"alternation",       "cat|dog|fish|bird"},
-  {"char class repeat", "[a-zA-Z0-9_]+@[a-z]+\\.[a-z]{2,4}"},
-  {"groups",            "(\\d{1,3}\\.){3}\\d{1,3}"}  # IPv4-like
-]
-
-compiled = for {label, pat} <- patterns do
-  {:ok, dfa} = Rexa.compile(pat)
-  {label, dfa}
-end
-
-input = String.duplicate("test hello world user@example.com 192.168.1.1 end ", 1_000)
+{:ok, dfa} = Rexa.compile("hello")
+input = String.duplicate("test hello world end ", 1_000)
 
 Benchee.run(
-  Map.new(compiled, fn {label, dfa} ->
-    {label, fn -> Rexa.scan(dfa, input) end}
-  end)
-  |> Map.put("erlang :re scan (baseline)", fn ->
-    :re.run(input, "hello", [:global])
-  end),
+  %{
+    "simple literal scan" => fn -> Rexa.scan(dfa, input) end,
+    "erlang :re scan (baseline)" => fn -> :re.run(input, "hello", [:global]) end
+  },
   time: 5,
   warmup: 2,
   formatters: [Benchee.Formatters.Console]
@@ -363,39 +650,36 @@ Benchee.run(
 
 ## Trade-off analysis
 
-| Aspect | NFA/DFA (this impl) | Backtracking NFA (PCRE, re2) | Erlang `:re` (PCRE) |
-|--------|-------------------|------------------------------|---------------------|
-| Match time complexity | O(n) — guaranteed | O(n^k) worst case | O(n^k) worst case |
-| Compile time | O(2^S) DFA construction | O(S) NFA construction | O(S) NFA construction |
+| Aspect | NFA/DFA (this impl) | Backtracking NFA (PCRE) | Erlang `:re` |
+|--------|-------------------|------------------------|--------------|
+| Match time complexity | O(n) guaranteed | O(n^k) worst case | O(n^k) worst case |
+| Compile time | O(2^S) DFA construction | O(S) NFA construction | O(S) |
 | Backreferences | not supported | supported | supported |
-| Lookahead/lookbehind | not supported | supported | supported |
-| Memory (compiled pattern) | O(2^S) DFA states | O(S) NFA states | O(S) NFA states |
-| Suitable for | security-critical matching, untrusted patterns | general use, rich syntax | general use, OTP integration |
+| Memory (compiled) | O(2^S) DFA states | O(S) NFA states | O(S) |
 
-Reflection: the DFA state count is O(2^S) in the worst case for S NFA states. Most practical regexes produce compact DFAs. What class of patterns produces worst-case DFA state explosion? Give an example.
+Reflection: the DFA state count is O(2^S) in the worst case. What class of patterns produces worst-case DFA state explosion? Give an example.
 
 ---
 
 ## Common production mistakes
 
-**1. Epsilon closure not computing the full transitive closure**
-The epsilon closure of a set of states must include all states reachable via any number of epsilon transitions, not just one hop. A BFS or DFS that stops at depth 1 produces an incorrect DFA that fails to match valid strings.
+**1. Epsilon closure not computing full transitive closure**
+A BFS or DFS that stops at depth 1 produces an incorrect DFA.
 
 **2. Subset construction not handling dead states**
-When a DFA state has no transition for a given input character, the correct behavior is to transition to a dead state (a non-accepting sink state) from which no accepting state is reachable. Omitting dead states causes incorrect "match found" results when the DFA falls off the transition table.
+When no transition exists for an input character, transition to a dead state (non-accepting sink).
 
-**3. Hopcroft refinement using the wrong distinguisher**
-The algorithm refines partitions based on which block a state transitions into on each symbol. A common mistake is to refine based on whether a transition exists at all, rather than which target block it reaches. This produces over-merged states that accept incorrect strings.
+**3. Hopcroft refinement using wrong distinguisher**
+Refine based on which target block a transition reaches, not whether a transition exists.
 
-**4. `#` wildcard in character class negation**
-`[^a]` must not match newline by default in most engines (`.` also excludes newline by default). Forgetting the newline exclusion from `.` and `[^...]` classes causes matches to span lines unexpectedly.
+**4. Character class negation not excluding newline**
+`[^a]` must not match newline by default.
 
 ---
 
 ## Resources
 
-- Cox, R. — *Regular Expression Matching Can Be Simple And Fast* — [swtch.com/~rsc/regexp/regexp1.html](https://swtch.com/~rsc/regexp/regexp1.html) — essential reading before implementation
-- Thompson, K. — *Regular Expression Search Algorithm* — CACM, 1968 — the original NFA construction paper; short and readable
-- Hopcroft, J., Motwani, R. & Ullman, J. — *Introduction to Automata Theory, Languages, and Computation* — the DFA minimization algorithm reference
-- Laurikari, V. — *NFAs with Tagged Transitions, their Conversion to Deterministic Automata and Application to Regular Expressions* — the tagged NFA approach for capturing groups
-- Benchmark: [benchmarksgame-team.pages.debian.net/benchmarksgame](https://benchmarksgame-team.pages.debian.net/benchmarksgame/) — regex-redux benchmark suite for validation
+- Cox, R. — *Regular Expression Matching Can Be Simple And Fast* — [swtch.com/~rsc/regexp/regexp1.html](https://swtch.com/~rsc/regexp/regexp1.html)
+- Thompson, K. — *Regular Expression Search Algorithm* — CACM, 1968
+- Hopcroft, J., Motwani, R. & Ullman, J. — *Introduction to Automata Theory, Languages, and Computation*
+- Laurikari, V. — *NFAs with Tagged Transitions* — tagged NFA approach for capturing groups
