@@ -1,143 +1,601 @@
 # 54. Build an AI Agents Framework
 
-**Difficulty**: Insane
+## Context
 
-**Estimated time**: 120+ hours
+Your team is building an AI assistant for a legal research platform. The assistant must search case law databases, summarize documents, run code to compute statistics, and delegate specialized tasks (contract analysis, precedent ranking) to specialist sub-agents. The orchestration logic is complex: plan a research question, call search tools, analyze results, synthesize findings, produce a final report.
 
-## Overview
+Python frameworks (LangChain, AutoGen) are considered but rejected: they carry runtime overhead, cannot model OTP supervision, and mix the orchestration loop with LLM provider specifics. The BEAM is a natural fit: each agent is a process, failures are isolated, the supervisor tree handles restarts, and `Task.async_stream` handles parallel tool calls.
 
-Large Language Models become genuinely useful when they can plan, act, and recover — not just respond. The "agent loop" is the architectural primitive that makes this possible: a stateful process that receives a goal, decides which tools to call, observes the results, and iterates until the goal is satisfied or a failure condition is reached. Python ecosystems (LangChain, AutoGen, CrewAI) have explored this space, but they carry runtime overhead, lack native concurrency primitives, and cannot model the supervision and fault isolation that production systems demand.
+You will build `AgentFramework`: a native BEAM AI agents framework. No LangChain. No external runtimes. The only external protocol boundary is the HTTP wire format to the LLM provider.
 
-Elixir and OTP are a near-perfect substrate for agents: each agent is a process, failures are isolated, supervision trees handle restarts, and the actor model maps directly to message-passing between agents. This challenge asks you to build that framework from first principles — not a wrapper around a Python library, but a native BEAM implementation where OTP patterns are the architecture, not an afterthought.
+## Why agents are GenServers and not plain Task processes
 
-## The Challenge
+An agent must hold state across multiple turns: conversation history, tool registry, memory, cost accumulator. A `Task` is stateless and terminates. A `GenServer` holds state indefinitely, can be supervised (auto-restarted on crash), registered by name (discoverable by other agents), and receives messages (for approval signals, streaming results). The actor model maps directly to the agent abstraction.
 
-Design and implement a production-grade AI Agents Framework in Elixir where agents are OTP processes that can plan, call tools, maintain memory, coordinate with other agents, stream responses, and operate correctly under partial failures. The framework must be usable as a library: a developer imports it, defines tools and agents, and builds multi-agent systems without understanding the internals.
+## Why the ReAct loop must be a recursive function, not multiple GenServer callbacks
 
-The framework must support both the ReAct pattern (Reason + Act interleaved) and a planner-executor pattern (decompose goal into sub-tasks, assign to specialists). It must handle LLM providers at the protocol level, not the library level — the only dependency on any specific LLM is the HTTP wire format.
+The ReAct loop is: call LLM → if tool calls, execute tools → call LLM again → repeat until final response. If implemented as `handle_call` → `handle_cast` → `handle_call` (multiple rounds), the agent's `GenServer` mailbox queues incoming messages from other processes between each LLM call. This causes ordering problems: a `stop` signal from the supervisor arrives between two LLM calls but is not processed until the loop completes. A private recursive function holds the control flow without yielding the GenServer between iterations.
 
-## Core Requirements
+## Why sandbox code execution requires AST analysis before evaluation
 
-### 1. Agent Primitive
+`Code.eval_string/1` executes arbitrary Elixir code with full access to the BEAM. A user-supplied snippet that calls `File.read("/etc/passwd")` or `:os.cmd("rm -rf /")` causes real damage. Allowing the LLM to generate and run arbitrary code requires a sandboxing layer. The AST analysis approach: parse with `Code.string_to_quoted!/1`, walk the AST with `Macro.prewalk/2`, and reject any node that calls forbidden modules (`File`, `Port`, `System`, `:os`, `:file`, etc.). This is static analysis before evaluation.
 
-Each agent is a `GenServer` that holds: a system prompt, a conversation history as a list of `%Message{role, content, tool_calls, tool_results}` structs, a registered tool set, a planning mode (`:react` or `:planner`), and a cost accumulator. The agent runs an agentic loop: send the current history to the LLM, parse the response, if the response contains tool calls then execute each tool, append the results to history, and recurse — terminating when the LLM produces a final text response with no tool calls, or when a configurable `max_iterations` limit is reached. The loop must be implemented as a private recursive function, not as multiple `handle_call` round-trips.
+## Project Structure
 
-### 2. Tool System
+```
+agent_framework/
+├── mix.exs
+├── lib/
+│   └── agent_framework/
+│       ├── agent.ex               # GenServer: history, tools, ReAct loop
+│       ├── tool.ex                # Tool behaviour: name/0, description/0, parameters_schema/0, execute/1
+│       ├── tools/
+│       │   ├── web_search.ex      # WebSearchTool
+│       │   ├── code_execution.ex  # CodeExecutionTool with AST sandbox
+│       │   ├── database_query.ex  # DatabaseQueryTool (SELECT only)
+│       │   └── agent_call.ex      # AgentCallTool: delegate to named agent
+│       ├── llm/
+│       │   ├── behaviour.ex       # LLM behaviour: complete/2, stream/3
+│       │   ├── anthropic.ex       # Anthropic Claude wire format
+│       │   ├── openai.ex          # OpenAI GPT wire format
+│       │   └── retry.ex           # Exponential backoff + fallback model
+│       ├── memory/
+│       │   ├── short_term.ex      # Conversation history + context summarization
+│       │   ├── long_term.ex       # pgvector RAG: embed, store, retrieve
+│       │   └── episodic.ex        # Decision log: tool calls with rationale
+│       ├── supervisor.ex          # Supervision tree: agents, pool, marketplace
+│       ├── pool.ex                # PoolSupervisor: bounded queue, least-loaded dispatch
+│       ├── marketplace.ex         # Registry: capabilities, embedding-based discovery
+│       ├── stats.ex               # ETS: per-agent metrics, cost tracking
+│       ├── streaming.ex           # Finch SSE streaming + chunk forwarding
+│       └── hitl.ex                # Human-in-the-loop approval protocol
+├── test/
+│   ├── support/
+│   │   └── mock_llm.ex            # Mock LLM for unit tests (no external calls)
+│   ├── agent_test.exs
+│   ├── tools/
+│   │   ├── code_execution_test.exs
+│   │   └── database_query_test.exs
+│   ├── memory_test.exs
+│   ├── pool_test.exs
+│   └── marketplace_test.exs
+└── bench/
+    └── concurrent_agents.exs
+```
 
-A tool is a module implementing the `AgentFramework.Tool` behaviour with four callbacks: `name/0` returning a string identifier, `description/0` returning a human-readable string for the LLM, `parameters_schema/0` returning a JSON Schema map that the framework serializes into the LLM request, and `execute/1` receiving the validated parameter map and returning `{:ok, result}` or `{:error, reason}`. The framework validates tool inputs against the schema before calling `execute/1` — malformed inputs are returned to the LLM as a structured error without calling the tool. Tool execution timeout is configurable per tool, defaulting to 30 seconds. A tool that times out returns `{:error, :timeout}` to the loop without crashing the agent.
+## Step 1 — Tool behaviour
 
-### 3. Built-in Tool Implementations
+```elixir
+defmodule AgentFramework.Tool do
+  @callback name() :: String.t()
+  @callback description() :: String.t()
+  @callback parameters_schema() :: map()  # JSON Schema
+  @callback execute(params :: map()) :: {:ok, term()} | {:error, term()}
 
-Implement four concrete tools that the framework ships:
+  @optional_callbacks []
 
-- `WebSearchTool`: accepts `%{query: string, num_results: integer}`, calls a configurable search API, returns the top N results as structured maps with title, url, and snippet.
-- `CodeExecutionTool`: accepts `%{code: string, language: "elixir"}`, evaluates Elixir code in a sandboxed `Task` under a `DynamicSupervisor` with a 5-second wall-clock timeout, captures stdout and the return value, and rejects any code containing file system or network calls by static analysis of the AST before execution.
-- `DatabaseQueryTool`: accepts `%{sql: string, repo: atom}`, executes the query against a configured Ecto repo, enforces that the statement is a `SELECT` (parse and reject DDL, DML, and stored procedure calls), and returns results as a list of maps.
-- `AgentCallTool`: accepts `%{agent_name: string, goal: string}`, looks up the named agent in the agent registry, delegates the goal via `GenServer.call/3` with a configurable timeout, and returns the agent's response. This tool enables multi-agent delegation without the orchestrator knowing the sub-agent's implementation.
+  @doc "Validate parameters against schema before calling execute/1"
+  def call(tool_module, raw_params) do
+    schema = tool_module.parameters_schema()
+    case validate_schema(raw_params, schema) do
+      :ok ->
+        timeout = Application.get_env(:agent_framework, :tool_timeout, 30_000)
+        task = Task.async(fn -> tool_module.execute(raw_params) end)
+        case Task.yield(task, timeout) || Task.shutdown(task) do
+          {:ok, result} -> result
+          nil -> {:error, :timeout}
+        end
+      {:error, reason} ->
+        {:error, {:schema_violation, reason}}
+    end
+  end
 
-### 4. Memory Architecture
+  defp validate_schema(params, schema) do
+    # TODO: validate params against JSON Schema
+    # HINT: check required fields, type constraints
+    # For simplicity: verify required keys are present and types match
+    required = Map.get(schema, "required", [])
+    properties = Map.get(schema, "properties", %{})
+    missing = Enum.filter(required, fn k -> not Map.has_key?(params, k) end)
+    if missing != [] do
+      {:error, "missing required fields: #{inspect(missing)}"}
+    else
+      type_errors = Enum.filter(properties, fn {k, prop} ->
+        val = Map.get(params, k)
+        val != nil and not type_matches?(val, prop["type"])
+      end)
+      if type_errors != [] do
+        {:error, "type mismatch: #{inspect(Enum.map(type_errors, &elem(&1, 0)))}"}
+      else
+        :ok
+      end
+    end
+  end
 
-Implement three memory tiers that agents use automatically:
+  defp type_matches?(val, "string"), do: is_binary(val)
+  defp type_matches?(val, "integer"), do: is_integer(val)
+  defp type_matches?(val, "number"), do: is_number(val)
+  defp type_matches?(val, "boolean"), do: is_boolean(val)
+  defp type_matches?(_val, _type), do: true
+end
+```
 
-Short-term memory is the conversation history held in the `GenServer` state. When the estimated token count of the history exceeds 80% of the configured context window limit, the agent automatically calls the LLM with a summarization prompt on the oldest half of the history, replaces those messages with a single summary message, and continues. Token estimation uses the heuristic of 4 characters per token unless the model reports exact counts in its response metadata.
+## Step 2 — Agent GenServer with ReAct loop
 
-Long-term memory is a vector store integration. After each completed agent turn (one full user request to final response), the turn is embedded using a configured embedding model and stored with `pgvector`. Before each LLM call, retrieve the 5 most semantically similar past turns using cosine similarity (threshold 0.7) and inject them into the system prompt as structured context. The embedding and retrieval operations must not block the agent loop — execute them asynchronously and incorporate results only when available within a 500ms budget.
+```elixir
+defmodule AgentFramework.Agent do
+  use GenServer
+  require Logger
 
-Episodic memory is a structured log of agent decisions: every time the agent chooses to call a tool, record `{timestamp, agent_id, tool_name, input, output, decision_rationale}` where the rationale is extracted from the LLM's reasoning text preceding the tool call. This log is queryable by agent, time range, and tool name.
+  defstruct [
+    :id, :llm_module, :llm_config, :system_prompt,
+    :tools, :max_iterations, :hitl_handler,
+    history: [], cost_usd: 0.0, total_tokens: 0
+  ]
 
-### 5. Multi-agent Coordination
+  def start_link(opts) do
+    id = Keyword.get(opts, :id, generate_id())
+    GenServer.start_link(__MODULE__, opts, name: via(id))
+  end
 
-A supervisor agent receives a complex goal and decomposes it into an ordered list of sub-tasks using a planning LLM call. Each sub-task is assigned to a specialist agent registered in the agent marketplace. Sub-tasks with no dependencies between them are dispatched concurrently via `Task.async_stream`. Sub-tasks with declared dependencies are dispatched sequentially, with the output of one task injected into the context of the next. The supervisor collects all specialist results and makes a final synthesis LLM call to produce the aggregated answer.
+  def run(agent_pid, user_message) do
+    GenServer.call(agent_pid, {:run, user_message}, :infinity)
+  end
 
-A specialist that exceeds its timeout is reported as `{:error, :specialist_timeout, agent_name}` and included in the synthesis context — the supervisor must not block on a timed-out specialist. A specialist that crashes is restarted by the OTP supervision tree and the orchestrator retries the subtask once before marking it failed.
+  def stream(agent_pid, user_message, caller_pid) do
+    GenServer.cast(agent_pid, {:stream, user_message, caller_pid})
+  end
 
-### 6. LLM Response Streaming
+  def init(opts) do
+    state = struct(__MODULE__,
+      id: Keyword.get(opts, :id, generate_id()),
+      llm_module: Keyword.fetch!(opts, :llm_module),
+      llm_config: Keyword.get(opts, :llm_config, %{}),
+      system_prompt: Keyword.get(opts, :system_prompt, "You are a helpful assistant."),
+      tools: Keyword.get(opts, :tools, []),
+      max_iterations: Keyword.get(opts, :max_iterations, 10),
+      hitl_handler: Keyword.get(opts, :hitl_handler)
+    )
+    AgentFramework.Stats.register(state.id)
+    {:ok, state}
+  end
 
-Implement streaming at the HTTP level using `Finch.stream/5`. As SSE chunks arrive, parse them incrementally and forward each decoded text token to the caller via `Process.send(caller_pid, {:agent_chunk, token})`. The agent loop itself runs on streamed responses: tool call detection is applied to the accumulated streamed content, not to a complete response. Expose `AgentFramework.stream/3` accepting an agent pid, a user message, and a caller pid — the function returns immediately and the caller receives `{:agent_chunk, token}` messages followed by `{:agent_done, final_response}` or `{:agent_error, reason}`.
+  def handle_call({:run, user_message}, _from, state) do
+    new_history = state.history ++ [%{role: "user", content: user_message}]
+    case react_loop(new_history, state, 0) do
+      {:ok, final_response, final_history, cost_delta, token_delta} ->
+        new_state = %{state |
+          history: final_history,
+          cost_usd: state.cost_usd + cost_delta,
+          total_tokens: state.total_tokens + token_delta
+        }
+        AgentFramework.Stats.record(state.id, :tokens, token_delta)
+        AgentFramework.Stats.record(state.id, :cost, cost_delta)
+        {:reply, {:ok, final_response}, new_state}
+      {:error, reason, final_history} ->
+        {:reply, {:error, reason}, %{state | history: final_history}}
+    end
+  end
 
-### 7. Retry and Fallback
+  defp react_loop(_history, _state, max_iter) when max_iter >= 0 and max_iter >= 10 do
+    {:error, :max_iterations_exceeded, []}
+  end
 
-LLM API calls are wrapped with a retry policy: on HTTP 429 or 5xx responses, retry with exponential backoff starting at 1 second, doubling each attempt, capped at 60 seconds, for a maximum of 3 retries. If all retries fail on the primary model, attempt the same call on a configured fallback model. If the fallback also fails after its own retry policy, the agent returns `{:error, :llm_unavailable}` to the caller without crashing. The agent process remains alive and accepts new requests after an `llm_unavailable` failure. Log every retry attempt with structured metadata: `[model, attempt, status_code, backoff_ms, error]`.
+  defp react_loop(history, state, iteration) do
+    :telemetry.execute([:agent_framework, :llm_call, :start],
+      %{system_time: System.system_time()},
+      %{agent_id: state.id, model: state.llm_config[:model], iteration: iteration})
 
-### 8. Agent Observability
+    t0 = System.monotonic_time(:microsecond)
 
-Emit `:telemetry` events for every significant operation: `[:agent_framework, :llm_call, :start]`, `[:agent_framework, :llm_call, :stop]`, `[:agent_framework, :tool_call, :start]`, `[:agent_framework, :tool_call, :stop]`, `[:agent_framework, :memory_retrieval, :stop]`. Each event carries a measurements map and a metadata map. The stop events include `duration_microseconds`, `token_count`, and `cost_usd` where applicable. Cost is computed from token counts using configurable per-model pricing tables stored as application config.
+    case state.llm_module.complete(history, state) do
+      {:ok, %{content: content, tool_calls: [], tokens: tokens, cost: cost}} ->
+        duration = System.monotonic_time(:microsecond) - t0
+        :telemetry.execute([:agent_framework, :llm_call, :stop],
+          %{duration_microseconds: duration, token_count: tokens, cost_usd: cost},
+          %{agent_id: state.id})
+        new_history = history ++ [%{role: "assistant", content: content}]
+        {:ok, content, new_history, cost, tokens}
 
-Aggregate per-agent statistics in ETS: total LLM calls, total tokens consumed, total cost in USD, number of tool calls, number of failed tool calls, average loop iterations to completion. Expose `AgentFramework.Stats.report(agent_id)` returning a structured map, and `AgentFramework.Stats.report_all()` returning stats for every registered agent.
+      {:ok, %{content: content, tool_calls: tool_calls, tokens: tokens, cost: cost}} ->
+        duration = System.monotonic_time(:microsecond) - t0
+        :telemetry.execute([:agent_framework, :llm_call, :stop],
+          %{duration_microseconds: duration, token_count: tokens, cost_usd: cost},
+          %{agent_id: state.id})
 
-### 9. Human-in-the-Loop
+        assistant_msg = %{role: "assistant", content: content, tool_calls: tool_calls}
+        tool_results = execute_tool_calls(tool_calls, state)
+        tool_result_msg = %{role: "tool", tool_results: tool_results}
 
-Agents support a `:hitl` mode where certain tool calls require human approval before execution. A tool is marked as requiring approval by setting `@requires_approval true` in its module. When the agent loop reaches a tool call for an approval-required tool, it pauses by sending `{:approval_required, agent_id, tool_name, input}` to a registered approval handler pid, then blocks with a `receive` with a configurable timeout (default 5 minutes). The human can approve with `AgentFramework.approve(agent_id, tool_call_id)` or reject with `AgentFramework.reject(agent_id, tool_call_id, reason)`. A rejection appends a `tool_result` with the rejection reason to the history and the agent loop continues. A timeout in waiting for approval is treated identically to a rejection.
+        new_history = history ++ [assistant_msg, tool_result_msg]
+        react_loop(new_history, state, iteration + 1)
 
-### 10. Agent Marketplace
+      {:error, reason} ->
+        {:error, reason, history}
+    end
+  end
 
-Implement a registry where agents advertise their capabilities. An agent registers itself with a name, a description, a list of capability tags, and an input/output schema. Implement `AgentFramework.Marketplace.discover(query)` that returns matching agents ranked by relevance — relevance is computed by embedding the query and performing cosine similarity against stored agent description embeddings. Marketplace entries are stored in ETS with periodic backup to PostgreSQL. On node restart, the marketplace reloads from PostgreSQL and agents re-register on startup via their `Application` supervision tree entry.
+  defp execute_tool_calls(tool_calls, state) do
+    # Execute all tool calls; concurrent for independent tools
+    Enum.map(tool_calls, fn %{name: tool_name, input: input, id: call_id} ->
+      tool_module = find_tool(state.tools, tool_name)
 
-### 11. Backpressure and Concurrency Control
+      cond do
+        is_nil(tool_module) ->
+          %{tool_call_id: call_id, result: {:error, "tool not found: #{tool_name}"}}
+        hitl_required?(tool_module) ->
+          result = request_approval(state, tool_module, input, call_id)
+          %{tool_call_id: call_id, result: result}
+        true ->
+          :telemetry.execute([:agent_framework, :tool_call, :start],
+            %{system_time: System.system_time()},
+            %{agent_id: state.id, tool: tool_name})
+          t0 = System.monotonic_time(:microsecond)
+          result = AgentFramework.Tool.call(tool_module, input)
+          duration = System.monotonic_time(:microsecond) - t0
+          :telemetry.execute([:agent_framework, :tool_call, :stop],
+            %{duration_microseconds: duration},
+            %{agent_id: state.id, tool: tool_name, result: elem(result, 0)})
+          AgentFramework.Episodic.record(state.id, tool_name, input, result)
+          %{tool_call_id: call_id, result: result}
+      end
+    end)
+  end
 
-Agent pools are managed by a `PoolSupervisor` that maintains a configurable number of agent worker processes. Incoming requests to a pool are queued in a bounded ETS queue. When the queue reaches its capacity limit, new requests receive `{:error, :pool_full}` immediately without blocking the caller. The pool tracks in-flight requests per worker and distributes new work to the worker with the fewest active tasks. Implement `AgentFramework.Pool.checkout/2` and `AgentFramework.Pool.checkin/2` for explicit pool management when the automatic dispatch is not appropriate.
+  defp find_tool(tools, name) do
+    Enum.find(tools, fn mod -> mod.name() == name end)
+  end
 
-## Acceptance Criteria
+  defp hitl_required?(tool_module) do
+    # TODO: check if tool_module has @requires_approval true attribute
+    false
+  end
 
-- An agent configured with `WebSearchTool` and `CodeExecutionTool` receives the goal `"Find the top 3 Elixir web frameworks and write a benchmarking script that measures their hello-world throughput"`, completes the full ReAct loop (search → reason → code → reason → final response) within 120 seconds, and the final response contains both a ranked list and syntactically valid Elixir code — verified by `Code.string_to_quoted/1`.
+  defp request_approval(state, tool_module, input, call_id) do
+    if state.hitl_handler do
+      send(state.hitl_handler, {:approval_required, state.id, tool_module.name(), input, call_id})
+      timeout = Application.get_env(:agent_framework, :hitl_timeout, 300_000)
+      receive do
+        {:approved, ^call_id} -> AgentFramework.Tool.call(tool_module, input)
+        {:rejected, ^call_id, reason} -> {:error, {:rejected, reason}}
+      after
+        timeout -> {:error, {:rejected, :timeout}}
+      end
+    else
+      {:error, :no_hitl_handler}
+    end
+  end
 
-- Conversation history persists correctly: calling `run/2` three times on the same agent pid with successive follow-up questions produces responses that demonstrate awareness of the prior turns; the history accumulates correctly across all three calls.
+  defp generate_id, do: :crypto.strong_rand_bytes(8) |> Base.encode16(case: :lower)
+  defp via(id), do: {:via, Registry, {AgentFramework.Registry, id}}
+end
+```
 
-- Context summarization triggers automatically when a synthetic history of 200 messages is injected into agent state: the next `run/2` call triggers a summarization LLM call, replaces the old messages with a summary, and the subsequent LLM call receives the shortened history — verified by intercepting LLM call counts and message counts.
+## Step 3 — Code execution tool with AST sandbox
 
-- A tool registered with `parameters_schema` requiring `%{query: :string}` rejects a call with `%{query: 42}` without invoking `execute/1` and appends a structured error to the history; the agent loop continues and the LLM corrects its call on the next iteration.
+```elixir
+defmodule AgentFramework.Tools.CodeExecution do
+  @behaviour AgentFramework.Tool
 
-- `CodeExecutionTool` returns stdout and return value for `IO.puts("hello"); 42`; returns `{:error, :timeout}` for `Process.sleep(:infinity)`; returns `{:error, :unsafe_code}` for `File.read("/etc/passwd")` — all without crashing the agent process.
+  @forbidden_modules [File, Port, System, IO, :os, :file, :gen_tcp, :httpc,
+                      :inet, :ssl, :net_adm, :net_kernel]
 
-- `DatabaseQueryTool` returns rows as maps for a valid `SELECT` statement; returns `{:error, :non_select_statement}` for `DROP TABLE users` without executing the query — verified by asserting no database mutation occurred.
+  def name, do: "code_execution"
+  def description, do: "Execute Elixir code in a sandbox and return stdout and return value"
+  def parameters_schema do
+    %{
+      "type" => "object",
+      "required" => ["code"],
+      "properties" => %{
+        "code" => %{"type" => "string", "description" => "Elixir code to execute"},
+        "language" => %{"type" => "string", "enum" => ["elixir"]}
+      }
+    }
+  end
 
-- An orchestrator agent with three registered specialists (`ResearchAgent`, `SynthesisAgent`, `ReviewAgent`) completes a research task where each specialist contributes distinct information; the specialists run concurrently and the orchestrator's synthesis response references content from all three.
+  def execute(%{"code" => code}) do
+    case analyze_ast(code) do
+      {:error, reason} -> {:error, reason}
+      :ok -> run_sandboxed(code)
+    end
+  end
 
-- Killing one specialist mid-task via `Process.exit(pid, :kill)` does not crash the orchestrator; the OTP supervisor restarts the specialist; the orchestrator receives `{:error, :specialist_timeout, "ResearchAgent"}` for that subtask and proceeds with synthesis using the available results.
+  @doc "AST-level analysis: reject any calls to forbidden modules"
+  def analyze_ast(code) do
+    case Code.string_to_quoted(code) do
+      {:error, _} -> {:error, :syntax_error}
+      {:ok, ast} ->
+        violations = find_violations(ast)
+        if violations == [] do
+          :ok
+        else
+          {:error, {:unsafe_code, violations}}
+        end
+    end
+  end
 
-- `AgentFramework.stream/3` delivers the first `{:agent_chunk, _}` message within 1 second of the LLM beginning its response; the caller receives chunks in correct order; the full response assembled from all chunks equals the response from the non-streaming `run/2` call for the same prompt.
+  defp find_violations(ast) do
+    {_ast, violations} = Macro.prewalk(ast, [], fn node, acc ->
+      case node do
+        # Detect Module.function calls
+        {{:., _, [{:__aliases__, _, mod_parts}, _func]}, _, _} ->
+          mod = Module.concat(mod_parts)
+          if mod in @forbidden_modules do
+            {node, [mod | acc]}
+          else
+            {node, acc}
+          end
+        # Detect :erlang_module.function calls
+        {{:., _, [mod, _func]}, _, _} when is_atom(mod) ->
+          if mod in @forbidden_modules do
+            {node, [mod | acc]}
+          else
+            {node, acc}
+          end
+        _ ->
+          {node, acc}
+      end
+    end)
+    violations
+  end
 
-- Simulating HTTP 429 from the LLM API causes 3 retry attempts with exponential delays (>=1s, >=2s, >=4s between attempts); after exhausting retries, the fallback model is attempted; exhausting fallback retries returns `{:error, :llm_unavailable}` and the agent remains alive and accepts the next request.
+  defp run_sandboxed(code) do
+    parent = self()
+    task = Task.Supervisor.async_nolink(AgentFramework.TaskSupervisor, fn ->
+      # Capture output and return value
+      {result, output} = capture_output(fn ->
+        try do
+          {value, _bindings} = Code.eval_string(code)
+          {:ok, value}
+        rescue
+          e -> {:error, Exception.message(e)}
+        end
+      end)
+      {result, output}
+    end)
 
-- A tool marked `@requires_approval true` pauses the agent loop; calling `AgentFramework.approve/2` with the correct agent id resumes execution; calling `AgentFramework.reject/2` appends the rejection as a tool result and continues the loop without executing the tool.
+    case Task.yield(task, 5_000) || Task.shutdown(task, :brutal_kill) do
+      {:ok, {{:ok, value}, output}} -> {:ok, %{return: value, stdout: output}}
+      {:ok, {{:error, reason}, _}} -> {:error, reason}
+      nil -> {:error, :timeout}
+    end
+  end
 
-- `AgentFramework.Stats.report/1` returns token counts within +-5% of the values reported by the LLM provider in its response metadata; cost is computed correctly for at least two configured model pricing tiers.
+  defp capture_output(fun) do
+    # TODO: use ExUnit.CaptureIO or redirect :stdio to capture output
+    result = fun.()
+    {result, ""}
+  end
+end
+```
 
-- `AgentFramework.Marketplace.discover("agent that can write and execute code")` returns the `CodeAgent` as the top result when the marketplace contains at least 10 registered agents with varied descriptions — verified with cosine similarity > 0.8 between the query embedding and the top result's description embedding.
+## Step 4 — LLM behaviour and retry
 
-- A pool of 5 workers with queue capacity 10 accepts 10 queued requests without error when all workers are busy; the 11th concurrent request receives `{:error, :pool_full}` immediately; workers pick up queued requests as they become available and all 10 complete correctly.
+```elixir
+defmodule AgentFramework.LLM do
+  @callback complete(history :: list(), state :: map()) ::
+    {:ok, %{content: String.t(), tool_calls: list(), tokens: non_neg_integer(), cost: float()}} |
+    {:error, term()}
 
-- Every LLM call emits `[:agent_framework, :llm_call, :start]` and `[:agent_framework, :llm_call, :stop]` telemetry events with correct `agent_id`, `model`, and `duration_microseconds` — verified by attaching a test telemetry handler and asserting event receipt for a complete agent run.
+  @callback stream(history :: list(), state :: map(), caller_pid :: pid()) :: :ok
+end
 
-## Constraints & Rules
+defmodule AgentFramework.LLM.Retry do
+  @max_retries 3
+  @initial_backoff_ms 1_000
 
-- No Python, no Node.js, no non-BEAM runtimes. All components run on the BEAM.
-- No wrapping of LangChain, AutoGen, or any existing agent framework. The HTTP wire format to the LLM provider is the only external protocol boundary.
-- LLM provider support must be abstracted behind a `AgentFramework.LLM` behaviour so that Anthropic and OpenAI can be swapped by configuration without changing agent code.
-- No agent process may crash due to a tool failure, an LLM API error, or a malformed LLM response. Every failure path must be handled explicitly and result in a structured error appended to history or returned to the caller.
-- The framework must compile and its test suite must pass with `mix test` without any external services running (use mocks for LLM calls and vector store in unit tests).
-- Sandbox enforcement in `CodeExecutionTool` is non-negotiable: before executing any code, perform AST-level analysis to detect calls to `File`, `Port`, `System`, `:os`, `:file`, `:gen_tcp`, `:httpc`, or any `:erlang` function that performs I/O. Code containing such calls must be rejected with `{:error, :unsafe_code}` without evaluation.
-- All public API functions must have `@spec` type annotations and pass `mix dialyzer` without warnings.
-- Streaming must not buffer the entire response before forwarding — chunks must be forwarded as they arrive from the HTTP layer.
+  def with_retry(fun, opts \\ []) do
+    max_retries = Keyword.get(opts, :max_retries, @max_retries)
+    initial_backoff = Keyword.get(opts, :initial_backoff_ms, @initial_backoff_ms)
+    fallback = Keyword.get(opts, :fallback_fn)
+    do_retry(fun, 0, max_retries, initial_backoff, fallback)
+  end
 
-## Stretch Goals
+  defp do_retry(fun, attempt, max_retries, backoff, fallback) do
+    case fun.() do
+      {:error, {:http, status}} when status in [429, 500, 502, 503] ->
+        if attempt < max_retries do
+          Process.sleep(backoff + :rand.uniform(div(backoff, 5)))
+          do_retry(fun, attempt + 1, max_retries, min(backoff * 2, 60_000), fallback)
+        else
+          if fallback do
+            do_retry(fallback, 0, max_retries, @initial_backoff_ms, nil)
+          else
+            {:error, :llm_unavailable}
+          end
+        end
+      result ->
+        result
+    end
+  end
+end
+```
 
-- Implement a visual tracing dashboard as a Phoenix LiveView that shows a real-time DAG of agent decisions, tool calls, and memory retrievals for any running agent — nodes for each step, edges showing data flow, color-coded by step type.
-- Add support for the Model Context Protocol (MCP) as a tool transport: any MCP-compatible tool server can be registered and its tools are automatically imported into the framework's tool registry.
-- Implement agent checkpointing: serialize the full agent state (history, memory, cost accumulator, episodic log) to a portable format and restore it in a new process — enabling agent migration across nodes and resumption after intentional shutdown.
-- Add a cost circuit breaker: an agent configured with a maximum budget in USD automatically pauses and sends `{:budget_exceeded, agent_id, current_cost}` to a configured pid when accumulated cost reaches the limit, before making the next LLM call.
-- Implement agent-to-agent communication over distributed Erlang: two agents on different BEAM nodes can exchange messages and delegate tasks using the same `AgentCallTool` interface, with location transparency.
+## Step 5 — Context summarization (short-term memory)
 
-## Evaluation Criteria
+```elixir
+defmodule AgentFramework.Memory.ShortTerm do
+  @summarize_threshold 0.80
+  @chars_per_token 4
 
-**Correctness of the agentic loop**: The ReAct loop must handle all cases correctly — text-only response (terminate), tool call response (execute and recurse), mixed response (extract all tool calls, execute all, append all results, recurse), and max-iterations exceeded (return partial result with error flag). Any loop that terminates prematurely or hangs indefinitely fails this criterion.
+  @doc "Check if history needs summarization; if so, call LLM to summarize oldest half"
+  def maybe_summarize(history, context_window, llm_module, state) do
+    tokens = estimate_tokens(history)
+    if tokens > context_window * @summarize_threshold do
+      half = div(length(history), 2)
+      {old, recent} = Enum.split(history, half)
+      summary = summarize(old, llm_module, state)
+      [%{role: "system", content: "Summary of prior conversation: #{summary}"} | recent]
+    else
+      history
+    end
+  end
 
-**OTP design quality**: Agents must be supervised, restartable, and isolated. A crash in one agent must not affect others. The supervision tree must be explicitly designed — not a flat list of workers under a single supervisor. Process registration, shutdown sequencing, and restart strategies must be deliberate choices justified by the semantics of each component.
+  defp estimate_tokens(history) do
+    history
+    |> Enum.map(fn msg ->
+      div(String.length(msg.content || ""), @chars_per_token)
+    end)
+    |> Enum.sum()
+  end
 
-**Tool system extensibility**: A new tool written outside the framework, implementing the `AgentFramework.Tool` behaviour, must be registerable with any agent at runtime without modifying framework code. The framework's serialization of tool schemas to LLM-specific formats must be correct for both Anthropic and OpenAI wire formats.
+  defp summarize(messages, llm_module, state) do
+    summary_prompt = [
+      %{role: "user", content: "Summarize this conversation concisely, preserving key facts: " <>
+        Enum.map_join(messages, "\n", fn m -> "#{m.role}: #{m.content}" end)}
+    ]
+    case llm_module.complete(summary_prompt, state) do
+      {:ok, %{content: summary}} -> summary
+      _ -> "[Summary unavailable]"
+    end
+  end
+end
+```
 
-**Memory correctness**: Context summarization must not lose information that was referenced in the preserved history. RAG retrieval must only include turns above the configured similarity threshold. Episodic log entries must be accurate — no missing entries, no entries for tool calls that were rejected before execution.
+## Given tests
 
-**Failure handling completeness**: Every external call (LLM API, tool execution, vector store, embedding model) must have an explicit failure path that results in a structured error, not an uncaught exception. Test this by building a fault-injection harness that randomly fails each external call type and asserting the agent remains alive and returns structured errors.
+```elixir
+# test/tools/code_execution_test.exs
+defmodule AgentFramework.Tools.CodeExecutionTest do
+  use ExUnit.Case, async: true
+  alias AgentFramework.Tools.CodeExecution
 
-**Performance under concurrency**: A pool of 10 agents running concurrently on a single BEAM node must process 100 independent requests in under 5 minutes (assuming LLM latency of 2 seconds per call). Agent processes must not be the bottleneck — measure scheduler utilization, process queue lengths, and ETS contention to identify and eliminate hot spots.
+  test "executes safe code and returns result" do
+    assert {:ok, %{return: 42}} = CodeExecution.execute(%{"code" => "21 * 2"})
+  end
+
+  test "captures stdout" do
+    assert {:ok, %{stdout: stdout}} = CodeExecution.execute(%{"code" => ~s(IO.puts("hello"))})
+    # stdout capture requires proper redirect — at minimum, result should not error
+  end
+
+  test "rejects File.read" do
+    assert {:error, {:unsafe_code, _}} = CodeExecution.execute(%{"code" => ~s(File.read("/etc/passwd"))})
+  end
+
+  test "rejects :os.cmd" do
+    assert {:error, {:unsafe_code, _}} = CodeExecution.execute(%{"code" => ~s(:os.cmd('id'))})
+  end
+
+  test "returns :timeout for infinite sleep" do
+    assert {:error, :timeout} = CodeExecution.execute(%{"code" => "Process.sleep(:infinity)"})
+  end
+
+  test "analyze_ast detects forbidden modules" do
+    assert :ok = CodeExecution.analyze_ast("1 + 2")
+    assert {:error, {:unsafe_code, [File]}} = CodeExecution.analyze_ast(~s(File.read("x")))
+  end
+end
+
+# test/agent_test.exs
+defmodule AgentFramework.AgentTest do
+  use ExUnit.Case, async: false
+
+  defmodule MockLLM do
+    @behaviour AgentFramework.LLM
+
+    def complete(history, _state) do
+      last = List.last(history)
+      # Simple mock: echo the user's message back
+      {:ok, %{
+        content: "Echo: #{last.content}",
+        tool_calls: [],
+        tokens: 10,
+        cost: 0.001
+      }}
+    end
+
+    def stream(history, state, caller_pid) do
+      {:ok, %{content: response}} = complete(history, state)
+      for char <- String.graphemes(response) do
+        send(caller_pid, {:agent_chunk, char})
+      end
+      send(caller_pid, {:agent_done, response})
+      :ok
+    end
+  end
+
+  test "agent run returns response" do
+    {:ok, pid} = AgentFramework.Agent.start_link(
+      llm_module: MockLLM,
+      system_prompt: "Test agent"
+    )
+    assert {:ok, response} = AgentFramework.Agent.run(pid, "Hello")
+    assert response =~ "Echo:"
+  end
+
+  test "history accumulates across runs" do
+    {:ok, pid} = AgentFramework.Agent.start_link(llm_module: MockLLM)
+    AgentFramework.Agent.run(pid, "First message")
+    AgentFramework.Agent.run(pid, "Second message")
+    state = :sys.get_state(pid)
+    assert length(state.history) >= 4  # 2 user + 2 assistant messages
+  end
+
+  test "stream delivers chunks then done" do
+    {:ok, pid} = AgentFramework.Agent.start_link(llm_module: MockLLM)
+    AgentFramework.Agent.stream(pid, "Hello", self())
+    chunks = collect_chunks([])
+    assert length(chunks) > 0
+    assert_receive {:agent_done, _}
+  end
+
+  defp collect_chunks(acc) do
+    receive do
+      {:agent_chunk, c} -> collect_chunks([c | acc])
+    after
+      500 -> Enum.reverse(acc)
+    end
+  end
+end
+
+# test/pool_test.exs
+defmodule AgentFramework.PoolTest do
+  use ExUnit.Case, async: false
+
+  test "pool returns pool_full when queue capacity exceeded" do
+    # Pool: 2 workers, queue capacity 3
+    pool_opts = [workers: 2, queue_capacity: 3, worker_mod: AgentFramework.Agent]
+    {:ok, pool} = AgentFramework.Pool.start_link(pool_opts)
+
+    # Fill all workers and queue
+    for _ <- 1..5, do: AgentFramework.Pool.submit(pool, :run, ["test"])
+
+    # 6th should be rejected
+    assert {:error, :pool_full} = AgentFramework.Pool.submit(pool, :run, ["overflow"])
+  end
+end
+```
+
+## Trade-offs
+
+| Design | Selected | Alternative | Trade-off |
+|---|---|---|---|
+| Loop implementation | Private recursive function | Multiple GenServer callbacks | Callbacks: allows mailbox processing between LLM calls; recursive function: holds control flow, prevents ordering surprises |
+| Tool execution | Task with timeout | GenServer per tool | GenServer: poolable; Task: simpler, sufficient for one-off executions |
+| Context window management | Summarization via LLM call | Truncation (drop oldest) | Truncation: no extra LLM cost; summarization: preserves semantic content |
+| Memory retrieval timing | Async, 500ms budget | Synchronous before LLM call | Synchronous: simpler; async: doesn't add RAG latency to every call |
+| Marketplace discovery | pgvector cosine similarity | Tag-based exact match | Tag match: faster, deterministic; vector: handles natural language queries |
+| LLM provider abstraction | Behaviour + adapter modules | HTTP library wrapper | Library wrapper: simpler but provider-specific; behaviour: hot-swappable providers |
+
+## Production mistakes
+
+**Not handling partial JSON in LLM tool call responses.** LLMs sometimes emit malformed JSON for tool call parameters (truncated, unescaped characters). The framework must handle `Jason.decode/1` errors gracefully — return a structured error to the LLM with the original invalid JSON and ask it to retry. Do not let a JSON parse error propagate as an uncaught exception.
+
+**Holding the GenServer loop during async tool calls.** If tools are executed synchronously inside the `react_loop` private function, the GenServer cannot process any other messages (including `:shutdown`) during tool execution. Use `Task.yield/2` with a timeout rather than `Task.await/2` so the loop remains preemptible by setting a reasonable timeout and handling `nil` (timeout) cases.
+
+**Not scoping `Code.eval_string/1` to a clean binding.** By default, `Code.eval_string/1` inherits the current process's variable bindings. Two successive calls may share state if the second call uses a variable name from the first. Always pass `[]` as the second argument: `Code.eval_string(code, [], __ENV__)`.
+
+**Episodic log missing entries for tool calls that returned errors.** The episodic log must record every tool call attempt, including failed ones. If `execute/1` returns `{:error, reason}`, the log entry should include `error: reason`. Omitting error entries makes debugging impossible — you cannot reconstruct why an agent made a decision if you cannot see what tools it tried.
+
+**Pool not draining gracefully on shutdown.** When the application shuts down, the `PoolSupervisor` sends `:shutdown` to workers. If workers are mid-LLM-call and the timeout is `:infinity`, they block the shutdown sequence indefinitely. Set a `shutdown: 30_000` in the worker's child spec and handle the `:stop` signal in the agent's `terminate/2` callback to abort the current loop cleanly.
+
+## Resources
+
+- Yao et al. — "ReAct: Synergizing Reasoning and Acting in Language Models" (2023) — https://arxiv.org/abs/2210.03629 (ReAct pattern)
+- Anthropic — Claude Messages API — https://docs.anthropic.com/en/api/messages (tool call wire format)
+- OpenAI — Chat Completions API — https://platform.openai.com/docs/api-reference/chat (function calling wire format)
+- Finch HTTP client — https://hexdocs.pm/finch/ (streaming HTTP with Finch.stream/5)
+- pgvector Elixir — https://github.com/pgvector/pgvector-elixir (vector store integration)
+- Erlang `Code` module — https://hexdocs.pm/elixir/Code.html (string_to_quoted, eval_string)
+- Model Context Protocol — https://modelcontextprotocol.io (tool protocol standard, for stretch goal)
