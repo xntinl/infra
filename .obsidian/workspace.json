@@ -13,12 +13,12 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "challenges/elixir/01-basico/01-setup-and-mix/01-setup-and-mix.md",
+                "file": "challenges/elixir/01-basico/04-strings-and-binaries-basics/04-strings-and-binaries-basics.md",
                 "mode": "source",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "01-setup-and-mix"
+              "title": "04-strings-and-binaries-basics"
             }
           }
         ]
@@ -210,6 +210,9 @@
   },
   "active": "80db5d002a546a52",
   "lastOpenFiles": [
+    "challenges/elixir/01-basico/03-numbers-and-arithmetic/03-numbers-and-arithmetic.md",
+    "challenges/elixir/01-basico/02-atoms-and-symbols/02-atoms-and-symbols.md",
+    "challenges/elixir/01-basico/01-setup-and-mix/01-setup-and-mix.md",
     "challenges/elixir/01-basico/01-setup-and-mix/test/_build/dev/lib/test/ebin/test.app",
     "challenges/elixir/01-basico/01-setup-and-mix/test/_build/dev/lib/test/consolidated/Elixir.Inspect.beam",
     "challenges/elixir/01-basico/01-setup-and-mix/test/_build/dev/lib/test/consolidated/Elixir.JSON.Encoder.beam",
@@ -220,7 +223,6 @@
     "challenges/elixir/01-basico/01-setup-and-mix/test/_build/dev/lib/test/consolidated/Elixir.List.Chars.beam",
     "challenges/elixir/01-basico/01-setup-and-mix/test/_build/dev/lib/test/consolidated",
     "challenges/elixir/01-basico/01-setup-and-mix/test/_build/dev/lib/test/ebin/Elixir.Test.beam",
-    "challenges/elixir/01-basico/01-setup-and-mix/test/_build/dev/lib/test/ebin",
     "challenges/elixir/01-basico/01-setup-and-mix/test/README.md",
     "ClaudeCode/Introducción.md",
     "ClaudeCode/Skills/Dead Code Skill — Ejemplo.md",
@@ -244,8 +246,6 @@
     "challenges/advanced-topics/01-advanced-data-structures/02-bloom-filter-and-variants/02-bloom-filter-and-variants.md",
     "challenges/elixir/03-avanzado/19-cache-patterns-ets/19-cache-patterns-ets.md",
     "challenges/elixir/03-avanzado/15-rpc-and-remote-calls/15-rpc-and-remote-calls.md",
-    "challenges/advanced-topics/01-advanced-data-structures/01-skip-list-probabilistic-indexing/01-skip-list-probabilistic-indexing.md",
-    "challenges/elixir/03-avanzado/18-mnesia-basics/18-mnesia-basics.md",
     "Presentacion/poc-just/web/node_modules/ordered-binary/assets/powers-dre.png",
     "Presentacion/poc-just/web/node_modules/retry/equation.gif",
     "Untitled.canvas"

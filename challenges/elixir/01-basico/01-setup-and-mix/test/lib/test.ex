@@ -1,18 +1,12 @@
 defmodule Test do
   @moduledoc """
-  Documentation for `Test`.
+  Ejemplos.
   """
 
-  @doc """
-  Hello world.
-
-  ## Examples
-
-      iex> Test.hello()
-      :world
-
-  """
-  def hello do
-    :world
+  @doc "pattern matching con tuplas"
+  def tupla_example do
+    {x,y}={10,20}
+    x+y
   end
+
 end
