@@ -327,4 +327,28 @@ Elixir añade sobre Erlang una sintaxis moderna y expresiva, metaprogramación p
   8. Trade-offs y errores comunes de producción
   9. Autocontenido — sin referencias a otros ejercicios
   10. Buenas prácticas con ejemplos reales enfocados en senior
+      
+      
+      
+      
+⏺ 1. Proyecto independiente por ejercicio con explicación corta de qué trata
+  2. Estructura de proyecto al inicio (árbol de directorios completo)
+  3. Código 100% resuelto, sin TODO, sin HINT
+  4. Tests completos — solo los más necesarios
+  5. Inglés en todo (variables, docs, prosa)
+  6. Sin metadata (sin estrellas, sin tiempo estimado)
+  7. Sin REPL standalone — todo dentro de un proyecto real
+  8. Trade-offs y errores comunes de producción
+  9. Autocontenido — sin referencias a otros ejercicios
+  10. Buenas prácticas con ejemplos reales enfocados en senior
+  11. "Why X and not Y" — explicar alternativas antes de implementar
+  12. "Why this works" — justificación después del código
+  13. Secciones educativas extra — profundización en conceptos clave del tema
+  14. Steps numerados — implementación paso a paso
+  15. Dependencias explícitas — archivo de configuración del proyecto copiable
+  16. Reflection question — pregunta de pensamiento crítico
+  17. Benchmark con resultado esperado — código de medición + target concreto
+  18. Diagramas ASCII — flujo de datos o arquitectura
+  19. Tests organizados por escenario — agrupados temáticamente
+  20. Design decisions inline — "Option A vs Option B" con pros/contras      
 ```
