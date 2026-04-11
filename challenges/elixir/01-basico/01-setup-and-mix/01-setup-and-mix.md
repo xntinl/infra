@@ -1,17 +1,6 @@
-# Setup and Mix: Bootstrapping payments_cli
+# Setup and Mix: Building a JSON Validator CLI
 
-**Project**: `payments_cli` — a CLI tool that processes payment transactions
-
----
-
-## Project context
-
-You are building `payments_cli`, a CLI tool that processes payment transactions from CSV
-files, validates them, applies business rules, and produces ledger reports.
-
-This exercise sets up the project from scratch and implements a minimal CLI entry point
-that accepts a file path argument, prints a message, and returns typed results for
-success and failure.
+**Project**: `json_validator` — a CLI tool that validates JSON files against structural rules
 
 ---
 
@@ -22,24 +11,27 @@ manager, and release tool for every Elixir project. Understanding what Mix gener
 and why matters when you need to:
 
 - Configure compile-time behavior per environment (`:dev`, `:test`, `:prod`)
-- Add Mix tasks for operational work (database migrations, data imports)
-- Configure releases with `mix release` for deployment
-- Understand the app supervision tree defined in `application/0`
+- Add external dependencies and manage their versions
+- Build escripts — single-binary CLI tools compiled from your project
+- Configure `mix test --cover` for coverage metrics
+- Customize `.formatter.exs` for consistent code style across teams
 
-Every Elixir project you encounter professionally starts with `mix.exs`. Reading
-it tells you the Elixir version, dependencies, test configuration, and release
-strategy in under 30 lines.
+Every professional Elixir project starts with `mix.exs`. Reading it tells you the
+Elixir version, dependencies, test configuration, and release strategy in under
+30 lines.
 
 ---
 
 ## The business problem
 
-The payments team needs a CLI tool to process transaction CSV files exported by the bank.
-The first version just needs to:
+Your team receives JSON configuration files from external partners. Before processing
+them, you need a CLI tool that:
 
-1. Accept a file path as a command-line argument
-2. Print the number of transactions found
-3. Exit with code 0 on success, 1 on error
+1. Accepts a file path and optional `--strict` flag via `OptionParser`
+2. Reads the file, parses it as JSON using the `jason` library
+3. Validates required keys are present
+4. Reports errors to stderr, output to stdout
+5. Can be compiled as an escript for distribution
 
 ---
 
@@ -48,28 +40,32 @@ The first version just needs to:
 ### Step 1: Create the project
 
 ```bash
-mix new payments_cli
-cd payments_cli
-mkdir -p lib/payments_cli
-mkdir -p test/payments_cli
+mix new json_validator
+cd json_validator
+mkdir -p config
 ```
 
-### Step 2: `mix.exs` — understand what was generated
-
-Open `mix.exs`. You will see:
+### Step 2: `mix.exs` — real-world configuration
 
 ```elixir
 # mix.exs
-defmodule PaymentsCli.MixProject do
+defmodule JsonValidator.MixProject do
   use Mix.Project
 
   def project do
     [
-      app: :payments_cli,
+      app: :json_validator,
       version: "0.1.0",
       elixir: "~> 1.17",
       start_permanent: Mix.env() == :prod,
-      deps: deps()
+      deps: deps(),
+      escript: escript(),
+      test_coverage: [tool: ExCoveralls],
+      preferred_cli_env: [
+        coveralls: :test,
+        "coveralls.detail": :test,
+        "coveralls.html": :test
+      ]
     ]
   end
 
@@ -80,145 +76,434 @@ defmodule PaymentsCli.MixProject do
   end
 
   defp deps do
-    []
+    [
+      {:jason, "~> 1.4"},
+      {:excoveralls, "~> 0.18", only: :test}
+    ]
+  end
+
+  defp escript do
+    [main_module: JsonValidator.CLI]
   end
 end
 ```
 
 Key decisions visible here:
-- `start_permanent: Mix.env() == :prod` — in production, if the top-level supervisor
-  crashes, the VM exits. In dev/test, it does not. This is intentional.
-- `extra_applications: [:logger]` — the Logger application starts automatically.
-  Remove it and you lose structured logging across your whole app.
-- `deps/0` is private (`defp`) — dependencies are an internal concern of the build
-  system, not a public API of the project module.
 
-### Step 3: `lib/payments_cli/cli.ex`
+- `escript: escript()` declares this project produces a compiled binary. The
+  `main_module` must export a `main/1` function that receives `argv` as a list
+  of strings. Build it with `mix escript.build`.
+- `deps/0` includes `jason` for JSON parsing — the de facto standard in the
+  Elixir ecosystem. The `~>` operator allows patch-level upgrades only.
+- `test_coverage` and `preferred_cli_env` configure `mix coveralls` to always
+  run in the `:test` environment, preventing accidental coverage runs in dev.
+- `start_permanent: Mix.env() == :prod` — in production, if the top-level
+  supervisor crashes, the VM exits. In dev/test, it does not.
 
-The module is intentionally thin — it handles argument parsing and exit codes only.
-Business logic lives elsewhere. Pattern matching on the `args` list dispatches to
-the correct behavior without any `if/else` chain.
+### Step 3: `.formatter.exs`
 
 ```elixir
-defmodule PaymentsCli.CLI do
-  @moduledoc """
-  Entry point for the payments_cli command-line tool.
+# .formatter.exs
+[
+  inputs: ["{mix,.formatter}.exs", "{config,lib,test}/**/*.{ex,exs}"],
+  line_length: 98,
+  locals_without_parens: [assert: 1, refute: 1]
+]
+```
 
-  Parses arguments and delegates to the appropriate subsystem.
-  This module is intentionally thin — it only handles argument parsing
-  and exit codes. Business logic lives elsewhere.
+The formatter ensures consistent style. `line_length: 98` fits most screens.
+`locals_without_parens` allows test macros like `assert` without parentheses,
+matching the idiomatic Elixir test style.
+
+### Step 4: `config/config.exs` and `config/runtime.exs`
+
+```elixir
+# config/config.exs
+import Config
+
+config :json_validator,
+  required_keys: ["name", "version", "type"]
+
+import_config "#{config_env()}.exs"
+```
+
+```elixir
+# config/dev.exs
+import Config
+
+config :json_validator,
+  verbose: true
+```
+
+```elixir
+# config/test.exs
+import Config
+
+config :json_validator,
+  verbose: false
+```
+
+```elixir
+# config/prod.exs
+import Config
+```
+
+```elixir
+# config/runtime.exs
+import Config
+
+if config_env() == :prod do
+  config :json_validator,
+    required_keys:
+      System.get_env("REQUIRED_KEYS", "name,version,type")
+      |> String.split(",", trim: true)
+end
+```
+
+`config/config.exs` runs at compile time. `config/runtime.exs` runs at boot time —
+critical for reading environment variables in production. Never put `System.get_env/1`
+in `config.exs` — it captures the value at compile time, which is almost never what
+you want in a deployed system.
+
+### Step 5: `lib/json_validator/cli.ex`
+
+```elixir
+defmodule JsonValidator.CLI do
+  @moduledoc """
+  Entry point for the json_validator escript.
+
+  Parses command-line arguments with OptionParser and delegates
+  to the validator. Handles exit codes following Unix conventions.
   """
+
+  @spec main([String.t()]) :: :ok
+  def main(argv) do
+    argv
+    |> parse_args()
+    |> run()
+    |> exit_with_code()
+  end
 
   @doc """
-  Main entry point. Called by `mix run` or the compiled escript.
+  Parses argv into a structured command using OptionParser.
 
-  Receives the list of command-line arguments as strings.
-  Returns :ok on success or {:error, reason} on failure.
+  OptionParser distinguishes between switches (--strict), flags,
+  and positional arguments. It returns {parsed, remaining, invalid}.
   """
-  @spec main([String.t()]) :: :ok | {:error, String.t()}
-  def main([file_path]) when is_binary(file_path) do
-    IO.puts("Processing: #{file_path}")
+  @spec parse_args([String.t()]) ::
+          {:validate, String.t(), keyword()} | :help
+  def parse_args(argv) do
+    switches = [strict: :boolean, help: :boolean, keys: :string]
+    aliases = [s: :strict, h: :help, k: :keys]
+
+    case OptionParser.parse(argv, switches: switches, aliases: aliases) do
+      {opts, [file_path], []} ->
+        if opts[:help], do: :help, else: {:validate, file_path, opts}
+
+      {opts, [], []} ->
+        if opts[:help], do: :help, else: :help
+
+      {_opts, _args, invalid} when invalid != [] ->
+        IO.puts(:stderr, "Invalid options: #{inspect(invalid)}")
+        :help
+
+      _ ->
+        :help
+    end
+  end
+
+  @spec run(:help | {:validate, String.t(), keyword()}) ::
+          :ok | {:error, String.t()}
+  defp run(:help) do
+    IO.puts("""
+    Usage: json_validator <file.json> [options]
+
+    Options:
+      -s, --strict   Reject unknown keys (not in required list)
+      -k, --keys     Comma-separated required keys (overrides config)
+      -h, --help     Show this help message
+    """)
+
     :ok
   end
 
-  def main([]) do
-    print_error("no file path given")
+  defp run({:validate, file_path, opts}) do
+    required_keys =
+      if opts[:keys] do
+        String.split(opts[:keys], ",", trim: true)
+      else
+        Application.get_env(:json_validator, :required_keys, ["name", "version"])
+      end
+
+    strict? = Keyword.get(opts, :strict, false)
+
+    JsonValidator.Core.validate_file(file_path, required_keys, strict?)
   end
 
-  def main(_other) do
-    print_error("usage: payments_cli <file>")
+  @spec exit_with_code(:ok | {:error, String.t()}) :: :ok
+  defp exit_with_code(:ok) do
+    IO.puts("Validation passed.")
+    :ok
   end
 
-  @doc """
-  Prints a formatted error message to stderr and returns the error.
-  Keeping this separate from main/1 makes testing easier — tests can
-  call main/1 and check the return value without capturing stderr.
-  """
-  @spec print_error(String.t()) :: {:error, String.t()}
-  def print_error(message) do
-    IO.puts(:stderr, message)
-    {:error, message}
+  defp exit_with_code({:error, reason}) do
+    IO.puts(:stderr, "Validation failed: #{reason}")
+    System.halt(1)
   end
 end
 ```
 
 **Why this works:**
 
-- `main/1` uses three function clauses with pattern matching. The first clause matches
-  a list with exactly one binary element — the file path. The second matches an empty
-  list. The third is a catch-all for any other input (too many arguments, wrong types).
-- Each clause returns a typed value (`:ok` or `{:error, reason}`) that callers and
-  tests can match on. No side effects leak into the return value.
-- `print_error/1` writes to `:stderr` (not stdout), following Unix convention where
-  error messages go to stderr and program output goes to stdout. This matters when
-  the CLI output is piped to another program.
+- `OptionParser.parse/2` returns a three-element tuple: `{parsed_opts, remaining_args, invalid}`.
+  The `switches` keyword constrains types — `:boolean` for flags, `:string` for values.
+  `aliases` maps short flags to long ones.
+- `parse_args/1` is public and returns data (not side effects) — making it testable
+  without capturing IO.
+- `run/1` is private — it performs IO and delegates to the core validator.
+- `exit_with_code/1` calls `System.halt(1)` on failure. This is intentionally in the
+  CLI layer, never in the core logic, so tests can call `Core.validate_file/3` without
+  the process dying.
 
-### Step 4: Tests
+### Step 6: `lib/json_validator/core.ex`
 
 ```elixir
-# test/payments_cli/cli_test.exs
-defmodule PaymentsCli.CLITest do
-  use ExUnit.Case, async: true
+defmodule JsonValidator.Core do
+  @moduledoc """
+  Pure validation logic. No IO, no side effects.
 
-  alias PaymentsCli.CLI
+  This module validates parsed JSON data against structural rules.
+  It does not read files or print output — that responsibility
+  belongs to the CLI layer.
+  """
 
-  describe "main/1" do
-    test "returns :ok when given a file path" do
-      assert :ok = CLI.main(["transactions.csv"])
-    end
+  @doc """
+  Reads a JSON file and validates it against the given rules.
 
-    test "returns error when no arguments given" do
-      assert {:error, message} = CLI.main([])
-      assert is_binary(message)
-      assert String.length(message) > 0
-    end
-
-    test "returns error when too many arguments given" do
-      assert {:error, message} = CLI.main(["file1.csv", "file2.csv"])
-      assert is_binary(message)
+  Returns :ok if all required keys are present, {:error, reason} otherwise.
+  """
+  @spec validate_file(String.t(), [String.t()], boolean()) ::
+          :ok | {:error, String.t()}
+  def validate_file(file_path, required_keys, strict?) do
+    with {:ok, content} <- read_file(file_path),
+         {:ok, data} <- parse_json(content),
+         :ok <- check_is_object(data),
+         :ok <- check_required_keys(data, required_keys),
+         :ok <- check_strict_mode(data, required_keys, strict?) do
+      :ok
     end
   end
 
-  describe "print_error/1" do
-    test "returns {:error, message}" do
-      assert {:error, "something went wrong"} = CLI.print_error("something went wrong")
+  @spec read_file(String.t()) :: {:ok, String.t()} | {:error, String.t()}
+  defp read_file(path) do
+    case File.read(path) do
+      {:ok, content} -> {:ok, content}
+      {:error, reason} -> {:error, "cannot read file: #{:file.format_error(reason)}"}
     end
+  end
 
-    test "returns the original message unchanged" do
-      msg = "unexpected input format"
-      assert {:error, ^msg} = CLI.print_error(msg)
+  @spec parse_json(String.t()) :: {:ok, term()} | {:error, String.t()}
+  defp parse_json(content) do
+    case Jason.decode(content) do
+      {:ok, data} -> {:ok, data}
+      {:error, %Jason.DecodeError{} = err} -> {:error, "invalid JSON: #{Exception.message(err)}"}
+    end
+  end
+
+  @spec check_is_object(term()) :: :ok | {:error, String.t()}
+  defp check_is_object(data) when is_map(data), do: :ok
+  defp check_is_object(_), do: {:error, "top-level value must be a JSON object"}
+
+  @spec check_required_keys(map(), [String.t()]) :: :ok | {:error, String.t()}
+  defp check_required_keys(data, required_keys) do
+    missing =
+      required_keys
+      |> Enum.reject(&Map.has_key?(data, &1))
+
+    case missing do
+      [] -> :ok
+      keys -> {:error, "missing required keys: #{Enum.join(keys, ", ")}"}
+    end
+  end
+
+  @spec check_strict_mode(map(), [String.t()], boolean()) ::
+          :ok | {:error, String.t()}
+  defp check_strict_mode(_data, _required_keys, false), do: :ok
+
+  defp check_strict_mode(data, required_keys, true) do
+    allowed = MapSet.new(required_keys)
+    extra = data |> Map.keys() |> Enum.reject(&MapSet.member?(allowed, &1))
+
+    case extra do
+      [] -> :ok
+      keys -> {:error, "unknown keys in strict mode: #{Enum.join(keys, ", ")}"}
     end
   end
 end
 ```
 
-### Step 5: Run the tests
+**Why this works:**
 
-```bash
-mix test test/payments_cli/cli_test.exs --trace
+- `validate_file/3` uses `with` to chain multiple validation steps. Each step
+  returns `{:ok, value}` on success or `{:error, reason}` on failure. If any
+  step fails, `with` short-circuits and returns the error. This avoids nested
+  `case` statements.
+- Every private function has a clear responsibility and a typed return.
+- `check_strict_mode/3` uses pattern matching on the boolean: the `false` clause
+  is a no-op, the `true` clause performs the check. No `if` needed.
+- `:file.format_error/1` converts Erlang file error atoms (`:enoent`, `:eacces`)
+  into human-readable strings. This is an Erlang interop pattern you will use
+  frequently.
+
+### Step 7: Tests
+
+```elixir
+# test/json_validator/core_test.exs
+defmodule JsonValidator.CoreTest do
+  use ExUnit.Case, async: true
+
+  alias JsonValidator.Core
+
+  @fixtures_dir Path.join([__DIR__, "..", "fixtures"])
+
+  setup_all do
+    File.mkdir_p!(Path.join(@fixtures_dir, ""))
+
+    File.write!(
+      Path.join(@fixtures_dir, "valid.json"),
+      Jason.encode!(%{"name" => "app", "version" => "1.0", "type" => "service"})
+    )
+
+    File.write!(
+      Path.join(@fixtures_dir, "missing_keys.json"),
+      Jason.encode!(%{"name" => "app"})
+    )
+
+    File.write!(
+      Path.join(@fixtures_dir, "invalid.json"),
+      "not json at all"
+    )
+
+    File.write!(
+      Path.join(@fixtures_dir, "array.json"),
+      Jason.encode!([1, 2, 3])
+    )
+
+    File.write!(
+      Path.join(@fixtures_dir, "extra_keys.json"),
+      Jason.encode!(%{"name" => "app", "version" => "1.0", "type" => "service", "debug" => true})
+    )
+
+    :ok
+  end
+
+  describe "validate_file/3" do
+    test "returns :ok for valid JSON with all required keys" do
+      path = Path.join(@fixtures_dir, "valid.json")
+      assert :ok = Core.validate_file(path, ["name", "version", "type"], false)
+    end
+
+    test "returns error for missing required keys" do
+      path = Path.join(@fixtures_dir, "missing_keys.json")
+      assert {:error, message} = Core.validate_file(path, ["name", "version", "type"], false)
+      assert message =~ "missing required keys"
+      assert message =~ "version"
+    end
+
+    test "returns error for non-existent file" do
+      assert {:error, message} = Core.validate_file("/tmp/nope.json", ["name"], false)
+      assert message =~ "cannot read file"
+    end
+
+    test "returns error for invalid JSON" do
+      path = Path.join(@fixtures_dir, "invalid.json")
+      assert {:error, message} = Core.validate_file(path, ["name"], false)
+      assert message =~ "invalid JSON"
+    end
+
+    test "returns error when top-level is not an object" do
+      path = Path.join(@fixtures_dir, "array.json")
+      assert {:error, message} = Core.validate_file(path, ["name"], false)
+      assert message =~ "must be a JSON object"
+    end
+
+    test "passes in non-strict mode with extra keys" do
+      path = Path.join(@fixtures_dir, "extra_keys.json")
+      assert :ok = Core.validate_file(path, ["name", "version", "type"], false)
+    end
+
+    test "fails in strict mode with extra keys" do
+      path = Path.join(@fixtures_dir, "extra_keys.json")
+      assert {:error, message} = Core.validate_file(path, ["name", "version", "type"], true)
+      assert message =~ "unknown keys"
+      assert message =~ "debug"
+    end
+  end
+end
 ```
 
-All tests should pass with the implementation above.
+```elixir
+# test/json_validator/cli_test.exs
+defmodule JsonValidator.CLITest do
+  use ExUnit.Case, async: true
 
-### Step 6: Explore Mix tasks
+  alias JsonValidator.CLI
+
+  describe "parse_args/1" do
+    test "parses file path without options" do
+      assert {:validate, "config.json", []} = CLI.parse_args(["config.json"])
+    end
+
+    test "parses file path with --strict flag" do
+      assert {:validate, "config.json", [strict: true]} =
+               CLI.parse_args(["config.json", "--strict"])
+    end
+
+    test "parses short aliases" do
+      assert {:validate, "config.json", [strict: true]} =
+               CLI.parse_args(["config.json", "-s"])
+    end
+
+    test "parses --keys option" do
+      assert {:validate, "f.json", opts} = CLI.parse_args(["f.json", "-k", "a,b,c"])
+      assert opts[:keys] == "a,b,c"
+    end
+
+    test "returns :help when no arguments given" do
+      assert :help = CLI.parse_args([])
+    end
+
+    test "returns :help when --help flag is present" do
+      assert :help = CLI.parse_args(["--help"])
+    end
+  end
+end
+```
+
+### Step 8: Run and verify
 
 ```bash
-# See all available tasks
-mix help
+# Install dependencies
+mix deps.get
 
-# Understand what test does
-mix help test
+# Compile with strict warnings
+mix compile --warnings-as-errors
 
-# Format your code
+# Run tests with trace output
+mix test --trace
+
+# Run tests with coverage
+mix test --cover
+
+# Format the project
 mix format
 
-# Check for compilation warnings
-mix compile --warnings-as-errors
-```
+# Build the escript (produces a ./json_validator binary)
+mix escript.build
 
-```bash
-# Run with arguments via mix run
-mix run -e 'PaymentsCli.CLI.main(["transactions.csv"])'
+# Run the binary
+./json_validator sample.json --strict
+./json_validator --help
 ```
 
 ---
@@ -227,46 +512,51 @@ mix run -e 'PaymentsCli.CLI.main(["transactions.csv"])'
 
 | Aspect | Current approach | Alternative |
 |--------|-----------------|-------------|
-| Argument parsing | Pattern match on `args` list | `OptionParser.parse/2` for flags |
-| Error reporting | Return `{:error, reason}` | Raise exception immediately |
-| stderr vs stdout | `IO.puts(:stderr, ...)` | `IO.puts(...)` (stdout) |
-| Entry point | `main/1` called by `mix run` | escript compiled binary |
+| Argument parsing | `OptionParser` with typed switches | Raw pattern match on `argv` |
+| JSON library | `jason` (pure Elixir, fast) | `poison` (older, less maintained) |
+| Validation chain | `with` expression | Nested `case` |
+| Distribution | escript (single binary) | `mix release` (full OTP release) |
+| Config at runtime | `config/runtime.exs` | `System.get_env/1` inline |
 
-Reflection question: why does `main/1` return `{:error, reason}` instead of calling
-`System.halt(1)` directly? Think about testability.
+When to use escript vs release: escripts are for CLI tools that run and exit. Releases
+are for long-running OTP applications with supervision trees. A validator CLI is a
+perfect escript use case.
 
 ---
 
 ## Common production mistakes
 
-**1. `iex` without `-S mix` loses your project**
-`iex` opens a bare Elixir session. `iex -S mix` compiles and loads your project.
-Running `PaymentsCli.CLI.main/1` in plain `iex` gives `UndefinedFunctionError`.
-Always use `iex -S mix` when working interactively on a project.
+**1. `System.get_env/1` in `config.exs` instead of `runtime.exs`**
+`config.exs` runs at compile time. If you read `DATABASE_URL` there, it captures the
+value from your CI environment and bakes it into the release. Use `runtime.exs` for
+anything that should be read at boot time.
 
-**2. `recompile()` in IEx is not the same as restarting**
-`recompile()` reloads changed modules but does not restart the supervision tree.
-For changes to `application/0` in `mix.exs`, you must fully restart `iex -S mix`.
-
-**3. Forgetting `mix deps.get` after editing `mix.exs`**
+**2. Forgetting `mix deps.get` after editing `mix.exs`**
 Adding a dependency to `deps/0` does not automatically download it. Run
 `mix deps.get` before `mix compile`. Skipping this gives cryptic "module not found"
 errors at compile time.
 
-**4. `start_permanent` confusion in dev**
+**3. `start_permanent` confusion in dev**
 `start_permanent: Mix.env() == :prod` means crashes are more visible in production
 (the VM exits) but silent in dev (the supervisor restarts). If something crashes in
 dev and you don't see it, check `Mix.env()`.
 
-**5. Test files in the wrong directory**
-Mix only picks up test files under `test/`. A file at `lib/my_test.exs` is never
-run by `mix test`. Follow the convention: `test/<module_path>_test.exs`.
+**4. Not using `--warnings-as-errors` in CI**
+`mix compile --warnings-as-errors` turns unused variables, unreachable clauses, and
+deprecated function calls into hard failures. Without it, warnings accumulate silently
+in CI and you lose the compiler's safety net.
+
+**5. Escript missing `main/1`**
+The module specified in `escript: [main_module: MyModule]` must export `main/1`.
+If it does not, `mix escript.build` succeeds but the binary crashes at runtime with
+`UndefinedFunctionError`. Always verify with `./your_binary --help` after building.
 
 ---
 
 ## Resources
 
-- [Mix documentation — HexDocs](https://hexdocs.pm/mix/Mix.html) — read `project/0`, `application/0`, and `deps/0` sections
-- [IEx documentation — HexDocs](https://hexdocs.pm/iex/IEx.html) — `h/1`, `recompile/0`, `i/1`
-- [Mix.Task — writing custom tasks](https://hexdocs.pm/mix/Mix.Task.html)
-- [Elixir releases — mix release](https://hexdocs.pm/mix/Mix.Tasks.Release.html) — how `start_permanent` matters in production
+- [Mix documentation — HexDocs](https://hexdocs.pm/mix/Mix.html)
+- [OptionParser — HexDocs](https://hexdocs.pm/elixir/OptionParser.html)
+- [Escript — mix escript.build](https://hexdocs.pm/mix/Mix.Tasks.Escript.Build.html)
+- [Config and runtime.exs — HexDocs](https://hexdocs.pm/elixir/Config.html)
+- [Jason library — HexDocs](https://hexdocs.pm/jason/Jason.html)
