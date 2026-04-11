@@ -193,10 +193,14 @@ end
 
 ### Step 2: Extend `CircuitBreaker.Worker` to broadcast state changes
 
+When the circuit breaker transitions to a new state (:open, :closed, :half_open),
+it broadcasts an event to the `"circuit_breaker:events"` topic. All subscribers
+on all nodes receive the event within milliseconds.
+
 ```elixir
 # In lib/api_gateway/circuit_breaker/worker.ex
 
-# After transitioning from :closed → :open, add:
+# Add this private function:
 defp broadcast_state_change(service_name, new_status) do
   Phoenix.PubSub.broadcast(
     ApiGateway.PubSub,
@@ -208,12 +212,21 @@ defp broadcast_state_change(service_name, new_status) do
   )
 end
 
-# Call from the state transition points in handle_call:
-# TODO: add broadcast_state_change(state.service_name, :open) after tripping
-# TODO: add broadcast_state_change(state.service_name, :closed) after recovery
+# Call from the state transition points in handle_cast(:failure, ...) and handle_cast(:success, ...):
+# After transitioning to :open:
+#   broadcast_state_change(state.service, :open)
+# After transitioning from :half_open to :closed:
+#   broadcast_state_change(state.service, :closed)
 ```
 
 ### Step 3: `lib/api_gateway/events/subscriber.ex`
+
+The Subscriber is a cross-cutting event consumer that subscribes to all event topics
+and maintains a bounded event log. It demonstrates the subscriber pattern: subscribe
+in `init/1`, handle events in `handle_info/2`, and let PubSub manage cleanup on death.
+
+The `@max_events` cap prevents unbounded memory growth under high event rates. Events
+are prepended (newest first) and the list is truncated after each insertion.
 
 ```elixir
 defmodule ApiGateway.Events.Subscriber do
@@ -223,8 +236,10 @@ defmodule ApiGateway.Events.Subscriber do
   @topics [
     "circuit_breaker:events",
     "route_table:events",
-    "audit:events",
+    "audit:events"
   ]
+
+  @max_events 500
 
   # ---------------------------------------------------------------------------
   # Public API
@@ -234,7 +249,8 @@ defmodule ApiGateway.Events.Subscriber do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
   end
 
-  @doc "Returns events received since startup, newest first. Capped at 500 entries."
+  @doc "Returns events received since startup, newest first. Capped at #{@max_events} entries."
+  @spec recent_events() :: [tuple()]
   def recent_events do
     GenServer.call(__MODULE__, :recent_events)
   end
@@ -245,8 +261,9 @@ defmodule ApiGateway.Events.Subscriber do
 
   @impl true
   def init(_opts) do
-    # TODO: subscribe to all topics in @topics
-    # HINT: Enum.each(@topics, &Phoenix.PubSub.subscribe(ApiGateway.PubSub, &1))
+    # Subscribe to all event topics. PubSub monitors this process and
+    # automatically removes subscriptions when it dies.
+    Enum.each(@topics, &Phoenix.PubSub.subscribe(ApiGateway.PubSub, &1))
 
     {:ok, %{events: []}}
   end
@@ -257,24 +274,27 @@ defmodule ApiGateway.Events.Subscriber do
 
   @impl true
   def handle_info({:circuit_breaker_state_changed, payload}, state) do
-    # TODO:
-    # 1. Log at appropriate level (warning for :open, info for :closed/:half_open)
-    # 2. Prepend {:circuit_breaker, payload} to state.events
-    # 3. Keep only last 500 events
-    # 4. {:noreply, new_state}
-    {:noreply, state}
+    level = if payload.status == :open, do: :warning, else: :info
+    Logger.log(level, "Circuit breaker #{payload.service} → #{payload.status} on #{payload.node}")
+
+    new_events = [{:circuit_breaker, payload} | state.events] |> Enum.take(@max_events)
+    {:noreply, %{state | events: new_events}}
   end
 
   @impl true
   def handle_info({:route_table_updated, payload}, state) do
-    # TODO: log and record event
-    {:noreply, state}
+    Logger.info("Route table updated: #{inspect(payload)}")
+
+    new_events = [{:route_table, payload} | state.events] |> Enum.take(@max_events)
+    {:noreply, %{state | events: new_events}}
   end
 
   @impl true
   def handle_info({:audit_entry, payload}, state) do
-    # TODO: log at debug level and record event
-    {:noreply, state}
+    Logger.debug("Audit entry received: #{inspect(payload)}")
+
+    new_events = [{:audit, payload} | state.events] |> Enum.take(@max_events)
+    {:noreply, %{state | events: new_events}}
   end
 
   @impl true
@@ -286,21 +306,19 @@ end
 
 ### Step 4: Route table cache invalidation with `local_broadcast`
 
+When a route is updated, only the local node's caches need to be invalidated. Other
+nodes manage their own route caches independently. `local_broadcast` avoids unnecessary
+cross-node traffic.
+
 ```elixir
 # In lib/api_gateway/route_table/server.ex
 
-# After a successful route update write, notify other local processes to clear caches:
 defp invalidate_local_caches(route_id) do
-  # TODO: use local_broadcast — only THIS node's subscribers need to react.
-  # Other nodes manage their own route caches and will receive the route update
-  # via their own route table sync mechanism.
-  #
-  # HINT:
-  #   Phoenix.PubSub.local_broadcast(
-  #     ApiGateway.PubSub,
-  #     "route_table:events",
-  #     {:route_table_updated, %{route_id: route_id, at: DateTime.utc_now()}}
-  #   )
+  Phoenix.PubSub.local_broadcast(
+    ApiGateway.PubSub,
+    "route_table:events",
+    {:route_table_updated, %{route_id: route_id, at: DateTime.utc_now()}}
+  )
 end
 ```
 
