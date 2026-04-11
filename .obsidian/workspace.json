@@ -13,12 +13,12 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "challenges/elixir/01-basico/01-setup-and-mix/01-setup-and-mix.md",
+                "file": "challenges/elixir/01-basico/03-numbers-and-arithmetic/03-numbers-and-arithmetic.md",
                 "mode": "source",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "01-setup-and-mix"
+              "title": "03-numbers-and-arithmetic"
             }
           }
         ]
@@ -210,6 +210,8 @@
   },
   "active": "e170d91267f0c529",
   "lastOpenFiles": [
+    "challenges/elixir/01-basico/01-setup-and-mix/01-setup-and-mix.md",
+    "challenges/elixir/01-basico/02-atoms-and-symbols/02-atoms-and-symbols.md",
     "challenges/elixir/01-basico/01-setup-and-mix/payments_cli/lib/payments_cli/cli.ex",
     "challenges/elixir/01-basico/01-setup-and-mix/payments_cli/test/payments_cli",
     "challenges/elixir/01-basico/01-setup-and-mix/payments_cli/lib/payments_cli",
@@ -223,8 +225,6 @@
     "challenges/elixir/01-basico/01-setup-and-mix/payments_cli",
     "challenges/elixir/01-basico/06-lists-and-head-tail-pattern/06-lists-and-head-tail-pattern.md",
     "challenges/elixir/01-basico/07-maps-and-keyword-lists/07-maps-and-keyword-lists.md",
-    "challenges/elixir/01-basico/01-setup-and-mix/01-setup-and-mix.md",
-    "challenges/elixir/01-basico/02-atoms-and-symbols/02-atoms-and-symbols.md",
     "challenges/elixir/04-insane/34-build-api-gateway/34-build-api-gateway.md",
     "challenges/elixir/02-intermedio/03-task-y-concurrencia/03-task-y-concurrencia.md",
     "challenges/elixir/02-intermedio/01-procesos-spawn-send-receive/01-procesos-spawn-send-receive.md",
@@ -245,7 +245,6 @@
     "challenges/elixir/en/01-basico/13-anonymous-functions-and-closures/13-anonymous-functions-and-closures.md",
     "challenges/elixir/es/01-basico/12-pipe-operator-and-composition/12-pipe-operator-and-composition.md",
     "challenges/elixir/en/01-basico/12-pipe-operator-and-composition/12-pipe-operator-and-composition.md",
-    "challenges/elixir/es/01-basico/15-structs-and-basic-validation",
     "Presentacion/poc-just/web/node_modules/ordered-binary/assets/powers-dre.png",
     "Presentacion/poc-just/web/node_modules/retry/equation.gif",
     "Untitled.canvas"

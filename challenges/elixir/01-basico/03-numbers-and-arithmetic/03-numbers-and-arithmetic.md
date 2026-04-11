@@ -1,266 +1,409 @@
-# Numbers and Arithmetic: Transaction Amount Calculations
+# Numbers and Arithmetic: Building a Money Library
 
-**Project**: `payments_cli` — a CLI tool that processes payment transactions
-
----
-
-## Project context
-
-You are building `payments_cli`, a CLI tool that processes payment transactions from CSV
-files, validates them, applies business rules, and produces ledger reports.
-
-This exercise implements a `Ledger` module that performs financial calculations: summing
-transaction amounts, computing processing fees, converting currencies, and formatting
-amounts for display. All amounts are stored as integers in the smallest currency unit
-(cents) to avoid floating-point precision errors.
+**Project**: `money` — a library for safe financial arithmetic using integer cents
 
 ---
 
-## Why numeric types matter for payments
+## Why floating-point arithmetic breaks financial code
 
-Payment systems expose the most common numeric bugs in software:
+Every senior developer has heard "don't use floats for money," but few have
+internalized why. In Elixir (and every IEEE 754 language):
 
-1. **Float rounding errors** — `0.1 + 0.2 != 0.3` in IEEE 754. If you store
-   `$0.10` as `0.1` and sum 10 such transactions, the total may be `$1.0000000000000002`.
-   This is a real problem in production payment systems.
+```elixir
+iex> 0.1 + 0.2
+0.30000000000000004
 
-2. **Integer overflow** — Python and Ruby integers have arbitrary precision. Java's
-   `int` overflows at ~2 billion. Elixir (and Erlang) integers have arbitrary precision
-   like Python — no overflow, ever.
+iex> 0.1 + 0.2 == 0.3
+false
+```
 
-3. **Division confusion** — `10 / 2` returning `5.0` (float) instead of `5` (integer)
-   breaks functions that expect an integer for pagination, list splitting, or index math.
+In a payment system processing millions of transactions, these rounding errors
+compound. A billing system that calculates `100 * 19.99` might produce
+`1998.9999999999998` instead of `1999.0`, causing a one-cent discrepancy per
+invoice. At scale, that is an audit failure.
 
-The canonical solution in financial systems: **store amounts as integers in the smallest
-unit** (cents for USD, pence for GBP, yen for JPY). Never store `$12.34` as `12.34`.
-Store it as `1234` cents. All arithmetic happens on integers. Display formatting is
-a presentation concern, not a domain concern.
+The solution used by every serious financial system: represent money as integers
+(cents, pence, centavos). `$19.99` becomes `1999` cents. Integer arithmetic in
+Elixir is exact and arbitrary precision — there is no overflow.
+
+```elixir
+iex> 10 + 20
+30  # Exactly 30 cents. No rounding. No surprises.
+
+# Elixir integers are arbitrary precision
+iex> 999_999_999_999_999_999 * 999_999_999_999_999_999
+999999999999999998000000000000000001  # No overflow, exact result
+```
 
 ---
 
 ## The business problem
 
-The `Ledger` module needs to:
+Build a `Money` module that:
 
-1. Sum transaction amounts (stored in cents as integers)
-2. Calculate a processing fee (percentage of amount)
-3. Convert amounts between currencies using exchange rates
-4. Format amounts for display (`1234` -> `"$12.34"`)
+1. Represents monetary values as integer cents with a currency code
+2. Performs addition, subtraction, and multiplication safely
+3. Prevents arithmetic between different currencies
+4. Splits amounts evenly (e.g., split a $10.01 bill three ways without losing a cent)
+5. Formats amounts for display
 
 ---
 
 ## Implementation
 
-### `lib/payments_cli/ledger.ex`
-
-Each function uses integer arithmetic wherever possible. The key insight is that
-`div/2` truncates toward zero (integer division), while `/` always returns a float.
-For fee calculations, `div/2` gives us floor behavior on positive numbers — the
-merchant pays at most the theoretical fee, never more.
-
-For currency conversion, we accept a float rate (from external APIs) and immediately
-round back to integer cents. The float exists only for the multiplication step.
+### `lib/money.ex`
 
 ```elixir
-defmodule PaymentsCli.Ledger do
+defmodule Money do
   @moduledoc """
-  Financial calculations for the payments ledger.
+  Safe monetary arithmetic using integer cents.
 
-  All amounts are stored and computed in the smallest unit of the currency
-  (cents for USD, pence for GBP). This avoids IEEE 754 floating-point
-  accumulation errors that are unacceptable in financial systems.
+  All amounts are stored as integers representing the smallest currency unit
+  (cents for USD/EUR, pence for GBP). This eliminates floating-point rounding
+  errors entirely.
 
-  Exchange rates are received as floats (from external APIs) and converted
-  to integer arithmetic using a fixed precision factor.
+  Currency is tracked to prevent accidentally adding USD to EUR.
   """
 
-  @doc """
-  Sums a list of transaction amounts in cents.
+  @type t :: %{amount: integer(), currency: atom()}
 
-  Returns the total as an integer. Empty list returns 0.
+  @doc """
+  Creates a Money value from an integer amount in cents.
 
   ## Examples
 
-      iex> PaymentsCli.Ledger.sum_amounts([1000, 2500, 750])
-      4250
-
-      iex> PaymentsCli.Ledger.sum_amounts([])
-      0
+      iex> Money.new(1999, :usd)
+      %{amount: 1999, currency: :usd}
 
   """
-  @spec sum_amounts([integer()]) :: integer()
-  def sum_amounts(amounts) when is_list(amounts) do
-    Enum.sum(amounts)
+  @spec new(integer(), atom()) :: t()
+  def new(amount, currency) when is_integer(amount) and is_atom(currency) do
+    %{amount: amount, currency: currency}
   end
 
   @doc """
-  Calculates the processing fee for an amount in cents.
+  Creates a Money value from a float dollar amount.
 
-  fee_basis_points is the fee expressed in basis points (1 basis point = 0.01%).
-  100 basis points = 1%. This avoids floating-point fee rates.
-
-  Returns the fee rounded DOWN (floor) to the nearest cent.
-  The merchant always pays less than or equal to the theoretical fee.
+  Converts to cents internally using rounding to handle float imprecision.
+  This is the ONLY place where floats touch the money system.
 
   ## Examples
 
-      iex> PaymentsCli.Ledger.calculate_fee(10_000, 250)
-      250
+      iex> Money.from_float(19.99, :usd)
+      %{amount: 1999, currency: :usd}
 
-      iex> PaymentsCli.Ledger.calculate_fee(333, 100)
-      3
+      iex> Money.from_float(0.1 + 0.2, :usd)
+      %{amount: 30, currency: :usd}
 
   """
-  @spec calculate_fee(integer(), integer()) :: integer()
-  def calculate_fee(amount_cents, fee_basis_points)
-      when is_integer(amount_cents) and amount_cents >= 0 and
-           is_integer(fee_basis_points) and fee_basis_points >= 0 do
-    div(amount_cents * fee_basis_points, 10_000)
+  @spec from_float(float(), atom()) :: t()
+  def from_float(dollars, currency) when is_float(dollars) and is_atom(currency) do
+    cents = round(dollars * 100)
+    new(cents, currency)
   end
 
   @doc """
-  Converts an amount from one currency to another.
-
-  rate is the exchange rate as a float (e.g. 1.08 for USD to EUR).
-  Returns the converted amount in cents, rounded to nearest cent.
+  Adds two money values. Both must have the same currency.
 
   ## Examples
 
-      iex> PaymentsCli.Ledger.convert_currency(10_000, 1.08)
-      10800
+      iex> a = Money.new(1000, :usd)
+      iex> b = Money.new(599, :usd)
+      iex> Money.add(a, b)
+      {:ok, %{amount: 1599, currency: :usd}}
 
-      iex> PaymentsCli.Ledger.convert_currency(10_000, 0.92)
-      9200
+      iex> a = Money.new(1000, :usd)
+      iex> b = Money.new(500, :eur)
+      iex> Money.add(a, b)
+      {:error, :currency_mismatch}
 
   """
-  @spec convert_currency(integer(), float()) :: integer()
-  def convert_currency(amount_cents, rate)
-      when is_integer(amount_cents) and is_float(rate) and rate > 0 do
-    round(amount_cents * rate)
+  @spec add(t(), t()) :: {:ok, t()} | {:error, :currency_mismatch}
+  def add(%{currency: c} = a, %{currency: c} = b) do
+    {:ok, new(a.amount + b.amount, c)}
+  end
+
+  def add(%{currency: _}, %{currency: _}), do: {:error, :currency_mismatch}
+
+  @doc """
+  Subtracts the second money value from the first.
+
+  ## Examples
+
+      iex> a = Money.new(1000, :usd)
+      iex> b = Money.new(300, :usd)
+      iex> Money.subtract(a, b)
+      {:ok, %{amount: 700, currency: :usd}}
+
+  """
+  @spec subtract(t(), t()) :: {:ok, t()} | {:error, :currency_mismatch}
+  def subtract(%{currency: c} = a, %{currency: c} = b) do
+    {:ok, new(a.amount - b.amount, c)}
+  end
+
+  def subtract(%{currency: _}, %{currency: _}), do: {:error, :currency_mismatch}
+
+  @doc """
+  Multiplies a money value by a scalar (quantity, tax rate, etc.).
+
+  The result is rounded to the nearest cent. This is the only operation
+  that introduces rounding, and it happens at the integer level.
+
+  ## Examples
+
+      iex> price = Money.new(999, :usd)
+      iex> Money.multiply(price, 3)
+      %{amount: 2997, currency: :usd}
+
+      iex> subtotal = Money.new(1000, :usd)
+      iex> Money.multiply(subtotal, 1.0825)
+      %{amount: 1083, currency: :usd}
+
+  """
+  @spec multiply(t(), number()) :: t()
+  def multiply(%{amount: amount, currency: currency}, factor) when is_number(factor) do
+    new(round(amount * factor), currency)
   end
 
   @doc """
-  Formats an amount in cents as a display string with currency symbol.
+  Splits a money value into N equal parts without losing cents.
+
+  The remainder is distributed one cent at a time to the first parts.
+  This guarantees that the parts always sum to the original amount.
 
   ## Examples
 
-      iex> PaymentsCli.Ledger.format_amount(1234, "USD")
-      "$12.34"
+      iex> bill = Money.new(1001, :usd)
+      iex> Money.split(bill, 3)
+      [
+        %{amount: 334, currency: :usd},
+        %{amount: 334, currency: :usd},
+        %{amount: 333, currency: :usd}
+      ]
 
-      iex> PaymentsCli.Ledger.format_amount(100, "GBP")
-      "£1.00"
-
-      iex> PaymentsCli.Ledger.format_amount(50, "USD")
-      "$0.50"
+      iex> bill = Money.new(1000, :usd)
+      iex> parts = Money.split(bill, 3)
+      iex> parts |> Enum.map(& &1.amount) |> Enum.sum()
+      1000
 
   """
-  @spec format_amount(integer(), String.t()) :: String.t()
-  def format_amount(amount_cents, currency) when is_integer(amount_cents) do
-    major = div(amount_cents, 100)
-    minor = rem(amount_cents, 100)
-    padded_minor = minor |> Integer.to_string() |> String.pad_leading(2, "0")
+  @spec split(t(), pos_integer()) :: [t()]
+  def split(%{amount: amount, currency: currency}, parts)
+      when is_integer(parts) and parts > 0 do
+    base = div(amount, parts)
+    remainder = rem(amount, parts)
+
+    for i <- 1..parts do
+      extra = if i <= remainder, do: 1, else: 0
+      new(base + extra, currency)
+    end
+  end
+
+  @doc """
+  Formats a money value as a human-readable string.
+
+  ## Examples
+
+      iex> Money.format(Money.new(1999, :usd))
+      "$19.99"
+
+      iex> Money.format(Money.new(500, :eur))
+      "€5.00"
+
+      iex> Money.format(Money.new(-250, :usd))
+      "-$2.50"
+
+  """
+  @spec format(t()) :: String.t()
+  def format(%{amount: amount, currency: currency}) do
     symbol = currency_symbol(currency)
-
-    "#{symbol}#{major}.#{padded_minor}"
+    {sign, abs_amount} = if amount < 0, do: {"-", -amount}, else: {"", amount}
+    major = div(abs_amount, 100)
+    minor = rem(abs_amount, 100) |> Integer.to_string() |> String.pad_leading(2, "0")
+    "#{sign}#{symbol}#{major}.#{minor}"
   end
 
-  defp currency_symbol("USD"), do: "$"
-  defp currency_symbol("GBP"), do: "£"
-  defp currency_symbol("EUR"), do: "€"
+  @doc """
+  Returns true if the money amount is zero.
+  """
+  @spec zero?(t()) :: boolean()
+  def zero?(%{amount: 0}), do: true
+  def zero?(%{amount: _}), do: false
+
+  @doc """
+  Returns true if the money amount is positive.
+  """
+  @spec positive?(t()) :: boolean()
+  def positive?(%{amount: amount}) when amount > 0, do: true
+  def positive?(%{amount: _}), do: false
+
+  @spec currency_symbol(atom()) :: String.t()
+  defp currency_symbol(:usd), do: "$"
+  defp currency_symbol(:eur), do: "€"
+  defp currency_symbol(:gbp), do: "£"
+  defp currency_symbol(:jpy), do: "¥"
   defp currency_symbol(other), do: "#{other} "
 end
 ```
 
 **Why this works:**
 
-- `sum_amounts/1` delegates to `Enum.sum/1`, which is implemented natively in the BEAM
-  and is faster than a hand-written recursive sum. There is no reason to reinvent it.
-
-- `calculate_fee/2` uses `div/2` for integer division. `div(333 * 100, 10_000)` evaluates
-  to `div(33_300, 10_000)` which is `3` — truncated toward zero. This is floor behavior
-  for positive numbers, meaning the fee is always rounded down (merchant-favorable).
-
-- `convert_currency/2` multiplies by the float rate, then uses `round/1` to get back to
-  an integer. `round/1` uses banker's rounding (round half to even), which is acceptable
-  for most payment rounding scenarios.
-
-- `format_amount/2` splits cents into major and minor units using `div/2` and `rem/2`,
-  then pads the minor unit with a leading zero. The currency symbol is looked up via
-  a private helper with pattern-matched clauses.
+- `add/2` pattern-matches the currency in both arguments using the same variable `c`.
+  If the currencies differ, the first clause does not match, and the catch-all returns
+  `{:error, :currency_mismatch}`. This is a compile-time guarantee — no `if` needed.
+- `split/2` uses `div/2` and `rem/2` (integer division) to calculate the base share
+  and remainder. The remainder is distributed one cent per part to the first N parts.
+  This guarantees the sum of all parts equals the original.
+- `from_float/2` is the only function that accepts floats. It uses `round/1` to convert
+  to the nearest integer cent. All subsequent operations are pure integer math.
+- `format/1` handles negative amounts (refunds) by extracting the sign first.
 
 ### Tests
 
 ```elixir
-# test/payments_cli/ledger_test.exs
-defmodule PaymentsCli.LedgerTest do
+# test/money_test.exs
+defmodule MoneyTest do
   use ExUnit.Case, async: true
 
-  alias PaymentsCli.Ledger
+  doctest Money
 
-  describe "sum_amounts/1" do
-    test "sums a list of amounts" do
-      assert Ledger.sum_amounts([1000, 2500, 750]) == 4250
+  describe "new/2" do
+    test "creates money with integer cents" do
+      m = Money.new(1999, :usd)
+      assert m.amount == 1999
+      assert m.currency == :usd
     end
 
-    test "returns 0 for empty list" do
-      assert Ledger.sum_amounts([]) == 0
+    test "allows negative amounts for refunds" do
+      m = Money.new(-500, :usd)
+      assert m.amount == -500
     end
 
-    test "handles a single amount" do
-      assert Ledger.sum_amounts([9999]) == 9999
-    end
-  end
-
-  describe "calculate_fee/2" do
-    test "2.5% fee on 100 USD (10000 cents)" do
-      # 250 basis points = 2.5%
-      assert Ledger.calculate_fee(10_000, 250) == 250
-    end
-
-    test "1% fee on $3.33 rounds down" do
-      # $3.33 = 333 cents, 1% = 100 bp, fee = 3.33 cents -> floor -> 3 cents
-      assert Ledger.calculate_fee(333, 100) == 3
-    end
-
-    test "zero fee" do
-      assert Ledger.calculate_fee(10_000, 0) == 0
-    end
-
-    test "zero amount" do
-      assert Ledger.calculate_fee(0, 250) == 0
+    test "allows zero" do
+      m = Money.new(0, :usd)
+      assert Money.zero?(m)
     end
   end
 
-  describe "convert_currency/2" do
-    test "USD to EUR at 1.08 rate" do
-      # $100.00 at 1.08 = $108.00
-      assert Ledger.convert_currency(10_000, 1.08) == 10_800
+  describe "from_float/2" do
+    test "converts dollars to cents" do
+      m = Money.from_float(19.99, :usd)
+      assert m.amount == 1999
     end
 
-    test "USD to GBP at 0.79 rate" do
-      assert Ledger.convert_currency(10_000, 0.79) == 7_900
+    test "handles float imprecision correctly" do
+      m = Money.from_float(0.1 + 0.2, :usd)
+      assert m.amount == 30
     end
 
-    test "identity rate" do
-      assert Ledger.convert_currency(5_000, 1.0) == 5_000
+    test "handles exact floats" do
+      m = Money.from_float(10.0, :usd)
+      assert m.amount == 1000
     end
   end
 
-  describe "format_amount/2" do
+  describe "add/2" do
+    test "adds same currency" do
+      a = Money.new(1000, :usd)
+      b = Money.new(599, :usd)
+      assert {:ok, %{amount: 1599, currency: :usd}} = Money.add(a, b)
+    end
+
+    test "rejects different currencies" do
+      a = Money.new(1000, :usd)
+      b = Money.new(500, :eur)
+      assert {:error, :currency_mismatch} = Money.add(a, b)
+    end
+
+    test "handles negative amounts" do
+      a = Money.new(1000, :usd)
+      b = Money.new(-300, :usd)
+      assert {:ok, %{amount: 700}} = Money.add(a, b)
+    end
+  end
+
+  describe "subtract/2" do
+    test "subtracts same currency" do
+      a = Money.new(1000, :usd)
+      b = Money.new(300, :usd)
+      assert {:ok, %{amount: 700}} = Money.subtract(a, b)
+    end
+
+    test "allows negative results" do
+      a = Money.new(100, :usd)
+      b = Money.new(500, :usd)
+      assert {:ok, %{amount: -400}} = Money.subtract(a, b)
+    end
+  end
+
+  describe "multiply/2" do
+    test "multiplies by integer" do
+      price = Money.new(999, :usd)
+      assert %{amount: 2997} = Money.multiply(price, 3)
+    end
+
+    test "multiplies by float and rounds" do
+      subtotal = Money.new(1000, :usd)
+      with_tax = Money.multiply(subtotal, 1.0825)
+      assert with_tax.amount == 1083
+    end
+
+    test "multiplies by zero" do
+      m = Money.new(999, :usd)
+      assert %{amount: 0} = Money.multiply(m, 0)
+    end
+  end
+
+  describe "split/2" do
+    test "splits evenly" do
+      bill = Money.new(900, :usd)
+      parts = Money.split(bill, 3)
+      assert length(parts) == 3
+      assert Enum.all?(parts, &(&1.amount == 300))
+    end
+
+    test "distributes remainder to first parts" do
+      bill = Money.new(1001, :usd)
+      parts = Money.split(bill, 3)
+      amounts = Enum.map(parts, & &1.amount)
+      assert amounts == [334, 334, 333]
+    end
+
+    test "parts always sum to original" do
+      bill = Money.new(1000, :usd)
+
+      for n <- 1..7 do
+        parts = Money.split(bill, n)
+        total = parts |> Enum.map(& &1.amount) |> Enum.sum()
+        assert total == 1000, "Split into #{n} parts lost cents"
+      end
+    end
+
+    test "split into 1 returns original" do
+      bill = Money.new(999, :usd)
+      assert [%{amount: 999}] = Money.split(bill, 1)
+    end
+  end
+
+  describe "format/1" do
     test "formats USD" do
-      assert Ledger.format_amount(1234, "USD") == "$12.34"
+      assert Money.format(Money.new(1999, :usd)) == "$19.99"
     end
 
-    test "formats GBP" do
-      assert Ledger.format_amount(100, "GBP") == "£1.00"
+    test "formats EUR" do
+      assert Money.format(Money.new(500, :eur)) == "€5.00"
     end
 
-    test "formats amount with leading zero in cents" do
-      assert Ledger.format_amount(50, "USD") == "$0.50"
+    test "formats negative amounts" do
+      assert Money.format(Money.new(-250, :usd)) == "-$2.50"
     end
 
     test "formats zero" do
-      assert Ledger.format_amount(0, "USD") == "$0.00"
+      assert Money.format(Money.new(0, :usd)) == "$0.00"
+    end
+
+    test "pads single-digit cents" do
+      assert Money.format(Money.new(105, :usd)) == "$1.05"
     end
   end
 end
@@ -269,51 +412,87 @@ end
 ### Run the tests
 
 ```bash
-mix test test/payments_cli/ledger_test.exs --trace
+mix test --trace
 ```
 
 ---
 
-## Trade-off analysis
+## Why Elixir integers never overflow
 
-| Aspect | Integer cents (your impl) | Float dollars | Decimal library |
-|--------|--------------------------|---------------|-----------------|
-| Precision | Exact for integers | IEEE 754 errors accumulate | Exact decimal arithmetic |
-| Performance | Fastest (native integer ops) | Fast | Slower (software arithmetic) |
-| Display formatting | Manual (`div`/`rem`) | `Float.round` + string | Built-in formatting |
-| External libraries | None needed | None needed | `{:decimal, "~> 2.0"}` |
-| Use case | Simple currencies with fixed minor units | Approximations, not money | Currencies with variable precision |
+Unlike Java's `int` (32-bit, max 2,147,483,647) or Go's `int64`, Elixir integers
+are arbitrary precision. The BEAM automatically promotes to big integers when needed:
 
-Reflection question: `format_amount/2` uses `rem(amount_cents, 100)`. What happens if
-`amount_cents` is negative? What does `rem(-50, 100)` return, and does your
-formatting handle it correctly?
+```elixir
+iex> :erlang.system_info(:wordsize)
+8  # 64-bit machine
+
+# Small integers (fits in a machine word) — fast, no allocation
+iex> 42 + 1
+43
+
+# Big integers (exceeds machine word) — automatic, exact, slower
+iex> 2 ** 100
+1267650600228229401496703205376
+
+# No overflow, no wrap-around, no silent truncation
+iex> 9_999_999_999_999_999_999 + 1
+10000000000000000000
+```
+
+For financial code, this means you never need to worry about overflow when summing
+millions of transactions. The VM handles promotion transparently.
+
+---
+
+## Integer vs float division
+
+Elixir distinguishes integer and float division at the operator level:
+
+```elixir
+iex> 10 / 3      # Always returns a float
+3.3333333333333335
+
+iex> div(10, 3)   # Integer division — truncates toward zero
+3
+
+iex> rem(10, 3)   # Integer remainder
+1
+
+iex> Integer.floor_div(-7, 2)  # Floors toward negative infinity
+-4
+
+iex> div(-7, 2)   # Truncates toward zero
+-3
+```
+
+For money calculations, always use `div/2` and `rem/2`. The `/` operator introduces
+floats and all their rounding problems.
 
 ---
 
 ## Common production mistakes
 
-**1. Storing money as floats**
-`0.1 + 0.2` in IEEE 754 is `0.30000000000000004`. In a ledger that sums thousands
-of transactions, these errors accumulate. Use integers in the smallest monetary unit.
+**1. Using `Decimal` when integers suffice**
+The `Decimal` library exists for when you genuinely need arbitrary-precision
+decimal arithmetic (e.g., cryptocurrency with 18 decimal places). For standard
+currencies with 2 decimal places, integer cents are simpler, faster, and
+sufficient.
 
-**2. Using `/` where `div/2` is needed**
-`div(total, count)` for computing average order value returns an integer.
-`total / count` returns a float. Passing a float to `Enum.split/2` or as an
-array index raises `FunctionClauseError`. The error message is confusing if
-you don't know this rule.
+**2. Mixing float and integer arithmetic**
+`10 / 3` returns `3.3333...` (float). `div(10, 3)` returns `3` (integer).
+Always use `div` and `rem` for money calculations.
 
-**3. `rem/2` sign follows the dividend**
-`rem(-7, 3)` is `-1` in Elixir (and C/Java). It is `2` in Python (`%` operator).
-For displaying negative amounts, use `abs/1` on the result of `rem`.
+**3. Forgetting the split remainder**
+Naive splitting: `div(1001, 3) * 3 = 999`. You lost 2 cents. Always distribute
+the remainder explicitly.
 
-**4. Float comparison with `==`**
-Never write `rate == 1.0` to check for identity rate. Use `abs(rate - 1.0) < 1.0e-9`.
-Float equality is almost never what you want.
+**4. Rounding at every step instead of at the end**
+If you calculate tax, then round, then add a fee, then round again, rounding errors
+compound. Calculate the entire chain in cents and round once at the final display step.
 
-**5. Integer precision on large amounts**
-Elixir integers have arbitrary precision. `2 ** 100` works perfectly.
-This is not true in all languages. You can safely accumulate millions of cent-valued
-transactions without overflow.
+**5. Comparing floats for equality**
+Never write `price == 19.99`. Floats cannot represent most decimal values exactly.
+Always compare money as integer cents: `price_cents == 1999`.
 
 ---
 
@@ -321,6 +500,6 @@ transactions without overflow.
 
 - [Integer — HexDocs](https://hexdocs.pm/elixir/Integer.html)
 - [Float — HexDocs](https://hexdocs.pm/elixir/Float.html)
-- [The Floating-Point Guide](https://floating-point-gui.de/) — essential reading for anyone handling money
-- [Decimal library for Elixir](https://github.com/ericmj/decimal) — when you need exact decimal arithmetic
-- [Erlang integer precision — efficiency guide](https://www.erlang.org/doc/efficiency_guide/advanced.html)
+- [Kernel arithmetic — div, rem](https://hexdocs.pm/elixir/Kernel.html#div/2)
+- [IEEE 754 — What Every Programmer Should Know About Floating-Point](https://floating-point-gui.de/)
+- [Decimal library — HexDocs](https://hexdocs.pm/decimal/Decimal.html)
