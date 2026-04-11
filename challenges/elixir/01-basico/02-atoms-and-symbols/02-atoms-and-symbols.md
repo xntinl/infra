@@ -1,133 +1,128 @@
-# Atoms: The Transaction Status Type System
+# Atoms and Symbols: Building an Order State Machine
 
-**Project**: `payments_cli` — a CLI tool that processes payment transactions
-
----
-
-## Project context
-
-You are building `payments_cli`, a CLI tool that processes payment transactions from CSV
-files, validates them, applies business rules, and produces ledger reports.
-
-This exercise implements a `Transaction` module that uses atoms as a type system for
-payment statuses and error codes. The module provides status classification for reporting
-and safe parsing of external string input into validated status atoms.
+**Project**: `order_fsm` — a finite state machine for order processing using atoms as states
 
 ---
 
-## Why this design decision matters
+## Why atoms are an architectural decision
 
-The payments system needs to represent transaction states: `:pending`, `:approved`,
-`:declined`, `:reversed`, `:flagged`. You have two choices:
+Atoms in Elixir are constants whose name is their value. They live in a global
+atom table — a fixed-size, never-garbage-collected lookup structure in the BEAM VM.
+This makes them perfect for representing a fixed set of known states, but dangerous
+when created from external input.
 
-**Option A — Strings:**
-```elixir
-status = "approved"
-```
-
-**Option B — Atoms:**
-```elixir
-status = :approved
-```
-
-The difference is not just aesthetics. Atom comparison is O(1) — the VM compares
-pointers into the global atom table, not byte sequences. With 10,000 transactions
-being classified per second, string comparisons for status codes are measurable
-overhead. More importantly, a typo in a string (`"aproved"`) compiles silently.
-A typo in an atom used in a `case` clause can generate a compiler warning.
+For a senior developer coming from Java or Go, atoms replace the role of enums,
+string constants, and sentinel values. The critical difference: atom comparison is
+O(1) pointer comparison, not O(n) byte comparison. With thousands of state transitions
+per second, this matters.
 
 The `{:ok, value}` / `{:error, reason}` pattern appears in every Elixir API because
-it makes error handling explicit and forces the caller to handle both cases. You
-cannot accidentally ignore an `:error` the way you can ignore a `nil` return in
-other languages.
+atoms make error handling explicit and pattern-matchable. You cannot accidentally
+ignore an `:error` the way you can ignore a `null` return in other languages.
 
 ---
 
 ## The business problem
 
-The `Transaction` module needs:
+An e-commerce system needs to track order lifecycle with strict state transitions.
+Not every transition is valid — you cannot ship a cancelled order, and you cannot
+cancel a delivered order. The state machine must:
 
-1. A function `classify_status/1` that takes an atom status and returns a human-readable
-   string category for reporting
-2. A function `parse_status/1` that converts external string input (from CSV) to
-   an atom status safely — without creating atoms from arbitrary strings
+1. Define valid states as atoms
+2. Enforce valid transitions with pattern matching
+3. Safely parse state strings from external systems (webhooks, APIs)
+4. Never create atoms from untrusted input
 
 ---
 
 ## Implementation
 
-### `lib/payments_cli/transaction.ex`
-
-Each status maps to a reporting category. The function uses multiple clauses with
-pattern matching — one clause per status. This is idiomatic Elixir: instead of a
-`case` or `if/else` chain, each pattern is a separate function head. Adding a new
-status means adding one clause, not modifying existing logic.
-
-`parse_status/1` converts external string input safely using `String.to_existing_atom/1`
-wrapped in a rescue, then verifies the result is actually a valid status. The two-step
-check (exists as atom + is a valid status) prevents both atom table exhaustion and
-accepting atoms that happen to exist but are not valid statuses.
+### `lib/order_fsm/state.ex`
 
 ```elixir
-defmodule PaymentsCli.Transaction do
+defmodule OrderFsm.State do
   @moduledoc """
-  Represents a payment transaction and provides status classification.
+  Defines valid order states and transitions.
 
-  Status atoms are the canonical representation internally. External data
-  (CSV, JSON, API responses) always arrives as strings and must be
-  converted via parse_status/1 — never with String.to_atom/1.
+  States are atoms representing the order lifecycle:
+  :pending -> :confirmed -> :shipped -> :delivered
+                         -> :cancelled (from pending or confirmed only)
+
+  External input (API, webhooks) arrives as strings and must be
+  converted via parse/1 — never with String.to_atom/1.
   """
 
-  @valid_statuses [:pending, :approved, :declined, :reversed, :flagged]
+  @valid_states [:pending, :confirmed, :shipped, :delivered, :cancelled]
+
+  @transitions %{
+    pending: [:confirmed, :cancelled],
+    confirmed: [:shipped, :cancelled],
+    shipped: [:delivered],
+    delivered: [],
+    cancelled: []
+  }
 
   @doc """
-  Returns the list of valid transaction statuses.
+  Returns all valid order states.
   """
-  @spec valid_statuses() :: [atom()]
-  def valid_statuses, do: @valid_statuses
+  @spec valid_states() :: [atom()]
+  def valid_states, do: @valid_states
 
   @doc """
-  Classifies a transaction status atom into a reporting category string.
-
-  Returns a string category used in ledger reports.
+  Returns the allowed next states from a given state.
 
   ## Examples
 
-      iex> PaymentsCli.Transaction.classify_status(:approved)
-      "successful"
+      iex> OrderFsm.State.allowed_transitions(:pending)
+      [:confirmed, :cancelled]
 
-      iex> PaymentsCli.Transaction.classify_status(:declined)
-      "failed"
-
-      iex> PaymentsCli.Transaction.classify_status(:flagged)
-      "under_review"
+      iex> OrderFsm.State.allowed_transitions(:delivered)
+      []
 
   """
-  @spec classify_status(atom()) :: String.t()
-  def classify_status(:approved), do: "successful"
-  def classify_status(:reversed), do: "successful"
-  def classify_status(:declined), do: "failed"
-  def classify_status(:flagged), do: "under_review"
-  def classify_status(:pending), do: "pending"
-  def classify_status(_unknown), do: "unknown"
+  @spec allowed_transitions(atom()) :: [atom()]
+  def allowed_transitions(state) when state in @valid_states do
+    Map.fetch!(@transitions, state)
+  end
 
   @doc """
-  Parses a status string from external input (CSV, API) into a status atom.
-
-  Returns {:ok, atom} for known statuses, {:error, :unknown_status} for anything else.
-  Uses String.to_existing_atom/1 so it NEVER creates new atoms from external input.
+  Checks if a transition from one state to another is valid.
 
   ## Examples
 
-      iex> PaymentsCli.Transaction.parse_status("approved")
-      {:ok, :approved}
+      iex> OrderFsm.State.valid_transition?(:pending, :confirmed)
+      true
 
-      iex> PaymentsCli.Transaction.parse_status("hacked_value")
-      {:error, :unknown_status}
+      iex> OrderFsm.State.valid_transition?(:delivered, :cancelled)
+      false
 
   """
-  @spec parse_status(String.t()) :: {:ok, atom()} | {:error, :unknown_status}
-  def parse_status(string) when is_binary(string) do
+  @spec valid_transition?(atom(), atom()) :: boolean()
+  def valid_transition?(from, to)
+      when from in @valid_states and to in @valid_states do
+    to in Map.fetch!(@transitions, from)
+  end
+
+  def valid_transition?(_, _), do: false
+
+  @doc """
+  Safely parses a string into a valid state atom.
+
+  Uses String.to_existing_atom/1 so it never creates new atoms from
+  external input. Then verifies the atom is actually a valid state —
+  not just any atom that happens to exist in the VM.
+
+  ## Examples
+
+      iex> OrderFsm.State.parse("confirmed")
+      {:ok, :confirmed}
+
+      iex> OrderFsm.State.parse("hacked_value")
+      {:error, :unknown_state}
+
+  """
+  @spec parse(String.t()) :: {:ok, atom()} | {:error, :unknown_state}
+  def parse(string) when is_binary(string) do
     atom =
       try do
         String.to_existing_atom(string)
@@ -135,82 +130,272 @@ defmodule PaymentsCli.Transaction do
         ArgumentError -> nil
       end
 
-    if atom in @valid_statuses do
+    if atom in @valid_states do
       {:ok, atom}
     else
-      {:error, :unknown_status}
+      {:error, :unknown_state}
+    end
+  end
+
+  @doc """
+  Returns true if the state is terminal (no further transitions possible).
+
+  ## Examples
+
+      iex> OrderFsm.State.terminal?(:delivered)
+      true
+
+      iex> OrderFsm.State.terminal?(:pending)
+      false
+
+  """
+  @spec terminal?(atom()) :: boolean()
+  def terminal?(state) when state in @valid_states do
+    Map.fetch!(@transitions, state) == []
+  end
+end
+```
+
+### `lib/order_fsm/order.ex`
+
+```elixir
+defmodule OrderFsm.Order do
+  @moduledoc """
+  Represents an order and manages state transitions.
+
+  Each transition is validated against the state machine rules.
+  Invalid transitions return {:error, reason} instead of raising,
+  following the Elixir convention for expected failures.
+  """
+
+  @type t :: %{
+          id: String.t(),
+          state: atom(),
+          items: [String.t()],
+          history: [{atom(), atom(), DateTime.t()}]
+        }
+
+  @doc """
+  Creates a new order in the :pending state.
+
+  ## Examples
+
+      iex> order = OrderFsm.Order.new("ORD-001", ["Widget A", "Gadget B"])
+      iex> order.state
+      :pending
+
+  """
+  @spec new(String.t(), [String.t()]) :: t()
+  def new(id, items) when is_binary(id) and is_list(items) do
+    %{
+      id: id,
+      state: :pending,
+      items: items,
+      history: []
+    }
+  end
+
+  @doc """
+  Transitions an order to a new state.
+
+  Records the transition in the history with a timestamp.
+  Returns {:error, reason} if the transition is not allowed.
+
+  ## Examples
+
+      iex> order = OrderFsm.Order.new("ORD-001", ["Widget"])
+      iex> {:ok, confirmed} = OrderFsm.Order.transition(order, :confirmed)
+      iex> confirmed.state
+      :confirmed
+
+      iex> order = OrderFsm.Order.new("ORD-001", ["Widget"])
+      iex> OrderFsm.Order.transition(order, :delivered)
+      {:error, :invalid_transition}
+
+  """
+  @spec transition(t(), atom()) :: {:ok, t()} | {:error, :invalid_transition}
+  def transition(%{state: current} = order, target) do
+    if OrderFsm.State.valid_transition?(current, target) do
+      now = DateTime.utc_now()
+
+      updated =
+        order
+        |> Map.put(:state, target)
+        |> Map.update!(:history, &[{current, target, now} | &1])
+
+      {:ok, updated}
+    else
+      {:error, :invalid_transition}
+    end
+  end
+
+  @doc """
+  Applies a sequence of transitions, stopping at the first failure.
+
+  Returns {:ok, final_order} if all transitions succeed, or
+  {:error, reason, last_successful_order} if any fails.
+
+  ## Examples
+
+      iex> order = OrderFsm.Order.new("ORD-001", ["Widget"])
+      iex> {:ok, delivered} = OrderFsm.Order.transition_chain(order, [:confirmed, :shipped, :delivered])
+      iex> delivered.state
+      :delivered
+
+  """
+  @spec transition_chain(t(), [atom()]) ::
+          {:ok, t()} | {:error, :invalid_transition, t()}
+  def transition_chain(order, states) do
+    Enum.reduce_while(states, {:ok, order}, fn target, {:ok, current} ->
+      case transition(current, target) do
+        {:ok, updated} -> {:cont, {:ok, updated}}
+        {:error, reason} -> {:halt, {:error, reason, current}}
+      end
+    end)
+  end
+
+  @doc """
+  Returns the transition history in chronological order.
+  """
+  @spec history(t()) :: [{atom(), atom(), DateTime.t()}]
+  def history(%{history: history}), do: Enum.reverse(history)
+end
+```
+
+### Tests
+
+```elixir
+# test/order_fsm/state_test.exs
+defmodule OrderFsm.StateTest do
+  use ExUnit.Case, async: true
+
+  alias OrderFsm.State
+
+  describe "valid_transition?/2" do
+    test "pending can move to confirmed" do
+      assert State.valid_transition?(:pending, :confirmed)
+    end
+
+    test "pending can move to cancelled" do
+      assert State.valid_transition?(:pending, :cancelled)
+    end
+
+    test "pending cannot jump to delivered" do
+      refute State.valid_transition?(:pending, :delivered)
+    end
+
+    test "delivered cannot move anywhere" do
+      refute State.valid_transition?(:delivered, :cancelled)
+      refute State.valid_transition?(:delivered, :pending)
+    end
+
+    test "shipped can only move to delivered" do
+      assert State.valid_transition?(:shipped, :delivered)
+      refute State.valid_transition?(:shipped, :cancelled)
+    end
+
+    test "unknown states return false" do
+      refute State.valid_transition?(:nonexistent, :pending)
+    end
+  end
+
+  describe "parse/1" do
+    test "parses all valid state strings" do
+      for state <- State.valid_states() do
+        string = Atom.to_string(state)
+        assert {:ok, ^state} = State.parse(string)
+      end
+    end
+
+    test "returns error for unknown state string" do
+      assert {:error, :unknown_state} = State.parse("processing")
+    end
+
+    test "returns error for valid atoms that are not states" do
+      assert {:error, :unknown_state} = State.parse("ok")
+    end
+
+    test "returns error for empty string" do
+      assert {:error, :unknown_state} = State.parse("")
+    end
+  end
+
+  describe "terminal?/1" do
+    test "delivered is terminal" do
+      assert State.terminal?(:delivered)
+    end
+
+    test "cancelled is terminal" do
+      assert State.terminal?(:cancelled)
+    end
+
+    test "pending is not terminal" do
+      refute State.terminal?(:pending)
     end
   end
 end
 ```
 
-**Why this works:**
-
-- `classify_status/1` uses six function clauses. Each clause matches exactly one atom.
-  The compiler evaluates them top-to-bottom and uses the first match. The catch-all
-  `_unknown` at the bottom ensures the function never raises on an unexpected atom —
-  it returns `"unknown"` instead.
-
-- `parse_status/1` uses a two-step defense against malicious input:
-  1. `String.to_existing_atom/1` only converts to atoms that already exist in the atom
-     table. If the string `"hacked"` has never been used as an atom in the running VM,
-     it raises `ArgumentError` — which we rescue and convert to `nil`.
-  2. Even if the conversion succeeds (e.g., `"ok"` is a real atom), we check membership
-     in `@valid_statuses`. This prevents accepting `:ok`, `:true`, or any other existing
-     atom that is not a valid transaction status.
-
-### Tests
-
 ```elixir
-# test/payments_cli/transaction_test.exs
-defmodule PaymentsCli.TransactionTest do
+# test/order_fsm/order_test.exs
+defmodule OrderFsm.OrderTest do
   use ExUnit.Case, async: true
 
-  alias PaymentsCli.Transaction
+  alias OrderFsm.Order
 
-  describe "classify_status/1" do
-    test "approved and reversed are both successful" do
-      assert Transaction.classify_status(:approved) == "successful"
-      assert Transaction.classify_status(:reversed) == "successful"
-    end
-
-    test "declined is failed" do
-      assert Transaction.classify_status(:declined) == "failed"
-    end
-
-    test "flagged is under_review" do
-      assert Transaction.classify_status(:flagged) == "under_review"
-    end
-
-    test "pending is pending" do
-      assert Transaction.classify_status(:pending) == "pending"
-    end
-
-    test "unknown atom returns unknown category" do
-      result = Transaction.classify_status(:some_future_status)
-      assert is_binary(result)
+  describe "new/2" do
+    test "creates order in pending state" do
+      order = Order.new("ORD-001", ["Widget A"])
+      assert order.state == :pending
+      assert order.id == "ORD-001"
+      assert order.items == ["Widget A"]
+      assert order.history == []
     end
   end
 
-  describe "parse_status/1" do
-    test "parses all valid status strings" do
-      for status <- Transaction.valid_statuses() do
-        string = Atom.to_string(status)
-        assert {:ok, ^status} = Transaction.parse_status(string)
-      end
+  describe "transition/2" do
+    test "valid transition updates state" do
+      order = Order.new("ORD-001", ["Widget"])
+      assert {:ok, confirmed} = Order.transition(order, :confirmed)
+      assert confirmed.state == :confirmed
     end
 
-    test "returns error for unknown status string" do
-      assert {:error, :unknown_status} = Transaction.parse_status("hacked")
+    test "invalid transition returns error" do
+      order = Order.new("ORD-001", ["Widget"])
+      assert {:error, :invalid_transition} = Order.transition(order, :delivered)
     end
 
-    test "returns error for valid atom names that are not statuses" do
-      # :ok is a real atom but not a valid transaction status
-      assert {:error, :unknown_status} = Transaction.parse_status("ok")
+    test "records transition in history" do
+      order = Order.new("ORD-001", ["Widget"])
+      {:ok, confirmed} = Order.transition(order, :confirmed)
+      assert [{:pending, :confirmed, %DateTime{}}] = confirmed.history
     end
 
-    test "returns error for empty string" do
-      assert {:error, :unknown_status} = Transaction.parse_status("")
+    test "original order is not mutated" do
+      order = Order.new("ORD-001", ["Widget"])
+      {:ok, _confirmed} = Order.transition(order, :confirmed)
+      assert order.state == :pending
+    end
+  end
+
+  describe "transition_chain/2" do
+    test "applies full lifecycle" do
+      order = Order.new("ORD-001", ["Widget"])
+
+      assert {:ok, delivered} =
+               Order.transition_chain(order, [:confirmed, :shipped, :delivered])
+
+      assert delivered.state == :delivered
+      assert length(Order.history(delivered)) == 3
+    end
+
+    test "stops at first invalid transition" do
+      order = Order.new("ORD-001", ["Widget"])
+
+      assert {:error, :invalid_transition, partial} =
+               Order.transition_chain(order, [:confirmed, :delivered])
+
+      assert partial.state == :confirmed
     end
   end
 end
@@ -219,60 +404,67 @@ end
 ### Run the tests
 
 ```bash
-mix test test/payments_cli/transaction_test.exs --trace
+mix test --trace
 ```
 
 ---
 
-## Trade-off analysis
+## The atom table security problem
 
-| Aspect | Atoms (your impl) | Strings | Integer codes (e.g. 1, 2, 3) |
-|--------|-------------------|---------|-------------------------------|
-| Comparison speed | O(1) pointer compare | O(n) byte compare | O(1) |
-| Typo safety | Compiler can warn | Silent failure | No semantic meaning |
-| External input | Requires parse step | Direct use | Requires mapping |
-| Memory | Global atom table, never GC'd | GC'd normally | Minimal |
-| Exhaustiveness checking | Dialyzer + patterns | Nothing | Nothing |
+The BEAM atom table has a default limit of 1,048,576 atoms. Atoms are never garbage
+collected. This creates a real denial-of-service vector:
 
-Reflection question: `parse_status/1` uses `String.to_existing_atom/1` followed
-by a membership check. Why are both steps needed? What attack does the membership
-check prevent that `to_existing_atom` alone does not?
+```elixir
+# NEVER do this with external input
+def handle_webhook(%{"status" => status_string}) do
+  status = String.to_atom(status_string)  # Creates a NEW atom every call
+  # ...
+end
+```
+
+An attacker sending unique status strings in API requests exhausts the atom table
+and crashes the entire VM. The fix is always the same pattern:
+
+1. Use `String.to_existing_atom/1` (raises if the atom does not exist)
+2. Verify the atom is in your allowed set
+
+Or skip atoms entirely and use a hardcoded `case` on the string:
+
+```elixir
+def parse_status("pending"), do: {:ok, :pending}
+def parse_status("confirmed"), do: {:ok, :confirmed}
+def parse_status(_), do: {:error, :unknown}
+```
+
+This approach creates no new atoms and compiles to efficient pattern matching.
 
 ---
 
 ## Common production mistakes
 
-**1. `String.to_atom/1` from external input**
-Every unique string passed to `String.to_atom/1` creates a permanent entry in the
-atom table. The BEAM atom table limit is 1,048,576 atoms. An attacker sending
-unique status strings in API requests can exhaust it and crash the VM. Use
-`String.to_existing_atom/1` plus a membership check, or a hardcoded `case` on strings.
+**1. `true`, `false`, and `nil` are atoms**
+`is_atom(true)` returns `true`. This means `:true == true` evaluates to `true`.
+Do not confuse boolean atoms with your domain atoms.
 
-**2. Using strings for internal status codes**
-If your business logic pattern-matches on `"approved"` instead of `:approved`, you
-lose O(1) comparison. You also introduce the risk of case mismatch (`"Approved"` vs
-`"approved"`). Reserve strings for data that crosses system boundaries (serialization,
-external APIs, user display).
+**2. Atom ordering is alphabetical, not insertion order**
+`[:declined, :approved, :pending] |> Enum.sort()` returns
+`[:approved, :declined, :pending]`. Never rely on definition order.
 
-**3. The atom table is global and process-independent**
-Atoms created in one process are visible to all processes. Creating atoms from user
-input in one handler affects the global atom table shared by the entire VM. There is
-no per-process or per-request isolation.
+**3. Atoms across nodes must match exactly**
+In a distributed Erlang cluster, atoms are compared by name. If node A uses
+`:confirmed` and node B uses `:Confirmed`, they are different atoms. Stick to
+lowercase snake_case.
 
-**4. `true`, `false`, and `nil` are atoms**
-`is_atom(true)` returns `true`. This surprises developers from other languages.
-It means `:true == true` and you can use booleans in atom-typed fields. Do not
-conflate them with your domain atoms.
-
-**5. Atom ordering is alphabetical, not insertion order**
-`[:declined, :approved, :pending] |> Enum.sort()` gives `[:approved, :declined, :pending]`.
-Never rely on definition order when sorting atoms. Always sort explicitly.
+**4. Module names are atoms**
+`is_atom(Enum)` returns `true`. Every module name is an atom prefixed with `Elixir.`
+internally (`Enum` is actually `:"Elixir.Enum"`). This means module references
+consume atom table entries too.
 
 ---
 
 ## Resources
 
 - [Atom — HexDocs](https://hexdocs.pm/elixir/Atom.html)
-- [Erlang atom table limits — Erlang efficiency guide](https://www.erlang.org/doc/efficiency_guide/advanced.html)
+- [Erlang atom table limits](https://www.erlang.org/doc/efficiency_guide/advanced.html)
 - [String.to_existing_atom/1 — HexDocs](https://hexdocs.pm/elixir/String.html#to_existing_atom/1)
-- [Elixir Getting Started — Atoms](https://elixir-lang.org/getting-started/basic-types.html#atoms)
+- [Pattern matching — Elixir Getting Started](https://elixir-lang.org/getting-started/pattern-matching.html)
