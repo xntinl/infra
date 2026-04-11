@@ -1,288 +1,436 @@
-# Strings and Binaries: Parsing CSV Transaction Lines
+# Strings and Binaries: Building a Log Parser
 
-**Project**: `payments_cli` — a CLI tool that processes payment transactions
-
----
-
-## Project context
-
-You are building `payments_cli`, a CLI tool that processes payment transactions from CSV
-files, validates them, applies business rules, and produces ledger reports.
-
-This exercise implements a `Formatter` module that parses raw CSV lines into structured
-data, truncates merchant names respecting UTF-8 grapheme boundaries, normalizes reference
-IDs, and validates string integrity. These operations are fundamental to processing
-bank-exported CSV files that may contain non-ASCII merchant names.
+**Project**: `log_parser` — a structured data extractor for nginx access logs using binary pattern matching
 
 ---
 
-## Why strings as binaries matters in a payments context
+## Why binaries matter in Elixir
 
-A CSV file exported by a European bank may contain merchant names like
-`"Cafe Munchen GmbH"`. If you treat strings as byte arrays (as C does),
-the length of that name is 19 bytes but only 16 visible characters.
-Truncating to 15 "characters" by bytes splits `u` in the middle and
-produces invalid UTF-8 — data corruption.
+In Elixir, strings are UTF-8 encoded binaries. This is not just an implementation
+detail — it fundamentally affects how you process text. A string like `"hello"` is
+a contiguous sequence of bytes in memory, and Elixir gives you direct access to
+those bytes through binary pattern matching.
 
-Elixir strings are UTF-8 encoded binaries. The distinction matters:
-- `byte_size("Cafe")` -> `5` (bytes, O(1), used for binary protocol headers)
-- `String.length("Cafe")` -> `4` (graphemes, O(n), used for display truncation)
-- `String.valid?/1` -> validates UTF-8 before storing or forwarding data
+For a senior developer coming from Java or Python, where strings are opaque objects
+with method calls, this is a paradigm shift. Binary pattern matching lets you write
+parsers that are both readable and fast — no regex needed for structured formats.
 
-The other gotcha: bank-exported CSVs often arrive with Erlang charlists from
-old Erlang library integrations. A senior developer recognizes `'hello'` (charlist)
-vs `"hello"` (binary) and knows when `to_string/1` is needed.
+```elixir
+# A string IS a binary
+iex> is_binary("hello")
+true
+
+iex> byte_size("hello")
+5
+
+# UTF-8 means some characters take multiple bytes
+iex> byte_size("José")
+5  # é is 2 bytes
+
+iex> String.length("José")
+4  # 4 graphemes
+```
 
 ---
 
 ## The business problem
 
-The `Formatter` module needs to:
+Your infrastructure team needs to parse nginx access logs to extract structured data
+for monitoring dashboards. The standard nginx combined log format looks like:
 
-1. Parse a raw CSV line into a map of field values
-2. Truncate merchant names to a display length (respecting UTF-8 graphemes)
-3. Normalize reference IDs (uppercase, trim, remove internal spaces)
-4. Validate that a string is non-empty and valid UTF-8
+```
+192.168.1.1 - frank [10/Oct/2024:13:55:36 -0700] "GET /api/users HTTP/1.1" 200 2326
+```
+
+Build a parser that:
+
+1. Extracts IP, method, path, status code, and response size
+2. Uses binary pattern matching where possible (fast path)
+3. Falls back to string functions for complex fields
+4. Handles malformed lines gracefully
 
 ---
 
 ## Implementation
 
-### `lib/payments_cli/formatter.ex`
-
-The CSV parser splits on commas, trims whitespace, and validates the field count.
-Amount parsing uses `Integer.parse/1` instead of `String.to_integer/1` because the
-latter raises on invalid input — dangerous in a parser that processes thousands of rows.
-
-Truncation uses `String.length/1` and `String.slice/3` (grapheme-aware operations)
-instead of `byte_size` and binary slicing. This ensures multi-byte characters like
-`e` and `u` are never split mid-byte.
+### `lib/log_parser.ex`
 
 ```elixir
-defmodule PaymentsCli.Formatter do
+defmodule LogParser do
   @moduledoc """
-  Parses and formats transaction data for display and storage.
+  Parses nginx combined log format into structured maps.
 
-  All string operations use the String module (not binary/charlist operations)
-  to correctly handle UTF-8 merchant names and reference fields.
+  Uses a combination of binary pattern matching and String functions
+  to extract fields from log lines efficiently.
   """
 
+  @type entry :: %{
+          ip: String.t(),
+          user: String.t(),
+          timestamp: String.t(),
+          method: String.t(),
+          path: String.t(),
+          protocol: String.t(),
+          status: non_neg_integer(),
+          size: non_neg_integer()
+        }
+
   @doc """
-  Parses a CSV line into a map with typed values.
+  Parses a single nginx log line into a structured map.
 
-  Expected CSV format: "id,amount_cents,currency,merchant,status"
-
-  Returns {:ok, map} or {:error, reason}.
+  Returns {:ok, entry} on success, {:error, reason} on failure.
 
   ## Examples
 
-      iex> PaymentsCli.Formatter.parse_csv_line("TXN001,1234,USD,Coffee Shop,approved")
-      {:ok, %{id: "TXN001", amount_cents: 1234, currency: "USD", merchant: "Coffee Shop", status: "approved"}}
-
-      iex> PaymentsCli.Formatter.parse_csv_line("bad data")
-      {:error, "expected 5 fields, got 1"}
+      iex> line = ~s(192.168.1.1 - frank [10/Oct/2024:13:55:36 -0700] "GET /api/users HTTP/1.1" 200 2326)
+      iex> {:ok, entry} = LogParser.parse_line(line)
+      iex> entry.ip
+      "192.168.1.1"
+      iex> entry.method
+      "GET"
+      iex> entry.status
+      200
 
   """
-  @spec parse_csv_line(String.t()) :: {:ok, map()} | {:error, String.t()}
-  def parse_csv_line(line) when is_binary(line) do
-    fields = line |> String.split(",") |> Enum.map(&String.trim/1)
+  @spec parse_line(String.t()) :: {:ok, entry()} | {:error, String.t()}
+  def parse_line(line) when is_binary(line) do
+    with {:ok, ip, rest} <- extract_ip(line),
+         {:ok, user, rest} <- extract_user(rest),
+         {:ok, timestamp, rest} <- extract_timestamp(rest),
+         {:ok, method, path, protocol, rest} <- extract_request(rest),
+         {:ok, status, size} <- extract_status_and_size(rest) do
+      {:ok,
+       %{
+         ip: ip,
+         user: user,
+         timestamp: timestamp,
+         method: method,
+         path: path,
+         protocol: protocol,
+         status: status,
+         size: size
+       }}
+    end
+  end
 
-    case fields do
-      [id, amount_str, currency, merchant, status] ->
-        case Integer.parse(amount_str) do
-          {amount, ""} ->
-            {:ok, %{
-              id: id,
-              amount_cents: amount,
-              currency: currency,
-              merchant: merchant,
-              status: status
-            }}
+  @doc """
+  Parses multiple log lines, returning only successful parses.
 
-          _ ->
-            {:error, "invalid amount: #{amount_str}"}
+  Returns a list of entries and a count of failed lines.
+
+  ## Examples
+
+      iex> lines = [
+      ...>   ~s(10.0.0.1 - - [01/Jan/2024:00:00:00 +0000] "GET / HTTP/1.1" 200 512),
+      ...>   "garbage line",
+      ...>   ~s(10.0.0.2 - admin [01/Jan/2024:00:00:01 +0000] "POST /login HTTP/1.1" 302 0)
+      ...> ]
+      iex> {entries, failed_count} = LogParser.parse_lines(lines)
+      iex> length(entries)
+      2
+      iex> failed_count
+      1
+
+  """
+  @spec parse_lines([String.t()]) :: {[entry()], non_neg_integer()}
+  def parse_lines(lines) when is_list(lines) do
+    {entries, failures} =
+      lines
+      |> Enum.reduce({[], 0}, fn line, {entries, failures} ->
+        case parse_line(line) do
+          {:ok, entry} -> {[entry | entries], failures}
+          {:error, _} -> {entries, failures + 1}
         end
+      end)
 
-      _ ->
-        {:error, "expected 5 fields, got #{length(fields)}"}
-    end
+    {Enum.reverse(entries), failures}
   end
 
   @doc """
-  Truncates a merchant name to max_length graphemes, adding "..." if truncated.
+  Extracts the HTTP method from a request string using binary pattern matching.
 
-  Uses String.length/1 and String.slice/3 — NOT byte_size — so UTF-8 merchant
-  names like "Cafe Munchen" are truncated at grapheme boundaries.
+  This demonstrates how binary matching can be faster than regex for
+  known-format strings.
 
   ## Examples
 
-      iex> PaymentsCli.Formatter.truncate_merchant("Coffee Shop", 20)
-      "Coffee Shop"
+      iex> LogParser.extract_method("GET /api/users HTTP/1.1")
+      {:ok, "GET"}
 
-      iex> PaymentsCli.Formatter.truncate_merchant("A Very Long Merchant Name Here", 15)
-      "A Very Long Mer..."
-
-      iex> PaymentsCli.Formatter.truncate_merchant("Cafe Munchen GmbH", 10)
-      "Cafe Munch..."
+      iex> LogParser.extract_method("POST /api/users HTTP/1.1")
+      {:ok, "POST"}
 
   """
-  @spec truncate_merchant(String.t(), pos_integer()) :: String.t()
-  def truncate_merchant(name, max_length)
-      when is_binary(name) and is_integer(max_length) and max_length > 0 do
-    if String.length(name) <= max_length do
-      name
+  @spec extract_method(String.t()) :: {:ok, String.t()} | {:error, :unknown_method}
+  def extract_method("GET " <> _), do: {:ok, "GET"}
+  def extract_method("POST " <> _), do: {:ok, "POST"}
+  def extract_method("PUT " <> _), do: {:ok, "PUT"}
+  def extract_method("DELETE " <> _), do: {:ok, "DELETE"}
+  def extract_method("PATCH " <> _), do: {:ok, "PATCH"}
+  def extract_method("HEAD " <> _), do: {:ok, "HEAD"}
+  def extract_method("OPTIONS " <> _), do: {:ok, "OPTIONS"}
+  def extract_method(_), do: {:error, :unknown_method}
+
+  @doc """
+  Checks if an IP address matches a known subnet prefix.
+
+  Uses binary prefix matching — O(1) comparison against the prefix bytes.
+
+  ## Examples
+
+      iex> LogParser.internal_ip?("10.0.0.1")
+      true
+
+      iex> LogParser.internal_ip?("192.168.1.100")
+      true
+
+      iex> LogParser.internal_ip?("8.8.8.8")
+      false
+
+  """
+  @spec internal_ip?(String.t()) :: boolean()
+  def internal_ip?("10." <> _), do: true
+  def internal_ip?("172.16." <> _), do: true
+  def internal_ip?("172.17." <> _), do: true
+  def internal_ip?("192.168." <> _), do: true
+  def internal_ip?("127." <> _), do: true
+  def internal_ip?(_), do: false
+
+  @doc """
+  Classifies HTTP status codes into categories.
+
+  ## Examples
+
+      iex> LogParser.status_category(200)
+      :success
+
+      iex> LogParser.status_category(404)
+      :client_error
+
+      iex> LogParser.status_category(503)
+      :server_error
+
+  """
+  @spec status_category(non_neg_integer()) :: atom()
+  def status_category(code) when code >= 200 and code < 300, do: :success
+  def status_category(code) when code >= 300 and code < 400, do: :redirect
+  def status_category(code) when code >= 400 and code < 500, do: :client_error
+  def status_category(code) when code >= 500 and code < 600, do: :server_error
+  def status_category(_), do: :unknown
+
+  # --- Private extraction functions ---
+
+  @spec extract_ip(String.t()) :: {:ok, String.t(), String.t()} | {:error, String.t()}
+  defp extract_ip(line) do
+    case String.split(line, " ", parts: 2) do
+      [ip, rest] -> {:ok, ip, rest}
+      _ -> {:error, "cannot extract IP from: #{truncate(line)}"}
+    end
+  end
+
+  @spec extract_user(String.t()) :: {:ok, String.t(), String.t()} | {:error, String.t()}
+  defp extract_user(line) do
+    # Format: "- username " or "- - "
+    case String.split(line, " ", parts: 3) do
+      [_ident, user, rest] -> {:ok, user, rest}
+      _ -> {:error, "cannot extract user from: #{truncate(line)}"}
+    end
+  end
+
+  @spec extract_timestamp(String.t()) ::
+          {:ok, String.t(), String.t()} | {:error, String.t()}
+  defp extract_timestamp(line) do
+    with "[" <> rest <- line,
+         {timestamp, "] " <> remainder} <- split_on_bracket(rest) do
+      {:ok, timestamp, remainder}
     else
-      String.slice(name, 0, max_length - 1) <> "\u2026"
+      _ -> {:error, "cannot extract timestamp from: #{truncate(line)}"}
     end
   end
 
-  @doc """
-  Normalizes a transaction reference ID from external input.
-
-  Rules: uppercase, trim whitespace, remove internal spaces.
-
-  ## Examples
-
-      iex> PaymentsCli.Formatter.normalize_reference("  txn 001 abc  ")
-      "TXN001ABC"
-
-  """
-  @spec normalize_reference(String.t()) :: String.t()
-  def normalize_reference(ref) when is_binary(ref) do
-    ref
-    |> String.trim()
-    |> String.upcase()
-    |> String.replace(" ", "")
-  end
-
-  @doc """
-  Validates that a string is non-empty and valid UTF-8.
-
-  Returns {:ok, string} or {:error, reason}.
-
-  ## Examples
-
-      iex> PaymentsCli.Formatter.validate_string("hello")
-      {:ok, "hello"}
-
-      iex> PaymentsCli.Formatter.validate_string("")
-      {:error, "string is empty"}
-
-  """
-  @spec validate_string(String.t()) :: {:ok, String.t()} | {:error, String.t()}
-  def validate_string(value) when is_binary(value) do
-    cond do
-      not String.valid?(value) ->
-        {:error, "invalid UTF-8"}
-
-      byte_size(value) == 0 ->
-        {:error, "string is empty"}
-
-      true ->
-        {:ok, value}
+  @spec split_on_bracket(String.t()) :: {String.t(), String.t()} | :error
+  defp split_on_bracket(string) do
+    case String.split(string, "]", parts: 2) do
+      [before, after_bracket] -> {before, "]" <> after_bracket}
+      _ -> :error
     end
   end
+
+  @spec extract_request(String.t()) ::
+          {:ok, String.t(), String.t(), String.t(), String.t()} | {:error, String.t()}
+  defp extract_request(line) do
+    with "\"" <> rest <- line,
+         [request_str, remainder] <- String.split(rest, "\"", parts: 2),
+         [method, path, protocol] <- String.split(request_str, " ", parts: 3) do
+      {:ok, method, path, protocol, String.trim_leading(remainder)}
+    else
+      _ -> {:error, "cannot extract request from: #{truncate(line)}"}
+    end
+  end
+
+  @spec extract_status_and_size(String.t()) ::
+          {:ok, non_neg_integer(), non_neg_integer()} | {:error, String.t()}
+  defp extract_status_and_size(rest) do
+    parts = rest |> String.trim() |> String.split(" ", parts: 2)
+
+    with [status_str, size_str | _] <- parts,
+         {status, ""} <- Integer.parse(status_str),
+         {size, _} <- Integer.parse(String.trim(size_str)) do
+      {:ok, status, size}
+    else
+      _ -> {:error, "cannot extract status/size from: #{truncate(rest)}"}
+    end
+  end
+
+  @spec truncate(String.t()) :: String.t()
+  defp truncate(string) when byte_size(string) > 50 do
+    String.slice(string, 0, 50) <> "..."
+  end
+
+  defp truncate(string), do: string
 end
 ```
 
 **Why this works:**
 
-- `parse_csv_line/1` splits on commas, trims each field, then pattern matches on exactly
-  five elements. If the split produces more or fewer fields, the catch-all returns an
-  error with the actual count. `Integer.parse/1` returns `{integer, rest}` on success
-  or `:error` — matching on `{amount, ""}` ensures the entire string was consumed
-  (no trailing characters like `"123abc"`).
+- `extract_method/1` uses binary prefix matching (`"GET " <> _`). The BEAM compiles
+  this to a direct byte comparison — no string scanning, no regex compilation. For
+  HTTP methods, which are a fixed set of short prefixes, this is the optimal approach.
+- `internal_ip?/1` matches IP prefixes as binary heads. This is O(1) against each prefix.
+- `parse_line/1` uses `with` to chain extraction steps. Each step returns the extracted
+  value and the remaining string. If any step fails, the entire parse fails with a
+  descriptive error.
+- `Integer.parse/1` returns `{integer, rest}` or `:error` — never raises. This is
+  safer than `String.to_integer/1` which raises on invalid input.
 
-- `truncate_merchant/2` checks `String.length/1` (grapheme count, not byte count) before
-  deciding to truncate. If truncation is needed, it slices to `max_length - 1` graphemes
-  and appends the ellipsis `"\u2026"` (a single grapheme, 3 bytes in UTF-8). The total
-  grapheme count of the result equals `max_length`.
+### Binary pattern matching explained
 
-- `normalize_reference/1` is a natural pipeline: trim -> upcase -> remove spaces. Each
-  step transforms the string and passes the result to the next via `|>`.
+```elixir
+# Match a known prefix and capture the rest
+"GET " <> rest = "GET /api/users"
+# rest => "/api/users"
 
-- `validate_string/1` checks UTF-8 validity first with `String.valid?/1`, then checks
-  for empty. Order matters: calling `String.length/1` on invalid UTF-8 could raise.
-  We use `byte_size(value) == 0` for the empty check because it is O(1) and safe
-  even on invalid binaries.
+# Match specific bytes (UTF-8 code points)
+<<first_byte, _rest::binary>> = "Hello"
+# first_byte => 72 (ASCII 'H')
+
+# Match a fixed-length prefix
+<<ip_bytes::binary-size(7), _::binary>> = "1.2.3.4 - user"
+# ip_bytes => "1.2.3.4"  (only works when length is known)
+
+# Pattern match on UTF-8 characters
+<<char::utf8, rest::binary>> = "José"
+# char => 74 (code point for 'J')
+# rest => "osé"
+```
+
+The `<< >>` syntax is the binary pattern matching operator. `binary-size(n)` matches
+exactly `n` bytes. `utf8` matches one UTF-8 code point (which may be multiple bytes).
 
 ### Tests
 
 ```elixir
-# test/payments_cli/formatter_test.exs
-defmodule PaymentsCli.FormatterTest do
+# test/log_parser_test.exs
+defmodule LogParserTest do
   use ExUnit.Case, async: true
 
-  alias PaymentsCli.Formatter
+  doctest LogParser
 
-  describe "parse_csv_line/1" do
-    test "parses a valid CSV line" do
-      assert {:ok, tx} = Formatter.parse_csv_line("TXN001,1234,USD,Coffee Shop,approved")
-      assert tx.id == "TXN001"
-      assert tx.amount_cents == 1234
-      assert tx.currency == "USD"
-      assert tx.merchant == "Coffee Shop"
-      assert tx.status == "approved"
+  @valid_line ~s(192.168.1.1 - frank [10/Oct/2024:13:55:36 -0700] "GET /api/users HTTP/1.1" 200 2326)
+
+  describe "parse_line/1" do
+    test "parses a valid nginx log line" do
+      assert {:ok, entry} = LogParser.parse_line(@valid_line)
+      assert entry.ip == "192.168.1.1"
+      assert entry.user == "frank"
+      assert entry.method == "GET"
+      assert entry.path == "/api/users"
+      assert entry.protocol == "HTTP/1.1"
+      assert entry.status == 200
+      assert entry.size == 2326
     end
 
-    test "trims whitespace from fields" do
-      assert {:ok, tx} = Formatter.parse_csv_line(" TXN002 , 500 , EUR , Cafe , pending ")
-      assert tx.id == "TXN002"
-      assert tx.amount_cents == 500
-      assert tx.merchant == "Cafe"
+    test "parses line with dash user" do
+      line = ~s(10.0.0.1 - - [01/Jan/2024:00:00:00 +0000] "POST /login HTTP/1.1" 302 0)
+      assert {:ok, entry} = LogParser.parse_line(line)
+      assert entry.user == "-"
+      assert entry.method == "POST"
+      assert entry.status == 302
     end
 
-    test "returns error for wrong field count" do
-      assert {:error, message} = Formatter.parse_csv_line("bad data")
-      assert is_binary(message)
-    end
-
-    test "returns error for non-integer amount" do
-      assert {:error, _} = Formatter.parse_csv_line("TXN003,not_a_number,USD,Shop,approved")
-    end
-  end
-
-  describe "truncate_merchant/2" do
-    test "returns name unchanged when within limit" do
-      assert Formatter.truncate_merchant("Coffee Shop", 20) == "Coffee Shop"
-    end
-
-    test "truncates at grapheme boundary and adds ellipsis" do
-      result = Formatter.truncate_merchant("A Very Long Merchant Name Here", 15)
-      assert String.length(result) == 15
-      assert String.ends_with?(result, "\u2026")
-    end
-
-    test "handles UTF-8 merchant names correctly" do
-      # "Cafe Munchen" has 12 graphemes but 14 bytes
-      result = Formatter.truncate_merchant("Cafe Munchen GmbH", 10)
-      assert String.length(result) == 10
-      # Verify UTF-8 is still valid after truncation
-      assert String.valid?(result)
-    end
-  end
-
-  describe "normalize_reference/1" do
-    test "uppercases and removes spaces" do
-      assert Formatter.normalize_reference("  txn 001 abc  ") == "TXN001ABC"
-    end
-
-    test "handles already normalized input" do
-      assert Formatter.normalize_reference("TXN001") == "TXN001"
-    end
-  end
-
-  describe "validate_string/1" do
-    test "returns ok for valid string" do
-      assert {:ok, "hello"} = Formatter.validate_string("hello")
+    test "returns error for malformed line" do
+      assert {:error, _reason} = LogParser.parse_line("garbage")
     end
 
     test "returns error for empty string" do
-      assert {:error, _} = Formatter.validate_string("")
+      assert {:error, _reason} = LogParser.parse_line("")
+    end
+  end
+
+  describe "parse_lines/1" do
+    test "parses multiple lines and counts failures" do
+      lines = [
+        @valid_line,
+        "bad line",
+        ~s(10.0.0.2 - - [01/Jan/2024:00:00:01 +0000] "GET / HTTP/1.1" 200 512)
+      ]
+
+      {entries, failed} = LogParser.parse_lines(lines)
+      assert length(entries) == 2
+      assert failed == 1
     end
 
-    test "returns error for invalid UTF-8" do
-      assert {:error, _} = Formatter.validate_string(<<0xFF, 0xFE>>)
+    test "handles all-valid input" do
+      {entries, failed} = LogParser.parse_lines([@valid_line])
+      assert length(entries) == 1
+      assert failed == 0
+    end
+
+    test "handles empty input" do
+      {entries, failed} = LogParser.parse_lines([])
+      assert entries == []
+      assert failed == 0
+    end
+  end
+
+  describe "extract_method/1" do
+    test "recognizes all standard HTTP methods" do
+      assert {:ok, "GET"} = LogParser.extract_method("GET /path HTTP/1.1")
+      assert {:ok, "POST"} = LogParser.extract_method("POST /path HTTP/1.1")
+      assert {:ok, "PUT"} = LogParser.extract_method("PUT /path HTTP/1.1")
+      assert {:ok, "DELETE"} = LogParser.extract_method("DELETE /path HTTP/1.1")
+      assert {:ok, "PATCH"} = LogParser.extract_method("PATCH /path HTTP/1.1")
+      assert {:ok, "HEAD"} = LogParser.extract_method("HEAD /path HTTP/1.1")
+      assert {:ok, "OPTIONS"} = LogParser.extract_method("OPTIONS /path HTTP/1.1")
+    end
+
+    test "returns error for unknown method" do
+      assert {:error, :unknown_method} = LogParser.extract_method("UNKNOWN /path")
+    end
+  end
+
+  describe "internal_ip?/1" do
+    test "recognizes RFC 1918 addresses" do
+      assert LogParser.internal_ip?("10.0.0.1")
+      assert LogParser.internal_ip?("192.168.1.100")
+      assert LogParser.internal_ip?("172.16.0.1")
+      assert LogParser.internal_ip?("127.0.0.1")
+    end
+
+    test "rejects public addresses" do
+      refute LogParser.internal_ip?("8.8.8.8")
+      refute LogParser.internal_ip?("203.0.113.1")
+    end
+  end
+
+  describe "status_category/1" do
+    test "classifies HTTP status codes" do
+      assert LogParser.status_category(200) == :success
+      assert LogParser.status_category(201) == :success
+      assert LogParser.status_category(301) == :redirect
+      assert LogParser.status_category(404) == :client_error
+      assert LogParser.status_category(500) == :server_error
+      assert LogParser.status_category(503) == :server_error
     end
   end
 end
@@ -291,57 +439,54 @@ end
 ### Run the tests
 
 ```bash
-mix test test/payments_cli/formatter_test.exs --trace
+mix test --trace
 ```
 
 ---
 
-## Trade-off analysis
+## Strings vs binaries vs charlists
 
-| Aspect | String module (your impl) | Binary pattern matching | Regex |
-|--------|--------------------------|------------------------|-------|
-| UTF-8 correctness | Automatic | Manual byte handling needed | Depends on flag |
-| Performance | O(n) per operation | O(n) but lower constant | Higher overhead |
-| CSV parsing | Simple split + trim | Requires delimiter handling | Overkill for simple CSV |
-| Truncation | Grapheme-safe with `slice` | Byte-level, can corrupt | Not applicable |
+| Type | Internal | Example | Use when |
+|------|----------|---------|----------|
+| String (binary) | UTF-8 bytes | `"hello"` | Always — default in Elixir |
+| Charlist | List of code points | `'hello'` | Erlang interop only |
+| Iodata | Nested lists/binaries | `["hello", " ", "world"]` | Building output without copying |
 
-Reflection question: `parse_csv_line/1` uses `String.split(line, ",")`. What happens
-if a merchant name contains a comma, like `"Smith, Jones Ltd"`? How would you fix
-the parser to handle quoted CSV fields?
+A common mistake: `'hello'` is NOT a string in Elixir. It is a charlist (a list
+of integers). `'hello' == [104, 101, 108, 108, 111]` is `true`. You encounter
+charlists when calling Erlang functions directly.
 
 ---
 
 ## Common production mistakes
 
-**1. Using `byte_size` for display truncation**
-`byte_size("Cafe Munchen")` returns `14`, not `12`. Truncating by bytes
-instead of `String.length` + `String.slice` corrupts multi-byte characters
-and produces invalid UTF-8 that downstream systems reject.
+**1. `String.length/1` vs `byte_size/1`**
+`String.length("José")` returns 4 (graphemes). `byte_size("José")` returns 5 (bytes).
+Use `byte_size/1` for binary protocol work and storage calculations. Use
+`String.length/1` for user-facing character counts.
 
-**2. Charlist vs binary confusion from Erlang libraries**
-Some Erlang HTTP clients and file libraries return charlists (`'hello'`) instead
-of binaries (`"hello"`). `String.upcase('hello')` raises `FunctionClauseError`.
-Wrap Erlang library calls with `to_string/1` or `List.to_string/1` at the boundary.
+**2. Using regex when pattern matching suffices**
+For fixed-format strings (HTTP methods, IP prefixes, status codes), binary pattern
+matching compiles to direct byte comparison. Regex compiles to a state machine.
+The pattern match is both faster and more readable for these cases.
 
-**3. `String.to_integer/1` raises on invalid input**
-`String.to_integer("abc")` raises `ArgumentError`. In a CSV parser that processes
-thousands of rows, one bad row kills the process. Use `Integer.parse/1` which
-returns `:error` instead of raising.
+**3. Building strings with concatenation in a loop**
+`result = result <> chunk` copies the entire binary on each iteration.
+Use iodata lists instead: `[result | chunk]` then `IO.iodata_to_binary/1` at the end.
 
-**4. String concatenation in a loop with `<>`**
-Building a report string with `acc <> line` in each iteration is O(n^2) — each
-`<>` creates a new binary by copying. Use `IO.iodata_to_binary/1` with an iolist,
-or `Enum.join/2`, to build strings efficiently.
+**4. `String.to_integer/1` on untrusted input**
+`String.to_integer("abc")` raises `ArgumentError`. Use `Integer.parse/1` which
+returns `:error` for invalid input. Always prefer the non-raising variant for
+external data.
 
-**5. Forgetting `String.trim/1` on CSV fields**
-Bank CSV exports often have trailing spaces or Windows line endings (`\r\n`).
-Always trim fields after splitting. `"approved\r"` does not match `"approved"`.
+**5. Forgetting that string interpolation copies**
+`"Hello, #{name}"` creates a new binary. In hot loops, build iodata instead.
 
 ---
 
 ## Resources
 
-- [String — HexDocs](https://hexdocs.pm/elixir/String.html) — read the Unicode section
-- [Elixir Getting Started — Binaries, strings, and charlists](https://elixir-lang.org/getting-started/binaries-strings-and-char-lists.html)
-- [Unicode in Elixir — Jose Valim's blog](https://elixir-lang.org/blog/2013/04/17/elixir-v0-8-0-released/)
-- [IO.iodata_to_binary/1 — efficient string building](https://hexdocs.pm/elixir/IO.html#iodata_to_binary/1)
+- [String — HexDocs](https://hexdocs.pm/elixir/String.html)
+- [Binary pattern matching — Elixir Getting Started](https://elixir-lang.org/getting-started/binaries-strings-and-charlists.html)
+- [IO data — Elixir Getting Started](https://elixir-lang.org/getting-started/io-and-the-file-system.html)
+- [Regex — HexDocs](https://hexdocs.pm/elixir/Regex.html)
