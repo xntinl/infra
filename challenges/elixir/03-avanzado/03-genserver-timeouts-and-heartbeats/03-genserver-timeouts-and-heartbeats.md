@@ -1,492 +1,440 @@
-# 3. GenServer Timeouts, Heartbeats & Circuit Breakers
+# GenServer Timeouts, Heartbeats & Circuit Breaker State Machine
 
-**Difficulty**: Avanzado
-
-## Prerequisites
-- Mastered: GenServer callbacks, `handle_info/2`, `handle_call/3`
-- Mastered: Process linking, monitoring — `Process.monitor/1`, `Process.link/1`
-- Familiarity with: Circuit breaker pattern, health-check systems, OTP supervision trees
-
-## Learning Objectives
-- Analyze the difference between GenServer call timeouts, inactivity timeouts, and heartbeat intervals
-- Design a watchdog process that monitors a pool of GenServers and restarts unhealthy ones
-- Evaluate circuit breaker state transitions and when to open, half-open, and close the breaker
-- Implement `process_flag(:trap_exit, true)` to handle linked process deaths gracefully
-
-## Concepts
-
-### Three Distinct Timeout Mechanisms
-
-In GenServer, "timeout" is overloaded — it refers to three different mechanisms with
-different semantics:
-
-**1. Call timeout** — the caller-side deadline. `GenServer.call(pid, msg, 5_000)` means
-"if no reply arrives in 5 seconds, raise `{:timeout, ...}` in the calling process."
-The GenServer itself is unaffected — it may still process the call and send a reply into
-a dead mailbox. This is a client-side concern.
-
-**2. Inactivity timeout** — the server-side idle detector. Returning
-`{:reply, val, state, 30_000}` from a callback schedules a `:timeout` message to be
-delivered to the GenServer after 30 seconds of no messages. When `handle_info(:timeout, state)`
-fires, the process knows it has been idle. Use this for cleanup, hibernation, or self-termination.
-
-**3. Explicit timer** — `:timer.send_interval/2` or `:timer.send_after/2`. These are
-Erlang timer wheel entries that send an arbitrary message to a process on a schedule.
-Use this for heartbeats, periodic polling, and TTL expiry.
-
-```elixir
-defmodule TimeoutDemo do
-  use GenServer
-
-  @idle_ms 30_000
-
-  def init(_) do
-    # Schedule a heartbeat every 5 seconds
-    {:ok, timer_ref} = :timer.send_interval(5_000, :heartbeat)
-    {:ok, %{timer: timer_ref, last_beat: nil}, @idle_ms}
-  end
-
-  # Inactivity timeout — no external messages for 30s
-  def handle_info(:timeout, state) do
-    {:stop, :normal, state}
-  end
-
-  # Periodic heartbeat from :timer
-  def handle_info(:heartbeat, state) do
-    # Still return with idle timeout to reset the inactivity clock
-    {:noreply, %{state | last_beat: DateTime.utc_now()}, @idle_ms}
-  end
-end
-```
-
-### Trapping Exits for Graceful Dependency Monitoring
-
-By default, if a process linked to a GenServer exits with a non-normal reason, the
-GenServer is killed. Setting `Process.flag(:trap_exit, true)` in `init/1` converts
-linked process deaths into messages: `{:EXIT, pid, reason}` delivered to `handle_info`.
-This lets the GenServer react to dependency failures without crashing itself.
-
-Use trap_exit when:
-- The GenServer manages a pool of workers and needs to restart failed workers
-- The GenServer holds a connection and needs to reconnect on link failure
-- You need to distinguish between intentional shutdown (`:normal`) and crashes
-
-Do NOT trap exits blindly — it suppresses supervisor kill signals and can prevent
-clean shutdown in some OTP patterns.
-
-```elixir
-def init(_opts) do
-  Process.flag(:trap_exit, true)
-  workers = spawn_and_link_workers(10)
-  {:ok, %{workers: workers}}
-end
-
-def handle_info({:EXIT, dead_pid, reason}, state) do
-  require Logger
-  Logger.warning("Worker #{inspect(dead_pid)} died: #{inspect(reason)}")
-  new_worker = spawn_and_link_worker()
-  workers = [new_worker | List.delete(state.workers, dead_pid)]
-  {:noreply, %{state | workers: workers}}
-end
-```
-
-### Circuit Breaker Pattern
-
-A circuit breaker protects a GenServer (or any client) from repeatedly calling a failing
-dependency. It tracks recent failures and transitions through three states:
-
-- **Closed** (normal): calls pass through. Failures increment a counter.
-- **Open**: failure threshold exceeded. Calls fail immediately without hitting the dependency.
-- **Half-open**: after a recovery window, one probe call is allowed. If it succeeds,
-  the breaker closes; if it fails, it opens again.
-
-Implementing this inside a GenServer gives you a single-writer, race-free state machine:
-
-```elixir
-defmodule CircuitBreaker do
-  use GenServer
-
-  @failure_threshold 5
-  @recovery_window_ms 30_000
-
-  defstruct state: :closed, failures: 0, opened_at: nil
-
-  def call(server, fun) do
-    GenServer.call(server, {:call, fun})
-  end
-
-  def handle_call({:call, fun}, _from, %{state: :open} = cb) do
-    if recovered?(cb) do
-      execute_probe(fun, cb)
-    else
-      {:reply, {:error, :circuit_open}, cb}
-    end
-  end
-
-  def handle_call({:call, fun}, _from, %{state: :closed} = cb) do
-    case safe_call(fun) do
-      {:ok, result} ->
-        {:reply, {:ok, result}, %{cb | failures: 0}}
-
-      {:error, reason} ->
-        new_cb = record_failure(cb)
-        {:reply, {:error, reason}, new_cb}
-    end
-  end
-
-  defp record_failure(%{failures: f} = cb) when f + 1 >= @failure_threshold do
-    %{cb | state: :open, failures: f + 1, opened_at: System.monotonic_time(:millisecond)}
-  end
-  defp record_failure(cb), do: %{cb | failures: cb.failures + 1}
-
-  defp recovered?(cb) do
-    now = System.monotonic_time(:millisecond)
-    now - cb.opened_at >= @recovery_window_ms
-  end
-
-  defp safe_call(fun) do
-    {:ok, fun.()}
-  rescue
-    e -> {:error, e}
-  end
-
-  # ... execute_probe implementation
-end
-```
-
-### Trade-offs
-
-| Mechanism | Use Case | Pitfall |
-|---|---|---|
-| Call timeout (client-side) | Prevent caller from hanging forever | GenServer still processes; orphan replies |
-| Inactivity timeout (server-side) | Cleanup idle processes | Heartbeats reset the clock — may never fire |
-| `:timer.send_interval` | Regular heartbeats, polling | Does not auto-cancel — must store ref and cancel |
-| `trap_exit` | Survive linked process deaths | Suppresses supervisor kill signals |
-| Circuit breaker | Prevent cascade failures | Half-open probe logic is subtle to implement correctly |
+**Project**: `api_gateway` — built incrementally across the advanced level
 
 ---
 
-## Exercises
+## Project context
 
-### Exercise 1: Self-Terminating Idle GenServer
+You're building `api_gateway`. The circuit breaker component (started in exercise 01)
+currently transitions between states based on failure counts, but it has no way to
+detect when an upstream service becomes **healthy again**. A breaker that opened at
+3 AM stays open forever unless someone manually resets it.
 
-**Problem**: You have a `JobProcessor` GenServer created on-demand by a
-`DynamicSupervisor` for each incoming job batch. Once the batch is processed, the
-GenServer should terminate itself after 30 seconds of inactivity — no external
-cleanup call required. If a new job arrives before the 30s window, the timer resets.
+You need to add:
+1. A **heartbeat** that probes open circuits every 30 seconds
+2. A **call timeout** that prevents the gateway router from hanging on slow upstreams
+3. A **watchdog** that health-checks a pool of circuit breaker workers and restarts
+   unresponsive ones
 
-**Requirements**:
-- GenServer terminates with `:normal` after 30s idle
-- Receiving any `handle_call` or `handle_cast` resets the idle timer
-- On termination, log `"JobProcessor #{id} shutting down after idle timeout"`
-- Test: spawn the GenServer, wait 35s, verify the process is dead
+Project structure at this point:
 
-**Hints**:
-- Return `{:noreply, state, 30_000}` from every callback — this is how the timer resets
-- `handle_info(:timeout, state)` should call `{:stop, :normal, state}` — GenServer
-  will call `terminate/2` and then the process exits cleanly
-- The DynamicSupervisor handles the exit; since it's `:normal`, no restart occurs
-- To verify the process is dead in tests: `assert not Process.alive?(pid)` after sleeping
+```
+api_gateway/
+├── lib/
+│   └── api_gateway/
+│       ├── application.ex
+│       ├── router.ex
+│       └── circuit_breaker/
+│           ├── worker.ex        # ← extend with heartbeat + half-open logic
+│           ├── supervisor.ex    # already exists
+│           └── watchdog.ex      # ← you implement this
+├── test/
+│   └── api_gateway/
+│       └── circuit_breaker/
+│           ├── worker_test.exs          # given tests — must pass
+│           └── watchdog_test.exs        # given tests — must pass
+└── mix.exs
+```
 
-**One possible solution**:
+---
+
+## Three distinct timeout mechanisms
+
+The word "timeout" is overloaded in GenServer. Conflating these three causes hard-to-debug
+production incidents.
+
+**1. Call timeout (caller-side deadline)**
+`GenServer.call(pid, msg, 5_000)` raises `{:timeout, ...}` in the *calling* process if
+no reply arrives in 5 seconds. The GenServer itself is unaffected — it may still process
+the call and send a reply into the dead caller's mailbox. This is a client concern.
+
+**2. Inactivity timeout (server-side idle detector)**
+Returning `{:reply, val, state, 30_000}` from a callback schedules a `:timeout` message
+to the GenServer after 30 seconds of no messages. Used for hibernation, cleanup, or
+self-termination. Resets automatically on every callback return.
+
+**3. Explicit timer (scheduled messages)**
+`:timer.send_interval/2` or `Process.send_after/3` inject arbitrary messages into the
+mailbox on a schedule. Use this for heartbeats and periodic probes. Unlike the inactivity
+timeout, explicit timers do NOT reset on message receipt — they fire unconditionally.
+
+```
+Mechanism        │ Where it runs   │ Resets on msg?  │ Cancels itself?
+─────────────────┼─────────────────┼─────────────────┼────────────────
+Call timeout     │ Caller process  │ N/A             │ On reply
+Inactivity timer │ GenServer       │ Yes             │ Never (fires once)
+send_interval    │ Timer wheel     │ No              │ Only with cancel/1
+```
+
+---
+
+## Circuit breaker state machine
+
+The full three-state machine the circuit breaker worker must implement:
+
+```
+           ┌──────────────────────────────────────────────┐
+           │  failures >= threshold                        │
+           ▼                                              │
+        :closed ──────────────────────────────────────▶ :open
+           ▲                                              │
+           │  probe succeeds                              │ recovery_window_ms elapsed
+           │                                              ▼
+        :half_open ◀─────────────────────────────────────┘
+           │
+           │ probe fails → back to :open
+           └──────────────────────────────────────────▶ :open
+```
+
+The `:open` state is useless without a timer that eventually tries to recover.
+That timer is the heartbeat.
+
+---
+
+## Implementation
+
+### Step 1: Extend `CircuitBreaker.Worker` with heartbeat
+
 ```elixir
-defmodule JobProcessor do
+defmodule ApiGateway.CircuitBreaker.Worker do
   use GenServer
   require Logger
 
-  @idle_timeout 30_000
+  @failure_threshold   5
+  @recovery_window_ms  30_000
+  @heartbeat_ms        30_000
 
-  def start_link(batch_id) do
-    GenServer.start_link(__MODULE__, batch_id)
+  # ---------------------------------------------------------------------------
+  # Public API
+  # ---------------------------------------------------------------------------
+
+  def start_link(service_name) do
+    GenServer.start_link(__MODULE__, service_name)
   end
 
-  def process_job(pid, job), do: GenServer.cast(pid, {:job, job})
-  def get_results(pid), do: GenServer.call(pid, :results, 5_000)
+  def record_success(pid), do: GenServer.cast(pid, :success)
+  def record_failure(pid), do: GenServer.cast(pid, :failure)
+  def status(pid), do: GenServer.call(pid, :status)
+  def ping(pid), do: GenServer.call(pid, :ping, 1_000)
 
-  def init(batch_id) do
-    Logger.info("JobProcessor #{batch_id} started")
-    {:ok, %{id: batch_id, results: [], count: 0}, @idle_timeout}
+  # ---------------------------------------------------------------------------
+  # GenServer lifecycle
+  # ---------------------------------------------------------------------------
+
+  @impl true
+  def init(service_name) do
+    # TODO: start the heartbeat timer with :timer.send_interval/2
+    # Store the timer ref in state so you can cancel it in terminate/2
+    #
+    # State fields:
+    #   :service       — service name (string)
+    #   :status        — :closed | :open | :half_open
+    #   :failures      — consecutive failure count
+    #   :opened_at     — monotonic timestamp when circuit opened (nil if closed)
+    #   :timer_ref     — ref returned by :timer.send_interval/2
+    #
+    # HINT: {:ok, timer_ref} = :timer.send_interval(@heartbeat_ms, :heartbeat)
   end
 
-  def handle_cast({:job, job}, state) do
-    result = do_work(job)
-    new_state = %{state | results: [result | state.results], count: state.count + 1}
-    {:noreply, new_state, @idle_timeout}
+  # ---------------------------------------------------------------------------
+  # Callbacks
+  # ---------------------------------------------------------------------------
+
+  @impl true
+  def handle_call(:status, _from, state) do
+    {:reply, state.status, state}
   end
 
-  def handle_call(:results, _from, state) do
-    {:reply, state.results, state, @idle_timeout}
+  @impl true
+  def handle_call(:ping, _from, state) do
+    # Used by the watchdog to verify the worker is alive and responsive
+    {:reply, :pong, state}
   end
 
-  def handle_info(:timeout, state) do
-    Logger.info("JobProcessor #{state.id} shutting down after idle timeout")
-    {:stop, :normal, state}
+  @impl true
+  def handle_cast(:success, state) do
+    # TODO: reset failures; if :half_open → :closed; log recovery
+    # HINT: if state.status == :half_open, log "circuit closed for #{state.service}"
   end
 
-  def terminate(:normal, state) do
-    Logger.info("JobProcessor #{state.id} terminated (processed #{state.count} jobs)")
+  @impl true
+  def handle_cast(:failure, state) do
+    # TODO:
+    # If :closed and failures + 1 >= @failure_threshold → open the circuit
+    # If :half_open → re-open the circuit
+    # If :open → do nothing (already open)
+    # Record opened_at when transitioning to :open
+  end
+
+  @impl true
+  def handle_info(:heartbeat, %{status: :open} = state) do
+    # TODO: check if recovery window has elapsed
+    # If yes: transition to :half_open and log "probing #{state.service}"
+    # If no: stay :open
+    #
+    # HINT: System.monotonic_time(:millisecond) - state.opened_at >= @recovery_window_ms
+  end
+
+  @impl true
+  def handle_info(:heartbeat, state) do
+    # Not :open — nothing to do
+    {:noreply, state}
+  end
+
+  @impl true
+  def terminate(_reason, state) do
+    # TODO: cancel the heartbeat timer to avoid orphan timer entries
+    # HINT: :timer.cancel(state.timer_ref)
     :ok
   end
-
-  defp do_work(job), do: {:result, job, System.monotonic_time()}
 end
 ```
 
----
+### Step 2: `lib/api_gateway/circuit_breaker/watchdog.ex`
 
-### Exercise 2: Dependency Heartbeat Monitor
-
-**Problem**: Your `DatabaseProxy` GenServer wraps a database connection. Every 5 seconds
-it must ping the database. If 3 consecutive pings fail, the proxy marks itself as
-`:unhealthy` and returns `{:error, :db_unavailable}` to all callers until the database
-recovers. When a ping succeeds after a failure, the proxy resets its failure counter
-and marks itself `:healthy` again.
-
-**Requirements**:
-- Heartbeat every 5 seconds using `:timer.send_interval/2`
-- Track `consecutive_failures` in state
-- After 3 failures: transition `health` field to `:unhealthy`
-- Any `handle_call` to `:unhealthy` proxy returns `{:error, :db_unavailable}` immediately
-- Recovery: a successful heartbeat resets `consecutive_failures` to 0 and sets `health: :healthy`
-- Expose `health_status/1` function that returns `{:healthy | :unhealthy, failures: n}`
-
-**Hints**:
-- Store the timer ref returned by `:timer.send_interval/2` in state so you can cancel
-  it in `terminate/2` with `:timer.cancel/1`
-- The `ping_db/1` function should be simulated: return `:ok` 70% of the time and
-  `{:error, :timeout}` 30% — use `:rand.uniform(10) < 7` for simulation
-- Pattern match on `state.health` at the top of `handle_call` clauses to implement
-  the fail-fast behavior cleanly
-
-**One possible solution**:
 ```elixir
-defmodule DatabaseProxy do
+defmodule ApiGateway.CircuitBreaker.Watchdog do
   use GenServer
   require Logger
 
-  @heartbeat_interval 5_000
-  @failure_threshold 3
+  @check_interval_ms 10_000
+  @ping_timeout_ms   1_000
 
+  # ---------------------------------------------------------------------------
+  # Public API
+  # ---------------------------------------------------------------------------
+
+  @doc """
+  Starts the watchdog with a supervisor reference and initial worker registry.
+  registry is a map of %{service_name => pid}.
+  """
   def start_link(opts) do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
   end
 
-  def query(sql), do: GenServer.call(__MODULE__, {:query, sql})
-  def health_status, do: GenServer.call(__MODULE__, :health_status)
-
-  def init(_opts) do
-    {:ok, timer} = :timer.send_interval(@heartbeat_interval, :heartbeat)
-    state = %{
-      health: :healthy,
-      consecutive_failures: 0,
-      timer: timer
-    }
-    {:ok, state}
-  end
-
-  def handle_call({:query, _sql}, _from, %{health: :unhealthy} = state) do
-    {:reply, {:error, :db_unavailable}, state}
-  end
-
-  def handle_call({:query, sql}, _from, state) do
-    result = execute_query(sql)
-    {:reply, result, state}
-  end
-
-  def handle_call(:health_status, _from, state) do
-    status = {state.health, failures: state.consecutive_failures}
-    {:reply, status, state}
-  end
-
-  def handle_info(:heartbeat, state) do
-    new_state =
-      case ping_db() do
-        :ok ->
-          if state.consecutive_failures > 0 do
-            Logger.info("DatabaseProxy recovered after #{state.consecutive_failures} failures")
-          end
-          %{state | health: :healthy, consecutive_failures: 0}
-
-        {:error, reason} ->
-          failures = state.consecutive_failures + 1
-          Logger.warning("DatabaseProxy ping failed (#{failures}): #{inspect(reason)}")
-          health = if failures >= @failure_threshold, do: :unhealthy, else: state.health
-          %{state | consecutive_failures: failures, health: health}
-      end
-
-    {:noreply, new_state}
-  end
-
-  def terminate(_reason, state) do
-    :timer.cancel(state.timer)
-  end
-
-  defp ping_db do
-    if :rand.uniform(10) < 7, do: :ok, else: {:error, :timeout}
-  end
-
-  defp execute_query(sql), do: {:ok, "result_for_#{sql}"}
-end
-```
-
----
-
-### Exercise 3: Watchdog GenServer
-
-**Problem**: You run a pool of 10 `Cache.Worker` processes (from Exercise 01). Build a
-`Watchdog` GenServer that monitors all 10 workers. Every 10 seconds, it sends a health
-check (`GenServer.call` with a 1-second timeout) to each worker. Workers that do not
-respond in time are killed and restarted via `DynamicSupervisor`. The watchdog must
-itself be resilient: if a restart fails, it logs the error and skips that worker for
-the next cycle.
-
-**Requirements**:
-- Watchdog has a registry of `{worker_id, pid}` pairs
-- Health check: `GenServer.call(pid, :ping, 1_000)` — workers implement `handle_call(:ping, ...)`
-- Unresponsive workers: kill with `Process.exit(pid, :kill)`, restart via supervisor,
-  update registry with new pid
-- Failed restarts: log error, remove from registry (do not leave zombie entries)
-- Expose `registry/1` so tests can inspect current pid assignments
-
-**Hints**:
-- Use `Task.async_stream/3` to health-check all workers in parallel — sequential checks
-  would take up to `10 * 1s = 10s` per cycle, which is too slow
-- Catch `{:exit, {:timeout, _}}` from Task results to identify unresponsive workers
-- `DynamicSupervisor.start_child(MySupervisor, {Cache.Worker, {id, nil}})` returns
-  `{:ok, new_pid}` or `{:error, reason}` — handle both
-- The watchdog itself should be started under a different supervisor than the workers
-  it monitors, so it is not affected by worker crashes
-
-**One possible solution**:
-```elixir
-defmodule Watchdog do
-  use GenServer
-  require Logger
-
-  @check_interval 10_000
-  @call_timeout 1_000
-
-  def start_link(opts) do
-    GenServer.start_link(__MODULE__, opts, name: __MODULE__)
-  end
-
+  @doc "Returns current {service_name => pid} registry."
   def registry, do: GenServer.call(__MODULE__, :registry)
 
-  def init(%{supervisor: sup, workers: initial_workers}) do
-    {:ok, timer} = :timer.send_interval(@check_interval, :health_check)
-    state = %{supervisor: sup, registry: Map.new(initial_workers), timer: timer}
-    {:ok, state}
+  # ---------------------------------------------------------------------------
+  # GenServer lifecycle
+  # ---------------------------------------------------------------------------
+
+  @impl true
+  def init(opts) do
+    supervisor = Keyword.fetch!(opts, :supervisor)
+    registry   = Keyword.get(opts, :registry, %{})
+
+    # TODO: schedule the health check loop
+    # HINT: {:ok, _ref} = :timer.send_interval(@check_interval_ms, :health_check)
+
+    {:ok, %{supervisor: supervisor, registry: registry}}
   end
 
+  # ---------------------------------------------------------------------------
+  # Callbacks
+  # ---------------------------------------------------------------------------
+
+  @impl true
   def handle_call(:registry, _from, state) do
     {:reply, state.registry, state}
   end
 
+  @impl true
   def handle_info(:health_check, state) do
-    updated_registry =
-      state.registry
-      |> Task.async_stream(
-        fn {id, pid} -> {id, pid, check_worker(pid)} end,
-        max_concurrency: 10,
-        timeout: @call_timeout + 500
-      )
-      |> Enum.reduce(state.registry, fn result, registry ->
-        handle_check_result(result, registry, state.supervisor)
-      end)
-
-    {:noreply, %{state | registry: updated_registry}}
-  end
-
-  defp check_worker(pid) do
-    try do
-      GenServer.call(pid, :ping, @call_timeout)
-      :healthy
-    catch
-      :exit, _ -> :unresponsive
-    end
-  end
-
-  defp handle_check_result({:ok, {id, pid, :healthy}}, registry, _sup) do
-    registry
-  end
-
-  defp handle_check_result({:ok, {id, pid, :unresponsive}}, registry, sup) do
-    Logger.warning("Watchdog: worker #{id} (#{inspect(pid)}) unresponsive — restarting")
-    Process.exit(pid, :kill)
-
-    case DynamicSupervisor.start_child(sup, {Cache.Worker, {id, nil}}) do
-      {:ok, new_pid} ->
-        Logger.info("Watchdog: worker #{id} restarted as #{inspect(new_pid)}")
-        Map.put(registry, id, new_pid)
-
-      {:error, reason} ->
-        Logger.error("Watchdog: failed to restart worker #{id}: #{inspect(reason)}")
-        Map.delete(registry, id)
-    end
-  end
-
-  defp handle_check_result({:exit, reason}, registry, _sup) do
-    Logger.error("Watchdog: health check task crashed: #{inspect(reason)}")
-    registry
+    # TODO: check all workers in parallel using Task.async_stream/3
+    # For each worker:
+    #   1. Call Worker.ping(pid) with @ping_timeout_ms
+    #   2. If it returns :pong → healthy, keep in registry
+    #   3. If it raises/exits → unresponsive:
+    #      a. Kill the worker: Process.exit(pid, :kill)
+    #      b. Restart via DynamicSupervisor.start_child(state.supervisor, ...)
+    #      c. If restart succeeds → update registry with new pid
+    #      d. If restart fails → log error and remove from registry
+    #
+    # HINT: use Task.async_stream with max_concurrency: map_size(state.registry)
+    # HINT: catch errors with on_timeout: :kill_task and handle {:exit, reason}
+    #
+    # Return {:noreply, %{state | registry: updated_registry}}
   end
 end
 ```
 
+### Step 3: Given tests — must pass without modification
+
+```elixir
+# test/api_gateway/circuit_breaker/worker_test.exs
+defmodule ApiGateway.CircuitBreaker.WorkerTest do
+  use ExUnit.Case, async: true
+
+  alias ApiGateway.CircuitBreaker.Worker
+
+  describe "heartbeat-driven recovery" do
+    test "transitions open → half_open after recovery window" do
+      {:ok, pid} = Worker.start_link("slow-upstream")
+
+      # Open the circuit
+      for _ <- 1..5, do: Worker.record_failure(pid)
+      Process.sleep(10)
+      assert Worker.status(pid) == :open
+
+      # Simulate recovery window elapsed by sending :heartbeat directly
+      # (avoids waiting 30 real seconds in a test)
+      # First manipulate opened_at so the window check passes
+      :sys.replace_state(pid, fn state ->
+        %{state | opened_at: System.monotonic_time(:millisecond) - 31_000}
+      end)
+
+      send(pid, :heartbeat)
+      Process.sleep(20)
+
+      assert Worker.status(pid) == :half_open
+    end
+
+    test "half_open → closed on success" do
+      {:ok, pid} = Worker.start_link("recovering-upstream")
+      for _ <- 1..5, do: Worker.record_failure(pid)
+      Process.sleep(10)
+      :sys.replace_state(pid, fn s -> %{s | opened_at: s.opened_at - 31_000} end)
+      send(pid, :heartbeat)
+      Process.sleep(20)
+
+      Worker.record_success(pid)
+      Process.sleep(10)
+      assert Worker.status(pid) == :closed
+    end
+
+    test "half_open → open on failure" do
+      {:ok, pid} = Worker.start_link("flapping-upstream")
+      for _ <- 1..5, do: Worker.record_failure(pid)
+      Process.sleep(10)
+      :sys.replace_state(pid, fn s -> %{s | opened_at: s.opened_at - 31_000} end)
+      send(pid, :heartbeat)
+      Process.sleep(20)
+      assert Worker.status(pid) == :half_open
+
+      Worker.record_failure(pid)
+      Process.sleep(10)
+      assert Worker.status(pid) == :open
+    end
+
+    test "heartbeat does nothing when circuit is closed" do
+      {:ok, pid} = Worker.start_link("healthy")
+      send(pid, :heartbeat)
+      Process.sleep(20)
+      assert Worker.status(pid) == :closed
+    end
+  end
+end
+```
+
+```elixir
+# test/api_gateway/circuit_breaker/watchdog_test.exs
+defmodule ApiGateway.CircuitBreaker.WatchdogTest do
+  use ExUnit.Case, async: false
+
+  alias ApiGateway.CircuitBreaker.{Worker, Watchdog}
+
+  setup do
+    {:ok, sup} = DynamicSupervisor.start_link(strategy: :one_for_one)
+
+    # Start 3 workers under the dynamic supervisor
+    workers =
+      for name <- ["svc-a", "svc-b", "svc-c"] do
+        {:ok, pid} = DynamicSupervisor.start_child(sup, {Worker, name})
+        {name, pid}
+      end
+      |> Map.new()
+
+    {:ok, _wd} =
+      Watchdog.start_link(supervisor: sup, registry: workers)
+
+    on_exit(fn -> DynamicSupervisor.stop(sup) end)
+    %{supervisor: sup, workers: workers}
+  end
+
+  test "registry contains all 3 workers initially", %{workers: workers} do
+    assert map_size(Watchdog.registry()) == 3
+    for {_name, pid} <- workers do
+      assert Map.values(Watchdog.registry()) |> Enum.member?(pid)
+    end
+  end
+
+  test "unresponsive worker is restarted and registry is updated", %{workers: workers} do
+    {"svc-a", old_pid} = Enum.find(workers, fn {k, _} -> k == "svc-a" end)
+
+    # Kill the worker without going through the supervisor
+    Process.exit(old_pid, :kill)
+    Process.sleep(50)
+
+    # Trigger a health check immediately
+    send(Process.whereis(Watchdog), :health_check)
+    Process.sleep(200)
+
+    registry = Watchdog.registry()
+    assert Map.has_key?(registry, "svc-a")
+
+    new_pid = registry["svc-a"]
+    assert is_pid(new_pid)
+    assert new_pid != old_pid
+    assert Process.alive?(new_pid)
+  end
+end
+```
+
+### Step 4: Run the tests
+
+```bash
+mix test test/api_gateway/circuit_breaker/ --trace
+```
+
 ---
 
-## Common Mistakes
+## Trade-off analysis
 
-### Mistake: Confusing Call Timeout With Server Inactivity Timeout
+| Mechanism | Use case | Key pitfall |
+|-----------|----------|-------------|
+| Call timeout (caller-side) | Prevent caller from hanging on slow upstream | GenServer still processes the call; orphan reply in dead mailbox |
+| Inactivity timeout (server-side) | Hibernate idle workers, self-terminate | Heartbeats reset the clock — may never fire if service is active |
+| `:timer.send_interval` | Periodic heartbeat, health probe | Does NOT auto-cancel on process death — always cancel in `terminate/2` |
+| `trap_exit` | React to linked process deaths | Suppresses supervisor kill signals; must handle all exit reasons |
 
-`GenServer.call(pid, msg, 5_000)` and `{:reply, val, state, 5_000}` are completely
-different mechanisms. The first is a client-side deadline that raises in the caller.
-The second is a server-side inactivity detector that sends `:timeout` to the server.
-Mixing them up leads to debugging sessions where the server seems to timeout
-immediately — often because someone returned `{:reply, val, state, 1_000}` thinking
-it sets the call deadline, when it actually makes the server self-message in 1s.
-
-### Mistake: Not Cancelling :timer.send_interval in terminate/2
-
-`:timer.send_interval/2` creates an entry in the Erlang timer wheel. When the process
-dies, the timer is NOT automatically cancelled unless explicitly done in `terminate/2`
-with `:timer.cancel(ref)`. On a restarted process, this means the old timer keeps firing
-and sending messages to a dead pid — which are silently dropped but accumulate in the
-timer wheel, creating a small memory and performance drain over time.
-
-### Mistake: Trapping Exits Without Handling All Exit Reasons
-
-`Process.flag(:trap_exit, true)` converts ALL linked process exits into messages,
-including `{:EXIT, pid, :normal}`. If your supervisor sends a shutdown exit signal
-(`:shutdown` or `{:shutdown, reason}`) to the GenServer, and you only handle `:normal`,
-the `:shutdown` message accumulates in the mailbox unhandled. This delays clean
-shutdown and can cause OTP timeout warnings during application stop.
-
-### Mistake: Sequential Health Checks in Watchdog
-
-Checking N workers one by one with `GenServer.call` makes the total time proportional
-to `N * timeout`. For 10 workers with a 1-second timeout, worst case is 10 seconds —
-which exceeds the check interval itself. Use `Task.async_stream` with
-`max_concurrency: N` to run all checks in parallel. Total time becomes `1 * timeout`
-regardless of N (up to your concurrency limit).
+Reflection question: the watchdog uses `Task.async_stream` to check all workers in
+parallel. What is the worst-case latency if you checked them sequentially with
+a 1-second call timeout each for 20 workers?
 
 ---
 
-## Summary
-- GenServer timeout flavors are distinct: call timeout (client), inactivity timeout
-  (server idle), and explicit timer (`:timer.send_interval`) — never conflate them
-- `trap_exit` converts crashes into messages; use it when you need to react to linked
-  process death without dying yourself — but handle all exit reasons
-- Circuit breakers belong in the GenServer that wraps the dependency, giving a
-  race-free state machine for open/closed/half-open transitions
-- Health check watchdogs must use parallel checks (Task.async_stream) to avoid
-  O(N) worst-case timing
+## Common production mistakes
 
-## What's Next
-Exercise 04 — Back-pressure with Internal Queues: combine GenServer with `:queue`
-to build bounded, priority-aware work queues that prevent overload.
+**1. Confusing call timeout with inactivity timeout**
+`GenServer.call(pid, msg, 5_000)` raises in the *caller* after 5 s.
+`{:reply, val, state, 5_000}` fires `:timeout` in the *GenServer* after 5 s of idle.
+Mixing them up causes impossible-to-reproduce bugs where the server self-messages
+thinking it is idle but it is actually the caller's deadline.
+
+**2. Not cancelling `:timer.send_interval` in `terminate/2`**
+The timer wheel entry persists after the process dies. On the next restart a new timer
+is created. Over time, dead timer entries accumulate. Always store the timer ref in state
+and call `:timer.cancel(state.timer_ref)` in `terminate/2`.
+
+**3. Trapping exits without handling all exit reasons**
+`Process.flag(:trap_exit, true)` converts ALL linked exits into messages, including
+`{:EXIT, pid, :normal}` and `{:EXIT, pid, :shutdown}`. If your supervisor sends
+`:shutdown` and you only handle `:normal`, the shutdown message accumulates unhandled
+and OTP emits timeout warnings during application stop.
+
+**4. Sequential health checks in the watchdog**
+Checking N workers one by one with `GenServer.call(pid, :ping, 1_000)` means worst-case
+latency is `N * 1_000` ms. For 20 workers that is 20 seconds — longer than the check
+interval itself. Use `Task.async_stream` with `max_concurrency: N` to run all checks
+in parallel. Total time becomes `1 * timeout` regardless of N.
+
+---
 
 ## Resources
-- Erlang docs — `:timer` module: https://www.erlang.org/doc/man/timer.html
-- Martin Fowler — Circuit Breaker pattern: https://martinfowler.com/bliki/CircuitBreaker.html
-- Erlang/OTP — `proc_lib` and trap_exit semantics
-- Fred Hébert — "Stuff Goes Bad: Erlang in Anger" ch. 4 (error handling)
+
+- [Erlang docs — `:timer` module](https://www.erlang.org/doc/man/timer.html)
+- [Martin Fowler — Circuit Breaker pattern](https://martinfowler.com/bliki/CircuitBreaker.html)
+- [HexDocs — GenServer callbacks](https://hexdocs.pm/elixir/GenServer.html)
+- [Fred Hébert — Erlang in Anger, ch. 4](https://www.erlang-in-anger.com/) — error handling patterns (free PDF)

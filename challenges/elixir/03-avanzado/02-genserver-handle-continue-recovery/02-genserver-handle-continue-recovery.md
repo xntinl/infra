@@ -1,465 +1,404 @@
-# 2. GenServer handle_continue & Lazy Recovery
+# GenServer handle_continue & Lazy Recovery
 
-**Difficulty**: Avanzado
+**Project**: `api_gateway` — built incrementally across the advanced level
 
-## Prerequisites
-- Mastered: GenServer lifecycle, `init/1`, `handle_call/3`, `handle_cast/2`
-- Mastered: ETS basics — table creation, `:ets.lookup/2`, `:ets.insert/2`
-- Familiarity with: Supervisor restart strategies, process linking, crash semantics
+---
 
-## Learning Objectives
-- Analyze the difference between blocking `init/1` and deferred `handle_continue/2`
-- Design lazy-initialization patterns that keep supervisor startup time predictable
-- Evaluate when async recovery from ETS is safer than synchronous DB loading
-- Implement the `{:reply, result, state, {:continue, key}}` pattern correctly
+## Project context
 
-## Concepts
+You're building `api_gateway`. The router component needs a `RouteTable` GenServer that
+loads its routing rules from a config service at startup. Loading takes ~2 seconds.
+The gateway has 8 such GenServers (one per traffic class). A blocking `init/1` makes
+the supervisor take 16 seconds to start — deployments time out in Kubernetes.
 
-### Why handle_continue Exists
+A second problem: the `RateLimiter.Server` (a previous exercise) holds per-client
+window data in ETS. When the process crashes and restarts, the ETS table is recreated
+from scratch — all window state is lost and clients briefly get a free pass.
+
+Project structure at this point:
+
+```
+api_gateway/
+├── lib/
+│   └── api_gateway/
+│       ├── application.ex
+│       ├── router.ex
+│       └── rate_limiter/
+│           ├── server.ex            # ← extend with crash recovery
+│           └── window.ex
+│       └── route_table/
+│           ├── server.ex            # ← you implement this
+│           └── loader.ex            # already exists — simulates slow load
+├── test/
+│   └── api_gateway/
+│       ├── route_table/
+│       │   └── server_test.exs      # given tests — must pass without modification
+│       └── rate_limiter/
+│           └── recovery_test.exs    # given tests — must pass without modification
+└── mix.exs
+```
+
+---
+
+## Why `handle_continue` exists
 
 Before `handle_continue/2` (added in OTP 21), developers faced a dilemma: expensive
-initialization work (DB queries, file reads, cache warm-up) had to happen either in
-`init/1` — blocking the supervisor until done — or via a `send(self(), :init)` trick
-that opened a race window where the process could receive external messages before
-its internal state was ready.
+initialization work had to happen either in `init/1` — blocking the supervisor until
+done — or via a `send(self(), :init)` trick that opened a race window where external
+messages could be processed before the process was ready.
 
-`handle_continue/2` closes that race. It runs AFTER the current callback returns and
-BEFORE any new message from the mailbox is processed. The process is fully registered,
-its supervisor considers it started, but no external message can jump the queue. It is
-the safe, first-class mechanism for deferred initialization.
+`handle_continue/2` closes that race. It runs **after** the current callback returns
+and **before** any new message from the mailbox is processed. The supervisor sees the
+process as started immediately; no external message can jump the queue.
 
 ```
 Supervisor calls start_link
-  └─ init/1 returns {:ok, state, {:continue, :load_data}}
-       └─ Supervisor continues (process is "started")
-            └─ handle_continue(:load_data, state) runs immediately
+  └─ init/1 returns {:ok, state, {:continue, :load_routes}}
+       └─ Supervisor marks process started  ← fast
+            └─ handle_continue(:load_routes, state) runs immediately
                  └─ state is now fully populated
                       └─ first external message handled HERE
 ```
 
-```elixir
-defmodule LazyWorker do
-  use GenServer
+---
 
-  def start_link(opts) do
-    GenServer.start_link(__MODULE__, opts, name: __MODULE__)
-  end
+## Why ETS as crash-safe mirror works
 
-  def init(opts) do
-    # Return immediately — supervisor startup is not blocked
-    {:ok, %{config: opts, data: nil, ready: false}, {:continue, :load_initial_data}}
-  end
+When a GenServer crashes, its supervisor restarts it with a fresh `init/1` — all
+in-memory state is gone. By mirroring every write to a named ETS table with
+`{:heir, :none}` (which survives the process but not the node), `handle_continue`
+can restore full state post-crash without any DB call.
 
-  def handle_continue(:load_initial_data, state) do
-    data = ExpensiveDataSource.load(state.config)
-    {:noreply, %{state | data: data, ready: true}}
-  end
-
-  def handle_call(:get_data, _from, %{ready: false} = state) do
-    {:reply, {:error, :not_ready}, state}
-  end
-
-  def handle_call(:get_data, _from, state) do
-    {:reply, {:ok, state.data}, state}
-  end
-end
 ```
+Normal operation:
+  handle_cast({:record, client, ts}, state) →
+    :ets.insert(@table, {client, ts})     # mirror write
+    update in-memory state
 
-### Chaining handle_continue
+Crash + restart:
+  init/1 → :ets.info(@table) == info    # table still exists
+         → {:ok, empty_state, {:continue, :recover}}
 
-`handle_continue/2` can itself return `{:noreply, state, {:continue, :next_step}}`,
-creating a chain of deferred steps. This models multi-phase initialization cleanly
-without nesting callbacks or building ad-hoc state machines.
-
-Use chaining when each step depends on the previous one and all steps must complete
-before external messages are safe to process. Avoid chaining for independent steps —
-parallel initialization via `Task.async` + `Task.await` in a single `handle_continue`
-is faster.
-
-```elixir
-def handle_continue(:phase_one, state) do
-  result = do_phase_one()
-  {:noreply, %{state | phase_one: result}, {:continue, :phase_two}}
-end
-
-def handle_continue(:phase_two, state) do
-  result = do_phase_two(state.phase_one)
-  {:noreply, %{state | phase_two: result}}
-  # No further continue — normal message handling begins
-end
+handle_continue(:recover, state) →
+  :ets.tab2list(@table)                  # restore from mirror
+  → {:noreply, fully_recovered_state}
 ```
-
-### State Recovery After Crash
-
-Supervisors restart crashed GenServers by calling `start_link` fresh — the process
-gets a clean `init/1`. Any in-memory state is gone. To survive crashes, GenServers
-must externalize state: ETS (survives process death if the table owner is a different
-process or uses `:heir`), Mnesia, a database, or a persistent file.
-
-`handle_continue` is the natural place to rebuild state post-crash:
-
-1. `init/1` runs, detects a prior ETS snapshot exists
-2. Returns `{:ok, empty_state, {:continue, :recover_from_ets}}`
-3. `handle_continue(:recover_from_ets, state)` loads the snapshot
-4. Process is now fully recovered before its first external call
-
-```elixir
-def init(id) do
-  base_state = %{id: id, entries: %{}, version: 0}
-  continuation =
-    if ets_snapshot_exists?(id),
-      do: {:continue, :recover},
-      else: :ignore |> then(fn _ -> nil end)
-
-  case continuation do
-    {:continue, _} = c -> {:ok, base_state, c}
-    _ -> {:ok, base_state}
-  end
-end
-```
-
-### The Reply + Continue Pattern
-
-A GenServer can respond to a caller AND then continue processing without the caller
-waiting. This is useful when the response is known immediately but the side effect
-takes longer:
-
-```elixir
-def handle_call({:submit_job, job}, _from, state) do
-  job_id = UUID.generate()
-  new_state = %{state | pending: [job_id | state.pending]}
-  # Reply immediately with job_id, then process in handle_continue
-  {:reply, {:ok, job_id}, new_state, {:continue, {:process_job, job_id}}}
-end
-
-def handle_continue({:process_job, job_id}, state) do
-  result = do_expensive_work(state.pending_jobs[job_id])
-  {:noreply, update_state(state, job_id, result)}
-end
-```
-
-### Trade-offs
-
-| Approach | Startup Time | Race Safety | Complexity |
-|---|---|---|---|
-| All work in `init/1` | Slow (blocks supervisor) | Safe | Low |
-| `send(self(), :init)` (old hack) | Fast | Unsafe (race window) | Medium |
-| `handle_continue` from `init` | Fast | Safe | Low |
-| `Task.async` in `handle_continue` | Fast | Safe | Medium |
-| External state + recovery | Fast | Safe | High |
 
 ---
 
-## Exercises
+## Implementation
 
-### Exercise 1: Lazy Database Initialization
+### Step 1: `lib/api_gateway/route_table/server.ex`
 
-**Problem**: You have a `ProductCatalog` GenServer that serves product lookup requests.
-It needs to load 50,000 products from a database at startup. Loading takes ~2 seconds.
-Your application has 12 such GenServers (one per product category). A blocking `init/1`
-makes your supervisor take 24 seconds to start — unacceptable.
-
-Implement lazy initialization: `start_link` returns immediately, and the DB load happens
-in `handle_continue`. Callers that arrive before loading completes receive
-`{:error, :loading}` with a retry hint. Once loaded, normal service resumes.
-
-**Requirements**:
-- `init/1` completes in under 5ms
-- Loading is simulated with `Process.sleep(2_000)` + building a map
-- Callers during load receive `{:error, :loading}` — not a crash, not a timeout
-- After load completes, all calls work normally
-- Expose `ready?/1` function for health-check polling
-
-**Hints**:
-- Keep `:ready` boolean in state. Pattern match on it in `handle_call`
-- The simulated DB load in `handle_continue` can just be `Process.sleep(2_000)` followed
-  by populating a map with fake data — the structure matters, not the source
-- Supervisors check that `init/1` returns — they do not wait for `handle_continue`.
-  Your test can call `ready?/1` in a retry loop to know when the server is done
-
-**One possible solution**:
 ```elixir
-defmodule ProductCatalog do
+defmodule ApiGateway.RouteTable.Server do
   use GenServer
   require Logger
 
-  def start_link(category) do
-    GenServer.start_link(__MODULE__, category, name: via(category))
+  # ---------------------------------------------------------------------------
+  # Public API
+  # ---------------------------------------------------------------------------
+
+  @doc """
+  Looks up the upstream URL for a given path prefix.
+  Returns {:ok, upstream} or {:error, :not_ready | :not_found}.
+  """
+  @spec lookup(String.t()) :: {:ok, String.t()} | {:error, :not_ready | :not_found}
+  def lookup(path) do
+    GenServer.call(__MODULE__, {:lookup, path})
   end
 
-  def lookup(category, product_id) do
-    GenServer.call(via(category), {:lookup, product_id})
+  @doc """
+  Returns true once the route table has loaded its rules.
+  """
+  @spec ready?() :: boolean()
+  def ready? do
+    GenServer.call(__MODULE__, :ready?)
   end
 
-  def ready?(category) do
-    GenServer.call(via(category), :ready?)
+  def start_link(opts \\ []) do
+    GenServer.start_link(__MODULE__, opts, name: __MODULE__)
   end
 
-  def init(category) do
-    Logger.info("ProductCatalog[#{category}] starting — data load deferred")
-    state = %{category: category, products: %{}, ready: false}
-    {:ok, state, {:continue, :load_products}}
+  # ---------------------------------------------------------------------------
+  # GenServer lifecycle
+  # ---------------------------------------------------------------------------
+
+  @impl true
+  def init(opts) do
+    # TODO: return immediately so the supervisor is not blocked.
+    # Defer route loading to handle_continue/2.
+    #
+    # Initial state fields:
+    #   :routes  — map of path_prefix => upstream_url (empty until loaded)
+    #   :ready   — false until loading completes
+    #   :traffic_class — from opts, defaults to :default
+    #
+    # HINT: {:ok, initial_state, {:continue, :load_routes}}
+    Logger.info("RouteTable starting — loading deferred")
+    _traffic_class = Keyword.get(opts, :traffic_class, :default)
+    # TODO
   end
 
-  def handle_continue(:load_products, state) do
-    Logger.info("ProductCatalog[#{state.category}] loading products...")
-    # Simulate expensive DB load
-    Process.sleep(2_000)
-    products = build_fake_catalog(state.category, 50_000)
-    Logger.info("ProductCatalog[#{state.category}] ready (#{map_size(products)} products)")
-    {:noreply, %{state | products: products, ready: true}}
+  @impl true
+  def handle_continue(:load_routes, state) do
+    # TODO: call ApiGateway.RouteTable.Loader.load(state.traffic_class)
+    # which simulates a 2-second remote call.
+    # On success: update state with routes and set ready: true.
+    # On error: log and retry via {:noreply, state, {:continue, :load_routes}}
+    #
+    # HINT: pattern match on {:ok, routes} | {:error, reason}
   end
 
+  @impl true
+  def handle_call({:lookup, _path}, _from, %{ready: false} = state) do
+    # TODO: return {:error, :not_ready} without crashing the caller
+  end
+
+  @impl true
+  def handle_call({:lookup, path}, _from, %{ready: true} = state) do
+    # TODO: find the longest matching prefix in state.routes
+    # HINT: Enum.find_value on Map.keys sorted by length desc
+  end
+
+  @impl true
   def handle_call(:ready?, _from, state) do
     {:reply, state.ready, state}
   end
-
-  def handle_call({:lookup, _id}, _from, %{ready: false} = state) do
-    {:reply, {:error, :loading}, state}
-  end
-
-  def handle_call({:lookup, product_id}, _from, state) do
-    result = Map.get(state.products, product_id, {:error, :not_found})
-    {:reply, result, state}
-  end
-
-  defp via(category), do: {:via, Registry, {ProductRegistry, category}}
-
-  defp build_fake_catalog(category, n) do
-    for i <- 1..n, into: %{} do
-      {"#{category}_#{i}", %{id: "#{category}_#{i}", price: :rand.uniform(10_000)}}
-    end
-  end
 end
 ```
 
----
+### Step 2: `lib/api_gateway/route_table/loader.ex` — already provided
 
-### Exercise 2: ETS-Backed Crash Recovery
-
-**Problem**: You have a `SessionStore` GenServer that holds active user sessions.
-Sessions accumulate during the day. If the process crashes and a supervisor restarts
-it, all session data is lost — users are logged out. Design a crash recovery mechanism:
-session writes are mirrored to ETS immediately (so ETS is always fresh), and on restart
-`handle_continue` reads the ETS snapshot to restore full state without any DB call.
-
-**Requirements**:
-- ETS table named `:session_store` is created by the GenServer with `heir: :none`
-  — this means the table is transferred to no process on death, so it survives the
-  crash (the table lives until explicitly deleted)
-- On `init/1`, check if `:session_store` ETS table already exists
-  - If yes → return `{:ok, state, {:continue, :recover}}`
-  - If no → create the table, return `{:ok, state}`
-- `handle_continue(:recover, state)` loads all entries from ETS into state
-- All `put_session/2` calls update both the GenServer state and ETS atomically
-  (within the callback — not truly atomic, but single-writer so safe)
-
-**Hints**:
-- `:ets.info(:session_store)` returns `:undefined` if the table does not exist
-- Use `:ets.tab2list/1` to load all entries at once during recovery
-- The ETS table must be created with appropriate options so it survives the process —
-  use `:public` (or `:protected`) and specify a fixed name, not a dynamic one
-- To test crash recovery: use `Process.exit(pid, :kill)` and wait for the supervisor
-  to restart the process, then call `get_session/1` and verify data is intact
-
-**One possible solution**:
 ```elixir
-defmodule SessionStore do
-  use GenServer
-
-  @table :session_store
-
-  def start_link(_opts) do
-    GenServer.start_link(__MODULE__, [], name: __MODULE__)
-  end
-
-  def put_session(session_id, data) do
-    GenServer.call(__MODULE__, {:put, session_id, data})
-  end
-
-  def get_session(session_id) do
-    GenServer.call(__MODULE__, {:get, session_id})
-  end
-
-  def init(_opts) do
-    case :ets.info(@table) do
-      :undefined ->
-        :ets.new(@table, [:named_table, :set, :public])
-        {:ok, %{sessions: %{}, recovered: false}}
-
-      _info ->
-        # Table exists from before the crash
-        {:ok, %{sessions: %{}, recovered: false}, {:continue, :recover}}
-    end
-  end
-
-  def handle_continue(:recover, state) do
-    sessions =
-      @table
-      |> :ets.tab2list()
-      |> Map.new(fn {k, v} -> {k, v} end)
-
-    require Logger
-    Logger.info("SessionStore recovered #{map_size(sessions)} sessions from ETS")
-    {:noreply, %{state | sessions: sessions, recovered: true}}
-  end
-
-  def handle_call({:put, sid, data}, _from, state) do
-    :ets.insert(@table, {sid, data})
-    {:reply, :ok, put_in(state, [:sessions, sid], data)}
-  end
-
-  def handle_call({:get, sid}, _from, state) do
-    {:reply, Map.get(state.sessions, sid, nil), state}
+defmodule ApiGateway.RouteTable.Loader do
+  @doc """
+  Simulates loading routes from a remote config service (~2 seconds).
+  """
+  def load(traffic_class) do
+    Process.sleep(2_000)
+    routes = %{
+      "/api/payments"  => "http://payments-svc:8080",
+      "/api/orders"    => "http://orders-svc:8080",
+      "/api/inventory" => "http://inventory-svc:8080",
+      "/health"        => "http://healthcheck-svc:8080"
+    }
+    {:ok, Map.put(routes, "/class/#{traffic_class}", "http://#{traffic_class}-svc:8080")}
   end
 end
 ```
 
----
+### Step 3: Extend `RateLimiter.Server` with crash recovery
 
-### Exercise 3: Reply-Then-Continue Async Processing
+Add recovery to the existing server from the rate limiter exercise:
 
-**Problem**: You have a `ReportGenerator` GenServer. Clients submit report jobs and
-expect an immediate `{:ok, job_id}` acknowledgment — they will poll for results later.
-However, the actual report generation takes 5–10 seconds. If generation happens
-synchronously inside `handle_call`, the entire GenServer is blocked for that duration,
-starving other callers. Use `handle_continue` to acknowledge immediately and process
-asynchronously in the background.
-
-**Requirements**:
-- `submit_report/1` returns `{:ok, job_id}` in under 1ms
-- Generation is simulated with `Process.sleep(5_000)`
-- `get_result/1` returns `{:pending}` while generating, `{:ok, report}` when done
-- The GenServer must remain responsive to `get_result` calls during generation
-- Queue multiple concurrent submissions correctly (FIFO processing)
-
-**Hints**:
-- `{:reply, {:ok, job_id}, new_state, {:continue, {:generate, job_id}}}` is the
-  key pattern — the reply goes to the caller, then generation runs in `handle_continue`
-- While `handle_continue` is running, new messages queue in the mailbox and are
-  processed after it returns — the GenServer IS blocked during generation. To allow
-  true concurrency you must spawn a Task from within `handle_continue`. This is an
-  important nuance: `handle_continue` is still sequential, just deferred
-- For the concurrent version: `Task.async(fn -> generate(job) end)`, then handle
-  `{:DOWN, ...}` or the Task's result message in `handle_info/2`
-
-**One possible solution**:
 ```elixir
-defmodule ReportGenerator do
-  use GenServer
+# In lib/api_gateway/rate_limiter/server.ex
+# Extend init/1 and add handle_continue(:recover, state)
 
-  def start_link(_), do: GenServer.start_link(__MODULE__, [], name: __MODULE__)
+@table :rate_limiter_windows
 
-  def submit_report(params) do
-    GenServer.call(__MODULE__, {:submit, params})
+@impl true
+def init(_opts) do
+  # TODO: check if the ETS table already exists (survived a crash)
+  # If yes: {:ok, state, {:continue, :recover}}
+  # If no:  create table, return {:ok, state}
+  #
+  # HINT: :ets.info(@table) returns :undefined if table does not exist
+  # HINT: create with [:named_table, :public, :bag]
+  #   :named_table — accessed by name in check/3
+  #   :public      — concurrent reads from any process
+  #   :bag         — multiple timestamps per client_id
+end
+
+@impl true
+def handle_continue(:recover, state) do
+  # TODO: count how many entries are in the table and log the recovery
+  # HINT: :ets.info(@table, :size) returns the number of entries
+  count = :ets.info(@table, :size)
+  require Logger
+  Logger.info("RateLimiter recovered #{count} window entries from ETS")
+  {:noreply, state}
+end
+```
+
+### Step 4: Given tests — must pass without modification
+
+```elixir
+# test/api_gateway/route_table/server_test.exs
+defmodule ApiGateway.RouteTable.ServerTest do
+  use ExUnit.Case, async: false
+
+  alias ApiGateway.RouteTable.Server
+
+  setup do
+    # Start a fresh server for each test
+    start_supervised!({Server, [traffic_class: :test]})
+    :ok
   end
 
-  def get_result(job_id) do
-    GenServer.call(__MODULE__, {:result, job_id})
-  end
+  describe "init/1 is non-blocking" do
+    test "start_link returns before routes are loaded" do
+      # The supervised server started in setup without blocking 2 seconds
+      # If init/1 blocked, the test setup would take 2+ seconds
+      assert true
+    end
 
-  def init(_) do
-    {:ok, %{jobs: %{}, queue: :queue.new()}}
-  end
-
-  def handle_call({:submit, params}, _from, state) do
-    job_id = generate_id()
-    jobs = Map.put(state.jobs, job_id, :pending)
-    queue = :queue.in({job_id, params}, state.queue)
-    new_state = %{state | jobs: jobs, queue: queue}
-    {:reply, {:ok, job_id}, new_state, {:continue, :process_next}}
-  end
-
-  def handle_call({:result, job_id}, _from, state) do
-    result = Map.get(state.jobs, job_id, {:error, :unknown_job})
-    {:reply, result, state}
-  end
-
-  def handle_continue(:process_next, state) do
-    case :queue.out(state.queue) do
-      {:empty, _} ->
-        {:noreply, state}
-
-      {{:value, {job_id, params}}, rest_queue} ->
-        # Spawn Task so GenServer remains responsive during generation
-        task = Task.async(fn -> do_generate(params) end)
-        new_state = %{state |
-          queue: rest_queue,
-          jobs: Map.put(state.jobs, job_id, {:in_progress, task})
-        }
-        {:noreply, new_state}
+    test "returns not_ready before load completes" do
+      # Immediately after startup, the server may not be ready yet
+      # (handle_continue may still be running)
+      case Server.lookup("/api/payments") do
+        {:ok, _} -> :ok                          # loaded fast enough
+        {:error, :not_ready} -> :ok              # still loading
+        other -> flunk("unexpected: #{inspect(other)}")
+      end
     end
   end
 
-  # Receive Task result
-  def handle_info({ref, result}, state) when is_reference(ref) do
-    Process.demonitor(ref, [:flush])
-    job_id =
-      Enum.find_value(state.jobs, fn
-        {id, {:in_progress, %Task{ref: ^ref}}} -> id
-        _ -> nil
-      end)
+  describe "after loading completes" do
+    setup do
+      # Wait for handle_continue to finish
+      wait_until_ready(Server, 5_000)
+      :ok
+    end
 
-    {:noreply, put_in(state, [:jobs, job_id], {:ok, result})}
+    test "ready? returns true" do
+      assert Server.ready?() == true
+    end
+
+    test "known routes resolve to upstream URLs" do
+      assert {:ok, upstream} = Server.lookup("/api/payments")
+      assert String.starts_with?(upstream, "http://")
+    end
+
+    test "unknown route returns not_found" do
+      assert {:error, :not_found} = Server.lookup("/unknown/path")
+    end
   end
 
-  defp do_generate(_params) do
-    Process.sleep(5_000)
-    %{generated_at: DateTime.utc_now(), data: "report_data"}
+  # Helper: poll until ready or timeout
+  defp wait_until_ready(server, timeout_ms) do
+    deadline = System.monotonic_time(:millisecond) + timeout_ms
+    Stream.repeatedly(fn -> server.ready?() end)
+    |> Stream.take_while(fn ready ->
+      not ready and System.monotonic_time(:millisecond) < deadline
+    end)
+    |> Enum.each(fn _ -> Process.sleep(50) end)
   end
-
-  defp generate_id, do: :crypto.strong_rand_bytes(8) |> Base.encode16()
 end
+```
+
+```elixir
+# test/api_gateway/rate_limiter/recovery_test.exs
+defmodule ApiGateway.RateLimiter.RecoveryTest do
+  use ExUnit.Case, async: false
+
+  alias ApiGateway.RateLimiter.Server
+
+  setup do
+    # Clean the ETS table if it exists
+    case :ets.info(:rate_limiter_windows) do
+      :undefined -> :ok
+      _ -> :ets.delete_all_objects(:rate_limiter_windows)
+    end
+    :ok
+  end
+
+  test "recovers window entries after crash" do
+    {:ok, pid} = Server.start_link([])
+
+    # Record some requests
+    for _ <- 1..5, do: Server.record("client_crash_test")
+    Process.sleep(20)
+
+    # Verify entries exist
+    assert {:allow, 5} = Server.check("client_crash_test", 10, 60_000)
+
+    # Kill the process (simulates crash)
+    Process.exit(pid, :kill)
+    Process.sleep(50)
+
+    # Start a new server — should recover from ETS
+    {:ok, _new_pid} = Server.start_link([])
+    Process.sleep(20)
+
+    # The window entries must still be counted
+    assert {:allow, remaining} = Server.check("client_crash_test", 10, 60_000)
+    assert remaining == 5
+  end
+end
+```
+
+### Step 5: Run the tests
+
+```bash
+mix test test/api_gateway/route_table/server_test.exs \
+         test/api_gateway/rate_limiter/recovery_test.exs --trace
+```
+
+### Step 6: Verify startup time does not block
+
+```bash
+# Time the application startup — should complete well under 1 second
+# even though each RouteTable takes 2 seconds to load routes
+time mix run --no-halt &
+sleep 3
+kill %1
 ```
 
 ---
 
-## Common Mistakes
+## Trade-off analysis
 
-### Mistake: Blocking init/1 With Expensive Work
+| Approach | Startup time | Race safety | Complexity |
+|----------|--------------|-------------|------------|
+| All work in `init/1` | Slow — blocks supervisor | Safe | Low |
+| `send(self(), :init)` (pre-OTP-21 hack) | Fast | Unsafe — race window | Medium |
+| `handle_continue` from `init/1` | Fast | Safe | Low |
+| `Task.async` inside `handle_continue` | Fast | Safe | Medium |
+| ETS mirror + crash recovery | Fast | Safe | Medium |
 
-Putting a 2-second DB call directly in `init/1` blocks the supervisor. If 10 workers
-start concurrently under a `DynamicSupervisor`, the supervisor is effectively serialized.
-The supervisor's own `start_child/2` call blocks until `init/1` returns. For slow
-initialization, always delegate to `handle_continue`.
-
-### Mistake: Using send(self(), :init) Instead of handle_continue
-
-The `send(self(), :init)` pattern predates `handle_continue`. It has a real race
-condition: if another process sends a message to the new GenServer BEFORE the `:init`
-message is processed, that external message runs before initialization is complete.
-`handle_continue` guarantees ordering — it always runs before the next mailbox message.
-
-### Mistake: Long handle_continue Chains Without Error Handling
-
-A `handle_continue` chain that crashes partway leaves the process in a half-initialized
-state. If the crash is unhandled, the supervisor restarts the process — but if `init/1`
-does not detect the partial state, you may end up in the same partial initialization
-loop. Design crash-safe recovery: each step should be idempotent or include a rollback.
-
-### Mistake: Assuming handle_continue Makes the GenServer Non-Blocking
-
-`handle_continue` runs in the GenServer's own process. While it is running, no other
-messages are processed. It is "deferred" only in the sense that the previous callback
-has already returned. A 5-second `handle_continue` blocks the GenServer for 5 seconds.
-Spawn a Task from within `handle_continue` if you need true concurrency.
+Reflection question: `handle_continue` still runs in the GenServer process — it is not
+truly asynchronous. If `Loader.load/1` takes 2 seconds, callers during that window get
+`{:error, :not_ready}`. When would you spawn a `Task` from within `handle_continue`
+instead of doing the work inline?
 
 ---
 
-## Summary
-- `handle_continue` eliminates the race condition of `send(self(), :init)` and the
-  startup cost of blocking `init/1` — use it for all expensive deferred initialization
-- Chain continue steps for sequential multi-phase init; use Tasks for parallel work
-- ETS as a crash-safe mirror is a robust recovery pattern for in-memory state
-- `{:reply, result, state, {:continue, work}}` lets callers get answers while work
-  continues — but the GenServer is still sequential; spawn Tasks for true concurrency
+## Common production mistakes
 
-## What's Next
-Exercise 03 — Timeouts & Heartbeats: build on GenServer's timeout mechanism to detect
-dead dependencies and implement circuit-breaker health tracking.
+**1. Blocking `init/1` with expensive work**
+Putting a 2-second DB call directly in `init/1` blocks the supervisor. If 8 workers
+start concurrently under a `Supervisor`, the first finishes in 2 s, the next at 4 s,
+and so on — 16 s total. Always delegate slow initialization to `handle_continue`.
+
+**2. Using `send(self(), :init)` instead of `handle_continue`**
+This pattern predates `handle_continue`. It has a real race condition: if another process
+sends a message to the new GenServer before the `:init` message is processed, the external
+message runs before initialization completes. `handle_continue` guarantees ordering.
+
+**3. Assuming `handle_continue` makes the GenServer non-blocking**
+`handle_continue` runs in the GenServer's own process. While it executes, no other messages
+are processed. A 2-second `handle_continue` blocks all callers for 2 seconds. That is why
+callers must handle `{:error, :not_ready}` gracefully. Spawn a Task if you need true
+concurrency.
+
+**4. Forgetting to handle partial state on crash-recovery failure**
+If `handle_continue(:recover, state)` itself crashes (e.g., ETS table was corrupted),
+the supervisor restarts the process again. If `init/1` then sees the corrupted table and
+tries to recover again, you loop. Always validate recovered state before using it, and
+have a fallback to start fresh.
+
+**5. Long `handle_continue` chains without per-step error handling**
+A chain that crashes partway leaves the process in a half-initialized state. Each step
+should be idempotent or include a rollback. If step 3 of a 5-step chain fails, the
+process restarts and re-runs steps 1–2 — make sure they are safe to repeat.
+
+---
 
 ## Resources
-- OTP 21 release notes — `handle_continue/2` introduction
-- Erlang/OTP docs: `gen_server` module — https://www.erlang.org/doc/man/gen_server.html
-- Saša Jurić — "Elixir in Action" 2nd ed., ch. 7 (GenServer internals)
-- Fred Hébert — "Learn You Some Erlang" — Error Handling chapter
+
+- [OTP 21 release notes — `handle_continue/2` introduction](https://www.erlang.org/blog/my-otp-21-highlights/)
+- [Erlang/OTP docs — `gen_server`](https://www.erlang.org/doc/man/gen_server.html)
+- [Saša Jurić — Elixir in Action, 2nd ed.](https://www.manning.com/books/elixir-in-action-second-edition) — ch. 7, GenServer internals
+- [HexDocs — GenServer.handle_continue/2](https://hexdocs.pm/elixir/GenServer.html#c:handle_continue/2)

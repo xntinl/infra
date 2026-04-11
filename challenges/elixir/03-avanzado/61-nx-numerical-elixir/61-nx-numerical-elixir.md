@@ -1,557 +1,371 @@
-# Ejercicio 61: Nx — Computación Numérica de Alta Performance
+# Nx — Numerical Computation for Gateway Metrics
 
-## Objetivo
-
-Dominar `Nx` (Numerical Elixir) para procesamiento tensorial: desde operaciones
-elementwise hasta compilación con `defn` y manejo de backends (BinaryBackend vs EXLA).
-
-## Conceptos Clave
-
-- `Nx.tensor/2` con tipos explícitos (`f32`, `u8`, `s64`, `f64`)
-- Operaciones elementwise: `add`, `multiply`, `exp`, `log`, `power`
-- Broadcasting: tensores de shapes distintos operando juntos
-- `Nx.dot/2` para multiplicación de matrices
-- `defn/2`: compilación a XLA/EXLA para vectorización real
-- Backends: `Nx.BinaryBackend` (default, portable) vs `EXLA` (CPU/GPU acelerado)
+**Project**: `api_gateway` — built incrementally across the advanced level
 
 ---
 
-## Setup
+## Project context
+
+You're building `api_gateway`. The gateway is accumulating request metrics — latency
+samples, error rates, payload sizes — stored as lists of floats in ETS. The ops team
+wants anomaly detection: flag services whose p99 latency deviates significantly from
+their rolling mean, and project future load based on recent trends. You will use `Nx`
+for the tensor operations and `defn` for the compiled hot path.
+
+Project structure at this point:
+
+```
+api_gateway/
+├── lib/
+│   └── api_gateway/
+│       ├── metrics/
+│       │   ├── store.ex            # already exists — ETS-backed metric collector
+│       │   ├── analyzer.ex         # ← you implement this
+│       │   └── anomaly_detector.ex # ← and this
+├── test/
+│   └── api_gateway/
+│       └── metrics_analyzer_test.exs # given tests — must pass without modification
+├── bench/
+│   └── metrics_bench.exs           # benchmark — run at the end
+└── mix.exs
+```
+
+---
+
+## The business problem
+
+The metrics store collects latency samples per service: `[12.3, 14.1, 11.8, 98.4, 13.2, ...]`.
+The anomaly detector needs to:
+
+1. Compute rolling statistics (mean, std dev) over a sliding window of samples
+2. Flag samples more than N standard deviations from the mean as anomalies
+3. Fit a linear trend to the last 60 minutes of request counts to project the next 15 minutes
+4. Process batches of samples at maximum throughput — compiled with `defn`
+
+The computations must be fast enough to run on every request flush (every 10 seconds)
+without blocking the main request path.
+
+---
+
+## Why Nx instead of plain Elixir math
+
+The naive approach — `Enum.sum(samples) / length(samples)` — copies data, allocates
+intermediate lists, and runs in O(n) interpreted Elixir. For 10,000 samples across
+50 services (500,000 values), this is measurably slow.
+
+Nx tensors are contiguous binary arrays. Operations run in native code (C, XLA). The
+key difference is `defn`: Nx macros that compile the entire function — including loops
+and conditionals — into a single native kernel. The BEAM calls the compiled kernel once
+per invocation instead of dispatching each arithmetic operation through the VM.
+
+The trade-off: `defn` functions can only call other `defn` functions and Nx operations.
+They cannot call arbitrary Elixir code. The boundary between `defn` and regular Elixir
+is the performance-vs-expressiveness trade-off you will feel in this exercise.
+
+---
+
+## Why `defn` improves performance over `Nx.*` calls from regular Elixir
+
+Each `Nx.*` call from regular Elixir code dispatches to the backend, transfers control,
+and returns a tensor. A chain of 10 operations is 10 round-trips. `defn` traces the
+entire function and compiles it into a single native kernel — the 10 operations execute
+as one, with no intermediate dispatch overhead and with opportunities for backend-level
+fusion (e.g., EXLA can fuse `add + multiply` into a single GPU kernel).
+
+---
+
+## Implementation
+
+### Step 1: `mix.exs` — add Nx
 
 ```elixir
-# mix.exs
 defp deps do
   [
+    # existing deps...
     {:nx, "~> 0.7"},
-    {:exla, "~> 0.7"}   # opcional, requiere XLA compilado
+    {:exla, "~> 0.7", only: [:dev, :prod]},  # optional — CPU/GPU acceleration
+    {:benchee, "~> 1.3", only: :dev}
   ]
 end
 ```
 
-```elixir
-# Configurar backend globalmente (en config/config.exs)
-config :nx, default_backend: EXLA.Backend
+### Step 2: `lib/api_gateway/metrics/analyzer.ex`
 
-# O por sesión en iex
-Nx.default_backend(EXLA.Backend)
-```
-
----
-
-## Parte 1: Tensores y Tipos
-
-### Creación de tensores
+`# TODO` marks what you implement. Do not change the function signatures.
 
 ```elixir
-# Escalar
-Nx.tensor(3.14)
-#=> #Nx.Tensor<f32 3.1400001049041748>
+defmodule ApiGateway.Metrics.Analyzer do
+  @moduledoc """
+  Statistical analysis of gateway latency samples using Nx.
 
-# Vector de enteros
-Nx.tensor([1, 2, 3, 4, 5])
-#=> #Nx.Tensor<s64[5] [1, 2, 3, 4, 5]>
-
-# Matriz f32 explícita
-Nx.tensor([[1.0, 2.0], [3.0, 4.0]], type: :f32)
-#=> #Nx.Tensor<f32[2][2] [[1.0, 2.0], [3.0, 4.0]]>
-
-# Tensor 3D (batch de imágenes grayscale: batch x H x W)
-Nx.tensor([[[0, 128, 255], [64, 192, 32]]], type: :u8)
-#=> #Nx.Tensor<u8[1][2][3] ...>
-```
-
-### Tipos disponibles
-
-| Tipo  | Descripción              | Rango                     |
-|-------|--------------------------|---------------------------|
-| `:f32` | float 32 bits           | ±3.4×10³⁸                |
-| `:f64` | float 64 bits           | ±1.8×10³⁰⁸               |
-| `:s8`  | signed int 8 bits       | -128 a 127                |
-| `:s64` | signed int 64 bits      | -2⁶³ a 2⁶³-1             |
-| `:u8`  | unsigned int 8 bits     | 0 a 255                   |
-| `:u32` | unsigned int 32 bits    | 0 a 4294967295            |
-| `:bf16`| bfloat16 (ML)           | menor precisión, más rango|
-
-```elixir
-# Conversión de tipos
-t = Nx.tensor([0, 128, 255], type: :u8)
-Nx.as_type(t, :f32)
-#=> #Nx.Tensor<f32[3] [0.0, 128.0, 255.0]>
-```
-
----
-
-## Parte 2: Operaciones Elementwise
-
-```elixir
-a = Nx.tensor([1.0, 2.0, 3.0, 4.0])
-b = Nx.tensor([10.0, 20.0, 30.0, 40.0])
-
-Nx.add(a, b)        #=> [11.0, 22.0, 33.0, 44.0]
-Nx.subtract(b, a)   #=> [9.0, 18.0, 27.0, 36.0]
-Nx.multiply(a, b)   #=> [10.0, 40.0, 90.0, 160.0]
-Nx.divide(b, a)     #=> [10.0, 10.0, 10.0, 10.0]
-
-# Funciones matemáticas
-Nx.exp(Nx.tensor([0.0, 1.0, 2.0]))
-#=> [1.0, 2.718..., 7.389...]
-
-Nx.log(Nx.tensor([1.0, Math.e, 10.0]))
-Nx.sqrt(Nx.tensor([4.0, 9.0, 16.0]))
-Nx.power(Nx.tensor([2.0, 3.0, 4.0]), 3)
-```
-
-### Broadcasting
-
-Broadcasting permite operar tensores de shapes distintos siguiendo reglas
-similares a NumPy: las dimensiones se alinean por la derecha y se expanden
-automáticamente donde una dimensión es 1.
-
-```elixir
-# Vector + escalar
-vector = Nx.tensor([1.0, 2.0, 3.0])
-scalar = Nx.tensor(10.0)
-Nx.add(vector, scalar)
-#=> [11.0, 12.0, 13.0]
-
-# Matriz + vector (broadcast sobre filas)
-matrix = Nx.tensor([[1.0, 2.0, 3.0],
-                    [4.0, 5.0, 6.0]])
-bias   = Nx.tensor([100.0, 200.0, 300.0])
-
-Nx.add(matrix, bias)
-#=> [[101.0, 202.0, 303.0],
-#    [104.0, 205.0, 306.0]]
-
-# Shape check antes de operar
-Nx.shape(matrix)  #=> {2, 3}
-Nx.shape(bias)    #=> {3}
-# broadcast: {2,3} + {3} → {2,3} ✓
-```
-
----
-
-## Parte 3: Estadísticas y Reducciones
-
-```elixir
-t = Nx.tensor([[1.0, 2.0, 3.0],
-               [4.0, 5.0, 6.0],
-               [7.0, 8.0, 9.0]])
-
-Nx.sum(t)                    #=> 45.0
-Nx.mean(t)                   #=> 5.0
-Nx.variance(t)               #=> 6.666...
-Nx.standard_deviation(t)     #=> 2.581...
-
-# Reducción por eje
-Nx.sum(t, axes: [0])         #=> [12.0, 15.0, 18.0]  (suma columnas)
-Nx.sum(t, axes: [1])         #=> [6.0, 15.0, 24.0]   (suma filas)
-Nx.mean(t, axes: [0])        #=> [4.0, 5.0, 6.0]
-
-# Min/max
-Nx.reduce_min(t)             #=> 1.0
-Nx.reduce_max(t, axes: [1])  #=> [3.0, 6.0, 9.0]
-```
-
----
-
-## Parte 4: Multiplicación Matricial
-
-```elixir
-# Nx.dot/2 = matrix multiplication cuando ambos son 2D
-a = Nx.tensor([[1.0, 2.0],
-               [3.0, 4.0]])
-
-b = Nx.tensor([[5.0, 6.0],
-               [7.0, 8.0]])
-
-Nx.dot(a, b)
-#=> [[19.0, 22.0],
-#    [43.0, 50.0]]
-# (1*5+2*7, 1*6+2*8) = (19, 22)
-# (3*5+4*7, 3*6+4*8) = (43, 50)
-
-# Producto punto entre vectores
-v1 = Nx.tensor([1.0, 2.0, 3.0])
-v2 = Nx.tensor([4.0, 5.0, 6.0])
-Nx.dot(v1, v2)
-#=> 32.0  (1*4 + 2*5 + 3*6)
-
-# Batch matmul: {batch, m, k} x {batch, k, n}
-Nx.LinAlg.matmul(batch_a, batch_b)
-```
-
----
-
-## Ejercicio 1: Normalización de Imagen
-
-**Contexto**: En computer vision, normalizar los píxeles a media 0 y desviación 1
-es un paso estándar de preprocesamiento antes de pasar imágenes a una red neuronal.
-
-**Tu tarea**: Implementa el módulo `ImageProcessor` con las funciones indicadas.
-
-```elixir
-defmodule ImageProcessor do
-  import Nx
-
-  @doc """
-  Normaliza un tensor de imagen: (x - mean) / std
-  Soporta tensores de cualquier shape (HxW, HxWxC, BxHxWxC).
-  Devuelve {:ok, normalized} o {:error, reason}.
+  The public API works with plain Elixir lists (coming from ETS).
+  Internally converts to tensors, runs Nx operations, and returns
+  plain Elixir values. The Nx boundary is entirely inside this module.
   """
-  def normalize(image) do
-    # TODO: validar que image es un tensor Nx
-    # TODO: calcular mean y std sobre todos los elementos
-    # TODO: manejar std == 0 (imagen constante)
-    # TODO: aplicar la fórmula y devolver {:ok, result}
-  end
-
-  @doc """
-  Normaliza cada canal por separado (último eje = canales).
-  Útil para imágenes RGB donde cada canal tiene su propia distribución.
-  """
-  def normalize_per_channel(image) do
-    # TODO: image shape debe ser {H, W, C} o {B, H, W, C}
-    # TODO: calcular mean y std por canal (reducir todos los ejes excepto el último)
-    # TODO: expandir dimensiones para broadcasting correcto
-    # TODO: aplicar normalización y devolver {:ok, result}
-  end
-
-  @doc """
-  Convierte imagen u8 [0,255] a f32 [0.0,1.0]
-  """
-  def to_float(image) do
-    # TODO: verificar type == :u8
-    # TODO: convertir a f32 y dividir entre 255.0
-  end
-end
-```
-
-**Datos de prueba**:
-
-```elixir
-# Imagen grayscale 3x3 (pixeles u8)
-gray = Nx.tensor([
-  [10,  20,  30],
-  [40,  50,  60],
-  [70,  80,  90]
-], type: :u8)
-
-# Imagen RGB 2x2x3
-rgb = Nx.tensor([
-  [[255, 0, 0], [0, 255, 0]],
-  [[0,   0, 255], [128, 128, 128]]
-], type: :u8)
-```
-
-**Resultado esperado** (normalize sobre gray como f32):
-
-```
-mean = 50.0
-std  = 25.819...
-normalized[0][0] = (10 - 50) / 25.819 = -1.549...
-normalized[1][1] = (50 - 50) / 25.819 =  0.0
-normalized[2][2] = (90 - 50) / 25.819 =  1.549...
-```
-
----
-
-## Ejercicio 2: Regresión Lineal con defn
-
-**Contexto**: `defn/2` es una macro de Nx que compila el código a XLA,
-permitiendo ejecución vectorizada en CPU/GPU. Las funciones `defn` solo
-pueden llamar a otras `defn` y a operaciones Nx — no a código Elixir arbitrario.
-
-```elixir
-defmodule LinearRegression do
   import Nx.Defn
 
+  # ---------------------------------------------------------------------------
+  # Public API
+  # ---------------------------------------------------------------------------
+
   @doc """
-  Predicción: y_hat = X @ W + b
-  X: {batch, features}
-  W: {features, outputs}
-  b: {outputs}
+  Computes mean and standard deviation over a list of float samples.
+  Returns `{mean, std_dev}` as plain floats.
   """
-  defn predict(x, weights, bias) do
-    Nx.dot(x, weights) + bias
+  @spec stats(list(float())) :: {float(), float()}
+  def stats(samples) when is_list(samples) and length(samples) > 0 do
+    # TODO: convert samples to an Nx tensor with type :f32
+    # TODO: compute mean and std_dev using Nx.mean/1 and Nx.standard_deviation/1
+    # TODO: convert results back to floats with Nx.to_number/1
+    # TODO: return {mean, std_dev}
   end
 
   @doc """
-  Mean Squared Error: mean((y_pred - y_true)^2)
+  Returns indices of samples that deviate more than `threshold` standard
+  deviations from the mean. Returns a list of integer indices.
   """
-  defn mse_loss(y_pred, y_true) do
-    # TODO: implementar con Nx.mean y Nx.power
+  @spec anomaly_indices(list(float()), float()) :: list(non_neg_integer())
+  def anomaly_indices(samples, threshold \\ 3.0) when is_list(samples) do
+    # TODO: compute stats/1 to get mean and std_dev
+    # TODO: build tensor from samples
+    # TODO: compute z_scores = |sample - mean| / std_dev for each element
+    # TODO: find indices where z_score > threshold
+    # HINT: Nx.abs(Nx.subtract(t, mean)) |> Nx.divide(std_dev)
+    # HINT: Nx.greater(z_scores, threshold) gives a boolean tensor
+    # HINT: Nx.to_flat_list/1 to get back a list of 0/1; filter with indices
   end
 
   @doc """
-  Un paso de gradient descent manual.
-  Devuelve {new_weights, new_bias, loss}.
+  Fits a linear trend y = a*x + b to the samples.
+  Returns `{slope, intercept}` as plain floats.
+
+  Uses closed-form least squares: a = cov(x,y) / var(x).
   """
-  defn train_step(x, y_true, weights, bias, learning_rate) do
-    # TODO: calcular y_pred con predict/3
-    # TODO: calcular loss con mse_loss/2
-    # TODO: calcular gradientes:
-    #   - grad_w = 2/n * X^T @ (y_pred - y_true)
-    #   - grad_b = 2/n * mean(y_pred - y_true)
-    # TODO: actualizar pesos: w = w - lr * grad_w
-    # TODO: devolver {new_w, new_b, loss}
+  @spec linear_trend(list(float())) :: {float(), float()}
+  def linear_trend(samples) when length(samples) >= 2 do
+    # TODO: build x = [0, 1, 2, ..., n-1] and y = samples as tensors
+    # TODO: compute slope: cov(x,y) / var(x)
+    #   cov(x,y) = mean(x*y) - mean(x)*mean(y)
+    #   var(x)   = mean(x^2) - mean(x)^2
+    # TODO: compute intercept: mean(y) - slope * mean(x)
+    # TODO: return {slope, intercept} as floats
   end
 
-  @doc """
-  Entrena por `epochs` iteraciones.
-  Devuelve {weights, bias, history_losses}.
-  """
-  def train(x, y_true, epochs \\ 1000, learning_rate \\ 0.01) do
-    # TODO: inicializar weights y bias con Nx.zeros
-    # TODO: iterar epochs veces llamando train_step/5
-    # TODO: acumular losses en lista
-    # TODO: devolver {final_w, final_b, losses}
-  end
-end
-```
-
-**Datos de prueba — relación lineal simple** `y = 3x + 7`:
-
-```elixir
-x_data = Nx.tensor([[1.0], [2.0], [3.0], [4.0], [5.0]])
-y_data = Nx.tensor([[10.0], [13.0], [16.0], [19.0], [22.0]])
-
-{w, b, losses} = LinearRegression.train(x_data, y_data, 2000, 0.05)
-
-# Esperado: w ≈ [[3.0]], b ≈ [7.0]
-# La loss debe decrecer monótonamente
-```
-
----
-
-## Ejercicio 3: Batch Processing con Medición de Throughput
-
-**Contexto**: Procesar datos en batches reduce overhead de llamadas al backend
-y permite al hardware (especialmente GPU) operar de forma óptima.
-
-```elixir
-defmodule BatchProcessor do
-  import Nx.Defn
+  # ---------------------------------------------------------------------------
+  # defn hot path — compiled, called from batch processing
+  # ---------------------------------------------------------------------------
 
   @doc """
-  Aplica una transformación a un tensor con la función dada,
-  procesando en batches de `batch_size`.
+  Compiled rolling z-score computation for a batch of sample windows.
+  Each row in `windows` is a window of samples. Returns z-scores per element.
 
-  Devuelve {resultados, tiempo_ms, throughput_items_per_sec}.
+  Shape: {batch, window_size} → {batch, window_size}
   """
-  def process_batches(data, batch_size, transform_fn) do
-    # TODO: dividir data en chunks de batch_size con Enum.chunk_every
-    # TODO: medir tiempo total con :timer.tc
-    # TODO: aplicar transform_fn a cada batch
-    # TODO: concatenar resultados con Nx.concatenate
-    # TODO: calcular throughput = n_items / tiempo_segundos
-  end
-
-  @doc """
-  Simula preprocesamiento de imágenes: normalización + resize (crop central).
-  Compilada con defn para máximo rendimiento.
-  """
-  defn preprocess_batch(batch) do
-    # batch shape: {B, H, W, C}
-    # TODO: convertir a f32
-    # TODO: normalizar a [0, 1]
-    # TODO: aplicar mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225] (ImageNet stats)
-    # Retorna batch normalizado
-  end
-
-  @doc """
-  Genera N imágenes sintéticas para benchmark.
-  """
-  def generate_images(n, height \\ 224, width \\ 224, channels \\ 3) do
-    # TODO: usar Nx.random_uniform con type: :u8, min: 0, max: 255
-    # shape: {n, height, width, channels}
+  defn rolling_zscore(windows) do
+    # TODO: compute per-row mean with axes: [1], keep_axes: true
+    # TODO: compute per-row std_dev with axes: [1], keep_axes: true
+    # TODO: return (windows - mean) / (std_dev + epsilon) where epsilon = 1.0e-7
+    # Broadcasting handles the shape mismatch automatically when keep_axes: true
   end
 end
 ```
 
-**Benchmark esperado**:
+### Step 3: `lib/api_gateway/metrics/anomaly_detector.ex`
 
 ```elixir
-images = BatchProcessor.generate_images(1000)
+defmodule ApiGateway.Metrics.AnomalyDetector do
+  @moduledoc """
+  Flags services with anomalous latency patterns.
 
-{results, time_ms, throughput} =
-  BatchProcessor.process_batches(images, 32, &BatchProcessor.preprocess_batch/1)
+  Reads from MetricsStore, runs statistical analysis, and returns
+  a list of services that require attention.
+  """
+  alias ApiGateway.Metrics.{Store, Analyzer}
 
-IO.puts("Procesadas: #{Nx.shape(results) |> elem(0)} imágenes")
-IO.puts("Tiempo total: #{time_ms} ms")
-IO.puts("Throughput: #{Float.round(throughput, 1)} imgs/seg")
+  @threshold_stddev 3.0
+  @min_samples 10
+
+  @doc """
+  Returns a list of `%{service: name, anomalies: count, p99: float}` maps
+  for services with at least one anomalous sample in their recent window.
+  """
+  def detect_anomalies do
+    Store.all_services()
+    |> Enum.map(fn service_name ->
+      samples = Store.get_samples(service_name, limit: 100)
+      analyze_service(service_name, samples)
+    end)
+    |> Enum.reject(&is_nil/1)
+  end
+
+  # -- private --
+
+  defp analyze_service(_name, samples) when length(samples) < @min_samples, do: nil
+
+  defp analyze_service(name, samples) do
+    # TODO: call Analyzer.anomaly_indices/2 with @threshold_stddev
+    # TODO: if no anomalies, return nil
+    # TODO: compute p99: sort samples, take the element at the 99th percentile index
+    # TODO: return %{service: name, anomalies: length(indices), p99: p99_value}
+  end
+end
 ```
 
----
-
-## Solución de Referencia
-
-<details>
-<summary>Ver solución (intenta resolver primero)</summary>
-
-### Ejercicio 1
+### Step 4: Given tests — must pass without modification
 
 ```elixir
-defmodule ImageProcessor do
-  import Nx
+# test/api_gateway/metrics_analyzer_test.exs
+defmodule ApiGateway.Metrics.AnalyzerTest do
+  use ExUnit.Case, async: true
 
-  def normalize(image) when is_struct(image, Nx.Tensor) do
-    image_f = as_type(image, :f32)
-    mean    = mean(image_f)
-    std     = standard_deviation(image_f)
+  alias ApiGateway.Metrics.Analyzer
 
-    # std == 0 significa imagen constante (todos mismos píxeles)
-    if Nx.to_number(std) < 1.0e-7 do
-      {:error, :constant_image}
-    else
-      {:ok, divide(subtract(image_f, mean), std)}
+  describe "stats/1" do
+    test "computes mean and std_dev correctly" do
+      samples = [2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0]
+      {mean, std_dev} = Analyzer.stats(samples)
+
+      assert_in_delta mean, 5.0, 0.001
+      assert_in_delta std_dev, 2.0, 0.001
+    end
+
+    test "handles single element" do
+      {mean, std_dev} = Analyzer.stats([42.0])
+      assert_in_delta mean, 42.0, 0.001
+      assert std_dev == 0.0 or is_float(std_dev)
     end
   end
 
-  def normalize(_), do: {:error, :not_a_tensor}
+  describe "anomaly_indices/2" do
+    test "detects obvious outliers" do
+      # 9 normal samples + 1 extreme outlier at index 5
+      samples = [10.0, 11.0, 10.5, 10.8, 11.2, 500.0, 10.1, 11.3, 10.7, 10.9]
+      indices = Analyzer.anomaly_indices(samples, 2.0)
 
-  def normalize_per_channel(image) when is_struct(image, Nx.Tensor) do
-    rank = Nx.rank(image)
-    unless rank in [3, 4], do: raise ArgumentError, "expected rank 3 or 4"
+      assert 5 in indices
+      assert length(indices) == 1
+    end
 
-    image_f = as_type(image, :f32)
-
-    # Reducir todos los ejes excepto el último (canales)
-    reduce_axes = Enum.to_list(0..(rank - 2))
-
-    channel_mean = mean(image_f, axes: reduce_axes, keep_axes: true)
-    channel_std  = standard_deviation(image_f, axes: reduce_axes, keep_axes: true)
-
-    # Broadcasting automático porque keep_axes: true preserva shape con 1s
-    {:ok, divide(subtract(image_f, channel_mean), channel_std)}
+    test "returns empty list when no anomalies" do
+      samples = Enum.map(1..20, fn _ -> 10.0 + :rand.uniform() end)
+      indices = Analyzer.anomaly_indices(samples, 3.0)
+      assert indices == []
+    end
   end
 
-  def to_float(image) when is_struct(image, Nx.Tensor) do
-    unless Nx.type(image) == {:u, 8},
-      do: raise ArgumentError, "expected u8 tensor"
+  describe "linear_trend/1" do
+    test "computes trend for y = 2x + 1" do
+      # x = [0,1,2,3,4], y = [1,3,5,7,9]
+      samples = [1.0, 3.0, 5.0, 7.0, 9.0]
+      {slope, intercept} = Analyzer.linear_trend(samples)
 
-    image
-    |> as_type(:f32)
-    |> divide(255.0)
+      assert_in_delta slope, 2.0, 0.001
+      assert_in_delta intercept, 1.0, 0.001
+    end
+
+    test "flat trend has slope ~0" do
+      samples = List.duplicate(5.0, 10)
+      {slope, _intercept} = Analyzer.linear_trend(samples)
+      assert_in_delta slope, 0.0, 0.01
+    end
+  end
+
+  describe "rolling_zscore/1" do
+    test "returns tensor of same shape as input" do
+      windows = Nx.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], type: :f32)
+      result = Analyzer.rolling_zscore(windows)
+      assert Nx.shape(result) == {2, 3}
+    end
+
+    test "center element of symmetric window has z-score ~0" do
+      windows = Nx.tensor([[1.0, 5.0, 9.0]], type: :f32)
+      result = Analyzer.rolling_zscore(windows)
+      center_zscore = result[0][1] |> Nx.to_number()
+      assert_in_delta center_zscore, 0.0, 0.01
+    end
   end
 end
 ```
 
-### Ejercicio 2
+### Step 5: Run the tests
+
+```bash
+mix test test/api_gateway/metrics_analyzer_test.exs --trace
+```
+
+### Step 6: Benchmark
 
 ```elixir
-defmodule LinearRegression do
-  import Nx.Defn
+# bench/metrics_bench.exs
+samples_1k  = Enum.map(1..1_000, fn _ -> :rand.uniform() * 100 end)
+samples_10k = Enum.map(1..10_000, fn _ -> :rand.uniform() * 100 end)
 
-  defn predict(x, weights, bias) do
-    Nx.dot(x, weights) + bias
-  end
+windows = Nx.random_uniform({100, 60}, type: :f32)
 
-  defn mse_loss(y_pred, y_true) do
-    Nx.mean(Nx.power(y_pred - y_true, 2))
-  end
-
-  defn train_step(x, y_true, weights, bias, learning_rate) do
-    y_pred = predict(x, weights, bias)
-    loss   = mse_loss(y_pred, y_true)
-
-    n        = Nx.size(y_true) |> Nx.as_type(:f32)
-    error    = y_pred - y_true
-
-    grad_w = Nx.dot(Nx.transpose(x), error) * (2.0 / n)
-    grad_b = Nx.mean(error) * 2.0
-
-    new_w = weights - learning_rate * grad_w
-    new_b = bias    - learning_rate * grad_b
-
-    {new_w, new_b, loss}
-  end
-
-  def train(x, y_true, epochs \\ 1000, learning_rate \\ 0.01) do
-    {_batch, features} = Nx.shape(x)
-    {_batch, outputs}  = Nx.shape(y_true)
-
-    weights = Nx.zeros({features, outputs})
-    bias    = Nx.zeros({outputs})
-    lr      = Nx.tensor(learning_rate, type: :f32)
-
-    Enum.reduce(1..epochs, {weights, bias, []}, fn _epoch, {w, b, losses} ->
-      {new_w, new_b, loss} = train_step(x, y_true, w, b, lr)
-      {new_w, new_b, [Nx.to_number(loss) | losses]}
-    end)
-    |> then(fn {w, b, losses} -> {w, b, Enum.reverse(losses)} end)
-  end
-end
+Benchee.run(
+  %{
+    "stats — 1k samples"  => fn -> ApiGateway.Metrics.Analyzer.stats(samples_1k) end,
+    "stats — 10k samples" => fn -> ApiGateway.Metrics.Analyzer.stats(samples_10k) end,
+    "rolling_zscore — 100 windows of 60" =>
+      fn -> ApiGateway.Metrics.Analyzer.rolling_zscore(windows) end
+  },
+  time: 5,
+  warmup: 2,
+  formatters: [Benchee.Formatters.Console]
+)
 ```
 
-### Ejercicio 3
-
-```elixir
-defmodule BatchProcessor do
-  import Nx.Defn
-
-  def process_batches(data, batch_size, transform_fn) do
-    n_items  = Nx.axis_size(data, 0)
-    indices  = Enum.to_list(0..(n_items - 1))
-    batches  = Enum.chunk_every(indices, batch_size)
-
-    {time_us, results} = :timer.tc(fn ->
-      batches
-      |> Enum.map(fn idx ->
-        batch = Nx.take(data, Nx.tensor(idx))
-        transform_fn.(batch)
-      end)
-      |> Nx.concatenate(axis: 0)
-    end)
-
-    time_ms    = time_us / 1000
-    throughput = n_items / (time_us / 1_000_000)
-
-    {results, time_ms, throughput}
-  end
-
-  defn preprocess_batch(batch) do
-    imagenet_mean = Nx.tensor([0.485, 0.456, 0.406], type: :f32)
-    imagenet_std  = Nx.tensor([0.229, 0.224, 0.225], type: :f32)
-
-    # {B, H, W, C} → normalizar a [0,1]
-    normalized = Nx.as_type(batch, :f32) / 255.0
-
-    # Reshape stats para broadcasting: {1, 1, 1, 3}
-    mean = Nx.reshape(imagenet_mean, {1, 1, 1, 3})
-    std  = Nx.reshape(imagenet_std,  {1, 1, 1, 3})
-
-    (normalized - mean) / std
-  end
-
-  def generate_images(n, height \\ 224, width \\ 224, channels \\ 3) do
-    Nx.random_uniform({n, height, width, channels}, 0, 255, type: :u8)
-  end
-end
+```bash
+mix run bench/metrics_bench.exs
 ```
-
-</details>
 
 ---
 
-## Preguntas de Reflexión
+## Trade-off analysis
 
-1. ¿Por qué `defn` mejora el rendimiento respecto a llamar funciones Nx directamente
-   desde código Elixir normal? ¿Qué hace XLA bajo el capó?
+| Aspect | Nx + `defn` | Plain `Enum` + `:math` | `Statistics` library |
+|--------|------------|------------------------|----------------------|
+| Throughput on large tensors | Very high | Low | Medium |
+| `defn` compilation cost | One-time per call-site | None | None |
+| Arbitrary Elixir in hot path | No (defn only) | Yes | Yes |
+| GPU acceleration | EXLA backend | No | No |
+| Type safety | Explicit tensor types | None | None |
+| Debugging | Hard (compiled) | Easy | Medium |
 
-2. En el ejercicio de batch processing, ¿por qué `Nx.take` es preferible a
-   construir sub-tensores con slicing manual para índices no contiguos?
-
-3. ¿Cuándo usarías `:bf16` en lugar de `:f32`? ¿Qué se pierde y qué se gana?
-
-4. El gradiente de MSE que calculamos es el gradiente analítico manual.
-   ¿Cómo lo haría Nx/Axon automáticamente con `Nx.Defn.grad/2`?
+Reflection question: `defn` functions cannot call arbitrary Elixir. What does this mean
+for error handling inside a `defn`? What happens if a division by zero occurs at the Nx
+level versus at the Elixir level?
 
 ---
 
-## Recursos
+## Common production mistakes
 
-- [Nx HexDocs](https://hexdocs.pm/nx/Nx.html)
-- [Nx.Defn — Numerical Definitions](https://hexdocs.pm/nx/Nx.Defn.html)
-- [EXLA Backend](https://hexdocs.pm/exla/EXLA.html)
-- [Sean Moriarity — Machine Learning in Elixir (PragProg)](https://pragprog.com/titles/smelixir/machine-learning-in-elixir/)
+**1. Converting tensors to lists inside `defn`**
+`Nx.to_flat_list/1` is not available in `defn` — it crosses the Nx/Elixir boundary.
+Move all tensor-to-Elixir conversions outside `defn` functions.
+
+**2. Using `System.os_time` for time-based sliding windows**
+If the BEAM node experiences an NTP adjustment, `os_time` can jump backwards. Use
+`System.monotonic_time` for any comparison where ordering matters.
+
+**3. Not specifying tensor types explicitly**
+Default type depends on the backend. On EXLA, integers may become `:s64`; on BinaryBackend,
+`:f32`. Code that works on one backend silently breaks on another. Always pass `type: :f32`
+or `type: :s64` explicitly when creating tensors from user data.
+
+**4. Building tensors inside a loop**
+`Nx.tensor([])` in a loop rebuilds the tensor each iteration, allocating memory each time.
+Build the tensor once from the full list, then operate on it with batch operations.
+
+**5. Forgetting EXLA is optional**
+EXLA requires XLA to be compiled on the first run (can take minutes). In CI, use the
+default `Nx.BinaryBackend` unless you are specifically benchmarking backend differences.
+
+---
+
+## Resources
+
+- [Nx HexDocs](https://hexdocs.pm/nx/Nx.html) — tensor operations reference
+- [Nx.Defn](https://hexdocs.pm/nx/Nx.Defn.html) — `defn` semantics and limitations
+- [EXLA Backend](https://hexdocs.pm/exla/EXLA.html) — XLA compilation and GPU support
+- [Machine Learning in Elixir — Sean Moriarity](https://pragprog.com/titles/smelixir/machine-learning-in-elixir/) — chapters on Nx fundamentals

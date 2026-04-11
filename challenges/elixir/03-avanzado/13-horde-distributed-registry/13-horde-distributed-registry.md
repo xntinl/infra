@@ -1,534 +1,474 @@
-# 13. Horde: Distributed Registry
+# Horde: Distributed Registry and Supervisor for `api_gateway`
 
-**Difficulty**: Avanzado
-
----
-
-## Prerequisites
-
-- Ejercicio 11: Distributed Erlang Clustering
-- Ejercicio 12: Global Process Registry (`:global` y `:pg`)
-- GenServer y supervisores avanzados (ejercicios 01-10)
-- Conceptos básicos de CRDTs (Conflict-free Replicated Data Types)
+**Project**: `api_gateway` — built incrementally across the advanced level
 
 ---
 
-## Learning Objectives
+## Project context
 
-- Usar `Horde.Registry` para registro distribuido con eventual consistency
-- Implementar supervisión distribuida con `Horde.DynamicSupervisor`
-- Entender delta CRDTs y por qué permiten mejor tolerancia a particiones
-- Configurar cluster membership dinámica en Horde
-- Comparar trade-offs entre Horde, `:global`, y `Registry` local
-- Implementar handoff de procesos entre nodos
+You're building `api_gateway`. The cluster is connected and coordinated (exercises 11–12).
+A new requirement has arrived: circuit breaker workers must be **distributed across nodes
+and survive node failures**.
 
----
+With `DynamicSupervisor` on a single node, if that node crashes, all circuit breaker
+workers for every upstream service vanish. The gateway on the surviving nodes has no
+circuit breaker state — it either routes all traffic blindly (risk: cascading failures)
+or refuses all traffic (risk: complete outage).
 
-## Concepts
+The operations team also wants circuit breaker state to be **consistent across nodes**:
+if gateway_a trips a breaker for `payment-service`, gateway_b should also stop routing
+to it immediately, not after its own 5-failure threshold is hit independently.
 
-### ¿Por qué Horde?
-
-`:global` usa locks distribuidos — si la red es lenta o hay partición, las operaciones se bloquean o fallan. `Registry` local es rápido pero solo visible en un nodo. Horde ofrece un punto medio:
-
-| Aspecto | `:global` | `Registry` | `Horde.Registry` |
-|---------|-----------|------------|------------------|
-| Scope | Cluster | Local | Cluster |
-| Consistency | Strong (CP) | N/A | Eventual (AP) |
-| Netsplit behavior | Bloquea | N/A | Diverge + reconcilia |
-| Lookup speed | Lento | O(1) | O(1) local |
-| Escala | ~20 nodos | Ilimitado | ~50-100 nodos |
-| Overhead | Alto | Mínimo | Medio |
-
-Horde es AP: disponible durante netsplits, reconcilia cuando la red se recupera. Esto significa que temporalmente puede haber dos procesos con el mismo nombre en particiones distintas — cuando la red se recupera, Horde los reconcilia matando el "perdedor" según una función de resolución.
-
-### Delta CRDTs: la clave técnica
-
-Un **CRDT** (Conflict-free Replicated Data Type) es una estructura de datos que puede ser modificada de forma concurrente en múltiples réplicas y siempre converge al mismo estado, sin coordinación.
-
-Un **delta CRDT** envía solo el "delta" (cambio incremental) en lugar del estado completo:
+Project structure at this point:
 
 ```
-Nodo A: {alice: pid1}
-Nodo B: {bob: pid2}
-
-Sin delta CRDTs: A envía {alice: pid1} a B, B envía {bob: pid2} a A
-Con delta CRDTs: A envía "agregué alice:pid1" a B, B envía "agregué bob:pid2" a A
-
-Resultado en ambos: {alice: pid1, bob: pid2}
+api_gateway/
+├── lib/
+│   └── api_gateway/
+│       ├── application.ex
+│       ├── cluster/
+│       │   ├── manager.ex          # from exercise 11
+│       │   ├── leader.ex           # from exercise 12
+│       │   └── horde_membership.ex # ← you implement
+│       ├── circuit_breaker/
+│       │   ├── worker.ex           # ← extend for Horde registration
+│       │   └── supervisor.ex       # ← replace with Horde.DynamicSupervisor
+│       └── rate_limiter/
+│           └── server.ex
+├── test/
+│   └── api_gateway/
+│       └── circuit_breaker/
+│           └── distributed_test.exs # given tests — must pass
+└── mix.exs
 ```
 
-Horde usa delta CRDTs implementados en la librería `DeltaCrdt`. El registro se propaga eventualmente a todos los nodos sin necesidad de coordinación central ni locks.
+---
 
-### Configuración básica de Horde
+## The business problem
+
+Before this exercise, circuit breaker workers are managed by `ApiGateway.CircuitBreaker.Supervisor`
+— a plain `DynamicSupervisor` running on one node. Two failure modes affect production:
+
+1. **Worker node crash = lost state**: when the node running the supervisor crashes,
+   all circuit breaker workers die. The other nodes have no knowledge of which services
+   were tripped. A payment service that was in `:open` state starts receiving traffic again.
+
+2. **Inconsistent tripping**: gateway_a and gateway_b maintain independent circuit
+   breaker states. A service that starts returning 500s will be tripped separately
+   on each node, allowing up to `5 × N_nodes` failed requests before all breakers open.
+
+The solution: use `Horde.DynamicSupervisor` and `Horde.Registry` to distribute circuit
+breaker workers across the cluster. One worker per upstream service exists in the entire
+cluster (not per node). If the node hosting a worker crashes, Horde restarts it on
+another node automatically.
+
+---
+
+## Why Horde and not `:global`
+
+Exercise 12 showed that `:global` is CP: during a netsplit, registration operations
+block or fail. For circuit breakers, partial availability during a netsplit is acceptable
+— the important property is that circuit breaker workers **restart on surviving nodes**
+when a node fails, and that the restart is automatic.
+
+`:global` can register a singleton and detect when it dies, but it does not manage
+process lifecycle. You would need to combine `:global` with a custom restart mechanism,
+monitor logic, and cross-node `DynamicSupervisor.start_child` calls. This is exactly
+what Horde implements — and it does it with delta CRDTs so the registry state propagates
+without blocking locks.
+
+| Property | `:global` + custom | `Horde` |
+|----------|--------------------|---------|
+| Auto-restart on node crash | Manual | Built-in |
+| Registry lookup | Cross-cluster blocking | O(1) local (eventual) |
+| Netsplit behavior | CP (blocks) | AP (diverges, reconciles) |
+| Implementation effort | High | Low |
+| Added dependency | None | `{:horde, "~> 0.9"}` |
+
+---
+
+## How Horde works
+
+### Delta CRDTs — the enabling technology
+
+Horde's state is a **delta CRDT** (Conflict-free Replicated Data Type). Each node
+maintains a local copy of the registry. Changes are propagated as small deltas rather
+than full state:
+
+```
+Node A registers {payment-svc → PID<0.234.0>}
+  → broadcasts delta "added: {payment-svc, PID<0.234.0>}" to all nodes
+  → all nodes merge the delta into their local copy
+  → result is consistent without any locking
+```
+
+Concurrent registrations on different nodes during a netsplit both succeed locally.
+When the partition heals, Horde reconciles: one registration "wins" and the loser
+receives a signal. The winning function is configurable.
+
+### Cluster membership — the critical step
+
+Horde does not auto-discover nodes. You must tell it which nodes are in the cluster.
+This is done via `Horde.Cluster.set_members/2`. The standard pattern: a `GenServer`
+that subscribes to `:net_kernel.monitor_nodes` and calls `set_members` when the
+topology changes.
 
 ```elixir
-# mix.exs
+Horde.Cluster.set_members(ApiGateway.CircuitBreaker.Supervisor, [
+  {ApiGateway.CircuitBreaker.Supervisor, :"gateway_a@10.0.1.5"},
+  {ApiGateway.CircuitBreaker.Supervisor, :"gateway_b@10.0.1.6"},
+])
+```
+
+If you forget to update membership after a node joins or leaves, Horde's consistent
+hash ring is wrong and process distribution is uneven (new node is underloaded; old
+nodes are overloaded).
+
+### Process distribution with consistent hashing
+
+Horde distributes processes across nodes using consistent hashing on the process `id`.
+When a node is added, only a fraction of processes migrate (not a full reshuffling).
+When a node crashes, only the processes that were on that node restart elsewhere.
+
+---
+
+## Implementation
+
+### Step 1: Add Horde to `mix.exs`
+
+```elixir
 defp deps do
   [
+    # ...existing deps...
     {:horde, "~> 0.9"}
   ]
 end
 ```
 
-```elixir
-# application.ex
-def start(_type, _args) do
-  children = [
-    # Registry distribuido
-    {Horde.Registry, [
-      name: MyApp.Registry,
-      keys: :unique,
-      members: :auto  # detección automática via libcluster o similar
-    ]},
+### Step 2: `lib/api_gateway/cluster/horde_membership.ex`
 
-    # Supervisor dinámico distribuido
-    {Horde.DynamicSupervisor, [
-      name: MyApp.DistSupervisor,
-      strategy: :one_for_one,
-      members: :auto
-    ]}
+```elixir
+defmodule ApiGateway.Cluster.HordeMembership do
+  use GenServer
+  require Logger
+
+  @horde_members [
+    ApiGateway.CircuitBreaker.Registry,
+    ApiGateway.CircuitBreaker.Supervisor,
   ]
 
-  Supervisor.start_link(children, strategy: :one_for_one)
-end
-```
+  def start_link(opts) do
+    GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+  end
 
-### Horde.Registry
+  @impl true
+  def init(_opts) do
+    # TODO: subscribe to node events so cluster topology changes trigger membership sync
+    # HINT: :net_kernel.monitor_nodes(true)
 
-```elixir
-# Registrar con via tuple (compatible con GenServer)
-def start_link(name) do
-  GenServer.start_link(__MODULE__, name,
-    name: {:via, Horde.Registry, {MyApp.Registry, name}}
-  )
-end
+    # TODO: sync membership immediately on startup
+    # HINT: send(self(), :sync_members)
 
-# Lookup
-case Horde.Registry.lookup(MyApp.Registry, "user:alice") do
-  [{pid, _meta}] -> {:ok, pid}
-  [] -> {:error, :not_found}
-end
-
-# Registrar manualmente
-Horde.Registry.register(MyApp.Registry, "session:xyz", %{started_at: DateTime.utc_now()})
-
-# Listar todos los registros (útil para debug)
-Horde.Registry.select(MyApp.Registry, [{{:"$1", :"$2", :"$3"}, [], [{{:"$1", :"$2", :"$3"}}]}])
-```
-
-### Horde.DynamicSupervisor
-
-Funciona como `DynamicSupervisor` pero distribuye procesos por el cluster:
-
-```elixir
-# Iniciar un child — puede arrancar en cualquier nodo del cluster
-Horde.DynamicSupervisor.start_child(
-  MyApp.DistSupervisor,
-  {MyWorker, [id: "worker-1", name: "worker-1"]}
-)
-
-# Horde decide en qué nodo arrancar basándose en la distribución actual
-# Si el nodo donde estaba el proceso se cae, Horde lo reinicia en otro nodo
-```
-
-**Estrategia de distribución**: Horde usa consistent hashing por defecto para distribuir procesos entre nodos. Cuando un nodo se une o se va, solo una fracción de los procesos migra.
-
-### Cluster membership: el paso crítico
-
-Horde necesita saber qué nodos forman el cluster. Hay dos formas:
-
-**1. Manual** (para pruebas y desarrollo):
-
-```elixir
-# Agregar un nodo al registry de Horde
-Horde.Cluster.set_members(MyApp.Registry, [
-  {MyApp.Registry, :"nodeA@localhost"},
-  {MyApp.Registry, :"nodeB@localhost"}
-])
-
-# Lo mismo para el supervisor
-Horde.Cluster.set_members(MyApp.DistSupervisor, [
-  {MyApp.DistSupervisor, :"nodeA@localhost"},
-  {MyApp.DistSupervisor, :"nodeB@localhost"}
-])
-```
-
-**2. Automático con libcluster** (para producción):
-
-```elixir
-# En application.ex, antes de Horde:
-{Cluster.Supervisor, [
-  [gossip: [strategy: Cluster.Strategy.Gossip]],
-  [name: MyApp.ClusterSupervisor]
-]},
-
-# Y un proceso que escucha eventos de libcluster y actualiza Horde:
-defmodule MyApp.HordeMembership do
-  use GenServer
-
-  def init(_) do
-    :net_kernel.monitor_nodes(true)
-    sync_horde_members()
     {:ok, []}
   end
 
-  def handle_info({:nodeup, _node}, state) do
-    sync_horde_members()
+  @impl true
+  def handle_info({:nodeup, node}, state) do
+    Logger.info("HordeMembership: node joined #{node}, syncing Horde members")
+    # TODO: call sync_members() and {:noreply, state}
     {:noreply, state}
   end
 
-  def handle_info({:nodedown, _node}, state) do
-    sync_horde_members()
+  @impl true
+  def handle_info({:nodedown, node}, state) do
+    Logger.warning("HordeMembership: node left #{node}, syncing Horde members")
+    # TODO: call sync_members() and {:noreply, state}
     {:noreply, state}
   end
 
-  defp sync_horde_members do
-    members = [node() | Node.list()]
-    horde_members = Enum.map(members, &{MyApp.Registry, &1})
-    Horde.Cluster.set_members(MyApp.Registry, horde_members)
-    # Igual para DynamicSupervisor...
+  @impl true
+  def handle_info(:sync_members, state) do
+    sync_members()
+    {:noreply, state}
+  end
+
+  # ---------------------------------------------------------------------------
+  # Private
+  # ---------------------------------------------------------------------------
+
+  defp sync_members do
+    # TODO:
+    # 1. Collect all nodes: [node() | Node.list()]
+    # 2. For each horde component in @horde_members, build the member list:
+    #    [{ComponentModule, node} for node in all_nodes]
+    # 3. Call Horde.Cluster.set_members/2 for each component
+    #
+    # HINT:
+    #   all_nodes = [node() | Node.list()]
+    #   Enum.each(@horde_members, fn component ->
+    #     members = Enum.map(all_nodes, &{component, &1})
+    #     Horde.Cluster.set_members(component, members)
+    #   end)
+    :ok
   end
 end
 ```
 
-### Handoff de procesos
-
-Cuando un nodo abandona el cluster gracefully, Horde puede "pasar" los procesos a otros nodos. Para implementar handoff, el worker debe implementar el callback `Horde.DynamicSupervisor` handoff protocol:
+### Step 3: Extend `lib/api_gateway/circuit_breaker/worker.ex`
 
 ```elixir
-defmodule MyWorker do
+defmodule ApiGateway.CircuitBreaker.Worker do
   use GenServer
 
-  # Horde llama esto antes de terminar el proceso por handoff
-  def handle_call({:handoff, handoff_state}, _from, state) do
-    # Retornar el estado que debe transferirse al nuevo proceso
-    {:reply, {:handoff, state}, state}
-  end
+  # ... (existing state machine from exercise 03) ...
 
-  # Horde llama init/1 con {:handoff, state} cuando es un proceso de handoff
-  def init({:handoff, previous_state}) do
-    # Restaurar desde el estado del proceso anterior
-    {:ok, previous_state}
-  end
-
-  def init(initial_state) do
-    {:ok, initial_state}
-  end
-end
-```
-
----
-
-## Exercises
-
-### Exercise 1: Registry con Failover Automático
-
-**Problem**: Implementa un sistema de sesiones de usuario donde cada sesión es un proceso registrado con el user ID como nombre. Si el nodo donde corre la sesión se cae, Horde debe reiniciar la sesión en otro nodo automáticamente. La sesión debe recordar su estado (historial de acciones) tras el restart.
-
-**Hints**:
-- La sesión necesita persistir su estado en algún store externo (ETS compartido, o simplemente simula con un Agent local al nodo del Registry)
-- Usa `{:via, Horde.Registry, {MyApp.Registry, user_id}}` para el nombre
-- Inicia la sesión con `Horde.DynamicSupervisor.start_child/2`
-- El failover es automático — cuando el nodo muere, Horde reinicia el child en otro nodo
-- Para probar: mata el nodo donde corre la sesión y verifica que aparece en otro nodo
-
-**One possible solution**:
-
-```elixir
-defmodule SessionServer do
-  use GenServer
-
-  def start_link({user_id, initial_state}) do
-    GenServer.start_link(
-      __MODULE__,
-      {user_id, initial_state},
-      name: via(user_id)
-    )
-  end
-
-  def child_spec({user_id, initial_state}) do
-    %{
-      id: {__MODULE__, user_id},
-      start: {__MODULE__, :start_link, [{user_id, initial_state}]},
-      restart: :transient
-    }
-  end
-
-  defp via(user_id) do
-    {:via, Horde.Registry, {MyApp.Registry, "session:#{user_id}"}}
-  end
-
-  def add_action(user_id, action) do
-    GenServer.call(via(user_id), {:add_action, action})
-  end
-
-  def get_history(user_id) do
-    GenServer.call(via(user_id), :get_history)
-  end
-
-  def start_session(user_id) do
-    Horde.DynamicSupervisor.start_child(
-      MyApp.DistSupervisor,
-      {__MODULE__, {user_id, []}}
-    )
-  end
-
-  def init({user_id, initial_history}) do
-    {:ok, %{user_id: user_id, history: initial_history, node: node()}}
-  end
-
-  def handle_call({:add_action, action}, _from, state) do
-    new_history = [action | state.history]
-    {:reply, :ok, %{state | history: new_history}}
-  end
-
-  def handle_call(:get_history, _from, state) do
-    {:reply, {state.history, state.node}, state}
-  end
-end
-```
-
----
-
-### Exercise 2: Distributed Supervisor con Handoff
-
-**Problem**: Implementa workers de larga duración que acumulan estado (ej: contadores de métricas por servicio). Cuando añades un nuevo nodo al cluster, Horde rebalancea y migra algunos workers al nuevo nodo. El worker debe transferir su estado acumulado (no perder métricas) durante la migración.
-
-**Hints**:
-- Implementa `handle_call({:handoff, handoff_state}, ...)` en el worker
-- El worker debe poder inicializarse tanto fresh como desde handoff state: `init({:handoff, state})` vs `init(initial_args)`
-- Para observar el handoff, usa `:sys.get_state/1` antes y después de mover el nodo
-- Horde no implementa handoff automático en versiones recientes — puede que necesites implementarlo manualmente via `terminate/2`
-- Documenta el trade-off: qué pasa si el nodo muere antes de completar el handoff
-
-**One possible solution**:
-
-```elixir
-defmodule MetricsWorker do
-  use GenServer
-
-  def start_link({service_name, initial_state}) do
-    GenServer.start_link(
-      __MODULE__,
-      {service_name, initial_state},
+  def start_link(service_name) do
+    GenServer.start_link(__MODULE__, service_name,
       name: via(service_name)
     )
   end
 
-  def child_spec({service_name, initial_state}) do
+  def child_spec(service_name) do
     %{
-      id: {__MODULE__, service_name},
-      start: {__MODULE__, :start_link, [{service_name, initial_state}]},
+      id:      {__MODULE__, service_name},
+      start:   {__MODULE__, :start_link, [service_name]},
+      # TODO: restart: :transient — if the worker exits cleanly (e.g., service removed),
+      # Horde should not restart it.
       restart: :transient
     }
   end
 
-  defp via(name) do
-    {:via, Horde.Registry, {MyApp.Registry, "metrics:#{name}"}}
+  # Via tuple for Horde.Registry lookup — replaces the old Process.register/2
+  defp via(service_name) do
+    # TODO: return {:via, Horde.Registry, {ApiGateway.CircuitBreaker.Registry, service_name}}
   end
 
-  def record(service_name, metric, value) do
-    GenServer.cast(via(service_name), {:record, metric, value})
-  end
-
-  def report(service_name) do
-    GenServer.call(via(service_name), :report)
-  end
-
-  # Init desde estado fresco
-  def init({service_name, []}) do
-    {:ok, %{service: service_name, metrics: %{}, running_on: node()}}
-  end
-
-  # Init desde handoff — restaurar estado previo
-  def init({_service_name, handoff_state}) when is_map(handoff_state) do
-    {:ok, Map.put(handoff_state, :running_on, node())}
-  end
-
-  def handle_cast({:record, metric, value}, state) do
-    new_metrics = Map.update(state.metrics, metric, [value], &[value | &1])
-    {:noreply, %{state | metrics: new_metrics}}
-  end
-
-  def handle_call(:report, _from, state) do
-    summary = Map.new(state.metrics, fn {k, vs} ->
-      {k, %{count: length(vs), sum: Enum.sum(vs), avg: Enum.sum(vs) / length(vs)}}
-    end)
-    {:reply, {summary, state.running_on}, state}
-  end
-
-  # Handoff: exportar estado antes de terminar
-  def terminate(:handoff, state) do
-    # Horde iniciará un nuevo proceso en otro nodo con este estado
-    state
-  end
-
-  def terminate(_reason, _state), do: :ok
+  # ... existing GenServer callbacks ...
 end
 ```
 
----
-
-### Exercise 3: Horde vs :global vs Registry — Comparación
-
-**Problem**: Implementa el mismo contador distribuido (registrado por nombre, único en el cluster) usando las tres alternativas: `Horde.Registry`, `:global`, y `Registry` local con un proceso de routing. Mide y documenta: latencia de lookup, comportamiento durante netsplit simulado, y complejidad de implementación.
-
-**Hints**:
-- Para simular netsplit con múltiples terminales IEx: `Node.disconnect/1` para separar nodos y reconectarlos después
-- Para medir latencia: `:timer.tc/1` o `Benchee`
-- El Router con Registry local necesita replicar los registros via `:global` o `:pg` — implementa el mínimo viable
-- El objetivo no es "cuál es mejor" sino entender cuándo usar cada uno
-- Documenta el comportamiento en estas condiciones: nodo normal, netsplit activo, recovery post-netsplit
-
-**One possible solution**:
+### Step 4: Replace `lib/api_gateway/circuit_breaker/supervisor.ex`
 
 ```elixir
-# Implementación 1: Con :global
-defmodule Counter.Global do
-  use GenServer
+defmodule ApiGateway.CircuitBreaker.Supervisor do
+  @moduledoc """
+  Distributed circuit breaker supervisor using Horde.
+  Workers are distributed across all cluster nodes. If a node crashes,
+  its workers are restarted on surviving nodes automatically.
+  """
 
-  def start_link(name) do
-    case GenServer.start_link(__MODULE__, name,
-           name: {:global, {__MODULE__, name}}) do
-      {:ok, pid} -> {:ok, pid}
-      {:error, {:already_started, pid}} -> {:ok, pid}
+  @doc "Start a circuit breaker worker for a service. Idempotent — safe to call if already started."
+  def start_worker(service_name) do
+    # TODO: use Horde.DynamicSupervisor.start_child/2 with the Worker child spec
+    # Return {:ok, pid} or {:error, {:already_started, pid}} — both are acceptable
+    # HINT:
+    #   Horde.DynamicSupervisor.start_child(
+    #     ApiGateway.CircuitBreaker.HordeSupervisor,
+    #     ApiGateway.CircuitBreaker.Worker.child_spec(service_name)
+    #   )
+  end
+
+  @doc "Look up the PID of a running circuit breaker worker."
+  def find_worker(service_name) do
+    # TODO: use Horde.Registry.lookup/2
+    # Return {:ok, pid} or {:error, :not_found}
+    # HINT:
+    #   case Horde.Registry.lookup(ApiGateway.CircuitBreaker.Registry, service_name) do
+    #     [{pid, _meta}] -> {:ok, pid}
+    #     []             -> {:error, :not_found}
+    #   end
+  end
+
+  @doc "List PIDs of all running circuit breaker workers across the cluster."
+  def list_workers do
+    # TODO: use Horde.Registry.select/2 to enumerate all registered workers
+    # HINT:
+    #   Horde.Registry.select(ApiGateway.CircuitBreaker.Registry,
+    #     [{{:"$1", :"$2", :"$3"}, [], [:"$2"]}]
+    #   )
+    []
+  end
+end
+```
+
+### Step 5: Update `application.ex`
+
+```elixir
+# In lib/api_gateway/application.ex, replace the old CircuitBreaker.Supervisor
+# child spec with Horde components. Add BEFORE CoreSupervisor:
+
+{Horde.Registry,
+  name:    ApiGateway.CircuitBreaker.Registry,
+  keys:    :unique,
+  members: []},  # HordeMembership will populate this
+
+{Horde.DynamicSupervisor,
+  name:     ApiGateway.CircuitBreaker.HordeSupervisor,
+  strategy: :one_for_one,
+  members:  []},
+
+ApiGateway.Cluster.HordeMembership,
+```
+
+### Step 6: Given tests — must pass without modification
+
+```elixir
+# test/api_gateway/circuit_breaker/distributed_test.exs
+defmodule ApiGateway.CircuitBreaker.DistributedTest do
+  use ExUnit.Case, async: false
+
+  alias ApiGateway.CircuitBreaker.{Worker, Supervisor}
+
+  setup do
+    # Ensure no leftover workers between tests
+    Supervisor.list_workers()
+    |> Enum.each(fn pid ->
+      DynamicSupervisor.terminate_child(
+        ApiGateway.CircuitBreaker.HordeSupervisor, pid
+      )
+    end)
+    Process.sleep(50)
+    :ok
+  end
+
+  describe "start_worker/1" do
+    test "starts a worker and registers it" do
+      assert {:ok, pid} = Supervisor.start_worker("payment-service")
+      assert Process.alive?(pid)
+    end
+
+    test "second start_worker for same service returns existing pid" do
+      {:ok, pid1} = Supervisor.start_worker("idempotent-service")
+      result = Supervisor.start_worker("idempotent-service")
+      assert match?({:ok, ^pid1}, result) or match?({:error, {:already_started, ^pid1}}, result)
     end
   end
 
-  def increment(name), do: GenServer.call({:global, {__MODULE__, name}}, :incr)
-  def value(name), do: GenServer.call({:global, {__MODULE__, name}}, :value)
+  describe "find_worker/1" do
+    test "returns {:ok, pid} for a running worker" do
+      {:ok, _} = Supervisor.start_worker("find-test")
+      assert {:ok, pid} = Supervisor.find_worker("find-test")
+      assert Process.alive?(pid)
+    end
 
-  def init(_name), do: {:ok, 0}
-  def handle_call(:incr, _from, n), do: {:reply, n + 1, n + 1}
-  def handle_call(:value, _from, n), do: {:reply, n, n}
-end
-
-# Implementación 2: Con Horde.Registry
-defmodule Counter.Horde do
-  use GenServer
-
-  defp via(name), do: {:via, Horde.Registry, {MyApp.Registry, {__MODULE__, name}}}
-
-  def start_link(name) do
-    Horde.DynamicSupervisor.start_child(
-      MyApp.DistSupervisor,
-      %{id: {__MODULE__, name}, start: {__MODULE__, :do_start, [name]}}
-    )
+    test "returns {:error, :not_found} for unknown service" do
+      assert {:error, :not_found} = Supervisor.find_worker("nonexistent")
+    end
   end
 
-  def do_start(name) do
-    GenServer.start_link(__MODULE__, name, name: via(name))
+  describe "list_workers/0" do
+    test "includes all running workers" do
+      {:ok, pid_a} = Supervisor.start_worker("svc-list-a")
+      {:ok, pid_b} = Supervisor.start_worker("svc-list-b")
+      Process.sleep(100)
+
+      workers = Supervisor.list_workers()
+      assert pid_a in workers
+      assert pid_b in workers
+    end
   end
 
-  def increment(name), do: GenServer.call(via(name), :incr)
-  def value(name), do: GenServer.call(via(name), :value)
+  describe "automatic restart on worker crash" do
+    test "crashed worker is restarted by Horde" do
+      {:ok, original_pid} = Supervisor.start_worker("crash-svc")
+      ref = Process.monitor(original_pid)
 
-  def init(_name), do: {:ok, 0}
-  def handle_call(:incr, _from, n), do: {:reply, n + 1, n + 1}
-  def handle_call(:value, _from, n), do: {:reply, n, n}
-end
+      Process.exit(original_pid, :kill)
+      assert_receive {:DOWN, ^ref, :process, _, _}, 1_000
 
-# Benchmark comparativo
-defmodule Counter.Benchmark do
-  def run(name, iterations \\ 1_000) do
-    {global_time, _} = :timer.tc(fn ->
-      Enum.each(1..iterations, fn _ -> Counter.Global.value(name) end)
-    end)
+      # Give Horde time to restart
+      Process.sleep(500)
 
-    {horde_time, _} = :timer.tc(fn ->
-      Enum.each(1..iterations, fn _ -> Counter.Horde.value(name) end)
-    end)
+      assert {:ok, new_pid} = Supervisor.find_worker("crash-svc")
+      assert Process.alive?(new_pid)
+      assert new_pid != original_pid
+    end
+  end
 
-    %{
-      global_us_per_op: global_time / iterations,
-      horde_us_per_op: horde_time / iterations,
-      ratio: horde_time / global_time
-    }
+  describe "worker state machine (via Horde)" do
+    test "worker starts in :closed state" do
+      {:ok, _} = Supervisor.start_worker("state-test-svc")
+      {:ok, pid} = Supervisor.find_worker("state-test-svc")
+      state = :sys.get_state(pid)
+      assert state.status == :closed
+    end
   end
 end
 ```
 
-**Resultados típicos esperados** (para documentar en tu análisis):
+### Step 7: Run the tests
 
-| Operación | `:global` | `Horde.Registry` |
-|-----------|-----------|------------------|
-| Lookup local | ~50-200μs | ~1-5μs |
-| Lookup remoto | ~100-500μs | ~1-5μs |
-| Register | ~1-5ms | ~1-10ms |
-| Netsplit behavior | Bloquea | AP, diverge |
-| Recovery | Automático | Automático |
-
----
-
-## Common Mistakes
-
-**No actualizar cluster membership en Horde**: Horde no detecta nodos automáticamente (a menos que uses `members: :auto` con libcluster). Si añades un nodo y no llamas `Horde.Cluster.set_members/2`, ese nodo no participa en la distribución.
-
-**Confundir eventual consistency con inconsistencia permanente**: Horde converge — después de un netsplit, los estados se reconcilian. El "problema" es la ventana de inconsistencia durante el netsplit. Para muchos casos de uso, esta ventana es aceptable.
-
-**No manejar el proceso "perdedor" post-netsplit**: Cuando Horde reconcilia dos registros del mismo nombre, mata uno. El proceso que muere recibirá una señal de terminación normal. Si tiene subscribers o estado externo, necesita cleanup. Implementa `terminate/2` defensivamente.
-
-**Usar Horde para workloads de alta frecuencia**: Horde tiene overhead por la sincronización CRDT. No es un reemplazo de ETS para lookups de millones de ops/segundo. Para hot paths, cachea el PID localmente.
-
-**members: :auto sin libcluster**: `members: :auto` en Horde requiere que los nodos estén conectados via libcluster o similar. Si los nodos se conectan manualmente con `Node.connect/1`, Horde no sabrá de ellos automáticamente — usa `Horde.Cluster.set_members/2` manualmente o implementa el listener de `monitor_nodes`.
-
-**Handoff incompleto**: El handoff de Horde no es atómico. Si el nodo muere durante el handoff, el estado puede perderse. Para estado crítico, usa un store externo (Postgres, Redis, ETS compartido) además del estado en el proceso.
-
----
-
-## Verification
-
-```elixir
-# Verifica que el registro funciona en el nodo local
-{:ok, _pid} = SessionServer.start_session("user-123")
-:ok = SessionServer.add_action("user-123", :login)
-{[{:login}], _node} = SessionServer.get_history("user-123")
-
-# Verifica que Horde.Registry puede hacer lookup
-[{pid, _}] = Horde.Registry.lookup(MyApp.Registry, "session:user-123")
-assert is_pid(pid)
-assert Process.alive?(pid)
-
-# Verifica distribución entre nodos (requiere cluster activo)
-nodes = [node() | Node.list()]
-sessions = Enum.map(["u1", "u2", "u3", "u4"], fn uid ->
-  {:ok, pid} = SessionServer.start_session(uid)
-  {uid, node(pid)}
-end)
-
-# Con múltiples nodos, los procesos deben distribuirse
-running_nodes = sessions |> Enum.map(&elem(&1, 1)) |> Enum.uniq()
-assert length(running_nodes) > 1  # distribuidos en más de un nodo
+```bash
+mix test test/api_gateway/circuit_breaker/distributed_test.exs --trace
 ```
 
 ---
 
-## Summary
+## Trade-off analysis
 
-Horde llena el espacio entre `Registry` local y `:global` distribuido:
+| Design choice | Benefit | Risk |
+|---------------|---------|------|
+| Horde over `:global` for circuit breakers | Auto-restart on node crash; non-blocking lookups | Eventual consistency — brief window where two nodes have conflicting worker state after netsplit |
+| `restart: :transient` on workers | Workers removed intentionally stay removed | A worker that exits due to a bug (clean exit) will not be restarted — distinguish exit reasons |
+| Membership managed by `HordeMembership` listener | Cluster changes propagate to Horde automatically | If `HordeMembership` crashes before syncing, Horde has stale membership until next restart |
+| One worker per service across the cluster | Consistent circuit breaker state; no per-node duplication | Single worker is a hot spot if that service generates very high check frequency |
+| `Horde.Registry.select/2` for `list_workers` | Enumerates all workers across the cluster | Full scan — O(N) where N is total registered processes; use for monitoring only, not hot paths |
 
-- Usa delta CRDTs para replicación eventual sin coordinación central
-- AP por diseño: disponible durante netsplits, reconcilia después
-- `Horde.Registry` para nombres únicos distribuidos con lookup O(1) local
-- `Horde.DynamicSupervisor` para procesos distribuidos con restart automático en otros nodos
-- La configuración de membership es el punto más crítico — automatizar con libcluster en producción
-- Los trade-offs son reales: eventual consistency implica ventanas de inconsistencia
+Reflection question: `Horde.DynamicSupervisor` distributes processes across nodes using
+consistent hashing on the child spec `id`. When a new node joins the cluster, some workers
+are migrated. During migration, there is a brief period where the worker is restarting on
+the new node but no longer running on the old node. What does `find_worker/1` return during
+this window? How would you build a caller that handles this gracefully?
 
 ---
 
-## What's Next
+## Common production mistakes
 
-- **Exercise 14**: Phoenix PubSub — mensajería distribuida que complementa Horde
-- **Exercise 15**: RPC — invocación de código remoto, diferente al registro de procesos
-- **Exercise 43**: Build a Cache Server — aplicación práctica de los conceptos de distribución
+**1. Not calling `Horde.Cluster.set_members/2` after node changes**
+Horde does not auto-discover nodes. If a new node joins and you never call `set_members`,
+Horde treats the cluster as unchanged. The new node runs `Horde.DynamicSupervisor` and
+`Horde.Registry` but they are isolated from the rest — processes started on the new node
+are not visible to other nodes and vice versa. The symptom: `find_worker/1` returns
+`{:error, :not_found}` for workers that are alive on the new node.
+
+**2. Using `members: :auto` without libcluster**
+The `members: :auto` option in Horde requires libcluster or a compatible cluster formation
+library. If your nodes connect manually via `Node.connect/1` and you set `members: :auto`,
+Horde's member list stays empty. Use `members: []` and manage membership explicitly with
+a `HordeMembership` GenServer.
+
+**3. Treating Horde as a distributed ETS**
+Horde registry lookups are O(1) on the local node but the local copy may be slightly
+stale (eventual consistency). Using Horde for rate limiting counters or session tokens —
+where you need guaranteed global uniqueness — will allow duplicates during netsplits.
+Use Horde for process lifecycle management, not as a distributed counter.
+
+**4. Starting workers without checking `{:error, {:already_started, pid}}`**
+`Horde.DynamicSupervisor.start_child/2` returns `{:error, {:already_started, pid}}`
+if another node started the same worker (same `id`) concurrently. If your code only
+handles `{:ok, pid}`, it crashes on the second caller in a race. Always handle both
+success and already-started as valid outcomes.
+
+**5. Not handling the process restart window**
+When a node crashes, Horde restarts its workers on other nodes — but not instantly.
+The CRDT must propagate, the new supervisor must detect the dead process, and the child
+spec must be re-started. This takes 100ms–2s depending on cluster size and tick intervals.
+During this window, `find_worker/1` returns `{:error, :not_found}`. Callers must
+retry with backoff, not fail immediately.
+
+**6. Using Horde in single-node deployments**
+Horde adds overhead (CRDT synchronization, consistent hashing) that is pure cost on
+a single node. For single-node or test environments, a plain `DynamicSupervisor` is
+faster and simpler. Use Horde only when you have an actual multi-node cluster to benefit from.
 
 ---
 
 ## Resources
 
-- [Horde documentation](https://hexdocs.pm/horde/Horde.html)
-- [Horde GitHub — derekkraan](https://github.com/derekkraan/horde)
-- [DeltaCrdt — la librería CRDT bajo Horde](https://hexdocs.pm/delta_crdt/DeltaCrdt.html)
+- [Horde documentation](https://hexdocs.pm/horde/readme.html)
+- [Horde.DynamicSupervisor](https://hexdocs.pm/horde/Horde.DynamicSupervisor.html)
+- [Horde.Registry](https://hexdocs.pm/horde/Horde.Registry.html)
+- [DeltaCrdt — underlying CRDT library](https://hexdocs.pm/delta_crdt/DeltaCrdt.html)
+- [libcluster — automatic cluster formation](https://hexdocs.pm/libcluster/readme.html)
+- [Horde: a distributed supervisor and registry — Derek Kraan (ElixirConf 2019)](https://www.youtube.com/watch?v=EZFLPG7V7RM)
 - [Understanding CRDTs — Martin Kleppmann](https://martin.kleppmann.com/2020/07/06/crdt-hard-parts-hydra.html)
-- [libcluster — cluster formation automática](https://hexdocs.pm/libcluster/readme.html)
-- [Horde: a distributed supervisor and registry — Derek Kraan's talk](https://www.youtube.com/watch?v=EZFLPG7V7RM)

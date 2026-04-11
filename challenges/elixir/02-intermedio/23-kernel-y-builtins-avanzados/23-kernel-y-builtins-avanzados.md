@@ -1,503 +1,340 @@
-# 23. Kernel y Builtins Avanzados
+# Kernel and Advanced Builtins
 
-**Difficulty**: Intermedio
+**Project**: `task_queue` — built incrementally across the intermediate level
 
-## Prerequisites
-- Completed exercises 01–22
-- Familiarity with maps, nested data structures, and anonymous functions
-- Understanding of GenServer basics (exercise 04)
-- Comfortable with pattern matching and the pipe operator
+---
 
-## Learning Objectives
-After completing this exercise, you will be able to:
-- Invoke functions and anonymous functions dinámicamente con `apply/2` y `apply/3`
-- Leer valores anidados en estructuras de datos con `get_in/2`
-- Actualizar valores anidados de forma inmutable con `put_in/3` y `update_in/3`
-- Eliminar claves anidadas con `pop_in/2`
-- Usar `__MODULE__` para referencias de módulo portables y auto-documentadas
-- Aplicar `Access` para operaciones sobre colecciones anidadas
+## Project context
 
-## Concepts
+`task_queue` needs utilities for dynamic job dispatch, deeply nested configuration access, and portable module references. These use cases are perfect for `apply/3`, `get_in/2`, `put_in/3`, `update_in/3`, and `__MODULE__`.
 
-### apply/2 y apply/3: invocación dinámica
+Project structure at this point:
 
-`apply/3` llama a una función en un módulo dado su nombre como átomo — útil cuando el módulo o la función se determinan en runtime. `apply/2` llama a una función anónima con una lista de argumentos.
-
-```elixir
-# apply/3: módulo, función, lista de argumentos
-apply(String, :upcase, ["hello"])     # => "HELLO"
-apply(Enum, :sum, [[1, 2, 3]])        # => 6
-apply(Map, :get, [%{a: 1}, :a, nil]) # => 1
-
-# apply/2: función anónima, lista de argumentos
-double = fn x -> x * 2 end
-apply(double, [5])   # => 10
-
-# Caso de uso: dispatcher genérico
-def dispatch(module, action, args) do
-  apply(module, action, args)
-end
 ```
-
-`apply` es especialmente útil cuando construyes sistemas de plugins, dispatchers de comandos, o cuando llamas funciones determinadas por configuración en runtime.
-
-### get_in/2: acceso a estructuras anidadas
-
-`get_in/2` acepta una estructura y una lista de claves (el "path"), y navega la estructura siguiendo ese camino. Retorna `nil` si cualquier nivel intermedio no existe, sin lanzar excepción.
-
-```elixir
-user = %{
-  name: "Alice",
-  address: %{
-    city: "Barcelona",
-    zip: "08001",
-    coords: %{lat: 41.3851, lng: 2.1734}
-  }
-}
-
-get_in(user, [:address, :city])          # => "Barcelona"
-get_in(user, [:address, :coords, :lat])  # => 41.3851
-get_in(user, [:address, :country])       # => nil (no existe, no falla)
-```
-
-Con `Access.all()` puedes traversar listas:
-
-```elixir
-catalog = %{
-  products: [
-    %{name: "Widget", price: 10.0},
-    %{name: "Gadget", price: 25.0}
-  ]
-}
-
-get_in(catalog, [:products, Access.all(), :name])
-# => ["Widget", "Gadget"]
-```
-
-### put_in/3 y update_in/3: actualización inmutable
-
-`put_in/3` retorna una copia de la estructura con el valor en el path especificado reemplazado. `update_in/3` toma una función que recibe el valor actual y retorna el nuevo valor.
-
-```elixir
-user = %{profile: %{name: "Bob", score: 100}}
-
-# put_in: establece un valor
-updated = put_in(user, [:profile, :score], 150)
-# => %{profile: %{name: "Bob", score: 150}}
-
-# update_in: transforma el valor actual
-boosted = update_in(user, [:profile, :score], &(&1 + 50))
-# => %{profile: %{name: "Bob", score: 150}}
-
-# update_in sobre listas con Access.all()
-cart = %{items: [%{price: 10}, %{price: 20}]}
-with_tax = update_in(cart, [:items, Access.all(), :price], &(&1 * 1.1))
-# => %{items: [%{price: 11.0}, %{price: 22.0}]}
-```
-
-### pop_in/2: eliminar claves anidadas
-
-`pop_in/2` extrae y retorna el valor en el path, devolviendo una tupla `{valor_eliminado, estructura_actualizada}`.
-
-```elixir
-data = %{user: %{name: "Carol", temp_token: "abc123"}}
-
-{token, clean_data} = pop_in(data, [:user, :temp_token])
-# token      => "abc123"
-# clean_data => %{user: %{name: "Carol"}}
-```
-
-### __MODULE__: referencias de módulo portables
-
-`__MODULE__` es una macro que se expande al átomo del módulo actual en tiempo de compilación. Hace el código más mantenible porque si renombras el módulo, no necesitas actualizar todas las referencias internas.
-
-```elixir
-defmodule MyApp.Cache do
-  @moduledoc "..."
-
-  # Sin __MODULE__ — frágil: si renombras el módulo, esto falla
-  def start_link(opts), do: GenServer.start_link(MyApp.Cache, opts, name: MyApp.Cache)
-
-  # Con __MODULE__ — robusto: se actualiza solo al renombrar
-  def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
-
-  # Útil también en @behaviour y en child specs
-  def child_spec(opts) do
-    %{id: __MODULE__, start: {__MODULE__, :start_link, [opts]}}
-  end
-end
-```
-
-Dentro de un módulo, `__MODULE__` siempre se refiere al módulo que lo contiene. En módulos anidados, cada nivel tiene su propio `__MODULE__`.
-
-### Kernel.binding/0: variables en scope actual
-
-`binding/0` retorna una keyword list con todas las variables actualmente en scope y sus valores. Principalmente útil para debugging y metaprogramación.
-
-```elixir
-x = 42
-name = "Alice"
-Kernel.binding()  # => [name: "Alice", x: 42]
+task_queue/
+├── lib/
+│   └── task_queue/
+│       ├── application.ex
+│       ├── worker.ex
+│       ├── queue_server.ex
+│       ├── scheduler.ex            # ← you add dynamic dispatch here
+│       └── registry.ex
+├── test/
+│   └── task_queue/
+│       └── kernel_builtins_test.exs   # given tests — must pass
+└── mix.exs
 ```
 
 ---
 
-## Exercises
+## The business problem
 
-### Exercise 1: apply/2 y apply/3 en la práctica
+Three concrete problems in `task_queue`:
+
+1. **Dynamic dispatch** — job handlers are determined at runtime from job payloads. `apply/3` lets the scheduler call `MyHandler.execute(args)` without knowing the handler at compile time.
+
+2. **Nested config access** — the job registry stores deeply nested metadata: `%{job_id => %{status: :running, meta: %{retries: 2, last_error: nil}}}`. Reading and updating individual fields without pattern-matching boilerplate requires `get_in` and `update_in`.
+
+3. **Portable module references** — every GenServer in `task_queue` uses `__MODULE__` in `start_link` and `child_spec` so that renaming a module never requires hunting down hardcoded references.
+
+---
+
+## Why `apply/3` and not anonymous functions
+
+```
+job_handler = "TaskQueue.Handlers.Email"   # from job payload
+# You cannot write: job_handler.execute(args)  ← syntax error
+# apply/3 bridges the gap:
+apply(String.to_existing_atom("Elixir.#{job_handler}"), :execute, [args])
+```
+
+This is the foundation of plugin systems, command dispatchers, and any architecture where the module to call is determined from data rather than code.
+
+The risk: `String.to_atom/1` creates atoms permanently. Use `String.to_existing_atom/1` — it only succeeds if the atom was already compiled into the VM, preventing atom table exhaustion from untrusted input.
+
+---
+
+## Why `get_in` and `update_in` and not pattern matching
+
+Pattern matching to read three levels deep is verbose and breaks when the structure changes:
 
 ```elixir
-defmodule DynamicDispatch do
-  @doc """
-  Ejercicio: Usa apply/3 y apply/2 para invocar funciones dinámicamente.
+# Pattern matching — verbose, fragile
+%{^job_id => %{meta: %{retries: retries}}} = registry
+# update is even worse
+
+# get_in/update_in — concise, composable
+retries = get_in(registry, [job_id, :meta, :retries])
+new_registry = update_in(registry, [job_id, :meta, :retries], &(&1 + 1))
+```
+
+When the registry is a list, `Access.all()` lets you batch-update every entry in one expression.
+For a map-based registry, use `Map.new/2` to iterate and rebuild with updated values.
+
+---
+
+## Implementation
+
+### Step 1: `lib/task_queue/scheduler.ex` — dynamic dispatch with apply/3
+
+```elixir
+defmodule TaskQueue.Scheduler do
+  @moduledoc """
+  Dispatches jobs to handler modules determined at runtime.
+
+  Handler modules must implement `execute/1`.
+  The handler name is read from the job's `:handler` field.
   """
 
-  def run do
-    # TODO 1: Usa apply/3 para llamar String.upcase con argumento "hello world"
-    # Almacena el resultado en `upcased`
-    upcased = # TODO
-
-    # TODO 2: Usa apply/3 para llamar Enum.max con [[3, 1, 4, 1, 5, 9]]
-    # Almacena el resultado en `max_val`
-    max_val = # TODO
-
-    # TODO 3: Define una función anónima que recibe dos números y retorna su suma
-    # Luego usa apply/2 para llamarla con argumentos [10, 32]
-    adder = # TODO
-    sum = # TODO (usa apply/2 con adder y [10, 32])
-
-    # TODO 4: Implementa dispatch/3 que toma (module, function_name, args)
-    # y llama la función. Debe funcionar con cualquier módulo y función.
-    # dispatch(String, :reverse, ["elixir"]) => "rixile"
-
-    IO.inspect(upcased, label: "upcase")   # => "HELLO WORLD"
-    IO.inspect(max_val, label: "max")      # => 9
-    IO.inspect(sum, label: "sum")          # => 42
-  end
-
-  # TODO 5: Implementa esta función usando apply/3
-  def dispatch(module, function_name, args) when is_atom(module) and is_atom(function_name) do
-    # PISTA: apply(módulo, átomo_función, lista_args)
-    # TODO
-  end
-end
-
-DynamicDispatch.run()
-```
-
----
-
-### Exercise 2: get_in con maps anidados
-
-```elixir
-defmodule NestedAccess do
-  @user %{
-    id: 1,
-    name: "Alice",
-    address: %{
-      street: "Carrer de Balmes, 42",
-      city: "Barcelona",
-      country: %{
-        code: "ES",
-        name: "Spain"
-      }
-    },
-    preferences: %{
-      theme: "dark",
-      notifications: %{
-        email: true,
-        sms: false
-      }
-    }
-  }
-
-  def run do
-    # TODO 1: Usa get_in para obtener la ciudad del usuario
-    city = # TODO
-    IO.inspect(city)   # => "Barcelona"
-
-    # TODO 2: Usa get_in para obtener el código de país (dos niveles en :address)
-    country_code = # TODO
-    IO.inspect(country_code)   # => "ES"
-
-    # TODO 3: Usa get_in para obtener si las notificaciones SMS están activas
-    sms_enabled = # TODO
-    IO.inspect(sms_enabled)   # => false
-
-    # TODO 4: Usa get_in para acceder a una clave que NO existe (:phone)
-    # dentro de :address. Verifica que retorna nil sin crashear.
-    phone = # TODO
-    IO.inspect(phone)   # => nil
-
-    # TODO 5: Dado este catálogo con lista de productos:
-    catalog = %{
-      products: [
-        %{name: "Widget", category: "tools"},
-        %{name: "Gadget", category: "electronics"},
-        %{name: "Donut", category: "food"}
-      ]
-    }
-    # Usa get_in con Access.all() para obtener la lista de nombres de productos
-    names = # TODO (usa Access.all())
-    IO.inspect(names)   # => ["Widget", "Gadget", "Donut"]
-  end
-end
-
-NestedAccess.run()
-```
-
----
-
-### Exercise 3: put_in para actualización inmutable
-
-```elixir
-defmodule NestedUpdate do
-  def run do
-    user = %{
-      id: 42,
-      profile: %{
-        name: "Bob",
-        email: "bob@example.com",
-        address: %{
-          city: "Madrid",
-          zip: "28001"
-        }
-      }
-    }
-
-    # TODO 1: Usa put_in para cambiar el email a "bob.new@example.com"
-    # PISTA: el path es [:profile, :email]
-    updated_email = # TODO
-    IO.inspect(get_in(updated_email, [:profile, :email]))  # => "bob.new@example.com"
-
-    # TODO 2: Usa put_in para agregar el campo :zip "28050" al address
-    # (reemplaza el valor actual)
-    updated_zip = # TODO
-    IO.inspect(get_in(updated_zip, [:profile, :address, :zip]))  # => "28050"
-
-    # TODO 3: Usa put_in para agregar una clave nueva :country "Spain"
-    # dentro de :address (que no existía antes)
-    with_country = # TODO
-    IO.inspect(get_in(with_country, [:profile, :address, :country]))  # => "Spain"
-
-    # Verifica que user original no fue modificado (inmutabilidad)
-    IO.inspect(user.profile.email)  # => "bob@example.com" (sin cambios)
-  end
-end
-
-NestedUpdate.run()
-```
-
----
-
-### Exercise 4: update_in con Access.all()
-
-```elixir
-defmodule CartOperations do
-  def run do
-    cart = %{
-      user_id: 99,
-      items: [
-        %{name: "Book", price: 15.0, qty: 2},
-        %{name: "Pen", price: 2.5, qty: 10},
-        %{name: "Notebook", price: 8.0, qty: 3}
-      ],
-      discount: 0.0
-    }
-
-    # TODO 1: Usa update_in con Access.all() para aplicar un 10% de impuesto
-    # a todos los precios (multiplica cada :price por 1.1)
-    # PISTA: update_in(cart, [:items, Access.all(), :price], &(&1 * 1.1))
-    with_tax = # TODO
-    IO.inspect(get_in(with_tax, [:items, Access.all(), :price]))
-    # => [16.5, 2.75, 8.8] (aproximado)
-
-    # TODO 2: Usa update_in para incrementar en 1 la qty de todos los items
-    more_items = # TODO
-    IO.inspect(get_in(more_items, [:items, Access.all(), :qty]))
-    # => [3, 11, 4]
-
-    # TODO 3: Usa update_in para establecer el discount a 5.0
-    # PISTA: el path es [:discount], la función puede ser fn _ -> 5.0 end
-    discounted = # TODO
-    IO.inspect(discounted.discount)   # => 5.0
-
-    # TODO 4: Usa pop_in para extraer el primer item del cart
-    # PISTA: Access.at(0) accede al elemento en índice 0 de una lista
-    {first_item, remaining_cart} = pop_in(cart, [:items, Access.at(0)])
-    IO.inspect(first_item.name)          # => "Book"
-    IO.inspect(length(remaining_cart.items))  # => 2
-  end
-end
-
-CartOperations.run()
-```
-
----
-
-### Exercise 5: __MODULE__ en GenServer
-
-```elixir
-defmodule CounterServer do
-  use GenServer
-
-  # TODO 1: Usa __MODULE__ en start_link en lugar de escribir CounterServer
-  # Esto hace el código portable si renombras el módulo
-  def start_link(initial_value \\ 0) do
-    # MAL: GenServer.start_link(CounterServer, initial_value, name: CounterServer)
-    # BIEN: usa __MODULE__ en ambas posiciones
-    GenServer.start_link(# TODO, initial_value, name: # TODO)
-  end
-
-  # TODO 2: Usa __MODULE__ en child_spec para hacer portable el child spec
-  # Un supervisor usará este spec para arrancar el proceso
-  def child_spec(opts) do
-    %{
-      id: # TODO,  # debe ser __MODULE__
-      start: {# TODO, :start_link, [opts]},  # debe ser __MODULE__
-      restart: :permanent,
-      type: :worker
-    }
-  end
-
-  # GenServer callbacks (no modificar)
-  @impl true
-  def init(initial_value), do: {:ok, initial_value}
-
-  @impl true
-  def handle_call(:get, _from, state), do: {:reply, state, state}
-
-  @impl true
-  def handle_cast(:increment, state), do: {:noreply, state + 1}
-
-  # TODO 3: Implementa la función get/0 usando __MODULE__ como nombre del servidor
-  # en GenServer.call. Evita escribir CounterServer explícitamente.
-  def get do
-    GenServer.call(# TODO, :get)
-  end
-
-  # TODO 4: Implementa increment/0 usando __MODULE__
-  def increment do
-    GenServer.cast(# TODO, :increment)
-  end
-
-  # TODO 5: En IEx, verifica que __MODULE__ evalúa al átomo del módulo:
-  # iex> CounterServer.__info__(:module)
-  # CounterServer
-  # iex> # Dentro de un módulo, __MODULE__ se expande en compilación
-  # Prueba: ¿Qué valor tiene __MODULE__ en un módulo anidado?
-
-  defmodule Stats do
-    # TODO: ¿Qué valor retornaría __MODULE__ aquí?
-    # Escribe tu respuesta como comentario
-    # __MODULE__ => ??? (pista: incluye el módulo padre)
-    def module_name, do: __MODULE__
-  end
-end
-
-# Test
-{:ok, _pid} = CounterServer.start_link(0)
-CounterServer.increment()
-CounterServer.increment()
-IO.inspect(CounterServer.get())   # => 2
-IO.inspect(CounterServer.Stats.module_name())  # => CounterServer.Stats
-```
-
----
-
-## Common Mistakes
-
-### apply con función de módulo incorrecta
-
-```elixir
-# MAL: apply/2 espera una función anónima, no un átomo
-apply(:upcase, ["hello"])   # Error
-
-# MAL: apply/3 espera el módulo como átomo, no como string
-apply("String", :upcase, ["hello"])   # Error
-
-# BIEN:
-apply(String, :upcase, ["hello"])     # => "HELLO"
-apply(&String.upcase/1, ["hello"])    # => "HELLO" (con apply/2)
-```
-
-### get_in con atom keys en maps con string keys
-
-```elixir
-# MAL: Si el map tiene keys de string, no funcionan atom keys
-data = %{"name" => "Alice"}
-get_in(data, [:name])     # => nil (no encontró la clave)
-
-# BIEN:
-get_in(data, ["name"])    # => "Alice"
-```
-
-### put_in no crea niveles intermedios inexistentes
-
-```elixir
-# MAL: Si :address no existe, put_in lanza KeyError
-user = %{name: "Bob"}
-put_in(user, [:address, :city], "Madrid")  # ** (KeyError)
-
-# BIEN: asegúrate de que los niveles intermedios existen,
-# o usa Map.put para crear el primer nivel
-user = Map.put(user, :address, %{})
-put_in(user, [:address, :city], "Madrid")  # OK
-```
-
-### __MODULE__ en módulos anidados
-
-```elixir
-defmodule Outer do
-  def outer_module, do: __MODULE__   # => Outer
-
-  defmodule Inner do
-    def inner_module, do: __MODULE__  # => Outer.Inner (no Outer!)
-  end
-end
-```
-
-### update_in con Access.all() modifica la lista original
-
-```elixir
-# update_in siempre retorna una nueva estructura — Elixir es inmutable
-original = %{items: [%{price: 10}]}
-updated = update_in(original, [:items, Access.all(), :price], &(&1 * 2))
-# original.items[0].price sigue siendo 10 — no fue modificado
-```
-
----
-
-## Try It Yourself
-
-Implementa `deep_merge/2`, una función que mezcla dos maps anidados. Para cada clave: si ambos values son maps, hace merge recursivo; si no, el valor del segundo map sobreescribe al primero.
-
-```elixir
-defmodule DeepMerge do
   @doc """
-  Merges two nested maps deeply.
+  Dispatches a job to its handler module using `apply/3`.
+
+  Returns `{:ok, result}` or `{:error, reason}`.
+
+  The handler is resolved from the job's `:handler` key as a module atom.
+  Only atoms that are already compiled into the VM are accepted.
+  """
+  @spec dispatch(map()) :: {:ok, term()} | {:error, term()}
+  def dispatch(%{handler: handler_name, args: args}) when is_atom(handler_name) do
+    # TODO: use apply/3 to call handler_name.execute(args)
+    # Wrap in try/rescue to return {:error, reason} on UndefinedFunctionError
+    # HINT: apply(handler_name, :execute, [args])
+  end
+
+  def dispatch(%{handler: handler_name, args: args}) when is_binary(handler_name) do
+    # TODO: convert handler_name to an existing atom, then delegate to the above clause
+    # HINT: String.to_existing_atom("Elixir.#{handler_name}")
+    # Return {:error, :unknown_handler} if the atom does not exist
+  end
+
+  def dispatch(_), do: {:error, :invalid_job_format}
+
+  @doc """
+  Returns the module name as an atom — useful for logging and child specs.
 
   ## Examples
 
-      iex> DeepMerge.deep_merge(%{a: %{x: 1, y: 2}}, %{a: %{y: 99, z: 3}})
-      %{a: %{x: 1, y: 99, z: 3}}
+      iex> TaskQueue.Scheduler.module_name()
+      TaskQueue.Scheduler
 
-      iex> DeepMerge.deep_merge(%{a: 1, b: 2}, %{b: 99, c: 3})
-      %{a: 1, b: 99, c: 3}
   """
-  def deep_merge(base, override) when is_map(base) and is_map(override) do
-    # TODO: Usa Map.merge/3 con una función de resolución de conflictos.
-    # La función de resolución recibe (key, base_val, override_val).
-    # Si ambos valores son maps, llama deep_merge recursivamente.
-    # Si no, retorna override_val.
-    # PISTA: Map.merge(base, override, fn _key, base_val, override_val -> ... end)
+  def module_name, do: __MODULE__
+end
+```
+
+### Step 2: `lib/task_queue/registry.ex` — nested access patterns
+
+```elixir
+defmodule TaskQueue.Registry do
+  @moduledoc """
+  Tracks running jobs and their metadata.
+
+  State shape:
+      %{job_id => %{status: atom, meta: %{retries: integer, last_error: term}}}
+  """
+
+  use GenServer
+
+  def start_link(opts \\ []) do
+    GenServer.start_link(__MODULE__, %{}, name: __MODULE__)
+  end
+
+  @doc """
+  Registers a new job with initial metadata.
+  """
+  def register(job_id, initial_meta \\ %{}) do
+    GenServer.call(__MODULE__, {:register, job_id, initial_meta})
+  end
+
+  @doc """
+  Returns the retry count for a job.
+  """
+  def get_retries(job_id) do
+    state = GenServer.call(__MODULE__, :get_state)
+    # TODO: use get_in to read state[job_id][:meta][:retries] with default 0
+    # HINT: get_in(state, [job_id, :meta, :retries]) || 0
+  end
+
+  @doc """
+  Increments the retry counter for a job and records the error.
+  Returns the updated registry state.
+  """
+  def record_retry(job_id, error) do
+    GenServer.call(__MODULE__, {:record_retry, job_id, error})
+  end
+
+  @doc """
+  Returns all job IDs currently in the registry.
+  """
+  def list_jobs do
+    state = GenServer.call(__MODULE__, :get_state)
+    Map.keys(state)
+  end
+
+  @doc """
+  Marks all running jobs as :stale (e.g., after a restart).
+  Uses Map.new/2 to batch-update every entry in the map-based registry.
+  """
+  def mark_all_stale do
+    GenServer.call(__MODULE__, :mark_all_stale)
+  end
+
+  @impl true
+  def init(state), do: {:ok, state}
+
+  @impl true
+  def handle_call({:register, job_id, meta}, _from, state) do
+    entry = %{status: :registered, meta: Map.merge(%{retries: 0, last_error: nil}, meta)}
+    {:reply, :ok, Map.put(state, job_id, entry)}
+  end
+
+  @impl true
+  def handle_call({:record_retry, job_id, error}, _from, state) do
+    # TODO: use update_in to increment state[job_id][:meta][:retries] by 1
+    # TODO: use put_in to set state[job_id][:meta][:last_error] to error
+    # TODO: use put_in to set state[job_id][:status] to :retrying
+    # Return {:reply, :ok, new_state}
+    {:reply, :ok, state}
+  end
+
+  @impl true
+  def handle_call(:mark_all_stale, _from, state) do
+    # TODO: set every job's :status to :stale
+    #
+    # Note: Access.all() works on lists, not maps.
+    # For a map of job_id => entry, use Map.new/2 to rebuild with updated entries:
+    #
+    # HINT:
+    # new_state = Map.new(state, fn {job_id, entry} -> {job_id, %{entry | status: :stale}} end)
+    # {:reply, :ok, new_state}
+    {:reply, :ok, state}
+  end
+
+  @impl true
+  def handle_call(:reset, _from, _state) do
+    {:reply, :ok, %{}}
+  end
+
+  @impl true
+  def handle_call(:get_state, _from, state) do
+    {:reply, state, state}
   end
 end
-
-# Tests
-IO.inspect DeepMerge.deep_merge(
-  %{user: %{name: "Alice", prefs: %{theme: "light", lang: "es"}}},
-  %{user: %{prefs: %{theme: "dark"}, role: "admin"}}
-)
-# => %{user: %{name: "Alice", prefs: %{theme: "dark", lang: "es"}, role: "admin"}}
 ```
+
+### Step 3: Given tests — must pass without modification
+
+```elixir
+# test/task_queue/kernel_builtins_test.exs
+defmodule TaskQueue.KernelBuiltinsTest do
+  use ExUnit.Case, async: false
+
+  alias TaskQueue.{Scheduler, Registry}
+
+  setup do
+    # Reset registry state between tests
+    try do
+      GenServer.call(Registry, :reset)
+    rescue
+      _ -> :ok
+    end
+
+    :ok
+  end
+
+  describe "Scheduler.dispatch/1 — apply/3 dispatch" do
+    test "dispatches to a known handler atom" do
+      # TaskQueue.Worker implements execute/1 for testing
+      result = Scheduler.dispatch(%{handler: TaskQueue.Worker, args: %{}})
+      assert match?({:ok, _} | {:error, :missing_required_fields}, result)
+    end
+
+    test "returns error for unknown handler string" do
+      result = Scheduler.dispatch(%{handler: "Unknown.Handler.DoesNotExist", args: %{}})
+      assert {:error, :unknown_handler} = result
+    end
+
+    test "returns error for invalid job format" do
+      assert {:error, :invalid_job_format} = Scheduler.dispatch("not a map")
+    end
+  end
+
+  describe "Registry — nested get_in / update_in" do
+    test "get_retries returns 0 for new job" do
+      Registry.register("job-1")
+      assert Registry.get_retries("job-1") == 0
+    end
+
+    test "record_retry increments retry count" do
+      Registry.register("job-2")
+      Registry.record_retry("job-2", :timeout)
+      Registry.record_retry("job-2", :timeout)
+      assert Registry.get_retries("job-2") == 2
+    end
+
+    test "mark_all_stale updates every job" do
+      Registry.register("job-3")
+      Registry.register("job-4")
+      Registry.mark_all_stale()
+
+      state = GenServer.call(Registry, :get_state)
+      assert Enum.all?(state, fn {_, entry} -> entry.status == :stale end)
+    end
+  end
+
+  describe "__MODULE__ portability" do
+    test "Scheduler.module_name/0 returns the module atom" do
+      assert Scheduler.module_name() == TaskQueue.Scheduler
+    end
+  end
+end
+```
+
+### Step 4: Run the tests
+
+```bash
+mix test test/task_queue/kernel_builtins_test.exs --trace
+```
+
+---
+
+## Trade-off analysis
+
+| Tool | Use case | What to watch for |
+|------|----------|-------------------|
+| `apply/3` | handler name from data | `String.to_existing_atom` over `String.to_atom` |
+| `get_in/2` | read nested path | returns `nil` silently if path is missing |
+| `put_in/3` | write nested path | raises if intermediate key is missing |
+| `update_in/3` | transform nested value | same as `put_in` for missing paths |
+| `Access.all()` | batch update elements in a **list** | works on lists only — use `Map.new/2` for maps |
+| `__MODULE__` | self-reference in GenServers | expands at compile time per module scope |
+
+Reflection question: `put_in(user, [:address, :city], "Madrid")` raises if `:address` does not exist. When is this behavior the right default, and when would silent nil insertion be preferable?
+
+---
+
+## Common production mistakes
+
+**1. `apply/3` with `String.to_atom/1`**
+Atoms are never garbage collected. A job payload from an external source can create unbounded atoms, exhausting the atom table and crashing the VM. Always use `String.to_existing_atom/1`.
+
+**2. `get_in` with atom keys on a map with string keys**
+`get_in(data, [:name])` returns `nil` on `%{"name" => "Alice"}`. String-keyed maps (typical after JSON decode) require string keys: `get_in(data, ["name"])`.
+
+**3. `put_in` on a path with missing intermediate keys**
+`put_in(%{}, [:a, :b], 1)` raises `KeyError`. Create the intermediate levels first or use `Map.put` for the top level.
+
+**4. `__MODULE__` in nested modules**
+Inside `defmodule Outer.Inner`, `__MODULE__` expands to `Outer.Inner`, not `Outer`. This trips developers who copy a GenServer pattern into a nested module expecting the outer name.
+
+**5. `update_in` with `Access.all()` on maps**
+`Access.all()` works on lists. On maps, use `Enum.map/2` and rebuild the map, or iterate with `Map.new/2`.
+
+---
+
+## Resources
+
+- [Kernel module — official docs](https://hexdocs.pm/elixir/Kernel.html)
+- [Access module — official docs](https://hexdocs.pm/elixir/Access.html)
+- [apply/3 — Erlang docs](https://www.erlang.org/doc/man/erlang.html#apply-3)
+- [get_in/put_in/update_in guide](https://hexdocs.pm/elixir/Kernel.html#get_in/2)

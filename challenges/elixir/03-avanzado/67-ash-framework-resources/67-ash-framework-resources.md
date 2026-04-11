@@ -1,108 +1,135 @@
-# Ejercicio 67: Ash Framework — Resources y Actions
+# Ash Framework — Resources and Actions
 
-## Objetivo
-
-Modelar un dominio de negocio usando Ash Framework: definir recursos declarativos,
-acciones con validaciones, relaciones entre recursos y queries avanzadas con filtros,
-ordenamiento y paginación. Ash reemplaza el imperativo Ecto por un DSL declarativo
-donde el framework genera comportamiento a partir de la declaración.
-
-## Conceptos clave
-
-- `use Ash.Resource` — define un recurso con atributos, acciones y relaciones
-- `use Ash.Domain` — agrupa recursos y expone la API pública del dominio
-- Atributos tipados con validaciones inline (`allow_nil?`, `constraints`)
-- Actions por defecto (`defaults [:create, :read, :update, :destroy]`)
-- Custom actions con `argument` y `change`
-- `Ash.Query` para filtrar, ordenar y paginar
-- `AshPostgres.DataLayer` para persistencia en PostgreSQL
+**Project**: `api_gateway` — built incrementally across the advanced level
 
 ---
 
-## Contexto del ejercicio
+## Project context
 
-Estás construyendo el backend de un e-commerce. El dominio tiene tres recursos:
-`Category`, `Product` y `Review`. Debes modelarlos con Ash, implementar acciones
-custom y escribir queries que el frontend consumirá.
+You're building `api_gateway`. The configuration management subsystem is currently
+a collection of ETS lookups and hand-written Ecto changesets. The platform team
+wants to expose service configuration — registered services, route rules, access
+policies — through a structured domain API that is queryable, paginatable, and
+generates its own database migrations.
+
+Ash Framework replaces imperative Ecto + hand-written action logic with a declarative
+resource DSL. Instead of writing `Repo.insert` + changeset + validation functions
+separately, you declare what a resource is and Ash generates the behaviour.
+
+Project structure:
+
+```
+api_gateway/
+├── lib/
+│   └── api_gateway/
+│       ├── config/
+│       │   ├── config.ex                       # Ash.Domain — ← you implement this
+│       │   └── resources/
+│       │       ├── service.ex                  # ← you implement this
+│       │       ├── route_rule.ex               # ← you implement this
+│       │       └── route_rule/
+│       │           └── validations/
+│       │               └── path_format.ex      # ← you implement this
+│       └── config/
+│           └── queries.ex                      # ← you implement this
+├── test/
+│   └── api_gateway/
+│       └── config/
+│           └── service_resource_test.exs       # given tests — must pass without modification
+└── mix.exs
+```
 
 ---
 
-## Parte 1: Domain y recursos base
+## The business problem
 
-### El dominio
+Three read-side operations the platform team needs constantly:
+
+1. **Service registry**: list active services with their upstream URLs and health status —
+   filtered, sorted, paginated. Currently requires three different ETS lookups and a
+   manual sort in application code.
+2. **Route matching**: given an inbound path, find the first matching `RouteRule`.
+   Currently a linear scan of a list loaded fresh from ETS on every request.
+3. **Audit trail**: when a route rule changes (path added, priority shifted), record who
+   changed it and when. Currently nothing — changes are silent.
+
+Ash gives you a queryable, filterable, paginatable domain with validations enforced
+at the resource level, migrations auto-generated from your declarations, and a uniform
+API (`Config.create!/2`, `Config.read!/1`, `Config.update!/2`) that works identically
+whether backed by PostgreSQL (production) or the in-memory data layer (tests).
+
+---
+
+## Why declare resources instead of writing Ecto schemas manually
+
+When you write an Ecto schema by hand, you also write: the changeset function, the
+validation logic, the query helpers, the CRUD functions in a context module, and the
+migration. Each of those is a separate file. Adding a field means touching all five.
+
+Ash collapses all five into one resource declaration. The constraints on an attribute
+are both the migration column constraint and the runtime validation. The `actions` block
+is both the public API and the changeset logic. When you add a field, you add one
+`attribute` line and run `mix ash_postgres.generate_migrations`.
+
+The tradeoff: you give up direct Ecto query control. Ash translates its expression DSL
+to Ecto queries, and that translation is occasionally surprising. For complex analytical
+queries (aggregations over joins with window functions), dropping down to raw Ecto or
+raw SQL is still the right call.
+
+---
+
+## Implementation
+
+### Step 1: `mix.exs` additions
 
 ```elixir
-# lib/shop/shop.ex
-defmodule Shop do
+{:ash, "~> 3.0"},
+{:ash_postgres, "~> 2.0"},
+{:ecto_sql, "~> 3.11"},
+{:postgrex, "~> 0.18"}
+```
+
+### Step 2: Domain — `lib/api_gateway/config/config.ex`
+
+```elixir
+defmodule ApiGateway.Config do
+  @moduledoc """
+  Ash domain for gateway configuration resources.
+
+  All external code calls Config.create!/2, Config.read!/1, etc.
+  Direct access to resource modules is an internal detail.
+  """
+
   use Ash.Domain
 
   resources do
-    resource Shop.Category
-    resource Shop.Product
-    resource Shop.Review
+    resource ApiGateway.Config.Resources.Service
+    resource ApiGateway.Config.Resources.RouteRule
   end
 end
 ```
 
-El dominio es el punto de entrada. Todo código externo llama `Shop.create!(...)`,
-`Shop.read!(...)`, nunca accede al recurso directamente.
-
-### Recurso Category
+### Step 3: Service resource — `lib/api_gateway/config/resources/service.ex`
 
 ```elixir
-# lib/shop/resources/category.ex
-defmodule Shop.Category do
+defmodule ApiGateway.Config.Resources.Service do
+  @moduledoc """
+  A backend service registered in the gateway.
+
+  Attributes:
+  - name: human-readable identifier, unique, 2–64 chars
+  - upstream_url: HTTPS URL the gateway proxies to
+  - status: :active | :draining | :offline
+  - weight: relative weight for load-balancing, 1–100
+  """
+
   use Ash.Resource,
-    domain: Shop,
+    domain: ApiGateway.Config,
     data_layer: AshPostgres.DataLayer
 
   postgres do
-    table "categories"
-    repo Shop.Repo
-  end
-
-  attributes do
-    uuid_primary_key :id
-    attribute :name, :string, allow_nil?: false, public?: true
-    attribute :slug, :string, allow_nil?: false, public?: true
-    attribute :active, :boolean, default: true, public?: true
-    timestamps()
-  end
-
-  actions do
-    defaults [:create, :read, :update, :destroy]
-
-    read :active do
-      filter expr(active == true)
-    end
-  end
-
-  relationships do
-    has_many :products, Shop.Product
-  end
-
-  identities do
-    identity :unique_slug, [:slug]
-  end
-end
-```
-
-`identities` genera constraints de unicidad en la base de datos y validaciones
-en el changeset automáticamente. `expr(...)` usa el DSL de Ash para expresiones
-que se traducen a SQL.
-
-### Recurso Product completo
-
-```elixir
-# lib/shop/resources/product.ex
-defmodule Shop.Product do
-  use Ash.Resource,
-    domain: Shop,
-    data_layer: AshPostgres.DataLayer
-
-  postgres do
-    table "products"
-    repo Shop.Repo
+    table "gateway_services"
+    repo ApiGateway.Repo
   end
 
   attributes do
@@ -111,26 +138,28 @@ defmodule Shop.Product do
     attribute :name, :string do
       allow_nil? false
       public? true
-      constraints min_length: 2, max_length: 200
+      constraints min_length: 2, max_length: 64
     end
 
-    attribute :description, :string, public?: true
-
-    attribute :price, :decimal do
+    attribute :upstream_url, :string do
       allow_nil? false
       public? true
-      constraints min: Decimal.new("0.01")
+      constraints min_length: 8
     end
 
-    attribute :stock, :integer do
-      default 0
+    attribute :status, :atom do
+      constraints one_of: [:active, :draining, :offline]
+      default :active
       allow_nil? false
       public? true
-      constraints min: 0
     end
 
-    attribute :sku, :string, allow_nil?: false, public?: true
-    attribute :active, :boolean, default: true, public?: true
+    attribute :weight, :integer do
+      default 100
+      allow_nil? false
+      public? true
+      constraints min: 1, max: 100
+    end
 
     timestamps()
   end
@@ -138,129 +167,158 @@ defmodule Shop.Product do
   actions do
     defaults [:create, :read, :update, :destroy]
 
-    # Acción custom: incrementar stock
-    update :restock do
-      description "Añade unidades al stock existente"
-
-      argument :quantity, :integer do
-        allow_nil? false
-        constraints min: 1
-      end
-
-      change fn changeset, _ ->
-        current = Ash.Changeset.get_data(changeset, :stock)
-        added = Ash.Changeset.get_argument(changeset, :quantity)
-        Ash.Changeset.change_attribute(changeset, :stock, current + added)
-      end
+    # TODO: implement a :drain action (update) that sets status to :draining.
+    # Use the built-in `change set_attribute/2` — no custom function needed.
+    update :drain do
+      description "Marks the service as draining — no new requests routed to it."
+      # TODO: change set_attribute(:status, :draining)
     end
 
-    # Acción custom: desactivar producto
-    update :deactivate do
-      description "Marca el producto como inactivo sin borrarlo"
-      change set_attribute(:active, false)
+    # TODO: implement a :take_offline action (update) that sets status to :offline.
+    update :take_offline do
+      description "Marks the service as offline."
+      # TODO: change set_attribute(:status, :offline)
     end
 
-    # Read con filtros por defecto
-    read :available do
-      description "Productos activos con stock > 0"
-      filter expr(active == true and stock > 0)
+    # TODO: implement a :activate action (update) that sets status back to :active.
+    update :activate do
+      description "Brings the service back to active status."
+      # TODO: change set_attribute(:status, :active)
     end
 
-    read :by_category do
-      argument :category_id, :uuid, allow_nil?: false
-      filter expr(category_id == ^arg(:category_id))
-    end
-  end
-
-  relationships do
-    belongs_to :category, Shop.Category do
-      allow_nil? false
-      public? true
+    read :active do
+      description "Returns only services with status :active."
+      # TODO: filter expr(status == :active)
     end
 
-    has_many :reviews, Shop.Review
+    read :routable do
+      description "Returns services eligible for routing (active or draining)."
+      # TODO: filter expr(status in [:active, :draining])
+      # TODO: add pagination block: keyset? true, default_limit: 50, countable: true
+    end
   end
 
   identities do
-    identity :unique_sku, [:sku]
+    identity :unique_name, [:name]
   end
 end
 ```
 
-Los `constraints` en atributos se validan antes de tocar la base de datos.
-`set_attribute/2` es un `change` built-in de Ash que evita escribir la función
-manualmente.
-
----
-
-## Parte 2: Recurso con validaciones custom
-
-### Review con validaciones explícitas
+### Step 4: RouteRule resource — `lib/api_gateway/config/resources/route_rule.ex`
 
 ```elixir
-# lib/shop/resources/review.ex
-defmodule Shop.Review do
+defmodule ApiGateway.Config.Resources.RouteRule do
+  @moduledoc """
+  A routing rule: maps an inbound path prefix to a registered Service.
+
+  Priority determines match order — lower number = higher priority.
+  The gateway evaluates rules in ascending priority order and routes
+  to the first matching service.
+  """
+
   use Ash.Resource,
-    domain: Shop,
+    domain: ApiGateway.Config,
     data_layer: AshPostgres.DataLayer
 
   postgres do
-    table "reviews"
-    repo Shop.Repo
+    table "gateway_route_rules"
+    repo ApiGateway.Repo
   end
 
   attributes do
     uuid_primary_key :id
-    attribute :rating, :integer, allow_nil?: false, public?: true
-    attribute :body, :string, public?: true
-    attribute :verified_purchase, :boolean, default: false, public?: true
+
+    attribute :path_prefix, :string do
+      allow_nil? false
+      public? true
+      constraints min_length: 1, max_length: 256
+    end
+
+    attribute :priority, :integer do
+      allow_nil? false
+      public? true
+      constraints min: 1, max: 1000
+    end
+
+    attribute :active, :boolean, default: true, public?: true
+
     timestamps()
   end
 
   validations do
-    # Validación inline con expr DSL
-    validate numericality(:rating, greater_than_or_equal_to: 1, less_than_or_equal_to: 5)
-
-    # Validación custom con módulo
-    validate {Shop.Review.Validations.BodyLength, []}
+    # TODO: add a validation that calls ApiGateway.Config.Resources.RouteRule.Validations.PathFormat
+    # to ensure path_prefix starts with "/" and contains no whitespace.
   end
 
   actions do
-    defaults [:create, :read, :destroy]
+    defaults [:create, :read, :update, :destroy]
 
-    update :mark_verified do
-      change set_attribute(:verified_purchase, true)
+    read :ordered do
+      description "Returns active route rules in ascending priority order."
+      # TODO: filter expr(active == true)
+      # TODO: sort priority: :asc
+    end
+
+    read :for_path do
+      description "Returns rules whose path_prefix is a prefix of the given path."
+      argument :path, :string, allow_nil?: false
+      # TODO: filter expr(active == true and starts_with(^arg(:path), path_prefix))
+      # TODO: sort priority: :asc
+      # TODO: limit 1
+    end
+
+    update :reprioritize do
+      description "Changes the priority of this rule."
+      argument :new_priority, :integer do
+        allow_nil? false
+        constraints min: 1, max: 1000
+      end
+      # TODO: change fn changeset, _ ->
+      #   Ash.Changeset.change_attribute(changeset, :priority,
+      #     Ash.Changeset.get_argument(changeset, :new_priority))
+      # end
     end
   end
 
   relationships do
-    belongs_to :product, Shop.Product, allow_nil?: false, public?: true
+    belongs_to :service, ApiGateway.Config.Resources.Service do
+      allow_nil? false
+      public? true
+    end
   end
 end
 ```
 
-### Validación custom como módulo
+### Step 5: PathFormat validation — `lib/api_gateway/config/resources/route_rule/validations/path_format.ex`
 
 ```elixir
-# lib/shop/resources/review/validations/body_length.ex
-defmodule Shop.Review.Validations.BodyLength do
+defmodule ApiGateway.Config.Resources.RouteRule.Validations.PathFormat do
+  @moduledoc """
+  Validates that path_prefix starts with "/" and contains no whitespace.
+
+  A route rule with path_prefix "/api/v1" matches requests to "/api/v1/users"
+  but not to "api/v1/users" (missing leading slash). Whitespace in a path prefix
+  would never match real HTTP requests.
+  """
+
   use Ash.Resource.Validation
 
   @impl true
   def validate(changeset, _opts, _context) do
-    body = Ash.Changeset.get_attribute(changeset, :body)
+    path = Ash.Changeset.get_attribute(changeset, :path_prefix)
 
     cond do
-      is_nil(body) ->
+      is_nil(path) ->
+        # allow_nil? false on the attribute will catch this separately
         :ok
 
-      String.length(body) < 10 ->
-        {:error,
-         field: :body,
-         message: "debe tener al menos 10 caracteres si se incluye"}
+      not String.starts_with?(path, "/") ->
+        # TODO: return {:error, field: :path_prefix, message: "must start with /"}
+        :ok
 
-      String.length(body) > 2000 ->
-        {:error, field: :body, message: "no puede superar 2000 caracteres"}
+      String.match?(path, ~r/\s/) ->
+        # TODO: return {:error, field: :path_prefix, message: "must not contain whitespace"}
+        :ok
 
       true ->
         :ok
@@ -269,256 +327,257 @@ defmodule Shop.Review.Validations.BodyLength do
 end
 ```
 
-Las validaciones custom implementan `Ash.Resource.Validation` y devuelven `:ok`
-o `{:error, keyword_list}`. Ash las ejecuta en el orden declarado antes de
-persistir.
-
----
-
-## Parte 3: Ash.Query — filtros, ordenamiento y paginación
-
-### Queries básicas
+### Step 6: Query helpers — `lib/api_gateway/config/queries.ex`
 
 ```elixir
-# lib/shop/queries.ex
-defmodule Shop.Queries do
+defmodule ApiGateway.Config.Queries do
+  @moduledoc """
+  Composable Ash.Query helpers for common gateway configuration reads.
+  """
+
   import Ash.Query
 
-  # Productos baratos con stock
-  def cheap_available(max_price) do
-    Shop.Product
-    |> filter(active == true and stock > 0 and price <= ^max_price)
-    |> sort(price: :asc)
-    |> limit(20)
-  end
+  alias ApiGateway.Config.Resources.{Service, RouteRule}
+  alias ApiGateway.Config
 
-  # Búsqueda por nombre (case-insensitive)
-  def search_by_name(term) do
-    Shop.Product
-    |> filter(contains(name, ^term))
-    |> sort(inserted_at: :desc)
-  end
-
-  # Productos de una categoría, ordenados por rating promedio
-  def by_category_sorted(category_id) do
-    Shop.Product
-    |> filter(category_id == ^category_id and active == true)
+  @doc "Returns active services ordered by name ascending."
+  def active_services do
+    Service
+    |> filter(status == :active)
     |> sort(name: :asc)
   end
-end
-```
 
-### Paginación con keyset
+  @doc "Returns all services for a given status."
+  def services_by_status(status) do
+    # TODO: filter Service by status == ^status, sort by name: :asc
+  end
 
-```elixir
-defmodule Shop.ProductList do
-  def paginated(params) do
-    page_opts = [
-      count: true,         # incluye total en el resultado
-      limit: params[:limit] || 20,
-      after: params[:cursor]  # keyset cursor para paginación eficiente
-    ]
+  @doc "Returns active route rules sorted by priority ascending."
+  def ordered_rules do
+    RouteRule
+    |> filter(active == true)
+    |> sort(priority: :asc)
+  end
 
-    Shop.Product
-    |> Ash.Query.filter(active == true)
-    |> Ash.Query.sort(inserted_at: :desc)
-    |> Shop.read!(page: page_opts)
+  @doc """
+  Returns the highest-priority active rule whose path_prefix is a prefix of `path`.
+  Returns nil if no rule matches.
+  """
+  def match_rule(path) when is_binary(path) do
+    # TODO: filter RouteRule where active == true and starts_with(^path, path_prefix)
+    # TODO: sort priority: :asc
+    # TODO: limit 1
+    # TODO: Ash.Query.load([:service]) to preload the target service
+    # TODO: call Config.read!/1 and return hd(results) or nil
   end
 end
 ```
 
-Ash soporta dos modos de paginación: `offset` (simple, menos eficiente) y
-`keyset` (cursor-based, O(1) en seek). El recurso debe declarar qué modo admite:
+### Step 7: Migration — `priv/repo/migrations/TIMESTAMP_create_gateway_config.exs`
+
+Run `mix ash_postgres.generate_migrations --name create_gateway_config` to let Ash
+generate this from the resource declarations. The output should be equivalent to:
 
 ```elixir
-# Dentro del bloque actions del recurso:
-read :list do
-  pagination do
-    keyset? true
-    default_limit 20
-    max_page_size 100
-    countable true
-  end
-end
-```
-
----
-
-## Parte 4: Uso desde código de aplicación
-
-### Crear y actualizar recursos
-
-```elixir
-defmodule Shop.ProductService do
-  # Crear un producto
-  def create_product(attrs) do
-    Shop.Product
-    |> Ash.Changeset.for_create(:create, attrs)
-    |> Shop.create()
-    # Devuelve {:ok, product} | {:error, %Ash.Error{}}
-  end
-
-  # Restockear (acción custom)
-  def restock(product_id, quantity) do
-    with {:ok, product} <- get_product(product_id) do
-      product
-      |> Ash.Changeset.for_update(:restock, %{quantity: quantity})
-      |> Shop.update()
-    end
-  end
-
-  # Leer con query
-  def available_under(max_price) do
-    Shop.Product
-    |> Ash.Query.filter(active == true and price <= ^max_price)
-    |> Ash.Query.sort(:price)
-    |> Shop.read!()
-  end
-
-  defp get_product(id) do
-    Shop.get(Shop.Product, id)
-    # {:ok, product} | {:error, %Ash.Error.Query.NotFound{}}
-  end
-end
-```
-
-### Manejo de errores de Ash
-
-```elixir
-defmodule Shop.ErrorHandler do
-  def handle({:error, %Ash.Error.Invalid{} = error}) do
-    # Errores de validación: atributos inválidos, constraints, etc.
-    errors =
-      error.errors
-      |> Enum.map(&format_invalid_error/1)
-
-    {:unprocessable, errors}
-  end
-
-  def handle({:error, %Ash.Error.Query.NotFound{}}) do
-    {:not_found, "Recurso no encontrado"}
-  end
-
-  def handle({:error, error}) do
-    {:internal_error, Exception.message(error)}
-  end
-
-  defp format_invalid_error(%{field: field, message: msg}),
-    do: %{field: field, message: msg}
-
-  defp format_invalid_error(error),
-    do: %{field: nil, message: Exception.message(error)}
-end
-```
-
----
-
-## Parte 5: Migraciones con AshPostgres
-
-```bash
-# Generar migración desde los recursos Ash
-mix ash_postgres.generate_migrations --name add_shop_resources
-
-# Ash analiza los recursos y genera la migración automáticamente
-# lib/shop/repo/migrations/20260101000001_add_shop_resources.exs
-```
-
-```elixir
-defmodule Shop.Repo.Migrations.AddShopResources do
+defmodule ApiGateway.Repo.Migrations.CreateGatewayConfig do
   use Ecto.Migration
 
   def change do
-    create table(:categories, primary_key: false) do
+    create table(:gateway_services, primary_key: false) do
       add :id, :uuid, null: false, primary_key: true
       add :name, :string, null: false
-      add :slug, :string, null: false
-      add :active, :boolean, default: true, null: false
+      add :upstream_url, :string, null: false
+      add :status, :string, null: false, default: "active"
+      add :weight, :integer, null: false, default: 100
       timestamps(type: :utc_datetime_usec)
     end
 
-    create unique_index(:categories, [:slug])
+    create unique_index(:gateway_services, [:name])
+    create index(:gateway_services, [:status])
 
-    create table(:products, primary_key: false) do
+    create table(:gateway_route_rules, primary_key: false) do
       add :id, :uuid, null: false, primary_key: true
-      add :name, :string, null: false
-      add :description, :text
-      add :price, :decimal, null: false
-      add :stock, :integer, default: 0, null: false
-      add :sku, :string, null: false
-      add :active, :boolean, default: true, null: false
-      add :category_id, references(:categories, type: :uuid, on_delete: :restrict), null: false
+      add :path_prefix, :string, null: false
+      add :priority, :integer, null: false
+      add :active, :boolean, null: false, default: true
+      add :service_id,
+          references(:gateway_services, type: :uuid, on_delete: :restrict),
+          null: false
       timestamps(type: :utc_datetime_usec)
     end
 
-    create unique_index(:products, [:sku])
-    create index(:products, [:category_id])
-    create index(:products, [:active, :price])
-
-    create table(:reviews, primary_key: false) do
-      add :id, :uuid, null: false, primary_key: true
-      add :rating, :integer, null: false
-      add :body, :text
-      add :verified_purchase, :boolean, default: false, null: false
-      add :product_id, references(:products, type: :uuid, on_delete: :delete_all), null: false
-      timestamps(type: :utc_datetime_usec)
-    end
-
-    create index(:reviews, [:product_id])
+    create index(:gateway_route_rules, [:active, :priority])
+    create index(:gateway_route_rules, [:service_id])
   end
 end
 ```
 
-Ash genera y gestiona las migraciones. Si cambias un atributo en el recurso,
-el siguiente `generate_migrations` detecta el diff y crea la migración delta.
-
----
-
-## Ejercicio propuesto
-
-Implementa lo siguiente:
-
-1. Añade al recurso `Product` una acción `:apply_discount` que reciba un
-   argumento `percent` (integer, 1..99) y reduzca el precio proporcionalmente.
-   Usa `Decimal.mult/2` y `Decimal.div/2`.
-
-2. Escribe una query `Shop.Queries.top_reviewed/1` que dado un `category_id`
-   devuelva los productos con al menos una review, ordenados por `rating` desc.
-   Pista: necesitas cargar la relación `:reviews` con `Ash.Query.load/2`.
-
-3. Añade una acción `read :search` en `Product` que acepte un argumento
-   `:term` y filtre por `contains(name, ^arg(:term))`.
-
-4. Implementa `Shop.ErrorHandler.handle/1` para el caso
-   `%Ash.Error.Changes.InvalidAttribute{}` (campo inválido específico).
-
----
-
-## Configuración del proyecto
+### Step 8: Given tests — must pass without modification
 
 ```elixir
-# mix.exs
-defp deps do
-  [
-    {:ash, "~> 3.0"},
-    {:ash_postgres, "~> 2.0"},
-    {:ecto_sql, "~> 3.11"},
-    {:postgrex, "~> 0.18"}
-  ]
+# test/api_gateway/config/service_resource_test.exs
+defmodule ApiGateway.Config.Resources.ServiceTest do
+  use ApiGateway.DataCase, async: true
+
+  alias ApiGateway.Config
+  alias ApiGateway.Config.Resources.Service
+
+  defp create_service(attrs \\ %{}) do
+    defaults = %{
+      name: "svc-#{:rand.uniform(9_999_999)}",
+      upstream_url: "https://upstream.internal/api",
+      status: :active,
+      weight: 100
+    }
+
+    Service
+    |> Ash.Changeset.for_create(:create, Map.merge(defaults, attrs))
+    |> Config.create!()
+  end
+
+  test "create/2 inserts a service and returns it" do
+    svc = create_service(name: "auth-service", weight: 80)
+    assert svc.name == "auth-service"
+    assert svc.status == :active
+    assert svc.weight == 80
+  end
+
+  test "create/2 fails when name is too short" do
+    assert_raise Ash.Error.Invalid, fn ->
+      create_service(name: "x")
+    end
+  end
+
+  test "drain/1 sets status to :draining" do
+    svc = create_service()
+
+    updated =
+      svc
+      |> Ash.Changeset.for_update(:drain, %{})
+      |> Config.update!()
+
+    assert updated.status == :draining
+  end
+
+  test "take_offline/1 sets status to :offline" do
+    svc = create_service()
+
+    updated =
+      svc
+      |> Ash.Changeset.for_update(:take_offline, %{})
+      |> Config.update!()
+
+    assert updated.status == :offline
+  end
+
+  test "activate/1 restores :active after offline" do
+    svc = create_service()
+
+    offline =
+      svc
+      |> Ash.Changeset.for_update(:take_offline, %{})
+      |> Config.update!()
+
+    assert offline.status == :offline
+
+    restored =
+      offline
+      |> Ash.Changeset.for_update(:activate, %{})
+      |> Config.update!()
+
+    assert restored.status == :active
+  end
+
+  test "read :active returns only active services" do
+    _active = create_service(status: :active)
+    draining = create_service(status: :draining)
+
+    active_ids =
+      Service
+      |> Ash.Query.for_read(:active)
+      |> Config.read!()
+      |> Enum.map(& &1.id)
+
+    refute draining.id in active_ids
+  end
+
+  test "path_format validation rejects path without leading slash" do
+    svc = create_service()
+
+    assert_raise Ash.Error.Invalid, fn ->
+      ApiGateway.Config.Resources.RouteRule
+      |> Ash.Changeset.for_create(:create, %{
+        path_prefix: "api/v1",
+        priority: 10,
+        service_id: svc.id,
+        active: true
+      })
+      |> Config.create!()
+    end
+  end
 end
 ```
 
-```elixir
-# config/config.exs
-config :my_app, :ash_domains, [Shop]
+### Step 9: Run the tests
 
-config :ash, :use_all_identities_in_manage_relationship?, false
+```bash
+mix test test/api_gateway/config/ --trace
 ```
 
 ---
 
-## Referencias
+## Trade-off analysis
 
-- [Ash Framework Docs](https://hexdocs.pm/ash)
-- [AshPostgres](https://hexdocs.pm/ash_postgres)
-- [Ash.Query](https://hexdocs.pm/ash/Ash.Query.html)
-- [Ash.Changeset](https://hexdocs.pm/ash/Ash.Changeset.html)
+| Aspect | Ash resource | Hand-written Ecto + context | Raw SQL |
+|--------|-------------|-----------------------------|---------| 
+| Boilerplate | Minimal (one file per resource) | High (schema + changeset + context) | None |
+| Query composability | Ash.Query DSL | Ecto.Query DSL | Raw string |
+| Generated migrations | `mix ash_postgres.generate_migrations` | `mix ecto.gen.migration` (manual) | Manual |
+| Complex joins/windows | Drops to raw Ecto | Native | Native |
+| Learning curve | High (new DSL, new mental model) | Medium | Low |
+| Multi-tenancy support | Built-in | Manual | Manual |
+| Policy/authorisation | Built-in (`Ash.Policy.Authorizer`) | Manual | Manual |
+
+Reflection question: `identities do identity :unique_name, [:name] end` generates both
+a database unique index and a runtime uniqueness validation. If two processes call
+`Config.create!/2` with the same name at the same millisecond, what happens? Does Ash
+prevent the race or does the database constraint prevent it? What error does the caller
+receive, and how does it differ from the error returned when validation fails at the
+Ash layer before touching the database?
+
+---
+
+## Common production mistakes
+
+**1. Calling resource modules directly instead of through the domain**
+`ApiGateway.Config.Resources.Service.create!(attrs)` bypasses the domain. Policies,
+hooks, and domain-level configuration do not apply. Always call `Config.create!/2`.
+
+**2. Forgetting `public?: true` on attributes**
+Attributes without `public?: true` are not exposed through AshJsonApi or AshGraphql.
+The attribute exists in the database but is invisible to API consumers with no error
+message to explain why.
+
+**3. Using `mix ecto.gen.migration` for Ash resources**
+Ash tracks its own resource schema separately from Ecto migrations. If you write a
+migration by hand that Ash did not generate, `mix ash_postgres.generate_migrations`
+will detect a drift and generate a conflicting migration.
+
+**4. `constraints min: 0` does not mean optional**
+`constraints min: 0` sets a lower bound on the value. `allow_nil?: false` controls
+whether the attribute can be absent. You need both to express "required integer >= 0".
+
+**5. Replaying actions in tests without resetting the domain**
+If you use `async: true` with `DataCase` and multiple tests insert services with the
+same name, the unique constraint fails. Use randomized names in test fixtures (as shown
+above) or wrap each test in a transaction that is rolled back.
+
+---
+
+## Resources
+
+- [Ash Framework — Resources](https://hexdocs.pm/ash/resources.html) — attributes, actions, identities
+- [AshPostgres — Migrations](https://hexdocs.pm/ash_postgres/migrations-and-tasks.html) — generate_migrations, snapshots
+- [Ash.Query DSL](https://hexdocs.pm/ash/Ash.Query.html) — filter, sort, limit, load
+- [Ash.Changeset](https://hexdocs.pm/ash/Ash.Changeset.html) — for_create, for_update, get_argument
+- [Ash.Resource.Validation behaviour](https://hexdocs.pm/ash/Ash.Resource.Validation.html) — custom validation modules

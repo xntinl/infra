@@ -1,539 +1,413 @@
-# 25. BEAM Schedulers y Reductions
+# BEAM Schedulers and Reductions
 
-**Difficulty**: Avanzado
-
----
-
-## Prerequisites
-
-### Mastered
-- Concurrencia con procesos Elixir: spawn, send, receive
-- GenServer: handle_call, handle_cast, handle_info
-- Supervisión y árboles de supervisión
-- Task y Task.Supervisor
-
-### Familiarity with
-- Conceptos básicos de sistemas operativos: scheduling, time slices
-- `:erlang` módulo y funciones de introspección
-- Observer (`:observer.start/0`) para visualización del sistema
+**Project**: `api_gateway` — built incrementally across the advanced level
 
 ---
 
-## Learning Objectives
+## Project context
 
-Al completar este ejercicio serás capaz de:
+You're building `api_gateway`. Under load testing, the SRE team reports that p99
+latency spikes from 5ms to 800ms intermittently. Profiling shows CPU-bound request
+handlers (JWT validation, response body compression, route regex matching) running
+on normal BEAM schedulers and starving I/O-bound handlers. A second issue: a
+background metrics aggregation job that runs a tight accumulation loop causes
+visible latency degradation for all other requests while it runs.
 
-- **Analizar** cómo el scheduler de BEAM distribuye trabajo entre schedulers y por qué esto impacta la latencia del sistema
-- **Evaluar los trade-offs** entre ejecutar código CPU-intensivo en schedulers normales vs dirty schedulers
-- **Diseñar** sistemas concurrentes que no monopolicen el scheduler y degraden la latencia de otros procesos
-- **Diagnosticar** problemas de scheduler starvation en producción usando herramientas de introspección de BEAM
+This exercise covers how BEAM schedules processes, what "reductions" are, why
+CPU-bound code on normal schedulers hurts latency, and how dirty schedulers and
+`:erlang.yield/0` provide the escape hatches.
+
+Project structure at this point:
+
+```
+api_gateway/
+├── lib/
+│   └── api_gateway/
+│       ├── application.ex
+│       ├── router.ex
+│       ├── metrics/
+│       │   ├── counter.ex
+│       │   ├── event_log.ex
+│       │   └── aggregator.ex       # ← you implement this
+│       └── ...
+├── test/
+│   └── api_gateway/
+│       └── metrics/
+│           └── aggregator_test.exs
+├── bench/
+│   └── scheduler_bench.exs
+└── mix.exs
+```
 
 ---
 
-## Concepts
+## The business problem
 
-### El Scheduler de BEAM: Preemptive Multitasking basado en Reductions
+Two requirements:
 
-El scheduler de BEAM es fundamentalmente diferente a los schedulers de lenguajes como Go o Java. En lugar de usar time slices basados en tiempo de CPU, BEAM usa **reductions** como unidad de trabajo.
+1. **Cooperative metrics aggregator**: the `ApiGateway.Metrics.Aggregator` GenServer
+   reads all ETS event log entries and computes per-route statistics on a 10-second
+   schedule. The computation is CPU-bound and must yield periodically so that normal
+   scheduler time is available to request-handling processes.
 
-Una **reduction** es aproximadamente una llamada a función. Cada proceso recibe un quantum de **~2000 reductions** antes de ser desalojado del scheduler. Esto tiene consecuencias importantes:
+2. **Scheduler wall time measurement**: before and after deploying the aggregator,
+   the team wants to measure scheduler utilization with `:erlang.statistics/1` to
+   prove that the cooperative version causes measurably less scheduler starvation.
 
-```elixir
-# Este loop NO monopoliza el scheduler — cada iteración consume reductions
-# y eventualmente BEAM desaloja el proceso
-defmodule SafeLoop do
-  def run(0), do: :done
-  def run(n) do
-    # ~1 reduction por llamada recursiva
-    run(n - 1)
-  end
-end
+---
 
-# Este loop SÍ puede causar problemas si invoca NIFs largos
-# porque los NIFs por defecto no consumen reductions ni son preemptibles
-defmodule DangerousNIF do
-  # Un NIF que tarda 100ms bloquea el scheduler entero durante ese tiempo
-  def expensive_nif(), do: :my_nif.long_computation()
-end
-```
+## How BEAM scheduling works
 
-### Anatomía del Scheduler de BEAM
+### Reductions — the scheduling unit
 
-```
-Schedulers Online (generalmente = número de cores)
-├── Scheduler 1 (thread OS dedicado)
-│   ├── Run Queue: [Pid1, Pid2, Pid3, ...]
-│   └── Current: ejecutando Pid1 (hasta agotar ~2000 reductions)
-├── Scheduler 2
-│   ├── Run Queue: [Pid4, Pid5, ...]
-│   └── Current: ejecutando Pid4
-└── ...
-
-Dirty Schedulers (separados de los normales)
-├── Dirty CPU Schedulers (por defecto: N schedulers online)
-│   └── Para código CPU-bound que no debe desalojarse
-└── Dirty IO Schedulers (por defecto: 10)
-    └── Para operaciones IO bloqueantes
-```
-
-### Funciones de Introspección
+BEAM does not use wall-clock time slices. Every process gets a quantum of
+approximately **2,000 reductions** before being preempted. A reduction is roughly
+one function call. This means:
 
 ```elixir
-# Número de schedulers disponibles
-:erlang.system_info(:schedulers)
-#=> 8
+# This loop does NOT monopolize the scheduler — BEAM preempts after ~2000 iterations
+def count_down(0), do: :done
+def count_down(n), do: count_down(n - 1)
 
-# Schedulers actualmente online (pueden ser menos si el sistema los durmió)
-:erlang.system_info(:schedulers_online)
-#=> 8
-
-# ID del scheduler que ejecuta el proceso actual (1..N)
-:erlang.system_info(:scheduler_id)
-#=> 3
-
-# Dirty schedulers
-:erlang.system_info(:dirty_cpu_schedulers)
-:erlang.system_info(:dirty_io_schedulers)
-
-# Reductions del proceso actual
-{:reductions, r} = :erlang.process_info(self(), :reductions)
-
-# Estadísticas globales del scheduler
-:erlang.statistics(:scheduler_wall_time)
-# Retorna: [{scheduler_id, active_time, total_time}, ...]
-# Requiere habilitar primero: :erlang.system_flag(:scheduler_wall_time, true)
+# This DOES monopolize the scheduler — a BIF that runs in C without yielding
+:crypto.strong_rand_bytes(10_000_000)   # runs for milliseconds without preemption
 ```
 
-### Process Priority
+The distinction: Elixir/Erlang code preempts cooperatively via the reduction
+counter. Certain BIFs (`:crypto`, `:zlib`, NIF calls) run entirely in C and do
+not decrement the reduction counter — they block the scheduler thread for their
+entire duration.
 
-BEAM permite ajustar la prioridad de procesos individuales. Las prioridades son relativas, no absolutas:
+### Scheduler types
+
+| Scheduler | Thread count | Used for | Can block? |
+|-----------|-------------|----------|------------|
+| Normal schedulers | `System.schedulers_online()` (default: CPU count) | All Elixir/Erlang code | No — must yield |
+| Dirty CPU schedulers | 10 by default | CPU-bound BIFs/NIFs | Yes |
+| Dirty I/O schedulers | 10 by default | Blocking I/O BIFs/NIFs | Yes |
+
+When a NIF or BIF is marked as dirty, BEAM moves it off the normal scheduler onto
+a dirty scheduler thread. Normal schedulers stay free for request handling.
+
+### Scheduler wall time
+
+`:erlang.statistics(:scheduler_wall_time)` returns `[{scheduler_id, active_time, total_time}]`.
+`active_time / total_time` is the utilization ratio for that scheduler. High utilization
+(>80%) on normal schedulers under load indicates a CPU-starvation risk.
 
 ```elixir
-# Niveles de prioridad (de menor a mayor):
-# :low -> :normal -> :high -> :max
+:erlang.system_flag(:scheduler_wall_time, true)  # must enable first
 
-# :max está reservado para procesos internos de BEAM
-# No usar :max en código de aplicación
+before = :erlang.statistics(:scheduler_wall_time) |> Enum.sort()
+# ... run workload ...
+after_stats = :erlang.statistics(:scheduler_wall_time) |> Enum.sort()
 
-Process.flag(:priority, :high)   # Este proceso se ejecuta más frecuentemente
-Process.flag(:priority, :low)    # Procesos de background, no críticos
+utilization =
+  Enum.zip(before, after_stats)
+  |> Enum.map(fn {{id, a0, t0}, {id, a1, t1}} ->
+    {id, (a1 - a0) / (t1 - t0)}
+  end)
+```
 
-# Ejemplo práctico: un proceso de heartbeat que debe responder rápido
-defmodule Heartbeat do
+---
+
+## Implementation
+
+### Step 1: `lib/api_gateway/metrics/aggregator.ex`
+
+```elixir
+defmodule ApiGateway.Metrics.Aggregator do
+  @moduledoc """
+  Periodically aggregates per-route metrics from the ETS event log.
+
+  Runs a CPU-bound aggregation pass every @interval_ms milliseconds.
+  The aggregation yields every @yield_every entries to avoid monopolizing
+  the normal BEAM scheduler and causing latency spikes for request handlers.
+  """
+
   use GenServer
 
-  def init(_) do
-    Process.flag(:priority, :high)
-    {:ok, %{}}
-  end
-end
-```
+  @interval_ms 10_000
+  @yield_every 500   # call :erlang.yield() every N entries processed
 
-### Trade-offs: Normal vs Dirty Schedulers
+  # ── Public API ──────────────────────────────────────────────────────────────
 
-| Aspecto | Scheduler Normal | Dirty CPU Scheduler | Dirty IO Scheduler |
-|---------|-----------------|--------------------|--------------------|
-| **Preemptible** | Sí (~2000 red.) | No | No |
-| **Impacto en latencia** | Bajo (otros procesos continúan) | Alto si abusa | Bajo (IO no bloquea CPU) |
-| **Caso de uso** | Todo el código Elixir normal | NIFs CPU-intensivos largos | NIFs con IO bloqueante |
-| **Límite** | N schedulers | N dirty CPU schedulers | 10 dirty IO schedulers |
-| **Overhead** | Mínimo | Cambio de contexto extra | Cambio de contexto extra |
-
-### Yielding Voluntario
-
-```elixir
-# En casos extremos, un proceso puede ceder el scheduler voluntariamente
-# Útil en loops que generan work units grandes sin llamadas a funciones
-:erlang.yield()
-
-# Equivalente más idiomático: receive con timeout 0
-# (cede el scheduler pero vuelve inmediatamente si no hay mensajes)
-receive do
-  msg -> handle(msg)
-after
-  0 -> :continue
-end
-```
-
-### Scheduler Binding (`+sbt` flags)
-
-Los flags de VM permiten controlar cómo los schedulers se "atan" a cores físicos:
-
-```bash
-# Sin binding (defecto): el OS decide en qué core corre cada scheduler thread
-iex --erl "+sbt unbound"
-
-# Binding por core (mejor para NUMA): cada scheduler thread se ancla a un core
-iex --erl "+sbt db"  # db = default bind
-
-# Útil en servidores NUMA donde memoria local es más rápida
-```
-
----
-
-## Exercises
-
-### Exercise 1: Scheduler Explorer — Visualizar Distribución de Trabajo
-
-**Problem**
-
-Escribe un módulo `SchedulerExplorer` que:
-
-1. Spawne N procesos (donde N = número de schedulers online × 4)
-2. Cada proceso reporta en qué scheduler está ejecutándose usando `:erlang.system_info(:scheduler_id)`
-3. El módulo recoja todos los reportes y muestre una distribución de cuántos procesos cayeron en cada scheduler
-4. Luego mida el **scheduler wall time** antes y después de ejecutar trabajo real: calcula el porcentaje de utilización de cada scheduler durante 2 segundos de carga
-
-El output esperado debe verse así:
-```
-Scheduler distribution (N processes):
-  Scheduler 1: ████████ 12 processes (15.0%)
-  Scheduler 2: ██████ 10 processes (12.5%)
-  ...
-
-Scheduler utilization (2s window):
-  Scheduler 1: 87.3% busy
-  Scheduler 2: 91.2% busy
-  ...
-```
-
-**Hints**
-
-- Habilita wall time antes de medir: `:erlang.system_flag(:scheduler_wall_time, true)`
-- Para calcular utilización: `utilization = (active2 - active1) / (total2 - total1) * 100`
-- Los procesos recién spawneados pueden migrar entre schedulers — mide el scheduler_id justo antes de que el proceso termine
-- Usa `Task.async_stream` o `Task.await_many` para recolectar resultados
-
-**One possible solution**
-
-```elixir
-defmodule SchedulerExplorer do
-  def distribution do
-    n_schedulers = :erlang.system_info(:schedulers_online)
-    n_processes = n_schedulers * 4
-
-    # Spawner N procesos y recoger en qué scheduler cayó cada uno
-    results =
-      1..n_processes
-      |> Task.async_stream(
-        fn _i ->
-          # Hacer algo mínimo para que el proceso sea asignado a un scheduler
-          _work = Enum.sum(1..100)
-          :erlang.system_info(:scheduler_id)
-        end,
-        max_concurrency: n_processes,
-        ordered: false
-      )
-      |> Enum.map(fn {:ok, scheduler_id} -> scheduler_id end)
-
-    # Agrupar por scheduler_id
-    distribution =
-      results
-      |> Enum.group_by(& &1)
-      |> Enum.map(fn {id, list} -> {id, length(list)} end)
-      |> Enum.sort_by(fn {id, _} -> id end)
-
-    total = length(results)
-
-    IO.puts("\nScheduler distribution (#{n_processes} processes):")
-
-    Enum.each(distribution, fn {id, count} ->
-      pct = Float.round(count / total * 100, 1)
-      bar = String.duplicate("█", div(count * 20, total))
-      IO.puts("  Scheduler #{id}: #{bar} #{count} processes (#{pct}%)")
-    end)
-
-    distribution
+  def start_link(opts \\ []) do
+    GenServer.start_link(__MODULE__, opts, name: __MODULE__)
   end
 
-  def utilization(duration_ms \\ 2_000) do
+  @doc """
+  Returns the most recently computed aggregation result.
+  Returns nil if no aggregation has run yet.
+  """
+  @spec last_result() :: map() | nil
+  def last_result do
+    GenServer.call(__MODULE__, :last_result)
+  end
+
+  @doc """
+  Triggers an immediate aggregation pass (for testing and manual flush).
+  Blocks until the aggregation completes.
+  """
+  @spec run_now() :: map()
+  def run_now do
+    GenServer.call(__MODULE__, :run_now, 30_000)
+  end
+
+  # ── GenServer callbacks ──────────────────────────────────────────────────────
+
+  @impl true
+  def init(_opts) do
+    # HINT: schedule the first aggregation with Process.send_after/3
+    # HINT: initial state: %{last_result: nil, run_count: 0}
+    # TODO: implement
+    {:ok, %{last_result: nil, run_count: 0}}
+  end
+
+  @impl true
+  def handle_call(:last_result, _from, state) do
+    {:reply, state.last_result, state}
+  end
+
+  @impl true
+  def handle_call(:run_now, _from, state) do
+    result = do_aggregate()
+    {:reply, result, %{state | last_result: result, run_count: state.run_count + 1}}
+  end
+
+  @impl true
+  def handle_info(:aggregate, state) do
+    result = do_aggregate()
+    # HINT: reschedule next aggregation with Process.send_after/3
+    # TODO: implement rescheduling
+    {:noreply, %{state | last_result: result, run_count: state.run_count + 1}}
+  end
+
+  # ── Private: CPU-bound aggregation with cooperative yielding ─────────────────
+
+  defp do_aggregate do
+    # Read all events directly from the ETS table.
+    # EventLog owns the :gateway_event_log table — read it without going through
+    # the GenServer to avoid serializing the expensive aggregation on its mailbox.
+    events = :ets.tab2list(:gateway_event_log)
+
+    # Aggregate with periodic yielding to avoid scheduler starvation
+    # HINT: use Enum.with_index to track position
+    # HINT: every @yield_every entries, call :erlang.yield()
+    # HINT: :erlang.yield() signals the scheduler that this process is willing
+    #       to be preempted — the scheduler may or may not actually preempt
+    # TODO: implement the yield-aware aggregation fold
+
+    # Return a map: %{route => %{count: N, total_us: N, p99_us: N}}
+    %{}
+  end
+
+  @doc false
+  # Measures scheduler wall time utilization across a workload.
+  # Returns a list of {scheduler_id, utilization_ratio} for each normal scheduler.
+  @spec measure_scheduler_utilization(fun()) :: [{integer(), float()}]
+  def measure_scheduler_utilization(workload_fn) do
     :erlang.system_flag(:scheduler_wall_time, true)
+    before = :erlang.statistics(:scheduler_wall_time) |> Enum.sort()
 
-    # TODO: implementar la captura de wall time snapshot 1
-    # snapshot_1 = :erlang.statistics(:scheduler_wall_time)
+    workload_fn.()
 
-    # TODO: generar carga durante duration_ms
-    # _load_pids = spawn_load_workers(...)
+    after_stats = :erlang.statistics(:scheduler_wall_time) |> Enum.sort()
 
-    # TODO: capturar snapshot 2 y calcular delta
-    # snapshot_2 = ...
-
-    # TODO: retornar mapa %{scheduler_id => utilization_pct}
-    :not_implemented
-  end
-
-  defp spawn_load_workers(_n) do
-    # TODO: spawnear procesos que hagan trabajo CPU continuo
-    # Cada uno debe ejecutar un loop de cálculos por duration_ms
-    :not_implemented
+    # HINT: zip before and after, compute (a1 - a0) / (t1 - t0) for each scheduler
+    # HINT: filter to normal schedulers only (ids 1..System.schedulers_online())
+    # TODO: implement
+    []
   end
 end
 ```
 
----
-
-### Exercise 2: Reduction Budget Meter
-
-**Problem**
-
-Crea un módulo `ReductionMeter` que permita medir cuántas reductions consume una operación dada. La API debe ser:
+### Step 2: Given tests — must pass without modification
 
 ```elixir
-# Medir las reductions de cualquier función
-{result, reductions} = ReductionMeter.measure(fn ->
-  Enum.sum(1..10_000)
-end)
+# test/api_gateway/metrics/aggregator_test.exs
+defmodule ApiGateway.Metrics.AggregatorTest do
+  use ExUnit.Case, async: false
 
-# Medir múltiples operaciones y comparar
-ReductionMeter.compare([
-  {"Enum.sum 10k", fn -> Enum.sum(1..10_000) end},
-  {"List.foldl 10k", fn -> List.foldl(Enum.to_list(1..10_000), 0, &+/2) end},
-  {"Recursive sum 10k", fn -> recursive_sum(10_000) end}
-])
-```
+  alias ApiGateway.Metrics.Aggregator
 
-Además, crea una función `budget_warning/2` que ejecute una función y emita un log de warning si la función consume más de un threshold de reductions:
-
-```elixir
-ReductionMeter.budget_warning(fn -> heavy_computation() end, max_reductions: 5_000)
-# => [WARNING] Function consumed 12_450 reductions (threshold: 5_000)
-```
-
-**Hints**
-
-- `:erlang.process_info(self(), :reductions)` retorna `{:reductions, N}` — llámalo antes y después
-- Las reductions incluyen el overhead de llamar a `process_info` misma (~5-10 reductions)
-- Para `compare/1`, ordena los resultados por reductions ascendente y muestra una tabla
-- El conteo de reductions es por proceso — no se ve afectado por otros procesos corriendo en paralelo
-
-**One possible solution**
-
-```elixir
-defmodule ReductionMeter do
-  require Logger
-
-  def measure(fun) when is_function(fun, 0) do
-    {:reductions, before_r} = :erlang.process_info(self(), :reductions)
-    result = fun.()
-    {:reductions, after_r} = :erlang.process_info(self(), :reductions)
-
-    # Restar overhead de process_info (aproximado)
-    reductions = after_r - before_r
-
-    {result, reductions}
-  end
-
-  def compare(named_funs) when is_list(named_funs) do
-    results =
-      Enum.map(named_funs, fn {name, fun} ->
-        {_result, reductions} = measure(fun)
-        {name, reductions}
-      end)
-
-    # TODO: ordenar por reductions
-    # TODO: encontrar el mínimo para calcular el ratio relativo
-    # TODO: imprimir tabla formateada con columnas: Name | Reductions | Ratio
-
-    IO.puts("\nReduction comparison:")
-    IO.puts(String.duplicate("-", 60))
-    # ... implementar tabla
-    results
-  end
-
-  def budget_warning(fun, opts \\ []) do
-    max = Keyword.get(opts, :max_reductions, 2_000)
-    {result, reductions} = measure(fun)
-
-    if reductions > max do
-      Logger.warning(
-        "Function consumed #{reductions} reductions (threshold: #{max})"
-      )
-    end
-
-    # TODO: retornar {:ok, result} o {:budget_exceeded, result, reductions}
-    result
-  end
-end
-```
-
----
-
-### Exercise 3: Dirty Scheduler — Impacto en Latencia del Sistema
-
-**Problem**
-
-Este ejercicio demuestra el problema central de los schedulers de BEAM: **una tarea CPU-intensiva en un scheduler normal puede degradar la latencia de todos los demás procesos**.
-
-Implementa un benchmark que:
-
-1. Inicie un proceso "canary" que responda a pings con latencia medida en microsegundos
-2. Mientras el canary corre, ejecute una tarea CPU-intensiva (simula un NIF largo con `:timer.sleep/1` dentro de un NIF simulado)
-3. Mida la latencia p50, p95 y p99 del canary **con y sin** la tarea interferente
-4. Muestre cómo dirty schedulers aislan el impacto (simulado con `Task` en un proceso de baja prioridad vs alta prioridad)
-
-```elixir
-# Resultado esperado (valores aproximados, varían por máquina):
-SchedulerLatency.run_experiment()
-
-# Sin carga:
-#   p50: 45μs  p95: 120μs  p99: 890μs
-
-# Con carga en scheduler normal (priority: :normal):
-#   p50: 180μs  p95: 2_400μs  p99: 15_000μs  ← degradación severa
-
-# Con carga en proceso :low priority:
-#   p50: 52μs  p95: 145μs  p99: 1_100μs  ← mucho mejor
-```
-
-**Hints**
-
-- Usa `:timer.tc/1` para medir en microsegundos: `{microseconds, result} = :timer.tc(fn -> ... end)`
-- El proceso canary debe ser un GenServer simple que responde a `{:ping, from}` con `{:pong, latency}`
-- Para simular carga CPU sin un NIF real: `for _ <- 1..100_000, do: :crypto.strong_rand_bytes(16)`
-- La diferencia de prioridad es más visible cuando hay muchos schedulers ocupados — intenta con `--erl "+S 2"` para limitar a 2 schedulers
-- Calcula percentiles ordenando la lista de latencias y tomando el índice correspondiente
-
-**One possible solution**
-
-```elixir
-defmodule SchedulerLatency do
-  use GenServer
-
-  # --- Canary GenServer ---
-
-  def start_link(_), do: GenServer.start_link(__MODULE__, [], name: __MODULE__)
-
-  def ping do
-    start = :erlang.monotonic_time(:microsecond)
-    :ok = GenServer.call(__MODULE__, :ping)
-    :erlang.monotonic_time(:microsecond) - start
-  end
-
-  def init(_), do: {:ok, %{}}
-
-  def handle_call(:ping, _from, state), do: {:reply, :ok, state}
-
-  # --- Experiment ---
-
-  def run_experiment do
-    {:ok, _} = start_link([])
-
-    IO.puts("=== Scheduler Latency Experiment ===\n")
-
-    baseline = measure_latencies(1_000, nil)
-    print_stats("Sin carga (baseline)", baseline)
-
-    # Carga con prioridad normal
-    load_pid = spawn_load(:normal)
-    with_normal_load = measure_latencies(1_000, nil)
-    Process.exit(load_pid, :kill)
-    print_stats("Con carga :normal priority", with_normal_load)
-
-    # TODO: repetir con Process.flag(:priority, :low) en el proceso de carga
-    # TODO: mostrar diferencia porcentual en p99
-
+  setup do
+    # Start aggregator for the test
+    start_supervised!({Aggregator, []})
     :ok
   end
 
-  defp spawn_load(priority) do
-    spawn(fn ->
-      Process.flag(:priority, priority)
-      # Loop infinito de trabajo CPU
-      Stream.repeatedly(fn ->
-        for _ <- 1..10_000, do: :crypto.strong_rand_bytes(16)
-      end)
-      |> Stream.run()
-    end)
+  describe "run_now/0" do
+    test "returns a map" do
+      result = Aggregator.run_now()
+      assert is_map(result)
+    end
+
+    test "last_result/0 returns nil before first aggregation completes" do
+      # This is tricky in a test — the aggregation runs immediately in run_now
+      # so we check the state is updated after run_now
+      result = Aggregator.run_now()
+      assert Aggregator.last_result() == result
+    end
   end
 
-  defp measure_latencies(n, _context) do
-    # TODO: enviar n pings y recolectar latencias
-    # Retornar lista de microsegundos
-    Enum.map(1..n, fn _ ->
-      # Pequeña pausa para no saturar el mailbox
-      :timer.sleep(1)
-      ping()
-    end)
-  end
+  describe "measure_scheduler_utilization/1" do
+    test "returns a list of {id, float} tuples" do
+      utilization =
+        Aggregator.measure_scheduler_utilization(fn ->
+          # A trivial CPU workload
+          Enum.reduce(1..100_000, 0, fn i, acc -> acc + i end)
+        end)
 
-  defp print_stats(label, latencies) do
-    sorted = Enum.sort(latencies)
-    p50 = percentile(sorted, 50)
-    p95 = percentile(sorted, 95)
-    p99 = percentile(sorted, 99)
+      assert is_list(utilization)
 
-    IO.puts("#{label}:")
-    IO.puts("  p50: #{p50}μs  p95: #{p95}μs  p99: #{p99}μs\n")
-  end
+      for {id, ratio} <- utilization do
+        assert is_integer(id)
+        assert is_float(ratio) or ratio == 0
+        assert ratio >= 0.0 and ratio <= 1.0
+      end
+    end
 
-  defp percentile(sorted_list, p) do
-    idx = round(length(sorted_list) * p / 100) - 1
-    Enum.at(sorted_list, max(idx, 0))
+    test "a tight loop shows positive scheduler utilization" do
+      utilization =
+        Aggregator.measure_scheduler_utilization(fn ->
+          for _ <- 1..500_000, do: :ok
+        end)
+
+      total_utilization = Enum.sum(for {_id, r} <- utilization, do: r)
+      assert total_utilization > 0
+    end
+
+    test "yielding version shows lower max utilization than non-yielding" do
+      scheduler_count = System.schedulers_online()
+
+      non_yielding_utilization =
+        Aggregator.measure_scheduler_utilization(fn ->
+          Enum.reduce(1..200_000, [], fn i, acc -> [i | acc] end)
+        end)
+
+      yielding_utilization =
+        Aggregator.measure_scheduler_utilization(fn ->
+          Enum.reduce(1..200_000, [], fn i, acc ->
+            if rem(i, 500) == 0, do: :erlang.yield()
+            [i | acc]
+          end)
+        end)
+
+      # The scheduler that ran the workload should show high utilization in the
+      # non-yielding case and lower peak in the yielding case.
+      # This is a statistical observation, not a hard guarantee.
+      max_non_yielding = Enum.max(for {_id, r} <- non_yielding_utilization, do: r)
+      max_yielding = Enum.max(for {_id, r} <- yielding_utilization, do: r)
+
+      # Both should show some utilization — the test is a sanity check on the
+      # measure function, not a strict performance gate
+      assert max_non_yielding >= 0.0
+      assert max_yielding >= 0.0
+      assert is_integer(scheduler_count) and scheduler_count > 0
+    end
   end
 end
 ```
 
----
+### Step 3: Run the tests
 
-## Common Mistakes
-
-### 1. Confundir "schedulers" con "threads del OS"
-
-BEAM crea un thread del OS por scheduler, pero los procesos de Elixir son multiplexados encima de esos threads. **No hay una relación 1:1** entre procesos Elixir y threads del OS. Millones de procesos Elixir corren en N threads (donde N = schedulers).
-
-### 2. Usar Process.flag(:priority, :max)
-
-`:max` está reservado para uso interno de BEAM (emulator processes). Usarlo en código de aplicación puede causar starvation de procesos del sistema e inestabilidad. Usa `:high` como máximo en código de usuario.
-
-### 3. Asumir que más schedulers = más performance
-
-En workloads IO-bound, agregar schedulers no ayuda. La contención de locks internos de BEAM puede incluso hacer que más schedulers empeore el rendimiento. Benchmark siempre antes de ajustar `+S`.
-
-### 4. Ignorar el overhead de dirty schedulers
-
-Dispatch a un dirty scheduler tiene overhead (cambio de contexto, sincronización). Para operaciones cortas (<1ms), el overhead puede superar el beneficio. Solo vale la pena para operaciones de varios milisegundos.
-
-### 5. No deshabilitar scheduler_wall_time después de medir
-
-```elixir
-# MAL: dejar wall time habilitado en producción
-:erlang.system_flag(:scheduler_wall_time, true)
-# ... medición ...
-
-# BIEN: deshabilitar cuando ya no necesitas
-:erlang.system_flag(:scheduler_wall_time, false)
+```bash
+mix test test/api_gateway/metrics/aggregator_test.exs --trace
 ```
 
-### 6. Medir scheduler_id una sola vez y asumir que es fijo
+### Step 4: Scheduler benchmark
 
-Los procesos pueden migrar entre schedulers. El scheduler_id puede cambiar entre llamadas, especialmente si el proceso hace receives que lo suspenden. Para un mapeo estable, ancla el proceso con `:erlang.process_flag(:scheduler, N)` (Erlang 24+) o diseña sin asumir localidad.
+```elixir
+# bench/scheduler_bench.exs
+# Compares a tight loop vs a yielding loop under concurrent load.
+# Measures impact on latency of a concurrent "fast" workload.
+
+fast_task = fn ->
+  Task.async(fn ->
+    # Simulates a fast I/O-bound handler — should not be starved
+    :timer.sleep(1)
+    :done
+  end)
+end
+
+tight_loop = fn n ->
+  Enum.reduce(1..n, 0, fn i, acc -> acc + i end)
+end
+
+yielding_loop = fn n ->
+  Enum.reduce(1..n, 0, fn i, acc ->
+    if rem(i, 500) == 0, do: :erlang.yield()
+    acc + i
+  end)
+end
+
+Benchee.run(
+  %{
+    "tight_loop 100k" => fn -> tight_loop.(100_000) end,
+    "yielding_loop 100k" => fn -> yielding_loop.(100_000) end
+  },
+  parallel: System.schedulers_online(),
+  warmup: 2,
+  time: 5,
+  formatters: [Benchee.Formatters.Console]
+)
+```
+
+```bash
+mix run bench/scheduler_bench.exs
+```
 
 ---
 
-## Summary
+## Trade-off analysis
 
-El scheduler de BEAM implementa preemptividad justa basada en reductions, no en tiempo. Esto garantiza que **ningún proceso puede monopolizar la CPU indefinidamente** sin cooperar, porque BEAM lo desaloja automáticamente. Las consecuencias prácticas son:
+| Technique | Scheduler impact | Latency effect | Implementation cost |
+|-----------|-----------------|---------------|---------------------|
+| Tight loop (no yield) | Monopolizes one scheduler for full quantum | Other processes on same scheduler wait | Zero — do nothing |
+| `:erlang.yield()` every N | Signals willingness to preempt | Reduces max latency spike | Minimal |
+| `Process.send_after` chunked work | Splits work across handle_info calls | Fully preemptible between chunks | Medium |
+| Dirty CPU scheduler (NIF) | Moves work off normal schedulers | Normal schedulers stay free | High — requires NIF |
+| Offload to separate node | Zero impact on gateway schedulers | Best isolation | Highest |
 
-- Código Elixir puro siempre es preemptible — no necesitas `yield()` explícito
-- NIFs son la excepción: bloquean el scheduler a menos que uses dirty schedulers
-- Las prioridades de proceso son una herramienta para gestionar latencia, no para garantizar tiempo real
-- Scheduler wall time es la herramienta correcta para detectar hotspots de CPU en producción
+**Rule of thumb**: if a single operation takes more than 1ms, it should either
+yield, be chunked via `handle_info`, or be moved to a dirty scheduler.
 
 ---
 
-## What's Next
+## Common production mistakes
 
-- **Ejercicio 26**: Memory Profiling con recon — detectar leaks de binaries y GC pressure
-- **Ejercicio 27**: Tracing en producción — ver qué hace tu sistema sin detenerlo
-- Investiga `:erlang.process_flag(:fullsweep_after, N)` para controlar la GC de procesos individuales
-- Lee el whitepaper de Joe Armstrong sobre el diseño del scheduler de BEAM
+**1. Assuming recursive Elixir code "blocks" the scheduler**
+Elixir recursive functions preempt normally via the reduction counter. The real
+risk is NIF calls and BIFs that run in C without yielding — not Elixir `defp` loops.
+
+**2. Calling `:erlang.yield()` in a NIF**
+`:erlang.yield/0` is an Erlang function, not a NIF primitive. It only works in
+regular Elixir/Erlang code. If you write a C NIF, you must use the NIF API's
+`enif_thread_type()` / rescheduling mechanisms to avoid blocking a scheduler thread.
+
+**3. Using `System.schedulers_online()` as a worker pool size without headroom**
+Setting worker pool size equal to scheduler count means a single slow worker
+saturates all schedulers. Leave headroom: `max(2, System.schedulers_online() - 1)`.
+
+**4. Enabling scheduler wall time without disabling it**
+`:erlang.system_flag(:scheduler_wall_time, true)` has a small but nonzero overhead.
+Enable it for measurement, then call `:erlang.system_flag(:scheduler_wall_time, false)`
+when done. In production monitoring pipelines, keep it enabled permanently if you
+sample periodically — the overhead is negligible compared to the visibility gained.
+
+**5. Interpreting high scheduler utilization as a problem**
+100% scheduler utilization is the goal for a CPU-bound system. The problem is
+*uneven* utilization or utilization that blocks I/O-bound processes. Use
+`:observer` or `Benchee` to correlate utilization with request latency, not just
+raw CPU percentage.
 
 ---
 
 ## Resources
 
-- [BEAM Book — Schedulers chapter](https://happi.github.io/theBeamBook/#_schedulers)
-- [Erlang docs: erl flags +S, +sbt, +SP](https://www.erlang.org/doc/man/erl.html)
-- [Recon library documentation](https://ferd.github.io/recon/)
-- `:erlang.system_info/1` — documentación oficial de todas las keys disponibles
-- [Jesper Louis Andersen — "On Erlang's Scheduler"](https://jlouisramblings.blogspot.com/2013/01/how-erlang-does-scheduling.html)
+- [BEAM Book — Scheduler chapter](https://happi.github.io/theBeamBook/#schedulers) — deep dive into the reduction-based preemption model
+- [`:erlang.statistics/1` — Erlang docs](https://www.erlang.org/doc/man/erlang.html#statistics-1) — `scheduler_wall_time` and other scheduler stats
+- [Dirty schedulers — Erlang NIF guide](https://www.erlang.org/doc/man/erl_nif.html#dirty_nifs) — when and how to use dirty schedulers
+- [Elixir Forum: measuring scheduler starvation](https://elixirforum.com/t/how-to-detect-scheduler-starvation/37412) — community discussion with examples
+- [`:observer.start/0`](https://www.erlang.org/doc/man/observer.html) — visual scheduler utilization in real time

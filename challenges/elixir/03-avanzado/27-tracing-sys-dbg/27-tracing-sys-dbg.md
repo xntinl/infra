@@ -1,600 +1,441 @@
-# 27. Tracing en Producción: :sys, :dbg y :recon_trace
+# Tracing in Production: :sys, :dbg, and :recon_trace
 
-**Difficulty**: Avanzado
-
----
-
-## Prerequisites
-
-### Mastered
-- GenServer: ciclo de vida completo, handle_call/cast/info
-- OTP: supervisores, aplicaciones
-- Procesos Elixir: spawn, send, receive, Process.monitor
-
-### Familiarity with
-- `:sys` module — GenServer internals
-- `:recon` library (ejercicio 26)
-- Erlang's pattern matching syntax (para los match specs de dbg)
+**Project**: `api_gateway` — built incrementally across the advanced level
 
 ---
 
-## Learning Objectives
+## Project context
 
-Al completar este ejercicio serás capaz de:
+You're building `api_gateway`. A request type is intermittently slow — p99
+latency at 800ms while median is 5ms. The slow requests appear in production
+only; the behavior disappears when the node is restarted. You cannot add logging
+and deploy because the problem is intermittent and you need to observe it *live*.
 
-- **Analizar** el comportamiento de GenServers en tiempo real sin reiniciarlos ni modificar código
-- **Diseñar** estrategias de tracing que no degraden la performance del sistema en producción
-- **Evaluar** el trade-off entre visibilidad y overhead para cada herramienta de tracing
-- **Construir** un call graph básico de invocaciones de módulo usando match specs de `:dbg`
+Elixir/Erlang has three production-safe tracing tools built into the runtime,
+each with different scope, overhead, and safety guarantees. This exercise covers
+all three applied to diagnosing slow requests in a live gateway node.
+
+Project structure at this point:
+
+```
+api_gateway/
+├── lib/
+│   └── api_gateway/
+│       ├── application.ex
+│       ├── router.ex
+│       ├── middleware/
+│       │   ├── pipeline.ex
+│       │   └── ...
+│       └── dev/
+│           ├── ast_tools.ex
+│           ├── memory_snapshot.ex
+│           └── tracer.ex           # ← you implement this
+├── test/
+│   └── api_gateway/
+│       └── dev/
+│           └── tracer_test.exs
+└── mix.exs
+```
 
 ---
 
-## Concepts
+## The business problem
 
-### ¿Por Qué Tracing en Lugar de Logging?
+Two requirements:
 
-Logging requiere modificar el código y hacer deploy. Tracing es dinámico — lo activas en un nodo vivo, observas lo que necesitas, y lo desactivas. En sistemas de producción donde el problema desaparece al reiniciar, el tracing es la única opción viable.
+1. **GenServer-level tracing**: observe the state transitions and message queue
+   of the `ApiGateway.RateLimit.Server` GenServer in real time to determine if
+   the slow requests are caused by a backed-up message queue or a slow
+   `handle_call` handler.
+
+2. **Function call tracing**: trace all calls to
+   `ApiGateway.Middleware.Pipeline.call/2` and `ApiGateway.Router.dispatch/1`
+   on a live node, with a call count limit to avoid flooding the system.
+
+---
+
+## Tracing tool comparison
 
 ```
-Herramienta         Scope              Overhead    Seguridad en Prod
-─────────────────────────────────────────────────────────────────────
-:sys.trace          Un GenServer        Bajo        Sí (por proceso)
-:sys.log            Un GenServer        Mínimo      Sí (ring buffer)
-:dbg                Sistema completo    ALTO        NO sin límites
-:recon_trace        Sistema completo    Controlado  Sí (con límites)
+Tool            Scope               Overhead          Production safe
+──────────────────────────────────────────────────────────────────────
+:sys.trace      One GenServer        Low               Yes
+:sys.log        One GenServer        Minimal           Yes (ring buffer)
+:sys.get_state  One GenServer        Zero              Yes (snapshot)
+:dbg            Any module/function  HIGH without limit NO without limits
+:recon_trace    Any module/function  Controlled        Yes (with msg limit)
 ```
 
-### `:sys` — Introspección de Procesos OTP
+**Never use `:dbg.tracer/0` on a production node without setting a message limit.**
+It traces every matching call system-wide and can generate enough traffic to OOM
+the tracing process.
 
-Cualquier proceso que siga el OTP behaviour protocol (GenServer, GenStateMachine, etc.) implementa la interfaz `:sys`. Es la forma más segura de inspeccionar un proceso OTP sin afectar otros.
+---
+
+## `:sys` — safe OTP process inspection
+
+Any process implementing an OTP behaviour (GenServer, GenStateMachine, Supervisor)
+automatically implements the `:sys` protocol.
 
 ```elixir
-{:ok, pid} = MyGenServer.start_link([])
+# Get current state without a code change
+:sys.get_state(pid_or_name)
 
-# Activar trace — imprime cada mensaje que recibe/envía el proceso
-:sys.trace(pid, true)
-# Al hacer GenServer.call(pid, :get), verás en stdout:
-# *DBG* <0.123.0> got call get from <0.84.0>
-# *DBG* <0.123.0> sent {ok, value} to <0.84.0>, new state: %{...}
+# Log the last N system messages (calls, casts, info) into a ring buffer
+:sys.log(pid_or_name, {true, 20})   # enable, keep last 20
+:sys.log(pid_or_name, get)          # retrieve the log
+:sys.log(pid_or_name, false)        # disable
 
-# Desactivar
-:sys.trace(pid, false)
+# Print each incoming message to the console
+:sys.trace(pid_or_name, true)       # enable
+:sys.trace(pid_or_name, false)      # disable
 
-# Ring buffer de los últimos N eventos (sin imprimir nada)
-:sys.log(pid, 20)  # guardar hasta 20 eventos
-# ... el proceso recibe llamadas ...
-:sys.log_to_file(pid, "/tmp/genserver.log")  # volcar a archivo
-
-# Ver el log acumulado
-{:ok, events} = :sys.log(pid, :get)
-
-# Obtener el estado actual del GenServer (llama a handle_system_msg)
-:sys.get_state(pid)
-
-# Reemplazar el estado (útil para debug — peligroso en producción)
-:sys.replace_state(pid, fn state -> Map.put(state, :debug_mode, true) end)
+# Suspend a process (freezes it — use only in emergencies)
+:sys.suspend(pid_or_name)
+:sys.resume(pid_or_name)
 ```
 
-### `:sys.log/2` — Ring Buffer de Eventos
+`:sys.log` is the right tool for diagnosing intermittent issues: enable the ring
+buffer, wait for the slow request to reproduce, then read the log. The buffer
+captures only OTP messages, not raw `send/receive`.
+
+---
+
+## `:recon_trace` — safe function tracing
+
+`:recon_trace.calls/3` traces function calls across the live system with a
+mandatory message limit. When the limit is reached, tracing stops automatically.
 
 ```elixir
-# Estructura de un evento del log:
-# {:in, message}          — mensaje entrante (call, cast, info)
-# {:out, reply, to_pid}   — respuesta saliente a un call
-# {:noreply, new_state}   — tras un cast sin respuesta
+# Trace up to 100 calls to Router.dispatch/1
+:recon_trace.calls({ApiGateway.Router, :dispatch, 1}, 100)
 
-# Ejemplo de uso para capturar sin interferir:
-:sys.log(pid, 50)  # capturar últimos 50 eventos
+# Trace with a match spec — only trace calls where first arg matches a pattern
+ms = [{{:_, :_, :"GET"}, [], [{:return_trace}]}]
+:recon_trace.calls({ApiGateway.Router, :dispatch, 1}, 50, [{:scope, :local}])
 
-# Esperar a que ocurran algunos mensajes...
-Process.sleep(5_000)
-
-# Recuperar y analizar
-{:ok, events} = :sys.log(pid, :get)
-
-Enum.each(events, fn event ->
-  IO.inspect(event, label: "Event")
-end)
-
-# Siempre limpiar después
-:sys.log(pid, false)
-```
-
-### `:dbg` — Tracing de Bajo Nivel
-
-`:dbg` es poderoso pero **peligroso en producción sin límites**. Puede generar tal volumen de mensajes que degrade o mate el nodo.
-
-```elixir
-# Iniciar el tracer (procesa los eventos de trace)
-:dbg.tracer()
-
-# Tracing de un proceso específico — todos sus mensajes
-:dbg.p(pid, [:m])  # m = messages
-
-# Tracing de todas las llamadas a una función
-:dbg.tp(MyModule, :my_function, [])  # tp = trace pattern
-
-# Con match spec — solo trazar cuando el primer arg es > 100
-:dbg.tp(MyModule, :my_function, [{[:"$1", :_], [{:>, :"$1", 100}], [{:return_trace}]}])
-
-# Remover trace patterns
-:dbg.ctpg()  # clear all trace patterns
-
-# SIEMPRE parar el tracer cuando termines
-:dbg.stop_clear()
-```
-
-### Match Specs — El Lenguaje de Filtrado de `:dbg`
-
-Los match specs son tuplas que actúan como predicados. Son la forma de decirle a `:dbg` qué llamadas interceptar:
-
-```elixir
-# Formato: [{head_pattern, guard_conditions, actions}]
-
-# Trazar todas las llamadas sin filtro:
-[]  # o equivalentemente: [{'_', [], []}]
-
-# Trazar solo cuando el primer argumento es el átomo :error:
-[{[:error, :_], [], [:return_trace]}]
-
-# Trazar y capturar el valor de retorno:
-[{:_, [], [:return_trace]}]
-
-# Trazar cuando el segundo arg es > 1000:
-[{[:_, :"$1"], [{:>, :"$1", 1000}], [:return_trace]}]
-
-# Elixir helper para construir match specs más legibles:
-# :dbg.fun2ms(fn [x, y] when x > y -> :return_trace end)
-```
-
-### `:recon_trace` — Tracing Seguro para Producción
-
-`:recon_trace` envuelve `:dbg` con garantías de seguridad críticas:
-
-```elixir
-# Limitar a máximo 100 calls totales — SIEMPRE usar un límite
-:recon_trace.calls({MyModule, :my_function, :_}, 100)
-
-# Con formatter personalizado
-:recon_trace.calls(
-  {MyModule, :my_function, :_},
-  50,
-  formatter: fn event -> IO.puts("Call: #{inspect(event)}") end
-)
-
-# Tracing con match spec — solo args específicos
-match_spec = [{{:_, :_, :"$1"}, [{:>, :"$1", 1000}], []}]
-:recon_trace.calls({MyModule, :my_function, match_spec}, 100)
-
-# Parar explícitamente (o esperar a que llegue al límite)
+# Stop all tracing
 :recon_trace.clear()
 ```
 
-### Overhead de Tracing y Cómo Minimizarlo
-
-| Factor | Impacto | Mitigación |
-|--------|---------|-----------|
-| Volumen de calls trazadas | Directo con throughput | Límite en `:recon_trace`, match specs selectivos |
-| Formato de output | Serialización es cara | Formatters mínimos, escribir a buffer |
-| `:sys.trace` | Solo un proceso | Seguro por naturaleza |
-| `:dbg` sin límites | Puede matar el nodo | NUNCA en producción sin límites |
-| Scope del trace | Todo el nodo vs un proceso | Preferir `:sys` para GenServers individuales |
+`:recon_trace` uses `:dbg` internally but adds automatic cleanup and safety
+wrappers. Always use `:recon_trace` instead of raw `:dbg` in production.
 
 ---
 
-## Exercises
+## `:dbg` match specs — filtering what gets traced
 
-### Exercise 1: :sys Trace — Auditoría de Mensajes de un GenServer
-
-**Problem**
-
-Implementa un módulo `ShoppingCart` como GenServer que gestiona un carrito de compras, y un módulo `CartAuditor` que use `:sys.log` para capturar la historia completa de mensajes de un carrito específico.
-
-El `ShoppingCart` debe soportar:
-- `add_item(pid, item, quantity)` — añadir item
-- `remove_item(pid, item)` — eliminar item
-- `get_total(pid)` — precio total
-- `checkout(pid)` — finalizar (limpia el carrito)
-
-El `CartAuditor` debe:
-1. Activar el log con buffer de 50 eventos
-2. Realizar una secuencia de operaciones
-3. Recuperar el log y mostrar un audit trail legible
-4. Calcular estadísticas: cuántos calls, cuántos casts, tiempo entre eventos
-
-```
-=== ShoppingCart Audit Trail ===
-[00:00.000] CALL  add_item {:apple, 2}          -> :ok
-[00:00.012] CALL  add_item {:banana, 1}         -> :ok
-[00:00.024] CAST  log_event :items_added
-[00:00.036] CALL  get_total                     -> 5.50
-[00:00.048] CALL  checkout                      -> {:ok, receipt}
-
-Summary: 4 calls, 1 cast, 48ms total
-```
-
-**Hints**
-
-- `:sys.log(pid, N)` activa la captura; `:sys.log(pid, :get)` recupera los eventos
-- Los eventos tienen formato `{:in, message}` o `{:out, reply, from_pid}`
-- Para el timestamp relativo: guarda `:erlang.monotonic_time(:millisecond)` antes y después de cada evento
-- `:sys.log(pid, false)` desactiva y limpia el buffer — hazlo al terminar
-- El `pid` en `:sys` funciones puede ser también un nombre registrado: `:sys.log(MyServer, 50)`
-
-**One possible solution**
+Match specs are the Erlang equivalent of a pattern-match filter for the tracing
+system. They specify which calls to trace based on argument patterns:
 
 ```elixir
-defmodule ShoppingCart do
-  use GenServer
+# Trace only when first argument is a map with method "POST"
+ms = :dbg.fun2ms(fn [%{method: "POST"} | _] -> true end)
 
-  @prices %{apple: 1.50, banana: 0.75, orange: 2.00}
-
-  def start_link(opts \\ []),
-    do: GenServer.start_link(__MODULE__, %{}, opts)
-
-  def add_item(pid, item, qty),
-    do: GenServer.call(pid, {:add_item, item, qty})
-
-  def remove_item(pid, item),
-    do: GenServer.call(pid, {:remove_item, item})
-
-  def get_total(pid),
-    do: GenServer.call(pid, :get_total)
-
-  def checkout(pid),
-    do: GenServer.call(pid, :checkout)
-
-  def init(_), do: {:ok, %{items: %{}, started_at: DateTime.utc_now()}}
-
-  def handle_call({:add_item, item, qty}, _from, %{items: items} = state) do
-    updated = Map.update(items, item, qty, &(&1 + qty))
-    {:reply, :ok, %{state | items: updated}}
-  end
-
-  def handle_call({:remove_item, item}, _from, %{items: items} = state) do
-    {:reply, :ok, %{state | items: Map.delete(items, item)}}
-  end
-
-  def handle_call(:get_total, _from, %{items: items} = state) do
-    total =
-      Enum.reduce(items, 0.0, fn {item, qty}, acc ->
-        acc + Map.get(@prices, item, 0.0) * qty
-      end)
-
-    {:reply, Float.round(total, 2), state}
-  end
-
-  def handle_call(:checkout, _from, %{items: items} = state) do
-    receipt = %{
-      items: items,
-      total: calculate_total(items),
-      timestamp: DateTime.utc_now()
-    }
-    {:reply, {:ok, receipt}, %{state | items: %{}}}
-  end
-
-  defp calculate_total(items) do
-    Enum.reduce(items, 0.0, fn {item, qty}, acc ->
-      acc + Map.get(@prices, item, 0.0) * qty
-    end)
-    |> Float.round(2)
-  end
-end
-
-defmodule CartAuditor do
-  def audit(pid, operations_fn) do
-    # Activar captura de log
-    :sys.log(pid, 50)
-
-    start_ts = :erlang.monotonic_time(:millisecond)
-
-    # Ejecutar operaciones
-    operations_fn.()
-
-    end_ts = :erlang.monotonic_time(:millisecond)
-
-    # Recuperar eventos
-    {:ok, events} = :sys.log(pid, :get)
-    :sys.log(pid, false)
-
-    IO.puts("\n=== ShoppingCart Audit Trail ===")
-
-    # TODO: formatear cada evento con tipo (call/cast/info) y contenido
-    # TODO: calcular tiempo relativo entre eventos
-    Enum.each(events, fn event ->
-      IO.inspect(event, label: "Event")
-    end)
-
-    calls = Enum.count(events, fn e -> match?({:in, {:"$gen_call", _, _}}, e) end)
-    casts = Enum.count(events, fn e -> match?({:in, {:"$gen_cast", _}}, e) end)
-    elapsed = end_ts - start_ts
-
-    IO.puts("\nSummary: #{calls} calls, #{casts} casts, #{elapsed}ms total")
-
-    {:ok, events}
-  end
-end
+# Return trace — also trace the return value
+ms = :dbg.fun2ms(fn [_conn, _opts] -> {:return_trace} end)
 ```
+
+`:dbg.fun2ms/1` compiles an Elixir anonymous function into a match spec at
+compile time. The argument pattern must match the actual function arguments.
 
 ---
 
-### Exercise 2: :recon_trace en Producción — Trace Limitado y Seguro
+## Implementation
 
-**Problem**
-
-Simula un escenario de producción donde necesitas diagnosticar por qué ciertos requests están siendo lentos. Tienes un módulo `SlowAPI` que ocasionalmente tarda más de lo esperado, y necesitas capturar exactamente cuándo y con qué argumentos ocurre.
-
-Implementa:
-
-1. `SlowAPI` — módulo con una función `handle_request/2` que introduce latencia aleatoria
-2. `ProductionTracer` — módulo que usa `:recon_trace` para:
-   - Trazar solo las llamadas donde el segundo argumento supera un threshold
-   - Limitar a máximo 50 traces totales
-   - Formatear el output de forma legible
-   - Medir el tiempo de cada call usando `:return_trace`
+### Step 1: `lib/api_gateway/dev/tracer.ex`
 
 ```elixir
-# Usar en producción:
-ProductionTracer.trace_slow_requests(threshold_ms: 100, max_traces: 50)
+defmodule ApiGateway.Dev.Tracer do
+  @moduledoc """
+  Production-safe tracing utilities wrapping :sys and :recon_trace.
 
-# Output:
-# [14:32:01.234] SlowAPI.handle_request(:user_profile, 1234) → 342ms ← SLOW
-# [14:32:01.891] SlowAPI.handle_request(:user_feed, 5678) → 89ms
-# [14:32:02.103] SlowAPI.handle_request(:recommendations, 9999) → 891ms ← SLOW
-# Captured 50 calls. Stopping trace.
-```
+  All functions are safe to call on a live node.
+  :recon_trace.calls always has a message limit — tracing stops automatically.
 
-**Hints**
+  Usage:
+    # Inspect a GenServer state without restarting
+    ApiGateway.Dev.Tracer.get_state(ApiGateway.RateLimit.Server)
 
-- `:recon_trace.calls({Module, :function, match_spec}, max_calls)` — siempre con límite
-- Para `:return_trace` en recon: usa `[{:_, [], [:return_trace]}]` como match spec
-- El formatter recibe un term con la info del trace — inspecciona su estructura con `IO.inspect/2`
-- Genera carga con `Task.async_stream` para ver múltiples calls concurrentes
-- `:recon_trace.clear()` detiene todos los traces activos — siempre en el `after` de un `try`
+    # Log the last 20 messages received by a GenServer
+    ApiGateway.Dev.Tracer.start_log(ApiGateway.RateLimit.Server, 20)
+    # ... wait for slow request ...
+    ApiGateway.Dev.Tracer.read_log(ApiGateway.RateLimit.Server)
 
-**One possible solution**
+    # Trace up to 50 calls to Pipeline.call/2
+    ApiGateway.Dev.Tracer.trace_calls(ApiGateway.Middleware.Pipeline, :call, 2, 50)
+  """
 
-```elixir
-defmodule SlowAPI do
-  def handle_request(endpoint, _user_id) do
-    # Simular latencia variable: 50% de las veces < 100ms, 50% > 100ms
-    latency = if :rand.uniform() > 0.5, do: :rand.uniform(50), else: :rand.uniform(500) + 100
-    :timer.sleep(latency)
-    {:ok, %{endpoint: endpoint, latency_ms: latency}}
+  @doc """
+  Returns the current state of a GenServer identified by name or pid.
+  Safe: read-only, no side effects.
+  """
+  @spec get_state(GenServer.server()) :: term()
+  def get_state(server) do
+    :sys.get_state(server)
+  end
+
+  @doc """
+  Enables the :sys message log ring buffer on `server`, keeping the last `n` messages.
+  Call read_log/1 to retrieve the captured messages.
+  Call stop_log/1 to disable.
+  """
+  @spec start_log(GenServer.server(), pos_integer()) :: :ok
+  def start_log(server, n \\ 20) do
+    # HINT: use :sys.log(server, {true, n})
+    # TODO: implement
+    :ok
+  end
+
+  @doc """
+  Returns the list of OTP messages captured by the ring buffer.
+  Format: [{:in, msg} | {:out, reply}] per OTP message.
+  """
+  @spec read_log(GenServer.server()) :: list()
+  def read_log(server) do
+    # HINT: use :sys.log(server, :get)
+    # HINT: the return is {:ok, messages} — extract messages
+    # TODO: implement
+    []
+  end
+
+  @doc """
+  Disables the :sys log buffer.
+  """
+  @spec stop_log(GenServer.server()) :: :ok
+  def stop_log(server) do
+    # HINT: use :sys.log(server, false)
+    # TODO: implement
+    :ok
+  end
+
+  @doc """
+  Returns statistics about a GenServer: start time, message queue length, reductions.
+  """
+  @spec stats(GenServer.server()) :: map()
+  def stats(server) do
+    # HINT: use :sys.statistics(server, :get)
+    # HINT: must first enable statistics with :sys.statistics(server, true)
+    # TODO: implement — enable, get, disable, return as map
+    %{}
+  end
+
+  @doc """
+  Traces up to `max_messages` calls to `module.function/arity` using :recon_trace.
+  Prints each call to the calling process's group leader.
+
+  Tracing stops automatically after max_messages calls or when clear/0 is called.
+  """
+  @spec trace_calls(module(), atom(), arity(), pos_integer()) :: :ok
+  def trace_calls(module, function, arity, max_messages \\ 50) do
+    # HINT: use :recon_trace.calls({module, function, arity}, max_messages)
+    # HINT: returns :ok — tracing happens asynchronously
+    # TODO: implement
+    :ok
+  end
+
+  @doc """
+  Traces calls with a match spec filter.
+  Only calls where the arguments match `match_spec` are traced.
+
+  Example match spec for calls where the first arg has method "GET":
+    ms = :dbg.fun2ms(fn [%{method: "GET"} | _] -> true end)
+  """
+  @spec trace_calls_with_spec(module(), atom(), arity(), list(), pos_integer()) :: :ok
+  def trace_calls_with_spec(module, function, _arity, match_spec, max_messages \\ 50) do
+    # HINT: use :recon_trace.calls({module, function, match_spec}, max_messages)
+    # Note: when a match spec is provided, arity is embedded in the spec
+    # TODO: implement
+    :ok
+  end
+
+  @doc """
+  Stops all active tracing. Call this after diagnosis is complete.
+  """
+  @spec clear() :: :ok
+  def clear do
+    :recon_trace.clear()
+    :ok
+  end
+
+  @doc """
+  Inspects the message queue length of a pid or registered name.
+  A long queue indicates the process is a bottleneck.
+  """
+  @spec message_queue_len(GenServer.server()) :: non_neg_integer()
+  def message_queue_len(server) do
+    pid =
+      case server do
+        pid when is_pid(pid) -> pid
+        name when is_atom(name) -> Process.whereis(name)
+      end
+
+    case pid do
+      nil -> 0
+      pid ->
+        {:message_queue_len, len} = Process.info(pid, :message_queue_len)
+        len
+    end
   end
 end
+```
 
-defmodule ProductionTracer do
-  require Logger
+### Step 2: Given tests — must pass without modification
 
-  def trace_slow_requests(opts \\ []) do
-    max = Keyword.get(opts, :max_traces, 50)
-    _threshold = Keyword.get(opts, :threshold_ms, 100)
+```elixir
+# test/api_gateway/dev/tracer_test.exs
+defmodule ApiGateway.Dev.TracerTest do
+  use ExUnit.Case, async: false
 
-    Logger.info("Starting production trace (max #{max} calls)...")
+  alias ApiGateway.Dev.Tracer
 
-    try do
-      # Match spec: trazar todas las calls con return_trace
-      # En una implementación real, el threshold se filtraría en el match spec
-      # o en el formatter comparando el tiempo de ejecución
-      match_spec = [{:_, [], [:return_trace]}]
+  # A test GenServer to use as a target for :sys tracing
+  defmodule TestServer do
+    use GenServer
 
-      :recon_trace.calls(
-        {SlowAPI, :handle_request, match_spec},
-        max,
-        formatter: &format_trace_event/1
-      )
+    def start_link(opts \\ []), do: GenServer.start_link(__MODULE__, opts)
+    def get(pid), do: GenServer.call(pid, :get)
+    def put(pid, value), do: GenServer.cast(pid, {:put, value})
 
-      # Esperar a que llegue al límite o se cancele manualmente
-      Process.sleep(30_000)
-    after
-      :recon_trace.clear()
-      Logger.info("Trace stopped.")
+    @impl true
+    def init(_), do: {:ok, %{value: :initial}}
+
+    @impl true
+    def handle_call(:get, _from, state), do: {:reply, state.value, state}
+
+    @impl true
+    def handle_cast({:put, value}, state), do: {:noreply, %{state | value: value}}
+  end
+
+  setup do
+    {:ok, pid} = start_supervised(TestServer)
+    %{pid: pid}
+  end
+
+  describe "get_state/1" do
+    test "returns current GenServer state", %{pid: pid} do
+      state = Tracer.get_state(pid)
+      assert state == %{value: :initial}
+    end
+
+    test "reflects state after mutation", %{pid: pid} do
+      TestServer.put(pid, :updated)
+      # Allow the cast to process
+      _ = TestServer.get(pid)
+      state = Tracer.get_state(pid)
+      assert state == %{value: :updated}
     end
   end
 
-  defp format_trace_event(event) do
-    # La estructura del evento varía entre call y return
-    # TODO: distinguir {:trace, pid, :call, {mod, fun, args}} de
-    #       {:trace, pid, :return_from, {mod, fun, arity}, return_value}
-    timestamp = DateTime.utc_now() |> DateTime.to_string()
-    IO.puts("[#{timestamp}] #{inspect(event)}")
-  end
-end
-```
+  describe "start_log/2, read_log/1, stop_log/1" do
+    test "captures messages after start_log", %{pid: pid} do
+      Tracer.start_log(pid, 10)
 
----
+      TestServer.put(pid, :logged_value)
+      _ = TestServer.get(pid)
 
-### Exercise 3: Call Graph con :dbg — Construir un Grafo de Invocaciones
+      messages = Tracer.read_log(pid)
+      Tracer.stop_log(pid)
 
-**Problem**
-
-Usa `:dbg` para construir un call graph básico de un módulo: qué funciones llaman a qué otras funciones durante la ejecución real (no estática).
-
-Implementa un `CallGraphBuilder` que:
-
-1. Active trace en todas las funciones del módulo objetivo
-2. Ejecute un workload de prueba
-3. Capture las relaciones caller→callee usando `:return_trace`
-4. Genere una representación del call graph en formato texto (Mermaid o dot)
-
-```elixir
-# Trazar las invocaciones durante el workload
-CallGraphBuilder.trace_module(MyModule, fn ->
-  MyModule.process_batch([1, 2, 3, 4, 5])
-end)
-
-# Output en formato Mermaid:
-# graph TD
-#   process_batch --> validate_item
-#   process_batch --> transform_item
-#   validate_item --> check_range
-#   transform_item --> normalize
-```
-
-El módulo a trazar (`MyModule`) debe tener una jerarquía de al menos 4 funciones con llamadas entre sí.
-
-**Hints**
-
-- `:dbg.tp(Module, :_, [])` traza TODAS las funciones exportadas del módulo
-- `:dbg.tpl(Module, :_, [])` traza también las funciones privadas (local)
-- El tracer callback recibe `{:trace, pid, :call, {mod, fun, args}}` — extrae `{fun, arity}`
-- Para capturar la relación caller→callee necesitas un stack por proceso — guárdalo en un Agent o ETS
-- Siempre `:dbg.stop_clear()` al terminar — incluso si el workload falla
-- Limita el trace a un solo PID para evitar capturar llamadas del resto del sistema: `:dbg.p(target_pid, :c)`
-
-**One possible solution**
-
-```elixir
-defmodule MyModule do
-  # Módulo de ejemplo con jerarquía de funciones
-  def process_batch(items) do
-    items
-    |> Enum.filter(&validate_item/1)
-    |> Enum.map(&transform_item/1)
-  end
-
-  def validate_item(item), do: check_range(item) && check_type(item)
-  def transform_item(item), do: normalize(item) |> format()
-
-  defp check_range(item), do: item > 0 && item < 1000
-  defp check_type(item), do: is_integer(item)
-  defp normalize(item), do: item / 100.0
-  defp format(value), do: Float.round(value, 2)
-end
-
-defmodule CallGraphBuilder do
-  def trace_module(module, workload_fn) do
-    # Tabla ETS para acumular edges del grafo
-    table = :ets.new(:call_graph, [:bag, :public])
-
-    # Iniciar tracer que acumula en ETS
-    :dbg.tracer(:process, {fn event, _state ->
-      handle_trace_event(event, table)
-    end, nil})
-
-    # Trazar solo el proceso que ejecuta el workload
-    target_pid = spawn(fn ->
-      # TODO: el workload se ejecuta aquí
-      workload_fn.()
-    end)
-
-    :dbg.p(target_pid, :c)
-    :dbg.tpl(module, :_, [{:_, [], [:return_trace]}])
-
-    # Esperar a que el proceso termine
-    ref = Process.monitor(target_pid)
-    receive do
-      {:DOWN, ^ref, _, _, _} -> :ok
+      assert is_list(messages)
+      assert length(messages) >= 1
     end
 
-    :dbg.stop_clear()
+    test "read_log returns empty list before any messages", %{pid: pid} do
+      Tracer.start_log(pid, 10)
+      messages = Tracer.read_log(pid)
+      Tracer.stop_log(pid)
 
-    # Construir y mostrar el grafo
-    edges = :ets.tab2list(table)
-    :ets.delete(table)
-
-    print_mermaid(edges)
-    edges
+      assert is_list(messages)
+    end
   end
 
-  defp handle_trace_event({:trace, _pid, :call, {_mod, fun, args}}, table) do
-    # TODO: mantener stack por proceso para conocer el caller
-    # Por ahora, simplemente registrar la función
-    :ets.insert(table, {:call, fun, length(args)})
+  describe "message_queue_len/1" do
+    test "returns 0 for a process with no queued messages", %{pid: pid} do
+      # Ensure the server has processed everything
+      _ = TestServer.get(pid)
+      assert Tracer.message_queue_len(pid) == 0
+    end
+
+    test "returns 0 for a non-existent registered name" do
+      assert Tracer.message_queue_len(:nonexistent_server_xyz) == 0
+    end
   end
 
-  defp handle_trace_event(_other, _table), do: :ok
+  describe "trace_calls/4 and clear/0" do
+    test "trace_calls returns :ok without crashing" do
+      result = Tracer.trace_calls(ApiGateway.Dev.Tracer, :get_state, 1, 5)
+      assert result == :ok
+      Tracer.clear()
+    end
 
-  defp print_mermaid(edges) do
-    IO.puts("\ngraph TD")
-
-    edges
-    |> Enum.uniq()
-    |> Enum.each(fn
-      {:edge, caller, callee} ->
-        IO.puts("  #{caller} --> #{callee}")
-      _ ->
-        :ok
-    end)
+    test "clear/0 returns :ok" do
+      assert Tracer.clear() == :ok
+    end
   end
 end
 ```
 
----
+### Step 3: Run the tests
 
-## Common Mistakes
-
-### 1. Usar `:dbg` en producción sin límites
-
-`:dbg` sin restricciones puede generar millones de eventos por segundo en un nodo con carga alta. El procesamiento del tracer se convierte en el cuello de botella y puede hacer que el nodo deje de responder. **Siempre usar `:recon_trace`** en producción.
-
-### 2. Olvidar `:dbg.stop_clear()` después de un error
-
-Si el workload falla con una excepción, `:dbg` sigue corriendo. Un `try/after` es obligatorio:
-
-```elixir
-try do
-  :dbg.tracer()
-  :dbg.tp(Module, :function, [])
-  workload()
-after
-  :dbg.stop_clear()
-end
+```bash
+mix test test/api_gateway/dev/tracer_test.exs --trace
 ```
 
-### 3. Confundir `:sys.get_state` con `:sys.log`
+---
 
-- `:sys.get_state/1` retorna el estado actual del GenServer en este momento — una foto instantánea
-- `:sys.log/2` captura el historial de mensajes en un ring buffer — es dinámico
+## Trade-off analysis
 
-### 4. Activar trace en producción sobre funciones de alto throughput
+| Tool | Scope | Overhead | Stops automatically | Production safe |
+|------|-------|----------|---------------------|-----------------|
+| `:sys.get_state` | One process | Zero | N/A | Yes |
+| `:sys.log` | One process | Minimal (ring buffer) | No — must call `false` | Yes |
+| `:sys.trace` | One process | Low | No | Yes (single process) |
+| `:recon_trace.calls` | Any function | Controlled | Yes — message limit | Yes |
+| `:dbg` raw | Any function | HIGH | No | No without limits |
 
-Trazar `Ecto.Repo.all/2` o `Phoenix.Router.dispatch/2` en un nodo con 10k req/s saturará el tracer inmediatamente. Usa match specs para filtrar antes de capturar:
-
-```elixir
-# MAL: traza absolutamente todo
-:recon_trace.calls({Ecto.Repo, :all, :_}, 100)
-
-# BIEN: solo cuando el segundo arg coincide con una query específica
-match_spec = [{{:_, :"$1"}, [{:==, :"$1", {:query, :users}}], []}]
-:recon_trace.calls({Ecto.Repo, :all, match_spec}, 100)
-```
-
-### 5. No considerar que `:sys` modifica la semántica de errores
-
-Si el proceso tracedado muere, `:sys.log/2` puede retornar `{:error, :noproc}`. Siempre envuelve las llamadas `:sys` en un `try/rescue` cuando el proceso puede estar muerto o reiniciándose.
-
-### 6. Asumir que el call graph dinámico coincide con el estático
-
-El call graph capturado con `:dbg` refleja las llamadas reales durante el workload. Rutas condicionales, pattern matching en funciones con múltiples clauses, y macros pueden hacer que el grafo dinámico sea muy diferente al análisis estático del código.
+**Decision rule**:
+- If the issue is in one known GenServer → start with `:sys.log` and `:sys.get_state`
+- If the issue is spread across function calls → use `:recon_trace.calls` with a low limit
+- Never use raw `:dbg` without `:recon_trace` wrapper on a production node
 
 ---
 
-## Summary
+## Common production mistakes
 
-El ecosistema de tracing de BEAM ofrece herramientas para cada nivel de riesgo:
+**1. Using `:dbg.tracer/0` without a message limit on a production node**
+`:dbg.tracer()` followed by `:dbg.p(:all, :call)` will trace every function call
+system-wide. On a busy gateway, this generates millions of trace messages per
+second, OOMs the tracer process, and can crash the node. Always use `:recon_trace`
+which has mandatory limits.
 
-- **Desarrollo/Staging**: `:sys.trace`, `:dbg` con match specs, `:sys.log` para captura pasiva
-- **Producción**: `:recon_trace` exclusivamente — tiene límites built-in y semántica de seguridad
+**2. Forgetting to call `:sys.log(pid, false)` or `:recon_trace.clear()`**
+`:sys.log` and `:recon_trace` tracing stays active until explicitly disabled.
+In `:sys.log`'s case, the ring buffer accumulates memory. In `:recon_trace`'s case,
+it stops after the message limit but leaves trace flags on the tracing target.
+Always clean up after diagnosis.
 
-La regla de oro: **siempre activa un límite de calls, siempre limpia en un `after`**. El tracing sin límites en producción es más peligroso que el bug que intentas diagnosticar.
+**3. Using `:sys.suspend/1` on a critical GenServer in production**
+`:sys.suspend` freezes the process — all messages queue up. On a GenServer that
+handles requests, this causes request timeouts. Use `:sys.get_state` (read-only)
+instead of suspend for observation.
 
----
+**4. Reading `:sys.log` before the slow event happens**
+The ring buffer captures the *last N* messages, overwriting older ones. Enable
+the log, wait for the slow event to reproduce, *then* read it. Reading it
+immediately after enabling returns zero messages.
 
-## What's Next
-
-- **Ejercicio 28**: Benchmarking riguroso con Benchee — cuantificar performance con rigor estadístico
-- Investiga `:ttb` (Trace Tool Builder) para tracing distribuido entre nodos
-- Lee sobre `Logger` backends y cómo construir un tracer que escriba a archivo en lugar de stdout
-- Explora `:observer_backend` para entender cómo Observer obtiene los datos que muestra
+**5. Assuming `:recon_trace` shows *all* calls up to the limit**
+`:recon_trace` uses BEAM's trace mechanism which samples at the VM level. Under
+very high call frequency, some calls may not appear in the trace output. Use it
+for diagnosis, not as a precise call counter.
 
 ---
 
 ## Resources
 
-- [Recon Trace documentation](https://ferd.github.io/recon/recon_trace.html)
-- [Fred Hébert — "Tracing Erlang Code"](https://ferd.ca/erlang-otp-21-s-new-logger.html)
-- [:sys module — Erlang docs](https://www.erlang.org/doc/man/sys.html)
-- [:dbg module — Erlang docs](https://www.erlang.org/doc/man/dbg.html)
-- [Matching Specs — Erlang docs](https://www.erlang.org/doc/apps/erts/match_spec.html)
+- [`:sys` module — Erlang docs](https://www.erlang.org/doc/man/sys.html) — complete API for OTP process inspection
+- [`:recon_trace` — Recon docs](https://ferd.github.io/recon/recon_trace.html) — safe function tracing with examples
+- [Erlang in Anger — Fred Hébert](https://www.erlang-in-anger.com/) — chapter 9 covers production tracing strategies
+- [`:dbg` module — Erlang docs](https://www.erlang.org/doc/man/dbg.html) — raw trace API (understand before using)
+- [Match specs — Erlang docs](https://www.erlang.org/doc/apps/erts/match_spec.html) — match specification language for tracing filters

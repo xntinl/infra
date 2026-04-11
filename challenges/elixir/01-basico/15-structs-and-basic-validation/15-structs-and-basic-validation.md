@@ -1,586 +1,496 @@
-# 15. Structs and Basic Validation
+# Structs and Basic Validation: Formalizing the Transaction Type
 
-**Difficulty**: Basico
-
----
-
-## Prerequisites
-
-- Módulos y visibilidad (ejercicio 14)
-- Maps y keyword lists (ejercicio 07)
-- Pattern matching básico (ejercicio 05)
-- Guards básicos (`when is_binary/1`, `when is_integer/1`)
+**Project**: `payments_cli` — built incrementally across the basic level
 
 ---
 
-## Learning Objectives
+## Project context
 
-- Definir structs con `defstruct` dentro de un módulo
-- Crear instancias de structs con valores por defecto y personalizados
-- Acceder a campos con dot notation: `user.name`
-- Actualizar structs de forma inmutable con la syntax `%Struct{original | field: value}`
-- Hacer pattern matching sobre structs
-- Distinguir structs de maps simples y entender cuándo usar cada uno
-- Implementar funciones constructor con validación básica
+You're building `payments_cli`. After fourteen exercises, the transaction data has
+been passed around as plain maps: `%{id: "T1", status: :approved, amount_cents: 1000, ...}`.
+That works, but it has a critical weakness: nothing prevents a caller from passing
+`%{id: "T1", amount: 1000}` (forgetting `amount_cents`) or `%{status: "approved"}`
+(wrong type for status). The compiler cannot help — it has no idea what shape a
+"transaction" should have.
 
----
+Structs fix this. A `%PaymentsCli.Transaction{}` struct declares the exact fields
+at compile time, provides defaults, and enables pattern matching by type. This exercise
+replaces the ad-hoc map convention with a proper typed struct, giving the entire
+project a stable, documented contract for what a transaction is.
 
-## Concepts
+Project structure at this point:
 
-### ¿Qué es un struct?
-
-Un struct es un map con:
-1. Un módulo asociado que le da su tipo
-2. Campos definidos en compile time (no pueden añadirse campos arbitrarios)
-3. Valores por defecto para cada campo
-
-```elixir
-defmodule User do
-  defstruct name: "", age: 0, active: true
-end
 ```
-
-### Crear instancias
-
-```elixir
-# Con valores por defecto
-empty_user = %User{}
-IO.inspect(empty_user)
-# => %User{active: true, age: 0, name: ""}
-
-# Con valores personalizados
-alice = %User{name: "Alice", age: 30}
-IO.inspect(alice)
-# => %User{active: true, age: 30, name: "Alice"}
-
-# Solo algunos campos (el resto usa defaults)
-partial = %User{name: "Bob"}
-IO.inspect(partial)
-# => %User{active: true, age: 0, name: "Bob"}
-```
-
-### Acceder a campos
-
-```elixir
-alice = %User{name: "Alice", age: 30, active: true}
-
-alice.name    # => "Alice"   — dot notation
-alice.age     # => 30
-alice.active  # => true
-
-# También funciona la syntax de map con atom key
-alice[:name]  # => "Alice"
-```
-
-### Actualizar campos — inmutabilidad
-
-Como todo en Elixir, los structs son inmutables. Para "actualizar" un campo
-debes crear un nuevo struct:
-
-```elixir
-alice = %User{name: "Alice", age: 30}
-
-# Crea un NUEVO struct con age modificado; alice no cambia
-senior_alice = %User{alice | age: 31}
-
-IO.inspect(alice.age)         # 30 — sin cambios
-IO.inspect(senior_alice.age)  # 31 — nuevo struct
-```
-
-La syntax `%Struct{original | field: new_value}` solo puede cambiar campos que
-ya existen en `defstruct`. Intentar añadir campos nuevos lanza `KeyError`.
-
-### Pattern matching con structs
-
-```elixir
-defmodule User do
-  defstruct name: "", age: 0, active: true
-
-  def greet(%User{name: name}) do
-    "Hello, #{name}!"
-  end
-
-  def status(%User{active: true}),  do: "Usuario activo"
-  def status(%User{active: false}), do: "Usuario inactivo"
-end
-
-alice = %User{name: "Alice", age: 30}
-User.greet(alice)        # => "Hello, Alice!"
-User.status(alice)       # => "Usuario activo"
-```
-
-El pattern `%User{name: name}` hace dos cosas a la vez:
-1. Verifica que el valor sea un struct de tipo `User`
-2. Extrae el campo `name` a la variable `name`
-
-### Struct vs Map
-
-```elixir
-# Map: cualquier clave, cualquier tipo, sin módulo asociado
-map = %{name: "Alice", age: 30}
-
-# Struct: campos fijos, tipo asociado al módulo
-struct = %User{name: "Alice", age: 30}
-
-# is_struct verifica el tipo
-is_struct(struct)        # => true
-is_struct(struct, User)  # => true
-is_struct(map, User)     # => false
-
-# Un struct también es un map
-is_map(struct)           # => true
-
-# Diferencia clave: los structs NO tienen campos arbitrarios
-# %User{nickname: "ally"}  # => KeyError en compile time
-```
-
-| Aspecto | Map | Struct |
-|---------|-----|--------|
-| Campos | Cualquiera, dinámicos | Definidos en compile time |
-| Tipo | Solo `%{}` | Módulo específico |
-| Defaults | No | Sí, en `defstruct` |
-| Pattern match por tipo | No | Sí, con `%User{}` |
-| Campos extra | Sí | No (KeyError) |
-
-### Función constructor con validación
-
-La convención en Elixir es definir `new/1` o `new/n` como función pública
-que valida los datos antes de crear el struct:
-
-```elixir
-defmodule User do
-  defstruct name: "", age: 0, active: true
-
-  def new(name, age) when is_binary(name) and is_integer(age) and age >= 0 do
-    {:ok, %User{name: name, age: age}}
-  end
-
-  def new(_name, _age) do
-    {:error, "name must be a string and age a non-negative integer"}
-  end
-end
-
-User.new("Alice", 30)   # => {:ok, %User{active: true, age: 30, name: "Alice"}}
-User.new("Bob", -5)     # => {:error, "name must be a string and age a non-negative integer"}
-User.new(123, 30)       # => {:error, "name must be a string and age a non-negative integer"}
+payments_cli/
+├── lib/
+│   └── payments_cli/
+│       ├── cli.ex
+│       ├── transaction.ex      # ← you extend this (add defstruct)
+│       ├── ledger.ex
+│       ├── formatter.ex
+│       ├── pipeline.ex
+│       ├── processor.ex
+│       ├── router.ex
+│       ├── analytics.ex
+│       ├── report.ex
+│       ├── rules.ex
+│       └── config.ex
+├── test/
+│   └── payments_cli/
+│       └── transaction_struct_test.exs  # given tests — must pass without modification
+└── mix.exs
 ```
 
 ---
 
-## Exercises
+## Why structs are an architectural decision, not syntax sugar
 
-### Ejercicio 1: Definir un struct básico
+Up to this point, the project has used convention to communicate what a transaction
+looks like. Every module has a comment like `# transactions are maps with :id, :status,
+:amount_cents, :currency`. This is documentation — invisible to the compiler.
 
-```elixir
-defmodule User do
-  @moduledoc "Representa un usuario del sistema."
+A struct changes that:
 
-  defstruct name: "", age: 0, active: true
-end
+1. **Compile-time field enforcement**: `%PaymentsCli.Transaction{nonexistent: 1}` is a
+   compile error. With maps, `%{nonexistent: 1}` silently creates an unintended key.
 
-# Con todos los defaults
-empty = %User{}
-IO.inspect(empty)
+2. **Pattern matching by type**: `def process(%Transaction{} = tx)` will raise at
+   runtime if the caller passes a plain map. The function signature becomes a contract
+   enforced at the call boundary.
 
-# Con valores personalizados
-alice = %User{name: "Alice", age: 30}
-IO.inspect(alice)
+3. **`@spec` alignment**: type specs can reference `%Transaction{}` rather than `map()`,
+   enabling Dialyzer to catch misuse.
 
-# Solo cambiando active
-inactive = %User{name: "Bob", age: 25, active: false}
-IO.inspect(inactive)
-```
+4. **Defaults are documented in the code**: `defstruct amount_cents: 0` documents the
+   default at the definition site, not scattered across callers.
 
-**Expected output:**
-```
-%User{active: true, age: 0, name: ""}
-%User{active: true, age: 30, name: "Alice"}
-%User{active: false, age: 25, name: "Bob"}
-```
+The trade-off: structs are more rigid. If you need a general key-value bag (arbitrary
+keys, flexible shape), a map is correct. When the shape is known and fixed — a domain
+entity like a transaction — a struct is the right tool.
 
 ---
 
-### Ejercicio 2: Crear instancias y explorar errores de campos inexistentes
+## The business problem
 
-```elixir
-defmodule Product do
-  defstruct name: "", price: 0.0, stock: 0
-end
+The `PaymentsCli.Transaction` module already has functions (`classify_status/1`,
+`parse_status/1`, etc.) that work on maps. This exercise adds a `defstruct` to that
+module, a validated `new/1` constructor, and functions that leverage pattern matching
+by struct type.
 
-laptop = %Product{name: "Laptop Pro", price: 999.99, stock: 10}
-IO.inspect(laptop)
-
-# Campo con default
-no_stock = %Product{name: "Widget", price: 4.99}
-IO.inspect(no_stock)
-
-# Intentar campo inexistente lanza error en compile time.
-# Descomenta la siguiente línea para ver el error:
-# invalid = %Product{name: "X", color: "red"}
-# => ** (KeyError) key :color not found
-```
-
-**Expected output:**
-```
-%Product{name: "Laptop Pro", price: 999.99, stock: 10}
-%Product{name: "Widget", price: 4.99, stock: 0}
-```
+The new `%Transaction{}` struct captures all the fields that the rest of the project
+has been using by convention: `:id`, `:status`, `:amount_cents`, `:currency`,
+`:merchant`, `:date`, and `:reference`.
 
 ---
 
-### Ejercicio 3: Acceso a campos con dot notation
+## Implementation
+
+### Extend `lib/payments_cli/transaction.ex`
+
+Add a `defstruct` and the new public functions to the existing module:
 
 ```elixir
-defmodule Point do
-  defstruct x: 0, y: 0
-end
+defmodule PaymentsCli.Transaction do
+  @moduledoc """
+  Typed representation of a payment transaction.
 
-p = %Point{x: 3, y: 7}
+  Use `new/1` to create validated transactions.
+  All processing functions in payments_cli accept `%Transaction{}` structs.
 
-IO.inspect(p.x)
-IO.inspect(p.y)
+  ## Examples
 
-# También funciona la sintaxis de map
-IO.inspect(p[:x])
+      iex> {:ok, tx} = PaymentsCli.Transaction.new(id: "T1", amount_cents: 1000, currency: "USD")
+      iex> tx.status
+      :pending
 
-# Calcular distancia al origen
-distance = :math.sqrt(p.x * p.x + p.y * p.y)
-IO.inspect(Float.round(distance, 4))
-```
+  """
 
-**Expected output:**
-```
-3
-7
-3
-7.6158
-```
+  # All fields that a transaction can carry.
+  # Fields without a default MUST be provided in new/1.
+  # Fields with nil defaults are optional.
+  @enforce_keys [:id, :amount_cents, :currency]
+  defstruct [
+    :id,
+    :amount_cents,
+    :currency,
+    status: :pending,
+    merchant: nil,
+    date: nil,
+    reference: nil
+  ]
 
----
-
-### Ejercicio 4: Actualizar structs — inmutabilidad
-
-```elixir
-defmodule User do
-  defstruct name: "", age: 0, active: true
-end
-
-alice = %User{name: "Alice", age: 30}
-IO.puts("Original: age = #{alice.age}")
-
-# Crear nuevo struct con age modificado
-older_alice = %User{alice | age: alice.age + 1}
-IO.puts("Updated:  age = #{older_alice.age}")
-IO.puts("Original unchanged: age = #{alice.age}")
-
-# Puedes cambiar múltiples campos a la vez
-retired = %User{alice | age: 65, active: false}
-IO.inspect(retired)
-IO.inspect(alice)
-```
-
-**Expected output:**
-```
-Original: age = 30
-Updated:  age = 31
-Original unchanged: age = 30
-%User{active: false, age: 65, name: "Alice"}
-%User{active: true, age: 30, name: "Alice"}
-```
-
----
-
-### Ejercicio 5: Pattern matching con structs
-
-```elixir
-defmodule User do
-  defstruct name: "", age: 0, active: true
-end
-
-defmodule UserFormatter do
-  def greet(%User{name: name, active: true}) do
-    "Hello, #{name}! (cuenta activa)"
-  end
-
-  def greet(%User{name: name, active: false}) do
-    "Hello, #{name}. (cuenta inactiva)"
-  end
-
-  def label(%User{age: age}) when age >= 18 do
-    :adult
-  end
-
-  def label(%User{}) do
-    :minor
-  end
-end
-
-alice = %User{name: "Alice", age: 30, active: true}
-bob   = %User{name: "Bob", age: 16, active: false}
-
-IO.puts(UserFormatter.greet(alice))
-IO.puts(UserFormatter.greet(bob))
-IO.inspect(UserFormatter.label(alice))
-IO.inspect(UserFormatter.label(bob))
-```
-
-**Expected output:**
-```
-Hello, Alice! (cuenta activa)
-Hello, Bob. (cuenta inactiva)
-:adult
-:minor
-```
-
----
-
-### Ejercicio 6: Constructor con validación básica
-
-```elixir
-defmodule User do
-  defstruct name: "", age: 0, active: true
+  @type t :: %__MODULE__{
+    id: String.t(),
+    amount_cents: non_neg_integer(),
+    currency: String.t(),
+    status: :pending | :approved | :declined | :flagged,
+    merchant: String.t() | nil,
+    date: String.t() | nil,
+    reference: String.t() | nil
+  }
 
   @doc """
-  Crea un nuevo User con validación básica.
+  Creates a validated Transaction struct from a keyword list.
 
-  Retorna `{:ok, %User{}}` si los datos son válidos,
-  o `{:error, reason}` si no lo son.
+  Required fields: `:id`, `:amount_cents`, `:currency`
+  Optional fields (with defaults): `:status` (`:pending`), `:merchant`, `:date`, `:reference`
+
+  Returns `{:ok, %Transaction{}}` on success, `{:error, reason}` on failure.
+
+  ## Examples
+
+      iex> PaymentsCli.Transaction.new(id: "T1", amount_cents: 500, currency: "USD")
+      {:ok, %PaymentsCli.Transaction{id: "T1", amount_cents: 500, currency: "USD", status: :pending, merchant: nil, date: nil, reference: nil}}
+
+      iex> PaymentsCli.Transaction.new(id: "T1", amount_cents: -1, currency: "USD")
+      {:error, "amount_cents must be >= 0"}
+
+      iex> PaymentsCli.Transaction.new(amount_cents: 500, currency: "USD")
+      {:error, "id is required"}
+
   """
-  def new(name, age)
-      when is_binary(name) and name != "" and
-           is_integer(age) and age >= 0 and age <= 150 do
-    {:ok, %User{name: name, age: age}}
+  @spec new(keyword()) :: {:ok, t()} | {:error, String.t()}
+  def new(fields) when is_list(fields) do
+    # TODO: build a Transaction struct from fields, then validate it.
+    #
+    # Step 1: check that required fields (:id, :amount_cents, :currency) are present
+    #   For each required field, if not Keyword.has_key?(fields, field),
+    #   return {:error, "#{field} is required"}
+    #
+    # Step 2: build the struct using struct/2
+    #   tx = struct(__MODULE__, fields)
+    #   Note: struct/2 ignores unknown keys, so only defined fields are set.
+    #
+    # Step 3: validate the built struct via validate/1 (private)
+    #   case validate(tx) do
+    #     :ok -> {:ok, tx}
+    #     {:error, reason} -> {:error, reason}
+    #   end
   end
 
-  def new("", _age), do: {:error, "name cannot be empty"}
-  def new(_name, age) when not is_integer(age), do: {:error, "age must be an integer"}
-  def new(_name, age) when age < 0, do: {:error, "age cannot be negative"}
-  def new(_name, _age), do: {:error, "invalid arguments"}
+  @doc """
+  Returns true if the transaction has been approved.
+
+  ## Examples
+
+      iex> {:ok, tx} = PaymentsCli.Transaction.new(id: "T1", amount_cents: 100, currency: "USD", status: :approved)
+      iex> PaymentsCli.Transaction.approved?(tx)
+      true
+
+      iex> {:ok, tx} = PaymentsCli.Transaction.new(id: "T2", amount_cents: 100, currency: "USD")
+      iex> PaymentsCli.Transaction.approved?(tx)
+      false
+
+  """
+  @spec approved?(t()) :: boolean()
+  def approved?(%__MODULE__{status: :approved}), do: true
+  def approved?(%__MODULE__{}), do: false
+
+  @doc """
+  Updates the status of a transaction, returning a new struct.
+
+  Returns `{:error, :invalid_status}` if the status is not a known atom.
+
+  ## Examples
+
+      iex> {:ok, tx} = PaymentsCli.Transaction.new(id: "T1", amount_cents: 100, currency: "USD")
+      iex> {:ok, approved} = PaymentsCli.Transaction.set_status(tx, :approved)
+      iex> approved.status
+      :approved
+
+      iex> {:ok, tx} = PaymentsCli.Transaction.new(id: "T1", amount_cents: 100, currency: "USD")
+      iex> PaymentsCli.Transaction.set_status(tx, :unknown)
+      {:error, :invalid_status}
+
+  """
+  @spec set_status(t(), atom()) :: {:ok, t()} | {:error, :invalid_status}
+  def set_status(%__MODULE__{} = tx, status) when status in [:pending, :approved, :declined, :flagged] do
+    # TODO: return {:ok, %__MODULE__{tx | status: status}}
+  end
+
+  def set_status(%__MODULE__{}, _status), do: {:error, :invalid_status}
+
+  @doc """
+  Formats the transaction amount as a human-readable dollar string.
+
+  ## Examples
+
+      iex> {:ok, tx} = PaymentsCli.Transaction.new(id: "T1", amount_cents: 15099, currency: "USD")
+      iex> PaymentsCli.Transaction.format_amount(tx)
+      "$150.99"
+
+  """
+  @spec format_amount(t()) :: String.t()
+  def format_amount(%__MODULE__{amount_cents: cents}) do
+    # TODO: convert cents to dollars and format as "$X.XX"
+    # Use div/2 for the dollar part and rem/2 for the cents part.
+    # Use String.pad_leading/3 to ensure the cents are always two digits.
+  end
+
+  # The existing functions (classify_status/1, parse_status/1, valid_statuses/0, etc.)
+  # from exercise 02 remain in the module unchanged — do NOT redefine them here.
+  # Structs are maps; the existing functions that accept map() also accept %Transaction{}.
+  # Over time, their @spec annotations would be tightened from map() to t().
+
+  # ---------------------------------------------------------------------------
+  # Private — validation details are implementation, not public contract
+  # ---------------------------------------------------------------------------
+
+  @spec validate(t()) :: :ok | {:error, String.t()}
+  defp validate(%__MODULE__{amount_cents: cents}) when cents < 0 do
+    {:error, "amount_cents must be >= 0"}
+  end
+
+  defp validate(%__MODULE__{currency: currency}) when not is_binary(currency) or byte_size(currency) == 0 do
+    {:error, "currency must be a non-empty string"}
+  end
+
+  defp validate(%__MODULE__{id: id}) when not is_binary(id) or byte_size(id) == 0 do
+    {:error, "id must be a non-empty string"}
+  end
+
+  defp validate(%__MODULE__{}), do: :ok
 end
-
-# Casos válidos
-IO.inspect(User.new("Alice", 30))
-IO.inspect(User.new("Bob", 0))
-
-# Casos inválidos
-IO.inspect(User.new("", 25))
-IO.inspect(User.new("Carol", -5))
-IO.inspect(User.new("Dave", "treinta"))
 ```
 
-**Expected output:**
-```
-{:ok, %User{active: true, age: 30, name: "Alice"}}
-{:ok, %User{active: true, age: 0, name: "Bob"}}
-{:error, "name cannot be empty"}
-{:error, "age cannot be negative"}
-{:error, "age must be an integer"}
-```
-
----
-
-## Common Mistakes
-
-### Error 1: Crear struct sin `defstruct` en el módulo
+### Given tests — must pass without modification
 
 ```elixir
-# WRONG — el módulo no tiene defstruct
-defmodule Foo do
-  def hello, do: "hello"
-end
+# test/payments_cli/transaction_struct_test.exs
+defmodule PaymentsCli.TransactionStructTest do
+  use ExUnit.Case, async: true
 
-%Foo{name: "Alice"}
-```
+  alias PaymentsCli.Transaction
 
-```
-** (UndefinedFunctionError) function Foo.__struct__/1 is undefined
-```
+  doctest PaymentsCli.Transaction
 
-**Why**: Los structs requieren `defstruct` dentro del módulo. Sin él, el módulo
-no tiene la función `__struct__/1` que habilita la syntax `%Foo{}`.
+  describe "new/1" do
+    test "creates a transaction with required fields" do
+      assert {:ok, tx} = Transaction.new(id: "T1", amount_cents: 1000, currency: "USD")
+      assert tx.id == "T1"
+      assert tx.amount_cents == 1000
+      assert tx.currency == "USD"
+    end
 
-**Fix**:
-```elixir
-defmodule Foo do
-  defstruct name: ""  # definir campos antes de usarlos
-end
+    test "applies default status of :pending" do
+      assert {:ok, tx} = Transaction.new(id: "T1", amount_cents: 500, currency: "USD")
+      assert tx.status == :pending
+    end
 
-%Foo{name: "Alice"}  # ahora funciona
-```
+    test "accepts optional fields" do
+      assert {:ok, tx} =
+               Transaction.new(
+                 id: "T1",
+                 amount_cents: 500,
+                 currency: "USD",
+                 merchant: "Coffee Co",
+                 date: "2024-01-15",
+                 reference: "REF-001"
+               )
 
----
+      assert tx.merchant == "Coffee Co"
+      assert tx.date == "2024-01-15"
+      assert tx.reference == "REF-001"
+    end
 
-### Error 2: Actualizar un campo que no existe en el struct
+    test "returns error when id is missing" do
+      assert {:error, message} = Transaction.new(amount_cents: 500, currency: "USD")
+      assert is_binary(message)
+    end
 
-```elixir
-# WRONG — intentar añadir un campo que no está en defstruct
-defmodule User do
-  defstruct name: "", age: 0
-end
+    test "returns error when amount_cents is missing" do
+      assert {:error, message} = Transaction.new(id: "T1", currency: "USD")
+      assert is_binary(message)
+    end
 
-user = %User{name: "Alice"}
-%User{user | email: "alice@example.com"}
-```
+    test "returns error when currency is missing" do
+      assert {:error, message} = Transaction.new(id: "T1", amount_cents: 500)
+      assert is_binary(message)
+    end
 
-```
-** (KeyError) key :email not found in: %User{age: 0, name: "Alice"}
-```
+    test "returns error for negative amount_cents" do
+      assert {:error, message} = Transaction.new(id: "T1", amount_cents: -1, currency: "USD")
+      assert is_binary(message)
+    end
 
-**Why**: La syntax `%User{original | field: value}` solo puede cambiar campos
-que ya existen en el struct. No puede añadir campos nuevos — eso rompería
-la garantía de que el struct tiene exactamente los campos definidos.
+    test "returns error for empty id" do
+      assert {:error, _} = Transaction.new(id: "", amount_cents: 500, currency: "USD")
+    end
 
-**Fix**: Añade el campo a `defstruct`:
-```elixir
-defmodule User do
-  defstruct name: "", age: 0, email: ""   # añadir email
-end
+    test "returns error for empty currency" do
+      assert {:error, _} = Transaction.new(id: "T1", amount_cents: 500, currency: "")
+    end
+  end
 
-user  = %User{name: "Alice"}
-user2 = %User{user | email: "alice@example.com"}  # ahora funciona
-```
+  describe "approved?/1" do
+    test "returns true for approved transaction" do
+      {:ok, tx} = Transaction.new(id: "T1", amount_cents: 100, currency: "USD", status: :approved)
+      assert Transaction.approved?(tx) == true
+    end
 
----
+    test "returns false for pending transaction" do
+      {:ok, tx} = Transaction.new(id: "T1", amount_cents: 100, currency: "USD")
+      assert Transaction.approved?(tx) == false
+    end
 
-### Error 3: Pensar que los structs soportan herencia
+    test "returns false for declined transaction" do
+      {:ok, tx} = Transaction.new(id: "T1", amount_cents: 100, currency: "USD", status: :declined)
+      assert Transaction.approved?(tx) == false
+    end
+  end
 
-```elixir
-# WRONG — no hay herencia de structs en Elixir
-defmodule Animal do
-  defstruct name: ""
-end
+  describe "set_status/2" do
+    setup do
+      {:ok, tx} = Transaction.new(id: "T1", amount_cents: 100, currency: "USD")
+      {:ok, tx: tx}
+    end
 
-defmodule Dog do
-  # No puedes "extender" Animal aquí
-  defstruct Animal, breed: ""  # esto no es sintaxis válida
-end
-```
+    test "updates status to approved", %{tx: tx} do
+      assert {:ok, updated} = Transaction.set_status(tx, :approved)
+      assert updated.status == :approved
+    end
 
-**Why**: Elixir no tiene herencia orientada a objetos. Los structs son
-simplemente maps con metadata de módulo. No hay jerarquía de tipos.
+    test "does not mutate the original struct", %{tx: tx} do
+      {:ok, _updated} = Transaction.set_status(tx, :approved)
+      assert tx.status == :pending
+    end
 
-**Fix**: Usa composición — incluye el struct como campo, o comparte lógica
-mediante funciones de módulo:
-```elixir
-defmodule Animal do
-  defstruct name: "", species: ""
-end
+    test "returns error for unknown status", %{tx: tx} do
+      assert {:error, :invalid_status} = Transaction.set_status(tx, :unknown)
+    end
+  end
 
-defmodule Dog do
-  defstruct animal: %Animal{}, breed: ""
+  describe "format_amount/1" do
+    test "formats cents as dollar string" do
+      {:ok, tx} = Transaction.new(id: "T1", amount_cents: 15099, currency: "USD")
+      assert Transaction.format_amount(tx) == "$150.99"
+    end
 
-  def new(name, breed) do
-    %Dog{
-      animal: %Animal{name: name, species: "Canis lupus familiaris"},
-      breed: breed
-    }
+    test "pads single-digit cents" do
+      {:ok, tx} = Transaction.new(id: "T1", amount_cents: 100, currency: "USD")
+      assert Transaction.format_amount(tx) == "$1.00"
+    end
+
+    test "handles zero" do
+      {:ok, tx} = Transaction.new(id: "T1", amount_cents: 0, currency: "USD")
+      assert Transaction.format_amount(tx) == "$0.00"
+    end
+  end
+
+  describe "struct type safety" do
+    test "is_struct/2 verifies module type" do
+      {:ok, tx} = Transaction.new(id: "T1", amount_cents: 100, currency: "USD")
+      assert is_struct(tx, Transaction)
+      refute is_struct(%{id: "T1", amount_cents: 100, currency: "USD"}, Transaction)
+    end
+
+    test "struct is also a map" do
+      {:ok, tx} = Transaction.new(id: "T1", amount_cents: 100, currency: "USD")
+      assert is_map(tx)
+    end
+
+    test "immutable update creates new struct" do
+      {:ok, tx} = Transaction.new(id: "T1", amount_cents: 100, currency: "USD")
+      updated = %Transaction{tx | amount_cents: 200}
+      assert tx.amount_cents == 100
+      assert updated.amount_cents == 200
+    end
   end
 end
 ```
 
----
-
-### Error 4: Usar Map.get con structs cuando dot notation falla de forma confusa
-
-```elixir
-defmodule User do
-  defstruct name: "", age: 0
-end
-
-user = %User{name: "Alice"}
-
-# Intentar acceder a un campo inexistente con dot notation
-user.email
-```
-
-```
-** (KeyError) key :email not found in: %User{age: 0, name: "Alice"}
-```
-
-**Why**: El struct no tiene el campo `:email`. A diferencia de `Map.get/3`,
-el dot notation lanza `KeyError` inmediatamente.
-
-**Fix**: Usa `Map.get/3` con default si el campo es opcional, o añade el campo
-al struct:
-```elixir
-# Si el campo puede no existir — aunque en structs bien definidos esto raro
-email = Map.get(user, :email, "no email")  # => "no email"
-
-# Lo correcto: definir el campo en defstruct con default nil
-defmodule User do
-  defstruct name: "", age: 0, email: nil
-end
-user = %User{name: "Alice"}
-user.email  # => nil  — siempre tiene el campo, puede ser nil
-```
-
----
-
-## Verification
+### Run the tests
 
 ```bash
-iex
+mix test test/payments_cli/transaction_struct_test.exs --trace
 ```
 
+Note: `doctest PaymentsCli.Transaction` runs the examples in `@doc` blocks as tests.
+Your `@doc` examples must produce the exact output shown.
+
+---
+
+## Trade-off analysis
+
+| Aspect | Plain map `%{...}` | Struct `%Transaction{}` | Ecto.Schema |
+|--------|-------------------|------------------------|-------------|
+| Compile-time field check | No | Yes (with `@enforce_keys`) | Yes |
+| Pattern match by type | No | Yes | Yes |
+| Can add arbitrary keys | Yes | No (`KeyError`) | No |
+| Type spec support | `map()` only | `%Transaction{}` | `%Transaction{}` |
+| Changeset / validation | Manual | Manual (`new/1`) | Built-in |
+| Appropriate for | Exploratory code, flexible shapes | Domain entities with known fields | Database-backed entities |
+
+Reflection question: `new/1` uses `struct/2` to build the transaction, which silently
+ignores unknown keys. An alternative is to check for unknown keys and return
+`{:error, "unknown field: #{key}"}` — rejecting unexpected input explicitly.
+When would that stricter approach prevent real bugs? When would it make the API
+unnecessarily fragile?
+
+---
+
+## Common production mistakes
+
+**1. `@enforce_keys` without handling the `ArgumentError`**
 ```elixir
-# Definir struct
-defmodule Point do
-  defstruct x: 0, y: 0
-end
-
-# Crear instancias
-p1 = %Point{}
-p2 = %Point{x: 3, y: 4}
-IO.inspect(p1)  # %Point{x: 0, y: 0}
-IO.inspect(p2)  # %Point{x: 3, y: 4}
-
-# Acceso
-p2.x   # => 3
-p2.y   # => 4
-
-# Actualización inmutable
-p3 = %Point{p2 | x: 10}
-p2.x   # => 3  (sin cambios)
-p3.x   # => 10 (nuevo struct)
-
-# Pattern matching
-%Point{x: x, y: y} = p2
-IO.inspect({x, y})  # => {3, 4}
-
-# is_struct
-is_struct(p2)         # => true
-is_struct(p2, Point)  # => true
-is_map(p2)            # => true (también es un map)
-is_struct(%{x: 3})    # => false (map simple)
+@enforce_keys [:id]
+defstruct [:id, name: ""]
 ```
+If you create `%MyStruct{}` without `:id`, Elixir raises `ArgumentError` at compile
+time (in `defstruct` context) or at runtime (when `struct!` is called directly).
+Always provide `:id` or use your `new/1` constructor which validates before creating.
 
----
+**2. Updating a field that does not exist**
+```elixir
+tx = %Transaction{id: "T1", amount_cents: 100, currency: "USD"}
+%Transaction{tx | fee: 25}  # KeyError — :fee is not a defined field
+```
+The update syntax `%Struct{original | key: val}` can only modify existing fields.
+Adding a new field requires changing `defstruct`. This is intentional — it prevents
+accidental schema drift.
 
-## Summary
+**3. Pattern matching structs from different modules**
+```elixir
+# Two modules, both with a :name field
+defmodule Cat do defstruct name: "" end
+defmodule Dog do defstruct name: "" end
 
-- `defstruct field: default` dentro de un módulo define los campos del struct.
-- `%Module{}` crea un struct con defaults; `%Module{field: value}` con valores.
-- El acceso es con dot notation: `struct.field`. También funciona `struct[:field]`.
-- La actualización crea un nuevo struct: `%Module{original | field: new_val}`.
-- No se pueden añadir campos fuera de los definidos en `defstruct` — KeyError.
-- Los structs también son maps (`is_map/1` retorna true), pero con tipo.
-- `is_struct(x, Module)` verifica que `x` sea exactamente ese tipo de struct.
-- La convención `def new/n` encapsula creación + validación.
-- No existe herencia de structs — usa composición.
+def pet_name(%Cat{name: n}), do: n  # only matches Cat structs
+def pet_name(%Dog{name: n}), do: n  # only matches Dog structs
+```
+The `%ModuleName{}` pattern checks the `__struct__` key of the map, which stores
+the module atom. A `%Cat{}` will never match `%Dog{name: n}` even though both have
+`:name`. This type-safety is the main advantage of structs over maps.
 
----
+**4. Assuming struct equality is field equality**
+```elixir
+%Transaction{id: "T1", amount_cents: 100, currency: "USD"} ==
+%Transaction{id: "T1", amount_cents: 100, currency: "USD"}
+# => true — struct equality IS field equality (including __struct__ key)
+```
+This actually works correctly — struct equality compares all fields including the
+hidden `__struct__` field. But be careful: a struct and a map with the same visible
+fields are NOT equal, because the map lacks `__struct__`.
 
-## What's Next
-
-- Protocolos — implementar behavior polimórfico para tus structs (ej. `String.Chars`)
-- Ecto.Schema — structs para bases de datos con validaciones completas
-- `Access` behaviour — acceso dinámico a campos de structs
+**5. Using `Map.put/3` to add fields to structs**
+```elixir
+tx = %Transaction{id: "T1", amount_cents: 100, currency: "USD"}
+Map.put(tx, :extra_field, "value")
+# => %{__struct__: PaymentsCli.Transaction, id: "T1", ..., extra_field: "value"}
+```
+`Map.put/3` bypasses struct validation and adds the field anyway (it treats the
+struct as a plain map). The result is no longer a valid struct — it has an extra
+key that `defstruct` did not declare. Pattern matching `%Transaction{}` on it still
+works (the `__struct__` key is present), but the extra field is invisible to struct
+operations and may confuse the next reader. Never use `Map.put/3` to modify structs.
 
 ---
 
 ## Resources
 
 - [Structs — Elixir Getting Started](https://elixir-lang.org/getting-started/structs.html)
-- [defstruct — HexDocs](https://hexdocs.pm/elixir/Kernel.html#defstruct/1)
+- [defstruct — Kernel docs](https://hexdocs.pm/elixir/Kernel.html#defstruct/1)
+- [@enforce_keys — Kernel docs](https://hexdocs.pm/elixir/Kernel.html#module-enforcing-keys)
+- [struct/2 — Kernel docs](https://hexdocs.pm/elixir/Kernel.html#struct/2)
 - [Elixir School — Structs](https://elixirschool.com/en/lessons/basics/structs)
-- [Composing Elixir structs](https://hexdocs.pm/elixir/Map.html)
+- [Typespec for structs — Elixir Getting Started](https://elixir-lang.org/getting-started/typespecs-and-behaviours.html)

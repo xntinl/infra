@@ -1,35 +1,85 @@
-# 1. Setup and Mix
+# Setup and Mix: Bootstrapping payments_cli
 
-**Difficulty**: Basico
+**Project**: `payments_cli` — built incrementally across the basic level
 
-## Prerequisites
-- Terminal / línea de comandos básica
-- Ningún conocimiento previo de Elixir requerido
+---
 
-## Learning Objectives
-After completing this exercise, you will be able to:
-- Instalar Elixir y verificar que el entorno funciona correctamente
-- Crear un proyecto nuevo con Mix y entender su estructura
-- Compilar el proyecto y ejecutar código en IEx (shell interactivo)
-- Gestionar dependencias con `mix deps.get`
-- Navegar los comandos disponibles con `mix help`
+## Project context
 
-## Concepts
+You're building `payments_cli`, a CLI tool that processes payment transactions from CSV
+files, validates them, applies business rules, and produces ledger reports.
 
-### Mix: El Build Tool de Elixir
-Mix es la herramienta oficial de construcción y gestión de proyectos en Elixir. Cumple un rol similar a `cargo` en Rust, `npm` en Node.js, o `gradle` en Java. Con un solo comando puedes crear proyectos, compilar código, ejecutar tests, formatear archivos y gestionar dependencias externas.
+This first exercise sets up the project from scratch. Every subsequent exercise adds a
+module to this same project.
 
-Mix no es una herramienta opcional — es parte del ecosistema central de Elixir. Todo proyecto real en Elixir se crea y gestiona con Mix. Entender Mix desde el principio te ahorrará confusión más adelante.
+Project structure at this point:
+
+```
+payments_cli/
+├── lib/
+│   └── payments_cli/
+│       └── cli.ex          # ← you create this
+├── test/
+│   └── payments_cli/
+│       └── cli_test.exs    # given tests — must pass without modification
+└── mix.exs
+```
+
+---
+
+## Why Mix matters for a senior developer
+
+Mix is not just a scaffold generator. It is the build system, task runner, dependency
+manager, and release tool for every Elixir project. Understanding what Mix generates
+and why matters when you need to:
+
+- Configure compile-time behavior per environment (`:dev`, `:test`, `:prod`)
+- Add Mix tasks for operational work (database migrations, data imports)
+- Configure releases with `mix release` for deployment
+- Understand the app supervision tree defined in `application/0`
+
+Every Elixir project you encounter professionally starts with `mix.exs`. Reading
+it tells you the Elixir version, dependencies, test configuration, and release
+strategy in under 30 lines.
+
+---
+
+## The business problem
+
+The payments team needs a CLI tool to process transaction CSV files exported by the bank.
+The first version just needs to:
+
+1. Accept a file path as a command-line argument
+2. Print the number of transactions found
+3. Exit with code 0 on success, 1 on error
+
+This is Exercise 1 of 15. The full `payments_cli` system emerges incrementally.
+
+---
+
+## Implementation
+
+### Step 1: Create the project
+
+```bash
+mix new payments_cli
+cd payments_cli
+mkdir -p lib/payments_cli
+mkdir -p test/payments_cli
+```
+
+### Step 2: `mix.exs` — understand what was generated
+
+Open `mix.exs`. You will see:
 
 ```elixir
-# mix.exs es el archivo de configuración del proyecto
-# Define el nombre, versión, y dependencias del proyecto
-defmodule HelloElixir.MixProject do
+# mix.exs
+defmodule PaymentsCli.MixProject do
   use Mix.Project
 
   def project do
     [
-      app: :hello_elixir,
+      app: :payments_cli,
       version: "0.1.0",
       elixir: "~> 1.17",
       start_permanent: Mix.env() == :prod,
@@ -38,7 +88,9 @@ defmodule HelloElixir.MixProject do
   end
 
   def application do
-    [extra_applications: [:logger]]
+    [
+      extra_applications: [:logger]
+    ]
   end
 
   defp deps do
@@ -47,434 +99,179 @@ defmodule HelloElixir.MixProject do
 end
 ```
 
-### Estructura de un Proyecto Mix
-Cuando ejecutas `mix new nombre_proyecto`, Mix genera una estructura estándar que todos los proyectos Elixir comparten. Esta convención sobre configuración permite a cualquier desarrollador Elixir orientarse rápidamente en cualquier proyecto.
+Key decisions visible here:
+- `start_permanent: Mix.env() == :prod` — in production, if the top-level supervisor
+  crashes, the VM exits. In dev/test, it does not. This is intentional.
+- `extra_applications: [:logger]` — the Logger application starts automatically.
+  Remove it and you lose structured logging across your whole app.
+- `deps/0` is private (`defp`) — dependencies are an internal concern of the build
+  system, not a public API of the project module.
 
-```
-hello_elixir/
-├── lib/
-│   └── hello_elixir.ex    # Código fuente principal
-├── test/
-│   ├── hello_elixir_test.exs  # Tests
-│   └── test_helper.exs        # Configuración de tests
-├── .formatter.exs         # Configuración del formateador
-├── .gitignore
-└── mix.exs                # Configuración del proyecto (dependencias, versión, etc.)
-```
+### Step 3: `lib/payments_cli/cli.ex`
 
-El directorio `lib/` contiene todo el código fuente. El directorio `test/` contiene los tests. Mix usa la extensión `.ex` para archivos compilados y `.exs` para scripts (incluyendo tests y configuración).
-
-### IEx: El Shell Interactivo
-IEx (Interactive Elixir) es el REPL de Elixir. Es una herramienta indispensable para explorar código, probar funciones, y depurar. La diferencia crítica entre `iex` e `iex -S mix` es que la segunda carga tu proyecto completo, haciendo disponibles todos tus módulos.
+`# TODO` marks what you need to implement. Do not change the public function
+signatures — the tests depend on them.
 
 ```elixir
-# En IEx puedes evaluar cualquier expresión Elixir
-iex> 1 + 1
-2
-
-iex> "Hello, " <> "Elixir!"
-"Hello, Elixir!"
-
-iex> Enum.map([1, 2, 3], fn x -> x * 2 end)
-[2, 4, 6]
-
-# Dentro de iex -S mix, tus módulos están disponibles
-iex> HelloElixir.hello()
-:world
-```
-
-### Comandos Mix Esenciales
-Mix expone una colección de tasks. Cada task es una operación específica — compilar, testear, formatear, etc. Puedes incluso crear tus propias Mix tasks para automatizar tareas del proyecto.
-
-```elixir
-# mix new: crea un proyecto nuevo
-# mix compile: compila el proyecto (también lo hace mix automaticamente cuando es necesario)
-# mix test: ejecuta el suite de tests
-# mix format: formatea el código según las reglas de Elixir
-# mix deps.get: descarga las dependencias definidas en mix.exs
-# mix deps.update --all: actualiza todas las dependencias
-# mix help: lista todos los comandos disponibles
-# mix help <task>: muestra documentación detallada de un task específico
-```
-
-## Exercises
-
-### Exercise 1: Install Elixir and Verify the Environment
-Antes de crear proyectos necesitas confirmar que Elixir está instalado correctamente y que las tres herramientas principales están disponibles: `elixir`, `mix`, e `iex`.
-
-```bash
-# Verificar versión de Elixir (runtime y compilador)
-$ elixir --version
-
-# Output esperado (versiones exactas pueden variar):
-# Erlang/OTP 27 [erts-15.0] [source] [64-bit] [smp:8:8] [async-threads:1]
-# Elixir 1.17.0 (compiled with Erlang/OTP 27)
-
-# Verificar Mix
-$ mix --version
-
-# Output esperado:
-# Mix 1.17.0 (compiled with Erlang/OTP 27)
-
-# Verificar IEx
-$ iex --version
-
-# Output esperado:
-# IEx 1.17.0 (compiled with Erlang/OTP 27)
-```
-
-Si alguno de los comandos falla con `command not found`, instala Elixir siguiendo la guía oficial en https://elixir-lang.org/install.html. Se recomienda usar `asdf` o `mise` para gestionar versiones de Elixir en el mismo sistema.
-
-Expected output:
-```
-Erlang/OTP 27 [erts-15.0] [source] [64-bit]
-Elixir 1.17.0 (compiled with Erlang/OTP 27)
-```
-
-### Exercise 2: Create a New Project with Mix
-`mix new` crea la estructura completa de un proyecto Elixir. El nombre del proyecto en Snake Case se convierte automáticamente en el nombre del módulo principal en CamelCase.
-
-```bash
-# Crear el proyecto en el directorio actual
-$ mix new hello_elixir
-
-# Output de mix new:
-# * creating README.md
-# * creating .formatter.exs
-# * creating .gitignore
-# * creating mix.exs
-# * creating lib/
-# * creating lib/hello_elixir.ex
-# * creating test/
-# * creating test/test_helper.exs
-# * creating test/hello_elixir_test.exs
-#
-# Your Mix project was created successfully.
-# You can use "mix" to compile it, test it, and more:
-#
-#     cd hello_elixir
-#     mix test
-
-# Entrar al directorio del proyecto
-$ cd hello_elixir
-
-# Explorar la estructura generada
-$ ls -la
-```
-
-Abre `lib/hello_elixir.ex` en tu editor. Verás el módulo generado automáticamente:
-
-```elixir
-defmodule HelloElixir do
+defmodule PaymentsCli.CLI do
   @moduledoc """
-  Documentation for `HelloElixir`.
+  Entry point for the payments_cli command-line tool.
+
+  Parses arguments and delegates to the appropriate subsystem.
+  This module is intentionally thin — it only handles argument parsing
+  and exit codes. Business logic lives elsewhere.
   """
 
   @doc """
-  Hello world.
+  Main entry point. Called by `mix run` or the compiled escript.
 
-  ## Examples
-
-      iex> HelloElixir.hello()
-      :world
-
+  Receives the list of command-line arguments as strings.
+  Returns :ok on success or {:error, reason} on failure.
   """
-  def hello do
-    :world
+  @spec main([String.t()]) :: :ok | {:error, String.t()}
+  def main(args) do
+    # TODO: implement argument parsing
+    #
+    # HINT: use pattern matching on `args` to handle:
+    #   [file_path] when is_binary(file_path) -> process the file
+    #   []                                    -> {:error, "no file path given"}
+    #   _other                                -> {:error, "usage: payments_cli <file>"}
+    #
+    # For now, just print "Processing: <file_path>" and return :ok
+    # The real processing comes in later exercises.
+  end
+
+  @doc """
+  Prints a formatted error message to stderr and returns the error.
+  Keeping this separate from main/1 makes testing easier — tests can
+  call main/1 and check the return value without capturing stderr.
+  """
+  @spec print_error(String.t()) :: {:error, String.t()}
+  def print_error(message) do
+    # TODO: write message to stderr using IO.puts(:stderr, ...)
+    # then return {:error, message}
   end
 end
 ```
 
-Expected output:
-```
-* creating README.md
-* creating .formatter.exs
-* creating .gitignore
-* creating mix.exs
-* creating lib/hello_elixir.ex
-* creating test/hello_elixir_test.exs
-```
+### Step 4: Given tests — must pass without modification
 
-### Exercise 3: Compile and Run in IEx
-Con el proyecto creado, compílalo y ábrelo en IEx para llamar a tu primera función Elixir.
-
-```bash
-# Compilar el proyecto (desde dentro del directorio hello_elixir)
-$ mix compile
-
-# Output:
-# Compiling 1 file (.ex)
-# Generated hello_elixir app
-
-# Abrir IEx con el proyecto cargado
-$ iex -S mix
-```
+Copy this file exactly. Your implementation must make all tests pass.
 
 ```elixir
-# Dentro de IEx, el módulo HelloElixir está disponible
-iex> HelloElixir.hello()
-:world
+# test/payments_cli/cli_test.exs
+defmodule PaymentsCli.CLITest do
+  use ExUnit.Case, async: true
 
-# También puedes inspeccionar el módulo
-iex> h HelloElixir
-# Muestra la documentación del módulo
+  alias PaymentsCli.CLI
 
-iex> h HelloElixir.hello
-# Muestra la documentación de la función hello/0
-```
+  describe "main/1" do
+    test "returns :ok when given a file path" do
+      assert :ok = CLI.main(["transactions.csv"])
+    end
 
-Expected output:
-```
-iex> HelloElixir.hello()
-:world
-```
+    test "returns error when no arguments given" do
+      assert {:error, message} = CLI.main([])
+      assert is_binary(message)
+      assert String.length(message) > 0
+    end
 
-### Exercise 4: Modify the Greeting and Recompile
-Edita el módulo para que `hello/0` retorne un string en lugar del atom `:world`. Luego recarga el módulo en IEx sin salir.
+    test "returns error when too many arguments given" do
+      assert {:error, message} = CLI.main(["file1.csv", "file2.csv"])
+      assert is_binary(message)
+    end
+  end
 
-```elixir
-# Edita lib/hello_elixir.ex y cambia la función hello:
-defmodule HelloElixir do
-  @moduledoc """
-  Mi primer módulo Elixir.
-  """
+  describe "print_error/1" do
+    test "returns {:error, message}" do
+      assert {:error, "something went wrong"} = CLI.print_error("something went wrong")
+    end
 
-  @doc """
-  Retorna un saludo personalizado.
-
-  ## Examples
-
-      iex> HelloElixir.hello()
-      "Hello, Elixir World!"
-
-  """
-  def hello do
-    "Hello, Elixir World!"
+    test "returns the original message unchanged" do
+      msg = "unexpected input format"
+      assert {:error, ^msg} = CLI.print_error(msg)
+    end
   end
 end
 ```
 
-```elixir
-# Dentro de IEx, recompila sin salir del shell
-iex> recompile()
-# Output: Compiling 1 file (.ex)
-# :ok
-
-# Ahora la función retorna el string nuevo
-iex> HelloElixir.hello()
-"Hello, Elixir World!"
-```
-
-`recompile()` es una función helper de IEx que recompila todos los archivos modificados y recarga los módulos. Es más rápido que salir de IEx y volver a entrar.
-
-Expected output:
-```
-iex> recompile()
-Compiling 1 file (.ex)
-:ok
-iex> HelloElixir.hello()
-"Hello, Elixir World!"
-```
-
-### Exercise 5: Explore Mix Help
-Mix tiene muchos comandos disponibles. Aprende a descubrirlos sin salir del terminal.
+### Step 5: Run the tests
 
 ```bash
-# Listar todos los tasks disponibles
-$ mix help
+mix test test/payments_cli/cli_test.exs --trace
+```
 
-# Output (fragmento):
-# mix                   # Runs the default task (current: "mix run")
-# mix app.config        # Reads and validates an application's config
-# mix app.start         # Starts all registered apps
-# mix app.tree          # Prints the application tree
-# mix archive           # Lists installed archives
-# mix clean             # Deletes generated application files
-# mix compile           # Compiles source files
-# mix deps              # Lists dependencies and their status
-# mix deps.clean        # Deletes the given dependencies' files
-# mix deps.compile      # Compiles dependencies
-# mix deps.get          # Gets all out of date dependencies
-# mix deps.tree         # Prints the dependency tree
-# mix deps.unlock       # Unlocks the given dependencies
-# mix deps.update       # Updates the given dependencies
-# mix format            # Formats the given files/patterns
-# mix help              # Prints help information for tasks
-# mix test              # Runs a project's tests
-# ...
+Tests fail initially — implement `CLI.main/1` and `CLI.print_error/1` until all pass.
 
-# Ver documentación detallada de un task específico
-$ mix help test
+### Step 6: Explore Mix tasks
 
-# Ejecutar los tests del proyecto
-$ mix test
+```bash
+# See all available tasks
+mix help
+
+# Understand what test does
+mix help test
+
+# Format your code
+mix format
+
+# Check for compilation warnings
+mix compile --warnings-as-errors
 ```
 
 ```bash
-# Output de mix test con el proyecto recién creado:
-# ..
-# Finished in 0.03 seconds (0.03s on load, 0.00s async, 0.00s sync)
-# 1 doctest, 1 test, 0 failures
+# Run with arguments via mix run
+mix run -e 'PaymentsCli.CLI.main(["transactions.csv"])'
 ```
 
-Expected output:
-```
-..
-Finished in 0.03 seconds
-1 doctest, 1 test, 0 failures
-```
+---
 
-### Exercise 6: Add Module Documentation with @moduledoc
-Elixir tiene documentación de primera clase integrada en el lenguaje. Agrega documentación real a tu módulo usando los atributos `@moduledoc` y `@doc`.
+## Trade-off analysis
 
-```elixir
-# lib/hello_elixir.ex — versión con documentación completa
-defmodule HelloElixir do
-  @moduledoc """
-  HelloElixir es el módulo principal de mi primer proyecto Elixir.
+Fill in this table based on what you observe after completing the implementation.
 
-  Contiene funciones de demostración para aprender los conceptos
-  básicos del lenguaje.
-  """
+| Aspect | Current approach | Alternative |
+|--------|-----------------|-------------|
+| Argument parsing | Pattern match on `args` list | `OptionParser.parse/2` for flags |
+| Error reporting | Return `{:error, reason}` | Raise exception immediately |
+| stderr vs stdout | `IO.puts(:stderr, ...)` | `IO.puts(...)` (stdout) |
+| Entry point | `main/1` called by `mix run` | escript compiled binary |
 
-  @doc """
-  Retorna un saludo de bienvenida.
+Reflection question: why does `main/1` return `{:error, reason}` instead of calling
+`System.halt(1)` directly? Think about testability.
 
-  ## Examples
+---
 
-      iex> HelloElixir.hello()
-      "Hello, Elixir World!"
+## Common production mistakes
 
-  """
-  def hello do
-    "Hello, Elixir World!"
-  end
+**1. `iex` without `-S mix` loses your project**
+`iex` opens a bare Elixir session. `iex -S mix` compiles and loads your project.
+Running `PaymentsCli.CLI.main/1` in plain `iex` gives `UndefinedFunctionError`.
+Always use `iex -S mix` when working interactively on a project.
 
-  @doc """
-  Retorna un saludo personalizado con el nombre dado.
+**2. `recompile()` in IEx is not the same as restarting**
+`recompile()` reloads changed modules but does not restart the supervision tree.
+For changes to `application/0` in `mix.exs`, you must fully restart `iex -S mix`.
 
-  ## Parameters
-  - name: String con el nombre a saludar
+**3. Forgetting `mix deps.get` after editing `mix.exs`**
+Adding a dependency to `deps/0` does not automatically download it. Run
+`mix deps.get` before `mix compile`. Skipping this gives cryptic "module not found"
+errors at compile time.
 
-  ## Examples
+**4. `start_permanent` confusion in dev**
+`start_permanent: Mix.env() == :prod` means crashes are more visible in production
+(the VM exits) but silent in dev (the supervisor restarts). If something crashes in
+dev and you don't see it, check `Mix.env()`.
 
-      iex> HelloElixir.greet("Alice")
-      "Hello, Alice! Welcome to Elixir."
+**5. Test files in the wrong directory**
+Mix only picks up test files under `test/`. A file at `lib/my_test.exs` is never
+run by `mix test`. Follow the convention: `test/<module_path>_test.exs`.
 
-  """
-  def greet(name) do
-    "Hello, #{name}! Welcome to Elixir."
-  end
-end
-```
-
-```bash
-# Dentro de IEx, la documentación es accesible con h/1
-$ iex -S mix
-```
-
-```elixir
-iex> recompile()
-:ok
-
-iex> HelloElixir.greet("Alice")
-"Hello, Alice! Welcome to Elixir."
-
-iex> h HelloElixir
-# Muestra el @moduledoc formateado
-
-iex> h HelloElixir.greet
-# Muestra el @doc de la función greet/1
-```
-
-Expected output:
-```
-iex> HelloElixir.greet("Alice")
-"Hello, Alice! Welcome to Elixir."
-```
-
-## Common Mistakes
-
-### Mistake 1: Olvidar mix deps.get después de editar mix.exs
-**Wrong:**
-```bash
-# Agregas una dependencia a mix.exs y vas directo a compilar
-$ mix compile
-```
-**Error:** `** (Mix) No such file or directory "deps/jason"`
-**Why:** Mix no descarga dependencias automáticamente. Necesitas ejecutar `mix deps.get` cada vez que agregas o cambias dependencias en `mix.exs`.
-**Fix:**
-```bash
-# Siempre ejecuta deps.get después de modificar mix.exs
-$ mix deps.get
-$ mix compile
-```
-
-### Mistake 2: Usar iex sin -S mix
-**Wrong:**
-```bash
-# Abrir IEx simple, sin cargar el proyecto
-$ iex
-```
-```elixir
-iex> HelloElixir.hello()
-# ** (UndefinedFunctionError) function HelloElixir.hello/0 is undefined
-# (module HelloElixir is not available)
-```
-**Error:** `UndefinedFunctionError` — el módulo no está disponible porque el proyecto no fue cargado.
-**Why:** `iex` abre una sesión Elixir vacía sin ningún proyecto. `iex -S mix` compila y carga tu proyecto antes de abrir la sesión interactiva.
-**Fix:**
-```bash
-# Siempre usar iex -S mix para trabajar con tu proyecto
-$ iex -S mix
-```
-
-### Mistake 3: No recompilar después de editar código en IEx
-**Wrong:**
-```elixir
-# Editas lib/hello_elixir.ex pero no recargas en IEx
-iex> HelloElixir.hello()
-"Hello, Elixir World!"  # Retorna el valor anterior, no el nuevo
-```
-**Error:** No hay error, pero los cambios no se reflejan — IEx mantiene la versión compilada anterior en memoria.
-**Why:** IEx carga los módulos compilados al iniciar. Los cambios en archivos fuente no se propagan automáticamente.
-**Fix:**
-```elixir
-# Recompila dentro de IEx para recargar los módulos modificados
-iex> recompile()
-Compiling 1 file (.ex)
-:ok
-iex> HelloElixir.hello()
-"Nuevo valor"
-```
-
-## Verification
-```bash
-$ cd hello_elixir
-$ iex -S mix
-iex> HelloElixir.hello()
-"Hello, Elixir World!"
-iex> HelloElixir.greet("Alice")
-"Hello, Alice! Welcome to Elixir."
-```
-
-```bash
-$ mix test
-..
-Finished in 0.03 seconds
-1 doctest, 1 test, 0 failures
-```
-
-## Summary
-- **Key concepts**: Mix como build tool, estructura de proyecto, IEx como REPL, `@moduledoc` y `@doc`
-- **What you practiced**: Crear proyecto con `mix new`, compilar con `mix compile`, explorar en `iex -S mix`, recompilar con `recompile()`, gestionar dependencias con `mix deps.get`
-- **Important to remember**: `iex -S mix` carga tu proyecto; `iex` no. Usa `recompile()` en IEx para recargar cambios sin reiniciar la sesión.
-
-## What's Next
-En el siguiente ejercicio **02-atoms-and-symbols** aprenderás sobre atoms — los identificadores únicos e inmutables de Elixir, y el patrón `{:ok, value}` / `{:error, reason}` que verás en todo el ecosistema.
+---
 
 ## Resources
-- [The Elixir Getting Started Guide](https://elixir-lang.org/getting-started)
-- [Mix Documentation](https://hexdocs.pm/mix/Mix.html)
-- [IEx Documentation](https://hexdocs.pm/iex/IEx.html)
-- [Installing Elixir](https://elixir-lang.org/install.html)
+
+- [Mix documentation — HexDocs](https://hexdocs.pm/mix/Mix.html) — read `project/0`, `application/0`, and `deps/0` sections
+- [IEx documentation — HexDocs](https://hexdocs.pm/iex/IEx.html) — `h/1`, `recompile/0`, `i/1`
+- [Mix.Task — writing custom tasks](https://hexdocs.pm/mix/Mix.Task.html)
+- [Elixir releases — mix release](https://hexdocs.pm/mix/Mix.Tasks.Release.html) — how `start_permanent` matters in production

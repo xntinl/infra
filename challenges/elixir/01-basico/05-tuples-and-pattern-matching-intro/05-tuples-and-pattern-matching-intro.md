@@ -1,610 +1,289 @@
-# 5. Tuples and Pattern Matching Intro
+# Tuples and Pattern Matching: Transaction Result Handling
 
-**Difficulty**: Basico
+**Project**: `payments_cli` — built incrementally across the basic level
 
-## Prerequisites
-- Haber completado los ejercicios 01 al 04
-- Familiaridad con atoms (ejercicio 02) — el patrón `{:ok, value}` es central aquí
-- IEx disponible
+---
 
-## Learning Objectives
-After completing this exercise, you will be able to:
-- Crear tuplas y acceder a sus elementos con `elem/2`
-- Usar el operador `=` como match (unificación), no como asignación
-- Desestructurar tuplas para extraer valores en variables
-- Aplicar el pin operator `^` para evitar rebinding
-- Ignorar valores irrelevantes con el wildcard `_`
+## Project context
 
-## Concepts
+You're building `payments_cli`. Every operation in the payments pipeline — parsing,
+validation, processing — can fail. Elixir's pattern matching and the `{:ok, value}` /
+`{:error, reason}` convention are the mechanism for expressing and handling these
+failures explicitly.
 
-### Tuplas: Colecciones de Tamaño Fijo
-Una tupla es una colección ordenada de elementos de tamaño fijo. Se crea con llaves `{}` y puede contener elementos de cualquier tipo — números, atoms, strings, otras tuplas. Su tamaño se determina en tiempo de compilación y no cambia.
+Project structure at this point:
 
-Las tuplas se almacenan de forma contigua en la BEAM heap, lo que hace que el acceso por índice sea O(1) y extremadamente rápido. Por otro lado, agregar o quitar elementos de una tupla requiere crear una nueva — por eso no son apropiadas para colecciones dinámicas. Para eso están las listas.
+```
+payments_cli/
+├── lib/
+│   └── payments_cli/
+│       ├── cli.ex
+│       ├── transaction.ex
+│       ├── ledger.ex
+│       ├── formatter.ex
+│       └── pipeline.ex     # ← you implement this
+├── test/
+│   └── payments_cli/
+│       └── pipeline_test.exs  # given tests — must pass without modification
+└── mix.exs
+```
+
+---
+
+## Why `=` is not assignment in Elixir
+
+In Python and Java, `x = 5` assigns the value `5` to `x`. In Elixir, `x = 5` is
+a **match expression**. The left side must be compatible with the right side, or
+the process raises `MatchError`.
+
+This distinction becomes important when you write:
 
 ```elixir
-# Tuplas de distintos tamaños y tipos
-{}                              # tupla vacía
-{1, 2, 3}                       # tupla de integers
-{:ok, 42}                       # el patrón ok/value
-{:error, "not found"}           # el patrón error/reason
-{:error, :timeout}              # reason como atom
-{"Alice", 30, :admin}           # mezcla de tipos
-{{1, 2}, {3, 4}}                # tuplas anidadas
-
-# Acceder elementos por índice (base 0)
-elem({:ok, 42}, 0)     # :ok
-elem({:ok, 42}, 1)     # 42
-
-# Tamaño de la tupla
-tuple_size({1, 2, 3})  # 3
-tuple_size({:ok})      # 1
+{:ok, transaction} = process(line)
 ```
 
-### El Operador = : Match, No Asignación
-Este es el concepto más importante de Elixir y el que más diferencia al lenguaje de los lenguajes imperativos. En Elixir, `=` es el **operador de match**. Cuando escribes `x = 5`, Elixir intenta hacer que el lado izquierdo "coincida" con el lado derecho. Si el lado izquierdo es una variable no asignada, el match siempre tiene éxito y la variable se liga al valor.
+This is not "assign the result to a variable called `transaction`". It is:
+"assert that `process/1` returned a two-element tuple where the first element
+is the atom `:ok`, and bind the second element to the variable `transaction`".
+If `process/1` returns `{:error, :invalid_amount}`, the match fails and the
+process dies with a `MatchError`.
 
-El binding de variables es un efecto secundario del match, no su propósito principal. El propósito del `=` es verificar que una estructura coincide con un patrón. Esto se llama **unificación** en la terminología de lenguajes de programación lógica.
+That failure is **not a bug** — it is Elixir's fail-fast design. A MatchError
+with a clear message (`no match of right hand side value: {:error, :invalid_amount}`)
+is better than silently continuing with corrupted data.
+
+---
+
+## The business problem
+
+The `Pipeline` module needs to:
+
+1. Process a single CSV line through parse → validate → classify
+2. Return `{:ok, transaction_map}` on success
+3. Return `{:error, reason}` on any failure, identifying which step failed
+4. Process a batch of lines and separate successes from failures
+
+---
+
+## Implementation
+
+### `lib/payments_cli/pipeline.ex`
 
 ```elixir
-# En lenguajes imperativos, = asigna:
-# x = 5  (Python/Java) → x recibe el valor 5
-
-# En Elixir, = intenta hacer match:
-x = 5     # Match exitoso: x se liga a 5
-
-# El match funciona en ambas direcciones conceptualmente
-5 = x     # Match exitoso: 5 == 5 ✓
-6 = x     # ** (MatchError) — 6 no coincide con 5
-
-# El poder del match: extraer partes de una estructura
-{a, b, c} = {1, 2, 3}   # a = 1, b = 2, c = 3
-```
-
-### Desestructuración: Extraer Valores
-El match no solo verifica igualdad — también puede extraer valores de estructuras complejas en variables. Esto se llama **desestructuración** o **destructuring**.
-
-La desestructuración es la forma idiomática de Elixir para acceder a los componentes de una tupla. En lugar de `elem(result, 1)` para acceder al segundo elemento, se usa el match `{:ok, value} = result` — que además verifica que el primer elemento es `:ok`.
-
-```elixir
-# Desestructuración básica
-{a, b} = {1, 2}
-# a = 1, b = 2
-
-# El atom en el match actúa como guardia — debe coincidir exactamente
-{:ok, value} = {:ok, 42}
-# value = 42
-
-# Si el atom no coincide, el match falla
-{:ok, value} = {:error, "oops"}
-# ** (MatchError) no match of right hand side value: {:error, "oops"}
-
-# Desestructuración anidada
-{:ok, {name, age}} = {:ok, {"Alice", 30}}
-# name = "Alice", age = 30
-
-# Uso real: procesar resultado de una función
-case File.read("config.txt") do
-  {:ok, content} -> process(content)
-  {:error, reason} -> handle_error(reason)
-end
-```
-
-### El Pin Operator ^: Match sin Rebinding
-Por defecto, cuando una variable aparece en el lado izquierdo de `=`, Elixir la rebinda al nuevo valor. El pin operator `^` previene el rebinding — fuerza a que la variable se use como valor fijo para el match.
-
-El `^` se pronuncia "pin" y su nombre viene de la idea de "fijar" (pin) una variable a su valor actual para que no cambie durante el match.
-
-```elixir
-x = 1
-
-# Sin pin: x se rebinda a 2
-x = 2
-# x es ahora 2
-
-x = 1
-
-# Con pin: x mantiene su valor 1 y se usa para el match
-^x = 1    # Match exitoso: 1 == 1 ✓
-^x = 2    # ** (MatchError) — 2 no coincide con x que vale 1
-
-# Caso de uso: verificar que una respuesta contiene el ID esperado
-expected_id = 42
-{:ok, ^expected_id} = {:ok, 42}   # Match exitoso
-{:ok, ^expected_id} = {:ok, 99}   # ** MatchError — el ID no es el esperado
-
-# En listas (se verá en ejercicios posteriores)
-y = 5
-[^y, second] = [5, 10]
-# second = 10
-
-[^y, second] = [99, 10]
-# ** (MatchError)
-```
-
-### Wildcard _: Ignorar Valores
-El wildcard `_` es un placeholder especial que siempre hace match con cualquier valor pero no lo liga a ninguna variable. Se usa cuando necesitas el match para que funcione pero no te importa el valor en esa posición.
-
-También puedes usar variables que empiezan con `_` (como `_reason`, `_id`) — estas hacen match y ligan el valor, pero el compilador suprime la advertencia de "variable no usada". La diferencia es que `_` no puede usarse después del match, mientras que `_reason` sí.
-
-```elixir
-# Ignorar un elemento específico
-{_, second, _} = {1, 2, 3}
-# second = 2
-# El primer y tercer elemento son ignorados
-
-# Ignorar el reason en un error cuando solo quieres saber que falló
-{:error, _} = {:error, "some complex error message we don't need"}
-# Match exitoso, el error se ignora
-
-# _ no se puede usar después del match
-{_, b} = {1, 2}
-_         # ** (CompileError) — _ no está disponible para leer
-
-# _variable sí puede usarse, pero suprime el warning
-{_first, second} = {1, 2}
-second    # 2
-# _first  # Esto funciona pero es inusual — mejor no hacerlo
-
-# Múltiples _ son independientes — cada uno puede coincidir con algo diferente
-{_, _, third} = {1, "different", 3}
-# third = 3
-```
-
-## Exercises
-
-### Exercise 1: Creating Tuples and Accessing Elements
-Crea tuplas de distintos tamaños y tipos, y accede a sus elementos con `elem/2`.
-
-```elixir
-$ iex
-
-# Tuplas simples
-iex> {1, 2, 3}
-{1, 2, 3}
-
-iex> {:ok, 42}
-{:ok, 42}
-
-iex> {:error, "not found"}
-{:error, "not found"}
-
-# Tupla con tipos mixtos
-iex> {"Alice", 30, :admin, true}
-{"Alice", 30, :admin, true}
-
-# Acceder por índice — base 0
-iex> elem({:ok, 42}, 0)
-:ok
-
-iex> elem({:ok, 42}, 1)
-42
-
-iex> elem({"Alice", 30, :admin}, 2)
-:admin
-
-# Tamaño de la tupla
-iex> tuple_size({1, 2, 3})
-3
-
-iex> tuple_size({:ok})
-1
-
-iex> tuple_size({})
-0
-
-# Tuplas son valores — se puede usar directamente el resultado
-iex> result = {:ok, 100}
-{:ok, 100}
-
-iex> elem(result, 1) * 2
-200
-```
-
-Expected output:
-```
-iex> elem({:ok, 42}, 0)
-:ok
-iex> elem({:ok, 42}, 1)
-42
-iex> tuple_size({1, 2, 3})
-3
-```
-
-### Exercise 2: Pattern Match as Assignment
-El caso más simple de pattern matching: ligar variables usando `=`.
-
-```elixir
-# Match básico — ambos lados deben coincidir
-iex> x = 42
-42
-
-iex> x
-42
-
-# Match con tupla — desestructuración
-iex> {a, b} = {1, 2}
-{1, 2}
-
-iex> a
-1
-
-iex> b
-2
-
-# El mismo valor en ambos lados siempre funciona
-iex> 42 = 42
-42
-
-# Pero valores distintos fallan
-iex> 42 = 43
-# ** (MatchError) no match of right hand side value: 43
-
-# Rebinding: Elixir permite reasignar variables
-iex> x = 1
-1
-iex> x = 2
-2
-iex> x
-2
-
-# Match con tupla de tres elementos
-iex> {first, second, third} = {"apple", "banana", "cherry"}
-{"apple", "banana", "cherry"}
-
-iex> first
-"apple"
-
-iex> second
-"banana"
-
-iex> third
-"cherry"
-```
-
-Expected output:
-```
-iex> {a, b} = {1, 2}
-{1, 2}
-iex> a
-1
-iex> b
-2
-```
-
-### Exercise 3: Nested Pattern Match
-Desestructura tuplas anidadas para extraer valores profundamente anidados en una sola expresión.
-
-```elixir
-# Tupla anidada
-iex> {{x, y}, z} = {{1, 2}, 3}
-{{1, 2}, 3}
-
-iex> x
-1
-
-iex> y
-2
-
-iex> z
-3
-
-# El patrón idiomático: {:ok, payload} donde payload es una tupla
-iex> {:ok, {name, age}} = {:ok, {"Alice", 30}}
-{:ok, {"Alice", 30}}
-
-iex> name
-"Alice"
-
-iex> age
-30
-
-# Tres niveles de anidamiento
-iex> {:ok, {:user, {id, email}}} = {:ok, {:user, {99, "alice@example.com"}}}
-{:ok, {:user, {99, "alice@example.com"}}}
-
-iex> id
-99
-
-iex> email
-"alice@example.com"
-
-# Con atoms como discriminadores en cada nivel
-iex> {:response, :success, {200, "OK", "body content"}} =
-...>   {:response, :success, {200, "OK", "body content"}}
-
-iex> # El match fue exitoso — todos los atoms coincidieron
-```
-
-Expected output:
-```
-iex> {:ok, {name, age}} = {:ok, {"Alice", 30}}
-{:ok, {"Alice", 30}}
-iex> name
-"Alice"
-iex> age
-30
-```
-
-### Exercise 4: Matching with Atoms — El Patrón Idiomático de Elixir
-Usa pattern matching con atoms para procesar resultados de funciones de forma segura.
-
-```elixir
-# Simular funciones que retornan {:ok, value} o {:error, reason}
-iex> success_result = {:ok, %{id: 1, name: "Alice"}}
-{:ok, %{id: 1, name: "Alice"}}
-
-iex> error_result = {:error, :not_found}
-{:error, :not_found}
-
-# Match exitoso — el atom :ok coincide
-iex> {:ok, user} = success_result
-{:ok, %{id: 1, name: "Alice"}}
-
-iex> user
-%{id: 1, name: "Alice"}
-
-iex> user.name
-"Alice"
-
-# Match fallido — :ok no coincide con :error
-iex> {:ok, user} = error_result
-# ** (MatchError) no match of right hand side value: {:error, :not_found}
-
-# La forma correcta de manejar ambos casos es con case
-iex> case error_result do
-...>   {:ok, data} -> "Got data: #{inspect(data)}"
-...>   {:error, reason} -> "Error: #{reason}"
-...> end
-"Error: not_found"
-
-iex> case success_result do
-...>   {:ok, data} -> "Got data: #{data.name}"
-...>   {:error, reason} -> "Error: #{reason}"
-...> end
-"Got data: Alice"
-```
-
-Expected output:
-```
-iex> {:ok, user} = {:ok, %{id: 1, name: "Alice"}}
-{:ok, %{id: 1, name: "Alice"}}
-iex> user.name
-"Alice"
-```
-
-### Exercise 5: Pin Operator — Match sin Rebinding
-El pin operator `^` te permite usar el valor actual de una variable en un match, previniendo que se rebinde.
-
-```elixir
-# Sin pin — la variable se rebinda
-iex> x = 1
-1
-
-iex> x = 2
-2
-
-iex> x
-2
-
-# Con pin — la variable se usa como valor fijo
-iex> x = 1
-1
-
-iex> ^x = 1
-1
-
-iex> ^x = 2
-# ** (MatchError) no match of right hand side value: 2
-
-# Caso de uso: verificar que el ID en la respuesta coincide con el esperado
-iex> expected_id = 42
-42
-
-iex> {:ok, ^expected_id} = {:ok, 42}
-{:ok, 42}
-
-iex> {:ok, ^expected_id} = {:ok, 99}
-# ** (MatchError) no match of right hand side value: {:ok, 99}
-
-# Ejemplo práctico: verificar que una operación devuelve el usuario correcto
-iex> user_id = 7
-7
-
-iex> response = {:ok, %{id: 7, name: "Alice"}}
-{:ok, %{id: 7, name: "Alice"}}
-
-iex> {:ok, %{id: ^user_id, name: name}} = response
-{:ok, %{id: 7, name: "Alice"}}
-
-iex> name
-"Alice"
-```
-
-Expected output:
-```
-iex> x = 1
-1
-iex> ^x = 1
-1
-iex> ^x = 2
-** (MatchError) no match of right hand side value: 2
-iex> expected_id = 42
-42
-iex> {:ok, ^expected_id} = {:ok, 42}
-{:ok, 42}
-```
-
-### Exercise 6: Wildcard _ — Ignorar Valores en el Match
-Usa `_` para hacer match con elementos que no necesitas capturar.
-
-```elixir
-# Ignorar el primer y tercer elemento
-iex> {_, second, _} = {1, 2, 3}
-{1, 2, 3}
-
-iex> second
-2
-
-# Ignorar el primer elemento de una tupla ok/error/value
-iex> {_, _, value} = {:response, :success, 42}
-{:response, :success, 42}
-
-iex> value
-42
-
-# Solo verificar que el status es :ok sin importar el valor
-iex> {:ok, _} = {:ok, "anything here"}
-{:ok, "anything here"}
-
-iex> {:ok, _} = {:ok, 12345}
-{:ok, 12345}
-
-# _ no está disponible después del match
-iex> {_, b} = {1, 2}
-{1, 2}
-
-iex> b
-2
-
-# _variable — suprime warning pero sí está disponible
-iex> {_first, second} = {10, 20}
-{10, 20}
-
-iex> second
-20
-
-# Uso real: ignorar el error cuando solo quieres continuar
-iex> case {:error, "complex error we don't care about"} do
-...>   {:ok, data} -> data
-...>   {:error, _} -> nil
-...> end
-nil
-```
-
-Expected output:
-```
-iex> {_, second, _} = {1, 2, 3}
-{1, 2, 3}
-iex> second
-2
-iex> {:ok, _} = {:ok, "anything"}
-{:ok, "anything"}
-```
-
-## Common Mistakes
-
-### Mistake 1: Pensar que = es asignación en todos los contextos
-**Wrong:**
-```elixir
-# Intentar "reasignar" la variable a usando el patrón de Elixir
-x = 5
-x = x + 1    # Esto funciona en Elixir (rebinding)
-# Pero no es lo que parece — no modifica x, crea un nuevo binding
-
-# El error real ocurre cuando se espera que el match funcione como mutación
-{:ok, count} = {:ok, 0}
-{:ok, count} = {:ok, count + 1}   # Esto funciona, pero count es una nueva variable
-# En un proceso con estado, esto no "actualiza" el estado global
-```
-**Error:** No hay error de compilación, pero el modelo mental es incorrecto. En Elixir, las variables son inmutables — cada `=` crea un nuevo binding en el mismo nombre, no modifica el valor existente.
-**Why:** Elixir sigue el modelo de variables de Erlang: una variable existe en un scope y su valor no cambia. Cuando haces `x = x + 1`, creas un nuevo binding que oculta al anterior. Los datos originales no se modifican.
-**Fix:**
-```elixir
-# El patrón correcto es pensar en transformaciones, no mutaciones
-initial = {:ok, 0}
-{:ok, count} = initial
-updated = {:ok, count + 1}   # nuevo valor, no mutación
-{:ok, new_count} = updated
-# new_count es 1
-```
-
-### Mistake 2: MatchError no manejado
-**Wrong:**
-```elixir
-# Código que asume siempre éxito sin manejar el caso de error
-def get_user_name(id) do
-  {:ok, user} = UserRepo.find(id)   # MatchError si find retorna {:error, ...}
-  user.name
-end
-```
-**Error:** `** (MatchError) no match of right hand side value: {:error, :not_found}` — el proceso muere con un error no manejado.
-**Why:** El match `{:ok, user} = ...` fallará con MatchError si la función retorna `{:error, ...}`. En Elixir, un proceso que falla con MatchError muere y genera un log de error. Esto puede ser aceptable (deja que el supervisor lo reinicie) o catastrófico dependiendo del contexto.
-**Fix:**
-```elixir
-# Opción 1: usar case para manejar ambos casos explícitamente
-def get_user_name(id) do
-  case UserRepo.find(id) do
-    {:ok, user} -> {:ok, user.name}
-    {:error, reason} -> {:error, reason}
+defmodule PaymentsCli.Pipeline do
+  @moduledoc """
+  Orchestrates the transaction processing pipeline.
+
+  Each step returns {:ok, data} or {:error, reason}. The pipeline
+  stops at the first failure and propagates the error upward.
+  This is the explicit error handling model — no exceptions, no nil checks.
+  """
+
+  alias PaymentsCli.{Formatter, Transaction}
+
+  @doc """
+  Processes a single CSV line through the full pipeline.
+
+  Returns {:ok, transaction} with a validated transaction map,
+  or {:error, {step, reason}} identifying which step failed.
+
+  ## Examples
+
+      iex> PaymentsCli.Pipeline.process_line("TXN001,1234,USD,Coffee Shop,approved")
+      {:ok, %{id: "TXN001", amount_cents: 1234, currency: "USD", merchant: "Coffee Shop", status: :approved}}
+
+      iex> PaymentsCli.Pipeline.process_line("bad data")
+      {:error, {:parse, "expected 5 fields, got 1"}}
+
+  """
+  @spec process_line(String.t()) :: {:ok, map()} | {:error, {atom(), term()}}
+  def process_line(line) when is_binary(line) do
+    # TODO: implement the pipeline
+    #
+    # Step 1: parse with Formatter.parse_csv_line/1
+    #   On {:error, reason}, return {:error, {:parse, reason}}
+    #
+    # Step 2: validate the parsed map (check amount_cents > 0, currency is 3 chars)
+    #   On failure, return {:error, {:validate, reason}}
+    #
+    # Step 3: convert string status to atom with Transaction.parse_status/1
+    #   On {:error, reason}, return {:error, {:status, reason}}
+    #
+    # Return {:ok, map_with_atom_status} on success
+    #
+    # HINT: use case expressions to pattern match on each step result.
+    # In exercise 09 you'll learn `with` which makes this more concise —
+    # for now, use nested case expressions.
+  end
+
+  @doc """
+  Processes a list of CSV lines and separates results.
+
+  Returns {successful_transactions, errors} where:
+  - successful_transactions is a list of transaction maps
+  - errors is a list of {line_number, error} tuples
+
+  ## Examples
+
+      iex> lines = ["TXN001,1000,USD,Shop,approved", "bad", "TXN002,500,USD,Cafe,pending"]
+      iex> {ok, errors} = PaymentsCli.Pipeline.process_batch(lines)
+      iex> length(ok)
+      2
+      iex> length(errors)
+      1
+
+  """
+  @spec process_batch([String.t()]) :: {[map()], [{pos_integer(), term()}]}
+  def process_batch(lines) when is_list(lines) do
+    # TODO: implement batch processing
+    #
+    # HINT: use Enum.with_index(lines, 1) to get {line, line_number} pairs.
+    # Then Enum.reduce to build two accumulators: one for successes, one for errors.
+    # Pattern match on {:ok, tx} and {:error, reason} from process_line/1.
+    #
+    # Remember: prepend to accumulators (O(1)) then Enum.reverse at the end.
+  end
+
+  # ---------------------------------------------------------------------------
+  # Private helpers
+  # ---------------------------------------------------------------------------
+
+  @spec validate_transaction(map()) :: {:ok, map()} | {:error, String.t()}
+  defp validate_transaction(%{amount_cents: amount, currency: currency} = tx) do
+    # TODO: validate amount_cents > 0 and String.length(currency) == 3
+    # Return {:ok, tx} on success, {:error, reason_string} on failure
   end
 end
-
-# Opción 2: usar la versión "bang" que lanza excepción explícita
-# Muchas librerías proveen función/1 y función!/1
-# La versión ! lanza excepción en lugar de retornar {:error, ...}
-user = UserRepo.find!(id)   # Lanza si no encuentra
-user.name
 ```
 
-### Mistake 3: Confundir _x con _
-**Wrong:**
+### Given tests — must pass without modification
+
 ```elixir
-# Pensar que _reason es lo mismo que _ y no puede usarse
-{:error, _reason} = {:error, "timeout after 30s"}
-# Intentar usar _reason y asumir que no funciona
-IO.puts("Ignoring error")
-# _reason   ← comentado porque "no se puede usar"
+# test/payments_cli/pipeline_test.exs
+defmodule PaymentsCli.PipelineTest do
+  use ExUnit.Case, async: true
+
+  alias PaymentsCli.Pipeline
+
+  describe "process_line/1" do
+    test "processes a valid line" do
+      assert {:ok, tx} = Pipeline.process_line("TXN001,1234,USD,Coffee Shop,approved")
+      assert tx.id == "TXN001"
+      assert tx.amount_cents == 1234
+      assert tx.status == :approved
+    end
+
+    test "returns parse error for bad format" do
+      assert {:error, {:parse, _reason}} = Pipeline.process_line("not csv at all")
+    end
+
+    test "returns validate error for negative amount" do
+      assert {:error, {:validate, _reason}} = Pipeline.process_line("TXN001,-100,USD,Shop,approved")
+    end
+
+    test "returns validate error for zero amount" do
+      assert {:error, {:validate, _reason}} = Pipeline.process_line("TXN001,0,USD,Shop,approved")
+    end
+
+    test "returns status error for unknown status" do
+      assert {:error, {:status, _reason}} = Pipeline.process_line("TXN001,100,USD,Shop,exploded")
+    end
+
+    test "converts status string to atom" do
+      assert {:ok, tx} = Pipeline.process_line("TXN001,500,USD,Shop,pending")
+      assert is_atom(tx.status)
+      assert tx.status == :pending
+    end
+  end
+
+  describe "process_batch/1" do
+    test "separates successes from errors" do
+      lines = [
+        "TXN001,1000,USD,Shop A,approved",
+        "bad line",
+        "TXN002,500,USD,Shop B,pending"
+      ]
+
+      {successes, errors} = Pipeline.process_batch(lines)
+      assert length(successes) == 2
+      assert length(errors) == 1
+    end
+
+    test "errors include line number" do
+      lines = ["good,100,USD,Shop,approved", "bad"]
+      {_ok, [{line_number, _reason}]} = Pipeline.process_batch(lines)
+      assert line_number == 2
+    end
+
+    test "empty batch returns empty results" do
+      assert {[], []} = Pipeline.process_batch([])
+    end
+  end
+end
 ```
-**Error:** No hay error técnico, pero se pierde información útil por confusión conceptual.
-**Why:** `_` es un wildcard especial que no crea ningún binding. `_reason` es una variable normal que sí crea un binding y puede usarse — el guión bajo solo suprime el warning del compilador de "variable no usada".
-**Fix:**
-```elixir
-# _ — no crea binding, no puede usarse después
-{:error, _} = {:error, "timeout"}
-# _ es inaccesible después del match
 
-# _reason — sí crea binding, puede usarse, pero no da warning de "no usada"
-{:error, _reason} = {:error, "timeout"}
-# _reason está disponible si la necesitas
-IO.puts("Debug: error was #{_reason}")   # Esto funciona
+### Run the tests
 
-# Convención: usa _ cuando genuinamente no necesitas el valor
-#             usa _name cuando quieres documentar qué es pero no usarlo
-```
-
-## Verification
 ```bash
-$ iex
-iex> {a, b, c} = {1, 2, 3}
-{1, 2, 3}
-iex> a
-1
-iex> {:ok, value} = {:ok, 42}
-{:ok, 42}
-iex> value
-42
-iex> x = 10
-10
-iex> ^x = 10
-10
-iex> {_, second, _} = {"ignored", "important", "also ignored"}
-{"ignored", "important", "also ignored"}
-iex> second
-"important"
-iex> elem({:ok, 42}, 1)
-42
+mix test test/payments_cli/pipeline_test.exs --trace
 ```
 
-## Summary
-- **Key concepts**: Tuplas como colecciones de tamaño fijo, `=` como operador de match (no asignación), desestructuración para extraer valores, pin operator `^` para match sin rebinding, wildcard `_` para ignorar valores
-- **What you practiced**: Crear tuplas, acceder con `elem/2`, desestructurar con `=`, usar `{:ok, value}` y `{:error, reason}`, proteger matches con `^`, ignorar valores con `_`
-- **Important to remember**: `=` en Elixir es el operador de match — el binding de variables es un efecto secundario. Cuando el patrón no coincide, el proceso falla con MatchError. Esto es intencional — Elixir prefiere el fallo explícito al éxito silencioso con datos incorrectos.
+---
 
-## What's Next
-En los siguientes ejercicios explorarás **listas** — la estructura de datos de colección dinámica de Elixir — y aprenderás pattern matching con listas usando `[head | tail]`. Luego verás cómo `case`, `cond`, y `with` te permiten encadenar múltiples matches de forma legible.
+## Trade-off analysis
+
+| Aspect | `{:ok, v}` / `{:error, r}` (your impl) | Raise exceptions | `nil` returns |
+|--------|----------------------------------------|-----------------|---------------|
+| Error visibility | Forced — caller must handle | Implicit — may be uncaught | Silent — nil propagates |
+| Error context | Tagged with step: `{:parse, reason}` | Stack trace | None |
+| Pattern exhaustiveness | Dialyzer can check | Nothing enforced | Nothing enforced |
+| Code structure | `case` / `with` chains | `try/rescue` | `if x != nil` chains |
+| Testing | Test each branch explicitly | Rescue in tests | Check for nil |
+
+Reflection question: `process_line/1` uses nested `case` expressions. In exercise 09
+you will learn the `with` macro. Compare the two approaches — what does `with` add
+beyond syntactic convenience?
+
+---
+
+## Common production mistakes
+
+**1. Bare match `{:ok, x} = function()` in non-trivial code**
+A bare match crashes the process on failure. This is intentional in tests
+(`assert {:ok, x} = ...`) and in contexts where failure should propagate to
+a supervisor. In a pipeline where you want to collect errors, use `case`.
+
+**2. Deeply nested `case` expressions**
+Three levels of `case` for three pipeline steps is the warning sign that you
+need `with`. `with` flattens the happy path and makes error handling at the bottom.
+
+**3. Losing error context through re-wrapping**
+```elixir
+case step1() do
+  {:error, _} -> {:error, "step1 failed"}  # BAD: lost the original reason
+  {:error, reason} -> {:error, {:step1, reason}}  # GOOD: reason preserved
+end
+```
+Always preserve the original error reason when re-wrapping.
+
+**4. The pin operator `^` is often needed in tests**
+```elixir
+expected_id = "TXN001"
+assert {:ok, %{id: ^expected_id}} = Pipeline.process_line(line)
+```
+Without `^`, `id: expected_id` would rebind `expected_id` to whatever the map
+contains, and the assertion would always pass.
+
+**5. Ignoring the wildcard `_` warning**
+The compiler warns when a match arm uses `_` in a position that hides data.
+A test with `{:error, _}` silently passes even if the error reason changes.
+Use `{:error, message}` and assert on `message` when the reason matters.
+
+---
 
 ## Resources
-- [The Elixir Getting Started Guide — Pattern Matching](https://elixir-lang.org/getting-started/pattern-matching.html)
-- [Elixir Docs - Tuple](https://hexdocs.pm/elixir/Tuple.html)
-- [Pattern Matching in Elixir — Comprehensive Guide](https://elixirschool.com/en/lessons/basics/pattern_matching)
+
+- [Pattern Matching — Elixir Getting Started](https://elixir-lang.org/getting-started/pattern-matching.html)
+- [Tuple — HexDocs](https://hexdocs.pm/elixir/Tuple.html)
+- [with — Kernel.SpecialForms](https://hexdocs.pm/elixir/Kernel.SpecialForms.html#with/1)
+- [Elixir School — Pattern Matching](https://elixirschool.com/en/lessons/basics/pattern_matching)

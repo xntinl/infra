@@ -1,581 +1,404 @@
-# 15. RPC y Remote Calls
+# RPC and Remote Calls
 
-**Difficulty**: Avanzado
-
----
-
-## Prerequisites
-
-- Ejercicio 11: Distributed Erlang Clustering
-- Ejercicio 12: Global Process Registry
-- GenServer avanzado con timeout handling
-- Comprensión de monitores y links de procesos
+**Project**: `api_gateway` — built incrementally across the advanced level
 
 ---
 
-## Learning Objectives
+## Project context
 
-- Ejecutar código remotamente con `:rpc.call` y `:erpc.call`
-- Implementar fan-out asíncrono a múltiples nodos con `:rpc.async_call`
-- Comparar RPC vs llamadas directas a GenServer en nodos remotos
-- Manejar correctamente errores y timeouts en llamadas distribuidas
-- Diseñar APIs de computación distribuida resilientes
-- Entender el overhead y cuándo RPC es la elección correcta
+You're building `api_gateway`, an internal HTTP gateway that routes traffic to microservices.
+Routing, rate limiting, and caching are already working. Now you need to distribute
+administrative operations — configuration reloads, health checks, and stats collection —
+across a cluster of gateway nodes.
 
----
-
-## Concepts
-
-### ¿Qué es RPC en Erlang?
-
-Remote Procedure Call (RPC) en el contexto de Erlang es ejecutar una función en un nodo remoto y obtener el resultado. A diferencia de enviar mensajes a procesos específicos, RPC invoca código arbitrario en el nodo remoto.
-
-Casos de uso:
-- Ejecutar operaciones de administración en nodos remotos (recargar config, estadísticas)
-- Distribuir computación entre nodos homogéneos
-- Invocar funciones de un release en otro nodo cuando no tienes el PID del proceso
-- Fan-out: ejecutar la misma función en todos los nodos del cluster
-
-### :rpc.call — la forma clásica
-
-```elixir
-# Ejecutar una función en un nodo remoto y esperar el resultado
-:rpc.call(:"nodeB@localhost", String, :upcase, ["hello"])
-#=> "HELLO"
-
-# Con timeout (en milisegundos)
-:rpc.call(:"nodeB@localhost", String, :upcase, ["hello"], 5_000)
-#=> "HELLO"
-#=> {:badrpc, :timeout}  # si excede el timeout
-
-# Errores posibles:
-:rpc.call(:"nodo_inexistente@localhost", IO, :puts, ["hi"])
-#=> {:badrpc, :nodedown}
-
-# Si la función lanza una excepción en el nodo remoto:
-:rpc.call(:"nodeB@localhost", __MODULE__, :bad_function, [])
-#=> {:badrpc, {:EXIT, {%RuntimeError{message: "..."}, stacktrace}}}
-```
-
-**Cómo funciona internamente**: `:rpc` usa un proceso servidor llamado `:rex` (Remote EXecution) que corre en cada nodo Erlang. Cuando llamas `:rpc.call(node, m, f, a)`, el mensaje va a `:rex` en el nodo remoto, que ejecuta `apply(m, f, a)` y envía el resultado de vuelta.
-
-Implicación: todas las llamadas `:rpc.call` a un nodo pasan por el mismo proceso `:rex`. Es un cuello de botella potencial si haces muchas llamadas concurrentes. Para alta concurrencia, usa llamadas directas a GenServer o `:erpc` (OTP 23+).
-
-### :rpc.async_call — sin bloquear
-
-```elixir
-# Iniciar la llamada remota sin bloquear
-key = :rpc.async_call(:"nodeB@localhost", Computation, :heavy_work, [data])
-
-# Hacer otras cosas mientras el nodo remoto trabaja...
-
-# Recoger el resultado cuando lo necesites
-result = :rpc.yield(key)
-#=> {:value, resultado}  # éxito
-#=> :timeout            # si ya expiró (usa nb_yield para timeouts)
-
-# Con timeout en yield
-:rpc.nb_yield(key, 5_000)
-#=> {:value, resultado}
-#=> :timeout
-```
-
-El patrón async_call + yield permite **paralelismo real** con múltiples nodos:
-
-```elixir
-nodes = Node.list()
-keys = Enum.map(nodes, fn node ->
-  {node, :rpc.async_call(node, Stats, :collect, [])}
-end)
-
-# Recoger resultados de todos los nodos
-results = Enum.map(keys, fn {node, key} ->
-  case :rpc.nb_yield(key, 10_000) do
-    {:value, stats} -> {node, stats}
-    :timeout -> {node, {:error, :timeout}}
-  end
-end)
-```
-
-### :erpc — RPC moderno (OTP 23+)
-
-`:erpc` es la reimplementación moderna de `:rpc`, disponible desde OTP 23 (Elixir ~1.12+). Resuelve los problemas de `:rpc`:
-
-```elixir
-# Call síncrono — no usa :rex, no hay cuello de botella
-:erpc.call(:"nodeB@localhost", String, :upcase, ["hello"])
-#=> "HELLO"
-
-# Con timeout
-:erpc.call(:"nodeB@localhost", String, :upcase, ["hello"], 5_000)
-
-# Manejo de errores más preciso
-try do
-  :erpc.call(:"bad@node", IO, :puts, ["hi"])
-catch
-  :error, {:erpc, :noconnection} -> {:error, :node_down}
-  :error, {:erpc, :timeout} -> {:error, :timeout}
-  :error, {exception, _stack} -> {:error, exception}
-end
-```
-
-**Diferencias clave con `:rpc`**:
-
-| Aspecto | `:rpc` | `:erpc` |
-|---------|--------|---------|
-| Proceso interno | `:rex` (cuello de botella) | Spawn directo |
-| Error format | `{:badrpc, reason}` | Excepción con `:erpc` |
-| Concurrencia | Limitada por `:rex` | Sin límite |
-| OTP version | Siempre disponible | OTP 23+ |
-| Performance | Menor | Mayor |
-
-Para nuevos proyectos: preferir `:erpc`. Para compatibilidad con OTP < 23: usar `:rpc`.
-
-### GenServer.call remoto vs RPC
-
-Hay dos formas de llamar a un GenServer en otro nodo:
-
-```elixir
-# Forma 1: via tuple {name, node}
-GenServer.call({MyServer, :"nodeB@localhost"}, :get_state)
-
-# Forma 2: con PID remoto
-remote_pid = :rpc.call(:"nodeB@localhost", Process, :whereis, [:my_server])
-GenServer.call(remote_pid, :get_state)
-
-# Forma 3: RPC directo (si no necesitas ir a un GenServer específico)
-:rpc.call(:"nodeB@localhost", MyServer, :public_api_function, [arg])
-```
-
-**Cuándo usar cada uno**:
-
-GenServer `{name, node}` es ideal cuando:
-- El servidor tiene un nombre registrado localmente en su nodo
-- Quieres usar la semántica de GenServer (timeout automático de 5s, monitor del proceso)
-- El servidor puede migrar entre nodos (cambias solo la lógica de "a qué nodo enviar")
-
-`:rpc.call` es mejor cuando:
-- No hay un proceso servidor — quieres ejecutar una función pura remotamente
-- La API es stateless
-- Necesitas fan-out a múltiples nodos con la misma función
-
-PID remoto directo (`send(remote_pid, msg)`) cuando:
-- Ya tienes el PID del proceso remoto (por ejemplo, lo registraste en :global)
-- Necesitas la mínima latencia posible
-- Haces muchas llamadas al mismo proceso (sin lookup overhead)
-
-### Handling badrpc y timeouts
-
-El error más común en RPC distribuido es no manejar los errores correctamente:
-
-```elixir
-defmodule SafeRPC do
-  @default_timeout 5_000
-
-  def call(node, module, function, args, timeout \\ @default_timeout) do
-    case :rpc.call(node, module, function, args, timeout) do
-      {:badrpc, :nodedown} ->
-        {:error, {:node_unavailable, node}}
-
-      {:badrpc, :timeout} ->
-        {:error, {:timeout, {module, function}}}
-
-      {:badrpc, {:EXIT, {exception, _stack}}} ->
-        {:error, {:remote_exception, exception}}
-
-      {:badrpc, reason} ->
-        {:error, {:rpc_error, reason}}
-
-      result ->
-        {:ok, result}
-    end
-  end
-
-  def fanout(nodes, module, function, args, timeout \\ @default_timeout) do
-    keys = Enum.map(nodes, fn node ->
-      {node, :rpc.async_call(node, module, function, args)}
-    end)
-
-    Enum.map(keys, fn {node, key} ->
-      case :rpc.nb_yield(key, timeout) do
-        {:value, {:badrpc, reason}} -> {node, {:error, reason}}
-        {:value, result} -> {node, {:ok, result}}
-        :timeout -> {node, {:error, :timeout}}
-      end
-    end)
-  end
-end
-```
-
-### El problema del timeout y las llamadas colgadas
-
-`:rpc.call` con timeout tiene un comportamiento importante: si el timeout expira, la llamada retorna `{:badrpc, :timeout}` al llamador, pero el proceso en el nodo remoto **sigue ejecutando**. No hay cancelación.
+Project structure at this point:
 
 ```
-t=0: nodeA llama :rpc.call(nodeB, Slow, :work, [], 1000)
-t=1: nodeB empieza a ejecutar Slow.work()
-t=1000: nodeA recibe {:badrpc, :timeout} y continúa
-t=5000: nodeB termina Slow.work(), envía resultado a... nadie
-```
-
-Para operaciones que deben ser cancelables, usa un enfoque diferente:
-
-```elixir
-# En el nodo remoto, el trabajo debe ser un proceso separado que puedas matar:
-defmodule CancellableRPC do
-  def start_work(caller, timeout) do
-    task_pid = spawn(fn ->
-      result = do_heavy_work()
-      send(caller, {:rpc_result, self(), result})
-    end)
-
-    receive do
-      {:rpc_result, ^task_pid, result} -> {:ok, result}
-    after
-      timeout ->
-        Process.exit(task_pid, :kill)
-        {:error, :timeout}
-    end
-  end
-end
+api_gateway/
+├── lib/
+│   └── api_gateway/
+│       ├── application.ex
+│       ├── router.ex
+│       ├── rate_limiter/
+│       │   └── server.ex
+│       ├── cache/
+│       │   └── store.ex
+│       └── cluster/
+│           ├── rpc_client.ex      # ← you implement this
+│           └── health_check.ex   # ← and this
+├── test/
+│   └── api_gateway/
+│       └── cluster/
+│           ├── rpc_client_test.exs
+│           └── health_check_test.exs
+├── bench/
+│   └── rpc_bench.exs
+└── mix.exs
 ```
 
 ---
 
-## Exercises
+## The business problem
 
-### Exercise 1: Remote Computation con :rpc y :erpc
+The platform team needs to reload configuration on all gateway nodes without downtime.
+They also need periodic health checks across the cluster to detect nodes with degraded
+cache hit rates before they impact traffic. Both operations must:
 
-**Problem**: Implementa un módulo `DistributedMath` que puede ejecutar operaciones costosas (factoriales grandes, sumas de series, etc.) en un nodo remoto. Compara el comportamiento de `:rpc.call` vs `:erpc.call`: manejo de errores, timeouts, y concurrencia bajo carga.
+1. Fan out to all connected nodes **in parallel**, not sequentially
+2. Handle node failures gracefully — a slow or dead node must not block the others
+3. Distinguish between `:node_down`, `:timeout`, and `:remote_exception` — each has a
+   different operational response
 
-**Hints**:
-- Define funciones públicas puras en `DistributedMath` — las ejecutarás en el nodo remoto via RPC
-- Prueba con una función que tarde más que el timeout — observa qué pasa en el nodo remoto después
-- Para la comparación de concurrencia, ejecuta 100 llamadas simultáneas con Task.async y mide el throughput
-- `:erpc` lanza excepciones en lugar de retornar `{:badrpc, ...}` — el patrón de manejo es diferente
-- Prueba también qué pasa cuando el nodo se cae a mitad de una llamada síncrona
+---
 
-**One possible solution**:
+## Why `:erpc` over `:rpc`
+
+The classic `:rpc.call/4` routes every call through a single process called `:rex`
+on the remote node. Under concurrent load, `:rex` becomes a serialization bottleneck:
+
+```
+node_a → :rpc.call → :rex (queue) → execute → reply
+node_a → :rpc.call → :rex (queue) → execute → reply   # waiting for :rex
+node_a → :rpc.call → :rex (queue) → execute → reply   # waiting for :rex
+```
+
+`:erpc` (OTP 23+) spawns a fresh process per call on the remote node, eliminating `:rex`:
+
+```
+node_a → :erpc.call → spawn process → execute → reply
+node_a → :erpc.call → spawn process → execute → reply  # no wait
+node_a → :erpc.call → spawn process → execute → reply  # no wait
+```
+
+Error semantics also differ: `:rpc` returns `{:badrpc, reason}` tuples; `:erpc`
+raises exceptions. Each requires a different error-handling pattern.
+
+---
+
+## Why GenServer.call with `{name, node}` over RPC for named processes
+
+When calling a named GenServer on a remote node, `GenServer.call({MyServer, node}, msg)`
+has an important advantage over `:rpc.call(node, Module, :function, [])`:
+
+- **Automatic 5s timeout** — built into GenServer, not something you manage
+- **Automatic monitor** — if the remote process dies mid-call, you get `{:exit, :noproc}` instead of hanging
+- **Supervisor-awareness** — the call respects the GenServer's message queue ordering
+
+Use `:rpc`/`:erpc` for stateless function invocations. Use `GenServer.call` for
+calls to specific supervised processes.
+
+---
+
+## Implementation
+
+### Step 1: Create the cluster directory
+
+```bash
+mkdir -p lib/api_gateway/cluster
+mkdir -p test/api_gateway/cluster
+```
+
+### Step 2: `lib/api_gateway/cluster/rpc_client.ex`
 
 ```elixir
-defmodule DistributedMath do
-  # Funciones que se ejecutarán remotamente
+defmodule ApiGateway.Cluster.RPCClient do
+  @moduledoc """
+  Safe RPC wrapper for inter-node calls in the api_gateway cluster.
 
-  def factorial(0), do: 1
-  def factorial(n) when n > 0, do: n * factorial(n - 1)
+  Design decisions:
+  - Uses :erpc for all calls (OTP 23+) — no :rex bottleneck
+  - All public functions return tagged tuples — never raise to the caller
+  - Fanout is always parallel — never sequential with multiplied timeouts
+  """
 
-  def sum_series(n), do: Enum.sum(1..n)
+  @default_timeout_ms 5_000
 
-  def slow_computation(ms) do
-    Process.sleep(ms)
-    {:done, node(), DateTime.utc_now()}
-  end
-end
+  # ---------------------------------------------------------------------------
+  # Public API
+  # ---------------------------------------------------------------------------
 
-defmodule RPCClient do
-  @timeout 5_000
-
-  def compute_factorial(node, n) do
-    rpc_call(node, DistributedMath, :factorial, [n])
-  end
-
-  def compute_factorial_erpc(node, n) do
-    erpc_call(node, DistributedMath, :factorial, [n])
-  end
-
-  defp rpc_call(node, m, f, a) do
-    case :rpc.call(node, m, f, a, @timeout) do
-      {:badrpc, :nodedown} -> {:error, :node_down}
-      {:badrpc, :timeout} -> {:error, :timeout}
-      {:badrpc, {:EXIT, {ex, _}}} -> {:error, {:exception, ex}}
-      result -> {:ok, result}
-    end
+  @doc """
+  Calls module.function(args) on a single remote node.
+  Returns {:ok, result} | {:error, :node_down | :timeout | {:exception, term()}}
+  """
+  @spec call(node(), module(), atom(), list(), pos_integer()) ::
+          {:ok, term()} | {:error, :node_down | :timeout | {:exception, term()}}
+  def call(node, module, function, args, timeout_ms \\ @default_timeout_ms) do
+    # HINT: :erpc.call/5 raises on error — wrap in try/catch
+    # HINT: catch :error, {:erpc, :noconnection} for node_down
+    # HINT: catch :error, {:erpc, :timeout} for timeout
+    # HINT: catch :error, {exception, _stacktrace} for remote exceptions
+    # TODO: implement
   end
 
-  defp erpc_call(node, m, f, a) do
-    try do
-      {:ok, :erpc.call(node, m, f, a, @timeout)}
-    catch
-      :error, {:erpc, :noconnection} -> {:error, :node_down}
-      :error, {:erpc, :timeout} -> {:error, :timeout}
-      :error, {exception, _} -> {:error, {:exception, exception}}
-    end
+  @doc """
+  Fans out module.function(args) to all connected nodes in parallel.
+  Returns a map of %{node => {:ok, result} | {:error, reason}}.
+
+  The global timeout applies to ALL nodes together, not per node.
+  A slow node does not block results from fast nodes.
+  """
+  @spec fanout(module(), atom(), list(), pos_integer()) ::
+          %{node() => {:ok, term()} | {:error, term()}}
+  def fanout(module, function, args, timeout_ms \\ @default_timeout_ms) do
+    nodes = Node.list()
+    # HINT: use Task.async per node, then Task.yield_many with the global timeout
+    # HINT: {:ok, result} on success, nil on timeout → {:error, :timeout}
+    # HINT: include the local node using call to localhost (node()) for consistency
+    # TODO: implement
   end
 
-  # Medir throughput bajo concurrencia
-  def concurrent_benchmark(node, concurrency, calls_per_task) do
-    {time, results} = :timer.tc(fn ->
-      1..concurrency
-      |> Enum.map(fn _ ->
-        Task.async(fn ->
-          Enum.map(1..calls_per_task, fn n ->
-            compute_factorial(node, n)
-          end)
-        end)
-      end)
-      |> Task.await_many(30_000)
-    end)
-
-    total_calls = concurrency * calls_per_task
-    %{
-      total_ms: time / 1_000,
-      total_calls: total_calls,
-      calls_per_second: total_calls / (time / 1_000_000)
-    }
+  @doc """
+  Calls the same named GenServer on every node in the cluster.
+  Uses GenServer.call({name, node}, message) — not RPC.
+  Returns %{node => {:ok, reply} | {:error, reason}}.
+  """
+  @spec call_named(atom(), term(), pos_integer()) ::
+          %{node() => {:ok, term()} | {:error, term()}}
+  def call_named(server_name, message, timeout_ms \\ @default_timeout_ms) do
+    nodes = [node() | Node.list()]
+    # HINT: Task.async per node, GenServer.call({server_name, node}, message, timeout_ms)
+    # HINT: wrap in try/catch — the remote process may not exist
+    # TODO: implement
   end
 end
 ```
 
----
-
-### Exercise 2: Fanout a Todos los Nodos
-
-**Problem**: Implementa un sistema de "health check distribuido" que ejecuta una función de diagnóstico en todos los nodos del cluster simultáneamente y agrega los resultados. Debe funcionar correctamente cuando algunos nodos están caídos, son lentos, o retornan errores.
-
-**Hints**:
-- Usa `Node.list()` para obtener todos los nodos activos y añade `node()` para el local
-- Las llamadas deben ser paralelas — no secuenciales con timeout multiplicado
-- Define un timeout global para el fanout (no por nodo) con `Task.yield_many/2`
-- Implementa un reducer que clasifique resultados en: `:ok`, `:timeout`, `:error`
-- El nodo local puede ejecutar la función directamente sin RPC (más eficiente)
-
-**One possible solution**:
+### Step 3: `lib/api_gateway/cluster/health_check.ex`
 
 ```elixir
-defmodule NodeDiagnostics do
-  # Esta función se ejecuta en cada nodo
+defmodule ApiGateway.Cluster.HealthCheck do
+  @moduledoc """
+  Cluster-wide health check for api_gateway nodes.
+  Collects diagnostics from every node using RPCClient.fanout/4.
+  """
+
+  alias ApiGateway.Cluster.RPCClient
+
+  @doc """
+  Runs diagnostics on every node in the cluster.
+  Returns a structured report with per-node results and a summary.
+  """
+  @spec run() :: %{
+          total_nodes: non_neg_integer(),
+          elapsed_ms: non_neg_integer(),
+          results: %{node() => {:ok, map()} | {:error, term()}},
+          summary: %{ok: [node()], timeout: [node()], error: [node()]}
+        }
+  def run do
+    # HINT: use RPCClient.fanout/4 with NodeDiagnostics.collect/0
+    # HINT: measure elapsed time with System.monotonic_time(:millisecond)
+    # HINT: summarize results into :ok, :timeout, :error buckets
+    # TODO: implement
+  end
+
+  @doc """
+  Local diagnostics — runs on whatever node calls this function.
+  Used by fanout as the remote target.
+  """
+  @spec collect() :: map()
   def collect do
     %{
       node: node(),
-      memory: :erlang.memory(:total),
-      processes: length(Process.list()),
-      uptime_ms: :erlang.statistics(:wall_clock) |> elem(0),
-      schedulers: :erlang.system_info(:schedulers_online),
-      message_queue_len: Process.info(self(), :message_queue_len) |> elem(1)
+      memory_mb: Float.round(:erlang.memory(:total) / (1024 * 1024), 1),
+      process_count: length(Process.list()),
+      scheduler_count: :erlang.system_info(:schedulers_online),
+      uptime_ms: :erlang.statistics(:wall_clock) |> elem(0)
     }
   end
 end
+```
 
-defmodule ClusterHealthCheck do
-  @fanout_timeout 10_000
-  @per_node_timeout 5_000
+### Step 4: Given tests — must pass without modification
 
-  def run do
-    all_nodes = [node() | Node.list()]
-    start_time = System.monotonic_time(:millisecond)
+```elixir
+# test/api_gateway/cluster/rpc_client_test.exs
+defmodule ApiGateway.Cluster.RPCClientTest do
+  use ExUnit.Case, async: true
 
-    tasks = Enum.map(all_nodes, fn target_node ->
-      task = Task.async(fn -> execute_on_node(target_node) end)
-      {target_node, task}
-    end)
+  alias ApiGateway.Cluster.RPCClient
 
-    # Esperar todos con timeout global
-    results = tasks
-    |> Enum.map(fn {target_node, task} ->
-      case Task.yield(task, @fanout_timeout) || Task.shutdown(task) do
-        {:ok, result} -> {target_node, result}
-        nil -> {target_node, {:error, :timeout}}
-      end
-    end)
+  describe "call/5" do
+    test "calls a function on the local node" do
+      # Calling node() itself with :erpc is valid
+      assert {:ok, result} = RPCClient.call(node(), String, :upcase, ["hello"])
+      assert result == "HELLO"
+    end
 
-    elapsed = System.monotonic_time(:millisecond) - start_time
+    test "returns {:error, :node_down} for a non-existent node" do
+      assert {:error, :node_down} =
+               RPCClient.call(:"phantom@localhost", String, :upcase, ["hello"])
+    end
 
-    %{
-      total_nodes: length(all_nodes),
-      elapsed_ms: elapsed,
-      results: results,
-      summary: summarize(results)
-    }
-  end
-
-  defp execute_on_node(target_node) when target_node == node() do
-    # Local: directo, sin RPC
-    {:ok, NodeDiagnostics.collect()}
-  end
-
-  defp execute_on_node(target_node) do
-    case :rpc.call(target_node, NodeDiagnostics, :collect, [], @per_node_timeout) do
-      {:badrpc, reason} -> {:error, reason}
-      result -> {:ok, result}
+    test "returns {:error, {:exception, _}} when remote raises" do
+      assert {:error, {:exception, _}} =
+               RPCClient.call(node(), Kernel, :/, [1, 0])
     end
   end
 
-  defp summarize(results) do
-    Enum.reduce(results, %{ok: [], timeout: [], error: []}, fn
-      {node, {:ok, _data}}, acc -> Map.update!(acc, :ok, &[node | &1])
-      {node, {:error, :timeout}}, acc -> Map.update!(acc, :timeout, &[node | &1])
-      {node, {:error, _}}, acc -> Map.update!(acc, :error, &[node | &1])
-    end)
-  end
-end
-```
+  describe "fanout/4" do
+    test "returns a map with at least the local node entry" do
+      results = RPCClient.fanout(String, :upcase, ["ping"])
+      # In a single-node test environment, Node.list() is empty.
+      # The implementation must handle this gracefully.
+      assert is_map(results)
+    end
 
----
+    test "all values are tagged tuples" do
+      results = RPCClient.fanout(String, :length, ["test"])
 
-### Exercise 3: Comparación :rpc vs GenServer Directo
-
-**Problem**: Implementa la misma operación de tres formas: (1) `:rpc.call`, (2) GenServer.call con `{module, node}`, y (3) send/receive directo con PID remoto. Benchmarkea las tres en un cluster real, documenta la diferencia de latencia, y define en qué casos cada una es superior.
-
-**Hints**:
-- La operación a comparar: un counter que se incrementa y retorna el nuevo valor
-- Para el benchmark, usa `:timer.tc/1` con 10,000 iteraciones de cada método
-- El método (3) requiere conocer el PID del proceso remoto — usa `:global` o `:rpc.call(node, Process, :whereis, [:counter])` para obtenerlo
-- La diferencia entre (1) y (2) es principalmente el overhead del proceso `:rex`
-- Documenta el trade-off: cuando (3) es 2x más rápido que (1), ¿qué perdemos? (no timeout, no monitor automático, etc.)
-
-**One possible solution**:
-
-```elixir
-defmodule RemoteCounter do
-  use GenServer
-
-  def start_link(_) do
-    GenServer.start_link(__MODULE__, 0, name: __MODULE__)
-  end
-
-  def increment_rpc(node) do
-    :rpc.call(node, __MODULE__, :do_increment, [])
-  end
-
-  def increment_genserver(node) do
-    GenServer.call({__MODULE__, node}, :increment)
-  end
-
-  def increment_direct(remote_pid) do
-    ref = make_ref()
-    send(remote_pid, {:increment, self(), ref})
-    receive do
-      {:increment_reply, ^ref, value} -> value
-    after
-      5_000 -> {:error, :timeout}
+      Enum.each(results, fn {_node, result} ->
+        assert match?({:ok, _}, result) or match?({:error, _}, result)
+      end)
     end
   end
 
-  # Función llamada via RPC
-  def do_increment do
-    GenServer.call(__MODULE__, :increment)
-  end
+  describe "call_named/3" do
+    test "returns a map with one entry per cluster node" do
+      results = RPCClient.call_named(:nonexistent_server, :ping)
+      assert is_map(results)
+    end
 
-  def init(n), do: {:ok, n}
+    test "returns {:error, _} for a server that does not exist" do
+      results = RPCClient.call_named(:nonexistent_server, :ping)
 
-  def handle_call(:increment, _from, n), do: {:reply, n + 1, n + 1}
-
-  def handle_info({:increment, caller, ref}, n) do
-    send(caller, {:increment_reply, ref, n + 1})
-    {:noreply, n + 1}
-  end
-end
-
-defmodule Benchmark do
-  @iterations 10_000
-
-  def run(remote_node) do
-    # Obtener PID remoto para el método directo
-    remote_pid = :rpc.call(remote_node, Process, :whereis, [RemoteCounter])
-
-    results = %{
-      rpc: measure(fn -> RemoteCounter.increment_rpc(remote_node) end),
-      genserver: measure(fn -> RemoteCounter.increment_genserver(remote_node) end),
-      direct: measure(fn -> RemoteCounter.increment_direct(remote_pid) end)
-    }
-
-    Enum.each(results, fn {method, {avg_us, total_ms}} ->
-      IO.puts("#{method}: #{Float.round(avg_us, 2)}μs/op (#{total_ms}ms total)")
-    end)
-
-    results
-  end
-
-  defp measure(f) do
-    {total_us, _} = :timer.tc(fn -> Enum.each(1..@iterations, fn _ -> f.() end) end)
-    avg_us = total_us / @iterations
-    {avg_us, total_us / 1_000}
+      Enum.each(results, fn {_node, result} ->
+        assert match?({:error, _}, result)
+      end)
+    end
   end
 end
 ```
-
-**Resultados típicos esperados** (varían según red y hardware):
-
-| Método | Latencia típica | Overhead | Cuándo usarlo |
-|--------|-----------------|----------|---------------|
-| `:rpc.call` | 200-500μs | `:rex` process | Funciones stateless, admin |
-| `GenServer.call` | 150-400μs | Monitor + lookup | GenServers con nombre |
-| `send` directo | 80-200μs | Mínimo | PID conocido, alta frecuencia |
-
----
-
-## Common Mistakes
-
-**No manejar `{:badrpc, :timeout}` vs `{:badrpc, :nodedown}`**: Son errores distintos con respuestas distintas. Timeout puede ser transitorio — reintentar tiene sentido. Nodedown es persistente — fallar rápido y reportar. Siempre pattern match específicamente.
-
-**Usar `:rpc` para alta concurrencia**: El proceso `:rex` es un único punto de concurrencia por nodo remoto. Si necesitas 1000 llamadas RPC concurrentes al mismo nodo, crea un pool de procesos que hagan llamadas directas, o usa `:erpc` que no tiene este cuello de botella.
-
-**Olvidar que el proceso remoto sigue ejecutando tras timeout**: Esta es la trampa más seria. Si tu función en el nodo remoto tiene efectos secundarios (escribe a DB, modifica estado), puede ejecutar parcialmente y dejar la operación en estado inconsistente. Diseña las operaciones remotas para ser idempotentes o usa sagas con compensación.
-
-**No incluir el nodo local en el fanout**: `Node.list()` no incluye `node()` — el nodo actual. Si haces fanout a `Node.list()` y olvidas añadir `node()`, el nodo local no ejecuta la operación.
-
-**Pasar lambdas como argumentos de RPC**: `:rpc.call(node, Module, :function, [fn -> ... end])` falla porque las lambdas capturan el entorno local y no son serializable. Solo pasa datos simples (strings, numbers, maps, lists) como argumentos.
-
-**Asumir que el módulo existe en el nodo remoto**: Si el release del nodo B no incluye `MyApp.SomeModule`, `:rpc.call` retornará `{:badrpc, {:EXIT, :undef}}`. En clusters heterogéneos o durante rolling deploys, esto es un problema real.
-
----
-
-## Verification
 
 ```elixir
-# Verifica :rpc básico en un cluster de dos nodos
-remote_node = List.first(Node.list())
+# test/api_gateway/cluster/health_check_test.exs
+defmodule ApiGateway.Cluster.HealthCheckTest do
+  use ExUnit.Case, async: true
 
-# Función simple sin efectos secundarios
-result = :rpc.call(remote_node, String, :upcase, ["hello"])
-assert result == "HELLO"
+  alias ApiGateway.Cluster.HealthCheck
 
-# Manejo de error: nodo inexistente
-bad_result = :rpc.call(:"fantasma@localhost", IO, :puts, ["hi"])
-assert {:badrpc, :nodedown} = bad_result
+  describe "collect/0" do
+    test "returns a map with expected keys" do
+      result = HealthCheck.collect()
+      assert is_map(result)
+      assert Map.has_key?(result, :node)
+      assert Map.has_key?(result, :memory_mb)
+      assert Map.has_key?(result, :process_count)
+      assert result.node == node()
+    end
+  end
 
-# Fanout a todos los nodos
-all_nodes = [node() | Node.list()]
-health = ClusterHealthCheck.run()
-assert health.total_nodes == length(all_nodes)
-assert health.summary.ok |> length() > 0
+  describe "run/0" do
+    test "returns a valid report structure" do
+      report = HealthCheck.run()
+      assert Map.has_key?(report, :total_nodes)
+      assert Map.has_key?(report, :elapsed_ms)
+      assert Map.has_key?(report, :results)
+      assert Map.has_key?(report, :summary)
+      assert report.elapsed_ms >= 0
+    end
 
-# Benchmark (verificar que compila y corre)
-if length(Node.list()) > 0 do
-  results = Benchmark.run(List.first(Node.list()))
-  assert Map.has_key?(results, :rpc)
-  assert Map.has_key?(results, :genserver)
-  assert Map.has_key?(results, :direct)
+    test "summary buckets are disjoint and cover all nodes" do
+      report = HealthCheck.run()
+      all_from_summary =
+        (report.summary.ok ++ report.summary.timeout ++ report.summary.error)
+        |> Enum.sort()
+
+      all_from_results = Map.keys(report.results) |> Enum.sort()
+      assert all_from_summary == all_from_results
+    end
+  end
 end
 ```
 
+### Step 5: Run the tests
+
+```bash
+mix test test/api_gateway/cluster/ --trace
+```
+
+### Step 6: RPC throughput benchmark
+
+```elixir
+# bench/rpc_bench.exs
+# Run with: mix run bench/rpc_bench.exs
+# Requires the node to be started with distribution:
+#   iex --sname gateway1 --cookie secret -S mix run bench/rpc_bench.exs
+
+Benchee.run(
+  %{
+    ":erpc.call — local node (baseline)" => fn ->
+      :erpc.call(node(), String, :upcase, ["benchmark"])
+    end,
+    "RPCClient.call — wraps :erpc" => fn ->
+      ApiGateway.Cluster.RPCClient.call(node(), String, :upcase, ["benchmark"])
+    end,
+    "GenServer.call — local named server" => fn ->
+      # Replace with an actual named GenServer in your app
+      GenServer.call(ApiGateway.Cache.Store, :stats)
+    end
+  },
+  warmup: 2,
+  time: 5,
+  formatters: [Benchee.Formatters.Console]
+)
+```
+
+```bash
+mix run bench/rpc_bench.exs
+```
+
+**Expected**: `RPCClient.call` overhead over raw `:erpc.call` should be < 5µs.
+The GenServer path will be faster for local named processes because it skips
+the `:erpc` spawn overhead.
+
 ---
 
-## Summary
+## Trade-off analysis
 
-RPC en Erlang/Elixir tiene múltiples sabores con trade-offs claros:
+| Aspect | `:rpc.call` | `:erpc.call` | `GenServer.call {name, node}` | `send(remote_pid, msg)` |
+|--------|------------|-------------|-------------------------------|------------------------|
+| Concurrency bottleneck | `:rex` process on remote | None | None | None |
+| Error format | `{:badrpc, reason}` | Raises exception | Raises on exit | None (fire and forget) |
+| Automatic timeout | Via 5th arg | Via 5th arg | Via 3rd arg (default 5s) | No — must implement |
+| Automatic monitor | No | No | Yes (GenServer built-in) | No |
+| OTP version | Always | OTP 23+ | Always | Always |
+| Use case | Stateless admin ops | Stateless, high concurrency | Named supervised processes | Known PID, max throughput |
 
-- `:rpc.call` es el clásico — simple, funciona siempre, pero `:rex` es cuello de botella bajo concurrencia alta
-- `:erpc.call` es el reemplazo moderno (OTP 23+) — mejor concurrencia, mejor manejo de errores
-- `GenServer.call({module, node})` es la forma natural de llamar GenServers registrados en otros nodos
-- `send(remote_pid, msg)` es el más rápido pero requiere conocer el PID y no tiene timeout automático
-- Fan-out con `async_call` + `nb_yield` es el patrón para computación paralela en el cluster
-- Siempre diseñar las operaciones remotas como idempotentes — los timeouts no cancelan la ejecución remota
+Reflection: when would you choose `GenServer.call {name, node}` over `:erpc.call`?
+Think about what happens when the remote supervisor restarts the process mid-call.
 
 ---
 
-## What's Next
+## Common production mistakes
 
-- **Exercise 16**: ETS avanzado — almacenamiento en memoria compartida local, complemento del estado distribuido
-- **Exercise 19**: Cache patterns con ETS — construir cachés eficientes que complementen la distribución
-- **Exercise 43**: Build a Job Scheduler — aplicación práctica de RPC para distribución de trabajo
+**1. Sequential fanout with multiplied timeouts**
+Calling `Enum.map(nodes, fn n -> :erpc.call(n, M, F, A, 5_000) end)` takes up to
+`5_000 * length(nodes)` milliseconds in the worst case. Always fan out with `Task.async`
+and collect with `Task.yield_many` using a single global timeout.
+
+**2. Using `:rpc` for high-concurrency calls**
+Under 100+ concurrent RPCs to the same node, `:rex` becomes a bottleneck. Switch to
+`:erpc` or direct `GenServer.call {name, node}` for throughput-sensitive paths.
+
+**3. Not handling `{:badrpc, :timeout}` residual execution**
+When `:rpc.call` returns `{:badrpc, :timeout}`, the remote function is still running.
+If it has side effects (DB writes, state mutations), you have a partial execution problem.
+Design remote operations to be idempotent, or use sagas with compensation.
+
+**4. Including the local node in `Node.list()` fanout**
+`Node.list()` never includes `node()` itself. If your fanout needs to include the local
+node, add it explicitly: `[node() | Node.list()]`.
+
+**5. Passing anonymous functions as RPC arguments**
+`fn -> ... end` captures its lexical environment and is not serializable across nodes.
+Only pass plain data (strings, atoms, maps, lists) as RPC arguments.
 
 ---
 
 ## Resources
 
-- [:rpc module documentation](https://www.erlang.org/doc/man/rpc.html)
-- [:erpc module documentation (OTP 23+)](https://www.erlang.org/doc/man/erpc.html)
-- [Erlang RPC — Fred Hebert's "Stuff Goes Bad"](https://ferd.github.io/stuff-goes-bad/)
-- [Distributed Elixir — The Little Elixir and OTP Guidebook](https://www.manning.com/books/the-little-elixir-and-otp-guidebook)
-- [Why erpc? — OTP 23 release notes](https://www.erlang.org/news/145)
+- [`:erpc` documentation — OTP 23+](https://www.erlang.org/doc/man/erpc.html) — read the error semantics section
+- [`:rpc` documentation](https://www.erlang.org/doc/man/rpc.html) — specifically the `:rex` architecture note
+- [Erlang in Anger — Fred Hebert](https://www.erlang-in-anger.com/) — chapter on distributed systems pitfalls (free PDF)
+- [Distributed Elixir — The Little Elixir and OTP Guidebook](https://www.manning.com/books/the-little-elixir-and-otp-guidebook) — chapter on distribution

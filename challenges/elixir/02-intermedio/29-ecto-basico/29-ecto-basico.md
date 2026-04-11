@@ -1,655 +1,535 @@
-# 29 - Ecto Básico
+# Ecto: Schemas, Changesets, and Queries
 
-## Prerequisites
-
-- Elixir intermedio: módulos, structs, pattern matching
-- PostgreSQL instalado y corriendo localmente
-- Familiaridad con Mix y dependencias Hex
-- Conceptos básicos de bases de datos relacionales (tablas, columnas, claves foráneas)
+**Project**: `task_queue` — built incrementally across the intermediate level
 
 ---
 
-## Learning Objectives
+## Project context
 
-Al completar este ejercicio serás capaz de:
+`task_queue` has been persisting jobs only in memory. When the node restarts, all pending and completed jobs are lost. The ops team needs a persistent job store so that completed job history is queryable, failed jobs can be retried after a restart, and auditors can reconstruct what happened.
 
-1. Configurar Ecto con PostgreSQL en un proyecto Mix
-2. Definir schemas con `@primary_key`, tipos y asociaciones
-3. Validar datos con changesets usando `cast/3`, `validate_required/3`, `validate_format/3`
-4. Escribir migrations reproducibles con `Ecto.Migration`
-5. Consultar la base de datos con el DSL de `Ecto.Query`
-6. Usar `Repo.get/2`, `Repo.all/1`, `Repo.insert/1`, `Repo.update/1`, `Repo.delete/1`
-7. Construir filtros dinámicos sobre queries base
+Project structure at this point:
 
----
-
-## Concepts
-
-### Repo: el punto de entrada a la base de datos
-
-`Ecto.Repo` es el módulo que maneja la conexión al adaptador (Postgrex para PostgreSQL). Toda operación de base de datos pasa por él.
-
-```elixir
-# config/config.exs
-import Config
-
-config :mi_app, MiApp.Repo,
-  username: "postgres",
-  password: "postgres",
-  hostname: "localhost",
-  database: "mi_app_dev",
-  stacktrace: true,
-  show_sensitive_data_on_connection_error: true,
-  pool_size: 10
+```
+task_queue/
+├── lib/
+│   └── task_queue/
+│       ├── application.ex
+│       ├── jobs/
+│       │   ├── job.ex              # ← you implement the schema
+│       │   └── job_store.ex        # ← you implement the query interface
+│       ├── worker.ex
+│       ├── queue_server.ex
+│       ├── scheduler.ex
+│       └── registry.ex
+├── priv/
+│   └── repo/
+│       └── migrations/
+│           └── 20240101000000_create_jobs.exs  # ← you implement this
+├── test/
+│   └── task_queue/
+│       └── ecto_test.exs           # given tests — must pass without modification
+├── config/
+│   └── test.exs                    # ← add Repo config
+└── mix.exs                         # ← add Ecto and Postgrex/SQLite
 ```
 
+Add to `mix.exs`:
+
 ```elixir
-# lib/mi_app/repo.ex
-defmodule MiApp.Repo do
+{:ecto_sql, "~> 3.11"},
+{:postgrex, ">= 0.0.0"}            # or {:ecto_sqlite3, "~> 0.15"} for SQLite
+```
+
+---
+
+## The business problem
+
+The product team wants to:
+1. Query all jobs of type `"send_email"` that failed in the last 24 hours
+2. Retry all jobs with status `:failed` and `retry_count < 3`
+3. Show job completion history for a given customer ID
+
+These queries require a structured schema, validated changesets, and composable query fragments. The in-memory `QueueServer` cannot support any of this.
+
+---
+
+## Why Ecto changesets and not direct struct construction
+
+You could insert a job into the database using a bare struct:
+
+```elixir
+%TaskQueue.Jobs.Job{type: "send_email", status: :pending}
+|> Repo.insert()
+```
+
+This bypasses all validation. If `type` is nil, the database constraint catches it — but the error message is a raw Postgres constraint violation, not a user-friendly validation error. If `status` is `:invalid_status`, it reaches the database as-is.
+
+Changesets intercept writes and validate data before it reaches the database:
+
+```elixir
+Job.changeset(%Job{}, %{type: "send_email", status: :pending})
+# Returns a changeset struct with :valid? field and :errors list
+# Only insert if changeset.valid? == true
+```
+
+This separates three concerns:
+- **Structure**: the schema defines columns and their types
+- **Validation**: the changeset defines business rules (required fields, valid values)
+- **Persistence**: `Repo.insert/2` writes a valid changeset
+
+---
+
+## Why `Ecto.Query` and not raw SQL strings
+
+Raw SQL is untyped, injection-prone, and database-specific:
+
+```elixir
+# Wrong — SQL injection risk, PostgreSQL-specific syntax, no type checking
+Repo.query!("SELECT * FROM jobs WHERE type = '#{type}' AND status = 'failed'")
+```
+
+`Ecto.Query` is composable, type-safe, and database-agnostic:
+
+```elixir
+# Right — composable, parameterized, portable
+from(j in Job, where: j.type == ^type and j.status == :failed)
+|> Repo.all()
+```
+
+Queries can be built incrementally and reused across functions without string manipulation.
+
+---
+
+## Implementation
+
+### Step 1: Repo module and configuration
+
+```elixir
+# lib/task_queue/repo.ex
+defmodule TaskQueue.Repo do
   use Ecto.Repo,
-    otp_app: :mi_app,
+    otp_app: :task_queue,
     adapter: Ecto.Adapters.Postgres
 end
 ```
 
-```elixir
-# lib/mi_app/application.ex
-defmodule MiApp.Application do
-  use Application
+Add the Repo to the supervision tree in `lib/task_queue/application.ex`:
 
-  def start(_type, _args) do
-    children = [MiApp.Repo]
-    Supervisor.start_link(children, strategy: :one_for_one)
-  end
-end
+```elixir
+children = [
+  TaskQueue.Repo,
+  # ... rest of children
+]
 ```
 
-### Schema: mapeo entre tablas y structs
-
-`Ecto.Schema` declara la estructura de los datos y cómo se mapean a columnas de la base de datos.
+Add Repo configuration to `config/config.exs`:
 
 ```elixir
-defmodule MiApp.Accounts.User do
-  use Ecto.Schema
-  import Ecto.Changeset
-
-  # Sobrescribir la clave primaria por defecto
-  @primary_key {:id, :binary_id, autogenerate: true}
-  # Indicar el tipo de claves foráneas en asociaciones
-  @foreign_key_type :binary_id
-
-  schema "users" do
-    field :name,  :string
-    field :email, :string
-    field :age,   :integer
-    field :role,  :string, default: "user"
-
-    # Campo virtual: no se persiste en la base de datos
-    field :password, :string, virtual: true
-    field :password_hash, :string
-
-    timestamps()  # inserted_at y updated_at automáticos
-  end
-end
+# config/config.exs
+config :task_queue, TaskQueue.Repo,
+  database: "task_queue_dev",
+  username: "postgres",
+  password: "postgres",
+  hostname: "localhost"
 ```
 
-### Changeset: validación y transformación de datos
-
-El changeset es el mecanismo de Ecto para validar y castear datos externos antes de persistirlos. Nunca se manipulan structs directamente para operaciones de escritura.
+Add test configuration to `config/test.exs` (required for `Ecto.Adapters.SQL.Sandbox`):
 
 ```elixir
-defmodule MiApp.Accounts.User do
-  # ... schema arriba ...
-
-  def changeset(user, attrs) do
-    user
-    |> cast(attrs, [:name, :email, :age, :role, :password])
-    |> validate_required([:name, :email])
-    |> validate_format(:email, ~r/^[^\s]+@[^\s]+\.[^\s]+$/,
-         message: "debe ser un email válido")
-    |> validate_length(:name, min: 2, max: 100)
-    |> validate_number(:age, greater_than: 0, less_than: 150)
-    |> validate_inclusion(:role, ["user", "admin", "moderator"])
-    |> unique_constraint(:email)
-    |> put_password_hash()
-  end
-
-  defp put_password_hash(changeset) do
-    case get_change(changeset, :password) do
-      nil -> changeset
-      password -> put_change(changeset, :password_hash, hash(password))
-    end
-  end
-
-  defp hash(password), do: :crypto.hash(:sha256, password) |> Base.encode16()
-end
+# config/test.exs
+config :task_queue, TaskQueue.Repo,
+  username: "postgres",
+  password: "postgres",
+  hostname: "localhost",
+  database: "task_queue_test#{System.get_env("MIX_TEST_PARTITION")}",
+  pool: Ecto.Adapters.SQL.Sandbox,
+  pool_size: 10
 ```
 
-### Migrations: evolución del esquema de base de datos
+Add to `test/test_helper.exs`:
 
 ```elixir
-# priv/repo/migrations/20240101000000_create_users.exs
-defmodule MiApp.Repo.Migrations.CreateUsers do
+Ecto.Adapters.SQL.Sandbox.mode(TaskQueue.Repo, :manual)
+```
+
+### Step 2: Migration — `priv/repo/migrations/20240101000000_create_jobs.exs`
+
+
+```elixir
+defmodule TaskQueue.Repo.Migrations.CreateJobs do
   use Ecto.Migration
 
   def change do
-    create table(:users, primary_key: false) do
-      add :id,            :binary_id, primary_key: true
-      add :name,          :string,    null: false
-      add :email,         :string,    null: false
-      add :age,           :integer
-      add :role,          :string,    default: "user", null: false
-      add :password_hash, :string
+    create table(:jobs) do
+      # TODO: add columns:
+      # - type (string, not null)
+      # - args (map, default %{})
+      # - status (string, not null, default "pending")
+      # - retry_count (integer, not null, default 0)
+      # - last_error (string, nullable)
+      # - scheduled_at (utc_datetime, nullable)
+      # HINT:
+      # add :type, :string, null: false
+      # add :args, :map, default: %{}
+      # add :status, :string, null: false, default: "pending"
+      # add :retry_count, :integer, null: false, default: 0
+      # add :last_error, :string
+      # add :scheduled_at, :utc_datetime
 
       timestamps()
     end
 
-    create unique_index(:users, [:email])
-    create index(:users, [:role])
+    # TODO: add an index on (status, type) for efficient filtering
+    # HINT: create index(:jobs, [:status, :type])
   end
 end
 ```
 
-```bash
-mix ecto.create
-mix ecto.migrate
-# Para deshacer la última migration:
-mix ecto.rollback
-```
-
-### Ecto.Query: consultas DSL
+### Step 3: `lib/task_queue/jobs/job.ex` — schema and changeset
 
 ```elixir
-import Ecto.Query
+defmodule TaskQueue.Jobs.Job do
+  @moduledoc """
+  Ecto schema for a persisted job.
 
-# Forma de keyword list
-query = from u in "users",
-          where: u.role == "admin",
-          select: %{id: u.id, name: u.name}
+  Status values: :pending, :running, :completed, :failed
+  """
 
-# Forma de pipe (composable)
-query =
-  MiApp.Accounts.User
-  |> where([u], u.age > 18)
-  |> order_by([u], asc: u.name)
-  |> limit(10)
-  |> select([u], {u.id, u.name, u.email})
-
-# Ejecutar
-MiApp.Repo.all(query)
-```
-
-### Operaciones básicas del Repo
-
-```elixir
-alias MiApp.{Repo, Accounts.User}
-import Ecto.Query
-
-# Insertar
-{:ok, user} =
-  %User{}
-  |> User.changeset(%{name: "Ana", email: "ana@example.com", age: 30})
-  |> Repo.insert()
-
-# Obtener por ID (devuelve nil si no existe)
-user = Repo.get(User, "uuid-aqui")
-
-# Obtener o lanzar excepción
-user = Repo.get!(User, "uuid-aqui")
-
-# Buscar por campo
-user = Repo.get_by(User, email: "ana@example.com")
-
-# Listar todos
-users = Repo.all(User)
-
-# Actualizar
-{:ok, updated} =
-  user
-  |> User.changeset(%{name: "Ana García"})
-  |> Repo.update()
-
-# Eliminar
-{:ok, deleted} = Repo.delete(user)
-```
-
-### Asociaciones
-
-```elixir
-defmodule MiApp.Blog.Post do
   use Ecto.Schema
   import Ecto.Changeset
 
-  @primary_key {:id, :binary_id, autogenerate: true}
-  @foreign_key_type :binary_id
+  @valid_statuses ~w(pending running completed failed)
 
-  schema "posts" do
-    field :title,   :string
-    field :body,    :string
-    field :published, :boolean, default: false
-
-    belongs_to :author, MiApp.Accounts.User
-    many_to_many :tags, MiApp.Blog.Tag, join_through: "posts_tags"
+  schema "jobs" do
+    # TODO: define fields matching the migration:
+    # field :type, :string
+    # field :args, :map, default: %{}
+    # field :status, :string, default: "pending"
+    # field :retry_count, :integer, default: 0
+    # field :last_error, :string
+    # field :scheduled_at, :utc_datetime
 
     timestamps()
   end
 
-  def changeset(post, attrs) do
-    post
-    |> cast(attrs, [:title, :body, :published, :author_id])
-    |> validate_required([:title, :body, :author_id])
-    |> validate_length(:title, min: 5, max: 200)
-    |> foreign_key_constraint(:author_id)
-  end
-end
-```
+  @doc """
+  Validates job attributes for insertion.
 
-```elixir
-# Preloading de asociaciones
-post = Repo.get!(Post, id) |> Repo.preload([:author, :tags])
-post.author.name  # ya cargado, no lazy-load
-```
+  Required: `:type`
+  Optional: `:args`, `:status`, `:retry_count`, `:scheduled_at`
 
----
+  ## Examples
 
-## Exercises
+      iex> TaskQueue.Jobs.Job.changeset(%TaskQueue.Jobs.Job{}, %{type: "send_email"})
+      #Ecto.Changeset<valid?: true, ...>
 
-### Ejercicio 1: User schema con validaciones de email
+      iex> TaskQueue.Jobs.Job.changeset(%TaskQueue.Jobs.Job{}, %{})
+      #Ecto.Changeset<valid?: false, errors: [type: {"can't be blank", ...}], ...>
 
-Implementa el módulo `Accounts.User` completo con validaciones robustas.
-
-```elixir
-# lib/mi_app/accounts/user.ex
-defmodule MiApp.Accounts.User do
-  use Ecto.Schema
-  import Ecto.Changeset
-
-  @primary_key {:id, :binary_id, autogenerate: true}
-  @foreign_key_type :binary_id
-
-  # TODO: Define el schema con los campos:
-  # - name (string, requerido)
-  # - email (string, requerido, único)
-  # - age (integer, opcional)
-  # - role (string, default: "user")
-  # - password (virtual, string)
-  # - password_hash (string)
-  # - timestamps()
-  schema "users" do
+  """
+  @spec changeset(t(), map()) :: Ecto.Changeset.t()
+  def changeset(job, attrs) do
+    job
+    |> cast(attrs, [:type, :args, :status, :retry_count, :last_error, :scheduled_at])
+    # TODO: validate that :type is required
+    # HINT: |> validate_required([:type])
+    # TODO: validate that :status is one of @valid_statuses
+    # HINT: |> validate_inclusion(:status, @valid_statuses)
+    # TODO: validate that :retry_count is >= 0
+    # HINT: |> validate_number(:retry_count, greater_than_or_equal_to: 0)
   end
 
   @doc """
-  Changeset para creación de usuario.
-  Valida: name (2-100 chars), email (formato), age (1-150), role (enum).
+  Changeset for updating job status (e.g., marking as failed with an error).
   """
-  def changeset(user, attrs) do
-    # TODO: implementar con cast, validate_required, validate_format para email,
-    # validate_length para name, validate_number para age,
-    # validate_inclusion para role, unique_constraint para email
+  @spec status_changeset(t(), map()) :: Ecto.Changeset.t()
+  def status_changeset(job, attrs) do
+    job
+    |> cast(attrs, [:status, :last_error, :retry_count])
+    # TODO: validate :status inclusion
+    # TODO: validate :retry_count >= 0
   end
+end
+```
 
-  @doc """
-  Changeset para actualización parcial (solo campos provistos).
+### Step 4: `lib/task_queue/jobs/job_store.ex` — query interface
+
+```elixir
+defmodule TaskQueue.Jobs.JobStore do
+  @moduledoc """
+  Query interface for persisted jobs.
+
+  All public functions return `{:ok, result}` or `{:error, reason}`.
+  Queries are composable — filter functions return queryable fragments.
   """
-  def update_changeset(user, attrs) do
-    # TODO: similar a changeset/2 pero sin validate_required
-    # (permite actualizaciones parciales)
-  end
 
-  # Prueba en iex:
-  # alias MiApp.Accounts.User
-  # cs = User.changeset(%User{}, %{name: "Ana", email: "ana@example.com", age: 25})
-  # cs.valid?   # true
-  # cs.errors   # []
-  #
-  # bad = User.changeset(%User{}, %{name: "A", email: "no-es-email"})
-  # bad.valid?  # false
-  # bad.errors  # [{:name, ...}, {:email, ...}]
-end
-```
-
-```elixir
-# priv/repo/migrations/20240101000001_create_users.exs
-defmodule MiApp.Repo.Migrations.CreateUsers do
-  use Ecto.Migration
-
-  def change do
-    # TODO: crear tabla "users" con los campos del schema
-    # Incluir: unique_index en email, index en role
-  end
-end
-```
-
----
-
-### Ejercicio 2: Blog con Posts y Tags (asociaciones)
-
-Implementa el sistema de blog con asociaciones `belongs_to`, `has_many`, y `many_to_many`.
-
-```elixir
-# lib/mi_app/blog/tag.ex
-defmodule MiApp.Blog.Tag do
-  use Ecto.Schema
-  import Ecto.Changeset
-
-  @primary_key {:id, :binary_id, autogenerate: true}
-  @foreign_key_type :binary_id
-
-  schema "tags" do
-    field :name, :string
-    field :slug, :string
-
-    # TODO: declarar asociación many_to_many con Post
-    # usando la tabla join "posts_tags"
-
-    timestamps()
-  end
-
-  def changeset(tag, attrs) do
-    tag
-    |> cast(attrs, [:name])
-    |> validate_required([:name])
-    |> validate_length(:name, min: 1, max: 50)
-    # TODO: generar slug automáticamente desde name usando put_change
-    # slug = name |> String.downcase() |> String.replace(~r/[^a-z0-9]+/, "-")
-    |> unique_constraint(:slug)
-  end
-end
-```
-
-```elixir
-# lib/mi_app/blog/post.ex
-defmodule MiApp.Blog.Post do
-  use Ecto.Schema
-  import Ecto.Changeset
-
-  @primary_key {:id, :binary_id, autogenerate: true}
-  @foreign_key_type :binary_id
-
-  schema "posts" do
-    field :title,     :string
-    field :body,      :string
-    field :published, :boolean, default: false
-
-    # TODO: belongs_to :author, MiApp.Accounts.User
-    # TODO: many_to_many :tags, MiApp.Blog.Tag, join_through: "posts_tags"
-
-    timestamps()
-  end
-
-  def changeset(post, attrs) do
-    # TODO: cast [:title, :body, :published, :author_id]
-    # validate_required [:title, :body, :author_id]
-    # validate_length :title, min: 5, max: 200
-    # foreign_key_constraint :author_id
-  end
-
-  @doc """
-  Changeset que permite asociar tags al post.
-  """
-  def with_tags_changeset(post, attrs, tags) do
-    post
-    |> changeset(attrs)
-    # TODO: usar put_assoc(:tags, tags) para asociar los tags
-  end
-end
-```
-
-```elixir
-# priv/repo/migrations/20240101000002_create_blog.exs
-defmodule MiApp.Repo.Migrations.CreateBlog do
-  use Ecto.Migration
-
-  def change do
-    create table(:tags, primary_key: false) do
-      # TODO: campos id (binary_id), name, slug
-      timestamps()
-    end
-
-    # TODO: unique_index en tags.slug
-
-    create table(:posts, primary_key: false) do
-      # TODO: campos id, title, body, published, references(:users)
-      timestamps()
-    end
-
-    # TODO: tabla join posts_tags con post_id y tag_id
-    # Índice único compuesto (post_id, tag_id)
-  end
-end
-```
-
-```elixir
-# Uso esperado en iex:
-# alias MiApp.{Repo, Accounts.User, Blog.Post, Blog.Tag}
-# import Ecto.Query
-#
-# {:ok, user} = %User{} |> User.changeset(%{name: "Ana", email: "ana@ex.com", age: 30}) |> Repo.insert()
-# {:ok, tag}  = %Tag{}  |> Tag.changeset(%{name: "Elixir"}) |> Repo.insert()
-# {:ok, post} = %Post{} |> Post.with_tags_changeset(%{title: "Intro a Ecto", body: "...", author_id: user.id}, [tag]) |> Repo.insert()
-#
-# post_cargado = Repo.get!(Post, post.id) |> Repo.preload([:author, :tags])
-# post_cargado.author.name  # "Ana"
-# post_cargado.tags |> Enum.map(& &1.name)  # ["Elixir"]
-```
-
----
-
-### Ejercicio 3: Búsqueda con filtros dinámicos
-
-Implementa un sistema de filtrado dinámico donde los filtros se componen sobre una query base.
-
-```elixir
-# lib/mi_app/blog/query.ex
-defmodule MiApp.Blog.Query do
   import Ecto.Query
-  alias MiApp.Blog.Post
+  alias TaskQueue.{Repo, Jobs.Job}
 
   @doc """
-  Construye una query filtrada dinámicamente.
+  Inserts a new job. Returns `{:ok, job}` or `{:error, changeset}`.
 
-  Filtros soportados:
-  - :published (boolean) — solo posts publicados/no publicados
-  - :author_id (binary_id) — posts de un autor específico
-  - :tag_slug (string) — posts con un tag específico
-  - :search (string) — búsqueda en título (ILIKE)
-  - :order_by (:asc | :desc) — ordenar por inserted_at
-  - :limit (integer) — limitar resultados
+  ## Examples
 
-  ## Ejemplo
-      iex> filters = [published: true, search: "ecto", limit: 5]
-      iex> Query.filter(filters) |> Repo.all()
+      iex> TaskQueue.Jobs.JobStore.insert(%{type: "send_email", args: %{to: "user@example.com"}})
+      {:ok, %TaskQueue.Jobs.Job{type: "send_email", status: "pending"}}
+
   """
-  def filter(filters) when is_list(filters) do
-    # Query base: todos los posts con autor precargado
-    base_query = from p in Post, preload: [:author, :tags]
-
-    # TODO: reducir los filtros sobre la query base
-    # Pista: Enum.reduce(filters, base_query, fn {key, value}, query ->
-    #           apply_filter(query, key, value)
-    #        end)
+  @spec insert(map()) :: {:ok, Job.t()} | {:error, Ecto.Changeset.t()}
+  def insert(attrs) do
+    # TODO: build a changeset with Job.changeset/2 and call Repo.insert/1
+    # HINT: %Job{} |> Job.changeset(attrs) |> Repo.insert()
   end
 
-  # TODO: implementar cada cláusula apply_filter/3:
-
-  defp apply_filter(query, :published, value) do
-    # TODO: where published == ^value
+  @doc """
+  Returns all pending jobs ordered by insertion time (oldest first).
+  """
+  @spec list_pending() :: [Job.t()]
+  def list_pending do
+    # TODO: query jobs where status == "pending", ordered by inserted_at asc
+    # HINT:
+    # from(j in Job, where: j.status == "pending", order_by: [asc: j.inserted_at])
+    # |> Repo.all()
   end
 
-  defp apply_filter(query, :author_id, author_id) do
-    # TODO: where author_id == ^author_id
+  @doc """
+  Returns all failed jobs with fewer than `max_retries` attempts.
+  """
+  @spec list_retryable(non_neg_integer()) :: [Job.t()]
+  def list_retryable(max_retries \\ 3) do
+    # TODO: query jobs where status == "failed" and retry_count < max_retries
+    # HINT:
+    # from(j in Job,
+    #   where: j.status == "failed" and j.retry_count < ^max_retries,
+    #   order_by: [asc: j.inserted_at]
+    # )
+    # |> Repo.all()
   end
 
-  defp apply_filter(query, :tag_slug, slug) do
-    # TODO: join con tags donde tags.slug == ^slug
-    # Pista: join :inner, usando many_to_many a través de posts_tags
+  @doc """
+  Marks a job as failed, increments retry_count, and records the error.
+  """
+  @spec mark_failed(integer(), String.t()) :: {:ok, Job.t()} | {:error, Ecto.Changeset.t()}
+  def mark_failed(job_id, error_message) do
+    # TODO: fetch the job, then apply status_changeset with:
+    #   status: "failed", last_error: error_message, retry_count: job.retry_count + 1
+    # HINT:
+    # job = Repo.get!(Job, job_id)
+    # job
+    # |> Job.status_changeset(%{
+    #     status: "failed",
+    #     last_error: error_message,
+    #     retry_count: job.retry_count + 1
+    #   })
+    # |> Repo.update()
   end
 
-  defp apply_filter(query, :search, term) do
-    # TODO: where ilike(p.title, ^"%#{term}%")
-  end
+  @doc """
+  Returns jobs matching a dynamic filter map.
 
-  defp apply_filter(query, :order_by, :asc) do
-    # TODO: order_by [asc: :inserted_at]
-  end
+  Supported filter keys: `:type`, `:status`
 
-  defp apply_filter(query, :order_by, :desc) do
-    # TODO: order_by [desc: :inserted_at]
-  end
+  ## Examples
 
-  defp apply_filter(query, :limit, n) do
-    # TODO: limit ^n
-  end
+      iex> TaskQueue.Jobs.JobStore.filter(%{type: "send_email", status: "pending"})
+      [%Job{type: "send_email", status: "pending"}, ...]
 
-  # Filtro desconocido: ignorar silenciosamente
-  defp apply_filter(query, _key, _value), do: query
-end
-```
-
-```elixir
-# Uso esperado:
-# alias MiApp.{Repo, Blog.Query}
-#
-# Query.filter([published: true, search: "elixir", limit: 10, order_by: :desc])
-# |> Repo.all()
-# |> Enum.each(fn p -> IO.puts("#{p.title} — #{p.author.name}") end)
-```
-
----
-
-## Common Mistakes
-
-**1. Manipular structs directamente en lugar de usar changesets**
-
-```elixir
-# MAL: salta las validaciones
-user = %User{email: "no-es-email"}
-Repo.insert(user)
-
-# BIEN: el changeset rechaza el email inválido
-{:error, changeset} =
-  %User{}
-  |> User.changeset(%{email: "no-es-email"})
-  |> Repo.insert()
-```
-
-**2. Olvidar `preload` antes de acceder asociaciones**
-
-```elixir
-# MAL: lanza %Ecto.Association.NotLoaded{}
-post = Repo.get!(Post, id)
-post.author.name  # error!
-
-# BIEN
-post = Repo.get!(Post, id) |> Repo.preload(:author)
-post.author.name  # "Ana"
-```
-
-**3. N+1 queries**
-
-```elixir
-# MAL: una query por post para cargar el autor
-posts = Repo.all(Post)
-Enum.each(posts, fn p ->
-  p = Repo.preload(p, :author)  # N queries!
-  IO.puts(p.author.name)
-end)
-
-# BIEN: preload en batch
-posts = Post |> Repo.all() |> Repo.preload(:author)  # 2 queries
-```
-
-**4. Confundir `cast` con `put_change`**
-
-```elixir
-# cast: para datos externos (usuario, API) — aplica filtering de campos
-# put_change: para datos internos del sistema — siempre se aplica
-changeset
-|> cast(attrs, [:name, :email])       # solo acepta estos campos de attrs
-|> put_change(:slug, slugify(name))   # campo calculado internamente
-```
-
-**5. Migrations irreversibles sin `down`**
-
-```elixir
-# Si usas `up/down` en lugar de `change`, define ambos:
-def up do
-  alter table(:users) do
-    add :verified, :boolean, default: false
-  end
-end
-
-def down do
-  alter table(:users) do
-    remove :verified
+  """
+  @spec filter(map()) :: [Job.t()]
+  def filter(filters) when is_map(filters) do
+    # TODO: start with `from(j in Job)` and compose filters dynamically
+    # For each key in filters, add a where clause
+    # HINT:
+    # Enum.reduce(filters, from(j in Job), fn
+    #   {:type, type}, query   -> where(query, [j], j.type == ^type)
+    #   {:status, s}, query    -> where(query, [j], j.status == ^s)
+    #   _, query               -> query
+    # end)
+    # |> Repo.all()
   end
 end
 ```
 
----
+### Step 5: Given tests — must pass without modification
 
-## Verification
+```elixir
+# test/task_queue/ecto_test.exs
+defmodule TaskQueue.EctoTest do
+  use ExUnit.Case, async: false
+
+  alias TaskQueue.Jobs.{Job, JobStore}
+
+  setup do
+    # Using Ecto Sandbox for test isolation
+    :ok = Ecto.Adapters.SQL.Sandbox.checkout(TaskQueue.Repo)
+  end
+
+  describe "Job.changeset/2" do
+    test "valid changeset with required type" do
+      changeset = Job.changeset(%Job{}, %{type: "send_email"})
+      assert changeset.valid?
+    end
+
+    test "invalid changeset missing type" do
+      changeset = Job.changeset(%Job{}, %{})
+      refute changeset.valid?
+      assert {:type, _} = hd(changeset.errors)
+    end
+
+    test "invalid changeset with bad status" do
+      changeset = Job.changeset(%Job{}, %{type: "noop", status: "invalid_status"})
+      refute changeset.valid?
+    end
+
+    test "invalid changeset with negative retry_count" do
+      changeset = Job.changeset(%Job{}, %{type: "noop", retry_count: -1})
+      refute changeset.valid?
+    end
+  end
+
+  describe "JobStore.insert/1" do
+    test "inserts a valid job" do
+      assert {:ok, job} = JobStore.insert(%{type: "send_email", args: %{to: "user@example.com"}})
+      assert job.id != nil
+      assert job.type == "send_email"
+      assert job.status == "pending"
+      assert job.retry_count == 0
+    end
+
+    test "returns changeset error for invalid job" do
+      assert {:error, changeset} = JobStore.insert(%{})
+      refute changeset.valid?
+    end
+  end
+
+  describe "JobStore.list_pending/0" do
+    test "returns only pending jobs" do
+      {:ok, _} = JobStore.insert(%{type: "noop"})
+      {:ok, j2} = JobStore.insert(%{type: "noop"})
+      JobStore.mark_failed(j2.id, "network error")
+
+      pending = JobStore.list_pending()
+      assert length(pending) >= 1
+      assert Enum.all?(pending, fn j -> j.status == "pending" end)
+    end
+  end
+
+  describe "JobStore.list_retryable/1" do
+    test "returns failed jobs with retry_count below max" do
+      {:ok, job} = JobStore.insert(%{type: "send_email"})
+      {:ok, _}   = JobStore.mark_failed(job.id, "timeout")
+
+      retryable = JobStore.list_retryable(3)
+      assert Enum.any?(retryable, fn j -> j.id == job.id end)
+    end
+
+    test "excludes jobs at or above max_retries" do
+      {:ok, job} = JobStore.insert(%{type: "send_email"})
+      # Exhaust retries
+      {:ok, j1} = JobStore.mark_failed(job.id, "e1")
+      {:ok, j2} = JobStore.mark_failed(j1.id, "e2")
+      {:ok, _}  = JobStore.mark_failed(j2.id, "e3")
+
+      retryable = JobStore.list_retryable(3)
+      refute Enum.any?(retryable, fn j -> j.id == job.id end)
+    end
+  end
+
+  describe "JobStore.filter/1" do
+    test "filters by type" do
+      {:ok, _} = JobStore.insert(%{type: "send_email"})
+      {:ok, _} = JobStore.insert(%{type: "send_sms"})
+
+      results = JobStore.filter(%{type: "send_email"})
+      assert Enum.all?(results, fn j -> j.type == "send_email" end)
+    end
+
+    test "filters by status" do
+      {:ok, job} = JobStore.insert(%{type: "noop"})
+      JobStore.mark_failed(job.id, "error")
+
+      failed = JobStore.filter(%{status: "failed"})
+      assert Enum.any?(failed, fn j -> j.id == job.id end)
+    end
+
+    test "combines multiple filters" do
+      {:ok, _} = JobStore.insert(%{type: "send_email"})
+      {:ok, j2} = JobStore.insert(%{type: "send_email"})
+      JobStore.mark_failed(j2.id, "error")
+
+      results = JobStore.filter(%{type: "send_email", status: "failed"})
+      assert Enum.all?(results, fn j -> j.type == "send_email" and j.status == "failed" end)
+    end
+  end
+end
+```
+
+### Step 6: Run migrations and tests
 
 ```bash
-# Setup inicial
 mix deps.get
 mix ecto.create
 mix ecto.migrate
-
-# En iex -S mix
-alias MiApp.{Repo, Accounts.User, Blog.Post, Blog.Tag, Blog.Query}
-import Ecto.Query
-
-# Verificar inserción con validación
-cs = User.changeset(%User{}, %{name: "Ana", email: "ana@example.com", age: 30})
-cs.valid?   # true
-
-{:ok, user} = Repo.insert(cs)
-user.id     # UUID generado
-
-# Verificar validación fallida
-bad = User.changeset(%User{}, %{name: "A", email: "malformado"})
-bad.valid?         # false
-bad.errors         # [{:name, {"should be at least %{count} character(s)", ...}}, {:email, ...}]
-
-# Verificar query básica
-from(u in User, where: u.age > 18) |> Repo.all() |> length()  # >= 1
-
-# Verificar filtros dinámicos
-Query.filter([published: true, limit: 5]) |> Repo.all()
+mix test test/task_queue/ecto_test.exs --trace
 ```
 
 ---
 
-## Summary
+## Trade-off analysis
 
-Ecto separa claramente tres responsabilidades:
+| Aspect | Ecto changeset | Direct struct insert | Raw SQL |
+|--------|---------------|----------------------|---------|
+| Validation before DB | yes | no | no |
+| Error messages | structured `{field, {msg, opts}}` | database constraint error | raw driver error |
+| Composable queries | yes — `Ecto.Query` | N/A | limited — string concat |
+| SQL injection safety | yes — parameterized | N/A | manual |
+| Schema evolution | migrations | manual `ALTER TABLE` | manual |
 
-| Componente | Responsabilidad |
-|------------|----------------|
-| `Schema` | Estructura de datos, mapeo tabla ↔ struct |
-| `Changeset` | Validación y transformación de datos externos |
-| `Repo` | Acceso a base de datos (queries, insert, update, delete) |
-| `Migration` | Evolución del esquema de base de datos |
-
-Los changesets son el núcleo de la seguridad de datos: nunca persistas datos sin pasar por uno. Las queries se componen de forma funcional con el pipe operator, lo que permite filtros dinámicos elegantes.
+Reflection question: `Repo.get!/2` raises on not found. `Repo.get/2` returns `nil`. When would you prefer `get!` in production code, and when would `nil` be the safer return?
 
 ---
 
-## What's Next
+## Common production mistakes
 
-- **30**: Process Dictionary — estado por proceso con `:erlang.put/get`
-- **Ecto.Multi**: transacciones atómicas con múltiples operaciones
-- **Ecto.Repo.transaction/2**: transacciones manuales
-- **Fragmentos SQL**: `fragment("lower(?)", u.email)` para funciones nativas
-- **Ecto.Query.API**: funciones agregadas (`count`, `sum`, `avg`, `max`)
+**1. Using `cast/3` without `validate_required/2`**
+
+`cast/3` silently drops fields not in the allowed list and sets missing fields to `nil`. Without `validate_required/2`, a changeset with a nil required field is marked valid and reaches the database — where the `NOT NULL` constraint fires with a cryptic error.
+
+**2. N+1 queries when loading associations**
+
+```elixir
+# Wrong — runs one query per job to load its worker
+jobs = Repo.all(Job)
+Enum.map(jobs, fn job -> Repo.preload(job, :worker) end)
+
+# Right — single query with JOIN
+Repo.all(from j in Job, preload: [:worker])
+```
+
+**3. `Repo.update/1` on a struct instead of a changeset**
+
+`Repo.update` requires a changeset, not a struct. Passing a struct directly updates ALL fields including `inserted_at`, which bypasses `updated_at` tracking.
+
+**4. Not using `Ecto.Adapters.SQL.Sandbox` in tests**
+
+Without sandbox mode, each test writes to the real database and leaves data behind, contaminating subsequent tests. Configure the repo with `pool: Ecto.Adapters.SQL.Sandbox` in `config/test.exs`.
+
+**5. Building WHERE clauses with string interpolation**
+
+```elixir
+# Wrong — SQL injection
+Repo.query!("SELECT * FROM jobs WHERE type = '#{type}'")
+
+# Right — parameterized
+from(j in Job, where: j.type == ^type) |> Repo.all()
+```
 
 ---
 
 ## Resources
 
-- [Ecto Getting Started](https://hexdocs.pm/ecto/getting-started.html)
-- [Ecto.Changeset docs](https://hexdocs.pm/ecto/Ecto.Changeset.html)
-- [Ecto.Query DSL](https://hexdocs.pm/ecto/Ecto.Query.html)
-- [Programming Ecto (Pragmatic Bookshelf)](https://pragprog.com/titles/wmecto/programming-ecto/)
-- [Postgrex adapter](https://hexdocs.pm/postgrex/readme.html)
+- [Ecto documentation — official hex](https://hexdocs.pm/ecto/Ecto.html)
+- [Ecto.Changeset — validation and casting](https://hexdocs.pm/ecto/Ecto.Changeset.html)
+- [Ecto.Query — composable queries](https://hexdocs.pm/ecto/Ecto.Query.html)
+- [Ecto.Adapters.SQL.Sandbox — test isolation](https://hexdocs.pm/ecto_sql/Ecto.Adapters.SQL.Sandbox.html)

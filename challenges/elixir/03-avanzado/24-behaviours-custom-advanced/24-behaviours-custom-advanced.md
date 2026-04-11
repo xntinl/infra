@@ -1,617 +1,479 @@
-# 24 — Advanced Behaviours with Compile-Time Validation
+# Advanced Behaviours with Compile-Time Validation
 
-**Nivel**: Avanzado  
-**Tema**: Behaviours avanzados con `@optional_callbacks`, validación en compile-time, `@macrocallback`, comparación con Protocols
+**Project**: `api_gateway` — built incrementally across the advanced level
 
 ---
 
-## Contexto
+## Project context
 
-Un **Behaviour** en Elixir es un contrato que define qué funciones (o macros) debe
-implementar un módulo. A diferencia de los Protocols, que polimorfismizan sobre el
-*tipo de un valor*, los Behaviours definen la *interfaz de un módulo*.
+You're building `api_gateway`. The gateway supports pluggable middleware components,
+and teams contribute new middleware constantly. Without a formal contract, middleware
+modules vary in their function signatures, miss required callbacks, or skip optional
+lifecycle hooks — causing runtime crashes that only appear when a specific request
+hits the missing code path.
 
-### Anatomía de un Behaviour
+The solution is a formal `ApiGateway.Middleware.Behaviour` that:
+1. Defines required and optional callbacks with full typespecs
+2. Validates at compile time (via `@before_compile`) that every required callback
+   is implemented — catching missing implementations at `mix compile`, not in prod
+3. Provides default implementations for optional callbacks via `__using__/1`
 
-```elixir
-defmodule MyBehaviour do
-  # Callback obligatorio con spec completa
-  @callback init(opts :: keyword()) :: {:ok, state :: term()} | {:error, reason :: term()}
+Project structure at this point:
 
-  # Callback con tipos complejos
-  @callback handle_event(event :: event_t(), state :: state_t()) ::
-              {:ok, new_state :: state_t()}
-              | {:error, reason :: term(), state :: state_t()}
-
-  # Callback opcional — no genera warning si no se implementa
-  @optional_callbacks [format_error: 1, on_exit: 1]
-  @callback format_error(error :: term()) :: String.t()
-  @callback on_exit(state :: term()) :: :ok
-
-  # Macrocallback — la implementación debe ser una macro, no una función
-  @macrocallback transform(ast :: Macro.t()) :: Macro.t()
-end
+```
+api_gateway/
+├── lib/
+│   └── api_gateway/
+│       ├── application.ex
+│       ├── router.ex
+│       ├── middleware/
+│       │   ├── pipeline.ex
+│       │   ├── instrumentation.ex
+│       │   ├── dsl.ex
+│       │   └── behaviour.ex        # ← you implement this
+│       └── ...
+├── test/
+│   └── api_gateway/
+│       └── middleware/
+│           └── behaviour_test.exs
+└── mix.exs
 ```
 
-### `@optional_callbacks`
+---
 
-Los callbacks opcionales no generan warning del compilador cuando no se implementan.
-Útil para hooks de extensión que tienen comportamiento default razonable.
+## The business problem
 
-```elixir
-@optional_callbacks [
-  handle_timeout: 2,   # función con aridad 2
-  on_start: 1
-]
-```
+Two requirements:
 
-### `__behaviour__/1` — introspección
+1. **Compile-time contract enforcement**: if a developer creates a middleware module
+   and forgets to implement `call/2`, the build must fail with a clear message
+   (`"Module Foo.Bar claims to be a middleware but does not implement call/2"`).
+   A runtime crash on the first request is unacceptable.
 
-```elixir
-# En módulos que definen @callback, Elixir genera automáticamente:
-MyBehaviour.behaviour_info(:callbacks)
-# => [init: 1, handle_event: 2, format_error: 1, on_exit: 1, transform: 1]
+2. **Optional lifecycle hooks**: middleware can optionally implement `init/1`
+   (called once at startup to validate options), `on_error/3` (called when an
+   exception escapes), and `telemetry_prefix/0` (returns the telemetry event
+   prefix). Middleware that doesn't implement these gets sensible defaults:
+   `init/1` returns its argument unchanged, `on_error/3` re-raises.
 
-MyBehaviour.behaviour_info(:optional_callbacks)
-# => [format_error: 1, on_exit: 1]
-```
+---
 
-### Default implementations via `__using__/1`
-
-```elixir
-defmodule MyBehaviour do
-  @callback required_callback(term()) :: term()
-  @optional_callbacks [optional_hook: 0]
-  @callback optional_hook() :: :ok
-
-  defmacro __using__(_opts) do
-    quote do
-      @behaviour MyBehaviour
-
-      # Implementación por defecto para callbacks opcionales
-      def optional_hook, do: :ok
-
-      # Permite que el módulo usuario la sobreescriba
-      defoverridable [optional_hook: 0]
-    end
-  end
-end
-```
-
-### Behaviour vs Protocol — cuándo usar cada uno
+## Behaviours vs Protocols — when to use which
 
 | | Behaviour | Protocol |
-|---|---|---|
-| Pregunta | "¿Este módulo tiene esta interfaz?" | "¿Este tipo de valor tiene esta operación?" |
-| Dispatch | Estático — el módulo se pasa explícitamente | Dinámico — por tipo del valor |
-| Composición | `use` inyecta implementación default | `@derive` genera implementación |
-| Ejemplo típico | Worker, Adapter, Plugin, GenServer | Stringify, Serialize, Compare |
-| Verificación | Compile-time (warnings) o runtime | Runtime (Protocol.impl_for) |
+|---|-----------|---------|
+| Polymorphism over | Module identity | Value type |
+| Dispatch | Explicit — `Module.function()` | Implicit — `Protocol.function(value)` |
+| Compile-time check | Via `@before_compile` or Dialyzer | Via `Protocol.impl_for!/1` in tests |
+| Default impl | Yes — via `__using__/1` | Yes — via `for: Any` |
+| Use case | Plugins, adapters, drivers | Data transformation, formatting |
+
+Middleware is a *module-level* contract: the pipeline calls `Module.call(conn, opts)`.
+This is a behaviour, not a protocol — no value dispatch is needed.
 
 ---
 
-## Ejercicio 1 — Plugin Behaviour con callbacks required + optional
-
-Implementa un sistema de plugins donde cada plugin debe implementar un contrato
-bien definido con callbacks obligatorios y opcionales.
-
-### El Behaviour
+## `@optional_callbacks` — how they work
 
 ```elixir
-defmodule Plugin do
-  # Required
-  @callback name() :: String.t()
-  @callback version() :: String.t()
-  @callback execute(input :: map(), config :: keyword()) ::
-              {:ok, output :: map()} | {:error, reason :: String.t()}
-
-  # Optional — con default implementations
-  @callback priority() :: integer()          # default: 0
-  @callback validate_config(config :: keyword()) :: :ok | {:error, String.t()}  # default: siempre :ok
-  @callback on_load(config :: keyword()) :: :ok  # default: :ok
-  @callback on_unload() :: :ok               # default: :ok
-  @callback description() :: String.t()      # default: ""
-end
+@optional_callbacks [init: 1, on_error: 3, telemetry_prefix: 0]
+@callback init(opts :: keyword()) :: keyword()
+@callback on_error(conn :: Conn.t(), error :: Exception.t(), stacktrace :: list()) :: Conn.t()
+@callback telemetry_prefix() :: [atom()]
 ```
 
-### Pipeline de plugins
+`@optional_callbacks` tells the compiler not to emit a warning when a module
+that `@behaviour MyBehaviour` does not implement these callbacks. The behaviour
+module itself can then check `function_exported?(mod, :init, 1)` at runtime to
+decide whether to call the optional implementation or use the default.
+
+---
+
+## `@macrocallback` — when the implementation must be a macro
 
 ```elixir
-defmodule PluginRunner do
-  # Ejecuta todos los plugins en orden de prioridad
-  # Cada plugin recibe el output del anterior como input
-  @spec run(plugins :: [module()], input :: map(), config :: keyword()) ::
-        {:ok, final_output :: map()} | {:error, {plugin :: module(), reason :: String.t()}}
-  def run(plugins, input, config \\ [])
-
-  # Lista plugins ordenados por prioridad
-  @spec sorted(plugins :: [module()]) :: [module()]
-  def sorted(plugins)
-
-  # Verifica que un módulo implementa el behaviour correctamente
-  @spec valid_plugin?(module :: module()) :: boolean()
-  def valid_plugin?(module)
-end
+@macrocallback transform_opts(opts :: Macro.t()) :: Macro.t()
 ```
 
-### Ejemplo de plugin
+`@macrocallback` is used when the implementing module must provide a macro, not a
+function. This is rare — it's used by DSLs (like `Ecto.Schema`) where the callback
+must inject quoted code into the caller's module. For the middleware behaviour, all
+callbacks are regular functions.
+
+---
+
+## Implementation
+
+### Step 1: `lib/api_gateway/middleware/behaviour.ex`
 
 ```elixir
-defmodule UppercasePlugin do
-  use Plugin  # inyecta behaviour + defaults
+defmodule ApiGateway.Middleware.Behaviour do
+  @moduledoc """
+  Behaviour contract for all ApiGateway middleware modules.
 
-  @impl Plugin
-  def name, do: "uppercase"
+  Required callbacks:
+    - call/2: processes a connection; must be implemented by every middleware
 
-  @impl Plugin
-  def version, do: "1.0.0"
+  Optional callbacks (have defaults via __using__/1):
+    - init/1: validates options at startup; default returns opts unchanged
+    - on_error/3: handles escaped exceptions; default re-raises
+    - telemetry_prefix/0: prefix for :telemetry events; default uses module name
 
-  @impl Plugin
-  def priority, do: 10  # sobreescribe el default de 0
+  Usage:
+    defmodule ApiGateway.Middleware.Auth do
+      use ApiGateway.Middleware.Behaviour
 
-  @impl Plugin
-  def execute(%{text: text} = input, _config) do
-    {:ok, Map.put(input, :text, String.upcase(text))}
-  end
-  def execute(_input, _config), do: {:error, "input must have :text key"}
-end
-```
+      @impl true
+      def call(conn, opts) do
+        # ... auth logic
+        conn
+      end
 
-### Hints
+      @impl true
+      def init(opts) do
+        Keyword.validate!(opts, [:realm, :required])
+      end
+    end
+  """
 
-<details>
-<summary>Hint 1 — Registrar @optional_callbacks correctamente</summary>
+  alias ApiGateway.Conn
 
-```elixir
-defmodule Plugin do
-  @optional_callbacks [
-    priority: 0,
-    validate_config: 1,
-    on_load: 1,
-    on_unload: 0,
-    description: 0
-  ]
+  # ── Required callbacks ──────────────────────────────────────────────────────
 
-  @callback priority() :: integer()
-  # ... más callbacks opcionales
+  @doc """
+  Processes an in-flight connection.
+  Must return the (possibly modified) conn.
+  """
+  @callback call(conn :: Conn.t(), opts :: keyword()) :: Conn.t()
+
+  # ── Optional callbacks ──────────────────────────────────────────────────────
+
+  @optional_callbacks [init: 1, on_error: 3, telemetry_prefix: 0]
+
+  @doc """
+  Called once when the middleware is initialized (at pipeline build time).
+  Use to validate options and raise ArgumentError for bad configuration.
+  Default: returns opts unchanged.
+  """
+  @callback init(opts :: keyword()) :: keyword()
+
+  @doc """
+  Called when an exception escapes from call/2.
+  Must return a conn (to send an error response) or re-raise.
+  Default: re-raises the exception with the original stacktrace.
+  """
+  @callback on_error(conn :: Conn.t(), error :: Exception.t(), stacktrace :: list()) :: Conn.t()
+
+  @doc """
+  Returns the :telemetry event name prefix for this middleware.
+  Default: [:api_gateway, :middleware, <module_name_snake_case>]
+  """
+  @callback telemetry_prefix() :: [atom()]
+
+  # ── __using__/1 — injects defaults and registers compile-time validation ────
 
   defmacro __using__(_opts) do
     quote do
-      @behaviour Plugin
+      @behaviour ApiGateway.Middleware.Behaviour
 
-      # Defaults para callbacks opcionales
-      def priority, do: 0
-      def validate_config(_config), do: :ok
-      def on_load(_config), do: :ok
-      def on_unload, do: :ok
-      def description, do: ""
+      # Default implementations for optional callbacks.
+      # Implementing modules may override these with @impl true.
 
-      defoverridable [priority: 0, validate_config: 1, on_load: 1, on_unload: 0, description: 0]
+      @impl ApiGateway.Middleware.Behaviour
+      def init(opts), do: opts
+
+      @impl ApiGateway.Middleware.Behaviour
+      def on_error(_conn, error, stacktrace), do: reraise(error, stacktrace)
+
+      @impl ApiGateway.Middleware.Behaviour
+      def telemetry_prefix do
+        # HINT: use Module.split(__MODULE__) to get parts, then Enum.map with &String.downcase/1
+        # HINT: convert the last component to a snake_case atom
+        # TODO: implement — return [:api_gateway, :middleware, <derived_atom>]
+        [:api_gateway, :middleware, :unknown]
+      end
+
+      # Allow implementing modules to override the defaults
+      defoverridable [init: 1, on_error: 3, telemetry_prefix: 0]
+
+      # Register compile-time validation
+      @before_compile ApiGateway.Middleware.Behaviour
     end
   end
-end
-```
-</details>
 
-<details>
-<summary>Hint 2 — valid_plugin? usando behaviour_info</summary>
-
-```elixir
-def valid_plugin?(module) do
-  # Verificar que el módulo exporta @behaviour Plugin
-  behaviours = module.__info__(:attributes) |> Keyword.get(:behaviour, [])
-
-  if Plugin not in behaviours do
-    false
-  else
-    required = Plugin.behaviour_info(:callbacks) -- Plugin.behaviour_info(:optional_callbacks)
-    Enum.all?(required, fn {fun, arity} ->
-      function_exported?(module, fun, arity)
-    end)
-  end
-end
-```
-</details>
-
-<details>
-<summary>Hint 3 — Pipeline con acumulación de errores</summary>
-
-```elixir
-def run(plugins, input, config) do
-  sorted_plugins = sorted(plugins)
-
-  Enum.reduce_while(sorted_plugins, {:ok, input}, fn plugin, {:ok, current_input} ->
-    case plugin.execute(current_input, config) do
-      {:ok, output}     -> {:cont, {:ok, output}}
-      {:error, reason}  -> {:halt, {:error, {plugin, reason}}}
-    end
-  end)
-end
-```
-</details>
-
----
-
-## Ejercicio 2 — Validación en compile-time
-
-Implementa un macro `assert_behaviour/1` que **en compile time** verifique que
-el módulo donde se usa implementa todos los callbacks required de un behaviour dado.
-Si falta alguno, debe generar un `CompileError` con un mensaje descriptivo.
-
-### API requerida
-
-```elixir
-defmodule MyPlugin do
-  @behaviour Plugin
-
-  # Esta línea verifica en compile time:
-  Plugin.assert_implemented(__MODULE__)
-  # Si falta algún callback, lanza CompileError antes de terminar la compilación
-
-  def name, do: "my-plugin"
-  def version, do: "1.0.0"
-  def execute(input, _config), do: {:ok, input}
-end
-```
-
-Alternativamente, como macro standalone:
-
-```elixir
-defmodule MyPlugin do
-  use Plugin  # esto ya llama assert_implemented internamente en @before_compile
-  # ...
-end
-```
-
-### Variante: `@before_compile` automático
-
-Modifica el `__using__/1` del behaviour para que el `@before_compile` hook
-verifique automáticamente que todos los callbacks required están definidos
-en el módulo usuario antes de terminar la compilación.
-
-### Hints
-
-<details>
-<summary>Hint 1 — ¿Qué información está disponible en @before_compile?</summary>
-
-En `@before_compile`, tienes acceso al entorno del módulo (`env`):
-
-```elixir
-defmacro __before_compile__(env) do
-  module = env.module
-
-  # Ver qué funciones están definidas hasta este momento
-  defined_fns = Module.definitions_in(module)
-  # => [{:name, 0}, {:version, 0}, {:execute, 2}, ...]
-
-  # Ver qué behaviours declaró el módulo
-  behaviours = Module.get_attribute(module, :behaviour)
-
-  # Callbacks required del behaviour
-  required = Plugin.behaviour_info(:callbacks) -- Plugin.behaviour_info(:optional_callbacks)
-
-  missing = required -- defined_fns
-
-  unless missing == [] do
-    missing_str = Enum.map_join(missing, ", ", fn {f, a} -> "#{f}/#{a}" end)
-    raise CompileError,
-      file: env.file,
-      line: env.line,
-      description: "#{module} no implementa los callbacks required de Plugin: #{missing_str}"
-  end
-
-  # No generar código adicional — sólo validar
-  :ok
-end
-```
-</details>
-
-<details>
-<summary>Hint 2 — Integrar en __using__/1</summary>
-
-```elixir
-defmacro __using__(_opts) do
-  quote do
-    @behaviour Plugin
-    @before_compile Plugin  # registra el hook
-
-    # ... defaults ...
-  end
-end
-```
-
-La clave: `@before_compile Plugin` hace que Elixir llame a `Plugin.__before_compile__/1`
-justo antes de compilar el módulo usuario. En ese momento,
-`Module.definitions_in/1` ya contiene todas las funciones definidas.
-</details>
-
----
-
-## Ejercicio 3 — Macro Callback: DSL Generation Behaviour
-
-Implementa un behaviour donde uno de los callbacks es un **macro** (`@macrocallback`).
-El caso de uso: un behaviour para "transformadores de código" donde cada implementación
-define cómo transformar un bloque de código en compile time.
-
-### El Behaviour
-
-```elixir
-defmodule CodeTransformer do
-  @doc """
-  Transforma un bloque de código AST en compile time.
-  La implementación debe ser un macro porque recibe y retorna AST.
-  """
-  @macrocallback transform(ast :: Macro.t()) :: Macro.t()
-
-  @doc "Nombre descriptivo del transformador"
-  @callback name() :: String.t()
-
-  @doc "Prioridad de aplicación cuando se encadenan múltiples transformadores"
-  @callback priority() :: integer()
-  @optional_callbacks [priority: 0]
-end
-```
-
-### Implementaciones de ejemplo
-
-```elixir
-defmodule LoggingTransformer do
-  @behaviour CodeTransformer
-
-  def name, do: "logging"
-
-  # Este es un macrocallback — debe ser defmacro
-  defmacro transform(ast) do
-    # Envuelve cada expresión del bloque con logging
-    quote do
-      result = unquote(ast)
-      IO.puts("[LOG] expresión evaluada: #{inspect(result)}")
-      result
-    end
-  end
-end
-
-defmodule TimingTransformer do
-  @behaviour CodeTransformer
-
-  def name, do: "timing"
-  def priority, do: 100  # alta prioridad → se aplica primero
-
-  defmacro transform(ast) do
-    quote do
-      start = System.monotonic_time(:microsecond)
-      result = unquote(ast)
-      elapsed = System.monotonic_time(:microsecond) - start
-      IO.puts("[TIMING] #{elapsed} µs")
-      result
-    end
-  end
-end
-```
-
-### El orquestador de transformadores
-
-```elixir
-defmodule Transform do
-  @doc """
-  Aplica una lista de transformadores al bloque dado, en orden de prioridad.
-  Cada transformador es un módulo que implementa CodeTransformer.
-  """
-  defmacro apply_transformers(transformers, do: block) do
-    # transformers es una lista de módulos evaluada en compile time
-    # Ordenar por priority (si implementan el callback opcional)
-    # Aplicar en cadena: cada transformador envuelve el resultado del anterior
-    # ...
-  end
-end
-```
-
-### Uso
-
-```elixir
-defmodule MyApp do
-  require Transform
-  require LoggingTransformer
-  require TimingTransformer
-
-  def run do
-    Transform.apply_transformers([TimingTransformer, LoggingTransformer]) do
-      heavy_computation(1..1000)
-    end
-    # Aplica primero TimingTransformer (prioridad 100), luego LoggingTransformer (prioridad 0)
-    # Equivalente a: TimingTransformer.transform(LoggingTransformer.transform(heavy_computation(1..1000)))
-  end
-end
-```
-
-### Hints
-
-<details>
-<summary>Hint 1 — ¿Cómo verificar macrocallbacks?</summary>
-
-`@macrocallback` en un behaviour espera que la implementación use `defmacro`.
-En el módulo implementador, Elixir espera `MACRO-name/arity`:
-
-```elixir
-# Para verificar que un módulo implementa el macrocallback:
-macro_exports = module.__info__(:macros)
-# => [transform: 1]  (si está definido con defmacro)
-
-# O usando macro_exported?/3:
-macro_exported?(module, :transform, 1)
-```
-</details>
-
-<details>
-<summary>Hint 2 — Encadenar transformadores en compile time</summary>
-
-El trick de `apply_transformers` es construir el AST final en compile time
-anidando las llamadas a los macros de cada transformador:
-
-```elixir
-defmacro apply_transformers(transformers, do: block) do
-  # Evaluar la lista de módulos en compile time
-  mods = Code.eval_quoted(transformers, [], __CALLER__) |> elem(0)
-
-  # Ordenar por prioridad
-  sorted = Enum.sort_by(mods, fn mod ->
-    if function_exported?(mod, :priority, 0), do: mod.priority(), else: 0
-  end, :desc)
-
-  # Construir AST anidado: t1.transform(t2.transform(block))
-  Enum.reduce(sorted, block, fn mod, inner_ast ->
-    quote do
-      require unquote(mod)
-      unquote(mod).transform(unquote(inner_ast))
-    end
-  end)
-end
-```
-</details>
-
-<details>
-<summary>Hint 3 — @impl para macrocallbacks</summary>
-
-Cuando implementas un `@macrocallback`, el `@impl` funciona igual:
-
-```elixir
-defmodule MyTransformer do
-  @behaviour CodeTransformer
-
-  @impl CodeTransformer
-  def name, do: "my-transformer"
-
-  @impl CodeTransformer
-  defmacro transform(ast) do
-    # ...
-  end
-end
-```
-
-`@impl` verifica en compile time que el nombre y aridad coinciden con
-el callback declarado en el behaviour, generando warnings si no coinciden.
-</details>
-
----
-
-## Trade-offs a considerar
-
-### `@macrocallback` vs `@callback`
-
-`@macrocallback` es poderoso pero raro. Úsalo cuando el comportamiento
-polimórfico necesita operar sobre AST (transformadores de código, DSL builders).
-Para todo lo demás, `@callback` con funciones normales es más simple, testeable
-y debuggeable.
-
-### Validación en compile-time: ¿cuándo es suficiente el warning del compilador?
-
-Elixir ya genera warnings cuando un módulo declara `@behaviour X` pero no
-implementa todos los callbacks required. En muchos casos esto es suficiente.
-El `@before_compile` que lanza `CompileError` es más estricto: convierte un
-warning (ignorable) en un error (no-ignorable). Úsalo cuando:
-- El contrato es crítico y no puede romperse silenciosamente
-- Tienes un sistema de plugins donde las implementaciones incompletas causarían
-  errores en runtime difíciles de trazar
-
-### `defoverridable` y la trampa del default
-
-Cuando defines defaults en `__using__/1` y los marcas como `defoverridable`,
-el módulo usuario puede olvidar sobreescribir algo importante. El error aparece
-en runtime, no en compile time. Considera usar callbacks required para todo
-lo que sea verdaderamente esencial, y opcionales sólo para hooks secundarios.
-
-### `Module.definitions_in/1` y el orden de compilación
-
-`Module.definitions_in/1` en `@before_compile` refleja **todas** las funciones
-definidas hasta ese momento, incluyendo las inyectadas por `use`. Esto significa
-que tus defaults (de `__using__`) aparecerán en la lista incluso si el usuario
-no los sobreescribió. Para distinguir "usuario implementó" vs "default inyectado",
-necesitas una estrategia adicional (e.g., marcar con un module attribute qué
-funciones fueron sobreescritas).
-
-### Performance: Behaviours no tienen overhead de dispatch
-
-A diferencia de los Protocols, los Behaviours no tienen overhead en runtime:
-llamas `ModuloConcreto.funcion()` directamente. El "polimorfismo" es resuelto
-por el programador (pasando el módulo como parámetro), no por el runtime.
-Esto hace que los Behaviours sean ideales para sistemas de plugins donde el
-módulo concreto se conoce en configuración.
-
----
-
-## One possible solution
-
-<details>
-<summary>Ver solución Plugin Behaviour (spoiler)</summary>
-
-```elixir
-defmodule Plugin do
-  @callback name() :: String.t()
-  @callback version() :: String.t()
-  @callback execute(map(), keyword()) :: {:ok, map()} | {:error, String.t()}
-  @callback priority() :: integer()
-  @callback validate_config(keyword()) :: :ok | {:error, String.t()}
-  @callback on_load(keyword()) :: :ok
-  @callback on_unload() :: :ok
-  @callback description() :: String.t()
-
-  @optional_callbacks [priority: 0, validate_config: 1, on_load: 1, on_unload: 0, description: 0]
-
-  defmacro __using__(_opts) do
-    quote do
-      @behaviour Plugin
-      @before_compile Plugin
-
-      def priority, do: 0
-      def validate_config(_), do: :ok
-      def on_load(_), do: :ok
-      def on_unload, do: :ok
-      def description, do: ""
-
-      defoverridable [priority: 0, validate_config: 1, on_load: 1, on_unload: 0, description: 0]
-    end
-  end
+  # ── Compile-time validation ──────────────────────────────────────────────────
 
   defmacro __before_compile__(env) do
-    required = Plugin.behaviour_info(:callbacks) -- Plugin.behaviour_info(:optional_callbacks)
-    defined  = Module.definitions_in(env.module)
-    missing  = required -- defined
+    module = env.module
 
-    unless missing == [] do
-      missing_str = Enum.map_join(missing, ", ", fn {f, a} -> "#{f}/#{a}" end)
-      raise CompileError,
-        file: env.file,
-        line: env.line,
-        description: "#{env.module} no implementa: #{missing_str}"
+    # Check that the required callback call/2 is defined.
+    # Module.defines?/3 checks if the function is explicitly defined in this module
+    # (not inherited from a default).
+    #
+    # HINT: use Module.defines?(module, {:call, 2}, :def)
+    # HINT: if not defined, raise CompileError with a clear message
+    # HINT: the message should include the module name so developers know which
+    #       module is missing the implementation
+    #
+    # TODO: implement the validation check
+    #
+    # Note: this hook runs AFTER the module body is evaluated, so all `def`
+    # declarations are visible to Module.defines?/3 at this point.
+    :ok
+  end
+
+  # ── Runtime helpers for the pipeline ────────────────────────────────────────
+
+  @doc """
+  Calls init/1 on `module` if it exports the function, otherwise returns opts unchanged.
+  Used by the pipeline builder to initialize each middleware.
+  """
+  @spec maybe_init(module(), keyword()) :: keyword()
+  def maybe_init(module, opts) do
+    if function_exported?(module, :init, 1) do
+      module.init(opts)
+    else
+      opts
     end
   end
-end
 
-defmodule PluginRunner do
-  def run(plugins, input, config \\ []) do
-    plugins
-    |> sorted()
-    |> Enum.reduce_while({:ok, input}, fn plugin, {:ok, acc} ->
-      case plugin.execute(acc, config) do
-        {:ok, out}       -> {:cont, {:ok, out}}
-        {:error, reason} -> {:halt, {:error, {plugin, reason}}}
-      end
-    end)
+  @doc """
+  Calls on_error/3 on `module` if it exports the function,
+  otherwise re-raises the error.
+  """
+  @spec maybe_on_error(module(), Conn.t(), Exception.t(), list()) :: Conn.t()
+  def maybe_on_error(module, conn, error, stacktrace) do
+    if function_exported?(module, :on_error, 3) do
+      module.on_error(conn, error, stacktrace)
+    else
+      reraise(error, stacktrace)
+    end
   end
 
-  def sorted(plugins) do
-    Enum.sort_by(plugins, & &1.priority(), :desc)
-  end
-
-  def valid_plugin?(module) do
-    behaviours = module.__info__(:attributes) |> Keyword.get(:behaviour, [])
-    Plugin in behaviours and
-      Enum.all?(
-        Plugin.behaviour_info(:callbacks) -- Plugin.behaviour_info(:optional_callbacks),
-        fn {f, a} -> function_exported?(module, f, a) end
-      )
+  @doc """
+  Returns true if `module` is a valid middleware (implements the behaviour).
+  Uses behaviour_info/1 introspection.
+  """
+  @spec middleware?(module()) :: boolean()
+  def middleware?(module) do
+    # HINT: check if module has a __info__(:attributes) that includes
+    #       {:behaviour, [ApiGateway.Middleware.Behaviour]}
+    # HINT: Code.ensure_loaded?/1 first to avoid errors for non-existent modules
+    # TODO: implement
+    false
   end
 end
 ```
 
-</details>
+### Step 2: Given tests — must pass without modification
+
+```elixir
+# test/api_gateway/middleware/behaviour_test.exs
+defmodule ApiGateway.Middleware.BehaviourTest do
+  use ExUnit.Case, async: true
+
+  alias ApiGateway.Middleware.Behaviour, as: MWBehaviour
+
+  # ---------------------------------------------------------------------------
+  # A correct middleware implementation
+  # ---------------------------------------------------------------------------
+
+  defmodule ValidMiddleware do
+    use ApiGateway.Middleware.Behaviour
+
+    @impl true
+    def call(conn, _opts), do: Map.put(conn, :valid_mw, true)
+  end
+
+  # A middleware with all optional callbacks overridden
+  defmodule FullMiddleware do
+    use ApiGateway.Middleware.Behaviour
+
+    @impl true
+    def call(conn, _opts), do: Map.put(conn, :full_mw, true)
+
+    @impl true
+    def init(opts), do: Keyword.put(opts, :initialized, true)
+
+    @impl true
+    def on_error(_conn, _error, _stacktrace), do: %{status: 500, error: true}
+
+    @impl true
+    def telemetry_prefix(), do: [:api_gateway, :middleware, :full]
+  end
+
+  # ---------------------------------------------------------------------------
+  # Tests
+  # ---------------------------------------------------------------------------
+
+  describe "required callback enforcement" do
+    test "module implementing call/2 compiles without error" do
+      # ValidMiddleware was defined above — if it compiled, this passes
+      assert function_exported?(ValidMiddleware, :call, 2)
+    end
+
+    test "compile-time error for missing call/2" do
+      assert_raise CompileError, ~r/call\/2/, fn ->
+        defmodule MissingCallMiddleware do
+          use ApiGateway.Middleware.Behaviour
+          # Intentionally no call/2
+        end
+      end
+    end
+  end
+
+  describe "default implementations" do
+    test "init/1 default returns opts unchanged" do
+      opts = [realm: "admin", timeout: 5_000]
+      assert ValidMiddleware.init(opts) == opts
+    end
+
+    test "telemetry_prefix/0 default returns a list of atoms" do
+      prefix = ValidMiddleware.telemetry_prefix()
+      assert is_list(prefix)
+      assert Enum.all?(prefix, &is_atom/1)
+      assert length(prefix) >= 2
+    end
+  end
+
+  describe "optional callback overrides" do
+    test "init/1 override is called instead of default" do
+      opts = [foo: :bar]
+      result = FullMiddleware.init(opts)
+      assert result[:initialized] == true
+      assert result[:foo] == :bar
+    end
+
+    test "telemetry_prefix/0 override returns custom prefix" do
+      assert FullMiddleware.telemetry_prefix() == [:api_gateway, :middleware, :full]
+    end
+
+    test "on_error/3 override returns a map instead of re-raising" do
+      result = FullMiddleware.on_error(%{}, %RuntimeError{message: "test"}, [])
+      assert result.error == true
+    end
+  end
+
+  describe "maybe_init/2 and maybe_on_error/4" do
+    test "maybe_init/2 calls init when exported" do
+      opts = MWBehaviour.maybe_init(FullMiddleware, [])
+      assert opts[:initialized] == true
+    end
+
+    test "maybe_init/2 returns opts unchanged when init not exported" do
+      # ValidMiddleware uses the default init (defoverridable + re-defined as default)
+      # But the default is exported — use a plain module without use
+      defmodule NoInitModule do
+        @behaviour ApiGateway.Middleware.Behaviour
+        def call(conn, _), do: conn
+      end
+
+      opts = [key: :value]
+      assert MWBehaviour.maybe_init(NoInitModule, opts) == opts
+    end
+  end
+
+  describe "middleware?/1" do
+    test "returns true for a module using the behaviour" do
+      assert MWBehaviour.middleware?(ValidMiddleware) == true
+    end
+
+    test "returns false for a plain module" do
+      defmodule PlainModule do
+        def hello, do: :world
+      end
+
+      assert MWBehaviour.middleware?(PlainModule) == false
+    end
+
+    test "returns false for non-existent module" do
+      assert MWBehaviour.middleware?(NonExistent.Module.XYZ) == false
+    end
+  end
+
+  describe "behaviour_info introspection" do
+    test "required callbacks includes call/2" do
+      all_callbacks = MWBehaviour.behaviour_info(:callbacks)
+      assert {:call, 2} in all_callbacks
+    end
+
+    test "optional callbacks includes init/1, on_error/3, telemetry_prefix/0" do
+      optional = MWBehaviour.behaviour_info(:optional_callbacks)
+      assert {:init, 1} in optional
+      assert {:on_error, 3} in optional
+      assert {:telemetry_prefix, 0} in optional
+    end
+
+    test "call/2 is NOT in optional callbacks" do
+      optional = MWBehaviour.behaviour_info(:optional_callbacks)
+      refute {:call, 2} in optional
+    end
+  end
+end
+```
+
+### Step 3: Run the tests
+
+```bash
+mix test test/api_gateway/middleware/behaviour_test.exs --trace
+```
+
+---
+
+## Trade-off analysis
+
+| Approach | Compile-time safety | Runtime overhead | Default impls | Polymorphism |
+|----------|--------------------|-----------------|--------------|----|
+| `@behaviour` + `@before_compile` check | High — missing callbacks = compile error | None | Via `__using__` + `defoverridable` | Module-level only |
+| `@behaviour` only (no extra check) | Medium — Dialyzer warns, compiler does not | None | Via `__using__` + `defoverridable` | Module-level only |
+| Protocol | Low (unless `impl_for!/1` in tests) | O(1) consolidated | Via `for: Any` | Value-type dispatch |
+| Plain function contract (docs only) | None | None | N/A | None |
+
+**When `@before_compile` validation is worth it**: when the behaviour is widely
+implemented by many teams (internal or external contributors) and a missing
+callback causes a hard crash rather than a graceful error. Gateway middleware is
+a perfect fit: `call/2` is load-bearing; forgetting it means every request crashes.
+
+---
+
+## Common production mistakes
+
+**1. Not using `defoverridable` before providing defaults**
+If you define a default `def init(opts)` in the `__using__` quote block without
+`defoverridable [init: 1]`, implementing modules that define their own `init/1`
+get a compile warning about redefining a function. Always call `defoverridable`
+before providing defaults.
+
+**2. Checking `function_exported?/3` for `@optional_callbacks` in the wrong place**
+`function_exported?(mod, :init, 1)` returns `true` even when the implementing
+module uses the default `init/1` injected by `__using__`. If you want to know
+whether the implementing module *explicitly overrode* the callback, check
+`Module.defines?(mod, {:init, 1}, :def)` at compile time, or compare the function
+body — but this is rarely needed in practice.
+
+**3. Using `@macrocallback` when you mean `@callback`**
+`@macrocallback` requires the implementing module to define a `defmacro`, not a
+`def`. Mixing the two raises a confusing error. Use `@macrocallback` only when
+the callback must inject quoted code into the caller at compile time — almost
+never the case for middleware.
+
+**4. Skipping `Code.ensure_loaded?/1` before `behaviour_info/1`**
+Calling `SomeModule.behaviour_info(:callbacks)` on a module that doesn't exist
+or hasn't been loaded raises `UndefinedFunctionError`. Always check
+`Code.ensure_loaded?(mod)` first when doing runtime behaviour introspection.
+
+**5. `@before_compile` validation running too early**
+`@before_compile` runs after the module body is fully evaluated. Do NOT use
+`Module.defines?/3` inside the `__using__` quote block (which runs when `use` is
+called, before the function definitions). The call will return `false` for every
+function. Put the validation exclusively in `__before_compile__/1`.
+
+---
+
+## Resources
+
+- [Elixir `@behaviour` documentation](https://hexdocs.pm/elixir/Module.html#module-behaviour) — `@callback`, `@optional_callbacks`, `behaviour_info/1`
+- [GenServer source — Elixir stdlib](https://github.com/elixir-lang/elixir/blob/main/lib/elixir/lib/gen_server.ex) — production example of `__using__`, `defoverridable`, and `@before_compile` validation
+- [Plug behaviour](https://github.com/elixir-plug/plug/blob/master/lib/plug.ex) — real-world middleware behaviour with `init/1` and `call/2`
+- [Dialyzer and behaviours](https://hexdocs.pm/mix/Mix.Tasks.Dialyzer.html) — Dialyzer catches missing callbacks without `@before_compile`, but only if you run it
+- [Elixir guide: Behaviours](https://elixir-lang.org/getting-started/typespecs-and-behaviours.html) — official intro to the behaviour system

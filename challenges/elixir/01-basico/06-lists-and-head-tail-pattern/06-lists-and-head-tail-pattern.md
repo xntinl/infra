@@ -1,486 +1,323 @@
-# 6. Lists and Head/Tail Pattern
+# Lists and Head/Tail: Processing Transaction Batches
 
-**Difficulty**: Basico
+**Project**: `payments_cli` — built incrementally across the basic level
 
-## Prerequisites
+---
 
-- Haber completado los ejercicios 01–05
-- Conocimiento básico de pattern matching (ejercicio 05)
-- IEx disponible en tu terminal
+## Project context
 
-## Learning Objectives
+You're building `payments_cli`. The `Ledger` module needs to process lists of
+transactions — filtering by status, summing amounts, finding the largest transaction.
+This requires understanding lists as linked structures and knowing when O(1) prepend
+vs O(n) append changes everything at scale.
 
-- Entender que las listas en Elixir son listas enlazadas, no arrays
-- Dominar el patrón `[head | tail]` para descomponer listas
-- Distinguir cuándo usar prepend (`[x | list]`) vs append (`list ++ [x]`) y por qué importa
-- Aplicar funciones básicas del módulo `Enum` sobre listas
+Project structure at this point:
 
-## Concepts
+```
+payments_cli/
+├── lib/
+│   └── payments_cli/
+│       ├── cli.ex
+│       ├── transaction.ex
+│       ├── ledger.ex           # ← you extend this
+│       ├── formatter.ex
+│       └── pipeline.ex
+├── test/
+│   └── payments_cli/
+│       └── ledger_list_test.exs  # given tests — must pass without modification
+└── mix.exs
+```
 
-### Las listas son listas enlazadas
+---
 
-En Elixir, una lista es una estructura recursiva. Internamente, `[1, 2, 3]` es:
+## Why linked lists matter at the implementation level
+
+A list in Elixir is not an array. `[1, 2, 3]` is syntactic sugar for:
 
 ```elixir
 [1 | [2 | [3 | []]]]
 ```
 
-Cada nodo contiene un valor (head) y un puntero al siguiente nodo (tail). La lista vacía `[]` termina la cadena.
+Each cons cell holds a value (head) and a pointer to the tail. This structure
+has concrete performance consequences for payments processing:
+
+- **`[tx | accumulator]`** — O(1). Creates one cons cell. Use this inside
+  `Enum.reduce` to build result lists.
+- **`accumulator ++ [tx]`** — O(n). Traverses the entire `accumulator` to append.
+  With 100,000 transactions, this turns O(n) processing into O(n²).
+- **`Enum.reverse/1` at the end** — O(n) once. Add this after the reduce to
+  restore order. Total cost: O(n). Contrast with repeated append: O(n²).
+
+The canonical pattern for building lists in Elixir:
 
 ```elixir
-# Estas expresiones son equivalentes
-[1, 2, 3] == [1 | [2 | [3 | []]]]  # true
-
-# Puedes construirlas manualmente
-[1 | [2 | [3 | []]]]  # [1, 2, 3]
+# O(n) — correct
+list
+|> Enum.reduce([], fn x, acc -> [transform(x) | acc] end)
+|> Enum.reverse()
 ```
 
-### Head y Tail
-
-El operador `|` separa el primer elemento (head) del resto (tail):
-
-```elixir
-[head | tail] = [1, 2, 3]
-head  # 1
-tail  # [2, 3]
-
-# Las funciones hd/1 y tl/1 hacen lo mismo
-hd([1, 2, 3])  # 1
-tl([1, 2, 3])  # [2, 3]
-```
-
-### Prepend es O(1), Append es O(n)
-
-Prepend crea un nuevo nodo que apunta a la lista existente — operación constante:
-
-```elixir
-# O(1): solo crea un nodo nuevo
-[0 | [1, 2, 3]]  # [0, 1, 2, 3]
-```
-
-Append con `++` recorre toda la lista izquierda para llegar al final:
-
-```elixir
-# O(n): recorre [1, 2, 3] completa para agregar [4]
-[1, 2, 3] ++ [4]  # [1, 2, 3, 4]
-```
-
-Cuando construyas listas en recursión, usa prepend y luego `Enum.reverse/1` al final. Esto es el patrón idiomático en Elixir.
-
-### Operadores y funciones de listas
-
-```elixir
-# Concatenación
-[1, 2] ++ [3, 4]         # [1, 2, 3, 4]
-
-# Diferencia (elimina primera ocurrencia de cada elemento del lado derecho)
-[1, 2, 3, 2] -- [2]      # [1, 3, 2]
-
-# Longitud
-length([1, 2, 3])         # 3
-
-# Head y Tail explícitos (lanzan error en lista vacía)
-hd([10, 20, 30])          # 10
-tl([10, 20, 30])          # [20, 30]
-```
-
-### Enum básico
-
-```elixir
-# map: transforma cada elemento
-Enum.map([1, 2, 3], fn x -> x * 2 end)    # [2, 4, 6]
-
-# filter: conserva elementos que cumplen la condición
-Enum.filter([1, 2, 3, 4], fn x -> rem(x, 2) == 0 end)  # [2, 4]
-
-# reduce: acumula un valor recorriendo la lista
-Enum.reduce([1, 2, 3], 0, fn x, acc -> x + acc end)    # 6
-```
-
-## Exercises
-
-### Exercise 1: Crear listas de distintos tipos
-
-```elixir
-# En IEx:
-
-# Lista de enteros
-nums = [1, 2, 3, 4, 5]
-
-# Lista de átomos
-statuses = [:ok, :error, :pending]
-
-# Lista mixta (Elixir permite tipos distintos en la misma lista)
-mixed = ["hello", 42, :ok, true, 3.14]
-
-# Lista vacía
-empty = []
-
-# Verificar tipos
-is_list(nums)    # true
-is_list(empty)   # true
-length(mixed)    # 5
-```
-
-**Expected output:**
-
-```
-iex> nums = [1, 2, 3, 4, 5]
-[1, 2, 3, 4, 5]
-iex> statuses = [:ok, :error, :pending]
-[:ok, :error, :pending]
-iex> mixed = ["hello", 42, :ok, true, 3.14]
-["hello", 42, :ok, true, 3.14]
-iex> empty = []
-[]
-iex> is_list(nums)
-true
-iex> length(mixed)
-5
-```
+In production code you use `Enum.map/2` which does this internally. But when you
+write a custom `Enum.reduce/3` that builds a list, you must apply this pattern.
 
 ---
 
-### Exercise 2: Head y Tail con pattern matching
+## The business problem
 
-```elixir
-# Descomponer una lista en head y tail
-[head | tail] = [1, 2, 3]
-head   # 1
-tail   # [2, 3]
+Extend the `Ledger` module with list-processing functions:
 
-# Usando hd/1 y tl/1
-hd([10, 20, 30])   # 10
-tl([10, 20, 30])   # [20, 30]
-
-# Lista de un solo elemento
-[solo | resto] = [42]
-solo   # 42
-resto  # []
-
-# La lista vacía NO tiene head ni tail
-# Esto lanza MatchError:
-# [h | t] = []
-```
-
-**Expected output:**
-
-```
-iex> [head | tail] = [1, 2, 3]
-[1, 2, 3]
-iex> head
-1
-iex> tail
-[2, 3]
-iex> hd([10, 20, 30])
-10
-iex> tl([10, 20, 30])
-[20, 30]
-iex> [solo | resto] = [42]
-[42]
-iex> solo
-42
-iex> resto
-[]
-```
+1. Filter transactions by status
+2. Find the transaction with the highest amount
+3. Group transactions by currency
+4. Build a running balance list from a sequence of transactions
 
 ---
 
-### Exercise 3: Pattern matching con múltiples elementos
+## Implementation
+
+### Extend `lib/payments_cli/ledger.ex`
+
+Add these functions to the existing `Ledger` module from exercise 03:
 
 ```elixir
-# Extraer los dos primeros elementos y el resto
-[first, second | rest] = [1, 2, 3, 4, 5]
-first   # 1
-second  # 2
-rest    # [3, 4, 5]
+# Add to PaymentsCli.Ledger
 
-# Extraer tres elementos
-[a, b, c | _] = [:x, :y, :z, :w]
-a  # :x
-b  # :y
-c  # :z
+@doc """
+Filters transactions to those matching the given status atom.
 
-# Ignorar el head con _
-[_ | tail] = [100, 200, 300]
-tail  # [200, 300]
+Returns a list of matching transaction maps, preserving order.
 
-# Match exacto de una lista de 3 elementos
-[x, y, z] = [10, 20, 30]
-x + y + z  # 60
-```
+## Examples
 
-**Expected output:**
+    iex> txs = [%{status: :approved, amount_cents: 100}, %{status: :declined, amount_cents: 50}]
+    iex> PaymentsCli.Ledger.filter_by_status(txs, :approved)
+    [%{status: :approved, amount_cents: 100}]
 
-```
-iex> [first, second | rest] = [1, 2, 3, 4, 5]
-[1, 2, 3, 4, 5]
-iex> first
-1
-iex> second
-2
-iex> rest
-[3, 4, 5]
-iex> [a, b, c | _] = [:x, :y, :z, :w]
-[:x, :y, :z, :w]
-iex> a
-:x
-iex> [_ | tail] = [100, 200, 300]
-[100, 200, 300]
-iex> tail
-[200, 300]
-```
-
----
-
-### Exercise 4: Prepend vs Append — diferencia de rendimiento
-
-```elixir
-list = [1, 2, 3]
-
-# Prepend: O(1) — crea un nodo nuevo que apunta a list
-new_list_prepend = [0 | list]
-# [0, 1, 2, 3]
-
-# Append: O(n) — recorre toda la lista izquierda
-new_list_append = list ++ [4]
-# [1, 2, 3, 4]
-
-# Concatenar dos listas
-combined = [1, 2] ++ [3, 4]
-# [1, 2, 3, 4]
-
-# Diferencia de listas: elimina primera ocurrencia de cada elemento
-[1, 2, 3, 2, 1] -- [2, 1]
-# [3, 2, 1]  — solo elimina la primera ocurrencia de cada uno
-
-# Patrón idiomático: construir con prepend y revertir al final
-# (verás esto más en el ejercicio de recursión)
-Enum.reverse([0 | [1 | [2 | []]]])
-# [2, 1, 0]
-```
-
-**Expected output:**
-
-```
-iex> list = [1, 2, 3]
-[1, 2, 3]
-iex> [0 | list]
-[0, 1, 2, 3]
-iex> list ++ [4]
-[1, 2, 3, 4]
-iex> [1, 2] ++ [3, 4]
-[1, 2, 3, 4]
-iex> [1, 2, 3, 2, 1] -- [2, 1]
-[3, 2, 1]
-```
-
----
-
-### Exercise 5: Funciones de lista — length, sum, member
-
-```elixir
-nums = [10, 20, 30, 40, 50]
-
-# Longitud
-length(nums)                     # 5
-
-# Suma de todos los elementos
-Enum.sum(nums)                   # 150
-
-# ¿Contiene un elemento?
-Enum.member?(nums, 30)           # true
-Enum.member?(nums, 99)           # false
-
-# Mínimo y máximo
-Enum.min(nums)                   # 10
-Enum.max(nums)                   # 50
-
-# Ordenar
-Enum.sort([3, 1, 4, 1, 5])      # [1, 1, 3, 4, 5]
-Enum.sort([3, 1, 4], :desc)     # [4, 3, 1]
-
-# Primer y último elemento (sin pattern matching)
-List.first(nums)                 # 10
-List.last(nums)                  # 50
-```
-
-**Expected output:**
-
-```
-iex> nums = [10, 20, 30, 40, 50]
-[10, 20, 30, 40, 50]
-iex> length(nums)
-5
-iex> Enum.sum(nums)
-150
-iex> Enum.member?(nums, 30)
-true
-iex> Enum.member?(nums, 99)
-false
-iex> Enum.min(nums)
-10
-iex> Enum.max(nums)
-50
-iex> Enum.sort([3, 1, 4, 1, 5])
-[1, 1, 3, 4, 5]
-```
-
----
-
-### Exercise 6: Enum.map — transformar listas
-
-```elixir
-# Duplicar cada número
-Enum.map([1, 2, 3], fn x -> x * 2 end)
-# [2, 4, 6]
-
-# Convertir a string
-Enum.map([1, 2, 3], fn x -> Integer.to_string(x) end)
-# ["1", "2", "3"]
-
-# Elevar al cuadrado
-Enum.map([1, 2, 3, 4, 5], fn x -> x * x end)
-# [1, 4, 9, 16, 25]
-
-# Con función nombrada existente (notación de captura)
-Enum.map(["hello", "world"], &String.upcase/1)
-# ["HELLO", "WORLD"]
-
-# filter: conservar solo pares
-Enum.filter([1, 2, 3, 4, 5, 6], fn x -> rem(x, 2) == 0 end)
-# [2, 4, 6]
-
-# Combinar map y filter
-[1, 2, 3, 4, 5]
-|> Enum.filter(fn x -> rem(x, 2) != 0 end)   # [1, 3, 5]
-|> Enum.map(fn x -> x * 10 end)               # [10, 30, 50]
-```
-
-**Expected output:**
-
-```
-iex> Enum.map([1, 2, 3], fn x -> x * 2 end)
-[2, 4, 6]
-iex> Enum.map([1, 2, 3], fn x -> Integer.to_string(x) end)
-["1", "2", "3"]
-iex> Enum.map([1, 2, 3, 4, 5], fn x -> x * x end)
-[1, 4, 9, 16, 25]
-iex> Enum.map(["hello", "world"], &String.upcase/1)
-["HELLO", "WORLD"]
-iex> Enum.filter([1, 2, 3, 4, 5, 6], fn x -> rem(x, 2) == 0 end)
-[2, 4, 6]
-iex> [1, 2, 3, 4, 5] |> Enum.filter(fn x -> rem(x, 2) != 0 end) |> Enum.map(fn x -> x * 10 end)
-[10, 30, 50]
-```
-
-## Common Mistakes
-
-### Error 1: Usar `++` para construir listas en loops
-
-```elixir
-# WRONG: O(n²) — cada iteración recorre toda la lista acumulada
-def build_wrong(items) do
-  Enum.reduce(items, [], fn x, acc -> acc ++ [x * 2] end)
+"""
+@spec filter_by_status([map()], atom()) :: [map()]
+def filter_by_status(transactions, status) when is_list(transactions) and is_atom(status) do
+  # TODO: use Enum.filter/2
+  # The predicate should match on tx.status == status
 end
 
-# FIX: prepend O(1) y revertir al final — O(n)
-def build_correct(items) do
-  items
-  |> Enum.reduce([], fn x, acc -> [x * 2 | acc] end)
-  |> Enum.reverse()
+@doc """
+Returns the transaction with the highest amount_cents.
+
+Returns {:ok, transaction} or {:error, :empty_list} for an empty list.
+
+## Examples
+
+    iex> txs = [%{id: "A", amount_cents: 500}, %{id: "B", amount_cents: 1200}, %{id: "C", amount_cents: 300}]
+    iex> PaymentsCli.Ledger.max_transaction(txs)
+    {:ok, %{id: "B", amount_cents: 1200}}
+
+"""
+@spec max_transaction([map()]) :: {:ok, map()} | {:error, :empty_list}
+def max_transaction([]), do: {:error, :empty_list}
+
+def max_transaction([first | rest]) do
+  # TODO: use Enum.reduce/3 with first as the initial accumulator
+  # Compare tx.amount_cents to find the maximum
+  # Return {:ok, winner}
+  #
+  # HINT: the initial accumulator is `first` (not 0 — you need the full map, not just the amount)
+end
+
+@doc """
+Groups transactions by currency into a map of %{currency => [transactions]}.
+
+## Examples
+
+    iex> txs = [
+    ...>   %{currency: "USD", amount_cents: 100},
+    ...>   %{currency: "EUR", amount_cents: 200},
+    ...>   %{currency: "USD", amount_cents: 150}
+    ...> ]
+    iex> PaymentsCli.Ledger.group_by_currency(txs)
+    %{"EUR" => [%{currency: "EUR", amount_cents: 200}], "USD" => [%{currency: "USD", amount_cents: 100}, %{currency: "USD", amount_cents: 150}]}
+
+"""
+@spec group_by_currency([map()]) :: %{String.t() => [map()]}
+def group_by_currency(transactions) when is_list(transactions) do
+  # TODO: use Enum.group_by/2
+  # The key function extracts tx.currency
+  #
+  # Design question: does Enum.group_by/2 preserve the order within each group?
+  # Check the docs and note your answer as a comment.
+end
+
+@doc """
+Builds a running balance list from a list of approved transaction amounts.
+
+Each element is the cumulative sum up to and including that transaction.
+
+## Examples
+
+    iex> PaymentsCli.Ledger.running_balance([100, 200, 50])
+    [100, 300, 350]
+
+    iex> PaymentsCli.Ledger.running_balance([])
+    []
+
+"""
+@spec running_balance([integer()]) :: [integer()]
+def running_balance(amounts) when is_list(amounts) do
+  # TODO: implement using Enum.reduce/3 with an accumulator that tracks
+  # {running_total, result_list}.
+  #
+  # HINT:
+  #   Enum.reduce(amounts, {0, []}, fn amount, {total, acc} ->
+  #     new_total = total + amount
+  #     {new_total, [new_total | acc]}
+  #   end)
+  #   |> then(fn {_total, list} -> Enum.reverse(list) end)
+  #
+  # Why prepend then reverse? Because [new_total | acc] is O(1) per step.
+  # Reversing once at the end is O(n). Total: O(n).
+  # Using acc ++ [new_total] would be O(n) per step = O(n²) total.
 end
 ```
 
-### Error 2: Llamar `hd/1` o `tl/1` en lista vacía
+### Given tests — must pass without modification
 
 ```elixir
-# WRONG: lanza ArgumentError
-hd([])  # ** (ArgumentError) errors were encountered during formatting
+# test/payments_cli/ledger_list_test.exs
+defmodule PaymentsCli.LedgerListTest do
+  use ExUnit.Case, async: true
 
-# FIX: verificar antes, o usar pattern matching con case
-def safe_head(list) do
-  case list do
-    []        -> nil
-    [head | _] -> head
+  alias PaymentsCli.Ledger
+
+  @transactions [
+    %{id: "T1", status: :approved, currency: "USD", amount_cents: 1000},
+    %{id: "T2", status: :declined, currency: "EUR", amount_cents: 500},
+    %{id: "T3", status: :approved, currency: "USD", amount_cents: 2500},
+    %{id: "T4", status: :flagged,  currency: "EUR", amount_cents: 750},
+    %{id: "T5", status: :approved, currency: "GBP", amount_cents: 300}
+  ]
+
+  describe "filter_by_status/2" do
+    test "filters approved transactions" do
+      result = Ledger.filter_by_status(@transactions, :approved)
+      assert length(result) == 3
+      assert Enum.all?(result, fn tx -> tx.status == :approved end)
+    end
+
+    test "returns empty list when no match" do
+      result = Ledger.filter_by_status(@transactions, :reversed)
+      assert result == []
+    end
+
+    test "empty input returns empty output" do
+      assert Ledger.filter_by_status([], :approved) == []
+    end
+  end
+
+  describe "max_transaction/1" do
+    test "finds the transaction with highest amount" do
+      assert {:ok, tx} = Ledger.max_transaction(@transactions)
+      assert tx.id == "T3"
+      assert tx.amount_cents == 2500
+    end
+
+    test "returns error for empty list" do
+      assert {:error, :empty_list} = Ledger.max_transaction([])
+    end
+
+    test "works with a single transaction" do
+      single = [%{id: "X", amount_cents: 999}]
+      assert {:ok, %{id: "X"}} = Ledger.max_transaction(single)
+    end
+  end
+
+  describe "group_by_currency/1" do
+    test "groups transactions by currency" do
+      groups = Ledger.group_by_currency(@transactions)
+      assert map_size(groups) == 3
+      assert length(groups["USD"]) == 2
+      assert length(groups["EUR"]) == 2
+      assert length(groups["GBP"]) == 1
+    end
+
+    test "empty input returns empty map" do
+      assert Ledger.group_by_currency([]) == %{}
+    end
+  end
+
+  describe "running_balance/1" do
+    test "computes running balance" do
+      assert Ledger.running_balance([100, 200, 50]) == [100, 300, 350]
+    end
+
+    test "single element" do
+      assert Ledger.running_balance([500]) == [500]
+    end
+
+    test "empty list" do
+      assert Ledger.running_balance([]) == []
+    end
   end
 end
 ```
 
-### Error 3: Asumir acceso O(1) por índice como en arrays
-
-```elixir
-# WRONG: Enum.at/2 es O(n) — recorre la lista hasta llegar al índice
-Enum.at([1, 2, 3, 4, 5], 4)  # 5, pero recorre 5 elementos
-
-# FIX: si necesitas acceso aleatorio frecuente, usa una tupla (O(1))
-elem({1, 2, 3, 4, 5}, 4)  # 5, O(1)
-
-# Las listas son para recorrido secuencial, no para acceso aleatorio
-```
-
-### Error 4: Confundir `--` con eliminación de todos los elementos
-
-```elixir
-# WRONG: asumir que -- elimina TODAS las ocurrencias
-[1, 2, 2, 3] -- [2]
-# [1, 2, 3]  — solo elimina la PRIMERA ocurrencia de 2
-
-# FIX: usar Enum.reject para eliminar todas las ocurrencias
-Enum.reject([1, 2, 2, 3], fn x -> x == 2 end)
-# [1, 3]
-```
-
-## Verification
-
-Verifica que entiendes los conceptos ejecutando esto en IEx:
+### Run the tests
 
 ```bash
-iex
+mix test test/payments_cli/ledger_list_test.exs --trace
 ```
 
+---
+
+## Trade-off analysis
+
+| Aspect | Prepend + reverse (your impl) | `++` append per step | `Enum.map` / `Enum.filter` |
+|--------|-------------------------------|---------------------|--------------------------|
+| Time complexity | O(n) | O(n²) | O(n) — preferred for simple transforms |
+| Memory per step | One cons cell | Copies entire list | One cons cell |
+| Code clarity | Requires knowing the pattern | Looks natural but slow | Most readable |
+| When to use | Custom accumulation logic | Never in reduce | Standard transforms |
+
+Reflection question: `Enum.group_by/2` internally uses `Map.update/4` to build the
+groups. What does its implementation look like if you had to write it from scratch
+using `Enum.reduce/3`? Write the equivalent manually as a mental exercise.
+
+---
+
+## Common production mistakes
+
+**1. `++` in reduce builds O(n²) pipelines**
+The most common performance bug in new Elixir code. With 100,000 transactions,
+`accumulator ++ [tx]` turns a 100ms operation into minutes. Profile with
+`:timer.tc/1` before and after fixing.
+
+**2. Calling `hd/1` or `tl/1` on potentially empty lists**
+`hd([])` raises `ArgumentError`. In transaction processing, an empty batch is
+a valid input. Pattern match with `case`:
 ```elixir
-# Prueba 1: estructura interna
-[1 | [2 | [3 | []]]] == [1, 2, 3]
-# Esperado: true
-
-# Prueba 2: pattern matching
-[h | t] = [10, 20, 30]
-{h, t}
-# Esperado: {10, [20, 30]}
-
-# Prueba 3: prepend
-[0 | [1, 2, 3]]
-# Esperado: [0, 1, 2, 3]
-
-# Prueba 4: Enum pipeline
-[1, 2, 3, 4, 5]
-|> Enum.filter(fn x -> x > 2 end)
-|> Enum.map(fn x -> x * x end)
-|> Enum.sum()
-# Esperado: 9 + 16 + 25 = 50
-
-# Prueba 5: diferencia de listas
-[1, 2, 3, 2, 1] -- [2, 1]
-# Esperado: [3, 2, 1]
+case transactions do
+  [] -> handle_empty()
+  [first | rest] -> process(first, rest)
+end
 ```
 
-## Summary
+**3. Using `Enum.at/2` in a loop**
+`Enum.at(list, n)` traverses the list to index `n` — it is O(n). Calling it
+inside a loop over the list is O(n²). Use pattern matching or `Enum.each_with_index/2`
+instead.
 
-- Las listas en Elixir son **listas enlazadas** — `[1, 2, 3]` es azúcar sintáctica para `[1 | [2 | [3 | []]]]`
-- El patrón `[head | tail]` es la forma idiomática de descomponer una lista
-- **Prepend es O(1)**, append con `++` es O(n) — para construir listas, prepend + `Enum.reverse/1`
-- `hd/1` y `tl/1` fallan en lista vacía — usa pattern matching con `case` para manejar este caso
-- `Enum.map/2`, `Enum.filter/2` y `Enum.reduce/3` son las funciones de transformación más usadas
+**4. List `--` removes only the first occurrence**
+`[1, 2, 2, 3] -- [2]` returns `[1, 2, 3]`, not `[1, 3]`. Use `Enum.reject/2`
+to remove all occurrences: `Enum.reject(list, &(&1 == 2))`.
 
-## What's Next
+**5. Assuming list ordering from `Enum.group_by/2`**
+`Enum.group_by/2` preserves insertion order within each group. But the map
+itself does not guarantee key ordering. Never iterate map keys and assume
+alphabetical or insertion order without an explicit sort.
 
-- **07-maps-and-keyword-lists**: Datos con clave-valor y opciones con orden
-- **10-recursion-and-tail-call-optimization**: Usar `[head | tail]` para escribir tus propias funciones recursivas sobre listas
+---
 
 ## Resources
 
-- [Elixir Docs — List](https://hexdocs.pm/elixir/List.html)
-- [Elixir Docs — Enum](https://hexdocs.pm/elixir/Enum.html)
-- [Elixir School — Collections](https://elixirschool.com/en/lessons/basics/collections)
+- [List — HexDocs](https://hexdocs.pm/elixir/List.html)
+- [Enum — HexDocs](https://hexdocs.pm/elixir/Enum.html) — `group_by/2`, `reduce/3`, `max_by/2`
+- [Erlang efficiency guide — list handling](https://www.erlang.org/doc/efficiency_guide/eff_guide.html)
 - [Elixir Getting Started — Lists](https://elixir-lang.org/getting-started/basic-types.html#lists-or-tuples)

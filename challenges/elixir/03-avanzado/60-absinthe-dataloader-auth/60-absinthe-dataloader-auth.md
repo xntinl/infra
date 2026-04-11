@@ -1,757 +1,390 @@
-# 60. Absinthe DataLoader y Auth Middleware
+# Absinthe DataLoader and Auth Middleware
 
-**Difficulty**: Avanzado
+**Project**: `api_gateway` — built incrementally across the advanced level
 
-## Prerequisites
-- Ejercicio 59: Absinthe GraphQL Schema y Resolvers
-- Ecto y asociaciones (has_many, belongs_to)
-- Comprensión del problema N+1 en bases de datos
-- Phoenix Plug middleware
+---
 
-## Learning Objectives
-After completing this exercise, you will be able to:
-- Identificar y resolver el problema N+1 con DataLoader
-- Implementar middleware de autenticación con `Absinthe.Middleware`
-- Crear middleware de autorización por campo
-- Definir scalars custom (DateTime, UUID, JSON)
-- Analizar la complejidad de queries para prevenir abuse
-- Configurar el contexto de Absinthe con fuentes DataLoader
+## Project context
 
-## Concepts
+You're building `api_gateway`. The GraphQL schema is working (previous exercise).
+Under load the dashboard team reports slow queries: listing 50 services with their
+health status takes 50 individual HTTP checks instead of 1 batched call. You also
+need to gate mutations behind the gateway's existing auth middleware.
 
-### El problema N+1: por qué DataLoader existe
+Project structure at this point:
 
-Considera este resolver para el campo `author` en `Post`:
+```
+api_gateway/
+├── lib/
+│   └── api_gateway/
+│       ├── graphql/
+│       │   ├── schema.ex           # already exists — add plugins/0 and middleware/3
+│       │   ├── middleware/
+│       │   │   ├── authenticate.ex # ← you implement this
+│       │   │   └── handle_errors.ex # ← and this
+│       │   └── loader.ex           # ← and this
+│       └── ...
+├── test/
+│   └── api_gateway/
+│       └── graphql_auth_test.exs   # given tests — must pass without modification
+└── mix.exs
+```
+
+---
+
+## The business problem
+
+Two problems compound each other:
+
+**N+1 health checks**: the `status` field on each service calls an HTTP health endpoint.
+When the dashboard lists 50 services, that is 50 sequential HTTP calls. Each takes ~50ms.
+The query takes 2.5 seconds. DataLoader batches them: collect all health check URLs during
+the resolution of one GraphQL level, fire them concurrently, resolve all 50 fields from
+the single batched result.
+
+**Unauthenticated mutations**: `registerService` and `deregisterService` have no auth.
+Any caller can deregister production services. The auth middleware reads `current_client`
+from the Absinthe context (set by the Plug pipeline's `Auth` middleware) and aborts
+before the resolver runs if it is missing.
+
+---
+
+## Why DataLoader and not `Task.async_stream`
+
+You could batch health checks with `Task.async_stream` in the list resolver. But this
+couples batching logic to the list resolver — the detail resolver does not benefit, and
+any future field that needs health status re-implements the same pattern.
+
+DataLoader is a protocol-level solution: it operates at the GraphQL execution level,
+collecting all pending loads across the entire query tree (not just one resolver), then
+dispatching them before moving to the next resolution level. It works for any source:
+HTTP calls, database queries, external APIs.
+
+---
+
+## Why middleware instead of resolver-level auth checks
+
+Without middleware:
 
 ```elixir
-# Resolver naive — O(N) queries a la base de datos
-field :author, :user do
-  resolve fn post, _, _ ->
-    user = MyApp.Accounts.get_user!(post.author_id)
-    {:ok, user}
+def register_service(_, %{input: input}, %{context: %{current_client: client}})
+    when not is_nil(client) do
+  # actual logic
+end
+
+def register_service(_, _, _), do: {:error, "authentication required"}
+```
+
+Every mutation needs this guard. Add 10 mutations and you have 10 copies of the same
+pattern — and 10 places where a developer can forget the `when not is_nil(client)` guard.
+
+With `middleware MyApp.Middleware.Authenticate` in the schema's `middleware/3` callback,
+auth is applied to every mutation automatically at schema definition time. Forget it in
+one place, the schema enforces it everywhere.
+
+---
+
+## Implementation
+
+### Step 1: `mix.exs` — add dataloader
+
+```elixir
+{:dataloader, "~> 2.0"}
+```
+
+### Step 2: `lib/api_gateway/graphql/loader.ex`
+
+```elixir
+defmodule ApiGateway.GraphQL.Loader do
+  @moduledoc """
+  DataLoader sources for api_gateway.
+
+  Uses KV source (not Ecto) because the gateway's data lives in ETS and
+  external HTTP endpoints, not a relational database.
+  """
+
+  def health_source do
+    # KV source: given a set of keys, call fetch_health/2 once with all keys
+    Dataloader.KV.new(&fetch_health/2)
+  end
+
+  # fetch_health/2 receives {:health, urls_set} where urls_set is a MapSet
+  # of service URLs that need checking. Returns %{url => status_string}.
+  defp fetch_health(:health, urls) do
+    # TODO: for each URL in urls, make a concurrent HTTP GET to the health_path
+    # TODO: return %{url => "healthy"} or %{url => "unreachable"} for each
+    # HINT: Task.async_stream/3 with max_concurrency: 20 and timeout: 3_000
+    # HINT: on {:ok, %{status: s}} when s in 200..299 → "healthy"
+    # HINT: on {:ok, _} or {:exit, _} → "unreachable"
+    # For now, a stub that returns "healthy" for all:
+    Map.new(urls, fn url -> {url, "healthy"} end)
   end
 end
 ```
 
-Cuando el cliente pide 10 posts con sus autores, Elixir ejecuta:
-1. `SELECT * FROM posts LIMIT 10` — 1 query
-2. `SELECT * FROM users WHERE id = 1` — por post.author_id = 1
-3. `SELECT * FROM users WHERE id = 2` — por post.author_id = 2
-4. ...10 queries más
-
-Total: 11 queries para una operación que debería ser 2. En producción con 100 posts son 101 queries. Esto es el problema N+1.
-
-DataLoader soluciona esto con batching: acumula todas las claves que necesita cargar durante la resolución de un nivel del árbol GraphQL, y las carga en una sola query al final.
-
-```
-Post 1 → author_id: 1 ─┐
-Post 2 → author_id: 2 ─┤─ DataLoader: SELECT * FROM users WHERE id IN (1,2,3,...) → 1 query
-Post 3 → author_id: 1 ─┘  (author_id=1 se deduplica automáticamente)
-```
-
-### Setup de DataLoader con Ecto
+### Step 3: `lib/api_gateway/graphql/middleware/authenticate.ex`
 
 ```elixir
-# mix.exs
-defp deps do
-  [
-    {:absinthe, "~> 1.7"},
-    {:dataloader, "~> 2.0"},
-    # dataloader viene con soporte Ecto built-in
-  ]
-end
-```
+defmodule ApiGateway.GraphQL.Middleware.Authenticate do
+  @moduledoc """
+  Absinthe middleware that aborts resolution if no authenticated client
+  is present in the context.
 
-```elixir
-# lib/my_app/loader.ex
-defmodule MyApp.Loader do
-  def data do
-    # Dataloader.Ecto usa el Repo y carga asociaciones automáticamente
-    Dataloader.Ecto.new(MyApp.Repo, query: &query/2)
-  end
-
-  # Permite personalizar la query por source y args
-  defp query(MyApp.Blog.Post, %{status: :published}) do
-    import Ecto.Query
-    from p in MyApp.Blog.Post, where: p.status == :published
-  end
-
-  defp query(queryable, _), do: queryable
-end
-```
-
-```elixir
-# lib/my_app_web/schema.ex
-defmodule MyAppWeb.Schema do
-  use Absinthe.Schema
-
-  import Absinthe.Resolution.Helpers, only: [dataloader: 1, dataloader: 2]
-
-  def context(ctx) do
-    loader =
-      Dataloader.new()
-      |> Dataloader.add_source(MyApp.Repo, MyApp.Loader.data())
-
-    Map.put(ctx, :loader, loader)
-  end
-
-  def plugins do
-    [Absinthe.Middleware.Dataloader | Absinthe.Plugin.defaults()]
-  end
-
-  # ... resto del schema
-end
-```
-
-### DataLoader en resolvers
-
-```elixir
-# lib/my_app_web/schema/types/post.ex
-defmodule MyAppWeb.Schema.Types.Post do
-  use Absinthe.Schema.Notation
-  import Absinthe.Resolution.Helpers, only: [dataloader: 1]
-
-  object :post do
-    field :id,    :id
-    field :title, :string
-    field :body,  :string
-
-    # BIEN: DataLoader batchea todas las cargas de :author
-    # Una sola query para N posts
-    field :author, :user do
-      resolve dataloader(MyApp.Repo)
-    end
-
-    # DataLoader también maneja has_many
-    field :comments, list_of(:comment) do
-      resolve dataloader(MyApp.Repo)
-    end
-
-    # DataLoader con args: filtra comentarios aprobados
-    field :approved_comments, list_of(:comment) do
-      resolve dataloader(MyApp.Repo, :comments, args: %{status: :approved})
-    end
-
-    # DataLoader con función de query personalizada
-    field :recent_comments, list_of(:comment) do
-      arg :limit, :integer, default_value: 5
-
-      resolve fn post, %{limit: limit}, %{context: %{loader: loader}} ->
-        loader
-        |> Dataloader.load(MyApp.Repo, {:many, MyApp.Blog.Comment}, [
-          post_id: post.id,
-          limit: limit,
-          order_by: [desc: :inserted_at]
-        ])
-        |> Absinthe.Resolution.Helpers.on_load(fn loader ->
-          comments = Dataloader.get(loader, MyApp.Repo, {:many, MyApp.Blog.Comment}, [
-            post_id: post.id,
-            limit: limit,
-            order_by: [desc: :inserted_at]
-          ])
-          {:ok, comments}
-        end)
-      end
-    end
-  end
-end
-```
-
-### Absinthe.Middleware: autenticación y autorización
-
-Middleware en Absinthe es una función que envuelve la resolución de un campo. Puede ejecutar lógica antes de llamar al resolver, después, o reemplazarlo completamente.
-
-```elixir
-# lib/my_app_web/middleware/authenticate.ex
-defmodule MyAppWeb.Middleware.Authenticate do
+  The Plug pipeline's Auth middleware sets conn.assigns[:client_id].
+  The schema's build_context/1 copies it into the Absinthe context as :current_client.
+  This middleware reads it.
+  """
   @behaviour Absinthe.Middleware
 
   @impl true
-  def call(%{context: %{current_user: user}} = resolution, _opts)
-      when not is_nil(user) do
-    # Usuario autenticado: continuar normalmente
+  def call(%{context: %{current_client: client}} = resolution, _opts)
+      when not is_nil(client) do
+    # Client is authenticated — pass through
     resolution
   end
 
   def call(resolution, _opts) do
-    # Sin usuario: abortar con error
-    Absinthe.Resolution.put_result(resolution, {:error, "Autenticación requerida"})
+    # TODO: use Absinthe.Resolution.put_result/2 to set {:error, "authentication required"}
+    # This stops resolution of this field without crashing the query
   end
 end
 ```
 
-```elixir
-# lib/my_app_web/middleware/authorize.ex
-defmodule MyAppWeb.Middleware.Authorize do
-  @behaviour Absinthe.Middleware
-
-  @impl true
-  def call(%{context: %{current_user: user}} = resolution, role) do
-    if user_has_role?(user, role) do
-      resolution
-    else
-      Absinthe.Resolution.put_result(resolution, {:error, "Permiso denegado"})
-    end
-  end
-
-  def call(resolution, _role) do
-    Absinthe.Resolution.put_result(resolution, {:error, "Autenticación requerida"})
-  end
-
-  defp user_has_role?(%{role: :admin}, _), do: true
-  defp user_has_role?(%{role: role}, required), do: role == required
-end
-```
+### Step 4: `lib/api_gateway/graphql/middleware/handle_errors.ex`
 
 ```elixir
-# Uso en el schema
-object :post_mutations do
-  field :create_post, :post do
-    arg :input, non_null(:create_post_input)
+defmodule ApiGateway.GraphQL.Middleware.HandleErrors do
+  @moduledoc """
+  Post-resolver middleware that normalizes error formats.
 
-    # El orden importa: Authenticate primero, luego el resolver
-    middleware MyAppWeb.Middleware.Authenticate
-    resolve &MyAppWeb.Resolvers.Post.create_post/3
-  end
-
-  field :delete_post, :boolean do
-    arg :id, non_null(:id)
-
-    middleware MyAppWeb.Middleware.Authenticate
-    middleware MyAppWeb.Middleware.Authorize, :admin
-    resolve &MyAppWeb.Resolvers.Post.delete_post/3
-  end
-end
-```
-
-### Middleware global con `middleware/2` callback
-
-En lugar de agregar middleware campo por campo, puedes aplicarlo globalmente:
-
-```elixir
-# lib/my_app_web/schema.ex
-defmodule MyAppWeb.Schema do
-  use Absinthe.Schema
-
-  # Este callback se llama para cada campo del schema
-  def middleware(middleware, field, object) do
-    middleware
-    |> apply_auth_middleware(field, object)
-    |> apply_error_handler(field, object)
-  end
-
-  # Agrega auth a todas las mutations automáticamente
-  defp apply_auth_middleware(middleware, _field, %Absinthe.Type.Object{identifier: :mutation}) do
-    [MyAppWeb.Middleware.Authenticate | middleware]
-  end
-
-  defp apply_auth_middleware(middleware, _field, _object), do: middleware
-
-  # Agrega manejo de errores al final de toda resolución
-  defp apply_error_handler(middleware, _field, _object) do
-    middleware ++ [MyAppWeb.Middleware.HandleErrors]
-  end
-end
-```
-
-```elixir
-# lib/my_app_web/middleware/handle_errors.ex
-# Middleware que se ejecuta DESPUÉS del resolver para normalizar errores
-defmodule MyAppWeb.Middleware.HandleErrors do
+  Runs after the resolver. Converts raw strings and Exception structs
+  to the map format Absinthe uses for the `errors` array in the response.
+  """
   @behaviour Absinthe.Middleware
 
   @impl true
   def call(%{errors: []} = resolution, _opts), do: resolution
 
   def call(%{errors: errors} = resolution, _opts) do
-    normalized =
-      Enum.map(errors, fn
-        %Ecto.Changeset{} = cs -> format_changeset(cs)
-        error -> error
-      end)
+    normalized = Enum.map(errors, fn
+      msg when is_binary(msg) -> %{message: msg, extensions: %{code: "ERROR"}}
+      error -> %{message: Exception.message(error), extensions: %{code: "INTERNAL"}}
+    end)
 
     %{resolution | errors: normalized}
   end
-
-  defp format_changeset(changeset) do
-    errors = Ecto.Changeset.traverse_errors(changeset, fn {msg, opts} ->
-      Enum.reduce(opts, msg, fn {k, v}, acc ->
-        String.replace(acc, "%{#{k}}", to_string(v))
-      end)
-    end)
-
-    %{
-      message: "Validación fallida",
-      extensions: %{code: "VALIDATION_ERROR", fields: errors}
-    }
-  end
 end
 ```
 
-### Query complexity: prevenir queries abusivas
-
-Un cliente podría pedir posts → comments → author → posts → comments en loop infinito. La complexity analysis detiene esto.
+### Step 5: Update `lib/api_gateway/graphql/schema.ex`
 
 ```elixir
-# lib/my_app_web/schema.ex
-defmodule MyAppWeb.Schema do
+defmodule ApiGateway.GraphQL.Schema do
   use Absinthe.Schema
 
-  # Complexity máxima permitida por query
-  @max_complexity 1000
+  import Absinthe.Resolution.Helpers, only: [dataloader: 1]
 
-  # Absinthe.Plug configuración
-  def complexity_limit, do: @max_complexity
-end
-```
+  import_types ApiGateway.GraphQL.Types.Scalars
+  import_types ApiGateway.GraphQL.Types.Service
 
-```elixir
-# lib/my_app_web/router.ex
-forward "/graphql", Absinthe.Plug,
-  schema: MyAppWeb.Schema,
-  analyze_complexity: true,
-  max_complexity: MyAppWeb.Schema.complexity_limit()
-```
-
-```elixir
-# Asignar complexity a campos costosos
-object :post do
-  field :id,    :id
-  field :title, :string
-
-  # Un post tiene complexity 1 (default)
-  # Sus comentarios cuestan 5 + n * complejidad_de_comment
-  field :comments, list_of(:comment) do
-    arg :limit, :integer, default_value: 10
-
-    complexity fn %{limit: limit}, child_complexity ->
-      5 + limit * child_complexity
-    end
-
-    resolve dataloader(MyApp.Repo)
-  end
-end
-```
-
-### Rate limiting con middleware
-
-```elixir
-# lib/my_app_web/middleware/rate_limit.ex
-defmodule MyAppWeb.Middleware.RateLimit do
-  @behaviour Absinthe.Middleware
-
-  # Límite: 100 mutations por minuto por usuario
-  @limit 100
-  @window_ms 60_000
-
-  @impl true
-  def call(%{context: %{current_user: user}} = resolution, _opts) do
-    key = "rate_limit:mutations:#{user.id}"
-
-    case check_rate(key) do
-      :ok ->
-        resolution
-
-      {:error, :rate_limited} ->
-        Absinthe.Resolution.put_result(
-          resolution,
-          {:error, message: "Rate limit excedido", extensions: %{code: "RATE_LIMITED"}}
-        )
-    end
+  query do
+    import_fields :service_queries
   end
 
-  def call(resolution, _opts), do: resolution
-
-  defp check_rate(key) do
-    # Usa ETS, Redis, o Hammer para implementar sliding window
-    case :ets.lookup(:rate_limits, key) do
-      [{_, count, window_start}] when count < @limit ->
-        now = System.monotonic_time(:millisecond)
-
-        if now - window_start < @window_ms do
-          :ets.update_counter(:rate_limits, key, {2, 1})
-          :ok
-        else
-          :ets.insert(:rate_limits, {key, 1, now})
-          :ok
-        end
-
-      [{_, count, _}] when count >= @limit ->
-        {:error, :rate_limited}
-
-      [] ->
-        now = System.monotonic_time(:millisecond)
-        :ets.insert(:rate_limits, {key, 1, now})
-        :ok
-    end
-  end
-end
-```
-
-### Scalars avanzados
-
-```elixir
-# lib/my_app_web/schema/types/scalars.ex
-defmodule MyAppWeb.Schema.Types.Scalars do
-  use Absinthe.Schema.Notation
-
-  scalar :naive_datetime, description: "NaiveDateTime como string ISO8601" do
-    serialize fn
-      %NaiveDateTime{} = dt -> NaiveDateTime.to_iso8601(dt)
-      value -> to_string(value)
-    end
-
-    parse fn
-      %Absinthe.Blueprint.Input.String{value: value} ->
-        case NaiveDateTime.from_iso8601(value) do
-          {:ok, dt} -> {:ok, dt}
-          {:error, _} -> :error
-        end
-
-      _ -> :error
-    end
+  mutation do
+    import_fields :service_mutations
   end
 
-  scalar :date, description: "Date como string YYYY-MM-DD" do
-    serialize fn
-      %Date{} = d -> Date.to_iso8601(d)
-      value -> to_string(value)
-    end
-
-    parse fn
-      %Absinthe.Blueprint.Input.String{value: value} ->
-        case Date.from_iso8601(value) do
-          {:ok, date} -> {:ok, date}
-          {:error, _} -> :error
-        end
-
-      _ -> :error
-    end
+  subscription do
+    import_fields :service_subscriptions
   end
 
-  scalar :upload, description: "File upload" do
-    serialize &Function.identity/1
-
-    parse fn
-      %Absinthe.Blueprint.Input.String{value: value} -> {:ok, value}
-      %Plug.Upload{} = upload -> {:ok, upload}
-      _ -> :error
-    end
-  end
-end
-```
-
-### Testing de DataLoader y middleware
-
-```elixir
-defmodule MyAppWeb.Schema.DataLoaderTest do
-  use MyAppWeb.ConnCase
-
-  @posts_with_authors_query """
-  query {
-    posts(pageSize: 10) {
-      entries {
-        title
-        author {
-          name
-          email
-        }
-        commentCount
-        comments {
-          body
-          author { name }
-        }
-      }
-    }
-  }
-  """
-
-  test "resuelve N posts con autores en 2 queries (no N+1)", %{conn: conn} do
-    user1 = insert(:user)
-    user2 = insert(:user)
-    insert_list(5, :post, author: user1, status: :published)
-    insert_list(5, :post, author: user2, status: :published)
-
-    # Ecto.Sandbox intercepta queries — podemos contarlas
-    parent = self()
-    :telemetry.attach(
-      "test-query-counter",
-      [:my_app, :repo, :query],
-      fn _, _, _, _ -> send(parent, :db_query) end,
-      nil
-    )
-
-    conn
-    |> authenticate(user1)
-    |> post("/api/graphql", %{query: @posts_with_authors_query})
-    |> json_response(200)
-
-    query_count =
-      receive do :db_query -> 1 after 0 -> 0 end
-      |> then(fn _ -> count_received_messages(:db_query) end)
-
-    # Con DataLoader: 1 query posts + 1 query users + 1 query comments = 3
-    # Sin DataLoader: 1 + 10 + 10 = 21
-    assert query_count <= 5
-
-    :telemetry.detach("test-query-counter")
-  end
-
-  @create_post_mutation """
-  mutation CreatePost($input: CreatePostInput!) {
-    createPost(input: $input) {
-      id
-      title
-    }
-  }
-  """
-
-  test "mutation sin auth retorna 200 con error en data", %{conn: conn} do
-    response =
-      conn
-      |> post("/api/graphql", %{
-        query: @create_post_mutation,
-        variables: %{input: %{title: "Test", body: "Body content here"}}
-      })
-      |> json_response(200)
-
-    # GraphQL siempre retorna 200 — los errores van en el body
-    assert [error] = response["errors"]
-    assert error["message"] == "Autenticación requerida"
-  end
-
-  test "middleware authorize bloquea usuarios sin rol admin", %{conn: conn} do
-    regular_user = insert(:user, role: :user)
-
-    response =
-      conn
-      |> authenticate(regular_user)
-      |> post("/api/graphql", %{
-        query: """
-        mutation {
-          deletePost(id: "123")
-        }
-        """
-      })
-      |> json_response(200)
-
-    assert [error] = response["errors"]
-    assert error["message"] == "Permiso denegado"
-  end
-end
-```
-
-## Exercises
-
-### Ejercicio 1: Migrar resolvers naive a DataLoader
-
-Tienes un schema con el problema N+1. Tu tarea es migrarlo a DataLoader.
-
-**Código actual (con N+1):**
-
-```elixir
-defmodule MyAppWeb.Schema.Types.Post do
-  use Absinthe.Schema.Notation
-
-  object :post do
-    field :id,    :id
-    field :title, :string
-
-    # BUG: N+1 — ejecuta 1 query por cada post
-    field :author, :user do
-      resolve fn post, _, _ ->
-        {:ok, MyApp.Accounts.get_user!(post.author_id)}
-      end
-    end
-
-    # BUG: N+1 — ejecuta 1 query por cada post
-    field :comments, list_of(:comment) do
-      resolve fn post, _, _ ->
-        {:ok, MyApp.Blog.list_comments(post_id: post.id)}
-      end
-    end
-
-    # BUG: N+1 — calcula count con query separada por post
-    field :comment_count, :integer do
-      resolve fn post, _, _ ->
-        {:ok, MyApp.Blog.count_comments(post.id)}
-      end
-    end
-  end
-end
-```
-
-**Pasos para migrar:**
-
-1. Agrega DataLoader al contexto del schema:
-
-```elixir
-defmodule MyAppWeb.Schema do
-  use Absinthe.Schema
-
+  # Called once per request to build the Absinthe context.
+  # Copies the client_id from Plug assigns into the GraphQL context.
   def context(ctx) do
     loader =
       Dataloader.new()
-      |> Dataloader.add_source(MyApp.Repo, MyApp.Loader.data())
+      |> Dataloader.add_source(:health, ApiGateway.GraphQL.Loader.health_source())
 
-    Map.put(ctx, :loader, loader)
+    ctx
+    |> Map.put(:loader, loader)
+    # current_client is set here by the Plug pipeline via ApiGateway.Router
+    # forward "/graphql", Absinthe.Plug, schema: ..., context: &build_context/1
   end
 
+  # Required to activate DataLoader batching
   def plugins do
     [Absinthe.Middleware.Dataloader | Absinthe.Plugin.defaults()]
   end
-end
-```
 
-2. Crea `MyApp.Loader` con una función `data/0` que devuelva un `Dataloader.Ecto` source
+  # Called for every field in the schema.
+  # Applies Authenticate to all mutations, HandleErrors to everything.
+  def middleware(middleware, _field, %Absinthe.Type.Object{identifier: :mutation}) do
+    [ApiGateway.GraphQL.Middleware.Authenticate | middleware] ++
+      [ApiGateway.GraphQL.Middleware.HandleErrors]
+  end
 
-3. Reemplaza los tres resolvers usando `dataloader(MyApp.Repo)`:
-   - `author`: asociación `belongs_to`
-   - `comments`: asociación `has_many`
-   - `comment_count`: usa `dataloader` con una query que cuente
-
-Para `comment_count`, necesitas un source personalizado (no Ecto directo):
-
-```elixir
-# En MyApp.Loader
-def data do
-  Dataloader.KV.new(&fetch_counts/2)
-end
-
-defp fetch_counts(:comment_count, post_ids) do
-  import Ecto.Query
-
-  counts =
-    from(c in MyApp.Blog.Comment,
-      where: c.post_id in ^MapSet.to_list(post_ids),
-      group_by: c.post_id,
-      select: {c.post_id, count(c.id)}
-    )
-    |> MyApp.Repo.all()
-    |> Map.new()
-
-  # Retorna un mapa post_id -> count (0 para posts sin comentarios)
-  Map.new(post_ids, fn id -> {id, Map.get(counts, id, 0)} end)
-end
-```
-
-### Ejercicio 2: Sistema de autorización por campo
-
-Implementa un sistema de autorización donde ciertos campos solo son visibles para ciertos usuarios.
-
-**Requisito:** El campo `email` de `User` solo debe ser visible para el propio usuario o para admins. Si otro usuario intenta verlo, debe recibir `nil` (no un error — el campo es opcional).
-
-```elixir
-# lib/my_app_web/middleware/field_policy.ex
-defmodule MyAppWeb.Middleware.FieldPolicy do
-  @behaviour Absinthe.Middleware
-
-  @impl true
-  def call(resolution, policy_fn) do
-    # TODO: llamar policy_fn con (resolution.source, context)
-    # Si retorna :ok -> continuar con resolution
-    # Si retorna {:error, :unauthorized} -> poner nil como resultado (no error)
-    # Si retorna {:error, message} -> poner error en resolution
+  def middleware(middleware, _field, _object) do
+    middleware ++ [ApiGateway.GraphQL.Middleware.HandleErrors]
   end
 end
 ```
 
-```elixir
-# Uso en el type
-object :user do
-  field :id,   :id
-  field :name, :string
+### Step 6: Use DataLoader in the `status` field
 
-  field :email, :string do
-    middleware MyAppWeb.Middleware.FieldPolicy, fn user, %{current_user: current_user} ->
-      cond do
-        is_nil(current_user)                 -> {:error, :unauthorized}
-        current_user.id == user.id           -> :ok
-        current_user.role == :admin          -> :ok
-        true                                 -> {:error, :unauthorized}
-      end
+```elixir
+# In ApiGateway.GraphQL.Types.Service — update the :service object
+object :service do
+  field :name,          :string
+  field :url,           :string
+  field :health_path,   :string
+  field :registered_at, :datetime
+
+  # DataLoader batches all status checks for a list of services into one call
+  field :status, :string do
+    resolve fn service, _, %{context: %{loader: loader}} ->
+      loader
+      |> Dataloader.load(:health, :health, service["url"])
+      |> Absinthe.Resolution.Helpers.on_load(fn loader ->
+        status = Dataloader.get(loader, :health, :health, service["url"])
+        {:ok, status}
+      end)
     end
-
-    resolve fn user, _, _ -> {:ok, user.email} end
-  end
-
-  field :role, :user_role do
-    middleware MyAppWeb.Middleware.FieldPolicy, fn _user, %{current_user: current_user} ->
-      if current_user && current_user.role == :admin, do: :ok, else: {:error, :unauthorized}
-    end
-
-    resolve fn user, _, _ -> {:ok, user.role} end
   end
 end
 ```
 
-**Tarea:** Implementa `FieldPolicy` y escribe tests que verifiquen:
-1. El propio usuario puede ver su email
-2. Un admin puede ver el email de cualquier usuario
-3. Otro usuario recibe `null` en el campo email (sin error GraphQL)
-4. Un usuario sin auth recibe `null` en el campo email
-
-### Ejercicio 3: Scalar DateTime con zona horaria
-
-Implementa un scalar `datetime_with_tz` que:
-- Serializa a RFC 3339 con zona horaria (ej: `"2024-01-15T10:30:00+02:00"`)
-- Parsea strings RFC 3339 a `DateTime`
-- En la serialización, convierte siempre a UTC antes de mostrar
-- Retorna `:error` para strings que no sean fechas válidas
+### Step 7: Given tests — must pass without modification
 
 ```elixir
-scalar :datetime_with_tz, description: "RFC 3339 datetime con timezone" do
-  serialize fn datetime ->
-    # TODO: convertir a UTC y formatear como RFC 3339
+# test/api_gateway/graphql_auth_test.exs
+defmodule ApiGateway.GraphQL.AuthTest do
+  use ExUnit.Case, async: false
+
+  alias ApiGateway.GraphQL.Schema
+
+  setup do
+    Agent.update(ApiGateway.ServiceStore, fn _ -> %{} end)
+    :ok
   end
 
-  parse fn
-    %Absinthe.Blueprint.Input.String{value: value} ->
-      # TODO: parsear RFC 3339, retornar {:ok, %DateTime{}} o :error
+  @register_mutation """
+  mutation Register($input: ServiceInput!) {
+    registerService(input: $input) {
+      name
+    }
+  }
+  """
 
-    _ -> :error
+  @deregister_mutation """
+  mutation Deregister($name: String!) {
+    deregisterService(name: $name)
+  }
+  """
+
+  test "mutation without auth returns authentication error" do
+    assert {:ok, result} =
+             Absinthe.run(@register_mutation, Schema,
+               variables: %{"input" => %{"name" => "x", "url" => "http://x"}},
+               context: %{}
+             )
+
+    assert [error] = result.errors
+    assert error.message =~ "authentication"
+  end
+
+  test "mutation with valid client succeeds" do
+    assert {:ok, result} =
+             Absinthe.run(@register_mutation, Schema,
+               variables: %{"input" => %{"name" => "payments", "url" => "http://payments:4001"}},
+               context: %{current_client: "dashboard"}
+             )
+
+    refute Map.has_key?(result, :errors)
+    assert result.data["registerService"]["name"] == "payments"
+  end
+
+  test "deregister without auth returns authentication error" do
+    ApiGateway.ServiceStore.register(%{"name" => "geo", "url" => "http://geo:4002"})
+
+    assert {:ok, result} =
+             Absinthe.run(@deregister_mutation, Schema,
+               variables: %{"name" => "geo"},
+               context: %{}
+             )
+
+    assert [error] = result.errors
+    assert error.message =~ "authentication"
+    # The service must still exist — the mutation was rejected
+    assert ApiGateway.ServiceStore.get("geo") != nil
+  end
+
+  test "queries do not require auth" do
+    ApiGateway.ServiceStore.register(%{"name" => "cache", "url" => "http://cache:4003"})
+
+    assert {:ok, %{data: %{"services" => services}}} =
+             Absinthe.run("query { services { name } }", Schema, context: %{})
+
+    assert length(services) == 1
   end
 end
 ```
 
-Tests que debe pasar:
+### Step 8: Run the tests
 
-```elixir
-test "serializa DateTime a RFC 3339 UTC" do
-  dt = ~U[2024-01-15 10:30:00Z]
-  assert MyAppWeb.Schema.Types.Scalars.serialize_datetime(dt) == "2024-01-15T10:30:00Z"
-end
-
-test "parsea string RFC 3339 valido" do
-  assert {:ok, %DateTime{}} =
-    MyAppWeb.Schema.Types.Scalars.parse_datetime("2024-01-15T10:30:00+02:00")
-end
-
-test "retorna error para string invalido" do
-  assert :error = MyAppWeb.Schema.Types.Scalars.parse_datetime("not-a-date")
-end
+```bash
+mix test test/api_gateway/graphql_auth_test.exs --trace
 ```
 
-## Expected Results
+---
 
-Con DataLoader activo, una query que pide 100 posts con autores, comentarios y conteos debería ejecutar exactamente:
-- 1 query para posts
-- 1 query para usuarios (batch de todos los `author_id`)
-- 1 query para comentarios (batch de todos los `post_id`)
-- 1 query para conteos (batch agregado)
+## Trade-off analysis
 
-Total: 4 queries independientemente de cuántos posts haya.
+| Aspect | DataLoader batching | `Task.async_stream` in resolver | No batching |
+|--------|--------------------|---------------------------------|-------------|
+| N+1 queries | Eliminated | Eliminated for lists only | Full N+1 |
+| Scope | Entire query tree | One resolver | — |
+| Code location | Field resolver | List resolver | Field resolver |
+| Testability | Source tested in isolation | Resolver test | Field test |
+| Overhead | Deferred resolution | None | None |
 
-El middleware de auth debe aplicarse automáticamente a todas las mutations sin repetir código campo por campo.
+Reflection question: `plugins/0` in the schema must include `Absinthe.Middleware.Dataloader`.
+What happens if you add DataLoader to the loader but forget the plugin? Do you get an error,
+wrong results, or correct results? Run the test and find out.
 
-Los scalars custom deben ser transparentes para el resolver: el resolver trabaja con tipos Elixir nativos (`%DateTime{}`, `%Date{}`), y Absinthe maneja la serialización/deserialización.
+---
 
-## Key Takeaways
+## Common production mistakes
 
-- DataLoader resuelve N+1 acumulando claves y cargándolas en batch al finalizar cada nivel del árbol GraphQL
-- `Absinthe.Middleware.Dataloader` debe estar en la lista de `plugins/0` del schema — sin esto DataLoader no funciona
-- El middleware se ejecuta en orden: `[Authenticate, Authorize, resolver_fn, HandleErrors]`
-- El callback `middleware/3` del schema permite aplicar middleware globalmente por tipo de objeto (queries, mutations, subscriptions)
-- Para campos opcionales con auth, prefer `nil` sobre error — es mejor UX para el cliente
-- Los scalars desacoplan la representación (string en el wire) de la implementación (tipo Elixir nativo)
-- Complexity analysis es una defensa necesaria en APIs públicas: sin límite, una query anidada puede explotar la BD
+**1. Missing `plugins/0` declaration**
+DataLoader uses a deferred execution model that requires Absinthe's plugin infrastructure.
+Without `Absinthe.Middleware.Dataloader` in `plugins/0`, DataLoader fields resolve to nil
+silently. No error is raised.
+
+**2. `middleware/3` arity confusion**
+Absinthe's `middleware/3` callback receives `(middleware_list, field, object)`. Returning
+just a list replaces the entire middleware chain — including the built-in resolver middleware.
+Always manipulate the incoming `middleware` list, don't replace it with a bare new list.
+
+**3. Context not propagated from Plug to Absinthe**
+`Absinthe.Plug` accepts a `context:` option that receives the conn and returns a map.
+Without it, `conn.assigns[:client_id]` never reaches the Absinthe context and the
+Authenticate middleware always denies requests.
+
+**4. Authenticate middleware on queries**
+Read-only queries often should be accessible without auth (public dashboards, health
+checks). The `middleware/3` callback targets `%Absinthe.Type.Object{identifier: :mutation}`
+specifically so queries are not blocked.
+
+**5. DataLoader sources not added to the context**
+If `context/1` does not add the DataLoader source, the `loader` key is nil in the context
+and any field using `dataloader/1` raises a `KeyError` at runtime.
+
+---
+
+## Resources
+
+- [Absinthe Middleware](https://hexdocs.pm/absinthe/Absinthe.Middleware.html) — `call/2` contract and `put_result/2`
+- [Dataloader](https://hexdocs.pm/dataloader) — KV and Ecto sources, batching semantics
+- [Absinthe.Middleware.Dataloader plugin](https://hexdocs.pm/absinthe/Absinthe.Middleware.Dataloader.html) — why `plugins/0` matters
+- [Absinthe Resolution Helpers](https://hexdocs.pm/absinthe/Absinthe.Resolution.Helpers.html) — `on_load/2` for deferred resolution

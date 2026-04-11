@@ -1,670 +1,352 @@
-# 33: Access Behaviour
+# Access Behaviour: Custom Lens-Like Access Patterns
 
-## Prerequisites
-
-- Pattern matching avanzado (ejercicio 09)
-- Protocols y behaviours (ejercicios 07-08)
-- Structs y mapas en Elixir
-- `Enum`, `Kernel` básicos
+**Project**: `task_queue` — built incrementally across the intermediate level
 
 ---
 
-## Learning Objectives
+## Project context
 
-Al finalizar este ejercicio serás capaz de:
+`task_queue` stores job configuration in a deeply nested map. The scheduler needs to read and update individual fields several levels deep — retry policies, timeout values, handler options. With the `Access` behaviour, structs become composable with `get_in/2`, `update_in/3`, and `put_in/3`, enabling path-based access just like plain maps.
 
-1. Usar `get_in/2`, `put_in/3`, `update_in/3` y `pop_in/2` para navegar y modificar estructuras anidadas sin boilerplate
-2. Entender qué callbacks implementa el behaviour `Access` (`fetch/2`, `get_and_update/3`, `pop/2`)
-3. Implementar `Access` en un struct propio para que funcione con los operadores de path
-4. Componer accessors con `Access.key/1`, `Access.at/1` y `Access.filter/1`
-5. Reconocer el patrón *lens* básico que Access habilita en Elixir
+Project structure at this point:
+
+```
+task_queue/
+├── lib/
+│   └── task_queue/
+│       ├── application.ex
+│       ├── job_config.ex           # ← you implement Access here
+│       ├── worker.ex
+│       ├── queue_server.ex
+│       ├── scheduler.ex
+│       └── registry.ex
+├── test/
+│   └── task_queue/
+│       └── access_test.exs         # given tests — must pass without modification
+└── mix.exs
+```
 
 ---
 
-## Concepts
+## The business problem
 
-### ¿Qué es el behaviour Access?
-
-`Access` es un behaviour de Elixir que define cómo se accede a la estructura interna de un dato. Cualquier módulo que lo implemente puede usarse como "paso" en los path operators (`get_in`, `put_in`, etc.).
-
-Los tres callbacks obligatorios son:
+Job configurations are nested structs:
 
 ```elixir
-@callback fetch(term(), term()) :: {:ok, term()} | :error
-@callback get_and_update(term(), term(), (term() -> {term(), term()} | :pop)) ::
-            {term(), term()}
-@callback pop(term(), term()) :: {term(), term()}
+%JobConfig{
+  handler: "TaskQueue.Handlers.Email",
+  retry: %RetryPolicy{max_attempts: 3, backoff_ms: 1_000},
+  timeout: %TimeoutPolicy{execute_ms: 5_000, connect_ms: 1_000}
+}
 ```
 
-### get_in / put_in / update_in / pop_in
+The scheduler needs to:
+1. Read `config.retry.max_attempts` without chained struct field access
+2. Update `config.retry.backoff_ms` after a transient failure using `update_in`
+3. Pass config paths to generic functions that work on both maps and structs
 
-Estos macros/funciones permiten operar sobre estructuras anidadas usando una lista de claves como "path":
+Without `Access`, path-based operations on structs raise `UndefinedFunctionError`. With `Access`, the struct participates in the same `get_in/update_in/put_in` ecosystem as maps.
+
+---
+
+## What the Access behaviour requires
+
+The `Access` behaviour defines three callbacks:
 
 ```elixir
-data = %{user: %{profile: %{name: "Ana", age: 30}}}
-
-# Leer anidado
-get_in(data, [:user, :profile, :name])
-# => "Ana"
-
-# Escribir anidado (devuelve estructura nueva, es inmutable)
-put_in(data, [:user, :profile, :name], "Beatriz")
-# => %{user: %{profile: %{name: "Beatriz", age: 30}}}
-
-# Actualizar con función
-update_in(data, [:user, :profile, :age], &(&1 + 1))
-# => %{user: %{profile: %{name: "Ana", age: 31}}}
-
-# Extraer y eliminar
-{val, rest} = pop_in(data, [:user, :profile, :age])
-# val => 30, rest => %{user: %{profile: %{name: "Ana"}}}
+@callback fetch(container, key) :: {:ok, value} | :error
+@callback get_and_update(container, key, (value -> {get_value, new_value} | :pop)) :: {get_value, new_container}
+@callback pop(container, key) :: {value, new_container}
 ```
 
-También existe la forma de macro con la sintaxis de corchetes:
+`fetch/2` is used by `get_in/2`. `get_and_update/3` is used by `update_in/3` and `get_and_update_in/3`. `pop/2` is used by `pop_in/2`.
+
+The simplest implementation delegates to `Map.fetch`, `Map.get_and_update`, and `Map.pop`:
 
 ```elixir
-put_in data[:user][:profile][:name], "Carlos"
+@behaviour Access
+
+def fetch(struct, key), do: Map.fetch(Map.from_struct(struct), key)
 ```
 
-### Access.fetch/2
+But this exposes ALL struct fields. A deliberate implementation exposes only the fields that make semantic sense as public paths.
 
-`Access.fetch/2` es la función de bajo nivel que implementan los mapas y listas de palabras clave. Devuelve `{:ok, valor}` o `:error`:
+---
 
-```elixir
-Access.fetch(%{a: 1}, :a)   # => {:ok, 1}
-Access.fetch(%{a: 1}, :b)   # => :error
-Access.fetch([a: 1], :a)    # => {:ok, 1}
-```
+## Implementation
 
-### Accessors estándar
-
-`Access` incluye funciones que generan accessors (funciones de orden superior) listos para usar en paths:
+### Step 1: `lib/task_queue/job_config.ex` — structs with Access behaviour
 
 ```elixir
-# Access.key/1 — para structs y mapas, con clave atom
-data = %{users: [%{name: "Ana"}, %{name: "Bob"}]}
-get_in(data, [Access.key(:users), Access.at(0), Access.key(:name)])
-# => "Ana"
-
-# Access.at/1 — para listas, por índice
-get_in([10, 20, 30], [Access.at(1)])
-# => 20
-
-# Access.filter/1 — devuelve sublista de elementos que cumplen predicado
-update_in(data, [Access.key(:users), Access.filter(&(&1.name != "Ana"))], fn user ->
-  Map.put(user, :active, false)
-end)
-```
-
-### Implementación del behaviour en un struct
-
-```elixir
-defmodule Config do
-  defstruct [:env, :values]
+defmodule TaskQueue.JobConfig.RetryPolicy do
+  @moduledoc "Retry configuration for a job."
 
   @behaviour Access
 
-  @impl Access
-  def fetch(%Config{values: values}, key) do
-    Access.fetch(values, key)
-  end
+  defstruct [
+    max_attempts: 3,
+    backoff_ms: 1_000,
+    max_backoff_ms: 30_000
+  ]
 
-  @impl Access
-  def get_and_update(%Config{values: values} = config, key, fun) do
-    {get, new_values} = Access.get_and_update(values, key, fun)
-    {get, %{config | values: new_values}}
-  end
-
-  @impl Access
-  def pop(%Config{values: values} = config, key) do
-    {val, new_values} = Access.pop(values, key)
-    {val, %{config | values: new_values}}
-  end
-end
-```
-
-Con esta implementación, `Config` puede usarse como paso en paths:
-
-```elixir
-cfg = %Config{env: :prod, values: %{timeout: 5000, retries: 3}}
-get_in(cfg, [:timeout])          # => 5000
-put_in(cfg, [:timeout], 10_000)  # => %Config{values: %{timeout: 10000, retries: 3}}
-```
-
-### El patrón Lens básico
-
-Un *lens* es una abstracción que encapsula cómo leer y escribir en una parte de una estructura. En Elixir, los accessors de `Access` son lenses simples:
-
-```elixir
-# Un lens es una función que recibe un getter/setter y actúa sobre una estructura
-lens_name = Access.key(:name)
-
-# Se puede componer
-lens_first_user_name = [Access.key(:users), Access.at(0), Access.key(:name)]
-
-get_in(data, lens_first_user_name)
-update_in(data, lens_first_user_name, &String.upcase/1)
-```
-
----
-
-## Exercises
-
-### Ejercicio 1: JSON anidado con get_in / update_in
-
-Tienes una estructura que representa la respuesta de una API REST con usuarios y sus órdenes. Debes acceder y modificar campos específicos usando paths.
-
-```elixir
-defmodule Exercise33.NestedAccess do
-  @moduledoc """
-  Manipulación de JSON anidado usando get_in, put_in, update_in y pop_in.
-  """
-
-  @api_response %{
-    "status" => "ok",
-    "data" => %{
-      "users" => [
-        %{
-          "id" => 1,
-          "name" => "Ana García",
-          "orders" => [
-            %{"id" => 101, "total" => 250.0, "status" => "delivered"},
-            %{"id" => 102, "total" => 89.5, "status" => "pending"}
-          ]
-        },
-        %{
-          "id" => 2,
-          "name" => "Bob Martínez",
-          "orders" => [
-            %{"id" => 201, "total" => 420.0, "status" => "pending"}
-          ]
-        }
-      ]
-    }
+  @type t :: %__MODULE__{
+    max_attempts:  pos_integer(),
+    backoff_ms:    pos_integer(),
+    max_backoff_ms: pos_integer()
   }
 
-  @doc """
-  Devuelve el nombre del primer usuario.
+  # Access behaviour — exposes all three fields for path-based access
 
-  ## Ejemplo
-
-      iex> Exercise33.NestedAccess.first_user_name()
-      "Ana García"
-  """
-  def first_user_name do
-    # TODO: usa get_in con Access.key("data"), Access.key("users"), Access.at(0)
-    # y Access.key("name") para obtener el nombre sin pattern matching explícito
+  @impl Access
+  def fetch(policy, key) do
+    # TODO: use Map.fetch/2 on the struct converted to a map
+    # HINT: Map.fetch(Map.from_struct(policy), key)
   end
 
-  @doc """
-  Devuelve todos los totales de órdenes del usuario en el índice dado.
-
-  ## Ejemplo
-
-      iex> Exercise33.NestedAccess.order_totals(0)
-      [250.0, 89.5]
-  """
-  def order_totals(user_index) do
-    # TODO: usa get_in con Access.at(user_index) y Access.all() (o un map manual)
-    # para extraer los totales de todas las órdenes del usuario
+  @impl Access
+  def get_and_update(policy, key, fun) do
+    # TODO: use Map.get_and_update/3 on Map.from_struct, then wrap in struct
+    # HINT:
+    # {get, updated_map} = Map.get_and_update(Map.from_struct(policy), key, fun)
+    # {get, struct(__MODULE__, updated_map)}
   end
 
-  @doc """
-  Marca todas las órdenes pendientes de un usuario como "processing".
-
-  ## Ejemplo
-
-      iex> updated = Exercise33.NestedAccess.process_pending_orders(1)
-      iex> get_in(updated, ["data", "users", Access.at(1), "orders", Access.at(0), "status"])
-      "processing"
-  """
-  def process_pending_orders(user_index) do
-    # TODO: usa update_in con Access.filter para seleccionar solo órdenes cuyo
-    # "status" == "pending" y actualiza el status a "processing"
-    # Path: ["data", "users", Access.at(user_index), "orders", Access.filter(...)]
+  @impl Access
+  def pop(policy, key) do
+    # TODO: use Map.pop/2 on Map.from_struct, wrap in struct
+    # HINT:
+    # {value, map} = Map.pop(Map.from_struct(policy), key)
+    # {value, struct(__MODULE__, map)}
   end
-
-  @doc """
-  Extrae y elimina el campo "status" del response raíz.
-  Devuelve {status_value, response_sin_status}.
-
-  ## Ejemplo
-
-      iex> {status, rest} = Exercise33.NestedAccess.pop_status()
-      iex> status
-      "ok"
-      iex> Map.has_key?(rest, "status")
-      false
-  """
-  def pop_status do
-    # TODO: usa pop_in sobre @api_response con el path correcto
-  end
-
-  # Datos accesibles para pruebas
-  def api_response, do: @api_response
 end
-```
 
-### Ejercicio 2: Implementar Access en un struct propio
-
-Implementa el behaviour `Access` para un struct `RingBuffer` que mantiene un buffer circular de tamaño fijo. Al implementar `Access`, podrás usar `get_in`, `put_in` y `pop_in` con índices sobre el buffer.
-
-```elixir
-defmodule Exercise33.RingBuffer do
+defmodule TaskQueue.JobConfig do
   @moduledoc """
-  Buffer circular de tamaño fijo con soporte para el behaviour Access.
+  Top-level job configuration.
 
-  Permite usar get_in/put_in/pop_in con índices enteros.
-  Los índices negativos acceden desde el final (como Python).
+  Implements `Access` to allow path-based reads and updates:
+
+      get_in(config, [:retry, :max_attempts])
+      update_in(config, [:retry, :backoff_ms], &(&1 * 2))
+
+  Only `:handler`, `:retry`, and `:timeout_ms` are accessible via Access.
+  Internal fields like `:_version` are hidden.
   """
 
   @behaviour Access
 
-  defstruct [:size, :data, :head]
+  defstruct [
+    :handler,
+    retry: %TaskQueue.JobConfig.RetryPolicy{},
+    timeout_ms: 5_000,
+    _version: 1    # internal — not accessible via Access
+  ]
 
-  @doc """
-  Crea un buffer circular vacío de tamaño `size`.
-  """
-  def new(size) when is_integer(size) and size > 0 do
-    %__MODULE__{
-      size: size,
-      data: :array.new(size, default: nil),
-      head: 0
-    }
-  end
+  @type t :: %__MODULE__{
+    handler:    String.t() | nil,
+    retry:      TaskQueue.JobConfig.RetryPolicy.t(),
+    timeout_ms: pos_integer()
+  }
 
-  @doc """
-  Inserta un elemento en la posición actual del head y avanza el puntero.
-  """
-  def push(%__MODULE__{size: size, data: data, head: head} = buf, value) do
-    new_data = :array.set(head, value, data)
-    %{buf | data: new_data, head: rem(head + 1, size)}
-  end
-
-  # Normaliza índices negativos (ej: -1 => size - 1)
-  defp normalize_index(index, size) when index < 0, do: size + index
-  defp normalize_index(index, _size), do: index
+  @accessible_keys ~w(handler retry timeout_ms)a
 
   @impl Access
-  def fetch(%__MODULE__{size: size, data: data}, index) do
-    # TODO: normaliza el índice con normalize_index/2
-    # Si el índice normalizado está fuera de [0, size-1], devuelve :error
-    # Si el valor en :array.get/2 es nil, devuelve :error
-    # Caso exitoso: devuelve {:ok, value}
+  def fetch(config, key) when key in @accessible_keys do
+    # TODO: fetch the field from the struct
+    # HINT: Map.fetch(Map.from_struct(config), key)
   end
 
+  def fetch(_config, _key), do: :error
+
   @impl Access
-  def get_and_update(%__MODULE__{size: size, data: data} = buf, index, fun) do
-    # TODO: obtiene el valor actual en el índice (nil si fuera de rango)
-    # Aplica fun.(current_value) — puede devolver {get, update} o :pop
-    # Caso :pop: llama a pop/2
-    # Caso {get, new_value}: actualiza :array en el índice, devuelve {get, nuevo_buf}
-    # Normaliza el índice antes de operar
+  def get_and_update(config, key, fun) when key in @accessible_keys do
+    # TODO: get and update the field, return {get_value, updated_config}
+    # HINT:
+    # {get, updated_map} = Map.get_and_update(Map.from_struct(config), key, fun)
+    # {get, struct(__MODULE__, updated_map)}
+  end
+
+  def get_and_update(config, _key, fun) do
+    # For inaccessible keys, call fun with nil to get the expected shape
+    {get, _} = fun.(nil)
+    {get, config}
   end
 
   @impl Access
-  def pop(%__MODULE__{size: size, data: data} = buf, index) do
-    # TODO: extrae el valor en el índice (normalizando), lo reemplaza por nil en data
-    # Devuelve {valor_extraido, buf_actualizado}
-    # Si el índice está fuera de rango, devuelve {nil, buf}
+  def pop(config, key) when key in @accessible_keys do
+    # TODO: pop the field and return {value, updated_config}
   end
 
-  @doc """
-  Convierte el buffer a lista (puede contener nils para posiciones vacías).
-  """
-  def to_list(%__MODULE__{size: size, data: data}) do
-    for i <- 0..(size - 1), do: :array.get(i, data)
-  end
+  def pop(config, _key), do: {nil, config}
 end
 ```
 
-Ejemplo de uso esperado en iex:
+### Step 2: Given tests — must pass without modification
 
 ```elixir
-iex> buf = Exercise33.RingBuffer.new(3)
-iex> buf = buf |> RingBuffer.push(10) |> RingBuffer.push(20) |> RingBuffer.push(30)
-iex> get_in(buf, [0])
-10
-iex> get_in(buf, [-1])
-30
-iex> {val, buf2} = pop_in(buf, [1])
-iex> val
-20
-iex> Exercise33.RingBuffer.to_list(buf2)
-[10, nil, 30]
-iex> put_in(buf, [0], 99) |> Exercise33.RingBuffer.to_list()
-[99, 20, 30]
-```
-
-### Ejercicio 3: Lenses compuestos sobre Access
-
-Crea un módulo `Lens` que proporcione helpers para componer paths de Access de forma más expresiva y reutilizable.
-
-```elixir
-defmodule Exercise33.Lens do
-  @moduledoc """
-  Lenses compuestos sobre el behaviour Access de Elixir.
-
-  Un lens es simplemente una lista de accessors que forma un path.
-  Este módulo proporciona combinadores para construirlos de forma expresiva.
-  """
-
-  @type lens :: [term()]
-
-  @doc """
-  Lens que apunta a una clave de mapa o struct.
-
-  ## Ejemplo
-
-      iex> Exercise33.Lens.key(:name) |> Exercise33.Lens.get(%{name: "Ana"})
-      "Ana"
-  """
-  def key(k), do: [Access.key(k)]
-
-  @doc """
-  Lens que apunta a una clave de mapa con string.
-  """
-  def key_str(k), do: [k]
-
-  @doc """
-  Lens que apunta a un índice de lista.
-  """
-  def at(index), do: [Access.at(index)]
-
-  @doc """
-  Lens que selecciona elementos de lista que cumplen el predicado.
-  """
-  def filter(pred), do: [Access.filter(pred)]
-
-  @doc """
-  Compone dos lenses en secuencia (el resultado es un path más profundo).
-
-  ## Ejemplo
-
-      iex> lens = Exercise33.Lens.key(:users) |> Exercise33.Lens.then(Exercise33.Lens.at(0))
-      iex> Exercise33.Lens.get(lens, %{users: ["Ana", "Bob"]})
-      "Ana"
-  """
-  def then(lens_a, lens_b) do
-    # TODO: concatena las dos listas de accessors
-  end
-
-  @doc """
-  Obtiene el valor apuntado por el lens en la estructura.
-  """
-  def get(lens, structure) do
-    # TODO: usa get_in/2 con lens como path
-  end
-
-  @doc """
-  Actualiza el valor apuntado por el lens aplicando la función.
-  """
-  def over(lens, structure, fun) do
-    # TODO: usa update_in/3 con lens como path
-  end
-
-  @doc """
-  Establece el valor apuntado por el lens.
-  """
-  def set(lens, structure, value) do
-    # TODO: usa put_in/3 con lens como path
-  end
-
-  @doc """
-  Extrae y elimina el valor apuntado por el lens.
-  """
-  def pop(lens, structure) do
-    # TODO: usa pop_in/2 con lens como path
-  end
-
-  @doc """
-  Crea un lens que navega por una lista de claves anidadas.
-
-  ## Ejemplo
-
-      iex> lens = Exercise33.Lens.path([:user, :profile, :name])
-      iex> Exercise33.Lens.get(lens, %{user: %{profile: %{name: "Ana"}}})
-      "Ana"
-  """
-  def path(keys) when is_list(keys) do
-    # TODO: convierte cada clave en un Access.key/1 y concatena todo
-    # Pista: Enum.flat_map(keys, &key/1)
-  end
-end
-```
-
-Ejemplo de uso compuesto:
-
-```elixir
-iex> alias Exercise33.Lens
-iex> data = %{users: [%{name: "Ana", score: 100}, %{name: "Bob", score: 80}]}
-
-# Leer el score del primer usuario
-iex> lens = Lens.key(:users) |> Lens.then(Lens.at(0)) |> Lens.then(Lens.key(:score))
-iex> Lens.get(lens, data)
-100
-
-# Incrementar el score del segundo usuario
-iex> Lens.over(
-...>   Lens.key(:users) |> Lens.then(Lens.at(1)) |> Lens.then(Lens.key(:score)),
-...>   data,
-...>   &(&1 + 10)
-...> )
-%{users: [%{name: "Ana", score: 100}, %{name: "Bob", score: 90}]}
-
-# Poner a false a todos los usuarios que no sean "Ana"
-iex> Lens.over(
-...>   Lens.key(:users) |> Lens.then(Lens.filter(&(&1.name != "Ana"))),
-...>   data,
-...>   &Map.put(&1, :active, false)
-...> )
-```
-
----
-
-## Common Mistakes
-
-**1. Confundir `Access.key/1` con el acceso directo por átomo**
-
-```elixir
-# Incorrecto — falla en structs porque los structs no implementan
-# el acceso con corchetes de mapa para claves arbitrarias
-get_in(my_struct, [:field])  # puede fallar
-
-# Correcto para structs
-get_in(my_struct, [Access.key(:field)])
-```
-
-**2. Mutar en vez de devolver la estructura actualizada**
-
-`put_in` y `update_in` son funciones puras. El resultado debe capturarse:
-
-```elixir
-# Error: la variable original no cambia
-put_in(data, [:user, :name], "Carlos")
-IO.inspect(data)  # sigue siendo el original
-
-# Correcto
-data = put_in(data, [:user, :name], "Carlos")
-```
-
-**3. `get_and_update/3` debe devolver `{get, update}` o `:pop`**
-
-```elixir
-# Incorrecto — la función pasada devuelve solo el nuevo valor
-get_and_update(map, :key, fn _v -> "nuevo" end)  # error en runtime
-
-# Correcto
-get_and_update(map, :key, fn v -> {v, "nuevo"} end)
-# o
-get_and_update(map, :key, fn _v -> :pop end)
-```
-
-**4. Índices negativos no soportados por defecto**
-
-Las listas de Elixir no soportan índices negativos en `Access.at/1`. Solo `Access.at(n)` con `n >= 0` funciona en listas estándar.
-
-**5. `Access.filter/1` siempre devuelve lista**
-
-Aunque el path apunte a un solo elemento, `Access.filter` trabaja sobre colecciones. El resultado de un `get_in` con `filter` es siempre una lista:
-
-```elixir
-get_in([%{a: 1}, %{a: 2}], [Access.filter(&(&1.a > 1))])
-# => [%{a: 2}]  — lista, no el elemento directamente
-```
-
----
-
-## Verification
-
-```bash
-# Crea un proyecto mix o usa iex directamente
-iex -S mix
-
-# Ejercicio 1
-iex> Exercise33.NestedAccess.first_user_name()
-"Ana García"
-
-iex> Exercise33.NestedAccess.order_totals(0)
-[250.0, 89.5]
-
-iex> updated = Exercise33.NestedAccess.process_pending_orders(1)
-iex> get_in(updated, ["data", "users", Access.at(1), "orders", Access.at(0), "status"])
-"processing"
-
-iex> {status, rest} = Exercise33.NestedAccess.pop_status()
-iex> status
-"ok"
-
-# Ejercicio 2
-iex> buf = Exercise33.RingBuffer.new(4)
-iex> buf = Enum.reduce(1..4, buf, &Exercise33.RingBuffer.push(&2, &1))
-iex> get_in(buf, [0])
-1
-iex> get_in(buf, [-1])
-4
-iex> {2, _} = pop_in(buf, [1])
-
-# Ejercicio 3
-iex> alias Exercise33.Lens
-iex> data = %{users: [%{name: "Ana", score: 100}]}
-iex> lens = Lens.key(:users) |> Lens.then(Lens.at(0)) |> Lens.then(Lens.key(:name))
-iex> Lens.get(lens, data)
-"Ana"
-iex> Lens.set(lens, data, "Beatriz")
-%{users: [%{name: "Beatriz", score: 100}]}
-```
-
-Test con ExUnit:
-
-```elixir
-defmodule Exercise33Test do
+# test/task_queue/access_test.exs
+defmodule TaskQueue.AccessTest do
   use ExUnit.Case, async: true
 
-  alias Exercise33.{NestedAccess, RingBuffer, Lens}
+  alias TaskQueue.JobConfig
+  alias TaskQueue.JobConfig.RetryPolicy
 
-  describe "NestedAccess" do
-    test "first_user_name/0 devuelve el nombre del primer usuario" do
-      assert NestedAccess.first_user_name() == "Ana García"
+  describe "RetryPolicy — Access behaviour" do
+    test "fetch returns value for existing key" do
+      policy = %RetryPolicy{max_attempts: 5}
+      assert {:ok, 5} = Access.fetch(policy, :max_attempts)
     end
 
-    test "order_totals/1 devuelve todos los totales del usuario 0" do
-      assert NestedAccess.order_totals(0) == [250.0, 89.5]
+    test "fetch returns :error for missing key" do
+      policy = %RetryPolicy{}
+      assert :error = Access.fetch(policy, :nonexistent)
     end
 
-    test "process_pending_orders/1 cambia pending a processing" do
-      updated = NestedAccess.process_pending_orders(1)
-      status = get_in(updated, ["data", "users", Access.at(1), "orders", Access.at(0), "status"])
-      assert status == "processing"
+    test "get_and_update modifies a field" do
+      policy = %RetryPolicy{backoff_ms: 1_000}
+      {old, new_policy} = Access.get_and_update(policy, :backoff_ms, fn v -> {v, v * 2} end)
+      assert old == 1_000
+      assert new_policy.backoff_ms == 2_000
     end
 
-    test "pop_status/0 extrae el campo status" do
-      {status, rest} = NestedAccess.pop_status()
-      assert status == "ok"
-      refute Map.has_key?(rest, "status")
-    end
-  end
-
-  describe "RingBuffer Access" do
-    setup do
-      buf =
-        RingBuffer.new(4)
-        |> RingBuffer.push(10)
-        |> RingBuffer.push(20)
-        |> RingBuffer.push(30)
-        |> RingBuffer.push(40)
-
-      {:ok, buf: buf}
-    end
-
-    test "fetch/2 obtiene elemento por índice positivo", %{buf: buf} do
-      assert get_in(buf, [0]) == 10
-      assert get_in(buf, [2]) == 30
-    end
-
-    test "fetch/2 obtiene elemento por índice negativo", %{buf: buf} do
-      assert get_in(buf, [-1]) == 40
-      assert get_in(buf, [-2]) == 30
-    end
-
-    test "pop/2 extrae y elimina el elemento", %{buf: buf} do
-      {val, updated} = pop_in(buf, [1])
-      assert val == 20
-      assert RingBuffer.to_list(updated) == [10, nil, 30, 40]
-    end
-
-    test "put_in actualiza un elemento", %{buf: buf} do
-      updated = put_in(buf, [0], 99)
-      assert RingBuffer.to_list(updated) == [99, 20, 30, 40]
+    test "pop removes and returns a field" do
+      policy = %RetryPolicy{max_attempts: 3}
+      {value, new_policy} = Access.pop(policy, :max_attempts)
+      assert value == 3
+      # After pop, field reverts to default (nil or struct default)
+      assert new_policy.max_attempts == nil or is_integer(new_policy.max_attempts)
     end
   end
 
-  describe "Lens" do
-    test "composición de lenses con then/2" do
-      data = %{users: [%{name: "Ana"}]}
-      lens = Lens.key(:users) |> Lens.then(Lens.at(0)) |> Lens.then(Lens.key(:name))
-      assert Lens.get(lens, data) == "Ana"
+  describe "JobConfig — Access behaviour with path operations" do
+    test "get_in reads top-level field" do
+      config = %JobConfig{handler: "TaskQueue.Handlers.Email"}
+      assert get_in(config, [:handler]) == "TaskQueue.Handlers.Email"
     end
 
-    test "path/1 crea lens desde lista de claves" do
-      data = %{a: %{b: %{c: 42}}}
-      lens = Lens.path([:a, :b, :c])
-      assert Lens.get(lens, data) == 42
+    test "get_in reads nested struct field" do
+      config = %JobConfig{retry: %RetryPolicy{max_attempts: 5}}
+      assert get_in(config, [:retry, :max_attempts]) == 5
     end
 
-    test "over/3 transforma el valor" do
-      data = %{score: 10}
-      result = Lens.over(Lens.key(:score), data, &(&1 * 2))
-      assert result == %{score: 20}
+    test "update_in modifies nested struct field" do
+      config = %JobConfig{retry: %RetryPolicy{backoff_ms: 1_000}}
+      new_config = update_in(config, [:retry, :backoff_ms], &(&1 * 2))
+      assert new_config.retry.backoff_ms == 2_000
+    end
+
+    test "put_in sets nested field" do
+      config = %JobConfig{retry: %RetryPolicy{max_attempts: 3}}
+      new_config = put_in(config, [:retry, :max_attempts], 10)
+      assert new_config.retry.max_attempts == 10
+    end
+
+    test "internal fields are not accessible via Access" do
+      config = %JobConfig{}
+      assert get_in(config, [:_version]) == nil
+    end
+
+    test "update_in returns same struct type" do
+      config = %JobConfig{timeout_ms: 5_000}
+      new_config = update_in(config, [:timeout_ms], &(&1 + 1_000))
+      assert %JobConfig{} = new_config
+      assert new_config.timeout_ms == 6_000
+    end
+
+    test "update_in on nested struct returns nested struct type" do
+      config = %JobConfig{}
+      new_config = update_in(config, [:retry, :max_attempts], &(&1 + 1))
+      assert %RetryPolicy{} = new_config.retry
+    end
+  end
+
+  describe "Access behaviour in get_in with Access helpers" do
+    test "Access.key/1 works with structs implementing Access" do
+      config = %JobConfig{retry: %RetryPolicy{max_attempts: 7}}
+      assert get_in(config, [Access.key(:retry), Access.key(:max_attempts)]) == 7
     end
   end
 end
 ```
 
----
+### Step 3: Run the tests
 
-## Summary
-
-- `Access` es un behaviour con tres callbacks: `fetch/2`, `get_and_update/3`, `pop/2`
-- Los macros `get_in`, `put_in`, `update_in`, `pop_in` usan estos callbacks para navegar paths anidados
-- `Access.key/1`, `Access.at/1`, `Access.filter/1` son accessors listos para componer en paths
-- Implementar `Access` en un struct propio lo hace compatible con toda la maquinaria de paths
-- El patrón *lens* emerge naturalmente de componer listas de accessors, sin necesidad de librerías externas para casos simples
+```bash
+mix test test/task_queue/access_test.exs --trace
+```
 
 ---
 
-## What's Next
+## Trade-off analysis
 
-- **Ejercicio 34**: Collectable y Enumerable — cómo se integran los protocolos que hacen posible `Enum.map`, `Enum.into`, y `for`
-- **Ecto.Changeset**: usa `put_in`/`Access` internamente para gestionar campos anidados
-- **Librería Lens**: [`lens`](https://hex.pm/packages/lens) en Hex ofrece lenses de orden superior más potentes
-- **Elixir 1.17+**: `Access.all/0` como accessor de "todos los elementos" en listas
+| Approach | Works with `get_in/update_in` | Hides internal fields | Boilerplate | Best for |
+|----------|------------------------------|----------------------|-------------|----------|
+| `@behaviour Access` custom | yes | yes (explicit allow-list) | medium | domain structs with controlled public interface |
+| `@derive [Access]` via macro | yes | no — exposes all fields | none | simple structs, all fields are public |
+| Manual `Map.from_struct` | no — must call explicitly | depends | high | one-off conversions |
+| Pattern matching | no | N/A | none | simple, one-level access |
+
+Reflection question: `Access.all()` works on lists, not maps. If the job registry is `%{job_id => %JobConfig{}}`, how would you use `update_in` with a custom `Access` function to update the `retry.max_attempts` for every job in the registry simultaneously?
+
+---
+
+## Common production mistakes
+
+**1. Not wrapping `Map.get_and_update` result back into the struct**
+
+```elixir
+# Wrong — returns a plain map, not the struct
+def get_and_update(policy, key, fun) do
+  Map.get_and_update(Map.from_struct(policy), key, fun)
+  # Returns {get_value, %{max_attempts: ..., backoff_ms: ...}}
+  # Callers expect a RetryPolicy struct
+end
+
+# Right — re-wrap in the struct
+def get_and_update(policy, key, fun) do
+  {get, map} = Map.get_and_update(Map.from_struct(policy), key, fun)
+  {get, struct(__MODULE__, map)}
+end
+```
+
+**2. Implementing `Access` but not handling the `:pop` tuple from `get_and_update`**
+
+`fun` in `get_and_update/3` can return `{get_value, new_value}` OR `:pop`. If your implementation does not handle the `:pop` atom, `pop_in/2` will crash:
+
+```elixir
+def get_and_update(policy, key, fun) do
+  case Map.get_and_update(Map.from_struct(policy), key, fun) do
+    {get, map} -> {get, struct(__MODULE__, map)}
+    # Map.get_and_update handles :pop correctly — delegates it
+  end
+end
+```
+
+In practice, delegating entirely to `Map.get_and_update` handles this correctly.
+
+**3. Exposing all fields including internal ones**
+
+A field prefixed with `_` signals "internal implementation detail." If `Access.fetch/2` returns it, callers can `update_in` it, breaking invariants. Use an explicit allow-list:
+
+```elixir
+@accessible_keys ~w(handler retry timeout_ms)a
+def fetch(config, key) when key in @accessible_keys, do: Map.fetch(Map.from_struct(config), key)
+def fetch(_config, _key), do: :error
+```
+
+**4. Using `Access.key/1` on a struct without `Access` implemented**
+
+`Access.key/1` calls `Access.fetch/2`. If the struct does not implement `Access`, this raises `Protocol.UndefinedError`. Always implement all three callbacks before using `get_in/update_in` with your struct.
+
+**5. Confusing `Access.fetch/2` with `Map.fetch/2`**
+
+`Access.fetch/2` is the protocol function — it dispatches to the struct's implementation. `Map.fetch/2` is a concrete function only for maps. Calling `Map.fetch(my_struct, :key)` works because all structs are maps under the hood, but it bypasses your custom `Access` implementation and exposes ALL fields.
 
 ---
 
 ## Resources
 
-- [Documentación oficial `Access`](https://hexdocs.pm/elixir/Access.html)
-- [Kernel — get_in/put_in/update_in](https://hexdocs.pm/elixir/Kernel.html#get_in/2)
-- [Elixir School — Access](https://elixirschool.com/en/lessons/intermediate/access_behaviour)
-- [Blog: Lenses in Elixir](https://www.elixirnewbie.com/articles/access-behaviour-in-elixir)
+- [Access behaviour — official docs](https://hexdocs.pm/elixir/Access.html)
+- [get_in/put_in/update_in — Kernel docs](https://hexdocs.pm/elixir/Kernel.html#get_in/2)
+- [Access.key/2 — path helpers](https://hexdocs.pm/elixir/Access.html#key/2)
+- [Implementing Access — José Valim blog](https://dashbit.co/blog/access-and-struct-updates)

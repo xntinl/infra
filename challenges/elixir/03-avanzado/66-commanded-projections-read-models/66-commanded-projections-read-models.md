@@ -1,532 +1,533 @@
-# Ejercicio 66: Commanded — Projections y Read Models
+# Commanded — Projections and Read Models
 
-## Tema
-En CQRS el lado de escritura (aggregates/events) y el de lectura (read models) son independientes. Las **proyecciones** consumen el stream de eventos y materializan vistas optimizadas para queries. Commanded provee `Commanded.Projections.Ecto` para sincronizar eventos con una base de datos Ecto.
-
-## Conceptos clave
-
-| Concepto | Rol |
-|---|---|
-| `Commanded.Projections.Ecto` | Proyecta eventos a tablas Ecto de forma transaccional |
-| `project/3` | Callback que recibe `(event, metadata, multi)` y devuelve un `Ecto.Multi` |
-| `after_update/3` | Hook post-proyección para notificaciones o side effects |
-| `Commanded.Event.Handler` | Handler genérico para side effects (sin persistencia Ecto) |
-| Snapshots | Persiste el estado del aggregate cada N eventos para acelerar replay |
-| Replay | Reproyecta todos los eventos desde cero para reconstruir/corregir read models |
+**Project**: `api_gateway` — billing subsystem read side
 
 ---
 
-## Ejercicio 1 — Dashboard Read Model: AccountSummary
+## Project context
 
-### Contexto
+You're building `api_gateway`. The event sourcing write side (aggregates, commands,
+events) is working from the previous exercise. Now the billing dashboard needs fast
+queries: current balance per client, top consumers, total platform revenue. The event
+store is the source of truth but is not optimized for these queries. You need projections.
 
-El frontend necesita mostrar un dashboard con el balance actual y el número de transacciones de cada cuenta. En lugar de consultar el event store (lento), proyectamos los eventos a una tabla `account_summaries` en Postgres que siempre tiene el estado más reciente.
+Project structure:
 
-### Schema Ecto
+```
+api_gateway/
+├── lib/
+│   └── api_gateway/
+│       └── billing/
+│           ├── projections/
+│           │   └── client_summary.ex       # Ecto schema — read model
+│           ├── projectors/
+│           │   └── client_projector.ex     # ← you implement this
+│           ├── handlers/
+│           │   └── overage_notifier.ex     # ← and this
+│           └── queries/
+│               └── billing_queries.ex      # ← and this
+├── test/
+│   └── api_gateway/
+│       └── billing/
+│           ├── client_projector_test.exs   # given tests — must pass without modification
+│           └── overage_notifier_test.exs   # given tests — must pass without modification
+└── mix.exs
+```
+
+---
+
+## The business problem
+
+Three read-side needs that the event store cannot serve efficiently:
+
+1. **Dashboard**: current balance, usage percentage, overage flag per client — needs
+   a materialized view that is always up to date.
+2. **Alerts**: when a client goes over quota, send a notification immediately — this
+   is a side effect, not a query.
+3. **Recovery**: when the projector code has a bug, fix it and re-project all events
+   from the beginning without touching the write side.
+
+---
+
+## Why `project/3` receives an `Ecto.Multi`
+
+`Commanded.Projections.Ecto` wraps each event's projection in a database transaction.
+The `project/3` callback receives an `Ecto.Multi` to which you add operations. Commanded
+commits all operations atomically, together with updating the projector's position in the
+event stream. If the commit fails, the projector retries. This is what gives exactly-once
+projection semantics: the position update and the data change happen in the same transaction.
+
+If you called `Repo.update/1` directly in `project/3` (bypassing the Multi), the position
+could advance without the data change having committed, or vice versa. You would get
+duplicate projections or missed events.
+
+---
+
+## Why `Event.Handler` for notifications, not `Projections.Ecto`
+
+`Projections.Ecto` is designed for database writes. A notification (email, Slack, webhook)
+is a side effect — it is not idempotent, and it does not update a database row. Using
+`Projections.Ecto` for notifications misuses the abstraction.
+
+`Commanded.Event.Handler` is the correct abstraction: it subscribes to the event stream
+and calls your `handle/2` for each event. You are responsible for idempotency. The handler
+does not participate in Ecto transactions.
+
+---
+
+## Implementation
+
+### Step 1: `mix.exs` additions
 
 ```elixir
-# lib/bank/projections/account_summary.ex
-defmodule Bank.Projections.AccountSummary do
+{:commanded_ecto_projections, "~> 1.4"},
+{:ecto_sql, "~> 3.11"},
+{:postgrex, "~> 0.18"}
+```
+
+### Step 2: Ecto schema — `lib/api_gateway/billing/projections/client_summary.ex`
+
+```elixir
+defmodule ApiGateway.Billing.Projections.ClientSummary do
   use Ecto.Schema
   import Ecto.Changeset
 
-  @primary_key {:account_id, :string, autogenerate: false}
-  schema "account_summaries" do
-    field :owner,             :string
-    field :balance,           :integer, default: 0
-    field :transaction_count, :integer, default: 0
-    field :status,            :string,  default: "open"
-    field :last_transaction_at, :utc_datetime
-
+  @primary_key {:client_id, :string, autogenerate: false}
+  schema "billing_client_summaries" do
+    field :plan,              :string
+    field :monthly_quota,     :integer, default: 0
+    field :cumulative_usage,  :integer, default: 0
+    field :status,            :string,  default: "active"
+    field :last_event_at,     :utc_datetime
     timestamps()
   end
 
   def changeset(summary, attrs) do
     summary
-    |> cast(attrs, [:owner, :balance, :transaction_count, :status, :last_transaction_at])
+    |> cast(attrs, [:plan, :monthly_quota, :cumulative_usage, :status, :last_event_at])
   end
 end
 ```
 
-### Migration
+### Step 3: Migration
 
 ```elixir
-# priv/repo/migrations/20240101000000_create_account_summaries.exs
-defmodule Bank.Repo.Migrations.CreateAccountSummaries do
+# priv/repo/migrations/TIMESTAMP_create_billing_client_summaries.exs
+defmodule ApiGateway.Repo.Migrations.CreateBillingClientSummaries do
   use Ecto.Migration
 
   def change do
-    create table(:account_summaries, primary_key: false) do
-      add :account_id,        :string,  primary_key: true
-      add :owner,             :string,  null: false
-      add :balance,           :integer, default: 0
-      add :transaction_count, :integer, default: 0
-      add :status,            :string,  default: "open"
-      add :last_transaction_at, :utc_datetime
-
+    create table(:billing_client_summaries, primary_key: false) do
+      add :client_id,        :string,  null: false, primary_key: true
+      add :plan,             :string
+      add :monthly_quota,    :integer, default: 0, null: false
+      add :cumulative_usage, :integer, default: 0, null: false
+      add :status,           :string,  default: "active", null: false
+      add :last_event_at,    :utc_datetime
       timestamps()
     end
+
+    create index(:billing_client_summaries, [:status])
   end
 end
 ```
 
-### Projector
+### Step 4: `lib/api_gateway/billing/projectors/client_projector.ex`
 
 ```elixir
-# lib/bank/projectors/account_projector.ex
-defmodule Bank.Projectors.AccountProjector do
+defmodule ApiGateway.Billing.Projectors.ClientProjector do
   @moduledoc """
-  Proyecta eventos de cuenta bancaria a la tabla account_summaries.
+  Projects billing events to the client_summaries read model.
 
-  Commanded.Projections.Ecto garantiza exactamente-una-vez semántica
-  usando una tabla interna de "projection versions" para rastrear
-  qué eventos ya fueron procesados, incluso tras reinicios.
+  Commanded.Projections.Ecto guarantees at-least-once delivery with
+  exactly-once semantics via the projection_versions table: the position
+  update and the data change commit in the same transaction.
+
+  consistency: :strong — the command dispatcher waits for this projector
+  to complete before returning. Required for synchronous tests.
   """
 
   use Commanded.Projections.Ecto,
-    application: Bank.Application,
-    repo: Bank.Repo,
-    name: "AccountProjector",
-    consistency: :strong  # el dispatch espera a que la proyección se complete
+    application: ApiGateway.Billing.Application,
+    repo:        ApiGateway.Repo,
+    name:        "ClientProjector",
+    consistency: :strong
 
-  alias Bank.Projections.AccountSummary
-  alias Bank.Events.{AccountOpened, MoneyDeposited, MoneyWithdrawn}
+  alias ApiGateway.Billing.Projections.ClientSummary
+  alias ApiGateway.Billing.Events.{ClientProvisioned, UsageRecorded, ClientSuspended}
 
-  # project/3 recibe el evento, metadata de Commanded, y un Ecto.Multi vacío
-  # Devuelve el Multi con las operaciones a ejecutar de forma atómica
+  import Ecto.Query
 
-  project(%AccountOpened{} = event, _metadata, multi) do
-    summary = %AccountSummary{
-      account_id: event.account_id,
-      owner:      event.owner,
-      balance:    event.initial_balance,
-      status:     "open"
-    }
+  # project/3 returns an Ecto.Multi. Commanded commits it atomically with
+  # the projector position update.
 
-    Ecto.Multi.insert(multi, :account_summary, summary)
+  project(%ClientProvisioned{} = event, _metadata, multi) do
+    # TODO: insert a new ClientSummary row using Ecto.Multi.insert/3
+    # Fields: client_id, plan, monthly_quota, status: "active"
   end
 
-  project(%MoneyDeposited{} = event, metadata, multi) do
-    Ecto.Multi.update_all(
-      multi,
-      :account_summary,
-      from(s in AccountSummary, where: s.account_id == ^event.account_id),
-      set: [
-        balance:             event.balance_after,
-        transaction_count:   fragment("transaction_count + 1"),
-        last_transaction_at: metadata.created_at
-      ]
-    )
+  project(%UsageRecorded{} = event, metadata, multi) do
+    new_status =
+      if event.cumulative_usage > 0 do
+        # We don't have monthly_quota here — derive status from the event
+        # The event already carries cumulative_usage; status derived in projector
+        # from a join or from a prior read. For simplicity, use a subquery:
+        # status = "over_quota" if cumulative_usage > monthly_quota else "active"
+        # Use Ecto.Multi.update_all with a fragment for atomic update
+        "active"  # placeholder — replace with proper logic
+      else
+        "active"
+      end
+
+    # TODO: use Ecto.Multi.update_all/4 to update cumulative_usage, status, last_event_at
+    # HINT: from(s in ClientSummary, where: s.client_id == ^event.client_id)
+    # HINT: set: [cumulative_usage: event.cumulative_usage, last_event_at: metadata.created_at,
+    #             status: fragment("CASE WHEN ? > monthly_quota THEN 'over_quota' ELSE 'active' END",
+    #                              ^event.cumulative_usage)]
   end
 
-  project(%MoneyWithdrawn{} = event, metadata, multi) do
-    Ecto.Multi.update_all(
-      multi,
-      :account_summary,
-      from(s in AccountSummary, where: s.account_id == ^event.account_id),
-      set: [
-        balance:             event.balance_after,
-        transaction_count:   fragment("transaction_count + 1"),
-        last_transaction_at: metadata.created_at
-      ]
-    )
+  project(%ClientSuspended{} = event, _metadata, multi) do
+    # TODO: update status to "suspended" for the given client_id
   end
 
-  # after_update/3 se llama DESPUÉS de que el Multi fue commitado exitosamente
-  def after_update(event, _metadata, changes) do
-    # Notifica via PubSub para que LiveView actualice la UI en tiempo real
+  # Called after the Multi commits successfully.
+  # Use for cache invalidation, PubSub, or logging.
+  def after_update(event, _metadata, _changes) do
     Phoenix.PubSub.broadcast(
-      Bank.PubSub,
-      "account:#{account_id_from(event)}",
-      {:account_updated, changes[:account_summary]}
+      ApiGateway.PubSub,
+      "billing:#{client_id_from(event)}",
+      {:billing_updated, event}
     )
+    :ok
+  end
+
+  defp client_id_from(%{client_id: id}), do: id
+end
+```
+
+### Step 5: `lib/api_gateway/billing/handlers/overage_notifier.ex`
+
+```elixir
+defmodule ApiGateway.Billing.Handlers.OverageNotifier do
+  @moduledoc """
+  Sends a notification when a client crosses their monthly quota.
+
+  Uses Commanded.Event.Handler (not Projections.Ecto) because this is a
+  side effect, not a database write. Idempotency must be handled explicitly:
+  if the handler is retried, we may send duplicate notifications.
+
+  Simple idempotency strategy: check an ETS table for already-notified events
+  keyed by (client_id, period). In production, use a DB table.
+  """
+
+  use Commanded.Event.Handler,
+    application: ApiGateway.Billing.Application,
+    name:        "OverageNotifier"
+
+  alias ApiGateway.Billing.Events.UsageRecorded
+
+  @table :overage_notifications_sent
+
+  def init do
+    :ets.new(@table, [:named_table, :public, :set])
+    :ok
+  end
+
+  def handle(%UsageRecorded{} = event, _metadata) do
+    # TODO: check if cumulative_usage exceeded quota for this client
+    # You need to read from the ClientSummary read model (not from the aggregate)
+    # to get monthly_quota — the event only carries cumulative_usage.
+
+    # TODO: check idempotency: has (client_id, period) been notified already?
+    # :ets.lookup(@table, {event.client_id, event.period})
+
+    # TODO: if over quota and not yet notified:
+    #   - send notification (log it, or call a real notification service)
+    #   - mark as notified in ETS: :ets.insert(@table, {{client_id, period}, true})
 
     :ok
   end
 
-  defp account_id_from(%{account_id: id}), do: id
+  # Ignore other event types
+  def handle(_event, _metadata), do: :ok
 end
 ```
 
-### Query del read model
+### Step 6: `lib/api_gateway/billing/queries/billing_queries.ex`
 
 ```elixir
-# lib/bank/queries/account_queries.ex
-defmodule Bank.Queries.AccountQueries do
+defmodule ApiGateway.Billing.Queries.BillingQueries do
   import Ecto.Query
+  alias ApiGateway.Billing.Projections.ClientSummary
+  alias ApiGateway.Repo
 
-  alias Bank.Projections.AccountSummary
-  alias Bank.Repo
-
-  def get_summary(account_id) do
-    Repo.get(AccountSummary, account_id)
+  def get_summary(client_id) do
+    Repo.get(ClientSummary, client_id)
   end
 
-  def list_top_balances(limit \\ 10) do
-    AccountSummary
-    |> where([s], s.status == "open")
-    |> order_by([s], desc: s.balance)
+  def top_consumers(limit \\ 10) do
+    ClientSummary
+    |> where([s], s.status in ["active", "over_quota"])
+    |> order_by([s], desc: s.cumulative_usage)
     |> limit(^limit)
     |> Repo.all()
   end
 
-  def total_assets do
-    AccountSummary
-    |> where([s], s.status == "open")
-    |> select([s], sum(s.balance))
+  def over_quota_clients do
+    ClientSummary
+    |> where([s], s.status == "over_quota")
+    |> Repo.all()
+  end
+
+  def total_platform_usage do
+    ClientSummary
+    |> where([s], s.status != "suspended")
+    |> select([s], sum(s.cumulative_usage))
     |> Repo.one()
   end
 end
 ```
 
-### Test del projector
+### Step 7: Given tests — must pass without modification
 
 ```elixir
-defmodule Bank.Projectors.AccountProjectorTest do
-  use Bank.DataCase, async: false  # async: false porque escribe en DB
+# test/api_gateway/billing/client_projector_test.exs
+defmodule ApiGateway.Billing.Projectors.ClientProjectorTest do
+  use ApiGateway.DataCase, async: false
 
-  alias Bank.Projectors.AccountProjector
-  alias Bank.Projections.AccountSummary
-  alias Bank.Events.{AccountOpened, MoneyDeposited, MoneyWithdrawn}
+  alias ApiGateway.Billing.Projectors.ClientProjector
+  alias ApiGateway.Billing.Projections.ClientSummary
+  alias ApiGateway.Billing.Events.{ClientProvisioned, UsageRecorded, ClientSuspended}
 
-  # Commanded.Projections.Ecto expone project/2 en tests
-  # pero la forma canónica es usar el CommandedCase que dispatcha comandos reales
-
-  describe "AccountOpened" do
-    test "crea un registro en account_summaries" do
-      event = %AccountOpened{
-        account_id: "acc-test-1",
-        owner: "Alice",
-        initial_balance: 1000,
-        opened_at: ~U[2024-01-01 12:00:00Z]
-      }
-
-      # En tests se puede aplicar la proyección directamente
-      multi = Ecto.Multi.new()
-      result_multi = AccountProjector.__project__(event, %{created_at: DateTime.utc_now()}, multi)
-      {:ok, changes} = Bank.Repo.transaction(result_multi)
-
-      summary = Bank.Repo.get(AccountSummary, "acc-test-1")
-      assert summary.balance == 1000
-      assert summary.owner == "Alice"
-      assert summary.transaction_count == 0
-    end
+  defp project(event, metadata \\ %{created_at: DateTime.utc_now()}) do
+    multi = Ecto.Multi.new()
+    result_multi = ClientProjector.__project__(event, metadata, multi)
+    {:ok, _} = ApiGateway.Repo.transaction(result_multi)
   end
 
-  describe "MoneyWithdrawn" do
-    setup do
-      Bank.Repo.insert!(%AccountSummary{
-        account_id: "acc-test-2",
-        owner: "Bob",
-        balance: 1000,
-        transaction_count: 2
-      })
-      :ok
-    end
+  test "ClientProvisioned creates a summary row" do
+    event = %ClientProvisioned{
+      client_id: "c-test-1",
+      monthly_quota: 5_000,
+      plan: "standard",
+      provisioned_at: DateTime.utc_now()
+    }
+    project(event)
 
-    test "decrementa el balance y aumenta transaction_count" do
-      event = %MoneyWithdrawn{
-        account_id: "acc-test-2",
-        amount: 300,
-        balance_after: 700
-      }
-
-      multi = Ecto.Multi.new()
-      result_multi = AccountProjector.__project__(event, %{created_at: DateTime.utc_now()}, multi)
-      {:ok, _} = Bank.Repo.transaction(result_multi)
-
-      summary = Bank.Repo.get(AccountSummary, "acc-test-2")
-      assert summary.balance == 700
-      assert summary.transaction_count == 3
-    end
-  end
-end
-```
-
----
-
-## Ejercicio 2 — Email Notification Event Handler
-
-### Contexto
-
-Cuando el balance de una cuenta cae por debajo de 100€ tras un retiro, hay que enviar un email de alerta al propietario. Este es un **side effect** puro que no necesita proyectar a una tabla; se implementa como un `Commanded.Event.Handler`.
-
-### Handler
-
-```elixir
-# lib/bank/handlers/low_balance_notifier.ex
-defmodule Bank.Handlers.LowBalanceNotifier do
-  @moduledoc """
-  Envía email cuando el balance cae bajo el umbral.
-
-  Usa Commanded.Event.Handler (no Projections.Ecto) porque no persiste
-  datos en DB — solo dispara un side effect externo.
-
-  Idempotencia: si el handler falla y se reintenta, el email puede
-  enviarse dos veces. Para evitarlo se puede idempotency-key con Redis
-  o una tabla DB de "notifications_sent".
-  """
-
-  use Commanded.Event.Handler,
-    application: Bank.Application,
-    name: "LowBalanceNotifier"
-
-  alias Bank.Events.MoneyWithdrawn
-  alias Bank.Emails.LowBalanceEmail
-  alias Bank.Mailer
-
-  @threshold 100
-
-  def handle(%MoneyWithdrawn{balance_after: balance} = event, _metadata)
-      when balance < @threshold do
-    # Buscamos el owner en el read model (no en el aggregate)
-    case Bank.Queries.AccountQueries.get_summary(event.account_id) do
-      nil ->
-        # El projector aún no procesó AccountOpened — eventual consistency
-        # Podemos reintentar o ignorar
-        :ok
-
-      %{owner: owner} ->
-        owner
-        |> LowBalanceEmail.build(balance)
-        |> Mailer.deliver()
-
-        :ok
-    end
+    summary = ApiGateway.Repo.get(ClientSummary, "c-test-1")
+    assert summary.monthly_quota == 5_000
+    assert summary.status == "active"
+    assert summary.cumulative_usage == 0
   end
 
-  # Si el balance es suficiente, no hacemos nada
-  def handle(%MoneyWithdrawn{}, _metadata), do: :ok
-end
-```
+  test "UsageRecorded updates cumulative_usage" do
+    ApiGateway.Repo.insert!(%ClientSummary{
+      client_id: "c-test-2",
+      monthly_quota: 1_000,
+      cumulative_usage: 0,
+      status: "active"
+    })
 
-### Email con Swoosh
+    event = %UsageRecorded{
+      client_id: "c-test-2",
+      request_count: 400,
+      period: "2026-04",
+      cumulative_usage: 400
+    }
+    project(event)
 
-```elixir
-# lib/bank/emails/low_balance_email.ex
-defmodule Bank.Emails.LowBalanceEmail do
-  import Swoosh.Email
+    summary = ApiGateway.Repo.get(ClientSummary, "c-test-2")
+    assert summary.cumulative_usage == 400
+    assert summary.status == "active"
+  end
 
-  @sender {"Bank Alerts", "alerts@bank.example"}
+  test "UsageRecorded sets over_quota when exceeded" do
+    ApiGateway.Repo.insert!(%ClientSummary{
+      client_id: "c-test-3",
+      monthly_quota: 100,
+      cumulative_usage: 0,
+      status: "active"
+    })
 
-  def build(owner_email, balance) do
-    new()
-    |> to(owner_email)
-    |> from(@sender)
-    |> subject("Alerta: saldo bajo en tu cuenta")
-    |> text_body("""
-    Hola,
+    event = %UsageRecorded{
+      client_id: "c-test-3",
+      request_count: 150,
+      period: "2026-04",
+      cumulative_usage: 150
+    }
+    project(event)
 
-    Tu saldo actual es #{balance}€, por debajo del umbral de alerta.
+    summary = ApiGateway.Repo.get(ClientSummary, "c-test-3")
+    assert summary.status == "over_quota"
+  end
 
-    Considera hacer un depósito para evitar cargos por saldo insuficiente.
+  test "ClientSuspended sets status to suspended" do
+    ApiGateway.Repo.insert!(%ClientSummary{
+      client_id: "c-test-4",
+      monthly_quota: 1_000,
+      cumulative_usage: 200,
+      status: "active"
+    })
 
-    — Equipo Bank
-    """)
+    event = %ClientSuspended{
+      client_id: "c-test-4",
+      reason: "non-payment",
+      suspended_at: DateTime.utc_now()
+    }
+    project(event)
+
+    summary = ApiGateway.Repo.get(ClientSummary, "c-test-4")
+    assert summary.status == "suspended"
   end
 end
 ```
 
-### Test del handler con mock de mailer
+Copy this file exactly. Your `OverageNotifier.handle/2` implementation must make all 3 tests pass.
 
 ```elixir
-defmodule Bank.Handlers.LowBalanceNotifierTest do
-  use ExUnit.Case, async: true
-  import Swoosh.TestAssertions  # verifica emails en test
+# test/api_gateway/billing/overage_notifier_test.exs
+defmodule ApiGateway.Billing.Handlers.OverageNotifierTest do
+  use ApiGateway.DataCase, async: false
 
-  alias Bank.Handlers.LowBalanceNotifier
-  alias Bank.Events.MoneyWithdrawn
+  alias ApiGateway.Billing.Handlers.OverageNotifier
+  alias ApiGateway.Billing.Projections.ClientSummary
+  alias ApiGateway.Billing.Events.UsageRecorded
 
   setup do
-    # El test adapter de Swoosh captura los emails sin enviarlos
-    Application.put_env(:bank, Bank.Mailer, adapter: Swoosh.Adapters.Test)
+    # Ensure the ETS dedup table is clean before each test.
+    # init/0 creates it on first call; subsequent calls hit the existing table.
+    if :ets.whereis(:overage_notifications_sent) == :undefined do
+      OverageNotifier.init()
+    else
+      :ets.delete_all_objects(:overage_notifications_sent)
+    end
+
     :ok
   end
 
-  test "envía email cuando balance < 100" do
-    # Precondición: summary existe en DB
-    Bank.Repo.insert!(%Bank.Projections.AccountSummary{
-      account_id: "acc-alert",
-      owner: "alice@example.com",
-      balance: 50,
-      transaction_count: 1
+  test "does not notify when within quota" do
+    ApiGateway.Repo.insert!(%ClientSummary{
+      client_id: "c-ok",
+      monthly_quota: 1_000,
+      cumulative_usage: 0,
+      status: "active"
     })
 
-    event = %MoneyWithdrawn{account_id: "acc-alert", amount: 950, balance_after: 50}
-
-    :ok = LowBalanceNotifier.handle(event, %{})
-
-    assert_email_sent(to: "alice@example.com", subject: "Alerta: saldo bajo en tu cuenta")
-  end
-
-  test "no envía email cuando balance >= 100" do
-    event = %MoneyWithdrawn{account_id: "acc-safe", amount: 50, balance_after: 200}
-
-    :ok = LowBalanceNotifier.handle(event, %{})
-
-    assert_no_email_sent()
-  end
-end
-```
-
----
-
-## Ejercicio 3 — Snapshot Strategy
-
-### Contexto
-
-Un aggregate con 10.000 eventos tarda demasiado en reconstruirse en memoria. La solución es tomar un **snapshot** del estado del aggregate cada N eventos. En lugar de replay desde el evento 1, Commanded carga el último snapshot y solo reproduce los eventos posteriores.
-
-### Habilitar snapshots en el aggregate
-
-```elixir
-# lib/bank/aggregates/bank_account.ex (fragmento adicional)
-defmodule Bank.Aggregates.BankAccount do
-  # ... código anterior ...
-
-  # Indica a Commanded que tome snapshot cada 100 eventos
-  @snapshot_every 100
-
-  def snapshot_after(_version, events_since_last_snapshot)
-      when events_since_last_snapshot >= @snapshot_every,
-      do: true
-
-  def snapshot_after(_version, _events), do: false
-end
-```
-
-### Registro del snapshot threshold en la configuración
-
-```elixir
-# config/config.exs
-config :bank, Bank.Application,
-  event_store: [
-    adapter: Commanded.EventStore.Adapters.InMemory
-  ],
-  snapshotting: %{
-    Bank.Aggregates.BankAccount => %{
-      snapshot_every: 100,
-      snapshot_version: 1  # versión del snapshot para migraciones
+    event = %UsageRecorded{
+      client_id: "c-ok",
+      request_count: 200,
+      period: "2026-04",
+      cumulative_usage: 200
     }
-  }
-```
 
-### Snapshot serialization
-
-Commanded serializa el estado del aggregate vía Jason (JSON) por defecto. Si el struct tiene campos complejos, implementa `Commanded.Serialization.JsonDecoder`:
-
-```elixir
-defimpl Commanded.Serialization.JsonDecoder, for: Bank.Aggregates.BankAccount do
-  def decode(%Bank.Aggregates.BankAccount{} = state) do
-    # Convierte strings a atoms donde sea necesario
-    %{state | status: String.to_existing_atom(state.status)}
+    assert :ok = OverageNotifier.handle(event, %{})
+    # No dedup entry — no notification was recorded
+    assert :ets.lookup(:overage_notifications_sent, {"c-ok", "2026-04"}) == []
   end
-end
-```
 
-### Test de rendimiento: replay vs snapshot
-
-```elixir
-defmodule Bank.Aggregates.SnapshotBenchmark do
-  @moduledoc """
-  Benchmark informal para comparar tiempos de reconstrucción.
-  Ejecutar con: mix run lib/bank/aggregates/snapshot_benchmark.ex
-  """
-
-  alias Bank.Commands.{OpenAccount, DepositMoney}
-
-  def run do
-    account_id = "bench-account-#{System.unique_integer([:positive])}"
-
-    # Abre la cuenta
-    :ok = Bank.Application.dispatch(%OpenAccount{
-      account_id: account_id,
-      initial_balance: 0,
-      owner: "Benchmark"
+  test "notifies when over quota and marks as notified" do
+    ApiGateway.Repo.insert!(%ClientSummary{
+      client_id: "c-over",
+      monthly_quota: 100,
+      cumulative_usage: 0,
+      status: "active"
     })
 
-    # Genera 500 depósitos (5 snapshots si threshold = 100)
-    Enum.each(1..500, fn _i ->
-      Bank.Application.dispatch(%DepositMoney{account_id: account_id, amount: 10})
-    end)
+    event = %UsageRecorded{
+      client_id: "c-over",
+      request_count: 150,
+      period: "2026-04",
+      cumulative_usage: 150
+    }
 
-    # Mide el tiempo de reconstrucción (Commanded hace esto internamente
-    # al recibir el primer comando tras un reinicio)
-    {time, _} = :timer.tc(fn ->
-      Bank.Application.dispatch(%DepositMoney{account_id: account_id, amount: 1})
-    end)
+    assert :ok = OverageNotifier.handle(event, %{})
+    # Dedup entry must exist after first notification
+    assert [{{"c-over", "2026-04"}, true}] =
+             :ets.lookup(:overage_notifications_sent, {"c-over", "2026-04"})
+  end
 
-    IO.puts("Reconstrucción con snapshots: #{time / 1_000}ms")
+  test "does not notify twice for the same client and period" do
+    ApiGateway.Repo.insert!(%ClientSummary{
+      client_id: "c-dup",
+      monthly_quota: 100,
+      cumulative_usage: 0,
+      status: "over_quota"
+    })
+
+    # Pre-insert dedup entry as if already notified
+    :ets.insert(:overage_notifications_sent, {{"c-dup", "2026-04"}, true})
+
+    event = %UsageRecorded{
+      client_id: "c-dup",
+      request_count: 10,
+      period: "2026-04",
+      cumulative_usage: 200
+    }
+
+    # Should return :ok without sending a second notification
+    assert :ok = OverageNotifier.handle(event, %{})
   end
 end
 ```
 
----
+### Step 8: Run the tests
 
-## Ejercicio 4 — Replay desde el inicio
-
-### Cuándo se necesita replay
-
-- Corregiste un bug en un projector y necesitas recalcular el read model.
-- Añadiste una nueva proyección y necesitas poblarla desde el histórico.
-- Los datos del read model quedaron corruptos.
-
-### Cómo hacer replay en Commanded
-
-```elixir
-defmodule Bank.Maintenance.ReplayProjections do
-  @moduledoc """
-  Resetea y reproyecta el AccountProjector desde el evento 0.
-
-  PRECAUCIÓN: en producción esto puede tardar minutos/horas.
-  Ejecutar en mantenimiento o con el projector en modo "offline".
-  """
-
-  alias Bank.Projectors.AccountProjector
-
-  def reset_and_replay do
-    # 1. Borra el estado del projector (reinicia desde posición 0)
-    :ok = Commanded.Projections.Ecto.reset(AccountProjector)
-
-    IO.puts("Projector reseteado. El replay comenzará automáticamente al reiniciar el handler.")
-    IO.puts("El projector procesará todos los eventos desde el inicio del stream.")
-  end
-end
+```bash
+mix test test/api_gateway/billing/ --trace
 ```
-
-Commanded reinicia automáticamente la subscripción desde el evento 1 cuando detecta que la versión del projector es 0 (tras el reset).
 
 ---
 
-## Preguntas de reflexión
+## Trade-off analysis
 
-1. ¿Por qué `project/3` recibe un `Ecto.Multi` en lugar de ejecutar operaciones Ecto directamente?
-2. ¿Qué garantía de consistencia ofrece `consistency: :strong` y cuál es su coste?
-3. Si el handler de email falla en el medio, ¿se puede garantizar exactamente-una-vez? ¿Cómo?
-4. ¿Cuál es la diferencia entre un `Event.Handler` y un `Projections.Ecto` projector?
-5. ¿Qué pasa si cambias la estructura de un snapshot (e.g., añades un campo al aggregate)? ¿Cómo manejas la migración de snapshots?
-6. ¿Por qué no se deben hacer queries a la DB dentro del `apply/2` del aggregate?
+| Aspect | `Projections.Ecto` | `Event.Handler` | Direct aggregate read |
+|--------|-------------------|-----------------|----------------------|
+| Persistence | Ecto transaction | None (manual) | N/A — replay only |
+| Idempotency | Built-in (projection_versions) | Manual | N/A |
+| Exactly-once | Yes (if DB supports it) | No | N/A |
+| Side effects | Misuse of abstraction | Correct use | N/A |
+| Reset & replay | Built-in reset | Manual | Full replay |
+| When to use | Read models, dashboards | Notifications, webhooks | Debugging only |
 
-## Dependencias (`mix.exs`)
+Reflection question: `after_update/3` is called after the Ecto.Multi commits. If the
+PubSub broadcast fails (Phoenix.PubSub is down), what happens? Does the projection
+roll back? Is the event re-processed? What does this mean for UI consistency?
 
-```elixir
-defp deps do
-  [
-    {:commanded, "~> 1.4"},
-    {:commanded_ecto_projections, "~> 1.4"},
-    {:commanded_eventstore_adapter, "~> 1.4"},
-    {:eventstore, "~> 1.4"},
-    {:ecto_sql, "~> 3.10"},
-    {:postgrex, "~> 0.17"},
-    {:swoosh, "~> 1.14"},        # emails
-    {:phoenix_pubsub, "~> 2.1"}  # notificaciones real-time
-  ]
-end
-```
+---
 
-## Referencias
+## Common production mistakes
 
-- [Commanded.Projections.Ecto](https://hexdocs.pm/commanded_ecto_projections)
-- [Commanded Event Handlers](https://hexdocs.pm/commanded/event-handlers.html)
-- [Snapshots](https://hexdocs.pm/commanded/snapshotting.html)
-- [Replay Events](https://hexdocs.pm/commanded/read-model-projections.html#resetting-a-projection)
+**1. `project/3` returning a different Multi than the one received**
+`project/3` must return the modified Multi, not a new one. `Ecto.Multi.new()` in
+`project/3` loses the transaction context Commanded needs for position tracking.
+
+**2. `consistency: :eventual` in tests**
+With `:eventual`, the command returns before the projection commits. Your test asserts
+on the read model before it has been updated. Use `:strong` for tests that read after
+dispatching.
+
+**3. `Event.Handler` without idempotency**
+If the handler process crashes and restarts, it replays events from the last committed
+position. Without idempotency, notifications are sent twice. The ETS approach in
+`OverageNotifier` is sufficient for development — use a DB-backed deduplication table
+in production where ETS state survives process restarts but not node restarts.
+
+**4. Deleting and re-creating the projector does not replay**
+To replay all events, call `Commanded.Projections.Ecto.reset(MyProjector)` which
+resets the position to 0. Commanded replays automatically on the next restart.
+Dropping the read model table without resetting the position leaves the projector
+at its previous position — no replay happens.
+
+**5. Schema evolution without event upcasting**
+If you add a field to `UsageRecorded` and replay old events that lack it, the `apply/2`
+pattern match may fail. Use Commanded's event upcasting to transform old event structs
+before they reach `apply/2`.
+
+---
+
+## Resources
+
+- [Commanded.Projections.Ecto](https://hexdocs.pm/commanded_ecto_projections) — `project/3`, `after_update/3`, reset
+- [Commanded Event Handlers](https://hexdocs.pm/commanded/event-handlers.html) — lifecycle, subscriptions
+- [Commanded Snapshotting](https://hexdocs.pm/commanded/snapshotting.html) — aggregate replay performance
+- [Commanded Event Upcasting](https://hexdocs.pm/commanded/event-upcasting.html) — schema evolution

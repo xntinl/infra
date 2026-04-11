@@ -1,165 +1,99 @@
-# 34. GenStage Avanzado: Dispatchers, ConsumerSupervisor y Demand Buffering
+# GenStage — Dispatchers, ConsumerSupervisor, and Demand Buffering
 
-**Difficulty**: Avanzado
+**Project**: `api_gateway` — built incrementally across the advanced level
 
-## Prerequisites
-- Sólido dominio de GenServer y OTP supervision trees
-- Experiencia con GenStage básico (producer/consumer)
-- Comprensión de back-pressure y demand-driven pipelines
-- Familiaridad con `DynamicSupervisor` y supervisión dinámica
+---
 
-## Learning Objectives
-After completing this exercise, you will be able to:
-- Usar `GenStage.PartitionDispatcher` para enrutar eventos a consumers específicos según su contenido
-- Usar `GenStage.BroadcastDispatcher` para fanout de eventos a todos los consumers
-- Implementar `ConsumerSupervisor` para procesar cada evento en un proceso temporal dedicado
-- Manejar demand buffering cuando el producer no puede satisfacer demanda inmediatamente
-- Diseñar pipelines GenStage de producción con múltiples etapas y topologías complejas
+## Project context
 
-## Concepts
+`api_gateway` needs an internal event processing pipeline. The gateway emits three event
+types (`payment`, `signup`, `click`) that must be routed to specialized consumers. Some
+events require CPU-bound work (fraud scoring) that should run in parallel. The event
+source is an external webhook receiver that delivers events in bursts — the producer does
+not always have data ready when consumers ask for it.
 
-### GenStage Dispatchers: quién recibe qué
+Project structure at this point:
 
-Por defecto, GenStage usa `GenStage.DemandDispatcher` — distribuye eventos round-robin entre consumers. Para casos avanzados existen tres dispatchers especializados:
-
-**BroadcastDispatcher**: cada evento se envía a TODOS los consumers suscritos. Útil para fanout (notificaciones, invalidación de caché distribuida).
-
-```elixir
-defmodule MyProducer do
-  use GenStage
-
-  def init(_) do
-    {:producer, [], dispatcher: GenStage.BroadcastDispatcher}
-  end
-end
+```
+api_gateway/
+├── lib/
+│   └── api_gateway/
+│       ├── application.ex
+│       └── middleware/
+│           ├── event_router.ex         # ← you implement this (Exercise 1)
+│           ├── parallel_processor.ex   # ← and this (Exercise 2)
+│           └── async_producer.ex       # ← and this (Exercise 3)
+├── test/
+│   └── api_gateway/
+│       └── middleware/
+│           └── event_pipeline_test.exs # given tests
+└── mix.exs
 ```
 
-**PartitionDispatcher**: enruta cada evento a exactamente UN consumer, determinado por una función hash/partition. Garantiza que eventos del mismo "grupo" siempre van al mismo consumer (ordering garantizado por partición).
+---
 
-```elixir
-defmodule MyProducer do
-  use GenStage
+## The business problem
 
-  def init(_) do
-    {:producer, [],
-     dispatcher: {GenStage.PartitionDispatcher,
-       partitions: [:payments, :signups, :events],
-       hash: fn event ->
-         # Devuelve {evento, partición_destino}
-         partition = determine_partition(event)
-         {event, partition}
-       end
-     }}
-  end
-end
+Three consumer teams need events from the gateway:
+1. **Payments team** — needs all `:payment` events for fraud scoring (CPU-bound, 50ms each)
+2. **Growth team** — needs all `:signup` events for onboarding flows
+3. **Analytics team** — needs all `:click` events, can process them in batches
+
+Additionally, the external webhook source delivers events unpredictably. When the webhook
+arrives, the GenStage consumers have already demanded data. The producer must buffer
+the demand and satisfy it when the data arrives.
+
+---
+
+## GenStage demand model — the core contract
+
+GenStage is a demand-driven pipeline. **Consumers pull; producers push only when asked.**
+
+```
+Consumer asks for 10 events  →  Producer emits up to 10 events
+Consumer asks for 10 more    →  Producer emits up to 10 more (or buffers demand if empty)
 ```
 
-El consumer se suscribe indicando su partición:
-```elixir
-GenStage.sync_subscribe(consumer, to: producer, partition: :payments)
-```
+This model provides natural backpressure: a slow consumer automatically slows its producer
+by not asking for more. No separate rate limiting is needed at the pipeline level.
 
-**DemandDispatcher** (default): distribuye eventos a consumers que tienen demand pendiente. Admite `min_demand` y `max_demand`.
+The three built-in dispatchers define how events are routed to consumers:
 
-### ConsumerSupervisor: escalado automático por evento
-
-`ConsumerSupervisor` es un consumer especial que actúa como supervisor. Cada evento recibido lanza un worker temporal (`Task` o proceso dedicado). El número de procesos vivos simultáneamente está acotado por `max_demand`:
-
-```elixir
-defmodule MyWorkerSupervisor do
-  use ConsumerSupervisor
-
-  def start_link(opts) do
-    ConsumerSupervisor.start_link(__MODULE__, opts)
-  end
-
-  def init(_opts) do
-    children = [
-      # Cada evento lanzará un proceso de este spec
-      %{id: MyWorker, start: {MyWorker, :start_link, []}, restart: :temporary}
-    ]
-
-    # max_demand = max procesos simultáneos
-    opts = [strategy: :one_for_one, subscribe_to: [{MyProducer, max_demand: 10}]]
-    ConsumerSupervisor.init(children, opts)
-  end
-end
-```
-
-El worker recibe el evento como argumento de `start_link`:
-```elixir
-defmodule MyWorker do
-  use Task
-
-  def start_link(event) do
-    Task.start_link(__MODULE__, :run, [event])
-  end
-
-  def run(event) do
-    # Procesar el evento — el proceso muere al terminar
-    process(event)
-  end
-end
-```
-
-### Demand Buffering: cuando el producer es lento
-
-El challenge más complejo de GenStage: el producer no tiene datos inmediatamente cuando los consumers piden. Hay que almacenar la demanda pendiente y satisfacerla cuando los datos estén disponibles.
-
-```elixir
-defmodule SlowProducer do
-  use GenStage
-
-  def init(_) do
-    # Estado: {buffer_de_eventos, demand_pendiente}
-    {:producer, {[], 0}}
-  end
-
-  def handle_demand(demand, {buffer, pending_demand}) do
-    total_demand = demand + pending_demand
-    {to_emit, remaining_buffer} = Enum.split(buffer, total_demand)
-    remaining_demand = total_demand - length(to_emit)
-
-    # Si hay eventos en buffer, emitirlos. Si no, guardar la demand.
-    {:noreply, to_emit, {remaining_buffer, remaining_demand}}
-  end
-
-  # Cuando llegan datos externos (ej: desde una fuente async)
-  def handle_info({:new_data, items}, {buffer, pending_demand}) do
-    new_buffer = buffer ++ items
-    {to_emit, remaining_buffer} = Enum.split(new_buffer, pending_demand)
-    remaining_demand = pending_demand - length(to_emit)
-    {:noreply, to_emit, {remaining_buffer, remaining_demand}}
-  end
-end
-```
-
-### Trade-offs de diseño en GenStage
-
-| Dispatcher | Cuándo usarlo | Consideraciones |
+| Dispatcher | Routing | Ordering guarantee |
 |---|---|---|
-| DemandDispatcher | Distribución equitativa de carga | No hay garantía de ordering entre consumers |
-| BroadcastDispatcher | Notificaciones, cache invalidation | Todos los consumers deben suscribirse antes de enviar eventos |
-| PartitionDispatcher | Ordering por clave, sharding | Requiere función hash determinista |
-| ConsumerSupervisor | CPU-bound work por evento | Max concurrency = max_demand |
+| `DemandDispatcher` (default) | Round-robin to demanding consumers | None across consumers |
+| `BroadcastDispatcher` | Every event to every consumer | Per-consumer |
+| `PartitionDispatcher` | One consumer per partition key | Within partition |
 
-En producción: `max_demand` es el parámetro de tuning más importante. Demasiado alto → memory pressure. Demasiado bajo → latencia alta por round-trip de demand.
+---
 
-## Exercises
+## Implementation
 
-### Exercise 1: PartitionDispatcher — Pipeline con enrutamiento por tipo de evento
-
-Implementa un pipeline que recibe eventos de distintos tipos (`{:payment, data}`, `{:signup, data}`, `{:click, data}`) y los enruta a consumers especializados según su tipo.
+### Step 1: `mix.exs`
 
 ```elixir
-defmodule EventRouter do
+defp deps do
+  [
+    {:gen_stage, "~> 1.2"}
+  ]
+end
+```
+
+### Step 2: `lib/api_gateway/middleware/event_router.ex`
+
+```elixir
+defmodule ApiGateway.Middleware.EventRouter do
   @moduledoc """
-  Pipeline GenStage con PartitionDispatcher.
+  Routes events to specialized consumers using PartitionDispatcher.
 
-  Topología:
-    EventProducer --> [PaymentConsumer, SignupConsumer, ClickConsumer]
+  Topology:
+    EventProducer
+      ├── PaymentConsumer  (partition: :payment)
+      ├── SignupConsumer   (partition: :signup)
+      └── ClickConsumer    (partition: :click)
 
-  Cada consumer solo recibe eventos de su tipo.
+  Each consumer receives only events of its type.
+  The partition key is extracted from the event tuple: {:payment, data} → :payment.
   """
 
   defmodule EventProducer do
@@ -170,17 +104,15 @@ defmodule EventRouter do
     end
 
     def init(events) do
-      # TODO: Configurar PartitionDispatcher con partitions: [:payment, :signup, :click]
-      # La función hash debe extraer el tipo del evento (primer elemento de la tupla)
-      # y devolver {event, tipo}
-      {
-        :producer,
-        events,
-        dispatcher: {
-          GenStage.PartitionDispatcher,
-          # TODO: completar opciones
-        }
-      }
+      # TODO: configure PartitionDispatcher with partitions: [:payment, :signup, :click]
+      # HINT: dispatcher: {GenStage.PartitionDispatcher, partitions: [...], hash: fn}
+      # HINT: the hash function receives an event and returns {event, partition_key}
+      # The partition key is the first element of the event tuple
+      {:producer, events,
+       dispatcher:
+         {GenStage.PartitionDispatcher,
+          # TODO: fill in partitions and hash options
+         }}
     end
 
     def handle_demand(demand, events) do
@@ -197,16 +129,13 @@ defmodule EventRouter do
     end
 
     def init(producer) do
-      # TODO: suscribirse al producer con partition: :payment
+      # TODO: subscribe to the producer with partition: :payment
       {:consumer, :ok, subscribe_to: [{producer, partition: :payment, max_demand: 10}]}
     end
 
     def handle_events(events, _from, state) do
-      # TODO: procesar eventos — cada evento es {:payment, data}
-      # Imprimir "PaymentConsumer procesó: #{inspect(data)}"
-      Enum.each(events, fn {:payment, data} ->
-        IO.puts("PaymentConsumer procesó: #{inspect(data)}")
-      end)
+      # TODO: process each {:payment, data} event
+      # HINT: log or IO.inspect each payment
       {:noreply, [], state}
     end
   end
@@ -219,11 +148,11 @@ defmodule EventRouter do
     end
 
     def init(producer) do
-      # TODO: suscribirse con partition: :signup
+      # TODO: subscribe with partition: :signup
     end
 
     def handle_events(events, _from, state) do
-      # TODO: imprimir "SignupConsumer procesó: #{inspect(data)}" para cada evento
+      # TODO: process each {:signup, data} event
     end
   end
 
@@ -235,82 +164,30 @@ defmodule EventRouter do
     end
 
     def init(producer) do
-      # TODO: suscribirse con partition: :click
+      # TODO: subscribe with partition: :click
     end
 
     def handle_events(events, _from, state) do
-      # TODO: imprimir "ClickConsumer procesó: #{inspect(data)}" para cada evento
+      # TODO: process each {:click, data} event
     end
   end
-
-  def run do
-    events = [
-      {:payment, %{amount: 100, currency: "USD"}},
-      {:signup, %{email: "alice@example.com"}},
-      {:click, %{button: "buy_now"}},
-      {:payment, %{amount: 50, currency: "EUR"}},
-      {:signup, %{email: "bob@example.com"}},
-      {:click, %{button: "learn_more"}},
-    ]
-
-    {:ok, producer}  = EventProducer.start_link(events)
-    {:ok, _payment}  = PaymentConsumer.start_link(producer)
-    {:ok, _signup}   = SignupConsumer.start_link(producer)
-    {:ok, _click}    = ClickConsumer.start_link(producer)
-
-    # Dar tiempo a que se procesen todos los eventos
-    :timer.sleep(500)
-  end
 end
-
-# Test it:
-# EventRouter.run()
-# Esperado:
-# PaymentConsumer procesó: %{amount: 100, currency: "USD"}
-# SignupConsumer procesó: %{email: "alice@example.com"}
-# ClickConsumer procesó: %{button: "buy_now"}
-# ... (en orden no determinístico entre consumers, pero cada tipo va al correcto)
 ```
 
-**Hints**:
-- `PartitionDispatcher` requiere que la función `:hash` devuelva `{event, partition_key}`, no solo `partition_key`
-- Los consumers deben suscribirse ANTES de que el producer empiece a enviar eventos; usa `sync_subscribe` si necesitas control del orden
-- Si un consumer no está suscrito a la partición correcta, los eventos para esa partición se descartan silenciosamente — verifica en las opciones
-
-**One possible solution** (sparse):
-```elixir
-# En EventProducer.init/1:
-dispatcher: {
-  GenStage.PartitionDispatcher,
-  partitions: [:payment, :signup, :click],
-  hash: fn {type, _data} = event -> {event, type} end
-}
-
-# En SignupConsumer.init/1:
-{:consumer, :ok, subscribe_to: [{producer, partition: :signup, max_demand: 10}]}
-
-# En ClickConsumer.handle_events/3:
-Enum.each(events, fn {:click, data} ->
-  IO.puts("ClickConsumer procesó: #{inspect(data)}")
-end)
-{:noreply, [], state}
-```
-
----
-
-### Exercise 2: ConsumerSupervisor — Cada evento en su propio proceso
-
-Implementa un pipeline donde cada evento se procesa en un proceso `Task` temporal, con concurrencia limitada por `max_demand`.
+### Step 3: `lib/api_gateway/middleware/parallel_processor.ex`
 
 ```elixir
-defmodule ParallelProcessor do
+defmodule ApiGateway.Middleware.ParallelProcessor do
   @moduledoc """
-  ConsumerSupervisor que lanza un Task por cada evento.
-  Útil para trabajo CPU-bound o IO-bound donde queremos
-  paralelismo real pero limitado.
+  ConsumerSupervisor that spawns one Task per event.
+
+  max_demand controls the maximum number of concurrent Task processes.
+  Workers are :temporary — ConsumerSupervisor does not restart them.
+  This is required: restarting a failed worker would re-process the event,
+  violating the exactly-once semantics expected by the fraud scorer.
   """
 
-  defmodule JobProducer do
+  defmodule FraudJobProducer do
     use GenStage
 
     def start_link(jobs) do
@@ -327,9 +204,10 @@ defmodule ParallelProcessor do
     end
   end
 
-  defmodule JobWorker do
-    # Task que procesa un job. Recibe el job en start_link/1.
-    # Debe ser :temporary — si falla, ConsumerSupervisor no lo reinicia.
+  defmodule FraudScoringWorker do
+    # Each worker receives one job in start_link/1 and exits when done.
+    # restart: :temporary is critical — ConsumerSupervisor must NOT retry
+    # failed workers or the pipeline's back-pressure contract breaks.
     use Task, restart: :temporary
 
     def start_link(job) do
@@ -337,13 +215,13 @@ defmodule ParallelProcessor do
     end
 
     def run(job) do
-      # TODO: Simular trabajo con :timer.sleep(job.duration_ms)
-      # Imprimir "Worker #{inspect(self())} procesando job #{job.id}"
-      # Al terminar: "Worker #{inspect(self())} completó job #{job.id}"
+      # TODO: simulate fraud scoring with :timer.sleep(job.duration_ms)
+      # Log: "Scoring job #{job.id} (#{job.duration_ms}ms)"
+      # Log completion: "Job #{job.id} scored"
     end
   end
 
-  defmodule JobSupervisor do
+  defmodule FraudSupervisor do
     use ConsumerSupervisor
 
     def start_link(opts) do
@@ -352,84 +230,43 @@ defmodule ParallelProcessor do
 
     def init(_opts) do
       children = [
-        # TODO: Spec para JobWorker — debe ser :temporary
-        # El spec debe referenciar JobWorker.start_link/1
+        # TODO: child spec for FraudScoringWorker with restart: :temporary
+        # HINT: %{id: FraudScoringWorker, start: {FraudScoringWorker, :start_link, []}, restart: :temporary}
       ]
 
       opts = [
         strategy: :one_for_one,
-        # TODO: suscribirse a JobProducer con max_demand: 5
-        # max_demand: 5 significa máximo 5 jobs simultáneos
+        # TODO: subscribe_to with max_demand: 5
+        # max_demand: 5 means at most 5 concurrent fraud-scoring Tasks
         subscribe_to: [
-          # TODO: completar
+          # TODO: {FraudJobProducer, max_demand: 5}
         ]
       ]
 
       ConsumerSupervisor.init(children, opts)
     end
   end
-
-  def run do
-    jobs = Enum.map(1..20, fn i ->
-      %{id: i, duration_ms: :rand.uniform(200) + 50}
-    end)
-
-    {:ok, _producer}    = JobProducer.start_link(jobs)
-    {:ok, _supervisor}  = JobSupervisor.start_link([])
-
-    # Esperar a que todos los jobs terminen
-    :timer.sleep(3_000)
-    IO.puts("Todos los jobs completados")
-  end
 end
-
-# Test it:
-# ParallelProcessor.run()
-# Esperado: ver workers procesando en paralelo (máx 5 simultáneos)
-# Los PID de los workers son distintos — cada job tiene su propio proceso
 ```
 
-**Hints**:
-- `ConsumerSupervisor.init/2` recibe la lista de child specs y opciones de supervisión + suscripción juntas
-- El child spec para un `Task` con `restart: :temporary` debe tener `restart: :temporary` explícito para que ConsumerSupervisor no reinicie workers fallidos (eso rompería el flow de back-pressure)
-- `max_demand: 5` en `subscribe_to` controla directamente cuántos procesos simultáneos habrá — es el parámetro de concurrencia
-
-**One possible solution** (sparse):
-```elixir
-# En JobWorker.run/1:
-def run(job) do
-  IO.puts("Worker #{inspect(self())} procesando job #{job.id}")
-  :timer.sleep(job.duration_ms)
-  IO.puts("Worker #{inspect(self())} completó job #{job.id}")
-end
-
-# En JobSupervisor.init/1:
-children = [
-  %{id: JobWorker, start: {JobWorker, :start_link, []}, restart: :temporary}
-]
-opts = [
-  strategy: :one_for_one,
-  subscribe_to: [{JobProducer, max_demand: 5}]
-]
-ConsumerSupervisor.init(children, opts)
-```
-
----
-
-### Exercise 3: Demand Buffering — Producer que satisface demand de forma asíncrona
-
-Implementa un producer que recibe datos de una fuente externa lenta (simulada con `send/2` asíncrono). Debe almacenar la demand pendiente y satisfacerla cuando los datos lleguen.
+### Step 4: `lib/api_gateway/middleware/async_producer.ex`
 
 ```elixir
-defmodule AsyncProducer do
+defmodule ApiGateway.Middleware.AsyncProducer do
   @moduledoc """
-  Producer que no tiene datos inmediatamente cuando se le pide.
-  Almacena la demand pendiente y emite cuando los datos llegan
-  via handle_info.
+  Producer that satisfies demand asynchronously.
 
-  Estado: {buffer, pending_demand}
-  - buffer: eventos ya disponibles pero no pedidos aún
-  - pending_demand: demand recibida pero no satisfecha aún
+  The webhook receiver delivers events via push (handle_info). Consumers
+  demand events before they arrive. The producer must buffer the demand
+  and satisfy it when the webhook data arrives.
+
+  Invariant: pending_demand * buffer_size == 0.
+  Either you have unsatisfied demand (buffer is empty) OR you have buffered
+  events (demand was already satisfied). Both simultaneously is a bug.
+
+  State: {buffer, pending_demand}
+    buffer:         events available but not yet demanded
+    pending_demand: demand received but not yet satisfied
   """
   use GenStage
 
@@ -437,178 +274,161 @@ defmodule AsyncProducer do
     GenStage.start_link(__MODULE__, {[], 0}, name: __MODULE__)
   end
 
-  # API pública: inyectar datos desde fuera (simula fuente externa)
+  @doc "Inject events from the webhook receiver (simulates external push)."
   def push(items) when is_list(items) do
     send(__MODULE__, {:new_data, items})
   end
 
+  @impl true
   def init(state) do
     {:producer, state}
   end
 
+  @impl true
   def handle_demand(demand, {buffer, pending_demand}) do
-    # TODO: Calcular total demand acumulada
-    # TODO: Tomar del buffer lo que se pueda emitir ahora
-    # TODO: Guardar demand no satisfecha en el estado
-    # Si hay eventos en buffer para emitir → {:noreply, events, nuevo_estado}
-    # Si no hay eventos → {:noreply, [], {buffer, total_demand}}
-    total_demand = demand + pending_demand
-    {to_emit, remaining_buffer} = Enum.split(buffer, total_demand)
-    remaining_demand = total_demand - length(to_emit)
-    {:noreply, to_emit, {remaining_buffer, remaining_demand}}
+    # TODO: accumulate total demand, emit what is available in the buffer
+    # total_demand = demand + pending_demand
+    # {to_emit, remaining_buffer} = Enum.split(buffer, total_demand)
+    # remaining_demand = total_demand - length(to_emit)
+    # {:noreply, to_emit, {remaining_buffer, remaining_demand}}
   end
 
+  @impl true
   def handle_info({:new_data, items}, {buffer, pending_demand}) do
-    # TODO: Añadir items al buffer
-    # TODO: Emitir lo que se pueda satisfacer con pending_demand
-    # TODO: Actualizar buffer y pending_demand en el estado
+    # TODO: add items to the buffer, then emit as much as pending_demand allows
+    # new_buffer = buffer ++ items
+    # {to_emit, remaining_buffer} = Enum.split(new_buffer, pending_demand)
+    # remaining_demand = pending_demand - length(to_emit)
+    # {:noreply, to_emit, {remaining_buffer, remaining_demand}}
   end
 
+  @impl true
   def handle_info(_msg, state), do: {:noreply, [], state}
 end
+```
 
-defmodule SlowConsumer do
-  use GenStage
+### Step 5: Given tests — must pass without modification
 
-  def start_link(producer) do
-    GenStage.start_link(__MODULE__, producer, name: __MODULE__)
+```elixir
+# test/api_gateway/middleware/event_pipeline_test.exs
+defmodule ApiGateway.Middleware.EventPipelineTest do
+  use ExUnit.Case, async: false
+
+  alias ApiGateway.Middleware.AsyncProducer
+
+  describe "AsyncProducer demand buffering" do
+    setup do
+      {:ok, _} = AsyncProducer.start_link()
+
+      consumer_pid = start_consumer(AsyncProducer)
+      {:ok, consumer: consumer_pid}
+    end
+
+    test "all pushed events are eventually received", %{consumer: consumer} do
+      Process.sleep(50)  # let consumer demand accumulate
+
+      AsyncProducer.push([1, 2, 3])
+      Process.sleep(50)
+      AsyncProducer.push([4, 5])
+      Process.sleep(100)
+
+      received = InlineConsumer.received(consumer)
+      assert Enum.sort(received) == [1, 2, 3, 4, 5]
+    end
+
+    test "buffer never holds items when demand is pending", %{consumer: _} do
+      # After consumer subscribes, it immediately demands items.
+      # The buffer should be empty — demand is pending.
+      Process.sleep(20)
+      {buffer, pending} = :sys.get_state(AsyncProducer)
+      # Invariant: either buffer is empty OR pending is 0, never both non-zero
+      assert buffer == [] or pending == 0
+    end
   end
 
-  def init(producer) do
-    {:consumer, %{received: 0},
-     subscribe_to: [{producer, min_demand: 0, max_demand: 5}]}
-  end
+  defp start_consumer(producer) do
+    # Inline consumer module — collects received events in state for inspection.
+    defmodule InlineConsumer do
+      use GenStage
 
-  def handle_events(events, _from, %{received: count} = state) do
-    Enum.each(events, fn event ->
-      IO.puts("Consumer recibió: #{inspect(event)}")
-    end)
-    {:noreply, [], %{state | received: count + length(events)}}
+      def start_link(producer) do
+        GenStage.start_link(__MODULE__, producer)
+      end
+
+      def received(pid), do: GenStage.call(pid, :received)
+
+      def init(producer) do
+        {:consumer, [], subscribe_to: [{producer, min_demand: 0, max_demand: 5}]}
+      end
+
+      def handle_events(events, _from, received) do
+        {:noreply, [], received ++ events}
+      end
+
+      def handle_call(:received, _from, received) do
+        {:reply, received, received}
+      end
+    end
+
+    {:ok, pid} = InlineConsumer.start_link(producer)
+    pid
   end
 end
-
-defmodule DemandBufferingDemo do
-  def run do
-    {:ok, producer} = AsyncProducer.start_link()
-    {:ok, _consumer} = SlowConsumer.start_link(producer)
-
-    # El consumer pedirá datos inmediatamente.
-    # El producer no tiene nada todavía — acumula la demand.
-    :timer.sleep(100)
-    IO.puts("--- Inyectando primera tanda de datos ---")
-    AsyncProducer.push([1, 2, 3])
-
-    :timer.sleep(200)
-    IO.puts("--- Inyectando segunda tanda ---")
-    AsyncProducer.push([4, 5, 6, 7, 8])
-
-    :timer.sleep(200)
-    IO.puts("--- Inyectando más datos ---")
-    AsyncProducer.push(Enum.to_list(9..15))
-
-    :timer.sleep(500)
-  end
-end
-
-# Test it:
-# DemandBufferingDemo.run()
-# Esperado: el consumer recibe todos los items en el orden correcto,
-# aunque llegaron en tandas distintas y con demand pendiente acumulada.
 ```
 
-**Hints**:
-- El invariante clave: `pending_demand * buffer_size == 0`. O tienes demand pendiente (buffer vacío) o tienes buffer (demand ya satisfecha). Nunca ambos.
-- En `handle_info({:new_data, items}, ...)`: el nuevo buffer es `buffer ++ items`. Luego `Enum.split(new_buffer, pending_demand)` decide qué emitir.
-- `min_demand: 0` en el consumer es importante para evitar que el sistema pida datos antes de que los haya; en producción ajusta según tu caso.
+### Step 6: Run the tests
 
-**One possible solution** (sparse):
-```elixir
-def handle_info({:new_data, items}, {buffer, pending_demand}) do
-  new_buffer = buffer ++ items
-  {to_emit, remaining_buffer} = Enum.split(new_buffer, pending_demand)
-  remaining_demand = pending_demand - length(to_emit)
-  {:noreply, to_emit, {remaining_buffer, remaining_demand}}
-end
-```
-
-## Common Mistakes
-
-### Mistake 1: Función hash de PartitionDispatcher con signature incorrecta
-```elixir
-# ❌ Devolver solo la partición — PartitionDispatcher necesita el evento también
-hash: fn {type, _} -> type end
-
-# ✓ Devolver {event, partition_key}
-hash: fn {type, _data} = event -> {event, type} end
-```
-
-### Mistake 2: ConsumerSupervisor con restart: :permanent en workers
-```elixir
-# ❌ Si el worker falla, ConsumerSupervisor intenta reiniciarlo,
-# pero no tiene el evento — el pipeline se rompe
-%{id: MyWorker, start: {MyWorker, :start_link, []}}  # restart: :permanent por defecto
-
-# ✓ Siempre :temporary en ConsumerSupervisor workers
-%{id: MyWorker, start: {MyWorker, :start_link, []}, restart: :temporary}
-```
-
-### Mistake 3: Invariante de demand buffering violado
-```elixir
-# ❌ Acumular tanto buffer como demand pendiente
-# Esto es imposible en un producer correcto —
-# si tienes demand, deberías emitir desde el buffer inmediatamente
-
-# ✓ Al recibir demand: emite del buffer si lo hay, o acumula demand
-# Al recibir datos: emite para satisfacer demand si la hay, o acumula en buffer
-```
-
-### Mistake 4: No usar sync_subscribe cuando el orden importa
-```elixir
-# ❌ Con start_link asíncrono, el consumer puede no estar listo cuando el producer emite
-{:ok, producer} = MyProducer.start_link(events)
-{:ok, consumer} = MyConsumer.start_link([])  # puede perderse los primeros eventos
-
-# ✓ Para garantizar que el consumer está suscrito antes de que fluyan datos:
-GenStage.sync_subscribe(consumer, to: producer)
-```
-
-## Verification
 ```bash
-# En IEx:
-iex> c("34-genstage-advanced.exs")
-
-# Exercise 1
-iex> EventRouter.run()
-# Cada consumer solo debe imprimir SUS eventos
-
-# Exercise 2
-iex> ParallelProcessor.run()
-# Máximo 5 workers simultáneos visible en los timestamps
-
-# Exercise 3
-iex> DemandBufferingDemo.run()
-# Todos los números del 1 al 15 recibidos en orden
+mix test test/api_gateway/middleware/event_pipeline_test.exs --trace
 ```
 
-Checklist de verificación:
-- [ ] PartitionDispatcher enruta eventos al consumer correcto (ningún consumer recibe eventos de otro tipo)
-- [ ] ConsumerSupervisor lanza procesos temporales — cada evento tiene su propio PID
-- [ ] La concurrencia en Exercise 2 no supera `max_demand`
-- [ ] El demand buffer nunca tiene simultáneamente pending_demand > 0 y buffer no vacío
-- [ ] Todos los eventos son procesados, ninguno se pierde
+---
 
-## Summary
-- `PartitionDispatcher` garantiza que eventos del mismo "tipo" van siempre al mismo consumer, habilitando ordering por partición
-- `BroadcastDispatcher` es fanout — todos los consumers reciben todos los eventos
-- `ConsumerSupervisor` es el patrón correcto para paralelizar trabajo por evento; `max_demand` es el throttle de concurrencia
-- Demand buffering es el challenge core de producers asíncronos: mantener el invariante `pending * buffer == 0`
-- En producción, GenStage pipelines se orquestan con Broadway para añadir batching, acking y observabilidad
+## Trade-off analysis
 
-## What's Next
-**35-broadway-data-pipelines**: Broadway es la capa de producción sobre GenStage. Añade batching, acknowledgment, rate limiting y soporte nativo para Kafka, SQS, RabbitMQ.
+| Aspect | `PartitionDispatcher` | `BroadcastDispatcher` | `DemandDispatcher` |
+|--------|----------------------|----------------------|-------------------|
+| Routing | One consumer per key | All consumers | Round-robin |
+| Use case | Sharding, type-based routing | Fan-out, cache invalidation | Load balancing |
+| Ordering | Within partition | Per consumer | None |
+| Consumer subscription | `partition: key` option | Any | Any |
+
+| Aspect | `ConsumerSupervisor` | Manual `Task.async_stream` |
+|--------|---------------------|--------------------------|
+| Back-pressure | Automatic via `max_demand` | Manual — you control concurrency |
+| Failure isolation | Per-event process | Per-task |
+| Worker restart | Never (`:temporary`) | Not applicable |
+| Best for | Unbounded event streams | Finite collections |
+
+Reflection: why is `restart: :temporary` required on `ConsumerSupervisor` workers?
+What would happen if a worker was `:permanent` and crashed?
+
+---
+
+## Common production mistakes
+
+**1. `PartitionDispatcher` hash function returning only the key**
+The hash function must return `{event, partition_key}`, not just the key. Returning
+only the key silently drops the event — the dispatcher has no event to route.
+
+**2. `ConsumerSupervisor` workers with `restart: :permanent`**
+If a worker crashes and is restarted with the original event as its argument, the event
+is processed twice. The `ConsumerSupervisor` contract assumes `:temporary` workers.
+
+**3. Violating the demand-buffer invariant**
+If `pending_demand > 0` and `buffer` is non-empty simultaneously, events are being
+held back unnecessarily. Always emit from the buffer whenever pending demand exists.
+
+**4. Not using `sync_subscribe` when startup order matters**
+If the producer starts emitting before consumers have subscribed, the first events are
+dropped. Use `GenStage.sync_subscribe/3` to ensure the consumer is subscribed before
+the producer processes its first `handle_demand`.
+
+---
 
 ## Resources
-- [GenStage Dispatchers — HexDocs](https://hexdocs.pm/gen_stage/GenStage.html#module-dispatchers)
+
+- [GenStage dispatchers — HexDocs](https://hexdocs.pm/gen_stage/GenStage.html#module-dispatchers)
 - [ConsumerSupervisor — HexDocs](https://hexdocs.pm/gen_stage/ConsumerSupervisor.html)
-- [GenStage in Practice — José Valim](https://elixir-lang.org/blog/2016/07/14/announcing-genstage/)
-- [Demand-driven back-pressure with GenStage](https://www.erlang-solutions.com/blog/gen-stage-behind-the-scenes/)
+- [Announcing GenStage — José Valim](https://elixir-lang.org/blog/2016/07/14/announcing-genstage/)
+- [GenStage and Flow — ElixirConf 2016](https://www.youtube.com/watch?v=XPlXNUXmio8)

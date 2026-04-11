@@ -1,426 +1,510 @@
-# 45 — Build an API Client Wrapper (Capstone)
+# Resilient HTTP Client with Circuit Breaker and Telemetry
 
-**Difficulty**: Avanzado  
-**Tiempo estimado**: 5-7 horas  
-**Área**: HTTP · Circuit Breaker · Telemetry · Finch · Concurrencia
+**Project**: `api_gateway` — built incrementally across the advanced level
 
 ---
 
-## Contexto
+## Project context
 
-Un cliente HTTP de producción es mucho más que `HTTPoison.get/1`. Necesita reintentos inteligentes,
-un circuit breaker que evite cascadas de fallos, observabilidad via telemetry, connection pooling
-eficiente y rate limiting para respetar los límites de las APIs externas. Este capstone integra
-todos estos patrones en un cliente cohesivo y configurable.
+You're building `api_gateway`, an internal HTTP gateway. The scheduler is in place (previous
+exercise). The gateway proxies requests to multiple upstream services. When an upstream is
+degraded, the gateway must not let that failure cascade — a slow payments service should
+not make the entire gateway unresponsive. You need a resilient HTTP client layer.
+
+Project structure at this point:
+
+```
+api_gateway/
+├── lib/
+│   └── api_gateway/
+│       ├── application.ex              # already exists — starts Finch and ETS tables
+│       └── http_client/
+│           ├── client.ex               # ← you implement this (facade)
+│           ├── circuit_breaker.ex      # ← and this
+│           ├── retry.ex                # ← and this
+│           └── telemetry_handler.ex    # ← and this
+├── test/
+│   └── api_gateway/
+│       └── http_client/
+│           ├── client_test.exs         # given tests — Bypass-based
+│           ├── circuit_breaker_test.exs
+│           └── retry_test.exs
+└── mix.exs
+```
 
 ---
 
-## Arquitectura propuesta
+## The business problem
+
+The payments service has an SLA of 99.9% uptime, but occasionally it becomes slow (>5s
+responses) rather than outright down. A slow upstream means all gateway requests pile up in
+connection pools, exhausting file descriptors across the node. You need:
+
+1. A circuit breaker that opens after N consecutive failures and stops sending requests
+   to a degraded upstream
+2. Retry logic that retries on transient errors but respects `Retry-After` headers
+3. Telemetry events on every request so the ops team can build dashboards
+
+---
+
+## Why circuit breaker and not just retries
+
+Retries alone amplify load on a struggling service: if it is responding in 5s and you retry
+3 times, each incoming request becomes 15s of upstream load. A circuit breaker opens after
+the first wave of failures and rejects subsequent requests immediately — allowing the upstream
+to recover without continued pressure.
+
+The three states:
 
 ```
-┌────────────────────────────────────────────────────────────┐
-│                   MyClient (facade)                        │
-│   get/3  post/3  put/3  delete/2                           │
-└────────────────┬───────────────────────────────────────────┘
-                 │
-┌────────────────▼───────────────────────────────────────────┐
-│              RequestPipeline                               │
-│                                                            │
-│  1. RateLimiter.check(host)      — token bucket           │
-│  2. CircuitBreaker.call(host, fn) — open/closed/half-open │
-│  3. RetryWrapper.with_retry(fn)  — backoff on failure     │
-│  4. Finch.request(...)           — HTTP real              │
-│  5. Telemetry.emit(...)          — métricas               │
-└────────────────────────────────────────────────────────────┘
-         │             │              │
-┌────────▼──┐  ┌───────▼──┐  ┌───────▼──────────┐
-│ Finch     │  │ Circuit   │  │ RateLimiter      │
-│ Pool      │  │ Breaker   │  │ (token bucket)   │
-│ (per host)│  │ (ETS)    │  │ (ETS + timer)    │
-└───────────┘  └──────────┘  └──────────────────┘
+CLOSED ──(N failures)──▶ OPEN ──(recovery_timeout)──▶ HALF_OPEN
+  ▲                                                         │
+  └────────────(M consecutive successes)───────────────────┘
 ```
 
-### Configuración del cliente
+In `HALF_OPEN`, only a limited number of probe requests are allowed through. If they succeed,
+the circuit closes; if they fail, it opens again with a fresh timeout.
+
+---
+
+## Why ETS for circuit breaker state
+
+A GenServer holding circuit state serializes all access — every request must acquire the
+lock to read the state. For a high-traffic gateway, this becomes the bottleneck.
+
+ETS with `:set, :public, read_concurrency: true` allows concurrent reads without any
+process overhead. Only state transitions (closed→open, open→half_open) require coordinated
+writes.
+
+---
+
+## Implementation
+
+### Step 1: `mix.exs` — add dependencies
 
 ```elixir
-# config/config.exs
-config :my_client,
-  pools: [
-    default: [size: 10, count: 1],
-    "api.stripe.com": [size: 25, count: 2]
-  ],
-  circuit_breaker: [
-    failure_threshold: 5,    # abre después de 5 fallos
-    recovery_timeout_ms: 30_000,
-    half_open_max_calls: 3
-  ],
-  retry: [
-    max_retries: 3,
-    base_delay_ms: 100,
-    max_delay_ms: 5_000,
-    retryable_statuses: [429, 500, 502, 503, 504]
-  ],
-  rate_limit: [
-    default: {100, :per_second},   # 100 req/s global
-    "api.stripe.com": {25, :per_second}
+defp deps do
+  [
+    {:finch, "~> 0.18"},
+    {:jason, "~> 1.4"},
+    {:bypass, "~> 2.1", only: :test},
+    {:telemetry, "~> 1.2"},
+    {:benchee, "~> 1.3", only: :dev}
   ]
-```
-
----
-
-## Ejercicio 1 — HTTP client base con Finch
-
-Implementa el cliente HTTP sobre Finch con opciones configurables.
-
-### Interfaz pública
-
-```elixir
-MyClient.get("https://api.example.com/users/1")
-# => {:ok, %{status: 200, body: %{"id" => 1, "name" => "Alice"}, headers: [...]}}
-
-MyClient.get("https://api.example.com/users/1",
-  headers: [{"Authorization", "Bearer token"}],
-  timeout_ms: 5_000,
-  decode_json: true   # default true si Content-Type es application/json
-)
-
-MyClient.post("https://api.example.com/users",
-  %{name: "Bob", email: "bob@example.com"},
-  headers: [{"Authorization", "Bearer token"}]
-)
-# => {:ok, %{status: 201, body: %{...}}}
-
-MyClient.delete("https://api.example.com/users/1")
-# => {:ok, %{status: 204, body: nil}}
-```
-
-### Implementación base
-
-```elixir
-defmodule MyClient do
-  @moduledoc "HTTP client con retry, circuit breaker y telemetry"
-
-  def get(url, opts \\ []),           do: request(:get, url, nil, opts)
-  def post(url, body, opts \\ []),    do: request(:post, url, body, opts)
-  def put(url, body, opts \\ []),     do: request(:put, url, body, opts)
-  def delete(url, opts \\ []),        do: request(:delete, url, nil, opts)
-
-  defp request(method, url, body, opts) do
-    uri = URI.parse(url)
-    host = uri.host
-
-    start_time = System.monotonic_time()
-
-    result =
-      with :ok <- MyClient.RateLimiter.check(host),
-           {:ok, response} <- MyClient.CircuitBreaker.call(host, fn ->
-             MyClient.RetryWrapper.with_retry(fn ->
-               do_http_request(method, url, body, opts)
-             end, opts)
-           end) do
-        {:ok, response}
-      end
-
-    duration = System.monotonic_time() - start_time
-    emit_telemetry(method, host, result, duration)
-
-    result
-  end
 end
 ```
 
-### Requisitos
-
-- Finch pool por host (pre-configurado o creado dinámicamente en primer uso)
-- Decodificación JSON automática basada en `Content-Type: application/json`
-- Timeout configurable por request (default 30s)
-- Serialización automática del body a JSON si es un Map
-- Tests con Bypass: simular respuestas HTTP sin servidor real
-
----
-
-## Ejercicio 2 — Retry con backoff y retryable conditions
-
-Implementa retry inteligente que distingue errores recuperables de no recuperables.
-
-### Condiciones de retry
+### Step 2: `lib/api_gateway/http_client/circuit_breaker.ex`
 
 ```elixir
-# Reintentar:
-# - Timeout de conexión
-# - HTTP 429 (Too Many Requests) — respetar Retry-After header
-# - HTTP 500, 502, 503, 504
-# - Errores de red (connection refused, DNS failure)
+defmodule ApiGateway.HttpClient.CircuitBreaker do
+  @moduledoc """
+  ETS-based circuit breaker. State is stored per host, read lock-free.
 
-# NO reintentar:
-# - HTTP 400 (Bad Request)
-# - HTTP 401, 403 (Auth errors)
-# - HTTP 404 (Not Found)
-# - HTTP 422 (Unprocessable Entity)
-```
+  State stored per host: {host, state, metadata}
+  where state is :closed | :open | :half_open
+  and metadata is the opened_at timestamp (for :open) or failure count (for :closed).
+  """
 
-### Implementación del wrapper
+  @table :circuit_breaker
 
-```elixir
-defmodule MyClient.RetryWrapper do
-  def with_retry(fun, opts \\ []) do
-    max_retries = Keyword.get(opts, :max_retries, 3)
-    do_retry(fun, 0, max_retries)
-  end
-
-  defp do_retry(fun, attempt, max) when attempt >= max do
-    fun.()  # último intento sin capturar
-  end
-
-  defp do_retry(fun, attempt, max) do
-    case fun.() do
-      {:ok, %{status: status}} = result when status in [200, 201, 204] ->
-        result
-      {:ok, %{status: 429, headers: headers}} ->
-        delay = extract_retry_after(headers) || backoff(attempt)
-        Process.sleep(delay)
-        do_retry(fun, attempt + 1, max)
-      {:ok, %{status: status}} when status in [500, 502, 503, 504] ->
-        Process.sleep(backoff(attempt))
-        do_retry(fun, attempt + 1, max)
-      {:error, _} = err when attempt < max ->
-        Process.sleep(backoff(attempt))
-        do_retry(fun, attempt + 1, max)
-      result ->
-        result
-    end
-  end
-
-  defp backoff(attempt), do: min(100 * :math.pow(2, attempt) |> round(), 5_000)
-
-  defp extract_retry_after(headers) do
-    case List.keyfind(headers, "retry-after", 0) do
-      {_, seconds} -> String.to_integer(seconds) * 1_000
-      nil          -> nil
-    end
-  end
-end
-```
-
-### Requisitos
-
-- `Retry-After` header tiene prioridad sobre backoff calculado
-- Jitter en el backoff para evitar thundering herd
-- El número máximo de reintentos es configurable por request y globalmente
-- Tests con Bypass: simular 2 fallos 503 seguidos de 200, verificar 3 intentos totales
-- Tests: 429 con Retry-After, no-retry en 400/401/404
-
----
-
-## Ejercicio 3 — Circuit Breaker
-
-Implementa el patrón circuit breaker para proteger el sistema de fallos en cascada.
-
-### Estados del circuit breaker
-
-```
-CLOSED (normal)
-  ↓ failure_count >= threshold
-OPEN (rechaza requests)
-  ↓ después de recovery_timeout
-HALF_OPEN (prueba si el servicio recuperó)
-  ↓ N llamadas exitosas consecutivas
-CLOSED (recuperado)
-```
-
-### Implementación con ETS
-
-```elixir
-defmodule MyClient.CircuitBreaker do
-  @table :circuit_breaker_state
+  # Default thresholds — override via Application config
+  @failure_threshold  5
+  @recovery_timeout_ms 30_000
+  @half_open_max_calls 3
 
   def init do
     :ets.new(@table, [:set, :public, :named_table, read_concurrency: true])
   end
 
+  @doc """
+  Executes `fun` through the circuit breaker for `host`.
+
+  Returns the result of `fun.()` if the circuit is closed or half-open.
+  Returns `{:error, :circuit_open}` if the circuit is open and not yet ready to probe.
+  """
+  @spec call(String.t(), (-> {:ok, term()} | {:error, term()})) ::
+          {:ok, term()} | {:error, term()}
   def call(host, fun) do
     case get_state(host) do
-      :closed    -> execute_and_track(host, fun)
-      :open      -> check_if_ready_to_probe(host, fun)
+      :closed    -> execute_closed(host, fun)
+      :open      -> {:error, :circuit_open}
       :half_open -> execute_half_open(host, fun)
     end
   end
 
+  @doc "Returns :closed, :half_open, or {:open, remaining_ms}."
+  @spec status(String.t()) :: :closed | :half_open | {:open, pos_integer()}
+  def status(host) do
+    # TODO: implement — read from ETS, return state with remaining time if open
+  end
+
+  # ---------------------------------------------------------------------------
+  # Private
+  # ---------------------------------------------------------------------------
+
   defp get_state(host) do
+    now = System.monotonic_time(:millisecond)
     case :ets.lookup(@table, host) do
       [{^host, :open, opened_at}] ->
-        now = System.monotonic_time(:millisecond)
-        if now - opened_at >= recovery_timeout_ms() do
-          :half_open
-        else
-          :open
-        end
-      [{^host, state, _}] -> state
-      [] -> :closed
+        if now - opened_at >= @recovery_timeout_ms, do: :half_open, else: :open
+      [{^host, state, _}] ->
+        state
+      [] ->
+        :closed
     end
   end
 
-  defp execute_and_track(host, fun) do
+  defp execute_closed(host, fun) do
     case fun.() do
       {:ok, _} = result ->
-        reset_failure_count(host)
+        reset_failures(host)
         result
       {:error, _} = err ->
-        increment_failure_count(host)
-        maybe_open_circuit(host)
+        failures = increment_failures(host)
+        if failures >= @failure_threshold, do: open_circuit(host)
         err
     end
   end
-end
-```
 
-### Requisitos
-
-- Estado en ETS (`[:set, :public, :named_table]`) para acceso concurrente sin GenServer
-- `HALF_OPEN`: permite pasar `half_open_max_calls` para probar recuperación
-- Si en `HALF_OPEN` falla → vuelve a `OPEN` con timestamp renovado
-- `CircuitBreaker.status(host)` retorna `{:open, remaining_ms}` o `:closed` o `:half_open`
-- Tests: secuencia failure_threshold fallos → estado open → timeout → half_open → éxito → closed
-
----
-
-## Ejercicio 4 — Rate Limiting y Telemetry
-
-Token bucket rate limiter y eventos telemetry para observabilidad.
-
-### Rate Limiter (token bucket)
-
-```elixir
-defmodule MyClient.RateLimiter do
-  # Token bucket por host
-  # Configuración: {max_tokens, refill_rate, refill_interval_ms}
-
-  def check(host) do
-    case consume_token(host) do
-      :ok              -> :ok
-      {:error, :empty} -> {:error, :rate_limited}
-    end
+  defp execute_half_open(host, fun) do
+    # TODO:
+    # 1. Increment probe count for this host
+    # 2. Execute fun.()
+    # 3. On success: if probe_count >= @half_open_max_calls, close circuit; else keep half_open
+    # 4. On failure: re-open circuit with fresh timestamp
+    # HINT: store probe count in ETS alongside state
   end
 
-  defp consume_token(host) do
-    # ETS atomic operations para thread safety
-    rate = get_rate(host)
-    now  = System.monotonic_time(:millisecond)
+  defp open_circuit(host) do
+    :ets.insert(@table, {host, :open, System.monotonic_time(:millisecond)})
+    :telemetry.execute(
+      [:api_gateway, :circuit_breaker, :state_change],
+      %{},
+      %{host: host, from: :closed, to: :open}
+    )
+  end
 
-    case :ets.lookup(:rate_limiter, host) do
-      [{^host, tokens, last_refill}] ->
-        refilled = calculate_refill(tokens, last_refill, now, rate)
-        if refilled >= 1 do
-          :ets.insert(:rate_limiter, {host, refilled - 1, now})
-          :ok
-        else
-          {:error, :empty}
-        end
-      [] ->
-        :ets.insert(:rate_limiter, {host, rate.max_tokens - 1, now})
-        :ok
-    end
+  defp reset_failures(host) do
+    :ets.delete(@table, host)
+  end
+
+  defp increment_failures(host) do
+    # TODO: :ets.update_counter/4 with default value — atomic increment
+    # HINT: :ets.update_counter(@table, host, {3, 1}, {host, :closed, 0})
   end
 end
 ```
 
-### Telemetry events
+### Step 3: `lib/api_gateway/http_client/retry.ex`
 
 ```elixir
-# Emitido en cada request completado:
-:telemetry.execute(
-  [:my_client, :request, :stop],
-  %{duration: duration_ns, status: status_code},
-  %{method: method, host: host, url: url, retry_count: retries}
-)
+defmodule ApiGateway.HttpClient.Retry do
+  @moduledoc """
+  Retry wrapper with exponential backoff.
 
-# Emitido cuando el circuit breaker cambia de estado:
-:telemetry.execute(
-  [:my_client, :circuit_breaker, :state_change],
-  %{},
-  %{host: host, from: :closed, to: :open}
-)
+  Retryable conditions:
+    - HTTP 429, 500, 502, 503, 504
+    - {:error, _} (network errors)
 
-# Emitido cuando rate limited:
-:telemetry.execute(
-  [:my_client, :rate_limiter, :throttled],
-  %{},
-  %{host: host}
-)
+  Non-retryable:
+    - HTTP 400, 401, 403, 404, 422 (client errors)
+    - HTTP 200, 201, 204 (success)
+  """
+
+  @retryable_statuses [429, 500, 502, 503, 504]
+
+  @doc """
+  Executes `fun` with up to `max_retries` retries on transient failures.
+  Respects `Retry-After` response headers.
+  """
+  @spec with_retry((-> {:ok, map()} | {:error, term()}), keyword()) ::
+          {:ok, map()} | {:error, term()}
+  def with_retry(fun, opts \\ []) do
+    max = Keyword.get(opts, :max_retries, 3)
+    do_retry(fun, 0, max)
+  end
+
+  defp do_retry(fun, attempt, max) do
+    case fun.() do
+      {:ok, %{status: status}} = result when status not in @retryable_statuses ->
+        result
+
+      {:ok, %{status: 429, headers: headers}} when attempt < max ->
+        delay = extract_retry_after(headers) || backoff(attempt)
+        Process.sleep(delay)
+        do_retry(fun, attempt + 1, max)
+
+      {:ok, %{status: status}} when status in @retryable_statuses and attempt < max ->
+        Process.sleep(backoff(attempt))
+        do_retry(fun, attempt + 1, max)
+
+      {:error, _} when attempt < max ->
+        Process.sleep(backoff(attempt))
+        do_retry(fun, attempt + 1, max)
+
+      other ->
+        other
+    end
+  end
+
+  defp backoff(attempt) do
+    # TODO: 100ms * 2^attempt, capped at 5_000ms, with jitter
+    # HINT: min(round(100 * :math.pow(2, attempt)), 5_000) + :rand.uniform(50)
+  end
+
+  defp extract_retry_after(headers) do
+    # TODO: find "retry-after" header (case-insensitive), parse as seconds -> ms
+    # HINT: List.keyfind/3 with lowercase header name
+  end
+end
 ```
 
-### Handler de telemetry para logging
+### Step 4: `lib/api_gateway/http_client/client.ex`
 
 ```elixir
-defmodule MyClient.TelemetryHandler do
+defmodule ApiGateway.HttpClient.Client do
+  @moduledoc """
+  Resilient HTTP client facade.
+
+  Pipeline per request:
+    1. CircuitBreaker.call(host, fn ->
+         Retry.with_retry(fn ->
+           Finch HTTP request
+         end)
+       end)
+    2. Emit telemetry
+  """
+
+  alias ApiGateway.HttpClient.{CircuitBreaker, Retry}
+
+  def get(url, opts \\ []),          do: request(:get, url, nil, opts)
+  def post(url, body, opts \\ []),   do: request(:post, url, body, opts)
+  def put(url, body, opts \\ []),    do: request(:put, url, body, opts)
+  def delete(url, opts \\ []),       do: request(:delete, url, nil, opts)
+
+  defp request(method, url, body, opts) do
+    uri       = URI.parse(url)
+    host      = uri.host
+    start     = System.monotonic_time()
+
+    result = CircuitBreaker.call(host, fn ->
+      Retry.with_retry(fn ->
+        do_request(method, url, body, opts)
+      end, opts)
+    end)
+
+    duration = System.monotonic_time() - start
+    emit_telemetry(method, host, url, result, duration)
+
+    result
+  end
+
+  defp do_request(method, url, body, opts) do
+    timeout_ms = Keyword.get(opts, :timeout_ms, 30_000)
+    headers    = build_headers(body, Keyword.get(opts, :headers, []))
+    encoded    = encode_body(body)
+
+    req = Finch.build(method, url, headers, encoded)
+
+    case Finch.request(req, ApiGateway.Finch, receive_timeout: timeout_ms) do
+      {:ok, %Finch.Response{status: status, headers: resp_headers, body: resp_body}} ->
+        # TODO: decode JSON body if Content-Type is application/json
+        {:ok, %{status: status, headers: resp_headers, body: resp_body}}
+      {:error, _} = err ->
+        err
+    end
+  end
+
+  defp build_headers(nil, headers), do: headers
+  defp build_headers(body, headers) when is_map(body) do
+    [{"content-type", "application/json"} | headers]
+  end
+  defp build_headers(_, headers), do: headers
+
+  defp encode_body(nil), do: nil
+  defp encode_body(body) when is_map(body), do: Jason.encode!(body)
+  defp encode_body(body), do: body
+
+  defp emit_telemetry(method, host, url, result, duration) do
+    status = case result do
+      {:ok, %{status: s}} -> s
+      _ -> 0
+    end
+
+    :telemetry.execute(
+      [:api_gateway, :http_client, :request],
+      %{duration: duration},
+      %{method: method, host: host, url: url, status: status}
+    )
+  end
+end
+```
+
+### Step 5: `lib/api_gateway/http_client/telemetry_handler.ex`
+
+```elixir
+defmodule ApiGateway.HttpClient.TelemetryHandler do
+  require Logger
+
   def attach do
     :telemetry.attach_many(
-      "my-client-logger",
+      "api-gateway-http-client",
       [
-        [:my_client, :request, :stop],
-        [:my_client, :circuit_breaker, :state_change],
-        [:my_client, :rate_limiter, :throttled]
+        [:api_gateway, :http_client, :request],
+        [:api_gateway, :circuit_breaker, :state_change]
       ],
       &handle_event/4,
       nil
     )
   end
 
-  def handle_event([:my_client, :request, :stop], measurements, metadata, _config) do
-    duration_ms = System.convert_time_unit(measurements.duration, :native, :millisecond)
-    require Logger
-    Logger.info("HTTP #{metadata.method} #{metadata.host} #{metadata.status} #{duration_ms}ms")
+  def handle_event([:api_gateway, :http_client, :request], %{duration: dur}, meta, _) do
+    ms = System.convert_time_unit(dur, :native, :millisecond)
+    Logger.info("HTTP #{meta.method} #{meta.host} → #{meta.status} (#{ms}ms)")
+  end
+
+  def handle_event([:api_gateway, :circuit_breaker, :state_change], _, meta, _) do
+    Logger.warning("Circuit breaker: #{meta.host} #{meta.from} → #{meta.to}")
   end
 end
 ```
 
-### Requisitos
+### Step 6: Given tests — must pass without modification
 
-- Token bucket implementado con operaciones atómicas en ETS (no GenServer)
-- Rate por host configurable; default configurable globalmente
-- Telemetry emitido incluso en errores (status: 0 si no hubo respuesta HTTP)
-- `duration` en nanosegundos (convención de `:telemetry`)
-- Tests de telemetry: usar `:telemetry.attach` en setup del test, verificar eventos emitidos
+```elixir
+# test/api_gateway/http_client/circuit_breaker_test.exs
+defmodule ApiGateway.HttpClient.CircuitBreakerTest do
+  use ExUnit.Case, async: false
 
-### Estructura del proyecto
+  alias ApiGateway.HttpClient.CircuitBreaker
 
+  setup do
+    # Reset ETS table between tests
+    :ets.delete_all_objects(:circuit_breaker)
+    :ok
+  end
+
+  test "circuit starts closed and allows requests" do
+    result = CircuitBreaker.call("api.example.com", fn -> {:ok, %{status: 200}} end)
+    assert {:ok, _} = result
+  end
+
+  test "circuit opens after failure threshold" do
+    host = "flaky.example.com"
+    for _ <- 1..5 do
+      CircuitBreaker.call(host, fn -> {:error, :timeout} end)
+    end
+    assert {:error, :circuit_open} = CircuitBreaker.call(host, fn -> {:ok, %{}} end)
+  end
+
+  test "circuit transitions to half_open after recovery timeout" do
+    host = "recovering.example.com"
+    # Force open state with past timestamp (recovery already elapsed)
+    past = System.monotonic_time(:millisecond) - 60_000
+    :ets.insert(:circuit_breaker, {host, :open, past})
+
+    # Next call should attempt half_open probe
+    result = CircuitBreaker.call(host, fn -> {:ok, %{status: 200}} end)
+    assert {:ok, _} = result
+  end
+end
 ```
-lib/
-├── my_client/
-│   ├── application.ex          # Inicia Finch + inicializa ETS tables
-│   ├── request_pipeline.ex     # Orquesta rate limit → CB → retry → HTTP
-│   ├── circuit_breaker.ex      # ETS-based circuit breaker
-│   ├── rate_limiter.ex         # Token bucket en ETS
-│   ├── retry_wrapper.ex        # Backoff + retryable conditions
-│   └── telemetry_handler.ex    # Attach + handle telemetry events
-test/
-├── my_client/
-│   ├── client_test.exs         # Tests de integración con Bypass
-│   ├── circuit_breaker_test.exs
-│   ├── rate_limiter_test.exs
-│   ├── retry_wrapper_test.exs
-│   └── telemetry_test.exs
+
+```elixir
+# test/api_gateway/http_client/retry_test.exs
+defmodule ApiGateway.HttpClient.RetryTest do
+  use ExUnit.Case
+
+  alias ApiGateway.HttpClient.Retry
+
+  test "does not retry on 200" do
+    calls = :counters.new(1, [])
+    Retry.with_retry(fn ->
+      :counters.add(calls, 1, 1)
+      {:ok, %{status: 200, headers: [], body: ""}}
+    end)
+    assert :counters.get(calls, 1) == 1
+  end
+
+  test "retries on 503 up to max_retries" do
+    calls = :counters.new(1, [])
+    Retry.with_retry(
+      fn ->
+        :counters.add(calls, 1, 1)
+        {:ok, %{status: 503, headers: [], body: ""}}
+      end,
+      max_retries: 2
+    )
+    assert :counters.get(calls, 1) == 3  # 1 original + 2 retries
+  end
+
+  test "does not retry on 404" do
+    calls = :counters.new(1, [])
+    Retry.with_retry(fn ->
+      :counters.add(calls, 1, 1)
+      {:ok, %{status: 404, headers: [], body: ""}}
+    end)
+    assert :counters.get(calls, 1) == 1
+  end
+end
+```
+
+### Step 7: Run the tests
+
+```bash
+mix test test/api_gateway/http_client/ --trace
 ```
 
 ---
 
-## Criterios de aceptación
+## Trade-off analysis
 
-- [ ] `get/post/put/delete` funcionan correctamente con Finch
-- [ ] JSON decode automático basado en Content-Type
-- [ ] Retry no ocurre en 400/401/404; sí ocurre en 429/500-504
-- [ ] `Retry-After` header es respetado en respuestas 429
-- [ ] Circuit breaker abre después de `failure_threshold` fallos consecutivos
-- [ ] Circuit breaker entra en `HALF_OPEN` después de `recovery_timeout_ms`
-- [ ] Rate limiter bloquea requests que superan el límite configurado
-- [ ] Telemetry emite `[:my_client, :request, :stop]` en cada request
-- [ ] Tests usan Bypass para simular todas las condiciones sin servidor real
+Fill in this table based on your implementation.
+
+| Aspect | ETS circuit breaker | GenServer circuit breaker | No circuit breaker |
+|--------|--------------------|--------------------------|--------------------|
+| Read path latency | ETS lookup (~1µs) | GenServer call (varies) | none |
+| State consistency | eventual under concurrent writes | strong | n/a |
+| Recovery detection | time-based (fixed timeout) | time-based | n/a |
+| Half-open probes | per-host counter in ETS | per-host counter in state | n/a |
+| Observable | telemetry events | telemetry events | blind |
+
+Reflection: the ETS-based circuit breaker has a race condition — two concurrent requests can
+both read `:closed` and both increment the failure counter. Under what traffic conditions
+does this matter? Is the race acceptable for this use case?
 
 ---
 
-## Retos adicionales (opcional)
+## Common production mistakes
 
-- Caché de respuestas: cachear respuestas GET con ETag/Last-Modified
-- Mock automático en tests: `MyClient.Mock` que implementa la misma interfaz
-- Métricas en Prometheus via `telemetry_metrics` + `telemetry_poller`
-- Adaptive concurrency: reducir automáticamente concurrencia cuando latencia sube
+**1. Retrying on 4xx errors**
+HTTP 4xx errors are client errors — retrying them wastes resources and never succeeds.
+Only retry 429 (rate limit, transient), 500, 502, 503, 504 (server errors, transient).
+
+**2. Not respecting `Retry-After`**
+When a service responds with 429 and a `Retry-After: 30` header, retrying before 30 seconds
+will immediately hit the rate limit again. Always extract and honor the header.
+
+**3. Circuit breaker without jitter on recovery**
+If the circuit opens for 100 requests simultaneously, and the recovery timeout is 30s,
+all 100 will probe at t=30s — a coordinated thundering herd. Add jitter to the recovery
+timeout to spread probes.
+
+**4. Telemetry emitted only on success**
+A telemetry event with `status: 0` when there's no HTTP response (network error, timeout)
+is still valuable — it tells the ops team the request never reached the service. Always
+emit telemetry regardless of outcome.
+
+**5. Finch pool per host not pre-warmed**
+Finch creates connection pools lazily by default. The first request to a new host pays the
+TCP handshake + TLS negotiation cost. Pre-configure known hosts in Application config.
+
+---
+
+## Resources
+
+- [Finch](https://hexdocs.pm/finch/Finch.html) — connection-pooled HTTP client built on Mint
+- [Bypass](https://github.com/PSPDFKit-labs/bypass) — test HTTP servers without a real service
+- [`:telemetry`](https://hexdocs.pm/telemetry/telemetry.html) — instrumentation standard for the BEAM ecosystem
+- [Release It! — Michael Nygard](https://pragprog.com/titles/mnee2/release-it-second-edition/) — circuit breaker pattern origin

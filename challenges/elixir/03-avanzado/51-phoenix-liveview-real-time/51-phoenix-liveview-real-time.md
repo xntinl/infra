@@ -1,501 +1,384 @@
-# 51. Phoenix LiveView — Real-time Dashboard
+# Phoenix LiveView: Real-Time Gateway Dashboard
 
-**Difficulty**: Avanzado
-
----
-
-## Prerequisites
-
-- Phoenix Framework básico (rutas, controllers, templates)
-- Ecto y changesets
-- GenServer y mensajes (`send/2`, `Process.send_after/3`)
-- Phoenix.PubSub
-- HEEx templates
+**Project**: `api_gateway` — built incrementally across the advanced level
 
 ---
 
-## Learning Objectives
+## Project context
 
-1. Montar un LiveView con estado reactivo usando `mount/3` y `assign/3`
-2. Manejar eventos del cliente con `handle_event/3`
-3. Actualizar el socket periódicamente con `handle_info/2`
-4. Suscribirse a PubSub para datos multiusuario en tiempo real
-5. Validar formularios en vivo con changesets y `phx-change`
+The `api_gateway` umbrella is in production. The ops team needs a web dashboard to monitor
+the gateway in real time: request rates, circuit breaker states, rate-limiter queue depths.
+Instead of building a React SPA with a REST polling loop, you'll build it with Phoenix
+LiveView — the entire dashboard is server-rendered HTML with WebSocket-pushed diffs.
+
+Project structure for this exercise:
+
+```
+api_gateway_umbrella/apps/gateway_api/
+├── lib/gateway_api_web/
+│   ├── live/
+│   │   ├── dashboard_live.ex         # ← you implement this
+│   │   ├── dashboard_live.html.heex  # ← and this
+│   │   ├── circuit_breaker_live.ex   # ← and this
+│   │   └── config_live.ex            # ← and this
+│   └── presence.ex                   # ← and this
+└── test/gateway_api_web/live/
+    └── dashboard_live_test.exs       # given tests
+```
 
 ---
 
-## Concepts
+## Why LiveView over a JavaScript SPA
 
-### LiveView lifecycle: mount → render → handle_event / handle_info
+A React dashboard requires: a REST or GraphQL API, JSON serialization, a client-side state
+manager, and a polling or WebSocket layer. Each layer has failure modes and deployment
+concerns. LiveView collapses all of this:
 
-Un LiveView arranca en `mount/3`, donde inicializas el socket con `assign`. Desde ese momento, cada vez que el socket cambia, Phoenix re-renderiza **solo el diff** del template HEEx — sin recargar la página ni escribir JavaScript.
+```
+Browser                    Server
+───────                    ──────
+HTML render ◀────────── mount/3 assigns initial state
+                │
+User click ──── handle_event/3 ──▶ update state
+                │
+                └─────── send diff HTML ──▶ browser patches DOM
+```
 
-El patrón más común para "ticks" periódicos es enviar un mensaje a sí mismo y reencolarlo dentro del handler:
+The server computes diffs; the browser applies them. No JSON. No client state sync. The
+tradeoff: all users' state lives in server memory (one LiveView process per connection),
+and the server must be reachable via WebSocket.
+
+---
+
+## LiveView lifecycle
+
+```
+mount/3         — called once when the LiveView mounts
+                  initialize assigns; start PubSub subscriptions; schedule ticks
+render/1        — called after every assign change; returns HEEx template
+handle_event/3  — called when user interacts (phx-click, phx-submit, phx-change)
+handle_info/2   — called when a message arrives (PubSub, Process.send_after, GenServer)
+```
+
+The key insight: **the socket is the state, the template is a pure function of the state**.
+Phoenix computes the diff between the previous and current render and sends only the changed
+HTML fragments over WebSocket.
+
+---
+
+## Implementation
+
+### Step 1: `lib/gateway_api_web/live/dashboard_live.ex`
 
 ```elixir
-defmodule MyAppWeb.MetricsLive do
-  use MyAppWeb, :live_view
+defmodule GatewayApiWeb.DashboardLive do
+  use GatewayApiWeb, :live_view
 
   @tick_ms 1_000
+  @history_limit 60   # 60 seconds of history
 
   @impl true
   def mount(_params, _session, socket) do
-    if connected?(socket), do: Process.send_after(self(), :tick, @tick_ms)
-    {:ok, assign(socket, cpu: 0.0, mem: 0.0, history: [])}
+    if connected?(socket) do
+      # Subscribe to gateway metrics published by the telemetry handler
+      Phoenix.PubSub.subscribe(GatewayApi.PubSub, "gateway:metrics")
+      # Schedule the first tick
+      Process.send_after(self(), :tick, @tick_ms)
+    end
+
+    metrics = fetch_current_metrics()
+
+    socket = assign(socket,
+      metrics: metrics,
+      history: [metrics],
+      circuit_breakers: fetch_circuit_breaker_states(),
+      rate_limiter_size: fetch_rate_limiter_size()
+    )
+
+    {:ok, socket}
   end
 
   @impl true
   def handle_info(:tick, socket) do
-    Process.send_after(self(), :tick, @tick_ms)
-    metrics = fetch_metrics()
-
-    socket =
-      socket
-      |> assign(cpu: metrics.cpu, mem: metrics.mem)
-      |> update(:history, fn h -> Enum.take([metrics | h], 60) end)
-
+    # TODO:
+    # 1. Re-schedule the next tick
+    # 2. Fetch fresh metrics
+    # 3. Update :metrics assign
+    # 4. Update :history using update/3 — keep last @history_limit entries
+    # 5. Update :circuit_breakers
+    # HINT: update(socket, :history, fn h -> Enum.take([metrics | h], @history_limit) end)
     {:noreply, socket}
   end
 
-  defp fetch_metrics do
-    # :cpu_sup.avg1() devuelve carga * 256; normaliza a %
-    cpu = :cpu_sup.avg1() / 256 * 100
-    mem_info = :memsup.get_system_memory_data()
-    total = mem_info[:total_memory]
-    free  = mem_info[:free_memory]
-    %{cpu: Float.round(cpu, 1), mem: Float.round((total - free) / total * 100, 1)}
-  end
-end
-```
-
-### PubSub en mount: datos compartidos entre sesiones
-
-Suscribirse en `mount` permite que cualquier proceso publique datos y todos los LiveViews suscritos los reciban simultáneamente. El guard `connected?(socket)` evita la doble suscripción durante el render estático inicial (SSR).
-
-```elixir
-@impl true
-def mount(_params, _session, socket) do
-  if connected?(socket) do
-    Phoenix.PubSub.subscribe(MyApp.PubSub, "system:metrics")
-  end
-  {:ok, assign(socket, metrics: %{})}
-end
-
-@impl true
-def handle_info({:metrics_update, data}, socket) do
-  {:noreply, assign(socket, metrics: data)}
-end
-
-# En cualquier otro proceso:
-# Phoenix.PubSub.broadcast(MyApp.PubSub, "system:metrics", {:metrics_update, data})
-```
-
-### Validación en tiempo real con phx-change y changesets
-
-`phx-change` dispara `handle_event("validate", params, socket)` con cada keystroke. El changeset se aplica con `action: :validate` para activar los errores sin intentar persistir.
-
-```elixir
-@impl true
-def handle_event("validate", %{"user" => params}, socket) do
-  changeset =
-    %User{}
-    |> User.changeset(params)
-    |> Map.put(:action, :validate)
-
-  {:noreply, assign(socket, form: to_form(changeset))}
-end
-```
-
-```heex
-<.form for={@form} phx-change="validate" phx-submit="save">
-  <.input field={@form[:email]} label="Email" />
-  <.input field={@form[:name]}  label="Name"  />
-  <.button>Save</.button>
-</.form>
-```
-
----
-
-## Exercises
-
-### Exercise 1: Métricas en tiempo real con barra ASCII
-
-**Problem**: Un equipo de ops necesita un dashboard en la terminal — pero también en el browser — que muestre CPU y memoria con un historial de 30 segundos. Sin JS externo. El gráfico debe ser una barra ASCII que cambia de color según el umbral.
-
-**Hints**:
-1. Usa `connected?(socket)` para no disparar el tick en el render SSR inicial.
-2. `update(:history, fn h -> Enum.take([new | h], 30) end)` mantiene la ventana deslizante sin crear listas nuevas innecesariamente.
-3. En HEEx, usa una función helper `bar/1` que devuelva una string de `█` repetidos para representar el porcentaje.
-
-**One possible solution**:
-
-```elixir
-# lib/my_app_web/live/metrics_live.ex
-defmodule MyAppWeb.MetricsLive do
-  use MyAppWeb, :live_view
-
-  @tick_ms 1_000
-  @bar_width 30
-
   @impl true
-  def mount(_params, _session, socket) do
-    if connected?(socket), do: Process.send_after(self(), :tick, @tick_ms)
-    sample = sample_metrics()
-    {:ok, assign(socket, cpu: sample.cpu, mem: sample.mem, history: [sample])}
-  end
-
-  @impl true
-  def handle_info(:tick, socket) do
-    Process.send_after(self(), :tick, @tick_ms)
-    sample = sample_metrics()
-
-    socket =
-      socket
-      |> assign(cpu: sample.cpu, mem: sample.mem)
-      |> update(:history, &Enum.take([sample | &1], 30))
-
+  def handle_info({:metrics_update, metrics}, socket) do
+    # PubSub broadcast from the telemetry handler — update state
+    # TODO: assign updated metrics
     {:noreply, socket}
   end
 
-  def bar(pct) do
-    filled = round(pct / 100 * @bar_width)
-    empty  = @bar_width - filled
-    String.duplicate("█", filled) <> String.duplicate("░", empty)
+  # ---------------------------------------------------------------------------
+  # Private helpers — implement these
+  # ---------------------------------------------------------------------------
+
+  defp fetch_current_metrics do
+    # TODO: read from ETS tables / GenServer state
+    # Return a map: %{request_rate: float, error_rate: float, p99_ms: float, ts: DateTime.t()}
+    %{request_rate: 0.0, error_rate: 0.0, p99_ms: 0.0, ts: DateTime.utc_now()}
   end
 
-  defp sample_metrics do
-    # Simulación; reemplaza con :cpu_sup / :memsup en producción
-    %{
-      cpu: Float.round(:rand.uniform() * 100, 1),
-      mem: Float.round(40 + :rand.uniform() * 40, 1),
-      ts:  DateTime.utc_now()
-    }
+  defp fetch_circuit_breaker_states do
+    # TODO: :ets.tab2list(:circuit_breaker) from exercise 45
+    # Return [%{host: String.t(), state: atom(), opened_at: integer() | nil}]
+    []
+  end
+
+  defp fetch_rate_limiter_size do
+    # TODO: :ets.info(:rate_limiter_windows, :size)
+    0
   end
 end
 ```
 
 ```heex
-<%# lib/my_app_web/live/metrics_live.html.heex %>
-<div class="font-mono p-4 bg-gray-900 text-green-400 min-h-screen">
-  <h1 class="text-xl mb-4">System Metrics</h1>
+<%# lib/gateway_api_web/live/dashboard_live.html.heex %>
+<div class="font-mono p-6 bg-gray-950 text-green-400 min-h-screen">
+  <h1 class="text-2xl mb-6">api_gateway dashboard</h1>
 
-  <div class="mb-2">
-    CPU  <%= @cpu %>%  [<%= bar(@cpu) %>]
-  </div>
-  <div class="mb-6">
-    MEM  <%= @mem %>%  [<%= bar(@mem) %>]
+  <%# Metrics row %>
+  <div class="grid grid-cols-3 gap-4 mb-8">
+    <div class="border border-green-800 p-4 rounded">
+      <div class="text-sm text-green-600">Request rate</div>
+      <div class="text-3xl"><%= Float.round(@metrics.request_rate, 1) %> req/s</div>
+    </div>
+    <div class="border border-green-800 p-4 rounded">
+      <div class="text-sm text-green-600">Error rate</div>
+      <div class="text-3xl"><%= Float.round(@metrics.error_rate * 100, 2) %>%</div>
+    </div>
+    <div class="border border-green-800 p-4 rounded">
+      <div class="text-sm text-green-600">p99 latency</div>
+      <div class="text-3xl"><%= Float.round(@metrics.p99_ms, 1) %> ms</div>
+    </div>
   </div>
 
-  <h2 class="mb-2">Last 30s</h2>
-  <table>
+  <%# Circuit breaker states %>
+  <h2 class="text-lg mb-3">Circuit Breakers</h2>
+  <table class="w-full mb-8 border-collapse">
+    <thead>
+      <tr class="text-green-600 text-left">
+        <th class="pb-2">Host</th>
+        <th class="pb-2">State</th>
+        <th class="pb-2">Since</th>
+      </tr>
+    </thead>
     <tbody>
-      <%= for s <- @history do %>
-        <tr>
-          <td class="pr-4"><%= Calendar.strftime(s.ts, "%H:%M:%S") %></td>
-          <td class="pr-2">CPU <%= s.cpu %>%</td>
-          <td>MEM <%= s.mem %>%</td>
+      <%= for cb <- @circuit_breakers do %>
+        <tr class={if cb.state == :open, do: "text-red-400", else: ""}>
+          <td class="py-1"><%= cb.host %></td>
+          <td class="py-1"><%= cb.state %></td>
+          <td class="py-1">
+            <%= if cb.state == :open, do: "#{System.monotonic_time(:millisecond) - cb.opened_at}ms ago" %>
+          </td>
         </tr>
       <% end %>
     </tbody>
   </table>
+
+  <%# History table — last 60 samples %>
+  <h2 class="text-lg mb-3">Last 60s</h2>
+  <div class="overflow-y-auto max-h-64">
+    <table class="w-full">
+      <tbody>
+        <%= for s <- @history do %>
+          <tr class="text-sm border-b border-green-900">
+            <td class="pr-4 text-green-600"><%= Calendar.strftime(s.ts, "%H:%M:%S") %></td>
+            <td class="pr-4"><%= Float.round(s.request_rate, 1) %> req/s</td>
+            <td class="pr-4"><%= Float.round(s.error_rate * 100, 2) %>% errors</td>
+            <td><%= Float.round(s.p99_ms, 1) %>ms p99</td>
+          </tr>
+        <% end %>
+      </tbody>
+    </table>
+  </div>
 </div>
 ```
 
----
-
-### Exercise 2: Chat room con Phoenix.Presence
-
-**Problem**: Una aplicación SaaS necesita un chat interno donde los usuarios vean en tiempo real quién está conectado. Al desconectarse, el nombre desaparece de la lista sin polling.
-
-**Hints**:
-1. Llama a `Presence.track/4` solo cuando `connected?(socket)` es `true`; en caso contrario Presence intenta registrar un PID que no tiene canal WebSocket activo.
-2. `handle_info(%Phoenix.Socket.Broadcast{event: "presence_diff"}, socket)` es el mensaje que PubSub envía cuando alguien entra o sale — úsalo para refrescar la lista.
-3. `Presence.list("room:lobby")` devuelve un mapa `%{user_id => %{metas: [...]}}` — transfórmalo con `Map.keys/1` para obtener los nombres.
-
-**One possible solution**:
+### Step 2: `lib/gateway_api_web/live/circuit_breaker_live.ex`
 
 ```elixir
-# lib/my_app_web/live/chat_live.ex
-defmodule MyAppWeb.ChatLive do
-  use MyAppWeb, :live_view
-  alias MyAppWeb.Presence
-
-  @topic "room:lobby"
-
-  @impl true
-  def mount(_params, session, socket) do
-    username = session["username"] || "anon-#{:rand.uniform(999)}"
-
-    if connected?(socket) do
-      Phoenix.PubSub.subscribe(MyApp.PubSub, @topic)
-      Presence.track(self(), @topic, username, %{joined_at: System.system_time(:second)})
-    end
-
-    users = list_users()
-    {:ok, assign(socket, username: username, messages: [], users: users, draft: "")}
-  end
-
-  @impl true
-  def handle_event("send_msg", %{"message" => text}, socket) when text != "" do
-    msg = %{user: socket.assigns.username, text: text, at: Time.utc_now()}
-    Phoenix.PubSub.broadcast(MyApp.PubSub, @topic, {:new_message, msg})
-    {:noreply, assign(socket, draft: "")}
-  end
-  def handle_event("send_msg", _params, socket), do: {:noreply, socket}
-
-  @impl true
-  def handle_info({:new_message, msg}, socket) do
-    {:noreply, update(socket, :messages, &(&1 ++ [msg]))}
-  end
-
-  def handle_info(%Phoenix.Socket.Broadcast{event: "presence_diff"}, socket) do
-    {:noreply, assign(socket, users: list_users())}
-  end
-
-  defp list_users do
-    Presence.list(@topic) |> Map.keys()
-  end
-end
-```
-
-```heex
-<%# lib/my_app_web/live/chat_live.html.heex %>
-<div class="flex h-screen">
-  <aside class="w-48 bg-gray-100 p-4">
-    <h2 class="font-bold mb-2">Online (<%= length(@users) %>)</h2>
-    <ul>
-      <%= for u <- @users do %>
-        <li class={if u == @username, do: "font-bold", else: ""}><%= u %></li>
-      <% end %>
-    </ul>
-  </aside>
-
-  <main class="flex-1 flex flex-col p-4">
-    <div class="flex-1 overflow-y-auto space-y-1 mb-4">
-      <%= for m <- @messages do %>
-        <p><span class="font-semibold"><%= m.user %></span>: <%= m.text %></p>
-      <% end %>
-    </div>
-
-    <.form for={%{}} phx-submit="send_msg">
-      <div class="flex gap-2">
-        <input name="message" value={@draft} placeholder="Type…"
-               class="flex-1 border rounded px-2 py-1" />
-        <.button>Send</.button>
-      </div>
-    </.form>
-  </main>
-</div>
-```
-
----
-
-### Exercise 3: Validación de formulario en tiempo real
-
-**Problem**: Un formulario de registro debe mostrar errores de validación a medida que el usuario escribe — sin esperar al submit — y deshabilitar el botón si el changeset es inválido.
-
-**Hints**:
-1. `phx-change="validate"` dispara el evento con cada cambio de campo. `phx-submit="save"` solo se dispara al enviar.
-2. Asigna el changeset con `action: :validate` para que `form_has_errors?` y `input_validations` de Phoenix.HTML funcionen correctamente.
-3. Puedes deshabilitar el botón con `disabled={not @form.source.valid?}` directamente desde el assign del form.
-
-**One possible solution**:
-
-```elixir
-# lib/my_app_web/live/registration_live.ex
-defmodule MyAppWeb.RegistrationLive do
-  use MyAppWeb, :live_view
-  alias MyApp.Accounts.User
+defmodule GatewayApiWeb.CircuitBreakerLive do
+  use GatewayApiWeb, :live_view
 
   @impl true
   def mount(_params, _session, socket) do
-    changeset = User.changeset(%User{}, %{})
-    {:ok, assign(socket, form: to_form(changeset))}
+    if connected?(socket), do: Phoenix.PubSub.subscribe(GatewayApi.PubSub, "circuit_breaker:events")
+    {:ok, assign(socket, events: [], states: load_states())}
   end
 
   @impl true
-  def handle_event("validate", %{"user" => params}, socket) do
-    changeset =
-      %User{}
-      |> User.changeset(params)
-      |> Map.put(:action, :validate)
-
-    {:noreply, assign(socket, form: to_form(changeset))}
+  def handle_event("reset_circuit", %{"host" => host}, socket) do
+    # TODO: clear the circuit breaker ETS entry for this host
+    # HINT: :ets.delete(:circuit_breaker, host)
+    {:noreply, assign(socket, states: load_states())}
   end
 
   @impl true
-  def handle_event("save", %{"user" => params}, socket) do
-    case MyApp.Accounts.create_user(params) do
-      {:ok, _user} ->
-        {:noreply, push_navigate(socket, to: ~p"/dashboard")}
+  def handle_info({:circuit_state_change, event}, socket) do
+    # TODO: prepend event to :events, keep last 50
+    {:noreply, socket}
+  end
 
-      {:error, changeset} ->
-        {:noreply, assign(socket, form: to_form(changeset))}
-    end
+  defp load_states do
+    # TODO: read :circuit_breaker ETS table
+    []
   end
 end
 ```
 
-```heex
-<%# lib/my_app_web/live/registration_live.html.heex %>
-<div class="max-w-md mx-auto mt-16 p-6 border rounded-lg">
-  <h1 class="text-2xl font-bold mb-6">Create account</h1>
-
-  <.form for={@form} phx-change="validate" phx-submit="save">
-    <.input field={@form[:name]}                 label="Full name"        />
-    <.input field={@form[:email]}  type="email"  label="Email"            />
-    <.input field={@form[:password]} type="password" label="Password (min 8)" />
-
-    <.button disabled={not @form.source.valid?} class="mt-4 w-full">
-      Create account
-    </.button>
-  </.form>
-</div>
-```
+### Step 3: `lib/gateway_api_web/live/config_live.ex`
 
 ```elixir
-# lib/my_app/accounts/user.ex (Ecto schema relevante)
-defmodule MyApp.Accounts.User do
-  use Ecto.Schema
-  import Ecto.Changeset
+defmodule GatewayApiWeb.ConfigLive do
+  use GatewayApiWeb, :live_view
 
-  schema "users" do
-    field :name,     :string
-    field :email,    :string
-    field :password, :string, virtual: true
-    timestamps()
+  alias GatewayCore.GatewayConfig
+
+  @impl true
+  def mount(_params, _session, socket) do
+    changeset = GatewayConfig.changeset(%GatewayConfig{}, %{})
+    {:ok, assign(socket, form: to_form(changeset), saved: false)}
   end
 
-  def changeset(user, attrs) do
-    user
-    |> cast(attrs, [:name, :email, :password])
-    |> validate_required([:name, :email, :password])
-    |> validate_format(:email, ~r/@/)
-    |> validate_length(:password, min: 8)
-    |> unique_constraint(:email)
+  @impl true
+  def handle_event("validate", %{"gateway_config" => params}, socket) do
+    # TODO: validate changeset with action: :validate
+    # HINT: changeset |> Map.put(:action, :validate)
+    {:noreply, socket}
+  end
+
+  @impl true
+  def handle_event("save", %{"gateway_config" => params}, socket) do
+    # TODO: apply config, update assigns, show confirmation
+    {:noreply, assign(socket, saved: true)}
   end
 end
 ```
 
----
-
-## Common Mistakes
-
-**1. No guardar el tick en `handle_info` — el reloj se detiene**
+### Step 4: Add routes to `router.ex`
 
 ```elixir
-# MAL: solo manda el primer tick desde mount, nunca reencola
-def handle_info(:tick, socket) do
-  {:noreply, assign(socket, data: fetch())}
-end
+# In gateway_api_web/router.ex
+scope "/admin", GatewayApiWeb do
+  pipe_through [:browser, :admin_auth]
 
-# BIEN: reencola dentro del handler
-def handle_info(:tick, socket) do
-  Process.send_after(self(), :tick, 1_000)
-  {:noreply, assign(socket, data: fetch())}
+  live "/dashboard",       DashboardLive
+  live "/circuit-breakers", CircuitBreakerLive
+  live "/config",           ConfigLive
 end
 ```
 
-**2. Suscribirse sin el guard `connected?/1` — duplica eventos**
+### Step 5: Given tests — must pass without modification
 
 ```elixir
-# MAL: se suscribe también durante el render estático (SSR)
-def mount(_p, _s, socket) do
-  Phoenix.PubSub.subscribe(MyApp.PubSub, "topic")
-  {:ok, socket}
+# test/gateway_api_web/live/dashboard_live_test.exs
+defmodule GatewayApiWeb.DashboardLiveTest do
+  use GatewayApiWeb.ConnCase
+  import Phoenix.LiveViewTest
+
+  test "renders dashboard with metrics", %{conn: conn} do
+    {:ok, view, html} = live(conn, ~p"/admin/dashboard")
+    assert html =~ "api_gateway dashboard"
+    assert html =~ "Request rate"
+    assert html =~ "Circuit Breakers"
+  end
+
+  test "updates when tick fires", %{conn: conn} do
+    {:ok, view, _html} = live(conn, ~p"/admin/dashboard")
+    # Trigger a tick manually
+    send(view.pid, :tick)
+    # Wait for re-render
+    html = render(view)
+    assert html =~ "req/s"
+  end
+
+  test "circuit reset button clears ETS state", %{conn: conn} do
+    # Seed a broken circuit
+    :ets.insert(:circuit_breaker, {"test-host", :open, System.monotonic_time(:millisecond)})
+
+    {:ok, view, _html} = live(conn, ~p"/admin/circuit-breakers")
+    assert render(view) =~ "test-host"
+
+    view |> element("[phx-click=reset_circuit][phx-value-host=test-host]") |> render_click()
+    refute render(view) =~ "test-host"
+  end
+
+  test "config form shows validation errors inline", %{conn: conn} do
+    {:ok, view, _html} = live(conn, ~p"/admin/config")
+
+    html = view
+    |> form("#config-form", gateway_config: %{rate_limit_per_minute: -1})
+    |> render_change()
+
+    assert html =~ "must be greater than"
+  end
 end
-
-# BIEN
-def mount(_p, _s, socket) do
-  if connected?(socket), do: Phoenix.PubSub.subscribe(MyApp.PubSub, "topic")
-  {:ok, socket}
-end
 ```
 
-**3. Olvidar `action: :validate` en el changeset — los errores no aparecen**
-
-```elixir
-# MAL: sin :action, Phoenix.HTML no muestra los errores
-changeset = User.changeset(%User{}, params)
-
-# BIEN
-changeset = %User{} |> User.changeset(params) |> Map.put(:action, :validate)
-```
-
-**4. Acumular mensajes sin límite — memory leak en chat**
-
-```elixir
-# MAL: la lista crece indefinidamente
-update(socket, :messages, &(&1 ++ [msg]))
-
-# BIEN: mantén solo los últimos N
-update(socket, :messages, fn msgs -> Enum.take(msgs ++ [msg], -200) end)
-```
-
----
-
-## Verification
+### Step 6: Run the tests
 
 ```bash
-# Crea un proyecto Phoenix con LiveView si no tienes uno
-mix phx.new my_app --live
-cd my_app
-mix ecto.create
-
-# Genera la ruta en router.ex
-# live "/metrics", MetricsLive
-# live "/chat",    ChatLive
-# live "/register", RegistrationLive
-
-mix phx.server
-# Abre http://localhost:4000/metrics — los valores deben cambiar cada segundo
-# Abre /chat en dos tabs — ambas deben ver la lista de usuarios actualizada
-# Abre /register — los errores deben aparecer mientras escribes
-```
-
-Para Presence necesitas agregar el módulo en `lib/my_app_web/presence.ex`:
-
-```elixir
-defmodule MyAppWeb.Presence do
-  use Phoenix.Presence,
-    otp_app: :my_app,
-    pubsub_server: MyApp.PubSub
-end
-```
-
-Y registrarlo en `lib/my_app/application.ex` dentro de `children`:
-
-```elixir
-MyAppWeb.Presence
+mix test test/gateway_api_web/live/ --trace
 ```
 
 ---
 
-## Summary
+## Trade-off analysis
 
-| Callback | Cuándo se llama | Para qué |
-|---|---|---|
-| `mount/3` | Al conectar el socket | Inicializar assigns, suscribir PubSub, arrancar ticks |
-| `handle_event/3` | Evento del cliente (click, submit, change) | Mutar estado, persistir datos |
-| `handle_info/2` | Mensaje recibido (PubSub, send_after, send) | Actualizar estado por eventos externos |
-| `render/1` | Después de cualquier cambio en assigns | Generar el diff HEEx — llamado automáticamente |
+| Aspect | LiveView | React + REST polling | React + WebSocket |
+|--------|---------|---------------------|-------------------|
+| State location | server (one process / conn) | client | client |
+| Network payload | HTML diffs (small) | full JSON responses | custom messages |
+| Real-time updates | push from server | polling interval | push |
+| JavaScript required | minimal (phoenix.js) | full framework | full framework |
+| Server memory | 1 process per connection | none | connection overhead |
+| Testability | `Phoenix.LiveViewTest` | Cypress / RTL | Cypress / RTL |
 
-El modelo mental clave: **el socket es el estado, el template es una función del estado**. Phoenix calcula el diff y envía solo los bytes que cambiaron.
+Reflection: the DashboardLive process holds the last 60 seconds of history. With 500
+concurrent ops users, how much memory does this consume? How would you change the design
+if the history window needed to be 24 hours?
 
 ---
 
-## What's Next
+## Common production mistakes
 
-- **Ejercicio 52**: LiveComponent para encapsular piezas de UI con estado propio
-- `push_event/3` + JS hooks para integrar librerías JS (Chart.js, etc.)
-- `phx-hook` para DOM callbacks en el cliente
-- Streams (`stream/3`, `stream_insert/3`) para listas grandes sin re-renderizar todo
+**1. Not re-enqueuing the tick in `handle_info(:tick, ...)`**
+The pattern is: `Process.send_after(self(), :tick, @tick_ms)` at the start of the handler,
+not in `mount/3`. If you only send it in `mount/3`, the tick fires once and stops.
+
+**2. Subscribing to PubSub without the `connected?/1` guard**
+LiveView renders twice: once server-side (SSR, no WebSocket) and once after the WebSocket
+connects. Without the guard, you subscribe during SSR — the process receives broadcasts but
+has no way to push diffs. Always guard PubSub subscriptions with `if connected?(socket)`.
+
+**3. Setting `action: :validate` on `phx-submit` event**
+`action: :validate` activates error display. It should be set in the `"validate"` handler
+(`phx-change`). In the `"save"` handler, the changeset should attempt the real operation —
+not be forced into validate-only mode.
+
+**4. Unbounded history list**
+Every tick appends to `:history`. Without `Enum.take/2`, after a day of uptime the list
+has 86,400 entries. Always cap it: `Enum.take([new | h], @history_limit)`.
+
+**5. Reading ETS directly in the template**
+ETS reads inside HEEx templates run on every render, including diffs. Put ETS reads in
+`handle_info(:tick, ...)` and store results as assigns. The template should be a pure
+function of assigns — no side effects, no external reads.
 
 ---
 
 ## Resources
 
-- [Phoenix LiveView Docs](https://hexdocs.pm/phoenix_live_view/Phoenix.LiveView.html)
-- [Phoenix.Presence](https://hexdocs.pm/phoenix/Phoenix.Presence.html)
-- [HEEx template syntax](https://hexdocs.pm/phoenix_live_view/assigns-eex.html)
-- [LiveView Security](https://hexdocs.pm/phoenix_live_view/security-model.html)
+- [Phoenix LiveView documentation](https://hexdocs.pm/phoenix_live_view/Phoenix.LiveView.html) — lifecycle callbacks
+- [Phoenix.LiveViewTest](https://hexdocs.pm/phoenix_live_view/Phoenix.LiveViewTest.html) — `live/2`, `render_click/2`, `form/3`
+- [LiveView security model](https://hexdocs.pm/phoenix_live_view/security-model.html) — why `connected?` matters
+- [Streams in LiveView](https://hexdocs.pm/phoenix_live_view/Phoenix.LiveView.html#stream/3) — efficient rendering for large lists

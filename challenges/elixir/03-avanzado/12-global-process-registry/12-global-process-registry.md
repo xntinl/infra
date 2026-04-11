@@ -1,545 +1,484 @@
-# 12. Global Process Registry
+# Global Process Registry: Cluster-Wide Coordination for `api_gateway`
 
-**Difficulty**: Avanzado
-
----
-
-## Prerequisites
-
-- Ejercicio 11: Distributed Erlang Clustering
-- GenServer avanzado (ejercicios 01-05)
-- Conceptos de leader election y consensus básico
-- Comprensión de netsplits y sus consecuencias
+**Project**: `api_gateway` — built incrementally across the advanced level
 
 ---
 
-## Learning Objectives
+## Project context
 
-- Registrar procesos globalmente en un cluster con `:global`
-- Resolver conflictos de registro con callbacks personalizados
-- Implementar singleton processes que sobrevivan a la migración de nodos
-- Usar `:pg` para process groups distribuidos
-- Entender las limitaciones de `:global` y cuándo usarlo vs alternativas
-- Implementar leader election básica sobre `:global`
+You're building `api_gateway`. Nodes are now connected (exercise 11). The next problem:
+coordinating cluster-wide singletons and distributing work across all nodes.
 
----
+Two concrete requirements have arrived:
 
-## Concepts
+1. The `RouteTable.Server` currently runs independently on each node. When a route is
+   updated via the admin API, only the node that received the request updates its table.
+   The other nodes keep serving stale routes for up to 60 seconds. You need a single
+   authoritative route table that all nodes read from.
 
-### El módulo :global
+2. The gateway's background janitor (audit log cleanup, expired circuit breaker removal)
+   currently runs on every node, doing the same work N times. With 10 nodes, this means
+   10× the database load for zero benefit. Only one node should run janitor tasks at a time.
+   If that node goes down, another node must take over.
 
-`:global` es el módulo OTP para registro de nombres a nivel de cluster. A diferencia del registro local (`Process.register/2`), los nombres registrados con `:global` son visibles desde cualquier nodo del cluster.
+Both problems reduce to the same pattern: cluster-wide singleton processes with
+deterministic leader election.
 
-```elixir
-# Registrar el proceso actual con un nombre global
-:global.register_name(:my_singleton, self())
-#=> :yes  # registro exitoso
-#=> :no   # ya existe un proceso con ese nombre
+Project structure at this point:
 
-# Buscar un proceso por nombre global
-:global.whereis_name(:my_singleton)
-#=> #PID<1.234.0>   # el PID, posiblemente en otro nodo
-#=> :undefined      # no encontrado
-
-# Eliminar un registro
-:global.unregister_name(:my_singleton)
-
-# Enviar mensaje a un proceso por nombre global
-:global.send(:my_singleton, {:hello, self()})
+```
+api_gateway/
+├── lib/
+│   └── api_gateway/
+│       ├── application.ex
+│       ├── cluster/
+│       │   ├── manager.ex          # from exercise 11
+│       │   └── leader.ex           # ← you implement
+│       ├── route_table/
+│       │   └── server.ex           # ← extend with global registration
+│       └── janitor/
+│           └── worker.ex           # ← you implement (leader-only tasks)
+├── test/
+│   └── api_gateway/
+│       └── cluster/
+│           └── leader_test.exs     # given tests — must pass
+└── mix.exs
 ```
 
-**Cómo funciona internamente**: `:global` usa un lock distribuido y sincronización entre nodos para garantizar que solo un proceso tiene un nombre dado. Cuando un nodo nuevo se une al cluster, sincroniza su tabla de registros.
+---
 
-### Resolución de conflictos
+## The business problem
 
-El problema fundamental de `:global`: durante un netsplit, dos particiones pueden registrar el mismo nombre independientemente. Cuando la red se recupera, hay un conflicto.
+Before this exercise, every node in the gateway cluster is an independent island:
+
+- Route updates only apply to the receiving node
+- Audit log cleanup runs on all 10 nodes simultaneously — the database sees 10×
+  the delete queries it should
+- There is no way to ask "which node is in charge?" — the answer is "all of them"
+  and "none of them" simultaneously
+
+The fix requires two primitives:
+
+1. **Global registration** — a process name visible from every node in the cluster
+2. **Leader election** — the mechanism by which exactly one node "owns" a name at any
+   given time, and another node takes over if the leader goes down
+
+---
+
+## Why `:global` and not a database flag
+
+Using a database row `{key: "leader", node: "gateway_a@10.0.1.5"}` is superficially
+simpler but creates a different class of problems:
+
+- Database writes are slower than in-memory operations — every election attempt is a DB round-trip
+- If the database is unavailable, no leader can be elected — the gateway and the DB
+  are now coupled for cluster coordination
+- Stale rows survive crashes — the "leader" row still says gateway_a even after it dies
+
+Erlang's `:global` module solves leader election in memory, using the cluster's own
+communication layer. No external dependency, no stale state after crashes. The trade-off:
+`:global` is CP (consistent, not available during netsplits). For a route table or janitor
+coordinator, that is the correct trade-off — wrong data is worse than temporary unavailability.
+
+---
+
+## How `:global` works
+
+`:global` maintains a cluster-wide mapping from name → PID. Every node in the cluster
+has a local copy of this mapping. When any node registers a name, all other nodes are
+notified via the Erlang distribution layer and update their local copies.
 
 ```elixir
-# Sin callback — comportamiento por defecto
-# :global mata aleatoriamente uno de los dos procesos
-:global.register_name(:leader, self())
+# Register the current process under a global name
+:global.register_name(:route_table_leader, self())
+#=> :yes   # registration succeeded — you own the name
+#=> :no    # another process already holds this name
 
-# Con callback de resolución
+# Look up a globally registered process (any node, any time)
+:global.whereis_name(:route_table_leader)
+#=> #PID<1.234.0>    # could be a PID on any node in the cluster
+#=> :undefined       # no process holds this name
+
+# Unregister (happens automatically when the process dies)
+:global.unregister_name(:route_table_leader)
+```
+
+When a registered process dies (on any node), Erlang automatically removes the name
+from `:global` — no cleanup needed. The name becomes available for the next election.
+
+### Using `:global` with GenServer's `{:via, module, name}` pattern
+
+GenServer accepts a `{:via, module, name}` tuple as the `name:` option. `:global`
+implements the `via` protocol:
+
+```elixir
+GenServer.start_link(__MODULE__, opts, name: {:global, :route_table_leader})
+
+# Calls automatically resolve the PID on any node:
+GenServer.call({:global, :route_table_leader}, :get_routes)
+```
+
+This is cleaner than manually calling `:global.whereis_name/1` before every call.
+If the process is not registered, `GenServer.call` raises `{:noproc, ...}` immediately.
+
+### Conflict resolution after netsplits
+
+During a netsplit, both partitions can independently elect a leader and register the
+same name. When the network heals, `:global` detects the conflict and calls a
+resolution callback:
+
+```elixir
 resolve = fn name, pid1, pid2 ->
-  # Debe retornar el PID ganador, o :none para matar ambos
-  # pid1 y pid2 son los procesos en conflicto
-  IO.puts("Conflict for #{name}: #{inspect(pid1)} vs #{inspect(pid2)}")
-  pid1  # siempre ganar el primero (determinístico por nodo)
+  # Must return the winning PID, or :none to kill both
+  # The losing process receives: {:global_name_conflict, name}
+  if node(pid1) <= node(pid2), do: pid1, else: pid2
 end
 
-:global.register_name(:leader, self(), resolve)
+:global.register_name(:route_table_leader, self(), resolve)
 ```
 
-El callback se llama en el nodo que detecta el conflicto. El PID retornado "gana" y el otro proceso recibe un mensaje `{:global_name_conflict, name}` — el proceso perdedor debe manejarlo.
+The resolution function must be **deterministic and symmetric**: both nodes call it
+with the same two PIDs (possibly in different order), and both must arrive at the same
+winner. Using lexicographic node name comparison is a simple, stable strategy.
 
-### Pattern: via tuple con :global
+### `:pg` for process groups
 
-Puedes usar `:global` como backend del mecanismo `{:via, module, name}` de GenServer:
+When you need "all instances of X across the cluster" (not a singleton), use `:pg`:
 
 ```elixir
-defmodule MySingleton do
-  use GenServer
+# A worker joins a group when it starts
+:pg.join(ApiGateway.PG, :janitor_workers, self())
 
-  # Arrancar con registro global automático
-  def start_link(opts) do
-    GenServer.start_link(__MODULE__, opts,
-      name: {:global, __MODULE__}
-    )
-  end
+# Dispatcher selects a worker from the group
+pids = :pg.get_members(ApiGateway.PG, :janitor_workers)
+worker = Enum.random(pids)
 
-  # Las llamadas usan la via tuple automáticamente
-  def get_state do
-    GenServer.call({:global, __MODULE__}, :get_state)
-  end
-end
+# Local-only members (on this node)
+local = :pg.get_local_members(ApiGateway.PG, :janitor_workers)
 ```
 
-Con `name: {:global, __MODULE__}`, GenServer usa `:global.register_name/2` internamente. Si el proceso muere, el registro se limpia. Las llamadas con `{:global, name}` resuelven automáticamente el nodo correcto.
+When a process in a group dies, `:pg` removes it automatically. `:pg` requires a
+scope (a named process) to be running before use — typically started in `application.ex`.
 
-### Limitaciones críticas de :global
+---
 
-**1. No tolera netsplits bien**: `:global` es CP (consistency over availability). Durante un netsplit, puede rechazar nuevos registros o bloquearse esperando consensus.
+## Implementation
 
-**2. Sincronización bloqueante**: Cuando un nodo nuevo se une, hay un período de bloqueo mientras se sincronizan los registros. En clusters grandes o con muchos registros, esto puede ser lento.
-
-**3. Sin garantía de orden**: Los callbacks de resolución pueden llamarse en orden diferente en distintos nodos.
-
-**4. Dead lock potencial**: Si dos nodos intentan registrar el mismo nombre simultáneamente, puede haber deadlock temporal.
-
-**Cuándo usar :global**:
-- Clusters pequeños (< 20 nodos)
-- Procesos singleton donde la disponibilidad durante netsplit no es crítica
-- Leader election con semántica "solo un líder a la vez"
-- Prototipado rápido
-
-**Cuándo NO usar :global**:
-- Alta disponibilidad requerida durante netsplits
-- Muchos registros dinámicos (hundreds/thousands)
-- Alta frecuencia de cambios en el cluster
-
-### El módulo :pg — Process Groups
-
-`:pg` (process groups) es diferente a `:global`: en lugar de mapear un nombre a un proceso, mapea un nombre a un **grupo de procesos**. Un proceso puede pertenecer a múltiples grupos.
+### Step 1: `lib/api_gateway/cluster/leader.ex`
 
 ```elixir
-# Crear/unirse a un grupo
-:pg.join(:my_scope, :my_group, self())
-:pg.join(:my_scope, :workers, self())
-
-# Obtener todos los procesos en un grupo (en todos los nodos)
-:pg.get_members(:my_scope, :my_group)
-#=> [#PID<0.234.0>, #PID<1.345.0>, #PID<2.456.0>]
-
-# Solo procesos locales
-:pg.get_local_members(:my_scope, :my_group)
-#=> [#PID<0.234.0>]
-
-# Salir de un grupo
-:pg.leave(:my_scope, :my_group, self())
-```
-
-El "scope" es un proceso OTP que gestiona el grupo. En Phoenix y muchas librerías, el scope es un módulo configurado en la aplicación:
-
-```elixir
-# En application.ex
-children = [
-  {Phoenix.PubSub, name: MyApp.PubSub},
-  # :pg internamente
-]
-
-# O directamente:
-children = [
-  {Registry, keys: :duplicate, name: MyApp.PG}
-]
-```
-
-**Casos de uso de :pg**:
-- Fan-out de mensajes a múltiples trabajadores
-- Tracking de usuarios conectados por sala
-- Load balancing con selección aleatoria del grupo
-- Suscripciones a eventos distribuidos
-
-### Leader Election con :global
-
-Un patrón común: usar `:global.register_name/3` como primitiva de election. El proceso que logra registrar el nombre es el líder.
-
-```elixir
-defmodule LeaderElection do
+defmodule ApiGateway.Cluster.Leader do
   use GenServer
   require Logger
 
-  @election_interval 5_000
+  @election_interval_ms 3_000
+  @leader_name          :api_gateway_leader
+
+  # ---------------------------------------------------------------------------
+  # Public API
+  # ---------------------------------------------------------------------------
 
   def start_link(opts) do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
   end
 
-  def am_i_leader? do
-    GenServer.call(__MODULE__, :am_i_leader)
+  @doc "Returns true if this node currently holds the leader registration."
+  @spec leader?() :: boolean()
+  def leader? do
+    GenServer.call(__MODULE__, :leader?)
   end
 
-  def current_leader do
-    case :global.whereis_name(:cluster_leader) do
+  @doc "Returns the node atom of the current leader, or nil if no leader."
+  @spec current_leader_node() :: atom() | nil
+  def current_leader_node do
+    case :global.whereis_name(@leader_name) do
       :undefined -> nil
-      pid -> {pid, node(pid)}
+      pid        -> node(pid)
     end
   end
 
+  # ---------------------------------------------------------------------------
+  # GenServer lifecycle
+  # ---------------------------------------------------------------------------
+
+  @impl true
   def init(_opts) do
-    schedule_election()
+    # TODO: subscribe to node events so we can trigger an election when the
+    # current leader's node goes down.
+    # HINT: :net_kernel.monitor_nodes(true)
+
+    # TODO: trigger an immediate election attempt.
+    # HINT: send(self(), :attempt_election)
+
     {:ok, %{leader: false}}
   end
 
+  # ---------------------------------------------------------------------------
+  # Election logic
+  # ---------------------------------------------------------------------------
+
+  @impl true
   def handle_info(:attempt_election, state) do
-    result = :global.register_name(
-      :cluster_leader,
-      self(),
-      &resolve_conflict/3
-    )
-
-    new_state = case result do
-      :yes ->
-        Logger.info("[Leader] I am the new leader on node #{node()}")
-        %{state | leader: true}
-      :no ->
-        %{state | leader: false}
-    end
-
-    schedule_election()
-    {:noreply, new_state}
+    # TODO:
+    # 1. If already leader, verify we still hold the name:
+    #    :global.whereis_name(@leader_name) == self()
+    #    If not, we lost it (e.g., after a netsplit resolution) — set leader: false
+    #
+    # 2. If not leader, attempt to register:
+    #    result = :global.register_name(@leader_name, self(), &resolve_conflict/3)
+    #    On :yes → log "became leader on #{node()}", set leader: true
+    #    On :no  → remain follower
+    #
+    # 3. Schedule next attempt:
+    #    Process.send_after(self(), :attempt_election, @election_interval_ms)
+    #
+    # 4. {:noreply, new_state}
+    {:noreply, state}
   end
 
-  # Cuando perdemos el liderazgo por conflicto
-  def handle_info({:global_name_conflict, :cluster_leader}, state) do
-    Logger.warning("[Leader] Lost leadership due to conflict")
-    {:noreply, %{state | leader: false}}
+  @impl true
+  def handle_info({:nodedown, node}, state) do
+    # TODO:
+    # If the downed node was the leader, trigger an immediate election attempt.
+    # HINT: if current_leader_node() == node or current_leader_node() == nil, do:
+    #   send(self(), :attempt_election)
+    {:noreply, state}
   end
 
-  def handle_call(:am_i_leader, _from, state) do
-    {:reply, state.leader, state}
+  @impl true
+  def handle_info({:global_name_conflict, @leader_name}, state) do
+    # TODO:
+    # We lost a post-netsplit conflict resolution — another process was chosen.
+    # 1. Log a warning: "Lost leadership via conflict resolution"
+    # 2. Set leader: false
+    # 3. {:noreply, new_state}
+    {:noreply, state}
   end
 
-  # Estrategia: el nodo con menor nombre lexicográfico gana
-  defp resolve_conflict(_name, pid1, pid2) do
-    if node(pid1) <= node(pid2), do: pid1, else: pid2
+  @impl true
+  def handle_call(:leader?, _from, state) do
+    # TODO: verify against :global, not just local state — they can diverge
+    # HINT: actual = :global.whereis_name(@leader_name) == self()
+    #       {:reply, actual, %{state | leader: actual}}
+    {:reply, false, state}
   end
 
-  defp schedule_election do
-    Process.send_after(self(), :attempt_election, @election_interval)
-  end
+  # ---------------------------------------------------------------------------
+  # Private
+  # ---------------------------------------------------------------------------
+
+  # TODO: implement resolve_conflict/3
+  # Strategy: node with lexicographically smaller name wins — deterministic and symmetric.
+  # HINT: defp resolve_conflict(_name, pid1, pid2) do
+  #         if to_string(node(pid1)) <= to_string(node(pid2)), do: pid1, else: pid2
+  #       end
 end
 ```
 
----
+### Step 2: `lib/api_gateway/janitor/worker.ex`
 
-## Exercises
-
-### Exercise 1: Singleton Global en Cluster
-
-**Problem**: Implementa un `ConfigServer` que actúa como fuente única de verdad para configuración dinámica del cluster. Solo debe existir una instancia en todo el cluster. Si el nodo donde corre se cae, debe reiniciarse automáticamente en otro nodo.
-
-**Hints**:
-- Registra con `name: {:global, __MODULE__}` para el registro automático
-- Para restart automático en otro nodo, el supervisor del nodo A necesita saber que el proceso de nodo B murió — esto requiere `:net_kernel.monitor_nodes` combinado con supervisión
-- Considera usar un supervisor en cada nodo que intente arrancar el singleton — `:global.register_name` retornará `:no` en el nodo que pierde y ese proceso debe terminar limpiamente
-- La clave es el `resolve_conflict` callback para el caso de netsplit recovery
-
-**One possible solution**:
+The janitor runs periodic cleanup tasks. Only the leader should run them.
 
 ```elixir
-defmodule ConfigServer do
-  use GenServer
-
-  def start_link(initial_config) do
-    case GenServer.start_link(__MODULE__, initial_config,
-           name: {:global, __MODULE__}) do
-      {:ok, pid} ->
-        {:ok, pid}
-      {:error, {:already_started, pid}} ->
-        # Ya existe en otro nodo — esto es correcto para un singleton
-        :ignore
-    end
-  end
-
-  def get(key) do
-    GenServer.call({:global, __MODULE__}, {:get, key})
-  end
-
-  def put(key, value) do
-    GenServer.call({:global, __MODULE__}, {:put, key, value})
-  end
-
-  def init(config), do: {:ok, config}
-
-  def handle_call({:get, key}, _from, config) do
-    {:reply, Map.get(config, key), config}
-  end
-
-  def handle_call({:put, key, value}, _from, config) do
-    {:reply, :ok, Map.put(config, key, value)}
-  end
-end
-
-# Supervisor que intenta mantener el singleton vivo en este nodo
-# si el nodo que lo tenía se cae:
-defmodule ConfigServerSupervisor do
-  use Supervisor
-
-  def start_link(opts) do
-    Supervisor.start_link(__MODULE__, opts, name: __MODULE__)
-  end
-
-  def init(config) do
-    children = [{ConfigServer, config}]
-    # :transient: solo restart si termina anormalmente
-    Supervisor.init(children, strategy: :one_for_one)
-  end
-end
-```
-
----
-
-### Exercise 2: Leader Election con :global
-
-**Problem**: Implementa un sistema de leader election donde el líder ejecuta tareas periódicas (ej: cleanup, métricas agregadas). Cuando el líder se cae, uno de los followers debe asumir el liderazgo automáticamente. Incluye un mecanismo para que los followers puedan consultar quién es el líder actual.
-
-**Hints**:
-- El truco está en combinar `monitor_nodes` con reintentos de registro
-- Cuando detectas `{:nodedown, leader_node}`, intenta registrar el nombre global inmediatamente
-- El `resolve_conflict` debe ser determinístico para evitar elecciones oscilantes — usa el nombre del nodo o el uptime
-- Los followers deben seguir intentando cada N segundos por si el líder falla silenciosamente
-- El líder debe monitorear el proceso de verificación: si `:global.whereis_name` retorna otro PID, abdicó
-
-**One possible solution**:
-
-```elixir
-defmodule ClusterLeader do
+defmodule ApiGateway.Janitor.Worker do
   use GenServer
   require Logger
 
-  @retry_interval 2_000
-  @leader_name :cluster_leader
+  @task_interval_ms 30_000
 
-  def start_link(opts \\ []) do
+  def start_link(opts) do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
   end
 
-  def leader_node do
-    case :global.whereis_name(@leader_name) do
-      :undefined -> nil
-      pid -> node(pid)
-    end
-  end
-
-  def am_i_leader?, do: GenServer.call(__MODULE__, :am_i_leader)
-
+  @impl true
   def init(_opts) do
-    :net_kernel.monitor_nodes(true)
-    send(self(), :attempt_leadership)
-    {:ok, %{is_leader: false, task_timer: nil}}
+    # TODO: schedule the first task run
+    # HINT: Process.send_after(self(), :run_tasks, @task_interval_ms)
+    {:ok, %{tasks_run: 0}}
   end
 
-  def handle_info(:attempt_leadership, state) do
-    new_state = try_become_leader(state)
-    Process.send_after(self(), :attempt_leadership, @retry_interval)
-    {:noreply, new_state}
+  @impl true
+  def handle_info(:run_tasks, state) do
+    # TODO:
+    # 1. Check if this node is the leader: ApiGateway.Cluster.Leader.leader?()
+    # 2. If leader: run each cleanup task (log + call private function)
+    # 3. If not leader: log debug "Skipping tasks — not the leader"
+    # 4. Reschedule
+    # 5. {:noreply, %{state | tasks_run: state.tasks_run + (if leader?, do: 1, else: 0)}}
+    {:noreply, state}
   end
 
-  def handle_info(:leader_task, %{is_leader: true} = state) do
-    # Solo el líder ejecuta esto
-    Logger.info("[Leader] Running periodic task on #{node()}")
-    timer = Process.send_after(self(), :leader_task, 5_000)
-    {:noreply, %{state | task_timer: timer}}
-  end
+  # ---------------------------------------------------------------------------
+  # Private cleanup tasks
+  # ---------------------------------------------------------------------------
 
-  def handle_info(:leader_task, state), do: {:noreply, state}
-
-  def handle_info({:nodedown, node}, state) do
-    Logger.info("[LeaderElection] Node down: #{node}, attempting leadership")
-    new_state = try_become_leader(state)
-    {:noreply, new_state}
-  end
-
-  def handle_info({:global_name_conflict, @leader_name}, state) do
-    Logger.warning("[LeaderElection] Lost leadership conflict")
-    if state.task_timer, do: Process.cancel_timer(state.task_timer)
-    {:noreply, %{state | is_leader: false, task_timer: nil}}
-  end
-
-  def handle_call(:am_i_leader, _from, state) do
-    {:reply, state.is_leader, state}
-  end
-
-  defp try_become_leader(state) do
-    case :global.register_name(@leader_name, self(), &resolve_conflict/3) do
-      :yes ->
-        Logger.info("[LeaderElection] Became leader on #{node()}")
-        timer = Process.send_after(self(), :leader_task, 1_000)
-        %{state | is_leader: true, task_timer: timer}
-      :no ->
-        state
-    end
-  end
-
-  # Nodo con menor nombre léxico gana — determinístico
-  defp resolve_conflict(_name, pid1, pid2) do
-    if to_string(node(pid1)) <= to_string(node(pid2)), do: pid1, else: pid2
-  end
+  # TODO: defp purge_expired_audit_entries, delete rows older than 90 days
+  # TODO: defp remove_stale_circuit_breakers, clean up workers with no traffic in 24h
 end
 ```
 
----
-
-### Exercise 3: Process Groups con :pg
-
-**Problem**: Implementa un sistema de workers distribuidos usando `:pg`. Los workers se registran en grupos por tipo de trabajo. Un dispatcher distribuye trabajo aleatoriamente entre workers disponibles del grupo correcto, con fallback a workers locales si no hay remotos.
-
-**Hints**:
-- `:pg` debe iniciarse como parte del supervision tree con un scope name
-- `pg.get_members/2` retorna PIDs de todos los nodos — filtra con `node(pid)` para locales vs remotos
-- Para selección aleatoria de worker, usa `Enum.random/1`
-- Un worker que muere se elimina automáticamente de `:pg` — no necesitas cleanup manual
-- El scope de `:pg` debe iniciarse antes que los workers
-
-**One possible solution**:
+### Step 3: Start `{:pg, :start_link, [ApiGateway.PG]}` in `application.ex`
 
 ```elixir
-defmodule WorkerRegistry do
-  @scope :worker_pg
-
-  def child_spec(_opts) do
-    %{
-      id: __MODULE__,
-      start: {:pg, :start_link, [@scope]},
-      type: :worker
-    }
-  end
-
-  def register(worker_type, pid \\ self()) do
-    :pg.join(@scope, worker_type, pid)
-  end
-
-  def get_worker(worker_type) do
-    case :pg.get_members(@scope, worker_type) do
-      [] -> {:error, :no_workers}
-      pids -> {:ok, Enum.random(pids)}
-    end
-  end
-
-  def get_local_worker(worker_type) do
-    case :pg.get_local_members(@scope, worker_type) do
-      [] -> get_worker(worker_type)  # fallback a remoto
-      pids -> {:ok, Enum.random(pids)}
-    end
-  end
-
-  def worker_count(worker_type) do
-    length(:pg.get_members(@scope, worker_type))
-  end
-end
-
-defmodule Worker do
-  use GenServer
-
-  def start_link(worker_type) do
-    GenServer.start_link(__MODULE__, worker_type)
-  end
-
-  def execute(pid, job), do: GenServer.call(pid, {:execute, job})
-
-  def init(worker_type) do
-    WorkerRegistry.register(worker_type)
-    {:ok, %{type: worker_type, jobs_done: 0}}
-  end
-
-  def handle_call({:execute, job}, _from, state) do
-    result = process_job(job)
-    {:reply, result, %{state | jobs_done: state.jobs_done + 1}}
-  end
-
-  defp process_job(job), do: {:completed, job, node()}
-end
-
-defmodule Dispatcher do
-  def dispatch(worker_type, job) do
-    with {:ok, worker} <- WorkerRegistry.get_local_worker(worker_type) do
-      Worker.execute(worker, job)
-    end
-  end
-end
+# In lib/api_gateway/application.ex, add before CoreSupervisor:
+%{
+  id:    ApiGateway.PG,
+  start: {:pg, :start_link, [ApiGateway.PG]}
+}
 ```
 
----
-
-## Common Mistakes
-
-**`:global.register_name` bloqueante**: La llamada puede bloquearse si el cluster está en proceso de reconfigurarse. Siempre úsala con un timeout o desde dentro de un GenServer donde el timeout es manejado por el caller.
-
-**No manejar `{:global_name_conflict, name}`**: Cuando un proceso pierde un conflicto de nombre, `:global` le envía este mensaje. Si el proceso no lo maneja, queda en su mailbox indefinidamente y puede causar confusión. Siempre agrega `handle_info` para este mensaje.
-
-**Asumir que `:global.whereis_name` es consistente**: Entre el momento que llamas `whereis_name` y usas el PID, el proceso puede morir. Siempre maneja `{:EXIT, pid, reason}` o usa `try/catch` alrededor de GenServer.call con PID remoto.
-
-**No iniciar el scope de `:pg`**: `:pg` requiere que el scope esté iniciado antes de usarlo. Si lo olvidas, obtendrás un error críptico. El scope puede ser un átomo o un módulo configurado en el supervision tree.
-
-**Usar `:global` para alta frecuencia de lookups**: `:global.whereis_name` no es particularmente rápido — implica una búsqueda en tabla distribuida. Para hot paths, cachea el PID localmente y monitorea el proceso para invalidar el caché.
-
-**Netsplit + `:global` = registros huérfanos**: Después de un netsplit y recovery, `:global` sincroniza pero puede haber registros de procesos muertos si el netsplit duró más que el process lifetime. Siempre verifica que el PID retornado por `whereis_name` sigue vivo.
-
----
-
-## Verification
+Then register the janitor worker in its `:pg` group from `Janitor.Worker.init/1`:
 
 ```elixir
-# Verifica registro y lookup básico
-:global.register_name(:test_process, self())
-#=> :yes
+# In Janitor.Worker.init/1:
+:pg.join(ApiGateway.PG, :janitor_workers, self())
+```
 
-pid = :global.whereis_name(:test_process)
-assert pid == self()
+### Step 4: Given tests — must pass without modification
 
-# Verifica via tuple con GenServer
-{:ok, _} = ConfigServer.start_link(%{env: :test})
-assert ConfigServer.get(:env) == :test
-ConfigServer.put(:version, "1.0")
-assert ConfigServer.get(:version) == "1.0"
+```elixir
+# test/api_gateway/cluster/leader_test.exs
+defmodule ApiGateway.Cluster.LeaderTest do
+  use ExUnit.Case, async: false
 
-# Verifica process groups
-{:ok, _} = Worker.start_link(:compute)
-{:ok, _} = Worker.start_link(:compute)
-assert WorkerRegistry.worker_count(:compute) == 2
+  alias ApiGateway.Cluster.Leader
 
-{:ok, worker} = WorkerRegistry.get_worker(:compute)
-assert is_pid(worker)
+  setup do
+    # Each test starts a fresh Leader — clean up any global registration first
+    :global.unregister_name(:api_gateway_leader)
+    {:ok, _} = start_supervised(Leader)
+    # Give the initial election attempt time to run
+    Process.sleep(50)
+    :ok
+  end
 
-{:completed, :my_job, _node} = Dispatcher.dispatch(:compute, :my_job)
+  describe "initial election" do
+    test "becomes leader when no other leader exists" do
+      # With only this node and no other leader registered, the process should claim it
+      assert Leader.leader?() == true
+    end
+
+    test "current_leader_node/0 returns this node" do
+      assert Leader.current_leader_node() == node()
+    end
+  end
+
+  describe "leader?/0 consistency" do
+    test "leader?/0 reflects :global state, not cached state" do
+      # Force-unregister the name externally (simulates a netsplit resolution loss)
+      :global.unregister_name(:api_gateway_leader)
+      Process.sleep(50)
+
+      # The leader should detect it no longer holds the name
+      refute Leader.leader?()
+    end
+
+    test "leader reclaims name after it is cleared" do
+      :global.unregister_name(:api_gateway_leader)
+      # Wait for the next election cycle
+      Process.sleep(4_000)
+
+      assert Leader.leader?() == true
+    end
+  end
+
+  describe "conflict resolution" do
+    test "handle_info :global_name_conflict clears leader state" do
+      pid = Process.whereis(Leader)
+      send(pid, {:global_name_conflict, :api_gateway_leader})
+      Process.sleep(50)
+
+      refute Leader.leader?()
+    end
+  end
+
+  describe "nodedown handling" do
+    test "triggers election attempt on nodedown" do
+      pid = Process.whereis(Leader)
+
+      # Unregister so there's something to elect
+      :global.unregister_name(:api_gateway_leader)
+
+      # Simulate a nodedown event
+      send(pid, {:nodedown, :"some_other_node@nohost"})
+      Process.sleep(100)
+
+      # After nodedown triggers election, leader should reclaim the name
+      assert Leader.leader?() == true
+    end
+  end
+end
+```
+
+### Step 5: Run the tests
+
+```bash
+mix test test/api_gateway/cluster/leader_test.exs --trace
 ```
 
 ---
 
-## Summary
+## Trade-off analysis
 
-`:global` provee registro de nombres a nivel de cluster con garantías de unicidad:
+| Design choice | Benefit | Risk |
+|---------------|---------|------|
+| `:global` for election primitive | Zero external dependencies; uses existing cluster connection | CP behavior — elections stall during netsplits; not suitable for AP workloads |
+| Lexicographic node-name conflict resolution | Deterministic, symmetric, no coordination needed | Tiebreaker depends on node naming convention — bad names cause unexpected winners |
+| Periodic re-election via `send_after` | Recovers from silent leadership loss without event | Elections fire even when everything is healthy — wastes CPU (negligible at 3s interval) |
+| Leader check in janitor before each task | No wasted work on non-leader nodes | Adds a GenServer round-trip per task cycle; negligible cost for 30s intervals |
+| `:pg` for fanout groups | Auto-cleanup on process death; per-node member filtering | `:pg` scope must be started before any `join` call — startup order matters |
 
-- Semántica CP: sacrifica disponibilidad para garantizar que solo hay un proceso con cada nombre
-- Los callbacks de resolución de conflictos son esenciales para comportamiento determinístico tras netsplits
-- `:pg` complementa a `:global`: grupos de procesos en lugar de singletons
-- Leader election sobre `:global` es el patrón más simple para coordinación básica de cluster
-- Para casos de uso más complejos o clusters grandes, considerar Horde (ejercicio 13)
+Reflection question: the `Leader` process re-checks `:global.whereis_name/1` on every
+`leader?/0` call instead of trusting its local `state.leader` field. What failure scenario
+does this prevent? What is the cost of not doing this check?
 
 ---
 
-## What's Next
+## Common production mistakes
 
-- **Exercise 13**: Horde — distribución con CRDTs para mejor tolerancia a particiones que `:global`
-- **Exercise 14**: Phoenix PubSub — mensajería distribuida construida sobre `:pg`
-- **Exercise 15**: RPC patterns para invocar código en nodos remotos
+**1. Not implementing `handle_info({:global_name_conflict, name}, state)`**
+When a process loses a post-netsplit conflict resolution, `:global` sends
+`{:global_name_conflict, name}` to the losing process. If this message is not handled,
+it sits in the mailbox forever and the process still believes it is the leader
+(`state.leader == true`) while another process actually holds the name. Always handle
+this message and clear your local leader flag.
+
+**2. Using `:global` registration as a mutex for frequent operations**
+`:global.register_name/2` involves cross-cluster locking. Calling it in a hot path
+(e.g., on every request) will serialize all nodes and destroy throughput. Use `:global`
+only for low-frequency coordination (elections, singleton startup) and cache the result
+locally with process monitoring.
+
+**3. Assuming `:global.whereis_name/1` and the returned PID are atomically valid**
+Between `whereis_name` returning a PID and your `GenServer.call` reaching that PID,
+the process can die. Always wrap calls to global processes in a `try/rescue` or use
+a monitor. The `{:via, :global, name}` pattern does not protect against this race.
+
+**4. Forgetting to start the `:pg` scope**
+`:pg` functions (`join`, `get_members`) crash with `{:noproc, ...}` if the scope is
+not running. The scope is a regular OTP process that must be in the supervision tree
+before any `:pg` calls. Symptom: tests pass in isolation but fail when the application
+is started because startup order differs.
+
+**5. Using `:global` for high-churn registrations**
+`:global` is optimized for long-lived singleton registrations, not for thousands of
+short-lived process registrations per second. Using it as a distributed process
+registry for every active request will create a synchronization bottleneck. Use
+`Horde.Registry` (exercise 13) or `Registry` with `:pg` for high-churn scenarios.
+
+**6. Relying on the leader for reads in a distributed cache**
+If all nodes must call the leader GenServer for every cache read, the leader becomes
+a bottleneck and a single point of failure for reads. The leader pattern is correct
+for **writes and coordination** (deciding who does what). Reads should be local
+wherever possible, using the leader only to push updates to followers.
 
 ---
 
 ## Resources
 
-- [:global module documentation](https://www.erlang.org/doc/man/global.html)
-- [:pg module documentation (OTP 23+)](https://www.erlang.org/doc/man/pg.html)
-- [Erlang/OTP: distributed applications](https://www.erlang.org/doc/design_principles/distributed_applications.html)
-- [Process Groups in Erlang — Erlang Solutions blog](https://www.erlang-solutions.com/blog/)
-- [Conflict resolution in :global — Stack Overflow discussion](https://stackoverflow.com/questions/tagged/erlang+distributed)
+- [Erlang :global module](https://www.erlang.org/doc/man/global.html)
+- [Erlang :pg module (OTP 23+)](https://www.erlang.org/doc/man/pg.html)
+- [HexDocs — GenServer via tuple](https://hexdocs.pm/elixir/GenServer.html#module-name-registration)
+- [Distributed applications — OTP Design Principles](https://www.erlang.org/doc/design_principles/distributed_applications.html)
+- [Horde: Distributed Supervisor and Registry for Elixir](https://hexdocs.pm/horde/readme.html)
+- [Elixir in Action, 3rd ed. — Saša Jurić](https://www.manning.com/books/elixir-in-action-third-edition) — ch. 13, distributed systems

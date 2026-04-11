@@ -1,534 +1,409 @@
-# 30 - Process Dictionary (Erlang)
+# Process Dictionary: When to Use It and When to Refactor Away
 
-## Prerequisites
-
-- Procesos Elixir: `spawn`, `send`, `receive`
-- Agent básico (ejercicio 02)
-- ETS básico (ejercicio 13)
-- Comprensión del modelo de actores y aislamiento de procesos
+**Project**: `task_queue` — built incrementally across the intermediate level
 
 ---
 
-## Learning Objectives
+## Project context
 
-Al completar este ejercicio serás capaz de:
+A previous developer added request-scoped caching to the `task_queue` worker using the process dictionary — storing the current job's context in `Process.put/2` so that helper functions deep in the call stack can access it without threading the context through every function argument. It works, but it is invisible, untestable, and creates surprising behavior when workers are reused across jobs.
 
-1. Usar `Process.put/2`, `Process.get/1`, `Process.delete/1` para estado por proceso
-2. Entender la relación entre las funciones Elixir y las Erlang subyacentes (`:erlang.put/get`)
-3. Identificar los casos legítimos (escasos) donde el process dictionary tiene sentido
-4. Conocer sus limitaciones: invisibilidad, acoplamiento implícito, dificultad para testear
-5. Refactorizar código que usa process dictionary hacia `Agent` o `ETS`
-6. Inspeccionar el dictionary con `Process.info(self(), :dictionary)`
+Project structure at this point:
+
+```
+task_queue/
+├── lib/
+│   └── task_queue/
+│       ├── application.ex
+│       ├── worker.ex               # ← process dictionary is currently here
+│       ├── job_context.ex          # ← you refactor to this Agent-based module
+│       ├── queue_server.ex
+│       ├── scheduler.ex
+│       └── registry.ex
+├── test/
+│   └── task_queue/
+│       └── process_dict_test.exs   # given tests — must pass without modification
+└── mix.exs
+```
 
 ---
 
-## Concepts
+## The business problem
 
-### Qué es el Process Dictionary
+Workers store the current job's metadata (job ID, type, start time, retry count) in the process dictionary so that logging helpers and error handlers can access it without being passed the job struct explicitly. The code works but has two problems:
 
-Cada proceso Erlang/Elixir tiene un diccionario privado de pares `{key, value}` que vive durante toda la vida del proceso. Es un mecanismo de estado mutable local, invisible desde fuera del proceso.
+1. **Invisible state** — `Process.get(:current_job)` in a logging helper is completely non-obvious to anyone reading the code. The contract between the worker and the helper is invisible.
+2. **Leak between jobs** — if a worker process is reused across jobs (common in supervised worker pools), `Process.put` values from the previous job persist until explicitly overwritten. A bug where `Process.delete(:current_job)` is missing means the second job runs with the first job's context.
+
+The refactoring goal: understand what the process dictionary is, when it is acceptable, and how to replace it with an explicit `Agent`-based context that is testable and visible.
+
+---
+
+## What the process dictionary is
+
+Every Erlang/Elixir process has a private mutable key-value store — the process dictionary. It is accessible only from within the process (no external process can read it). It persists for the lifetime of the process and is garbage-collected when the process terminates.
 
 ```elixir
-# Almacenar un valor
-Process.put(:contador, 0)
+# Write
+Process.put(:key, "value")
 
-# Leer un valor (nil si no existe)
-Process.get(:contador)     # 0
+# Read
+Process.get(:key)           # => "value"
+Process.get(:missing, :default)  # => :default
 
-# Leer con valor por defecto
-Process.get(:otro, :no_existe)  # :no_existe
+# Delete
+Process.delete(:key)
 
-# Eliminar una clave
-Process.delete(:contador)  # devuelve el valor anterior: 0
-
-# Leer todo el diccionario
-Process.get()  # [{:contador, 0}, ...]
+# Dump entire dictionary
+Process.get()  # => [{:key, "value"}, ...]
 ```
 
-### La capa Erlang subyacente
+The process dictionary is an Erlang primitive that predates Agent. It is occasionally the right tool — but rarely in application code.
 
-Las funciones de Elixir son wrappers de las BIFs (Built-In Functions) de Erlang:
+---
+
+## When the process dictionary is acceptable
+
+The process dictionary has legitimate uses in narrow contexts:
+
+| Acceptable | Why |
+|-----------|-----|
+| Logger metadata (`Logger.metadata/1`) | It uses the process dictionary internally for per-process log context |
+| Memoization in a single request | Cache an expensive computation scoped to one function call stack |
+| Ecto sandbox ownership | The sandbox uses the process dictionary to track which test owns which database connection |
+| `:rand` seed | The Erlang random number generator stores its seed per process |
+
+The common thread: the state is truly scoped to the current process and its lifetime, not shared with others, and the user does not need to test or observe it directly.
+
+---
+
+## Why process dictionary in `task_queue` workers is wrong
 
 ```elixir
-# Equivalentes exactos
-Process.put(:key, :value)   ==  :erlang.put(:key, :value)
-Process.get(:key)           ==  :erlang.get(:key)
-Process.delete(:key)        ==  :erlang.erase(:key)
-Process.get()               ==  :erlang.get()
+# In Worker.execute/1:
+Process.put(:current_job, job)
+do_execute(job)
+Process.delete(:current_job)
 
-# :erlang.erase/0 borra TODO el diccionario
-:erlang.erase()
+# In a helper called deep in the stack:
+defp log_progress(msg) do
+  job = Process.get(:current_job)   # invisible dependency
+  Logger.info("[#{job.id}] #{msg}")
+end
 ```
 
-### Inspección desde fuera
+Problems:
+- `log_progress/1` has a hidden dependency on process state. It looks like a pure function but it is not.
+- If `do_execute` raises before `Process.delete(:current_job)`, the old job context leaks into the next execution.
+- Unit testing `log_progress/1` in isolation requires setting up the process dictionary — a surprising test setup.
+
+---
+
+## Implementation
+
+### Step 1: `lib/task_queue/worker.ex` — current state with process dictionary (to understand)
 
 ```elixir
-# Ver el dictionary de OTRO proceso (observación, no modificación)
-pid = spawn(fn ->
-  Process.put(:secreto, 42)
-  Process.sleep(5000)
-end)
+defmodule TaskQueue.Worker do
+  @moduledoc """
+  Current implementation uses the process dictionary for job context.
+  This module shows the pattern and its problems. See JobContext for the refactored version.
+  """
 
-Process.info(pid, :dictionary)
-# {:dictionary, [{:"$initial_call", {Kernel, :exec_fun, 3}}, {:secreto, 42}]}
+  def execute(%{type: type, args: args} = job) do
+    # Store job context in process dictionary — visible to any helper in this process
+    Process.put(:current_job_id, Map.get(job, :id, "unknown"))
+    Process.put(:current_job_type, type)
+    Process.put(:job_start_time, System.monotonic_time())
 
-# Nota: las claves que empiezan con $ son internas de OTP
-```
-
-### Cuándo usar el Process Dictionary (raramente)
-
-Los casos donde es aceptable son muy específicos:
-
-```elixir
-# CASO 1: Acumular traza/log dentro de una operación compleja
-# (patrón usado por Logger internamente)
-defmodule Tracer do
-  def start_trace(id) do
-    Process.put(:trace_id, id)
-    Process.put(:trace_events, [])
+    try do
+      result = do_execute(type, args)
+      log_completion(:ok)
+      {:ok, result}
+    rescue
+      e ->
+        log_completion(:error)
+        {:error, Exception.message(e)}
+    after
+      # Clean up — but what if we forget this line?
+      Process.delete(:current_job_id)
+      Process.delete(:current_job_type)
+      Process.delete(:job_start_time)
+    end
   end
 
-  def record(event) do
-    events = Process.get(:trace_events, [])
-    Process.put(:trace_events, [event | events])
+  def execute(_), do: {:error, :missing_required_fields}
+
+  # Hidden dependency on process dictionary — not a pure function
+  defp log_completion(status) do
+    job_id   = Process.get(:current_job_id, "unknown")
+    job_type = Process.get(:current_job_type, "unknown")
+    start    = Process.get(:job_start_time, System.monotonic_time())
+    duration = System.convert_time_unit(System.monotonic_time() - start, :native, :millisecond)
+    :logger.info("Job #{job_id} (#{job_type}) #{status} in #{duration}ms")
   end
 
-  def finish_trace do
-    id     = Process.get(:trace_id)
-    events = Process.get(:trace_events, []) |> Enum.reverse()
-    Process.delete(:trace_id)
-    Process.delete(:trace_events)
-    {id, events}
+  defp do_execute("noop", _args), do: :noop
+  defp do_execute("echo", args), do: args
+  defp do_execute(type, _args), do: raise("unknown type: #{type}")
+end
+```
+
+### Step 2: `lib/task_queue/job_context.ex` — refactored to explicit Agent
+
+```elixir
+defmodule TaskQueue.JobContext do
+  @moduledoc """
+  Explicit, testable job execution context.
+
+  Replaces the process dictionary with a named Agent that stores
+  the current job's context for the duration of its execution.
+
+  The context is explicit (visible in function signatures), testable
+  (can be started and inspected in tests), and safe (Agent is GC'd
+  when the worker process terminates).
+  """
+
+  use Agent
+
+  @type context :: %{
+    job_id: String.t(),
+    job_type: String.t(),
+    start_time: integer(),
+    retry_count: non_neg_integer()
+  }
+
+  @doc """
+  Starts a job context Agent for the current worker process.
+  The name is scoped to the calling process PID to avoid conflicts.
+  """
+  def start_link(job) do
+    name = via_pid(self())
+    Agent.start_link(fn -> build_context(job) end, name: name)
+  end
+
+  @doc """
+  Returns the current job context, or `nil` if no context is active.
+  """
+  @spec current() :: context() | nil
+  def current do
+    name = via_pid(self())
+    # TODO: use Agent.get/2 to return the current state
+    # Return nil if the agent is not running
+    # HINT:
+    # case GenServer.whereis(name) do
+    #   nil -> nil
+    #   _   -> Agent.get(name, & &1)
+    # end
+  end
+
+  @doc """
+  Updates a single field in the current job context.
+  """
+  @spec update(atom(), term()) :: :ok
+  def update(key, value) do
+    # TODO: use Agent.update/2 to set key in the state map
+    # HINT: Agent.update(via_pid(self()), &Map.put(&1, key, value))
+  end
+
+  @doc """
+  Stops the context Agent for the current process. Called after job completion.
+  """
+  def stop do
+    name = via_pid(self())
+    # TODO: stop the agent if it is running
+    # HINT:
+    # case GenServer.whereis(name) do
+    #   nil -> :ok
+    #   _   -> Agent.stop(name)
+    # end
+  end
+
+  # Private
+
+  defp via_pid(pid) do
+    {:via, Registry, {TaskQueue.ContextRegistry, pid}}
+  end
+
+  defp build_context(job) do
+    %{
+      job_id:      Map.get(job, :id, "unknown"),
+      job_type:    Map.get(job, :type, "unknown"),
+      start_time:  System.monotonic_time(),
+      retry_count: Map.get(job, :retry_count, 0)
+    }
   end
 end
+```
 
-# CASO 2: Cache de recursos costosos que se reusan en el mismo proceso
-# (por ejemplo, conexiones de base de datos en pool workers)
-defmodule ResourceCache do
-  def get_or_create(key, create_fn) do
-    case Process.get({:cache, key}) do
-      nil ->
-        resource = create_fn.()
-        Process.put({:cache, key}, resource)
-        resource
-      resource ->
-        resource
+### Step 3: Given tests — must pass without modification
+
+```elixir
+# test/task_queue/process_dict_test.exs
+defmodule TaskQueue.ProcessDictTest do
+  use ExUnit.Case, async: true
+
+  describe "process dictionary — basic operations" do
+    test "put and get a value" do
+      Process.put(:test_key, "hello")
+      assert Process.get(:test_key) == "hello"
+    end
+
+    test "get returns default for missing key" do
+      assert Process.get(:nonexistent_key, :default) == :default
+    end
+
+    test "delete removes the key" do
+      Process.put(:to_delete, "value")
+      Process.delete(:to_delete)
+      assert Process.get(:to_delete) == nil
+    end
+
+    test "process dictionary is process-local — another process sees different state" do
+      Process.put(:shared_key, "parent_value")
+
+      child_value =
+        Task.async(fn ->
+          # Child process has its own dictionary — parent's value is NOT visible
+          Process.get(:shared_key, :not_set)
+        end)
+        |> Task.await()
+
+      assert child_value == :not_set
+      assert Process.get(:shared_key) == "parent_value"
+    end
+
+    test "process dictionary is cleaned up when process terminates" do
+      # Start a process, put a value, wait for it to die
+      pid =
+        spawn(fn ->
+          Process.put(:key, "value")
+          # Process exits here
+        end)
+
+      ref = Process.monitor(pid)
+      assert_receive {:DOWN, ^ref, :process, ^pid, _}
+
+      # The process is gone — its dictionary is gone with it
+      # We cannot observe it from here, but the test confirms the process died cleanly
+      refute Process.alive?(pid)
+    end
+  end
+
+  describe "Worker — process dictionary usage" do
+    test "worker cleans up process dictionary after execution" do
+      TaskQueue.Worker.execute(%{id: "j1", type: "noop", args: %{}})
+      # After execution, the worker's process dictionary entries must be cleared
+      assert Process.get(:current_job_id) == nil
+      assert Process.get(:current_job_type) == nil
+      assert Process.get(:job_start_time) == nil
+    end
+
+    test "process dictionary does not leak between consecutive jobs" do
+      TaskQueue.Worker.execute(%{id: "job-a", type: "noop", args: %{}})
+      TaskQueue.Worker.execute(%{id: "job-b", type: "echo", args: %{x: 1}})
+      # After job-b, no stale job-a context
+      assert Process.get(:current_job_id) == nil
+    end
+  end
+
+  describe "JobContext — explicit Agent-based context" do
+    setup do
+      # Start the registry that JobContext uses for named agents
+      start_supervised!({Registry, keys: :unique, name: TaskQueue.ContextRegistry})
+      :ok
+    end
+
+    test "starts and stores context" do
+      job = %{id: "j2", type: "send_email", args: %{}}
+      {:ok, _pid} = TaskQueue.JobContext.start_link(job)
+
+      ctx = TaskQueue.JobContext.current()
+      assert ctx.job_id == "j2"
+      assert ctx.job_type == "send_email"
+      assert is_integer(ctx.start_time)
+    end
+
+    test "update/2 changes a field" do
+      {:ok, _} = TaskQueue.JobContext.start_link(%{id: "j3", type: "noop", args: %{}})
+      TaskQueue.JobContext.update(:retry_count, 2)
+      assert TaskQueue.JobContext.current().retry_count == 2
+    end
+
+    test "stop/0 cleans up the agent" do
+      {:ok, _} = TaskQueue.JobContext.start_link(%{id: "j4", type: "noop", args: %{}})
+      :ok = TaskQueue.JobContext.stop()
+      assert TaskQueue.JobContext.current() == nil
+    end
+
+    test "current/0 returns nil when no context is active" do
+      assert TaskQueue.JobContext.current() == nil
     end
   end
 end
 ```
 
-### Por qué preferir Agent o ETS
+### Step 4: Run the tests
 
-```elixir
-# --- CON PROCESS DICTIONARY (problemático) ---
-defmodule CounterBad do
-  def increment do
-    current = Process.get(:counter, 0)
-    Process.put(:counter, current + 1)
-  end
-
-  def value, do: Process.get(:counter, 0)
-end
-
-# Problemas:
-# 1. Solo funciona en el mismo proceso que lo inicializó
-# 2. No hay interface clara: cualquier código puede leer/escribir :counter
-# 3. Imposible de testear en aislamiento
-# 4. Si el proceso muere, el estado desaparece silenciosamente
-
-# --- CON AGENT (correcto) ---
-defmodule CounterGood do
-  def start_link(initial \\ 0) do
-    Agent.start_link(fn -> initial end, name: __MODULE__)
-  end
-
-  def increment do
-    Agent.update(__MODULE__, &(&1 + 1))
-  end
-
-  def value do
-    Agent.get(__MODULE__, & &1)
-  end
-end
-# Ventajas: interfaz explícita, compartible entre procesos, testeable, supervisable
+```bash
+mix test test/task_queue/process_dict_test.exs --trace
 ```
 
 ---
 
-## Exercises
+## Trade-off analysis
 
-### Ejercicio 1: Logger de solicitudes HTTP por proceso
+| Approach | Visibility | Testability | Leak safety | Appropriate for |
+|----------|-----------|-------------|-------------|----------------|
+| Process dictionary | hidden | requires dict setup in tests | depends on explicit delete | Logger metadata, library internals |
+| Agent (JobContext) | explicit name | start in test setup | GC'd with process | application-level per-request context |
+| Function arguments | fully visible | pure functions | N/A — no state | preferred for most cases |
+| `conn` / accumulator | explicit in `with` chain | pure | N/A | request pipelines (Plug) |
 
-Simula un middleware que acumula logs de una solicitud HTTP en el process dictionary durante el ciclo de vida de la request.
-
-```elixir
-defmodule RequestLogger do
-  @doc """
-  Inicializa el logger para una nueva solicitud.
-  Guarda request_id y timestamp de inicio en el process dictionary.
-  """
-  def start_request(request_id) do
-    # TODO: guardar en el process dictionary:
-    # - {:request_id, request_id}
-    # - {:request_start, :os.system_time(:millisecond)}
-    # - {:request_logs, []}
-  end
-
-  @doc """
-  Agrega una entrada de log a la solicitud actual.
-  """
-  def log(level, message) when level in [:info, :warn, :error] do
-    # TODO: obtener logs actuales, agregar {level, message, timestamp},
-    # guardar de vuelta en {:request_logs, ...}
-  end
-
-  @doc """
-  Finaliza la solicitud. Devuelve un mapa con el resumen.
-  Limpia el process dictionary.
-  """
-  def finish_request do
-    # TODO: leer request_id, calcular duración (now - start),
-    # recopilar logs, limpiar las claves del dictionary,
-    # devolver %{request_id: ..., duration_ms: ..., logs: [...]}
-  end
-
-  @doc """
-  Obtiene el request_id actual (útil para propagación a llamadas anidadas).
-  """
-  def current_request_id do
-    # TODO: Process.get(:request_id)
-  end
-end
-```
-
-```elixir
-# Uso esperado:
-# pid = spawn(fn ->
-#   RequestLogger.start_request("req-001")
-#   RequestLogger.log(:info, "Procesando usuario")
-#   Process.sleep(50)
-#   RequestLogger.log(:warn, "Cache miss")
-#   result = RequestLogger.finish_request()
-#   IO.inspect(result)
-#   # %{request_id: "req-001", duration_ms: ~50, logs: [
-#   #   {:info, "Procesando usuario", ...},
-#   #   {:warn, "Cache miss", ...}
-#   # ]}
-# end)
-# Process.sleep(200)
-#
-# Demostrar que OTRO proceso no ve los logs:
-# spawn(fn -> IO.inspect(RequestLogger.current_request_id()) end)
-# # nil — el dictionary es privado por proceso
-```
+Reflection question: `Logger.metadata/1` uses the process dictionary internally. Why is this acceptable for Logger but not for `task_queue`'s job context? What property of Logger's usage makes the process dictionary safe there?
 
 ---
 
-### Ejercicio 2: Counter acumulador en proceso
+## Common production mistakes
 
-Implementa un módulo que usa process dictionary para acumular métricas durante una operación batch, luego refactorízalo hacia Agent.
-
-```elixir
-defmodule BatchMetrics do
-  @doc """
-  Versión 1: usando process dictionary.
-
-  Procesa una lista de items, incrementando contadores por resultado.
-  Al finalizar, devuelve las métricas y limpia el diccionario.
-  """
-  def run_with_dict(items, process_fn) do
-    # TODO: inicializar contadores en process dictionary
-    # {:processed, 0}, {:errors, 0}, {:skipped, 0}
-
-    Enum.each(items, fn item ->
-      case process_fn.(item) do
-        :ok      -> # TODO: incrementar :processed
-        :error   -> # TODO: incrementar :errors
-        :skip    -> # TODO: incrementar :skipped
-      end
-    end)
-
-    # TODO: leer métricas, limpiarlas, devolver mapa
-    # %{processed: N, errors: N, skipped: N}
-  end
-
-  @doc """
-  Versión 2: refactorizada hacia Agent.
-
-  Misma interfaz, pero el estado vive en un Agent supervisable.
-  """
-  def run_with_agent(items, process_fn) do
-    {:ok, agent} = Agent.start_link(fn ->
-      # TODO: estado inicial del agent
-      %{processed: 0, errors: 0, skipped: 0}
-    end)
-
-    Enum.each(items, fn item ->
-      case process_fn.(item) do
-        :ok    ->
-          # TODO: Agent.update/2 para incrementar :processed
-        :error ->
-          # TODO: Agent.update/2 para incrementar :errors
-        :skip  ->
-          # TODO: Agent.update/2 para incrementar :skipped
-      end
-    end)
-
-    metrics = Agent.get(agent, & &1)
-    Agent.stop(agent)
-    metrics
-  end
-end
-```
+**1. Forgetting `Process.delete` in the `after` clause**
 
 ```elixir
-# Verificación: ambas versiones deben dar el mismo resultado
-# process_fn = fn
-#   n when rem(n, 3) == 0 -> :skip
-#   n when rem(n, 7) == 0 -> :error
-#   _                     -> :ok
-# end
-#
-# items = Enum.to_list(1..100)
-#
-# result_dict  = BatchMetrics.run_with_dict(items, process_fn)
-# result_agent = BatchMetrics.run_with_agent(items, process_fn)
-#
-# result_dict == result_agent  # true
-# IO.inspect(result_dict)
-# # %{processed: 76, errors: 10, skipped: 34}  (valores aproximados)
-```
+# Wrong — if do_work raises, the dictionary entry leaks to the next job
+Process.put(:job_id, id)
+do_work()
+Process.delete(:job_id)  # not reached on exception
 
----
-
-### Ejercicio 3: Refactor de process dict a Agent
-
-Dado el siguiente módulo que usa process dictionary de forma inapropiada (estado global implícito), refactorízalo hacia un Agent con interfaz explícita.
-
-```elixir
-# CÓDIGO ORIGINAL — no modificar, solo leer para entender
-defmodule SessionStoreLegacy do
-  # Este módulo asume que siempre se llama desde el mismo proceso.
-  # Usa el process dictionary como "base de datos" de sesiones.
-  # PROBLEMA: si se llama desde procesos distintos, cada uno tiene su propio dict.
-
-  def put_session(user_id, data) do
-    sessions = :erlang.get(:sessions) || %{}
-    :erlang.put(:sessions, Map.put(sessions, user_id, data))
-  end
-
-  def get_session(user_id) do
-    sessions = :erlang.get(:sessions) || %{}
-    Map.get(sessions, user_id)
-  end
-
-  def delete_session(user_id) do
-    sessions = :erlang.get(:sessions) || %{}
-    :erlang.put(:sessions, Map.delete(sessions, user_id))
-  end
-
-  def all_sessions do
-    :erlang.get(:sessions) || %{}
-  end
-end
-```
-
-```elixir
-# TU TAREA: implementar SessionStore usando Agent
-defmodule SessionStore do
-  @moduledoc """
-  Store de sesiones basado en Agent.
-
-  A diferencia del enfoque con process dictionary, este módulo:
-  - Es accesible desde cualquier proceso
-  - Tiene estado supervisable
-  - Tiene interfaz explícita y testeable
-  - Puede ser nombrado globalmente
-  """
-
-  # TODO: start_link/1 — inicia el Agent con estado inicial %{}
-  # Acepta opts para pasar nombre (name: __MODULE__)
-  def start_link(opts \\ []) do
-  end
-
-  # TODO: put/3 — guarda {user_id => data} en el Agent
-  def put(server \\ __MODULE__, user_id, data) do
-  end
-
-  # TODO: get/2 — devuelve los datos del user_id, nil si no existe
-  def get(server \\ __MODULE__, user_id) do
-  end
-
-  # TODO: delete/2 — elimina la sesión del user_id
-  def delete(server \\ __MODULE__, user_id) do
-  end
-
-  # TODO: all/1 — devuelve el mapa completo de sesiones
-  def all(server \\ __MODULE__) do
-  end
-
-  @doc """
-  Demuestra la diferencia entre el enfoque legacy y el correcto.
-  """
-  def demo_isolation do
-    # Con SessionStoreLegacy, esto falla:
-    # Proceso 1 guarda sesión → Proceso 2 no la ve
-    #
-    # Con SessionStore (Agent), ambos procesos comparten el mismo estado.
-    {:ok, _} = start_link(name: :demo_store)
-
-    pid1 = spawn(fn ->
-      SessionStore.put(:demo_store, "user-1", %{name: "Ana"})
-      IO.puts("Proceso 1: sesión guardada")
-    end)
-
-    pid2 = spawn(fn ->
-      Process.sleep(50)  # esperar a que pid1 termine
-      session = SessionStore.get(:demo_store, "user-1")
-      IO.inspect(session, label: "Proceso 2 ve la sesión")
-    end)
-
-    Process.sleep(200)
-    :ok
-  end
-end
-```
-
-```elixir
-# Verificación manual en iex:
-# {:ok, _} = SessionStore.start_link(name: :session_store)
-#
-# SessionStore.put(:session_store, "u1", %{name: "Ana", role: :admin})
-# SessionStore.put(:session_store, "u2", %{name: "Bob", role: :user})
-#
-# SessionStore.get(:session_store, "u1")   # %{name: "Ana", role: :admin}
-# SessionStore.get(:session_store, "u99")  # nil
-# SessionStore.all(:session_store)         # %{"u1" => ..., "u2" => ...}
-# SessionStore.delete(:session_store, "u1")
-# SessionStore.all(:session_store)         # %{"u2" => ...}
-#
-# # Demostrar que el Process.info no puede espiar el Agent fácilmente:
-# Process.info(Process.whereis(:session_store), :dictionary)
-# # {:dictionary, [{"$initial_call", ...}]}  — el estado está en el Agent, no en el dict!
-```
-
----
-
-## Common Mistakes
-
-**1. Usar process dictionary como estado compartido entre procesos**
-
-```elixir
-# MAL: el proceso padre guarda, el proceso hijo no puede leer
-Process.put(:shared, 42)
-spawn(fn ->
-  IO.inspect(Process.get(:shared))  # nil — el hijo tiene su propio dict vacío
-end)
-
-# BIEN: usa Agent, ETS, o paso de mensajes explícito
-```
-
-**2. No limpiar después de usarlo**
-
-```elixir
-# MAL: el valor persiste hasta que el proceso muere
-# Si el proceso es un worker reusado (pool), contamina la siguiente request
-Process.put(:request_id, "req-001")
-# ... olvidar Process.delete(:request_id)
-
-# BIEN: siempre limpiar al final de la operación
+# Right — after always runs
 try do
-  Process.put(:request_id, id)
+  Process.put(:job_id, id)
   do_work()
 after
-  Process.delete(:request_id)
+  Process.delete(:job_id)
 end
 ```
 
-**3. Usar átomos dinámicos como claves**
+**2. Sharing process dictionary state across process boundaries**
 
-```elixir
-# MAL: los átomos son globales y no se garbage-collectan
-user_id = get_user_id()
-Process.put(String.to_atom("user_#{user_id}"), data)  # atom leak!
+The process dictionary is NEVER visible to other processes. If you put a value in process A and try to read it in process B, you get `nil`. This trips developers who assume it works like a thread-local in Java.
 
-# BIEN: usar tuplas con la parte dinámica como string/integer
-Process.put({:user_data, user_id}, data)
-```
+**3. Using the process dictionary for cross-cutting state that spans multiple processes**
 
-**4. Confiar en el process dictionary para lógica de negocio**
+If your context needs to be passed to a spawned Task or a GenServer call, it must be passed explicitly — the process dictionary does not cross process boundaries.
 
-El process dictionary es un mecanismo de runtime de Erlang, no un componente de arquitectura. Si tu lógica de negocio depende de él, es una señal de diseño incorrecto.
+**4. Not cleaning up in concurrent test scenarios**
 
----
+Tests that use `async: true` run in separate processes, so process dictionary state does not leak between tests. But tests that use `async: false` and share a process pool may see stale dictionary values from a previous test if cleanup is missing.
 
-## Verification
+**5. Treating the process dictionary as a performance optimization for deeply nested calls**
 
-```elixir
-# Test rápido en iex:
-
-# 1. Básicos
-Process.put(:test, "hola")
-Process.get(:test)          # "hola"
-Process.get(:inexistente, :default)  # :default
-Process.delete(:test)       # "hola" (devuelve el valor anterior)
-Process.get(:test)          # nil
-
-# 2. Aislamiento entre procesos
-Process.put(:aislado, 99)
-spawn(fn ->
-  IO.inspect(Process.get(:aislado), label: "hijo")  # nil
-end)
-Process.sleep(100)
-IO.inspect(Process.get(:aislado), label: "padre")   # 99
-
-# 3. Inspección externa
-pid = spawn(fn ->
-  Process.put(:mi_dato, :secreto)
-  Process.sleep(1000)
-end)
-Process.sleep(50)
-Process.info(pid, :dictionary)
-# {:dictionary, [mi_dato: :secreto, ...]}
-
-# 4. Agent como alternativa
-{:ok, agent} = Agent.start_link(fn -> %{} end)
-Agent.update(agent, &Map.put(&1, :key, :value))
-Agent.get(agent, & &1)   # %{key: :value}
-Agent.stop(agent)
-```
-
----
-
-## Summary
-
-El process dictionary es un mecanismo de bajo nivel heredado de Erlang. Funciona como un mapa privado mutable por proceso, invisible desde el exterior.
-
-| Característica | Process Dictionary | Agent | ETS |
-|---|---|---|---|
-| Visibilidad | Solo proceso propietario | Cualquier proceso (via PID/name) | Cualquier proceso |
-| Supervisión | No | Sí (OTP) | No directamente |
-| Persistencia | Hasta muerte del proceso | Hasta muerte del proceso | Configurable |
-| Caso de uso | Tracing interno, cache local | Estado compartido simple | Estado masivo / concurrente |
-
-**Regla práctica**: si dudas entre process dictionary y Agent, elige Agent.
-
----
-
-## What's Next
-
-- **31**: Concurrencia Fan-Out/Fan-In — `Task.async_stream` para paralelismo
-- **ETS**: tabla de hash compartida entre procesos (ejercicio 13)
-- **GenServer**: state machine con `handle_call`/`handle_cast`
-- **:persistent_term`**: para datos inmutables globales de alta performance
+Threading context through function arguments is almost always the right answer. The performance difference is negligible. Use the process dictionary only when you cannot control the call stack (e.g., library callbacks that don't pass context).
 
 ---
 
 ## Resources
 
-- [Process module docs](https://hexdocs.pm/elixir/Process.html)
-- [Erlang process dictionary](https://www.erlang.org/doc/man/erlang.html#get-0)
-- [Process.info/2](https://hexdocs.pm/elixir/Process.html#info/2)
-- [Agent docs](https://hexdocs.pm/elixir/Agent.html)
-- [When to use the process dictionary (Erlang forums)](https://erlangforums.com)
+- [Process module — official docs](https://hexdocs.pm/elixir/Process.html)
+- [Agent module — official docs](https://hexdocs.pm/elixir/Agent.html)
+- [Process dictionary — Erlang reference](https://www.erlang.org/doc/man/erlang.html#get-0)
+- [Avoid the process dictionary — Elixir Forum](https://elixirforum.com/t/when-is-it-appropriate-to-use-the-process-dictionary/5484)

@@ -1,640 +1,434 @@
-# 25. Error Handling: try/rescue/catch/else/after
+# Error Handling: try/rescue/else/after and Custom Exceptions
 
-**Difficulty**: Intermedio
+**Project**: `task_queue` — built incrementally across the intermediate level
 
-## Prerequisites
-- Completed exercises 01–24
-- Familiarity with `{:ok, result}` / `{:error, reason}` pattern
-- Understanding of Elixir exceptions vs Erlang errors
-- Comfortable with pattern matching and anonymous functions
+---
 
-## Learning Objectives
-After completing this exercise, you will be able to:
-- Capturar excepciones con `try/rescue` y manejar múltiples tipos de error
-- Usar la cláusula `else` para manejar el caso de éxito por separado
-- Usar la cláusula `after` para ejecutar limpieza garantizada (como `finally`)
-- Lanzar excepciones con `raise/1` y `raise/2`
-- Relanzar excepciones preservando el stack trace con `reraise/2`
-- Definir excepciones personalizadas con `defexception`
-- Distinguir entre errores de Elixir (`RuntimeError`) y errores de Erlang (`:error`)
+## Project context
 
-## Concepts
+`task_queue` executes arbitrary jobs: send emails, call webhooks, write to S3, run database migrations. These operations fail in many ways — network timeouts, invalid payloads, external service errors. Without structured error handling, a single bad job can crash the worker process and halt the entire queue.
 
-### La filosofía de errores en Elixir: dos estilos
+Project structure at this point:
 
-Elixir tiene dos patrones de manejo de errores que coexisten: el estilo funcional con `{:ok, value}` / `{:error, reason}`, y el estilo de excepciones con `raise` / `rescue`. El primero es preferido para errores esperados (validaciones, recursos no encontrados). El segundo se reserva para errores inesperados o situaciones excepcionales.
-
-La regla práctica es: si un error es parte del flujo normal del programa, usa `{:ok, _}` / `{:error, _}`. Si es verdaderamente excepcional (bug, corrupción de datos, fallo de hardware), usa excepciones.
-
-```elixir
-# Estilo funcional — para errores esperados
-def find_user(id) do
-  case Database.lookup(id) do
-    nil -> {:error, :not_found}
-    user -> {:ok, user}
-  end
-end
-
-# Estilo excepción — para situaciones excepcionales
-def load_config! do
-  case File.read("config.json") do
-    {:ok, content} -> Jason.decode!(content)
-    {:error, reason} -> raise "Cannot load config: #{reason}"
-  end
-end
 ```
-
-### try/rescue: capturar excepciones específicas
-
-`rescue` captura excepciones por su tipo. Puedes capturar múltiples tipos en una sola cláusula o en cláusulas separadas. La variable después de `in` es la excepción misma, con campos accesibles como `e.message`.
-
-```elixir
-try do
-  String.to_integer("not_a_number")
-rescue
-  e in ArgumentError ->
-    IO.puts("Argument error: #{e.message}")
-    {:error, :bad_argument}
-end
-
-# Capturar múltiples tipos en una cláusula
-try do
-  risky_operation()
-rescue
-  e in [RuntimeError, ArgumentError] ->
-    {:error, Exception.message(e)}
-  e in KeyError ->
-    {:error, {:missing_key, e.key}}
-end
-```
-
-### La cláusula else
-
-`else` en `try` se ejecuta cuando el bloque `try` termina sin lanzar excepción. Permite hacer pattern matching sobre el valor de retorno del bloque `try`. Es útil cuando el éxito tiene múltiples casos que quieres manejar por separado:
-
-```elixir
-try do
-  perform_operation(input)
-rescue
-  e in RuntimeError -> {:error, e.message}
-else
-  {:ok, result} ->
-    process_result(result)
-  {:partial, result} ->
-    {:ok, result, :partial}
-end
-```
-
-### La cláusula after: cleanup garantizado
-
-`after` se ejecuta siempre, sin importar si hubo excepción o no. Es el equivalente de `finally` en otros lenguajes. El valor de retorno de `after` es descartado — el valor del `try` completo es el de la cláusula que manejó (rescue/else/try body).
-
-```elixir
-file = File.open!("data.txt")
-try do
-  process_file(file)
-rescue
-  e -> Logger.error("Processing failed: #{e.message}")
-after
-  File.close(file)   # siempre se ejecuta, incluso si hubo excepción
-end
-```
-
-### raise/1, raise/2 y reraise/2
-
-`raise/1` lanza un `RuntimeError` con el mensaje dado. `raise/2` lanza el tipo de excepción especificado con opciones. `reraise/2` relanza una excepción preservando el stack trace original — importante cuando capturas solo para limpiar recursos y quieres propagar el error original.
-
-```elixir
-# raise/1: RuntimeError con mensaje
-raise "Something went wrong"
-
-# raise/2: tipo específico con opciones
-raise ArgumentError, message: "Expected a non-negative integer"
-raise KeyError, key: :missing_field, term: %{}
-
-# reraise: propaga la excepción original con su stack trace
-try do
-  dangerous_operation()
-rescue
-  e ->
-    Logger.error("Operation failed: #{inspect(e)}")
-    reraise e, __STACKTRACE__   # conserva el stack trace original
-end
-```
-
-### Excepciones personalizadas con defexception
-
-`defexception` define un módulo que implementa la excepción. El campo `:message` es obligatorio (define el texto por defecto). Puedes agregar campos adicionales para contexto estructurado.
-
-```elixir
-defmodule DatabaseError do
-  defexception [:message, :query, :code]
-
-  def exception(opts) do
-    query = Keyword.get(opts, :query, "<unknown>")
-    code  = Keyword.get(opts, :code, 0)
-    msg   = "Database error #{code} executing: #{query}"
-    %__MODULE__{message: msg, query: query, code: code}
-  end
-end
-
-# Uso:
-raise DatabaseError, query: "SELECT * FROM users", code: 1045
-# Captura:
-rescue
-  e in DatabaseError ->
-    Logger.error("DB error #{e.code}: #{e.message}")
-```
-
-### Errores de Erlang: catch vs rescue
-
-Las funciones de Erlang no lanzan `Exception` — lanzan `:error`, `:exit`, o `:throw`. Para capturarlos, necesitas `catch` en lugar de `rescue`:
-
-```elixir
-# rescue captura excepciones de Elixir (structs de Exception)
-# catch captura throws/exits/errors de Erlang
-
-try do
-  :erlang.error(:badarg)
-rescue
-  e in ErlangError -> "ErlangError: #{inspect(e)}"
-catch
-  :error, :badarg -> "Erlang error: badarg"
-  :exit, reason  -> "Process exit: #{inspect(reason)}"
-  value          -> "Throw: #{inspect(value)}"
-end
+task_queue/
+├── lib/
+│   └── task_queue/
+│       ├── application.ex
+│       ├── worker.ex               # ← you add error handling here
+│       ├── queue_server.ex
+│       ├── scheduler.ex
+│       └── registry.ex
+├── test/
+│   └── task_queue/
+│       └── error_handling_test.exs # given tests — must pass without modification
+└── mix.exs
 ```
 
 ---
 
-## Exercises
+## The business problem
 
-### Exercise 1: rescue básico con RuntimeError
+The ops team reported two failure modes in production:
 
-```elixir
-defmodule BasicRescue do
-  def run do
-    # TODO 1: Usa try/rescue para capturar el RuntimeError lanzado por risky/0
-    # Cuando hay error, retorna {:error, message} donde message es e.message
-    # Cuando no hay error, retorna {:ok, result}
-    result = try do
-      risky()
-    rescue
-      # TODO: captura RuntimeError como `e`, retorna {:error, e.message}
-    end
-    IO.inspect(result)   # => {:error, "intentional failure"}
+1. **Silent crashes** — a worker raises, the supervisor restarts it, but the job is lost with no record of what failed or why
+2. **Resource leaks** — a worker opens a TCP connection to an external agent, crashes mid-job, and the connection is never closed
 
-    # TODO 2: Escribe safe_divide/2 que usa try/rescue para capturar
-    # ArithmeticError cuando se divide entre cero.
-    # Retorna {:ok, result} o {:error, :division_by_zero}
-    IO.inspect(safe_divide(10, 2))   # => {:ok, 5.0}
-    IO.inspect(safe_divide(5, 0))    # => {:error, :division_by_zero}
-
-    # TODO 3: ¿Qué pasa si haces Integer.parse("abc")?
-    # No lanza excepción — retorna :error. Esto NO se puede capturar con rescue.
-    # Escribe un comentario explicando la diferencia.
-    # Integer.parse("abc") => :error (no exception, no rescue needed)
-  end
-
-  defp risky do
-    raise "intentional failure"
-  end
-
-  def safe_divide(a, b) do
-    # TODO: try/rescue que captura ArithmeticError
-    # PISTA: en Elixir, 5 / 0 lanza ArithmeticError
-    # Pero 5.0 / 0 retorna Infinity (no lanza)
-    # Usa división entera: div(a, b) para provocar el error
-  end
-end
-
-BasicRescue.run()
-```
+You need:
+- Custom exception types that carry structured context (job ID, error code, agent address)
+- `try/rescue` boundaries in `Worker.execute/1` that turn exceptions into `{:error, reason}` tuples without losing diagnostic information
+- `after` clauses that guarantee connection cleanup regardless of outcome
+- `reraise` for cases where you need to log and then propagate (letting the supervisor handle the crash)
 
 ---
 
-### Exercise 2: Múltiples rescue y tipos de error
+## Why `try/rescue` and not just `{:ok, _} | {:error, _}`
+
+The functional `{:ok, value} | {:error, reason}` style is preferred for expected error paths — validation failures, resource not found, rate limit exceeded. These are not exceptional — they are part of the normal control flow.
+
+`try/rescue` is for truly exceptional conditions: bugs in job handler code, unexpected raises from third-party libraries, protocol violations from external agents. You cannot pattern-match your way out of a `RuntimeError` raised inside a `Jason.decode!` call; you need `rescue`.
+
+The practical rule for `task_queue`:
+- Job validation failure → `{:error, :invalid_job}`
+- External HTTP call returns 404 → `{:error, :not_found}`
+- External HTTP call raises `Req.TransportError` → `rescue` it and return `{:error, {:transport, reason}}`
+- Bug in job handler code → `rescue`, log with full stacktrace, `reraise` to let the supervisor restart the worker
+
+---
+
+## Why `defexception` and not plain maps or atoms
+
+Atoms like `:timeout` or `:invalid_payload` are too coarse for diagnosis. A `:timeout` on which job? From which agent? At which retry?
+
+`defexception` lets you define structured exception types with named fields:
 
 ```elixir
-defmodule MultiRescue do
-  @doc """
-  Intenta parsear un valor según el tipo especificado.
-  Maneja diferentes tipos de error con diferentes respuestas.
+defmodule TaskQueue.JobError do
+  defexception [:message, :job_id, :reason]
+end
+
+raise TaskQueue.JobError,
+  job_id: "abc-123",
+  reason: :payload_too_large,
+  message: "Job abc-123 rejected: payload exceeds 64KB limit"
+```
+
+When this exception is rescued, `e.job_id` and `e.reason` are available for structured logging — not just a string message.
+
+---
+
+## Implementation
+
+### Step 1: `lib/task_queue/worker.ex` — custom exceptions and error handling
+
+```elixir
+defmodule TaskQueue.Worker do
+  @moduledoc """
+  Executes a single job from the task queue.
+
+  Wraps job execution in structured error handling:
+  - `JobError` for domain-level job failures
+  - `AgentError` for failures communicating with external worker agents
+  - `try/rescue` in `execute/1` converts raises to `{:error, reason}` tuples
+  - `after` in `execute_with_agent/2` guarantees connection cleanup
   """
-  def parse(value, type) do
-    try do
-      do_parse(value, type)
-    rescue
-      # TODO 1: Captura ArgumentError y retorna {:error, {:bad_argument, e.message}}
-      # TODO 2: Captura RuntimeError y retorna {:error, {:runtime, e.message}}
-      # TODO 3: Captura UndefinedFunctionError y retorna {:error, :unsupported_type}
-      # PISTA: puedes tener múltiples cláusulas rescue separadas
-      # O usar: e in [ArgumentError, RuntimeError] -> ...
+
+  # Custom exception: job-level failures
+  defmodule JobError do
+    defexception [:message, :job_id, :reason]
+
+    @impl true
+    def exception(opts) do
+      job_id = Keyword.get(opts, :job_id, "<unknown>")
+      reason = Keyword.get(opts, :reason, :unknown)
+      msg    = Keyword.get(opts, :message, "Job #{job_id} failed: #{inspect(reason)}")
+      %__MODULE__{message: msg, job_id: job_id, reason: reason}
     end
   end
 
-  defp do_parse(value, :integer) do
-    case Integer.parse(value) do
-      {n, ""} -> n
-      _       -> raise ArgumentError, "not a valid integer: #{value}"
+  # Custom exception: agent communication failures
+  defmodule AgentError do
+    defexception [:message, :agent_address, :status_code]
+
+    @impl true
+    def exception(opts) do
+      address     = Keyword.get(opts, :agent_address, "<unknown>")
+      status_code = Keyword.get(opts, :status_code)
+      msg =
+        if status_code do
+          "Agent #{address} returned HTTP #{status_code}"
+        else
+          "Agent #{address} communication failed"
+        end
+      %__MODULE__{message: msg, agent_address: address, status_code: status_code}
     end
   end
 
-  defp do_parse(value, :float) do
-    case Float.parse(value) do
-      {f, ""} -> f
-      _       -> raise ArgumentError, "not a valid float: #{value}"
-    end
-  end
-
-  defp do_parse(_value, :boolean) do
-    raise RuntimeError, "boolean parsing not implemented"
-  end
-
-  defp do_parse(value, unknown_type) do
-    raise UndefinedFunctionError,
-      module: __MODULE__,
-      function: :"parse_#{unknown_type}",
-      arity: 1
-  end
-
-  def run do
-    IO.inspect(parse("42", :integer))      # => 42
-    IO.inspect(parse("abc", :integer))     # => {:error, {:bad_argument, "..."}}
-    IO.inspect(parse("3.14", :float))      # => 3.14
-    IO.inspect(parse("true", :boolean))    # => {:error, {:runtime, "..."}}
-    IO.inspect(parse("hi", :xml))          # => {:error, :unsupported_type}
-  end
-end
-
-MultiRescue.run()
-```
-
----
-
-### Exercise 3: La cláusula else
-
-```elixir
-defmodule ElseClause do
-  def process_file(path) do
-    try do
-      File.read!(path)
-    rescue
-      e in File.Error ->
-        {:error, "Cannot read file: #{e.message}"}
-    else
-      # TODO 1: La cláusula else recibe el valor retornado por el bloque try
-      # Haz pattern matching sobre el contenido del archivo:
-      # - Si está vacío (""), retorna {:error, :empty_file}
-      # - Si tiene contenido, retorna {:ok, content, byte_size(content)}
-      # PISTA: else recibe el resultado del try body (el string del archivo)
-      "" ->
-        # TODO
-      content ->
-        # TODO
-    end
-  end
-
-  def safe_call(fun) when is_function(fun, 0) do
-    try do
-      fun.()
-    rescue
-      e -> {:rescued, Exception.message(e)}
-    else
-      # TODO 2: La cláusula else solo se ejecuta si NO hubo excepción
-      # Haz pattern matching sobre el resultado:
-      # - {:ok, value} -> retorna {:success, value}
-      # - {:error, reason} -> retorna {:failure, reason}
-      # - otro valor -> retorna {:unknown, valor}
-      {:ok, value} ->
-        # TODO
-      {:error, reason} ->
-        # TODO
-      other ->
-        # TODO
-    end
-  end
-
-  def run do
-    # Crea un archivo temporal para el test
-    File.write!("/tmp/test_else.txt", "Hello, Elixir!")
-    IO.inspect(process_file("/tmp/test_else.txt"))    # => {:ok, "Hello, Elixir!", 14}
-
-    File.write!("/tmp/empty_else.txt", "")
-    IO.inspect(process_file("/tmp/empty_else.txt"))   # => {:error, :empty_file}
-
-    IO.inspect(process_file("/nonexistent.txt"))      # => {:error, "Cannot read file: ..."}
-
-    IO.inspect(safe_call(fn -> {:ok, 42} end))        # => {:success, 42}
-    IO.inspect(safe_call(fn -> {:error, :nope} end))  # => {:failure, :nope}
-    IO.inspect(safe_call(fn -> raise "boom" end))     # => {:rescued, "boom"}
-    IO.inspect(safe_call(fn -> :weird end))           # => {:unknown, :weird}
-  end
-end
-
-ElseClause.run()
-```
-
----
-
-### Exercise 4: La cláusula after (cleanup garantizado)
-
-```elixir
-defmodule AfterClause do
   @doc """
-  Lee un archivo, procesa su contenido, y garantiza que se registra
-  en un log de auditoría sin importar si tuvo éxito o error.
+  Executes a job map, returning `{:ok, result}` or `{:error, reason}`.
+
+  Never raises — all exceptions are caught and converted to error tuples.
+  Logs the full exception and stacktrace before converting.
+
+  ## Examples
+
+      iex> TaskQueue.Worker.execute(%{type: "noop", args: %{}})
+      {:ok, :noop}
+
+      iex> TaskQueue.Worker.execute(%{type: "fail", args: %{reason: :test_error}})
+      {:error, {:job_failed, :test_error}}
+
   """
-  def process_with_audit(path) do
-    # TODO 1: Usa try/rescue/after para:
-    # - En el bloque try: lee el archivo con File.read!/1, retorna {:ok, content}
-    # - En rescue: captura File.Error, retorna {:error, e.message}
-    # - En after: siempre imprime "Audit: attempted to read #{path}"
-    #   (simula un log de auditoría que debe ejecutarse siempre)
+  @spec execute(map()) :: {:ok, term()} | {:error, term()}
+  def execute(%{type: type, args: args} = job) do
+    job_id = Map.get(job, :id, "unknown")
+
     try do
-      # TODO
+      do_execute(type, args, job_id)
     rescue
-      # TODO
-    after
-      # TODO: IO.puts("Audit: attempted to read #{path}")
+      e in JobError ->
+        {:error, {:job_failed, e.reason}}
+      e in AgentError ->
+        {:error, {:agent_failed, e.agent_address, e.status_code}}
+      e ->
+        # Unexpected exception — log with stacktrace for debugging
+        :logger.error("Unexpected error in job #{job_id}: #{Exception.message(e)}")
+        {:error, {:unexpected, Exception.message(e)}}
     end
   end
 
-  def with_resource(resource_name, fun) do
-    IO.puts("Opening resource: #{resource_name}")
-    # TODO 2: Ejecuta fun.() dentro de un try
-    # En after: siempre imprime "Closing resource: #{resource_name}"
-    # El valor de retorno debe ser el de fun.() (o la excepción relanzada)
-    # IMPORTANTE: after NO cambia el valor de retorno — es solo cleanup
+  def execute(_), do: {:error, :missing_required_fields}
+
+  @doc """
+  Executes a job that requires a connection to an external worker agent.
+
+  Guarantees the connection is closed even if execution raises.
+
+  The `agent_address` is a string like `"tcp://agent-1.internal:9000"`.
+  """
+  @spec execute_with_agent(map(), String.t()) :: {:ok, term()} | {:error, term()}
+  def execute_with_agent(job, agent_address) do
+    conn = open_agent_connection(agent_address)
+
     try do
-      fun.()
+      send_job_to_agent(conn, job)
     rescue
-      e -> reraise e, __STACKTRACE__   # propaga la excepción original
+      e in AgentError ->
+        {:error, {:agent_failed, e.agent_address}}
+      e ->
+        reraise e, __STACKTRACE__
     after
-      # TODO
+      # TODO: close the agent connection regardless of success or failure
+      # HINT: close_agent_connection(conn)
     end
   end
 
-  def run do
-    # Test 1: archivo que existe
-    File.write!("/tmp/audit_test.txt", "data")
-    result = process_with_audit("/tmp/audit_test.txt")
-    IO.inspect(result)
-    # Output: "Audit: attempted to read /tmp/audit_test.txt"
-    # Result: {:ok, "data"}
+  # Private helpers
 
-    # Test 2: archivo que no existe
-    result2 = process_with_audit("/nonexistent_audit.txt")
-    IO.inspect(result2)
-    # Output: "Audit: attempted to read /nonexistent_audit.txt" (SIEMPRE)
-    # Result: {:error, "..."}
+  # TODO: implement do_execute/3
+  # Dispatch based on `type`:
+  # - "noop"    → return :noop
+  # - "echo"    → return args
+  # - "fail"    → raise JobError with job_id and reason from args
+  # - other     → raise JobError with reason: {:unknown_type, type}
+  # HINT:
+  # defp do_execute("noop", _args, _job_id), do: :noop
+  # defp do_execute("echo", args, _job_id), do: args
+  # defp do_execute("fail", %{reason: reason}, job_id) do
+  #   raise JobError, job_id: job_id, reason: reason
+  # end
+  # defp do_execute(type, _args, job_id) do
+  #   raise JobError, job_id: job_id, reason: {:unknown_type, type}
+  # end
 
-    # Test 3: with_resource muestra que after siempre cierra
-    with_resource("database_connection", fn ->
-      IO.puts("Working with resource...")
-      {:ok, "done"}
-    end)
-    # Output: Opening resource: database_connection
-    #         Working with resource...
-    #         Closing resource: database_connection
-  end
-end
-
-AfterClause.run()
-```
-
----
-
-### Exercise 5: Excepciones personalizadas
-
-```elixir
-# TODO 1: Define ValidationError con campos :message, :field, y :value
-defmodule ValidationError do
-  defexception [:message, :field, :value]
-
-  # TODO: Implementa exception/1 que recibe un keyword list y construye
-  # el mensaje: "Validation failed for field ':field' with value '#{value}'"
-  # PISTA: def exception(opts) do ... %__MODULE__{...} end
-  def exception(opts) do
-    field = Keyword.fetch!(opts, :field)
-    value = Keyword.get(opts, :value)
-    # TODO: construye el mensaje y retorna el struct
-  end
-end
-
-# TODO 2: Define NetworkError con campos :message, :status_code, y :url
-defmodule NetworkError do
-  defexception [:message, :status_code, :url]
-
-  def exception(opts) do
-    code = Keyword.get(opts, :status_code, 0)
-    url  = Keyword.get(opts, :url, "<unknown>")
-    msg  = "HTTP #{code} error fetching #{url}"
-    # TODO: retorna el struct con todos los campos
-  end
-end
-
-defmodule CustomExceptions do
-  def validate_age(age) when is_integer(age) and age >= 0 and age <= 150, do: {:ok, age}
-  def validate_age(age) do
-    # TODO 3: Lanza ValidationError con field: :age, value: age
-    raise ValidationError, field: :age, value: age
+  defp open_agent_connection(address) do
+    # Simulates opening a TCP connection — returns a connection token
+    %{address: address, opened_at: System.monotonic_time()}
   end
 
-  def fetch_url(url) do
-    # Simula una respuesta HTTP fallida
-    if String.contains?(url, "fail") do
-      # TODO 4: Lanza NetworkError con status_code: 503, url: url
-      raise NetworkError, status_code: 503, url: url
+  defp send_job_to_agent(%{address: address}, _job) do
+    # Simulates sending — raises AgentError for "bad" addresses
+    if String.contains?(address, "bad") do
+      raise AgentError, agent_address: address, status_code: 503
     else
-      {:ok, "Response from #{url}"}
+      {:ok, :delivered}
     end
   end
 
-  def run do
-    # Test ValidationError
-    try do
-      validate_age(-5)
-    rescue
-      e in ValidationError ->
-        IO.puts("Caught: #{e.message}")
-        IO.inspect({e.field, e.value})
-    end
-    # => "Caught: Validation failed for field ':age' with value '-5'"
-    # => {:age, -5}
+  defp close_agent_connection(%{address: address}) do
+    :logger.debug("Connection to #{address} closed")
+    :ok
+  end
+end
+```
 
-    # Test NetworkError
-    try do
-      fetch_url("https://fail.example.com/api")
-    rescue
-      e in NetworkError ->
-        IO.puts("Network error: #{e.message}")
-        IO.inspect(e.status_code)
-    end
-    # => "Network error: HTTP 503 error fetching https://fail.example.com/api"
-    # => 503
+### Step 2: Given tests — must pass without modification
 
-    # TODO 5: Escribe un try/rescue que captura AMBAS excepciones en una sola cláusula
-    # usando la sintaxis: rescue e in [ValidationError, NetworkError] -> ...
-    try do
-      if :rand.uniform() > 0.5, do: validate_age(-1), else: fetch_url("http://fail.com")
-    rescue
-      # TODO: e in [ValidationError, NetworkError] -> imprime e.message
+```elixir
+# test/task_queue/error_handling_test.exs
+defmodule TaskQueue.ErrorHandlingTest do
+  use ExUnit.Case, async: true
+
+  alias TaskQueue.Worker
+  alias TaskQueue.Worker.{JobError, AgentError}
+
+  describe "Worker.execute/1 — error handling" do
+    test "noop job returns :ok" do
+      assert {:ok, :noop} = Worker.execute(%{type: "noop", args: %{}})
+    end
+
+    test "echo job returns args" do
+      assert {:ok, %{msg: "hello"}} = Worker.execute(%{type: "echo", args: %{msg: "hello"}})
+    end
+
+    test "fail job returns error tuple" do
+      assert {:error, {:job_failed, :test_error}} =
+        Worker.execute(%{type: "fail", args: %{reason: :test_error}})
+    end
+
+    test "unknown job type returns error tuple" do
+      assert {:error, {:job_failed, {:unknown_type, "magic"}}} =
+        Worker.execute(%{type: "magic", args: %{}})
+    end
+
+    test "non-map job returns :missing_required_fields" do
+      assert {:error, :missing_required_fields} = Worker.execute("not a map")
+      assert {:error, :missing_required_fields} = Worker.execute(%{wrong: :keys})
+    end
+  end
+
+  describe "Worker.execute_with_agent/2 — after cleanup" do
+    test "good agent returns :ok" do
+      job = %{type: "noop", args: %{}}
+      assert {:ok, :delivered} = Worker.execute_with_agent(job, "tcp://good-agent:9000")
+    end
+
+    test "bad agent returns error tuple" do
+      job = %{type: "noop", args: %{}}
+      assert {:error, {:agent_failed, _address}} =
+        Worker.execute_with_agent(job, "tcp://bad-agent:9000")
+    end
+  end
+
+  describe "JobError — custom exception" do
+    test "carries job_id and reason" do
+      error = JobError.exception(job_id: "abc-123", reason: :timeout)
+      assert error.job_id == "abc-123"
+      assert error.reason == :timeout
+      assert String.contains?(error.message, "abc-123")
+    end
+
+    test "raises and rescues with structured fields" do
+      result =
+        try do
+          raise JobError, job_id: "xyz-456", reason: :quota_exceeded
+        rescue
+          e in JobError -> {:caught, e.job_id, e.reason}
+        end
+
+      assert {:caught, "xyz-456", :quota_exceeded} = result
+    end
+  end
+
+  describe "AgentError — custom exception" do
+    test "carries agent_address and status_code" do
+      error = AgentError.exception(agent_address: "tcp://agent-1:9000", status_code: 503)
+      assert error.agent_address == "tcp://agent-1:9000"
+      assert error.status_code == 503
+      assert String.contains?(error.message, "503")
+    end
+
+    test "nil status_code produces generic message" do
+      error = AgentError.exception(agent_address: "tcp://agent-2:9000")
+      assert error.status_code == nil
+      assert String.contains?(error.message, "communication failed")
+    end
+  end
+
+  describe "reraise preserves stacktrace" do
+    test "unexpected exception is reraised" do
+      assert_raise RuntimeError, "boom", fn ->
+        Worker.execute_with_agent(%{type: "noop", args: %{}}, "tcp://good-agent:9000")
+        # This won't raise with a good agent, so force one:
+        try do
+          raise "boom"
+        rescue
+          e -> reraise e, __STACKTRACE__
+        end
+      end
     end
   end
 end
+```
 
-CustomExceptions.run()
+### Step 3: Run the tests
+
+```bash
+mix test test/task_queue/error_handling_test.exs --trace
 ```
 
 ---
 
-## Common Mistakes
+## Trade-off analysis
 
-### Usar try/rescue para control de flujo normal
+| Approach | Use case | Risk |
+|----------|----------|------|
+| `{:ok, _} / {:error, _}` | Expected failures in normal flow | Not composable with code that raises |
+| `try/rescue` | Unexpected raises from libraries | Overuse turns normal flow into exception-driven code |
+| `defexception` | Structured error context | Requires discipline — don't add fields you never read |
+| `reraise e, __STACKTRACE__` | Log-and-propagate pattern | Forgetting `__STACKTRACE__` loses the original origin |
+| `after` clause | Resource cleanup | Value of `after` is discarded — do not rely on its return |
+
+Reflection question: `Task.async/1` + `Task.await/1` raises if the task crashes. What does `try/rescue` around `Task.await` give you that `Task.yield/2` does not?
+
+---
+
+## Common production mistakes
+
+**1. Rescuing `Exception` — catching everything including bugs**
 
 ```elixir
-# MAL: try/rescue es costoso y semánticamente incorrecto para flujo normal
-def find_or_default(map, key, default) do
+# Wrong — catches ArgumentError from your own bad code, masking bugs
+rescue
+  e in Exception -> {:error, e.message}
+
+# Right — rescue only what you know how to handle
+rescue
+  e in [Req.TransportError, Jason.DecodeError] -> {:error, {:external, e.message}}
+```
+
+**2. `reraise` without `__STACKTRACE__`**
+
+```elixir
+# Wrong — stacktrace points to the rescue clause, not the original raise
+rescue
+  e -> reraise e, []
+
+# Right — __STACKTRACE__ is a special variable available only inside rescue
+rescue
+  e -> reraise e, __STACKTRACE__
+```
+
+**3. Using `try/rescue` for control flow that should use `with`**
+
+```elixir
+# Wrong — exceptions as control flow is slow and semantically misleading
+def process(id) do
   try do
-    Map.fetch!(map, key)
+    job = Map.fetch!(jobs, id)
+    {:ok, job}
   rescue
-    KeyError -> default
+    KeyError -> {:error, :not_found}
   end
 end
 
-# BIEN: Map.get ya maneja el caso de clave ausente
-def find_or_default(map, key, default) do
-  Map.get(map, key, default)
+# Right — Map.fetch/2 returns {:ok, v} | :error, no exception needed
+def process(id) do
+  case Map.fetch(jobs, id) do
+    {:ok, job} -> {:ok, job}
+    :error     -> {:error, :not_found}
+  end
 end
 ```
 
-### reraise sin __STACKTRACE__
+**4. Putting side effects in `after` that depend on variables from `try`**
 
 ```elixir
-# MAL: reraise(e, []) pierde el stack trace original
-rescue
-  e -> reraise e, []   # stack trace apunta aquí, no al origen
+# Wrong — if try raises before `conn` is bound, after will NameError
+try do
+  conn = open_connection()
+  do_work(conn)
+after
+  close_connection(conn)  # conn may not be bound if open_connection raised
+end
 
-# BIEN: __STACKTRACE__ es una variable especial disponible en rescue
-rescue
-  e -> reraise e, __STACKTRACE__   # preserva el origen del error
+# Right — bind conn before try
+conn = open_connection()
+try do
+  do_work(conn)
+after
+  close_connection(conn)
+end
 ```
 
-### after cambia el valor de retorno (falsa creencia)
+**5. Expecting `after` to change the return value**
 
 ```elixir
-# after NO afecta el valor de retorno del try completo
+# Wrong assumption — after's return value is ALWAYS discarded
 result = try do
   42
 after
-  IO.puts("cleanup")   # se ejecuta, pero el resultado del try sigue siendo 42
+  99   # this does NOT become the result
 end
-# result => 42 (not nil, not the return of after)
-```
-
-### defexception sin implementar exception/1 cuando se necesitan campos
-
-```elixir
-# Si solo defines los campos pero no exception/1, `raise` con opciones fallará
-defmodule MyError do
-  defexception [:message, :code]
-  # Sin exception/1, solo funciona: raise MyError, message: "..."
-  # Para campos adicionales y mensaje automático, implementa exception/1
-end
-```
-
-### Rescatar Exception (captura demasiado)
-
-```elixir
-# MAL: captura absolutamente todo, incluyendo errores de programación
-rescue
-  e in Exception -> handle(e)
-
-# BIEN: captura solo los tipos que sabes manejar
-rescue
-  e in [MyError, ArgumentError] -> handle(e)
+# result == 42, not 99
 ```
 
 ---
 
-## Try It Yourself
+## Resources
 
-Implementa `safe_parse/1` que intenta parsear un string como JSON, luego como CSV (una línea de valores separados por comas), y finalmente como un entero simple. Maneja errores específicos de cada intento con mensajes descriptivos.
-
-```elixir
-defmodule SafeParser do
-  @doc """
-  Tries to parse input as JSON, CSV, or integer, in that order.
-  Returns {:ok, {format, value}} for the first successful parse,
-  or {:error, reasons} with a list of what was tried and failed.
-  """
-  def safe_parse(input) when is_binary(input) do
-    attempts = [
-      {:json, fn -> parse_json(input) end},
-      {:csv,  fn -> parse_csv(input) end},
-      {:integer, fn -> parse_integer(input) end}
-    ]
-
-    # TODO: Itera los intentos en orden. Para cada uno:
-    # - Ejecuta la función en un try/rescue
-    # - Si tiene éxito, retorna {:ok, {format, value}} inmediatamente
-    # - Si falla, acumula {:error, format, reason} en una lista
-    # Al final, si ninguno funcionó, retorna {:error, reasons_list}
-    Enum.reduce_while(attempts, [], fn {format, parse_fn}, errors ->
-      result = try do
-        {:ok, parse_fn.()}
-      rescue
-        e -> {:error, Exception.message(e)}
-      end
-
-      case result do
-        {:ok, value} ->
-          {:halt, {:ok, {format, value}}}
-        {:error, reason} ->
-          {:cont, [{format, reason} | errors]}
-      end
-    end)
-    |> case do
-      {:ok, _} = success -> success
-      errors when is_list(errors) -> {:error, Enum.reverse(errors)}
-    end
-  end
-
-  # TODO: Implementa parse_json/1
-  # Usa Jason.decode!/1 si está disponible, o simula lanzando para inputs no-JSON
-  defp parse_json(input) do
-    # Si el input empieza con { o [, simula JSON válido
-    # Si no, raise RuntimeError "Invalid JSON"
-    if String.starts_with?(input, ["{", "["]) do
-      %{parsed: input, format: "json"}  # simulación
-    else
-      raise RuntimeError, "Invalid JSON: #{input}"
-    end
-  end
-
-  # TODO: Implementa parse_csv/1
-  # Una línea CSV válida tiene al menos una coma
-  defp parse_csv(input) do
-    # TODO: si contiene ",", retorna la lista de campos
-    # Si no, raise ArgumentError "Not a CSV line"
-  end
-
-  # TODO: Implementa parse_integer/1
-  defp parse_integer(input) do
-    # TODO: usa Integer.parse/1, si falla lanza ArgumentError
-  end
-end
-
-IO.inspect SafeParser.safe_parse("{\"key\": 1}")
-# => {:ok, {:json, %{parsed: "{\"key\": 1}", format: "json"}}}
-
-IO.inspect SafeParser.safe_parse("alice,30,admin")
-# => {:ok, {:csv, ["alice", "30", "admin"]}}
-
-IO.inspect SafeParser.safe_parse("42")
-# => {:ok, {:integer, 42}}
-
-IO.inspect SafeParser.safe_parse("not parseable !@#")
-# => {:error, [{:json, "..."}, {:csv, "..."}, {:integer, "..."}]}
-```
+- [try, catch, and rescue — Elixir official guide](https://elixir-lang.org/getting-started/try-catch-and-rescue.html)
+- [Exception module — official docs](https://hexdocs.pm/elixir/Exception.html)
+- [defexception — Elixir macro docs](https://hexdocs.pm/elixir/Kernel.html#defexception/1)
+- [reraise/2 — Kernel docs](https://hexdocs.pm/elixir/Kernel.SpecialForms.html#try/1)
+- [Error handling patterns — Saša Jurić's blog](https://www.theerlangelist.com/article/exceptions)

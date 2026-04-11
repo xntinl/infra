@@ -1,526 +1,310 @@
-# 7. Maps and Keyword Lists
+# Maps and Keyword Lists: Transaction Configuration
 
-**Difficulty**: Basico
+**Project**: `payments_cli` — built incrementally across the basic level
 
-## Prerequisites
+---
 
-- Haber completado los ejercicios 01–06
-- Conocimiento básico de átomos (ejercicio 02) y pattern matching (ejercicio 05)
-- IEx disponible en tu terminal
+## Project context
 
-## Learning Objectives
+You're building `payments_cli`. Transaction maps represent in-flight data.
+Configuration for processing rules (fee rates, currency limits, retry policies)
+uses keyword lists because order and optionality matter. Understanding when to use
+each is a design decision, not a syntax question.
 
-- Crear y acceder a maps con atom keys y string keys
-- Actualizar maps de forma inmutable con `%{map | key: value}` y `Map.put/3`
-- Entender qué son las keyword lists y cuándo usarlas en lugar de maps
-- Aplicar pattern matching sobre maps para extraer valores
-- Conocer las funciones esenciales del módulo `Map`
-
-## Concepts
-
-### Maps: estructura de datos clave-valor
-
-Un map asocia claves con valores. En Elixir existen dos notaciones según el tipo de clave:
-
-```elixir
-# Con atom keys: notación compacta con ":"
-user = %{name: "Alice", age: 30, active: true}
-
-# Con string keys: notación con "=>"
-config = %{"host" => "localhost", "port" => 5432}
-
-# Mixed (posible, pero evitar — elige un estilo consistente)
-mixed = %{:name => "Bob", "role" => "admin"}
-
-# Map vacío
-empty = %{}
-```
-
-### Acceso a valores en un Map
-
-```elixir
-user = %{name: "Alice", age: 30}
-
-# Acceso con punto: SOLO funciona con atom keys
-user.name    # "Alice"
-user.age     # 30
-
-# Acceso con corchetes: funciona con cualquier key
-user[:name]  # "Alice"
-user[:name]  # "Alice"
-
-# Map.get/3: permite un valor por defecto si la key no existe
-Map.get(user, :name, "unknown")     # "Alice"
-Map.get(user, :email, "unknown")    # "unknown"
-
-# Acceso con string keys: SOLO con corchetes o Map.get
-config = %{"host" => "localhost"}
-config["host"]                       # "localhost"
-# config.host                        # KeyError!
-```
-
-### Actualizar un Map
-
-Los maps en Elixir son **inmutables**. Actualizar devuelve un nuevo map:
-
-```elixir
-user = %{name: "Alice", age: 30}
-
-# Syntax de actualización: SOLO para keys que ya existen
-updated = %{user | age: 31}
-# %{name: "Alice", age: 31}
-
-# Map.put/3: agrega o actualiza, incluso si la key es nueva
-with_email = Map.put(user, :email, "alice@example.com")
-# %{name: "Alice", age: 30, email: "alice@example.com"}
-
-# Map.delete/2: elimina una key
-without_age = Map.delete(user, :age)
-# %{name: "Alice"}
-
-# Map.merge/2: combina dos maps (el segundo gana en conflictos)
-Map.merge(%{a: 1, b: 2}, %{b: 99, c: 3})
-# %{a: 1, b: 99, c: 3}
-```
-
-### Pattern Matching en Maps
-
-El pattern matching en maps extrae solo las keys que especificas — las demás son ignoradas:
-
-```elixir
-user = %{name: "Alice", age: 30, role: :admin}
-
-# Extraer name y age (role es ignorado)
-%{name: name, age: age} = user
-name  # "Alice"
-age   # 30
-
-# Match parcial en una función
-def greet(%{name: name}), do: "Hello, #{name}!"
-greet(user)  # "Hello, Alice!"
-
-# Match con condición de valor (el valor debe ser exactamente :admin)
-%{role: :admin} = user  # ok — Alice es admin
-```
-
-### Keyword Lists
-
-Una keyword list es una lista de tuplas `{atom, valor}` con sintaxis especial:
-
-```elixir
-# Estas dos formas son equivalentes
-[name: "Alice", age: 30]
-[{:name, "Alice"}, {:age, 30}]
-
-# Acceso por key (devuelve el primero que encuentre)
-opts = [timeout: 5000, retries: 3]
-opts[:timeout]   # 5000
-opts[:retries]   # 3
-opts[:missing]   # nil
-
-# Las keyword lists permiten keys duplicadas
-[status: :ok, status: :error]  # válido
-```
-
-### Maps vs Keyword Lists: cuándo usar cada uno
-
-| Característica | Map | Keyword List |
-|---|---|---|
-| Orden garantizado | No | Sí (orden de inserción) |
-| Keys duplicadas | No | Sí |
-| Acceso O(1) | Sí | No — O(n) |
-| Uso típico | Datos con estructura | Opciones de funciones |
-
-```elixir
-# Maps: para modelar datos con estructura fija
-user = %{name: "Alice", age: 30}
-
-# Keyword lists: para opciones de funciones (patrón muy común en Elixir)
-File.read!("file.txt", encoding: :utf8)
-GenServer.start_link(MyServer, [], name: MyServer)
-```
-
-## Exercises
-
-### Exercise 1: Crear Maps
-
-```elixir
-# Map con atom keys (la forma más común en Elixir)
-user = %{name: "Alice", age: 30, role: :admin}
-
-# Map con string keys (común para datos externos — JSON, config)
-config = %{"host" => "localhost", "port" => 5432, "ssl" => false}
-
-# Map anidado
-company = %{
-  name: "Acme Corp",
-  address: %{city: "New York", country: "USA"},
-  employees: 500
-}
-
-# Map vacío
-empty = %{}
-
-# Verificar
-is_map(user)     # true
-map_size(user)   # 3
-map_size(empty)  # 0
-```
-
-**Expected output:**
+Project structure at this point:
 
 ```
-iex> user = %{name: "Alice", age: 30, role: :admin}
-%{age: 30, name: "Alice", role: :admin}
-iex> config = %{"host" => "localhost", "port" => 5432}
-%{"host" => "localhost", "port" => 5432}
-iex> is_map(user)
-true
-iex> map_size(user)
-3
+payments_cli/
+├── lib/
+│   └── payments_cli/
+│       ├── cli.ex
+│       ├── transaction.ex
+│       ├── ledger.ex
+│       ├── formatter.ex
+│       ├── pipeline.ex
+│       └── processor.ex    # ← you implement this
+├── test/
+│   └── payments_cli/
+│       └── processor_test.exs  # given tests — must pass without modification
+└── mix.exs
 ```
 
 ---
 
-### Exercise 2: Acceder a valores
+## Maps vs keyword lists: the design question
 
-```elixir
-user = %{name: "Alice", age: 30, role: :admin}
+Both maps and keyword lists associate keys with values. The choice between them
+is determined by requirements, not preference:
 
-# Con punto (solo atom keys)
-user.name    # "Alice"
-user.age     # 30
+**Use maps when:**
+- Keys are unique (each transaction has one `amount_cents`)
+- Access is O(1) by key
+- Structure is fixed and known at compile time (or modeled with a struct in exercise 15)
+- Data crosses module boundaries as the primary data type
 
-# Con corchetes (cualquier key)
-user[:name]  # "Alice"
-user[:role]  # :admin
+**Use keyword lists when:**
+- Options to a function need default values
+- Key order matters to the caller
+- Duplicate keys are meaningful (`headers: [:accept, :content_type]`)
+- The list is passed as the last argument (Elixir convention for opts)
 
-# Key inexistente: punto lanza error, corchetes devuelve nil
-# user.email        # ** (KeyError) key :email not found in: ...
-user[:email]        # nil
-
-# Map.get con default
-Map.get(user, :name, "unknown")    # "Alice"
-Map.get(user, :email, "unknown")   # "unknown"
-
-# Map con string keys — SOLO corchetes
-config = %{"host" => "localhost", "port" => 5432}
-config["host"]                    # "localhost"
-Map.get(config, "port", 3000)     # 5432
-Map.get(config, "timeout", 30)    # 30 (default)
-```
-
-**Expected output:**
-
-```
-iex> user = %{name: "Alice", age: 30, role: :admin}
-%{age: 30, name: "Alice", role: :admin}
-iex> user.name
-"Alice"
-iex> user[:role]
-:admin
-iex> user[:email]
-nil
-iex> Map.get(user, :email, "unknown")
-"unknown"
-iex> config = %{"host" => "localhost", "port" => 5432}
-%{"host" => "localhost", "port" => 5432}
-iex> config["host"]
-"localhost"
-```
+The Elixir standard library uses keyword lists for function options consistently:
+`String.split(str, ",", trim: true, parts: 5)`. The `trim: true, parts: 5` part
+is a keyword list. Your own option-accepting functions should follow the same pattern.
 
 ---
 
-### Exercise 3: Actualizar Maps
+## The business problem
 
-```elixir
-user = %{name: "Alice", age: 30}
+The `Processor` module needs to:
 
-# Syntax de actualización — requiere que la key exista
-older_user = %{user | age: 31}
-older_user  # %{age: 31, name: "Alice"}
-
-# Map.put — agrega o sobreescribe, no requiere key existente
-with_email = Map.put(user, :email, "alice@example.com")
-# %{age: 30, email: "alice@example.com", name: "Alice"}
-
-# Map.put_new — solo agrega si la key NO existe
-Map.put_new(user, :age, 99)    # no modifica age — ya existe
-Map.put_new(user, :email, "x") # agrega email — no existía
-
-# Map.delete — eliminar una key
-Map.delete(user, :age)
-# %{name: "Alice"}
-
-# Encadenar actualizaciones con pipe
-user
-|> Map.put(:email, "alice@example.com")
-|> Map.put(:role, :user)
-|> Map.delete(:age)
-# %{email: "alice@example.com", name: "Alice", role: :user}
-```
-
-**Expected output:**
-
-```
-iex> user = %{name: "Alice", age: 30}
-%{age: 30, name: "Alice"}
-iex> %{user | age: 31}
-%{age: 31, name: "Alice"}
-iex> Map.put(user, :email, "alice@example.com")
-%{age: 30, email: "alice@example.com", name: "Alice"}
-iex> Map.delete(user, :age)
-%{name: "Alice"}
-```
+1. Apply processing rules to a transaction (using options as keyword lists)
+2. Merge transaction updates immutably
+3. Extract summary statistics from a transaction map
+4. Validate that a transaction map has required fields
 
 ---
 
-### Exercise 4: Pattern Matching en Maps
+## Implementation
+
+### `lib/payments_cli/processor.ex`
 
 ```elixir
-user = %{name: "Alice", age: 30, role: :admin}
+defmodule PaymentsCli.Processor do
+  @moduledoc """
+  Applies processing rules to transactions and manages transaction state updates.
 
-# Extraer múltiples valores en una sola operación
-%{name: name, role: role} = user
-name   # "Alice"
-role   # :admin
+  Processing options follow Elixir convention: keyword list as last argument
+  with documented defaults. Callers only specify options they want to override.
+  """
 
-# El pattern NO necesita incluir todas las keys
-%{name: name} = user   # ok — extrae solo name
-name   # "Alice"
+  @default_opts [
+    fee_basis_points: 250,
+    max_amount_cents: 1_000_000,
+    require_reference: false
+  ]
 
-# Match con valor literal — útil en case y funciones
-case user do
-  %{role: :admin} -> "Es administrador"
-  %{role: :user}  -> "Es usuario normal"
-  _               -> "Rol desconocido"
+  @doc """
+  Applies processing rules to a transaction map.
+
+  Options:
+    - fee_basis_points: integer, default 250 (2.5%)
+    - max_amount_cents: integer, default 1_000_000 ($10,000)
+    - require_reference: boolean, default false
+
+  Returns {:ok, processed_transaction} or {:error, reason}.
+
+  ## Examples
+
+      iex> tx = %{id: "T1", amount_cents: 1000, status: :pending}
+      iex> PaymentsCli.Processor.apply_rules(tx, fee_basis_points: 100)
+      {:ok, %{id: "T1", amount_cents: 1000, fee_cents: 10, status: :pending}}
+
+  """
+  @spec apply_rules(map(), keyword()) :: {:ok, map()} | {:error, String.t()}
+  def apply_rules(transaction, opts \\ []) when is_map(transaction) and is_list(opts) do
+    # TODO: implement
+    #
+    # HINT:
+    # 1. Merge opts with @default_opts using Keyword.merge(@default_opts, opts)
+    #    The caller's opts override the defaults. Order matters for Keyword.merge.
+    #
+    # 2. Extract options:
+    #    fee_bp = Keyword.get(effective_opts, :fee_basis_points)
+    #    max_cents = Keyword.get(effective_opts, :max_amount_cents)
+    #    require_ref = Keyword.get(effective_opts, :require_reference)
+    #
+    # 3. Validate: if transaction.amount_cents > max_cents, return error
+    #
+    # 4. If require_ref is true and Map.has_key?(transaction, :reference) is false, return error
+    #
+    # 5. Compute fee using div(transaction.amount_cents * fee_bp, 10_000)
+    #
+    # 6. Return {:ok, Map.put(transaction, :fee_cents, fee)}
+  end
+
+  @doc """
+  Updates a transaction map with new field values.
+
+  Only allows updating fields that already exist in the transaction.
+  Attempting to add new fields returns {:error, :unknown_fields}.
+
+  This is the immutable update pattern — returns a new map, never mutates.
+
+  ## Examples
+
+      iex> tx = %{id: "T1", status: :pending, amount_cents: 1000}
+      iex> PaymentsCli.Processor.update_transaction(tx, status: :approved)
+      {:ok, %{id: "T1", status: :approved, amount_cents: 1000}}
+
+      iex> PaymentsCli.Processor.update_transaction(tx, unknown_field: "value")
+      {:error, :unknown_fields}
+
+  """
+  @spec update_transaction(map(), keyword()) :: {:ok, map()} | {:error, :unknown_fields}
+  def update_transaction(transaction, updates) when is_map(transaction) and is_list(updates) do
+    # TODO: implement
+    #
+    # HINT:
+    # 1. Convert updates to a map: Map.new(updates)
+    # 2. Check all update keys exist in transaction: Map.keys(updates_map) -- Map.keys(transaction)
+    #    If the difference is non-empty, return {:error, :unknown_fields}
+    # 3. Merge: {:ok, Map.merge(transaction, updates_map)}
+    #    Map.merge with two maps: second map's values win on conflicts. That is what we want.
+  end
+
+  @doc """
+  Extracts a summary map from a transaction with only the display-relevant fields.
+
+  Returns a new map with only: id, amount_cents, currency, status.
+  Other fields (internal references, fee_cents, etc.) are excluded.
+
+  ## Examples
+
+      iex> tx = %{id: "T1", amount_cents: 500, currency: "USD", status: :approved, fee_cents: 12, internal_ref: "X"}
+      iex> PaymentsCli.Processor.summary(tx)
+      %{id: "T1", amount_cents: 500, currency: "USD", status: :approved}
+
+  """
+  @spec summary(map()) :: map()
+  def summary(%{id: id, amount_cents: amount, currency: currency, status: status}) do
+    # TODO: build and return a map with only these four fields
+    # Pattern matching in the function head extracts the values — no Map.get needed
+  end
 end
-# "Es administrador"
+```
 
-# En parámetros de función
-defmodule Greeter do
-  def greet(%{name: name, role: :admin}), do: "Admin #{name}, bienvenido"
-  def greet(%{name: name}), do: "Hola, #{name}"
+### Given tests — must pass without modification
+
+```elixir
+# test/payments_cli/processor_test.exs
+defmodule PaymentsCli.ProcessorTest do
+  use ExUnit.Case, async: true
+
+  alias PaymentsCli.Processor
+
+  @base_tx %{id: "TXN001", amount_cents: 1000, currency: "USD", status: :pending}
+
+  describe "apply_rules/2" do
+    test "applies default fee when no opts given" do
+      assert {:ok, tx} = Processor.apply_rules(@base_tx)
+      # Default fee: 2.5% of 1000 cents = 25 cents
+      assert tx.fee_cents == 25
+    end
+
+    test "applies custom fee basis points" do
+      assert {:ok, tx} = Processor.apply_rules(@base_tx, fee_basis_points: 100)
+      # 1% of 1000 cents = 10 cents
+      assert tx.fee_cents == 10
+    end
+
+    test "returns error when amount exceeds maximum" do
+      assert {:error, _reason} = Processor.apply_rules(@base_tx, max_amount_cents: 500)
+    end
+
+    test "returns error when reference required but missing" do
+      assert {:error, _reason} = Processor.apply_rules(@base_tx, require_reference: true)
+    end
+
+    test "allows transaction when reference required and present" do
+      tx_with_ref = Map.put(@base_tx, :reference, "REF001")
+      assert {:ok, _tx} = Processor.apply_rules(tx_with_ref, require_reference: true)
+    end
+  end
+
+  describe "update_transaction/2" do
+    test "updates an existing field" do
+      assert {:ok, tx} = Processor.update_transaction(@base_tx, status: :approved)
+      assert tx.status == :approved
+      # Other fields unchanged
+      assert tx.id == "TXN001"
+      assert tx.amount_cents == 1000
+    end
+
+    test "returns error for unknown field" do
+      assert {:error, :unknown_fields} =
+               Processor.update_transaction(@base_tx, new_field: "value")
+    end
+
+    test "does not mutate the original" do
+      {:ok, _updated} = Processor.update_transaction(@base_tx, status: :approved)
+      assert @base_tx.status == :pending
+    end
+  end
+
+  describe "summary/1" do
+    test "returns only display fields" do
+      full_tx = Map.merge(@base_tx, %{fee_cents: 25, internal_ref: "REF", extra: "data"})
+      result = Processor.summary(full_tx)
+      assert Map.keys(result) |> Enum.sort() == [:amount_cents, :currency, :id, :status]
+    end
+
+    test "contains correct values" do
+      result = Processor.summary(@base_tx)
+      assert result.id == "TXN001"
+      assert result.status == :pending
+    end
+  end
 end
-
-Greeter.greet(%{name: "Alice", role: :admin})  # "Admin Alice, bienvenido"
-Greeter.greet(%{name: "Bob", role: :user})     # "Hola, Bob"
 ```
 
-**Expected output:**
-
-```
-iex> user = %{name: "Alice", age: 30, role: :admin}
-%{age: 30, name: "Alice", role: :admin}
-iex> %{name: name, role: role} = user
-%{age: 30, name: "Alice", role: :admin}
-iex> name
-"Alice"
-iex> role
-:admin
-iex> case user do %{role: :admin} -> "Es administrador"; _ -> "otro" end
-"Es administrador"
-```
-
----
-
-### Exercise 5: Keyword Lists
-
-```elixir
-# Crear keyword lists
-opts = [timeout: 5000, retries: 3, verbose: false]
-
-# Acceder con corchetes — devuelve el primer match
-opts[:timeout]   # 5000
-opts[:retries]   # 3
-opts[:missing]   # nil
-
-# Son equivalentes a listas de tuplas
-[{:timeout, 5000}, {:retries, 3}] == [timeout: 5000, retries: 3]
-# true
-
-# Keyword.get con default
-Keyword.get(opts, :timeout, 30_000)    # 5000
-Keyword.get(opts, :missing, :default)  # :default
-
-# Keys duplicadas — solo Maps las rechazan
-duped = [status: :ok, status: :error]
-duped[:status]                   # :ok — devuelve el primero
-Keyword.get_values(duped, :status)  # [:ok, :error]
-```
-
-**Expected output:**
-
-```
-iex> opts = [timeout: 5000, retries: 3, verbose: false]
-[timeout: 5000, retries: 3, verbose: false]
-iex> opts[:timeout]
-5000
-iex> opts[:missing]
-nil
-iex> [{:timeout, 5000}, {:retries, 3}] == [timeout: 5000, retries: 3]
-true
-iex> Keyword.get(opts, :missing, :default)
-:default
-```
-
----
-
-### Exercise 6: Funciones del módulo Map
-
-```elixir
-user = %{name: "Alice", age: 30, role: :admin}
-
-# Obtener todas las keys
-Map.keys(user)
-# [:age, :name, :role]  (orden no garantizado)
-
-# Obtener todos los valores
-Map.values(user)
-# [30, "Alice", :admin]
-
-# Verificar si una key existe
-Map.has_key?(user, :name)    # true
-Map.has_key?(user, :email)   # false
-
-# Combinar dos maps
-Map.merge(%{a: 1, b: 2}, %{b: 99, c: 3})
-# %{a: 1, b: 99, c: 3}
-
-# Map.merge con función de resolución de conflictos
-Map.merge(%{a: 1, b: 2}, %{b: 99, c: 3}, fn _key, old, new -> old + new end)
-# %{a: 1, b: 101, c: 3}
-
-# Convertir a lista de tuplas y viceversa
-Map.to_list(%{a: 1, b: 2})
-# [a: 1, b: 2]  (o [{:a, 1}, {:b, 2}])
-
-Map.new([{:x, 10}, {:y, 20}])
-# %{x: 10, y: 20}
-```
-
-**Expected output:**
-
-```
-iex> user = %{name: "Alice", age: 30, role: :admin}
-%{age: 30, name: "Alice", role: :admin}
-iex> Map.keys(user)
-[:age, :name, :role]
-iex> Map.has_key?(user, :name)
-true
-iex> Map.has_key?(user, :email)
-false
-iex> Map.merge(%{a: 1, b: 2}, %{b: 99, c: 3})
-%{a: 1, b: 99, c: 3}
-iex> Map.to_list(%{a: 1, b: 2})
-[a: 1, b: 2]
-```
-
-## Common Mistakes
-
-### Error 1: Usar `.` con string keys
-
-```elixir
-config = %{"host" => "localhost", "port" => 5432}
-
-# WRONG: lanza KeyError
-# config.host  # ** (KeyError) key :host not found
-
-# FIX: usar corchetes o Map.get
-config["host"]                  # "localhost"
-Map.get(config, "host", nil)    # "localhost"
-```
-
-### Error 2: Usar `%{map | key: val}` para agregar una key nueva
-
-```elixir
-user = %{name: "Alice", age: 30}
-
-# WRONG: lanza KeyError porque :email no existe en user
-# %{user | email: "alice@example.com"}
-# ** (KeyError) key :email not found in: %{age: 30, name: "Alice"}
-
-# FIX: usar Map.put/3 para agregar keys nuevas
-Map.put(user, :email, "alice@example.com")
-# %{age: 30, email: "alice@example.com", name: "Alice"}
-```
-
-### Error 3: Asumir orden en Maps
-
-```elixir
-# WRONG: los maps NO garantizan orden de keys
-user = %{c: 3, a: 1, b: 2}
-# En IEx se muestra como %{a: 1, b: 2, c: 3} — pero NO asumas ese orden en código
-
-# FIX: si necesitas orden, usa una keyword list o Enum.sort
-Map.to_list(user) |> Enum.sort_by(fn {k, _} -> k end)
-# [a: 1, b: 2, c: 3]
-```
-
-### Error 4: Confundir Map.put_new con Map.put
-
-```elixir
-user = %{name: "Alice", age: 30}
-
-# Map.put: siempre sobreescribe
-Map.put(user, :age, 99)      # %{age: 99, name: "Alice"}
-
-# Map.put_new: solo inserta si la key NO existe
-Map.put_new(user, :age, 99)  # %{age: 30, name: "Alice"} — age no se modifica
-Map.put_new(user, :email, "alice@example.com")  # sí inserta, email no existía
-```
-
-## Verification
-
-Ejecuta en IEx para verificar tu comprensión:
+### Run the tests
 
 ```bash
-iex
+mix test test/payments_cli/processor_test.exs --trace
 ```
 
+---
+
+## Trade-off analysis
+
+| Aspect | Maps (transactions) | Keyword lists (opts) | Structs (exercise 15) |
+|--------|--------------------|--------------------|----------------------|
+| Key uniqueness | Enforced | Not enforced | Enforced at compile time |
+| Access speed | O(1) | O(n) — linear scan | O(1) — same as map |
+| Default values | Manual with `Map.get/3` | `Keyword.get/3` with default | `defstruct` field defaults |
+| Type checking | None | None | Pattern match by module |
+| Adding unknown fields | Always allowed | N/A | Compile-time error |
+
+Reflection question: `apply_rules/2` uses `Keyword.merge(@default_opts, opts)` to
+merge options. What is the difference between `Keyword.merge(defaults, overrides)` and
+`Keyword.merge(overrides, defaults)`? Which one gives you "caller overrides defaults"
+behavior, and why?
+
+---
+
+## Common production mistakes
+
+**1. Dot notation on string-keyed maps**
+`config = %{"host" => "localhost"}` — then `config.host` raises `KeyError`.
+Dot notation only works with atom keys. Use `config["host"]` or `Map.get/3`.
+
+**2. `%{map | key: val}` to add a new key**
+`%{tx | new_key: value}` raises `KeyError` if `:new_key` does not exist.
+The update syntax only modifies existing keys. Use `Map.put/3` to add.
+
+**3. Assuming map key order**
+`%{b: 2, a: 1}` may print as `%{a: 1, b: 2}` in IEx (sorted for display)
+but iteration order is not guaranteed. Never rely on `Map.keys/1` being sorted
+unless you call `Enum.sort/1` explicitly.
+
+**4. Keyword list with `[]` access vs `Keyword.get/3`**
+`opts[:missing_key]` returns `nil`. `Keyword.get(opts, :missing_key, default)` returns
+`default`. If your default is not `nil`, use `Keyword.get/3` explicitly — silence nil
+returns are hard to debug.
+
+**5. Mutating a map with `Map.put/3` and discarding the result**
 ```elixir
-# Prueba 1: acceso atom vs string keys
-m1 = %{name: "Alice"}
-m2 = %{"name" => "Alice"}
-m1.name       # "Alice"
-# m2.name     # KeyError!
-m2["name"]    # "Alice"
-
-# Prueba 2: update seguro vs KeyError
-user = %{name: "Bob", age: 25}
-Map.put(user, :city, "Madrid")          # ok — agrega nueva key
-# %{user | city: "Madrid"}              # KeyError — city no existe
-
-# Prueba 3: pattern matching extrae solo lo que necesitas
-%{name: n} = %{name: "Carol", age: 40, role: :user}
-n  # "Carol"
-
-# Prueba 4: merge con resolución de conflictos
-Map.merge(%{score: 10}, %{score: 5}, fn _, a, b -> a + b end)
-# %{score: 15}
-
-# Prueba 5: keyword list vs map
-kw = [a: 1, a: 2]
-kw[:a]                    # 1 (primero)
-Keyword.get_values(kw, :a)  # [1, 2]
+Map.put(transaction, :status, :approved)  # BAD: result discarded
+transaction  # still has the old status
 ```
+Maps are immutable. `Map.put/3` returns a new map. Always bind the result.
 
-## Summary
-
-- Los **maps** son la estructura de datos clave-valor principal en Elixir — O(1) en acceso
-- Atom keys: acceso con `.` o `[]`. String keys: solo con `[]` o `Map.get/3`
-- `%{map | key: val}` actualiza keys **existentes**; `Map.put/3` agrega o sobreescribe
-- **Keyword lists** son listas de tuplas — mantienen orden, permiten duplicados, usadas para opciones de funciones
-- Pattern matching en maps extrae solo las keys que declares — las demás se ignoran
-
-## What's Next
-
-- **08-functions-and-arity**: Definir funciones y usar pattern matching en sus parámetros
-- **09-control-flow**: Usar maps en `case` y `cond` para control de flujo
+---
 
 ## Resources
 
-- [Elixir Docs — Map](https://hexdocs.pm/elixir/Map.html)
-- [Elixir Docs — Keyword](https://hexdocs.pm/elixir/Keyword.html)
+- [Map — HexDocs](https://hexdocs.pm/elixir/Map.html)
+- [Keyword — HexDocs](https://hexdocs.pm/elixir/Keyword.html)
+- [Elixir Getting Started — Keywords and Maps](https://elixir-lang.org/getting-started/keywords-and-maps.html)
 - [Elixir School — Maps](https://elixirschool.com/en/lessons/basics/collections#maps-6)
-- [Elixir Getting Started — Key-Value Stores](https://elixir-lang.org/getting-started/keywords-and-maps.html)

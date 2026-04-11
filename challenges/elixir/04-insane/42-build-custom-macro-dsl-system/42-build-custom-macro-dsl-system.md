@@ -1,66 +1,495 @@
-# 42. Build a Custom Macro DSL System
+# Custom Macro DSL System
 
-**Difficulty**: Insane
+**Project**: `dsl_kit` — three interoperable compile-time DSLs with error reporting and code generation transparency
 
-## Prerequisites
+---
 
-- Metaprogramación avanzada en Elixir: `quote/2`, `unquote/1`, `__using__/1`, `__before_compile__/1`
-- AST de Elixir: estructura de `{form, meta, args}` y cómo manipularla
-- Módulo `Module` y sus funciones: `put_attribute/3`, `get_attribute/2`, `register_attribute/3`
-- Macros de acumulación de atributos (`@doc`, `@spec`, equivalentes propios)
-- Compilación de Elixir: qué ocurre en `use`, en `defmacro`, en `__before_compile__`
-- Conocimiento de cómo Phoenix, Ecto o Absinthe implementan sus DSLs
-- Guard clauses y validación en tiempo de compilación
+## Project context
 
-## Problem Statement
+You are building `dsl_kit`, a macro system the framework team will use as the foundation for their internal toolkit. Three DSLs must coexist in the same module without conflicts: a state machine DSL, a validation DSL, and a router DSL. All errors must be caught at compile time with precise file and line information. The generated code must be identical to what a developer would write by hand.
 
-Diseña e implementa un sistema de tres DSLs interoperables en Elixir, cada uno generando código de producción a partir de declaraciones de alto nivel. Los DSLs se implementan como macros que transforman descripciones declarativas en módulos Elixir completos con funciones, callbacks, y documentación generada automáticamente.
+Project structure:
 
-El sistema debe detectar errores en los DSLs en tiempo de compilación (no en runtime), generar código legible e inspeccionable, y permitir que los tres DSLs se usen juntos en el mismo módulo.
+```
+dsl_kit/
+├── lib/
+│   └── dsl_kit/
+│       ├── application.ex
+│       ├── state_machine.ex     # ← StateMachine DSL: state/1, transition/4, initial/1
+│       ├── validation.ex        # ← Validation DSL: validates/2 with rules
+│       ├── router.ex            # ← Router DSL: scope/2, get/post/delete + path params
+│       ├── composer.ex          # ← enables all three DSLs in one module
+│       └── debug.ex             # ← code generation transparency tools
+├── test/
+│   └── dsl_kit/
+│       ├── state_machine_test.exs
+│       ├── validation_test.exs
+│       ├── router_test.exs
+│       └── compose_test.exs
+├── bench/
+│   └── dispatch_bench.exs
+└── mix.exs
+```
 
-El objetivo final es que un desarrollador pueda definir un módulo con `use StateMachine`, `use Validation`, y `use Router` de forma limpia, sin boilerplate repetitivo, y con errores descriptivos cuando la configuración es incorrecta.
+---
 
-## Acceptance Criteria
+## The business problem
 
-- [ ] StateMachine DSL: las macros `state/1`, `transition/4` (from, to, on: event, guard: function) y `initial/1` definen la máquina; en `__before_compile__`, el framework genera: `transition(state, event)` que retorna `{:ok, new_state}` o `{:error, :invalid_transition}`, `valid_state?/1`, `states/0`, `events/0`; los guards son funciones `fn state -> boolean` evaluadas en runtime
-- [ ] Validation DSL: `validates :field, [rule: value, ...]` acumula validaciones por campo; las reglas soportadas incluyen `:required`, `:format` (regex), `:min_length`, `:max_length`, `:inclusion` (enum), `:custom` (función `fn value -> {:ok, value} | {:error, reason}`); en `__before_compile__`, genera `validate/1` que retorna `{:ok, attrs}` o `{:error, %{field => [error_message]}}` con todos los errores acumulados (no fail-fast)
-- [ ] Route DSL: `scope path, [do: block]` y `get/post/put/delete path, Controller, :action` dentro del scope; en `__before_compile__`, genera `dispatch(method, path)` que retorna `{:ok, {Controller, :action, path_params}}` o `{:error, :not_found}`; soporta path params (`:id`) y wildcard (`*rest`)
-- [ ] Compile-time errors: un `transition` que referencia un estado no declarado con `state/1` produce `CompileError` con mensaje "unknown state :foo in transition from :bar to :foo"; un `validates` con una regla desconocida produce `CompileError` con mensaje "unknown validation rule :baz for field :email"; una ruta duplicada produce warning (no error) con la localización exacta (archivo, línea)
-- [ ] Code generation transparency: `mix compile --verbose` muestra un log de cuántas funciones generó cada DSL; una macro `debug_generated_code/0` en cada módulo permite inspeccionar el AST generado en formato legible; el código generado es idéntico al que escribirías a mano (sin artifactos de metaprogramación en el output)
-- [ ] Composability: los tres DSLs pueden usarse en el mismo módulo sin conflictos de nombres; el StateMachine puede referenciar validaciones del Validation DSL en sus guards; el Router puede verificar en compile-time que los Controllers referenciados existen y que las actions están definidas
-- [ ] Documentation: cada `state/1`, `validates/2`, y ruta genera `@doc` automáticamente para las funciones producidas; `mix docs` genera documentación legible que muestra la máquina de estados, las validaciones por campo, y la tabla de rutas; las funciones generadas aparecen como si fueran escritas manualmente
+The framework team is building a toolkit where every service defines its own resources using a declarative DSL. Today, three separate systems handle state machines, validations, and routing — each with its own configuration format. A misconfiguration in any of them is only discovered at runtime. `dsl_kit` makes the configuration itself be code, verified at compile time.
 
-## What You Will Learn
+The critical insight: **a compile-time error is worth ten runtime errors**. When a developer defines a transition to an undefined state, they should see a `CompileError` when they run `mix compile`, not a `FunctionClauseError` at 3 AM in production.
 
-- Metaprogramación avanzada en Elixir: el sistema de macros como herramienta de diseño de lenguajes
-- Cómo funciona el proceso de compilación de Elixir y cuándo se ejecuta cada hook
-- Acumulación de atributos de módulo para construir configuración declarativa
-- Generación de código AST: escribir código que escribe código correcto
-- Errores de compilación descriptivos: cómo guiar al desarrollador cuando el DSL está mal usado
-- Por qué Elixir es especialmente bueno para DSLs internos comparado con otros lenguajes
+---
 
-## Hints
+## Why `__before_compile__` is the right hook for code generation
 
-- `Module.register_attribute(module, :transitions, accumulate: true)` en `__using__/1` permite acumular con `@transitions {:from, :to, event, guard}`
-- En `__before_compile__/1`: `Module.get_attribute(env.module, :transitions)` lee todos los acumulados; luego genera las funciones con `quote do ... end` y las inyecta con `Module.eval_quoted/2`
-- Para compile-time errors: `raise CompileError, description: "...", file: env.file, line: env.line` dentro de un macro
-- La composabilidad entre DSLs: usa un atributo compartido `@dsl_config` y cada DSL añade su sección; en `__before_compile__` cada DSL solo lee su propia sección
-- Para la transparencia: añade `IO.puts` condicional bajo una env var `MIX_DSL_DEBUG=true`; o genera una función `__dsl_debug__/0` que retorna el código como string con `Macro.to_string/1`
-- El Router con path params: parsea `"/users/:id/posts/:post_id"` en tiempo de compilación a un pattern con capturas; genera cláusulas de función con pattern matching sobre los segmentos del path
+`use MyDSL` runs immediately when the module is parsed. Individual macro calls (`state :active`, `transition :idle, :active, on: :start`) run as they are encountered. But you cannot generate the `transition/2` dispatch function until all `state/1` and `transition/4` calls have been processed — you don't know all the valid states until the module is fully defined.
 
-## Reference Material
+`__before_compile__` fires after all macro calls in the module have executed but before the module is compiled to BEAM bytecode. This is the correct point to:
 
-- "Metaprogramming Elixir" — Chris McCord (capítulos 3-5 sobre DSLs avanzados)
-- Código fuente de Ecto `Schema` y `Changeset` (macros acumuladoras reales en producción)
-- Código fuente de Phoenix `Router` (cómo genera las rutas con macros)
-- Elixir documentation: `Kernel.SpecialForms` (quote, unquote, unquote_splicing)
-- "Understanding Elixir Macros" — Saša Jurić (blog series)
-- Absinthe source code (DSL de GraphQL en Elixir, muy instructivo)
+1. Read all accumulated attributes
+2. Validate consistency (all transitions reference declared states)
+3. Generate dispatch functions
 
-## Difficulty Rating ★★★★★★★
+---
 
-Las macros de Elixir son poderosas pero tracioneras: los errores de metaprogramación son difíciles de debuggear porque ocurren en un momento diferente al de la ejecución normal. La parte más difícil es la composabilidad entre DSLs sin conflictos y los errores de compilación con contexto preciso (archivo, línea, nombre del campo/estado/ruta problemático).
+## The two-phase macro pattern
 
-## Estimated Time
+```
+Phase 1 (per-declaration): accumulate
+  @states :active        → Module attribute list grows
+  @transitions {:idle, :active, :start, nil}
 
-25–40 horas
+Phase 2 (__before_compile__): generate
+  Read @states, @transitions
+  Validate: all states in transitions are in @states
+  Generate: def transition(:idle, :start) → {:ok, :active}
+```
+
+This pattern — accumulate in phase 1, generate in phase 2 — is used by Ecto schemas, Phoenix Router, and Absinthe. Implementing it from scratch makes you understand why Phoenix Router needs `__before_compile__` before you can appreciate it as a user.
+
+---
+
+## Implementation
+
+### Step 1: Create the project
+
+```bash
+mix new dsl_kit --sup
+cd dsl_kit
+mkdir -p test/dsl_kit bench
+```
+
+### Step 2: `mix.exs`
+
+```elixir
+defp deps do
+  [
+    {:benchee, "~> 1.3", only: :dev}
+  ]
+end
+```
+
+### Step 3: `lib/dsl_kit/state_machine.ex`
+
+```elixir
+defmodule DslKit.StateMachine do
+  @moduledoc """
+  Compile-time state machine DSL.
+
+  Usage:
+    defmodule OrderFSM do
+      use DslKit.StateMachine
+
+      initial :pending
+
+      state :pending
+      state :processing
+      state :shipped
+      state :cancelled
+
+      transition :pending, :processing, on: :start_processing
+      transition :processing, :shipped, on: :ship
+      transition :processing, :cancelled, on: :cancel, guard: &Order.can_cancel?/1
+      transition :pending, :cancelled, on: :cancel
+    end
+
+  Generated functions:
+    def transition(state, event) → {:ok, new_state} | {:error, :invalid_transition}
+    def valid_state?(state) → boolean()
+    def states() → [:pending, :processing, :shipped, :cancelled]
+    def events() → [:start_processing, :ship, :cancel]
+    def initial_state() → :pending
+  """
+
+  defmacro __using__(_opts) do
+    quote do
+      import DslKit.StateMachine
+      Module.register_attribute(__MODULE__, :sm_states, accumulate: true)
+      Module.register_attribute(__MODULE__, :sm_transitions, accumulate: true)
+      Module.put_attribute(__MODULE__, :sm_initial, nil)
+      @before_compile DslKit.StateMachine
+    end
+  end
+
+  defmacro __before_compile__(env) do
+    states = Module.get_attribute(env.module, :sm_states) |> Enum.reverse() |> Enum.uniq()
+    transitions = Module.get_attribute(env.module, :sm_transitions) |> Enum.reverse()
+    initial = Module.get_attribute(env.module, :sm_initial)
+
+    # Validate all transition endpoints reference declared states
+    Enum.each(transitions, fn {from, to, _event, _guard} ->
+      unless from in states do
+        raise CompileError,
+          description: "unknown state #{inspect(from)} in transition from #{inspect(from)} to #{inspect(to)}",
+          file: env.file,
+          line: env.line
+      end
+
+      unless to in states do
+        raise CompileError,
+          description: "unknown state #{inspect(to)} in transition from #{inspect(from)} to #{inspect(to)}",
+          file: env.file,
+          line: env.line
+      end
+    end)
+
+    # Generate transition/2 clauses
+    transition_clauses =
+      Enum.map(transitions, fn {from, to, event, guard} ->
+        if guard do
+          quote do
+            def transition(unquote(from), unquote(event), context) do
+              if unquote(guard).(context) do
+                {:ok, unquote(to)}
+              else
+                {:error, :guard_rejected}
+              end
+            end
+          end
+        else
+          quote do
+            def transition(unquote(from), unquote(event)) do
+              {:ok, unquote(to)}
+            end
+          end
+        end
+      end)
+
+    catch_all = quote do
+      def transition(_state, _event), do: {:error, :invalid_transition}
+    end
+
+    quote do
+      unquote_splicing(transition_clauses)
+      unquote(catch_all)
+
+      def valid_state?(state), do: state in unquote(states)
+      def states(), do: unquote(states)
+      def events(), do: unquote(Enum.map(transitions, fn {_, _, e, _} -> e end) |> Enum.uniq())
+      def initial_state(), do: unquote(initial)
+    end
+  end
+
+  defmacro initial(state) do
+    quote do
+      @sm_initial unquote(state)
+    end
+  end
+
+  defmacro state(name) do
+    quote do
+      @sm_states unquote(name)
+    end
+  end
+
+  defmacro transition(from, to, opts) do
+    event = Keyword.fetch!(opts, :on)
+    guard = Keyword.get(opts, :guard)
+
+    quote do
+      @sm_transitions {unquote(from), unquote(to), unquote(event), unquote(guard)}
+    end
+  end
+end
+```
+
+### Step 4: `lib/dsl_kit/validation.ex`
+
+```elixir
+defmodule DslKit.Validation do
+  @moduledoc """
+  Compile-time validation DSL.
+
+  Usage:
+    defmodule UserSchema do
+      use DslKit.Validation
+
+      validates :name,  [required: true, min_length: 2, max_length: 100]
+      validates :email, [required: true, format: ~r/@/]
+      validates :age,   [required: false, min: 0, max: 150]
+      validates :role,  [required: true, inclusion: ["admin", "user", "viewer"]]
+    end
+
+  Generated function:
+    def validate(attrs) → {:ok, attrs} | {:error, %{field => [error_messages]}}
+    (accumulates ALL errors — does not fail-fast)
+
+  Compile-time errors:
+    - Unknown rule name → CompileError with field and rule name
+  """
+
+  @known_rules [:required, :min_length, :max_length, :format, :inclusion, :custom, :min, :max]
+
+  defmacro __using__(_opts) do
+    quote do
+      import DslKit.Validation
+      Module.register_attribute(__MODULE__, :validation_rules, accumulate: true)
+      @before_compile DslKit.Validation
+    end
+  end
+
+  defmacro __before_compile__(env) do
+    rules = Module.get_attribute(env.module, :validation_rules) |> Enum.reverse()
+
+    # Group by field
+    by_field = Enum.group_by(rules, fn {field, _rules} -> field end, fn {_field, rules} -> rules end)
+
+    # Generate validate/1
+    quote do
+      def validate(attrs) do
+        errors =
+          unquote(Macro.escape(by_field))
+          |> Enum.flat_map(fn {field, rule_sets} ->
+            value = Map.get(attrs, to_string(field)) || Map.get(attrs, field)
+            rule_set = List.flatten(rule_sets)
+            DslKit.Validation.validate_field(field, value, rule_set)
+          end)
+          |> Enum.group_by(fn {field, _} -> field end, fn {_, msg} -> msg end)
+
+        if map_size(errors) == 0, do: {:ok, attrs}, else: {:error, errors}
+      end
+    end
+  end
+
+  defmacro validates(field, rules) do
+    # Compile-time validation: reject unknown rules
+    Enum.each(rules, fn {rule, _value} ->
+      unless rule in @known_rules do
+        raise CompileError,
+          description: "unknown validation rule #{inspect(rule)} for field #{inspect(field)}",
+          file: __CALLER__.file,
+          line: __CALLER__.line
+      end
+    end)
+
+    quote do
+      @validation_rules {unquote(field), unquote(rules)}
+    end
+  end
+
+  # Runtime validation helpers (called by generated validate/1)
+  def validate_field(field, nil, rules) do
+    if Keyword.get(rules, :required, false) do
+      [{field, "is required"}]
+    else
+      []
+    end
+  end
+
+  def validate_field(field, value, rules) do
+    Enum.flat_map(rules, fn
+      {:required, true} when value == nil -> [{field, "is required"}]
+      {:required, _} -> []
+
+      {:min_length, min} when is_binary(value) and String.length(value) < min ->
+        [{field, "must be at least #{min} characters"}]
+
+      {:max_length, max} when is_binary(value) and String.length(value) > max ->
+        [{field, "must be at most #{max} characters"}]
+
+      {:format, regex} when is_binary(value) ->
+        if Regex.match?(regex, value), do: [], else: [{field, "has invalid format"}]
+
+      {:inclusion, valid_values} ->
+        if value in valid_values, do: [], else: [{field, "must be one of #{inspect(valid_values)}"}]
+
+      {:min, min} when is_number(value) and value < min ->
+        [{field, "must be at least #{min}"}]
+
+      {:max, max} when is_number(value) and value > max ->
+        [{field, "must be at most #{max}"}]
+
+      {:custom, fun} when is_function(fun, 1) ->
+        case fun.(value) do
+          {:ok, _} -> []
+          {:error, msg} -> [{field, msg}]
+        end
+
+      _ -> []
+    end)
+  end
+end
+```
+
+### Step 5: Given tests — must pass without modification
+
+```elixir
+# test/dsl_kit/state_machine_test.exs
+defmodule DslKit.StateMachineTest do
+  use ExUnit.Case, async: true
+
+  defmodule TrafficLight do
+    use DslKit.StateMachine
+    initial :red
+    state :red
+    state :green
+    state :yellow
+    transition :red,    :green,  on: :go
+    transition :green,  :yellow, on: :slow
+    transition :yellow, :red,    on: :stop
+  end
+
+  test "valid transitions" do
+    assert {:ok, :green}  = TrafficLight.transition(:red,    :go)
+    assert {:ok, :yellow} = TrafficLight.transition(:green,  :slow)
+    assert {:ok, :red}    = TrafficLight.transition(:yellow, :stop)
+  end
+
+  test "invalid transition returns error" do
+    assert {:error, :invalid_transition} = TrafficLight.transition(:red, :slow)
+  end
+
+  test "valid_state? works" do
+    assert TrafficLight.valid_state?(:red)
+    refute TrafficLight.valid_state?(:purple)
+  end
+
+  test "states/0 returns all declared states" do
+    assert :red in TrafficLight.states()
+    assert :green in TrafficLight.states()
+    assert :yellow in TrafficLight.states()
+  end
+
+  test "initial_state/0" do
+    assert TrafficLight.initial_state() == :red
+  end
+end
+```
+
+```elixir
+# test/dsl_kit/validation_test.exs
+defmodule DslKit.ValidationTest do
+  use ExUnit.Case, async: true
+
+  defmodule UserSchema do
+    use DslKit.Validation
+    validates :name,  [required: true, min_length: 2]
+    validates :email, [required: true, format: ~r/@/]
+    validates :role,  [required: true, inclusion: ["admin", "user"]]
+  end
+
+  test "valid attributes pass" do
+    attrs = %{"name" => "Alice", "email" => "alice@example.com", "role" => "admin"}
+    assert {:ok, _} = UserSchema.validate(attrs)
+  end
+
+  test "missing required field fails" do
+    assert {:error, errors} = UserSchema.validate(%{"email" => "a@b.com", "role" => "user"})
+    assert Map.has_key?(errors, :name)
+  end
+
+  test "all errors accumulated (not fail-fast)" do
+    # Both name and email are wrong
+    assert {:error, errors} = UserSchema.validate(%{"role" => "admin"})
+    assert Map.has_key?(errors, :name)
+    assert Map.has_key?(errors, :email)
+    assert map_size(errors) >= 2
+  end
+
+  test "unknown role fails inclusion" do
+    assert {:error, errors} = UserSchema.validate(%{"name" => "X", "email" => "x@y.com", "role" => "superadmin"})
+    assert Map.has_key?(errors, :role)
+  end
+end
+```
+
+```elixir
+# test/dsl_kit/compose_test.exs
+defmodule DslKit.ComposeTest do
+  use ExUnit.Case, async: true
+
+  # Verify all three DSLs can coexist in one module
+  defmodule OrderModule do
+    use DslKit.StateMachine
+    use DslKit.Validation
+
+    initial :draft
+    state :draft
+    state :submitted
+    transition :draft, :submitted, on: :submit
+
+    validates :amount, [required: true, min: 1]
+    validates :currency, [required: true, inclusion: ["USD", "EUR"]]
+  end
+
+  test "state machine works in composed module" do
+    assert {:ok, :submitted} = OrderModule.transition(:draft, :submit)
+  end
+
+  test "validation works in composed module" do
+    assert {:ok, _} = OrderModule.validate(%{"amount" => 100, "currency" => "USD"})
+    assert {:error, _} = OrderModule.validate(%{"amount" => -1, "currency" => "USD"})
+  end
+end
+```
+
+### Step 6: Run the tests
+
+```bash
+mix test test/dsl_kit/ --trace
+```
+
+---
+
+## Trade-off analysis
+
+| Aspect | Compile-time DSL (your impl) | Runtime config (keyword lists) | External config (YAML/JSON) |
+|--------|-----------------------------|-----------------------------|----------------------------|
+| Error detection | compile time | runtime | runtime / deploy time |
+| IDE support | full Elixir tooling | partial | language server dependent |
+| Expressiveness | Elixir macros (high) | limited | limited |
+| Generated code | inspectable | interpreted at runtime | interpreted at runtime |
+| Debugging | `mix compile --verbose` | stack traces | config validation errors |
+| Onboarding | macro concepts required | none | none |
+
+Reflection: Phoenix Router uses compile-time route compilation for dispatch performance, but stores route metadata in module attributes for use at runtime (e.g., path helpers). What data from your Router DSL would you want accessible at runtime, and how would you expose it without duplicating it?
+
+---
+
+## Common production mistakes
+
+**1. Generating code with hygiene violations**
+Macros have hygiene by default: variables defined in `quote do ... end` don't leak into the caller's scope. If you use `var!(x)` to bypass hygiene, you risk variable name collisions. Keep generated code hygienic unless you explicitly need to share a variable.
+
+**2. `Module.eval_quoted/2` instead of returning AST from `__before_compile__`**
+`__before_compile__` should return quoted expressions. Using `Module.eval_quoted` inside it evaluates code in a non-standard context and can cause compiler warnings or incorrect module metadata. Return the `quote do ... end` block directly.
+
+**3. Attribute accumulation in definition order reversed**
+`Module.register_attribute(module, :name, accumulate: true)` prepends each new value. `[:transition_3, :transition_2, :transition_1]` — reversed from definition order. Call `Enum.reverse/1` in `__before_compile__` before generating clauses.
+
+**4. Compile-time errors without file and line**
+`raise CompileError, description: "..."` without `file:` and `line:` fields produces an error pointing to the wrong location. Always extract these from `__CALLER__` (in macros) or `env` (in `__before_compile__`).
+
+**5. Generated functions shadowing existing ones**
+If a user's module defines a function with the same name as one your DSL generates, you'll get a `function already defined` warning or error. Namespace your generated functions or document clearly which names are reserved.
+
+---
+
+## Resources
+
+- ["Metaprogramming Elixir"](https://pragprog.com/titles/cmelixir/metaprogramming-elixir/) — Chris McCord — chapters 3–5 on DSL design and compile-time code generation
+- [Ecto Schema source](https://github.com/elixir-ecto/ecto/blob/master/lib/ecto/schema.ex) — the best real-world example of accumulating attributes with `__before_compile__`; study how fields accumulate and how the schema is generated
+- [Phoenix Router source](https://github.com/phoenixframework/phoenix/blob/main/lib/phoenix/router.ex) — compile-time route generation; the `__before_compile__` hook and route compilation
+- [Elixir — `Kernel.SpecialForms`](https://hexdocs.pm/elixir/Kernel.SpecialForms.html) — read the `quote/2`, `unquote/1`, and `unquote_splicing/1` documentation; these are the primitives your macros use
+- ["Understanding Elixir Macros"](https://www.theerlangelist.com/article/macros_1) — Saša Jurić — a 6-part blog series that builds intuition for the macro system from first principles

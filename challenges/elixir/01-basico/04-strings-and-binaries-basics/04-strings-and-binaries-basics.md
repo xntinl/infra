@@ -1,604 +1,312 @@
-# 4. Strings and Binaries Basics
+# Strings and Binaries: Parsing CSV Transaction Lines
 
-**Difficulty**: Basico
+**Project**: `payments_cli` — built incrementally across the basic level
 
-## Prerequisites
-- Haber completado el ejercicio 01-setup-and-mix
-- Familiaridad básica con atoms (ejercicio 02)
-- IEx disponible
+---
 
-## Learning Objectives
-After completing this exercise, you will be able to:
-- Crear strings UTF-8 y verificar su encoding con funciones del módulo `String`
-- Usar interpolación de strings con `#{}`
-- Concatenar strings con el operador `<>`
-- Distinguir entre strings (binarios) y charlists (listas de codepoints)
-- Aplicar las funciones más comunes del módulo `String`
+## Project context
 
-## Concepts
+You're building `payments_cli`. The system reads transaction data from CSV files
+exported by the bank. CSV parsing requires splitting, trimming, validating, and
+formatting strings correctly — including merchant names with non-ASCII characters.
 
-### Strings son Binarios UTF-8
-En Elixir, los strings se escriben entre comillas dobles y son secuencias de bytes UTF-8. No son arrays de caracteres como en C, ni objetos como en Java. Son binarios — secuencias de bytes — donde cada "carácter" puede ocupar entre 1 y 4 bytes dependiendo del codepoint Unicode.
+Project structure at this point:
 
-Esta representación tiene una implicación importante: `String.length/1` retorna el número de graphemes (caracteres visibles), mientras que `byte_size/1` retorna el número de bytes. Para texto ASCII puro son iguales, pero para texto con acentos, caracteres asiáticos, o emojis, pueden diferir significativamente.
-
-```elixir
-# Strings básicos
-"hello"
-"Hello, World!"
-"Café"           # UTF-8: 'é' ocupa 2 bytes
-"こんにちは"      # UTF-8: cada carácter ocupa 3 bytes
-"🎉"             # UTF-8: emoji ocupa 4 bytes
-
-# String.length cuenta graphemes (caracteres visibles)
-String.length("hello")    # 5
-String.length("Café")     # 4  — cuatro letras visibles
-String.length("🎉")       # 1  — un emoji
-
-# byte_size cuenta bytes raw
-byte_size("hello")    # 5   — ASCII: 1 byte por carácter
-byte_size("Café")     # 5   — 'C','a','f' = 3 bytes, 'é' = 2 bytes
-byte_size("🎉")       # 4   — emoji usa 4 bytes en UTF-8
+```
+payments_cli/
+├── lib/
+│   └── payments_cli/
+│       ├── cli.ex              # from exercise 01
+│       ├── transaction.ex      # from exercise 02
+│       ├── ledger.ex           # from exercise 03
+│       └── formatter.ex        # ← you implement this
+├── test/
+│   └── payments_cli/
+│       └── formatter_test.exs  # given tests — must pass without modification
+└── mix.exs
 ```
 
-### Charlists: El Otro Tipo de "String"
-Elixir hereda de Erlang el tipo charlist — una lista de integers donde cada integer es el codepoint Unicode de un carácter. Se escriben entre comillas simples: `'hello'`. Son fundamentalmente diferentes a los strings de doble comilla.
+---
 
-Los charlists son necesarios cuando interactúas con APIs de Erlang — muchas funciones de Erlang esperan charlists, no binarios. En código Elixir puro, usa siempre strings de doble comilla. Solo usa charlists cuando una librería Erlang lo requiera.
+## Why strings as binaries matters in a payments context
 
-```elixir
-# Charlist — comilla simple
-'hello'
-# equivale a [104, 101, 108, 108, 111] — lista de codepoints
+A CSV file exported by a European bank may contain merchant names like
+`"Café München GmbH"`. If you treat strings as byte arrays (as C does),
+the length of that name is 19 bytes but only 16 visible characters.
+Truncating to 15 "characters" by bytes splits `ü` in the middle and
+produces invalid UTF-8 — data corruption.
 
-# String — comilla doble
-"hello"
-# es un binario: <<104, 101, 108, 108, 111>>
+Elixir strings are UTF-8 encoded binaries. The distinction matters:
+- `byte_size("Café")` → `5` (bytes, O(1), used for binary protocol headers)
+- `String.length("Café")` → `4` (graphemes, O(n), used for display truncation)
+- `String.valid?/1` → validates UTF-8 before storing or forwarding data
 
-# Son tipos completamente distintos
-is_list('hello')      # true  — charlist es una lista
-is_binary("hello")    # true  — string es un binario
+The other gotcha: bank-exported CSVs often arrive with Erlang charlists from
+old Erlang library integrations. A senior developer recognizes `'hello'` (charlist)
+vs `"hello"` (binary) and knows when `to_string/1` is needed.
 
-# IEx muestra charlists como strings si todos los codepoints son ASCII imprimibles
-# Esto puede ser confuso al principio
-[104, 101, 108, 108, 111]  # IEx muestra: 'hello'
+---
 
-# Convertir entre ambos
-to_charlist("hello")    # 'hello' => [104, 101, 108, 108, 111]
-to_string('hello')      # "hello"
-List.to_string('hello') # "hello"
-```
+## The business problem
 
-### Interpolación de Strings
-La interpolación permite insertar el valor de cualquier expresión Elixir dentro de un string usando la sintaxis `#{expresión}`. La expresión dentro de `#{}` puede ser cualquier código Elixir válido — variables, llamadas a funciones, operaciones aritméticas, etc.
+The `Formatter` module needs to:
 
-```elixir
-name = "Alice"
-age = 30
+1. Parse a raw CSV line into a map of field values
+2. Truncate merchant names to a display length (respecting UTF-8 graphemes)
+3. Normalize reference IDs (uppercase, trim, remove internal spaces)
+4. Format an amount in cents as a human-readable string (builds on Ledger.format_amount/2)
 
-# Interpolación básica
-"Hello, #{name}!"
-# "Hello, Alice!"
+---
 
-# Expresiones complejas dentro de #{}
-"#{name} will be #{age + 1} next year"
-# "Alice will be 31 next year"
+## Implementation
 
-# Llamadas a funciones
-"Name in uppercase: #{String.upcase(name)}"
-# "Name in uppercase: ALICE"
-
-# Cualquier valor se convierte a string automáticamente via to_string/1
-"Pi is approximately #{:math.pi()}"
-# "Pi is approximately 3.141592653589793"
-
-"Today's status: #{:active}"
-# "Today's status: active"
-```
-
-### Concatenación con <>
-El operador `<>` concatena binarios (strings). Es equivalente al `+` de Python o Java para strings, pero con un nombre diferente para evitar confusión con la suma aritmética.
+### `lib/payments_cli/formatter.ex`
 
 ```elixir
-"Hello" <> " " <> "World"
-# "Hello World"
+defmodule PaymentsCli.Formatter do
+  @moduledoc """
+  Parses and formats transaction data for display and storage.
 
-first = "John"
-last = "Doe"
-full_name = first <> " " <> last
-# "John Doe"
-
-# Concatenar en un loop o con Enum.join es más eficiente que <> repetido
-words = ["Hello", "from", "Elixir"]
-Enum.join(words, " ")
-# "Hello from Elixir"
-```
-
-### Funciones Esenciales del Módulo String
-El módulo `String` provee funciones para manipular strings UTF-8 de forma correcta — respetando la codificación y los graphemes compuestos.
-
-```elixir
-# Transformaciones de caso
-String.upcase("hello")          # "HELLO"
-String.downcase("HELLO")        # "hello"
-String.capitalize("hello world") # "Hello world"
-
-# Longitud y contenido
-String.length("hello")          # 5
-String.contains?("hello", "ell") # true
-String.starts_with?("hello", "he") # true
-String.ends_with?("hello", "lo")   # true
-
-# División y unión
-String.split("hello world", " ")  # ["hello", "world"]
-String.split("a,b,c", ",")        # ["a", "b", "c"]
-Enum.join(["a", "b", "c"], "-")    # "a-b-c"
-
-# Recorte de espacios
-String.trim("  hello  ")          # "hello"
-String.trim_leading("  hello  ")  # "hello  "
-String.trim_trailing("  hello  ") # "  hello"
-
-# Reemplazar
-String.replace("hello world", "world", "Elixir")  # "hello Elixir"
-
-# Invertir
-String.reverse("hello")  # "olleh"
-
-# Obtener parte de un string
-String.slice("hello world", 0, 5)  # "hello"
-String.slice("hello world", 6, 5)  # "world"
-```
-
-### Heredocs — Strings Multilínea
-Para strings que abarcan múltiples líneas, Elixir ofrece la sintaxis heredoc con triple comilla.
-
-```elixir
-# Heredoc básico
-message = """
-Hola, Elixir!
-Este es un string
-de múltiples líneas.
-"""
-
-# El heredoc elimina el indentado base automáticamente
-query = """
-  SELECT *
-  FROM users
-  WHERE active = true
+  All string operations use the String module (not binary/charlist operations)
+  to correctly handle UTF-8 merchant names and reference fields.
   """
 
-# También existe ~s para heredocs con escape
-html = ~s"""
-<div class="container">
-  <p>Hello, #{name}!</p>
-</div>
-"""
-```
-
-## Exercises
-
-### Exercise 1: Creating Strings and UTF-8
-Experimenta con strings UTF-8 y la diferencia entre `String.length/1` y `byte_size/1`.
-
-```elixir
-$ iex
-
-# String ASCII simple
-iex> "Hello, Elixir!"
-"Hello, Elixir!"
-
-iex> String.length("Hello, Elixir!")
-14
-
-iex> byte_size("Hello, Elixir!")
-14
-
-# String con caracteres UTF-8 multibyte
-iex> "Café"
-"Café"
-
-iex> String.length("Café")
-4
-
-iex> byte_size("Café")
-5
-
-# Verificar que es un binario
-iex> is_binary("Hello")
-true
-
-# Inspeccionar los bytes raw de un string
-iex> :binary.bin_to_list("café")
-[99, 97, 102, 195, 169]
-
-# 'é' es dos bytes: 195, 169 (0xC3, 0xA9) en UTF-8
-```
-
-Expected output:
-```
-iex> String.length("Café")
-4
-iex> byte_size("Café")
-5
-iex> is_binary("Café")
-true
-```
-
-### Exercise 2: String Interpolation
-Practica la interpolación usando variables, cálculos, y llamadas a funciones.
-
-```elixir
-# Definir variables
-iex> name = "Alice"
-"Alice"
-
-iex> birth_year = 1990
-1990
-
-# Interpolación básica
-iex> "Hello, #{name}!"
-"Hello, Alice!"
-
-# Interpolación con expresión aritmética
-iex> "Hello, #{name}! You are #{2026 - birth_year} years old."
-"Hello, Alice! You are 36 years old."
-
-# Interpolación con llamada a función
-iex> "Name in uppercase: #{String.upcase(name)}"
-"Name in uppercase: ALICE"
-
-# Interpolación con atom (se convierte a string automáticamente)
-iex> status = :active
-iex> "User status: #{status}"
-"User status: active"
-
-# Interpolación anidada (no recomendada, pero funciona)
-iex> items = 3
-iex> "You have #{items} item#{if items == 1, do: "", else: "s"}."
-"You have 3 items."
-```
-
-Expected output:
-```
-iex> "Hello, #{name}! You are #{2026 - birth_year} years old."
-"Hello, Alice! You are 36 years old."
-```
-
-### Exercise 3: Concatenation with <>
-Usa el operador `<>` para construir strings a partir de partes más pequeñas.
-
-```elixir
-# Concatenación básica
-iex> "Hello" <> " " <> "World"
-"Hello World"
-
-# Construir un nombre completo
-iex> first = "John"
-"John"
-
-iex> last = "Doe"
-"Doe"
-
-iex> full_name = first <> " " <> last
-"John Doe"
-
-# Concatenar con números — debes convertir primero
-iex> "Answer: " <> Integer.to_string(42)
-"Answer: 42"
-
-# Alternativa más idiomática: interpolación
-iex> "Answer: #{42}"
-"Answer: 42"
-
-# Concatenar muchos items — Enum.join es más eficiente
-iex> parts = ["Elixir", "is", "awesome"]
-iex> Enum.join(parts, " ")
-"Elixir is awesome"
-
-# <> en pattern matching — extraer prefijo o sufijo
-iex> "Hello" <> rest = "Hello World"
-"Hello World"
-
-iex> rest
-" World"
-```
-
-Expected output:
-```
-iex> "Hello" <> " " <> "World"
-"Hello World"
-iex> first <> " " <> last
-"John Doe"
-iex> Enum.join(["Elixir", "is", "awesome"], " ")
-"Elixir is awesome"
-```
-
-### Exercise 4: String Functions
-Practica las funciones más útiles del módulo `String`.
-
-```elixir
-# Transformaciones de caso
-iex> String.upcase("hello world")
-"HELLO WORLD"
-
-iex> String.downcase("HELLO WORLD")
-"hello world"
-
-iex> String.capitalize("hello world")
-"Hello world"
-
-# División
-iex> String.split("hello world elixir", " ")
-["hello", "world", "elixir"]
-
-iex> String.split("a,b,,c", ",")
-["a", "b", "", "c"]
-
-# Eliminar partes vacías
-iex> String.split("a,b,,c", ",", trim: true)
-["a", "b", "c"]
-
-# Búsqueda y verificación
-iex> String.contains?("hello world", "world")
-true
-
-iex> String.starts_with?("hello", "he")
-true
-
-iex> String.ends_with?("hello", "lo")
-true
-
-# Recorte y reemplazo
-iex> String.trim("   hello   ")
-"hello"
-
-iex> String.replace("hello world", "world", "Elixir")
-"hello Elixir"
-
-# Invertir y rebanar
-iex> String.reverse("hello")
-"olleh"
-
-iex> String.slice("hello world", 6, 5)
-"world"
-```
-
-Expected output:
-```
-iex> String.upcase("hello world")
-"HELLO WORLD"
-iex> String.split("a,b,c", ",")
-["a", "b", "c"]
-iex> String.trim("   hello   ")
-"hello"
-iex> String.reverse("hello")
-"olleh"
-```
-
-### Exercise 5: Charlists vs Strings
-Entiende la diferencia entre charlists (comilla simple) y strings (comilla doble).
-
-```elixir
-# Charlist — comilla simple
-iex> 'hello'
-'hello'
-
-iex> is_list('hello')
-true
-
-iex> is_binary('hello')
-false
-
-# String — comilla doble
-iex> "hello"
-"hello"
-
-iex> is_binary("hello")
-true
-
-iex> is_list("hello")
-false
-
-# La diferencia interna
-iex> 'hello' == [104, 101, 108, 108, 111]
-true
-
-# IEx puede mostrar listas como charlists si todos los valores son ASCII imprimibles
-iex> [104, 101, 108, 108, 111]
-'hello'
-
-# Conversión entre tipos
-iex> to_charlist("hello")
-'hello'
-
-iex> to_string('hello')
-"hello"
-
-# Una función que espera string rechaza charlist
-iex> String.upcase('hello')
-# ** (FunctionClauseError) — String.upcase espera un binary, no una lista
-
-# Solución: convertir primero
-iex> String.upcase(to_string('hello'))
-"HELLO"
-```
-
-Expected output:
-```
-iex> is_list('hello')
-true
-iex> is_binary("hello")
-true
-iex> to_charlist("hello")
-'hello'
-iex> to_string('hello')
-"hello"
-```
-
-### Exercise 6: String Inspection — Graphemes y Bytes
-Explora la representación interna de strings UTF-8 con las funciones avanzadas del módulo `String`.
-
-```elixir
-# Graphemes — unidades visibles de texto (puede ser más de un codepoint)
-iex> String.graphemes("café")
-["c", "a", "f", "é"]
-
-iex> String.graphemes("hello")
-["h", "e", "l", "l", "o"]
-
-# Codepoints — valores Unicode de cada carácter
-iex> String.codepoints("café")
-["c", "a", "f", "é"]
-
-# Length vs byte_size
-iex> String.length("café")
-4
-
-iex> byte_size("café")
-5
-
-# Carácter especial — emoji
-iex> String.length("🎉 party")
-7
-
-iex> byte_size("🎉 party")
-10
-
-# Iterar sobre graphemes
-iex> "café" |> String.graphemes() |> Enum.each(&IO.puts/1)
-c
-a
-f
-é
-:ok
-
-# Verificar si un string es válido UTF-8
-iex> String.valid?("hello")
-true
-
-iex> String.valid?(<<0xFF, 0xFE>>)
-false
-
-# Contar ocurrencias
-iex> "hello world hello" |> String.split("hello") |> length() |> Kernel.-(1)
-2
-```
-
-Expected output:
-```
-iex> String.graphemes("café")
-["c", "a", "f", "é"]
-iex> String.length("café")
-4
-iex> byte_size("café")
-5
-iex> String.valid?("hello")
-true
-```
-
-## Common Mistakes
-
-### Mistake 1: Usar + para concatenar strings
-**Wrong:**
-```elixir
-iex> "hello" + " world"
-```
-**Error:** `** (ArithmeticError) bad argument in arithmetic expression`
-**Why:** En Elixir, `+` es solo para números. No hay sobrecarga de operadores en el lenguaje, y strings no son números. El compilador no convierte strings a números automáticamente.
-**Fix:**
-```elixir
-# Usar el operador <> para concatenación
-iex> "hello" <> " world"
-"hello world"
-
-# O usar interpolación
-iex> greeting = "hello"
-iex> "#{greeting} world"
-"hello world"
-```
-
-### Mistake 2: Confundir charlist con string al pasar a funciones
-**Wrong:**
-```elixir
-# Intentar usar funciones String con un charlist
-iex> name = 'Alice'    # charlist (comilla simple)
-iex> String.upcase(name)
-```
-**Error:** `** (FunctionClauseError) no function clause matching in String.upcase/1` — `String.upcase` espera un binario, no una lista.
-**Why:** `'Alice'` es una lista de integers `[65, 108, 105, 99, 101]`, no un binario. Las funciones del módulo `String` trabajan exclusivamente con binarios.
-**Fix:**
-```elixir
-# Opción 1: usar comillas dobles desde el principio
-name = "Alice"
-String.upcase(name)   # "ALICE"
-
-# Opción 2: convertir la charlist a string
-name = 'Alice'
-String.upcase(to_string(name))   # "ALICE"
-```
-
-### Mistake 3: String.length != byte_size para UTF-8
-**Wrong:**
-```elixir
-# Truncar a 10 caracteres usando byte_size para calcular
-def truncate(str, max_chars) do
-  if byte_size(str) > max_chars do
-    binary_part(str, 0, max_chars) <> "..."  # INCORRECTO para UTF-8
-  else
-    str
+  @doc """
+  Parses a CSV line into a map with typed values.
+
+  Expected CSV format: "id,amount_cents,currency,merchant,status"
+
+  Returns {:ok, map} or {:error, reason}.
+
+  ## Examples
+
+      iex> PaymentsCli.Formatter.parse_csv_line("TXN001,1234,USD,Coffee Shop,approved")
+      {:ok, %{id: "TXN001", amount_cents: 1234, currency: "USD", merchant: "Coffee Shop", status: "approved"}}
+
+      iex> PaymentsCli.Formatter.parse_csv_line("bad data")
+      {:error, "expected 5 fields, got 1"}
+
+  """
+  @spec parse_csv_line(String.t()) :: {:ok, map()} | {:error, String.t()}
+  def parse_csv_line(line) when is_binary(line) do
+    # TODO: implement CSV parsing
+    #
+    # HINT:
+    #   1. String.split(line, ",") to split on commas
+    #   2. Enum.map each field with String.trim/1
+    #   3. Pattern match on the list to extract exactly 5 fields
+    #   4. Parse amount_cents with String.to_integer/1 (raises on invalid — handle it)
+    #   5. Return {:ok, %{id: ..., amount_cents: ..., currency: ..., merchant: ..., status: ...}}
+    #
+    # For step 4: Integer.parse/1 returns {integer, rest} or :error — safer than
+    # String.to_integer/1 which raises. Use Integer.parse/1 and match on {n, ""}.
+  end
+
+  @doc """
+  Truncates a merchant name to max_length graphemes, adding "…" if truncated.
+
+  Uses String.length/1 and String.slice/3 — NOT byte_size — so UTF-8 merchant
+  names like "Café München" are truncated at grapheme boundaries.
+
+  ## Examples
+
+      iex> PaymentsCli.Formatter.truncate_merchant("Coffee Shop", 20)
+      "Coffee Shop"
+
+      iex> PaymentsCli.Formatter.truncate_merchant("A Very Long Merchant Name Here", 15)
+      "A Very Long Mer…"
+
+      iex> PaymentsCli.Formatter.truncate_merchant("Café München GmbH", 10)
+      "Café Münch…"
+
+  """
+  @spec truncate_merchant(String.t(), pos_integer()) :: String.t()
+  def truncate_merchant(name, max_length)
+      when is_binary(name) and is_integer(max_length) and max_length > 0 do
+    # TODO: implement
+    #
+    # HINT: if String.length(name) <= max_length, return name as-is.
+    # Otherwise, String.slice(name, 0, max_length - 1) <> "…"
+    # The ellipsis "…" is a single grapheme (3 bytes in UTF-8).
+  end
+
+  @doc """
+  Normalizes a transaction reference ID from external input.
+
+  Rules: uppercase, trim whitespace, remove internal spaces.
+
+  ## Examples
+
+      iex> PaymentsCli.Formatter.normalize_reference("  txn 001 abc  ")
+      "TXN001ABC"
+
+  """
+  @spec normalize_reference(String.t()) :: String.t()
+  def normalize_reference(ref) when is_binary(ref) do
+    # TODO: implement using a pipe chain
+    #
+    # HINT: String.trim/1 -> String.upcase/1 -> String.replace/3 with " " -> ""
+    # This is a natural pipeline — use |> to express the transformation steps.
+  end
+
+  @doc """
+  Validates that a string is non-empty and valid UTF-8.
+
+  Returns {:ok, string} or {:error, reason}.
+
+  ## Examples
+
+      iex> PaymentsCli.Formatter.validate_string("hello")
+      {:ok, "hello"}
+
+      iex> PaymentsCli.Formatter.validate_string("")
+      {:error, "string is empty"}
+
+  """
+  @spec validate_string(String.t()) :: {:ok, String.t()} | {:error, String.t()}
+  def validate_string(value) when is_binary(value) do
+    # TODO: check String.valid?/1 first, then check length > 0
+    # Order matters: checking length on invalid UTF-8 may raise.
   end
 end
-
-# truncate("café résumé", 5) puede cortar en medio de un carácter multibyte
-# produciendo un string UTF-8 inválido
 ```
-**Error:** No siempre hay error inmediato, pero el resultado puede ser un binario inválido o con caracteres cortados.
-**Why:** `byte_size/1` cuenta bytes, no caracteres. Un solo grapheme como `é` ocupa 2 bytes. Cortar en el byte 5 de "café" crea un binario inválido.
-**Fix:**
+
+### Given tests — must pass without modification
+
 ```elixir
-def truncate(str, max_chars) do
-  if String.length(str) > max_chars do
-    # String.slice respeta los límites de graphemes
-    String.slice(str, 0, max_chars) <> "..."
-  else
-    str
+# test/payments_cli/formatter_test.exs
+defmodule PaymentsCli.FormatterTest do
+  use ExUnit.Case, async: true
+
+  alias PaymentsCli.Formatter
+
+  describe "parse_csv_line/1" do
+    test "parses a valid CSV line" do
+      assert {:ok, tx} = Formatter.parse_csv_line("TXN001,1234,USD,Coffee Shop,approved")
+      assert tx.id == "TXN001"
+      assert tx.amount_cents == 1234
+      assert tx.currency == "USD"
+      assert tx.merchant == "Coffee Shop"
+      assert tx.status == "approved"
+    end
+
+    test "trims whitespace from fields" do
+      assert {:ok, tx} = Formatter.parse_csv_line(" TXN002 , 500 , EUR , Café , pending ")
+      assert tx.id == "TXN002"
+      assert tx.amount_cents == 500
+      assert tx.merchant == "Café"
+    end
+
+    test "returns error for wrong field count" do
+      assert {:error, message} = Formatter.parse_csv_line("bad data")
+      assert is_binary(message)
+    end
+
+    test "returns error for non-integer amount" do
+      assert {:error, _} = Formatter.parse_csv_line("TXN003,not_a_number,USD,Shop,approved")
+    end
+  end
+
+  describe "truncate_merchant/2" do
+    test "returns name unchanged when within limit" do
+      assert Formatter.truncate_merchant("Coffee Shop", 20) == "Coffee Shop"
+    end
+
+    test "truncates at grapheme boundary and adds ellipsis" do
+      result = Formatter.truncate_merchant("A Very Long Merchant Name Here", 15)
+      assert String.length(result) == 15
+      assert String.ends_with?(result, "…")
+    end
+
+    test "handles UTF-8 merchant names correctly" do
+      # "Café München" has 12 graphemes but 14 bytes
+      result = Formatter.truncate_merchant("Café München GmbH", 10)
+      assert String.length(result) == 10
+      # Verify UTF-8 is still valid after truncation
+      assert String.valid?(result)
+    end
+  end
+
+  describe "normalize_reference/1" do
+    test "uppercases and removes spaces" do
+      assert Formatter.normalize_reference("  txn 001 abc  ") == "TXN001ABC"
+    end
+
+    test "handles already normalized input" do
+      assert Formatter.normalize_reference("TXN001") == "TXN001"
+    end
+  end
+
+  describe "validate_string/1" do
+    test "returns ok for valid string" do
+      assert {:ok, "hello"} = Formatter.validate_string("hello")
+    end
+
+    test "returns error for empty string" do
+      assert {:error, _} = Formatter.validate_string("")
+    end
+
+    test "returns error for invalid UTF-8" do
+      assert {:error, _} = Formatter.validate_string(<<0xFF, 0xFE>>)
+    end
   end
 end
-
-# Ahora truncate("café résumé", 5) retorna "café ..."
 ```
 
-## Verification
+### Run the tests
+
 ```bash
-$ iex
-iex> String.upcase("hello elixir")
-"HELLO ELIXIR"
-iex> "Hello, #{"World"}!"
-"Hello, World!"
-iex> "Hello" <> " " <> "World"
-"Hello World"
-iex> String.length("café")
-4
-iex> byte_size("café")
-5
-iex> is_list('hello')
-true
-iex> is_binary("hello")
-true
-iex> String.split("a,b,c", ",")
-["a", "b", "c"]
+mix test test/payments_cli/formatter_test.exs --trace
 ```
 
-## Summary
-- **Key concepts**: Strings son binarios UTF-8, `String.length/1` vs `byte_size/1`, interpolación con `#{}`, concatenación con `<>`, charlists como alternativa de Erlang
-- **What you practiced**: Crear strings UTF-8, interpolar expresiones, concatenar con `<>`, usar `String.upcase/downcase/split/trim/replace`, distinguir charlist de string
-- **Important to remember**: Siempre usa comillas dobles `"..."` para strings en Elixir. Las comillas simples `'...'` crean charlists (listas de integers), no strings. `String.length("café") == 4` pero `byte_size("café") == 5` — UTF-8 es multibyte.
+---
 
-## What's Next
-En el siguiente ejercicio **05-tuples-and-pattern-matching-intro** aprenderás sobre las tuplas y el operador de match `=` como fundamento del paradigma de Elixir. Entenderás por qué `=` en Elixir no es asignación sino unificación.
+## Trade-off analysis
+
+| Aspect | String module (your impl) | Binary pattern matching | Regex |
+|--------|--------------------------|------------------------|-------|
+| UTF-8 correctness | Automatic | Manual byte handling needed | Depends on flag |
+| Performance | O(n) per operation | O(n) but lower constant | Higher overhead |
+| CSV parsing | Simple split + trim | Requires delimiter handling | Overkill for simple CSV |
+| Truncation | Grapheme-safe with `slice` | Byte-level, can corrupt | Not applicable |
+
+Reflection question: `parse_csv_line/1` uses `String.split(line, ",")`. What happens
+if a merchant name contains a comma, like `"Smith, Jones Ltd"`? How would you fix
+the parser to handle quoted CSV fields?
+
+---
+
+## Common production mistakes
+
+**1. Using `byte_size` for display truncation**
+`byte_size("Café München")` returns `14`, not `12`. Truncating by bytes
+instead of `String.length` + `String.slice` corrupts multi-byte characters
+and produces invalid UTF-8 that downstream systems reject.
+
+**2. Charlist vs binary confusion from Erlang libraries**
+Some Erlang HTTP clients and file libraries return charlists (`'hello'`) instead
+of binaries (`"hello"`). `String.upcase('hello')` raises `FunctionClauseError`.
+Wrap Erlang library calls with `to_string/1` or `List.to_string/1` at the boundary.
+
+**3. `String.to_integer/1` raises on invalid input**
+`String.to_integer("abc")` raises `ArgumentError`. In a CSV parser that processes
+thousands of rows, one bad row kills the process. Use `Integer.parse/1` which
+returns `:error` instead of raising.
+
+**4. String concatenation in a loop with `<>`**
+Building a report string with `acc <> line` in each iteration is O(n²) — each
+`<>` creates a new binary by copying. Use `IO.iodata_to_binary/1` with an iolist,
+or `Enum.join/2`, to build strings efficiently.
+
+**5. Forgetting `String.trim/1` on CSV fields**
+Bank CSV exports often have trailing spaces or Windows line endings (`\r\n`).
+Always trim fields after splitting. `"approved\r"` does not match `"approved"`.
+
+---
 
 ## Resources
-- [The Elixir Getting Started Guide — Strings](https://elixir-lang.org/getting-started/binaries-strings-and-char-lists.html)
-- [Elixir Docs - String](https://hexdocs.pm/elixir/String.html)
-- [Unicode in Elixir](https://elixir-lang.org/blog/2013/04/17/elixir-v0-8-0-released/)
+
+- [String — HexDocs](https://hexdocs.pm/elixir/String.html) — read the Unicode section
+- [Elixir Getting Started — Binaries, strings, and charlists](https://elixir-lang.org/getting-started/binaries-strings-and-char-lists.html)
+- [Unicode in Elixir — José Valim's blog](https://elixir-lang.org/blog/2013/04/17/elixir-v0-8-0-released/)
+- [IO.iodata_to_binary/1 — efficient string building](https://hexdocs.pm/elixir/IO.html#iodata_to_binary/1)

@@ -1,630 +1,374 @@
-# 14. Modules and Function Visibility
+# Modules and Function Visibility: The payments_cli API Surface
 
-**Difficulty**: Basico
-
----
-
-## Prerequisites
-
-- Funciones anónimas y closures (ejercicio 13)
-- Pattern matching básico (ejercicio 05)
-- Atoms (ejercicio 02)
+**Project**: `payments_cli` — built incrementally across the basic level
 
 ---
 
-## Learning Objectives
+## Project context
 
-- Definir módulos con `defmodule` para organizar código relacionado
-- Distinguir funciones públicas (`def`) de privadas (`defp`)
-- Usar module attributes `@attr` para constantes y metadata
-- Escribir documentación con `@moduledoc` y `@doc`
-- Entender módulos anidados y la convención de nombres
-- Usar `alias` para abreviar nombres de módulos largos
-- Conocer `import` y `require` a nivel introductorio
+You're building `payments_cli`. The system has grown to eight modules. This exercise
+focuses on designing the module boundaries — what is public, what is private, how
+modules reference each other, and how documentation becomes a first-class artifact.
+
+Project structure at this point:
+
+```
+payments_cli/
+├── lib/
+│   └── payments_cli/
+│       ├── cli.ex          # public API: main/1
+│       ├── transaction.ex  # public API: classify_status/1, parse_status/1, etc.
+│       ├── ledger.ex       # public API: sum_amounts/1, calculate_fee/2, etc.
+│       ├── formatter.ex    # public API: parse_csv_line/1, truncate_merchant/2, etc.
+│       ├── pipeline.ex     # public API: process_line/1, process_batch/1
+│       ├── processor.ex    # public API: apply_rules/2, update_transaction/2
+│       ├── router.ex       # public API: route/1, validate/1, process/1
+│       ├── analytics.ex    # public API: revenue_stats/1, top_merchants/2, etc.
+│       ├── report.ex       # public API: summary/1, merchant_report/2, etc.
+│       ├── rules.ex        # public API: make_fee_calculator/2, etc.
+│       └── config.ex       # ← you implement this
+├── test/
+│   └── payments_cli/
+│       └── config_test.exs  # given tests — must pass without modification
+└── mix.exs
+```
 
 ---
 
-## Concepts
+## Why module design is an architectural decision
 
-### `defmodule`: el contenedor de código
+Every `def` in your module is a **contract**. Changing a public function signature
+breaks every caller — potentially in other applications, other teams, other services.
+Every `defp` is an implementation detail you can change freely.
 
-Un módulo es un namespace que agrupa funciones relacionadas. El nombre es
-un atom que empieza en mayúscula.
+The decision "should this be `def` or `defp`?" is not about access control in the
+OO sense. It is about: **what is the stable interface, and what is the implementation?**
 
-```elixir
-defmodule Greeting do
-  def hello(name) do
-    "Hello, #{name}!"
-  end
-end
+In payments_cli, the modules expose different surfaces:
+- `CLI` exposes `main/1` — the entire public API is one function
+- `Ledger` exposes arithmetic functions — a stable math library
+- `Pipeline` exposes `process_line/1` and `process_batch/1` — the entry points
+- `Router` exposes routing and validation — business logic contracts
 
-Greeting.hello("Alice")
-# => "Hello, Alice!"
-```
+The internal helpers (`validate_transaction/1` in `Pipeline`, `build_csv_lines/2`
+in `Ledger`) should be `defp`. If you make them `def` "just in case", you've created
+accidental contracts that you cannot change without checking all callers.
 
-Los módulos se compilan. En IEx puedes definirlos directamente. En proyectos
-Mix van en archivos `.ex`.
+Module attributes (`@`) are compile-time constants — not runtime variables. They are
+ideal for configuration constants, version strings, and magic numbers that should
+be named. They are the wrong tool for runtime configuration (use process state or ETS).
 
-### `def` vs `defp`: visibilidad
+---
 
-`def` define una función **pública** — accesible desde cualquier módulo.
-`defp` define una función **privada** — solo accesible dentro del mismo módulo.
+## The business problem
 
-```elixir
-defmodule Formatter do
-  # Pública: parte de la API del módulo
-  def format_name(first, last) do
-    "#{capitalize_word(first)} #{capitalize_word(last)}"
-  end
+Implement a `Config` module that:
 
-  # Privada: detalle de implementación, no expuesta
-  defp capitalize_word(word) do
-    String.capitalize(word)
-  end
-end
+1. Exposes typed access to processing configuration (module attributes + public functions)
+2. Documents all configuration options with `@doc` and doctests
+3. Uses `alias` to cleanly reference other `payments_cli` modules
+4. Provides a validation function for configuration correctness
 
-Formatter.format_name("alice", "smith")
-# => "Alice Smith"
+---
 
-Formatter.capitalize_word("alice")
-# ** (UndefinedFunctionError) function Formatter.capitalize_word/1 is undefined
-```
+## Implementation
 
-Regla: expón solo lo mínimo necesario. Las funciones privadas son detalles
-de implementación que puedes cambiar sin romper contratos externos.
-
-### Module attributes: `@attr`
-
-Los module attributes son valores de **compile time**. Se evalúan cuando el
-módulo se compila, no cuando las funciones se ejecutan.
+### `lib/payments_cli/config.ex`
 
 ```elixir
-defmodule Config do
-  @version "1.0.0"
-  @max_retries 3
-  @default_timeout 5_000  # 5 segundos en milisegundos
-
-  def version, do: @version
-  def max_retries, do: @max_retries
-  def timeout, do: @default_timeout
-end
-
-Config.version()    # => "1.0.0"
-Config.max_retries  # => 3
-```
-
-Los attributes con nombres especiales tienen comportamiento específico:
-- `@moduledoc` — documentación del módulo
-- `@doc` — documentación de la función siguiente
-- `@spec` — especificación de tipos (Dialyzer)
-- `@behaviour` — declarar que el módulo implementa un behaviour
-
-### Documentación con `@moduledoc` y `@doc`
-
-```elixir
-defmodule MathUtils do
+defmodule PaymentsCli.Config do
   @moduledoc """
-  Funciones matemáticas de uso general.
+  Central configuration for the payments_cli processing system.
 
-  Todas las funciones son puras — sin side effects.
+  All configuration values have documented defaults and validation.
+  Use `PaymentsCli.Config.new/1` to create validated configurations,
+  then pass the config struct (exercise 15) or map to processing functions.
+
+  ## Usage
+
+      iex> {:ok, config} = PaymentsCli.Config.new(fee_basis_points: 150)
+      iex> config.fee_basis_points
+      150
+
   """
+
+  # Module attributes are compile-time constants.
+  # They name magic numbers and make them searchable.
+  @default_fee_basis_points 250
+  @default_max_amount_cents 1_000_000
+  @supported_currencies ["USD", "EUR", "GBP", "JPY", "CAD"]
+  @version "0.1.0"
 
   @doc """
-  Calcula la suma de una lista de números.
+  Returns the current version of payments_cli.
 
-  ## Ejemplos
+  ## Examples
 
-      iex> MathUtils.sum([1, 2, 3])
-      6
+      iex> PaymentsCli.Config.version()
+      "0.1.0"
 
-      iex> MathUtils.sum([])
-      0
   """
-  def sum(numbers) do
-    Enum.sum(numbers)
-  end
-end
-```
-
-En IEx puedes consultar la documentación:
-```elixir
-h MathUtils
-h MathUtils.sum
-```
-
-### Módulos anidados
-
-Elixir usa el punto para crear namespaces jerárquicos.
-
-```elixir
-defmodule MyApp.User do
-  def new(name, email) do
-    %{name: name, email: email}
-  end
-end
-
-defmodule MyApp.User.Auth do
-  def valid_password?(password) do
-    String.length(password) >= 8
-  end
-end
-
-MyApp.User.new("Alice", "alice@example.com")
-MyApp.User.Auth.valid_password?("secret123")
-```
-
-Los módulos anidados son simples convenciones de nombres — en Elixir no hay
-"módulos dentro de módulos" como en otros lenguajes OO. Son todos módulos
-independientes con nombres que comparten un prefijo.
-
-### `alias`: abreviar nombres
-
-```elixir
-defmodule MyApp.Reports do
-  alias MyApp.User          # ahora puedes usar User en lugar de MyApp.User
-  alias MyApp.User.Auth     # y Auth en lugar de MyApp.User.Auth
-
-  def active_users(all_users) do
-    Enum.filter(all_users, fn u ->
-      Auth.valid_password?(u.password)  # en lugar de MyApp.User.Auth
-    end)
-  end
-end
-```
-
-Con alias personalizado:
-```elixir
-alias MyApp.User, as: U
-U.new("Alice", "alice@example.com")
-```
-
-### `import`: traer funciones al scope
-
-```elixir
-defmodule MyModule do
-  import Enum, only: [map: 2, filter: 2]
-
-  def process(list) do
-    list
-    |> filter(&(&1 > 0))   # sin el prefijo Enum.
-    |> map(&(&1 * 2))
-  end
-end
-```
-
-Usar `import` con moderación — puede hacer el código ambiguo si dos módulos
-exportan funciones con el mismo nombre.
-
----
-
-## Exercises
-
-### Ejercicio 1: Definir un módulo y llamarlo
-
-```elixir
-defmodule Greeting do
-  def hello(name) do
-    "Hello, #{name}!"
-  end
-
-  def hello do
-    "Hello, World!"
-  end
-end
-
-IO.puts(Greeting.hello("Alice"))
-IO.puts(Greeting.hello())
-```
-
-**Expected output:**
-```
-Hello, Alice!
-Hello, World!
-```
-
----
-
-### Ejercicio 2: Funciones públicas y privadas
-
-```elixir
-defmodule Formatter do
-  @moduledoc "Formatea nombres y textos."
-
-  # Pública: forma parte de la API
-  def format_full_name(first, last) do
-    "#{capitalize(first)} #{capitalize(last)}"
-  end
-
-  # Pública: forma parte de la API
-  def format_initials(first, last) do
-    "#{String.first(capitalize(first))}.#{String.first(capitalize(last))}."
-  end
-
-  # Privada: detalle de implementación
-  defp capitalize(word) do
-    String.capitalize(word)
-  end
-end
-
-IO.puts(Formatter.format_full_name("alice", "smith"))
-IO.puts(Formatter.format_initials("alice", "smith"))
-
-# Esto fallaría con UndefinedFunctionError:
-# Formatter.capitalize("alice")
-```
-
-**Expected output:**
-```
-Alice Smith
-A.S.
-```
-
----
-
-### Ejercicio 3: Module attributes como constantes
-
-```elixir
-defmodule AppConfig do
-  @version "2.1.0"
-  @app_name "MyElixirApp"
-  @max_connections 100
-
+  @spec version() :: String.t()
   def version, do: @version
-  def app_name, do: @app_name
-  def max_connections, do: @max_connections
-
-  def banner do
-    "#{@app_name} v#{@version} (max #{@max_connections} connections)"
-  end
-end
-
-IO.puts(AppConfig.version())
-IO.puts(AppConfig.app_name())
-IO.inspect(AppConfig.max_connections())
-IO.puts(AppConfig.banner())
-```
-
-**Expected output:**
-```
-2.1.0
-MyElixirApp
-100
-MyElixirApp v2.1.0 (max 100 connections)
-```
-
----
-
-### Ejercicio 4: Documentación con `@doc` y `@moduledoc`
-
-```elixir
-defmodule MathUtils do
-  @moduledoc """
-  Funciones matemáticas de utilidad general.
-
-  Todas las funciones son puras y sin side effects.
-  """
 
   @doc """
-  Retorna true si el número es par.
+  Returns the default fee in basis points (2.5%).
 
-  ## Ejemplos
+  One basis point = 0.01%. 250 basis points = 2.5%.
 
-      iex> MathUtils.even?(4)
+  ## Examples
+
+      iex> PaymentsCli.Config.default_fee_basis_points()
+      250
+
+  """
+  @spec default_fee_basis_points() :: non_neg_integer()
+  def default_fee_basis_points, do: @default_fee_basis_points
+
+  @doc """
+  Returns the list of supported currency codes.
+
+  ## Examples
+
+      iex> "USD" in PaymentsCli.Config.supported_currencies()
       true
 
-      iex> MathUtils.even?(3)
+      iex> "XYZ" in PaymentsCli.Config.supported_currencies()
       false
+
   """
-  def even?(n) when is_integer(n) do
-    rem(n, 2) == 0
+  @spec supported_currencies() :: [String.t()]
+  def supported_currencies, do: @supported_currencies
+
+  @doc """
+  Creates a validated configuration map from keyword options.
+
+  Accepted options:
+    - fee_basis_points: integer >= 0 (default: 250)
+    - max_amount_cents: integer > 0 (default: 1_000_000)
+    - require_reference: boolean (default: false)
+    - currencies: list of 3-char strings (default: all supported)
+
+  Returns {:ok, config_map} or {:error, reason}.
+
+  ## Examples
+
+      iex> PaymentsCli.Config.new()
+      {:ok, %{fee_basis_points: 250, max_amount_cents: 1_000_000, require_reference: false, currencies: ["USD", "EUR", "GBP", "JPY", "CAD"]}}
+
+      iex> PaymentsCli.Config.new(fee_basis_points: -1)
+      {:error, "fee_basis_points must be >= 0"}
+
+  """
+  @spec new(keyword()) :: {:ok, map()} | {:error, String.t()}
+  def new(opts \\ []) when is_list(opts) do
+    # TODO: build a config map with defaults, then validate it
+    #
+    # defaults = %{
+    #   fee_basis_points: @default_fee_basis_points,
+    #   max_amount_cents: @default_max_amount_cents,
+    #   require_reference: false,
+    #   currencies: @supported_currencies
+    # }
+    #
+    # config = Enum.reduce(opts, defaults, fn {key, value}, acc ->
+    #   Map.put(acc, key, value)
+    # end)
+    #
+    # Then call validate_config/1 (private) and return {:ok, config} or {:error, reason}
   end
 
   @doc """
-  Calcula el factorial de n.
+  Checks whether a currency code is supported by this configuration.
 
-  ## Ejemplos
+  ## Examples
 
-      iex> MathUtils.factorial(5)
-      120
+      iex> {:ok, config} = PaymentsCli.Config.new()
+      iex> PaymentsCli.Config.currency_supported?(config, "USD")
+      true
+
+      iex> PaymentsCli.Config.currency_supported?(config, "BTC")
+      false
+
   """
-  def factorial(0), do: 1
-  def factorial(n) when n > 0, do: n * factorial(n - 1)
+  @spec currency_supported?(map(), String.t()) :: boolean()
+  def currency_supported?(%{currencies: currencies}, currency) when is_binary(currency) do
+    # TODO: check currency in currencies
+  end
+
+  # ---------------------------------------------------------------------------
+  # Private — validation details are not part of the public contract
+  # ---------------------------------------------------------------------------
+
+  @spec validate_config(map()) :: :ok | {:error, String.t()}
+  defp validate_config(%{fee_basis_points: fee}) when fee < 0 do
+    {:error, "fee_basis_points must be >= 0"}
+  end
+
+  defp validate_config(%{max_amount_cents: max}) when max <= 0 do
+    {:error, "max_amount_cents must be > 0"}
+  end
+
+  defp validate_config(%{currencies: currencies}) when not is_list(currencies) do
+    {:error, "currencies must be a list"}
+  end
+
+  defp validate_config(%{currencies: []}), do: {:error, "currencies cannot be empty"}
+
+  defp validate_config(_config), do: :ok
 end
-
-IO.inspect(MathUtils.even?(4))
-IO.inspect(MathUtils.even?(7))
-IO.inspect(MathUtils.factorial(5))
-IO.inspect(MathUtils.factorial(0))
-
-# En IEx puedes ver la documentación con:
-# h MathUtils
-# h MathUtils.even?
 ```
 
-**Expected output:**
-```
-true
-false
-120
-1
-```
-
----
-
-### Ejercicio 5: Módulos anidados
+### Given tests — must pass without modification
 
 ```elixir
-defmodule MyApp.User do
-  @moduledoc "Representa un usuario del sistema."
+# test/payments_cli/config_test.exs
+defmodule PaymentsCli.ConfigTest do
+  use ExUnit.Case, async: true
 
-  def new(name, email) when is_binary(name) and is_binary(email) do
-    %{name: name, email: email, active: true}
+  alias PaymentsCli.Config
+
+  doctest PaymentsCli.Config
+
+  describe "version/0" do
+    test "returns a version string" do
+      assert is_binary(Config.version())
+      assert Config.version() =~ ~r/\d+\.\d+\.\d+/
+    end
   end
 
-  def display(%{name: name, email: email}) do
-    "#{name} <#{email}>"
+  describe "new/0 and new/1" do
+    test "returns defaults with no opts" do
+      assert {:ok, config} = Config.new()
+      assert config.fee_basis_points == 250
+      assert config.max_amount_cents == 1_000_000
+      assert config.require_reference == false
+      assert is_list(config.currencies)
+    end
+
+    test "custom fee basis points" do
+      assert {:ok, config} = Config.new(fee_basis_points: 150)
+      assert config.fee_basis_points == 150
+      # Other defaults unchanged
+      assert config.max_amount_cents == 1_000_000
+    end
+
+    test "returns error for negative fee" do
+      assert {:error, message} = Config.new(fee_basis_points: -1)
+      assert is_binary(message)
+    end
+
+    test "returns error for zero max_amount" do
+      assert {:error, _} = Config.new(max_amount_cents: 0)
+    end
+
+    test "returns error for empty currencies list" do
+      assert {:error, _} = Config.new(currencies: [])
+    end
   end
-end
 
-defmodule MyApp.User.Auth do
-  @moduledoc "Autenticación de usuarios."
+  describe "currency_supported?/2" do
+    setup do
+      {:ok, config} = Config.new()
+      {:ok, config: config}
+    end
 
-  @min_password_length 8
+    test "returns true for supported currency", %{config: config} do
+      assert Config.currency_supported?(config, "USD") == true
+    end
 
-  def valid_password?(password) when is_binary(password) do
-    String.length(password) >= @min_password_length
+    test "returns false for unsupported currency", %{config: config} do
+      assert Config.currency_supported?(config, "BTC") == false
+    end
+
+    test "is case-sensitive", %{config: config} do
+      assert Config.currency_supported?(config, "usd") == false
+    end
   end
 
-  def password_strength(password) do
-    cond do
-      String.length(password) < 6  -> :weak
-      String.length(password) < 12 -> :medium
-      true                          -> :strong
+  describe "default_fee_basis_points/0 and supported_currencies/0" do
+    test "basis points is a non-negative integer" do
+      assert is_integer(Config.default_fee_basis_points())
+      assert Config.default_fee_basis_points() >= 0
+    end
+
+    test "supported currencies is a list of 3-char strings" do
+      currencies = Config.supported_currencies()
+      assert is_list(currencies)
+      assert Enum.all?(currencies, fn c -> is_binary(c) and String.length(c) == 3 end)
     end
   end
 end
-
-user = MyApp.User.new("Alice", "alice@example.com")
-IO.puts(MyApp.User.display(user))
-IO.inspect(MyApp.User.Auth.valid_password?("secret"))
-IO.inspect(MyApp.User.Auth.valid_password?("securepassword"))
-IO.inspect(MyApp.User.Auth.password_strength("abc"))
-IO.inspect(MyApp.User.Auth.password_strength("securepassword!"))
 ```
 
-**Expected output:**
-```
-Alice <alice@example.com>
-false
-true
-:weak
-:strong
-```
-
----
-
-### Ejercicio 6: `alias` para simplificar nombres
-
-```elixir
-defmodule MyApp.Reports.UserReport do
-  alias MyApp.User
-  alias MyApp.User.Auth
-
-  def generate(users) do
-    Enum.map(users, fn u ->
-      display = User.display(u)
-      # En lugar de: MyApp.User.display(u)
-      "#{display} — activo: #{u.active}"
-    end)
-  end
-end
-
-# Para probar en IEx necesitaríamos definir todo. Aquí lo simplificamos:
-defmodule Demo.Alias do
-  # alias crea un shorthand local al módulo
-  alias String, as: S
-
-  def process(text) do
-    text
-    |> S.trim()
-    |> S.upcase()
-    |> S.replace(" ", "_")
-  end
-end
-
-IO.puts(Demo.Alias.process("  hello world  "))
-```
-
-**Expected output:**
-```
-HELLO_WORLD
-```
-
----
-
-## Common Mistakes
-
-### Error 1: Llamar una función privada desde afuera del módulo
-
-```elixir
-# WRONG — defp no es accesible desde fuera
-defmodule Calculator do
-  def add(a, b), do: a + b
-  defp multiply(a, b), do: a * b
-end
-
-Calculator.multiply(3, 4)
-```
-
-```
-** (UndefinedFunctionError) function Calculator.multiply/2 is undefined or private
-```
-
-**Why**: `defp` es privada — solo puede ser llamada por otras funciones **dentro**
-del mismo módulo. Es intencional: `defp` es un detalle de implementación.
-
-**Fix**: Si necesitas `multiply` desde afuera, cámbiala a `def`.
-Si no, úsala solo internamente:
-```elixir
-defmodule Calculator do
-  def add(a, b), do: a + b
-  def square(x), do: multiply(x, x)   # uso interno válido
-  defp multiply(a, b), do: a * b
-end
-```
-
----
-
-### Error 2: Confundir module attributes con variables de runtime
-
-```elixir
-# WRONG — pensar que @counter cambia en runtime
-defmodule Counter do
-  @count 0
-
-  def increment do
-    @count = @count + 1   # esto no compila
-    @count
-  end
-end
-```
-
-```
-** (CompileError) cannot invoke remote function @count/0 inside a match
-```
-
-**Why**: Los module attributes son valores de **compile time** — se evalúan
-cuando el módulo se compila, no cuando se ejecutan las funciones. No son
-variables mutables de runtime.
-
-**Fix**: Para estado mutable en Elixir, usa procesos (GenServer, Agent).
-Para constantes, usa attributes correctamente:
-```elixir
-defmodule Config do
-  @default_count 0        # constante de compile time — correcto
-
-  def default_count, do: @default_count  # retorna el valor
-
-  # Para estado mutable: usa Agent o GenServer
-end
-```
-
----
-
-### Error 3: El nombre del módulo es un Atom
-
-```elixir
-# El nombre del módulo en realidad es un atom especial
-IO.inspect(MyApp.User == :"Elixir.MyApp.User")
-```
-
-```
-true
-```
-
-**Why**: Todos los módulos en Elixir son atoms con el prefijo `"Elixir."`.
-Esto raramente importa en código normal, pero puede sorprender al usar
-`String.to_atom/1` o al trabajar con módulos dinámicamente.
-
-```elixir
-# Puedes crear módulos dinámicamente con Module.concat
-mod = Module.concat(MyApp, User)
-IO.inspect(mod)
-# => MyApp.User
-```
-
----
-
-### Error 4: `import` demasiado amplio genera ambigüedad
-
-```elixir
-# WRONG — importar todo puede causar conflictos
-defmodule MyModule do
-  import List         # importa ALL de List
-  import Enum         # importa ALL de Enum
-
-  # ¿flatten viene de List o de Enum?
-  def process(nested), do: flatten(nested)
-end
-```
-
-**Why**: Ambos módulos tienen `flatten/1`. El compilador puede advertir o
-comportarse de forma inesperada.
-
-**Fix**: Importa solo lo que necesitas:
-```elixir
-defmodule MyModule do
-  import List, only: [flatten: 1]
-
-  def process(nested), do: flatten(nested)
-end
-```
-
----
-
-## Verification
+### Run the tests
 
 ```bash
-iex
+mix test test/payments_cli/config_test.exs --trace
 ```
 
+Note: `doctest PaymentsCli.Config` runs the examples in `@doc` blocks as tests.
+Your `@doc` examples must be correct and runnable.
+
+---
+
+## Trade-off analysis
+
+| Aspect | Module attributes `@attr` | Application config `Application.get_env/3` | Process state (Agent/GenServer) |
+|--------|--------------------------|-------------------------------------------|--------------------------------|
+| When evaluated | Compile time | Runtime (but app start) | Runtime |
+| Can change at runtime | No | With `Application.put_env/3` | Yes |
+| Testable | Yes — direct function calls | Requires Application setup | Requires process setup |
+| Appropriate for | Named constants, magic numbers | Environment-specific config | Per-session state |
+
+Reflection question: `validate_config/1` uses multiple `defp` clauses with guards.
+What is the advantage of this approach over a single `defp` with a long `cond`?
+Think about what happens when you add a new validation rule — which approach requires
+fewer changes?
+
+---
+
+## Common production mistakes
+
+**1. Using module attributes as runtime config**
 ```elixir
-# Definir y usar un módulo básico
-defmodule Demo do
-  def greet(name), do: "Hello, #{name}!"
-  defp secret, do: "no accesible desde afuera"
-
-  def show_secret, do: secret()
-end
-
-Demo.greet("Alice")
-# => "Hello, Alice!"
-
-Demo.show_secret()
-# => "no accesible desde afuera"
-
-# Demo.secret()   # UndefinedFunctionError
-
-# Module attributes
-defmodule V do
-  @version "1.0"
-  def v, do: @version
-end
-
-V.v()
-# => "1.0"
-
-# El módulo es un atom
-Demo == :"Elixir.Demo"
-# => true
+@base_url "https://api.example.com"  # WRONG for runtime config
+# This is baked in at compile time. Changing the env variable has no effect.
 ```
+Use `Application.get_env/3` or pass config explicitly. Module attributes are
+for compile-time constants, not runtime configuration.
 
----
+**2. Making private helpers public "just in case"**
+Every `def` is a contract. If you later change `validate_config/1`'s behavior,
+you break every caller. `defp` is not weakness — it is proper encapsulation.
+If you want to test a private function, test it through the public API.
 
-## Summary
+**3. `alias` does not change module loading**
+`alias PaymentsCli.Ledger` makes `Ledger` available as a short name in the current
+module. It does not load or compile `Ledger`. If `Ledger` is not in your project,
+`alias` still works but calling `Ledger.sum_amounts/1` fails at runtime.
 
-- `defmodule Name do ... end` agrupa funciones relacionadas en un namespace.
-- `def` = función pública; `defp` = función privada al módulo.
-- Los module attributes (`@attr`) son valores de compile time — no son variables.
-- `@moduledoc` y `@doc` documentan módulos y funciones, accesibles con `h` en IEx.
-- Los módulos anidados (`MyApp.User.Auth`) son convenciones de nombre, no herencia.
-- `alias` crea un shorthand local para módulos con nombres largos.
-- `import` trae funciones al scope sin el prefijo del módulo — usar con moderación.
-- El nombre del módulo es un atom: `MyApp.User == :"Elixir.MyApp.User"`.
+**4. Doctests fail silently when IEx output differs**
+The doctest for `new/0` expects the map keys in a specific order. Map key order
+in Elixir is not guaranteed for display. If the test fails with mismatched order,
+adjust the doctest to use `{:ok, %{fee_basis_points: 250}} = Config.new()` instead
+of expecting the full map.
 
----
-
-## What's Next
-
-- **Ejercicio 15**: Structs — data containers tipados definidos dentro de módulos
-- Behaviours y callbacks — contratos entre módulos
-- Protocols — polimorfismo en Elixir
+**5. Module attributes in guards**
+Module attributes are available in guards, but with a gotcha:
+```elixir
+@min 0
+def valid?(n) when n >= @min, do: true  # OK — @min is substituted at compile time
+```
+This works because guards are evaluated at compile time. But computed attributes
+(those using `@attr computed_value`) may not work as expected in guards.
 
 ---
 
 ## Resources
 
 - [Modules — Elixir Getting Started](https://elixir-lang.org/getting-started/modules-and-functions.html)
-- [Module attributes — Elixir docs](https://elixir-lang.org/getting-started/module-attributes.html)
-- [Alias, require, import — Elixir docs](https://elixir-lang.org/getting-started/alias-require-and-import.html)
+- [Module attributes — Elixir Getting Started](https://elixir-lang.org/getting-started/module-attributes.html)
 - [ExDoc — generate documentation](https://github.com/elixir-lang/ex_doc)
+- [Doctests — ExUnit docs](https://hexdocs.pm/ex_unit/ExUnit.DocTest.html)
+- [alias, require, import — Elixir Getting Started](https://elixir-lang.org/getting-started/alias-require-and-import.html)

@@ -1,66 +1,327 @@
-# 3. Build a Distributed Cache with Redis-Compatible Protocol
+# Distributed Cache with Redis-Compatible Protocol
 
-**Difficulty**: Insane
+**Project**: `krebs` — a distributed, multi-node in-memory cache that speaks RESP2 over TCP
 
-## Prerequisites
-- Mastered: All Elixir/OTP intermediate and advanced concepts (GenServer, Supervisor, :gen_tcp, Ranch or raw socket programming)
-- Mastered: Distributed systems data placement — consistent hashing, replication, quorum reads/writes
-- Familiarity with: Redis internals (persistence modes, pub/sub semantics, RESP wire protocol), LRU eviction policies
-- Reading: The Amazon Dynamo paper (DeCandia et al., 2007), the Redis source code (specifically `dict.c`, `ae.c`, `aof.c`)
+---
 
-## Problem Statement
+## Project context
 
-Build a distributed, in-memory cache in Elixir/OTP that speaks a subset of the Redis protocol over TCP. A standard `redis-cli` binary must be able to connect and issue commands without knowing it is talking to Elixir. The system is multi-node: data is distributed across nodes using consistent hashing and replicated for fault tolerance.
+You are building `krebs`, a distributed in-memory cache with a subset of the Redis protocol. A standard `redis-cli` binary connects and issues commands without knowing it is talking to Elixir. Data is distributed across nodes using consistent hashing and replicated for fault tolerance.
 
-Your system must implement:
-1. A consistent hashing ring with virtual nodes (V virtual nodes per physical node, configurable). Each key hashes to exactly one primary node; the ring determines responsibility without any central coordinator
-2. Replication with a configurable factor R: each key is stored on R consecutive nodes in the ring; reads and writes use quorum (R/2 + 1 acknowledgments required)
-3. An LRU eviction policy: when the allocated memory budget is exceeded, evict the least-recently-used key; eviction must not require a full scan
-4. TTL-based expiration: each key may carry an optional TTL; expired keys must be removed within ±100ms of their deadline via lazy expiration (on access) plus an active background sweep
-5. A pub/sub subsystem: clients may SUBSCRIBE to channels; other clients may PUBLISH to channels; messages route across nodes to all subscribers regardless of which node they are connected to
-6. Append-only file (AOF) persistence: every write command is appended to an AOF log on disk before acknowledging the client; on startup, the AOF is replayed in order to restore state
-7. Sloppy quorum with hinted handoff: if a target replica is down, route the write to the next available node with a "hint" annotation; when the target recovers, the hinted write is forwarded
-8. The RESP2 wire protocol (Redis Serialization Protocol) over raw TCP sockets — every supported command returns exactly the RESP encoding `redis-cli` expects
+Project structure:
 
-## Acceptance Criteria
+```
+krebs/
+├── lib/
+│   └── krebs/
+│       ├── application.ex           # starts TCP listener, ring supervisor, pub/sub
+│       ├── listener.ex              # :gen_tcp accept loop, spawns connection handlers
+│       ├── connection.ex            # GenServer per TCP connection, RESP parser state machine
+│       ├── resp.ex                  # RESP2 encoder and decoder
+│       ├── command.ex               # command dispatch: SET, GET, DEL, TTL, SUBSCRIBE, PUBLISH
+│       ├── ring.ex                  # consistent hashing ring with virtual nodes
+│       ├── shard.ex                 # GenServer per shard: ETS-backed KV store with LRU
+│       ├── replication.ex           # quorum writes, quorum reads across R replicas
+│       ├── pubsub.ex                # pub/sub: subscribe, publish, cross-node routing
+│       ├── ttl_sweeper.ex           # background process: active TTL expiration sweep
+│       ├── aof.ex                   # append-only file: write before ack, replay on start
+│       └── hinted_handoff.ex        # sloppy quorum: hinted writes, forwarding on recovery
+├── test/
+│   └── krebs/
+│       ├── resp_test.exs            # RESP2 encoding/decoding correctness
+│       ├── ring_test.exs            # consistent hashing distribution
+│       ├── replication_test.exs     # quorum reads/writes, failure tolerance
+│       ├── ttl_test.exs             # TTL expiration and lazy cleanup
+│       ├── pubsub_test.exs          # cross-node pub/sub delivery
+│       └── aof_test.exs             # persistence and replay
+├── bench/
+│   └── krebs_bench.exs
+└── mix.exs
+```
 
-- [ ] **RESP protocol**: `redis-cli -p 6380 SET foo bar` returns `+OK`; `redis-cli -p 6380 GET foo` returns `bar`; `redis-cli -p 6380 DEL foo` returns `:1`; all in correct RESP encoding
-- [ ] **Consistent hashing distribution**: With 3 nodes and 150 virtual nodes each, insert 100,000 keys and confirm no single node holds more than 40% of all keys (uniform distribution)
-- [ ] **Quorum replication**: With R=2, write a key, immediately kill one replica node, read the key — it must still return the correct value (surviving replica serves the read)
-- [ ] **LRU eviction**: Set `max_memory` to 100MB; insert enough keys to exceed the limit; confirm older, less-recently-accessed keys are evicted before newer ones; confirm the cache never exceeds the memory budget
-- [ ] **TTL expiration**: `SET foo bar EX 1` — after 1000ms ±100ms, `GET foo` returns nil; verify with 10,000 keys having varying TTLs that no key survives past its deadline by more than 100ms
-- [ ] **Pub/sub cross-node**: Client A connects to node 1 and subscribes to channel "news"; Client B connects to node 3 and publishes to "news"; Client A receives the message without polling
-- [ ] **AOF persistence**: Write 1,000 keys; kill all nodes abruptly (no graceful shutdown); restart all nodes; confirm all 1,000 keys are present after AOF replay
-- [ ] **Network partition — sloppy quorum**: Take one replica offline; write to the shard it owns; confirm the hinted handoff node accepts the write; bring the replica back; confirm it receives the hinted write automatically
-- [ ] **Benchmark — reads**: Sustain 100,000 read operations per second on a 3-node cluster from a single client machine
-- [ ] **Benchmark — writes**: Sustain 50,000 write operations per second on a 3-node cluster with AOF enabled and R=2 quorum
+---
 
-## What You Will Learn
-- How consistent hashing distributes keys without any central directory — and why virtual nodes are essential for uniform balance
-- The difference between strict quorum and sloppy quorum (Dynamo-style), and the eventual consistency trade-off each makes
-- How to implement a true O(1) LRU cache using a doubly-linked list + hash map (not `:queue`, not ETS ordered_set alone)
-- How `redis-cli` frames commands in RESP2 and why the protocol's simplicity enables high throughput
-- The read-repair and anti-entropy mechanisms that keep replicas consistent after partial failures
-- How append-only files work as a durability mechanism and the trade-off versus RDB snapshots
-- How pub/sub systems route messages across nodes without a centralized broker — and why this is hard to make reliable
+## The problem
 
-## Hints
+You need a cache that multiple services connect to over TCP using the Redis protocol so existing tooling (redis-cli, redis-benchmark) works out of the box. The cache must be distributed: no single node holds all data, and the death of one node does not lose data. The protocol parser is the foundation — every byte matters when redis-cli is your integration test.
 
-This exercise is intentionally sparse. You are expected to:
-- Read the RESP protocol specification before writing any socket code — every byte matters when `redis-cli` is your integration test
-- Study the Dynamo paper's "Partitioning" and "Replication" sections carefully before touching consistent hashing code
-- LRU in a concurrent system requires careful design: ETS does not give you LRU ordering for free; you need to track access order yourself
-- AOF replay must be idempotent — if a write was partially flushed before crash, your parser must detect and skip the truncated entry
-- Build a clock-wheel or hierarchical timing wheel for TTL expiration — a naive timer-per-key approach will not survive 1M keys
+---
 
-## Reference Material (Research Required)
-- DeCandia, G. et al. (2007). *Dynamo: Amazon's Highly Available Key-Value Store* — the canonical reference for consistent hashing, quorum, and hinted handoff
-- Redis RESP2 protocol specification — https://redis.io/docs/reference/protocol-spec — study the wire encoding in full detail
-- Redis source code — `src/dict.c` (hash table), `src/aof.c` (AOF persistence), `src/pubsub.c` (pub/sub routing) — do not look at tutorials, read the C source
-- Karger, D. et al. (1997). *Consistent Hashing and Random Trees* — the original consistent hashing paper from MIT
+## Why this design
 
-## Difficulty Rating
-★★★★★★
+**RESP2 first, distribution second**: start with the protocol. A complete RESP2 encoder and decoder is the prerequisite for every other feature. Only once redis-cli works end-to-end do you add distribution.
 
-## Estimated Time
-4–7 weeks for an experienced Elixir developer with networking and distributed systems background
+**Consistent hashing over modular hashing**: with modular hashing, adding a node requires rehashing nearly all keys. Consistent hashing with virtual nodes moves only `1/N` of keys when a node joins or leaves. This is the difference between a 10-second migration and a 10-minute migration on a live system.
+
+**Sloppy quorum with hinted handoff**: strict quorum requires `R` live replicas to serve a write. Sloppy quorum (Dynamo-style) allows writes to go to any available node with a "hint" annotation, then forward to the target replica when it recovers. This trades strict consistency for availability during partial failures.
+
+**LRU via doubly-linked list + hash map**: a true O(1) LRU cache requires both O(1) access (hash map) and O(1) eviction (doubly-linked list that tracks access order). ETS `:ordered_set` gives you sorted access but not access-order tracking. You must maintain the order yourself.
+
+---
+
+## Implementation milestones
+
+### Step 1: Create the project
+
+```bash
+mix new krebs --sup
+cd krebs
+mkdir -p lib/krebs test/krebs bench
+```
+
+### Step 2: `mix.exs` — dependencies
+
+```elixir
+defp deps do
+  [
+    {:benchee, "~> 1.3", only: :dev}
+  ]
+end
+```
+
+### Step 3: RESP2 protocol
+
+The entire client-facing API depends on this being correct.
+
+```elixir
+# lib/krebs/resp.ex
+defmodule Krebs.RESP do
+  @moduledoc """
+  RESP2 wire protocol encoder and decoder.
+
+  Types:
+    Simple strings: "+OK\r\n"
+    Errors:         "-ERR message\r\n"
+    Integers:       ":42\r\n"
+    Bulk strings:   "$5\r\nhello\r\n"   (or "$-1\r\n" for nil)
+    Arrays:         "*2\r\n$3\r\nfoo\r\n$3\r\nbar\r\n"
+  """
+
+  @doc "Encodes an Elixir term into RESP2 binary."
+  def encode(:ok),              do: "+OK\r\n"
+  def encode(nil),              do: "$-1\r\n"
+  def encode(n) when is_integer(n), do: ":#{n}\r\n"
+  def encode(s) when is_binary(s) do
+    # TODO: bulk string encoding
+  end
+  def encode(list) when is_list(list) do
+    # TODO: array encoding
+  end
+  def encode({:error, msg}),    do: "-ERR #{msg}\r\n"
+
+  @doc """
+  Parses RESP2 bytes from a TCP stream. Returns {:ok, value, rest} when
+  a complete message is available, or {:more, partial_state} when more
+  bytes are needed.
+
+  The connection handler maintains partial_state across TCP recv calls.
+  """
+  def parse(buffer) do
+    # TODO
+    # HINT: implement as a state machine — the connection receives bytes
+    #       in arbitrary chunks; a single recv may contain multiple commands
+    #       or only part of one
+  end
+end
+```
+
+### Step 4: Consistent hashing ring
+
+```elixir
+# lib/krebs/ring.ex
+defmodule Krebs.Ring do
+  @moduledoc """
+  Consistent hashing ring with virtual nodes.
+
+  Each physical node owns V virtual token positions on the ring.
+  A key is routed to the physical node whose first virtual token
+  is encountered walking the ring clockwise from the key's hash.
+
+  The ring is stored as a sorted list of {token, physical_node} pairs.
+  Key lookup uses binary search: O(log(N * V)) per lookup.
+  """
+
+  @doc "Creates a new ring with the given nodes and virtual node count V."
+  def new(nodes, v \\ 150) do
+    # TODO
+    # HINT: for each node, hash "{node_name}:#{i}" for i in 1..V
+    # HINT: sort the resulting list by token value
+  end
+
+  @doc "Returns the primary physical node for a key."
+  def lookup(ring, key) do
+    # TODO: hash the key, walk the ring clockwise, return the first node
+    # HINT: :erlang.phash2/2 or :crypto.hash(:sha256, key) for better uniformity
+  end
+
+  @doc "Returns the R replica nodes for a key (primary + R-1 successors)."
+  def replicas(ring, key, r) do
+    # TODO: lookup + next R-1 distinct physical nodes clockwise
+  end
+
+  @doc "Returns a new ring with the node added."
+  def add_node(ring, node, v \\ 150) do
+    # TODO
+  end
+
+  @doc "Returns a new ring with the node removed."
+  def remove_node(ring, node) do
+    # TODO
+  end
+end
+```
+
+### Step 5: Given tests — must pass without modification
+
+```elixir
+# test/krebs/resp_test.exs
+defmodule Krebs.RESPTest do
+  use ExUnit.Case, async: true
+
+  alias Krebs.RESP
+
+  test "encodes simple string" do
+    assert RESP.encode(:ok) == "+OK\r\n"
+  end
+
+  test "encodes bulk string" do
+    assert RESP.encode("hello") == "$5\r\nhello\r\n"
+  end
+
+  test "encodes nil as null bulk string" do
+    assert RESP.encode(nil) == "$-1\r\n"
+  end
+
+  test "encodes integer" do
+    assert RESP.encode(42) == ":42\r\n"
+  end
+
+  test "encodes array" do
+    assert RESP.encode(["SET", "foo", "bar"]) == "*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n"
+  end
+
+  test "parses inline command" do
+    assert {:ok, ["SET", "foo", "bar"], ""} =
+      RESP.parse("*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n")
+  end
+
+  test "returns :more when buffer is incomplete" do
+    assert {:more, _} = RESP.parse("*3\r\n$3\r\nSET\r\n")
+  end
+
+  test "handles pipelined commands in one buffer" do
+    buf = "+OK\r\n:1\r\n"
+    assert {:ok, :ok, ":1\r\n"} = RESP.parse(buf)
+  end
+end
+```
+
+```elixir
+# test/krebs/ring_test.exs
+defmodule Krebs.RingTest do
+  use ExUnit.Case, async: true
+
+  alias Krebs.Ring
+
+  test "uniform distribution: no node holds more than 40% of keys" do
+    nodes = [:node1, :node2, :node3]
+    ring = Ring.new(nodes, 150)
+
+    distribution =
+      for _ <- 1..100_000, reduce: %{} do
+        acc ->
+          key = :crypto.strong_rand_bytes(16) |> Base.encode16()
+          node = Ring.lookup(ring, key)
+          Map.update(acc, node, 1, &(&1 + 1))
+      end
+
+    for {node, count} <- distribution do
+      pct = count / 100_000
+      assert pct < 0.40, "#{node} holds #{Float.round(pct * 100, 1)}% of keys (max 40%)"
+    end
+  end
+
+  test "adding a node moves at most 1/N + 5% keys" do
+    ring4 = Ring.new([:n1, :n2, :n3, :n4], 150)
+    ring5 = Ring.add_node(ring4, :n5, 150)
+
+    keys = for _ <- 1..10_000, do: :crypto.strong_rand_bytes(8) |> Base.encode16()
+
+    moved =
+      keys
+      |> Enum.count(fn k -> Ring.lookup(ring4, k) != Ring.lookup(ring5, k) end)
+
+    moved_pct = moved / 10_000
+    assert moved_pct < 0.25, "expected ~20% movement, got #{Float.round(moved_pct * 100, 1)}%"
+  end
+end
+```
+
+### Step 6: Run the tests
+
+```bash
+mix test test/krebs/ --trace
+```
+
+### Step 7: Benchmark
+
+```elixir
+# bench/krebs_bench.exs
+# Requires krebs to be running: iex -S mix
+# Then: mix run bench/krebs_bench.exs
+
+Benchee.run(
+  %{
+    "GET — cache hit"  => fn -> Krebs.get("bench_key") end,
+    "SET — no replica" => fn -> Krebs.set("bench_key", "v", ttl: nil) end
+  },
+  parallel: 8,
+  time: 10,
+  warmup: 3,
+  formatters: [Benchee.Formatters.Console]
+)
+```
+
+Target: 100,000 reads/second and 50,000 writes/second with AOF enabled and R=2 quorum.
+
+---
+
+## Trade-off analysis
+
+| Aspect | Strict quorum (R + W > N) | Sloppy quorum + hinted handoff | Single-node (no replication) |
+|--------|--------------------------|-------------------------------|------------------------------|
+| Write availability | requires R live replicas | always writes to any node | always available |
+| Read consistency | strong | eventual (until handoff completes) | strong |
+| Failure tolerance | minority partition | sloppy — survives any minority | none |
+| Handoff complexity | none | must track hints, forward on recovery | none |
+| Consistency model | linearizable reads | read-your-writes eventually | linearizable |
+
+Reflection: in what scenarios does sloppy quorum return a stale value even after hinted handoff completes?
+
+---
+
+## Common production mistakes
+
+**1. Parsing RESP inline vs multibulk incorrectly**
+redis-cli sends commands as multibulk arrays (`*N\r\n$len\r\nword\r\n...`). Some clients send inline commands (`PING\r\n`). Both must parse correctly. A parser that only handles one will fail silently on the other.
+
+**2. LRU eviction using `:ordered_set` access time**
+ETS `:ordered_set` orders by key, not by access time. To implement LRU, you must maintain a separate doubly-linked structure that tracks access order. Sorting all entries to find the LRU is O(n) and will not meet the benchmark.
+
+**3. One timer per key for TTL**
+`Process.send_after` per key does not scale to millions of entries. Use a clock wheel or bucket expiration: group keys by their expiration second into ETS buckets. A single sweeper wakes up each second and evicts all keys in the current bucket.
+
+**4. Forgetting to handle partial TCP writes**
+`:gen_tcp.send/2` may not send the full binary in one call. Accumulate bytes in the connection process state until a complete RESP message is parsed.
+
+**5. Blocking the accept loop**
+The accept loop must only call `:gen_tcp.accept/1` and spawn a handler process. Any work beyond that blocks new connections. Each connection runs in its own process.
+
+---
+
+## Resources
+
+- DeCandia, G. et al. (2007). *Dynamo: Amazon's Highly Available Key-Value Store* — sections on consistent hashing, quorum, and hinted handoff
+- [Redis RESP2 protocol specification](https://redis.io/docs/reference/protocol-spec) — study the wire encoding in full detail
+- [Redis `dict.c`](https://github.com/redis/redis/blob/unstable/src/dict.c), [`aof.c`](https://github.com/redis/redis/blob/unstable/src/aof.c) — reference C implementations
+- Karger, D. et al. (1997). *Consistent Hashing and Random Trees* — the original MIT paper

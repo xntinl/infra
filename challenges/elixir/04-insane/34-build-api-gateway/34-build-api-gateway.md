@@ -1,88 +1,506 @@
-# 34. Build an API Gateway
+# API Gateway
 
-**Difficulty**: Insane
-
----
-
-## Prerequisites
-
-- Elixir HTTP client and server (`:httpc`, `Mint`, or raw TCP)
-- GenServer and ETS for service registry state
-- Circuit breaker pattern theory (Hystrix, Resilience4j concepts)
-- JWT structure and verification (HMAC-SHA256, RS256)
-- Distributed rate limiting concepts
-- Caching strategies: TTL, cache invalidation, stale-while-revalidate
-- OpenTelemetry or custom tracing concepts
+**Project**: `apigw` — a production API gateway with discovery, auth, rate limiting, circuit breaking, and observability
 
 ---
 
-## Problem Statement
+## Project context
 
-Build an API gateway that sits between clients and a collection of backend microservices. The gateway must handle service discovery, intelligent load balancing, authentication, rate limiting, circuit breaking, response caching, request/response transformation, and observability — all without the client knowing which backend instance serves any given request.
+You are building `apigw`, the single ingress point for a microservices platform. Client traffic arrives at the gateway, gets authenticated, rate-limited, routed to the correct backend, protected by a circuit breaker, possibly cached, and observed. No request reaches a backend without passing through all of these layers.
 
-1. Maintain a live service registry where backend services register themselves and the gateway discovers their instances
-2. Route incoming requests to the correct backend based on path prefix or host header, then balance across healthy instances
-3. Validate authentication credentials (JWT tokens and API keys) at the gateway before forwarding to backends
-4. Enforce per-key and per-IP rate limits without a central coordinator (distributed, lease-based)
-5. Protect each backend with a circuit breaker that opens when error rate exceeds a threshold
-6. Cache `GET` responses with TTL and conditional request support to reduce backend load
-7. Transform requests and responses in transit: add/remove headers, rewrite paths, modify JSON bodies
-8. Emit per-request metrics and distributed trace spans for every proxied request
+Project structure:
 
----
-
-## Acceptance Criteria
-
-- [ ] Service discovery: backends `POST /register` with `{name, host, port, health_path, weight}`; the gateway polls each registered instance's `health_path` every 10 seconds; unhealthy instances are removed from the rotation automatically; instances deregister with `DELETE /register/:id`
-- [ ] Load balancing: supports `round_robin`, `least_connections`, and `weighted_round_robin` algorithms, selectable per service; `ip_hash` is also available for sticky-session use cases; the algorithm is hot-swappable without restart
-- [ ] Authentication: `Authorization: Bearer <jwt>` tokens are verified against a configured public key or shared secret; `X-API-Key: <key>` is validated against a key registry; requests without valid credentials are rejected with `401`; authentication is skippable per route (public routes)
-- [ ] Rate limiting: per API key and per IP, using a sliding window algorithm; limits are configurable per service; the gateway uses a lease-based approach so individual nodes can approve requests locally without per-request coordination; rate limit headers (`X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset`) are included in all responses
-- [ ] Circuit breaker: each backend service has an independent circuit breaker with configurable `error_threshold` (percentage) and `open_duration`; in `open` state all requests immediately return `503`; after `open_duration` the breaker enters `half_open` and allows one probe request; success closes it, failure reopens it
-- [ ] Caching: `GET` responses with `Cache-Control: max-age=N` or a configured default TTL are cached in ETS; cache key includes method, path, and query string; `If-None-Match` / `ETag` is supported; stale entries are evicted on a background schedule
-- [ ] Request transformation: a per-route configuration allows: `add_header`, `remove_header`, `rewrite_path` (regex replace), `add_query_param`, and `inject_json_field` (add a field to a JSON request body); transformations apply before forwarding
-- [ ] Observability: every proxied request emits a metric `{service, route, status_code, duration_ms}`; a distributed trace span is created with `trace_id` propagated via `X-Trace-Id` header; `GET /metrics` returns all metrics in Prometheus format; `GET /services` returns current registry state with health and circuit breaker status
-
----
-
-## What You Will Learn
-
-- Service registry design and health check polling
-- Load balancing algorithms and connection tracking
-- JWT verification (parsing, signature validation, claims checking)
-- Circuit breaker state machine with half-open probe logic
-- HTTP reverse proxy mechanics: connection reuse, header forwarding, body streaming
-- Cache invalidation strategies and ETag-based conditional requests
-- Distributed tracing context propagation (W3C Trace Context spec)
-
----
-
-## Hints
-
-- Research the W3C Trace Context specification for `traceparent` header format
-- Study the Hystrix circuit breaker design document for the state machine and metrics window approach
-- Investigate how `Mint` handles connection pooling for efficient reverse proxy forwarding
-- Think about how `least_connections` tracking works correctly when the gateway is itself clustered
-- Look into JWT verification without a library: the structure is `base64(header).base64(payload).signature`; HMAC-SHA256 or RSA verification is in the Erlang standard library
-- Research how Nginx implements `proxy_cache_bypass` and `stale-while-revalidate` for inspiration
+```
+apigw/
+├── lib/
+│   └── apigw/
+│       ├── application.ex
+│       ├── registry/
+│       │   ├── server.ex            # ← backend registration + health polling
+│       │   └── store.ex             # ← ETS-backed backend list
+│       ├── lb/
+│       │   ├── round_robin.ex       # ← stateless algorithm
+│       │   ├── least_connections.ex # ← :atomics connection counter per backend
+│       │   ├── weighted.ex          # ← weighted round-robin with current weights
+│       │   └── ip_hash.ex           # ← consistent hash for sticky sessions
+│       ├── auth/
+│       │   ├── jwt.ex               # ← JWT verify (HS256 + RS256)
+│       │   └── api_key.ex           # ← key registry + validation
+│       ├── rate_limiter.ex          # ← sliding window, lease-based, ETS
+│       ├── circuit_breaker.ex       # ← per-backend state machine
+│       ├── cache.ex                 # ← GET response cache with ETag
+│       ├── transformer.ex           # ← request/response mutation rules
+│       ├── proxy.ex                 # ← HTTP reverse proxy (Mint connection pool)
+│       └── telemetry.ex             # ← per-request metrics + trace spans
+├── test/
+│   └── apigw/
+│       ├── registry_test.exs
+│       ├── circuit_breaker_test.exs
+│       ├── rate_limiter_test.exs
+│       ├── auth_test.exs
+│       └── cache_test.exs
+├── bench/
+│   └── proxy_bench.exs
+└── mix.exs
+```
 
 ---
 
-## Reference Material
+## The business problem
 
-- W3C Trace Context Specification (w3.org/TR/trace-context)
-- "Hystrix: Latency and Fault Tolerance for Distributed Systems" — Netflix Tech Blog
-- JWT specification (RFC 7519)
-- NGINX documentation on `proxy_pass`, `proxy_cache`, and health checks
-- "Building Microservices" — Sam Newman, O'Reilly (gateway chapter)
+A misconfigured client is retrying a failing request 1000 times per second against the payments service. Other clients are degraded. The platform team needs a gateway that isolates this impact without touching any backend: rate limit the offending API key, open the circuit breaker when the payments service error rate spikes, and cache the responses that were healthy before the spike.
+
+These are not independent features — they must compose:
+
+```
+request → [auth] → [rate limiter] → [circuit breaker check] → [cache check]
+                                                               → [proxy] → [cache write] → response
+```
+
+If any layer short-circuits (auth failure, rate limited, circuit open, cache hit), the subsequent layers never execute.
 
 ---
 
-## Difficulty Rating ★★★★★★
+## Why lease-based rate limiting scales across nodes
 
-Combining seven independent distributed systems concerns (discovery, load balancing, auth, rate limiting, circuit breaking, caching, observability) into a single coherent system is a production-engineering challenge.
+A centralized rate limiter serializes all requests through one process. Under 50k req/s this becomes a bottleneck. A lease-based approach distributes the limit:
+
+- Each gateway node acquires a lease of `quota / N` tokens per window from a central coordinator (or directly from Redis/ETS if single-node).
+- Locally, the node enforces the lease with an `:atomics` counter.
+- No cross-node coordination per request — only per lease renewal (every few seconds).
+
+The trade-off: a node that crashes forfeits its unused lease tokens for that window. The limit may be slightly over-served during the inter-lease period. This is acceptable for most rate limiting use cases.
 
 ---
 
-## Estimated Time
+## Why the circuit breaker needs a half-open state
 
-70–110 hours
+A two-state breaker (open/closed) that tests the backend by re-opening it immediately on timeout expiry would cause request storms: N gateway instances simultaneously probe a recovering backend with their first request, potentially overwhelming it again.
+
+The half-open state allows exactly one probe request through. Success closes the breaker for all instances. Failure keeps it open and resets the timeout. This "single probe" invariant is the entire purpose of the half-open state.
+
+---
+
+## Implementation
+
+### Step 1: Create the project
+
+```bash
+mix new apigw --sup
+cd apigw
+mkdir -p lib/apigw/{registry,lb,auth,pagination}
+mkdir -p test/apigw bench
+```
+
+### Step 2: `mix.exs`
+
+```elixir
+defp deps do
+  [
+    {:plug_cowboy, "~> 2.7"},
+    {:mint, "~> 1.5"},
+    {:jason, "~> 1.4"},
+    {:benchee, "~> 1.3", only: :dev}
+  ]
+end
+```
+
+### Step 3: `lib/apigw/circuit_breaker.ex`
+
+```elixir
+defmodule Apigw.CircuitBreaker do
+  use GenServer
+
+  @open_duration_ms 30_000
+  @error_threshold 0.5   # 50% error rate triggers open
+  @window_ms 60_000
+
+  # States: :closed | :open | :half_open
+  # Transitions:
+  #   :closed → :open when error_rate > threshold in window
+  #   :open → :half_open after @open_duration_ms
+  #   :half_open → :closed on successful probe
+  #   :half_open → :open on failed probe
+
+  defstruct [
+    :backend_id,
+    state: :closed,
+    # Ring buffer of {timestamp, :success | :error} for the window
+    events: [],
+    opened_at: nil,
+    half_open_probe_sent: false
+  ]
+
+  # ---------------------------------------------------------------------------
+  # Public API
+  # ---------------------------------------------------------------------------
+
+  @doc """
+  Returns :allow or {:deny, :circuit_open} for a request to backend_id.
+  In half_open state, only one concurrent probe is allowed.
+  """
+  @spec check(String.t()) :: :allow | {:deny, :circuit_open}
+  def check(backend_id) do
+    GenServer.call(via(backend_id), :check)
+  end
+
+  @doc """
+  Records the outcome of a request to backend_id.
+  Must be called for every request that passed check/1.
+  """
+  @spec record_outcome(String.t(), :success | :error) :: :ok
+  def record_outcome(backend_id, outcome) do
+    GenServer.cast(via(backend_id), {:record, outcome, System.monotonic_time(:millisecond)})
+  end
+
+  # ---------------------------------------------------------------------------
+  # GenServer
+  # ---------------------------------------------------------------------------
+
+  def start_link(backend_id) do
+    GenServer.start_link(__MODULE__, backend_id, name: via(backend_id))
+  end
+
+  @impl true
+  def init(backend_id) do
+    {:ok, %__MODULE__{backend_id: backend_id}}
+  end
+
+  @impl true
+  def handle_call(:check, _from, %{state: :closed} = state) do
+    {:reply, :allow, state}
+  end
+
+  @impl true
+  def handle_call(:check, _from, %{state: :open, opened_at: opened_at} = state) do
+    now = System.monotonic_time(:millisecond)
+    if now - opened_at >= @open_duration_ms do
+      # Transition to half_open, allow one probe
+      new_state = %{state | state: :half_open, half_open_probe_sent: true}
+      {:reply, :allow, new_state}
+    else
+      {:reply, {:deny, :circuit_open}, state}
+    end
+  end
+
+  @impl true
+  def handle_call(:check, _from, %{state: :half_open, half_open_probe_sent: true} = state) do
+    # Already sent one probe, deny until result comes back
+    {:reply, {:deny, :circuit_open}, state}
+  end
+
+  @impl true
+  def handle_cast({:record, outcome, ts}, state) do
+    # TODO: append {ts, outcome} to the events ring buffer
+    # TODO: drop events older than @window_ms
+    # TODO: calculate error_rate = error_count / total_count
+    # TODO: if in :closed and error_rate > @error_threshold → transition to :open
+    # TODO: if in :half_open:
+    #   - outcome :success → transition to :closed, clear events
+    #   - outcome :error → transition to :open, reset opened_at
+    {:noreply, state}
+  end
+
+  defp via(backend_id) do
+    {:via, Registry, {Apigw.CircuitBreaker.Registry, backend_id}}
+  end
+end
+```
+
+### Step 4: `lib/apigw/auth/jwt.ex`
+
+```elixir
+defmodule Apigw.Auth.JWT do
+  @moduledoc """
+  Verifies JWT tokens without any library.
+
+  A JWT is three base64url-encoded sections separated by ".":
+    header.payload.signature
+
+  Verification steps:
+  1. Decode header → check "alg" field (HS256 or RS256 supported)
+  2. Decode payload → check "exp" (expiry), "iss" (issuer), "aud" (audience)
+  3. Verify signature:
+     - HS256: HMAC-SHA256(base64(header) <> "." <> base64(payload), secret)
+     - RS256: RSA-SHA256 verify with public key
+
+  Why implement this without a library?
+  JWT libraries introduce dependencies and often support legacy algorithms (RS512, PS256).
+  A custom implementation supports exactly HS256 and RS256 — no more. Reducing the
+  algorithm surface reduces the attack surface.
+  """
+
+  @doc """
+  Verifies a JWT token string.
+  Returns {:ok, claims} or {:error, reason}.
+  """
+  @spec verify(String.t(), String.t() | binary()) :: {:ok, map()} | {:error, atom()}
+  def verify(token, key) do
+    with [header_b64, payload_b64, sig_b64] <- String.split(token, ".", parts: 3),
+         {:ok, header} <- decode_json(header_b64),
+         {:ok, payload} <- decode_json(payload_b64),
+         :ok <- check_expiry(payload),
+         :ok <- verify_signature(header["alg"], "#{header_b64}.#{payload_b64}", sig_b64, key) do
+      {:ok, payload}
+    else
+      parts when is_list(parts) -> {:error, :malformed_token}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp decode_json(base64_string) do
+    with {:ok, json} <- Base.url_decode64(base64_string, padding: false),
+         {:ok, map} <- Jason.decode(json) do
+      {:ok, map}
+    else
+      _ -> {:error, :malformed_token}
+    end
+  end
+
+  defp check_expiry(%{"exp" => exp}) do
+    if System.system_time(:second) < exp, do: :ok, else: {:error, :token_expired}
+  end
+
+  defp check_expiry(_), do: :ok
+
+  defp verify_signature("HS256", signing_input, sig_b64, secret) do
+    # TODO: compute HMAC-SHA256(secret, signing_input)
+    # TODO: Base64url-encode the computed MAC
+    # TODO: constant-time compare with sig_b64
+    {:error, :not_implemented}
+  end
+
+  defp verify_signature("RS256", signing_input, sig_b64, public_key_pem) do
+    # TODO: decode PEM public key with :public_key.pem_decode/1
+    # TODO: :public_key.verify(signing_input, :sha256, Base.url_decode64!(sig_b64, padding: false), decoded_key)
+    {:error, :not_implemented}
+  end
+
+  defp verify_signature(alg, _, _, _), do: {:error, {:unsupported_algorithm, alg}}
+end
+```
+
+### Step 5: `lib/apigw/cache.ex`
+
+```elixir
+defmodule Apigw.Cache do
+  use GenServer
+
+  @table :apigw_cache
+  @default_ttl_s 300
+
+  # ---------------------------------------------------------------------------
+  # Public API  (reads go directly to ETS — no GenServer call)
+  # ---------------------------------------------------------------------------
+
+  @doc """
+  Checks the cache for a GET request.
+  Returns {:hit, response} or :miss.
+  Also handles conditional requests via ETag.
+  """
+  @spec get(String.t(), map()) :: {:hit, map()} | {:miss}
+  def get(cache_key, request_headers) do
+    case :ets.lookup(@table, cache_key) do
+      [{^cache_key, entry}] ->
+        if entry_expired?(entry) do
+          :miss
+        else
+          etag = entry.etag
+          if_none_match = Map.get(request_headers, "if-none-match")
+
+          if if_none_match == etag do
+            {:hit, %{status: 304, headers: [{"etag", etag}], body: ""}}
+          else
+            {:hit, entry.response}
+          end
+        end
+
+      [] ->
+        :miss
+    end
+  end
+
+  @doc """
+  Stores a response in the cache.
+  Computes ETag from response body hash.
+  """
+  @spec put(String.t(), map(), pos_integer()) :: :ok
+  def put(cache_key, response, ttl_s \\ @default_ttl_s) do
+    GenServer.cast(__MODULE__, {:put, cache_key, response, ttl_s})
+  end
+
+  # ---------------------------------------------------------------------------
+  # GenServer
+  # ---------------------------------------------------------------------------
+
+  def start_link(opts \\ []) do
+    GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+  end
+
+  @impl true
+  def init(_opts) do
+    :ets.new(@table, [:named_table, :public, :set])
+    schedule_cleanup()
+    {:ok, %{}}
+  end
+
+  @impl true
+  def handle_cast({:put, key, response, ttl_s}, state) do
+    etag = compute_etag(response.body)
+    entry = %{
+      response: Map.put(response, :headers, [{"etag", etag} | response.headers]),
+      etag: etag,
+      expires_at: System.monotonic_time(:second) + ttl_s
+    }
+    :ets.insert(@table, {key, entry})
+    {:noreply, state}
+  end
+
+  @impl true
+  def handle_info(:cleanup, state) do
+    # TODO: :ets.select_delete on entries where expires_at < now
+    schedule_cleanup()
+    {:noreply, state}
+  end
+
+  defp entry_expired?(%{expires_at: exp}) do
+    System.monotonic_time(:second) > exp
+  end
+
+  defp compute_etag(body) do
+    # TODO: Base.encode16(:crypto.hash(:sha256, body), case: :lower) |> String.slice(0, 16)
+    ""
+  end
+
+  defp schedule_cleanup, do: Process.send_after(self(), :cleanup, 60_000)
+end
+```
+
+### Step 6: Given tests — must pass without modification
+
+```elixir
+# test/apigw/circuit_breaker_test.exs
+defmodule Apigw.CircuitBreakerTest do
+  use ExUnit.Case, async: false
+
+  alias Apigw.CircuitBreaker
+
+  setup do
+    {:ok, _} = start_supervised({CircuitBreaker, "test-backend"})
+    :ok
+  end
+
+  test "starts closed and allows requests" do
+    assert CircuitBreaker.check("test-backend") == :allow
+  end
+
+  test "opens after error threshold exceeded" do
+    # Record 10 errors and 0 successes → 100% error rate → should open
+    for _ <- 1..10, do: CircuitBreaker.record_outcome("test-backend", :error)
+    Process.sleep(10)
+
+    assert {:deny, :circuit_open} = CircuitBreaker.check("test-backend")
+  end
+
+  test "closed if error rate below threshold" do
+    # 40% error rate — below 50% threshold
+    for _ <- 1..4, do: CircuitBreaker.record_outcome("test-backend", :error)
+    for _ <- 1..6, do: CircuitBreaker.record_outcome("test-backend", :success)
+    Process.sleep(10)
+
+    assert CircuitBreaker.check("test-backend") == :allow
+  end
+end
+```
+
+```elixir
+# test/apigw/auth_test.exs
+defmodule Apigw.AuthTest do
+  use ExUnit.Case, async: true
+
+  alias Apigw.Auth.JWT
+
+  @secret "test_hmac_secret_key_minimum_32_bytes"
+
+  defp make_token(claims, secret) do
+    header = Base.url_encode64(~s({"alg":"HS256","typ":"JWT"}), padding: false)
+    payload = Base.url_encode64(Jason.encode!(claims), padding: false)
+    signing_input = "#{header}.#{payload}"
+    mac = :crypto.mac(:hmac, :sha256, secret, signing_input)
+    sig = Base.url_encode64(mac, padding: false)
+    "#{signing_input}.#{sig}"
+  end
+
+  test "valid HS256 token with future expiry verifies" do
+    token = make_token(%{"sub" => "user_1", "exp" => System.system_time(:second) + 3600}, @secret)
+    assert {:ok, claims} = JWT.verify(token, @secret)
+    assert claims["sub"] == "user_1"
+  end
+
+  test "expired token is rejected" do
+    token = make_token(%{"sub" => "user_1", "exp" => System.system_time(:second) - 1}, @secret)
+    assert {:error, :token_expired} = JWT.verify(token, @secret)
+  end
+
+  test "tampered payload is rejected" do
+    token = make_token(%{"sub" => "user_1", "exp" => System.system_time(:second) + 3600}, @secret)
+    [h, _p, s] = String.split(token, ".")
+    tampered_payload = Base.url_encode64(~s({"sub":"admin","exp":9999999999}), padding: false)
+    assert {:error, _} = JWT.verify("#{h}.#{tampered_payload}.#{s}", @secret)
+  end
+
+  test "malformed token returns error" do
+    assert {:error, :malformed_token} = JWT.verify("not.a.jwt.token.at.all", @secret)
+  end
+end
+```
+
+### Step 7: Run the tests
+
+```bash
+mix test test/apigw/ --trace
+```
+
+---
+
+## Trade-off analysis
+
+| Concern | Gateway-level (your impl) | Backend-level | External service |
+|---------|--------------------------|---------------|------------------|
+| Auth | centralized, consistent | per-service (risk of gaps) | IdP like Auth0 |
+| Rate limiting | per-key, no backend changes | harder to coordinate | Redis/Envoy |
+| Circuit breaking | protects backend from storms | self-protection only | Hystrix, Resilience4j |
+| Caching | transparent to backend | backend-aware cache | CDN (Cloudflare, etc.) |
+| Tracing | single injection point | manual per service | OpenTelemetry auto-instr |
+| Single point of failure | yes — must be HA | no | usually HA |
+
+Reflection: the gateway is a single point of failure. What changes would you make to run `apigw` in a 3-node cluster with no shared state except ETS? Which components require distributed coordination and which are safe to be node-local?
+
+---
+
+## Common production mistakes
+
+**1. Circuit breaker that never transitions to half-open**
+If the `open_duration_ms` timer is reset on every incoming request (even rejected ones), the circuit never gets a chance to probe the backend. The timer must count from `opened_at`, not from the last rejected request.
+
+**2. Rate limit headers missing on denied requests**
+RFC 6585 and industry convention require `X-RateLimit-Limit`, `X-RateLimit-Remaining`, and `X-RateLimit-Reset` on ALL responses, not just successful ones. A 429 response without these headers leaves clients guessing when to retry.
+
+**3. JWT algorithm confusion attack**
+A token with `"alg": "none"` bypasses signature verification in naive implementations. Your `verify/2` must reject any algorithm not in an explicit allowlist (`["HS256", "RS256"]`). The `alg` field in the header is attacker-controlled.
+
+**4. Cache key collision between different routes**
+If two routes `/users?sort=name` and `/users?sort=email` map to the same cache key because query params are not normalized, one response pollutes the cache for the other. The cache key must include a canonical representation of the query string (sorted params, lowercase values).
+
+**5. Least-connections count going negative**
+When a backend dies mid-request, the connection count for that backend is never decremented if decrement happens in the response handler. Use `try/after` to guarantee decrement regardless of proxy outcome.
+
+---
+
+## Resources
+
+- [W3C Trace Context Specification](https://www.w3.org/TR/trace-context/) — the `traceparent` header format your gateway must propagate
+- [Hystrix Design Document](https://github.com/Netflix/Hystrix/wiki/How-it-Works) — Netflix's original circuit breaker design; the half-open state rationale is here
+- [JWT RFC 7519](https://www.rfc-editor.org/rfc/rfc7519) — sections 4 (claims) and 7 (validation) define what your verifier must check
+- [Mint](https://hexdocs.pm/mint/Mint.HTTP.html) — the HTTP client for your reverse proxy; study connection reuse and streaming response handling
+- ["Building Microservices"](https://www.oreilly.com/library/view/building-microservices-2nd/9781492034018/) — Sam Newman, O'Reilly — the API Gateway chapter covers patterns your implementation must handle

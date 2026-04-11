@@ -1,511 +1,330 @@
-# 2. Agent: Estado Mutable Seguro
+# Agent: Managed Mutable State
 
-**Difficulty**: Intermedio
+**Project**: `task_queue` — built incrementally across the intermediate level
 
-## Prerequisites
-- Completed 01-basico exercises
-- Completed 01-procesos-spawn-send-receive
-- Understanding of anonymous functions and closures
-- Familiarity with maps and keyword lists
+---
 
-## Learning Objectives
-After completing this exercise, you will be able to:
-- Use `Agent` to hold and manage mutable state safely in a concurrent environment
-- Start an agent with an initial state using `Agent.start_link/1`
-- Read state with `Agent.get/2` without modifying it
-- Update state atomically with `Agent.update/2`
-- Combine read and write atomically with `Agent.get_and_update/2`
-- Stop an agent gracefully with `Agent.stop/1`
-- Register agents with names for global access
+## Project context
 
-## Concepts
+The task_queue system needs a place to track **task metadata**: which tasks have been
+submitted, what their current status is, and when each status changed. This is read-heavy
+shared state that multiple processes need to query.
 
-### Agent: abstracción sobre procesos con estado
-En el ejercicio anterior vimos cómo crear procesos con `spawn` y mantener estado con recursión. `Agent` es exactamente eso, pero envuelto en una abstracción limpia. Un Agent es un proceso que almacena un valor (cualquier término Elixir) y expone una API síncrona para leerlo y modificarlo.
+The previous exercise used a raw receive loop with manual state. `Agent` is that same
+pattern as a well-behaved OTP citizen: supervised, named, and with a clean API.
 
-Internamente, Agent usa GenServer (que veremos en el próximo ejercicio). Lo que hace Agent es eliminar el boilerplate de implementar manualmente `handle_call` y `handle_cast` cuando todo lo que necesitas es guardar un valor y modificarlo de forma segura entre varios procesos concurrentes.
+Project structure at this point:
 
-La seguridad viene del modelo de procesos de Elixir: como el estado vive en un proceso, solo un "cliente" puede modificarlo a la vez. No hay condiciones de carrera posibles sin usar ningún lock o mutex explícito.
-
-```elixir
-# Iniciar un agent con estado inicial 0
-{:ok, pid} = Agent.start_link(fn -> 0 end)
-
-# Leer el estado (no lo modifica)
-Agent.get(pid, fn estado -> estado end)   # => 0
-
-# Modificar el estado
-Agent.update(pid, fn estado -> estado + 1 end)
-
-# Leer de nuevo
-Agent.get(pid, fn estado -> estado end)   # => 1
+```
+task_queue/
+├── lib/
+│   └── task_queue/
+│       ├── worker_process.ex    # previous exercise
+│       ├── accumulator.ex       # previous exercise
+│       └── task_registry.ex     # ← you implement this
+├── test/
+│   └── task_queue/
+│       └── task_registry_test.exs   # given tests — must pass without modification
+└── mix.exs
 ```
 
-### get vs update vs get_and_update
-Estos tres son los verbos fundamentales de Agent:
+---
 
-`Agent.get/2` ejecuta la función en el proceso del agent y devuelve su resultado al llamante. El estado no cambia. Se usa para consultas puras.
+## Why Agent and not a raw process
 
-`Agent.update/2` ejecuta la función en el proceso del agent y reemplaza el estado con el valor que retorna la función. No devuelve el estado anterior. Se usa cuando solo necesitas cambiar el estado.
+The accumulator from the previous exercise already is an Agent — it just does not know it.
+`Agent` wraps the exact same receive loop pattern, but provides:
 
-`Agent.get_and_update/2` ejecuta la función que debe retornar `{valor_a_devolver, nuevo_estado}`. Esto permite hacer la lectura y la escritura como una operación atómica — importante cuando el nuevo estado depende del estado anterior de forma que no puede haber una lectura separada antes de la escritura.
+- A supervised `start_link/1` with the signature Supervisor expects
+- Atomic `get_and_update` that eliminates the race condition between separate get and update
+- Consistent error semantics and timeout handling
+
+The key limitation you must understand: the function you pass to `Agent.get/2` or
+`Agent.update/2` executes **inside the Agent process**. If that function is slow, every
+caller blocks waiting for the Agent to finish. Never do I/O or expensive computation inside
+an Agent callback — compute first, pass the result to `update`.
+
+---
+
+## The business problem
+
+`TaskQueue.TaskRegistry` tracks every task submitted to the system:
+
+- A task has an ID (string), a status (`:pending | :running | :done | :failed`), and a
+  timestamp for the last status change.
+- Multiple worker processes update the same registry concurrently.
+- The scheduler queries the registry to find tasks that have been `:running` for longer
+  than a configurable deadline (they may be stuck).
+
+---
+
+## Implementation
+
+### Step 1: `lib/task_queue/task_registry.ex`
 
 ```elixir
-{:ok, agent} = Agent.start_link(fn -> [1, 2, 3] end)
+defmodule TaskQueue.TaskRegistry do
+  @moduledoc """
+  Tracks task metadata across the lifetime of a task_queue run.
 
-# get: lee sin modificar
-Agent.get(agent, fn lista -> length(lista) end)   # => 3
+  State shape: %{task_id => %{status: atom(), updated_at: integer()}}
+  """
+  use Agent
 
-# update: modifica, no retorna el estado
-Agent.update(agent, fn lista -> [0 | lista] end)
-# Estado ahora: [0, 1, 2, 3]
+  @type task_id :: String.t()
+  @type status :: :pending | :running | :done | :failed
+  @type task_entry :: %{status: status(), updated_at: integer()}
 
-# get_and_update: pop atómico (saca el primero y actualiza)
-Agent.get_and_update(agent, fn [h | t] -> {h, t} end)
-# => 0 (el elemento sacado)
-# Estado ahora: [1, 2, 3]
-```
+  # ---------------------------------------------------------------------------
+  # Public API — entry points for workers, scheduler, and tests
+  # ---------------------------------------------------------------------------
 
-### Nombres de agents
-Por defecto, un agent solo puede referenciarse por su PID. Si el PID cambia (por ejemplo, al reiniciarse bajo un supervisor), las referencias quedan obsoletas. Los nombres resuelven esto:
-
-```elixir
-# Registrar con nombre de módulo (el más común)
-Agent.start_link(fn -> 0 end, name: MiContador)
-
-# Ahora se puede usar el nombre directamente
-Agent.get(MiContador, & &1)
-Agent.update(MiContador, &(&1 + 1))
-```
-
-## Exercises
-
-### Exercise 1: Counter agent
-```elixir
-defmodule ContadorAgent do
-  @agent_name __MODULE__
-
-  # TODO: Implementa `start/0` que:
-  # 1. Llama Agent.start_link con estado inicial 0
-  # 2. Usa `name: @agent_name` para registrarlo con nombre
-  # 3. Retorna {:ok, pid} en caso de éxito
-  def start do
-    Agent.start_link(fn ->
-      # TODO: estado inicial
-    end, name: @agent_name)
+  @doc """
+  Starts the registry and registers it under its module name.
+  Accepts an optional initial map of task entries (useful in tests).
+  """
+  @spec start_link(map()) :: Agent.on_start()
+  def start_link(initial \\ %{}) do
+    # HINT: Agent.start_link(fn -> initial end, name: __MODULE__)
+    # TODO: implement
   end
 
-  # TODO: Implementa `get/0` que retorna el valor actual del contador
-  # Usa @agent_name como referencia (no necesitas el PID)
-  def get do
-    Agent.get(@agent_name, fn estado ->
-      # TODO: retornar el estado
+  @doc "Registers a new task with :pending status."
+  @spec register(task_id()) :: :ok
+  def register(task_id) do
+    entry = %{status: :pending, updated_at: now()}
+    # HINT: Agent.update(__MODULE__, fn state -> Map.put(state, task_id, entry) end)
+    # TODO: implement
+  end
+
+  @doc "Transitions a task to a new status. Returns {:error, :not_found} if unknown."
+  @spec transition(task_id(), status()) :: :ok | {:error, :not_found}
+  def transition(task_id, new_status) do
+    # HINT: Agent.get_and_update — read current state, check if task_id exists,
+    #   if yes: update the entry and return {:ok, new_state}
+    #   if no:  return {{:error, :not_found}, state} (state unchanged)
+    # TODO: implement
+  end
+
+  @doc "Returns the current entry for a task, or nil if not registered."
+  @spec get(task_id()) :: task_entry() | nil
+  def get(task_id) do
+    Agent.get(__MODULE__, fn state -> Map.get(state, task_id) end)
+  end
+
+  @doc "Returns all task IDs currently in the given status."
+  @spec by_status(status()) :: [task_id()]
+  def by_status(status) do
+    # HINT: Agent.get — filter Map.keys by entry.status == status
+    # TODO: implement
+  end
+
+  @doc """
+  Returns task IDs that have been in :running status for longer than `threshold_ms`.
+  Used by the scheduler to detect stuck workers.
+  """
+  @spec stale_running(pos_integer()) :: [task_id()]
+  def stale_running(threshold_ms) do
+    cutoff = now() - threshold_ms
+    # HINT: Agent.get — filter tasks where status == :running and updated_at < cutoff
+    # TODO: implement
+  end
+
+  @doc "Removes a task entry. Returns :ok regardless of whether the task existed."
+  @spec remove(task_id()) :: :ok
+  def remove(task_id) do
+    # HINT: Agent.update — Map.delete
+    # TODO: implement
+  end
+
+  @doc "Returns the count of tasks in each status as a map."
+  @spec stats() :: %{status() => non_neg_integer()}
+  def stats do
+    Agent.get(__MODULE__, fn state ->
+      # HINT: Enum.reduce over state, accumulating counts per status
+      # Start with %{pending: 0, running: 0, done: 0, failed: 0}
+      # TODO: implement
     end)
   end
 
-  # TODO: Implementa `incrementar/0` que suma 1 al contador
-  def incrementar do
-    Agent.update(@agent_name, fn estado ->
-      # TODO: retornar estado + 1
-    end)
-  end
+  # ---------------------------------------------------------------------------
+  # Private
+  # ---------------------------------------------------------------------------
 
-  # TODO: Implementa `decrementar/0` que resta 1 al contador
-  def decrementar do
-    Agent.update(@agent_name, fn estado ->
-      # TODO: retornar estado - 1
-    end)
-  end
-
-  # TODO: Implementa `reset/0` que vuelve el contador a 0
-  def reset do
-    Agent.update(@agent_name, fn _estado ->
-      # TODO: retornar 0
-    end)
-  end
-
-  def stop, do: Agent.stop(@agent_name)
+  defp now, do: System.monotonic_time(:millisecond)
 end
-
-# Test it:
-# ContadorAgent.start()
-# ContadorAgent.get()           # => 0
-# ContadorAgent.incrementar()
-# ContadorAgent.incrementar()
-# ContadorAgent.get()           # => 2
-# ContadorAgent.decrementar()
-# ContadorAgent.get()           # => 1
-# ContadorAgent.reset()
-# ContadorAgent.get()           # => 0
-# ContadorAgent.stop()
 ```
 
-### Exercise 2: Stack agent con get_and_update
+### Step 2: Given tests — must pass without modification
+
 ```elixir
-defmodule StackAgent do
-  # TODO: Implementa `start/0` que inicia el agent con una lista vacía como estado
-  def start do
-    Agent.start_link(fn ->
-      # TODO: estado inicial (lista vacía)
-    end)
+# test/task_queue/task_registry_test.exs
+defmodule TaskQueue.TaskRegistryTest do
+  use ExUnit.Case, async: false
+  # async: false — tests share the named Agent process
+
+  alias TaskQueue.TaskRegistry
+
+  setup do
+    # Start a fresh registry for each test by stopping any existing one
+    case Process.whereis(TaskRegistry) do
+      nil -> :ok
+      pid -> Agent.stop(pid)
+    end
+
+    {:ok, _} = TaskRegistry.start_link()
+    :ok
   end
 
-  # TODO: Implementa `push/2` que recibe el PID del agent y un valor:
-  # Agrega el valor al frente de la lista (stack LIFO)
-  # [nuevo | lista_actual]
-  def push(agent, valor) do
-    Agent.update(agent, fn lista ->
-      # TODO: retornar [valor | lista]
-    end)
-  end
+  describe "register/1 and get/1" do
+    test "new task starts as :pending" do
+      TaskRegistry.register("task_001")
+      entry = TaskRegistry.get("task_001")
+      assert entry.status == :pending
+      assert is_integer(entry.updated_at)
+    end
 
-  # TODO: Implementa `pop/1` usando get_and_update — ATÓMICO:
-  # Si la lista tiene elementos: retorna {:ok, primer_elemento} y actualiza estado a la cola
-  # Si la lista está vacía: retorna {:error, :empty} y deja el estado sin cambios
-  # PISTA: get_and_update espera que la función retorne {valor_devuelto, nuevo_estado}
-  def pop(agent) do
-    Agent.get_and_update(agent, fn
-      [] ->
-        # TODO: retornar {{:error, :empty}, []}
-      [h | t] ->
-        # TODO: retornar {{:ok, h}, t}
-    end)
-  end
-
-  # TODO: Implementa `peek/1` que retorna el elemento en el tope sin sacarlo
-  # Si está vacío, retorna {:error, :empty}
-  def peek(agent) do
-    Agent.get(agent, fn
-      [] -> {:error, :empty}
-      [h | _] ->
-        # TODO: retornar {:ok, h}
-    end)
-  end
-
-  # TODO: Implementa `size/1` que retorna cuántos elementos tiene el stack
-  def size(agent) do
-    Agent.get(agent, fn lista ->
-      # TODO: retornar length(lista)
-    end)
-  end
-
-  def stop(agent), do: Agent.stop(agent)
-end
-
-# Test it:
-# {:ok, stack} = StackAgent.start()
-# StackAgent.push(stack, :a)
-# StackAgent.push(stack, :b)
-# StackAgent.push(stack, :c)
-# StackAgent.peek(stack)           # => {:ok, :c}
-# StackAgent.pop(stack)            # => {:ok, :c}
-# StackAgent.pop(stack)            # => {:ok, :b}
-# StackAgent.size(stack)           # => 1
-# StackAgent.pop(stack)            # => {:ok, :a}
-# StackAgent.pop(stack)            # => {:error, :empty}
-# StackAgent.stop(stack)
-```
-
-### Exercise 3: Config store agent
-```elixir
-defmodule ConfigAgent do
-  # Un agent que funciona como un key-value store en memoria
-  # El estado es un mapa %{clave => valor}
-
-  # TODO: Implementa `start/1` que acepta una keyword list de configuración inicial
-  # Convierte la keyword list a mapa con Enum.into(%{}) o Map.new/1
-  # Registra el agent con name: __MODULE__
-  def start(config_inicial \\ []) do
-    estado_inicial = Map.new(config_inicial)
-    Agent.start_link(fn ->
-      # TODO: retornar estado_inicial
-    end, name: __MODULE__)
-  end
-
-  # TODO: Implementa `get/1` que retorna el valor de una clave (o nil si no existe)
-  def get(clave) do
-    Agent.get(__MODULE__, fn mapa ->
-      # TODO: retornar Map.get(mapa, clave)
-    end)
-  end
-
-  # TODO: Implementa `get/2` que acepta un valor por defecto
-  def get(clave, default) do
-    Agent.get(__MODULE__, fn mapa ->
-      # TODO: retornar Map.get(mapa, clave, default)
-    end)
-  end
-
-  # TODO: Implementa `put/2` que guarda una clave-valor
-  def put(clave, valor) do
-    Agent.update(__MODULE__, fn mapa ->
-      # TODO: retornar Map.put(mapa, clave, valor)
-    end)
-  end
-
-  # TODO: Implementa `delete/1` que elimina una clave
-  def delete(clave) do
-    Agent.update(__MODULE__, fn mapa ->
-      # TODO: retornar Map.delete(mapa, clave)
-    end)
-  end
-
-  # TODO: Implementa `all/0` que retorna todo el mapa de configuración
-  def all do
-    Agent.get(__MODULE__, fn mapa ->
-      # TODO: retornar mapa
-    end)
-  end
-
-  def stop, do: Agent.stop(__MODULE__)
-end
-
-# Test it:
-# ConfigAgent.start(host: "localhost", port: 4000, debug: false)
-# ConfigAgent.get(:host)                    # => "localhost"
-# ConfigAgent.get(:timeout, 5000)           # => 5000 (no existe, devuelve default)
-# ConfigAgent.put(:timeout, 3000)
-# ConfigAgent.get(:timeout)                 # => 3000
-# ConfigAgent.all()                         # => %{host: "localhost", port: 4000, debug: false, timeout: 3000}
-# ConfigAgent.delete(:debug)
-# ConfigAgent.all()                         # => %{host: "localhost", port: 4000, timeout: 3000}
-# ConfigAgent.stop()
-```
-
-### Exercise 4: Múltiples agents coordinados
-```elixir
-defmodule BancoSimple do
-  # Dos agents: uno para saldo de cuenta A, otro para cuenta B
-  # Esto demuestra cómo coordinar múltiples agents
-
-  # TODO: Implementa `abrir_cuentas/2` que:
-  # 1. Inicia un agent para la cuenta A con saldo inicial saldo_a
-  # 2. Inicia un agent para la cuenta B con saldo inicial saldo_b
-  # 3. Retorna {:ok, pid_a, pid_b}
-  def abrir_cuentas(saldo_a, saldo_b) do
-    {:ok, cuenta_a} = Agent.start_link(fn -> saldo_a end)
-    {:ok, cuenta_b} = Agent.start_link(fn ->
-      # TODO: estado inicial
-    end)
-    {:ok, cuenta_a, cuenta_b}
-  end
-
-  # TODO: Implementa `saldo/1` que retorna el saldo de una cuenta (por PID)
-  def saldo(cuenta) do
-    Agent.get(cuenta, fn s ->
-      # TODO: retornar s
-    end)
-  end
-
-  # TODO: Implementa `transferir/3` que transfiere `monto` de cuenta_origen a cuenta_destino:
-  # 1. Verifica que cuenta_origen tenga saldo suficiente
-  # 2. Si sí: debita origen, acredita destino, retorna {:ok, nuevo_saldo_origen}
-  # 3. Si no: retorna {:error, :saldo_insuficiente}
-  # IMPORTANTE: esto NO es atómico entre dos agents — es una limitación de este enfoque
-  def transferir(origen, destino, monto) do
-    saldo_origen = saldo(origen)
-    if saldo_origen >= monto do
-      # TODO: restar monto del origen
-      Agent.update(origen, fn s -> s - monto end)
-      # TODO: sumar monto al destino
-      Agent.update(destino, fn s ->
-        # TODO: retornar s + monto
-      end)
-      {:ok, saldo(origen)}
-    else
-      {:error, :saldo_insuficiente}
+    test "get returns nil for unknown task" do
+      assert nil == TaskRegistry.get("nonexistent")
     end
   end
 
-  def cerrar(cuenta_a, cuenta_b) do
-    Agent.stop(cuenta_a)
-    Agent.stop(cuenta_b)
-  end
-end
+  describe "transition/2" do
+    test "valid transition updates status" do
+      TaskRegistry.register("task_002")
+      assert :ok = TaskRegistry.transition("task_002", :running)
+      assert %{status: :running} = TaskRegistry.get("task_002")
+    end
 
-# Test it:
-# {:ok, a, b} = BancoSimple.abrir_cuentas(1000, 500)
-# BancoSimple.saldo(a)                    # => 1000
-# BancoSimple.saldo(b)                    # => 500
-# BancoSimple.transferir(a, b, 300)       # => {:ok, 700}
-# BancoSimple.saldo(a)                    # => 700
-# BancoSimple.saldo(b)                    # => 800
-# BancoSimple.transferir(a, b, 1000)      # => {:error, :saldo_insuficiente}
-# BancoSimple.cerrar(a, b)
-```
+    test "transition returns error for unknown task" do
+      assert {:error, :not_found} = TaskRegistry.transition("ghost", :running)
+    end
 
-### Exercise 5: Agent bajo supervisión
-```elixir
-defmodule ContadorSupervisado do
-  # Un agent diseñado para correr bajo un Supervisor.
-  # La clave: usar name: __MODULE__ y exponer start_link/1
-  # con la firma correcta que el Supervisor espera.
-
-  # TODO: Implementa `start_link/1` — la firma que los Supervisores esperan:
-  # Acepta opts (keyword list, puede ignorarse por ahora)
-  # Llama Agent.start_link con estado inicial 0 y name: __MODULE__
-  def start_link(_opts \\ []) do
-    Agent.start_link(fn ->
-      # TODO: estado inicial
-    end, name: __MODULE__)
+    test "updated_at changes on each transition" do
+      TaskRegistry.register("task_003")
+      registered_at = TaskRegistry.get("task_003").updated_at
+      Process.sleep(2)
+      TaskRegistry.transition("task_003", :running)
+      entry = TaskRegistry.get("task_003")
+      # updated_at must be strictly greater than the registration timestamp
+      assert entry.updated_at > registered_at
+    end
   end
 
-  # TODO: Implementa `child_spec/1` — la especificación para el Supervisor:
-  # Retorna un mapa con:
-  #   id: __MODULE__
-  #   start: {__MODULE__, :start_link, [[]]}
-  #   restart: :permanent   (siempre reiniciar si cae)
-  #   type: :worker
-  def child_spec(opts) do
-    %{
-      id: __MODULE__,
-      start: {__MODULE__, :start_link, [opts]},
-      # TODO: agregar restart: :permanent
-      # TODO: agregar type: :worker
-    }
+  describe "by_status/1" do
+    test "returns task IDs in the requested status" do
+      TaskRegistry.register("t_a")
+      TaskRegistry.register("t_b")
+      TaskRegistry.register("t_c")
+      TaskRegistry.transition("t_a", :running)
+      TaskRegistry.transition("t_b", :done)
+
+      assert ["t_c"] == TaskRegistry.by_status(:pending)
+      assert ["t_a"] == TaskRegistry.by_status(:running)
+      assert ["t_b"] == TaskRegistry.by_status(:done)
+      assert [] == TaskRegistry.by_status(:failed)
+    end
   end
 
-  def get, do: Agent.get(__MODULE__, & &1)
-  def incrementar, do: Agent.update(__MODULE__, &(&1 + 1))
-  def reset, do: Agent.update(__MODULE__, fn _ -> 0 end)
+  describe "stale_running/1" do
+    test "returns tasks running longer than threshold" do
+      TaskRegistry.register("slow_task")
+      TaskRegistry.transition("slow_task", :running)
+      # Simulate passage of time by updating the entry directly
+      Agent.update(TaskQueue.TaskRegistry, fn state ->
+        Map.update!(state, "slow_task", fn e -> %{e | updated_at: e.updated_at - 10_000} end)
+      end)
 
-  # Para probar que sobrevive a reinicios:
-  def crash!, do: Agent.update(__MODULE__, fn _ -> raise "¡Crash intencional!" end)
-end
+      stale = TaskRegistry.stale_running(5_000)
+      assert "slow_task" in stale
+    end
 
-# Para usar bajo un Supervisor (en IEx):
-# children = [ContadorSupervisado]
-# {:ok, sup} = Supervisor.start_link(children, strategy: :one_for_one)
-# ContadorSupervisado.incrementar()
-# ContadorSupervisado.get()     # => 1
-# El Supervisor lo reiniciará si falla
+    test "does not return recently started running tasks" do
+      TaskRegistry.register("fresh_task")
+      TaskRegistry.transition("fresh_task", :running)
+      stale = TaskRegistry.stale_running(5_000)
+      refute "fresh_task" in stale
+    end
+  end
 
-# Test it (sin supervisor):
-# ContadorSupervisado.start_link()
-# ContadorSupervisado.incrementar()
-# ContadorSupervisado.incrementar()
-# ContadorSupervisado.get()     # => 2
-```
+  describe "stats/0" do
+    test "counts tasks by status" do
+      TaskRegistry.register("s1")
+      TaskRegistry.register("s2")
+      TaskRegistry.register("s3")
+      TaskRegistry.transition("s1", :running)
+      TaskRegistry.transition("s2", :done)
 
-### Try It Yourself
-Construye un carrito de compras usando Agent. El carrito debe soportar:
-
-- `start/0` — inicia el carrito vacío
-- `agregar_item/3` — agrega `{nombre, precio, cantidad}` al carrito
-- `quitar_item/2` — elimina un item por nombre
-- `actualizar_cantidad/3` — cambia la cantidad de un item existente
-- `get_total/1` — calcula el total (`precio * cantidad` para cada item)
-- `listar_items/1` — lista todos los items actuales
-- `vaciar/1` — elimina todos los items
-
-El estado interno puede ser un mapa `%{nombre => {precio, cantidad}}`.
-
-```elixir
-defmodule CarritoCompras do
-  # Tu implementación aquí
-
-  # Debería comportarse así:
-  # {:ok, carrito} = CarritoCompras.start()
-  # CarritoCompras.agregar_item(carrito, "manzana", 0.50, 4)
-  # CarritoCompras.agregar_item(carrito, "pan", 1.20, 2)
-  # CarritoCompras.listar_items(carrito)
-  # # => %{"manzana" => {0.50, 4}, "pan" => {1.20, 2}}
-  # CarritoCompras.get_total(carrito)    # => 4.40
-  # CarritoCompras.actualizar_cantidad(carrito, "manzana", 2)
-  # CarritoCompras.get_total(carrito)    # => 3.40
-  # CarritoCompras.quitar_item(carrito, "pan")
-  # CarritoCompras.get_total(carrito)    # => 1.00
+      stats = TaskRegistry.stats()
+      assert stats.pending == 1
+      assert stats.running == 1
+      assert stats.done == 1
+      assert stats.failed == 0
+    end
+  end
 end
 ```
 
-## Common Mistakes
+### Step 3: Run the tests
 
-### Mistake 1: Hacer lógica compleja dentro del agent
-```elixir
-# ❌ Si la función tarda mucho, bloquea a todos los que esperan acceso al agent
-Agent.update(agent, fn estado ->
-  resultado = hacer_peticion_http(estado.url)   # ¡Bloquea el agent!
-  %{estado | cache: resultado}
-end)
-
-# ✓ Computar fuera del agent, solo pasar el resultado
-resultado = hacer_peticion_http(url)
-Agent.update(agent, fn estado -> %{estado | cache: resultado} end)
-```
-
-### Mistake 2: Confundir get con get_and_update para operaciones atómicas
-```elixir
-# ❌ NO atómico — otro proceso puede modificar el estado entre get y update
-valor = Agent.get(agent, & &1)
-Agent.update(agent, fn _ -> valor + 1 end)
-
-# ✓ Atómico — todo ocurre en una sola operación
-Agent.get_and_update(agent, fn estado -> {estado, estado + 1} end)
-# o simplemente:
-Agent.update(agent, &(&1 + 1))
-```
-
-### Mistake 3: No usar nombres en agents de larga vida
-```elixir
-# ❌ Si el agent se reinicia, el PID cambia y la referencia queda inválida
-{:ok, pid} = Agent.start_link(fn -> 0 end)
-# ... más tarde, si el agent cayó y fue reiniciado ...
-Agent.get(pid, & &1)   # ** (exit) no process
-
-# ✓ Usar nombre para que el Supervisor pueda reiniciarlo y sea encontrable
-Agent.start_link(fn -> 0 end, name: MiAgent)
-Agent.get(MiAgent, & &1)   # Funciona aunque se haya reiniciado
-```
-
-### Mistake 4: Olvidar que Agent.stop/1 es síncrono
-```elixir
-# Agent.stop/1 espera a que el proceso termine antes de retornar
-# Si el agent está procesando algo, stop espera a que termine
-Agent.stop(agent)   # Seguro — el estado final se preserva hasta aquí
-```
-
-## Verification
 ```bash
-$ iex
-iex> ContadorAgent.start()
-{:ok, #PID<0.115.0>}
-iex> ContadorAgent.incrementar()
-:ok
-iex> ContadorAgent.incrementar()
-:ok
-iex> ContadorAgent.get()
-2
-iex> ContadorAgent.reset()
-:ok
-iex> ContadorAgent.get()
-0
-iex> ContadorAgent.stop()
-:ok
+mix test test/task_queue/task_registry_test.exs --trace
 ```
 
-Checklist de verificación:
-- [ ] `Agent.start_link` con estado inicial funciona correctamente
-- [ ] `Agent.get` retorna el estado sin modificarlo
-- [ ] `Agent.update` modifica el estado y retorna `:ok`
-- [ ] `Agent.get_and_update` es atómico — lee y escribe en una sola operación
-- [ ] El stack agent hace pop atómico correctamente
-- [ ] El config agent soporta todas las operaciones CRUD
-- [ ] `start_link/1` tiene la firma correcta para ser usado por un Supervisor
-- [ ] `child_spec/1` retorna el mapa correcto
+---
 
-## Summary
-- `Agent` es una abstracción sobre procesos para gestionar estado mutable de forma segura
-- El estado vive en un proceso propio — no hay condiciones de carrera sin locks explícitos
-- `get/2` lee, `update/2` escribe, `get_and_update/2` hace ambas operaciones atómicamente
-- Para usar con Supervisores, implementar `start_link/1` con firma estándar y `child_spec/1`
-- Mantener las funciones pasadas al agent simples y rápidas — bloquean el acceso de otros procesos
-- Registrar agents con nombre cuando deben sobrevivir reinicios bajo un Supervisor
+## Trade-off analysis
 
-## What's Next
-**03-task-y-concurrencia**: Aprende a usar `Task` para ejecutar trabajo en paralelo y recolectar resultados de forma asíncrona, ideal para I/O concurrente y procesamiento en batch.
+| Aspect | Agent (this exercise) | GenServer | ETS (exercise 13) |
+|--------|----------------------|-----------|--------------------|
+| Boilerplate | Minimal | Medium | Low (no process overhead) |
+| Concurrent reads | Serialized through Agent process | Serialized through GenServer | True parallel reads |
+| Atomicity | Single get_and_update is atomic | Full control in callbacks | ets:update_counter is atomic; multi-op is not |
+| Observability | :sys.get_state/1 | :sys.get_state/1 | :ets.tab2list/1 |
+| Supervised restart | Yes — name survives restart | Yes | Table destroyed on owner crash |
+| Code complexity | Low — just pass functions | Higher — explicit message handling | Low but raw Erlang API |
+
+Reflection question: `stale_running/1` scans all tasks on every call. In a system with
+50,000 active tasks, this is O(n) on each scheduler tick. What data structure change to
+the Agent state would make this O(1), and what is the tradeoff?
+
+---
+
+## Common production mistakes
+
+**1. Doing I/O inside Agent callbacks**
+The function passed to `Agent.get/update/get_and_update` executes inside the Agent process.
+A slow HTTP call there blocks every other caller for the duration. Compute outside the Agent,
+then update with the result.
+
+**2. Non-atomic read-then-update pattern**
+```elixir
+# WRONG — another process can modify state between get and update
+status = Agent.get(__MODULE__, fn s -> s[task_id].status end)
+if status == :pending, do: Agent.update(__MODULE__, fn s -> ... end)
+
+# CORRECT — get_and_update is a single atomic operation
+Agent.get_and_update(__MODULE__, fn state ->
+  case Map.get(state, task_id) do
+    %{status: :pending} = e -> {:ok, Map.put(state, task_id, %{e | status: :running})}
+    nil -> {{:error, :not_found}, state}
+  end
+end)
+```
+
+**3. Using Agent when reads vastly outnumber writes at high concurrency**
+At 10,000 req/s with 90% reads, the Agent process becomes the bottleneck. Every read goes
+through the process mailbox. This is the correct migration path to ETS (exercise 13).
+
+**4. Forgetting that `start_link` must have the standard signature**
+Supervisors call `start_link(init_arg)` with exactly one argument. If your `start_link`
+expects zero arguments, the Supervisor cannot start your Agent.
+
+---
 
 ## Resources
+
 - [Agent — HexDocs](https://hexdocs.pm/elixir/Agent.html)
-- [Agent.get/2 — HexDocs](https://hexdocs.pm/elixir/Agent.html#get/3)
-- [Agent.get_and_update/2 — HexDocs](https://hexdocs.pm/elixir/Agent.html#get_and_update/3)
+- [Agent.get_and_update/3 — HexDocs](https://hexdocs.pm/elixir/Agent.html#get_and_update/3)
 - [Mix and OTP: Agent](https://elixir-lang.org/getting-started/mix-otp/agent.html)
+- [Erlang in Anger — Fred Hebert](https://www.erlang-in-anger.com/) — chapter on process bottlenecks (free PDF)

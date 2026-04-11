@@ -1,663 +1,396 @@
-# 08. Protocols
+# Protocols: Type-Based Polymorphism
 
-**Difficulty**: Intermedio
-
----
-
-## Prerequisites
-
-- Módulos y structs en Elixir
-- Pattern matching básico
-- Comprensión de polimorfismo
-- Ejercicio 07: Behaviours y Callbacks
+**Project**: `task_queue` — built incrementally across the intermediate level
 
 ---
 
-## Learning Objectives
+## Project context
 
-1. Definir un protocol con `defprotocol` y entender su contrato
-2. Implementar un protocol con `defimpl` para tipos nativos y structs propios
-3. Comprender el mecanismo de dispatch dinámico basado en tipo
-4. Usar `@fallback_to_any true` para implementaciones por defecto
-5. Distinguir cuándo usar protocols vs behaviours
-6. Implementar protocols para múltiples tipos sin modificar el código fuente original
+The task_queue system now routes jobs through pluggable handlers (exercise 07). The next
+need is **serialization**: job results, errors, and queue stats must be exported to a
+monitoring dashboard, a log file, and an HTTP API. Each destination expects a different
+format, and the data types involved are diverse — job maps, error tuples, handler results,
+and runtime stats.
 
----
+Protocols are the right mechanism: they let you add serialization behaviour to existing
+types without modifying them. This is how the standard library's `Inspect`, `Enumerable`,
+and `String.Chars` protocols work.
 
-## Concepts
+Project structure at this point:
 
-### ¿Qué es un Protocol?
-
-Un protocol define un conjunto de funciones que pueden ser implementadas por distintos tipos. A diferencia de los behaviours (que son para módulos que siguen un contrato), los protocols permiten el **polimorfismo ad-hoc**: añadir comportamiento a tipos existentes sin modificarlos.
-
-```elixir
-# Definición del protocol
-defprotocol Serializable do
-  @doc "Serializa el valor a una cadena JSON"
-  def to_json(value)
-end
-
-# Implementación para Integer
-defimpl Serializable, for: Integer do
-  def to_json(value), do: Integer.to_string(value)
-end
-
-# Implementación para List
-defimpl Serializable, for: List do
-  def to_json(values) do
-    inner = values |> Enum.map(&Serializable.to_json/1) |> Enum.join(", ")
-    "[#{inner}]"
-  end
-end
-
-# Uso — el dispatch es automático por tipo
-Serializable.to_json(42)        # "42"
-Serializable.to_json([1, 2])    # "[1, 2]"
 ```
-
-### defprotocol
-
-```elixir
-defprotocol MiProtocol do
-  # Las funciones aquí son el contrato. No tienen cuerpo.
-  @doc "Documentación de la función"
-  def funcion_requerida(value)
-
-  # Puedes declarar múltiples funciones
-  def otra_funcion(value, opts \\ [])
-end
-```
-
-### defimpl
-
-```elixir
-defimpl MiProtocol, for: MiStruct do
-  def funcion_requerida(%MiStruct{campo: v}), do: v
-  def otra_funcion(value, _opts), do: value
-end
-
-# Tipos nativos disponibles: Integer, Float, String, Atom,
-# List, Map, Tuple, Function, PID, Port, Reference, BitString, Any
-```
-
-### @fallback_to_any
-
-Cuando ninguna implementación específica existe para un tipo, Elixir lanza `Protocol.UndefinedError`. Con `@fallback_to_any true`, el protocol cae a la implementación de `Any`:
-
-```elixir
-defprotocol Describible do
-  @fallback_to_any true
-  def describe(value)
-end
-
-defimpl Describible, for: Any do
-  def describe(value), do: "Valor desconocido: #{inspect(value)}"
-end
-
-defimpl Describible, for: Integer do
-  def describe(n), do: "Entero: #{n}"
-end
-
-Describible.describe(42)        # "Entero: 42"
-Describible.describe(:ok)       # "Valor desconocido: :ok"
-Describible.describe(%{a: 1})   # "Valor desconocido: %{a: 1}"
-```
-
-### Implementar para Structs propios
-
-Las structs pertenecen al módulo que las define. Puedes implementar un protocol en el mismo módulo o en un `defimpl` separado:
-
-```elixir
-defmodule Usuario do
-  defstruct [:nombre, :email, :edad]
-end
-
-defimpl Serializable, for: Usuario do
-  def to_json(%Usuario{nombre: n, email: e, edad: edad}) do
-    ~s({"nombre": "#{n}", "email": "#{e}", "edad": #{edad}})
-  end
-end
-
-usuario = %Usuario{nombre: "Ana", email: "ana@example.com", edad: 30}
-Serializable.to_json(usuario)
-# {"nombre": "Ana", "email": "ana@example.com", "edad": 30}
-```
-
-### Dispatch automático
-
-El protocolo selecciona la implementación correcta en runtime basándose en el tipo del primer argumento:
-
-```elixir
-def procesar(valor) do
-  # No importa el tipo — el protocol lo resuelve
-  Serializable.to_json(valor)
-end
-
-procesar(1)           # delega a Integer
-procesar("hola")      # delega a BitString
-procesar([1, 2, 3])   # delega a List
-```
-
-### Protocols vs Behaviours
-
-| | Protocol | Behaviour |
-|---|---|---|
-| Propósito | Polimorfismo por tipo de datos | Contrato para módulos |
-| Extensibilidad | Cualquiera puede añadir implementaciones | Solo el módulo que usa `@behaviour` |
-| Dispatch | Dinámico, por tipo del primer argumento | Estático, por módulo |
-| Caso de uso | `Enum`, `String.Chars`, `Inspect` | `GenServer`, `Supervisor`, plugins |
-
----
-
-## Exercises
-
-### Exercise 1: Serializable Protocol (JSON)
-
-Implementa el protocol `Serializable` que convierte distintos tipos de datos a su representación JSON.
-
-```elixir
-# Archivo: lib/serializable.ex
-
-defprotocol Serializable do
-  @doc """
-  Convierte un valor a su representación JSON como string.
-  """
-  def to_json(value)
-end
-
-# --- Implementaciones para tipos nativos ---
-
-defimpl Serializable, for: Integer do
-  # TODO: Devolver el entero como string
-  # Pista: Integer.to_string/1
-  def to_json(value) do
-  end
-end
-
-defimpl Serializable, for: Float do
-  # TODO: Devolver el float como string
-  # Pista: Float.to_string/1
-  def to_json(value) do
-  end
-end
-
-defimpl Serializable, for: BitString do
-  # TODO: Envolver el string en comillas dobles
-  # Ej: "hola" -> ~s("hola")
-  def to_json(value) do
-  end
-end
-
-defimpl Serializable, for: Atom do
-  # TODO: nil -> "null", true/false -> "true"/"false"
-  # Otros atoms -> string con comillas: :ok -> ~s("ok")
-  def to_json(value) do
-  end
-end
-
-defimpl Serializable, for: List do
-  # TODO: Serializar cada elemento y unir con comas entre corchetes
-  # Ej: [1, "a", true] -> "[1, \"a\", true]"
-  # Pista: Enum.map + Enum.join + Serializable.to_json/1 (recursivo)
-  def to_json(values) do
-  end
-end
-
-defimpl Serializable, for: Map do
-  # TODO: Serializar el mapa como objeto JSON
-  # Ej: %{nombre: "Ana", edad: 30} -> {"nombre": "Ana", "edad": 30}
-  # Pista: Enum.map_join sobre Map.to_list/1
-  # Las claves atom se convierten a string sin comillas externas primero
-  def to_json(map) do
-  end
-end
-
-# --- Struct de dominio ---
-
-defmodule Producto do
-  defstruct [:id, :nombre, :precio, :disponible]
-end
-
-defimpl Serializable, for: Producto do
-  # TODO: Serializar el struct como JSON con todos sus campos
-  # Ej: %Producto{id: 1, nombre: "Silla", precio: 99.9, disponible: true}
-  #     -> {"id": 1, "nombre": "Silla", "precio": 99.9, "disponible": true}
-  def to_json(%Producto{id: id, nombre: n, precio: p, disponible: d}) do
-  end
-end
-```
-
-**Verificación esperada:**
-
-```elixir
-# En iex:
-Serializable.to_json(42)            # "42"
-Serializable.to_json(3.14)          # "3.14"
-Serializable.to_json("hola")        # "\"hola\""
-Serializable.to_json(nil)           # "null"
-Serializable.to_json(true)          # "true"
-Serializable.to_json([1, "x"])      # "[1, \"x\"]"
-Serializable.to_json(%{a: 1})       # "{\"a\": 1}"
-
-p = %Producto{id: 1, nombre: "Silla", precio: 99.9, disponible: true}
-Serializable.to_json(p)
-# {"id": 1, "nombre": "Silla", "precio": 99.9, "disponible": true}
+task_queue/
+├── lib/
+│   └── task_queue/
+│       ├── serializable.ex          # ← the protocol (you implement this)
+│       ├── exportable.ex            # ← second protocol (you implement this)
+│       └── types/
+│           ├── job_result.ex        # ← struct + protocol impls (you implement this)
+│           └── queue_stats.ex       # ← struct + protocol impls (you implement this)
+├── test/
+│   └── task_queue/
+│       └── protocols_test.exs       # given tests — must pass without modification
+└── mix.exs
 ```
 
 ---
 
-### Exercise 2: Printable Protocol con colores ANSI
+## Why protocols and not behaviours here
 
-Implementa el protocol `Printable` que genera representaciones visuales con colores ANSI para la terminal.
+The previous exercise used behaviours because you were plugging in entire strategy modules.
+Protocols solve a different problem: you have **existing data types** (maps, tuples, structs
+defined in other modules) and you want to add the same operation to all of them without
+modifying their source code.
 
-```elixir
-# Archivo: lib/printable.ex
+The key difference:
 
-defmodule ANSI do
-  # Códigos de escape ANSI básicos
-  def reset, do: "\e[0m"
-  def red(text),     do: "\e[31m#{text}\e[0m"
-  def green(text),   do: "\e[32m#{text}\e[0m"
-  def yellow(text),  do: "\e[33m#{text}\e[0m"
-  def blue(text),    do: "\e[34m#{text}\e[0m"
-  def cyan(text),    do: "\e[36m#{text}\e[0m"
-  def bold(text),    do: "\e[1m#{text}\e[0m"
-end
+- Behaviour dispatch: `handler_module.execute(job, ctx)` — you choose the module explicitly.
+- Protocol dispatch: `Serializable.to_map(value)` — Elixir chooses the implementation
+  automatically based on the runtime type of `value`.
 
-defprotocol Printable do
-  @fallback_to_any true
-
-  @doc """
-  Devuelve una representación visual coloreada del valor.
-  """
-  def pretty(value)
-
-  @doc """
-  Imprime el valor en stdout con un salto de línea.
-  """
-  def print(value)
-end
-
-defimpl Printable, for: Any do
-  # Implementación por defecto — usa inspect con color gris
-  def pretty(value), do: "\e[90m#{inspect(value)}\e[0m"
-  def print(value),  do: IO.puts(Printable.pretty(value))
-end
-
-defimpl Printable, for: Integer do
-  # TODO: Mostrar enteros en color azul
-  # Ej: pretty(42) -> ANSI.blue("42")
-  def pretty(value) do
-  end
-
-  def print(value), do: IO.puts(pretty(value))
-end
-
-defimpl Printable, for: Float do
-  # TODO: Mostrar floats en color cyan
-  def pretty(value) do
-  end
-
-  def print(value), do: IO.puts(pretty(value))
-end
-
-defimpl Printable, for: BitString do
-  # TODO: Mostrar strings en color verde, con comillas incluidas
-  # Ej: pretty("hola") -> ANSI.green("\"hola\"")
-  def pretty(value) do
-  end
-
-  def print(value), do: IO.puts(pretty(value))
-end
-
-defimpl Printable, for: Atom do
-  # TODO: nil -> rojo, true/false -> amarillo, otros -> cyan con ":"
-  # Ej: pretty(nil) -> ANSI.red("nil")
-  #     pretty(:ok)  -> ANSI.cyan(":ok")
-  def pretty(value) do
-  end
-
-  def print(value), do: IO.puts(pretty(value))
-end
-
-defimpl Printable, for: List do
-  # TODO: Mostrar lista con cada elemento pretty-printeado, separados por ", "
-  # y rodeados de "[" y "]" en negrita
-  # Ej: pretty([1, "a"]) -> "[#{ANSI.blue("1")}, #{ANSI.green("\"a\"")}]"
-  def pretty(values) do
-  end
-
-  def print(value), do: IO.puts(pretty(value))
-end
-
-# --- Struct propio ---
-
-defmodule Alerta do
-  defstruct [:tipo, :mensaje, :timestamp]
-  # tipo: :error | :warning | :info
-end
-
-defimpl Printable, for: Alerta do
-  # TODO: Mostrar según tipo:
-  # :error   -> rojo con "[ERROR]"
-  # :warning -> amarillo con "[WARN]"
-  # :info    -> azul con "[INFO]"
-  # Formato: "[TIPO] mensaje (timestamp)"
-  def pretty(%Alerta{tipo: tipo, mensaje: msg, timestamp: ts}) do
-  end
-
-  def print(value), do: IO.puts(pretty(value))
-end
-```
-
-**Verificación esperada:**
-
-```elixir
-# En iex — los colores se ven en terminal real
-Printable.print(42)
-Printable.print(3.14)
-Printable.print("hola")
-Printable.print(nil)
-Printable.print(true)
-Printable.print(:ok)
-Printable.print([1, "x", nil])
-
-alerta = %Alerta{tipo: :error, mensaje: "Fallo de conexión", timestamp: "2026-04-10"}
-Printable.print(alerta)
-# [ERROR] Fallo de conexión (2026-04-10)  <- en rojo
-
-# Fallback para tipos sin implementación:
-Printable.print({:tuple, :value})  # usa Any -> gris
-```
+If your team adds a new result type six months from now, they implement the protocol in
+their module without touching yours. Open/closed principle via language mechanics.
 
 ---
 
-### Exercise 3: Comparable Protocol con Ordering
+## The business problem
 
-Implementa el protocol `Comparable` que permite ordenar y comparar distintos tipos de datos con semántica personalizada.
+Two protocols:
+
+1. `TaskQueue.Serializable` — converts a value to a plain map suitable for JSON encoding.
+   Needed by the HTTP API export.
+
+2. `TaskQueue.Exportable` — converts a value to a human-readable log line string.
+   Needed by the log file export.
+
+Both protocols must work for:
+- `TaskQueue.Types.JobResult` — a struct holding `{:ok, value} | {:error, reason}` and
+  metadata.
+- `TaskQueue.Types.QueueStats` — a struct with queue depth, throughput, and error counts.
+- Native Elixir types: maps, lists, tuples (used in job payloads).
+
+---
+
+## Implementation
+
+### Step 1: `lib/task_queue/serializable.ex`
 
 ```elixir
-# Archivo: lib/comparable.ex
-
-defprotocol Comparable do
-  @doc """
-  Compara dos valores del mismo tipo.
-  Devuelve: :lt (menor), :eq (igual), :gt (mayor)
-  """
-  def compare(a, b)
-
-  @doc """
-  Devuelve true si a < b
-  """
-  def less_than?(a, b)
-
-  @doc """
-  Devuelve true si a > b
-  """
-  def greater_than?(a, b)
-end
-
-# Módulo helper para implementaciones repetitivas
-defmodule Comparable.Helpers do
-  # TODO: Implementar less_than?/2 usando compare/2
-  # Pista: Comparable.compare(a, b) == :lt
-  def less_than?(a, b) do
-  end
-
-  # TODO: Implementar greater_than?/2 usando compare/2
-  def greater_than?(a, b) do
-  end
-end
-
-defimpl Comparable, for: Integer do
-  # TODO: Comparar dos enteros
-  # Pista: usar cond o guards para devolver :lt | :eq | :gt
-  def compare(a, b) do
-  end
-
-  def less_than?(a, b),    do: Comparable.Helpers.less_than?(a, b)
-  def greater_than?(a, b), do: Comparable.Helpers.greater_than?(a, b)
-end
-
-defimpl Comparable, for: Float do
-  # TODO: Comparar dos floats (misma lógica que Integer)
-  def compare(a, b) do
-  end
-
-  def less_than?(a, b),    do: Comparable.Helpers.less_than?(a, b)
-  def greater_than?(a, b), do: Comparable.Helpers.greater_than?(a, b)
-end
-
-defimpl Comparable, for: BitString do
-  # TODO: Comparar strings alfabéticamente
-  # Pista: String.compare/2 o simplemente < > ==
-  def compare(a, b) do
-  end
-
-  def less_than?(a, b),    do: Comparable.Helpers.less_than?(a, b)
-  def greater_than?(a, b), do: Comparable.Helpers.greater_than?(a, b)
-end
-
-# --- Structs de dominio con semántica de ordenación propia ---
-
-defmodule Temperatura do
+defprotocol TaskQueue.Serializable do
   @moduledoc """
-  Temperatura en cualquier unidad. La comparación normaliza a Celsius.
+  Converts a value to a plain map for JSON serialization.
+  All keys must be strings. Nested values must also be serializable.
   """
-  defstruct [:valor, :unidad]  # unidad: :celsius | :fahrenheit | :kelvin
 
-  def to_celsius(%Temperatura{valor: v, unidad: :celsius}),    do: v
-  def to_celsius(%Temperatura{valor: v, unidad: :fahrenheit}), do: (v - 32) * 5 / 9
-  def to_celsius(%Temperatura{valor: v, unidad: :kelvin}),     do: v - 273.15
-end
-
-defimpl Comparable, for: Temperatura do
-  # TODO: Comparar temperaturas normalizando a Celsius primero
-  # Pista: Temperatura.to_celsius/1
-  def compare(a, b) do
-  end
-
-  def less_than?(a, b),    do: Comparable.Helpers.less_than?(a, b)
-  def greater_than?(a, b), do: Comparable.Helpers.greater_than?(a, b)
-end
-
-defmodule Version do
-  @moduledoc """
-  Versión semántica simplificada: major.minor.patch
-  """
-  defstruct [:major, :minor, :patch]
-
-  def parse(str) do
-    [major, minor, patch] = str |> String.split(".") |> Enum.map(&String.to_integer/1)
-    %Version{major: major, minor: minor, patch: patch}
-  end
-end
-
-defimpl Comparable, for: Version do
-  # TODO: Comparar versiones: primero major, luego minor, luego patch
-  # Si major es distinto, ese determina el resultado
-  # Pista: puedes usar múltiples cond o pattern matching en tuplas
-  def compare(%Version{} = a, %Version{} = b) do
-  end
-
-  def less_than?(a, b),    do: Comparable.Helpers.less_than?(a, b)
-  def greater_than?(a, b), do: Comparable.Helpers.greater_than?(a, b)
-end
-
-# --- Función de ordenación genérica ---
-
-defmodule Sorter do
-  @doc """
-  Ordena una lista de elementos Comparable usando merge sort.
-  """
-  # TODO: Implementar sort/1 usando Enum.sort/2 con Comparable.less_than?/2
-  # Pista: Enum.sort(lista, fn a, b -> Comparable.less_than?(a, b) end)
-  def sort(lista) do
-  end
-
-  @doc """
-  Devuelve el mínimo de una lista.
-  """
-  # TODO: Usar Enum.min_by/2 con Comparable.compare
-  def min(lista) do
-  end
-
-  @doc """
-  Devuelve el máximo de una lista.
-  """
-  # TODO: Usar Enum.max_by/2 con Comparable.compare
-  def max(lista) do
-  end
-end
-```
-
-**Verificación esperada:**
-
-```elixir
-# Enteros
-Comparable.compare(1, 2)   # :lt
-Comparable.compare(2, 2)   # :eq
-Comparable.compare(3, 1)   # :gt
-
-# Strings
-Comparable.compare("a", "b")   # :lt
-Comparable.compare("z", "a")   # :gt
-
-# Temperaturas — comparación por valor físico real
-t1 = %Temperatura{valor: 100, unidad: :celsius}     # 100°C
-t2 = %Temperatura{valor: 212, unidad: :fahrenheit}  # también 100°C
-t3 = %Temperatura{valor: 373.15, unidad: :kelvin}   # también 100°C
-Comparable.compare(t1, t2)   # :eq
-Comparable.compare(t1, t3)   # :eq
-
-# Versiones
-v1 = Version.parse("1.2.3")
-v2 = Version.parse("1.10.0")
-v3 = Version.parse("2.0.0")
-Comparable.compare(v1, v2)   # :lt  (minor: 2 < 10)
-Comparable.compare(v2, v3)   # :lt  (major: 1 < 2)
-Comparable.compare(v3, v3)   # :eq
-
-# Ordenación genérica
-versiones = [v3, v1, v2]
-Sorter.sort(versiones)
-# [%Version{major: 1, minor: 2, patch: 3},
-#  %Version{major: 1, minor: 10, patch: 0},
-#  %Version{major: 2, minor: 0, patch: 0}]
-```
-
----
-
-## Common Mistakes
-
-### 1. Confundir Protocol con Behaviour
-
-```elixir
-# MAL — usar @behaviour cuando quieres polimorfismo por tipo
-defmodule MiModulo do
-  @behaviour Serializable  # No funciona así
-end
-
-# BIEN — usar defimpl para extender un protocol a un tipo
-defimpl Serializable, for: MiStruct do
-  def to_json(%MiStruct{} = s), do: ...
-end
-```
-
-### 2. Olvidar @fallback_to_any
-
-```elixir
-# MAL — el protocol falla en runtime para tipos no implementados
-defprotocol MiProtocol do
-  def hacer(value)
-end
-
-MiProtocol.hacer(:some_atom)  # ** (Protocol.UndefinedError)
-
-# BIEN — con fallback
-defprotocol MiProtocol do
   @fallback_to_any true
-  def hacer(value)
+
+  @doc "Returns a map with string keys suitable for JSON.encode!/1."
+  @spec to_map(t()) :: map()
+  def to_map(value)
 end
 
-defimpl MiProtocol, for: Any do
-  def hacer(value), do: {:error, "Tipo no soportado: #{inspect(value)}"}
+# Fallback: unknown types become an opaque string representation
+defimpl TaskQueue.Serializable, for: Any do
+  def to_map(value), do: %{"__opaque__" => inspect(value)}
 end
-```
 
-### 3. Pattern matching incompleto en defimpl
-
-```elixir
-# MAL — no desempaqueta el struct, usa el valor entero directamente
-defimpl Serializable, for: Producto do
-  def to_json(p) do
-    # Acceder a p.nombre funciona pero es menos idiomático
-    ~s({"nombre": "#{p.nombre}"})
+defimpl TaskQueue.Serializable, for: Map do
+  def to_map(map) do
+    # HINT: Enum.into(map, %{}, fn {k, v} -> {to_string(k), TaskQueue.Serializable.to_map(v)} end)
+    # This recursively serializes nested values via the protocol
+    # TODO: implement
   end
 end
 
-# BIEN — desempaquetar en la cabeza de función
-defimpl Serializable, for: Producto do
-  def to_json(%Producto{nombre: n, precio: p}) do
-    ~s({"nombre": "#{n}", "precio": #{p}})
+defimpl TaskQueue.Serializable, for: List do
+  def to_map(list) do
+    # HINT: wrap the list: %{"items" => Enum.map(list, &TaskQueue.Serializable.to_map/1)}
+    # TODO: implement
+  end
+end
+
+defimpl TaskQueue.Serializable, for: Tuple do
+  def to_map(tuple) do
+    # HINT: %{"tuple" => tuple |> Tuple.to_list() |> Enum.map(&TaskQueue.Serializable.to_map/1)}
+    # TODO: implement
+  end
+end
+
+defimpl TaskQueue.Serializable, for: Integer do
+  # Integers are already JSON-safe — return as-is wrapped in a consistent envelope
+  def to_map(n), do: %{"value" => n, "type" => "integer"}
+end
+
+defimpl TaskQueue.Serializable, for: Atom do
+  def to_map(nil), do: %{"value" => nil}
+  def to_map(bool) when is_boolean(bool), do: %{"value" => bool}
+  def to_map(atom), do: %{"value" => Atom.to_string(atom), "type" => "atom"}
+end
+```
+
+### Step 2: `lib/task_queue/exportable.ex`
+
+```elixir
+defprotocol TaskQueue.Exportable do
+  @moduledoc """
+  Converts a value to a single-line string for log export.
+  The format is structured: [TYPE] key=value key=value
+  """
+
+  @fallback_to_any true
+
+  @doc "Returns a log-formatted string."
+  @spec to_log_line(t()) :: String.t()
+  def to_log_line(value)
+end
+
+defimpl TaskQueue.Exportable, for: Any do
+  def to_log_line(value), do: "[UNKNOWN] value=#{inspect(value)}"
+end
+```
+
+### Step 3: `lib/task_queue/types/job_result.ex`
+
+```elixir
+defmodule TaskQueue.Types.JobResult do
+  @moduledoc "Struct representing the outcome of a single job execution attempt."
+
+  @enforce_keys [:job_id, :outcome, :duration_ms, :attempts]
+  defstruct [:job_id, :outcome, :duration_ms, :attempts, :value, :error]
+
+  # outcome: :ok | :error
+
+  @doc "Creates a successful result."
+  def ok(job_id, value, duration_ms, attempts) do
+    %__MODULE__{job_id: job_id, outcome: :ok, duration_ms: duration_ms,
+                attempts: attempts, value: value, error: nil}
+  end
+
+  @doc "Creates a failed result."
+  def error(job_id, reason, duration_ms, attempts) do
+    %__MODULE__{job_id: job_id, outcome: :error, duration_ms: duration_ms,
+                attempts: attempts, value: nil, error: reason}
+  end
+end
+
+defimpl TaskQueue.Serializable, for: TaskQueue.Types.JobResult do
+  alias TaskQueue.Types.JobResult
+
+  def to_map(%JobResult{} = r) do
+    # HINT: build a string-keyed map with all fields
+    # For :ok outcome, include "value" key
+    # For :error outcome, include "error" key as inspect(r.error)
+    # TODO: implement
+  end
+end
+
+defimpl TaskQueue.Exportable, for: TaskQueue.Types.JobResult do
+  alias TaskQueue.Types.JobResult
+
+  def to_log_line(%JobResult{outcome: :ok} = r) do
+    # Format: [JOB_OK] job_id=xxx duration_ms=123 attempts=1
+    # HINT: "[JOB_OK] job_id=#{r.job_id} duration_ms=#{r.duration_ms} attempts=#{r.attempts}"
+    # TODO: implement
+  end
+
+  def to_log_line(%JobResult{outcome: :error} = r) do
+    # Format: [JOB_ERROR] job_id=xxx error="reason" duration_ms=123 attempts=3
+    # TODO: implement
   end
 end
 ```
 
-### 4. Implementar para Map cuando se quiere Struct
+### Step 4: `lib/task_queue/types/queue_stats.ex`
 
 ```elixir
-# MAL — los structs NO son Map a efectos de protocols
-defimpl MiProtocol, for: Map do
-  def hacer(%MiStruct{} = s), do: ...  # Nunca se llama para MiStruct
+defmodule TaskQueue.Types.QueueStats do
+  @moduledoc "Point-in-time snapshot of queue metrics."
+
+  defstruct [
+    :snapshot_at,
+    :queue_depth,
+    :jobs_processed_total,
+    :jobs_failed_total,
+    :avg_duration_ms
+  ]
 end
 
-# BIEN — implementar explícitamente para el struct
-defimpl MiProtocol, for: MiStruct do
-  def hacer(%MiStruct{} = s), do: ...
+defimpl TaskQueue.Serializable, for: TaskQueue.Types.QueueStats do
+  alias TaskQueue.Types.QueueStats
+
+  def to_map(%QueueStats{} = s) do
+    # HINT: all fields, string keys, snapshot_at as Unix ms integer
+    # TODO: implement
+  end
+end
+
+defimpl TaskQueue.Exportable, for: TaskQueue.Types.QueueStats do
+  alias TaskQueue.Types.QueueStats
+
+  def to_log_line(%QueueStats{} = s) do
+    # Format: [QUEUE_STATS] depth=5 processed=100 failed=2 avg_ms=45
+    # TODO: implement
+  end
 end
 ```
 
----
+### Step 5: Given tests — must pass without modification
 
-## Verification
+```elixir
+# test/task_queue/protocols_test.exs
+defmodule TaskQueue.ProtocolsTest do
+  use ExUnit.Case, async: true
+
+  alias TaskQueue.Serializable
+  alias TaskQueue.Exportable
+  alias TaskQueue.Types.{JobResult, QueueStats}
+
+  describe "Serializable — native types" do
+    test "Map with atom keys produces string keys" do
+      result = Serializable.to_map(%{job_id: "j1", status: :ok})
+      assert Map.has_key?(result, "job_id")
+      assert Map.has_key?(result, "status")
+    end
+
+    test "List wraps items under 'items' key" do
+      result = Serializable.to_map([1, 2, 3])
+      assert %{"items" => [_ | _]} = result
+    end
+
+    test "Tuple wraps elements under 'tuple' key" do
+      result = Serializable.to_map({:ok, 42})
+      assert %{"tuple" => [_, _]} = result
+    end
+
+    test "nil atom serializes to nil value" do
+      assert %{"value" => nil} = Serializable.to_map(nil)
+    end
+
+    test "fallback Any wraps opaque value" do
+      result = Serializable.to_map(make_ref())
+      assert Map.has_key?(result, "__opaque__")
+    end
+  end
+
+  describe "Serializable — JobResult" do
+    test "ok result includes outcome and value" do
+      r = JobResult.ok("j1", :done, 123, 1)
+      m = Serializable.to_map(r)
+      assert m["job_id"] == "j1"
+      assert m["outcome"] == "ok"
+      assert Map.has_key?(m, "value")
+    end
+
+    test "error result includes outcome and error" do
+      r = JobResult.error("j2", :timeout, 5_000, 3)
+      m = Serializable.to_map(r)
+      assert m["outcome"] == "error"
+      assert Map.has_key?(m, "error")
+      assert m["attempts"] == 3
+    end
+  end
+
+  describe "Exportable — JobResult" do
+    test "ok result log line contains [JOB_OK] and job_id" do
+      r = JobResult.ok("j3", :result, 50, 1)
+      line = Exportable.to_log_line(r)
+      assert String.contains?(line, "[JOB_OK]")
+      assert String.contains?(line, "j3")
+    end
+
+    test "error result log line contains [JOB_ERROR] and error info" do
+      r = JobResult.error("j4", :network_error, 3_000, 2)
+      line = Exportable.to_log_line(r)
+      assert String.contains?(line, "[JOB_ERROR]")
+      assert String.contains?(line, "j4")
+    end
+  end
+
+  describe "Exportable — QueueStats" do
+    test "stats log line contains [QUEUE_STATS] and depth" do
+      stats = %QueueStats{
+        snapshot_at: System.os_time(:millisecond),
+        queue_depth: 7,
+        jobs_processed_total: 200,
+        jobs_failed_total: 5,
+        avg_duration_ms: 88
+      }
+
+      line = Exportable.to_log_line(stats)
+      assert String.contains?(line, "[QUEUE_STATS]")
+      assert String.contains?(line, "depth=7")
+    end
+  end
+
+  describe "Protocol dispatch" do
+    test "same function dispatches correctly across multiple types" do
+      values = [
+        %{key: "val"},
+        [1, 2],
+        {:ok, :done},
+        JobResult.ok("jx", :x, 1, 1)
+      ]
+
+      # All must return a map without raising
+      for v <- values do
+        result = Serializable.to_map(v)
+        assert is_map(result)
+      end
+    end
+  end
+end
+```
+
+### Step 6: Run the tests
 
 ```bash
-# Compilar el proyecto
-mix compile
-
-# Ejecutar tests
-mix test
-
-# Explorar en consola interactiva
-iex -S mix
-```
-
-```elixir
-# Smoke test rápido en iex:
-Serializable.to_json(42)
-Serializable.to_json([1, 2, 3])
-Serializable.to_json(%{a: 1, b: true})
-
-Printable.print(42)
-Printable.print(%Alerta{tipo: :error, mensaje: "Test", timestamp: "now"})
-
-Comparable.compare(Version.parse("1.0.0"), Version.parse("2.0.0"))
+mix test test/task_queue/protocols_test.exs --trace
 ```
 
 ---
 
-## Summary
+## Trade-off analysis
 
-Los protocols en Elixir son el mecanismo de polimorfismo más potente del lenguaje: permiten extender el comportamiento de cualquier tipo — incluyendo tipos nativos y de librerías externas — sin modificar su código fuente. La clave está en el dispatch dinámico que selecciona la implementación correcta según el tipo del primer argumento en runtime. El uso de `@fallback_to_any true` proporciona un comportamiento por defecto seguro para tipos no contemplados, evitando errores inesperados en producción.
+| Aspect | Protocol | Behaviour | Plain function with `cond/case` |
+|--------|----------|-----------|--------------------------------|
+| Open to extension | Yes — add `defimpl` anywhere | No — need to modify the dispatcher | No — modify the function |
+| Dispatch | Runtime, by type | Explicit module argument | Explicit type check at call site |
+| Performance | Compiled dispatch table — very fast | Direct module call — fast | Pattern match — fast |
+| `@fallback_to_any` | Yes — safe default for unknown types | N/A | Explicit `_` clause |
+| When to use | Adding capabilities to data types | Pluggable module strategies | Small, stable type sets |
 
-## What's Next
+Reflection question: the `Serializable` implementation for `List` wraps the list in
+`%{"items" => [...]}` to produce a valid map. But if the consumer expects a JSON array,
+not an object, this design is wrong. What protocol function signature change would let
+the implementation return a list directly, and what would break?
 
-**09. Pattern Matching Avanzado** — guards con `when`, el operador pin `^`, y nested matching en estructuras complejas.
+---
+
+## Common production mistakes
+
+**1. Implementing for `Map` when you want a struct**
+Structs are not `Map` from a protocol's perspective. A `defimpl Serializable, for: Map`
+clause is never called for `%JobResult{}`. Implement for the struct module explicitly.
+
+**2. Forgetting `@fallback_to_any` and hitting Protocol.UndefinedError in production**
+Without a fallback, any new data type that reaches your protocol causes a runtime crash.
+Add `@fallback_to_any true` with a safe `for: Any` implementation so new types fail
+gracefully and observably.
+
+**3. Infinite recursion in recursive protocol implementations**
+If `Serializable.to_map` for `Map` calls itself on values without a base case for
+non-map types, you will stackoverflow on deeply nested structures. Ensure every branch
+eventually reaches a concrete implementation.
+
+**4. Implementing protocols for `Any` that swallow type errors silently**
+A `for: Any` fallback that returns `%{}` for unknown types can hide bugs. Log or tag
+the opaque representation so unknown types are discoverable in monitoring.
+
+---
 
 ## Resources
 
-- [Elixir Docs — Protocols](https://hexdocs.pm/elixir/Protocol.html)
-- [Protocol Guide](https://elixir-lang.org/getting-started/protocols.html)
-- [Enumerable Protocol](https://hexdocs.pm/elixir/Enumerable.html)
-- [String.Chars Protocol](https://hexdocs.pm/elixir/String.Chars.html)
+- [Protocol — HexDocs](https://hexdocs.pm/elixir/Protocol.html)
+- [Elixir Getting Started: Protocols](https://elixir-lang.org/getting-started/protocols.html)
+- [Enumerable Protocol source](https://github.com/elixir-lang/elixir/blob/main/lib/elixir/lib/enumerable.ex) — study how the standard library uses protocols
+- [Inspect Protocol](https://hexdocs.pm/elixir/Inspect.html) — the protocol you call every time you use `IO.inspect`

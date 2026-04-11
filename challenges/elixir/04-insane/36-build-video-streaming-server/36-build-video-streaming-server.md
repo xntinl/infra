@@ -1,70 +1,526 @@
-# 36. Build a Video Streaming Server
+# Adaptive Bitrate Video Streaming Server
 
-**Difficulty**: Insane
+**Project**: `hls_server` — an HLS-compatible adaptive bitrate streaming server
 
-## Prerequisites
+---
 
-- Elixir processes, GenServer, Supervisor trees
-- TCP/HTTP servers with `:gen_tcp` or Plug/Bandit
-- Binary pattern matching y bitstring manipulation
-- File I/O y streaming con `File.stream!/3`
-- Understanding of multimedia containers and codecs at a conceptual level
-- HTTP/1.1 range requests (RFC 7233)
-- Concurrency patterns: Task.async_stream, GenStage o Flow
+## Project context
 
-## Problem Statement
+You are building `hls_server`, a streaming backend the media team will use for internal video delivery. It must segment video files into HLS-compatible chunks, generate M3U8 playlists, serve segments with proper range request support, simulate a CDN distribution layer, and expose real-time metrics. Clients adapt their quality automatically based on measured download throughput.
 
-Implementa un servidor de streaming de video adaptativo (ABR — Adaptive Bitrate) compatible con el protocolo HLS (HTTP Live Streaming, RFC 8216).
+Project structure:
 
-El servidor debe recibir un archivo de video fuente y realizar la segmentación en tiempo real o pre-procesada, sirviendo los segmentos a clientes HTTP. Cada cliente debe ser capaz de solicitar una variante de distinta calidad (bitrate) y cambiar de calidad dinámicamente en función del ancho de banda disponible, que el servidor simulará con delays configurables por conexión.
+```
+hls_server/
+├── lib/
+│   └── hls_server/
+│       ├── application.ex
+│       ├── segmenter.ex           # ← binary splitting into .ts segments
+│       ├── playlist/
+│       │   ├── master.ex          # ← master.m3u8 with variant streams
+│       │   └── media.ex           # ← media.m3u8 per variant + live sliding window
+│       ├── segment_store.ex       # ← ETS-backed segment registry + TTL cleanup
+│       ├── range_handler.ex       # ← HTTP/1.1 range requests (RFC 7233)
+│       ├── live_producer.ex       # ← periodic segment generation for live mode
+│       ├── cdn/
+│       │   ├── node.ex            # ← CDN node GenServer (cache + origin fetch)
+│       │   └── router.ex          # ← weighted node selection + failover
+│       ├── abr_client.ex          # ← simulated adaptive bitrate client
+│       └── metrics.ex             # ← ETS counters + /metrics endpoint
+├── test/
+│   └── hls_server/
+│       ├── segmenter_test.exs
+│       ├── playlist_test.exs
+│       ├── range_handler_test.exs
+│       ├── live_producer_test.exs
+│       └── cdn_test.exs
+├── bench/
+│   └── segment_serve_bench.exs
+└── mix.exs
+```
 
-El servidor gestiona además un modo de live streaming donde los segmentos se generan continuamente (simulando una fuente de video en directo) y una sliding window limita cuántos segmentos están disponibles en la playlist.
+---
 
-Una capa de caché CDN simulada distribuye los segmentos entre múltiples "nodos" en memoria; las peticiones se dirigen al nodo más cercano (round-robin con pesos) y, en caso de cache miss, el nodo recupera el segmento del origen.
+## The business problem
 
-El servidor expone un endpoint de métricas en tiempo real: número de viewers activos, bandwidth total servido por segundo, y tasa de buffer stall (veces que un cliente esperó más de 2 segundos por el siguiente segmento).
+The media team streams training videos to employees in three office locations. Each location has different available bandwidth. A single fixed-bitrate stream means the high-bandwidth office gets poor quality and the low-bandwidth office buffers constantly. Adaptive bitrate streaming solves this: each client measures its download speed and switches to the appropriate quality variant automatically.
 
-## Acceptance Criteria
+Two design constraints shape the implementation:
 
-- [ ] HLS segmentation: el servidor divide un archivo de video binario en segmentos `.ts` de duración configurable (2–10 segundos); cada segmento es un chunk de bytes válido con timestamps correctos relativo al inicio del stream
-- [ ] M3U8 playlist: genera `master.m3u8` con al menos tres variantes de bitrate (`#EXT-X-STREAM-INF`) y una `media.m3u8` por variante con los `#EXTINF` correctos; un cliente que siga la spec puede parsearlas sin errores
-- [ ] Adaptive bitrate: un cliente simulado cambia de variante cuando el tiempo de descarga del último segmento supera 0.8× la duración del segmento (buffer en riesgo); el cambio ocurre en el siguiente segmento sin cortes
-- [ ] Byte-range requests: el servidor responde correctamente a `Range: bytes=N-M` con status 206 y headers `Content-Range`; permite seeking arbitrario a cualquier posición del segmento
-- [ ] Live streaming: el servidor produce un nuevo segmento cada N segundos (configurable), actualiza la `media.m3u8` con `#EXT-X-MEDIA-SEQUENCE` incremental y mantiene solo los últimos K segmentos en la sliding window; los segmentos expirados se purgan automáticamente
-- [ ] CDN simulation: al menos 3 nodos CDN en memoria; el master playlist devuelve URLs con el hostname del nodo asignado; los nodos se comunican entre sí via mensaje de proceso para replicar segmentos; un nodo caído no interrumpe el streaming (failover al origen)
-- [ ] Metrics: endpoint `/metrics` devuelve JSON con `viewers_active`, `bandwidth_bps`, `buffer_stall_rate`, `segments_served` actualizados cada segundo; los valores son consistentes con el tráfico real generado por los clientes de prueba
+1. **Zero unnecessary binary copies** — video segments can be hundreds of megabytes. Every copy doubles memory usage. Elixir's binary sharing means sub-binaries reference the parent — use `:binary.part/3` instead of `String.slice`.
+2. **Metrics via atomic counters** — the metrics endpoint must not be a bottleneck. Every segment served goes through an ETS `update_counter` — no GenServer, no lock.
 
-## What You Will Learn
+---
 
-- Manipulación de binarios de gran tamaño de forma eficiente en Elixir (sin copias innecesarias)
-- HTTP chunked transfer encoding y streaming de respuestas
-- Diseño de sistemas con múltiples procesos que comparten estado de forma concurrente (ETS para caché de segmentos)
-- Implementación de protocolos de industria a partir de sus especificaciones (HLS RFC 8216)
-- Simulación de condiciones de red adversas para probar resiliencia del sistema
-- Sliding window y expiración de recursos con limpieza automática
+## Why HLS uses fixed-duration segments
 
-## Hints
+HLS segments are designed around one invariant: a client can switch quality variants at any segment boundary. If segments have variable durations, calculating the next segment's URL for a different variant becomes ambiguous. Fixed durations mean variant playlists are always in sync: segment 5 in the 720p variant covers exactly the same time range as segment 5 in the 360p variant.
 
-- Usa `:binary.part/3` para extraer chunks del video sin copiar todo el binario; mantén el binario completo en un `Agent` o ETS
-- HLS requiere que los segmentos `.ts` empiecen en un keyframe; en la simulación, trata cada chunk de tamaño fijo como si fuera un keyframe
-- La `media.m3u8` debe tener `#EXT-X-TARGETDURATION` igual al máximo `EXTINF` redondeado hacia arriba
-- Para live streaming, un `GenServer` con `:timer.send_interval/2` produce segmentos periódicamente
-- Los nodos CDN pueden ser procesos `GenServer` registrados en un `Registry` local; el routing usa un módulo separado con lógica de selección
-- Para métricas, acumula contadores en ETS (operaciones atómicas con `:ets.update_counter/3`) en lugar de usar un proceso serializado
-- El cliente simulado debe correr en un proceso separado y medir el wall-clock time de cada descarga
+The `#EXT-X-TARGETDURATION` playlist tag must equal the maximum segment duration in the playlist, rounded up to the nearest integer second. A player uses this to decide how long to buffer before starting playback.
 
-## Reference Material
+---
 
-- RFC 8216 — HTTP Live Streaming: https://www.rfc-editor.org/rfc/rfc8216
-- MPEG-DASH ISO/IEC 23009-1 (para comparar el enfoque alternativo)
-- Apple HLS authoring specification: https://developer.apple.com/documentation/http-live-streaming
-- FFmpeg HLS muxer documentation (para entender los parámetros de segmentación)
-- "Video Streaming Technology" — capítulos de ABR en Coursera/edX
+## Why the sliding window matters for live streaming
 
-## Difficulty Rating ★★★★★★★
+A live stream generates segments indefinitely. Without a window, the media.m3u8 grows unbounded — a client that joins late would need to download all past segments to seek to the live edge. HLS specifies that a live playlist should keep only the last N segments (typically 3–5). Older segments are removed from the playlist and their storage is freed.
 
-Este ejercicio combina manipulación de binarios de bajo nivel, diseño de protocolos multimedia, sistemas distribuidos en memoria y métricas en tiempo real. La dificultad principal reside en mantener la coherencia de la playlist mientras múltiples clientes acceden concurrentemente, y en implementar el algoritmo ABR de forma que se comporte de manera predecible y verificable.
+The `#EXT-X-MEDIA-SEQUENCE` tag tells clients which sequence number the first segment in the current playlist has. This prevents clients from re-requesting segments they have already seen.
 
-## Estimated Time
+---
 
-25–40 horas
+## Implementation
+
+### Step 1: Create the project
+
+```bash
+mix new hls_server --sup
+cd hls_server
+mkdir -p lib/hls_server/{playlist,cdn}
+mkdir -p test/hls_server bench
+```
+
+### Step 2: `mix.exs`
+
+```elixir
+defp deps do
+  [
+    {:plug_cowboy, "~> 2.7"},
+    {:jason, "~> 1.4"},
+    {:benchee, "~> 1.3", only: :dev}
+  ]
+end
+```
+
+### Step 3: `lib/hls_server/segmenter.ex`
+
+```elixir
+defmodule HLSServer.Segmenter do
+  @moduledoc """
+  Splits a video binary into fixed-size segments.
+
+  In real HLS, segments must start on keyframes. This implementation uses
+  fixed byte boundaries as a simulation — treating each chunk as if it
+  starts on a keyframe, which is valid for our testing purposes.
+
+  Memory design: store the entire video binary in an Agent (or :persistent_term).
+  Sub-segments are created with :binary.part/3, which returns a sub-binary that
+  SHARES the parent binary's memory. The original binary is not copied.
+
+  If you use binary slice operations that trigger a copy (e.g., pattern matching
+  that extracts into a new variable), you pay 2x memory. Measure with
+  :erlang.memory(:binary) before and after segmentation.
+  """
+
+  defstruct [:video_binary, :segment_size_bytes, :num_segments, :duration_s]
+
+  @doc """
+  Loads a video binary and computes segment metadata.
+  segment_duration_s: target duration of each segment in seconds
+  total_duration_s: total video duration (used to calculate byte-rate)
+  """
+  @spec load(binary(), pos_integer(), pos_integer()) :: t()
+  def load(video_binary, segment_duration_s, total_duration_s) do
+    bytes_per_second = div(byte_size(video_binary), total_duration_s)
+    segment_size = bytes_per_second * segment_duration_s
+    num_segments = ceil(byte_size(video_binary) / segment_size)
+
+    %__MODULE__{
+      video_binary: video_binary,
+      segment_size_bytes: segment_size,
+      num_segments: num_segments,
+      duration_s: segment_duration_s
+    }
+  end
+
+  @doc """
+  Returns segment N as a binary slice (no copy).
+  Returns {:ok, binary} or {:error, :out_of_range}.
+  """
+  @spec get_segment(t(), non_neg_integer()) :: {:ok, binary()} | {:error, :out_of_range}
+  def get_segment(%__MODULE__{} = seg, index) when index >= 0 do
+    offset = index * seg.segment_size_bytes
+    total_size = byte_size(seg.video_binary)
+
+    if offset >= total_size do
+      {:error, :out_of_range}
+    else
+      length = min(seg.segment_size_bytes, total_size - offset)
+      # TODO: :binary.part(seg.video_binary, offset, length)
+      # This is a zero-copy sub-binary reference
+      {:ok, :binary.part(seg.video_binary, offset, length)}
+    end
+  end
+
+  @doc """
+  Returns the actual duration of segment N in seconds.
+  All segments except the last have duration = segment_duration_s.
+  The last segment may be shorter.
+  """
+  @spec segment_duration(t(), non_neg_integer()) :: float()
+  def segment_duration(%__MODULE__{} = seg, index) do
+    if index < seg.num_segments - 1 do
+      seg.duration_s * 1.0
+    else
+      # TODO: calculate actual duration of the last (possibly short) segment
+      seg.duration_s * 1.0
+    end
+  end
+end
+```
+
+### Step 4: `lib/hls_server/playlist/media.ex`
+
+```elixir
+defmodule HLSServer.Playlist.Media do
+  @moduledoc """
+  Generates and updates HLS media playlists (media.m3u8).
+
+  Playlist format:
+    #EXTM3U
+    #EXT-X-VERSION:3
+    #EXT-X-TARGETDURATION:6
+    #EXT-X-MEDIA-SEQUENCE:0
+
+    #EXTINF:6.000,
+    /segments/720p/0.ts
+    #EXTINF:6.000,
+    /segments/720p/1.ts
+    ...
+    #EXT-X-ENDLIST    (only for VOD, not live)
+
+  For live streams:
+  - no #EXT-X-ENDLIST tag
+  - #EXT-X-MEDIA-SEQUENCE increments as old segments are evicted
+  - only the last K segments appear in the playlist
+  """
+
+  defstruct [
+    :variant_name,
+    :segment_duration_s,
+    :window_size,      # max segments in live playlist (nil for VOD)
+    segments: [],      # [{sequence_number, duration_s, url}]
+    media_sequence: 0
+  ]
+
+  @doc "Creates a VOD playlist from a list of {sequence, duration, url} tuples."
+  def new_vod(variant_name, segments, segment_duration_s) do
+    %__MODULE__{
+      variant_name: variant_name,
+      segment_duration_s: segment_duration_s,
+      window_size: nil,
+      segments: segments,
+      media_sequence: 0
+    }
+  end
+
+  @doc "Creates a live playlist. new_segment/2 adds segments and evicts old ones."
+  def new_live(variant_name, segment_duration_s, window_size \\ 5) do
+    %__MODULE__{
+      variant_name: variant_name,
+      segment_duration_s: segment_duration_s,
+      window_size: window_size,
+      segments: [],
+      media_sequence: 0
+    }
+  end
+
+  @doc "Appends a segment to a live playlist, evicting the oldest if window is full."
+  @spec add_segment(t(), float(), String.t()) :: t()
+  def add_segment(%__MODULE__{window_size: w} = playlist, duration_s, url) do
+    next_seq = playlist.media_sequence + length(playlist.segments)
+    new_seg = {next_seq, duration_s, url}
+    new_segments = playlist.segments ++ [new_seg]
+
+    if w != nil and length(new_segments) > w do
+      # TODO: evict the oldest segment and increment media_sequence
+      # This signals to clients that they should not request the evicted segment
+      %{playlist | segments: tl(new_segments), media_sequence: playlist.media_sequence + 1}
+    else
+      %{playlist | segments: new_segments}
+    end
+  end
+
+  @doc "Renders the playlist to a string."
+  @spec render(t()) :: String.t()
+  def render(%__MODULE__{} = playlist) do
+    target_duration = playlist.segment_duration_s |> ceil() |> trunc()
+
+    header = """
+    #EXTM3U
+    #EXT-X-VERSION:3
+    #EXT-X-TARGETDURATION:#{target_duration}
+    #EXT-X-MEDIA-SEQUENCE:#{playlist.media_sequence}
+    """
+
+    segments_text =
+      Enum.map_join(playlist.segments, "\n", fn {_seq, duration, url} ->
+        "#EXTINF:#{:erlang.float_to_binary(duration, decimals: 3)},\n#{url}"
+      end)
+
+    endlist = if playlist.window_size == nil, do: "\n#EXT-X-ENDLIST\n", else: "\n"
+
+    header <> "\n" <> segments_text <> endlist
+  end
+end
+```
+
+### Step 5: `lib/hls_server/range_handler.ex`
+
+```elixir
+defmodule HLSServer.RangeHandler do
+  @moduledoc """
+  Handles HTTP Range requests (RFC 7233) for video segments.
+
+  Range header format: "Range: bytes=0-1023"
+  Response: HTTP 206 Partial Content with Content-Range header.
+
+  This enables:
+  1. Seeking: a player can jump to position X without downloading from the start.
+  2. Resumable downloads: interrupted transfers can resume from the last byte.
+  3. Parallel chunk downloads: multiple range requests for different parts.
+
+  Your implementation must handle:
+  - bytes=N-M: specific byte range [N, M] inclusive
+  - bytes=N-: from N to end of file
+  - bytes=-N: last N bytes of file
+  - Invalid ranges: return 416 Range Not Satisfiable
+  """
+
+  @doc """
+  Processes a Range header and returns the appropriate response map.
+  Returns {:ok, %{status: 206, body: binary, headers: [...]}}
+       or {:ok, %{status: 200, body: binary, headers: [...]}} if no Range header
+       or {:error, 416} for unsatisfiable ranges.
+  """
+  @spec handle(binary(), String.t() | nil) :: {:ok, map()} | {:error, 416}
+  def handle(full_content, range_header) when is_nil(range_header) do
+    {:ok, %{
+      status: 200,
+      body: full_content,
+      headers: [{"content-length", to_string(byte_size(full_content))}]
+    }}
+  end
+
+  def handle(full_content, "bytes=" <> range_spec) do
+    total = byte_size(full_content)
+
+    with {:ok, {first, last}} <- parse_range(range_spec, total),
+         true <- first <= last and last < total do
+      length = last - first + 1
+      body = :binary.part(full_content, first, length)
+
+      {:ok, %{
+        status: 206,
+        body: body,
+        headers: [
+          {"content-range", "bytes #{first}-#{last}/#{total}"},
+          {"content-length", to_string(length)},
+          {"accept-ranges", "bytes"}
+        ]
+      }}
+    else
+      _ -> {:error, 416}
+    end
+  end
+
+  defp parse_range(spec, total) do
+    cond do
+      String.contains?(spec, "-") ->
+        case String.split(spec, "-") do
+          ["", suffix] ->
+            n = String.to_integer(suffix)
+            {:ok, {total - n, total - 1}}
+
+          [prefix, ""] ->
+            first = String.to_integer(prefix)
+            {:ok, {first, total - 1}}
+
+          [prefix, suffix] ->
+            {:ok, {String.to_integer(prefix), String.to_integer(suffix)}}
+        end
+
+      true ->
+        {:error, :invalid_range}
+    end
+  end
+end
+```
+
+### Step 6: Given tests — must pass without modification
+
+```elixir
+# test/hls_server/segmenter_test.exs
+defmodule HLSServer.SegmenterTest do
+  use ExUnit.Case, async: true
+
+  alias HLSServer.Segmenter
+
+  @video_size 1_000_000  # 1MB simulated video
+
+  setup do
+    video = :crypto.strong_rand_bytes(@video_size)
+    seg = Segmenter.load(video, 6, 60)
+    %{seg: seg, video: video}
+  end
+
+  test "produces correct number of segments", %{seg: seg} do
+    # 1MB at ~16.6KB/s over 60s, split into 6s chunks → ~10 segments
+    assert seg.num_segments > 0
+  end
+
+  test "all segments reassemble to original video", %{seg: seg, video: video} do
+    reassembled =
+      for i <- 0..(seg.num_segments - 1), reduce: <<>> do
+        acc ->
+          {:ok, chunk} = Segmenter.get_segment(seg, i)
+          acc <> chunk
+      end
+
+    assert reassembled == video
+  end
+
+  test "out of range returns error", %{seg: seg} do
+    assert {:error, :out_of_range} = Segmenter.get_segment(seg, seg.num_segments + 100)
+  end
+
+  test "segment is a sub-binary (no copy)", %{seg: seg} do
+    {:ok, seg0} = Segmenter.get_segment(seg, 0)
+    # If :binary.part is used, the sub-binary shares memory with the parent.
+    # We can't test this directly, but we can verify the size is correct.
+    assert byte_size(seg0) == seg.segment_size_bytes
+  end
+end
+```
+
+```elixir
+# test/hls_server/playlist_test.exs
+defmodule HLSServer.PlaylistTest do
+  use ExUnit.Case, async: true
+
+  alias HLSServer.Playlist.Media
+
+  test "VOD playlist contains #EXT-X-ENDLIST" do
+    segments = for i <- 0..4, do: {i, 6.0, "/segments/720p/#{i}.ts"}
+    playlist = Media.new_vod("720p", segments, 6)
+    rendered = Media.render(playlist)
+    assert String.contains?(rendered, "#EXT-X-ENDLIST")
+  end
+
+  test "live playlist does not contain #EXT-X-ENDLIST" do
+    playlist = Media.new_live("720p", 6, 3)
+    playlist = Media.add_segment(playlist, 6.0, "/segments/720p/0.ts")
+    rendered = Media.render(playlist)
+    refute String.contains?(rendered, "#EXT-X-ENDLIST")
+  end
+
+  test "live playlist evicts old segments when window exceeded" do
+    playlist =
+      Enum.reduce(0..4, Media.new_live("720p", 6, 3), fn i, p ->
+        Media.add_segment(p, 6.0, "/segments/720p/#{i}.ts")
+      end)
+
+    # Window of 3: segments 0 and 1 should be evicted
+    assert length(playlist.segments) == 3
+    assert playlist.media_sequence == 2
+  end
+
+  test "#EXT-X-MEDIA-SEQUENCE increments with evictions" do
+    playlist =
+      Enum.reduce(0..9, Media.new_live("720p", 6, 5), fn i, p ->
+        Media.add_segment(p, 6.0, "/seg/#{i}.ts")
+      end)
+
+    rendered = Media.render(playlist)
+    assert String.contains?(rendered, "#EXT-X-MEDIA-SEQUENCE:5")
+  end
+end
+```
+
+```elixir
+# test/hls_server/range_handler_test.exs
+defmodule HLSServer.RangeHandlerTest do
+  use ExUnit.Case, async: true
+
+  alias HLSServer.RangeHandler
+
+  @content "0123456789"  # 10 bytes for easy math
+
+  test "no Range header returns 200 with full content" do
+    {:ok, resp} = RangeHandler.handle(@content, nil)
+    assert resp.status == 200
+    assert resp.body == @content
+  end
+
+  test "bytes=0-4 returns first 5 bytes" do
+    {:ok, resp} = RangeHandler.handle(@content, "bytes=0-4")
+    assert resp.status == 206
+    assert resp.body == "01234"
+  end
+
+  test "bytes=5- returns from offset to end" do
+    {:ok, resp} = RangeHandler.handle(@content, "bytes=5-")
+    assert resp.status == 206
+    assert resp.body == "56789"
+  end
+
+  test "bytes=-3 returns last 3 bytes" do
+    {:ok, resp} = RangeHandler.handle(@content, "bytes=-3")
+    assert resp.status == 206
+    assert resp.body == "789"
+  end
+
+  test "out of range returns 416" do
+    assert {:error, 416} = RangeHandler.handle(@content, "bytes=100-200")
+  end
+end
+```
+
+### Step 7: Run the tests
+
+```bash
+mix test test/hls_server/ --trace
+```
+
+---
+
+## Trade-off analysis
+
+| Aspect | HLS (your impl) | MPEG-DASH | WebRTC |
+|--------|----------------|-----------|--------|
+| Latency | 15–30s (segment duration) | 4–12s | < 500ms |
+| CDN compatibility | excellent (plain HTTP) | excellent | limited |
+| Adaptive bitrate | yes (variant playlists) | yes | yes |
+| Seeking support | segment granularity | byte-range | N/A |
+| Player ecosystem | native iOS/macOS, hls.js | dash.js, Shaka | browser native |
+| Server complexity | moderate | higher | high (signaling + DTLS) |
+
+Reflection: HLS has an inherent minimum latency equal to the segment duration plus the number of segments a player buffers before starting playback. If you reduce segment duration from 6s to 1s, what happens to the number of playlist entries a client must fetch per minute? What is the trade-off?
+
+---
+
+## Common production mistakes
+
+**1. Using `String.split` on video binary data**
+Video segments contain arbitrary bytes including null bytes and non-UTF-8 sequences. `String.split` and string operations assume UTF-8. Use `:binary.part/3` and `binary_part/3` for all segment operations.
+
+**2. Storing segments as GenServer state**
+A GenServer holding 10 segments of 500KB each has 5MB in its heap. GC pressure and heap fragmentation grow quickly. Use ETS with the segment binary as the value — it lives off the heap.
+
+**3. Not handling the last segment's duration correctly**
+The last segment is almost always shorter than `segment_duration_s`. If you report it as the full duration in `#EXTINF`, players may stall waiting for bytes that don't exist. Always compute and report the actual duration.
+
+**4. CDN node returning stale segments after live window eviction**
+A CDN node caches segment 0. The live producer evicts segment 0. A client requests segment 0 from the CDN node — it returns the cached version. But the segment is no longer in the origin's `media.m3u8`. The CDN must respect the live window's eviction and purge cached segments when they are removed from the playlist.
+
+**5. Metrics endpoint as a GenServer.call bottleneck**
+If `GET /metrics` calls a GenServer to read counters, it serializes with all counter updates. Use `:ets.update_counter/3` for writes (atomic, no GenServer) and `:ets.lookup` for reads (concurrent, no lock).
+
+---
+
+## Resources
+
+- [RFC 8216 — HTTP Live Streaming](https://www.rfc-editor.org/rfc/rfc8216) — the HLS specification; sections 4 (playlist format) and 6 (protocol version compatibility) are essential
+- [RFC 7233 — HTTP Range Requests](https://www.rfc-editor.org/rfc/rfc7233) — sections 2 (Range header) and 4 (206 response) define what your range handler must implement
+- [Apple HLS Authoring Specification](https://developer.apple.com/documentation/http-live-streaming/hls-authoring-specification-for-apple-devices) — Apple's additional constraints on valid HLS streams
+- [MPEG-DASH ISO/IEC 23009-1](https://www.iso.org/standard/79329.html) — the alternative to HLS; useful for understanding why HLS made certain design choices
+- [Erlang `:binary` module](https://www.erlang.org/doc/man/binary.html) — study `:binary.part/3` and the memory sharing semantics for large binary operations

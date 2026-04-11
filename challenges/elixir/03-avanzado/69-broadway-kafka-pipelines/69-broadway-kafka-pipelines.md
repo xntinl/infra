@@ -1,82 +1,113 @@
-# Ejercicio 69: Broadway + Kafka — Data Pipelines de Producción
+# Broadway + Kafka — Data Pipelines
 
-**Nivel**: Avanzado  
-**Tiempo estimado**: 90–120 min  
-**Módulo**: Concurrencia y procesamiento de mensajes  
+**Project**: `api_gateway` — built incrementally across the advanced level
 
 ---
 
-## Contexto
+## Project context
 
-Estás construyendo la capa de ingesta de eventos para una plataforma de analytics.
-El sistema recibe millones de eventos de usuario por día desde múltiples fuentes,
-los normaliza y los persiste en PostgreSQL para análisis posterior.
+You're building `api_gateway`. Every request that passes through the gateway is logged
+as a usage event: client ID, service name, method, status code, latency, timestamp.
+At peak traffic the gateway handles 50,000 req/min. Persisting each event
+synchronously in the request path is not an option — it would add 5–20ms to every
+response. Instead, the gateway publishes events to Kafka and a separate pipeline
+process consumes them, normalises them, and persists them to PostgreSQL.
 
-Broadway es el framework de Elixir para construir pipelines de procesamiento
-de mensajes concurrentes. Está diseñado para integrarse con sistemas de mensajería
-como Kafka, RabbitMQ o SQS y proporciona:
+Project structure:
 
-- Procesamiento concurrente con back-pressure automático
-- Batching configurable para operaciones bulk
-- Acking garantizado (at-least-once delivery)
-- Supervisión integrada con reinicio automático
-
----
-
-## Setup del Proyecto
-
-```bash
-mix new event_pipeline --sup
-cd event_pipeline
+```
+api_gateway/
+├── lib/
+│   └── api_gateway/
+│       ├── pipeline/
+│       │   ├── usage_pipeline.ex       # ← you implement this
+│       │   ├── event_normalizer.ex     # ← you implement this
+│       │   └── dlq_handler.ex          # ← you implement this
+│       ├── usage_events/
+│       │   └── usage_event.ex          # Ecto schema — given
+│       └── application.ex             # already exists — add pipeline to supervision tree
+├── test/
+│   └── api_gateway/
+│       └── pipeline/
+│           └── usage_pipeline_test.exs # given tests — must pass without modification
+└── mix.exs
 ```
 
-**`mix.exs`**:
+---
+
+## The business problem
+
+Three pipeline requirements from the analytics team:
+
+1. **Normalisation**: events arrive as raw JSON with inconsistent field names from
+   different gateway versions. The pipeline must translate them to a canonical schema
+   before inserting.
+2. **Deduplication**: Kafka provides at-least-once delivery. The same event can arrive
+   twice after a rebalance. Inserting duplicates corrupts usage metrics.
+3. **Dead letter queue**: malformed events (missing required fields, unparseable JSON)
+   must not block the pipeline. They must go to a separate topic for later inspection,
+   without losing the position of the well-formed events around them.
+
+---
+
+## Why Broadway and not a raw GenServer consuming Kafka
+
+A raw GenServer that calls `KafkaEx.stream/2` in a loop handles one message at a time
+and has no back-pressure. Under burst load, the GenServer mailbox fills faster than
+messages are processed. When the GenServer crashes, it restarts from an uncommitted
+offset — replaying messages already processed.
+
+Broadway addresses all three problems:
+
+1. **Concurrency with back-pressure**: `max_demand` controls how many messages
+   each processor requests from the producer. The producer stops delivering when
+   processors are saturated.
+2. **Batching**: `batchers` aggregate messages from multiple processors and call
+   `handle_batch/4` once per batch. A single `Repo.insert_all/2` for 100 events is
+   ~20x more efficient than 100 individual inserts.
+3. **Acknowledgement**: Broadway acks messages only after `handle_batch/4` returns.
+   If the process crashes, Kafka replays from the last committed offset.
+
+---
+
+## Why `handle_message/3` and `handle_batch/4` are separate
+
+`handle_message/3` runs per-message. It is stateless — it receives one raw message
+and returns it validated, normalised, and tagged with a batcher. No I/O should happen
+here unless absolutely necessary (a fast local ETS dedup check is acceptable).
+
+`handle_batch/4` runs per-batch. It is the right place for I/O: a single bulk insert,
+a single Kafka produce call to the DLQ, a single HTTP request to an enrichment service.
+Doing I/O in `handle_message/3` means one network round-trip per message instead of
+one per batch of 100 — a 100x throughput difference.
+
+---
+
+## Implementation
+
+### Step 1: `mix.exs` additions
+
 ```elixir
-defp deps do
-  [
-    {:broadway, "~> 1.0"},
-    {:broadway_kafka, "~> 0.4"},
-    {:jason, "~> 1.4"},
-    {:ecto_sql, "~> 3.11"},
-    {:postgrex, ">= 0.0.0"},
-    {:telemetry_metrics, "~> 1.0"},
-    {:telemetry_poller, "~> 1.0"}
-  ]
-end
+{:broadway, "~> 1.0"},
+{:broadway_kafka, "~> 0.4"},
+{:jason, "~> 1.4"}
 ```
 
----
+### Step 2: Ecto schema — `lib/api_gateway/usage_events/usage_event.ex`
 
-## Parte 1: Pipeline Básico de Ingesta de Eventos
-
-### Contexto del dominio
-
-Los eventos llegan como JSON con esta estructura:
-
-```json
-{
-  "event_id": "uuid-v4",
-  "user_id": 42,
-  "type": "page_view",
-  "properties": {"page": "/home", "referrer": "google.com"},
-  "occurred_at": "2026-04-10T12:00:00Z"
-}
-```
-
-### Schema Ecto
-
-**`lib/event_pipeline/events/event.ex`**:
 ```elixir
-defmodule EventPipeline.Events.Event do
+defmodule ApiGateway.UsageEvents.UsageEvent do
   use Ecto.Schema
 
   @primary_key {:id, :binary_id, autogenerate: true}
 
-  schema "events" do
-    field :event_id, :string
-    field :user_id, :integer
-    field :type, :string
-    field :properties, :map
+  schema "gateway_usage_events" do
+    field :event_id,    :string         # idempotency key from the producer
+    field :client_id,   :string
+    field :service,     :string
+    field :method,      :string
+    field :status_code, :integer
+    field :latency_ms,  :integer
     field :occurred_at, :utc_datetime_usec
     field :ingested_at, :utc_datetime_usec
 
@@ -85,50 +116,108 @@ defmodule EventPipeline.Events.Event do
 end
 ```
 
-### El Pipeline Broadway
+### Step 3: Event normalizer — `lib/api_gateway/pipeline/event_normalizer.ex`
 
-**`lib/event_pipeline/ingestion_pipeline.ex`**:
 ```elixir
-defmodule EventPipeline.IngestionPipeline do
+defmodule ApiGateway.Pipeline.EventNormalizer do
+  @moduledoc """
+  Parses raw Kafka message bytes into a canonical usage event map.
+
+  Gateway versions prior to 2.0 sent `client` instead of `client_id` and
+  `duration_ms` instead of `latency_ms`. This module normalises both schemas
+  into the canonical form expected by UsageEvent.
+
+  Returns {:ok, event_map} or {:error, reason}.
+  The returned map contains atom keys matching UsageEvent schema fields.
+  """
+
+  @required_fields ~w[event_id client_id service method status_code latency_ms occurred_at]
+
+  @doc """
+  Parses and normalises a raw binary event payload.
+  """
+  def normalise(raw) when is_binary(raw) do
+    with {:ok, data} <- Jason.decode(raw),
+         {:ok, canonical} <- to_canonical(data),
+         :ok <- validate_required(canonical) do
+      {:ok, canonical}
+    end
+  end
+
+  def normalise(_), do: {:error, :not_binary}
+
+  defp to_canonical(data) do
+    # TODO: build the canonical map by extracting fields.
+    # Handle legacy field names:
+    #   "client" → :client_id (if "client_id" is absent)
+    #   "duration_ms" → :latency_ms (if "latency_ms" is absent)
+    #   "ts" or "timestamp" → :occurred_at (if "occurred_at" is absent)
+    # Parse :occurred_at from ISO8601 string using DateTime.from_iso8601/1.
+    # Return {:ok, map_with_atom_keys} or {:error, {:parse_error, field, value}}.
+
+    {:ok, %{}}  # placeholder — replace with actual logic
+  end
+
+  defp validate_required(canonical) do
+    # TODO: check that all @required_fields keys are present in canonical
+    # and none of them are nil.
+    # Return :ok or {:error, {:missing_fields, [field_names]}}.
+    :ok
+  end
+end
+```
+
+### Step 4: Pipeline — `lib/api_gateway/pipeline/usage_pipeline.ex`
+
+```elixir
+defmodule ApiGateway.Pipeline.UsagePipeline do
+  @moduledoc """
+  Broadway pipeline that consumes usage events from Kafka and persists them
+  to PostgreSQL in bulk.
+
+  Flow:
+    Kafka → handle_message/3 (validate + normalise, per message)
+          → handle_batch/4 :db_insert (Repo.insert_all, per 100 messages)
+          → handle_batch/4 :dlq (log + publish to DLQ topic, per 50 failed)
+
+  Exactly-once semantics are approximated via:
+    1. on_conflict: :nothing in insert_all (dedup by event_id)
+    2. Kafka consumer group with manual ack (Broadway manages this)
+  """
+
   use Broadway
 
   alias Broadway.Message
-  alias EventPipeline.{Repo, Events.Event}
+  alias ApiGateway.{Repo, UsageEvents.UsageEvent}
+  alias ApiGateway.Pipeline.{EventNormalizer, DLQHandler}
 
   require Logger
 
   @kafka_hosts [{"kafka.internal", 9092}]
-  @topic "user-events"
-  @consumer_group "event-ingestion-v1"
+  @topic "gateway-usage-events"
+  @consumer_group "usage-pipeline-v1"
 
   def start_link(_opts) do
     Broadway.start_link(__MODULE__,
       name: __MODULE__,
       producer: [
-        module:
-          {BroadwayKafka.Producer,
-           hosts: @kafka_hosts,
-           group_id: @consumer_group,
-           topics: [@topic],
-           # Procesar al menos una partición por consumer
-           offset_reset_policy: :latest,
-           # Nunca procesar más de 10_000 mensajes pendientes
-           fetch_max_bytes: 10_240}
+        module: {BroadwayKafka.Producer,
+          hosts: @kafka_hosts,
+          group_id: @consumer_group,
+          topics: [@topic],
+          offset_reset_policy: :latest}
       ],
       processors: [
-        # 10 workers paralelos, cada uno procesa un mensaje a la vez
         default: [concurrency: 10, max_demand: 5]
       ],
       batchers: [
-        # Batcher para inserciones normales
         db_insert: [
-          concurrency: 5,
+          concurrency: 3,
           batch_size: 100,
           batch_timeout: 1_000
         ],
-        # Batcher para el Dead Letter Queue
         dlq: [
-          concurrency: 2,
+          concurrency: 1,
           batch_size: 50,
           batch_timeout: 500
         ]
@@ -136,29 +225,13 @@ defmodule EventPipeline.IngestionPipeline do
     )
   end
 
-  # --- Processors: un mensaje a la vez ---
-
   @impl true
   def handle_message(_processor, %Message{data: raw} = message, _context) do
-    case decode_and_validate(raw) do
-      {:ok, event} ->
-        message
-        |> Message.update_data(fn _ -> event end)
-        |> Message.put_batcher(:db_insert)
-
-      {:error, reason} ->
-        Logger.warning("Evento inválido descartado",
-          reason: inspect(reason),
-          raw: String.slice(raw, 0, 200)
-        )
-        # Mensaje fallido va al batcher DLQ
-        message
-        |> Message.failed(reason)
-        |> Message.put_batcher(:dlq)
-    end
+    # TODO: call EventNormalizer.normalise(raw)
+    # On {:ok, event}: update message data with event, put_batcher(:db_insert)
+    # On {:error, reason}: call Message.failed(message, reason), put_batcher(:dlq)
+    message
   end
-
-  # --- Batchers: lotes de mensajes ---
 
   @impl true
   def handle_batch(:db_insert, messages, _batch_info, _context) do
@@ -166,435 +239,232 @@ defmodule EventPipeline.IngestionPipeline do
 
     rows =
       Enum.map(messages, fn %Message{data: event} ->
+        # TODO: merge :ingested_at into the event map
         Map.put(event, :ingested_at, now)
       end)
 
-    case Repo.insert_all(Event, rows,
-           on_conflict: :nothing,
-           conflict_target: :event_id
-         ) do
-      {count, nil} ->
-        Logger.debug("Batch insertado", count: count)
-        messages
+    # TODO: call Repo.insert_all(UsageEvent, rows,
+    #   on_conflict: :nothing, conflict_target: :event_id)
+    # Log the count of inserted rows.
+    # Return messages unchanged (Broadway needs the original list back).
 
-      # insert_all/3 no devuelve {:error, _}, falla con excepción.
-      # El rescue en Broadway atrapa la excepción y marca los mensajes como fallidos.
-    end
+    messages
   end
 
   @impl true
   def handle_batch(:dlq, messages, _batch_info, _context) do
-    # Publicar al topic de DLQ para análisis posterior.
-    # En producción usarías un producer Kafka aquí.
-    Enum.each(messages, fn msg ->
-      Logger.error("Evento enviado a DLQ",
-        reason: inspect(msg.status),
-        data: inspect(msg.data)
-      )
-    end)
-
+    # TODO: call DLQHandler.handle/1 with the failed messages
+    # Return messages unchanged.
     messages
-  end
-
-  # --- Helpers privados ---
-
-  defp decode_and_validate(raw) when is_binary(raw) do
-    with {:ok, data} <- Jason.decode(raw),
-         {:ok, event} <- validate_event(data) do
-      {:ok, event}
-    end
-  end
-
-  defp validate_event(%{
-         "event_id" => event_id,
-         "user_id" => user_id,
-         "type" => type,
-         "occurred_at" => occurred_at
-       })
-       when is_binary(event_id) and is_integer(user_id) and is_binary(type) do
-    with {:ok, dt, _} <- DateTime.from_iso8601(occurred_at) do
-      {:ok,
-       %{
-         event_id: event_id,
-         user_id: user_id,
-         type: type,
-         properties: %{},
-         occurred_at: dt
-       }}
-    end
-  end
-
-  defp validate_event(data), do: {:error, {:invalid_schema, data}}
-end
-```
-
----
-
-## Parte 2: Dead Letter Queue con Reintentos
-
-Implementa un mecanismo donde los mensajes que fallan se reencolan
-con metadatos de reintento. Cuando superan 3 intentos, se publican
-definitivamente al topic `user-events-dlq`.
-
-**`lib/event_pipeline/dlq_handler.ex`**:
-```elixir
-defmodule EventPipeline.DLQHandler do
-  @moduledoc """
-  Gestiona mensajes fallidos: reintentos exponenciales y publicación a DLQ.
-
-  Estrategia: los mensajes fallidos llevan un header `x-retry-count`.
-  Si el contador es menor a @max_retries, se reencolan al topic original
-  con backoff. Si supera el límite, van al topic DLQ permanente.
-  """
-
-  @max_retries 3
-  @original_topic "user-events"
-  @dlq_topic "user-events-dlq"
-
-  alias KafkaEx.Protocol.Produce.Message, as: KafkaMessage
-
-  def handle_failed_messages(messages) do
-    {retry, dead} =
-      Enum.split_with(messages, fn msg ->
-        retry_count(msg) < @max_retries
-      end)
-
-    publish_retries(retry)
-    publish_dlq(dead)
-
-    # Broadway espera que devolvamos los mensajes tal cual
-    messages
-  end
-
-  defp retry_count(%Broadway.Message{metadata: %{headers: headers}}) do
-    case List.keyfind(headers, "x-retry-count", 0) do
-      {_, count} -> String.to_integer(count)
-      nil -> 0
-    end
-  end
-
-  defp retry_count(_), do: 0
-
-  defp publish_retries(messages) do
-    Enum.each(messages, fn msg ->
-      count = retry_count(msg)
-      backoff_ms = :timer.seconds(2 ** count)
-
-      # Reencolar con header actualizado después del backoff
-      Process.sleep(backoff_ms)
-
-      kafka_msg = %KafkaMessage{
-        key: nil,
-        value: Jason.encode!(msg.data),
-        headers: [{"x-retry-count", Integer.to_string(count + 1)}]
-      }
-
-      KafkaEx.produce(@original_topic, 0, kafka_msg)
-    end)
-  end
-
-  defp publish_dlq(messages) do
-    Enum.each(messages, fn msg ->
-      payload = %{
-        original_data: msg.data,
-        failed_at: DateTime.utc_now(),
-        reason: inspect(msg.status),
-        retry_count: retry_count(msg)
-      }
-
-      kafka_msg = %KafkaMessage{
-        key: nil,
-        value: Jason.encode!(payload)
-      }
-
-      KafkaEx.produce(@dlq_topic, 0, kafka_msg)
-    end)
   end
 end
 ```
 
----
+### Step 5: DLQ handler — `lib/api_gateway/pipeline/dlq_handler.ex`
 
-## Parte 3: Rate Limiting con Token Bucket en ETS
-
-Cuando el pipeline necesita llamar a una API externa durante el procesamiento
-(enriquecimiento de datos, geolocalización, etc.), debes limitar la tasa
-de requests para no saturar el servicio.
-
-**`lib/event_pipeline/rate_limiter.ex`**:
 ```elixir
-defmodule EventPipeline.RateLimiter do
+defmodule ApiGateway.Pipeline.DLQHandler do
   @moduledoc """
-  Token bucket usando ETS para rate limiting distribuido entre workers.
+  Handles failed usage events.
 
-  Cada llamada a `acquire/1` consume un token. Si no hay tokens disponibles,
-  bloquea hasta que el refill los reponga. Thread-safe gracias a `update_counter`
-  atómico de ETS.
+  In this implementation the DLQ handler logs each failure with structured
+  metadata and records a Telemetry event. In production, replace the Logger
+  call with a Kafka produce to the "gateway-usage-events-dlq" topic.
+
+  Idempotency: the DLQ handler does not attempt re-delivery. Each failed
+  message is logged once and discarded. The Kafka offset advances, so the
+  message will not be replayed unless the consumer group is reset.
   """
 
-  use GenServer
-
-  @table :rate_limiter_tokens
-  # Tokens disponibles por ventana de tiempo
-  @default_rate 100
-  @default_window_ms 1_000
-
-  def start_link(opts) do
-    rate = Keyword.get(opts, :rate, @default_rate)
-    window_ms = Keyword.get(opts, :window_ms, @default_window_ms)
-    GenServer.start_link(__MODULE__, {rate, window_ms}, name: __MODULE__)
-  end
+  require Logger
 
   @doc """
-  Adquiere un token o bloquea hasta que haya uno disponible.
-  Devuelve `:ok` cuando se puede proceder.
+  Processes a list of failed Broadway messages.
+  Returns the list unchanged (Broadway requires it).
   """
-  def acquire(timeout \\ 5_000) do
-    deadline = System.monotonic_time(:millisecond) + timeout
-    do_acquire(deadline)
-  end
+  def handle(messages) when is_list(messages) do
+    Enum.each(messages, fn msg ->
+      # TODO: extract the failure reason from msg.status
+      # msg.status is {:failed, reason} for messages that called Message.failed/2
+      # Log at :error level with fields: reason, raw_data (truncated to 200 chars)
+      # Emit :telemetry.execute([:api_gateway, :pipeline, :dlq], %{count: 1}, %{})
 
-  defp do_acquire(deadline) do
-    case try_consume_token() do
-      :ok ->
-        :ok
-
-      :empty ->
-        remaining = deadline - System.monotonic_time(:millisecond)
-
-        if remaining <= 0 do
-          {:error, :timeout}
-        else
-          # Esperar un tick pequeño antes de reintentar
-          Process.sleep(10)
-          do_acquire(deadline)
-        end
-    end
-  end
-
-  # Decremento atómico: si el valor ya es 0, no decrementa (guard en ETS)
-  defp try_consume_token do
-    case :ets.update_counter(@table, :tokens, {2, -1, 0, 0}) do
-      n when n >= 0 -> :ok
-      _ -> :empty
-    end
-  catch
-    :error, :badarg -> :empty
-  end
-
-  # --- GenServer callbacks ---
-
-  @impl true
-  def init({rate, window_ms}) do
-    :ets.new(@table, [:named_table, :public, :set, read_concurrency: true])
-    :ets.insert(@table, {:tokens, rate})
-
-    # Timer periódico para reponer tokens
-    {:ok, _ref} = :timer.send_interval(window_ms, :refill)
-
-    {:ok, %{rate: rate}}
-  end
-
-  @impl true
-  def handle_info(:refill, %{rate: rate} = state) do
-    :ets.insert(@table, {:tokens, rate})
-    {:noreply, state}
-  end
-end
-```
-
-**Uso del rate limiter en el pipeline**:
-```elixir
-def handle_message(_processor, message, _context) do
-  # Bloquea si se supera el límite antes de llamar a la API externa
-  :ok = EventPipeline.RateLimiter.acquire()
-
-  enriched = ExternalAPI.enrich(message.data)
-  Message.update_data(message, fn _ -> enriched end)
-end
-```
-
----
-
-## Parte 4: Telemetría y Observabilidad
-
-Broadway emite eventos de telemetría automáticamente. Adjunta handlers
-para métricas de producción.
-
-**`lib/event_pipeline/telemetry.ex`**:
-```elixir
-defmodule EventPipeline.Telemetry do
-  use Supervisor
-
-  import Telemetry.Metrics
-
-  def start_link(arg) do
-    Supervisor.start_link(__MODULE__, arg, name: __MODULE__)
-  end
-
-  @impl true
-  def init(_arg) do
-    children = [
-      {:telemetry_poller,
-       measurements: [
-         {EventPipeline.RateLimiter, :report_tokens, []}
-       ],
-       period: :timer.seconds(10)}
-    ]
-
-    :telemetry.attach_many(
-      "broadway-pipeline-metrics",
-      [
-        [:broadway, :processor, :message, :stop],
-        [:broadway, :batcher, :stop],
-        [:broadway, :processor, :message, :exception]
-      ],
-      &__MODULE__.handle_event/4,
-      nil
-    )
-
-    Supervisor.init(children, strategy: :one_for_one)
-  end
-
-  def handle_event([:broadway, :processor, :message, :stop], measurements, meta, _) do
-    Logger.info("Mensaje procesado",
-      duration_ms: System.convert_time_unit(measurements.duration, :native, :millisecond),
-      pipeline: meta.name
-    )
-  end
-
-  def handle_event([:broadway, :batcher, :stop], measurements, meta, _) do
-    Logger.info("Batch completado",
-      batch_size: meta.batch_size,
-      duration_ms: System.convert_time_unit(measurements.duration, :native, :millisecond)
-    )
-  end
-
-  def handle_event([:broadway, :processor, :message, :exception], _measurements, meta, _) do
-    Logger.error("Excepción en processor",
-      kind: meta.kind,
-      reason: inspect(meta.reason)
-    )
-  end
-
-  def metrics do
-    [
-      summary("broadway.processor.message.stop.duration",
-        unit: {:native, :millisecond},
-        tags: [:name]
-      ),
-      counter("broadway.processor.message.exception.count", tags: [:name]),
-      summary("broadway.batcher.stop.duration",
-        unit: {:native, :millisecond},
-        tags: [:name, :batcher]
+      Logger.error("Usage event sent to DLQ",
+        status: inspect(msg.status),
+        data: inspect(msg.data) |> String.slice(0, 200)
       )
-    ]
+    end)
+
+    messages
   end
 end
 ```
 
----
+### Step 6: Supervision — `lib/api_gateway/application.ex`
 
-## Ejercicios Propuestos
-
-### Ejercicio A: Back-pressure adaptativo
-
-Modifica la configuración de `max_demand` del processor para que se ajuste
-dinámicamente según la latencia de inserción en base de datos.
-Cuando el percentil 95 de `Repo.insert_all` supere 500ms, reduce `max_demand`
-de 5 a 1. Investiga `Broadway.update_producer/3`.
-
-### Ejercicio B: Particionamiento por `user_id`
-
-Todos los eventos del mismo usuario deben procesarse en orden (sin reordenar).
-Usa `partition_by` en el batcher para garantizar que mensajes del mismo `user_id`
-vayan al mismo batcher worker:
+Add the pipeline to the supervision tree:
 
 ```elixir
-batchers: [
-  db_insert: [
-    concurrency: 5,
-    batch_size: 100,
-    partition_by: fn %Message{data: event} ->
-      rem(event.user_id, 5)
-    end
-  ]
-]
+# In ApiGateway.Application.start/2, add to children:
+ApiGateway.Pipeline.UsagePipeline
 ```
 
-### Ejercicio C: Circuit breaker para el batcher
-
-Si el batcher de DB falla 5 veces consecutivas en menos de 30 segundos,
-el circuit breaker debe abrirse y redirigir todos los mensajes al batcher `:dlq`
-sin intentar la inserción. Implementa el circuit breaker con un GenServer
-que mantenga el estado `{:open, since}` o `:closed`.
-
----
-
-## Tests
+### Step 7: Given tests — must pass without modification
 
 ```elixir
-defmodule EventPipeline.IngestionPipelineTest do
-  use ExUnit.Case, async: false
+# test/api_gateway/pipeline/usage_pipeline_test.exs
+defmodule ApiGateway.Pipeline.UsagePipelineTest do
+  use ExUnit.Case, async: true
 
-  alias EventPipeline.IngestionPipeline
+  alias ApiGateway.Pipeline.{UsagePipeline, EventNormalizer}
 
-  test "procesa evento JSON válido correctamente" do
-    raw = Jason.encode!(%{
-      event_id: "test-123",
-      user_id: 1,
-      type: "page_view",
+  # Test handle_message/3 directly — no Kafka required.
+  # Broadway.Message requires an acknowledger tuple {module, ack_ref, ack_data}.
+  # Broadway.NoopAcknowledger is a built-in that silently discards ack/nack calls,
+  # which is correct for unit tests that bypass the full pipeline.
+
+  defp make_message(data) do
+    %Broadway.Message{
+      data: data,
+      acknowledger: {Broadway.NoopAcknowledger, :ok, :ok}
+    }
+  end
+
+  defp valid_event_json(overrides \\ %{}) do
+    base = %{
+      event_id: "evt-#{:rand.uniform(9_999_999)}",
+      client_id: "c-test",
+      service: "billing",
+      method: "GET",
+      status_code: 200,
+      latency_ms: 45,
       occurred_at: "2026-04-10T12:00:00Z"
-    })
-
-    message = %Broadway.Message{
-      data: raw,
-      acknowledger: Broadway.NoopAcknowledger.init()
     }
 
-    result = IngestionPipeline.handle_message(:default, message, %{})
-
-    assert result.batcher == :db_insert
-    assert result.data.event_id == "test-123"
+    Jason.encode!(Map.merge(base, overrides))
   end
 
-  test "mensaje inválido va al batcher DLQ" do
-    message = %Broadway.Message{
-      data: "not-json{{{",
-      acknowledger: Broadway.NoopAcknowledger.init()
-    }
+  describe "handle_message/3" do
+    test "valid event is routed to :db_insert batcher" do
+      msg = make_message(valid_event_json())
+      result = UsagePipeline.handle_message(:default, msg, %{})
+      assert result.batcher == :db_insert
+      assert is_map(result.data)
+      assert result.data.client_id == "c-test"
+    end
 
-    result = IngestionPipeline.handle_message(:default, message, %{})
+    test "invalid JSON is routed to :dlq batcher and marked failed" do
+      msg = make_message("not-json{{")
+      result = UsagePipeline.handle_message(:default, msg, %{})
+      assert result.batcher == :dlq
+      assert {:failed, _reason} = result.status
+    end
 
-    assert result.batcher == :dlq
-    assert result.status == {:failed, _reason} = result.status
+    test "event missing required field is routed to :dlq" do
+      incomplete = Jason.encode!(%{event_id: "x", client_id: "c-1"})
+      msg = make_message(incomplete)
+      result = UsagePipeline.handle_message(:default, msg, %{})
+      assert result.batcher == :dlq
+    end
+  end
+
+  describe "EventNormalizer.normalise/1" do
+    test "normalises canonical event" do
+      raw = valid_event_json()
+      assert {:ok, event} = EventNormalizer.normalise(raw)
+      assert event.client_id == "c-test"
+      assert %DateTime{} = event.occurred_at
+    end
+
+    test "maps legacy 'client' field to :client_id" do
+      raw = Jason.encode!(%{
+        event_id: "evt-leg-1",
+        client: "c-legacy",
+        service: "auth",
+        method: "POST",
+        status_code: 201,
+        duration_ms: 80,
+        occurred_at: "2026-04-10T08:00:00Z"
+      })
+
+      assert {:ok, event} = EventNormalizer.normalise(raw)
+      assert event.client_id == "c-legacy"
+      assert event.latency_ms == 80
+    end
+
+    test "returns error for non-binary input" do
+      assert {:error, :not_binary} = EventNormalizer.normalise(42)
+    end
+
+    test "returns error for missing required fields" do
+      raw = Jason.encode!(%{event_id: "evt-x", client_id: "c-x"})
+      assert {:error, {:missing_fields, _fields}} = EventNormalizer.normalise(raw)
+    end
   end
 end
 ```
 
----
+### Step 8: Run the tests
 
-## Preguntas de Comprensión
-
-1. ¿Por qué Broadway garantiza at-least-once delivery y no exactly-once?
-   ¿Cómo mitiga el `on_conflict: :nothing` el problema de duplicados?
-
-2. `handle_batch/4` recibe mensajes ya procesados por `handle_message/3`.
-   Si un mensaje fue marcado como fallido en `handle_message/3`, ¿llega
-   al batcher `:db_insert` o al `:dlq`? ¿Por qué?
-
-3. El rate limiter usa `Process.sleep/1` dentro de `do_acquire/1`.
-   ¿Qué problema introduce esto cuando tienes 10 processor workers
-   esperando tokens simultáneamente? ¿Cómo lo resolverías?
-
-4. ¿Cuál es la diferencia entre `concurrency: 10` en processors
-   y `concurrency: 5` en batchers? ¿Pueden ambos modificarse en caliente?
+```bash
+mix test test/api_gateway/pipeline/ --trace
+```
 
 ---
 
-## Recursos
+## Trade-off analysis
 
-- [Broadway Docs](https://hexdocs.pm/broadway)
-- [BroadwayKafka](https://hexdocs.pm/broadway_kafka)
-- [Broadway Architecture](https://elixir-broadway.org/docs/architecture)
-- [Sagas and DLQ patterns](https://microservices.io/patterns/data/saga.html)
+| Aspect | Broadway + Kafka | GenServer + KafkaEx loop | Oban (database queue) |
+|--------|-----------------|--------------------------|-----------------------|
+| Back-pressure | Built-in (`max_demand`) | Manual or absent | Configurable |
+| Batching | Built-in (batchers) | Manual | Configurable |
+| At-least-once | Built-in (ack after batch) | Manual (ack timing) | Yes (DB-backed) |
+| Ordering guarantee | Per-partition | Per-consumer | No (concurrent workers) |
+| Throughput ceiling | Very high (millions/min) | Medium | Medium |
+| Durability | Kafka (external) | Kafka (external) | PostgreSQL |
+| Operational complexity | Medium (Kafka cluster) | Medium | Low (DB only) |
+
+Reflection question: `handle_batch/4` calls `Repo.insert_all/2` with
+`on_conflict: :nothing`. If Kafka replays 100 events after a consumer rebalance and
+50 of them were already inserted in a previous batch, `insert_all` silently ignores
+the 50 duplicates. But Broadway still acks all 100 messages — including the 50 that
+produced no DB rows. Is this correct behaviour? What would happen if you used
+`on_conflict: :replace_all` instead?
+
+---
+
+## Common production mistakes
+
+**1. Performing I/O in `handle_message/3`**
+`handle_message/3` is called once per message across all processor workers. A database
+read or HTTP call in `handle_message/3` adds a full round-trip to every single message's
+critical path. Validate in `handle_message/3`, do I/O in `handle_batch/4`.
+
+**2. Not returning the messages list from `handle_batch/4`**
+`handle_batch/4` must return the messages list (possibly with failures marked). If you
+return `:ok` or anything else, Broadway raises a function clause error at runtime.
+
+**3. `batch_timeout` too long in development**
+With `batch_size: 100` and `batch_timeout: 1_000`, a test that sends 1 message will
+wait up to 1 second for the batch to flush. Tests are slow. Set `batch_timeout: 50`
+in the test environment.
+
+**4. Forgetting `offset_reset_policy: :earliest` for replay**
+The default is `:latest` — Broadway ignores messages that arrived before the consumer
+group connected. To replay historical events after a bug fix, set
+`offset_reset_policy: :earliest` and reset the consumer group offset in Kafka.
+
+**5. Shared consumer group across environments**
+If `dev` and `staging` share the same `group_id`, they compete for partitions.
+One environment sees half the messages. Always include the environment in
+`@consumer_group`.
+
+---
+
+## Resources
+
+- [Broadway](https://hexdocs.pm/broadway) — pipeline configuration, back-pressure, acking
+- [BroadwayKafka](https://hexdocs.pm/broadway_kafka) — Kafka producer, offset management, partition assignment
+- [Broadway Architecture](https://elixir-broadway.org/docs/architecture) — producer/processor/batcher model
+- [Ecto insert_all](https://hexdocs.pm/ecto/Ecto.Repo.html#c:insert_all/3) — on_conflict, conflict_target, returning
+- [Kafka Consumer Groups](https://kafka.apache.org/documentation/#intro_consumers) — partition assignment, rebalancing

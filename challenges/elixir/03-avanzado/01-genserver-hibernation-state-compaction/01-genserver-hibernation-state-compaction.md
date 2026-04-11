@@ -1,415 +1,433 @@
-# 1. GenServer Hibernation & State Compaction
+# GenServer Hibernation & State Compaction
 
-**Difficulty**: Avanzado
-
-## Prerequisites
-- Mastered: GenServer lifecycle, `handle_call/3`, `handle_cast/2`, `handle_info/2`
-- Mastered: BEAM memory model, process heap, garbage collection
-- Familiarity with: `:recon` library, `:erlang.hibernate/3`, process flags
-
-## Learning Objectives
-- Analyze trade-offs between memory savings and latency introduced by hibernation
-- Design a cache GenServer that automatically hibernates idle processes
-- Evaluate when state compaction before hibernation is worth the CPU cost
-- Measure P99 latency impact using `:recon` and `:timer` tools
-
-## Concepts
-
-### Process Hibernation in the BEAM
-
-In the BEAM, every process has its own heap. When a GenServer is idle, its heap still occupies
-memory — even if it holds no useful work to do. `:erlang.hibernate/3` is a low-level primitive
-that suspends a process, runs a full garbage collection on its heap, and puts it in a minimal
-footprint state. The process is resumed only when a message arrives in its mailbox.
-
-GenServer exposes this via the `:hibernate` atom in return tuples. Returning
-`{:noreply, state, :hibernate}` from any callback will trigger hibernation immediately after
-the callback returns. The process wakes up when a message arrives and executes the appropriate
-callback normally — there is no explicit "wake up" handler.
-
-The cost of hibernation is real: the first message after waking incurs a cold-heap penalty
-because the process must rebuild its stack and potentially page in data. In latency-sensitive
-systems, this manifests as P99 spikes on calls that hit a dormant process. You must measure
-this before deploying hibernation in production.
-
-```elixir
-defmodule Cache.Worker do
-  use GenServer
-
-  @inactivity_ms 30_000
-
-  def start_link(key) do
-    GenServer.start_link(__MODULE__, key)
-  end
-
-  def init(key) do
-    {:ok, %{key: key, value: nil, last_access: monotonic()}}
-  end
-
-  # Return :hibernate after a timeout period — the next handle_info(:timeout) triggers it
-  def handle_call(:get, _from, state) do
-    new_state = %{state | last_access: monotonic()}
-    {:reply, state.value, new_state, @inactivity_ms}
-  end
-
-  # Inactivity fires — go dormant
-  def handle_info(:timeout, state) do
-    {:noreply, compact_state(state), :hibernate}
-  end
-
-  defp compact_state(state), do: Map.drop(state, [:last_access])
-  defp monotonic, do: System.monotonic_time(:millisecond)
-end
-```
-
-### State Compaction Before Hibernation
-
-Hibernation runs GC on the current heap. If the state still holds large binaries, reference-
-counted sub-binaries, or ETS references pointing to large structures, GC cannot collect them —
-the memory stays high even after hibernation. Compaction means explicitly reducing the state to
-its smallest meaningful representation before calling `:hibernate`.
-
-Patterns for compaction:
-- Drop fields that can be recomputed on wake-up (timestamps, derived caches)
-- Serialize large in-memory structures to a compact binary and store the binary
-- Move data to ETS and keep only the table reference in state
-- Truncate history lists to a fixed maximum
-
-The trade-off is CPU: compaction runs on every hibernation. If your processes hibernate
-frequently and their state is large, compaction can become a bottleneck. Profile first.
-
-```elixir
-defmodule EventBuffer do
-  use GenServer
-
-  @max_history 100
-
-  def handle_info(:timeout, state) do
-    compacted = %{
-      id: state.id,
-      # Truncate unbounded history before hibernating
-      recent_events: Enum.take(state.events, @max_history),
-      snapshot: summarize(state.events)
-    }
-    {:noreply, compacted, :hibernate}
-  end
-
-  defp summarize(events) do
-    %{
-      count: length(events),
-      last_seen: List.first(events)
-    }
-  end
-end
-```
-
-### Measuring Memory with :recon
-
-`:recon` is a production-safe introspection library. It does not require pausing the scheduler
-and is safe to run on live nodes. The key function for memory analysis is:
-
-```elixir
-# Top 10 processes by memory usage
-:recon.proc_count(:memory, 10)
-
-# Returns: [{pid, memory_bytes, [registered_name: ..., current_function: ...]}]
-```
-
-To measure hibernation impact:
-1. Spawn N idle GenServers, record baseline memory with `:recon.proc_count`
-2. Let inactivity timeout trigger hibernation on all processes
-3. Record memory again — difference shows hibernation savings
-4. Send a message to a hibernated process, measure response time with `:timer.tc`
-
-### Trade-offs
-
-| Aspect | Before Hibernation | After Hibernation |
-|---|---|---|
-| Memory (idle process) | ~2–8 KB heap | ~0.5–1 KB (GC'd) |
-| Memory (with large state) | High | High unless compacted |
-| First-message latency | Baseline | +50–500 µs (GC + heap rebuild) |
-| Subsequent latency | Baseline | Baseline |
-| Scheduler impact | None | Brief GC pause on wake |
-| Complexity | Low | Medium (compaction logic needed) |
-
-**When to use**: Cache workers with thousands of keys where most are idle, session servers
-where users are active for short bursts, any "fan-out" server farm where active/idle ratio
-is low.
-
-**When to avoid**: Processes that receive messages at <100ms intervals (hibernation overhead
-exceeds benefit), real-time systems where P99 latency is a hard SLA.
+**Project**: `api_gateway` — built incrementally across the advanced level
 
 ---
 
-## Exercises
+## Project context
 
-### Exercise 1: Hibernating Cache Worker
+You're building `api_gateway`, an internal HTTP gateway. The circuit breaker component
+(a previous exercise) spawns one `CircuitBreaker.Worker` process per upstream service.
+At peak the gateway tracks 5,000 upstream services. Profiling shows that at any moment
+only ~200 workers are actively handling traffic — the other 4,800 are idle, each
+consuming ~4 KB of heap. Your ops team is asking why the gateway eats 200 MB of process
+heap even when traffic is low.
 
-**Problem**: You run a distributed cache where each key is owned by a dedicated GenServer
-process. At peak, you have 50,000 key-worker processes. A profiling session shows that
-at any moment only ~2,000 workers are actively serving requests — the other 48,000 are
-idle, each consuming ~4 KB of heap. Your ops team reports 192 MB of wasted process heap.
-Implement automatic hibernation after 30 seconds of inactivity.
+Project structure at this point:
 
-**Requirements**:
-- Worker hibernates after exactly 30s of no `get` or `put` calls
-- Any call resets the inactivity timer
-- Hibernation must be transparent: callers see no difference in behavior
-- Track hibernation count in state so tests can assert it happened
+```
+api_gateway/
+├── lib/
+│   └── api_gateway/
+│       ├── application.ex
+│       ├── router.ex
+│       └── circuit_breaker/
+│           ├── worker.ex          # ← you implement this
+│           └── supervisor.ex      # already exists
+├── test/
+│   └── api_gateway/
+│       └── circuit_breaker/
+│           └── worker_test.exs    # given tests — must pass without modification
+├── bench/
+│   └── hibernation_bench.exs      # benchmark — run at the end
+└── mix.exs
+```
 
-**Hints**:
-- The GenServer timeout mechanism (`{:reply, val, state, timeout_ms}`) fires a
-  `handle_info(:timeout, state)` — combine this with `:hibernate` in that handler
-- Do not use `:timer.send_after` for this — the built-in timeout is reset automatically
-  on each callback return, which is exactly the semantic you want
-- After hibernation, the process wakes on the next message — no special handling needed
-  in `handle_call` because GenServer dispatches normally post-wake
+---
 
-**One possible solution**:
+## The business problem
+
+The infra team wants to scale the gateway to 50,000 upstream services. At 4 KB per idle
+process that is 200 MB of wasted heap. The solution: `:hibernate` idle workers after
+30 seconds of inactivity. A hibernated process runs a full GC on its heap and suspends
+until the next message arrives.
+
+---
+
+## Why hibernate and not just kill idle workers
+
+Killing and re-creating a worker on demand involves re-fetching configuration from
+the config service (~50 ms), reloading connection pool handles, and re-registering in
+the circuit breaker registry. Hibernation preserves all that state at minimal memory
+cost. The worker wakes up in microseconds — not milliseconds.
+
+The cost is real: the first message after waking incurs a cold-heap penalty. In
+latency-sensitive hot paths, this manifests as P99 spikes. You must measure this
+before shipping hibernation to production.
+
+---
+
+## Why state compaction matters
+
+Hibernation runs GC on the current heap. If the state still holds large binaries,
+reference-counted sub-binaries, or ETS references pointing to large structures, GC
+cannot collect them — memory stays high even after hibernation. Compaction means
+explicitly reducing the state to its smallest meaningful representation before
+calling `:hibernate`.
+
+```
+BEFORE compaction + hibernate:
+  state = %{
+    service: "payments",
+    config: %{...large map, 2 KB...},
+    connection_pool: #Reference<...>,
+    request_log: [... 500 entries ...],   # 50 KB
+    last_error: %RuntimeError{...},
+    metrics: %{p99: 12.4, p50: 3.1, ...}
+  }
+  heap after hibernate: ~52 KB  (log still referenced)
+
+AFTER compaction + hibernate:
+  state = %{
+    service: "payments",
+    status: :open,
+    failure_count: 3,
+    last_check: 1_712_000_000_000
+  }
+  heap after hibernate: ~0.5 KB
+```
+
+---
+
+## Implementation
+
+### Step 1: `mix.exs` — add recon as a dev dependency
+
 ```elixir
-defmodule Cache.Worker do
+# mix.exs
+defp deps do
+  [
+    {:recon, "~> 2.5", only: :dev}
+  ]
+end
+```
+
+### Step 2: `lib/api_gateway/circuit_breaker/worker.ex`
+
+`# TODO` marks what you must implement. `# HINT` gives direction without spoiling
+the solution. Do not change the public function signatures — the tests depend on them.
+
+```elixir
+defmodule ApiGateway.CircuitBreaker.Worker do
   use GenServer
+  require Logger
 
   @hibernate_after_ms 30_000
 
-  def start_link({key, initial_value}) do
-    GenServer.start_link(__MODULE__, {key, initial_value})
-  end
+  # ---------------------------------------------------------------------------
+  # Public API
+  # ---------------------------------------------------------------------------
 
-  def get(pid), do: GenServer.call(pid, :get)
-  def put(pid, value), do: GenServer.call(pid, {:put, value})
+  @doc """
+  Records a successful call to the upstream service.
+  Resets the inactivity timer.
+  """
+  @spec record_success(pid()) :: :ok
+  def record_success(pid), do: GenServer.cast(pid, :success)
 
-  def init({key, value}) do
-    state = %{key: key, value: value, hibernations: 0}
-    {:ok, state, @hibernate_after_ms}
-  end
+  @doc """
+  Records a failed call. When failures exceed the threshold the circuit opens.
+  Resets the inactivity timer.
+  """
+  @spec record_failure(pid()) :: :ok
+  def record_failure(pid), do: GenServer.cast(pid, :failure)
 
-  def handle_call(:get, _from, state) do
-    {:reply, state.value, state, @hibernate_after_ms}
-  end
+  @doc """
+  Returns the current circuit state: :closed | :open | :half_open.
+  Resets the inactivity timer.
+  """
+  @spec status(pid()) :: :closed | :open | :half_open
+  def status(pid), do: GenServer.call(pid, :status)
 
-  def handle_call({:put, value}, _from, state) do
-    {:reply, :ok, %{state | value: value}, @hibernate_after_ms}
-  end
-
-  def handle_info(:timeout, state) do
-    new_state = %{state | hibernations: state.hibernations + 1}
-    {:noreply, new_state, :hibernate}
-  end
-
-  # Expose for testing
+  @doc """
+  Returns the number of times this worker has hibernated.
+  Used in tests to assert hibernation happened.
+  """
+  @spec hibernation_count(pid()) :: non_neg_integer()
   def hibernation_count(pid), do: GenServer.call(pid, :hibernation_count)
 
-  # ... rest of implementation
-end
-```
+  # ---------------------------------------------------------------------------
+  # GenServer lifecycle
+  # ---------------------------------------------------------------------------
 
----
-
-### Exercise 2: Unbounded History Compaction
-
-**Problem**: You have a `MetricsCollector` GenServer that accumulates raw event structs
-throughout the day. Each event is ~500 bytes. By end of day, a single collector holds
-~86,400 events (one per second) — that is 43 MB of in-process heap. The collector is
-idle overnight. Design a compaction strategy that runs at hibernation time to reduce
-the heap footprint to under 1 MB while preserving enough data to answer "what happened
-in the last hour" queries after the process wakes.
-
-**Requirements**:
-- Full event list is maintained during active hours
-- On hibernation: compact to `{summary, recent_events}` where `recent_events` is the
-  last 3,600 entries and `summary` captures aggregate statistics
-- On wake (first call after hibernation): log a warning that state was compacted
-- Compaction must be idempotent: compacting an already-compacted state is safe
-
-**Hints**:
-- Use a version tag in state to distinguish full vs. compacted: `%{mode: :full, ...}`
-  vs. `%{mode: :compact, ...}`. Pattern match on `mode` in callbacks
-- `:erlang.term_to_binary/2` with `[:compressed]` can reduce binary size by 60–80%
-  for repetitive data, but adds CPU cost on deserialization — measure before using
-- The `handle_info(:timeout, state)` → `{:noreply, compact(state), :hibernate}` chain
-  runs synchronously; keep compaction under 100ms or it blocks the process
-
-**One possible solution**:
-```elixir
-defmodule MetricsCollector do
-  use GenServer
-
-  @inactivity_ms 60_000
-  @recent_window 3_600
-
-  def init(collector_id) do
-    {:ok, %{id: collector_id, mode: :full, events: [], summary: nil}, @inactivity_ms}
+  def start_link(service_name) do
+    GenServer.start_link(__MODULE__, service_name)
   end
 
-  def handle_call(:query_recent, _from, %{mode: :compact} = state) do
-    # Log degraded mode so operators are aware
-    require Logger
-    Logger.warning("MetricsCollector #{state.id} serving from compacted state")
-    {:reply, {:compacted, state.recent_events}, state, @inactivity_ms}
+  @impl true
+  def init(service_name) do
+    # TODO: build initial state and schedule inactivity timeout
+    #
+    # State fields to include:
+    #   :service        — the upstream service name
+    #   :status         — :closed | :open | :half_open
+    #   :failures       — consecutive failure count
+    #   :hibernations   — how many times this worker hibernated (for tests)
+    #
+    # HINT: return {:ok, state, @hibernate_after_ms} to arm the inactivity timer.
+    # The BEAM will send :timeout to handle_info/2 if no message arrives in that window.
   end
 
-  def handle_call(:query_recent, _from, %{mode: :full} = state) do
-    recent = Enum.take(state.events, @recent_window)
-    {:reply, {:full, recent}, state, @inactivity_ms}
+  # ---------------------------------------------------------------------------
+  # Callbacks
+  # ---------------------------------------------------------------------------
+
+  @impl true
+  def handle_call(:status, _from, state) do
+    # TODO: reply with state.status and reset the inactivity timer
+    # HINT: {:reply, value, state, @hibernate_after_ms}
   end
 
+  @impl true
+  def handle_call(:hibernation_count, _from, state) do
+    # TODO: reply with state.hibernations (no timer reset needed here)
+  end
+
+  @impl true
+  def handle_cast(:success, state) do
+    # TODO: reset failures to 0, transition to :closed if :half_open, reset timer
+  end
+
+  @impl true
+  def handle_cast(:failure, state) do
+    # TODO: increment failures; if >= 5 transition to :open; reset timer
+    # HINT: use a module attribute @failure_threshold 5
+  end
+
+  @impl true
   def handle_info(:timeout, state) do
-    {:noreply, compact(state), :hibernate}
+    # Inactivity timeout fired — compact state and hibernate.
+    #
+    # HINT: call a private compact/1 function that drops fields which can be
+    # recomputed on wake (e.g., derived caches, large logs).
+    # Then return {:noreply, compacted_state, :hibernate}.
+    #
+    # Design question: what fields are safe to drop vs. unsafe to drop?
+    # Answer: anything you can recompute from service_name + status + failures.
   end
 
-  defp compact(%{mode: :compact} = state), do: state
+  # ---------------------------------------------------------------------------
+  # Private helpers
+  # ---------------------------------------------------------------------------
 
-  defp compact(%{mode: :full, events: events} = state) do
-    %{
-      id: state.id,
-      mode: :compact,
-      recent_events: Enum.take(events, @recent_window),
-      summary: build_summary(events)
-    }
-  end
-
-  defp build_summary(events) do
-    # Aggregate: do not store raw events in summary
-    %{
-      total_count: length(events),
-      # ... aggregate fields
-    }
+  defp compact(state) do
+    # TODO: return the smallest state that preserves correctness.
+    # Increment :hibernations so tests can assert hibernation happened.
   end
 end
 ```
 
----
+### Step 3: Given tests — must pass without modification
 
-### Exercise 3: Measuring P99 Latency Impact
-
-**Problem**: Before proposing hibernation to your team you need hard numbers. Write a
-benchmark module that spawns 100 worker GenServers (use Exercise 1's `Cache.Worker`),
-measures baseline P99 call latency, forces hibernation on all of them, then measures
-the first-call P99 after wake-up. Report the delta.
-
-**Requirements**:
-- Spawn 100 workers, warm them up with 1,000 calls each
-- Record latency of 10,000 calls distributed across all workers (`:timer.tc`)
-- Force hibernation: send a direct message that triggers `:hibernate` or wait for timeout
-- Record latency of 100 calls (one per worker, first-call-after-hibernate)
-- Output: `baseline_p99_µs`, `post_hibernate_p99_µs`, `overhead_µs`
-
-**Hints**:
-- `:timer.tc(fn -> GenServer.call(pid, :get) end)` returns `{microseconds, result}`
-- To calculate P99: sort the latency list, take element at index `floor(length * 0.99)`
-- You can force hibernation without waiting 30s by using `:sys.replace_state/2` to
-  corrupt the timer, then sending `:timeout` directly with `send(pid, :timeout)`
-- Use `Process.sleep(10)` between the hibernate trigger and the measurement call to
-  ensure the process has fully entered hibernation before you call it
-
-**One possible solution**:
 ```elixir
-defmodule HibernationBenchmark do
-  @worker_count 100
-  @warmup_calls 1_000
-  @measure_calls 10_000
+# test/api_gateway/circuit_breaker/worker_test.exs
+defmodule ApiGateway.CircuitBreaker.WorkerTest do
+  use ExUnit.Case, async: true
 
-  def run do
-    workers = spawn_workers()
-    warmup(workers)
+  alias ApiGateway.CircuitBreaker.Worker
 
-    baseline = measure_p99(workers, @measure_calls)
-    force_hibernate(workers)
-    # Give all processes time to fully enter hibernation
-    Process.sleep(50)
-    post_hibernate = measure_p99(workers, @worker_count)
+  describe "normal operation" do
+    test "starts closed" do
+      {:ok, pid} = Worker.start_link("payments")
+      assert Worker.status(pid) == :closed
+    end
 
-    IO.puts("Baseline P99:      #{baseline} µs")
-    IO.puts("Post-hibernate P99: #{post_hibernate} µs")
-    IO.puts("Overhead:          #{post_hibernate - baseline} µs")
-  end
+    test "opens after 5 consecutive failures" do
+      {:ok, pid} = Worker.start_link("inventory")
+      for _ <- 1..5, do: Worker.record_failure(pid)
+      Process.sleep(10)
+      assert Worker.status(pid) == :open
+    end
 
-  defp spawn_workers do
-    for i <- 1..@worker_count do
-      {:ok, pid} = Cache.Worker.start_link({"key_#{i}", nil})
-      pid
+    test "success resets failure count" do
+      {:ok, pid} = Worker.start_link("shipping")
+      for _ <- 1..3, do: Worker.record_failure(pid)
+      Worker.record_success(pid)
+      Process.sleep(10)
+      assert Worker.status(pid) == :closed
     end
   end
 
-  defp warmup(workers) do
-    for _ <- 1..@warmup_calls, w <- workers do
-      Cache.Worker.get(w)
+  describe "hibernation" do
+    test "hibernates after inactivity and wakes correctly" do
+      {:ok, pid} = Worker.start_link("dormant-service")
+      # Force immediate hibernation by sending :timeout directly
+      send(pid, :timeout)
+      Process.sleep(20)
+
+      # Worker must still respond after waking
+      assert Worker.status(pid) == :closed
+      assert Worker.hibernation_count(pid) == 1
     end
-  end
 
-  defp measure_p99(workers, n) do
-    latencies =
-      for _ <- 1..n do
-        worker = Enum.random(workers)
-        {µs, _} = :timer.tc(fn -> Cache.Worker.get(worker) end)
-        µs
-      end
+    test "state is preserved across hibernation" do
+      {:ok, pid} = Worker.start_link("auth")
+      for _ <- 1..3, do: Worker.record_failure(pid)
+      Process.sleep(10)
 
-    percentile(latencies, 99)
-  end
+      # Hibernate
+      send(pid, :timeout)
+      Process.sleep(20)
 
-  defp force_hibernate(workers) do
-    Enum.each(workers, fn pid -> send(pid, :timeout) end)
-  end
+      # Failure count must survive hibernation
+      # Two more failures should open the circuit (3 + 2 = 5)
+      for _ <- 1..2, do: Worker.record_failure(pid)
+      Process.sleep(10)
+      assert Worker.status(pid) == :open
+    end
 
-  defp percentile(list, p) do
-    sorted = Enum.sort(list)
-    idx = floor(length(sorted) * p / 100)
-    Enum.at(sorted, idx)
+    test "hibernation count increments on each hibernate" do
+      {:ok, pid} = Worker.start_link("catalog")
+      send(pid, :timeout)
+      Process.sleep(20)
+      send(pid, :timeout)
+      Process.sleep(20)
+      assert Worker.hibernation_count(pid) == 2
+    end
   end
 end
 ```
 
+### Step 4: Run the tests
+
+```bash
+mix test test/api_gateway/circuit_breaker/worker_test.exs --trace
+```
+
+All tests fail initially — that is expected. Implement `Worker` until they all pass.
+
+### Step 5: Measure memory savings
+
+Once tests pass, measure the impact using `:recon`:
+
+```elixir
+# In iex -S mix
+alias ApiGateway.CircuitBreaker.Worker
+
+# Spawn 200 workers
+workers = for i <- 1..200 do
+  {:ok, pid} = Worker.start_link("service_#{i}")
+  pid
+end
+
+# Baseline memory
+baseline = :recon.proc_count(:memory, 5)
+IO.inspect(baseline, label: "top 5 by memory (before hibernation)")
+
+# Force hibernation on all
+Enum.each(workers, fn pid -> send(pid, :timeout) end)
+Process.sleep(200)
+
+# Post-hibernate memory
+after_hib = :recon.proc_count(:memory, 5)
+IO.inspect(after_hib, label: "top 5 by memory (after hibernation)")
+```
+
+### Step 6: Measure P99 latency impact
+
+```elixir
+# bench/hibernation_bench.exs
+workers = for i <- 1..50 do
+  {:ok, pid} = ApiGateway.CircuitBreaker.Worker.start_link("bench_#{i}")
+  pid
+end
+
+# Warm up
+Enum.each(workers, &ApiGateway.CircuitBreaker.Worker.status/1)
+
+# Baseline P99
+latencies_baseline =
+  for _ <- 1..10_000 do
+    w = Enum.random(workers)
+    {us, _} = :timer.tc(fn -> ApiGateway.CircuitBreaker.Worker.status(w) end)
+    us
+  end
+
+# Force hibernation
+Enum.each(workers, fn pid -> send(pid, :timeout) end)
+Process.sleep(100)
+
+# Post-hibernation first-call P99
+latencies_wake =
+  for w <- workers do
+    {us, _} = :timer.tc(fn -> ApiGateway.CircuitBreaker.Worker.status(w) end)
+    us
+  end
+
+p99 = fn list ->
+  sorted = Enum.sort(list)
+  Enum.at(sorted, floor(length(sorted) * 0.99))
+end
+
+IO.puts("Baseline P99:       #{p99.(latencies_baseline)} µs")
+IO.puts("Post-hibernate P99: #{p99.(latencies_wake)} µs")
+IO.puts("Overhead:           #{p99.(latencies_wake) - p99.(latencies_baseline)} µs")
+```
+
+```bash
+mix run bench/hibernation_bench.exs
+```
+
+**Expected result**: post-hibernate P99 is 50–500 µs higher than baseline.
+If the delta is < 10 µs, verify hibernation is actually happening (check `hibernation_count/1`).
+
 ---
 
-## Common Mistakes
+## Trade-off analysis
 
-### Mistake: Using `:timer.send_after` Instead of Built-in Timeout
+Fill this table after running the benchmark.
 
-Calling `:timer.send_after(@delay, self(), :hibernate_now)` in `init/1` and then
-resetting it in every callback creates timer leaks. If a callback forgets to cancel
-the previous timer reference before scheduling a new one, you accumulate phantom timers
-that fire after the process has moved on. The built-in GenServer timeout
-(`{:reply, val, state, ms}`) is reset automatically on every callback return — it is
-the correct primitive for inactivity detection.
+| Aspect | With hibernation + compaction | Without hibernation | Notes |
+|--------|-------------------------------|---------------------|-------|
+| Heap per idle worker | ~0.5 KB (estimate) | ~4 KB | Measure with `:recon` |
+| Memory for 5,000 idle workers | estimate | ~20 MB | |
+| First-call P99 after wake | measure | baseline | Your benchmark |
+| Subsequent call P99 | baseline | baseline | |
+| Code complexity | Medium (compact/1 logic) | Low | |
+| Risk | Low if fields are safe to drop | None | |
 
-### Mistake: Hibernating Without Compacting Large Binaries
+Reflection question: what fields in the circuit breaker state are **unsafe** to drop
+during compaction? What would happen if you dropped `:failures` by mistake?
 
-A process can hold a reference-counted sub-binary that points into a large binary on
-the shared heap. Even after GC, that reference keeps the large binary alive. Hibernation
-will not reclaim it. You must explicitly nil out or drop those fields before hibernating.
-Use `:recon_trace` or `:erlang.process_info(pid, :binary)` to audit binary references.
+---
 
-### Mistake: Hibernating Frequently-Active Processes
+## Common production mistakes
 
-If a process receives a message every 200ms, putting it to sleep for 30s of inactivity
-means it will never hibernate in practice — which is fine. But if you set the threshold
-too low (e.g., 1s) on a process that receives bursts separated by 1.5s gaps, you create
-a pathological pattern: hibernate → wake (latency spike) → work → hibernate → wake.
-Profile your actual traffic pattern before choosing the inactivity threshold.
+**1. Using `:timer.send_after` instead of the built-in timeout**
+Calling `:timer.send_after(@delay, self(), :timeout)` in every callback and cancelling
+the previous reference is error-prone. If one callback forgets to cancel, phantom timers
+accumulate. The built-in GenServer timeout (`{:reply, val, state, ms}`) resets itself
+automatically on every callback return — zero timer leak risk.
 
-### Mistake: Assuming Hibernation Is Free on Wake
+**2. Not compacting before hibernating**
+A process holding a 500-entry request log in state will hibernate — but the log is still
+referenced from the heap. GC cannot collect it. Memory stays high. Compaction is not
+optional: explicitly drop or truncate anything large before calling `:hibernate`.
 
+**3. Hibernating processes that receive frequent messages**
+If a circuit breaker worker handles 50 req/s, the inactivity timeout never fires in
+practice — good. But if you set the threshold too low (e.g., 500 ms) on a bursty
+service (quiet for 600 ms, then a burst), you create a pathological pattern:
+hibernate → burst → wake (latency spike) → hibernate. Profile traffic patterns before
+choosing the threshold.
+
+**4. Assuming hibernate is free on wake**
 The first call to a hibernated process must rebuild the process stack and may trigger
-paging if the OS swapped the process memory. On loaded systems, post-hibernation P99 can
-be 10x higher than baseline. Always measure on hardware similar to production.
+OS paging if the process memory was swapped. On loaded systems, post-hibernation P99
+can be 10× higher than baseline. Always measure on hardware similar to production.
+
+**5. Reference-counted binaries defeating compaction**
+A state field like `last_request_body: binary` may point into a large shared binary on
+the heap. Even after compaction (removing the field), the reference keeps the binary
+alive. Use `:erlang.process_info(pid, :binary)` to audit binary references before
+and after compaction.
 
 ---
-
-## Summary
-- `:hibernate` reduces idle process memory significantly; combined with state compaction
-  it can cut per-process footprint by 80–95%
-- The cost is first-message latency: plan for P99 spikes of 100–500µs on wake-up
-- Use the built-in GenServer timeout, not `:timer.send_after`, for inactivity detection
-- Always measure with `:recon` and `:timer.tc` before and after — never assume
-
-## What's Next
-Exercise 02 — `handle_continue/2`: lazy initialization and async recovery patterns that
-complement hibernation by keeping startup fast while deferring expensive work.
 
 ## Resources
-- Erlang docs: `:erlang.hibernate/3` — https://www.erlang.org/doc/man/erlang.html#hibernate-3
-- Fred Hébert — "Stuff Goes Bad: Erlang in Anger" (`:recon` usage)
-- Saša Jurić — "Elixir in Action" ch. 12 (process internals)
-- BEAM Wisdoms — Process Memory Layout — http://beam-wisdoms.clau.se/en/latest/
+
+- [`:erlang.hibernate/3` — Erlang/OTP docs](https://www.erlang.org/doc/man/erlang.html#hibernate-3)
+- [`:recon` — Fred Hébert](https://ferd.github.io/recon/) — production-safe introspection
+- [Erlang in Anger — Fred Hébert](https://www.erlang-in-anger.com/) — chapter on process memory (free PDF)
+- [BEAM Wisdoms — Process Memory Layout](http://beam-wisdoms.clau.se/en/latest/eli5-memory.html)
+- [Saša Jurić — Elixir in Action, 2nd ed.](https://www.manning.com/books/elixir-in-action-second-edition) — ch. 12, process internals

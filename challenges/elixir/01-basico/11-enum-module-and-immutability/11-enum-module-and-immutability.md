@@ -1,497 +1,382 @@
-# 11. Enum Module and Immutability
+# Enum and Immutability: Transaction Analytics
 
-**Difficulty**: Basico
-
----
-
-## Prerequisites
-
-- Listas en Elixir (ejercicio 06)
-- Pattern matching básico (ejercicio 05)
-- Funciones anónimas básicas (conocimiento general)
+**Project**: `payments_cli` — built incrementally across the basic level
 
 ---
 
-## Learning Objectives
+## Project context
 
-- Entender que Elixir es inmutable: ninguna operación modifica la lista original
-- Usar `Enum.map/2` para transformar cada elemento de una colección
-- Usar `Enum.filter/2` para seleccionar elementos que cumplen un predicado
-- Usar `Enum.reduce/3` para acumular un resultado desde una colección
-- Usar `Enum.each/2` para ejecutar side effects sobre cada elemento
-- Distinguir cuándo usar `Enum` (eager) vs `Stream` (lazy)
-- Aplicar capture syntax `&` como shorthand de funciones anónimas
+You're building `payments_cli`. The reporting system needs to compute analytics
+over transaction lists: totals by category, top merchants, daily summaries.
+The `Enum` module is the primary tool. This exercise focuses on WHY immutability
+and eager evaluation have concrete consequences in a production system.
 
----
+Project structure at this point:
 
-## Concepts
-
-### Immutability: Los datos nunca se modifican
-
-En Elixir, los datos son **inmutables**. Cuando usas `Enum.map`, no estás modificando
-la lista original — estás creando una **nueva lista** con los resultados transformados.
-
-```elixir
-original = [1, 2, 3]
-doubled  = Enum.map(original, fn x -> x * 2 end)
-
-IO.inspect(original)  # [1, 2, 3]  — sin cambios
-IO.inspect(doubled)   # [2, 4, 6]  — nueva lista
 ```
-
-Esto es fundamentalmente diferente a lenguajes como Python o JavaScript, donde
-`list.push()` o `list.sort()` modifican la lista en el lugar.
-
-### `Enum.map/2`: Transformar cada elemento
-
-`map` aplica una función a cada elemento y retorna una **nueva lista** del mismo tamaño.
-
-```elixir
-# Función anónima completa
-Enum.map([1, 2, 3], fn x -> x * x end)
-# => [1, 4, 9]
-
-# Con capture syntax
-Enum.map([1, 2, 3], &(&1 * &1))
-# => [1, 4, 9]
-
-# Con strings
-Enum.map(["alice", "bob", "carol"], fn name -> String.upcase(name) end)
-# => ["ALICE", "BOB", "CAROL"]
-```
-
-### `Enum.filter/2`: Seleccionar por predicado
-
-`filter` retorna una nueva lista con solo los elementos donde el predicado retorna `true`.
-
-```elixir
-# Solo números pares
-Enum.filter([1, 2, 3, 4, 5], fn x -> rem(x, 2) == 0 end)
-# => [2, 4]
-
-# Solo strings largos
-Enum.filter(["hi", "hello", "hey", "greetings"], fn s -> String.length(s) > 3 end)
-# => ["hello", "greetings"]
-```
-
-### `Enum.reduce/3`: Acumular un resultado
-
-`reduce` colapsa una colección a un solo valor. Requiere un valor inicial (acumulador).
-
-```elixir
-# Sumar todos los elementos (acumulador inicia en 0)
-Enum.reduce([1, 2, 3, 4], 0, fn x, acc -> acc + x end)
-# => 10
-
-# Construir un string desde una lista
-Enum.reduce(["a", "b", "c"], "", fn letter, acc -> acc <> letter end)
-# => "abc"
-
-# Encontrar el máximo
-Enum.reduce([3, 1, 4, 1, 5, 9], 0, fn x, acc -> if x > acc, do: x, else: acc end)
-# => 9
-```
-
-### `Enum.each/2`: Side effects, no transformación
-
-`each` es para **efectos secundarios** (imprimir, escribir a disco, enviar mensajes).
-Siempre retorna `:ok`, nunca retorna los elementos transformados.
-
-```elixir
-result = Enum.each(["alice", "bob"], fn name ->
-  IO.puts("Hello, #{name}!")
-end)
-# Imprime:
-# Hello, alice!
-# Hello, bob!
-
-IO.inspect(result)  # :ok
-```
-
-### Enum vs Stream: Eager vs Lazy
-
-`Enum` procesa **todos los elementos inmediatamente** (eager).
-`Stream` construye un pipeline **sin ejecutarlo** hasta que se necesita (lazy).
-
-```elixir
-# Enum: procesa toda la lista en cada paso
-[1, 2, 3, 4, 5]
-|> Enum.map(&(&1 * 2))    # crea lista intermedia [2, 4, 6, 8, 10]
-|> Enum.filter(&(&1 > 4)) # crea lista final [6, 8, 10]
-
-# Stream: construye el pipeline, ejecuta una sola vez al final
-[1, 2, 3, 4, 5]
-|> Stream.map(&(&1 * 2))    # no ejecuta nada aún
-|> Stream.filter(&(&1 > 4)) # no ejecuta nada aún
-|> Enum.to_list()           # ejecuta todo: [6, 8, 10]
-```
-
-Para colecciones pequeñas usa `Enum`. Para colecciones muy grandes o infinitas, `Stream`.
-
-### Capture syntax `&`
-
-`&` es shorthand para crear funciones anónimas. `&1` es el primer argumento.
-
-```elixir
-# Equivalentes:
-fn x -> x * 2 end
-&(&1 * 2)
-
-# Function capture: referencia a una función existente
-fn x -> String.upcase(x) end
-&String.upcase/1   # módulo.función/aridad
-
-# Con dos argumentos
-fn x, y -> x + y end
-&(&1 + &2)
+payments_cli/
+├── lib/
+│   └── payments_cli/
+│       ├── cli.ex
+│       ├── transaction.ex
+│       ├── ledger.ex
+│       ├── formatter.ex
+│       ├── pipeline.ex
+│       ├── processor.ex
+│       ├── router.ex
+│       └── analytics.ex    # ← you implement this
+├── test/
+│   └── payments_cli/
+│       └── analytics_test.exs  # given tests — must pass without modification
+└── mix.exs
 ```
 
 ---
 
-## Exercises
+## Why immutability matters for analytics — not just correctness
 
-### Ejercicio 1: map — transformar elementos
+In a mutable language, this code is dangerous:
 
-```elixir
-# Multiplica cada número por 2
-result = Enum.map([1, 2, 3], fn x -> x * 2 end)
-IO.inspect(result)
+```python
+# Python — dangerous
+def top_merchants(transactions):
+    transactions.sort(key=lambda t: t['amount'], reverse=True)  # mutates input!
+    return [t['merchant'] for t in transactions[:5]]
 ```
 
-**Expected output:**
-```
-[2, 4, 6]
-```
+Calling `top_merchants(txs)` changes the order of `txs` for every subsequent caller.
+In Elixir, `Enum.sort/2` returns a new list. The original `txs` is never touched.
+
+This is not just a correctness guarantee — it enables safe concurrency. Multiple
+processes can read the same transaction list simultaneously without locks because
+no process can modify the data. This is the foundation of Elixir's concurrency model.
+
+The practical implication for analytics: you can pass the same transaction list through
+ten different `Enum` pipelines in parallel and each produces its own result without
+interfering with the others.
 
 ---
 
-### Ejercicio 2: filter — seleccionar por condición
+## The business problem
 
-```elixir
-# Filtra solo los números pares
-evens = Enum.filter([1, 2, 3, 4, 5], fn x -> rem(x, 2) == 0 end)
-IO.inspect(evens)
+The `Analytics` module needs to:
 
-# También puedes filtrar por valor negativo (rechazar impares)
-odds = Enum.filter([1, 2, 3, 4, 5], fn x -> rem(x, 2) != 0 end)
-IO.inspect(odds)
-```
-
-**Expected output:**
-```
-[2, 4]
-[1, 3, 5]
-```
+1. Compute revenue statistics (total, average, percentiles)
+2. Find the top N merchants by transaction volume
+3. Build a per-day summary grouped by date
+4. Identify suspicious patterns (multiple large transactions from same merchant)
 
 ---
 
-### Ejercicio 3: reduce — acumular resultado
+## Implementation
+
+### `lib/payments_cli/analytics.ex`
 
 ```elixir
-# Suma todos los elementos, acumulador inicia en 0
-total = Enum.reduce([1, 2, 3, 4], 0, fn x, acc -> acc + x end)
-IO.inspect(total)
+defmodule PaymentsCli.Analytics do
+  @moduledoc """
+  Computes analytics and reports over transaction lists.
 
-# Concatenar strings
-sentence = Enum.reduce(["Elixir", " ", "is", " ", "fun"], "", fn word, acc ->
-  acc <> word
-end)
-IO.inspect(sentence)
-```
+  All functions are pure — no side effects, no mutation. The same transaction
+  list can be passed to multiple functions and each produces independent results.
 
-**Expected output:**
-```
-10
-"Elixir is fun"
-```
+  Uses Enum (eager) throughout. Switch to Stream for datasets > 1M transactions
+  where intermediate list allocations become a memory concern.
+  """
 
----
+  @doc """
+  Computes revenue statistics for a list of approved transactions.
 
-### Ejercicio 4: each — side effects
+  Returns a map with :total, :count, :average, :min, :max.
+  Returns {:error, :no_approved_transactions} if no approved transactions exist.
 
-```elixir
-# each ejecuta una acción por cada elemento
-result = Enum.each(["alice", "bob"], fn name ->
-  IO.puts("Hello, #{name}!")
-end)
+  ## Examples
 
-# ¿Qué retorna each?
-IO.inspect(result)
-```
+      iex> txs = [
+      ...>   %{status: :approved, amount_cents: 1000},
+      ...>   %{status: :approved, amount_cents: 3000},
+      ...>   %{status: :declined, amount_cents: 500}
+      ...> ]
+      iex> PaymentsCli.Analytics.revenue_stats(txs)
+      {:ok, %{total: 4000, count: 2, average: 2000, min: 1000, max: 3000}}
 
-**Expected output:**
-```
-Hello, alice!
-Hello, bob!
-:ok
-```
+  """
+  @spec revenue_stats([map()]) :: {:ok, map()} | {:error, :no_approved_transactions}
+  def revenue_stats(transactions) when is_list(transactions) do
+    # TODO: implement
+    #
+    # Step 1: filter to approved only
+    # Step 2: extract amount_cents (Enum.map)
+    # Step 3: if amounts is empty, return {:error, :no_approved_transactions}
+    # Step 4: compute stats
+    #   total   = Enum.sum(amounts)
+    #   count   = length(amounts)
+    #   average = div(total, count)
+    #   min     = Enum.min(amounts)
+    #   max     = Enum.max(amounts)
+    # Step 5: return {:ok, %{total: ..., count: ..., average: ..., min: ..., max: ...}}
+  end
 
----
+  @doc """
+  Returns the top N merchants by total transaction amount (approved only).
 
-### Ejercicio 5: Capture syntax `&`
+  Sorted descending by total amount. Ties broken alphabetically by merchant name.
 
-```elixir
-# Cuadrado de cada número — forma larga
-squares_long = Enum.map([1, 2, 3], fn x -> x * x end)
-IO.inspect(squares_long)
+  ## Examples
 
-# Cuadrado de cada número — con capture syntax
-squares_short = Enum.map([1, 2, 3], &(&1 * &1))
-IO.inspect(squares_short)
+      iex> txs = [
+      ...>   %{status: :approved, merchant: "Shop A", amount_cents: 1000},
+      ...>   %{status: :approved, merchant: "Shop B", amount_cents: 3000},
+      ...>   %{status: :approved, merchant: "Shop A", amount_cents: 500}
+      ...> ]
+      iex> PaymentsCli.Analytics.top_merchants(txs, 2)
+      [{"Shop B", 3000}, {"Shop A", 1500}]
 
-# Function capture: referencia a función existente
-uppercased = Enum.map(["hello", "world"], &String.upcase/1)
-IO.inspect(uppercased)
-```
+  """
+  @spec top_merchants([map()], pos_integer()) :: [{String.t(), integer()}]
+  def top_merchants(transactions, n) when is_list(transactions) and is_integer(n) and n > 0 do
+    # TODO: implement
+    #
+    # Step 1: filter to :approved
+    # Step 2: Enum.group_by(fn tx -> tx.merchant end)
+    #         -> %{"Shop A" => [tx1, tx2], "Shop B" => [tx3]}
+    # Step 3: Enum.map each group to {merchant, total_amount}
+    #         Enum.map(groups, fn {merchant, txs} -> {merchant, Enum.sum(Enum.map(txs, & &1.amount_cents))} end)
+    # Step 4: Sort: Enum.sort_by(fn {_m, total} -> total end, :desc)
+    # Step 5: Enum.take(n)
+  end
 
-**Expected output:**
-```
-[1, 4, 9]
-[1, 4, 9]
-["HELLO", "WORLD"]
-```
+  @doc """
+  Groups transactions by date string and sums amounts per day.
 
----
+  Transactions must have a :date field (string "YYYY-MM-DD").
+  Returns a map %{date_string => total_cents}.
 
-### Ejercicio 6: Inmutabilidad en acción
+  ## Examples
 
-```elixir
-# La lista original NUNCA se modifica
-original = [1, 2, 3]
-doubled  = Enum.map(original, &(&1 * 2))
-filtered = Enum.filter(original, &(&1 > 1))
+      iex> txs = [
+      ...>   %{date: "2024-01-15", amount_cents: 1000, status: :approved},
+      ...>   %{date: "2024-01-15", amount_cents: 500,  status: :approved},
+      ...>   %{date: "2024-01-16", amount_cents: 2000, status: :approved}
+      ...> ]
+      iex> PaymentsCli.Analytics.daily_totals(txs)
+      %{"2024-01-15" => 1500, "2024-01-16" => 2000}
 
-IO.puts("original:")
-IO.inspect(original)
+  """
+  @spec daily_totals([map()]) :: %{String.t() => integer()}
+  def daily_totals(transactions) when is_list(transactions) do
+    # TODO: implement
+    #
+    # Step 1: filter to :approved
+    # Step 2: Enum.group_by(fn tx -> tx.date end)
+    # Step 3: Enum.map each group to {date, sum_of_amounts}
+    # Step 4: Map.new from the list of {date, total} tuples
+  end
 
-IO.puts("doubled:")
-IO.inspect(doubled)
+  @doc """
+  Finds merchants with suspiciously many large transactions.
 
-IO.puts("filtered:")
-IO.inspect(filtered)
+  "Suspicious" means: same merchant has >= threshold_count transactions
+  where each transaction amount_cents > large_amount_threshold.
 
-IO.puts("original again (unchanged):")
-IO.inspect(original)
-```
+  Returns a list of suspicious merchant names.
 
-**Expected output:**
-```
-original:
-[1, 2, 3]
-doubled:
-[2, 4, 6]
-filtered:
-[2, 3]
-original again (unchanged):
-[1, 2, 3]
-```
+  ## Examples
 
----
+      iex> txs = [
+      ...>   %{merchant: "Casino", amount_cents: 50_000, status: :approved},
+      ...>   %{merchant: "Casino", amount_cents: 60_000, status: :approved},
+      ...>   %{merchant: "Casino", amount_cents: 55_000, status: :approved},
+      ...>   %{merchant: "Coffee", amount_cents: 500,    status: :approved}
+      ...> ]
+      iex> PaymentsCli.Analytics.suspicious_merchants(txs, 3, 10_000)
+      ["Casino"]
 
-### Ejercicio 7: Chaining con pipe operator
-
-```elixir
-# Procesar una lista en pasos encadenados:
-# 1. Filtrar positivos
-# 2. Multiplicar por 10
-# 3. Sumar todo
-
-result =
-  [1, -2, 3, -4, 5]
-  |> Enum.filter(&(&1 > 0))
-  |> Enum.map(&(&1 * 10))
-  |> Enum.sum()
-
-IO.inspect(result)
-
-# Mismo resultado, sin pipe (difícil de leer):
-result2 = Enum.sum(Enum.map(Enum.filter([1, -2, 3, -4, 5], &(&1 > 0)), &(&1 * 10)))
-IO.inspect(result2)
-```
-
-**Expected output:**
-```
-90
-90
-```
-
----
-
-## Common Mistakes
-
-### Error 1: Pensar que `Enum.map` muta la lista original
-
-```elixir
-# WRONG — pensando que map modifica original_list
-original_list = [1, 2, 3]
-Enum.map(original_list, &(&1 * 2))
-IO.inspect(original_list)  # espero [2, 4, 6]...
-```
-
-```
-# Error conceptual — no es un error de compilación, pero el resultado sorprende:
-[1, 2, 3]  # original_list sigue siendo [1, 2, 3]
-```
-
-**Why**: `Enum.map` nunca modifica la lista original. Crea y retorna una nueva lista.
-
-**Fix**:
-```elixir
-original_list = [1, 2, 3]
-doubled = Enum.map(original_list, &(&1 * 2))  # asigna el resultado
-IO.inspect(doubled)  # [2, 4, 6]
-```
-
----
-
-### Error 2: Usar `Enum.each` cuando quieres transformar
-
-```elixir
-# WRONG — each retorna :ok, no la lista transformada
-result = Enum.each([1, 2, 3], fn x -> x * 2 end)
-IO.inspect(result)
-```
-
-```
-:ok   # no es [2, 4, 6]
-```
-
-**Why**: `each` es para side effects (imprimir, loggear, etc.), no para transformar.
-Siempre retorna `:ok`.
-
-**Fix**:
-```elixir
-# Para transformar, usa map
-result = Enum.map([1, 2, 3], fn x -> x * 2 end)
-IO.inspect(result)  # [2, 4, 6]
-```
-
----
-
-### Error 3: `Enum.sum` sobre lista vacía
-
-```elixir
-# Sorpresa: esto NO lanza error
-result = Enum.sum([])
-IO.inspect(result)
-```
-
-```
-0
-```
-
-**Why**: El acumulador de `sum` tiene identidad `0` para la suma. Una lista vacía
-reducida con suma da el elemento neutro (0). Lo mismo aplica a `Enum.reduce([], 0, ...)`.
-
-**Fix**: Si necesitas distinguir lista vacía de "suma = 0", verifica antes:
-```elixir
-list = []
-if Enum.empty?(list) do
-  IO.puts("Lista vacía")
-else
-  IO.inspect(Enum.sum(list))
+  """
+  @spec suspicious_merchants([map()], pos_integer(), pos_integer()) :: [String.t()]
+  def suspicious_merchants(transactions, threshold_count, large_amount_threshold)
+      when is_list(transactions) and is_integer(threshold_count) and
+             is_integer(large_amount_threshold) do
+    # TODO: implement
+    #
+    # Step 1: filter to :approved AND amount_cents > large_amount_threshold
+    # Step 2: Enum.group_by(fn tx -> tx.merchant end)
+    # Step 3: filter groups where length(txs) >= threshold_count
+    # Step 4: extract merchant names (map over remaining groups)
+    # Step 5: sort for deterministic output
+  end
 end
 ```
 
----
-
-### Error 4: Confundir `rem/2` con `mod` de otros lenguajes
+### Given tests — must pass without modification
 
 ```elixir
-# WRONG — en algunos lenguajes negativo % 2 da resultados distintos
-IO.inspect(rem(-3, 2))  # ¿cuánto da?
+# test/payments_cli/analytics_test.exs
+defmodule PaymentsCli.AnalyticsTest do
+  use ExUnit.Case, async: true
+
+  alias PaymentsCli.Analytics
+
+  @transactions [
+    %{id: "T1", status: :approved, merchant: "Coffee Co",  amount_cents: 450,    date: "2024-01-15"},
+    %{id: "T2", status: :approved, merchant: "Gas Station", amount_cents: 8000,   date: "2024-01-15"},
+    %{id: "T3", status: :declined, merchant: "Coffee Co",  amount_cents: 300,    date: "2024-01-15"},
+    %{id: "T4", status: :approved, merchant: "Coffee Co",  amount_cents: 520,    date: "2024-01-16"},
+    %{id: "T5", status: :approved, merchant: "Gas Station", amount_cents: 7500,   date: "2024-01-16"},
+    %{id: "T6", status: :approved, merchant: "Supermarket", amount_cents: 15000,  date: "2024-01-16"}
+  ]
+
+  describe "revenue_stats/1" do
+    test "computes stats for approved transactions only" do
+      assert {:ok, stats} = Analytics.revenue_stats(@transactions)
+      # T3 is declined — excluded
+      assert stats.count == 5
+      # 450 + 8000 + 520 + 7500 + 15000 = 31470
+      assert stats.total == 31_470
+      assert stats.min == 450
+      assert stats.max == 15_000
+    end
+
+    test "returns error for empty list" do
+      assert {:error, :no_approved_transactions} = Analytics.revenue_stats([])
+    end
+
+    test "returns error when all transactions are declined" do
+      declined = [%{status: :declined, amount_cents: 100}]
+      assert {:error, :no_approved_transactions} = Analytics.revenue_stats(declined)
+    end
+
+    test "does not mutate the original list" do
+      original_count = length(@transactions)
+      Analytics.revenue_stats(@transactions)
+      assert length(@transactions) == original_count
+    end
+  end
+
+  describe "top_merchants/2" do
+    test "returns top N merchants by total amount" do
+      result = Analytics.top_merchants(@transactions, 2)
+      assert length(result) == 2
+      # Gas Station: 8000 + 7500 = 15500
+      # Supermarket: 15000
+      # Coffee Co: 450 + 520 = 970
+      [{top_merchant, top_total} | _] = result
+      # Either Gas Station or Supermarket could be first — check both candidates
+      assert top_total >= 15_000
+    end
+
+    test "excludes declined transactions" do
+      declined_only = [%{status: :declined, merchant: "Evil Co", amount_cents: 999_999}]
+      result = Analytics.top_merchants(declined_only, 5)
+      assert result == []
+    end
+
+    test "returns fewer than N when not enough merchants" do
+      result = Analytics.top_merchants(@transactions, 100)
+      # Only 3 unique merchants with approved transactions
+      assert length(result) == 3
+    end
+  end
+
+  describe "daily_totals/1" do
+    test "groups and sums by date" do
+      totals = Analytics.daily_totals(@transactions)
+      # 2024-01-15: 450 + 8000 = 8450 (T3 declined)
+      assert totals["2024-01-15"] == 8_450
+      # 2024-01-16: 520 + 7500 + 15000 = 23020
+      assert totals["2024-01-16"] == 23_020
+    end
+
+    test "returns empty map for empty input" do
+      assert Analytics.daily_totals([]) == %{}
+    end
+  end
+
+  describe "suspicious_merchants/3" do
+    test "finds merchants with many large transactions" do
+      txs = [
+        %{merchant: "Casino", amount_cents: 50_000, status: :approved},
+        %{merchant: "Casino", amount_cents: 60_000, status: :approved},
+        %{merchant: "Casino", amount_cents: 55_000, status: :approved},
+        %{merchant: "Coffee", amount_cents: 500,    status: :approved}
+      ]
+      result = Analytics.suspicious_merchants(txs, 3, 10_000)
+      assert result == ["Casino"]
+    end
+
+    test "returns empty list when no merchants meet threshold" do
+      result = Analytics.suspicious_merchants(@transactions, 10, 1_000)
+      assert result == []
+    end
+  end
+end
 ```
 
-```
--1   # en Elixir, rem/2 sigue el signo del dividendo
-```
-
-**Why**: `rem(-3, 2)` en Elixir es `-1`, no `1`. Si necesitas siempre positivo:
-
-**Fix**:
-```elixir
-# Para verificar paridad de forma segura:
-is_even = fn x -> rem(abs(x), 2) == 0 end
-IO.inspect(is_even.(-4))  # true
-```
-
----
-
-## Verification
-
-Abre IEx y ejecuta cada ejercicio:
+### Run the tests
 
 ```bash
-iex
-```
-
-```elixir
-# Ejercicio 1
-Enum.map([1, 2, 3], fn x -> x * 2 end)
-# => [2, 4, 6]
-
-# Ejercicio 2
-Enum.filter([1, 2, 3, 4, 5], fn x -> rem(x, 2) == 0 end)
-# => [2, 4]
-
-# Ejercicio 3
-Enum.reduce([1, 2, 3, 4], 0, fn x, acc -> acc + x end)
-# => 10
-
-# Ejercicio 4
-Enum.each(["alice", "bob"], fn name -> IO.puts("Hello, #{name}!") end)
-# Hello, alice!
-# Hello, bob!
-# :ok
-
-# Ejercicio 5
-Enum.map(["hello", "world"], &String.upcase/1)
-# => ["HELLO", "WORLD"]
-
-# Ejercicio 6 — inmutabilidad
-original = [1, 2, 3]
-_doubled = Enum.map(original, &(&1 * 2))
-original
-# => [1, 2, 3]
-
-# Ejercicio 7
-[1, -2, 3, -4, 5] |> Enum.filter(&(&1 > 0)) |> Enum.map(&(&1 * 10)) |> Enum.sum()
-# => 90
-```
-
-Para explorar más funciones del módulo Enum:
-
-```elixir
-# En IEx:
-Enum.__info__(:functions) |> Keyword.keys() |> Enum.sort()
+mix test test/payments_cli/analytics_test.exs --trace
 ```
 
 ---
 
-## Summary
+## Trade-off analysis
 
-- **Inmutabilidad**: `Enum.map`, `Enum.filter`, `Enum.reduce` nunca modifican la
-  colección original — siempre retornan una nueva colección.
-- **map**: transforma cada elemento → nueva lista del mismo tamaño.
-- **filter**: selecciona elementos → nueva lista de igual o menor tamaño.
-- **reduce**: colapsa a un valor → cualquier tipo (número, string, mapa, etc.).
-- **each**: side effects → siempre retorna `:ok`.
-- **Capture syntax `&`**: shorthand para funciones simples (`&(&1 * 2)`) y para
-  capturar funciones existentes (`&String.upcase/1`).
-- **Enum vs Stream**: Enum es eager (inmediato), Stream es lazy (diferido).
+| Aspect | Enum (eager, your impl) | Stream (lazy) | Manual recursion |
+|--------|------------------------|---------------|-----------------|
+| Memory | Intermediate lists allocated | No intermediate lists | Controlled by accumulator |
+| When to prefer | Datasets < 1M rows, simple pipelines | Very large datasets, IO-bound | Complex custom logic |
+| Debugging | `IO.inspect/2` after any step | Need to materialize first | Trace in function head |
+| Parallelism | `Task.async_stream` wraps Enum | `Stream` + `Task` | Explicit |
+| Code clarity | Most readable | Good for generators | Most control |
+
+Reflection question: `revenue_stats/1` makes three passes over the approved transactions
+list (filter, then map, then multiple Enum calls). Could you compute total, min, max,
+and count in a single `Enum.reduce/3`? Write it. When would the single-pass version
+be meaningfully faster?
 
 ---
 
-## What's Next
+## Common production mistakes
 
-- **Ejercicio 12**: Pipe operator `|>` para encadenar transformaciones de forma legible
-- **Ejercicio 13**: Funciones anónimas y closures en profundidad
-- **Stream module**: colecciones lazy para grandes conjuntos de datos
+**1. `Enum.each/2` when you want `Enum.map/2`**
+`Enum.each/2` always returns `:ok` — the transformed values are discarded.
+If you compute `Enum.each(txs, fn tx -> tx.amount_cents * 2 end)`, the doubled
+amounts are lost. Use `Enum.map/2` when you need the results.
+
+**2. `Enum.sort/1` on maps sorts by key/value tuples, not by a field**
+```elixir
+# WRONG — sorts maps by {key, value} tuple order, not by :amount_cents
+Enum.sort(transactions)
+
+# CORRECT — sort by a specific field
+Enum.sort_by(transactions, fn tx -> tx.amount_cents end, :desc)
+```
+
+**3. Chained `Enum` on very large datasets**
+Five `Enum` operations on a 1M-element list creates five intermediate lists,
+each 1M elements. Switch to `Stream` for lazy evaluation when intermediate
+allocations become a memory concern. The change is mechanical: replace `Enum.`
+with `Stream.` and add `|> Enum.to_list()` at the end.
+
+**4. `Enum.group_by/2` and expecting sorted keys**
+`Enum.group_by/2` returns a map. Maps do not guarantee key order. Always sort
+the keys explicitly when the order matters for output: `Map.keys(groups) |> Enum.sort()`.
+
+**5. Using `Enum.count/1` when pattern already filters**
+```elixir
+# Inefficient: builds filtered list then counts it
+Enum.count(Enum.filter(txs, &(&1.status == :approved)))
+
+# Efficient: Enum.count/2 with predicate — single pass
+Enum.count(txs, fn tx -> tx.status == :approved end)
+```
 
 ---
 
 ## Resources
 
-- [Enum module — HexDocs](https://hexdocs.pm/elixir/Enum.html)
+- [Enum — HexDocs](https://hexdocs.pm/elixir/Enum.html) — especially `group_by/2`, `sort_by/3`, `reduce/3`
+- [Stream — HexDocs](https://hexdocs.pm/elixir/Stream.html) — when to switch from Enum
 - [Elixir School — Enum](https://elixirschool.com/en/lessons/basics/enum)
-- [Stream module — HexDocs](https://hexdocs.pm/elixir/Stream.html)
+- [Elixir in Action — Chapter 4: data abstractions](https://www.manning.com/books/elixir-in-action-third-edition)

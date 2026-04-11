@@ -1,436 +1,434 @@
-# 12. Pipe Operator and Composition
+# Pipe Operator: Transaction Processing Pipelines
 
-**Difficulty**: Basico
-
----
-
-## Prerequisites
-
-- Funciones básicas en Elixir (ejercicio 08)
-- Módulo Enum (ejercicio 11)
-- String functions básicas
+**Project**: `payments_cli` — built incrementally across the basic level
 
 ---
 
-## Learning Objectives
+## Project context
 
-- Entender qué hace el operador `|>` y cómo transforma el código
-- Reescribir llamadas anidadas como pipelines lineales y legibles
-- Saber que `data |> func(arg2)` equivale a `func(data, arg2)`
-- Usar `IO.inspect/2` con `label:` para depurar pipelines paso a paso
-- Aplicar pipeline thinking: modelar transformaciones como pasos secuenciales
-- Reconocer cuándo un pipeline tiene demasiados pasos y debe extraerse
+You're building `payments_cli`. The reporting system chains many transformation
+steps: parse, validate, enrich, filter, aggregate, format. Without `|>`, each step
+becomes a nested function call. The pipe operator makes the data flow explicit and
+readable — but only when used with discipline.
 
----
-
-## Concepts
-
-### El operador `|>`: qué hace exactamente
-
-`|>` toma el valor de la izquierda y lo pasa como **primer argumento** a la función
-de la derecha.
-
-```elixir
-# Sin pipe — se lee de adentro hacia afuera
-String.downcase(String.trim("  Hello World  "))
-# => "hello world"
-
-# Con pipe — se lee de arriba hacia abajo
-"  Hello World  "
-|> String.trim()
-|> String.downcase()
-# => "hello world"
-```
-
-Ambas expresiones son **idénticas**. El pipe es azúcar sintáctica — no cambia la
-semántica, solo la disposición visual.
-
-### Regla del primer argumento
-
-El valor del lado izquierdo siempre se inserta como el **primer argumento**:
-
-```elixir
-# data |> func(a, b)  ==  func(data, a, b)
-
-[3, 1, 4, 1, 5]
-|> Enum.sort()                   # Enum.sort([3, 1, 4, 1, 5])
-|> Enum.uniq()                   # Enum.uniq([1, 3, 4, 5])
-|> Enum.reverse()                # Enum.reverse([1, 3, 4, 5])
-# => [5, 4, 3, 1]
-
-# Con argumentos adicionales
-"hello world"
-|> String.split(" ")             # String.split("hello world", " ")
-|> Enum.map(&String.capitalize/1)
-|> Enum.join(", ")               # Enum.join(["Hello", "World"], ", ")
-# => "Hello, World"
-```
-
-### Composición vs anidación
-
-La anidación profunda se lee de adentro hacia afuera, lo cual es cognitivamente costoso.
-Los pipelines se leen en orden de ejecución.
-
-```elixir
-# Anidación — ¿cuál se ejecuta primero?
-Enum.sum(Enum.map(Enum.filter([1, 2, 3, 4, 5], &(rem(&1, 2) == 0)), &(&1 * 10)))
-
-# Pipeline — cada paso es obvio
-[1, 2, 3, 4, 5]
-|> Enum.filter(&(rem(&1, 2) == 0))  # paso 1: [2, 4]
-|> Enum.map(&(&1 * 10))             # paso 2: [20, 40]
-|> Enum.sum()                       # paso 3: 60
-```
-
-### Depurar con `IO.inspect/2`
-
-`IO.inspect` retorna su argumento sin modificarlo, lo que permite insertarlo en
-cualquier punto del pipeline para ver el estado intermedio.
-
-```elixir
-[1, 2, 3]
-|> IO.inspect(label: "original")
-|> Enum.map(&(&1 * 2))
-|> IO.inspect(label: "doubled")
-|> Enum.filter(&(&1 > 3))
-|> IO.inspect(label: "filtered")
-```
+Project structure at this point:
 
 ```
-original: [1, 2, 3]
-doubled: [2, 4, 6]
-filtered: [4, 6]
-```
-
-### Pipeline thinking
-
-Modelar una transformación como una serie de pasos secuenciales:
-
-1. ¿Qué dato tengo al inicio?
-2. ¿Qué pasos lo transforman hasta el resultado final?
-3. Cada paso recibe el output del anterior como primer argumento.
-
-```elixir
-# Dado: lista de usuarios (maps) con :name y :age
-# Quiero: nombres (string) de usuarios mayores de edad, ordenados
-
-users = [
-  %{name: "Alice", age: 30},
-  %{name: "Bob", age: 16},
-  %{name: "Carol", age: 25}
-]
-
-result =
-  users
-  |> Enum.filter(fn u -> u.age >= 18 end)   # solo adultos
-  |> Enum.map(fn u -> u.name end)            # extraer nombres
-  |> Enum.sort()                             # ordenar
-# => ["Alice", "Carol"]
+payments_cli/
+├── lib/
+│   └── payments_cli/
+│       ├── cli.ex
+│       ├── transaction.ex
+│       ├── ledger.ex
+│       ├── formatter.ex
+│       ├── pipeline.ex
+│       ├── processor.ex
+│       ├── router.ex
+│       ├── analytics.ex
+│       └── report.ex       # ← you implement this
+├── test/
+│   └── payments_cli/
+│       └── report_test.exs  # given tests — must pass without modification
+└── mix.exs
 ```
 
 ---
 
-## Exercises
+## Why `|>` is more than syntactic sugar
 
-### Ejercicio 1: Sin pipe — funciones anidadas
+`data |> f(a) |> g(b)` is exactly `g(f(data, a), b)`. The semantics are identical.
+The difference is cognitive: the pipe version reads in execution order, the nested
+version reads inside-out.
 
-```elixir
-# Difícil de leer: se ejecuta de adentro hacia afuera
-result = String.downcase(String.trim("  Hello World  "))
-IO.inspect(result)
+For payment reporting, this matters because:
 
-# ¿En qué orden se ejecutan las funciones?
-# 1. String.trim/1
-# 2. String.downcase/1
-```
+1. A report pipeline has 5-8 steps in a fixed order
+2. Each step receives the result of the previous step
+3. The data type changes through the pipeline (list → grouped map → sorted list → string)
 
-**Expected output:**
-```
-"hello world"
-```
+The pipe expresses the **intent** of the transformation as a sequence of steps,
+not as a composition of functions. Intent-revealing code is maintainable code.
 
----
-
-### Ejercicio 2: Con pipe — mismo resultado, más legible
-
-```elixir
-# Fácil de leer: se ejecuta de arriba hacia abajo
-result =
-  "  Hello World  "
-  |> String.trim()
-  |> String.downcase()
-
-IO.inspect(result)
-```
-
-**Expected output:**
-```
-"hello world"
-```
+The constraint that every piped function must accept the previous result as its
+**first argument** is a design pressure: it pushes you to design functions that
+work well with the data they transform, not functions that take configuration first.
 
 ---
 
-### Ejercicio 3: Pipe con múltiples argumentos
+## The business problem
 
-```elixir
-# |> pasa el dato como PRIMER argumento
-# Los argumentos adicionales se añaden después
-result =
-  [3, 1, 4, 1, 5, 9, 2, 6]
-  |> Enum.sort()
-  |> Enum.uniq()
-  |> Enum.reverse()
-
-IO.inspect(result)
-
-# Equivalente sin pipe:
-result2 = Enum.reverse(Enum.uniq(Enum.sort([3, 1, 4, 1, 5, 9, 2, 6])))
-IO.inspect(result2)
-```
-
-**Expected output:**
-```
-[9, 6, 5, 4, 3, 2, 1]
-[9, 6, 5, 4, 3, 2, 1]
-```
+The `Report` module generates formatted transaction reports. Each report type is
+a pipeline from raw transactions to a formatted string.
 
 ---
 
-### Ejercicio 4: Depurar con `IO.inspect`
+## Implementation
+
+### `lib/payments_cli/report.ex`
 
 ```elixir
-# IO.inspect retorna su argumento — se puede insertar en cualquier paso
-[1, 2, 3]
-|> IO.inspect(label: "original")
-|> Enum.map(&(&1 * 2))
-|> IO.inspect(label: "doubled")
-|> Enum.filter(&(&1 > 3))
-|> IO.inspect(label: "filtered")
-```
+defmodule PaymentsCli.Report do
+  @moduledoc """
+  Generates formatted transaction reports by composing transformation pipelines.
 
-**Expected output:**
-```
-original: [1, 2, 3]
-doubled: [2, 4, 6]
-filtered: [4, 6]
-```
+  Each public function is a pipeline: transactions in, formatted string out.
+  The pipe operator makes each step explicit and independently testable.
+  """
 
----
+  alias PaymentsCli.Analytics
 
-### Ejercicio 5: Pipeline con strings — iniciales
+  @doc """
+  Generates a summary report for a list of transactions.
 
-```elixir
-# Dado un nombre completo, extrae las iniciales separadas por punto
-initials =
-  "alice marie smith"
-  |> String.split()                    # ["alice", "marie", "smith"]
-  |> Enum.map(&String.first/1)         # ["a", "m", "s"]
-  |> Enum.map(&String.upcase/1)        # ["A", "M", "S"]
-  |> Enum.join(".")                    # "A.M.S"
+  Format:
+    === Transaction Summary ===
+    Total transactions: N
+    Approved: N (total: $X.XX)
+    Declined: N
+    Under review: N
 
-IO.inspect(initials)
-```
+  ## Examples
 
-**Expected output:**
-```
-"A.M.S"
-```
+      iex> txs = [%{status: :approved, amount_cents: 1000, currency: "USD"}, ...]
+      iex> PaymentsCli.Report.summary(txs)
+      "=== Transaction Summary ===\\nTotal transactions: 1\\nApproved: 1 ..."
 
----
+  """
+  @spec summary([map()]) :: String.t()
+  def summary(transactions) when is_list(transactions) do
+    # TODO: implement as a pipeline
+    #
+    # stats = transactions
+    #   |> compute_summary_stats()
+    #   |> format_summary()
+    #
+    # Implement compute_summary_stats/1 as a private function that returns a map
+    # with counts and totals, then format_summary/1 that converts it to a string.
+    #
+    # The key discipline: each step transforms data, returns a value, and is independently testable.
+  end
 
-### Ejercicio 6: Pipeline real — procesar lista de usuarios
+  @doc """
+  Generates a per-merchant breakdown report.
 
-```elixir
-users = [
-  %{name: "Alice", age: 30, active: true},
-  %{name: "Bob", age: 16, active: true},
-  %{name: "Carol", age: 25, active: false},
-  %{name: "Dave", age: 22, active: true},
-  %{name: "Eve", age: 17, active: false}
-]
+  Format: one line per merchant, sorted by total descending.
+    === Merchant Report ===
+    Gas Station: 2 transactions, $155.00 total
+    Supermarket: 1 transaction, $150.00 total
 
-# Quiero: nombres de usuarios activos y adultos, ordenados alfabéticamente
-result =
-  users
-  |> Enum.filter(fn u -> u.active end)           # solo activos
-  |> Enum.filter(fn u -> u.age >= 18 end)        # solo adultos
-  |> Enum.map(fn u -> u.name end)                # extraer nombres
-  |> Enum.sort()                                 # orden alfabético
+  """
+  @spec merchant_report([map()], pos_integer()) :: String.t()
+  def merchant_report(transactions, top_n \\ 10) when is_list(transactions) do
+    # TODO: implement as a pipeline
+    #
+    # transactions
+    # |> Analytics.top_merchants(top_n)
+    # |> Enum.map(fn {merchant, total_cents} -> format_merchant_line(merchant, total_cents) end)
+    # |> then(fn lines -> ["=== Merchant Report ===" | lines] end)
+    # |> Enum.join("\n")
+    #
+    # Note: `then/2` applies a function to the pipeline result.
+    # It is useful when you need to wrap or transform the accumulated value.
+  end
 
-IO.inspect(result)
-```
+  @doc """
+  Generates a CSV export of approved transactions.
 
-**Expected output:**
-```
-["Alice", "Dave"]
-```
+  Columns: id, date, merchant, amount, currency, status
+  """
+  @spec to_csv_report([map()]) :: String.t()
+  def to_csv_report(transactions) when is_list(transactions) do
+    # TODO: implement as a pipeline
+    #
+    # header = "id,date,merchant,amount_cents,currency,status"
+    #
+    # body =
+    #   transactions
+    #   |> Enum.filter(fn tx -> tx.status == :approved end)
+    #   |> Enum.sort_by(fn tx -> tx.id end)
+    #   |> Enum.map(&transaction_to_csv_line/1)
+    #   |> Enum.join("\n")
+    #
+    # header <> "\n" <> body
+  end
 
----
+  @doc """
+  Generates a daily totals report with trend indication.
 
-## Common Mistakes
+  Format:
+    === Daily Report ===
+    2024-01-15: $84.50 (↑ 12% from prior day)
+    2024-01-16: $230.20
 
-### Error 1: Creer que `|>` pasa el dato como último argumento
+  For the first day, omit the trend indicator.
+  """
+  @spec daily_report([map()]) :: String.t()
+  def daily_report(transactions) when is_list(transactions) do
+    # TODO: implement as a pipeline
+    #
+    # transactions
+    # |> Analytics.daily_totals()             -- %{date => total}
+    # |> Enum.sort_by(fn {date, _} -> date end) -- sorted by date
+    # |> add_trend_indicators()               -- private helper adds % change
+    # |> Enum.map(&format_daily_line/1)       -- format each day
+    # |> then(fn lines -> ["=== Daily Report ===" | lines] end)
+    # |> Enum.join("\n")
+  end
 
-```elixir
-# WRONG — confusión sobre la posición del argumento
-data = [1, 2, 3]
+  # ---------------------------------------------------------------------------
+  # Private helpers — each one does one thing
+  # ---------------------------------------------------------------------------
 
-# ¿Esto llama Enum.member?(1, data) o Enum.member?(data, 1)?
-result = data |> Enum.member?(1)
-IO.inspect(result)
-```
+  @spec transaction_to_csv_line(map()) :: String.t()
+  defp transaction_to_csv_line(%{id: id, amount_cents: a, currency: c, status: s} = tx) do
+    # TODO: format as CSV line, using Map.get with default for optional fields
+    date = Map.get(tx, :date, "")
+    merchant = Map.get(tx, :merchant, "")
+    "#{id},#{date},#{merchant},#{a},#{c},#{s}"
+  end
 
-```
-true
-```
+  @spec add_trend_indicators([{String.t(), integer()}]) :: [{String.t(), integer(), String.t()}]
+  defp add_trend_indicators([]), do: []
 
-**Why**: `data |> Enum.member?(1)` es `Enum.member?(data, 1)` — el dato va como
-**primer** argumento, no último. En este caso funciona bien, pero si esperas que
-vaya al final, tendrás bugs sutiles.
+  defp add_trend_indicators([{first_date, first_total} | rest]) do
+    # TODO: prepend the first entry with no trend indicator
+    # Then Enum.reduce the rest, tracking the previous total to compute % change
+    # Each entry becomes {date, total, trend_string} where trend_string is like "↑ 12%"
+    # or "" for the first entry
+    first_entry = {first_date, first_total, ""}
 
-**Fix**: Siempre recuerda: `data |> func(a, b)` = `func(data, a, b)`.
-Si la función que necesitas no acepta el dato como primer argumento, usa un wrapper:
-```elixir
-# Función donde el dato NO es el primer argumento
-data = "needle"
-haystack = "the needle in a haystack"
+    {_, result} =
+      Enum.reduce(rest, {first_total, [first_entry]}, fn {date, total}, {prev, acc} ->
+        trend = compute_trend(prev, total)
+        {total, [{date, total, trend} | acc]}
+      end)
 
-# NO puedes hacer: data |> String.contains?(haystack)
-# porque String.contains?(string, pattern) espera haystack como primer arg
+    Enum.reverse(result)
+  end
 
-# Wrapper explícito:
-result = haystack |> String.contains?(data)
-IO.inspect(result)  # true
-```
+  @spec compute_trend(integer(), integer()) :: String.t()
+  defp compute_trend(prev, current) when prev == 0, do: ""
 
----
+  defp compute_trend(prev, current) do
+    # GIVEN: computes percentage change and formats as "↑ N%" or "↓ N%"
+    pct = round((current - prev) / prev * 100)
 
-### Error 2: Expresión que no es función al final del pipe
+    if pct >= 0 do
+      "↑ #{pct}%"
+    else
+      "↓ #{abs(pct)}%"
+    end
+  end
 
-```elixir
-# WRONG — no puedes pipar a un valor literal
-result = [1, 2, 3] |> length
-```
+  @spec format_daily_line({String.t(), integer(), String.t()}) :: String.t()
+  defp format_daily_line({date, total_cents, ""}) do
+    # GIVEN: formats as "date: $X.XX"
+    dollars = div(total_cents, 100)
+    cents = rem(total_cents, 100)
+    "#{date}: $#{dollars}.#{String.pad_leading(Integer.to_string(cents), 2, "0")}"
+  end
 
-```
-** (CompileError) undefined function length/0
-```
+  defp format_daily_line({date, total_cents, trend}) do
+    base = format_daily_line({date, total_cents, ""})
+    "#{base} (#{trend} from prior day)"
+  end
 
-**Why**: `length` sin paréntesis se interpreta como una llamada a función de aridad 0,
-no como `length([1, 2, 3])`.
+  defp format_merchant_line(merchant, total_cents) do
+    # GIVEN: formats as "Merchant Name: $Y.ZZ total"
+    dollars = div(total_cents, 100)
+    cents = rem(total_cents, 100)
+    "#{merchant}: $#{dollars}.#{String.pad_leading(Integer.to_string(cents), 2, "0")} total"
+  end
 
-**Fix**: Usa paréntesis siempre en el lado derecho del pipe:
-```elixir
-result = [1, 2, 3] |> length()
-IO.inspect(result)  # 3
+  defp compute_summary_stats(transactions) do
+    # GIVEN: computes %{total: n, approved: n, approved_total: n, declined: n, flagged: n}
+    approved = Enum.filter(transactions, fn tx -> tx.status == :approved end)
+    declined = Enum.filter(transactions, fn tx -> tx.status == :declined end)
+    flagged  = Enum.filter(transactions, fn tx -> tx.status == :flagged end)
 
-# O simplemente:
-result = [1, 2, 3] |> Kernel.length()
-```
+    %{
+      total: length(transactions),
+      approved: length(approved),
+      approved_total: approved |> Enum.map(& &1.amount_cents) |> Enum.sum(),
+      declined: length(declined),
+      flagged: length(flagged)
+    }
+  end
 
----
+  defp format_summary(%{total: t, approved: a, approved_total: at, declined: d, flagged: f}) do
+    # GIVEN: formats the multi-line summary string
+    dollars = div(at, 100)
+    cents = rem(at, 100)
+    amount_str = "$#{dollars}.#{String.pad_leading(Integer.to_string(cents), 2, "0")}"
 
-### Error 3: Pipeline excesivo — dificulta la lectura
-
-```elixir
-# WRONG — demasiados pasos sin nombre, difícil de entender qué hace
-result =
-  raw_data
-  |> step_a()
-  |> step_b()
-  |> step_c()
-  |> step_d()
-  |> step_e()
-  |> step_f()
-  |> step_g()
-  |> step_h()
-  |> step_i()
-  |> step_j()
-```
-
-**Why**: Un pipeline de 10+ pasos es tan difícil de seguir como el código anidado.
-Pierde el beneficio de legibilidad.
-
-**Fix**: Extrae sub-pipelines en funciones con nombres descriptivos:
-```elixir
-defp parse_and_validate(data) do
-  data
-  |> step_a()
-  |> step_b()
-  |> step_c()
+    """
+    === Transaction Summary ===
+    Total transactions: #{t}
+    Approved: #{a} (total: #{amount_str})
+    Declined: #{d}
+    Under review: #{f}
+    """
+    |> String.trim_trailing()
+  end
 end
-
-defp transform_and_format(data) do
-  data
-  |> step_d()
-  |> step_e()
-  |> step_f()
-end
-
-result =
-  raw_data
-  |> parse_and_validate()
-  |> transform_and_format()
 ```
 
----
+### Given tests — must pass without modification
 
-## Verification
+```elixir
+# test/payments_cli/report_test.exs
+defmodule PaymentsCli.ReportTest do
+  use ExUnit.Case, async: true
+
+  alias PaymentsCli.Report
+
+  @transactions [
+    %{id: "T1", status: :approved,  merchant: "Gas Station", amount_cents: 8000,  currency: "USD", date: "2024-01-15"},
+    %{id: "T2", status: :approved,  merchant: "Coffee Co",   amount_cents: 450,   currency: "USD", date: "2024-01-15"},
+    %{id: "T3", status: :declined,  merchant: "Coffee Co",   amount_cents: 300,   currency: "USD", date: "2024-01-15"},
+    %{id: "T4", status: :approved,  merchant: "Supermarket", amount_cents: 15000, currency: "USD", date: "2024-01-16"},
+    %{id: "T5", status: :flagged,   merchant: "Casino",      amount_cents: 50000, currency: "USD", date: "2024-01-16"}
+  ]
+
+  describe "summary/1" do
+    test "includes total count" do
+      result = Report.summary(@transactions)
+      assert String.contains?(result, "Total transactions: 5")
+    end
+
+    test "includes approved count" do
+      result = Report.summary(@transactions)
+      assert String.contains?(result, "Approved: 3")
+    end
+
+    test "includes declined count" do
+      result = Report.summary(@transactions)
+      assert String.contains?(result, "Declined: 1")
+    end
+
+    test "returns a string" do
+      assert is_binary(Report.summary(@transactions))
+    end
+  end
+
+  describe "merchant_report/2" do
+    test "includes report header" do
+      result = Report.merchant_report(@transactions)
+      assert String.contains?(result, "=== Merchant Report ===")
+    end
+
+    test "includes merchant names" do
+      result = Report.merchant_report(@transactions)
+      assert String.contains?(result, "Gas Station")
+      assert String.contains?(result, "Supermarket")
+    end
+
+    test "excludes declined and flagged transactions from totals" do
+      result = Report.merchant_report(@transactions)
+      # Coffee Co only has 1 approved transaction (T2, $4.50)
+      # The declined T3 should not appear in the total
+      assert String.contains?(result, "Coffee Co")
+    end
+  end
+
+  describe "to_csv_report/1" do
+    test "includes CSV header" do
+      result = Report.to_csv_report(@transactions)
+      assert String.starts_with?(result, "id,date,merchant,amount_cents,currency,status")
+    end
+
+    test "includes approved transactions only" do
+      result = Report.to_csv_report(@transactions)
+      assert String.contains?(result, "T1")
+      assert String.contains?(result, "T2")
+      assert String.contains?(result, "T4")
+      # T3 is declined, T5 is flagged
+      refute String.contains?(result, "T3")
+      refute String.contains?(result, "T5")
+    end
+  end
+
+  describe "daily_report/1" do
+    test "includes daily report header" do
+      result = Report.daily_report(@transactions)
+      assert String.contains?(result, "=== Daily Report ===")
+    end
+
+    test "includes both dates" do
+      result = Report.daily_report(@transactions)
+      assert String.contains?(result, "2024-01-15")
+      assert String.contains?(result, "2024-01-16")
+    end
+  end
+end
+```
+
+### Run the tests
 
 ```bash
-iex
+mix test test/payments_cli/report_test.exs --trace
 ```
 
+---
+
+## Trade-off analysis
+
+| Aspect | Pipe chains (your impl) | Nested function calls | Intermediate variables |
+|--------|------------------------|-----------------------|----------------------|
+| Readability | Execution order matches code order | Read inside-out | Clear names, more lines |
+| Debuggability | Insert `IO.inspect` at any step | Must break apart | Inspect any variable |
+| Refactoring | Add/remove steps trivially | Rewrite nesting | Update both sides |
+| Performance | No difference at runtime | No difference | No difference |
+| When to prefer | Transformations with clear data flow | Single expression needed | When intermediate values need names |
+
+Reflection question: `merchant_report/1` uses `then/2` to prepend the header.
+What does `then/2` do, and why is it useful in a pipeline? When would you prefer
+a different approach (like computing the header outside the pipe)?
+
+---
+
+## Common production mistakes
+
+**1. Piping to functions where the data is not the first argument**
+`transactions |> Enum.member?(target)` works because `member?` takes the
+enumerable first. But `transactions |> String.contains?("search")` does not
+work — `String.contains?` expects the string first, then the pattern.
+Use a wrapper lambda: `|> then(fn txs -> String.contains?(format(txs), "search") end)`.
+
+**2. Pipes without parentheses fail**
 ```elixir
-# Verificar la regla del primer argumento
-"  hello  " |> String.trim()
-# => "hello"
+# WRONG — length without () is not a function call in pipe position
+[1, 2, 3] |> length
+# ** (CompileError) undefined function length/0
 
-# Equivalente explícito
-String.trim("  hello  ")
-# => "hello"
-
-# Pipe con argumento adicional
-"hello world" |> String.split(" ")
-# => ["hello", "world"]
-
-# IO.inspect no altera el valor
-[1, 2, 3] |> IO.inspect(label: "lista") |> Enum.sum()
-# lista: [1, 2, 3]
-# => 6
-
-# Pipeline completo
-"alice marie smith"
-|> String.split()
-|> Enum.map(&String.first/1)
-|> Enum.map(&String.upcase/1)
-|> Enum.join(".")
-# => "A.M.S"
+# CORRECT
+[1, 2, 3] |> length()
 ```
+Always use parentheses on the right side of `|>`.
 
----
+**3. Overly long pipelines lose context**
+A pipeline with 15 steps is as hard to read as deeply nested calls. When a pipeline
+grows beyond 6-8 steps, extract named private functions for sub-pipelines.
+`compute_summary_stats/1` and `format_summary/1` are good examples — they give
+names to what would otherwise be anonymous sections of a long pipeline.
 
-## Summary
+**4. `IO.inspect/2` left in production code**
+Inserting `|> IO.inspect(label: "debug")` into a pipeline is the correct debugging
+technique. But `IO.inspect` has a return value (it returns its argument), so it
+is invisible to the pipeline. This makes it easy to forget to remove before merging.
+Enable `--warnings-as-errors` and treat `IO.inspect` calls as lint warnings in CI.
 
-- `|>` pasa el valor de la izquierda como **primer argumento** a la función de la derecha.
-- `data |> func(a, b)` es exactamente `func(data, a, b)`.
-- Los pipelines se leen en orden de ejecución — más legibles que la anidación.
-- `IO.inspect(label: "step")` es transparente: retorna su argumento sin modificarlo.
-- Si necesitas pasar el dato como argumento no-primero, usa un wrapper o lambda.
-- Pipelines de 2-5 pasos son ideales. Más de eso → extraer en funciones con nombre.
-
----
-
-## What's Next
-
-- **Ejercicio 13**: Funciones anónimas y closures — cómo crearlas y capturar variables
-- **Ejercicio 14**: Módulos y visibilidad de funciones
-- Combinando pipes con pattern matching en funciones
+**5. Pipelines that change the data type unexpectedly**
+A pipeline that starts with `[map()]` and ends with a `String.t()` is correct —
+but if an intermediate step returns `{:ok, list}` instead of `list`, the next
+step receives a tuple instead of a list and crashes. Make the type flow explicit
+through `@spec` annotations.
 
 ---
 
 ## Resources
 
-- [Pipe operator — Elixir docs](https://hexdocs.pm/elixir/Kernel.html#%7C%3E/2)
-- [Elixir School — Pipe operator](https://elixirschool.com/en/lessons/basics/pipe_operator)
-- [IO.inspect — HexDocs](https://hexdocs.pm/elixir/IO.html#inspect/2)
+- [Pipe operator — Kernel docs](https://hexdocs.pm/elixir/Kernel.html#%7C%3E/2)
+- [then/2 — Kernel docs](https://hexdocs.pm/elixir/Kernel.html#then/2)
+- [IO.inspect/2 — HexDocs](https://hexdocs.pm/elixir/IO.html#inspect/2)
+- [Elixir School — Pipe Operator](https://elixirschool.com/en/lessons/basics/pipe_operator)

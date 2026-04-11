@@ -1,528 +1,269 @@
-# 2. Atoms and Symbols
+# Atoms: The Transaction Status Type System
 
-**Difficulty**: Basico
+**Project**: `payments_cli` — built incrementally across the basic level
 
-## Prerequisites
-- Haber completado el ejercicio 01-setup-and-mix
-- Tener IEx disponible (`iex` o `iex -S mix`)
+---
 
-## Learning Objectives
-After completing this exercise, you will be able to:
-- Crear y reconocer atoms como identificadores únicos e inmutables
-- Usar el patrón `{:ok, value}` / `{:error, reason}` que aparece en todo el ecosistema Elixir
-- Distinguir cuándo usar atoms versus strings
-- Entender que `true`, `false`, y `nil` son atoms especiales
-- Convertir entre atoms y strings con las funciones del módulo `Atom`
+## Project context
 
-## Concepts
+You're building `payments_cli`. The `Transaction` module needs a type system for
+payment statuses and error codes. In a language without enums, Elixir uses atoms
+for exactly this purpose.
 
-### ¿Qué es un Atom?
-Un atom es una constante cuyo nombre es su propio valor. Se escriben con dos puntos `:` como prefijo: `:ok`, `:error`, `:hello`. A diferencia de los strings, los atoms no contienen datos arbitrarios — son identificadores fijos que se definen en tiempo de compilación.
+Project structure at this point:
 
-El nombre "atom" viene de la idea de que son valores indivisibles y no pueden cambiar. Dos atoms con el mismo nombre son idénticos en todo el sistema — no hay diferencia entre el `:ok` que defines en un módulo y el `:ok` de otro. Esta propiedad los hace extremadamente eficientes para comparaciones.
+```
+payments_cli/
+├── lib/
+│   └── payments_cli/
+│       ├── cli.ex              # from exercise 01
+│       └── transaction.ex      # ← you implement this
+├── test/
+│   └── payments_cli/
+│       └── transaction_test.exs  # given tests — must pass without modification
+└── mix.exs
+```
+
+---
+
+## Why this design decision matters
+
+The payments system needs to represent transaction states: `:pending`, `:approved`,
+`:declined`, `:reversed`, `:flagged`. You have two choices:
+
+**Option A — Strings:**
+```elixir
+status = "approved"
+```
+
+**Option B — Atoms:**
+```elixir
+status = :approved
+```
+
+The difference is not just aesthetics. Atom comparison is O(1) — the VM compares
+pointers into the global atom table, not byte sequences. With 10,000 transactions
+being classified per second, string comparisons for status codes are measurable
+overhead. More importantly, a typo in a string (`"aproved"`) compiles silently.
+A typo in an atom used in a `case` clause can generate a compiler warning.
+
+The `{:ok, value}` / `{:error, reason}` pattern appears in every Elixir API because
+it makes error handling explicit and forces the caller to handle both cases. You
+cannot accidentally ignore an `:error` the way you can ignore a `nil` return in
+other languages.
+
+---
+
+## The business problem
+
+The `Transaction` module needs:
+
+1. A function `classify_status/1` that takes an atom status and returns a human-readable
+   string category for reporting
+2. A function `parse_status/1` that converts external string input (from CSV) to
+   an atom status safely — without creating atoms from arbitrary strings
+
+---
+
+## Implementation
+
+### `lib/payments_cli/transaction.ex`
 
 ```elixir
-# Atoms básicos
-:ok
-:error
-:hello
-:not_found
-:timeout
-
-# Atoms con espacios o caracteres especiales requieren comillas dobles
-:"hello world"
-:"some-atom-with-dashes"
-:"123_starts_with_number"
-
-# La comparación de atoms es O(1) — se compara por referencia, no por contenido
-:ok == :ok    # true
-:ok == :error # false
-```
-
-### El Patrón {:ok, value} / {:error, reason}
-Este es uno de los patrones más importantes en Elixir. En lugar de lanzar excepciones, las funciones en Elixir retornan tuplas `{:ok, resultado}` cuando tienen éxito, y `{:error, razón}` cuando fallan. Este patrón es omnipresente en el ecosistema y hace el manejo de errores explícito y legible.
-
-La razón de usar atoms en este patrón es eficiencia y claridad. Al hacer pattern matching, Elixir verifica el atom primero (comparación O(1)) antes de acceder al resto de la tupla. Además, `:ok` y `:error` son inequívocos — su significado es universalmente entendido en Elixir.
-
-```elixir
-# Ejemplos del patrón ok/error en funciones reales
-File.read("existing_file.txt")
-# {:ok, "contenido del archivo"}
-
-File.read("nonexistent.txt")
-# {:error, :enoent}
-
-Integer.parse("42")
-# {42, ""}
-
-Integer.parse("not_a_number")
-# :error
-
-# Funciones propias siguiendo el patrón
-def find_user(id) when id > 0 do
-  # Simula buscar en base de datos
-  {:ok, %{id: id, name: "Alice"}}
-end
-
-def find_user(_id) do
-  {:error, :not_found}
-end
-```
-
-### Atoms en Memoria: La Atom Table
-Los atoms se almacenan en una tabla global en la VM de Erlang (la BEAM). Cada atom único ocupa espacio en esta tabla y **nunca se elimina durante la vida del proceso**. Esto significa que crear un atom nuevo tiene un costo y que crear atoms dinámicamente (desde input del usuario, por ejemplo) es un riesgo de seguridad — un atacante podría agotar la memoria enviando strings únicos que se conviertan en atoms.
-
-```elixir
-# Seguro: atoms hardcodeados en código fuente
-status = :active
-
-# PELIGROSO en producción: convertir input externo a atom
-user_input = params["status"]
-atom_status = String.to_atom(user_input)  # Crea atom nuevo si no existe — ¡riesgo!
-
-# Seguro: usar String.to_existing_atom/1 que falla si el atom no existe
-atom_status = String.to_existing_atom(user_input)  # Solo funciona con atoms ya definidos
-```
-
-### Atoms Especiales: true, false, nil
-En Elixir, los valores booleanos y `nil` son atoms especiales. No existe un tipo `Boolean` separado — `true` es simplemente el atom `:true`, `false` es `:false`, y `nil` es `:nil`. Esta unificación simplifica el sistema de tipos.
-
-```elixir
-# true, false y nil son atoms
-is_atom(true)   # true
-is_atom(false)  # true
-is_atom(nil)    # true
-
-# Son equivalentes a sus versiones con dos puntos
-true == :true   # true
-false == :false # true
-nil == :nil     # true
-
-# Operaciones booleanas funcionan con atoms
-true and false  # false
-true or false   # true
-not true        # false
-```
-
-## Exercises
-
-### Exercise 1: Creating Atoms in IEx
-Abre IEx y experimenta con la creación y verificación de atoms. Este ejercicio te dará familiaridad con la sintaxis básica.
-
-```elixir
-# Abre IEx con: iex
-
-# Atoms básicos
-iex> :ok
-:ok
-
-iex> :error
-:error
-
-iex> :hello
-:hello
-
-# Atom con espacios — requiere comillas dobles
-iex> :"hello world"
-:"hello world"
-
-# Verificar que algo es un atom
-iex> is_atom(:ok)
-true
-
-iex> is_atom("ok")
-false
-
-# Inspeccionar el tipo
-iex> i(:ok)
-# Term
-#   :ok
-# Data type
-#   Atom
-# Reference modules
-#   Atom
-```
-
-Expected output:
-```
-iex> :ok
-:ok
-iex> is_atom(:ok)
-true
-iex> is_atom("ok")
-false
-```
-
-### Exercise 2: Atoms vs Strings — Comparación de Eficiencia
-Compara el comportamiento de atoms y strings para entender por qué los atoms son preferidos como identificadores.
-
-```elixir
-# Comparación de atoms: O(1) — compara referencia en atom table
-iex> :hello == :hello
-true
-
-iex> :hello == :world
-false
-
-# Comparación de strings: O(n) — compara byte a byte
-iex> "hello" == "hello"
-true
-
-# Los atoms con el mismo nombre siempre son idénticos
-iex> :my_status === :my_status
-true
-
-# Un string con el mismo contenido es IGUAL pero no el mismo objeto
-iex> "my_status" == "my_status"
-true
-
-# Convertir entre atom y string
-iex> Atom.to_string(:hello)
-"hello"
-
-iex> String.to_atom("hello")
-:hello
-
-# Los atoms se ordenan por su nombre en comparaciones
-iex> :apple < :banana
-true
-
-iex> :zebra > :apple
-true
-```
-
-Expected output:
-```
-iex> :hello == :hello
-true
-iex> Atom.to_string(:hello)
-"hello"
-iex> String.to_atom("hello")
-:hello
-```
-
-### Exercise 3: Tuples with Atoms — El Patrón ok/error
-Crea tuplas con el patrón `{:ok, value}` y `{:error, reason}` para simular respuestas de funciones.
-
-```elixir
-# Tupla de éxito
-iex> {:ok, 42}
-{:ok, 42}
-
-iex> {:ok, "user found"}
-{:ok, "user found"}
-
-# Tupla de error
-iex> {:error, "not found"}
-{:error, "not found"}
-
-# El reason puede ser otro atom (común en Elixir)
-iex> {:error, :not_found}
-{:error, :not_found}
-
-iex> {:error, :timeout}
-{:error, :timeout}
-
-iex> {:error, :unauthorized}
-{:error, :unauthorized}
-
-# Tuplas anidadas (resultado complejo)
-iex> {:ok, %{id: 1, name: "Alice", role: :admin}}
-{:ok, %{id: 1, name: "Alice", role: :admin}}
-
-# Acceder elementos de una tupla con elem/2
-iex> result = {:ok, 42}
-{:ok, 42}
-
-iex> elem(result, 0)
-:ok
-
-iex> elem(result, 1)
-42
-```
-
-Expected output:
-```
-iex> {:ok, 42}
-{:ok, 42}
-iex> {:error, :not_found}
-{:error, :not_found}
-iex> elem({:ok, 42}, 1)
-42
-```
-
-### Exercise 4: Pattern Matching Introduction with Atoms
-El verdadero poder de las tuplas con atoms se ve con pattern matching. Usamos `=` para "desestructurar" el contenido de una tupla.
-
-```elixir
-# Match exitoso: el patrón coincide con la tupla
-iex> {:ok, value} = {:ok, 42}
-{:ok, 42}
-
-# Ahora 'value' está vinculado al número 42
-iex> value
-42
-
-# Match con error
-iex> {:error, reason} = {:error, :not_found}
-{:error, :not_found}
-
-iex> reason
-:not_found
-
-# Match que falla: el atom :ok no coincide con :error
-iex> {:ok, value} = {:error, "something went wrong"}
-# ** (MatchError) no match of right hand side value: {:error, "something went wrong"}
-
-# Caso de uso real: procesar resultado de File.read/1
-iex> result = {:ok, "file content here"}
-{:ok, "file content here"}
-
-iex> {:ok, content} = result
-{:ok, "file content here"}
-
-iex> content
-"file content here"
-```
-
-Expected output:
-```
-iex> {:ok, value} = {:ok, 42}
-{:ok, 42}
-iex> value
-42
-iex> {:error, reason} = {:error, :not_found}
-{:error, :not_found}
-iex> reason
-:not_found
-```
-
-### Exercise 5: Boolean Atoms — true, false, nil
-Confirma que los valores booleanos y nil son atoms en Elixir y experimenta con operaciones booleanas.
-
-```elixir
-# Verificar que true, false, nil son atoms
-iex> is_atom(true)
-true
-
-iex> is_atom(false)
-true
-
-iex> is_atom(nil)
-true
-
-# Son equivalentes a sus formas con dos puntos
-iex> true == :true
-true
-
-iex> nil == :nil
-true
-
-# Operaciones booleanas
-iex> true and false
-false
-
-iex> true or false
-true
-
-iex> not true
-false
-
-# nil es "falsy" en Elixir (junto con false)
-iex> nil || "default value"
-"default value"
-
-iex> false || "fallback"
-"fallback"
-
-iex> :ok || "not reached"
-:ok
-
-# is_nil/1 verifica específicamente nil
-iex> is_nil(nil)
-true
-
-iex> is_nil(false)
-false
-
-iex> is_nil(:ok)
-false
-```
-
-Expected output:
-```
-iex> is_atom(true)
-true
-iex> true == :true
-true
-iex> nil || "default value"
-"default value"
-```
-
-### Exercise 6: Atom Functions — Módulo Atom
-Explora las funciones disponibles en el módulo `Atom` para convertir y manipular atoms.
-
-```elixir
-# Atom a string
-iex> Atom.to_string(:hello)
-"hello"
-
-iex> Atom.to_string(:ok)
-"ok"
-
-iex> Atom.to_string(true)
-"true"
-
-# String a atom — CREA el atom si no existe
-iex> String.to_atom("hello")
-:hello
-
-iex> String.to_atom("my_custom_atom")
-:my_custom_atom
-
-# String.to_existing_atom/1 — FALLA si el atom no existe previamente
-iex> String.to_existing_atom("ok")    # :ok ya existe
-:ok
-
-iex> String.to_existing_atom("random_nonexistent_atom_xyz")
-# ** (ArgumentError) errors were found at the given arguments:
-#   * 1st argument: not an already existing atom
-
-# Inspeccionar el atom
-iex> inspect(:hello)
-":hello"
-
-# Usar atoms como claves en maps (sintaxis especial)
-iex> user = %{name: "Alice", role: :admin, active: true}
-%{name: "Alice", role: :admin, active: true}
-
-iex> user.role
-:admin
-
-iex> user[:name]
-"Alice"
-```
-
-Expected output:
-```
-iex> Atom.to_string(:hello)
-"hello"
-iex> String.to_atom("hello")
-:hello
-iex> String.to_existing_atom("ok")
-:ok
-```
-
-## Common Mistakes
-
-### Mistake 1: String.to_atom/1 desde input del usuario
-**Wrong:**
-```elixir
-# En un controlador web o endpoint de API
-def handle_request(params) do
-  status = String.to_atom(params["status"])  # PELIGROSO
-  update_user(status)
-end
-```
-**Error:** No hay error inmediato, pero cada valor único de `params["status"]` crea un atom nuevo en la atom table que **nunca se libera**. Un atacante enviando strings únicos puede agotar la memoria del sistema.
-**Why:** La atom table tiene un límite por defecto (1,048,576 atoms en BEAM). Al agotarla, la VM se detiene.
-**Fix:**
-```elixir
-# Opción 1: usar String.to_existing_atom/1 — falla si el atom no existe previamente
-def handle_request(params) do
-  status = String.to_existing_atom(params["status"])
-  update_user(status)
-rescue
-  ArgumentError -> {:error, :invalid_status}
-end
-
-# Opción 2: validar contra una lista de atoms permitidos
-@valid_statuses [:active, :inactive, :pending]
-
-def parse_status(str) when str in ["active", "inactive", "pending"] do
-  String.to_existing_atom(str)
-end
-def parse_status(_), do: {:error, :invalid_status}
-```
-
-### Mistake 2: Confundir el nombre del módulo con un atom
-**Wrong:**
-```elixir
-# Pensar que :string es el módulo String
-iex> :string.upcase("hello")
-# Esto llama a funciones Erlang, no a módulos Elixir
-# En algunos casos funciona, en otros no, y confunde
-```
-**Error:** En Elixir, los módulos son atoms — `String` es el atom `:"Elixir.String"`. Pero la convención es usar el nombre del módulo directamente, no su atom.
-**Why:** Los módulos Elixir tienen el prefijo `"Elixir."` en su atom interno. `:string` sin prefijo es el módulo de strings de Erlang — diferente API.
-**Fix:**
-```elixir
-# Usar el nombre del módulo Elixir directamente
-iex> String.upcase("hello")
-"HELLO"
-
-# Si necesitas el atom del módulo
-iex> is_atom(String)
-true
-
-iex> String == :"Elixir.String"
-true
-```
-
-### Mistake 3: Usar strings donde atoms son más apropiados
-**Wrong:**
-```elixir
-# Usando strings para estados fijos y conocidos en tiempo de compilación
-def process(event) do
-  case event["type"] do
-    "user_created" -> handle_user_created(event)
-    "order_placed" -> handle_order_placed(event)
-    "payment_failed" -> handle_payment_failed(event)
-  end
-end
-```
-**Error:** No hay error de compilación, pero es menos eficiente y más propenso a errores tipográficos silenciosos.
-**Why:** Las comparaciones de strings son O(n). Con atoms son O(1). Además, un typo en un string (`"user_creatd"`) no produce error — simplemente no hace match. Un typo en un atom puede producir un warning del compilador.
-**Fix:**
-```elixir
-# Usar atoms para identificadores fijos
-def process(event) do
-  case event.type do
-    :user_created -> handle_user_created(event)
-    :order_placed -> handle_order_placed(event)
-    :payment_failed -> handle_payment_failed(event)
+defmodule PaymentsCli.Transaction do
+  @moduledoc """
+  Represents a payment transaction and provides status classification.
+
+  Status atoms are the canonical representation internally. External data
+  (CSV, JSON, API responses) always arrives as strings and must be
+  converted via parse_status/1 — never with String.to_atom/1.
+  """
+
+  # The complete set of valid statuses as a module attribute.
+  # Defining them here means the compiler can warn on exhaustiveness
+  # and documents the domain model in one place.
+  @valid_statuses [:pending, :approved, :declined, :reversed, :flagged]
+
+  @doc """
+  Returns the list of valid transaction statuses.
+  """
+  @spec valid_statuses() :: [atom()]
+  def valid_statuses, do: @valid_statuses
+
+  @doc """
+  Classifies a transaction status atom into a reporting category string.
+
+  Returns a string category used in ledger reports.
+
+  ## Examples
+
+      iex> PaymentsCli.Transaction.classify_status(:approved)
+      "successful"
+
+      iex> PaymentsCli.Transaction.classify_status(:declined)
+      "failed"
+
+      iex> PaymentsCli.Transaction.classify_status(:flagged)
+      "under_review"
+
+  """
+  @spec classify_status(atom()) :: String.t()
+  def classify_status(status)
+
+  # TODO: implement one clause per status atom
+  #
+  # HINT: use multiple function clauses with pattern matching:
+  #   def classify_status(:approved), do: "successful"
+  #   def classify_status(:reversed), do: "successful"   <- reversals clear successfully
+  #   def classify_status(:declined), do: ...
+  #   def classify_status(:flagged),  do: ...
+  #   def classify_status(:pending),  do: ...
+  #   def classify_status(unknown),   do: ...  <- catch-all for unknown atoms
+
+  @doc """
+  Parses a status string from external input (CSV, API) into a status atom.
+
+  Returns {:ok, atom} for known statuses, {:error, :unknown_status} for anything else.
+  Uses String.to_existing_atom/1 so it NEVER creates new atoms from external input.
+
+  ## Examples
+
+      iex> PaymentsCli.Transaction.parse_status("approved")
+      {:ok, :approved}
+
+      iex> PaymentsCli.Transaction.parse_status("hacked_value")
+      {:error, :unknown_status}
+
+  """
+  @spec parse_status(String.t()) :: {:ok, atom()} | {:error, :unknown_status}
+  def parse_status(string) when is_binary(string) do
+    # TODO: implement safe status parsing
+    #
+    # HINT: use String.to_existing_atom/1 wrapped in a rescue block.
+    # String.to_existing_atom/1 raises ArgumentError if the atom was never
+    # defined anywhere in the loaded code. This prevents atom table exhaustion
+    # from attacker-controlled input.
+    #
+    # After conversion, verify the atom is actually in @valid_statuses —
+    # an attacker could send "ok" which IS an existing atom but not a valid status.
   end
 end
 ```
 
-## Verification
+### Given tests — must pass without modification
+
+```elixir
+# test/payments_cli/transaction_test.exs
+defmodule PaymentsCli.TransactionTest do
+  use ExUnit.Case, async: true
+
+  alias PaymentsCli.Transaction
+
+  describe "classify_status/1" do
+    test "approved and reversed are both successful" do
+      assert Transaction.classify_status(:approved) == "successful"
+      assert Transaction.classify_status(:reversed) == "successful"
+    end
+
+    test "declined is failed" do
+      assert Transaction.classify_status(:declined) == "failed"
+    end
+
+    test "flagged is under_review" do
+      assert Transaction.classify_status(:flagged) == "under_review"
+    end
+
+    test "pending is pending" do
+      assert Transaction.classify_status(:pending) == "pending"
+    end
+
+    test "unknown atom returns unknown category" do
+      result = Transaction.classify_status(:some_future_status)
+      assert is_binary(result)
+    end
+  end
+
+  describe "parse_status/1" do
+    test "parses all valid status strings" do
+      for status <- Transaction.valid_statuses() do
+        string = Atom.to_string(status)
+        assert {:ok, ^status} = Transaction.parse_status(string)
+      end
+    end
+
+    test "returns error for unknown status string" do
+      assert {:error, :unknown_status} = Transaction.parse_status("hacked")
+    end
+
+    test "returns error for valid atom names that are not statuses" do
+      # :ok is a real atom but not a valid transaction status
+      assert {:error, :unknown_status} = Transaction.parse_status("ok")
+    end
+
+    test "returns error for empty string" do
+      assert {:error, :unknown_status} = Transaction.parse_status("")
+    end
+  end
+end
+```
+
+### Run the tests
+
 ```bash
-$ iex
-iex> :ok
-:ok
-iex> is_atom(:ok)
-true
-iex> is_atom(true)
-true
-iex> {:ok, value} = {:ok, 42}
-{:ok, 42}
-iex> value
-42
-iex> Atom.to_string(:hello)
-"hello"
-iex> String.to_atom("world")
-:world
+mix test test/payments_cli/transaction_test.exs --trace
 ```
 
-## Summary
-- **Key concepts**: Atoms como identificadores únicos e inmutables, patrón `{:ok, value}` / `{:error, reason}`, `true`/`false`/`nil` como atoms especiales, atom table global
-- **What you practiced**: Crear atoms, comparar atoms con strings, desestructurar tuplas con pattern matching, usar `Atom.to_string/1` y `String.to_atom/1`
-- **Important to remember**: Nunca uses `String.to_atom/1` con input externo — usa `String.to_existing_atom/1` o valida primero. Los atoms nunca se liberan de la memoria.
+---
 
-## What's Next
-En el siguiente ejercicio **03-numbers-and-arithmetic** aprenderás sobre los tipos numéricos de Elixir: integers, floats, y las operaciones aritméticas incluyendo las diferencias importantes entre `/`, `div/2`, y `rem/2`.
+## Trade-off analysis
+
+| Aspect | Atoms (your impl) | Strings | Integer codes (e.g. 1, 2, 3) |
+|--------|-------------------|---------|-------------------------------|
+| Comparison speed | O(1) pointer compare | O(n) byte compare | O(1) |
+| Typo safety | Compiler can warn | Silent failure | No semantic meaning |
+| External input | Requires parse step | Direct use | Requires mapping |
+| Memory | Global atom table, never GC'd | GC'd normally | Minimal |
+| Exhaustiveness checking | Dialyzer + patterns | Nothing | Nothing |
+
+Reflection question: `parse_status/1` uses `String.to_existing_atom/1` followed
+by a membership check. Why are both steps needed? What attack does the membership
+check prevent that `to_existing_atom` alone does not?
+
+---
+
+## Common production mistakes
+
+**1. `String.to_atom/1` from external input**
+Every unique string passed to `String.to_atom/1` creates a permanent entry in the
+atom table. The BEAM atom table limit is 1,048,576 atoms. An attacker sending
+unique status strings in API requests can exhaust it and crash the VM. Use
+`String.to_existing_atom/1` plus a membership check, or a hardcoded `case` on strings.
+
+**2. Using strings for internal status codes**
+If your business logic pattern-matches on `"approved"` instead of `:approved`, you
+lose O(1) comparison. You also introduce the risk of case mismatch (`"Approved"` vs
+`"approved"`). Reserve strings for data that crosses system boundaries (serialization,
+external APIs, user display).
+
+**3. The atom table is global and process-independent**
+Atoms created in one process are visible to all processes. Creating atoms from user
+input in one handler affects the global atom table shared by the entire VM. There is
+no per-process or per-request isolation.
+
+**4. `true`, `false`, and `nil` are atoms**
+`is_atom(true)` returns `true`. This surprises developers from other languages.
+It means `:true == true` and you can use booleans in atom-typed fields. Do not
+conflate them with your domain atoms.
+
+**5. Atom ordering is alphabetical, not insertion order**
+`[:declined, :approved, :pending] |> Enum.sort()` gives `[:approved, :declined, :pending]`.
+Never rely on definition order when sorting atoms. Always sort explicitly.
+
+---
 
 ## Resources
-- [The Elixir Getting Started Guide — Atoms](https://elixir-lang.org/getting-started/basic-types.html#atoms)
-- [Elixir Docs - Atom](https://hexdocs.pm/elixir/Atom.html)
-- [Erlang Atom Table — Why it matters](https://www.erlang.org/doc/efficiency_guide/advanced.html)
+
+- [Atom — HexDocs](https://hexdocs.pm/elixir/Atom.html)
+- [Erlang atom table limits — Erlang efficiency guide](https://www.erlang.org/doc/efficiency_guide/advanced.html)
+- [String.to_existing_atom/1 — HexDocs](https://hexdocs.pm/elixir/String.html#to_existing_atom/1)
+- [Elixir Getting Started — Atoms](https://elixir-lang.org/getting-started/basic-types.html#atoms)

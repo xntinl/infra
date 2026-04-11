@@ -1,98 +1,335 @@
-# 20. Build Conflict-Free Replicated Data Types (CRDTs)
+# Conflict-Free Replicated Data Types (CRDTs)
 
-**Difficulty**: Insane
+**Project**: `crdts` — a production-grade CRDT library with gossip-based cluster convergence
 
-## Prerequisites
+---
 
-- Mastered: GenServer, distributed Elixir (node connections, `:rpc`), ETS, binary encoding
-- Mastered: Set theory, monotonic lattices, partial ordering concepts
-- Familiarity with: CRDT survey paper (Shapiro et al. 2011), vector clocks, Hybrid Logical Clocks, Riak's riak_dt library, Automerge internals
+## Project context
 
-## Problem Statement
+You are building `crdts`, a library of Conflict-Free Replicated Data Types that enables multiple nodes to make changes independently and then merge their states without coordination. Convergence is guaranteed by mathematical properties of the data structures, not by consensus protocols.
 
-Implement a suite of Conflict-Free Replicated Data Types in Elixir that enable multiple
-nodes to make changes independently and then merge their states without coordination or
-consensus — convergence is guaranteed by mathematical properties of the data structures:
+Project structure:
 
-1. Implement a **G-Counter** (grow-only counter): each node has its own counter slot;
-   the global value is the sum of all slots; merge takes the max per slot.
-2. Implement a **PN-Counter** (positive-negative counter): two G-Counters (increments
-   and decrements); value is `sum(P) - sum(D)`; supports negative values and decrement.
-3. Implement an **OR-Set** (Observed-Remove Set): each `add(element)` tags the element
-   with a unique dot (actor, counter); `remove(element)` removes all observed dots for
-   that element; concurrent add and remove resolves in favor of add.
-4. Implement a **LWW-Register** (Last-Write-Wins Register): stores a single value with
-   a timestamp; merge selects the value with the highest timestamp; use Hybrid Logical
-   Clocks (HLC) as the timestamp to maintain causal consistency across nodes with
-   unsynchronized clocks.
-5. Implement an **RGA** (Replicated Growable Array) for collaborative text editing:
-   each character is tagged with a unique ID; insertions use the ID of the preceding
-   character as an anchor; concurrent insertions at the same position are resolved by
-   a tie-breaking rule (higher actor ID wins or lexicographic order).
-6. All CRDTs must implement a `merge/2` function that is commutative, associative, and
-   idempotent (merge of identical states is a no-op).
-7. Causal consistency: use Dotted Version Vectors (DVV) or a per-actor vector clock to
-   track causality. A state update must carry its causal context so that merges can
-   detect concurrent vs causally ordered operations.
-8. Simulate a 5-node cluster: each node makes independent changes while partitioned;
-   after partition heals, states are merged via gossip until all nodes converge to the
-   same state. All 5 nodes must converge within 1 second after the last merge round.
+```
+crdts/
+├── lib/
+│   └── crdts/
+│       ├── application.ex           # cluster supervisor, gossip scheduler
+│       ├── g_counter.ex             # grow-only counter: per-node slots, max merge
+│       ├── pn_counter.ex            # positive-negative counter: two G-Counters
+│       ├── or_set.ex                # observed-remove set: add-wins via dots
+│       ├── lww_register.ex          # last-write-wins register with Hybrid Logical Clocks
+│       ├── rga.ex                   # replicated growable array for collaborative text editing
+│       ├── dvv.ex                   # dotted version vectors for causal context tracking
+│       ├── hlc.ex                   # hybrid logical clock: physical + logical component
+│       └── gossip.ex                # state-based gossip: periodic random-peer merge
+├── test/
+│   └── crdts/
+│       ├── g_counter_test.exs       # value, merge, idempotency, commutativity
+│       ├── pn_counter_test.exs      # negative values, decrement semantics
+│       ├── or_set_test.exs          # add-wins, concurrent add/remove
+│       ├── lww_register_test.exs    # HLC ordering, clock skew tolerance
+│       ├── rga_test.exs             # insertion order, concurrent inserts, tie-breaking
+│       ├── lattice_laws_test.exs    # property-based: all three laws for all CRDTs
+│       └── convergence_test.exs    # 5-node simulation, convergence within 1 second
+├── bench/
+│   └── crdts_bench.exs
+└── mix.exs
+```
 
-## Acceptance Criteria
+---
 
-- [ ] `GCounter.increment(counter, :node_a)` increments node_a's slot; `GCounter.value(counter)`
-      returns the sum of all slots; `GCounter.merge(c1, c2)` takes slot-wise max.
-- [ ] `GCounter.merge(c1, c2)` is idempotent: `merge(c1, merge(c1, c2)) == merge(c1, c2)`.
-- [ ] `PNCounter.decrement(counter, :node_a)` produces a negative contribution;
-      `PNCounter.value/1` correctly returns negative values when decrements exceed increments.
-- [ ] `ORSet.add(set, :apple, :node_a)` followed by `ORSet.remove(set, :apple)` removes
-      the element; a concurrent `add` on another node that is merged after the remove wins
-      (add-wins semantics).
-- [ ] `LWWRegister.write(reg, "value", :node_a)` stores the value with an HLC timestamp;
-      `LWWRegister.merge(r1, r2)` selects the value with the higher HLC; the register
-      never goes backwards in time even across nodes with clock skew up to 500ms.
-- [ ] `RGA.insert(doc, after_id: :root, value: "H", actor: :node_a)` inserts "H" at the
-      beginning; subsequent inserts build correct string order regardless of arrival order.
-- [ ] Concurrent inserts at the same position by two different actors produce the same
-      final character order on all nodes (tie-breaking is deterministic).
-- [ ] A simulation with 5 nodes, each making 200 random operations while disconnected,
-      converges to the same state on all nodes within 1 second of reconnection.
-- [ ] `CRDT.merge(a, b)` satisfies: `merge(a, b) == merge(b, a)` (commutative),
-      `merge(a, merge(b, c)) == merge(merge(a, b), c)` (associative),
-      `merge(a, a) == a` (idempotent) — verified by property-based tests with `StreamData`.
+## The problem
 
-## What You Will Learn
+In a distributed system where network partitions are possible, you have two choices: stop accepting writes during a partition (sacrifice availability) or accept writes on all partitions (sacrifice consistency). CRDTs choose availability: each node accepts writes independently. When the partition heals, states are merged. The merge is guaranteed to produce the same result regardless of the order in which it is applied — this is the join-semilattice property.
 
-- Join-semilattice structure: what makes a data type a valid CRDT (monotonic merge, no information loss)
-- Dotted Version Vectors (DVV): how they improve on plain vector clocks for detecting concurrent vs. causally ordered events
-- Hybrid Logical Clocks: combining physical time and logical time to achieve total order compatible with wall-clock time
-- OR-Set mechanics: why "remove all observed tags" is the correct semantics and why simpler timestamp-based approaches fail
-- RGA text editing: the anchor-based insertion model and how it avoids the interleaving anomaly present in OT approaches
-- Gossip protocol design: how to spread state updates across a cluster with bounded communication cost
+---
 
-## Hints
+## Why this design
 
-This exercise is intentionally sparse. Research:
+**G-Counter via per-node slots**: each node increments only its own slot in a `%{node_id => count}` map. The total value is the sum of all slots. Merge takes the max per slot: `max(local[node], remote[node])`. This is correct because no node decrements another's slot — the value only moves upward, satisfying the lattice monotonicity requirement.
 
-- G-Counter: represent as a map `%{node_id => count}`; merge is `Map.merge(c1, c2, fn _k, v1, v2 -> max(v1, v2) end)`
-- OR-Set: represent each element as `{element, MapSet.t(dot)}` where a dot is `{actor, sequence_number}`; the DVV context tracks the maximum seen sequence per actor
-- HLC: `{physical_time_ms, logical_counter, node_id}`; on message receive, `new_physical = max(local_physical, received_physical)`, then increment counter if tied
-- RGA: store the sequence as a list of `{id, char, deleted?}` where `id = {actor, counter}`; on insert, find the anchor and insert after all elements with a higher-priority ID at the same position
-- Property-based tests: use `StreamData.member_of([:node_a, :node_b, :node_c])` and `StreamData.integer()` to generate random sequences of operations; verify all three lattice laws hold for any generated pair of states
+**OR-Set via dots**: each `add(element)` operation generates a unique "dot" `{actor_id, sequence_number}`. The element's presence in the set is represented by the set of its dots. `remove(element)` removes all observed dots. If node A adds with dot `{A,1}` and node B concurrently adds with dot `{B,1}`, a merge that removes A's add still contains B's add — add-wins semantics arise naturally.
 
-## Reference Material
+**Hybrid Logical Clocks for LWW registers**: pure physical clocks cannot determine which of two concurrent writes happened "last" because clocks on different machines are not synchronized. Logical clocks (Lamport timestamps) are monotonic but lose wall-clock ordering information. HLC combines both: `{physical_time_ms, logical_counter, node_id}`. On receive, the physical time is set to `max(local, received)`, and the logical counter breaks ties. Clock skew up to 500ms is tolerated.
 
-- CRDT survey: Shapiro et al., "A Comprehensive Study of Convergent and Commutative Replicated Data Types", INRIA RR-7506, 2011
-- Dotted Version Vectors: Preguiça et al., "Dotted Version Vectors: Logical Clocks for Optimistic Replication", 2010
-- Hybrid Logical Clocks paper: Kulkarni et al., "Logical Physical Clocks and Consistent Snapshots in Globally Distributed Databases", 2014
-- RGA paper: Roh et al., "Replicated abstract data types: Building blocks for collaborative applications", JSS 2011
-- Automerge implementation (JavaScript reference): https://github.com/automerge/automerge
-- riak_dt Elixir/Erlang reference: https://github.com/basho/riak_dt
+**RGA for collaborative text editing**: each character has a unique ID `{actor, counter}`. Insertions use the ID of the preceding character as an anchor. Concurrent insertions at the same position are ordered by ID, deterministically. This avoids the interleaving anomaly that plagues operational transformation (OT) approaches.
 
-## Difficulty Rating
+---
 
-★★★★★★
+## Implementation milestones
 
-## Estimated Time
+### Step 1: Create the project
 
-55–80 hours
+```bash
+mix new crdts --sup
+cd crdts
+mkdir -p lib/crdts test/crdts bench
+```
+
+### Step 2: `mix.exs` — dependencies
+
+```elixir
+defp deps do
+  [
+    {:stream_data, "~> 0.6", only: :test},
+    {:benchee, "~> 1.3", only: :dev}
+  ]
+end
+```
+
+### Step 3: G-Counter and PN-Counter
+
+```elixir
+# lib/crdts/g_counter.ex
+defmodule CRDTs.GCounter do
+  @moduledoc """
+  Grow-only counter. Each node has its own slot.
+  value/1 = sum of all slots.
+  merge/2 = slot-wise max.
+  """
+
+  def new(), do: %{}
+
+  def increment(%{} = counter, node_id) do
+    Map.update(counter, node_id, 1, &(&1 + 1))
+  end
+
+  def value(%{} = counter) do
+    counter |> Map.values() |> Enum.sum()
+  end
+
+  def merge(%{} = c1, %{} = c2) do
+    # TODO: Map.merge(c1, c2, fn _k, v1, v2 -> max(v1, v2) end)
+  end
+end
+```
+
+```elixir
+# lib/crdts/or_set.ex
+defmodule CRDTs.ORSet do
+  @moduledoc """
+  Observed-Remove Set with add-wins semantics.
+
+  State: %{element => MapSet.t({actor, sequence})}
+  A "dot" is {actor, sequence}.
+
+  add(set, element, actor): generate a new dot, add to element's dot set
+  remove(set, element):     remove all current dots for element
+  member?(set, element):    true if element has at least one dot
+  merge(s1, s2):            union of dot sets per element; concurrent adds always win
+  """
+
+  def new(), do: %{}
+
+  def add(set, element, actor) do
+    current_dots = Map.get(set, element, MapSet.new())
+    seq = MapSet.size(current_dots) + 1  # simple sequence; in production use a vector clock
+    new_dot = {actor, seq}
+    Map.put(set, element, MapSet.put(current_dots, new_dot))
+  end
+
+  def remove(set, element) do
+    # TODO: remove all dots for element; the element effectively disappears
+    # HINT: Map.delete(set, element)
+  end
+
+  def member?(set, element) do
+    set |> Map.get(element, MapSet.new()) |> MapSet.size() > 0
+  end
+
+  def merge(s1, s2) do
+    # TODO: for each element in either set, union the dot sets
+    # HINT: Map.merge(s1, s2, fn _k, d1, d2 -> MapSet.union(d1, d2) end)
+  end
+end
+```
+
+### Step 4: Hybrid Logical Clock
+
+```elixir
+# lib/crdts/hlc.ex
+defmodule CRDTs.HLC do
+  @moduledoc """
+  Hybrid Logical Clock.
+  State: {physical_ms, logical_counter, node_id}
+
+  On send: l' = max(l, physical_ms); if l' == l, c' = c + 1; else c' = 0
+  On receive: l' = max(l, recv_l, physical_ms); if l' == recv_l, c' = max(c, recv_c) + 1
+                                                 if l' == l, c' = c + 1
+                                                 else c' = 0
+  """
+
+  def new(node_id) do
+    {System.system_time(:millisecond), 0, node_id}
+  end
+
+  def tick({l, c, node_id}) do
+    now = System.system_time(:millisecond)
+    l_new = max(l, now)
+    c_new = if l_new == l, do: c + 1, else: 0
+    {l_new, c_new, node_id}
+  end
+
+  def receive_event({l, c, node_id}, {recv_l, recv_c, _recv_node}) do
+    # TODO
+  end
+
+  def compare({l1, c1, n1}, {l2, c2, n2}) do
+    # TODO: total order: first by l, then c, then node_id (for tie-breaking)
+  end
+end
+```
+
+### Step 5: Given tests — must pass without modification
+
+```elixir
+# test/crdts/lattice_laws_test.exs
+defmodule CRDTs.LatticeTest do
+  use ExUnit.Case
+  use ExUnitProperties
+
+  alias CRDTs.{GCounter, PNCounter, ORSet}
+
+  defp random_gcounter do
+    gen all nodes <- StreamData.list_of(StreamData.member_of([:a, :b, :c]), min_length: 1),
+            do: Enum.reduce(nodes, GCounter.new(), fn n, c -> GCounter.increment(c, n) end)
+  end
+
+  property "GCounter merge is commutative" do
+    check all c1 <- random_gcounter(), c2 <- random_gcounter() do
+      assert GCounter.merge(c1, c2) == GCounter.merge(c2, c1)
+    end
+  end
+
+  property "GCounter merge is associative" do
+    check all c1 <- random_gcounter(), c2 <- random_gcounter(), c3 <- random_gcounter() do
+      assert GCounter.merge(c1, GCounter.merge(c2, c3)) ==
+             GCounter.merge(GCounter.merge(c1, c2), c3)
+    end
+  end
+
+  property "GCounter merge is idempotent" do
+    check all c1 <- random_gcounter(), c2 <- random_gcounter() do
+      merged = GCounter.merge(c1, c2)
+      assert GCounter.merge(merged, c2) == merged
+    end
+  end
+end
+```
+
+```elixir
+# test/crdts/convergence_test.exs
+defmodule CRDTs.ConvergenceTest do
+  use ExUnit.Case, async: false
+
+  test "5-node simulation converges within 1 second after reconnect" do
+    nodes = [:n1, :n2, :n3, :n4, :n5]
+    sim = CRDTs.Simulation.start(nodes)
+
+    # Partition into two groups
+    CRDTs.Simulation.partition(sim, group_a: [:n1, :n2], group_b: [:n3, :n4, :n5])
+
+    # Each partition makes 200 operations on a shared GCounter
+    for node <- [:n1, :n2], _ <- 1..100 do
+      CRDTs.Simulation.increment(sim, node, :shared_counter)
+    end
+
+    for node <- [:n3, :n4, :n5], _ <- 1..100 do
+      CRDTs.Simulation.increment(sim, node, :shared_counter)
+    end
+
+    # Heal partition
+    CRDTs.Simulation.heal(sim)
+
+    # Allow gossip rounds to converge
+    Process.sleep(1_000)
+
+    values = for node <- nodes, do: CRDTs.Simulation.value(sim, node, :shared_counter)
+
+    assert Enum.uniq(values) == [500],
+      "expected all nodes to converge to 500, got: #{inspect(values)}"
+
+    CRDTs.Simulation.stop(sim)
+  end
+end
+```
+
+### Step 6: Run the tests
+
+```bash
+mix test test/crdts/ --trace
+```
+
+### Step 7: Benchmark
+
+```elixir
+# bench/crdts_bench.exs
+counter = CRDTs.GCounter.new()
+counter = Enum.reduce(1..1_000, counter, fn _, c -> CRDTs.GCounter.increment(c, :node_a) end)
+
+or_set = Enum.reduce(1..1_000, CRDTs.ORSet.new(), fn i, s ->
+  CRDTs.ORSet.add(s, "item_#{i}", :node_a)
+end)
+
+Benchee.run(
+  %{
+    "GCounter increment" => fn ->
+      CRDTs.GCounter.increment(counter, :node_b)
+    end,
+    "GCounter merge (1000 entries)" => fn ->
+      CRDTs.GCounter.merge(counter, counter)
+    end,
+    "ORSet add" => fn ->
+      CRDTs.ORSet.add(or_set, "new_item_#{:rand.uniform(1_000)}", :node_a)
+    end,
+    "ORSet merge (1000 entries)" => fn ->
+      CRDTs.ORSet.merge(or_set, or_set)
+    end
+  },
+  time: 5,
+  warmup: 2,
+  formatters: [Benchee.Formatters.Console]
+)
+```
+
+---
+
+## Trade-off analysis
+
+| CRDT | Merge cost | Space cost | Semantics | Suitable for |
+|------|-----------|------------|-----------|-------------|
+| G-Counter | O(N) per-node slots | O(N) | monotonic increment | view counts, likes |
+| PN-Counter | O(N) | O(2N) | increment and decrement | inventory, balances |
+| OR-Set | O(elements × dots) | O(elements × dots) | add-wins | shopping cart, tag sets |
+| LWW-Register | O(1) | O(1) | last-write-wins | settings, config |
+| RGA | O(sequence length) | O(sequence length) | insertion order | collaborative text |
+
+Reflection: OR-Set has add-wins semantics. Design a remove-wins variant. What changes to the merge function and the add/remove operations? What use cases prefer remove-wins over add-wins?
+
+---
+
+## Common production mistakes
+
+**1. Using physical timestamps instead of HLC for LWW**
+Physical clocks can go backward. An NTP adjustment on node A might make its timestamp earlier than node B's, causing node B's older write to "win." HLC prevents this by advancing the logical component when physical time is tied.
+
+**2. OR-Set dots not unique across nodes**
+If two nodes use the same sequence generator (e.g., a simple integer counter starting at 1), they can generate the same dot `{A, 1}` and `{B, 1}` is not a collision, but `{A, 1}` on two different nodes is. The actor component of the dot must be unique per node.
+
+**3. RGA not handling concurrent inserts at the same anchor**
+Two nodes insert at the same position concurrently. Without a deterministic tie-breaking rule (e.g., higher actor ID wins), the two nodes produce different orderings after merge. The tie-breaking rule must be total and deterministic.
+
+**4. Gossip not accounting for partial state exchange**
+State-based gossip sends the full CRDT state to a random peer. For a large ORSet with millions of elements, this is expensive. Delta-CRDT gossip sends only the changes since the last exchange. Design the gossip protocol with delta-state in mind from the start.
+
+---
+
+## Resources
+
+- Shapiro, M. et al. (2011). *A Comprehensive Study of Convergent and Commutative Replicated Data Types* — INRIA RR-7506 — the primary survey
+- Preguiça, N. et al. (2010). *Dotted Version Vectors: Logical Clocks for Optimistic Replication*
+- Kulkarni, S. et al. (2014). *Logical Physical Clocks and Consistent Snapshots in Globally Distributed Databases*
+- Roh, H.G. et al. (2011). *Replicated abstract data types: Building blocks for collaborative applications* — JSS
+- [Automerge](https://github.com/automerge/automerge) — JavaScript CRDT library with RGA implementation
+- [riak_dt](https://github.com/basho/riak_dt) — Erlang/Elixir CRDT reference

@@ -1,465 +1,408 @@
-# Ejercicio 53: Phoenix Channels para WebSockets
+# Phoenix Channels: Real-Time Client Streaming
 
-## Tema
-Comunicación bidireccional en tiempo real con Phoenix Channels.
-
-## Conceptos clave
-- `use Phoenix.Channel` + `join/3` para autorizar conexiones
-- `handle_in/3` para procesar mensajes entrantes del cliente
-- `push/3` para enviar al socket individual, `broadcast!/3` para enviar a todos
-- `intercept/1` + `handle_out/3` para filtrar broadcasts salientes
-- Assigns del socket para almacenar estado por conexión
-- Client JS: `new Socket`, `channel.join()`, `channel.on("event", cb)`
+**Project**: `api_gateway` — built incrementally across the advanced level
 
 ---
 
-## Ejercicio 1: Multiplayer Game — Sincronización de posición
+## Project context
 
-### Contexto
-Un juego multijugador necesita sincronizar la posición `(x, y)` de cada jugador
-en tiempo real. Todos los participantes de una sala deben ver los movimientos
-de los demás, pero **no deben recibir su propio movimiento** (evita eco).
+The `api_gateway` needs to stream real-time events to JavaScript clients — not just ops
+dashboards (which use LiveView), but external API consumers: mobile apps, SPAs, and
+third-party integrations that listen for gateway events over WebSocket. Phoenix Channels
+provide the bidirectional WebSocket layer for this. LiveView uses Channels internally;
+here you use them directly.
 
-### Problema
-Dado el siguiente channel incompleto, identifica qué falla y corrígelo:
+Project structure for this exercise:
 
-```elixir
-defmodule MyAppWeb.GameChannel do
-  use Phoenix.Channel
-
-  # ERROR: falta intercept — los jugadores reciben su propio "move"
-  # intercept ["move"]
-
-  def join("game:" <> game_id, %{"token" => token}, socket) do
-    case GameAuth.verify(token, game_id) do
-      {:ok, player_id} ->
-        socket = assign(socket, :player_id, player_id)
-        {:ok, socket}
-
-      :error ->
-        {:error, %{reason: "unauthorized"}}
-    end
-  end
-
-  def handle_in("move", %{"x" => x, "y" => y}, socket) do
-    payload = %{
-      player_id: socket.assigns.player_id,
-      x: x,
-      y: y
-    }
-    broadcast!(socket, "move", payload)
-    {:noreply, socket}
-  end
-
-  # ERROR: sin este callback el broadcast llega también al emisor
-  # def handle_out("move", payload, socket) do
-  #   if payload.player_id != socket.assigns.player_id do
-  #     push(socket, "move", payload)
-  #   end
-  #   {:noreply, socket}
-  # end
-end
 ```
-
-### Solución completa
-
-```elixir
-defmodule MyAppWeb.GameChannel do
-  use Phoenix.Channel
-
-  # intercept declara qué eventos salientes pasan por handle_out/3
-  # Sin esto, broadcast! envía directo a TODOS, incluyendo el emisor
-  intercept ["move"]
-
-  def join("game:" <> game_id, %{"token" => token}, socket) do
-    case GameAuth.verify(token, game_id) do
-      {:ok, player_id} ->
-        socket = assign(socket, :player_id, player_id)
-        # Notificar a los demás que este jugador entró
-        broadcast!(socket, "player_joined", %{player_id: player_id})
-        {:ok, socket}
-
-      :error ->
-        {:error, %{reason: "unauthorized"}}
-    end
-  end
-
-  def handle_in("move", %{"x" => x, "y" => y}, socket) do
-    payload = %{
-      player_id: socket.assigns.player_id,
-      x: x,
-      y: y
-    }
-    # Broadcast a todos en "game:{game_id}" — handle_out filtrará
-    broadcast!(socket, "move", payload)
-    {:noreply, socket}
-  end
-
-  # handle_out intercepta el broadcast ANTES de enviarlo al socket
-  # Permite filtrar, transformar o descartar el evento por conexión
-  def handle_out("move", payload, socket) do
-    if payload.player_id != socket.assigns.player_id do
-      push(socket, "move", payload)
-    end
-
-    # Siempre retorna {:noreply, socket}, incluso si no se hace push
-    {:noreply, socket}
-  end
-end
-```
-
-### Client JS equivalente
-
-```javascript
-// Conectar al servidor Phoenix
-const socket = new Socket("/socket", { params: { token: userToken } })
-socket.connect()
-
-const channel = socket.channel("game:sala-42", {})
-
-channel.join()
-  .receive("ok", () => console.log("Unido a la partida"))
-  .receive("error", ({ reason }) => console.error("Error:", reason))
-
-// Enviar posición al servidor
-document.addEventListener("mousemove", (e) => {
-  channel.push("move", { x: e.clientX, y: e.clientY })
-})
-
-// Recibir posiciones de OTROS jugadores (el propio no llega — filtrado en handle_out)
-channel.on("move", ({ player_id, x, y }) => {
-  updatePlayerPosition(player_id, x, y)
-})
-
-channel.on("player_joined", ({ player_id }) => {
-  addPlayerToGame(player_id)
-})
-```
-
-### Error común #1: olvidar `intercept`
-
-Sin `intercept ["move"]`, el callback `handle_out/3` **nunca se ejecuta**.
-Phoenix solo enruta el broadcast por `handle_out` cuando el evento está
-declarado en `intercept`. Resultado: cada jugador ve su propio movimiento,
-causando duplicación visual y posibles loops.
-
-### Error común #2: retornar `{:ok, payload, socket}` en handle_out
-
-```elixir
-# INCORRECTO — handle_out no acepta payload como retorno
-def handle_out("move", payload, socket) do
-  {:ok, payload, socket}  # Esto genera un error en runtime
-end
-
-# CORRECTO
-def handle_out("move", payload, socket) do
-  push(socket, "move", payload)
-  {:noreply, socket}
-end
+api_gateway_umbrella/apps/gateway_api/
+├── lib/gateway_api_web/
+│   ├── channels/
+│   │   ├── user_socket.ex              # ← you implement this
+│   │   ├── gateway_events_channel.ex   # ← and this
+│   │   └── client_stats_channel.ex     # ← and this
+│   └── presence.ex                     # already exists from exercise 51
+└── test/gateway_api_web/channels/
+    ├── gateway_events_channel_test.exs # given tests
+    └── client_stats_channel_test.exs  # given tests
 ```
 
 ---
 
-## Ejercicio 2: Collaborative Document Editing — Operational Transforms básico
+## Channels vs LiveView for this use case
 
-### Contexto
-Un editor colaborativo donde múltiples usuarios editan el mismo documento.
-Cada operación tiene un tipo (`insert` o `delete`), una posición y contenido.
-El servidor debe retransmitir la operación a todos **excepto al emisor**.
+LiveView is the right tool when the UI is server-rendered and the user interacts through
+a browser. Channels are the right tool when:
 
-### Problema
-El siguiente código tiene un bug sutil en cómo se maneja el broadcast:
+- The client is a mobile app, a CLI tool, or a third-party service (not a browser with
+  server-rendered HTML)
+- The protocol is bidirectional: the client sends data, the server processes it and
+  pushes responses
+- Multiple clients need to broadcast to each other (not just receive from the server)
 
-```elixir
-defmodule MyAppWeb.DocChannel do
-  use Phoenix.Channel
-
-  def join("doc:" <> doc_id, _params, socket) do
-    # ERROR: no se asigna user_id al socket — handle_in no podrá usarlo
-    {:ok, socket}
-  end
-
-  def handle_in("operation", %{"type" => type, "pos" => pos, "content" => content}, socket) do
-    op = %{
-      type: type,
-      pos: pos,
-      content: content,
-      # ERROR: socket.assigns.user_id no existe — crasheará
-      author: socket.assigns.user_id,
-      ts: System.system_time(:millisecond)
-    }
-
-    # ERROR: broadcast! envía a TODOS, incluido el autor
-    broadcast!(socket, "operation", op)
-    {:reply, {:ok, %{ts: op.ts}}, socket}
-  end
-end
-```
-
-### Solución completa
-
-```elixir
-defmodule MyAppWeb.DocChannel do
-  use Phoenix.Channel
-
-  intercept ["operation"]
-
-  def join("doc:" <> doc_id, %{"user_id" => user_id}, socket) do
-    socket =
-      socket
-      |> assign(:user_id, user_id)
-      |> assign(:doc_id, doc_id)
-
-    # Enviar estado actual del documento solo al que se une
-    current_doc = DocStore.get(doc_id)
-    {:ok, %{content: current_doc}, socket}
-  end
-
-  def handle_in("operation", %{"type" => type, "pos" => pos, "content" => content}, socket) do
-    op = %{
-      type: type,
-      pos: pos,
-      content: content,
-      author: socket.assigns.user_id,
-      ts: System.system_time(:millisecond)
-    }
-
-    # Persistir la operación antes de hacer broadcast
-    :ok = DocStore.apply_operation(socket.assigns.doc_id, op)
-
-    broadcast!(socket, "operation", op)
-
-    # Confirmar al emisor con el timestamp del servidor
-    {:reply, {:ok, %{ts: op.ts}}, socket}
-  end
-
-  def handle_out("operation", %{author: author} = op, socket) do
-    # No reenviar al autor — él ya aplicó la operación localmente
-    if author != socket.assigns.user_id do
-      push(socket, "operation", op)
-    end
-
-    {:noreply, socket}
-  end
-end
-```
-
-### Client JS equivalente
-
-```javascript
-const channel = socket.channel("doc:mi-documento", { user_id: currentUserId })
-
-channel.join()
-  .receive("ok", ({ content }) => initEditor(content))
-
-// Enviar operación de inserción
-function insertText(pos, text) {
-  channel.push("operation", { type: "insert", pos, content: text })
-    .receive("ok", ({ ts }) => console.log("Op confirmada en:", ts))
-    .receive("error", (err) => rollbackOperation())
-}
-
-// Recibir operaciones de otros colaboradores
-channel.on("operation", (op) => {
-  applyRemoteOperation(op)  // Aplicar transform y actualizar el editor
-})
-```
-
-### Reconciliación de conflictos simple
-
-Cuando dos usuarios editan simultáneamente la misma posición, las operaciones
-pueden llegar en distinto orden. Una estrategia básica es usar el timestamp
-del servidor como desempate:
-
-```elixir
-defmodule DocStore do
-  # Aplicar operación con transformación básica de posición
-  # Si op.ts < last_op.ts, la posición puede necesitar ajuste
-  def apply_operation(doc_id, op) do
-    Agent.update(__MODULE__, fn state ->
-      doc = Map.get(state, doc_id, %{content: "", ops: []})
-      adjusted_op = maybe_transform(op, doc.ops)
-      new_content = apply_to_content(doc.content, adjusted_op)
-      Map.put(state, doc_id, %{content: new_content, ops: [adjusted_op | doc.ops]})
-    end)
-  end
-
-  defp maybe_transform(op, [last | _]) when op.ts < last.ts do
-    # Ajustar posición si hay operaciones posteriores al timestamp del op
-    %{op | pos: op.pos + String.length(last.content)}
-  end
-  defp maybe_transform(op, _), do: op
-end
-```
+For the gateway's external API consumers, the clients are not browsers — they're monitoring
+agents. Channels are correct here.
 
 ---
 
-## Ejercicio 3: Live Notifications con filtros por preferencias de usuario
+## The `intercept` / `handle_out` pattern
 
-### Contexto
-Un sistema de notificaciones en tiempo real donde cada usuario configura
-qué categorías quiere recibir. El canal debe filtrar notificaciones según
-las preferencias almacenadas en el socket assign.
+`broadcast!/3` sends to every subscriber in a topic — including the sender. For most
+gateway events, the sender already knows what happened and should not receive its own
+echo. The pattern:
 
-### Problema
-Detecta los dos errores en este código:
+```
+intercept ["event_name"]          ← declare which outgoing events to intercept
+handle_out("event_name", payload, socket)  ← filter, transform, or drop per socket
+```
+
+Without `intercept`, `handle_out` is never called. This is the most common bug with channels.
+
+The alternative for simple "all except sender" cases: `broadcast_from!/3`. It skips the
+sender without needing `intercept`. Use `broadcast!/3` + `handle_out` when you need to
+transform the payload per receiver (e.g., filter based on per-socket subscriptions).
+
+---
+
+## Implementation
+
+### Step 1: `lib/gateway_api_web/channels/user_socket.ex`
 
 ```elixir
-defmodule MyAppWeb.NotificationChannel do
-  use Phoenix.Channel
+defmodule GatewayApiWeb.UserSocket do
+  use Phoenix.Socket
 
-  # ERROR 1: sin intercept, handle_out nunca se ejecuta
-  # intercept ["notification"]
+  channel "gateway:events", GatewayApiWeb.GatewayEventsChannel
+  channel "client:*",       GatewayApiWeb.ClientStatsChannel
 
-  def join("notifications:" <> user_id, _params, socket) do
-    # ERROR 2: no se cargan las preferencias en el socket
-    {:ok, socket}
-  end
-
-  def handle_out("notification", payload, socket) do
-    # Este callback NUNCA se ejecuta sin intercept ["notification"]
-    if payload.category in socket.assigns.preferences do
-      push(socket, "notification", payload)
+  @impl true
+  def connect(%{"token" => token}, socket, _connect_info) do
+    case Phoenix.Token.verify(GatewayApiWeb.Endpoint, "socket", token, max_age: 86_400) do
+      {:ok, client_id} ->
+        {:ok, assign(socket, :client_id, client_id)}
+      {:error, _reason} ->
+        :error
     end
-
-    {:noreply, socket}
   end
+
+  @impl true
+  def id(socket), do: "client_socket:#{socket.assigns.client_id}"
 end
 ```
 
-### Solución completa
+### Step 2: `lib/gateway_api_web/channels/gateway_events_channel.ex`
+
+This channel streams gateway-level events (circuit breaker state changes, rate limit
+triggers) to all subscribed monitoring clients. Clients can filter by event category.
 
 ```elixir
-defmodule MyAppWeb.NotificationChannel do
+defmodule GatewayApiWeb.GatewayEventsChannel do
   use Phoenix.Channel
 
-  # Necesario para que handle_out intercepte el evento antes de enviar
-  intercept ["notification"]
+  # All outgoing "event" messages pass through handle_out for filtering
+  intercept ["event"]
 
-  def join("notifications:" <> user_id, %{"token" => token}, socket) do
-    case UserAuth.verify_token(token) do
-      {:ok, ^user_id} ->
-        prefs = UserPreferences.get_categories(user_id)
-
-        socket =
-          socket
-          |> assign(:user_id, user_id)
-          |> assign(:preferences, prefs)  # Cargar preferencias en el socket
-
-        {:ok, socket}
-
-      _ ->
-        {:error, %{reason: "unauthorized"}}
-    end
+  @impl true
+  def join("gateway:events", %{"categories" => categories}, socket) do
+    socket = assign(socket, :categories, categories)
+    # Send current system state as initial payload
+    {:ok, %{circuit_breakers: current_circuit_state()}, socket}
   end
 
-  def handle_in("update_preferences", %{"categories" => categories}, socket) do
-    # Permitir actualización de preferencias sin reconectar
-    socket = assign(socket, :preferences, categories)
-    {:reply, :ok, socket}
+  def join("gateway:events", _params, socket) do
+    # No filter — subscribe to all categories
+    socket = assign(socket, :categories, :all)
+    {:ok, %{circuit_breakers: current_circuit_state()}, socket}
   end
 
-  def handle_out("notification", payload, socket) do
-    if payload.category in socket.assigns.preferences do
-      push(socket, "notification", payload)
-    end
-
-    {:noreply, socket}
+  @impl true
+  def handle_in("update_filter", %{"categories" => categories}, socket) do
+    # Client can update its category filter without reconnecting
+    {:reply, :ok, assign(socket, :categories, categories)}
   end
-end
-```
 
-### Emitir una notificación desde el servidor
+  @impl true
+  def handle_out("event", payload, socket) do
+    # TODO:
+    # If socket.assigns.categories is :all → push unconditionally
+    # If it's a list → only push if payload.category is in the list
+    # Always return {:noreply, socket}
+  end
 
-```elixir
-defmodule MyApp.Notifications do
-  alias MyAppWeb.Endpoint
+  # ---------------------------------------------------------------------------
+  # Called from the telemetry handler when gateway events occur
+  # ---------------------------------------------------------------------------
 
-  def broadcast_notification(user_id, category, message) do
-    Endpoint.broadcast(
-      "notifications:#{user_id}",
-      "notification",
-      %{category: category, message: message, ts: DateTime.utc_now()}
+  def broadcast_event(category, data) do
+    GatewayApiWeb.Endpoint.broadcast(
+      "gateway:events",
+      "event",
+      %{category: category, data: data, ts: DateTime.utc_now()}
     )
   end
+
+  defp current_circuit_state do
+    # TODO: read :circuit_breaker ETS table
+    []
+  end
 end
 ```
 
-### Client JS equivalente
+### Step 3: `lib/gateway_api_web/channels/client_stats_channel.ex`
+
+This channel gives each client a private stats stream for their own request history.
+
+```elixir
+defmodule GatewayApiWeb.ClientStatsChannel do
+  use Phoenix.Channel
+
+  # broadcast_from! is used here (not broadcast! + intercept) because
+  # there's no per-socket payload transformation needed
+  @max_history 100
+
+  @impl true
+  def join("client:" <> client_id, _params, socket) do
+    # Clients can only subscribe to their own channel
+    if client_id == socket.assigns.client_id do
+      send(self(), :after_join)
+      {:ok, assign(socket, :client_id, client_id)}
+    else
+      {:error, %{reason: "unauthorized"}}
+    end
+  end
+
+  @impl true
+  def handle_info(:after_join, socket) do
+    # Send the client their recent request history
+    history = load_recent_history(socket.assigns.client_id)
+    push(socket, "history", %{requests: history})
+    {:noreply, socket}
+  end
+
+  @impl true
+  def handle_in("get_stats", _payload, socket) do
+    stats = compute_stats(socket.assigns.client_id)
+    {:reply, {:ok, stats}, socket}
+  end
+
+  # Called by the gateway router after processing each request for this client
+  def push_request_event(client_id, request_data) do
+    GatewayApiWeb.Endpoint.broadcast(
+      "client:#{client_id}",
+      "request",
+      request_data
+    )
+  end
+
+  defp load_recent_history(client_id) do
+    # TODO: query recent requests from DB or ETS
+    []
+  end
+
+  defp compute_stats(client_id) do
+    # TODO: aggregate stats for this client
+    %{requests_today: 0, error_rate: 0.0, avg_latency_ms: 0.0}
+  end
+end
+```
+
+### Step 4: Mount the socket in `endpoint.ex`
+
+```elixir
+# In lib/gateway_api_web/endpoint.ex
+socket "/socket", GatewayApiWeb.UserSocket,
+  websocket: true,
+  longpoll: false
+```
+
+### Step 5: JavaScript client
 
 ```javascript
-const channel = socket.channel("notifications:user-123", { token: authToken })
+// Monitoring agent connecting to gateway:events
+import { Socket } from "phoenix"
 
-channel.join()
-  .receive("ok", () => console.log("Notificaciones activas"))
+const socket = new Socket("/socket", { params: { token: authToken } })
+socket.connect()
 
-// Recibir solo notificaciones según preferencias (filtrado en servidor)
-channel.on("notification", ({ category, message, ts }) => {
-  showToast(category, message)
+// Subscribe to circuit breaker and rate limit events only
+const channel = socket.channel("gateway:events", {
+  categories: ["circuit_breaker", "rate_limit"]
 })
 
-// Actualizar preferencias sin reconectar
-function updatePreferences(categories) {
-  channel.push("update_preferences", { categories })
-    .receive("ok", () => console.log("Preferencias actualizadas"))
+channel.join()
+  .receive("ok", ({ circuit_breakers }) => {
+    renderCircuitBreakerState(circuit_breakers)
+  })
+  .receive("error", ({ reason }) => console.error("Join failed:", reason))
+
+channel.on("event", ({ category, data, ts }) => {
+  appendEventToLog(category, data, ts)
+
+  if (category === "circuit_breaker" && data.state === "open") {
+    showAlert(`Circuit opened for ${data.host}`)
+  }
+})
+
+// Update filter without reconnecting
+function setFilter(categories) {
+  channel.push("update_filter", { categories })
+    .receive("ok", () => console.log("Filter updated"))
 }
 ```
 
----
-
-## Resumen de errores comunes
-
-| Error | Síntoma | Solución |
-|-------|---------|---------|
-| Omitir `intercept ["evento"]` | `handle_out/3` nunca se ejecuta | Declarar `intercept` con los eventos a interceptar |
-| No asignar estado en `join/3` | `socket.assigns.clave` falla en runtime | Usar `assign/3` dentro de `join/3` antes de retornar |
-| Retornar `{:ok, payload, socket}` en `handle_out` | Error en runtime | Usar `push/3` + `{:noreply, socket}` |
-| `broadcast!` sin `handle_out` para filtrar | El emisor recibe su propio mensaje | Interceptar y filtrar por `socket.assigns.user_id` |
-| No manejar `{:error, reason}` en `join/3` | Clientes no autorizados se unen | Retornar `{:error, %{reason: "..."}}` en caso de fallo |
-
----
-
-## Cómo probar
-
-```bash
-# Crear la app Phoenix (solo para contexto, no ejecutar en el ejercicio)
-mix phx.new my_game --no-ecto
-cd my_game
-
-# El channel va en: lib/my_game_web/channels/game_channel.ex
-# El socket va en:  lib/my_game_web/channels/user_socket.ex
-
-# En user_socket.ex agregar:
-# channel "game:*", MyAppWeb.GameChannel
-```
+### Step 6: Given tests — must pass without modification
 
 ```elixir
-# Test básico del channel con Phoenix.ChannelTest
-defmodule MyAppWeb.GameChannelTest do
-  use MyAppWeb.ChannelCase
+# test/gateway_api_web/channels/gateway_events_channel_test.exs
+defmodule GatewayApiWeb.GatewayEventsChannelTest do
+  use GatewayApiWeb.ChannelCase
 
   setup do
+    token = Phoenix.Token.sign(GatewayApiWeb.Endpoint, "socket", "client-test")
+
     {:ok, _, socket} =
-      MyAppWeb.UserSocket
-      |> socket("user_id", %{player_id: "p1"})
-      |> subscribe_and_join(MyAppWeb.GameChannel, "game:sala-1", %{"token" => "valid"})
+      GatewayApiWeb.UserSocket
+      |> socket("client-test", %{client_id: "client-test"})
+      |> subscribe_and_join(GatewayApiWeb.GatewayEventsChannel, "gateway:events", %{})
 
-    %{socket: socket}
+    %{socket: socket, token: token}
   end
 
-  test "move no llega al emisor", %{socket: socket} do
-    push(socket, "move", %{"x" => 10, "y" => 20})
-    refute_push "move", %{player_id: "p1"}
+  test "join returns current circuit breaker state", %{socket: socket} do
+    # The channel replied with the initial state during subscribe_and_join
+    # Verify the join response included circuit_breakers key
+    # (subscribe_and_join returns {:ok, reply, socket})
+    assert :ok  # covered by subscribe_and_join not raising
   end
 
-  test "move llega a otros jugadores" do
-    {:ok, _, other_socket} =
-      MyAppWeb.UserSocket
-      |> socket("user_id", %{player_id: "p2"})
-      |> subscribe_and_join(MyAppWeb.GameChannel, "game:sala-1", %{"token" => "valid"})
+  test "subscribed client receives broadcast events", %{socket: socket} do
+    GatewayApiWeb.GatewayEventsChannel.broadcast_event(
+      "circuit_breaker",
+      %{host: "payments.internal", state: "open"}
+    )
 
-    push(other_socket, "move", %{"x" => 5, "y" => 15})
-    assert_push "move", %{player_id: "p2", x: 5, y: 15}
+    assert_push "event", %{category: "circuit_breaker"}
+  end
+
+  test "filter: client only receives matching categories" do
+    token = Phoenix.Token.sign(GatewayApiWeb.Endpoint, "socket", "filtered-client")
+    {:ok, _, filtered_socket} =
+      GatewayApiWeb.UserSocket
+      |> socket("filtered-client", %{client_id: "filtered-client"})
+      |> subscribe_and_join(
+        GatewayApiWeb.GatewayEventsChannel,
+        "gateway:events",
+        %{"categories" => ["rate_limit"]}
+      )
+
+    # Broadcast a circuit_breaker event — filtered socket should NOT receive it
+    GatewayApiWeb.GatewayEventsChannel.broadcast_event(
+      "circuit_breaker",
+      %{host: "payments.internal", state: "open"}
+    )
+
+    refute_push "event", %{category: "circuit_breaker"}
+  end
+
+  test "update_filter changes subscribed categories", %{socket: socket} do
+    ref = push(socket, "update_filter", %{"categories" => ["rate_limit"]})
+    assert_reply ref, :ok
+
+    # Now broadcast a circuit_breaker event — should be filtered out
+    GatewayApiWeb.GatewayEventsChannel.broadcast_event("circuit_breaker", %{host: "x"})
+    refute_push "event", %{category: "circuit_breaker"}
   end
 end
 ```
+
+```elixir
+# test/gateway_api_web/channels/client_stats_channel_test.exs
+defmodule GatewayApiWeb.ClientStatsChannelTest do
+  use GatewayApiWeb.ChannelCase
+
+  test "client can only join their own channel" do
+    # client-1 tries to join client:client-2 — should fail
+    {:error, %{reason: "unauthorized"}} =
+      GatewayApiWeb.UserSocket
+      |> socket("client-1", %{client_id: "client-1"})
+      |> subscribe_and_join(GatewayApiWeb.ClientStatsChannel, "client:client-2", %{})
+  end
+
+  test "client receives history on join" do
+    {:ok, _, socket} =
+      GatewayApiWeb.UserSocket
+      |> socket("client-1", %{client_id: "client-1"})
+      |> subscribe_and_join(GatewayApiWeb.ClientStatsChannel, "client:client-1", %{})
+
+    assert_push "history", %{requests: _}
+  end
+
+  test "get_stats returns stats for the client", %{} do
+    {:ok, _, socket} =
+      GatewayApiWeb.UserSocket
+      |> socket("c1", %{client_id: "c1"})
+      |> subscribe_and_join(GatewayApiWeb.ClientStatsChannel, "client:c1", %{})
+
+    ref = push(socket, "get_stats", %{})
+    assert_reply ref, :ok, %{requests_today: _, error_rate: _}
+  end
+end
+```
+
+### Step 7: Run the tests
+
+```bash
+mix test test/gateway_api_web/channels/ --trace
+```
+
+---
+
+## Trade-off analysis
+
+| Aspect | Phoenix Channels | Phoenix LiveView | Plain WebSocket (cowboy) |
+|--------|-----------------|-----------------|--------------------------|
+| Protocol | Phoenix wire format | Phoenix wire format | raw binary/text |
+| Client library | `phoenix.js` | `phoenix_live_view.js` | custom |
+| Topic routing | per-channel module | per-LiveView module | manual |
+| Broadcast filtering | handle_out/intercept | per-process PubSub | manual |
+| State per connection | socket assigns | socket assigns | custom |
+| JS framework needed | no | no | no |
+
+Reflection: `broadcast!/3` delivers to all subscribers in a topic synchronously in the
+calling process. On a topic with 10,000 subscribers and large payloads, this blocks the
+caller for the duration of all pushes. How does Phoenix handle this internally? (Hint:
+look at `Phoenix.Channel.Server` and process-per-connection architecture.)
+
+---
+
+## Common production mistakes
+
+**1. Forgetting `intercept ["event"]` before `handle_out`**
+Without `intercept`, `handle_out` is never called. The event goes directly to all
+subscribers with no filtering. This is the most common channel bug.
+
+**2. Returning `{:ok, payload, socket}` from `handle_out`**
+`handle_out` must return `{:noreply, socket}`. It calls `push/3` directly to send,
+or skips the push to filter. Returning anything else crashes the channel process at runtime.
+
+**3. Not assigning state in `join/3`**
+If `join/3` returns `{:ok, socket}` without assigning `client_id`, any `handle_in` or
+`handle_out` that references `socket.assigns.client_id` crashes at runtime.
+
+**4. Using `broadcast!/3` for "all except sender"**
+`broadcast!/3` sends to everyone, including the sender. For "all except sender", use
+`broadcast_from!/3`. It's cleaner than `broadcast!` + `intercept` + `handle_out` when no
+per-socket payload transformation is needed.
+
+**5. Trusting the client's claimed `client_id` in `join/3`**
+Never accept the `client_id` from the join payload to authorize access. Verify identity
+using the `socket.assigns.client_id` set in `connect/3` from a verified token.
+
+---
+
+## Resources
+
+- [Phoenix Channels overview](https://hexdocs.pm/phoenix/channels.html) — join, handle_in, handle_out
+- [Phoenix.ChannelTest](https://hexdocs.pm/phoenix/Phoenix.ChannelTest.html) — `subscribe_and_join/4`, `push/3`, `assert_push/2`
+- [Phoenix.Token](https://hexdocs.pm/phoenix/Phoenix.Token.html) — signing and verifying tokens for socket auth
+- [phoenix.js](https://hexdocs.pm/phoenix/js/) — JavaScript client library reference

@@ -1,527 +1,386 @@
-# 8. Functions and Arity
+# Functions and Arity: The Transaction Module API
 
-**Difficulty**: Basico
+**Project**: `payments_cli` — built incrementally across the basic level
 
-## Prerequisites
+---
 
-- Haber completado los ejercicios 01–07
-- Conocimiento de pattern matching (ejercicio 05) y maps (ejercicio 07)
-- Un proyecto Mix creado con `mix new` o IEx disponible
+## Project context
 
-## Learning Objectives
+You're building `payments_cli`. The `Transaction` module needs a well-designed
+public API: functions that clearly express their intent through multiple clauses,
+guards, and arity conventions. This exercise is about what makes a function
+interface good in Elixir.
 
-- Definir funciones públicas con `def` y privadas con `defp`
-- Entender que la arity es parte del identificador de una función
-- Escribir múltiples cláusulas de una misma función con patrones distintos
-- Usar argumentos con valor por defecto con `\\`
-- Proteger cláusulas con guards (`when`)
-- Leer la notación `Module.function/arity`
+Project structure at this point:
 
-## Concepts
-
-### def y defp
-
-Las funciones en Elixir se definen dentro de módulos:
-
-```elixir
-defmodule MathUtils do
-  # Función pública: accesible desde fuera del módulo
-  def add(a, b), do: a + b
-
-  # Función privada: solo accesible dentro de MathUtils
-  defp validate_positive(n) when n > 0, do: :ok
-  defp validate_positive(_), do: :error
-end
-
-MathUtils.add(2, 3)           # 5
-# MathUtils.validate_positive(5) # UndefinedFunctionError
+```
+payments_cli/
+├── lib/
+│   └── payments_cli/
+│       ├── cli.ex
+│       ├── transaction.ex   # ← you extend this
+│       ├── ledger.ex
+│       ├── formatter.ex
+│       ├── pipeline.ex
+│       └── processor.ex
+├── test/
+│   └── payments_cli/
+│       └── transaction_api_test.exs  # given tests — must pass without modification
+└── mix.exs
 ```
 
-La forma compacta `do:` es equivalente al bloque `do...end`:
+---
+
+## Why arity is part of the function identity
+
+In Elixir, `Transaction.describe/1` and `Transaction.describe/2` are completely
+distinct functions — as different as `describe` and `describe_with_context`. The
+notation `Module.function/arity` is the canonical identifier for a function in:
+
+- Documentation: `see Transaction.classify_status/1`
+- Error messages: `UndefinedFunctionError: function Transaction.classify_status/0 is undefined`
+- Function capture: `&Transaction.classify_status/1`
+
+This design eliminates a class of bugs where calling a function with the wrong number
+of arguments silently uses defaults. In Elixir, calling `classify_status()` with no
+arguments is a compile error — it looks for `classify_status/0` which does not exist.
+
+Multiple clauses with pattern matching let you express business rules as data, not as
+procedural conditionals. A payment processor that routes transactions based on currency
+reads better as:
 
 ```elixir
-# Estas dos formas son idénticas
-def greet(name), do: "Hello, #{name}!"
+def route_to_processor(:USD), do: :stripe
+def route_to_processor(:EUR), do: :adyen
+def route_to_processor(_),    do: :fallback_processor
+```
 
-def greet(name) do
-  "Hello, #{name}!"
+than as a long `cond` block.
+
+---
+
+## The business problem
+
+Extend the `Transaction` module with a complete API:
+
+1. Describe a transaction for logging (multiple clauses by status)
+2. Determine if a transaction is reversible (guard-based business rule)
+3. Compare two transactions by amount (multiple arity variant)
+4. Build a display label (default argument for optional currency symbol)
+
+---
+
+## Implementation
+
+### Extend `lib/payments_cli/transaction.ex`
+
+Add these functions to the existing `Transaction` module:
+
+```elixir
+# Add to PaymentsCli.Transaction
+
+@doc """
+Returns a human-readable log description for a transaction.
+
+Uses multiple clauses — one per status — so each case is explicit.
+A catch-all handles statuses added in the future without breaking existing code.
+
+## Examples
+
+    iex> PaymentsCli.Transaction.describe(%{id: "T1", status: :approved, amount_cents: 1000, currency: "USD"})
+    "T1: approved $10.00"
+
+    iex> PaymentsCli.Transaction.describe(%{id: "T2", status: :declined, amount_cents: 500, currency: "USD"})
+    "T2: DECLINED (amount: $5.00)"
+
+"""
+@spec describe(map()) :: String.t()
+def describe(%{id: id, status: :approved, amount_cents: cents, currency: currency}) do
+  # TODO: return "#{id}: approved #{format_display(cents, currency)}"
+end
+
+def describe(%{id: id, status: :declined, amount_cents: cents, currency: currency}) do
+  # TODO: return "#{id}: DECLINED (amount: #{format_display(cents, currency)})"
+end
+
+def describe(%{id: id, status: :flagged, amount_cents: cents, currency: currency}) do
+  # TODO: return "#{id}: FLAGGED FOR REVIEW — #{format_display(cents, currency)}"
+end
+
+def describe(%{id: id, status: :reversed, amount_cents: cents, currency: currency}) do
+  # TODO: return "#{id}: reversed #{format_display(cents, currency)}"
+end
+
+def describe(%{id: id, status: status}) do
+  # TODO: catch-all — return "#{id}: #{status}"
+end
+
+@doc """
+Returns true if a transaction can be reversed.
+
+Business rules:
+- Only :approved transactions can be reversed
+- Amount must be positive (> 0)
+- Uses guards so the rule is enforced at the function head, not in the body
+
+## Examples
+
+    iex> PaymentsCli.Transaction.reversible?(%{status: :approved, amount_cents: 1000})
+    true
+
+    iex> PaymentsCli.Transaction.reversible?(%{status: :declined, amount_cents: 1000})
+    false
+
+"""
+@spec reversible?(map()) :: boolean()
+def reversible?(%{status: :approved, amount_cents: cents}) when cents > 0, do: true
+def reversible?(_), do: false
+
+@doc """
+Compares two transactions by amount.
+
+Returns :gt, :lt, or :eq.
+
+reversible?/1 and compare/2 demonstrate arity-based differentiation:
+compare/2 takes two transactions; compare/3 takes two transactions and a field.
+
+## Examples
+
+    iex> t1 = %{amount_cents: 1000}
+    iex> t2 = %{amount_cents: 500}
+    iex> PaymentsCli.Transaction.compare(t1, t2)
+    :gt
+
+"""
+@spec compare(map(), map()) :: :gt | :lt | :eq
+def compare(%{amount_cents: a}, %{amount_cents: b}) do
+  # TODO: use cond or guards to return :gt, :lt, or :eq
+end
+
+@doc """
+Compares two transactions by a specified field.
+
+The field must exist in both transactions and must be comparable.
+
+## Examples
+
+    iex> t1 = %{amount_cents: 1000, id: "TXN002"}
+    iex> t2 = %{amount_cents: 500,  id: "TXN001"}
+    iex> PaymentsCli.Transaction.compare(t1, t2, :id)
+    :gt
+
+"""
+@spec compare(map(), map(), atom()) :: :gt | :lt | :eq
+def compare(tx1, tx2, field) when is_atom(field) do
+  # TODO: extract Map.get(tx1, field) and Map.get(tx2, field), then compare
+end
+
+@doc """
+Builds a short display label for a transaction.
+
+`symbol` is optional — defaults to the currency code when not provided.
+
+## Examples
+
+    iex> tx = %{id: "T1", amount_cents: 1234, currency: "USD"}
+    iex> PaymentsCli.Transaction.label(tx)
+    "T1 [USD 12.34]"
+
+    iex> PaymentsCli.Transaction.label(tx, "$")
+    "T1 [$12.34]"
+
+"""
+@spec label(map(), String.t()) :: String.t()
+def label(tx, symbol \\ nil)
+
+def label(%{id: id, amount_cents: cents, currency: currency}, nil) do
+  # TODO: return "#{id} [#{currency} #{format_cents(cents)}]"
+end
+
+def label(%{id: id, amount_cents: cents}, symbol) when is_binary(symbol) do
+  # TODO: return "#{id} [#{symbol}#{format_cents(cents)}]"
+end
+
+# ---------------------------------------------------------------------------
+# Private helpers
+# ---------------------------------------------------------------------------
+
+# Format cents as "12.34" (two decimal places, no currency symbol)
+defp format_cents(cents) do
+  # TODO: div and rem to split, pad minor unit with leading zero
+end
+
+# Format with currency for display descriptions
+defp format_display(cents, currency) do
+  # TODO: use format_cents and prepend currency code + space
+  # e.g. "USD 12.34"
 end
 ```
 
-### Arity: el número de argumentos es parte del nombre
-
-En Elixir, `greet/1` y `greet/2` son funciones **distintas** aunque compartan nombre:
+### Given tests — must pass without modification
 
 ```elixir
-defmodule Greeter do
-  def greet(name), do: "Hello, #{name}!"
-  def greet(name, lang) when lang == :es, do: "Hola, #{name}!"
-  def greet(name, lang) when lang == :fr, do: "Bonjour, #{name}!"
-end
+# test/payments_cli/transaction_api_test.exs
+defmodule PaymentsCli.TransactionApiTest do
+  use ExUnit.Case, async: true
 
-Greeter.greet("Alice")           # "Hello, Alice!"
-Greeter.greet("Alice", :es)      # "Hola, Alice!"
-Greeter.greet("Alice", :fr)      # "Bonjour, Alice!"
-```
+  alias PaymentsCli.Transaction
 
-La notación `Module.function/arity` identifica exactamente qué función es:
-- `String.upcase/1` — recibe 1 argumento
-- `Enum.map/2` — recibe 2 argumentos
-- `Map.get/3` — recibe 3 argumentos
+  @approved  %{id: "T1", status: :approved,  amount_cents: 1000, currency: "USD"}
+  @declined  %{id: "T2", status: :declined,  amount_cents: 500,  currency: "USD"}
+  @flagged   %{id: "T3", status: :flagged,   amount_cents: 750,  currency: "EUR"}
+  @reversed  %{id: "T4", status: :reversed,  amount_cents: 200,  currency: "GBP"}
+  @pending   %{id: "T5", status: :pending,   amount_cents: 300,  currency: "USD"}
 
-### Multiple Clauses — pattern matching en parámetros
-
-Puedes definir varias cláusulas de la misma función. Elixir evalúa de arriba a abajo y usa la primera que hace match:
-
-```elixir
-defmodule Status do
-  def describe(:ok),    do: "Operation succeeded"
-  def describe(:error), do: "Operation failed"
-  def describe(other),  do: "Unknown status: #{inspect(other)}"
-end
-
-Status.describe(:ok)      # "Operation succeeded"
-Status.describe(:error)   # "Operation failed"
-Status.describe(:pending) # "Unknown status: :pending"
-```
-
-**El orden importa**: las cláusulas más específicas siempre deben ir primero.
-
-### Destruir estructuras en los parámetros
-
-El pattern matching ocurre directamente en los parámetros:
-
-```elixir
-defmodule Geometry do
-  # Destruir tupla en el parámetro
-  def area({:rect, width, height}), do: width * height
-  def area({:circle, radius}),      do: :math.pi() * radius * radius
-
-  # Destruir map en el parámetro
-  def greet(%{name: name, role: :admin}), do: "Admin #{name}"
-  def greet(%{name: name}),               do: "User #{name}"
-end
-
-Geometry.area({:rect, 4, 5})     # 20
-Geometry.area({:circle, 3})      # 28.274...
-```
-
-### Default Arguments
-
-El operador `\\` define un valor por defecto:
-
-```elixir
-defmodule Formatter do
-  def repeat(str, times \\ 1) do
-    String.duplicate(str, times)
-  end
-end
-
-Formatter.repeat("ha")     # "ha"      — times = 1
-Formatter.repeat("ha", 3)  # "hahaha"  — times = 3
-```
-
-Los default arguments generan múltiples variantes: `repeat/1` y `repeat/2` en este caso.
-
-### Guards — `when`
-
-Los guards filtran cláusulas con condiciones booleanas. Solo funciones puras están permitidas:
-
-```elixir
-defmodule NumberUtils do
-  def classify(n) when n < 0,  do: :negative
-  def classify(0),              do: :zero
-  def classify(n) when n > 0,  do: :positive
-end
-
-NumberUtils.classify(-5)  # :negative
-NumberUtils.classify(0)   # :zero
-NumberUtils.classify(42)  # :positive
-```
-
-Funciones permitidas en guards: `is_integer/1`, `is_binary/1`, `is_list/1`, `is_map/1`, `is_atom/1`, `is_nil/1`, comparaciones (`==`, `<`, `>`, `>=`, `<=`), operadores lógicos (`and`, `or`, `not`), `rem/2`, `abs/1`, `length/1` en binarios, entre otras. **`String.length/1` y `length/1` en listas no son válidos en guards.**
-
-## Exercises
-
-### Exercise 1: Funciones básicas — forma compacta y bloque
-
-```elixir
-defmodule BasicMath do
-  # Forma compacta (una sola expresión)
-  def add(a, b), do: a + b
-  def subtract(a, b), do: a - b
-  def multiply(a, b), do: a * b
-
-  # Forma con bloque (múltiples expresiones)
-  def divide(a, b) do
-    if b == 0 do
-      {:error, "division by zero"}
-    else
-      {:ok, a / b}
+  describe "describe/1" do
+    test "describes approved transaction" do
+      result = Transaction.describe(@approved)
+      assert String.contains?(result, "T1")
+      assert String.contains?(result, "approved")
     end
-  end
-end
 
-BasicMath.add(3, 4)         # 7
-BasicMath.subtract(10, 3)   # 7
-BasicMath.multiply(4, 5)    # 20
-BasicMath.divide(10, 2)     # {:ok, 5.0}
-BasicMath.divide(10, 0)     # {:error, "division by zero"}
-```
+    test "describes declined transaction with emphasis" do
+      result = Transaction.describe(@declined)
+      assert String.contains?(result, "DECLINED")
+    end
 
-**Expected output:**
+    test "describes flagged transaction" do
+      result = Transaction.describe(@flagged)
+      assert String.contains?(result, "FLAGGED")
+    end
 
-```
-iex> BasicMath.add(3, 4)
-7
-iex> BasicMath.subtract(10, 3)
-7
-iex> BasicMath.divide(10, 2)
-{:ok, 5.0}
-iex> BasicMath.divide(10, 0)
-{:error, "division by zero"}
-```
+    test "describes reversed transaction" do
+      result = Transaction.describe(@reversed)
+      assert String.contains?(result, "reversed")
+    end
 
----
-
-### Exercise 2: Multiple Clauses — pattern matching en el parámetro
-
-```elixir
-defmodule HttpStatus do
-  def describe(200), do: "OK"
-  def describe(201), do: "Created"
-  def describe(404), do: "Not Found"
-  def describe(500), do: "Internal Server Error"
-  def describe(code), do: "Unknown status: #{code}"
-
-  # Pattern matching con átomos
-  def outcome(:ok),    do: "Success"
-  def outcome(:error), do: "Failure"
-  def outcome(_),      do: "Unknown"
-end
-
-HttpStatus.describe(200)   # "OK"
-HttpStatus.describe(404)   # "Not Found"
-HttpStatus.describe(302)   # "Unknown status: 302"
-HttpStatus.outcome(:ok)    # "Success"
-HttpStatus.outcome(:other) # "Unknown"
-```
-
-**Expected output:**
-
-```
-iex> HttpStatus.describe(200)
-"OK"
-iex> HttpStatus.describe(404)
-"Not Found"
-iex> HttpStatus.describe(302)
-"Unknown status: 302"
-iex> HttpStatus.outcome(:ok)
-"Success"
-iex> HttpStatus.outcome(:other)
-"Unknown"
-```
-
----
-
-### Exercise 3: Destruir estructuras en parámetros
-
-```elixir
-defmodule ShapeArea do
-  # Destruir tuplas directamente en los parámetros
-  def area({:square, side}),            do: side * side
-  def area({:rect, width, height}),     do: width * height
-  def area({:circle, radius}),          do: :math.pi() * radius * radius
-  def area({:triangle, base, height}),  do: base * height / 2
-
-  # Destruir map en el parámetro
-  def full_name(%{first: first, last: last}), do: "#{first} #{last}"
-
-  # Destruir lista — extraer primer elemento
-  def first_item([head | _]), do: head
-  def first_item([]),         do: nil
-end
-
-ShapeArea.area({:square, 5})         # 25
-ShapeArea.area({:rect, 4, 6})        # 24
-ShapeArea.area({:circle, 3})         # ~28.27
-ShapeArea.full_name(%{first: "John", last: "Doe"})  # "John Doe"
-ShapeArea.first_item([10, 20, 30])   # 10
-ShapeArea.first_item([])             # nil
-```
-
-**Expected output:**
-
-```
-iex> ShapeArea.area({:square, 5})
-25
-iex> ShapeArea.area({:rect, 4, 6})
-24
-iex> ShapeArea.area({:circle, 3})
-28.274333882308138
-iex> ShapeArea.full_name(%{first: "John", last: "Doe"})
-"John Doe"
-iex> ShapeArea.first_item([10, 20, 30])
-10
-iex> ShapeArea.first_item([])
-nil
-```
-
----
-
-### Exercise 4: Default Arguments
-
-```elixir
-defmodule Greeter do
-  # greeting tiene valor por defecto "Hello"
-  def greet(name, greeting \\ "Hello") do
-    "#{greeting}, #{name}!"
-  end
-
-  # Repetir con default de 1
-  def repeat(message, times \\ 1) do
-    String.duplicate(message, times)
-  end
-end
-
-Greeter.greet("Alice")             # "Hello, Alice!"
-Greeter.greet("Alice", "Hi")       # "Hi, Alice!"
-Greeter.greet("Alice", "Hola")     # "Hola, Alice!"
-Greeter.repeat("ha")               # "ha"
-Greeter.repeat("ha", 3)            # "hahaha"
-
-# Los default args crean múltiples variantes — arity 1 y arity 2:
-# Greeter.greet/1 y Greeter.greet/2 existen como funciones separadas
-```
-
-**Expected output:**
-
-```
-iex> Greeter.greet("Alice")
-"Hello, Alice!"
-iex> Greeter.greet("Alice", "Hi")
-"Hi, Alice!"
-iex> Greeter.greet("Alice", "Hola")
-"Hola, Alice!"
-iex> Greeter.repeat("ha", 3)
-"hahaha"
-```
-
----
-
-### Exercise 5: Guards con `when`
-
-```elixir
-defmodule NumberClassifier do
-  def factorial(0), do: 1
-  def factorial(n) when is_integer(n) and n > 0 do
-    n * factorial(n - 1)
-  end
-  def factorial(_), do: {:error, "Must be a non-negative integer"}
-
-  def sign(n) when n > 0,  do: :positive
-  def sign(0),              do: :zero
-  def sign(n) when n < 0,  do: :negative
-
-  def classify_list(list) when is_list(list) and list == [], do: :empty
-  def classify_list(list) when is_list(list),                do: {:has_elements, length(list)}
-  def classify_list(_),                                      do: :not_a_list
-end
-
-NumberClassifier.factorial(5)        # 120
-NumberClassifier.factorial(0)        # 1
-NumberClassifier.factorial(-1)       # {:error, "Must be a non-negative integer"}
-NumberClassifier.sign(42)            # :positive
-NumberClassifier.sign(0)             # :zero
-NumberClassifier.sign(-10)           # :negative
-NumberClassifier.classify_list([])   # :empty
-NumberClassifier.classify_list([1,2,3])  # {:has_elements, 3}
-NumberClassifier.classify_list("x") # :not_a_list
-```
-
-**Expected output:**
-
-```
-iex> NumberClassifier.factorial(5)
-120
-iex> NumberClassifier.factorial(0)
-1
-iex> NumberClassifier.factorial(-1)
-{:error, "Must be a non-negative integer"}
-iex> NumberClassifier.sign(42)
-:positive
-iex> NumberClassifier.classify_list([])
-:empty
-iex> NumberClassifier.classify_list([1, 2, 3])
-{:has_elements, 3}
-```
-
----
-
-### Exercise 6: Funciones privadas con `defp`
-
-```elixir
-defmodule PasswordChecker do
-  # Función pública: punto de entrada
-  def validate(password) do
-    cond do
-      not long_enough?(password) -> {:error, "Too short (min 8 chars)"}
-      not has_digit?(password)   -> {:error, "Must contain a digit"}
-      true                       -> :ok
+    test "catch-all handles pending" do
+      result = Transaction.describe(@pending)
+      assert is_binary(result)
+      assert String.contains?(result, "T5")
     end
   end
 
-  # Funciones privadas: detalles de implementación
-  defp long_enough?(str), do: String.length(str) >= 8
-  defp has_digit?(str),   do: String.match?(str, ~r/[0-9]/)
-end
+  describe "reversible?/1" do
+    test "approved transaction with positive amount is reversible" do
+      assert Transaction.reversible?(@approved) == true
+    end
 
-PasswordChecker.validate("abc")           # {:error, "Too short (min 8 chars)"}
-PasswordChecker.validate("abcdefgh")      # {:error, "Must contain a digit"}
-PasswordChecker.validate("abcdefg1")      # :ok
+    test "declined transaction is not reversible" do
+      assert Transaction.reversible?(@declined) == false
+    end
 
-# Intentar llamar a una función privada desde afuera:
-# PasswordChecker.long_enough?("test")
-# ** (UndefinedFunctionError) function PasswordChecker.long_enough?/1 is undefined or private
-```
+    test "approved transaction with zero amount is not reversible" do
+      tx = %{status: :approved, amount_cents: 0}
+      assert Transaction.reversible?(tx) == false
+    end
+  end
 
-**Expected output:**
+  describe "compare/2 and compare/3" do
+    test "returns :gt when first amount is greater" do
+      assert Transaction.compare(@approved, @declined) == :gt
+    end
 
-```
-iex> PasswordChecker.validate("abc")
-{:error, "Too short (min 8 chars)"}
-iex> PasswordChecker.validate("abcdefgh")
-{:error, "Must contain a digit"}
-iex> PasswordChecker.validate("abcdefg1")
-:ok
-iex> PasswordChecker.long_enough?("test")
-** (UndefinedFunctionError) function PasswordChecker.long_enough?/1 is undefined or private
-```
+    test "returns :lt when first amount is less" do
+      assert Transaction.compare(@declined, @approved) == :lt
+    end
 
-## Common Mistakes
+    test "returns :eq for equal amounts" do
+      same = %{amount_cents: 1000}
+      assert Transaction.compare(@approved, same) == :eq
+    end
 
-### Error 1: Confundir funciones con distinta arity
+    test "compare/3 compares by specified field" do
+      t1 = %{amount_cents: 1000, id: "TXN002"}
+      t2 = %{amount_cents: 500,  id: "TXN001"}
+      assert Transaction.compare(t1, t2, :id) == :gt
+    end
+  end
 
-```elixir
-# greet/1 y greet/2 son funciones DISTINTAS
-defmodule Greeter do
-  def greet(name), do: "Hello, #{name}!"
-  def greet(name, lang), do: "Hola #{name} en #{lang}"
-end
+  describe "label/1 and label/2" do
+    test "label/1 uses currency code" do
+      result = Transaction.label(@approved)
+      assert String.contains?(result, "T1")
+      assert String.contains?(result, "USD")
+    end
 
-# WRONG: asumir que son "versiones" de la misma función
-# Son identificadas como Greeter.greet/1 y Greeter.greet/2
-
-# La notación Module.function/arity es la referencia completa:
-fun = &Greeter.greet/1   # captura específicamente la de 1 argumento
-fun.("Alice")            # "Hello, Alice!"
-```
-
-### Error 2: Argumentos por defecto con múltiples cláusulas
-
-```elixir
-# WRONG: definir default en múltiples cláusulas lanza warning o error
-defmodule BadGreeter do
-  # def greet(name, lang \\ :en), do: "en: #{name}"   # ERROR si hay otra cláusula
-  # def greet(name, :es), do: "es: #{name}"
-end
-
-# FIX: declarar el default en una cláusula cabecera separada
-defmodule GoodGreeter do
-  def greet(name, lang \\ :en)  # Solo la declaración, sin body
-
-  def greet(name, :en), do: "Hello, #{name}!"
-  def greet(name, :es), do: "Hola, #{name}!"
-  def greet(name, _),   do: "Hi, #{name}!"
+    test "label/2 uses provided symbol" do
+      result = Transaction.label(@approved, "$")
+      assert String.contains?(result, "$")
+      refute String.contains?(result, "USD")
+    end
+  end
 end
 ```
 
-### Error 3: Funciones no permitidas en guards
-
-```elixir
-# WRONG: String.length/1 no está permitida en guards
-# def process(str) when String.length(str) > 10, do: :long
-
-# FIX: usar byte_size/1 (sí permitida) o mover la condición al body
-def process(str) when byte_size(str) > 10, do: :long  # aproximación para ASCII
-def process(str) do
-  if String.length(str) > 10, do: :long, else: :short
-end
-```
-
-### Error 4: Cláusula más general antes que la específica
-
-```elixir
-# WRONG: la cláusula catch-all _ intercepta todo — las siguientes nunca se ejecutan
-defmodule BadStatus do
-  def describe(_),      do: "unknown"  # demasiado general — primero
-  def describe(:ok),    do: "success"  # NUNCA se alcanza
-  def describe(:error), do: "failure"  # NUNCA se alcanza
-end
-
-# FIX: las cláusulas específicas siempre primero
-defmodule GoodStatus do
-  def describe(:ok),    do: "success"
-  def describe(:error), do: "failure"
-  def describe(_),      do: "unknown"  # catch-all al final
-end
-```
-
-## Verification
+### Run the tests
 
 ```bash
-# Crear un archivo de prueba
-cat > /tmp/test_functions.exs << 'EOF'
-defmodule MathTest do
-  def add(a, b), do: a + b
-
-  def factorial(0), do: 1
-  def factorial(n) when is_integer(n) and n > 0, do: n * factorial(n - 1)
-
-  def sign(n) when n > 0, do: :positive
-  def sign(0),             do: :zero
-  def sign(n) when n < 0, do: :negative
-
-  def greet(name, greeting \\ "Hello"), do: "#{greeting}, #{name}!"
-end
-
-IO.puts MathTest.add(3, 4)            # 7
-IO.puts MathTest.factorial(5)         # 120
-IO.puts inspect(MathTest.sign(-3))    # :negative
-IO.puts MathTest.greet("Alice")       # Hello, Alice!
-IO.puts MathTest.greet("Alice", "Hi") # Hi, Alice!
-EOF
-
-elixir /tmp/test_functions.exs
+mix test test/payments_cli/transaction_api_test.exs --trace
 ```
 
-**Expected output:**
+---
 
+## Trade-off analysis
+
+| Aspect | Multiple clauses (your impl) | Single function with `cond` | Single function with `if` |
+|--------|-----------------------------|-----------------------------|--------------------------|
+| Adding a new status | Add one clause | Edit the `cond` block | Nest another `if` |
+| Pattern match guards | First-class, in the head | Separate condition | Separate condition |
+| Dialyzer exhaustiveness | Can warn on unhandled | Cannot | Cannot |
+| Readability | Each case isolated | All cases in one block | Deeply nested |
+| Catch-all | Natural final clause | `true ->` at end | Final `else` |
+
+Reflection question: `label/1` uses a default argument `symbol \\ nil`. The
+compiler generates two functions: `label/1` and `label/2`. What does `label/1`
+actually do at the call site? Look at what Mix generates with `mix compile` and
+inspect the beam file with `:beam_lib.chunks/2`.
+
+---
+
+## Common production mistakes
+
+**1. Catch-all clause before specific clauses**
+```elixir
+def describe(_tx), do: "unknown"  # catches everything — wrong position
+def describe(%{status: :approved}), do: "approved"  # never reached
 ```
-7
-120
-:negative
-Hello, Alice!
-Hi, Alice!
+Elixir evaluates clauses top-to-bottom and uses the first match. Specific clauses
+must come before the catch-all. The compiler warns, but only if `--warnings-as-errors`
+is set (which it should be in CI).
+
+**2. Default arguments with multiple clauses need a header declaration**
+```elixir
+# WRONG — compiler error with multiple clauses that have a default
+def label(tx, symbol \\ nil)  # this is the header-only declaration
+def label(tx, nil), do: ...   # clause 1
+def label(tx, symbol), do: ... # clause 2
 ```
+The header-only declaration (`def label(tx, symbol \\ nil)` with no body) is
+required when a function with a default argument has multiple clauses. Omitting it
+causes a compilation error.
 
-## Summary
+**3. Guards cannot call user-defined functions**
+`when reversible?(tx)` is not valid in a guard. Guards are limited to BIFs
+(built-in functions) like `is_integer/1`, `is_binary/1`, `>`, `<`, `rem/2`.
+The reason: guards must be pure and side-effect-free. Move complex conditions
+to the function body.
 
-- `def` define funciones públicas, `defp` define funciones privadas — ambas van dentro de módulos
-- La **arity** (número de argumentos) es parte del identificador: `greet/1 ≠ greet/2`
-- Las cláusulas se evalúan **de arriba a abajo** — pon las más específicas primero
-- Los argumentos por defecto (`\\`) generan variantes adicionales de la función
-- Los **guards** (`when`) filtran cláusulas con condiciones — solo funciones puras son válidas en guards
-- La notación `Module.function/arity` identifica unívocamente cualquier función en Elixir
+**4. Function capture captures the arity**
+`&Transaction.compare/2` and `&Transaction.compare/3` are different captures.
+Passing `&Transaction.compare/2` to `Enum.sort_by/3` will fail if you intended
+the three-argument version.
 
-## What's Next
+**5. Forgetting that `defp` breaks the public contract**
+Changing `def validate/1` to `defp validate/1` breaks every caller outside the
+module. Unlike access modifiers in OO languages, there is no warning from the
+compiler — callers just get `UndefinedFunctionError` at runtime.
 
-- **09-control-flow-if-case-cond**: Combinar funciones con `if`, `case` y `cond`
-- **10-recursion-and-tail-call-optimization**: Usar multiple clauses para escribir funciones recursivas
+---
 
 ## Resources
 
-- [Elixir Docs — def/defp](https://hexdocs.pm/elixir/Kernel.html#def/2)
-- [Elixir Getting Started — Modules and Functions](https://elixir-lang.org/getting-started/modules-and-functions.html)
+- [Modules and Functions — Elixir Getting Started](https://elixir-lang.org/getting-started/modules-and-functions.html)
+- [def/defp — Kernel docs](https://hexdocs.pm/elixir/Kernel.html#def/2)
+- [Guards — Elixir Getting Started](https://elixir-lang.org/getting-started/case-cond-and-if.html#guards)
 - [Elixir School — Functions](https://elixirschool.com/en/lessons/basics/functions)
-- [Elixir Getting Started — Guards](https://elixir-lang.org/getting-started/case-cond-and-if.html#guards)

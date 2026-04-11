@@ -1,400 +1,412 @@
-# 21 — Advanced Macros & AST Manipulation
+# Advanced Macros and AST Manipulation
 
-**Nivel**: Avanzado  
-**Tema**: Manipulación directa del Abstract Syntax Tree y el módulo `Macro`
+**Project**: `api_gateway` — built incrementally across the advanced level
 
 ---
 
-## Contexto
+## Project context
 
-En Elixir, todo el código fuente se representa como una estructura de datos uniforme antes de compilarse:
-el **AST** (Abstract Syntax Tree). Entender cómo leerlo, traversarlo y transformarlo te permite escribir
-macros que operan a nivel semántico profundo, no sólo de texto.
+You're building `api_gateway`. The gateway has middleware functions that validate,
+transform, and log requests. The engineering team wants tooling to:
+1. Inspect what any middleware does at compile time without running it
+2. Automatically instrument middleware with timing and logging by transforming its AST
+3. Analyze which variables a middleware function reads from the connection struct
 
-El AST de Elixir sigue un formato estricto de tres elementos:
+These requirements push you into AST manipulation — reading, traversing, and
+transforming the abstract syntax tree before code is compiled.
+
+Project structure at this point:
+
+```
+api_gateway/
+├── lib/
+│   └── api_gateway/
+│       ├── application.ex
+│       ├── router.ex
+│       ├── middleware/
+│       │   ├── pipeline.ex
+│       │   └── instrumentation.ex  # ← you implement this
+│       └── dev/
+│           └── ast_tools.ex        # ← and this
+├── test/
+│   └── api_gateway/
+│       └── middleware/
+│           └── instrumentation_test.exs
+└── mix.exs
+```
+
+---
+
+## The business problem
+
+Three tooling requirements:
+
+1. **Compile-time inspection**: during code review, developers want to print the AST
+   of any expression to understand what the compiler sees. The macro must print at
+   compile time (not runtime) and still return the correct value.
+
+2. **Automatic instrumentation**: instead of manually wrapping every middleware function
+   with timing code, a macro should transform the function body at compile time to
+   add `System.monotonic_time` measurements and emit a telemetry event.
+
+3. **Variable analysis**: a static analysis tool that lists all variables referenced
+   in a block of code — useful for dead code analysis and security audits.
+
+---
+
+## The Elixir AST format
+
+Every Elixir expression, before compilation, is represented as nested tuples:
 
 ```elixir
-# {función_o_operador, metadata, argumentos}
 quote do: 1 + 2
-#=> {:+, [context: Elixir, imports: [...]}, [1, 2]}
+#=> {:+, [context: Elixir, imports: [{2, Kernel}]], [1, 2]}
 
 quote do: foo(bar)
 #=> {:foo, [line: 1], [{:bar, [line: 1], Elixir}]}
 
-# Las variables son tres-element tuples con el módulo como tercer elemento
-quote do: x
-#=> {:x, [], Elixir}
+# Variables vs function calls — distinguished by the third element:
+quote do: x         #=> {:x, [], Elixir}       # variable: atom context
+quote do: x()       #=> {:x, [], []}            # call: empty list args
+quote do: x(1)      #=> {:x, [], [1]}           # call with args: non-empty list
 ```
 
-### Herramientas clave del módulo `Macro`
-
-| Función | Propósito |
-|---|---|
-| `Macro.traverse/4` | Pre y post walk simultáneos con acumulador |
-| `Macro.prewalk/3` | Visita el nodo ANTES de visitar sus hijos |
-| `Macro.postwalk/3` | Visita el nodo DESPUÉS de visitar sus hijos |
-| `Macro.expand/2` | Expande macros en el AST dado un `__ENV__` |
-| `Macro.to_string/1` | Convierte AST a código Elixir legible |
-| `Code.eval_quoted/3` | Evalúa AST en runtime con bindings opcionales |
-
-### Hygiene de macros
-
-Por defecto, las macros son **higiénicas**: las variables definidas dentro no
-"escapan" al contexto del llamador. `var!(:name, context)` rompe la hygiene
-intencionalmente. Úsalo sólo cuando el objetivo explícito es mutar variables
-del llamador (e.g., DSLs que acumulan estado).
+The critical distinction: `{name, meta, context}` where `context` is an atom
+(or `nil`) for variables, and a list for function calls.
 
 ---
 
-## Ejercicio 1 — AST Inspector
+## Why `Macro.escape` matters
 
-Escribe una macro `ast_inspect/1` que, en **compile time**, imprima el AST de
-la expresión que recibe, luego la evalúe normalmente y retorne su valor.
-
-### Requisitos
-
-- La macro debe imprimir el AST completo usando `IO.inspect/2` con un label descriptivo
-- También debe imprimir la representación en código legible con `Macro.to_string/1`
-- El valor de la expresión original debe retornarse sin modificación
-- El output debe ocurrir durante la compilación, no en runtime
-
-### Uso esperado
+Inside a `quote do ... end` block, `unquote(expr)` inserts `expr` as **code to execute**.
+`unquote(Macro.escape(expr))` inserts the AST of `expr` as **data** (a literal value
+that produces the AST tuple when evaluated).
 
 ```elixir
-defmodule MyModule do
-  require ASTInspector
-  import ASTInspector
+expr = quote do: 1 + 2   # => {:+, [], [1, 2]}
 
-  def example do
-    result = ast_inspect(1 + 2 * 3)
-    # Durante compilación imprime:
-    # [AST] {:+, [...], [1, {:*, [...], [2, 3]}]}
-    # [Code] 1 + 2 * 3
-    result  # => 7 en runtime
-  end
-end
+# Without Macro.escape:
+quote do: IO.inspect(unquote(expr))
+# expands to: IO.inspect(1 + 2)  ← evaluates to IO.inspect(3)
+
+# With Macro.escape:
+quote do: IO.inspect(unquote(Macro.escape(expr)))
+# expands to: IO.inspect({:+, [], [1, 2]})  ← prints the AST tuple
 ```
-
-### Hints
-
-<details>
-<summary>Hint 1 — Estructura básica</summary>
-
-```elixir
-defmacro ast_inspect(expr) do
-  # `expr` ya ES el AST — no necesitas quote dentro
-  ast_str = Macro.to_string(expr)
-  
-  quote do
-    IO.inspect(unquote(Macro.escape(expr)), label: "[AST]")
-    IO.puts("[Code] #{unquote(ast_str)}")
-    unquote(expr)
-  end
-end
-```
-
-El truco: `Macro.escape/1` convierte el AST (que es una estructura de datos Elixir)
-en un AST que produce esa misma estructura de datos cuando se evalúa.
-</details>
-
-<details>
-<summary>Hint 2 — ¿Por qué Macro.escape?</summary>
-
-Sin `Macro.escape`, hacer `unquote(expr)` dentro de `quote do` insertaría el AST
-como código a ejecutar. Con `Macro.escape`, lo convierte para que sea tratado como
-dato literal. Compara:
-
-```elixir
-expr = quote do: 1 + 2
-# Sin escape: unquote(expr) dentro de quote → evalúa 1 + 2 → resultado 3
-# Con escape: unquote(Macro.escape(expr)) → produce {:+, [], [1, 2]} como valor
-```
-</details>
 
 ---
 
-## Ejercicio 2 — Variable Tracker
+## Implementation
 
-Escribe una macro `track_vars/1` que analice un bloque de código y retorne
-una lista de todos los nombres de variables referenciadas en él, sin ejecutar
-el bloque.
-
-### Requisitos
-
-- Usar `Macro.postwalk/3` con un acumulador para recolectar variables
-- Una variable en el AST tiene la forma `{nombre, meta, contexto}` donde
-  `contexto` es un átomo (o `nil` para variables especiales)
-- Filtrar `_` y variables que empiecen con `_` (ignoradas por convención)
-- Retornar la lista como valor en **compile time** (no en runtime)
-- Deduplicar y ordenar el resultado
-
-### Uso esperado
+### Step 1: `lib/api_gateway/dev/ast_tools.ex`
 
 ```elixir
-vars = VariableTracker.track_vars do
-  x = y + z
-  result = foo(x, bar)
-  _ignored = 42
-end
+defmodule ApiGateway.Dev.ASTTools do
+  @moduledoc """
+  Compile-time AST inspection and analysis utilities.
+  These macros operate at compile time — all output is produced during compilation,
+  not during test or production runtime.
+  """
 
-IO.inspect(vars)  # => [:bar, :foo, :result, :x, :y, :z]
-# Nota: foo y bar pueden aparecer como llamadas a función, no variables
-# El ejercicio debe distinguir ambos casos
-```
+  @doc """
+  Prints the AST of `expr` at compile time, then evaluates and returns `expr` normally.
 
-### Hints
-
-<details>
-<summary>Hint 1 — ¿Cómo identificar variables en el AST?</summary>
-
-En el AST de Elixir:
-- **Variable**: `{:nombre, meta, nil}` o `{:nombre, meta, ContextModule}` donde el nombre es un átomo
-- **Llamada a función**: `{:nombre, meta, lista_de_args}` donde el tercer elemento es una lista
-
-```elixir
-# Variable `x`:
-{:x, [line: 1], nil}
-
-# Llamada a función `foo()`:
-{:foo, [line: 1], []}
-
-# Llamada a función `foo(bar)`:
-{:foo, [line: 1], [{:bar, [line: 1], nil}]}
-```
-
-La clave: el tercer elemento es `nil` o un módulo (átomo) para variables,
-y una lista para llamadas de función.
-</details>
-
-<details>
-<summary>Hint 2 — Estructura con postwalk</summary>
-
-```elixir
-defmacro track_vars(do: block) do
-  {_ast, vars} =
-    Macro.postwalk(block, [], fn
-      {name, _meta, context} = node, acc
-      when is_atom(name) and (is_atom(context) or is_nil(context))
-      and not is_list(context) ->
-        # Es una variable
-        {node, [name | acc]}
-      node, acc ->
-        {node, acc}
-    end)
-
-  vars
-  |> Enum.reject(&String.starts_with?(to_string(&1), "_"))
-  |> Enum.uniq()
-  |> Enum.sort()
-  |> Macro.escape()  # retornar como valor, no como código
-end
-```
-</details>
-
----
-
-## Ejercicio 3 — Optimizer Macro
-
-Escribe una macro `optimize/1` que transforme el AST de un bloque antes de compilarlo,
-aplicando la siguiente optimización algebraica:
-
-**Regla**: `x + x` → `2 * x`  (para cualquier expresión `x`)
-
-### Requisitos
-
-- Usar `Macro.prewalk/2` para transformar el AST
-- La transformación debe ser recursiva: si `x` mismo contiene `y + y`, también
-  se optimiza
-- Sólo aplicar cuando ambos lados de `+` son **estructuralmente idénticos**
-- El módulo debe exponer también una función `count_optimizations/1` que retorne
-  cuántas transformaciones se aplicaron (usando un acumulador)
-
-### Uso esperado
-
-```elixir
-result = Optimizer.optimize do
-  a + a          # → 2 * a
-  b + b + b      # → (2 * b) + b  (sólo el primer par)
-  (x + y) + (x + y)  # → 2 * (x + y)
-  c + d          # sin cambio
-end
-
-{result, count} = Optimizer.optimize_counted do
-  a + a
-  b + b
-end
-# count => 2
-```
-
-### Hints
-
-<details>
-<summary>Hint 1 — Matching en el AST</summary>
-
-El AST de `a + a` es:
-```elixir
-{:+, meta, [left, right]}
-```
-
-En `prewalk`, cada nodo es visitado antes que sus hijos. Para detectar `x + x`:
-
-```elixir
-Macro.prewalk(ast, fn
-  {:+, meta, [left, right]} when left == right ->
-    {:*, meta, [2, left]}
-  node ->
-    node
-end)
-```
-</details>
-
-<details>
-<summary>Hint 2 — Comparación estructural de AST</summary>
-
-`left == right` funciona para comparación estructural de AST porque el AST
-son tuplas/listas/átomos normales de Elixir. Sin embargo, la metadata (`meta`)
-puede diferir entre dos usos de la misma variable (números de línea distintos).
-
-Para ignorar metadata, necesitas un helper:
-
-```elixir
-defp ast_equal?(a, b) do
-  strip_meta(a) == strip_meta(b)
-end
-
-defp strip_meta({name, _meta, args}) when is_list(args) do
-  {name, [], Enum.map(args, &strip_meta/1)}
-end
-defp strip_meta({name, _meta, ctx}) do
-  {name, [], ctx}
-end
-defp strip_meta(other), do: other
-```
-</details>
-
-<details>
-<summary>Hint 3 — Acumulador con traverse</summary>
-
-Para contar transformaciones, usa `Macro.traverse/4` que acepta un acumulador
-tanto en pre como en post walk:
-
-```elixir
-{new_ast, count} =
-  Macro.traverse(
-    ast,
-    0,          # acumulador inicial
-    fn          # pre_fun
-      {:+, meta, [l, r]}, acc when ast_equal?(l, r) ->
-        {{:*, meta, [2, l]}, acc + 1}
-      node, acc ->
-        {node, acc}
-    end,
-    fn node, acc -> {node, acc} end  # post_fun (identidad)
-  )
-```
-</details>
-
----
-
-## Trade-offs a considerar
-
-### `prewalk` vs `postwalk`
-
-- **`prewalk`**: transforma el nodo antes de visitar sus hijos. Útil para
-  optimizaciones que eliminen ramas completas (evita trabajo innecesario).
-  Riesgo: no ves el resultado de transformar los hijos.
-
-- **`postwalk`**: transforma después de visitar hijos. Los hijos ya están
-  transformados cuando llegas al padre. Más costoso si eliminas ramas,
-  pero más seguro para composición.
-
-### Hygiene vs pragmatismo
-
-Las macros higiénicas son más seguras pero menos expresivas para DSLs.
-`var!/2` es necesario cuando querás que una macro interactúe con variables
-del contexto del llamador. Es una herramienta, no un anti-patrón — pero
-debe ser explícito y documentado.
-
-### `Code.eval_quoted/3` — ¿cuándo usarlo?
-
-Evaluar AST en runtime (`Code.eval_quoted`) es poderoso pero tiene costos:
-- No hay optimizaciones del compilador
-- Difícil de debuggear
-- Rompe algunas garantías del tipo system
-
-Preferir expansión en compile-time siempre que sea posible.
-
----
-
-## One possible solution
-
-<details>
-<summary>Ver solución (spoiler)</summary>
-
-```elixir
-defmodule ASTInspector do
+  Usage:
+    import ApiGateway.Dev.ASTTools
+    result = ast_inspect(conn.method == "GET")
+    # During compilation prints the AST and code representation.
+    # At runtime, result = true or false depending on conn.method.
+  """
   defmacro ast_inspect(expr) do
     ast_str = Macro.to_string(expr)
     escaped = Macro.escape(expr)
 
     quote do
-      IO.inspect(unquote(escaped), label: "[AST]")
-      IO.puts("[Code] #{unquote(ast_str)}")
+      IO.inspect(unquote(escaped), label: "[AST] #{unquote(ast_str)}")
       unquote(expr)
     end
   end
-end
 
-defmodule VariableTracker do
-  defmacro track_vars(do: block) do
+  @doc """
+  Analyzes a block of code at compile time and returns the list of variable names
+  referenced in it, deduplicated and sorted.
+
+  This is a compile-time operation: the returned list is available as a literal
+  value at the call site. The block is NOT executed.
+
+  Usage:
+    vars = ApiGateway.Dev.ASTTools.referenced_vars do
+      method = conn.method
+      path = conn.request_path
+      _ignored = conn.body_params
+    end
+    # vars == [:conn, :method, :path]
+  """
+  defmacro referenced_vars(do: block) do
     {_ast, vars} =
       Macro.postwalk(block, [], fn
+        # Variables: third element is an atom (not a list)
         {name, _meta, ctx} = node, acc
         when is_atom(name) and not is_list(ctx) ->
           {node, [name | acc]}
+
         node, acc ->
           {node, acc}
       end)
 
-    vars
-    |> Enum.reject(&(&1 == :_ or String.starts_with?(to_string(&1), "_")))
-    |> Enum.uniq()
-    |> Enum.sort()
-    |> Macro.escape()
+    result =
+      vars
+      |> Enum.reject(fn name ->
+        name == :_ or String.starts_with?(to_string(name), "_")
+      end)
+      |> Enum.uniq()
+      |> Enum.sort()
+
+    # Macro.escape converts the list to an AST that produces the list at runtime
+    Macro.escape(result)
   end
 end
+```
 
-defmodule Optimizer do
-  defp strip_meta({name, _meta, args}) when is_list(args),
-    do: {name, [], Enum.map(args, &strip_meta/1)}
-  defp strip_meta({name, _meta, ctx}), do: {name, [], ctx}
-  defp strip_meta(other), do: other
+### Step 2: `lib/api_gateway/middleware/instrumentation.ex`
 
-  defp ast_equal?(a, b), do: strip_meta(a) == strip_meta(b)
+```elixir
+defmodule ApiGateway.Middleware.Instrumentation do
+  @moduledoc """
+  Compile-time AST transformation that wraps function bodies with timing and telemetry.
 
-  defmacro optimize(do: block) do
-    Macro.prewalk(block, fn
-      {:+, meta, [l, r]} = node ->
-        if ast_equal?(l, r), do: {:*, meta, [2, l]}, else: node
-      node -> node
-    end)
+  Usage:
+    defmodule ApiGateway.Middleware.AuthCheck do
+      import ApiGateway.Middleware.Instrumentation
+
+      instrument def call(conn, _opts) do
+        # ... middleware logic
+        conn
+      end
+    end
+
+  The `instrument` macro transforms the AST of the function body to:
+    1. Record start time with System.monotonic_time(:microsecond)
+    2. Execute the original body
+    3. Emit a :telemetry event with elapsed time and function metadata
+  """
+
+  @doc """
+  Wraps a function definition with automatic timing instrumentation.
+  Transforms the function body at compile time — no runtime overhead
+  beyond the timing calls themselves.
+  """
+  defmacro instrument({:def, meta, [{name, fun_meta, args}, [do: body]]}) do
+    module_ref = __CALLER__.module
+    fun_name_str = to_string(name)
+
+    instrumented_body =
+      quote do
+        __start__ = System.monotonic_time(:microsecond)
+
+        result =
+          try do
+            unquote(body)
+          rescue
+            e ->
+              elapsed = System.monotonic_time(:microsecond) - __start__
+              :telemetry.execute(
+                [:api_gateway, :middleware, :exception],
+                %{duration_us: elapsed},
+                %{module: unquote(module_ref), function: unquote(fun_name_str), error: e}
+              )
+              reraise e, __STACKTRACE__
+          end
+
+        elapsed = System.monotonic_time(:microsecond) - __start__
+
+        :telemetry.execute(
+          [:api_gateway, :middleware, :call],
+          %{duration_us: elapsed},
+          %{module: unquote(module_ref), function: unquote(fun_name_str)}
+        )
+
+        result
+      end
+
+    {:def, meta, [{name, fun_meta, args}, [do: instrumented_body]]}
   end
 
-  defmacro optimize_counted(do: block) do
-    {new_ast, count} =
-      Macro.traverse(block, 0,
-        fn {:+, meta, [l, r]}, acc ->
-          if ast_equal?(l, r), do: {{:*, meta, [2, l]}, acc + 1}, else: {{:+, meta, [l, r]}, acc}
-        fn node, acc -> {node, acc}
+  @doc """
+  Counts the number of timing instrumentation injections a `do` block would receive
+  if passed through `instrument/1`. Used in testing to verify transformation behavior.
+  """
+  @spec count_instrument_sites(Macro.t()) :: non_neg_integer()
+  def count_instrument_sites(ast) do
+    # HINT: use Macro.prewalk with an accumulator
+    # HINT: count occurrences of {:def, _, _} nodes in the AST
+    # TODO: implement
+  end
+end
+```
+
+### Step 3: Given tests — must pass without modification
+
+```elixir
+# test/api_gateway/middleware/instrumentation_test.exs
+defmodule ApiGateway.Middleware.InstrumentationTest do
+  use ExUnit.Case, async: true
+
+  import ApiGateway.Middleware.Instrumentation
+  alias ApiGateway.Dev.ASTTools
+
+  # ---------------------------------------------------------------------------
+  # ASTTools tests
+  # ---------------------------------------------------------------------------
+
+  describe "referenced_vars/1" do
+    test "returns sorted, deduplicated variable names" do
+      vars =
+        ASTTools.referenced_vars do
+          method = conn.method
+          path = conn.request_path
+          result = String.upcase(method) <> path
+          _ignored = "not counted"
+        end
+
+      # conn, method, path, result — conn appears multiple times but deduped
+      assert :conn in vars
+      assert :method in vars
+      assert :path in vars
+      assert :result in vars
+      # _ignored must be excluded
+      refute :_ignored in vars
+      # List must be sorted
+      assert vars == Enum.sort(vars)
+    end
+
+    test "excludes variables starting with underscore" do
+      vars =
+        ASTTools.referenced_vars do
+          _private = 1
+          _also_private = 2
+          public = 3
+        end
+
+      assert vars == [:public]
+    end
+
+    test "returns empty list for a block with no variables" do
+      vars =
+        ASTTools.referenced_vars do
+          1 + 2
+          "hello"
+        end
+
+      assert vars == []
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Instrumentation macro tests
+  # ---------------------------------------------------------------------------
+
+  describe "instrument/1" do
+    defmodule SampleMiddleware do
+      import ApiGateway.Middleware.Instrumentation
+
+      instrument def process(conn, _opts) do
+        Map.put(conn, :processed, true)
+      end
+    end
+
+    setup do
+      # Attach a telemetry handler to capture events
+      handler_id = :test_handler
+      test_pid = self()
+
+      :telemetry.attach(
+        handler_id,
+        [:api_gateway, :middleware, :call],
+        fn event, measurements, metadata, _config ->
+          send(test_pid, {:telemetry, event, measurements, metadata})
         end,
-        fn node, acc -> {node, acc} end
+        nil
       )
 
-    quote do
-      {unquote(new_ast), unquote(count)}
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+      :ok
+    end
+
+    test "executes the original function logic correctly" do
+      result = SampleMiddleware.process(%{method: "GET"}, [])
+      assert result == %{method: "GET", processed: true}
+    end
+
+    test "emits a telemetry event with duration" do
+      SampleMiddleware.process(%{}, [])
+
+      assert_receive {:telemetry, [:api_gateway, :middleware, :call], measurements, metadata},
+                     1_000
+
+      assert is_integer(measurements.duration_us)
+      assert measurements.duration_us >= 0
+      assert metadata.function == "process"
     end
   end
 end
 ```
 
-</details>
+### Step 4: Run the tests
+
+```bash
+mix test test/api_gateway/middleware/instrumentation_test.exs --trace
+```
+
+---
+
+## Trade-off analysis
+
+| Technique | Compile-time cost | Runtime overhead | Debuggability |
+|-----------|------------------|-----------------|---------------|
+| `Macro.prewalk` | O(n) AST nodes | Zero | Hard — errors show AST positions |
+| `Macro.postwalk` | O(n) AST nodes | Zero | Hard — same as prewalk |
+| `Macro.traverse` | O(n) AST nodes | Zero | Hardest — pre+post in one pass |
+| `Code.eval_quoted` | O(n) | Runtime eval cost | Worst — no compiler optimizations |
+| Regular function | None | Normal | Best |
+
+Reflection: `referenced_vars` is a compile-time macro — the list of variables
+is a literal in the compiled beam file. What happens if you call it with a block
+that references variables that don't exist yet? Does the macro care? Why?
+
+---
+
+## Common production mistakes
+
+**1. Using `Code.eval_quoted` in production hot paths**
+`Code.eval_quoted` bypasses the compiler — no type checking, no optimization, no
+dialyzer analysis. Use it only for developer tooling or one-time startup operations.
+
+**2. Not using `Macro.escape` when passing AST as data**
+Without `Macro.escape`, `unquote(some_ast)` inside a `quote` block injects the
+code for evaluation, not the AST structure as a value. The difference is subtle
+and causes confusing runtime errors.
+
+**3. Writing match specs manually when `fun2ms` suffices**
+AST manipulation macros are powerful but complex. For ETS match specs specifically,
+`:ets.fun2ms/1` handles the transformation correctly within its constraints.
+Only write AST transformation when `fun2ms` cannot (dynamic runtime arguments).
+
+**4. Ignoring `@before_compile` ordering with multiple `use` calls**
+If a module uses two DSLs that both register `@before_compile` hooks, the hooks
+run in reverse registration order. Hooks that depend on each other must account
+for this ordering or use a single coordinating hook.
+
+**5. Accumulating module attributes in LIFO order**
+`Module.register_attribute(mod, :rules, accumulate: true)` inserts in LIFO order.
+`@rules :a; @rules :b` gives `[:b, :a]` when read. Always `Enum.reverse/1` the
+accumulator in `@before_compile`.
+
+---
+
+## Resources
+
+- [Elixir `Macro` module documentation](https://hexdocs.pm/elixir/Macro.html) — `prewalk`, `postwalk`, `traverse`, `escape`
+- [Metaprogramming Elixir — Chris McCord](https://pragprog.com/titles/cmelixir/metaprogramming-elixir/) — the definitive book on Elixir macros
+- [Quote and unquote — Elixir guides](https://elixir-lang.org/getting-started/meta/quote-and-unquote.html)
+- [`:telemetry` library](https://hexdocs.pm/telemetry/readme.html) — the instrumentation standard in the Elixir ecosystem

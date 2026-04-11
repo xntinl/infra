@@ -1,535 +1,491 @@
-# 23 — Protocol Consolidation & Dispatch Performance
+# Protocol Consolidation and Dispatch Performance
 
-**Nivel**: Avanzado  
-**Tema**: Consolidación de protocolos, dispatch O(1) vs O(n), `@derive`, introspección
+**Project**: `api_gateway` — built incrementally across the advanced level
 
 ---
 
-## Contexto
+## Project context
 
-Los protocolos de Elixir son polimorfismo ad-hoc. Cada tipo que implementa un
-protocolo registra su implementación. El mecanismo de **dispatch** (encontrar
-la implementación correcta para un valor en runtime) tiene dos modos:
+You're building `api_gateway`. The gateway serializes request and response data
+to multiple formats (JSON body, log lines, telemetry metadata) depending on the
+context. Different parts of the codebase produce different struct types: `Conn`,
+`Route`, `RateLimitResult`, `AuthToken`, `ErrorResponse`. All need to be serializable
+to a log-friendly string and to a telemetry-friendly map.
 
-### Sin consolidación — Dynamic dispatch O(n)
+The team uses two protocols:
+- `ApiGateway.Serializable` — converts a value to a map for JSON encoding
+- `ApiGateway.Loggable` — converts a value to a flat string for structured logs
 
-En desarrollo (`Mix.env() == :dev`), el dispatch busca la implementación en
-tiempo de ejecución consultando una tabla de atoms:
+As the number of protocol implementations grows, the protocol dispatch path shows
+up in profiling. This exercise covers how Elixir dispatches protocols, what
+consolidation does, and how to design protocols for zero-overhead dispatch in prod.
 
-```
-Protocol.dispatch(value)
-  → typeof(value) = Struct/Integer/BitString/...
-  → buscar en lista de módulos que implementan el protocolo
-  → O(n) donde n = número de implementaciones
-```
-
-El número de módulos se escanea linealmente porque en dev cualquier módulo
-puede añadir una implementación en calquier momento (hot code reload).
-
-### Con consolidación — Static dispatch O(1)
-
-`mix compile` en producción (o `Protocol.consolidate/2` manualmente) genera
-un módulo optimizado donde el dispatch es una única llamada a `apply/3` con
-pattern matching compilado:
+Project structure at this point:
 
 ```
-Protocol.dispatch(value)
-  → typeof(value) → direct call via case/cond compilado
-  → O(1) — el compilador genera un dispatch table estático
-```
-
-La diferencia en benchmarks puede ser **10-50x** para protocolos con muchas
-implementaciones.
-
-### `@derive`
-
-```elixir
-defmodule Point do
-  @derive [Inspect, MyProtocol]
-  defstruct [:x, :y]
-end
-```
-
-`@derive` genera automáticamente la implementación de un protocolo para una
-struct usando la estrategia que el protocolo define en su cláusula `@for Any`.
-
-### Introspección con `Protocol.impl_for/1`
-
-```elixir
-Protocol.impl_for(42)          # => Integer
-Protocol.impl_for("hello")     # => BitString
-Protocol.impl_for(%MyStruct{}) # => MyStruct (si implementa el protocolo)
-Protocol.impl_for(nil)         # => nil (si no implementa y no hay Any)
+api_gateway/
+├── lib/
+│   └── api_gateway/
+│       ├── application.ex
+│       ├── router.ex
+│       ├── protocols/
+│       │   ├── serializable.ex     # ← you implement this
+│       │   └── loggable.ex         # ← and this
+│       ├── middleware/
+│       │   ├── pipeline.ex
+│       │   ├── instrumentation.ex
+│       │   └── dsl.ex
+│       └── ...
+├── test/
+│   └── api_gateway/
+│       └── protocols/
+│           └── protocols_test.exs
+├── bench/
+│   └── protocol_bench.exs
+└── mix.exs
 ```
 
 ---
 
-## Ejercicio 1 — Benchmark: Consolidado vs No Consolidado
+## The business problem
 
-Escribe un benchmark que mida la diferencia de performance entre dispatch
-consolidado y no consolidado para un protocolo con múltiples implementaciones.
+Two requirements:
 
-### Setup del protocolo
+1. **Uniform serialization**: every struct in the gateway must implement
+   `ApiGateway.Serializable` so that JSON encoding, telemetry metadata maps, and
+   HTTP response construction all go through one dispatch path. New struct types
+   added by contributors get a compile error if they forget to implement the
+   protocol — not a runtime `Protocol.UndefinedError` in production.
 
-```elixir
-defprotocol Serializable do
-  @doc "Convierte un valor a su representación en string"
-  def serialize(value)
-end
-
-# Implementar para al menos 15 tipos distintos:
-# Integer, Float, BitString, Atom, List, Map, Tuple,
-# y 8+ structs propias (Point, Color, Line, Circle, Rect, etc.)
-```
-
-### Tarea
-
-1. Implementar el protocolo para los 15+ tipos
-2. Escribir una función `run_benchmark/0` que:
-   - Ejecute 100_000 llamadas a `Serializable.serialize/1` con valores variados
-   - Mida el tiempo con `:timer.tc/1`
-   - Fuerze la consolidación con `Protocol.consolidate/2` y repita
-   - Imprima la comparación en microsegundos
-
-3. Escribir `compare_dispatch/1` que reciba un valor y retorne:
-   ```elixir
-   %{
-     consolidated: boolean(),  # ¿está el protocolo consolidado?
-     impl_module: module(),     # qué módulo maneja este tipo
-     dispatch_info: String.t()  # descripción del mecanismo
-   }
-   ```
-
-### Hints
-
-<details>
-<summary>Hint 1 — ¿Cómo consolidar manualmente?</summary>
-
-```elixir
-# Lista de módulos que implementan el protocolo
-impls = [
-  Serializable.Integer,
-  Serializable.BitString,
-  Serializable.Float,
-  # ... etc
-]
-
-# Consolidar
-{:ok, consolidated_module} = Protocol.consolidate(Serializable, impls)
-
-# Verificar si está consolidado
-Protocol.consolidated?(Serializable)  # => true/false
-```
-
-Nota: en entorno de desarrollo, `Protocol.consolidate/2` puede no tener efecto
-porque Mix recarga el protocolo. Para forzarlo en tests, usa `:code.purge/1`
-y `:code.load_binary/3` con el módulo generado.
-</details>
-
-<details>
-<summary>Hint 2 — Estructura del benchmark</summary>
-
-```elixir
-def run_benchmark do
-  values = [
-    42, 3.14, "hello", :atom, [1, 2, 3], %{a: 1},
-    {1, 2}, %Point{x: 1, y: 2}, %Color{r: 255, g: 0, b: 0},
-    # ... más valores
-  ]
-
-  # Repetir muchas veces para obtener muestra estable
-  iterations = 100_000
-  sample = Enum.take(Stream.cycle(values), iterations)
-
-  {time_us, _} = :timer.tc(fn ->
-    Enum.each(sample, &Serializable.serialize/1)
-  end)
-
-  IO.puts("Tiempo total: #{time_us} µs")
-  IO.puts("Por llamada: #{time_us / iterations} µs")
-end
-```
-</details>
-
-<details>
-<summary>Hint 3 — Introspección con impl_for</summary>
-
-```elixir
-def compare_dispatch(value) do
-  impl = Serializable.impl_for(value)
-  consolidated = Protocol.consolidated?(Serializable)
-
-  %{
-    consolidated: consolidated,
-    impl_module: impl,
-    dispatch_info:
-      if consolidated do
-        "Static dispatch (O(1)) — módulo consolidado cargado"
-      else
-        "Dynamic dispatch (O(n)) — buscando entre implementaciones registradas"
-      end
-  }
-end
-```
-</details>
+2. **Log-friendly representation**: every event emitted to the structured log
+   (`:logger`, `:telemetry`) must produce a flat string via `ApiGateway.Loggable`.
+   Structs that are "obviously loggable" from their `Serializable` implementation
+   should use `@derive` instead of writing a redundant implementation.
 
 ---
 
-## Ejercicio 2 — `@derive` y derivación automática con el protocolo `Hashable`
+## How Elixir protocol dispatch works
 
-Implementa un protocolo `Hashable` que compute un hash determinístico de
-cualquier valor Elixir, y soporte derivación automática via `@derive`.
+### Development: dynamic dispatch, O(n)
 
-### Definición del protocolo
+In `Mix.env() == :dev`, every `Protocol.dispatch/1` call walks a list of known
+implementations at runtime to find the right module. Because hot code reload can
+add a new implementation at any time, the VM cannot cache the result.
+
+```
+Serializable.to_map(value)
+  → typeof(value) = ApiGateway.Conn
+  → scan [:Conn, :Route, :RateLimitResult, ...] for matching module
+  → O(n) where n = number of implementations
+```
+
+### Production: consolidated dispatch, O(1)
+
+`mix compile` (or `Protocol.consolidate/2`) generates a single optimized module
+where dispatch is compiled pattern matching — essentially a `case` over the type
+tag. The result is a direct function call with no list scan.
+
+```
+Serializable.to_map(value)
+  → typeof(value) → compiled case → direct call
+  → O(1) regardless of how many implementations exist
+```
+
+**Benchmarks on typical gateway protocol with 10 implementations**:
+- Development (no consolidation): ~800ns–1.2µs per dispatch
+- Production (consolidated): ~60–120ns per dispatch
+
+### `@derive` — automatic delegation
 
 ```elixir
-defprotocol Hashable do
-  @doc """
-  Retorna un hash entero de 64 bits del valor.
-  Debe ser determinístico: mismo input → mismo output.
+defmodule ApiGateway.AuthToken do
+  @derive [ApiGateway.Loggable]
+  defstruct [:token, :user_id, :expires_at]
+end
+```
+
+When `ApiGateway.Loggable` defines an `Any` implementation, `@derive` generates
+a `Loggable` implementation for `AuthToken` that calls the `Any` fallback. This
+avoids writing boilerplate implementations for structs whose loggable representation
+is the same as the generic fallback.
+
+### `Protocol.impl_for/1` — introspection
+
+```elixir
+Protocol.impl_for(%ApiGateway.Conn{})   # => ApiGateway.Serializable.ApiGateway.Conn
+Protocol.impl_for(42)                   # => ApiGateway.Serializable.Integer (if implemented)
+Protocol.impl_for(:unknown_atom)        # => nil (raises UndefinedError on dispatch)
+```
+
+Use `Protocol.impl_for!/1` in tests to assert that a struct implements a protocol —
+it raises if no implementation exists, making missing implementations a test failure
+rather than a production crash.
+
+---
+
+## Implementation
+
+### Step 1: `lib/api_gateway/protocols/serializable.ex`
+
+```elixir
+defprotocol ApiGateway.Serializable do
+  @moduledoc """
+  Converts gateway structs to maps suitable for JSON encoding and telemetry metadata.
+
+  Every struct that moves through the gateway pipeline must implement this protocol.
+  The `to_map/1` return value must contain only JSON-safe values: strings, numbers,
+  booleans, nil, lists, and maps. No atoms, no tuples, no pids.
   """
-  def hash(value)
+
+  @doc """
+  Converts `value` to a map with string keys and JSON-safe values.
+  """
+  @spec to_map(t()) :: map()
+  def to_map(value)
+end
+
+# ── Core gateway struct implementations ──────────────────────────────────────
+
+defimpl ApiGateway.Serializable, for: Map do
+  def to_map(map) do
+    Map.new(map, fn {k, v} -> {to_string(k), v} end)
+  end
+end
+
+# Implement for the gateway's own structs:
+
+defmodule ApiGateway.Conn do
+  @moduledoc "Represents an in-flight HTTP connection through the gateway."
+  defstruct [:method, :path, :status, :remote_ip, :assigns]
+end
+
+defimpl ApiGateway.Serializable, for: ApiGateway.Conn do
+  # HINT: convert method and path to strings, status to integer
+  # HINT: remote_ip may be a tuple {a, b, c, d} — convert to "a.b.c.d" string
+  # HINT: assigns is a map — recursively call Serializable.to_map on it
+  # TODO: implement to_map/1
+end
+
+defmodule ApiGateway.Route do
+  @moduledoc "Represents a matched route definition."
+  defstruct [:method, :pattern, :handler, :middleware]
+end
+
+defimpl ApiGateway.Serializable, for: ApiGateway.Route do
+  # HINT: handler is a module atom — convert to string with inspect/1
+  # HINT: middleware is a list of module atoms — map to strings
+  # TODO: implement to_map/1
+end
+
+defmodule ApiGateway.RateLimitResult do
+  @moduledoc "Result of a rate limit check."
+  defstruct [:allowed, :remaining, :reset_at, :limit]
+end
+
+defimpl ApiGateway.Serializable, for: ApiGateway.RateLimitResult do
+  # HINT: all fields are scalars — straightforward map construction
+  # TODO: implement to_map/1
+end
+
+defmodule ApiGateway.ErrorResponse do
+  @moduledoc "Structured error for HTTP error responses."
+  defstruct [:status, :code, :message, :details]
+end
+
+defimpl ApiGateway.Serializable, for: ApiGateway.ErrorResponse do
+  # HINT: status is integer, code is atom — convert to string
+  # TODO: implement to_map/1
 end
 ```
 
-### Implementaciones requeridas
+### Step 2: `lib/api_gateway/protocols/loggable.ex`
 
 ```elixir
-# Tipos primitivos
-Hashable.hash(42)         # => algún entero
-Hashable.hash("hello")    # => algún entero
-Hashable.hash(:atom)      # => algún entero
-Hashable.hash(3.14)       # => algún entero
-Hashable.hash(nil)        # => algún entero
+defprotocol ApiGateway.Loggable do
+  @moduledoc """
+  Converts gateway values to a flat, human-readable string for structured logs.
 
-# Tipos compuestos — hash debe combinar los hashes de los elementos
-Hashable.hash([1, 2, 3])  # => hash que depende de [hash(1), hash(2), hash(3)]
-Hashable.hash({:a, :b})   # => hash de la tupla
+  Log lines must be flat (no nested maps), short (under 200 chars), and include
+  the struct type as a prefix: "conn GET /api/users status=200".
+  """
 
-# Structs con @derive
-defmodule Point do
-  @derive Hashable
-  defstruct [:x, :y]
+  @fallback_to_any true
+
+  @doc """
+  Returns a compact, log-friendly string representation.
+  """
+  @spec to_log(t()) :: String.t()
+  def to_log(value)
 end
 
-Hashable.hash(%Point{x: 1, y: 2})  # => hash basado en sus campos
+# Any fallback — used when @derive [ApiGateway.Loggable] is set on a struct
+defimpl ApiGateway.Loggable, for: Any do
+  def to_log(%{__struct__: struct} = value) do
+    # HINT: use inspect/2 with [limit: 5] to keep output short
+    # HINT: prefix with the last part of the struct module name (Module.split/1)
+    # TODO: implement
+  end
+
+  def to_log(value) do
+    inspect(value, limit: 5)
+  end
+end
+
+# Concrete implementations for gateway structs
+
+defimpl ApiGateway.Loggable, for: ApiGateway.Conn do
+  def to_log(%ApiGateway.Conn{method: method, path: path, status: status}) do
+    # Format: "conn GET /api/users status=200"
+    # HINT: status may be nil if the response hasn't been set yet
+    # TODO: implement
+  end
+end
+
+defimpl ApiGateway.Loggable, for: ApiGateway.RateLimitResult do
+  def to_log(%ApiGateway.RateLimitResult{allowed: allowed, remaining: remaining}) do
+    # Format: "rate_limit allowed=true remaining=42"
+    # TODO: implement
+  end
+end
+
+# Route and ErrorResponse use the Any fallback via @derive
+# (This is declared in the struct modules above — add @derive [ApiGateway.Loggable])
 ```
 
-### Requisitos de la derivación automática
-
-Cuando se usa `@derive Hashable` en una struct:
-1. La implementación generada debe hashear cada campo de la struct en orden
-2. Combinar los hashes con una función de mezcla (e.g., XOR con rotación)
-3. Incluir el nombre del módulo de la struct en el hash (para evitar colisiones
-   entre `%Point{x: 1, y: 2}` y `%Color{x: 1, y: 2}`)
-
-### Implementar derivación con `defimpl ... for Any` + `@derive`
+### Step 3: Given tests — must pass without modification
 
 ```elixir
-defimpl Hashable, for: Any do
-  defmacro __deriving__(module, struct, _opts) do
-    fields = Map.keys(struct) |> Enum.reject(&(&1 == :__struct__))
-    quote do
-      defimpl Hashable, for: unquote(module) do
-        def hash(value) do
-          module_hash = Hashable.hash(unquote(module))
-          field_hashes =
-            unquote(fields)
-            |> Enum.map(fn field -> Hashable.hash(Map.get(value, field)) end)
-          Enum.reduce(field_hashes, module_hash, &mix_hash/2)
-        end
+# test/api_gateway/protocols/protocols_test.exs
+defmodule ApiGateway.ProtocolsTest do
+  use ExUnit.Case, async: true
 
-        defp mix_hash(a, b), do: Bitwise.bxor(a, b * 0x9e3779b9 + (b <<< 6) + (b >>> 2))
-      end
+  alias ApiGateway.{Conn, Route, RateLimitResult, ErrorResponse}
+  alias ApiGateway.{Serializable, Loggable}
+
+  # ---------------------------------------------------------------------------
+  # Serializable tests
+  # ---------------------------------------------------------------------------
+
+  describe "Serializable.to_map/1" do
+    test "Conn produces map with string keys" do
+      conn = %Conn{method: "GET", path: "/health", status: 200, remote_ip: {127, 0, 0, 1}, assigns: %{}}
+      result = Serializable.to_map(conn)
+
+      assert is_map(result)
+      assert result["method"] == "GET"
+      assert result["path"] == "/health"
+      assert result["status"] == 200
+      assert result["remote_ip"] == "127.0.0.1"
     end
-  end
 
-  def hash(value) do
-    raise Protocol.UndefinedError, protocol: Hashable, value: value
-  end
-end
-```
+    test "RateLimitResult serializes scalar fields" do
+      result = %RateLimitResult{allowed: true, remaining: 42, reset_at: 1_700_000_000, limit: 100}
+      map = Serializable.to_map(result)
 
-### Hints
+      assert map["allowed"] == true
+      assert map["remaining"] == 42
+      assert map["limit"] == 100
+    end
 
-<details>
-<summary>Hint 1 — Hash para primitivos</summary>
+    test "ErrorResponse converts code atom to string" do
+      err = %ErrorResponse{status: 429, code: :rate_limited, message: "Too many requests", details: nil}
+      map = Serializable.to_map(err)
 
-Usa `:erlang.phash2/1` o implementa un hash simple:
+      assert map["status"] == 429
+      assert map["code"] == "rate_limited"
+      assert map["message"] == "Too many requests"
+    end
 
-```elixir
-defimpl Hashable, for: Integer do
-  def hash(n), do: :erlang.phash2(n, 0xFFFFFFFFFFFFFFFF)
-end
+    test "Route converts handler module to string" do
+      route = %Route{method: "GET", pattern: "/users", handler: MyApp.UserHandler, middleware: []}
+      map = Serializable.to_map(route)
 
-defimpl Hashable, for: BitString do
-  def hash(s) do
-    s
-    |> :erlang.md5()
-    |> :binary.bin_to_list()
-    |> Enum.take(8)
-    |> Enum.reduce(0, fn byte, acc -> (acc <<< 8) + byte end)
-  end
-end
-```
-</details>
+      assert is_binary(map["handler"])
+      assert String.contains?(map["handler"], "UserHandler")
+    end
 
-<details>
-<summary>Hint 2 — Hash compuesto para listas</summary>
+    test "all values in result are JSON-safe (no atoms, no tuples)" do
+      conn = %Conn{method: "GET", path: "/test", status: 200, remote_ip: {10, 0, 0, 1}, assigns: %{}}
+      map = Serializable.to_map(conn)
 
-```elixir
-defimpl Hashable, for: List do
-  def hash([]), do: 0
-  def hash(list) do
-    list
-    |> Enum.map(&Hashable.hash/1)
-    |> Enum.reduce(fn h, acc ->
-      # FNV-1a mix
-      Bitwise.bxor(acc, h) |> Kernel.*(0x100000001b3) |> Bitwise.band(0xFFFFFFFFFFFFFFFF)
-    end)
-  end
-end
-```
-</details>
-
----
-
-## Ejercicio 3 — Protocol Introspection
-
-Escribe un módulo `ProtocolInspector` con funciones para introspección profunda
-de protocolos en el sistema.
-
-### API requerida
-
-```elixir
-# ¿Qué módulos implementan un protocolo?
-ProtocolInspector.implementations(Enumerable)
-# => [List, Map, Range, Stream, MapSet, File.Stream, ...]
-
-# ¿Implementa un valor dado el protocolo?
-ProtocolInspector.implements?(42, String.Chars)
-# => true
-
-# ¿Está consolidado?
-ProtocolInspector.consolidated?(Enumerable)
-# => true (en producción)
-
-# Info completa del protocolo
-ProtocolInspector.info(Serializable)
-# => %{
-#   name: Serializable,
-#   consolidated: boolean(),
-#   callbacks: [:serialize],
-#   implementations: [module(), ...],
-#   fallback_to_any: boolean()
-# }
-
-# Comparar dos protocolos
-ProtocolInspector.compare(Enumerable, Collectable)
-# => %{
-#   only_in_first: [List, ...],
-#   only_in_second: [MapSet, ...],
-#   in_both: [...]
-# }
-```
-
-### Hints
-
-<details>
-<summary>Hint 1 — Obtener implementaciones via __protocol__</summary>
-
-Los protocolos exponen metainformación vía `__protocol__/1`:
-
-```elixir
-Enumerable.__protocol__(:impls)
-# En producción (consolidado): {:consolidated, [List, Map, Range, ...]}
-# En desarrollo: :not_consolidated
-
-Enumerable.__protocol__(:callbacks)
-# => [count: 1, member?: 2, reduce: 3, slice: 1]
-
-Enumerable.__protocol__(:consolidated?)
-# => true/false
-```
-</details>
-
-<details>
-<summary>Hint 2 — Listar implementaciones con :not_consolidated</summary>
-
-```elixir
-def implementations(protocol) do
-  case protocol.__protocol__(:impls) do
-    {:consolidated, modules} ->
-      modules
-
-    :not_consolidated ->
-      # En dev, buscar módulos cargados que implementen el protocolo
-      :code.all_loaded()
-      |> Enum.map(fn {mod, _} -> mod end)
-      |> Enum.filter(fn mod ->
-        Protocol.impl_for(struct_or_value_for(mod)) == mod
+      Enum.each(map, fn {k, v} ->
+        assert is_binary(k), "key #{inspect(k)} is not a string"
+        assert is_binary(v) or is_number(v) or is_boolean(v) or is_nil(v) or is_map(v) or is_list(v),
+               "value #{inspect(v)} for key #{k} is not JSON-safe"
       end)
+    end
   end
-end
-```
 
-Alternativamente, construye un valor de cada tipo y verifica con `Protocol.impl_for/1`.
-</details>
+  # ---------------------------------------------------------------------------
+  # Loggable tests
+  # ---------------------------------------------------------------------------
 
-<details>
-<summary>Hint 3 — Fallback to Any</summary>
+  describe "Loggable.to_log/1" do
+    test "Conn produces compact log string" do
+      conn = %Conn{method: "POST", path: "/api/users", status: 201, remote_ip: nil, assigns: %{}}
+      log = Loggable.to_log(conn)
 
-```elixir
-def fallback_to_any?(protocol) do
-  # Los protocolos definen `@fallback_to_any true` cuando quieren
-  # que tipos sin implementación explícita caigan a `for: Any`
-  function_exported?(protocol, :__protocol__, 1) and
-    protocol.__protocol__(:fallback_to_any)
-end
-```
-</details>
+      assert is_binary(log)
+      assert String.contains?(log, "POST")
+      assert String.contains?(log, "/api/users")
+      assert String.contains?(log, "201")
+    end
 
----
+    test "RateLimitResult log contains allowed and remaining" do
+      result = %RateLimitResult{allowed: false, remaining: 0, reset_at: nil, limit: 10}
+      log = Loggable.to_log(result)
 
-## Trade-offs a considerar
+      assert String.contains?(log, "allowed")
+      assert String.contains?(log, "false")
+    end
 
-### ¿Cuándo importa la consolidación?
+    test "ErrorResponse uses Any fallback via @derive" do
+      err = %ErrorResponse{status: 500, code: :internal_error, message: "oops", details: nil}
+      log = Loggable.to_log(err)
 
-En aplicaciones con pocas implementaciones de protocolo (< 10), la diferencia
-entre O(n) y O(1) es prácticamente imperceptible. La consolidación importa cuando:
-- Tienes 20+ implementaciones de un protocolo
-- El protocolo se llama en hot paths (e.g., serialización de requests HTTP)
-- El protocolo está en el critical path de latencia
+      assert is_binary(log)
+      assert byte_size(log) < 500
+    end
 
-### `@derive` vs implementación explícita
+    test "log output is a flat string (no newlines)" do
+      conn = %Conn{method: "GET", path: "/", status: 200, remote_ip: nil, assigns: %{}}
+      log = Loggable.to_log(conn)
 
-`@derive` es conveniente para structs simples, pero pierde el control fino.
-Si necesitas lógica custom (e.g., ignorar ciertos campos, transformar valores),
-implementa explícitamente. La regla: `@derive` para comportamiento default,
-`defimpl` para comportamiento específico.
-
-### Protocolos vs Behaviours
-
-| Criterio | Protocol | Behaviour |
-|---|---|---|
-| Polimorfismo sobre | Tipo del valor | Módulo implementador |
-| Dispatch | Dinámico por tipo | Estático (módulo conocido) |
-| Uso típico | Serialización, pretty-print, comparación | Workers, adaptadores, plugins |
-| `impl_for` nil | Posible (sin Any) | N/A — siempre existe |
-| Performance consolidado | O(1) | N/A |
-
-### `Protocol.consolidate/2` en tests
-
-Los tests en `mix test` corren en `:test` env, que como `:dev`, no consolida
-automáticamente. Si testeas comportamiento dependiente de consolidación, necesitas
-consolidar manualmente en el test setup y revertir después.
-
----
-
-## One possible solution
-
-<details>
-<summary>Ver solución parcial — Hashable con @derive (spoiler)</summary>
-
-```elixir
-defprotocol Hashable do
-  def hash(value)
-end
-
-defimpl Hashable, for: Integer do
-  def hash(n), do: :erlang.phash2(n, 0xFFFFFFFFFFFFFFFF)
-end
-
-defimpl Hashable, for: Atom do
-  def hash(a), do: Hashable.hash(Atom.to_string(a))
-end
-
-defimpl Hashable, for: BitString do
-  def hash(s), do: :erlang.phash2(s, 0xFFFFFFFFFFFFFFFF)
-end
-
-defimpl Hashable, for: Float do
-  def hash(f), do: :erlang.phash2(f, 0xFFFFFFFFFFFFFFFF)
-end
-
-defimpl Hashable, for: List do
-  import Bitwise
-
-  def hash([]), do: 0
-  def hash(list) do
-    list
-    |> Enum.map(&Hashable.hash/1)
-    |> Enum.reduce(0, fn h, acc -> bxor(acc, h + 0x9e3779b9 + (acc <<< 6) + (acc >>> 2)) end)
+      refute String.contains?(log, "\n")
+    end
   end
-end
 
-defimpl Hashable, for: Map do
-  def hash(map) do
-    map
-    |> Enum.sort_by(fn {k, _} -> Hashable.hash(k) end)
-    |> Enum.flat_map(fn {k, v} -> [Hashable.hash(k), Hashable.hash(v)] end)
-    |> Hashable.hash()
-  end
-end
+  # ---------------------------------------------------------------------------
+  # Protocol introspection tests
+  # ---------------------------------------------------------------------------
 
-defimpl Hashable, for: Any do
-  defmacro __deriving__(module, struct, _opts) do
-    fields = struct |> Map.keys() |> Enum.reject(&(&1 == :__struct__)) |> Enum.sort()
+  describe "Protocol.impl_for/1" do
+    test "all gateway structs implement Serializable" do
+      structs = [
+        %Conn{},
+        %Route{},
+        %RateLimitResult{},
+        %ErrorResponse{}
+      ]
 
-    quote do
-      defimpl Hashable, for: unquote(module) do
-        import Bitwise
-
-        def hash(value) do
-          module_hash = Hashable.hash(unquote(to_string(module)))
-          field_hashes = Enum.map(unquote(fields), &Hashable.hash(Map.get(value, &1)))
-          Enum.reduce(field_hashes, module_hash, fn h, acc ->
-            bxor(acc, h + 0x9e3779b9 + (acc <<< 6) + (acc >>> 2))
-          end)
-        end
+      for s <- structs do
+        assert Protocol.impl_for(s) != nil,
+               "#{inspect(s.__struct__)} does not implement Serializable"
       end
     end
-  end
 
-  def hash(value), do: raise Protocol.UndefinedError, protocol: Hashable, value: value
-end
-
-defmodule ProtocolInspector do
-  def consolidated?(protocol), do: Protocol.consolidated?(protocol)
-
-  def implementations(protocol) do
-    case protocol.__protocol__(:impls) do
-      {:consolidated, mods} -> mods
-      :not_consolidated -> []
+    test "Protocol.impl_for!/1 does not raise for gateway structs" do
+      assert Serializable.impl_for!(%Conn{}) != nil
+      assert Serializable.impl_for!(%RateLimitResult{}) != nil
     end
-  end
-
-  def implements?(value, protocol) do
-    Protocol.impl_for(value) != nil
-  end
-
-  def info(protocol) do
-    %{
-      name: protocol,
-      consolidated: consolidated?(protocol),
-      callbacks: protocol.__protocol__(:callbacks) |> Keyword.keys(),
-      implementations: implementations(protocol),
-      fallback_to_any: function_exported?(protocol, :__protocol__, 1) &&
-                       protocol.__protocol__(:fallback_to_any)
-    }
-  end
-
-  def compare(p1, p2) do
-    i1 = MapSet.new(implementations(p1))
-    i2 = MapSet.new(implementations(p2))
-
-    %{
-      only_in_first:  MapSet.difference(i1, i2) |> MapSet.to_list(),
-      only_in_second: MapSet.difference(i2, i1) |> MapSet.to_list(),
-      in_both:        MapSet.intersection(i1, i2) |> MapSet.to_list()
-    }
   end
 end
 ```
 
-</details>
+### Step 4: Run the tests
+
+```bash
+mix test test/api_gateway/protocols/protocols_test.exs --trace
+```
+
+### Step 5: Protocol dispatch benchmark
+
+```elixir
+# bench/protocol_bench.exs
+# Measures consolidated vs unconsolidated dispatch on the Serializable protocol.
+# Run in dev (unconsolidated) vs prod (consolidated) to see the difference.
+
+alias ApiGateway.{Conn, Route, RateLimitResult, ErrorResponse, Serializable, Loggable}
+
+conn = %Conn{method: "GET", path: "/api/users", status: 200, remote_ip: {127, 0, 0, 1}, assigns: %{}}
+route = %Route{method: "GET", pattern: "/api/users", handler: MyHandler, middleware: []}
+rate_result = %RateLimitResult{allowed: true, remaining: 99, reset_at: 1_700_000_000, limit: 100}
+error = %ErrorResponse{status: 500, code: :internal, message: "err", details: nil}
+
+values = [conn, route, rate_result, error]
+
+Benchee.run(
+  %{
+    "Serializable.to_map (mixed types)" => fn ->
+      for v <- values, do: Serializable.to_map(v)
+    end,
+    "Loggable.to_log (mixed types)" => fn ->
+      for v <- values, do: Loggable.to_log(v)
+    end,
+    "Protocol.impl_for (dispatch only)" => fn ->
+      for v <- values, do: Serializable.impl_for(v)
+    end
+  },
+  warmup: 2,
+  time: 5,
+  formatters: [Benchee.Formatters.Console]
+)
+```
+
+```bash
+# Run in dev (unconsolidated):
+MIX_ENV=dev mix run bench/protocol_bench.exs
+
+# Run in prod (consolidated):
+MIX_ENV=prod mix run bench/protocol_bench.exs
+```
+
+**Expected gap**: consolidated dispatch is 5–15x faster for protocols with 4+
+implementations. The gap widens as the number of implementations grows because
+dev dispatch scans a list while prod dispatch uses compiled pattern matching.
+
+---
+
+## Trade-off analysis
+
+| Dispatch mode | Latency | Hot code reload | Implementation discovery | Use case |
+|---------------|---------|-----------------|--------------------------|----------|
+| Unconsolidated (dev) | O(n) ~800ns | Yes | Dynamic | Development only |
+| Consolidated (prod) | O(1) ~80ns | No | Static (compile time) | Production |
+| Direct function call | O(1) ~10ns | N/A | None — no polymorphism | Fixed types only |
+| `@derive` with Any | O(1) prod | N/A | Via `@derive` declaration | Boilerplate reduction |
+
+**When `@derive` is appropriate**: when a struct's implementation would be identical
+or structurally similar to the `Any` fallback. When the implementation needs
+struct-specific field access, write an explicit `defimpl`.
+
+---
+
+## Common production mistakes
+
+**1. Forgetting `@fallback_to_any true` when using `@derive`**
+If the protocol definition does not include `@fallback_to_any true`, then
+`@derive [MyProtocol]` on a struct silently does nothing — no error, no implementation.
+The first call raises `Protocol.UndefinedError` at runtime. Always set
+`@fallback_to_any true` when the protocol is intended to support `@derive`.
+
+**2. Returning atoms from `to_map/1`**
+Protocols like `Serializable` are typically used before JSON encoding. JSON encoders
+(`Jason`, `Poison`) cannot encode bare atoms (`:ok`, `:error`, `:admin`). Convert
+all atoms to strings in the protocol implementation, not in the encoder.
+
+**3. Using `Protocol.consolidate/2` manually in production**
+`Protocol.consolidate/2` is a build tool — call it once at compile time. Calling it
+at runtime (in `Application.start/2`) re-runs consolidation on every deploy start,
+adding seconds to boot time and defeating the purpose of pre-consolidated builds.
+
+**4. Not testing `Protocol.impl_for!/1` in CI**
+New struct types added by contributors silently lack protocol implementations until
+the code path that dispatches to them is hit in production. A simple test that calls
+`Protocol.impl_for!/1` for every known struct catches this at CI time.
+
+**5. Implementing the protocol for `Any` when you meant to implement it for a specific struct**
+`defimpl MyProtocol, for: Any` applies to all types that don't have a specific
+implementation. If `@fallback_to_any` is true, this silently handles types that
+should have explicit implementations. Turn on `@derive` only for structs that
+truly benefit from the generic fallback.
+
+---
+
+## Resources
+
+- [Elixir Protocol documentation](https://hexdocs.pm/elixir/Protocol.html) — consolidation, `impl_for/1`, `@fallback_to_any`
+- [Protocol.consolidate/2 — Elixir docs](https://hexdocs.pm/elixir/Protocol.html#consolidate/2) — manual consolidation API
+- [Jason library source](https://github.com/michalmuskala/jason) — real-world protocol-based JSON encoding with `@derive`
+- [Elixir guide: Protocols](https://elixir-lang.org/getting-started/protocols.html) — intro to polymorphism and `@derive`
+- [Erlang match compilation — BEAM book](https://www.oreilly.com/library/view/the-erlang-runtime/9781800560818/) — how consolidated dispatch maps to pattern-match bytecode

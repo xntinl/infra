@@ -1,85 +1,317 @@
-# 14. Build a Compile-Time Behaviour Callback Validator
+# Compile-Time Behaviour Callback Validator
 
-**Difficulty**: Insane
+**Project**: `behaviour_check` — a static analysis tool that enforces strict behaviour compliance at compile time
 
-## Prerequisites
+---
 
-- Mastered: Elixir macros, `__using__`, `@before_compile`, `@after_compile`, `Module` introspection
-- Mastered: Elixir type system (`@spec`, `@type`, `@callback`), Dialyzer PLT mechanics
-- Familiarity with: Elixir compiler pipeline, Mix tasks, abstract code format (`:beam_lib`, `:compile.forms`)
+## Project context
 
-## Problem Statement
+You are building `behaviour_check`, a Mix compiler and Mix task that enforces behaviour compliance beyond what the Elixir compiler provides. Missing callbacks become errors, type mismatches become warnings, and undocumented implementations become warnings — all at `mix compile` time.
 
-Build a static analysis tool and compile-time framework that enforces strict behaviour
-compliance beyond what the Elixir compiler provides by default:
+Project structure:
 
-1. Detect at compile time when a module declares `@behaviour MyBehaviour` but is missing
-   one or more required callbacks. Emit a compiler error (not a warning) that names the
-   specific missing callbacks and their expected signatures.
-2. Distinguish `@optional_callbacks`: missing optional callbacks produce a warning with
-   the recommendation to document why the callback is deliberately omitted.
-3. Validate return types: compare the return type annotation on the implementing module's
-   function `@spec` against the `@callback` spec declared in the behaviour. Report a
-   mismatch as a compiler warning with both the expected and actual types shown.
-4. Implement behaviour inheritance: `BehaviourB` can `use BehaviourA`, meaning any module
-   implementing `BehaviourB` must also satisfy all callbacks from `BehaviourA`.
-5. Enforce documentation: a callback implementation without a `@doc` annotation generates
-   a compiler warning. The warning must identify the module, function name, and arity.
-6. Implement a Mix task `mix behaviour.check` that scans all compiled modules in the
-   project (including dependencies if requested), reports every module with missing or
-   non-conforming callbacks, and exits with a non-zero status code if violations exist.
+```
+behaviour_check/
+├── lib/
+│   └── behaviour_check/
+│       ├── application.ex           # starts nothing; framework for compile hooks
+│       ├── validator.ex             # core validator: checks modules, emits diagnostics
+│       ├── callback_loader.ex       # reads @callback specs from behaviour modules
+│       ├── impl_loader.ex           # reads @spec and @doc from implementing modules via :beam_lib
+│       ├── type_checker.ex          # structural comparison of spec ASTs
+│       ├── inheritance.ex           # resolves BehaviourB extends BehaviourA callbacks
+│       └── compiler.ex              # Mix.Compiler implementation: hooks into mix compile
+├── mix_tasks/
+│   └── mix/tasks/behaviour/check.ex # mix behaviour.check task
+├── test/
+│   └── behaviour_check/
+│       ├── validator_test.exs        # missing required, optional warning, type mismatch
+│       ├── inheritance_test.exs      # inherited callbacks enforced
+│       ├── documentation_test.exs    # missing @doc warning
+│       └── mix_task_test.exs         # exit code 1 on violations
+├── bench/
+│   └── validator_bench.exs
+└── mix.exs
+```
 
-## Acceptance Criteria
+---
 
-- [ ] A module with `@behaviour MyBehaviour` that is missing callback `foo/2` causes
-      `mix compile` to emit a compiler error: `(CompileError) MyModule does not implement
-      required callback MyBehaviour.foo/2`.
-- [ ] A module missing an `@optional_callbacks` entry compiles successfully but emits:
-      `warning: MyModule does not implement optional callback MyBehaviour.bar/1`.
-- [ ] A module where `foo/2` returns `{:ok, String.t()}` but the `@callback` declares
-      `foo(atom, integer) :: {:ok, integer} | {:error, term}` emits a type mismatch warning.
-- [ ] `BehaviourB` that extends `BehaviourA` causes implementing modules to satisfy both
-      sets of callbacks; missing a callback from either triggers the appropriate error.
-- [ ] A callback implementation without `@doc` emits:
-      `warning: callback MyBehaviour.foo/2 implemented in MyModule without documentation`.
-- [ ] `mix behaviour.check` scans all modules in `_build/dev/lib/**/*.beam`, reports
-      violations in a structured format, and exits with code 1 if any violations exist.
-- [ ] `mix behaviour.check --include-deps` also checks dependency modules.
-- [ ] The validator itself compiles with zero warnings under `--warnings-as-errors`.
-- [ ] All checks are implemented as a compiler pass using `@after_compile` hooks or a
-      custom Mix compiler, not as a runtime check.
+## The problem
 
-## What You Will Learn
+The Elixir compiler emits a warning when a module declares `@behaviour MyBehaviour` but does not implement a required callback. It does not check types, it does not enforce `@doc`, and it does not support behaviour inheritance. In a large codebase with many behaviours, these gaps lead to silent API drift — implementing modules that satisfy the compiler but violate the contract their behaviour defines.
 
-- The Elixir compiler's module attribute accumulation and how `@after_compile` hooks execute
-- How to read and parse `@callback`, `@spec`, and `@type` from module beam attributes at compile time
-- The Erlang abstract code format and how to extract type information from `.beam` files using `:beam_lib`
-- How Mix compilers and Mix tasks integrate with the build pipeline
-- The difference between compile-time diagnostics (errors/warnings from `IO.warn` vs raising `CompileError`) and their stack trace formats
-- Static analysis without Dialyzer: building custom type-compatibility checks on spec ASTs
+This tool closes those gaps by reading module metadata from `.beam` files after compilation and emitting structured diagnostics.
 
-## Hints
+---
 
-This exercise is intentionally sparse. Research:
+## Why this design
 
-- `Module.get_attribute(module, :behaviour)` retrieves the declared behaviours from within an `@after_compile` hook
-- `module.__info__(:functions)` lists implemented functions; `Code.fetch_docs/1` retrieves `@doc` annotations from beam
-- Behaviour callbacks are stored in `module.behaviour_info(:callbacks)` for Erlang modules; Elixir stores them differently via `__MODULE__.__info__(:functions)` — inspect the actual beam attributes with `:beam_lib.chunks/2` and the `"ExCk"` chunk
-- For type checking, parse `@spec` ASTs using `Code.string_to_quoted/1` on the spec string and compare type trees structurally
-- `Mix.Task` requires implementing `run/1`; use `Mix.Task.run("compile")` to ensure beam files are fresh before scanning
+**`@after_compile` hooks**: the Elixir compiler calls `@after_compile` callbacks after a module is compiled but before the build finishes. This is the correct point to inspect the compiled module — the beam file exists, all attributes are finalized, but the build process can still emit errors or warnings.
 
-## Reference Material
+**`:beam_lib` for spec extraction**: the Elixir compiler embeds `@spec`, `@callback`, and `@doc` metadata in the `.beam` file's `"ExCk"` chunk (Elixir type information) and `abstract_code` chunk (Erlang abstract forms). `:beam_lib.chunks/2` retrieves this metadata without loading the module.
 
-- Elixir compiler internals: https://github.com/elixir-lang/elixir/blob/main/lib/elixir/lib/module.ex
-- Erlang abstract format: https://www.erlang.org/doc/apps/erts/absform
-- `:beam_lib` documentation: https://www.erlang.org/doc/man/beam_lib
-- Dialyzer PLT and type inference: https://www.erlang.org/doc/man/dialyzer
-- "Metaprogramming Elixir" — Chris McCord, Chapters 4–5
+**Structural spec comparison**: you cannot compare spec types by string equality. `String.t()` and `binary()` are equivalent; `[atom()]` and `list(atom())` are equivalent. Structural comparison walks both type ASTs and returns true if they denote the same type. You do not need a complete type checker — a conservative approximation that catches obvious mismatches is sufficient.
 
-## Difficulty Rating
+**Mix compiler integration**: implementing the `Mix.Compiler` behaviour allows `behaviour_check` to run automatically as part of `mix compile`. The compiler receives a list of modules that were compiled in this pass and can emit diagnostics against them.
 
-★★★★★★
+---
 
-## Estimated Time
+## Implementation milestones
 
-35–50 hours
+### Step 1: Create the project
+
+```bash
+mix new behaviour_check --sup
+cd behaviour_check
+mkdir -p lib/behaviour_check mix_tasks/mix/tasks/behaviour test/behaviour_check bench
+```
+
+### Step 2: `mix.exs` — no external dependencies needed
+
+The validator uses only OTP's `:beam_lib` and Elixir's `Code` module.
+
+### Step 3: Callback loader
+
+```elixir
+# lib/behaviour_check/callback_loader.ex
+defmodule BehaviourCheck.CallbackLoader do
+  @moduledoc """
+  Reads @callback and @optional_callbacks from a behaviour module.
+  Returns lists of {name, arity, type_spec} for required and optional callbacks.
+  """
+
+  def load(behaviour_module) do
+    # TODO: use Code.fetch_docs/1 to get doc metadata
+    # TODO: use :beam_lib.chunks(beam_path, [:abstract_code]) to get type specs
+    # TODO: return {required_callbacks, optional_callbacks}
+    # HINT: behaviour.behaviour_info(:callbacks) returns [{name, arity}]
+    # HINT: behaviour.behaviour_info(:optional_callbacks) returns [{name, arity}]
+  end
+
+  defp beam_path(module) do
+    # TODO: :code.which(module) returns the path to the .beam file
+  end
+end
+```
+
+### Step 4: Validator
+
+```elixir
+# lib/behaviour_check/validator.ex
+defmodule BehaviourCheck.Validator do
+  @moduledoc """
+  Validates a module against its declared behaviours.
+  Returns a list of diagnostics: {:error | :warning, message, location}.
+  """
+
+  def validate(module) do
+    behaviours = module.__info__(:attributes)[:behaviour] || []
+    Enum.flat_map(behaviours, fn behaviour ->
+      validate_against(module, behaviour)
+    end)
+  end
+
+  defp validate_against(module, behaviour) do
+    {required, optional} = BehaviourCheck.CallbackLoader.load(behaviour)
+    implemented = module.__info__(:functions)
+
+    missing_required  = check_missing_required(required, implemented, module)
+    missing_optional  = check_missing_optional(optional, implemented, module)
+    type_mismatches   = check_type_specs(required ++ optional, module, behaviour)
+    missing_docs      = check_documentation(required ++ optional, module)
+
+    missing_required ++ missing_optional ++ type_mismatches ++ missing_docs
+  end
+
+  defp check_missing_required(callbacks, implemented, module) do
+    # TODO: for each callback not in implemented, emit {:error, message, location}
+    # HINT: location = {module_file, line} — use Module.get_attribute(module, :file)
+  end
+
+  defp check_type_specs(callbacks, module, behaviour) do
+    # TODO: fetch @spec for each callback in module using Code.fetch_docs/1
+    # TODO: compare return type structurally against @callback spec in behaviour
+    # TODO: emit {:warning, ...} on mismatch
+  end
+end
+```
+
+### Step 5: Mix compiler
+
+```elixir
+# lib/behaviour_check/compiler.ex
+defmodule BehaviourCheck.Compiler do
+  @moduledoc "Mix compiler that runs behaviour validation after each compile pass."
+
+  use Mix.Task.Compiler
+
+  @impl true
+  def run(argv) do
+    # Ensure modules are compiled first
+    Mix.Task.run("compile.elixir", argv)
+
+    modules = get_project_modules()
+    diagnostics = Enum.flat_map(modules, &BehaviourCheck.Validator.validate/1)
+
+    errors   = Enum.filter(diagnostics, fn {sev, _, _} -> sev == :error end)
+    warnings = Enum.filter(diagnostics, fn {sev, _, _} -> sev == :warning end)
+
+    Enum.each(warnings, fn {_, msg, loc} -> Mix.shell().info("warning: #{msg} at #{inspect(loc)}") end)
+    Enum.each(errors,   fn {_, msg, loc} -> Mix.shell().error("error: #{msg} at #{inspect(loc)}") end)
+
+    if Enum.any?(errors), do: {:error, diagnostics}, else: {:ok, diagnostics}
+  end
+
+  defp get_project_modules do
+    # TODO: list all .beam files in _build/dev/lib/**/*.beam
+    # TODO: load module name from each beam file using :beam_lib.info/1
+  end
+end
+```
+
+### Step 6: Given tests — must pass without modification
+
+```elixir
+# test/behaviour_check/validator_test.exs
+defmodule BehaviourCheck.ValidatorTest do
+  use ExUnit.Case, async: true
+
+  # Define a test behaviour
+  defmodule TestBehaviour do
+    @callback required_fn(atom()) :: {:ok, term()} | {:error, term()}
+    @callback optional_fn(integer()) :: boolean()
+    @optional_callbacks [optional_fn: 1]
+  end
+
+  # Missing required callback
+  defmodule MissingRequired do
+    @behaviour TestBehaviour
+    # does NOT implement required_fn/1
+    def optional_fn(_), do: true
+  end
+
+  # Missing optional callback
+  defmodule MissingOptional do
+    @behaviour TestBehaviour
+    def required_fn(_), do: {:ok, :done}
+    # does NOT implement optional_fn/1
+  end
+
+  test "missing required callback emits :error diagnostic" do
+    diagnostics = BehaviourCheck.Validator.validate(MissingRequired)
+    errors = Enum.filter(diagnostics, fn {sev, _, _} -> sev == :error end)
+
+    assert Enum.any?(errors, fn {_, msg, _} ->
+      String.contains?(msg, "required_fn/1")
+    end), "expected error about missing required_fn/1, got: #{inspect(errors)}"
+  end
+
+  test "missing optional callback emits :warning diagnostic" do
+    diagnostics = BehaviourCheck.Validator.validate(MissingOptional)
+    warnings = Enum.filter(diagnostics, fn {sev, _, _} -> sev == :warning end)
+
+    assert Enum.any?(warnings, fn {_, msg, _} ->
+      String.contains?(msg, "optional_fn/1")
+    end)
+  end
+
+  test "complete implementation emits no diagnostics" do
+    defmodule CompleteImpl do
+      @behaviour TestBehaviour
+      @doc "Creates something"
+      def required_fn(_), do: {:ok, :done}
+      @doc "Checks something"
+      def optional_fn(_), do: true
+    end
+
+    assert [] = BehaviourCheck.Validator.validate(CompleteImpl)
+  end
+end
+```
+
+```elixir
+# test/behaviour_check/inheritance_test.exs
+defmodule BehaviourCheck.InheritanceTest do
+  use ExUnit.Case, async: true
+
+  defmodule BehaviourA do
+    @callback foo(atom()) :: :ok
+  end
+
+  defmodule BehaviourB do
+    use BehaviourA
+    @callback bar(integer()) :: boolean()
+  end
+
+  defmodule MissingFoo do
+    @behaviour BehaviourB
+    # implements bar but not foo
+    def bar(_), do: true
+  end
+
+  test "module missing inherited callback emits error" do
+    diagnostics = BehaviourCheck.Validator.validate(MissingFoo)
+    errors = Enum.filter(diagnostics, fn {sev, _, _} -> sev == :error end)
+
+    assert Enum.any?(errors, fn {_, msg, _} ->
+      String.contains?(msg, "foo/1")
+    end)
+  end
+end
+```
+
+### Step 7: Run the tests
+
+```bash
+mix test test/behaviour_check/ --trace
+```
+
+### Step 8: Test the Mix task
+
+```bash
+mix behaviour.check
+echo "Exit code: $?"
+```
+
+Expected: exit code 0 on a clean project, exit code 1 if any violations exist.
+
+---
+
+## Trade-off analysis
+
+| Aspect | Your validator | Dialyzer | Elixir compiler default |
+|--------|----------------|----------|------------------------|
+| Execution point | `mix compile` | `mix dialyzer` (separate run) | `mix compile` |
+| Required callback check | error | warning | warning |
+| Type mismatch check | structural (conservative) | full type inference | none |
+| Optional callback | warning | none | none |
+| Documentation enforcement | warning | none | none |
+| Speed | fast (metadata only) | slow (full PLT analysis) | fast |
+| False positives | possible (structural only) | low | n/a |
+
+Architectural question: your structural type checker is conservative — it may miss some mismatches and flag some valid implementations. What are the cases where structural comparison is insufficient? What would you need to implement a complete type equivalence check?
+
+---
+
+## Common production mistakes
+
+**1. Running validation before the beam files exist**
+If your `@after_compile` hook fires before the module's beam file is written to disk, `:beam_lib` cannot find it. Ensure the hook path matches the actual output path from `Mix.Project.compile_path/0`.
+
+**2. Comparing spec strings instead of AST nodes**
+`atom()` and `Atom.t()` are equivalent but not string-equal. You must parse both spec strings into AST with `Code.string_to_quoted/1` and compare the AST trees.
+
+**3. Not handling behaviours that are Erlang modules**
+Erlang behaviour modules store callback info in `module.behaviour_info(:callbacks)`, not in Elixir's `@callback` attributes. Your loader must handle both cases.
+
+**4. Emitting errors for optional callbacks**
+Required and optional callbacks have different enforcement rules. Confusing them causes false positives that block compilation for valid modules.
+
+---
+
+## Resources
+
+- [Elixir `Module` source](https://github.com/elixir-lang/elixir/blob/main/lib/elixir/lib/module.ex) — how Elixir stores module attributes
+- [Erlang abstract format](https://www.erlang.org/doc/apps/erts/absform) — the format returned by `:beam_lib.chunks/2`
+- [`:beam_lib` documentation](https://www.erlang.org/doc/man/beam_lib)
+- McCord, C. — *Metaprogramming Elixir* — Chapters 4–5 on `__using__` and compiler hooks

@@ -1,578 +1,362 @@
-# 32 - String.Chars e Inspect Protocol
+# String.Chars and Inspect Protocols
 
-## Prerequisites
-
-- Protocols en Elixir (ejercicio 08)
-- Structs y módulos
-- Pattern matching básico
-- Familiaridad con `IO.puts`, `IO.inspect`, interpolación de strings
+**Project**: `task_queue` — built incrementally across the intermediate level
 
 ---
 
-## Learning Objectives
+## Project context
 
-Al completar este ejercicio serás capaz de:
+`task_queue` logs job execution details, renders job summaries in CLI output, and includes job context in error messages. Currently every log line calls `inspect/1` or manually extracts fields — the resulting strings are verbose, contain internal implementation details, and are inconsistent across modules.
 
-1. Implementar `String.Chars` para convertir structs propias en strings legibles
-2. Implementar `Inspect` para controlar cómo `IO.inspect` representa tus tipos
-3. Usar `Inspect.Opts` para personalizar el output: `:limit`, `:printable_limit`, `:pretty`
-4. Aplicar coloreado con `Inspect.Algebra` y `Macro.inspect_atom/2`
-5. Distinguir cuándo usar cada protocolo y cuál es su contrato
+Project structure at this point:
 
----
-
-## Concepts
-
-### El protocolo String.Chars
-
-`String.Chars` define cómo un valor se convierte a string binario. Se invoca implícitamente en interpolación de strings y en `to_string/1`.
-
-```elixir
-# Contrato: implementar to_string/1 que devuelva un String binario
-defprotocol String.Chars do
-  def to_string(term)
-end
-
-# Se invoca en:
-"Hola #{value}"       # interpolación
-to_string(value)      # función explícita
-IO.puts(value)        # IO.puts llama a to_string internamente
 ```
-
-```elixir
-# Implementaciones built-in ya existentes:
-to_string(42)         # "42"
-to_string(3.14)       # "3.14"
-to_string(:atom)      # "atom"
-to_string(true)       # "true"
-to_string([1,2,3])    # no implementado para listas arbitrarias → error
-
-# Para structs propias: sin implementación, la interpolación lanza Protocol.UndefinedError
-```
-
-### El protocolo Inspect
-
-`Inspect` define cómo un valor se representa para debugging. Se invoca por `IO.inspect/2`, `inspect/2`, y el REPL de iex.
-
-```elixir
-defprotocol Inspect do
-  def inspect(term, opts)  # opts es %Inspect.Opts{}
-end
-
-# A diferencia de String.Chars, Inspect puede devolver:
-# - Un String directamente
-# - Un Inspect.Algebra document (para formato complejo / multilinea)
-```
-
-### Inspect.Opts: opciones de formateo
-
-```elixir
-# Las opciones se pasan como segundo argumento a IO.inspect/2
-IO.inspect(value, pretty: true)         # formato multilinea
-IO.inspect(value, limit: 5)             # limitar elementos de listas/mapas
-IO.inspect(value, printable_limit: 20)  # limitar chars en strings
-IO.inspect(value, width: 40)            # ancho máximo de línea (con pretty: true)
-IO.inspect(value, structs: false)       # no usar implementación de Inspect del struct
-IO.inspect(value, syntax_colors: [     # colores ANSI
-  number: :cyan,
-  atom: :blue,
-  string: :green,
-  nil: :magenta,
-  boolean: :magenta
-])
-```
-
-### Inspect.Algebra: formato estructurado
-
-Para implementaciones avanzadas de `Inspect` que soporten pretty-printing:
-
-```elixir
-import Inspect.Algebra
-
-# Primitivos
-empty()                     # documento vacío
-string("hola")              # texto literal
-line()                      # salto de línea
-space()                     # espacio
-break(" ")                  # espacio que puede convertirse en newline
-
-# Composición
-concat(["#MyStruct<", "value", ">"])
-nest(doc, 2)                # indenta 2 espacios
-group(doc)                  # intenta poner en una línea; si no, expande
-```
-
-```elixir
-# Patrón típico: to_doc/2 para tipos anidados
-defimpl Inspect, for: MyStruct do
-  import Inspect.Algebra
-
-  def inspect(%MyStruct{value: v, name: n}, opts) do
-    concat([
-      "#MyStruct<",
-      "name: ",
-      to_doc(n, opts),   # respeta las opts del caller (limit, colors, etc.)
-      ", value: ",
-      to_doc(v, opts),
-      ">"
-    ])
-  end
-end
+task_queue/
+├── lib/
+│   └── task_queue/
+│       ├── application.ex
+│       ├── job.ex                  # ← you implement String.Chars and Inspect here
+│       ├── worker.ex
+│       ├── queue_server.ex
+│       ├── scheduler.ex
+│       └── registry.ex
+├── test/
+│   └── task_queue/
+│       └── protocol_impl_test.exs  # given tests — must pass without modification
+└── mix.exs
 ```
 
 ---
 
-## Exercises
+## The business problem
 
-### Ejercicio 1: Struct Money con to_string
+Current log output for a failed job looks like this:
 
-Implementa `String.Chars` para un struct que representa una cantidad monetaria.
+```
+[error] Job failed: %TaskQueue.Job{id: "abc-123", type: "send_email",
+  args: %{to: "user@example.com", subject: "Welcome"}, status: :failed,
+  retry_count: 2, last_error: "timeout", inserted_at: ~U[2024-01-15 10:30:00Z]}
+```
+
+The ops team needs:
+1. **String interpolation** — `"Processing #{job}"` should produce `"Processing send_email:abc-123"` — a compact identifier, not the full struct dump
+2. **Inspectable output** — `inspect(job, pretty: true)` should show only fields relevant for debugging, hiding internal implementation details like raw timestamps
+3. **Consistent format** — job references in logs, error messages, and CLI output must look the same everywhere without manual field extraction
+
+---
+
+## Why `String.Chars` and `Inspect` and not `to_string/1` or custom functions
+
+You could define `def job_to_string(job)` in `TaskQueue.Job` and call it everywhere. The problem is that:
+- String interpolation `"#{job}"` calls `to_string(job)` which calls `String.Chars.to_string/1` — if not implemented, it raises `Protocol.UndefinedError`
+- `IO.puts(job)` and `Logger.info(job)` both invoke `String.Chars`
+- `IO.inspect(job)` and `dbg(job)` both invoke `Inspect`
+
+Implementing these protocols means your struct works naturally everywhere strings and inspection are needed — no special function calls required.
+
+---
+
+## The two protocols
+
+**`String.Chars`** controls what `to_string(value)` and string interpolation `"#{value}"` produce. It should return a human-readable representation suitable for end-user output — not debug output. For `TaskQueue.Job`, this is a compact identifier like `"send_email:abc-123 [failed]"`.
+
+**`Inspect`** controls what `inspect(value)` produces. It is used by IEx, `IO.inspect/2`, and the `dbg/1` macro. It should return a string that could be pasted back into Elixir code and evaluated, or at minimum a clear debug representation. For `TaskQueue.Job`, this is `#TaskQueue.Job<id: "abc-123", type: "send_email", status: :failed>`.
+
+The key difference: `String.Chars` is for users; `Inspect` is for developers.
+
+---
+
+## Implementation
+
+### Step 1: `lib/task_queue/job.ex` — struct with protocol implementations
 
 ```elixir
-defmodule Money do
+defmodule TaskQueue.Job do
   @moduledoc """
-  Representa una cantidad monetaria con precisión de centavos.
-  Almacena el monto en la menor unidad (centavos) para evitar errores de float.
+  Represents a unit of work in the task queue.
+
+  Implements `String.Chars` for human-readable string interpolation
+  and `Inspect` for developer-friendly debug output.
   """
 
-  @enforce_keys [:amount_cents, :currency]
-  defstruct [:amount_cents, :currency]
+  @enforce_keys [:type]
 
-  @currencies ~w(USD EUR GBP MXN)
+  defstruct [
+    :id,
+    :type,
+    :last_error,
+    :scheduled_at,
+    args: %{},
+    status: :pending,
+    retry_count: 0
+  ]
 
-  def new(amount_cents, currency)
-      when is_integer(amount_cents) and currency in @currencies do
-    %Money{amount_cents: amount_cents, currency: currency}
-  end
-
-  # TODO: implementar String.Chars para Money
-  # El formato debe ser: "$ 12.50 USD" o "€ 9.99 EUR" según moneda
-  # Reglas:
-  # - Dividir amount_cents entre 100 para obtener el monto
-  # - Mostrar siempre 2 decimales
-  # - Usar el símbolo correcto: USD→$, EUR→€, GBP→£, MXN→$
-  # - Formato: "SÍMBOLO MONTO MONEDA"
-  # Ejemplo: Money.new(1099, "USD") |> to_string()  # "$ 10.99 USD"
-  #          Money.new(599, "EUR")  |> to_string()  # "€ 5.99 EUR"
-
-  defimpl String.Chars do
-    def to_string(%Money{amount_cents: cents, currency: currency}) do
-      # TODO: calcular part entera y decimal
-      # whole   = div(cents, 100)
-      # decimal = rem(cents, 100)
-      # symbol  = currency_symbol(currency)
-      # "#{symbol} #{whole}.#{String.pad_leading(to_string(decimal), 2, "0")} #{currency}"
-    end
-
-    # TODO: implementar currency_symbol/1 para cada moneda soportada
-    defp currency_symbol(currency) do
-      # USD -> "$", EUR -> "€", GBP -> "£", MXN -> "$"
-    end
-  end
-
-  # TODO: implementar Inspect para Money
-  # Formato: #Money<$ 10.99 USD>
-  # Usar to_string ya implementado dentro del Inspect
-
-  defimpl Inspect do
-    def inspect(money, _opts) do
-      # TODO: "#Money<#{to_string(money)}>"
-    end
-  end
-end
-```
-
-```elixir
-# Verificación en iex:
-# alias Money
-
-# price = Money.new(2999, "EUR")
-# to_string(price)          # "€ 29.99 EUR"
-# "El precio es: #{price}"  # "El precio es: € 29.99 EUR"
-# IO.puts(price)            # € 29.99 EUR
-# IO.inspect(price)         # #Money<€ 29.99 EUR>
-
-# tax = Money.new(299, "USD")
-# to_string(tax)            # "$ 2.99 USD"
-
-# Verificar que funciona en listas:
-# prices = [Money.new(999, "USD"), Money.new(1499, "EUR")]
-# IO.inspect(prices)
-# [#Money<$ 9.99 USD>, #Money<€ 14.99 EUR>]
-
-# Caso borde: centavos < 10
-# Money.new(5, "GBP") |> to_string()  # "£ 0.05 GBP"
-```
-
----
-
-### Ejercicio 2: Struct Tree con Inspect multilinea
-
-Implementa `Inspect` con `Inspect.Algebra` para un árbol binario que se muestre de forma legible según la profundidad.
-
-```elixir
-defmodule Tree do
-  @moduledoc """
-  Árbol binario genérico.
-  """
-  defstruct [:value, :left, :right]
-
-  def leaf(value), do: %Tree{value: value, left: nil, right: nil}
-
-  def node(value, left, right), do: %Tree{value: value, left: left, right: right}
+  @type t :: %__MODULE__{
+    id:           String.t() | nil,
+    type:         String.t(),
+    args:         map(),
+    status:       :pending | :running | :completed | :failed,
+    retry_count:  non_neg_integer(),
+    last_error:   String.t() | nil,
+    scheduled_at: DateTime.t() | nil
+  }
 
   @doc """
-  Inserta un valor en un BST (Binary Search Tree).
+  Creates a new Job struct with a generated ID.
+
+  ## Examples
+
+      iex> job = TaskQueue.Job.new("send_email", %{to: "user@example.com"})
+      iex> job.type
+      "send_email"
+      iex> job.status
+      :pending
+
   """
-  def insert(nil, value), do: leaf(value)
-  def insert(%Tree{value: v} = t, value) when value < v do
-    %{t | left: insert(t.left, value)}
-  end
-  def insert(%Tree{value: v} = t, value) when value >= v do
-    %{t | right: insert(t.right, value)}
-  end
-
-  # TODO: implementar Inspect con Inspect.Algebra
-  # El formato debe ser:
-  #
-  # Para árbol pequeño (en una línea):
-  #   #Tree<5>            (leaf)
-  #   #Tree<5, left: #Tree<3>, right: #Tree<7>>
-  #
-  # Para árbol grande (multilinea con pretty: true):
-  #   #Tree<
-  #     5,
-  #     left: #Tree<
-  #       3,
-  #       left: #Tree<1>,
-  #       right: #Tree<4>
-  #     >,
-  #     right: #Tree<7>
-  #   >
-
-  defimpl Inspect do
-    import Inspect.Algebra
-
-    def inspect(%Tree{value: value, left: nil, right: nil}, opts) do
-      # TODO: leaf — formato simple "#Tree<VALUE>"
-      # Usar to_doc/2 para el value (respeta opts del caller)
-    end
-
-    def inspect(%Tree{value: value, left: left, right: right}, opts) do
-      # TODO: nodo con hijos
-      # Construir con concat, nest, group, break
-      # Usar to_doc/2 para value, left, y right (recursivo)
-      #
-      # Pista para multilinea:
-      # group(
-      #   concat([
-      #     "#Tree<",
-      #     nest(
-      #       concat([
-      #         break(""),
-      #         to_doc(value, opts),
-      #         ...children...
-      #       ]),
-      #       2
-      #     ),
-      #     break(""),
-      #     ">"
-      #   ])
-      # )
-    end
-
-    defp child_doc(nil, _opts), do: empty()
-    defp child_doc(child, opts) do
-      # TODO: formatear un hijo como ", left: SUBTREE" o ", right: SUBTREE"
-    end
-  end
-end
-```
-
-```elixir
-# Verificación:
-# alias Tree
-
-# leaf = Tree.leaf(5)
-# IO.inspect(leaf)
-# #Tree<5>
-
-# small = Tree.node(5, Tree.leaf(3), Tree.leaf(7))
-# IO.inspect(small)
-# #Tree<5, left: #Tree<3>, right: #Tree<7>>
-
-# Árbol más grande
-# tree = Enum.reduce([5, 3, 7, 1, 4, 6, 9], nil, &Tree.insert(&2, &1))
-# IO.inspect(tree, pretty: true, width: 40)
-# #Tree<
-#   5,
-#   left: #Tree<
-#     3,
-#     left: #Tree<1>,
-#     right: #Tree<4>
-#   >,
-#   right: #Tree<7, ...>
-# >
-
-# Verificar que los límites se respetan:
-# IO.inspect(tree, limit: 2)  # acorta la representación
-```
-
----
-
-### Ejercicio 3: Custom Color Coding en Inspect
-
-Implementa un struct `LogEntry` con coloreado ANSI en su representación de Inspect para hacer los logs más legibles en la terminal.
-
-```elixir
-defmodule LogEntry do
-  @moduledoc """
-  Entrada de log con nivel, mensaje y metadatos.
-  La representación de Inspect usa colores ANSI según el nivel.
-  """
-
-  @levels [:debug, :info, :warn, :error]
-
-  @enforce_keys [:level, :message, :timestamp]
-  defstruct [:level, :message, :timestamp, metadata: %{}]
-
-  def new(level, message, metadata \\ %{})
-      when level in @levels and is_binary(message) do
-    %LogEntry{
-      level:     level,
-      message:   message,
-      timestamp: DateTime.utc_now(),
-      metadata:  metadata
+  @spec new(String.t(), map()) :: t()
+  def new(type, args \\ %{}) when is_binary(type) do
+    %__MODULE__{
+      id:   generate_id(),
+      type: type,
+      args: args
     }
   end
 
-  # TODO: implementar String.Chars
-  # Formato: "[LEVEL] TIMESTAMP — MESSAGE"
-  # Sin colores en to_string (para archivos de log, pipes, etc.)
-  # Ejemplo: "[ERROR] 2024-01-15T10:30:00Z — Connection refused"
-
-  defimpl String.Chars do
-    def to_string(%LogEntry{level: level, message: msg, timestamp: ts}) do
-      # TODO: formatear timestamp como ISO8601 con Calendar.strftime o DateTime.to_iso8601
-      # "[#{String.upcase(to_string(level))}] #{ts} — #{msg}"
-    end
-  end
-
-  # TODO: implementar Inspect con colores según nivel
-  # El coloreado solo aplica si opts.syntax_colors está configurado
-  # (no asumir que siempre hay colores — respetar el entorno)
-  #
-  # Colores por nivel:
-  # :debug  → :cyan
-  # :info   → :green
-  # :warn   → :yellow
-  # :error  → :red
-  #
-  # Formato visual:
-  # #LogEntry<[ERROR] 2024-01-15T10:30:00Z — Connection refused {port: 5432}>
-
-  defimpl Inspect do
-    import Inspect.Algebra
-
-    @level_colors %{
-      debug: :cyan,
-      info:  :green,
-      warn:  :yellow,
-      error: :red
-    }
-
-    def inspect(%LogEntry{level: level, message: msg, timestamp: ts, metadata: meta}, opts) do
-      # TODO: construir la representación coloreada
-      # Pista: usar color/3 de Inspect.Algebra si opts.syntax_colors no es []
-      # color(doc, :atom, opts)  — aplica el color del tipo :atom según opts
-      #
-      # Para colores personalizados (no los tipos estándar), usar escape ANSI directamente:
-      # ansi_color = Map.get(@level_colors, level)
-      # IO.ANSI.format([ansi_color, text, :reset])  — pero solo si opts.syntax_colors != []
-      #
-      # Formato: "#LogEntry<" <> level_colored <> " " <> timestamp <> " — " <> msg <> meta_part <> ">"
-    end
-
-    defp format_meta(meta, _opts) when meta == %{}, do: empty()
-    defp format_meta(meta, opts) do
-      # TODO: formatear metadata como " {key: value, ...}"
-      # Usar to_doc para respetar los opts (limit, colors, etc.)
-    end
-
-    defp colors_enabled?(%Inspect.Opts{syntax_colors: colors}), do: colors != []
-  end
-end
-```
-
-```elixir
-# Verificación en iex:
-# alias LogEntry
-
-# entries = [
-#   LogEntry.new(:debug, "Cache hit", %{key: "user:42"}),
-#   LogEntry.new(:info,  "Request processed", %{path: "/api/users", ms: 45}),
-#   LogEntry.new(:warn,  "Slow query", %{table: "orders", ms: 1200}),
-#   LogEntry.new(:error, "Connection refused", %{host: "db.internal", port: 5432})
-# ]
-
-# Sin colores (default en pipes/archivos):
-# Enum.each(entries, fn e -> IO.puts(to_string(e)) end)
-# [DEBUG] 2024-01-15T10:30:00Z — Cache hit
-# [INFO]  2024-01-15T10:30:00Z — Request processed
-# [WARN]  2024-01-15T10:30:00Z — Slow query
-# [ERROR] 2024-01-15T10:30:00Z — Connection refused
-
-# Con colores en iex (iex activa syntax_colors automáticamente):
-# IO.inspect(entries, pretty: true)
-# (los niveles aparecen con colores ANSI en terminal)
-
-# Forzar colores:
-# IO.inspect(entries,
-#   pretty: true,
-#   syntax_colors: [atom: :blue, string: :green, number: :cyan]
-# )
-
-# Verificar String.Chars para logging en archivo:
-# log_line = to_string(LogEntry.new(:error, "Disk full"))
-# File.write!("/tmp/app.log", log_line <> "\n", [:append])
-```
-
----
-
-## Common Mistakes
-
-**1. Implementar `String.Chars` devolviendo algo que no es un binary**
-
-```elixir
-# MAL: to_string debe devolver siempre un String (binary)
-defimpl String.Chars, for: Money do
-  def to_string(%Money{amount_cents: c}) do
-    c / 100  # devuelve un float, no un String!
+  defp generate_id do
+    :crypto.strong_rand_bytes(8) |> Base.encode16(case: :lower)
   end
 end
 
-# BIEN:
-defimpl String.Chars, for: Money do
-  def to_string(%Money{amount_cents: c}) do
-    Kernel.to_string(c / 100)  # Kernel.to_string para no recursión infinita
-  end
-end
-```
+defimpl String.Chars, for: TaskQueue.Job do
+  @doc """
+  Returns a compact human-readable string for the job.
 
-**2. Confundir `to_string/1` del protocolo con `Kernel.to_string/1`**
+  Format: "{type}:{id} [{status}]"
+  If id is nil, uses "new" as the id placeholder.
 
-```elixir
-# Dentro de defimpl String.Chars, el nombre "to_string" hace sombra a Kernel.to_string
-defimpl String.Chars, for: MyStruct do
-  def to_string(%MyStruct{value: v}) do
-    to_string(v)  # recursión infinita si v es otro MyStruct!
-    # BIEN: Kernel.to_string(v) o Integer.to_string(v)
-  end
-end
-```
+  ## Examples
 
-**3. No respetar `opts` en implementaciones de Inspect**
+      iex> job = %TaskQueue.Job{id: "abc-123", type: "send_email", status: :pending}
+      iex> to_string(job)
+      "send_email:abc-123 [pending]"
 
-```elixir
-# MAL: ignorar opts hace que limit/colors/pretty no funcionen
-defimpl Inspect, for: MyStruct do
-  def inspect(%MyStruct{items: items}, _opts) do
-    "#MyStruct<#{inspect(items)}>"  # items puede ser enorme, sin límite
+      iex> "Processing #{job}"
+      "Processing send_email:abc-123 [pending]"
+
+  """
+  def to_string(%TaskQueue.Job{id: id, type: type, status: status}) do
+    # TODO: return "#{type}:#{id || "new"} [#{status}]"
   end
 end
 
-# BIEN: usar to_doc/2 que respeta opts
-defimpl Inspect, for: MyStruct do
+defimpl Inspect, for: TaskQueue.Job do
   import Inspect.Algebra
-  def inspect(%MyStruct{items: items}, opts) do
-    concat(["#MyStruct<", to_doc(items, opts), ">"])
+
+  @doc """
+  Returns a developer-friendly debug representation.
+
+  Shows id, type, status, and retry_count. Hides args (potentially large)
+  and scheduled_at (implementation detail).
+
+  Format: #TaskQueue.Job<id: "abc-123", type: "send_email", status: :failed, retries: 2>
+
+  ## Examples
+
+      iex> job = %TaskQueue.Job{id: "abc-123", type: "send_email", status: :failed, retry_count: 2}
+      iex> inspect(job)
+      "#TaskQueue.Job<id: \\"abc-123\\", type: \\"send_email\\", status: :failed, retries: 2>"
+
+  """
+  def inspect(%TaskQueue.Job{id: id, type: type, status: status, retry_count: retries}, opts) do
+    # TODO: use Inspect.Algebra helpers to build:
+    # "#TaskQueue.Job<id: {id}, type: {type}, status: {status}, retries: {retries}>"
+    #
+    # HINT:
+    # fields = [
+    #   concat(["id: ", Inspect.inspect(id, opts)]),
+    #   concat(["type: ", Inspect.inspect(type, opts)]),
+    #   concat(["status: ", Inspect.inspect(status, opts)]),
+    #   concat(["retries: ", Inspect.inspect(retries, opts)])
+    # ]
+    # concat(["#TaskQueue.Job<", Enum.join(fields, ", "), ">"])
+    #
+    # Note: the simplest correct implementation avoids Inspect.Algebra entirely:
+    # "#TaskQueue.Job<id: #{inspect(id)}, type: #{inspect(type)}, " <>
+    # "status: #{inspect(status)}, retries: #{retries}>"
   end
 end
 ```
 
-**4. Asumir que los colores siempre están disponibles**
+### Step 2: Given tests — must pass without modification
 
 ```elixir
-# MAL: siempre inyectar códigos ANSI
-def inspect(term, _opts) do
-  "\e[31m#MyStruct\e[0m<...>"  # aparece como basura en archivos de log
-end
+# test/task_queue/protocol_impl_test.exs
+defmodule TaskQueue.ProtocolImplTest do
+  use ExUnit.Case, async: true
 
-# BIEN: verificar si los colores están habilitados
-def inspect(term, opts) do
-  if opts.syntax_colors != [] do
-    # versión con color
-  else
-    # versión plana
+  alias TaskQueue.Job
+
+  describe "String.Chars implementation" do
+    test "to_string/1 returns compact format" do
+      job = %Job{id: "abc-123", type: "send_email", status: :pending, retry_count: 0}
+      assert to_string(job) == "send_email:abc-123 [pending]"
+    end
+
+    test "string interpolation uses String.Chars" do
+      job = %Job{id: "xyz-456", type: "run_report", status: :running, retry_count: 1}
+      assert "Job: #{job}" == "Job: run_report:xyz-456 [running]"
+    end
+
+    test "nil id renders as 'new'" do
+      job = %Job{id: nil, type: "heartbeat", status: :pending, retry_count: 0}
+      assert to_string(job) == "heartbeat:new [pending]"
+    end
+
+    test "failed status is included" do
+      job = %Job{id: "j1", type: "send_sms", status: :failed, retry_count: 3}
+      assert String.contains?(to_string(job), "failed")
+    end
+
+    test "IO.puts does not raise" do
+      job = %Job{id: "j2", type: "noop", status: :completed, retry_count: 0}
+      # If String.Chars is not implemented, this raises Protocol.UndefinedError
+      assert capture_io(fn -> IO.puts(job) end) =~ "noop:j2"
+    end
+  end
+
+  describe "Inspect implementation" do
+    test "inspect/1 returns developer format" do
+      job = %Job{id: "abc-123", type: "send_email", status: :failed, retry_count: 2}
+      result = inspect(job)
+      assert result =~ "#TaskQueue.Job<"
+      assert result =~ "abc-123"
+      assert result =~ "send_email"
+      assert result =~ "failed"
+      assert result =~ "retries: 2"
+    end
+
+    test "inspect does not expose args" do
+      job = %Job{
+        id: "j3",
+        type: "send_email",
+        args: %{to: "user@example.com", password: "secret"},
+        status: :pending,
+        retry_count: 0
+      }
+      result = inspect(job)
+      refute result =~ "password"
+      refute result =~ "secret"
+    end
+
+    test "inspect does not expose scheduled_at" do
+      job = %Job{
+        id: "j4",
+        type: "noop",
+        status: :pending,
+        retry_count: 0,
+        scheduled_at: ~U[2024-01-15 10:00:00Z]
+      }
+      result = inspect(job)
+      refute result =~ "scheduled_at"
+    end
+
+    test "IO.inspect returns the job unchanged" do
+      job = %Job{id: "j5", type: "noop", status: :pending, retry_count: 0}
+      # IO.inspect returns its argument — this verifies the Inspect protocol works
+      assert IO.inspect(job) == job
+    end
+  end
+
+  describe "Job.new/2" do
+    test "creates a job with a generated id" do
+      job = Job.new("send_email", %{to: "user@example.com"})
+      assert job.type == "send_email"
+      assert job.args == %{to: "user@example.com"}
+      assert is_binary(job.id)
+      assert String.length(job.id) > 0
+      assert job.status == :pending
+      assert job.retry_count == 0
+    end
+
+    test "two jobs have different ids" do
+      job1 = Job.new("noop")
+      job2 = Job.new("noop")
+      assert job1.id != job2.id
+    end
+  end
+
+  # Helper for testing IO.puts output
+  defp capture_io(fun) do
+    ExUnit.CaptureIO.capture_io(fun)
   end
 end
 ```
 
----
+### Step 3: Run the tests
 
-## Verification
-
-```elixir
-# Verificar String.Chars:
-money = Money.new(1099, "USD")
-to_string(money)           # "$ 10.99 USD"
-"Total: #{money}"          # "Total: $ 10.99 USD"
-
-# Verificar que Protocol.UndefinedError ya no ocurre:
-try do
-  "#{%{not: :implemented}}"
-rescue
-  Protocol.UndefinedError -> IO.puts("Error esperado para Map sin implementación")
-end
-
-# Verificar Inspect básico:
-IO.inspect(money)
-# #Money<$ 10.99 USD>
-
-# Verificar Inspect con opts:
-entries = Enum.map(1..10, fn i -> Money.new(i * 100, "EUR") end)
-IO.inspect(entries, limit: 3)
-# [#Money<€ 1.00 EUR>, #Money<€ 2.00 EUR>, #Money<€ 3.00 EUR>, ...]
-
-# Verificar Tree con pretty:
-tree = Enum.reduce([5, 3, 7], nil, &Tree.insert(&2, &1))
-IO.inspect(tree, pretty: true, width: 40)
-
-# Verificar LogEntry coloreado:
-IO.inspect(LogEntry.new(:error, "Disk full"), syntax_colors: [atom: :red])
+```bash
+mix test test/task_queue/protocol_impl_test.exs --trace
 ```
 
 ---
 
-## Summary
+## Trade-off analysis
 
-| Protocolo | Se invoca en | Devuelve | Propósito |
-|---|---|---|---|
-| `String.Chars` | `to_string/1`, `"#{}"`, `IO.puts` | `String.t()` | Representación legible para usuarios/logs |
-| `Inspect` | `inspect/2`, `IO.inspect`, iex REPL | `String.t()` o `Algebra.t()` | Representación para debugging |
+| Approach | String interpolation | Debug output | Hides sensitive fields | Location |
+|----------|---------------------|--------------|----------------------|----------|
+| `String.Chars` + `Inspect` | automatic via `#{}` | automatic via `inspect/1` | yes (Inspect) | protocol implementations |
+| Custom `to_string_job/1` function | must call explicitly | N/A | yes | module function |
+| Default struct inspect | N/A | yes but verbose | no — shows all fields | automatic |
+| `@derive [Inspect]` with except | N/A | yes, filtered | yes | module attribute |
 
-Reglas de oro:
-- `String.Chars` es para el usuario final o para serialización a texto.
-- `Inspect` es para el desarrollador que debuggea.
-- Usa `to_doc/2` dentro de `Inspect` para respetar `opts` en tipos anidados.
-- Usa `Inspect.Algebra` cuando el formato dependa del tamaño (pretty-printing).
-- Nunca asumas que los colores ANSI están disponibles: verifica `opts.syntax_colors`.
+Reflection question: `@derive [Inspect, except: [:args, :scheduled_at]]` would hide those fields automatically without a custom implementation. When would you write a full `defimpl Inspect` instead of using `@derive`?
 
 ---
 
-## What's Next
+## Common production mistakes
 
-- **33**: Access behaviour — acceso dinámico con `get_in/put_in`
-- **34**: Collectable e Enumerable — protocolos para colecciones personalizadas
-- Librería `Jason`: implementa `Jason.Encoder` (protocolo similar) para serialización JSON
-- `Kernel.inspect/2`: entender cómo iex usa el protocolo internamente
+**1. `String.Chars` returning a binary that includes secrets**
+
+If `args` contains API keys or passwords and your `to_string` includes all args, every log line in production leaks credentials. The `String.Chars` implementation should include only identifier fields.
+
+**2. Calling `to_string` in `defimpl Inspect`**
+
+The `Inspect` protocol expects a string formatted for developer inspection, not user display. Using `to_string(value)` inside `inspect/2` breaks `IO.inspect` formatting and `dbg` output:
+
+```elixir
+# Wrong — uses String.Chars in Inspect, loses developer context
+def inspect(job, _opts) do
+  to_string(job)
+end
+
+# Right — returns a developer-readable representation
+def inspect(job, opts) do
+  "#TaskQueue.Job<id: #{Kernel.inspect(job.id, opts)}, ...>"
+end
+```
+
+**3. Raising in `String.Chars` for nil fields**
+
+`to_string/1` is called in string interpolation inside `rescue` clauses and log handlers. If it raises, you lose the original error and see a confusing `Protocol.UndefinedError` or pattern match failure instead.
+
+**4. Not testing with `IO.inspect`**
+
+Your `Inspect` implementation must return the struct unchanged from `IO.inspect/2`. If `inspect/2` returns a string instead of an `Inspect.Algebra` document, `IO.inspect` may not return the original value:
+
+```elixir
+# Test that IO.inspect is identity on your struct
+assert IO.inspect(job) == job
+```
+
+**5. `@derive Inspect` with `:only` ignoring the `:id` field**
+
+If you use `@derive [Inspect, only: [:type, :status]]` and omit `:id`, debug output is ambiguous — you cannot distinguish two different jobs of the same type and status in IEx.
 
 ---
 
 ## Resources
 
-- [String.Chars docs](https://hexdocs.pm/elixir/String.Chars.html)
-- [Inspect protocol docs](https://hexdocs.pm/elixir/Inspect.html)
-- [Inspect.Algebra docs](https://hexdocs.pm/elixir/Inspect.Algebra.html)
-- [Inspect.Opts docs](https://hexdocs.pm/elixir/Inspect.Opts.html)
-- [Elixir Guide: Protocols](https://elixir-lang.org/getting-started/protocols.html)
+- [String.Chars protocol — official docs](https://hexdocs.pm/elixir/String.Chars.html)
+- [Inspect protocol — official docs](https://hexdocs.pm/elixir/Inspect.html)
+- [Inspect.Algebra — building custom inspect output](https://hexdocs.pm/elixir/Inspect.Algebra.html)
+- [Implementing protocols — Elixir official guide](https://elixir-lang.org/getting-started/protocols.html)

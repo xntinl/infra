@@ -1,597 +1,444 @@
-# Ejercicio 62: Axon — Redes Neuronales en Elixir
+# Axon — Neural Networks for Request Classification
 
-## Objetivo
-
-Construir, entrenar y evaluar redes neuronales con `Axon`: desde un clasificador
-simple hasta un custom training loop con gradient accumulation.
-
-## Conceptos Clave
-
-- `Axon.input/2`, `Axon.dense/3`, `Axon.relu/1`, `Axon.softmax/1`, `Axon.dropout/2`
-- `Axon.Loop.trainer/3`: orquesta optimizer, loss function y métricas
-- `Axon.Loop.run/3`: ejecuta el training loop sobre batches de datos
-- `Axon.serialize/1` / `Axon.deserialize/1`: persistencia de modelos
-- Transfer learning: `Axon.freeze/2` para congelar capas
-- Custom layers: `Axon.layer/3` para definir operaciones arbitrarias
+**Project**: `api_gateway` — built incrementally across the advanced level
 
 ---
 
-## Setup
+## Project context
+
+You're building `api_gateway`. The metrics analyzer (previous exercise) can detect
+anomalies statistically. Now the security team wants something smarter: classify
+incoming requests as `normal`, `suspicious`, or `abusive` based on a feature vector
+extracted from each request (rate, payload size, endpoint pattern, time-of-day).
+
+Project structure at this point:
+
+```
+api_gateway/
+├── lib/
+│   └── api_gateway/
+│       ├── ml/
+│       │   ├── feature_extractor.ex  # ← you implement this
+│       │   ├── classifier.ex         # ← and this
+│       │   └── training.ex           # ← and this
+├── test/
+│   └── api_gateway/
+│       └── ml_classifier_test.exs    # given tests — must pass without modification
+└── mix.exs
+```
+
+---
+
+## The business problem
+
+Statistical anomaly detection (z-score) triggers on any deviation from the mean —
+including legitimate traffic spikes during business hours. The security team wants a
+model trained on labeled examples of past attacks to distinguish malicious patterns
+from legitimate load. The model must be:
+
+1. Small enough to run inference in < 1ms per request
+2. Retrained periodically as new attack patterns emerge
+3. Serializable — the trained model persists across gateway restarts
+
+This is a classification problem with a fixed 8-feature input and 3-class output.
+A two-layer dense network is sufficient — no need for transformers or CNNs.
+
+---
+
+## Why Axon over raw Nx
+
+Raw Nx gives you tensors and `defn`. Building a neural network with raw Nx means:
+implementing weight initialization, forward pass, loss functions, optimizer state,
+gradient computation, training loop, and serialization manually. Axon provides all
+of these. The difference is not convenience — it is correctness. Weight initialization
+strategies (Glorot, He) and optimizers (Adam momentum terms) have subtle numerical
+properties that are easy to get wrong from scratch.
+
+Axon's `%Axon{}` struct is a description of the computation graph — not a running
+process. `Axon.build/2` compiles it to init/predict functions. `Axon.Loop.trainer/3`
+constructs the training loop. This separation makes the model definition readable and
+the training logic independent.
+
+---
+
+## How `Axon.freeze/1` works
+
+`Axon.freeze/1` marks layers so that their parameters are excluded from gradient
+computation. Mathematically, it inserts a `stop_gradient` operation at the boundary —
+gradients flow forward (for inference) but not backward through frozen layers (for
+training). This is equivalent to TensorFlow's `trainable=False` or PyTorch's
+`requires_grad=False`.
+
+---
+
+## Implementation
+
+### Step 1: `mix.exs`
 
 ```elixir
-# mix.exs
 defp deps do
   [
+    # existing deps...
     {:nx,   "~> 0.7"},
     {:axon, "~> 0.6"},
-    {:exla, "~> 0.7"}   # aceleración CPU/GPU
+    {:exla, "~> 0.7", only: [:dev, :prod]}
   ]
 end
 ```
 
-```elixir
-# config/config.exs
-config :nx, default_backend: EXLA.Backend
-```
-
----
-
-## Conceptos Previos: Anatomía de un Modelo Axon
-
-En Axon, un modelo es un `%Axon{}` struct que describe el grafo computacional.
-No es un proceso — es una descripción que se compila cuando se entrena o se predice.
-
-```
-Input → Dense(128) → ReLU → Dropout(0.5) → Dense(10) → Softmax
-  ↑                                                         ↑
-{nil, 784}                                             {nil, 10}
-(batch, features)                                  (batch, clases)
-```
-
-- `nil` en el shape indica dimensión dinámica (el batch size varía)
-- Axon infiere shapes automáticamente propagando a través del grafo
-- `Axon.Loop.trainer` construye el training loop con optimizer y loss
-
----
-
-## Parte 1: Conceptos de Capas
+### Step 2: `lib/api_gateway/ml/feature_extractor.ex`
 
 ```elixir
-# Dense: y = activation(xW + b)
-Axon.dense(3, activation: :relu)   # 3 unidades de salida
-Axon.dense(10)                     # sin activación (lineal)
+defmodule ApiGateway.ML.FeatureExtractor do
+  @moduledoc """
+  Converts raw request metadata into a normalized 8-element feature vector.
 
-# Activaciones independientes
-Axon.relu(x)
-Axon.sigmoid(x)
-Axon.softmax(x)                    # para clasificación multiclase
-Axon.tanh(x)
+  Features (all normalized to [0, 1] or z-scored):
+    0: requests_per_minute / 1000  (rate, normalized)
+    1: payload_bytes / 65536       (size, normalized)
+    2: unique_endpoints / 100      (diversity)
+    3: error_rate                  (fraction of 4xx/5xx)
+    4: hour_of_day / 24            (time pattern)
+    5: is_weekend (0.0 or 1.0)
+    6: p99_latency_ms / 10_000     (normalized)
+    7: burst_score                 (stddev of per-second counts, normalized)
+  """
 
-# Regularización
-Axon.dropout(x, rate: 0.5)        # desactiva 50% en training, off en inference
+  @feature_count 8
 
-# Normalización
-Axon.batch_norm(x)
+  @doc "Extracts and returns an Nx tensor of shape {1, 8} from a request stats map."
+  @spec extract(%{
+    requests_per_minute: number(),
+    payload_bytes: number(),
+    unique_endpoints: number(),
+    error_rate: float(),
+    hour_of_day: integer(),
+    is_weekend: boolean(),
+    p99_latency_ms: number(),
+    burst_score: number()
+  }) :: Nx.Tensor.t()
+  def extract(stats) do
+    features = [
+      min(stats.requests_per_minute / 1_000.0, 1.0),
+      min(stats.payload_bytes / 65_536.0, 1.0),
+      min(stats.unique_endpoints / 100.0, 1.0),
+      stats.error_rate,
+      stats.hour_of_day / 24.0,
+      if(stats.is_weekend, do: 1.0, else: 0.0),
+      min(stats.p99_latency_ms / 10_000.0, 1.0),
+      min(stats.burst_score, 1.0)
+    ]
 
-# Inspeccionar el modelo (sin datos aún)
-Axon.Display.as_table(model, Nx.template({1, 784}, :f32))
-```
+    Nx.tensor([features], type: :f32)
+  end
 
----
-
-## Parte 2: Optimizadores y Funciones de Loss
-
-```elixir
-# Optimizadores (de Polaris, incluido con Axon)
-optimizer = Axon.Optimizers.adam(0.001)
-optimizer = Axon.Optimizers.sgd(0.01, momentum: 0.9)
-optimizer = Axon.Optimizers.rmsprop(0.001)
-
-# Loss functions
-loss = :categorical_cross_entropy   # clasificación multiclase (con softmax)
-loss = :binary_cross_entropy        # clasificación binaria (con sigmoid)
-loss = :mean_squared_error          # regresión
-loss = :mean_absolute_error         # regresión robusta a outliers
-
-# Loss customizada
-custom_loss = fn y_pred, y_true ->
-  Nx.mean(Nx.power(y_pred - y_true, 2)) * 0.5
+  def feature_count, do: @feature_count
 end
 ```
 
----
-
-## Ejercicio 1: Clasificador MNIST
-
-**Contexto**: MNIST tiene 60.000 imágenes de dígitos escritos a mano (28×28 px,
-grayscale). La tarea es clasificar cada imagen en una de 10 clases (0-9).
-
-**Tu tarea**: Completa el módulo `MnistClassifier`.
+### Step 3: `lib/api_gateway/ml/classifier.ex`
 
 ```elixir
-defmodule MnistClassifier do
-  @doc """
-  Define la arquitectura del modelo.
-  Input: imágenes aplanadas de 784 píxeles.
-  Output: probabilidades sobre 10 clases.
+defmodule ApiGateway.ML.Classifier do
+  @moduledoc """
+  Neural network classifier for request patterns.
+
+  Architecture: Dense(16, relu) → Dropout(0.3) → Dense(8, relu) → Dense(3, softmax)
+  Output classes: 0=normal, 1=suspicious, 2=abusive
   """
-  def build_model do
-    # TODO: Axon.input con shape {nil, 784} y name "images"
-    # TODO: Dense(128) con relu
-    # TODO: Dropout(0.5) para regularización
-    # TODO: Dense(64) con relu
-    # TODO: Dense(10) con softmax
+
+  alias ApiGateway.ML.FeatureExtractor
+
+  @model_path "priv/ml/classifier.axon"
+  @classes [:normal, :suspicious, :abusive]
+
+  @doc """
+  Builds and returns the model architecture. Does not initialize weights.
+  """
+  def build do
+    # TODO: build the network with Axon
+    # Input: shape {nil, 8} (batch x features), name "request_features"
+    # Dense(16) with relu activation
+    # Dropout(rate: 0.3)
+    # Dense(8) with relu activation
+    # Dense(3) with softmax activation (3 output classes)
+    # Return the Axon model
   end
 
   @doc """
-  Configura y devuelve el training loop.
+  Classifies a request stats map. Returns `{class_atom, confidence_float}`.
+  Loads the saved model state from disk. Raises if model not trained yet.
   """
-  def build_loop(model) do
-    # TODO: crear loop con Axon.Loop.trainer/3
-    #   - model: el modelo de build_model/0
+  def classify(stats) do
+    model = build()
+    model_state = load_state!()
+    features = FeatureExtractor.extract(stats)
+
+    predictions = Axon.predict(model, model_state, %{"request_features" => features})
+    # predictions shape: {1, 3}
+    class_idx = predictions[0] |> Nx.argmax() |> Nx.to_number()
+    confidence = predictions[0][class_idx] |> Nx.to_number()
+
+    {Enum.at(@classes, class_idx), confidence}
+  end
+
+  @doc """
+  Saves the model state to disk.
+  """
+  def save_state(model, state) do
+    File.mkdir_p!(Path.dirname(@model_path))
+    serialized = Axon.serialize(model, state)
+    File.write!(@model_path, serialized)
+    :ok
+  end
+
+  @doc """
+  Loads the model state from disk. Returns `{model, state}`.
+  """
+  def load_state! do
+    @model_path
+    |> File.read!()
+    |> Axon.deserialize()
+    |> elem(1)
+  end
+
+  def classes, do: @classes
+end
+```
+
+### Step 4: `lib/api_gateway/ml/training.ex`
+
+```elixir
+defmodule ApiGateway.ML.Training do
+  @moduledoc """
+  Training pipeline for the request classifier.
+
+  The training data comes from labeled historical request logs.
+  Labels: 0=normal, 1=suspicious, 2=abusive (one-hot encoded).
+  """
+
+  alias ApiGateway.ML.{Classifier, FeatureExtractor}
+
+  @doc """
+  Trains the classifier on labeled examples and saves the model.
+
+  `data` is a list of `{stats_map, label_integer}` tuples.
+  `label_integer` is 0, 1, or 2.
+
+  Returns `{model, model_state}`.
+  """
+  def train(data, opts \\ []) do
+    epochs        = Keyword.get(opts, :epochs, 20)
+    learning_rate = Keyword.get(opts, :learning_rate, 0.001)
+    batch_size    = Keyword.get(opts, :batch_size, 32)
+
+    model = Classifier.build()
+
+    # TODO: convert data list to batches:
+    #   - For each {stats_map, label} pair: extract features tensor, one-hot encode label
+    #   - Group into batches of batch_size
+    #   - Each batch is %{"request_features" => {batch, 8} tensor, "labels" => {batch, 3} tensor}
+
+    # TODO: build a training loop with Axon.Loop.trainer/3:
     #   - loss: :categorical_cross_entropy
-    #   - optimizer: adam con lr 0.001
-    # TODO: agregar métrica de accuracy con Axon.Loop.metric/3
-    # TODO: devolver el loop configurado
+    #   - optimizer: Axon.Optimizers.adam(learning_rate)
+    # TODO: add :accuracy metric with Axon.Loop.metric/3
+    # TODO: run with Axon.Loop.run/4, epochs: epochs
+    # TODO: save model with Classifier.save_state/2
+    # TODO: return {model, model_state}
   end
 
   @doc """
-  Entrena el modelo y devuelve {model_state, history}.
-  data debe ser un stream de {%{"images" => x, "labels" => y}}.
-  """
-  def train(model, loop, data, epochs \\ 10) do
-    # TODO: usar Axon.Loop.run/4 con epochs: epochs
-    # TODO: capturar y devolver el estado entrenado
-  end
+  Generates synthetic labeled training data for testing.
 
-  @doc """
-  Evalúa accuracy sobre un batch de test.
-  Devuelve accuracy como float entre 0.0 y 1.0.
+  In production this comes from labeled incident logs.
   """
-  def evaluate(model, model_state, x_test, y_test) do
-    # TODO: obtener predicciones con Axon.predict/4
-    # TODO: y_pred tiene shape {batch, 10}: tomar argmax de axis 1
-    # TODO: y_test también debe convertirse a labels (argmax si one-hot)
-    # TODO: calcular fracción correctas
+  def synthetic_data(n \\ 1_000) do
+    Enum.map(1..n, fn _ ->
+      label = :rand.uniform(3) - 1
+
+      stats =
+        case label do
+          0 ->
+            # Normal traffic profile
+            %{
+              requests_per_minute: 10 + :rand.uniform(50),
+              payload_bytes: 100 + :rand.uniform(500),
+              unique_endpoints: 1 + :rand.uniform(10),
+              error_rate: :rand.uniform() * 0.05,
+              hour_of_day: :rand.uniform(24) - 1,
+              is_weekend: :rand.uniform(2) == 1,
+              p99_latency_ms: 50 + :rand.uniform(100),
+              burst_score: :rand.uniform() * 0.1
+            }
+
+          1 ->
+            # Suspicious — elevated rate, some errors
+            %{
+              requests_per_minute: 200 + :rand.uniform(300),
+              payload_bytes: 100 + :rand.uniform(2000),
+              unique_endpoints: 5 + :rand.uniform(20),
+              error_rate: 0.1 + :rand.uniform() * 0.2,
+              hour_of_day: :rand.uniform(24) - 1,
+              is_weekend: :rand.uniform(2) == 1,
+              p99_latency_ms: 200 + :rand.uniform(500),
+              burst_score: 0.3 + :rand.uniform() * 0.3
+            }
+
+          2 ->
+            # Abusive — very high rate, high errors, tight burst
+            %{
+              requests_per_minute: 800 + :rand.uniform(200),
+              payload_bytes: 500 + :rand.uniform(10_000),
+              unique_endpoints: 1 + :rand.uniform(3),
+              error_rate: 0.4 + :rand.uniform() * 0.5,
+              hour_of_day: :rand.uniform(24) - 1,
+              is_weekend: false,
+              p99_latency_ms: 1_000 + :rand.uniform(5_000),
+              burst_score: 0.7 + :rand.uniform() * 0.3
+            }
+        end
+
+      {stats, label}
+    end)
   end
 end
 ```
 
-**Preparar datos** (sin descargar MNIST real, usamos datos sintéticos para el ejercicio):
+### Step 5: Given tests — must pass without modification
 
 ```elixir
-defmodule MnistData do
-  @doc """
-  Genera datos sintéticos con la misma forma que MNIST.
-  En producción usarías Scidata.MNIST o similar.
-  """
-  def synthetic_dataset(n_samples) do
-    x = Nx.random_uniform({n_samples, 784}, 0.0, 1.0, type: :f32)
-    # Labels one-hot: {n_samples, 10}
-    labels = Enum.map(1..n_samples, fn _ -> :rand.uniform(10) - 1 end)
-    y = Nx.tensor(labels) |> one_hot(num_classes: 10)
-    {x, y}
-  end
+# test/api_gateway/ml_classifier_test.exs
+defmodule ApiGateway.ML.ClassifierTest do
+  use ExUnit.Case, async: true
 
-  defp one_hot(labels, num_classes: n) do
-    # Convierte [0,3,7,...] a [[1,0,...,0],[0,0,0,1,...],...]
-    batch = Nx.size(labels)
-    eye   = Nx.eye(n, type: :f32)
-    Nx.take(eye, labels)
-    |> Nx.reshape({batch, n})
-  end
+  alias ApiGateway.ML.{Classifier, FeatureExtractor, Training}
 
-  @doc """
-  Convierte tensores x,y a stream de batches para Axon.Loop.
-  """
-  def to_batches(x, y, batch_size \\ 32) do
-    n = Nx.axis_size(x, 0)
-    Enum.map(Enum.chunk_every(0..(n-1), batch_size), fn idx ->
-      batch_idx = Nx.tensor(idx)
-      %{
-        "images" => Nx.take(x, batch_idx),
-        "labels" => Nx.take(y, batch_idx)
+  describe "FeatureExtractor.extract/1" do
+    test "returns tensor of shape {1, 8}" do
+      stats = %{
+        requests_per_minute: 100,
+        payload_bytes: 1024,
+        unique_endpoints: 5,
+        error_rate: 0.01,
+        hour_of_day: 14,
+        is_weekend: false,
+        p99_latency_ms: 200,
+        burst_score: 0.1
       }
-    end)
+      tensor = FeatureExtractor.extract(stats)
+      assert Nx.shape(tensor) == {1, 8}
+      assert Nx.type(tensor) == {:f, 32}
+    end
+
+    test "all features are in [0, 1]" do
+      stats = %{
+        requests_per_minute: 100_000,
+        payload_bytes: 999_999,
+        unique_endpoints: 99_999,
+        error_rate: 1.0,
+        hour_of_day: 23,
+        is_weekend: true,
+        p99_latency_ms: 999_999,
+        burst_score: 999_999
+      }
+      tensor = FeatureExtractor.extract(stats)
+      values = Nx.to_flat_list(tensor)
+      assert Enum.all?(values, fn v -> v >= 0.0 and v <= 1.0 end)
+    end
+  end
+
+  describe "Classifier.build/0" do
+    test "returns an Axon model" do
+      model = Classifier.build()
+      assert %Axon{} = model
+    end
+  end
+
+  describe "Training.train/2" do
+    test "trains and returns a model state that classifies all three classes" do
+      data = Training.synthetic_data(300)
+      {model, state} = Training.train(data, epochs: 3, batch_size: 32)
+
+      # Verify the model can classify a normal request
+      normal_stats = %{
+        requests_per_minute: 20,
+        payload_bytes: 256,
+        unique_endpoints: 3,
+        error_rate: 0.01,
+        hour_of_day: 10,
+        is_weekend: false,
+        p99_latency_ms: 80,
+        burst_score: 0.05
+      }
+
+      features = FeatureExtractor.extract(normal_stats)
+      predictions = Axon.predict(model, state, %{"request_features" => features})
+      assert Nx.shape(predictions) == {1, 3}
+
+      # All three output probabilities must sum to ~1.0 (softmax)
+      sum = predictions[0] |> Nx.sum() |> Nx.to_number()
+      assert_in_delta sum, 1.0, 0.001
+    end
   end
 end
 ```
 
-**Uso esperado**:
+### Step 6: Run the tests
 
-```elixir
-{x_train, y_train} = MnistData.synthetic_dataset(5000)
-{x_test,  y_test}  = MnistData.synthetic_dataset(1000)
-
-model  = MnistClassifier.build_model()
-loop   = MnistClassifier.build_loop(model)
-train_data = MnistData.to_batches(x_train, y_train)
-
-{model_state, _} = MnistClassifier.train(model, loop, train_data, 5)
-
-acc = MnistClassifier.evaluate(model, model_state, x_test, y_test)
-IO.puts("Test accuracy: #{Float.round(acc * 100, 2)}%")
-# Con datos sintéticos (aleatorios) → ~10% (aleatorio)
-# Con MNIST real → >97% después de 10 epochs
+```bash
+mix test test/api_gateway/ml_classifier_test.exs --trace
 ```
 
 ---
 
-## Ejercicio 2: Transfer Learning — Congelar Capas
+## Trade-off analysis
 
-**Contexto**: Transfer learning = tomar un modelo preentrenado, congelar sus
-capas (no actualizar sus pesos) y añadir nuevas capas que sí se entrenan.
-Útil cuando tienes pocos datos propios pero existe un modelo preentrenado en
-un dominio similar.
+| Aspect | Axon neural network | Statistical z-score | Rule-based |
+|--------|---------------------|---------------------|------------|
+| Handles novel patterns | After retraining | No | No |
+| Interpretability | Low (black box) | High | High |
+| Training data required | Yes (labeled) | No | No |
+| Inference latency | <1ms (dense, small) | <0.1ms | <0.01ms |
+| False positives | Tunable via threshold | High on traffic spikes | Binary |
+| Maintenance | Retrain on new attacks | Adjust threshold | Update rules |
 
-```elixir
-defmodule TransferLearning do
-  @doc """
-  Simula un modelo "preentrenado" con pesos inicializados.
-  En producción cargarías desde disco con Axon.deserialize/1.
-  """
-  def load_pretrained do
-    model =
-      Axon.input("features", shape: {nil, 256})
-      |> Axon.dense(128, activation: :relu, name: "pretrained_dense_1")
-      |> Axon.dense(64, activation: :relu, name: "pretrained_dense_2")
-
-    # Simular pesos "preentrenados"
-    {init_fn, _predict_fn} = Axon.build(model)
-    params = init_fn.(Nx.template({1, 256}, :f32), %{})
-
-    {model, params}
-  end
-
-  @doc """
-  Construye modelo con transfer learning:
-  1. Toma el backbone preentrenado
-  2. Congela todas sus capas
-  3. Añade nueva cabeza de clasificación para 5 clases
-
-  Devuelve {full_model, frozen_params}.
-  """
-  def build_transfer_model(backbone, pretrained_params) do
-    # TODO: congelar el backbone con Axon.freeze/1
-    #   Axon.freeze/1 acepta el modelo y devuelve modelo con capas congeladas
-
-    # TODO: añadir nueva cabeza sobre el backbone congelado:
-    #   - Dense(32) con relu
-    #   - Dense(5) con softmax (5 clases nuevas)
-
-    # TODO: devolver {full_model, pretrained_params}
-    # Nota: los params del backbone se pasan como params iniciales.
-    #   Axon.Loop.trainer los respeta y no los actualiza en las capas congeladas.
-  end
-
-  @doc """
-  Entrena solo la cabeza nueva, manteniendo el backbone congelado.
-  Devuelve model_state entrenado.
-  """
-  def fine_tune(model, initial_params, data, epochs \\ 5) do
-    # TODO: configurar loop con Axon.Loop.trainer
-    # TODO: pasar initial_params a Axon.Loop.run como params iniciales
-    #   Axon.Loop.run(loop, data, initial_params, epochs: epochs)
-  end
-end
-```
-
-**Lo que demuestras**: con `Axon.freeze`, solo las capas de la "cabeza" reciben
-gradientes — el backbone mantiene sus pesos intactos.
+Reflection question: the `Dropout` layer in `Classifier.build/0` deactivates neurons
+randomly during training. What does `Axon.predict/4` do with the dropout layer by default
+during inference? What argument would change this behavior?
 
 ---
 
-## Ejercicio 3: Custom Training Loop con Gradient Accumulation
+## Common production mistakes
 
-**Contexto**: Cuando el batch es demasiado grande para caber en memoria,
-gradient accumulation divide el batch en micro-batches, acumula gradientes
-de cada uno y aplica el update una sola vez. Equivale matemáticamente a
-un batch completo.
+**1. Using `Axon.Loop.run/4` return value incorrectly**
+`Axon.Loop.run/4` returns the model state directly (not `{model, state}`). The model
+definition is separate from the state. You need both to call `Axon.predict/4`.
 
-```elixir
-defmodule CustomTrainer do
-  import Nx.Defn
+**2. Not seeding randomness in tests**
+Synthetic training data with `:rand.uniform()` produces different results each run.
+Tests that check accuracy after training may pass or fail non-deterministically.
+Use `Nx.Random` with an explicit key in test fixtures.
 
-  @doc """
-  Un paso de forward + backward sobre un micro-batch.
-  Devuelve {loss, gradients}.
-  """
-  defn compute_gradients(model_predict_fn, params, x, y_true) do
-    # TODO: usar Nx.Defn.value_and_grad/2 para obtener loss y grads en un paso
-    # value_and_grad calcula tanto el valor como el gradiente de una función
-    Nx.Defn.value_and_grad(params, fn p ->
-      y_pred = model_predict_fn.(p, x)
-      categorical_cross_entropy(y_pred, y_true)
-    end)
-  end
+**3. Saving state without the model**
+`Axon.serialize/2` takes both model and state. `Axon.deserialize/1` returns `{model, state}`.
+If you serialize only the state and lose the model definition, you cannot deserialize.
 
-  defn categorical_cross_entropy(y_pred, y_true) do
-    # TODO: implementar -mean(sum(y_true * log(y_pred + epsilon), axis: 1))
-    # epsilon = 1.0e-7 para estabilidad numérica
-  end
+**4. Training in the request path**
+`Axon.Loop.run/4` is synchronous and CPU/GPU intensive. Never call it in a request
+handler. Train in a background task or scheduled job, then swap the loaded model state
+atomically (e.g., via an Agent).
 
-  @doc """
-  Acumula gradientes sobre `accumulation_steps` micro-batches
-  y aplica el update una sola vez.
-
-  Simula un effective_batch_size = batch_size * accumulation_steps.
-  """
-  def accumulate_and_update(model, params, optimizer_state, micro_batches, optimizer) do
-    # TODO: inicializar grads acumulados con Nx.zeros_like(params)
-    # TODO: para cada micro-batch: llamar compute_gradients y sumar al acumulado
-    # TODO: promediar grads dividiendo por número de micro-batches
-    # TODO: aplicar optimizer update: optimizer.update(grads_avg, optimizer_state, params)
-    # TODO: devolver {new_params, new_optimizer_state, avg_loss}
-  end
-
-  @doc """
-  Training loop manual completo con gradient accumulation.
-  """
-  def train(model, data, opts \\ []) do
-    epochs             = Keyword.get(opts, :epochs, 10)
-    accumulation_steps = Keyword.get(opts, :accumulation_steps, 4)
-    learning_rate      = Keyword.get(opts, :learning_rate, 0.001)
-
-    # TODO: inicializar params con Axon.build
-    # TODO: inicializar optimizer (adam)
-    # TODO: dividir data en chunks de accumulation_steps
-    # TODO: loop principal: para cada chunk de micro-batches:
-    #   - llamar accumulate_and_update/5
-    #   - loggear loss cada N pasos
-    # TODO: devolver params finales
-  end
-end
-```
-
-**Lo que demuestras vs Axon.Loop.trainer**:
-
-| Aspecto                    | `Axon.Loop.trainer`     | Custom Loop              |
-|----------------------------|-------------------------|--------------------------|
-| Simplicidad                | Alta                    | Media                    |
-| Control sobre gradientes   | Limitado                | Total                    |
-| Gradient accumulation      | No incluido             | Implementable            |
-| Gradient clipping manual   | Posible con callbacks   | Directo                  |
-| Mixed precision custom     | Difícil                 | Controlado               |
+**5. One-hot encoding mismatch**
+`Axon.Loop.trainer/3` with `:categorical_cross_entropy` expects one-hot encoded labels
+`{batch, num_classes}`. Passing integer class indices `{batch}` produces wrong gradients
+silently — the loss decreases but the model does not learn.
 
 ---
 
-## Solución de Referencia
+## Resources
 
-<details>
-<summary>Ver solución (intenta resolver primero)</summary>
-
-### Ejercicio 1
-
-```elixir
-defmodule MnistClassifier do
-  def build_model do
-    Axon.input("images", shape: {nil, 784})
-    |> Axon.dense(128, activation: :relu)
-    |> Axon.dropout(rate: 0.5)
-    |> Axon.dense(64, activation: :relu)
-    |> Axon.dense(10, activation: :softmax)
-  end
-
-  def build_loop(model) do
-    model
-    |> Axon.Loop.trainer(:categorical_cross_entropy, Axon.Optimizers.adam(0.001))
-    |> Axon.Loop.metric(:accuracy)
-  end
-
-  def train(model, loop, data, epochs \\ 10) do
-    Axon.Loop.run(loop, data, %{}, epochs: epochs)
-  end
-
-  def evaluate(model, model_state, x_test, y_test) do
-    y_pred   = Axon.predict(model, model_state, %{"images" => x_test})
-    pred_cls = Nx.argmax(y_pred, axis: 1)
-
-    # Si y_test es one-hot, convertir a labels
-    true_cls =
-      if Nx.rank(y_test) == 2,
-        do: Nx.argmax(y_test, axis: 1),
-        else: y_test
-
-    correct = Nx.sum(Nx.equal(pred_cls, true_cls)) |> Nx.to_number()
-    total   = Nx.axis_size(x_test, 0)
-    correct / total
-  end
-end
-```
-
-### Ejercicio 2
-
-```elixir
-defmodule TransferLearning do
-  def load_pretrained do
-    model =
-      Axon.input("features", shape: {nil, 256})
-      |> Axon.dense(128, activation: :relu, name: "pretrained_dense_1")
-      |> Axon.dense(64,  activation: :relu, name: "pretrained_dense_2")
-
-    {init_fn, _} = Axon.build(model)
-    params = init_fn.(Nx.template({1, 256}, :f32), %{})
-    {model, params}
-  end
-
-  def build_transfer_model(backbone, pretrained_params) do
-    full_model =
-      backbone
-      |> Axon.freeze()
-      |> Axon.dense(32, activation: :relu, name: "head_dense")
-      |> Axon.dense(5,  activation: :softmax, name: "head_output")
-
-    {full_model, pretrained_params}
-  end
-
-  def fine_tune(model, initial_params, data, epochs \\ 5) do
-    loop =
-      model
-      |> Axon.Loop.trainer(:categorical_cross_entropy, Axon.Optimizers.adam(0.0001))
-      |> Axon.Loop.metric(:accuracy)
-
-    # Pasamos los params preentrenados como estado inicial
-    Axon.Loop.run(loop, data, initial_params, epochs: epochs)
-  end
-end
-```
-
-### Ejercicio 3
-
-```elixir
-defmodule CustomTrainer do
-  import Nx.Defn
-
-  defn compute_gradients(model_predict_fn, params, x, y_true) do
-    Nx.Defn.value_and_grad(params, fn p ->
-      y_pred = model_predict_fn.(p, x)
-      categorical_cross_entropy(y_pred, y_true)
-    end)
-  end
-
-  defn categorical_cross_entropy(y_pred, y_true) do
-    eps = Nx.tensor(1.0e-7, type: :f32)
-    -Nx.mean(Nx.sum(y_true * Nx.log(y_pred + eps), axes: [1]))
-  end
-
-  def accumulate_and_update(predict_fn, params, optimizer_state, micro_batches, optimizer) do
-    n_micro = length(micro_batches)
-
-    {accumulated_grads, total_loss} =
-      Enum.reduce(micro_batches, {nil, 0.0}, fn {x, y}, {acc_grads, acc_loss} ->
-        {loss, grads} = compute_gradients(predict_fn, params, x, y)
-        loss_val = Nx.to_number(loss)
-
-        new_acc =
-          if acc_grads == nil,
-            do: grads,
-            else: deep_add(acc_grads, grads)
-
-        {new_acc, acc_loss + loss_val}
-      end)
-
-    avg_grads = deep_scale(accumulated_grads, 1.0 / n_micro)
-    avg_loss  = total_loss / n_micro
-
-    {updates, new_opt_state} = optimizer.update.(avg_grads, optimizer_state, params)
-    new_params = Axon.Updates.apply_updates(params, updates)
-
-    {new_params, new_opt_state, avg_loss}
-  end
-
-  # Suma recursiva de nested maps de tensores
-  defp deep_add(a, b) when is_map(a) do
-    Map.merge(a, b, fn _k, va, vb -> deep_add(va, vb) end)
-  end
-  defp deep_add(a, b), do: Nx.add(a, b)
-
-  defp deep_scale(grads, factor) when is_map(grads) do
-    Map.new(grads, fn {k, v} -> {k, deep_scale(v, factor)} end)
-  end
-  defp deep_scale(tensor, factor), do: Nx.multiply(tensor, factor)
-
-  def train(model, data, opts \\ []) do
-    epochs             = Keyword.get(opts, :epochs, 10)
-    accumulation_steps = Keyword.get(opts, :accumulation_steps, 4)
-    learning_rate      = Keyword.get(opts, :learning_rate, 0.001)
-
-    {init_fn, predict_fn} = Axon.build(model, mode: :train)
-    params = init_fn.(Nx.template({1, 784}, :f32), %{})
-
-    {optimizer_init, _optimizer_update} = Axon.Optimizers.adam(learning_rate)
-    opt_state = optimizer_init.(params)
-    optimizer = %{update: fn g, s, p -> Axon.Optimizers.adam(learning_rate) |> elem(1).(g, s, p) end}
-
-    Enum.reduce(1..epochs, {params, opt_state}, fn epoch, {p, os} ->
-      chunks = Enum.chunk_every(data, accumulation_steps)
-
-      {final_p, final_os} =
-        Enum.reduce(chunks, {p, os}, fn chunk, {cp, cos} ->
-          {new_p, new_os, loss} =
-            accumulate_and_update(predict_fn, cp, cos, chunk, optimizer)
-          IO.puts("epoch #{epoch} | loss: #{Float.round(loss, 4)}")
-          {new_p, new_os}
-        end)
-
-      {final_p, final_os}
-    end)
-    |> elem(0)
-  end
-end
-```
-
-</details>
-
----
-
-## Serializar y Cargar Modelos
-
-```elixir
-# Serializar (guardar)
-model_state = Axon.Loop.run(loop, data, %{}, epochs: 10)
-
-serialized = Axon.serialize(model, model_state)
-File.write!("mnist_model.axon", serialized)
-
-# Deserializar (cargar)
-{model, loaded_state} =
-  File.read!("mnist_model.axon")
-  |> Axon.deserialize()
-
-# Inferencia con modelo cargado
-Axon.predict(model, loaded_state, %{"images" => x_new})
-```
-
----
-
-## Custom Layer con Axon.layer
-
-```elixir
-# Capa personalizada: Scaled Dot-Product Attention simplificada
-defmodule Layers do
-  import Nx.Defn
-
-  defn scaled_dot_attention(query, key, value) do
-    d_k    = Nx.axis_size(query, -1) |> Nx.as_type(:f32)
-    scores = Nx.dot(query, Nx.transpose(key)) / Nx.sqrt(d_k)
-    weights = Nx.exp(scores) / Nx.sum(Nx.exp(scores), axes: [-1], keep_axes: true)
-    Nx.dot(weights, value)
-  end
-
-  def attention_layer(query, key, value) do
-    Axon.layer(
-      &scaled_dot_attention/4,   # función con arity = inputs + 1 (opts)
-      [query, key, value],
-      name: "scaled_dot_attention"
-    )
-  end
-end
-```
-
----
-
-## Preguntas de Reflexión
-
-1. ¿Por qué `Axon.dropout` se desactiva automáticamente durante inference?
-   ¿Cómo sabe Axon si está en modo `:train` o `:inference`?
-
-2. `Axon.freeze/1` evita que los gradientes fluyan hacia atrás a través de
-   las capas congeladas. ¿Qué operación matemática hace esto? ¿Es equivalente
-   a `stop_gradient` en TensorFlow/JAX?
-
-3. En gradient accumulation, dividimos los gradientes acumulados por el número
-   de micro-batches. ¿Es esto matemáticamente equivalente al gradiente de la
-   loss sobre el batch completo? ¿Bajo qué condiciones?
-
-4. ¿Qué ventaja tiene usar `Nx.Defn.value_and_grad/2` respecto a calcular
-   la loss y los gradientes en dos llamadas separadas?
-
----
-
-## Recursos
-
-- [Axon HexDocs](https://hexdocs.pm/axon/Axon.html)
-- [Axon.Loop — Training Loops](https://hexdocs.pm/axon/Axon.Loop.html)
-- [Axon GitHub examples](https://github.com/elixir-nx/axon/tree/main/examples)
-- [Bumblebee — modelos preentrenados Hugging Face en Elixir](https://hexdocs.pm/bumblebee)
-- [Sean Moriarity — Machine Learning in Elixir (PragProg)](https://pragprog.com/titles/smelixir/machine-learning-in-elixir/)
+- [Axon HexDocs](https://hexdocs.pm/axon/Axon.html) — layers, build, predict
+- [Axon.Loop](https://hexdocs.pm/axon/Axon.Loop.html) — trainer, metric, run
+- [Bumblebee](https://hexdocs.pm/bumblebee) — pre-trained Hugging Face models in Elixir
+- [Machine Learning in Elixir — Sean Moriarity](https://pragprog.com/titles/smelixir/machine-learning-in-elixir/)

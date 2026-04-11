@@ -1,370 +1,566 @@
-# 44 — Build a Job Scheduler (Capstone)
+# Job Scheduler with Cron, Retry, and Backoff
 
-**Difficulty**: Avanzado  
-**Tiempo estimado**: 6-8 horas  
-**Área**: GenServer · Cron · Task.Supervisor · Backoff · Concurrencia
+**Project**: `api_gateway` — built incrementally across the advanced level
 
 ---
 
-## Contexto
+## Project context
 
-Un scheduler de jobs es el corazón de cualquier sistema backend serio. Debe ejecutar tareas
-periódicas (tipo cron), gestionar fallos con reintentos inteligentes, evitar que un job lento
-bloquee a otros y proporcionar visibilidad del historial de ejecuciones. Construirás uno desde
-cero, sin Quantum ni Oban, usando solo el runtime de Erlang/Elixir.
+You're building `api_gateway`, an internal HTTP gateway. The cache layer is in place
+(previous exercise). The infrastructure team now needs scheduled maintenance tasks:
+purge stale rate-limiter entries, refresh upstream service configs, and send hourly
+health digests. You need a job scheduler — without Oban or Quantum, using only the
+BEAM runtime.
+
+Project structure at this point:
+
+```
+api_gateway/
+├── lib/
+│   └── api_gateway/
+│       ├── application.ex              # already exists — supervises Scheduler
+│       └── scheduler/
+│           ├── server.ex               # ← you implement this
+│           ├── job.ex                  # ← and this
+│           ├── cron_parser.ex          # ← and this
+│           └── backoff.ex              # ← and this
+├── test/
+│   └── api_gateway/
+│       └── scheduler/
+│           ├── server_test.exs         # given tests — must pass without modification
+│           └── cron_parser_test.exs    # given tests — must pass without modification
+└── mix.exs
+```
 
 ---
 
-## Arquitectura propuesta
+## The business problem
+
+The infra team needs three recurring tasks:
+
+1. Every 60 seconds: purge expired rate-limiter entries from ETS
+2. Every 5 minutes: fetch the current list of upstream service URLs from Consul
+3. `0 * * * *` (every hour on the hour): emit a health digest to the logging pipeline
+
+Each task must retry on failure with exponential backoff, never run more than N instances
+concurrently, and expose a history of recent executions for debugging.
+
+---
+
+## Why build this instead of using Quantum
+
+Quantum is production-grade but pulls in 6 transitive dependencies and runs a Postgres
+or ETS-backed persistence layer. For an embedded scheduler that runs 3–5 tasks, the overhead
+is unjustified. Building it yourself also means you understand exactly what happens when a
+job crashes, times out, or runs long.
+
+The patterns here — `Process.send_after` for self-scheduling, `Task.Supervisor` for isolated
+execution, exponential backoff with jitter — are the same ones Quantum uses internally.
+
+---
+
+## Why exponential backoff with jitter
+
+A failing job that retries immediately creates load storms: if the downstream is down, 20
+concurrent jobs all retry at second intervals and hammer the recovering service. Exponential
+backoff spreads retries out geometrically. Jitter (randomized delay) prevents multiple
+independent job instances from synchronizing their retry times — the thundering herd problem.
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│                  Scheduler.Server (GenServer)                │
-│                                                              │
-│  jobs:     %{job_id => %Job{}}                               │
-│  timers:   %{job_id => timer_ref}      — :timer.send_after   │
-│  history:  %{job_id => [%Execution{}]} — últimas N por job   │
-│  dlq:      [%DLQEntry{}]               — jobs sin retries    │
-└──────────────┬───────────────────────────────────────────────┘
-               │
-   ┌───────────┴──────────────────┐
-   │                              │
-┌──▼──────────────┐    ┌──────────▼─────────┐
-│ CronParser      │    │ Task.Supervisor     │
-│ "*/5 * * * *"   │    │ ejecuta jobs con   │
-│ → next_run_in   │    │ concurrencia N     │
-└─────────────────┘    └────────────────────┘
-               │
-    ┌──────────▼──────────┐
-    │  BackoffCalculator  │
-    │  1s, 2s, 4s, 8s... │
-    └─────────────────────┘
+Attempt 1: fails → wait 1s + jitter(250ms) = ~1.2s
+Attempt 2: fails → wait 2s + jitter(500ms) = ~2.4s
+Attempt 3: fails → wait 4s + jitter(1000ms) = ~4.7s
+Attempt 4: fails → dead letter queue
 ```
 
-### Modelo de datos
+---
+
+## Implementation
+
+### Step 1: `lib/api_gateway/scheduler/job.ex`
 
 ```elixir
-defmodule Scheduler.Job do
+defmodule ApiGateway.Scheduler.Job do
+  @enforce_keys [:id, :name, :fun, :schedule]
   defstruct [
-    :id,          # UUID o atom
-    :fun,         # función de 0 aridad
-    :schedule,    # {:cron, expr} | {:every, ms}
-    :name,        # string descriptivo
-    max_retries:  3,
-    timeout_ms:   30_000,
-    enabled:      true
+    :id,           # String.t() — unique identifier
+    :name,         # String.t() — human-readable description
+    :fun,          # (-> any()) — zero-arity function to execute
+    :schedule,     # {:every, ms} | {:cron, String.t()}
+    max_retries: 3,
+    timeout_ms: 30_000,
+    enabled: true
   ]
 end
 
-defmodule Scheduler.Execution do
+defmodule ApiGateway.Scheduler.Execution do
   defstruct [
     :job_id,
     :started_at,
     :finished_at,
     :duration_ms,
-    :result,      # :ok | {:error, reason}
-    :attempt      # 1..max_retries
+    :result,    # :ok | {:error, reason}
+    :attempt    # 1..max_retries
   ]
 end
 ```
 
----
-
-## Ejercicio 1 — Scheduler básico con intervalos fijos
-
-Implementa scheduling con `every: ms` y ejecución asíncrona de jobs.
-
-### Interfaz pública
+### Step 2: `lib/api_gateway/scheduler/backoff.ex`
 
 ```elixir
-{:ok, _} = Scheduler.start_link(max_concurrent: 5, history_size: 20)
+defmodule ApiGateway.Scheduler.Backoff do
+  @base_ms 1_000
+  @max_ms  300_000
 
-job_id = Scheduler.schedule(
-  fn -> IO.puts("Tick!") end,
-  every: :timer.minutes(5),
-  name: "heartbeat"
-)
+  @doc """
+  Delay in ms for a given retry attempt. Grows exponentially, capped at @max_ms.
 
-Scheduler.schedule(
-  fn -> MyApp.cleanup_sessions() end,
-  every: :timer.hours(1),
-  name: "session_cleanup",
-  max_retries: 3
-)
-
-Scheduler.cancel(job_id)       # => :ok
-Scheduler.pause(job_id)        # => :ok — no ejecuta pero mantiene schedule
-Scheduler.resume(job_id)       # => :ok — reprograma desde ahora
-Scheduler.run_now(job_id)      # => :ok — fuerza ejecución inmediata
-```
-
-### Timer management
-
-```elixir
-# En el GenServer, para cada job programado:
-defp schedule_next(job, state) do
-  interval_ms = case job.schedule do
-    {:every, ms}  -> ms
-    {:cron, expr} -> CronParser.next_run_in_ms(expr)
+  ## Examples
+      delay_for(1) #=> 1_000
+      delay_for(2) #=> 2_000
+      delay_for(3) #=> 4_000
+  """
+  @spec delay_for(pos_integer()) :: pos_integer()
+  def delay_for(attempt) do
+    # TODO: @base_ms * 2^(attempt-1), capped at @max_ms
+    # HINT: :math.pow/2 returns a float; use round/1
   end
 
-  timer_ref = Process.send_after(self(), {:run_job, job.id}, interval_ms)
-
-  put_in(state.timers[job.id], timer_ref)
-end
-
-def handle_info({:run_job, job_id}, state) do
-  job = state.jobs[job_id]
-  execute_job(job, attempt: 1)
-  state = schedule_next(job, state)   # reprogramar inmediatamente
-  {:noreply, state}
+  @doc """
+  Adds uniform random jitter of up to 25% of the base delay.
+  Prevents synchronized retries from multiple job instances.
+  """
+  @spec with_jitter(pos_integer()) :: pos_integer()
+  def with_jitter(delay_ms) do
+    # TODO: add :rand.uniform(div(delay_ms, 4)) to delay_ms
+  end
 end
 ```
 
-### Requisitos
-
-- Cada job tiene su propio timer — `Process.send_after(self(), {:run_job, id}, ms)`
-- Al cancelar: `Process.cancel_timer(timer_ref)` y eliminar de `jobs` y `timers`
-- `run_now/1`: cancela timer actual, envía `{:run_job, id}` inmediatamente, reprograma
-- Ejecución en `Task.Supervisor` para no bloquear el GenServer
-- Tests: job se ejecuta después del intervalo, cancel evita ejecución, run_now dispara inmediatamente
-
----
-
-## Ejercicio 2 — Parser de expresiones Cron
-
-Implementa un parser de cron expressions para scheduling por horario.
-
-### Expresiones soportadas
-
-```
-"*/5 * * * *"    — cada 5 minutos
-"0 * * * *"      — cada hora en punto
-"0 9 * * 1"      — lunes a las 9am
-"0 0 1 * *"      — primer día del mes a medianoche
-"*/15 9-17 * * 1-5" — cada 15min de 9-17h en días laborales
-```
-
-### Estructura del parser
+### Step 3: `lib/api_gateway/scheduler/cron_parser.ex`
 
 ```elixir
-defmodule Scheduler.CronParser do
+defmodule ApiGateway.Scheduler.CronParser do
+  @moduledoc """
+  Parses cron expressions and calculates milliseconds until the next execution.
+
+  Supported syntax per field:
+    *       — any value
+    */n     — every n units
+    n       — exact value
+    a-b     — inclusive range
+    a,b,c   — list of values
+
+  Fields: minute hour day-of-month month day-of-week
+  """
+
   defstruct [:minute, :hour, :day, :month, :weekday]
-  # Cada campo es una de:
-  # :any           — "*"
-  # {:every, n}    — "*/n"
-  # {:range, a, b} — "a-b"
-  # {:list, [n]}   — "1,3,5"
-  # n (integer)    — valor literal
 
+  @type field :: :any | {:every, pos_integer()} | {:range, integer(), integer()} |
+                 {:list, [integer()]} | integer()
+
+  @doc """
+  Parses a 5-field cron expression string into a CronParser struct.
+  Raises ArgumentError on invalid input.
+
+  ## Examples
+      parse("*/5 * * * *")   #=> %CronParser{minute: {:every, 5}, ...}
+      parse("0 9 * * 1")     #=> %CronParser{minute: 0, hour: 9, weekday: 1, ...}
+  """
+  @spec parse(String.t()) :: t()
   def parse(expr) do
-    [min, hr, day, mon, wday] = String.split(expr, " ")
-    %__MODULE__{
-      minute:  parse_field(min, 0..59),
-      hour:    parse_field(hr,  0..23),
-      day:     parse_field(day, 1..31),
-      month:   parse_field(mon, 1..12),
-      weekday: parse_field(wday, 0..6)
-    }
+    case String.split(expr, " ") do
+      [min, hr, day, mon, wday] ->
+        %__MODULE__{
+          minute:  parse_field(min),
+          hour:    parse_field(hr),
+          day:     parse_field(day),
+          month:   parse_field(mon),
+          weekday: parse_field(wday)
+        }
+      _ ->
+        raise ArgumentError, "invalid cron expression: #{inspect(expr)}"
+    end
   end
 
-  @doc "Calcula milisegundos hasta la próxima ejecución desde DateTime.utc_now()"
+  @doc """
+  Returns milliseconds from now until the next time this cron fires.
+  Always returns a positive value — even if the cron should have fired moments ago.
+  """
+  @spec next_run_in_ms(t()) :: pos_integer()
   def next_run_in_ms(%__MODULE__{} = parsed) do
-    now = DateTime.utc_now()
-    next = find_next_datetime(parsed, now)
+    now  = DateTime.utc_now()
+    next = find_next(parsed, DateTime.add(now, 60, :second))
     DateTime.diff(next, now, :millisecond)
   end
 
-  defp parse_field("*", _range), do: :any
-  defp parse_field("*/" <> n, _range), do: {:every, String.to_integer(n)}
-  # ... implementar range y list
+  # TODO: implement parse_field/1 for *, */n, n, a-b, a,b,c
+  # HINT: String.contains?/2, String.split/2, String.to_integer/1
+
+  defp parse_field("*"), do: :any
+  defp parse_field("*/" <> n), do: {:every, String.to_integer(n)}
+
+  defp parse_field(f) do
+    cond do
+      String.contains?(f, "-") ->
+        [a, b] = String.split(f, "-")
+        {:range, String.to_integer(a), String.to_integer(b)}
+      String.contains?(f, ",") ->
+        {:list, f |> String.split(",") |> Enum.map(&String.to_integer/1)}
+      true ->
+        String.to_integer(f)
+    end
+  end
+
+  # TODO: implement find_next/2 — advance minute-by-minute from `from` until
+  # a DateTime matches all fields. Cap search at 1 year to avoid infinite loops.
+  defp find_next(parsed, from) do
+    # HINT: check if from matches all fields via field_matches?/2
+    # HINT: if not, recurse with DateTime.add(from, 60, :second)
+  end
+
+  defp field_matches?(:any, _value), do: true
+  defp field_matches?({:every, n}, value), do: rem(value, n) == 0
+  defp field_matches?({:range, a, b}, value), do: value >= a and value <= b
+  defp field_matches?({:list, vals}, value), do: value in vals
+  defp field_matches?(exact, value), do: exact == value
 end
 ```
 
-### Requisitos
-
-- Parser correcto para `*`, `*/n`, `n`, `a-b`, `a,b,c` en cada campo
-- `next_run_in_ms/1` retorna ms hasta la próxima ocurrencia (siempre > 0)
-- Si el cron debía correr hace 30 segundos, retorna ms hasta la SIGUIENTE ocurrencia
-- Tests exhaustivos: tabla de expresiones conocidas con fechas de referencia fijas
-- No usar librerías externas de cron parsing (implementar desde cero)
-
----
-
-## Ejercicio 3 — Retry con backoff exponencial
-
-Implementa lógica de retry cuando un job falla.
-
-### Backoff exponencial
-
-```
-Intento 1: ejecuta → falla → espera 1s
-Intento 2: ejecuta → falla → espera 2s
-Intento 3: ejecuta → falla → espera 4s
-Intento 4: ejecuta → falla → espera 8s
-Intento max_retries+1: → va a DLQ
-```
-
-### Implementación del retry
+### Step 4: `lib/api_gateway/scheduler/server.ex`
 
 ```elixir
-defmodule Scheduler.BackoffCalculator do
-  @base_delay_ms 1_000
-  @max_delay_ms  300_000  # 5 minutos máximo
+defmodule ApiGateway.Scheduler.Server do
+  use GenServer
 
-  def delay_for_attempt(attempt) do
-    delay = @base_delay_ms * :math.pow(2, attempt - 1) |> round()
-    min(delay, @max_delay_ms)
+  alias ApiGateway.Scheduler.{Job, Execution, Backoff, CronParser}
+
+  @history_limit 20
+
+  # ---------------------------------------------------------------------------
+  # Public API
+  # ---------------------------------------------------------------------------
+
+  @doc """
+  Registers a job and schedules its first execution.
+
+  ## Options
+    - `every: ms`       — fixed interval in milliseconds
+    - `cron: expr`      — cron expression string
+    - `name: string`    — human-readable label
+    - `max_retries: n`  — default 3
+    - `timeout_ms: ms`  — default 30_000
+  """
+  @spec schedule((-> any()), keyword()) :: String.t()
+  def schedule(fun, opts) do
+    GenServer.call(__MODULE__, {:schedule, fun, opts})
   end
 
-  def with_jitter(delay_ms) do
-    jitter = :rand.uniform(div(delay_ms, 4))
-    delay_ms + jitter
+  @spec cancel(String.t()) :: :ok | {:error, :not_found}
+  def cancel(job_id) do
+    GenServer.call(__MODULE__, {:cancel, job_id})
   end
-end
-```
 
-### Flujo de ejecución con retry
+  @spec run_now(String.t()) :: :ok | {:error, :not_found}
+  def run_now(job_id) do
+    GenServer.call(__MODULE__, {:run_now, job_id})
+  end
 
-```elixir
-def handle_info({:execute_with_retry, job_id, attempt}, state) do
-  job = state.jobs[job_id]
+  @spec pause(String.t()) :: :ok
+  def pause(job_id), do: GenServer.call(__MODULE__, {:set_enabled, job_id, false})
 
-  result =
-    try do
-      Task.Supervisor.async_nolink(Scheduler.TaskSupervisor, job.fun)
-      |> Task.await(job.timeout_ms)
-      :ok
-    rescue
-      e -> {:error, Exception.message(e)}
-    catch
-      :exit, reason -> {:error, {:exit, reason}}
+  @spec resume(String.t()) :: :ok
+  def resume(job_id), do: GenServer.call(__MODULE__, {:set_enabled, job_id, true})
+
+  @spec list_jobs() :: [map()]
+  def list_jobs, do: GenServer.call(__MODULE__, :list_jobs)
+
+  @spec job_history(String.t()) :: [Execution.t()]
+  def job_history(job_id), do: GenServer.call(__MODULE__, {:history, job_id})
+
+  # ---------------------------------------------------------------------------
+  # GenServer lifecycle
+  # ---------------------------------------------------------------------------
+
+  def start_link(opts \\ []) do
+    GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+  end
+
+  @impl true
+  def init(opts) do
+    max_concurrent = Keyword.get(opts, :max_concurrent, 10)
+    {:ok, task_sup} = Task.Supervisor.start_link()
+
+    state = %{
+      jobs:           %{},    # job_id => %Job{}
+      timers:         %{},    # job_id => timer_ref
+      history:        %{},    # job_id => [%Execution{}, ...]
+      running:        MapSet.new(),
+      max_concurrent: max_concurrent,
+      task_supervisor: task_sup
+    }
+
+    {:ok, state}
+  end
+
+  # ---------------------------------------------------------------------------
+  # Callbacks — implement handle_call and handle_info
+  # ---------------------------------------------------------------------------
+
+  @impl true
+  def handle_call({:schedule, fun, opts}, _from, state) do
+    job_id = generate_id()
+    schedule_type = cond do
+      Keyword.has_key?(opts, :every) -> {:every, Keyword.fetch!(opts, :every)}
+      Keyword.has_key?(opts, :cron)  -> {:cron, Keyword.fetch!(opts, :cron)}
+      true -> raise ArgumentError, "must provide :every or :cron"
     end
 
-  execution = %Execution{
-    job_id:      job_id,
-    started_at:  DateTime.utc_now(),
-    result:      result,
-    attempt:     attempt
-  }
+    job = %Job{
+      id:          job_id,
+      name:        Keyword.get(opts, :name, job_id),
+      fun:         fun,
+      schedule:    schedule_type,
+      max_retries: Keyword.get(opts, :max_retries, 3),
+      timeout_ms:  Keyword.get(opts, :timeout_ms, 30_000)
+    }
 
-  state = record_execution(state, execution)
+    # TODO: calculate next interval, create timer with Process.send_after/3
+    # HINT: for {:every, ms} use ms directly
+    # HINT: for {:cron, expr} use CronParser.parse(expr) |> CronParser.next_run_in_ms()
 
-  case {result, attempt >= job.max_retries} do
-    {:ok, _}    -> {:noreply, state}
-    {_, true}   -> {:noreply, send_to_dlq(state, job, execution)}
-    {err, false} ->
-      delay = BackoffCalculator.delay_for_attempt(attempt + 1) |> BackoffCalculator.with_jitter()
-      Process.send_after(self(), {:execute_with_retry, job_id, attempt + 1}, delay)
+    {:reply, job_id, state}
+  end
+
+  @impl true
+  def handle_info({:run_job, job_id}, state) do
+    job = state.jobs[job_id]
+
+    if job && job.enabled do
+      if MapSet.size(state.running) >= state.max_concurrent do
+        # Skip this execution — log the skip
+        require Logger
+        Logger.warning("[Scheduler] Skipping #{job.name} — max concurrent reached")
+        state = schedule_next(job, state)
+        {:noreply, state}
+      else
+        # TODO:
+        # 1. Mark job as running (add to state.running)
+        # 2. Execute via Task.Supervisor.async_nolink/2
+        # 3. Reschedule the next run
+        # 4. Return {:noreply, state}
+        {:noreply, state}
+      end
+    else
       {:noreply, state}
+    end
+  end
+
+  @impl true
+  def handle_info({ref, result}, state) when is_reference(ref) do
+    # Task completed successfully — result is the return value of fun.()
+    # TODO: record execution in history, remove from running set
+    Process.demonitor(ref, [:flush])
+    {:noreply, state}
+  end
+
+  @impl true
+  def handle_info({:DOWN, ref, :process, _pid, reason}, state) when reason != :normal do
+    # Task crashed — implement retry with backoff
+    # TODO: find which job this task belonged to (hint: store ref -> job_id mapping)
+    # TODO: if attempts < max_retries, schedule retry with Backoff.delay_for + with_jitter
+    # TODO: otherwise, record as failed in history
+    Process.demonitor(ref, [:flush])
+    {:noreply, state}
+  end
+
+  # ---------------------------------------------------------------------------
+  # Private helpers
+  # ---------------------------------------------------------------------------
+
+  defp schedule_next(job, state) do
+    interval_ms = case job.schedule do
+      {:every, ms}  -> ms
+      {:cron, expr} -> CronParser.parse(expr) |> CronParser.next_run_in_ms()
+    end
+
+    timer_ref = Process.send_after(self(), {:run_job, job.id}, interval_ms)
+    put_in(state.timers[job.id], timer_ref)
+  end
+
+  defp record_execution(state, job_id, execution) do
+    history = Map.get(state.history, job_id, [])
+    new_history = Enum.take([execution | history], @history_limit)
+    put_in(state.history[job_id], new_history)
+  end
+
+  defp generate_id do
+    :crypto.strong_rand_bytes(8) |> Base.url_encode64(padding: false)
   end
 end
 ```
 
-### Requisitos
-
-- Jitter en el backoff para evitar thundering herd
-- Timeout por job: si la tarea no termina en `timeout_ms`, fuerza cancelación
-- Cada intento genera una entrada en el historial del job
-- Job en DLQ puede ser reintentado manualmente: `Scheduler.retry_dlq(job_id)`
-- Tests: job que siempre falla → llega a DLQ con historial de intentos; job que falla 2 veces y luego funciona
-
----
-
-## Ejercicio 4 — Concurrencia y observabilidad
-
-Control de concurrencia máxima y visibilidad del estado del scheduler.
-
-### Control de concurrencia
+### Step 5: Given tests — must pass without modification
 
 ```elixir
-# Máximo N jobs corriendo en paralelo
-Scheduler.start_link(max_concurrent: 5)
+# test/api_gateway/scheduler/server_test.exs
+defmodule ApiGateway.Scheduler.ServerTest do
+  use ExUnit.Case, async: false
 
-# Si hay 5 corriendo y se dispara el 6to:
-# Opción A: encolar y ejecutar cuando haya slot
-# Opción B: skipar esta ejecución (log warning)
-# Implementar Opción B como default, A como opción configurable
+  alias ApiGateway.Scheduler.Server
+
+  setup do
+    # Restart with a clean state
+    if Process.whereis(Server), do: GenServer.stop(Server)
+    {:ok, _} = Server.start_link(max_concurrent: 5)
+    :ok
+  end
+
+  test "schedules and executes a job" do
+    parent = self()
+    Server.schedule(fn -> send(parent, :executed) end, every: 50, name: "test-job")
+    assert_receive :executed, 500
+  end
+
+  test "cancel stops future executions" do
+    parent = self()
+    job_id = Server.schedule(fn -> send(parent, :should_not_run) end, every: 50, name: "cancel-test")
+    Server.cancel(job_id)
+    refute_receive :should_not_run, 200
+  end
+
+  test "run_now triggers immediate execution" do
+    parent = self()
+    job_id = Server.schedule(fn -> send(parent, :ran) end, every: 60_000, name: "immediate")
+    Server.run_now(job_id)
+    assert_receive :ran, 500
+  end
+
+  test "pause and resume" do
+    parent = self()
+    job_id = Server.schedule(fn -> send(parent, :tick) end, every: 50, name: "pausable")
+    assert_receive :tick, 300
+    Server.pause(job_id)
+    flush_mailbox()
+    refute_receive :tick, 200
+    Server.resume(job_id)
+    assert_receive :tick, 300
+  end
+
+  test "history records executions" do
+    job_id = Server.schedule(fn -> :ok end, every: 50, name: "history-job")
+    Process.sleep(200)
+    history = Server.job_history(job_id)
+    assert length(history) >= 2
+    assert Enum.all?(history, &(&1.result == :ok))
+  end
+
+  defp flush_mailbox do
+    receive do
+      _ -> flush_mailbox()
+    after
+      0 -> :ok
+    end
+  end
+end
 ```
-
-### Observabilidad
 
 ```elixir
-Scheduler.list_jobs()
-# => [
-#   %{id: "cleanup", name: "session_cleanup", status: :running, next_run_in_ms: 42_000},
-#   %{id: "heartbeat", name: "heartbeat", status: :scheduled, next_run_in_ms: 180_000},
-#   %{id: "report", name: "report", status: :paused, next_run_in_ms: nil}
-# ]
+# test/api_gateway/scheduler/cron_parser_test.exs
+defmodule ApiGateway.Scheduler.CronParserTest do
+  use ExUnit.Case
 
-Scheduler.job_history("cleanup", limit: 10)
-# => [
-#   %Execution{started_at: ~U[...], duration_ms: 234, result: :ok, attempt: 1},
-#   %Execution{started_at: ~U[...], duration_ms: 15_002, result: {:error, :timeout}, attempt: 1},
-#   ...
-# ]
+  alias ApiGateway.Scheduler.CronParser
 
-Scheduler.dlq()
-# => [%{job_id: "flaky_job", failed_at: ~U[...], last_error: "connection refused", attempts: 3}]
+  describe "parse/1" do
+    test "parses wildcard" do
+      assert %CronParser{minute: :any} = CronParser.parse("* * * * *")
+    end
 
-Scheduler.stats()
-# => %{
-#   total_jobs: 5,
-#   running: 1,
-#   scheduled: 3,
-#   paused: 1,
-#   dlq_count: 2,
-#   executions_today: 142,
-#   success_rate: 0.986
-# }
+    test "parses every-n" do
+      assert %CronParser{minute: {:every, 5}} = CronParser.parse("*/5 * * * *")
+    end
+
+    test "parses exact value" do
+      assert %CronParser{hour: 9} = CronParser.parse("0 9 * * *")
+    end
+
+    test "parses range" do
+      assert %CronParser{weekday: {:range, 1, 5}} = CronParser.parse("0 9 * * 1-5")
+    end
+
+    test "parses list" do
+      assert %CronParser{minute: {:list, [0, 15, 30, 45]}} = CronParser.parse("0,15,30,45 * * * *")
+    end
+  end
+
+  describe "next_run_in_ms/1" do
+    test "returns a positive number of milliseconds" do
+      ms = CronParser.parse("*/5 * * * *") |> CronParser.next_run_in_ms()
+      assert is_integer(ms) and ms > 0
+    end
+
+    test "hourly cron fires within the hour" do
+      ms = CronParser.parse("0 * * * *") |> CronParser.next_run_in_ms()
+      assert ms <= 3_600_000
+    end
+  end
+end
 ```
 
-### Requisitos
+### Step 6: Run the tests
 
-- Tracking de jobs actualmente en ejecución con contador atómico o ETS
-- `duration_ms` calculado al completar la Task (`System.monotonic_time` diff)
-- Historial limitado a `history_size` entradas por job (configurable en start)
-- `success_rate` calculado sobre el total de ejecuciones del día (reset en medianoche)
-- Tests: max_concurrent=2 con 5 jobs disparados simultáneamente, verificar solo 2 corren
-
-### Estructura del proyecto
-
-```
-lib/
-├── scheduler/
-│   ├── application.ex       # Inicia Supervisor
-│   ├── supervisor.ex        # Server + TaskSupervisor
-│   ├── server.ex            # GenServer principal
-│   ├── job.ex               # Struct + validación
-│   ├── execution.ex         # Struct de resultado
-│   ├── cron_parser.ex       # Parsing de cron expressions
-│   └── backoff_calculator.ex
-test/
-├── scheduler/
-│   ├── server_test.exs
-│   ├── cron_parser_test.exs
-│   ├── retry_test.exs
-│   └── concurrency_test.exs
+```bash
+mix test test/api_gateway/scheduler/ --trace
 ```
 
 ---
 
-## Criterios de aceptación
+## Trade-off analysis
 
-- [ ] `schedule/2` con `every: ms` ejecuta el job en el intervalo correcto
-- [ ] `schedule/2` con `cron: expr` ejecuta en los momentos correctos del cron
-- [ ] Cron parser maneja `*`, `*/n`, `n`, `a-b` en todos los campos
-- [ ] Un job que falla hace backoff exponencial y eventualmente va a DLQ
-- [ ] `run_now/1` dispara ejecución inmediata sin afectar el schedule regular
-- [ ] `pause/1` y `resume/1` funcionan correctamente
-- [ ] `job_history/2` muestra intentos con duración y resultado
-- [ ] `max_concurrent` evita ejecutar más de N jobs simultáneos
+Fill in this table based on your implementation.
+
+| Aspect | This scheduler | Oban | Quantum |
+|--------|---------------|------|---------|
+| Persistence after crash | none (in-memory) | PostgreSQL | configurable |
+| Distributed (multi-node) | no | yes (DB-backed) | yes (global/distributed) |
+| Cron syntax | subset (5-field) | n/a | full |
+| Retry semantics | exponential backoff | at-least-once via DB | configurable |
+| Observability | in-memory history | full DB queryable | dashboard |
+| Dependencies | none | ~6 | ~4 |
+
+Reflection: when would you reach for Oban over this scheduler? (Hint: what happens to
+scheduled jobs when the node restarts?)
 
 ---
 
-## Retos adicionales (opcional)
+## Common production mistakes
 
-- Persistencia del estado a DETS/ETS para sobrevivir reinicios
-- Scheduler distribuido: usar `:global` o Horde para un único scheduler en el cluster
-- Priority queues: jobs con prioridad high corren antes que los normal
-- Métricas con `:telemetry`: `[:scheduler, :job, :start]` y `[:scheduler, :job, :stop]`
+**1. Not re-enqueuing in `handle_info({:run_job, ...})`**
+If `schedule_next/2` is only called in `handle_call({:schedule, ...})`, the job fires once
+and never again. Always re-schedule inside the execution handler.
+
+**2. Accumulating timers on `run_now`**
+`run_now/1` should cancel the existing timer before sending the immediate message, otherwise
+the job runs twice in quick succession (once immediately and once when the timer fires).
+
+**3. No jitter on retry**
+Without jitter, all retries for all failing jobs fire at exact multiples of the base delay.
+If 10 jobs fail simultaneously, they all retry at t+1s, t+2s, t+4s — correlated spikes.
+
+**4. Blocking the GenServer during job execution**
+Running `job.fun.()` inside `handle_info` blocks the entire scheduler for the duration of
+the job. Always delegate to `Task.Supervisor`.
+
+**5. Unlimited history**
+Without `@history_limit`, long-running gateways accumulate unlimited execution records per
+job. After a week, the history map becomes the dominant memory consumer.
+
+---
+
+## Resources
+
+- [`Process.send_after/3`](https://hexdocs.pm/elixir/Process.html#send_after/3) — scheduling without external deps
+- [`Task.Supervisor`](https://hexdocs.pm/elixir/Task.Supervisor.html) — isolated async execution
+- [Oban source — scheduler](https://github.com/sorentwo/oban) — how production-grade scheduling works
+- [Exponential backoff and jitter — AWS blog](https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/) — the jitter argument

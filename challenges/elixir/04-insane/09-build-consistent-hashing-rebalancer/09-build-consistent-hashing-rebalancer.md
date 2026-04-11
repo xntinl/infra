@@ -1,65 +1,310 @@
-# 9. Build a Consistent Hashing Ring with Live Rebalancing
+# Consistent Hashing Ring with Live Rebalancing
 
-**Difficulty**: Insane
+**Project**: `chord_ring` — a production-grade consistent hashing ring with live migration and hotspot detection
 
-## Prerequisites
-- Mastered: All Elixir/OTP intermediate and advanced concepts (GenServer, ETS, distributed Erlang, :pg, binary pattern matching)
-- Mastered: Hash function properties — uniformity, avalanche effect, collision resistance trade-offs; ring topology data structures
-- Familiarity with: The Dynamo paper's partitioning scheme, Cassandra's virtual node (vnode) implementation, the Chord DHT protocol
-- Reading: Amazon Dynamo paper (DeCandia et al., 2007) — sections 4.1 and 4.2 on partitioning and replication; the Chord paper (Stoica et al., 2001)
+---
 
-## Problem Statement
+## Project context
 
-Build a production-grade consistent hashing ring in Elixir/OTP with virtual nodes, live node addition and removal with minimal data movement, lazy background migration, and hotspot detection. The ring must serve reads and writes during rebalancing without downtime — reads of a key that is currently being migrated must return the correct value from the source node until migration completes.
+You are building `chord_ring`, a distributed consistent hashing ring with virtual nodes, live node addition and removal with minimal data movement, lazy background migration, and hotspot detection. The ring serves reads and writes during rebalancing without downtime.
 
-Your system must implement:
-1. A consistent hashing ring with configurable virtual nodes per physical node (V); each physical node owns V token positions on the ring; a key is routed to the physical node whose first virtual node token is encountered when walking the ring clockwise from the key's hash value
-2. Replication: each key is owned by the primary node (by ring position) and replicated to the next R-1 nodes clockwise on the ring; reads and writes use configurable quorum (W writes, R reads, where R + W > total replicas)
-3. Live node addition: when a new physical node joins with V virtual tokens, only the keys in the ranges now owned by the new node migrate — no other keys move; the fraction of keys that must move is 1/N (where N is the new total number of nodes)
-4. Lazy migration: migration runs in the background at a configurable rate (max M keys/second); during migration, reads for a key that has not yet migrated are served from the old (source) node; writes go to both source and destination until migration of that key completes
-5. Live node removal: when a node is removed, its key ranges are distributed to its successor nodes; migration follows the same lazy protocol as addition; the system must be fully available throughout
-6. Hotspot detection: the ring tracks access frequency per key using a sliding window counter; keys accessed more than K times per second over a rolling 60-second window are flagged as hotspots; the system emits an event and suggests whether the hotspot is a routing artifact (many keys hash to the same token) or a genuine hot key
-7. A monitoring API: query the ring for the current node distribution (how many tokens and keys each physical node owns), migration progress (percentage complete per ongoing migration), and the current hotspot list
+Project structure:
 
-## Acceptance Criteria
+```
+chord_ring/
+├── lib/
+│   └── chord_ring/
+│       ├── application.ex           # ring supervisor, HTTP monitoring API
+│       ├── ring.ex                  # ring data structure: sorted token list, O(log N) lookup
+│       ├── node_manager.ex          # GenServer: add/remove physical nodes, update ring
+│       ├── shard.ex                 # GenServer per shard: owns a token range, stores KV data
+│       ├── replication.ex           # quorum reads/writes across R consecutive ring nodes
+│       ├── migration.ex             # FSM: lazy background migration, dual-write protocol
+│       ├── hotspot.ex               # sliding window counter, hotspot detection, alerts
+│       └── api.ex                   # HTTP monitoring: ring state, migration progress, hotspots
+├── test/
+│   └── chord_ring/
+│       ├── ring_test.exs            # distribution, routing determinism, minimal movement
+│       ├── migration_test.exs       # read availability during migration, dual-write correctness
+│       ├── replication_test.exs     # quorum reads/writes, fault tolerance
+│       ├── hotspot_test.exs         # detection latency, true/false positive
+│       └── visualization_test.exs  # ASCII ring output
+├── bench/
+│   └── ring_bench.exs
+└── mix.exs
+```
 
-- [ ] **Uniform distribution**: With 5 physical nodes and V=150 virtual nodes per node, insert 1,000,000 keys; confirm no physical node owns more than 25% or less than 15% of all keys (within ±5% of ideal 20%)
-- [ ] **Key routing determinism**: Given the same ring state and the same key, `route(key)` always returns the same physical node; verify with 100,000 key lookups across process restarts
-- [ ] **Minimal movement on node add**: Add a 6th node to a 5-node ring; measure how many keys migrated; confirm it is within 5% of the theoretical minimum (1/6 = 16.7% of all keys)
-- [ ] **Minimal movement on node remove**: Remove one node from a 6-node ring; confirm only the removed node's keys migrate to successors; all other nodes' key sets are unchanged
-- [ ] **Read availability during migration**: Start migrating keys from node A to node B; before a specific key's migration completes, read that key from any node; confirm it returns the correct value (served from node A, the source); after migration completes, confirm reads are served from node B
-- [ ] **Write consistency during migration**: Write a key that is currently being migrated; confirm the write is applied to both source and destination nodes; confirm that after migration completes, only the destination node is authoritative
-- [ ] **Replication — fault tolerance**: With R=3 replicas, kill one replica node; confirm all keys whose primary was on the dead node are still readable from the surviving replicas using quorum reads
-- [ ] **Hotspot detection**: Issue 200 reads/second to a single key for 70 seconds; confirm the key is flagged as a hotspot within 30 seconds of exceeding the threshold; confirm the hotspot report includes the key, access rate, and the owning node
-- [ ] **Monitoring API**: `GET /ring/nodes` returns each physical node with token count, key count, and current migration status; values are accurate within 5 seconds
-- [ ] **Visualization**: Output the ring as an ASCII representation with each node's token positions marked on a 0–360 degree scale; tokens should be visually distributed; output must update after each node add/remove
+---
 
-## What You Will Learn
-- Why consistent hashing solves the K/N key movement problem of naive modular hashing — and why this matters enormously when adding capacity to a live system
-- How virtual nodes (vnodes) improve load balance by giving each physical node multiple, scattered positions on the ring — and the trade-off between V and routing table memory
-- The read/write quorum equations (R + W > N for strong consistency, R + W ≤ N for eventual consistency) and how to choose quorum sizes for different latency/consistency trade-offs
-- How lazy migration avoids a migration storm when a new node joins — and the protocol guarantees needed to serve reads correctly from either source or destination during migration
-- How a sliding window counter works without storing every access timestamp — and why the hyperloglog structure is useful when you need to count distinct keys, not access frequency
-- The Chord lookup algorithm (O(log N) hops) as an alternative to the O(1) local routing table approach — and why real systems choose local tables despite their O(N) memory cost per node
-- How hotspots in consistent hashing arise: the difference between a hot key (true data skew) and a routing hotspot (vnode imbalance) requires different remediation strategies
+## The problem
 
-## Hints
+A distributed data store has N physical nodes. Keys must be assigned to nodes in a way that: distributes load evenly, minimizes data movement when nodes join or leave, and serves reads correctly during migration. The naive approach — `hash(key) mod N` — requires rehashing `(N-1)/N` keys when a node is added. Consistent hashing moves only `1/N` of keys.
 
-This exercise is intentionally sparse. You are expected to:
-- Choose your hash function carefully before writing the ring: MD5 is common in textbooks but not uniform enough for high V; use SHA-256 or xxHash and verify empirical distribution before building on it
-- The ring data structure must support O(log N) successor lookup for a key — a sorted list with binary search or a balanced tree (`:gb_trees` in Erlang) are appropriate; a linear scan will not meet the benchmark at scale
-- Lazy migration requires tracking which keys have and have not migrated — a per-key flag in ETS with a dedicated migration FSM per range is a clean approach; avoid single-process bottlenecks
-- The dual-write protocol during migration (write to source and destination) is easy to get wrong under failures — what happens if the write to source succeeds but destination fails? Design this carefully
-- Hotspot detection must be decoupled from the read/write hot path — use a separate process that samples the access counter periodically rather than updating a shared counter on every access
+The hard part is live migration. When a new node joins and takes ownership of some key ranges, keys already stored on the old node must migrate to the new node. During migration, reads for a not-yet-migrated key must still return the correct value from the source node. Writes must go to both source and destination. This dual-write window must be atomic and correct under failures.
 
-## Reference Material (Research Required)
-- DeCandia, G. et al. (2007). *Dynamo: Amazon's Highly Available Key-Value Store* — sections 4.1 (Partitioning), 4.2 (Replication), and 4.7 (Membership and Failure Detection) are directly relevant
-- Stoica, I. et al. (2001). *Chord: A Scalable Peer-to-Peer Lookup Service for Internet Applications* — the Chord DHT protocol; provides the theoretical foundation for consistent hashing lookup
-- Karger, D. et al. (1997). *Consistent Hashing and Random Trees: Distributed Caching Protocols for Relieving Hot Spots on the World Wide Web* — the original consistent hashing paper
-- Apache Cassandra documentation — *Data Distribution and Replication* section — the production implementation of vnodes with live rebalancing; study the architecture, not the configuration guide
+---
 
-## Difficulty Rating
-★★★★★★
+## Why this design
 
-## Estimated Time
-3–5 weeks for an experienced Elixir developer with distributed systems and data structures background
+**Virtual nodes (`vnodes`) for uniform distribution**: a single token per physical node leads to unequal load (one node might be responsible for 40% of the ring if its token happens to land far from its neighbors). With V=150 virtual nodes per physical node, each physical node has many scattered positions. The variance in load drops to roughly `1/sqrt(V)` of the single-token variance.
+
+**Sorted list with binary search for O(log N) lookup**: the ring is a sorted list of `{token, physical_node}` pairs. Given a key's hash, you binary-search for the first token ≥ hash(key). This is O(log(N*V)) per lookup. A linear scan is O(N*V) and fails the benchmark at scale. Erlang's `:gb_trees` or a sorted list with `:lists.search/2` are both appropriate.
+
+**Lazy migration at configurable rate**: migrating all keys immediately on node join causes a migration storm — 1/N of all keys moving simultaneously, saturating network and disk. Lazy migration runs in the background at max M keys/second. During migration, reads fall back to the source node. After migration, the source removes the key.
+
+**Dual-write protocol**: during migration of a key range, writes go to both source and destination. This ensures that once migration completes, the destination has all writes — not just the pre-join snapshot. The protocol must handle the case where the write to source succeeds but destination fails (write only to source, key stays unmigrated).
+
+---
+
+## Implementation milestones
+
+### Step 1: Create the project
+
+```bash
+mix new chord_ring --sup
+cd chord_ring
+mkdir -p lib/chord_ring test/chord_ring bench
+```
+
+### Step 2: `mix.exs` — dependencies
+
+```elixir
+defp deps do
+  [
+    {:plug_cowboy, "~> 2.7"},
+    {:jason, "~> 1.4"},
+    {:benchee, "~> 1.3", only: :dev}
+  ]
+end
+```
+
+### Step 3: Ring data structure
+
+```elixir
+# lib/chord_ring/ring.ex
+defmodule ChordRing.Ring do
+  @moduledoc """
+  Consistent hashing ring represented as a sorted list of
+  {token, physical_node} tuples.
+
+  token is a 32-bit integer derived from hashing "{node_name}:{vnode_index}".
+  """
+
+  @doc "Creates a ring with the given physical nodes and V virtual nodes each."
+  def new(nodes, v \\ 150) do
+    # TODO
+    # HINT: for each node, for i <- 1..v do
+    #         token = :erlang.phash2("#{node}:#{i}", 0xFFFFFFFF)
+    #         {token, node}
+    #       end
+    # HINT: sort the resulting list by token
+    # HINT: deduplicate tokens (hash collisions are possible with phash2)
+  end
+
+  @doc "Returns the primary physical node responsible for key."
+  def lookup(ring, key) do
+    # TODO: token = hash(key); binary search for first {t, node} where t >= token
+    # HINT: if no token >= token, wrap around to the first token (ring topology)
+  end
+
+  @doc "Returns a list of R consecutive distinct physical nodes starting from key."
+  def replicas(ring, key, r) do
+    # TODO
+  end
+
+  @doc "Returns the fraction of keys that moved when node is added to ring."
+  def movement_fraction(old_ring, new_ring, sample_size \\ 10_000) do
+    # TODO: generate random keys, compare lookup results
+  end
+end
+```
+
+### Step 4: Migration FSM
+
+```elixir
+# lib/chord_ring/migration.ex
+defmodule ChordRing.Migration do
+  @moduledoc """
+  Lazy migration FSM for a key range.
+
+  States:
+    :pending    — range assigned to new node, migration not started
+    :migrating  — actively copying keys from source to destination
+    :complete   — all keys migrated, source can drop the range
+
+  During :migrating:
+    reads  → try destination; fall back to source if key not yet migrated
+    writes → write to both source and destination (dual-write)
+
+  Rate limiting: migrate at most max_keys_per_second keys/second.
+  Use a token bucket with a GenServer timer to refill tokens.
+  """
+
+  def start_migration(source_node, dest_node, key_range, opts \\ []) do
+    # TODO
+  end
+
+  def read(key, migration_state) do
+    # TODO: if key is in :complete range, read from dest only
+    #        if key is in :migrating range and migrated, read from dest
+    #        if key is in :migrating range and not yet migrated, read from source
+  end
+
+  def write(key, value, migration_state) do
+    # TODO: dual-write if key range is in :migrating state
+  end
+end
+```
+
+### Step 5: Given tests — must pass without modification
+
+```elixir
+# test/chord_ring/ring_test.exs
+defmodule ChordRing.RingTest do
+  use ExUnit.Case, async: true
+
+  alias ChordRing.Ring
+
+  test "no node holds more than 25% of keys with V=150" do
+    nodes = [:n1, :n2, :n3, :n4, :n5]
+    ring = Ring.new(nodes, 150)
+
+    counts =
+      for _ <- 1..1_000_000, reduce: %{} do
+        acc ->
+          key = :crypto.strong_rand_bytes(8) |> Base.encode16()
+          node = Ring.lookup(ring, key)
+          Map.update(acc, node, 1, &(&1 + 1))
+      end
+
+    for {node, count} <- counts do
+      pct = count / 1_000_000
+      assert pct <= 0.25, "#{node} holds #{Float.round(pct * 100, 1)}% (max 25%)"
+      assert pct >= 0.15, "#{node} holds #{Float.round(pct * 100, 1)}% (min 15%)"
+    end
+  end
+
+  test "minimal movement on node add: at most 1/N + 5% of keys" do
+    ring5 = Ring.new([:n1, :n2, :n3, :n4, :n5], 150)
+    ring6 = Ring.add_node(ring5, :n6, 150)
+
+    moved = Ring.movement_fraction(ring5, ring6, 10_000)
+    assert moved < 0.22, "expected ~16.7% movement, got #{Float.round(moved * 100, 1)}%"
+  end
+
+  test "routing is deterministic across identical ring states" do
+    ring = Ring.new([:n1, :n2, :n3], 150)
+    key = "my_deterministic_key"
+    first = Ring.lookup(ring, key)
+
+    for _ <- 1..1_000 do
+      assert Ring.lookup(ring, key) == first
+    end
+  end
+end
+```
+
+```elixir
+# test/chord_ring/migration_test.exs
+defmodule ChordRing.MigrationTest do
+  use ExUnit.Case, async: false
+
+  test "reads during migration return correct value from source" do
+    ring = ChordRing.start(nodes: [:n1, :n2, :n3])
+    ChordRing.put(ring, "migrating_key", "original_value")
+
+    # Add n4, triggering migration of some key ranges
+    ChordRing.add_node(ring, :n4)
+
+    # Immediately read — migration may not be complete
+    {:ok, val} = ChordRing.get(ring, "migrating_key")
+    assert val == "original_value",
+      "expected original value during migration, got #{inspect(val)}"
+  end
+
+  test "writes during migration are visible after migration completes" do
+    ring = ChordRing.start(nodes: [:n1, :n2])
+    ChordRing.put(ring, "dual_write_key", "v1")
+    ChordRing.add_node(ring, :n3)
+
+    ChordRing.put(ring, "dual_write_key", "v2")
+
+    # Wait for migration to complete
+    Process.sleep(5_000)
+
+    {:ok, val} = ChordRing.get(ring, "dual_write_key")
+    assert val == "v2"
+  end
+end
+```
+
+### Step 6: Run the tests
+
+```bash
+mix test test/chord_ring/ --trace
+```
+
+### Step 7: Benchmark
+
+```elixir
+# bench/ring_bench.exs
+nodes = for i <- 1..10, do: :"node_#{i}"
+ring = ChordRing.Ring.new(nodes, 150)
+keys = for _ <- 1..1_000, do: :crypto.strong_rand_bytes(8) |> Base.encode16()
+
+Benchee.run(
+  %{
+    "lookup — single key" => fn ->
+      ChordRing.Ring.lookup(ring, Enum.random(keys))
+    end,
+    "replicas — R=3" => fn ->
+      ChordRing.Ring.replicas(ring, Enum.random(keys), 3)
+    end
+  },
+  parallel: 4,
+  time: 5,
+  warmup: 2,
+  formatters: [Benchee.Formatters.Console]
+)
+```
+
+Target: `lookup/2` < 1µs per call with 10 physical nodes and V=150.
+
+---
+
+## Trade-off analysis
+
+| Aspect | Consistent hashing + vnodes | Modular hashing | Static partition map |
+|--------|----------------------------|-----------------|---------------------|
+| Keys moved on node add | 1/N | (N-1)/N | 0 (manual reassignment) |
+| Load balance | tunable via V | deterministic | fully manual |
+| Hotspot mitigation | vnode rebalancing | key-level sharding | manual |
+| Lookup cost | O(log(N*V)) | O(1) | O(1) |
+| Live migration | lazy background | full rehash required | manual |
+
+Reflection: the Chord DHT protocol proposes O(log N) distributed lookups so no node needs the full routing table. For a system like this one (all nodes accessible, local routing table in memory), why is the O(1) local table approach preferable despite its O(N*V) memory cost?
+
+---
+
+## Common production mistakes
+
+**1. Using MD5 for virtual node hashing**
+MD5 has poor uniformity for short inputs like `"node_name:1"`. The distribution test will fail. Use SHA-256 (`:crypto.hash(:sha256, key)`) or `:erlang.phash2/2` with large max value.
+
+**2. Dual-write failure leaves key unmigrated indefinitely**
+If the write to destination fails during migration, the migration tracker must not advance past that key. It must retry the write at the configured rate. Without this, migration completes but the destination has a stale snapshot.
+
+**3. Reading from destination before verifying migration status**
+Reading from the destination before the key has been migrated returns `not_found` instead of the correct value. You must check migration status per-key, not per-range, or implement full range migration before changing the read routing.
+
+**4. Hotspot detection in the read path**
+Incrementing an access counter on every read adds serialization to what should be a concurrent ETS lookup. Sample access frequency in a separate process, not inline in the read path.
+
+---
+
+## Resources
+
+- DeCandia, G. et al. (2007). *Dynamo: Amazon's Highly Available Key-Value Store* — sections 4.1 (Partitioning), 4.2 (Replication), 4.7 (Membership)
+- Stoica, I. et al. (2001). *Chord: A Scalable Peer-to-Peer Lookup Service for Internet Applications*
+- Karger, D. et al. (1997). *Consistent Hashing and Random Trees* — the original paper from MIT
+- [Apache Cassandra: Data Distribution and Replication](https://cassandra.apache.org/doc/latest/cassandra/architecture/dynamo.html) — production vnode implementation

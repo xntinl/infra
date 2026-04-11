@@ -1,65 +1,324 @@
-# 4. Build a Distributed Job Scheduler with Bin-Packing and Preemption
+# Distributed Job Scheduler with Bin-Packing and Preemption
 
-**Difficulty**: Insane
+**Project**: `helios` — a distributed job scheduler with resource-aware placement and fault tolerance
 
-## Prerequisites
-- Mastered: All Elixir/OTP intermediate and advanced concepts (GenServer, DynamicSupervisor, Process monitoring, :pg, distributed Erlang)
-- Mastered: Operating system scheduling theory — priority queues, preemption, resource accounting, bin-packing algorithms
-- Familiarity with: Container orchestration concepts (resource requests/limits, node affinity, job preemption), REST API design with Plug
-- Reading: The Kubernetes scheduler source code, the Mesos paper (Hindman et al., 2011), the Omega paper (Schwarzkopf et al., 2012)
+---
 
-## Problem Statement
+## Project context
 
-Build a distributed job scheduler in Elixir/OTP that assigns computational jobs to worker nodes based on resource availability, enforces fairness across users, and handles node failures by rescheduling affected jobs. The scheduler must expose a REST API built with Plug (not Phoenix) for job management.
+You are building `helios`, a distributed job scheduler that assigns computational jobs to worker nodes based on resource availability, enforces fairness, and handles node failures by rescheduling affected jobs. The scheduler exposes a REST API built with Plug (not Phoenix).
 
-Your system must implement:
-1. A resource model where each worker node continuously reports its available CPU (units) and memory (MB) to the scheduler via heartbeats; the scheduler maintains a live view of cluster capacity
-2. A bin-packing algorithm for job placement: given a job's resource request (CPU units + memory MB), select the node that satisfies the request while minimizing wasted capacity (best-fit decreasing heuristic)
-3. Priority-based preemption: jobs carry a priority level (1–10); when a high-priority job cannot be scheduled due to resource contention, the scheduler may evict one or more lower-priority jobs from a node to make room, provided the evicted jobs are rescheduled elsewhere or queued
-4. Fault tolerance: the scheduler monitors all worker nodes; when a node stops heartbeating (death), all jobs running on that node are detected, their resources freed, and the jobs requeued for rescheduling on surviving nodes
-5. Fair-share scheduling: no single user's jobs may consume more than a configurable percentage X of total cluster resources; a user exceeding their fair share has new job submissions queued until their consumption drops below the threshold
-6. A complete job lifecycle audit trail: every state transition (submitted → queued → scheduled → running → completed/failed/preempted) is recorded with timestamps and node assignment
-7. A REST API over Plug with endpoints for: submit job, cancel job, query job status, list all jobs, list nodes and their current resource usage
+Project structure:
 
-## Acceptance Criteria
+```
+helios/
+├── lib/
+│   └── helios/
+│       ├── application.ex           # supervisor tree: scheduler + cluster + API
+│       ├── scheduler.ex             # GenServer: bin-packing, preemption, queue
+│       ├── worker_node.ex           # GenServer per worker: heartbeat, resource reporting
+│       ├── cluster.ex               # tracks live nodes and their capacity
+│       ├── job.ex                   # job struct and FSM: submitted→queued→scheduled→running→done
+│       ├── bin_packer.ex            # best-fit decreasing placement algorithm
+│       ├── preemptor.ex             # selects jobs to evict for high-priority placement
+│       ├── fair_share.ex            # per-user resource accounting and threshold enforcement
+│       ├── audit.ex                 # append-only audit log: all job state transitions
+│       └── api/
+│           ├── router.ex            # Plug.Router: job CRUD, node listing
+│           └── plug_pipeline.ex     # Plug.Builder: parsers, logging, auth
+├── test/
+│   └── helios/
+│       ├── bin_packing_test.exs     # placement algorithm correctness
+│       ├── preemption_test.exs      # eviction and requeue logic
+│       ├── fault_tolerance_test.exs # node death → job requeue
+│       ├── fair_share_test.exs      # per-user cap enforcement
+│       └── api_test.exs             # REST endpoint integration
+├── bench/
+│   └── placement_bench.exs
+└── mix.exs
+```
 
-- [ ] **Resource model**: Each worker node GenServer reports CPU and memory every 5 seconds; the scheduler's cluster view reflects changes within one heartbeat cycle; a node that misses 3 consecutive heartbeats is marked unavailable
-- [ ] **Bin-packing correctness**: Given 5 nodes with varying available capacity, submit 20 jobs with varying resource requests; verify via audit trail that each job is placed on the node with the tightest fit that still satisfies the request (best-fit)
-- [ ] **No overcommit**: The scheduler must never assign a job to a node if the assignment would exceed the node's available CPU or memory; verify this invariant across 10,000 random job submissions
-- [ ] **Preemption**: Submit a low-priority (1) job on a nearly full cluster; then submit a high-priority (9) job that requires resources only available via eviction; confirm the low-priority job is preempted, the high-priority job runs, and the preempted job is requeued
-- [ ] **Fault tolerance**: With 10 jobs running across 3 nodes, kill one node abruptly; within 30 seconds, all jobs that were on the dead node must be detected, requeued, and rescheduled on surviving nodes
-- [ ] **Fair-share enforcement**: Configure max 33% per user; user A submits 100 CPU-intensive jobs; user B submits 10 jobs; verify user A's jobs beyond the fair-share threshold are queued and user B's jobs run without starvation
-- [ ] **Job audit trail**: Every state transition for every job is recorded; after 1,000 jobs complete, query the audit trail by job ID and verify each job has a complete, chronologically consistent state history
-- [ ] **REST API — submit**: `POST /jobs` with `{user, cpu, memory, priority, command}` returns `{job_id, status: "queued"}`; subsequent `GET /jobs/:id` returns the current state
-- [ ] **REST API — cancel**: `DELETE /jobs/:id` cancels a queued or running job; a running job's resources are immediately freed on the worker node
-- [ ] **REST API — cluster view**: `GET /nodes` returns each node with its total capacity and current usage; values are accurate within one heartbeat cycle (5 seconds)
+---
 
-## What You Will Learn
-- How bin-packing is a variant of the NP-hard knapsack problem and why greedy heuristics (best-fit decreasing) work well in practice for scheduling
-- Why preemption requires careful ordering: you must guarantee the evicted job is successfully requeued before committing to the eviction
-- How fair-share scheduling differs from strict priority scheduling and how Dominant Resource Fairness (DRF) extends it to multi-resource environments
-- The difference between optimistic concurrency (Omega's model) and pessimistic locking (Mesos's two-level scheduling) for cluster state
-- How heartbeat-based failure detection works and why it always has a trade-off between false-positive rate and detection latency
-- How to build a REST API with Plug directly (routing, request parsing, JSON response encoding) without the Phoenix framework abstraction layer
-- How to model a multi-state FSM for job lifecycle in Elixir without any framework — pure GenServer state machines
+## The problem
 
-## Hints
+A compute cluster of N worker nodes has finite CPU and memory. Jobs arrive continuously with resource requests and priorities. The scheduler must place each job on the node that best fits its requirements (maximizing utilization) without overcommitting any node. When a high-priority job cannot be scheduled due to resource contention, it must preempt lower-priority jobs. When a worker node dies, its jobs must be detected and rescheduled within 30 seconds.
 
-This exercise is intentionally sparse. You are expected to:
-- Study the Mesos paper's architecture diagram carefully — understand the difference between the scheduler (global) and the executor (per-node) before designing your process topology
-- The Omega paper introduces the concept of optimistic concurrency for scheduling decisions — understand why it outperforms pessimistic locking at scale
-- Preemption is deceptively hard: you must handle the case where the preempted job cannot be rescheduled (no available node) — what do you do then?
-- Fair-share requires tracking resource usage over a window, not just point-in-time — think about what "consumption" means for a job that ran for 30 seconds
-- Your Plug router is pure Elixir; read the Plug documentation for `Plug.Router` and `Plug.Parsers` — do not reach for Phoenix
+This is a variant of the bin-packing problem (NP-hard in the general case), solved with a greedy heuristic that works well in practice for scheduler workloads.
 
-## Reference Material (Research Required)
-- Hindman, B. et al. (2011). *Mesos: A Platform for Fine-Grained Resource Sharing in the Data Center* — study section 3 (architecture) and section 4 (two-level scheduling) deeply
-- Schwarzkopf, M. et al. (2013). *Omega: Flexible, Scalable Schedulers for Large Compute Clusters* — focus on the shared-state scheduling model and conflict resolution
-- Ghodsi, A. et al. (2011). *Dominant Resource Fairness: Fair Allocation of Multiple Resource Types* — the foundational paper on multi-resource fair sharing
-- Kubernetes scheduler source code — `pkg/scheduler/` directory — study `framework.go`, `generic_scheduler.go`, and the filter/score plugin architecture
+---
 
-## Difficulty Rating
-★★★★★★
+## Why this design
 
-## Estimated Time
-4–6 weeks for an experienced Elixir developer with systems programming background
+**Best-fit decreasing heuristic**: sort nodes by remaining capacity descending, then pick the node where the job fits with the smallest remaining gap. This minimizes wasted capacity per node, leaving large blocks of free capacity on other nodes for large jobs. It is O(N log N) per placement decision.
+
+**Heartbeat-based failure detection**: each worker sends a heartbeat every 5 seconds. If the scheduler misses 3 consecutive heartbeats (15 seconds), it marks the node unavailable and requeues its jobs. This is not perfect — a slow-but-alive node will generate false positives. The trade-off is between detection latency (low threshold) and false positive rate (high threshold).
+
+**Fair-share over strict priority**: strict priority scheduling starves low-priority jobs indefinitely when high-priority work is constant. Fair-share caps each user's resource consumption at a configurable percentage of cluster capacity. A user exceeding their cap has new submissions queued, not rejected, and they drain the queue as other users release resources.
+
+**Plug over Phoenix**: the scheduler API is a small set of CRUD endpoints with JSON request/response. Plug.Router and Plug.Parsers are sufficient. Adding a full framework dependency for six endpoints is YAGNI.
+
+---
+
+## Implementation milestones
+
+### Step 1: Create the project
+
+```bash
+mix new helios --sup
+cd helios
+mkdir -p lib/helios/api test/helios bench
+```
+
+### Step 2: `mix.exs` — dependencies
+
+```elixir
+defp deps do
+  [
+    {:plug_cowboy, "~> 2.7"},
+    {:jason, "~> 1.4"},
+    {:benchee, "~> 1.3", only: :dev}
+  ]
+end
+```
+
+### Step 3: Job struct and lifecycle FSM
+
+```elixir
+# lib/helios/job.ex
+defmodule Helios.Job do
+  @moduledoc """
+  Job lifecycle:
+
+    submitted → queued → scheduled → running → completed
+                                  ↘ preempted → queued (requeued)
+                           ↘ failed → dead_queue (after max_attempts)
+
+  Each transition is recorded in the audit log with a timestamp and node assignment.
+  """
+
+  @states [:submitted, :queued, :scheduled, :running, :completed, :failed, :preempted]
+
+  defstruct [
+    :id,
+    :user,
+    :command,
+    :cpu,           # units requested
+    :memory_mb,     # MB requested
+    :priority,      # 1–10
+    :state,
+    :node_id,
+    :submitted_at,
+    :started_at,
+    :completed_at,
+    :attempt
+  ]
+
+  # TODO: implement new/1 — assigns a UUID, sets state: :submitted, attempt: 1
+  # TODO: implement transition/2 — returns {:ok, updated_job} or {:error, :invalid_transition}
+  # HINT: encode allowed transitions as a map of {from, to} pairs
+end
+```
+
+### Step 4: Bin-packing placement
+
+```elixir
+# lib/helios/bin_packer.ex
+defmodule Helios.BinPacker do
+  @moduledoc """
+  Best-fit decreasing placement.
+
+  Given a list of available nodes and a job's resource request,
+  returns the node that satisfies the request with the smallest
+  remaining capacity gap (tightest fit).
+  """
+
+  @doc """
+  Returns {:ok, node} or {:error, :no_capacity}.
+
+  nodes: list of %{id, available_cpu, available_memory_mb}
+  job:   %{cpu, memory_mb}
+  """
+  def place(nodes, job) do
+    # TODO
+    # HINT: filter nodes where cpu >= job.cpu AND memory_mb >= job.memory_mb
+    # HINT: sort remaining nodes by (available_cpu - job.cpu) ascending
+    #        to get the tightest fit
+    # HINT: return the first node, or {:error, :no_capacity} if none fit
+  end
+end
+```
+
+### Step 5: REST API
+
+```elixir
+# lib/helios/api/router.ex
+defmodule Helios.API.Router do
+  use Plug.Router
+
+  plug Plug.Parsers, parsers: [:json], json_decoder: Jason
+  plug :match
+  plug :dispatch
+
+  post "/jobs" do
+    # TODO: validate body, create job, return {job_id, status: "queued"}
+    # HINT: Plug.Conn.get_req_header(conn, "content-type")
+  end
+
+  get "/jobs/:id" do
+    # TODO: look up job by id, return current state
+  end
+
+  delete "/jobs/:id" do
+    # TODO: cancel job — free resources if running, remove from queue if queued
+  end
+
+  get "/nodes" do
+    # TODO: return each node with capacity and current usage
+  end
+
+  match _ do
+    send_resp(conn, 404, ~s({"error": "not_found"}))
+  end
+end
+```
+
+### Step 6: Given tests — must pass without modification
+
+```elixir
+# test/helios/bin_packing_test.exs
+defmodule Helios.BinPackingTest do
+  use ExUnit.Case, async: true
+
+  alias Helios.BinPacker
+
+  test "selects the node with the tightest fit" do
+    nodes = [
+      %{id: :n1, available_cpu: 8, available_memory_mb: 8_000},
+      %{id: :n2, available_cpu: 4, available_memory_mb: 4_000},
+      %{id: :n3, available_cpu: 2, available_memory_mb: 2_000}
+    ]
+
+    job = %{cpu: 2, memory_mb: 2_000}
+    assert {:ok, %{id: :n3}} = BinPacker.place(nodes, job)
+  end
+
+  test "returns :no_capacity when no node fits" do
+    nodes = [%{id: :n1, available_cpu: 1, available_memory_mb: 512}]
+    job = %{cpu: 4, memory_mb: 4_000}
+    assert {:error, :no_capacity} = BinPacker.place(nodes, job)
+  end
+
+  test "never overcommits a node" do
+    nodes = [%{id: :n1, available_cpu: 3, available_memory_mb: 3_000}]
+    job = %{cpu: 4, memory_mb: 2_000}
+    assert {:error, :no_capacity} = BinPacker.place(nodes, job)
+  end
+end
+```
+
+```elixir
+# test/helios/fault_tolerance_test.exs
+defmodule Helios.FaultToleranceTest do
+  use ExUnit.Case, async: false
+
+  setup do
+    {:ok, scheduler} = Helios.Scheduler.start_link(nodes: 3)
+    {:ok, scheduler: scheduler}
+  end
+
+  test "jobs on a dead node are requeued within 30 seconds", %{scheduler: scheduler} do
+    # Submit 10 jobs that land on node 2
+    job_ids = for _ <- 1..10 do
+      {:ok, job} = Helios.submit(scheduler, %{cpu: 1, memory_mb: 512, priority: 5, user: "alice"})
+      job.id
+    end
+
+    # Wait for all to be running
+    Process.sleep(500)
+
+    # Kill node 2
+    Helios.TestHelpers.kill_node(scheduler, :node_2)
+
+    # Within 30 seconds, all jobs from node 2 must be requeued or rescheduled
+    Process.sleep(30_000)
+
+    for job_id <- job_ids do
+      state = Helios.job_state(scheduler, job_id)
+      assert state in [:queued, :running, :completed],
+        "job #{job_id} stuck in state #{state}"
+    end
+  end
+end
+```
+
+### Step 7: Run the tests
+
+```bash
+mix test test/helios/ --trace
+```
+
+### Step 8: Benchmark
+
+```elixir
+# bench/placement_bench.exs
+nodes = for i <- 1..50 do
+  %{id: :"node_#{i}", available_cpu: 32, available_memory_mb: 64_000}
+end
+
+jobs = for _ <- 1..1_000 do
+  %{cpu: :rand.uniform(8), memory_mb: :rand.uniform(8_000) * 512}
+end
+
+Benchee.run(
+  %{
+    "bin-pack — 1000 jobs × 50 nodes" => fn ->
+      Enum.each(jobs, fn job -> Helios.BinPacker.place(nodes, job) end)
+    end
+  },
+  time: 5,
+  warmup: 2,
+  formatters: [Benchee.Formatters.Console]
+)
+```
+
+---
+
+## Trade-off analysis
+
+| Aspect | Best-fit decreasing | First-fit decreasing | Random placement |
+|--------|--------------------|--------------------|-----------------|
+| Utilization | high (tight fit) | medium | low |
+| Placement time | O(N log N) | O(N) | O(1) |
+| Fragmentation | low | moderate | high |
+| Preemption frequency | lower (fits more) | moderate | higher |
+| Implementation complexity | moderate | simple | trivial |
+
+Fill in measured placement latency from the benchmark.
+
+Architectural question: the Omega paper (Schwarzkopf et al.) proposes optimistic scheduling with conflict detection instead of pessimistic locking of the cluster state. Under what workload conditions does optimistic scheduling outperform the pessimistic approach you built?
+
+---
+
+## Common production mistakes
+
+**1. Overcommitting on the scheduling decision**
+Placement assigns a job to a node, but the node's available capacity is not decremented until the job actually starts. A window exists where multiple jobs are assigned to the same node before any of them start, causing overcommit. Decrement capacity at assignment time, not at execution time.
+
+**2. Preemption without guaranteed requeue**
+Before evicting a low-priority job, verify there is a node where it can be rescheduled. If no node can accept the evicted job and the high-priority job, you have evicted a job for nothing. Check requeue feasibility before committing to the eviction.
+
+**3. Fair-share measured at point-in-time only**
+A user's fair-share consumption should be measured over a rolling window, not instantaneously. A user who ran 100% of cluster for 1 second and 0% for the next 59 seconds should be counted differently from one who ran 100% for 60 seconds. Use a sliding window EMA.
+
+**4. Heartbeat timeout too aggressive**
+Setting the heartbeat timeout too low causes frequent false-positive node failures, triggering unnecessary job requeues and disrupting running work. Calibrate the timeout based on your network's p99 round-trip time, not its p50.
+
+---
+
+## Resources
+
+- Hindman, B. et al. (2011). *Mesos: A Platform for Fine-Grained Resource Sharing in the Data Center* — section 3 (architecture) and section 4 (two-level scheduling)
+- Schwarzkopf, M. et al. (2013). *Omega: Flexible, Scalable Schedulers for Large Compute Clusters* — shared-state scheduling and conflict resolution
+- Ghodsi, A. et al. (2011). *Dominant Resource Fairness: Fair Allocation of Multiple Resource Types* — multi-resource fair sharing
+- [Plug documentation](https://hexdocs.pm/plug/) — `Plug.Router`, `Plug.Parsers`, and the Plug specification

@@ -1,708 +1,370 @@
-# 11. Streams y Lazy Evaluation
+# Streams and Lazy Evaluation
 
-**Difficulty**: Intermedio
-
----
-
-## Prerequisites
-
-- Enum.map/filter/reduce
-- Comprensión de evaluación ansiosa (eager)
-- Ficheros y IO básico en Elixir
-- Ejercicio 10: Comprehensions Avanzadas
+**Project**: `task_queue` — built incrementally across the intermediate level
 
 ---
 
-## Learning Objectives
+## Project context
 
-1. Entender la diferencia entre evaluación eager (Enum) y lazy (Stream)
-2. Construir pipelines de Stream sin consumir memoria hasta el final
-3. Usar `Stream.iterate/2` y `Stream.cycle/1` para streams infinitos
-4. Procesar ficheros grandes línea a línea con `Stream.resource/3` y `File.stream!/1`
-5. Combinar streams con `Stream.flat_map/2` y `Stream.transform/3`
-6. Saber cuándo elegir Stream sobre Enum y viceversa
+The task_queue system writes job results to a log file and needs to read them back for
+reporting. A log file with 10 million entries cannot be loaded into memory with
+`File.read!`. The system also needs to generate scheduling sequences (cron trigger times)
+that are conceptually infinite — you stop when you have enough, not when the sequence ends.
 
----
+Streams solve both problems: they produce values on demand, one at a time, without
+materializing the entire sequence in memory.
 
-## Concepts
+Project structure at this point:
 
-### Eager vs Lazy
-
-Con `Enum`, cada operación materializa una colección completa en memoria:
-
-```elixir
-# Eager — crea 3 listas intermedias
-[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
-|> Enum.map(&(&1 * 2))      # [2, 4, 6, 8, 10, 12, 14, 16, 18, 20]
-|> Enum.filter(&(&1 > 10))  # [12, 14, 16, 18, 20]
-|> Enum.take(3)             # [12, 14, 16]
 ```
-
-Con `Stream`, las operaciones se encadenan como una descripción y solo se ejecutan cuando se necesita un resultado:
-
-```elixir
-# Lazy — no hace nada hasta el Enum.to_list/take final
-[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
-|> Stream.map(&(&1 * 2))
-|> Stream.filter(&(&1 > 10))
-|> Enum.take(3)   # <- aquí se ejecuta todo de una vez, elemento a elemento
-# [12, 14, 16]
-```
-
-La diferencia de rendimiento es enorme cuando trabajas con colecciones grandes o potencialmente infinitas.
-
-### Funciones principales de Stream
-
-```elixir
-# Transformación
-Stream.map(stream, fun)
-Stream.flat_map(stream, fun)   # fun devuelve enumerable, se aplana
-Stream.filter(stream, pred)
-Stream.reject(stream, pred)
-
-# Limitación
-Stream.take(stream, n)         # toma los primeros n elementos
-Stream.take_while(stream, pred)
-Stream.drop(stream, n)
-Stream.drop_while(stream, pred)
-
-# Generación
-Stream.iterate(inicial, fun)   # fun(inicial), fun(fun(inicial)), ...
-Stream.repeatedly(fun)         # llama fun infinitamente
-Stream.cycle(enumerable)       # repite el enumerable sin fin
-
-# Combinación
-Stream.zip(s1, s2)
-Stream.concat(s1, s2)
-Stream.with_index(stream)
-
-# Control
-Stream.chunk_every(stream, n)
-Stream.each(stream, fun)       # side effects, devuelve stream original
-```
-
-### Stream.iterate — Streams Infinitos
-
-```elixir
-# Fibonacci infinito
-fib = Stream.iterate({0, 1}, fn {a, b} -> {b, a + b} end)
-      |> Stream.map(&elem(&1, 0))
-
-Enum.take(fib, 10)
-# [0, 1, 1, 2, 3, 5, 8, 13, 21, 34]
-
-# Números naturales
-naturales = Stream.iterate(1, &(&1 + 1))
-Enum.take(naturales, 5)  # [1, 2, 3, 4, 5]
-
-# Potencias de 2
-potencias = Stream.iterate(1, &(&1 * 2))
-Enum.take(potencias, 8)  # [1, 2, 4, 8, 16, 32, 64, 128]
-```
-
-### File.stream! — Ficheros Grandes
-
-```elixir
-# Sin cargar todo en memoria — línea a línea
-"datos.csv"
-|> File.stream!()
-|> Stream.map(&String.trim/1)
-|> Stream.filter(&(String.length(&1) > 0))
-|> Stream.map(&parsear_linea/1)
-|> Enum.each(&insertar_en_db/1)
-
-# chunk_every para procesar en batches
-"datos.csv"
-|> File.stream!()
-|> Stream.map(&String.trim/1)
-|> Stream.chunk_every(1000)    # procesa 1000 líneas a la vez
-|> Enum.each(&insertar_batch/1)
-```
-
-### Stream.resource — Streams Personalizados
-
-`Stream.resource/3` es la primitiva de bajo nivel para crear streams desde recursos externos:
-
-```elixir
-# Estructura: Stream.resource(iniciar_fn, siguiente_fn, limpiar_fn)
-# - iniciar_fn: devuelve el estado inicial del recurso
-# - siguiente_fn: recibe estado, devuelve {[elementos], nuevo_estado} o {:halt, estado}
-# - limpiar_fn: libera el recurso al terminar
-
-Stream.resource(
-  fn -> File.open!("datos.csv", [:read]) end,   # abrir fichero
-  fn file ->
-    case IO.read(file, :line) do
-      :eof  -> {:halt, file}
-      linea -> {[String.trim(linea)], file}
-    end
-  end,
-  fn file -> File.close(file) end               # cerrar siempre
-)
-|> Enum.take(5)
+task_queue/
+├── lib/
+│   └── task_queue/
+│       └── log_reader.ex        # ← you implement this
+├── test/
+│   └── task_queue/
+│       └── streams_test.exs     # given tests — must pass without modification
+└── mix.exs
 ```
 
 ---
 
-## Exercises
+## Eager vs lazy — the memory model
 
-### Exercise 1: Procesar CSV de 1M líneas sin cargar en RAM
+`Enum` is eager: it processes the entire collection and materializes the result before
+returning. Pipelines like `list |> Enum.filter(...) |> Enum.map(...)` allocate two
+intermediate lists.
 
-Implementa un procesador de fichero CSV que lea, valide, transforme y agregue datos en streaming.
+`Stream` is lazy: each element passes through the entire pipeline before the next element
+enters. No intermediate collection is allocated. The pipeline does not execute at all until
+a terminal function (`Enum.to_list`, `Enum.take`, `Stream.run`) consumes it.
+
+```
+Enum (eager):
+  input → [filter → intermediate list] → [map → final list]
+
+Stream (lazy):
+  element_1 → filter → map → consumer
+  element_2 → filter → map → consumer
+  element_3 → filter (dropped)
+  element_4 → filter → map → consumer
+```
+
+This matters when:
+- The input is larger than available memory (file, network stream, paginated API).
+- You only need the first N results — lazy evaluation stops early.
+- The collection is conceptually infinite (sequence generators).
+
+This does not matter when:
+- The full result is needed and it fits in memory — `Enum` is simpler.
+- The collection is small — lazy overhead (function calls per element) exceeds the savings.
+
+---
+
+## The business problem
+
+`TaskQueue.LogReader` processes task_queue log files:
+
+1. Read a large log file line by line, parsing each line into a structured map.
+2. Filter, transform, and aggregate without loading the file into memory.
+3. Generate a stream of scheduled cron trigger times using `Stream.iterate`.
+4. Implement a bounded retry stream: given a failing operation, retry with backoff until
+   success or max attempts reached.
+
+---
+
+## Implementation
+
+### Step 1: `lib/task_queue/log_reader.ex`
 
 ```elixir
-# Archivo: lib/csv_streamer.ex
-
-defmodule CSVStreamer do
+defmodule TaskQueue.LogReader do
   @moduledoc """
-  Procesador de CSV gigante usando Stream para O(1) de memoria.
-
-  Formato del CSV (con cabecera):
-  id,producto,categoria,cantidad,precio,fecha
-  1,Silla,Muebles,10,99.50,2026-01-15
-  2,Mesa,Muebles,3,249.00,2026-01-16
-  ...
+  Processes task_queue log files using lazy streams.
+  File I/O never loads more than one line into memory at a time.
   """
+
+  # Log line format: "timestamp|job_id|status|duration_ms|worker_id"
+  # Example: "1712345678000|job_abc|ok|123|worker_1"
 
   @doc """
-  Devuelve un Stream de líneas del fichero, descartando la cabecera y líneas vacías.
-  No carga el fichero en memoria.
+  Returns a lazy stream of parsed log entries from a file.
+  Each element is a map: %{timestamp: integer, job_id: string, status: atom,
+                            duration_ms: integer, worker_id: string}
+  Lines that do not match the expected format are silently skipped.
   """
-  def leer_stream(path) do
-    # TODO: File.stream!/1 -> Stream.drop(1) para saltar cabecera
-    # -> Stream.map para String.trim
-    # -> Stream.reject para líneas vacías (String.length == 0)
+  @spec stream_file(Path.t()) :: Enumerable.t()
+  def stream_file(path) do
+    # HINT: File.stream!(path) produces a stream of lines (with trailing newline)
+    # HINT: Stream.map to String.trim each line
+    # HINT: Stream.filter to keep non-empty lines
+    # HINT: Stream.map to parse_line/1
+    # HINT: Stream.filter to reject :error (keep only {:ok, entry} values)
+    # HINT: Stream.map to unwrap {:ok, entry} → entry
+    # TODO: implement
   end
 
   @doc """
-  Parsea una línea CSV a un mapa.
-  Devuelve {:ok, mapa} o {:error, razon}.
+  Returns the count of entries with the given status in the log file.
+  Processes the file as a stream — O(1) memory regardless of file size.
   """
-  def parsear_linea(linea) do
-    case String.split(linea, ",") do
-      [id, producto, categoria, cantidad_str, precio_str, fecha] ->
-        with {cantidad, ""} <- Integer.parse(cantidad_str),
-             {precio, ""}   <- Float.parse(precio_str) do
+  @spec count_by_status(Path.t(), atom()) :: non_neg_integer()
+  def count_by_status(path, status) do
+    # HINT: stream_file(path) |> Stream.filter(...) |> Enum.count()
+    # TODO: implement
+  end
+
+  @doc """
+  Returns the first `n` failed entries from the log file.
+  Stops reading the file after finding n failures — does not scan the whole file.
+  """
+  @spec first_failures(Path.t(), pos_integer()) :: [map()]
+  def first_failures(path, n) do
+    # HINT: stream_file(path) |> Stream.filter(status == :error) |> Enum.take(n)
+    # TODO: implement
+  end
+
+  @doc """
+  Generates an infinite stream of cron trigger timestamps starting from `start_ms`,
+  with each trigger `interval_ms` apart.
+
+  Returns a Stream that yields integers (Unix millisecond timestamps).
+  The caller controls how many to take.
+  """
+  @spec cron_schedule_stream(pos_integer(), pos_integer()) :: Enumerable.t()
+  def cron_schedule_stream(start_ms, interval_ms) do
+    # HINT: Stream.iterate(start_ms, fn ts -> ts + interval_ms end)
+    # This produces an infinite stream — never enumerate it without Enum.take/Stream.take
+    # TODO: implement
+  end
+
+  @doc """
+  Returns the next `count` trigger timestamps starting at or after `after_ms`.
+  """
+  @spec next_triggers(pos_integer(), pos_integer(), pos_integer()) :: [pos_integer()]
+  def next_triggers(after_ms, interval_ms, count) do
+    # HINT: cron_schedule_stream(after_ms, interval_ms) |> Enum.take(count)
+    # TODO: implement
+  end
+
+  @doc """
+  Retries `operation` (a zero-arg function) up to `max_attempts` times with
+  exponential backoff between attempts.
+
+  Returns {:ok, result} on first success or {:error, :max_attempts} on final failure.
+  Uses Stream.resource/3 to model the retry sequence as a lazy stream.
+  """
+  @spec retry_stream((() -> {:ok, any()} | {:error, any()}), pos_integer()) ::
+          {:ok, any()} | {:error, :max_attempts}
+  def retry_stream(operation, max_attempts) do
+    1..max_attempts
+    |> Stream.map(fn attempt ->
+      backoff_ms = if attempt > 1, do: (100 * :math.pow(2, attempt - 2)) |> round(), else: 0
+      if backoff_ms > 0, do: Process.sleep(backoff_ms)
+      {attempt, operation.()}
+    end)
+    |> Stream.drop_while(fn {_attempt, result} ->
+      # HINT: keep iterating (drop) while result is {:error, _}
+      # Stop (keep) when result is {:ok, _}
+      # TODO: implement
+    end)
+    |> Enum.take(1)
+    |> case do
+      [{_attempt, {:ok, _} = success}] -> success
+      _ -> {:error, :max_attempts}
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Private
+  # ---------------------------------------------------------------------------
+
+  @spec parse_line(String.t()) :: {:ok, map()} | :error
+  defp parse_line(line) do
+    case String.split(line, "|") do
+      [ts_str, job_id, status_str, duration_str, worker_id] ->
+        with {ts, ""} <- Integer.parse(ts_str),
+             {duration_ms, ""} <- Integer.parse(duration_str),
+             status when status in [:ok, :error, :timeout] <-
+               String.to_existing_atom(status_str) do
           {:ok, %{
-            id:        id,
-            producto:  producto,
-            categoria: categoria,
-            cantidad:  cantidad,
-            precio:    precio,
-            fecha:     fecha
+            timestamp: ts,
+            job_id: job_id,
+            status: status,
+            duration_ms: duration_ms,
+            worker_id: worker_id
           }}
         else
-          _ -> {:error, "Formato numérico inválido en: #{linea}"}
+          _ -> :error
         end
 
       _ ->
-        {:error, "Número de columnas incorrecto: #{linea}"}
+        :error
+    end
+  end
+end
+```
+
+### Step 2: Given tests — must pass without modification
+
+```elixir
+# test/task_queue/streams_test.exs
+defmodule TaskQueue.StreamsTest do
+  use ExUnit.Case, async: true
+
+  alias TaskQueue.LogReader
+
+  @log_content """
+  1712345678000|job_001|ok|50|worker_1
+  1712345679000|job_002|error|200|worker_1
+  1712345680000|job_003|ok|30|worker_2
+  1712345681000|job_004|error|100|worker_2
+  1712345682000|job_005|ok|500|worker_1
+  1712345683000|job_006|timeout|80|worker_3
+  INVALID_LINE
+  """
+
+  setup do
+    path = Path.join(System.tmp_dir!(), "task_queue_test_#{:rand.uniform(999_999)}.log")
+    File.write!(path, @log_content)
+    on_exit(fn -> File.rm(path) end)
+    {:ok, path: path}
+  end
+
+  describe "stream_file/1" do
+    test "parses valid lines and skips invalid ones", %{path: path} do
+      entries = LogReader.stream_file(path) |> Enum.to_list()
+      assert length(entries) == 6
+      assert Enum.all?(entries, &is_map/1)
+      assert Enum.all?(entries, &Map.has_key?(&1, :job_id))
+    end
+
+    test "correctly parses job_id and status", %{path: path} do
+      first = LogReader.stream_file(path) |> Enum.at(0)
+      assert first.job_id == "job_001"
+      assert first.status == :ok
+      assert first.duration_ms == 50
     end
   end
 
-  @doc """
-  Stream de mapas válidos. Las líneas con error se descartan (y se loguean a stderr).
-  """
-  def stream_valido(path) do
-    path
-    |> leer_stream()
-    |> Stream.map(&parsear_linea/1)
-    |> Stream.each(fn
-      {:error, razon} -> IO.warn("Línea descartada: #{razon}")
-      _               -> :ok
-    end)
-    |> Stream.filter(fn
-      # TODO: pasar solo los {:ok, _}
-    end)
-    |> Stream.map(fn
-      # TODO: extraer el mapa del {:ok, mapa}
-    end)
+  describe "count_by_status/2" do
+    test "counts ok entries", %{path: path} do
+      assert 3 = LogReader.count_by_status(path, :ok)
+    end
+
+    test "counts error entries", %{path: path} do
+      assert 2 = LogReader.count_by_status(path, :error)
+    end
   end
 
-  @doc """
-  Calcula el total de ventas (suma de cantidad * precio) por categoría.
-  Lee el fichero UNA sola vez. Devuelve %{categoria => total}.
-  """
-  def totales_por_categoria(path) do
-    path
-    |> stream_valido()
-    |> Enum.reduce(%{}, fn %{categoria: cat, cantidad: c, precio: p}, acc ->
-      # TODO: actualizar acc[cat] sumando c * p
-      # Pista: Map.update(acc, cat, c * p, fn prev -> prev + c * p end)
-    end)
+  describe "first_failures/2" do
+    test "returns at most n failures", %{path: path} do
+      failures = LogReader.first_failures(path, 1)
+      assert length(failures) == 1
+      assert hd(failures).status == :error
+    end
+
+    test "returns all failures when n exceeds count", %{path: path} do
+      failures = LogReader.first_failures(path, 100)
+      assert length(failures) == 2
+    end
   end
 
-  @doc """
-  Devuelve las primeras n filas de una categoría específica sin leer el fichero entero.
-  """
-  def primeras_de_categoria(path, categoria, n) do
-    path
-    |> stream_valido()
-    |> Stream.filter(fn %{categoria: cat} ->
-      # TODO: filtrar por categoría
-    end)
-    |> Enum.take(n)
-    # Enum.take/2 para el stream cuando ya tiene n elementos — no lee más del fichero
+  describe "cron_schedule_stream/2" do
+    test "generates trigger times at the given interval" do
+      triggers = LogReader.next_triggers(1_000_000, 3_600_000, 3)
+      assert [1_000_000, 4_600_000, 8_200_000] = triggers
+    end
+
+    test "stream is infinite — Enum.take stops it without error" do
+      stream = LogReader.cron_schedule_stream(0, 1_000)
+      first_10 = Enum.take(stream, 10)
+      assert length(first_10) == 10
+      assert Enum.at(first_10, 0) == 0
+      assert Enum.at(first_10, 9) == 9_000
+    end
   end
 
-  @doc """
-  Genera un fichero de reporte CSV con los totales por categoría.
-  Escribe línea a línea sin construir el string completo en memoria.
-  """
-  def escribir_reporte(totales, output_path) do
-    # totales es un mapa %{categoria => total}
-    lineas =
-      [
-        "categoria,total_euros\n"
-        | totales
-          |> Enum.sort_by(fn {_cat, total} -> total end, :desc)
-          |> Enum.map(fn {cat, total} ->
-            # TODO: formatear como "#{cat},#{:erlang.float_to_binary(total, [decimals: 2])}\n"
-          end)
-      ]
+  describe "retry_stream/2" do
+    test "returns result on first success" do
+      op = fn -> {:ok, :result} end
+      assert {:ok, :result} = LogReader.retry_stream(op, 3)
+    end
 
-    # TODO: Usar File.write!/2 con el contenido construido como IOList
-    # Para ficheros muy grandes, usar Stream.into/2 o File.open + IO.write en stream
-    File.write!(output_path, lineas)
+    test "retries and succeeds on second attempt" do
+      calls = Agent.start_link(fn -> 0 end) |> elem(1)
+      op = fn ->
+        n = Agent.get_and_update(calls, fn n -> {n + 1, n + 1} end)
+        if n < 2, do: {:error, :not_yet}, else: {:ok, :success}
+      end
+      assert {:ok, :success} = LogReader.retry_stream(op, 5)
+      Agent.stop(calls)
+    end
+
+    test "returns error after max attempts" do
+      op = fn -> {:error, :always_fails} end
+      assert {:error, :max_attempts} = LogReader.retry_stream(op, 3)
+    end
   end
 end
 ```
 
-**Script de generación de datos de prueba** (crea un CSV de prueba):
-
-```elixir
-# En iex para generar datos de prueba:
-defmodule CSVGen do
-  def generar(path, n_filas) do
-    categorias = ["Muebles", "Hogar", "Electrónica", "Ropa", "Libros"]
-    productos  = ["Item A", "Item B", "Item C", "Item D", "Item E"]
-
-    cabecera = "id,producto,categoria,cantidad,precio,fecha\n"
-    filas =
-      1..n_filas
-      |> Stream.map(fn i ->
-        cat = Enum.at(categorias, rem(i, 5))
-        prod = Enum.at(productos, rem(i, 5))
-        cant = rem(i, 10) + 1
-        precio = 10.0 + rem(i, 100)
-        fecha = "2026-01-#{String.pad_leading(to_string(rem(i, 28) + 1), 2, "0")}"
-        "#{i},#{prod},#{cat},#{cant},#{precio},#{fecha}\n"
-      end)
-      |> Enum.to_list()
-
-    File.write!(path, [cabecera | filas])
-    IO.puts("Generadas #{n_filas} filas en #{path}")
-  end
-end
-
-CSVGen.generar("/tmp/ventas.csv", 100_000)
-```
-
-**Verificación esperada:**
-
-```elixir
-# Con el fichero generado:
-totales = CSVStreamer.totales_por_categoria("/tmp/ventas.csv")
-# %{"Muebles" => 123456.0, "Hogar" => 98765.0, ...}
-
-CSVStreamer.primeras_de_categoria("/tmp/ventas.csv", "Muebles", 3)
-# [%{id: ..., categoria: "Muebles", ...}, ...]  <- solo 3 elementos
-
-CSVStreamer.escribir_reporte(totales, "/tmp/reporte.csv")
-# Escribe fichero CSV con categorías ordenadas por total desc
-```
-
----
-
-### Exercise 2: Fibonacci y Streams Infinitos
-
-Implementa varios streams infinitos útiles y funciones sobre ellos.
-
-```elixir
-# Archivo: lib/infinite_streams.ex
-
-defmodule InfiniteStreams do
-  @doc """
-  Stream infinito de números de Fibonacci: 0, 1, 1, 2, 3, 5, 8, 13, ...
-  """
-  # TODO: Stream.iterate con estado {a, b} = {0, 1}
-  # Cada paso: {b, a + b}
-  # Extraer el primer elemento de la tupla con Stream.map
-  def fibonacci do
-  end
-
-  @doc """
-  Stream infinito de números primos usando criba de Eratóstenes incremental.
-  Enfoque simplificado: para cada n, verificar si es primo.
-  """
-  # TODO: Stream.iterate(2, &(&1 + 1)) — todos los enteros desde 2
-  # Stream.filter con es_primo?/1
-  def primos do
-    Stream.iterate(2, &(&1 + 1))
-    |> Stream.filter(&es_primo?/1)
-  end
-
-  # TODO: Implementar es_primo?/1
-  # Un número n es primo si no tiene divisores entre 2 y floor(sqrt(n))
-  # Pista: Enum.all?(2..trunc(:math.sqrt(n)), fn d -> rem(n, d) != 0 end)
-  # Caso base: n < 2 -> false
-  defp es_primo?(n) when n < 2, do: false
-  defp es_primo?(2),             do: true
-  defp es_primo?(n) do
-  end
-
-  @doc """
-  Stream infinito que cicla sobre una lista de colores.
-  """
-  # TODO: Stream.cycle/1 sobre la lista de colores
-  def semaforo_colores do
-    Stream.cycle([:rojo, :amarillo, :verde])
-  end
-
-  @doc """
-  Devuelve los primeros n números de Fibonacci mayores que min_value.
-  """
-  # TODO: Stream.drop_while + Enum.take
-  def fibonacci_mayores_que(min_value, n) do
-  end
-
-  @doc """
-  Devuelve el N-ésimo número primo (1-indexed).
-  """
-  # TODO: Stream.drop + Stream.take o Enum.at
-  def primo_n(n) when n > 0 do
-  end
-
-  @doc """
-  Zip de fibonacci con primos: [{fib_n, primo_n}] para los primeros n pares.
-  """
-  # TODO: Stream.zip + Enum.take
-  def fib_primo_pairs(n) do
-  end
-
-  @doc """
-  Genera un stream de "ventanas deslizantes" de tamaño window sobre otro stream.
-  Ej: ventana([1,2,3,4,5], 3) -> [[1,2,3],[2,3,4],[3,4,5]]
-  """
-  # TODO: Usar Stream.chunk_every(stream, window, 1, :discard)
-  def ventanas(stream, window) do
-  end
-
-  @doc """
-  Detecta si una secuencia de Fibonacci tiene un patrón de suma de dígitos
-  repetido. Devuelve el primer n donde sum_digits(fib(n)) == target.
-  """
-  # TODO: fibonacci() |> Stream.with_index |> Stream.find
-  # sum_digits: convertir a string, split en chars, parsear y sumar
-  def fibonacci_con_suma_digitos(target) do
-  end
-end
-```
-
-**Verificación esperada:**
-
-```elixir
-Enum.take(InfiniteStreams.fibonacci(), 10)
-# [0, 1, 1, 2, 3, 5, 8, 13, 21, 34]
-
-Enum.take(InfiniteStreams.primos(), 10)
-# [2, 3, 5, 7, 11, 13, 17, 19, 23, 29]
-
-InfiniteStreams.semaforo_colores() |> Enum.take(7)
-# [:rojo, :amarillo, :verde, :rojo, :amarillo, :verde, :rojo]
-
-InfiniteStreams.fibonacci_mayores_que(100, 5)
-# [144, 233, 377, 610, 987]
-
-InfiniteStreams.primo_n(10)
-# 29
-
-InfiniteStreams.fib_primo_pairs(5)
-# [{0,2},{1,3},{1,5},{2,7},{3,11}]
-
-InfiniteStreams.ventanas(1..6, 3) |> Enum.to_list()
-# [[1,2,3],[2,3,4],[3,4,5],[4,5,6]]
-
-InfiniteStreams.fibonacci_con_suma_digitos(9)
-# devuelve {valor_fib, indice} donde los dígitos suman 9
-```
-
----
-
-### Exercise 3: Merge de Múltiples Streams
-
-Implementa un sistema de merge e intercalado de streams, útil para combinar fuentes de datos concurrentes.
-
-```elixir
-# Archivo: lib/stream_merger.ex
-
-defmodule StreamMerger do
-  @doc """
-  Intercala elementos de múltiples streams en round-robin.
-  Termina cuando el stream más corto se agota.
-
-  Ej: interleave([[1,2,3],[a,b,c],[x,y,z]]) -> [1,a,x, 2,b,y, 3,c,z]
-  """
-  # TODO: Stream.zip_with/2 para zipar los streams
-  # zip_with devuelve una función que combina los elementos en tupla o lista
-  # Luego Stream.flat_map para aplanar
-  def interleave(streams) do
-    streams
-    |> Stream.zip_with(fn elementos -> elementos end)
-    |> Stream.flat_map(fn elementos ->
-      # TODO: convertir la lista de elementos en una lista (ya lo es)
-    end)
-  end
-
-  @doc """
-  Merge de streams ordenados — asume que cada stream está ordenado.
-  Devuelve un stream con todos los elementos en orden.
-
-  Solo funciona con streams finitos (materializa en Enum.sort final).
-  """
-  # TODO: Stream.concat todos los streams, luego Enum.sort al final
-  # Para merge verdaderamente lazy necesitaríamos un heap, aquí simplificamos
-  def merge_sorted(streams) do
-    streams
-    |> Stream.concat()
-    |> Enum.sort()
-  end
-
-  @doc """
-  Combina dos streams aplicando una función binaria a cada par de elementos.
-  Como Stream.zip pero con transformación.
-  Ej: zip_map([1,2,3], [10,20,30], &+/2) -> [11, 22, 33]
-  """
-  # TODO: Stream.zip(s1, s2) |> Stream.map(fn {a, b} -> fun.(a, b) end)
-  def zip_map(stream1, stream2, fun) do
-  end
-
-  @doc """
-  Particiona un stream en dos según un predicado.
-  Devuelve {stream_true, stream_false}.
-
-  NOTA: Para streams lazy puros, la partición requiere materializar.
-  Esta implementación hace Enum.split_with y devuelve las listas.
-  """
-  def partition(stream, pred) do
-    # TODO: Enum.split_with/2
-  end
-
-  @doc """
-  Toma streams de eventos de múltiples "sensores" y los normaliza
-  a un formato común añadiendo el nombre del sensor.
-
-  sensores = [
-    {"sensor_1", stream_de_lecturas_1},
-    {"sensor_2", stream_de_lecturas_2},
-    ...
-  ]
-
-  Cada lectura es un número. El resultado es un stream de:
-  %{sensor: nombre, valor: lectura, timestamp: monotonic_ms}
-  """
-  def normalizar_sensores(sensores) do
-    sensores
-    |> Enum.map(fn {nombre, stream} ->
-      # TODO: Stream.map sobre el stream del sensor
-      # Para cada lectura, construir el mapa con sensor, valor y timestamp
-      # Pista: :erlang.monotonic_time(:millisecond)
-      Stream.map(stream, fn lectura ->
-      end)
-    end)
-    |> Stream.concat()
-    # concat aplana la lista de streams en un solo stream secuencial
-    # (no es un merge concurrente real, es secuencial)
-  end
-
-  @doc """
-  Agrupa elementos consecutivos de un stream que cumplan el mismo predicado.
-  chunk_by — si pred(elem) cambia de valor, empieza un nuevo chunk.
-
-  Ej: agrupar_consecutivos([1,1,2,3,3,3,1], &(&1)) -> [[1,1],[2],[3,3,3],[1]]
-  """
-  # TODO: Stream.chunk_by/2 con la función dada
-  def agrupar_consecutivos(stream, fun) do
-  end
-
-  @doc """
-  Aplica una función acumuladora que puede emitir múltiples valores por elemento.
-  Útil para "expandir" elementos del stream.
-
-  Ej: expand([1,2,3], fn n -> 1..n end) -> [1, 1,2, 1,2,3]
-  """
-  # TODO: Stream.flat_map/2
-  def expand(stream, fun) do
-  end
-end
-```
-
-**Verificación esperada:**
-
-```elixir
-# interleave
-StreamMerger.interleave([[1, 2, 3], [:a, :b, :c], [:x, :y, :z]])
-|> Enum.to_list()
-# [1, :a, :x, 2, :b, :y, 3, :c, :z]
-
-# merge_sorted
-StreamMerger.merge_sorted([[1, 4, 7], [2, 5, 8], [3, 6, 9]])
-# [1, 2, 3, 4, 5, 6, 7, 8, 9]
-
-# zip_map
-StreamMerger.zip_map([1, 2, 3], [10, 20, 30], &+/2)
-|> Enum.to_list()
-# [11, 22, 33]
-
-StreamMerger.zip_map(
-  InfiniteStreams.fibonacci(),
-  InfiniteStreams.primos(),
-  fn f, p -> f + p end
-) |> Enum.take(5)
-# [2, 4, 6, 9, 14]  (fib + primo para los primeros 5)
-
-# partition
-{pares, impares} = StreamMerger.partition(1..10, &(rem(&1, 2) == 0))
-pares    # [2, 4, 6, 8, 10]
-impares  # [1, 3, 5, 7, 9]
-
-# agrupar_consecutivos
-StreamMerger.agrupar_consecutivos([1, 1, 2, 3, 3, 3, 1], &(&1))
-|> Enum.to_list()
-# [[1, 1], [2], [3, 3, 3], [1]]
-
-# expand
-StreamMerger.expand([1, 2, 3], fn n -> 1..n end)
-|> Enum.to_list()
-# [1, 1, 2, 1, 2, 3]
-```
-
----
-
-## Common Mistakes
-
-### 1. Olvidar que Stream no hace nada hasta el terminal
-
-```elixir
-# MAL — cree que esto imprime algo
-stream = Stream.map([1, 2, 3], &IO.puts/1)  # solo crea la descripción
-
-# BIEN — necesita un terminal (Enum.*) para ejecutar
-Stream.map([1, 2, 3], &IO.puts/1) |> Stream.run()
-# o
-Stream.each([1, 2, 3], &IO.puts/1) |> Stream.run()
-```
-
-### 2. Crear stream infinito y olvidar limitarlo
-
-```elixir
-# MAL — bloquea para siempre (o hasta OOM)
-Stream.iterate(1, &(&1 + 1)) |> Enum.to_list()
-
-# BIEN — siempre limitar streams infinitos con take o similares
-Stream.iterate(1, &(&1 + 1)) |> Enum.take(1000)
-```
-
-### 3. Usar Stream cuando Enum es suficiente
-
-```elixir
-# INNECESARIO — para listas pequeñas, Stream tiene overhead
-small_list = [1, 2, 3, 4, 5]
-result = small_list |> Stream.map(&(&1 * 2)) |> Enum.to_list()
-
-# MEJOR — Enum directo para colecciones que caben en memoria
-result = Enum.map(small_list, &(&1 * 2))
-```
-
-### 4. File.stream! sin gestión de errores
-
-```elixir
-# MAL — falla si el fichero no existe o no hay permisos
-File.stream!("/ruta/que/no/existe")
-|> Enum.each(&IO.puts/1)
-
-# BIEN — verificar existencia o manejar la excepción
-case File.stat("/ruta/fichero.csv") do
-  {:ok, _} ->
-    File.stream!("/ruta/fichero.csv") |> Enum.each(&IO.puts/1)
-  {:error, reason} ->
-    {:error, "No se puede abrir el fichero: #{reason}"}
-end
-```
-
-### 5. Stream.resource sin limpiar el recurso
-
-```elixir
-# MAL — el fichero queda abierto si el stream se abandona a medias
-Stream.resource(
-  fn -> File.open!("datos.txt") end,
-  fn f -> case IO.read(f, :line) do
-    :eof -> {:halt, f}
-    l    -> {[l], f}
-  end end,
-  fn _f -> :ok end   # <- no cierra el fichero!
-)
-
-# BIEN — siempre cerrar en la función de limpieza
-Stream.resource(
-  fn -> File.open!("datos.txt") end,
-  fn f -> case IO.read(f, :line) do
-    :eof -> {:halt, f}
-    l    -> {[l], f}
-  end end,
-  fn f -> File.close(f) end   # <- siempre se ejecuta, incluso en errores
-)
-```
-
----
-
-## Verification
+### Step 3: Run the tests
 
 ```bash
-# Generar fichero de prueba
-iex -S mix
-# > CSVGen.generar("/tmp/ventas_test.csv", 10_000)
-
-# Ejecutar tests
-mix test
-
-# Verificar uso de memoria (no debe crecer con ficheros grandes)
-mix run -e 'CSVStreamer.totales_por_categoria("/tmp/ventas_test.csv") |> IO.inspect()'
-```
-
-```elixir
-# Smoke tests en iex:
-
-# Exercise 1
-CSVStreamer.primeras_de_categoria("/tmp/ventas_test.csv", "Muebles", 3)
-
-# Exercise 2
-InfiniteStreams.fibonacci() |> Enum.take(15)
-InfiniteStreams.primos() |> Enum.take(20)
-InfiniteStreams.primo_n(100)   # el primo 100
-
-# Exercise 3
-StreamMerger.interleave([1..3, 4..6, 7..9]) |> Enum.to_list()
-StreamMerger.agrupar_consecutivos(
-  Stream.iterate(1, fn x -> if rem(x, 3) == 0, do: x + 1, else: x + 1 end) |> Enum.take(9),
-  &(rem(&1, 3))
-)
+mix test test/task_queue/streams_test.exs --trace
 ```
 
 ---
 
-## Summary
+## Trade-off analysis
 
-`Stream` es la herramienta correcta cuando los datos son demasiado grandes para caber en memoria, cuando la fuente es potencialmente infinita, o cuando el pipeline tiene múltiples etapas de filtrado que reducen drásticamente el volumen. La clave es que `Stream` construye una descripción del pipeline que solo se materializa en el momento del terminal (`Enum.to_list`, `Enum.take`, `Enum.reduce`, etc.), permitiendo al runtime procesar elemento a elemento sin colecciones intermedias.
+| Aspect | Stream (lazy) | Enum (eager) | File.read! + String.split |
+|--------|--------------|-------------|--------------------------|
+| Memory for 1 GB file | O(1) — one line at a time | O(n) — full file in memory | Crashes on large files |
+| Time to first result | Immediate | After full processing | After full file read |
+| Composability | High — pipeline of transformations | High | Low |
+| Can stop early? | Yes — `Enum.take` stops processing | No — entire collection is traversed | No |
+| Overhead per element | Higher — function call chain | Lower — direct traversal | Lowest |
+| Infinite sequences | Yes — `Stream.iterate`, `Stream.cycle` | No | No |
 
-## What's Next
+Reflection question: `retry_stream/2` uses `Stream.drop_while` to skip failed attempts
+and `Enum.take(1)` to get the first success. What happens if you replace `Enum.take(1)`
+with `Enum.to_list()`? Why does the backoff `Process.sleep` still happen for all attempts
+even though only the successful one is returned?
 
-**12. Macros y Quote/Unquote** — metaprogramación en Elixir: cómo el compilador representa el código y cómo escribir macros que generan código en tiempo de compilación.
+---
+
+## Common production mistakes
+
+**1. Calling `Enum.to_list` on an infinite stream**
+`Stream.iterate(0, &(&1 + 1)) |> Enum.to_list()` will run forever, consuming all memory.
+Always pair infinite streams with `Enum.take/2` or `Stream.take/2`.
+
+**2. Side effects in `Stream.map` without a terminal function**
+```elixir
+# This does NOTHING — the stream is defined but never consumed
+File.stream!("big.log") |> Stream.map(&IO.puts/1)
+
+# Correct — Enum.run/1 consumes the stream for side effects
+File.stream!("big.log") |> Stream.map(&IO.puts/1) |> Stream.run()
+```
+
+**3. Forgetting that `Stream.map` is not `Enum.map`**
+`Stream.map(collection, fn)` returns a lazy stream description, not a list.
+`Enum.map(collection, fn)` executes immediately and returns a list.
+Use `Stream.map` in pipelines; use `Enum.map` when you need the result immediately.
+
+**4. Using streams for small in-memory collections**
+Streams have per-element overhead from the function call chain. For a list of 100
+items, `Enum.map` is faster than `Stream.map`. Streams pay off at thousands of items
+or when memory is the constraint.
+
+---
 
 ## Resources
 
-- [Elixir Docs — Stream](https://hexdocs.pm/elixir/Stream.html)
-- [Stream Guide](https://elixir-lang.org/getting-started/enumerables-and-streams.html)
-- [File.stream!/1](https://hexdocs.pm/elixir/File.html#stream!/1)
-- [Elixir School — Streams](https://elixirschool.com/en/lessons/intermediate/concurrency)
-- [José Valim — Lazy Elixir](https://www.youtube.com/watch?v=5TxA0KCGmSU)
+- [Stream — HexDocs](https://hexdocs.pm/elixir/Stream.html)
+- [File.stream!/1 — HexDocs](https://hexdocs.pm/elixir/File.html#stream!/1)
+- [Stream.resource/3 — HexDocs](https://hexdocs.pm/elixir/Stream.html#resource/3) — for wrapping stateful external resources
+- [Enum vs Stream — Elixir School](https://elixirschool.com/en/lessons/basics/enum#lazy-evaluation-2)

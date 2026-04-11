@@ -1,496 +1,449 @@
-# 22 — Custom DSL with Macros
+# Custom DSL with Macros
 
-**Nivel**: Avanzado  
-**Tema**: Domain Specific Languages con macros de Elixir — `__using__/1`, `@before_compile`, `@on_definition`
+**Project**: `api_gateway` — built incrementally across the advanced level
 
 ---
 
-## Contexto
+## Project context
 
-Un DSL bien diseñado en Elixir se construye sobre tres mecanismos complementarios:
+You're building `api_gateway`. The gateway needs two declarative subsystems:
 
-1. **`__using__/1`**: ejecutado cuando el usuario escribe `use MyDSL`. Inyecta código
-   en el módulo cliente, define atributos de módulo como acumuladores, e importa macros.
+1. A **middleware pipeline DSL** so that route handlers declare their middleware chain
+   at compile time instead of calling `Plug.Builder.plug/2` imperatively — giving the
+   compiler visibility into every middleware applied to every route.
 
-2. **`@before_compile`**: un hook registrado en `__using__` que ejecuta un macro
-   justo antes de que el módulo cliente termine de compilar. Es el momento donde
-   generas las funciones finales desde los datos acumulados.
+2. A **request validation DSL** so that handlers declare field requirements as module
+   attributes, and validation functions are generated at compile time.
 
-3. **`@on_definition`**: hook invocado cada vez que se define una función en el módulo.
-   Recibe el `env`, el tipo (`:def`/`:defp`), nombre, args, guards, y body.
+Both systems rely on the same three macro building blocks: `__using__/1` to inject
+infrastructure, module attributes as LIFO accumulators, and `@before_compile` to
+synthesize generated code from the accumulated data.
 
-4. **Module attributes como acumuladores**: `Module.register_attribute(mod, :rules, accumulate: true)`
-   permite que `@rules value` en el módulo cliente vaya añadiendo a una lista.
-
-### Flujo típico de un DSL
+Project structure at this point:
 
 ```
-use MyDSL
-   ↓
-__using__/1 ejecutado
-   ↓ registra @before_compile
-   ↓ registra atributos acumuladores
-   ↓ importa macros del DSL
-   ↓
-Usuario llama macros (state :idle, transition ..., etc.)
-   ↓ cada macro añade datos al acumulador
-   ↓
-@before_compile ejecutado
-   ↓ lee el acumulador
-   ↓ genera funciones def con los datos
-   ↓
-Módulo compilado
-```
-
-### `defmacrop` — macros privadas
-
-```elixir
-defmacrop validate_state(name) do
-  # Sólo accesible dentro del módulo que lo define
-  # Útil para helpers internos del DSL
-end
+api_gateway/
+├── lib/
+│   └── api_gateway/
+│       ├── application.ex
+│       ├── router.ex
+│       ├── middleware/
+│       │   ├── pipeline.ex
+│       │   ├── instrumentation.ex
+│       │   └── dsl.ex              # ← you implement this
+│       ├── validation/
+│       │   └── dsl.ex              # ← and this
+│       └── dev/
+│           └── ast_tools.ex
+├── test/
+│   └── api_gateway/
+│       └── dsl/
+│           └── dsl_test.exs
+└── mix.exs
 ```
 
 ---
 
-## Ejercicio 1 — StateMachine DSL
+## The business problem
 
-Implementa un módulo `StateMachine` que permita a cualquier módulo definir
-una máquina de estados declarativa.
+Two engineering requirements:
 
-### API del DSL
+1. **Pipeline DSL**: every route module declares its middleware stack with
+   `plug MyMiddleware, option: value`. The `pipeline/0` function is generated at
+   compile time and returns the ordered list of `{module, opts}` pairs. The compiler
+   validates that every referenced middleware module exists; a typo becomes a compile
+   error, not a runtime crash.
 
-```elixir
-defmodule TrafficLight do
-  use StateMachine
+2. **Validation DSL**: route handlers declare field requirements with
+   `field :user_id, :integer, required: true`. A `validate/1` function is generated
+   that type-checks, coerces, and reports missing required fields in one pass. Writing
+   validation by hand for each handler duplicates ~20 lines per endpoint.
 
-  state :red
-  state :green
-  state :yellow
+---
 
-  transition :red,    to: :green,  on: :go
-  transition :green,  to: :yellow, on: :slow
-  transition :yellow, to: :red,    on: :stop
-end
+## How `__using__/1` / `@before_compile` / module attributes work together
+
+```
+use ApiGateway.Middleware.DSL
+   ↓
+__using__/1 executes in the CALLER's context
+   ↓ registers @plugs accumulator (accumulate: true → LIFO list)
+   ↓ registers @before_compile hook pointing back to DSL module
+   ↓ imports the `plug/2` macro
+   ↓
+Caller defines:  plug Auth, realm: "admin"
+                 plug RateLimit, max: 100
+   ↓ each `plug` call prepends to @plugs: [{RateLimit, [max: 100]}, {Auth, [realm: "admin"]}]
+   ↓
+@before_compile executes — reads @plugs, reverses it (LIFO → declaration order),
+   ↓ generates:  def pipeline(), do: [{Auth, [realm: "admin"]}, {RateLimit, [max: 100]}]
+   ↓
+Module compiled — pipeline/0 is a compiled function, zero runtime overhead
 ```
 
-### Funciones generadas (en TrafficLight)
+**Critical detail**: `Module.register_attribute(mod, :plugs, accumulate: true)` means
+`@plugs value` *prepends* to the list. After two `plug` calls the attribute holds
+`[second, first]`. Always `Enum.reverse/1` in `__before_compile__`.
 
+---
+
+## Why compile-time validation matters
+
+Without DSL:
 ```elixir
-# Estado inicial es el primer estado declarado
-TrafficLight.initial_state()       # => :red
-
-# Listar estados válidos
-TrafficLight.states()              # => [:red, :green, :yellow]
-
-# Ejecutar transición
-TrafficLight.transition(:red, :go)      # => {:ok, :green}
-TrafficLight.transition(:red, :slow)    # => {:error, :invalid_transition}
-TrafficLight.transition(:invalid, :go)  # => {:error, :invalid_state}
-
-# Listar transiciones posibles desde un estado
-TrafficLight.transitions_from(:red)    # => [{:go, :green}]
+# Runtime crash if Auth module is misspelled — discovered when the route is hit
+Plug.Builder.plug(AuthMiddlewarr, [])   # typo: no error at compile time
 ```
 
-### Requisitos de implementación
+With DSL:
+```elixir
+plug AuthMiddlewarr, []   # CompileError at build time: module does not exist
+```
 
-- `@states` acumulador para estados en orden de declaración
-- `@transitions` acumulador para transiciones como `{from, to, event}`
-- Validar en `@before_compile` que todas las transiciones referencian estados declarados;
-  si no, lanzar `CompileError`
-- Generar todas las funciones en `@before_compile`
+The pipeline is also a first-class value: introspectable with `MyRoute.pipeline()`,
+usable in tests, and documentable without running the server.
 
-### Hints
+---
 
-<details>
-<summary>Hint 1 — Estructura de __using__/1</summary>
+## Implementation
+
+### Step 1: `lib/api_gateway/middleware/dsl.ex`
 
 ```elixir
-defmodule StateMachine do
+defmodule ApiGateway.Middleware.DSL do
+  @moduledoc """
+  Compile-time middleware pipeline DSL.
+
+  Usage:
+    defmodule ApiGateway.Routes.AdminRoute do
+      use ApiGateway.Middleware.DSL
+
+      plug ApiGateway.Middleware.Auth, realm: "admin"
+      plug ApiGateway.Middleware.RateLimit, max: 10
+      plug ApiGateway.Middleware.Instrumentation
+    end
+
+  Generates:
+    AdminRoute.pipeline/0  → [{Auth, [realm: "admin"]}, {RateLimit, [max: 10]}, {Instrumentation, []}]
+  """
+
   defmacro __using__(_opts) do
     quote do
-      import StateMachine, only: [state: 1, transition: 3]
-      Module.register_attribute(__MODULE__, :states, accumulate: true)
-      Module.register_attribute(__MODULE__, :transitions, accumulate: true)
-      @before_compile StateMachine
+      import ApiGateway.Middleware.DSL, only: [plug: 1, plug: 2]
+      Module.register_attribute(__MODULE__, :plugs, accumulate: true)
+      @before_compile ApiGateway.Middleware.DSL
     end
   end
 
-  defmacro state(name) do
+  @doc """
+  Declares a middleware module with options.
+  Validates at compile time that `module` is a known atom (basic existence check).
+  """
+  defmacro plug(module, opts \\ []) do
     quote do
-      @states unquote(name)
-    end
-  end
-
-  defmacro transition(from, to: to, on: event) do
-    quote do
-      @transitions {unquote(from), unquote(to), unquote(event)}
+      @plugs {unquote(module), unquote(opts)}
     end
   end
 
   defmacro __before_compile__(env) do
-    states     = Module.get_attribute(env.module, :states) |> Enum.reverse()
-    transitions = Module.get_attribute(env.module, :transitions) |> Enum.reverse()
-    # ... generar código aquí
+    plugs =
+      env.module
+      |> Module.get_attribute(:plugs)
+      |> Enum.reverse()
+
+    # HINT: use Macro.escape/1 to embed the list as a literal value in the generated function
+    # HINT: generate:  def pipeline(), do: <escaped_plugs>
+    # TODO: implement the generated pipeline/0 function
   end
 end
 ```
-</details>
 
-<details>
-<summary>Hint 2 — Validar en compile time</summary>
+### Step 2: `lib/api_gateway/validation/dsl.ex`
 
 ```elixir
-defmacro __before_compile__(env) do
-  states = Module.get_attribute(env.module, :states) |> Enum.reverse()
-  transitions = Module.get_attribute(env.module, :transitions) |> Enum.reverse()
-  state_set = MapSet.new(states)
+defmodule ApiGateway.Validation.DSL do
+  @moduledoc """
+  Compile-time request validation DSL.
 
-  Enum.each(transitions, fn {from, to, _event} ->
-    unless MapSet.member?(state_set, from) do
-      raise CompileError,
-        description: "StateMachine: estado '#{from}' no declarado (transición desde #{from})",
-        file: env.file,
-        line: env.line
+  Usage:
+    defmodule ApiGateway.Routes.CreateUser do
+      use ApiGateway.Validation.DSL
+
+      field :username, :string, required: true
+      field :age,      :integer, required: false
+      field :role,     :atom,    required: true, default: :viewer
     end
-    unless MapSet.member?(state_set, to) do
-      raise CompileError,
-        description: "StateMachine: estado '#{to}' no declarado (transición hacia #{to})",
-        file: env.file,
-        line: env.line
-    end
-  end)
-  # continuar con generación...
-end
-```
-</details>
 
-<details>
-<summary>Hint 3 — Generar funciones desde datos</summary>
+  Generates:
+    CreateUser.validate(%{"username" => "alice", "age" => "30", "role" => "admin"})
+    # => {:ok, %{username: "alice", age: 30, role: :admin}}
 
-```elixir
-# Dentro de __before_compile__:
-transition_clauses =
-  Enum.map(transitions, fn {from, to, event} ->
-    quote do
-      def transition(unquote(from), unquote(event)), do: {:ok, unquote(to)}
-    end
-  end)
+    CreateUser.validate(%{})
+    # => {:error, [:username, :role]}   ← missing required fields
+  """
 
-quote do
-  def initial_state, do: unquote(hd(states))
-  def states, do: unquote(states)
-  unquote_splicing(transition_clauses)
-  def transition(state, _event) when state in unquote(states), do: {:error, :invalid_transition}
-  def transition(_, _), do: {:error, :invalid_state}
-end
-```
-</details>
+  @supported_types [:string, :integer, :float, :atom, :boolean]
 
----
-
-## Ejercicio 2 — Validation DSL
-
-Implementa un módulo `Validatable` que genere validaciones tipo changeset.
-
-### API del DSL
-
-```elixir
-defmodule UserSchema do
-  use Validatable
-
-  field :name,  :string, required: true,  length: 2..50
-  field :age,   :integer, min: 0, max: 150
-  field :email, :string, required: true,  format: ~r/@/
-  field :role,  :atom,   inclusion: [:admin, :user, :guest]
-end
-```
-
-### Funciones generadas
-
-```elixir
-# Valida un mapa de datos, retorna {:ok, data} | {:error, errors}
-UserSchema.validate(%{name: "Ana", email: "ana@example.com", age: 25, role: :user})
-# => {:ok, %{name: "Ana", email: "ana@example.com", age: 25, role: :user}}
-
-UserSchema.validate(%{name: "A", email: "no-email", role: :superadmin})
-# => {:error, [
-#   name: "must have length between 2 and 50",
-#   email: "must match format",
-#   role: "must be one of [:admin, :user, :guest]",
-#   age: "is required"  # si required: true estuviera en age
-# ]}
-
-# Introspección
-UserSchema.fields()
-# => [:name, :age, :email, :role]
-
-UserSchema.field_type(:name)
-# => :string
-```
-
-### Requisitos
-
-- `@fields` acumulador: `{name, type, opts}`
-- Generar `validate/1` que ejecute todas las reglas en secuencia y acumule errores
-- Reglas soportadas: `required`, `length` (Range), `min`, `max`, `format` (Regex), `inclusion`
-- Type coercion básica: si el tipo es `:integer` y el valor es un string numérico, convertirlo
-
-### Hints
-
-<details>
-<summary>Hint 1 — Separar definición de reglas de ejecución</summary>
-
-En `@before_compile`, en lugar de generar código inline para cada regla, genera
-una función `validate_field/3` por cada campo que llame a helpers privados.
-
-```elixir
-defp validate_rule({:required, true}, name, nil),
-  do: {name, "is required"}
-defp validate_rule({:required, true}, _name, _val), do: nil
-defp validate_rule({:length, first..last}, name, val) when is_binary(val) do
-  len = String.length(val)
-  if len >= first and len <= last, do: nil, else: {name, "must have length between #{first} and #{last}"}
-end
-defp validate_rule(_, _name, _val), do: nil
-```
-
-Esto mantiene la lógica de validación fuera del código generado, facilitando pruebas.
-</details>
-
-<details>
-<summary>Hint 2 — Estructura del validate/1 generado</summary>
-
-```elixir
-# En __before_compile__:
-quote do
-  def validate(data) do
-    errors =
-      unquote(fields)  # lista de {name, type, opts}
-      |> Enum.flat_map(fn {name, type, opts} ->
-        value = Map.get(data, name)
-        coerced = __MODULE__.__coerce__(type, value)
-        Enum.map(opts, &__MODULE__.__validate_rule__(&1, name, coerced))
-      end)
-      |> Enum.reject(&is_nil/1)
-
-    if errors == [], do: {:ok, data}, else: {:error, errors}
-  end
-end
-```
-</details>
-
----
-
-## Ejercicio 3 — Route DSL
-
-Implementa un `Router` DSL que genere una tabla de dispatch para HTTP.
-
-### API del DSL
-
-```elixir
-defmodule MyApp.Router do
-  use Router
-
-  get    "/users",        to: MyApp.UsersController,  action: :index
-  post   "/users",        to: MyApp.UsersController,  action: :create
-  get    "/users/:id",    to: MyApp.UsersController,  action: :show
-  put    "/users/:id",    to: MyApp.UsersController,  action: :update
-  delete "/users/:id",    to: MyApp.UsersController,  action: :delete
-
-  scope "/admin" do
-    get  "/dashboard",    to: MyApp.AdminController,  action: :index
-  end
-end
-```
-
-### Función generada: `dispatch/2`
-
-```elixir
-MyApp.Router.dispatch(:get, "/users")
-# => {:ok, {MyApp.UsersController, :index, %{}}}
-
-MyApp.Router.dispatch(:get, "/users/42")
-# => {:ok, {MyApp.UsersController, :show, %{"id" => "42"}}}
-
-MyApp.Router.dispatch(:get, "/admin/dashboard")
-# => {:ok, {MyApp.AdminController, :index, %{}}}
-
-MyApp.Router.dispatch(:get, "/nonexistent")
-# => {:error, :not_found}
-
-MyApp.Router.dispatch(:post, "/users/42")
-# => {:error, :method_not_allowed}  (ruta existe pero no el método)
-
-# Introspección
-MyApp.Router.routes()
-# => [{:get, "/users", MyApp.UsersController, :index}, ...]
-```
-
-### Requisitos
-
-- Macros `get/2`, `post/2`, `put/2`, `delete/2` como `defmacrop` wrapper sobre `route/3`
-- Macro `scope/2` que prefija el path a todas las rutas dentro de su bloque.
-  Usar `@scope_prefix` como atributo de módulo (no acumulador, sólo valor)
-- Path params: segmentos que empiecen con `:` se convierten en captures
-- `dispatch/2` generado con pattern matching — una cláusula por ruta, más dos
-  cláusulas catch-all (`:not_found`, `:method_not_allowed`)
-- Para `:method_not_allowed`, necesitas saber qué métodos SÍ existen para un path
-
-### Hints
-
-<details>
-<summary>Hint 1 — Matching de path params en runtime</summary>
-
-Convierte el path template en segmentos y genera un pattern de matching:
-
-```elixir
-# "/users/:id/posts/:post_id" →
-# fn "/users/" <> rest → match "id" hasta "/" → match "posts/" → match "post_id"
-
-# Más simple: dividir por "/" y comparar segmentos
-defp match_path(template_segments, actual_segments) do
-  match_segments(template_segments, actual_segments, %{})
-end
-
-defp match_segments([], [], params), do: {:ok, params}
-defp match_segments([":" <> param | rest_t], [val | rest_a], params),
-  do: match_segments(rest_t, rest_a, Map.put(params, param, val))
-defp match_segments([seg | rest_t], [seg | rest_a], params),
-  do: match_segments(rest_t, rest_a, params)
-defp match_segments(_, _, _), do: :no_match
-```
-</details>
-
-<details>
-<summary>Hint 2 — scope/2 con atributo mutable</summary>
-
-```elixir
-defmacro scope(prefix, do: block) do
-  quote do
-    old_prefix = Module.get_attribute(__MODULE__, :scope_prefix) || ""
-    Module.put_attribute(__MODULE__, :scope_prefix, old_prefix <> unquote(prefix))
-    unquote(block)
-    Module.put_attribute(__MODULE__, :scope_prefix, old_prefix)
-  end
-end
-```
-
-Importante: el atributo `@scope_prefix` NO es un acumulador — se usa como
-variable temporal durante la compilación del módulo.
-</details>
-
-<details>
-<summary>Hint 3 — method_not_allowed detection</summary>
-
-Al generar `dispatch/2`, agrupa las rutas por path template (ignorando método).
-Si un path tiene matches en algún método pero no en el solicitado, retorna
-`:method_not_allowed`.
-
-```elixir
-# En __before_compile__:
-routes_by_path = Enum.group_by(routes, fn {_method, path, _ctrl, _action} -> path end)
-
-# Para cada path, generar claúsulas para los métodos que existen,
-# luego una cláusula con _ para el método → :method_not_allowed
-```
-</details>
-
----
-
-## Trade-offs a considerar
-
-### `@before_compile` vs función de tiempo de ejecución
-
-La validación en `@before_compile` tiene errores en compile time, lo cual es ideal.
-Sin embargo, si la información sólo está disponible en runtime (e.g., configuración
-de DB), necesitas un enfoque diferente. El DSL es mejor para esquemas estáticos.
-
-### Acumuladores: orden de inserción
-
-Los atributos acumuladores de Elixir insertan en orden LIFO. Si el orden
-importa (como en `initial_state()`), siempre aplica `Enum.reverse/1` al leer
-el acumulador en `@before_compile`.
-
-### `defmacrop` vs `defmacro`
-
-`defmacrop` crea macros que sólo pueden usarse en el mismo módulo donde se
-definen. Útil para helpers internos del DSL que el usuario no debe usar directamente.
-El trade-off: no puedes compartirlas ni testearlas desde fuera.
-
-### Complejidad de compile time
-
-Cada usuario de `use StateMachine` ejecuta `__before_compile__`. Si este hook
-hace trabajo costoso (O(n²) o más), escala mal en proyectos grandes.
-Diseña tus acumuladores para que la generación sea O(n).
-
----
-
-## One possible solution
-
-<details>
-<summary>Ver solución StateMachine (spoiler)</summary>
-
-```elixir
-defmodule StateMachine do
   defmacro __using__(_opts) do
     quote do
-      import StateMachine, only: [state: 1, transition: 3]
-      Module.register_attribute(__MODULE__, :states, accumulate: true)
-      Module.register_attribute(__MODULE__, :transitions, accumulate: true)
-      @before_compile StateMachine
+      import ApiGateway.Validation.DSL, only: [field: 2, field: 3]
+      Module.register_attribute(__MODULE__, :fields, accumulate: true)
+      @before_compile ApiGateway.Validation.DSL
     end
   end
 
-  defmacro state(name) do
-    quote do: @states unquote(name)
-  end
+  @doc """
+  Declares a validated field.
 
-  defmacro transition(from, to: to, on: event) do
-    quote do: @transitions {unquote(from), unquote(to), unquote(event)}
+  Options:
+    - required: boolean (default false)
+    - default: any term (applied when field is absent and not required)
+  """
+  defmacro field(name, type, opts \\ []) when type in @supported_types do
+    quote do
+      @fields {unquote(name), unquote(type), unquote(opts)}
+    end
   end
 
   defmacro __before_compile__(env) do
-    states = Module.get_attribute(env.module, :states) |> Enum.reverse()
-    transitions = Module.get_attribute(env.module, :transitions) |> Enum.reverse()
-    state_set = MapSet.new(states)
+    fields =
+      env.module
+      |> Module.get_attribute(:fields)
+      |> Enum.reverse()
 
-    Enum.each(transitions, fn {from, to, _} ->
-      for s <- [from, to], not MapSet.member?(state_set, s) do
-        raise CompileError,
-          description: "StateMachine: estado desconocido '#{s}'",
-          file: env.file, line: env.line
+    # Each field is {name, type, opts}
+    # Generate validate/1 that:
+    #   1. Iterates fields in declaration order
+    #   2. For each field, looks up the string key (Atom.to_string(name)) in the input map
+    #   3. If present: coerce via coerce/2 helper (see below)
+    #   4. If absent and required: add to missing list
+    #   5. If absent and has :default: use the default value
+    #   6. If absent and not required and no default: skip (field absent from result)
+    #   7. Return {:ok, result_map} or {:error, missing_fields_list}
+    #
+    # HINT: You can generate the validate/1 body as a quoted expression that pattern-matches
+    #       over the compile-time-known field list, OR generate a series of clauses.
+    #       The simplest approach: generate one validate/1 that calls a runtime helper
+    #       with the compile-time field spec embedded as a literal.
+    #
+    # HINT: use Macro.escape(fields) to embed the field list as data in the generated function
+    #
+    # TODO: implement the generated validate/1 function
+
+    # HINT: Also generate a fields/0 introspection function returning the field spec list
+    # TODO: implement fields/0
+  end
+
+  @doc false
+  # Runtime coercion helper — called by generated validate/1
+  def coerce(value, :string) when is_binary(value), do: {:ok, value}
+  def coerce(value, :string), do: {:ok, to_string(value)}
+
+  def coerce(value, :integer) when is_integer(value), do: {:ok, value}
+
+  def coerce(value, :integer) when is_binary(value) do
+    case Integer.parse(value) do
+      {int, ""} -> {:ok, int}
+      _ -> {:error, :bad_integer}
+    end
+  end
+
+  def coerce(value, :float) when is_float(value), do: {:ok, value}
+  def coerce(value, :float) when is_integer(value), do: {:ok, value / 1.0}
+
+  def coerce(value, :float) when is_binary(value) do
+    case Float.parse(value) do
+      {f, ""} -> {:ok, f}
+      _ -> {:error, :bad_float}
+    end
+  end
+
+  def coerce(value, :atom) when is_atom(value), do: {:ok, value}
+  def coerce(value, :atom) when is_binary(value), do: {:ok, String.to_existing_atom(value)}
+
+  def coerce(true, :boolean), do: {:ok, true}
+  def coerce(false, :boolean), do: {:ok, false}
+  def coerce("true", :boolean), do: {:ok, true}
+  def coerce("false", :boolean), do: {:ok, false}
+
+  def coerce(_value, type), do: {:error, {:bad_type, type}}
+
+  @doc false
+  # Runtime validate helper — called by generated validate/1 with the field spec
+  def run_validate(params, fields) do
+    # HINT: use Enum.reduce over fields, accumulating {result_map, missing_list}
+    # HINT: String key lookup: Map.get(params, Atom.to_string(name)) || Map.get(params, name)
+    # HINT: on coerce error, treat as bad input — add to missing list or return error
+    # TODO: implement
+  end
+end
+```
+
+### Step 3: Given tests — must pass without modification
+
+```elixir
+# test/api_gateway/dsl/dsl_test.exs
+defmodule ApiGateway.DSLTest do
+  use ExUnit.Case, async: true
+
+  # ---------------------------------------------------------------------------
+  # Middleware Pipeline DSL tests
+  # ---------------------------------------------------------------------------
+
+  describe "ApiGateway.Middleware.DSL" do
+    defmodule SampleRoute do
+      use ApiGateway.Middleware.DSL
+
+      plug ApiGateway.Middleware.Instrumentation
+      plug ApiGateway.Middleware.Pipeline, strategy: :halt
+    end
+
+    test "pipeline/0 returns plugs in declaration order" do
+      pipeline = SampleRoute.pipeline()
+
+      assert length(pipeline) == 2
+      assert {ApiGateway.Middleware.Instrumentation, []} = hd(pipeline)
+      assert {ApiGateway.Middleware.Pipeline, [strategy: :halt]} = List.last(pipeline)
+    end
+
+    test "pipeline/0 returns a list of {module, opts} tuples" do
+      for {mod, opts} <- SampleRoute.pipeline() do
+        assert is_atom(mod)
+        assert is_list(opts)
       end
-    end)
+    end
 
-    transition_clauses =
-      Enum.map(transitions, fn {from, to, event} ->
-        quote do
-          def transition(unquote(from), unquote(event)), do: {:ok, unquote(to)}
-        end
-      end)
+    test "empty pipeline returns empty list" do
+      defmodule EmptyRoute do
+        use ApiGateway.Middleware.DSL
+      end
 
-    from_clauses =
-      transitions
-      |> Enum.group_by(fn {from, _, _} -> from end)
-      |> Enum.map(fn {from, ts} ->
-        pairs = Enum.map(ts, fn {_, to, event} -> {event, to} end)
-        quote do
-          def transitions_from(unquote(from)), do: unquote(pairs)
-        end
-      end)
+      assert EmptyRoute.pipeline() == []
+    end
+  end
 
-    quote do
-      def initial_state, do: unquote(hd(states))
-      def states, do: unquote(states)
-      unquote_splicing(transition_clauses)
-      def transition(s, _) when s in unquote(states), do: {:error, :invalid_transition}
-      def transition(_, _), do: {:error, :invalid_state}
-      unquote_splicing(from_clauses)
-      def transitions_from(_), do: []
+  # ---------------------------------------------------------------------------
+  # Validation DSL tests
+  # ---------------------------------------------------------------------------
+
+  describe "ApiGateway.Validation.DSL" do
+    defmodule CreateUserRequest do
+      use ApiGateway.Validation.DSL
+
+      field :username, :string,  required: true
+      field :age,      :integer, required: false
+      field :role,     :atom,    required: true, default: :viewer
+    end
+
+    test "validate/1 returns ok with valid params (string keys)" do
+      result = CreateUserRequest.validate(%{"username" => "alice", "age" => "30"})
+      assert {:ok, validated} = result
+      assert validated.username == "alice"
+      assert validated.age == 30
+      # role has a default
+      assert validated.role == :viewer
+    end
+
+    test "validate/1 returns error with missing required fields" do
+      result = CreateUserRequest.validate(%{})
+      assert {:error, missing} = result
+      assert :username in missing
+      # role has a default so it should NOT be in missing
+      refute :role in missing
+    end
+
+    test "validate/1 coerces integer strings" do
+      {:ok, validated} = CreateUserRequest.validate(%{"username" => "bob", "age" => "25"})
+      assert validated.age == 25
+      assert is_integer(validated.age)
+    end
+
+    test "validate/1 accepts atom keys as well as string keys" do
+      result = CreateUserRequest.validate(%{username: "carol"})
+      assert {:ok, validated} = result
+      assert validated.username == "carol"
+    end
+
+    test "fields/0 returns the field spec list in declaration order" do
+      fields = CreateUserRequest.fields()
+      assert length(fields) == 3
+      [{:username, :string, _}, {:age, :integer, _}, {:role, :atom, _}] = fields
+    end
+
+    test "required field with no default causes error when absent" do
+      defmodule StrictRequest do
+        use ApiGateway.Validation.DSL
+        field :api_key, :string, required: true
+      end
+
+      assert {:error, [:api_key]} = StrictRequest.validate(%{})
     end
   end
 end
 ```
 
-</details>
+### Step 4: Run the tests
+
+```bash
+mix test test/api_gateway/dsl/dsl_test.exs --trace
+```
+
+---
+
+## Trade-off analysis
+
+| Approach | Compile-time safety | Runtime overhead | Introspectability | Boilerplate |
+|----------|--------------------|-----------------|--------------------|-------------|
+| DSL with `@before_compile` | High — typos are compile errors | Near-zero (generated fns) | High — `pipeline/0`, `fields/0` | Low at call site |
+| `Plug.Builder.plug/2` | Medium — module must exist | Near-zero | Low — no introspection | Low |
+| Runtime configuration map | None | Map lookup per request | High | Lowest |
+| Plain function composition | None | Minimal | None — opaque | High |
+
+**When to choose compile-time DSL**: when the set of operations is fixed at design
+time, correctness matters more than flexibility, and introspection/documentation
+tooling is valuable. Avoid for anything that must change at runtime.
+
+---
+
+## Common production mistakes
+
+**1. Forgetting `Enum.reverse/1` on accumulated module attributes**
+`Module.register_attribute(mod, :plugs, accumulate: true)` stores values in LIFO
+order — each new `@plugs value` prepends. If you forget `Enum.reverse/1` in
+`__before_compile__`, the generated pipeline runs middleware in *reverse* declaration
+order. This is a silent correctness bug — no error, just wrong behavior.
+
+**2. Calling `Module.get_attribute/2` outside `__before_compile__`**
+Module attributes are available only during compilation of that module. Calling
+`Module.get_attribute(SomeModule, :plugs)` after the module is compiled returns
+`nil`. Compile-time data must be converted to generated functions in `__before_compile__`;
+it cannot be read at runtime.
+
+**3. Using `String.to_atom/1` in the validation coercer**
+`String.to_atom/1` creates atoms that are never garbage collected. In a gateway
+that receives arbitrary user input, this is a memory leak and a denial-of-service
+vector. Always use `String.to_existing_atom/1` and catch `ArgumentError` for
+unknown atoms.
+
+**4. Missing `__before_compile__` registration in `__using__`**
+If `@before_compile ModuleName` is not registered inside the `quote do` block in
+`__using__/1`, the hook never fires. The `@plugs` accumulator fills up but
+`pipeline/0` is never generated. The error at call time is a `UndefinedFunctionError`,
+not a helpful message about the missing hook.
+
+**5. Applying `@before_compile` ordering assumptions with multiple `use` calls**
+If a module does `use DSL.A` and `use DSL.B`, both register `@before_compile` hooks.
+Hooks run in reverse registration order: B's hook runs first, then A's. If B's
+generated `pipeline/0` depends on a module attribute that A's hook was supposed to
+finalize first, the result is silently wrong. Use a single coordinating hook or
+document ordering constraints explicitly.
+
+---
+
+## Resources
+
+- [Elixir `Module` documentation](https://hexdocs.pm/elixir/Module.html) — `register_attribute/3`, `get_attribute/2`, `@before_compile`, `@on_definition`
+- [Metaprogramming Elixir — Chris McCord](https://pragprog.com/titles/cmelixir/metaprogramming-elixir/) — DSL chapter covers `__using__` and `@before_compile` in depth
+- [Plug.Builder source](https://github.com/elixir-plug/plug/blob/master/lib/plug/builder.ex) — production implementation of a compile-time pipeline DSL
+- [Ecto.Schema source](https://github.com/elixir-ecto/ecto/blob/master/lib/ecto/schema.ex) — large-scale example of module attribute accumulators driving code generation
+- [`__using__` macro guide — Elixir docs](https://hexdocs.pm/elixir/Module.html#module-use-and-__using__) — official guidance on when to use `use` vs `import`

@@ -1,567 +1,416 @@
-# Ejercicio 54: Channel Presence y Room Management
+# Phoenix Presence: Connected Client Tracking
 
-## Tema
-Phoenix.Presence para tracking de usuarios online en canales en tiempo real.
-
-## Conceptos clave
-- `use Phoenix.Presence` para definir un módulo de presencia
-- `Presence.track/3` para registrar un socket en el sistema de presencia
-- `Presence.list/1` para obtener todos los usuarios presentes en un topic
-- `handle_info {:DOWN, ...}` para detectar desconexiones inesperadas
-- Evento `presence_diff` en el cliente: contiene `joins` y `leaves`
-- Metadata de presencia: `user_id`, `username`, `role`, `joined_at`, `typing`
+**Project**: `api_gateway` — built incrementally across the advanced level
 
 ---
 
-## Ejercicio 1: Who's Online — Lista de usuarios conectados
+## Project context
 
-### Contexto
-Un canal de chat necesita mostrar a todos los participantes quién está
-conectado en tiempo real. Al unirse, el usuario aparece en la lista;
-al desconectarse, desaparece automáticamente.
+The `api_gateway` now has a Channel layer (exercise 53). Clients connect via WebSocket and
+receive real-time events. The operations team wants to know, at any moment: which clients
+are connected, how long they've been connected, and what they're doing. The gateway also
+needs to enforce per-room limits on concurrent debug sessions.
 
-### Definir el módulo de Presence
+Phoenix Presence provides distributed, conflict-free tracking of who is connected where.
+
+Project structure for this exercise:
+
+```
+api_gateway_umbrella/apps/gateway_api/
+├── lib/gateway_api_web/
+│   ├── presence.ex                      # ← you implement this
+│   └── channels/
+│       ├── debug_session_channel.ex     # ← and this
+│       └── client_monitor_channel.ex    # ← and this
+└── test/gateway_api_web/channels/
+    └── debug_session_channel_test.exs   # given tests
+```
+
+---
+
+## Why Presence and not a custom ETS table
+
+When you track connected clients in ETS directly, you get a race condition: between `join/3`
+checking the count and `track/3` inserting the new entry, another connection can slip in.
+You also get stale entries when a node crashes — ETS is in-memory and lost.
+
+Phoenix Presence is built on `Phoenix.Tracker`, a CRDTs-based distributed tracker. It:
+- Automatically removes entries when a socket process dies (via monitoring)
+- Synchronizes across nodes using delta CRDTs — no centralized coordinator
+- Broadcasts `presence_diff` events to all subscribers when membership changes
+
+The cost: Presence state is eventually consistent across nodes. For connection tracking
+where a few milliseconds of lag is acceptable, this is fine. For strict capacity limits,
+the exercise shows how to mitigate the inherent race condition.
+
+---
+
+## The `after_join` pattern
+
+Calling `Presence.track/3` directly inside `join/3` creates a race condition: the socket
+is not yet fully initialized. The correct pattern:
 
 ```elixir
-# lib/my_app_web/channels/room_presence.ex
-defmodule MyAppWeb.RoomPresence do
+def join("room:x", params, socket) do
+  send(self(), :after_join)   # schedule track for AFTER join returns
+  {:ok, socket}
+end
+
+def handle_info(:after_join, socket) do
+  {:ok, _} = Presence.track(socket, ...)
+  push(socket, "presence_state", Presence.list(socket))
+  {:noreply, socket}
+end
+```
+
+`send(self(), :after_join)` enqueues the message in the channel process's mailbox. It will
+be processed after `join/3` has returned and the socket is fully registered.
+
+---
+
+## Implementation
+
+### Step 1: `lib/gateway_api_web/presence.ex`
+
+```elixir
+defmodule GatewayApiWeb.Presence do
   use Phoenix.Presence,
-    otp_app: :my_app,
-    pubsub_server: MyApp.PubSub
+    otp_app: :gateway_api,
+    pubsub_server: GatewayApi.PubSub
 end
 ```
 
+Add to `application.ex`:
+
 ```elixir
-# lib/my_app/application.ex — agregar al árbol de supervisión
+# apps/gateway_api/lib/gateway_api/application.ex
 children = [
-  MyApp.Repo,
-  MyAppWeb.Endpoint,
-  MyAppWeb.RoomPresence  # Debe supervisarse explícitamente
+  GatewayApiWeb.Endpoint,
+  GatewayApiWeb.Presence   # must be supervised explicitly
 ]
 ```
 
-### Problema
-El siguiente channel tiene dos errores relacionados con Presence:
+### Step 2: `lib/gateway_api_web/channels/debug_session_channel.ex`
+
+Debug sessions allow clients to receive detailed trace logs for their requests. The gateway
+limits each debug room to 5 concurrent sessions to prevent resource exhaustion.
 
 ```elixir
-defmodule MyAppWeb.RoomChannel do
+defmodule GatewayApiWeb.DebugSessionChannel do
   use Phoenix.Channel
-  alias MyAppWeb.RoomPresence
+  alias GatewayApiWeb.Presence
 
-  def join("room:" <> room_id, %{"username" => username}, socket) do
-    socket = assign(socket, :username, username)
+  @max_sessions 5
 
-    # ERROR 1: track debe llamarse FUERA del join, desde handle_info o
-    # con send(self(), :after_join). Llamarlo aquí puede causar race condition
-    # porque el socket aún no está completamente inicializado.
-    RoomPresence.track(socket, socket.assigns.user_id, %{
-      username: username,
-      online_at: System.system_time(:second)
-    })
-
-    {:ok, socket}
-  end
-
-  def handle_info(:after_join, socket) do
-    # ERROR 2: push de presences se haría aquí, pero join no lo programó
-    {:noreply, socket}
-  end
-end
-```
-
-### Solución completa
-
-```elixir
-defmodule MyAppWeb.RoomChannel do
-  use Phoenix.Channel
-  alias MyAppWeb.RoomPresence
-
-  def join("room:" <> room_id, %{"user_id" => user_id, "username" => username}, socket) do
-    socket =
-      socket
-      |> assign(:user_id, user_id)
-      |> assign(:username, username)
-      |> assign(:room_id, room_id)
-
-    # Programar el track para después de que join/3 finalice
-    # Garantiza que el socket esté completamente inicializado
-    send(self(), :after_join)
-
-    {:ok, socket}
-  end
-
-  def handle_info(:after_join, socket) do
-    # Enviar al nuevo usuario la lista ACTUAL de presencias
-    {:ok, _} = RoomPresence.track(socket, socket.assigns.user_id, %{
-      username: socket.assigns.username,
-      online_at: System.system_time(:second)
-    })
-
-    # push de presences solo al socket que acaba de unirse
-    push(socket, "presence_state", RoomPresence.list(socket))
-
-    {:noreply, socket}
-  end
-end
-```
-
-### Client JS equivalente
-
-```javascript
-import { Presence } from "phoenix"
-
-const channel = socket.channel("room:general", { user_id: "u1", username: "alice" })
-const presence = new Presence(channel)
-
-channel.join()
-
-// presence_state es el snapshot inicial cuando te unes
-// presence_diff llega en cada cambio posterior (join/leave)
-presence.onSync(() => {
-  const users = presence.list((id, { metas: [first] }) => ({
-    id,
-    username: first.username,
-    onlineAt: first.online_at
-  }))
-
-  renderUserList(users)
-})
-
-presence.onJoin((id, current, newPresence) => {
-  if (!current) console.log(`${newPresence.metas[0].username} se unió`)
-})
-
-presence.onLeave((id, current, leftPresence) => {
-  if (current.metas.length === 0) {
-    console.log(`${leftPresence.metas[0].username} se desconectó`)
-  }
-})
-```
-
-### Error común: no supervisar RoomPresence
-
-```elixir
-# Sin esto, RoomPresence.track/3 lanza:
-# ** (exit) no process: the process is not alive or
-#    there's no process currently associated with the given name
-#
-# Solución: agregar al árbol de supervisión en application.ex
-children = [
-  MyAppWeb.RoomPresence  # OBLIGATORIO
-]
-```
-
----
-
-## Ejercicio 2: Typing Indicators — Quién está escribiendo
-
-### Contexto
-En un chat grupal, cuando un usuario empieza a escribir, los demás ven
-"Alice está escribiendo...". El indicador desaparece automáticamente
-después de 3 segundos de inactividad (sin depender del cliente).
-
-### Problema
-Este código tiene un bug grave en la gestión del timeout:
-
-```elixir
-defmodule MyAppWeb.ChatChannel do
-  use Phoenix.Channel
-  alias MyAppWeb.RoomPresence
-
-  def join("chat:" <> room_id, %{"user_id" => user_id}, socket) do
-    send(self(), :after_join)
-    {:ok, assign(socket, :user_id, user_id)}
-  end
-
-  def handle_info(:after_join, socket) do
-    {:ok, _} = RoomPresence.track(socket, socket.assigns.user_id, %{
-      typing: false
-    })
-    push(socket, "presence_state", RoomPresence.list(socket))
-    {:noreply, socket}
-  end
-
-  def handle_in("typing_start", _payload, socket) do
-    # Actualizar metadata de presencia
-    RoomPresence.update(socket, socket.assigns.user_id, fn meta ->
-      Map.put(meta, :typing, true)
-    end)
-
-    # ERROR: si el cliente envía "typing_start" repetidamente cada segundo,
-    # se acumulan N timers. Cada uno llama a typing_stop al expirar.
-    # Resultado: el indicador parpadea o se limpia antes de tiempo.
-    Process.send_after(self(), :typing_timeout, 3_000)
-
-    {:noreply, socket}
-  end
-
-  def handle_info(:typing_timeout, socket) do
-    RoomPresence.update(socket, socket.assigns.user_id, fn meta ->
-      Map.put(meta, :typing, false)
-    end)
-    {:noreply, socket}
-  end
-end
-```
-
-### Solución completa — cancelar timer anterior antes de crear uno nuevo
-
-```elixir
-defmodule MyAppWeb.ChatChannel do
-  use Phoenix.Channel
-  alias MyAppWeb.RoomPresence
-
-  def join("chat:" <> room_id, %{"user_id" => user_id, "username" => username}, socket) do
-    socket =
-      socket
-      |> assign(:user_id, user_id)
-      |> assign(:username, username)
-      |> assign(:typing_timer, nil)  # Inicializar referencia del timer
-
-    send(self(), :after_join)
-    {:ok, socket}
-  end
-
-  def handle_info(:after_join, socket) do
-    {:ok, _} = RoomPresence.track(socket, socket.assigns.user_id, %{
-      username: socket.assigns.username,
-      typing: false,
-      online_at: System.system_time(:second)
-    })
-
-    push(socket, "presence_state", RoomPresence.list(socket))
-    {:noreply, socket}
-  end
-
-  def handle_in("typing_start", _payload, socket) do
-    # Cancelar timer previo antes de crear uno nuevo
-    # Esto evita la acumulación de timers con keystroke rápido
-    if socket.assigns.typing_timer do
-      Process.cancel_timer(socket.assigns.typing_timer)
-    end
-
-    RoomPresence.update(socket, socket.assigns.user_id, fn meta ->
-      Map.put(meta, :typing, true)
-    end)
-
-    timer_ref = Process.send_after(self(), :typing_timeout, 3_000)
-    {:noreply, assign(socket, :typing_timer, timer_ref)}
-  end
-
-  def handle_in("typing_stop", _payload, socket) do
-    if socket.assigns.typing_timer do
-      Process.cancel_timer(socket.assigns.typing_timer)
-    end
-
-    RoomPresence.update(socket, socket.assigns.user_id, fn meta ->
-      Map.put(meta, :typing, false)
-    end)
-
-    {:noreply, assign(socket, :typing_timer, nil)}
-  end
-
-  def handle_info(:typing_timeout, socket) do
-    RoomPresence.update(socket, socket.assigns.user_id, fn meta ->
-      Map.put(meta, :typing, false)
-    end)
-
-    {:noreply, assign(socket, :typing_timer, nil)}
-  end
-end
-```
-
-### Client JS equivalente
-
-```javascript
-const channel = socket.channel("chat:general", { user_id: userId, username })
-const presence = new Presence(channel)
-
-channel.join()
-
-let typingTimeout = null
-
-messageInput.addEventListener("input", () => {
-  channel.push("typing_start", {})
-
-  // El servidor maneja el timeout de 3s — el cliente solo avisa
-  // No es necesario que el cliente envíe "typing_stop" salvo al submit
-})
-
-messageInput.addEventListener("blur", () => {
-  channel.push("typing_stop", {})
-})
-
-// Renderizar indicadores de quién escribe
-presence.onSync(() => {
-  const typing = presence.list((id, { metas: [first] }) => first)
-    .filter(u => u.typing && u.user_id !== currentUserId)
-    .map(u => u.username)
-
-  renderTypingIndicator(typing)
-})
-```
-
----
-
-## Ejercicio 3: Room Capacity Limits — Límite de aforo
-
-### Contexto
-Una sala de videollamada tiene un máximo de 10 participantes. Al intentar
-unirse cuando la sala está llena, el servidor rechaza la conexión con
-un error descriptivo. Los participantes actuales ven el conteo actualizado.
-
-### Problema
-El siguiente código tiene una race condition crítica:
-
-```elixir
-defmodule MyAppWeb.CallChannel do
-  use Phoenix.Channel
-  alias MyAppWeb.RoomPresence
-
-  @max_capacity 10
-
-  def join("call:" <> room_id, %{"user_id" => user_id}, socket) do
-    current_count = RoomPresence.list("call:#{room_id}") |> map_size()
-
-    if current_count >= @max_capacity do
-      {:error, %{reason: "room_full", capacity: @max_capacity}}
-    else
-      # RACE CONDITION: entre el check y el track, otro usuario puede
-      # haberse unido. Con 9 presentes y 2 intentos simultáneos,
-      # ambos pasan el check y la sala queda con 11 usuarios.
-      send(self(), :after_join)
-      {:ok, assign(socket, :user_id, user_id)}
-    end
-  end
-end
-```
-
-### Solución — usar Presence como fuente de verdad atómica
-
-La race condition es inherente a sistemas distribuidos. La mitigación más
-práctica en Phoenix es aceptar que Presence.track es la operación atómica
-real, y agregar una validación post-join:
-
-```elixir
-defmodule MyAppWeb.CallChannel do
-  use Phoenix.Channel
-  alias MyAppWeb.RoomPresence
-
-  @max_capacity 10
-
-  def join("call:" <> room_id, %{"user_id" => user_id, "username" => username}, socket) do
-    presences = RoomPresence.list("call:#{room_id}")
-
-    # Verificar que el usuario no esté ya conectado (rejoin tras reconexión)
-    already_present = Map.has_key?(presences, user_id)
+  @impl true
+  def join("debug:" <> room_id, %{"trace_level" => level}, socket) do
+    presences = Presence.list("debug:#{room_id}")
 
     cond do
-      already_present ->
-        # Permitir reconexión sin contar como slot nuevo
-        socket =
-          socket
-          |> assign(:user_id, user_id)
-          |> assign(:username, username)
-          |> assign(:room_id, room_id)
-
+      Map.has_key?(presences, socket.assigns.client_id) ->
+        # Reconnect — this client is already tracked, allow re-join
+        socket = socket
+        |> assign(:room_id, room_id)
+        |> assign(:trace_level, level)
         send(self(), :after_join)
         {:ok, socket}
 
-      map_size(presences) >= @max_capacity ->
-        {:error, %{reason: "room_full", capacity: @max_capacity, current: map_size(presences)}}
+      map_size(presences) >= @max_sessions ->
+        {:error, %{
+          reason: "room_full",
+          current: map_size(presences),
+          max: @max_sessions
+        }}
 
       true ->
-        socket =
-          socket
-          |> assign(:user_id, user_id)
-          |> assign(:username, username)
-          |> assign(:room_id, room_id)
-
+        socket = socket
+        |> assign(:room_id, room_id)
+        |> assign(:trace_level, level)
         send(self(), :after_join)
         {:ok, socket}
     end
   end
 
+  @impl true
   def handle_info(:after_join, socket) do
-    presences = RoomPresence.list(socket)
-
-    # Segunda verificación DESPUÉS del track para detectar race condition
-    # Si la sala ya está llena, desconectar limpiamente
-    if map_size(presences) > @max_capacity do
-      push(socket, "error", %{reason: "room_full"})
-      # Terminar el proceso del channel — el cliente recibirá phx_close
-      {:stop, :normal, socket}
-    else
-      {:ok, _} = RoomPresence.track(socket, socket.assigns.user_id, %{
-        username: socket.assigns.username,
-        joined_at: System.system_time(:second)
-      })
-
-      push(socket, "presence_state", RoomPresence.list(socket))
-
-      # Informar a todos sobre el nuevo aforo
-      broadcast!(socket, "room_info", %{
-        current_count: map_size(RoomPresence.list(socket)),
-        max_capacity: @max_capacity
-      })
-
-      {:noreply, socket}
-    end
+    # TODO:
+    # 1. Presence.track/3 with metadata: client_id, trace_level, joined_at
+    # 2. push "presence_state" with current presences to this socket
+    # 3. broadcast! "session_joined" to all others in the room
+    {:noreply, socket}
   end
 
-  def handle_in("get_capacity", _payload, socket) do
-    count = RoomPresence.list(socket) |> map_size()
-    {:reply, {:ok, %{current: count, max: @max_capacity}}, socket}
+  @impl true
+  def handle_in("set_trace_level", %{"level" => level}, socket)
+      when level in ["debug", "info", "warn", "error"] do
+    # Update presence metadata with new trace level without reconnecting
+    # TODO: Presence.update/3 to change the :trace_level field
+    {:reply, :ok, assign(socket, :trace_level, level)}
+  end
+
+  def handle_in("set_trace_level", _, socket) do
+    {:reply, {:error, %{reason: "invalid trace level"}}, socket}
+  end
+
+  @impl true
+  def handle_in("get_sessions", _payload, socket) do
+    sessions = Presence.list(socket)
+    |> Enum.map(fn {client_id, %{metas: [meta | _]}} ->
+      %{client_id: client_id, trace_level: meta.trace_level, joined_at: meta.joined_at}
+    end)
+    {:reply, {:ok, %{sessions: sessions}}, socket}
   end
 end
 ```
 
-### Client JS equivalente
+### Step 3: `lib/gateway_api_web/channels/client_monitor_channel.ex`
+
+This channel gives the ops team a live view of all connected clients.
+
+```elixir
+defmodule GatewayApiWeb.ClientMonitorChannel do
+  use Phoenix.Channel
+  alias GatewayApiWeb.Presence
+
+  @topic "ops:clients"
+
+  @impl true
+  def join("ops:monitor", _params, socket) do
+    # Only ops-role clients can join this channel
+    # Assume the socket assigns :role from the token verification in UserSocket
+    if socket.assigns[:role] == :ops do
+      send(self(), :after_join)
+      {:ok, socket}
+    else
+      {:error, %{reason: "unauthorized"}}
+    end
+  end
+
+  @impl true
+  def handle_info(:after_join, socket) do
+    # TODO:
+    # 1. Track this ops client in Presence with metadata: role, connected_at
+    # 2. Push "presence_state" with ALL connected clients (not just ops ones)
+    #    HINT: Presence.list(@topic) where @topic tracks all gateway clients
+    {:noreply, socket}
+  end
+
+  @impl true
+  def handle_in("disconnect_client", %{"client_id" => client_id}, socket) do
+    # Force-disconnect a misbehaving client
+    # TODO: GatewayApiWeb.Endpoint.broadcast("client_socket:#{client_id}", "disconnect", %{})
+    # This triggers the UserSocket's id/1 — matches "client_socket:{id}"
+    {:reply, :ok, socket}
+  end
+end
+```
+
+### Step 4: JavaScript client
 
 ```javascript
-const channel = socket.channel("call:sala-privada", { user_id: userId, username })
+import { Socket, Presence } from "phoenix"
+
+const socket = new Socket("/socket", { params: { token: authToken } })
+socket.connect()
+
+// Join a debug session room
+const channel = socket.channel("debug:payments-service", {
+  trace_level: "debug"
+})
+
+const presence = new Presence(channel)
 
 channel.join()
-  .receive("ok", () => {
-    console.log("Unido a la llamada")
-    initWebRTC()
-  })
-  .receive("error", ({ reason, capacity, current }) => {
+  .receive("ok", () => console.log("Joined debug session"))
+  .receive("error", ({ reason, current, max }) => {
     if (reason === "room_full") {
-      showError(`Sala llena (${current}/${capacity} participantes)`)
+      showError(`Debug room full: ${current}/${max} sessions active`)
     }
   })
 
-channel.on("room_info", ({ current_count, max_capacity }) => {
-  updateCapacityBadge(current_count, max_capacity)
+// Track who else is in the debug session
+presence.onSync(() => {
+  const sessions = presence.list((id, { metas: [first] }) => ({
+    clientId: id,
+    traceLevel: first.trace_level,
+    joinedAt: first.joined_at
+  }))
+  renderSessionList(sessions)
 })
 
-// Detectar si el servidor nos desconecta por race condition
-channel.onClose(() => {
-  showError("La sala está llena, intenta de nuevo")
+presence.onJoin((id, _current, newPresence) => {
+  console.log(`${id} joined with trace level: ${newPresence.metas[0].trace_level}`)
 })
+
+presence.onLeave((id, current) => {
+  if (current.metas.length === 0) {
+    console.log(`${id} left the debug session`)
+  }
+})
+
+// Update trace level without reconnecting
+function setTraceLevel(level) {
+  channel.push("set_trace_level", { level })
+    .receive("ok", () => console.log("Trace level updated"))
+    .receive("error", ({ reason }) => console.error("Invalid level:", reason))
+}
 ```
 
----
-
-## Comparativa: `push` vs `broadcast!` vs `broadcast_from!`
-
-| Función | Destinatario | Caso de uso |
-|---------|-------------|-------------|
-| `push/3` | Solo el socket actual | Estado inicial, confirmaciones personales |
-| `broadcast!/3` | Todos en el topic (incluido emisor) | Eventos globales, con `intercept` para filtrar |
-| `broadcast_from!/3` | Todos excepto el emisor | Notificaciones a otros, sin necesidad de `intercept` |
+### Step 5: Given tests — must pass without modification
 
 ```elixir
-# broadcast_from!/3 es equivalente a broadcast! + handle_out con filtro del emisor
-# Úsalo cuando no necesitas transformar el payload por socket
+# test/gateway_api_web/channels/debug_session_channel_test.exs
+defmodule GatewayApiWeb.DebugSessionChannelTest do
+  use GatewayApiWeb.ChannelCase
 
-def handle_in("message", %{"text" => text}, socket) do
-  payload = %{text: text, author: socket.assigns.username}
+  alias GatewayApiWeb.Presence
 
-  # Enviar a todos EXCEPTO el emisor — sin necesitar intercept
-  broadcast_from!(socket, "message", payload)
+  defp make_socket(client_id) do
+    GatewayApiWeb.UserSocket
+    |> socket(client_id, %{client_id: client_id})
+  end
 
-  # Confirmar al emisor
-  {:reply, :ok, socket}
-end
-```
+  test "join succeeds and pushes presence_state" do
+    {:ok, _, _socket} =
+      make_socket("c1")
+      |> subscribe_and_join(
+        GatewayApiWeb.DebugSessionChannel,
+        "debug:test-room",
+        %{"trace_level" => "debug"}
+      )
 
----
+    assert_push "presence_state", _
+  end
 
-## Resumen de errores comunes con Presence
-
-| Error | Síntoma | Solución |
-|-------|---------|---------|
-| No agregar `RoomPresence` al árbol de supervisión | `no process` en runtime al hacer `track/3` | Agregar a `children` en `application.ex` |
-| Llamar `track/3` directamente en `join/3` | Race condition, socket no inicializado | Usar `send(self(), :after_join)` |
-| No cancelar timer anterior en typing | Indicador parpadea, desaparece prematuramente | Guardar `timer_ref` en assigns y cancelar con `Process.cancel_timer/1` |
-| Asumir que el check de capacidad en `join/3` es atómico | Sala supera el límite bajo carga concurrente | Verificar también en `handle_info(:after_join, ...)` |
-| No inicializar assigns en `join/3` | `KeyError` en `handle_in` o `handle_info` | Asignar todos los valores necesarios antes de retornar `{:ok, socket}` |
-
----
-
-## Test con ChannelCase y Presence
-
-```elixir
-defmodule MyAppWeb.CallChannelTest do
-  use MyAppWeb.ChannelCase
-
-  alias MyAppWeb.RoomPresence
-
-  test "rechaza join cuando la sala está llena" do
-    # Llenar la sala hasta el máximo
-    Enum.each(1..10, fn i ->
-      {:ok, _, _socket} =
-        MyAppWeb.UserSocket
-        |> socket("user_#{i}", %{})
+  test "rejects when room is at max capacity" do
+    # Fill the room to @max_sessions
+    Enum.each(1..5, fn i ->
+      {:ok, _, _} =
+        make_socket("client-#{i}")
         |> subscribe_and_join(
-          MyAppWeb.CallChannel,
-          "call:sala-test",
-          %{"user_id" => "u#{i}", "username" => "User #{i}"}
+          GatewayApiWeb.DebugSessionChannel,
+          "debug:full-room",
+          %{"trace_level" => "info"}
         )
     end)
 
-    # El undécimo debe ser rechazado
-    assert {:error, %{reason: "room_full"}} =
-      MyAppWeb.UserSocket
-      |> socket("user_11", %{})
+    assert {:error, %{reason: "room_full", max: 5}} =
+      make_socket("client-6")
       |> subscribe_and_join(
-        MyAppWeb.CallChannel,
-        "call:sala-test",
-        %{"user_id" => "u11", "username" => "User 11"}
+        GatewayApiWeb.DebugSessionChannel,
+        "debug:full-room",
+        %{"trace_level" => "info"}
       )
   end
 
-  test "presencia se actualiza cuando un usuario se desconecta", %{} do
-    {:ok, _, socket1} =
-      MyAppWeb.UserSocket
-      |> socket("user_1", %{})
+  test "presence clears when client disconnects" do
+    {:ok, _, socket} =
+      make_socket("dc-client")
       |> subscribe_and_join(
-        MyAppWeb.CallChannel,
-        "call:sala-dc",
-        %{"user_id" => "u1", "username" => "Alice"}
+        GatewayApiWeb.DebugSessionChannel,
+        "debug:dc-room",
+        %{"trace_level" => "warn"}
       )
 
-    assert 1 = RoomPresence.list("call:sala-dc") |> map_size()
+    # Give Presence time to register
+    Process.sleep(50)
+    assert 1 == Presence.list("debug:dc-room") |> map_size()
 
-    Process.exit(socket1.channel_pid, :normal)
+    # Simulate disconnect
+    Process.exit(socket.channel_pid, :normal)
+    Process.sleep(50)
 
-    # Dar tiempo al sistema de presencia para procesar la salida
-    :timer.sleep(50)
+    assert 0 == Presence.list("debug:dc-room") |> map_size()
+  end
 
-    assert 0 = RoomPresence.list("call:sala-dc") |> map_size()
+  test "set_trace_level updates presence metadata" do
+    {:ok, _, socket} =
+      make_socket("level-client")
+      |> subscribe_and_join(
+        GatewayApiWeb.DebugSessionChannel,
+        "debug:level-room",
+        %{"trace_level" => "info"}
+      )
+
+    ref = push(socket, "set_trace_level", %{"level" => "debug"})
+    assert_reply ref, :ok
+
+    Process.sleep(50)
+    presences = Presence.list("debug:level-room")
+    [meta | _] = presences["level-client"].metas
+    assert meta.trace_level == "debug"
+  end
+
+  test "rejects invalid trace level" do
+    {:ok, _, socket} =
+      make_socket("inv-client")
+      |> subscribe_and_join(
+        GatewayApiWeb.DebugSessionChannel,
+        "debug:inv-room",
+        %{"trace_level" => "info"}
+      )
+
+    ref = push(socket, "set_trace_level", %{"level" => "verbose"})
+    assert_reply ref, :error, %{reason: "invalid trace level"}
   end
 end
+```
+
+### Step 6: Run the tests
+
+```bash
+mix test test/gateway_api_web/channels/ --trace
 ```
 
 ---
 
-## Cómo configurar el socket y el endpoint
+## Trade-off analysis
 
-```elixir
-# lib/my_app_web/channels/user_socket.ex
-defmodule MyAppWeb.UserSocket do
-  use Phoenix.Socket
+| Aspect | Phoenix Presence | Manual ETS tracking | External Redis SETEX |
+|--------|-----------------|--------------------|--------------------|
+| Auto-cleanup on disconnect | yes (monitors process) | no (manual cleanup) | no (TTL required) |
+| Distributed sync | yes (delta CRDTs) | no (node-local) | yes (shared Redis) |
+| Consistency | eventual | strong (single node) | strong |
+| Race condition on join | mitigated (after_join pattern) | inherent | mitigated (SETNX) |
+| Metadata updates | Presence.update/3 | :ets.insert | HSET |
+| Overhead | PubSub broadcast per change | ETS write | network round-trip |
 
-  channel "room:*",  MyAppWeb.RoomChannel
-  channel "chat:*",  MyAppWeb.ChatChannel
-  channel "call:*",  MyAppWeb.CallChannel
+Reflection: the capacity check in `join/3` is not atomic — two clients can both read
+`map_size(presences) == 4` and both pass the check, resulting in 6 sessions in a room
+capped at 5. How would you tighten this without introducing a serializing GenServer?
+(Hint: `handle_info(:after_join, ...)` can check again and kick itself out.)
 
-  def connect(%{"token" => token}, socket, _connect_info) do
-    case Phoenix.Token.verify(MyAppWeb.Endpoint, "user socket", token) do
-      {:ok, user_id} -> {:ok, assign(socket, :user_id, user_id)}
-      {:error, _}    -> :error
-    end
-  end
+---
 
-  def id(socket), do: "user_socket:#{socket.assigns.user_id}"
-end
-```
+## Common production mistakes
 
-```elixir
-# lib/my_app_web/endpoint.ex — montar el socket
-socket "/socket", MyAppWeb.UserSocket,
-  websocket: true,
-  longpoll: false
-```
+**1. Not adding `Presence` to the supervision tree**
+`Presence.track/3` calls the Presence GenServer process. If it's not supervised, the call
+raises `no process`. Add it explicitly to `application.ex` children.
+
+**2. Calling `Presence.track/3` directly in `join/3`**
+The socket is not fully initialized when `join/3` runs. The `send(self(), :after_join)`
+pattern defers tracking until after `join/3` has returned and the socket is registered.
+
+**3. Not canceling timers before creating new ones**
+If you add timer-based metadata (e.g., "typing" indicator that clears after 3s), calling
+`Process.send_after` on every keystroke without canceling the previous timer accumulates
+timers. Store the `timer_ref` in socket assigns and call `Process.cancel_timer/1` first.
+
+**4. Using `map_size(Presence.list(...))` for strict capacity enforcement**
+`Presence.list` reflects the CRDT state at query time. Under concurrent joins, this is
+eventually consistent. For hard capacity limits on critical resources, a GenServer with
+serialized join logic is more appropriate than Presence alone.
+
+**5. Sending `presence_state` before `Presence.track/3`**
+If you push `presence_state` before tracking yourself, the joining client sees the list
+without themselves. Always track first, then push the state.
+
+---
+
+## Resources
+
+- [`Phoenix.Presence`](https://hexdocs.pm/phoenix/Phoenix.Presence.html) — API reference and CRDTs explanation
+- [`Phoenix.Tracker`](https://hexdocs.pm/phoenix_pubsub/Phoenix.Tracker.html) — the underlying distributed tracker
+- [phoenix.js `Presence` class](https://hexdocs.pm/phoenix/js/) — `onSync`, `onJoin`, `onLeave` callbacks
+- [CRDTs explained](https://crdt.tech/) — the theory behind conflict-free replicated data types

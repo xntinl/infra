@@ -1,67 +1,307 @@
-# 6. Build a Distributed Tracing System Compatible with OpenTelemetry
+# Distributed Tracing System
 
-**Difficulty**: Insane
+**Project**: `tracer` — an OpenTelemetry-compatible distributed tracing system with macro instrumentation
 
-## Prerequisites
-- Mastered: All Elixir/OTP intermediate and advanced concepts (GenServer, :telemetry, process dictionary, ETS, binary encoding)
-- Mastered: Observability principles — traces vs metrics vs logs, sampling theory, structured telemetry
-- Familiarity with: OpenTelemetry specification, Jaeger architecture, Thrift binary encoding, W3C TraceContext propagation header format
-- Reading: The Dapper paper (Sigelman et al., 2010), the OpenTelemetry specification (OTEP docs), the Jaeger Thrift IDL definitions
+---
 
-## Problem Statement
+## Project context
 
-Build a distributed tracing system in Elixir/OTP that instruments Elixir applications, collects spans from across a BEAM cluster, samples intelligently, stores spans in memory, and exports them in Jaeger Thrift format. The system must be transparent to application code: a single `use MyTracer` macro should add tracing to any GenServer without modifying business logic.
+You are building `tracer`, a distributed tracing system that instruments Elixir applications, collects spans across a BEAM cluster, samples intelligently, stores spans in memory, and exports in Jaeger Thrift format. A single `use Tracer.GenServer` macro adds tracing to any GenServer without modifying business logic.
 
-Your system must implement:
-1. A span API with high-resolution timestamps: `start_span(name, attributes)` starts a new span under the current trace context; `finish_span(span)` records duration and emits the span to the local collector; spans carry a 128-bit trace ID and a 64-bit span ID
-2. Context propagation through GenServer calls: when process A calls a GenServer B, the trace context (trace_id + parent_span_id) must automatically flow into B's `handle_call` without the developer manually passing it — use the process dictionary as the implicit context carrier
-3. A macro-based auto-instrumentation layer: `use MyTracer.GenServer` wraps `handle_call`, `handle_cast`, and `handle_info` to automatically start/finish spans, tag them with the message pattern, and propagate context from the caller
-4. Two sampling strategies, composable: head-based sampling (sample X% of incoming traces at the entry point, propagate the sampling decision downstream) and tail-based sampling (buffer all spans for a trace; after the root span finishes, inspect the full trace and always keep traces that contain errors or exceed a latency threshold)
-5. A collector process per node that receives spans via a local ETS-backed buffer, flushes them to a central aggregator on a configurable interval, and handles backpressure (drop oldest when buffer exceeds MAX_SIZE)
-6. An in-memory storage engine on the aggregator that can hold 1,000,000 spans, supports point lookup by trace_id, and supports range queries by timestamp
-7. A Jaeger Thrift exporter: serialize collected spans into Jaeger's Thrift binary format and POST them to the Jaeger collector HTTP endpoint (or emit to stdout if Jaeger is not available)
-8. A text-based dashboard that shows: top 10 slowest traces in the last 60 seconds, error rate per service, span count per operation, and a sample trace rendered as an ASCII tree
+Project structure:
 
-## Acceptance Criteria
+```
+tracer/
+├── lib/
+│   └── tracer/
+│       ├── application.ex           # starts collector, aggregator, dashboard
+│       ├── span.ex                  # span struct, start/finish, 128-bit trace IDs
+│       ├── context.ex               # process dictionary: current trace context carrier
+│       ├── propagation.ex           # W3C TraceContext: inject/extract across process boundaries
+│       ├── gen_server.ex            # macro: use Tracer.GenServer — wraps callbacks automatically
+│       ├── sampling.ex              # head-based (rate) and tail-based (error/latency) strategies
+│       ├── collector.ex             # per-node ETS buffer, backpressure, flush to aggregator
+│       ├── aggregator.ex            # central span store: 1M spans, point lookup, range queries
+│       ├── exporter.ex              # Jaeger Thrift binary serializer
+│       └── dashboard.ex             # periodic text dashboard: slowest traces, error rate, ASCII tree
+├── test/
+│   └── tracer/
+│       ├── span_test.exs            # span creation, finish, timestamps
+│       ├── propagation_test.exs     # context propagation across GenServer calls
+│       ├── sampling_test.exs        # head-based and tail-based sampling correctness
+│       ├── collector_test.exs       # backpressure and buffer overflow
+│       └── dashboard_test.exs       # ASCII trace tree rendering
+├── bench/
+│   └── tracer_bench.exs
+└── mix.exs
+```
 
-- [ ] **Span creation and finish**: `start_span("db.query", %{table: "users"})` returns a span struct with non-zero timestamps and a valid 128-bit trace ID; `finish_span/1` records a `duration_us` field with microsecond precision
-- [ ] **Context propagation — same process**: A span started in process A is visible as the parent when a child span is started in the same process; child span's `parent_span_id` equals the parent's `span_id`
-- [ ] **Context propagation — across GenServer call**: Process A holds an active span and calls GenServer B via `GenServer.call`; within B's `handle_call`, a new span is automatically created with the correct `trace_id` and `parent_span_id` referencing A's span
-- [ ] **Auto-instrumentation**: Add `use MyTracer.GenServer` to a GenServer module; without any other changes, every `handle_call` invocation is automatically wrapped in a span; verify via the dashboard that spans appear with operation names derived from the message pattern
-- [ ] **Head-based sampling**: Configure 10% sampling rate; send 10,000 distinct traces through the system; confirm that approximately 1,000 (±5%) are retained and 9,000 are dropped; confirm the sampling decision is consistent across all spans in a given trace
-- [ ] **Tail-based sampling**: Configure tail-based sampling to always keep error traces; inject 100 traces where the root span carries an `error: true` attribute; send 900 normal traces; confirm all 100 error traces are retained regardless of head-sample decision
-- [ ] **1M span storage**: Insert 1,000,000 spans into the in-memory store; perform 10,000 point lookups by `trace_id`; confirm median lookup latency is under 1ms and no lookup returns a wrong or missing result
-- [ ] **Jaeger export**: After inserting 100 spans, invoke the exporter and confirm the output is valid Jaeger Thrift binary (parse it with the Jaeger Thrift IDL); if Jaeger is running locally, confirm traces appear in the Jaeger UI
-- [ ] **Backpressure**: Flood the collector with 100,000 spans/second; confirm the buffer never exceeds MAX_SIZE; confirm the oldest spans are dropped (not the newest); confirm the system remains stable and does not crash
-- [ ] **Text dashboard**: The dashboard must refresh every 10 seconds and correctly show the 10 slowest traces (ranked by root span duration), error rate per service, and a correct ASCII tree for a selected trace
+---
 
-## What You Will Learn
-- Why distributed tracing requires an implicit context carrier (process dictionary in Elixir, ThreadLocal in Java, context.Context in Go) rather than explicit parameter threading
-- The difference between head-based and tail-based sampling and why tail-based sampling is fundamentally harder to implement — it requires buffering the full trace before making a sampling decision
-- How to implement a macro in Elixir that wraps existing callbacks transparently using `defoverridable` and `__using__/1`
-- How Thrift binary encoding works — field IDs, type tags, zigzag encoding for integers — and why it is more compact than JSON for high-volume telemetry
-- Why high-resolution timestamps (`System.monotonic_time/1`) are necessary for span duration and why wall-clock time is unreliable for ordering events across processes
-- How to implement a bounded buffer with O(1) oldest-drop eviction using a ring buffer or double-ended queue in ETS
-- The architectural split between a per-node local agent (low overhead, always-on) and a central aggregator (stateful, queryable) — the same split used by Datadog Agent, Jaeger Agent, and OpenTelemetry Collector
+## The problem
 
-## Hints
+A request enters service A, which calls service B via GenServer, which queries a database, which calls service C. When the request is slow, you need to know which service caused it and what was happening inside each service at that moment. Distributed tracing answers this by recording a tree of spans, one per operation, with parent-child relationships that reconstruct the causal path.
 
-This exercise is intentionally sparse. You are expected to:
-- Read the Dapper paper fully — pay special attention to section 3 (distributed tracing infrastructure) and section 4 (instrumentation) before designing your span API
-- The W3C TraceContext header spec defines how trace context crosses HTTP boundaries — your GenServer propagation is the intra-process equivalent; the same semantics apply
-- Auto-instrumentation via `use` macros requires you to understand Elixir's `__using__/1`, `defoverridable`, and `quote/unquote` deeply — experiment with a minimal example before building the full system
-- Tail-based sampling requires a trace buffer that expires after a timeout — if the root span never finishes (bug or very long trace), you must eventually flush or discard
-- Study the Jaeger Thrift IDL file (`jaeger.thrift`) before writing any serialization code — the schema defines which fields are required, their type IDs, and the expected field ordering
+The hard part is context propagation: the trace ID and parent span ID must flow automatically from caller to callee without the developer manually threading them through every function signature. In Elixir, the process dictionary is the mechanism that makes this invisible.
 
-## Reference Material (Research Required)
-- Sigelman, B. et al. (2010). *Dapper, a Large-Scale Distributed Systems Tracing Infrastructure* (Google Technical Report) — the paper that defined modern distributed tracing
-- OpenTelemetry Specification — https://opentelemetry.io/docs/specs/ — focus on the Trace API, SDK, and Data Model sections; do not read introductory blog posts
-- W3C TraceContext specification — https://www.w3.org/TR/trace-context/ — the standard for cross-service context propagation
-- Jaeger Thrift IDL — `model/proto/api_v2/jaeger.proto` and `jaeger-idl/thrift/jaeger.thrift` in the Jaeger GitHub repository
-- Thrift binary protocol specification — Apache Thrift documentation, Binary Protocol Encoding section
+---
 
-## Difficulty Rating
-★★★★★★
+## Why this design
 
-## Estimated Time
-4–6 weeks for an experienced Elixir developer with observability and binary protocol background
+**Process dictionary as implicit context carrier**: every process has a private dictionary (`Process.put/2`, `Process.get/2`). When a GenServer call is made, the caller's process dictionary is not automatically copied to the callee. Your macro layer copies the trace context from the calling process into the message, then extracts it in the callee's `handle_call` before the user callback runs. This is identical to how OpenTelemetry's Go `context.Context` works — an implicit channel alongside the explicit message.
+
+**Head vs tail sampling**: head-based sampling makes the keep/drop decision at the trace entry point and propagates it. It is cheap (one coin flip per trace) but samples blindly — errors and slow traces are dropped at the same rate as fast, successful ones. Tail-based sampling buffers all spans for a trace and makes the decision after the root span finishes. It always keeps errors and slow traces, at the cost of buffering everything. You must implement both because neither is sufficient alone.
+
+**Per-node collector, central aggregator**: each node runs a lightweight local collector that buffers spans in ETS and flushes periodically. The aggregator is stateful and queryable. This mirrors the Datadog Agent architecture: the per-node agent is always-on with minimal overhead; the central aggregator does the expensive work.
+
+---
+
+## Implementation milestones
+
+### Step 1: Create the project
+
+```bash
+mix new tracer --sup
+cd tracer
+mkdir -p lib/tracer test/tracer bench
+```
+
+### Step 2: `mix.exs` — dependencies
+
+```elixir
+defp deps do
+  [
+    {:benchee, "~> 1.3", only: :dev}
+  ]
+end
+```
+
+### Step 3: Span API
+
+```elixir
+# lib/tracer/span.ex
+defmodule Tracer.Span do
+  @moduledoc """
+  A span represents a single operation within a trace.
+
+  Fields:
+    trace_id:       128-bit integer (16 bytes), shared across all spans in a trace
+    span_id:        64-bit integer (8 bytes), unique per span
+    parent_span_id: 64-bit integer or nil for root spans
+    name:           operation name
+    attributes:     map of string keys to string/integer/boolean values
+    started_at_us:  microsecond monotonic timestamp
+    duration_us:    set by finish_span/1
+    status:         :ok | :error
+  """
+
+  defstruct [
+    :trace_id, :span_id, :parent_span_id,
+    :name, :attributes, :started_at_us, :duration_us, :status
+  ]
+
+  @doc "Starts a new span. Reads parent context from process dictionary."
+  def start_span(name, attributes \\ %{}) do
+    # TODO
+    # HINT: trace_id = if parent exists, inherit it; else generate new 16-byte random ID
+    # HINT: parent_span_id = current span from process dictionary
+    # HINT: push self as current span into process dictionary
+  end
+
+  @doc "Finishes the span, recording duration. Pops self from process dictionary."
+  def finish_span(span) do
+    # TODO
+    # HINT: duration_us = System.monotonic_time(:microsecond) - span.started_at_us
+    # HINT: emit to local collector
+  end
+end
+```
+
+### Step 4: Auto-instrumentation macro
+
+```elixir
+# lib/tracer/gen_server.ex
+defmodule Tracer.GenServer do
+  @moduledoc """
+  Drop-in replacement for `use GenServer` that automatically wraps
+  handle_call, handle_cast, and handle_info in spans.
+
+  Usage:
+    defmodule MyServer do
+      use Tracer.GenServer
+      # all callbacks are automatically traced
+    end
+
+  Context propagation: the caller embeds its trace context in the message
+  envelope. The macro extracts it before calling the user's callback.
+  """
+
+  defmacro __using__(_opts) do
+    quote do
+      use GenServer
+      @before_compile Tracer.GenServer
+    end
+  end
+
+  defmacro __before_compile__(_env) do
+    quote do
+      # TODO: defoverridable handle_call/3, handle_cast/2, handle_info/2
+      # TODO: each override:
+      #   1. extracts trace context from message envelope
+      #   2. restores context in process dictionary
+      #   3. starts a span named after the message pattern
+      #   4. calls the original callback
+      #   5. finishes the span
+      #   6. clears trace context from process dictionary
+      # HINT: use defoverridable after use GenServer injects the default callbacks
+    end
+  end
+end
+```
+
+### Step 5: Given tests — must pass without modification
+
+```elixir
+# test/tracer/propagation_test.exs
+defmodule Tracer.PropagationTest do
+  use ExUnit.Case, async: true
+
+  defmodule EchoServer do
+    use Tracer.GenServer
+
+    def start_link(_), do: GenServer.start_link(__MODULE__, :ok)
+    def init(_), do: {:ok, nil}
+
+    def handle_call(:get_context, _from, state) do
+      {:reply, Tracer.Context.current(), state}
+    end
+  end
+
+  setup do
+    {:ok, pid} = EchoServer.start_link(:ok)
+    {:ok, server: pid}
+  end
+
+  test "trace context propagates from caller to GenServer", %{server: server} do
+    parent_span = Tracer.Span.start_span("parent_op")
+
+    child_context = GenServer.call(server, :get_context)
+
+    assert child_context.trace_id == parent_span.trace_id,
+      "trace ID must match: #{parent_span.trace_id} vs #{child_context.trace_id}"
+
+    assert child_context.parent_span_id == parent_span.span_id,
+      "parent span ID must be set in child context"
+
+    Tracer.Span.finish_span(parent_span)
+  end
+
+  test "root span has no parent" do
+    span = Tracer.Span.start_span("root")
+    assert is_nil(span.parent_span_id)
+    Tracer.Span.finish_span(span)
+  end
+end
+```
+
+```elixir
+# test/tracer/sampling_test.exs
+defmodule Tracer.SamplingTest do
+  use ExUnit.Case, async: false
+
+  test "head-based 10% sampling retains ~1000 of 10000 traces" do
+    Tracer.Sampling.configure(:head, rate: 0.10)
+
+    for _ <- 1..10_000 do
+      span = Tracer.Span.start_span("req")
+      Tracer.Span.finish_span(span)
+    end
+
+    count = Tracer.Aggregator.span_count()
+    assert count >= 800 and count <= 1_200,
+      "expected ~1000 spans, got #{count}"
+  end
+
+  test "tail-based sampling always keeps error traces" do
+    Tracer.Sampling.configure(:tail, keep_errors: true)
+    Tracer.Aggregator.clear()
+
+    for _ <- 1..100 do
+      span = Tracer.Span.start_span("req") |> Map.put(:status, :error)
+      Tracer.Span.finish_span(span)
+    end
+
+    assert Tracer.Aggregator.span_count() == 100
+  end
+end
+```
+
+### Step 6: Run the tests
+
+```bash
+mix test test/tracer/ --trace
+```
+
+### Step 7: Benchmark
+
+```elixir
+# bench/tracer_bench.exs
+Benchee.run(
+  %{
+    "start + finish span — sampled" => fn ->
+      s = Tracer.Span.start_span("bench_op")
+      Tracer.Span.finish_span(s)
+    end,
+    "start + finish span — dropped by head sampler" => fn ->
+      Tracer.Sampling.configure(:head, rate: 0.0)
+      s = Tracer.Span.start_span("bench_dropped")
+      Tracer.Span.finish_span(s)
+    end
+  },
+  parallel: 4,
+  time: 5,
+  warmup: 2,
+  formatters: [Benchee.Formatters.Console]
+)
+```
+
+Target: start + finish span < 5µs per operation at p99 on a warm collector.
+
+---
+
+## Trade-off analysis
+
+| Aspect | Head-based sampling | Tail-based sampling | No sampling |
+|--------|--------------------|--------------------|-------------|
+| Memory per trace | constant (decision at entry) | full trace buffered | full trace kept |
+| Error trace retention | probabilistic | guaranteed | guaranteed |
+| Latency overhead | negligible | timeout-dependent | high at scale |
+| Implementation complexity | trivial | significant (buffer + timeout) | trivial |
+| Suitable for | high-volume, low-error services | error analysis, SLA debugging | low-volume only |
+
+Reflection: tail-based sampling requires a trace buffer that times out if the root span never finishes. What is the correct behavior when the timeout fires — flush, drop, or sample probabilistically?
+
+---
+
+## Common production mistakes
+
+**1. Using wall-clock time for span duration**
+`System.os_time/1` can go backward after NTP adjustment. Span durations must use `System.monotonic_time(:microsecond)`. The start and finish must use the same clock.
+
+**2. Not clearing trace context after the request**
+If the process is reused (pooled processes, long-lived GenServers), residual context from the previous request leaks into the next. Always clear the process dictionary context in a `try/after` block around the callback wrapper.
+
+**3. Tail-based sampling without a root span detector**
+The tail sampler must know which span is the root to know when the trace is complete. If you buffer spans without tracking which trace they belong to, you can never make the flush decision.
+
+**4. Blocking the hot path with Jaeger export**
+The Jaeger exporter performs HTTP requests or binary encoding. This must happen in a background process (the aggregator or a dedicated exporter process), never in the span finish path.
+
+---
+
+## Resources
+
+- Sigelman, B. et al. (2010). *Dapper, a Large-Scale Distributed Systems Tracing Infrastructure* — section 3 (infrastructure) and section 4 (instrumentation) are the foundational reference
+- [OpenTelemetry Specification](https://opentelemetry.io/docs/specs/) — Trace API, SDK, and Data Model sections
+- [W3C TraceContext specification](https://www.w3.org/TR/trace-context/) — standard for cross-service context propagation
+- [Jaeger Thrift IDL](https://github.com/jaegertracing/jaeger-idl/blob/main/thrift/jaeger.thrift) — the schema for the Thrift binary format your exporter must emit

@@ -1,580 +1,407 @@
-# 09. Pattern Matching Avanzado
+# Advanced Pattern Matching
 
-**Difficulty**: Intermedio
-
----
-
-## Prerequisites
-
-- Pattern matching básico (literales, variables, `_`)
-- Structs y Maps en Elixir
-- Funciones multi-cláusula
-- Ejercicio 08: Protocols
+**Project**: `task_queue` — built incrementally across the intermediate level
 
 ---
 
-## Learning Objectives
+## Project context
 
-1. Aplicar guards `when` para refinar el matching más allá del tipo/estructura
-2. Ordenar correctamente cláusulas multi-clause (de más a menos específica)
-3. Usar el operador pin `^` para comparar contra valores ya enlazados
-4. Aprovechar el underscore `_` y sus variantes para ignorar partes irrelevantes
-5. Hacer nested pattern matching en maps, structs y listas anidadas
-6. Diseñar state machines con funciones multi-cláusula y guards
+The task_queue system receives diverse job payloads and must route them to the correct
+handler, validate their shape, and decode nested structures from external sources (webhook
+events, cron definitions, pipeline steps). All of this routing and decoding logic is cleaner,
+safer, and faster with advanced pattern matching than with conditional logic.
 
----
+Project structure at this point:
 
-## Concepts
-
-### Guards `when`
-
-Los guards amplían el pattern matching con predicados booleanos. Se evalúan solo si el patrón ya coincidió:
-
-```elixir
-defmodule Clasificador do
-  def clasificar(n) when is_integer(n) and n > 0, do: :positivo
-  def clasificar(n) when is_integer(n) and n < 0, do: :negativo
-  def clasificar(0),                               do: :cero
-  def clasificar(_),                               do: :no_es_entero
-end
-
-Clasificador.clasificar(5)    # :positivo
-Clasificador.clasificar(-3)   # :negativo
-Clasificador.clasificar(0)    # :cero
-Clasificador.clasificar("x")  # :no_es_entero
 ```
-
-**Funciones permitidas en guards** (subconjunto seguro sin efectos secundarios):
-`is_integer/1`, `is_float/1`, `is_atom/1`, `is_binary/1`, `is_list/1`, `is_map/1`,
-`is_nil/1`, `is_pid/1`, `length/1`, `map_size/1`, `div/2`, `rem/2`, `abs/1`,
-operadores aritméticos, comparación, booleanos `and/or/not`.
-
-```elixir
-# Guards compuestos
-def procesar(lista) when is_list(lista) and length(lista) > 0 do
-  hd(lista)
-end
-
-def procesar([]), do: {:error, :lista_vacia}
-
-# Guard con múltiples tipos (or)
-def es_numero?(v) when is_integer(v) or is_float(v), do: true
-def es_numero?(_), do: false
-```
-
-### Operador Pin `^`
-
-El operador `^` fija una variable a su valor actual en lugar de reasignarla:
-
-```elixir
-esperado = :ok
-resultado = :ok
-
-# Sin pin — reasigna resultado (siempre coincide)
-case resultado do
-  esperado -> "siempre llega aquí"
-end
-
-# Con pin — compara contra el valor de esperado
-case resultado do
-  ^esperado -> "coincide con :ok"
-  _         -> "otro valor"
-end
-```
-
-Casos de uso frecuentes:
-
-```elixir
-# En receive — esperar respuesta de un PID específico
-pid = self()
-receive do
-  {^pid, mensaje} -> mensaje  # Solo del PID correcto
-  _               -> :ignorado
-end
-
-# En funciones — verificar que algo no cambió
-def sin_cambios?([h | t], ^h), do: true
-def sin_cambios?(_, _),        do: false
-```
-
-### Underscore y variantes
-
-```elixir
-# _ descarta cualquier valor
-{:ok, _} = {:ok, "ignorado"}
-
-# _nombre documenta qué es pero no lo usa (evita warning del compilador)
-def log({:error, _razon} = evento), do: IO.inspect(evento)
-
-# Múltiples _ en el mismo patrón — cada uno es independiente
-{_, _, _} = {1, 2, 3}
-```
-
-### Nested Pattern Matching
-
-El matching puede ir tan profundo como la estructura requiera:
-
-```elixir
-# Maps anidados
-%{usuario: %{nombre: nombre, rol: :admin}} = datos
-# Solo coincide si datos.usuario.rol es :admin
-
-# Listas con patrones internos
-[%{id: id1}, %{id: id2} | _resto] = registros
-# Desempaqueta los primeros dos ids
-
-# Structs anidados
-defmodule Pedido do
-  defstruct [:id, :cliente, :lineas]
-end
-
-defmodule Cliente do
-  defstruct [:nombre, :tipo]  # tipo: :vip | :normal
-end
-
-def descuento(%Pedido{cliente: %Cliente{tipo: :vip}, lineas: l})
-    when length(l) > 5 do
-  0.20  # 20% para VIP con más de 5 líneas
-end
-
-def descuento(%Pedido{cliente: %Cliente{tipo: :vip}}) do
-  0.10  # 10% para VIP con pocas líneas
-end
-
-def descuento(_), do: 0.0  # Sin descuento por defecto
-```
-
-### Multi-Clause Ordering
-
-Las cláusulas se evalúan de arriba a abajo. Las más específicas deben ir primero:
-
-```elixir
-# MAL — la cláusula genérica captura todo
-def f(_),          do: :cualquiera    # siempre llega aquí
-def f(0),          do: :cero          # nunca se alcanza
-
-# BIEN — de específico a general
-def f(0),          do: :cero
-def f(n) when n > 0, do: :positivo
-def f(_),          do: :negativo
+task_queue/
+├── lib/
+│   └── task_queue/
+│       ├── job_router.ex        # ← you implement this
+│       └── payload_decoder.ex   # ← you implement this
+├── test/
+│   └── task_queue/
+│       └── pattern_matching_test.exs   # given tests — must pass without modification
+└── mix.exs
 ```
 
 ---
 
-## Exercises
+## Why advanced pattern matching matters in production code
 
-### Exercise 1: Parser de Tokens con Pattern Matching
+Pattern matching in Elixir is not just destructuring. It is:
 
-Implementa un lexer/tokenizador que convierte strings en tokens tipados usando pattern matching multi-cláusula.
+- **Guards** (`when`) that express constraints impossible to encode in structural patterns
+  alone — numeric ranges, type checks, string lengths.
+- **The pin operator** (`^`) that distinguishes "bind this variable" from "assert this
+  variable has the value it already has" — critical in message receive loops and ETS lookups.
+- **Multi-clause functions** ordered from most to least specific — the compiler calls the
+  first matching clause, making exhaustiveness and precedence explicit.
+- **Nested matching** that decodes deeply nested structures in a single `case` arm instead
+  of multiple nested conditionals.
+
+The cost of getting this wrong: a function that matches a `:done` job and processes it as
+`:pending` because the clause order was wrong. Pattern matching bugs are logic bugs — no
+exception is raised, the wrong branch just runs silently.
+
+---
+
+## The business problem
+
+`TaskQueue.JobRouter` takes an incoming job map (from an external webhook or internal
+source) and routes it to one of several handlers based on its type, priority, and payload
+shape.
+
+`TaskQueue.PayloadDecoder` takes raw maps from external sources (JSON decoded, no struct
+guarantees) and decodes them into typed job structs, validating shape and constraints.
+
+---
+
+## Implementation
+
+### Step 1: `lib/task_queue/job_router.ex`
 
 ```elixir
-# Archivo: lib/lexer.ex
-
-defmodule Lexer do
+defmodule TaskQueue.JobRouter do
   @moduledoc """
-  Tokenizador simple para una expresión aritmética.
-  Tokens posibles:
-    {:number, integer}
-    {:op, :plus | :minus | :mult | :div}
-    {:lparen}
-    {:rparen}
-    {:whitespace}
-    {:unknown, char}
+  Routes incoming jobs to the correct handler based on type, priority, and payload shape.
+  Uses multi-clause functions and guards — no if/cond chains.
   """
+
+  @type job_map :: %{
+    type: atom(),
+    priority: :low | :normal | :high | :critical,
+    payload: any(),
+    retry_count: non_neg_integer()
+  }
 
   @doc """
-  Tokeniza un string completo, devolviendo lista de tokens.
-  Filtra los whitespace del resultado final.
+  Returns the handler module for the given job.
+
+  Routing rules (in order of priority):
+  1. Critical-priority jobs always go to CriticalHandler, regardless of type.
+  2. Jobs that have been retried 3+ times go to DeadLetterHandler.
+  3. :webhook jobs with a URL payload go to WebhookHandler.
+  4. :cron jobs go to CronHandler.
+  5. :pipeline jobs with a list of steps go to PipelineHandler.
+  6. All others go to DefaultHandler.
   """
-  def tokenize(input) when is_binary(input) do
-    input
-    |> String.graphemes()
-    |> Enum.map(&tokenize_char/1)
-    |> Enum.reject(&match?({:whitespace}, &1))
+  @spec route(job_map()) :: module()
+
+  # Rule 1: critical priority — always wins
+  def route(%{priority: :critical}) do
+    TaskQueue.Handlers.CriticalHandler
   end
 
-  # TODO: Implementar tokenize_char/1 con pattern matching
-  # Debe manejar los siguientes casos:
-  # - Dígitos "0".."9" -> {:number, integer}   (Pista: String.to_integer/1)
-  # - "+" -> {:op, :plus}
-  # - "-" -> {:op, :minus}
-  # - "*" -> {:op, :mult}
-  # - "/" -> {:op, :div}
-  # - "(" -> {:lparen}
-  # - ")" -> {:rparen}
-  # - " " o "\t" -> {:whitespace}
-  # - Cualquier otro -> {:unknown, char}
-  defp tokenize_char(char) do
+  # Rule 2: dead letter — too many retries
+  # HINT: use a guard: when retry_count >= 3
+  def route(%{retry_count: retry_count}) when retry_count >= 3 do
+    # TODO: return TaskQueue.Handlers.DeadLetterHandler
+  end
+
+  # Rule 3: webhook jobs with a URL payload
+  # HINT: nested pattern match on payload: %{url: url} where is_binary(url)
+  def route(%{type: :webhook, payload: %{url: url}}) when is_binary(url) do
+    # TODO: return TaskQueue.Handlers.WebhookHandler
+  end
+
+  # Rule 4: cron jobs
+  def route(%{type: :cron}) do
+    TaskQueue.Handlers.CronHandler
+  end
+
+  # Rule 5: pipeline jobs with a list of steps
+  # HINT: pattern match payload: steps when is_list(steps)
+  def route(%{type: :pipeline, payload: steps}) when is_list(steps) do
+    # TODO: return TaskQueue.Handlers.PipelineHandler
+  end
+
+  # Rule 6: default fallback
+  def route(_job) do
+    TaskQueue.Handlers.DefaultHandler
   end
 
   @doc """
-  Agrupa tokens consecutivos de tipo :number en un solo número multi-dígito.
-  Ej: [{:number,1},{:number,2},{:op,:plus}] -> [{:number,12},{:op,:plus}]
+  Validates a job map and returns {:ok, job} or {:error, reason}.
+
+  Validation rules:
+  - :type must be one of :webhook, :cron, :pipeline, :batch, or :adhoc
+  - :priority must be one of :low, :normal, :high, :critical
+  - :payload must not be nil
+  - :retry_count must be a non-negative integer
   """
-  def merge_numbers(tokens) do
-    # TODO: Implementar con Enum.reduce/3
-    # Acumula dígitos consecutivos {:number, n} en un buffer
-    # Cuando aparece un token no-number, vuelca el buffer como {:number, N}
-    # Pista: el acumulador puede ser {lista_resultado, buffer_digitos}
-    # donde buffer_digitos es una lista de dígitos pendientes de unir
+  @spec validate(map()) :: {:ok, job_map()} | {:error, atom()}
+  def validate(%{type: type, priority: priority, payload: payload, retry_count: rc})
+      when type in [:webhook, :cron, :pipeline, :batch, :adhoc]
+      and priority in [:low, :normal, :high, :critical]
+      and payload != nil
+      and is_integer(rc)
+      and rc >= 0 do
+    {:ok, %{type: type, priority: priority, payload: payload, retry_count: rc}}
   end
 
-  @doc """
-  Valida que los paréntesis estén balanceados.
-  Devuelve :ok | {:error, :unclosed} | {:error, :unopened}
-  """
-  def validate_parens(tokens) do
-    # TODO: Usar Enum.reduce_while/3
-    # Lleva un contador: +1 en :lparen, -1 en :rparen
-    # Si el contador baja de 0 -> {:halt, {:error, :unopened}}
-    # Al final: 0 -> :ok, >0 -> {:error, :unclosed}
+  def validate(%{type: type})
+      when type not in [:webhook, :cron, :pipeline, :batch, :adhoc] do
+    {:error, :invalid_type}
   end
+
+  def validate(%{priority: priority})
+      when priority not in [:low, :normal, :high, :critical] do
+    {:error, :invalid_priority}
+  end
+
+  def validate(%{payload: nil}), do: {:error, :nil_payload}
+  def validate(%{retry_count: rc}) when not is_integer(rc) or rc < 0, do: {:error, :invalid_retry_count}
+  def validate(_), do: {:error, :missing_required_fields}
 end
 ```
 
-**Verificación esperada:**
+### Step 2: `lib/task_queue/payload_decoder.ex`
 
 ```elixir
-Lexer.tokenize("3 + 42 * (2 - 1)")
-# [
-#   {:number, 3}, {:op, :plus}, {:number, 4}, {:number, 2},
-#   {:op, :mult}, {:lparen}, {:number, 2}, {:op, :minus}, {:number, 1}, {:rparen}
-# ]
-
-tokens = Lexer.tokenize("3 + 42 * (2 - 1)")
-Lexer.merge_numbers(tokens)
-# [{:number, 3}, {:op, :plus}, {:number, 42}, {:op, :mult},
-#  {:lparen}, {:number, 2}, {:op, :minus}, {:number, 1}, {:rparen}]
-
-Lexer.validate_parens(Lexer.merge_numbers(tokens))   # :ok
-Lexer.validate_parens([{:lparen}, {:number, 1}])     # {:error, :unclosed}
-Lexer.validate_parens([{:rparen}, {:number, 1}])     # {:error, :unopened}
-```
-
----
-
-### Exercise 2: State Machine con Guards
-
-Implementa una máquina de estados para un semáforo de tráfico con transiciones controladas por guards y multi-clause.
-
-```elixir
-# Archivo: lib/semaforo.ex
-
-defmodule Semaforo do
+defmodule TaskQueue.PayloadDecoder do
   @moduledoc """
-  Máquina de estados para un semáforo.
-
-  Estados: :rojo | :verde | :amarillo
-  Eventos: :tick (avance normal) | :emergencia | :reset
-
-  Transiciones normales (tick):
-    :rojo     -> :verde
-    :verde    -> :amarillo
-    :amarillo -> :rojo
-
-  Transiciones especiales:
-    :emergencia desde cualquier estado -> :rojo
-    :reset      desde cualquier estado -> :rojo
+  Decodes raw maps (from JSON, external APIs) into typed job payload structs.
+  Demonstrates nested pattern matching, pin operator, and guard clauses.
   """
 
-  defstruct [:estado, :ciclos, :en_emergencia]
-  # ciclos: cuántas veces ha completado rojo->verde->amarillo->rojo
-  # en_emergencia: boolean
+  defmodule WebhookPayload do
+    defstruct [:url, :method, :headers, :body]
+  end
 
-  def nuevo do
-    %Semaforo{estado: :rojo, ciclos: 0, en_emergencia: false}
+  defmodule CronPayload do
+    defstruct [:schedule, :command, :timezone]
+  end
+
+  defmodule PipelinePayload do
+    defstruct [:steps, :on_failure]
   end
 
   @doc """
-  Aplica un evento al semáforo y devuelve el nuevo estado.
+  Decodes a raw map into the appropriate payload struct.
+  Returns {:ok, struct} or {:error, {field, reason}}.
   """
-  # TODO: Implementar transition/2 con múltiples cláusulas
-  # Casos a cubrir:
-  # 1. Evento :emergencia -> pone en_emergencia: true, estado: :rojo (sin contar ciclo)
-  # 2. Evento :reset      -> vuelve a estado inicial (ciclos no se resetean)
-  # 3. :tick desde :rojo  -> :verde
-  # 4. :tick desde :verde -> :amarillo
-  # 5. :tick desde :amarillo -> :rojo, incrementa ciclos en 1
-  # 6. Cualquier otro evento -> devuelve el semáforo sin cambios
-  def transition(%Semaforo{} = sem, evento) do
+  @spec decode(map()) :: {:ok, struct()} | {:error, {atom(), atom()}}
+
+  # Webhook — must have url (binary) and method (one of the known HTTP verbs)
+  def decode(%{"url" => url, "method" => method} = raw)
+      when is_binary(url)
+      and method in ["GET", "POST", "PUT", "PATCH", "DELETE"] do
+    headers = Map.get(raw, "headers", %{})
+    body = Map.get(raw, "body")
+    {:ok, %WebhookPayload{url: url, method: method, headers: headers, body: body}}
   end
+
+  # Cron — must have schedule (cron string) and command
+  def decode(%{"schedule" => schedule, "command" => command} = raw)
+      when is_binary(schedule)
+      and is_binary(command) do
+    # HINT: build a CronPayload with timezone defaulting to "UTC"
+    timezone = Map.get(raw, "timezone", "UTC")
+    # TODO: return {:ok, %CronPayload{schedule: schedule, command: command, timezone: timezone}}
+  end
+
+  # Pipeline — must have "steps" as a non-empty list
+  def decode(%{"steps" => [_ | _] = steps} = raw) do
+    # HINT: build a PipelinePayload, on_failure defaults to :abort
+    on_failure = Map.get(raw, "on_failure", "abort") |> String.to_existing_atom()
+    # TODO: return {:ok, %PipelinePayload{steps: steps, on_failure: on_failure}}
+  end
+
+  # Empty steps list is invalid
+  def decode(%{"steps" => []}), do: {:error, {:steps, :empty}}
+
+  # Missing required fields
+  def decode(%{"url" => _}), do: {:error, {:method, :missing}}
+  def decode(%{"method" => _}), do: {:error, {:url, :missing}}
+  def decode(%{"schedule" => _}), do: {:error, {:command, :missing}}
+  def decode(_), do: {:error, {:payload, :unrecognized_format}}
 
   @doc """
-  Devuelve el color como string para mostrar.
+  Uses the pin operator to assert that the decoded type matches an expected type.
+  Returns {:ok, payload} if the type matches, {:error, :type_mismatch} otherwise.
   """
-  # TODO: Usar pattern matching con guard para cada estado
-  # :rojo     -> "🔴 STOP"
-  # :verde    -> "🟢 GO"
-  # :amarillo -> "🟡 SLOW"
-  def mostrar(%Semaforo{estado: estado, en_emergencia: true}) do
-    # TODO: Si está en emergencia, prefija con "⚠️  EMERGENCIA — "
-  end
-
-  def mostrar(%Semaforo{estado: estado}) do
-  end
-
-  @doc """
-  Simula N ciclos del semáforo, devolviendo el log de estados.
-  """
-  def simular(semaforo, n_ticks) when is_integer(n_ticks) and n_ticks > 0 do
-    # TODO: Usar Enum.reduce/3 sobre 1..n_ticks
-    # Acumula {semaforo_actual, lista_de_logs}
-    # Cada tick registra: {tick_numero, estado, ciclos}
-    Enum.reduce(1..n_ticks, {semaforo, []}, fn tick, {sem, log} ->
-    end)
-    |> then(fn {sem_final, log} -> {sem_final, Enum.reverse(log)} end)
+  @spec decode_as(map(), atom()) :: {:ok, struct()} | {:error, atom()}
+  def decode_as(raw, expected_type) do
+    case decode(raw) do
+      {:ok, %^expected_type{} = payload} -> {:ok, payload}
+      # HINT: the ^ operator pins expected_type — matches only if the struct module
+      #   equals expected_type exactly
+      {:ok, _wrong_type} -> {:error, :type_mismatch}
+      {:error, _} = err -> err
+    end
   end
 end
 ```
 
-**Verificación esperada:**
+### Step 3: Given tests — must pass without modification
 
 ```elixir
-sem = Semaforo.nuevo()
-Semaforo.mostrar(sem)  # "🔴 STOP"
+# test/task_queue/pattern_matching_test.exs
+defmodule TaskQueue.PatternMatchingTest do
+  use ExUnit.Case, async: true
 
-sem = Semaforo.transition(sem, :tick)
-Semaforo.mostrar(sem)  # "🟢 GO"
+  alias TaskQueue.JobRouter
+  alias TaskQueue.PayloadDecoder
+  alias TaskQueue.PayloadDecoder.{WebhookPayload, CronPayload, PipelinePayload}
 
-sem = Semaforo.transition(sem, :emergencia)
-Semaforo.mostrar(sem)  # "⚠️  EMERGENCIA — 🔴 STOP"
+  describe "JobRouter.route/1" do
+    test "critical priority wins over all other rules" do
+      job = %{type: :webhook, priority: :critical, payload: %{url: "https://x"}, retry_count: 5}
+      assert TaskQueue.Handlers.CriticalHandler = JobRouter.route(job)
+    end
 
-sem = Semaforo.transition(sem, :reset)
-sem.en_emergencia  # false
-sem.estado         # :rojo
+    test "dead letter for retry_count >= 3 (non-critical)" do
+      job = %{type: :batch, priority: :normal, payload: :anything, retry_count: 3}
+      assert TaskQueue.Handlers.DeadLetterHandler = JobRouter.route(job)
+    end
 
-{sem_final, log} = Semaforo.simular(Semaforo.nuevo(), 9)
-# log tiene 9 entradas: 3 ciclos completos
-sem_final.ciclos   # 3
-```
+    test "webhook handler for :webhook type with url" do
+      job = %{type: :webhook, priority: :normal, payload: %{url: "https://example.com"}, retry_count: 0}
+      assert TaskQueue.Handlers.WebhookHandler = JobRouter.route(job)
+    end
 
----
+    test "cron handler for :cron type" do
+      job = %{type: :cron, priority: :normal, payload: %{schedule: "*/5 * * * *"}, retry_count: 0}
+      assert TaskQueue.Handlers.CronHandler = JobRouter.route(job)
+    end
 
-### Exercise 3: Matching en Estructuras Anidadas
+    test "pipeline handler for :pipeline type with list payload" do
+      job = %{type: :pipeline, priority: :normal, payload: [:step_a, :step_b], retry_count: 0}
+      assert TaskQueue.Handlers.PipelineHandler = JobRouter.route(job)
+    end
 
-Implementa un procesador de órdenes de compra que extrae información usando nested pattern matching.
-
-```elixir
-# Archivo: lib/order_processor.ex
-
-defmodule Direccion do
-  defstruct [:calle, :ciudad, :pais, :codigo_postal]
-end
-
-defmodule LineaPedido do
-  defstruct [:producto_id, :nombre, :cantidad, :precio_unitario]
-end
-
-defmodule Cliente do
-  defstruct [:id, :nombre, :tipo, :direccion]
-  # tipo: :vip | :corporativo | :normal
-end
-
-defmodule Pedido do
-  defstruct [:id, :cliente, :lineas, :estado, :metodo_pago]
-  # estado: :pendiente | :confirmado | :enviado | :cancelado
-  # metodo_pago: :tarjeta | :transferencia | :contrarrembolso
-end
-
-defmodule OrderProcessor do
-  @doc """
-  Calcula el total de un pedido aplicando descuentos según tipo de cliente.
-  Descuentos: VIP -> 15%, corporativo -> 10%, normal -> 0%
-  """
-  # TODO: Usar nested pattern matching para extraer cliente.tipo y lineas
-  # Calcular subtotal: sum(cantidad * precio_unitario por linea)
-  # Aplicar descuento según tipo de cliente
-  def calcular_total(%Pedido{
-        cliente: %Cliente{tipo: tipo},
-        lineas: lineas
-      }) do
+    test "default handler for unmatched jobs" do
+      job = %{type: :adhoc, priority: :low, payload: :custom, retry_count: 0}
+      assert TaskQueue.Handlers.DefaultHandler = JobRouter.route(job)
+    end
   end
 
-  @doc """
-  Filtra pedidos por país del cliente y estado.
-  """
-  # TODO: Usar Enum.filter/2 con nested pattern matching en el predicado
-  # Predicado: pedido.cliente.direccion.pais == pais AND pedido.estado == estado
-  def filtrar_por_pais_y_estado(pedidos, pais, estado) do
+  describe "JobRouter.validate/1" do
+    test "valid job passes validation" do
+      job = %{type: :batch, priority: :high, payload: "work", retry_count: 0}
+      assert {:ok, _} = JobRouter.validate(job)
+    end
+
+    test "invalid type returns error" do
+      job = %{type: :unknown, priority: :normal, payload: "x", retry_count: 0}
+      assert {:error, :invalid_type} = JobRouter.validate(job)
+    end
+
+    test "nil payload returns error" do
+      job = %{type: :batch, priority: :normal, payload: nil, retry_count: 0}
+      assert {:error, :nil_payload} = JobRouter.validate(job)
+    end
   end
 
-  @doc """
-  Extrae los IDs de producto de todos los pedidos confirmados de clientes VIP
-  en España, sin duplicados.
-  """
-  # TODO: Combinar Enum.flat_map + pattern matching en cláusula + MapSet para uniq
-  def productos_vip_espana(pedidos) do
-    pedidos
-    |> Enum.filter(fn
-      # TODO: Pattern match aquí — solo pedidos confirmados de VIP en España
-    end)
-    |> Enum.flat_map(fn %Pedido{lineas: lineas} ->
-      # TODO: Extraer producto_id de cada línea
-    end)
-    |> Enum.uniq()
+  describe "PayloadDecoder.decode/1" do
+    test "decodes webhook payload" do
+      raw = %{"url" => "https://api.example.com/hook", "method" => "POST", "body" => %{"event" => "push"}}
+      assert {:ok, %WebhookPayload{url: "https://api.example.com/hook", method: "POST"}} = PayloadDecoder.decode(raw)
+    end
+
+    test "rejects webhook with missing method" do
+      raw = %{"url" => "https://example.com"}
+      assert {:error, {:method, :missing}} = PayloadDecoder.decode(raw)
+    end
+
+    test "decodes cron payload with default timezone" do
+      raw = %{"schedule" => "0 * * * *", "command" => "mix task_queue.run"}
+      assert {:ok, %CronPayload{timezone: "UTC"}} = PayloadDecoder.decode(raw)
+    end
+
+    test "decodes pipeline payload" do
+      raw = %{"steps" => ["compile", "test", "deploy"]}
+      assert {:ok, %PipelinePayload{steps: ["compile", "test", "deploy"]}} = PayloadDecoder.decode(raw)
+    end
+
+    test "rejects empty steps list" do
+      assert {:error, {:steps, :empty}} = PayloadDecoder.decode(%{"steps" => []})
+    end
   end
 
-  @doc """
-  Clasifica un pedido como :rentable, :neutro, o :deficitario.
-  Un pedido es rentable si total > 500, neutro si 100..500, deficitario si < 100.
-  Además, los pedidos de contrarrembolso tienen un cargo fijo de +10.
-  """
-  # TODO: Usar multiple cláusulas con guards
-  # Pista: calcular_total primero, luego ajustar por metodo_pago, luego clasificar
-  def clasificar(%Pedido{metodo_pago: :contrarrembolso} = pedido) do
-  end
+  describe "PayloadDecoder.decode_as/2 — pin operator" do
+    test "matches when decoded type equals expected" do
+      raw = %{"url" => "https://x.com", "method" => "GET"}
+      assert {:ok, %WebhookPayload{}} = PayloadDecoder.decode_as(raw, WebhookPayload)
+    end
 
-  def clasificar(%Pedido{} = pedido) do
-  end
-
-  @doc """
-  Agrupa pedidos por ciudad del cliente.
-  Devuelve %{ciudad => [pedidos]}
-  """
-  # TODO: Usar Enum.group_by/2 con nested pattern matching
-  def agrupar_por_ciudad(pedidos) do
+    test "returns type_mismatch when types differ" do
+      raw = %{"url" => "https://x.com", "method" => "GET"}
+      assert {:error, :type_mismatch} = PayloadDecoder.decode_as(raw, CronPayload)
+    end
   end
 end
 ```
 
-**Verificación esperada:**
-
-```elixir
-dir_es = %Direccion{calle: "Gran Vía 1", ciudad: "Madrid", pais: "España", codigo_postal: "28001"}
-dir_fr = %Direccion{calle: "Rue de la Paix", ciudad: "París", pais: "Francia", codigo_postal: "75001"}
-
-cliente_vip  = %Cliente{id: 1, nombre: "Ana VIP",  tipo: :vip,        direccion: dir_es}
-cliente_corp = %Cliente{id: 2, nombre: "Corp SL",  tipo: :corporativo, direccion: dir_es}
-cliente_norm = %Cliente{id: 3, nombre: "Bob Normal", tipo: :normal,    direccion: dir_fr}
-
-lineas_a = [
-  %LineaPedido{producto_id: "P1", nombre: "Silla", cantidad: 2, precio_unitario: 150.0},
-  %LineaPedido{producto_id: "P2", nombre: "Mesa",  cantidad: 1, precio_unitario: 300.0}
-]
-# Subtotal: 600.0
-
-pedido_vip = %Pedido{
-  id: "O1", cliente: cliente_vip, lineas: lineas_a,
-  estado: :confirmado, metodo_pago: :tarjeta
-}
-
-OrderProcessor.calcular_total(pedido_vip)
-# 600.0 * (1 - 0.15) = 510.0
-
-OrderProcessor.clasificar(pedido_vip)
-# :rentable  (510 > 500)
-
-pedidos = [pedido_vip, ...]
-OrderProcessor.filtrar_por_pais_y_estado(pedidos, "España", :confirmado)
-# Solo pedidos de clientes en España con estado :confirmado
-
-OrderProcessor.productos_vip_espana(pedidos)
-# ["P1", "P2"]  <- únicos, sin duplicar
-```
-
----
-
-## Common Mistakes
-
-### 1. Guard inválido — función con efectos secundarios
-
-```elixir
-# MAL — String.contains? no está permitida en guards
-def f(s) when String.contains?(s, "hola"), do: :saludo
-
-# BIEN — mover la lógica al cuerpo
-def f(s) when is_binary(s) do
-  if String.contains?(s, "hola"), do: :saludo, else: :otro
-end
-```
-
-### 2. Orden incorrecto de cláusulas
-
-```elixir
-# MAL — el catch-all captura antes que el caso específico
-def describir(lista) when is_list(lista), do: "lista de #{length(lista)}"
-def describir([]),                         do: "lista vacía"  # nunca alcanzado
-
-# BIEN — más específico primero
-def describir([]),                          do: "lista vacía"
-def describir(lista) when is_list(lista),   do: "lista de #{length(lista)}"
-```
-
-### 3. Pin operator olvidado
-
-```elixir
-esperado = :ok
-
-# MAL — reasigna esperado a :error (siempre coincide)
-case :error do
-  esperado -> IO.puts("coincide con #{esperado}")  # imprime "coincide con :error"
-end
-
-# BIEN — fija el valor con ^
-case :error do
-  ^esperado -> IO.puts("coincide")
-  otro      -> IO.puts("no coincide, es #{otro}")  # llega aquí
-end
-```
-
-### 4. Nested matching demasiado profundo sin variables intermedias
-
-```elixir
-# MAL — difícil de leer y mantener
-def procesar(%{a: %{b: %{c: %{d: valor}}}}) when valor > 0, do: valor
-
-# BIEN — usar variables intermedias en el cuerpo cuando sea necesario
-def procesar(%{a: seccion_a} = datos) do
-  %{b: %{c: %{d: valor}}} = seccion_a
-  if valor > 0, do: valor, else: {:error, :valor_negativo}
-end
-```
-
----
-
-## Verification
+### Step 4: Run the tests
 
 ```bash
-mix compile
-mix test
-
-# En iex:
-iex -S mix
-```
-
-```elixir
-# Smoke tests en iex:
-
-# Exercise 1
-Lexer.tokenize("1 + 2")
-tokens = Lexer.tokenize("(3 + 4) * 2")
-Lexer.merge_numbers(tokens)
-Lexer.validate_parens(tokens)
-
-# Exercise 2
-sem = Semaforo.nuevo()
-sem = Semaforo.transition(sem, :tick)
-sem = Semaforo.transition(sem, :emergencia)
-{final, log} = Semaforo.simular(Semaforo.nuevo(), 6)
-final.ciclos  # 2
-
-# Exercise 3
-# (ver verificación del ejercicio arriba)
+mix test test/task_queue/pattern_matching_test.exs --trace
 ```
 
 ---
 
-## Summary
+## Trade-off analysis
 
-El pattern matching avanzado en Elixir es mucho más que simple desestructuración: los guards permiten expresar condiciones complejas de forma declarativa, el operador pin `^` habilita comparaciones contra valores ya conocidos, y el matching anidado en mapas, structs y listas permite extraer datos profundamente estructurados en una sola expresión. El orden correcto de las cláusulas multi-función es crítico: siempre de lo más específico a lo más general, dejando los catch-all al final.
+| Aspect | Multi-clause + guards | `cond` chain | `case` with nested `if` |
+|--------|----------------------|-------------|------------------------|
+| Exhaustiveness check | Compiler warns on unreachable clauses | No check | No check |
+| Clause ordering | Explicit — first match wins | Explicit | Explicit |
+| Readability | High — each clause is self-contained | Medium | Low |
+| Performance | Equal — all compile to pattern match bytecode | Equal | Equal |
+| Error on no match | `FunctionClauseError` | Falls through `cond` to nil | Depends on else clause |
 
-## What's Next
+Reflection question: the `validate/1` function in `JobRouter` has multiple clauses that
+each check one field. What happens when a job is missing both `type` and `priority`?
+Which clause matches? How would you reorder or restructure to give a more precise error?
 
-**10. Comprehensions Avanzadas** — `for` con múltiples generators, filtros, `:into`, `:uniq`, y map comprehensions.
+---
+
+## Common production mistakes
+
+**1. Wrong clause order — less specific before more specific**
+```elixir
+# WRONG — the catch-all fires first, specific clauses are unreachable
+def route(_job), do: DefaultHandler
+def route(%{priority: :critical}), do: CriticalHandler  # never reached
+
+# CORRECT — most specific first
+def route(%{priority: :critical}), do: CriticalHandler
+def route(_job), do: DefaultHandler
+```
+
+**2. Forgetting the pin operator in receive loops**
+```elixir
+# WRONG — rebinds `ref` to whatever reference arrives
+receive do
+  {:reply, ref, result} -> result
+end
+
+# CORRECT — only matches the reply for the specific ref you sent
+ref = make_ref()
+send(pid, {:call, ref, :get})
+receive do
+  {:reply, ^ref, result} -> result
+end
+```
+
+**3. Guards with functions that can raise**
+Guard expressions must be pure and cannot raise. `is_integer/1`, `is_binary/1`, and
+arithmetic are safe. Calling arbitrary functions in a guard is a compile error.
+
+**4. Pattern matching on string content with `=~`**
+`=~` is not valid in a guard. Use `String.starts_with?/2` inside the function body, or
+use binary pattern matching for prefix checks:
+```elixir
+def route(%{payload: %{url: "https://" <> _rest}}), do: SecureHandler
+```
+
+---
 
 ## Resources
 
-- [Elixir Docs — Pattern Matching](https://elixir-lang.org/getting-started/pattern-matching.html)
-- [Elixir Docs — Guards](https://hexdocs.pm/elixir/guards.html)
-- [Kernel — guard functions](https://hexdocs.pm/elixir/Kernel.html)
-- [Elixir School — Pattern Matching](https://elixirschool.com/en/lessons/basics/pattern_matching)
+- [Pattern Matching — Elixir Getting Started](https://elixir-lang.org/getting-started/pattern-matching.html)
+- [Guards — HexDocs](https://hexdocs.pm/elixir/patterns-and-guards.html)
+- [Kernel — Guard expressions](https://hexdocs.pm/elixir/Kernel.html#module-guards)
+- [Elixir in Action — Saša Jurić](https://www.manning.com/books/elixir-in-action-third-edition) — Chapter 4: Data abstractions

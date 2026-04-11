@@ -1,501 +1,475 @@
-# 13. Anonymous Functions and Closures
+# Anonymous Functions and Closures: Configurable Processing Rules
 
-**Difficulty**: Basico
-
----
-
-## Prerequisites
-
-- Funciones nombradas básicas (ejercicio 08)
-- Pipe operator (ejercicio 12)
-- Módulo Enum (ejercicio 11)
+**Project**: `payments_cli` — built incrementally across the basic level
 
 ---
 
-## Learning Objectives
+## Project context
 
-- Definir funciones anónimas con `fn ... end`
-- Invocar funciones anónimas con el punto obligatorio: `func.(args)`
-- Entender qué es un closure y cómo captura variables del scope externo
-- Definir múltiples cláusulas en una función anónima
-- Escribir funciones anónimas con capture syntax `&`
-- Capturar funciones nombradas existentes con `&Módulo.función/aridad`
-- Pasar funciones como argumentos (higher-order functions)
+You're building `payments_cli`. The system needs configurable processing rules —
+fee calculators, formatters, and validators that can be swapped at runtime without
+changing module APIs. Anonymous functions and closures are the mechanism.
+
+Project structure at this point:
+
+```
+payments_cli/
+├── lib/
+│   └── payments_cli/
+│       ├── cli.ex
+│       ├── transaction.ex
+│       ├── ledger.ex
+│       ├── formatter.ex
+│       ├── pipeline.ex
+│       ├── processor.ex
+│       ├── router.ex
+│       ├── analytics.ex
+│       ├── report.ex
+│       └── rules.ex        # ← you implement this
+├── test/
+│   └── payments_cli/
+│       └── rules_test.exs  # given tests — must pass without modification
+└── mix.exs
+```
 
 ---
 
-## Concepts
+## Why closures enable configurable systems
 
-### Función anónima: `fn ... end`
+A named function is defined at compile time and cannot capture runtime state.
+An anonymous function (closure) captures variables from the scope where it was
+created. This enables runtime configuration without changing the calling API.
 
-Una función anónima no tiene nombre. Se asigna a una variable para poder usarla.
-
-```elixir
-# Definición
-double = fn x -> x * 2 end
-
-# Invocación — NECESITA el punto
-double.(5)    # => 10
-double.(100)  # => 200
-```
-
-La sintaxis completa es:
-```
-fn <argumentos> -> <cuerpo> end
-```
-
-### El punto obligatorio `.()`
-
-Las funciones anónimas (guardadas en variables) se invocan con un punto antes de
-los paréntesis. Las funciones nombradas (definidas con `def`) NO llevan punto.
+Consider a fee calculator. Different payment processors have different fee structures.
+Instead of a `calculate_fee(amount, processor)` function with a long `case`, you
+create a closure per processor at startup:
 
 ```elixir
-# Función anónima — CON punto
-double = fn x -> x * 2 end
-double.(5)         # correcto
-# double(5)        # ERROR: UndefinedFunctionError
+stripe_fee    = make_fee_calculator(250, 30)  # 2.5% + $0.30
+paypal_fee    = make_fee_calculator(290, 0)   # 2.9% + $0
+enterprise_fee = make_fee_calculator(100, 0)  # 1.0% + $0
 
-# Función nombrada — SIN punto
-String.upcase("hello")   # correcto
-# String.upcase.("hello") # ERROR: FunctionClauseError
+# Later, the processor just calls the function — it does not know the rates
+fee = stripe_fee.(transaction.amount_cents)
 ```
 
-El punto es la forma en que Elixir distingue "llamar una variable que contiene
-una función" de "llamar una función con ese nombre".
+This is the **Strategy pattern** from OO design, expressed as higher-order functions.
+The closure is the strategy. The caller does not need to know which strategy it has.
 
-### Funciones de múltiples argumentos
+The production consequence: configuration loaded from environment variables or a
+database at startup can be captured in closures and used by the processing pipeline
+without threading configuration through every function signature.
 
-```elixir
-add = fn a, b -> a + b end
-add.(3, 4)   # => 7
+---
 
-greet = fn name, greeting -> "#{greeting}, #{name}!" end
-greet.("Alice", "Hello")  # => "Hello, Alice!"
-```
+## The business problem
 
-### Closures: capturar el scope externo
+The `Rules` module provides factory functions that return configured closures:
 
-Una función anónima **captura** las variables del scope donde fue creada.
-Esto se llama closure.
+1. A fee calculator factory (configured with rate and fixed fee)
+2. A transaction filter factory (configured with criteria)
+3. A formatter factory (configured with locale/currency options)
+4. A validator factory (configured with validation rules)
 
-```elixir
-factor = 3
-triple = fn x -> x * factor end
+---
 
-triple.(7)   # => 21
-triple.(10)  # => 30
-```
+## Implementation
 
-Aunque `factor` es una variable del scope exterior, `triple` la "recuerda"
-incluso si el scope original ya no existe.
+### `lib/payments_cli/rules.ex`
 
 ```elixir
-# Fábrica de multiplicadores: retorna una función nueva por cada factor
-multiplier = fn factor -> fn x -> x * factor end end
+defmodule PaymentsCli.Rules do
+  @moduledoc """
+  Factory functions that produce configured closures for transaction processing.
 
-double = multiplier.(2)
-triple = multiplier.(3)
+  Each factory captures its configuration at creation time. The returned function
+  can be passed to Enum functions, stored in maps, or called directly — it carries
+  its configuration without requiring it to be threaded through every call site.
+  """
 
-double.(5)   # => 10
-triple.(5)   # => 15
-```
+  @doc """
+  Returns a fee calculator function configured with basis points and fixed fee.
 
-### Inmutabilidad y closures
+  The returned function takes amount_cents (integer) and returns fee_cents (integer).
+  Fee = floor(amount * rate) + fixed_fee
 
-En Elixir, las variables son inmutables por reasignación — cuando haces
-`x = x + 1`, estás creando una nueva variable `x`, no mutando la original.
-El closure captura el **valor** en el momento de creación.
+  ## Examples
 
-```elixir
-x = 10
-add_x = fn n -> n + x end
+      iex> calc = PaymentsCli.Rules.make_fee_calculator(250, 30)
+      iex> calc.(1000)
+      55
 
-x = 999  # reasignas x en el scope exterior — no afecta al closure
+      iex> calc = PaymentsCli.Rules.make_fee_calculator(0, 0)
+      iex> calc.(9999)
+      0
 
-add_x.(5)   # => 15  (capturó x = 10, no x = 999)
-```
+  """
+  @spec make_fee_calculator(non_neg_integer(), non_neg_integer()) ::
+          (integer() -> integer())
+  def make_fee_calculator(basis_points, fixed_fee_cents)
+      when is_integer(basis_points) and basis_points >= 0 and
+           is_integer(fixed_fee_cents) and fixed_fee_cents >= 0 do
+    # TODO: return an anonymous function that captures basis_points and fixed_fee_cents
+    #
+    # fn amount_cents ->
+    #   percentage_fee = div(amount_cents * basis_points, 10_000)
+    #   percentage_fee + fixed_fee_cents
+    # end
+    #
+    # The closure captures basis_points and fixed_fee_cents from this scope.
+    # Even after make_fee_calculator/2 returns, the returned function still has
+    # access to those values.
+  end
 
-### Múltiples cláusulas en funciones anónimas
+  @doc """
+  Returns a filter predicate function configured with filter criteria.
 
-```elixir
-describe = fn
-  :ok    -> "todo salió bien"
-  :error -> "algo falló"
-  other  -> "valor desconocido: #{inspect(other)}"
-end
+  criteria is a map with optional keys:
+    - min_amount: integer (inclusive)
+    - max_amount: integer (inclusive)
+    - statuses: list of atoms (if present, only these statuses pass)
+    - currencies: list of strings (if present, only these currencies pass)
 
-describe.(:ok)     # => "todo salió bien"
-describe.(:error)  # => "algo falló"
-describe.(42)      # => "valor desconocido: 42"
-```
+  The returned function takes a transaction map and returns a boolean.
 
-### Capture syntax `&`
+  ## Examples
 
-`&` es una forma compacta de escribir funciones anónimas simples.
+      iex> filter = PaymentsCli.Rules.make_filter(%{min_amount: 1000, statuses: [:approved]})
+      iex> filter.(%{amount_cents: 500,  status: :approved})
+      false
+      iex> filter.(%{amount_cents: 1500, status: :approved})
+      true
+      iex> filter.(%{amount_cents: 1500, status: :declined})
+      false
 
-```elixir
-# &1 es el primer argumento, &2 el segundo, etc.
-double = &(&1 * 2)
-add    = &(&1 + &2)
+  """
+  @spec make_filter(map()) :: (map() -> boolean())
+  def make_filter(criteria) when is_map(criteria) do
+    # TODO: return a closure that captures `criteria` and applies all active filters
+    #
+    # fn tx ->
+    #   passes_min?(tx, criteria) and
+    #   passes_max?(tx, criteria) and
+    #   passes_statuses?(tx, criteria) and
+    #   passes_currencies?(tx, criteria)
+    # end
+    #
+    # Implement private helpers:
+    #   defp passes_min?(tx, %{min_amount: min}), do: tx.amount_cents >= min
+    #   defp passes_min?(_tx, _criteria), do: true  # no min_amount key = no constraint
+    # Similar pattern for the others.
+  end
 
-double.(5)    # => 10
-add.(3, 4)    # => 7
+  @doc """
+  Returns a formatting function configured with display options.
 
-# Equivalentes completos:
-double_long = fn x    -> x * 2   end
-add_long    = fn x, y -> x + y   end
-```
+  opts is a keyword list with:
+    - currency_symbol: string (default: use currency code)
+    - show_status: boolean (default: false)
+    - max_merchant_length: integer (default: 30)
 
-### Function capture: `&Módulo.función/aridad`
+  The returned function takes a transaction map and returns a formatted string.
 
-Captura una función nombrada existente como si fuera una función anónima.
+  ## Examples
 
-```elixir
-upcase_fn = &String.upcase/1
-upcase_fn.("hello")   # => "HELLO"
+      iex> fmt = PaymentsCli.Rules.make_formatter(currency_symbol: "$", show_status: true)
+      iex> fmt.(%{id: "T1", amount_cents: 1234, currency: "USD", status: :approved, merchant: "Shop"})
+      "T1 | Shop | $12.34 | approved"
 
-# Muy útil en Enum
-Enum.map(["hello", "world"], &String.upcase/1)
-# => ["HELLO", "WORLD"]
+  """
+  @spec make_formatter(keyword()) :: (map() -> String.t())
+  def make_formatter(opts \\ []) when is_list(opts) do
+    # TODO: capture opts (or specific values from opts) in the closure
+    #
+    # symbol     = Keyword.get(opts, :currency_symbol, nil)
+    # show_status = Keyword.get(opts, :show_status, false)
+    # max_len    = Keyword.get(opts, :max_merchant_length, 30)
+    #
+    # fn tx ->
+    #   amount_str = format_amount(tx.amount_cents, tx.currency, symbol)
+    #   merchant = String.slice(tx.merchant || "", 0, max_len)
+    #   base = "#{tx.id} | #{merchant} | #{amount_str}"
+    #   if show_status, do: base <> " | #{tx.status}", else: base
+    # end
+  end
 
-# Capturar función local
-defmodule MyApp do
-  def double(x), do: x * 2
+  @doc """
+  Returns a composed validator function from a list of individual validator functions.
 
-  def run do
-    Enum.map([1, 2, 3], &double/1)
-    # => [2, 4, 6]
+  Each validator in the list takes a transaction and returns :ok or {:error, reason}.
+  The composed validator runs all validators and returns :ok only if all pass,
+  or {:error, [reasons]} with all failure reasons.
+
+  ## Examples
+
+      iex> v1 = fn tx -> if tx.amount_cents > 0, do: :ok, else: {:error, "bad amount"} end
+      iex> v2 = fn tx -> if is_binary(tx.currency), do: :ok, else: {:error, "bad currency"} end
+      iex> combined = PaymentsCli.Rules.make_validator([v1, v2])
+      iex> combined.(%{amount_cents: 100, currency: "USD"})
+      :ok
+      iex> combined.(%{amount_cents: -1, currency: "USD"})
+      {:error, ["bad amount"]}
+
+  """
+  @spec make_validator([(map() -> :ok | {:error, String.t()})]) ::
+          (map() -> :ok | {:error, [String.t()]})
+  def make_validator(validators) when is_list(validators) do
+    # TODO: return a closure that captures `validators`
+    #
+    # fn tx ->
+    #   errors =
+    #     Enum.reduce(validators, [], fn validator, acc ->
+    #       case validator.(tx) do
+    #         :ok             -> acc
+    #         {:error, reason} -> [reason | acc]
+    #       end
+    #     end)
+    #
+    #   case errors do
+    #     []     -> :ok
+    #     reasons -> {:error, Enum.reverse(reasons)}
+    #   end
+    # end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Private helpers
+  # ---------------------------------------------------------------------------
+
+  defp passes_min?(tx, %{min_amount: min}), do: tx.amount_cents >= min
+  defp passes_min?(_tx, _criteria), do: true
+
+  defp passes_max?(tx, %{max_amount: max}), do: tx.amount_cents <= max
+  defp passes_max?(_tx, _criteria), do: true
+
+  defp passes_statuses?(tx, %{statuses: statuses}), do: tx.status in statuses
+  defp passes_statuses?(_tx, _criteria), do: true
+
+  defp passes_currencies?(tx, %{currencies: currencies}), do: tx.currency in currencies
+  defp passes_currencies?(_tx, _criteria), do: true
+
+  defp format_amount(cents, currency, nil) do
+    dollars = div(cents, 100)
+    minor = rem(cents, 100)
+    "#{currency} #{dollars}.#{String.pad_leading(Integer.to_string(minor), 2, "0")}"
+  end
+
+  defp format_amount(cents, _currency, symbol) do
+    dollars = div(cents, 100)
+    minor = rem(cents, 100)
+    "#{symbol}#{dollars}.#{String.pad_leading(Integer.to_string(minor), 2, "0")}"
   end
 end
 ```
 
----
-
-## Exercises
-
-### Ejercicio 1: Función anónima básica
+### Given tests — must pass without modification
 
 ```elixir
-# Definir y llamar una función anónima
-double = fn x -> x * 2 end
+# test/payments_cli/rules_test.exs
+defmodule PaymentsCli.RulesTest do
+  use ExUnit.Case, async: true
 
-IO.inspect(double.(5))
-IO.inspect(double.(0))
-IO.inspect(double.(-3))
-```
+  alias PaymentsCli.Rules
 
-**Expected output:**
-```
-10
-0
--6
-```
+  describe "make_fee_calculator/2" do
+    test "returns a function" do
+      calc = Rules.make_fee_calculator(250, 30)
+      assert is_function(calc, 1)
+    end
 
----
+    test "calculates fee with percentage and fixed component" do
+      # 2.5% of 1000 = 25 cents + 30 cents fixed = 55 cents
+      calc = Rules.make_fee_calculator(250, 30)
+      assert calc.(1000) == 55
+    end
 
-### Ejercicio 2: Función anónima con múltiples argumentos
+    test "zero rate and zero fixed" do
+      calc = Rules.make_fee_calculator(0, 0)
+      assert calc.(9999) == 0
+    end
 
-```elixir
-add      = fn a, b -> a + b end
-multiply = fn a, b -> a * b end
-greet    = fn name, greeting -> "#{greeting}, #{name}!" end
+    test "different calculators are independent" do
+      stripe = Rules.make_fee_calculator(250, 30)
+      paypal = Rules.make_fee_calculator(290, 0)
+      # Same amount, different fees
+      assert stripe.(1000) != paypal.(1000)
+    end
 
-IO.inspect(add.(3, 4))
-IO.inspect(multiply.(6, 7))
-IO.inspect(greet.("Alice", "Hello"))
-```
+    test "each calculator closure captures its own configuration" do
+      calcs = Enum.map([100, 200, 300], fn bp -> Rules.make_fee_calculator(bp, 0) end)
+      # Each calc should use its own basis points
+      fees = Enum.map(calcs, fn calc -> calc.(10_000) end)
+      assert fees == [100, 200, 300]
+    end
+  end
 
-**Expected output:**
-```
-7
-42
-"Hello, Alice!"
-```
+  describe "make_filter/1" do
+    test "returns a function" do
+      filter = Rules.make_filter(%{})
+      assert is_function(filter, 1)
+    end
 
----
+    test "min_amount filter" do
+      filter = Rules.make_filter(%{min_amount: 1000})
+      assert filter.(%{amount_cents: 999,  status: :approved, currency: "USD"}) == false
+      assert filter.(%{amount_cents: 1000, status: :approved, currency: "USD"}) == true
+    end
 
-### Ejercicio 3: Closure — captura del scope externo
+    test "status filter" do
+      filter = Rules.make_filter(%{statuses: [:approved]})
+      assert filter.(%{amount_cents: 100, status: :declined, currency: "USD"}) == false
+      assert filter.(%{amount_cents: 100, status: :approved, currency: "USD"}) == true
+    end
 
-```elixir
-# El closure recuerda el valor de factor del momento en que fue creado
-multiplier = fn factor ->
-  fn x -> x * factor end
+    test "combined criteria" do
+      filter = Rules.make_filter(%{min_amount: 500, statuses: [:approved]})
+      assert filter.(%{amount_cents: 1000, status: :approved, currency: "USD"}) == true
+      assert filter.(%{amount_cents: 100,  status: :approved, currency: "USD"}) == false
+      assert filter.(%{amount_cents: 1000, status: :declined, currency: "USD"}) == false
+    end
+
+    test "empty criteria passes everything" do
+      filter = Rules.make_filter(%{})
+      assert filter.(%{amount_cents: 1, status: :declined, currency: "XYZ"}) == true
+    end
+  end
+
+  describe "make_formatter/1" do
+    @tx %{id: "T1", amount_cents: 1234, currency: "USD", status: :approved, merchant: "Coffee Shop"}
+
+    test "returns a function" do
+      fmt = Rules.make_formatter()
+      assert is_function(fmt, 1)
+    end
+
+    test "formats without symbol by default" do
+      fmt = Rules.make_formatter()
+      result = fmt.(@tx)
+      assert String.contains?(result, "T1")
+      assert String.contains?(result, "USD")
+    end
+
+    test "formats with currency symbol" do
+      fmt = Rules.make_formatter(currency_symbol: "$")
+      result = fmt.(@tx)
+      assert String.contains?(result, "$12.34")
+    end
+
+    test "includes status when show_status is true" do
+      fmt = Rules.make_formatter(show_status: true)
+      result = fmt.(@tx)
+      assert String.contains?(result, "approved")
+    end
+
+    test "omits status by default" do
+      fmt = Rules.make_formatter()
+      result = fmt.(@tx)
+      refute String.contains?(result, "approved")
+    end
+  end
+
+  describe "make_validator/1" do
+    @amount_v fn tx -> if tx.amount_cents > 0, do: :ok, else: {:error, "bad amount"} end
+    @currency_v fn tx -> if is_binary(tx.currency), do: :ok, else: {:error, "bad currency"} end
+
+    test "returns a function" do
+      v = Rules.make_validator([@amount_v])
+      assert is_function(v, 1)
+    end
+
+    test "returns :ok when all validators pass" do
+      v = Rules.make_validator([@amount_v, @currency_v])
+      assert v.(%{amount_cents: 100, currency: "USD"}) == :ok
+    end
+
+    test "collects all error reasons" do
+      v = Rules.make_validator([@amount_v, @currency_v])
+      {:error, reasons} = v.(%{amount_cents: -1, currency: 123})
+      assert length(reasons) == 2
+    end
+
+    test "empty validator list always passes" do
+      v = Rules.make_validator([])
+      assert v.(%{amount_cents: -999, currency: nil}) == :ok
+    end
+  end
 end
-
-double = multiplier.(2)
-triple = multiplier.(3)
-times_ten = multiplier.(10)
-
-IO.inspect(double.(5))
-IO.inspect(triple.(5))
-IO.inspect(times_ten.(5))
 ```
 
-**Expected output:**
-```
-10
-15
-50
-```
-
----
-
-### Ejercicio 4: Múltiples cláusulas en función anónima
-
-```elixir
-# La función anónima usa pattern matching en sus cláusulas
-describe = fn
-  :ok    -> "operación exitosa"
-  :error -> "operación fallida"
-  n when is_integer(n) and n > 0 -> "número positivo: #{n}"
-  _other -> "valor no reconocido"
-end
-
-IO.inspect(describe.(:ok))
-IO.inspect(describe.(:error))
-IO.inspect(describe.(42))
-IO.inspect(describe.("algo"))
-```
-
-**Expected output:**
-```
-"operación exitosa"
-"operación fallida"
-"número positivo: 42"
-"valor no reconocido"
-```
-
----
-
-### Ejercicio 5: Capture syntax `&` como shorthand
-
-```elixir
-# Forma larga
-square_long = fn x -> x * x end
-
-# Forma corta con &
-square_short = &(&1 * &1)
-
-# Ambas son idénticas
-IO.inspect(square_long.(4))
-IO.inspect(square_short.(4))
-
-# Usando & en Enum.map
-results = Enum.map([1, 2, 3, 4, 5], &(&1 * &1))
-IO.inspect(results)
-```
-
-**Expected output:**
-```
-16
-16
-[1, 4, 9, 16, 25]
-```
-
----
-
-### Ejercicio 6: Function capture `&Módulo.función/aridad`
-
-```elixir
-# Capturar función de un módulo
-upcase = &String.upcase/1
-length = &String.length/1
-
-IO.inspect(upcase.("hello"))
-IO.inspect(length.("hello"))
-
-# Usar function capture en Enum
-uppercased = Enum.map(["hello", "world", "elixir"], &String.upcase/1)
-IO.inspect(uppercased)
-
-# IO.puts también es una función capturable
-Enum.each([1, 2, 3], &IO.puts/1)
-```
-
-**Expected output:**
-```
-"HELLO"
-5
-["HELLO", "WORLD", "ELIXIR"]
-1
-2
-3
-```
-
----
-
-## Common Mistakes
-
-### Error 1: Llamar función anónima sin el punto
-
-```elixir
-# WRONG — falta el punto
-double = fn x -> x * 2 end
-double(5)
-```
-
-```
-** (UndefinedFunctionError) function double/1 is undefined or not exported
-```
-
-**Why**: Sin el punto, Elixir busca una función **nombrada** llamada `double/1`
-en el módulo actual. El punto es la sintaxis para invocar una función guardada
-en una variable.
-
-**Fix**:
-```elixir
-double = fn x -> x * 2 end
-double.(5)   # punto obligatorio
-```
-
----
-
-### Error 2: Poner punto en funciones nombradas
-
-```elixir
-# WRONG — las funciones nombradas NO usan punto
-String.upcase.("hello")
-```
-
-```
-** (UndefinedFunctionError) function String.upcase/0 is undefined or not exported
-```
-
-**Why**: `String.upcase.("hello")` se interpreta como llamar `String.upcase/0`
-(sin args) y luego aplicar el resultado como función. Las funciones nombradas
-no usan punto en la invocación.
-
-**Fix**:
-```elixir
-String.upcase("hello")   # sin punto, argumentos directamente
-```
-
----
-
-### Error 3: Pensar que el closure captura una referencia mutable
-
-```elixir
-# ¿Qué imprime esto?
-x = 10
-add_x = fn n -> n + x end
-
-x = 99  # reasignación en el scope exterior
-
-IO.inspect(add_x.(5))
-```
-
-```
-15   # no 104
-```
-
-**Why**: El closure capturó `x = 10` en el momento de creación. Cuando reasignas
-`x = 99`, estás creando una nueva ligadura en el scope — el closure ya tiene
-su propia copia del valor original. En Elixir esto nunca es sorprendente porque
-los valores son inmutables.
-
-**Fix**: No hay nada que corregir — es el comportamiento correcto. Si necesitas
-que el closure use un valor actualizado, debes recrear el closure:
-```elixir
-x = 10
-add_x = fn n -> n + x end
-
-x = 99
-add_x_v2 = fn n -> n + x end   # nuevo closure con x = 99
-
-IO.inspect(add_x.(5))     # 15  — closure original
-IO.inspect(add_x_v2.(5))  # 104 — nuevo closure
-```
-
----
-
-### Error 4: `&` sin los paréntesis externos
-
-```elixir
-# WRONG — & sin envolver en paréntesis
-double = & &1 * 2
-```
-
-```
-** (SyntaxError) unexpected token: &
-```
-
-**Why**: La syntax correcta envuelve la expresión en paréntesis: `&(&1 * 2)`.
-El `&` externo indica "esto es una función anónima", y la expresión entre
-paréntesis es su cuerpo con `&1` como argumento.
-
-**Fix**:
-```elixir
-double = &(&1 * 2)      # correcto
-double = fn x -> x * 2 end  # equivalente, igualmente correcto
-```
-
----
-
-## Verification
+### Run the tests
 
 ```bash
-iex
+mix test test/payments_cli/rules_test.exs --trace
 ```
 
+---
+
+## Trade-off analysis
+
+| Aspect | Closures as strategy (your impl) | Module callbacks (behaviour) | Config map + case |
+|--------|----------------------------------|------------------------------|-------------------|
+| Runtime configuration | Yes — captured at creation | No — fixed at compile time | Yes — passed per call |
+| Type safety | Limited — function type only | Full — @callback specs | None |
+| Testability | Test the closure directly | Test the callback module | Test the case branch |
+| Discovery | Implicit — who has the function? | Explicit — `@impl` | Explicit — case clauses |
+| Use case | Configurable runtime rules | Plugin systems, adapters | Simple branching |
+
+Reflection question: `make_fee_calculator/2` returns a function with type
+`(integer() -> integer())`. How would you make multiple instances of this function
+in a map keyed by processor name, and then look up and call the right one for
+each transaction? Think about `Map.fetch/2` and calling the returned function.
+
+---
+
+## Common production mistakes
+
+**1. Calling anonymous functions without the dot**
 ```elixir
-# Función anónima básica
-double = fn x -> x * 2 end
-double.(7)
-# => 14
-
-# Closure
-multiplier = fn factor -> fn x -> x * factor end end
-triple = multiplier.(3)
-triple.(7)
-# => 21
-
-# Múltiples cláusulas
-describe = fn
-  :ok    -> "success"
-  :error -> "failure"
-end
-describe.(:ok)
-# => "success"
-
-# Capture syntax
-Enum.map([1, 2, 3], &(&1 * &1))
-# => [1, 4, 9]
-
-# Function capture
-Enum.map(["hello", "world"], &String.upcase/1)
-# => ["HELLO", "WORLD"]
-
-# Verificar que el punto es obligatorio
-f = fn x -> x + 1 end
-# f(1)   # esto lanzaría UndefinedFunctionError
-f.(1)    # => 2
+calc = Rules.make_fee_calculator(250, 30)
+calc(1000)    # WRONG — UndefinedFunctionError: function calc/1 is undefined
+calc.(1000)   # CORRECT — dot is required for functions stored in variables
 ```
 
----
+**2. Closures capture the value, not the variable**
+```elixir
+rate = 250
+calc = fn amount -> div(amount * rate, 10_000) end
+rate = 500  # This does NOT affect calc — it captured rate = 250
+calc.(1000)  # still 25, not 50
+```
+The closure captured the value `250` at creation. Re-binding `rate` creates a new
+variable in the enclosing scope; the closure holds its own reference.
 
-## Summary
+**3. Generating closures in a loop with a shared mutable reference**
+In Elixir this is not a problem (variables are immutable). But developers from
+JavaScript backgrounds expect the classic "closure in a loop" bug where all closures
+share the last value of the loop variable. In Elixir, each iteration's binding is
+independent.
 
-- Funciones anónimas se definen con `fn args -> body end` y se asignan a variables.
-- La invocación requiere el punto: `func.(args)`. Sin punto = error.
-- Funciones nombradas (`def`) **nunca** usan punto en la invocación.
-- Un **closure** captura variables del scope externo en el momento de creación.
-- La inmutabilidad de Elixir garantiza que los closures sean predecibles.
-- `&(&1 * 2)` es shorthand para `fn x -> x * 2 end`.
-- `&String.upcase/1` captura una función nombrada existente.
-- Las funciones anónimas pueden pasarse como argumentos (higher-order functions).
+**4. `&` syntax cannot capture multi-clause functions**
+```elixir
+# WRONG — & cannot express multiple clauses
+filter = &(if &1.status == :approved and &1.amount_cents > 0, do: true, else: false)
+# This works but is hard to read. Prefer fn ... end for anything non-trivial.
+```
+Use `fn ... end` for functions with logic. Reserve `&` for simple expressions
+and function captures (`&String.upcase/1`).
 
----
-
-## What's Next
-
-- **Ejercicio 14**: Módulos y visibilidad — organizar código con `def` y `defp`
-- **Ejercicio 15**: Structs — data containers tipados
-- Pattern matching avanzado con funciones anónimas de múltiples cláusulas
+**5. Forgetting that `is_function/2` checks arity**
+```elixir
+calc = Rules.make_fee_calculator(250, 30)
+is_function(calc)    # true
+is_function(calc, 1) # true — arity 1
+is_function(calc, 2) # false — wrong arity
+```
+Use `is_function(f, expected_arity)` in guards and assertions to verify the
+contract, not just that something is a function.
 
 ---
 
 ## Resources
 
 - [Anonymous functions — Elixir Getting Started](https://elixir-lang.org/getting-started/basic-types.html#anonymous-functions)
-- [Capture operator — Elixir docs](https://hexdocs.pm/elixir/Kernel.SpecialForms.html#&/1)
+- [Capture operator &/1 — Kernel.SpecialForms](https://hexdocs.pm/elixir/Kernel.SpecialForms.html#&/1)
 - [Elixir School — Functions](https://elixirschool.com/en/lessons/basics/functions)
+- [Function — HexDocs](https://hexdocs.pm/elixir/Function.html) — `is_function/2`, `capture/3`

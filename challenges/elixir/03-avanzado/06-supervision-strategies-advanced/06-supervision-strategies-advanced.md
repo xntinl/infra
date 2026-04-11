@@ -1,238 +1,173 @@
-# 06 — Supervision Strategies Advanced
+# Supervision Strategies: Designing Failure Domains
 
-**Difficulty**: Avanzado  
-**Estimated time**: 90–120 min  
-**Topics**: OTP, Supervisors, Fault Tolerance, Production Patterns
+**Project**: `api_gateway` — built incrementally across the advanced level
 
 ---
 
-## Context
+## Project context
 
-Un supervisor en OTP no es un simple "re-lanzador de procesos". Es el mecanismo que define cómo falla tu sistema: si falla silenciosamente, si falla rápido, si propaga el fallo o lo contiene. La elección de estrategia determina el contrato de disponibilidad de tu aplicación.
+You're building `api_gateway`. The application now has several components running
+together: the rate limiter, circuit breakers, route table, audit writer, and priority
+dispatcher. They were all placed in a flat list under one supervisor during prototyping.
 
-Entender la diferencia entre `:one_for_one`, `:one_for_all` y `:rest_for_one` no es trivia: es la diferencia entre un sistema que se recupera solo y uno que derrumba producción en cascada.
+A `MetricsReporter` that calls an external Datadog agent has started crashing every
+30 seconds when the agent is unreachable. Because it shares a supervisor with
+`RateLimiter.Server`, the supervisor's `max_restarts` threshold is being hit and the
+entire gateway is restarting — including the rate limiter that was working fine.
 
----
+This exercise redesigns the supervision tree to contain failures.
 
-## Concepts
+Project structure at this point:
 
-### Supervision Strategies
-
-#### `:one_for_one`
-Solo el proceso que falla es reiniciado. Los demás no son afectados.
-
-```elixir
-children = [
-  CacheWorker,    # si falla → solo CacheWorker se reinicia
-  MetricsWorker,  # no se toca
-  AuditWorker,    # no se toca
-]
-Supervisor.init(children, strategy: :one_for_one)
+```
+api_gateway/
+├── lib/
+│   └── api_gateway/
+│       ├── application.ex              # ← you redesign this
+│       ├── router.ex
+│       ├── rate_limiter/
+│       │   └── server.ex
+│       ├── circuit_breaker/
+│       │   ├── supervisor.ex           # ← you implement this
+│       │   └── worker.ex
+│       ├── route_table/
+│       │   └── server.ex
+│       ├── middleware/
+│       │   ├── audit_writer.ex
+│       │   └── priority_dispatcher.ex
+│       └── telemetry/
+│           └── reporter.ex             # already exists — crashes when agent is down
+├── test/
+│   └── api_gateway/
+│       └── supervision_test.exs        # given tests — must pass without modification
+└── mix.exs
 ```
 
-**Úsalo cuando**: los workers son completamente independientes. El fallo de uno no invalida el estado de los demás.
+---
 
-**Trampa**: si los workers comparten estado implícito (por ejemplo, un ETS table que el proceso A escribe y B lee), `:one_for_one` puede dejar B con datos corruptos invisibles.
+## The three supervision strategies
+
+### `:one_for_one`
+
+Only the failing process is restarted. All siblings are unaffected.
+
+Use when workers are **completely independent** — the failure of one does not
+invalidate the state of the others.
+
+Trap: if workers share implicit state (e.g., an ETS table that worker A writes and
+worker B reads), `:one_for_one` can leave worker B with stale data after A restarts.
+
+### `:one_for_all`
+
+When any child fails, **all children** are terminated and restarted together.
+
+Use when children have **mutual state dependencies** — if one falls, the rest
+are in an inconsistent state anyway.
+
+Trap: a noisy worker that crashes frequently will drag all siblings with it
+on every crash. The cost of a single failure is multiplied by N children.
+
+### `:rest_for_one`
+
+When child N fails, child N and every child started **after** N are restarted.
+Children started before N are not touched.
+
+Use when there is a **linear dependency chain**: B depends on A, C depends on B.
+If A crashes, B and C are invalidated; but A's crash does not affect any prior siblings.
+
+Trap: the **position** in the child list is semantically significant. Reordering
+children silently changes failure semantics.
 
 ---
 
-#### `:one_for_all`
-Si cualquier child falla, **todos** son terminados y reiniciados juntos.
-
-```elixir
-children = [
-  DatabasePool,   # si falla → todos se reinician
-  CacheLayer,     # depende de DB estar sana
-  QueryRouter,    # depende de ambos
-]
-Supervisor.init(children, strategy: :one_for_all)
-```
-
-**Úsalo cuando**: los children tienen dependencias mutuas de estado. Si uno cae, el resto queda en un estado inconsistente de todas formas.
-
-**Trampa**: un worker ruidoso que falla frecuentemente arrastrará a todos los demás con él repetidamente. El costo de un fallo es multiplicado por N children.
-
----
-
-#### `:rest_for_one`
-Si el child N falla, se reinician el child N y todos los que fueron iniciados **después** de él (índices > N). Los anteriores no se tocan.
-
-```elixir
-children = [
-  ConnectionPool,   # índice 0: si falla → reinicia 0, 1, 2
-  SessionManager,   # índice 1: si falla → reinicia 1, 2
-  RequestHandler,   # índice 2: si falla → reinicia solo 2
-]
-Supervisor.init(children, strategy: :rest_for_one)
-```
-
-**Úsalo cuando**: existe una cadena de dependencia lineal. B depende de A, C depende de B. Si A cae, B y C quedan inválidos pero no al revés.
-
-**Trampa**: la posición en la lista importa. Mover un child cambia la semántica de supervisión silenciosamente.
-
----
-
-### Intensity and Period: `max_restarts` / `max_seconds`
+## `max_restarts` / `max_seconds` — the sliding window
 
 ```elixir
 Supervisor.init(children,
-  strategy: :one_for_one,
-  max_restarts: 3,    # máximo 3 reinicios...
-  max_seconds: 5      # ...en una ventana de 5 segundos
+  strategy:     :one_for_one,
+  max_restarts: 3,    # up to 3 restarts...
+  max_seconds:  5     # ...within any 5-second window
 )
 ```
 
-Si un child se reinicia más de `max_restarts` veces en `max_seconds` segundos, el supervisor **se rinde** y termina él mismo. Esto propaga el fallo hacia arriba en el árbol.
+When a child restarts more than `max_restarts` times within `max_seconds` seconds,
+the supervisor **gives up** and terminates itself, propagating the failure upward
+in the tree.
 
-**Por qué existe**: un proceso que falla constantemente en un loop consume CPU y puede enmascarar un bug real. El supervisor se rinde para forzar visibilidad del problema.
+This is intentional: a process that crashes in a tight loop masks a real bug.
+The supervisor gives up to force visibility. Default values (`3/5`) are aggressive.
+Production workers with legitimate transient spikes may need wider windows.
 
-**Valores por defecto**: `max_restarts: 3`, `max_seconds: 5` — relativamente agresivos. En producción con workers que pueden tener spikes legítimos, considera aumentarlos o reestructurar el árbol.
-
-```
-Ventana deslizante (no fija):
-  t=0s → crash #1
-  t=3s → crash #2
-  t=5s → crash #3
-  t=5.1s → supervisor termina (3 crashes en 5.1s < 5s... ¿o no?)
-
-Cuidado: la ventana se mide desde el PRIMER crash reciente, no desde t=0.
-```
+**The window is sliding, not fixed.** The supervisor keeps timestamps of the last
+`max_restarts` restarts and checks whether the oldest falls within `max_seconds` of
+the most recent.
 
 ---
 
-### Cascading Failures
-
-El patrón más peligroso: un proceso ruidoso que:
-1. Falla repetidamente
-2. Supera el threshold del supervisor
-3. El supervisor termina
-4. El supervisor padre reinicia el supervisor hijo
-5. Si el padre también supera su threshold → todo el árbol cae
-
-```
-Application
-└── TopSupervisor (max_restarts: 10, max_seconds: 60)
-    ├── InfrastructureSupervisor (max_restarts: 3, max_seconds: 5)
-    │   ├── DatabasePool
-    │   └── CachePool
-    └── BusinessSupervisor
-        ├── OrderService
-        └── PaymentService
-```
-
-Si `CachePool` falla 4 veces en 5 segundos:
-1. `InfrastructureSupervisor` termina
-2. `TopSupervisor` reinicia `InfrastructureSupervisor`
-3. Si `CachePool` sigue fallando → `TopSupervisor` puede terminar
-4. La aplicación entera cae
-
-**Solución**: aislar workers ruidosos en supervisores con thresholds apropiados, o usar `:temporary` restart type para workers que no necesitan sobrevivir.
-
----
-
-### Restart Types en Child Spec
+## Restart types
 
 ```elixir
-def child_spec(opts) do
-  %{
-    id: __MODULE__,
-    start: {__MODULE__, :start_link, [opts]},
-    restart: :permanent,  # siempre reiniciar (default)
-    # restart: :temporary, # nunca reiniciar (fire-and-forget)
-    # restart: :transient, # reiniciar solo si terminó anormalmente
-    shutdown: 5_000
-  }
-end
+%{
+  id:      MyWorker,
+  start:   {MyWorker, :start_link, [[]]},
+  restart: :permanent   # always restart (default)
+  # restart: :temporary # never restart — fire-and-forget
+  # restart: :transient # restart only on abnormal exit (not :normal or :shutdown)
+}
 ```
 
-- `:permanent` — se reinicia siempre. Para workers críticos.
-- `:temporary` — nunca se reinicia. Para tareas únicas.
-- `:transient` — se reinicia solo si el proceso terminó con error (no si llamó `stop` normalmente). Para workers opcionales.
+- `:permanent` — critical workers that must always run
+- `:temporary` — one-shot tasks; use with `Task.Supervisor`
+- `:transient` — optional workers; restart only on crashes, not on clean shutdown
 
 ---
 
-## Exercise 1 — Strategy Selection
+## Implementation
 
-### Problem
+### Step 1: Redesign `application.ex`
 
-Diseña el árbol de supervisión para una aplicación web con los siguientes componentes:
+The target tree:
 
-- `DBPool` — pool de conexiones a PostgreSQL. Sin él nada funciona.
-- `CachePool` — pool de conexiones a Redis. Usado por `RequestHandler` para caching. Si falla, el sistema puede operar sin caché (más lento, pero funcional).
-- `HTTPServer` — servidor HTTP. Depende de `DBPool` para queries. `CachePool` es opcional.
-- `MetricsReporter` — reporta métricas a Datadog cada 30s. Completamente independiente.
-- `HealthChecker` — hace health checks contra servicios externos. Independiente.
-
-**Tu tarea**:
-
-1. Decide qué estrategia usar para cada nivel del árbol (puede haber múltiples supervisores)
-2. Decide el `restart` type para cada worker
-3. Justifica cada decisión con un trade-off explícito
-4. Implementa el código del `Application` y los supervisores necesarios
+```
+ApiGateway.Application
+├── ApiGateway.CoreSupervisor        (rest_for_one, max_restarts: 5/30s)
+│   ├── ApiGateway.RateLimiter.Server       :permanent
+│   ├── ApiGateway.RouteTable.Server        :permanent
+│   └── ApiGateway.CircuitBreaker.Supervisor :permanent  (supervises workers)
+│
+├── ApiGateway.MiddlewareSupervisor   (one_for_one, max_restarts: 10/60s)
+│   ├── ApiGateway.Middleware.AuditWriter         :permanent
+│   └── ApiGateway.Middleware.PriorityDispatcher  :permanent
+│
+└── ApiGateway.TelemetrySupervisor    (one_for_one, max_restarts: 20/60s)
+    └── ApiGateway.Telemetry.Reporter  :transient
+```
 
 ```elixir
-# Estructura esperada (incompleta — tú la completas):
-defmodule MyApp.Application do
+# lib/api_gateway/application.ex
+defmodule ApiGateway.Application do
   use Application
 
+  @impl true
   def start(_type, _args) do
     children = [
-      # ¿Qué va aquí y en qué orden?
+      # TODO: add the three second-level supervisors in dependency order
+      # CoreSupervisor must start before Middleware (middleware uses rate limiter)
+      # TelemetrySupervisor is independent — can go last
     ]
 
-    opts = [strategy: ???, name: MyApp.Supervisor]
-    Supervisor.start_link(children, opts)
+    Supervisor.start_link(children,
+      strategy: :one_for_one,
+      name: ApiGateway.Supervisor
+    )
   end
 end
 ```
 
-### Hints
-
-<details>
-<summary>Hint 1 — Dominios de fallo</summary>
-
-No todo debe ir en un supervisor. Agrupa por "si esto falla, ¿qué más queda inválido?". `MetricsReporter` y `HealthChecker` son completamente independientes del core. Considéralos en un supervisor separado con `:temporary` o `:transient` restart.
-
-</details>
-
-<details>
-<summary>Hint 2 — CachePool es opcional</summary>
-
-Si `CachePool` falla y el sistema puede continuar sin él, ¿tiene sentido que su fallo derribe `HTTPServer`? Considera `:transient` restart para `CachePool` o aislarlo en un supervisor diferente al de `DBPool` + `HTTPServer`.
-
-</details>
-
-<details>
-<summary>Hint 3 — Dependencia DB → HTTP</summary>
-
-`HTTPServer` depende de `DBPool`. Si `DBPool` cae y se reinicia, ¿`HTTPServer` sigue apuntando a conexiones válidas? Depende de cómo implementes el pool. Si el pool usa un nombre global y el handler busca conexiones por nombre, `:one_for_one` puede funcionar. Si el handler recibe un PID al inicio (inyección), necesitas `:rest_for_one`.
-
-</details>
-
-### One Possible Solution
-
-<details>
-<summary>Ver solución (intenta resolverlo primero)</summary>
+### Step 2: `lib/api_gateway/core_supervisor.ex`
 
 ```elixir
-defmodule MyApp.Application do
-  use Application
-
-  def start(_type, _args) do
-    children = [
-      # Infraestructura crítica: DB debe iniciar antes que HTTP
-      # rest_for_one porque HTTPServer depende del pool por nombre registrado
-      {MyApp.InfrastructureSupervisor, []},
-
-      # Servicios auxiliares: independientes, no afectan el core si fallan
-      {MyApp.AuxiliarySupervisor, []},
-    ]
-
-    Supervisor.start_link(children, strategy: :one_for_one, name: MyApp.Supervisor)
-  end
-end
-
-defmodule MyApp.InfrastructureSupervisor do
+defmodule ApiGateway.CoreSupervisor do
   use Supervisor
 
   def start_link(opts) do
@@ -241,450 +176,205 @@ defmodule MyApp.InfrastructureSupervisor do
 
   def init(_opts) do
     children = [
-      # DBPool primero: HTTPServer depende de él
-      {MyApp.DBPool, []},
-      # CachePool segundo: si falla, HTTPServer sigue funcionando (sin caché)
-      # transient: no reiniciar si terminó normalmente (shutdown limpio)
-      %{
-        id: MyApp.CachePool,
-        start: {MyApp.CachePool, :start_link, [[]]},
-        restart: :transient
-      },
-      # HTTPServer último: depende de DBPool estar disponible
-      {MyApp.HTTPServer, []},
+      # TODO: list RateLimiter.Server, RouteTable.Server, CircuitBreaker.Supervisor
+      # in dependency order
+      #
+      # Why rest_for_one here?
+      # If RateLimiter crashes and restarts, RouteTable is unaffected (they share no state).
+      # But if RouteTable crashes and restarts with a fresh ETS table, processes that
+      # cached route entries need to re-fetch them.
+      # rest_for_one ensures that any process depending on a crashed sibling is also reset.
     ]
-
-    # rest_for_one: si DBPool cae, CachePool y HTTPServer se reinician también
-    # Si CachePool cae (transient + fallo), solo HTTPServer se reinicia
-    Supervisor.init(children, strategy: :rest_for_one)
-  end
-end
-
-defmodule MyApp.AuxiliarySupervisor do
-  use Supervisor
-
-  def start_link(opts) do
-    Supervisor.start_link(__MODULE__, opts, name: __MODULE__)
-  end
-
-  def init(_opts) do
-    children = [
-      # Completamente independientes entre sí
-      %{
-        id: MyApp.MetricsReporter,
-        start: {MyApp.MetricsReporter, :start_link, [[]]},
-        restart: :permanent  # métricas deben seguir funcionando
-      },
-      %{
-        id: MyApp.HealthChecker,
-        start: {MyApp.HealthChecker, :start_link, [[]]},
-        restart: :permanent
-      },
-    ]
-
-    Supervisor.init(children, strategy: :one_for_one)
-  end
-end
-```
-
-**Trade-offs de esta solución**:
-- `rest_for_one` en Infrastructure garantiza que si DB cae, HTTP se reinicia y obtiene conexiones frescas
-- `CachePool` con `:transient` significa que si Redis no está disponible y el pool termina limpiamente (`:normal`), no se intenta reconectar en loop
-- Separar en dos supervisores aísla fallo de auxiliares del core: si `MetricsReporter` explota repetidamente, no afecta `DBPool` ni `HTTPServer`
-
-</details>
-
----
-
-## Exercise 2 — Threshold Tuning
-
-### Problem
-
-Tienes un supervisor con configuración por defecto (`max_restarts: 3, max_seconds: 5`) supervisando un worker que simula trabajo con fallos esporádicos.
-
-```elixir
-defmodule MyApp.UnreliableWorker do
-  use GenServer
-
-  def start_link(opts), do: GenServer.start_link(__MODULE__, opts)
-
-  def init(_opts) do
-    # Simula trabajo que tarda en inicializarse
-    Process.send_after(self(), :do_work, 1_000)
-    {:ok, %{count: 0}}
-  end
-
-  def handle_info(:do_work, state) do
-    new_count = state.count + 1
-
-    if rem(new_count, 4) == 0 do
-      # Falla cada 4ta iteración
-      raise "Simulated transient error at count #{new_count}"
-    end
-
-    Process.send_after(self(), :do_work, 500)
-    {:noreply, %{state | count: new_count}}
-  end
-end
-```
-
-**Tu tarea**:
-
-1. Configura el supervisor con los defaults y observa cuándo termina
-2. Calcula manualmente: con este patrón de fallo (cada 4ta iteración, cada 500ms), ¿cuánto tiempo tarda el supervisor en rendirse?
-3. Ajusta `max_restarts` y `max_seconds` para que el supervisor tolere este patrón de fallo sin rendirse
-4. ¿Cuándo es una mala idea aumentar los thresholds indefinidamente?
-
-```elixir
-defmodule MyApp.WorkerSupervisor do
-  use Supervisor
-
-  def start_link(opts) do
-    Supervisor.start_link(__MODULE__, opts, name: __MODULE__)
-  end
-
-  def init(_opts) do
-    children = [MyApp.UnreliableWorker]
 
     Supervisor.init(children,
-      strategy: :one_for_one,
-      max_restarts: ???,
-      max_seconds: ???
+      strategy: :rest_for_one,
+      max_restarts: 5,
+      max_seconds: 30
     )
   end
 end
 ```
 
-### Hints
-
-<details>
-<summary>Hint 1 — Calcula el tiempo hasta el crash</summary>
-
-El worker hace trabajo cada 500ms. Falla en la iteración 4 (t≈2s desde inicio). Se reinicia, arranca en 1s, hace trabajo en 500ms... ¿cuántas veces puede caer en 5 segundos? Haz el cálculo antes de correr el código.
-
-</details>
-
-<details>
-<summary>Hint 2 — La ventana es deslizante</summary>
-
-`max_seconds` no es una ventana fija que se resetea cada N segundos. Es una ventana deslizante: el supervisor mantiene timestamps de los últimos `max_restarts` reinicios y compara si el más antiguo ocurrió hace menos de `max_seconds` segundos.
-
-</details>
-
-<details>
-<summary>Hint 3 — Threshold alto no es gratis</summary>
-
-Si aumentas `max_restarts` a 1000, el supervisor nunca se rinde — pero un worker que crashea en loop consume CPU en reinicios constantes, llena logs, y puede enmascarar un bug que debería ser detectado. El threshold es una señal de alarma, no una solución al problema subyacente.
-
-</details>
-
-### One Possible Solution
-
-<details>
-<summary>Ver análisis (intenta calcularlo primero)</summary>
-
-**Cálculo del tiempo hasta el crash con defaults (max_restarts: 3, max_seconds: 5)**:
-
-```
-Inicio: t=0s
-  Worker init: 1s de delay
-  t=1.0s: iteración 1 (ok)
-  t=1.5s: iteración 2 (ok)
-  t=2.0s: iteración 3 (ok)
-  t=2.5s: iteración 4 → CRASH #1
-
-Reinicio #1: supervisor reinicia worker
-  t=2.5s + init 1s = t=3.5s: iteración 1 (ok)
-  t=4.0s: iteración 2 (ok)
-  t=4.5s: iteración 3 (ok)
-  t=5.0s: iteración 4 → CRASH #2
-
-Reinicio #2:
-  t=5.0s + 1s = t=6.0s: iteración 1 (ok)
-  t=6.5s: iteración 2 (ok)
-  t=7.0s: iteración 3 (ok)
-  t=7.5s: iteración 4 → CRASH #3
-
-Reinicio #3:
-  t=7.5s + 1s = t=8.5s: iteración 1 (ok)
-  t=9.0s: iteración 2 (ok)
-  t=9.5s: iteración 3 (ok)
-  t=10.0s: iteración 4 → CRASH #4
-
-En t=10.0s el supervisor verifica: crash #4 ocurrió.
-¿Los últimos 3 crashes (crashes #2, #3, #4) en t=5.0s, t=7.5s, t=10.0s?
-Ventana: t=10.0 - t=5.0 = 5.0s — EXACTAMENTE en el límite.
-
-Resultado: supervisor termina en ~t=10s.
-```
-
-**Configuración tolerante**:
+### Step 3: `lib/api_gateway/circuit_breaker/supervisor.ex`
 
 ```elixir
-# Opción A: ampliar la ventana temporal
-Supervisor.init(children,
-  strategy: :one_for_one,
-  max_restarts: 3,
-  max_seconds: 30  # 3 crashes en 30 segundos está bien
-)
+defmodule ApiGateway.CircuitBreaker.Supervisor do
+  use DynamicSupervisor
+  require Logger
 
-# Opción B: usar :transient para que el worker no cuente si termina normalmente
-# (no aplica aquí porque siempre termina con excepción)
+  def start_link(opts) do
+    DynamicSupervisor.start_link(__MODULE__, opts, name: __MODULE__)
+  end
 
-# Opción C: separar la lógica de retry del worker
-# El worker captura su propio error y espera antes de reintentar
-# → no crashea el proceso, solo registra el error
-defmodule MyApp.ResilientWorker do
-  use GenServer
+  def init(_opts) do
+    DynamicSupervisor.init(strategy: :one_for_one)
+  end
 
-  def handle_info(:do_work, state) do
-    new_count = state.count + 1
+  @doc """
+  Starts a circuit breaker worker for a service.
+  Returns {:ok, pid} or {:error, reason}.
+  """
+  def start_worker(service_name) do
+    spec = {ApiGateway.CircuitBreaker.Worker, service_name}
+    DynamicSupervisor.start_child(__MODULE__, spec)
+  end
 
-    result =
-      try do
-        if rem(new_count, 4) == 0, do: raise("error"), else: :ok
-      rescue
-        e ->
-          Logger.error("Work failed: #{inspect(e)}")
-          :error
-      end
-
-    # Continúa independientemente del resultado
-    Process.send_after(self(), :do_work, 500)
-    {:noreply, %{state | count: new_count}}
+  @doc "Lists all currently supervised circuit breaker workers."
+  def list_workers do
+    DynamicSupervisor.which_children(__MODULE__)
+    |> Enum.map(fn {_, pid, _, _} -> pid end)
+    |> Enum.filter(&is_pid/1)
   end
 end
 ```
 
-**Cuándo NO aumentar thresholds**:
-- El worker falla por un bug en el código (no por condición externa transitoria)
-- El worker consume recursos en cada reinicio (conexiones, memoria)
-- La tasa de fallo está aumentando (indicio de degradación progresiva)
-
-</details>
-
----
-
-## Exercise 3 — Cascading Failures
-
-### Problem
-
-Demuestra el problema de cascading failures y diseña una solución de contención.
-
-Implementa este sistema:
+### Step 4: `lib/api_gateway/telemetry_supervisor.ex`
 
 ```elixir
-# Sistema inicial — PROBLEMÁTICO
-defmodule MyApp.ProblematicApp do
-  use Application
+defmodule ApiGateway.TelemetrySupervisor do
+  use Supervisor
 
-  def start(_type, _args) do
+  def start_link(opts) do
+    Supervisor.start_link(__MODULE__, opts, name: __MODULE__)
+  end
+
+  def init(_opts) do
     children = [
-      MyApp.DatabasePool,
-      MyApp.CachePool,       # falla frecuentemente (Redis inestable)
-      MyApp.OrderService,
-      MyApp.PaymentService,
+      # TODO: add Reporter with restart: :transient
+      # :transient means: if the reporter terminates cleanly (e.g., Datadog agent
+      # unavailable and it gives up gracefully), the supervisor does NOT restart it.
+      # This prevents the "crash loop" that was taking down the whole gateway.
+      %{
+        id:      ApiGateway.Telemetry.Reporter,
+        start:   {ApiGateway.Telemetry.Reporter, :start_link, [[]]},
+        restart: :transient
+      }
     ]
 
-    # Con :one_for_all, si CachePool falla → TODO se reinicia
-    Supervisor.start_link(children,
-      strategy: :one_for_all,
-      max_restarts: 3,
-      max_seconds: 10,
-      name: MyApp.Supervisor
+    # Generous thresholds: telemetry is noisy by nature.
+    # It can crash 20 times in 60 seconds before we give up.
+    Supervisor.init(children,
+      strategy: :one_for_one,
+      max_restarts: 20,
+      max_seconds: 60
     )
   end
 end
-
-defmodule MyApp.CachePool do
-  use GenServer
-
-  def start_link(_), do: GenServer.start_link(__MODULE__, [], name: __MODULE__)
-
-  def init(_) do
-    # Simula Redis inestable: falla al conectar el 70% de las veces
-    if :rand.uniform(10) > 3 do
-      {:stop, :redis_connection_failed}
-    else
-      {:ok, %{connected: true}}
-    end
-  end
-end
 ```
 
-**Tu tarea**:
-
-1. Implementa el sistema problemático y observa cómo `CachePool` inestable derriba `OrderService` y `PaymentService`
-2. Calcula en qué momento el supervisor raíz termina y por qué
-3. Rediseña el sistema para que `CachePool` inestable **no afecte** a `OrderService` y `PaymentService`
-4. Implementa un mecanismo de circuit-breaking manual: si `CachePool` falla N veces, el sistema opera sin caché en lugar de intentar reiniciar indefinidamente
-
-### Hints
-
-<details>
-<summary>Hint 1 — Aislamiento en supervisor dedicado</summary>
-
-El primer paso es sacar `CachePool` de bajo el supervisor que usa `:one_for_all`. Si `CachePool` tiene su propio supervisor, sus fallos no derribarán a `OrderService`.
-
-</details>
-
-<details>
-<summary>Hint 2 — Restart type :temporary para cache</summary>
-
-¿Necesitas que `CachePool` sea reiniciado indefinidamente? Si Redis está caído, el pool va a fallar en cada reinicio. Considera `:temporary` (no reiniciar nunca) con un mecanismo separado de reconexión bajo demanda.
-
-</details>
-
-<details>
-<summary>Hint 3 — Estado del circuit breaker</summary>
-
-Un circuit breaker simple puede vivir en un GenServer que registra fallos de `CachePool`. Las funciones que usan caché consultan si el circuit está "abierto" (fallando) o "cerrado" (ok) antes de intentar usar Redis. Si está abierto, van directo a DB.
-
-</details>
-
----
-
-## Common Mistakes
-
-### Mistake 1 — Usar `:one_for_all` por defecto "porque es más seguro"
+### Step 5: Given tests — must pass without modification
 
 ```elixir
-# MAL: "más reinicios = más seguro"
-Supervisor.init(children, strategy: :one_for_all)
+# test/api_gateway/supervision_test.exs
+defmodule ApiGateway.SupervisionTest do
+  use ExUnit.Case, async: false
 
-# El resultado: un MetricsReporter que falla cada 30s
-# derriba DBPool, CachePool, y HTTPServer en cada ciclo.
-# Tu aplicación reinicia completamente cada 30 segundos.
-```
+  describe "failure domain isolation" do
+    test "TelemetrySupervisor crash does not affect RateLimiter.Server" do
+      # Verify core is running
+      assert Process.alive?(Process.whereis(ApiGateway.RateLimiter.Server))
 
-**Regla**: `:one_for_all` es la estrategia más costosa. Solo úsala cuando puedas demostrar que los workers comparten estado que se invalida mutuamente.
-
----
-
-### Mistake 2 — Ignorar el orden de children con `:rest_for_one`
-
-```elixir
-# MAL: HTTPServer antes de DBPool con :rest_for_one
-children = [
-  MyApp.HTTPServer,   # índice 0
-  MyApp.DBPool,       # índice 1
-]
-Supervisor.init(children, strategy: :rest_for_one)
-
-# Si HTTPServer falla → reinicia HTTPServer y DBPool (¡innecesario!)
-# Si DBPool falla → reinicia solo DBPool (HTTPServer sigue con conexiones inválidas)
-# El orden está al revés de lo que necesitas
-```
-
----
-
-### Mistake 3 — Thresholds demasiado permisivos como solución a bugs
-
-```elixir
-# MAL: el worker crashea → aumentamos el threshold para "arreglarlo"
-Supervisor.init(children,
-  strategy: :one_for_one,
-  max_restarts: 1_000_000,
-  max_seconds: 1
-)
-
-# Ahora el worker puede crashear un millón de veces por segundo
-# sin que el supervisor se rinda. Tu log tiene 1M errores/s
-# y el CPU está al 100% en reinicios.
-```
-
----
-
-### Mistake 4 — Confundir `max_seconds` con un timer de reseteo
-
-```elixir
-# Asunción incorrecta: "cada 5 segundos el contador de reinicios se resetea"
-# Realidad: es una ventana DESLIZANTE basada en timestamps
-
-# Con max_restarts: 3, max_seconds: 5:
-# crash en t=0, t=4, t=8 → NO supera el threshold
-# porque en t=8, el crash de t=0 ya está fuera de la ventana de 5s
-# Solo se cuentan los crashes dentro de los últimos max_seconds segundos
-```
-
----
-
-## Production Patterns
-
-### Pattern 1 — Supervisor Tree Depth para contención
-
-```
-Application
-├── CoreSupervisor (max_restarts: 5, max_seconds: 30)
-│   ├── DBPool          :permanent
-│   └── HTTPServer      :permanent
-└── OptionalSupervisor (max_restarts: 10, max_seconds: 10)
-    ├── CachePool       :transient
-    ├── MetricsReporter :permanent
-    └── HealthChecker   :permanent
-```
-
-Si `OptionalSupervisor` se rinde, `CoreSupervisor` sobrevive. La aplicación degrada gracefully.
-
-### Pattern 2 — Proceso Sentinel para detección de degradación
-
-```elixir
-defmodule MyApp.Sentinel do
-  use GenServer
-
-  # Monitorea otros procesos y reporta degradación
-  def init(_) do
-    :timer.send_interval(5_000, :check_health)
-    {:ok, %{failure_counts: %{}}}
-  end
-
-  def handle_info(:check_health, state) do
-    Supervisor.which_children(MyApp.OptionalSupervisor)
-    |> Enum.each(fn {id, pid, _type, _modules} ->
-      unless is_pid(pid) and Process.alive?(pid) do
-        Logger.warning("Child #{id} is not running")
-        # Alerta a sistema de monitoreo externo
+      # Kill the telemetry supervisor's Reporter
+      reporter_pid = Process.whereis(ApiGateway.Telemetry.Reporter)
+      if reporter_pid do
+        ref = Process.monitor(reporter_pid)
+        Process.exit(reporter_pid, :kill)
+        assert_receive {:DOWN, ^ref, :process, _, _}, 1_000
       end
-    end)
-    {:noreply, state}
-  end
-end
-```
 
-### Pattern 3 — Backoff en reinicios con `handle_continue`
+      Process.sleep(100)
 
-Los supervisores OTP no soportan backoff exponencial nativo. La solución es que el proceso mismo implemente el delay de inicialización:
+      # RateLimiter must still be alive and functional
+      assert Process.alive?(Process.whereis(ApiGateway.RateLimiter.Server))
+      assert {:allow, _} = ApiGateway.RateLimiter.Server.check("test-client", 100, 60_000)
+    end
 
-```elixir
-defmodule MyApp.BackoffWorker do
-  use GenServer
+    test "CoreSupervisor is started before MiddlewareSupervisor" do
+      # Verify start ordering by checking that core components exist
+      # before middleware components
+      assert Process.whereis(ApiGateway.RateLimiter.Server) != nil
+      assert Process.whereis(ApiGateway.Middleware.AuditWriter) != nil
+    end
 
-  def init(opts) do
-    attempt = Keyword.get(opts, :attempt, 1)
-    delay = min(1_000 * attempt, 30_000)  # max 30s
-    Process.send_after(self(), {:connect, attempt}, delay)
-    {:ok, %{connected: false, attempt: attempt}}
-  end
+    test "CircuitBreaker.Supervisor can add and list workers dynamically" do
+      {:ok, pid1} = ApiGateway.CircuitBreaker.Supervisor.start_worker("svc-x")
+      {:ok, pid2} = ApiGateway.CircuitBreaker.Supervisor.start_worker("svc-y")
 
-  def handle_info({:connect, attempt}, state) do
-    case do_connect() do
-      {:ok, conn} ->
-        {:noreply, %{state | connected: true}}
-      {:error, reason} ->
-        Logger.warning("Connect attempt #{attempt} failed: #{inspect(reason)}")
-        # Terminar con :normal para que :transient no lo reinicie en loop
-        # O dejar que el supervisor lo reinicie con nuevo attempt en state
-        {:stop, {:connection_failed, reason}, state}
+      workers = ApiGateway.CircuitBreaker.Supervisor.list_workers()
+      assert Enum.member?(workers, pid1)
+      assert Enum.member?(workers, pid2)
+    end
+
+    test "crashed circuit breaker worker is restarted by DynamicSupervisor" do
+      {:ok, pid} = ApiGateway.CircuitBreaker.Supervisor.start_worker("crash-test-svc")
+      ref = Process.monitor(pid)
+      Process.exit(pid, :kill)
+      assert_receive {:DOWN, ^ref, :process, _, _}, 1_000
+
+      # DynamicSupervisor restarts it; check list has a live pid for the service
+      Process.sleep(100)
+      workers = ApiGateway.CircuitBreaker.Supervisor.list_workers()
+      assert Enum.any?(workers, &Process.alive?/1)
     end
   end
 end
 ```
+
+### Step 6: Run the tests
+
+```bash
+mix test test/api_gateway/supervision_test.exs --trace
+```
+
+---
+
+## Trade-off analysis
+
+| Strategy | Best for | Key risk |
+|----------|----------|----------|
+| `:one_for_one` | Independent workers | Silent state corruption if workers share ETS |
+| `:one_for_all` | Tightly coupled state | Noisy worker takes down all siblings |
+| `:rest_for_one` | Linear dependency chain | Child list order is now load-bearing |
+
+Reflection question: the `CoreSupervisor` uses `:rest_for_one`. If you later add a
+fourth child between `RouteTable.Server` and `CircuitBreaker.Supervisor`, what are
+the failure semantics of the new child? Why is this dangerous if the change is made
+without reviewing the dependency graph?
+
+---
+
+## Common production mistakes
+
+**1. Using `:one_for_all` as default "because it is safer"**
+A `MetricsReporter` that crashes every 30 seconds under `:one_for_all` will restart
+`DBPool`, `RateLimiter`, and every other sibling every 30 seconds. Your application
+effectively restarts every 30 seconds. `:one_for_all` is the most expensive strategy —
+only use it when you can demonstrate that worker state is mutually invalidated on failure.
+
+**2. Wrong child order with `:rest_for_one`**
+If `HTTPServer` is listed before `DBPool` in a `:rest_for_one` supervisor:
+- `HTTPServer` crash → restarts `HTTPServer` AND `DBPool` (unnecessary)
+- `DBPool` crash → restarts only `DBPool` (HTTPServer keeps stale connections)
+The order is the opposite of what you need. Always list dependencies before dependents.
+
+**3. Increasing `max_restarts` as a fix for crashing workers**
+Setting `max_restarts: 1_000_000` prevents the supervisor from giving up but does nothing
+about the underlying crash. The worker crashes a million times per second, fills logs, and
+saturates the CPU with restart overhead. `max_restarts` is a circuit breaker for the
+supervisor itself — raising it masks real bugs. Fix the bug first.
+
+**4. Confusing `max_seconds` with a fixed-window reset timer**
+`max_seconds` is a **sliding window** based on timestamps, not a fixed window that resets
+every N seconds. With `max_restarts: 3, max_seconds: 5`: crashes at t=0, t=4, t=8 do NOT
+exceed the threshold because at t=8 the crash at t=0 is outside the 5-second window.
+Only crashes within the last 5 seconds of the most recent crash are counted.
 
 ---
 
 ## Resources
 
-- [Erlang Supervisor Behaviour](https://www.erlang.org/doc/design_principles/sup_princ.html)
-- [Elixir Supervisor docs](https://hexdocs.pm/elixir/Supervisor.html)
-- [The Zen of Erlang — Fred Hébert](https://ferd.ca/the-zen-of-erlang.html)
-- [Designing for Failure in Distributed Systems](https://hexdocs.pm/elixir/design-anti-patterns.html)
+- [Erlang OTP — Supervisor Behaviour](https://www.erlang.org/doc/design_principles/sup_princ.html)
+- [HexDocs — Elixir Supervisor](https://hexdocs.pm/elixir/Supervisor.html)
+- [HexDocs — DynamicSupervisor](https://hexdocs.pm/elixir/DynamicSupervisor.html)
+- [Fred Hébert — The Zen of Erlang](https://ferd.ca/the-zen-of-erlang.html)
+- [Designing Elixir Systems with OTP — James Edward Gray II & Bruce Tate](https://pragprog.com/titles/jgotp/)

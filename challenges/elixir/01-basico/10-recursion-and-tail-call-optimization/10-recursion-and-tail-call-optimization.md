@@ -1,557 +1,345 @@
-# 10. Recursion and Tail Call Optimization
+# Recursion and TCO: Building the Transaction Report
 
-**Difficulty**: Basico
+**Project**: `payments_cli` — built incrementally across the basic level
 
-## Prerequisites
+---
 
-- Haber completado los ejercicios 01–09
-- Conocimiento de pattern matching (05), listas y `[H|T]` (06), funciones y arity (08)
-- Un proyecto Mix con `mix new` o IEx para pruebas interactivas
+## Project context
 
-## Learning Objectives
+You're building `payments_cli`. The `Ledger` module needs functions that walk a
+list of transactions to compute reports. This exercise explores recursion as the
+fundamental loop mechanism in Elixir, and why tail-call optimization (TCO) determines
+whether your code handles 1,000 transactions or 1,000,000.
 
-- Entender la estructura de toda función recursiva: base case + recursive case
-- Reconocer por qué la recursión naive puede causar stack overflow en listas grandes
-- Escribir funciones con Tail Call Optimization (TCO) usando el patrón acumulador
-- Identificar cuándo una llamada es tail call y cuándo no lo es
-- Entender por qué Elixir no tiene loops `for`/`while` clásicos (y qué usa en su lugar)
-
-## Concepts
-
-### Recursión: base case + recursive case
-
-Toda función recursiva tiene dos partes obligatorias:
-
-```elixir
-defmodule MyList do
-  # Base case: la lista está vacía — retorna 0 directamente
-  def sum([]), do: 0
-
-  # Recursive case: tomar el head, sumar al resultado de la cola
-  def sum([head | tail]), do: head + sum(tail)
-end
-
-MyList.sum([1, 2, 3])
-# sum([1, 2, 3])
-# = 1 + sum([2, 3])
-# = 1 + 2 + sum([3])
-# = 1 + 2 + 3 + sum([])
-# = 1 + 2 + 3 + 0
-# = 6
-```
-
-Sin base case, la recursión nunca termina y el proceso muere por stack overflow.
-
-### Por qué hay stack overflow: la pila crece
-
-En recursión naive, **cada llamada espera que la anterior retorne** para completar su cálculo. Esto apila frames en el call stack:
+Project structure at this point:
 
 ```
-sum([1, 2, 3])                    <- frame 1, esperando sum([2,3])
-  1 + sum([2, 3])                 <- frame 2, esperando sum([3])
-      2 + sum([3])                <- frame 3, esperando sum([])
-          3 + sum([])             <- frame 4 — ya puede retornar
-```
-
-Con una lista de 1.000.000 de elementos, habría 1.000.000 de frames apilados. Esto causa:
-
-```
-** (SystemLimitError) a system limit has been reached
-```
-
-### Tail Call Optimization (TCO): la VM de Erlang/BEAM lo resuelve
-
-Una llamada es **tail call** cuando es la **última operación** de la función — no hay nada más que calcular después. La BEAM puede reusar el frame del stack actual en lugar de crear uno nuevo.
-
-```elixir
-# NOT tail call: después de la llamada recursiva, aún hay que hacer + head
-def sum([head | tail]), do: head + sum(tail)
-#                              ^^^^^^^^^^^^^
-#                          La suma ocurre DESPUÉS — no es tail call
-
-# Tail call: la llamada recursiva ES la última operación
-def sum_tail([], acc), do: acc
-def sum_tail([head | tail], acc), do: sum_tail(tail, head + acc)
-#                                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^
-#                                 Esta es la ÚLTIMA operación — es tail call
-```
-
-### El patrón Acumulador
-
-Para convertir recursión naive en TCO, se agrega un argumento extra que acumula el resultado:
-
-```elixir
-defmodule Recursive do
-  # Versión pública con interfaz limpia — default arg
-  def sum(list, acc \\ 0)
-
-  # Base case: retornar el acumulador
-  def sum([], acc), do: acc
-
-  # Recursive case: sumar head al acumulador, continuar con tail
-  def sum([head | tail], acc), do: sum(tail, head + acc)
-end
-
-Recursive.sum([1, 2, 3])
-# sum([1,2,3], 0)
-# -> sum([2,3], 1)   -- acc = 0 + 1 = 1
-# -> sum([3], 3)     -- acc = 1 + 2 = 3
-# -> sum([], 6)      -- acc = 3 + 3 = 6
-# -> 6
-```
-
-Cada llamada no espera a la anterior — la VM puede reutilizar el mismo frame. **Sin límite de profundidad**.
-
-### Por qué Elixir no tiene loops clásicos
-
-Elixir no tiene `for x in list: ...` ni `while condition: ...`. La razón: los procesos de Erlang no tienen estado mutable. Una variable asignada no puede reasignarse en un loop.
-
-En su lugar:
-- **`Enum.map/filter/reduce`**: para transformaciones de colecciones (el 95% de los casos)
-- **Recursión**: para lógica compleja que no encaja en Enum
-- **`for` comprehension**: para transformaciones con filtros y generadores (no es un loop clásico)
-
-```elixir
-# En otros lenguajes
-result = []
-for x in [1, 2, 3]:
-    result.append(x * 2)
-
-# En Elixir — usar Enum.map
-result = Enum.map([1, 2, 3], fn x -> x * 2 end)
-# [2, 4, 6]
-```
-
-## Exercises
-
-### Exercise 1: Suma recursiva simple
-
-```elixir
-defmodule MyMath do
-  # Base case
-  def sum([]), do: 0
-
-  # Recursive case: head + sum del resto
-  def sum([head | tail]) do
-    head + sum(tail)
-  end
-end
-
-MyMath.sum([])          # 0
-MyMath.sum([5])         # 5
-MyMath.sum([1, 2, 3])   # 6
-MyMath.sum([10, 20, 30, 40])  # 100
-```
-
-**Expected output:**
-
-```
-iex> MyMath.sum([])
-0
-iex> MyMath.sum([5])
-5
-iex> MyMath.sum([1, 2, 3])
-6
-iex> MyMath.sum([10, 20, 30, 40])
-100
-```
-
-**Traza mental:**
-```
-sum([1, 2, 3])
-= 1 + sum([2, 3])
-= 1 + (2 + sum([3]))
-= 1 + (2 + (3 + sum([])))
-= 1 + (2 + (3 + 0))
-= 6
+payments_cli/
+├── lib/
+│   └── payments_cli/
+│       ├── cli.ex
+│       ├── transaction.ex
+│       ├── ledger.ex           # ← you extend this
+│       ├── formatter.ex
+│       ├── pipeline.ex
+│       ├── processor.ex
+│       └── router.ex
+├── test/
+│   └── payments_cli/
+│       └── ledger_recursion_test.exs  # given tests — must pass without modification
+└── mix.exs
 ```
 
 ---
 
-### Exercise 2: Longitud recursiva
+## Why TCO matters in a payments context
+
+A bank transaction export can have millions of rows. A function that processes
+each transaction naively — building up a stack frame per transaction — will exhaust
+the process stack before finishing.
+
+The BEAM VM provides a guarantee: **a tail call never grows the stack**. The current
+frame is reused. This is not an optimization; it is a language contract. Erlang and
+Elixir GenServers are implemented as infinite recursive loops that never blow the
+stack precisely because of this guarantee.
+
+The key distinction:
 
 ```elixir
-defmodule MyList do
-  # Base case: lista vacía tiene longitud 0
-  def my_length([]), do: 0
+# NOT a tail call — the + happens AFTER the recursive call returns
+def sum([h | t]), do: h + sum(t)
+#                         ^^^^^^ this result is needed to compute + h
+# Stack grows: sum([1,2,3]) needs sum([2,3]) needs sum([3]) needs sum([])
 
-  # Recursive case: 1 (por el head) + longitud del tail
-  def my_length([_ | tail]) do
-    1 + my_length(tail)
-  end
-end
-
-MyList.my_length([])           # 0
-MyList.my_length([1])          # 1
-MyList.my_length([1, 2, 3])    # 3
-MyList.my_length([:a, :b, :c, :d, :e])  # 5
-
-# Verificar contra la función estándar
-length([1, 2, 3]) == MyList.my_length([1, 2, 3])  # true
+# Tail call — recursive call IS the last operation
+def sum([h | t], acc), do: sum(t, h + acc)
+#                          ^^^^^^^^^^^^^^^ this IS the last thing that happens
+# Stack stays flat: each call replaces the current frame
 ```
 
-**Expected output:**
-
-```
-iex> MyList.my_length([])
-0
-iex> MyList.my_length([1, 2, 3])
-3
-iex> MyList.my_length([:a, :b, :c, :d, :e])
-5
-iex> length([1, 2, 3]) == MyList.my_length([1, 2, 3])
-true
-```
+The accumulator pattern converts a naive recursive function to a tail-recursive one
+by moving the "work in progress" into an argument.
 
 ---
 
-### Exercise 3: Factorial naive (NO tail-call)
+## The business problem
 
-```elixir
-defmodule NaiveMath do
-  # Base case
-  def factorial(0), do: 1
+Extend the `Ledger` module with report-building functions that must handle large
+transaction lists without stack overflow:
 
-  # Recursive case: n * factorial(n-1)
-  # NOT tail call: la multiplicación ocurre DESPUÉS de que factorial retorna
-  def factorial(n) when n > 0 do
-    n * factorial(n - 1)
-  end
-end
-
-NaiveMath.factorial(0)    # 1
-NaiveMath.factorial(1)    # 1
-NaiveMath.factorial(5)    # 120
-NaiveMath.factorial(10)   # 3628800
-
-# Con N muy grande eventualmente causaría stack overflow
-# (Para factorials, el número crece tan rápido que el problema de precisión llega antes)
-```
-
-**Expected output:**
-
-```
-iex> NaiveMath.factorial(0)
-1
-iex> NaiveMath.factorial(1)
-1
-iex> NaiveMath.factorial(5)
-120
-iex> NaiveMath.factorial(10)
-3628800
-```
-
-**Por qué NO es tail call:**
-```
-factorial(3)
-= 3 * factorial(2)     <- espera que factorial(2) retorne para multiplicar
-    = 2 * factorial(1) <- espera que factorial(1) retorne para multiplicar
-        = 1 * factorial(0) <- espera que factorial(0) retorne
-            = 1
-```
+1. Count transactions by status (tail-recursive counter)
+2. Find all transactions above an amount threshold (tail-recursive filter)
+3. Compute a CSV report string from a transaction list (tail-recursive string builder)
+4. Verify that both naive and TCO versions produce identical results
 
 ---
 
-### Exercise 4: Factorial con TCO — patrón acumulador
+## Implementation
+
+### Extend `lib/payments_cli/ledger.ex`
+
+Add these functions to the existing `Ledger` module:
 
 ```elixir
-defmodule TCOMath do
-  # Interfaz pública limpia — el acumulador es un detalle de implementación
-  def factorial(n), do: factorial(n, 1)
+# Add to PaymentsCli.Ledger
 
-  # Base case: cuando n llega a 0, el acumulador tiene el resultado
-  defp factorial(0, acc), do: acc
+@doc """
+Counts the number of transactions matching the given status.
 
-  # Tail call: la ÚLTIMA operación es la llamada recursiva — no hay nada después
-  defp factorial(n, acc) when n > 0 do
-    factorial(n - 1, n * acc)
-  end
+Implemented with TCO — safe for arbitrarily long transaction lists.
+
+## Examples
+
+    iex> txs = [%{status: :approved}, %{status: :declined}, %{status: :approved}]
+    iex> PaymentsCli.Ledger.count_by_status(txs, :approved)
+    2
+
+"""
+@spec count_by_status([map()], atom()) :: non_neg_integer()
+def count_by_status(transactions, status) when is_list(transactions) and is_atom(status) do
+  count_by_status(transactions, status, 0)
 end
 
-TCOMath.factorial(0)    # 1
-TCOMath.factorial(5)    # 120
-TCOMath.factorial(10)   # 3628800
-TCOMath.factorial(20)   # 2432902008176640000
+# TODO: implement the private tail-recursive helper
+#
+# defp count_by_status([], _status, acc), do: acc
+# defp count_by_status([%{status: s} | rest], status, acc) when s == status do
+#   count_by_status(rest, status, acc + 1)
+# end
+# defp count_by_status([_ | rest], status, acc) do
+#   count_by_status(rest, status, acc)
+# end
+#
+# The third clause (catch-all) handles transactions whose status does not match.
+# Pattern matching in the head, not in the body — this is the Elixir way.
+
+@doc """
+Returns all transactions where amount_cents exceeds the threshold.
+
+Tail-recursive. Preserves order of the original list.
+
+## Examples
+
+    iex> txs = [%{id: "A", amount_cents: 100}, %{id: "B", amount_cents: 500}, %{id: "C", amount_cents: 50}]
+    iex> PaymentsCli.Ledger.above_threshold(txs, 200)
+    [%{id: "B", amount_cents: 500}]
+
+"""
+@spec above_threshold([map()], integer()) :: [map()]
+def above_threshold(transactions, threshold_cents)
+    when is_list(transactions) and is_integer(threshold_cents) do
+  # TODO: implement using private tail-recursive helper with accumulator
+  #
+  # Public API calls the private helper with acc = []
+  # Private helper:
+  #   - base case: [], acc -> Enum.reverse(acc)  <- reverse because we prepend
+  #   - recursive case with match: amount > threshold -> prepend to acc
+  #   - recursive case without match: skip, continue
+  #
+  # Why Enum.reverse at the end?
+  # Prepending is O(1). Each step we do [tx | acc].
+  # The accumulator ends up in reverse order. One O(n) reverse at the end
+  # is cheaper than O(n) append at each step (which would be O(n²) total).
+end
+
+@doc """
+Builds a CSV report string from a list of transactions.
+
+Format: one line per transaction, comma-separated, with header row.
+"id,amount_cents,currency,status\n" + one line per transaction.
+
+Tail-recursive — builds the line list with prepend, then joins at the end.
+
+## Examples
+
+    iex> txs = [%{id: "T1", amount_cents: 1000, currency: "USD", status: :approved}]
+    iex> report = PaymentsCli.Ledger.to_csv(txs)
+    iex> String.starts_with?(report, "id,amount_cents,currency,status")
+    true
+    iex> String.contains?(report, "T1,1000,USD,approved")
+    true
+
+"""
+@spec to_csv([map()]) :: String.t()
+def to_csv(transactions) when is_list(transactions) do
+  header = "id,amount_cents,currency,status"
+  lines = build_csv_lines(transactions, [])
+  # lines are in reverse order — reverse once here
+  all_lines = [header | Enum.reverse(lines)]
+  Enum.join(all_lines, "\n")
+end
+
+# TODO: implement build_csv_lines/2
+#
+# defp build_csv_lines([], acc), do: acc
+# defp build_csv_lines([tx | rest], acc) do
+#   line = "#{tx.id},#{tx.amount_cents},#{tx.currency},#{tx.status}"
+#   build_csv_lines(rest, [line | acc])
+# end
+#
+# Design note: this is a tail call. `build_csv_lines(rest, [line | acc])` is
+# the LAST thing that happens. The VM reuses the current stack frame.
 ```
 
-**Expected output:**
-
-```
-iex> TCOMath.factorial(0)
-1
-iex> TCOMath.factorial(5)
-120
-iex> TCOMath.factorial(10)
-3628800
-iex> TCOMath.factorial(20)
-2432902008176640000
-```
-
-**Traza con acumulador — sin crecimiento de pila:**
-```
-factorial(3, 1)    -- acc = 1
-factorial(2, 3)    -- acc = 1 * 3 = 3
-factorial(1, 6)    -- acc = 3 * 2 = 6
-factorial(0, 6)    -- base case: retorna 6
-```
-
----
-
-### Exercise 5: Suma con TCO — patrón acumulador
+### Given tests — must pass without modification
 
 ```elixir
-defmodule TCOList do
-  # Interfaz pública con default arg — acc es invisible para el usuario
-  def sum(list, acc \\ 0)
+# test/payments_cli/ledger_recursion_test.exs
+defmodule PaymentsCli.LedgerRecursionTest do
+  use ExUnit.Case, async: true
 
-  # Base case: lista vacía — retornar el acumulador
-  def sum([], acc), do: acc
+  alias PaymentsCli.Ledger
 
-  # Tail call: mover head al acumulador, continuar con tail
-  # La última operación es sum/2 — TCO aplica
-  def sum([head | tail], acc), do: sum(tail, head + acc)
-end
+  # Generate a large list to verify TCO (no stack overflow)
+  @large_count 100_000
+  @large_txs Enum.map(1..@large_count, fn i ->
+    status = if rem(i, 3) == 0, do: :declined, else: :approved
+    %{id: "T#{i}", amount_cents: i * 10, currency: "USD", status: status}
+  end)
 
-TCOList.sum([])              # 0
-TCOList.sum([1, 2, 3])       # 6
-TCOList.sum(Enum.to_list(1..1_000_000))  # 500000500000 — sin stack overflow
-```
+  describe "count_by_status/2" do
+    test "counts approved transactions" do
+      txs = [
+        %{status: :approved},
+        %{status: :declined},
+        %{status: :approved},
+        %{status: :flagged}
+      ]
+      assert Ledger.count_by_status(txs, :approved) == 2
+    end
 
-**Expected output:**
+    test "returns 0 when no match" do
+      assert Ledger.count_by_status([%{status: :approved}], :declined) == 0
+    end
 
-```
-iex> TCOList.sum([])
-0
-iex> TCOList.sum([1, 2, 3])
-6
-iex> TCOList.sum(Enum.to_list(1..100))
-5050
-iex> TCOList.sum(Enum.to_list(1..1_000_000))
-500000500000
-```
+    test "handles empty list" do
+      assert Ledger.count_by_status([], :approved) == 0
+    end
 
-**Diferencia clave:**
-```
-# Naive: crece la pila
-sum([1,2,3]) = 1 + (2 + (3 + 0))  <- 4 frames en pila
-
-# TCO: la pila no crece
-sum([1,2,3], 0)
--> sum([2,3], 1)    <- reusa el frame
--> sum([3], 3)      <- reusa el frame
--> sum([], 6)       <- reusa el frame
--> 6
-```
-
----
-
-### Exercise 6: Map recursivo — construir lista con prepend + reverse
-
-```elixir
-defmodule MyEnum do
-  # Base case: lista vacía — retorna lista vacía
-  def my_map([], _func), do: []
-
-  # Recursive case: aplicar func al head, prepend al resultado de la cola
-  def my_map([head | tail], func) do
-    [func.(head) | my_map(tail, func)]
+    test "handles 100k transactions without stack overflow" do
+      # If not tail-recursive, this crashes with stack overflow
+      result = Ledger.count_by_status(@large_txs, :approved)
+      # 2/3 of 100k are approved (those not divisible by 3)
+      assert result > 0
+      assert result < @large_count
+    end
   end
 
-  # Versión con TCO — patrón acumulador + reverse al final
-  def my_map_tco(list, func), do: my_map_tco(list, func, [])
+  describe "above_threshold/2" do
+    test "filters by threshold" do
+      txs = [
+        %{id: "A", amount_cents: 100},
+        %{id: "B", amount_cents: 500},
+        %{id: "C", amount_cents: 50}
+      ]
+      result = Ledger.above_threshold(txs, 200)
+      assert length(result) == 1
+      assert hd(result).id == "B"
+    end
 
-  defp my_map_tco([], _func, acc), do: Enum.reverse(acc)
-  defp my_map_tco([head | tail], func, acc) do
-    my_map_tco(tail, func, [func.(head) | acc])
+    test "preserves original order" do
+      txs = [
+        %{id: "Z", amount_cents: 1000},
+        %{id: "A", amount_cents: 900}
+      ]
+      [first, second] = Ledger.above_threshold(txs, 500)
+      assert first.id == "Z"
+      assert second.id == "A"
+    end
+
+    test "returns empty for all below threshold" do
+      txs = [%{id: "X", amount_cents: 10}]
+      assert Ledger.above_threshold(txs, 100) == []
+    end
+
+    test "handles 100k transactions without stack overflow" do
+      result = Ledger.above_threshold(@large_txs, 500_000)
+      assert is_list(result)
+    end
   end
-end
 
-MyEnum.my_map([1, 2, 3], fn x -> x * 2 end)
-# [2, 4, 6]
+  describe "to_csv/1" do
+    test "includes header row" do
+      result = Ledger.to_csv([])
+      assert String.starts_with?(result, "id,amount_cents,currency,status")
+    end
 
-MyEnum.my_map(["hello", "world"], &String.upcase/1)
-# ["HELLO", "WORLD"]
+    test "includes transaction data" do
+      txs = [%{id: "T1", amount_cents: 1000, currency: "USD", status: :approved}]
+      result = Ledger.to_csv(txs)
+      assert String.contains?(result, "T1,1000,USD,approved")
+    end
 
-MyEnum.my_map_tco([1, 2, 3], fn x -> x * x end)
-# [1, 4, 9]
-
-# Verificar que el resultado es el mismo que Enum.map
-Enum.map([1, 2, 3], fn x -> x * 2 end) == MyEnum.my_map([1, 2, 3], fn x -> x * 2 end)
-# true
-```
-
-**Expected output:**
-
-```
-iex> MyEnum.my_map([1, 2, 3], fn x -> x * 2 end)
-[2, 4, 6]
-iex> MyEnum.my_map(["hello", "world"], &String.upcase/1)
-["HELLO", "WORLD"]
-iex> MyEnum.my_map_tco([1, 2, 3], fn x -> x * x end)
-[1, 4, 9]
-iex> Enum.map([1, 2, 3], fn x -> x * 2 end) == MyEnum.my_map([1, 2, 3], fn x -> x * 2 end)
-true
-```
-
-**Por qué prepend + reverse y no append:**
-```
-# Append en cada paso: O(n²) — muy lento
-acc ++ [new_elem]  # recorre acc completo en cada iteración
-
-# Prepend + reverse al final: O(n) — eficiente
-[new_elem | acc]   # O(1) cada vez
-Enum.reverse(acc)  # O(n) una sola vez al final
-```
-
-## Common Mistakes
-
-### Error 1: Recursión sin base case — bucle infinito
-
-```elixir
-# WRONG: sin base case, recurre para siempre hasta crash
-defmodule BadRecursion do
-  def count(n) do
-    count(n - 1)  # nunca termina
-  end
-end
-
-# FIX: siempre definir el base case primero
-defmodule GoodRecursion do
-  def count(0), do: 0  # base case
-  def count(n) when n > 0, do: 1 + count(n - 1)
-end
-```
-
-### Error 2: El acumulador no es el último argumento — TCO no aplica
-
-```elixir
-# WRONG: la llamada recursiva NO es la última operación
-# n * factorial(n-1, acc) calcula factorial primero y luego multiplica
-defmodule WrongTCO do
-  def factorial(0, acc), do: acc
-  def factorial(n, acc), do: n * factorial(n - 1, acc)  # NO es tail call
-  #                          ^^^
-  #                  multiplicación ocurre DESPUÉS — no es la última op
-end
-
-# FIX: mover el cálculo AL argumento, no al retorno
-defmodule CorrectTCO do
-  def factorial(0, acc), do: acc
-  def factorial(n, acc), do: factorial(n - 1, n * acc)  # sí es tail call
-  #                          ^^^^^^^^^^^^^^^^^^^^^^^^^^
-  #                   factorial es LA ÚLTIMA operación
-end
-```
-
-### Error 3: Construir lista con ++ en recursión — O(n²)
-
-```elixir
-# WRONG: acc ++ [transformed] es O(n) en cada iteración -> O(n²) total
-defmodule SlowMap do
-  def my_map([], _func, acc), do: acc
-  def my_map([h | t], func, acc) do
-    my_map(t, func, acc ++ [func.(h)])  # O(n²) total
-  end
-end
-
-# FIX: prepend O(1) + reverse al final O(n) = O(n) total
-defmodule FastMap do
-  def my_map(list, func), do: my_map(list, func, [])
-  defp my_map([], _func, acc), do: Enum.reverse(acc)
-  defp my_map([h | t], func, acc) do
-    my_map(t, func, [func.(h) | acc])  # O(1)
+    test "handles 100k transactions without stack overflow" do
+      result = Ledger.to_csv(@large_txs)
+      line_count = result |> String.split("\n") |> length()
+      # header + 100k lines
+      assert line_count == @large_count + 1
+    end
   end
 end
 ```
 
-### Error 4: Reinventar Enum innecesariamente en código de producción
-
-```elixir
-# WRONG en producción: reimplementar lo que Enum ya hace
-defmodule MyApp do
-  def process(list) do
-    my_map(list, fn x -> x * 2 end)  # implementación propia
-  end
-end
-
-# FIX: usar Enum para código de producción — más legible, más optimizado
-defmodule MyApp do
-  def process(list) do
-    Enum.map(list, fn x -> x * 2 end)
-  end
-end
-
-# La recursión manual es valiosa para:
-# 1. Aprender el mecanismo
-# 2. Lógica que no encaja en Enum.map/filter/reduce
-# 3. Estructuras de datos propias (árboles, grafos)
-```
-
-## Verification
+### Run the tests
 
 ```bash
-# Crear archivo de verificación
-cat > /tmp/test_recursion.exs << 'EOF'
-defmodule Verify do
-  # Suma naive
-  def sum([]), do: 0
-  def sum([h | t]), do: h + sum(t)
-
-  # Suma TCO
-  def sum_tco(list, acc \\ 0)
-  def sum_tco([], acc), do: acc
-  def sum_tco([h | t], acc), do: sum_tco(t, h + acc)
-
-  # Factorial TCO
-  def factorial(n), do: factorial(n, 1)
-  defp factorial(0, acc), do: acc
-  defp factorial(n, acc) when n > 0, do: factorial(n - 1, n * acc)
-
-  # Map recursivo
-  def my_map([], _f), do: []
-  def my_map([h | t], f), do: [f.(h) | my_map(t, f)]
-end
-
-IO.puts "sum([1..5]): #{Verify.sum([1, 2, 3, 4, 5])}"
-IO.puts "sum_tco([1..5]): #{Verify.sum_tco([1, 2, 3, 4, 5])}"
-IO.puts "factorial(10): #{Verify.factorial(10)}"
-IO.puts "my_map x*2: #{inspect(Verify.my_map([1, 2, 3], fn x -> x * 2 end))}"
-
-# TCO con lista grande — no causa stack overflow
-big_sum = Verify.sum_tco(Enum.to_list(1..100_000))
-IO.puts "sum(1..100_000): #{big_sum}"
-EOF
-
-elixir /tmp/test_recursion.exs
+mix test test/payments_cli/ledger_recursion_test.exs --trace
 ```
 
-**Expected output:**
+The 100k transaction tests will fail if your implementation is not tail-recursive —
+they exist specifically to surface stack overflow.
 
-```
-sum([1..5]): 15
-sum_tco([1..5]): 15
-factorial(10): 3628800
-my_map x*2: [2, 4, 6]
-sum(1..100_000): 5000050000
-```
+---
 
-## Summary
+## Trade-off analysis
 
-- Toda función recursiva necesita **base case** (termina la recursión) y **recursive case** (avanza hacia el base case)
-- La recursión **naive** crea un frame de pila por llamada — con listas grandes causa stack overflow
-- **Tail Call Optimization (TCO)**: si la llamada recursiva es la **última operación**, la BEAM reutiliza el frame — sin límite de profundidad
-- El **patrón acumulador** convierte recursión naive en TCO: mueve el cálculo al argumento en lugar de al retorno
-- Para construir listas con TCO: **prepend `[x | acc]`** + **`Enum.reverse/1` al final** — O(n) total
-- En código de producción, prefer `Enum.map/filter/reduce` sobre recursión manual — la recursión es para aprender el mecanismo y para casos que Enum no cubre
+| Aspect | Tail-recursive with accumulator | Naive recursion | `Enum.reduce/3` |
+|--------|--------------------------------|-----------------|-----------------|
+| Stack usage | O(1) — constant | O(n) — grows with list | O(1) — implemented with TCO internally |
+| Max list size | Unlimited | ~10k-100k depending on frame size | Unlimited |
+| Code clarity | Requires accumulator pattern knowledge | Reads like math | Most readable |
+| When to use | When Enum doesn't fit the logic | Learning, or guaranteed small lists | Production code |
+| Performance | Comparable to Enum | Comparable for small n | Preferred |
 
-## What's Next
+Reflection question: `to_csv/1` builds lines with prepend + reverse. If the CSV
+report is later streamed to a file instead of held in memory, how would the
+implementation change? Think about `Stream.map/2` and `IO.stream/2`.
 
-- **Módulos y estructuras avanzadas**: `defstruct` para tipos de datos propios
-- **Procesos y concurrencia**: la recursión infinita con TCO es la base de los GenServers
+---
+
+## Common production mistakes
+
+**1. Naive recursion on user-provided data**
+A bank file with 1M transactions crashes a naive recursive sum. The call stack
+default is ~10,000 frames on most BEAM configurations. Use TCO or `Enum` for
+anything that processes external data.
+
+**2. Accumulator in wrong argument position**
+The tail call must be the **last** operation. `n * factorial(n-1, acc)` is NOT a
+tail call — the multiplication happens after the recursive call returns. The tail
+call form is `factorial(n-1, n * acc)` — the multiplication is in the argument,
+not in the return expression.
+
+**3. Forgetting `Enum.reverse/1` after prepend-accumulation**
+The accumulator reverses the order because `[new_item | acc]` prepends. Without
+`Enum.reverse/1` at the end, your results are backwards. This produces subtle
+bugs in ordered reports that are hard to catch without a large test dataset.
+
+**4. Using `++` in the accumulator**
+`acc ++ [new_item]` in every recursive step is O(n²). Use `[new_item | acc]` then
+reverse once. With 100k transactions, the difference is milliseconds vs minutes.
+
+**5. Reinventing `Enum` in production code**
+The exercises build recursive functions to teach the mechanism. In production, use
+`Enum.count/2`, `Enum.filter/2`, `Enum.map_join/3` — they are correct, optimized,
+and readable. Write manual recursion only when the logic genuinely does not fit
+the Enum API (tree traversal, state machines, non-linear accumulation).
+
+---
 
 ## Resources
 
-- [Elixir Getting Started — Recursion](https://elixir-lang.org/getting-started/recursion.html)
-- [Elixir School — Recursion](https://elixirschool.com/en/lessons/basics/functions#recursion-6)
+- [Recursion — Elixir Getting Started](https://elixir-lang.org/getting-started/recursion.html)
 - [Erlang Efficiency Guide — Tail Recursion](https://www.erlang.org/doc/efficiency_guide/eff_guide.html)
-- [Elixir Docs — Enum](https://hexdocs.pm/elixir/Enum.html)
+- [Enum — HexDocs](https://hexdocs.pm/elixir/Enum.html)
+- [Elixir in Action — Saša Jurić — Chapter 3 (recursion and loops)](https://www.manning.com/books/elixir-in-action-third-edition)

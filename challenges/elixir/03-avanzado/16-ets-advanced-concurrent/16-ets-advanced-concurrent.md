@@ -1,597 +1,491 @@
-# 16 — ETS Avanzado: Concurrencia
+# ETS Advanced: Concurrency Patterns
 
-## Prerequisites
-
-- ETS básico: `new/2`, `insert/2`, `lookup/2`, `delete/2`
-- GenServer intermedio con estado propio
-- Comprensión de procesos y schedulers en la BEAM
-- Benchmarking básico con `:timer.tc/1`
+**Project**: `api_gateway` — built incrementally across the advanced level
 
 ---
 
-## Learning Objectives
+## Project context
 
-Al completar este ejercicio serás capaz de:
+You're building `api_gateway`. The rate limiter (previous exercise) uses a basic ETS
+`:bag` table. Now you need to push further: the gateway must track per-route request
+statistics under heavy concurrent load, and the ops team wants real-time range queries
+on request timestamps without full table scans.
 
-1. Configurar ETS para workloads de alta concurrencia con `:read_concurrency` y `:write_concurrency`
-2. Usar `decentralized_counters` para eliminar contención en contadores
-3. Realizar range queries eficientes con tablas `:ordered_set`
-4. Escribir match specs con `:ets.fun2ms` sin escribirlas a mano
-5. Elegir cuándo ETS supera a GenServer como almacén de estado
-6. Implementar un rate limiter distribuido sin cuello de botella central
+Project structure at this point:
 
----
-
-## Concepts
-
-### 1. Opciones de concurrencia en ETS
-
-Por defecto, ETS protege el acceso concurrente con un lock global por tabla. En aplicaciones de alta carga, esto crea contención. Las dos banderas clave son:
-
-```elixir
-:ets.new(:my_cache, [
-  :set,
-  :public,
-  {:read_concurrency, true},
-  {:write_concurrency, true}
-])
+```
+api_gateway/
+├── lib/
+│   └── api_gateway/
+│       ├── application.ex
+│       ├── router.ex
+│       ├── rate_limiter/
+│       │   └── server.ex
+│       └── metrics/
+│           ├── counter.ex     # ← you implement this
+│           └── event_log.ex   # ← and this
+├── test/
+│   └── api_gateway/
+│       └── metrics/
+│           ├── counter_test.exs
+│           └── event_log_test.exs
+├── bench/
+│   └── metrics_bench.exs
+└── mix.exs
 ```
 
-**`:read_concurrency true`**: usa read-write locks en lugar de locks exclusivos. Múltiples lecturas concurrentes no se bloquean entre sí. Eficaz cuando las lecturas superan ampliamente a las escrituras (ratio > 10:1).
+---
 
-**`:write_concurrency true`**: divide la tabla internamente en segmentos (shards). Escrituras a claves distintas pueden ocurrir en paralelo si caen en segmentos diferentes. Añade overhead fijo de memoria y es contraproducente si hay muchas operaciones de tabla completa (`tab2list/1`, `first/1`, `next/2`).
+## The business problem
 
-**Cuándo usar cada bandera:**
+Two separate requirements arrived this sprint:
 
-| Escenario | Configuración recomendada |
-|-----------|--------------------------|
-| Cache con muchas lecturas | `read_concurrency: true` |
-| Contador distribuido | `write_concurrency: true` + `decentralized_counters: true` |
-| Mix equilibrado | ambas `true` |
-| Iteración frecuente de tabla completa | ninguna (overhead no vale la pena) |
+1. **Per-route counters**: the dashboard polls every 5 seconds for `{route, requests, errors, bytes}`.
+   With 50k req/s across 200 routes and 8 dashboard pollers, the naive GenServer approach
+   (one process serializing all counter updates) saturates its mailbox within minutes.
 
-### 2. `decentralized_counters`
+2. **Event log with time range queries**: the security team needs to query "all requests to
+   `/api/payments` between T1 and T2" without loading the entire log into memory.
 
-Disponible desde OTP 23. Elimina la contención en contadores al mantener copias por scheduler:
+---
+
+## Why `:write_concurrency` and `:read_concurrency` are not the same flag
+
+`:read_concurrency true` replaces the default exclusive lock with a read-write lock.
+Multiple concurrent readers proceed in parallel. It helps when reads dominate writes
+by a ratio of at least 10:1. It **adds overhead** when reads and writes are balanced,
+because RW lock acquisition is more expensive than an exclusive lock.
+
+`:write_concurrency true` shards the table internally. Writes to different keys can
+proceed in parallel if they land on different shards. It degrades for operations that
+touch many keys at once (`tab2list`, `first/next` iteration) because those must acquire
+all shards.
+
+`decentralized_counters: true` (OTP 23+) takes sharding further for numeric counters:
+each scheduler maintains its own copy. Reads must sum all scheduler-local copies, making
+reads O(schedulers). Use only when writes dramatically outnumber reads.
+
+The right combination for the gateway counters:
 
 ```elixir
-:ets.new(:counters, [
+:ets.new(:route_metrics, [
   :set,
   :public,
+  :named_table,
   {:write_concurrency, true},
-  {:decentralized_counters, true}
+  {:decentralized_counters, true}   # 50k writes/s, 5s poll = writes >> reads
 ])
-
-# update_counter es atómico y sin lock global
-:ets.update_counter(:counters, :requests, {2, 1}, {:requests, 0})
 ```
 
-El trade-off: leer el valor total requiere sumar los parciales de cada scheduler, lo que hace que las lecturas sean más costosas. Ideal para casos donde escribes mucho y lees poco (métricas, contadores de rate limiting).
+---
 
-### 3. `:ordered_set` para range queries
+## Why `:ordered_set` for time-range queries
 
-La estructura `:set` usa un hash table — O(1) para lookup exacto pero sin orden. `:ordered_set` usa un árbol AVL — O(log n) para lookup pero permite iterar en orden y hacer range queries:
+`:set` uses a hash table — O(1) lookup but no ordering. To query events between T1 and T2
+on a `:set`, you must read every record and filter. That is O(n) and copies the entire table.
+
+`:ordered_set` uses an AVL tree — O(log n) lookup and guaranteed key ordering. Range queries
+use `:ets.select/2` with guards on the key field: the tree traversal starts at T1 and stops
+at T2. No full scan, no copy.
+
+The cost: 30–40% more memory per entry and O(log n) for individual lookups vs O(1).
+Use `:ordered_set` only when your access patterns are temporal or require ordered iteration.
+
+---
+
+## Implementation
+
+### Step 1: `lib/api_gateway/metrics/counter.ex`
 
 ```elixir
-:ets.new(:events, [:ordered_set, :public, :named_table])
+defmodule ApiGateway.Metrics.Counter do
+  @moduledoc """
+  Per-route request counters backed by ETS with decentralized_counters.
 
-# Insertar eventos con timestamp como clave
-:ets.insert(:events, {1_700_000_001, :login, "user_1"})
-:ets.insert(:events, {1_700_000_002, :purchase, "user_2"})
-:ets.insert(:events, {1_700_000_005, :logout, "user_1"})
+  Record layout: {route, requests, errors, bytes}
+                    ^1      ^2        ^3     ^4
+  Position indices are 1-based and matter for update_counter/4.
+  """
 
-# Range query: eventos entre t1 y t2
-defmodule EventLog do
-  def range(table, from, to) do
-    match_spec = [
-      {{:"$1", :"$2", :"$3"},
-       [{:>=, :"$1", from}, {:"=<", :"$1", to}],
-       [{{:"$1", :"$2", :"$3"}}]}
-    ]
-    :ets.select(table, match_spec)
+  use GenServer
+
+  @table :route_metrics
+
+  # ---------------------------------------------------------------------------
+  # Public API — reads go directly to ETS, never through the GenServer
+  # ---------------------------------------------------------------------------
+
+  @doc """
+  Records a completed request. Fire-and-forget via :ets.update_counter.
+  Thread-safe: multiple processes can call this concurrently.
+  """
+  @spec record(String.t(), non_neg_integer(), 200..599) :: :ok
+  def record(route, bytes, status_code) do
+    error_inc = if status_code >= 400, do: 1, else: 0
+    # HINT: :ets.update_counter/4 with a list of {position, increment} tuples
+    # HINT: fourth arg is the default record if key doesn't exist: {route, 0, 0, 0}
+    # HINT: positions: requests=2, errors=3, bytes=4
+    # TODO: implement — this must NOT go through the GenServer
+    :ok
+  end
+
+  @doc """
+  Returns current stats for a route.
+  Direct ETS read — no GenServer call.
+  """
+  @spec get(String.t()) :: %{requests: integer(), errors: integer(), bytes: integer()}
+  def get(route) do
+    # HINT: :ets.lookup(@table, route) returns [{route, req, err, bytes}] or []
+    # TODO: implement
+  end
+
+  @doc """
+  Returns stats for all routes.
+  """
+  @spec all() :: [%{route: String.t(), requests: integer(), errors: integer(), bytes: integer()}]
+  def all do
+    # HINT: :ets.tab2list(@table) |> Enum.map(...)
+    # TODO: implement
+  end
+
+  # ---------------------------------------------------------------------------
+  # GenServer — only responsible for table creation
+  # ---------------------------------------------------------------------------
+
+  def start_link(opts \\ []) do
+    GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+  end
+
+  @impl true
+  def init(_opts) do
+    :ets.new(@table, [
+      :set,
+      :public,
+      :named_table,
+      {:write_concurrency, true},
+      {:decentralized_counters, true}
+    ])
+
+    {:ok, %{}}
   end
 end
 ```
 
-### 4. Match specs y `:ets.fun2ms`
-
-Las match specs son poderosas pero su sintaxis manual es propensa a errores. `:ets.fun2ms/1` compila una función Elixir/Erlang a una match spec en tiempo de compilación:
+### Step 2: `lib/api_gateway/metrics/event_log.ex`
 
 ```elixir
-# Requiere importar :ets para que fun2ms funcione en Elixir
-import :ets, only: [fun2ms: 1]
+defmodule ApiGateway.Metrics.EventLog do
+  @moduledoc """
+  Append-only event log for gateway requests, backed by ETS :ordered_set.
+  Key: {timestamp_microsecond, unique_id} — ensures uniqueness without losing ordering.
 
-# Equivalente al match_spec del ejemplo anterior, pero legible:
-ms = :ets.fun2ms(fn {ts, type, user}
-  when ts >= 1_700_000_001 and ts =< 1_700_000_005 ->
-    {ts, type, user}
-end)
+  GenServer owns the table. Writes go through the GenServer to serialize inserts.
+  Reads use :ets.select directly — no GenServer bottleneck.
+  """
 
-:ets.select(:events, ms)
-```
-
-> **Nota**: `fun2ms` solo funciona en tiempo de compilación (se expande como macro). No puede usarse con funciones anónimas guardadas en variables en runtime.
-
-### 5. ETS como alternativa a GenServer para estado de alta concurrencia
-
-Un GenServer serializa todo el acceso a su estado — es un cuello de botella por diseño. Para estado que es ampliamente leído y raramente escrito, ETS con `read_concurrency: true` elimina ese cuello de botella:
-
-```elixir
-# Patrón: GenServer como propietario y escritor, ETS para lecturas
-defmodule ConfigStore do
   use GenServer
 
-  @table :config_store
+  @table :gateway_event_log
 
-  def start_link(_), do: GenServer.start_link(__MODULE__, [], name: __MODULE__)
+  # ---------------------------------------------------------------------------
+  # Public API
+  # ---------------------------------------------------------------------------
 
-  def init(_) do
-    :ets.new(@table, [:set, :public, :named_table, {:read_concurrency, true}])
+  @doc """
+  Appends a request event. Serialized through the GenServer.
+  """
+  @spec append(String.t(), 200..599, non_neg_integer()) :: {:ok, integer()}
+  def append(route, status_code, bytes) do
+    GenServer.call(__MODULE__, {:append, route, status_code, bytes})
+  end
+
+  @doc """
+  Returns all events in the time range [from_us, to_us] (microseconds).
+  Direct ETS select — no GenServer bottleneck.
+  """
+  @spec range(integer(), integer()) :: list()
+  def range(from_us, to_us) do
+    # HINT: build a match spec manually — fun2ms can't capture runtime variables
+    # Match spec pattern: {{:"$1", :"$2"}, :"$3", :"$4", :"$5"}
+    # Guard: [{:>=, :"$1", from_us}, {:"=<", :"$1", to_us}]
+    # Return: [{{:"$1", :"$2"}, :"$3", :"$4", :"$5"}]
+    # TODO: implement
+  end
+
+  @doc """
+  Returns events in [from_us, to_us] filtered by route.
+  Direct ETS select.
+  """
+  @spec range_by_route(integer(), integer(), String.t()) :: list()
+  def range_by_route(from_us, to_us, route) do
+    # HINT: same as range/2 but add {:==, :"$3", route} to the guard list
+    # TODO: implement
+  end
+
+  @doc """
+  Deletes events older than max_age_seconds.
+  Uses :ets.select_delete — operates directly in ETS, no memory copy.
+  """
+  @spec purge_older_than(pos_integer()) :: {:purged, non_neg_integer()}
+  def purge_older_than(max_age_seconds) do
+    GenServer.call(__MODULE__, {:purge, max_age_seconds})
+  end
+
+  def size, do: :ets.info(@table, :size)
+
+  # ---------------------------------------------------------------------------
+  # GenServer callbacks
+  # ---------------------------------------------------------------------------
+
+  def start_link(opts \\ []) do
+    GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+  end
+
+  @impl true
+  def init(_opts) do
+    :ets.new(@table, [:ordered_set, :protected, :named_table])
     {:ok, %{}}
   end
 
-  # Las lecturas van directamente a ETS — no pasan por el proceso
-  def get(key), do: :ets.lookup(@table, key) |> case do
-    [{^key, value}] -> {:ok, value}
-    [] -> :error
-  end
-
-  # Solo las escrituras pasan por el GenServer (serialización controlada)
-  def put(key, value), do: GenServer.call(__MODULE__, {:put, key, value})
-
-  def handle_call({:put, key, value}, _from, state) do
-    :ets.insert(@table, {key, value})
-    {:reply, :ok, state}
-  end
-end
-```
-
-Este patrón escala lecturas a N schedulers sin contención, mientras mantiene consistencia en escrituras.
-
-### 6. `:ets.select_count` y operaciones bulk
-
-Para operaciones de análisis sobre tablas grandes:
-
-```elixir
-# Contar elementos que cumplen condición sin materializarlos todos
-import :ets, only: [fun2ms: 1]
-
-ms = :ets.fun2ms(fn {_ts, :error, _user} -> true end)
-error_count = :ets.select_count(:events, ms)
-
-# select_delete: eliminar en batch con match spec
-expired_ms = :ets.fun2ms(fn {ts, _, _} when ts < 1_700_000_003 -> true end)
-:ets.select_delete(:events, expired_ms)
-```
-
----
-
-## Exercises
-
-### Exercise 1 — Benchmark GenServer vs ETS para lecturas concurrentes
-
-**Problem**
-
-Mide empíricamente la diferencia de throughput entre un GenServer tradicional y ETS con `read_concurrency` cuando N procesos hacen lecturas concurrentes. El objetivo no es el número absoluto sino entender cuándo el cambio vale la pena.
-
-Implementa:
-1. `SlowStore` — GenServer que guarda un mapa en estado y responde a `get/1` con `call`
-2. `FastStore` — ETS con `read_concurrency: true`, reads directas sin GenServer
-3. Una función `benchmark/2` que lanza N tareas concurrentes, cada una haciendo K lecturas, y reporta el tiempo total y throughput (ops/sec)
-
-**Hints**
-
-- Usa `Task.async_stream/3` con `max_concurrency: N` para simular carga concurrente
-- Precarga datos antes de medir (10-100 claves está bien)
-- Mide con `System.monotonic_time(:millisecond)` antes y después
-- Prueba con N = 1, 10, 50, 100 tareas concurrentes para ver la curva
-
-**One possible solution**
-
-```elixir
-defmodule SlowStore do
-  use GenServer
-
-  def start_link(_), do: GenServer.start_link(__MODULE__, %{}, name: __MODULE__)
-  def init(state), do: {:ok, state}
-
-  def load(data) when is_map(data), do: GenServer.call(__MODULE__, {:load, data})
-  def get(key), do: GenServer.call(__MODULE__, {:get, key})
-
-  def handle_call({:load, data}, _from, _state), do: {:reply, :ok, data}
-  def handle_call({:get, key}, _from, state), do: {:reply, Map.get(state, key), state}
-end
-
-defmodule FastStore do
-  @table :fast_store
-
-  def start do
-    :ets.new(@table, [:set, :public, :named_table, {:read_concurrency, true}])
-  end
-
-  def load(data) when is_map(data) do
-    Enum.each(data, fn {k, v} -> :ets.insert(@table, {k, v}) end)
-  end
-
-  def get(key) do
-    case :ets.lookup(@table, key) do
-      [{^key, value}] -> value
-      [] -> nil
-    end
-  end
-end
-
-defmodule ConcurrencyBenchmark do
-  @keys Enum.map(1..100, &"key_#{&1}")
-  @data Map.new(@keys, &{&1, :rand.uniform(1_000_000)})
-
-  def run do
-    {:ok, _} = SlowStore.start_link([])
-    SlowStore.load(@data)
-
-    FastStore.start()
-    FastStore.load(@data)
-
-    for concurrency <- [1, 10, 50, 100] do
-      slow = benchmark_slow(concurrency, 500)
-      fast = benchmark_fast(concurrency, 500)
-
-      IO.puts("""
-      Concurrency: #{concurrency} tasks × 500 reads
-        GenServer: #{slow.total_ms}ms  (#{slow.ops_per_sec} ops/sec)
-        ETS:       #{fast.total_ms}ms  (#{fast.ops_per_sec} ops/sec)
-        Speedup:   #{Float.round(slow.total_ms / max(fast.total_ms, 1), 1)}x
-      """)
-    end
-  end
-
-  defp benchmark_slow(concurrency, reads_per_task) do
-    t0 = System.monotonic_time(:millisecond)
-
-    1..concurrency
-    |> Task.async_stream(fn _ ->
-      for _ <- 1..reads_per_task do
-        SlowStore.get(Enum.random(@keys))
-      end
-    end, max_concurrency: concurrency, timeout: 30_000)
-    |> Stream.run()
-
-    t1 = System.monotonic_time(:millisecond)
-    total_ops = concurrency * reads_per_task
-    elapsed = t1 - t0
-
-    %{
-      total_ms: elapsed,
-      ops_per_sec: round(total_ops / max(elapsed, 1) * 1000)
-    }
-  end
-
-  defp benchmark_fast(concurrency, reads_per_task) do
-    t0 = System.monotonic_time(:millisecond)
-
-    1..concurrency
-    |> Task.async_stream(fn _ ->
-      for _ <- 1..reads_per_task do
-        FastStore.get(Enum.random(@keys))
-      end
-    end, max_concurrency: concurrency, timeout: 30_000)
-    |> Stream.run()
-
-    t1 = System.monotonic_time(:millisecond)
-    total_ops = concurrency * reads_per_task
-    elapsed = t1 - t0
-
-    %{
-      total_ms: elapsed,
-      ops_per_sec: round(total_ops / max(elapsed, 1) * 1000)
-    }
-  end
-end
-
-ConcurrencyBenchmark.run()
-```
-
-**Trade-off analysis**: El GenServer escala linealmente peor con más concurrencia porque serializa todas las llamadas. ETS con `read_concurrency` escala casi horizontalmente hasta el número de schedulers. El punto de inflexión suele estar entre 5-10 procesos concurrentes: por debajo, GenServer es suficientemente rápido; por encima, ETS gana de forma significativa.
-
----
-
-### Exercise 2 — Range query con `:ordered_set` y `fun2ms`
-
-**Problem**
-
-Implementa un log de eventos en memoria usando `:ordered_set` con timestamps como clave. El sistema debe:
-1. Aceptar inserciones con timestamp Unix (microsegundos)
-2. Soportar queries por rango de tiempo `[from, to]`
-3. Soportar filtrado por tipo de evento dentro del rango
-4. Implementar un TTL de purga: eliminar eventos anteriores a N segundos
-
-El reto está en escribir las match specs de forma legible usando `fun2ms`.
-
-**Hints**
-
-- La clave del tuple debe ser `{timestamp, id_unico}` para evitar colisiones (dos eventos pueden tener el mismo timestamp)
-- `fun2ms` debe usarse dentro de una función, no en el top-level del módulo
-- Para rangos, los guards `>=` y `=<` funcionan en match specs
-- `select_delete/2` es atómico y eficiente para TTL cleanup
-
-**One possible solution**
-
-```elixir
-defmodule EventLog do
-  @table :event_log
-
-  def new do
-    :ets.new(@table, [:ordered_set, :public, :named_table])
-  end
-
-  def insert(type, data) when is_atom(type) do
+  @impl true
+  def handle_call({:append, route, status_code, bytes}, _from, state) do
     ts = System.os_time(:microsecond)
-    # clave compuesta para unicidad sin sacrificar ordenación temporal
+    # unique_integer guarantees uniqueness when two events share the same microsecond
     id = :erlang.unique_integer([:monotonic, :positive])
-    :ets.insert(@table, {{ts, id}, type, data})
+    :ets.insert(@table, {{ts, id}, route, status_code, bytes})
+    {:reply, {:ok, ts}, state}
   end
 
-  # Trae todos los eventos en el rango [from_ts, to_ts] (microsegundos)
-  def range(from_ts, to_ts) do
-    ms = build_range_ms(from_ts, to_ts, :_)
-    :ets.select(@table, ms)
-  end
-
-  # Trae eventos en rango filtrados por tipo
-  def range_by_type(from_ts, to_ts, type) when is_atom(type) do
-    ms = build_range_ms(from_ts, to_ts, type)
-    :ets.select(@table, ms)
-  end
-
-  # Elimina eventos anteriores a `max_age_seconds` segundos
-  def purge_older_than(max_age_seconds) do
+  @impl true
+  def handle_call({:purge, max_age_seconds}, _from, state) do
     cutoff = System.os_time(:microsecond) - max_age_seconds * 1_000_000
-
-    ms = :ets.fun2ms(fn {{ts, _id}, _type, _data} when ts < cutoff -> true end)
+    # HINT: :ets.fun2ms can be used here because cutoff is known at call time
+    # but it's compile-time only. Build the match spec manually instead.
+    ms = [
+      {{{:"$1", :_}, :_, :_, :_}, [{:<, :"$1", cutoff}], [true]}
+    ]
     deleted = :ets.select_delete(@table, ms)
-    {:purged, deleted}
-  end
-
-  def count, do: :ets.info(@table, :size)
-
-  # fun2ms no puede recibir variables capturadas desde el exterior directamente,
-  # así que construimos el match spec manualmente para el rango variable
-  defp build_range_ms(from_ts, to_ts, :_) do
-    [
-      {
-        {{:"$1", :"$2"}, :"$3", :"$4"},
-        [{:>=, :"$1", from_ts}, {:"=<", :"$1", to_ts}],
-        [{{{{:"$1", :"$2"}}, :"$3", :"$4"}}]
-      }
-    ]
-  end
-
-  defp build_range_ms(from_ts, to_ts, type) do
-    [
-      {
-        {{:"$1", :"$2"}, :"$3", :"$4"},
-        [{:>=, :"$1", from_ts}, {:"=<", :"$1", to_ts}, {:"=:=", :"$3", type}],
-        [{{{{:"$1", :"$2"}}, :"$3", :"$4"}}]
-      }
-    ]
+    {:reply, {:purged, deleted}, state}
   end
 end
-
-# Demo
-EventLog.new()
-
-now = System.os_time(:microsecond)
-EventLog.insert(:login, %{user: "alice"})
-Process.sleep(1)
-EventLog.insert(:purchase, %{user: "alice", amount: 99.9})
-Process.sleep(1)
-EventLog.insert(:login, %{user: "bob"})
-Process.sleep(1)
-EventLog.insert(:error, %{code: 500, path: "/api/items"})
-Process.sleep(1)
-later = System.os_time(:microsecond)
-
-IO.inspect(EventLog.range(now, later), label: "all events in range")
-IO.inspect(EventLog.range_by_type(now, later, :login), label: "only :login events")
-
-{:purged, n} = EventLog.purge_older_than(0)
-IO.puts("Purged #{n} events (cutoff = now)")
-IO.puts("Remaining: #{EventLog.count()}")
 ```
 
-**Trade-off analysis**: `:ordered_set` cuesta ~30-40% más memoria que `:set` para las mismas entradas y el lookup exacto es O(log n) vs O(1). El beneficio es range queries sin full scan y ordenación garantizada sin sort posterior. Úsalo cuando tus access patterns sean temporales o requieran iteración en orden.
-
----
-
-### Exercise 3 — Rate limiter concurrente sin bottleneck
-
-**Problem**
-
-Implementa un rate limiter de ventana fija (fixed window) que permita N peticiones por proceso/cliente en W segundos. El reto es hacerlo sin un GenServer central que sea cuello de botella: el estado debe vivir en ETS y el cleanup debe ser lazy (no un proceso timer centralizado).
-
-Requisitos:
-1. `RateLimiter.check(client_id, limit, window_seconds)` — retorna `{:ok, remaining}` o `{:error, :rate_limited, retry_after_ms}`
-2. Thread-safe: múltiples procesos pueden llamar con el mismo `client_id` concurrentemente
-3. Sin GenServer, sin proceso supervisor: solo ETS + operaciones atómicas
-4. Cleanup lazy: entradas expiradas se eliminan cuando se accede a ellas
-
-**Hints**
-
-- La clave puede ser `{client_id, window_number}` donde `window_number = div(unix_seconds, window_seconds)`
-- `update_counter/4` con valor inicial es atómico y retorna el nuevo valor
-- El cleanup lazy es: si `window_number` de la entrada es anterior al actual, resetear
-- Para `retry_after_ms`: `(window_number + 1) * window_seconds * 1000 - unix_ms_now`
-
-**One possible solution**
+### Step 3: Given tests — must pass without modification
 
 ```elixir
-defmodule RateLimiter do
-  @table :rate_limiter
+# test/api_gateway/metrics/counter_test.exs
+defmodule ApiGateway.Metrics.CounterTest do
+  use ExUnit.Case, async: false
 
-  def start do
-    if :ets.whereis(@table) == :undefined do
-      :ets.new(@table, [
-        :set,
-        :public,
-        :named_table,
-        {:write_concurrency, true},
-        {:read_concurrency, true},
-        {:decentralized_counters, true}
-      ])
+  alias ApiGateway.Metrics.Counter
+
+  setup do
+    :ets.delete_all_objects(:route_metrics)
+    :ok
+  end
+
+  describe "record/3 and get/1" do
+    test "records requests for a route" do
+      Counter.record("/api/users", 512, 200)
+      Counter.record("/api/users", 256, 200)
+      Process.sleep(5)  # allow decentralized_counters to coalesce
+
+      stats = Counter.get("/api/users")
+      assert stats.requests == 2
+      assert stats.bytes == 768
+      assert stats.errors == 0
+    end
+
+    test "counts error responses separately" do
+      Counter.record("/api/payments", 100, 500)
+      Counter.record("/api/payments", 200, 200)
+      Process.sleep(5)
+
+      stats = Counter.get("/api/payments")
+      assert stats.requests == 2
+      assert stats.errors == 1
+    end
+
+    test "returns zero stats for unknown route" do
+      stats = Counter.get("/unknown")
+      assert stats.requests == 0
+      assert stats.errors == 0
+      assert stats.bytes == 0
     end
   end
 
-  @spec check(term(), pos_integer(), pos_integer()) ::
-    {:ok, non_neg_integer()} | {:error, :rate_limited, non_neg_integer()}
-  def check(client_id, limit, window_seconds) do
-    now_ms = System.os_time(:millisecond)
-    now_sec = div(now_ms, 1000)
-    window_number = div(now_sec, window_seconds)
-    key = {client_id, window_number}
+  describe "concurrent writes" do
+    test "100 concurrent writers produce correct totals" do
+      tasks =
+        for _ <- 1..100 do
+          Task.async(fn -> Counter.record("/api/concurrent", 100, 200) end)
+        end
 
-    count = :ets.update_counter(@table, key, {2, 1}, {key, 0})
+      Task.await_many(tasks, 5_000)
+      Process.sleep(20)
 
-    if count <= limit do
-      {:ok, limit - count}
-    else
-      # Calcula cuándo expira la ventana actual
-      next_window_start_ms = (window_number + 1) * window_seconds * 1000
-      retry_after_ms = next_window_start_ms - now_ms
-      {:error, :rate_limited, max(retry_after_ms, 0)}
+      stats = Counter.get("/api/concurrent")
+      assert stats.requests == 100
+      assert stats.bytes == 10_000
     end
-  end
-
-  # Cleanup de entradas viejas — llamar periódicamente o desde un proceso de mantenimiento
-  def cleanup(window_seconds) do
-    now_sec = div(System.os_time(:millisecond), 1000)
-    current_window = div(now_sec, window_seconds)
-
-    ms = :ets.fun2ms(fn {{_client, w}, _count} when w < current_window -> true end)
-    deleted = :ets.select_delete(@table, ms)
-    {:cleaned, deleted}
   end
 end
-
-# Demo de uso concurrente
-RateLimiter.start()
-
-limit = 5
-window = 10  # segundos
-
-results =
-  1..20
-  |> Task.async_stream(fn i ->
-    client = "user_#{rem(i, 3)}"  # 3 clientes distintos
-    result = RateLimiter.check(client, limit, window)
-    {client, i, result}
-  end, max_concurrency: 20)
-  |> Enum.map(fn {:ok, r} -> r end)
-
-Enum.each(results, fn {client, req, result} ->
-  case result do
-    {:ok, remaining} ->
-      IO.puts("#{client} req##{req}: ALLOWED (#{remaining} left)")
-    {:error, :rate_limited, retry_ms} ->
-      IO.puts("#{client} req##{req}: BLOCKED (retry in #{retry_ms}ms)")
-  end
-end)
 ```
 
-**Trade-off analysis**: Este diseño escala perfectamente horizontalmente porque no hay proceso central. La contención solo ocurre en la misma clave `{client_id, window}`, que es inherente al problema. `decentralized_counters` ayuda cuando hay muchos clientes distintos. La desventaja: el cleanup lazy puede acumular entradas viejas en workloads con muchos clientes únicos — se necesita un cleanup periódico para producción.
+```elixir
+# test/api_gateway/metrics/event_log_test.exs
+defmodule ApiGateway.Metrics.EventLogTest do
+  use ExUnit.Case, async: false
 
----
+  alias ApiGateway.Metrics.EventLog
 
-## Common Mistakes
+  setup do
+    EventLog.purge_older_than(0)
+    :ok
+  end
 
-**Usar `read_concurrency` con tablas donde iteras frecuentemente**
-`tab2list/1`, `first/1`, `last/1`, `next/2` adquieren un lock completo sobre la tabla independientemente de la configuración. Si tu workload implica iterar la tabla completa con frecuencia, `read_concurrency: true` no ayuda y añade overhead.
+  describe "append/3 and range/2" do
+    test "appended events appear in range queries" do
+      t_before = System.os_time(:microsecond)
+      {:ok, _} = EventLog.append("/api/users", 200, 512)
+      {:ok, _} = EventLog.append("/api/orders", 404, 128)
+      t_after = System.os_time(:microsecond)
 
-**Asumir que `write_concurrency` hace todas las escrituras sin lock**
-Operaciones como `delete_all_objects/1` o `delete/1` de una clave que afecta a múltiples objetos aún requieren coordinación. La concurrencia se aplica a nivel de segmento (shard), no por operación individual.
+      results = EventLog.range(t_before, t_after)
+      assert length(results) == 2
+    end
 
-**Usar `:ordered_set` donde no necesitas orden**
-El árbol AVL de `:ordered_set` tiene overhead constante vs el hash table de `:set`. Para lookups exactos sin range queries, `:set` siempre es más rápido.
+    test "events outside the range are excluded" do
+      t_before = System.os_time(:microsecond) - 10_000_000
+      t_cutoff = System.os_time(:microsecond) - 5_000_000
 
-**Escribir match specs a mano en lugar de usar `fun2ms`**
-Las match specs manuales son propensas a errores de arity en los guards (`:>=` vs `>=`, etc.). `fun2ms` es más seguro y el overhead de compilación es cero en runtime porque es una macro.
+      # Insert an old event via direct ETS (simulating a past event)
+      :ets.insert(:gateway_event_log, {{t_before, 99999}, "/old", 200, 0})
 
-**Olvidar que `fun2ms` no captura variables del scope externo**
-`fun2ms` expande en tiempo de compilación. No puede usar variables del scope de la función que la contiene. Cuando necesitas match specs dinámicas, debes construirlas manualmente como listas de tuples.
+      {:ok, _} = EventLog.append("/api/new", 200, 100)
 
-**Crear la tabla ETS dentro de un proceso efímero**
-El proceso propietario de una tabla ETS es quien la creó. Si ese proceso muere, la tabla se elimina (a menos que uses `:heir`). Siempre crea tablas en procesos supervisados y de vida larga (Application, GenServer permanente).
+      old_events = EventLog.range(t_before - 1, t_cutoff)
+      assert length(old_events) == 1
 
----
+      new_events = EventLog.range(t_cutoff + 1, System.os_time(:microsecond))
+      assert length(new_events) == 1
+    end
+  end
 
-## Verification
+  describe "range_by_route/3" do
+    test "filters events by route within the time range" do
+      t_before = System.os_time(:microsecond)
+      EventLog.append("/api/users", 200, 100)
+      EventLog.append("/api/orders", 200, 100)
+      EventLog.append("/api/users", 500, 100)
+      t_after = System.os_time(:microsecond)
 
-Ejecuta los ejercicios con:
+      results = EventLog.range_by_route(t_before, t_after, "/api/users")
+      assert length(results) == 2
+    end
+  end
+
+  describe "purge_older_than/1" do
+    test "removes old events and leaves recent ones" do
+      EventLog.append("/api/users", 200, 100)
+      {:purged, n} = EventLog.purge_older_than(0)
+      assert n >= 1
+    end
+  end
+end
+```
+
+### Step 4: Run the tests
 
 ```bash
-# Ejercicio 1: benchmark
-elixir 16-ets-advanced-concurrent.md  # o copiar el código en un .exs
-
-# Verificación manual del benchmark:
-# - Con concurrency=1, GenServer y ETS deben ser similares
-# - Con concurrency=50+, ETS debe ser 3-10x más rápido
-# - Si ambos son iguales, verificar que :read_concurrency está activado
+mix test test/api_gateway/metrics/ --trace
 ```
+
+### Step 5: Benchmark — GenServer vs ETS for concurrent reads
 
 ```elixir
-# Verificación del rate limiter
-RateLimiter.start()
+# bench/metrics_bench.exs
+alias ApiGateway.Metrics.Counter
 
-# Debe permitir exactamente 5 requests
-results = for _ <- 1..7, do: RateLimiter.check("test_user", 5, 60)
-allowed = Enum.count(results, &match?({:ok, _}, &1))
-blocked = Enum.count(results, &match?({:error, :rate_limited, _}, &1))
+# Pre-populate some routes
+for i <- 1..50 do
+  Counter.record("/api/route_#{i}", 512, 200)
+end
 
-IO.puts("Allowed: #{allowed}, Blocked: #{blocked}")
-# Expected: Allowed: 5, Blocked: 2
+Benchee.run(
+  %{
+    "Counter.get — direct ETS read" => fn ->
+      Counter.get("/api/route_#{:rand.uniform(50)}")
+    end,
+    "Counter.all — full table scan" => fn ->
+      Counter.all()
+    end
+  },
+  parallel: 50,
+  warmup: 2,
+  time: 5,
+  formatters: [Benchee.Formatters.Console]
+)
 ```
 
-```elixir
-# Verificación del event log
-EventLog.new()
-EventLog.insert(:a, "x")
-EventLog.insert(:b, "y")
-
-count_before = EventLog.count()
-{:purged, _} = EventLog.purge_older_than(0)
-count_after = EventLog.count()
-
-IO.puts("Before: #{count_before}, After: #{count_after}")
-# count_after debe ser 0
+```bash
+mix run bench/metrics_bench.exs
 ```
+
+**Expected**: `Counter.get` should complete in under 5µs at p99 under 50 concurrent readers.
+If you see serialization (latency growing with concurrency), verify that `record/3`
+does NOT call `GenServer.call` — it must write directly to ETS.
 
 ---
 
-## Summary
+## Trade-off analysis
 
-ETS con opciones de concurrencia es una de las herramientas más poderosas de la BEAM para estado compartido de alta performance. Los patrones clave son:
+Fill in this table based on your implementation and benchmark results:
 
-- **`read_concurrency: true`**: elimina contención en workloads read-heavy
-- **`write_concurrency: true` + `decentralized_counters: true`**: contadores sin lock global
-- **`:ordered_set`**: cuando necesitas orden o range queries; acepta el overhead de O(log n)
-- **`fun2ms`**: match specs legibles y correctas sin escribirlas a mano
-- **ETS + GenServer**: GenServer como propietario/escritor, ETS para lecturas directas — patrón estándar para config y caches
+| Aspect | `:set` + `write_concurrency` | `:ordered_set` | GenServer map |
+|--------|------------------------------|---------------|--------------|
+| Lookup by key | O(1) | O(log n) | O(1) with map |
+| Range query | O(n) full scan | O(log n) tree walk | O(n) with Enum.filter |
+| Concurrent reads | No bottleneck | No bottleneck | Serialized by mailbox |
+| Memory overhead | Low | +30-40% vs `:set` | In-process heap |
+| `decentralized_counters` | Supported | Not supported | N/A |
+| Write ordering guarantee | None | None | FIFO mailbox |
 
-La regla práctica: si mides contención en un GenServer con VisualVM o `:sys.get_status/1` y ves un mailbox que crece, ETS es la solución natural.
+Reflection: the event log uses `:protected` access while counters use `:public`.
+What does that mean for who can write to each table, and why is it the right choice?
 
 ---
 
-## What's Next
+## Common production mistakes
 
-- **Ejercicio 17**: DETS para persistencia — cuando los datos deben sobrevivir reinicios
-- **Ejercicio 19**: Cache patterns con ETS — TTL, LRU, cache stampede
-- **Ejercicio 20**: `:atomics` y `:counters` para counters lock-free de más bajo nivel
-- **Ejercicio 25**: BEAM schedulers y reductions — entender cómo los schedulers afectan a ETS
+**1. Using `read_concurrency: true` on tables you iterate frequently**
+`tab2list/1`, `first/1`, `next/2` acquire a full table lock regardless of `read_concurrency`.
+If your workload mixes point lookups with full scans, benchmark both flag combinations.
+
+**2. Applying `decentralized_counters` when reads are frequent**
+With `decentralized_counters`, reading the current counter value requires summing
+scheduler-local copies — O(schedulers). For a dashboard polling every 5 seconds
+this is fine. For a rate limiter checking every request, it adds up.
+
+**3. Using `:ordered_set` for point lookups that don't need ordering**
+O(log n) vs O(1) is a 3–5x difference at 1M entries. Only use `:ordered_set` when
+range queries or ordered iteration are part of the actual access pattern.
+
+**4. Writing match specs by hand instead of building them programmatically**
+`fun2ms` is compile-time only and cannot capture runtime variables. For dynamic
+range queries (where `from_us` and `to_us` come from function arguments), you must
+build the match spec as a list of tuples at runtime. See `range/2` above.
+
+**5. Creating the ETS table in a process that can die**
+The process that creates an ETS table owns it. When the owner dies, the table is
+destroyed. Always create tables in supervised, long-lived processes (Application or
+GenServer in the supervision tree).
 
 ---
 
 ## Resources
 
-- [Erlang ETS documentation](https://www.erlang.org/doc/man/ets.html) — referencia completa de opciones y operaciones
-- [Erlang efficiency guide — ETS](https://www.erlang.org/doc/efficiency_guide/tablesDatabases.html) — cuándo usar qué tipo de tabla
-- [`:ets.fun2ms` documentation](https://www.erlang.org/doc/man/ms_transform.html) — cómo funciona la transformación
-- [Saša Jurić — "The Erlang Runtime System"](https://www.oreilly.com/library/view/the-erlang-runtime/9781800560818/) — capítulo sobre schedulers y concurrencia en ETS
+- [`:ets` documentation — Erlang/OTP](https://www.erlang.org/doc/man/ets.html) — read the `type`, `access`, and `write_concurrency` sections
+- [Erlang efficiency guide — ETS](https://www.erlang.org/doc/efficiency_guide/tablesDatabases.html) — when to use each table type
+- [`:ets.fun2ms` / ms_transform](https://www.erlang.org/doc/man/ms_transform.html) — compile-time match spec generation
+- [Erlang in Anger — Fred Hebert](https://www.erlang-in-anger.com/) — production ETS patterns (free PDF)

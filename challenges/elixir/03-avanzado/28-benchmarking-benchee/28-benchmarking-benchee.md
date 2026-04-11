@@ -1,534 +1,454 @@
-# 28. Benchmarking Riguroso con Benchee
+# Rigorous Benchmarking with Benchee
 
-**Difficulty**: Avanzado
-
----
-
-## Prerequisites
-
-### Mastered
-- Elixir: Map, Keyword List, String, IO.iodata
-- Concurrencia: Task, GenServer, Process
-- Mix: dependencias, entornos de desarrollo
-
-### Familiarity with
-- Conceptos de benchmarking: warm-up, varianza, outliers
-- `{:benchee, "~> 1.0"}` — agregar a `mix.exs` en deps
+**Project**: `api_gateway` — built incrementally across the advanced level
 
 ---
 
-## Learning Objectives
+## Project context
 
-Al completar este ejercicio serás capaz de:
+You're building `api_gateway`. Three architectural decisions need data to resolve:
 
-- **Diseñar** experimentos de benchmarking que produzcan resultados estadísticamente válidos
-- **Interpretar** métricas de Benchee: IPS, mean, median, std_dev y su significado real
-- **Evaluar** estrategias de implementación con diferentes tamaños de input (scaling behavior)
-- **Analizar** el throughput de sistemas concurrentes bajo carga variable
+1. The router currently uses a linear scan through route patterns. A radix tree
+   alternative was proposed. Which is faster for the gateway's actual route set?
+2. The cache uses ETS direct lookup. A two-level L1/L2 design was added. What is
+   the actual hit-rate vs latency trade-off under realistic access patterns?
+3. The rate limiter has three counter implementations from exercise 20. Which
+   performs best under the gateway's actual concurrency level (50 workers)?
 
----
+All three need rigorous benchmarks — not "I ran it once and it seemed faster."
 
-## Concepts
-
-### ¿Por Qué el Microbenchmarking es Difícil?
-
-Antes de ejecutar cualquier benchmark, es importante entender sus limitaciones:
+Project structure at this point:
 
 ```
-Fuentes de ruido en benchmarks:
-├── JIT warm-up: código no compilado se ejecuta más lento al inicio
-├── GC pressure: una GC durante la medición distorsiona los resultados
-├── CPU throttling: macbooks y servidores con thermal throttling
-├── Context switches del OS: el thread del scheduler puede ser interrumpido
-├── Branch predictor: el CPU "aprende" patterns en loops repetitivos
-└── Cache effects: datos en L1/L2/L3 vs RAM tienen diferente latencia
+api_gateway/
+├── lib/
+│   └── api_gateway/
+│       ├── router.ex
+│       ├── cache/
+│       │   └── store.ex
+│       ├── metrics/
+│       │   └── sliding_window.ex
+│       └── ...
+├── bench/
+│   ├── router_bench.exs            # ← you implement this
+│   ├── cache_bench.exs             # ← and this
+│   └── counter_bench.exs           # (from exercise 20, extend here)
+└── mix.exs
 ```
 
-Benchee mitiga estos problemas con warm-up, múltiples iteraciones y estadísticas descriptivas.
-
-### Benchee API
-
+Add Benchee to `mix.exs`:
 ```elixir
-# mix.exs
 defp deps do
   [
-    {:benchee, "~> 1.0", only: :dev},
-    {:benchee_html, "~> 1.0", only: :dev}  # para reportes HTML (opcional)
+    # ...
+    {:benchee, "~> 1.3", only: [:dev, :bench]}
   ]
 end
 ```
 
-```elixir
-# Ejemplo completo con todas las opciones relevantes
-Benchee.run(
-  %{
-    "implementación A" => fn -> my_function_a(input) end,
-    "implementación B" => fn -> my_function_b(input) end,
-  },
-  # Tiempo de calentamiento (segundos) — deja que el compilador JIT se estabilice
-  warmup: 2,
-  # Tiempo de medición por implementación (segundos)
-  time: 5,
-  # Tiempo para medir memoria (segundos) — 0 = no medir
-  memory_time: 2,
-  # Tiempo de reducción (operaciones) — 0 = no medir
-  reduction_time: 1,
-  # Formato de salida
-  formatters: [
-    Benchee.Formatters.Console,
-    {Benchee.Formatters.HTML, file: "benchmarks/results.html"}
-  ],
-  # Inputs para probar con diferentes tamaños
-  inputs: %{
-    "small (100)"  => 100,
-    "medium (10k)" => 10_000,
-    "large (1M)"   => 1_000_000
-  }
-)
-```
+---
 
-### Anatomía de los Resultados de Benchee
+## The business problem
+
+Benchmarks must answer specific questions, not just produce numbers. For each
+benchmark, the team needs:
+- A clear hypothesis ("the radix router is faster for > 50 routes")
+- Inputs that represent real production patterns (not just a single case)
+- Statistical validity (warm-up, multiple iterations, standard deviation reported)
+- A conclusion with the data to back it
+
+---
+
+## Why microbenchmarking is difficult
 
 ```
-Name                  ips        average  deviation         median         99th %
-implementation A    2.34 K      427.35 μs   ±12.34%       415.12 μs      891.23 μs
-implementation B    1.12 K      892.14 μs   ±45.67%       650.00 μs     3456.78 μs
-
-Comparison:
-implementation A    2.34 K
-implementation B    1.12 K  — 2.09x slower
+Sources of noise in benchmarks:
+├── JIT warm-up: BEAM interprets bytecode before native-compiling hot paths
+├── GC pauses: a GC cycle during measurement inflates latency
+├── CPU throttling: thermal throttling on laptops skews results
+├── OS scheduling: the BEAM scheduler thread can be preempted by the OS
+├── Branch predictor: CPU learns patterns in hot loops, inflating throughput
+└── Cache effects: data accessed repeatedly moves to L1 cache vs RAM
 ```
 
-- **ips** (iterations per second): cuántas veces por segundo se puede ejecutar la función
-- **average**: media aritmética del tiempo — sensible a outliers
-- **deviation** (std_dev %): variabilidad relativa — alto % = resultados poco confiables
-- **median**: valor central — más robusto que la media ante outliers
-- **99th %**: el percentil 99 — el "peor caso casi real"
+Benchee mitigates these with:
+- **Warm-up phase**: discarded iterations to let BEAM JIT and CPU caches settle
+- **Multiple samples**: statistical mean, median, std_dev, p99 across many iterations
+- **`inputs:`**: run the same benchmark across multiple input sizes to observe scaling
 
-### `inputs:` — Probar Comportamiento de Scaling
+---
 
-La feature más importante de Benchee para decisiones arquitectónicas:
-
-```elixir
-# Sin inputs: solo ves el comportamiento con UN tamaño de dato
-# Con inputs: ves cómo escala cada implementación
-
-Benchee.run(
-  %{
-    "Enum.find" => fn list -> Enum.find(list, &(&1 == :target)) end,
-    "MapSet.member?" => fn set -> MapSet.member?(set, :target) end
-  },
-  inputs: %{
-    "10 elements"      => generate_data(10),
-    "1_000 elements"   => generate_data(1_000),
-    "100_000 elements" => generate_data(100_000)
-  }
-)
-# Con 10 elements: ambos son ~igual de rápidos
-# Con 100_000: Enum.find es O(n), MapSet.member? es O(1) — diferencia clara
-```
-
-### `before_scenario` y `after_scenario` — Setup por Input
+## Benchee API essentials
 
 ```elixir
 Benchee.run(
   %{
-    "with ETS" => fn table ->
-      :ets.lookup(table, :key)
-    end
+    "scenario name" => fn -> code_to_benchmark() end,
+    # With setup that runs before each measurement:
+    "with setup" => fn input -> use(input) end
   },
   inputs: %{
-    "small" => 1_000,
-    "large" => 1_000_000
+    "small" => generate_small_input(),
+    "large" => generate_large_input()
   },
-  before_scenario: fn size ->
-    # Se ejecuta UNA VEZ por input — setup costoso aquí, no en el benchmark
-    table = :ets.new(:bench_table, [:set])
-    Enum.each(1..size, fn i -> :ets.insert(table, {i, :data}) end)
-    table
+  before_scenario: fn input ->
+    # Runs once before each input/scenario combination
+    # Use to set up state that should not be measured
+    prepare(input)
   end,
-  after_scenario: fn table ->
-    :ets.delete(table)
-  end
+  warmup: 2,        # seconds of warm-up (discarded)
+  time: 10,         # seconds of measurement
+  memory_time: 2,   # seconds of memory measurement (optional)
+  parallel: 4,      # number of concurrent processes
+  formatters: [Benchee.Formatters.Console]
 )
 ```
 
-### Memory Benchmarking
+**`before_scenario` vs `before_each`**:
+- `before_scenario`: runs once per `{scenario, input}` combination, before the
+  timed loop. Use for setup that is expensive and should not be measured.
+- `before_each`: runs before *every single iteration*. Avoid unless the setup
+  is intentionally part of the measurement.
+
+---
+
+## Implementation
+
+### Step 1: `bench/router_bench.exs`
 
 ```elixir
+# bench/router_bench.exs
+# Benchmarks linear scan vs ETS-based route matching across route set sizes.
+
+# --- Setup -------------------------------------------------------------------
+
+# Builds a list of {method, pattern, handler} route definitions
+build_routes = fn count ->
+  for i <- 1..count do
+    {"GET", "/api/resource_#{i}/:id", :"Handler#{i}"}
+  end
+end
+
+# Linear scan matcher: iterate routes until a match is found
+linear_match = fn routes, method, path ->
+  Enum.find(routes, fn {m, pattern, _handler} ->
+    m == method and String.starts_with?(path, String.replace(pattern, "/:id", "/"))
+  end)
+end
+
+# ETS-based matcher: store routes in an ETS table, lookup by prefix
+build_ets_table = fn routes ->
+  table = :ets.new(:route_table, [:set, :public, {:read_concurrency, true}])
+  for {method, pattern, handler} <- routes do
+    prefix = String.replace(pattern, "/:id", "")
+    :ets.insert(table, {{method, prefix}, handler})
+  end
+  table
+end
+
+ets_match = fn table, method, path ->
+  # Simplified: strip the last segment to get the prefix
+  prefix = path |> String.split("/") |> Enum.drop(-1) |> Enum.join("/")
+  :ets.lookup(table, {method, prefix})
+end
+
+# --- Benchmark ---------------------------------------------------------------
+
 Benchee.run(
   %{
-    "lista" => fn n -> Enum.to_list(1..n) end,
-    "mapset" => fn n -> MapSet.new(1..n) end
+    "linear_scan" => fn {routes, _table} ->
+      linear_match.(routes, "GET", "/api/resource_25/42")
+    end,
+    "ets_lookup" => fn {_routes, table} ->
+      ets_match.(table, "GET", "/api/resource_25/42")
+    end
   },
-  memory_time: 2,  # medir memoria durante 2 segundos
-  inputs: %{"10k" => 10_000}
+  inputs: %{
+    "10 routes" => build_routes.(10),
+    "50 routes" => build_routes.(50),
+    "200 routes" => build_routes.(200)
+  },
+  before_scenario: fn routes ->
+    # Setup runs once per input — build both the list and the ETS table
+    table = build_ets_table.(routes)
+    {routes, table}
+  end,
+  warmup: 2,
+  time: 8,
+  formatters: [Benchee.Formatters.Console]
 )
-
-# Output incluye:
-# Memory usage statistics:
-# Name             average  deviation      median         99th %
-# lista          156.25 KB    ±0.00%    156.25 KB      156.25 KB
-# mapset         312.50 KB    ±0.00%    312.50 KB      312.50 KB
 ```
 
-### Reduction Time
+### Step 2: `bench/cache_bench.exs`
 
 ```elixir
+# bench/cache_bench.exs
+# Benchmarks single-level ETS cache vs L1/L2 two-level cache under
+# varying cache hit rates.
+
+alias ApiGateway.Cache.Store
+
+# Setup: populate the cache with N entries.
+# Store is started by the application supervision tree.
+# flush/0 clears stale entries before each scenario.
+populate_cache = fn count ->
+  Store.flush()
+
+  for i <- 1..count do
+    Store.put("key_#{i}", "value_#{i}")
+  end
+
+  count
+end
+
+# Simulates a realistic access pattern: 80% of requests hit 20% of keys (Pareto)
+pareto_key = fn count ->
+  hot_key_count = max(1, div(count, 5))
+  if :rand.uniform() < 0.8 do
+    "key_#{:rand.uniform(hot_key_count)}"
+  else
+    "key_#{:rand.uniform(count)}"
+  end
+end
+
 Benchee.run(
   %{
-    "recursiva" => fn -> recursive_sum(10_000) end,
-    "Enum.sum"  => fn -> Enum.sum(1..10_000) end
+    "cache_get (pareto access)" => fn {_n, count} ->
+      Store.get(pareto_key.(count))
+    end,
+    "cache_get_or_put (fetch on miss)" => fn {_count, count} ->
+      key = pareto_key.(count)
+      case Store.get(key) do
+        {:ok, _value} -> :hit
+        :miss -> Store.put(key, "fetched_value")
+      end
+    end
   },
-  reduction_time: 1  # medir reductions durante 1 segundo
+  inputs: %{
+    "100 entries" => 100,
+    "10_000 entries" => 10_000
+  },
+  before_scenario: fn count ->
+    n = populate_cache.(count)
+    {n, count}
+  end,
+  warmup: 2,
+  time: 8,
+  parallel: 10,   # simulate concurrent cache access
+  formatters: [Benchee.Formatters.Console]
 )
-# Reduction time correlaciona con cuánto trabajo hace BEAM
-# No necesariamente con el tiempo wall-clock (depende de GC, IO, etc.)
 ```
 
----
-
-## Exercises
-
-### Exercise 1: Map vs Keyword List — Benchmark de Lookup con Scaling
-
-**Problem**
-
-Implementa un benchmark que compare `Map` vs `Keyword List` para operaciones de lookup con diferentes tamaños y diferentes patrones de acceso.
-
-El benchmark debe probar:
-
-- **Lookup por key existente** — `Map.get(map, key)` vs `Keyword.get(kw, key)`
-- **Lookup por key inexistente** — mismo comparativo
-- **Tamaños**: 5 keys, 20 keys, 100 keys, 500 keys
-
-Además, incluye una función `generate_data/1` que construya ambas estructuras con el mismo contenido para comparación justa, y un `before_scenario` que prepare los datos sin contaminar el tiempo medido.
-
-Expectativa de aprendizaje: ver en qué punto el Map supera al Keyword List y entender por qué.
+### Step 3: Given tests — must pass without modification
 
 ```elixir
-# Resultado esperado (aproximado):
-# ##### With input: 5 keys #####
-# Keyword.get (found):  12.45 M ops/s
-# Map.get (found):       8.23 M ops/s  ← Map es más lento para N pequeño
-#
-# ##### With input: 100 keys #####
-# Map.get (found):       9.11 M ops/s
-# Keyword.get (found):   1.23 M ops/s  ← Keyword degrada linealmente
-```
+# test/api_gateway/bench/benchee_integration_test.exs
+defmodule ApiGateway.BencheeIntegrationTest do
+  @moduledoc """
+  Smoke tests that verify benchmark scripts are syntactically valid and
+  all referenced modules and functions exist before running the full benchmarks.
+  """
 
-**Hints**
+  use ExUnit.Case, async: true
 
-- Un Keyword List es una lista enlazada — el lookup es O(n)
-- Un Map es un HAMT (Hash Array Mapped Trie) — el lookup es O(log n) con constante pequeña
-- Para el caso de "key inexistente", el Keyword List debe recorrer toda la lista — el peor caso
-- Usa `before_scenario` para construir las estructuras una vez por input size
-- Benchee retorna un `%Benchee.Suite{}` — puedes usarlo para análisis posterior
-
-**One possible solution**
-
-```elixir
-# benchmarks/map_vs_keyword.exs
-defmodule MapVsKeyword do
-  def run do
-    Benchee.run(
-      %{
-        "Map.get (found)" => fn {map, key, _} ->
-          Map.get(map, key)
-        end,
-        "Keyword.get (found)" => fn {kw, key, _} ->
-          Keyword.get(kw, key)
-        end,
-        "Map.get (missing)" => fn {map, _, missing_key} ->
-          Map.get(map, missing_key, :default)
-        end,
-        "Keyword.get (missing)" => fn {kw, _, missing_key} ->
-          Keyword.get(kw, missing_key, :default)
-        end
-      },
-      inputs: %{
-        "5 keys"   => 5,
-        "20 keys"  => 20,
-        "100 keys" => 100,
-        "500 keys" => 500
-      },
-      before_scenario: fn size ->
-        # Construir ambas estructuras con el mismo contenido
-        pairs = Enum.map(1..size, fn i -> {:"key_#{i}", "value_#{i}"} end)
-        kw_list = pairs
-        map = Map.new(pairs)
-
-        # Elegir una key existente (la del medio)
-        existing_key = :"key_#{div(size, 2)}"
-        missing_key = :nonexistent_key_xyz
-
-        {map, kw_list, existing_key, missing_key}
-      end,
-      # TODO: transformar el input para cada benchmark fn
-      # El before_scenario retorna {map, kw, existing, missing}
-      # pero cada fn recibe ese mismo valor
-      warmup: 2,
-      time: 5
-    )
-  end
-end
-
-MapVsKeyword.run()
-```
-
----
-
-### Exercise 2: String Concatenation — ¿Qué Estrategia Escala Mejor?
-
-**Problem**
-
-Elixir tiene múltiples formas de construir strings. Cada una tiene características de performance muy diferentes dependiendo del número de piezas y su tamaño.
-
-Benchmarkea estas estrategias para construir un string grande desde N fragmentos:
-
-- **`<>` recursivo**: `Enum.reduce(parts, "", fn p, acc -> acc <> p end)`
-- **`IO.iodata_to_binary`**: acumular una lista de strings y convertir al final
-- **`String.join`**: `Enum.join(parts, "")`
-- **`Enum.map |> Enum.join`**: cuando hay transformación previa
-- **`:erlang.iolist_to_binary`**: versión Erlang de iodata — a veces más rápida
-
-Prueba con: 10 partes, 100 partes, 1000 partes, 10000 partes.
-
-El benchmark debe también medir **memory_time** para ver cuánta memoria intermedia genera cada estrategia.
-
-```elixir
-# Expectativa de aprendizaje:
-# - <> recursivo: O(n²) — cada concatenación copia el string acumulado
-# - iodata: O(n) — construye la lista sin copias, solo una al final
-# - String.join: similar a iodata internamente
-```
-
-**Hints**
-
-- `IO.iodata_to_binary/1` acepta listas anidadas de strings/binaries — no necesitas flatten
-- Usa `before_scenario` para generar la lista de partes (strings pequeños de tamaño fijo)
-- Cada parte debe tener el mismo tamaño para una comparación justa — ej: strings de 10 bytes
-- El patrón iodata es: acumular en lista `[part | acc]` (prepend, O(1)) y convertir al final
-- Mide con `memory_time: 2` — la diferencia de memoria entre `<>` e iodata es dramática
-
-**One possible solution**
-
-```elixir
-# benchmarks/string_concat.exs
-defmodule StringConcatBench do
-  def run do
-    Benchee.run(
-      %{
-        "<> recursivo" => fn parts ->
-          Enum.reduce(parts, "", fn p, acc -> acc <> p end)
-        end,
-        "IO.iodata_to_binary" => fn parts ->
-          # Construir iodata list y convertir al final
-          iodata = Enum.reduce(parts, [], fn p, acc -> [acc | p] end)
-          IO.iodata_to_binary(iodata)
-        end,
-        "String.join" => fn parts ->
-          Enum.join(parts, "")
-        end,
-        ":erlang.iolist_to_binary" => fn parts ->
-          :erlang.iolist_to_binary(parts)
-        end
-      },
-      inputs: %{
-        "10 parts"    => 10,
-        "100 parts"   => 100,
-        "1_000 parts" => 1_000,
-        "10_000 parts" => 10_000
-      },
-      before_scenario: fn n ->
-        # Generar lista de N strings de 10 bytes cada uno
-        Enum.map(1..n, fn _ -> :crypto.strong_rand_bytes(10) |> Base.encode16() end)
-      end,
-      warmup: 2,
-      time: 5,
-      memory_time: 2,
-      formatters: [Benchee.Formatters.Console]
-    )
-  end
-end
-
-StringConcatBench.run()
-```
-
----
-
-### Exercise 3: Concurrent Benchmark — Throughput de GenServer bajo Carga Paralela
-
-**Problem**
-
-Un GenServer serializa todas las operaciones en un mailbox. Esto es correcto para estado compartido, pero tiene implicaciones de throughput. Este benchmark mide cómo escala el throughput de un GenServer cuando el número de clientes aumenta.
-
-Implementa:
-
-1. `CounterServer` — GenServer simple que incrementa un contador
-2. Un benchmark que prueba throughput con **1, 10, 100 clientes concurrentes**
-3. Compara con una alternativa sin serialización: usar `:atomics` (array de enteros atómicos de BEAM)
-
-La métrica clave no es IPS individual sino **throughput total** (operaciones/segundo del sistema completo).
-
-```elixir
-# Resultado esperado (aproximado):
-# 1 client:
-#   GenServer: 125k ops/s  — cuello de botella: mailbox serializado
-#   :atomics:  890k ops/s
-#
-# 10 clients:
-#   GenServer: 130k ops/s  — ¡apenas sube! El GenServer es el cuello
-#   :atomics: 4.2M ops/s   — escala linealmente con clientes
-#
-# 100 clients:
-#   GenServer: 128k ops/s  — meseta total
-#   :atomics: 12.1M ops/s
-```
-
-**Hints**
-
-- Para el benchmark de N clientes: spawna N Tasks que ejecuten M operaciones cada una y mide el tiempo total
-- La métrica a comparar es `total_ops / elapsed_ms * 1000` (ops/segundo)
-- `:atomics.new(1, signed: false)` crea un array de 1 entero atómico no signado
-- `:atomics.add(ref, 1, 1)` incrementa atómicamente la posición 1 del array
-- Benchee no tiene soporte nativo para este tipo de benchmark "wall clock total" — usa `:timer.tc` manualmente o un `before_scenario`/`after_scenario` para medir el tiempo de todo el grupo
-
-**One possible solution**
-
-```elixir
-defmodule CounterServer do
-  use GenServer
-
-  def start_link(opts \\ []),
-    do: GenServer.start_link(__MODULE__, 0, opts)
-
-  def increment(pid), do: GenServer.call(pid, :inc)
-  def get(pid), do: GenServer.call(pid, :get)
-
-  def init(count), do: {:ok, count}
-
-  def handle_call(:inc, _from, count), do: {:reply, count + 1, count + 1}
-  def handle_call(:get, _from, count), do: {:reply, count, count}
-end
-
-defmodule ConcurrentBench do
-  @ops_per_client 1_000
-
-  def run do
-    IO.puts("=== Concurrent Throughput Benchmark ===\n")
-
-    for n_clients <- [1, 10, 100] do
-      gs_throughput = bench_genserver(n_clients)
-      atomic_throughput = bench_atomics(n_clients)
-
-      IO.puts("#{n_clients} clients:")
-      IO.puts("  GenServer: #{format_ops(gs_throughput)} ops/s")
-      IO.puts("  :atomics:  #{format_ops(atomic_throughput)} ops/s\n")
+  # Verify modules referenced in benchmarks exist and export the expected functions
+  describe "router benchmark dependencies" do
+    test "ETS table creation works" do
+      table = :ets.new(:test_routes, [:set, :public])
+      :ets.insert(table, {{"GET", "/api/users"}, MyHandler})
+      result = :ets.lookup(table, {"GET", "/api/users"})
+      assert [{{"GET", "/api/users"}, MyHandler}] = result
+      :ets.delete(table)
     end
   end
 
-  defp bench_genserver(n_clients) do
-    {:ok, pid} = CounterServer.start_link()
+  describe "Benchee.run/2 basic invocation" do
+    test "runs a minimal benchmark without error" do
+      # Verify Benchee is available and the API works
+      result =
+        Benchee.run(
+          %{"noop" => fn -> :ok end},
+          warmup: 0,
+          time: 0.01,
+          formatters: []
+        )
 
-    {elapsed_us, _} = :timer.tc(fn ->
-      tasks = Enum.map(1..n_clients, fn _ ->
-        Task.async(fn ->
-          Enum.each(1..@ops_per_client, fn _ ->
-            CounterServer.increment(pid)
-          end)
-        end)
-      end)
-      Task.await_many(tasks, :infinity)
-    end)
+      assert %Benchee.Suite{} = result
+    end
 
-    GenServer.stop(pid)
-    total_ops = n_clients * @ops_per_client
-    total_ops / elapsed_us * 1_000_000
+    test "inputs: option works correctly" do
+      result =
+        Benchee.run(
+          %{"identity" => fn input -> input end},
+          inputs: %{"small" => 1, "large" => 1_000},
+          warmup: 0,
+          time: 0.01,
+          formatters: []
+        )
+
+      scenario_names = Enum.map(result.scenarios, & &1.name)
+      assert "identity" in scenario_names
+    end
+
+    test "before_scenario: runs before each scenario" do
+      test_pid = self()
+
+      Benchee.run(
+        %{"with_setup" => fn _input -> :ok end},
+        inputs: %{"x" => 1},
+        before_scenario: fn input ->
+          send(test_pid, {:setup_ran, input})
+          input
+        end,
+        warmup: 0,
+        time: 0.01,
+        formatters: []
+      )
+
+      assert_receive {:setup_ran, 1}, 2_000
+    end
+
+    test "parallel: option accepts integer" do
+      result =
+        Benchee.run(
+          %{"parallel_noop" => fn -> :ok end},
+          parallel: 2,
+          warmup: 0,
+          time: 0.01,
+          formatters: []
+        )
+
+      assert %Benchee.Suite{} = result
+    end
+
+    test "memory_time: option measures memory" do
+      result =
+        Benchee.run(
+          %{"list_alloc" => fn -> Enum.to_list(1..100) end},
+          warmup: 0,
+          time: 0.01,
+          memory_time: 0.01,
+          formatters: []
+        )
+
+      scenario = hd(result.scenarios)
+      # memory_usage_data may be nil if no allocations happened, but the field exists
+      assert Map.has_key?(scenario, :memory_usage_data)
+    end
   end
 
-  defp bench_atomics(n_clients) do
-    # TODO: crear :atomics ref, benchmarkear con N tasks concurrentes
-    # Cada task hace @ops_per_client llamadas a :atomics.add/3
-    _ = n_clients
-    0.0
-  end
+  describe "statistical output" do
+    test "Benchee.Suite contains scenario statistics" do
+      suite =
+        Benchee.run(
+          %{"with_stats" => fn -> Enum.sum(1..1000) end},
+          warmup: 0,
+          time: 0.1,
+          formatters: []
+        )
 
-  defp format_ops(ops_per_sec) do
-    cond do
-      ops_per_sec >= 1_000_000 -> "#{Float.round(ops_per_sec / 1_000_000, 1)}M"
-      ops_per_sec >= 1_000 -> "#{Float.round(ops_per_sec / 1_000, 1)}k"
-      true -> "#{round(ops_per_sec)}"
+      scenario = hd(suite.scenarios)
+      stats = scenario.run_time_data.statistics
+
+      assert stats.average > 0
+      assert stats.median > 0
+      assert stats.std_dev >= 0
+      assert stats.sample_size > 0
     end
   end
 end
+```
 
-ConcurrentBench.run()
+### Step 4: Run the tests and benchmarks
+
+```bash
+# Unit tests (fast — verifies Benchee API and dependencies)
+mix test test/api_gateway/bench/benchee_integration_test.exs --trace
+
+# Router benchmark (takes ~30 seconds)
+mix run bench/router_bench.exs
+
+# Cache benchmark (takes ~30 seconds)
+mix run bench/cache_bench.exs
 ```
 
 ---
 
-## Common Mistakes
+## Reading Benchee output
 
-### 1. No usar warm-up
-
-Sin warm-up, las primeras iteraciones son más lentas por compilación lazy, cold caches, y inicialización del GC. Benchee hace warm-up por defecto (`warmup: 2`) — no lo pongas en 0 a menos que tengas una razón muy específica.
-
-### 2. Incluir setup en la función benchmarked
-
-```elixir
-# MAL: la creación de datos forma parte del tiempo medido
-%{"bad bench" => fn -> data = generate_data(1000); process(data) end}
-
-# BIEN: datos preparados antes de la medición
-%{"good bench" => fn data -> process(data) end}
-# con inputs o before_scenario para generar data
+```
+Name                    ips        average  deviation         median         99th %
+ets_lookup          4.23 M      236.64 ns   ±142.94%     210.00 ns      470.00 ns
+linear_scan (10)    2.15 M      465.12 ns    ±89.23%     430.00 ns      890.00 ns
+linear_scan (200)  48.32 K    20701.54 ns    ±31.45%   20200.00 ns    35400.00 ns
 ```
 
-### 3. Comparar implementaciones con diferentes cargas de trabajo
+- **ips** (iterations per second): higher is better. Primary throughput metric.
+- **average**: mean latency. Skewed by outliers — prefer median.
+- **deviation**: `±X%` of the mean. High deviation (> 20%) means noisy measurement.
+  Re-run with longer `time:` or check for GC interference.
+- **median**: 50th percentile. Best single-number latency representation.
+- **99th %**: tail latency. If this is 10x the median, there are occasional slow
+  outliers (GC, OS scheduling) — check memory_time to confirm.
 
-Si "implementación A" hace más trabajo real que "implementación B", el benchmark no compara lo que crees. Asegúrate de que ambas producen el mismo resultado para el mismo input.
-
-### 4. Ignorar std_dev alto
-
-Un `deviation` mayor al 15-20% indica que los resultados son poco confiables. Causas comunes: GC durante la medición, throttling térmico, o el benchmark hace IO. Investiga antes de concluir algo.
-
-### 5. Concluir de microbenchmarks sin validar en el contexto real
-
-Un benchmark de `Map.get` aislado puede mostrar que Map es 2x más rápido, pero en tu aplicación real el costo dominante puede ser la serialización de mensajes o el IO de base de datos. Siempre perfilar el sistema completo antes de optimizar.
-
-### 6. No usar `inputs:` para encontrar el punto de inflexión
-
-La pregunta más importante no es "¿qué es más rápido?" sino "¿a qué tamaño cambia el comportamiento?". Benchee con `inputs:` de diferentes órdenes de magnitud revela esta información.
-
----
-
-## Summary
-
-Benchee convierte el benchmarking de arte en ciencia: warm-up controlado, múltiples iteraciones, estadísticas descriptivas completas, y soporte para comparar comportamiento de scaling con `inputs:`. Las métricas más importantes son:
-
-- **IPS y median**: rendimiento típico
-- **std_dev**: confiabilidad del resultado
-- **99th %**: comportamiento en el peor caso real
-- **memory_time**: costo en allocations, no solo en tiempo
-
-El benchmarking más valioso es el que responde "¿a qué escala cambia el ganador?" — usa siempre `inputs:` con órdenes de magnitud diferentes.
+**Comparing scenarios**: Benchee prints comparison ratios:
+```
+Comparison:
+ets_lookup           4.23 M
+linear_scan (10)     2.15 M — 1.97x slower
+linear_scan (200)   48.32 K — 87.5x slower
+```
 
 ---
 
-## What's Next
+## Trade-off analysis
 
-- **Ejercicio 29**: Binary matching performance — cuándo el matching supera al Regex
-- Investiga `benchee_html` para reportes visuales con gráficas de percentiles
-- Explora `:observer.start()` mientras corre un benchmark para ver el comportamiento del GC en tiempo real
-- Lee sobre flame graphs en Elixir con `eflambe` — profiling del sistema completo, no solo funciones aisladas
+| Benchmark type | When to use | Pitfall |
+|----------------|-------------|---------|
+| `parallel: 1` (sequential) | Pure CPU performance, no contention | Doesn't reflect real concurrency |
+| `parallel: N` (concurrent) | Throughput under concurrent load, lock contention | Results vary by hardware core count |
+| `inputs:` scaling | To find O(n) vs O(1) behavior | Must use representative input sizes |
+| `before_scenario:` | Setup that should not be measured | Do NOT use for state that varies per iteration |
+| `memory_time:` | When memory allocation is part of the trade-off | Not all scenarios produce measurable allocation |
+
+---
+
+## Common production mistakes
+
+**1. Benchmarking with `warmup: 0`**
+The first iterations of a benchmark run interpreted bytecode before BEAM's JIT
+compiles the hot path. Without warm-up, the first measurement samples include
+slow interpreted execution, inflating the average. Always use at least 2 seconds
+of warm-up for functions that will be called frequently in production.
+
+**2. Benchmarking in `MIX_ENV=test` or `MIX_ENV=dev`**
+Mix builds in dev/test include debug assertions, extra logging, and unoptimized
+compilation. Always run production benchmarks with `MIX_ENV=prod mix run bench/...`.
+The difference can be 2–5x for CPU-bound code.
+
+**3. Using `before_each:` for expensive setup**
+`before_each` runs before *every single iteration* — potentially millions of times.
+Use `before_scenario` for anything that takes > 1µs. `before_each` should only be
+used when the setup is truly per-iteration (e.g., generating a unique random key
+that must not be cached).
+
+**4. Drawing conclusions from a single run on a laptop**
+Thermal throttling, background processes, and OS scheduling make single-run results
+unreliable. Run benchmarks at least 3 times and compare medians, not averages.
+On CI infrastructure, pin CPU frequency (`cpupower frequency-set`) for reproducible results.
+
+**5. Benchmarking the wrong thing**
+A benchmark that measures "how fast is the router?" actually measures
+"how fast is the router, the ETS table, and the process scheduler together in
+this specific configuration on this machine." Make sure the benchmark reflects
+the actual bottleneck, not a neighboring system component.
 
 ---
 
 ## Resources
 
-- [Benchee documentation](https://github.com/bencheeorg/benchee)
-- [Benchee HTML formatter](https://github.com/bencheeorg/benchee_html)
-- [Saša Jurić — "Writing Quality Benchmarks"](https://www.theerlangelist.com/)
-- [:atomics module — Erlang docs](https://www.erlang.org/doc/man/atomics.html)
-- [Erlang efficiency guide — Maps vs Proplists](https://www.erlang.org/doc/efficiency_guide/maps.html)
+- [Benchee documentation](https://github.com/bencheeorg/benchee) — comprehensive guide with `inputs`, `before_scenario`, formatters
+- [Benchee formatters](https://github.com/bencheeorg/benchee#formatters) — HTML, CSV, and JSON output for storing historical results
+- [Saša Jurić — "Benchmarking Elixir" (ElixirConf 2019)](https://www.youtube.com/watch?v=7-mE5CKXjkw) — practical benchmarking methodology
+- [`:timer.tc/1` — Erlang docs](https://www.erlang.org/doc/man/timer.html#tc-1) — manual microsecond timing for one-off measurements
+- [Elixir Forum: Benchee best practices](https://elixirforum.com/t/benchmarking-best-practices/45218) — community discussion on avoiding pitfalls

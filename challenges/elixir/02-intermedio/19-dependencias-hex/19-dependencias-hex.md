@@ -1,632 +1,267 @@
-# 19. Dependencias con Hex y Mix
+# Hex Dependencies and mix.lock
 
-**Difficulty**: Intermedio
+**Project**: `task_queue` — built incrementally across the intermediate level
 
-## Prerequisites
-- Conocimiento de la estructura de un proyecto Mix
-- Familiaridad con `mix.exs` y su función `deps/0`
-- Comprensión básica de semantic versioning
+---
 
-## Learning Objectives
-After completing this exercise, you will be able to:
-- Agregar, actualizar y eliminar dependencias en `mix.exs`
-- Entender las restricciones de versión: `~>`, `>=`, `==`
-- Separar dependencias por ambiente con `only: :dev` y `only: :test`
-- Usar y committear correctamente el `mix.lock`
-- Referenciar dependencias locales con `path:` durante desarrollo
+## Project context
 
-## Concepts
+You're working on `task_queue`, a background job processing system. As it grows, it needs external libraries: JSON encoding for job payloads, HTTP for webhook notifications, and dev-only tooling for static analysis and documentation.
 
-### Hex: El Package Manager de Elixir
-
-Hex es el gestor de paquetes oficial del ecosistema Erlang/Elixir, similar a npm para Node.js o PyPI para Python. Cuando agregas una dependencia a `mix.exs`, Mix la descarga desde hex.pm.
-
-```elixir
-# mix.exs — sección deps
-defp deps do
-  [
-    # {nombre_del_paquete, "restricción_de_versión"}
-    {:jason, "~> 1.4"},
-    {:req, "~> 0.5"},
-    {:phoenix, "~> 1.7"}
-  ]
-end
-```
-
-```bash
-# Descargar todas las dependencias definidas en mix.exs
-$ mix deps.get
-
-# Ver el estado de todas las dependencias
-$ mix deps
-
-# Actualizar una dependencia específica a la versión más reciente compatible
-$ mix deps.update jason
-
-# Actualizar todas las dependencias
-$ mix deps.update --all
-
-# Eliminar archivos compilados de las dependencias
-$ mix deps.clean --all
-```
-
-### Restricciones de Versión
-
-Elixir usa semantic versioning (MAJOR.MINOR.PATCH) y ofrece varios operadores para restringir qué versiones son aceptables.
-
-```elixir
-# ~> (optimistic) — La más común. Permite actualizaciones compatibles.
-# ~> 1.4    equivale a  >= 1.4.0 and < 2.0.0
-# ~> 1.4.2  equivale a  >= 1.4.2 and < 1.5.0
-
-# La diferencia crítica entre ~> 1.4 y ~> 1.4.2:
-{:jason, "~> 1.4"}    # Acepta 1.4.0, 1.5.0, 1.9.0, pero NO 2.0.0
-{:jason, "~> 1.4.2"}  # Acepta 1.4.2, 1.4.9, pero NO 1.5.0
-
-# >= — Mínimo, sin máximo. Raramente usado porque puede incluir breaking changes.
-{:some_lib, ">= 1.0.0"}   # Acepta cualquier versión >= 1.0.0, incluyendo 2.0.0, 3.0.0
-
-# == — Versión exacta. Solo para reproducibilidad máxima o durante debug.
-{:my_dep, "== 1.4.3"}    # Solo acepta exactamente 1.4.3
-
-# >= con < para rango explícito
-{:some_dep, ">= 1.0.0 and < 2.0.0"}   # Equivalente manual a ~> 1.0
-```
-
-### Dependencias por Ambiente
-
-No todas las dependencias necesitan estar disponibles en producción. Las herramientas de testing, análisis estático, y documentación deben ser solo para desarrollo.
-
-```elixir
-defp deps do
-  [
-    # Disponible en todos los ambientes (dev, test, prod)
-    {:jason, "~> 1.4"},
-    {:req, "~> 0.5"},
-
-    # Solo en desarrollo — no se incluye en el release de producción
-    {:dialyxir, "~> 1.0", only: :dev, runtime: false},
-    {:ex_doc, "~> 0.31", only: :dev, runtime: false},
-
-    # Solo en testing
-    {:mock, "~> 0.3", only: :test},
-    {:bypass, "~> 2.1", only: :test},
-
-    # En desarrollo Y testing, pero no en producción
-    {:faker, "~> 0.18", only: [:dev, :test]},
-
-    # runtime: false — compilado en dev pero no iniciado como app en runtime
-    # Úsalo con herramientas que solo se usan desde la línea de comandos
-    {:credo, "~> 1.7", only: [:dev, :test], runtime: false}
-  ]
-end
-```
-
-### mix.lock — El Lockfile
-
-`mix.lock` registra las versiones exactas resueltas de todas las dependencias (incluyendo las transitivas — las dependencias de tus dependencias). Es el equivalente de `package-lock.json` en npm o `Cargo.lock` en Rust.
+Project structure at this point:
 
 ```
-# mix.lock (fragmento)
-%{
-  "jason": {:hex, :jason, "1.4.4",
-    "b9226785a9aa77b6857ca22832cffa5d5150298a",
-    [:mix], [{:decimal, "~> 1.0 or ~> 2.0", [hex: :decimal, optional: true]}],
-    "hexpm", "..."},
-  "req": {:hex, :req, "0.5.6",
-    "...",
-    ...},
-}
-```
-
-**Regla crítica**: El `mix.lock` SIEMPRE debe committearse al repositorio. Sin el lockfile, distintos desarrolladores (o distintos servidores de CI) podrían resolver versiones diferentes de dependencias transitivas, causando bugs difíciles de reproducir.
-
-```bash
-# mix deps.get con lockfile — instala las versiones EXACTAS del lock
-$ mix deps.get
-
-# mix deps.update — actualiza y regenera el lock
-$ mix deps.update jason
-
-# Si el lock y mix.exs están desincronizados, Mix avisa
-$ mix compile
-# ** (Mix) Some dependencies failed to compile:
-#   jason: lock file is out of date
-```
-
-### Dependencias Locales con path:
-
-Durante el desarrollo de librerías que luego se publicarán en Hex, es útil referenciar una copia local en lugar de la versión publicada.
-
-```elixir
-defp deps do
-  [
-    # En desarrollo: usa la copia local
-    {:my_shared_lib, path: "../my_shared_lib"},
-
-    # En producción: usa la versión de Hex
-    # {:my_shared_lib, "~> 1.2"},
-  ]
-end
-```
-
-```
-# Estructura de directorios típica con dependencia local
-projects/
-├── my_app/
-│   └── mix.exs  # {:my_shared_lib, path: "../my_shared_lib"}
-└── my_shared_lib/
-    └── mix.exs  # La librería que estás desarrollando
-```
-
-Las dependencias `path:` se recompilan automáticamente cuando cambias el código de la librería local — exactamente como si fueran parte de tu proyecto.
-
-## Exercises
-
-### Exercise 1: Agregar y Usar una Dependencia
-
-Agrega `jason` (el encoder/decoder JSON más popular en Elixir) y úsalo en tu código.
-
-```elixir
-# mix.exs — ANTES
-defp deps do
-  []
-end
-
-# TODO: Modifica mix.exs para agregar {:jason, "~> 1.4"}
-# mix.exs — DESPUÉS
-defp deps do
-  [
-    # Agrega Jason aquí
-  ]
-end
-```
-
-```bash
-# TODO: Ejecuta estos comandos después de modificar mix.exs
-$ mix deps.get
-# Resolving Hex dependencies...
-# Dependency resolution completed...
-# * Getting jason (Hex package)
-
-$ mix compile
-```
-
-```elixir
-# lib/json_example.ex
-defmodule JsonExample do
-  @doc """
-  Convierte un mapa Elixir a JSON string.
-
-  ## Examples
-
-      iex> JsonExample.encode(%{name: "Alice", age: 30})
-      {:ok, ~s({"age":30,"name":"Alice"})}
-
-  """
-  def encode(data) do
-    # TODO: Usa Jason.encode/1 para convertir data a JSON
-    # Retorna {:ok, json_string} o {:error, reason}
-  end
-
-  @doc """
-  Convierte un JSON string a mapa Elixir.
-  """
-  def decode(json) do
-    # TODO: Usa Jason.decode/1 para parsear el JSON
-    # Retorna {:ok, map} o {:error, reason}
-  end
-end
-```
-
-Expected output:
-```elixir
-iex> JsonExample.encode(%{name: "Alice", age: 30})
-{:ok, "{\"age\":30,\"name\":\"Alice\"}"}
-
-iex> JsonExample.decode(~s({"name":"Alice","age":30}))
-{:ok, %{"age" => 30, "name" => "Alice"}}
+task_queue/
+├── lib/
+│   └── task_queue/
+│       ├── application.ex          # already exists — starts the supervision tree
+│       ├── worker.ex               # already exists — processes jobs
+│       ├── queue_server.ex         # already exists — GenServer holding the queue
+│       ├── scheduler.ex            # already exists — dispatches jobs to workers
+│       └── registry.ex             # already exists — tracks running workers
+├── test/
+│   └── task_queue/
+│       └── queue_server_test.exs   # given tests — must pass without modification
+└── mix.exs                         # ← you configure dependencies here
 ```
 
 ---
 
-### Exercise 2: Restricciones de Versión — Entendiendo las Diferencias
+## The business problem
 
-Experimenta con las restricciones de versión en un proyecto limpio para entender qué versiones acepta cada una.
+The team needs to add three capabilities to `task_queue`:
 
-```elixir
-# mix.exs — Experimenta con distintas restricciones
-defp deps do
-  [
-    # Caso 1: ~> con dos dígitos (MAJOR.MINOR)
-    {:plug, "~> 1.14"},
-    # Pregunta: ¿Acepta 1.15.0? ¿Acepta 1.13.0? ¿Acepta 2.0.0?
+1. **JSON serialization** — job payloads are encoded as JSON before enqueueing and decoded when processed
+2. **HTTP webhook notifications** — workers call an external URL when a job completes
+3. **Static analysis and docs** — Dialyxir and ExDoc for dev workflow, never deployed
 
-    # Caso 2: ~> con tres dígitos (MAJOR.MINOR.PATCH)
-    # {:plug, "~> 1.14.2"},
-    # Pregunta: ¿Acepta 1.14.3? ¿Acepta 1.15.0? ¿Acepta 1.14.1?
-
-    # Caso 3: >= sin límite superior
-    # {:plug, ">= 1.0.0"},
-    # ¿Por qué es peligroso en producción?
-
-    # Caso 4: versión exacta
-    # {:plug, "== 1.14.2"},
-    # ¿Cuándo tiene sentido usar esto?
-  ]
-end
-```
-
-```bash
-# TODO: Para cada restricción, ejecuta:
-$ mix deps.get
-
-# Verifica qué versión fue instalada mirando el lockfile:
-$ cat mix.lock | grep plug
-# "plug": {:hex, :plug, "1.15.3", ...}
-
-# O usa mix deps para ver el estado:
-$ mix deps
-# * plug 1.15.3 (Hex package) [ok]
-```
-
-```elixir
-# Resuelve mentalmente (y verifica con mix):
-# ¿Cuál es la diferencia entre estas dos restricciones?
-
-# A: {:phoenix, "~> 1.7"}
-# B: {:phoenix, "~> 1.7.0"}
-
-# Respuesta esperada:
-# A (~> 1.7) acepta: 1.7.0, 1.7.x, 1.8.0, 1.9.0, ... pero NO 2.0.0
-# B (~> 1.7.0) acepta: 1.7.0, 1.7.1, 1.7.x, ... pero NO 1.8.0 ni 2.0.0
-# La regla: el último segmento incluido determina el "techo" del incremento permitido
-```
-
-Expected output:
-```bash
-$ mix deps
-* jason 1.4.4 (Hex package) [ok]
-* plug 1.15.3 (Hex package) [ok]
-```
+These map directly to different dependency scopes in `mix.exs`.
 
 ---
 
-### Exercise 3: Dependencias Solo para Desarrollo
+## Why the lockfile is a production concern
 
-Configura correctamente las dependencias que no deben ir a producción.
+`mix.lock` records exact resolved versions — including transitive dependencies. Without committing it, two developers running `mix deps.get` on the same `mix.exs` may resolve different transitive versions. A bug that only reproduces on the CI server often traces back to a missing or inconsistent lockfile.
+
+The lockfile also records SHA hashes of downloaded tarballs, making supply-chain tampering detectable.
+
+```
+mix.lock entry anatomy:
+"jason": {:hex, :jason, "1.4.4",
+  "b9226785a9aa77b6857ca22832cffa5d5150298a",   ← tarball SHA
+  [:mix], [{:decimal, "~> 1.0 or ~> 2.0", [hex: :decimal, optional: true]}],
+  "hexpm", "..."}
+```
+
+Rule: `mix.lock` is always committed alongside `mix.exs`. It is never in `.gitignore`.
+
+---
+
+## Why `~>` and not `>=`
+
+`~>` (the optimistic operator) pins the upper bound to the next breaking version:
+
+- `~> 1.4` means `>= 1.4.0 and < 2.0.0` — allows minor and patch bumps
+- `~> 1.4.2` means `>= 1.4.2 and < 1.5.0` — only allows patch bumps
+- `>= 1.4.0` has no upper bound — could resolve `2.0.0` with breaking changes
+
+For stable, widely-used libraries like Jason, `~> 1.4` is idiomatic. For less stable APIs, `~> 1.4.2` gives tighter control.
+
+---
+
+## Implementation
+
+### Step 1: Create the project
+
+```bash
+mix new task_queue --sup
+cd task_queue
+```
+
+### Step 2: `mix.exs` — configure dependencies by environment
 
 ```elixir
-# mix.exs — Configura el proyecto con dependencias separadas por ambiente
-defmodule MyProject.MixProject do
+# mix.exs
+defmodule TaskQueue.MixProject do
   use Mix.Project
 
   def project do
     [
-      app: :my_project,
+      app: :task_queue,
       version: "0.1.0",
-      elixir: "~> 1.14",
+      elixir: "~> 1.15",
+      start_permanent: Mix.env() == :prod,
       deps: deps()
+    ]
+  end
+
+  def application do
+    [
+      extra_applications: [:logger],
+      mod: {TaskQueue.Application, []}
     ]
   end
 
   defp deps do
     [
-      # Dependencias de producción (todos los ambientes)
-      {:jason, "~> 1.4"},
+      # Production dependencies — available in all environments
+      # TODO: add {:jason, "~> 1.4"} for JSON encoding of job payloads
+      # TODO: add {:req, "~> 0.5"} for HTTP webhook notifications
 
-      # TODO: Agrega Dialyxir solo para :dev con runtime: false
-      # {:dialyxir, "~> 1.0", ...}
+      # Dev-only — static analysis, never included in a release
+      # TODO: add {:dialyxir, "~> 1.0", only: :dev, runtime: false}
 
-      # TODO: Agrega ExDoc solo para :dev con runtime: false
-      # {:ex_doc, "~> 0.31", ...}
+      # Dev-only — documentation generation
+      # TODO: add {:ex_doc, "~> 0.31", only: :dev, runtime: false}
 
-      # TODO: Agrega una dependencia de mocking solo para :test
-      # Busca en hex.pm una librería de mocking para Elixir (ej: "mox")
-      # {:mox, "~> 1.0", ...}
+      # Test-only — mocking for external HTTP calls
+      # TODO: add {:mox, "~> 1.0", only: :test}
 
-      # TODO: Agrega una dependencia para :dev y :test (lista de ambientes)
-      # {:faker, "~> 0.18", ...}
+      # Dev + test — seed data generation
+      # TODO: add {:faker, "~> 0.18", only: [:dev, :test]}
     ]
   end
 end
 ```
 
-```bash
-# TODO: Verifica que en el ambiente :prod las deps de dev no están disponibles
-$ MIX_ENV=prod mix deps
-# Las dependencias con only: :dev NO deben aparecer aquí
-
-$ MIX_ENV=dev mix deps
-# Las dependencias de dev SÍ aparecen aquí
-
-# ¿Por qué runtime: false para dialyxir y ex_doc?
-# Porque son herramientas de CLI — no necesitan iniciar como aplicaciones OTP
-# runtime: false significa "compilar pero no arrancar como app en el runtime"
-```
-
-Expected output:
-```bash
-$ MIX_ENV=prod mix deps
-* jason 1.4.4 (Hex package) [ok]
-# Solo jason aparece — dialyxir, ex_doc, mox, faker NO aparecen en prod
-```
-
----
-
-### Exercise 4: El Lockfile en Detalle
-
-Inspecciona y comprende el `mix.lock` para entender por qué es crítico para la reproducibilidad.
-
-```bash
-# Después de mix deps.get, inspecciona el lockfile generado
-$ cat mix.lock
-```
+### Step 3: `lib/task_queue/worker.ex` — use Jason for payload encoding
 
 ```elixir
-# mix.lock tiene este formato (fragmento real)
-%{
-  "jason": {:hex, :jason, "1.4.4",
-    "b9226785a9aa77b6857ca22832cffa5d5150298a",
-    [:mix], [{:decimal, "~> 1.0 or ~> 2.0", [hex: :decimal, optional: true]}],
-    "hexpm",
-    "82ce2b7648c57d4f72c0b7e55abf2b9b4f43a6e7..."},
-}
-```
-
-```elixir
-# Cada entrada en mix.lock tiene:
-# - Nombre del paquete: "jason"
-# - Fuente: :hex (de hex.pm)
-# - Nombre del package en hex: :jason
-# - Versión exacta instalada: "1.4.4"
-# - Hash SHA del tarball descargado (para verificación de integridad)
-# - Dependencias del paquete (las transitivas)
-# - Registro: "hexpm"
-# - Hash del contenido del paquete
-
-# TODO: Responde estas preguntas examinando tu mix.lock:
-# 1. ¿Qué versión exacta de jason está instalada?
-# 2. ¿Jason tiene alguna dependencia transitiva?
-# 3. ¿Qué pasa si borras mix.lock y ejecutas mix deps.get?
-#    (Pruébalo: mv mix.lock mix.lock.bak && mix deps.get)
-#    ¿Obtienes las mismas versiones?
-
-# TODO: Simula el escenario donde un colega no tiene mix.lock:
-# rm mix.lock
-# mix deps.get
-# git diff mix.lock    # ¿Qué cambió? ¿Es lo mismo?
-```
-
-Expected output:
-```bash
-$ cat mix.lock
-%{
-  "jason": {:hex, :jason, "1.4.4",
-    "b9226785a9aa77b6857ca22832cffa5d5150298a",
-    [:mix], [{:decimal, "~> 1.0 or ~> 2.0", [hex: :decimal, optional: true]}],
-    "hexpm", "..."},
-}
-# El lockfile garantiza que TODOS los desarrolladores instalan la misma versión exacta
-```
-
----
-
-### Exercise 5: Dependencia Local con path:
-
-Simula el desarrollo de una librería compartida referenciándola localmente desde otro proyecto.
-
-```bash
-# Crea dos proyectos separados
-$ mix new my_utils --module MyUtils
-$ mix new my_app --module MyApp
-
-# Estructura resultante:
-# workspace/
-# ├── my_utils/     ← La librería que desarrollas
-# └── my_app/       ← La app que usa la librería
-```
-
-```elixir
-# my_utils/lib/my_utils.ex
-defmodule MyUtils do
-  @doc "Formatea un número como moneda."
-  def format_currency(amount, currency \\ "USD") do
-    # TODO: Implementa formateo básico: "$1,234.56"
-    # Hint: usa :erlang.float_to_binary(amount, decimals: 2)
-    "#{currency} #{amount}"
-  end
-
-  @doc "Capitaliza cada palabra de un string."
-  def title_case(str) do
-    str
-    |> String.split()
-    |> Enum.map(&String.capitalize/1)
-    |> Enum.join(" ")
-  end
-end
-```
-
-```elixir
-# my_app/mix.exs — Referencia la librería local
-defp deps do
-  [
-    # TODO: Agrega {:my_utils, path: "../my_utils"} como dependencia local
-    # El path es relativo al directorio de my_app
-  ]
-end
-```
-
-```bash
-# En my_app
-$ mix deps.get
-# * Getting my_utils (../my_utils)  ← No descarga de hex, usa el path local
-
-$ iex -S mix
-```
-
-```elixir
-# En IEx de my_app — my_utils ya está disponible
-iex> MyUtils.title_case("hello world from elixir")
-"Hello World From Elixir"
-
-iex> MyUtils.format_currency(1234.56)
-"USD 1234.56"
-
-# TODO: Modifica MyUtils.format_currency/2 en my_utils para retornar "$1,234.56"
-# Luego en el IEx de my_app:
-iex> recompile()
-# Recompila my_utils y my_app automáticamente
-iex> MyUtils.format_currency(1234.56)
-"$1,234.56"   # El cambio se refleja sin reinstalar nada
-```
-
-Expected output:
-```elixir
-iex> MyUtils.title_case("the quick brown fox")
-"The Quick Brown Fox"
-```
-
----
-
-## Try It Yourself
-
-Crea un proyecto que use `{:req, "~> 0.5"}` para hacer un HTTP request y `{:jason, "~> 1.4"}` para parsear el JSON. Sin solución incluida.
-
-```elixir
-# Proyecto: weather_client
-# Objetivo: Consultar la API pública https://wttr.in/?format=j1
-#           y mostrar temperatura y descripción del tiempo
-
-defmodule WeatherClient do
+defmodule TaskQueue.Worker do
   @moduledoc """
-  Cliente HTTP para consultar temperatura actual.
-  Usa Req para HTTP y Jason para parsear el JSON de respuesta.
-  """
+  Processes a single job from the queue.
 
-  # La URL retorna JSON con el tiempo actual para una ciudad
-  @base_url "https://wttr.in"
+  Job payloads are JSON-encoded strings. Workers decode them, execute the job,
+  and optionally notify a webhook when done.
+  """
 
   @doc """
-  Consulta el tiempo para una ciudad dada.
-  Retorna {:ok, weather_info} o {:error, reason}.
+  Executes a job given its JSON-encoded payload.
+
+  Returns `{:ok, result}` or `{:error, reason}`.
   """
-  def get_weather(city \\ "London") do
-    # Implementa usando:
-    # 1. Req.get/1 para hacer el GET request a "#{@base_url}/#{city}?format=j1"
-    # 2. El body ya viene parseado (Req lo hace automáticamente si Jason está instalado)
-    # 3. Extrae current_condition -> temp_C y weatherDesc del JSON
-    # 4. Retorna {:ok, %{city: city, temp_c: temp, description: desc}}
-    raise "Not implemented"
+  @spec execute(String.t()) :: {:ok, term()} | {:error, term()}
+  def execute(encoded_payload) when is_binary(encoded_payload) do
+    # TODO: decode the JSON payload with Jason.decode/1
+    # If decoding fails, return {:error, {:bad_payload, reason}}
+    # If decoding succeeds, call do_work/1 with the decoded map
+    # TODO: implement
   end
 
   @doc """
-  Imprime el tiempo de forma legible.
+  Encodes a job map as a JSON string for enqueueing.
+
+  Returns `{:ok, json_string}` or `{:error, reason}`.
   """
-  def print_weather(city \\ "London") do
-    case get_weather(city) do
-      {:ok, info} ->
-        IO.puts("Weather in #{info.city}: #{info.temp_c}°C — #{info.description}")
-      {:error, reason} ->
-        IO.puts("Error: #{inspect(reason)}")
+  @spec encode_job(map()) :: {:ok, String.t()} | {:error, term()}
+  def encode_job(job_map) when is_map(job_map) do
+    # TODO: use Jason.encode/1
+    # TODO: implement
+  end
+
+  defp do_work(%{"type" => type, "args" => args}) do
+    # Simulate work — in production this dispatches by job type
+    {:ok, %{type: type, args: args, processed_at: DateTime.utc_now()}}
+  end
+
+  defp do_work(_invalid), do: {:error, :missing_required_fields}
+end
+```
+
+### Step 4: Given tests — must pass without modification
+
+```elixir
+# test/task_queue/worker_test.exs
+defmodule TaskQueue.WorkerTest do
+  use ExUnit.Case, async: true
+
+  alias TaskQueue.Worker
+
+  describe "encode_job/1 and execute/1 round-trip" do
+    test "encodes and decodes a valid job" do
+      job = %{"type" => "send_email", "args" => %{"to" => "user@example.com"}}
+
+      assert {:ok, encoded} = Worker.encode_job(job)
+      assert is_binary(encoded)
+
+      assert {:ok, result} = Worker.execute(encoded)
+      assert result.type == "send_email"
+    end
+
+    test "returns error for invalid JSON payload" do
+      assert {:error, {:bad_payload, _}} = Worker.execute("not valid json {{{")
+    end
+
+    test "returns error for payload missing required fields" do
+      assert {:ok, encoded} = Worker.encode_job(%{"incomplete" => true})
+      assert {:error, :missing_required_fields} = Worker.execute(encoded)
     end
   end
 end
-
-# En IEx:
-# WeatherClient.print_weather("Madrid")
-# Weather in Madrid: 22°C — Partly cloudy
 ```
 
-**Objetivo**: Configurar las dependencias correctamente en `mix.exs`, ejecutar `mix deps.get`, y que el código funcione consultando una API real.
+### Step 5: Run the tests
 
----
-
-## Common Mistakes
-
-### Mistake 1: Olvidar mix deps.get después de editar mix.exs
-
-**Wrong:**
 ```bash
-# Agregas {:jason, "~> 1.4"} a mix.exs y vas directo a compilar
-$ mix compile
+mix deps.get
+mix test test/task_queue/worker_test.exs --trace
 ```
-**Error:** `** (Mix) No such file or directory "deps/jason"`
-**Why:** Mix no descarga dependencias automáticamente al compilar. Solo las usa si ya están descargadas en el directorio `deps/`.
-**Fix:**
+
+All 3 tests fail initially. Implement `Worker.encode_job/1` and `Worker.execute/1` until they pass.
+
+### Step 6: Verify environment isolation
+
 ```bash
-$ mix deps.get  # Siempre después de cambiar deps en mix.exs
-$ mix compile
-```
+# Only jason, req appear — no dialyxir, ex_doc, mox, faker
+MIX_ENV=prod mix deps
 
-### Mistake 2: No committear mix.lock
+# All deps appear
+MIX_ENV=dev mix deps
 
-**Wrong:**
-```bash
-# .gitignore incorrecto que ignora el lockfile
-echo "mix.lock" >> .gitignore
-git add .gitignore
-git commit -m "ignore lock file"
-```
-**Why:** Sin el lockfile, distintos desarrolladores y entornos de CI instalan versiones diferentes de dependencias transitivas. Esto causa bugs que "solo ocurren en mi máquina".
-**Fix:**
-```bash
-# mix.lock NUNCA debe estar en .gitignore
-# Siempre committearlo junto con mix.exs
-git add mix.exs mix.lock
-git commit -m "add jason dependency"
-```
-
-### Mistake 3: Usar ~> con versión mayor que la disponible
-
-**Wrong:**
-```elixir
-{:jason, "~> 2.0"}   # Si Jason 2.x no existe todavía
-```
-**Error:** `No matching version found: jason ~> 2.0`
-**Fix:**
-```bash
-# Antes de agregar una dependencia, verifica en hex.pm qué versión es la latest
-$ mix hex.info jason
-# Latest: 1.4.4
-# Versions: 1.4.4, 1.4.3, 1.4.2, ...
-
-# Usar la versión correcta
-{:jason, "~> 1.4"}
+# Verify the lockfile was created
+ls -la mix.lock
 ```
 
 ---
 
-## Verification
+## Trade-off analysis
 
-```bash
-# Verificar que las dependencias están instaladas
-$ mix deps
+Fill in this table after running the project.
 
-# Verificar que el proyecto compila
-$ mix compile
+| Aspect | `~> 1.4` (minor range) | `~> 1.4.2` (patch range) | `>= 1.4.0` (no ceiling) |
+|--------|------------------------|--------------------------|-------------------------|
+| Flexibility | accepts minor bumps | patch bumps only | accepts breaking changes |
+| CI reproducibility | depends on lock | depends on lock | lock required, high risk |
+| Typical use | stable public APIs | unstable minor releases | almost never appropriate |
+| lock needed? | yes | yes | especially yes |
 
-# Verificar que los tests pasan (las deps no deben romper tests)
-$ mix test
+Reflection question: why does `runtime: false` on `dialyxir` matter for releases, even though `only: :dev` already excludes it from production builds?
 
-# Verificar que el lockfile existe y está actualizado
-$ ls -la mix.lock
+---
 
-# Verificar qué versión exacta de jason está instalada
-$ cat mix.lock | grep jason
-```
+## Common production mistakes
 
-## Summary
-- **Key concepts**: Hex package manager, `~>` vs `>=` vs `==`, `only: :dev`, `runtime: false`, `mix.lock`, dependencias `path:`
-- **What you practiced**: Agregar dependencias, entender restricciones de versión, separar dependencias por ambiente, leer el lockfile, referenciar proyectos locales
-- **Important to remember**: Siempre ejecuta `mix deps.get` después de cambiar `mix.exs`. Siempre committea `mix.lock`. Usa `~>` con dos dígitos para librerías estables, tres dígitos cuando quieres estabilidad máxima de patch.
+**1. `mix.lock` in `.gitignore`**
+Two developers resolve different transitive versions. Bug appears in CI but not locally. Always commit `mix.lock`.
 
-## What's Next
-En el siguiente ejercicio **20-configuracion-config-runtime** aprenderás a separar la configuración por ambiente y a leer variables de entorno en runtime de forma segura.
+**2. `mix compile` without `mix deps.get` first**
+After editing `mix.exs`, you must run `mix deps.get`. The compiler uses whatever is in `deps/` — it does not auto-fetch.
+
+**3. `~>` with the wrong precision**
+`{:plug, "~> 1.14"}` allows `1.15`, `1.16`, etc. `{:plug, "~> 1.14.2"}` locks to `1.14.x`. Using two-digit `~>` for well-maintained libraries is idiomatic; three-digit when you want strict patch stability.
+
+**4. Forgetting `runtime: false` on CLI tools**
+Without it, `dialyxir` starts as an OTP application at runtime — adding startup overhead and potentially conflicting with your app's process tree.
+
+**5. `path:` dependencies left in production**
+`{:my_lib, path: "../my_lib"}` is useful during local development but must never be deployed. Use it only in dev, with the Hex version commented out alongside it.
+
+---
 
 ## Resources
+
 - [Hex Package Manager](https://hex.pm)
-- [Mix.Tasks.Deps](https://hexdocs.pm/mix/Mix.Tasks.Deps.html)
-- [Version Constraints — Mix](https://hexdocs.pm/elixir/Version.html)
-- [Req HTTP Client](https://hexdocs.pm/req/Req.html)
-- [Jason JSON Library](https://hexdocs.pm/jason/Jason.html)
+- [Mix.Tasks.Deps — official docs](https://hexdocs.pm/mix/Mix.Tasks.Deps.html)
+- [Version constraints in Elixir](https://hexdocs.pm/elixir/Version.html)
+- [Jason — JSON library](https://hexdocs.pm/jason/Jason.html)
+- [Req — HTTP client](https://hexdocs.pm/req/Req.html)

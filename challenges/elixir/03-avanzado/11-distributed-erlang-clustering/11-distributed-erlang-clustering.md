@@ -1,491 +1,544 @@
-# 11. Distributed Erlang Clustering
+# Distributed Erlang Clustering: Multi-Node `api_gateway`
 
-**Difficulty**: Avanzado
-
----
-
-## Prerequisites
-
-- GenServer y OTP fundamentals (ejercicios 01-10)
-- Conceptos de red: TCP/IP, hostname resolution
-- IEx básico y Mix projects
-- Comprensión de procesos y PIDs en Elixir
+**Project**: `api_gateway` — built incrementally across the advanced level
 
 ---
 
-## Learning Objectives
+## Project context
 
-- Conectar múltiples nodos Erlang/Elixir en un cluster
-- Entender el modelo de distribución de Erlang: fully connected mesh
-- Manejar cookies de seguridad para autenticación entre nodos
-- Implementar monitoring de nodos y detección de netsplits
-- Hacer llamadas remotas a procesos en otros nodos
-- Diseñar sistemas resilientes ante particiones de red
+You're building `api_gateway`. Traffic has grown to the point where a single node cannot
+handle peak load. The operations team needs to run multiple gateway instances in a Kubernetes
+cluster and keep them coordinated: rate limit counters must be shared, circuit breaker state
+must be consistent, and if one node goes down the others must keep serving.
 
----
+This exercise introduces Erlang's native distribution layer — how nodes connect, authenticate,
+communicate, and detect each other's failures.
 
-## Concepts
-
-### El modelo de distribución de Erlang
-
-Erlang usa un modelo de **fully connected mesh**: cada nodo conoce y está conectado directamente a todos los demás nodos del cluster. No hay nodo central ni routing — los mensajes van directo de origen a destino.
-
-Esto tiene implicaciones importantes:
-- Con N nodos, hay N*(N-1)/2 conexiones TCP
-- Un cluster de 100 nodos tiene ~5000 conexiones — razonable
-- Un cluster de 10,000 nodos tendría 50 millones — no escala bien
-- En producción, clusters de Erlang rara vez superan los 100-200 nodos
+Project structure at this point:
 
 ```
-Nodo A ←——→ Nodo B
-  ↕               ↕
-Nodo C ←——→ Nodo D
+api_gateway/
+├── lib/
+│   └── api_gateway/
+│       ├── application.ex
+│       ├── cluster/
+│       │   └── manager.ex          # ← you implement
+│       └── rate_limiter/
+│           └── server.ex           # already exists
+├── test/
+│   └── api_gateway/
+│       └── cluster/
+│           └── manager_test.exs    # given tests — must pass
+└── mix.exs
 ```
 
-Cada par está conectado directamente via TCP. Cuando A envía un mensaje a D, va directo, sin pasar por B o C.
+---
 
-### Nombres de nodo
+## The business problem
 
-Un nodo distribuido necesita un nombre único. Hay dos formatos:
+The gateway currently runs as a single BEAM node. Three failure modes are now hitting
+production:
+
+1. **Rate limit bypass**: with two instances behind a load balancer, a client hitting
+   different instances on every request sees its own independent counter on each. A limit
+   of 100 req/min effectively becomes 100 × N req/min.
+
+2. **No failover awareness**: when a node crashes, the other nodes keep routing to its
+   upstreams without knowing whether its circuit breakers had opened them.
+
+3. **Blind restarts**: Kubernetes restarts a crashed pod, but the other nodes don't know
+   a pod returned until they try to call it and discover it's alive. There is no cluster
+   membership event.
+
+The immediate fix is to make the nodes aware of each other. Before building distributed
+data structures (Horde, exercise 13), you need the foundation: connected nodes, mutual
+authentication, and a process that reacts to cluster topology changes.
+
+---
+
+## Why Erlang's distribution model works for this
+
+Erlang uses a **fully connected mesh**: every node connects directly to every other node.
+There is no broker, no relay. A message from node A to node D crosses one TCP hop.
+
+```
+A ←——→ B
+↕         ↕
+C ←——→ D
+```
+
+Every pair has a direct TCP connection. With N nodes, there are N×(N-1)/2 connections.
+At 10 nodes: 45 connections. At 100 nodes: 4,950 connections. At 200 nodes: 19,900
+connections. In practice Erlang clusters in production rarely exceed ~100–150 nodes.
+`api_gateway` clusters are typically 3–20 nodes — the mesh model is the right fit.
+
+The key property: once connected, a process on any node can send a message to a process
+on any other node using the same `send/2` or `GenServer.call/2` API as a local call.
+Distribution is transparent to application code.
+
+---
+
+## How node identity and authentication work
+
+### Node names
+
+Every distributed BEAM node needs a unique name:
 
 ```bash
-# Short name — solo funciona en la misma red local
-iex --sname mynode
+# Short names — only within the same LAN subnet (not recommended for production)
+iex --sname gateway_a
 
-# Long name — incluye hostname, recomendado para producción
-iex --name mynode@192.168.1.10
-iex --name mynode@hostname.example.com
+# Long names — include full hostname, required across subnets
+iex --name gateway_a@10.0.1.5
+iex --name gateway_a@gateway-a.cluster.internal
 ```
 
-En código, el nombre del nodo actual:
+Long names and short names cannot connect to each other. In production, always use
+long names with stable hostnames (not ephemeral IPs).
+
+In code:
 
 ```elixir
-node()
-#=> :mynode@hostname
-
-Node.self()
-#=> :mynode@hostname  # equivalente
+node()         #=> :"gateway_a@10.0.1.5"
+Node.self()    #=> :"gateway_a@10.0.1.5"  # same thing
+Node.list()    #=> [:"gateway_b@10.0.1.6", :"gateway_c@10.0.1.7"]
 ```
 
-**Long names vs short names**: los nodos con long names solo pueden conectarse a otros long names, y viceversa. No mezclar.
+### Cookie authentication
 
-### Cookies: el mecanismo de seguridad
-
-La "cookie" es un shared secret que todos los nodos del cluster deben compartir. Es el único control de acceso en Erlang distribuido — no hay TLS por defecto, no hay autenticación adicional.
+The "cookie" is a shared secret. Two nodes will refuse to connect if their cookies differ.
+It is the **only** built-in access control in Erlang distribution — there is no TLS
+by default, no certificate validation.
 
 ```elixir
-# Ver la cookie actual
-:erlang.get_cookie()
-#=> :mycookie
+# Read the current cookie
+:erlang.get_cookie()       #=> :my_secret_cookie
 
-# Establecer cookie en runtime
-:erlang.set_cookie(node(), :mysecretcookie)
-
-# Establecer cookie para un nodo específico
-:erlang.set_cookie(:"other@host", :theirpassword)
+# Set cookie at runtime (before connecting)
+:erlang.set_cookie(:"gateway_b@10.0.1.6", :my_secret_cookie)
 ```
 
-Desde la línea de comandos:
+In production, provide the cookie via environment variable and set it in `application.ex`
+before starting the supervision tree. Never hardcode it or commit it to version control.
 
-```bash
-iex --name nodeA@localhost --cookie mysecretcookie
-```
+Real production security: run the cluster on an isolated VPC with WireGuard or mTLS.
+The cookie alone protects against accidental cross-cluster connections, not against
+a compromised host inside the same network segment.
 
-En producción, la cookie debe venir de un secret manager, nunca hardcodeada. El archivo `~/.erlang.cookie` es otro mecanismo — Erlang lo lee automáticamente si no se especifica cookie.
-
-**Seguridad real en producción**: usar WireGuard o VPN para la red del cluster, y TLS para distribución Erlang (`:inet_tls_dist`). La cookie sola no es suficiente.
-
-### Conectar nodos
+### Connecting nodes
 
 ```elixir
-# Conectar a otro nodo — retorna true si exitoso
-Node.connect(:"nodeB@localhost")
-#=> true
+# Returns true if connected (or already connected), false if unreachable or auth failed
+Node.connect(:"gateway_b@10.0.1.6")   #=> true
 
-# Listar nodos conectados
-Node.list()
-#=> [:"nodeB@localhost", :"nodeC@localhost"]
-
-# Verificar si un nodo está disponible
-:net_adm.ping(:"nodeB@localhost")
-#=> :pong   # disponible
-#=> :pang   # no disponible (la p viene de "ping/pang" en sueco)
+# Probe reachability without connecting (uses ICMP-like mechanism at the Erlang level)
+:net_adm.ping(:"gateway_b@10.0.1.6")  #=> :pong   # reachable
+                                       #=> :pang   # unreachable (Swedish: "pong/pang")
 ```
 
-`Node.connect/1` establece la conexión TCP y autentica con la cookie. Si las cookies no coinciden, retorna `false` y logea un error.
+Connecting node A to node B also connects A to every node B already knows. Cluster
+formation is transitive: connect to one member and you join the full mesh.
 
-### Topología del cluster y :net_kernel
+---
 
-`:net_kernel` es el proceso OTP que gestiona la distribución. En condiciones normales no interactúas directamente con él, pero es útil para monitoring:
+## Detecting cluster topology changes
+
+`:net_kernel` is the OTP process that manages distribution. Subscribing to node events:
 
 ```elixir
-# Monitorear eventos de nodos (conexiones y desconexiones)
+# In init/1 of your GenServer:
 :net_kernel.monitor_nodes(true)
 
-# Ahora recibirás mensajes:
-# {:nodeup, :"nodeB@localhost"}
-# {:nodedown, :"nodeB@localhost"}
+# You now receive in handle_info:
+{:nodeup,   :"gateway_b@10.0.1.6"}
+{:nodedown, :"gateway_b@10.0.1.6"}
 
-# Con opciones adicionales
-:net_kernel.monitor_nodes(true, [node_type: :all])
+# With full metadata:
+:net_kernel.monitor_nodes(true, node_type: :all)
+# Messages become: {:nodeup, node, info} and {:nodedown, node, info}
 ```
 
-Para desactivar:
+Call `:net_kernel.monitor_nodes(false)` to unsubscribe. Subscriptions are per-process.
+When the subscribing process dies, Erlang cleans up the subscription automatically.
+
+---
+
+## Netsplits and the CAP theorem
+
+A **netsplit** is when the TCP layer between two groups of nodes breaks. Each group
+believes the other is down. Both groups keep running. If both groups accept writes,
+you have **split brain**: two conflicting versions of truth that must be reconciled
+when the network heals.
+
+```
+Before:     A ←→ B ←→ C
+Netsplit:   A  |  B ←→ C
+
+A sees:  B, C as :nodedown
+B sees:  A as :nodedown, C as alive
+C sees:  A as :nodedown, B as alive
+```
+
+The CAP theorem says a distributed system can guarantee at most two of: Consistency,
+Availability, Partition tolerance. During a netsplit you must choose:
+
+- **CP** (consistency + partition tolerance): reject writes when below quorum.
+  The minority partition refuses to accept requests that could diverge from the majority.
+  Correct but unavailable during the split.
+
+- **AP** (availability + partition tolerance): both sides keep accepting writes.
+  They will diverge and must merge on recovery. Available but risks data loss or
+  conflicts.
+
+For `api_gateway`'s rate limiter: CP is correct. If we cannot confirm the global count,
+we should either reject the request or apply a conservative local limit. Allowing 100
+req/min on each of 3 isolated partitions means 300 req/min reach the downstream — worse
+than having no rate limiting.
+
+**Quorum rule**: the minority partition (fewer than half the expected nodes) stops
+accepting requests. The majority partition keeps serving normally.
+
+---
+
+## Implementation
+
+### Step 1: `lib/api_gateway/cluster/manager.ex`
 
 ```elixir
-:net_kernel.monitor_nodes(false)
-```
-
-### Enviar mensajes a procesos remotos
-
-Si tienes el PID de un proceso remoto, puedes enviarle mensajes directamente:
-
-```elixir
-# Un PID remoto se ve así:
-remote_pid = #PID<1.0.1>  # el primer número es el nodo
-
-# Enviar mensaje — funciona igual que local
-send(remote_pid, {:hello, "from nodeA"})
-
-# GenServer.call también funciona con PIDs remotos
-GenServer.call(remote_pid, :get_state)
-```
-
-También puedes registrar procesos por nombre y hacer llamadas remotas:
-
-```elixir
-# En nodeB, un GenServer registrado como :my_server
-GenServer.call({:my_server, :"nodeB@localhost"}, :get_state)
-```
-
-### Netsplits: la realidad de los sistemas distribuidos
-
-Un **netsplit** (partición de red) ocurre cuando los nodos del cluster se separan en grupos que no pueden comunicarse entre sí. Cada grupo cree que los otros nodos están caídos.
-
-```
-ANTES:    A ←→ B ←→ C
-NETSPLIT: A | B ←→ C
-
-A ve: [B, C] desconectados
-B ve: [A desconectado], [C conectado]
-C ve: [A desconectado], [B conectado]
-```
-
-Las implicaciones son severas:
-- Si B y C son primarios de un dato, A puede tener datos stale
-- Si A tenía el "líder", B y C pueden elegir otro — split brain
-- Cuando la red se recupera, hay conflictos que resolver
-
-**No hay solución perfecta** — el teorema CAP dice que debes elegir:
-- CP: consistency + partition tolerance (rechazar escrituras durante netsplit)
-- AP: availability + partition tolerance (aceptar escrituras con riesgo de conflicto)
-
-En producción, la mayoría de sistemas críticos usan CP: si el nodo no puede contactar quorum, rechaza operaciones.
-
-### Handling netsplits con monitor_nodes
-
-```elixir
-defmodule ClusterMonitor do
+defmodule ApiGateway.Cluster.Manager do
   use GenServer
   require Logger
 
-  def start_link(opts \\ []) do
+  @reconnect_interval_ms 5_000
+  @max_history            100
+
+  # ---------------------------------------------------------------------------
+  # Public API
+  # ---------------------------------------------------------------------------
+
+  def start_link(opts) do
+    # opts must include: known_nodes: [node_name, ...]
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
   end
 
-  def init(_opts) do
-    :net_kernel.monitor_nodes(true, [node_type: :all])
-    {:ok, %{nodes: Node.list()}}
+  @doc "Returns %{connected: [node], degraded: bool, quorum_size: int}"
+  def status do
+    GenServer.call(__MODULE__, :status)
   end
 
-  def handle_info({:nodeup, node, _info}, state) do
-    Logger.info("Node joined cluster: #{node}")
-    {:noreply, %{state | nodes: [node | state.nodes]}}
+  @doc "Returns the last @max_history cluster events, newest first."
+  def event_history do
+    GenServer.call(__MODULE__, :history)
   end
 
-  def handle_info({:nodedown, node, _info}, state) do
-    Logger.warning("Node left cluster (possible netsplit): #{node}")
-    # Aquí irían las acciones de recovery
-    {:noreply, %{state | nodes: List.delete(state.nodes, node)}}
-  end
-end
-```
-
----
-
-## Exercises
-
-### Exercise 1: Conectar dos nodos IEx
-
-**Problem**: Inicia dos nodos IEx en terminales separadas y conéctalos. Verifica la conexión bidireccional, envía mensajes entre ellos, y examina cómo se ven los PIDs remotos.
-
-**Hints**:
-- Usa `--name` con long names para ambos nodos
-- La cookie debe ser idéntica en ambos
-- `Node.connect/1` en uno solo es suficiente — la conexión es bidireccional
-- Examina el PID resultante de `spawn` remoto — el primer número identifica el nodo
-
-**One possible solution**:
-
-```elixir
-# Terminal 1:
-# iex --name nodeA@127.0.0.1 --cookie secretcookie
-
-# Terminal 2:
-# iex --name nodeB@127.0.0.1 --cookie secretcookie
-
-# En nodeA:
-Node.connect(:"nodeB@127.0.0.1")
-#=> true
-
-Node.list()
-#=> [:"nodeB@127.0.0.1"]
-
-# Spawn un proceso en nodeB desde nodeA:
-pid = Node.spawn(:"nodeB@127.0.0.1", fn ->
-  receive do
-    {:hello, from} -> IO.puts("Hello from #{inspect(from)}")
-  end
-end)
-
-# El PID tiene el nodo codificado: #PID<nodo.proceso.serial>
-send(pid, {:hello, node()})
-
-# Llamada a función remota:
-Node.spawn(:"nodeB@127.0.0.1", IO, :inspect, [node()])
-```
-
----
-
-### Exercise 2: Remote GenServer Calls
-
-**Problem**: Implementa un `CounterServer` que se registra localmente en su nodo. Desde otro nodo, inicia el servidor, haz calls y casts remotos, y maneja el caso donde el nodo remoto no está disponible.
-
-**Hints**:
-- Registra el GenServer con `name: __MODULE__` para usar `{Module, node}` desde remoto
-- `GenServer.call({Module, remote_node}, msg)` funciona si el módulo está cargado en ambos nodos
-- El timeout por defecto de GenServer.call es 5000ms — ajústalo para llamadas remotas lentas
-- Prueba desconectar el nodo B mientras hay calls en vuelo — observa el error
-
-**One possible solution**:
-
-```elixir
-defmodule CounterServer do
-  use GenServer
-
-  def start_link(opts \\ []) do
-    GenServer.start_link(__MODULE__, 0, name: __MODULE__)
+  @doc """
+  Returns true if this node has quorum — i.e., it should accept writes.
+  Quorum = strict majority of known_nodes (including self).
+  """
+  def has_quorum? do
+    GenServer.call(__MODULE__, :has_quorum?)
   end
 
-  def increment(node \\ node()) do
-    GenServer.call({__MODULE__, node}, :increment)
-  end
+  # ---------------------------------------------------------------------------
+  # GenServer lifecycle
+  # ---------------------------------------------------------------------------
 
-  def value(node \\ node()) do
-    GenServer.call({__MODULE__, node}, :value)
-  end
+  @impl true
+  def init(opts) do
+    known_nodes = Keyword.fetch!(opts, :known_nodes)
 
-  def init(initial), do: {:ok, initial}
+    # TODO: subscribe to node events so handle_info receives {:nodeup, node} and {:nodedown, node}
+    # HINT: :net_kernel.monitor_nodes(true)
 
-  def handle_call(:increment, _from, count), do: {:reply, count + 1, count + 1}
-  def handle_call(:value, _from, count), do: {:reply, count, count}
-end
+    # TODO: attempt to connect to all known nodes immediately.
+    # Node.connect returns true/false — log failures at :warning level.
+    # HINT: Enum.each(known_nodes, fn n -> ... end)
 
-# En nodeA: iniciar el servidor
-{:ok, _} = CounterServer.start_link()
+    # TODO: schedule periodic reconnect attempts for unreachable nodes.
+    # HINT: Process.send_after(self(), :reconnect, @reconnect_interval_ms)
 
-# En nodeB: llamar al servidor en nodeA
-remote_node = :"nodeA@127.0.0.1"
-
-# Verificar que el nodo está disponible antes de llamar
-case :net_adm.ping(remote_node) do
-  :pong ->
-    CounterServer.increment(remote_node)
-  :pang ->
-    {:error, :node_not_available}
-end
-```
-
----
-
-### Exercise 3: Netsplit Detection y Recovery
-
-**Problem**: Implementa un `ClusterManager` GenServer que monitorea el estado del cluster, detecta netsplits, y ejecuta una estrategia de recovery configurable. Debe mantener un log de eventos del cluster y permitir consultar el historial.
-
-**Hints**:
-- Usa `:net_kernel.monitor_nodes(true, [node_type: :all])` para recibir eventos con metadata
-- Los mensajes son `{:nodeup, node, info}` y `{:nodedown, node, info}` con la opción `node_type: :all`
-- Implementa una estrategia de "quorum": si pierdes más de la mitad de los nodos, activa modo degradado
-- Considera usar un timer para intentar reconexión periódica a nodos conocidos
-- El historial puede ser una lista limitada (últimos 100 eventos) para evitar memoria ilimitada
-
-**One possible solution**:
-
-```elixir
-defmodule ClusterManager do
-  use GenServer
-  require Logger
-
-  @reconnect_interval 5_000
-  @max_history 100
-
-  defstruct [:known_nodes, :connected_nodes, :history, :degraded_mode]
-
-  def start_link(known_nodes) do
-    GenServer.start_link(__MODULE__, known_nodes, name: __MODULE__)
-  end
-
-  def cluster_status, do: GenServer.call(__MODULE__, :status)
-  def event_history, do: GenServer.call(__MODULE__, :history)
-
-  def init(known_nodes) do
-    :net_kernel.monitor_nodes(true, [node_type: :all])
-    # Intentar conectar a todos los nodos conocidos al inicio
-    Enum.each(known_nodes, &Node.connect/1)
-
-    schedule_reconnect()
-
-    state = %__MODULE__{
+    state = %{
       known_nodes: known_nodes,
-      connected_nodes: Node.list(),
+      # TODO: populate connected_nodes from Node.list() filtered to known_nodes
+      connected_nodes: [],
       history: [],
-      degraded_mode: false
+      degraded: false
     }
+
     {:ok, state}
   end
 
-  def handle_info({:nodeup, node, _info}, state) do
-    event = {DateTime.utc_now(), :nodeup, node}
-    Logger.info("[ClusterManager] Node up: #{node}")
-    new_connected = Enum.uniq([node | state.connected_nodes])
-    new_state = %{state |
-      connected_nodes: new_connected,
-      history: Enum.take([event | state.history], @max_history),
-      degraded_mode: false
-    }
-    {:noreply, new_state}
-  end
+  # ---------------------------------------------------------------------------
+  # Cluster event handlers
+  # ---------------------------------------------------------------------------
 
-  def handle_info({:nodedown, node, _info}, state) do
-    event = {DateTime.utc_now(), :nodedown, node}
-    Logger.warning("[ClusterManager] Node down: #{node} — possible netsplit")
-    new_connected = List.delete(state.connected_nodes, node)
-
-    # Quorum: degraded si perdemos más de la mitad de nodos conocidos
-    quorum = length(state.known_nodes) / 2
-    degraded = length(new_connected) < quorum
-
-    if degraded, do: Logger.error("[ClusterManager] Below quorum — entering degraded mode")
-
-    new_state = %{state |
-      connected_nodes: new_connected,
-      history: Enum.take([event | state.history], @max_history),
-      degraded_mode: degraded
-    }
-    {:noreply, new_state}
-  end
-
-  def handle_info(:reconnect, state) do
-    disconnected = state.known_nodes -- state.connected_nodes -- [node()]
-    Enum.each(disconnected, fn n ->
-      Logger.info("[ClusterManager] Attempting reconnect to #{n}")
-      Node.connect(n)
-    end)
-    schedule_reconnect()
+  @impl true
+  def handle_info({:nodeup, node}, state) do
+    # TODO:
+    # 1. Log info: "Node joined: #{node}"
+    # 2. Add node to connected_nodes (only if it is in known_nodes)
+    # 3. Prepend {:nodeup, node, DateTime.utc_now()} to history, keep last @max_history
+    # 4. Recompute degraded? flag
+    # 5. {:noreply, new_state}
     {:noreply, state}
   end
 
-  def handle_call(:status, _from, state) do
-    status = %{
-      current_node: node(),
-      connected: state.connected_nodes,
-      degraded_mode: state.degraded_mode,
-      quorum_size: length(state.known_nodes)
-    }
-    {:reply, status, state}
+  @impl true
+  def handle_info({:nodedown, node}, state) do
+    # TODO:
+    # 1. Log warning: "Node left (possible netsplit): #{node}"
+    # 2. Remove node from connected_nodes
+    # 3. Prepend {:nodedown, node, DateTime.utc_now()} to history, keep last @max_history
+    # 4. Recompute degraded? flag — if below quorum, also log error
+    # 5. {:noreply, new_state}
+    {:noreply, state}
   end
 
+  @impl true
+  def handle_info(:reconnect, state) do
+    # TODO:
+    # 1. Find disconnected = known_nodes -- connected_nodes -- [node()]
+    # 2. For each disconnected node, attempt Node.connect(n) — log attempts at :debug
+    # 3. Reschedule :reconnect
+    # 4. {:noreply, state}  (node_up events will update connected_nodes if connect succeeds)
+    {:noreply, state}
+  end
+
+  # ---------------------------------------------------------------------------
+  # Query handlers
+  # ---------------------------------------------------------------------------
+
+  @impl true
+  def handle_call(:status, _from, state) do
+    # TODO: return %{connected: state.connected_nodes, degraded: state.degraded,
+    #               quorum_size: quorum_size(state), current_node: node()}
+    {:reply, %{}, state}
+  end
+
+  @impl true
   def handle_call(:history, _from, state) do
     {:reply, state.history, state}
   end
 
-  defp schedule_reconnect do
-    Process.send_after(self(), :reconnect, @reconnect_interval)
+  @impl true
+  def handle_call(:has_quorum?, _from, state) do
+    # TODO: true if (length(connected_nodes) + 1) > length(known_nodes) / 2
+    # +1 because self() is always in the cluster but not in connected_nodes
+    {:reply, false, state}
+  end
+
+  # ---------------------------------------------------------------------------
+  # Private helpers
+  # ---------------------------------------------------------------------------
+
+  # TODO: defp quorum_size(state), return ceil(length(state.known_nodes) / 2)
+  # TODO: defp compute_degraded(state), return not has_quorum? based on current connected count
+end
+```
+
+### Step 2: Wire into `application.ex`
+
+```elixir
+# In lib/api_gateway/application.ex start/2, add to the children list
+# BEFORE CoreSupervisor so the cluster is formed before rate limiting starts:
+
+{ApiGateway.Cluster.Manager,
+  known_nodes: Application.fetch_env!(:api_gateway, :cluster_nodes)}
+```
+
+In `config/runtime.exs`:
+
+```elixir
+config :api_gateway, :cluster_nodes,
+  System.get_env("CLUSTER_NODES", "")
+  |> String.split(",", trim: true)
+  |> Enum.map(&String.to_atom/1)
+```
+
+### Step 3: Guard rate limiting with quorum
+
+```elixir
+# In lib/api_gateway/rate_limiter/server.ex, add to check/3:
+def check(client_id, limit, window_ms) do
+  # TODO: if not ApiGateway.Cluster.Manager.has_quorum?(),
+  # return {:deny, :no_quorum} before the normal ETS check.
+  # When degraded, refuse the request rather than allow potentially uncounted traffic.
+  # ...existing implementation...
+end
+```
+
+### Step 4: Given tests — must pass without modification
+
+```elixir
+# test/api_gateway/cluster/manager_test.exs
+defmodule ApiGateway.Cluster.ManagerTest do
+  use ExUnit.Case, async: false
+
+  alias ApiGateway.Cluster.Manager
+
+  # These tests start the Manager in isolation with fake known_nodes
+  # so they don't require a real multi-node setup.
+
+  setup do
+    # Use the current node plus two non-existent nodes as the cluster config
+    known = [node(), :"fake_a@nohost", :"fake_b@nohost"]
+    {:ok, manager} = start_supervised({Manager, known_nodes: known})
+    %{manager: manager, known: known}
+  end
+
+  describe "status/0" do
+    test "reports current node, no fake nodes connected", %{known: known} do
+      status = Manager.status()
+      assert status.current_node == node()
+      # The two fake nodes are unreachable — only self is in quorum count
+      assert is_list(status.connected)
+      assert is_boolean(status.degraded)
+      assert status.quorum_size == 2  # ceil(3/2)
+    end
+  end
+
+  describe "has_quorum?/0" do
+    test "returns false when only self is reachable out of 3 known nodes" do
+      # Only self is up; 1 out of 3 < majority (2)
+      refute Manager.has_quorum?()
+    end
+  end
+
+  describe "event_history/0" do
+    test "starts empty" do
+      assert Manager.event_history() == []
+    end
+
+    test "records nodeup events" do
+      # Simulate a nodeup by sending the message directly
+      send(Process.whereis(Manager), {:nodeup, :"fake_a@nohost"})
+      Process.sleep(50)
+
+      history = Manager.event_history()
+      assert length(history) == 1
+      assert match?({:nodeup, :"fake_a@nohost", _datetime}, hd(history))
+    end
+
+    test "records nodedown events" do
+      send(Process.whereis(Manager), {:nodeup, :"fake_a@nohost"})
+      send(Process.whereis(Manager), {:nodedown, :"fake_a@nohost"})
+      Process.sleep(50)
+
+      history = Manager.event_history()
+      # Most recent first
+      assert match?({:nodedown, :"fake_a@nohost", _}, hd(history))
+    end
+
+    test "history is capped at 100 entries" do
+      pid = Process.whereis(Manager)
+      for i <- 1..120 do
+        send(pid, {:nodeup, :"node_#{i}@nohost"})
+      end
+      Process.sleep(200)
+
+      assert length(Manager.event_history()) == 100
+    end
+  end
+
+  describe "quorum transitions" do
+    test "has_quorum? becomes true when majority of nodes join" do
+      pid = Process.whereis(Manager)
+      # With 3 known nodes, need 2 connected (+ self = 3) for quorum... but
+      # actually need (connected+1) > 3/2 → connected+1 > 1.5 → connected >= 1
+      send(pid, {:nodeup, :"fake_a@nohost"})
+      Process.sleep(50)
+
+      assert Manager.has_quorum?()
+    end
+
+    test "degraded flag is set when below quorum" do
+      # Initially below quorum (only self, 2 fake nodes unreachable)
+      status = Manager.status()
+      assert status.degraded == true
+    end
+
+    test "degraded flag clears when quorum is restored" do
+      pid = Process.whereis(Manager)
+      send(pid, {:nodeup, :"fake_a@nohost"})
+      Process.sleep(50)
+
+      status = Manager.status()
+      assert status.degraded == false
+    end
   end
 end
 ```
 
----
+### Step 5: Run the tests
 
-## Common Mistakes
-
-**Cookie mismatch silencioso**: `Node.connect/1` retorna `false` sin error claro cuando las cookies no coinciden. Siempre verifica con `:net_adm.ping/1` y revisa los logs de Erlang (`--logger-level debug`).
-
-**Mezclar short y long names**: Un nodo con `--sname` no puede conectarse a uno con `--name`. El error es confuso porque `Node.connect` simplemente retorna `false`.
-
-**Asumir que los módulos están disponibles en el nodo remoto**: Si haces `Node.spawn(remote, MyModule, :func, [])`, el módulo `MyModule` debe estar compilado y disponible en el nodo remoto. En desarrollo con iex, puedes copiar el beam manualmente. En producción, todos los nodos deben tener el mismo release.
-
-**No manejar `:nodedown` en procesos que dependen de nodos remotos**: Si tienes un GenServer con un PID remoto cacheado, ese PID deja de ser válido cuando el nodo se cae. Siempre monitorea los nodos de los que dependes.
-
-**Split brain silencioso**: El mayor peligro en sistemas distribuidos. Sin quorum ni consensus, dos particiones pueden aceptar escrituras contradictorias. Diseña explícitamente qué pasa durante un netsplit — la respuesta "no me importa" casi siempre está mal.
-
-**localhost vs 127.0.0.1**: Con long names, usa la misma forma en todos los nodos. `nodeA@localhost` y `nodeA@127.0.0.1` son nodos diferentes.
-
----
-
-## Verification
-
-Para verificar tu implementación del Exercise 3:
-
-```elixir
-# Inicia el cluster con 3 nodos
-known = [:"nodeA@127.0.0.1", :"nodeB@127.0.0.1", :"nodeC@127.0.0.1"]
-{:ok, _} = ClusterManager.start_link(known)
-
-# Verifica estado inicial
-%{connected: connected, degraded_mode: false} = ClusterManager.cluster_status()
-assert length(connected) == 2  # los otros 2 nodos
-
-# Simula netsplit desconectando un nodo
-Node.disconnect(:"nodeB@127.0.0.1")
-
-# Verifica que el manager detectó el evento
-:timer.sleep(100)
-history = ClusterManager.event_history()
-assert {:nodedown, :"nodeB@127.0.0.1"} in Enum.map(history, fn {_, type, node} -> {type, node} end)
-
-# Con 2 de 3 nodos aún conectados (incluyendo el actual), no debe ser degraded
-%{degraded_mode: false} = ClusterManager.cluster_status()
+```bash
+mix test test/api_gateway/cluster/manager_test.exs --trace
 ```
 
 ---
 
-## Summary
+## Trade-off analysis
 
-Erlang's distribution model es poderoso pero requiere diseño explícito para la resiliencia:
+| Design choice | Benefit | Risk |
+|---------------|---------|------|
+| Fully connected mesh | Zero-hop messaging, simple topology | Connection count grows as N²; unsuitable for > ~200 nodes |
+| Cookie-only auth | Zero configuration overhead | Provides no protection against compromised hosts on the same network |
+| Quorum-based degraded mode | Prevents split-brain rate limit bypass | Minority partition becomes unavailable — requires ops runbook for planned splits |
+| Periodic reconnect timer | Nodes auto-heal without human intervention | Node that is intentionally removed keeps getting reconnect attempts |
+| History capped at 100 entries | Bounded memory usage | Long netsplits that generate many events lose early history |
 
-- El modelo fully connected mesh es simple pero no escala más allá de ~200 nodos
-- Las cookies proveen autenticación básica — complementar con TLS o VPN en producción
-- Los netsplits son inevitables en cualquier sistema distribuido real
-- La decisión CP vs AP debe tomarse conscientemente, no por omisión
-- `:net_kernel.monitor_nodes/2` es la primitiva fundamental para detectar cambios en el cluster
-- El quorum es la herramienta más simple para evitar split brain
+Reflection question: the `Manager` reconnects every 5 seconds to all unreachable known nodes.
+In a Kubernetes cluster where pods are scaled down intentionally, this means the gateway
+keeps trying to reach a pod that no longer exists. How would you differentiate between
+"node crashed" (should reconnect) and "node decommissioned" (should remove from known set)?
+What configuration or signaling mechanism would support this?
 
 ---
 
-## What's Next
+## Common production mistakes
 
-- **Exercise 12**: Registro global de procesos con `:global` — construcción sobre la capa de distribución
-- **Exercise 13**: Horde para distribución con tolerancia a particiones via CRDTs
-- **Exercise 14**: Phoenix PubSub distribuido para mensajería en el cluster
-- **Exercise 15**: RPC patterns para computación remota
+**1. Using short names in production**
+`--sname` only works on the same LAN broadcast domain. The moment nodes are in different
+subnets, availability zones, or VPCs, `--sname` connections silently fail. Always use
+`--name` with fully qualified hostnames in any environment beyond a developer's laptop.
+
+**2. Cookie in the repository**
+Hardcoding `:erlang.set_cookie(node(), :my_hardcoded_cookie)` in `application.ex` means
+every developer who clones the repo, every CI run, and every deployed instance shares the
+same cookie. Any node with that cookie on any network can join the cluster. Source the
+cookie from a secret manager (Vault, AWS Secrets Manager, Kubernetes Secret) at runtime.
+
+**3. Ignoring `:nodedown` in processes that hold remote PIDs**
+A common pattern: cache a remote PID in GenServer state for fast calls. When the remote
+node crashes, that PID is stale. Any call to it will either time out or raise `{:EXIT, :noproc}`.
+Always `Process.monitor/1` the remote PID and clear the cache in `handle_info({:DOWN, ...})`.
+
+**4. Treating netsplit as node crash**
+`{:nodedown, node}` fires for both a crashed node and a network partition. If your recovery
+logic is "restart the missing workers", you may trigger work on both sides of a split that
+conflict when the network heals. Log the event, enter a safe mode, and let a human or a
+consensus protocol decide which partition is authoritative.
+
+**5. Not accounting for self in quorum calculations**
+`Node.list()` returns remote nodes only — it does not include `node()` (self). When
+calculating quorum, add 1 for the local node: `length(Node.list()) + 1 >= quorum_size`.
+Omitting this makes a 1-node cluster report `0/1` quorum and refuse all requests.
+
+**6. Using `:global` for rate limit state during a netsplit**
+`:global` (exercise 12) maintains a globally registered name but splits into two registries
+during a netsplit. Both partitions can independently believe they are the authoritative
+rate limiter. Rate limits are violated silently. For rate limiting specifically, use a
+dedicated distributed counter with quorum writes (or accept the degraded-mode strategy
+from this exercise).
 
 ---
 
 ## Resources
 
-- [Erlang Distribution Protocol](https://www.erlang.org/doc/apps/erts/erl_dist_protocol.html)
-- [net_kernel documentation](https://www.erlang.org/doc/man/net_kernel.html)
-- [Distributed Erlang — Erlang docs](https://www.erlang.org/doc/reference_manual/distributed.html)
-- [The perils of the perplexed programmer — Fred Hebert on netsplits](https://ferd.ca/the-zen-of-erlang.html)
-- [Partisan — alternative distribution layer for large clusters](https://github.com/lasp-lang/partisan)
+- [Distributed Erlang — Official reference](https://www.erlang.org/doc/reference_manual/distributed.html)
+- [HexDocs — Node](https://hexdocs.pm/elixir/Node.html)
+- [Erlang :net_kernel](https://www.erlang.org/doc/man/net_kernel.html)
+- [Erlang :net_adm](https://www.erlang.org/doc/man/net_adm.html)
+- [The Zen of Erlang — Fred Hébert (netsplits section)](https://ferd.ca/the-zen-of-erlang.html)
+- [Partisan — alternative distribution for large clusters](https://github.com/lasp-lang/partisan)
+- [libcluster — automatic cluster formation for Elixir](https://github.com/bitwalker/libcluster)

@@ -1,540 +1,330 @@
-# 17. Debugging con IO.inspect y dbg
+# Debugging: IO.inspect, dbg, and Observability
 
-**Difficulty**: Intermedio
+**Project**: `task_queue` — built incrementally across the intermediate level
 
-## Prerequisites
-- Conocimiento de pipelines con `|>`
-- Estructuras de datos: mapas, listas, tuplas
-- Procesos básicos con `self()` y `Process`
+---
 
-## Learning Objectives
-After completing this exercise, you will be able to:
-- Usar `IO.inspect/2` para inspeccionar valores en medio de un pipeline sin interrumpirlo
-- Aplicar `dbg/1` de Elixir 1.14+ para debugging interactivo con contexto completo
-- Configurar opciones de `IO.inspect` para estructuras grandes o profundas
-- Inspeccionar procesos en runtime con `Process.info/2` y `Process.list/0`
-- Leer e interpretar stack traces de Elixir para localizar errores
+## Project context
 
-## Concepts
+The task_queue system is running in staging. A batch of jobs was submitted, but
+`Scheduler.run_cycle/0` returned `dispatched: []` when the queue had depth > 0 and two
+workers were running. Something in the dispatch pipeline filtered out all jobs. You need
+to find what, fast, without deploying new code.
 
-### IO.inspect/2: El Debugging No Destructivo
+This exercise covers the practical debugging toolkit for Elixir + OTP:
+`IO.inspect`, `dbg`, `:sys.get_state`, `:observer`, and reading stack traces.
 
-`IO.inspect/2` retorna su primer argumento sin modificarlo, lo que permite insertarlo en cualquier punto de un pipeline para observar el valor sin romper el flujo de datos. Es la herramienta de debugging más usada en el día a día.
-
-```elixir
-# Sin IO.inspect — no sabes qué valor tiene en cada etapa
-result =
-  [1, 2, 3, 4, 5]
-  |> Enum.filter(&(rem(&1, 2) == 0))
-  |> Enum.map(&(&1 * 10))
-  |> Enum.sum()
-
-# Con IO.inspect — observas cada etapa sin cambiar el resultado
-result =
-  [1, 2, 3, 4, 5]
-  |> IO.inspect(label: "input")
-  |> Enum.filter(&(rem(&1, 2) == 0))
-  |> IO.inspect(label: "after filter")
-  |> Enum.map(&(&1 * 10))
-  |> IO.inspect(label: "after map")
-  |> Enum.sum()
-
-# Output en consola:
-# input: [1, 2, 3, 4, 5]
-# after filter: [2, 4]
-# after map: [20, 40]
-# result sigue siendo 60
-```
-
-La clave es que `IO.inspect` retorna el valor inalterado — no rompe el pipeline.
-
-### Opciones de IO.inspect
-
-`IO.inspect/2` acepta un keyword list de opciones para controlar cómo se muestra el valor:
-
-```elixir
-# label: Prefijo descriptivo para identificar el punto de inspección
-IO.inspect(value, label: "My Value")
-# My Value: [1, 2, 3]
-
-# limit: Máximo de elementos a mostrar en listas/maps (default: 50)
-IO.inspect(long_list, limit: 5)
-# [1, 2, 3, 4, 5, ...]
-
-# pretty: true para formato multilínea legible
-IO.inspect(nested_map, pretty: true)
-
-# width: caracteres por línea en modo pretty
-IO.inspect(value, pretty: true, width: 40)
-
-# structs: false para ver el mapa subyacente de un struct
-IO.inspect(%MyStruct{}, structs: false)
-
-# Combinación típica para debugging de estructuras complejas
-IO.inspect(complex_data, label: "API response", pretty: true, limit: 10)
-```
-
-### dbg/1: Debugging Interactivo (Elixir 1.14+)
-
-`dbg/1` es una macro de debugging más poderosa que `IO.inspect`. Muestra no solo el valor, sino también la expresión que lo produjo, el archivo, y la línea. Cuando se usa con `IEx`, permite inspección interactiva.
-
-```elixir
-# dbg muestra la expresión Y el valor
-x = 42
-dbg(x)
-# [lib/my_module.ex:10: MyModule.my_function/1]
-# x #=> 42
-
-# dbg en pipeline — muestra cada paso
-result =
-  [1, 2, 3]
-  |> dbg()
-  |> Enum.map(&(&1 * 2))
-  |> dbg()
-  |> Enum.sum()
-
-# Output:
-# [lib/my_module.ex:3: MyModule.run/0]
-# [1, 2, 3] |> Enum.map(&(&1 * 2)) #=> [2, 4, 6]
-# [2, 4, 6] |> Enum.sum() #=> 12
-```
-
-En IEx, `dbg` abre un sub-shell donde puedes inspeccionar variables locales antes de continuar.
-
-### Process.info: Inspección de Procesos
-
-En sistemas concurrentes, a veces necesitas inspeccionar el estado interno de un proceso en runtime.
-
-```elixir
-# Información del proceso actual
-Process.info(self())
-# Retorna una keyword list con: status, memory, message_queue_len, etc.
-
-# Solo una clave específica (más eficiente)
-Process.info(self(), :message_queue_len)
-# {:message_queue_len, 0}
-
-# Información de memoria del proceso
-Process.info(self(), :memory)
-# {:memory, 2840}   # bytes
-
-# Ver mensajes en la queue sin consumirlos
-Process.info(self(), :messages)
-# {:messages, []}
-
-# Listar todos los procesos vivos en el sistema
-Process.list()
-# [#PID<0.0.0>, #PID<0.1.0>, ...]
-# Devuelve cientos de PIDs — usar con cuidado en producción
-
-# Número de procesos activos
-length(Process.list())
-```
-
-### Leyendo Stack Traces
-
-Cuando un proceso crashea, el stack trace muestra el camino exacto que llevó al error. Saber leerlo es fundamental.
+Project structure at this point:
 
 ```
-** (ArithmeticError) bad argument in arithmetic expression
-    (my_app 0.1.0) lib/calculator.ex:15: Calculator.divide/2
-    (my_app 0.1.0) lib/calculator.ex:8: Calculator.process/1
-    (my_app 0.1.0) lib/my_app.ex:42: MyApp.run/0
-    (elixir 1.15.0) lib/task.ex:330: Task.await/2
-```
-
-Cómo leer cada línea:
-- `(ArithmeticError)` — tipo de excepción
-- `bad argument in arithmetic expression` — mensaje del error
-- `(my_app 0.1.0) lib/calculator.ex:15` — aplicación, archivo y línea
-- `Calculator.divide/2` — módulo, función y aridad (número de argumentos)
-
-El error ocurrió en `Calculator.divide/2` línea 15, que fue llamada desde `Calculator.process/1` línea 8.
-
-## Exercises
-
-### Exercise 1: IO.inspect con label en Pipeline
-
-Inserta `IO.inspect` con labels descriptivos en cada paso del pipeline para ver la transformación de datos.
-
-```elixir
-defmodule DataTransformer do
-  def process_sales(raw_data) do
-    raw_data
-    # TODO: Agrega IO.inspect con label: "1. raw input"
-    |> Enum.filter(fn sale -> sale.amount > 0 end)
-    # TODO: Agrega IO.inspect con label: "2. after filter negative"
-    |> Enum.map(fn sale -> %{sale | amount: sale.amount * 1.19} end)
-    # TODO: Agrega IO.inspect con label: "3. after tax"
-    |> Enum.sort_by(& &1.amount, :desc)
-    # TODO: Agrega IO.inspect con label: "4. sorted"
-    |> Enum.take(3)
-    # TODO: Agrega IO.inspect con label: "5. top 3"
-  end
-end
-
-# Datos de prueba para ejecutar en IEx:
-sales = [
-  %{id: 1, product: "Widget", amount: 50.0},
-  %{id: 2, product: "Gadget", amount: -10.0},   # Venta inválida
-  %{id: 3, product: "Donut", amount: 120.0},
-  %{id: 4, product: "Cable", amount: 15.0},
-  %{id: 5, product: "Monitor", amount: 350.0},
-  %{id: 6, product: "Mouse", amount: 25.0}
-]
-
-DataTransformer.process_sales(sales)
-```
-
-Expected output:
-```
-1. raw input: [%{amount: 50.0, id: 1, product: "Widget"}, ...]
-2. after filter negative: [%{amount: 50.0, id: 1, ...}, ...]  # Sin el -10.0
-3. after tax: [%{amount: 59.5, id: 1, ...}, ...]
-4. sorted: [%{amount: 416.5, id: 5, ...}, ...]
-5. top 3: [%{amount: 416.5, ...}, %{amount: 142.8, ...}, %{amount: 59.5, ...}]
+task_queue/
+├── lib/
+│   └── task_queue/
+│       └── [all previous modules]
+├── test/
+│   └── task_queue/
+│       └── debugging_test.exs   # given tests — must pass without modification
+└── mix.exs
 ```
 
 ---
 
-### Exercise 2: dbg en Pipeline
+## The two debugging modes
 
-Reemplaza los `IO.inspect` anteriores con `dbg/1` y observa la diferencia en el output — dbg muestra el contexto de la expresión.
+**Interactive debugging** (`iex -S mix`): you are at the keyboard, the system is running,
+you can inject calls and inspect live state. Tools: `:sys.get_state`, `Process.info`,
+`:observer.start()`, `send/2` directly to process PIDs.
 
-```elixir
-defmodule TextProcessor do
-  def analyze(text) do
-    text
-    # TODO: Inserta dbg() aquí para ver el valor inicial
-    |> String.downcase()
-    # TODO: Inserta dbg() aquí para ver después de downcase
-    |> String.split(~r/\W+/, trim: true)
-    # TODO: Inserta dbg() aquí para ver las palabras
-    |> Enum.frequencies()
-    # TODO: Inserta dbg() aquí para ver las frecuencias
-    |> Enum.sort_by(fn {_word, count} -> count end, :desc)
-    |> Enum.take(5)
-  end
-end
+**Code-level debugging** (deployed staging, test failures): you add probes to the code and
+re-run. Tools: `IO.inspect` (non-destructive, returns its input), `dbg` (shows full
+expression context), `ExUnit.CaptureLog`.
 
-# Ejecutar en IEx:
-# TextProcessor.analyze("the quick brown fox jumps over the lazy dog the fox")
-```
-
-Expected output (fragmento — dbg muestra la expresión y el resultado):
-```
-[lib/text_processor.ex:5: TextProcessor.analyze/1]
-"the quick brown fox jumps over the lazy dog the fox" |> String.downcase() #=> "the quick..."
-
-[lib/text_processor.ex:7: TextProcessor.analyze/1]
-... |> String.split(~r/\W+/, trim: true) #=> ["the", "quick", "brown", ...]
-```
+The critical property of `IO.inspect`: **it returns its first argument unchanged**. You
+can drop it into any pipeline without modifying the data flow. This is not true for
+`IO.puts` — `IO.puts` returns `:ok`, breaking the pipeline if inserted mid-pipe.
 
 ---
 
-### Exercise 3: IO.inspect con Opciones para Datos Grandes
+## The business problem
 
-Aprende a configurar `IO.inspect` para estructuras grandes o profundamente anidadas.
+The staging incident revealed that `dispatch_batch/1` silently skips workers that return
+`{:error, :empty}`, but the `nil` filter was inadvertently filtering out successful dispatches
+too because `process_job` returned a different shape than expected.
+
+This exercise instruments the pipeline, adds structured logging to `QueueServer`, and
+writes tests that assert on observable behavior — not on internal state.
+
+---
+
+## Implementation
+
+### Step 1: Instrument `dispatch_batch/1` with `IO.inspect`
+
+Read the existing `Scheduler.dispatch_batch/1` (exercise 15) and add inspect probes:
 
 ```elixir
-defmodule DataInspector do
-  # Genera datos de prueba con estructura compleja
-  def sample_data do
-    Enum.map(1..100, fn i ->
-      %{
-        id: i,
-        name: "Product #{i}",
-        tags: Enum.take(["electronics", "books", "food", "sports", "toys"], rem(i, 5) + 1),
-        metadata: %{
-          created_at: "2024-01-#{rem(i, 28) + 1}",
-          weight: i * 0.5,
-          dimensions: %{width: i, height: i * 2, depth: i * 0.5}
-        }
-      }
+defp dispatch_batch(0), do: []
+
+defp dispatch_batch(batch_size) do
+  worker_ids = TaskQueue.DynamicWorker.list_ids()
+  |> IO.inspect(label: "available_workers")   # shows how many workers are found
+
+  if worker_ids == [] do
+    []
+  else
+    limit = min(batch_size, length(worker_ids))
+
+    worker_ids
+    |> Enum.take(limit)
+    |> IO.inspect(label: "workers_selected_for_dispatch")
+    |> Enum.map(fn worker_id ->
+      result = TaskQueue.DynamicWorker.process_job(worker_id)
+      |> IO.inspect(label: "process_job_result worker=#{worker_id}")
+      # Returning nil here was the bug — change to return the dispatch outcome map
+      case result do
+        {:ok, value} ->
+          %{job_id: "unknown", worker_id: worker_id, result: {:ok, value}}
+        {:error, :empty} ->
+          nil  # No job available for this worker — skip
+        {:error, reason} ->
+          %{job_id: "unknown", worker_id: worker_id, result: {:error, reason}}
+      end
     end)
-  end
-
-  def process(data) do
-    data
-    # TODO: Agrega IO.inspect con limit: 3 para ver solo los primeros 3 elementos
-    # Esto evita inundar la consola con 100 items
-    |> Enum.filter(fn p -> p.id <= 10 end)
-    # TODO: Agrega IO.inspect con pretty: true y limit: 5
-    # Verás la estructura anidada formateada correctamente
-    |> Enum.map(fn p -> Map.take(p, [:id, :name]) end)
-    # TODO: Agrega IO.inspect con label: "simplified" para el resultado final
+    |> IO.inspect(label: "dispatch_outcomes_before_filter")
+    |> Enum.reject(&is_nil/1)
+    |> IO.inspect(label: "dispatch_outcomes_final")
   end
 end
-
-# También practica inspeccionar con opciones directamente en IEx:
-# data = DataInspector.sample_data()
-# TODO: Inspecciona data con limit: 2 para ver solo 2 elementos
-# TODO: Inspecciona el primer elemento con pretty: true para ver la estructura anidada
 ```
 
-Expected output:
+After diagnosing the bug, **remove the `IO.inspect` calls** — they are debugging aids,
+not production code. Replace with structured logging at the appropriate level.
+
+### Step 2: Add structured logging to `QueueServer`
+
 ```elixir
-# Con limit: 3
-[
-  %{id: 1, name: "Product 1", tags: [...], metadata: %{...}},
-  %{id: 2, name: "Product 2", tags: [...], metadata: %{...}},
-  %{id: 3, name: "Product 3", tags: [...], metadata: %{...}},
-  ...
-]
-# Con pretty: true — indentación multilínea legible
-%{
-  dimensions: %{depth: 0.5, height: 2, width: 1},
-  ...
-}
+# In lib/task_queue/queue_server.ex
+# Update handle_cast for push to include metadata
+
+@impl GenServer
+def handle_cast({:push, job}, state) do
+  new_state = state ++ [job]
+  # HINT: Logger.debug adds structured metadata available to log aggregators
+  # Logger.debug("job_pushed", job_id: job.id, queue_depth: length(new_state))
+  # TODO: add the Logger.debug call with job.id and new queue depth
+  {:noreply, new_state}
+end
 ```
 
----
-
-### Exercise 4: Process.info para Inspección de Procesos
-
-Usa las funciones de `Process` para inspeccionar el estado de procesos en runtime.
+### Step 3: A debugging-focused test module
 
 ```elixir
-defmodule ProcessInspector do
-  def inspect_self do
-    pid = self()
+# test/task_queue/debugging_test.exs
+defmodule TaskQueue.DebuggingTest do
+  use ExUnit.Case, async: false
+  import ExUnit.CaptureIO
+  import ExUnit.CaptureLog
+  require Logger
 
-    # TODO: Usa Process.info/1 para obtener toda la info del proceso actual
-    # Asigna el resultado a una variable e imprimelo con IO.inspect
+  alias TaskQueue.QueueServer
 
-    # TODO: Usa Process.info/2 para obtener solo :message_queue_len del proceso actual
-    # ¿Cuántos mensajes hay en la queue? (debería ser 0)
+  setup do
+    case Process.whereis(QueueServer) do
+      nil -> :ok
+      pid -> GenServer.stop(pid, :normal)
+    end
 
-    # TODO: Usa Process.info/2 para obtener :memory del proceso actual
-    # ¿Cuánta memoria usa este proceso en bytes?
-
-    # TODO: Usa Process.list() para obtener todos los PIDs activos
-    # ¿Cuántos procesos hay? Usa length/1 para contarlos
-
-    # TODO: Envíate 3 mensajes a ti mismo con send(self(), :test_message)
-    # Luego vuelve a consultar :message_queue_len
-    # ¿Cambió el número?
+    {:ok, _} = QueueServer.start_link()
     :ok
   end
 
-  def send_and_inspect do
-    pid = self()
+  describe "IO.inspect in pipelines" do
+    test "IO.inspect returns its first argument unchanged" do
+      # This is the fundamental contract that makes IO.inspect safe to use mid-pipeline
+      result = [1, 2, 3]
+        |> IO.inspect(label: "before_map")
+        |> Enum.map(&(&1 * 2))
+        |> IO.inspect(label: "after_map")
 
-    # Envía mensajes sin consumirlos
-    send(pid, {:message, 1})
-    send(pid, {:message, 2})
-    send(pid, {:message, 3})
+      assert result == [2, 4, 6]
+    end
 
-    # TODO: Consulta Process.info(self(), :messages) para ver los mensajes
-    # sin consumirlos — ¿aparecen los 3?
+    test "IO.inspect with options does not change the value" do
+      value = %{a: 1, b: %{c: 2, d: %{e: 3}}}
+      result = IO.inspect(value, limit: 5, pretty: true)
+      assert result == value
+    end
 
-    # TODO: Consulta Process.info(self(), :message_queue_len)
-    # El resultado debe ser {:message_queue_len, 3}
+    test "IO.inspect output is captured by CaptureIO" do
+      output = capture_io(fn ->
+        [1, 2, 3] |> IO.inspect(label: "test_label")
+      end)
+
+      assert String.contains?(output, "test_label")
+      assert String.contains?(output, "[1, 2, 3]")
+    end
+  end
+
+  describe ":sys.get_state for GenServer introspection" do
+    test "reads QueueServer state directly without going through public API" do
+      QueueServer.push(:job_a)
+      QueueServer.push(:job_b)
+      Process.sleep(10)
+
+      # :sys.get_state bypasses the public API and reads the internal state
+      state = :sys.get_state(QueueServer)
+      assert is_list(state)
+      assert length(state) == 2
+      payloads = Enum.map(state, & &1.payload)
+      assert :job_a in payloads
+      assert :job_b in payloads
+    end
+
+    test "worker stats available via GenServer.call — public API is observable" do
+      {:ok, _} = TaskQueue.WorkerPool.start_worker("debug_worker")
+      stats = TaskQueue.DynamicWorker.stats("debug_worker")
+      assert is_map(stats)
+      assert stats.worker_id == "debug_worker"
+      assert Map.has_key?(stats, :jobs_processed)
+      assert Map.has_key?(stats, :uptime_ms)
+      TaskQueue.WorkerPool.stop_worker("debug_worker")
+    end
+  end
+
+  describe "Process introspection" do
+    test "Process.info shows message queue length for a live process" do
+      pid = Process.whereis(QueueServer)
+      info = Process.info(pid, :message_queue_len)
+      assert {:message_queue_len, n} = info
+      assert n >= 0
+    end
+
+    test "Process.list includes the QueueServer" do
+      queue_pid = Process.whereis(QueueServer)
+      assert queue_pid in Process.list()
+    end
+  end
+
+  describe "CaptureLog for log assertion" do
+    test "Logger output is captured and assertable" do
+      log = capture_log(fn ->
+        Logger.warning("test_event job_id=test_123 status=failed")
+      end)
+
+      assert String.contains?(log, "test_event")
+      assert String.contains?(log, "test_123")
+    end
+
+    test "QueueServer emits a log when cleanup removes stale jobs" do
+      stale = %{id: "stale_id", payload: :x, queued_at: 0}
+      :sys.replace_state(QueueServer, fn _ -> [stale] end)
+
+      log = capture_log(fn -> QueueServer.flush() end)
+      assert String.contains?(log, "stale")
+    end
+  end
+
+  describe "dbg/1 — Elixir 1.14+" do
+    test "dbg returns the expression value unchanged" do
+      # dbg prints to stderr with full expression context: file, line, value
+      # In tests, capture stderr to avoid noise
+      result = capture_io(:stderr, fn ->
+        value = dbg(1 + 1)
+        send(self(), {:result, value})
+      end)
+
+      assert_receive {:result, 2}
+      # dbg output includes the expression text
+      assert String.contains?(result, "1 + 1")
+    end
   end
 end
 ```
 
-Expected output:
-```elixir
-iex> ProcessInspector.inspect_self()
-# Total process count: ~150 (varía según el sistema)
-# message_queue_len antes: {:message_queue_len, 0}
-# memory: {:memory, 2840}
-# message_queue_len después de 3 sends: {:message_queue_len, 3}
-:ok
-```
+### Step 4: Run the tests
 
----
-
-### Exercise 5: Leer e Interpretar Stack Traces
-
-Provoca errores intencionalmente y practica leer el stack trace para identificar la causa raíz.
-
-```elixir
-defmodule BuggyModule do
-  # Esta función tiene un bug intencional
-  def process_order(order) do
-    order
-    |> validate_order()
-    |> apply_discount()
-    |> calculate_total()
-  end
-
-  defp validate_order(order) do
-    # TODO: Agrega IO.inspect(order, label: "validate_order input") aquí
-    order
-  end
-
-  defp apply_discount(order) do
-    # TODO: Agrega IO.inspect(order, label: "apply_discount input") aquí
-    # Este bug: si order.discount es nil, falla con ArithmeticError
-    %{order | total: order.total * (1 - order.discount)}
-  end
-
-  defp calculate_total(order) do
-    # TODO: Agrega IO.inspect(order, label: "calculate_total input") aquí
-    order.total + order.shipping
-  end
-end
-
-# Ejecuta en IEx y observa el stack trace:
-# BuggyModule.process_order(%{total: 100.0, discount: nil, shipping: 10.0})
-
-# Ejercicio:
-# 1. Ejecuta el código y lee el stack trace completo
-# 2. Identifica: ¿en qué función ocurrió el error?
-# 3. Identifica: ¿en qué línea?
-# 4. ¿Cuál es la causa raíz del error?
-# 5. TODO: Corrige el bug en apply_discount/1 para manejar discount: nil
-#    (usa || 0 o un guard para defaultear a 0 cuando discount es nil)
-```
-
-Expected output (stack trace de ejemplo):
-```
-** (ArithmeticError) bad argument in arithmetic expression: 1 - nil
-    (my_app 0.1.0) lib/buggy_module.ex:16: BuggyModule.apply_discount/1
-    (my_app 0.1.0) lib/buggy_module.ex:5: BuggyModule.process_order/1
-```
-
----
-
-## Try It Yourself
-
-Debuggea un pipeline de procesamiento de datos usando `IO.inspect` en cada etapa para encontrar dónde se introduce un bug. Sin solución incluida.
-
-```elixir
-defmodule ReportGenerator do
-  @moduledoc """
-  Genera un reporte de ventas. Hay un bug en algún paso del pipeline.
-  Usa IO.inspect en cada etapa para encontrar dónde los datos se corrompen.
-  """
-
-  def generate_report(transactions) do
-    transactions
-    |> filter_valid()
-    |> group_by_category()
-    |> calculate_category_totals()
-    |> sort_by_revenue()
-    |> format_report()
-  end
-
-  defp filter_valid(txns), do: Enum.filter(txns, &valid?/1)
-  defp valid?(%{amount: a}) when is_number(a) and a > 0, do: true
-  defp valid?(_), do: false
-
-  defp group_by_category(txns), do: Enum.group_by(txns, & &1.category)
-
-  # BUG: Esta función hace algo incorrecto con los totales
-  defp calculate_category_totals(grouped) do
-    Enum.map(grouped, fn {category, txns} ->
-      # Hay un bug aquí — ¿lo encuentras con IO.inspect?
-      {category, Enum.count(txns)}  # Debería ser Enum.sum con el amount
-    end)
-  end
-
-  defp sort_by_revenue(categories), do: Enum.sort_by(categories, &elem(&1, 1), :desc)
-
-  defp format_report(categories) do
-    Enum.map(categories, fn {cat, total} ->
-      "#{cat}: $#{Float.round(total * 1.0, 2)}"
-    end)
-  end
-end
-
-# Datos de prueba:
-transactions = [
-  %{id: 1, category: "electronics", amount: 250.0},
-  %{id: 2, category: "books", amount: 15.0},
-  %{id: 3, category: "electronics", amount: 180.0},
-  %{id: 4, category: "books", amount: -5.0},   # Inválida
-  %{id: 5, category: "food", amount: 45.0},
-  %{id: 6, category: "electronics", amount: 320.0}
-]
-
-# 1. Ejecuta ReportGenerator.generate_report(transactions)
-# 2. Agrega IO.inspect después de cada paso del pipeline
-# 3. Encuentra el bug (pista: el total de electronics debería ser 750.0, no 3)
-# 4. Corrige la función calculate_category_totals/1
-```
-
-**Objetivo**: Usar únicamente `IO.inspect` (sin leer el código en detalle) para diagnosticar y confirmar el bug. Luego corregirlo.
-
----
-
-## Common Mistakes
-
-### Mistake 1: Olvidar que IO.inspect retorna el valor — el pipeline no se rompe
-
-**Wrong (creencia incorrecta):**
-```elixir
-# Muchos desarrolladores piensan que IO.inspect "interrumpe" el pipeline
-result =
-  [1, 2, 3]
-  |> IO.inspect()   # ¿Esto rompe el pipe?
-  |> Enum.sum()
-```
-**Aclaración:** `IO.inspect` retorna su primer argumento sin modificar. El pipeline funciona exactamente igual con o sin él. Es seguro agregarlo y quitarlo sin alterar el comportamiento.
-
-### Mistake 2: Usar IO.puts en lugar de IO.inspect para debugging
-
-**Wrong:**
-```elixir
-IO.puts(complex_data)  # Convierte a string con to_string/1 — pierde estructura
-```
-**Why:** `IO.puts` llama a `String.Chars.to_string/1`, que para estructuras complejas puede fallar o perder información. `IO.inspect` siempre muestra la representación Elixir completa.
-**Fix:**
-```elixir
-IO.inspect(complex_data, label: "debug")  # Siempre muestra la estructura real
-```
-
-### Mistake 3: Dejar IO.inspect en código de producción
-
-**Wrong:**
-```elixir
-# lib/my_module.ex — código que va a producción
-def process(data) do
-  data
-  |> IO.inspect(label: "DEBUG")   # Olvidado en producción
-  |> transform()
-end
-```
-**Why:** `IO.inspect` escribe a stdout en producción, lo que puede saturar logs, exponer datos sensibles, o degradar performance.
-**Fix:** Usa un buscador de texto para encontrar `IO.inspect` antes de cada PR/deploy:
 ```bash
-$ grep -r "IO.inspect" lib/   # Debe retornar vacío antes de merge
+mix test test/task_queue/debugging_test.exs --trace
 ```
 
 ---
 
-## Verification
+## Debugging live systems with `iex -S mix`
 
-```elixir
-# En IEx, verificar que IO.inspect no rompe pipelines
-iex> [1, 2, 3] |> IO.inspect(label: "test") |> Enum.sum()
-# test: [1, 2, 3]
-# 6
+Once the tests pass, practice the interactive debugging workflow:
 
-# Verificar dbg disponible (requiere Elixir 1.14+)
-iex> elixir_version = System.version()
-iex> dbg(elixir_version)
-# [iex:2: (top level)]
-# elixir_version #=> "1.15.7"
-
-# Verificar Process.info
-iex> Process.info(self(), :message_queue_len)
-{:message_queue_len, 0}
+```bash
+iex -S mix
 ```
 
-## Summary
-- **Key concepts**: `IO.inspect/2`, `label:`, `limit:`, `pretty:`, `dbg/1`, `Process.info/2`, stack traces
-- **What you practiced**: Inspeccionar pipelines sin interrumpirlos, configurar output para datos complejos, inspeccionar procesos en runtime, localizar errores con stack traces
-- **Important to remember**: `IO.inspect` retorna el valor — nunca rompe el pipeline. `dbg` muestra la expresión + valor. Elimina todos los `IO.inspect` antes de mergear código.
+```elixir
+# Inspect running process state
+iex> :sys.get_state(TaskQueue.QueueServer)
 
-## What's Next
-En el siguiente ejercicio **18-mix-tasks-personalizadas** aprenderás a crear tus propias Mix tasks para automatizar tareas repetitivas del proyecto.
+# See all registered processes
+iex> Process.list() |> Enum.filter(&Process.info(&1, :registered_name)) |> Enum.map(&Process.info(&1, :registered_name))
+
+# Push a job and watch the queue depth
+iex> TaskQueue.QueueServer.push(:my_test_job)
+iex> TaskQueue.QueueServer.size()
+
+# Start the visual observer (opens a GUI window)
+iex> :observer.start()
+# Navigate to Processes → find TaskQueue.QueueServer → double-click for details
+
+# Trace all messages to a GenServer (use carefully — floods the console)
+iex> :sys.trace(TaskQueue.QueueServer, true)
+iex> TaskQueue.QueueServer.push(:traced_job)
+iex> :sys.trace(TaskQueue.QueueServer, false)
+```
+
+---
+
+## Trade-off analysis
+
+| Tool | When to use | Cost | Leaves code changes |
+|------|------------|------|---------------------|
+| `IO.inspect` | Quick pipeline diagnosis | None — returns value unchanged | Yes — remove after diagnosis |
+| `dbg` | One-shot expression context | None | Yes — remove after diagnosis |
+| `Logger.debug` | Structured production observability | Minimal at :info level | No — stays in production |
+| `:sys.get_state` | Live state inspection in iex | None | No |
+| `:observer.start()` | Visual process/memory overview | GUI dependency | No |
+| `:sys.trace` | Message-level tracing | High — floods console | No |
+
+Reflection question: `IO.inspect` is the most common debugging tool in Elixir, but it is
+also the most dangerous to leave in production code. What automated safeguard would you add
+to your CI pipeline to prevent `IO.inspect` from being committed to `main`? (Hint: think
+about `mix credo` or a custom git hook.)
+
+---
+
+## Common production mistakes
+
+**1. Using `IO.puts` in a pipeline instead of `IO.inspect`**
+`IO.puts` returns `:ok`, which replaces the pipeline value. The pipeline produces `:ok`
+instead of the expected data, and the bug is now even harder to diagnose.
+
+**2. `dbg` left in production code**
+`dbg` prints to stderr on every call — visible in production logs. It is a developer tool,
+not an observability tool. Remove it before committing.
+
+**3. `:sys.get_state` in production monitoring**
+`:sys.get_state` is a synchronous call that temporarily pauses the GenServer. On a busy
+process, this adds latency. For production monitoring, expose state via a dedicated
+`handle_call(:stats, ...)` callback.
+
+**4. Forgetting `IO.inspect` in the middle of a pipeline changes the terminal output**
+When debugging deep pipelines, multiple `IO.inspect` calls produce interleaved output
+that is hard to read. Use the `label:` option religiously:
+```elixir
+|> IO.inspect(label: "after_filter step_2")
+```
+
+---
 
 ## Resources
-- [IO.inspect Documentation](https://hexdocs.pm/elixir/IO.html#inspect/2)
-- [Kernel.dbg/2 Documentation](https://hexdocs.pm/elixir/Kernel.html#dbg/2)
-- [Process Module](https://hexdocs.pm/elixir/Process.html)
-- [Debugging Guide — Elixir](https://elixir-lang.org/getting-started/debugging.html)
+
+- [IO.inspect/2 — HexDocs](https://hexdocs.pm/elixir/IO.html#inspect/2)
+- [Kernel.dbg/2 — HexDocs](https://hexdocs.pm/elixir/Kernel.html#dbg/2) — Elixir 1.14+
+- [:sys module — Erlang/OTP](https://www.erlang.org/doc/man/sys.html) — `get_state`, `trace`, `statistics`
+- [Observer — Erlang/OTP](https://www.erlang.org/doc/apps/observer/observer_ug.html) — the visual debugging tool
