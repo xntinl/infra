@@ -102,6 +102,19 @@ in state and update it manually on enqueue and dequeue.
 
 ### Step 1: `lib/api_gateway/middleware/audit_writer.ex`
 
+The AuditWriter implements a bounded internal queue with back-pressure. The key
+patterns:
+
+1. **Depth counter**: we maintain `state.depth` as a plain integer instead of calling
+   `:queue.len/1` (which is O(n)). This keeps the `handle_call` for submissions O(1).
+
+2. **Processing guard**: the `state.processing` boolean prevents multiple concurrent
+   drain chains. Without it, two separate code paths could both trigger
+   `{:continue, :drain}`, causing items to be processed out of FIFO order.
+
+3. **Synchronous rejection**: callers use `GenServer.call`, not `cast`. When the queue
+   is full, they receive `{:error, :overloaded}` immediately and can retry or drop.
+
 ```elixir
 defmodule ApiGateway.Middleware.AuditWriter do
   use GenServer
@@ -149,22 +162,32 @@ defmodule ApiGateway.Middleware.AuditWriter do
 
   @impl true
   def handle_call({:write, _entry}, _from, state) when state.depth >= @max_queue do
-    # TODO: reject the entry, increment stats.rejected, return {:error, :overloaded}
-    # HINT: do not modify the queue
+    # Queue is full — reject immediately. The caller receives {:error, :overloaded}
+    # and can decide whether to retry with backoff or drop the entry.
+    new_stats = Map.update!(state.stats, :rejected, &(&1 + 1))
+    {:reply, {:error, :overloaded}, %{state | stats: new_stats}}
   end
 
   @impl true
   def handle_call({:write, entry}, _from, state) do
-    # TODO:
-    # 1. timestamp the entry with System.monotonic_time(:millisecond)
-    # 2. enqueue {entry, queued_at} into state.queue
-    # 3. increment depth and stats.queued
-    # 4. if not already processing, trigger {:continue, :drain}
-    # 5. reply {:ok, queued_at}
-    #
-    # HINT: use state.processing to gate drain entry
-    # HINT: {:reply, {:ok, queued_at}, new_state, {:continue, :drain}}
-    #       (only include {:continue, :drain} when NOT already processing)
+    queued_at = System.monotonic_time(:millisecond)
+    new_queue = :queue.in({entry, queued_at}, state.queue)
+    new_stats = Map.update!(state.stats, :queued, &(&1 + 1))
+
+    new_state = %{state |
+      queue: new_queue,
+      depth: state.depth + 1,
+      stats: new_stats
+    }
+
+    # Only start the drain chain if we are not already draining.
+    # This prevents multiple concurrent drain chains which would
+    # interleave and process items out of FIFO order.
+    if state.processing do
+      {:reply, {:ok, queued_at}, new_state}
+    else
+      {:reply, {:ok, queued_at}, %{new_state | processing: true}, {:continue, :drain}}
+    end
   end
 
   @impl true
@@ -174,18 +197,24 @@ defmodule ApiGateway.Middleware.AuditWriter do
 
   @impl true
   def handle_continue(:drain, state) do
-    # TODO: dequeue one item, write it, decrement depth, continue drain
-    # When queue is empty: set processing: false and stop the chain
-    #
-    # HINT: case :queue.out(state.queue) do
-    #   {:empty, _} -> {:noreply, %{state | processing: false}}
-    #   {{:value, {entry, queued_at}}, rest} ->
-    #     do_write(entry, queued_at)
-    #     new_state = %{state | queue: rest, depth: state.depth - 1,
-    #                           processing: true,
-    #                           stats: Map.update!(state.stats, :written, &(&1 + 1))}
-    #     {:noreply, new_state, {:continue, :drain}}
-    # end
+    case :queue.out(state.queue) do
+      {:empty, _} ->
+        # Queue is drained — stop the processing chain.
+        {:noreply, %{state | processing: false}}
+
+      {{:value, {entry, queued_at}}, rest} ->
+        do_write(entry, queued_at)
+        new_state = %{state |
+          queue: rest,
+          depth: state.depth - 1,
+          processing: true,
+          stats: Map.update!(state.stats, :written, &(&1 + 1))
+        }
+        # Continue draining — this chains handle_continue calls until the queue is empty.
+        # Between each item, GenServer processes any pending handle_call messages in the
+        # mailbox, keeping the server responsive to stats/0 queries during heavy drain.
+        {:noreply, new_state, {:continue, :drain}}
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -201,6 +230,12 @@ end
 ```
 
 ### Step 2: `lib/api_gateway/middleware/priority_dispatcher.ex`
+
+The PriorityDispatcher maintains two separate queues (`:critical` and `:normal`) with
+independent depth counters and capacity limits. The drain loop always dequeues from the
+critical queue first — all critical items are processed before any normal item, regardless
+of arrival order. This guarantees that health checks and payment confirmations are never
+delayed by catalog browsing traffic.
 
 ```elixir
 defmodule ApiGateway.Middleware.PriorityDispatcher do
@@ -262,10 +297,31 @@ defmodule ApiGateway.Middleware.PriorityDispatcher do
   end
 
   @impl true
-  def handle_call({:dispatch, request, priority}, _from, state) do
-    # TODO: enqueue into the correct queue, increment the corresponding depth counter
-    # Start drain if not already processing
-    # HINT: similar pattern to AuditWriter
+  def handle_call({:dispatch, request, :critical}, _from, state) do
+    new_state = %{state |
+      critical: :queue.in(request, state.critical),
+      crit_depth: state.crit_depth + 1
+    }
+
+    if state.processing do
+      {:reply, :ok, new_state}
+    else
+      {:reply, :ok, %{new_state | processing: true}, {:continue, :drain}}
+    end
+  end
+
+  @impl true
+  def handle_call({:dispatch, request, :normal}, _from, state) do
+    new_state = %{state |
+      normal: :queue.in(request, state.normal),
+      norm_depth: state.norm_depth + 1
+    }
+
+    if state.processing do
+      {:reply, :ok, new_state}
+    else
+      {:reply, :ok, %{new_state | processing: true}, {:continue, :drain}}
+    end
   end
 
   @impl true
@@ -275,23 +331,33 @@ defmodule ApiGateway.Middleware.PriorityDispatcher do
 
   @impl true
   def handle_continue(:drain, state) do
-    # TODO: call next_job/1 to select the highest-priority item
-    # Process it, decrement the appropriate depth, continue drain
-    # When empty: {:noreply, %{state | processing: false}}
+    case next_job(state) do
+      :empty ->
+        {:noreply, %{state | processing: false}}
+
+      {request, updated_state} ->
+        do_dispatch(request)
+        {:noreply, %{updated_state | processing: true}, {:continue, :drain}}
+    end
   end
 
   # ---------------------------------------------------------------------------
   # Private helpers
   # ---------------------------------------------------------------------------
 
-  defp next_job(state) do
-    # TODO: implement priority selection
-    # 1. If crit_depth > 0: dequeue from critical queue
-    # 2. Else if norm_depth > 0: dequeue from normal queue
-    # 3. Else: return :empty
-    #
-    # Return: :empty | {request, updated_state}
+  # Priority selection: critical queue is always drained first.
+  # Only when critical is empty do we process normal items.
+  defp next_job(%{crit_depth: cd} = state) when cd > 0 do
+    {{:value, request}, rest} = :queue.out(state.critical)
+    {request, %{state | critical: rest, crit_depth: state.crit_depth - 1}}
   end
+
+  defp next_job(%{norm_depth: nd} = state) when nd > 0 do
+    {{:value, request}, rest} = :queue.out(state.normal)
+    {request, %{state | normal: rest, norm_depth: state.norm_depth - 1}}
+  end
+
+  defp next_job(_state), do: :empty
 
   defp do_dispatch(request) do
     Logger.debug("Dispatching: #{inspect(request)}")

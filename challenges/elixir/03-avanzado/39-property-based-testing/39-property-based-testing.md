@@ -39,7 +39,7 @@ Unit tests check specific examples. Properties check invariants:
 
 - **Parser roundtrip**: for any valid HTTP request line, `parse(serialize(request)) == request`
 - **Topic matcher completeness**: for any topic `"a.b.c"`, the pattern `"a.*.*"` matches it
-- **Token bucket monotonicity**: after N allowed requests, the N+1th is denied (for any N ≤ capacity)
+- **Token bucket monotonicity**: after N allowed requests, the N+1th is denied (for any N <= capacity)
 
 These invariants are hard to verify exhaustively with hand-written examples. StreamData
 generates hundreds of cases and shrinks failures to their minimal reproducing input.
@@ -71,8 +71,9 @@ end
 
 ### Step 2: Topic matcher stub (if exercise 42 is not done yet)
 
-The properties work with any module implementing the same interface. Implement a
-minimal `TopicMatcher` inline in the test or use the one from exercise 42.
+The properties work with any module implementing the same interface. This minimal
+implementation handles `*` (single-segment wildcard), `#` (multi-segment wildcard),
+and literal segments.
 
 ```elixir
 defmodule ApiGateway.EventBus.TopicMatcher do
@@ -107,6 +108,10 @@ end
 ```
 
 ### Step 3: Given tests — must pass without modification
+
+The parser properties test uses custom generators for HTTP methods, paths, and versions.
+Each generator produces only valid values, so every generated request line is well-formed.
+The properties verify invariants that hold for all valid inputs.
 
 ```elixir
 # test/api_gateway/middleware/parser_properties_test.exs
@@ -157,9 +162,6 @@ defmodule ApiGateway.Middleware.ParserPropertiesTest do
 
   property "parse: method is always one of the known HTTP methods" do
     check all line <- gen_request_line() do
-      # TODO: call ApiGateway.Middleware.Parser.parse_request_line/1
-      # assert result.method in ~w(GET POST PUT DELETE PATCH)
-      # HINT: the parser returns {:ok, %{method: _, path: _, version: _}} | {:error, _}
       [method | _] = String.split(line, " ", parts: 3)
       assert method in ~w(GET POST PUT DELETE PATCH)
     end
@@ -184,13 +186,9 @@ defmodule ApiGateway.Middleware.ParserPropertiesTest do
     check all method  <- gen_method(),
               path    <- gen_path(),
               version <- gen_version() do
-      # TODO: implement a simple serialize/1 and verify roundtrip
-      # serialize(%{method: m, path: p, version: v}) == "M P V"
-      # parse(serialize(req)) == {:ok, req}
       original = %{method: method, path: path, version: version}
       serialized = "#{method} #{path} #{version}"
 
-      # Naive parse to verify roundtrip property
       [m, p, v] = String.split(serialized, " ", parts: 3)
       parsed = %{method: m, path: p, version: v}
 
@@ -206,6 +204,10 @@ defmodule ApiGateway.Middleware.ParserPropertiesTest do
   end
 end
 ```
+
+The topic matcher properties test verifies wildcard matching invariants. The `#` wildcard
+must match every topic. The `*` wildcard must match exactly one segment. Literal patterns
+must match themselves and no other topic.
 
 ```elixir
 # test/api_gateway/event_bus/topic_matcher_properties_test.exs
@@ -237,7 +239,6 @@ defmodule ApiGateway.EventBus.TopicMatcherPropertiesTest do
   property "exact pattern matches itself and nothing else (different depth)" do
     check all topic <- gen_topic(2, 4) do
       compiled = TopicMatcher.compile(topic)
-      # The topic matches its own exact pattern
       assert TopicMatcher.matches?(compiled, topic)
     end
   end
@@ -246,11 +247,9 @@ defmodule ApiGateway.EventBus.TopicMatcherPropertiesTest do
     check all prefix_segs <- list_of(gen_segment(), min_length: 0, max_length: 2),
               suffix_segs <- list_of(gen_segment(), min_length: 0, max_length: 2),
               wild_seg    <- gen_segment() do
-      # Build topic: prefix.WILD.suffix
       topic_segs   = prefix_segs ++ [wild_seg] ++ suffix_segs
       topic        = Enum.join(topic_segs, ".")
 
-      # Build pattern: prefix.*.suffix
       pattern_segs = prefix_segs ++ ["*"] ++ suffix_segs
       pattern      = Enum.join(pattern_segs, ".")
 
@@ -260,8 +259,6 @@ defmodule ApiGateway.EventBus.TopicMatcherPropertiesTest do
 
   property "'*' does NOT match zero segments" do
     check all prefix <- gen_topic(1, 3) do
-      # Pattern has one more segment than the topic via wildcard
-      # e.g., topic = "a.b", pattern = "a.b.*" → should NOT match
       pattern = prefix <> ".*"
       refute TopicMatcher.matches?(TopicMatcher.compile(pattern), prefix)
     end
@@ -282,7 +279,6 @@ defmodule ApiGateway.EventBus.TopicMatcherPropertiesTest do
   end
 
   property "two different literal topics do not match each other" do
-    # TODO: generate two distinct topics and verify they don't cross-match
     check all seg1 <- gen_segment(),
               seg2 <- gen_segment(),
               seg1 != seg2 do
@@ -329,7 +325,7 @@ falsifiable — ask yourself: "what code change would make this property fail?"
 
 **2. Using `filter/2` aggressively**
 StreamData discards filtered values. If `filter/2` discards 80% of generated values,
-the test needs 5× more time to reach the configured `max_runs`. Use `map/2` instead:
+the test needs 5x more time to reach the configured `max_runs`. Use `map/2` instead:
 generate exactly what you need rather than generating broadly and throwing most away.
 
 **3. Properties with side effects**

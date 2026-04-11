@@ -23,8 +23,8 @@ api_gateway/
 │       ├── metrics/
 │       ├── config/
 │       └── cache/
-│           ├── store.ex           # ← you implement this
-│           └── stampede_guard.ex  # ← and this
+│           ├── store.ex
+│           └── stampede_guard.ex
 ├── test/
 │   └── api_gateway/
 │       └── cache/
@@ -102,7 +102,7 @@ defmodule ApiGateway.Cache.Store do
 
   Design:
   - Reads bypass the GenServer entirely (direct :ets.lookup)
-  - Writes go through the GenServer only to ensure the table exists while alive
+  - Writes go directly to ETS (:ets.insert is atomic for a single record)
   - Cleanup runs periodically via handle_info — no separate supervisor needed
   - Lazy eviction on read removes expired entries on access
   - Periodic cleanup removes entries that expire without being accessed
@@ -183,8 +183,8 @@ defmodule ApiGateway.Cache.Store do
   def stats do
     now = System.monotonic_time(:millisecond)
     total = :ets.info(@table, :size)
-    # HINT: :ets.fun2ms generates compile-time match specs — valid here because
-    #       `now` is bound at call time and captured in the closure correctly
+    # :ets.fun2ms generates compile-time match specs — valid here because
+    # `now` is bound at call time and captured in the closure correctly
     expired_ms = :ets.fun2ms(fn {_k, _v, expires_at} when expires_at =< now -> true end)
     expired = :ets.select_count(@table, expired_ms)
     %{total: total, expired: expired, fresh: total - expired}
@@ -249,6 +249,10 @@ defmodule ApiGateway.Cache.StampedeGuard do
   Implementation: uses a separate ETS lock table with :ets.insert_new/2 as
   a lightweight mutex. The process that wins the lock fetches; the rest poll
   with exponential backoff until the key appears in the cache.
+
+  insert_new/2 is atomic — it returns true only for the first process that inserts
+  the lock key, and false for all subsequent attempts. This makes it a perfect
+  lightweight mutex without requiring a GenServer serialization point.
   """
 
   use GenServer
@@ -325,10 +329,12 @@ defmodule ApiGateway.Cache.StampedeGuard do
       {:error, :timeout}
     else
       case direct_get(key) do
-        {:ok, value} -> {:ok, value}
+        {:ok, value} ->
+          {:ok, value}
+
         :miss ->
-          # HINT: Process.sleep(@poll_interval_ms) then recurse
-          # TODO: implement — return :miss path
+          Process.sleep(@poll_interval_ms)
+          wait_for_key(key, deadline)
       end
     end
   end

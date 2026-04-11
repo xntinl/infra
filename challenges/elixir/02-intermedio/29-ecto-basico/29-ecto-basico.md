@@ -162,26 +162,17 @@ defmodule TaskQueue.Repo.Migrations.CreateJobs do
 
   def change do
     create table(:jobs) do
-      # TODO: add columns:
-      # - type (string, not null)
-      # - args (map, default %{})
-      # - status (string, not null, default "pending")
-      # - retry_count (integer, not null, default 0)
-      # - last_error (string, nullable)
-      # - scheduled_at (utc_datetime, nullable)
-      # HINT:
-      # add :type, :string, null: false
-      # add :args, :map, default: %{}
-      # add :status, :string, null: false, default: "pending"
-      # add :retry_count, :integer, null: false, default: 0
-      # add :last_error, :string
-      # add :scheduled_at, :utc_datetime
+      add :type, :string, null: false
+      add :args, :map, default: %{}
+      add :status, :string, null: false, default: "pending"
+      add :retry_count, :integer, null: false, default: 0
+      add :last_error, :string
+      add :scheduled_at, :utc_datetime
 
       timestamps()
     end
 
-    # TODO: add an index on (status, type) for efficient filtering
-    # HINT: create index(:jobs, [:status, :type])
+    create index(:jobs, [:status, :type])
   end
 end
 ```
@@ -202,13 +193,12 @@ defmodule TaskQueue.Jobs.Job do
   @valid_statuses ~w(pending running completed failed)
 
   schema "jobs" do
-    # TODO: define fields matching the migration:
-    # field :type, :string
-    # field :args, :map, default: %{}
-    # field :status, :string, default: "pending"
-    # field :retry_count, :integer, default: 0
-    # field :last_error, :string
-    # field :scheduled_at, :utc_datetime
+    field :type, :string
+    field :args, :map, default: %{}
+    field :status, :string, default: "pending"
+    field :retry_count, :integer, default: 0
+    field :last_error, :string
+    field :scheduled_at, :utc_datetime
 
     timestamps()
   end
@@ -232,12 +222,9 @@ defmodule TaskQueue.Jobs.Job do
   def changeset(job, attrs) do
     job
     |> cast(attrs, [:type, :args, :status, :retry_count, :last_error, :scheduled_at])
-    # TODO: validate that :type is required
-    # HINT: |> validate_required([:type])
-    # TODO: validate that :status is one of @valid_statuses
-    # HINT: |> validate_inclusion(:status, @valid_statuses)
-    # TODO: validate that :retry_count is >= 0
-    # HINT: |> validate_number(:retry_count, greater_than_or_equal_to: 0)
+    |> validate_required([:type])
+    |> validate_inclusion(:status, @valid_statuses)
+    |> validate_number(:retry_count, greater_than_or_equal_to: 0)
   end
 
   @doc """
@@ -247,8 +234,8 @@ defmodule TaskQueue.Jobs.Job do
   def status_changeset(job, attrs) do
     job
     |> cast(attrs, [:status, :last_error, :retry_count])
-    # TODO: validate :status inclusion
-    # TODO: validate :retry_count >= 0
+    |> validate_inclusion(:status, @valid_statuses)
+    |> validate_number(:retry_count, greater_than_or_equal_to: 0)
   end
 end
 ```
@@ -278,8 +265,9 @@ defmodule TaskQueue.Jobs.JobStore do
   """
   @spec insert(map()) :: {:ok, Job.t()} | {:error, Ecto.Changeset.t()}
   def insert(attrs) do
-    # TODO: build a changeset with Job.changeset/2 and call Repo.insert/1
-    # HINT: %Job{} |> Job.changeset(attrs) |> Repo.insert()
+    %Job{}
+    |> Job.changeset(attrs)
+    |> Repo.insert()
   end
 
   @doc """
@@ -287,10 +275,8 @@ defmodule TaskQueue.Jobs.JobStore do
   """
   @spec list_pending() :: [Job.t()]
   def list_pending do
-    # TODO: query jobs where status == "pending", ordered by inserted_at asc
-    # HINT:
-    # from(j in Job, where: j.status == "pending", order_by: [asc: j.inserted_at])
-    # |> Repo.all()
+    from(j in Job, where: j.status == "pending", order_by: [asc: j.inserted_at])
+    |> Repo.all()
   end
 
   @doc """
@@ -298,13 +284,11 @@ defmodule TaskQueue.Jobs.JobStore do
   """
   @spec list_retryable(non_neg_integer()) :: [Job.t()]
   def list_retryable(max_retries \\ 3) do
-    # TODO: query jobs where status == "failed" and retry_count < max_retries
-    # HINT:
-    # from(j in Job,
-    #   where: j.status == "failed" and j.retry_count < ^max_retries,
-    #   order_by: [asc: j.inserted_at]
-    # )
-    # |> Repo.all()
+    from(j in Job,
+      where: j.status == "failed" and j.retry_count < ^max_retries,
+      order_by: [asc: j.inserted_at]
+    )
+    |> Repo.all()
   end
 
   @doc """
@@ -312,17 +296,15 @@ defmodule TaskQueue.Jobs.JobStore do
   """
   @spec mark_failed(integer(), String.t()) :: {:ok, Job.t()} | {:error, Ecto.Changeset.t()}
   def mark_failed(job_id, error_message) do
-    # TODO: fetch the job, then apply status_changeset with:
-    #   status: "failed", last_error: error_message, retry_count: job.retry_count + 1
-    # HINT:
-    # job = Repo.get!(Job, job_id)
-    # job
-    # |> Job.status_changeset(%{
-    #     status: "failed",
-    #     last_error: error_message,
-    #     retry_count: job.retry_count + 1
-    #   })
-    # |> Repo.update()
+    job = Repo.get!(Job, job_id)
+
+    job
+    |> Job.status_changeset(%{
+      status: "failed",
+      last_error: error_message,
+      retry_count: job.retry_count + 1
+    })
+    |> Repo.update()
   end
 
   @doc """
@@ -338,15 +320,12 @@ defmodule TaskQueue.Jobs.JobStore do
   """
   @spec filter(map()) :: [Job.t()]
   def filter(filters) when is_map(filters) do
-    # TODO: start with `from(j in Job)` and compose filters dynamically
-    # For each key in filters, add a where clause
-    # HINT:
-    # Enum.reduce(filters, from(j in Job), fn
-    #   {:type, type}, query   -> where(query, [j], j.type == ^type)
-    #   {:status, s}, query    -> where(query, [j], j.status == ^s)
-    #   _, query               -> query
-    # end)
-    # |> Repo.all()
+    Enum.reduce(filters, from(j in Job), fn
+      {:type, type}, query   -> where(query, [j], j.type == ^type)
+      {:status, s}, query    -> where(query, [j], j.status == ^s)
+      _, query               -> query
+    end)
+    |> Repo.all()
   end
 end
 ```
@@ -487,6 +466,8 @@ mix test test/task_queue/ecto_test.exs --trace
 | Schema evolution | migrations | manual `ALTER TABLE` | manual |
 
 Reflection question: `Repo.get!/2` raises on not found. `Repo.get/2` returns `nil`. When would you prefer `get!` in production code, and when would `nil` be the safer return?
+
+Answer: Use `get!/2` when absence is a programming error — for example, loading a job by ID that was just returned from an insert. The raise gives a clear stack trace. Use `get/2` when absence is expected — for example, looking up a user by email that may not exist. Returning `nil` lets you handle the missing case with a `case`/`with` clause instead of a rescue block.
 
 ---
 

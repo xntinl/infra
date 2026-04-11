@@ -60,7 +60,7 @@ A direct `send` from producer to consumer creates unbounded mailboxes:
 ```
 producer sends 10,000 messages
 consumer processes 100/sec
-mailbox grows at 9,900 messages/sec → OOM in ~1 minute
+mailbox grows at 9,900 messages/sec -> OOM in ~1 minute
 ```
 
 GenStage's demand protocol inverts control:
@@ -113,26 +113,19 @@ defmodule TaskQueue.Pipeline.JobProducer do
 
   @impl true
   def init(:ok) do
-    # TODO: return {:producer, %{pending_demand: 0}}
+    {:producer, %{pending_demand: 0}}
   end
 
   @impl true
   def handle_demand(demand, state) when demand > 0 do
-    # TODO: dequeue up to `demand` jobs from TaskQueue.QueueServer
-    # Build a list of jobs by calling QueueServer.dequeue() in a loop
-    # until you have `demand` jobs or the queue is empty
-    # Return {:noreply, jobs, %{state | pending_demand: demand - length(jobs)}}
-    #
-    # HINT:
-    # jobs = dequeue_batch(demand)
-    # {:noreply, jobs, %{state | pending_demand: demand - length(jobs)}}
+    jobs = dequeue_batch(demand)
+    {:noreply, jobs, %{state | pending_demand: demand - length(jobs)}}
   end
 
-  # Private helper: dequeue up to `n` jobs
-  # Returns a list (may be shorter than n if queue is empty)
   defp dequeue_batch(n), do: dequeue_batch(n, [])
 
   defp dequeue_batch(0, acc), do: Enum.reverse(acc)
+
   defp dequeue_batch(n, acc) do
     case TaskQueue.QueueServer.dequeue() do
       {:ok, job}       -> dequeue_batch(n - 1, [job | acc])
@@ -161,24 +154,17 @@ defmodule TaskQueue.Pipeline.JobValidator do
 
   @impl true
   def init(:ok) do
-    # TODO: return {:producer_consumer, :ok}
-    # producer_consumer needs no initial state beyond :ok
+    {:producer_consumer, :ok}
   end
 
   @impl true
   def handle_events(jobs, _from, state) do
-    # TODO: filter and transform jobs:
-    # 1. Keep only jobs that are maps with :type and :args keys
-    # 2. Add validated_at: System.monotonic_time() to each valid job
-    # 3. Log (or discard) invalid jobs
-    # Return {:noreply, valid_jobs, state}
-    #
-    # HINT:
-    # valid_jobs =
-    #   jobs
-    #   |> Enum.filter(&valid_job?/1)
-    #   |> Enum.map(&Map.put(&1, :validated_at, System.monotonic_time()))
-    # {:noreply, valid_jobs, state}
+    valid_jobs =
+      jobs
+      |> Enum.filter(&valid_job?/1)
+      |> Enum.map(&Map.put(&1, :validated_at, System.monotonic_time()))
+
+    {:noreply, valid_jobs, state}
   end
 
   defp valid_job?(%{type: _, args: _}), do: true
@@ -207,25 +193,19 @@ defmodule TaskQueue.Pipeline.JobConsumer do
 
   @impl true
   def init(:ok) do
-    # TODO: subscribe to JobValidator with max_demand: @max_demand
-    # Return {:consumer, :ok, subscribe_to: [{JobValidator, max_demand: @max_demand}]}
-    # HINT: {:consumer, :ok, subscribe_to: [{TaskQueue.Pipeline.JobValidator, max_demand: @max_demand}]}
+    {:consumer, :ok, subscribe_to: [{TaskQueue.Pipeline.JobValidator, max_demand: @max_demand}]}
   end
 
   @impl true
   def handle_events(jobs, _from, state) do
-    # TODO: execute each job using TaskQueue.Worker.execute/1
-    # Log the result for each job (success or failure)
-    # Return {:noreply, [], state}  — consumers always return empty events list
-    #
-    # HINT:
-    # Enum.each(jobs, fn job ->
-    #   case TaskQueue.Worker.execute(job) do
-    #     {:ok, result}    -> :logger.info("Job done: #{inspect(result)}")
-    #     {:error, reason} -> :logger.warning("Job failed: #{inspect(reason)}")
-    #   end
-    # end)
-    # {:noreply, [], state}
+    Enum.each(jobs, fn job ->
+      case TaskQueue.Worker.execute(job) do
+        {:ok, result}    -> :logger.info("Job done: #{inspect(result)}")
+        {:error, reason} -> :logger.warning("Job failed: #{inspect(reason)}")
+      end
+    end)
+
+    {:noreply, [], state}
   end
 end
 ```
@@ -335,6 +315,8 @@ mix test test/task_queue/genstage_test.exs --trace
 
 Reflection question: a `JobValidator` with `max_demand: 10` subscribing to a `JobProducer` means the validator requests 10 events at a time. What happens if the validator is slow — does it block the producer from accepting new work from the queue? Trace the demand flow.
 
+Answer: The validator only sends new demand after processing its current batch. If it is slow, it does not request more events, so the producer's `handle_demand` is not called. The producer is not blocked — it simply has no pending demand to fulfill. Jobs remain in the QueueServer until the validator finishes, requests more, and the producer dequeues a new batch. This is precisely the backpressure mechanism: the slowest stage determines the pipeline throughput, and no mailbox grows unbounded.
+
 ---
 
 ## Common production mistakes
@@ -383,6 +365,6 @@ A GenStage stage is a GenServer. Calling `GenServer.call/2` on itself causes a d
 ## Resources
 
 - [GenStage — official hex package](https://hexdocs.pm/gen_stage/GenStage.html)
-- [Introduction to GenStage — José Valim](https://elixir-lang.org/blog/2016/07/14/announcing-genstage/)
+- [Introduction to GenStage — Jose Valim](https://elixir-lang.org/blog/2016/07/14/announcing-genstage/)
 - [Flow: built on GenStage for parallel data processing](https://hexdocs.pm/flow/Flow.html)
-- [Backpressure explained — Saša Jurić](https://www.theerlangelist.com/article/gen_stage)
+- [Backpressure explained — Sasa Juric](https://www.theerlangelist.com/article/gen_stage)

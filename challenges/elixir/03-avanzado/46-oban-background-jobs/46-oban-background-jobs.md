@@ -23,12 +23,12 @@ api_gateway/
 │   └── api_gateway/
 │       ├── application.ex              # already exists — starts Oban
 │       ├── workers/
-│       │   ├── notification_worker.ex  # ← you implement this
-│       │   ├── audit_worker.ex         # ← and this
-│       │   └── report_worker.ex        # ← and this
-│       └── oban_logger.ex             # ← and this
+│       │   ├── notification_worker.ex  # welcome emails, threshold alerts
+│       │   ├── audit_worker.ex         # fire-and-forget audit log writes
+│       │   └── report_worker.ex        # slow report generation with chaining
+│       └── oban_logger.ex             # telemetry-based structured logging
 ├── priv/repo/migrations/
-│   └── *_add_oban_jobs_table.exs      # ← you create this
+│   └── *_add_oban_jobs_table.exs      # Oban migration
 ├── test/
 │   └── api_gateway/
 │       └── workers/
@@ -146,26 +146,64 @@ children = [
 
 ### Step 5: `lib/api_gateway/workers/notification_worker.ex`
 
+The notification worker handles welcome emails and threshold alerts. It uses Oban's
+`unique` option to prevent duplicate welcome notifications for the same client within
+a 5-minute window — protecting against double-enqueue from retried HTTP requests.
+
 ```elixir
 defmodule ApiGateway.Workers.NotificationWorker do
   use Oban.Worker,
     queue: :notifications,
     max_attempts: 5,
-    # Prevent duplicate welcome notifications for the same client
     unique: [period: 300, fields: [:args]]
 
   @impl Oban.Worker
   def perform(%Oban.Job{args: %{"type" => "welcome", "client_id" => client_id}}) do
-    # TODO:
-    # 1. Fetch client from DB — if not found, return {:cancel, "client not found"}
-    # 2. Send welcome email via ApiGateway.Mailer
-    # 3. Send push notification via ApiGateway.PushNotifier
-    # 4. Return :ok on success
-    # 5. Return {:error, reason} if email service is temporarily unavailable
+    case ApiGateway.Clients.get(client_id) do
+      nil ->
+        # Client was deleted between enqueue and execution — retrying is pointless.
+        {:cancel, "client #{client_id} not found"}
+
+      client ->
+        with :ok <- ApiGateway.Mailer.send_welcome(client),
+             :ok <- ApiGateway.PushNotifier.send_welcome(client) do
+          :ok
+        else
+          {:error, :service_unavailable} ->
+            # Email service is temporarily down — Oban will retry with backoff.
+            {:error, "email service unavailable"}
+
+          {:error, reason} ->
+            {:error, reason}
+        end
+    end
   end
 
   def perform(%Oban.Job{args: %{"type" => "threshold_alert", "client_id" => client_id, "threshold" => pct}}) do
-    # TODO: implement threshold alert notification
+    case ApiGateway.Clients.get(client_id) do
+      nil ->
+        {:cancel, "client #{client_id} not found"}
+
+      client ->
+        message = "Usage has reached #{pct}% of your plan quota."
+
+        with :ok <- ApiGateway.Mailer.send_alert(client, message),
+             :ok <- ApiGateway.PushNotifier.send_alert(client, message) do
+          :ok
+        else
+          {:error, reason} -> {:error, reason}
+        end
+    end
+  end
+
+  def perform(%Oban.Job{args: %{"type" => "report_ready", "client_id" => client_id}}) do
+    case ApiGateway.Clients.get(client_id) do
+      nil ->
+        {:cancel, "client #{client_id} not found"}
+
+      client ->
+        ApiGateway.Mailer.send_report_ready(client)
+    end
   end
 
   def perform(%Oban.Job{args: %{"type" => type}}) do
@@ -177,43 +215,89 @@ end
 
 ### Step 6: `lib/api_gateway/workers/audit_worker.ex`
 
+The audit worker writes event logs to the analytics store. It runs at high volume
+on a dedicated queue with 50 concurrent slots. Failed writes retry up to 3 times;
+unknown event types are cancelled immediately.
+
 ```elixir
 defmodule ApiGateway.Workers.AuditWorker do
   use Oban.Worker,
     queue: :audit,
     max_attempts: 3
 
+  @known_events ~w(api_request client_login client_logout rate_limited config_changed)
+
   @impl Oban.Worker
   def perform(%Oban.Job{args: %{"event" => event, "client_id" => client_id, "metadata" => meta}}) do
-    # TODO:
-    # Fire-and-forget audit log write to analytics store.
-    # This worker runs at high volume — keep it simple and fast.
-    # Return {:error, reason} on transient DB errors so Oban retries.
-    # Return {:cancel, reason} if the event type is unknown (no point retrying).
+    unless event in @known_events do
+      return {:cancel, "unknown event type: #{event}"}
+    end
+
+    audit_entry = %{
+      event: event,
+      client_id: client_id,
+      metadata: meta,
+      recorded_at: DateTime.utc_now()
+    }
+
+    case ApiGateway.Analytics.record(audit_entry) do
+      :ok ->
+        :ok
+
+      {:error, :connection_refused} ->
+        # Analytics store is temporarily down — retry with backoff.
+        {:error, "analytics store unavailable"}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  def perform(%Oban.Job{args: %{"event" => event}}) when event not in @known_events do
+    {:cancel, "unknown event type: #{event}"}
   end
 end
 ```
 
 ### Step 7: `lib/api_gateway/workers/report_worker.ex`
 
+The report worker handles slow, CPU-bound report generation. It chains a notification
+job upon completion so the client is informed when their report is ready. The `unique`
+option prevents duplicate reports for the same client+period within an hour.
+
 ```elixir
 defmodule ApiGateway.Workers.ReportWorker do
   use Oban.Worker,
     queue: :reports,
     max_attempts: 3,
-    # Prevent duplicate reports for the same client+period combination
     unique: [period: 3_600, fields: [:args, :worker], keys: [:client_id, :period]]
 
   @impl Oban.Worker
   def perform(%Oban.Job{args: %{"client_id" => client_id, "period" => period}}) do
-    # TODO:
-    # 1. Generate the usage report (slow operation — may take minutes)
-    # 2. Store the report
-    # 3. On success: enqueue a NotificationWorker to tell the client the report is ready
-    #    HINT: NotificationWorker.new(%{type: "report_ready", client_id: client_id}) |> Oban.insert()
-    # 4. Return :ok
-    # 5. Return {:error, reason} on transient failures
-    # 6. Return {:cancel, reason} if client_id is invalid
+    case ApiGateway.Clients.get(client_id) do
+      nil ->
+        {:cancel, "client #{client_id} not found"}
+
+      client ->
+        # Generate the usage report (slow operation — may take minutes)
+        with {:ok, report} <- ApiGateway.Reports.generate(client, period),
+             {:ok, _stored} <- ApiGateway.Reports.store(report) do
+          # Chain a notification to inform the client their report is ready.
+          # This runs as a separate Oban job on the notifications queue.
+          %{"type" => "report_ready", "client_id" => client_id}
+          |> ApiGateway.Workers.NotificationWorker.new()
+          |> Oban.insert()
+
+          :ok
+        else
+          {:error, :timeout} ->
+            # External service timed out — transient, Oban will retry.
+            {:error, "report generation timed out"}
+
+          {:error, reason} ->
+            {:error, reason}
+        end
+    end
   end
 
   # Kill the job if it takes more than 10 minutes
@@ -222,6 +306,9 @@ end
 ```
 
 ### Step 8: `lib/api_gateway/oban_logger.ex`
+
+Structured logging for all Oban job lifecycle events. Attach this in `Application.start/2`
+to get visibility into job execution times, failures, and retries.
 
 ```elixir
 defmodule ApiGateway.ObanLogger do

@@ -28,7 +28,7 @@ api_gateway/
 │       ├── metrics/
 │       │   ├── counter.ex
 │       │   ├── event_log.ex
-│       │   └── aggregator.ex       # ← you implement this
+│       │   └── aggregator.ex
 │       └── ...
 ├── test/
 │   └── api_gateway/
@@ -123,12 +123,17 @@ defmodule ApiGateway.Metrics.Aggregator do
   Runs a CPU-bound aggregation pass every @interval_ms milliseconds.
   The aggregation yields every @yield_every entries to avoid monopolizing
   the normal BEAM scheduler and causing latency spikes for request handlers.
+
+  The yield strategy uses :erlang.yield/0, which signals the scheduler that
+  this process is willing to be preempted. The scheduler may or may not
+  actually preempt — it depends on whether other runnable processes are waiting.
+  This is cooperative, not preemptive: it hints rather than forces.
   """
 
   use GenServer
 
   @interval_ms 10_000
-  @yield_every 500   # call :erlang.yield() every N entries processed
+  @yield_every 500
 
   # ── Public API ──────────────────────────────────────────────────────────────
 
@@ -158,9 +163,7 @@ defmodule ApiGateway.Metrics.Aggregator do
 
   @impl true
   def init(_opts) do
-    # HINT: schedule the first aggregation with Process.send_after/3
-    # HINT: initial state: %{last_result: nil, run_count: 0}
-    # TODO: implement
+    Process.send_after(self(), :aggregate, @interval_ms)
     {:ok, %{last_result: nil, run_count: 0}}
   end
 
@@ -178,8 +181,7 @@ defmodule ApiGateway.Metrics.Aggregator do
   @impl true
   def handle_info(:aggregate, state) do
     result = do_aggregate()
-    # HINT: reschedule next aggregation with Process.send_after/3
-    # TODO: implement rescheduling
+    Process.send_after(self(), :aggregate, @interval_ms)
     {:noreply, %{state | last_result: result, run_count: state.run_count + 1}}
   end
 
@@ -189,22 +191,53 @@ defmodule ApiGateway.Metrics.Aggregator do
     # Read all events directly from the ETS table.
     # EventLog owns the :gateway_event_log table — read it without going through
     # the GenServer to avoid serializing the expensive aggregation on its mailbox.
-    events = :ets.tab2list(:gateway_event_log)
+    #
+    # If the table doesn't exist (e.g., EventLog not started), return empty map.
+    events =
+      try do
+        :ets.tab2list(:gateway_event_log)
+      catch
+        :error, :badarg -> []
+      end
 
-    # Aggregate with periodic yielding to avoid scheduler starvation
-    # HINT: use Enum.with_index to track position
-    # HINT: every @yield_every entries, call :erlang.yield()
-    # HINT: :erlang.yield() signals the scheduler that this process is willing
-    #       to be preempted — the scheduler may or may not actually preempt
-    # TODO: implement the yield-aware aggregation fold
+    # Aggregate with periodic yielding to avoid scheduler starvation.
+    # Every @yield_every entries, call :erlang.yield() to signal the scheduler
+    # that this process is willing to be preempted. This prevents a large event
+    # log from causing latency spikes for concurrent request handlers.
+    events
+    |> Enum.with_index(1)
+    |> Enum.reduce(%{}, fn {event, index}, acc ->
+      if rem(index, @yield_every) == 0, do: :erlang.yield()
 
-    # Return a map: %{route => %{count: N, total_us: N, p99_us: N}}
-    %{}
+      case event do
+        {{_ts, _id}, route, status_code, bytes} ->
+          route_stats = Map.get(acc, route, %{count: 0, total_bytes: 0, errors: 0})
+
+          error_inc = if status_code >= 400, do: 1, else: 0
+
+          updated = %{
+            count: route_stats.count + 1,
+            total_bytes: route_stats.total_bytes + bytes,
+            errors: route_stats.errors + error_inc
+          }
+
+          Map.put(acc, route, updated)
+
+        _ ->
+          acc
+      end
+    end)
   end
 
   @doc false
-  # Measures scheduler wall time utilization across a workload.
-  # Returns a list of {scheduler_id, utilization_ratio} for each normal scheduler.
+  @doc """
+  Measures scheduler wall time utilization across a workload.
+  Returns a list of {scheduler_id, utilization_ratio} for each normal scheduler.
+
+  Enables scheduler_wall_time tracking, snapshots before and after the workload,
+  then computes the utilization ratio (active_time / total_time) for each scheduler.
+  Only includes normal schedulers (ids 1..schedulers_online), not dirty schedulers.
+  """
   @spec measure_scheduler_utilization(fun()) :: [{integer(), float()}]
   def measure_scheduler_utilization(workload_fn) do
     :erlang.system_flag(:scheduler_wall_time, true)
@@ -213,11 +246,22 @@ defmodule ApiGateway.Metrics.Aggregator do
     workload_fn.()
 
     after_stats = :erlang.statistics(:scheduler_wall_time) |> Enum.sort()
+    online = System.schedulers_online()
 
-    # HINT: zip before and after, compute (a1 - a0) / (t1 - t0) for each scheduler
-    # HINT: filter to normal schedulers only (ids 1..System.schedulers_online())
-    # TODO: implement
-    []
+    Enum.zip(before, after_stats)
+    |> Enum.filter(fn {{id, _, _}, _} -> id <= online end)
+    |> Enum.map(fn {{id, a0, t0}, {^id, a1, t1}} ->
+      delta_total = t1 - t0
+
+      ratio =
+        if delta_total > 0 do
+          (a1 - a0) / delta_total
+        else
+          0.0
+        end
+
+      {id, ratio + 0.0}
+    end)
   end
 end
 ```
@@ -320,12 +364,8 @@ mix test test/api_gateway/metrics/aggregator_test.exs --trace
 
 ```elixir
 # bench/scheduler_bench.exs
-# Compares a tight loop vs a yielding loop under concurrent load.
-# Measures impact on latency of a concurrent "fast" workload.
-
 fast_task = fn ->
   Task.async(fn ->
-    # Simulates a fast I/O-bound handler — should not be starved
     :timer.sleep(1)
     :done
   end)

@@ -23,15 +23,15 @@ api_gateway/
 ├── lib/
 │   └── api_gateway/
 │       ├── config/
-│       │   ├── config.ex                       # Ash.Domain — ← you implement this
+│       │   ├── config.ex                       # Ash.Domain
 │       │   └── resources/
-│       │       ├── service.ex                  # ← you implement this
-│       │       ├── route_rule.ex               # ← you implement this
+│       │       ├── service.ex                  # Service resource
+│       │       ├── route_rule.ex               # RouteRule resource
 │       │       └── route_rule/
 │       │           └── validations/
-│       │               └── path_format.ex      # ← you implement this
+│       │               └── path_format.ex      # custom validation
 │       └── config/
-│           └── queries.ex                      # ← you implement this
+│           └── queries.ex                      # composable Ash.Query helpers
 ├── test/
 │   └── api_gateway/
 │       └── config/
@@ -117,10 +117,10 @@ defmodule ApiGateway.Config.Resources.Service do
   A backend service registered in the gateway.
 
   Attributes:
-  - name: human-readable identifier, unique, 2–64 chars
+  - name: human-readable identifier, unique, 2-64 chars
   - upstream_url: HTTPS URL the gateway proxies to
   - status: :active | :draining | :offline
-  - weight: relative weight for load-balancing, 1–100
+  - weight: relative weight for load-balancing, 1-100
   """
 
   use Ash.Resource,
@@ -167,34 +167,35 @@ defmodule ApiGateway.Config.Resources.Service do
   actions do
     defaults [:create, :read, :update, :destroy]
 
-    # TODO: implement a :drain action (update) that sets status to :draining.
-    # Use the built-in `change set_attribute/2` — no custom function needed.
     update :drain do
       description "Marks the service as draining — no new requests routed to it."
-      # TODO: change set_attribute(:status, :draining)
+      change set_attribute(:status, :draining)
     end
 
-    # TODO: implement a :take_offline action (update) that sets status to :offline.
     update :take_offline do
       description "Marks the service as offline."
-      # TODO: change set_attribute(:status, :offline)
+      change set_attribute(:status, :offline)
     end
 
-    # TODO: implement a :activate action (update) that sets status back to :active.
     update :activate do
       description "Brings the service back to active status."
-      # TODO: change set_attribute(:status, :active)
+      change set_attribute(:status, :active)
     end
 
     read :active do
       description "Returns only services with status :active."
-      # TODO: filter expr(status == :active)
+      filter expr(status == :active)
     end
 
     read :routable do
       description "Returns services eligible for routing (active or draining)."
-      # TODO: filter expr(status in [:active, :draining])
-      # TODO: add pagination block: keyset? true, default_limit: 50, countable: true
+      filter expr(status in [:active, :draining])
+
+      pagination do
+        keyset? true
+        default_limit 50
+        countable true
+      end
     end
   end
 
@@ -203,6 +204,24 @@ defmodule ApiGateway.Config.Resources.Service do
   end
 end
 ```
+
+The `drain`, `take_offline`, and `activate` actions use `change set_attribute/2` — a
+built-in Ash change that sets the attribute to a fixed value. No custom change module
+is needed. The caller invokes these as:
+
+```elixir
+service
+|> Ash.Changeset.for_update(:drain, %{})
+|> Config.update!()
+```
+
+The `:active` and `:routable` read actions use `filter expr(...)` to apply server-side
+filters. The `:routable` action also enables keyset pagination with a default limit of
+50, which is suitable for dashboard table views.
+
+The `identity :unique_name, [:name]` generates both a database unique index and a
+runtime uniqueness check. The database constraint is the true guard against race
+conditions; the Ash-level check provides a friendlier error message.
 
 ### Step 4: RouteRule resource — `lib/api_gateway/config/resources/route_rule.ex`
 
@@ -246,8 +265,7 @@ defmodule ApiGateway.Config.Resources.RouteRule do
   end
 
   validations do
-    # TODO: add a validation that calls ApiGateway.Config.Resources.RouteRule.Validations.PathFormat
-    # to ensure path_prefix starts with "/" and contains no whitespace.
+    validate {ApiGateway.Config.Resources.RouteRule.Validations.PathFormat, []}
   end
 
   actions do
@@ -255,16 +273,15 @@ defmodule ApiGateway.Config.Resources.RouteRule do
 
     read :ordered do
       description "Returns active route rules in ascending priority order."
-      # TODO: filter expr(active == true)
-      # TODO: sort priority: :asc
+      filter expr(active == true)
+      prepare build(sort: [priority: :asc])
     end
 
     read :for_path do
       description "Returns rules whose path_prefix is a prefix of the given path."
       argument :path, :string, allow_nil?: false
-      # TODO: filter expr(active == true and starts_with(^arg(:path), path_prefix))
-      # TODO: sort priority: :asc
-      # TODO: limit 1
+      filter expr(active == true and contains(^arg(:path), path_prefix))
+      prepare build(sort: [priority: :asc], limit: 1)
     end
 
     update :reprioritize do
@@ -273,10 +290,14 @@ defmodule ApiGateway.Config.Resources.RouteRule do
         allow_nil? false
         constraints min: 1, max: 1000
       end
-      # TODO: change fn changeset, _ ->
-      #   Ash.Changeset.change_attribute(changeset, :priority,
-      #     Ash.Changeset.get_argument(changeset, :new_priority))
-      # end
+
+      change fn changeset, _ ->
+        Ash.Changeset.change_attribute(
+          changeset,
+          :priority,
+          Ash.Changeset.get_argument(changeset, :new_priority)
+        )
+      end
     end
   end
 
@@ -288,6 +309,19 @@ defmodule ApiGateway.Config.Resources.RouteRule do
   end
 end
 ```
+
+The `:ordered` read action combines a filter and a sort using `prepare build(...)`.
+The `build` preparation is a built-in Ash preparation that applies query modifiers
+at the action level.
+
+The `:for_path` action takes a `:path` argument and uses `contains/2` in the filter
+expression to find rules whose `path_prefix` is contained within the requested path.
+The `limit: 1` ensures only the highest-priority match is returned.
+
+The `:reprioritize` action demonstrates a custom change function. It reads the
+`:new_priority` argument from the changeset and applies it to the `:priority` attribute.
+This pattern keeps the action's intent explicit in the DSL while allowing computed
+attribute changes.
 
 ### Step 5: PathFormat validation — `lib/api_gateway/config/resources/route_rule/validations/path_format.ex`
 
@@ -309,16 +343,13 @@ defmodule ApiGateway.Config.Resources.RouteRule.Validations.PathFormat do
 
     cond do
       is_nil(path) ->
-        # allow_nil? false on the attribute will catch this separately
         :ok
 
       not String.starts_with?(path, "/") ->
-        # TODO: return {:error, field: :path_prefix, message: "must start with /"}
-        :ok
+        {:error, field: :path_prefix, message: "must start with /"}
 
       String.match?(path, ~r/\s/) ->
-        # TODO: return {:error, field: :path_prefix, message: "must not contain whitespace"}
-        :ok
+        {:error, field: :path_prefix, message: "must not contain whitespace"}
 
       true ->
         :ok
@@ -326,6 +357,15 @@ defmodule ApiGateway.Config.Resources.RouteRule.Validations.PathFormat do
   end
 end
 ```
+
+The validation runs on every create and update action. The `cond` handles three cases:
+
+1. **nil path**: allowed through — the `allow_nil? false` constraint on the attribute
+   will catch this separately with its own error message.
+2. **Missing leading slash**: returns a field-level error that Ash formats into the
+   standard error structure.
+3. **Contains whitespace**: `~r/\s/` matches any whitespace character (space, tab,
+   newline). HTTP paths never contain whitespace, so this is always a mistake.
 
 ### Step 6: Query helpers — `lib/api_gateway/config/queries.ex`
 
@@ -349,7 +389,9 @@ defmodule ApiGateway.Config.Queries do
 
   @doc "Returns all services for a given status."
   def services_by_status(status) do
-    # TODO: filter Service by status == ^status, sort by name: :asc
+    Service
+    |> filter(status == ^status)
+    |> sort(name: :asc)
   end
 
   @doc "Returns active route rules sorted by priority ascending."
@@ -364,16 +406,28 @@ defmodule ApiGateway.Config.Queries do
   Returns nil if no rule matches.
   """
   def match_rule(path) when is_binary(path) do
-    # TODO: filter RouteRule where active == true and starts_with(^path, path_prefix)
-    # TODO: sort priority: :asc
-    # TODO: limit 1
-    # TODO: Ash.Query.load([:service]) to preload the target service
-    # TODO: call Config.read!/1 and return hd(results) or nil
+    result =
+      RouteRule
+      |> filter(active == true and contains(^path, path_prefix))
+      |> sort(priority: :asc)
+      |> limit(1)
+      |> load([:service])
+      |> Config.read!()
+
+    case result do
+      [rule | _] -> rule
+      [] -> nil
+    end
   end
 end
 ```
 
-### Step 7: Migration — `priv/repo/migrations/TIMESTAMP_create_gateway_config.exs`
+`match_rule/1` demonstrates a complete query composition: filter, sort, limit, and
+relationship loading. The `contains/2` expression in Ash translates to a SQL `LIKE`
+or `POSITION` check depending on the backend. The `load([:service])` preloads the
+associated service in the same query, avoiding an N+1 if multiple rules are fetched.
+
+### Step 7: Migration
 
 Run `mix ash_postgres.generate_migrations --name create_gateway_config` to let Ash
 generate this from the resource declarations. The output should be equivalent to:

@@ -77,6 +77,15 @@ The `Rules` module provides factory functions that return configured closures:
 
 ### `lib/payments_cli/rules.ex`
 
+Each factory function returns a closure that captures its configuration. The caller
+receives a function and does not need to know the configuration — it just calls the
+function. This decouples configuration from invocation.
+
+`make_fee_calculator/2` returns a function that computes `floor(amount * rate) + fixed`.
+`make_filter/1` returns a predicate that applies all active filter criteria.
+`make_formatter/1` returns a function that formats a transaction with captured options.
+`make_validator/1` composes multiple validator functions into one.
+
 ```elixir
 defmodule PaymentsCli.Rules do
   @moduledoc """
@@ -109,16 +118,10 @@ defmodule PaymentsCli.Rules do
   def make_fee_calculator(basis_points, fixed_fee_cents)
       when is_integer(basis_points) and basis_points >= 0 and
            is_integer(fixed_fee_cents) and fixed_fee_cents >= 0 do
-    # TODO: return an anonymous function that captures basis_points and fixed_fee_cents
-    #
-    # fn amount_cents ->
-    #   percentage_fee = div(amount_cents * basis_points, 10_000)
-    #   percentage_fee + fixed_fee_cents
-    # end
-    #
-    # The closure captures basis_points and fixed_fee_cents from this scope.
-    # Even after make_fee_calculator/2 returns, the returned function still has
-    # access to those values.
+    fn amount_cents ->
+      percentage_fee = div(amount_cents * basis_points, 10_000)
+      percentage_fee + fixed_fee_cents
+    end
   end
 
   @doc """
@@ -145,19 +148,12 @@ defmodule PaymentsCli.Rules do
   """
   @spec make_filter(map()) :: (map() -> boolean())
   def make_filter(criteria) when is_map(criteria) do
-    # TODO: return a closure that captures `criteria` and applies all active filters
-    #
-    # fn tx ->
-    #   passes_min?(tx, criteria) and
-    #   passes_max?(tx, criteria) and
-    #   passes_statuses?(tx, criteria) and
-    #   passes_currencies?(tx, criteria)
-    # end
-    #
-    # Implement private helpers:
-    #   defp passes_min?(tx, %{min_amount: min}), do: tx.amount_cents >= min
-    #   defp passes_min?(_tx, _criteria), do: true  # no min_amount key = no constraint
-    # Similar pattern for the others.
+    fn tx ->
+      passes_min?(tx, criteria) and
+        passes_max?(tx, criteria) and
+        passes_statuses?(tx, criteria) and
+        passes_currencies?(tx, criteria)
+    end
   end
 
   @doc """
@@ -179,18 +175,21 @@ defmodule PaymentsCli.Rules do
   """
   @spec make_formatter(keyword()) :: (map() -> String.t())
   def make_formatter(opts \\ []) when is_list(opts) do
-    # TODO: capture opts (or specific values from opts) in the closure
-    #
-    # symbol     = Keyword.get(opts, :currency_symbol, nil)
-    # show_status = Keyword.get(opts, :show_status, false)
-    # max_len    = Keyword.get(opts, :max_merchant_length, 30)
-    #
-    # fn tx ->
-    #   amount_str = format_amount(tx.amount_cents, tx.currency, symbol)
-    #   merchant = String.slice(tx.merchant || "", 0, max_len)
-    #   base = "#{tx.id} | #{merchant} | #{amount_str}"
-    #   if show_status, do: base <> " | #{tx.status}", else: base
-    # end
+    symbol = Keyword.get(opts, :currency_symbol, nil)
+    show_status = Keyword.get(opts, :show_status, false)
+    max_len = Keyword.get(opts, :max_merchant_length, 30)
+
+    fn tx ->
+      amount_str = format_amount(tx.amount_cents, tx.currency, symbol)
+      merchant = String.slice(tx.merchant || "", 0, max_len)
+      base = "#{tx.id} | #{merchant} | #{amount_str}"
+
+      if show_status do
+        base <> " | #{tx.status}"
+      else
+        base
+      end
+    end
   end
 
   @doc """
@@ -214,22 +213,20 @@ defmodule PaymentsCli.Rules do
   @spec make_validator([(map() -> :ok | {:error, String.t()})]) ::
           (map() -> :ok | {:error, [String.t()]})
   def make_validator(validators) when is_list(validators) do
-    # TODO: return a closure that captures `validators`
-    #
-    # fn tx ->
-    #   errors =
-    #     Enum.reduce(validators, [], fn validator, acc ->
-    #       case validator.(tx) do
-    #         :ok             -> acc
-    #         {:error, reason} -> [reason | acc]
-    #       end
-    #     end)
-    #
-    #   case errors do
-    #     []     -> :ok
-    #     reasons -> {:error, Enum.reverse(reasons)}
-    #   end
-    # end
+    fn tx ->
+      errors =
+        Enum.reduce(validators, [], fn validator, acc ->
+          case validator.(tx) do
+            :ok -> acc
+            {:error, reason} -> [reason | acc]
+          end
+        end)
+
+      case errors do
+        [] -> :ok
+        reasons -> {:error, Enum.reverse(reasons)}
+      end
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -261,6 +258,26 @@ defmodule PaymentsCli.Rules do
   end
 end
 ```
+
+**Why this works:**
+
+- `make_fee_calculator/2` returns a `fn` that closes over `basis_points` and
+  `fixed_fee_cents`. Each call to the factory creates an independent closure with its
+  own captured values. Multiple calculators coexist without interference.
+
+- `make_filter/1` returns a `fn` that closes over `criteria` and delegates to private
+  helpers. Each helper uses pattern matching: `passes_min?(tx, %{min_amount: min})`
+  matches when the criteria map has `:min_amount`; the catch-all `passes_min?(_tx, _criteria)`
+  returns `true` when the key is absent. This means absent criteria = no constraint.
+
+- `make_formatter/1` extracts options once at factory time (not per call), capturing
+  the resolved values in the closure. The returned function only does formatting work —
+  it does not re-read options on every invocation.
+
+- `make_validator/1` returns a closure that reduces over the captured list of validators.
+  Each validator is called with the transaction; errors are collected into a list.
+  If no errors, return `:ok`. If errors, return them in order (reversed back from
+  accumulation order).
 
 ### Given tests — must pass without modification
 

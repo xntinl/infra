@@ -27,11 +27,11 @@ api_gateway/
 │   └── api_gateway/
 │       ├── application.ex          # target-aware supervision tree
 │       ├── sensor/
-│       │   ├── bme280.ex           # ← you implement this
-│       │   └── store.ex            # ← and this
+│       │   ├── bme280.ex           # BME280 sensor over I2C
+│       │   └── store.ex            # ETS-backed circular buffer
 │       ├── indicator/
-│       │   └── led.ex              # ← and this
-│       └── device_api.ex           # ← and this
+│       │   └── led.ex              # status LED controller
+│       └── device_api.ex           # local HTTP API
 ├── test/
 │   └── api_gateway/
 │       └── sensor_store_test.exs   # given tests — run on host, no hardware needed
@@ -162,6 +162,17 @@ defmodule ApiGateway.Sensor.Store do
 end
 ```
 
+The store uses `System.monotonic_time(:millisecond)` as the ETS key — monotonic time
+is strictly increasing and never goes backwards (unlike wall-clock time which can
+jump due to NTP adjustments). The `:ordered_set` table type keeps entries sorted by
+key, so `:ets.last/1` always returns the most recent reading in O(log n).
+
+Eviction is handled asynchronously via `GenServer.cast/2`. This means `insert/1`
+returns immediately after the ETS write. The cast runs in the GenServer process,
+checking the table size and removing the oldest entry if over capacity. The small
+window where the table has 101 entries is acceptable — it is bounded and resolved
+on the next message.
+
 ### Step 4: `lib/api_gateway/sensor/bme280.ex`
 
 ```elixir
@@ -195,30 +206,44 @@ defmodule ApiGateway.Sensor.BME280 do
 
   @impl true
   def init({bus, address}) do
-    # TODO: open the I2C bus with I2C.open/1
-    # TODO: initialize the BME280 sensor (set normal mode, oversampling x1)
-    # TODO: schedule the first poll with Process.send_after
-    # TODO: return {:ok, %{bus_ref: ref, address: address, error_count: 0}}
+    {:ok, bus_ref} = I2C.open(bus)
+
+    # Initialize BME280: write 0x27 to ctrl_hum (oversampling x1),
+    # then 0x27 to ctrl_meas (temp x1, pressure x1, normal mode)
+    I2C.write(bus_ref, address, <<0xF2, 0x01>>)
+    I2C.write(bus_ref, address, <<0xF4, 0x27>>)
+
+    schedule_poll(@poll_interval_ms)
+
+    {:ok, %{bus_ref: bus_ref, address: address, error_count: 0}}
   end
 
   @impl true
   def handle_info(:poll, state) do
-    # TODO: call read_sensor/2 with state.bus_ref and state.address
-    # TODO: on {:ok, reading}: insert into Store, reset error_count, schedule next poll
-    # TODO: on {:error, reason}: increment error_count, schedule backoff poll
-    # Backoff: min(@poll_interval_ms * 2^error_count, @max_backoff_ms)
+    case read_sensor(state.bus_ref, state.address) do
+      {:ok, reading} ->
+        ApiGateway.Sensor.Store.insert(reading)
+        schedule_poll(@poll_interval_ms)
+        {:noreply, %{state | error_count: 0}}
+
+      {:error, reason} ->
+        Logger.warning("BME280 read failed: #{inspect(reason)}")
+        backoff = min(@poll_interval_ms * Integer.pow(2, state.error_count), @max_backoff_ms)
+        schedule_poll(backoff)
+        {:noreply, %{state | error_count: state.error_count + 1}}
+    end
   end
 
   @impl true
   def terminate(_reason, state) do
-    # TODO: close the I2C bus with I2C.close/1 to release the OS resource
+    I2C.close(state.bus_ref)
   end
 
   # Private
 
+  defp schedule_poll(ms), do: Process.send_after(self(), :poll, ms)
+
   defp read_sensor(bus_ref, address) do
-    # Simplified: in production use the full Bosch compensation algorithm
-    # with calibration registers. This approximation is sufficient for testing.
     with {:ok, t_raw}  <- I2C.write_read(bus_ref, address, <<0xFA>>, 3),
          {:ok, h_raw}  <- I2C.write_read(bus_ref, address, <<0xFD>>, 2),
          {:ok, p_raw}  <- I2C.write_read(bus_ref, address, <<0xF7>>, 3) do
@@ -245,6 +270,16 @@ defmodule ApiGateway.Sensor.BME280 do
   end
 end
 ```
+
+The `init/1` callback opens the I2C bus, writes initialization registers to the BME280
+sensor, and schedules the first poll. On successful reads, the reading is inserted into
+the `Store` and the next poll is scheduled at the normal interval. On failures, the
+error count increments and the backoff grows exponentially up to `@max_backoff_ms`.
+This prevents the GenServer from hammering a failing sensor bus.
+
+`terminate/2` closes the I2C bus reference, releasing the OS file descriptor. Without
+this, a crashed-and-restarted process would fail with `{:error, :resource_busy}` when
+trying to reopen the same bus.
 
 ### Step 5: `lib/api_gateway/indicator/led.ex`
 
@@ -319,7 +354,7 @@ defmodule ApiGateway.Indicator.LED do
 
   defp interval(:healthy), do: 500
   defp interval(:warning),  do: 100
-  defp interval(:off),      do: 60_000  # effectively never
+  defp interval(:off),      do: 60_000
 
   defp schedule_blink(state) do
     timer = Process.send_after(self(), :blink, interval(state.mode))
@@ -356,10 +391,13 @@ defmodule ApiGateway.DeviceAPI do
   end
 
   get "/system" do
-    # TODO: respond with firmware_version, uptime_seconds, memory_mb
-    # HINT: Nerves.Runtime.firmware_metadata()["nerves_fw_version"]
-    # HINT: Nerves.Runtime.uptime() |> elem(0)
-    # HINT: :erlang.memory(:total) |> div(1_048_576)
+    info = %{
+      firmware_version: Nerves.Runtime.firmware_metadata()["nerves_fw_version"] || "unknown",
+      uptime_seconds: Nerves.Runtime.uptime() |> elem(0),
+      memory_mb: :erlang.memory(:total) |> div(1_048_576)
+    }
+
+    json(conn, 200, info)
   end
 
   match _ do
@@ -385,6 +423,11 @@ defmodule ApiGateway.DeviceAPI do
   end
 end
 ```
+
+The `/system` endpoint returns firmware metadata, uptime, and memory usage. These
+values come from Nerves runtime functions that read from the Linux procfs and firmware
+metadata stored in the firmware image. On the host target these functions may not be
+available, which is why this endpoint is only included in the device supervision tree.
 
 ### Step 7: `lib/api_gateway/application.ex` — target-aware tree
 

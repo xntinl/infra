@@ -95,6 +95,10 @@ Cost: O(log n) for insert and delete vs O(1) amortized for `Map`.
 
 ### Step 1: `lib/api_gateway/middleware/job_queue.ex`
 
+The `JobQueue` wraps Erlang's `:queue` module in a GenServer. Each callback delegates to the
+corresponding `:queue` function. The state is a single `:queue.queue()` value — no wrapper
+struct needed because the GenServer itself provides the process boundary.
+
 ```elixir
 defmodule ApiGateway.Middleware.JobQueue do
   @moduledoc """
@@ -134,43 +138,51 @@ defmodule ApiGateway.Middleware.JobQueue do
 
   @impl true
   def init(:ok) do
-    # TODO: initialize state as an empty :queue
-    # HINT: :queue.new/0
+    {:ok, :queue.new()}
   end
 
   @impl true
   def handle_call({:enqueue, job}, _from, queue) do
-    # TODO: enqueue job at the back
-    # HINT: :queue.in/2 appends to the back
+    {:reply, :ok, :queue.in(job, queue)}
   end
 
   @impl true
   def handle_call(:dequeue, _from, queue) do
-    # TODO: dequeue from the front
-    # HINT: :queue.out/1 returns {{:value, item}, new_queue} or {:empty, queue}
+    case :queue.out(queue) do
+      {{:value, item}, new_queue} ->
+        {:reply, {:ok, item}, new_queue}
+
+      {:empty, ^queue} ->
+        {:reply, {:error, :empty}, queue}
+    end
   end
 
   @impl true
   def handle_call(:peek, _from, queue) do
-    # TODO: inspect without removing
-    # HINT: :queue.peek/1 returns {:value, item} or :empty
+    case :queue.peek(queue) do
+      {:value, item} -> {:reply, {:ok, item}, queue}
+      :empty -> {:reply, {:error, :empty}, queue}
+    end
   end
 
   @impl true
   def handle_call(:size, _from, queue) do
-    # TODO: return the number of elements
-    # HINT: :queue.len/1
+    {:reply, :queue.len(queue), queue}
   end
 
   @impl true
   def handle_call(:drain, _from, queue) do
-    # TODO: return all elements in FIFO order and reset the queue
-    # HINT: :queue.to_list/1 preserves FIFO order
+    {:reply, :queue.to_list(queue), :queue.new()}
   end
 end
 ```
 
 ### Step 2: `lib/api_gateway/middleware/priority_scheduler.ex`
+
+The priority scheduler uses `:gb_trees` as its backing store. Keys are `{priority, sequence_number}`
+tuples. Because `:gb_trees` sorts by key, and tuples compare element-by-element, items with
+lower priority numbers are served first. The sequence number breaks ties within the same
+priority level, preserving insertion order (FIFO within priority).
 
 ```elixir
 defmodule ApiGateway.Middleware.PriorityScheduler do
@@ -189,44 +201,55 @@ defmodule ApiGateway.Middleware.PriorityScheduler do
 
   @spec new() :: t()
   def new do
-    # TODO: return {:gb_trees.empty(), 0}
-    # The second element is the sequence counter for tie-breaking
+    {:gb_trees.empty(), 0}
   end
 
   @spec insert(t(), priority(), term()) :: t()
   def insert({tree, seq}, priority, value) do
-    # TODO: insert with key {priority, seq} into the tree
-    # HINT: :gb_trees.insert/3 — key must be unique; {priority, seq} guarantees that
-    # HINT: return {new_tree, seq + 1}
+    new_tree = :gb_trees.insert({priority, seq}, value, tree)
+    {new_tree, seq + 1}
   end
 
   @spec peek_min(t()) :: {:ok, {priority(), term()}} | {:error, :empty}
   def peek_min({tree, _seq}) do
-    # TODO: inspect the minimum element without removing it
-    # HINT: :gb_trees.is_empty/1, :gb_trees.smallest/1
-    # HINT: smallest returns {{priority, _seq}, value} — strip the seq from the key
+    if :gb_trees.is_empty(tree) do
+      {:error, :empty}
+    else
+      {{priority, _seq_num}, value} = :gb_trees.smallest(tree)
+      {:ok, {priority, value}}
+    end
   end
 
   @spec pop_min(t()) :: {{:ok, {priority(), term()}}, t()} | {{:error, :empty}, t()}
   def pop_min({tree, seq}) do
-    # TODO: remove and return the minimum element
-    # HINT: :gb_trees.take_smallest/1 returns {key, value, new_tree}
+    if :gb_trees.is_empty(tree) do
+      {{:error, :empty}, {tree, seq}}
+    else
+      {{priority, _seq_num}, value, new_tree} = :gb_trees.take_smallest(tree)
+      {{:ok, {priority, value}}, {new_tree, seq}}
+    end
   end
 
   @spec size(t()) :: non_neg_integer()
   def size({tree, _seq}) do
-    # TODO: :gb_trees.size/1
+    :gb_trees.size(tree)
   end
 
   @spec to_sorted_list(t()) :: [{priority(), term()}]
   def to_sorted_list({tree, _seq}) do
-    # TODO: :gb_trees.to_list/1 returns [{key, value}] in ascending key order
-    # HINT: map each {{priority, _seq}, value} to {priority, value}
+    tree
+    |> :gb_trees.to_list()
+    |> Enum.map(fn {{priority, _seq_num}, value} -> {priority, value} end)
   end
 end
 ```
 
 ### Step 3: `lib/api_gateway/middleware/erlang_adapter.ex`
+
+The adapter converts legacy Erlang data structures to idiomatic Elixir. The key challenge is
+charlist detection: Erlang strings are lists of integers, which look identical to regular lists
+at the type level. `:io_lib.deep_char_list/1` inspects the list contents to determine whether
+it represents a printable string.
 
 ```elixir
 defmodule ApiGateway.Middleware.ErlangAdapter do
@@ -254,9 +277,14 @@ defmodule ApiGateway.Middleware.ErlangAdapter do
   """
   @spec record_to_map(record(), [atom()]) :: map()
   def record_to_map(record, fields) when is_tuple(record) do
-    # TODO: skip the first element (record name) with tl/1
-    # HINT: Tuple.to_list/1, then tl/1 to drop the record name
-    # HINT: zip fields with values, then Map.new, converting charlists recursively
+    values =
+      record
+      |> Tuple.to_list()
+      |> tl()
+
+    fields
+    |> Enum.zip(values)
+    |> Map.new(fn {field, value} -> {field, deep_charlist_to_string(value)} end)
   end
 
   @doc """
@@ -268,8 +296,12 @@ defmodule ApiGateway.Middleware.ErlangAdapter do
   """
   @spec proplist_to_map(proplist()) :: map()
   def proplist_to_map(proplist) do
-    # TODO: use :proplists.get_keys/1 to get unique keys
-    # HINT: Map.new(keys, fn k -> {k, deep_charlist_to_string(:proplists.get_value(k, proplist))} end)
+    keys = :proplists.get_keys(proplist)
+
+    Map.new(keys, fn key ->
+      value = :proplists.get_value(key, proplist)
+      {key, deep_charlist_to_string(value)}
+    end)
   end
 
   @doc """
@@ -279,14 +311,18 @@ defmodule ApiGateway.Middleware.ErlangAdapter do
   """
   @spec deep_charlist_to_string(term()) :: term()
   def deep_charlist_to_string(value) when is_list(value) do
-    # TODO: use :io_lib.deep_char_list/1 to detect charlists
-    # If it is a charlist → List.to_string/1
-    # If it is a regular list → Enum.map each element recursively
+    if :io_lib.deep_char_list(value) do
+      List.to_string(value)
+    else
+      Enum.map(value, &deep_charlist_to_string/1)
+    end
   end
 
   def deep_charlist_to_string(value) when is_tuple(value) do
-    # TODO: convert each element recursively, then rebuild the tuple
-    # HINT: Tuple.to_list, Enum.map, List.to_tuple
+    value
+    |> Tuple.to_list()
+    |> Enum.map(&deep_charlist_to_string/1)
+    |> List.to_tuple()
   end
 
   def deep_charlist_to_string(value), do: value

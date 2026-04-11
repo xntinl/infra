@@ -57,7 +57,7 @@ Three rate limiting use cases:
 
 | Algorithm | Memory | Accuracy | Burst control | Implementation |
 |-----------|--------|----------|---------------|---------------|
-| Fixed window | O(1) | Boundary burst (2× at reset) | No | Trivial |
+| Fixed window | O(1) | Boundary burst (2x at reset) | No | Trivial |
 | Token bucket | O(1) per key | Exact | Yes (capacity = burst size) | Medium |
 | Sliding window log | O(events) per key | Exact | No | Medium |
 | Sliding window counter | O(1) per key | ~1% error | No | Medium |
@@ -67,6 +67,15 @@ Three rate limiting use cases:
 ## Implementation
 
 ### Step 1: `lib/api_gateway/rate_limiter/token_bucket.ex`
+
+The token bucket uses lazy refill: instead of a background process that adds tokens
+periodically, we compute how many tokens should have been added since the last check.
+This eliminates the need for a timer process and makes the implementation stateless from
+a process perspective.
+
+The ETS table stores `{key, tokens_remaining, last_refill_monotonic_ms}` per key.
+`System.monotonic_time/1` is used instead of wall clock time because monotonic time
+never jumps backward (NTP adjustments can cause `DateTime.utc_now()` to go backward).
 
 ```elixir
 defmodule ApiGateway.RateLimiter.TokenBucket do
@@ -121,10 +130,9 @@ defmodule ApiGateway.RateLimiter.TokenBucket do
 
     case :ets.lookup(@table, key) do
       [] ->
-        # First request for this key: initialize full bucket, consume cost
-        # TODO: insert {key, capacity - cost, now} into ETS
-        # return {:ok, capacity - cost}
-        {:error, :not_implemented}
+        new_tokens = capacity - cost
+        :ets.insert(@table, {key, new_tokens, now})
+        {:ok, new_tokens}
 
       [{^key, current_tokens, last_refill}] ->
         elapsed_ms          = now - last_refill
@@ -132,16 +140,14 @@ defmodule ApiGateway.RateLimiter.TokenBucket do
         tokens_after_refill = min(capacity, current_tokens + refilled)
 
         if tokens_after_refill >= cost do
-          # TODO: compute new_tokens = tokens_after_refill - cost
-          # update ETS: {key, new_tokens, if refilled > 0 then now else last_refill}
-          # return {:ok, new_tokens}
-          # HINT: :ets.insert(@table, {key, new_tokens, new_last_refill})
-          {:error, :not_implemented}
+          new_tokens = tokens_after_refill - cost
+          new_last_refill = if refilled > 0, do: now, else: last_refill
+          :ets.insert(@table, {key, new_tokens, new_last_refill})
+          {:ok, new_tokens}
         else
-          # TODO: compute tokens_needed = cost - tokens_after_refill
-          # ms_to_wait = ceil(tokens_needed / refill_rate * 1_000)
-          # return {:error, :rate_limited, ms_to_wait}
-          {:error, :not_implemented}
+          tokens_needed = cost - tokens_after_refill
+          ms_to_wait = ceil(tokens_needed / max(refill_rate, 1) * 1_000)
+          {:error, :rate_limited, ms_to_wait}
         end
     end
   end
@@ -167,6 +173,14 @@ end
 
 ### Step 2: `lib/api_gateway/rate_limiter/sliding_window_counter.ex`
 
+The sliding window counter approximates a sliding window with O(1) memory per key.
+It maintains two fixed windows (current and previous) and weights the previous window's
+count by how much of it overlaps with the current sliding window.
+
+The formula: `estimated = prev_count * ((window_ms - elapsed_in_current) / window_ms) + current_count`
+
+When the current window expires, it becomes the previous window and a new current window starts.
+
 ```elixir
 defmodule ApiGateway.RateLimiter.SlidingWindowCounter do
   @moduledoc """
@@ -175,7 +189,7 @@ defmodule ApiGateway.RateLimiter.SlidingWindowCounter do
   Approximates a sliding window with O(1) memory using two fixed windows:
   the current window and the previous window. The estimate is:
 
-    count ≈ prev_count × ((window_ms - elapsed_in_current) / window_ms)
+    count ~ prev_count * ((window_ms - elapsed_in_current) / window_ms)
             + current_count
 
   Error is at most 1 request per window — accurate enough for most use cases
@@ -224,7 +238,6 @@ defmodule ApiGateway.RateLimiter.SlidingWindowCounter do
 
         [{^key, cur, win_start, prev}] ->
           if now - win_start >= window_ms do
-            # Current window expired → it becomes prev, start a new current
             {0, cur, now}
           else
             {cur, prev, win_start}
@@ -236,13 +249,9 @@ defmodule ApiGateway.RateLimiter.SlidingWindowCounter do
     estimated          = prev_count * prev_weight + current_count
 
     if estimated < limit do
-      # TODO: persist {key, current_count + 1, window_start, prev_count}
-      # return {:ok, trunc(estimated) + 1}
-      # HINT: :ets.insert(@table, {key, current_count + 1, window_start, prev_count})
-      {:error, :not_implemented}
+      :ets.insert(@table, {key, current_count + 1, window_start, prev_count})
+      {:ok, trunc(estimated) + 1}
     else
-      # TODO: estimate when the oldest counted request exits the window
-      # A rough approximation: window_ms / limit (average inter-request gap)
       retry_ms = trunc(window_ms / max(limit, 1))
       {:error, :rate_limited, retry_ms}
     end
@@ -304,7 +313,7 @@ defmodule ApiGateway.RateLimiter.TokenBucketTest do
     # Exhaust
     TokenBucket.check_and_consume(key, 10, capacity: 10, refill_rate: 100)
 
-    # Wait for 100ms at 100 tokens/sec → 10 tokens refilled
+    # Wait for 100ms at 100 tokens/sec -> 10 tokens refilled
     Process.sleep(110)
 
     assert {:ok, _} =
@@ -410,7 +419,7 @@ mix test test/api_gateway/rate_limiter/sliding_window_counter_test.exs --trace
 | Token bucket | O(1) | Yes (capacity = burst size) | Exact | APIs with legitimate burst patterns |
 | Sliding window log | O(N) N=requests in window | No | Exact | Low-volume, strict accuracy |
 | Sliding window counter | O(1) | No | ~1% error | High-volume webhook ingestion |
-| Fixed window | O(1) | Boundary burst (2× at reset) | Exact per window | Legacy systems, simple quotas |
+| Fixed window | O(1) | Boundary burst (2x at reset) | Exact per window | Legacy systems, simple quotas |
 
 | Concurrency model | Throughput | Strict accuracy |
 |------------------|-----------|----------------|
@@ -436,7 +445,7 @@ race condition, or use `:ets.update_counter/3` for atomic integer increments.
 `System.monotonic_time(:millisecond)` for measuring elapsed time in rate limiters.
 
 **3. Sliding window counter: forgetting to weight the previous window**
-The approximation formula is `prev × weight + current`. Omitting the weight factor
+The approximation formula is `prev * weight + current`. Omitting the weight factor
 turns it back into a fixed window, losing the sliding behavior and reintroducing the
 boundary burst problem.
 

@@ -23,7 +23,7 @@ task_queue/
 ├── test/
 │   └── task_queue/
 │       └── protocol_impl_test.exs  # given tests — must pass without modification
-└── mix.exs
+└─�� mix.exs
 ```
 
 ---
@@ -133,19 +133,9 @@ defimpl String.Chars, for: TaskQueue.Job do
 
   Format: "{type}:{id} [{status}]"
   If id is nil, uses "new" as the id placeholder.
-
-  ## Examples
-
-      iex> job = %TaskQueue.Job{id: "abc-123", type: "send_email", status: :pending}
-      iex> to_string(job)
-      "send_email:abc-123 [pending]"
-
-      iex> "Processing #{job}"
-      "Processing send_email:abc-123 [pending]"
-
   """
   def to_string(%TaskQueue.Job{id: id, type: type, status: status}) do
-    # TODO: return "#{type}:#{id || "new"} [#{status}]"
+    "#{type}:#{id || "new"} [#{status}]"
   end
 end
 
@@ -159,30 +149,20 @@ defimpl Inspect, for: TaskQueue.Job do
   and scheduled_at (implementation detail).
 
   Format: #TaskQueue.Job<id: "abc-123", type: "send_email", status: :failed, retries: 2>
-
-  ## Examples
-
-      iex> job = %TaskQueue.Job{id: "abc-123", type: "send_email", status: :failed, retry_count: 2}
-      iex> inspect(job)
-      "#TaskQueue.Job<id: \\"abc-123\\", type: \\"send_email\\", status: :failed, retries: 2>"
-
   """
   def inspect(%TaskQueue.Job{id: id, type: type, status: status, retry_count: retries}, opts) do
-    # TODO: use Inspect.Algebra helpers to build:
-    # "#TaskQueue.Job<id: {id}, type: {type}, status: {status}, retries: {retries}>"
-    #
-    # HINT:
-    # fields = [
-    #   concat(["id: ", Inspect.inspect(id, opts)]),
-    #   concat(["type: ", Inspect.inspect(type, opts)]),
-    #   concat(["status: ", Inspect.inspect(status, opts)]),
-    #   concat(["retries: ", Inspect.inspect(retries, opts)])
-    # ]
-    # concat(["#TaskQueue.Job<", Enum.join(fields, ", "), ">"])
-    #
-    # Note: the simplest correct implementation avoids Inspect.Algebra entirely:
-    # "#TaskQueue.Job<id: #{inspect(id)}, type: #{inspect(type)}, " <>
-    # "status: #{inspect(status)}, retries: #{retries}>"
+    inner =
+      Enum.join(
+        [
+          "id: #{Kernel.inspect(id)}",
+          "type: #{Kernel.inspect(type)}",
+          "status: #{Kernel.inspect(status)}",
+          "retries: #{retries}"
+        ],
+        ", "
+      )
+
+    concat(["#TaskQueue.Job<", inner, ">"])
   end
 end
 ```
@@ -310,6 +290,8 @@ mix test test/task_queue/protocol_impl_test.exs --trace
 | `@derive [Inspect]` with except | N/A | yes, filtered | yes | module attribute |
 
 Reflection question: `@derive [Inspect, except: [:args, :scheduled_at]]` would hide those fields automatically without a custom implementation. When would you write a full `defimpl Inspect` instead of using `@derive`?
+
+Answer: When you need a custom format that `@derive` cannot produce — for example, the `#TaskQueue.Job<...>` format with `retries:` instead of `retry_count:`, or computing derived fields (like duration from timestamps), or conditionally showing fields based on status. `@derive` only supports `:only` and `:except` for filtering fields; it cannot rename, transform, or conditionally display them.
 
 ---
 

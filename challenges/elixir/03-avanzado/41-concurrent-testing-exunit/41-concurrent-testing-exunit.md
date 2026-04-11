@@ -36,10 +36,10 @@ A slow test suite delays every deploy. The bottleneck is serial test execution:
 
 ```
 async: false (current)     async: true (target)
-[Test A: 300ms]            [Test A] ──┐
-[Test B: 300ms]            [Test B] ──┤ all run in parallel
-[Test C: 300ms]            [Test C] ──┤ = ~300ms total
-[Test D: 300ms]            [Test D] ──┘
+[Test A: 300ms]            [Test A] --+
+[Test B: 300ms]            [Test B] --| all run in parallel
+[Test C: 300ms]            [Test C] --| = ~300ms total
+[Test D: 300ms]            [Test D] --+
 Total: 1,200ms             Total: ~300ms
 ```
 
@@ -67,8 +67,11 @@ For a test to be `async: true` safe, it must satisfy:
 ### Step 1: Refactored sliding window module (table name as argument)
 
 The original `SlidingWindow` hardcodes `:request_log` as the ETS table name.
-Refactor it to accept the table name as an argument — this is the minimal change
+The refactored version accepts the table name as an argument — this is the minimal change
 that enables per-test isolation without restructuring the production code.
+
+In production, you call `SlidingWindow.init(:request_log)` once at startup. In tests,
+each test creates a uniquely named table via `System.unique_integer/1`.
 
 ```elixir
 defmodule ApiGateway.RateLimiter.SlidingWindow do
@@ -83,7 +86,7 @@ defmodule ApiGateway.RateLimiter.SlidingWindow do
     SlidingWindow.check("user_1", table: :request_log)
 
   Test usage (each test creates a unique table name):
-    table = :"sw_#{System.unique_integer([:positive])}"
+    table = :"sw_\#{System.unique_integer([:positive])}"
     SlidingWindow.init(table)
     SlidingWindow.check("user_1", table: table)
   """
@@ -134,6 +137,10 @@ end
 ```
 
 ### Step 2: Given tests — must pass without modification
+
+The sliding window test creates a unique ETS table per test via `setup`. The `on_exit`
+callback ensures the table is deleted even if the test fails. Because each test has its
+own table, there is no shared state and `async: true` is safe.
 
 ```elixir
 # test/api_gateway/rate_limiter/sliding_window_test.exs
@@ -226,6 +233,10 @@ defmodule ApiGateway.RateLimiter.SlidingWindowTest do
 end
 ```
 
+The isolated server test demonstrates `start_supervised!` for GenServer lifecycle management.
+Each test creates a GenServer with a unique name, and `start_supervised!` automatically
+stops the process when the test exits.
+
 ```elixir
 # test/api_gateway/rate_limiter/isolated_server_test.exs
 defmodule ApiGateway.RateLimiter.IsolatedServerTest do
@@ -256,8 +267,6 @@ defmodule ApiGateway.RateLimiter.IsolatedServerTest do
   test "start_supervised! cleans up the process automatically" do
     name = :"counter_#{System.unique_integer([:positive])}"
 
-    # TODO: use start_supervised! to start Counter with the unique name
-    # HINT: start_supervised!({Counter, [name: name, initial: 5]})
     pid = start_supervised!({Counter, [name: name, initial: 5]})
 
     assert is_pid(pid)
@@ -285,8 +294,6 @@ defmodule ApiGateway.RateLimiter.IsolatedServerTest do
     Counter.increment(name)
     assert Counter.value(name) == 1
 
-    # TODO: stop the process explicitly
-    # HINT: stop_supervised!(:stoppable_counter)
     stop_supervised!(:stoppable_counter)
 
     refute Process.alive?(pid)

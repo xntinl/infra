@@ -56,6 +56,8 @@ For fraud detection classifiers, empirical accuracy loss is typically under 1% o
 
 ### Step 1: Tensor type
 
+The tensor stores all numerical data as a flat binary. The shape is tracked separately. Element access uses byte offsets computed from the flat index and the byte width of the dtype. Broadcasting follows NumPy semantics: dimensions of size 1 are stretched to match the other operand along each axis.
+
 ```elixir
 defmodule InferenceEngine.Tensor do
   @enforce_keys [:data, :shape, :dtype]
@@ -68,99 +70,355 @@ defmodule InferenceEngine.Tensor do
     dtype: dtype()
   }
 
-  @doc "Create a tensor from a list of floats with the given shape"
+  @doc """
+  Create a tensor from a flat list of numbers with the given shape.
+  Validates that the list length matches the product of shape dimensions,
+  then encodes each element according to the dtype (:f32 or :i8).
+  """
+  @spec from_list([number()], [non_neg_integer()], dtype()) :: t()
   def from_list(list, shape, dtype \\ :f32) do
-    # TODO: validate that length(list) == product of shape dimensions
-    # TODO: encode each element as float-32-native or signed-8 depending on dtype
-    # HINT: for f32: Enum.reduce(list, <<>>, fn x, acc -> acc <> <<x::float-32-native>> end)
-    # HINT: for i8: <<round(x)::signed-8>>
+    expected = num_elements(shape)
+
+    if length(list) != expected do
+      raise ArgumentError,
+        "list length #{length(list)} does not match shape #{inspect(shape)} (#{expected} elements)"
+    end
+
+    data =
+      case dtype do
+        :f32 ->
+          Enum.reduce(list, <<>>, fn x, acc ->
+            acc <> <<x * 1.0::float-32-native>>
+          end)
+
+        :i8 ->
+          Enum.reduce(list, <<>>, fn x, acc ->
+            acc <> <<round(x)::signed-8>>
+          end)
+      end
+
+    %__MODULE__{data: data, shape: shape, dtype: dtype}
   end
 
-  @doc "Return the element at the given flat index"
+  @doc """
+  Return the element at the given flat index.
+  For :f32 tensors, skips index * 4 bytes and reads one float-32-native.
+  For :i8 tensors, skips index bytes and reads one signed-8.
+  """
+  @spec at(t(), non_neg_integer()) :: number()
   def at(%__MODULE__{data: data, dtype: :f32}, index) do
-    # TODO: skip index * 4 bytes, read one float-32-native
-    # HINT: <<_::binary-size(offset), value::float-32-native, _::binary>> = data
+    offset = index * 4
+    <<_::binary-size(offset), value::float-32-native, _::binary>> = data
+    value
   end
 
-  @doc "Element-wise add with NumPy-style broadcasting"
-  def add(%__MODULE__{shape: sa} = a, %__MODULE__{shape: sb} = b) do
-    # TODO: compute broadcast shape; raise if shapes are incompatible
-    # TODO: iterate over output indices, compute a_index and b_index using broadcast strides
-    # HINT: broadcast strides: if a dim == 1, the stride for that axis is 0
+  def at(%__MODULE__{data: data, dtype: :i8}, index) do
+    <<_::binary-size(index), value::signed-8, _::binary>> = data
+    value
   end
 
-  @doc "Element-wise multiply with broadcasting"
-  def mul(a, b) do
-    # TODO: same pattern as add/2 but multiply instead of add
+  @doc """
+  Element-wise addition with NumPy-style broadcasting.
+  When a dimension is 1 in one tensor, its stride for that axis is 0
+  so the single value is reused across all positions in that dimension.
+  """
+  @spec add(t(), t()) :: t()
+  def add(%__MODULE__{shape: sa, dtype: :f32} = a, %__MODULE__{shape: sb, dtype: :f32} = b) do
+    out_shape = broadcast_shape(sa, sb)
+    strides_a = broadcast_strides(sa, out_shape)
+    strides_b = broadcast_strides(sb, out_shape)
+    total = num_elements(out_shape)
+
+    data =
+      Enum.reduce((total - 1)..0//-1, <<>>, fn flat_idx, acc ->
+        coords = flat_to_coords(flat_idx, out_shape)
+        a_idx = dot_strides(coords, strides_a)
+        b_idx = dot_strides(coords, strides_b)
+        val = at(a, a_idx) + at(b, b_idx)
+        <<val::float-32-native, acc::binary>>
+      end)
+
+    %__MODULE__{data: data, shape: out_shape, dtype: :f32}
   end
 
-  @doc "Matrix multiply: both tensors must be rank-2"
-  def matmul(%__MODULE__{shape: [m, k], dtype: :f32} = a, %__MODULE__{shape: [k2, n], dtype: :f32} = b)
+  @doc """
+  Element-wise multiplication with NumPy-style broadcasting.
+  Same broadcasting logic as add/2.
+  """
+  @spec mul(t(), t()) :: t()
+  def mul(%__MODULE__{shape: sa, dtype: :f32} = a, %__MODULE__{shape: sb, dtype: :f32} = b) do
+    out_shape = broadcast_shape(sa, sb)
+    strides_a = broadcast_strides(sa, out_shape)
+    strides_b = broadcast_strides(sb, out_shape)
+    total = num_elements(out_shape)
+
+    data =
+      Enum.reduce((total - 1)..0//-1, <<>>, fn flat_idx, acc ->
+        coords = flat_to_coords(flat_idx, out_shape)
+        a_idx = dot_strides(coords, strides_a)
+        b_idx = dot_strides(coords, strides_b)
+        val = at(a, a_idx) * at(b, b_idx)
+        <<val::float-32-native, acc::binary>>
+      end)
+
+    %__MODULE__{data: data, shape: out_shape, dtype: :f32}
+  end
+
+  @doc """
+  Matrix multiplication for rank-2 tensors.
+  For each output position (i, j), computes the dot product of
+  row i of a with column j of b.
+  """
+  @spec matmul(t(), t()) :: t()
+  def matmul(
+        %__MODULE__{shape: [m, k], dtype: :f32} = a,
+        %__MODULE__{shape: [k2, n], dtype: :f32} = b
+      )
       when k == k2 do
-    # TODO: produce a [m, n] tensor
-    # TODO: for each (i, j): sum over k of a[i,k] * b[k,j]
-    # HINT: inner loop can be expressed as Enum.reduce(0..(k-1), 0.0, fn ...)
-    # HINT: then encode results row-major into binary
+    data =
+      for i <- 0..(m - 1), j <- 0..(n - 1), reduce: <<>> do
+        acc ->
+          sum =
+            Enum.reduce(0..(k - 1), 0.0, fn kk, s ->
+              a_val = at(a, i * k + kk)
+              b_val = at(b, kk * n + j)
+              s + a_val * b_val
+            end)
+
+          acc <> <<sum::float-32-native>>
+      end
+
+    %__MODULE__{data: data, shape: [m, n], dtype: :f32}
   end
 
   def matmul(%__MODULE__{shape: sa}, %__MODULE__{shape: sb}) do
     raise ArgumentError, "matmul shape mismatch: #{inspect(sa)} × #{inspect(sb)}"
   end
 
-  @doc "Reshape without copying data; total elements must be unchanged"
+  @doc """
+  Reshape without copying data. The total number of elements
+  must remain unchanged. Returns the same binary with a new shape.
+  """
+  @spec reshape(t(), [non_neg_integer()]) :: t()
   def reshape(%__MODULE__{shape: old_shape} = t, new_shape) do
-    # TODO: validate that product(old_shape) == product(new_shape)
-    # TODO: return struct with same data binary and new shape
+    if num_elements(old_shape) != num_elements(new_shape) do
+      raise ArgumentError,
+        "cannot reshape #{inspect(old_shape)} (#{num_elements(old_shape)} elements) " <>
+          "to #{inspect(new_shape)} (#{num_elements(new_shape)} elements)"
+    end
+
+    %{t | shape: new_shape}
   end
 
-  @doc "Transpose a 2D tensor (swap axes 0 and 1)"
-  def transpose(%__MODULE__{shape: [rows, cols], data: data, dtype: :f32}) do
-    # TODO: produce a [cols, rows] tensor
-    # TODO: for each (r, c) in new layout: value = old[c, r]
-    # HINT: new_index = r * rows + c, old_offset = (c * cols + r) * 4
+  @doc """
+  Transpose a 2D tensor by swapping axes 0 and 1.
+  Produces a [cols, rows] tensor where each element at (r, c) comes
+  from position (c, r) in the original.
+  """
+  @spec transpose(t()) :: t()
+  def transpose(%__MODULE__{shape: [rows, cols], data: _data, dtype: :f32} = t) do
+    data =
+      for r <- 0..(cols - 1), c <- 0..(rows - 1), reduce: <<>> do
+        acc ->
+          val = at(t, c * cols + r)
+          acc <> <<val::float-32-native>>
+      end
+
+    %__MODULE__{data: data, shape: [cols, rows], dtype: :f32}
   end
 
-  # Internal helpers
+  # --- Internal helpers ---
+
+  @doc false
   def num_elements(shape), do: Enum.product(shape)
+
+  @doc false
   def bytes_per_element(:f32), do: 4
   def bytes_per_element(:i8), do: 1
+
+  # Compute broadcast output shape following NumPy rules.
+  # Pads shorter shape with leading 1s, then for each dimension
+  # picks the max of the two sizes (they must be equal or one must be 1).
+  defp broadcast_shape(sa, sb) do
+    max_rank = max(length(sa), length(sb))
+    pa = List.duplicate(1, max_rank - length(sa)) ++ sa
+    pb = List.duplicate(1, max_rank - length(sb)) ++ sb
+
+    Enum.zip(pa, pb)
+    |> Enum.map(fn
+      {a, b} when a == b -> a
+      {1, b} -> b
+      {a, 1} -> a
+      {a, b} -> raise ArgumentError, "incompatible broadcast dimensions: #{a} vs #{b}"
+    end)
+  end
+
+  # Compute the effective strides for a tensor being broadcast to out_shape.
+  # If a dimension is 1 in the original, its stride is 0 (the value is reused).
+  defp broadcast_strides(shape, out_shape) do
+    padded = List.duplicate(1, length(out_shape) - length(shape)) ++ shape
+    suffix_products = suffix_strides(padded)
+
+    Enum.zip(padded, suffix_products)
+    |> Enum.map(fn
+      {1, _stride} -> 0
+      {_dim, stride} -> stride
+    end)
+  end
+
+  # Compute row-major strides from a shape: stride_i = product of dims after i.
+  defp suffix_strides(shape) do
+    shape
+    |> Enum.reverse()
+    |> Enum.reduce({[], 1}, fn dim, {strides, acc} ->
+      {[acc | strides], acc * dim}
+    end)
+    |> elem(0)
+  end
+
+  # Convert a flat index to multi-dimensional coordinates.
+  defp flat_to_coords(flat_idx, shape) do
+    {coords, _} =
+      shape
+      |> Enum.reverse()
+      |> Enum.reduce({[], flat_idx}, fn dim, {coords, remaining} ->
+        {[rem(remaining, dim) | coords], div(remaining, dim)}
+      end)
+
+    coords
+  end
+
+  # Compute a flat index from coordinates and strides via dot product.
+  defp dot_strides(coords, strides) do
+    Enum.zip(coords, strides)
+    |> Enum.reduce(0, fn {c, s}, acc -> acc + c * s end)
+  end
 end
 ```
 
 ### Step 2: Operators
 
+Operators are applied element-wise. ReLU zeros out negatives. Sigmoid maps values through the logistic function. Softmax is computed per row with max-subtraction for numerical stability to prevent overflow from large exponentials. Batch normalization normalizes channels using running statistics, then scales and shifts.
+
 ```elixir
 defmodule InferenceEngine.Ops do
   alias InferenceEngine.Tensor
 
-  @doc "ReLU: max(0, x) element-wise"
+  @doc """
+  ReLU activation: max(0, x) applied element-wise.
+  Iterates the binary in 4-byte chunks, decodes each float,
+  clamps negatives to 0, and re-encodes.
+  """
+  @spec relu(Tensor.t()) :: Tensor.t()
   def relu(%Tensor{data: data, shape: shape, dtype: :f32}) do
-    # TODO: iterate bytes in chunks of 4, decode float, apply max(0.0, x), re-encode
-    # HINT: for bin << x::float-32-native, rest::binary >> -> recurse
+    new_data = apply_elementwise_f32(data, fn x -> max(0.0, x) end)
+    %Tensor{data: new_data, shape: shape, dtype: :f32}
   end
 
-  @doc "Sigmoid: 1 / (1 + exp(-x))"
-  def sigmoid(%Tensor{} = t) do
-    # TODO: apply sigmoid element-wise using :math.exp/1
+  @doc """
+  Sigmoid activation: 1 / (1 + exp(-x)) applied element-wise.
+  Uses :math.exp/1 for the exponential.
+  """
+  @spec sigmoid(Tensor.t()) :: Tensor.t()
+  def sigmoid(%Tensor{data: data, shape: shape, dtype: :f32}) do
+    new_data =
+      apply_elementwise_f32(data, fn x ->
+        1.0 / (1.0 + :math.exp(-x))
+      end)
+
+    %Tensor{data: new_data, shape: shape, dtype: :f32}
   end
 
-  @doc "Softmax over the last axis; numerically stable via max subtraction"
-  def softmax(%Tensor{shape: shape} = t) do
-    # TODO: for each row (last axis), subtract max, compute exp, divide by sum
-    # HINT: a 2D [batch, classes] tensor → apply softmax per row
-    # HINT: numeric stability: subtract max(row) before exp
+  @doc """
+  Softmax over the last axis with numerical stability.
+  For a 2D tensor [batch, classes], applies softmax per row:
+  1. Subtract the row maximum from each element (prevents exp overflow)
+  2. Compute exp of each shifted element
+  3. Divide each exp by the row sum
+
+  For a 1D tensor, treats the entire tensor as one row.
+  """
+  @spec softmax(Tensor.t()) :: Tensor.t()
+  def softmax(%Tensor{shape: shape, dtype: :f32} = t) do
+    {num_rows, row_len} =
+      case shape do
+        [n, c] -> {n, c}
+        [c] -> {1, c}
+      end
+
+    data =
+      for row <- 0..(num_rows - 1), reduce: <<>> do
+        acc ->
+          row_vals = for j <- 0..(row_len - 1), do: Tensor.at(t, row * row_len + j)
+          row_max = Enum.max(row_vals)
+          exps = Enum.map(row_vals, fn v -> :math.exp(v - row_max) end)
+          sum_exps = Enum.sum(exps)
+
+          Enum.reduce(exps, acc, fn e, bin ->
+            bin <> <<(e / sum_exps)::float-32-native>>
+          end)
+      end
+
+    %Tensor{data: data, shape: shape, dtype: :f32}
   end
 
-  @doc "Batch normalization: (x - mean) / sqrt(var + eps) * gamma + beta"
-  def batch_norm(%Tensor{} = x, %Tensor{} = gamma, %Tensor{} = beta, %Tensor{} = running_mean, %Tensor{} = running_var, eps \\ 1.0e-5) do
-    # TODO: element-wise: normalized = (x - mean) / sqrt(var + eps)
-    # TODO: then scale and shift: normalized * gamma + beta
-    # HINT: gamma, beta, mean, var are all shape [channels]; broadcast over [N, H, W, C]
+  @doc """
+  Batch normalization: (x - mean) / sqrt(var + eps) * gamma + beta.
+  gamma, beta, running_mean, and running_var are 1D tensors of shape [channels].
+  The input x can be any shape where the last dimension is channels (NHWC layout).
+  Broadcasting is handled by iterating the flat data and indexing the channel
+  parameters by `flat_index mod num_channels`.
+  """
+  @spec batch_norm(Tensor.t(), Tensor.t(), Tensor.t(), Tensor.t(), Tensor.t(), float()) ::
+          Tensor.t()
+  def batch_norm(
+        %Tensor{data: data, shape: shape, dtype: :f32} = _x,
+        %Tensor{} = gamma,
+        %Tensor{} = beta,
+        %Tensor{} = running_mean,
+        %Tensor{} = running_var,
+        eps \\ 1.0e-5
+      ) do
+    num_channels = List.last(shape)
+    total = Tensor.num_elements(shape)
+
+    new_data =
+      for i <- 0..(total - 1), reduce: <<>> do
+        acc ->
+          c = rem(i, num_channels)
+          offset = i * 4
+          <<_::binary-size(offset), x_val::float-32-native, _::binary>> = data
+
+          mean_c = Tensor.at(running_mean, c)
+          var_c = Tensor.at(running_var, c)
+          gamma_c = Tensor.at(gamma, c)
+          beta_c = Tensor.at(beta, c)
+
+          normalized = (x_val - mean_c) / :math.sqrt(var_c + eps)
+          result = normalized * gamma_c + beta_c
+          acc <> <<result::float-32-native>>
+      end
+
+    %Tensor{data: new_data, shape: shape, dtype: :f32}
+  end
+
+  # Iterate a float-32 binary, applying fun to each element and rebuilding the binary.
+  defp apply_elementwise_f32(data, fun) do
+    apply_elementwise_f32_acc(data, <<>>, fun)
+  end
+
+  defp apply_elementwise_f32_acc(<<>>, acc, _fun), do: acc
+
+  defp apply_elementwise_f32_acc(<<x::float-32-native, rest::binary>>, acc, fun) do
+    val = fun.(x)
+    apply_elementwise_f32_acc(rest, acc <> <<val::float-32-native>>, fun)
   end
 end
 ```
 
 ### Step 3: Conv2D
+
+The convolution uses im2col to reshape the problem into a single matrix multiply. For each output position, im2col extracts the corresponding input patch and flattens it into a row of the column matrix. The kernel is reshaped from `[kH, kW, C_in, C_out]` to `[kH*kW*C_in, C_out]`. The output is `im2col_matrix × kernel_2d`, reshaped to `[N, out_H, out_W, C_out]`.
 
 ```elixir
 defmodule InferenceEngine.Conv2D do
@@ -168,34 +426,114 @@ defmodule InferenceEngine.Conv2D do
 
   @doc """
   2D convolution in NHWC format.
-  input: [N, H, W, C_in]
+  input:  [N, H, W, C_in]
   kernel: [kH, kW, C_in, C_out]
   Returns: [N, out_H, out_W, C_out]
+
+  Supports integer padding (number of pixels) or :same for auto-padding.
+  Uses im2col to convert the convolution into a matrix multiplication.
   """
-  def forward(%Tensor{shape: [n, h, w, c_in]} = input,
-              %Tensor{shape: [kh, kw, c_in2, c_out]} = kernel,
-              stride: stride,
-              padding: padding)
+  @spec forward(Tensor.t(), Tensor.t(), keyword()) :: Tensor.t()
+  def forward(
+        %Tensor{shape: [n, h, w, c_in]} = input,
+        %Tensor{shape: [kh, kw, c_in2, c_out]} = kernel,
+        stride: stride,
+        padding: padding
+      )
       when c_in == c_in2 do
-    # TODO: compute padded input if padding == :same or padding > 0
-    # TODO: compute out_H = div(H + 2*padding - kH, stride) + 1
-    # TODO: build im2col matrix: shape [out_H * out_W, kH * kW * C_in]
-    # TODO: reshape kernel to [kH * kW * C_in, C_out]
-    # TODO: matmul(im2col, kernel_2d) → reshape to [N, out_H, out_W, C_out]
+    pad =
+      case padding do
+        :same -> div(kh - 1, 2)
+        p when is_integer(p) -> p
+      end
+
+    padded_input = if pad > 0, do: pad_nhwc(input, pad), else: input
+    {_n2, ph, pw, _c} = shape_tuple(padded_input.shape)
+
+    out_h = div(ph - kh, stride) + 1
+    out_w = div(pw - kw, stride) + 1
+
+    kernel_2d = Tensor.reshape(kernel, [kh * kw * c_in, c_out])
+
+    data =
+      for batch <- 0..(n - 1), reduce: <<>> do
+        acc ->
+          sample = extract_sample(padded_input, batch, ph, pw, c_in)
+          col_matrix = im2col(sample, kh, kw, out_h, out_w, stride)
+          result = Tensor.matmul(col_matrix, kernel_2d)
+          acc <> result.data
+      end
+
+    %Tensor{data: data, shape: [n, out_h, out_w, c_out], dtype: :f32}
   end
 
-  @doc "Extract im2col matrix for one sample"
-  def im2col(%Tensor{shape: [h, w, c]} = input, kh, kw, out_h, out_w, stride) do
-    # TODO: for each (oh, ow) output position:
-    #   extract patch input[oh*stride .. oh*stride+kH, ow*stride .. ow*stride+kW, :]
-    #   flatten patch to a row of length kH * kW * C
-    # TODO: stack all rows → binary of shape [out_h * out_w, kh * kw * c]
-    # HINT: use :binary.part(data, offset, length) to extract sub-binaries
+  @doc """
+  Extract the im2col matrix for a single HWC sample.
+  For each output position (oh, ow), extracts the input patch of size
+  [kh, kw, c] starting at (oh*stride, ow*stride) and flattens it
+  into a single row. Stacks all rows into a matrix of shape
+  [out_h * out_w, kh * kw * c].
+  """
+  @spec im2col(Tensor.t(), pos_integer(), pos_integer(), pos_integer(), pos_integer(), pos_integer()) ::
+          Tensor.t()
+  def im2col(%Tensor{shape: [h, w, c], dtype: :f32} = input, kh, kw, out_h, out_w, stride) do
+    row_len = kh * kw * c
+
+    data =
+      for oh <- 0..(out_h - 1), ow <- 0..(out_w - 1), reduce: <<>> do
+        acc ->
+          patch =
+            for kr <- 0..(kh - 1), kc <- 0..(kw - 1), ch <- 0..(c - 1), reduce: <<>> do
+              patch_acc ->
+                r = oh * stride + kr
+                col = ow * stride + kc
+                flat_idx = r * w * c + col * c + ch
+                val = Tensor.at(input, flat_idx)
+                patch_acc <> <<val::float-32-native>>
+            end
+
+          acc <> patch
+      end
+
+    %Tensor{data: data, shape: [out_h * out_w, row_len], dtype: :f32}
   end
+
+  # Pad an NHWC tensor with zeros around the H and W dimensions.
+  defp pad_nhwc(%Tensor{shape: [n, h, w, c], dtype: :f32} = input, pad) do
+    new_h = h + 2 * pad
+    new_w = w + 2 * pad
+
+    data =
+      for batch <- 0..(n - 1), r <- 0..(new_h - 1), col <- 0..(new_w - 1), ch <- 0..(c - 1),
+          reduce: <<>> do
+        acc ->
+          if r >= pad and r < h + pad and col >= pad and col < w + pad do
+            orig_idx = batch * h * w * c + (r - pad) * w * c + (col - pad) * c + ch
+            val = Tensor.at(input, orig_idx)
+            acc <> <<val::float-32-native>>
+          else
+            acc <> <<0.0::float-32-native>>
+          end
+      end
+
+    %Tensor{data: data, shape: [n, new_h, new_w, c], dtype: :f32}
+  end
+
+  # Extract one sample from a batch NHWC tensor, returning an [H, W, C] tensor.
+  defp extract_sample(%Tensor{shape: [_n, h, w, c], data: data, dtype: :f32}, batch, _ph, _pw, _c_in) do
+    sample_size = h * w * c * 4
+    offset = batch * sample_size
+    sample_data = :binary.part(data, offset, sample_size)
+    %Tensor{data: sample_data, shape: [h, w, c], dtype: :f32}
+  end
+
+  defp shape_tuple([n, h, w, c]), do: {n, h, w, c}
 end
 ```
 
 ### Step 4: Model and loader
+
+The model is a linear sequence of layers, each described as `{op_atom, weights_map, config_map}`. The loader parses a custom binary format. The ONNX loader handles a minimal subset of ops (Conv, Relu, Flatten, Gemm, Softmax) by manually parsing protobuf wire format.
 
 ```elixir
 defmodule InferenceEngine.Model do
@@ -204,41 +542,276 @@ defmodule InferenceEngine.Model do
 
   defstruct layers: [], input_shape: nil
 
-  @doc "Validate that layer output shapes chain correctly"
+  @doc """
+  Validate that layer output shapes chain correctly.
+  Walks the layer list, computing the output shape of each layer
+  given its input shape. Returns {:ok, final_shape} if valid,
+  or {:error, reason, layer_index} on the first mismatch.
+  """
+  @spec validate(t()) :: {:ok, [non_neg_integer()]} | {:error, String.t(), non_neg_integer()}
   def validate(%__MODULE__{layers: layers, input_shape: shape}) do
-    # TODO: walk layers, compute output shape of each, raise on mismatch
-    # TODO: return {:ok, output_shape} or {:error, reason, layer_index}
+    layers
+    |> Enum.with_index()
+    |> Enum.reduce_while({:ok, shape}, fn {{op, weights, config}, idx}, {:ok, current_shape} ->
+      case output_shape(op, weights, config, current_shape) do
+        {:ok, next_shape} -> {:cont, {:ok, next_shape}}
+        {:error, reason} -> {:halt, {:error, reason, idx}}
+      end
+    end)
+  end
+
+  defp output_shape(:conv2d, %{kernel: %{shape: [kh, _kw, _ci, c_out]}}, config, [_n, h, w, _c]) do
+    stride = Map.get(config, :stride, 1)
+    pad = Map.get(config, :padding, 0)
+    pad = if pad == :same, do: div(kh - 1, 2), else: pad
+    out_h = div(h + 2 * pad - kh, stride) + 1
+    out_w = div(w + 2 * pad - kh, stride) + 1
+    {:ok, [1, out_h, out_w, c_out]}
+  end
+
+  defp output_shape(:batch_norm, _w, _c, shape), do: {:ok, shape}
+  defp output_shape(:relu, _w, _c, shape), do: {:ok, shape}
+  defp output_shape(:sigmoid, _w, _c, shape), do: {:ok, shape}
+  defp output_shape(:softmax, _w, _c, shape), do: {:ok, shape}
+
+  defp output_shape(:flatten, _w, _c, [n | rest]) do
+    {:ok, [n, Enum.product(rest)]}
+  end
+
+  defp output_shape(:dense, %{kernel: %{shape: [_in, out]}}, _c, [n, _in2]) do
+    {:ok, [n, out]}
+  end
+
+  defp output_shape(op, _w, _c, shape) do
+    {:error, "cannot compute output shape for #{inspect(op)} with input #{inspect(shape)}"}
   end
 end
 
 defmodule InferenceEngine.Loader do
   alias InferenceEngine.{Model, Tensor}
 
+  @op_map %{
+    0 => :conv2d,
+    1 => :batch_norm,
+    2 => :relu,
+    3 => :sigmoid,
+    4 => :softmax,
+    5 => :flatten,
+    6 => :dense
+  }
+
   @doc """
   Load a model from a custom binary format.
   Header: <<magic::32, version::8, num_layers::32>>
   Each layer: <<op_type::8, config_len::32, config_json::binary-size(config_len),
                 num_weights::8, [weight_header, weight_data]...>>
+  Weight header: <<name_len::8, name::binary-size(name_len),
+                   dtype::8, ndims::8, [dim::32]...>>
+  Weight data follows immediately after shape.
   """
+  @spec load_binary(String.t()) :: {:ok, Model.t()} | {:error, term()}
   def load_binary(path) do
-    # TODO: File.read!(path) → parse header → parse layers
-    # TODO: for each layer, decode op_type byte to atom
-    # TODO: decode config JSON → map
-    # TODO: decode weight tensors from binary
-    # TODO: return {:ok, %Model{}} or {:error, reason}
+    case File.read(path) do
+      {:ok, binary} -> parse_binary(binary)
+      {:error, reason} -> {:error, reason}
+    end
   end
 
-  @doc "Load a minimal ONNX protobuf (Conv, Relu, Flatten, Gemm, Softmax only)"
+  defp parse_binary(<<"INFE"::binary, version::8, num_layers::32, rest::binary>>) do
+    case parse_layers(rest, num_layers, []) do
+      {:ok, layers} ->
+        {:ok, %Model{layers: layers, input_shape: nil}}
+
+      {:error, _} = err ->
+        err
+    end
+  end
+
+  defp parse_binary(_), do: {:error, :invalid_magic}
+
+  defp parse_layers(_rest, 0, acc), do: {:ok, Enum.reverse(acc)}
+
+  defp parse_layers(
+         <<op_type::8, config_len::32, config_json::binary-size(config_len), num_weights::8,
+           rest::binary>>,
+         remaining,
+         acc
+       ) do
+    op = Map.get(@op_map, op_type, :unknown)
+    config = Jason.decode!(config_json, keys: :atoms)
+
+    case parse_weights(rest, num_weights, %{}) do
+      {:ok, weights, rest2} ->
+        parse_layers(rest2, remaining - 1, [{op, weights, config} | acc])
+
+      {:error, _} = err ->
+        err
+    end
+  end
+
+  defp parse_layers(_, _, _), do: {:error, :truncated_layer}
+
+  defp parse_weights(rest, 0, acc), do: {:ok, acc, rest}
+
+  defp parse_weights(<<name_len::8, name::binary-size(name_len), dtype_byte::8, ndims::8, rest::binary>>, remaining, acc) do
+    {shape, rest2} = parse_dims(rest, ndims, [])
+    dtype = if dtype_byte == 0, do: :f32, else: :i8
+    elem_size = if dtype == :f32, do: 4, else: 1
+    data_size = Enum.product(shape) * elem_size
+    <<data::binary-size(data_size), rest3::binary>> = rest2
+    tensor = %Tensor{data: data, shape: shape, dtype: dtype}
+    parse_weights(rest3, remaining - 1, Map.put(acc, String.to_atom(name), tensor))
+  end
+
+  defp parse_weights(_, _, _), do: {:error, :truncated_weight}
+
+  defp parse_dims(rest, 0, acc), do: {Enum.reverse(acc), rest}
+
+  defp parse_dims(<<dim::32, rest::binary>>, remaining, acc) do
+    parse_dims(rest, remaining - 1, [dim | acc])
+  end
+
+  @doc """
+  Load a minimal ONNX protobuf (Conv, Relu, Flatten, Gemm, Softmax only).
+  Parses protobuf wire format manually without a protobuf library.
+  This is a simplified parser that handles the subset needed for
+  convolutional classifiers.
+  """
+  @spec load_onnx(String.t()) :: {:ok, Model.t()} | {:error, term()}
   def load_onnx(path) do
-    # TODO: parse protobuf binary manually (no protobuf library)
-    # HINT: ONNX field IDs: model.graph=7, node.op_type=4, node.input=1, initializer=5
-    # HINT: protobuf wire type 2 = length-delimited; wire type 5 = 32-bit
-    # TODO: build %Model{} from parsed nodes and initializer tensors
+    case File.read(path) do
+      {:ok, binary} ->
+        case parse_onnx_model(binary) do
+          {:ok, _} = result -> result
+          {:error, _} = err -> err
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  # Minimal protobuf parser for ONNX ModelProto.
+  # Field 7 is GraphProto. Inside GraphProto, field 1 = nodes, field 5 = initializers.
+  defp parse_onnx_model(binary) do
+    fields = parse_protobuf_fields(binary)
+    graph_bin = Map.get(fields, 7, <<>>)
+    graph_fields = parse_protobuf_fields(graph_bin)
+
+    nodes = Map.get(graph_fields, 1, [])
+    nodes = if is_list(nodes), do: nodes, else: [nodes]
+
+    initializers = Map.get(graph_fields, 5, [])
+    initializers = if is_list(initializers), do: initializers, else: [initializers]
+
+    weight_map = parse_initializers(initializers)
+
+    layers =
+      Enum.map(nodes, fn node_bin ->
+        node_fields = parse_protobuf_fields(node_bin)
+        op_type_str = Map.get(node_fields, 4, "")
+        inputs = Map.get(node_fields, 1, [])
+        inputs = if is_list(inputs), do: inputs, else: [inputs]
+
+        op = onnx_op_to_atom(op_type_str)
+        weights = collect_node_weights(inputs, weight_map)
+        {op, weights, %{}}
+      end)
+
+    {:ok, %Model{layers: layers, input_shape: nil}}
+  end
+
+  defp onnx_op_to_atom("Conv"), do: :conv2d
+  defp onnx_op_to_atom("Relu"), do: :relu
+  defp onnx_op_to_atom("Flatten"), do: :flatten
+  defp onnx_op_to_atom("Gemm"), do: :dense
+  defp onnx_op_to_atom("Softmax"), do: :softmax
+  defp onnx_op_to_atom("BatchNormalization"), do: :batch_norm
+  defp onnx_op_to_atom(other), do: String.to_atom(String.downcase(other))
+
+  defp collect_node_weights(input_names, weight_map) do
+    input_names
+    |> Enum.with_index()
+    |> Enum.reduce(%{}, fn {name, idx}, acc ->
+      case Map.get(weight_map, name) do
+        nil -> acc
+        tensor ->
+          key = if idx == 1, do: :kernel, else: :"weight_#{idx}"
+          Map.put(acc, key, tensor)
+      end
+    end)
+  end
+
+  defp parse_initializers(initializer_bins) do
+    Enum.reduce(initializer_bins, %{}, fn init_bin, acc ->
+      init_fields = parse_protobuf_fields(init_bin)
+      name = Map.get(init_fields, 1, "unknown")
+      dims = Map.get(init_fields, 2, [])
+      dims = if is_list(dims), do: dims, else: [dims]
+      shape = Enum.map(dims, &parse_varint_value/1)
+      raw_data = Map.get(init_fields, 13, <<>>)
+
+      if byte_size(raw_data) > 0 do
+        tensor = %Tensor{data: raw_data, shape: shape, dtype: :f32}
+        Map.put(acc, name, tensor)
+      else
+        acc
+      end
+    end)
+  end
+
+  defp parse_varint_value(v) when is_integer(v), do: v
+  defp parse_varint_value(v) when is_binary(v), do: :binary.decode_unsigned(v, :little)
+
+  # Minimal protobuf field parser. Groups repeated fields into lists.
+  defp parse_protobuf_fields(binary) do
+    parse_protobuf_fields(binary, %{})
+  end
+
+  defp parse_protobuf_fields(<<>>, acc), do: acc
+
+  defp parse_protobuf_fields(binary, acc) do
+    {tag, rest} = decode_varint(binary)
+    field_number = Bitwise.bsr(tag, 3)
+    wire_type = Bitwise.band(tag, 0x07)
+
+    {value, rest2} =
+      case wire_type do
+        0 -> decode_varint(rest)
+        1 -> <<v::little-64, r::binary>> = rest; {v, r}
+        2 ->
+          {len, r} = decode_varint(rest)
+          <<v::binary-size(len), r2::binary>> = r
+          {v, r2}
+        5 -> <<v::little-32, r::binary>> = rest; {v, r}
+        _ -> {nil, <<>>}
+      end
+
+    updated =
+      case Map.get(acc, field_number) do
+        nil -> Map.put(acc, field_number, value)
+        existing when is_list(existing) -> Map.put(acc, field_number, existing ++ [value])
+        existing -> Map.put(acc, field_number, [existing, value])
+      end
+
+    parse_protobuf_fields(rest2, updated)
+  end
+
+  defp decode_varint(binary, acc \\ 0, shift \\ 0)
+
+  defp decode_varint(<<1::1, byte::7, rest::binary>>, acc, shift) do
+    decode_varint(rest, acc + Bitwise.bsl(byte, shift), shift + 7)
+  end
+
+  defp decode_varint(<<0::1, byte::7, rest::binary>>, acc, shift) do
+    {acc + Bitwise.bsl(byte, shift), rest}
   end
 end
 ```
 
 ### Step 5: Quantization
+
+Symmetric int8 quantization maps the float range `[-max_abs, max_abs]` to `[-127, 127]` using a single scale factor. The scale is `max_abs / 127`. Quantization rounds each float to the nearest int8 after dividing by scale. Dequantization multiplies each int8 by the scale to recover an approximate float.
 
 ```elixir
 defmodule InferenceEngine.Quantize do
@@ -248,31 +821,92 @@ defmodule InferenceEngine.Quantize do
 
   @doc """
   Symmetric per-tensor quantization.
-  scale = max(abs(weights)) / 127
-  quantized = clamp(round(x / scale), -127, 127)
+  Computes scale = max(abs(weights)) / 127, then maps each float to
+  clamp(round(x / scale), -127, 127) stored as signed-8.
+  Returns {quantized_tensor, scale}.
   """
-  def quantize_tensor(%Tensor{dtype: :f32} = t) do
-    # TODO: find max abs value in tensor
-    # TODO: compute scale
-    # TODO: re-encode each float as i8 after rounding and clamping
-    # TODO: return {%Tensor{dtype: :i8}, scale}
+  @spec quantize_tensor(Tensor.t()) :: {Tensor.t(), float()}
+  def quantize_tensor(%Tensor{data: data, shape: shape, dtype: :f32}) do
+    floats = decode_all_f32(data)
+    max_abs = floats |> Enum.map(&abs/1) |> Enum.max()
+    scale = if max_abs == 0.0, do: 1.0, else: max_abs / @max_int8
+
+    quantized_data =
+      Enum.reduce(floats, <<>>, fn x, acc ->
+        q = round(x / scale)
+        q = q |> max(-@max_int8) |> min(@max_int8)
+        acc <> <<q::signed-8>>
+      end)
+
+    {%Tensor{data: quantized_data, shape: shape, dtype: :i8}, scale}
   end
 
-  @doc "Dequantize int8 tensor back to float32 using stored scale"
-  def dequantize_tensor(%Tensor{dtype: :i8} = t, scale) do
-    # TODO: decode each signed-8 integer, multiply by scale, encode as float-32-native
+  @doc """
+  Dequantize int8 tensor back to float32.
+  Each signed-8 integer is multiplied by the scale and encoded as float-32-native.
+  """
+  @spec dequantize_tensor(Tensor.t(), float()) :: Tensor.t()
+  def dequantize_tensor(%Tensor{data: data, shape: shape, dtype: :i8}, scale) do
+    new_data = dequantize_binary(data, scale, <<>>)
+    %Tensor{data: new_data, shape: shape, dtype: :f32}
   end
 
-  @doc "Quantize all weight tensors in a model; return model with int8 weights and scale map"
-  def quantize_model(%InferenceEngine.Model{} = model) do
-    # TODO: walk model.layers, quantize each weight tensor
-    # TODO: store scales in a map keyed by layer index and weight name
-    # TODO: return {quantized_model, scales}
+  @doc """
+  Quantize all weight tensors in a model.
+  Returns {quantized_model, scales} where scales is a map of
+  {layer_index, weight_name} => scale_float.
+  """
+  @spec quantize_model(InferenceEngine.Model.t()) ::
+          {InferenceEngine.Model.t(), map()}
+  def quantize_model(%InferenceEngine.Model{layers: layers} = model) do
+    {new_layers, scales} =
+      layers
+      |> Enum.with_index()
+      |> Enum.map_reduce(%{}, fn {{op, weights, config}, idx}, scale_acc ->
+        {new_weights, layer_scales} =
+          Enum.reduce(weights, {%{}, %{}}, fn {name, tensor}, {w_acc, s_acc} ->
+            case tensor do
+              %Tensor{dtype: :f32} ->
+                {qt, scale} = quantize_tensor(tensor)
+                {Map.put(w_acc, name, qt), Map.put(s_acc, name, scale)}
+
+              _ ->
+                {Map.put(w_acc, name, tensor), s_acc}
+            end
+          end)
+
+        new_scale_acc =
+          Enum.reduce(layer_scales, scale_acc, fn {wname, scale}, acc ->
+            Map.put(acc, {idx, wname}, scale)
+          end)
+
+        {{op, new_weights, config}, new_scale_acc}
+      end)
+
+    {%{model | layers: new_layers}, scales}
+  end
+
+  # Decode all float-32-native values from a binary into a list.
+  defp decode_all_f32(data), do: decode_all_f32(data, [])
+  defp decode_all_f32(<<>>, acc), do: Enum.reverse(acc)
+
+  defp decode_all_f32(<<v::float-32-native, rest::binary>>, acc) do
+    decode_all_f32(rest, [v | acc])
+  end
+
+  # Dequantize a binary of signed-8 integers to float-32-native.
+  defp dequantize_binary(<<>>, _scale, acc), do: acc
+
+  defp dequantize_binary(<<q::signed-8, rest::binary>>, scale, acc) do
+    val = q * scale
+    dequantize_binary(rest, scale, acc <> <<val::float-32-native>>)
   end
 end
 ```
 
 ### Step 6: Inference engine
+
+The engine runs a forward pass through the model's layer list. Each layer is dispatched to the appropriate operator. Batch inference uses `Task.async_stream` to parallelize across inputs while preserving ordering.
 
 ```elixir
 defmodule InferenceEngine.Engine do
@@ -280,18 +914,30 @@ defmodule InferenceEngine.Engine do
 
   @doc """
   Run inference on a batch of input tensors.
-  Returns results in the same order as inputs.
+  Uses Task.async_stream for parallelism with ordered results.
+  Returns {:ok, [%Tensor{}, ...]} or {:error, reason}.
   """
+  @spec infer(Model.t(), [Tensor.t()], keyword()) :: {:ok, [Tensor.t()]} | {:error, term()}
   def infer(%Model{} = model, inputs, opts \\ []) when is_list(inputs) do
     concurrency = Keyword.get(opts, :concurrency, System.schedulers_online())
 
-    # TODO: use Task.async_stream(inputs, fn input -> forward_pass(model, input) end,
-    #       max_concurrency: concurrency, ordered: true)
-    # TODO: collect results, preserving order
-    # TODO: return {:ok, [%Tensor{}, ...]} or {:error, reason}
+    results =
+      inputs
+      |> Task.async_stream(
+        fn input -> forward_pass(model, input) end,
+        max_concurrency: concurrency,
+        ordered: true
+      )
+      |> Enum.map(fn {:ok, result} -> result end)
+
+    {:ok, results}
   end
 
-  @doc "Run a single forward pass through the model"
+  @doc """
+  Run a single forward pass through the model.
+  Reduces over the layer list, threading the tensor through each layer.
+  """
+  @spec forward_pass(Model.t(), Tensor.t()) :: Tensor.t()
   def forward_pass(%Model{layers: layers}, %Tensor{} = input) do
     Enum.reduce(layers, input, fn layer, acc ->
       apply_layer(layer, acc)
@@ -299,23 +945,45 @@ defmodule InferenceEngine.Engine do
   end
 
   defp apply_layer({:conv2d, weights, config}, input) do
-    # TODO: call Conv2D.forward/4 with kernel from weights, stride and padding from config
-    # TODO: if config.activation == :relu, fuse: apply Ops.relu/1 after conv
+    stride = Map.get(config, :stride, 1)
+    padding = Map.get(config, :padding, 0)
+    result = Conv2D.forward(input, weights.kernel, stride: stride, padding: padding)
+
+    case Map.get(config, :activation) do
+      :relu -> Ops.relu(result)
+      :sigmoid -> Ops.sigmoid(result)
+      _ -> result
+    end
   end
 
-  defp apply_layer({:batch_norm, weights, _config}, input) do
-    # TODO: call Ops.batch_norm/6 with gamma, beta, mean, var from weights
+  defp apply_layer({:batch_norm, weights, config}, input) do
+    eps = Map.get(config, :eps, 1.0e-5)
+    Ops.batch_norm(input, weights.gamma, weights.beta, weights.mean, weights.var, eps)
   end
 
   defp apply_layer({:relu, _weights, _config}, input), do: Ops.relu(input)
 
+  defp apply_layer({:sigmoid, _weights, _config}, input), do: Ops.sigmoid(input)
+
   defp apply_layer({:flatten, _weights, _config}, %Tensor{shape: [n | rest]} = input) do
-    # TODO: reshape to [n, product(rest)]
+    Tensor.reshape(input, [n, Enum.product(rest)])
   end
 
-  defp apply_layer({:dense, weights, _config}, input) do
-    # TODO: matmul(input, weights.kernel) then add weights.bias
-    # TODO: apply activation if specified in config
+  defp apply_layer({:dense, weights, config}, input) do
+    result = Tensor.matmul(input, weights.kernel)
+
+    result =
+      if Map.has_key?(weights, :bias) do
+        Tensor.add(result, weights.bias)
+      else
+        result
+      end
+
+    case Map.get(config, :activation) do
+      :relu -> Ops.relu(result)
+      :sigmoid -> Ops.sigmoid(result)
+      _ -> result
+    end
   end
 
   defp apply_layer({:softmax, _weights, _config}, input), do: Ops.softmax(input)

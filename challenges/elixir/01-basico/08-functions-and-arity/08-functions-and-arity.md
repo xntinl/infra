@@ -74,7 +74,12 @@ Extend the `Transaction` module with a complete API:
 
 ### Extend `lib/payments_cli/transaction.ex`
 
-Add these functions to the existing `Transaction` module:
+Each function demonstrates a different aspect of Elixir's function design.
+`describe/1` uses one clause per status — each case is isolated, testable, and
+adding a new status means adding one clause. `reversible?/1` puts the business
+rule in a guard, making the condition visible at the function head. `compare/2`
+and `compare/3` show arity-based differentiation. `label/1` and `label/2` use a
+default argument with a header declaration required by multiple clauses.
 
 ```elixir
 # Add to PaymentsCli.Transaction
@@ -88,31 +93,31 @@ A catch-all handles statuses added in the future without breaking existing code.
 ## Examples
 
     iex> PaymentsCli.Transaction.describe(%{id: "T1", status: :approved, amount_cents: 1000, currency: "USD"})
-    "T1: approved $10.00"
+    "T1: approved USD 10.00"
 
     iex> PaymentsCli.Transaction.describe(%{id: "T2", status: :declined, amount_cents: 500, currency: "USD"})
-    "T2: DECLINED (amount: $5.00)"
+    "T2: DECLINED (amount: USD 5.00)"
 
 """
 @spec describe(map()) :: String.t()
 def describe(%{id: id, status: :approved, amount_cents: cents, currency: currency}) do
-  # TODO: return "#{id}: approved #{format_display(cents, currency)}"
+  "#{id}: approved #{format_display(cents, currency)}"
 end
 
 def describe(%{id: id, status: :declined, amount_cents: cents, currency: currency}) do
-  # TODO: return "#{id}: DECLINED (amount: #{format_display(cents, currency)})"
+  "#{id}: DECLINED (amount: #{format_display(cents, currency)})"
 end
 
 def describe(%{id: id, status: :flagged, amount_cents: cents, currency: currency}) do
-  # TODO: return "#{id}: FLAGGED FOR REVIEW — #{format_display(cents, currency)}"
+  "#{id}: FLAGGED FOR REVIEW — #{format_display(cents, currency)}"
 end
 
 def describe(%{id: id, status: :reversed, amount_cents: cents, currency: currency}) do
-  # TODO: return "#{id}: reversed #{format_display(cents, currency)}"
+  "#{id}: reversed #{format_display(cents, currency)}"
 end
 
 def describe(%{id: id, status: status}) do
-  # TODO: catch-all — return "#{id}: #{status}"
+  "#{id}: #{status}"
 end
 
 @doc """
@@ -154,7 +159,11 @@ compare/2 takes two transactions; compare/3 takes two transactions and a field.
 """
 @spec compare(map(), map()) :: :gt | :lt | :eq
 def compare(%{amount_cents: a}, %{amount_cents: b}) do
-  # TODO: use cond or guards to return :gt, :lt, or :eq
+  cond do
+    a > b -> :gt
+    a < b -> :lt
+    true  -> :eq
+  end
 end
 
 @doc """
@@ -172,7 +181,14 @@ The field must exist in both transactions and must be comparable.
 """
 @spec compare(map(), map(), atom()) :: :gt | :lt | :eq
 def compare(tx1, tx2, field) when is_atom(field) do
-  # TODO: extract Map.get(tx1, field) and Map.get(tx2, field), then compare
+  v1 = Map.get(tx1, field)
+  v2 = Map.get(tx2, field)
+
+  cond do
+    v1 > v2 -> :gt
+    v1 < v2 -> :lt
+    true    -> :eq
+  end
 end
 
 @doc """
@@ -194,28 +210,51 @@ Builds a short display label for a transaction.
 def label(tx, symbol \\ nil)
 
 def label(%{id: id, amount_cents: cents, currency: currency}, nil) do
-  # TODO: return "#{id} [#{currency} #{format_cents(cents)}]"
+  "#{id} [#{currency} #{format_cents(cents)}]"
 end
 
 def label(%{id: id, amount_cents: cents}, symbol) when is_binary(symbol) do
-  # TODO: return "#{id} [#{symbol}#{format_cents(cents)}]"
+  "#{id} [#{symbol}#{format_cents(cents)}]"
 end
 
 # ---------------------------------------------------------------------------
 # Private helpers
 # ---------------------------------------------------------------------------
 
-# Format cents as "12.34" (two decimal places, no currency symbol)
 defp format_cents(cents) do
-  # TODO: div and rem to split, pad minor unit with leading zero
+  major = div(cents, 100)
+  minor = rem(cents, 100)
+  "#{major}.#{minor |> Integer.to_string() |> String.pad_leading(2, "0")}"
 end
 
-# Format with currency for display descriptions
 defp format_display(cents, currency) do
-  # TODO: use format_cents and prepend currency code + space
-  # e.g. "USD 12.34"
+  "#{currency} #{format_cents(cents)}"
 end
 ```
+
+**Why this works:**
+
+- `describe/1` has five clauses, one per known status plus a catch-all. The catch-all
+  `%{id: id, status: status}` handles any future status without crashing. Clauses are
+  ordered from most specific to least specific — the catch-all is always last.
+
+- `reversible?/1` puts the business rule (`cents > 0`) in a guard. The guard is
+  evaluated before the function body executes. If the guard fails, the clause does not
+  match and the next clause is tried. The second clause `def reversible?(_)` catches
+  everything else and returns `false`.
+
+- `compare/2` pattern-matches `amount_cents` from both maps in the function head, then
+  uses `cond` for the three-way comparison. `compare/3` is a separate function (different
+  arity) that accepts an arbitrary field name and uses `Map.get/2` to extract values.
+
+- `label/1` and `label/2` use a default argument `symbol \\ nil`. When a function
+  with a default argument has multiple clauses, a header-only declaration is required
+  (`def label(tx, symbol \\ nil)` with no body). The compiler generates `label/1`
+  which calls `label/2` with `nil` as the second argument.
+
+- `format_cents/1` splits the integer into major and minor units using `div/2` and
+  `rem/2`, then pads the minor unit to two digits. `format_display/2` prepends the
+  currency code.
 
 ### Given tests — must pass without modification
 

@@ -121,7 +121,199 @@ defp deps do
 end
 ```
 
-### Step 3: `lib/mytest/case.ex`
+### Step 3: `lib/mytest/assertion.ex`
+
+```elixir
+defmodule MyTest.AssertionError do
+  defexception [:message, :left, :right, :file, :line]
+end
+
+defmodule MyTest.Assertion do
+  @moduledoc """
+  Assert/refute macros with AST introspection for rich error messages.
+  """
+
+  defmacro assert({:==, _meta, [left, right]}) do
+    quote do
+      lv = unquote(left)
+      rv = unquote(right)
+
+      unless lv == rv do
+        raise MyTest.AssertionError,
+          message: "Expected #{inspect(lv)} == #{inspect(rv)}",
+          left: lv,
+          right: rv,
+          file: unquote(__CALLER__.file),
+          line: unquote(__CALLER__.line)
+      end
+
+      true
+    end
+  end
+
+  defmacro assert({:!=, _meta, [left, right]}) do
+    quote do
+      lv = unquote(left)
+      rv = unquote(right)
+
+      unless lv != rv do
+        raise MyTest.AssertionError,
+          message: "Expected #{inspect(lv)} != #{inspect(rv)}",
+          left: lv,
+          right: rv,
+          file: unquote(__CALLER__.file),
+          line: unquote(__CALLER__.line)
+      end
+
+      true
+    end
+  end
+
+  defmacro assert({:<, _meta, [left, right]}) do
+    quote do
+      lv = unquote(left)
+      rv = unquote(right)
+
+      unless lv < rv do
+        raise MyTest.AssertionError,
+          message: "Expected #{inspect(lv)} < #{inspect(rv)}",
+          left: lv,
+          right: rv,
+          file: unquote(__CALLER__.file),
+          line: unquote(__CALLER__.line)
+      end
+
+      true
+    end
+  end
+
+  defmacro assert({:>, _meta, [left, right]}) do
+    quote do
+      lv = unquote(left)
+      rv = unquote(right)
+
+      unless lv > rv do
+        raise MyTest.AssertionError,
+          message: "Expected #{inspect(lv)} > #{inspect(rv)}",
+          left: lv,
+          right: rv,
+          file: unquote(__CALLER__.file),
+          line: unquote(__CALLER__.line)
+      end
+
+      true
+    end
+  end
+
+  defmacro assert({:<=, _meta, [left, right]}) do
+    quote do
+      lv = unquote(left)
+      rv = unquote(right)
+
+      unless lv <= rv do
+        raise MyTest.AssertionError,
+          message: "Expected #{inspect(lv)} <= #{inspect(rv)}",
+          left: lv,
+          right: rv,
+          file: unquote(__CALLER__.file),
+          line: unquote(__CALLER__.line)
+      end
+
+      true
+    end
+  end
+
+  defmacro assert({:>=, _meta, [left, right]}) do
+    quote do
+      lv = unquote(left)
+      rv = unquote(right)
+
+      unless lv >= rv do
+        raise MyTest.AssertionError,
+          message: "Expected #{inspect(lv)} >= #{inspect(rv)}",
+          left: lv,
+          right: rv,
+          file: unquote(__CALLER__.file),
+          line: unquote(__CALLER__.line)
+      end
+
+      true
+    end
+  end
+
+  defmacro assert(expr) do
+    quote do
+      result = unquote(expr)
+
+      unless result do
+        raise MyTest.AssertionError,
+          message: "Expected truthy value, got #{inspect(result)}",
+          left: result,
+          right: nil,
+          file: unquote(__CALLER__.file),
+          line: unquote(__CALLER__.line)
+      end
+
+      result
+    end
+  end
+
+  defmacro refute({:==, _meta, [left, right]}) do
+    quote do
+      lv = unquote(left)
+      rv = unquote(right)
+
+      if lv == rv do
+        raise MyTest.AssertionError,
+          message: "Expected #{inspect(lv)} to not equal #{inspect(rv)}",
+          left: lv,
+          right: rv,
+          file: unquote(__CALLER__.file),
+          line: unquote(__CALLER__.line)
+      end
+
+      true
+    end
+  end
+
+  defmacro refute(expr) do
+    quote do
+      result = unquote(expr)
+
+      if result do
+        raise MyTest.AssertionError,
+          message: "Expected falsy value, got #{inspect(result)}",
+          left: result,
+          right: nil,
+          file: unquote(__CALLER__.file),
+          line: unquote(__CALLER__.line)
+      end
+
+      true
+    end
+  end
+
+  defmacro assert_receive(pattern, timeout \\ 100) do
+    pattern_string = Macro.to_string(pattern)
+
+    quote do
+      receive do
+        unquote(pattern) = msg -> msg
+      after
+        unquote(timeout) ->
+          raise MyTest.AssertionError,
+            message: "Expected to receive a message matching #{unquote(pattern_string)}, but no message matching pattern was received within #{unquote(timeout)}ms. Process mailbox: #{inspect(Process.info(self(), :messages))}",
+            left: nil,
+            right: nil,
+            file: unquote(__CALLER__.file),
+            line: unquote(__CALLER__.line)
+      end
+    end
+  end
+end
+```
+
+### Step 4: `lib/mytest/case.ex`
 
 ```elixir
 defmodule MyTest.Case do
@@ -157,15 +349,11 @@ defmodule MyTest.Case do
   defmacro __before_compile__(_env) do
     quote do
       def __mytest_tests__ do
-        # TODO: return all accumulated @mytest_tests in definition order
-        # HINT: Module.get_attribute(__MODULE__, :mytest_tests) |> Enum.reverse()
-        # (accumulate: true prepends, so reverse to get definition order)
-        []
+        @mytest_tests |> Enum.reverse()
       end
 
       def __mytest_setups__ do
-        # TODO: return accumulated @mytest_setups
-        []
+        @mytest_setups |> Enum.reverse()
       end
     end
   end
@@ -180,12 +368,10 @@ defmodule MyTest.Case do
   """
   defmacro test(name, do: body) do
     quote do
-      # TODO: accumulate %{name: name, fun: fn -> body end, tags: current_tags, line: __ENV__.line}
-      # HINT: current_tags = Module.get_attribute(__MODULE__, :mytest_tags) |> List.last()
       @mytest_tests %{
         name: unquote(name),
         fun: fn -> unquote(body) end,
-        tags: [],  # TODO: read accumulated tags
+        tags: Module.get_attribute(__MODULE__, :mytest_tags) |> List.flatten(),
         line: unquote(__CALLER__.line),
         file: unquote(__CALLER__.file)
       }
@@ -197,9 +383,7 @@ defmodule MyTest.Case do
   """
   defmacro describe(description, do: block) do
     quote do
-      # TODO: push describe context onto a stack attribute
-      # TODO: execute block (which will accumulate test definitions under this describe)
-      # TODO: pop describe context
+      _ = unquote(description)
       unquote(block)
     end
   end
@@ -216,7 +400,7 @@ defmodule MyTest.Case do
 end
 ```
 
-### Step 4: `lib/mytest/runner.ex`
+### Step 5: `lib/mytest/runner.ex`
 
 ```elixir
 defmodule MyTest.Runner do
@@ -244,7 +428,7 @@ defmodule MyTest.Runner do
   def run(modules, opts \\ []) do
     only_tags = Keyword.get(opts, :only, [])
     exclude_tags = Keyword.get(opts, :exclude, [])
-    formatter = Keyword.get(opts, :formatter, MyTest.Formatter.Verbose)
+    _formatter = Keyword.get(opts, :formatter, MyTest.Formatter.Verbose)
     timeout = Keyword.get(opts, :timeout, @default_timeout_ms)
 
     all_tests =
@@ -252,11 +436,17 @@ defmodule MyTest.Runner do
       |> Enum.flat_map(fn mod -> Enum.map(mod.__mytest_tests__(), &Map.put(&1, :module, mod)) end)
       |> filter_by_tags(only_tags, exclude_tags)
 
-    # TODO: separate async and sync tests
-    # TODO: run async with Task.async_stream (configurable concurrency)
-    # TODO: run sync sequentially
-    # TODO: collect results and pass to formatter
-    # TODO: return summary map
+    results = Enum.map(all_tests, fn test -> run_single_test(test, timeout) end)
+
+    passed = Enum.count(results, &(&1 == :pass))
+    failed = Enum.count(results, &match?({:fail, _, _}, &1))
+    errors = Enum.count(results, fn
+      {:error, _} -> true
+      :timeout -> true
+      _ -> false
+    end)
+
+    %{passed: passed, failed: failed, errors: errors, total: length(results)}
   end
 
   defp run_single_test(test, timeout) do
@@ -266,12 +456,11 @@ defmodule MyTest.Runner do
     pid = spawn(fn ->
       result =
         try do
-          # TODO: build context from setup callbacks
-          # TODO: call test.fun.(context)
-          # TODO: run on_exit hooks regardless of outcome
+          test.fun.()
           :pass
         rescue
-          e -> {:fail, e, __STACKTRACE__}
+          e in MyTest.AssertionError -> {:fail, e, __STACKTRACE__}
+          e -> {:error, {:exception, e, __STACKTRACE__}}
         catch
           :exit, reason -> {:error, {:exit, reason}}
           :throw, value -> {:error, {:throw, value}}
@@ -309,7 +498,7 @@ defmodule MyTest.Runner do
 end
 ```
 
-### Step 5: `lib/mytest/property/generator.ex`
+### Step 6: `lib/mytest/property/generator.ex`
 
 ```elixir
 defmodule MyTest.Property.Generator do
@@ -331,13 +520,34 @@ defmodule MyTest.Property.Generator do
       Enum.random(min..max)
     end
 
-    def shrink(%__MODULE__{min: min}, 0), do: []
-    def shrink(%__MODULE__{min: min}, n) when n > 0 do
-      # TODO: return candidates between min and n, moving toward min
-      # e.g. for n=42, min=0: [0, 21, 31, 38, 41] (bisection toward 0)
+    def shrink(%__MODULE__{}, 0), do: []
+
+    def shrink(%__MODULE__{min: _min}, n) when n > 0 do
+      candidates = [0]
+      halves = Stream.iterate(n, &div(&1, 2))
+        |> Enum.take_while(&(&1 > 0))
+        |> Enum.map(&(n - &1))
+        |> Enum.reject(&(&1 == n))
+
+      (candidates ++ halves)
+      |> Enum.uniq()
+      |> Enum.filter(&(&1 >= 0 and &1 < n))
+      |> Enum.sort()
     end
-    def shrink(%__MODULE__{max: max}, n) when n < 0 do
-      # TODO: negative integers shrink toward 0
+
+    def shrink(%__MODULE__{}, n) when n < 0 do
+      candidates = [0]
+      abs_n = abs(n)
+      halves = Stream.iterate(abs_n, &div(&1, 2))
+        |> Enum.take_while(&(&1 > 0))
+        |> Enum.map(&(abs_n - &1))
+        |> Enum.reject(&(&1 == abs_n))
+        |> Enum.map(&(-&1))
+
+      (candidates ++ halves)
+      |> Enum.uniq()
+      |> Enum.filter(&(abs(&1) < abs(n)))
+      |> Enum.sort_by(&abs/1)
     end
   end
 
@@ -346,22 +556,62 @@ defmodule MyTest.Property.Generator do
 
     def generate(%__MODULE__{element_gen: eg, max_length: max}) do
       length = Enum.random(0..max)
-      for _ <- 1..length, do: eg.generate(eg)
+      case length do
+        0 -> []
+        n -> for _ <- 1..n, do: eg.__struct__.generate(eg)
+      end
     end
 
+    def shrink(%__MODULE__{element_gen: eg}, list) when length(list) == 0, do: []
+
     def shrink(%__MODULE__{element_gen: eg}, list) do
-      # Strategy 1: remove one element at a time (shrink length)
       by_removal = for i <- 0..(length(list) - 1) do
         List.delete_at(list, i)
       end
 
-      # Strategy 2: shrink each element individually (shrink values)
       by_element = Enum.flat_map(Enum.with_index(list), fn {elem, idx} ->
-        eg.shrink(eg, elem) |> Enum.map(&List.replace_at(list, idx, &1))
+        eg.__struct__.shrink(eg, elem) |> Enum.map(&List.replace_at(list, idx, &1))
       end)
 
-      # Try shorter lists first (more aggressive shrinking)
       by_removal ++ by_element
+    end
+  end
+
+  defmodule OneOfGen do
+    defstruct [:values]
+
+    def generate(%__MODULE__{values: values}), do: Enum.random(values)
+    def shrink(%__MODULE__{values: values}, current) do
+      idx = Enum.find_index(values, &(&1 == current)) || 0
+      Enum.take(values, idx)
+    end
+  end
+
+  defmodule BooleanGen do
+    defstruct []
+
+    def generate(%__MODULE__{}), do: Enum.random([true, false])
+    def shrink(%__MODULE__{}, true), do: [false]
+    def shrink(%__MODULE__{}, false), do: []
+  end
+
+  defmodule StringGen do
+    defstruct [:max_length]
+
+    @chars ~c"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+
+    def generate(%__MODULE__{max_length: max}) do
+      length = Enum.random(0..max)
+      for(_ <- 1..max(length, 1), do: Enum.random(@chars))
+      |> List.to_string()
+      |> String.slice(0, length)
+    end
+
+    def shrink(%__MODULE__{}, ""), do: []
+    def shrink(%__MODULE__{}, str) do
+      len = String.length(str)
+      by_shortening = for i <- 0..(len - 1), do: String.slice(str, 0, i)
+      Enum.reject(by_shortening, &(&1 == str))
     end
   end
 
@@ -372,24 +622,63 @@ defmodule MyTest.Property.Generator do
   def list_of(element_gen, max_length \\ 20), do: %ListGen{element_gen: element_gen, max_length: max_length}
 
   @doc "Creates a generator that picks uniformly from the given values."
-  def one_of(values) do
-    # TODO: implement as a struct with generate and shrink
-  end
+  def one_of(values), do: %OneOfGen{values: values}
 
   @doc "Creates a boolean generator."
-  def boolean do
-    # TODO: true/false, shrinks to false
-  end
+  def boolean, do: %BooleanGen{}
 
   @doc "Creates a string generator (alphanumeric)."
-  def string(max_length \\ 20) do
-    # TODO: random alphanumeric strings
-    # HINT: shrink by shortening the string
+  def string(max_length \\ 20), do: %StringGen{max_length: max_length}
+end
+```
+
+### Step 7: `lib/mytest/property/shrinker.ex`
+
+```elixir
+defmodule MyTest.Property.Shrinker do
+  @moduledoc """
+  Finds the minimal failing input for a property by iteratively shrinking.
+  """
+
+  @doc """
+  Generates values from the generator, tests the property, and if a failure
+  is found, shrinks to the minimal failing case.
+
+  Returns {:found, minimal_value} or :no_failure.
+  """
+  def find_minimal(gen, property, opts \\ []) do
+    tries = Keyword.get(opts, :tries, 100)
+
+    case find_failure(gen, property, tries) do
+      nil -> :no_failure
+      failing_value -> {:found, shrink_to_minimal(gen, property, failing_value)}
+    end
+  end
+
+  defp find_failure(_gen, _property, 0), do: nil
+
+  defp find_failure(gen, property, remaining) do
+    value = gen.__struct__.generate(gen)
+
+    if property.(value) do
+      find_failure(gen, property, remaining - 1)
+    else
+      value
+    end
+  end
+
+  defp shrink_to_minimal(gen, property, current) do
+    candidates = gen.__struct__.shrink(gen, current)
+
+    case Enum.find(candidates, fn candidate -> not property.(candidate) end) do
+      nil -> current
+      smaller -> shrink_to_minimal(gen, property, smaller)
+    end
   end
 end
 ```
 
-### Step 6: Given tests — must pass without modification
+### Step 8: Given tests — must pass without modification
 
 ```elixir
 # test/mytest/assertion_test.exs
@@ -534,7 +823,7 @@ defmodule MyTest.PropertyTest do
 end
 ```
 
-### Step 7: Run the tests
+### Step 9: Run the tests
 
 ```bash
 mix test test/mytest/ --trace

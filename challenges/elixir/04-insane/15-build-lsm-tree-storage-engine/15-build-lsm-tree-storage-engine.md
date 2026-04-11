@@ -94,19 +94,47 @@ defmodule Lsmex.WAL do
   A CRC32 mismatch indicates a partial write — stop replay at that point.
   """
 
+  @tombstone_marker <<0xFF, 0xFF, 0xFF, 0xFF>>
+
   @doc "Appends a record to the WAL and fsyncs. Returns :ok."
+  @spec append(Path.t(), binary(), binary() | nil) :: :ok
   def append(path, key, value) do
-    # TODO
-    # HINT: :file.open(path, [:append, :binary, :raw]) for low-level IO
-    # HINT: crc = :erlang.crc32(<<key_len::32, val_len::32, key::binary, value_or_tombstone::binary>>)
-    # HINT: :file.sync(fd) before returning
+    key_bin = if is_binary(key), do: key, else: :erlang.term_to_binary(key)
+    val_bin = if is_nil(value), do: @tombstone_marker, else: (if is_binary(value), do: value, else: :erlang.term_to_binary(value))
+
+    payload = <<byte_size(key_bin)::32, byte_size(val_bin)::32, key_bin::binary, val_bin::binary>>
+    crc = :erlang.crc32(payload)
+    frame = <<crc::32, payload::binary>>
+
+    {:ok, fd} = :file.open(path, [:append, :binary, :raw])
+    :ok = :file.write(fd, frame)
+    :ok = :file.sync(fd)
+    :ok = :file.close(fd)
+    :ok
   end
 
   @doc "Replays the WAL. Calls callback({key, value}) for each valid record."
+  @spec replay(Path.t(), (tuple() -> any())) :: :ok
   def replay(path, callback) do
-    # TODO: read binary, pattern match frame-by-frame
-    # HINT: stop at first CRC32 mismatch (partial write at crash point)
+    case File.read(path) do
+      {:ok, data} -> replay_frames(data, callback)
+      {:error, :enoent} -> :ok
+    end
   end
+
+  defp replay_frames(<<crc::32, klen::32, vlen::32, key::binary-size(klen),
+                       val::binary-size(vlen), rest::binary>>, callback) do
+    payload = <<klen::32, vlen::32, key::binary, val::binary>>
+    if :erlang.crc32(payload) == crc do
+      value = if val == @tombstone_marker, do: nil, else: val
+      callback.({key, value})
+      replay_frames(rest, callback)
+    else
+      :ok
+    end
+  end
+
+  defp replay_frames(_rest, _callback), do: :ok
 end
 ```
 
@@ -132,17 +160,64 @@ defmodule Lsmex.SSTable do
   """
 
   @doc "Writes a sorted list of {key, value} pairs to a new SSTable file."
+  @spec write(Path.t(), [{binary(), binary()}]) :: :ok
   def write(path, entries) do
-    # TODO: write data blocks, build index, write footer
-    # TODO: build Bloom filter from keys, write to path <> ".bloom"
+    index = []
+    {:ok, fd} = :file.open(path, [:write, :binary, :raw])
+
+    {_offset, index} =
+      Enum.reduce(entries, {0, []}, fn {key, value}, {offset, idx} ->
+        key_bin = if is_binary(key), do: key, else: :erlang.term_to_binary(key)
+        val_bin = if is_binary(value), do: value, else: :erlang.term_to_binary(value)
+        record = <<byte_size(key_bin)::32, byte_size(val_bin)::32, key_bin::binary, val_bin::binary>>
+        crc = :erlang.crc32(record)
+        block = <<byte_size(record)::32, crc::32, record::binary>>
+        :file.write(fd, block)
+        new_offset = offset + byte_size(block)
+        {new_offset, [{key_bin, offset} | idx]}
+      end)
+
+    index_data = :erlang.term_to_binary(Enum.reverse(index))
+    index_offset = :file.position(fd, :cur) |> elem(1)
+    :file.write(fd, index_data)
+    :file.write(fd, <<index_offset::64>>)
+    :file.close(fd)
+
+    keys = Enum.map(entries, fn {k, _} -> if is_binary(k), do: k, else: :erlang.term_to_binary(k) end)
+    bloom = Lsmex.Bloom.build(keys, target_fp: 0.01)
+    File.write!(path <> ".bloom", :erlang.term_to_binary(bloom))
+    :ok
   end
 
   @doc "Reads the value for key. Returns {:ok, value} | {:error, :not_found}."
+  @spec get(Path.t(), binary()) :: {:ok, binary()} | {:error, :not_found}
   def get(path, key) do
-    # TODO: check Bloom filter first — if absent, return {:error, :not_found}
-    # TODO: binary search the index for key's block offset
-    # TODO: read and verify CRC32 on the block
-    # TODO: linear search within the block for the key
+    key_bin = if is_binary(key), do: key, else: :erlang.term_to_binary(key)
+
+    bloom =
+      case File.read(path <> ".bloom") do
+        {:ok, data} -> :erlang.binary_to_term(data)
+        _ -> nil
+      end
+
+    if bloom && not Lsmex.Bloom.member?(bloom, key_bin) do
+      {:error, :not_found}
+    else
+      {:ok, data} = File.read(path)
+      data_size = byte_size(data) - 8
+      <<content::binary-size(data_size), index_offset::64>> = data
+      index_data = binary_part(content, index_offset, data_size - index_offset)
+      index = :erlang.binary_to_term(index_data)
+
+      case Enum.find(index, fn {k, _off} -> k == key_bin end) do
+        nil -> {:error, :not_found}
+        {_k, offset} ->
+          <<_before::binary-size(offset), block_len::32, _crc::32,
+            klen::32, vlen::32, _key::binary-size(klen), val::binary-size(vlen),
+            _rest::binary>> = content
+          {:ok, val}
+      end
+    end
   end
 end
 ```

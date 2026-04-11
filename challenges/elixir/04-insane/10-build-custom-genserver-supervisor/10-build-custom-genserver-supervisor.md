@@ -80,48 +80,79 @@ defmodule MyGenServer do
   """
 
   @doc "Starts and links a server running module with init_args."
+  @spec start_link(module(), term(), keyword()) :: {:ok, pid()}
   def start_link(module, init_args, opts \\ []) do
-    # TODO: spawn_link a process that calls module.init(init_args)
-    # TODO: register the process under opts[:name] if provided
-    # TODO: return {:ok, pid}
-    # HINT: the child process must call Process.flag(:trap_exit, true) if it
-    #        needs to handle exit signals as messages — decide if that is appropriate here
+    parent = self()
+    ref = make_ref()
+
+    pid = spawn_link(fn ->
+      {:ok, initial_state} = module.init(init_args)
+      send(parent, {ref, :started})
+      loop(module, initial_state)
+    end)
+
+    receive do
+      {^ref, :started} -> :ok
+    after
+      5_000 -> raise "MyGenServer start_link timeout"
+    end
+
+    case Keyword.get(opts, :name) do
+      nil -> :ok
+      name -> Process.register(pid, name)
+    end
+
+    {:ok, pid}
   end
 
   @doc "Synchronous call. Blocks until reply arrives or timeout elapses."
+  @spec call(pid() | atom(), term(), non_neg_integer()) :: term()
   def call(server, message, timeout \\ 5_000) do
     ref = make_ref()
-    # TODO: send {:"$call", {self(), ref}, message} to server
-    # TODO: receive {^ref, reply} with timeout
-    # TODO: on timeout, raise an error with the server identity and message
-    # HINT: a stale reply that arrives after timeout must be discarded by the caller;
-    #        how does the pinned ref help here?
+    pid = resolve_pid(server)
+    send(pid, {:"$call", {self(), ref}, message})
+
+    receive do
+      {^ref, reply} -> reply
+    after
+      timeout ->
+        raise RuntimeError, "MyGenServer.call to #{inspect(server)} timed out after #{timeout}ms"
+    end
   end
 
   @doc "Asynchronous cast. Returns :ok immediately."
+  @spec cast(pid() | atom(), term()) :: :ok
   def cast(server, message) do
-    # TODO: send {:"$cast", message}
+    pid = resolve_pid(server)
+    send(pid, {:"$cast", message})
     :ok
   end
 
-  # The server loop — implement this as a tail-recursive function
+  defp resolve_pid(pid) when is_pid(pid), do: pid
+  defp resolve_pid(name) when is_atom(name), do: Process.whereis(name) || name
+
   defp loop(module, state) do
     receive do
       {:"$call", {from, ref}, message} ->
-        # TODO: call module.handle_call(message, {from, ref}, state)
-        # TODO: send {ref, reply} back to from
-        # TODO: continue loop with new state
-        :todo
+        case module.handle_call(message, {from, ref}, state) do
+          {:reply, reply, new_state} ->
+            send(from, {ref, reply})
+            loop(module, new_state)
+          {:noreply, new_state} ->
+            loop(module, new_state)
+        end
 
       {:"$cast", message} ->
-        # TODO: call module.handle_cast(message, state)
-        # TODO: continue loop with new state
-        :todo
+        case module.handle_cast(message, state) do
+          {:noreply, new_state} ->
+            loop(module, new_state)
+        end
 
       other ->
-        # TODO: call module.handle_info(other, state)
-        # TODO: continue loop with new state
-        :todo
+        case module.handle_info(other, state) do
+          {:noreply, new_state} ->
+            loop(module, new_state)
+        end
     end
   end
 end
@@ -151,25 +182,119 @@ defmodule MyGenServer.Supervisor do
   the supervisor itself crashes with reason {:shutdown, :max_restarts_exceeded}.
   """
 
+  @spec start_link([map()], keyword()) :: {:ok, pid()}
   def start_link(children, opts \\ []) do
     strategy    = opts[:strategy]    || :one_for_one
     max_restarts = opts[:max_restarts] || 3
     max_seconds  = opts[:max_seconds]  || 5
 
-    # TODO: spawn a supervisor process
-    # TODO: start each child, monitor it (not link), store {ref, child_spec, pid}
-    # TODO: enter the supervisor receive loop
+    parent = self()
+    ref = make_ref()
+
+    pid = spawn(fn ->
+      Process.flag(:trap_exit, true)
+      started_children = start_children(children)
+      Process.register(self(), :my_supervisor)
+      send(parent, {ref, :started})
+      supervisor_loop(started_children, children, strategy, max_restarts, max_seconds, [])
+    end)
+
+    receive do
+      {^ref, :started} -> {:ok, pid}
+    after
+      5_000 -> {:error, :timeout}
+    end
   end
 
-  defp supervisor_loop(children, strategy, max_restarts, max_seconds, restart_history) do
+  def child_pid(child_id) do
+    send(:my_supervisor, {:lookup, child_id, self()})
     receive do
-      {:DOWN, ref, :process, pid, reason} ->
-        # TODO: find the child spec for this pid
-        # TODO: check restart policy — should we restart?
-        # TODO: check restart intensity — have we restarted too many times?
-        # TODO: apply the restart strategy
-        :todo
+      {:child_pid, pid} -> {:ok, pid}
+    after
+      1_000 -> {:error, :not_found}
     end
+  end
+
+  defp start_children(specs) do
+    Enum.map(specs, fn spec ->
+      {module, args} = spec.start
+      {:ok, pid} = MyGenServer.start_link(module, args)
+      monitor_ref = Process.monitor(pid)
+      {spec.id, pid, monitor_ref, spec}
+    end)
+  end
+
+  defp start_child(spec) do
+    {module, args} = spec.start
+    {:ok, pid} = MyGenServer.start_link(module, args)
+    monitor_ref = Process.monitor(pid)
+    {spec.id, pid, monitor_ref, spec}
+  end
+
+  defp supervisor_loop(running, specs, strategy, max_restarts, max_seconds, restart_history) do
+    receive do
+      {:lookup, child_id, caller} ->
+        pid = Enum.find_value(running, fn
+          {^child_id, pid, _, _} -> pid
+          _ -> nil
+        end)
+        send(caller, {:child_pid, pid})
+        supervisor_loop(running, specs, strategy, max_restarts, max_seconds, restart_history)
+
+      {:DOWN, _ref, :process, pid, reason} ->
+        case Enum.find(running, fn {_, p, _, _} -> p == pid end) do
+          nil ->
+            supervisor_loop(running, specs, strategy, max_restarts, max_seconds, restart_history)
+
+          {child_id, _pid, _ref, spec} ->
+            now = System.monotonic_time(:second)
+            new_history = [now | restart_history]
+
+            if intensity_exceeded?(new_history, max_restarts, max_seconds) do
+              exit({:shutdown, :max_restarts_exceeded})
+            end
+
+            restart_policy = Map.get(spec, :restart, :permanent)
+
+            if should_restart?(restart_policy, reason) do
+              new_running = apply_strategy(strategy, child_id, running, specs)
+              supervisor_loop(new_running, specs, strategy, max_restarts, max_seconds, new_history)
+            else
+              remaining = Enum.reject(running, fn {id, _, _, _} -> id == child_id end)
+              supervisor_loop(remaining, specs, strategy, max_restarts, max_seconds, new_history)
+            end
+        end
+    end
+  end
+
+  defp apply_strategy(:one_for_one, child_id, running, specs) do
+    spec = Enum.find(specs, fn s -> s.id == child_id end)
+    remaining = Enum.reject(running, fn {id, _, _, _} -> id == child_id end)
+    new_child = start_child(spec)
+    remaining ++ [new_child]
+  end
+
+  defp apply_strategy(:one_for_all, _child_id, running, specs) do
+    Enum.each(Enum.reverse(running), fn {_, pid, ref, _} ->
+      Process.demonitor(ref, [:flush])
+      Process.exit(pid, :shutdown)
+    end)
+    Process.sleep(10)
+    start_children(specs)
+  end
+
+  defp apply_strategy(:rest_for_one, child_id, running, specs) do
+    idx = Enum.find_index(running, fn {id, _, _, _} -> id == child_id end) || 0
+    {keep, restart} = Enum.split(running, idx)
+
+    Enum.each(Enum.reverse(restart), fn {_, pid, ref, _} ->
+      Process.demonitor(ref, [:flush])
+      Process.exit(pid, :shutdown)
+    end)
+    Process.sleep(10)
+
+    restart_specs = Enum.drop(specs, idx)
+    keep ++ start_children(restart_specs)
   end
 
   defp should_restart?(:permanent, _reason), do: true
@@ -177,8 +302,10 @@ defmodule MyGenServer.Supervisor do
   defp should_restart?(:temporary, _reason), do: false
 
   defp intensity_exceeded?(restart_history, max_restarts, max_seconds) do
-    # TODO: count restarts within the last max_seconds
-    # HINT: System.monotonic_time(:second) for timestamps
+    now = System.monotonic_time(:second)
+    cutoff = now - max_seconds
+    recent = Enum.count(restart_history, fn ts -> ts >= cutoff end)
+    recent > max_restarts
   end
 end
 ```

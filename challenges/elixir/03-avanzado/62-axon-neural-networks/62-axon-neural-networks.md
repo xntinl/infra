@@ -18,9 +18,9 @@ api_gateway/
 ├── lib/
 │   └── api_gateway/
 │       ├── ml/
-│       │   ├── feature_extractor.ex  # ← you implement this
-│       │   ├── classifier.ex         # ← and this
-│       │   └── training.ex           # ← and this
+│       │   ├── feature_extractor.ex  # converts raw request stats to tensors
+│       │   ├── classifier.ex         # neural network model definition
+│       │   └── training.ex           # training pipeline
 ├── test/
 │   └── api_gateway/
 │       └── ml_classifier_test.exs    # given tests — must pass without modification
@@ -143,7 +143,7 @@ defmodule ApiGateway.ML.Classifier do
   @moduledoc """
   Neural network classifier for request patterns.
 
-  Architecture: Dense(16, relu) → Dropout(0.3) → Dense(8, relu) → Dense(3, softmax)
+  Architecture: Dense(16, relu) -> Dropout(0.3) -> Dense(8, relu) -> Dense(3, softmax)
   Output classes: 0=normal, 1=suspicious, 2=abusive
   """
 
@@ -156,13 +156,11 @@ defmodule ApiGateway.ML.Classifier do
   Builds and returns the model architecture. Does not initialize weights.
   """
   def build do
-    # TODO: build the network with Axon
-    # Input: shape {nil, 8} (batch x features), name "request_features"
-    # Dense(16) with relu activation
-    # Dropout(rate: 0.3)
-    # Dense(8) with relu activation
-    # Dense(3) with softmax activation (3 output classes)
-    # Return the Axon model
+    Axon.input("request_features", shape: {nil, 8})
+    |> Axon.dense(16, activation: :relu)
+    |> Axon.dropout(rate: 0.3)
+    |> Axon.dense(8, activation: :relu)
+    |> Axon.dense(3, activation: :softmax)
   end
 
   @doc """
@@ -206,6 +204,20 @@ defmodule ApiGateway.ML.Classifier do
 end
 ```
 
+The `build/0` function defines a sequential network:
+- Input layer: `{nil, 8}` — the `nil` dimension is the batch size, determined at runtime.
+- Dense(16, relu): 16 neurons with ReLU activation. This is the first hidden layer.
+- Dropout(0.3): randomly deactivates 30% of neurons during training to prevent
+  overfitting. During inference (`Axon.predict/4`), dropout is automatically disabled.
+- Dense(8, relu): second hidden layer narrows the representation.
+- Dense(3, softmax): output layer with 3 neurons, one per class. Softmax ensures
+  outputs sum to 1.0, making them interpretable as probabilities.
+
+`classify/1` is the inference entry point. It builds the model graph, loads trained
+weights from disk, extracts features from the stats map, and runs a forward pass.
+`Nx.argmax` finds the highest-probability class index, and the class atom is looked
+up from the `@classes` list.
+
 ### Step 4: `lib/api_gateway/ml/training.ex`
 
 ```elixir
@@ -234,18 +246,38 @@ defmodule ApiGateway.ML.Training do
 
     model = Classifier.build()
 
-    # TODO: convert data list to batches:
-    #   - For each {stats_map, label} pair: extract features tensor, one-hot encode label
-    #   - Group into batches of batch_size
-    #   - Each batch is %{"request_features" => {batch, 8} tensor, "labels" => {batch, 3} tensor}
+    # Convert data to batched tensors
+    {features_list, labels_list} =
+      data
+      |> Enum.map(fn {stats, label} ->
+        features = FeatureExtractor.extract(stats) |> Nx.squeeze(axes: [0])
+        one_hot = Nx.tensor(one_hot_encode(label, 3), type: :f32)
+        {features, one_hot}
+      end)
+      |> Enum.unzip()
 
-    # TODO: build a training loop with Axon.Loop.trainer/3:
-    #   - loss: :categorical_cross_entropy
-    #   - optimizer: Axon.Optimizers.adam(learning_rate)
-    # TODO: add :accuracy metric with Axon.Loop.metric/3
-    # TODO: run with Axon.Loop.run/4, epochs: epochs
-    # TODO: save model with Classifier.save_state/2
-    # TODO: return {model, model_state}
+    # Stack all features and labels into single tensors
+    all_features = Nx.stack(features_list)
+    all_labels = Nx.stack(labels_list)
+
+    # Create batched stream for training
+    batches =
+      Stream.zip(
+        Nx.to_batched(all_features, batch_size),
+        Nx.to_batched(all_labels, batch_size)
+      )
+      |> Stream.map(fn {feat_batch, label_batch} ->
+        %{"request_features" => feat_batch, "labels" => label_batch}
+      end)
+
+    # Build training loop
+    model_state =
+      model
+      |> Axon.Loop.trainer(:categorical_cross_entropy, Polaris.Optimizers.adam(learning_rate: learning_rate))
+      |> Axon.Loop.metric(:accuracy)
+      |> Axon.Loop.run(batches, %{}, epochs: epochs, compiler: EXLA)
+
+    {model, model_state}
   end
 
   @doc """
@@ -260,7 +292,6 @@ defmodule ApiGateway.ML.Training do
       stats =
         case label do
           0 ->
-            # Normal traffic profile
             %{
               requests_per_minute: 10 + :rand.uniform(50),
               payload_bytes: 100 + :rand.uniform(500),
@@ -273,7 +304,6 @@ defmodule ApiGateway.ML.Training do
             }
 
           1 ->
-            # Suspicious — elevated rate, some errors
             %{
               requests_per_minute: 200 + :rand.uniform(300),
               payload_bytes: 100 + :rand.uniform(2000),
@@ -286,7 +316,6 @@ defmodule ApiGateway.ML.Training do
             }
 
           2 ->
-            # Abusive — very high rate, high errors, tight burst
             %{
               requests_per_minute: 800 + :rand.uniform(200),
               payload_bytes: 500 + :rand.uniform(10_000),
@@ -302,8 +331,31 @@ defmodule ApiGateway.ML.Training do
       {stats, label}
     end)
   end
+
+  # Converts an integer class index to a one-hot list.
+  # one_hot_encode(1, 3) => [0.0, 1.0, 0.0]
+  defp one_hot_encode(class_idx, num_classes) do
+    Enum.map(0..(num_classes - 1), fn i ->
+      if i == class_idx, do: 1.0, else: 0.0
+    end)
+  end
 end
 ```
+
+The `train/2` function converts labeled data to tensors and runs the Axon training loop:
+
+1. Each `{stats_map, label}` pair is converted to a feature tensor (shape `{8}`)
+   and a one-hot label tensor (shape `{3}`).
+2. All features and labels are stacked into batch tensors using `Nx.stack/1`.
+3. `Nx.to_batched/2` splits the data into mini-batches of `batch_size`.
+4. `Axon.Loop.trainer/3` creates the training loop with categorical cross-entropy
+   loss and Adam optimizer.
+5. `Axon.Loop.metric/2` adds accuracy tracking printed at each epoch.
+6. `Axon.Loop.run/4` executes the training and returns the learned model state.
+
+The one-hot encoding is critical: `Axon.Loop.trainer/3` with `:categorical_cross_entropy`
+expects labels as `{batch, num_classes}` tensors, not integer indices. Passing raw
+integers produces incorrect gradients silently.
 
 ### Step 5: Given tests — must pass without modification
 

@@ -105,15 +105,12 @@ defmodule TaskQueue.Telemetry do
       [:task_queue, :queue, :dequeue]
     ]
 
-    # TODO: use :telemetry.attach_many/4 to attach handle_event/4 to all events
-    # The handler_id must be unique — use "task-queue-telemetry"
-    # HINT:
-    # :telemetry.attach_many(
-    #   "task-queue-telemetry",
-    #   events,
-    #   &handle_event/4,
-    #   nil
-    # )
+    :telemetry.attach_many(
+      "task-queue-telemetry",
+      events,
+      &handle_event/4,
+      nil
+    )
   end
 
   @doc false
@@ -168,25 +165,23 @@ defmodule TaskQueue.Worker do
     job_id   = Map.get(job, :id, "unknown")
     metadata = %{job_id: job_id, job_type: type}
 
-    # TODO: emit [:task_queue, :job, :start] with empty measurements and metadata
-    # HINT: :telemetry.execute([:task_queue, :job, :start], %{}, metadata)
+    :telemetry.execute([:task_queue, :job, :start], %{}, metadata)
 
     start_time = System.monotonic_time()
 
     try do
       result = do_execute(type, args, job_id)
-
-      # TODO: emit [:task_queue, :job, :stop] with duration measurement
-      # duration = System.monotonic_time() - start_time
-      # HINT: :telemetry.execute([:task_queue, :job, :stop], %{duration: duration}, metadata)
-
+      duration = System.monotonic_time() - start_time
+      :telemetry.execute([:task_queue, :job, :stop], %{duration: duration}, metadata)
       {:ok, result}
     rescue
       e ->
-        # TODO: emit [:task_queue, :job, :exception] with duration and reason
-        # HINT: :telemetry.execute([:task_queue, :job, :exception],
-        #         %{duration: System.monotonic_time() - start_time},
-        #         Map.put(metadata, :reason, e))
+        duration = System.monotonic_time() - start_time
+        :telemetry.execute(
+          [:task_queue, :job, :exception],
+          %{duration: duration},
+          Map.put(metadata, :reason, e)
+        )
         {:error, {:unexpected, Exception.message(e)}}
     end
   end
@@ -195,9 +190,11 @@ defmodule TaskQueue.Worker do
 
   defp do_execute("noop", _args, _job_id), do: :noop
   defp do_execute("echo", args, _job_id), do: args
+
   defp do_execute("fail", %{reason: reason}, job_id) do
     raise RuntimeError, "Job #{job_id} failed: #{inspect(reason)}"
   end
+
   defp do_execute(type, _args, job_id) do
     raise RuntimeError, "Job #{job_id}: unknown type #{type}"
   end
@@ -234,8 +231,6 @@ defmodule TaskQueue.Application do
 
   @impl true
   def start(_type, _args) do
-    # TODO: call TaskQueue.Telemetry.setup() before starting children
-    # This attaches the handlers before any events are emitted
     TaskQueue.Telemetry.setup()
 
     children = [
@@ -354,6 +349,8 @@ mix test test/task_queue/telemetry_test.exs --trace
 | `:statsix` / `:prometheus_ex` directly | no — backend embedded in code | yes | no |
 
 Reflection question: `:telemetry.attach/4` takes a handler ID. What happens if you call `setup/0` twice without detaching first? How would you make `setup/0` idempotent?
+
+Answer: `:telemetry.attach/4` raises if the handler ID already exists. To make `setup/0` idempotent, detach before attaching: `:telemetry.detach("task-queue-telemetry")` followed by the attach call. The detach returns `:ok` if the ID exists or `{:error, :not_found}` if it does not — either way, the subsequent attach succeeds.
 
 ---
 

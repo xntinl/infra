@@ -19,9 +19,10 @@ api_gateway/
 │       ├── application.ex          # already exists — supervises the pipeline
 │       ├── router.ex               # already exists — downstream of the pipeline
 │       └── middleware/
-│           ├── request_id.ex       # ← you implement this
-│           ├── auth.ex             # ← and this
-│           └── pipeline.ex         # ← and this
+│           ├── request_id.ex       # propagates or generates X-Request-ID
+│           ├── auth.ex             # validates X-Client-ID header
+│           ├── rate_limit.ex       # checks per-client rate limit
+│           └── pipeline.ex         # declares the plug chain
 ├── test/
 │   └── api_gateway/
 │       └── middleware_test.exs     # given tests — must pass without modification
@@ -169,17 +170,82 @@ defmodule ApiGateway.Middleware.Auth do
   def init(opts), do: opts
 
   def call(conn, _opts) do
-    # TODO: read the @header from the request
-    # TODO: if present and non-empty → assign(:client_id, value) and return conn
-    # TODO: if missing or empty → send 401 JSON body and halt
-    # HINT: get_req_header/2 returns a list; pattern-match on [id | _] when id != ""
-    # HINT: send_resp/3 + Jason.encode! for the JSON body
-    # HINT: halt/1 must be the last call — it returns the conn with halted: true
+    case get_req_header(conn, @header) do
+      [id | _] when id != "" ->
+        assign(conn, :client_id, id)
+
+      _ ->
+        conn
+        |> put_resp_content_type("application/json")
+        |> send_resp(401, Jason.encode!(%{error: "missing or empty X-Client-ID header"}))
+        |> halt()
+    end
   end
 end
 ```
 
-### Step 4: `lib/api_gateway/middleware/pipeline.ex`
+The pattern match `[id | _] when id != ""` covers both the case where the header is
+present with a non-empty value and the case where multiple values are sent (it takes
+the first). The guard `id != ""` rejects explicitly empty strings. When neither clause
+matches — the header is absent (empty list) or all values are empty — the `_` clause
+sends a 401 JSON response and halts the pipeline. `halt/1` must always be the last
+call in the chain because it returns the conn with `halted: true`, signalling
+`Plug.Builder` to skip all subsequent plugs.
+
+### Step 4: `lib/api_gateway/middleware/rate_limit.ex`
+
+```elixir
+defmodule ApiGateway.Middleware.RateLimit do
+  @moduledoc """
+  Connects the Plug pipeline to the RateLimiter.Server built in the previous exercise.
+
+  Reads client_id from conn.assigns (set by Auth). Calls RateLimiter.Server.check/3
+  directly from ETS — no GenServer call, no serialization bottleneck.
+  """
+  import Plug.Conn
+
+  def init(opts) do
+    limit = Keyword.get(opts, :limit, 100)
+    window_ms = Keyword.get(opts, :window_ms, 60_000)
+    {limit, window_ms}
+  end
+
+  def call(conn, {limit, window_ms}) do
+    client_id = conn.assigns[:client_id]
+
+    case ApiGateway.RateLimiter.Server.check(client_id, limit, window_ms) do
+      {:allow, remaining} ->
+        ApiGateway.RateLimiter.Server.record(client_id)
+
+        conn
+        |> put_resp_header("x-ratelimit-remaining", Integer.to_string(remaining))
+
+      {:deny, retry_after_ms} ->
+        retry_after_seconds = ceil(retry_after_ms / 1_000)
+
+        conn
+        |> put_resp_content_type("application/json")
+        |> put_resp_header("retry-after", Integer.to_string(retry_after_seconds))
+        |> send_resp(429, Jason.encode!(%{
+          error: "rate limit exceeded",
+          retry_after_seconds: retry_after_seconds
+        }))
+        |> halt()
+    end
+  end
+end
+```
+
+`init/1` extracts configuration options with sensible defaults and returns them as a
+tuple. Plug.Builder calls `init/1` once at compile time and caches the result; `call/2`
+receives it on every request. Keeping `init/1` fast and deterministic is important
+because it runs during compilation.
+
+In `call/2`, the `:allow` branch records the hit and adds the remaining count as a
+response header so callers can self-throttle. The `:deny` branch converts milliseconds
+to seconds for the standard `Retry-After` header, sends a 429 JSON body, and halts.
+
+### Step 5: `lib/api_gateway/middleware/pipeline.ex`
 
 ```elixir
 defmodule ApiGateway.Middleware.Pipeline do
@@ -193,44 +259,19 @@ defmodule ApiGateway.Middleware.Pipeline do
   """
   use Plug.Builder
 
-  alias ApiGateway.Middleware.{RequestId, Auth}
-  alias ApiGateway.RateLimiter
-
-  # TODO: declare the three plugs with `plug` macro in the correct order
-  # The rate limiter plug should call RateLimiter.Server.check/3 and halt with 429 if denied
-  # plug RequestId
-  # plug Auth
-  # plug ApiGateway.Middleware.RateLimit, limit: 100, window_ms: 60_000
+  plug ApiGateway.Middleware.RequestId
+  plug ApiGateway.Middleware.Auth
+  plug ApiGateway.Middleware.RateLimit, limit: 100, window_ms: 60_000
 end
 ```
 
-### Step 5: `lib/api_gateway/middleware/rate_limit.ex`
+`Plug.Builder` compiles these three `plug` declarations into a single `call/2` function
+at compile time. Between each plug it inserts a `conn.halted` check. If `Auth` halts
+(because `X-Client-ID` is missing), `RateLimit` never executes — the conn flows directly
+to the caller with the 401 response already set.
 
-```elixir
-defmodule ApiGateway.Middleware.RateLimit do
-  @moduledoc """
-  Connects the Plug pipeline to the RateLimiter.Server built in the previous exercise.
-
-  Reads client_id from conn.assigns (set by Auth). Calls RateLimiter.Server.check/3
-  directly from ETS — no GenServer call, no serialization bottleneck.
-  """
-  import Plug.Conn
-
-  def init(opts) do
-    # TODO: extract :limit and :window_ms from opts with defaults 100 / 60_000
-    # Return a tuple that call/2 will receive as opts
-  end
-
-  def call(conn, {limit, window_ms}) do
-    client_id = conn.assigns[:client_id]
-
-    # TODO: call ApiGateway.RateLimiter.Server.check(client_id, limit, window_ms)
-    # TODO: on {:allow, remaining} → add X-RateLimit-Remaining header, record the hit, return conn
-    # TODO: on {:deny, retry_after_ms} → send 429 JSON, add Retry-After header, halt
-    # HINT: ApiGateway.RateLimiter.Server.record/1 registers the request (cast — fire and forget)
-  end
-end
-```
+The `limit: 100, window_ms: 60_000` options are passed to `RateLimit.init/1` at compile
+time. Changing them requires recompilation.
 
 ### Step 6: Given tests — must pass without modification
 
@@ -307,9 +348,6 @@ end
 ```bash
 mix test test/api_gateway/middleware_test.exs --trace
 ```
-
-All tests are red initially. Implement `Auth.call/2`, `RateLimit.init/1`, `RateLimit.call/2`,
-and the `plug` declarations in `Pipeline` until they go green.
 
 ---
 

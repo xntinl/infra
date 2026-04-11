@@ -30,7 +30,7 @@ api_gateway/
 │       │   ├── pipeline.ex
 │       │   ├── instrumentation.ex
 │       │   ├── dsl.ex
-│       │   └── behaviour.ex        # ← you implement this
+│       │   └── behaviour.ex
 │       └── ...
 ├── test/
 │   └── api_gateway/
@@ -134,6 +134,11 @@ defmodule ApiGateway.Middleware.Behaviour do
         Keyword.validate!(opts, [:realm, :required])
       end
     end
+
+  The __using__/1 macro injects three things into the implementing module:
+  1. @behaviour declaration (enables compiler callback checking)
+  2. Default implementations for all optional callbacks (overridable)
+  3. @before_compile hook that validates call/2 is explicitly defined
   """
 
   alias ApiGateway.Conn
@@ -187,10 +192,18 @@ defmodule ApiGateway.Middleware.Behaviour do
 
       @impl ApiGateway.Middleware.Behaviour
       def telemetry_prefix do
-        # HINT: use Module.split(__MODULE__) to get parts, then Enum.map with &String.downcase/1
-        # HINT: convert the last component to a snake_case atom
-        # TODO: implement — return [:api_gateway, :middleware, <derived_atom>]
-        [:api_gateway, :middleware, :unknown]
+        # Derive the telemetry prefix from the module name.
+        # Takes the last component of the module name (e.g., "Auth" from
+        # "ApiGateway.Middleware.Auth"), converts it to snake_case, and
+        # builds the standard telemetry prefix path.
+        last_part =
+          __MODULE__
+          |> Module.split()
+          |> List.last()
+          |> Macro.underscore()
+          |> String.to_atom()
+
+        [:api_gateway, :middleware, last_part]
       end
 
       # Allow implementing modules to override the defaults
@@ -206,19 +219,18 @@ defmodule ApiGateway.Middleware.Behaviour do
   defmacro __before_compile__(env) do
     module = env.module
 
-    # Check that the required callback call/2 is defined.
-    # Module.defines?/3 checks if the function is explicitly defined in this module
-    # (not inherited from a default).
-    #
-    # HINT: use Module.defines?(module, {:call, 2}, :def)
-    # HINT: if not defined, raise CompileError with a clear message
-    # HINT: the message should include the module name so developers know which
-    #       module is missing the implementation
-    #
-    # TODO: implement the validation check
-    #
-    # Note: this hook runs AFTER the module body is evaluated, so all `def`
-    # declarations are visible to Module.defines?/3 at this point.
+    # Module.defines?/3 checks if the function is explicitly defined in this module.
+    # At this point the module body has been fully evaluated, so all `def` declarations
+    # are visible. If call/2 is not defined, the module cannot function as middleware.
+    unless Module.defines?(module, {:call, 2}, :def) do
+      raise CompileError,
+        file: env.file,
+        line: env.line,
+        description:
+          "#{inspect(module)} uses ApiGateway.Middleware.Behaviour " <>
+          "but does not implement the required callback call/2"
+    end
+
     :ok
   end
 
@@ -253,14 +265,18 @@ defmodule ApiGateway.Middleware.Behaviour do
   @doc """
   Returns true if `module` is a valid middleware (implements the behaviour).
   Uses behaviour_info/1 introspection.
+
+  First checks Code.ensure_loaded?/1 to avoid errors for non-existent modules,
+  then inspects the module's :behaviour attribute list to verify this specific
+  behaviour is declared.
   """
   @spec middleware?(module()) :: boolean()
   def middleware?(module) do
-    # HINT: check if module has a __info__(:attributes) that includes
-    #       {:behaviour, [ApiGateway.Middleware.Behaviour]}
-    # HINT: Code.ensure_loaded?/1 first to avoid errors for non-existent modules
-    # TODO: implement
-    false
+    Code.ensure_loaded?(module) &&
+      module.__info__(:attributes)
+      |> Keyword.get_values(:behaviour)
+      |> List.flatten()
+      |> Enum.member?(__MODULE__)
   end
 end
 ```

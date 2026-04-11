@@ -27,8 +27,8 @@ api_gateway/
 │       ├── metrics/
 │       ├── config/
 │       └── auth/
-│           ├── session_store.ex     # ← you implement this
-│           └── account_system.ex   # ← and this
+│           ├── session_store.ex
+│           └── account_system.ex
 ├── test/
 │   └── api_gateway/
 │       └── auth/
@@ -108,6 +108,10 @@ defmodule ApiGateway.Auth.SessionStore do
 
   Call setup/0 once at application startup (before start/0).
   The table is replicated to all nodes that call setup/0.
+
+  Uses disc_copies so that sessions survive node restarts. Index on :user_id
+  enables efficient "invalidate all sessions for user X" without a full table scan.
+  Index on :token enables O(1) token-based lookups for request authentication.
   """
 
   @table __MODULE__
@@ -148,6 +152,10 @@ defmodule ApiGateway.Auth.SessionStore do
   # Public API
   # ---------------------------------------------------------------------------
 
+  @doc """
+  Creates a new session for a user. Uses a transaction to ensure the write is
+  atomic and replicated to all nodes with disc_copies of this table.
+  """
   @spec create(pos_integer(), map()) :: {:ok, t()} | {:error, term()}
   def create(user_id, metadata \\ %{}) do
     session = %__MODULE__{
@@ -158,16 +166,30 @@ defmodule ApiGateway.Auth.SessionStore do
       metadata: metadata
     }
 
-    # HINT: :mnesia.transaction(fn -> :mnesia.write(session) end)
-    # HINT: pattern match {:atomic, :ok} and return {:ok, session}
-    # TODO: implement
+    case :mnesia.transaction(fn -> :mnesia.write(session) end) do
+      {:atomic, :ok} -> {:ok, session}
+      {:aborted, reason} -> {:error, reason}
+    end
   end
 
+  @doc """
+  Looks up a session by its token. Uses dirty_index_read because token lookups
+  happen on every request and the slight staleness risk is acceptable for a
+  read-only operation. Checks expiry to avoid returning stale sessions.
+  """
   @spec get_by_token(String.t()) :: {:ok, t()} | {:error, :not_found | :expired}
   def get_by_token(token) do
-    # HINT: :mnesia.dirty_index_read(@table, token, :token)
-    # HINT: check expires_at > :erlang.system_time(:second)
-    # TODO: implement
+    case :mnesia.dirty_index_read(@table, token, :token) do
+      [session] ->
+        if session.expires_at > :erlang.system_time(:second) do
+          {:ok, session}
+        else
+          {:error, :expired}
+        end
+
+      [] ->
+        {:error, :not_found}
+    end
   end
 
   @spec get_active_for_user(pos_integer()) :: [t()]
@@ -177,12 +199,31 @@ defmodule ApiGateway.Auth.SessionStore do
     Enum.filter(sessions, &(&1.expires_at > now))
   end
 
+  @doc """
+  Renews a session by extending its expiry. Uses a transaction with a :write lock
+  to prevent two concurrent renew calls from reading the same old expiry and both
+  writing updates — the write lock serializes access to this specific session record.
+  """
   @spec renew(String.t()) :: {:ok, t()} | {:error, :not_found}
   def renew(session_id) do
-    # HINT: :mnesia.transaction with :mnesia.read({@table, session_id}, :write)
-    # HINT: write lock (:write) prevents concurrent renew on the same session
-    # HINT: :mnesia.abort(:not_found) if session not found — rolls back the transaction
-    # TODO: implement
+    result =
+      :mnesia.transaction(fn ->
+        case :mnesia.read({@table, session_id}, :write) do
+          [session] ->
+            new_expiry = :erlang.system_time(:second) + @ttl_seconds
+            updated = %{session | expires_at: new_expiry}
+            :mnesia.write(updated)
+            updated
+
+          [] ->
+            :mnesia.abort(:not_found)
+        end
+      end)
+
+    case result do
+      {:atomic, updated_session} -> {:ok, updated_session}
+      {:aborted, :not_found} -> {:error, :not_found}
+    end
   end
 
   @spec invalidate(String.t()) :: :ok
@@ -193,10 +234,25 @@ defmodule ApiGateway.Auth.SessionStore do
     :ok
   end
 
+  @doc """
+  Invalidates all sessions for a given user. Uses a transaction to ensure
+  atomicity — either all sessions are deleted or none are (on abort/retry).
+  Returns the count of deleted sessions for operational visibility.
+  """
   @spec invalidate_all_for_user(pos_integer()) :: {:ok, non_neg_integer()}
   def invalidate_all_for_user(user_id) do
-    # HINT: :mnesia.transaction, index_read, Enum.each delete, return count
-    # TODO: implement
+    {:atomic, count} =
+      :mnesia.transaction(fn ->
+        sessions = :mnesia.index_read(@table, user_id, :user_id)
+
+        Enum.each(sessions, fn session ->
+          :mnesia.delete({@table, session.id})
+        end)
+
+        length(sessions)
+      end)
+
+    {:ok, count}
   end
 
   @spec cleanup_expired() :: {:cleaned, non_neg_integer()}
@@ -226,6 +282,10 @@ defmodule ApiGateway.Auth.AccountSystem do
 
   The canonical use case for transactions: debit + credit must be atomic.
   Uses write locks in canonical order to prevent deadlocks.
+
+  Canonical lock ordering means: always acquire the lock on the lower ID first.
+  If process A transfers from account 1 to 2 and process B transfers from 2 to 1,
+  both acquire account 1's lock first, then account 2's. No circular wait is possible.
   """
 
   defmodule Account do
@@ -520,4 +580,4 @@ or ephemeral session tokens that don't need to survive a cluster-wide crash,
 - [Erlang Mnesia user guide](https://www.erlang.org/doc/apps/mnesia/mnesia_chap1.html) — official guide with replication examples
 - [Mnesia reference manual](https://www.erlang.org/doc/man/mnesia.html) — full API reference
 - [Learn You Some Erlang — Mnesia chapter](https://learnyousomeerlang.com/mnesia) — clear tutorial with transaction examples
-- [Elixir in Action 2nd ed. — Saša Jurić](https://www.manning.com/books/elixir-in-action-second-edition) — persistence patterns chapter
+- [Elixir in Action 2nd ed. — Saša Juric](https://www.manning.com/books/elixir-in-action-second-edition) — persistence patterns chapter

@@ -64,8 +64,8 @@ monitor it with `Port.monitor/1`. When the GenServer that owns the Port dies, th
 closes and the OS process receives EOF on stdin.
 
 ```
-GenServer  ───send({self(), {:command, data}})───▶  Port  ───stdin───▶  OS process
-           ◀───{port, {:data, response}}───────────         ◀───stdout──
+GenServer  ---send({self(), {:command, data}})----->  Port  ---stdin----->  OS process
+           <---{port, {:data, response}}-----------         <---stdout--
 ```
 
 ---
@@ -94,6 +94,14 @@ for line in sys.stdin:
 ## Implementation
 
 ### Step 1: `lib/api_gateway/middleware/ml_scorer.ex`
+
+The MlScorer GenServer opens a Python process via a Port at startup and keeps it alive across
+requests. Each scoring request is serialized as a JSON line to the Port's stdin; the response
+arrives as a JSON line on stdout. The GenServer stores the caller's `from` reference and replies
+asynchronously when the Port sends back data.
+
+The restart logic uses exponential backoff: if the Python process crashes, the GenServer waits
+progressively longer before re-opening the Port, up to `@max_retries` attempts.
 
 ```elixir
 defmodule ApiGateway.Middleware.MlScorer do
@@ -161,17 +169,22 @@ defmodule ApiGateway.Middleware.MlScorer do
 
   @impl true
   def handle_call({:score, request}, from, state) do
-    # TODO: encode request as JSON, send to port, store `from` in pending
-    # HINT: send(state.port, {self(), {:command, json_line}})
-    # HINT: the port uses {:line, 4096} so you need a newline at the end
-    # TODO: return {:noreply, %{state | pending: from}}
+    json_line = Jason.encode!(request) <> "\n"
+    send(state.port, {self(), {:command, json_line}})
+    {:noreply, %{state | pending: from}}
   end
 
   @impl true
   def handle_info({port, {:data, {:eol, line}}}, %{port: port} = state) do
-    # TODO: decode JSON line, reply to state.pending
-    # HINT: GenServer.reply(state.pending, {:ok, decoded}) or {:error, reason}
-    # TODO: clear pending, return {:noreply, new_state}
+    case Jason.decode(line) do
+      {:ok, decoded} ->
+        if state.pending, do: GenServer.reply(state.pending, {:ok, decoded})
+
+      {:error, reason} ->
+        if state.pending, do: GenServer.reply(state.pending, {:error, {:decode_failed, reason}})
+    end
+
+    {:noreply, %{state | pending: nil}}
   end
 
   @impl true
@@ -253,6 +266,10 @@ end
 
 ### Step 2: `lib/api_gateway/middleware/log_tailer.ex`
 
+The LogTailer opens `tail -f` via a Port and fans out each new line to all subscribed processes.
+Subscribers are monitored with `Process.monitor/1` so dead subscribers are automatically
+removed from the fanout list without affecting the others.
+
 ```elixir
 defmodule ApiGateway.Middleware.LogTailer do
   @moduledoc """
@@ -288,11 +305,17 @@ defmodule ApiGateway.Middleware.LogTailer do
 
   @impl true
   def init({file_path, subscriber}) do
-    # TODO: open a Port running `tail -f file_path` with {:line, 4096}
-    # HINT: System.find_executable("tail")
-    # HINT: Port.open({:spawn_executable, tail}, [:binary, {:line, 4096}, args: ["-f", file_path]])
-    # TODO: monitor the initial subscriber with Process.monitor/1
-    # TODO: return {:ok, %{port: port, subscribers: %{subscriber => ref}}}
+    tail = System.find_executable("tail")
+
+    port =
+      Port.open({:spawn_executable, tail}, [
+        :binary,
+        {:line, 4096},
+        args: ["-f", file_path]
+      ])
+
+    ref = Process.monitor(subscriber)
+    {:ok, %{port: port, subscribers: %{subscriber => ref}}}
   end
 
   # ---------------------------------------------------------------------------
@@ -301,26 +324,39 @@ defmodule ApiGateway.Middleware.LogTailer do
 
   @impl true
   def handle_call({:subscribe, pid}, _from, state) do
-    # TODO: monitor pid, add to subscribers map
-    # TODO: return {:reply, :ok, new_state}
+    if Map.has_key?(state.subscribers, pid) do
+      {:reply, :ok, state}
+    else
+      ref = Process.monitor(pid)
+      {:reply, :ok, %{state | subscribers: Map.put(state.subscribers, pid, ref)}}
+    end
   end
 
   @impl true
   def handle_call({:unsubscribe, pid}, _from, state) do
-    # TODO: pop pid from subscribers, demonitor its ref
-    # TODO: return {:reply, :ok | {:error, :not_subscribed}, new_state}
+    case Map.pop(state.subscribers, pid) do
+      {nil, _subs} ->
+        {:reply, {:error, :not_subscribed}, state}
+
+      {ref, new_subs} ->
+        Process.demonitor(ref, [:flush])
+        {:reply, :ok, %{state | subscribers: new_subs}}
+    end
   end
 
   @impl true
   def handle_info({port, {:data, {:eol, line}}}, %{port: port} = state) do
-    # TODO: send {:new_line, line} to every subscriber pid
-    # HINT: Enum.each(state.subscribers, fn {pid, _ref} -> send(pid, {:new_line, line}) end)
+    Enum.each(state.subscribers, fn {pid, _ref} ->
+      send(pid, {:new_line, line})
+    end)
+
+    {:noreply, state}
   end
 
   @impl true
   def handle_info({:DOWN, ref, :process, pid, _reason}, state) do
-    # TODO: remove the dead subscriber from the map
-    # HINT: Map.reject(state.subscribers, fn {p, r} -> p == pid and r == ref end)
+    new_subs = Map.reject(state.subscribers, fn {p, r} -> p == pid and r == ref end)
+    {:noreply, %{state | subscribers: new_subs}}
   end
 
   @impl true
@@ -468,7 +504,7 @@ mix test test/api_gateway/middleware/log_tailer_test.exs --trace
 | Suitable for | JSON-over-stdio protocols | Binary protocols | Quick commands |
 | Streaming | Yes | Yes | No |
 | Backpressure | None (OS pipe buffer) | None | N/A |
-| Latency per call | ~0.1ms IPC | ~0.1ms IPC | 100–300ms (spawn) |
+| Latency per call | ~0.1ms IPC | ~0.1ms IPC | 100-300ms (spawn) |
 | Crash handling | Monitor Port, restart | Monitor Port, restart | Check exit code |
 
 Reflection: the ML scorer currently processes one request at a time. If you needed 50
@@ -480,7 +516,7 @@ IDs in a single Port vs. a `ConsumerSupervisor` pattern.
 ## Common production mistakes
 
 **1. Spawning a new Port per request**
-OS process startup is 50–300ms. Opening a Port once and keeping it alive is the reason
+OS process startup is 50-300ms. Opening a Port once and keeping it alive is the reason
 `MlScorer` is a GenServer. Never `Port.open` inside a request handler.
 
 **2. Not handling `{:exit_status, code}` in `handle_info`**

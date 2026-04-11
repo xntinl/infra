@@ -96,15 +96,23 @@ defmodule TaskQueue.Scheduler do
   """
   @spec dispatch(map()) :: {:ok, term()} | {:error, term()}
   def dispatch(%{handler: handler_name, args: args}) when is_atom(handler_name) do
-    # TODO: use apply/3 to call handler_name.execute(args)
-    # Wrap in try/rescue to return {:error, reason} on UndefinedFunctionError
-    # HINT: apply(handler_name, :execute, [args])
+    try do
+      result = apply(handler_name, :execute, [args])
+      {:ok, result}
+    rescue
+      UndefinedFunctionError ->
+        {:error, :unknown_handler}
+    end
   end
 
   def dispatch(%{handler: handler_name, args: args}) when is_binary(handler_name) do
-    # TODO: convert handler_name to an existing atom, then delegate to the above clause
-    # HINT: String.to_existing_atom("Elixir.#{handler_name}")
-    # Return {:error, :unknown_handler} if the atom does not exist
+    try do
+      module = String.to_existing_atom("Elixir.#{handler_name}")
+      dispatch(%{handler: module, args: args})
+    rescue
+      ArgumentError ->
+        {:error, :unknown_handler}
+    end
   end
 
   def dispatch(_), do: {:error, :invalid_job_format}
@@ -151,8 +159,7 @@ defmodule TaskQueue.Registry do
   """
   def get_retries(job_id) do
     state = GenServer.call(__MODULE__, :get_state)
-    # TODO: use get_in to read state[job_id][:meta][:retries] with default 0
-    # HINT: get_in(state, [job_id, :meta, :retries]) || 0
+    get_in(state, [job_id, :meta, :retries]) || 0
   end
 
   @doc """
@@ -190,24 +197,19 @@ defmodule TaskQueue.Registry do
 
   @impl true
   def handle_call({:record_retry, job_id, error}, _from, state) do
-    # TODO: use update_in to increment state[job_id][:meta][:retries] by 1
-    # TODO: use put_in to set state[job_id][:meta][:last_error] to error
-    # TODO: use put_in to set state[job_id][:status] to :retrying
-    # Return {:reply, :ok, new_state}
-    {:reply, :ok, state}
+    new_state =
+      state
+      |> update_in([job_id, :meta, :retries], &((&1 || 0) + 1))
+      |> put_in([job_id, :meta, :last_error], error)
+      |> put_in([job_id, :status], :retrying)
+
+    {:reply, :ok, new_state}
   end
 
   @impl true
   def handle_call(:mark_all_stale, _from, state) do
-    # TODO: set every job's :status to :stale
-    #
-    # Note: Access.all() works on lists, not maps.
-    # For a map of job_id => entry, use Map.new/2 to rebuild with updated entries:
-    #
-    # HINT:
-    # new_state = Map.new(state, fn {job_id, entry} -> {job_id, %{entry | status: :stale}} end)
-    # {:reply, :ok, new_state}
-    {:reply, :ok, state}
+    new_state = Map.new(state, fn {job_id, entry} -> {job_id, %{entry | status: :stale}} end)
+    {:reply, :ok, new_state}
   end
 
   @impl true
@@ -310,6 +312,8 @@ mix test test/task_queue/kernel_builtins_test.exs --trace
 | `__MODULE__` | self-reference in GenServers | expands at compile time per module scope |
 
 Reflection question: `put_in(user, [:address, :city], "Madrid")` raises if `:address` does not exist. When is this behavior the right default, and when would silent nil insertion be preferable?
+
+Answer: Raising is the right default when you expect the path to exist and a missing intermediate key signals a programming error (e.g., the struct was not initialized correctly). Silent insertion would be preferable when building structures from partial data (like API responses where nested objects may be absent). In that case, use `Map.put_new/3` to create intermediates, or build the nested structure explicitly before calling `put_in`.
 
 ---
 

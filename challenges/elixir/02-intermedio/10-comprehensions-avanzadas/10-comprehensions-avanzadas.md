@@ -17,7 +17,7 @@ Project structure at this point:
 task_queue/
 ├── lib/
 │   └── task_queue/
-│       └── report_builder.ex    # ← you implement this
+│       └── report_builder.ex
 ├── test/
 │   └── task_queue/
 │       └── comprehensions_test.exs   # given tests — must pass without modification
@@ -78,9 +78,7 @@ defmodule TaskQueue.ReportBuilder do
   """
   @spec success_durations([map()]) :: %{String.t() => non_neg_integer()}
   def success_durations(results) do
-    # HINT: for %{status: :ok, job_id: id, duration_ms: ms} <- results, into: %{}, do: {id, ms}
-    # The pattern match in the generator skips non-matching shapes silently
-    # TODO: implement
+    for %{status: :ok, job_id: id, duration_ms: ms} <- results, into: %{}, do: {id, ms}
   end
 
   @doc """
@@ -89,8 +87,7 @@ defmodule TaskQueue.ReportBuilder do
   """
   @spec unique_errors([map()]) :: [any()]
   def unique_errors(results) do
-    # HINT: for %{status: :error, error: reason} <- results, uniq: true, do: reason
-    # TODO: implement
+    for %{status: :error, error: reason} <- results, uniq: true, do: reason
   end
 
   @doc """
@@ -99,9 +96,7 @@ defmodule TaskQueue.ReportBuilder do
   """
   @spec worker_type_matrix([map()], [String.t()]) :: [{String.t(), atom()}]
   def worker_type_matrix(results, worker_ids) do
-    # HINT: for worker_id <- worker_ids, %{type: type, status: :ok} <- results, do: {worker_id, type}
-    # Two generators produce the cartesian product; the filter selects only :ok jobs
-    # TODO: implement
+    for worker_id <- worker_ids, %{type: type, status: :ok} <- results, do: {worker_id, type}
   end
 
   @doc """
@@ -113,8 +108,7 @@ defmodule TaskQueue.ReportBuilder do
     for %{status: status, job_id: id} <- results,
         reduce: %{ok: [], error: [], timeout: []} do
       acc ->
-        # HINT: Map.update(acc, status, [id], fn existing -> [id | existing] end)
-        # TODO: implement
+        Map.update(acc, status, [id], fn existing -> [id | existing] end)
     end
   end
 
@@ -124,9 +118,9 @@ defmodule TaskQueue.ReportBuilder do
   """
   @spec slow_jobs([map()], pos_integer()) :: [String.t()]
   def slow_jobs(results, threshold_ms) do
-    # HINT: for %{duration_ms: ms, job_id: id} <- results, ms > threshold_ms, do: {ms, id}
-    # HINT: then sort desc and map to extract just the id
-    # TODO: implement
+    for %{duration_ms: ms, job_id: id} <- results, ms > threshold_ms, do: {ms, id}
+    |> Enum.sort_by(fn {ms, _id} -> ms end, :desc)
+    |> Enum.map(fn {_ms, id} -> id end)
   end
 
   @doc """
@@ -140,16 +134,44 @@ defmodule TaskQueue.ReportBuilder do
       acc ->
         default = %{ok: 0, error: 0, total_ms: 0}
         worker_stats = Map.get(acc, wid, default)
+
         updated =
           worker_stats
           |> Map.update!(:total_ms, &(&1 + ms))
           |> Map.update!(status, &(&1 + 1))
-        # HINT: Map.put(acc, wid, updated)
-        # TODO: implement
+
+        Map.put(acc, wid, updated)
     end
   end
 end
 ```
+
+Each function demonstrates a different comprehension feature:
+
+- **`success_durations/1`** uses `into: %{}` to collect directly into a map. The generator
+  pattern `%{status: :ok, job_id: id, duration_ms: ms}` both filters (only `:ok` status)
+  and destructures (extracts `id` and `ms`) in one expression. Entries that do not match
+  the pattern (like entries with `:error` status or missing keys) are silently skipped.
+
+- **`unique_errors/1`** uses `uniq: true` to deduplicate results. This is equivalent to
+  piping through `Enum.uniq/1` at the end, but expressed declaratively.
+
+- **`worker_type_matrix/2`** uses two generators to produce a cartesian product. For each
+  `worker_id` and each successful job, a `{worker_id, type}` tuple is emitted. The pattern
+  `%{type: type, status: :ok}` in the second generator acts as both a filter and a
+  destructure.
+
+- **`group_by_status/1`** uses `:reduce` to build a map accumulator. Each iteration updates
+  the map by prepending the job ID to the appropriate status list. The `Map.update/4`
+  function handles both initial insertion and subsequent updates.
+
+- **`slow_jobs/1`** combines a comprehension (for filtering and extracting) with
+  `Enum.sort_by/3` (for ordering). Comprehensions do not support sorting, so post-processing
+  with `Enum` is the right approach.
+
+- **`worker_summary/1`** uses `:reduce` with a nested map structure. The `default` map
+  provides zero-value initialization for each new worker. `Map.update!/3` increments the
+  counter for the matching status.
 
 ### Step 2: Given tests — must pass without modification
 
@@ -185,7 +207,7 @@ defmodule TaskQueue.ComprehensionsTest do
 
   test "worker_type_matrix produces cross-product of workers and successful job types" do
     pairs = ReportBuilder.worker_type_matrix(@results, ["w1", "w2"])
-    # 2 workers × 3 ok jobs = 6 pairs
+    # 2 workers x 3 ok jobs = 6 pairs
     assert length(pairs) == 6
     assert {"w1", :webhook} in pairs
     assert {"w2", :pipeline} in pairs
@@ -245,7 +267,7 @@ mix test test/task_queue/comprehensions_test.exs --trace
 | Readable for complex multi-step transforms? | Moderate | Better | Best |
 
 Reflection question: `worker_type_matrix/2` uses two generators and produces a cartesian
-product of workers × ok jobs. If your system has 100 workers and 10,000 results, the
+product of workers x ok jobs. If your system has 100 workers and 10,000 results, the
 product has 1,000,000 tuples. What alternative data structure or query approach would you
 use instead, and when would the cartesian product actually be the correct choice?
 

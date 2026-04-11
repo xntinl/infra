@@ -50,8 +50,8 @@ the demand and satisfy it when the data arrives.
 GenStage is a demand-driven pipeline. **Consumers pull; producers push only when asked.**
 
 ```
-Consumer asks for 10 events  →  Producer emits up to 10 events
-Consumer asks for 10 more    →  Producer emits up to 10 more (or buffers demand if empty)
+Consumer asks for 10 events  ->  Producer emits up to 10 events
+Consumer asks for 10 more    ->  Producer emits up to 10 more (or buffers demand if empty)
 ```
 
 This model provides natural backpressure: a slow consumer automatically slows its producer
@@ -81,6 +81,10 @@ end
 
 ### Step 2: `lib/api_gateway/middleware/event_router.ex`
 
+The EventRouter uses `PartitionDispatcher` to route events by type. The hash function
+extracts the first element of the event tuple as the partition key. Each consumer subscribes
+with `partition: :payment` (or `:signup`, `:click`) and receives only events of that type.
+
 ```elixir
 defmodule ApiGateway.Middleware.EventRouter do
   @moduledoc """
@@ -88,12 +92,12 @@ defmodule ApiGateway.Middleware.EventRouter do
 
   Topology:
     EventProducer
-      ├── PaymentConsumer  (partition: :payment)
-      ├── SignupConsumer   (partition: :signup)
-      └── ClickConsumer    (partition: :click)
+      |-- PaymentConsumer  (partition: :payment)
+      |-- SignupConsumer   (partition: :signup)
+      +-- ClickConsumer    (partition: :click)
 
   Each consumer receives only events of its type.
-  The partition key is extracted from the event tuple: {:payment, data} → :payment.
+  The partition key is extracted from the event tuple: {:payment, data} -> :payment.
   """
 
   defmodule EventProducer do
@@ -104,15 +108,11 @@ defmodule ApiGateway.Middleware.EventRouter do
     end
 
     def init(events) do
-      # TODO: configure PartitionDispatcher with partitions: [:payment, :signup, :click]
-      # HINT: dispatcher: {GenStage.PartitionDispatcher, partitions: [...], hash: fn}
-      # HINT: the hash function receives an event and returns {event, partition_key}
-      # The partition key is the first element of the event tuple
       {:producer, events,
        dispatcher:
          {GenStage.PartitionDispatcher,
-          # TODO: fill in partitions and hash options
-         }}
+          partitions: [:payment, :signup, :click],
+          hash: fn event -> {event, elem(event, 0)} end}}
     end
 
     def handle_demand(demand, events) do
@@ -129,13 +129,14 @@ defmodule ApiGateway.Middleware.EventRouter do
     end
 
     def init(producer) do
-      # TODO: subscribe to the producer with partition: :payment
       {:consumer, :ok, subscribe_to: [{producer, partition: :payment, max_demand: 10}]}
     end
 
     def handle_events(events, _from, state) do
-      # TODO: process each {:payment, data} event
-      # HINT: log or IO.inspect each payment
+      Enum.each(events, fn {:payment, data} ->
+        IO.puts("[PaymentConsumer] Processing payment: #{inspect(data)}")
+      end)
+
       {:noreply, [], state}
     end
   end
@@ -148,11 +149,15 @@ defmodule ApiGateway.Middleware.EventRouter do
     end
 
     def init(producer) do
-      # TODO: subscribe with partition: :signup
+      {:consumer, :ok, subscribe_to: [{producer, partition: :signup, max_demand: 10}]}
     end
 
     def handle_events(events, _from, state) do
-      # TODO: process each {:signup, data} event
+      Enum.each(events, fn {:signup, data} ->
+        IO.puts("[SignupConsumer] Processing signup: #{inspect(data)}")
+      end)
+
+      {:noreply, [], state}
     end
   end
 
@@ -164,17 +169,25 @@ defmodule ApiGateway.Middleware.EventRouter do
     end
 
     def init(producer) do
-      # TODO: subscribe with partition: :click
+      {:consumer, :ok, subscribe_to: [{producer, partition: :click, max_demand: 10}]}
     end
 
     def handle_events(events, _from, state) do
-      # TODO: process each {:click, data} event
+      Enum.each(events, fn {:click, data} ->
+        IO.puts("[ClickConsumer] Processing click batch: #{inspect(data)}")
+      end)
+
+      {:noreply, [], state}
     end
   end
 end
 ```
 
 ### Step 3: `lib/api_gateway/middleware/parallel_processor.ex`
+
+The `ConsumerSupervisor` spawns one Task per event. `max_demand` controls the maximum number
+of concurrent Task processes — this is the backpressure mechanism. Workers are `:temporary`
+because restarting a failed worker would re-process the event, violating at-most-once semantics.
 
 ```elixir
 defmodule ApiGateway.Middleware.ParallelProcessor do
@@ -205,9 +218,6 @@ defmodule ApiGateway.Middleware.ParallelProcessor do
   end
 
   defmodule FraudScoringWorker do
-    # Each worker receives one job in start_link/1 and exits when done.
-    # restart: :temporary is critical — ConsumerSupervisor must NOT retry
-    # failed workers or the pipeline's back-pressure contract breaks.
     use Task, restart: :temporary
 
     def start_link(job) do
@@ -215,9 +225,9 @@ defmodule ApiGateway.Middleware.ParallelProcessor do
     end
 
     def run(job) do
-      # TODO: simulate fraud scoring with :timer.sleep(job.duration_ms)
-      # Log: "Scoring job #{job.id} (#{job.duration_ms}ms)"
-      # Log completion: "Job #{job.id} scored"
+      IO.puts("Scoring job #{job.id} (#{job.duration_ms}ms)")
+      :timer.sleep(job.duration_ms)
+      IO.puts("Job #{job.id} scored")
     end
   end
 
@@ -230,16 +240,17 @@ defmodule ApiGateway.Middleware.ParallelProcessor do
 
     def init(_opts) do
       children = [
-        # TODO: child spec for FraudScoringWorker with restart: :temporary
-        # HINT: %{id: FraudScoringWorker, start: {FraudScoringWorker, :start_link, []}, restart: :temporary}
+        %{
+          id: FraudScoringWorker,
+          start: {FraudScoringWorker, :start_link, []},
+          restart: :temporary
+        }
       ]
 
       opts = [
         strategy: :one_for_one,
-        # TODO: subscribe_to with max_demand: 5
-        # max_demand: 5 means at most 5 concurrent fraud-scoring Tasks
         subscribe_to: [
-          # TODO: {FraudJobProducer, max_demand: 5}
+          {FraudJobProducer, max_demand: 5}
         ]
       ]
 
@@ -250,6 +261,15 @@ end
 ```
 
 ### Step 4: `lib/api_gateway/middleware/async_producer.ex`
+
+The AsyncProducer handles the case where consumer demand arrives before data is available.
+It maintains a `{buffer, pending_demand}` tuple as state. The invariant is:
+`pending_demand * length(buffer) == 0` — either there is unsatisfied demand (buffer empty)
+or there are buffered events (demand fully satisfied), never both simultaneously.
+
+When `handle_demand` is called, it adds to the pending demand and emits whatever is in the
+buffer. When `handle_info({:new_data, items})` arrives, it adds items to the buffer and
+emits as much as pending demand allows.
 
 ```elixir
 defmodule ApiGateway.Middleware.AsyncProducer do
@@ -286,20 +306,18 @@ defmodule ApiGateway.Middleware.AsyncProducer do
 
   @impl true
   def handle_demand(demand, {buffer, pending_demand}) do
-    # TODO: accumulate total demand, emit what is available in the buffer
-    # total_demand = demand + pending_demand
-    # {to_emit, remaining_buffer} = Enum.split(buffer, total_demand)
-    # remaining_demand = total_demand - length(to_emit)
-    # {:noreply, to_emit, {remaining_buffer, remaining_demand}}
+    total_demand = demand + pending_demand
+    {to_emit, remaining_buffer} = Enum.split(buffer, total_demand)
+    remaining_demand = total_demand - length(to_emit)
+    {:noreply, to_emit, {remaining_buffer, remaining_demand}}
   end
 
   @impl true
   def handle_info({:new_data, items}, {buffer, pending_demand}) do
-    # TODO: add items to the buffer, then emit as much as pending_demand allows
-    # new_buffer = buffer ++ items
-    # {to_emit, remaining_buffer} = Enum.split(new_buffer, pending_demand)
-    # remaining_demand = pending_demand - length(to_emit)
-    # {:noreply, to_emit, {remaining_buffer, remaining_demand}}
+    new_buffer = buffer ++ items
+    {to_emit, remaining_buffer} = Enum.split(new_buffer, pending_demand)
+    remaining_demand = pending_demand - length(to_emit)
+    {:noreply, to_emit, {remaining_buffer, remaining_demand}}
   end
 
   @impl true
@@ -430,5 +448,5 @@ the producer processes its first `handle_demand`.
 
 - [GenStage dispatchers — HexDocs](https://hexdocs.pm/gen_stage/GenStage.html#module-dispatchers)
 - [ConsumerSupervisor — HexDocs](https://hexdocs.pm/gen_stage/ConsumerSupervisor.html)
-- [Announcing GenStage — José Valim](https://elixir-lang.org/blog/2016/07/14/announcing-genstage/)
+- [Announcing GenStage — Jose Valim](https://elixir-lang.org/blog/2016/07/14/announcing-genstage/)
 - [GenStage and Flow — ElixirConf 2016](https://www.youtube.com/watch?v=XPlXNUXmio8)

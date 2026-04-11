@@ -18,9 +18,9 @@ api_gateway/
 ├── lib/
 │   └── api_gateway/
 │       ├── application.ex          # already exists
-│       ├── router.ex               # ← you implement this
-│       ├── service_store.ex        # ← and this
-│       ├── endpoint.ex             # ← and this (error wrapper)
+│       ├── router.ex               # routes for the management API
+│       ├── service_store.ex        # Agent-backed service registry
+│       ├── endpoint.ex             # error wrapper
 │       └── middleware/
 │           └── pipeline.ex         # already exists
 ├── test/
@@ -115,8 +115,6 @@ end
 
 ### Step 2: `lib/api_gateway/router.ex`
 
-`# TODO` marks what you need to implement.
-
 ```elixir
 defmodule ApiGateway.Router do
   use Plug.Router
@@ -143,37 +141,62 @@ defmodule ApiGateway.Router do
   # -- Routes --
 
   get "/health" do
-    # TODO: respond 200 with JSON body %{status: "ok", gateway: "api_gateway"}
+    json(conn, 200, %{status: "ok", gateway: "api_gateway"})
   end
 
   get "/services" do
-    # TODO: list all services from ServiceStore and respond 200
+    services = ApiGateway.ServiceStore.list()
+    json(conn, 200, services)
   end
 
   post "/services" do
-    # TODO: validate body_params has "name" and "url" (non-empty strings)
-    # TODO: on valid → register in ServiceStore, respond 201
-    # TODO: on invalid → respond 422 with error details
-    # HINT: conn.body_params is populated by Plug.Parsers after :match
+    name = conn.body_params["name"]
+    url = conn.body_params["url"]
+
+    cond do
+      is_nil(name) or name == "" ->
+        json(conn, 422, %{error: "name is required and must be non-empty"})
+
+      is_nil(url) or url == "" ->
+        json(conn, 422, %{error: "url is required and must be non-empty"})
+
+      true ->
+        entry = ApiGateway.ServiceStore.register(conn.body_params)
+        json(conn, 201, entry)
+    end
   end
 
   get "/services/:name" do
-    # TODO: look up the service by name
-    # TODO: respond 200 if found, 404 if not
-    # HINT: conn.path_params["name"]
+    case ApiGateway.ServiceStore.get(name) do
+      nil -> json(conn, 404, %{error: "service not found", name: name})
+      service -> json(conn, 200, service)
+    end
   end
 
   delete "/services/:name" do
-    # TODO: deregister the service
-    # TODO: respond 200 if deleted, 404 if not found
+    case ApiGateway.ServiceStore.deregister(name) do
+      :ok -> json(conn, 200, %{deleted: name})
+      :error -> json(conn, 404, %{error: "service not found", name: name})
+    end
   end
 
   get "/logs/stream" do
-    # TODO: open a chunked response with send_chunked/2
-    # TODO: send 20 synthetic log lines, one per chunk, with 50ms between each
-    # TODO: handle {:error, :closed} — client disconnected mid-stream
-    # HINT: send_chunked/2 returns the conn; chunk/2 returns {:ok, conn} | {:error, :closed}
-    # HINT: Enum.reduce_while/3 for a clean early exit on client disconnect
+    conn = send_chunked(conn, 200)
+
+    Enum.reduce_while(1..20, conn, fn i, conn ->
+      line = "[#{DateTime.utc_now() |> DateTime.to_iso8601()}] gateway log entry ##{i}\n"
+
+      case chunk(conn, line) do
+        {:ok, conn} ->
+          Process.sleep(50)
+          {:cont, conn}
+
+        {:error, :closed} ->
+          {:halt, conn}
+      end
+    end)
+
+    conn
   end
 
   # Catch-all — must be last
@@ -190,6 +213,22 @@ defmodule ApiGateway.Router do
   end
 end
 ```
+
+The `post "/services"` route validates that both `name` and `url` are present and
+non-empty strings before registering. `conn.body_params` is populated by `Plug.Parsers`
+after the `:match` plug runs, so it is available in the route handler. The `cond`
+validates each field and returns a 422 with a specific error message for the first
+violation found.
+
+The `get "/logs/stream"` route demonstrates chunked transfer encoding.
+`send_chunked/2` flushes the HTTP headers immediately with `Transfer-Encoding: chunked`.
+Each `chunk/2` call writes one frame to the wire. `Enum.reduce_while/3` provides a
+clean way to stop early if the client disconnects: `chunk/2` returns
+`{:error, :closed}` when the TCP connection is gone, and the reducer halts.
+
+The 50ms sleep between chunks simulates real-time log tailing. Without it, all 20
+lines would arrive in a burst and the streaming behaviour would be indistinguishable
+from a regular buffered response.
 
 ### Step 3: `lib/api_gateway/endpoint.ex`
 

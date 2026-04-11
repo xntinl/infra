@@ -77,7 +77,13 @@ Extend the `Ledger` module with list-processing functions:
 
 ### Extend `lib/payments_cli/ledger.ex`
 
-Add these functions to the existing `Ledger` module from exercise 03:
+Add these functions to the existing `Ledger` module from exercise 03. Each function
+uses the appropriate `Enum` function for the task. `filter_by_status/2` delegates to
+`Enum.filter/2`. `max_transaction/1` uses `Enum.reduce/3` with the first element as
+the initial accumulator — this avoids the "what is the initial max?" problem.
+`group_by_currency/1` delegates to `Enum.group_by/2`, which preserves order within
+each group. `running_balance/1` uses `Enum.reduce/3` with a tuple accumulator to
+track both the running total and the result list.
 
 ```elixir
 # Add to PaymentsCli.Ledger
@@ -96,8 +102,7 @@ Returns a list of matching transaction maps, preserving order.
 """
 @spec filter_by_status([map()], atom()) :: [map()]
 def filter_by_status(transactions, status) when is_list(transactions) and is_atom(status) do
-  # TODO: use Enum.filter/2
-  # The predicate should match on tx.status == status
+  Enum.filter(transactions, fn tx -> tx.status == status end)
 end
 
 @doc """
@@ -116,15 +121,18 @@ Returns {:ok, transaction} or {:error, :empty_list} for an empty list.
 def max_transaction([]), do: {:error, :empty_list}
 
 def max_transaction([first | rest]) do
-  # TODO: use Enum.reduce/3 with first as the initial accumulator
-  # Compare tx.amount_cents to find the maximum
-  # Return {:ok, winner}
-  #
-  # HINT: the initial accumulator is `first` (not 0 — you need the full map, not just the amount)
+  winner =
+    Enum.reduce(rest, first, fn tx, current_max ->
+      if tx.amount_cents > current_max.amount_cents, do: tx, else: current_max
+    end)
+
+  {:ok, winner}
 end
 
 @doc """
 Groups transactions by currency into a map of %{currency => [transactions]}.
+
+Enum.group_by/2 preserves the order of elements within each group.
 
 ## Examples
 
@@ -139,11 +147,7 @@ Groups transactions by currency into a map of %{currency => [transactions]}.
 """
 @spec group_by_currency([map()]) :: %{String.t() => [map()]}
 def group_by_currency(transactions) when is_list(transactions) do
-  # TODO: use Enum.group_by/2
-  # The key function extracts tx.currency
-  #
-  # Design question: does Enum.group_by/2 preserve the order within each group?
-  # Check the docs and note your answer as a comment.
+  Enum.group_by(transactions, fn tx -> tx.currency end)
 end
 
 @doc """
@@ -162,21 +166,34 @@ Each element is the cumulative sum up to and including that transaction.
 """
 @spec running_balance([integer()]) :: [integer()]
 def running_balance(amounts) when is_list(amounts) do
-  # TODO: implement using Enum.reduce/3 with an accumulator that tracks
-  # {running_total, result_list}.
-  #
-  # HINT:
-  #   Enum.reduce(amounts, {0, []}, fn amount, {total, acc} ->
-  #     new_total = total + amount
-  #     {new_total, [new_total | acc]}
-  #   end)
-  #   |> then(fn {_total, list} -> Enum.reverse(list) end)
-  #
-  # Why prepend then reverse? Because [new_total | acc] is O(1) per step.
-  # Reversing once at the end is O(n). Total: O(n).
-  # Using acc ++ [new_total] would be O(n) per step = O(n²) total.
+  amounts
+  |> Enum.reduce({0, []}, fn amount, {total, acc} ->
+    new_total = total + amount
+    {new_total, [new_total | acc]}
+  end)
+  |> then(fn {_total, list} -> Enum.reverse(list) end)
 end
 ```
+
+**Why this works:**
+
+- `filter_by_status/2` delegates to `Enum.filter/2` with a predicate that compares
+  `tx.status` to the target atom. Atom comparison is O(1). The function preserves
+  order because `Enum.filter/2` iterates left-to-right.
+
+- `max_transaction/1` handles the empty list explicitly (returns `{:error, :empty_list}`),
+  then uses `Enum.reduce/3` with `first` as the initial accumulator. This avoids needing
+  a sentinel value like `0` or `-infinity` — the initial max is always a real transaction.
+
+- `group_by_currency/1` delegates to `Enum.group_by/2`, which internally uses
+  `Map.update/4` to build the groups. Order within each group is preserved (elements
+  appear in the same order as in the original list). The map keys have no guaranteed
+  order — do not rely on `Map.keys/1` being sorted.
+
+- `running_balance/1` uses a tuple accumulator `{running_total, result_list}` in
+  `Enum.reduce/3`. Each step adds the current amount to the running total and prepends
+  the new total to the result list (O(1)). After the reduce, `Enum.reverse/1` restores
+  the original order (O(n) once). The `then/2` function unwraps the tuple.
 
 ### Given tests — must pass without modification
 

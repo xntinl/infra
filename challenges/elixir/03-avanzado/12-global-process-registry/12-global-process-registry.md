@@ -166,6 +166,20 @@ scope (a named process) to be running before use — typically started in `appli
 
 ### Step 1: `lib/api_gateway/cluster/leader.ex`
 
+The Leader process periodically attempts to claim the global leader name. If it
+succeeds, it is the leader until it dies or loses a conflict resolution. The key
+design decisions:
+
+1. **Verify against `:global` on every `leader?/0` call**: the local `state.leader`
+   field can go stale if another process claims the name via conflict resolution.
+   Always verify against the source of truth.
+
+2. **Periodic re-election**: even when already leader, the process periodically
+   checks that it still holds the name. This catches silent leadership loss.
+
+3. **Deterministic conflict resolution**: lexicographic node name comparison ensures
+   both sides of a netsplit agree on the winner when the network heals.
+
 ```elixir
 defmodule ApiGateway.Cluster.Leader do
   use GenServer
@@ -203,12 +217,12 @@ defmodule ApiGateway.Cluster.Leader do
 
   @impl true
   def init(_opts) do
-    # TODO: subscribe to node events so we can trigger an election when the
+    # Subscribe to node events so we can trigger an election when the
     # current leader's node goes down.
-    # HINT: :net_kernel.monitor_nodes(true)
+    :net_kernel.monitor_nodes(true)
 
-    # TODO: trigger an immediate election attempt.
-    # HINT: send(self(), :attempt_election)
+    # Trigger an immediate election attempt.
+    send(self(), :attempt_election)
 
     {:ok, %{leader: false}}
   end
@@ -219,65 +233,83 @@ defmodule ApiGateway.Cluster.Leader do
 
   @impl true
   def handle_info(:attempt_election, state) do
-    # TODO:
-    # 1. If already leader, verify we still hold the name:
-    #    :global.whereis_name(@leader_name) == self()
-    #    If not, we lost it (e.g., after a netsplit resolution) — set leader: false
-    #
-    # 2. If not leader, attempt to register:
-    #    result = :global.register_name(@leader_name, self(), &resolve_conflict/3)
-    #    On :yes → log "became leader on #{node()}", set leader: true
-    #    On :no  → remain follower
-    #
-    # 3. Schedule next attempt:
-    #    Process.send_after(self(), :attempt_election, @election_interval_ms)
-    #
-    # 4. {:noreply, new_state}
+    new_leader =
+      if state.leader do
+        # Already leader — verify we still hold the name.
+        # Another process may have claimed it via conflict resolution.
+        if :global.whereis_name(@leader_name) == self() do
+          true
+        else
+          Logger.warning("Lost leadership (detected during periodic check)")
+          false
+        end
+      else
+        # Not leader — attempt to register.
+        case :global.register_name(@leader_name, self(), &resolve_conflict/3) do
+          :yes ->
+            Logger.info("Became leader on #{node()}")
+            true
+
+          :no ->
+            false
+        end
+      end
+
+    # Schedule next election attempt
+    Process.send_after(self(), :attempt_election, @election_interval_ms)
+    {:noreply, %{state | leader: new_leader}}
+  end
+
+  @impl true
+  def handle_info({:nodedown, _node}, state) do
+    # A node went down — the leader may have been on that node.
+    # Trigger an immediate election attempt to claim leadership if available.
+    leader_node = current_leader_node()
+
+    if leader_node == nil do
+      send(self(), :attempt_election)
+    end
+
     {:noreply, state}
   end
 
   @impl true
-  def handle_info({:nodedown, node}, state) do
-    # TODO:
-    # If the downed node was the leader, trigger an immediate election attempt.
-    # HINT: if current_leader_node() == node or current_leader_node() == nil, do:
-    #   send(self(), :attempt_election)
+  def handle_info({:nodeup, _node}, state) do
+    # A node joined — no action needed for leadership.
     {:noreply, state}
   end
 
   @impl true
   def handle_info({:global_name_conflict, @leader_name}, state) do
-    # TODO:
     # We lost a post-netsplit conflict resolution — another process was chosen.
-    # 1. Log a warning: "Lost leadership via conflict resolution"
-    # 2. Set leader: false
-    # 3. {:noreply, new_state}
-    {:noreply, state}
+    Logger.warning("Lost leadership via conflict resolution")
+    {:noreply, %{state | leader: false}}
   end
 
   @impl true
   def handle_call(:leader?, _from, state) do
-    # TODO: verify against :global, not just local state — they can diverge
-    # HINT: actual = :global.whereis_name(@leader_name) == self()
-    #       {:reply, actual, %{state | leader: actual}}
-    {:reply, false, state}
+    # Verify against :global, not just local state — they can diverge
+    # after a conflict resolution or if the name was unregistered externally.
+    actual = :global.whereis_name(@leader_name) == self()
+    {:reply, actual, %{state | leader: actual}}
   end
 
   # ---------------------------------------------------------------------------
   # Private
   # ---------------------------------------------------------------------------
 
-  # TODO: implement resolve_conflict/3
-  # Strategy: node with lexicographically smaller name wins — deterministic and symmetric.
-  # HINT: defp resolve_conflict(_name, pid1, pid2) do
-  #         if to_string(node(pid1)) <= to_string(node(pid2)), do: pid1, else: pid2
-  #       end
+  # Conflict resolution: node with lexicographically smaller name wins.
+  # This is deterministic and symmetric — both nodes will agree on the winner.
+  defp resolve_conflict(_name, pid1, pid2) do
+    if to_string(node(pid1)) <= to_string(node(pid2)), do: pid1, else: pid2
+  end
 end
 ```
 
 ### Step 2: `lib/api_gateway/janitor/worker.ex`
 
-The janitor runs periodic cleanup tasks. Only the leader should run them.
+The janitor runs periodic cleanup tasks. Only the leader should run them — non-leader
+nodes skip the work. This prevents N-way duplication of expensive database operations.
 
 ```elixir
 defmodule ApiGateway.Janitor.Worker do
@@ -292,28 +324,49 @@ defmodule ApiGateway.Janitor.Worker do
 
   @impl true
   def init(_opts) do
-    # TODO: schedule the first task run
-    # HINT: Process.send_after(self(), :run_tasks, @task_interval_ms)
+    # Join the :pg group so the cluster can enumerate all janitor instances
+    :pg.join(ApiGateway.PG, :janitor_workers, self())
+
+    # Schedule the first task run
+    Process.send_after(self(), :run_tasks, @task_interval_ms)
     {:ok, %{tasks_run: 0}}
   end
 
   @impl true
   def handle_info(:run_tasks, state) do
-    # TODO:
-    # 1. Check if this node is the leader: ApiGateway.Cluster.Leader.leader?()
-    # 2. If leader: run each cleanup task (log + call private function)
-    # 3. If not leader: log debug "Skipping tasks — not the leader"
-    # 4. Reschedule
-    # 5. {:noreply, %{state | tasks_run: state.tasks_run + (if leader?, do: 1, else: 0)}}
-    {:noreply, state}
+    is_leader = ApiGateway.Cluster.Leader.leader?()
+
+    new_tasks_run =
+      if is_leader do
+        Logger.info("Janitor running cleanup tasks (leader on #{node()})")
+        purge_expired_audit_entries()
+        remove_stale_circuit_breakers()
+        state.tasks_run + 1
+      else
+        Logger.debug("Janitor skipping tasks — not the leader")
+        state.tasks_run
+      end
+
+    # Reschedule
+    Process.send_after(self(), :run_tasks, @task_interval_ms)
+    {:noreply, %{state | tasks_run: new_tasks_run}}
   end
 
   # ---------------------------------------------------------------------------
   # Private cleanup tasks
   # ---------------------------------------------------------------------------
 
-  # TODO: defp purge_expired_audit_entries, delete rows older than 90 days
-  # TODO: defp remove_stale_circuit_breakers, clean up workers with no traffic in 24h
+  defp purge_expired_audit_entries do
+    Logger.info("Purging audit entries older than 90 days")
+    # In production: Repo.delete_all(from a in AuditEntry, where: a.inserted_at < ^cutoff)
+    :ok
+  end
+
+  defp remove_stale_circuit_breakers do
+    Logger.info("Removing circuit breaker workers with no traffic in 24h")
+    # In production: query workers, check last activity, terminate stale ones
+    :ok
+  end
 end
 ```
 
@@ -325,13 +378,6 @@ end
   id:    ApiGateway.PG,
   start: {:pg, :start_link, [ApiGateway.PG]}
 }
-```
-
-Then register the janitor worker in its `:pg` group from `Janitor.Worker.init/1`:
-
-```elixir
-# In Janitor.Worker.init/1:
-:pg.join(ApiGateway.PG, :janitor_workers, self())
 ```
 
 ### Step 4: Given tests — must pass without modification

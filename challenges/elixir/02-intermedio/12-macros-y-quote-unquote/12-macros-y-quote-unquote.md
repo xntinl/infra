@@ -20,7 +20,7 @@ Project structure at this point:
 task_queue/
 ├── lib/
 │   └── task_queue/
-│       └── defhandler.ex    # ← you implement this
+│       └── defhandler.ex
 ├── test/
 │   └── task_queue/
 │       └── macros_test.exs  # given tests — must pass without modification
@@ -92,7 +92,7 @@ defmodule TaskQueue.Defhandler do
   end
 
   @doc """
-  Defines a `handle_job/2` function that wraps the body with:
+  Defines a `handle_job/1` function that wraps the body with:
   - Duration tracking (start/end monotonic time)
   - Error capture (exceptions become {:error, exception} return values)
   - Logging (job_id, duration_ms, outcome)
@@ -143,25 +143,47 @@ defmodule TaskQueue.Defhandler do
   # def supported?(_), do: false
   """
   defmacro defjob_type(types) do
-    # HINT: types is an AST node — use Macro.expand(types, __CALLER__) to evaluate it,
-    #   then Enum.map to generate one `def supported?(type), do: true` per type,
-    #   plus a catch-all `def supported?(_), do: false`
-    #
-    # The generated code looks like:
-    #   quote do
-    #     def supported?(:webhook), do: true
-    #     def supported?(:cron), do: true
-    #     def supported?(_), do: false
-    #   end
-    #
-    # HINT: use Enum.map over the evaluated types list, quoting each clause,
-    #   then use [clause_list | catch_all] to combine them into a block
-    # TODO: implement
+    evaluated_types = Macro.expand(types, __CALLER__)
+
+    clauses =
+      Enum.map(evaluated_types, fn type ->
+        quote do
+          def supported?(unquote(type)), do: true
+        end
+      end)
+
+    catch_all =
+      quote do
+        def supported?(_), do: false
+      end
+
+    {:__block__, [], clauses ++ [catch_all]}
   end
 end
 ```
 
-### Step 2: Example handler using the macros (not tested, for reference)
+The `defhandler/2` macro generates a `def handle_job/1` function clause that pattern
+matches on `%{type: handler_name}`. When the caller writes:
+
+```elixir
+defhandler :webhook, job do
+  {:ok, process(job.payload)}
+end
+```
+
+The macro expands to a full function definition that:
+1. Records the start time with `System.monotonic_time/1`.
+2. Wraps the user's body in a `try/rescue` to capture exceptions.
+3. Calculates the duration after execution.
+4. Logs the outcome with the handler name, job ID, and duration.
+5. Returns the result (either `{:ok, value}` or `{:error, exception}`).
+
+The `defjob_type/1` macro uses `Macro.expand/2` to evaluate the types list at compile
+time, then generates one `def supported?(type), do: true` clause per type, plus a
+catch-all `def supported?(_), do: false`. The `{:__block__, [], ...}` wrapping combines
+multiple AST nodes into a single block that Elixir can inject into the caller's module.
+
+### Step 2: Example handler using the macros (for reference)
 
 ```elixir
 defmodule TaskQueue.Handlers.WebhookHandler do

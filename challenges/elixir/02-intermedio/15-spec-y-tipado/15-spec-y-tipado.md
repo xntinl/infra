@@ -21,7 +21,7 @@ Project structure at this point:
 task_queue/
 ├── lib/
 │   └── task_queue/
-│       ├── scheduler.ex         # ← you add specs to this (new module)
+│       ├── scheduler.ex         # new module with full specs
 │       └── [all previous modules]
 ├── test/
 │   └── task_queue/
@@ -179,9 +179,15 @@ defmodule TaskQueue.Scheduler do
   end
 
   def apply_scaling(:scale_down, current) when current > @min_workers do
-    # HINT: get the first worker ID from WorkerPool, stop it, return -1
-    # If no workers, return 0
-    # TODO: implement
+    case TaskQueue.DynamicWorker.list_ids() do
+      [] ->
+        0
+
+      [first_id | _] ->
+        TaskQueue.WorkerPool.stop_worker(first_id)
+        Logger.info("Scheduler: scaled down, stopped worker #{first_id}")
+        -1
+    end
   end
 
   def apply_scaling(:hold, _current), do: 0
@@ -202,17 +208,24 @@ defmodule TaskQueue.Scheduler do
     if worker_ids == [] do
       []
     else
-      # Take min(batch_size, worker_count) items
       limit = min(batch_size, length(worker_ids))
 
       worker_ids
       |> Enum.take(limit)
       |> Enum.map(fn worker_id ->
         result = TaskQueue.DynamicWorker.process_job(worker_id)
-        # HINT: return a dispatch_outcome map
-        # TODO: implement
+
+        case result do
+          {:ok, _value} ->
+            %{job_id: "dispatched", worker_id: worker_id, result: result}
+
+          {:error, :empty} ->
+            nil
+
+          {:error, _reason} ->
+            %{job_id: "dispatched", worker_id: worker_id, result: result}
+        end
       end)
-      # Filter workers that had no job available
       |> Enum.reject(&is_nil/1)
     end
   end
@@ -227,6 +240,20 @@ defmodule TaskQueue.Scheduler do
   end
 end
 ```
+
+The type definitions at the top of the module serve two purposes: they document the
+data shapes for human readers, and they provide Dialyzer with precise enough information
+to detect mismatches. Using `required(:key)` in map types tells Dialyzer that these keys
+must always be present — accessing a missing key would be a type error.
+
+The `decide_scaling/2` function uses guards with module attributes (`@scale_up_threshold`,
+`@max_workers`) to encode the scaling policy. Each clause handles a specific condition,
+and the catch-all returns `:hold`. Dialyzer verifies that all possible combinations of
+`non_neg_integer()` arguments are handled.
+
+The `apply_scaling/2` function for `:scale_down` checks `list_ids()` to find a worker
+to stop, handling the edge case where no workers are registered despite `current > @min_workers`
+(which can happen due to race conditions between the count and the list operation).
 
 ### Step 3: Given tests — must pass without modification
 

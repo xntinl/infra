@@ -18,9 +18,9 @@ Project structure for this exercise:
 api_gateway_umbrella/apps/gateway_api/
 ├── lib/gateway_api_web/
 │   └── components/
-│       ├── metrics_table_component.ex     # ← you implement this
-│       ├── autocomplete_component.ex      # ← and this
-│       └── confirm_modal_component.ex     # ← and this
+│       ├── metrics_table_component.ex     # sortable, paginated table
+│       ├── autocomplete_component.ex      # search with debounce
+│       └── confirm_modal_component.ex     # reusable confirmation modal
 └── test/gateway_api_web/components/
     └── metrics_table_component_test.exs   # given tests
 ```
@@ -31,8 +31,8 @@ api_gateway_umbrella/apps/gateway_api/
 
 ```
 LiveView
-  └── LiveComponent (stateful, own event handling, no route)
-        └── function component (stateless, pure assigns → HTML)
+  +-- LiveComponent (stateful, own event handling, no route)
+        +-- function component (stateless, pure assigns -> HTML)
 ```
 
 Use a **LiveComponent** when:
@@ -69,6 +69,9 @@ without re-rendering the entire page.
 ## Implementation
 
 ### Step 1: `lib/gateway_api_web/components/metrics_table_component.ex`
+
+A sortable, paginated data table that manages its own sort order and page state.
+The parent provides `rows` and `columns`; the component handles all interaction.
 
 ```elixir
 defmodule GatewayApiWeb.MetricsTableComponent do
@@ -207,6 +210,9 @@ Usage in `DashboardLive`:
 
 ### Step 2: `lib/gateway_api_web/components/autocomplete_component.ex`
 
+A search input with debounce that calls a parent-provided `fetch_fn` to load suggestions.
+Selecting an item notifies the parent LiveView via `send(self(), ...)`.
+
 ```elixir
 defmodule GatewayApiWeb.AutocompleteComponent do
   use GatewayApiWeb, :live_component
@@ -218,10 +224,8 @@ defmodule GatewayApiWeb.AutocompleteComponent do
 
   @impl true
   def handle_event("search", %{"query" => q}, socket) when byte_size(q) >= 2 do
-    # TODO:
-    # 1. Call socket.assigns.fetch_fn.(q) to get suggestions
-    # 2. assign(socket, query: q, suggestions: suggestions, open: true)
-    {:noreply, socket}
+    suggestions = socket.assigns.fetch_fn.(q)
+    {:noreply, assign(socket, query: q, suggestions: suggestions, open: true)}
   end
 
   def handle_event("search", %{"query" => q}, socket) do
@@ -229,8 +233,7 @@ defmodule GatewayApiWeb.AutocompleteComponent do
   end
 
   def handle_event("select", %{"value" => value}, socket) do
-    # Notify the parent LiveView
-    # NOTE: self() here is the parent LiveView's PID — this is intentional
+    # Notify the parent LiveView. self() here is the parent's PID — this is intentional.
     send(self(), {:autocomplete_selected, socket.assigns.id, value})
     {:noreply, assign(socket, query: value, suggestions: [], open: false)}
   end
@@ -247,7 +250,7 @@ defmodule GatewayApiWeb.AutocompleteComponent do
         <input
           name="query"
           value={@query}
-          placeholder={assigns[:placeholder] || "Search…"}
+          placeholder={assigns[:placeholder] || "Search..."}
           phx-change="search"
           phx-debounce="300"
           phx-target={@myself}
@@ -256,7 +259,7 @@ defmodule GatewayApiWeb.AutocompleteComponent do
         />
         <%= if @query != "" do %>
           <button phx-click="clear" phx-target={@myself}
-                  class="text-gray-400 hover:text-gray-700 px-1">✕</button>
+                  class="text-gray-400 hover:text-gray-700 px-1">x</button>
         <% end %>
       </div>
 
@@ -290,6 +293,9 @@ end
 
 ### Step 3: `lib/gateway_api_web/components/confirm_modal_component.ex`
 
+A reusable confirmation modal. The parent opens it via `send_update/3` and
+receives `:modal_confirmed` or `:modal_closed` messages.
+
 ```elixir
 defmodule GatewayApiWeb.ConfirmModalComponent do
   use GatewayApiWeb, :live_component
@@ -322,7 +328,7 @@ defmodule GatewayApiWeb.ConfirmModalComponent do
           <div class="flex justify-between items-start mb-4">
             <h2 class="text-lg font-semibold"><%= assigns[:title] || "Confirm" %></h2>
             <button phx-click="close" phx-target={@myself}
-                    class="text-gray-400 hover:text-gray-600 text-xl leading-none">✕</button>
+                    class="text-gray-400 hover:text-gray-600 text-xl leading-none">x</button>
           </div>
 
           <div class="mb-6 text-gray-700">
@@ -476,7 +482,7 @@ updated rows. Use `assign(socket, assigns)` for parent-controlled data.
 
 **3. IDs that are not unique per instance**
 If two `MetricsTableComponent` instances both have `id="table"`, Phoenix maps their events
-to the same state. Always use IDs that are unique per page: `id={"table-#{@context}"`.
+to the same state. Always use IDs that are unique per page: `id={"table-#{@context}"}`.
 
 **4. `self()` confusion**
 Inside a LiveComponent, `self()` is the parent LiveView's PID. This means

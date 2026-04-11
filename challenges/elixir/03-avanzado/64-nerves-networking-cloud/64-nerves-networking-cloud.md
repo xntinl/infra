@@ -18,10 +18,10 @@ api_gateway/
 ├── lib/
 │   └── api_gateway/
 │       ├── network/
-│       │   ├── wifi_manager.ex         # ← you implement this
-│       │   └── telemetry_publisher.ex  # ← and this
+│       │   ├── wifi_manager.ex         # WiFi with exponential backoff
+│       │   └── telemetry_publisher.ex  # MQTT with offline buffer
 │       ├── fleet/
-│       │   └── identity.ex             # ← and this
+│       │   └── identity.ex             # MAC-based device identity
 │       └── application.ex              # update supervision tree
 ├── test/
 │   └── api_gateway/
@@ -52,7 +52,7 @@ reconnect at exactly the same time. If there are 200 devices with a 5-second bac
 200 TLS handshakes hit the MQTT broker at t=5, then again at t=10. This is the
 "thundering herd" problem and it can overload the broker faster than the original outage.
 
-Adding ±25% random jitter spreads reconnection attempts across the backoff window.
+Adding +/-25% random jitter spreads reconnection attempts across the backoff window.
 200 devices reconnect over a 5-second window instead of all at second 0.
 
 ---
@@ -98,10 +98,12 @@ defmodule ApiGateway.Fleet.Identity do
   end
 
   def mac_address(interface) do
-    # TODO: read /sys/class/net/<interface>/address
-    # TODO: return {:ok, trimmed_mac_string} or {:error, reason}
-    # HINT: File.read/1 returns {:ok, contents} or {:error, reason}
-    # HINT: String.trim/1 removes the trailing newline
+    path = "/sys/class/net/#{interface}/address"
+
+    case File.read(path) do
+      {:ok, contents} -> {:ok, String.trim(contents)}
+      {:error, reason} -> {:error, reason}
+    end
   end
 
   def device_info do
@@ -129,6 +131,15 @@ defmodule ApiGateway.Fleet.Identity do
 end
 ```
 
+The `mac_address/1` function reads the MAC address from the Linux sysfs filesystem.
+Every network interface exposes its hardware address at `/sys/class/net/<iface>/address`.
+`File.read/1` returns `{:ok, contents}` on success or `{:error, reason}` on failure
+(e.g., the interface does not exist). `String.trim/1` removes the trailing newline
+that Linux appends to sysfs files.
+
+When the MAC address is unavailable (e.g., on the host target during development),
+the fallback uses the system hostname.
+
 ### Step 3: `lib/api_gateway/network/wifi_manager.ex`
 
 ```elixir
@@ -137,8 +148,8 @@ defmodule ApiGateway.Network.WiFiManager do
   Manages WiFi connectivity with exponential backoff and jitter.
 
   Subscribes to VintageNet property changes instead of polling.
-  On :disconnected → schedules reconnect with exponential backoff.
-  On :internet/:lan → resets backoff counter.
+  On :disconnected -> schedules reconnect with exponential backoff.
+  On :internet/:lan -> resets backoff counter.
 
   Backoff formula: min(base * 2^attempt, max_backoff) + rand(0, backoff/4)
   The jitter prevents thundering herd when the entire fleet loses connectivity.
@@ -194,13 +205,16 @@ defmodule ApiGateway.Network.WiFiManager do
         {:noreply, %{state | attempt: 0, backoff_ms: @base_backoff_ms}}
 
       :disconnected ->
-        # TODO: cancel existing timer if any
-        # TODO: schedule reconnect after state.backoff_ms
-        # TODO: compute next_backoff = min(state.backoff_ms * 2, @max_backoff_ms)
-        # TODO: add jitter: :rand.uniform(div(next_backoff, 4))
-        # TODO: update state with new timer ref and next_backoff + jitter
-        Logger.warning("WiFi disconnected — attempt #{state.attempt + 1}")
-        {:noreply, state}
+        cancel_timer(state.timer)
+
+        next_backoff = min(state.backoff_ms * 2, @max_backoff_ms)
+        jitter = :rand.uniform(max(div(next_backoff, 4), 1))
+        delay = next_backoff + jitter
+
+        Logger.warning("WiFi disconnected — attempt #{state.attempt + 1}, retry in #{delay}ms")
+
+        timer = Process.send_after(self(), :reconnect, delay)
+        {:noreply, %{state | timer: timer, backoff_ms: next_backoff}}
 
       other ->
         Logger.debug("WiFi status: #{inspect(other)}")
@@ -225,8 +239,24 @@ defmodule ApiGateway.Network.WiFiManager do
       ipv4: %{method: :dhcp}
     })
   end
+
+  defp cancel_timer(nil), do: :ok
+  defp cancel_timer(ref), do: Process.cancel_timer(ref)
 end
 ```
+
+The `:disconnected` handler implements the core backoff logic:
+
+1. Cancel any existing reconnect timer to avoid duplicate reconnection attempts.
+2. Compute `next_backoff = min(current * 2, max)` — doubles each time, capped at 5 minutes.
+3. Add jitter: a random value between 0 and 25% of the backoff. `max(div(...), 1)` prevents
+   `:rand.uniform(0)` which would raise.
+4. Schedule the `:reconnect` message after the computed delay.
+5. Store the timer reference so it can be cancelled if another status change arrives
+   before the timer fires.
+
+The `:internet` / `:lan` handler resets the attempt counter and backoff to their
+initial values — the device is connected, so the next disconnection starts fresh.
 
 ### Step 4: `lib/api_gateway/network/telemetry_publisher.ex`
 
@@ -388,7 +418,6 @@ defmodule ApiGateway.Network.TelemetryPublisher do
             do_flush(%{state | buffer: rest, buffer_count: state.buffer_count - 1})
 
           {:error, _} ->
-            # Stop flushing, put the message back at the front
             %{state | buffer: :queue.in_r(msg, rest)}
         end
     end
@@ -400,6 +429,16 @@ defmodule ApiGateway.Network.TelemetryPublisher do
 end
 ```
 
+The buffer uses Erlang's `:queue` module which provides O(1) amortized enqueue and
+dequeue operations. When the buffer is full (`buffer_count >= @max_buffer`), the
+oldest message is dequeued and discarded before the new one is enqueued — maintaining
+FIFO order and bounded memory usage.
+
+The `flush_buffer/1` function drains the queue in order, publishing each message via
+MQTT. If a publish fails mid-flush, the undelivered message is pushed back to the
+front of the queue with `:queue.in_r/2` (insert at the rear of the "reverse" list,
+which is the front of the logical queue), preserving order for the next flush attempt.
+
 ### Step 5: Given tests — must pass without modification
 
 ```elixir
@@ -410,7 +449,6 @@ defmodule ApiGateway.Network.TelemetryPublisherTest do
   alias ApiGateway.Network.TelemetryPublisher
 
   setup do
-    # Override MQTT publish to a local function for testing
     Application.put_env(:api_gateway, :mqtt_publish_fn, fn _pid, _topic, msg, _opts ->
       send(:test_sink, {:published, msg})
       :ok
@@ -453,16 +491,13 @@ defmodule ApiGateway.Network.TelemetryPublisherTest do
       [host: "localhost", device_id: "test-003"]
     })
 
-    # Fill to max
     for i <- 1..500, do: TelemetryPublisher.publish(%{seq: i})
     Process.sleep(50)
 
-    # One more — should drop the oldest (seq: 1), keep this one
     TelemetryPublisher.publish(%{seq: :last})
     Process.sleep(50)
 
     state = :sys.get_state(pid)
-    # The last message must be in the buffer (at the rear of the queue)
     messages =
       state.buffer
       |> :queue.to_list()

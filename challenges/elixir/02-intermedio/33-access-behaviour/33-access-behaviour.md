@@ -95,28 +95,21 @@ defmodule TaskQueue.JobConfig.RetryPolicy do
     max_backoff_ms: pos_integer()
   }
 
-  # Access behaviour — exposes all three fields for path-based access
-
   @impl Access
   def fetch(policy, key) do
-    # TODO: use Map.fetch/2 on the struct converted to a map
-    # HINT: Map.fetch(Map.from_struct(policy), key)
+    Map.fetch(Map.from_struct(policy), key)
   end
 
   @impl Access
   def get_and_update(policy, key, fun) do
-    # TODO: use Map.get_and_update/3 on Map.from_struct, then wrap in struct
-    # HINT:
-    # {get, updated_map} = Map.get_and_update(Map.from_struct(policy), key, fun)
-    # {get, struct(__MODULE__, updated_map)}
+    {get, updated_map} = Map.get_and_update(Map.from_struct(policy), key, fun)
+    {get, struct(__MODULE__, updated_map)}
   end
 
   @impl Access
   def pop(policy, key) do
-    # TODO: use Map.pop/2 on Map.from_struct, wrap in struct
-    # HINT:
-    # {value, map} = Map.pop(Map.from_struct(policy), key)
-    # {value, struct(__MODULE__, map)}
+    {value, map} = Map.pop(Map.from_struct(policy), key)
+    {value, struct(__MODULE__, map)}
   end
 end
 
@@ -152,29 +145,26 @@ defmodule TaskQueue.JobConfig do
 
   @impl Access
   def fetch(config, key) when key in @accessible_keys do
-    # TODO: fetch the field from the struct
-    # HINT: Map.fetch(Map.from_struct(config), key)
+    Map.fetch(Map.from_struct(config), key)
   end
 
   def fetch(_config, _key), do: :error
 
   @impl Access
   def get_and_update(config, key, fun) when key in @accessible_keys do
-    # TODO: get and update the field, return {get_value, updated_config}
-    # HINT:
-    # {get, updated_map} = Map.get_and_update(Map.from_struct(config), key, fun)
-    # {get, struct(__MODULE__, updated_map)}
+    {get, updated_map} = Map.get_and_update(Map.from_struct(config), key, fun)
+    {get, struct(__MODULE__, updated_map)}
   end
 
   def get_and_update(config, _key, fun) do
-    # For inaccessible keys, call fun with nil to get the expected shape
     {get, _} = fun.(nil)
     {get, config}
   end
 
   @impl Access
   def pop(config, key) when key in @accessible_keys do
-    # TODO: pop the field and return {value, updated_config}
+    {value, map} = Map.pop(Map.from_struct(config), key)
+    {value, struct(__MODULE__, map)}
   end
 
   def pop(config, _key), do: {nil, config}
@@ -288,6 +278,24 @@ mix test test/task_queue/access_test.exs --trace
 
 Reflection question: `Access.all()` works on lists, not maps. If the job registry is `%{job_id => %JobConfig{}}`, how would you use `update_in` with a custom `Access` function to update the `retry.max_attempts` for every job in the registry simultaneously?
 
+Answer: You would define a custom access function that iterates over map values, similar to how `Access.all()` works for lists:
+
+```elixir
+def all_values do
+  fn :get, data, next ->
+    Enum.map(data, fn {_k, v} -> next.(v) end)
+  :get_and_update, data, next ->
+    Map.new(data, fn {k, v} ->
+      {get, updated} = next.(v)
+      {k, updated}
+    end)
+    |> then(fn new_map -> {Map.values(data), new_map} end)
+  end
+end
+
+update_in(registry, [all_values(), :retry, :max_attempts], &(&1 + 1))
+```
+
 ---
 
 ## Common production mistakes
@@ -298,8 +306,6 @@ Reflection question: `Access.all()` works on lists, not maps. If the job registr
 # Wrong — returns a plain map, not the struct
 def get_and_update(policy, key, fun) do
   Map.get_and_update(Map.from_struct(policy), key, fun)
-  # Returns {get_value, %{max_attempts: ..., backoff_ms: ...}}
-  # Callers expect a RetryPolicy struct
 end
 
 # Right — re-wrap in the struct
@@ -311,18 +317,7 @@ end
 
 **2. Implementing `Access` but not handling the `:pop` tuple from `get_and_update`**
 
-`fun` in `get_and_update/3` can return `{get_value, new_value}` OR `:pop`. If your implementation does not handle the `:pop` atom, `pop_in/2` will crash:
-
-```elixir
-def get_and_update(policy, key, fun) do
-  case Map.get_and_update(Map.from_struct(policy), key, fun) do
-    {get, map} -> {get, struct(__MODULE__, map)}
-    # Map.get_and_update handles :pop correctly — delegates it
-  end
-end
-```
-
-In practice, delegating entirely to `Map.get_and_update` handles this correctly.
+`fun` in `get_and_update/3` can return `{get_value, new_value}` OR `:pop`. If your implementation does not handle the `:pop` atom, `pop_in/2` will crash. Delegating entirely to `Map.get_and_update` handles this correctly.
 
 **3. Exposing all fields including internal ones**
 
@@ -349,4 +344,4 @@ def fetch(_config, _key), do: :error
 - [Access behaviour — official docs](https://hexdocs.pm/elixir/Access.html)
 - [get_in/put_in/update_in — Kernel docs](https://hexdocs.pm/elixir/Kernel.html#get_in/2)
 - [Access.key/2 — path helpers](https://hexdocs.pm/elixir/Access.html#key/2)
-- [Implementing Access — José Valim blog](https://dashbit.co/blog/access-and-struct-updates)
+- [Implementing Access — Jose Valim blog](https://dashbit.co/blog/access-and-struct-updates)

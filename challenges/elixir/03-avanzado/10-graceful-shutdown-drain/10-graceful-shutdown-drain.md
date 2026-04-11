@@ -110,6 +110,18 @@ terminate/2 runs (logs final state, nothing else needed)
 
 ### Step 1: Add drain logic to `Router`
 
+The Router uses `Process.flag(:trap_exit, true)` so the supervisor's shutdown signal
+arrives as a `{:EXIT, ...}` message in `handle_info` rather than killing the process
+outright. This gives the Router control over the shutdown sequence:
+
+1. Stop accepting new requests (return `{:error, :draining}`)
+2. Wait for in-flight requests to complete (tracked via MapSet)
+3. Schedule a drain timeout (if requests don't complete in time, stop anyway)
+4. When all active requests finish (or timeout fires), stop the process
+
+The `child_spec` sets `:shutdown` to 35 seconds (30s drain + 5s buffer) so the
+supervisor gives the Router enough time to finish in-flight work before force-killing.
+
 ```elixir
 # In lib/api_gateway/router.ex
 
@@ -124,9 +136,7 @@ defmodule ApiGateway.Router do
       id:       __MODULE__,
       start:    {__MODULE__, :start_link, [opts]},
       restart:  :permanent,
-      # TODO: set shutdown to @drain_timeout_ms + 5_000
-      # This gives the drain logic time to finish before the supervisor force-kills
-      shutdown: :timer.seconds(35),
+      shutdown: @drain_timeout_ms + 5_000,
       type:     :worker
     }
   end
@@ -136,17 +146,20 @@ defmodule ApiGateway.Router do
   end
 
   @doc "Returns :accepting or :draining."
+  @spec status() :: :accepting | :draining
   def status, do: GenServer.call(__MODULE__, :status)
 
   @doc "Simulates handling a new incoming request."
+  @spec handle_request(String.t(), (-> any())) :: {:ok, String.t()} | {:error, :draining}
   def handle_request(request_id, work_fn) do
     GenServer.call(__MODULE__, {:new_request, request_id, work_fn})
   end
 
   @impl true
   def init(_opts) do
-    # TODO: set trap_exit so shutdown arrives as {:EXIT, ...} message in handle_info
-    # HINT: Process.flag(:trap_exit, true)
+    # trap_exit ensures the supervisor's shutdown signal arrives as a message
+    # in handle_info rather than killing the process outright.
+    Process.flag(:trap_exit, true)
     {:ok, %{accepting: true, active: MapSet.new(), draining_ref: nil}}
   end
 
@@ -163,47 +176,42 @@ defmodule ApiGateway.Router do
 
   @impl true
   def handle_call({:new_request, request_id, work_fn}, _from, state) do
-    # TODO: launch work_fn in a Task (fire-and-forget)
-    # When the task finishes, it should send {:request_done, request_id} to self()
-    # Add request_id to state.active
-    # Reply {:ok, request_id}
+    # Launch work in a Task. When done, the task sends {:request_done, id} back.
     server = self()
     Task.start(fn ->
       work_fn.()
       send(server, {:request_done, request_id})
     end)
-    {:reply, {:ok, request_id},
-     %{state | active: MapSet.put(state.active, request_id)}}
+
+    new_state = %{state | active: MapSet.put(state.active, request_id)}
+    {:reply, {:ok, request_id}, new_state}
   end
 
   @impl true
   def handle_info({:request_done, request_id}, state) do
     new_active = MapSet.delete(state.active, request_id)
-    new_state  = %{state | active: new_active}
+    new_state = %{state | active: new_active}
 
-    # TODO: if draining and active is now empty, stop the process
-    # HINT:
-    #   if state.draining_ref && MapSet.size(new_active) == 0 do
-    #     {:stop, :shutdown, new_state}
-    #   else
-    #     {:noreply, new_state}
-    #   end
-    {:noreply, new_state}
+    # If we are draining and all active requests have finished, stop the process.
+    if state.draining_ref && MapSet.size(new_active) == 0 do
+      {:stop, :shutdown, new_state}
+    else
+      {:noreply, new_state}
+    end
   end
 
   @impl true
   def handle_info({:EXIT, _from, reason}, state) do
-    # TODO: stop accepting new requests
-    # If active is empty: stop immediately
-    # If active is non-empty: set draining mode, schedule a drain timeout
+    # Supervisor sent shutdown signal. Stop accepting new requests.
     Logger.info("Router draining #{MapSet.size(state.active)} active requests")
     new_state = %{state | accepting: false}
 
     if MapSet.size(state.active) == 0 do
+      # No active requests — stop immediately.
       {:stop, reason, new_state}
     else
-      # TODO: schedule drain timeout — if drain doesn't complete in time, force stop
-      # HINT: Process.send_after(self(), {:drain_timeout, reason}, @drain_timeout_ms)
+      # Active requests in flight — schedule a drain timeout.
+      Process.send_after(self(), {:drain_timeout, reason}, @drain_timeout_ms)
       {:noreply, %{new_state | draining_ref: reason}}
     end
   end
@@ -225,12 +233,16 @@ end
 
 ### Step 2: Add drain logic to `AuditWriter`
 
+The AuditWriter extends the back-pressure queue (exercise 04) with graceful shutdown.
+When the shutdown signal arrives, it stops accepting new entries and continues draining
+the internal queue. When the queue is empty (or a timeout fires), it stops.
+
 ```elixir
 # In lib/api_gateway/middleware/audit_writer.ex — extend existing module
 
 @impl true
 def init(_opts) do
-  # TODO: set trap_exit
+  Process.flag(:trap_exit, true)
   state = %{
     queue:      :queue.new(),
     depth:      0,
@@ -254,9 +266,10 @@ def handle_info({:EXIT, _from, reason}, state) do
     Process.send_after(self(), {:drain_timeout, reason}, 60_000)
     # Ensure drain loop is running
     if not state.processing do
-      send(self(), {:continue, :drain_internal})
+      {:noreply, %{new_state | processing: true}, {:continue, :drain}}
+    else
+      {:noreply, new_state}
     end
-    {:noreply, new_state}
   end
 end
 
@@ -268,24 +281,34 @@ end
 
 @impl true
 def handle_continue(:drain, state) do
-  # TODO: same drain logic as before, but when queue empties AND draining == true,
-  # call {:stop, :shutdown, state} instead of just setting processing: false
   case :queue.out(state.queue) do
     {:empty, _} ->
       if state.draining do
+        # Queue is empty and we are shutting down — stop the process.
         {:stop, :shutdown, %{state | processing: false}}
       else
         {:noreply, %{state | processing: false}}
       end
 
     {{:value, {entry, queued_at}}, rest} ->
-      # TODO: write entry, update stats, continue drain
-      {:noreply, state}
+      do_write(entry, queued_at)
+      new_state = %{state |
+        queue: rest,
+        depth: state.depth - 1,
+        processing: true,
+        stats: Map.update!(state.stats, :written, &(&1 + 1))
+      }
+      {:noreply, new_state, {:continue, :drain}}
   end
 end
 ```
 
 ### Step 3: `lib/api_gateway/cache/connection_pool.ex`
+
+The ConnectionPool demonstrates graceful shutdown for resource-managing processes.
+On shutdown, it immediately closes all available (not checked-out) connections and
+waits for checked-out connections to be returned. If connections are not returned
+within the timeout, it force-closes them.
 
 ```elixir
 defmodule ApiGateway.Cache.ConnectionPool do
@@ -310,14 +333,16 @@ defmodule ApiGateway.Cache.ConnectionPool do
   end
 
   @doc "Checks out a connection. Returns {:ok, ref, conn} or {:error, reason}."
+  @spec checkout() :: {:ok, reference(), map()} | {:error, atom()}
   def checkout, do: GenServer.call(__MODULE__, :checkout, 5_000)
 
   @doc "Returns a connection to the pool."
+  @spec checkin(reference()) :: :ok
   def checkin(ref), do: GenServer.cast(__MODULE__, {:checkin, ref})
 
   @impl true
   def init(pool_size) do
-    # TODO: set trap_exit
+    Process.flag(:trap_exit, true)
     connections = Enum.map(1..pool_size, &open_conn/1)
     {:ok, %{available: connections, checked_out: %{}, accepting: true, shutdown: false}}
   end
@@ -342,8 +367,6 @@ defmodule ApiGateway.Cache.ConnectionPool do
 
   @impl true
   def handle_cast({:checkin, ref}, state) do
-    # TODO: return connection to available pool
-    # If shutdown mode and checked_out becomes empty → {:stop, :shutdown, state}
     case Map.pop(state.checked_out, ref) do
       {nil, _} ->
         Logger.warning("Unknown checkin ref: #{inspect(ref)}")
@@ -354,6 +377,8 @@ defmodule ApiGateway.Cache.ConnectionPool do
           available:   [conn | state.available],
           checked_out: remaining
         }
+
+        # If in shutdown mode and all connections have been returned, stop.
         if state.shutdown && map_size(remaining) == 0 do
           {:stop, :shutdown, new_state}
         else
@@ -364,13 +389,12 @@ defmodule ApiGateway.Cache.ConnectionPool do
 
   @impl true
   def handle_info({:EXIT, _from, reason}, state) do
-    # TODO: close all available connections immediately
-    # If checked_out is empty: stop now
-    # Else: enter shutdown mode, schedule force-close timeout
+    # Close all available connections immediately — they are not in use.
     Enum.each(state.available, &close_conn/1)
     new_state = %{state | available: [], accepting: false, shutdown: true}
 
     if map_size(state.checked_out) == 0 do
+      # No checked-out connections — stop now.
       {:stop, reason, new_state}
     else
       Logger.info("Pool waiting for #{map_size(state.checked_out)} connections to be returned")

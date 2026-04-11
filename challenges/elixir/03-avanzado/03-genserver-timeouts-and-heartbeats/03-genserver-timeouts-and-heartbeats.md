@@ -96,6 +96,19 @@ That timer is the heartbeat.
 
 ### Step 1: Extend `CircuitBreaker.Worker` with heartbeat
 
+The heartbeat is an explicit `:timer.send_interval/2` timer that fires unconditionally
+every `@heartbeat_ms` milliseconds. Unlike the built-in GenServer inactivity timeout
+(exercise 01), this timer does NOT reset when the process handles messages — it fires
+on a fixed schedule regardless of activity.
+
+When the heartbeat fires and the circuit is `:open`, the worker checks whether enough
+time has passed since the circuit opened (`@recovery_window_ms`). If yes, it transitions
+to `:half_open` — a probe state where the next success closes the circuit and the next
+failure re-opens it.
+
+The timer ref is stored in state so we can cancel it in `terminate/2`, preventing
+orphan timer entries from accumulating across process restarts.
+
 ```elixir
 defmodule ApiGateway.CircuitBreaker.Worker do
   use GenServer
@@ -113,9 +126,16 @@ defmodule ApiGateway.CircuitBreaker.Worker do
     GenServer.start_link(__MODULE__, service_name)
   end
 
+  @spec record_success(pid()) :: :ok
   def record_success(pid), do: GenServer.cast(pid, :success)
+
+  @spec record_failure(pid()) :: :ok
   def record_failure(pid), do: GenServer.cast(pid, :failure)
+
+  @spec status(pid()) :: :closed | :open | :half_open
   def status(pid), do: GenServer.call(pid, :status)
+
+  @spec ping(pid()) :: :pong
   def ping(pid), do: GenServer.call(pid, :ping, 1_000)
 
   # ---------------------------------------------------------------------------
@@ -124,17 +144,20 @@ defmodule ApiGateway.CircuitBreaker.Worker do
 
   @impl true
   def init(service_name) do
-    # TODO: start the heartbeat timer with :timer.send_interval/2
-    # Store the timer ref in state so you can cancel it in terminate/2
-    #
-    # State fields:
-    #   :service       — service name (string)
-    #   :status        — :closed | :open | :half_open
-    #   :failures      — consecutive failure count
-    #   :opened_at     — monotonic timestamp when circuit opened (nil if closed)
-    #   :timer_ref     — ref returned by :timer.send_interval/2
-    #
-    # HINT: {:ok, timer_ref} = :timer.send_interval(@heartbeat_ms, :heartbeat)
+    # :timer.send_interval returns {:ok, timer_ref}. The timer fires every
+    # @heartbeat_ms regardless of message activity — this is not the same as
+    # the built-in GenServer inactivity timeout.
+    {:ok, timer_ref} = :timer.send_interval(@heartbeat_ms, :heartbeat)
+
+    state = %{
+      service: service_name,
+      status: :closed,
+      failures: 0,
+      opened_at: nil,
+      timer_ref: timer_ref
+    }
+
+    {:ok, state}
   end
 
   # ---------------------------------------------------------------------------
@@ -148,50 +171,89 @@ defmodule ApiGateway.CircuitBreaker.Worker do
 
   @impl true
   def handle_call(:ping, _from, state) do
-    # Used by the watchdog to verify the worker is alive and responsive
     {:reply, :pong, state}
   end
 
   @impl true
   def handle_cast(:success, state) do
-    # TODO: reset failures; if :half_open → :closed; log recovery
-    # HINT: if state.status == :half_open, log "circuit closed for #{state.service}"
+    new_status =
+      case state.status do
+        :half_open ->
+          Logger.info("Circuit closed for #{state.service}")
+          :closed
+
+        other ->
+          other
+      end
+
+    {:noreply, %{state | failures: 0, status: new_status}}
   end
 
   @impl true
   def handle_cast(:failure, state) do
-    # TODO:
-    # If :closed and failures + 1 >= @failure_threshold → open the circuit
-    # If :half_open → re-open the circuit
-    # If :open → do nothing (already open)
-    # Record opened_at when transitioning to :open
+    new_failures = state.failures + 1
+
+    new_state =
+      case state.status do
+        :closed when new_failures >= @failure_threshold ->
+          Logger.warning("Circuit opened for #{state.service} after #{new_failures} failures")
+          %{state | failures: new_failures, status: :open, opened_at: System.monotonic_time(:millisecond)}
+
+        :half_open ->
+          # Probe failed — re-open the circuit with a fresh recovery window
+          Logger.warning("Circuit re-opened for #{state.service} (probe failed)")
+          %{state | failures: new_failures, status: :open, opened_at: System.monotonic_time(:millisecond)}
+
+        _ ->
+          %{state | failures: new_failures}
+      end
+
+    {:noreply, new_state}
   end
 
   @impl true
   def handle_info(:heartbeat, %{status: :open} = state) do
-    # TODO: check if recovery window has elapsed
-    # If yes: transition to :half_open and log "probing #{state.service}"
-    # If no: stay :open
-    #
-    # HINT: System.monotonic_time(:millisecond) - state.opened_at >= @recovery_window_ms
+    # Check if the recovery window has elapsed since the circuit opened.
+    elapsed = System.monotonic_time(:millisecond) - state.opened_at
+
+    if elapsed >= @recovery_window_ms do
+      Logger.info("Probing #{state.service} — transitioning to half_open")
+      {:noreply, %{state | status: :half_open}}
+    else
+      {:noreply, state}
+    end
   end
 
   @impl true
   def handle_info(:heartbeat, state) do
-    # Not :open — nothing to do
+    # Not :open — nothing to do. The heartbeat fires regardless of state;
+    # we only act on it when the circuit is open.
     {:noreply, state}
   end
 
   @impl true
   def terminate(_reason, state) do
-    # TODO: cancel the heartbeat timer to avoid orphan timer entries
-    # HINT: :timer.cancel(state.timer_ref)
+    # Cancel the heartbeat timer to avoid orphan timer entries.
+    # Without this, each process restart creates a new timer while the
+    # old one keeps firing into the dead process's PID (which the BEAM
+    # may recycle for a new process).
+    :timer.cancel(state.timer_ref)
     :ok
   end
 end
 ```
 
 ### Step 2: `lib/api_gateway/circuit_breaker/watchdog.ex`
+
+The watchdog periodically health-checks all circuit breaker workers in parallel. If a
+worker is unresponsive (ping times out or the process is dead), the watchdog kills it
+and asks the DynamicSupervisor to restart it, then updates its internal registry with
+the new PID.
+
+The key design decision: health checks run in parallel via `Task.async_stream`, not
+sequentially. With a 1-second ping timeout and 20 workers, sequential checks would take
+up to 20 seconds — longer than the check interval itself. Parallel checks take at most
+1 × timeout regardless of worker count.
 
 ```elixir
 defmodule ApiGateway.CircuitBreaker.Watchdog do
@@ -214,6 +276,7 @@ defmodule ApiGateway.CircuitBreaker.Watchdog do
   end
 
   @doc "Returns current {service_name => pid} registry."
+  @spec registry() :: %{String.t() => pid()}
   def registry, do: GenServer.call(__MODULE__, :registry)
 
   # ---------------------------------------------------------------------------
@@ -225,9 +288,7 @@ defmodule ApiGateway.CircuitBreaker.Watchdog do
     supervisor = Keyword.fetch!(opts, :supervisor)
     registry   = Keyword.get(opts, :registry, %{})
 
-    # TODO: schedule the health check loop
-    # HINT: {:ok, _ref} = :timer.send_interval(@check_interval_ms, :health_check)
-
+    {:ok, _ref} = :timer.send_interval(@check_interval_ms, :health_check)
     {:ok, %{supervisor: supervisor, registry: registry}}
   end
 
@@ -242,20 +303,56 @@ defmodule ApiGateway.CircuitBreaker.Watchdog do
 
   @impl true
   def handle_info(:health_check, state) do
-    # TODO: check all workers in parallel using Task.async_stream/3
-    # For each worker:
-    #   1. Call Worker.ping(pid) with @ping_timeout_ms
-    #   2. If it returns :pong → healthy, keep in registry
-    #   3. If it raises/exits → unresponsive:
-    #      a. Kill the worker: Process.exit(pid, :kill)
-    #      b. Restart via DynamicSupervisor.start_child(state.supervisor, ...)
-    #      c. If restart succeeds → update registry with new pid
-    #      d. If restart fails → log error and remove from registry
-    #
-    # HINT: use Task.async_stream with max_concurrency: map_size(state.registry)
-    # HINT: catch errors with on_timeout: :kill_task and handle {:exit, reason}
-    #
-    # Return {:noreply, %{state | registry: updated_registry}}
+    updated_registry =
+      state.registry
+      |> Task.async_stream(
+        fn {name, pid} -> {name, pid, check_worker(pid)} end,
+        max_concurrency: max(map_size(state.registry), 1),
+        timeout: @ping_timeout_ms + 500,
+        on_timeout: :kill_task
+      )
+      |> Enum.reduce(state.registry, fn result, reg ->
+        handle_check_result(result, reg, state.supervisor)
+      end)
+
+    {:noreply, %{state | registry: updated_registry}}
+  end
+
+  # ---------------------------------------------------------------------------
+  # Private helpers
+  # ---------------------------------------------------------------------------
+
+  defp check_worker(pid) do
+    try do
+      GenServer.call(pid, :ping, @ping_timeout_ms)
+      :healthy
+    catch
+      :exit, _ -> :unresponsive
+    end
+  end
+
+  defp handle_check_result({:ok, {_name, _pid, :healthy}}, registry, _sup) do
+    registry
+  end
+
+  defp handle_check_result({:ok, {name, pid, :unresponsive}}, registry, sup) do
+    Logger.warning("Watchdog: #{name} unresponsive — restarting")
+    Process.exit(pid, :kill)
+
+    case DynamicSupervisor.start_child(sup, {ApiGateway.CircuitBreaker.Worker, name}) do
+      {:ok, new_pid} ->
+        Logger.info("Watchdog: #{name} restarted as #{inspect(new_pid)}")
+        Map.put(registry, name, new_pid)
+
+      {:error, reason} ->
+        Logger.error("Watchdog: failed to restart #{name}: #{inspect(reason)}")
+        Map.delete(registry, name)
+    end
+  end
+
+  defp handle_check_result({:exit, reason}, registry, _sup) do
+    Logger.error("Watchdog: health check task crashed: #{inspect(reason)}")
+    registry
   end
 end
 ```

@@ -48,7 +48,7 @@ docker run -p 8080:8080 -p 8081:8081 --pull always ghcr.io/livebook-dev/livebook
 
 # Connecting to a remote production node:
 # 1. In vm.args: -name api_gateway@10.0.0.1 -setcookie my-secret-cookie
-# 2. In Livebook: "Runtime Settings" → "Attached Node"
+# 2. In Livebook: "Runtime Settings" -> "Attached Node"
 # 3. Enter node name and cookie
 ```
 
@@ -68,20 +68,43 @@ Mix.install([
 ```
 
 ```elixir
-# Cell: Top 20 processes by memory — implement this
-# TODO:
-# 1. Process.list() — get all PIDs
-# 2. For each pid: Process.info(pid, [:registered_name, :memory, :message_queue_len, :reductions])
-# 3. Build a list of maps with pid, name, memory_kb, msg_queue, reductions
-# 4. Sort by memory_kb descending, take 20
-# 5. Render with Kino.DataTable.new/2
-#
-# HINT: Process.info/2 returns nil if the process died between listing and inspection
-# HINT: filter out nils before building maps
+# Cell: Top 20 processes by memory
+# Iterates all processes, collects memory and message queue info,
+# and renders a sortable table of the top 20 memory consumers.
+process_data =
+  Process.list()
+  |> Enum.map(fn pid ->
+    case Process.info(pid, [:registered_name, :memory, :message_queue_len, :reductions]) do
+      nil ->
+        # Process died between listing and inspection — skip it
+        nil
+
+      info ->
+        name =
+          case info[:registered_name] do
+            [] -> inspect(pid)
+            name -> inspect(name)
+          end
+
+        %{
+          pid: inspect(pid),
+          name: name,
+          memory_kb: Float.round(info[:memory] / 1024, 1),
+          msg_queue: info[:message_queue_len],
+          reductions: info[:reductions]
+        }
+    end
+  end)
+  |> Enum.reject(&is_nil/1)
+  |> Enum.sort_by(& &1.memory_kb, :desc)
+  |> Enum.take(20)
+
+Kino.DataTable.new(process_data, name: "Top 20 Processes by Memory")
 ```
 
 ```elixir
 # Cell: api_gateway supervisor tree
+# Recursively walks the supervisor tree and renders it as an interactive tree widget.
 defmodule TreeInspector do
   def build(sup_pid) do
     children = Supervisor.which_children(sup_pid)
@@ -112,24 +135,51 @@ defmodule TreeInspector do
   end
 end
 
-# TODO: replace with the actual top-level supervisor of api_gateway
 tree = TreeInspector.build(Process.whereis(ApiGateway.Supervisor))
 Kino.Tree.new(tree)
 ```
 
 ```elixir
-# Cell: ETS tables — view rate-limiter state
-# TODO:
-# 1. :ets.all() — list all ETS tables
-# 2. For each table: :ets.info(table, :name), :ets.info(table, :size), :ets.info(table, :memory)
-# 3. Render as Kino.DataTable
+# Cell: ETS tables — view all tables with size and memory usage
+ets_data =
+  :ets.all()
+  |> Enum.map(fn table ->
+    %{
+      name: :ets.info(table, :name),
+      size: :ets.info(table, :size),
+      memory_kb: Float.round(:ets.info(table, :memory) * :erlang.system_info(:wordsize) / 1024, 1),
+      type: :ets.info(table, :type),
+      protection: :ets.info(table, :protection)
+    }
+  end)
+  |> Enum.sort_by(& &1.memory_kb, :desc)
+
+Kino.DataTable.new(ets_data, name: "ETS Tables")
 ```
 
 ```elixir
 # Cell: Auto-refresh process table every 5 seconds
-# TODO:
-# Use Kino.animate/2 to re-execute the process inspection cell every 5000ms
-# HINT: Kino.animate(5_000, fn _ -> ... Kino.DataTable.new(...) end)
+# Uses Kino.animate to re-execute the process inspection on a timer.
+Kino.animate(5_000, fn _iteration ->
+  data =
+    Process.list()
+    |> Enum.map(fn pid ->
+      case Process.info(pid, [:registered_name, :memory, :message_queue_len]) do
+        nil -> nil
+        info ->
+          name = case info[:registered_name] do
+            [] -> inspect(pid)
+            n -> inspect(n)
+          end
+          %{name: name, memory_kb: Float.round(info[:memory] / 1024, 1), msg_queue: info[:message_queue_len]}
+      end
+    end)
+    |> Enum.reject(&is_nil/1)
+    |> Enum.sort_by(& &1.memory_kb, :desc)
+    |> Enum.take(10)
+
+  Kino.DataTable.new(data, name: "Top 10 (live)")
+end)
 ```
 
 ---
@@ -149,43 +199,137 @@ alias VegaLite, as: Vl
 
 ```elixir
 # Cell: Telemetry collector GenServer
-# TODO: implement a GenServer that:
-# 1. Attaches to [:api_gateway, :http_client, :request] telemetry events
-# 2. Stores the last 1000 samples as a list of maps with event, duration_ms, status, host
-# 3. Exposes get_samples/0 for reading
-# 4. Starts with GenServer.start_link without supervision (notebook-local process)
-#
-# HINT: see the MetricsCollector pattern from the original exercise 49
+# A notebook-local process that attaches to gateway telemetry events
+# and stores the last 1000 samples for charting.
+defmodule MetricsCollector do
+  use GenServer
+
+  @max_samples 1_000
+
+  def start_link, do: GenServer.start_link(__MODULE__, [], name: __MODULE__)
+  def get_samples, do: GenServer.call(__MODULE__, :get_samples)
+
+  @impl true
+  def init(_) do
+    :telemetry.attach(
+      "notebook-metrics-collector",
+      [:api_gateway, :http_client, :request],
+      &__MODULE__.handle_telemetry/4,
+      nil
+    )
+    {:ok, %{samples: []}}
+  end
+
+  @impl true
+  def handle_call(:get_samples, _from, state) do
+    {:reply, state.samples, state}
+  end
+
+  @impl true
+  def handle_cast({:sample, sample}, state) do
+    samples = Enum.take([sample | state.samples], @max_samples)
+    {:noreply, %{state | samples: samples}}
+  end
+
+  def handle_telemetry(_event, %{duration: dur}, meta, _config) do
+    ms = System.convert_time_unit(dur, :native, :millisecond)
+    sample = %{
+      ts: DateTime.utc_now(),
+      duration_ms: ms,
+      status: meta[:status] || 0,
+      host: meta[:host] || "unknown"
+    }
+    GenServer.cast(__MODULE__, {:sample, sample})
+  end
+end
+
+{:ok, _} = MetricsCollector.start_link()
+Kino.Markdown.new("MetricsCollector started. Collecting telemetry samples...")
 ```
 
 ```elixir
 # Cell: Real-time HTTP request latency chart (line chart)
-# TODO:
-# 1. Create a VegaLite chart spec: x = timestamp (temporal), y = duration_ms (quantitative)
-# 2. Wrap it with Kino.VegaLite.new/1
-# 3. Use Kino.animate/2 to push new data every 2 seconds
-#
-# HINT: Kino.VegaLite.push_many/2 appends data points without rebuilding the chart
+# Creates a live-updating line chart that shows request latency over time.
+chart =
+  Vl.new(width: 600, height: 300, title: "HTTP Request Latency (ms)")
+  |> Vl.mark(:line)
+  |> Vl.encode_field(:x, "ts", type: :temporal, title: "Time")
+  |> Vl.encode_field(:y, "duration_ms", type: :quantitative, title: "Latency (ms)")
+  |> Vl.encode_field(:color, "host", type: :nominal)
+  |> Kino.VegaLite.new()
+
+# Push new data every 2 seconds
+Kino.animate(2_000, fn _i ->
+  samples = MetricsCollector.get_samples() |> Enum.take(50)
+
+  data =
+    Enum.map(samples, fn s ->
+      %{"ts" => DateTime.to_iso8601(s.ts), "duration_ms" => s.duration_ms, "host" => s.host}
+    end)
+
+  unless data == [] do
+    Kino.VegaLite.push_many(chart, data, window: 100)
+  end
+
+  chart
+end)
 ```
 
 ```elixir
 # Cell: Circuit breaker status per host
-# TODO: read from ETS table :circuit_breaker
-# Show a table with: host, state (:closed/:open/:half_open), opened_at (if open)
-# Render as Kino.DataTable
+# Reads from the :circuit_breaker ETS table and displays current state per host.
+cb_data =
+  case :ets.whereis(:circuit_breaker) do
+    :undefined ->
+      [%{host: "(table not found)", state: "n/a", opened_at: "n/a"}]
+
+    _ref ->
+      :ets.tab2list(:circuit_breaker)
+      |> Enum.filter(fn entry -> is_binary(elem(entry, 0)) end)
+      |> Enum.map(fn {host, state, meta} ->
+        %{
+          host: host,
+          state: state,
+          opened_at: if(state == :open, do: "#{System.monotonic_time(:millisecond) - meta}ms ago", else: "n/a")
+        }
+      end)
+  end
+
+Kino.DataTable.new(cb_data, name: "Circuit Breaker Status")
 ```
 
 ```elixir
 # Cell: HTTP status distribution (pie chart)
-# TODO:
-# 1. Get samples from MetricsCollector
-# 2. Group by status code bucket (2xx, 4xx, 5xx, circuit_open)
-# 3. Render as VegaLite arc/pie mark
+# Groups collected samples by status code bucket and renders a pie chart.
+samples = MetricsCollector.get_samples()
+
+status_groups =
+  samples
+  |> Enum.group_by(fn s ->
+    cond do
+      s.status >= 200 and s.status < 300 -> "2xx"
+      s.status >= 400 and s.status < 500 -> "4xx"
+      s.status >= 500 -> "5xx"
+      s.status == 0 -> "circuit_open"
+      true -> "other"
+    end
+  end)
+  |> Enum.map(fn {bucket, items} -> %{"bucket" => bucket, "count" => length(items)} end)
+
+Vl.new(width: 300, height: 300, title: "Status Distribution")
+|> Vl.data_from_values(status_groups)
+|> Vl.mark(:arc, inner_radius: 50)
+|> Vl.encode_field(:theta, "count", type: :quantitative)
+|> Vl.encode_field(:color, "bucket", type: :nominal)
 ```
 
 ---
 
 ## Notebook 3 — Oban Analysis (`03_oban_analysis.livemd`)
+
+**Note**: This notebook requires a live DB connection. It queries Oban job history directly
+from PostgreSQL via `GatewayCore.Repo`. When running in Livebook, attach to a node that
+has the Repo started, or configure a standalone Repo connection.
 
 ```elixir
 # Cell: Setup
@@ -206,55 +350,95 @@ alias Explorer.Series
 # Cell: Load Oban job history from DB as a DataFrame
 import Ecto.Query
 
-# TODO:
-# 1. Query Oban.Job for jobs in the last 7 days
-#    Select: worker, queue, state, attempt, inserted_at, completed_at
-# 2. Calculate duration_ms from completed_at - attempted_at
-# 3. Convert to Explorer.DataFrame
-#
-# HINT:
-# from(j in Oban.Job,
-#   where: j.inserted_at > ago(7, "day"),
-#   select: %{worker: j.worker, queue: j.queue, state: j.state, ...}
-# ) |> GatewayCore.Repo.all()
+jobs =
+  from(j in "oban_jobs",
+    where: j.inserted_at > ago(7, "day"),
+    select: %{
+      worker: j.worker,
+      queue: j.queue,
+      state: j.state,
+      attempt: j.attempt,
+      inserted_at: j.inserted_at,
+      completed_at: j.completed_at,
+      attempted_at: j.attempted_at
+    }
+  )
+  |> GatewayCore.Repo.all()
+  |> Enum.map(fn row ->
+    duration_ms =
+      if row.completed_at && row.attempted_at do
+        DateTime.diff(row.completed_at, row.attempted_at, :millisecond)
+      else
+        nil
+      end
+
+    Map.put(row, :duration_ms, duration_ms)
+  end)
+
+df = DataFrame.new(jobs)
+Kino.DataTable.new(df, name: "Oban Jobs (last 7 days)")
 ```
 
 ```elixir
 # Cell: Worker performance summary table
-# TODO:
-# df
-# |> DataFrame.group_by(["worker", "state"])
-# |> DataFrame.summarise(
-#     count:        count(col("worker")),
-#     avg_duration: mean(col("duration_ms")),
-#     p95_duration: quantile(col("duration_ms"), 0.95)
-#    )
-# |> DataFrame.sort_by(desc: col("count"))
-# |> Kino.DataTable.new(name: "Worker Performance (last 7 days)")
+# Groups jobs by worker and state, computes count, average duration, and p95 duration.
+summary =
+  df
+  |> DataFrame.group_by(["worker", "state"])
+  |> DataFrame.summarise(
+    count: count(col("worker")),
+    avg_duration: mean(col("duration_ms")),
+    p95_duration: quantile(col("duration_ms"), 0.95)
+  )
+  |> DataFrame.sort_by(desc: col("count"))
+
+Kino.DataTable.new(summary, name: "Worker Performance (last 7 days)")
 ```
 
 ```elixir
 # Cell: Failed jobs bar chart
-# TODO:
-# 1. Filter df where state == "discarded"
-# 2. Group by worker, count failures
-# 3. Render as VegaLite bar chart with red fill, sorted by count descending
+# Filters discarded jobs and renders a bar chart of failure counts per worker.
+failed =
+  df
+  |> DataFrame.filter(col("state") == "discarded")
+  |> DataFrame.group_by("worker")
+  |> DataFrame.summarise(failures: count(col("worker")))
+  |> DataFrame.sort_by(desc: col("failures"))
+  |> DataFrame.to_rows()
+
+Vl.new(width: 500, height: 300, title: "Failed Jobs by Worker")
+|> Vl.data_from_values(failed)
+|> Vl.mark(:bar, color: "#e74c3c")
+|> Vl.encode_field(:x, "worker", type: :nominal, sort: "-y", title: "Worker")
+|> Vl.encode_field(:y, "failures", type: :quantitative, title: "Failures")
 ```
 
 ```elixir
-# Cell: Job throughput heatmap (hour of day × day of week)
-# TODO:
-# 1. DataFrame.mutate to extract hour and weekday from inserted_at
-# 2. Group by [hour, weekday], count jobs
-# 3. Render as VegaLite rect mark (heatmap)
+# Cell: Job throughput heatmap (hour of day x day of week)
+# Extracts hour and weekday from inserted_at, groups, and renders a heatmap.
+heatmap_data =
+  df
+  |> DataFrame.mutate(
+    hour: Explorer.Series.hour(col("inserted_at")),
+    weekday: Explorer.Series.day_of_week(col("inserted_at"))
+  )
+  |> DataFrame.group_by(["hour", "weekday"])
+  |> DataFrame.summarise(job_count: count(col("worker")))
+  |> DataFrame.to_rows()
+
+Vl.new(width: 500, height: 300, title: "Job Throughput Heatmap")
+|> Vl.data_from_values(heatmap_data)
+|> Vl.mark(:rect)
+|> Vl.encode_field(:x, "hour", type: :ordinal, title: "Hour of Day")
+|> Vl.encode_field(:y, "weekday", type: :ordinal, title: "Day of Week")
+|> Vl.encode_field(:color, "job_count", type: :quantitative, title: "Jobs")
 ```
 
 ```elixir
 # Cell: Export analysis to CSV
-# TODO:
-# summary = ... (the worker performance DataFrame from above)
-# DataFrame.to_csv!(summary, "/tmp/oban_analysis_#{Date.utc_today()}.csv")
-# Kino.Markdown.new("Saved to /tmp/oban_analysis_*.csv")
+filename = "/tmp/oban_analysis_#{Date.utc_today()}.csv"
+DataFrame.to_csv!(summary, filename)
+Kino.Markdown.new("Saved to `#{filename}`")
 ```
 
 ---
@@ -268,20 +452,51 @@ Mix.install([{:kino, "~> 0.12"}])
 
 ```elixir
 # Cell: GenServer state inspector form
-# TODO:
-# 1. Kino.Control.form with:
-#    - module: Kino.Input.text("Module name", default: "ApiGateway.Cache.Server")
-#    - include_state: Kino.Input.checkbox("Include full state (may be large)")
-# 2. Kino.listen/2 on the form:
-#    - String.to_existing_atom("Elixir." <> data.module) to get the module
-#    - Process.whereis/1 to get the PID
-#    - Process.info/2 for [:memory, :message_queue_len, :reductions, :status]
-#    - :sys.get_state/1 if include_state is checked
-#    - Render with Kino.Tree.new/1
-#
-# DESIGN NOTE: String.to_existing_atom/1 is safe here — it only works for atoms
-# already in the atom table (i.e., modules that have been loaded). Never use
-# String.to_atom/1 with user input in production code.
+# Interactive form to inspect any named GenServer's process info and optionally its state.
+form = Kino.Control.form(
+  [
+    module: Kino.Input.text("Module name", default: "ApiGateway.Cache.Server"),
+    include_state: Kino.Input.checkbox("Include full state (may be large)")
+  ],
+  submit: "Inspect"
+)
+
+Kino.listen(form, fn %{data: %{module: module_name, include_state: include_state}} ->
+  try do
+    mod = String.to_existing_atom("Elixir." <> module_name)
+    pid = Process.whereis(mod)
+
+    if pid do
+      info = Process.info(pid, [:memory, :message_queue_len, :reductions, :status])
+
+      result = %{
+        module: module_name,
+        pid: inspect(pid),
+        memory_kb: Float.round(info[:memory] / 1024, 1),
+        message_queue: info[:message_queue_len],
+        reductions: info[:reductions],
+        status: info[:status]
+      }
+
+      result =
+        if include_state do
+          state = :sys.get_state(pid)
+          Map.put(result, :state, state)
+        else
+          result
+        end
+
+      Kino.Tree.new(result)
+    else
+      Kino.Markdown.new("**Process `#{module_name}` not found** (not registered or not started)")
+    end
+  rescue
+    ArgumentError ->
+      Kino.Markdown.new("**Module `#{module_name}` does not exist** (atom not in table)")
+  end
+end)
+
+form
 ```
 
 ```elixir
@@ -292,10 +507,26 @@ form = Kino.Control.form(
 )
 
 Kino.listen(form, fn %{data: %{client_id: client_id}} ->
-  # TODO:
-  # 1. :ets.lookup(:rate_limiter_windows, client_id) — from exercise 71
-  # 2. Show all timestamps in the window as a table
-  # 3. Show how many requests remain before the limit is reached
+  case :ets.whereis(:rate_limiter_windows) do
+    :undefined ->
+      Kino.Markdown.new("**:rate_limiter_windows table not found**")
+
+    _ref ->
+      entries = :ets.lookup(:rate_limiter_windows, client_id)
+
+      if entries == [] do
+        Kino.Markdown.new("No entries found for client `#{client_id}`")
+      else
+        timestamps =
+          Enum.flat_map(entries, fn {_key, ts_list} ->
+            Enum.map(List.wrap(ts_list), fn ts ->
+              %{client_id: client_id, timestamp: ts}
+            end)
+          end)
+
+        Kino.DataTable.new(timestamps, name: "Rate Limiter Entries for #{client_id}")
+      end
+  end
 end)
 
 form
@@ -303,15 +534,32 @@ form
 
 ```elixir
 # Cell: System health snapshot (refresh button)
-# TODO:
-# 1. Kino.Control.button("Refresh")
-# 2. Kino.listen/2: collect the following metrics and render as Kino.Tree:
-#    - node()
-#    - uptime: :erlang.statistics(:wall_clock) |> elem(0) |> div(1000)
-#    - process_count: length(Process.list())
-#    - memory: :erlang.memory() — total, processes, ets, binary (all in MB)
-#    - scheduler_utilization: :scheduler.utilization(1) (if available)
-#    - run_queue: :erlang.statistics(:run_queue)
+# One-click button that collects BEAM-level health metrics and renders them.
+button = Kino.Control.button("Refresh")
+
+Kino.listen(button, fn _event ->
+  {uptime_ms, _} = :erlang.statistics(:wall_clock)
+  memory = :erlang.memory()
+  run_queue = :erlang.statistics(:run_queue)
+
+  snapshot = %{
+    node: node(),
+    uptime_seconds: div(uptime_ms, 1000),
+    process_count: length(Process.list()),
+    memory: %{
+      total_mb: Float.round(memory[:total] / 1_048_576, 1),
+      processes_mb: Float.round(memory[:processes] / 1_048_576, 1),
+      ets_mb: Float.round(memory[:ets] / 1_048_576, 1),
+      binary_mb: Float.round(memory[:binary] / 1_048_576, 1)
+    },
+    run_queue: run_queue,
+    schedulers_online: :erlang.system_info(:schedulers_online)
+  }
+
+  Kino.Tree.new(snapshot)
+end)
+
+button
 ```
 
 ---
@@ -324,7 +572,7 @@ Livebook notebooks don't use ExUnit, but each notebook must satisfy these manual
 - `Kino.DataTable` renders a visible, sortable table with at least one row of data
 - `Kino.animate/2` cells update visibly after the configured interval
 - The form in Notebook 4 responds to input within 500ms
-- Notebook 3's DataFrame cells require a live DB connection — document this in a Markdown cell
+- Notebook 3's DataFrame cells require a live DB connection — documented in a Markdown cell
 
 ---
 

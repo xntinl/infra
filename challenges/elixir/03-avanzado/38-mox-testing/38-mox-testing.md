@@ -87,6 +87,10 @@ end
 
 ### Step 2: `lib/api_gateway/notifications/slack_behaviour.ex`
 
+The behaviour defines the contract that both the real client and the mock must satisfy.
+Each callback has a full typespec, which Dialyzer uses to verify that callers match the
+expected argument and return types.
+
 ```elixir
 defmodule ApiGateway.Notifications.SlackBehaviour do
   @moduledoc """
@@ -106,22 +110,23 @@ end
 
 ### Step 3: `lib/api_gateway/notifications/slack_client.ex`
 
+The real Slack client implements the behaviour. In production, this would use `Req` or
+`HTTPoison` to call the Slack Web API. The placeholder implementation logs and returns
+success so the module compiles and satisfies the behaviour contract.
+
 ```elixir
 defmodule ApiGateway.Notifications.SlackClient do
   @moduledoc "Real Slack client. Makes HTTP calls to the Slack Web API."
   @behaviour ApiGateway.Notifications.SlackBehaviour
 
-  # TODO: implement using Req or HTTPoison
-  # For now, placeholder implementations that log and return success
+  @impl true
   def send_message(channel, text) do
-    # TODO: POST to https://slack.com/api/chat.postMessage
-    # return {:ok, %{ts: "...", channel: channel}} on success
     IO.puts("[Slack] #{channel}: #{text}")
     {:ok, %{ts: "#{System.system_time(:second)}.000", channel: channel}}
   end
 
+  @impl true
   def upload_file(channel, filename, _content) do
-    # TODO: POST to https://slack.com/api/files.upload
     IO.puts("[Slack] upload #{filename} to #{channel}")
     {:ok, %{file_id: "F#{:erlang.phash2(filename)}"}}
   end
@@ -129,6 +134,11 @@ end
 ```
 
 ### Step 4: `lib/api_gateway/notifications/ops_notifier.ex`
+
+The OpsNotifier contains the business logic. It depends on a SlackBehaviour implementation
+injected via Application config. The `with` expression in `payment_recovered/1` ensures that
+`upload_file` is only called if `send_message` succeeds — this is the key behavior that
+the Mox tests verify.
 
 ```elixir
 defmodule ApiGateway.Notifications.OpsNotifier do
@@ -168,6 +178,9 @@ end
 ```
 
 ### Step 5: `test/test_helper.exs` additions
+
+The `defmock` call creates a module that implements all callbacks from the behaviour.
+It must run exactly once per test suite — placing it in `test_helper.exs` guarantees this.
 
 ```elixir
 # Add to test/test_helper.exs — defmock must run exactly once per test suite
@@ -338,5 +351,5 @@ it, creating a false sense of parity. Run `mix compile --warnings-as-errors` in 
 
 - [Mox — HexDocs](https://hexdocs.pm/mox/Mox.html)
 - [Mox — GitHub](https://github.com/dashbitco/mox)
-- [José Valim — Mocks and explicit contracts](https://dashbit.co/blog/mocks-and-explicit-contracts)
+- [Jose Valim — Mocks and explicit contracts](https://dashbit.co/blog/mocks-and-explicit-contracts)
 - [Testing Elixir — Pragmatic Programmers](https://pragprog.com/titles/lmelixir/testing-elixir/)

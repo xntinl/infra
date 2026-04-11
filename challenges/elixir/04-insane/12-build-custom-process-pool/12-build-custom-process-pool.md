@@ -109,40 +109,139 @@ defmodule Poolex.PoolServer do
     overflow     = opts[:overflow]     || 0
     idle_timeout = opts[:idle_timeout] || 60_000
 
-    # TODO: spawn min_size workers via DynamicSupervisor
-    # TODO: monitor each worker
-    # TODO: schedule idle timeout check
-    {:ok, initial_state}
+    workers =
+      for _ <- 1..min_size, into: %{} do
+        {:ok, pid} = apply(worker_module, :start_link, [worker_args])
+        ref = Process.monitor(pid)
+        {pid, ref}
+      end
+
+    state = %{
+      worker_module: worker_module,
+      worker_args: worker_args,
+      workers: workers,
+      checked_out: %{},
+      waiting: Poolex.PriorityQueue.new(),
+      caller_monitors: %{},
+      overflow_workers: MapSet.new(),
+      min_size: min_size,
+      max_size: max_size,
+      overflow: overflow,
+      idle_timeout: idle_timeout
+    }
+
+    {:ok, state}
   end
 
   def handle_call({:checkout, priority, timeout}, from, state) do
-    # TODO
-    # HINT: if worker available, move to checked_out and {:reply, {:ok, pid}, state}
-    # HINT: if at max_size and overflow > 0, spawn overflow worker and reply
-    # HINT: otherwise, add caller to waiting queue, monitor caller, {:noreply, state}
-    # HINT: use Process.send_after for the caller's timeout
+    priority = priority || :normal
+
+    case Map.keys(state.workers) do
+      [worker_pid | _] ->
+        {ref, workers} = Map.pop(state.workers, worker_pid)
+        checked_out = Map.put(state.checked_out, worker_pid, ref)
+        {:reply, {:ok, worker_pid}, %{state | workers: workers, checked_out: checked_out}}
+
+      [] ->
+        total = map_size(state.checked_out) + map_size(state.workers)
+
+        if total < state.max_size + state.overflow do
+          {:ok, pid} = apply(state.worker_module, :start_link, [state.worker_args])
+          ref = Process.monitor(pid)
+          checked_out = Map.put(state.checked_out, pid, ref)
+          overflow = MapSet.put(state.overflow_workers, pid)
+          {:reply, {:ok, pid}, %{state | checked_out: checked_out, overflow_workers: overflow}}
+        else
+          caller_ref = Process.monitor(elem(from, 0))
+          timer_ref = Process.send_after(self(), {:checkout_timeout, caller_ref}, timeout || 5_000)
+          waiting = Poolex.PriorityQueue.push(state.waiting, {from, caller_ref, timer_ref}, priority)
+          caller_monitors = Map.put(state.caller_monitors, caller_ref, from)
+          {:noreply, %{state | waiting: waiting, caller_monitors: caller_monitors}}
+        end
+    end
+  end
+
+  def handle_call(:metrics, _from, state) do
+    metrics = %{
+      pool_size: map_size(state.workers) + map_size(state.checked_out),
+      checked_out: map_size(state.checked_out),
+      available: map_size(state.workers),
+      waiting: Poolex.PriorityQueue.size(state.waiting)
+    }
+    {:reply, metrics, state}
   end
 
   def handle_cast({:checkin, worker_pid}, state) do
-    # TODO
-    # HINT: if waiter in queue, demonitor the waiter, deliver worker to it
-    # HINT: if overflow worker, stop it instead of returning to pool
+    case Map.pop(state.checked_out, worker_pid) do
+      {nil, _} ->
+        {:noreply, state}
+      {ref, checked_out} ->
+        state = %{state | checked_out: checked_out}
+
+        if MapSet.member?(state.overflow_workers, worker_pid) do
+          Process.demonitor(ref, [:flush])
+          Process.exit(worker_pid, :shutdown)
+          {:noreply, %{state | overflow_workers: MapSet.delete(state.overflow_workers, worker_pid)}}
+        else
+          case Poolex.PriorityQueue.pop(state.waiting) do
+            {:ok, {from, caller_ref, timer_ref}, new_waiting} ->
+              Process.demonitor(caller_ref, [:flush])
+              Process.cancel_timer(timer_ref)
+              caller_monitors = Map.delete(state.caller_monitors, caller_ref)
+              new_checked_out = Map.put(state.checked_out, worker_pid, ref)
+              GenServer.reply(from, {:ok, worker_pid})
+              {:noreply, %{state | waiting: new_waiting, checked_out: new_checked_out, caller_monitors: caller_monitors}}
+
+            {:empty, _} ->
+              workers = Map.put(state.workers, worker_pid, ref)
+              {:noreply, %{state | workers: workers}}
+          end
+        end
+    end
   end
 
   def handle_info({:DOWN, ref, :process, pid, _reason}, state) do
     cond do
       Map.has_key?(state.checked_out, pid) ->
-        # Worker crashed while checked out
-        # TODO: remove from checked_out, spawn replacement, deliver to next waiter
+        {_, checked_out} = Map.pop(state.checked_out, pid)
+        {:ok, new_pid} = apply(state.worker_module, :start_link, [state.worker_args])
+        new_ref = Process.monitor(new_pid)
+        state = %{state | checked_out: checked_out}
+
+        case Poolex.PriorityQueue.pop(state.waiting) do
+          {:ok, {from, caller_ref, timer_ref}, new_waiting} ->
+            Process.demonitor(caller_ref, [:flush])
+            Process.cancel_timer(timer_ref)
+            caller_monitors = Map.delete(state.caller_monitors, caller_ref)
+            new_checked = Map.put(state.checked_out, new_pid, new_ref)
+            GenServer.reply(from, {:ok, new_pid})
+            {:noreply, %{state | waiting: new_waiting, checked_out: new_checked, caller_monitors: caller_monitors}}
+
+          {:empty, _} ->
+            workers = Map.put(state.workers, new_pid, new_ref)
+            {:noreply, %{state | workers: workers}}
+        end
 
       Map.has_key?(state.caller_monitors, ref) ->
-        # Waiting caller died
-        # TODO: remove from waiting queue, demonitor
+        {from, caller_monitors} = Map.pop(state.caller_monitors, ref)
+        waiting = Poolex.PriorityQueue.remove(state.waiting, fn {f, _, _} -> f == from end)
+        {:noreply, %{state | caller_monitors: caller_monitors, waiting: waiting}}
+
+      true ->
+        {:noreply, state}
     end
   end
 
-  def handle_info({:checkout_timeout, from_ref}, state) do
-    # TODO: if caller is still in the queue, remove and reply {:error, :timeout}
+  def handle_info({:checkout_timeout, caller_ref}, state) do
+    case Map.pop(state.caller_monitors, caller_ref) do
+      {nil, _} ->
+        {:noreply, state}
+      {from, caller_monitors} ->
+        Process.demonitor(caller_ref, [:flush])
+        waiting = Poolex.PriorityQueue.remove(state.waiting, fn {f, _, _} -> f == from end)
+        GenServer.reply(from, {:error, :timeout})
+        {:noreply, %{state | waiting: waiting, caller_monitors: caller_monitors}}
+    end
   end
 end
 ```
@@ -163,13 +262,40 @@ defmodule Poolex.PriorityQueue do
   def push(%__MODULE__{} = pq, item, :normal), do: %{pq | normal: :queue.in(item, pq.normal)}
   def push(%__MODULE__{} = pq, item, :low),    do: %{pq | low:    :queue.in(item, pq.low)}
 
+  @spec pop(%__MODULE__{}) :: {:ok, term(), %__MODULE__{}} | {:empty, %__MODULE__{}}
   def pop(%__MODULE__{} = pq) do
-    # TODO: try high, then normal, then low
-    # Return {:ok, item, new_pq} or {:empty, pq}
+    cond do
+      not :queue.is_empty(pq.high) ->
+        {{:value, item}, new_high} = :queue.out(pq.high)
+        {:ok, item, %{pq | high: new_high}}
+
+      not :queue.is_empty(pq.normal) ->
+        {{:value, item}, new_normal} = :queue.out(pq.normal)
+        {:ok, item, %{pq | normal: new_normal}}
+
+      not :queue.is_empty(pq.low) ->
+        {{:value, item}, new_low} = :queue.out(pq.low)
+        {:ok, item, %{pq | low: new_low}}
+
+      true ->
+        {:empty, pq}
+    end
   end
 
+  @spec remove(%__MODULE__{}, term()) :: %__MODULE__{}
   def remove(%__MODULE__{} = pq, item) do
-    # TODO: remove item from whichever queue contains it
+    %{pq |
+      high: queue_remove(pq.high, item),
+      normal: queue_remove(pq.normal, item),
+      low: queue_remove(pq.low, item)
+    }
+  end
+
+  defp queue_remove(queue, item) do
+    queue
+    |> :queue.to_list()
+    |> Enum.reject(&(&1 == item))
+    |> :queue.from_list()
   end
 
   def size(%__MODULE__{} = pq) do

@@ -22,8 +22,8 @@ api_gateway/
 │       ├── rate_limiter/
 │       │   └── server.ex
 │       └── metrics/
-│           ├── counter.ex     # ← you implement this
-│           └── event_log.ex   # ← and this
+│           ├── counter.ex
+│           └── event_log.ex
 ├── test/
 │   └── api_gateway/
 │       └── metrics/
@@ -105,6 +105,10 @@ defmodule ApiGateway.Metrics.Counter do
   Record layout: {route, requests, errors, bytes}
                     ^1      ^2        ^3     ^4
   Position indices are 1-based and matter for update_counter/4.
+
+  The GenServer exists solely to own the ETS table and ensure its lifecycle
+  is tied to the supervision tree. All reads and writes bypass the GenServer
+  entirely, going directly to ETS for maximum concurrency.
   """
 
   use GenServer
@@ -118,14 +122,23 @@ defmodule ApiGateway.Metrics.Counter do
   @doc """
   Records a completed request. Fire-and-forget via :ets.update_counter.
   Thread-safe: multiple processes can call this concurrently.
+
+  Uses update_counter/4 with a list of {position, increment} tuples to atomically
+  update multiple fields in a single call. The fourth argument provides the default
+  record to insert if the key doesn't exist yet — this avoids a separate insert_new
+  call and the race condition that would come with it.
   """
   @spec record(String.t(), non_neg_integer(), 200..599) :: :ok
   def record(route, bytes, status_code) do
     error_inc = if status_code >= 400, do: 1, else: 0
-    # HINT: :ets.update_counter/4 with a list of {position, increment} tuples
-    # HINT: fourth arg is the default record if key doesn't exist: {route, 0, 0, 0}
-    # HINT: positions: requests=2, errors=3, bytes=4
-    # TODO: implement — this must NOT go through the GenServer
+
+    :ets.update_counter(
+      @table,
+      route,
+      [{2, 1}, {3, error_inc}, {4, bytes}],
+      {route, 0, 0, 0}
+    )
+
     :ok
   end
 
@@ -135,8 +148,13 @@ defmodule ApiGateway.Metrics.Counter do
   """
   @spec get(String.t()) :: %{requests: integer(), errors: integer(), bytes: integer()}
   def get(route) do
-    # HINT: :ets.lookup(@table, route) returns [{route, req, err, bytes}] or []
-    # TODO: implement
+    case :ets.lookup(@table, route) do
+      [{_route, requests, errors, bytes}] ->
+        %{requests: requests, errors: errors, bytes: bytes}
+
+      [] ->
+        %{requests: 0, errors: 0, bytes: 0}
+    end
   end
 
   @doc """
@@ -144,8 +162,10 @@ defmodule ApiGateway.Metrics.Counter do
   """
   @spec all() :: [%{route: String.t(), requests: integer(), errors: integer(), bytes: integer()}]
   def all do
-    # HINT: :ets.tab2list(@table) |> Enum.map(...)
-    # TODO: implement
+    :ets.tab2list(@table)
+    |> Enum.map(fn {route, requests, errors, bytes} ->
+      %{route: route, requests: requests, errors: errors, bytes: bytes}
+    end)
   end
 
   # ---------------------------------------------------------------------------
@@ -181,6 +201,10 @@ defmodule ApiGateway.Metrics.EventLog do
 
   GenServer owns the table. Writes go through the GenServer to serialize inserts.
   Reads use :ets.select directly — no GenServer bottleneck.
+
+  The :ordered_set type enables efficient range queries: the AVL tree traversal
+  starts at the lower bound key and stops at the upper bound, avoiding a full
+  table scan. Match specs with guards on the timestamp field drive this traversal.
   """
 
   use GenServer
@@ -202,24 +226,43 @@ defmodule ApiGateway.Metrics.EventLog do
   @doc """
   Returns all events in the time range [from_us, to_us] (microseconds).
   Direct ETS select — no GenServer bottleneck.
+
+  The match spec is built manually at runtime because :ets.fun2ms is a compile-time
+  macro and cannot capture the from_us/to_us function arguments. The pattern matches
+  against the composite key {timestamp, unique_id} and applies guards on the timestamp
+  component to restrict the range.
   """
   @spec range(integer(), integer()) :: list()
   def range(from_us, to_us) do
-    # HINT: build a match spec manually — fun2ms can't capture runtime variables
-    # Match spec pattern: {{:"$1", :"$2"}, :"$3", :"$4", :"$5"}
-    # Guard: [{:>=, :"$1", from_us}, {:"=<", :"$1", to_us}]
-    # Return: [{{:"$1", :"$2"}, :"$3", :"$4", :"$5"}]
-    # TODO: implement
+    ms = [
+      {
+        {{:"$1", :"$2"}, :"$3", :"$4", :"$5"},
+        [{:>=, :"$1", from_us}, {:"=<", :"$1", to_us}],
+        [{{{{:"$1", :"$2"}}, :"$3", :"$4", :"$5"}}]
+      }
+    ]
+
+    :ets.select(@table, ms)
   end
 
   @doc """
   Returns events in [from_us, to_us] filtered by route.
   Direct ETS select.
+
+  Same approach as range/2 but adds a route equality guard to the match spec,
+  so only events matching both the time window and the target route are returned.
   """
   @spec range_by_route(integer(), integer(), String.t()) :: list()
   def range_by_route(from_us, to_us, route) do
-    # HINT: same as range/2 but add {:==, :"$3", route} to the guard list
-    # TODO: implement
+    ms = [
+      {
+        {{:"$1", :"$2"}, :"$3", :"$4", :"$5"},
+        [{:>=, :"$1", from_us}, {:"=<", :"$1", to_us}, {:==, :"$3", route}],
+        [{{{{:"$1", :"$2"}}, :"$3", :"$4", :"$5"}}]
+      }
+    ]
+
+    :ets.select(@table, ms)
   end
 
   @doc """
@@ -259,8 +302,6 @@ defmodule ApiGateway.Metrics.EventLog do
   @impl true
   def handle_call({:purge, max_age_seconds}, _from, state) do
     cutoff = System.os_time(:microsecond) - max_age_seconds * 1_000_000
-    # HINT: :ets.fun2ms can be used here because cutoff is known at call time
-    # but it's compile-time only. Build the match spec manually instead.
     ms = [
       {{{:"$1", :_}, :_, :_, :_}, [{:<, :"$1", cutoff}], [true]}
     ]

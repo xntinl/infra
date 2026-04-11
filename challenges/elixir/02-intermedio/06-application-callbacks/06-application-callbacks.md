@@ -20,18 +20,18 @@ Project structure at this point:
 task_queue/
 ├── lib/
 │   └── task_queue/
-│       ├── application.ex       # ← you complete this
+│       ├── application.ex
 │       ├── supervisor.ex        # exercise 05
 │       ├── queue_server.ex      # exercise 04
 │       ├── task_registry.ex     # exercise 02
 │       └── worker.ex            # exercise 05
 ├── config/
-│   ├── config.exs               # ← you configure this
-│   └── dev.exs                  # ← you configure this
+│   ├── config.exs
+│   └── dev.exs
 ├── test/
 │   └── task_queue/
 │       └── application_test.exs # given tests — must pass without modification
-└── mix.exs                      # ← you update the :mod key
+└── mix.exs                      # ← the :mod key registers the Application
 ```
 
 ---
@@ -95,13 +95,15 @@ config :task_queue,
 ```elixir
 def application do
   [
-    # HINT: add mod: {TaskQueue.Application, []}
-    # Without this key, OTP never calls start/2
     mod: {TaskQueue.Application, []},
     extra_applications: [:logger, :crypto]
   ]
 end
 ```
+
+Without the `mod:` key, OTP never calls `start/2`. The application compiles fine,
+`mix test` runs, but in production `mix run --no-halt` starts nothing. This is the
+single most common OTP configuration bug.
 
 ### Step 4: `lib/task_queue/application.ex`
 
@@ -112,8 +114,6 @@ defmodule TaskQueue.Application do
 
   @impl Application
   def start(_type, _args) do
-    # HINT: read each config value with Application.get_env(:task_queue, key, default)
-    # Use the defaults below if the key is not in config.exs
     max_queue_size = Application.get_env(:task_queue, :max_queue_size, 1_000)
     job_ttl_ms     = Application.get_env(:task_queue, :job_ttl_ms, 300_000)
     worker_count   = Application.get_env(:task_queue, :worker_count, 4)
@@ -129,22 +129,17 @@ defmodule TaskQueue.Application do
       log_level:      #{log_level}
     """)
 
-    # HINT: pass configuration down to the Supervisor
     children = build_children(worker_count)
 
     opts = [strategy: :one_for_one, name: TaskQueue.RootSupervisor]
 
-    # HINT: Supervisor.start_link(children, opts)
-    # IMPORTANT: return the result of Supervisor.start_link directly.
-    # Returning :ok here causes OTP to consider the start a failure.
-    # TODO: implement
+    Supervisor.start_link(children, opts)
   end
 
   @impl Application
   def stop(_state) do
-    # HINT: Logger.info("TaskQueue stopped")
-    # HINT: return :ok
-    # TODO: implement
+    Logger.info("TaskQueue stopped")
+    :ok
   end
 
   # ---------------------------------------------------------------------------
@@ -161,6 +156,20 @@ defmodule TaskQueue.Application do
   end
 end
 ```
+
+The `start/2` function reads configuration with `Application.get_env/3`, configures the
+Logger level, logs the startup parameters, and starts the root Supervisor. The return
+value of `Supervisor.start_link/2` is `{:ok, pid}` — exactly what OTP requires from
+`start/2`. Returning `:ok` or any other value causes OTP to mark the application as
+failed to start.
+
+The `stop/1` callback is called by OTP when the application is shutting down (either
+via `Application.stop/1` or during VM termination). Here we log the event; in production
+you would flush log buffers, close database connections, and drain pending work.
+
+Configuration is read at runtime with `Application.get_env/3`, not at compile time
+with module attributes. This means the config values can be changed between compilations
+(e.g., via `config/runtime.exs` in production) without recompiling the module.
 
 ### Step 5: Given tests — must pass without modification
 

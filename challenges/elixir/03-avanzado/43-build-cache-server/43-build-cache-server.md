@@ -20,9 +20,9 @@ api_gateway/
 │       ├── application.ex              # already exists — supervises Cache.Server
 │       ├── router.ex                   # already exists — calls Cache.Server.get/1
 │       └── cache/
-│           ├── server.ex               # ← you implement this
-│           ├── lru.ex                  # ← and this
-│           └── ttl_expirer.ex          # ← and this
+│           ├── server.ex               # GenServer that owns the ETS table
+│           ├── lru.ex                  # LRU order tracking
+│           └── ttl_expirer.ex          # periodic sweep of expired entries
 ├── test/
 │   └── api_gateway/
 │       └── cache_test.exs             # given tests — must pass without modification
@@ -104,8 +104,8 @@ end
 
 ### Step 3: `lib/api_gateway/cache/server.ex`
 
-`# TODO` marks what you implement. `# HINT` gives direction without spoiling the solution.
-Do not change the public function signatures — the tests depend on them.
+The GenServer owns the ETS table and serializes all write operations.
+Reads go directly to ETS via `get/1` — they never touch the GenServer mailbox.
 
 ```elixir
 defmodule ApiGateway.Cache.Server do
@@ -127,10 +127,22 @@ defmodule ApiGateway.Cache.Server do
   @spec get(term()) :: {:ok, term()} | {:miss}
   def get(key) do
     now = System.monotonic_time(:millisecond)
-    # HINT: :ets.lookup/2 returns [{key, value, expiry_ms}] or []
-    # HINT: compare expiry_ms with now
-    # HINT: if expired, call :ets.delete/2 and return {:miss}
-    # TODO: implement
+
+    case :ets.lookup(@table, key) do
+      [{^key, value, expiry_ms}] when expiry_ms > now ->
+        {:ok, value}
+
+      [{^key, _value, _expiry_ms}] ->
+        # Entry exists but has expired — lazy eviction on read.
+        # This is safe because :ets.delete on a :protected table is allowed
+        # only by the owner process. Since get/1 runs in the caller's process,
+        # we use a cast to let the owner clean it up without blocking the reader.
+        GenServer.cast(__MODULE__, {:lazy_delete, key})
+        {:miss}
+
+      [] ->
+        {:miss}
+    end
   end
 
   @doc """
@@ -172,18 +184,10 @@ defmodule ApiGateway.Cache.Server do
   def init(opts) do
     max_size = Keyword.get(opts, :max_size, 1_000)
 
-    # TODO: create the ETS table
-    #
-    # Options:
-    #   :named_table        — access by name in get/1
-    #   :protected          — GenServer owns; other processes can only read
-    #   :set                — one value per key
-    #   read_concurrency: true — optimize for concurrent reads
-    #
-    # Design question: why :protected and not :public here?
-    # With :public, any process could corrupt the LRU order by writing directly.
-    # Writes go through the GenServer to keep the order consistent.
-
+    # :protected — the GenServer owns the table; other processes can only read.
+    # This prevents any process from corrupting the LRU order by writing directly.
+    # :set — one value per key, O(1) lookup.
+    # read_concurrency: true — optimizes concurrent reads from multiple schedulers.
     table = :ets.new(@table, [:named_table, :protected, :set, read_concurrency: true])
 
     {:ok, %{table: table, max_size: max_size, lru_order: [], hits: 0, misses: 0}}
@@ -197,29 +201,56 @@ defmodule ApiGateway.Cache.Server do
   def handle_call({:put, key, value, ttl_ms}, _from, state) do
     expiry = System.monotonic_time(:millisecond) + ttl_ms
 
-    # TODO:
-    # 1. If size >= max_size AND key is not already in the table, evict LRU first
-    #    HINT: use ApiGateway.Cache.LRU.evict_lru/1 to get the LRU key, then delete it from ETS
-    # 2. Insert {key, value, expiry} into ETS
-    # 3. Update LRU order via ApiGateway.Cache.LRU.touch/2
-    # 4. Update stats (writes)
+    already_exists = :ets.lookup(@table, key) != []
 
-    {:reply, :ok, state}
+    # If we're at capacity and this is a new key, evict the LRU entry first
+    state =
+      if :ets.info(@table, :size) >= state.max_size and not already_exists do
+        {lru_key, new_order} = ApiGateway.Cache.LRU.evict_lru(state.lru_order)
+
+        if lru_key do
+          :ets.delete(@table, lru_key)
+        end
+
+        %{state | lru_order: new_order}
+      else
+        state
+      end
+
+    # Insert the entry into ETS
+    :ets.insert(@table, {key, value, expiry})
+
+    # Update the LRU order — move key to MRU position
+    new_order = ApiGateway.Cache.LRU.touch(state.lru_order, key)
+
+    {:reply, :ok, %{state | lru_order: new_order}}
   end
 
   def handle_call({:delete, key}, _from, state) do
-    # TODO: delete from ETS, remove from LRU order
-    {:reply, :ok, state}
+    :ets.delete(@table, key)
+    new_order = ApiGateway.Cache.LRU.remove(state.lru_order, key)
+    {:reply, :ok, %{state | lru_order: new_order}}
   end
 
   def handle_call(:flush, _from, state) do
-    # TODO: :ets.delete_all_objects/1
+    :ets.delete_all_objects(@table)
     {:reply, :ok, %{state | lru_order: []}}
+  end
+
+  @impl true
+  def handle_cast({:lazy_delete, key}, state) do
+    :ets.delete(@table, key)
+    new_order = ApiGateway.Cache.LRU.remove(state.lru_order, key)
+    {:noreply, %{state | lru_order: new_order}}
   end
 end
 ```
 
 ### Step 4: `lib/api_gateway/cache/lru.ex`
+
+The LRU order is maintained as a simple list where the head is the Most Recently Used (MRU)
+and the tail is the Least Recently Used (LRU). `touch/2` moves a key to the front.
+`evict_lru/1` removes the last element.
 
 ```elixir
 defmodule ApiGateway.Cache.LRU do
@@ -236,8 +267,9 @@ defmodule ApiGateway.Cache.LRU do
   """
   @spec touch([term()], term()) :: [term()]
   def touch(order, key) do
-    # HINT: List.delete/2 removes the key if present, then prepend
-    # TODO: implement
+    # Remove the key if it already exists, then prepend it.
+    # List.delete/2 is a no-op if the key is absent.
+    [key | List.delete(order, key)]
   end
 
   @doc """
@@ -248,8 +280,9 @@ defmodule ApiGateway.Cache.LRU do
   def evict_lru([]), do: {nil, []}
 
   def evict_lru(order) do
-    # HINT: List.last/1 gives the LRU key; Enum.drop/2 with -1 removes it
-    # TODO: implement
+    lru_key = List.last(order)
+    new_order = Enum.drop(order, -1)
+    {lru_key, new_order}
   end
 
   @doc """
@@ -257,12 +290,16 @@ defmodule ApiGateway.Cache.LRU do
   """
   @spec remove([term()], term()) :: [term()]
   def remove(order, key) do
-    # TODO: implement
+    List.delete(order, key)
   end
 end
 ```
 
 ### Step 5: `lib/api_gateway/cache/ttl_expirer.ex`
+
+Lazy expiry on `get/1` handles hot entries. Cold entries — keys that are never requested
+again — accumulate indefinitely without the periodic sweep. This GenServer runs a sweep
+every 30 seconds to clean them up.
 
 ```elixir
 defmodule ApiGateway.Cache.TTLExpirer do
@@ -282,20 +319,20 @@ defmodule ApiGateway.Cache.TTLExpirer do
   @impl true
   def handle_info(:sweep, state) do
     # ETS has no native TTL — periodic cleanup is the owner's responsibility.
-    #
-    # Option A (simple): :ets.tab2list/1 + filter + :ets.delete/2
-    #   Pros: readable. Cons: copies entire table into process heap.
-    #
-    # Option B (efficient): :ets.select_delete/2 with match spec
-    #   Pros: operates inside ETS with no copy. Cons: match spec syntax.
-    #
-    # Start with Option A. Migrate to Option B if benchmarks show sweep is a bottleneck.
+    # We iterate over the entire table and delete expired entries.
+    # This copies the table into the process heap, which is acceptable for
+    # caches under ~100k entries. For larger caches, use :ets.select_delete/2
+    # with a match spec to operate inside ETS without copying.
 
     now = System.monotonic_time(:millisecond)
 
-    # TODO: delete all entries where expiry < now
-    # HINT (Option A): :ets.tab2list(@table) returns [{key, value, expiry}, ...]
-    # HINT (Option A): :ets.delete(@table, key) removes a specific key
+    @table
+    |> :ets.tab2list()
+    |> Enum.each(fn {key, _value, expiry} ->
+      if expiry < now do
+        :ets.delete(@table, key)
+      end
+    end)
 
     Process.send_after(self(), :sweep, @sweep_interval_ms)
     {:noreply, state}
@@ -431,7 +468,7 @@ ApiGateway.Cache.Server.put("exchange_rates", %{usd: 1.08, gbp: 0.86}, ttl_ms: 3
 mix run bench/cache_bench.exs
 ```
 
-**Expected result on modern hardware**: `get` < 5µs at p99. If `get` is > 50µs, verify
+**Expected result on modern hardware**: `get` < 5us at p99. If `get` is > 50us, verify
 it is reading directly from ETS and not making a `GenServer.call`.
 
 ---
@@ -444,7 +481,7 @@ Fill in this table based on your implementation and benchmark results.
 |--------|-----------------------------|------------------------|-------|
 | Concurrent reads | lock-free after ETS lookup | serialized by mailbox | network round-trip |
 | Eviction policy | LRU (O(n) list) | configurable | configurable |
-| p50 read latency | < 2µs (measure) | proportional to backlog | > 500µs |
+| p50 read latency | < 2us (measure) | proportional to backlog | > 500us |
 | Memory for 1k entries | measure | measure | off-heap |
 | TTL enforcement | lazy (on read) + periodic sweep | lazy or periodic | native |
 | Survives node crash | no | no | yes (persistence) |

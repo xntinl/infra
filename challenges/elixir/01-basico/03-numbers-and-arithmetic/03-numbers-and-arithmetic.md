@@ -64,6 +64,14 @@ The `Ledger` module needs to:
 
 ### `lib/payments_cli/ledger.ex`
 
+Each function uses integer arithmetic wherever possible. The key insight is that
+`div/2` truncates toward zero (integer division), while `/` always returns a float.
+For fee calculations, `div/2` gives us floor behavior on positive numbers — the
+merchant pays at most the theoretical fee, never more.
+
+For currency conversion, we accept a float rate (from external APIs) and immediately
+round back to integer cents. The float exists only for the multiplication step.
+
 ```elixir
 defmodule PaymentsCli.Ledger do
   @moduledoc """
@@ -93,9 +101,7 @@ defmodule PaymentsCli.Ledger do
   """
   @spec sum_amounts([integer()]) :: integer()
   def sum_amounts(amounts) when is_list(amounts) do
-    # TODO: use Enum.sum/1
-    # Why not a recursive sum? Enum.sum is implemented in C in the BEAM and
-    # is faster. Write your own only when you need custom accumulation logic.
+    Enum.sum(amounts)
   end
 
   @doc """
@@ -120,14 +126,7 @@ defmodule PaymentsCli.Ledger do
   def calculate_fee(amount_cents, fee_basis_points)
       when is_integer(amount_cents) and amount_cents >= 0 and
            is_integer(fee_basis_points) and fee_basis_points >= 0 do
-    # TODO: implement integer-only fee calculation
-    #
-    # HINT: fee = amount_cents * fee_basis_points / 10_000
-    # But / returns a float! Use div/2 for integer division (truncates toward zero).
-    # For fees, truncating toward zero = rounding down = merchant-favorable.
-    #
-    # Why basis points? A fee of 2.5% as a float is 0.025.
-    # As basis points it is 250 (integer). Integer math throughout.
+    div(amount_cents * fee_basis_points, 10_000)
   end
 
   @doc """
@@ -148,12 +147,7 @@ defmodule PaymentsCli.Ledger do
   @spec convert_currency(integer(), float()) :: integer()
   def convert_currency(amount_cents, rate)
       when is_integer(amount_cents) and is_float(rate) and rate > 0 do
-    # TODO: implement
-    #
-    # HINT: multiply amount_cents by rate (produces a float), then round/1
-    # to get the nearest integer cent.
-    # round/1 uses banker's rounding (round half to even). For most payment
-    # rounding, this is acceptable.
+    round(amount_cents * rate)
   end
 
   @doc """
@@ -173,22 +167,37 @@ defmodule PaymentsCli.Ledger do
   """
   @spec format_amount(integer(), String.t()) :: String.t()
   def format_amount(amount_cents, currency) when is_integer(amount_cents) do
-    # TODO: implement formatting
-    #
-    # HINT: use div/2 and rem/2 to split cents into major and minor units:
-    #   major = div(amount_cents, 100)
-    #   minor = rem(amount_cents, 100)
-    #
-    # Then format minor with leading zero: String.pad_leading(Integer.to_string(minor), 2, "0")
-    #
-    # Currency symbol lookup:
-    #   "USD" -> "$"
-    #   "GBP" -> "£"
-    #   "EUR" -> "€"
-    #   other -> currency <> " "  (e.g. "JPY 500")
+    major = div(amount_cents, 100)
+    minor = rem(amount_cents, 100)
+    padded_minor = minor |> Integer.to_string() |> String.pad_leading(2, "0")
+    symbol = currency_symbol(currency)
+
+    "#{symbol}#{major}.#{padded_minor}"
   end
+
+  defp currency_symbol("USD"), do: "$"
+  defp currency_symbol("GBP"), do: "£"
+  defp currency_symbol("EUR"), do: "€"
+  defp currency_symbol(other), do: "#{other} "
 end
 ```
+
+**Why this works:**
+
+- `sum_amounts/1` delegates to `Enum.sum/1`, which is implemented natively in the BEAM
+  and is faster than a hand-written recursive sum. There is no reason to reinvent it.
+
+- `calculate_fee/2` uses `div/2` for integer division. `div(333 * 100, 10_000)` evaluates
+  to `div(33_300, 10_000)` which is `3` — truncated toward zero. This is floor behavior
+  for positive numbers, meaning the fee is always rounded down (merchant-favorable).
+
+- `convert_currency/2` multiplies by the float rate, then uses `round/1` to get back to
+  an integer. `round/1` uses banker's rounding (round half to even), which is acceptable
+  for most payment rounding scenarios.
+
+- `format_amount/2` splits cents into major and minor units using `div/2` and `rem/2`,
+  then pads the minor unit with a leading zero. The currency symbol is looked up via
+  a private helper with pattern-matched clauses.
 
 ### Given tests — must pass without modification
 

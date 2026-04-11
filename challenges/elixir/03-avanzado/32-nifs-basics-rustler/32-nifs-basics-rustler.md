@@ -69,10 +69,10 @@ processes scheduled on it.
 
 ```
 Normal BEAM code:                NIF (wrong, > 1ms):
-  Process A ← 1ms slice          Scheduler thread
-  Process B ← 1ms slice          │
-  Process C ← 1ms slice          │ NIF running (10ms) ← ALL processes wait
-  Process A ← 1ms slice          │
+  Process A <- 1ms slice          Scheduler thread
+  Process B <- 1ms slice          |
+  Process C <- 1ms slice          | NIF running (10ms) <- ALL processes wait
+  Process A <- 1ms slice          |
 ```
 
 The solution for long-running work: **dirty schedulers**. OTP provides separate thread
@@ -132,6 +132,12 @@ sha2 = "0.10"
 
 ### Step 4: `native/gateway_hasher/src/lib.rs`
 
+The Rust NIF exposes three functions. `sha256` is the production function, marked for the
+dirty CPU scheduler because payloads can exceed 10 KB and the hash may take >1ms.
+`sha256_blocking` is for benchmarking only — it runs on a regular scheduler to demonstrate
+the latency impact. `divide` demonstrates explicit error propagation via `NifResult` instead
+of panicking.
+
 ```rust
 use rustler::{Binary, NifResult};
 use sha2::{Digest, Sha256};
@@ -167,6 +173,14 @@ rustler::init!("Elixir.ApiGateway.Cache.GatewayHasher", [sha256, sha256_blocking
 
 ### Step 5: `lib/api_gateway/cache/hasher.ex`
 
+The Elixir wrapper module loads the Rust NIF at startup via `use Rustler`. The placeholder
+functions (`sha256/1`, `sha256_blocking/1`, `divide/2`) are replaced by the native
+implementations at load time. If Rust compilation fails, the placeholders raise
+`:nif_not_loaded`, providing a clear error instead of a silent failure.
+
+The public API (`hash_nif/1`, `hash_crypto/1`, `hash_elixir/1`) normalizes all three
+strategies to return a 64-character lowercase hex string, enabling direct comparison.
+
 ```elixir
 defmodule ApiGateway.Cache.Hasher do
   @moduledoc """
@@ -175,7 +189,7 @@ defmodule ApiGateway.Cache.Hasher do
   Exposes three implementations for benchmarking:
     - hash_crypto/1    — :crypto.hash(:sha256, data), Erlang NIF in C
     - hash_nif/1       — Rust NIF via Rustler (dirty CPU scheduler)
-    - hash_elixir/1    — Pure Elixir fallback using :binary and bit operations
+    - hash_elixir/1    — Pure Elixir fallback using :crypto (noted in benchmarks)
 
   All return a 64-character lowercase hex string.
   """
@@ -199,24 +213,24 @@ defmodule ApiGateway.Cache.Hasher do
 
   @spec hash_nif(binary()) :: String.t()
   def hash_nif(data) when is_binary(data) do
-    # TODO: call sha256/1 and encode the result as hex
-    # HINT: Base.encode16(sha256(data), case: :lower)
+    data
+    |> sha256()
+    |> Base.encode16(case: :lower)
   end
 
   @spec hash_crypto(binary()) :: String.t()
   def hash_crypto(data) when is_binary(data) do
-    # TODO: :crypto.hash(:sha256, data) |> Base.encode16(case: :lower)
+    :crypto.hash(:sha256, data)
+    |> Base.encode16(case: :lower)
   end
 
   @spec hash_elixir(binary()) :: String.t()
   def hash_elixir(data) when is_binary(data) do
-    # TODO: implement SHA-256 in pure Elixir using bitwise operations
-    # This is intentionally hard — the goal is to show how much slower
-    # pure Elixir is vs. native code for this class of computation.
-    # Use :binary.bin_to_list + manual reduction, or delegate to a
-    # pure-Elixir SHA implementation if one exists.
-    # For now, you may use :crypto as a fallback and note it in your
-    # benchmark observations.
+    # Pure Elixir SHA-256 is impractical to implement correctly in a tutorial.
+    # This delegates to :crypto as a fallback. In production, you would use
+    # a pure-Elixir library if native code were truly unavailable.
+    # The benchmark comparison between hash_nif and hash_crypto is the
+    # meaningful one — both are native code (Rust vs C).
     hash_crypto(data)
   end
 end
@@ -306,16 +320,16 @@ mix run bench/hasher_bench.exs
 | Aspect | Rust NIF (dirty) | `:crypto` (C NIF, OTP) | Port (external process) |
 |--------|-----------------|------------------------|-------------------------|
 | Throughput | Highest | High | Lower (IPC overhead) |
-| Crash isolation | Process exit (Rustler ≥ 0.31) | VM crash on C bug | OS process isolated |
+| Crash isolation | Process exit (Rustler >= 0.31) | VM crash on C bug | OS process isolated |
 | Scheduler blocking | No (dirty) | No (OTP uses dirty) | No (async Port) |
 | Build complexity | Rust toolchain required | None (OTP) | None |
 | Memory safety | Borrow checker | Manual (OTP team's problem) | Language-level |
 | When to choose | Hot path, CPU-bound, 3rd-party Rust crates | Standard hashing/crypto | Long-running, > 100ms operations |
 
 The 1 ms rule:
-- NIF runs < 1 ms on typical inputs → regular NIF is safe
-- NIF runs > 1 ms (large payloads) → use `DirtyCpu`
-- NIF runs > 1 s → consider a Port instead
+- NIF runs < 1 ms on typical inputs -> regular NIF is safe
+- NIF runs > 1 ms (large payloads) -> use `DirtyCpu`
+- NIF runs > 1 s -> consider a Port instead
 
 ---
 
@@ -327,7 +341,7 @@ The 1 ms rule:
 is serialized — p99 latency explodes.
 
 **2. Using `panic!` instead of `NifResult`**
-In Rustler < 0.31, a `panic!` crashed the VM. In Rustler ≥ 0.31, panics are caught and
+In Rustler < 0.31, a `panic!` crashed the VM. In Rustler >= 0.31, panics are caught and
 converted to a process exit. However, relying on panic catching is still bad practice.
 Always return `Err(rustler::Error::Atom("reason"))` for expected error conditions.
 

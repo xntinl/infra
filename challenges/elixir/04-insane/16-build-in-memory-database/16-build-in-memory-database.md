@@ -96,29 +96,58 @@ defmodule Memdb.MVCC do
   """
 
   @doc "Inserts a new row version."
+  @spec insert(atom(), term(), map(), pos_integer()) :: true
   def insert(table, row_id, data, txn_xid) do
-    # TODO: :ets.insert(table, {row_id, data, txn_xid, 0})
+    :ets.insert(table, {row_id, data, txn_xid, 0})
   end
 
   @doc "Marks existing versions of row_id as expired by txn_xid."
+  @spec expire(atom(), term(), pos_integer()) :: :ok
   def expire(table, row_id, txn_xid) do
-    # TODO: :ets.select_replace/2 to set expired_xid for versions where expired_xid == 0
+    versions = :ets.lookup(table, row_id)
+    Enum.each(versions, fn {rid, data, created, expired} = row ->
+      if expired == 0 and created < txn_xid do
+        :ets.delete_object(table, row)
+        :ets.insert(table, {rid, data, created, txn_xid})
+      end
+    end)
+    :ok
   end
 
   @doc "Returns all versions of row_id visible to snapshot_xid."
+  @spec visible_versions(atom(), term(), pos_integer()) :: [map()]
   def visible_versions(table, row_id, snapshot_xid) do
-    # TODO
-    # HINT: created_xid < snapshot_xid AND (expired_xid == 0 OR expired_xid > snapshot_xid)
+    :ets.lookup(table, row_id)
+    |> Enum.filter(fn {_rid, _data, created, expired} ->
+      created < snapshot_xid and (expired == 0 or expired > snapshot_xid)
+    end)
+    |> Enum.sort_by(fn {_, _, created, _} -> created end, :desc)
+    |> Enum.map(fn {_rid, data, _created, _expired} -> data end)
   end
 
   @doc "Scans all rows visible to snapshot_xid."
+  @spec scan(atom(), pos_integer()) :: [map()]
   def scan(table, snapshot_xid) do
-    # TODO: :ets.tab2list, filter by visibility, deduplicate by row_id (latest version)
+    :ets.tab2list(table)
+    |> Enum.filter(fn {_rid, _data, created, expired} ->
+      created < snapshot_xid and (expired == 0 or expired > snapshot_xid)
+    end)
+    |> Enum.group_by(fn {rid, _, _, _} -> rid end)
+    |> Enum.map(fn {_rid, versions} ->
+      versions
+      |> Enum.sort_by(fn {_, _, created, _} -> created end, :desc)
+      |> List.first()
+      |> elem(1)
+    end)
   end
 
   @doc "Deletes row versions invisible to all active transactions (GC)."
+  @spec gc(atom(), pos_integer()) :: non_neg_integer()
   def gc(table, horizon) do
-    # TODO: :ets.select_delete for expired_xid > 0 AND expired_xid < horizon
+    match_spec = [
+      {{:_, :_, :_, :"$1"}, [{:andalso, {:>, :"$1", 0}, {:<, :"$1", horizon}}], [true]}
+    ]
+    :ets.select_delete(table, match_spec)
   end
 end
 ```

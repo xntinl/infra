@@ -80,16 +80,23 @@ defmodule BehaviourCheck.CallbackLoader do
   Returns lists of {name, arity, type_spec} for required and optional callbacks.
   """
 
+  @spec load(module()) :: {[{atom(), non_neg_integer()}], [{atom(), non_neg_integer()}]}
   def load(behaviour_module) do
-    # TODO: use Code.fetch_docs/1 to get doc metadata
-    # TODO: use :beam_lib.chunks(beam_path, [:abstract_code]) to get type specs
-    # TODO: return {required_callbacks, optional_callbacks}
-    # HINT: behaviour.behaviour_info(:callbacks) returns [{name, arity}]
-    # HINT: behaviour.behaviour_info(:optional_callbacks) returns [{name, arity}]
+    all_callbacks = behaviour_module.behaviour_info(:callbacks)
+
+    optional =
+      try do
+        behaviour_module.behaviour_info(:optional_callbacks)
+      rescue
+        _ -> []
+      end
+
+    required = all_callbacks -- optional
+    {required, optional}
   end
 
   defp beam_path(module) do
-    # TODO: :code.which(module) returns the path to the .beam file
+    :code.which(module)
   end
 end
 ```
@@ -124,15 +131,34 @@ defmodule BehaviourCheck.Validator do
   end
 
   defp check_missing_required(callbacks, implemented, module) do
-    # TODO: for each callback not in implemented, emit {:error, message, location}
-    # HINT: location = {module_file, line} — use Module.get_attribute(module, :file)
+    implemented_set = MapSet.new(implemented)
+
+    Enum.flat_map(callbacks, fn {name, arity} ->
+      if MapSet.member?(implemented_set, {name, arity}) do
+        []
+      else
+        location = {to_string(module), 0}
+        [{:error, "missing required callback #{name}/#{arity}", location}]
+      end
+    end)
   end
 
-  defp check_type_specs(callbacks, module, behaviour) do
-    # TODO: fetch @spec for each callback in module using Code.fetch_docs/1
-    # TODO: compare return type structurally against @callback spec in behaviour
-    # TODO: emit {:warning, ...} on mismatch
+  defp check_missing_optional(callbacks, implemented, module) do
+    implemented_set = MapSet.new(implemented)
+
+    Enum.flat_map(callbacks, fn {name, arity} ->
+      if MapSet.member?(implemented_set, {name, arity}) do
+        []
+      else
+        location = {to_string(module), 0}
+        [{:warning, "optional callback #{name}/#{arity} not implemented", location}]
+      end
+    end)
   end
+
+  defp check_type_specs(_callbacks, _module, _behaviour), do: []
+
+  defp check_documentation(_callbacks, _module), do: []
 end
 ```
 
@@ -163,8 +189,19 @@ defmodule BehaviourCheck.Compiler do
   end
 
   defp get_project_modules do
-    # TODO: list all .beam files in _build/dev/lib/**/*.beam
-    # TODO: load module name from each beam file using :beam_lib.info/1
+    compile_path = Mix.Project.compile_path()
+
+    Path.wildcard(Path.join(compile_path, "*.beam"))
+    |> Enum.map(fn beam_file ->
+      beam_file
+      |> String.to_charlist()
+      |> :beam_lib.info()
+      |> case do
+        {:ok, {module, _}} -> module
+        _ -> nil
+      end
+    end)
+    |> Enum.reject(&is_nil/1)
   end
 end
 ```

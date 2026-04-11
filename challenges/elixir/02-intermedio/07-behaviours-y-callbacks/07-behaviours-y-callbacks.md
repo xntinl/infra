@@ -21,10 +21,10 @@ Project structure at this point:
 task_queue/
 ├── lib/
 │   └── task_queue/
-│       ├── job_handler.ex           # ← the behaviour definition (you implement this)
+│       ├── job_handler.ex           # the behaviour definition
 │       ├── handlers/
-│       │   ├── default_handler.ex   # ← you implement this
-│       │   └── retrying_handler.ex  # ← you implement this
+│       │   ├── default_handler.ex
+│       │   └── retrying_handler.ex
 │       └── worker.ex                # updated to accept a configurable handler
 ├── test/
 │   └── task_queue/
@@ -150,6 +150,16 @@ defmodule TaskQueue.JobHandler do
 end
 ```
 
+The `run/2` function is the behavior's dispatch engine. It orchestrates the retry loop
+by calling the handler module's callbacks at each step. Each attempt runs inside a
+`Task.async/await` pair to enforce the timeout. If the task exceeds `timeout_ms`, the
+catch clause returns `{:error, :timeout}` and the handler's `on_failure/3` decides
+whether to retry or abort.
+
+The recursive `do_run/3` increments the attempt counter on each retry. When `attempt`
+reaches `max_attempts`, the function returns `{:error, {:max_attempts_exceeded, reason}}`
+regardless of what `on_failure/3` returns — the handler cannot override the maximum.
+
 ### Step 2: `lib/task_queue/handlers/default_handler.ex`
 
 ```elixir
@@ -166,20 +176,22 @@ defmodule TaskQueue.Handlers.DefaultHandler do
 
   @impl TaskQueue.JobHandler
   def execute(job, _ctx) do
-    # HINT: job.payload is expected to be a function (-> any())
-    # Call it and return {:ok, result}
-    # If it returns an error tuple, pass it through
-    # TODO: implement
+    result = job.payload.()
+    {:ok, result}
   end
 
   @impl TaskQueue.JobHandler
-  def on_failure(_job, reason, _ctx) do
-    # DefaultHandler never retries — always abort
-    # HINT: return :abort
-    # TODO: implement
+  def on_failure(_job, _reason, _ctx) do
+    :abort
   end
 end
 ```
+
+The DefaultHandler calls `job.payload.()` directly and wraps the return value in
+`{:ok, result}`. If the payload raises an exception, the raise propagates out of
+`execute/2`, and the `Task.async/await` in `JobHandler.run/2` catches it as an exit
+signal. Since `max_attempts` is 1, the error is immediately returned as
+`{:error, {:max_attempts_exceeded, reason}}` — `on_failure/3` is never called.
 
 ### Step 3: `lib/task_queue/handlers/retrying_handler.ex`
 
@@ -194,35 +206,40 @@ defmodule TaskQueue.Handlers.RetryingHandler do
   require Logger
 
   @impl TaskQueue.JobHandler
-  # HINT: return 3
-  def max_attempts do
-    # TODO: implement
-  end
+  def max_attempts, do: 3
 
   @impl TaskQueue.JobHandler
-  # HINT: return 5_000
-  def timeout_ms do
-    # TODO: implement
-  end
+  def timeout_ms, do: 5_000
 
   @impl TaskQueue.JobHandler
   def execute(job, ctx) do
     Logger.debug("RetryingHandler attempt #{ctx.attempt} for job #{job.id}")
-    # HINT: same as DefaultHandler — call job.payload.() and wrap result
-    # TODO: implement
+    result = job.payload.()
+    {:ok, result}
   end
 
   @impl TaskQueue.JobHandler
   def on_failure(job, reason, ctx) do
-    # Exponential backoff: 100ms * 2^(attempt-1)
     backoff_ms = 100 * :math.pow(2, ctx.attempt - 1) |> round()
-    Logger.warning("Job #{job.id} failed (attempt #{ctx.attempt}): #{inspect(reason)}. Retrying in #{backoff_ms}ms")
+
+    Logger.warning(
+      "Job #{job.id} failed (attempt #{ctx.attempt}): #{inspect(reason)}. " <>
+      "Retrying in #{backoff_ms}ms"
+    )
+
     Process.sleep(backoff_ms)
-    # HINT: return :retry — the behaviour infrastructure handles max_attempts
-    # TODO: implement
+    :retry
   end
 end
 ```
+
+The RetryingHandler uses exponential backoff: 100ms after the first failure, 200ms after
+the second. `Process.sleep/1` in `on_failure/3` blocks the Worker process during backoff.
+In a production system with many concurrent jobs, this blocking is a throughput concern —
+you would move the retry scheduling to a separate timer or use `Process.send_after/3`.
+
+The `on_failure/3` always returns `:retry` — the `JobHandler.run/2` engine enforces the
+`max_attempts` limit independently, so the handler does not need to track attempt counts.
 
 ### Step 4: Given tests — must pass without modification
 
@@ -321,7 +338,7 @@ mix test test/task_queue/job_handler_test.exs --trace
 | Aspect | Behaviour (this exercise) | Anonymous function | Protocol |
 |--------|--------------------------|-------------------|---------|
 | Multiple related callbacks | Yes — all grouped in one contract | No — one function per argument | Yes, but for data types |
-| Compile-time verification | Yes — missing @impl → warning | No | Yes |
+| Compile-time verification | Yes — missing @impl -> warning | No | Yes |
 | Module-level state/config | Yes — module attributes, compile_env | Via closure capture | No |
 | Dispatch | Static — you pass the module | Static — you pass the function | Dynamic — based on value type |
 | When to use | Pluggable strategy modules | Simple, single-function plug | Extending behaviour of data types |

@@ -69,6 +69,15 @@ The `Pipeline` module needs to:
 
 ### `lib/payments_cli/pipeline.ex`
 
+The pipeline processes each CSV line through three steps: parse, validate, and status
+conversion. Each step returns `{:ok, data}` or `{:error, reason}`. On error, we tag
+the error with the step name so the caller knows where the failure occurred.
+
+The batch processor uses `Enum.with_index/2` to track line numbers and
+`Enum.reduce/3` to split results into successes and errors in a single pass.
+Results are prepended (O(1)) then reversed at the end (O(n) once) — the standard
+pattern for building lists efficiently in Elixir.
+
 ```elixir
 defmodule PaymentsCli.Pipeline do
   @moduledoc """
@@ -98,22 +107,25 @@ defmodule PaymentsCli.Pipeline do
   """
   @spec process_line(String.t()) :: {:ok, map()} | {:error, {atom(), term()}}
   def process_line(line) when is_binary(line) do
-    # TODO: implement the pipeline
-    #
-    # Step 1: parse with Formatter.parse_csv_line/1
-    #   On {:error, reason}, return {:error, {:parse, reason}}
-    #
-    # Step 2: validate the parsed map (check amount_cents > 0, currency is 3 chars)
-    #   On failure, return {:error, {:validate, reason}}
-    #
-    # Step 3: convert string status to atom with Transaction.parse_status/1
-    #   On {:error, reason}, return {:error, {:status, reason}}
-    #
-    # Return {:ok, map_with_atom_status} on success
-    #
-    # HINT: use case expressions to pattern match on each step result.
-    # In exercise 09 you'll learn `with` which makes this more concise —
-    # for now, use nested case expressions.
+    case Formatter.parse_csv_line(line) do
+      {:error, reason} ->
+        {:error, {:parse, reason}}
+
+      {:ok, parsed} ->
+        case validate_transaction(parsed) do
+          {:error, reason} ->
+            {:error, {:validate, reason}}
+
+          {:ok, validated} ->
+            case Transaction.parse_status(validated.status) do
+              {:error, reason} ->
+                {:error, {:status, reason}}
+
+              {:ok, status_atom} ->
+                {:ok, Map.put(validated, :status, status_atom)}
+            end
+        end
+    end
   end
 
   @doc """
@@ -135,13 +147,17 @@ defmodule PaymentsCli.Pipeline do
   """
   @spec process_batch([String.t()]) :: {[map()], [{pos_integer(), term()}]}
   def process_batch(lines) when is_list(lines) do
-    # TODO: implement batch processing
-    #
-    # HINT: use Enum.with_index(lines, 1) to get {line, line_number} pairs.
-    # Then Enum.reduce to build two accumulators: one for successes, one for errors.
-    # Pattern match on {:ok, tx} and {:error, reason} from process_line/1.
-    #
-    # Remember: prepend to accumulators (O(1)) then Enum.reverse at the end.
+    {successes, errors} =
+      lines
+      |> Enum.with_index(1)
+      |> Enum.reduce({[], []}, fn {line, line_number}, {ok_acc, err_acc} ->
+        case process_line(line) do
+          {:ok, tx} -> {[tx | ok_acc], err_acc}
+          {:error, reason} -> {ok_acc, [{line_number, reason} | err_acc]}
+        end
+      end)
+
+    {Enum.reverse(successes), Enum.reverse(errors)}
   end
 
   # ---------------------------------------------------------------------------
@@ -150,11 +166,36 @@ defmodule PaymentsCli.Pipeline do
 
   @spec validate_transaction(map()) :: {:ok, map()} | {:error, String.t()}
   defp validate_transaction(%{amount_cents: amount, currency: currency} = tx) do
-    # TODO: validate amount_cents > 0 and String.length(currency) == 3
-    # Return {:ok, tx} on success, {:error, reason_string} on failure
+    cond do
+      amount <= 0 ->
+        {:error, "amount must be positive"}
+
+      String.length(currency) != 3 ->
+        {:error, "currency must be 3 characters"}
+
+      true ->
+        {:ok, tx}
+    end
   end
 end
 ```
+
+**Why this works:**
+
+- `process_line/1` uses nested `case` expressions to chain three fallible steps. Each
+  `case` pattern-matches on the result tuple: `{:ok, data}` continues to the next step,
+  `{:error, reason}` wraps the reason with a step tag and returns immediately. The
+  nesting is intentional — in exercise 09 you will learn `with` which flattens this
+  pattern, but understanding the explicit `case` chain first is essential.
+
+- `process_batch/1` uses `Enum.with_index(lines, 1)` to pair each line with its 1-based
+  line number, then reduces into two accumulators. Each result is prepended to the
+  appropriate accumulator (O(1) per step), then both lists are reversed at the end
+  (O(n) total). This is O(n) overall, not O(n²).
+
+- `validate_transaction/1` uses `cond` because the checks are independent boolean
+  conditions, not pattern matches on a value's shape. `cond` is the right tool when
+  you have "check this, then that, then the other" logic.
 
 ### Given tests — must pass without modification
 

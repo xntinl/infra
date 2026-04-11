@@ -23,8 +23,8 @@ task_queue/
 │       ├── application.ex       # ← you wire this (exercise 06 completes it)
 │       ├── queue_server.ex      # exercise 04
 │       ├── task_registry.ex     # exercise 02
-│       ├── worker.ex            # ← you implement this
-│       └── supervisor.ex        # ← you implement this
+│       ├── worker.ex
+│       └── supervisor.ex
 ├── test/
 │   └── task_queue/
 │       └── supervisor_test.exs  # given tests — must pass without modification
@@ -110,11 +110,27 @@ defmodule TaskQueue.Worker do
         {:reply, {:error, :empty}, state}
 
       {:ok, job} ->
-        # HINT: call TaskQueue.TaskRegistry.transition(job.id, :running)
-        # HINT: execute job.payload.() wrapped in try/rescue
-        # HINT: on success: transition to :done, reply {:ok, result}
-        # HINT: on error: transition to :failed, reply {:error, reason}
-        # TODO: implement
+        TaskQueue.TaskRegistry.transition(job.id, :running)
+
+        result =
+          try do
+            value = if is_function(job.payload), do: job.payload.(), else: job.payload
+            TaskQueue.TaskRegistry.transition(job.id, :done)
+            {:ok, value}
+          rescue
+            e ->
+              TaskQueue.TaskRegistry.transition(job.id, :failed)
+              {:error, e}
+          end
+
+        case result do
+          {:ok, _} ->
+            Logger.debug("Worker processed job #{job.id} successfully")
+
+          {:error, reason} ->
+            Logger.warning("Worker job #{job.id} failed: #{inspect(reason)}")
+        end
+
         {:reply, :ok, %{state | jobs_processed: state.jobs_processed + 1}}
     end
   end
@@ -123,6 +139,15 @@ defmodule TaskQueue.Worker do
   def handle_info(_, state), do: {:noreply, state}
 end
 ```
+
+The Worker first calls `TaskQueue.TaskRegistry.transition/2` to mark the job as `:running`,
+then executes the payload. If execution succeeds, the job transitions to `:done`; if it
+raises, the job transitions to `:failed`. The `try/rescue` ensures the Worker process
+itself never crashes due to a bad payload — it reports the error and continues.
+
+The payload check `is_function(job.payload)` handles both callable payloads (from the
+batch runner) and data payloads (from manual pushes in tests). In production, you would
+enforce a consistent payload contract.
 
 ### Step 2: `lib/task_queue/supervisor.ex`
 
@@ -137,18 +162,24 @@ defmodule TaskQueue.Supervisor do
   @impl Supervisor
   def init(_opts) do
     children = [
-      # HINT: list the three children in dependency order:
-      #   TaskQueue.TaskRegistry — no dependencies
-      #   TaskQueue.QueueServer  — no dependencies
-      #   TaskQueue.Worker       — depends on both above
-      # TODO: implement children list
+      TaskQueue.TaskRegistry,
+      TaskQueue.QueueServer,
+      TaskQueue.Worker
     ]
 
-    # HINT: Supervisor.init(children, strategy: :one_for_one)
-    # TODO: implement
+    Supervisor.init(children, strategy: :one_for_one)
   end
 end
 ```
+
+The children are listed in dependency order: TaskRegistry and QueueServer have no
+dependencies and start first. Worker depends on both — it is listed last so that by
+the time it starts, the processes it calls are already running.
+
+`Supervisor.init/2` with `strategy: :one_for_one` means each child is independent:
+if QueueServer crashes, only QueueServer restarts. TaskRegistry and Worker continue
+running with their existing state. This matches the task_queue architecture where the
+queue and registry are independent stores.
 
 ### Step 3: Given tests — must pass without modification
 
@@ -245,7 +276,7 @@ mix test test/task_queue/supervisor_test.exs --trace
 |--------|---------------|---------------|----------------|
 | Impact of one crash | Minimal — only that child restarts | Maximum — all children restart | Medium — crashed + later children |
 | Use case | Independent workers | Tightly coupled children | Linear dependency chain |
-| In task_queue | Registry ↔ QueueServer independent | N/A | Worker depends on Queue + Registry |
+| In task_queue | Registry <-> QueueServer independent | N/A | Worker depends on Queue + Registry |
 | max_restarts default | 3 in 5 seconds | Same | Same |
 
 Reflection question: the Supervisor uses `max_restarts: 3, max_seconds: 5` by default. If

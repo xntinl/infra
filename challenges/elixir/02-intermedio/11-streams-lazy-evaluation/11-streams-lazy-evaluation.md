@@ -20,7 +20,7 @@ Project structure at this point:
 task_queue/
 ├── lib/
 │   └── task_queue/
-│       └── log_reader.ex        # ← you implement this
+│       └── log_reader.ex
 ├── test/
 │   └── task_queue/
 │       └── streams_test.exs     # given tests — must pass without modification
@@ -41,13 +41,13 @@ a terminal function (`Enum.to_list`, `Enum.take`, `Stream.run`) consumes it.
 
 ```
 Enum (eager):
-  input → [filter → intermediate list] → [map → final list]
+  input -> [filter -> intermediate list] -> [map -> final list]
 
 Stream (lazy):
-  element_1 → filter → map → consumer
-  element_2 → filter → map → consumer
-  element_3 → filter (dropped)
-  element_4 → filter → map → consumer
+  element_1 -> filter -> map -> consumer
+  element_2 -> filter -> map -> consumer
+  element_3 -> filter (dropped)
+  element_4 -> filter -> map -> consumer
 ```
 
 This matters when:
@@ -95,13 +95,16 @@ defmodule TaskQueue.LogReader do
   """
   @spec stream_file(Path.t()) :: Enumerable.t()
   def stream_file(path) do
-    # HINT: File.stream!(path) produces a stream of lines (with trailing newline)
-    # HINT: Stream.map to String.trim each line
-    # HINT: Stream.filter to keep non-empty lines
-    # HINT: Stream.map to parse_line/1
-    # HINT: Stream.filter to reject :error (keep only {:ok, entry} values)
-    # HINT: Stream.map to unwrap {:ok, entry} → entry
-    # TODO: implement
+    path
+    |> File.stream!()
+    |> Stream.map(&String.trim/1)
+    |> Stream.reject(&(&1 == ""))
+    |> Stream.map(&parse_line/1)
+    |> Stream.filter(fn
+      {:ok, _} -> true
+      :error -> false
+    end)
+    |> Stream.map(fn {:ok, entry} -> entry end)
   end
 
   @doc """
@@ -110,8 +113,10 @@ defmodule TaskQueue.LogReader do
   """
   @spec count_by_status(Path.t(), atom()) :: non_neg_integer()
   def count_by_status(path, status) do
-    # HINT: stream_file(path) |> Stream.filter(...) |> Enum.count()
-    # TODO: implement
+    path
+    |> stream_file()
+    |> Stream.filter(fn entry -> entry.status == status end)
+    |> Enum.count()
   end
 
   @doc """
@@ -120,8 +125,10 @@ defmodule TaskQueue.LogReader do
   """
   @spec first_failures(Path.t(), pos_integer()) :: [map()]
   def first_failures(path, n) do
-    # HINT: stream_file(path) |> Stream.filter(status == :error) |> Enum.take(n)
-    # TODO: implement
+    path
+    |> stream_file()
+    |> Stream.filter(fn entry -> entry.status == :error end)
+    |> Enum.take(n)
   end
 
   @doc """
@@ -133,9 +140,7 @@ defmodule TaskQueue.LogReader do
   """
   @spec cron_schedule_stream(pos_integer(), pos_integer()) :: Enumerable.t()
   def cron_schedule_stream(start_ms, interval_ms) do
-    # HINT: Stream.iterate(start_ms, fn ts -> ts + interval_ms end)
-    # This produces an infinite stream — never enumerate it without Enum.take/Stream.take
-    # TODO: implement
+    Stream.iterate(start_ms, fn ts -> ts + interval_ms end)
   end
 
   @doc """
@@ -143,8 +148,9 @@ defmodule TaskQueue.LogReader do
   """
   @spec next_triggers(pos_integer(), pos_integer(), pos_integer()) :: [pos_integer()]
   def next_triggers(after_ms, interval_ms, count) do
-    # HINT: cron_schedule_stream(after_ms, interval_ms) |> Enum.take(count)
-    # TODO: implement
+    after_ms
+    |> cron_schedule_stream(interval_ms)
+    |> Enum.take(count)
   end
 
   @doc """
@@ -152,7 +158,7 @@ defmodule TaskQueue.LogReader do
   exponential backoff between attempts.
 
   Returns {:ok, result} on first success or {:error, :max_attempts} on final failure.
-  Uses Stream.resource/3 to model the retry sequence as a lazy stream.
+  Uses Stream.map and Stream.drop_while to model the retry sequence as a lazy stream.
   """
   @spec retry_stream((() -> {:ok, any()} | {:error, any()}), pos_integer()) ::
           {:ok, any()} | {:error, :max_attempts}
@@ -164,9 +170,7 @@ defmodule TaskQueue.LogReader do
       {attempt, operation.()}
     end)
     |> Stream.drop_while(fn {_attempt, result} ->
-      # HINT: keep iterating (drop) while result is {:error, _}
-      # Stop (keep) when result is {:ok, _}
-      # TODO: implement
+      match?({:error, _}, result)
     end)
     |> Enum.take(1)
     |> case do
@@ -204,6 +208,29 @@ defmodule TaskQueue.LogReader do
   end
 end
 ```
+
+The `stream_file/1` function builds a pipeline of lazy transformations:
+
+1. `File.stream!/1` opens the file and returns a stream that yields one line at a time.
+   The file is only read as the stream is consumed — no upfront allocation.
+2. `Stream.map(&String.trim/1)` strips trailing newlines from each line.
+3. `Stream.reject(&(&1 == ""))` drops blank lines.
+4. `Stream.map(&parse_line/1)` parses each line into `{:ok, map}` or `:error`.
+5. `Stream.filter` keeps only successfully parsed lines.
+6. `Stream.map` unwraps the `{:ok, entry}` tuple.
+
+None of these transformations execute until a terminal function like `Enum.to_list`,
+`Enum.count`, or `Enum.take` consumes the stream.
+
+The `retry_stream/2` function uses `Stream.drop_while/2` to skip failed attempts. As
+soon as the first success is found, `Enum.take(1)` stops the stream — no further attempts
+are made. If all attempts fail, `Enum.take(1)` returns an empty list, and the `case`
+returns `{:error, :max_attempts}`.
+
+The `cron_schedule_stream/2` function uses `Stream.iterate/2` to produce an infinite
+sequence. Each element is the previous value plus the interval. Since the stream is lazy,
+it never materializes more than one element at a time — but calling `Enum.to_list/1` on
+it would run forever.
 
 ### Step 2: Given tests — must pass without modification
 
@@ -346,7 +373,7 @@ Always pair infinite streams with `Enum.take/2` or `Stream.take/2`.
 # This does NOTHING — the stream is defined but never consumed
 File.stream!("big.log") |> Stream.map(&IO.puts/1)
 
-# Correct — Enum.run/1 consumes the stream for side effects
+# Correct — Stream.run/1 consumes the stream for side effects
 File.stream!("big.log") |> Stream.map(&IO.puts/1) |> Stream.run()
 ```
 

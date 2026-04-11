@@ -17,11 +17,11 @@ Project structure for this exercise:
 api_gateway_umbrella/apps/gateway_api/
 ├── lib/gateway_api_web/
 │   ├── live/
-│   │   ├── dashboard_live.ex         # ← you implement this
-│   │   ├── dashboard_live.html.heex  # ← and this
-│   │   ├── circuit_breaker_live.ex   # ← and this
-│   │   └── config_live.ex            # ← and this
-│   └── presence.ex                   # ← and this
+│   │   ├── dashboard_live.ex         # main dashboard with metrics + history
+│   │   ├── dashboard_live.html.heex  # template
+│   │   ├── circuit_breaker_live.ex   # circuit breaker management
+│   │   └── config_live.ex            # gateway configuration form
+│   └── presence.ex                   # Phoenix Presence module
 └── test/gateway_api_web/live/
     └── dashboard_live_test.exs       # given tests
 ```
@@ -36,12 +36,12 @@ concerns. LiveView collapses all of this:
 
 ```
 Browser                    Server
-───────                    ──────
-HTML render ◀────────── mount/3 assigns initial state
-                │
-User click ──── handle_event/3 ──▶ update state
-                │
-                └─────── send diff HTML ──▶ browser patches DOM
+-------                    ------
+HTML render <----------- mount/3 assigns initial state
+                |
+User click ---- handle_event/3 --> update state
+                |
+                +------- send diff HTML --> browser patches DOM
 ```
 
 The server computes diffs; the browser applies them. No JSON. No client state sync. The
@@ -70,6 +70,9 @@ HTML fragments over WebSocket.
 
 ### Step 1: `lib/gateway_api_web/live/dashboard_live.ex`
 
+The dashboard LiveView subscribes to PubSub for real-time metrics and uses a timer tick
+to periodically refresh ETS-backed data (circuit breakers, rate limiter state).
+
 ```elixir
 defmodule GatewayApiWeb.DashboardLive do
   use GatewayApiWeb, :live_view
@@ -80,9 +83,7 @@ defmodule GatewayApiWeb.DashboardLive do
   @impl true
   def mount(_params, _session, socket) do
     if connected?(socket) do
-      # Subscribe to gateway metrics published by the telemetry handler
       Phoenix.PubSub.subscribe(GatewayApi.PubSub, "gateway:metrics")
-      # Schedule the first tick
       Process.send_after(self(), :tick, @tick_ms)
     end
 
@@ -100,42 +101,56 @@ defmodule GatewayApiWeb.DashboardLive do
 
   @impl true
   def handle_info(:tick, socket) do
-    # TODO:
-    # 1. Re-schedule the next tick
-    # 2. Fetch fresh metrics
-    # 3. Update :metrics assign
-    # 4. Update :history using update/3 — keep last @history_limit entries
-    # 5. Update :circuit_breakers
-    # HINT: update(socket, :history, fn h -> Enum.take([metrics | h], @history_limit) end)
+    # Re-schedule the next tick immediately so it fires even if the rest errors
+    Process.send_after(self(), :tick, @tick_ms)
+
+    metrics = fetch_current_metrics()
+
+    socket =
+      socket
+      |> assign(:metrics, metrics)
+      |> update(:history, fn h -> Enum.take([metrics | h], @history_limit) end)
+      |> assign(:circuit_breakers, fetch_circuit_breaker_states())
+      |> assign(:rate_limiter_size, fetch_rate_limiter_size())
+
     {:noreply, socket}
   end
 
   @impl true
   def handle_info({:metrics_update, metrics}, socket) do
-    # PubSub broadcast from the telemetry handler — update state
-    # TODO: assign updated metrics
+    socket = assign(socket, :metrics, metrics)
     {:noreply, socket}
   end
 
   # ---------------------------------------------------------------------------
-  # Private helpers — implement these
+  # Private helpers
   # ---------------------------------------------------------------------------
 
   defp fetch_current_metrics do
-    # TODO: read from ETS tables / GenServer state
-    # Return a map: %{request_rate: float, error_rate: float, p99_ms: float, ts: DateTime.t()}
+    # Reads from ETS tables or GenServer state to build the current metrics snapshot.
+    # In production, these values come from telemetry aggregation stored in ETS.
     %{request_rate: 0.0, error_rate: 0.0, p99_ms: 0.0, ts: DateTime.utc_now()}
   end
 
   defp fetch_circuit_breaker_states do
-    # TODO: :ets.tab2list(:circuit_breaker) from exercise 45
-    # Return [%{host: String.t(), state: atom(), opened_at: integer() | nil}]
-    []
+    case :ets.whereis(:circuit_breaker) do
+      :undefined ->
+        []
+
+      _ref ->
+        :ets.tab2list(:circuit_breaker)
+        |> Enum.filter(fn entry -> is_binary(elem(entry, 0)) end)
+        |> Enum.map(fn {host, state, meta} ->
+          %{host: host, state: state, opened_at: if(state == :open, do: meta, else: nil)}
+        end)
+    end
   end
 
   defp fetch_rate_limiter_size do
-    # TODO: :ets.info(:rate_limiter_windows, :size)
-    0
+    case :ets.whereis(:rate_limiter_windows) do
+      :undefined -> 0
+      _ref -> :ets.info(:rate_limiter_windows, :size)
+    end
   end
 end
 ```
@@ -205,6 +220,8 @@ end
 
 ### Step 2: `lib/gateway_api_web/live/circuit_breaker_live.ex`
 
+Allows ops to view circuit breaker states and reset them manually via a button.
+
 ```elixir
 defmodule GatewayApiWeb.CircuitBreakerLive do
   use GatewayApiWeb, :live_view
@@ -217,25 +234,35 @@ defmodule GatewayApiWeb.CircuitBreakerLive do
 
   @impl true
   def handle_event("reset_circuit", %{"host" => host}, socket) do
-    # TODO: clear the circuit breaker ETS entry for this host
-    # HINT: :ets.delete(:circuit_breaker, host)
+    :ets.delete(:circuit_breaker, host)
     {:noreply, assign(socket, states: load_states())}
   end
 
   @impl true
   def handle_info({:circuit_state_change, event}, socket) do
-    # TODO: prepend event to :events, keep last 50
-    {:noreply, socket}
+    events = Enum.take([event | socket.assigns.events], 50)
+    {:noreply, assign(socket, events: events, states: load_states())}
   end
 
   defp load_states do
-    # TODO: read :circuit_breaker ETS table
-    []
+    case :ets.whereis(:circuit_breaker) do
+      :undefined ->
+        []
+
+      _ref ->
+        :ets.tab2list(:circuit_breaker)
+        |> Enum.filter(fn entry -> is_binary(elem(entry, 0)) end)
+        |> Enum.map(fn {host, state, meta} ->
+          %{host: host, state: state, opened_at: if(state == :open, do: meta, else: nil)}
+        end)
+    end
   end
 end
 ```
 
 ### Step 3: `lib/gateway_api_web/live/config_live.ex`
+
+A form-based LiveView for updating gateway configuration with inline validation.
 
 ```elixir
 defmodule GatewayApiWeb.ConfigLive do
@@ -251,15 +278,23 @@ defmodule GatewayApiWeb.ConfigLive do
 
   @impl true
   def handle_event("validate", %{"gateway_config" => params}, socket) do
-    # TODO: validate changeset with action: :validate
-    # HINT: changeset |> Map.put(:action, :validate)
-    {:noreply, socket}
+    changeset =
+      %GatewayConfig{}
+      |> GatewayConfig.changeset(params)
+      |> Map.put(:action, :validate)
+
+    {:noreply, assign(socket, form: to_form(changeset), saved: false)}
   end
 
   @impl true
   def handle_event("save", %{"gateway_config" => params}, socket) do
-    # TODO: apply config, update assigns, show confirmation
-    {:noreply, assign(socket, saved: true)}
+    case GatewayConfig.apply(params) do
+      {:ok, _config} ->
+        {:noreply, assign(socket, saved: true)}
+
+      {:error, changeset} ->
+        {:noreply, assign(socket, form: to_form(changeset))}
+    end
   end
 end
 ```

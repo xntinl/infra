@@ -75,6 +75,12 @@ Implement a `Config` module that:
 
 ### `lib/payments_cli/config.ex`
 
+The `Config` module uses module attributes for compile-time constants and exposes
+them through typed public functions. `new/1` is the validated constructor — it
+merges caller options with defaults, then runs validation. The validation logic
+is private (`defp`) because it is an implementation detail. External callers use
+`new/1` and get either `{:ok, config}` or `{:error, reason}`.
+
 ```elixir
 defmodule PaymentsCli.Config do
   @moduledoc """
@@ -92,8 +98,6 @@ defmodule PaymentsCli.Config do
 
   """
 
-  # Module attributes are compile-time constants.
-  # They name magic numbers and make them searchable.
   @default_fee_basis_points 250
   @default_max_amount_cents 1_000_000
   @supported_currencies ["USD", "EUR", "GBP", "JPY", "CAD"]
@@ -162,20 +166,22 @@ defmodule PaymentsCli.Config do
   """
   @spec new(keyword()) :: {:ok, map()} | {:error, String.t()}
   def new(opts \\ []) when is_list(opts) do
-    # TODO: build a config map with defaults, then validate it
-    #
-    # defaults = %{
-    #   fee_basis_points: @default_fee_basis_points,
-    #   max_amount_cents: @default_max_amount_cents,
-    #   require_reference: false,
-    #   currencies: @supported_currencies
-    # }
-    #
-    # config = Enum.reduce(opts, defaults, fn {key, value}, acc ->
-    #   Map.put(acc, key, value)
-    # end)
-    #
-    # Then call validate_config/1 (private) and return {:ok, config} or {:error, reason}
+    defaults = %{
+      fee_basis_points: @default_fee_basis_points,
+      max_amount_cents: @default_max_amount_cents,
+      require_reference: false,
+      currencies: @supported_currencies
+    }
+
+    config =
+      Enum.reduce(opts, defaults, fn {key, value}, acc ->
+        Map.put(acc, key, value)
+      end)
+
+    case validate_config(config) do
+      :ok -> {:ok, config}
+      {:error, reason} -> {:error, reason}
+    end
   end
 
   @doc """
@@ -187,13 +193,14 @@ defmodule PaymentsCli.Config do
       iex> PaymentsCli.Config.currency_supported?(config, "USD")
       true
 
+      iex> {:ok, config} = PaymentsCli.Config.new()
       iex> PaymentsCli.Config.currency_supported?(config, "BTC")
       false
 
   """
   @spec currency_supported?(map(), String.t()) :: boolean()
   def currency_supported?(%{currencies: currencies}, currency) when is_binary(currency) do
-    # TODO: check currency in currencies
+    currency in currencies
   end
 
   # ---------------------------------------------------------------------------
@@ -218,6 +225,27 @@ defmodule PaymentsCli.Config do
   defp validate_config(_config), do: :ok
 end
 ```
+
+**Why this works:**
+
+- Module attributes (`@default_fee_basis_points`, `@supported_currencies`, `@version`)
+  are compile-time constants. They are inlined into the functions that reference them,
+  so there is no runtime lookup cost. They name magic numbers and make the module
+  self-documenting.
+
+- `new/1` uses `Enum.reduce/3` to merge caller options into the defaults map. Each
+  `{key, value}` pair from the keyword list overwrites the corresponding default.
+  Unknown keys are silently added — this is intentional for forward compatibility.
+  After merging, `validate_config/1` checks invariants.
+
+- `validate_config/1` uses multiple `defp` clauses with guards. Each clause checks
+  one invariant. The clauses are ordered so that the first failing check returns its
+  error. The final catch-all returns `:ok`. Adding a new validation rule means adding
+  one clause — no existing code changes.
+
+- `currency_supported?/2` pattern-matches the `:currencies` key from the config map
+  in the function head and uses `in` to check membership. The `in` operator works
+  on lists and is O(n), but for a short list of 5 currencies, this is negligible.
 
 ### Given tests — must pass without modification
 

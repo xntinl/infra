@@ -93,23 +93,17 @@ defmodule TaskQueue.MixProject do
       elixir: "~> 1.15",
       start_permanent: Mix.env() == :prod,
       deps: deps(),
-      releases: releases()   # ← add this
+      releases: releases()
     ]
   end
 
-  # TODO: implement releases/0
-  # Return a keyword list with a :task_queue release that includes:
-  #   include_executables_for: [:unix]
-  #   include_erts: true
-  # HINT:
-  # [
-  #   task_queue: [
-  #     include_executables_for: [:unix],
-  #     include_erts: true
-  #   ]
-  # ]
   defp releases do
-    # TODO: implement
+    [
+      task_queue: [
+        include_executables_for: [:unix],
+        include_erts: true
+      ]
+    ]
   end
 
   def application do
@@ -254,6 +248,8 @@ mix test test/task_queue/release_config_test.exs --trace
 | CI reproducibility | depends on Elixir version on server | self-contained |
 
 Reflection question: `start_permanent: Mix.env() == :prod` causes the Erlang VM to exit if the top-level supervisor crashes. Why is this desirable in production but undesirable in development?
+
+Answer: In production, a crashed top-level supervisor means the application is broken beyond recovery. Exiting the VM lets the orchestrator (systemd, Docker, Kubernetes) restart the entire node from a clean state, which is far safer than leaving a half-running application. In development, you want the VM to stay alive after a crash so you can inspect the error in IEx, fix the code, and recompile — without restarting the entire session and losing REPL state.
 
 ---
 

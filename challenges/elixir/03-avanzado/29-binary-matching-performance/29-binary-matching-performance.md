@@ -132,7 +132,13 @@ end
 
 ### Step 3: `lib/api_gateway/middleware/parser.ex`
 
-`# TODO` marks what you implement. Do not change the public function signatures.
+The module implements three parsing strategies for the same HTTP request line format.
+All three return the identical result shape, allowing direct benchmarking comparison.
+
+The binary matching strategy (`parse_binary/1`) is the target implementation. It scans
+the input left-to-right using tail-recursive helpers that preserve BEAM's match context.
+Each helper accumulates bytes into an iolist (O(1) per step) and converts to a binary
+only at the boundary between tokens.
 
 ```elixir
 defmodule ApiGateway.Middleware.Parser do
@@ -198,52 +204,58 @@ defmodule ApiGateway.Middleware.Parser do
 
   @spec parse_binary(binary()) :: {:ok, map()} | {:error, :invalid_request_line}
   def parse_binary(line) do
-    # HINT: scan left-to-right using tail-recursive helpers
-    # HINT: keep the cursor on the same binary argument — do not rebind `line`
-    # HINT: space is 0x20, "?" is 0x3F — use integer literals as delimiters
-    # TODO: implement by delegating to scan_method/2
     scan_method(line, [])
   end
 
-  # Scans bytes until 0x20 (space), accumulates the method
+  # Scans bytes until 0x20 (space), accumulates the method into an iolist.
+  # When the space delimiter is found, the accumulated iolist is converted to
+  # a binary and scanning continues with scan_path/3.
   defp scan_method(<<0x20, rest::binary>>, acc) do
-    # HINT: convert the iolist accumulator to a binary here
-    # TODO: call scan_path with the method and rest
+    method = IO.iodata_to_binary(acc)
+    scan_path(rest, [], method)
   end
 
+  # Each byte is appended to the iolist accumulator. Because the same binary
+  # argument (`rest`) flows directly into the next recursive call without
+  # rebinding, BEAM reuses the match context — zero allocations per byte.
   defp scan_method(<<byte, rest::binary>>, acc) do
-    # TODO: accumulate byte and recurse — match context is preserved here
+    scan_method(rest, [acc, byte])
   end
 
   defp scan_method(<<>>, _acc), do: {:error, :invalid_request_line}
 
-  # Scans bytes until 0x3F ("?") or 0x20 (space)
+  # Scans bytes until 0x3F ("?") or 0x20 (space).
+  # 0x3F means a query string follows; 0x20 means no query, jump to version.
   defp scan_path(<<0x3F, rest::binary>>, acc, method) do
-    # TODO: path found, now scan query
+    path = IO.iodata_to_binary(acc)
+    scan_query(rest, [], method, path)
   end
 
   defp scan_path(<<0x20, rest::binary>>, acc, method) do
-    # TODO: no query string, now scan version
+    path = IO.iodata_to_binary(acc)
+    scan_version(rest, method, path, "")
   end
 
   defp scan_path(<<byte, rest::binary>>, acc, method) do
-    # TODO: accumulate and recurse
+    scan_path(rest, [acc, byte], method)
   end
 
   defp scan_path(<<>>, _acc, _method), do: {:error, :invalid_request_line}
 
-  # Scans bytes until 0x20 (space), accumulates the query string
+  # Scans bytes until 0x20 (space), accumulates the query string.
   defp scan_query(<<0x20, rest::binary>>, acc, method, path) do
-    # TODO: call scan_version
+    query = IO.iodata_to_binary(acc)
+    scan_version(rest, method, path, query)
   end
 
   defp scan_query(<<byte, rest::binary>>, acc, method, path) do
-    # TODO: accumulate and recurse
+    scan_query(rest, [acc, byte], method, path)
   end
 
   defp scan_query(<<>>, _acc, _method, _path), do: {:error, :invalid_request_line}
 
-  # Matches the literal "HTTP/" prefix and extracts the version
+  # Matches the literal "HTTP/" prefix and extracts the version string.
+  # String.trim/1 handles any trailing whitespace (e.g., \r\n from raw TCP).
   defp scan_version(<<"HTTP/", version::binary>>, method, path, query) do
     {:ok, %{method: method, path: path, query: query, version: String.trim(version)}}
   end
@@ -309,7 +321,9 @@ end
 mix test test/api_gateway/middleware/parser_test.exs --trace
 ```
 
-All tests for `parse_binary/1` fail initially. Implement the `scan_*` helpers until all pass.
+All tests should pass. The binary parser scans left-to-right through the input,
+splitting on space (0x20) and question mark (0x3F) delimiters, accumulating bytes
+into iolists for O(1) per-step allocation.
 
 ### Step 6: Benchmark
 
@@ -339,7 +353,7 @@ Benchee.run(
 mix run bench/parser_bench.exs
 ```
 
-**Expected result**: `parse_binary` should be 2–4× faster than `parse_regex` and allocate
+**Expected result**: `parse_binary` should be 2-4x faster than `parse_regex` and allocate
 significantly less memory. If binary and regex are equivalent, verify that your `scan_*`
 helpers do not rebind the binary before matching it.
 
@@ -375,7 +389,7 @@ you intend to store beyond the current request lifecycle.
 
 **3. Accumulating bytes into a new binary inside the recursive loop**
 ```elixir
-# Every iteration allocates a new binary — O(n²) total allocations
+# Every iteration allocates a new binary — O(n^2) total allocations
 defp scan(<<b, rest::binary>>, acc), do: scan(rest, acc <> <<b>>)
 
 # Accumulate into an iolist instead — O(1) per step, one copy at the end

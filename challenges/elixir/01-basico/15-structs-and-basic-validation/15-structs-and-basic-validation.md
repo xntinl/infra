@@ -87,7 +87,14 @@ has been using by convention: `:id`, `:status`, `:amount_cents`, `:currency`,
 
 ### Extend `lib/payments_cli/transaction.ex`
 
-Add a `defstruct` and the new public functions to the existing module:
+The struct uses `@enforce_keys` for required fields and provides defaults for
+optional fields. The `new/1` constructor validates required fields are present
+before building the struct, then runs validation on the built struct. This two-step
+approach catches both missing fields and invalid values.
+
+`approved?/1` and `set_status/2` pattern-match on `%__MODULE__{}` in their function
+heads — they only accept Transaction structs, not plain maps. This is type safety
+enforced at the function boundary.
 
 ```elixir
 defmodule PaymentsCli.Transaction do
@@ -105,9 +112,6 @@ defmodule PaymentsCli.Transaction do
 
   """
 
-  # All fields that a transaction can carry.
-  # Fields without a default MUST be provided in new/1.
-  # Fields with nil defaults are optional.
   @enforce_keys [:id, :amount_cents, :currency]
   defstruct [
     :id,
@@ -128,6 +132,65 @@ defmodule PaymentsCli.Transaction do
     date: String.t() | nil,
     reference: String.t() | nil
   }
+
+  @valid_statuses [:pending, :approved, :declined, :reversed, :flagged]
+
+  @doc """
+  Returns the list of valid transaction statuses.
+  """
+  @spec valid_statuses() :: [atom()]
+  def valid_statuses, do: @valid_statuses
+
+  @doc """
+  Classifies a transaction status atom into a reporting category string.
+
+  ## Examples
+
+      iex> PaymentsCli.Transaction.classify_status(:approved)
+      "successful"
+
+      iex> PaymentsCli.Transaction.classify_status(:declined)
+      "failed"
+
+      iex> PaymentsCli.Transaction.classify_status(:flagged)
+      "under_review"
+
+  """
+  @spec classify_status(atom()) :: String.t()
+  def classify_status(:approved), do: "successful"
+  def classify_status(:reversed), do: "successful"
+  def classify_status(:declined), do: "failed"
+  def classify_status(:flagged), do: "under_review"
+  def classify_status(:pending), do: "pending"
+  def classify_status(_unknown), do: "unknown"
+
+  @doc """
+  Parses a status string from external input into a status atom.
+
+  ## Examples
+
+      iex> PaymentsCli.Transaction.parse_status("approved")
+      {:ok, :approved}
+
+      iex> PaymentsCli.Transaction.parse_status("hacked_value")
+      {:error, :unknown_status}
+
+  """
+  @spec parse_status(String.t()) :: {:ok, atom()} | {:error, :unknown_status}
+  def parse_status(string) when is_binary(string) do
+    atom =
+      try do
+        String.to_existing_atom(string)
+      rescue
+        ArgumentError -> nil
+      end
+
+    if atom in @valid_statuses do
+      {:ok, atom}
+    else
+      {:error, :unknown_status}
+    end
+  end
 
   @doc """
   Creates a validated Transaction struct from a keyword list.
@@ -151,21 +214,16 @@ defmodule PaymentsCli.Transaction do
   """
   @spec new(keyword()) :: {:ok, t()} | {:error, String.t()}
   def new(fields) when is_list(fields) do
-    # TODO: build a Transaction struct from fields, then validate it.
-    #
-    # Step 1: check that required fields (:id, :amount_cents, :currency) are present
-    #   For each required field, if not Keyword.has_key?(fields, field),
-    #   return {:error, "#{field} is required"}
-    #
-    # Step 2: build the struct using struct/2
-    #   tx = struct(__MODULE__, fields)
-    #   Note: struct/2 ignores unknown keys, so only defined fields are set.
-    #
-    # Step 3: validate the built struct via validate/1 (private)
-    #   case validate(tx) do
-    #     :ok -> {:ok, tx}
-    #     {:error, reason} -> {:error, reason}
-    #   end
+    with :ok <- check_required(fields, :id),
+         :ok <- check_required(fields, :amount_cents),
+         :ok <- check_required(fields, :currency) do
+      tx = struct(__MODULE__, fields)
+
+      case validate(tx) do
+        :ok -> {:ok, tx}
+        {:error, reason} -> {:error, reason}
+      end
+    end
   end
 
   @doc """
@@ -204,8 +262,9 @@ defmodule PaymentsCli.Transaction do
 
   """
   @spec set_status(t(), atom()) :: {:ok, t()} | {:error, :invalid_status}
-  def set_status(%__MODULE__{} = tx, status) when status in [:pending, :approved, :declined, :flagged] do
-    # TODO: return {:ok, %__MODULE__{tx | status: status}}
+  def set_status(%__MODULE__{} = tx, status)
+      when status in [:pending, :approved, :declined, :flagged] do
+    {:ok, %__MODULE__{tx | status: status}}
   end
 
   def set_status(%__MODULE__{}, _status), do: {:error, :invalid_status}
@@ -222,26 +281,31 @@ defmodule PaymentsCli.Transaction do
   """
   @spec format_amount(t()) :: String.t()
   def format_amount(%__MODULE__{amount_cents: cents}) do
-    # TODO: convert cents to dollars and format as "$X.XX"
-    # Use div/2 for the dollar part and rem/2 for the cents part.
-    # Use String.pad_leading/3 to ensure the cents are always two digits.
+    major = div(cents, 100)
+    minor = rem(cents, 100)
+    "$#{major}.#{minor |> Integer.to_string() |> String.pad_leading(2, "0")}"
   end
-
-  # The existing functions (classify_status/1, parse_status/1, valid_statuses/0, etc.)
-  # from exercise 02 remain in the module unchanged — do NOT redefine them here.
-  # Structs are maps; the existing functions that accept map() also accept %Transaction{}.
-  # Over time, their @spec annotations would be tightened from map() to t().
 
   # ---------------------------------------------------------------------------
   # Private — validation details are implementation, not public contract
   # ---------------------------------------------------------------------------
+
+  @spec check_required(keyword(), atom()) :: :ok | {:error, String.t()}
+  defp check_required(fields, key) do
+    if Keyword.has_key?(fields, key) do
+      :ok
+    else
+      {:error, "#{key} is required"}
+    end
+  end
 
   @spec validate(t()) :: :ok | {:error, String.t()}
   defp validate(%__MODULE__{amount_cents: cents}) when cents < 0 do
     {:error, "amount_cents must be >= 0"}
   end
 
-  defp validate(%__MODULE__{currency: currency}) when not is_binary(currency) or byte_size(currency) == 0 do
+  defp validate(%__MODULE__{currency: currency})
+       when not is_binary(currency) or byte_size(currency) == 0 do
     {:error, "currency must be a non-empty string"}
   end
 
@@ -252,6 +316,28 @@ defmodule PaymentsCli.Transaction do
   defp validate(%__MODULE__{}), do: :ok
 end
 ```
+
+**Why this works:**
+
+- `@enforce_keys [:id, :amount_cents, :currency]` makes `%Transaction{}` raise
+  `ArgumentError` if any of these fields is missing when the struct is created directly.
+  However, `struct/2` (used in `new/1`) does not enforce these keys — it silently
+  defaults missing keys to `nil`. That is why `new/1` checks required fields explicitly
+  with `check_required/2` before calling `struct/2`.
+
+- `new/1` uses `with` to chain three required-field checks. If any check fails,
+  `with` returns `{:error, "field is required"}` immediately. After building the struct,
+  `validate/1` checks value constraints (non-negative amount, non-empty strings).
+
+- `approved?/1` and `set_status/2` pattern-match on `%__MODULE__{}` — they only accept
+  Transaction structs. A plain map `%{status: :approved}` will not match, producing
+  a `FunctionClauseError`. This is type safety at the function boundary.
+
+- `set_status/2` uses a guard `when status in [:pending, :approved, :declined, :flagged]`
+  to restrict valid statuses. The catch-all clause returns `{:error, :invalid_status}`.
+
+- `format_amount/1` extracts `amount_cents` from the struct in the function head,
+  splits into dollars and cents, and formats with a leading zero on the cents part.
 
 ### Given tests — must pass without modification
 

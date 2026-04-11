@@ -90,6 +90,18 @@ handle_continue(:recover, state) →
 
 ### Step 1: `lib/api_gateway/route_table/server.ex`
 
+The RouteTable server demonstrates the `handle_continue` pattern for deferred
+initialization. The key insight: `init/1` returns immediately with an empty route
+map and a `{:continue, :load_routes}` instruction. The supervisor sees the process
+as started and moves on to the next child. Meanwhile, `handle_continue` runs the
+expensive 2-second load in the GenServer's own process, before any external message
+can be processed.
+
+Callers that arrive during the loading window receive `{:error, :not_ready}` — a
+clear, non-crashing signal that they should retry. This is deliberate: the alternative
+(blocking in `init/1`) makes the entire supervisor wait, while returning `:not_ready`
+lets the system start fast and degrade gracefully.
+
 ```elixir
 defmodule ApiGateway.RouteTable.Server do
   use GenServer
@@ -126,39 +138,58 @@ defmodule ApiGateway.RouteTable.Server do
 
   @impl true
   def init(opts) do
-    # TODO: return immediately so the supervisor is not blocked.
-    # Defer route loading to handle_continue/2.
-    #
-    # Initial state fields:
-    #   :routes  — map of path_prefix => upstream_url (empty until loaded)
-    #   :ready   — false until loading completes
-    #   :traffic_class — from opts, defaults to :default
-    #
-    # HINT: {:ok, initial_state, {:continue, :load_routes}}
     Logger.info("RouteTable starting — loading deferred")
-    _traffic_class = Keyword.get(opts, :traffic_class, :default)
-    # TODO
+    traffic_class = Keyword.get(opts, :traffic_class, :default)
+
+    initial_state = %{
+      routes: %{},
+      ready: false,
+      traffic_class: traffic_class
+    }
+
+    # Return immediately so the supervisor is not blocked. The {:continue, :load_routes}
+    # tuple tells GenServer to call handle_continue(:load_routes, state) right after
+    # init/1 returns — before any message from the mailbox is processed.
+    {:ok, initial_state, {:continue, :load_routes}}
   end
 
   @impl true
   def handle_continue(:load_routes, state) do
-    # TODO: call ApiGateway.RouteTable.Loader.load(state.traffic_class)
-    # which simulates a 2-second remote call.
-    # On success: update state with routes and set ready: true.
-    # On error: log and retry via {:noreply, state, {:continue, :load_routes}}
-    #
-    # HINT: pattern match on {:ok, routes} | {:error, reason}
+    # This runs in the GenServer process, after init/1 has returned to the supervisor.
+    # The supervisor has already moved on to start the next child.
+    case ApiGateway.RouteTable.Loader.load(state.traffic_class) do
+      {:ok, routes} ->
+        Logger.info("RouteTable loaded #{map_size(routes)} routes for #{state.traffic_class}")
+        {:noreply, %{state | routes: routes, ready: true}}
+
+      {:error, reason} ->
+        # Retry by chaining another handle_continue. This is safe because
+        # handle_continue runs before any mailbox message, so the retry
+        # does not starve callers — they simply get {:error, :not_ready}.
+        Logger.error("Failed to load routes: #{inspect(reason)}, retrying...")
+        {:noreply, state, {:continue, :load_routes}}
+    end
   end
 
   @impl true
   def handle_call({:lookup, _path}, _from, %{ready: false} = state) do
-    # TODO: return {:error, :not_ready} without crashing the caller
+    {:reply, {:error, :not_ready}, state}
   end
 
   @impl true
   def handle_call({:lookup, path}, _from, %{ready: true} = state) do
-    # TODO: find the longest matching prefix in state.routes
-    # HINT: Enum.find_value on Map.keys sorted by length desc
+    # Find the longest matching prefix in the route table. Routes are stored as
+    # exact path prefixes (e.g., "/api/payments"). We sort by descending length
+    # so "/api/payments/refund" matches before "/api/payments" if both existed.
+    result =
+      state.routes
+      |> Map.keys()
+      |> Enum.sort_by(&byte_size/1, :desc)
+      |> Enum.find_value(fn prefix ->
+        if String.starts_with?(path, prefix), do: {:ok, Map.fetch!(state.routes, prefix)}
+      end)
+
+    {:reply, result || {:error, :not_found}, state}
   end
 
   @impl true
@@ -190,31 +221,44 @@ end
 
 ### Step 3: Extend `RateLimiter.Server` with crash recovery
 
-Add recovery to the existing server from the rate limiter exercise:
+The ETS table survives a process crash because it is a named table owned by the BEAM,
+not by the process. When the process restarts, `init/1` checks whether the table already
+exists. If it does, the data from the previous incarnation is still there — we recover
+it via `handle_continue(:recover, state)` instead of starting from scratch.
+
+The `:heir` option is not used here because the table uses `:named_table` and `:public`,
+which means any process can read/write it. The table persists as long as the owning
+process is alive; when the process dies, the table ownership transfers to the next
+process that creates a table with the same name — but since the table already exists,
+we skip creation entirely.
 
 ```elixir
 # In lib/api_gateway/rate_limiter/server.ex
-# Extend init/1 and add handle_continue(:recover, state)
 
 @table :rate_limiter_windows
 
 @impl true
 def init(_opts) do
-  # TODO: check if the ETS table already exists (survived a crash)
-  # If yes: {:ok, state, {:continue, :recover}}
-  # If no:  create table, return {:ok, state}
-  #
-  # HINT: :ets.info(@table) returns :undefined if table does not exist
-  # HINT: create with [:named_table, :public, :bag]
-  #   :named_table — accessed by name in check/3
-  #   :public      — concurrent reads from any process
-  #   :bag         — multiple timestamps per client_id
+  # Check if the ETS table survived a crash. :ets.info/1 returns :undefined
+  # if the table does not exist, or a keyword list with table metadata if it does.
+  case :ets.info(@table) do
+    :undefined ->
+      # First start — create the table from scratch.
+      # :named_table allows access by atom name from any process.
+      # :public allows concurrent reads from router processes (not just the owner).
+      # :bag allows multiple timestamps per client_id (one per request).
+      :ets.new(@table, [:named_table, :public, :bag])
+      {:ok, %{}}
+
+    _info ->
+      # Table already exists — we crashed and restarted.
+      # Defer recovery to handle_continue so init/1 returns fast.
+      {:ok, %{}, {:continue, :recover}}
+  end
 end
 
 @impl true
 def handle_continue(:recover, state) do
-  # TODO: count how many entries are in the table and log the recovery
-  # HINT: :ets.info(@table, :size) returns the number of entries
   count = :ets.info(@table, :size)
   require Logger
   Logger.info("RateLimiter recovered #{count} window entries from ETS")

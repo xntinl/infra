@@ -146,6 +146,7 @@ defmodule BeamProfiler.Sampler do
 
   @impl true
   def init(_opts) do
+    :ets.new(:profiler_samples, [:named_table, :public, :bag])
     {:ok, %{sessions: %{}}}
   end
 
@@ -154,40 +155,76 @@ defmodule BeamProfiler.Sampler do
     session_id = make_ref()
     interval_ms = div(1_000, hz)
 
-    # TODO: start a timer that fires every interval_ms
-    # TODO: on each tick, collect stacktraces from all processes:
-    #   pids = Process.list()
-    #   samples = Enum.map(pids, fn pid ->
-    #     case Process.info(pid, [:current_stacktrace, :registered_name]) do
-    #       nil -> nil   # process died between list and info
-    #       info -> %{pid: pid, stack: info[:current_stacktrace], ts: System.monotonic_time()}
-    #     end
-    #   end)
-    # TODO: accumulate samples in session state (ETS for memory efficiency)
-    # TODO: after duration_ms, mark session as complete (send :session_done to self)
+    timer_ref = Process.send_after(self(), {:sample, session_id}, interval_ms)
+    deadline = System.monotonic_time(:millisecond) + duration_ms
 
-    # Design question: why store samples in ETS rather than the GenServer state map?
-    # A 30-second session at 100 Hz with 500 processes = 1.5M samples.
-    # Storing in a map would cause process heap growth and GC pressure on the profiler
-    # itself, skewing the data. ETS is off-heap.
+    session = %{
+      interval_ms: interval_ms,
+      deadline: deadline,
+      timer_ref: timer_ref,
+      complete: false,
+      sample_count: 0
+    }
 
-    {:reply, {:ok, session_id}, state}
+    new_state = put_in(state, [:sessions, session_id], session)
+    {:reply, {:ok, session_id}, new_state}
   end
 
   @impl true
   def handle_call({:collect, session_id}, _from, state) do
-    # TODO: check if session exists and is complete
-    # TODO: read all samples from ETS for this session_id
-    # TODO: delete ETS entries to free memory
-    {:reply, {:error, :not_implemented}, state}
+    case Map.get(state.sessions, session_id) do
+      nil ->
+        {:reply, {:error, :session_not_found}, state}
+
+      session ->
+        samples =
+          :ets.match_object(:profiler_samples, {session_id, :_, :_, :_})
+          |> Enum.map(fn {_sid, pid, stack, ts} -> %{pid: pid, stack: stack, ts: ts} end)
+          |> Enum.sort_by(& &1.ts)
+
+        :ets.match_delete(:profiler_samples, {session_id, :_, :_, :_})
+        new_state = update_in(state, [:sessions], &Map.delete(&1, session_id))
+        {:reply, {:ok, samples}, new_state}
+    end
   end
 
   @impl true
   def handle_info({:sample, session_id}, state) do
-    # TODO: collect one round of samples from all processes
-    # TODO: insert into ETS table :profiler_samples with key {session_id, timestamp}
-    # TODO: reschedule next sample tick unless session is done
-    {:noreply, state}
+    case Map.get(state.sessions, session_id) do
+      nil ->
+        {:noreply, state}
+
+      session ->
+        now = System.monotonic_time(:millisecond)
+
+        if now >= session.deadline do
+          new_state = put_in(state, [:sessions, session_id, :complete], true)
+          {:noreply, new_state}
+        else
+          pids = Process.list()
+          ts = System.monotonic_time(:nanosecond)
+
+          Enum.each(pids, fn pid ->
+            case Process.info(pid, [:current_stacktrace, :registered_name]) do
+              nil ->
+                :ok
+
+              info ->
+                stack = Keyword.get(info, :current_stacktrace, [])
+                :ets.insert(:profiler_samples, {session_id, pid, stack, ts})
+            end
+          end)
+
+          timer_ref = Process.send_after(self(), {:sample, session_id}, session.interval_ms)
+
+          new_state =
+            state
+            |> put_in([:sessions, session_id, :timer_ref], timer_ref)
+            |> update_in([:sessions, session_id, :sample_count], &(&1 + 1))
+
+          {:noreply, new_state}
+        end
+    end
   end
 end
 ```
@@ -211,18 +248,64 @@ defmodule BeamProfiler.CallGraph do
 
   defstruct [:nodes, :edges]
 
+  @type t :: %__MODULE__{
+    nodes: %{term() => %{total_samples: non_neg_integer(), self_samples: non_neg_integer()}},
+    edges: %{{term(), term()} => non_neg_integer()}
+  }
+
   @doc """
   Builds a call graph from a list of samples.
   Each sample is %{pid: pid, stack: [{module, function, arity}, ...]}.
   """
   @spec build([map()]) :: t()
   def build(samples) do
-    # TODO: for each sample:
-    #   1. reverse the stack (samples come leaf-first, we want root-first)
-    #   2. walk the path, creating or updating nodes
-    #   3. increment self_samples only for the original leaf
-    # HINT: use a map %{node_id => %{total: n, self: n}} as the accumulator
-    # HINT: node_id = {module, function, arity} | :root
+    {nodes, edges} =
+      Enum.reduce(samples, {%{}, %{}}, fn sample, {nodes_acc, edges_acc} ->
+        stack = sample.stack
+
+        reversed =
+          stack
+          |> Enum.map(fn
+            {mod, fun, arity, _info} -> {mod, fun, arity}
+            {mod, fun, arity} -> {mod, fun, arity}
+          end)
+          |> Enum.reverse()
+
+        leaf =
+          case reversed do
+            [] -> nil
+            list -> List.last(list)
+          end
+
+        path = [:root | reversed]
+
+        nodes_acc =
+          Enum.reduce(reversed, nodes_acc, fn mfa, acc ->
+            Map.update(acc, mfa, %{total_samples: 1, self_samples: 0}, fn node ->
+              %{node | total_samples: node.total_samples + 1}
+            end)
+          end)
+
+        nodes_acc =
+          if leaf do
+            Map.update(nodes_acc, leaf, %{total_samples: 1, self_samples: 1}, fn node ->
+              %{node | self_samples: node.self_samples + 1}
+            end)
+          else
+            nodes_acc
+          end
+
+        edges_acc =
+          path
+          |> Enum.chunk_every(2, 1, :discard)
+          |> Enum.reduce(edges_acc, fn [parent, child], acc ->
+            Map.update(acc, {parent, child}, 1, &(&1 + 1))
+          end)
+
+        {nodes_acc, edges_acc}
+      end)
+
+    %__MODULE__{nodes: nodes, edges: edges}
   end
 
   @doc """
@@ -230,8 +313,11 @@ defmodule BeamProfiler.CallGraph do
   Use this to find hotspots.
   """
   @spec top_by_self(t(), non_neg_integer()) :: [{mfa(), non_neg_integer()}]
-  def top_by_self(%__MODULE__{} = graph, n \\ 20) do
-    # TODO: sort nodes by self_samples descending, return top n
+  def top_by_self(%__MODULE__{nodes: nodes}, n \\ 20) do
+    nodes
+    |> Enum.map(fn {mfa, %{self_samples: s}} -> {mfa, s} end)
+    |> Enum.sort_by(fn {_mfa, s} -> s end, :desc)
+    |> Enum.take(n)
   end
 
   @doc """
@@ -239,8 +325,39 @@ defmodule BeamProfiler.CallGraph do
   Use this to explore why a specific function is hot.
   """
   @spec subtree(t(), mfa(), non_neg_integer()) :: t()
-  def subtree(%__MODULE__{} = graph, node_mfa, max_depth \\ 5) do
-    # TODO: BFS/DFS from node_mfa, limiting depth
+  def subtree(%__MODULE__{nodes: nodes, edges: edges} = _graph, node_mfa, max_depth \\ 5) do
+    reachable = bfs_collect(edges, node_mfa, max_depth)
+    filtered_nodes = Map.take(nodes, reachable)
+
+    filtered_edges =
+      edges
+      |> Enum.filter(fn {{from, to}, _} -> from in reachable and to in reachable end)
+      |> Map.new()
+
+    %__MODULE__{nodes: filtered_nodes, edges: filtered_edges}
+  end
+
+  defp bfs_collect(edges, start, max_depth) do
+    do_bfs(edges, [{start, 0}], MapSet.new([start]), max_depth)
+    |> MapSet.to_list()
+  end
+
+  defp do_bfs(_edges, [], visited, _max_depth), do: visited
+
+  defp do_bfs(edges, [{current, depth} | rest], visited, max_depth) when depth < max_depth do
+    children =
+      edges
+      |> Enum.filter(fn {{from, _to}, _} -> from == current end)
+      |> Enum.map(fn {{_from, to}, _} -> to end)
+      |> Enum.reject(&MapSet.member?(visited, &1))
+
+    new_visited = Enum.reduce(children, visited, &MapSet.put(&2, &1))
+    new_queue = rest ++ Enum.map(children, &{&1, depth + 1})
+    do_bfs(edges, new_queue, new_visited, max_depth)
+  end
+
+  defp do_bfs(edges, [_ | rest], visited, max_depth) do
+    do_bfs(edges, rest, visited, max_depth)
   end
 end
 ```
@@ -269,11 +386,32 @@ defmodule BeamProfiler.Flamegraph do
   """
   @spec export(String.t(), [map()]) :: :ok | {:error, term()}
   def export(path, samples) do
-    # TODO: fold samples into %{stack_string => count}
-    #   stack_string = Enum.join(reversed_mfa_list, ";")
-    #   mfa_string = "#{inspect(mod)}.#{fun}/#{arity}"
-    # TODO: write "stack_string count\n" for each entry
-    # TODO: File.write!(path, content)
+    counts =
+      Enum.reduce(samples, %{}, fn sample, acc ->
+        stack =
+          sample.stack
+          |> Enum.reverse()
+          |> Enum.map(fn
+            {mod, fun, arity, _info} -> "#{inspect(mod)}.#{fun}/#{arity}"
+            {mod, fun, arity} -> "#{inspect(mod)}.#{fun}/#{arity}"
+          end)
+
+        stack_string = Enum.join(stack, ";")
+
+        if stack_string != "" do
+          Map.update(acc, stack_string, 1, &(&1 + 1))
+        else
+          acc
+        end
+      end)
+
+    content =
+      counts
+      |> Enum.map(fn {stack, count} -> "#{stack} #{count}" end)
+      |> Enum.join("\n")
+
+    File.write!(path, content <> "\n")
+    :ok
   end
 
   @doc """
@@ -282,9 +420,50 @@ defmodule BeamProfiler.Flamegraph do
   """
   @spec export_speedscope(String.t(), [map()]) :: :ok | {:error, term()}
   def export_speedscope(path, samples) do
-    # TODO: build Speedscope JSON with "shared.frames" and "profiles" sections
-    # HINT: Speedscope uses integer frame indices to avoid string repetition
-    # HINT: the "sampled" profile type expects {startValue, endValue, stack: [indices]}
+    all_frames =
+      samples
+      |> Enum.flat_map(fn sample ->
+        Enum.map(sample.stack, fn
+          {mod, fun, arity, _info} -> "#{inspect(mod)}.#{fun}/#{arity}"
+          {mod, fun, arity} -> "#{inspect(mod)}.#{fun}/#{arity}"
+        end)
+      end)
+      |> Enum.uniq()
+
+    frame_index = all_frames |> Enum.with_index() |> Map.new()
+    shared_frames = Enum.map(all_frames, fn name -> %{"name" => name} end)
+
+    profile_samples =
+      Enum.map(samples, fn sample ->
+        indices =
+          sample.stack
+          |> Enum.reverse()
+          |> Enum.map(fn
+            {mod, fun, arity, _info} -> Map.get(frame_index, "#{inspect(mod)}.#{fun}/#{arity}", 0)
+            {mod, fun, arity} -> Map.get(frame_index, "#{inspect(mod)}.#{fun}/#{arity}", 0)
+          end)
+
+        indices
+      end)
+
+    speedscope = %{
+      "$schema" => "https://www.speedscope.app/file-format-schema.json",
+      "shared" => %{"frames" => shared_frames},
+      "profiles" => [
+        %{
+          "type" => "sampled",
+          "name" => "beam_profiler",
+          "unit" => "none",
+          "startValue" => 0,
+          "endValue" => length(profile_samples),
+          "samples" => profile_samples,
+          "weights" => List.duplicate(1, length(profile_samples))
+        }
+      ]
+    }
+
+    File.write!(path, Jason.encode!(speedscope, pretty: true))
+    :ok
   end
 end
 ```

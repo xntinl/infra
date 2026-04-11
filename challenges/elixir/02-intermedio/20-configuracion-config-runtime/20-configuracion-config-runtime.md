@@ -24,7 +24,7 @@ task_queue/
 │   ├── dev.exs           # ← development overrides
 │   ├── test.exs          # ← test overrides
 │   ├── prod.exs          # ← production compile-time config
-│   └── runtime.exs       # ← you implement this — reads env vars at startup
+│   └── runtime.exs       # ← reads env vars at startup
 ├── test/
 │   └── task_queue/
 │       └── config_test.exs   # given tests — must pass without modification
@@ -88,10 +88,12 @@ import_config "#{config_env()}.exs"
 # config/dev.exs
 import Config
 
-# TODO: override :log_level with :debug
-# TODO: override :worker_pool_size with 2 (small pool, easier to observe)
-# TODO: set :webhook_url to a local mock server, e.g. "http://localhost:4000/webhook"
-# TODO: configure :logger level to :debug
+config :task_queue,
+  log_level: :debug,
+  worker_pool_size: 2,
+  webhook_url: "http://localhost:4000/webhook"
+
+config :logger, level: :debug
 ```
 
 ### Step 3: `config/test.exs` — fast, deterministic test settings
@@ -100,11 +102,13 @@ import Config
 # config/test.exs
 import Config
 
-# TODO: override :log_level with :warning (silence noise in test output)
-# TODO: override :worker_pool_size with 1 (single worker for deterministic tests)
-# TODO: override :max_retries with 1 (fail fast in tests)
-# TODO: set :webhook_url to nil (webhook calls must be mocked in tests)
-# TODO: configure :logger level to :warning
+config :task_queue,
+  log_level: :warning,
+  worker_pool_size: 1,
+  max_retries: 1,
+  webhook_url: nil
+
+config :logger, level: :warning
 ```
 
 ### Step 4: `config/runtime.exs` — read env vars at startup
@@ -138,7 +142,10 @@ if config_env() == :prod do
     System.get_env("MAX_RETRIES", "3")
     |> String.to_integer()
 
-  # TODO: configure :task_queue with webhook_url, worker_pool_size, max_retries
+  config :task_queue,
+    webhook_url: webhook_url,
+    worker_pool_size: worker_pool_size,
+    max_retries: max_retries
 end
 ```
 
@@ -154,16 +161,15 @@ defmodule TaskQueue.Scheduler do
   """
 
   def worker_pool_size do
-    # TODO: read :worker_pool_size from Application.get_env with default 5
-    # HINT: Application.get_env(:task_queue, :worker_pool_size, 5)
+    Application.get_env(:task_queue, :worker_pool_size, 5)
   end
 
   def max_retries do
-    # TODO: read :max_retries with default 3
+    Application.get_env(:task_queue, :max_retries, 3)
   end
 
   def webhook_url do
-    # TODO: read :webhook_url with default nil
+    Application.get_env(:task_queue, :webhook_url, nil)
   end
 
   @doc """
@@ -256,6 +262,8 @@ mix test test/task_queue/config_test.exs --trace
 | Use case | constants, library config | secrets, deployment vars | test isolation, feature flags |
 
 Reflection question: what happens if you call `String.to_existing_atom/1` with a value that was never compiled into any atom? Why is this safer than `String.to_atom/1` for reading env vars?
+
+Answer: `String.to_existing_atom/1` raises `ArgumentError` if the atom does not already exist in the atom table. This prevents an attacker (or a misconfigured env var) from creating arbitrary atoms that are never garbage-collected, eventually exhausting the VM's atom table (default limit: 1,048,576). `String.to_atom/1` creates the atom unconditionally, so repeated calls with different strings cause unbounded atom table growth. For log levels, the atoms `:debug`, `:info`, `:warning`, `:error` are always compiled into the BEAM, so `to_existing_atom` succeeds for valid values and fails loudly for typos.
 
 ---
 

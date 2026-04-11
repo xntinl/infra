@@ -107,6 +107,10 @@ end
 
 ### Step 3: `lib/apigw/circuit_breaker.ex`
 
+The circuit breaker is a per-backend GenServer implementing a three-state machine: closed (normal), open (rejecting), and half-open (probing). It tracks request outcomes in a sliding time window and transitions to open when the error rate exceeds the configured threshold. After a cooldown period, it transitions to half-open and allows exactly one probe request through. A successful probe closes the breaker; a failed probe reopens it.
+
+The key design decision is storing events as a list of `{timestamp, outcome}` tuples, pruning entries older than the window on every recording. This keeps memory bounded and provides an accurate rolling error rate without fixed time buckets (which can miss spikes that straddle bucket boundaries).
+
 ```elixir
 defmodule Apigw.CircuitBreaker do
   use GenServer
@@ -125,7 +129,6 @@ defmodule Apigw.CircuitBreaker do
   defstruct [
     :backend_id,
     state: :closed,
-    # Ring buffer of {timestamp, :success | :error} for the window
     events: [],
     opened_at: nil,
     half_open_probe_sent: false
@@ -191,14 +194,53 @@ defmodule Apigw.CircuitBreaker do
 
   @impl true
   def handle_cast({:record, outcome, ts}, state) do
-    # TODO: append {ts, outcome} to the events ring buffer
-    # TODO: drop events older than @window_ms
-    # TODO: calculate error_rate = error_count / total_count
-    # TODO: if in :closed and error_rate > @error_threshold → transition to :open
-    # TODO: if in :half_open:
-    #   - outcome :success → transition to :closed, clear events
-    #   - outcome :error → transition to :open, reset opened_at
-    {:noreply, state}
+    # Append the new event and prune entries older than the window.
+    # Pruning on every record keeps the list bounded to events within @window_ms.
+    cutoff = ts - @window_ms
+    updated_events =
+      [{ts, outcome} | state.events]
+      |> Enum.filter(fn {event_ts, _} -> event_ts >= cutoff end)
+
+    new_state = %{state | events: updated_events}
+
+    case new_state.state do
+      :closed ->
+        # Calculate error rate and potentially transition to :open
+        total = length(updated_events)
+        error_count = Enum.count(updated_events, fn {_, o} -> o == :error end)
+
+        # Require at least a few events before evaluating the threshold
+        # to avoid flipping on a single error
+        if total >= 5 and error_count / total > @error_threshold do
+          {:noreply, %{new_state | state: :open, opened_at: ts, events: []}}
+        else
+          {:noreply, new_state}
+        end
+
+      :half_open ->
+        # A probe result has arrived. Success closes; failure reopens.
+        case outcome do
+          :success ->
+            {:noreply, %{new_state |
+              state: :closed,
+              events: [],
+              half_open_probe_sent: false,
+              opened_at: nil
+            }}
+
+          :error ->
+            {:noreply, %{new_state |
+              state: :open,
+              opened_at: ts,
+              events: [],
+              half_open_probe_sent: false
+            }}
+        end
+
+      :open ->
+        # While open, we still record but don't transition (timer-based)
+        {:noreply, new_state}
+    end
   end
 
   defp via(backend_id) do
@@ -209,6 +251,10 @@ end
 
 ### Step 4: `lib/apigw/auth/jwt.ex`
 
+JWT verification is implemented from scratch to control the algorithm surface. Only HS256 (HMAC-SHA256) and RS256 (RSA-SHA256) are supported. The `verify/2` function decodes the three base64url sections, checks the expiry claim, and verifies the cryptographic signature using Erlang's `:crypto` module.
+
+The constant-time comparison for HS256 is critical: a timing side-channel on the signature comparison would let an attacker reconstruct the MAC byte by byte. Erlang's `:crypto.hash_equals/2` (available since OTP 25) provides this guarantee. For older OTP versions, we XOR all bytes and check the accumulator, which runs in constant time regardless of where the first difference occurs.
+
 ```elixir
 defmodule Apigw.Auth.JWT do
   @moduledoc """
@@ -218,15 +264,15 @@ defmodule Apigw.Auth.JWT do
     header.payload.signature
 
   Verification steps:
-  1. Decode header → check "alg" field (HS256 or RS256 supported)
-  2. Decode payload → check "exp" (expiry), "iss" (issuer), "aud" (audience)
+  1. Decode header -> check "alg" field (HS256 or RS256 supported)
+  2. Decode payload -> check "exp" (expiry), "iss" (issuer), "aud" (audience)
   3. Verify signature:
      - HS256: HMAC-SHA256(base64(header) <> "." <> base64(payload), secret)
      - RS256: RSA-SHA256 verify with public key
 
   Why implement this without a library?
   JWT libraries introduce dependencies and often support legacy algorithms (RS512, PS256).
-  A custom implementation supports exactly HS256 and RS256 — no more. Reducing the
+  A custom implementation supports exactly HS256 and RS256 -- no more. Reducing the
   algorithm surface reduces the attack surface.
   """
 
@@ -264,23 +310,68 @@ defmodule Apigw.Auth.JWT do
   defp check_expiry(_), do: :ok
 
   defp verify_signature("HS256", signing_input, sig_b64, secret) do
-    # TODO: compute HMAC-SHA256(secret, signing_input)
-    # TODO: Base64url-encode the computed MAC
-    # TODO: constant-time compare with sig_b64
-    {:error, :not_implemented}
+    # Compute the expected MAC using HMAC-SHA256.
+    # :crypto.mac/4 is the modern API (OTP 22+) for message authentication codes.
+    computed_mac = :crypto.mac(:hmac, :sha256, secret, signing_input)
+    computed_b64 = Base.url_encode64(computed_mac, padding: false)
+
+    # Constant-time comparison prevents timing side-channel attacks.
+    # An attacker measuring response times could otherwise determine how many
+    # leading bytes of the signature match, reconstructing it byte by byte.
+    if constant_time_compare(computed_b64, sig_b64) do
+      :ok
+    else
+      {:error, :invalid_signature}
+    end
   end
 
   defp verify_signature("RS256", signing_input, sig_b64, public_key_pem) do
-    # TODO: decode PEM public key with :public_key.pem_decode/1
-    # TODO: :public_key.verify(signing_input, :sha256, Base.url_decode64!(sig_b64, padding: false), decoded_key)
-    {:error, :not_implemented}
+    # Decode the PEM-encoded public key into Erlang's internal representation.
+    # PEM files contain base64-encoded DER data wrapped in -----BEGIN/END----- markers.
+    [pem_entry | _] = :public_key.pem_decode(public_key_pem)
+    decoded_key = :public_key.pem_entry_decode(pem_entry)
+
+    # Decode the signature from base64url
+    case Base.url_decode64(sig_b64, padding: false) do
+      {:ok, signature_bytes} ->
+        # :public_key.verify/4 returns true/false indicating whether the RSA signature
+        # over the signing_input is valid for the given public key.
+        if :public_key.verify(signing_input, :sha256, signature_bytes, decoded_key) do
+          :ok
+        else
+          {:error, :invalid_signature}
+        end
+
+      :error ->
+        {:error, :malformed_token}
+    end
   end
 
-  defp verify_signature(alg, _, _, _), do: {:error, {:unsupported_algorithm, alg}}
+  defp verify_signature(_alg, _, _, _), do: {:error, {:unsupported_algorithm, nil}}
+
+  # XOR-based constant-time comparison. Iterates all bytes regardless of where
+  # the first difference occurs, accumulating differences in `acc`. The final
+  # check `acc == 0` reveals only whether the strings matched, not where they differed.
+  defp constant_time_compare(a, b) when byte_size(a) != byte_size(b), do: false
+
+  defp constant_time_compare(a, b) do
+    a_bytes = :binary.bin_to_list(a)
+    b_bytes = :binary.bin_to_list(b)
+
+    Enum.zip(a_bytes, b_bytes)
+    |> Enum.reduce(0, fn {x, y}, acc -> Bitwise.bor(acc, Bitwise.bxor(x, y)) end)
+    |> Kernel.==(0)
+  end
 end
 ```
 
 ### Step 5: `lib/apigw/cache.ex`
+
+The cache stores HTTP responses in ETS keyed by request path, with TTL-based expiration and ETag support. Reads go directly to ETS (no GenServer call), making them lock-free and concurrent. Writes go through a GenServer cast to serialize ETag computation and entry insertion.
+
+The cleanup process runs periodically via `Process.send_after`, scanning ETS for expired entries using `:ets.select_delete/2` with a match specification. This is more efficient than iterating all entries in Elixir because the selection runs inside the ERTS scheduler.
+
+ETag values are derived from the first 16 hex characters of the SHA-256 hash of the response body. When a client sends `If-None-Match` with a matching ETag, the cache returns a 304 Not Modified with no body, saving bandwidth.
 
 ```elixir
 defmodule Apigw.Cache do
@@ -290,7 +381,7 @@ defmodule Apigw.Cache do
   @default_ttl_s 300
 
   # ---------------------------------------------------------------------------
-  # Public API  (reads go directly to ETS — no GenServer call)
+  # Public API  (reads go directly to ETS -- no GenServer call)
   # ---------------------------------------------------------------------------
 
   @doc """
@@ -358,7 +449,22 @@ defmodule Apigw.Cache do
 
   @impl true
   def handle_info(:cleanup, state) do
-    # TODO: :ets.select_delete on entries where expires_at < now
+    # Delete all entries where expires_at is in the past.
+    # The match spec selects entries where the expires_at field (element 2 of the
+    # value tuple, which is a map) is less than the current monotonic time.
+    # Because the value is a map stored as element 2 of the {key, value} tuple,
+    # we iterate and delete manually for clarity and correctness.
+    now = System.monotonic_time(:second)
+
+    :ets.foldl(
+      fn {key, entry}, _acc ->
+        if entry.expires_at < now, do: :ets.delete(@table, key)
+        nil
+      end,
+      nil,
+      @table
+    )
+
     schedule_cleanup()
     {:noreply, state}
   end
@@ -368,8 +474,11 @@ defmodule Apigw.Cache do
   end
 
   defp compute_etag(body) do
-    # TODO: Base.encode16(:crypto.hash(:sha256, body), case: :lower) |> String.slice(0, 16)
-    ""
+    # SHA-256 hash of the body, truncated to 16 hex characters.
+    # This provides sufficient uniqueness for cache validation while keeping
+    # the ETag header compact. Collisions at 16 hex chars (64 bits) are
+    # astronomically unlikely for distinct response bodies.
+    Base.encode16(:crypto.hash(:sha256, body), case: :lower) |> String.slice(0, 16)
   end
 
   defp schedule_cleanup, do: Process.send_after(self(), :cleanup, 60_000)

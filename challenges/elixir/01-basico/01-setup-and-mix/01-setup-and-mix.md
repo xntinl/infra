@@ -109,8 +109,9 @@ Key decisions visible here:
 
 ### Step 3: `lib/payments_cli/cli.ex`
 
-`# TODO` marks what you need to implement. Do not change the public function
-signatures — the tests depend on them.
+The module is intentionally thin — it handles argument parsing and exit codes only.
+Business logic lives elsewhere. Pattern matching on the `args` list dispatches to
+the correct behavior without any `if/else` chain.
 
 ```elixir
 defmodule PaymentsCli.CLI do
@@ -129,16 +130,17 @@ defmodule PaymentsCli.CLI do
   Returns :ok on success or {:error, reason} on failure.
   """
   @spec main([String.t()]) :: :ok | {:error, String.t()}
-  def main(args) do
-    # TODO: implement argument parsing
-    #
-    # HINT: use pattern matching on `args` to handle:
-    #   [file_path] when is_binary(file_path) -> process the file
-    #   []                                    -> {:error, "no file path given"}
-    #   _other                                -> {:error, "usage: payments_cli <file>"}
-    #
-    # For now, just print "Processing: <file_path>" and return :ok
-    # The real processing comes in later exercises.
+  def main([file_path]) when is_binary(file_path) do
+    IO.puts("Processing: #{file_path}")
+    :ok
+  end
+
+  def main([]) do
+    print_error("no file path given")
+  end
+
+  def main(_other) do
+    print_error("usage: payments_cli <file>")
   end
 
   @doc """
@@ -148,11 +150,22 @@ defmodule PaymentsCli.CLI do
   """
   @spec print_error(String.t()) :: {:error, String.t()}
   def print_error(message) do
-    # TODO: write message to stderr using IO.puts(:stderr, ...)
-    # then return {:error, message}
+    IO.puts(:stderr, message)
+    {:error, message}
   end
 end
 ```
+
+**Why this works:**
+
+- `main/1` uses three function clauses with pattern matching. The first clause matches
+  a list with exactly one binary element — the file path. The second matches an empty
+  list. The third is a catch-all for any other input (too many arguments, wrong types).
+- Each clause returns a typed value (`:ok` or `{:error, reason}`) that callers and
+  tests can match on. No side effects leak into the return value.
+- `print_error/1` writes to `:stderr` (not stdout), following Unix convention where
+  error messages go to stderr and program output goes to stdout. This matters when
+  the CLI output is piped to another program.
 
 ### Step 4: Given tests — must pass without modification
 
@@ -201,7 +214,7 @@ end
 mix test test/payments_cli/cli_test.exs --trace
 ```
 
-Tests fail initially — implement `CLI.main/1` and `CLI.print_error/1` until all pass.
+All tests should pass with the implementation above.
 
 ### Step 6: Explore Mix tasks
 
@@ -227,8 +240,6 @@ mix run -e 'PaymentsCli.CLI.main(["transactions.csv"])'
 ---
 
 ## Trade-off analysis
-
-Fill in this table based on what you observe after completing the implementation.
 
 | Aspect | Current approach | Alternative |
 |--------|-----------------|-------------|

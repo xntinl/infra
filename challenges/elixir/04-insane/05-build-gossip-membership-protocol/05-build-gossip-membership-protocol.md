@@ -95,17 +95,42 @@ defmodule Swimlane.Membership do
 
   defstruct [:node_id, :state, :incarnation, :address, :last_updated_at]
 
+  @state_priority %{alive: 3, suspect: 2, dead: 1}
+
   @doc "Merges an incoming membership update into the local view."
-  def merge(local_view, update) do
-    # TODO
-    # HINT: higher incarnation always wins
-    # HINT: alive > suspect > dead for same incarnation
-    # HINT: update last_updated_at on any change
+  @spec merge(map(), %__MODULE__{}) :: map()
+  def merge(local_view, %__MODULE__{} = update) do
+    case Map.get(local_view, update.node_id) do
+      nil ->
+        Map.put(local_view, update.node_id, update)
+
+      existing ->
+        winner = resolve_conflict(existing, update)
+        if winner != existing do
+          Map.put(local_view, update.node_id, %{winner | last_updated_at: System.monotonic_time(:millisecond)})
+        else
+          local_view
+        end
+    end
+  end
+
+  defp resolve_conflict(a, b) do
+    cond do
+      b.incarnation > a.incarnation -> b
+      a.incarnation > b.incarnation -> a
+      Map.get(@state_priority, b.state, 0) > Map.get(@state_priority, a.state, 0) -> b
+      true -> a
+    end
   end
 
   @doc "Returns nodes that should receive the next probe."
+  @spec probe_candidates(map(), [term()]) :: [%__MODULE__{}]
   def probe_candidates(view, exclude \\ []) do
-    # TODO: return alive/suspect nodes excluding self and the exclude list
+    view
+    |> Map.values()
+    |> Enum.filter(fn member ->
+      member.state in [:alive, :suspect] and member.node_id not in exclude
+    end)
   end
 end
 ```
@@ -128,10 +153,36 @@ defmodule Swimlane.FailureDetector do
   7. After suspicion_timeout_ms with no refutation: mark B :dead.
   """
 
+  @spec probe(term(), map(), keyword()) :: :alive | :suspect
   def probe(node_b, membership, opts \\ []) do
-    # TODO
-    # HINT: use Task.async for parallel indirect probes
-    # HINT: task timeout must be probe_timeout_ms, not infinity
+    probe_timeout = Keyword.get(opts, :probe_timeout_ms, 500)
+    indirect_count = Keyword.get(opts, :k, 3)
+    transport = Keyword.get(opts, :transport, Swimlane.Transport)
+
+    case transport.ping(node_b, probe_timeout) do
+      :ok ->
+        :alive
+
+      :timeout ->
+        candidates =
+          Swimlane.Membership.probe_candidates(membership, [node_b])
+          |> Enum.take_random(indirect_count)
+
+        indirect_results =
+          candidates
+          |> Enum.map(fn candidate ->
+            Task.async(fn ->
+              transport.indirect_ping(candidate.node_id, node_b, probe_timeout)
+            end)
+          end)
+          |> Task.await_many(probe_timeout * 2)
+
+        if Enum.any?(indirect_results, fn r -> r == :ok end) do
+          :alive
+        else
+          :suspect
+        end
+    end
   end
 end
 ```
@@ -150,10 +201,27 @@ defmodule Swimlane.Disseminator do
   ceil(log(N)) disseminations (they have likely reached all nodes).
   """
 
+  @spec next_round(map(), term(), pos_integer()) :: {[term()], [map()]}
   def next_round(membership, self_id, k) do
-    # TODO: select K peers, return {peers, events_to_send}
-    # HINT: peers = Enum.take_random(alive_nodes -- [self_id], k)
-    # HINT: events with lowest dissemination_count first
+    alive_nodes =
+      membership
+      |> Map.values()
+      |> Enum.filter(fn m -> m.state in [:alive, :suspect] and m.node_id != self_id end)
+
+    peers =
+      alive_nodes
+      |> Enum.take_random(min(k, length(alive_nodes)))
+      |> Enum.map(& &1.node_id)
+
+    max_disseminations = :math.log2(max(map_size(membership), 2)) |> ceil()
+
+    events =
+      membership
+      |> Map.values()
+      |> Enum.filter(fn m -> Map.get(m, :dissemination_count, 0) < max_disseminations end)
+      |> Enum.sort_by(fn m -> Map.get(m, :dissemination_count, 0) end)
+
+    {peers, events}
   end
 end
 ```

@@ -111,7 +111,6 @@ defmodule TaskQueue.Worker do
   """
 
   def execute(%{type: type, args: args} = job) do
-    # Store job context in process dictionary — visible to any helper in this process
     Process.put(:current_job_id, Map.get(job, :id, "unknown"))
     Process.put(:current_job_type, type)
     Process.put(:job_start_time, System.monotonic_time())
@@ -125,7 +124,6 @@ defmodule TaskQueue.Worker do
         log_completion(:error)
         {:error, Exception.message(e)}
     after
-      # Clean up — but what if we forget this line?
       Process.delete(:current_job_id)
       Process.delete(:current_job_type)
       Process.delete(:job_start_time)
@@ -134,7 +132,6 @@ defmodule TaskQueue.Worker do
 
   def execute(_), do: {:error, :missing_required_fields}
 
-  # Hidden dependency on process dictionary — not a pure function
   defp log_completion(status) do
     job_id   = Process.get(:current_job_id, "unknown")
     job_type = Process.get(:current_job_type, "unknown")
@@ -188,13 +185,11 @@ defmodule TaskQueue.JobContext do
   @spec current() :: context() | nil
   def current do
     name = via_pid(self())
-    # TODO: use Agent.get/2 to return the current state
-    # Return nil if the agent is not running
-    # HINT:
-    # case GenServer.whereis(name) do
-    #   nil -> nil
-    #   _   -> Agent.get(name, & &1)
-    # end
+
+    case GenServer.whereis(name) do
+      nil -> nil
+      _   -> Agent.get(name, & &1)
+    end
   end
 
   @doc """
@@ -202,8 +197,7 @@ defmodule TaskQueue.JobContext do
   """
   @spec update(atom(), term()) :: :ok
   def update(key, value) do
-    # TODO: use Agent.update/2 to set key in the state map
-    # HINT: Agent.update(via_pid(self()), &Map.put(&1, key, value))
+    Agent.update(via_pid(self()), &Map.put(&1, key, value))
   end
 
   @doc """
@@ -211,12 +205,11 @@ defmodule TaskQueue.JobContext do
   """
   def stop do
     name = via_pid(self())
-    # TODO: stop the agent if it is running
-    # HINT:
-    # case GenServer.whereis(name) do
-    #   nil -> :ok
-    #   _   -> Agent.stop(name)
-    # end
+
+    case GenServer.whereis(name) do
+      nil -> :ok
+      _   -> Agent.stop(name)
+    end
   end
 
   # Private
@@ -361,6 +354,8 @@ mix test test/task_queue/process_dict_test.exs --trace
 | `conn` / accumulator | explicit in `with` chain | pure | N/A | request pipelines (Plug) |
 
 Reflection question: `Logger.metadata/1` uses the process dictionary internally. Why is this acceptable for Logger but not for `task_queue`'s job context? What property of Logger's usage makes the process dictionary safe there?
+
+Answer: Logger metadata is write-once-per-request and read-only by the Logger formatter — it is never mutated by helper functions and never needs to be tested in isolation. The contract is simple: set metadata at the top of the request, and every log line in that process includes it. In `task_queue`, the job context is read and mutated by multiple helpers at different call depths, creating invisible coupling. The key property that makes Logger safe is that the consumer (the formatter) is a framework component, not user code — users never call `Process.get(:logger_metadata)` directly.
 
 ---
 

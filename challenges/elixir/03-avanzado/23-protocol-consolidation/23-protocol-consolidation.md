@@ -29,8 +29,8 @@ api_gateway/
 │       ├── application.ex
 │       ├── router.ex
 │       ├── protocols/
-│       │   ├── serializable.ex     # ← you implement this
-│       │   └── loggable.ex         # ← and this
+│       │   ├── serializable.ex
+│       │   └── loggable.ex
 │       ├── middleware/
 │       │   ├── pipeline.ex
 │       │   ├── instrumentation.ex
@@ -156,25 +156,66 @@ end
 
 defmodule ApiGateway.Conn do
   @moduledoc "Represents an in-flight HTTP connection through the gateway."
+  @derive [ApiGateway.Loggable]
   defstruct [:method, :path, :status, :remote_ip, :assigns]
 end
 
 defimpl ApiGateway.Serializable, for: ApiGateway.Conn do
-  # HINT: convert method and path to strings, status to integer
-  # HINT: remote_ip may be a tuple {a, b, c, d} — convert to "a.b.c.d" string
-  # HINT: assigns is a map — recursively call Serializable.to_map on it
-  # TODO: implement to_map/1
+  @doc """
+  Serializes a Conn to a JSON-safe map. The remote_ip tuple is converted to
+  a dotted-quad string because JSON cannot represent Erlang tuples.
+  The assigns map is recursively serialized with string keys.
+  """
+  def to_map(%ApiGateway.Conn{} = conn) do
+    ip_string =
+      case conn.remote_ip do
+        {a, b, c, d} -> "#{a}.#{b}.#{c}.#{d}"
+        nil -> nil
+        other -> to_string(other)
+      end
+
+    assigns_map =
+      case conn.assigns do
+        nil -> %{}
+        m when is_map(m) -> Map.new(m, fn {k, v} -> {to_string(k), v} end)
+      end
+
+    %{
+      "method" => conn.method,
+      "path" => conn.path,
+      "status" => conn.status,
+      "remote_ip" => ip_string,
+      "assigns" => assigns_map
+    }
+  end
 end
 
 defmodule ApiGateway.Route do
   @moduledoc "Represents a matched route definition."
+  @derive [ApiGateway.Loggable]
   defstruct [:method, :pattern, :handler, :middleware]
 end
 
 defimpl ApiGateway.Serializable, for: ApiGateway.Route do
-  # HINT: handler is a module atom — convert to string with inspect/1
-  # HINT: middleware is a list of module atoms — map to strings
-  # TODO: implement to_map/1
+  @doc """
+  Serializes a Route to a JSON-safe map. The handler module atom and
+  middleware module list are converted to strings via inspect/1 because
+  JSON cannot represent Elixir atoms.
+  """
+  def to_map(%ApiGateway.Route{} = route) do
+    middleware_list =
+      case route.middleware do
+        nil -> []
+        list -> Enum.map(list, &inspect/1)
+      end
+
+    %{
+      "method" => route.method,
+      "pattern" => route.pattern,
+      "handler" => inspect(route.handler),
+      "middleware" => middleware_list
+    }
+  end
 end
 
 defmodule ApiGateway.RateLimitResult do
@@ -183,18 +224,35 @@ defmodule ApiGateway.RateLimitResult do
 end
 
 defimpl ApiGateway.Serializable, for: ApiGateway.RateLimitResult do
-  # HINT: all fields are scalars — straightforward map construction
-  # TODO: implement to_map/1
+  def to_map(%ApiGateway.RateLimitResult{} = r) do
+    %{
+      "allowed" => r.allowed,
+      "remaining" => r.remaining,
+      "reset_at" => r.reset_at,
+      "limit" => r.limit
+    }
+  end
 end
 
 defmodule ApiGateway.ErrorResponse do
   @moduledoc "Structured error for HTTP error responses."
+  @derive [ApiGateway.Loggable]
   defstruct [:status, :code, :message, :details]
 end
 
 defimpl ApiGateway.Serializable, for: ApiGateway.ErrorResponse do
-  # HINT: status is integer, code is atom — convert to string
-  # TODO: implement to_map/1
+  @doc """
+  Serializes an ErrorResponse. The code atom is converted to a string
+  because JSON encoders cannot encode bare atoms.
+  """
+  def to_map(%ApiGateway.ErrorResponse{} = err) do
+    %{
+      "status" => err.status,
+      "code" => to_string(err.code),
+      "message" => err.message,
+      "details" => err.details
+    }
+  end
 end
 ```
 
@@ -218,12 +276,18 @@ defprotocol ApiGateway.Loggable do
   def to_log(value)
 end
 
-# Any fallback — used when @derive [ApiGateway.Loggable] is set on a struct
+# Any fallback — used when @derive [ApiGateway.Loggable] is set on a struct.
+# Produces a generic log line using the struct's module name as prefix and
+# inspect/2 with a low limit to keep output compact.
 defimpl ApiGateway.Loggable, for: Any do
   def to_log(%{__struct__: struct} = value) do
-    # HINT: use inspect/2 with [limit: 5] to keep output short
-    # HINT: prefix with the last part of the struct module name (Module.split/1)
-    # TODO: implement
+    prefix =
+      struct
+      |> Module.split()
+      |> List.last()
+      |> String.downcase()
+
+    "#{prefix} #{inspect(value, limit: 5)}"
   end
 
   def to_log(value) do
@@ -235,21 +299,19 @@ end
 
 defimpl ApiGateway.Loggable, for: ApiGateway.Conn do
   def to_log(%ApiGateway.Conn{method: method, path: path, status: status}) do
-    # Format: "conn GET /api/users status=200"
-    # HINT: status may be nil if the response hasn't been set yet
-    # TODO: implement
+    status_str = if status, do: " status=#{status}", else: ""
+    "conn #{method} #{path}#{status_str}"
   end
 end
 
 defimpl ApiGateway.Loggable, for: ApiGateway.RateLimitResult do
   def to_log(%ApiGateway.RateLimitResult{allowed: allowed, remaining: remaining}) do
-    # Format: "rate_limit allowed=true remaining=42"
-    # TODO: implement
+    "rate_limit allowed=#{allowed} remaining=#{remaining}"
   end
 end
 
 # Route and ErrorResponse use the Any fallback via @derive
-# (This is declared in the struct modules above — add @derive [ApiGateway.Loggable])
+# (declared on the struct modules in serializable.ex with @derive [ApiGateway.Loggable])
 ```
 
 ### Step 3: Given tests — must pass without modification
@@ -392,9 +454,6 @@ mix test test/api_gateway/protocols/protocols_test.exs --trace
 
 ```elixir
 # bench/protocol_bench.exs
-# Measures consolidated vs unconsolidated dispatch on the Serializable protocol.
-# Run in dev (unconsolidated) vs prod (consolidated) to see the difference.
-
 alias ApiGateway.{Conn, Route, RateLimitResult, ErrorResponse, Serializable, Loggable}
 
 conn = %Conn{method: "GET", path: "/api/users", status: 200, remote_ip: {127, 0, 0, 1}, assigns: %{}}

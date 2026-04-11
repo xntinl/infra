@@ -110,55 +110,44 @@ leaks processes and, for I/O-bound work, leaks connections.
 
 ### Step 2: Extend `CircuitBreaker.Watchdog` with async health checks
 
+The watchdog now uses `Task.async_stream` (via the `Task.Supervisor`) to check all
+workers in parallel. Each check runs in its own supervised task with a bounded timeout.
+If a worker is unresponsive, the task times out and the watchdog restarts the worker.
+
 ```elixir
 # In lib/api_gateway/circuit_breaker/watchdog.ex
 
 @impl true
 def handle_info(:health_check, state) do
-  # TODO: replace sequential checks with Task.Supervisor.async_stream
-  #
-  # For each {service_name, pid} in state.registry:
-  #   1. Call Worker.ping(pid) with @ping_timeout_ms
-  #   2. If :pong → healthy
-  #   3. If task exits (timeout or crash) → unresponsive:
-  #      a. Process.exit(pid, :kill)
-  #      b. DynamicSupervisor.start_child(state.supervisor, {Worker, service_name})
-  #      c. Update registry with new pid on success, remove entry on failure
-  #
-  # HINT:
-  #   state.registry
-  #   |> Task.async_stream(
-  #     fn {name, pid} -> {name, pid, check_worker(pid)} end,
-  #     supervisor: ApiGateway.TaskSupervisor,
-  #     max_concurrency: map_size(state.registry),
-  #     timeout: @ping_timeout_ms + 500,
-  #     on_timeout: :kill_task
-  #   )
-  #   |> Enum.reduce(state.registry, fn result, reg ->
-  #     handle_check_result(result, reg, state.supervisor)
-  #   end)
-  {:noreply, state}
+  updated_registry =
+    state.registry
+    |> Task.async_stream(
+      fn {name, pid} -> {name, pid, check_worker(pid)} end,
+      max_concurrency: max(map_size(state.registry), 1),
+      timeout: @ping_timeout_ms + 500,
+      on_timeout: :kill_task
+    )
+    |> Enum.reduce(state.registry, fn result, reg ->
+      handle_check_result(result, reg, state.supervisor)
+    end)
+
+  {:noreply, %{state | registry: updated_registry}}
 end
 
 defp check_worker(pid) do
-  # TODO: try GenServer.call(pid, :ping, @ping_timeout_ms)
-  # Return :healthy or :unresponsive
-  # HINT:
-  #   try do
-  #     GenServer.call(pid, :ping, @ping_timeout_ms)
-  #     :healthy
-  #   catch
-  #     :exit, _ -> :unresponsive
-  #   end
-  :healthy
+  try do
+    GenServer.call(pid, :ping, @ping_timeout_ms)
+    :healthy
+  catch
+    :exit, _ -> :unresponsive
+  end
 end
 
-defp handle_check_result({:ok, {name, _pid, :healthy}}, registry, _sup) do
+defp handle_check_result({:ok, {_name, _pid, :healthy}}, registry, _sup) do
   registry
 end
 
 defp handle_check_result({:ok, {name, pid, :unresponsive}}, registry, sup) do
-  # TODO: kill, restart, update registry
   require Logger
   Logger.warning("Watchdog: #{name} unresponsive — restarting")
   Process.exit(pid, :kill)
@@ -183,6 +172,18 @@ end
 
 ### Step 3: `lib/api_gateway/middleware/webhook_notifier.ex`
 
+The WebhookNotifier demonstrates two Task.Supervisor patterns:
+
+1. `start_child/2` for true fire-and-forget (circuit breaker state change notifications)
+2. `async_stream` for fan-out with result collection (batch webhook delivery)
+
+The key design choice: `start_child` is used for `notify_async/2` because the circuit
+breaker worker should not be burdened with webhook delivery results or failure handling.
+The webhook fires and the worker immediately continues processing requests.
+
+For `deliver_to_all/2`, we use `async_stream` because the caller needs to know which
+URLs succeeded and which failed — partial failures are expected and must be reported.
+
 ```elixir
 defmodule ApiGateway.Middleware.WebhookNotifier do
   require Logger
@@ -196,13 +197,11 @@ defmodule ApiGateway.Middleware.WebhookNotifier do
   """
   @spec notify_async(String.t(), :open | :closed | :half_open) :: :ok
   def notify_async(service_name, new_state) do
-    # TODO: use Task.Supervisor.start_child/2 for true fire-and-forget
-    # (async_nolink would send result messages to this caller, which we don't want)
-    #
-    # HINT:
-    #   Task.Supervisor.start_child(ApiGateway.TaskSupervisor, fn ->
-    #     deliver_webhook(service_name, new_state)
-    #   end)
+    # start_child is truly fire-and-forget: no result message, no DOWN notification.
+    # The task runs under the TaskSupervisor and logs its own success/failure.
+    Task.Supervisor.start_child(ApiGateway.TaskSupervisor, fn ->
+      deliver_webhook(service_name, new_state)
+    end)
     :ok
   end
 
@@ -264,6 +263,15 @@ end
 
 ### Step 4: `lib/api_gateway/router/upstream_prober.ex`
 
+The UpstreamProber uses `Task.Supervisor.async_nolink` with `Task.yield_many` to probe
+multiple upstreams concurrently. The key pattern:
+
+1. Launch all probes simultaneously with `async_nolink` (no link to caller — a probe
+   crash does not kill the router)
+2. Wait up to `@probe_timeout_ms` for all results using `Task.yield_many`
+3. Shut down any tasks that did not finish (preventing leaked connections)
+4. Categorize results: responsive (succeeded), slow (timed out), down (crashed)
+
 ```elixir
 defmodule ApiGateway.Router.UpstreamProber do
   require Logger
@@ -284,24 +292,39 @@ defmodule ApiGateway.Router.UpstreamProber do
         end)
       end)
 
-    # TODO: use Task.yield_many/2 to collect results within @probe_timeout_ms
-    # Then cancel any tasks that did not finish.
-    #
-    # HINT:
-    #   raw_results = Task.yield_many(tasks, @probe_timeout_ms)
-    #
-    #   # Cancel timed-out tasks
-    #   Enum.each(raw_results, fn
-    #     {task, nil} -> Task.shutdown(task, :brutal_kill)
-    #     _ -> :ok
-    #   end)
-    #
-    # Categorize results:
-    #   {:ok, {url, :ok}}         → responsive
-    #   nil (did not finish)       → slow
-    #   {:exit, reason}            → down
+    # Wait for all tasks up to the probe timeout. Task.yield_many returns a list
+    # of {task, result} tuples where result is {:ok, value}, {:exit, reason}, or nil.
+    raw_results = Task.yield_many(tasks, @probe_timeout_ms)
 
-    {:ok, %{responsive: [], slow: [], down: []}}
+    # Shut down any tasks that did not finish within the timeout.
+    # :brutal_kill ensures they don't leak connections or keep running.
+    Enum.each(raw_results, fn
+      {task, nil} -> Task.shutdown(task, :brutal_kill)
+      _ -> :ok
+    end)
+
+    # Categorize results into responsive, slow, and down.
+    categorized =
+      Enum.zip(urls, raw_results)
+      |> Enum.reduce(%{responsive: [], slow: [], down: []}, fn {url, {_task, result}}, acc ->
+        case result do
+          {:ok, {^url, :ok}} ->
+            %{acc | responsive: [url | acc.responsive]}
+
+          nil ->
+            # Task did not finish within timeout — upstream is slow
+            %{acc | slow: [url | acc.slow]}
+
+          {:exit, _reason} ->
+            # Task crashed — upstream is down
+            %{acc | down: [url | acc.down]}
+
+          _ ->
+            %{acc | down: [url | acc.down]}
+        end
+      end)
+
+    {:ok, categorized}
   end
 
   # ---------------------------------------------------------------------------

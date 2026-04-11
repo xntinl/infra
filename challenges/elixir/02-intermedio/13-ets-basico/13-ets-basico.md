@@ -21,8 +21,8 @@ Project structure at this point:
 task_queue/
 ├── lib/
 │   └── task_queue/
-│       ├── ets_registry.ex      # ← you implement this
-│       └── job_counter.ex       # ← you implement this
+│       ├── ets_registry.ex
+│       └── job_counter.ex
 ├── test/
 │   └── task_queue/
 │       └── ets_test.exs         # given tests — must pass without modification
@@ -102,9 +102,10 @@ defmodule TaskQueue.EtsRegistry do
   """
   @spec get(String.t()) :: map() | nil
   def get(task_id) do
-    # HINT: :ets.lookup(@table, task_id) returns [{task_id, entry}] or []
-    # HINT: case the result: [{_, entry}] -> entry; [] -> nil
-    # TODO: implement — must NOT call GenServer
+    case :ets.lookup(@table, task_id) do
+      [{^task_id, entry}] -> entry
+      [] -> nil
+    end
   end
 
   @doc """
@@ -122,24 +123,21 @@ defmodule TaskQueue.EtsRegistry do
   """
   @spec update_status(String.t(), atom()) :: :ok | {:error, :not_found}
   def update_status(task_id, new_status) do
-    # For writes that require the current value, use a call to serialize the update
     GenServer.call(__MODULE__, {:update_status, task_id, new_status})
   end
 
   @doc "Returns all task IDs with the given status. Direct ETS read."
   @spec by_status(atom()) :: [String.t()]
   def by_status(status) do
-    # HINT: :ets.match_object(@table, {:"$1", %{status: status, updated_at: :"$2"}})
-    #   returns a list of {task_id, entry} tuples
-    # HINT: Enum.map to extract task_id
-    # TODO: implement — must NOT call GenServer
+    @table
+    |> :ets.match_object({:"$1", %{status: status, updated_at: :"$2"}})
+    |> Enum.map(fn {task_id, _entry} -> task_id end)
   end
 
   @doc "Returns total count of all registered tasks."
   @spec count() :: non_neg_integer()
   def count do
-    # HINT: :ets.info(@table, :size)
-    # TODO: implement — must NOT call GenServer
+    :ets.info(@table, :size)
   end
 
   # ---------------------------------------------------------------------------
@@ -148,19 +146,13 @@ defmodule TaskQueue.EtsRegistry do
 
   @impl GenServer
   def init(_opts) do
-    # HINT: :ets.new(@table, [:named_table, :public, :set, read_concurrency: true])
-    # :named_table — access by name from any process
-    # :public — any process can read and write
-    # :set — one entry per task_id
-    # read_concurrency: true — optimizes for concurrent reads (slight write overhead)
-    # TODO: create the table
-    {:ok, %{table: @table}}
+    table = :ets.new(@table, [:named_table, :public, :set, read_concurrency: true])
+    {:ok, %{table: table}}
   end
 
   @impl GenServer
   def handle_cast({:put, task_id, entry}, state) do
-    # HINT: :ets.insert(@table, {task_id, entry})
-    # TODO: implement
+    :ets.insert(@table, {task_id, entry})
     {:noreply, state}
   end
 
@@ -172,21 +164,33 @@ defmodule TaskQueue.EtsRegistry do
 
       [{^task_id, entry}] ->
         updated = %{entry | status: new_status, updated_at: now()}
-        # HINT: :ets.insert(@table, {task_id, updated})
-        # TODO: implement
+        :ets.insert(@table, {task_id, updated})
         {:reply, :ok, state}
     end
   end
 
   @impl GenServer
   def terminate(_reason, _state) do
-    # ETS table is automatically destroyed when the owner process exits
     :ok
   end
 
   defp now, do: System.monotonic_time(:millisecond)
 end
 ```
+
+The key design: `get/1`, `by_status/1`, and `count/0` read directly from ETS without
+going through the GenServer. This means 100 concurrent readers do not contend with each
+other — they all read the ETS table in parallel. The `read_concurrency: true` option
+tells ETS to use multiple read locks, further improving parallel read throughput.
+
+Writes go through the GenServer (`register/2` via cast, `update_status/2` via call).
+The GenServer serializes writes to prevent two processes from reading the same entry,
+both modifying it, and one overwriting the other's change. For `register/2`, we use cast
+because there is no read-before-write concern — it is a simple insert.
+
+The `by_status/1` function uses `:ets.match_object/2` with a pattern that matches tuples
+where the entry map has the requested status. The `:"$1"` and `:"$2"` are match
+specification variables that match any value — they act as wildcards in the pattern.
 
 ### Step 2: `lib/task_queue/job_counter.ex`
 
@@ -196,7 +200,6 @@ defmodule TaskQueue.JobCounter do
   require Logger
 
   @table :tq_job_counters
-  # Counter record: {key, count} where key is an atom like :jobs_submitted
 
   def start_link(opts \\ []) do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
@@ -209,11 +212,7 @@ defmodule TaskQueue.JobCounter do
   """
   @spec increment(atom(), pos_integer()) :: non_neg_integer()
   def increment(key, amount \\ 1) do
-    # HINT: :ets.update_counter(@table, key, {2, amount})
-    # The {2, amount} argument means: increment element at position 2 of the tuple by `amount`
-    # If key does not exist, this raises. Use update_counter with a default:
-    # :ets.update_counter(@table, key, {2, amount}, {key, 0})
-    # TODO: implement — must NOT call GenServer
+    :ets.update_counter(@table, key, {2, amount}, {key, 0})
   end
 
   @doc "Returns the current value of a counter. Returns 0 if not found."
@@ -228,9 +227,9 @@ defmodule TaskQueue.JobCounter do
   @doc "Returns all counters as a map."
   @spec all() :: %{atom() => non_neg_integer()}
   def all do
-    # HINT: :ets.tab2list(@table) returns [{key, count}, ...]
-    # HINT: Map.new/2 or Enum.into
-    # TODO: implement
+    @table
+    |> :ets.tab2list()
+    |> Map.new(fn {key, count} -> {key, count} end)
   end
 
   @doc "Resets a specific counter to 0."
@@ -252,6 +251,15 @@ defmodule TaskQueue.JobCounter do
   end
 end
 ```
+
+The `increment/2` function uses `:ets.update_counter/4` — the 4-argument form that
+accepts a default tuple. If the key does not exist, ETS inserts `{key, 0}` first, then
+applies the increment. The `{2, amount}` argument means "increment element at position 2
+of the tuple by `amount`". This entire operation is atomic: even with 100 concurrent
+callers incrementing the same key, no updates are lost.
+
+The table uses `write_concurrency: true` because counters are written frequently from
+many processes. This option uses finer-grained locks to reduce write contention.
 
 ### Step 3: Given tests — must pass without modification
 
@@ -408,7 +416,7 @@ Benchee.run(
 mix run bench/ets_bench.exs
 ```
 
-Expected: `get` < 5µs at p99 with 8 parallel readers. If you see > 50µs, `get/1` is
+Expected: `get` < 5us at p99 with 8 parallel readers. If you see > 50us, `get/1` is
 routing through the GenServer instead of reading ETS directly.
 
 ---

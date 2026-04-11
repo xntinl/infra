@@ -21,7 +21,7 @@ task_queue/
 │       ├── worker_process.ex    # exercise 01
 │       ├── task_registry.ex     # exercise 02
 │       ├── batch_runner.ex      # exercise 03
-│       └── queue_server.ex      # ← you implement this
+│       └── queue_server.ex
 ├── test/
 │   └── task_queue/
 │       └── queue_server_test.exs   # given tests — must pass without modification
@@ -110,15 +110,14 @@ defmodule TaskQueue.QueueServer do
       payload: payload,
       queued_at: System.monotonic_time(:millisecond)
     }
-    # HINT: GenServer.cast — fire and forget, no reply needed
-    # TODO: implement
+
+    GenServer.cast(__MODULE__, {:push, job})
   end
 
   @doc "Takes the front job off the queue. Blocks until the server replies."
   @spec pop() :: {:ok, job()} | {:error, :empty}
   def pop do
-    # HINT: GenServer.call(__MODULE__, :pop)
-    # TODO: implement
+    GenServer.call(__MODULE__, :pop)
   end
 
   @doc "Returns the front job without removing it."
@@ -154,10 +153,7 @@ defmodule TaskQueue.QueueServer do
 
   @impl GenServer
   def handle_cast({:push, job}, state) do
-    # HINT: append job to the END: state ++ [job]
-    # Note: this is O(n). In exercise 13 (ETS) we explore better data structures.
-    # TODO: implement
-    {:noreply, state}
+    {:noreply, state ++ [job]}
   end
 
   @impl GenServer
@@ -167,8 +163,7 @@ defmodule TaskQueue.QueueServer do
         {:reply, {:error, :empty}, state}
 
       [job | rest] ->
-        # HINT: {:reply, {:ok, job}, rest}
-        # TODO: implement
+        {:reply, {:ok, job}, rest}
     end
   end
 
@@ -187,9 +182,15 @@ defmodule TaskQueue.QueueServer do
 
   @impl GenServer
   def handle_call(:flush, _from, state) do
-    # HINT: filter jobs where queued_at > cutoff, count the removed ones
     cutoff = System.monotonic_time(:millisecond) - @job_ttl_ms
-    # TODO: implement — return {:reply, removed_count, remaining_jobs}
+    remaining = Enum.filter(state, fn job -> job.queued_at > cutoff end)
+    removed = length(state) - length(remaining)
+
+    if removed > 0 do
+      Logger.info("QueueServer cleanup: removed #{removed} stale jobs")
+    end
+
+    {:reply, removed, remaining}
   end
 
   @impl GenServer
@@ -228,6 +229,19 @@ defmodule TaskQueue.QueueServer do
   end
 end
 ```
+
+The `handle_cast({:push, job}, state)` appends the job to the end of the list with
+`state ++ [job]`. This is O(n), which is acceptable for moderate queue sizes. For
+high-throughput queues, a `:queue` (Erlang's double-ended queue) provides O(1)
+enqueue/dequeue — that optimization is explored in exercise 13 with ETS.
+
+The `handle_call(:flush, ...)` uses the same cleanup logic as `handle_info(:cleanup, ...)`.
+The difference: `:flush` is triggered manually and returns the count of removed jobs
+to the caller. `:cleanup` is triggered by the timer and returns nothing — it is
+internal housekeeping.
+
+The `handle_info` catch-all clause logs unexpected messages at warning level. Without
+this, an unexpected message would crash the GenServer with a `{:EXIT, ...}` signal.
 
 ### Step 2: Given tests — must pass without modification
 

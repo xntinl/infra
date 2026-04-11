@@ -22,8 +22,8 @@ api_gateway/
 │       ├── rate_limiter/
 │       ├── metrics/
 │       └── config/
-│           ├── store.ex        # ← you implement this
-│           └── persistent_cache.ex  # ← and this
+│           ├── store.ex
+│           └── persistent_cache.ex
 ├── test/
 │   └── api_gateway/
 │       └── config/
@@ -88,6 +88,8 @@ defmodule ApiGateway.Config.Store do
   and is safe for concurrent reads.
 
   Key format: {namespace, key} — e.g., {:rate_limits, "/api/users"}
+  This namespacing allows querying all entries for a given domain
+  (all rate limits, all backends) without a full table scan.
   """
 
   use GenServer
@@ -103,9 +105,10 @@ defmodule ApiGateway.Config.Store do
 
   @spec get(term()) :: {:ok, term()} | :error
   def get(key) do
-    # HINT: :dets.lookup/2 returns [{key, value}] or []
-    # Read directly from DETS — no need for GenServer.call
-    # TODO: implement
+    case :dets.lookup(@table, key) do
+      [{^key, value}] -> {:ok, value}
+      [] -> :error
+    end
   end
 
   @spec put(atom(), term(), term()) :: :ok
@@ -124,11 +127,24 @@ defmodule ApiGateway.Config.Store do
     GenServer.call(__MODULE__, {:delete, key})
   end
 
+  @doc """
+  Returns all entries for a given namespace as a list of {key, value} tuples.
+
+  Uses :dets.select with a match spec that filters on the namespace component
+  of the composite key. The match spec destructures the key tuple {namespace, inner_key}
+  and returns only the inner_key and value for matching entries.
+  """
   @spec all(atom()) :: [{term(), term()}]
   def all(namespace) do
-    # HINT: :dets.match/2 with pattern {{{namespace, :"$1"}, :"$2"}, [], ...}
-    # Or build a select match spec for the namespace prefix
-    # TODO: implement
+    ms = [
+      {
+        {{namespace, :"$1"}, :"$2"},
+        [],
+        [{{:"$1", :"$2"}}]
+      }
+    ]
+
+    :dets.select(@table, ms)
   end
 
   @spec all() :: [{term(), term()}]
@@ -200,6 +216,11 @@ defmodule ApiGateway.Config.PersistentCache do
   Read path: L1 hit → return. L1 miss → L2 lookup → warm L1 → return.
   Write path: write both L1 and L2 simultaneously.
   Expiry: stored as {value, expires_at_ms} in both layers. Lazy eviction on read.
+
+  L1 uses System.monotonic_time because it only needs to measure duration within
+  a single process lifetime. L2 uses System.os_time because monotonic_time resets
+  on restart — a value stored before restart would appear expired immediately if
+  compared against the new monotonic clock.
   """
 
   use GenServer
@@ -247,12 +268,24 @@ defmodule ApiGateway.Config.PersistentCache do
   end
 
   defp l2_get_and_warm(key) do
-    # HINT: :dets.lookup returns [{key, value, expires_at}] or []
-    # HINT: compare expires_at with System.os_time(:millisecond) (wall clock, not monotonic)
-    #       because DETS entries survive across restarts — os_time is appropriate here
-    # HINT: on L2 hit: insert into L1 with remaining TTL, return {:ok, value}
-    # HINT: on expired: :dets.delete to lazy-evict, return :miss
-    # TODO: implement
+    now_os = System.os_time(:millisecond)
+
+    case :dets.lookup(@l2_table, key) do
+      [{^key, value, expires_at}] when expires_at > now_os ->
+        # L2 hit and not expired — warm L1 with remaining TTL
+        remaining_ttl = expires_at - now_os
+        l1_expires = System.monotonic_time(:millisecond) + remaining_ttl
+        :ets.insert(@l1_table, {key, value, l1_expires})
+        {:ok, value}
+
+      [{^key, _value, _expired}] ->
+        # L2 hit but expired — lazy evict from L2
+        :dets.delete(@l2_table, key)
+        :miss
+
+      [] ->
+        :miss
+    end
   end
 
   # ---------------------------------------------------------------------------

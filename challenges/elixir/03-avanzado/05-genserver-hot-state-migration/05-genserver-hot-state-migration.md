@@ -145,6 +145,16 @@ The current `CircuitBreaker.Worker` produces this state:
 
 ### Step 3: Add `code_change/3` to `CircuitBreaker.Worker`
 
+The `code_change/3` callback receives state in the old format and transforms it to the
+new format. The migration is implemented as a recursive chain: each step advances the
+state by one version, so a v1 state reaches v2 by traversing `migrate/1` once. If a
+future v3 is added, the chain extends naturally — v1 reaches v3 by passing through v2.
+
+The downgrade path (`{:down, "2"}`) strips the new fields to restore v1 compatibility.
+This is critical for rollbacks: if a deployment is reverted under production pressure,
+the downgrade path must produce valid v1 state without data loss in the fields that v1
+expects.
+
 ```elixir
 # In lib/api_gateway/circuit_breaker/worker.ex
 # Add after the existing callbacks
@@ -153,18 +163,18 @@ The current `CircuitBreaker.Worker` produces this state:
 
 @impl true
 def code_change("1", state, _extra) do
-  # TODO: migrate v1 → v2
-  # 1. Call migrate/1 to transform the state
-  # 2. Return {:ok, v2_state}
-  #
-  # HINT: use a private migrate/1 that pattern-matches on :version key presence
+  # Migrate v1 → v2 via the migration chain.
+  # The chain is recursive: each step advances one version.
+  migrate(state)
 end
 
 @impl true
 def code_change({:down, "2"}, state, _extra) do
-  # TODO: downgrade v2 → v1
-  # Strip :version, :sla_tier, :upgraded_at
-  # HINT: Map.drop(state, [:version, :sla_tier, :upgraded_at])
+  # Downgrade v2 → v1: strip fields that v1 does not expect.
+  # The core fields (:service, :status, :failures, :opened_at, :hibernations, :timer_ref)
+  # are preserved — they are the same in both versions.
+  v1_state = Map.drop(state, [:version, :sla_tier, :upgraded_at])
+  {:ok, v1_state}
 end
 
 @impl true
@@ -176,14 +186,21 @@ end
 # Private migration chain
 # ---------------------------------------------------------------------------
 
+# Terminal case: state is already at target version — no transformation needed.
 defp migrate(%{version: 2} = state), do: {:ok, state}
 
+# v1 → v2: add version tag, SLA tier, and upgrade timestamp.
+# v1 state has no :version key — we detect it by the absence of that key.
 defp migrate(v1_state) when not is_map_key(v1_state, :version) do
-  # TODO: build v2 state from v1
-  # Add version: 2, sla_tier: :standard, upgraded_at: now
-  # HINT: Map.merge(v1_state, %{version: 2, sla_tier: :standard,
-  #                              upgraded_at: System.monotonic_time(:millisecond)})
-  #       then call migrate/1 recursively
+  v2_state = Map.merge(v1_state, %{
+    version: 2,
+    sla_tier: :standard,
+    upgraded_at: System.monotonic_time(:millisecond)
+  })
+
+  # Recurse to handle future multi-step migrations (v1 → v2 → v3 → ...).
+  # Currently this terminates at the v2 clause above.
+  migrate(v2_state)
 end
 ```
 

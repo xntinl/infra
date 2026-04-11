@@ -62,6 +62,14 @@ The `Formatter` module needs to:
 
 ### `lib/payments_cli/formatter.ex`
 
+The CSV parser splits on commas, trims whitespace, and validates the field count.
+Amount parsing uses `Integer.parse/1` instead of `String.to_integer/1` because the
+latter raises on invalid input — dangerous in a parser that processes thousands of rows.
+
+Truncation uses `String.length/1` and `String.slice/3` (grapheme-aware operations)
+instead of `byte_size` and binary slicing. This ensures multi-byte characters like
+`é` and `ü` are never split mid-byte.
+
 ```elixir
 defmodule PaymentsCli.Formatter do
   @moduledoc """
@@ -89,17 +97,27 @@ defmodule PaymentsCli.Formatter do
   """
   @spec parse_csv_line(String.t()) :: {:ok, map()} | {:error, String.t()}
   def parse_csv_line(line) when is_binary(line) do
-    # TODO: implement CSV parsing
-    #
-    # HINT:
-    #   1. String.split(line, ",") to split on commas
-    #   2. Enum.map each field with String.trim/1
-    #   3. Pattern match on the list to extract exactly 5 fields
-    #   4. Parse amount_cents with String.to_integer/1 (raises on invalid — handle it)
-    #   5. Return {:ok, %{id: ..., amount_cents: ..., currency: ..., merchant: ..., status: ...}}
-    #
-    # For step 4: Integer.parse/1 returns {integer, rest} or :error — safer than
-    # String.to_integer/1 which raises. Use Integer.parse/1 and match on {n, ""}.
+    fields = line |> String.split(",") |> Enum.map(&String.trim/1)
+
+    case fields do
+      [id, amount_str, currency, merchant, status] ->
+        case Integer.parse(amount_str) do
+          {amount, ""} ->
+            {:ok, %{
+              id: id,
+              amount_cents: amount,
+              currency: currency,
+              merchant: merchant,
+              status: status
+            }}
+
+          _ ->
+            {:error, "invalid amount: #{amount_str}"}
+        end
+
+      _ ->
+        {:error, "expected 5 fields, got #{length(fields)}"}
+    end
   end
 
   @doc """
@@ -123,11 +141,11 @@ defmodule PaymentsCli.Formatter do
   @spec truncate_merchant(String.t(), pos_integer()) :: String.t()
   def truncate_merchant(name, max_length)
       when is_binary(name) and is_integer(max_length) and max_length > 0 do
-    # TODO: implement
-    #
-    # HINT: if String.length(name) <= max_length, return name as-is.
-    # Otherwise, String.slice(name, 0, max_length - 1) <> "…"
-    # The ellipsis "…" is a single grapheme (3 bytes in UTF-8).
+    if String.length(name) <= max_length do
+      name
+    else
+      String.slice(name, 0, max_length - 1) <> "…"
+    end
   end
 
   @doc """
@@ -143,10 +161,10 @@ defmodule PaymentsCli.Formatter do
   """
   @spec normalize_reference(String.t()) :: String.t()
   def normalize_reference(ref) when is_binary(ref) do
-    # TODO: implement using a pipe chain
-    #
-    # HINT: String.trim/1 -> String.upcase/1 -> String.replace/3 with " " -> ""
-    # This is a natural pipeline — use |> to express the transformation steps.
+    ref
+    |> String.trim()
+    |> String.upcase()
+    |> String.replace(" ", "")
   end
 
   @doc """
@@ -165,11 +183,40 @@ defmodule PaymentsCli.Formatter do
   """
   @spec validate_string(String.t()) :: {:ok, String.t()} | {:error, String.t()}
   def validate_string(value) when is_binary(value) do
-    # TODO: check String.valid?/1 first, then check length > 0
-    # Order matters: checking length on invalid UTF-8 may raise.
+    cond do
+      not String.valid?(value) ->
+        {:error, "invalid UTF-8"}
+
+      byte_size(value) == 0 ->
+        {:error, "string is empty"}
+
+      true ->
+        {:ok, value}
+    end
   end
 end
 ```
+
+**Why this works:**
+
+- `parse_csv_line/1` splits on commas, trims each field, then pattern matches on exactly
+  five elements. If the split produces more or fewer fields, the catch-all returns an
+  error with the actual count. `Integer.parse/1` returns `{integer, rest}` on success
+  or `:error` — matching on `{amount, ""}` ensures the entire string was consumed
+  (no trailing characters like `"123abc"`).
+
+- `truncate_merchant/2` checks `String.length/1` (grapheme count, not byte count) before
+  deciding to truncate. If truncation is needed, it slices to `max_length - 1` graphemes
+  and appends the ellipsis `"…"` (a single grapheme, 3 bytes in UTF-8). The total
+  grapheme count of the result equals `max_length`.
+
+- `normalize_reference/1` is a natural pipeline: trim → upcase → remove spaces. Each
+  step transforms the string and passes the result to the next via `|>`.
+
+- `validate_string/1` checks UTF-8 validity first with `String.valid?/1`, then checks
+  for empty. Order matters: calling `String.length/1` on invalid UTF-8 could raise.
+  We use `byte_size(value) == 0` for the empty check because it is O(1) and safe
+  even on invalid binaries.
 
 ### Given tests — must pass without modification
 

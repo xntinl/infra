@@ -22,7 +22,7 @@ api_gateway/
 │   └── api_gateway/
 │       ├── billing/
 │       │   ├── application.ex          # Commanded.Application
-│       │   ├── router.ex               # Commands → Aggregates
+│       │   ├── router.ex               # Commands -> Aggregates
 │       │   ├── commands/
 │       │   │   ├── provision_client.ex
 │       │   │   ├── record_usage.ex
@@ -32,7 +32,7 @@ api_gateway/
 │       │   │   ├── usage_recorded.ex
 │       │   │   └── client_suspended.ex
 │       │   └── aggregates/
-│       │       └── client_account.ex   # ← you implement this
+│       │       └── client_account.ex   # aggregate root
 ├── test/
 │   └── api_gateway/
 │       └── billing/
@@ -145,8 +145,8 @@ defmodule ApiGateway.Billing.Aggregates.ClientAccount do
   Aggregate root for client billing accounts.
 
   Business rules:
-  - A client can only be provisioned once (status :new → :active)
-  - Usage can only be recorded on :active accounts
+  - A client can only be provisioned once (status :new -> :active)
+  - Usage can only be recorded on :active or :over_quota accounts
   - A suspended account rejects all commands except re-provisioning (not in scope here)
   - Usage that would exceed monthly_quota emits UsageRecorded BUT sets status :over_quota
     (soft limit — we record the usage, alert separately)
@@ -164,8 +164,21 @@ defmodule ApiGateway.Billing.Aggregates.ClientAccount do
   # -- Command handlers --
 
   def execute(%__MODULE__{status: :new}, %ProvisionClient{} = cmd) do
-    # TODO: validate monthly_quota > 0 and plan is non-nil
-    # TODO: return a %ClientProvisioned{} event with provisioned_at: DateTime.utc_now()
+    cond do
+      is_nil(cmd.monthly_quota) or cmd.monthly_quota <= 0 ->
+        {:error, :invalid_quota}
+
+      is_nil(cmd.plan) ->
+        {:error, :plan_required}
+
+      true ->
+        %ClientProvisioned{
+          client_id: cmd.client_id,
+          monthly_quota: cmd.monthly_quota,
+          plan: cmd.plan,
+          provisioned_at: DateTime.utc_now()
+        }
+    end
   end
 
   def execute(%__MODULE__{status: s}, %ProvisionClient{}) when s != :new do
@@ -173,15 +186,33 @@ defmodule ApiGateway.Billing.Aggregates.ClientAccount do
   end
 
   def execute(%__MODULE__{status: :active} = account, %RecordUsage{} = cmd) do
-    # TODO: validate request_count > 0
-    # TODO: compute new cumulative_usage = account.cumulative_usage + cmd.request_count
-    # TODO: return %UsageRecorded{cumulative_usage: new_cumulative, ...}
-    # Note: do NOT reject if over quota — record usage and let the projector alert
+    if is_nil(cmd.request_count) or cmd.request_count <= 0 do
+      {:error, :invalid_request_count}
+    else
+      new_cumulative = account.cumulative_usage + cmd.request_count
+
+      %UsageRecorded{
+        client_id: cmd.client_id,
+        request_count: cmd.request_count,
+        period: cmd.period,
+        cumulative_usage: new_cumulative
+      }
+    end
   end
 
   def execute(%__MODULE__{status: :over_quota} = account, %RecordUsage{} = cmd) do
-    # TODO: same as :active — still record usage even when over quota
-    # The soft-limit behavior: we log it, we charge overage, we don't block
+    if is_nil(cmd.request_count) or cmd.request_count <= 0 do
+      {:error, :invalid_request_count}
+    else
+      new_cumulative = account.cumulative_usage + cmd.request_count
+
+      %UsageRecorded{
+        client_id: cmd.client_id,
+        request_count: cmd.request_count,
+        period: cmd.period,
+        cumulative_usage: new_cumulative
+      }
+    end
   end
 
   def execute(%__MODULE__{status: :suspended}, %RecordUsage{}) do
@@ -193,7 +224,19 @@ defmodule ApiGateway.Billing.Aggregates.ClientAccount do
   end
 
   def execute(%__MODULE__{status: :active}, %SuspendClient{} = cmd) do
-    # TODO: return %ClientSuspended{suspended_at: DateTime.utc_now(), reason: cmd.reason}
+    %ClientSuspended{
+      client_id: cmd.client_id,
+      reason: cmd.reason,
+      suspended_at: DateTime.utc_now()
+    }
+  end
+
+  def execute(%__MODULE__{status: :over_quota}, %SuspendClient{} = cmd) do
+    %ClientSuspended{
+      client_id: cmd.client_id,
+      reason: cmd.reason,
+      suspended_at: DateTime.utc_now()
+    }
   end
 
   def execute(%__MODULE__{status: :suspended}, %SuspendClient{}) do
@@ -203,14 +246,26 @@ defmodule ApiGateway.Billing.Aggregates.ClientAccount do
   # -- State mutators --
 
   def apply(%__MODULE__{} = account, %ClientProvisioned{} = event) do
-    # TODO: return account with client_id, monthly_quota, plan set and status: :active
+    %__MODULE__{account |
+      client_id: event.client_id,
+      monthly_quota: event.monthly_quota,
+      plan: event.plan,
+      status: :active
+    }
   end
 
   def apply(%__MODULE__{} = account, %UsageRecorded{} = event) do
-    # TODO: update cumulative_usage to event.cumulative_usage
-    # TODO: if cumulative_usage > monthly_quota → status: :over_quota, else keep :active
-    # HINT: the status transition must be derived from the event data, not from cmd data
-    #       (apply receives the event, not the command)
+    new_status =
+      if event.cumulative_usage > account.monthly_quota do
+        :over_quota
+      else
+        :active
+      end
+
+    %__MODULE__{account |
+      cumulative_usage: event.cumulative_usage,
+      status: new_status
+    }
   end
 
   def apply(%__MODULE__{} = account, %ClientSuspended{}) do
@@ -218,6 +273,32 @@ defmodule ApiGateway.Billing.Aggregates.ClientAccount do
   end
 end
 ```
+
+The `execute/2` functions enforce business rules:
+
+- **ProvisionClient**: validates that `monthly_quota > 0` and `plan` is non-nil.
+  Returns a `ClientProvisioned` event with a `provisioned_at` timestamp. The
+  timestamp is set here (in `execute/2`, not in `apply/2`) because it captures the
+  moment the decision was made — not the moment of replay.
+
+- **RecordUsage** on `:active` or `:over_quota`: computes `new_cumulative` by adding
+  the request count to the current cumulative usage. The event carries the computed
+  cumulative, not just the delta — this makes `apply/2` simpler and the event
+  self-contained for debugging.
+
+- **RecordUsage** on `:suspended` or `:new`: rejected with a descriptive error atom.
+
+- **SuspendClient** on `:active` or `:over_quota`: emits `ClientSuspended`. Both
+  states can transition to suspended. Suspending an already-suspended account is
+  rejected.
+
+The `apply/2` functions are pure state reducers:
+
+- **ClientProvisioned**: sets all fields and transitions status to `:active`.
+- **UsageRecorded**: updates `cumulative_usage` and derives `status` by comparing
+  the new cumulative to the monthly quota. This comparison happens during replay too,
+  so the status is always consistent with the event data.
+- **ClientSuspended**: sets status to `:suspended`.
 
 ### Step 5: Router and Application
 

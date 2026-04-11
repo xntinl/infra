@@ -96,16 +96,23 @@ defmodule Nexus.Registry do
 
   def start_link(_), do: GenServer.start_link(__MODULE__, [], name: __MODULE__)
 
-  @doc "Registers name → pid. Returns :ok or {:error, :already_registered}."
+  @doc "Registers name -> pid. Returns :ok or {:error, :already_registered}."
+  @spec register(term(), pid()) :: :ok | {:error, :already_registered}
   def register(name, pid) do
-    # TODO
-    # HINT: :ets.insert_new/2 for atomic check-and-insert
-    # HINT: GenServer.call so that monitoring happens in the server process
+    GenServer.call(__MODULE__, {:register, name, pid})
   end
 
   @doc "Returns {:ok, pid} or {:error, :not_found}."
+  @spec lookup(term()) :: {:ok, pid()} | {:error, :not_found}
   def lookup(name) do
-    # TODO: :ets.lookup(@table, name) — direct read, no GenServer call
+    case :ets.lookup(@table, name) do
+      [{^name, pid}] -> {:ok, pid}
+      [] -> {:error, :not_found}
+    end
+  end
+
+  def clear do
+    GenServer.call(__MODULE__, :clear)
   end
 
   # GenServer callbacks
@@ -115,11 +122,29 @@ defmodule Nexus.Registry do
   end
 
   def handle_call({:register, name, pid}, _from, state) do
-    # TODO: :ets.insert_new, Process.monitor(pid), store ref → name
+    if :ets.insert_new(@table, {name, pid}) do
+      ref = Process.monitor(pid)
+      new_monitors = Map.put(state.monitors, ref, name)
+      {:reply, :ok, %{state | monitors: new_monitors}}
+    else
+      {:reply, {:error, :already_registered}, state}
+    end
+  end
+
+  def handle_call(:clear, _from, state) do
+    :ets.delete_all_objects(@table)
+    Enum.each(state.monitors, fn {ref, _name} -> Process.demonitor(ref, [:flush]) end)
+    {:reply, :ok, %{state | monitors: %{}}}
   end
 
   def handle_info({:DOWN, ref, :process, _pid, _reason}, state) do
-    # TODO: find name for ref, :ets.delete(@table, name), remove ref from state
+    case Map.pop(state.monitors, ref) do
+      {nil, monitors} ->
+        {:noreply, %{state | monitors: monitors}}
+      {name, monitors} ->
+        :ets.delete(@table, name)
+        {:noreply, %{state | monitors: monitors}}
+    end
   end
 end
 ```
@@ -144,21 +169,71 @@ defmodule Nexus.Trie do
   """
 
   @doc "Inserts a subscription pattern into the trie."
+  @spec insert(map(), String.t(), term()) :: map()
   def insert(trie, pattern, subscriber) do
     segments = String.split(pattern, ".")
-    # TODO
+    insert_segments(trie, segments, subscriber)
+  end
+
+  defp insert_segments(trie, [], subscriber) do
+    existing = Map.get(trie, :leaf, [])
+    Map.put(trie, :leaf, [subscriber | existing])
+  end
+
+  defp insert_segments(trie, [segment | rest], subscriber) do
+    subtrie = Map.get(trie, segment, %{})
+    Map.put(trie, segment, insert_segments(subtrie, rest, subscriber))
   end
 
   @doc "Returns all subscribers whose patterns match the given topic."
+  @spec match(map(), String.t()) :: [term()]
   def match(trie, topic) do
     segments = String.split(topic, ".")
-    # TODO: DFS through trie; at each level, follow exact match, "*", and "#" branches
-    # HINT: "#" can match zero segments — try continuing without consuming a segment
+    match_segments(trie, segments) |> Enum.uniq()
+  end
+
+  defp match_segments(trie, []) do
+    leaf_subs = Map.get(trie, :leaf, [])
+    hash_subs = case Map.get(trie, "#") do
+      nil -> []
+      sub_trie -> Map.get(sub_trie, :leaf, [])
+    end
+    leaf_subs ++ hash_subs
+  end
+
+  defp match_segments(trie, [segment | rest]) do
+    exact = case Map.get(trie, segment) do
+      nil -> []
+      sub_trie -> match_segments(sub_trie, rest)
+    end
+
+    wildcard = case Map.get(trie, "*") do
+      nil -> []
+      sub_trie -> match_segments(sub_trie, rest)
+    end
+
+    hash = case Map.get(trie, "#") do
+      nil -> []
+      sub_trie ->
+        leaf_subs = Map.get(sub_trie, :leaf, [])
+        continue = match_segments(sub_trie, rest)
+        skip_one = match_segments(trie, rest)
+        leaf_subs ++ continue ++ skip_one
+    end
+
+    exact ++ wildcard ++ hash
   end
 
   @doc "Removes a subscriber from all patterns in the trie."
+  @spec remove(map(), term()) :: map()
   def remove(trie, subscriber) do
-    # TODO
+    trie
+    |> Enum.map(fn
+      {:leaf, subs} -> {:leaf, Enum.reject(subs, &(&1 == subscriber))}
+      {key, subtrie} when is_map(subtrie) -> {key, remove(subtrie, subscriber)}
+      other -> other
+    end)
+    |> Map.new()
   end
 end
 ```

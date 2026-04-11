@@ -20,9 +20,9 @@ api_gateway/
 │       ├── graphql/
 │       │   ├── schema.ex           # already exists — add plugins/0 and middleware/3
 │       │   ├── middleware/
-│       │   │   ├── authenticate.ex # ← you implement this
-│       │   │   └── handle_errors.ex # ← and this
-│       │   └── loader.ex           # ← and this
+│       │   │   ├── authenticate.ex # gates mutations behind auth
+│       │   │   └── handle_errors.ex # normalizes error formats
+│       │   └── loader.ex           # DataLoader KV source for health checks
 │       └── ...
 ├── test/
 │   └── api_gateway/
@@ -104,23 +104,50 @@ defmodule ApiGateway.GraphQL.Loader do
   """
 
   def health_source do
-    # KV source: given a set of keys, call fetch_health/2 once with all keys
     Dataloader.KV.new(&fetch_health/2)
   end
 
   # fetch_health/2 receives {:health, urls_set} where urls_set is a MapSet
   # of service URLs that need checking. Returns %{url => status_string}.
   defp fetch_health(:health, urls) do
-    # TODO: for each URL in urls, make a concurrent HTTP GET to the health_path
-    # TODO: return %{url => "healthy"} or %{url => "unreachable"} for each
-    # HINT: Task.async_stream/3 with max_concurrency: 20 and timeout: 3_000
-    # HINT: on {:ok, %{status: s}} when s in 200..299 → "healthy"
-    # HINT: on {:ok, _} or {:exit, _} → "unreachable"
-    # For now, a stub that returns "healthy" for all:
-    Map.new(urls, fn url -> {url, "healthy"} end)
+    urls
+    |> Task.async_stream(
+      fn url ->
+        try do
+          case :httpc.request(:get, {to_charlist(url), []}, [timeout: 3_000], []) do
+            {:ok, {{_, status, _}, _, _}} when status in 200..299 ->
+              {url, "healthy"}
+
+            _ ->
+              {url, "unreachable"}
+          end
+        rescue
+          _ -> {url, "unreachable"}
+        catch
+          _, _ -> {url, "unreachable"}
+        end
+      end,
+      max_concurrency: 20,
+      timeout: 5_000,
+      on_timeout: :kill_task
+    )
+    |> Enum.reduce(%{}, fn
+      {:ok, {url, status}}, acc -> Map.put(acc, url, status)
+      {:exit, _}, acc -> acc
+    end)
   end
 end
 ```
+
+The `fetch_health/2` function receives a batch key (`:health`) and a `MapSet` of URLs.
+It fans out concurrent HTTP checks using `Task.async_stream/3` with a limit of 20
+concurrent connections and a 5-second timeout per task. Each task attempts an HTTP GET
+and classifies the response: 2xx means `"healthy"`, anything else means `"unreachable"`.
+The try/catch/rescue block handles network errors, DNS failures, and timeouts
+uniformly — a health check failure should never crash the DataLoader.
+
+The results are collected into a `%{url => status}` map that DataLoader uses to resolve
+individual fields.
 
 ### Step 3: `lib/api_gateway/graphql/middleware/authenticate.ex`
 
@@ -139,16 +166,24 @@ defmodule ApiGateway.GraphQL.Middleware.Authenticate do
   @impl true
   def call(%{context: %{current_client: client}} = resolution, _opts)
       when not is_nil(client) do
-    # Client is authenticated — pass through
     resolution
   end
 
   def call(resolution, _opts) do
-    # TODO: use Absinthe.Resolution.put_result/2 to set {:error, "authentication required"}
-    # This stops resolution of this field without crashing the query
+    resolution
+    |> Absinthe.Resolution.put_result({:error, "authentication required"})
   end
 end
 ```
+
+The first clause matches when `current_client` is present and non-nil in the context.
+It passes the resolution through unchanged — the resolver will run normally.
+
+The second clause is the catch-all: no `current_client` in context, or it is nil.
+`Absinthe.Resolution.put_result/2` sets the field result to an error without running
+the resolver. The field resolves to `null` in the response, and the error message
+appears in the `errors` array. The query does not crash — other fields that do not
+require auth continue resolving normally.
 
 ### Step 4: `lib/api_gateway/graphql/middleware/handle_errors.ex`
 
@@ -182,8 +217,6 @@ end
 defmodule ApiGateway.GraphQL.Schema do
   use Absinthe.Schema
 
-  import Absinthe.Resolution.Helpers, only: [dataloader: 1]
-
   import_types ApiGateway.GraphQL.Types.Scalars
   import_types ApiGateway.GraphQL.Types.Service
 
@@ -208,17 +241,16 @@ defmodule ApiGateway.GraphQL.Schema do
 
     ctx
     |> Map.put(:loader, loader)
-    # current_client is set here by the Plug pipeline via ApiGateway.Router
-    # forward "/graphql", Absinthe.Plug, schema: ..., context: &build_context/1
   end
 
-  # Required to activate DataLoader batching
+  # Required to activate DataLoader batching. Without this declaration,
+  # DataLoader fields silently resolve to nil — no error is raised.
   def plugins do
     [Absinthe.Middleware.Dataloader | Absinthe.Plugin.defaults()]
   end
 
-  # Called for every field in the schema.
-  # Applies Authenticate to all mutations, HandleErrors to everything.
+  # Called for every field in the schema. Applies Authenticate to all
+  # mutations and HandleErrors to everything.
   def middleware(middleware, _field, %Absinthe.Type.Object{identifier: :mutation}) do
     [ApiGateway.GraphQL.Middleware.Authenticate | middleware] ++
       [ApiGateway.GraphQL.Middleware.HandleErrors]
@@ -229,6 +261,14 @@ defmodule ApiGateway.GraphQL.Schema do
   end
 end
 ```
+
+The `middleware/3` callback is invoked at schema compilation time for every field.
+It receives the current middleware stack, the field definition, and the parent object
+type. The implementation pattern-matches on `%Absinthe.Type.Object{identifier: :mutation}`
+to add `Authenticate` only to mutation fields. Read queries remain accessible without
+auth — appropriate for a dashboard that shows public service status.
+
+`HandleErrors` is appended to every field so error normalization applies uniformly.
 
 ### Step 6: Use DataLoader in the `status` field
 
@@ -253,6 +293,13 @@ object :service do
   end
 end
 ```
+
+The `status` field resolver uses the deferred resolution pattern. Instead of making
+an HTTP call immediately, it calls `Dataloader.load/4` to register a pending load
+and `on_load/2` to provide a callback that runs after all pending loads at this
+resolution level are batched together. When Absinthe moves to the next resolution
+level, it calls `fetch_health/2` once with all collected URLs, then invokes each
+field's `on_load` callback with the populated loader.
 
 ### Step 7: Given tests — must pass without modification
 

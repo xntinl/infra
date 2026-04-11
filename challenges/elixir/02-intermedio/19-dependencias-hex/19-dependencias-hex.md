@@ -105,20 +105,20 @@ defmodule TaskQueue.MixProject do
   defp deps do
     [
       # Production dependencies — available in all environments
-      # TODO: add {:jason, "~> 1.4"} for JSON encoding of job payloads
-      # TODO: add {:req, "~> 0.5"} for HTTP webhook notifications
+      {:jason, "~> 1.4"},
+      {:req, "~> 0.5"},
 
       # Dev-only — static analysis, never included in a release
-      # TODO: add {:dialyxir, "~> 1.0", only: :dev, runtime: false}
+      {:dialyxir, "~> 1.0", only: :dev, runtime: false},
 
       # Dev-only — documentation generation
-      # TODO: add {:ex_doc, "~> 0.31", only: :dev, runtime: false}
+      {:ex_doc, "~> 0.31", only: :dev, runtime: false},
 
       # Test-only — mocking for external HTTP calls
-      # TODO: add {:mox, "~> 1.0", only: :test}
+      {:mox, "~> 1.0", only: :test},
 
       # Dev + test — seed data generation
-      # TODO: add {:faker, "~> 0.18", only: [:dev, :test]}
+      {:faker, "~> 0.18", only: [:dev, :test]}
     ]
   end
 end
@@ -142,10 +142,13 @@ defmodule TaskQueue.Worker do
   """
   @spec execute(String.t()) :: {:ok, term()} | {:error, term()}
   def execute(encoded_payload) when is_binary(encoded_payload) do
-    # TODO: decode the JSON payload with Jason.decode/1
-    # If decoding fails, return {:error, {:bad_payload, reason}}
-    # If decoding succeeds, call do_work/1 with the decoded map
-    # TODO: implement
+    case Jason.decode(encoded_payload) do
+      {:ok, decoded} ->
+        do_work(decoded)
+
+      {:error, reason} ->
+        {:error, {:bad_payload, reason}}
+    end
   end
 
   @doc """
@@ -155,8 +158,7 @@ defmodule TaskQueue.Worker do
   """
   @spec encode_job(map()) :: {:ok, String.t()} | {:error, term()}
   def encode_job(job_map) when is_map(job_map) do
-    # TODO: use Jason.encode/1
-    # TODO: implement
+    Jason.encode(job_map)
   end
 
   defp do_work(%{"type" => type, "args" => args}) do
@@ -207,7 +209,7 @@ mix deps.get
 mix test test/task_queue/worker_test.exs --trace
 ```
 
-All 3 tests fail initially. Implement `Worker.encode_job/1` and `Worker.execute/1` until they pass.
+All 3 tests should pass. The `execute/1` function decodes JSON via `Jason.decode/1`, pattern-matches on the decoded map to extract `"type"` and `"args"`, and delegates to `do_work/1`. The `encode_job/1` function delegates directly to `Jason.encode/1`.
 
 ### Step 6: Verify environment isolation
 
@@ -226,8 +228,6 @@ ls -la mix.lock
 
 ## Trade-off analysis
 
-Fill in this table after running the project.
-
 | Aspect | `~> 1.4` (minor range) | `~> 1.4.2` (patch range) | `>= 1.4.0` (no ceiling) |
 |--------|------------------------|--------------------------|-------------------------|
 | Flexibility | accepts minor bumps | patch bumps only | accepts breaking changes |
@@ -236,6 +236,8 @@ Fill in this table after running the project.
 | lock needed? | yes | yes | especially yes |
 
 Reflection question: why does `runtime: false` on `dialyxir` matter for releases, even though `only: :dev` already excludes it from production builds?
+
+Answer: `only: :dev` prevents the dependency from being fetched and compiled in prod. `runtime: false` prevents the dependency's OTP application from being started when the app boots in dev. Without `runtime: false`, `dialyxir` registers itself as a started application, adding startup overhead and potentially interfering with the dev supervision tree. Both options serve different purposes and should be used together for CLI tools.
 
 ---
 

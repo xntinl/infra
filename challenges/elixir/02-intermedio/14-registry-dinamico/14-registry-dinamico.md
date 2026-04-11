@@ -21,8 +21,8 @@ task_queue/
 ├── lib/
 │   └── task_queue/
 │       ├── application.ex           # updated to start Registry and DynamicSupervisor
-│       ├── dynamic_worker.ex        # ← you implement this
-│       └── worker_pool.ex           # ← you implement this
+│       ├── dynamic_worker.ex
+│       └── worker_pool.ex
 ├── test/
 │   └── task_queue/
 │       └── registry_test.exs        # given tests — must pass without modification
@@ -112,9 +112,7 @@ defmodule TaskQueue.DynamicWorker do
   @doc "Returns the via tuple for Registry-based naming."
   @spec via(String.t()) :: {:via, Registry, {module(), {atom(), String.t()}}}
   def via(worker_id) do
-    # HINT: {:via, Registry, {@registry, {:worker, worker_id}}}
-    # This tuple is accepted anywhere a process name is accepted (GenServer.call, etc.)
-    # TODO: implement
+    {:via, Registry, {@registry, {:worker, worker_id}}}
   end
 
   @doc "Returns the PID of the worker with the given ID, or nil."
@@ -129,8 +127,6 @@ defmodule TaskQueue.DynamicWorker do
   @doc "Returns all currently registered worker IDs."
   @spec list_ids() :: [String.t()]
   def list_ids do
-    # HINT: Registry.select(@registry, [{{:"$1", :"$2", :"$3"}, [], [:"$1"]}])
-    #   returns all keys. Then extract the worker_id from the {:worker, worker_id} tuple.
     @registry
     |> Registry.select([{{:"$1", :"$2", :"$3"}, [], [:"$1"]}])
     |> Enum.map(fn {:worker, id} -> id end)
@@ -139,11 +135,6 @@ defmodule TaskQueue.DynamicWorker do
   @doc "Sends a message to all registered workers via Registry.dispatch."
   @spec broadcast(any()) :: :ok
   def broadcast(message) do
-    # HINT: Registry.dispatch(@registry, :broadcast_group, fn entries ->
-    #   for {pid, _} <- entries, do: send(pid, message)
-    # end)
-    # Note: broadcast via dispatch requires workers to have registered under the same key.
-    # For simplicity, we iterate all workers here.
     for id <- list_ids() do
       case lookup(id) do
         nil -> :ok
@@ -156,8 +147,7 @@ defmodule TaskQueue.DynamicWorker do
   @doc "Requests a worker to process the next available job. Returns result."
   @spec process_job(String.t()) :: {:ok, any()} | {:error, any()}
   def process_job(worker_id) do
-    # HINT: GenServer.call(via(worker_id), :process_job, 30_000)
-    # TODO: implement
+    GenServer.call(via(worker_id), :process_job, 30_000)
   end
 
   @doc "Returns statistics for a specific worker."
@@ -221,6 +211,17 @@ defmodule TaskQueue.DynamicWorker do
 end
 ```
 
+The `via/1` function returns a `:via` tuple that Registry understands. When passed as the
+`name:` option to `GenServer.start_link/3`, the GenServer registers itself in the Registry
+under `{:worker, worker_id}`. The same tuple can be used anywhere a process name is
+accepted — `GenServer.call(via(worker_id), :stats)` routes through the Registry to the
+correct PID.
+
+The `list_ids/0` function uses `Registry.select/2` with a match specification to extract
+all registered keys. The specification `[{{:"$1", :"$2", :"$3"}, [], [:"$1"]}]` means
+"match any entry, return the key". The result is a list of `{:worker, id}` tuples, which
+we map to extract just the string IDs.
+
 ### Step 3: `lib/task_queue/worker_pool.ex`
 
 ```elixir
@@ -238,8 +239,7 @@ defmodule TaskQueue.WorkerPool do
   @doc "Starts a new worker with the given ID. Returns {:ok, pid} or {:error, reason}."
   @spec start_worker(String.t()) :: {:ok, pid()} | {:error, any()}
   def start_worker(worker_id) do
-    # HINT: DynamicSupervisor.start_child(@supervisor, {DynamicWorker, worker_id})
-    # TODO: implement
+    DynamicSupervisor.start_child(@supervisor, {DynamicWorker, worker_id})
   end
 
   @doc "Stops the worker with the given ID gracefully."
@@ -276,12 +276,21 @@ defmodule TaskQueue.WorkerPool do
   @doc "Collects stats from all active workers."
   @spec all_stats() :: [map()]
   def all_stats do
-    # HINT: DynamicWorker.list_ids() |> Enum.map(&DynamicWorker.stats/1)
-    # HINT: filter out {:error, :not_found} entries (race condition: worker exited between list and stats)
-    # TODO: implement
+    DynamicWorker.list_ids()
+    |> Enum.map(&DynamicWorker.stats/1)
+    |> Enum.filter(&is_map/1)
   end
 end
 ```
+
+The `start_worker/1` function uses `DynamicSupervisor.start_child/2` to launch a new
+worker under supervision. The child spec `{DynamicWorker, worker_id}` tells the
+DynamicSupervisor to call `DynamicWorker.start_link(worker_id)`.
+
+The `all_stats/1` function collects stats from all workers. The `Enum.filter(&is_map/1)`
+at the end handles the race condition where a worker exits between `list_ids()` and
+`stats/1` — the stats call returns `{:error, :not_found}`, which is not a map and gets
+filtered out.
 
 ### Step 4: Given tests — must pass without modification
 
@@ -435,4 +444,4 @@ ETS instead.
 - [Registry — HexDocs](https://hexdocs.pm/elixir/Registry.html)
 - [DynamicSupervisor — HexDocs](https://hexdocs.pm/elixir/DynamicSupervisor.html)
 - [Registry source code](https://github.com/elixir-lang/elixir/blob/main/lib/elixir/lib/registry.ex) — well-documented, worth reading
-- [Elixir in Action — Saša Jurić](https://www.manning.com/books/elixir-in-action-third-edition) — Chapter 12: Building a fault-tolerant system
+- [Elixir in Action — Sasa Juric](https://www.manning.com/books/elixir-in-action-third-edition) — Chapter 12: Building a fault-tolerant system

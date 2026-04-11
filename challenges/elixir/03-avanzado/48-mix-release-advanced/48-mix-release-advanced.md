@@ -22,18 +22,18 @@ api_gateway_umbrella/
 │   ├── config.exs
 │   ├── dev.exs
 │   ├── test.exs
-│   └── runtime.exs         # ← you write this
+│   └── runtime.exs         # runtime secrets and env-specific config
 ├── rel/
-│   ├── vm.args.eex          # ← you write this
+│   ├── vm.args.eex          # Erlang VM arguments
 │   └── env.sh.eex
 ├── lib/gateway_core/
-│   ├── release.ex           # ← you write this
-│   └── config_validator.ex  # ← you write this
+│   ├── release.ex           # migration runner for releases
+│   └── config_validator.ex  # startup validation for required config
 ├── lib/gateway_api_web/
-│   └── plugs/health_check.ex # ← you write this
-├── Dockerfile               # ← you write this
+│   └── plugs/health_check.ex # K8s liveness and readiness probes
+├── Dockerfile               # multi-stage build
 └── k8s/
-    └── deployment.yaml      # ← you write this
+    └── deployment.yaml      # Kubernetes manifest
 ```
 
 ---
@@ -63,9 +63,9 @@ the server's environment. This is where secrets belong.
 
 ```
 compile time                              runtime
-────────────────                          ────────────────────────────
-config.exs    ──baked into binary──▶     runtime.exs reads env vars
-prod.exs                                  ↓
+----------------                          --------------------------
+config.exs    --baked into binary-->     runtime.exs reads env vars
+prod.exs                                  |
                                          Application.start/2 runs
 ```
 
@@ -75,44 +75,67 @@ prod.exs                                  ↓
 
 ### Step 1: `config/runtime.exs`
 
+All production secrets are read at startup from environment variables. The `fetch_env!/1`
+helper raises immediately with a descriptive message if a required variable is missing —
+preventing the app from starting in a misconfigured state.
+
 ```elixir
 import Config
 
-defp fetch_env!(name) do
-  System.get_env(name) ||
-    raise """
-    Required environment variable #{name} is not set.
-
-    In development: add to .env and source it.
-    In production: set via Kubernetes secret or deployment system.
-    """
-end
-
 if config_env() == :prod do
+  database_url =
+    System.get_env("DATABASE_URL") ||
+      raise """
+      Required environment variable DATABASE_URL is not set.
+
+      In development: add to .env and source it.
+      In production: set via Kubernetes secret or deployment system.
+      """
+
+  secret_key_base =
+    System.get_env("SECRET_KEY_BASE") ||
+      raise """
+      Required environment variable SECRET_KEY_BASE is not set.
+
+      Generate with: mix phx.gen.secret
+      """
+
+  phx_host =
+    System.get_env("PHX_HOST") ||
+      raise "Required environment variable PHX_HOST is not set."
+
+  jwt_secret =
+    System.get_env("JWT_SECRET") ||
+      raise "Required environment variable JWT_SECRET is not set."
+
   config :gateway_core, GatewayCore.Repo,
-    url:       fetch_env!("DATABASE_URL"),
+    url:       database_url,
     pool_size: System.get_env("DATABASE_POOL_SIZE", "10") |> String.to_integer(),
     ssl:       System.get_env("DATABASE_SSL", "true") == "true"
 
   config :gateway_api, GatewayApiWeb.Endpoint,
-    secret_key_base: fetch_env!("SECRET_KEY_BASE"),
+    secret_key_base: secret_key_base,
     http: [
       ip:   {0, 0, 0, 0},
       port: System.get_env("PORT", "4000") |> String.to_integer()
     ],
     url: [
-      host:   fetch_env!("PHX_HOST"),
+      host:   phx_host,
       scheme: "https",
       port:   443
     ],
     server: true
 
   config :gateway_core,
-    jwt_secret: fetch_env!("JWT_SECRET")
+    jwt_secret: jwt_secret
 end
 ```
 
 ### Step 2: `lib/gateway_core/config_validator.ex`
+
+Validates that all required configuration is present before the application accepts
+traffic. Called in `Application.start/2` — crashes the boot if anything is missing.
+This catches misconfiguration at startup, not at the first request.
 
 ```elixir
 defmodule GatewayCore.ConfigValidator do
@@ -129,15 +152,42 @@ defmodule GatewayCore.ConfigValidator do
 
   @spec validate!() :: :ok
   def validate! do
-    # TODO: for each {app_or_module, key} in @required,
-    # check Application.get_env/2 is not nil or empty string.
-    # Collect all missing configs and raise with a descriptive message listing them all.
-    # HINT: use Enum.flat_map + Enum.empty? to collect and check in one pass
+    missing =
+      Enum.flat_map(@required, fn {app_or_module, key} ->
+        value = Application.get_env(app_or_module, key) || Application.get_env(:gateway_core, key)
+
+        if is_nil(value) or value == "" do
+          [{app_or_module, key}]
+        else
+          []
+        end
+      end)
+
+    if Enum.empty?(missing) do
+      :ok
+    else
+      formatted =
+        Enum.map_join(missing, "\n  - ", fn {app, key} ->
+          "#{inspect(app)} :#{key}"
+        end)
+
+      raise """
+      Missing required configuration:
+        - #{formatted}
+
+      Set the corresponding environment variables in runtime.exs or application config.
+      """
+    end
   end
 end
 ```
 
 ### Step 3: `lib/gateway_api_web/plugs/health_check.ex`
+
+Health check plug registered BEFORE the Phoenix router. Kubernetes uses `/health/live`
+to determine if the process is alive, and `/health/ready` to determine if it should
+receive traffic. During graceful shutdown, `/health/ready` returns 503 so Kubernetes
+stops routing new requests to this pod.
 
 ```elixir
 defmodule GatewayApiWeb.Plugs.HealthCheck do
@@ -161,23 +211,48 @@ defmodule GatewayApiWeb.Plugs.HealthCheck do
   end
 
   def call(%Plug.Conn{request_path: "/health/ready"} = conn, _) do
-    # TODO:
-    # 1. If :persistent_term.get(:app_draining, false) is true → return 503
-    # 2. Run check_database/0 — 503 if it fails
-    # 3. Return 200 with JSON body listing each check result
+    draining = :persistent_term.get(:app_draining, false)
+
+    if draining do
+      conn
+      |> put_resp_content_type("application/json")
+      |> send_resp(503, Jason.encode!(%{status: "draining"}))
+      |> halt()
+    else
+      case check_database() do
+        :ok ->
+          conn
+          |> put_resp_content_type("application/json")
+          |> send_resp(200, Jason.encode!(%{status: "ok", checks: %{database: "ok"}}))
+          |> halt()
+
+        {:error, reason} ->
+          conn
+          |> put_resp_content_type("application/json")
+          |> send_resp(503, Jason.encode!(%{status: "unhealthy", checks: %{database: inspect(reason)}}))
+          |> halt()
+      end
+    end
   end
 
   def call(conn, _), do: conn
 
   defp check_database do
-    # TODO: Ecto.Adapters.SQL.query(GatewayCore.Repo, "SELECT 1", [])
-    # Return :ok or {:error, reason}
-    # HINT: wrap in rescue to handle the case where Repo is not yet started
+    case Ecto.Adapters.SQL.query(GatewayCore.Repo, "SELECT 1", []) do
+      {:ok, _} -> :ok
+      {:error, reason} -> {:error, reason}
+    end
+  rescue
+    error -> {:error, error}
   end
 end
 ```
 
 ### Step 4: `lib/gateway_core/shutdown_handler.ex`
+
+Handles SIGTERM for graceful shutdown. When Kubernetes sends SIGTERM during a rolling
+deploy, this handler marks the app as draining (health check returns 503), pauses Oban
+queues, and waits for in-flight requests to complete before shutting down.
 
 ```elixir
 defmodule GatewayCore.ShutdownHandler do
@@ -196,16 +271,16 @@ defmodule GatewayCore.ShutdownHandler do
 
   @impl true
   def handle_info({:signal, :sigterm}, state) do
-    Logger.info("SIGTERM received — starting graceful drain")
+    Logger.info("SIGTERM received -- starting graceful drain")
 
-    # Mark the app as draining — health check /ready will return 503
-    # Kubernetes will stop routing new traffic here within ~5s
+    # Mark the app as draining — health check /ready will return 503.
+    # Kubernetes will stop routing new traffic here within ~5s.
     :persistent_term.put(:app_draining, true)
 
-    # Pause Oban queues — don't start new jobs
-    # TODO: Oban.pause_queue(queue: :notifications)
-    # TODO: Oban.pause_queue(queue: :audit)
-    # TODO: Oban.pause_queue(queue: :reports)
+    # Pause Oban queues — don't start new jobs, let running ones finish
+    Oban.pause_queue(queue: :notifications)
+    Oban.pause_queue(queue: :audit)
+    Oban.pause_queue(queue: :reports)
 
     # Force shutdown after drain timeout
     Process.send_after(self(), :force_shutdown, @drain_timeout_ms)
@@ -215,7 +290,7 @@ defmodule GatewayCore.ShutdownHandler do
 
   @impl true
   def handle_info(:force_shutdown, state) do
-    Logger.warning("Drain timeout (#{@drain_timeout_ms}ms) reached — forcing shutdown")
+    Logger.warning("Drain timeout (#{@drain_timeout_ms}ms) reached -- forcing shutdown")
     System.stop(0)
     {:noreply, state}
   end
@@ -223,6 +298,9 @@ end
 ```
 
 ### Step 5: `lib/gateway_core/release.ex`
+
+Migration runner for releases. Called via `eval` in deployment scripts before starting
+the application. This avoids requiring Mix on the production server.
 
 ```elixir
 defmodule GatewayCore.Release do
@@ -255,6 +333,9 @@ end
 
 ### Step 6: `rel/vm.args.eex`
 
+Erlang VM arguments control process limits, crash dump behavior, and distributed
+Erlang naming. These are evaluated at release start time using EEx.
+
 ```
 ## Erlang VM arguments — evaluated at release start
 
@@ -280,8 +361,12 @@ end
 
 ### Step 7: Dockerfile (multi-stage)
 
+The multi-stage build separates compilation from the runtime image. The first stage
+installs Elixir and compiles the release; the second stage copies only the compiled
+release into a minimal Debian image. This produces a ~100MB image instead of ~1GB.
+
 ```dockerfile
-# ── Stage 1: Build ──────────────────────────────────────────────────────────
+# -- Stage 1: Build --
 FROM hexpm/elixir:1.16.2-erlang-26.2.5-alpine-3.19.1 AS builder
 
 RUN apk add --no-cache build-base git
@@ -307,7 +392,7 @@ COPY rel rel
 RUN MIX_ENV=prod mix compile
 RUN MIX_ENV=prod mix release
 
-# ── Stage 2: Runtime ─────────────────────────────────────────────────────────
+# -- Stage 2: Runtime --
 FROM debian:bookworm-slim AS runner
 
 RUN apt-get update -y && \
@@ -509,6 +594,6 @@ then copy source.
 ## Resources
 
 - [Mix Release docs](https://hexdocs.pm/mix/Mix.Tasks.Release.html) — comprehensive release configuration
-- [Distillery → Mix Release migration guide](https://elixirforum.com/t/distillery-to-mix-releases/26904)
+- [Distillery to Mix Release migration guide](https://elixirforum.com/t/distillery-to-mix-releases/26904)
 - [Kubernetes probes](https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/) — liveness vs readiness
 - [hexpm/elixir Docker images](https://hub.docker.com/r/hexpm/elixir) — official multi-arch images

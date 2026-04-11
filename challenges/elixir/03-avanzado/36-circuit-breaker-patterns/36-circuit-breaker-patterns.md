@@ -84,6 +84,12 @@ end
 
 ### Step 2: `lib/api_gateway/circuit_breaker/fuse_breaker.ex`
 
+The FuseBreaker delegates all state management to the Fuse library. `install/1` registers
+a named fuse with threshold and reset configuration. `call/2` checks whether the circuit
+is open before executing the function — if open, it returns immediately without calling
+the function. On failure, `:fuse.melt/1` records the failure, and Fuse internally tracks
+whether the threshold has been reached.
+
 ```elixir
 defmodule ApiGateway.CircuitBreaker.FuseBreaker do
   @moduledoc """
@@ -98,8 +104,8 @@ defmodule ApiGateway.CircuitBreaker.FuseBreaker do
   Fuse configuration format:
     {{:standard, max_failures, window_ms}, {:reset, reset_ms}}
 
-  max_failures failures in window_ms → circuit opens.
-  After reset_ms → Fuse allows one probe (:half_open).
+  max_failures failures in window_ms -> circuit opens.
+  After reset_ms -> Fuse allows one probe (:half_open).
   """
 
   @type fuse_name :: atom()
@@ -115,10 +121,10 @@ defmodule ApiGateway.CircuitBreaker.FuseBreaker do
     window_ms  = Keyword.get(opts, :window_ms, 10_000)
     reset_ms   = Keyword.get(opts, :reset_ms, 30_000)
 
-    # TODO: call :fuse.install/2 with the options above
-    # On {:error, :already_installed} → return :ok (idempotent)
-    # HINT: :fuse.install(name, {{:standard, threshold, window_ms}, {:reset, reset_ms}})
-    :ok
+    case :fuse.install(name, {{:standard, threshold, window_ms}, {:reset, reset_ms}}) do
+      :ok -> :ok
+      {:error, :already_installed} -> :ok
+    end
   end
 
   @doc """
@@ -131,21 +137,30 @@ defmodule ApiGateway.CircuitBreaker.FuseBreaker do
   """
   @spec call(fuse_name(), (-> term())) :: {:ok, term()} | {:error, term()}
   def call(name, fun) when is_function(fun, 0) do
-    # TODO: call :fuse.ask(name, :sync)
-    # On :ok  → execute fun via safe_call/1
-    #            On {:ok, _} → return result
-    #            On {:error, _} → call :fuse.melt(name) to record the failure, return error
-    # On :blown → return {:error, :circuit_open} WITHOUT calling fun
-    # HINT: :fuse.melt/1 records one failure; it never throws
-    {:error, :not_implemented}
+    case :fuse.ask(name, :sync) do
+      :ok ->
+        case safe_call(fun) do
+          {:ok, _} = result ->
+            result
+
+          {:error, _} = error ->
+            :fuse.melt(name)
+            error
+        end
+
+      :blown ->
+        {:error, :circuit_open}
+    end
   end
 
   @doc "Query the current circuit state."
-  @spec state(fuse_name()) :: :closed | :open | :blown | {:error, term()}
+  @spec state(fuse_name()) :: :ok | :blown | {:error, term()}
   def state(name) do
-    # TODO: call :fuse.circuit_state/1
-    # Returns: :ok (closed), :blown (open/half_open), or {:error, :not_found}
-    {:error, :not_implemented}
+    case :fuse.circuit_state(name) do
+      :ok -> :ok
+      :blown -> :blown
+      {:error, _} = error -> error
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -169,6 +184,15 @@ end
 ```
 
 ### Step 3: `lib/api_gateway/circuit_breaker/bulkhead.ex`
+
+The bulkhead pattern limits concurrent in-flight requests to a downstream service.
+The GenServer serializes acquire/release operations, maintaining an exact count of
+in-flight calls. When the count reaches `max_concurrent`, new requests are rejected
+immediately (fail fast) rather than queued.
+
+The `run/2` function uses `try/after` to guarantee that the slot is released even if the
+user function raises an exception. The `release` operation is a cast (fire-and-forget)
+because the caller does not need to wait for confirmation.
 
 ```elixir
 defmodule ApiGateway.CircuitBreaker.Bulkhead do
@@ -235,15 +259,12 @@ defmodule ApiGateway.CircuitBreaker.Bulkhead do
   @impl true
   def handle_call(:acquire, _from, %{current: current, max_concurrent: max} = state)
       when current < max do
-    # TODO: increment current and reply :ok
-    # HINT: {:reply, :ok, %{state | current: current + 1}}
-    {:reply, {:error, :not_implemented}, state}
+    {:reply, :ok, %{state | current: current + 1}}
   end
 
   @impl true
   def handle_call(:acquire, _from, state) do
-    # TODO: at capacity — reply {:error, :at_capacity} without changing state
-    {:reply, {:error, :not_implemented}, state}
+    {:reply, {:error, :at_capacity}, state}
   end
 
   @impl true
@@ -259,9 +280,7 @@ defmodule ApiGateway.CircuitBreaker.Bulkhead do
 
   @impl true
   def handle_cast(:release, %{current: current} = state) do
-    # TODO: decrement current, floor at 0
-    # HINT: {:noreply, %{state | current: max(0, current - 1)}}
-    {:noreply, state}
+    {:noreply, %{state | current: max(0, current - 1)}}
   end
 
   # ---------------------------------------------------------------------------
@@ -325,10 +344,10 @@ defmodule ApiGateway.CircuitBreaker.FuseBreakerTest do
     assert :counters.get(called, 1) == 0
   end
 
-  test "state/1 returns :closed when circuit is healthy" do
+  test "state/1 returns :ok when circuit is healthy" do
     name = fuse_name()
     FuseBreaker.install(name, threshold: 5)
-    assert FuseBreaker.state(name) == :ok  # Fuse returns :ok for closed
+    assert FuseBreaker.state(name) == :ok
   end
 
   test "exceptions in the function are caught and recorded as failures" do

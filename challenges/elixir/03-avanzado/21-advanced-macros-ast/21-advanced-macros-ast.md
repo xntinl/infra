@@ -25,9 +25,9 @@ api_gateway/
 │       ├── router.ex
 │       ├── middleware/
 │       │   ├── pipeline.ex
-│       │   └── instrumentation.ex  # ← you implement this
+│       │   └── instrumentation.ex
 │       └── dev/
-│           └── ast_tools.ex        # ← and this
+│           └── ast_tools.ex
 ├── test/
 │   └── api_gateway/
 │       └── middleware/
@@ -134,6 +134,12 @@ defmodule ApiGateway.Dev.ASTTools do
   This is a compile-time operation: the returned list is available as a literal
   value at the call site. The block is NOT executed.
 
+  Uses Macro.postwalk to traverse the AST bottom-up. Variables are identified by
+  the three-tuple {name, meta, context} where context is an atom (not a list).
+  Function calls have a list as the third element, so they are excluded.
+  Variables starting with underscore are excluded by convention (they signal
+  intentionally unused bindings).
+
   Usage:
     vars = ApiGateway.Dev.ASTTools.referenced_vars do
       method = conn.method
@@ -189,6 +195,10 @@ defmodule ApiGateway.Middleware.Instrumentation do
     1. Record start time with System.monotonic_time(:microsecond)
     2. Execute the original body
     3. Emit a :telemetry event with elapsed time and function metadata
+
+  The macro pattern-matches on the AST structure of a `def` form to extract
+  the function name, arguments, and body. It then wraps the body in timing
+  code and re-emits the `def` with the instrumented body.
   """
 
   @doc """
@@ -235,12 +245,19 @@ defmodule ApiGateway.Middleware.Instrumentation do
   @doc """
   Counts the number of timing instrumentation injections a `do` block would receive
   if passed through `instrument/1`. Used in testing to verify transformation behavior.
+
+  Traverses the AST with Macro.prewalk, counting every {:def, _, _} node found.
+  Each such node represents one function definition that would be instrumented.
   """
   @spec count_instrument_sites(Macro.t()) :: non_neg_integer()
   def count_instrument_sites(ast) do
-    # HINT: use Macro.prewalk with an accumulator
-    # HINT: count occurrences of {:def, _, _} nodes in the AST
-    # TODO: implement
+    {_ast, count} =
+      Macro.prewalk(ast, 0, fn
+        {:def, _meta, _args} = node, acc -> {node, acc + 1}
+        node, acc -> {node, acc}
+      end)
+
+    count
   end
 end
 ```

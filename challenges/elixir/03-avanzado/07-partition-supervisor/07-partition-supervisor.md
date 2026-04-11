@@ -92,6 +92,10 @@ zero traffic. The overhead of extra processes exceeds the benefit.
 
 ### Step 1: Update `application.ex`
 
+Replace the single `RateLimiter.Server` with a `PartitionSupervisor` that creates
+N copies (one per scheduler). Each partition is an independent GenServer with its own
+ETS table.
+
 ```elixir
 # In lib/api_gateway/application.ex, inside CoreSupervisor children:
 
@@ -104,6 +108,15 @@ zero traffic. The overhead of extra processes exceeds the benefit.
 ```
 
 ### Step 2: Rewrite `lib/api_gateway/rate_limiter/server.ex`
+
+The key changes from the original single-process server:
+
+1. **No fixed name registration**: each partition gets its own name from the
+   PartitionSupervisor, so `start_link` must NOT register with a fixed `name:`.
+2. **Unnamed ETS tables**: each partition creates its own private ETS table. Using
+   `:named_table` would crash the second partition because the name is already taken.
+3. **Via-tuple routing**: public API functions route through the PartitionSupervisor
+   using `{:via, PartitionSupervisor, {supervisor_name, routing_key}}`.
 
 ```elixir
 defmodule ApiGateway.RateLimiter.Server do
@@ -123,11 +136,10 @@ defmodule ApiGateway.RateLimiter.Server do
   @spec check(String.t(), pos_integer(), pos_integer()) ::
           {:allow, non_neg_integer()} | {:deny, pos_integer()}
   def check(client_id, limit, window_ms) do
-    # TODO: route to the correct partition using:
-    # GenServer.call(
-    #   {:via, PartitionSupervisor, {ApiGateway.RateLimiter.Partitions, client_id}},
-    #   {:check, client_id, limit, window_ms}
-    # )
+    GenServer.call(
+      {:via, PartitionSupervisor, {ApiGateway.RateLimiter.Partitions, client_id}},
+      {:check, client_id, limit, window_ms}
+    )
   end
 
   @doc """
@@ -136,11 +148,10 @@ defmodule ApiGateway.RateLimiter.Server do
   """
   @spec record(String.t()) :: :ok
   def record(client_id) do
-    # TODO: route via PartitionSupervisor using cast
-    # GenServer.cast(
-    #   {:via, PartitionSupervisor, {ApiGateway.RateLimiter.Partitions, client_id}},
-    #   {:record, client_id}
-    # )
+    GenServer.cast(
+      {:via, PartitionSupervisor, {ApiGateway.RateLimiter.Partitions, client_id}},
+      {:record, client_id}
+    )
     :ok
   end
 
@@ -150,23 +161,19 @@ defmodule ApiGateway.RateLimiter.Server do
   # ---------------------------------------------------------------------------
 
   def start_link(opts \\ []) do
-    # NOTE: do NOT register with a fixed name here.
+    # Do NOT register with a fixed name here.
     # PartitionSupervisor manages the naming via the partition index.
     GenServer.start_link(__MODULE__, opts)
   end
 
   @impl true
   def init(_opts) do
-    # Each partition has its own ETS table — NOT a shared named table.
-    # Using a named table would crash the second partition trying to create it.
-    #
-    # TODO: create a local, unnamed ETS table (:bag, :public)
-    # Store the table ref in state.
-    # Schedule periodic cleanup.
-    #
-    # HINT: table = :ets.new(:rate_limiter_shard, [:bag, :public])
-    # HINT: Process.send_after(self(), :cleanup, @cleanup_interval_ms)
-    # HINT: {:ok, %{table: table}}
+    # Each partition creates its own unnamed ETS table.
+    # Using :named_table would crash the second partition because the
+    # name would already be taken by the first.
+    table = :ets.new(:rate_limiter_shard, [:bag, :public])
+    Process.send_after(self(), :cleanup, @cleanup_interval_ms)
+    {:ok, %{table: table}}
   end
 
   # ---------------------------------------------------------------------------
@@ -175,22 +182,48 @@ defmodule ApiGateway.RateLimiter.Server do
 
   @impl true
   def handle_call({:check, client_id, limit, window_ms}, _from, state) do
-    # TODO: implement sliding window check using state.table (not a named table)
-    # Same logic as the original rate limiter but using state.table instead of @table
-    # HINT: :ets.lookup(state.table, client_id)
+    now = System.monotonic_time(:millisecond)
+    cutoff = now - window_ms
+
+    # Count only timestamps within the current window
+    count =
+      :ets.lookup(state.table, client_id)
+      |> Enum.count(fn {_id, ts} -> ts > cutoff end)
+
+    result =
+      if count >= limit do
+        # Find the oldest timestamp in the window to calculate retry_after
+        oldest_in_window =
+          :ets.lookup(state.table, client_id)
+          |> Enum.filter(fn {_id, ts} -> ts > cutoff end)
+          |> Enum.min_by(fn {_id, ts} -> ts end, fn -> {nil, now} end)
+          |> elem(1)
+
+        retry_after = window_ms - (now - oldest_in_window)
+        {:deny, max(retry_after, 1)}
+      else
+        remaining = limit - count
+        {:allow, remaining}
+      end
+
+    {:reply, result, state}
   end
 
   @impl true
   def handle_cast({:record, client_id}, state) do
     ts = System.monotonic_time(:millisecond)
-    # TODO: insert {client_id, ts} into state.table
+    :ets.insert(state.table, {client_id, ts})
     {:noreply, state}
   end
 
   @impl true
   def handle_info(:cleanup, state) do
     cutoff = System.monotonic_time(:millisecond) - 3_600_000
-    # TODO: delete entries older than 1 hour from state.table
+
+    # Delete entries older than 1 hour. :ets.select_delete with a match spec
+    # efficiently removes matching entries without building an intermediate list.
+    :ets.select_delete(state.table, [{{:_, :"$1"}, [{:<, :"$1", cutoff}], [true]}])
+
     Process.send_after(self(), :cleanup, @cleanup_interval_ms)
     {:noreply, state}
   end
@@ -199,7 +232,8 @@ end
 
 ### Step 3: `lib/api_gateway/rate_limiter/partition_counter.ex`
 
-The gateway dashboard needs to show aggregate stats across all partitions.
+The gateway dashboard needs aggregate stats across all partitions. This module
+collects per-partition data in parallel using `Task.async_stream`.
 
 ```elixir
 defmodule ApiGateway.RateLimiter.PartitionCounter do
@@ -214,12 +248,11 @@ defmodule ApiGateway.RateLimiter.PartitionCounter do
 
     0..(n - 1)
     |> Task.async_stream(fn partition_index ->
-      # TODO: get the state from each partition and return its table entry count
-      # HINT: pid = GenServer.whereis(
-      #          {:via, PartitionSupervisor,
-      #            {ApiGateway.RateLimiter.Partitions, partition_index}})
-      #       state = :sys.get_state(pid)
-      #       :ets.info(state.table, :size)
+      pid = GenServer.whereis(
+        {:via, PartitionSupervisor, {ApiGateway.RateLimiter.Partitions, partition_index}}
+      )
+      state = :sys.get_state(pid)
+      :ets.info(state.table, :size)
     end, max_concurrency: n, timeout: 5_000)
     |> Enum.reduce(0, fn {:ok, count}, acc -> acc + count end)
   end
@@ -227,14 +260,20 @@ defmodule ApiGateway.RateLimiter.PartitionCounter do
   @doc """
   Returns partition-level stats for observability/debugging.
   """
-  @spec partition_stats() :: [%{partition: integer(), entries: integer(), pid: pid()}]
+  @spec partition_stats() :: [%{partition: integer(), entries: integer(), pid: pid(), queue_len: integer()}]
   def partition_stats do
     n = PartitionSupervisor.partitions(ApiGateway.RateLimiter.Partitions)
 
-    # TODO: for each partition 0..n-1, return:
-    # %{partition: index, pid: pid, entries: ets_size, queue_len: mailbox_size}
-    # HINT: Process.info(pid, :message_queue_len)
-    []
+    Enum.map(0..(n - 1), fn index ->
+      pid = GenServer.whereis(
+        {:via, PartitionSupervisor, {ApiGateway.RateLimiter.Partitions, index}}
+      )
+      state = :sys.get_state(pid)
+      entries = :ets.info(state.table, :size)
+      {:message_queue_len, queue_len} = Process.info(pid, :message_queue_len)
+
+      %{partition: index, pid: pid, entries: entries, queue_len: queue_len}
+    end)
   end
 end
 ```

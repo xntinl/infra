@@ -24,7 +24,7 @@ api_gateway/
 │       ├── metrics/
 │       │   ├── counter.ex       # existing
 │       │   ├── event_log.ex     # existing
-│       │   └── sliding_window.ex  # ← you implement this
+│       │   └── sliding_window.ex
 │       ├── cache/
 │       └── config/
 ├── test/
@@ -123,6 +123,10 @@ defmodule ApiGateway.Metrics.SlidingWindow do
   On count/1: sum all bucket slots whose timestamp falls within the window.
 
   Thread-safe: multiple processes can call record/1 concurrently without locks.
+
+  The CAS (compare-and-swap) on the timestamp array ensures that when a bucket
+  wraps around to a new cycle, exactly one process wins the reset. All others
+  see that the timestamp has already been updated and simply increment the count.
   """
 
   @buckets 60
@@ -169,15 +173,25 @@ defmodule ApiGateway.Metrics.SlidingWindow do
 
   @doc """
   Counts total events in the last `seconds` seconds (seconds <= 60).
+
+  Iterates backwards from the current second, checking each bucket's timestamp
+  to verify it belongs to the current window. Only buckets with a matching
+  timestamp are included in the sum — stale buckets from a previous cycle
+  are excluded even though their count slot may still hold old data.
   """
   @spec count({reference(), reference()}, pos_integer()) :: non_neg_integer()
   def count({counts, timestamps}, seconds) when seconds <= @buckets do
     now = System.os_time(:second)
-    # HINT: iterate from (now - seconds + 1) to now
-    # HINT: compute idx = rem(s, @buckets) + 1 for each second s
-    # HINT: only count bucket if :atomics.get(timestamps, idx) == s
-    # HINT: Enum.sum/1 over the filtered counts
-    # TODO: implement
+
+    Enum.reduce((now - seconds + 1)..now, 0, fn second, acc ->
+      idx = rem(second, @buckets) + 1
+
+      if :atomics.get(timestamps, idx) == second do
+        acc + :atomics.get(counts, idx)
+      else
+        acc
+      end
+    end)
   end
 
   @doc """

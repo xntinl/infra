@@ -125,6 +125,21 @@ GenServer — the timer is scoped to the state, not the process.
 
 ### Step 1: `lib/api_gateway/circuit_breaker/breaker.ex`
 
+The circuit breaker uses `callback_mode: :state_functions` because each state responds to
+the `:execute` event in a fundamentally different way. The `safe_call/1` helper wraps the
+user-provided function in `try/rescue/catch` to ensure that exceptions, exits, and
+unexpected return values are normalized into `{:ok, _}` or `{:error, _}` tuples.
+
+Key design decisions:
+- **State timeout for recovery**: when the circuit opens, a `:state_timeout` is set. This
+  timer is automatically cancelled if the state changes before it fires, which prevents
+  stale timeouts from causing unexpected transitions.
+- **Failure counter reset on success**: any successful call in `:closed` resets the failure
+  counter to zero. This ensures that intermittent failures do not accumulate indefinitely.
+- **Catch-all clauses for stale timeouts**: if the circuit transitions rapidly (e.g.,
+  open -> half_open -> closed -> open), a stale state_timeout from a previous `:open`
+  entry might fire in `:closed`. The catch-all clauses silently ignore these.
+
 ```elixir
 defmodule ApiGateway.CircuitBreaker.Breaker do
   @moduledoc """
@@ -132,8 +147,8 @@ defmodule ApiGateway.CircuitBreaker.Breaker do
 
   States:
     :closed   — normal operation; counts consecutive failures
-    :open     — fast-fail; waits for recovery_timeout, then → :half_open
-    :half_open — allows one probe; success → :closed, failure → :open
+    :open     — fast-fail; waits for recovery_timeout, then -> :half_open
+    :half_open — allows one probe; success -> :closed, failure -> :open
 
   Usage:
     {:ok, cb} = Breaker.start_link(name: :payments_cb, threshold: 5, timeout: 10_000)
@@ -185,12 +200,25 @@ defmodule ApiGateway.CircuitBreaker.Breaker do
   # ---------------------------------------------------------------------------
 
   def closed({:call, from}, {:execute, fun}, data) do
-    # TODO: call safe_call(fun)
-    # On {:ok, _}: reset failures to 0, reply with result
-    # On {:error, _}: increment failures
-    #   if failures >= threshold: transition to :open with state_timeout
-    #   else: stay in :closed
-    # HINT: {:next_state, :open, new_data, [{:reply, from, result}, {:state_timeout, data.timeout_ms, :recovery}]}
+    case safe_call(fun) do
+      {:ok, _} = result ->
+        new_data = %{data | failures: 0}
+        {:keep_state, new_data, [{:reply, from, result}]}
+
+      {:error, _} = result ->
+        new_failures = data.failures + 1
+
+        if new_failures >= data.threshold do
+          new_data = %{data | failures: new_failures}
+          {:next_state, :open, new_data, [
+            {:reply, from, result},
+            {:state_timeout, data.timeout_ms, :recovery}
+          ]}
+        else
+          new_data = %{data | failures: new_failures}
+          {:keep_state, new_data, [{:reply, from, result}]}
+        end
+    end
   end
 
   def closed({:call, from}, :get_state, data) do
@@ -202,8 +230,7 @@ defmodule ApiGateway.CircuitBreaker.Breaker do
   # ---------------------------------------------------------------------------
 
   def open({:call, from}, {:execute, _fun}, data) do
-    # TODO: fast-fail — do not call fun
-    # HINT: {:keep_state, data, [{:reply, from, {:error, :circuit_open}}]}
+    {:keep_state, data, [{:reply, from, {:error, :circuit_open}}]}
   end
 
   def open({:call, from}, :get_state, data) do
@@ -211,8 +238,7 @@ defmodule ApiGateway.CircuitBreaker.Breaker do
   end
 
   def open(:state_timeout, :recovery, data) do
-    # TODO: transition to :half_open — no timer needed here
-    # The :open state_timeout fires only once; :half_open has no auto-timeout
+    {:next_state, :half_open, data}
   end
 
   # ---------------------------------------------------------------------------
@@ -220,9 +246,17 @@ defmodule ApiGateway.CircuitBreaker.Breaker do
   # ---------------------------------------------------------------------------
 
   def half_open({:call, from}, {:execute, fun}, data) do
-    # TODO: one probe call
-    # On {:ok, _}: close the circuit (reset failures), reply with result
-    # On {:error, _}: reopen the circuit with state_timeout again
+    case safe_call(fun) do
+      {:ok, _} = result ->
+        new_data = %{data | failures: 0}
+        {:next_state, :closed, new_data, [{:reply, from, result}]}
+
+      {:error, _} = result ->
+        {:next_state, :open, data, [
+          {:reply, from, result},
+          {:state_timeout, data.timeout_ms, :recovery}
+        ]}
+    end
   end
 
   def half_open({:call, from}, :get_state, data) do
@@ -398,7 +432,7 @@ timeout > circuit `timeout_ms` or use a very low `timeout_ms` for tests.
 
 **4. Forgetting that `state_timeout` is per-state-entry**
 Each time you enter a state with `{:state_timeout, ms, event}`, the timer resets. If
-the circuit flaps (open → half_open → open → half_open) rapidly, each entry of `:open`
+the circuit flaps (open -> half_open -> open -> half_open) rapidly, each entry of `:open`
 resets the timer to `timeout_ms`. This is the correct behavior — but it surprises
 developers who expect a global timeout.
 

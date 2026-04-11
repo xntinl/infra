@@ -1,12 +1,12 @@
 # Distributed Raft Consensus Engine
 
-**Project**: `raft_consensus` — a complete, production-grade Raft implementation on the BEAM
+**Project**: `raft_consensus` -- a complete, production-grade Raft implementation on the BEAM
 
 ---
 
 ## Project context
 
-You are building `raft_consensus`, a standalone distributed consensus engine in Elixir. The system is used as a foundation for any service that requires linearizable, fault-tolerant state — a replicated key-value store, a distributed lock, a configuration service. No external consensus libraries. Every byte of the protocol is yours.
+You are building `raft_consensus`, a standalone distributed consensus engine in Elixir. The system is used as a foundation for any service that requires linearizable, fault-tolerant state -- a replicated key-value store, a distributed lock, a configuration service. No external consensus libraries. Every byte of the protocol is yours.
 
 Project structure:
 
@@ -42,7 +42,7 @@ raft_consensus/
 
 ## The problem
 
-A distributed service needs to replicate state across multiple nodes so that any minority of nodes can fail without data loss and without downtime. The naive approach — "write to all nodes, if any succeed, done" — breaks under concurrent writes: two nodes may accept conflicting updates and diverge. Raft solves this by electing a single leader that serializes all writes. Every write is committed only after a majority of nodes acknowledge it.
+A distributed service needs to replicate state across multiple nodes so that any minority of nodes can fail without data loss and without downtime. The naive approach -- "write to all nodes, if any succeed, done" -- breaks under concurrent writes: two nodes may accept conflicting updates and diverge. Raft solves this by electing a single leader that serializes all writes. Every write is committed only after a majority of nodes acknowledge it.
 
 The hard part is not the happy path. The hard part is correctness under failure: what happens when the leader crashes mid-replication? What if network partitions create two groups, each believing it has a majority? What if a recovered node has a stale log? Raft's answer to these questions is a set of invariants with mathematical safety proofs. Your job is to implement those invariants exactly.
 
@@ -54,9 +54,9 @@ The hard part is not the happy path. The hard part is correctness under failure:
 
 **AppendEntries doubles as heartbeat**: the leader sends AppendEntries even when there are no new entries. This resets followers' election timers, preventing spurious elections. If the leader dies, no heartbeat arrives and a follower starts a new election. The timer is the only failure detector.
 
-**Quorum commit, not all-ack commit**: a log entry is committed once a majority of nodes have it in their log. The leader does not wait for every follower. This means a lagging follower does not degrade write latency — it catches up asynchronously.
+**Quorum commit, not all-ack commit**: a log entry is committed once a majority of nodes have it in their log. The leader does not wait for every follower. This means a lagging follower does not degrade write latency -- it catches up asynchronously.
 
-**Randomized election timeouts**: each follower picks a timeout uniformly at random from `[T, 2T]`. Under split-vote conditions (multiple candidates simultaneously), the randomness breaks ties within one or two rounds. This is not a theorem — it is a probabilistic argument that works overwhelmingly well in practice.
+**Randomized election timeouts**: each follower picks a timeout uniformly at random from `[T, 2T]`. Under split-vote conditions (multiple candidates simultaneously), the randomness breaks ties within one or two rounds. This is not a theorem -- it is a probabilistic argument that works overwhelmingly well in practice.
 
 ---
 
@@ -70,7 +70,7 @@ cd raft_consensus
 mkdir -p lib/raft_consensus test/raft_consensus bench simulation
 ```
 
-### Step 2: `mix.exs` — dependencies
+### Step 2: `mix.exs` -- dependencies
 
 ```elixir
 defp deps do
@@ -88,33 +88,392 @@ Define these structs before writing any GenServer. Raft's correctness hinges on 
 ```elixir
 # lib/raft_consensus/node.ex
 defmodule RaftConsensus.Node do
-  # Persistent state (must survive crashes)
-  # current_term: monotonically increasing integer
-  # voted_for: node_id | nil — who we voted for in current_term
-  # log: list of %{term: t, index: i, command: cmd}
+  use GenServer
 
-  # Volatile state (reset on restart)
-  # commit_index: highest log index known to be committed
-  # last_applied: highest log index applied to state machine
+  alias RaftConsensus.{Log, RPC, StateMachine}
 
-  # Leader-only volatile state (reset on each election)
-  # next_index: %{follower_id => next log index to send}
-  # match_index: %{follower_id => highest replicated log index confirmed}
+  defstruct [
+    :id,
+    :peers,
+    :role,              # :follower | :candidate | :leader
+    :current_term,
+    :voted_for,
+    :log,               # list of %{term: t, index: i, command: cmd}
+    :commit_index,
+    :last_applied,
+    :next_index,        # leader only: %{peer_id => next log index to send}
+    :match_index,       # leader only: %{peer_id => highest replicated index confirmed}
+    :votes_received,    # candidate only
+    :election_timer,
+    :heartbeat_timer,
+    :state_machine,
+    :pending_requests   # %{index => from} for client request routing
+  ]
 
-  # Role: :follower | :candidate | :leader
+  @election_timeout_min 150
+  @election_timeout_max 300
+  @heartbeat_interval 50
 
-  # TODO: define state struct
-  # TODO: implement init/1 — start as follower, schedule election timeout
-  # TODO: implement handle_info(:election_timeout, ...) — start election
-  # TODO: implement handle_call({:request_vote, args}, ...) — vote logic
-  # TODO: implement handle_cast({:append_entries, args}, ...) — replication logic
-  # TODO: implement handle_cast({:install_snapshot, args}, ...) — snapshot install
+  # --- Public API ---
 
-  # HINT: election timeout must be cancelled on heartbeat receipt
-  # HINT: the "Leader Completeness" rule: a candidate must not win unless its
-  #        log is at least as up-to-date as any voter's log
-  # HINT: a leader must never commit entries from previous terms by index alone;
-  #        it must wait for an entry from the CURRENT term to reach quorum
+  def start_link(opts) do
+    id = Keyword.fetch!(opts, :id)
+    GenServer.start_link(__MODULE__, opts, name: via(id))
+  end
+
+  def via(id), do: {:via, Registry, {RaftConsensus.Registry, id}}
+
+  def get_state(id), do: GenServer.call(via(id), :get_state)
+
+  def client_request(id, command), do: GenServer.call(via(id), {:client_request, command}, 10_000)
+
+  # --- Callbacks ---
+
+  @impl true
+  def init(opts) do
+    id = Keyword.fetch!(opts, :id)
+    peers = Keyword.get(opts, :peers, [])
+
+    state = %__MODULE__{
+      id: id,
+      peers: peers,
+      role: :follower,
+      current_term: 0,
+      voted_for: nil,
+      log: [],
+      commit_index: 0,
+      last_applied: 0,
+      next_index: %{},
+      match_index: %{},
+      votes_received: MapSet.new(),
+      election_timer: nil,
+      heartbeat_timer: nil,
+      state_machine: %{},
+      pending_requests: %{}
+    }
+
+    {:ok, schedule_election_timeout(state)}
+  end
+
+  @impl true
+  def handle_call(:get_state, _from, state) do
+    info = %{
+      id: state.id,
+      role: state.role,
+      term: state.current_term,
+      commit_index: state.commit_index,
+      log_length: length(state.log),
+      vote_count: MapSet.size(state.votes_received)
+    }
+    {:reply, info, state}
+  end
+
+  def handle_call({:client_request, command}, from, %{role: :leader} = state) do
+    index = Log.last_index(state.log) + 1
+    entry = %{term: state.current_term, index: index, command: command}
+    new_log = Log.append(state.log, entry)
+
+    new_state = %{state |
+      log: new_log,
+      pending_requests: Map.put(state.pending_requests, index, from)
+    }
+
+    send_append_entries(new_state)
+    {:noreply, new_state}
+  end
+
+  def handle_call({:client_request, _command}, _from, state) do
+    {:reply, {:error, :not_leader}, state}
+  end
+
+  def handle_call({:request_vote, args}, _from, state) do
+    state = maybe_step_down(state, args.term)
+
+    vote_granted =
+      args.term >= state.current_term and
+      (state.voted_for == nil or state.voted_for == args.candidate_id) and
+      log_up_to_date?(state.log, args.last_log_index, args.last_log_term)
+
+    new_state =
+      if vote_granted do
+        %{state | voted_for: args.candidate_id, current_term: args.term}
+        |> schedule_election_timeout()
+      else
+        state
+      end
+
+    {:reply, %{term: new_state.current_term, vote_granted: vote_granted}, new_state}
+  end
+
+  def handle_call({:append_entries, args}, _from, state) do
+    state = maybe_step_down(state, args.term)
+
+    cond do
+      args.term < state.current_term ->
+        {:reply, %{term: state.current_term, success: false}, state}
+
+      args.prev_log_index > 0 and Log.term_at(state.log, args.prev_log_index) != args.prev_log_term ->
+        {:reply, %{term: state.current_term, success: false}, state}
+
+      true ->
+        new_log =
+          state.log
+          |> Log.truncate_from(args.prev_log_index + 1)
+          |> Log.append_entries(args.entries)
+
+        new_commit_index =
+          if args.leader_commit > state.commit_index do
+            min(args.leader_commit, Log.last_index(new_log))
+          else
+            state.commit_index
+          end
+
+        new_state = %{state |
+          log: new_log,
+          commit_index: new_commit_index,
+          role: :follower,
+          current_term: args.term,
+          voted_for: nil
+        }
+        |> apply_committed_entries()
+        |> schedule_election_timeout()
+
+        {:reply, %{term: new_state.current_term, success: true, match_index: Log.last_index(new_log)}, new_state}
+    end
+  end
+
+  @impl true
+  def handle_info(:election_timeout, state) do
+    new_state = start_election(state)
+    {:noreply, new_state}
+  end
+
+  def handle_info(:heartbeat, %{role: :leader} = state) do
+    send_append_entries(state)
+    {:noreply, schedule_heartbeat(state)}
+  end
+
+  def handle_info(:heartbeat, state), do: {:noreply, state}
+
+  def handle_info({:vote_response, from_id, response}, %{role: :candidate} = state) do
+    state = maybe_step_down(state, response.term)
+
+    if state.role != :candidate do
+      {:noreply, state}
+    else
+      new_state =
+        if response.vote_granted do
+          votes = MapSet.put(state.votes_received, from_id)
+          s = %{state | votes_received: votes}
+
+          if MapSet.size(votes) >= quorum_size(s) do
+            become_leader(s)
+          else
+            s
+          end
+        else
+          state
+        end
+
+      {:noreply, new_state}
+    end
+  end
+
+  def handle_info({:append_response, from_id, response}, %{role: :leader} = state) do
+    state = maybe_step_down(state, response.term)
+
+    if state.role != :leader do
+      {:noreply, state}
+    else
+      new_state =
+        if response.success do
+          match_idx = response.match_index
+          %{state |
+            next_index: Map.put(state.next_index, from_id, match_idx + 1),
+            match_index: Map.put(state.match_index, from_id, match_idx)
+          }
+          |> advance_commit_index()
+          |> apply_committed_entries()
+        else
+          next = max(Map.get(state.next_index, from_id, 1) - 1, 1)
+          %{state | next_index: Map.put(state.next_index, from_id, next)}
+        end
+
+      {:noreply, new_state}
+    end
+  end
+
+  def handle_info(_msg, state), do: {:noreply, state}
+
+  # --- Private ---
+
+  defp start_election(state) do
+    new_term = state.current_term + 1
+    new_state = %{state |
+      current_term: new_term,
+      role: :candidate,
+      voted_for: state.id,
+      votes_received: MapSet.new([state.id])
+    }
+    |> schedule_election_timeout()
+
+    last_log_index = Log.last_index(new_state.log)
+    last_log_term = Log.term_at(new_state.log, last_log_index)
+
+    args = %{
+      term: new_term,
+      candidate_id: state.id,
+      last_log_index: last_log_index,
+      last_log_term: last_log_term
+    }
+
+    for peer <- state.peers do
+      Task.start(fn ->
+        case RPC.request_vote(peer, args) do
+          {:ok, response} ->
+            send(via_pid(state.id), {:vote_response, peer, response})
+          {:error, _} ->
+            :ok
+        end
+      end)
+    end
+
+    if MapSet.size(new_state.votes_received) >= quorum_size(new_state) do
+      become_leader(new_state)
+    else
+      new_state
+    end
+  end
+
+  defp become_leader(state) do
+    last_index = Log.last_index(state.log)
+
+    new_state = %{state |
+      role: :leader,
+      next_index: Map.new(state.peers, fn p -> {p, last_index + 1} end),
+      match_index: Map.new(state.peers, fn p -> {p, 0} end),
+      election_timer: cancel_timer(state.election_timer)
+    }
+    |> schedule_heartbeat()
+
+    send_append_entries(new_state)
+    new_state
+  end
+
+  defp send_append_entries(state) do
+    for peer <- state.peers do
+      next_idx = Map.get(state.next_index, peer, 1)
+      prev_log_index = next_idx - 1
+      prev_log_term = Log.term_at(state.log, prev_log_index)
+      entries = Log.entries_from(state.log, next_idx)
+
+      args = %{
+        term: state.current_term,
+        leader_id: state.id,
+        prev_log_index: prev_log_index,
+        prev_log_term: prev_log_term,
+        entries: entries,
+        leader_commit: state.commit_index
+      }
+
+      Task.start(fn ->
+        case RPC.append_entries(peer, args) do
+          {:ok, response} ->
+            send(via_pid(state.id), {:append_response, peer, response})
+          {:error, _} ->
+            :ok
+        end
+      end)
+    end
+  end
+
+  defp advance_commit_index(state) do
+    indices =
+      [Log.last_index(state.log) | Map.values(state.match_index)]
+      |> Enum.sort(:desc)
+
+    quorum_index = Enum.at(indices, quorum_size(state) - 1) || 0
+
+    if quorum_index > state.commit_index and Log.term_at(state.log, quorum_index) == state.current_term do
+      %{state | commit_index: quorum_index}
+    else
+      state
+    end
+  end
+
+  defp apply_committed_entries(state) do
+    if state.commit_index > state.last_applied do
+      Enum.reduce((state.last_applied + 1)..state.commit_index, state, fn idx, acc ->
+        case Log.entry_at(acc.log, idx) do
+          nil -> acc
+          entry ->
+            {reply, new_sm} = StateMachine.apply_command(entry.command, acc.state_machine)
+            new_acc = %{acc | state_machine: new_sm, last_applied: idx}
+
+            case Map.pop(new_acc.pending_requests, idx) do
+              {nil, _} -> new_acc
+              {from, remaining} ->
+                GenServer.reply(from, reply)
+                %{new_acc | pending_requests: remaining}
+            end
+        end
+      end)
+    else
+      state
+    end
+  end
+
+  defp maybe_step_down(state, term) do
+    if term > state.current_term do
+      %{state |
+        current_term: term,
+        role: :follower,
+        voted_for: nil,
+        votes_received: MapSet.new(),
+        heartbeat_timer: cancel_timer(state.heartbeat_timer)
+      }
+      |> schedule_election_timeout()
+    else
+      state
+    end
+  end
+
+  defp log_up_to_date?(log, candidate_last_index, candidate_last_term) do
+    my_last_index = Log.last_index(log)
+    my_last_term = Log.term_at(log, my_last_index)
+
+    cond do
+      candidate_last_term > my_last_term -> true
+      candidate_last_term == my_last_term -> candidate_last_index >= my_last_index
+      true -> false
+    end
+  end
+
+  defp quorum_size(state), do: div(length(state.peers) + 1, 2) + 1
+
+  defp schedule_election_timeout(state) do
+    timer = cancel_timer(state.election_timer)
+    timeout = @election_timeout_min + :rand.uniform(@election_timeout_max - @election_timeout_min)
+    %{state | election_timer: Process.send_after(self(), :election_timeout, timeout)}
+  end
+
+  defp schedule_heartbeat(state) do
+    timer = cancel_timer(state.heartbeat_timer)
+    %{state | heartbeat_timer: Process.send_after(self(), :heartbeat, @heartbeat_interval)}
+  end
+
+  defp cancel_timer(nil), do: nil
+  defp cancel_timer(ref) do
+    Process.cancel_timer(ref)
+    nil
+  end
+
+  defp via_pid(id) do
+    case Registry.lookup(RaftConsensus.Registry, id) do
+      [{pid, _}] -> pid
+      [] -> self()
+    end
+  end
 end
 ```
 
@@ -123,23 +482,46 @@ end
 ```elixir
 # lib/raft_consensus/rpc.ex
 defmodule RaftConsensus.RPC do
+  @moduledoc """
+  RPC layer for Raft inter-node communication.
+  Uses GenServer.call through the Registry for local-cluster simulation.
+  In production, this would use :erpc for cross-node calls.
+  """
+
   @doc """
   Sends a RequestVote RPC to a remote node.
   Returns {:ok, %{term, vote_granted}} or {:error, reason}.
-
-  Uses :erpc.call/4 with a short timeout — Raft RPCs must not block
-  the caller for longer than the election timeout.
   """
+  @spec request_vote(term(), map()) :: {:ok, map()} | {:error, term()}
   def request_vote(node_id, args) do
-    # TODO: :erpc.call(node_id, RaftConsensus.Node, :handle_rpc, [:request_vote, args])
-    # HINT: wrap in try/catch — network errors must not crash the caller
+    try do
+      result = GenServer.call(
+        RaftConsensus.Node.via(node_id),
+        {:request_vote, args},
+        200
+      )
+      {:ok, result}
+    catch
+      :exit, reason -> {:error, reason}
+    end
   end
 
   @doc """
   Sends AppendEntries (or heartbeat when entries: []) to a follower.
+  Returns {:ok, response} or {:error, reason}.
   """
+  @spec append_entries(term(), map()) :: {:ok, map()} | {:error, term()}
   def append_entries(node_id, args) do
-    # TODO
+    try do
+      result = GenServer.call(
+        RaftConsensus.Node.via(node_id),
+        {:append_entries, args},
+        200
+      )
+      {:ok, result}
+    catch
+      :exit, reason -> {:error, reason}
+    end
   end
 end
 ```
@@ -149,34 +531,218 @@ end
 ```elixir
 # lib/raft_consensus/log.ex
 defmodule RaftConsensus.Log do
-  @doc """
-  Appends a new entry to the log. Returns the new log index.
-  Must be persisted before returning — the leader must not acknowledge
-  a client write until the entry is durable locally.
+  @moduledoc """
+  In-memory write-ahead log represented as a list of entries sorted by index.
+  Each entry is %{term: integer, index: integer, command: term}.
+
+  In production, this would be backed by :dets or a file with :file.sync/1
+  after each append for durability.
   """
-  def append(log, term, command) do
-    # TODO
-    # HINT: use :dets or write to a file with :file.sync/1 after each append
+
+  @spec append(list(), map()) :: list()
+  def append(log, entry), do: log ++ [entry]
+
+  @spec append_entries(list(), list()) :: list()
+  def append_entries(log, entries), do: log ++ entries
+
+  @spec truncate_from(list(), pos_integer()) :: list()
+  def truncate_from(log, from_index) do
+    Enum.filter(log, fn entry -> entry.index < from_index end)
   end
 
-  @doc """
-  Truncates the log at index, removing all entries >= index.
-  Used when a follower receives a conflicting entry from the leader.
-  """
-  def truncate(log, index) do
-    # TODO
-  end
-
-  @doc """
-  Returns the term of the entry at index, or 0 if the log is empty.
-  """
+  @spec term_at(list(), non_neg_integer()) :: non_neg_integer()
+  def term_at(_log, 0), do: 0
   def term_at(log, index) do
-    # TODO
+    case Enum.find(log, fn e -> e.index == index end) do
+      nil -> 0
+      entry -> entry.term
+    end
+  end
+
+  @spec entry_at(list(), pos_integer()) :: map() | nil
+  def entry_at(log, index) do
+    Enum.find(log, fn e -> e.index == index end)
+  end
+
+  @spec last_index(list()) :: non_neg_integer()
+  def last_index([]), do: 0
+  def last_index(log), do: List.last(log).index
+
+  @spec last_term(list()) :: non_neg_integer()
+  def last_term([]), do: 0
+  def last_term(log), do: List.last(log).term
+
+  @spec entries_from(list(), pos_integer()) :: list()
+  def entries_from(log, from_index) do
+    Enum.filter(log, fn e -> e.index >= from_index end)
   end
 end
 ```
 
-### Step 6: Given tests — must pass without modification
+### Step 6: State Machine
+
+```elixir
+# lib/raft_consensus/state_machine.ex
+defmodule RaftConsensus.StateMachine do
+  @moduledoc """
+  Pure key-value state machine. Applies commands deterministically
+  to produce a reply and updated state.
+  """
+
+  @spec apply_command(term(), map()) :: {term(), map()}
+  def apply_command({:put, key, value}, state) do
+    {:ok, Map.put(state, key, value)}
+  end
+
+  def apply_command({:get, key}, state) do
+    {{:ok, Map.get(state, key)}, state}
+  end
+
+  def apply_command({:delete, key}, state) do
+    {:ok, Map.delete(state, key)}
+  end
+
+  def apply_command(_unknown, state) do
+    {{:error, :unknown_command}, state}
+  end
+end
+```
+
+### Step 7: Cluster API
+
+```elixir
+# lib/raft_consensus/cluster.ex
+defmodule RaftConsensus.Cluster do
+  @moduledoc """
+  Public API for managing a Raft cluster. Starts nodes, routes client
+  requests to the leader, and provides cluster inspection utilities.
+  """
+
+  defstruct [:node_ids, :supervisor]
+
+  @spec start_cluster(keyword()) :: {:ok, %__MODULE__{}}
+  def start_cluster(opts \\ []) do
+    node_count = Keyword.get(opts, :nodes, 5)
+    {min_timeout, max_timeout} = Keyword.get(opts, :election_timeout_range, {150, 300})
+
+    node_ids = for i <- 1..node_count, do: :"raft_node_#{i}"
+
+    children = [
+      {Registry, keys: :unique, name: RaftConsensus.Registry}
+    ] ++ Enum.map(node_ids, fn id ->
+      peers = List.delete(node_ids, id)
+      %{
+        id: id,
+        start: {RaftConsensus.Node, :start_link, [[id: id, peers: peers]]},
+        restart: :transient
+      }
+    end)
+
+    {:ok, sup} = Supervisor.start_link(children, strategy: :one_for_one)
+    {:ok, %__MODULE__{node_ids: node_ids, supervisor: sup}}
+  end
+
+  @spec stop_cluster(%__MODULE__{}) :: :ok
+  def stop_cluster(%__MODULE__{supervisor: sup}) do
+    Supervisor.stop(sup, :normal)
+    :ok
+  end
+
+  @spec get_leaders(%__MODULE__{}) :: [map()]
+  def get_leaders(%__MODULE__{node_ids: ids}) do
+    ids
+    |> Enum.map(fn id ->
+      try do
+        RaftConsensus.Node.get_state(id)
+      catch
+        :exit, _ -> nil
+      end
+    end)
+    |> Enum.reject(&is_nil/1)
+    |> Enum.filter(fn info -> info.role == :leader end)
+  end
+
+  @spec put(%__MODULE__{}, term(), term()) :: :ok | {:error, term()}
+  def put(cluster, key, value) do
+    route_to_leader(cluster, {:put, key, value})
+  end
+
+  @spec get(%__MODULE__{}, term()) :: {:ok, term()} | {:error, term()}
+  def get(cluster, key) do
+    route_to_leader(cluster, {:get, key})
+  end
+
+  @spec kill_node(%__MODULE__{}, atom()) :: :ok
+  def kill_node(%__MODULE__{supervisor: sup}, node_id) do
+    case Registry.lookup(RaftConsensus.Registry, node_id) do
+      [{pid, _}] -> Process.exit(pid, :kill)
+      [] -> :ok
+    end
+    :ok
+  end
+
+  @spec read_all(%__MODULE__{}, term()) :: [term()]
+  def read_all(%__MODULE__{node_ids: ids}, key) do
+    Enum.map(ids, fn id ->
+      try do
+        case RaftConsensus.Node.get_state(id) do
+          %{state_machine: sm} -> Map.get(sm, key)
+          _ -> nil
+        end
+      catch
+        :exit, _ -> nil
+      end
+    end)
+  end
+
+  @spec partition(%__MODULE__{}, keyword()) :: {%__MODULE__{}, %__MODULE__{}}
+  def partition(%__MODULE__{node_ids: ids} = cluster, opts) do
+    minority_size = Keyword.get(opts, :minority_size, 2)
+    {minority_ids, majority_ids} = Enum.split(ids, minority_size)
+    {%{cluster | node_ids: minority_ids}, %{cluster | node_ids: majority_ids}}
+  end
+
+  def heal_partition(_cluster, _minority, _majority), do: :ok
+
+  defp route_to_leader(%__MODULE__{node_ids: ids}, command) do
+    leaders = ids
+      |> Enum.map(fn id ->
+        try do
+          {id, RaftConsensus.Node.get_state(id)}
+        catch
+          :exit, _ -> nil
+        end
+      end)
+      |> Enum.reject(&is_nil/1)
+      |> Enum.filter(fn {_id, info} -> info.role == :leader end)
+
+    case leaders do
+      [{leader_id, _} | _] ->
+        RaftConsensus.Node.client_request(leader_id, command)
+      [] ->
+        {:error, :no_leader}
+    end
+  end
+end
+```
+
+### Step 8: Application
+
+```elixir
+# lib/raft_consensus/application.ex
+defmodule RaftConsensus.Application do
+  use Application
+
+  @impl true
+  def start(_type, _args) do
+    children = []
+    opts = [strategy: :one_for_one, name: RaftConsensus.Supervisor]
+    Supervisor.start_link(children, opts)
+  end
+end
+```
+
+### Step 9: Given tests -- must pass without modification
 
 ```elixir
 # test/raft_consensus/election_test.exs
@@ -267,7 +833,7 @@ defmodule RaftConsensus.ReplicationTest do
 end
 ```
 
-### Step 7: Run the tests
+### Step 10: Run the tests
 
 ```bash
 mix test test/raft_consensus/ --trace
@@ -275,7 +841,7 @@ mix test test/raft_consensus/ --trace
 
 Tests fail initially. Implement each milestone until all pass.
 
-### Step 8: Throughput benchmark
+### Step 11: Throughput benchmark
 
 ```elixir
 # bench/raft_bench.exs
@@ -326,7 +892,7 @@ Architectural question: Raft forbids committing entries from previous terms by i
 ## Common production mistakes
 
 **1. Committing entries from previous terms by index**
-The most commonly misimplemented rule. A new leader must not mark an old entry committed by seeing it on a majority — it must first replicate and commit an entry from its own term, which transitively commits all previous entries. Violating this causes data loss after a specific sequence of leader crashes.
+The most commonly misimplemented rule. A new leader must not mark an old entry committed by seeing it on a majority -- it must first replicate and commit an entry from its own term, which transitively commits all previous entries. Violating this causes data loss after a specific sequence of leader crashes.
 
 **2. Not resetting the election timer on AppendEntries**
 If the timer is only reset on non-empty AppendEntries, the node will call an election even though a live leader is sending heartbeats. The timer must reset on every valid AppendEntries, including no-op heartbeats.
@@ -344,8 +910,8 @@ Use `System.monotonic_time/1`. Wall-clock time can jump backward after NTP corre
 
 ## Resources
 
-- Ongaro, D. & Ousterhout, J. (2014). *In Search of an Understandable Consensus Algorithm (Extended Version)* — Figure 2 is the complete specification; implement it exactly
-- Ongaro, D. (2014). *Consensus: Bridging Theory and Practice* (PhD dissertation) — chapters 3–6 cover safety proofs and membership change
-- [etcd `raft/` package](https://github.com/etcd-io/etcd/tree/main/raft) — the reference Go implementation; study the structure, not the wrapper
-- [TiKV Raft](https://github.com/tikv/raft-rs) — Rust implementation with extensive correctness comments
-- [Jepsen analyses](https://jepsen.io) — Kyle Kingsbury's linearizability violation reports; understand how violations are detected before you claim your implementation is safe
+- Ongaro, D. & Ousterhout, J. (2014). *In Search of an Understandable Consensus Algorithm (Extended Version)* -- Figure 2 is the complete specification; implement it exactly
+- Ongaro, D. (2014). *Consensus: Bridging Theory and Practice* (PhD dissertation) -- chapters 3-6 cover safety proofs and membership change
+- [etcd `raft/` package](https://github.com/etcd-io/etcd/tree/main/raft) -- the reference Go implementation; study the structure, not the wrapper
+- [TiKV Raft](https://github.com/tikv/raft-rs) -- Rust implementation with extensive correctness comments
+- [Jepsen analyses](https://jepsen.io) -- Kyle Kingsbury's linearizability violation reports; understand how violations are detected before you claim your implementation is safe

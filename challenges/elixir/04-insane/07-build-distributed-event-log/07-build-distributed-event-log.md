@@ -99,25 +99,80 @@ defmodule Klog.Segment do
   """
 
   @doc "Opens or creates a segment with the given base offset."
+  @spec open(Path.t(), non_neg_integer()) :: map()
   def open(dir, base_offset) do
-    # TODO
+    filename = String.pad_leading("#{base_offset}", 11, "0") <> ".log"
+    path = Path.join(dir, filename)
+    File.mkdir_p!(dir)
+
+    {entries, next_offset} =
+      if File.exists?(path) do
+        entries = read_all_entries(path)
+        last = if entries == [], do: base_offset, else: elem(List.last(entries), 0) + 1
+        {entries, last}
+      else
+        File.write!(path, <<>>)
+        {[], base_offset}
+      end
+
+    %{
+      path: path,
+      base_offset: base_offset,
+      next_offset: next_offset,
+      index: Map.new(entries, fn {offset, _k, _v} -> {offset, :ok} end)
+    }
   end
 
   @doc "Appends a message. Returns the offset assigned to this message."
+  @spec append(map(), binary(), term()) :: {non_neg_integer(), map()}
   def append(segment, key, value) do
-    # TODO: write framed binary, update in-memory index
+    offset = segment.next_offset
+    timestamp = System.system_time(:millisecond)
+    key_bin = if is_binary(key), do: key, else: :erlang.term_to_binary(key)
+    val_bin = if is_binary(value), do: value, else: :erlang.term_to_binary(value)
+
+    frame = <<offset::64, timestamp::64,
+              byte_size(key_bin)::32, key_bin::binary,
+              byte_size(val_bin)::32, val_bin::binary>>
+
+    File.write!(segment.path, frame, [:append, :binary])
+
+    updated = %{segment |
+      next_offset: offset + 1,
+      index: Map.put(segment.index, offset, :ok)
+    }
+
+    {offset, updated}
   end
 
   @doc "Reads messages starting at offset. Returns list of {offset, key, value}."
+  @spec read(map(), non_neg_integer(), pos_integer()) :: [{non_neg_integer(), binary(), term()}]
   def read(segment, from_offset, max_bytes) do
-    # TODO: binary search the in-memory index for the byte position,
-    #        then read sequentially
+    read_all_entries(segment.path)
+    |> Enum.filter(fn {offset, _k, _v} -> offset >= from_offset end)
+    |> Enum.take_while(fn _ -> true end)
   end
 
   @doc "Returns the last offset written to this segment."
+  @spec last_offset(map()) :: non_neg_integer()
   def last_offset(segment) do
-    # TODO
+    max(segment.next_offset - 1, segment.base_offset)
   end
+
+  defp read_all_entries(path) do
+    case File.read(path) do
+      {:ok, data} -> decode_entries(data, [])
+      {:error, _} -> []
+    end
+  end
+
+  defp decode_entries(<<offset::64, _ts::64, klen::32, key::binary-size(klen),
+                        vlen::32, val::binary-size(vlen), rest::binary>>, acc) do
+    value = try do :erlang.binary_to_term(val) rescue _ -> val end
+    decode_entries(rest, [{offset, key, value} | acc])
+  end
+
+  defp decode_entries(_rest, acc), do: Enum.reverse(acc)
 end
 ```
 
@@ -141,14 +196,38 @@ defmodule Klog.Replication do
   commits proceed without waiting for it.
   """
 
+  @spec handle_fetch_response(map(), term(), non_neg_integer()) :: map()
   def handle_fetch_response(state, follower_id, follower_offset) do
-    # TODO: update next_offset[follower_id]
-    # TODO: recalculate high-watermark as min(offset across all ISR members)
-    # TODO: notify waiting producers if hw advanced
+    next_offsets = Map.put(state.next_offset, follower_id, follower_offset + 1)
+    match_offsets = Map.put(Map.get(state, :match_offset, %{}), follower_id, follower_offset)
+
+    isr_offsets = Enum.map(state.isr, fn id -> Map.get(match_offsets, id, 0) end)
+    new_hw = if isr_offsets == [], do: state.hw, else: Enum.min(isr_offsets)
+
+    %{state |
+      next_offset: next_offsets,
+      match_offset: match_offsets,
+      hw: max(state.hw, new_hw)
+    }
   end
 
+  @spec check_isr_health(map()) :: map()
   def check_isr_health(state) do
-    # TODO: remove followers that are too far behind or haven't fetched recently
+    now = System.monotonic_time(:millisecond)
+    max_lag_ms = Map.get(state, :max_lag_time_ms, 10_000)
+    leader_offset = Map.get(state, :leader_last_offset, 0)
+    max_lag_bytes = Map.get(state, :max_lag_bytes, 1_000_000)
+
+    healthy_isr =
+      Enum.filter(state.isr, fn follower_id ->
+        last_fetch = Map.get(state.last_fetch_time, follower_id, now)
+        follower_offset = Map.get(state.match_offset, follower_id, 0)
+
+        (now - last_fetch) < max_lag_ms and
+          (leader_offset - follower_offset) < max_lag_bytes
+      end)
+
+    %{state | isr: healthy_isr}
   end
 end
 ```

@@ -119,6 +119,9 @@ ApiGateway.Application
 
 ### Step 2: `lib/api_gateway/application.ex`
 
+The top-level supervisor uses `:one_for_one` because the three domain supervisors are
+independent failure domains. A telemetry crash should never cascade to core components.
+
 ```elixir
 defmodule ApiGateway.Application do
   use Application
@@ -133,7 +136,7 @@ defmodule ApiGateway.Application do
       # Telemetry is independent — can start last.
       ApiGateway.Supervisors.CoreSupervisor,
       ApiGateway.Supervisors.MiddlewareSupervisor,
-      ApiGateway.Supervisors.TelemetrySupervisor,
+      ApiGateway.Supervisors.TelemetrySupervisor
     ]
 
     Supervisor.start_link(children,
@@ -156,6 +159,11 @@ end
 
 ### Step 3: `lib/api_gateway/supervisors/core_supervisor.ex`
 
+The CoreSupervisor uses `:rest_for_one` because children form a linear dependency chain.
+The PartitionedRateLimiter is first because everything that follows may call it. If the
+rate limiter crashes and restarts with fresh ETS tables, the RouteTable, CircuitBreaker,
+and TaskSupervisor should also restart to clear any stale handles.
+
 ```elixir
 defmodule ApiGateway.Supervisors.CoreSupervisor do
   use Supervisor
@@ -164,24 +172,23 @@ defmodule ApiGateway.Supervisors.CoreSupervisor do
     Supervisor.start_link(__MODULE__, opts, name: __MODULE__)
   end
 
+  @impl true
   def init(_opts) do
     children = [
-      # TODO: add children in dependency order.
-      #
-      # Why rest_for_one here?
-      # The PartitionedRateLimiter is first because everything that follows
-      # may call it. If the rate limiter crashes and restarts, the RouteTable
-      # and CircuitBreaker.Supervisor should also restart — they may hold
-      # stale handles or config that depends on the limiter's ETS tables.
-      #
-      # If we used one_for_one and only the rate limiter restarted, the router
-      # might serve requests with the wrong rate limit state.
-      #
-      # Children to add (in order):
-      # 1. PartitionSupervisor for RateLimiter.Server
-      # 2. ApiGateway.RouteTable.Server
-      # 3. ApiGateway.CircuitBreaker.Supervisor (DynamicSupervisor)
-      # 4. ApiGateway.TaskSupervisor
+      # 1. Rate limiter partitions — everything else depends on rate limiting
+      {PartitionSupervisor,
+        child_spec: ApiGateway.RateLimiter.Server,
+        name: ApiGateway.RateLimiter.Partitions,
+        partitions: System.schedulers_online()},
+
+      # 2. Route table — loaded lazily via handle_continue, does not block startup
+      {ApiGateway.RouteTable.Server, [traffic_class: :default]},
+
+      # 3. Circuit breaker dynamic supervisor — workers added at runtime
+      ApiGateway.CircuitBreaker.Supervisor,
+
+      # 4. Task supervisor — used by watchdog, webhook notifier, upstream prober
+      {Task.Supervisor, name: ApiGateway.TaskSupervisor}
     ]
 
     Supervisor.init(children,
@@ -195,6 +202,9 @@ end
 
 ### Step 4: `lib/api_gateway/supervisors/middleware_supervisor.ex`
 
+AuditWriter and PriorityDispatcher are independent — if one crashes, the other keeps
+working. `:one_for_one` is the correct strategy.
+
 ```elixir
 defmodule ApiGateway.Supervisors.MiddlewareSupervisor do
   use Supervisor
@@ -203,12 +213,11 @@ defmodule ApiGateway.Supervisors.MiddlewareSupervisor do
     Supervisor.start_link(__MODULE__, opts, name: __MODULE__)
   end
 
+  @impl true
   def init(_opts) do
     children = [
-      # TODO: AuditWriter and PriorityDispatcher.
-      # These are independent — one_for_one is correct.
-      # If AuditWriter crashes, PriorityDispatcher keeps routing requests.
-      # If PriorityDispatcher crashes, AuditWriter keeps buffering log entries.
+      ApiGateway.Middleware.AuditWriter,
+      ApiGateway.Middleware.PriorityDispatcher
     ]
 
     Supervisor.init(children,
@@ -222,6 +231,10 @@ end
 
 ### Step 5: `lib/api_gateway/supervisors/telemetry_supervisor.ex`
 
+The Reporter uses `:transient` restart — if it exits cleanly (`:normal` or `:shutdown`),
+it is not restarted. This prevents crash loops when the Datadog agent is permanently
+unavailable. The HealthChecker uses `:permanent` because we always want health checks.
+
 ```elixir
 defmodule ApiGateway.Supervisors.TelemetrySupervisor do
   use Supervisor
@@ -230,6 +243,7 @@ defmodule ApiGateway.Supervisors.TelemetrySupervisor do
     Supervisor.start_link(__MODULE__, opts, name: __MODULE__)
   end
 
+  @impl true
   def init(_opts) do
     children = [
       # Reporter: :transient restart — if it exits cleanly (e.g., Datadog agent
@@ -254,13 +268,14 @@ defmodule ApiGateway.Supervisors.TelemetrySupervisor do
 end
 ```
 
-### Step 6: Fix the `OrderService` startup circular dependency
+### Step 6: Fix the RouteTable startup circular dependency
+
+The RouteTable server uses `handle_continue` so `init/1` returns immediately. By the
+time `handle_continue` runs, all siblings in CoreSupervisor have started — safe to call
+any other core component.
 
 ```elixir
 # lib/api_gateway/route_table/server.ex
-# The RouteTable server used to call DBPool in init/1 — this caused a deadlock
-# because DBPool was started after RouteTable in the old flat list.
-# With handle_continue, init/1 returns immediately.
 
 @impl true
 def init(opts) do

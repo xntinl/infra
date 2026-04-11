@@ -104,8 +104,19 @@ end
 
 ### Step 2: `lib/api_gateway/circuit_breaker/worker.ex`
 
-`# TODO` marks what you must implement. `# HINT` gives direction without spoiling
-the solution. Do not change the public function signatures — the tests depend on them.
+The worker implements a circuit breaker state machine with three states: `:closed`
+(healthy, passes traffic), `:open` (tripped, rejects traffic), and `:half_open`
+(probing, allows one request to test recovery).
+
+The key pattern: every callback that handles external messages returns the built-in
+GenServer timeout as the third element of the return tuple. When no message arrives
+within `@hibernate_after_ms`, the BEAM delivers a `:timeout` message to `handle_info/2`.
+This is simpler and safer than managing explicit timer references with
+`:timer.send_after/2` because the timeout resets automatically on every callback return.
+
+When the timeout fires, the worker compacts its state (dropping any large derived data)
+and returns `{:noreply, compacted_state, :hibernate}`. The BEAM then runs a full GC on
+the process heap and suspends the process until the next message arrives.
 
 ```elixir
 defmodule ApiGateway.CircuitBreaker.Worker do
@@ -113,6 +124,7 @@ defmodule ApiGateway.CircuitBreaker.Worker do
   require Logger
 
   @hibernate_after_ms 30_000
+  @failure_threshold 5
 
   # ---------------------------------------------------------------------------
   # Public API
@@ -156,16 +168,16 @@ defmodule ApiGateway.CircuitBreaker.Worker do
 
   @impl true
   def init(service_name) do
-    # TODO: build initial state and schedule inactivity timeout
-    #
-    # State fields to include:
-    #   :service        — the upstream service name
-    #   :status         — :closed | :open | :half_open
-    #   :failures       — consecutive failure count
-    #   :hibernations   — how many times this worker hibernated (for tests)
-    #
-    # HINT: return {:ok, state, @hibernate_after_ms} to arm the inactivity timer.
-    # The BEAM will send :timeout to handle_info/2 if no message arrives in that window.
+    state = %{
+      service: service_name,
+      status: :closed,
+      failures: 0,
+      hibernations: 0
+    }
+
+    # The third element arms the inactivity timer. If no message arrives
+    # within @hibernate_after_ms, the BEAM sends :timeout to handle_info/2.
+    {:ok, state, @hibernate_after_ms}
   end
 
   # ---------------------------------------------------------------------------
@@ -174,45 +186,69 @@ defmodule ApiGateway.CircuitBreaker.Worker do
 
   @impl true
   def handle_call(:status, _from, state) do
-    # TODO: reply with state.status and reset the inactivity timer
-    # HINT: {:reply, value, state, @hibernate_after_ms}
+    # Reply with current status and reset the inactivity timer.
+    # The timeout in the fourth position restarts the countdown.
+    {:reply, state.status, state, @hibernate_after_ms}
   end
 
   @impl true
   def handle_call(:hibernation_count, _from, state) do
-    # TODO: reply with state.hibernations (no timer reset needed here)
+    # No timer reset needed — this is a diagnostic call used only in tests.
+    {:reply, state.hibernations, state}
   end
 
   @impl true
   def handle_cast(:success, state) do
-    # TODO: reset failures to 0, transition to :closed if :half_open, reset timer
+    new_status = if state.status == :half_open, do: :closed, else: state.status
+    new_state = %{state | failures: 0, status: new_status}
+    {:noreply, new_state, @hibernate_after_ms}
   end
 
   @impl true
   def handle_cast(:failure, state) do
-    # TODO: increment failures; if >= 5 transition to :open; reset timer
-    # HINT: use a module attribute @failure_threshold 5
+    new_failures = state.failures + 1
+
+    new_status =
+      if new_failures >= @failure_threshold do
+        :open
+      else
+        state.status
+      end
+
+    new_state = %{state | failures: new_failures, status: new_status}
+    {:noreply, new_state, @hibernate_after_ms}
   end
 
   @impl true
   def handle_info(:timeout, state) do
     # Inactivity timeout fired — compact state and hibernate.
-    #
-    # HINT: call a private compact/1 function that drops fields which can be
-    # recomputed on wake (e.g., derived caches, large logs).
-    # Then return {:noreply, compacted_state, :hibernate}.
-    #
-    # Design question: what fields are safe to drop vs. unsafe to drop?
-    # Answer: anything you can recompute from service_name + status + failures.
+    # compact/1 drops any large fields that can be recomputed on wake,
+    # keeping only the essential fields needed to preserve correctness.
+    compacted = compact(state)
+    {:noreply, compacted, :hibernate}
   end
 
   # ---------------------------------------------------------------------------
   # Private helpers
   # ---------------------------------------------------------------------------
 
+  # Returns the smallest state that preserves correctness.
+  # The fields :service, :status, :failures, and :hibernations are all essential:
+  #   - :service identifies which upstream this worker protects
+  #   - :status is the circuit state (:closed/:open/:half_open)
+  #   - :failures is the consecutive failure count — dropping this would reset the
+  #     circuit and silently allow traffic to a failing upstream
+  #   - :hibernations is incremented for test observability
+  #
+  # In a production worker with richer state (request logs, metrics caches, connection
+  # pool handles), those derived fields would be dropped here and rebuilt lazily on wake.
   defp compact(state) do
-    # TODO: return the smallest state that preserves correctness.
-    # Increment :hibernations so tests can assert hibernation happened.
+    %{
+      service: state.service,
+      status: state.status,
+      failures: state.failures,
+      hibernations: state.hibernations + 1
+    }
   end
 end
 ```
@@ -294,7 +330,7 @@ end
 mix test test/api_gateway/circuit_breaker/worker_test.exs --trace
 ```
 
-All tests fail initially — that is expected. Implement `Worker` until they all pass.
+All tests should pass with the implementation above.
 
 ### Step 5: Measure memory savings
 

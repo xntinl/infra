@@ -69,6 +69,19 @@ The `Processor` module needs to:
 
 ### `lib/payments_cli/processor.ex`
 
+The `apply_rules/2` function merges caller options with defaults using
+`Keyword.merge/2`. The order matters: `Keyword.merge(defaults, overrides)` gives
+priority to `overrides`. After merging, the function validates business rules
+and computes the fee.
+
+`update_transaction/2` enforces that only existing fields can be updated — this
+prevents accidental schema drift. It converts the keyword list to a map, checks
+that all keys exist in the original transaction, then merges.
+
+`summary/1` uses pattern matching in the function head to extract exactly the fields
+needed for display. This is more explicit than `Map.take/2` and documents the expected
+shape of the input at the function boundary.
+
 ```elixir
 defmodule PaymentsCli.Processor do
   @moduledoc """
@@ -103,24 +116,23 @@ defmodule PaymentsCli.Processor do
   """
   @spec apply_rules(map(), keyword()) :: {:ok, map()} | {:error, String.t()}
   def apply_rules(transaction, opts \\ []) when is_map(transaction) and is_list(opts) do
-    # TODO: implement
-    #
-    # HINT:
-    # 1. Merge opts with @default_opts using Keyword.merge(@default_opts, opts)
-    #    The caller's opts override the defaults. Order matters for Keyword.merge.
-    #
-    # 2. Extract options:
-    #    fee_bp = Keyword.get(effective_opts, :fee_basis_points)
-    #    max_cents = Keyword.get(effective_opts, :max_amount_cents)
-    #    require_ref = Keyword.get(effective_opts, :require_reference)
-    #
-    # 3. Validate: if transaction.amount_cents > max_cents, return error
-    #
-    # 4. If require_ref is true and Map.has_key?(transaction, :reference) is false, return error
-    #
-    # 5. Compute fee using div(transaction.amount_cents * fee_bp, 10_000)
-    #
-    # 6. Return {:ok, Map.put(transaction, :fee_cents, fee)}
+    effective_opts = Keyword.merge(@default_opts, opts)
+
+    fee_bp = Keyword.get(effective_opts, :fee_basis_points)
+    max_cents = Keyword.get(effective_opts, :max_amount_cents)
+    require_ref = Keyword.get(effective_opts, :require_reference)
+
+    cond do
+      transaction.amount_cents > max_cents ->
+        {:error, "amount #{transaction.amount_cents} exceeds maximum #{max_cents}"}
+
+      require_ref and not Map.has_key?(transaction, :reference) ->
+        {:error, "reference is required"}
+
+      true ->
+        fee = div(transaction.amount_cents * fee_bp, 10_000)
+        {:ok, Map.put(transaction, :fee_cents, fee)}
+    end
   end
 
   @doc """
@@ -143,14 +155,14 @@ defmodule PaymentsCli.Processor do
   """
   @spec update_transaction(map(), keyword()) :: {:ok, map()} | {:error, :unknown_fields}
   def update_transaction(transaction, updates) when is_map(transaction) and is_list(updates) do
-    # TODO: implement
-    #
-    # HINT:
-    # 1. Convert updates to a map: Map.new(updates)
-    # 2. Check all update keys exist in transaction: Map.keys(updates_map) -- Map.keys(transaction)
-    #    If the difference is non-empty, return {:error, :unknown_fields}
-    # 3. Merge: {:ok, Map.merge(transaction, updates_map)}
-    #    Map.merge with two maps: second map's values win on conflicts. That is what we want.
+    updates_map = Map.new(updates)
+    unknown_keys = Map.keys(updates_map) -- Map.keys(transaction)
+
+    if unknown_keys == [] do
+      {:ok, Map.merge(transaction, updates_map)}
+    else
+      {:error, :unknown_fields}
+    end
   end
 
   @doc """
@@ -168,11 +180,26 @@ defmodule PaymentsCli.Processor do
   """
   @spec summary(map()) :: map()
   def summary(%{id: id, amount_cents: amount, currency: currency, status: status}) do
-    # TODO: build and return a map with only these four fields
-    # Pattern matching in the function head extracts the values — no Map.get needed
+    %{id: id, amount_cents: amount, currency: currency, status: status}
   end
 end
 ```
+
+**Why this works:**
+
+- `apply_rules/2` uses `Keyword.merge(@default_opts, opts)` — the second argument's
+  values win on conflict. This means caller-provided options override defaults, which
+  is the standard convention. `Keyword.merge(opts, @default_opts)` would be backwards —
+  defaults would override caller options.
+
+- `update_transaction/2` converts the keyword list to a map with `Map.new/1`, then
+  computes the difference between update keys and transaction keys using `--`. If any
+  keys in the update are not in the original transaction, the function rejects the
+  update. This prevents typos like `staus: :approved` from silently adding a new field.
+
+- `summary/1` pattern-matches four specific keys in the function head. If the input
+  map is missing any of these keys, the match fails with a `FunctionClauseError` — this
+  is fail-fast behavior that immediately surfaces schema mismatches.
 
 ### Given tests — must pass without modification
 

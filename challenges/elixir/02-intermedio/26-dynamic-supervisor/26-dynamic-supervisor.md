@@ -47,7 +47,7 @@ The key insight: `Supervisor` requires knowing all children at startup. `Dynamic
 Spawning with `spawn/1` or `Task.start/1` creates processes with no supervision:
 
 ```
-spawn/1 → process crashes → process disappears silently → job is lost
+spawn/1 -> process crashes -> process disappears silently -> job is lost
 ```
 
 `DynamicSupervisor` provides:
@@ -116,18 +116,13 @@ defmodule TaskQueue.Worker do
 
   @impl true
   def handle_call(:execute, _from, job) do
-    # TODO: dispatch based on job.type and job.args
-    # Return {:reply, result, job} so the process stays alive after execution
-    #
-    # HINT:
-    # result = do_execute(Map.get(job, :type), Map.get(job, :args, %{}))
-    # {:reply, result, job}
+    result = do_execute(Map.get(job, :type), Map.get(job, :args, %{}))
+    {:reply, result, job}
   end
 
-  # TODO: implement do_execute/2 to handle each job type:
-  # defp do_execute("noop", _args), do: {:ok, :noop}
-  # defp do_execute("echo", args), do: {:ok, args}
-  # defp do_execute(type, _args), do: {:error, {:unknown_type, type}}
+  defp do_execute("noop", _args), do: {:ok, :noop}
+  defp do_execute("echo", args), do: {:ok, args}
+  defp do_execute(type, _args), do: {:error, {:unknown_type, type}}
 end
 ```
 
@@ -158,9 +153,7 @@ defmodule TaskQueue.WorkerSupervisor do
 
   @impl true
   def init(_opts) do
-    # TODO: call DynamicSupervisor.init/1 with strategy: :one_for_one
-    # and max_children: @max_workers
-    # HINT: DynamicSupervisor.init(strategy: :one_for_one, max_children: @max_workers)
+    DynamicSupervisor.init(strategy: :one_for_one, max_children: @max_workers)
   end
 
   @doc """
@@ -180,14 +173,10 @@ defmodule TaskQueue.WorkerSupervisor do
   def start_worker(job) when is_map(job) do
     child_spec = {TaskQueue.Worker, job}
 
-    # TODO: use DynamicSupervisor.start_child/2 to start the worker
-    # If it returns {:error, :max_children}, return {:error, :max_workers_reached}
-    # Otherwise return the result as-is
-    # HINT:
-    # case DynamicSupervisor.start_child(__MODULE__, child_spec) do
-    #   {:error, :max_children} -> {:error, :max_workers_reached}
-    #   other -> other
-    # end
+    case DynamicSupervisor.start_child(__MODULE__, child_spec) do
+      {:error, :max_children} -> {:error, :max_workers_reached}
+      other -> other
+    end
   end
 
   @doc """
@@ -198,9 +187,10 @@ defmodule TaskQueue.WorkerSupervisor do
   """
   @spec terminate_worker(pid()) :: :ok | {:error, :not_found}
   def terminate_worker(pid) when is_pid(pid) do
-    # TODO: use DynamicSupervisor.terminate_child/2
-    # Return :ok on success, {:error, :not_found} on :not_found error
-    # HINT: DynamicSupervisor.terminate_child(__MODULE__, pid)
+    case DynamicSupervisor.terminate_child(__MODULE__, pid) do
+      :ok -> :ok
+      {:error, :not_found} -> {:error, :not_found}
+    end
   end
 
   @doc """
@@ -208,8 +198,7 @@ defmodule TaskQueue.WorkerSupervisor do
   """
   @spec active_count() :: non_neg_integer()
   def active_count do
-    # TODO: use DynamicSupervisor.count_children/1 and return the :active count
-    # HINT: DynamicSupervisor.count_children(__MODULE__).active
+    DynamicSupervisor.count_children(__MODULE__).active
   end
 
   @doc """
@@ -217,13 +206,12 @@ defmodule TaskQueue.WorkerSupervisor do
   """
   @spec active_pids() :: [pid()]
   def active_pids do
-    # TODO: use DynamicSupervisor.which_children/1
-    # Each entry is {id, pid, type, modules} — extract the pid
-    # Filter out :restarting entries (pid is not a pid in those)
-    # HINT:
-    # __MODULE__
-    # |> DynamicSupervisor.which_children()
-    # |> Enum.flat_map(fn {_, pid, _, _} when is_pid(pid) -> [pid]; _ -> [] end)
+    __MODULE__
+    |> DynamicSupervisor.which_children()
+    |> Enum.flat_map(fn
+      {_, pid, _, _} when is_pid(pid) -> [pid]
+      _ -> []
+    end)
   end
 end
 ```
@@ -238,8 +226,6 @@ defmodule TaskQueue.Application do
   def start(_type, _args) do
     children = [
       TaskQueue.QueueServer,
-      # TODO: add TaskQueue.WorkerSupervisor to the supervision tree
-      # It must be started before the Scheduler so the Scheduler can use it
       TaskQueue.WorkerSupervisor,
       TaskQueue.Scheduler,
       TaskQueue.Registry
@@ -353,6 +339,8 @@ mix test test/task_queue/dynamic_supervisor_test.exs --trace
 | Overhead per child | low | low (same ETS entry per child) |
 
 Reflection question: `DynamicSupervisor` with `:one_for_one` restarts a crashed child. But if the worker crashes because the job payload is invalid, the restart will crash again immediately. How does the restart intensity mechanism (`max_restarts`, `max_seconds`) protect against this, and what does it do when the limit is exceeded?
+
+Answer: The restart intensity mechanism defines a window: if more than `max_restarts` restarts occur within `max_seconds` (defaults: 3 restarts in 5 seconds), the DynamicSupervisor itself shuts down. This prevents an infinite crash loop from consuming all CPU. When the limit is exceeded, the supervisor exits, which propagates up the supervision tree — the parent supervisor then decides whether to restart the DynamicSupervisor (resetting the counter) or shut down further. For invalid payloads, the correct fix is to validate before starting the child, not to rely on restart limits.
 
 ---
 

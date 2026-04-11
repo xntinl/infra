@@ -91,30 +91,61 @@ defmodule ChordRing.Ring do
   """
 
   @doc "Creates a ring with the given physical nodes and V virtual nodes each."
+  @spec new([atom()], pos_integer()) :: list()
   def new(nodes, v \\ 150) do
-    # TODO
-    # HINT: for each node, for i <- 1..v do
-    #         token = :erlang.phash2("#{node}:#{i}", 0xFFFFFFFF)
-    #         {token, node}
-    #       end
-    # HINT: sort the resulting list by token
-    # HINT: deduplicate tokens (hash collisions are possible with phash2)
+    for node <- nodes, i <- 1..v do
+      token = :erlang.phash2("#{node}:#{i}", 0xFFFFFFFF)
+      {token, node}
+    end
+    |> Enum.uniq_by(fn {token, _} -> token end)
+    |> Enum.sort_by(fn {token, _} -> token end)
   end
 
   @doc "Returns the primary physical node responsible for key."
+  @spec lookup(list(), binary()) :: atom()
   def lookup(ring, key) do
-    # TODO: token = hash(key); binary search for first {t, node} where t >= token
-    # HINT: if no token >= token, wrap around to the first token (ring topology)
+    hash = :erlang.phash2(key, 0xFFFFFFFF)
+
+    case Enum.find(ring, fn {token, _node} -> token >= hash end) do
+      {_token, node} -> node
+      nil ->
+        {_token, node} = List.first(ring)
+        node
+    end
   end
 
   @doc "Returns a list of R consecutive distinct physical nodes starting from key."
+  @spec replicas(list(), binary(), pos_integer()) :: [atom()]
   def replicas(ring, key, r) do
-    # TODO
+    hash = :erlang.phash2(key, 0xFFFFFFFF)
+    ring_size = length(ring)
+    start_idx = Enum.find_index(ring, fn {token, _} -> token >= hash end) || 0
+
+    Stream.iterate(start_idx, fn i -> rem(i + 1, ring_size) end)
+    |> Stream.map(fn i -> elem(Enum.at(ring, i), 1) end)
+    |> Stream.uniq()
+    |> Enum.take(r)
+  end
+
+  @doc "Adds a node to the ring."
+  @spec add_node(list(), atom(), pos_integer()) :: list()
+  def add_node(ring, node, v \\ 150) do
+    new_tokens = for i <- 1..v do
+      token = :erlang.phash2("#{node}:#{i}", 0xFFFFFFFF)
+      {token, node}
+    end
+
+    (ring ++ new_tokens)
+    |> Enum.uniq_by(fn {token, _} -> token end)
+    |> Enum.sort_by(fn {token, _} -> token end)
   end
 
   @doc "Returns the fraction of keys that moved when node is added to ring."
+  @spec movement_fraction(list(), list(), pos_integer()) :: float()
   def movement_fraction(old_ring, new_ring, sample_size \\ 10_000) do
-    # TODO: generate random keys, compare lookup results
+    keys = for _ <- 1..sample_size, do: :crypto.strong_rand_bytes(8) |> Base.encode16()
+    moved = Enum.count(keys, fn k -> lookup(old_ring, k) != lookup(new_ring, k) end)
+    moved / sample_size
   end
 end
 ```
@@ -140,18 +171,54 @@ defmodule ChordRing.Migration do
   Use a token bucket with a GenServer timer to refill tokens.
   """
 
+  @spec start_migration(atom(), atom(), {non_neg_integer(), non_neg_integer()}, keyword()) :: map()
   def start_migration(source_node, dest_node, key_range, opts \\ []) do
-    # TODO
+    max_keys_per_second = Keyword.get(opts, :max_keys_per_second, 1000)
+
+    %{
+      source: source_node,
+      dest: dest_node,
+      key_range: key_range,
+      status: :migrating,
+      migrated_keys: MapSet.new(),
+      max_rate: max_keys_per_second
+    }
   end
 
+  @spec read(term(), map()) :: {:ok, term()} | {:error, :not_found}
   def read(key, migration_state) do
-    # TODO: if key is in :complete range, read from dest only
-    #        if key is in :migrating range and migrated, read from dest
-    #        if key is in :migrating range and not yet migrated, read from source
+    case migration_state.status do
+      :complete ->
+        GenServer.call(migration_state.dest, {:get, key})
+
+      :migrating ->
+        if MapSet.member?(migration_state.migrated_keys, key) do
+          GenServer.call(migration_state.dest, {:get, key})
+        else
+          GenServer.call(migration_state.source, {:get, key})
+        end
+
+      :pending ->
+        GenServer.call(migration_state.source, {:get, key})
+    end
   end
 
+  @spec write(term(), term(), map()) :: {:ok, map()}
   def write(key, value, migration_state) do
-    # TODO: dual-write if key range is in :migrating state
+    case migration_state.status do
+      :migrating ->
+        GenServer.call(migration_state.source, {:put, key, value})
+        GenServer.call(migration_state.dest, {:put, key, value})
+        {:ok, %{migration_state | migrated_keys: MapSet.put(migration_state.migrated_keys, key)}}
+
+      :complete ->
+        GenServer.call(migration_state.dest, {:put, key, value})
+        {:ok, migration_state}
+
+      :pending ->
+        GenServer.call(migration_state.source, {:put, key, value})
+        {:ok, migration_state}
+    end
   end
 end
 ```

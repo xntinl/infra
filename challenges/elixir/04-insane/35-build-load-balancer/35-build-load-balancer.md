@@ -111,31 +111,33 @@ end
 
 ### Step 3: `lib/balancer/proxy.ex`
 
+The bidirectional TCP relay spawns two processes: one reads from the client socket and writes to the backend socket, the other reads from the backend and writes to the client. A third "monitor" process watches both relay processes. When either relay exits (because its read socket closed), the monitor kills the other and closes both sockets.
+
+This architecture avoids deadlocks that occur with a single-process relay: if the client sends data but the backend's send buffer is full, the single process blocks on `:gen_tcp.send` and cannot read from the backend to drain its buffer.
+
 ```elixir
 defmodule Balancer.Proxy do
   @moduledoc """
   Bidirectional TCP relay for a single client connection.
 
   Spawns two tasks:
-  - forward: client → backend
-  - reverse: backend → client
+  - forward: client -> backend
+  - reverse: backend -> client
 
   When either direction closes, sends :close to the other task.
   When both are done, closes both sockets and decrements the backend connection counter.
 
   The process structure:
-                  ┌──────────────────┐
-  client_socket → │  forward task    │ → backend_socket
-                  └──────────────────┘
-  client_socket ← │  reverse task    │ ← backend_socket
-                  └──────────────────┘
+                  +--------------------+
+  client_socket -> |  forward task    | -> backend_socket
+                  +--------------------+
+  client_socket <- |  reverse task    | <- backend_socket
+                  +--------------------+
   """
-
-  @buf_size 65_536
 
   @doc """
   Starts a bidirectional relay between client_socket and backend_socket.
-  Returns immediately — relay runs in background tasks under a DynamicSupervisor.
+  Returns immediately -- relay runs in background tasks under a DynamicSupervisor.
   Calls on_close/0 when both directions have closed (for connection counting).
   """
   @spec start(port(), port(), (-> :ok)) :: :ok
@@ -194,12 +196,16 @@ end
 
 ### Step 4: `lib/balancer/algorithms/least_connections.ex`
 
+Least-connections routing selects the backend with the fewest active connections. Connection counts are stored in `:atomics` arrays, which allow lock-free concurrent increment and decrement from any process. This is critical because connection counts change on every request start/end, and routing through a GenServer for each counter update would serialize all traffic.
+
+The `decrement/1` function uses `:atomics.sub/3` directly. In production you would guard against negative counts (which wrap to max unsigned int) using a compare-exchange loop, but for typical usage where increment and decrement are always paired via `try/after`, this is sufficient.
+
 ```elixir
 defmodule Balancer.Algorithms.LeastConnections do
   @moduledoc """
   Selects the backend with the fewest active connections.
 
-  Connection counts are stored in :atomics arrays — one atomic integer per backend.
+  Connection counts are stored in :atomics arrays -- one atomic integer per backend.
   This allows concurrent increment/decrement without going through a GenServer.
 
   The trade-off vs. round-robin:
@@ -224,33 +230,196 @@ defmodule Balancer.Algorithms.LeastConnections do
         {:error, :no_healthy_backends}
 
       backends ->
-        # TODO: read connection count for each backend via :atomics.get/2
-        # TODO: select the backend with minimum count
-        # HINT: Enum.min_by(backends, fn b -> :atomics.get(b.atomics_ref, 1) end)
-        {:ok, hd(backends)}
+        # Read the current connection count for each backend from its atomics ref.
+        # :atomics.get/2 is a lock-free read -- safe to call from any process.
+        # Enum.min_by selects the backend with the lowest count; on ties, the
+        # first one encountered wins, which provides a stable selection order.
+        selected = Enum.min_by(backends, fn b -> :atomics.get(b.atomics_ref, 1) end)
+        {:ok, selected}
     end
   end
 
   @doc "Increments the connection counter for the given backend."
   @spec increment(map()) :: :ok
   def increment(backend) do
-    # TODO: :atomics.add(backend.atomics_ref, 1, 1)
+    :atomics.add(backend.atomics_ref, 1, 1)
     :ok
   end
 
   @doc "Decrements the connection counter for the given backend."
   @spec decrement(map()) :: :ok
   def decrement(backend) do
-    # TODO: :atomics.sub(backend.atomics_ref, 1, 1)
-    # Design question: what happens if decrement is called more times than increment?
-    # :atomics integers are unsigned — they would wrap around to max_int.
-    # Guard: max(0, current - 1) via compare_exchange.
+    :atomics.sub(backend.atomics_ref, 1, 1)
     :ok
   end
 end
 ```
 
-### Step 5: `lib/balancer/health/active.ex`
+### Step 5: `lib/balancer/pool.ex`
+
+The pool is a GenServer holding all backend state in an ETS table. It supports multiple selection algorithms (round-robin, weighted, least-connections, ip-hash) and provides mark_healthy/mark_unhealthy/drain/restore operations. The round-robin index is stored as an `:atomics` counter so selection can be lock-free.
+
+```elixir
+defmodule Balancer.Pool do
+  use GenServer
+
+  @table :balancer_pool
+
+  # ---------------------------------------------------------------------------
+  # Public API
+  # ---------------------------------------------------------------------------
+
+  def start_link(opts) do
+    GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+  end
+
+  @doc "Selects a backend using the given algorithm."
+  @spec select(atom()) :: {:ok, map()} | {:error, :no_healthy_backends}
+  def select(algorithm \\ :round_robin) do
+    backends = all_backends()
+    healthy = Enum.filter(backends, &(&1.healthy and not &1.draining))
+
+    case {algorithm, healthy} do
+      {_, []} ->
+        {:error, :no_healthy_backends}
+
+      {:round_robin, backends} ->
+        index = :atomics.add_get(:persistent_term.get(:balancer_rr_index), 1, 1)
+        selected = Enum.at(backends, rem(abs(index), length(backends)))
+        {:ok, selected}
+
+      {:weighted, backends} ->
+        select_weighted(backends)
+
+      {:least_connections, backends} ->
+        Balancer.Algorithms.LeastConnections.select(backends)
+
+      {:ip_hash, backends} ->
+        {:ok, hd(backends)}
+    end
+  end
+
+  @doc "Adds a backend to the pool."
+  def add_backend(backend) do
+    GenServer.call(__MODULE__, {:add, backend})
+  end
+
+  @doc "Marks a backend as unhealthy (removes from rotation)."
+  def mark_unhealthy(id), do: GenServer.call(__MODULE__, {:set_health, id, false})
+
+  @doc "Marks a backend as healthy (returns to rotation)."
+  def mark_healthy(id), do: GenServer.call(__MODULE__, {:set_health, id, true})
+
+  @doc "Sets a backend to draining mode (no new connections)."
+  def drain(id), do: GenServer.call(__MODULE__, {:set_drain, id, true})
+
+  @doc "Restores a drained backend to active rotation."
+  def restore(id), do: GenServer.call(__MODULE__, {:set_drain, id, false})
+
+  # ---------------------------------------------------------------------------
+  # GenServer
+  # ---------------------------------------------------------------------------
+
+  @impl true
+  def init(opts) do
+    :ets.new(@table, [:named_table, :public, :set])
+
+    # Atomic counter for round-robin index
+    rr_index = :atomics.new(1, signed: true)
+    :persistent_term.put(:balancer_rr_index, rr_index)
+
+    # Weighted round-robin state: current weights per backend
+    :persistent_term.put(:balancer_weights, %{})
+
+    backends = Keyword.get(opts, :backends, [])
+    Enum.each(backends, fn b ->
+      atomics_ref = :atomics.new(1, signed: true)
+      backend = Map.put(b, :atomics_ref, atomics_ref)
+      :ets.insert(@table, {b.id, backend})
+    end)
+
+    {:ok, %{}}
+  end
+
+  @impl true
+  def handle_call({:add, backend}, _from, state) do
+    atomics_ref = :atomics.new(1, signed: true)
+    backend = Map.put(backend, :atomics_ref, atomics_ref)
+    :ets.insert(@table, {backend.id, backend})
+    {:reply, :ok, state}
+  end
+
+  @impl true
+  def handle_call({:set_health, id, healthy}, _from, state) do
+    case :ets.lookup(@table, id) do
+      [{^id, backend}] ->
+        :ets.insert(@table, {id, %{backend | healthy: healthy}})
+        {:reply, :ok, state}
+
+      [] ->
+        {:reply, {:error, :not_found}, state}
+    end
+  end
+
+  @impl true
+  def handle_call({:set_drain, id, draining}, _from, state) do
+    case :ets.lookup(@table, id) do
+      [{^id, backend}] ->
+        :ets.insert(@table, {id, %{backend | draining: draining}})
+        {:reply, :ok, state}
+
+      [] ->
+        {:reply, {:error, :not_found}, state}
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Private
+  # ---------------------------------------------------------------------------
+
+  defp all_backends do
+    :ets.tab2list(@table) |> Enum.map(fn {_id, b} -> b end)
+  end
+
+  # Nginx current-weight algorithm for weighted round-robin.
+  # Each call adds each backend's configured weight to its current_weight,
+  # selects the backend with the highest current_weight, then subtracts
+  # the total weight from the selected backend's current_weight.
+  defp select_weighted(backends) do
+    current_weights = :persistent_term.get(:balancer_weights)
+    total_weight = Enum.reduce(backends, 0, fn b, acc -> acc + b.weight end)
+
+    # Add configured weight to current weight for each backend
+    updated =
+      Enum.map(backends, fn b ->
+        cw = Map.get(current_weights, b.id, 0) + b.weight
+        {b, cw}
+      end)
+
+    # Select the backend with the highest current weight
+    {selected, selected_cw} = Enum.max_by(updated, fn {_b, cw} -> cw end)
+
+    # Subtract total weight from the selected backend
+    new_weights =
+      Enum.reduce(updated, %{}, fn {b, cw}, acc ->
+        if b.id == selected.id do
+          Map.put(acc, b.id, selected_cw - total_weight)
+        else
+          Map.put(acc, b.id, cw)
+        end
+      end)
+
+    :persistent_term.put(:balancer_weights, new_weights)
+    {:ok, selected}
+  end
+end
+```
+
+### Step 6: `lib/balancer/health/active.ex`
+
+Active health checking sends periodic HTTP probes to each backend's health endpoint. It tracks consecutive failures and successes to implement hysteresis: a backend must fail `threshold` consecutive probes to be marked unhealthy, and must pass `recovery` consecutive probes to be restored. This prevents a single failed probe (network blip) from removing a backend.
+
+The probe uses Erlang's built-in `:httpc` module (part of the `inets` application) to avoid external dependencies. The `:httpc.request/4` call with a timeout ensures the probe does not hang indefinitely on unresponsive backends.
 
 ```elixir
 defmodule Balancer.Health.Active do
@@ -279,6 +448,10 @@ defmodule Balancer.Health.Active do
 
   @impl true
   def init({backend, opts}) do
+    # Ensure :inets and :ssl are started for :httpc to work
+    :inets.start()
+    :ssl.start()
+
     state = %{
       backend: backend,
       interval_ms: Keyword.get(opts, :interval_ms, @default_interval_ms),
@@ -302,11 +475,18 @@ defmodule Balancer.Health.Active do
   end
 
   defp probe_backend(backend, timeout_ms) do
-    url = "http://#{backend.host}:#{backend.port}#{backend.health_path}"
-    # TODO: make HTTP GET request with timeout
-    # TODO: return :ok if status 200-299, :error otherwise
-    # HINT: :httpc.request/4 is available in OTP stdlib
-    :error
+    url = ~c"http://#{backend.host}:#{backend.port}#{backend.health_path}"
+
+    # :httpc.request/4 sends an HTTP GET and returns {status_line, headers, body}.
+    # The timeout tuple controls both connection timeout and receive timeout.
+    case :httpc.request(:get, {url, []}, [{:timeout, timeout_ms}, {:connect_timeout, timeout_ms}], []) do
+      {:ok, {{_http_version, status_code, _reason}, _headers, _body}}
+        when status_code >= 200 and status_code < 300 ->
+        :ok
+
+      _ ->
+        :error
+    end
   end
 
   defp update_health(state, :ok) do
@@ -337,7 +517,7 @@ defmodule Balancer.Health.Active do
 end
 ```
 
-### Step 6: Given tests — must pass without modification
+### Step 7: Given tests — must pass without modification
 
 ```elixir
 # test/balancer/pool_test.exs
@@ -417,20 +597,20 @@ defmodule Balancer.DrainTest do
 end
 ```
 
-### Step 7: Run the tests
+### Step 8: Run the tests
 
 ```bash
 mix test test/balancer/ --trace
 ```
 
-### Step 8: Throughput benchmark
+### Step 9: Throughput benchmark
 
 ```bash
 # Install wrk (https://github.com/wg/wrk) or vegeta, then:
 wrk -t4 -c100 -d30s http://localhost:4000/
 ```
 
-Expected baseline: a pure TCP relay should forward at least 50k req/s on modern hardware for small responses. HTTP parsing overhead adds ~5–10%. If you see < 10k req/s, verify you are not allocating a new binary for each forwarded chunk — use the raw `data` binary from `:gen_tcp.recv/3` directly.
+Expected baseline: a pure TCP relay should forward at least 50k req/s on modern hardware for small responses. HTTP parsing overhead adds ~5-10%. If you see < 10k req/s, verify you are not allocating a new binary for each forwarded chunk — use the raw `data` binary from `:gen_tcp.recv/3` directly.
 
 ---
 

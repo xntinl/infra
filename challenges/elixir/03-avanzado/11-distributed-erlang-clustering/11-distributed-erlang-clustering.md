@@ -204,6 +204,13 @@ accepting requests. The majority partition keeps serving normally.
 
 ### Step 1: `lib/api_gateway/cluster/manager.ex`
 
+The ClusterManager is a GenServer that:
+1. Subscribes to `:net_kernel.monitor_nodes` for topology change events
+2. Attempts to connect to all known nodes on startup
+3. Periodically retries connections to unreachable nodes
+4. Tracks cluster events in a bounded history buffer
+5. Computes quorum status (majority of known nodes reachable)
+
 ```elixir
 defmodule ApiGateway.Cluster.Manager do
   use GenServer
@@ -217,16 +224,17 @@ defmodule ApiGateway.Cluster.Manager do
   # ---------------------------------------------------------------------------
 
   def start_link(opts) do
-    # opts must include: known_nodes: [node_name, ...]
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
   end
 
-  @doc "Returns %{connected: [node], degraded: bool, quorum_size: int}"
+  @doc "Returns %{connected: [node], degraded: bool, quorum_size: int, current_node: node}"
+  @spec status() :: map()
   def status do
     GenServer.call(__MODULE__, :status)
   end
 
   @doc "Returns the last @max_history cluster events, newest first."
+  @spec event_history() :: [{atom(), atom(), DateTime.t()}]
   def event_history do
     GenServer.call(__MODULE__, :history)
   end
@@ -235,6 +243,7 @@ defmodule ApiGateway.Cluster.Manager do
   Returns true if this node has quorum — i.e., it should accept writes.
   Quorum = strict majority of known_nodes (including self).
   """
+  @spec has_quorum?() :: boolean()
   def has_quorum? do
     GenServer.call(__MODULE__, :has_quorum?)
   end
@@ -247,22 +256,31 @@ defmodule ApiGateway.Cluster.Manager do
   def init(opts) do
     known_nodes = Keyword.fetch!(opts, :known_nodes)
 
-    # TODO: subscribe to node events so handle_info receives {:nodeup, node} and {:nodedown, node}
-    # HINT: :net_kernel.monitor_nodes(true)
+    # Subscribe to node up/down events
+    :net_kernel.monitor_nodes(true)
 
-    # TODO: attempt to connect to all known nodes immediately.
-    # Node.connect returns true/false — log failures at :warning level.
-    # HINT: Enum.each(known_nodes, fn n -> ... end)
+    # Attempt to connect to all known nodes immediately
+    Enum.each(known_nodes, fn n ->
+      unless n == node() do
+        case Node.connect(n) do
+          true -> Logger.info("Connected to #{n}")
+          false -> Logger.warning("Failed to connect to #{n}")
+          :ignored -> Logger.debug("Node #{n} connect ignored (not distributed)")
+        end
+      end
+    end)
 
-    # TODO: schedule periodic reconnect attempts for unreachable nodes.
-    # HINT: Process.send_after(self(), :reconnect, @reconnect_interval_ms)
+    # Schedule periodic reconnect attempts for unreachable nodes
+    Process.send_after(self(), :reconnect, @reconnect_interval_ms)
+
+    # Build initial connected list from Node.list() filtered to known_nodes
+    connected = Node.list() |> Enum.filter(&(&1 in known_nodes))
 
     state = %{
       known_nodes: known_nodes,
-      # TODO: populate connected_nodes from Node.list() filtered to known_nodes
-      connected_nodes: [],
+      connected_nodes: connected,
       history: [],
-      degraded: false
+      degraded: not has_quorum_check?(connected, known_nodes)
     }
 
     {:ok, state}
@@ -273,34 +291,64 @@ defmodule ApiGateway.Cluster.Manager do
   # ---------------------------------------------------------------------------
 
   @impl true
-  def handle_info({:nodeup, node}, state) do
-    # TODO:
-    # 1. Log info: "Node joined: #{node}"
-    # 2. Add node to connected_nodes (only if it is in known_nodes)
-    # 3. Prepend {:nodeup, node, DateTime.utc_now()} to history, keep last @max_history
-    # 4. Recompute degraded? flag
-    # 5. {:noreply, new_state}
-    {:noreply, state}
+  def handle_info({:nodeup, node_name}, state) do
+    Logger.info("Node joined: #{node_name}")
+
+    new_connected =
+      if node_name in state.known_nodes do
+        Enum.uniq([node_name | state.connected_nodes])
+      else
+        state.connected_nodes
+      end
+
+    new_history =
+      [{:nodeup, node_name, DateTime.utc_now()} | state.history]
+      |> Enum.take(@max_history)
+
+    new_degraded = not has_quorum_check?(new_connected, state.known_nodes)
+
+    {:noreply, %{state |
+      connected_nodes: new_connected,
+      history: new_history,
+      degraded: new_degraded
+    }}
   end
 
   @impl true
-  def handle_info({:nodedown, node}, state) do
-    # TODO:
-    # 1. Log warning: "Node left (possible netsplit): #{node}"
-    # 2. Remove node from connected_nodes
-    # 3. Prepend {:nodedown, node, DateTime.utc_now()} to history, keep last @max_history
-    # 4. Recompute degraded? flag — if below quorum, also log error
-    # 5. {:noreply, new_state}
-    {:noreply, state}
+  def handle_info({:nodedown, node_name}, state) do
+    Logger.warning("Node left (possible netsplit): #{node_name}")
+
+    new_connected = List.delete(state.connected_nodes, node_name)
+
+    new_history =
+      [{:nodedown, node_name, DateTime.utc_now()} | state.history]
+      |> Enum.take(@max_history)
+
+    new_degraded = not has_quorum_check?(new_connected, state.known_nodes)
+
+    if new_degraded do
+      Logger.error("Cluster below quorum — degraded mode active")
+    end
+
+    {:noreply, %{state |
+      connected_nodes: new_connected,
+      history: new_history,
+      degraded: new_degraded
+    }}
   end
 
   @impl true
   def handle_info(:reconnect, state) do
-    # TODO:
-    # 1. Find disconnected = known_nodes -- connected_nodes -- [node()]
-    # 2. For each disconnected node, attempt Node.connect(n) — log attempts at :debug
-    # 3. Reschedule :reconnect
-    # 4. {:noreply, state}  (node_up events will update connected_nodes if connect succeeds)
+    # Find nodes that should be connected but are not
+    disconnected = state.known_nodes -- [node() | state.connected_nodes]
+
+    Enum.each(disconnected, fn n ->
+      Logger.debug("Attempting reconnect to #{n}")
+      Node.connect(n)
+    end)
+
+    # Reschedule
+    Process.send_after(self(), :reconnect, @reconnect_interval_ms)
     {:noreply, state}
   end
 
@@ -310,9 +358,13 @@ defmodule ApiGateway.Cluster.Manager do
 
   @impl true
   def handle_call(:status, _from, state) do
-    # TODO: return %{connected: state.connected_nodes, degraded: state.degraded,
-    #               quorum_size: quorum_size(state), current_node: node()}
-    {:reply, %{}, state}
+    reply = %{
+      connected: state.connected_nodes,
+      degraded: state.degraded,
+      quorum_size: quorum_size(state),
+      current_node: node()
+    }
+    {:reply, reply, state}
   end
 
   @impl true
@@ -322,17 +374,26 @@ defmodule ApiGateway.Cluster.Manager do
 
   @impl true
   def handle_call(:has_quorum?, _from, state) do
-    # TODO: true if (length(connected_nodes) + 1) > length(known_nodes) / 2
-    # +1 because self() is always in the cluster but not in connected_nodes
-    {:reply, false, state}
+    result = has_quorum_check?(state.connected_nodes, state.known_nodes)
+    {:reply, result, state}
   end
 
   # ---------------------------------------------------------------------------
   # Private helpers
   # ---------------------------------------------------------------------------
 
-  # TODO: defp quorum_size(state), return ceil(length(state.known_nodes) / 2)
-  # TODO: defp compute_degraded(state), return not has_quorum? based on current connected count
+  # Quorum size: strict majority of the total known cluster size.
+  # ceil(3 / 2) = 2, meaning you need at least 2 nodes (including self) for quorum.
+  defp quorum_size(state) do
+    ceil(length(state.known_nodes) / 2)
+  end
+
+  # Has quorum if the number of reachable nodes (connected + self) exceeds half
+  # the total known cluster size. +1 because Node.list() / connected_nodes
+  # does not include self.
+  defp has_quorum_check?(connected, known_nodes) do
+    (length(connected) + 1) > length(known_nodes) / 2
+  end
 end
 ```
 
@@ -357,13 +418,18 @@ config :api_gateway, :cluster_nodes,
 
 ### Step 3: Guard rate limiting with quorum
 
+When the cluster is below quorum (minority partition), refuse rate-limit checks.
+This prevents split-brain rate limit bypass where each isolated partition allows
+the full rate independently.
+
 ```elixir
 # In lib/api_gateway/rate_limiter/server.ex, add to check/3:
 def check(client_id, limit, window_ms) do
-  # TODO: if not ApiGateway.Cluster.Manager.has_quorum?(),
-  # return {:deny, :no_quorum} before the normal ETS check.
-  # When degraded, refuse the request rather than allow potentially uncounted traffic.
-  # ...existing implementation...
+  unless ApiGateway.Cluster.Manager.has_quorum?() do
+    {:deny, :no_quorum}
+  else
+    # ...existing sliding window implementation...
+  end
 end
 ```
 

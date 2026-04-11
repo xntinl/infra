@@ -49,10 +49,10 @@ The functional `{:ok, value} | {:error, reason}` style is preferred for expected
 `try/rescue` is for truly exceptional conditions: bugs in job handler code, unexpected raises from third-party libraries, protocol violations from external agents. You cannot pattern-match your way out of a `RuntimeError` raised inside a `Jason.decode!` call; you need `rescue`.
 
 The practical rule for `task_queue`:
-- Job validation failure → `{:error, :invalid_job}`
-- External HTTP call returns 404 → `{:error, :not_found}`
-- External HTTP call raises `Req.TransportError` → `rescue` it and return `{:error, {:transport, reason}}`
-- Bug in job handler code → `rescue`, log with full stacktrace, `reraise` to let the supervisor restart the worker
+- Job validation failure -> `{:error, :invalid_job}`
+- External HTTP call returns 404 -> `{:error, :not_found}`
+- External HTTP call raises `Req.TransportError` -> `rescue` it and return `{:error, {:transport, reason}}`
+- Bug in job handler code -> `rescue`, log with full stacktrace, `reraise` to let the supervisor restart the worker
 
 ---
 
@@ -93,8 +93,8 @@ defmodule TaskQueue.Worker do
   - `after` in `execute_with_agent/2` guarantees connection cleanup
   """
 
-  # Custom exception: job-level failures
   defmodule JobError do
+    @moduledoc "Structured exception for job-level failures."
     defexception [:message, :job_id, :reason]
 
     @impl true
@@ -106,20 +106,22 @@ defmodule TaskQueue.Worker do
     end
   end
 
-  # Custom exception: agent communication failures
   defmodule AgentError do
+    @moduledoc "Structured exception for agent communication failures."
     defexception [:message, :agent_address, :status_code]
 
     @impl true
     def exception(opts) do
       address     = Keyword.get(opts, :agent_address, "<unknown>")
       status_code = Keyword.get(opts, :status_code)
+
       msg =
         if status_code do
           "Agent #{address} returned HTTP #{status_code}"
         else
           "Agent #{address} communication failed"
         end
+
       %__MODULE__{message: msg, agent_address: address, status_code: status_code}
     end
   end
@@ -144,14 +146,16 @@ defmodule TaskQueue.Worker do
     job_id = Map.get(job, :id, "unknown")
 
     try do
-      do_execute(type, args, job_id)
+      result = do_execute(type, args, job_id)
+      {:ok, result}
     rescue
       e in JobError ->
         {:error, {:job_failed, e.reason}}
+
       e in AgentError ->
         {:error, {:agent_failed, e.agent_address, e.status_code}}
+
       e ->
-        # Unexpected exception — log with stacktrace for debugging
         :logger.error("Unexpected error in job #{job_id}: #{Exception.message(e)}")
         {:error, {:unexpected, Exception.message(e)}}
     end
@@ -175,39 +179,32 @@ defmodule TaskQueue.Worker do
     rescue
       e in AgentError ->
         {:error, {:agent_failed, e.agent_address}}
+
       e ->
         reraise e, __STACKTRACE__
     after
-      # TODO: close the agent connection regardless of success or failure
-      # HINT: close_agent_connection(conn)
+      close_agent_connection(conn)
     end
   end
 
-  # Private helpers
+  # Private helpers — dispatch based on job type
 
-  # TODO: implement do_execute/3
-  # Dispatch based on `type`:
-  # - "noop"    → return :noop
-  # - "echo"    → return args
-  # - "fail"    → raise JobError with job_id and reason from args
-  # - other     → raise JobError with reason: {:unknown_type, type}
-  # HINT:
-  # defp do_execute("noop", _args, _job_id), do: :noop
-  # defp do_execute("echo", args, _job_id), do: args
-  # defp do_execute("fail", %{reason: reason}, job_id) do
-  #   raise JobError, job_id: job_id, reason: reason
-  # end
-  # defp do_execute(type, _args, job_id) do
-  #   raise JobError, job_id: job_id, reason: {:unknown_type, type}
-  # end
+  defp do_execute("noop", _args, _job_id), do: :noop
+  defp do_execute("echo", args, _job_id), do: args
+
+  defp do_execute("fail", %{reason: reason}, job_id) do
+    raise JobError, job_id: job_id, reason: reason
+  end
+
+  defp do_execute(type, _args, job_id) do
+    raise JobError, job_id: job_id, reason: {:unknown_type, type}
+  end
 
   defp open_agent_connection(address) do
-    # Simulates opening a TCP connection — returns a connection token
     %{address: address, opened_at: System.monotonic_time()}
   end
 
   defp send_job_to_agent(%{address: address}, _job) do
-    # Simulates sending — raises AgentError for "bad" addresses
     if String.contains?(address, "bad") do
       raise AgentError, agent_address: address, status_code: 503
     else
@@ -341,6 +338,8 @@ mix test test/task_queue/error_handling_test.exs --trace
 
 Reflection question: `Task.async/1` + `Task.await/1` raises if the task crashes. What does `try/rescue` around `Task.await` give you that `Task.yield/2` does not?
 
+Answer: `try/rescue` around `Task.await/1` catches the exit and converts it to a value you can handle. However, `Task.yield/2` achieves the same goal without exceptions: it returns `{:ok, result}` or `nil` (timeout) without raising. The key difference is that `Task.await/1` kills the task on timeout and raises, while `Task.yield/2` returns `nil` but leaves the task running — you must call `Task.shutdown/2` explicitly. Use `yield` when you want non-destructive timeout checks; use `await` when timeout is a hard deadline.
+
 ---
 
 ## Common production mistakes
@@ -431,4 +430,4 @@ end
 - [Exception module — official docs](https://hexdocs.pm/elixir/Exception.html)
 - [defexception — Elixir macro docs](https://hexdocs.pm/elixir/Kernel.html#defexception/1)
 - [reraise/2 — Kernel docs](https://hexdocs.pm/elixir/Kernel.SpecialForms.html#try/1)
-- [Error handling patterns — Saša Jurić's blog](https://www.theerlangelist.com/article/exceptions)
+- [Error handling patterns — Sasa Juric's blog](https://www.theerlangelist.com/article/exceptions)

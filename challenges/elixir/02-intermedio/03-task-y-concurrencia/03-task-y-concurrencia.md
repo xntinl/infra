@@ -22,7 +22,7 @@ task_queue/
 │   └── task_queue/
 │       ├── worker_process.ex    # exercise 01
 │       ├── task_registry.ex     # exercise 02
-│       └── batch_runner.ex      # ← you implement this
+│       └── batch_runner.ex
 ├── test/
 │   └── task_queue/
 │       └── batch_runner_test.exs   # given tests — must pass without modification
@@ -88,12 +88,14 @@ defmodule TaskQueue.BatchRunner do
   """
   @spec run_all(list(job()), pos_integer()) :: list(job_result())
   def run_all(jobs, timeout_ms \\ 5_000) do
-    # HINT: Task.async_stream(jobs, fn job -> job.() end, timeout: timeout_ms,
-    #         on_timeout: :kill_task, ordered: true)
-    # HINT: Enum.map the stream, converting {:ok, v} -> {:ok, v}
-    #   and {:exit, :timeout} -> {:error, :timeout}
-    #   and {:exit, reason} -> {:error, reason}
-    # TODO: implement
+    jobs
+    |> Task.async_stream(
+      fn job -> job.() end,
+      timeout: timeout_ms,
+      on_timeout: :kill_task,
+      ordered: true
+    )
+    |> Enum.map(&normalize_stream_result/1)
   end
 
   @doc """
@@ -104,8 +106,15 @@ defmodule TaskQueue.BatchRunner do
   """
   @spec run_stream(list(job()), pos_integer(), pos_integer()) :: list(job_result())
   def run_stream(jobs, max_concurrency, timeout_ms \\ 5_000) do
-    # HINT: same as run_all but pass max_concurrency: max_concurrency to async_stream
-    # TODO: implement
+    jobs
+    |> Task.async_stream(
+      fn job -> job.() end,
+      timeout: timeout_ms,
+      on_timeout: :kill_task,
+      ordered: true,
+      max_concurrency: max_concurrency
+    )
+    |> Enum.map(&normalize_stream_result/1)
   end
 
   @doc """
@@ -116,8 +125,7 @@ defmodule TaskQueue.BatchRunner do
   """
   @spec fire_and_forget(list(job())) :: :ok
   def fire_and_forget(jobs) do
-    # HINT: Enum.each(jobs, fn job -> Task.start(fn -> job.() end) end)
-    # TODO: implement
+    Enum.each(jobs, fn job -> Task.start(fn -> job.() end) end)
   end
 
   @doc """
@@ -128,11 +136,12 @@ defmodule TaskQueue.BatchRunner do
   @spec stats(list(job_result())) :: map()
   def stats(results) do
     base = %{total: length(results), ok: 0, timeout: 0, error: 0}
-    # HINT: Enum.reduce over results, incrementing the appropriate key
-    # {:ok, _}         -> increment :ok
-    # {:error, :timeout} -> increment :timeout
-    # {:error, _}      -> increment :error
-    # TODO: implement
+
+    Enum.reduce(results, base, fn
+      {:ok, _}, acc -> Map.update!(acc, :ok, &(&1 + 1))
+      {:error, :timeout}, acc -> Map.update!(acc, :timeout, &(&1 + 1))
+      {:error, _}, acc -> Map.update!(acc, :error, &(&1 + 1))
+    end)
   end
 
   @doc """
@@ -143,13 +152,52 @@ defmodule TaskQueue.BatchRunner do
   """
   @spec run_with_callback(list(job()), (non_neg_integer(), job_result() -> any())) :: :ok
   def run_with_callback(jobs, on_result) do
-    # HINT: Enum.with_index(jobs) → Task.async each one →
-    #   Task.await_many(tasks, 10_000) → Enum.with_index → call on_result
-    # Alternative: use Task.async_stream with ordered: false for true streaming
-    # TODO: implement
+    jobs
+    |> Enum.with_index()
+    |> Task.async_stream(
+      fn {job, idx} ->
+        result =
+          try do
+            {:ok, job.()}
+          rescue
+            e -> {:error, e}
+          end
+
+        {idx, result}
+      end,
+      ordered: false,
+      timeout: 10_000,
+      on_timeout: :kill_task
+    )
+    |> Enum.each(fn
+      {:ok, {idx, result}} -> on_result.(idx, result)
+      {:exit, :timeout} -> :ok
+    end)
   end
+
+  # ---------------------------------------------------------------------------
+  # Private
+  # ---------------------------------------------------------------------------
+
+  defp normalize_stream_result({:ok, value}), do: {:ok, value}
+  defp normalize_stream_result({:exit, :timeout}), do: {:error, :timeout}
+  defp normalize_stream_result({:exit, reason}), do: {:error, reason}
 end
 ```
+
+The `normalize_stream_result/1` function translates `Task.async_stream` output format
+into the application's `{:ok, value} | {:error, reason}` convention. `Task.async_stream`
+wraps successful results in `{:ok, value}` and failures in `{:exit, reason}`. The
+`:timeout` atom is a special exit reason produced by `on_timeout: :kill_task`.
+
+`run_with_callback/2` uses `ordered: false` so that results are delivered to the callback
+as soon as each task finishes, rather than waiting for earlier tasks to complete first. This
+enables real-time progress tracking. The index is threaded through the task so the callback
+knows which job produced each result.
+
+`fire_and_forget/1` uses `Task.start/1` instead of `Task.async/1` because no result
+collection is needed. `Task.start` creates an unlinked task — if it crashes, the caller
+is not affected. This is appropriate for truly background work like sending notifications.
 
 ### Step 2: Given tests — must pass without modification
 

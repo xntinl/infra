@@ -19,8 +19,8 @@ Project structure at this point:
 task_queue/
 ├── lib/
 │   └── task_queue/
-│       ├── worker_process.ex    # ← you implement this
-│       └── accumulator.ex       # ← and this
+│       ├── worker_process.ex
+│       └── accumulator.ex
 ├── test/
 │   └── task_queue/
 │       └── worker_process_test.exs   # given tests — must pass without modification
@@ -76,9 +76,6 @@ mkdir -p test/task_queue
 
 ### Step 2: `lib/task_queue/worker_process.ex`
 
-`# TODO` marks what you need to implement. `# HINT` gives direction without spoiling
-the solution. Do not change the public function signatures — the tests depend on them.
-
 ```elixir
 defmodule TaskQueue.WorkerProcess do
   @moduledoc """
@@ -108,8 +105,7 @@ defmodule TaskQueue.WorkerProcess do
   """
   @spec start_link() :: pid()
   def start_link do
-    # HINT: spawn_link/1 — same as start/0 but with a bidirectional link
-    # TODO: implement
+    spawn_link(fn -> loop() end)
   end
 
   @doc """
@@ -121,10 +117,13 @@ defmodule TaskQueue.WorkerProcess do
   @spec run_job(pid(), (-> any()), pos_integer()) :: {:ok, any()} | {:error, any()}
   def run_job(worker_pid, job_fn, timeout_ms \\ 5_000) do
     send(worker_pid, {:run, job_fn, self()})
-    # HINT: receive {:result, value} → {:ok, value}
-    #               {:error, reason} → {:error, reason}
-    # HINT: after timeout_ms → raise a RuntimeError with a clear message
-    # TODO: implement
+
+    receive do
+      {:result, value} -> {:ok, value}
+      {:error, reason} -> {:error, reason}
+    after
+      timeout_ms -> raise RuntimeError, "Worker did not respond within #{timeout_ms}ms"
+    end
   end
 
   @doc """
@@ -143,22 +142,34 @@ defmodule TaskQueue.WorkerProcess do
   defp loop do
     receive do
       {:run, job_fn, reply_to} ->
-        # HINT: wrap job_fn.() in a try/rescue block
-        # On success: send {:result, value} to reply_to, then call loop() again
-        # On rescue e: send {:error, e} to reply_to, then call loop() again
-        #
-        # Design question: why call loop() inside each branch rather than after
-        # the receive block? Because pattern matching is exhaustive — if :stop
-        # arrives and we called loop() unconditionally, we would loop forever.
-        # TODO: implement
+        try do
+          value = job_fn.()
+          send(reply_to, {:result, value})
+        rescue
+          e -> send(reply_to, {:error, e})
+        end
+
+        loop()
 
       :stop ->
-        # Do not call loop() — the process exits normally here
         :ok
     end
   end
 end
 ```
+
+The `loop/0` function is recursive: after handling a `:run` message, it calls itself to
+wait for the next message. The `:stop` branch does **not** call `loop/0` — the process
+exits normally by returning `:ok` from the function.
+
+The `try/rescue` inside the `:run` handler ensures that a failing job does not crash the
+worker. Instead, the exception is captured and sent back as `{:error, e}`. The worker
+remains alive and ready for the next job. This is the manual equivalent of what GenServer
+does automatically with its callback error handling.
+
+Why call `loop()` inside each branch rather than after the `receive` block? Because
+pattern matching is exhaustive — if `:stop` arrives and we called `loop()` unconditionally
+after the receive, the process would loop forever instead of terminating.
 
 ### Step 3: `lib/task_queue/accumulator.ex`
 
@@ -215,17 +226,14 @@ defmodule TaskQueue.Accumulator do
   defp loop(results) do
     receive do
       {:record, result} ->
-        # HINT: call loop([result | results]) to prepend and recurse
-        # TODO: implement
+        loop([result | results])
 
       {:fetch, reply_to} ->
-        # HINT: send {:results, Enum.reverse(results)} to reply_to
-        # HINT: then call loop(results) to keep the same state
-        # TODO: implement
+        send(reply_to, {:results, Enum.reverse(results)})
+        loop(results)
 
       :clear ->
-        # HINT: call loop([]) — fresh state
-        # TODO: implement
+        loop([])
 
       :stop ->
         :ok
@@ -233,6 +241,16 @@ defmodule TaskQueue.Accumulator do
   end
 end
 ```
+
+The accumulator uses `[result | results]` to prepend new entries (O(1)) and
+`Enum.reverse/1` on fetch to return them in insertion order. This is the standard
+Elixir pattern for building lists incrementally — appending with `results ++ [result]`
+would be O(n) on every insert, which degrades to O(n^2) over time.
+
+The state (`results`) is carried as a function argument through recursive calls.
+Each branch decides independently whether to recurse (`:record`, `:fetch`, `:clear`)
+or terminate (`:stop`). This is exactly what GenServer does internally with its
+`{:noreply, new_state}` and `{:stop, reason, state}` return tuples.
 
 ### Step 4: Given tests — must pass without modification
 
@@ -310,8 +328,6 @@ end
 ```bash
 mix test test/task_queue/worker_process_test.exs --trace
 ```
-
-All tests fail initially. Your implementation is done when all pass.
 
 ---
 

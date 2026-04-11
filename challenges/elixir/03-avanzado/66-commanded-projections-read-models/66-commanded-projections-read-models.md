@@ -21,11 +21,11 @@ api_gateway/
 │           ├── projections/
 │           │   └── client_summary.ex       # Ecto schema — read model
 │           ├── projectors/
-│           │   └── client_projector.ex     # ← you implement this
+│           │   └── client_projector.ex     # projects events to read model
 │           ├── handlers/
-│           │   └── overage_notifier.ex     # ← and this
+│           │   └── overage_notifier.ex     # side-effect handler for alerts
 │           └── queries/
-│               └── billing_queries.ex      # ← and this
+│               └── billing_queries.ex      # composable Ecto queries
 ├── test/
 │   └── api_gateway/
 │       └── billing/
@@ -158,40 +158,46 @@ defmodule ApiGateway.Billing.Projectors.ClientProjector do
 
   import Ecto.Query
 
-  # project/3 returns an Ecto.Multi. Commanded commits it atomically with
-  # the projector position update.
-
   project(%ClientProvisioned{} = event, _metadata, multi) do
-    # TODO: insert a new ClientSummary row using Ecto.Multi.insert/3
-    # Fields: client_id, plan, monthly_quota, status: "active"
+    summary = %ClientSummary{
+      client_id: event.client_id,
+      plan: event.plan,
+      monthly_quota: event.monthly_quota,
+      cumulative_usage: 0,
+      status: "active"
+    }
+
+    Ecto.Multi.insert(multi, :client_summary, summary)
   end
 
   project(%UsageRecorded{} = event, metadata, multi) do
-    new_status =
-      if event.cumulative_usage > 0 do
-        # We don't have monthly_quota here — derive status from the event
-        # The event already carries cumulative_usage; status derived in projector
-        # from a join or from a prior read. For simplicity, use a subquery:
-        # status = "over_quota" if cumulative_usage > monthly_quota else "active"
-        # Use Ecto.Multi.update_all with a fragment for atomic update
-        "active"  # placeholder — replace with proper logic
-      else
-        "active"
-      end
+    last_event_at = Map.get(metadata, :created_at, DateTime.utc_now())
 
-    # TODO: use Ecto.Multi.update_all/4 to update cumulative_usage, status, last_event_at
-    # HINT: from(s in ClientSummary, where: s.client_id == ^event.client_id)
-    # HINT: set: [cumulative_usage: event.cumulative_usage, last_event_at: metadata.created_at,
-    #             status: fragment("CASE WHEN ? > monthly_quota THEN 'over_quota' ELSE 'active' END",
-    #                              ^event.cumulative_usage)]
+    Ecto.Multi.update_all(
+      multi,
+      :update_usage,
+      from(s in ClientSummary, where: s.client_id == ^event.client_id),
+      set: [
+        cumulative_usage: event.cumulative_usage,
+        last_event_at: last_event_at,
+        status:
+          fragment(
+            "CASE WHEN ? > monthly_quota THEN 'over_quota' ELSE 'active' END",
+            ^event.cumulative_usage
+          )
+      ]
+    )
   end
 
   project(%ClientSuspended{} = event, _metadata, multi) do
-    # TODO: update status to "suspended" for the given client_id
+    Ecto.Multi.update_all(
+      multi,
+      :suspend_client,
+      from(s in ClientSummary, where: s.client_id == ^event.client_id),
+      set: [status: "suspended"]
+    )
   end
 
-  # Called after the Multi commits successfully.
-  # Use for cache invalidation, PubSub, or logging.
   def after_update(event, _metadata, _changes) do
     Phoenix.PubSub.broadcast(
       ApiGateway.PubSub,
@@ -204,6 +210,23 @@ defmodule ApiGateway.Billing.Projectors.ClientProjector do
   defp client_id_from(%{client_id: id}), do: id
 end
 ```
+
+The `ClientProvisioned` projector inserts a new `ClientSummary` row with initial values.
+The primary key is `client_id` (not an auto-generated integer), so the insert will fail
+with a constraint violation if the same client is provisioned twice — an additional
+safety net beyond the aggregate's `execute/2` guard.
+
+The `UsageRecorded` projector uses `Ecto.Multi.update_all/4` with a SQL `CASE` fragment
+to atomically update the cumulative usage and derive the status in a single query. The
+`fragment` compares the new `cumulative_usage` against the existing `monthly_quota`
+column in the database row. This avoids a read-then-write race condition — the status
+derivation happens in the database, not in Elixir.
+
+The `ClientSuspended` projector sets the status to `"suspended"` unconditionally.
+
+`after_update/3` is called after the `Ecto.Multi` commits successfully. It broadcasts
+to Phoenix PubSub so that live dashboards can update in real time. If PubSub fails,
+the projection is not rolled back — `after_update` is a best-effort notification.
 
 ### Step 5: `lib/api_gateway/billing/handlers/overage_notifier.ex`
 
@@ -225,6 +248,9 @@ defmodule ApiGateway.Billing.Handlers.OverageNotifier do
     name:        "OverageNotifier"
 
   alias ApiGateway.Billing.Events.UsageRecorded
+  alias ApiGateway.Billing.Projections.ClientSummary
+
+  require Logger
 
   @table :overage_notifications_sent
 
@@ -234,24 +260,63 @@ defmodule ApiGateway.Billing.Handlers.OverageNotifier do
   end
 
   def handle(%UsageRecorded{} = event, _metadata) do
-    # TODO: check if cumulative_usage exceeded quota for this client
-    # You need to read from the ClientSummary read model (not from the aggregate)
-    # to get monthly_quota — the event only carries cumulative_usage.
+    # Read the client's quota from the read model
+    summary = ApiGateway.Repo.get(ClientSummary, event.client_id)
 
-    # TODO: check idempotency: has (client_id, period) been notified already?
-    # :ets.lookup(@table, {event.client_id, event.period})
+    cond do
+      is_nil(summary) ->
+        :ok
 
-    # TODO: if over quota and not yet notified:
-    #   - send notification (log it, or call a real notification service)
-    #   - mark as notified in ETS: :ets.insert(@table, {{client_id, period}, true})
+      event.cumulative_usage <= summary.monthly_quota ->
+        :ok
 
-    :ok
+      already_notified?(event.client_id, event.period) ->
+        :ok
+
+      true ->
+        send_overage_notification(event)
+        mark_notified(event.client_id, event.period)
+        :ok
+    end
   end
 
-  # Ignore other event types
   def handle(_event, _metadata), do: :ok
+
+  # Private
+
+  defp already_notified?(client_id, period) do
+    :ets.lookup(@table, {client_id, period}) != []
+  end
+
+  defp mark_notified(client_id, period) do
+    :ets.insert(@table, {{client_id, period}, true})
+  end
+
+  defp send_overage_notification(event) do
+    Logger.warning(
+      "OVERAGE ALERT: client #{event.client_id} exceeded quota " <>
+        "in period #{event.period} — cumulative usage: #{event.cumulative_usage}"
+    )
+  end
 end
 ```
+
+The overage notifier implements a three-step check:
+
+1. **Read the quota**: queries the `ClientSummary` read model to get the `monthly_quota`.
+   The event only carries `cumulative_usage`, not the quota — reading the quota from the
+   event store would require replaying the aggregate, which is expensive and inappropriate
+   for a notification handler.
+
+2. **Check threshold**: if `cumulative_usage <= monthly_quota`, the client is within
+   quota and no notification is needed.
+
+3. **Check idempotency**: if the `(client_id, period)` pair is already in the ETS
+   deduplication table, the notification was already sent and we skip it.
+
+Only when all three conditions pass does the handler send the notification (here a
+Logger warning; in production this would be an email, Slack message, or webhook) and
+mark the pair as notified in ETS.
 
 ### Step 6: `lib/api_gateway/billing/queries/billing_queries.ex`
 
@@ -382,8 +447,6 @@ defmodule ApiGateway.Billing.Projectors.ClientProjectorTest do
 end
 ```
 
-Copy this file exactly. Your `OverageNotifier.handle/2` implementation must make all 3 tests pass.
-
 ```elixir
 # test/api_gateway/billing/overage_notifier_test.exs
 defmodule ApiGateway.Billing.Handlers.OverageNotifierTest do
@@ -394,8 +457,6 @@ defmodule ApiGateway.Billing.Handlers.OverageNotifierTest do
   alias ApiGateway.Billing.Events.UsageRecorded
 
   setup do
-    # Ensure the ETS dedup table is clean before each test.
-    # init/0 creates it on first call; subsequent calls hit the existing table.
     if :ets.whereis(:overage_notifications_sent) == :undefined do
       OverageNotifier.init()
     else
@@ -421,7 +482,6 @@ defmodule ApiGateway.Billing.Handlers.OverageNotifierTest do
     }
 
     assert :ok = OverageNotifier.handle(event, %{})
-    # No dedup entry — no notification was recorded
     assert :ets.lookup(:overage_notifications_sent, {"c-ok", "2026-04"}) == []
   end
 
@@ -441,7 +501,6 @@ defmodule ApiGateway.Billing.Handlers.OverageNotifierTest do
     }
 
     assert :ok = OverageNotifier.handle(event, %{})
-    # Dedup entry must exist after first notification
     assert [{{"c-over", "2026-04"}, true}] =
              :ets.lookup(:overage_notifications_sent, {"c-over", "2026-04"})
   end
@@ -454,7 +513,6 @@ defmodule ApiGateway.Billing.Handlers.OverageNotifierTest do
       status: "over_quota"
     })
 
-    # Pre-insert dedup entry as if already notified
     :ets.insert(:overage_notifications_sent, {{"c-dup", "2026-04"}, true})
 
     event = %UsageRecorded{
@@ -464,7 +522,6 @@ defmodule ApiGateway.Billing.Handlers.OverageNotifierTest do
       cumulative_usage: 200
     }
 
-    # Should return :ok without sending a second notification
     assert :ok = OverageNotifier.handle(event, %{})
   end
 end

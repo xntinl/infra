@@ -64,17 +64,17 @@ Pattern matching on the same syntax makes encode/decode symmetric — the parser
 
 ## Why `::utf8` for strings
 
-Strings in Elixir are UTF-8 binaries. A character like `é` occupies 2 bytes (`<<195, 169>>`). Using `::8` for character-by-character iteration treats multibyte characters as two separate bytes, producing corrupt output. The `::utf8` specifier extracts complete codepoints:
+Strings in Elixir are UTF-8 binaries. A character like `e` occupies 2 bytes (`<<195, 169>>`). Using `::8` for character-by-character iteration treats multibyte characters as two separate bytes, producing corrupt output. The `::utf8` specifier extracts complete codepoints:
 
 ```elixir
-<<head::utf8, rest::binary>> = "café"
-# head => 99 ('c'), rest => "afé"  — correct
+<<head::utf8, rest::binary>> = "cafe"
+# head => 99 ('c'), rest => "afe"  — correct
 
-<<head::8, rest::binary>> = "café"
-# head => 99 ('c'), rest => "afé"  — happens to work for ASCII prefix
-# But for "élan":
-<<head::8, rest::binary>> = "élan"
-# head => 195 (first byte of 'é'), rest => <<169, 108, 97, 110>>  — wrong
+<<head::8, rest::binary>> = "cafe"
+# head => 99 ('c'), rest => "afe"  — happens to work for ASCII prefix
+# But for "elan":
+<<head::8, rest::binary>> = "elan"
+# head => 195 (first byte of 'e'), rest => <<169, 108, 97, 110>>  — wrong
 ```
 
 ---
@@ -122,8 +122,7 @@ defmodule TaskQueue.Protocol do
   def encode(type, payload) when is_binary(payload) do
     type_byte = type_to_byte(type)
     length = byte_size(payload)
-    # TODO: construct the frame using <<>>
-    # HINT: <<@magic::binary, @version::8, type_byte::8, length::big-16, payload::binary>>
+    <<@magic::binary, @version::8, type_byte::8, length::big-16, payload::binary>>
   end
 
   @doc """
@@ -144,9 +143,9 @@ defmodule TaskQueue.Protocol do
   def decode(frame) do
     case frame do
       <<"TSKQ", _version::8, type_byte::8, length::big-16, payload::binary-size(length)>> ->
-        # TODO: convert type_byte to atom with byte_to_type/1
-        # TODO: return {:ok, %{type: type_atom, payload: payload}}
-        :not_implemented
+        type_atom = byte_to_type(type_byte)
+        {:ok, %{type: type_atom, payload: payload}}
+
       _ ->
         {:error, :invalid_frame}
     end
@@ -159,7 +158,7 @@ defmodule TaskQueue.Protocol do
 
   ## Examples
 
-      iex> TaskQueue.Protocol.codepoint_count("café")
+      iex> TaskQueue.Protocol.codepoint_count("cafe")
       4
 
       iex> TaskQueue.Protocol.codepoint_count("hello")
@@ -170,9 +169,8 @@ defmodule TaskQueue.Protocol do
   def codepoint_count(<<>>), do: 0
 
   def codepoint_count(binary) when is_binary(binary) do
-    # TODO: pattern match the first codepoint using ::utf8 and recurse on the rest
-    # HINT: <<_::utf8, rest::binary>> = binary
-    #       1 + codepoint_count(rest)
+    <<_::utf8, rest::binary>> = binary
+    1 + codepoint_count(rest)
   end
 
   @doc """
@@ -186,9 +184,8 @@ defmodule TaskQueue.Protocol do
   """
   @spec split_at(binary(), non_neg_integer()) :: {binary(), binary()}
   def split_at(binary, n) when is_binary(binary) and n >= 0 do
-    # TODO: use binary-size(n) in a pattern match
-    # HINT: <<head::binary-size(n), rest::binary>> = binary
-    #       {head, rest}
+    <<head::binary-size(n), rest::binary>> = binary
+    {head, rest}
   end
 
   # Private helpers
@@ -198,7 +195,6 @@ defmodule TaskQueue.Protocol do
   defp type_to_byte(:heartbeat),   do: @type_heartbeat
   defp type_to_byte(:error),       do: @type_error
 
-  # TODO: implement byte_to_type/1 — the inverse of type_to_byte/1
   defp byte_to_type(@type_job_request), do: :job_request
   defp byte_to_type(@type_job_result),  do: :job_result
   defp byte_to_type(@type_heartbeat),   do: :heartbeat
@@ -261,8 +257,8 @@ defmodule TaskQueue.ProtocolTest do
     end
 
     test "multibyte characters counted as one codepoint each" do
-      assert Protocol.codepoint_count("café") == 4
-      assert Protocol.codepoint_count("naïve") == 5
+      assert Protocol.codepoint_count("cafe") == 4
+      assert Protocol.codepoint_count("naive") == 5
     end
 
     test "empty string" do
@@ -302,12 +298,14 @@ mix test test/task_queue/protocol_test.exs --trace
 
 Reflection question: why is `System.monotonic_time` preferred over `System.os_time` for the timestamp field in a binary frame header? Consider NTP clock adjustments and monotonicity guarantees.
 
+Answer: `System.monotonic_time/0` is guaranteed to never go backwards — even if the system clock is adjusted by NTP (which can jump forward or backward). `System.os_time/0` reflects wall-clock time that NTP can adjust mid-operation, meaning two consecutive calls might return t2 < t1. For protocol frames, where timestamps are used to compute durations or detect ordering, a backwards jump would produce negative durations or incorrect ordering decisions. Monotonic time guarantees that later events always have greater timestamps.
+
 ---
 
 ## Common production mistakes
 
 **1. `byte_size` vs `String.length` confusion**
-`byte_size("café")` returns `5` (bytes). `String.length("café")` returns `4` (codepoints). For the `length` field in a binary protocol, you always want `byte_size` — the receiver reads bytes, not codepoints.
+`byte_size("cafe")` returns `5` (bytes). `String.length("cafe")` returns `4` (codepoints). For the `length` field in a binary protocol, you always want `byte_size` — the receiver reads bytes, not codepoints.
 
 **2. No `binary-size(length)` in payload pattern**
 Without the size constraint, the `payload::binary` match captures everything remaining in the buffer — including bytes from the next frame in a TCP stream. Always bound the payload: `payload::binary-size(length)`.

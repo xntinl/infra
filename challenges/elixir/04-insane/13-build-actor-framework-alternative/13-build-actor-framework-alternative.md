@@ -111,18 +111,53 @@ defmodule TypedActors.Actor do
   end
 
   defmacro receive_message(pattern, do: body) do
+    msg_type = extract_struct_type(pattern)
+
     quote do
-      # TODO: accumulate message type in @declared_messages
-      # TODO: generate a private handler function for this pattern
+      @declared_messages [unquote(msg_type) | @declared_messages]
+      @handler_clauses {unquote(Macro.escape(pattern)), unquote(Macro.escape(body))}
     end
   end
 
+  defp extract_struct_type({:=, _, [{:%, _, [type, _]}, _]}), do: type
+  defp extract_struct_type({:%, _, [type, _]}), do: type
+  defp extract_struct_type(other), do: other
+
   defmacro __before_compile__(env) do
+    declared = Module.get_attribute(env.module, :declared_messages) |> Enum.uniq()
+    clauses = Module.get_attribute(env.module, :handler_clauses) |> Enum.reverse()
+
+    dispatch_clauses =
+      Enum.map(clauses, fn {pattern, body} ->
+        quote do
+          def dispatch(unquote(pattern), var!(state)) do
+            unquote(body)
+          end
+        end
+      end)
+
     quote do
-      # TODO: generate dispatch/2 that:
-      #        - matches each declared message type and calls its handler
-      #        - catch-all raises Actor.UnknownMessageError with declared types listed
-      # TODO: override handle_call and handle_cast to go through dispatch/2
+      unquote_splicing(dispatch_clauses)
+
+      def dispatch(msg, _state) do
+        raise TypedActors.Actor.UnknownMessageError,
+          message: "Unknown message type: #{inspect(msg.__struct__)}",
+          declared_types: unquote(declared)
+      end
+
+      def handle_call(msg, _from, state) when is_struct(msg) do
+        case dispatch(msg, state) do
+          {:reply, reply, new_state} -> {:reply, reply, new_state}
+          {:noreply, new_state} -> {:noreply, new_state}
+        end
+      end
+
+      def handle_cast(msg, state) when is_struct(msg) do
+        case dispatch(msg, state) do
+          {:reply, _reply, new_state} -> {:noreply, new_state}
+          {:noreply, new_state} -> {:noreply, new_state}
+        end
+      end
     end
   end
 end
@@ -142,20 +177,27 @@ defmodule TypedActors.ActorRef do
 
   defstruct [:location]
 
+  def local(pid), do: %__MODULE__{location: {:local, pid}}
+  def remote(node, name), do: %__MODULE__{location: {:remote, node, name}}
+
   @doc "Sends a message to the actor without waiting for a reply."
+  @spec send(%__MODULE__{}, term()) :: :ok
   def send(%__MODULE__{location: {:local, pid}}, message) do
-    # TODO: Kernel.send(pid, message)
+    GenServer.cast(pid, message)
+    :ok
   end
   def send(%__MODULE__{location: {:remote, node, name}}, message) do
-    # TODO: :rpc.cast(node, GenServer, :cast, [name, message])
+    GenServer.cast({name, node}, message)
+    :ok
   end
 
   @doc "Sends a message and waits for a reply. Same semantics as GenServer.call/3."
+  @spec call(%__MODULE__{}, term(), non_neg_integer()) :: term()
   def call(%__MODULE__{location: {:local, pid}}, message, timeout \\ 5_000) do
-    # TODO: GenServer.call(pid, message, timeout)
+    GenServer.call(pid, message, timeout)
   end
   def call(%__MODULE__{location: {:remote, node, name}}, message, timeout) do
-    # TODO: :erpc.call(node, GenServer, :call, [name, message, timeout], timeout)
+    :erpc.call(node, GenServer, :call, [{name, node}, message, timeout], timeout)
   end
 end
 ```

@@ -79,6 +79,22 @@ The `Router` module needs to:
 
 ### `lib/payments_cli/router.ex`
 
+`route/1` uses `cond` because the routing rules are priority-ordered boolean
+conditions — not pattern matches on a single value. The amount check comes first
+(highest priority), then currency checks, then a catch-all.
+
+`validate/1` also uses `cond` because the validation rules are independent boolean
+checks. Each returns early with a specific error message. The `true ->` at the end
+is the happy path.
+
+`process/1` uses `with` to chain three fallible steps. The `with` expression
+flattens what would otherwise be three nested `case` expressions. Each `<-` clause
+pattern-matches the result; on mismatch, `with` returns the non-matching value
+immediately.
+
+`retryable?/1` uses `case` because it matches on the shape of a value (the error
+tuple), not on independent conditions.
+
 ```elixir
 defmodule PaymentsCli.Router do
   @moduledoc """
@@ -116,16 +132,12 @@ defmodule PaymentsCli.Router do
   """
   @spec route(map()) :: atom()
   def route(%{currency: currency, amount_cents: amount}) do
-    # TODO: use cond to implement the routing rules
-    # Rules are checked in priority order — cond evaluates top-to-bottom
-    # and uses the first truthy condition.
-    #
-    # cond do
-    #   amount > 500_000         -> :enterprise_processor
-    #   currency == "EUR"        -> :sepa_processor
-    #   currency == "GBP"        -> :bacs_processor
-    #   true                     -> :stripe
-    # end
+    cond do
+      amount > 500_000  -> :enterprise_processor
+      currency == "EUR" -> :sepa_processor
+      currency == "GBP" -> :bacs_processor
+      true              -> :stripe
+    end
   end
 
   @doc """
@@ -151,17 +163,13 @@ defmodule PaymentsCli.Router do
   """
   @spec validate(map()) :: :ok | {:error, String.t()}
   def validate(%{id: id, amount_cents: amount, currency: currency, status: status}) do
-    # TODO: use cond to check each rule in order
-    # Each condition returns an {:error, reason} string
-    # The final true -> :ok is the happy path
-    #
-    # cond do
-    #   amount <= 0                       -> {:error, "amount must be positive"}
-    #   String.length(currency) != 3      -> {:error, "invalid currency code"}
-    #   id == "" or is_nil(id)            -> {:error, "id is required"}
-    #   status != :pending                -> {:error, "only pending transactions can be processed"}
-    #   true                              -> :ok
-    # end
+    cond do
+      amount <= 0                  -> {:error, "amount must be positive"}
+      String.length(currency) != 3 -> {:error, "invalid currency code"}
+      id == "" or is_nil(id)       -> {:error, "id is required"}
+      status != :pending           -> {:error, "only pending transactions can be processed"}
+      true                         -> :ok
+    end
   end
 
   @doc """
@@ -179,20 +187,11 @@ defmodule PaymentsCli.Router do
   """
   @spec process(map()) :: {:ok, map()} | {:error, term()}
   def process(transaction) when is_map(transaction) do
-    # TODO: implement using with
-    #
-    # with :ok             <- validate(transaction),
-    #      processor       = route(transaction),
-    #      {:ok, result}   <- simulate_processor_call(processor, transaction) do
-    #   {:ok, %{processor: processor, transaction: result}}
-    # end
-    #
-    # Note: `validate/1` returns :ok (not {:ok, _}) on success.
-    # The `with` clause `<-` matches :ok against :ok and continues.
-    # If validate returns {:error, reason}, with immediately returns {:error, reason}.
-    #
-    # The `processor = route(transaction)` line uses `=` (not `<-`) because
-    # route/1 never fails — no need to match on {:ok, _}.
+    with :ok           <- validate(transaction),
+         processor     = route(transaction),
+         {:ok, result} <- simulate_processor_call(processor, transaction) do
+      {:ok, %{processor: processor, transaction: result}}
+    end
   end
 
   @doc """
@@ -214,14 +213,12 @@ defmodule PaymentsCli.Router do
   """
   @spec retryable?({:error, atom()}) :: boolean()
   def retryable?(error_result) do
-    # TODO: use case to match on the error
-    #
-    # case error_result do
-    #   {:error, :timeout}            -> true
-    #   {:error, :network_error}      -> true
-    #   {:error, :rate_limited}       -> true
-    #   {:error, _other}              -> false
-    # end
+    case error_result do
+      {:error, :timeout}       -> true
+      {:error, :network_error} -> true
+      {:error, :rate_limited}  -> true
+      {:error, _other}         -> false
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -229,7 +226,6 @@ defmodule PaymentsCli.Router do
   # ---------------------------------------------------------------------------
 
   defp simulate_processor_call(:enterprise_processor, tx) do
-    # Enterprise processor requires a reference field
     if Map.has_key?(tx, :reference) do
       {:ok, Map.put(tx, :status, :approved)}
     else
@@ -238,11 +234,30 @@ defmodule PaymentsCli.Router do
   end
 
   defp simulate_processor_call(_processor, tx) do
-    # Standard processors always approve in this simulation
     {:ok, Map.put(tx, :status, :approved)}
   end
 end
 ```
+
+**Why this works:**
+
+- `route/1` uses `cond` because the routing decision depends on priority-ordered
+  conditions that mix different fields (amount and currency). A `case` on a single
+  value would not express the priority between amount and currency.
+
+- `validate/1` uses `cond` because each validation rule is an independent boolean
+  expression. The first failing condition returns its error immediately. The `true ->`
+  at the end is the happy path — all rules passed.
+
+- `process/1` uses `with` to chain three steps. `validate/1` returns `:ok` on success,
+  which the `<-` operator matches. `route/1` never fails, so it uses `=` instead of
+  `<-`. `simulate_processor_call/2` returns `{:ok, result}` or `{:error, reason}`.
+  If any `<-` clause does not match, `with` returns the non-matching value immediately.
+  Without `else`, the non-matching value passes through unchanged — this is usually
+  correct for `{:error, reason}` propagation.
+
+- `retryable?/1` uses `case` because it matches on the shape of a value (a tuple
+  with a specific atom). This is pattern matching, not boolean evaluation.
 
 ### Given tests — must pass without modification
 

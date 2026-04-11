@@ -24,8 +24,8 @@ api_gateway/
 │       ├── cache/
 │       │   └── store.ex
 │       └── cluster/
-│           ├── rpc_client.ex      # ← you implement this
-│           └── health_check.ex   # ← and this
+│           ├── rpc_client.ex
+│           └── health_check.ex
 ├── test/
 │   └── api_gateway/
 │       └── cluster/
@@ -120,15 +120,27 @@ defmodule ApiGateway.Cluster.RPCClient do
   @doc """
   Calls module.function(args) on a single remote node.
   Returns {:ok, result} | {:error, :node_down | :timeout | {:exception, term()}}
+
+  Wraps :erpc.call/5 in a try/catch to normalize all error types into tagged tuples.
+  :erpc raises on error rather than returning {:badrpc, _} like :rpc, so we catch
+  the three known exception categories and map them to descriptive error atoms.
   """
   @spec call(node(), module(), atom(), list(), pos_integer()) ::
           {:ok, term()} | {:error, :node_down | :timeout | {:exception, term()}}
   def call(node, module, function, args, timeout_ms \\ @default_timeout_ms) do
-    # HINT: :erpc.call/5 raises on error — wrap in try/catch
-    # HINT: catch :error, {:erpc, :noconnection} for node_down
-    # HINT: catch :error, {:erpc, :timeout} for timeout
-    # HINT: catch :error, {exception, _stacktrace} for remote exceptions
-    # TODO: implement
+    try do
+      result = :erpc.call(node, module, function, args, timeout_ms)
+      {:ok, result}
+    catch
+      :error, {:erpc, :noconnection} ->
+        {:error, :node_down}
+
+      :error, {:erpc, :timeout} ->
+        {:error, :timeout}
+
+      kind, reason ->
+        {:error, {:exception, {kind, reason}}}
+    end
   end
 
   @doc """
@@ -137,29 +149,96 @@ defmodule ApiGateway.Cluster.RPCClient do
 
   The global timeout applies to ALL nodes together, not per node.
   A slow node does not block results from fast nodes.
+
+  Uses Task.async/Task.yield_many to execute calls in parallel with a single
+  shared deadline. Nodes that don't respond within timeout_ms get {:error, :timeout}.
+  The local node (node()) is included explicitly because Node.list() never contains it.
   """
   @spec fanout(module(), atom(), list(), pos_integer()) ::
           %{node() => {:ok, term()} | {:error, term()}}
   def fanout(module, function, args, timeout_ms \\ @default_timeout_ms) do
-    nodes = Node.list()
-    # HINT: use Task.async per node, then Task.yield_many with the global timeout
-    # HINT: {:ok, result} on success, nil on timeout → {:error, :timeout}
-    # HINT: include the local node using call to localhost (node()) for consistency
-    # TODO: implement
+    nodes = [node() | Node.list()]
+
+    task_map =
+      nodes
+      |> Enum.map(fn n ->
+        task = Task.async(fn -> call(n, module, function, args, timeout_ms) end)
+        {task, n}
+      end)
+
+    tasks = Enum.map(task_map, fn {task, _node} -> task end)
+    node_by_ref = Map.new(task_map, fn {task, n} -> {task.ref, n} end)
+
+    results = Task.yield_many(tasks, timeout_ms)
+
+    Map.new(results, fn {task, result} ->
+      target_node = Map.fetch!(node_by_ref, task.ref)
+
+      value =
+        case result do
+          {:ok, {:ok, val}} ->
+            {:ok, val}
+
+          {:ok, {:error, reason}} ->
+            {:error, reason}
+
+          nil ->
+            Task.shutdown(task, :brutal_kill)
+            {:error, :timeout}
+        end
+
+      {target_node, value}
+    end)
   end
 
   @doc """
   Calls the same named GenServer on every node in the cluster.
   Uses GenServer.call({name, node}, message) — not RPC.
   Returns %{node => {:ok, reply} | {:error, reason}}.
+
+  GenServer.call is preferred over :erpc for named processes because it provides
+  automatic monitoring (detects process death mid-call) and respects the GenServer's
+  message queue ordering. Each node call runs in its own Task for parallelism.
   """
   @spec call_named(atom(), term(), pos_integer()) ::
           %{node() => {:ok, term()} | {:error, term()}}
   def call_named(server_name, message, timeout_ms \\ @default_timeout_ms) do
     nodes = [node() | Node.list()]
-    # HINT: Task.async per node, GenServer.call({server_name, node}, message, timeout_ms)
-    # HINT: wrap in try/catch — the remote process may not exist
-    # TODO: implement
+
+    task_map =
+      nodes
+      |> Enum.map(fn n ->
+        task =
+          Task.async(fn ->
+            try do
+              reply = GenServer.call({server_name, n}, message, timeout_ms)
+              {:ok, reply}
+            catch
+              :exit, reason -> {:error, {:exit, reason}}
+            end
+          end)
+
+        {task, n}
+      end)
+
+    tasks = Enum.map(task_map, fn {task, _node} -> task end)
+    node_by_ref = Map.new(task_map, fn {task, n} -> {task.ref, n} end)
+
+    results = Task.yield_many(tasks, timeout_ms)
+
+    Map.new(results, fn {task, result} ->
+      target_node = Map.fetch!(node_by_ref, task.ref)
+
+      value =
+        case result do
+          {:ok, val} -> val
+          nil ->
+            Task.shutdown(task, :brutal_kill)
+            {:error, :timeout}
+        end
+
+      {target_node, value}
+    end)
   end
 end
 ```
@@ -178,6 +257,11 @@ defmodule ApiGateway.Cluster.HealthCheck do
   @doc """
   Runs diagnostics on every node in the cluster.
   Returns a structured report with per-node results and a summary.
+
+  Uses RPCClient.fanout/4 to call collect/0 on every node in parallel,
+  then classifies each result into :ok, :timeout, or :error buckets.
+  Elapsed time is measured with monotonic_time to ensure accuracy regardless
+  of wall clock adjustments.
   """
   @spec run() :: %{
           total_nodes: non_neg_integer(),
@@ -186,10 +270,25 @@ defmodule ApiGateway.Cluster.HealthCheck do
           summary: %{ok: [node()], timeout: [node()], error: [node()]}
         }
   def run do
-    # HINT: use RPCClient.fanout/4 with NodeDiagnostics.collect/0
-    # HINT: measure elapsed time with System.monotonic_time(:millisecond)
-    # HINT: summarize results into :ok, :timeout, :error buckets
-    # TODO: implement
+    start = System.monotonic_time(:millisecond)
+    results = RPCClient.fanout(__MODULE__, :collect, [])
+    elapsed = System.monotonic_time(:millisecond) - start
+
+    summary =
+      Enum.reduce(results, %{ok: [], timeout: [], error: []}, fn {n, result}, acc ->
+        case result do
+          {:ok, _data} -> %{acc | ok: [n | acc.ok]}
+          {:error, :timeout} -> %{acc | timeout: [n | acc.timeout]}
+          {:error, _reason} -> %{acc | error: [n | acc.error]}
+        end
+      end)
+
+    %{
+      total_nodes: map_size(results),
+      elapsed_ms: elapsed,
+      results: results,
+      summary: summary
+    }
   end
 
   @doc """

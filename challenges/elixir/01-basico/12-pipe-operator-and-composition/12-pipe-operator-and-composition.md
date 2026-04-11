@@ -44,7 +44,7 @@ For payment reporting, this matters because:
 
 1. A report pipeline has 5-8 steps in a fixed order
 2. Each step receives the result of the previous step
-3. The data type changes through the pipeline (list → grouped map → sorted list → string)
+3. The data type changes through the pipeline (list -> grouped map -> sorted list -> string)
 
 The pipe expresses the **intent** of the transformation as a sequence of steps,
 not as a composition of functions. Intent-revealing code is maintainable code.
@@ -65,6 +65,13 @@ a pipeline from raw transactions to a formatted string.
 ## Implementation
 
 ### `lib/payments_cli/report.ex`
+
+Each public function is a pipeline: transactions in, formatted string out. Private
+helpers handle the individual transformation steps. `compute_summary_stats/1` and
+`format_summary/1` are given — they demonstrate how to name sub-pipelines for clarity.
+
+The key discipline: each step transforms data, returns a value, and is independently
+testable. No step has side effects. The pipe makes the data flow visible.
 
 ```elixir
 defmodule PaymentsCli.Report do
@@ -89,23 +96,17 @@ defmodule PaymentsCli.Report do
 
   ## Examples
 
-      iex> txs = [%{status: :approved, amount_cents: 1000, currency: "USD"}, ...]
-      iex> PaymentsCli.Report.summary(txs)
-      "=== Transaction Summary ===\\nTotal transactions: 1\\nApproved: 1 ..."
+      iex> txs = [%{status: :approved, amount_cents: 1000, currency: "USD"}]
+      iex> report = PaymentsCli.Report.summary(txs)
+      iex> String.contains?(report, "Total transactions:")
+      true
 
   """
   @spec summary([map()]) :: String.t()
   def summary(transactions) when is_list(transactions) do
-    # TODO: implement as a pipeline
-    #
-    # stats = transactions
-    #   |> compute_summary_stats()
-    #   |> format_summary()
-    #
-    # Implement compute_summary_stats/1 as a private function that returns a map
-    # with counts and totals, then format_summary/1 that converts it to a string.
-    #
-    # The key discipline: each step transforms data, returns a value, and is independently testable.
+    transactions
+    |> compute_summary_stats()
+    |> format_summary()
   end
 
   @doc """
@@ -113,22 +114,17 @@ defmodule PaymentsCli.Report do
 
   Format: one line per merchant, sorted by total descending.
     === Merchant Report ===
-    Gas Station: 2 transactions, $155.00 total
-    Supermarket: 1 transaction, $150.00 total
+    Gas Station: $155.00 total
+    Supermarket: $150.00 total
 
   """
   @spec merchant_report([map()], pos_integer()) :: String.t()
   def merchant_report(transactions, top_n \\ 10) when is_list(transactions) do
-    # TODO: implement as a pipeline
-    #
-    # transactions
-    # |> Analytics.top_merchants(top_n)
-    # |> Enum.map(fn {merchant, total_cents} -> format_merchant_line(merchant, total_cents) end)
-    # |> then(fn lines -> ["=== Merchant Report ===" | lines] end)
-    # |> Enum.join("\n")
-    #
-    # Note: `then/2` applies a function to the pipeline result.
-    # It is useful when you need to wrap or transform the accumulated value.
+    transactions
+    |> Analytics.top_merchants(top_n)
+    |> Enum.map(fn {merchant, total_cents} -> format_merchant_line(merchant, total_cents) end)
+    |> then(fn lines -> ["=== Merchant Report ===" | lines] end)
+    |> Enum.join("\n")
   end
 
   @doc """
@@ -138,18 +134,16 @@ defmodule PaymentsCli.Report do
   """
   @spec to_csv_report([map()]) :: String.t()
   def to_csv_report(transactions) when is_list(transactions) do
-    # TODO: implement as a pipeline
-    #
-    # header = "id,date,merchant,amount_cents,currency,status"
-    #
-    # body =
-    #   transactions
-    #   |> Enum.filter(fn tx -> tx.status == :approved end)
-    #   |> Enum.sort_by(fn tx -> tx.id end)
-    #   |> Enum.map(&transaction_to_csv_line/1)
-    #   |> Enum.join("\n")
-    #
-    # header <> "\n" <> body
+    header = "id,date,merchant,amount_cents,currency,status"
+
+    body =
+      transactions
+      |> Enum.filter(fn tx -> tx.status == :approved end)
+      |> Enum.sort_by(fn tx -> tx.id end)
+      |> Enum.map(&transaction_to_csv_line/1)
+      |> Enum.join("\n")
+
+    header <> "\n" <> body
   end
 
   @doc """
@@ -157,22 +151,20 @@ defmodule PaymentsCli.Report do
 
   Format:
     === Daily Report ===
-    2024-01-15: $84.50 (↑ 12% from prior day)
-    2024-01-16: $230.20
+    2024-01-15: $84.50
+    2024-01-16: $230.20 (up 172% from prior day)
 
   For the first day, omit the trend indicator.
   """
   @spec daily_report([map()]) :: String.t()
   def daily_report(transactions) when is_list(transactions) do
-    # TODO: implement as a pipeline
-    #
-    # transactions
-    # |> Analytics.daily_totals()             -- %{date => total}
-    # |> Enum.sort_by(fn {date, _} -> date end) -- sorted by date
-    # |> add_trend_indicators()               -- private helper adds % change
-    # |> Enum.map(&format_daily_line/1)       -- format each day
-    # |> then(fn lines -> ["=== Daily Report ===" | lines] end)
-    # |> Enum.join("\n")
+    transactions
+    |> Analytics.daily_totals()
+    |> Enum.sort_by(fn {date, _} -> date end)
+    |> add_trend_indicators()
+    |> Enum.map(&format_daily_line/1)
+    |> then(fn lines -> ["=== Daily Report ===" | lines] end)
+    |> Enum.join("\n")
   end
 
   # ---------------------------------------------------------------------------
@@ -181,7 +173,6 @@ defmodule PaymentsCli.Report do
 
   @spec transaction_to_csv_line(map()) :: String.t()
   defp transaction_to_csv_line(%{id: id, amount_cents: a, currency: c, status: s} = tx) do
-    # TODO: format as CSV line, using Map.get with default for optional fields
     date = Map.get(tx, :date, "")
     merchant = Map.get(tx, :merchant, "")
     "#{id},#{date},#{merchant},#{a},#{c},#{s}"
@@ -191,10 +182,6 @@ defmodule PaymentsCli.Report do
   defp add_trend_indicators([]), do: []
 
   defp add_trend_indicators([{first_date, first_total} | rest]) do
-    # TODO: prepend the first entry with no trend indicator
-    # Then Enum.reduce the rest, tracking the previous total to compute % change
-    # Each entry becomes {date, total, trend_string} where trend_string is like "↑ 12%"
-    # or "" for the first entry
     first_entry = {first_date, first_total, ""}
 
     {_, result} =
@@ -207,10 +194,9 @@ defmodule PaymentsCli.Report do
   end
 
   @spec compute_trend(integer(), integer()) :: String.t()
-  defp compute_trend(prev, current) when prev == 0, do: ""
+  defp compute_trend(prev, _current) when prev == 0, do: ""
 
   defp compute_trend(prev, current) do
-    # GIVEN: computes percentage change and formats as "↑ N%" or "↓ N%"
     pct = round((current - prev) / prev * 100)
 
     if pct >= 0 do
@@ -222,7 +208,6 @@ defmodule PaymentsCli.Report do
 
   @spec format_daily_line({String.t(), integer(), String.t()}) :: String.t()
   defp format_daily_line({date, total_cents, ""}) do
-    # GIVEN: formats as "date: $X.XX"
     dollars = div(total_cents, 100)
     cents = rem(total_cents, 100)
     "#{date}: $#{dollars}.#{String.pad_leading(Integer.to_string(cents), 2, "0")}"
@@ -234,14 +219,12 @@ defmodule PaymentsCli.Report do
   end
 
   defp format_merchant_line(merchant, total_cents) do
-    # GIVEN: formats as "Merchant Name: $Y.ZZ total"
     dollars = div(total_cents, 100)
     cents = rem(total_cents, 100)
     "#{merchant}: $#{dollars}.#{String.pad_leading(Integer.to_string(cents), 2, "0")} total"
   end
 
   defp compute_summary_stats(transactions) do
-    # GIVEN: computes %{total: n, approved: n, approved_total: n, declined: n, flagged: n}
     approved = Enum.filter(transactions, fn tx -> tx.status == :approved end)
     declined = Enum.filter(transactions, fn tx -> tx.status == :declined end)
     flagged  = Enum.filter(transactions, fn tx -> tx.status == :flagged end)
@@ -256,7 +239,6 @@ defmodule PaymentsCli.Report do
   end
 
   defp format_summary(%{total: t, approved: a, approved_total: at, declined: d, flagged: f}) do
-    # GIVEN: formats the multi-line summary string
     dollars = div(at, 100)
     cents = rem(at, 100)
     amount_str = "$#{dollars}.#{String.pad_leading(Integer.to_string(cents), 2, "0")}"
@@ -272,6 +254,24 @@ defmodule PaymentsCli.Report do
   end
 end
 ```
+
+**Why this works:**
+
+- `summary/1` is a two-step pipeline: compute stats, then format. Each step is a
+  named private function, making the pipeline self-documenting.
+
+- `merchant_report/2` chains `Analytics.top_merchants/2` (which returns `[{name, total}]`),
+  maps each to a formatted line, prepends the header using `then/2`, and joins with
+  newlines. `then/2` is used because the transformation (prepending a header) does not
+  fit the pipe pattern — the header is not an argument to a function that takes the
+  list first.
+
+- `to_csv_report/1` filters, sorts, maps to CSV lines, and joins. The header is
+  concatenated separately because it is not derived from the transaction data.
+
+- `daily_report/1` computes daily totals, sorts by date, adds trend indicators (percent
+  change from prior day), formats each line, and joins. The `add_trend_indicators/1`
+  helper tracks the previous day's total to compute percent change.
 
 ### Given tests — must pass without modification
 

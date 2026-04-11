@@ -20,8 +20,8 @@ api_gateway/
 │   └── api_gateway/
 │       ├── metrics/
 │       │   ├── store.ex            # already exists — ETS-backed metric collector
-│       │   ├── analyzer.ex         # ← you implement this
-│       │   └── anomaly_detector.ex # ← and this
+│       │   ├── analyzer.ex         # statistical analysis with Nx
+│       │   └── anomaly_detector.ex # flags anomalous services
 ├── test/
 │   └── api_gateway/
 │       └── metrics_analyzer_test.exs # given tests — must pass without modification
@@ -91,8 +91,6 @@ end
 
 ### Step 2: `lib/api_gateway/metrics/analyzer.ex`
 
-`# TODO` marks what you implement. Do not change the function signatures.
-
 ```elixir
 defmodule ApiGateway.Metrics.Analyzer do
   @moduledoc """
@@ -114,10 +112,10 @@ defmodule ApiGateway.Metrics.Analyzer do
   """
   @spec stats(list(float())) :: {float(), float()}
   def stats(samples) when is_list(samples) and length(samples) > 0 do
-    # TODO: convert samples to an Nx tensor with type :f32
-    # TODO: compute mean and std_dev using Nx.mean/1 and Nx.standard_deviation/1
-    # TODO: convert results back to floats with Nx.to_number/1
-    # TODO: return {mean, std_dev}
+    tensor = Nx.tensor(samples, type: :f32)
+    mean = tensor |> Nx.mean() |> Nx.to_number()
+    std_dev = tensor |> Nx.standard_deviation() |> Nx.to_number()
+    {mean, std_dev}
   end
 
   @doc """
@@ -126,13 +124,26 @@ defmodule ApiGateway.Metrics.Analyzer do
   """
   @spec anomaly_indices(list(float()), float()) :: list(non_neg_integer())
   def anomaly_indices(samples, threshold \\ 3.0) when is_list(samples) do
-    # TODO: compute stats/1 to get mean and std_dev
-    # TODO: build tensor from samples
-    # TODO: compute z_scores = |sample - mean| / std_dev for each element
-    # TODO: find indices where z_score > threshold
-    # HINT: Nx.abs(Nx.subtract(t, mean)) |> Nx.divide(std_dev)
-    # HINT: Nx.greater(z_scores, threshold) gives a boolean tensor
-    # HINT: Nx.to_flat_list/1 to get back a list of 0/1; filter with indices
+    {mean, std_dev} = stats(samples)
+
+    if std_dev == 0.0 do
+      []
+    else
+      tensor = Nx.tensor(samples, type: :f32)
+
+      z_scores =
+        tensor
+        |> Nx.subtract(mean)
+        |> Nx.abs()
+        |> Nx.divide(std_dev)
+
+      mask = Nx.greater(z_scores, threshold) |> Nx.to_flat_list()
+
+      mask
+      |> Enum.with_index()
+      |> Enum.filter(fn {flag, _idx} -> flag == 1 end)
+      |> Enum.map(fn {_, idx} -> idx end)
+    end
   end
 
   @doc """
@@ -143,12 +154,31 @@ defmodule ApiGateway.Metrics.Analyzer do
   """
   @spec linear_trend(list(float())) :: {float(), float()}
   def linear_trend(samples) when length(samples) >= 2 do
-    # TODO: build x = [0, 1, 2, ..., n-1] and y = samples as tensors
-    # TODO: compute slope: cov(x,y) / var(x)
-    #   cov(x,y) = mean(x*y) - mean(x)*mean(y)
-    #   var(x)   = mean(x^2) - mean(x)^2
-    # TODO: compute intercept: mean(y) - slope * mean(x)
-    # TODO: return {slope, intercept} as floats
+    n = length(samples)
+    x = Nx.tensor(Enum.to_list(0..(n - 1)), type: :f32)
+    y = Nx.tensor(samples, type: :f32)
+
+    mean_x = Nx.mean(x) |> Nx.to_number()
+    mean_y = Nx.mean(y) |> Nx.to_number()
+
+    # cov(x, y) = mean(x * y) - mean(x) * mean(y)
+    cov_xy =
+      Nx.multiply(x, y)
+      |> Nx.mean()
+      |> Nx.to_number()
+      |> Kernel.-(mean_x * mean_y)
+
+    # var(x) = mean(x^2) - mean(x)^2
+    var_x =
+      Nx.multiply(x, x)
+      |> Nx.mean()
+      |> Nx.to_number()
+      |> Kernel.-(mean_x * mean_x)
+
+    slope = if var_x == 0.0, do: 0.0, else: cov_xy / var_x
+    intercept = mean_y - slope * mean_x
+
+    {slope, intercept}
   end
 
   # ---------------------------------------------------------------------------
@@ -159,16 +189,36 @@ defmodule ApiGateway.Metrics.Analyzer do
   Compiled rolling z-score computation for a batch of sample windows.
   Each row in `windows` is a window of samples. Returns z-scores per element.
 
-  Shape: {batch, window_size} → {batch, window_size}
+  Shape: {batch, window_size} -> {batch, window_size}
   """
   defn rolling_zscore(windows) do
-    # TODO: compute per-row mean with axes: [1], keep_axes: true
-    # TODO: compute per-row std_dev with axes: [1], keep_axes: true
-    # TODO: return (windows - mean) / (std_dev + epsilon) where epsilon = 1.0e-7
-    # Broadcasting handles the shape mismatch automatically when keep_axes: true
+    mean = Nx.mean(windows, axes: [1], keep_axes: true)
+    std_dev = Nx.standard_deviation(windows, axes: [1], keep_axes: true)
+    epsilon = 1.0e-7
+
+    (windows - mean) / (std_dev + epsilon)
   end
 end
 ```
+
+The `stats/1` function converts a plain Elixir list to an `:f32` tensor, computes
+mean and standard deviation with single Nx calls, and converts back to floats.
+The Nx boundary is fully encapsulated — callers never see tensors.
+
+`anomaly_indices/2` computes a z-score for each sample: `|sample - mean| / std_dev`.
+The result is a boolean mask tensor where `1` means the z-score exceeds the threshold.
+`Nx.to_flat_list/1` converts the mask back to Elixir, and `Enum.with_index` filters
+for the anomalous indices. When `std_dev` is zero (all samples identical), no anomalies
+are possible, so it short-circuits to an empty list.
+
+`linear_trend/1` implements ordinary least squares regression in closed form.
+The slope formula `cov(x,y) / var(x)` avoids matrix inversion and works correctly
+for the 1D case. The x-axis is simply `[0, 1, 2, ..., n-1]` — the sample index.
+
+`rolling_zscore/1` is the `defn` hot path. It operates on a 2D tensor where each row
+is a window of samples. Per-row mean and standard deviation use `axes: [1]` with
+`keep_axes: true` so broadcasting works automatically. The epsilon prevents division
+by zero when all values in a window are identical.
 
 ### Step 3: `lib/api_gateway/metrics/anomaly_detector.ex`
 
@@ -203,13 +253,33 @@ defmodule ApiGateway.Metrics.AnomalyDetector do
   defp analyze_service(_name, samples) when length(samples) < @min_samples, do: nil
 
   defp analyze_service(name, samples) do
-    # TODO: call Analyzer.anomaly_indices/2 with @threshold_stddev
-    # TODO: if no anomalies, return nil
-    # TODO: compute p99: sort samples, take the element at the 99th percentile index
-    # TODO: return %{service: name, anomalies: length(indices), p99: p99_value}
+    indices = Analyzer.anomaly_indices(samples, @threshold_stddev)
+
+    if indices == [] do
+      nil
+    else
+      sorted = Enum.sort(samples)
+      p99_index = trunc(length(sorted) * 0.99)
+      p99_value = Enum.at(sorted, min(p99_index, length(sorted) - 1))
+
+      %{
+        service: name,
+        anomalies: length(indices),
+        p99: p99_value
+      }
+    end
   end
 end
 ```
+
+The `detect_anomalies/0` function iterates over all services, retrieves their recent
+samples, and runs the anomaly analysis. Services with fewer than 10 samples are
+skipped — statistical analysis on tiny samples produces unreliable results.
+
+For each qualifying service, it computes the p99 latency by sorting the samples and
+taking the value at the 99th percentile index. The result includes the service name,
+the count of anomalous samples, and the p99 value — enough for the ops team to
+prioritize investigation.
 
 ### Step 4: Given tests — must pass without modification
 

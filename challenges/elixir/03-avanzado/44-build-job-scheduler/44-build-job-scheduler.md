@@ -20,10 +20,10 @@ api_gateway/
 │   └── api_gateway/
 │       ├── application.ex              # already exists — supervises Scheduler
 │       └── scheduler/
-│           ├── server.ex               # ← you implement this
-│           ├── job.ex                  # ← and this
-│           ├── cron_parser.ex          # ← and this
-│           └── backoff.ex              # ← and this
+│           ├── server.ex               # scheduler GenServer
+│           ├── job.ex                  # job and execution structs
+│           ├── cron_parser.ex          # cron expression parser
+│           └── backoff.ex              # exponential backoff with jitter
 ├── test/
 │   └── api_gateway/
 │       └── scheduler/
@@ -50,7 +50,7 @@ concurrently, and expose a history of recent executions for debugging.
 ## Why build this instead of using Quantum
 
 Quantum is production-grade but pulls in 6 transitive dependencies and runs a Postgres
-or ETS-backed persistence layer. For an embedded scheduler that runs 3–5 tasks, the overhead
+or ETS-backed persistence layer. For an embedded scheduler that runs 3-5 tasks, the overhead
 is unjustified. Building it yourself also means you understand exactly what happens when a
 job crashes, times out, or runs long.
 
@@ -67,10 +67,10 @@ backoff spreads retries out geometrically. Jitter (randomized delay) prevents mu
 independent job instances from synchronizing their retry times — the thundering herd problem.
 
 ```
-Attempt 1: fails → wait 1s + jitter(250ms) = ~1.2s
-Attempt 2: fails → wait 2s + jitter(500ms) = ~2.4s
-Attempt 3: fails → wait 4s + jitter(1000ms) = ~4.7s
-Attempt 4: fails → dead letter queue
+Attempt 1: fails -> wait 1s + jitter(250ms) = ~1.2s
+Attempt 2: fails -> wait 2s + jitter(500ms) = ~2.4s
+Attempt 3: fails -> wait 4s + jitter(1000ms) = ~4.7s
+Attempt 4: fails -> dead letter queue
 ```
 
 ---
@@ -107,6 +107,9 @@ end
 
 ### Step 2: `lib/api_gateway/scheduler/backoff.ex`
 
+Exponential backoff caps delay at a maximum to prevent unbounded wait times.
+Jitter adds randomized noise to prevent synchronized retry storms.
+
 ```elixir
 defmodule ApiGateway.Scheduler.Backoff do
   @base_ms 1_000
@@ -122,8 +125,8 @@ defmodule ApiGateway.Scheduler.Backoff do
   """
   @spec delay_for(pos_integer()) :: pos_integer()
   def delay_for(attempt) do
-    # TODO: @base_ms * 2^(attempt-1), capped at @max_ms
-    # HINT: :math.pow/2 returns a float; use round/1
+    delay = round(@base_ms * :math.pow(2, attempt - 1))
+    min(delay, @max_ms)
   end
 
   @doc """
@@ -132,12 +135,16 @@ defmodule ApiGateway.Scheduler.Backoff do
   """
   @spec with_jitter(pos_integer()) :: pos_integer()
   def with_jitter(delay_ms) do
-    # TODO: add :rand.uniform(div(delay_ms, 4)) to delay_ms
+    jitter = :rand.uniform(max(1, div(delay_ms, 4)))
+    delay_ms + jitter
   end
 end
 ```
 
 ### Step 3: `lib/api_gateway/scheduler/cron_parser.ex`
+
+Parses standard 5-field cron expressions and calculates the next firing time.
+The parser supports `*`, `*/n`, exact values, ranges (`a-b`), and lists (`a,b,c`).
 
 ```elixir
 defmodule ApiGateway.Scheduler.CronParser do
@@ -190,12 +197,10 @@ defmodule ApiGateway.Scheduler.CronParser do
   @spec next_run_in_ms(t()) :: pos_integer()
   def next_run_in_ms(%__MODULE__{} = parsed) do
     now  = DateTime.utc_now()
-    next = find_next(parsed, DateTime.add(now, 60, :second))
+    # Start searching from the next full minute
+    next = find_next(parsed, DateTime.add(now, 60, :second) |> truncate_to_minute())
     DateTime.diff(next, now, :millisecond)
   end
-
-  # TODO: implement parse_field/1 for *, */n, n, a-b, a,b,c
-  # HINT: String.contains?/2, String.split/2, String.to_integer/1
 
   defp parse_field("*"), do: :any
   defp parse_field("*/" <> n), do: {:every, String.to_integer(n)}
@@ -212,11 +217,33 @@ defmodule ApiGateway.Scheduler.CronParser do
     end
   end
 
-  # TODO: implement find_next/2 — advance minute-by-minute from `from` until
-  # a DateTime matches all fields. Cap search at 1 year to avoid infinite loops.
-  defp find_next(parsed, from) do
-    # HINT: check if from matches all fields via field_matches?/2
-    # HINT: if not, recurse with DateTime.add(from, 60, :second)
+  # Advance minute-by-minute from `from` until a DateTime matches all fields.
+  # Cap search at 1 year (525_600 minutes) to avoid infinite loops on impossible expressions.
+  defp find_next(parsed, from, iterations \\ 0)
+
+  defp find_next(_parsed, from, iterations) when iterations > 525_600 do
+    # Safety valve — if no match in a year, return the current candidate
+    from
+  end
+
+  defp find_next(parsed, from, iterations) do
+    if matches_all?(parsed, from) do
+      from
+    else
+      find_next(parsed, DateTime.add(from, 60, :second), iterations + 1)
+    end
+  end
+
+  defp matches_all?(parsed, dt) do
+    # Date.day_of_week/1 returns 1 (Monday) through 7 (Sunday).
+    # Cron convention: 0 = Sunday, 1 = Monday, ..., 6 = Saturday, 7 = Sunday.
+    dow = Date.day_of_week(dt) |> rem(7)
+
+    field_matches?(parsed.minute, dt.minute) and
+      field_matches?(parsed.hour, dt.hour) and
+      field_matches?(parsed.day, dt.day) and
+      field_matches?(parsed.month, dt.month) and
+      field_matches?(parsed.weekday, dow)
   end
 
   defp field_matches?(:any, _value), do: true
@@ -224,10 +251,17 @@ defmodule ApiGateway.Scheduler.CronParser do
   defp field_matches?({:range, a, b}, value), do: value >= a and value <= b
   defp field_matches?({:list, vals}, value), do: value in vals
   defp field_matches?(exact, value), do: exact == value
+
+  defp truncate_to_minute(dt) do
+    %{dt | second: 0, microsecond: {0, 0}}
+  end
 end
 ```
 
 ### Step 4: `lib/api_gateway/scheduler/server.ex`
+
+The scheduler GenServer manages job registration, timer-based scheduling, and delegates
+execution to a `Task.Supervisor` for isolation. Failed jobs retry with exponential backoff.
 
 ```elixir
 defmodule ApiGateway.Scheduler.Server do
@@ -296,6 +330,7 @@ defmodule ApiGateway.Scheduler.Server do
       timers:         %{},    # job_id => timer_ref
       history:        %{},    # job_id => [%Execution{}, ...]
       running:        MapSet.new(),
+      task_refs:      %{},    # ref => {job_id, attempt}
       max_concurrent: max_concurrent,
       task_supervisor: task_sup
     }
@@ -304,7 +339,7 @@ defmodule ApiGateway.Scheduler.Server do
   end
 
   # ---------------------------------------------------------------------------
-  # Callbacks — implement handle_call and handle_info
+  # Callbacks
   # ---------------------------------------------------------------------------
 
   @impl true
@@ -325,11 +360,93 @@ defmodule ApiGateway.Scheduler.Server do
       timeout_ms:  Keyword.get(opts, :timeout_ms, 30_000)
     }
 
-    # TODO: calculate next interval, create timer with Process.send_after/3
-    # HINT: for {:every, ms} use ms directly
-    # HINT: for {:cron, expr} use CronParser.parse(expr) |> CronParser.next_run_in_ms()
+    # Calculate the first interval and schedule
+    interval_ms = case schedule_type do
+      {:every, ms}  -> ms
+      {:cron, expr} -> CronParser.parse(expr) |> CronParser.next_run_in_ms()
+    end
+
+    timer_ref = Process.send_after(self(), {:run_job, job_id}, interval_ms)
+
+    state = state
+    |> put_in([:jobs, job_id], job)
+    |> put_in([:timers, job_id], timer_ref)
+    |> put_in([:history, job_id], [])
 
     {:reply, job_id, state}
+  end
+
+  @impl true
+  def handle_call({:cancel, job_id}, _from, state) do
+    case state.jobs[job_id] do
+      nil ->
+        {:reply, {:error, :not_found}, state}
+
+      _job ->
+        # Cancel the pending timer
+        if timer = state.timers[job_id] do
+          Process.cancel_timer(timer)
+        end
+
+        state = state
+        |> update_in([:jobs], &Map.delete(&1, job_id))
+        |> update_in([:timers], &Map.delete(&1, job_id))
+
+        {:reply, :ok, state}
+    end
+  end
+
+  @impl true
+  def handle_call({:run_now, job_id}, _from, state) do
+    case state.jobs[job_id] do
+      nil ->
+        {:reply, {:error, :not_found}, state}
+
+      _job ->
+        # Cancel the existing timer to avoid double-execution
+        if timer = state.timers[job_id] do
+          Process.cancel_timer(timer)
+        end
+
+        # Send the run message immediately
+        send(self(), {:run_job, job_id})
+        {:reply, :ok, state}
+    end
+  end
+
+  @impl true
+  def handle_call({:set_enabled, job_id, enabled}, _from, state) do
+    case state.jobs[job_id] do
+      nil ->
+        {:reply, :ok, state}
+
+      job ->
+        updated_job = %{job | enabled: enabled}
+        state = put_in(state.jobs[job_id], updated_job)
+
+        # If resuming, reschedule the next run
+        state =
+          if enabled do
+            schedule_next(updated_job, state)
+          else
+            state
+          end
+
+        {:reply, :ok, state}
+    end
+  end
+
+  @impl true
+  def handle_call(:list_jobs, _from, state) do
+    jobs = Enum.map(state.jobs, fn {_id, job} ->
+      %{id: job.id, name: job.name, enabled: job.enabled, schedule: job.schedule}
+    end)
+    {:reply, jobs, state}
+  end
+
+  @impl true
+  def handle_call({:history, job_id}, _from, state) do
+    {:reply, Map.get(state.history, job_id, []), state}
   end
 
   @impl true
@@ -338,17 +455,26 @@ defmodule ApiGateway.Scheduler.Server do
 
     if job && job.enabled do
       if MapSet.size(state.running) >= state.max_concurrent do
-        # Skip this execution — log the skip
         require Logger
-        Logger.warning("[Scheduler] Skipping #{job.name} — max concurrent reached")
+        Logger.warning("[Scheduler] Skipping #{job.name} -- max concurrent reached")
         state = schedule_next(job, state)
         {:noreply, state}
       else
-        # TODO:
-        # 1. Mark job as running (add to state.running)
-        # 2. Execute via Task.Supervisor.async_nolink/2
-        # 3. Reschedule the next run
-        # 4. Return {:noreply, state}
+        # Execute the job in an isolated task
+        started_at = DateTime.utc_now()
+
+        task = Task.Supervisor.async_nolink(state.task_supervisor, fn ->
+          job.fun.()
+        end)
+
+        # Track the task reference to the job
+        state = state
+        |> update_in([:running], &MapSet.put(&1, job_id))
+        |> put_in([:task_refs, task.ref], {job_id, 1, started_at})
+
+        # Reschedule the next run
+        state = schedule_next(job, state)
+
         {:noreply, state}
       end
     else
@@ -359,19 +485,115 @@ defmodule ApiGateway.Scheduler.Server do
   @impl true
   def handle_info({ref, result}, state) when is_reference(ref) do
     # Task completed successfully — result is the return value of fun.()
-    # TODO: record execution in history, remove from running set
     Process.demonitor(ref, [:flush])
-    {:noreply, state}
+
+    case Map.pop(state.task_refs, ref) do
+      {{job_id, attempt, started_at}, task_refs} ->
+        finished_at = DateTime.utc_now()
+        duration_ms = DateTime.diff(finished_at, started_at, :millisecond)
+
+        execution = %Execution{
+          job_id: job_id,
+          started_at: started_at,
+          finished_at: finished_at,
+          duration_ms: duration_ms,
+          result: :ok,
+          attempt: attempt
+        }
+
+        state = state
+        |> Map.put(:task_refs, task_refs)
+        |> record_execution(job_id, execution)
+        |> update_in([:running], &MapSet.delete(&1, job_id))
+
+        {:noreply, state}
+
+      {nil, _} ->
+        {:noreply, state}
+    end
   end
 
   @impl true
   def handle_info({:DOWN, ref, :process, _pid, reason}, state) when reason != :normal do
     # Task crashed — implement retry with backoff
-    # TODO: find which job this task belonged to (hint: store ref -> job_id mapping)
-    # TODO: if attempts < max_retries, schedule retry with Backoff.delay_for + with_jitter
-    # TODO: otherwise, record as failed in history
     Process.demonitor(ref, [:flush])
+
+    case Map.pop(state.task_refs, ref) do
+      {{job_id, attempt, started_at}, task_refs} ->
+        state = Map.put(state, :task_refs, task_refs)
+        job = state.jobs[job_id]
+
+        if job && attempt < job.max_retries do
+          # Schedule a retry with exponential backoff + jitter
+          delay = Backoff.delay_for(attempt) |> Backoff.with_jitter()
+
+          retry_task_fn = fn ->
+            new_started_at = DateTime.utc_now()
+
+            task = Task.Supervisor.async_nolink(state.task_supervisor, fn ->
+              job.fun.()
+            end)
+
+            # We need to send ourselves a message to update state since we can't
+            # modify state from inside Process.send_after callback
+            {task, new_started_at}
+          end
+
+          # Schedule retry: send a message to ourselves after the backoff delay
+          Process.send_after(self(), {:retry_job, job_id, attempt + 1}, delay)
+
+          state = update_in(state.running, &MapSet.delete(&1, job_id))
+          {:noreply, state}
+        else
+          # Max retries exhausted — record as failed
+          finished_at = DateTime.utc_now()
+          duration_ms = DateTime.diff(finished_at, started_at, :millisecond)
+
+          execution = %Execution{
+            job_id: job_id,
+            started_at: started_at,
+            finished_at: finished_at,
+            duration_ms: duration_ms,
+            result: {:error, reason},
+            attempt: attempt
+          }
+
+          state = state
+          |> record_execution(job_id, execution)
+          |> update_in([:running], &MapSet.delete(&1, job_id))
+
+          {:noreply, state}
+        end
+
+      {nil, _} ->
+        {:noreply, state}
+    end
+  end
+
+  # Handle :DOWN for normal exits (task finished normally but we already handled via {ref, result})
+  def handle_info({:DOWN, _ref, :process, _pid, :normal}, state) do
     {:noreply, state}
+  end
+
+  @impl true
+  def handle_info({:retry_job, job_id, attempt}, state) do
+    job = state.jobs[job_id]
+
+    if job && job.enabled do
+      started_at = DateTime.utc_now()
+
+      task = Task.Supervisor.async_nolink(state.task_supervisor, fn ->
+        job.fun.()
+      end)
+
+      state = state
+      |> update_in([:running], &MapSet.put(&1, job_id))
+      |> put_in([:task_refs, task.ref], {job_id, attempt, started_at})
+
+      {:noreply, state}
+    else
+      {:noreply, state}
+    end
   end
 
   # ---------------------------------------------------------------------------

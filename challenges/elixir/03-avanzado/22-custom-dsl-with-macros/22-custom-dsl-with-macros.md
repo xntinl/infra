@@ -30,9 +30,9 @@ api_gateway/
 │       ├── middleware/
 │       │   ├── pipeline.ex
 │       │   ├── instrumentation.ex
-│       │   └── dsl.ex              # ← you implement this
+│       │   └── dsl.ex
 │       ├── validation/
-│       │   └── dsl.ex              # ← and this
+│       │   └── dsl.ex
 │       └── dev/
 │           └── ast_tools.ex
 ├── test/
@@ -125,6 +125,11 @@ defmodule ApiGateway.Middleware.DSL do
 
   Generates:
     AdminRoute.pipeline/0  → [{Auth, [realm: "admin"]}, {RateLimit, [max: 10]}, {Instrumentation, []}]
+
+  The __using__/1 macro sets up the accumulator and before_compile hook.
+  Each `plug` call appends to the LIFO @plugs accumulator.
+  The __before_compile__/1 macro reads all accumulated plugs, reverses them
+  to restore declaration order, and generates the pipeline/0 function.
   """
 
   defmacro __using__(_opts) do
@@ -151,9 +156,15 @@ defmodule ApiGateway.Middleware.DSL do
       |> Module.get_attribute(:plugs)
       |> Enum.reverse()
 
-    # HINT: use Macro.escape/1 to embed the list as a literal value in the generated function
-    # HINT: generate:  def pipeline(), do: <escaped_plugs>
-    # TODO: implement the generated pipeline/0 function
+    escaped = Macro.escape(plugs)
+
+    quote do
+      @doc """
+      Returns the middleware pipeline in declaration order.
+      Each element is a {module, opts} tuple.
+      """
+      def pipeline, do: unquote(escaped)
+    end
   end
 end
 ```
@@ -180,6 +191,10 @@ defmodule ApiGateway.Validation.DSL do
 
     CreateUser.validate(%{})
     # => {:error, [:username, :role]}   ← missing required fields
+
+  The generated validate/1 delegates to the runtime helper run_validate/2 with
+  the compile-time field spec embedded as a literal. This keeps the macro simple
+  while allowing the validation logic to be tested as a regular function.
   """
 
   @supported_types [:string, :integer, :float, :atom, :boolean]
@@ -211,27 +226,25 @@ defmodule ApiGateway.Validation.DSL do
       |> Module.get_attribute(:fields)
       |> Enum.reverse()
 
-    # Each field is {name, type, opts}
-    # Generate validate/1 that:
-    #   1. Iterates fields in declaration order
-    #   2. For each field, looks up the string key (Atom.to_string(name)) in the input map
-    #   3. If present: coerce via coerce/2 helper (see below)
-    #   4. If absent and required: add to missing list
-    #   5. If absent and has :default: use the default value
-    #   6. If absent and not required and no default: skip (field absent from result)
-    #   7. Return {:ok, result_map} or {:error, missing_fields_list}
-    #
-    # HINT: You can generate the validate/1 body as a quoted expression that pattern-matches
-    #       over the compile-time-known field list, OR generate a series of clauses.
-    #       The simplest approach: generate one validate/1 that calls a runtime helper
-    #       with the compile-time field spec embedded as a literal.
-    #
-    # HINT: use Macro.escape(fields) to embed the field list as data in the generated function
-    #
-    # TODO: implement the generated validate/1 function
+    escaped_fields = Macro.escape(fields)
 
-    # HINT: Also generate a fields/0 introspection function returning the field spec list
-    # TODO: implement fields/0
+    quote do
+      @doc """
+      Validates and coerces a map of params against the declared field spec.
+      Accepts both string and atom keys. Returns {:ok, map} or {:error, missing_fields}.
+      """
+      def validate(params) do
+        ApiGateway.Validation.DSL.run_validate(params, unquote(escaped_fields))
+      end
+
+      @doc """
+      Returns the field spec list in declaration order.
+      Each element is {name, type, opts}.
+      """
+      def fields do
+        unquote(escaped_fields)
+      end
+    end
   end
 
   @doc false
@@ -269,12 +282,41 @@ defmodule ApiGateway.Validation.DSL do
   def coerce(_value, type), do: {:error, {:bad_type, type}}
 
   @doc false
-  # Runtime validate helper — called by generated validate/1 with the field spec
+  # Runtime validate helper — called by generated validate/1 with the field spec.
+  #
+  # Iterates over the compile-time field list, looking up each field by both
+  # its atom and string key forms. Applies coercion, default values, and
+  # required-field checking in a single pass using Enum.reduce.
   def run_validate(params, fields) do
-    # HINT: use Enum.reduce over fields, accumulating {result_map, missing_list}
-    # HINT: String key lookup: Map.get(params, Atom.to_string(name)) || Map.get(params, name)
-    # HINT: on coerce error, treat as bad input — add to missing list or return error
-    # TODO: implement
+    {result_map, missing} =
+      Enum.reduce(fields, {%{}, []}, fn {name, type, opts}, {result, missing_acc} ->
+        string_key = Atom.to_string(name)
+        raw_value = Map.get(params, string_key) || Map.get(params, name)
+        required? = Keyword.get(opts, :required, false)
+        default = Keyword.get(opts, :default, :__no_default__)
+
+        cond do
+          not is_nil(raw_value) ->
+            case coerce(raw_value, type) do
+              {:ok, coerced} -> {Map.put(result, name, coerced), missing_acc}
+              {:error, _reason} -> {result, [name | missing_acc]}
+            end
+
+          default != :__no_default__ ->
+            {Map.put(result, name, default), missing_acc}
+
+          required? ->
+            {result, [name | missing_acc]}
+
+          true ->
+            {result, missing_acc}
+        end
+      end)
+
+    case missing do
+      [] -> {:ok, result_map}
+      _ -> {:error, Enum.reverse(missing)}
+    end
   end
 end
 ```

@@ -74,9 +74,9 @@ releases or separate repositories with minimal changes to the code.
 ## Dependency graph — unidirectional
 
 ```
-gateway_api     ──depends on──▶ gateway_core
-gateway_workers ──depends on──▶ gateway_core
-                                      ▲
+gateway_api     ──depends on──> gateway_core
+gateway_workers ──depends on──> gateway_core
+                                      ^
                   (NO reverse dependency — core never imports from api or workers)
 ```
 
@@ -184,7 +184,7 @@ defmodule GatewayApi.MixProject do
     [
       {:phoenix, "~> 1.7"},
       {:phoenix_live_view, "~> 0.20"},
-      {:gateway_core, in_umbrella: true}   # ← intra-umbrella dep
+      {:gateway_core, in_umbrella: true}   # intra-umbrella dep
     ]
   end
 end
@@ -212,7 +212,7 @@ defmodule GatewayWorkers.MixProject do
 
   defp deps do
     [
-      {:gateway_core, in_umbrella: true}   # ← intra-umbrella dep
+      {:gateway_core, in_umbrella: true}   # intra-umbrella dep
     ]
   end
 end
@@ -370,12 +370,22 @@ The workers from exercise 46 move here unchanged. Their only dependency is `gate
 defmodule GatewayWorkers.Workers.AuditWorker do
   use Oban.Worker, queue: :audit, max_attempts: 3
 
-  # Imports from gateway_core — allowed by the dependency graph
   alias GatewayCore.Audit
 
   @impl Oban.Worker
   def perform(%Oban.Job{args: %{"event" => event, "client_id" => client_id} = args}) do
-    # TODO: delegate to GatewayCore.Audit.record/2
+    metadata = Map.get(args, "metadata", %{})
+
+    case Audit.record(event, client_id, metadata) do
+      :ok ->
+        :ok
+
+      {:error, :unknown_event} ->
+        {:cancel, "unknown event type: #{event}"}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
   end
 end
 ```

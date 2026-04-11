@@ -21,7 +21,7 @@ task_queue/
 │   └── task_queue/
 │       ├── worker_process.ex    # previous exercise
 │       ├── accumulator.ex       # previous exercise
-│       └── task_registry.ex     # ← you implement this
+│       └── task_registry.ex
 ├── test/
 │   └── task_queue/
 │       └── task_registry_test.exs   # given tests — must pass without modification
@@ -85,25 +85,29 @@ defmodule TaskQueue.TaskRegistry do
   """
   @spec start_link(map()) :: Agent.on_start()
   def start_link(initial \\ %{}) do
-    # HINT: Agent.start_link(fn -> initial end, name: __MODULE__)
-    # TODO: implement
+    Agent.start_link(fn -> initial end, name: __MODULE__)
   end
 
   @doc "Registers a new task with :pending status."
   @spec register(task_id()) :: :ok
   def register(task_id) do
     entry = %{status: :pending, updated_at: now()}
-    # HINT: Agent.update(__MODULE__, fn state -> Map.put(state, task_id, entry) end)
-    # TODO: implement
+    Agent.update(__MODULE__, fn state -> Map.put(state, task_id, entry) end)
   end
 
   @doc "Transitions a task to a new status. Returns {:error, :not_found} if unknown."
   @spec transition(task_id(), status()) :: :ok | {:error, :not_found}
   def transition(task_id, new_status) do
-    # HINT: Agent.get_and_update — read current state, check if task_id exists,
-    #   if yes: update the entry and return {:ok, new_state}
-    #   if no:  return {{:error, :not_found}, state} (state unchanged)
-    # TODO: implement
+    Agent.get_and_update(__MODULE__, fn state ->
+      case Map.get(state, task_id) do
+        nil ->
+          {{:error, :not_found}, state}
+
+        entry ->
+          updated_entry = %{entry | status: new_status, updated_at: now()}
+          {:ok, Map.put(state, task_id, updated_entry)}
+      end
+    end)
   end
 
   @doc "Returns the current entry for a task, or nil if not registered."
@@ -115,8 +119,11 @@ defmodule TaskQueue.TaskRegistry do
   @doc "Returns all task IDs currently in the given status."
   @spec by_status(status()) :: [task_id()]
   def by_status(status) do
-    # HINT: Agent.get — filter Map.keys by entry.status == status
-    # TODO: implement
+    Agent.get(__MODULE__, fn state ->
+      state
+      |> Enum.filter(fn {_id, entry} -> entry.status == status end)
+      |> Enum.map(fn {id, _entry} -> id end)
+    end)
   end
 
   @doc """
@@ -126,24 +133,29 @@ defmodule TaskQueue.TaskRegistry do
   @spec stale_running(pos_integer()) :: [task_id()]
   def stale_running(threshold_ms) do
     cutoff = now() - threshold_ms
-    # HINT: Agent.get — filter tasks where status == :running and updated_at < cutoff
-    # TODO: implement
+
+    Agent.get(__MODULE__, fn state ->
+      state
+      |> Enum.filter(fn {_id, entry} ->
+        entry.status == :running and entry.updated_at < cutoff
+      end)
+      |> Enum.map(fn {id, _entry} -> id end)
+    end)
   end
 
   @doc "Removes a task entry. Returns :ok regardless of whether the task existed."
   @spec remove(task_id()) :: :ok
   def remove(task_id) do
-    # HINT: Agent.update — Map.delete
-    # TODO: implement
+    Agent.update(__MODULE__, fn state -> Map.delete(state, task_id) end)
   end
 
   @doc "Returns the count of tasks in each status as a map."
   @spec stats() :: %{status() => non_neg_integer()}
   def stats do
     Agent.get(__MODULE__, fn state ->
-      # HINT: Enum.reduce over state, accumulating counts per status
-      # Start with %{pending: 0, running: 0, done: 0, failed: 0}
-      # TODO: implement
+      Enum.reduce(state, %{pending: 0, running: 0, done: 0, failed: 0}, fn {_id, entry}, acc ->
+        Map.update(acc, entry.status, 1, &(&1 + 1))
+      end)
     end)
   end
 
@@ -154,6 +166,17 @@ defmodule TaskQueue.TaskRegistry do
   defp now, do: System.monotonic_time(:millisecond)
 end
 ```
+
+The `transition/2` function uses `Agent.get_and_update/2` — a single atomic operation
+that reads the current state, checks whether the task exists, and either updates it or
+returns an error. This is critical: if you separated this into a `get` followed by an
+`update`, another process could modify the state between the two calls, leading to
+a race condition where you overwrite their changes.
+
+The `stats/0` function uses `Enum.reduce` to count tasks by status in a single pass
+through the state map. Starting with the default map `%{pending: 0, running: 0, done: 0,
+failed: 0}` ensures that all statuses appear in the result even when no tasks have that
+status.
 
 ### Step 2: Given tests — must pass without modification
 

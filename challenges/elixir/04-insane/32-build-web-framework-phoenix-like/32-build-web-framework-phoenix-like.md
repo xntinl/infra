@@ -111,7 +111,30 @@ defp deps do
 end
 ```
 
-### Step 3: `lib/nova/transport/http_parser.ex`
+### Step 3: `lib/nova/conn.ex`
+
+```elixir
+defmodule Nova.Conn do
+  @moduledoc "Request/response struct — the 'conn' flowing through the pipeline."
+
+  defstruct [
+    :method, :path, :query, :version, :headers, :body,
+    :path_segments, :params,
+    status: 200,
+    resp_headers: [],
+    resp_body: "",
+    halted: false
+  ]
+
+  @type t :: %__MODULE__{}
+
+  def send_resp(%__MODULE__{} = conn, status, body) do
+    %{conn | status: status, resp_body: body}
+  end
+end
+```
+
+### Step 4: `lib/nova/transport/http_parser.ex`
 
 ```elixir
 defmodule Nova.Transport.HttpParser do
@@ -124,7 +147,7 @@ defmodule Nova.Transport.HttpParser do
     CRLF
     message-body
 
-  The parser is a state machine: :request_line → :headers → :body → :done.
+  The parser is a state machine: :request_line -> :headers -> :body -> :done.
   This matters for keep-alive: after one request is fully parsed, the socket
   remains open and the next request begins from :request_line again.
   """
@@ -159,22 +182,46 @@ defmodule Nova.Transport.HttpParser do
   defp parse_request_line(data) do
     case :binary.split(data, @crlf) do
       [line, rest] ->
-        # TODO: parse "METHOD /path?query HTTP/1.1"
-        # HINT: String.split(line, " ") gives [method, target, version]
-        # HINT: URI.parse/1 splits path and query
-        {:error, :not_implemented}
+        case String.split(line, " ", parts: 3) do
+          [method, target, version] ->
+            {path, query} = split_target(target)
+            {:ok, {method, path, query, version}, rest}
+
+          _ ->
+            {:error, :invalid_request_line}
+        end
 
       [_incomplete] ->
         :incomplete
     end
   end
 
+  defp split_target(target) do
+    case String.split(target, "?", parts: 2) do
+      [path, query] -> {path, query}
+      [path] -> {path, nil}
+    end
+  end
+
   defp parse_headers(data) do
-    # TODO: split on "\r\n\r\n" to find header/body boundary
-    # TODO: parse each "Name: value\r\n" pair into a list of {name, value} tuples
-    # TODO: header names are case-insensitive — downcase them
-    # HINT: :binary.split(data, "\r\n\r\n") gives [headers_block, body_start]
-    {:error, :not_implemented}
+    case :binary.split(data, "\r\n\r\n") do
+      [headers_block, rest] ->
+        headers =
+          headers_block
+          |> String.split(@crlf)
+          |> Enum.reject(&(&1 == ""))
+          |> Enum.map(fn line ->
+            case String.split(line, ": ", parts: 2) do
+              [name, value] -> {String.downcase(name), value}
+              [name] -> {String.downcase(name), ""}
+            end
+          end)
+
+        {:ok, headers, rest}
+
+      [_incomplete] ->
+        :incomplete
+    end
   end
 
   defp parse_body(data, headers) do
@@ -183,16 +230,44 @@ defmodule Nova.Transport.HttpParser do
 
     cond do
       transfer_encoding == "chunked" ->
-        # TODO: parse chunked encoding: hex_size\r\ndata\r\n ... 0\r\n\r\n
-        {:error, :not_implemented}
+        parse_chunked_body(data, <<>>)
 
       content_length != nil ->
         len = String.to_integer(content_length)
-        # TODO: verify we have `len` bytes available; if not, return :incomplete
-        {:error, :not_implemented}
+
+        if byte_size(data) >= len do
+          <<body::binary-size(len), rest::binary>> = data
+          {:ok, body, rest}
+        else
+          :incomplete
+        end
 
       true ->
         {:ok, "", data}
+    end
+  end
+
+  defp parse_chunked_body(data, acc) do
+    case :binary.split(data, @crlf) do
+      [size_hex, rest] ->
+        chunk_size = String.to_integer(String.trim(size_hex), 16)
+
+        if chunk_size == 0 do
+          case :binary.split(rest, @crlf) do
+            [_, final_rest] -> {:ok, acc, final_rest}
+            _ -> {:ok, acc, rest}
+          end
+        else
+          if byte_size(rest) >= chunk_size + 2 do
+            <<chunk::binary-size(chunk_size), @crlf, remaining::binary>> = rest
+            parse_chunked_body(remaining, acc <> chunk)
+          else
+            :incomplete
+          end
+        end
+
+      [_] ->
+        :incomplete
     end
   end
 
@@ -205,7 +280,7 @@ defmodule Nova.Transport.HttpParser do
 end
 ```
 
-### Step 4: `lib/nova/router.ex`
+### Step 5: `lib/nova/router.ex`
 
 ```elixir
 defmodule Nova.Router do
@@ -225,20 +300,15 @@ defmodule Nova.Router do
       get "/", HomeController, :index
     end
 
-  At compile time, __before_compile__ generates:
-
-    def match("GET", ["api", "users"], conn), do: UserController.index(conn, %{})
-    def match("GET", ["api", "users", id], conn), do: UserController.show(conn, %{"id" => id})
-    def match(_, _, conn), do: send_resp(conn, 404, "Not Found")
-
-  The path is split into segments at compile time — matching is purely structural.
+  At compile time, __before_compile__ generates match/3 function clauses
+  with pattern matching for O(1) dispatch.
   """
 
   defmacro __using__(_) do
     quote do
       import Nova.Router
       Module.register_attribute(__MODULE__, :nova_routes, accumulate: true)
-      Module.register_attribute(__MODULE__, :nova_scope_prefix, [])
+      Module.put_attribute(__MODULE__, :nova_scope_prefix, "")
       @before_compile Nova.Router
     end
   end
@@ -246,16 +316,38 @@ defmodule Nova.Router do
   defmacro __before_compile__(env) do
     routes = Module.get_attribute(env.module, :nova_routes) |> Enum.reverse()
 
-    # Generate one match/3 clause per route
-    clauses = Enum.map(routes, fn {method, path, controller, action} ->
-      {segments, param_names} = compile_path(path)
-      # TODO: generate a function clause that:
-      #   1. pattern-matches on method and segments
-      #   2. extracts path params from the pattern
-      #   3. calls controller.action(conn, params)
-    end)
+    clauses =
+      Enum.map(routes, fn {method, path, controller, action} ->
+        segments = String.split(path, "/", trim: true)
 
-    # Catch-all 404 clause
+        {pattern_ast, param_bindings} =
+          Enum.map_reduce(segments, [], fn seg, acc ->
+            if String.starts_with?(seg, ":") do
+              param_name = String.trim_leading(seg, ":") |> String.to_atom()
+              var = Macro.var(param_name, nil)
+              {var, [{Atom.to_string(param_name), var} | acc]}
+            else
+              {seg, acc}
+            end
+          end)
+
+        params_map =
+          case param_bindings do
+            [] ->
+              quote do: %{}
+
+            bindings ->
+              pairs = Enum.map(bindings, fn {k, v} -> {k, v} end)
+              {:%{}, [], pairs}
+          end
+
+        quote do
+          def match(unquote(method), unquote(pattern_ast), conn) do
+            unquote(controller).unquote(action)(conn, unquote(params_map))
+          end
+        end
+      end)
+
     catch_all = quote do
       def match(_method, _path, conn) do
         Nova.Conn.send_resp(conn, 404, "Not Found")
@@ -270,39 +362,56 @@ defmodule Nova.Router do
 
   defmacro get(path, controller, action) do
     quote do
-      @nova_routes {"GET", Path.join(@nova_scope_prefix || "", unquote(path)), unquote(controller), unquote(action)}
+      prefix = Module.get_attribute(__MODULE__, :nova_scope_prefix) || ""
+      full_path = if prefix == "", do: unquote(path), else: prefix <> unquote(path)
+      @nova_routes {"GET", full_path, unquote(controller), unquote(action)}
     end
   end
 
   defmacro post(path, controller, action) do
     quote do
-      @nova_routes {"POST", Path.join(@nova_scope_prefix || "", unquote(path)), unquote(controller), unquote(action)}
+      prefix = Module.get_attribute(__MODULE__, :nova_scope_prefix) || ""
+      full_path = if prefix == "", do: unquote(path), else: prefix <> unquote(path)
+      @nova_routes {"POST", full_path, unquote(controller), unquote(action)}
     end
   end
 
-  # TODO: add put/2, delete/2, patch/2
+  defmacro put(path, controller, action) do
+    quote do
+      prefix = Module.get_attribute(__MODULE__, :nova_scope_prefix) || ""
+      full_path = if prefix == "", do: unquote(path), else: prefix <> unquote(path)
+      @nova_routes {"PUT", full_path, unquote(controller), unquote(action)}
+    end
+  end
+
+  defmacro delete(path, controller, action) do
+    quote do
+      prefix = Module.get_attribute(__MODULE__, :nova_scope_prefix) || ""
+      full_path = if prefix == "", do: unquote(path), else: prefix <> unquote(path)
+      @nova_routes {"DELETE", full_path, unquote(controller), unquote(action)}
+    end
+  end
+
+  defmacro patch(path, controller, action) do
+    quote do
+      prefix = Module.get_attribute(__MODULE__, :nova_scope_prefix) || ""
+      full_path = if prefix == "", do: unquote(path), else: prefix <> unquote(path)
+      @nova_routes {"PATCH", full_path, unquote(controller), unquote(action)}
+    end
+  end
 
   defmacro scope(prefix, do: block) do
     quote do
-      old_prefix = @nova_scope_prefix
-      @nova_scope_prefix unquote(prefix)
+      old_prefix = Module.get_attribute(__MODULE__, :nova_scope_prefix)
+      Module.put_attribute(__MODULE__, :nova_scope_prefix, unquote(prefix))
       unquote(block)
-      @nova_scope_prefix old_prefix
+      Module.put_attribute(__MODULE__, :nova_scope_prefix, old_prefix)
     end
-  end
-
-  defp compile_path(path) do
-    segments = String.split(path, "/", trim: true)
-    # TODO: for each segment:
-    #   - literal "users" → quoted string "users"
-    #   - param ":id" → a quoted variable `id` captured in params
-    # Return {pattern_segments, param_names}
-    {segments, []}
   end
 end
 ```
 
-### Step 5: `lib/nova/websocket/handshake.ex`
+### Step 6: `lib/nova/websocket/handshake.ex`
 
 ```elixir
 defmodule Nova.WebSocket.Handshake do
@@ -333,8 +442,12 @@ defmodule Nova.WebSocket.Handshake do
   """
   @spec upgrade_request?(Nova.Conn.t()) :: boolean()
   def upgrade_request?(conn) do
-    # TODO: check Upgrade: websocket and Connection: Upgrade headers (case-insensitive)
-    false
+    headers = conn.headers || []
+    upgrade = find_header(headers, "upgrade")
+    connection = find_header(headers, "connection")
+
+    upgrade != nil and String.downcase(upgrade) == "websocket" and
+      connection != nil and String.downcase(connection) =~ "upgrade"
   end
 
   @doc """
@@ -345,23 +458,28 @@ defmodule Nova.WebSocket.Handshake do
   def build_response(client_key) do
     accept = compute_accept(client_key)
 
-    # TODO: build the response string with correct CRLF line endings
-    # "HTTP/1.1 101 Switching Protocols\r\n" <>
-    # "Upgrade: websocket\r\n" <>
-    # "Connection: Upgrade\r\n" <>
-    # "Sec-WebSocket-Accept: #{accept}\r\n\r\n"
+    "HTTP/1.1 101 Switching Protocols\r\n" <>
+      "Upgrade: websocket\r\n" <>
+      "Connection: Upgrade\r\n" <>
+      "Sec-WebSocket-Accept: #{accept}\r\n\r\n"
   end
 
   @spec compute_accept(String.t()) :: String.t()
   def compute_accept(client_key) do
-    # TODO: SHA-1(client_key <> @magic_guid) then Base64 encode
-    # HINT: :crypto.hash(:sha, data) returns raw binary
-    # HINT: Base.encode64/1 encodes to base64 string
+    :crypto.hash(:sha, client_key <> @magic_guid)
+    |> Base.encode64()
+  end
+
+  defp find_header(headers, name) do
+    case List.keyfind(headers, name, 0) do
+      {_, value} -> value
+      nil -> nil
+    end
   end
 end
 ```
 
-### Step 6: `lib/nova/session.ex`
+### Step 7: `lib/nova/session.ex`
 
 ```elixir
 defmodule Nova.Session do
@@ -409,19 +527,26 @@ defmodule Nova.Session do
   end
 
   defp compute_mac(data, secret_key) do
-    # TODO: :crypto.mac(:hmac, :sha256, secret_key, data) |> Base.url_encode64(padding: false)
+    :crypto.mac(:hmac, :sha256, secret_key, data)
+    |> Base.url_encode64(padding: false)
   end
 
+  defp secure_compare(a, b) when byte_size(a) != byte_size(b), do: false
+
   defp secure_compare(a, b) do
-    # TODO: constant-time comparison to prevent timing attacks
-    # HINT: XOR every byte, OR all results; if the final OR is 0, they are equal
-    # NEVER use == for MAC comparison — it short-circuits on first mismatch
-    # revealing the comparison time and enabling timing attacks
+    a_bytes = :binary.bin_to_list(a)
+    b_bytes = :binary.bin_to_list(b)
+
+    result =
+      Enum.zip(a_bytes, b_bytes)
+      |> Enum.reduce(0, fn {x, y}, acc -> Bitwise.bor(acc, Bitwise.bxor(x, y)) end)
+
+    result == 0
   end
 end
 ```
 
-### Step 7: Given tests — must pass without modification
+### Step 8: Given tests — must pass without modification
 
 ```elixir
 # test/nova/http_parser_test.exs
@@ -518,13 +643,13 @@ defmodule Nova.WebSocketTest do
 end
 ```
 
-### Step 8: Run the tests
+### Step 9: Run the tests
 
 ```bash
 mix test test/nova/ --trace
 ```
 
-### Step 9: Router benchmark
+### Step 10: Router benchmark
 
 ```elixir
 # bench/router_bench.exs
@@ -547,7 +672,7 @@ Benchee.run(
 )
 ```
 
-Expected: dispatch with 100 routes should be under 1µs. If you see > 10µs, verify your `match/3` clauses are true pattern-match clauses — not a `cond` or `Enum.find` at runtime.
+Expected: dispatch with 100 routes should be under 1us. If you see > 10us, verify your `match/3` clauses are true pattern-match clauses — not a `cond` or `Enum.find` at runtime.
 
 ---
 
@@ -579,7 +704,7 @@ A common mistake is Base64(SHA-1(client_key)) without appending the GUID. The re
 HTTP/1.1 defaults to `Connection: keep-alive`. After parsing one request, the socket stays open. A server that closes the socket after each response forces a new TCP handshake per request. Your TCP server must loop back to parsing after sending the response.
 
 **4. Template compilation at request time**
-Calling `EEx.eval_file/2` on every request re-reads and re-compiles the template file. This adds 10–100ms per request and burns I/O. Compile with `EEx.compile_file/1` once at application start and store the compiled AST.
+Calling `EEx.eval_file/2` on every request re-reads and re-compiles the template file. This adds 10-100ms per request and burns I/O. Compile with `EEx.compile_file/1` once at application start and store the compiled AST.
 
 **5. Path segment matching with URL encoding**
 A client may request `/users/alice%20smith`. Your path splitter must URL-decode each segment before matching. Failure to do so means `%20` never matches a `:name` capture for `"alice smith"`.
@@ -588,8 +713,8 @@ A client may request `/users/alice%20smith`. Your path splitter must URL-decode 
 
 ## Resources
 
-- [RFC 7230 — HTTP/1.1 Message Syntax](https://www.rfc-editor.org/rfc/rfc7230) — sections 3–5 cover the wire format your parser must implement
-- [RFC 6455 — The WebSocket Protocol](https://www.rfc-editor.org/rfc/rfc6455) — section 1.3 (opening handshake) and section 5 (framing) are the two pieces you implement
+- [RFC 7230 -- HTTP/1.1 Message Syntax](https://www.rfc-editor.org/rfc/rfc7230) — sections 3-5 cover the wire format your parser must implement
+- [RFC 6455 -- The WebSocket Protocol](https://www.rfc-editor.org/rfc/rfc6455) — section 1.3 (opening handshake) and section 5 (framing) are the two pieces you implement
 - [Phoenix Framework source](https://github.com/phoenixframework/phoenix) — study `Phoenix.Router` for the macro pattern; `Phoenix.Socket` for channel multiplexing
 - [Plug specification](https://hexdocs.pm/plug/readme.html) — your `Nova.Plug` behaviour should be compatible so existing Plug middlewares can be adapted
 - ["Programming Phoenix 1.4"](https://pragprog.com/titles/phoenix14/programming-phoenix-1-4/) — McCord, Tate, Valim — chapters on Router internals and Channel architecture

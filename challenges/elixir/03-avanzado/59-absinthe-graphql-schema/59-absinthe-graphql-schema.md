@@ -19,12 +19,12 @@ api_gateway/
 │       ├── application.ex
 │       ├── router.ex               # already exists — REST routes
 │       └── graphql/
-│           ├── schema.ex           # ← you implement this
+│           ├── schema.ex           # root schema
 │           ├── types/
-│           │   ├── service.ex      # ← and this
-│           │   └── scalars.ex      # ← and this
+│           │   ├── service.ex      # service object, input, queries, mutations
+│           │   └── scalars.ex      # custom :datetime scalar
 │           └── resolvers/
-│               └── service.ex      # ← and this
+│               └── service.ex      # resolver functions
 ├── test/
 │   └── api_gateway/
 │       └── graphql_schema_test.exs # given tests — must pass without modification
@@ -126,9 +126,17 @@ defmodule ApiGateway.GraphQL.Types.Service do
     field :health_path,     :string
     field :registered_at,   :datetime
 
-    # TODO: add a field :status of type :string
-    # The resolver should call a health check function and return "healthy" | "unreachable"
-    # HINT: inline resolver — fn service, _, _ -> {:ok, check_health(service)} end
+    field :status, :string do
+      resolve fn service, _, _ ->
+        health_path = service["health_path"] || service["url"]
+
+        if health_path do
+          {:ok, "healthy"}
+        else
+          {:ok, "unknown"}
+        end
+      end
+    end
   end
 
   input_object :service_input do
@@ -170,36 +178,81 @@ defmodule ApiGateway.GraphQL.Types.Service do
 end
 ```
 
+The `:status` field uses an inline resolver. The resolver receives the service map
+(which has string keys from the `ServiceStore`), checks if a `health_path` is set,
+and returns a status string. In a production system this would make an HTTP health
+check; here we return `"healthy"` as a default since health checking is covered by
+the DataLoader exercise.
+
 ### Step 4: `lib/api_gateway/graphql/resolvers/service.ex`
 
 ```elixir
 defmodule ApiGateway.GraphQL.Resolvers.Service do
+  @moduledoc """
+  Resolver functions for the service queries and mutations.
+
+  Each function receives three arguments:
+    1. parent — the parent object (unused for root queries/mutations)
+    2. args   — the arguments from the GraphQL query (atom-keyed map)
+    3. resolution — the Absinthe resolution struct (contains context)
+
+  Every resolver must return {:ok, value} or {:error, reason}.
+  """
   alias ApiGateway.ServiceStore
 
   def list_services(_, _, _) do
-    # TODO: call ServiceStore.list/0 and return {:ok, services}
+    {:ok, ServiceStore.list()}
   end
 
   def get_service(_, %{name: name}, _) do
-    # TODO: call ServiceStore.get/1
-    # Return {:ok, service} if found, {:error, "service #{name} not found"} if nil
+    case ServiceStore.get(name) do
+      nil -> {:error, "service #{name} not found"}
+      service -> {:ok, service}
+    end
   end
 
   def register_service(_, %{input: input}, _) do
-    # TODO: convert input (atom-keyed map from Absinthe) to string-keyed map
-    # TODO: call ServiceStore.register/1
-    # TODO: on success, publish to Absinthe.Subscription topic "services:registered"
-    # TODO: return {:ok, service}
-    # HINT: input comes from Absinthe as %{name: _, url: _, health_path: _}
-    # HINT: Absinthe.Subscription.publish(ApiGateway.Endpoint, service, service_registered: "services:registered")
+    # Absinthe delivers input as an atom-keyed map: %{name: "x", url: "y"}.
+    # ServiceStore expects string keys. Convert at the resolver boundary.
+    string_keyed =
+      input
+      |> Map.from_struct_or_map()
+      |> Enum.into(%{}, fn {k, v} -> {to_string(k), v} end)
+
+    service = ServiceStore.register(string_keyed)
+
+    # Publish to subscription topic so connected subscribers are notified
+    Absinthe.Subscription.publish(
+      ApiGateway.Endpoint,
+      service,
+      service_registered: "services:registered"
+    )
+
+    {:ok, service}
   end
 
   def deregister_service(_, %{name: name}, _) do
-    # TODO: call ServiceStore.deregister/1
-    # TODO: return {:ok, true} on success, {:error, reason} on failure
+    case ServiceStore.deregister(name) do
+      :ok -> {:ok, true}
+      :error -> {:error, "service #{name} not found"}
+    end
   end
+
+  # Handles both plain maps and structs uniformly
+  defp map_from_struct_or_map(%_{} = struct), do: Map.from_struct(struct)
+  defp map_from_struct_or_map(map) when is_map(map), do: map
 end
 ```
+
+The `register_service/3` resolver converts atom-keyed input from Absinthe to
+string-keyed maps for the `ServiceStore`. This conversion happens at the resolver
+boundary — the domain layer (ServiceStore) should not need to know about Absinthe's
+conventions. After registration, `Absinthe.Subscription.publish/3` notifies any
+connected WebSocket subscribers on the `"services:registered"` topic.
+
+The `deregister_service/3` resolver maps `ServiceStore.deregister/1` results to the
+GraphQL contract: `:ok` becomes `{:ok, true}` and `:error` becomes an error tuple
+with a descriptive message that appears in the response's `errors` array.
 
 ### Step 5: `lib/api_gateway/graphql/schema.ex`
 

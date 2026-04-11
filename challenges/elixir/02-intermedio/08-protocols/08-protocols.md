@@ -22,11 +22,11 @@ Project structure at this point:
 task_queue/
 ├── lib/
 │   └── task_queue/
-│       ├── serializable.ex          # ← the protocol (you implement this)
-│       ├── exportable.ex            # ← second protocol (you implement this)
+│       ├── serializable.ex          # the protocol
+│       ├── exportable.ex            # second protocol
 │       └── types/
-│           ├── job_result.ex        # ← struct + protocol impls (you implement this)
-│           └── queue_stats.ex       # ← struct + protocol impls (you implement this)
+│           ├── job_result.ex        # struct + protocol impls
+│           └── queue_stats.ex       # struct + protocol impls
 ├── test/
 │   └── task_queue/
 │       └── protocols_test.exs       # given tests — must pass without modification
@@ -96,23 +96,21 @@ end
 
 defimpl TaskQueue.Serializable, for: Map do
   def to_map(map) do
-    # HINT: Enum.into(map, %{}, fn {k, v} -> {to_string(k), TaskQueue.Serializable.to_map(v)} end)
-    # This recursively serializes nested values via the protocol
-    # TODO: implement
+    Enum.into(map, %{}, fn {k, v} ->
+      {to_string(k), TaskQueue.Serializable.to_map(v)}
+    end)
   end
 end
 
 defimpl TaskQueue.Serializable, for: List do
   def to_map(list) do
-    # HINT: wrap the list: %{"items" => Enum.map(list, &TaskQueue.Serializable.to_map/1)}
-    # TODO: implement
+    %{"items" => Enum.map(list, &TaskQueue.Serializable.to_map/1)}
   end
 end
 
 defimpl TaskQueue.Serializable, for: Tuple do
   def to_map(tuple) do
-    # HINT: %{"tuple" => tuple |> Tuple.to_list() |> Enum.map(&TaskQueue.Serializable.to_map/1)}
-    # TODO: implement
+    %{"tuple" => tuple |> Tuple.to_list() |> Enum.map(&TaskQueue.Serializable.to_map/1)}
   end
 end
 
@@ -127,6 +125,16 @@ defimpl TaskQueue.Serializable, for: Atom do
   def to_map(atom), do: %{"value" => Atom.to_string(atom), "type" => "atom"}
 end
 ```
+
+The `Map` implementation recursively calls `TaskQueue.Serializable.to_map/1` on each
+value, which dispatches through the protocol again. This means nested maps, lists, and
+tuples are all handled automatically. The recursion terminates at leaf types (Integer,
+Atom, BitString) which return concrete maps.
+
+The `@fallback_to_any true` directive means any type without an explicit implementation
+falls through to the `Any` implementation, which wraps the value in an opaque inspect
+string. This prevents `Protocol.UndefinedError` crashes in production when an unexpected
+type reaches the serializer.
 
 ### Step 2: `lib/task_queue/exportable.ex`
 
@@ -177,10 +185,17 @@ defimpl TaskQueue.Serializable, for: TaskQueue.Types.JobResult do
   alias TaskQueue.Types.JobResult
 
   def to_map(%JobResult{} = r) do
-    # HINT: build a string-keyed map with all fields
-    # For :ok outcome, include "value" key
-    # For :error outcome, include "error" key as inspect(r.error)
-    # TODO: implement
+    base = %{
+      "job_id" => r.job_id,
+      "outcome" => Atom.to_string(r.outcome),
+      "duration_ms" => r.duration_ms,
+      "attempts" => r.attempts
+    }
+
+    case r.outcome do
+      :ok -> Map.put(base, "value", inspect(r.value))
+      :error -> Map.put(base, "error", inspect(r.error))
+    end
   end
 end
 
@@ -188,17 +203,22 @@ defimpl TaskQueue.Exportable, for: TaskQueue.Types.JobResult do
   alias TaskQueue.Types.JobResult
 
   def to_log_line(%JobResult{outcome: :ok} = r) do
-    # Format: [JOB_OK] job_id=xxx duration_ms=123 attempts=1
-    # HINT: "[JOB_OK] job_id=#{r.job_id} duration_ms=#{r.duration_ms} attempts=#{r.attempts}"
-    # TODO: implement
+    "[JOB_OK] job_id=#{r.job_id} duration_ms=#{r.duration_ms} attempts=#{r.attempts}"
   end
 
   def to_log_line(%JobResult{outcome: :error} = r) do
-    # Format: [JOB_ERROR] job_id=xxx error="reason" duration_ms=123 attempts=3
-    # TODO: implement
+    "[JOB_ERROR] job_id=#{r.job_id} error=\"#{inspect(r.error)}\" duration_ms=#{r.duration_ms} attempts=#{r.attempts}"
   end
 end
 ```
+
+The `Serializable` implementation for `JobResult` produces different maps depending on
+the outcome: successful results include a `"value"` key, failed results include an
+`"error"` key. Both use `inspect/1` to convert arbitrary Elixir terms to string
+representations safe for JSON encoding.
+
+The `Exportable` implementation uses the `[JOB_OK]` / `[JOB_ERROR]` prefix convention
+for structured log lines, making them easy to grep and parse with log aggregation tools.
 
 ### Step 4: `lib/task_queue/types/queue_stats.ex`
 
@@ -219,8 +239,13 @@ defimpl TaskQueue.Serializable, for: TaskQueue.Types.QueueStats do
   alias TaskQueue.Types.QueueStats
 
   def to_map(%QueueStats{} = s) do
-    # HINT: all fields, string keys, snapshot_at as Unix ms integer
-    # TODO: implement
+    %{
+      "snapshot_at" => s.snapshot_at,
+      "queue_depth" => s.queue_depth,
+      "jobs_processed_total" => s.jobs_processed_total,
+      "jobs_failed_total" => s.jobs_failed_total,
+      "avg_duration_ms" => s.avg_duration_ms
+    }
   end
 end
 
@@ -228,8 +253,8 @@ defimpl TaskQueue.Exportable, for: TaskQueue.Types.QueueStats do
   alias TaskQueue.Types.QueueStats
 
   def to_log_line(%QueueStats{} = s) do
-    # Format: [QUEUE_STATS] depth=5 processed=100 failed=2 avg_ms=45
-    # TODO: implement
+    "[QUEUE_STATS] depth=#{s.queue_depth} processed=#{s.jobs_processed_total} " <>
+    "failed=#{s.jobs_failed_total} avg_ms=#{s.avg_duration_ms}"
   end
 end
 ```

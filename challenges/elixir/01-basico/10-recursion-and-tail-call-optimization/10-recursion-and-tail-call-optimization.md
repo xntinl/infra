@@ -78,7 +78,10 @@ transaction lists without stack overflow:
 
 ### Extend `lib/payments_cli/ledger.ex`
 
-Add these functions to the existing `Ledger` module:
+Each function uses the accumulator pattern for tail recursion. The public function
+accepts the user-facing arguments and delegates to a private helper that adds the
+accumulator. The private helper has three clauses: base case (empty list), matching
+case (element qualifies), and non-matching case (skip and continue).
 
 ```elixir
 # Add to PaymentsCli.Ledger
@@ -100,18 +103,15 @@ def count_by_status(transactions, status) when is_list(transactions) and is_atom
   count_by_status(transactions, status, 0)
 end
 
-# TODO: implement the private tail-recursive helper
-#
-# defp count_by_status([], _status, acc), do: acc
-# defp count_by_status([%{status: s} | rest], status, acc) when s == status do
-#   count_by_status(rest, status, acc + 1)
-# end
-# defp count_by_status([_ | rest], status, acc) do
-#   count_by_status(rest, status, acc)
-# end
-#
-# The third clause (catch-all) handles transactions whose status does not match.
-# Pattern matching in the head, not in the body — this is the Elixir way.
+defp count_by_status([], _status, acc), do: acc
+
+defp count_by_status([%{status: s} | rest], status, acc) when s == status do
+  count_by_status(rest, status, acc + 1)
+end
+
+defp count_by_status([_ | rest], status, acc) do
+  count_by_status(rest, status, acc)
+end
 
 @doc """
 Returns all transactions where amount_cents exceeds the threshold.
@@ -128,18 +128,18 @@ Tail-recursive. Preserves order of the original list.
 @spec above_threshold([map()], integer()) :: [map()]
 def above_threshold(transactions, threshold_cents)
     when is_list(transactions) and is_integer(threshold_cents) do
-  # TODO: implement using private tail-recursive helper with accumulator
-  #
-  # Public API calls the private helper with acc = []
-  # Private helper:
-  #   - base case: [], acc -> Enum.reverse(acc)  <- reverse because we prepend
-  #   - recursive case with match: amount > threshold -> prepend to acc
-  #   - recursive case without match: skip, continue
-  #
-  # Why Enum.reverse at the end?
-  # Prepending is O(1). Each step we do [tx | acc].
-  # The accumulator ends up in reverse order. One O(n) reverse at the end
-  # is cheaper than O(n) append at each step (which would be O(n²) total).
+  do_above_threshold(transactions, threshold_cents, [])
+end
+
+defp do_above_threshold([], _threshold, acc), do: Enum.reverse(acc)
+
+defp do_above_threshold([%{amount_cents: amount} = tx | rest], threshold, acc)
+     when amount > threshold do
+  do_above_threshold(rest, threshold, [tx | acc])
+end
+
+defp do_above_threshold([_ | rest], threshold, acc) do
+  do_above_threshold(rest, threshold, acc)
 end
 
 @doc """
@@ -164,22 +164,35 @@ Tail-recursive — builds the line list with prepend, then joins at the end.
 def to_csv(transactions) when is_list(transactions) do
   header = "id,amount_cents,currency,status"
   lines = build_csv_lines(transactions, [])
-  # lines are in reverse order — reverse once here
   all_lines = [header | Enum.reverse(lines)]
   Enum.join(all_lines, "\n")
 end
 
-# TODO: implement build_csv_lines/2
-#
-# defp build_csv_lines([], acc), do: acc
-# defp build_csv_lines([tx | rest], acc) do
-#   line = "#{tx.id},#{tx.amount_cents},#{tx.currency},#{tx.status}"
-#   build_csv_lines(rest, [line | acc])
-# end
-#
-# Design note: this is a tail call. `build_csv_lines(rest, [line | acc])` is
-# the LAST thing that happens. The VM reuses the current stack frame.
+defp build_csv_lines([], acc), do: acc
+
+defp build_csv_lines([tx | rest], acc) do
+  line = "#{tx.id},#{tx.amount_cents},#{tx.currency},#{tx.status}"
+  build_csv_lines(rest, [line | acc])
+end
 ```
+
+**Why this works:**
+
+- `count_by_status/2` delegates to `count_by_status/3` with an initial accumulator of `0`.
+  The three private clauses handle: empty list (return accumulator), matching status
+  (increment and recurse), non-matching status (skip and recurse). Every recursive call
+  is in tail position — it is the last operation in the function body.
+
+- `above_threshold/2` delegates to `do_above_threshold/3` with an empty accumulator.
+  Matching transactions are prepended to the accumulator (O(1)). The base case reverses
+  the accumulator once (O(n)) to restore the original order. Total: O(n).
+
+- `to_csv/1` delegates to `build_csv_lines/2` which builds lines in reverse order by
+  prepending each line to the accumulator. After the recursion, `Enum.reverse/1` restores
+  the correct order, then `Enum.join/2` combines header and lines with newlines.
+
+- All three functions are safe for 100k+ elements because every recursive call is a
+  tail call — the BEAM reuses the current stack frame.
 
 ### Given tests — must pass without modification
 

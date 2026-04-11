@@ -19,10 +19,10 @@ api_gateway/
 │   └── api_gateway/
 │       ├── application.ex              # already exists — starts Finch and ETS tables
 │       └── http_client/
-│           ├── client.ex               # ← you implement this (facade)
-│           ├── circuit_breaker.ex      # ← and this
-│           ├── retry.ex                # ← and this
-│           └── telemetry_handler.ex    # ← and this
+│           ├── client.ex               # facade combining circuit breaker + retry
+│           ├── circuit_breaker.ex      # ETS-based circuit breaker
+│           ├── retry.ex                # retry with exponential backoff
+│           └── telemetry_handler.ex    # structured logging via telemetry
 ├── test/
 │   └── api_gateway/
 │       └── http_client/
@@ -57,9 +57,9 @@ to recover without continued pressure.
 The three states:
 
 ```
-CLOSED ──(N failures)──▶ OPEN ──(recovery_timeout)──▶ HALF_OPEN
-  ▲                                                         │
-  └────────────(M consecutive successes)───────────────────┘
+CLOSED --(N failures)--> OPEN --(recovery_timeout)--> HALF_OPEN
+  ^                                                         |
+  <--------(M consecutive successes)------------------------+
 ```
 
 In `HALF_OPEN`, only a limited number of probe requests are allowed through. If they succeed,
@@ -73,7 +73,7 @@ A GenServer holding circuit state serializes all access — every request must a
 lock to read the state. For a high-traffic gateway, this becomes the bottleneck.
 
 ETS with `:set, :public, read_concurrency: true` allows concurrent reads without any
-process overhead. Only state transitions (closed→open, open→half_open) require coordinated
+process overhead. Only state transitions (closed->open, open->half_open) require coordinated
 writes.
 
 ---
@@ -96,6 +96,10 @@ end
 
 ### Step 2: `lib/api_gateway/http_client/circuit_breaker.ex`
 
+The circuit breaker stores per-host state in ETS for lock-free reads. The three states
+(closed, open, half_open) are tracked along with metadata: failure count for closed,
+opened_at timestamp for open, and probe count for half_open.
+
 ```elixir
 defmodule ApiGateway.HttpClient.CircuitBreaker do
   @moduledoc """
@@ -108,7 +112,6 @@ defmodule ApiGateway.HttpClient.CircuitBreaker do
 
   @table :circuit_breaker
 
-  # Default thresholds — override via Application config
   @failure_threshold  5
   @recovery_timeout_ms 30_000
   @half_open_max_calls 3
@@ -136,7 +139,26 @@ defmodule ApiGateway.HttpClient.CircuitBreaker do
   @doc "Returns :closed, :half_open, or {:open, remaining_ms}."
   @spec status(String.t()) :: :closed | :half_open | {:open, pos_integer()}
   def status(host) do
-    # TODO: implement — read from ETS, return state with remaining time if open
+    now = System.monotonic_time(:millisecond)
+
+    case :ets.lookup(@table, host) do
+      [{^host, :open, opened_at}] ->
+        elapsed = now - opened_at
+        if elapsed >= @recovery_timeout_ms do
+          :half_open
+        else
+          {:open, @recovery_timeout_ms - elapsed}
+        end
+
+      [{^host, :half_open, _}] ->
+        :half_open
+
+      [{^host, :closed, _}] ->
+        :closed
+
+      [] ->
+        :closed
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -168,16 +190,32 @@ defmodule ApiGateway.HttpClient.CircuitBreaker do
   end
 
   defp execute_half_open(host, fun) do
-    # TODO:
-    # 1. Increment probe count for this host
-    # 2. Execute fun.()
-    # 3. On success: if probe_count >= @half_open_max_calls, close circuit; else keep half_open
-    # 4. On failure: re-open circuit with fresh timestamp
-    # HINT: store probe count in ETS alongside state
+    # Transition to half_open state with probe count tracking.
+    # Use update_counter to atomically increment probe count.
+    # If this is the first probe, initialize the half_open entry.
+    ensure_half_open_entry(host)
+    probe_count = :ets.update_counter(@table, {:half_open_probes, host}, {2, 1}, {{:half_open_probes, host}, 0})
+
+    case fun.() do
+      {:ok, _} = result ->
+        if probe_count >= @half_open_max_calls do
+          # Enough successful probes — close the circuit
+          close_circuit(host)
+        end
+        result
+
+      {:error, _} = err ->
+        # Probe failed — re-open circuit with fresh timestamp
+        open_circuit(host)
+        err
+    end
   end
 
   defp open_circuit(host) do
     :ets.insert(@table, {host, :open, System.monotonic_time(:millisecond)})
+    # Clean up probe counter if it exists
+    :ets.delete(@table, {:half_open_probes, host})
+
     :telemetry.execute(
       [:api_gateway, :circuit_breaker, :state_change],
       %{},
@@ -185,18 +223,42 @@ defmodule ApiGateway.HttpClient.CircuitBreaker do
     )
   end
 
+  defp close_circuit(host) do
+    :ets.delete(@table, host)
+    :ets.delete(@table, {:half_open_probes, host})
+
+    :telemetry.execute(
+      [:api_gateway, :circuit_breaker, :state_change],
+      %{},
+      %{host: host, from: :half_open, to: :closed}
+    )
+  end
+
+  defp ensure_half_open_entry(host) do
+    # Mark as half_open if not already
+    case :ets.lookup(@table, host) do
+      [{^host, :half_open, _}] -> :ok
+      _ -> :ets.insert(@table, {host, :half_open, System.monotonic_time(:millisecond)})
+    end
+  end
+
   defp reset_failures(host) do
     :ets.delete(@table, host)
   end
 
   defp increment_failures(host) do
-    # TODO: :ets.update_counter/4 with default value — atomic increment
-    # HINT: :ets.update_counter(@table, host, {3, 1}, {host, :closed, 0})
+    # Atomic increment with default value. The tuple {host, :closed, 0} is the default
+    # if the key doesn't exist. {3, 1} means: increment element at position 3 by 1.
+    :ets.update_counter(@table, host, {3, 1}, {host, :closed, 0})
   end
 end
 ```
 
 ### Step 3: `lib/api_gateway/http_client/retry.ex`
+
+Retry logic wraps any function call with exponential backoff. It distinguishes
+retryable server errors (5xx, 429) from non-retryable client errors (4xx) and
+respects `Retry-After` headers from rate-limited responses.
 
 ```elixir
 defmodule ApiGateway.HttpClient.Retry do
@@ -249,18 +311,31 @@ defmodule ApiGateway.HttpClient.Retry do
   end
 
   defp backoff(attempt) do
-    # TODO: 100ms * 2^attempt, capped at 5_000ms, with jitter
-    # HINT: min(round(100 * :math.pow(2, attempt)), 5_000) + :rand.uniform(50)
+    # 100ms * 2^attempt, capped at 5_000ms, with jitter to prevent synchronized retries
+    base_delay = min(round(100 * :math.pow(2, attempt)), 5_000)
+    base_delay + :rand.uniform(50)
   end
 
   defp extract_retry_after(headers) do
-    # TODO: find "retry-after" header (case-insensitive), parse as seconds -> ms
-    # HINT: List.keyfind/3 with lowercase header name
+    # Find "retry-after" header (case-insensitive), parse as seconds -> ms.
+    # HTTP headers are typically lowercase but the spec allows mixed case.
+    case List.keyfind(headers, "retry-after", 0) do
+      {_, value} ->
+        case Integer.parse(value) do
+          {seconds, _} -> seconds * 1_000
+          :error -> nil
+        end
+      nil ->
+        nil
+    end
   end
 end
 ```
 
 ### Step 4: `lib/api_gateway/http_client/client.ex`
+
+The client facade composes circuit breaker and retry into a single pipeline.
+Every request: check circuit -> retry on transient errors -> emit telemetry.
 
 ```elixir
 defmodule ApiGateway.HttpClient.Client do
@@ -309,10 +384,29 @@ defmodule ApiGateway.HttpClient.Client do
 
     case Finch.request(req, ApiGateway.Finch, receive_timeout: timeout_ms) do
       {:ok, %Finch.Response{status: status, headers: resp_headers, body: resp_body}} ->
-        # TODO: decode JSON body if Content-Type is application/json
-        {:ok, %{status: status, headers: resp_headers, body: resp_body}}
+        # Decode JSON body if Content-Type is application/json
+        decoded_body = maybe_decode_json(resp_headers, resp_body)
+        {:ok, %{status: status, headers: resp_headers, body: decoded_body}}
       {:error, _} = err ->
         err
+    end
+  end
+
+  defp maybe_decode_json(headers, body) do
+    content_type = List.keyfind(headers, "content-type", 0)
+
+    case content_type do
+      {_, ct} when is_binary(ct) ->
+        if String.contains?(ct, "application/json") do
+          case Jason.decode(body) do
+            {:ok, decoded} -> decoded
+            {:error, _} -> body
+          end
+        else
+          body
+        end
+      _ ->
+        body
     end
   end
 
@@ -343,6 +437,10 @@ end
 
 ### Step 5: `lib/api_gateway/http_client/telemetry_handler.ex`
 
+Telemetry handlers convert raw events into structured log lines. Attaching
+them at application startup ensures every HTTP request and circuit breaker
+state change is logged without any code changes in the client.
+
 ```elixir
 defmodule ApiGateway.HttpClient.TelemetryHandler do
   require Logger
@@ -361,11 +459,11 @@ defmodule ApiGateway.HttpClient.TelemetryHandler do
 
   def handle_event([:api_gateway, :http_client, :request], %{duration: dur}, meta, _) do
     ms = System.convert_time_unit(dur, :native, :millisecond)
-    Logger.info("HTTP #{meta.method} #{meta.host} → #{meta.status} (#{ms}ms)")
+    Logger.info("HTTP #{meta.method} #{meta.host} -> #{meta.status} (#{ms}ms)")
   end
 
   def handle_event([:api_gateway, :circuit_breaker, :state_change], _, meta, _) do
-    Logger.warning("Circuit breaker: #{meta.host} #{meta.from} → #{meta.to}")
+    Logger.warning("Circuit breaker: #{meta.host} #{meta.from} -> #{meta.to}")
   end
 end
 ```
@@ -464,7 +562,7 @@ Fill in this table based on your implementation.
 
 | Aspect | ETS circuit breaker | GenServer circuit breaker | No circuit breaker |
 |--------|--------------------|--------------------------|--------------------|
-| Read path latency | ETS lookup (~1µs) | GenServer call (varies) | none |
+| Read path latency | ETS lookup (~1us) | GenServer call (varies) | none |
 | State consistency | eventual under concurrent writes | strong | n/a |
 | Recovery detection | time-based (fixed timeout) | time-based | n/a |
 | Half-open probes | per-host counter in ETS | per-host counter in state | n/a |

@@ -6,7 +6,7 @@
 
 ## Project context
 
-`task_queue` needs to notify multiple webhook endpoints when a batch of jobs completes. Calling them sequentially takes N × average_latency. With fan-out, all webhooks are called concurrently and the total time is max(latency) instead of sum(latency).
+`task_queue` needs to notify multiple webhook endpoints when a batch of jobs completes. Calling them sequentially takes N x average_latency. With fan-out, all webhooks are called concurrently and the total time is max(latency) instead of sum(latency).
 
 Project structure at this point:
 
@@ -37,12 +37,12 @@ When a batch of 50 jobs completes, `task_queue` must:
 3. Collect all results — including partial failures — and return a summary
 
 Sequential execution:
-- 10 webhooks × 200ms average = 2,000ms total
-- 50 jobs × 50ms average = 2,500ms total (single-threaded)
+- 10 webhooks x 200ms average = 2,000ms total
+- 50 jobs x 50ms average = 2,500ms total (single-threaded)
 
 Fan-out execution:
 - 10 webhooks in parallel = 200ms total (bounded by slowest webhook)
-- 50 jobs across 5 workers = 500ms total (bounded by 10 batches × 50ms)
+- 50 jobs across 5 workers = 500ms total (bounded by 10 batches x 50ms)
 
 ---
 
@@ -114,29 +114,30 @@ defmodule TaskQueue.Notifier do
   def notify_all(webhook_urls, payload, opts \\ []) when is_list(webhook_urls) do
     timeout = Keyword.get(opts, :timeout, @default_timeout)
 
-    # TODO: start a Task for each URL using Task.async/1
-    # Each task should call notify_one(url, payload) and return {url, result}
-    # Then use Task.yield_many/2 to collect results within the timeout
-    # Classify results into :ok, :error, :timeout
-    #
-    # HINT:
-    # tasks =
-    #   Enum.map(webhook_urls, fn url ->
-    #     Task.async(fn -> {url, notify_one(url, payload)} end)
-    #   end)
-    #
-    # results = Task.yield_many(tasks, timeout: timeout)
-    #
-    # Enum.reduce(results, %{ok: [], error: [], timeout: []}, fn
-    #   {_task, {:ok, {url, :ok}}}, acc ->
-    #     Map.update!(acc, :ok, &[url | &1])
-    #   {_task, {:ok, {url, {:error, reason}}}}, acc ->
-    #     Map.update!(acc, :error, &[{url, reason} | &1])
-    #   {task, nil}, acc ->
-    #     Task.shutdown(task, :brutal_kill)
-    #     url = get_url_from_task(tasks, task, webhook_urls)
-    #     Map.update!(acc, :timeout, &[url | &1])
-    # end)
+    tasks =
+      Enum.map(webhook_urls, fn url ->
+        Task.async(fn -> {url, notify_one(url, payload)} end)
+      end)
+
+    results = Task.yield_many(tasks, timeout: timeout)
+
+    # Build a lookup from task ref to URL for timeout classification
+    task_to_url =
+      Enum.zip(tasks, webhook_urls)
+      |> Map.new(fn {task, url} -> {task.ref, url} end)
+
+    Enum.reduce(results, %{ok: [], error: [], timeout: []}, fn
+      {_task, {:ok, {url, :ok}}}, acc ->
+        Map.update!(acc, :ok, &[url | &1])
+
+      {_task, {:ok, {url, {:error, reason}}}}, acc ->
+        Map.update!(acc, :error, &[{url, reason} | &1])
+
+      {task, nil}, acc ->
+        Task.shutdown(task, :brutal_kill)
+        url = Map.get(task_to_url, task.ref, "unknown")
+        Map.update!(acc, :timeout, &[url | &1])
+    end)
   end
 
   @doc """
@@ -147,17 +148,15 @@ defmodule TaskQueue.Notifier do
   replaced by a stub via the `notify_fn` option.
   """
   @spec notify_one(String.t(), map()) :: :ok | {:error, term()}
-  def notify_one(url, payload) do
-    # TODO: call the webhook. For now, simulate:
-    # - URLs containing "timeout" → :timer.sleep(10_000) (simulates slow webhook)
-    # - URLs containing "error" → {:error, :connection_refused}
-    # - All other URLs → :ok after a short sleep
+  def notify_one(url, _payload) do
     cond do
       String.contains?(url, "timeout") ->
         :timer.sleep(60_000)
         :ok
+
       String.contains?(url, "error") ->
         {:error, :connection_refused}
+
       true ->
         :timer.sleep(10)
         :ok
@@ -203,27 +202,24 @@ defmodule TaskQueue.BatchProcessor do
     concurrency = Keyword.get(opts, :max_concurrency, @default_concurrency)
     timeout     = Keyword.get(opts, :timeout, @default_timeout)
 
-    # TODO: use Task.async_stream/3 to process jobs concurrently
-    # Pair each result with its input job for correlation
-    # Classify into succeeded, failed, timed_out
-    #
-    # HINT:
-    # jobs
-    # |> Task.async_stream(
-    #     &TaskQueue.Worker.execute/1,
-    #     max_concurrency: concurrency,
-    #     timeout: timeout,
-    #     on_timeout: :kill_task
-    #   )
-    # |> Enum.zip(jobs)
-    # |> Enum.reduce(%{succeeded: [], failed: [], timed_out: []}, fn
-    #   {{:ok, {:ok, result}}, job}, acc ->
-    #     Map.update!(acc, :succeeded, &[{job, result} | &1])
-    #   {{:ok, {:error, reason}}, job}, acc ->
-    #     Map.update!(acc, :failed, &[{job, reason} | &1])
-    #   {{:exit, :timeout}, job}, acc ->
-    #     Map.update!(acc, :timed_out, &[job | &1])
-    # end)
+    jobs
+    |> Task.async_stream(
+      &TaskQueue.Worker.execute/1,
+      max_concurrency: concurrency,
+      timeout: timeout,
+      on_timeout: :kill_task
+    )
+    |> Enum.zip(jobs)
+    |> Enum.reduce(%{succeeded: [], failed: [], timed_out: []}, fn
+      {{:ok, {:ok, result}}, job}, acc ->
+        Map.update!(acc, :succeeded, &[{job, result} | &1])
+
+      {{:ok, {:error, reason}}, job}, acc ->
+        Map.update!(acc, :failed, &[{job, reason} | &1])
+
+      {{:exit, :timeout}, job}, acc ->
+        Map.update!(acc, :timed_out, &[job | &1])
+    end)
   end
 
   @doc """
@@ -238,8 +234,7 @@ defmodule TaskQueue.BatchProcessor do
   """
   @spec summarize(map()) :: String.t()
   def summarize(%{succeeded: ok, failed: err, timed_out: to}) do
-    # TODO: return a formatted summary string
-    # HINT: "#{length(ok)} succeeded, #{length(err)} failed, #{length(to)} timed out"
+    "#{length(ok)} succeeded, #{length(err)} failed, #{length(to)} timed out"
   end
 end
 ```
@@ -301,7 +296,7 @@ defmodule TaskQueue.FanOutTest do
       Notifier.notify_all(urls, %{}, timeout: 1_000)
       elapsed = System.monotonic_time(:millisecond) - start
 
-      # Should complete much faster than sequential (5 × 10ms = 50ms)
+      # Should complete much faster than sequential (5 x 10ms = 50ms)
       assert elapsed < 100
     end
   end
@@ -375,6 +370,8 @@ mix test test/task_queue/fan_out_test.exs --trace
 | `GenStage` | configurable | yes (demand) | no | continuous streaming pipeline |
 
 Reflection question: `Task.async_stream` with `on_timeout: :kill_task` kills the task process. What happens to resources the task was holding — open file handles, database connections from Ecto.Sandbox? How do you prevent leaks?
+
+Answer: When a task process is killed, its `terminate/2` callback (if it is a GenServer) is NOT called — `:kill` bypasses normal shutdown. Open file handles are closed by the OS when the process terminates. Database connections from Ecto.Sandbox are reclaimed because the sandbox tracks connection ownership by process — when the owning process dies, the connection is returned to the pool. For custom resources (TCP sockets, file locks), you must either use a separate cleanup process that monitors the task, or use `on_timeout: :exit` instead of `:kill_task` to allow a graceful shutdown.
 
 ---
 

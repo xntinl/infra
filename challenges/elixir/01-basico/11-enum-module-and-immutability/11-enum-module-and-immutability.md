@@ -72,6 +72,12 @@ The `Analytics` module needs to:
 
 ### `lib/payments_cli/analytics.ex`
 
+Each function follows the same pattern: filter to approved transactions, transform
+the data, aggregate. The filtering step is repeated in each function because each
+function is independent and pure — it does not depend on shared state or a pre-filtered
+list. This is the trade-off of immutability: slight redundancy in exchange for
+complete independence between functions.
+
 ```elixir
 defmodule PaymentsCli.Analytics do
   @moduledoc """
@@ -103,18 +109,27 @@ defmodule PaymentsCli.Analytics do
   """
   @spec revenue_stats([map()]) :: {:ok, map()} | {:error, :no_approved_transactions}
   def revenue_stats(transactions) when is_list(transactions) do
-    # TODO: implement
-    #
-    # Step 1: filter to approved only
-    # Step 2: extract amount_cents (Enum.map)
-    # Step 3: if amounts is empty, return {:error, :no_approved_transactions}
-    # Step 4: compute stats
-    #   total   = Enum.sum(amounts)
-    #   count   = length(amounts)
-    #   average = div(total, count)
-    #   min     = Enum.min(amounts)
-    #   max     = Enum.max(amounts)
-    # Step 5: return {:ok, %{total: ..., count: ..., average: ..., min: ..., max: ...}}
+    amounts =
+      transactions
+      |> Enum.filter(fn tx -> tx.status == :approved end)
+      |> Enum.map(fn tx -> tx.amount_cents end)
+
+    case amounts do
+      [] ->
+        {:error, :no_approved_transactions}
+
+      _ ->
+        total = Enum.sum(amounts)
+        count = length(amounts)
+
+        {:ok, %{
+          total: total,
+          count: count,
+          average: div(total, count),
+          min: Enum.min(amounts),
+          max: Enum.max(amounts)
+        }}
+    end
   end
 
   @doc """
@@ -135,15 +150,14 @@ defmodule PaymentsCli.Analytics do
   """
   @spec top_merchants([map()], pos_integer()) :: [{String.t(), integer()}]
   def top_merchants(transactions, n) when is_list(transactions) and is_integer(n) and n > 0 do
-    # TODO: implement
-    #
-    # Step 1: filter to :approved
-    # Step 2: Enum.group_by(fn tx -> tx.merchant end)
-    #         -> %{"Shop A" => [tx1, tx2], "Shop B" => [tx3]}
-    # Step 3: Enum.map each group to {merchant, total_amount}
-    #         Enum.map(groups, fn {merchant, txs} -> {merchant, Enum.sum(Enum.map(txs, & &1.amount_cents))} end)
-    # Step 4: Sort: Enum.sort_by(fn {_m, total} -> total end, :desc)
-    # Step 5: Enum.take(n)
+    transactions
+    |> Enum.filter(fn tx -> tx.status == :approved end)
+    |> Enum.group_by(fn tx -> tx.merchant end)
+    |> Enum.map(fn {merchant, txs} ->
+      {merchant, txs |> Enum.map(& &1.amount_cents) |> Enum.sum()}
+    end)
+    |> Enum.sort_by(fn {merchant, total} -> {-total, merchant} end)
+    |> Enum.take(n)
   end
 
   @doc """
@@ -165,12 +179,13 @@ defmodule PaymentsCli.Analytics do
   """
   @spec daily_totals([map()]) :: %{String.t() => integer()}
   def daily_totals(transactions) when is_list(transactions) do
-    # TODO: implement
-    #
-    # Step 1: filter to :approved
-    # Step 2: Enum.group_by(fn tx -> tx.date end)
-    # Step 3: Enum.map each group to {date, sum_of_amounts}
-    # Step 4: Map.new from the list of {date, total} tuples
+    transactions
+    |> Enum.filter(fn tx -> tx.status == :approved end)
+    |> Enum.group_by(fn tx -> tx.date end)
+    |> Enum.map(fn {date, txs} ->
+      {date, txs |> Enum.map(& &1.amount_cents) |> Enum.sum()}
+    end)
+    |> Map.new()
   end
 
   @doc """
@@ -197,16 +212,38 @@ defmodule PaymentsCli.Analytics do
   def suspicious_merchants(transactions, threshold_count, large_amount_threshold)
       when is_list(transactions) and is_integer(threshold_count) and
              is_integer(large_amount_threshold) do
-    # TODO: implement
-    #
-    # Step 1: filter to :approved AND amount_cents > large_amount_threshold
-    # Step 2: Enum.group_by(fn tx -> tx.merchant end)
-    # Step 3: filter groups where length(txs) >= threshold_count
-    # Step 4: extract merchant names (map over remaining groups)
-    # Step 5: sort for deterministic output
+    transactions
+    |> Enum.filter(fn tx ->
+      tx.status == :approved and tx.amount_cents > large_amount_threshold
+    end)
+    |> Enum.group_by(fn tx -> tx.merchant end)
+    |> Enum.filter(fn {_merchant, txs} -> length(txs) >= threshold_count end)
+    |> Enum.map(fn {merchant, _txs} -> merchant end)
+    |> Enum.sort()
   end
 end
 ```
+
+**Why this works:**
+
+- `revenue_stats/1` filters to approved transactions, extracts amounts, then computes
+  all statistics in a single scope. The empty case is handled explicitly — calling
+  `Enum.min/1` on an empty list raises, so we check first. `div(total, count)` gives
+  integer division for the average, which is appropriate for cent-denominated amounts.
+
+- `top_merchants/2` chains filter → group → map → sort → take. The sort key
+  `{-total, merchant}` sorts by total descending (negative for descending) and
+  alphabetically by name for ties. `Enum.take/2` returns at most `n` elements,
+  handling the case where fewer merchants exist.
+
+- `daily_totals/1` filters to approved, groups by date, maps each group to a
+  `{date, sum}` tuple, then builds a map with `Map.new/1`. The result is a flat
+  `%{date => total}` map.
+
+- `suspicious_merchants/3` filters on two conditions (approved AND large amount),
+  groups by merchant, filters groups by count threshold, extracts names, and sorts
+  for deterministic output. The sort ensures test assertions work regardless of
+  map iteration order.
 
 ### Given tests — must pass without modification
 

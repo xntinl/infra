@@ -126,7 +126,9 @@ the most recent.
 
 ### Step 1: Redesign `application.ex`
 
-The target tree:
+The target tree separates components into three failure domains. The top-level
+supervisor uses `:one_for_one` because the three domain supervisors are independent:
+a telemetry crash should never affect the core domain.
 
 ```
 ApiGateway.Application
@@ -151,9 +153,11 @@ defmodule ApiGateway.Application do
   @impl true
   def start(_type, _args) do
     children = [
-      # TODO: add the three second-level supervisors in dependency order
-      # CoreSupervisor must start before Middleware (middleware uses rate limiter)
-      # TelemetrySupervisor is independent — can go last
+      # Order matters: Core must be up before Middleware can serve requests.
+      # TelemetrySupervisor is independent — can go last.
+      ApiGateway.CoreSupervisor,
+      ApiGateway.MiddlewareSupervisor,
+      ApiGateway.TelemetrySupervisor
     ]
 
     Supervisor.start_link(children,
@@ -166,6 +170,16 @@ end
 
 ### Step 2: `lib/api_gateway/core_supervisor.ex`
 
+The CoreSupervisor uses `:rest_for_one` because the children form a linear dependency
+chain: RouteTable depends on RateLimiter (it checks rate limits before looking up routes),
+and CircuitBreaker.Supervisor depends on RouteTable (it needs route information to know
+which upstream each breaker protects).
+
+If RateLimiter crashes and restarts, RouteTable and CircuitBreaker.Supervisor are also
+restarted — they may hold stale handles or cached state that depends on the limiter's
+ETS tables. If RouteTable crashes alone, only it and CircuitBreaker.Supervisor restart;
+the RateLimiter (listed before RouteTable) is unaffected.
+
 ```elixir
 defmodule ApiGateway.CoreSupervisor do
   use Supervisor
@@ -174,16 +188,12 @@ defmodule ApiGateway.CoreSupervisor do
     Supervisor.start_link(__MODULE__, opts, name: __MODULE__)
   end
 
+  @impl true
   def init(_opts) do
     children = [
-      # TODO: list RateLimiter.Server, RouteTable.Server, CircuitBreaker.Supervisor
-      # in dependency order
-      #
-      # Why rest_for_one here?
-      # If RateLimiter crashes and restarts, RouteTable is unaffected (they share no state).
-      # But if RouteTable crashes and restarts with a fresh ETS table, processes that
-      # cached route entries need to re-fetch them.
-      # rest_for_one ensures that any process depending on a crashed sibling is also reset.
+      ApiGateway.RateLimiter.Server,
+      {ApiGateway.RouteTable.Server, [traffic_class: :default]},
+      ApiGateway.CircuitBreaker.Supervisor
     ]
 
     Supervisor.init(children,
@@ -197,6 +207,11 @@ end
 
 ### Step 3: `lib/api_gateway/circuit_breaker/supervisor.ex`
 
+The CircuitBreaker.Supervisor is a DynamicSupervisor because workers are created at
+runtime (one per upstream service discovered). Each worker is independent — if one
+crashes, only that worker restarts. The `:one_for_one` strategy is the only option
+for DynamicSupervisor.
+
 ```elixir
 defmodule ApiGateway.CircuitBreaker.Supervisor do
   use DynamicSupervisor
@@ -206,6 +221,7 @@ defmodule ApiGateway.CircuitBreaker.Supervisor do
     DynamicSupervisor.start_link(__MODULE__, opts, name: __MODULE__)
   end
 
+  @impl true
   def init(_opts) do
     DynamicSupervisor.init(strategy: :one_for_one)
   end
@@ -214,12 +230,14 @@ defmodule ApiGateway.CircuitBreaker.Supervisor do
   Starts a circuit breaker worker for a service.
   Returns {:ok, pid} or {:error, reason}.
   """
+  @spec start_worker(String.t()) :: {:ok, pid()} | {:error, term()}
   def start_worker(service_name) do
     spec = {ApiGateway.CircuitBreaker.Worker, service_name}
     DynamicSupervisor.start_child(__MODULE__, spec)
   end
 
   @doc "Lists all currently supervised circuit breaker workers."
+  @spec list_workers() :: [pid()]
   def list_workers do
     DynamicSupervisor.which_children(__MODULE__)
     |> Enum.map(fn {_, pid, _, _} -> pid end)
@@ -228,7 +246,45 @@ defmodule ApiGateway.CircuitBreaker.Supervisor do
 end
 ```
 
-### Step 4: `lib/api_gateway/telemetry_supervisor.ex`
+### Step 4: `lib/api_gateway/middleware_supervisor.ex`
+
+AuditWriter and PriorityDispatcher are independent — if one crashes, the other keeps
+working. `:one_for_one` is correct. The `max_restarts` threshold is generous (10 in
+60 seconds) because middleware components may crash transiently under load spikes.
+
+```elixir
+defmodule ApiGateway.MiddlewareSupervisor do
+  use Supervisor
+
+  def start_link(opts) do
+    Supervisor.start_link(__MODULE__, opts, name: __MODULE__)
+  end
+
+  @impl true
+  def init(_opts) do
+    children = [
+      ApiGateway.Middleware.AuditWriter,
+      ApiGateway.Middleware.PriorityDispatcher
+    ]
+
+    Supervisor.init(children,
+      strategy: :one_for_one,
+      max_restarts: 10,
+      max_seconds: 60
+    )
+  end
+end
+```
+
+### Step 5: `lib/api_gateway/telemetry_supervisor.ex`
+
+The Reporter uses `restart: :transient` — if it exits cleanly (e.g., the Datadog agent
+is permanently unavailable and the Reporter gives up gracefully with `:normal`), the
+supervisor does NOT restart it. This prevents the crash loop that was taking down the
+entire gateway. If it crashes abnormally (unexpected error), it still restarts.
+
+The generous `max_restarts: 20, max_seconds: 60` allows the Reporter to crash 20 times
+per minute before the supervisor gives up — telemetry is legitimately noisy.
 
 ```elixir
 defmodule ApiGateway.TelemetrySupervisor do
@@ -238,12 +294,9 @@ defmodule ApiGateway.TelemetrySupervisor do
     Supervisor.start_link(__MODULE__, opts, name: __MODULE__)
   end
 
+  @impl true
   def init(_opts) do
     children = [
-      # TODO: add Reporter with restart: :transient
-      # :transient means: if the reporter terminates cleanly (e.g., Datadog agent
-      # unavailable and it gives up gracefully), the supervisor does NOT restart it.
-      # This prevents the "crash loop" that was taking down the whole gateway.
       %{
         id:      ApiGateway.Telemetry.Reporter,
         start:   {ApiGateway.Telemetry.Reporter, :start_link, [[]]},
@@ -251,8 +304,6 @@ defmodule ApiGateway.TelemetrySupervisor do
       }
     ]
 
-    # Generous thresholds: telemetry is noisy by nature.
-    # It can crash 20 times in 60 seconds before we give up.
     Supervisor.init(children,
       strategy: :one_for_one,
       max_restarts: 20,
@@ -262,7 +313,7 @@ defmodule ApiGateway.TelemetrySupervisor do
 end
 ```
 
-### Step 5: Given tests — must pass without modification
+### Step 6: Given tests — must pass without modification
 
 ```elixir
 # test/api_gateway/supervision_test.exs
@@ -320,7 +371,7 @@ defmodule ApiGateway.SupervisionTest do
 end
 ```
 
-### Step 6: Run the tests
+### Step 7: Run the tests
 
 ```bash
 mix test test/api_gateway/supervision_test.exs --trace

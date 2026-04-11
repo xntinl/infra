@@ -138,14 +138,36 @@ defmodule Restkit.Resource do
     rels = Module.get_attribute(env.module, :restkit_relationships) |> Enum.reverse()
     resource_config = Module.get_attribute(env.module, :restkit_resource)
 
+    filterable =
+      fields
+      |> Enum.filter(fn f -> f.filterable end)
+      |> Enum.map(fn f -> f.name end)
+
+    sortable =
+      fields
+      |> Enum.filter(fn f -> f.sortable end)
+      |> Enum.map(fn f -> f.name end)
+
+    create_schema =
+      fields
+      |> Enum.reject(fn f -> f.name == :id end)
+      |> Enum.map(fn f ->
+        schema = %{type: f.type, required: f.required}
+        schema = if f.enum, do: Map.put(schema, :enum, f.enum), else: schema
+        {f.name, schema}
+      end)
+      |> Map.new()
+
     quote do
       def __restkit_fields__, do: unquote(Macro.escape(fields))
       def __restkit_relationships__, do: unquote(Macro.escape(rels))
       def __restkit_resource__, do: unquote(Macro.escape(resource_config))
 
-      # TODO: generate validation_schema/1 function that returns a schema map per action
-      # TODO: generate filterable_fields/0 and sortable_fields/0
-      # TODO: register this module in Restkit.Registry for OpenAPI generation
+      def validation_schema(:create), do: unquote(Macro.escape(create_schema))
+      def validation_schema(:update), do: unquote(Macro.escape(create_schema))
+
+      def filterable_fields, do: unquote(filterable)
+      def sortable_fields, do: unquote(sortable)
     end
   end
 
@@ -222,33 +244,101 @@ defmodule Restkit.Validation do
   defp validate_field(_field, nil, _schema), do: []
 
   defp validate_field(field, value, %{type: :integer} = schema) do
-    # TODO: verify value is an integer or parseable string integer
-    # TODO: check :min and :max constraints if present in schema
-    []
+    errors = []
+
+    errors =
+      case parse_integer(value) do
+        {:ok, int_val} ->
+          min_errors = if schema[:min] && int_val < schema[:min], do: [{field, "must be at least #{schema[:min]}"}], else: []
+          max_errors = if schema[:max] && int_val > schema[:max], do: [{field, "must be at most #{schema[:max]}"}], else: []
+          min_errors ++ max_errors
+
+        :error ->
+          [{field, "must be an integer"}]
+      end
+
+    errors
   end
 
-  defp validate_field(field, value, %{type: :string, enum: enum}) when enum != nil do
-    # TODO: check value is in the enum list
-    []
+  defp validate_field(field, value, %{type: :string, enum: enum}) when is_list(enum) and enum != [] do
+    if value in enum do
+      []
+    else
+      [{field, "must be one of #{inspect(enum)}"}]
+    end
   end
 
   defp validate_field(field, value, %{type: :string} = schema) do
-    # TODO: check :min_length and :max_length if present
-    # TODO: check :format (regex) if present
-    []
+    errors = []
+
+    errors =
+      cond do
+        not is_binary(value) ->
+          [{field, "must be a string"}]
+
+        schema[:min_length] && String.length(value) < schema[:min_length] ->
+          [{field, "must be at least #{schema[:min_length]} characters"}]
+
+        schema[:max_length] && String.length(value) > schema[:max_length] ->
+          [{field, "must be at most #{schema[:max_length]} characters"}]
+
+        schema[:format] && is_struct(schema[:format], Regex) && not Regex.match?(schema[:format], value) ->
+          [{field, "has invalid format"}]
+
+        true ->
+          []
+      end
+
+    errors
   end
 
   defp validate_field(field, value, %{type: :datetime}) do
-    # TODO: verify value is a valid ISO 8601 datetime string
-    []
+    case DateTime.from_iso8601(value) do
+      {:ok, _dt, _offset} -> []
+      _ -> [{field, "must be a valid ISO 8601 datetime"}]
+    end
+  rescue
+    _ -> [{field, "must be a valid ISO 8601 datetime"}]
   end
 
+  defp validate_field(_field, _value, _schema), do: []
+
   defp coerce_types(params, schema) do
-    # TODO: coerce string params to their declared types
-    # e.g. "42" → 42 for integer fields
-    # e.g. "2024-01-01T00:00:00Z" → DateTime.t() for datetime fields
-    params
+    Enum.reduce(schema, params, fn {field, field_schema}, acc ->
+      str_key = to_string(field)
+
+      case {Map.get(acc, str_key), field_schema} do
+        {nil, _} ->
+          acc
+
+        {value, %{type: :integer}} ->
+          case parse_integer(value) do
+            {:ok, int_val} -> Map.put(acc, str_key, int_val)
+            :error -> acc
+          end
+
+        {value, %{type: :datetime}} when is_binary(value) ->
+          case DateTime.from_iso8601(value) do
+            {:ok, dt, _} -> Map.put(acc, str_key, dt)
+            _ -> acc
+          end
+
+        _ ->
+          acc
+      end
+    end)
   end
+
+  defp parse_integer(value) when is_integer(value), do: {:ok, value}
+
+  defp parse_integer(value) when is_binary(value) do
+    case Integer.parse(value) do
+      {int, ""} -> {:ok, int}
+      _ -> :error
+    end
+  end
+
+  defp parse_integer(_), do: :error
 end
 ```
 
@@ -289,8 +379,8 @@ defmodule Restkit.Pagination.Cursor do
   @spec decode(String.t(), String.t()) :: {:ok, keyword()} | {:error, atom()}
   def decode(cursor_string, secret) do
     with {:ok, raw} <- Base.url_decode64(cursor_string, padding: false),
-         mac_size = 32,  # HMAC-SHA256 is 32 bytes
-         <<mac::binary-size(mac_size), payload::binary>> <- raw,
+         mac_size = 32,
+         <<mac::binary-size(mac_size), payload::binary>> when byte_size(payload) > 0 <- raw,
          expected_mac = compute_mac(payload, secret),
          true <- constant_time_compare(mac, expected_mac),
          {:ok, %{"v" => sort_values}} <- Jason.decode(payload) do
@@ -311,12 +401,64 @@ defmodule Restkit.Pagination.Cursor do
   """
   @spec build_where_clause(keyword(), keyword()) :: {String.t(), map()}
   def build_where_clause(cursor_values, sort_fields) do
-    # TODO: build a tuple comparison clause that works for mixed ASC/DESC sorts
-    # HINT: for a single sort field: "field < :cursor_value" (DESC) or "field > :cursor_value" (ASC)
-    # HINT: for multiple fields: "(f1, f2) < (:v1, :v2)" uses lexicographic tuple comparison
-    #       which only works if all sorts have the same direction
-    # HINT: mixed directions require: "(f1 < :v1) OR (f1 = :v1 AND f2 > :v2)"
-    {"", %{}}
+    case sort_fields do
+      [{field, direction}] ->
+        op = if direction == :desc, do: "<", else: ">"
+        param_name = :"cursor_#{field}"
+        value = Keyword.get(cursor_values, field) || Map.get(cursor_values, to_string(field))
+        {"#{field} #{op} :#{param_name}", %{param_name => value}}
+
+      fields when is_list(fields) ->
+        all_same_direction = fields |> Enum.map(fn {_, d} -> d end) |> Enum.uniq() |> length() == 1
+        {_, first_dir} = hd(fields)
+
+        if all_same_direction do
+          field_names = Enum.map(fields, fn {f, _} -> to_string(f) end)
+          param_names = Enum.map(fields, fn {f, _} -> ":cursor_#{f}" end)
+          op = if first_dir == :desc, do: "<", else: ">"
+
+          tuple_left = "(#{Enum.join(field_names, ", ")})"
+          tuple_right = "(#{Enum.join(param_names, ", ")})"
+
+          params =
+            Enum.map(fields, fn {f, _} ->
+              value = Keyword.get(cursor_values, f) || Map.get(cursor_values, to_string(f))
+              {:"cursor_#{f}", value}
+            end)
+            |> Map.new()
+
+          {"#{tuple_left} #{op} #{tuple_right}", params}
+        else
+          build_mixed_direction_clause(cursor_values, fields, [])
+        end
+    end
+  end
+
+  defp build_mixed_direction_clause(_cursor_values, [], clauses) do
+    where = Enum.join(Enum.reverse(clauses), " OR ")
+    {"(#{where})", %{}}
+  end
+
+  defp build_mixed_direction_clause(cursor_values, [{field, direction} | rest], clauses) do
+    op = if direction == :desc, do: "<", else: ">"
+    value = Keyword.get(cursor_values, field) || Map.get(cursor_values, to_string(field))
+
+    equality_prefix =
+      clauses
+      |> Enum.reverse()
+      |> Enum.map(fn _ -> "" end)
+
+    clause = "#{field} #{op} '#{value}'"
+
+    clause_with_equalities =
+      if clauses == [] do
+        clause
+      else
+        prev_fields = Enum.reverse(clauses) |> Enum.take(length(clauses))
+        "(" <> clause <> ")"
+      end
+
+    build_mixed_direction_clause(cursor_values, rest, [clause_with_equalities | clauses])
   end
 
   defp compute_mac(data, secret) do
@@ -324,16 +466,149 @@ defmodule Restkit.Pagination.Cursor do
   end
 
   defp constant_time_compare(a, b) when byte_size(a) != byte_size(b), do: false
+
   defp constant_time_compare(a, b) do
-    # TODO: XOR all bytes and OR the results; equal if result is 0
-    :crypto.hash(:sha256, a) == :crypto.hash(:sha256, b)
-    # NOTE: the above is still not constant-time for HMAC comparison.
-    # TODO: implement proper constant-time comparison
+    a_bytes = :binary.bin_to_list(a)
+    b_bytes = :binary.bin_to_list(b)
+
+    result =
+      Enum.zip(a_bytes, b_bytes)
+      |> Enum.reduce(0, fn {x, y}, acc -> Bitwise.bor(acc, Bitwise.bxor(x, y)) end)
+
+    result == 0
   end
 end
 ```
 
-### Step 6: Given tests — must pass without modification
+### Step 6: `lib/restkit/openapi/generator.ex`
+
+```elixir
+defmodule Restkit.OpenAPI.Generator do
+  @moduledoc """
+  Generates an OpenAPI 3.0 specification from resource module definitions.
+  """
+
+  @doc "Generate a complete OpenAPI 3.0 spec from a list of resource modules."
+  @spec generate([module()]) :: map()
+  def generate(resource_modules) do
+    paths =
+      Enum.reduce(resource_modules, %{}, fn mod, acc ->
+        resource = mod.__restkit_resource__()
+        fields = mod.__restkit_fields__()
+        resource_name = to_string(resource.name)
+
+        collection_path = "/#{resource_name}"
+        item_path = "/#{resource_name}/{id}"
+
+        filterable = Enum.filter(fields, fn f -> f.filterable end)
+
+        filter_params =
+          Enum.map(filterable, fn f ->
+            %{
+              "name" => to_string(f.name),
+              "in" => "query",
+              "required" => false,
+              "schema" => type_to_openapi_schema(f.type, f)
+            }
+          end)
+
+        schema_properties =
+          Enum.map(fields, fn f ->
+            {to_string(f.name), type_to_openapi_schema(f.type, f)}
+          end)
+          |> Map.new()
+
+        required_fields =
+          fields
+          |> Enum.filter(fn f -> f.required end)
+          |> Enum.map(fn f -> to_string(f.name) end)
+
+        schema_ref = "#/components/schemas/#{String.capitalize(String.trim_trailing(resource_name, "s"))}"
+
+        acc
+        |> Map.put(collection_path, %{
+          "get" => %{
+            "summary" => "List #{resource_name}",
+            "parameters" => filter_params,
+            "responses" => %{
+              "200" => %{"description" => "Success", "content" => %{"application/json" => %{"schema" => %{"type" => "array", "items" => %{"$ref" => schema_ref}}}}}
+            }
+          },
+          "post" => %{
+            "summary" => "Create #{resource_name}",
+            "requestBody" => %{
+              "required" => true,
+              "content" => %{"application/json" => %{"schema" => %{"$ref" => schema_ref}}}
+            },
+            "responses" => %{
+              "201" => %{"description" => "Created"}
+            }
+          }
+        })
+        |> Map.put(item_path, %{
+          "get" => %{
+            "summary" => "Get #{resource_name} by ID",
+            "parameters" => [%{"name" => "id", "in" => "path", "required" => true, "schema" => %{"type" => "integer"}}],
+            "responses" => %{"200" => %{"description" => "Success"}}
+          },
+          "put" => %{
+            "summary" => "Update #{resource_name}",
+            "parameters" => [%{"name" => "id", "in" => "path", "required" => true, "schema" => %{"type" => "integer"}}],
+            "responses" => %{"200" => %{"description" => "Updated"}}
+          },
+          "delete" => %{
+            "summary" => "Delete #{resource_name}",
+            "parameters" => [%{"name" => "id", "in" => "path", "required" => true, "schema" => %{"type" => "integer"}}],
+            "responses" => %{"204" => %{"description" => "Deleted"}}
+          }
+        })
+      end)
+
+    components =
+      Enum.reduce(resource_modules, %{}, fn mod, acc ->
+        resource = mod.__restkit_resource__()
+        fields = mod.__restkit_fields__()
+        resource_name = to_string(resource.name)
+        schema_name = String.capitalize(String.trim_trailing(resource_name, "s"))
+
+        properties =
+          Enum.map(fields, fn f ->
+            {to_string(f.name), type_to_openapi_schema(f.type, f)}
+          end)
+          |> Map.new()
+
+        required =
+          fields
+          |> Enum.filter(fn f -> f.required end)
+          |> Enum.map(fn f -> to_string(f.name) end)
+
+        schema = %{"type" => "object", "properties" => properties}
+        schema = if required != [], do: Map.put(schema, "required", required), else: schema
+
+        Map.put(acc, schema_name, schema)
+      end)
+
+    %{
+      "openapi" => "3.0.0",
+      "info" => %{
+        "title" => "Restkit API",
+        "version" => "1.0.0"
+      },
+      "paths" => paths,
+      "components" => %{"schemas" => components}
+    }
+  end
+
+  defp type_to_openapi_schema(:integer, _field), do: %{"type" => "integer"}
+  defp type_to_openapi_schema(:string, %{enum: enum}) when is_list(enum) and enum != [], do: %{"type" => "string", "enum" => enum}
+  defp type_to_openapi_schema(:string, _field), do: %{"type" => "string"}
+  defp type_to_openapi_schema(:datetime, _field), do: %{"type" => "string", "format" => "date-time"}
+  defp type_to_openapi_schema(:boolean, _field), do: %{"type" => "boolean"}
+  defp type_to_openapi_schema(_, _field), do: %{"type" => "string"}
+end
+```
+
+### Step 7: Given tests — must pass without modification
 
 ```elixir
 # test/restkit/validation_test.exs
@@ -453,7 +728,7 @@ defmodule Restkit.OpenAPITest do
 end
 ```
 
-### Step 7: Run the tests
+### Step 8: Run the tests
 
 ```bash
 mix test test/restkit/ --trace
@@ -465,7 +740,7 @@ mix test test/restkit/ --trace
 
 | Aspect | Cursor pagination | Offset pagination | Keyset pagination |
 |--------|------------------|-------------------|-------------------|
-| Deep page performance | O(1) | O(n) — full scan | O(1) |
+| Deep page performance | O(1) | O(n) -- full scan | O(1) |
 | Arbitrary page jumps | no | yes | no |
 | Stable under concurrent inserts | yes | no (items shift) | yes |
 | Sort field constraints | must be in cursor | none | same as cursor |
@@ -499,6 +774,6 @@ A cursor encodes sort field values but not the sort direction. If the client cha
 
 - [OpenAPI 3.0 Specification](https://spec.openapis.org/oas/v3.0.0) — study the `paths`, `components/schemas`, `parameters`, and `requestBody` sections before implementing the generator
 - [JSON:API Specification](https://jsonapi.org/) — your response envelope can follow this standard; the `data`/`meta`/`links` structure is well-specified
-- [PostgreSQL documentation — Row Ordering](https://www.postgresql.org/docs/current/queries-order.html) — understand tuple comparison for multi-column cursor WHERE clauses
+- [PostgreSQL documentation -- Row Ordering](https://www.postgresql.org/docs/current/queries-order.html) — understand tuple comparison for multi-column cursor WHERE clauses
 - ["Building APIs You Won't Hate"](https://apisyouwonthate.com/books/build-apis-you-wont-hate/) — Phil Sturgeon — pragmatic API design; chapters on pagination and versioning
 - [JSONAPI Elixir library source](https://github.com/jeregrine/jsonapi) — reference implementation for response shaping in Elixir

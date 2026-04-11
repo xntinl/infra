@@ -142,9 +142,21 @@ defmodule MetricsCollector.Registry do
   """
   @spec all_families() :: [map()]
   def all_families do
-    # TODO: read directly from ETS — no GenServer call needed
-    # HINT: :ets.tab2list(@table) returns all entries
-    # HINT: group entries by metric name to build families
+    :ets.tab2list(@table)
+    |> Enum.group_by(
+      fn {name, _labels, _ref} -> name end,
+      fn {_name, labels, ref} -> %{labels: labels, ref: ref} end
+    )
+    |> Enum.map(fn {name, series_list} ->
+      [{^name, meta}] = :ets.lookup(:metrics_registry_meta, name)
+      %{
+        name: name,
+        type: meta.type,
+        help: meta.help,
+        label_names: meta.label_names,
+        series: series_list
+      }
+    end)
   end
 
   @doc """
@@ -154,9 +166,19 @@ defmodule MetricsCollector.Registry do
   """
   @spec check_cardinality(atom(), map()) :: :ok | {:error, :cardinality_exceeded}
   def check_cardinality(metric_name, labels) do
-    # TODO: count distinct label sets for metric_name in ETS
-    # TODO: allow if this label set already exists OR count < @max_label_cardinality
+    existing = :ets.match(@table, {metric_name, :"$1", :_})
+    label_set = normalize_labels(labels)
+
+    already_exists = Enum.any?(existing, fn [l] -> l == label_set end)
+
+    if already_exists or length(existing) < @max_label_cardinality do
+      :ok
+    else
+      {:error, :cardinality_exceeded}
+    end
   end
+
+  defp normalize_labels(labels) when is_map(labels), do: labels |> Enum.sort() |> Map.new()
 
   # ---------------------------------------------------------------------------
   # GenServer
@@ -168,16 +190,21 @@ defmodule MetricsCollector.Registry do
 
   @impl true
   def init(_opts) do
-    table = :ets.new(@table, [:named_table, :public, :set])
-    {:ok, %{table: table}}
+    :ets.new(@table, [:named_table, :public, :bag])
+    :ets.new(:metrics_registry_meta, [:named_table, :public, :set])
+    {:ok, %{}}
   end
 
   @impl true
   def handle_call({:register, name, type, help, label_names}, _from, state) do
-    # TODO: check if name already registered (return error if so)
-    # TODO: insert {name, %{type: type, help: help, label_names: label_names, series: %{}}}
-    # TODO: return {:ok, name} on success
-    {:reply, {:error, :not_implemented}, state}
+    case :ets.lookup(:metrics_registry_meta, name) do
+      [{^name, _meta}] ->
+        {:reply, {:error, :already_registered}, state}
+
+      [] ->
+        :ets.insert(:metrics_registry_meta, {name, %{type: type, help: help, label_names: label_names}})
+        {:reply, {:ok, name}, state}
+    end
   end
 end
 ```
@@ -194,28 +221,64 @@ defmodule MetricsCollector.Types.Counter do
   during resets. Prometheus convention: use a Gauge for values that go down.
   """
 
+  @type t :: %__MODULE__{
+    name: atom(),
+    help: String.t(),
+    label_names: [atom()],
+    atomics_ref: reference(),
+    label_index_table: atom()
+  }
+
   defstruct [:name, :help, :label_names, :atomics_ref, :label_index_table]
+
+  @initial_atomics_size 64
 
   @doc "Creates a new counter. The :atomics array starts at index 1."
   def new(name, help, label_names) do
-    # TODO: create :atomics ref with size 1 (single value for label-less counter)
-    # TODO: for labeled counters, the atomics array grows dynamically — use an ETS
-    #       table to map label_sets to array indices
-    # HINT: :atomics.new(size, [signed: false]) creates unsigned 64-bit array
-    # TODO: return %__MODULE__{...}
+    atomics_ref = :atomics.new(@initial_atomics_size, signed: false)
+    table_name = :"counter_labels_#{name}_#{:erlang.unique_integer([:positive])}"
+    label_table = :ets.new(table_name, [:set, :public])
+
+    %__MODULE__{
+      name: name,
+      help: help,
+      label_names: label_names,
+      atomics_ref: atomics_ref,
+      label_index_table: label_table
+    }
   end
 
   @doc "Increments counter for the given label set by amount (default 1)."
   @spec inc(t(), map(), pos_integer()) :: :ok
   def inc(%__MODULE__{} = counter, labels \\ %{}, amount \\ 1) do
-    # TODO: resolve label_set to an atomics index (create if new, check cardinality)
-    # TODO: :atomics.add(counter.atomics_ref, index, amount)
+    index = resolve_index(counter, labels)
+    :atomics.add(counter.atomics_ref, index, amount)
+    :ok
   end
 
   @doc "Returns current value for the given label set."
   @spec get(t(), map()) :: non_neg_integer()
   def get(%__MODULE__{} = counter, labels \\ %{}) do
-    # TODO: :atomics.get(counter.atomics_ref, index)
+    index = resolve_index(counter, labels)
+    :atomics.get(counter.atomics_ref, index)
+  end
+
+  defp resolve_index(%__MODULE__{label_index_table: table}, labels) do
+    sorted_labels = labels |> Enum.sort()
+
+    case :ets.lookup(table, sorted_labels) do
+      [{^sorted_labels, index}] ->
+        index
+
+      [] ->
+        next_index = :ets.info(table, :size) + 1
+        :ets.insert_new(table, {sorted_labels, next_index})
+
+        case :ets.lookup(table, sorted_labels) do
+          [{^sorted_labels, index}] -> index
+          [] -> next_index
+        end
+    end
   end
 end
 ```
@@ -237,32 +300,109 @@ defmodule MetricsCollector.Types.Histogram do
   that works well when buckets are sized to match the actual distribution.
   """
 
-  # Default buckets follow Prometheus convention for HTTP latency (seconds)
   @default_buckets [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]
 
-  defstruct [:name, :help, :label_names, :buckets, :atomics_ref]
+  @type t :: %__MODULE__{
+    name: atom(),
+    help: String.t(),
+    label_names: [atom()],
+    buckets: [float()],
+    atomics_ref: reference(),
+    label_index_table: atom(),
+    sum_agent: pid()
+  }
 
+  defstruct [:name, :help, :label_names, :buckets, :atomics_ref, :label_index_table, :sum_agent]
+
+  @doc """
+  Creates a new histogram with specified bucket boundaries.
+
+  Layout per label set in the atomics array:
+  [bucket_0, bucket_1, ..., bucket_n, +Inf (= count)]
+  Sum is stored separately in an Agent because :atomics only supports integers.
+  We multiply float sums by a precision factor for integer storage.
+  """
   def new(name, help, label_names, buckets \\ @default_buckets) do
-    # TODO: validate buckets are sorted and finite
-    # TODO: create :atomics array sized for: N buckets + _count + _sum per label set
-    # HINT: layout per label set: [bucket_0, bucket_1, ..., bucket_n, +Inf, count, sum]
-    #       +Inf bucket always equals count
+    sorted_buckets = Enum.sort(buckets)
+    slots_per_label = length(sorted_buckets) + 1
+    atomics_ref = :atomics.new(slots_per_label * 64, signed: false)
+    table_name = :"hist_labels_#{name}_#{:erlang.unique_integer([:positive])}"
+    label_table = :ets.new(table_name, [:set, :public])
+    {:ok, sum_agent} = Agent.start_link(fn -> %{} end)
+
+    %__MODULE__{
+      name: name,
+      help: help,
+      label_names: label_names,
+      buckets: sorted_buckets,
+      atomics_ref: atomics_ref,
+      label_index_table: label_table,
+      sum_agent: sum_agent
+    }
   end
 
   @doc "Records an observation. Updates all buckets where le >= value, plus _count and _sum."
   @spec observe(t(), float(), map()) :: :ok
   def observe(%__MODULE__{} = hist, value, labels \\ %{}) do
-    # TODO: find the atomics base index for this label set
-    # TODO: for each bucket where bucket_bound >= value: :atomics.add(..., bucket_index, 1)
-    # TODO: always increment the +Inf bucket (= _count)
-    # TODO: increment _sum — note: :atomics is integer-only; store sum * 1000 for ms precision
-    #       OR use a separate Agent for float sums (document the trade-off)
+    base_index = resolve_base_index(hist, labels)
+    slots_per_label = length(hist.buckets) + 1
+
+    hist.buckets
+    |> Enum.with_index()
+    |> Enum.each(fn {bound, i} ->
+      if value <= bound do
+        :atomics.add(hist.atomics_ref, base_index + i, 1)
+      end
+    end)
+
+    inf_index = base_index + length(hist.buckets)
+    :atomics.add(hist.atomics_ref, inf_index, 1)
+
+    sorted_labels = labels |> Enum.sort()
+    Agent.update(hist.sum_agent, fn sums ->
+      Map.update(sums, sorted_labels, value, &(&1 + value))
+    end)
+
+    :ok
   end
 
   @doc "Returns {buckets, count, sum} for the given label set."
   def get(%__MODULE__{} = hist, labels \\ %{}) do
-    # TODO: read all atomic values for this label set
-    # TODO: return %{buckets: [{le, count}], count: n, sum: f}
+    base_index = resolve_base_index(hist, labels)
+
+    bucket_values =
+      hist.buckets
+      |> Enum.with_index()
+      |> Enum.map(fn {bound, i} ->
+        {bound, :atomics.get(hist.atomics_ref, base_index + i)}
+      end)
+
+    inf_index = base_index + length(hist.buckets)
+    count = :atomics.get(hist.atomics_ref, inf_index)
+
+    sorted_labels = labels |> Enum.sort()
+    sum = Agent.get(hist.sum_agent, fn sums -> Map.get(sums, sorted_labels, 0.0) end)
+
+    %{buckets: bucket_values, count: count, sum: sum}
+  end
+
+  defp resolve_base_index(%__MODULE__{label_index_table: table, buckets: buckets}, labels) do
+    sorted_labels = labels |> Enum.sort()
+    slots_per_label = length(buckets) + 1
+
+    case :ets.lookup(table, sorted_labels) do
+      [{^sorted_labels, base}] ->
+        base
+
+      [] ->
+        next_base = :ets.info(table, :size) * slots_per_label + 1
+        :ets.insert_new(table, {sorted_labels, next_base})
+
+        case :ets.lookup(table, sorted_labels) do
+          [{^sorted_labels, base}] -> base
+          [] -> next_base
+        end
+    end
   end
 end
 ```

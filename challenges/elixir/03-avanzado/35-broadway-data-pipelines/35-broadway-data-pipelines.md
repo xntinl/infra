@@ -58,9 +58,9 @@ on top of GenStage that adds:
 | Producers | Custom GenStage modules | Plug-and-play: SQS, Kafka, RabbitMQ |
 
 The acknowledgment contract:
-- Message returned from `handle_message/3` without `:failed` status → **ack** (processed)
-- Message with `:failed` status → **nack** (returned to the queue for redelivery)
-- Process crash before returning → **nack** (automatic)
+- Message returned from `handle_message/3` without `:failed` status -> **ack** (processed)
+- Message with `:failed` status -> **nack** (returned to the queue for redelivery)
+- Process crash before returning -> **nack** (automatic)
 
 ---
 
@@ -78,6 +78,10 @@ end
 ```
 
 ### Step 2: `lib/api_gateway/middleware/simulated_producer.ex`
+
+The simulated producer wraps raw messages into Broadway.Message structs with a
+`NoopAcknowledger`. In production, you would use `BroadwaySQS.Producer` or
+`BroadwayKafka.Producer` which handle acknowledgment natively.
 
 ```elixir
 defmodule ApiGateway.Middleware.SimulatedProducer do
@@ -113,6 +117,16 @@ end
 
 ### Step 3: `lib/api_gateway/middleware/webhook_pipeline.ex`
 
+The pipeline has three batchers: `:normal` for bulk inserts, `:high_priority` for immediate
+processing, and `:dead_letter` for permanently failed messages.
+
+`handle_message/3` is the routing stage. It parses JSON, determines priority, and assigns
+each message to the appropriate batcher. Parse failures are marked as failed and routed to
+the dead-letter batcher.
+
+`handle_batch/4` implements the batch-level logic: bulk insert for normal messages,
+immediate processing for high-priority, and logging/alerting for dead-letter entries.
+
 ```elixir
 defmodule ApiGateway.Middleware.WebhookPipeline do
   @moduledoc """
@@ -125,9 +139,9 @@ defmodule ApiGateway.Middleware.WebhookPipeline do
     4. handle_batch/4    — dead-letter queue (:dead_letter)
 
   Acknowledgment:
-    - Successful messages → ack (Broadway default when no :failed status)
-    - Permanently failed messages → nack + routed to :dead_letter batcher
-    - Transiently failed messages → nack without DLQ (provider re-delivers)
+    - Successful messages -> ack (Broadway default when no :failed status)
+    - Permanently failed messages -> nack + routed to :dead_letter batcher
+    - Transiently failed messages -> nack without DLQ (provider re-delivers)
   """
   use Broadway
 
@@ -143,12 +157,12 @@ defmodule ApiGateway.Middleware.WebhookPipeline do
         concurrency: 1
       ],
       processors: [
-        # TODO: default processors with concurrency: 5
+        default: [concurrency: 5]
       ],
       batchers: [
-        # TODO: :normal batcher — batch_size: 100, batch_timeout: 2_000, concurrency: 2
-        # TODO: :high_priority batcher — batch_size: 1, batch_timeout: 100, concurrency: 5
-        # TODO: :dead_letter batcher — batch_size: 10, batch_timeout: 500, concurrency: 1
+        normal: [batch_size: 100, batch_timeout: 2_000, concurrency: 2],
+        high_priority: [batch_size: 1, batch_timeout: 100, concurrency: 5],
+        dead_letter: [batch_size: 10, batch_timeout: 500, concurrency: 1]
       ]
     )
   end
@@ -159,19 +173,19 @@ defmodule ApiGateway.Middleware.WebhookPipeline do
 
   @impl true
   def handle_message(_processor, message, _context) do
-    # TODO: parse message.data (raw JSON string or map)
-    # On parse success:
-    #   - update data with the parsed map
-    #   - route high-priority events to :high_priority batcher
-    #   - route normal events to :normal batcher
-    # On parse failure:
-    #   - mark as failed with Broadway.Message.failed(message, reason)
-    #   - route to :dead_letter batcher
-    #
-    # HINT: Broadway.Message.update_data/2, Broadway.Message.put_batcher/2
-    # HINT: Broadway.Message.failed/2 marks the message but does NOT remove it
-    #       from the pipeline — you still need put_batcher(:dead_letter) after failed/2
-    message
+    case parse_message(message.data) do
+      {:ok, parsed} ->
+        batcher = if parsed["priority"] == "high", do: :high_priority, else: :normal
+
+        message
+        |> Broadway.Message.update_data(fn _raw -> parsed end)
+        |> Broadway.Message.put_batcher(batcher)
+
+      {:error, reason} ->
+        message
+        |> Broadway.Message.failed(reason)
+        |> Broadway.Message.put_batcher(:dead_letter)
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -180,29 +194,29 @@ defmodule ApiGateway.Middleware.WebhookPipeline do
 
   @impl true
   def handle_batch(:normal, messages, _batch_info, _context) do
-    # TODO: simulate bulk database insert
-    # records = Enum.map(messages, fn msg -> %{data: msg.data, inserted_at: DateTime.utc_now()} end)
-    # IO.puts("Bulk insert: #{length(records)} records")
-    # MUST return messages for Broadway to ack them
+    records = Enum.map(messages, fn msg ->
+      %{data: msg.data, inserted_at: DateTime.utc_now()}
+    end)
+
+    IO.puts("Bulk insert: #{length(records)} records")
     messages
   end
 
   @impl true
   def handle_batch(:high_priority, messages, _batch_info, _context) do
-    # TODO: process each high-priority message immediately
-    # IO.puts("HIGH PRIORITY: #{inspect(msg.data)}") for each
-    # MUST return messages
+    Enum.each(messages, fn msg ->
+      IO.puts("HIGH PRIORITY: #{inspect(msg.data)}")
+    end)
+
     messages
   end
 
   @impl true
   def handle_batch(:dead_letter, messages, _batch_info, _context) do
-    # TODO: log each failed message with its status
-    # In production: forward to SQS DLQ, alert Sentry, etc.
-    # MUST return messages
     Enum.each(messages, fn msg ->
       IO.puts("[DLQ] status=#{inspect(msg.status)} data=#{inspect(msg.data)}")
     end)
+
     messages
   end
 
@@ -212,11 +226,24 @@ defmodule ApiGateway.Middleware.WebhookPipeline do
 
   @impl true
   def handle_failed(messages, _context) do
-    # Called for messages that have :failed status but no batcher assigned.
-    # These will be nacked — the producer re-delivers them.
-    # Do NOT re-enqueue manually here — that creates duplicates.
     IO.puts("[Pipeline] #{length(messages)} messages being nacked for redelivery")
     messages
+  end
+
+  # ---------------------------------------------------------------------------
+  # Private helpers
+  # ---------------------------------------------------------------------------
+
+  defp parse_message(data) when is_binary(data) do
+    Jason.decode(data)
+  end
+
+  defp parse_message(data) when is_map(data) do
+    {:ok, data}
+  end
+
+  defp parse_message(data) do
+    {:error, {:invalid_format, data}}
   end
 end
 ```

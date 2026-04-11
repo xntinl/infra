@@ -101,18 +101,54 @@ defmodule Tracer.Span do
   ]
 
   @doc "Starts a new span. Reads parent context from process dictionary."
+  @spec start_span(String.t(), map()) :: %__MODULE__{}
   def start_span(name, attributes \\ %{}) do
-    # TODO
-    # HINT: trace_id = if parent exists, inherit it; else generate new 16-byte random ID
-    # HINT: parent_span_id = current span from process dictionary
-    # HINT: push self as current span into process dictionary
+    parent_context = Process.get(:tracer_context)
+
+    {trace_id, parent_span_id} =
+      case parent_context do
+        %{trace_id: tid, span_id: sid} -> {tid, sid}
+        nil -> {:crypto.strong_rand_bytes(16) |> :binary.decode_unsigned(), nil}
+      end
+
+    span_id = :crypto.strong_rand_bytes(8) |> :binary.decode_unsigned()
+
+    span = %__MODULE__{
+      trace_id: trace_id,
+      span_id: span_id,
+      parent_span_id: parent_span_id,
+      name: name,
+      attributes: attributes,
+      started_at_us: System.monotonic_time(:microsecond),
+      duration_us: nil,
+      status: :ok
+    }
+
+    Process.put(:tracer_context, %{trace_id: trace_id, span_id: span_id, parent_span_id: parent_span_id})
+    span
   end
 
   @doc "Finishes the span, recording duration. Pops self from process dictionary."
-  def finish_span(span) do
-    # TODO
-    # HINT: duration_us = System.monotonic_time(:microsecond) - span.started_at_us
-    # HINT: emit to local collector
+  @spec finish_span(%__MODULE__{}) :: %__MODULE__{}
+  def finish_span(%__MODULE__{} = span) do
+    duration = System.monotonic_time(:microsecond) - span.started_at_us
+    finished = %{span | duration_us: duration}
+
+    case span.parent_span_id do
+      nil -> Process.delete(:tracer_context)
+      parent_id ->
+        Process.put(:tracer_context, %{
+          trace_id: span.trace_id,
+          span_id: parent_id,
+          parent_span_id: nil
+        })
+    end
+
+    if Process.whereis(Tracer.Collector) do
+      send(Tracer.Collector, {:span, finished})
+    end
+
+    finished
   end
 end
 ```
@@ -145,15 +181,50 @@ defmodule Tracer.GenServer do
 
   defmacro __before_compile__(_env) do
     quote do
-      # TODO: defoverridable handle_call/3, handle_cast/2, handle_info/2
-      # TODO: each override:
-      #   1. extracts trace context from message envelope
-      #   2. restores context in process dictionary
-      #   3. starts a span named after the message pattern
-      #   4. calls the original callback
-      #   5. finishes the span
-      #   6. clears trace context from process dictionary
-      # HINT: use defoverridable after use GenServer injects the default callbacks
+      defoverridable handle_call: 3, handle_cast: 2, handle_info: 2
+
+      def handle_call(msg, from, state) do
+        context = extract_context(msg)
+        restore_context(context)
+        span = Tracer.Span.start_span("handle_call")
+
+        try do
+          result = super(msg, from, state)
+          Tracer.Span.finish_span(span)
+          result
+        after
+          Process.delete(:tracer_context)
+        end
+      end
+
+      def handle_cast(msg, state) do
+        context = extract_context(msg)
+        restore_context(context)
+        span = Tracer.Span.start_span("handle_cast")
+
+        try do
+          result = super(msg, state)
+          Tracer.Span.finish_span(span)
+          result
+        after
+          Process.delete(:tracer_context)
+        end
+      end
+
+      def handle_info(msg, state) do
+        span = Tracer.Span.start_span("handle_info")
+        try do
+          result = super(msg, state)
+          Tracer.Span.finish_span(span)
+          result
+        after
+          Process.delete(:tracer_context)
+        end
+      end
+
+      defp extract_context(_msg), do: Process.get(:tracer_context)
+      defp restore_context(nil), do: :ok
+      defp restore_context(ctx), do: Process.put(:tracer_context, ctx)
     end
   end
 end

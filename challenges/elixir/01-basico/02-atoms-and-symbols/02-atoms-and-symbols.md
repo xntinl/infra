@@ -69,6 +69,16 @@ The `Transaction` module needs:
 
 ### `lib/payments_cli/transaction.ex`
 
+Each status maps to a reporting category. The function uses multiple clauses with
+pattern matching — one clause per status. This is idiomatic Elixir: instead of a
+`case` or `if/else` chain, each pattern is a separate function head. Adding a new
+status means adding one clause, not modifying existing logic.
+
+`parse_status/1` converts external string input safely using `String.to_existing_atom/1`
+wrapped in a rescue, then verifies the result is actually a valid status. The two-step
+check (exists as atom + is a valid status) prevents both atom table exhaustion and
+accepting atoms that happen to exist but are not valid statuses.
+
 ```elixir
 defmodule PaymentsCli.Transaction do
   @moduledoc """
@@ -79,9 +89,6 @@ defmodule PaymentsCli.Transaction do
   converted via parse_status/1 — never with String.to_atom/1.
   """
 
-  # The complete set of valid statuses as a module attribute.
-  # Defining them here means the compiler can warn on exhaustiveness
-  # and documents the domain model in one place.
   @valid_statuses [:pending, :approved, :declined, :reversed, :flagged]
 
   @doc """
@@ -108,17 +115,12 @@ defmodule PaymentsCli.Transaction do
 
   """
   @spec classify_status(atom()) :: String.t()
-  def classify_status(status)
-
-  # TODO: implement one clause per status atom
-  #
-  # HINT: use multiple function clauses with pattern matching:
-  #   def classify_status(:approved), do: "successful"
-  #   def classify_status(:reversed), do: "successful"   <- reversals clear successfully
-  #   def classify_status(:declined), do: ...
-  #   def classify_status(:flagged),  do: ...
-  #   def classify_status(:pending),  do: ...
-  #   def classify_status(unknown),   do: ...  <- catch-all for unknown atoms
+  def classify_status(:approved), do: "successful"
+  def classify_status(:reversed), do: "successful"
+  def classify_status(:declined), do: "failed"
+  def classify_status(:flagged), do: "under_review"
+  def classify_status(:pending), do: "pending"
+  def classify_status(_unknown), do: "unknown"
 
   @doc """
   Parses a status string from external input (CSV, API) into a status atom.
@@ -137,18 +139,36 @@ defmodule PaymentsCli.Transaction do
   """
   @spec parse_status(String.t()) :: {:ok, atom()} | {:error, :unknown_status}
   def parse_status(string) when is_binary(string) do
-    # TODO: implement safe status parsing
-    #
-    # HINT: use String.to_existing_atom/1 wrapped in a rescue block.
-    # String.to_existing_atom/1 raises ArgumentError if the atom was never
-    # defined anywhere in the loaded code. This prevents atom table exhaustion
-    # from attacker-controlled input.
-    #
-    # After conversion, verify the atom is actually in @valid_statuses —
-    # an attacker could send "ok" which IS an existing atom but not a valid status.
+    atom =
+      try do
+        String.to_existing_atom(string)
+      rescue
+        ArgumentError -> nil
+      end
+
+    if atom in @valid_statuses do
+      {:ok, atom}
+    else
+      {:error, :unknown_status}
+    end
   end
 end
 ```
+
+**Why this works:**
+
+- `classify_status/1` uses six function clauses. Each clause matches exactly one atom.
+  The compiler evaluates them top-to-bottom and uses the first match. The catch-all
+  `_unknown` at the bottom ensures the function never raises on an unexpected atom —
+  it returns `"unknown"` instead.
+
+- `parse_status/1` uses a two-step defense against malicious input:
+  1. `String.to_existing_atom/1` only converts to atoms that already exist in the atom
+     table. If the string `"hacked"` has never been used as an atom in the running VM,
+     it raises `ArgumentError` — which we rescue and convert to `nil`.
+  2. Even if the conversion succeeds (e.g., `"ok"` is a real atom), we check membership
+     in `@valid_statuses`. This prevents accepting `:ok`, `:true`, or any other existing
+     atom that is not a valid transaction status.
 
 ### Given tests — must pass without modification
 

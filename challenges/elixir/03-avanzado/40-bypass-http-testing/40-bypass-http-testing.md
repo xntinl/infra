@@ -51,11 +51,11 @@ The tests verify:
 
 | Question | Use Bypass | Use Mox |
 |----------|-----------|--------|
-| Does the test care about JSON parsing? | Yes → Bypass | No → Mox |
-| Does the test care about headers sent? | Yes → Bypass | No → Mox |
-| Does the test simulate TCP-level errors? | Yes → Bypass | No → Mox |
-| Is HTTP an implementation detail? | No → Mox | Yes → Mox |
-| Is network I/O acceptable in the test? | Yes → Bypass | No → Mox |
+| Does the test care about JSON parsing? | Yes -> Bypass | No -> Mox |
+| Does the test care about headers sent? | Yes -> Bypass | No -> Mox |
+| Does the test simulate TCP-level errors? | Yes -> Bypass | No -> Mox |
+| Is HTTP an implementation detail? | No -> Mox | Yes -> Mox |
+| Is network I/O acceptable in the test? | Yes -> Bypass | No -> Mox |
 
 ---
 
@@ -74,19 +74,29 @@ end
 
 ### Step 2: `lib/api_gateway/payments/provider_client.ex`
 
+The ProviderClient has two public functions (`fetch/2` and `confirm/2`) that delegate to
+private helpers with retry logic. The `base_url` is configurable via keyword options,
+allowing Bypass to intercept calls in tests.
+
+The retry policy:
+- 500 -> retry up to `max_retries` times with exponential backoff
+- 429 -> retry after the `Retry-After` header value
+- 4xx (other) -> no retry (permanent client error)
+- Network error -> retry up to `max_retries` times
+
 ```elixir
 defmodule ApiGateway.Payments.ProviderClient do
   @moduledoc """
   HTTP client for the payment provider REST API.
 
   The base URL is configurable to allow Bypass to intercept calls in tests:
-    ProviderClient.confirm("ch_001", base_url: "http://localhost:#{bypass.port}")
+    ProviderClient.confirm("ch_001", base_url: "http://localhost:\#{bypass.port}")
 
   Retry policy:
-    - 500 → retry up to max_retries times with exponential backoff
-    - 429 → retry after the Retry-After header value
-    - 4xx (other) → no retry (permanent client error)
-    - Network error → retry up to max_retries times
+    - 500 -> retry up to max_retries times with exponential backoff
+    - 429 -> retry after the Retry-After header value
+    - 4xx (other) -> no retry (permanent client error)
+    - Network error -> retry up to max_retries times
   """
 
   @default_base_url "https://api.payments.example.com"
@@ -128,8 +138,7 @@ defmodule ApiGateway.Payments.ProviderClient do
   defp do_get(url, headers, attempt, max_retries) do
     case Req.get(url, headers: headers) do
       {:ok, %{status: 200, body: body}} ->
-        # TODO: parse the body using parse_charge/1 and return {:ok, charge}
-        {:error, :not_implemented}
+        {:ok, parse_charge(body)}
 
       {:ok, %{status: 404}} ->
         {:error, :not_found}
@@ -138,7 +147,6 @@ defmodule ApiGateway.Payments.ProviderClient do
         {:error, :forbidden}
 
       {:ok, %{status: 429, headers: resp_headers}} ->
-        # TODO: extract Retry-After, retry if attempt < max_retries
         retry_after = get_retry_after(resp_headers)
         if attempt < max_retries do
           Process.sleep(retry_after)
@@ -148,10 +156,13 @@ defmodule ApiGateway.Payments.ProviderClient do
         end
 
       {:ok, %{status: 500}} ->
-        # TODO: exponential backoff and retry if attempt < max_retries
-        # backoff_ms = trunc(@base_backoff_ms * :math.pow(2, attempt))
-        # return {:error, :server_error} when retries are exhausted
-        {:error, :not_implemented}
+        if attempt < max_retries do
+          backoff_ms = trunc(@base_backoff_ms * :math.pow(2, attempt))
+          Process.sleep(backoff_ms)
+          do_get(url, headers, attempt + 1, max_retries)
+        else
+          {:error, :server_error}
+        end
 
       {:error, reason} ->
         {:error, {:network_error, reason}}
@@ -161,8 +172,7 @@ defmodule ApiGateway.Payments.ProviderClient do
   defp do_post(url, body, headers, attempt, max_retries) do
     case Req.post(url, json: body, headers: headers) do
       {:ok, %{status: status, body: resp_body}} when status in [200, 201] ->
-        # TODO: parse resp_body and return {:ok, charge}
-        {:error, :not_implemented}
+        {:ok, parse_charge(resp_body)}
 
       {:ok, %{status: 404}} ->
         {:error, :not_found}
@@ -171,8 +181,13 @@ defmodule ApiGateway.Payments.ProviderClient do
         {:error, {:validation_error, resp_body}}
 
       {:ok, %{status: 500}} ->
-        # TODO: retry with backoff
-        {:error, :not_implemented}
+        if attempt < max_retries do
+          backoff_ms = trunc(@base_backoff_ms * :math.pow(2, attempt))
+          Process.sleep(backoff_ms)
+          do_post(url, body, headers, attempt + 1, max_retries)
+        else
+          {:error, :server_error}
+        end
 
       {:error, reason} ->
         {:error, {:network_error, reason}}

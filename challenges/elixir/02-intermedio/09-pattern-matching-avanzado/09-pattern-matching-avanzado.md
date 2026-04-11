@@ -17,8 +17,8 @@ Project structure at this point:
 task_queue/
 ├── lib/
 │   └── task_queue/
-│       ├── job_router.ex        # ← you implement this
-│       └── payload_decoder.ex   # ← you implement this
+│       ├── job_router.ex
+│       └── payload_decoder.ex
 ├── test/
 │   └── task_queue/
 │       └── pattern_matching_test.exs   # given tests — must pass without modification
@@ -94,15 +94,13 @@ defmodule TaskQueue.JobRouter do
   end
 
   # Rule 2: dead letter — too many retries
-  # HINT: use a guard: when retry_count >= 3
   def route(%{retry_count: retry_count}) when retry_count >= 3 do
-    # TODO: return TaskQueue.Handlers.DeadLetterHandler
+    TaskQueue.Handlers.DeadLetterHandler
   end
 
   # Rule 3: webhook jobs with a URL payload
-  # HINT: nested pattern match on payload: %{url: url} where is_binary(url)
   def route(%{type: :webhook, payload: %{url: url}}) when is_binary(url) do
-    # TODO: return TaskQueue.Handlers.WebhookHandler
+    TaskQueue.Handlers.WebhookHandler
   end
 
   # Rule 4: cron jobs
@@ -111,9 +109,8 @@ defmodule TaskQueue.JobRouter do
   end
 
   # Rule 5: pipeline jobs with a list of steps
-  # HINT: pattern match payload: steps when is_list(steps)
   def route(%{type: :pipeline, payload: steps}) when is_list(steps) do
-    # TODO: return TaskQueue.Handlers.PipelineHandler
+    TaskQueue.Handlers.PipelineHandler
   end
 
   # Rule 6: default fallback
@@ -156,6 +153,17 @@ defmodule TaskQueue.JobRouter do
 end
 ```
 
+The `route/1` function clauses are ordered from most specific to least specific. Clause
+order matters: if the default fallback were listed first, it would match every job and
+none of the specific handlers would ever be reached. The compiler warns about unreachable
+clauses when `@impl` annotations are used, but multi-clause module functions require
+manual ordering discipline.
+
+The `validate/1` function uses a single guard clause with `and` to check all constraints
+at once. If the full validation passes, `{:ok, job}` is returned. The subsequent clauses
+catch specific failures and return descriptive error atoms. This pattern gives precise
+error messages without nested `if/cond` chains.
+
 ### Step 2: `lib/task_queue/payload_decoder.ex`
 
 ```elixir
@@ -196,16 +204,14 @@ defmodule TaskQueue.PayloadDecoder do
   def decode(%{"schedule" => schedule, "command" => command} = raw)
       when is_binary(schedule)
       and is_binary(command) do
-    # HINT: build a CronPayload with timezone defaulting to "UTC"
     timezone = Map.get(raw, "timezone", "UTC")
-    # TODO: return {:ok, %CronPayload{schedule: schedule, command: command, timezone: timezone}}
+    {:ok, %CronPayload{schedule: schedule, command: command, timezone: timezone}}
   end
 
   # Pipeline — must have "steps" as a non-empty list
   def decode(%{"steps" => [_ | _] = steps} = raw) do
-    # HINT: build a PipelinePayload, on_failure defaults to :abort
     on_failure = Map.get(raw, "on_failure", "abort") |> String.to_existing_atom()
-    # TODO: return {:ok, %PipelinePayload{steps: steps, on_failure: on_failure}}
+    {:ok, %PipelinePayload{steps: steps, on_failure: on_failure}}
   end
 
   # Empty steps list is invalid
@@ -225,14 +231,25 @@ defmodule TaskQueue.PayloadDecoder do
   def decode_as(raw, expected_type) do
     case decode(raw) do
       {:ok, %^expected_type{} = payload} -> {:ok, payload}
-      # HINT: the ^ operator pins expected_type — matches only if the struct module
-      #   equals expected_type exactly
       {:ok, _wrong_type} -> {:error, :type_mismatch}
       {:error, _} = err -> err
     end
   end
 end
 ```
+
+The `decode/1` function demonstrates several pattern matching techniques working together:
+
+- **Nested map matching**: `%{"url" => url, "method" => method}` extracts multiple keys
+  in a single pattern. If either key is missing, the clause does not match and the next
+  one is tried.
+- **Guard constraints**: `when is_binary(url) and method in [...]` adds type and value
+  constraints that cannot be expressed in structural patterns alone.
+- **Non-empty list matching**: `[_ | _] = steps` matches lists with at least one element.
+  This is more concise than `when length(steps) > 0` and does not traverse the list.
+- **The pin operator** in `decode_as/2`: `%^expected_type{}` pins the `expected_type`
+  variable so it is used as a match assertion, not a new binding. Without the pin, `expected_type`
+  would rebind to whatever struct module the decoded result has, always matching.
 
 ### Step 3: Given tests — must pass without modification
 
@@ -404,4 +421,4 @@ def route(%{payload: %{url: "https://" <> _rest}}), do: SecureHandler
 - [Pattern Matching — Elixir Getting Started](https://elixir-lang.org/getting-started/pattern-matching.html)
 - [Guards — HexDocs](https://hexdocs.pm/elixir/patterns-and-guards.html)
 - [Kernel — Guard expressions](https://hexdocs.pm/elixir/Kernel.html#module-guards)
-- [Elixir in Action — Saša Jurić](https://www.manning.com/books/elixir-in-action-third-edition) — Chapter 4: Data abstractions
+- [Elixir in Action — Sasa Juric](https://www.manning.com/books/elixir-in-action-third-edition) — Chapter 4: Data abstractions

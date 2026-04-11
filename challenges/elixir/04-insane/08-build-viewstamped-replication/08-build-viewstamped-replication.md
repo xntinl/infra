@@ -99,13 +99,151 @@ defmodule VrReplica.Replica do
     prepare_ok_count: votes received for current op (primary only)
   """
 
-  # TODO: implement init/1
-  # TODO: implement handle_call({:request, client_id, nonce, op}, ...) — primary only
-  # TODO: implement handle_cast({:prepare, ...}, ...) — backup: add to log, send prepare_ok
-  # TODO: implement handle_cast({:commit, commit_number}, ...) — backup: apply ops up to commit_number
-  # TODO: implement handle_cast({:start_view_change, view_number, replica}, ...) — count votes
-  # TODO: implement handle_cast({:do_view_change, ...}, ...) — new primary: collect f+1 logs
-  # TODO: implement handle_cast({:start_view, ...}, ...) — replicas: install new view
+  @impl true
+  def init(opts) do
+    replica_number = Keyword.fetch!(opts, :replica_number)
+    num_replicas = Keyword.fetch!(opts, :num_replicas)
+    peers = Keyword.get(opts, :peers, [])
+
+    state = %{
+      replica_number: replica_number,
+      num_replicas: num_replicas,
+      peers: peers,
+      view_number: 0,
+      status: :normal,
+      op_number: 0,
+      log: [],
+      commit_number: 0,
+      client_table: %{},
+      prepare_ok_count: %{},
+      view_change_votes: MapSet.new(),
+      do_view_change_msgs: [],
+      state_machine: %{},
+      pending_requests: %{}
+    }
+
+    schedule_view_change_timer(state)
+    {:ok, state}
+  end
+
+  @impl true
+  def handle_call({:request, client_id, nonce, op}, from, state) do
+    if primary?(state) do
+      case Map.get(state.client_table, {client_id, nonce}) do
+        nil ->
+          new_op = state.op_number + 1
+          entry = %{op_number: new_op, client_id: client_id, nonce: nonce, op: op}
+          new_log = state.log ++ [entry]
+          new_state = %{state |
+            op_number: new_op,
+            log: new_log,
+            pending_requests: Map.put(state.pending_requests, new_op, from),
+            prepare_ok_count: Map.put(state.prepare_ok_count, new_op, 1)
+          }
+
+          for peer <- state.peers do
+            send(peer, {:prepare, state.view_number, entry, state.commit_number})
+          end
+
+          {:noreply, new_state}
+
+        cached_reply ->
+          {:reply, cached_reply, state}
+      end
+    else
+      {:reply, {:error, :not_primary}, state}
+    end
+  end
+
+  @impl true
+  def handle_info({:prepare, view_number, entry, leader_commit}, state) do
+    if view_number == state.view_number and state.status == :normal and not primary?(state) do
+      new_log = state.log ++ [entry]
+      new_state = %{state | log: new_log, op_number: entry.op_number}
+      new_state = apply_commits(new_state, leader_commit)
+
+      primary = primary_for_view(state.view_number, state.num_replicas)
+      send(primary, {:prepare_ok, state.view_number, entry.op_number, state.replica_number})
+
+      {:noreply, new_state}
+    else
+      {:noreply, state}
+    end
+  end
+
+  def handle_info({:prepare_ok, view_number, op_number, _replica}, state) do
+    if primary?(state) and view_number == state.view_number do
+      count = Map.get(state.prepare_ok_count, op_number, 0) + 1
+      new_counts = Map.put(state.prepare_ok_count, op_number, count)
+      f = div(state.num_replicas - 1, 2)
+
+      new_state = %{state | prepare_ok_count: new_counts}
+
+      if count >= f + 1 and op_number > state.commit_number do
+        committed = apply_commits(new_state, op_number)
+
+        for peer <- state.peers do
+          send(peer, {:commit, committed.commit_number})
+        end
+
+        {:noreply, committed}
+      else
+        {:noreply, new_state}
+      end
+    else
+      {:noreply, state}
+    end
+  end
+
+  def handle_info({:commit, commit_number}, state) do
+    {:noreply, apply_commits(state, commit_number)}
+  end
+
+  def handle_info(:view_change_timeout, state) do
+    if not primary?(state) do
+      VrReplica.ViewChange.start_view_change(state)
+    else
+      schedule_view_change_timer(state)
+      {:noreply, state}
+    end
+  end
+
+  def handle_info(_msg, state), do: {:noreply, state}
+
+  defp primary?(state) do
+    rem(state.view_number, state.num_replicas) == state.replica_number
+  end
+
+  defp primary_for_view(view, num_replicas), do: rem(view, num_replicas)
+
+  defp apply_commits(state, new_commit) do
+    if new_commit > state.commit_number do
+      Enum.reduce((state.commit_number + 1)..new_commit, state, fn op_num, acc ->
+        case Enum.find(acc.log, fn e -> e.op_number == op_num end) do
+          nil -> acc
+          entry ->
+            {reply, new_sm} = VrReplica.StateMachine.apply_op(entry.op, acc.state_machine)
+            new_acc = %{acc |
+              commit_number: op_num,
+              state_machine: new_sm,
+              client_table: Map.put(acc.client_table, {entry.client_id, entry.nonce}, reply)
+            }
+            case Map.pop(new_acc.pending_requests, op_num) do
+              {nil, _} -> new_acc
+              {from, rest} ->
+                GenServer.reply(from, reply)
+                %{new_acc | pending_requests: rest}
+            end
+        end
+      end)
+    else
+      state
+    end
+  end
+
+  defp schedule_view_change_timer(_state) do
+    Process.send_after(self(), :view_change_timeout, 5_000 + :rand.uniform(5_000))
+  end
 end
 ```
 
@@ -131,13 +269,41 @@ defmodule VrReplica.ViewChange do
      - resume normal operation, apply uncommitted ops
   """
 
+  @spec start_view_change(map()) :: {:noreply, map()}
   def start_view_change(state) do
-    # TODO
+    new_view = state.view_number + 1
+    new_state = %{state |
+      view_number: new_view,
+      status: :view_change,
+      view_change_votes: MapSet.new([state.replica_number])
+    }
+
+    for peer <- state.peers do
+      send(peer, {:start_view_change, new_view, state.replica_number})
+    end
+
+    {:noreply, new_state}
   end
 
+  @spec handle_do_view_change(map(), [map()]) :: map()
   def handle_do_view_change(state, messages) do
-    # TODO: select authoritative log
-    # HINT: sort messages by op_number desc, then last_normal_view desc; take first
+    best =
+      messages
+      |> Enum.sort_by(fn msg -> {msg.op_number, msg.last_normal_view} end, :desc)
+      |> List.first()
+
+    new_state = %{state |
+      log: best.log,
+      op_number: best.op_number,
+      commit_number: best.commit_number,
+      status: :normal
+    }
+
+    for peer <- state.peers do
+      send(peer, {:start_view, state.view_number, new_state.log, new_state.op_number, new_state.commit_number})
+    end
+
+    new_state
   end
 end
 ```

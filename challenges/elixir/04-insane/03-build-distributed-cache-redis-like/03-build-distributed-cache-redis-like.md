@@ -1,6 +1,6 @@
 # Distributed Cache with Redis-Compatible Protocol
 
-**Project**: `krebs` — a distributed, multi-node in-memory cache that speaks RESP2 over TCP
+**Project**: `krebs` -- a distributed, multi-node in-memory cache that speaks RESP2 over TCP
 
 ---
 
@@ -43,7 +43,7 @@ krebs/
 
 ## The problem
 
-You need a cache that multiple services connect to over TCP using the Redis protocol so existing tooling (redis-cli, redis-benchmark) works out of the box. The cache must be distributed: no single node holds all data, and the death of one node does not lose data. The protocol parser is the foundation — every byte matters when redis-cli is your integration test.
+You need a cache that multiple services connect to over TCP using the Redis protocol so existing tooling (redis-cli, redis-benchmark) works out of the box. The cache must be distributed: no single node holds all data, and the death of one node does not lose data. The protocol parser is the foundation -- every byte matters when redis-cli is your integration test.
 
 ---
 
@@ -69,7 +69,7 @@ cd krebs
 mkdir -p lib/krebs test/krebs bench
 ```
 
-### Step 2: `mix.exs` — dependencies
+### Step 2: `mix.exs` -- dependencies
 
 ```elixir
 defp deps do
@@ -90,24 +90,33 @@ defmodule Krebs.RESP do
   RESP2 wire protocol encoder and decoder.
 
   Types:
-    Simple strings: "+OK\r\n"
-    Errors:         "-ERR message\r\n"
-    Integers:       ":42\r\n"
-    Bulk strings:   "$5\r\nhello\r\n"   (or "$-1\r\n" for nil)
-    Arrays:         "*2\r\n$3\r\nfoo\r\n$3\r\nbar\r\n"
+    Simple strings: "+OK\\r\\n"
+    Errors:         "-ERR message\\r\\n"
+    Integers:       ":42\\r\\n"
+    Bulk strings:   "$5\\r\\nhello\\r\\n"   (or "$-1\\r\\n" for nil)
+    Arrays:         "*2\\r\\n$3\\r\\nfoo\\r\\n$3\\r\\nbar\\r\\n"
   """
 
+  # --- Encoder ---
+
   @doc "Encodes an Elixir term into RESP2 binary."
-  def encode(:ok),              do: "+OK\r\n"
-  def encode(nil),              do: "$-1\r\n"
+  @spec encode(term()) :: binary()
+  def encode(:ok), do: "+OK\r\n"
+  def encode(nil), do: "$-1\r\n"
   def encode(n) when is_integer(n), do: ":#{n}\r\n"
+
   def encode(s) when is_binary(s) do
-    # TODO: bulk string encoding
+    "$#{byte_size(s)}\r\n#{s}\r\n"
   end
+
   def encode(list) when is_list(list) do
-    # TODO: array encoding
+    elements = Enum.map(list, &encode/1) |> Enum.join()
+    "*#{length(list)}\r\n#{elements}"
   end
-  def encode({:error, msg}),    do: "-ERR #{msg}\r\n"
+
+  def encode({:error, msg}), do: "-ERR #{msg}\r\n"
+
+  # --- Decoder ---
 
   @doc """
   Parses RESP2 bytes from a TCP stream. Returns {:ok, value, rest} when
@@ -116,11 +125,76 @@ defmodule Krebs.RESP do
 
   The connection handler maintains partial_state across TCP recv calls.
   """
-  def parse(buffer) do
-    # TODO
-    # HINT: implement as a state machine — the connection receives bytes
-    #       in arbitrary chunks; a single recv may contain multiple commands
-    #       or only part of one
+  @spec parse(binary()) :: {:ok, term(), binary()} | {:more, binary()}
+  def parse("+" <> rest) do
+    case String.split(rest, "\r\n", parts: 2) do
+      [str, remaining] ->
+        value = if str == "OK", do: :ok, else: str
+        {:ok, value, remaining}
+      [_incomplete] ->
+        {:more, "+" <> rest}
+    end
+  end
+
+  def parse("-" <> rest) do
+    case String.split(rest, "\r\n", parts: 2) do
+      [msg, remaining] -> {:ok, {:error, msg}, remaining}
+      [_incomplete] -> {:more, "-" <> rest}
+    end
+  end
+
+  def parse(":" <> rest) do
+    case String.split(rest, "\r\n", parts: 2) do
+      [num_str, remaining] -> {:ok, String.to_integer(num_str), remaining}
+      [_incomplete] -> {:more, ":" <> rest}
+    end
+  end
+
+  def parse("$" <> rest) do
+    case String.split(rest, "\r\n", parts: 2) do
+      [len_str, remaining] ->
+        len = String.to_integer(len_str)
+        if len == -1 do
+          {:ok, nil, remaining}
+        else
+          if byte_size(remaining) >= len + 2 do
+            <<data::binary-size(len), "\r\n", final_rest::binary>> = remaining
+            {:ok, data, final_rest}
+          else
+            {:more, "$" <> rest}
+          end
+        end
+      [_incomplete] ->
+        {:more, "$" <> rest}
+    end
+  end
+
+  def parse("*" <> rest) do
+    case String.split(rest, "\r\n", parts: 2) do
+      [count_str, remaining] ->
+        count = String.to_integer(count_str)
+        if count == -1 do
+          {:ok, nil, remaining}
+        else
+          parse_array_elements(remaining, count, [])
+        end
+      [_incomplete] ->
+        {:more, "*" <> rest}
+    end
+  end
+
+  def parse(buffer) when byte_size(buffer) == 0, do: {:more, buffer}
+  def parse(buffer), do: {:more, buffer}
+
+  defp parse_array_elements(rest, 0, acc), do: {:ok, Enum.reverse(acc), rest}
+
+  defp parse_array_elements(rest, count, acc) do
+    case parse(rest) do
+      {:ok, element, remaining} ->
+        parse_array_elements(remaining, count - 1, [element | acc])
+      {:more, _} ->
+        {:more, rest}
+    end
   end
 end
 ```
@@ -141,37 +215,78 @@ defmodule Krebs.Ring do
   Key lookup uses binary search: O(log(N * V)) per lookup.
   """
 
+  defstruct [:tokens, :node_count]
+
   @doc "Creates a new ring with the given nodes and virtual node count V."
+  @spec new([atom()], pos_integer()) :: %__MODULE__{}
   def new(nodes, v \\ 150) do
-    # TODO
-    # HINT: for each node, hash "{node_name}:#{i}" for i in 1..V
-    # HINT: sort the resulting list by token value
+    tokens =
+      for node <- nodes, i <- 1..v do
+        token = :erlang.phash2("#{node}:#{i}", 0xFFFFFFFF)
+        {token, node}
+      end
+      |> Enum.uniq_by(fn {token, _} -> token end)
+      |> Enum.sort_by(fn {token, _} -> token end)
+
+    %__MODULE__{tokens: tokens, node_count: length(nodes)}
   end
 
   @doc "Returns the primary physical node for a key."
-  def lookup(ring, key) do
-    # TODO: hash the key, walk the ring clockwise, return the first node
-    # HINT: :erlang.phash2/2 or :crypto.hash(:sha256, key) for better uniformity
+  @spec lookup(%__MODULE__{}, binary()) :: atom()
+  def lookup(%__MODULE__{tokens: tokens}, key) do
+    hash = :erlang.phash2(key, 0xFFFFFFFF)
+
+    case Enum.find(tokens, fn {token, _node} -> token >= hash end) do
+      {_token, node} -> node
+      nil ->
+        {_token, node} = List.first(tokens)
+        node
+    end
   end
 
   @doc "Returns the R replica nodes for a key (primary + R-1 successors)."
-  def replicas(ring, key, r) do
-    # TODO: lookup + next R-1 distinct physical nodes clockwise
+  @spec replicas(%__MODULE__{}, binary(), pos_integer()) :: [atom()]
+  def replicas(%__MODULE__{tokens: tokens}, key, r) do
+    hash = :erlang.phash2(key, 0xFFFFFFFF)
+
+    start_idx =
+      Enum.find_index(tokens, fn {token, _} -> token >= hash end) || 0
+
+    ring_size = length(tokens)
+
+    Stream.iterate(start_idx, fn i -> rem(i + 1, ring_size) end)
+    |> Stream.map(fn i -> elem(Enum.at(tokens, i), 1) end)
+    |> Stream.uniq()
+    |> Enum.take(r)
   end
 
   @doc "Returns a new ring with the node added."
-  def add_node(ring, node, v \\ 150) do
-    # TODO
+  @spec add_node(%__MODULE__{}, atom(), pos_integer()) :: %__MODULE__{}
+  def add_node(%__MODULE__{tokens: existing_tokens, node_count: nc}, node, v \\ 150) do
+    new_tokens =
+      for i <- 1..v do
+        token = :erlang.phash2("#{node}:#{i}", 0xFFFFFFFF)
+        {token, node}
+      end
+
+    merged =
+      (existing_tokens ++ new_tokens)
+      |> Enum.uniq_by(fn {token, _} -> token end)
+      |> Enum.sort_by(fn {token, _} -> token end)
+
+    %__MODULE__{tokens: merged, node_count: nc + 1}
   end
 
   @doc "Returns a new ring with the node removed."
-  def remove_node(ring, node) do
-    # TODO
+  @spec remove_node(%__MODULE__{}, atom()) :: %__MODULE__{}
+  def remove_node(%__MODULE__{tokens: tokens, node_count: nc}, node) do
+    filtered = Enum.reject(tokens, fn {_token, n} -> n == node end)
+    %__MODULE__{tokens: filtered, node_count: max(nc - 1, 0)}
   end
 end
 ```
 
-### Step 5: Given tests — must pass without modification
+### Step 5: Given tests -- must pass without modification
 
 ```elixir
 # test/krebs/resp_test.exs
@@ -292,7 +407,7 @@ Target: 100,000 reads/second and 50,000 writes/second with AOF enabled and R=2 q
 |--------|--------------------------|-------------------------------|------------------------------|
 | Write availability | requires R live replicas | always writes to any node | always available |
 | Read consistency | strong | eventual (until handoff completes) | strong |
-| Failure tolerance | minority partition | sloppy — survives any minority | none |
+| Failure tolerance | minority partition | sloppy -- survives any minority | none |
 | Handoff complexity | none | must track hints, forward on recovery | none |
 | Consistency model | linearizable reads | read-your-writes eventually | linearizable |
 
@@ -321,7 +436,7 @@ The accept loop must only call `:gen_tcp.accept/1` and spawn a handler process. 
 
 ## Resources
 
-- DeCandia, G. et al. (2007). *Dynamo: Amazon's Highly Available Key-Value Store* — sections on consistent hashing, quorum, and hinted handoff
-- [Redis RESP2 protocol specification](https://redis.io/docs/reference/protocol-spec) — study the wire encoding in full detail
-- [Redis `dict.c`](https://github.com/redis/redis/blob/unstable/src/dict.c), [`aof.c`](https://github.com/redis/redis/blob/unstable/src/aof.c) — reference C implementations
-- Karger, D. et al. (1997). *Consistent Hashing and Random Trees* — the original MIT paper
+- DeCandia, G. et al. (2007). *Dynamo: Amazon's Highly Available Key-Value Store* -- sections on consistent hashing, quorum, and hinted handoff
+- [Redis RESP2 protocol specification](https://redis.io/docs/reference/protocol-spec) -- study the wire encoding in full detail
+- [Redis `dict.c`](https://github.com/redis/redis/blob/unstable/src/dict.c), [`aof.c`](https://github.com/redis/redis/blob/unstable/src/aof.c) -- reference C implementations
+- Karger, D. et al. (1997). *Consistent Hashing and Random Trees* -- the original MIT paper
