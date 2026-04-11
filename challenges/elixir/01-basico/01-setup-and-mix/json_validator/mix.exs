@@ -18,7 +18,16 @@ defmodule JsonValidator.MixProject do
     ]
   end
 
-  # Run "mix help compile.app" to learn about applications.
+  def cli do
+    [
+      preferred_envs: [
+        coveralls: :test,
+        "coveralls.detail": :test,
+        "coveralls.html": :test
+      ]
+    ]
+  end
+
   def application do
     [
       extra_applications: [:logger]

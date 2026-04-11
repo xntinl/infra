@@ -1,395 +1,486 @@
-# Anonymous Functions and Closures: Configurable Processing Rules
+# Anonymous Functions and Closures: Building a Rules Engine
 
-**Project**: `payments_cli` — a CLI tool that processes payment transactions
-
----
-
-## Project context
-
-You are building `payments_cli`, a CLI tool that processes payment transactions from CSV
-files, validates them, applies business rules, and produces ledger reports.
-
-This exercise implements a `Rules` module that provides factory functions returning
-configured closures: fee calculators, transaction filters, formatters, and validators
-that can be swapped at runtime without changing module APIs. Anonymous functions and
-closures are the mechanism that enables this runtime configurability.
+**Project**: `rules_engine` — a business rules engine where rules are first-class functions composed at runtime
 
 ---
 
-## Why closures enable configurable systems
+## Why closures replace the Strategy pattern
 
-A named function is defined at compile time and cannot capture runtime state.
-An anonymous function (closure) captures variables from the scope where it was
-created. This enables runtime configuration without changing the calling API.
-
-Consider a fee calculator. Different payment processors have different fee structures.
-Instead of a `calculate_fee(amount, processor)` function with a long `case`, you
-create a closure per processor at startup:
+In Java or Go, the Strategy pattern requires defining an interface, implementing
+it in multiple classes, and injecting the strategy at construction time. In Elixir,
+a function IS a strategy. You do not need interfaces, classes, or dependency injection
+frameworks — just pass a function.
 
 ```elixir
-stripe_fee    = make_fee_calculator(250, 30)  # 2.5% + $0.30
-paypal_fee    = make_fee_calculator(290, 0)   # 2.9% + $0
-enterprise_fee = make_fee_calculator(100, 0)  # 1.0% + $0
+# Java needs: interface, classes, constructor injection
+# Elixir needs: a function
 
-# Later, the processor just calls the function — it does not know the rates
-fee = stripe_fee.(transaction.amount_cents)
+# Define a rule as a function
+age_check = fn user -> user.age >= 18 end
+
+# Compose rules
+rules = [age_check, fn user -> user.verified end]
+
+# Apply them
+Enum.all?(rules, fn rule -> rule.(user) end)
 ```
 
-This is the **Strategy pattern** from OO design, expressed as higher-order functions.
-The closure is the strategy. The caller does not need to know which strategy it has.
+Closures add another dimension: a function can capture variables from its creation
+context. This means you can create parameterized rules at runtime without classes:
 
-The production consequence: configuration loaded from environment variables or a
-database at startup can be captured in closures and used by the processing pipeline
-without threading configuration through every function signature.
+```elixir
+# min_age is "closed over" — captured at creation time
+def min_age_rule(min_age) do
+  fn user -> user.age >= min_age end
+end
+
+# Creates different functions with different captured values
+adult_rule = min_age_rule(18)
+senior_rule = min_age_rule(65)
+```
 
 ---
 
 ## The business problem
 
-The `Rules` module provides factory functions that return configured closures:
+Build a rules engine for an insurance quoting system that:
 
-1. A fee calculator factory (configured with rate and fixed fee)
-2. A transaction filter factory (configured with criteria)
-3. A formatter factory (configured with locale/currency options)
-4. A validator factory (configured with validation rules)
+1. Defines rules as anonymous functions (closures)
+2. Composes rules using `and`, `or`, and `not` combinators
+3. Creates parameterized rules using factory functions (closures)
+4. Evaluates a set of rules against an applicant and returns a decision
+5. Provides detailed explanations for which rules passed or failed
 
 ---
 
 ## Implementation
 
-### `lib/payments_cli/rules.ex`
-
-Each factory function returns a closure that captures its configuration. The caller
-receives a function and does not need to know the configuration — it just calls the
-function. This decouples configuration from invocation.
-
-`make_fee_calculator/2` returns a function that computes `floor(amount * rate) + fixed`.
-`make_filter/1` returns a predicate that applies all active filter criteria.
-`make_formatter/1` returns a function that formats a transaction with captured options.
-`make_validator/1` composes multiple validator functions into one.
+### `lib/rules_engine.ex`
 
 ```elixir
-defmodule PaymentsCli.Rules do
+defmodule RulesEngine do
   @moduledoc """
-  Factory functions that produce configured closures for transaction processing.
+  A business rules engine using anonymous functions and closures.
 
-  Each factory captures its configuration at creation time. The returned function
-  can be passed to Enum functions, stored in maps, or called directly — it carries
-  its configuration without requiring it to be threaded through every call site.
+  Rules are functions that take a subject and return a boolean.
+  Rule factories are functions that return rules (closures capturing config).
+  Combinators compose rules into complex logic without inheritance.
   """
 
-  @doc """
-  Returns a fee calculator function configured with basis points and fixed fee.
+  @type subject :: map()
+  @type rule :: (subject() -> boolean())
+  @type named_rule :: {String.t(), rule()}
 
-  The returned function takes amount_cents (integer) and returns fee_cents (integer).
-  Fee = floor(amount * rate) + fixed_fee
+  # --- Rule Factories (closures) ---
+
+  @doc """
+  Creates a rule that checks if a field value meets a minimum.
+
+  The returned function closes over `field` and `minimum`,
+  capturing them at creation time.
 
   ## Examples
 
-      iex> calc = PaymentsCli.Rules.make_fee_calculator(250, 30)
-      iex> calc.(1000)
-      55
-
-      iex> calc = PaymentsCli.Rules.make_fee_calculator(0, 0)
-      iex> calc.(9999)
-      0
-
-  """
-  @spec make_fee_calculator(non_neg_integer(), non_neg_integer()) ::
-          (integer() -> integer())
-  def make_fee_calculator(basis_points, fixed_fee_cents)
-      when is_integer(basis_points) and basis_points >= 0 and
-           is_integer(fixed_fee_cents) and fixed_fee_cents >= 0 do
-    fn amount_cents ->
-      percentage_fee = div(amount_cents * basis_points, 10_000)
-      percentage_fee + fixed_fee_cents
-    end
-  end
-
-  @doc """
-  Returns a filter predicate function configured with filter criteria.
-
-  criteria is a map with optional keys:
-    - min_amount: integer (inclusive)
-    - max_amount: integer (inclusive)
-    - statuses: list of atoms (if present, only these statuses pass)
-    - currencies: list of strings (if present, only these currencies pass)
-
-  The returned function takes a transaction map and returns a boolean.
-
-  ## Examples
-
-      iex> filter = PaymentsCli.Rules.make_filter(%{min_amount: 1000, statuses: [:approved]})
-      iex> filter.(%{amount_cents: 500,  status: :approved})
-      false
-      iex> filter.(%{amount_cents: 1500, status: :approved})
+      iex> rule = RulesEngine.min_value(:age, 18)
+      iex> rule.(%{age: 25})
       true
-      iex> filter.(%{amount_cents: 1500, status: :declined})
+      iex> rule.(%{age: 16})
       false
 
   """
-  @spec make_filter(map()) :: (map() -> boolean())
-  def make_filter(criteria) when is_map(criteria) do
-    fn tx ->
-      passes_min?(tx, criteria) and
-        passes_max?(tx, criteria) and
-        passes_statuses?(tx, criteria) and
-        passes_currencies?(tx, criteria)
+  @spec min_value(atom(), number()) :: rule()
+  def min_value(field, minimum) do
+    fn subject ->
+      value = Map.get(subject, field, 0)
+      is_number(value) and value >= minimum
     end
   end
 
   @doc """
-  Returns a formatting function configured with display options.
-
-  opts is a keyword list with:
-    - currency_symbol: string (default: use currency code)
-    - show_status: boolean (default: false)
-    - max_merchant_length: integer (default: 30)
-
-  The returned function takes a transaction map and returns a formatted string.
+  Creates a rule that checks if a field value does not exceed a maximum.
 
   ## Examples
 
-      iex> fmt = PaymentsCli.Rules.make_formatter(currency_symbol: "$", show_status: true)
-      iex> fmt.(%{id: "T1", amount_cents: 1234, currency: "USD", status: :approved, merchant: "Shop"})
-      "T1 | Shop | $12.34 | approved"
+      iex> rule = RulesEngine.max_value(:debt_ratio, 0.5)
+      iex> rule.(%{debt_ratio: 0.3})
+      true
+      iex> rule.(%{debt_ratio: 0.8})
+      false
 
   """
-  @spec make_formatter(keyword()) :: (map() -> String.t())
-  def make_formatter(opts \\ []) when is_list(opts) do
-    symbol = Keyword.get(opts, :currency_symbol, nil)
-    show_status = Keyword.get(opts, :show_status, false)
-    max_len = Keyword.get(opts, :max_merchant_length, 30)
-
-    fn tx ->
-      amount_str = format_amount(tx.amount_cents, tx.currency, symbol)
-      merchant = String.slice(tx.merchant || "", 0, max_len)
-      base = "#{tx.id} | #{merchant} | #{amount_str}"
-
-      if show_status do
-        base <> " | #{tx.status}"
-      else
-        base
-      end
+  @spec max_value(atom(), number()) :: rule()
+  def max_value(field, maximum) do
+    fn subject ->
+      value = Map.get(subject, field, 0)
+      is_number(value) and value <= maximum
     end
   end
 
   @doc """
-  Returns a composed validator function from a list of individual validator functions.
-
-  Each validator in the list takes a transaction and returns :ok or {:error, reason}.
-  The composed validator runs all validators and returns :ok only if all pass,
-  or {:error, [reasons]} with all failure reasons.
+  Creates a rule that checks if a field is in a set of allowed values.
 
   ## Examples
 
-      iex> v1 = fn tx -> if tx.amount_cents > 0, do: :ok, else: {:error, "bad amount"} end
-      iex> v2 = fn tx -> if is_binary(tx.currency), do: :ok, else: {:error, "bad currency"} end
-      iex> combined = PaymentsCli.Rules.make_validator([v1, v2])
-      iex> combined.(%{amount_cents: 100, currency: "USD"})
-      :ok
-      iex> combined.(%{amount_cents: -1, currency: "USD"})
-      {:error, ["bad amount"]}
+      iex> rule = RulesEngine.in_set(:state, MapSet.new(["CA", "NY", "TX"]))
+      iex> rule.(%{state: "CA"})
+      true
+      iex> rule.(%{state: "FL"})
+      false
 
   """
-  @spec make_validator([(map() -> :ok | {:error, String.t()})]) ::
-          (map() -> :ok | {:error, [String.t()]})
-  def make_validator(validators) when is_list(validators) do
-    fn tx ->
-      errors =
-        Enum.reduce(validators, [], fn validator, acc ->
-          case validator.(tx) do
-            :ok -> acc
-            {:error, reason} -> [reason | acc]
-          end
-        end)
-
-      case errors do
-        [] -> :ok
-        reasons -> {:error, Enum.reverse(reasons)}
-      end
+  @spec in_set(atom(), MapSet.t()) :: rule()
+  def in_set(field, allowed_values) do
+    fn subject ->
+      MapSet.member?(allowed_values, Map.get(subject, field))
     end
   end
 
-  # ---------------------------------------------------------------------------
-  # Private helpers
-  # ---------------------------------------------------------------------------
+  @doc """
+  Creates a rule that checks if a field matches a regex pattern.
 
-  defp passes_min?(tx, %{min_amount: min}), do: tx.amount_cents >= min
-  defp passes_min?(_tx, _criteria), do: true
+  ## Examples
 
-  defp passes_max?(tx, %{max_amount: max}), do: tx.amount_cents <= max
-  defp passes_max?(_tx, _criteria), do: true
+      iex> rule = RulesEngine.matches(:email, ~r/@.+\\./)
+      iex> rule.(%{email: "user@example.com"})
+      true
+      iex> rule.(%{email: "invalid"})
+      false
 
-  defp passes_statuses?(tx, %{statuses: statuses}), do: tx.status in statuses
-  defp passes_statuses?(_tx, _criteria), do: true
-
-  defp passes_currencies?(tx, %{currencies: currencies}), do: tx.currency in currencies
-  defp passes_currencies?(_tx, _criteria), do: true
-
-  defp format_amount(cents, currency, nil) do
-    dollars = div(cents, 100)
-    minor = rem(cents, 100)
-    "#{currency} #{dollars}.#{String.pad_leading(Integer.to_string(minor), 2, "0")}"
+  """
+  @spec matches(atom(), Regex.t()) :: rule()
+  def matches(field, pattern) do
+    fn subject ->
+      value = Map.get(subject, field, "")
+      is_binary(value) and Regex.match?(pattern, value)
+    end
   end
 
-  defp format_amount(cents, _currency, symbol) do
-    dollars = div(cents, 100)
-    minor = rem(cents, 100)
-    "#{symbol}#{dollars}.#{String.pad_leading(Integer.to_string(minor), 2, "0")}"
+  # --- Combinators ---
+
+  @doc """
+  Combines rules with AND logic — all must pass.
+
+  ## Examples
+
+      iex> rule = RulesEngine.all_of([
+      ...>   RulesEngine.min_value(:age, 18),
+      ...>   RulesEngine.max_value(:debt_ratio, 0.5)
+      ...> ])
+      iex> rule.(%{age: 25, debt_ratio: 0.3})
+      true
+      iex> rule.(%{age: 25, debt_ratio: 0.8})
+      false
+
+  """
+  @spec all_of([rule()]) :: rule()
+  def all_of(rules) when is_list(rules) do
+    fn subject ->
+      Enum.all?(rules, fn rule -> rule.(subject) end)
+    end
+  end
+
+  @doc """
+  Combines rules with OR logic — at least one must pass.
+
+  ## Examples
+
+      iex> rule = RulesEngine.any_of([
+      ...>   RulesEngine.min_value(:age, 65),
+      ...>   RulesEngine.min_value(:years_employed, 10)
+      ...> ])
+      iex> rule.(%{age: 70, years_employed: 2})
+      true
+      iex> rule.(%{age: 30, years_employed: 15})
+      true
+      iex> rule.(%{age: 30, years_employed: 2})
+      false
+
+  """
+  @spec any_of([rule()]) :: rule()
+  def any_of(rules) when is_list(rules) do
+    fn subject ->
+      Enum.any?(rules, fn rule -> rule.(subject) end)
+    end
+  end
+
+  @doc """
+  Negates a rule.
+
+  ## Examples
+
+      iex> not_minor = RulesEngine.negate(RulesEngine.max_value(:age, 17))
+      iex> not_minor.(%{age: 25})
+      true
+      iex> not_minor.(%{age: 15})
+      false
+
+  """
+  @spec negate(rule()) :: rule()
+  def negate(rule) do
+    fn subject -> not rule.(subject) end
+  end
+
+  # --- Evaluation with explanations ---
+
+  @doc """
+  Evaluates named rules and returns a detailed result.
+
+  Each named rule is a {name, rule_function} tuple. The result
+  includes which rules passed, which failed, and the overall decision.
+
+  ## Examples
+
+      iex> rules = [
+      ...>   {"minimum age", RulesEngine.min_value(:age, 18)},
+      ...>   {"low debt", RulesEngine.max_value(:debt_ratio, 0.5)}
+      ...> ]
+      iex> result = RulesEngine.evaluate(rules, %{age: 25, debt_ratio: 0.3})
+      iex> result.approved
+      true
+      iex> length(result.passed)
+      2
+
+  """
+  @spec evaluate([named_rule()], subject()) :: map()
+  def evaluate(named_rules, subject) when is_list(named_rules) and is_map(subject) do
+    results =
+      Enum.map(named_rules, fn {name, rule} ->
+        {name, rule.(subject)}
+      end)
+
+    passed = for {name, true} <- results, do: name
+    failed = for {name, false} <- results, do: name
+
+    %{
+      approved: failed == [],
+      passed: passed,
+      failed: failed,
+      total_rules: length(named_rules)
+    }
+  end
+
+  @doc """
+  Builds a rule set from a declarative configuration.
+
+  Demonstrates how closures enable configuration-driven behavior:
+  the rules are created at startup from a data structure,
+  not hardcoded as module functions.
+
+  ## Examples
+
+      iex> config = [
+      ...>   %{name: "adult", type: :min, field: :age, value: 18},
+      ...>   %{name: "low debt", type: :max, field: :debt_ratio, value: 0.5}
+      ...> ]
+      iex> rules = RulesEngine.from_config(config)
+      iex> result = RulesEngine.evaluate(rules, %{age: 25, debt_ratio: 0.3})
+      iex> result.approved
+      true
+
+  """
+  @spec from_config([map()]) :: [named_rule()]
+  def from_config(config) when is_list(config) do
+    Enum.map(config, fn rule_def ->
+      {rule_def.name, build_rule(rule_def)}
+    end)
+  end
+
+  @spec build_rule(map()) :: rule()
+  defp build_rule(%{type: :min, field: field, value: value}) do
+    min_value(field, value)
+  end
+
+  defp build_rule(%{type: :max, field: field, value: value}) do
+    max_value(field, value)
+  end
+
+  defp build_rule(%{type: :in, field: field, value: values}) do
+    in_set(field, MapSet.new(values))
+  end
+
+  defp build_rule(%{type: :matches, field: field, value: pattern}) do
+    matches(field, Regex.compile!(pattern))
   end
 end
 ```
 
 **Why this works:**
 
-- `make_fee_calculator/2` returns a `fn` that closes over `basis_points` and
-  `fixed_fee_cents`. Each call to the factory creates an independent closure with its
-  own captured values. Multiple calculators coexist without interference.
-
-- `make_filter/1` returns a `fn` that closes over `criteria` and delegates to private
-  helpers. Each helper uses pattern matching: `passes_min?(tx, %{min_amount: min})`
-  matches when the criteria map has `:min_amount`; the catch-all `passes_min?(_tx, _criteria)`
-  returns `true` when the key is absent. This means absent criteria = no constraint.
-
-- `make_formatter/1` extracts options once at factory time (not per call), capturing
-  the resolved values in the closure. The returned function only does formatting work —
-  it does not re-read options on every invocation.
-
-- `make_validator/1` returns a closure that reduces over the captured list of validators.
-  Each validator is called with the transaction; errors are collected into a list.
-  If no errors, return `:ok`. If errors, return them in order (reversed back from
-  accumulation order).
+- Rule factories (`min_value/2`, `max_value/2`, etc.) return anonymous functions
+  that close over their parameters. Each call creates a new function with different
+  captured values. This is the Strategy pattern without classes.
+- Combinators (`all_of/1`, `any_of/1`, `negate/1`) take rules and return new rules.
+  This is function composition — building complex behavior from simple pieces.
+- `evaluate/2` takes named rules (tuples of name + function) and applies each to
+  the subject. The comprehension `for {name, true} <- results` filters only passing
+  rules using pattern matching inside the `for`.
+- `from_config/1` builds rules from data at runtime. The rules are closures, so
+  they carry their configuration internally. No global state needed.
 
 ### Tests
 
 ```elixir
-# test/payments_cli/rules_test.exs
-defmodule PaymentsCli.RulesTest do
+# test/rules_engine_test.exs
+defmodule RulesEngineTest do
   use ExUnit.Case, async: true
 
-  alias PaymentsCli.Rules
+  doctest RulesEngine
 
-  describe "make_fee_calculator/2" do
-    test "returns a function" do
-      calc = Rules.make_fee_calculator(250, 30)
-      assert is_function(calc, 1)
+  @applicant %{
+    age: 35,
+    income: 75_000,
+    debt_ratio: 0.3,
+    years_employed: 5,
+    state: "CA",
+    email: "alice@example.com"
+  }
+
+  describe "rule factories" do
+    test "min_value creates a threshold rule" do
+      rule = RulesEngine.min_value(:age, 18)
+      assert rule.(%{age: 25})
+      refute rule.(%{age: 16})
     end
 
-    test "calculates fee with percentage and fixed component" do
-      # 2.5% of 1000 = 25 cents + 30 cents fixed = 55 cents
-      calc = Rules.make_fee_calculator(250, 30)
-      assert calc.(1000) == 55
+    test "max_value creates a ceiling rule" do
+      rule = RulesEngine.max_value(:debt_ratio, 0.5)
+      assert rule.(%{debt_ratio: 0.3})
+      refute rule.(%{debt_ratio: 0.8})
     end
 
-    test "zero rate and zero fixed" do
-      calc = Rules.make_fee_calculator(0, 0)
-      assert calc.(9999) == 0
+    test "in_set checks membership" do
+      rule = RulesEngine.in_set(:state, MapSet.new(["CA", "NY"]))
+      assert rule.(%{state: "CA"})
+      refute rule.(%{state: "FL"})
     end
 
-    test "different calculators are independent" do
-      stripe = Rules.make_fee_calculator(250, 30)
-      paypal = Rules.make_fee_calculator(290, 0)
-      # Same amount, different fees
-      assert stripe.(1000) != paypal.(1000)
+    test "matches checks regex" do
+      rule = RulesEngine.matches(:email, ~r/@.+\./)
+      assert rule.(%{email: "a@b.com"})
+      refute rule.(%{email: "invalid"})
     end
 
-    test "each calculator closure captures its own configuration" do
-      calcs = Enum.map([100, 200, 300], fn bp -> Rules.make_fee_calculator(bp, 0) end)
-      # Each calc should use its own basis points
-      fees = Enum.map(calcs, fn calc -> calc.(10_000) end)
-      assert fees == [100, 200, 300]
-    end
-  end
-
-  describe "make_filter/1" do
-    test "returns a function" do
-      filter = Rules.make_filter(%{})
-      assert is_function(filter, 1)
-    end
-
-    test "min_amount filter" do
-      filter = Rules.make_filter(%{min_amount: 1000})
-      assert filter.(%{amount_cents: 999,  status: :approved, currency: "USD"}) == false
-      assert filter.(%{amount_cents: 1000, status: :approved, currency: "USD"}) == true
-    end
-
-    test "status filter" do
-      filter = Rules.make_filter(%{statuses: [:approved]})
-      assert filter.(%{amount_cents: 100, status: :declined, currency: "USD"}) == false
-      assert filter.(%{amount_cents: 100, status: :approved, currency: "USD"}) == true
-    end
-
-    test "combined criteria" do
-      filter = Rules.make_filter(%{min_amount: 500, statuses: [:approved]})
-      assert filter.(%{amount_cents: 1000, status: :approved, currency: "USD"}) == true
-      assert filter.(%{amount_cents: 100,  status: :approved, currency: "USD"}) == false
-      assert filter.(%{amount_cents: 1000, status: :declined, currency: "USD"}) == false
-    end
-
-    test "empty criteria passes everything" do
-      filter = Rules.make_filter(%{})
-      assert filter.(%{amount_cents: 1, status: :declined, currency: "XYZ"}) == true
+    test "handles missing fields gracefully" do
+      rule = RulesEngine.min_value(:age, 18)
+      refute rule.(%{})
     end
   end
 
-  describe "make_formatter/1" do
-    @tx %{id: "T1", amount_cents: 1234, currency: "USD", status: :approved, merchant: "Coffee Shop"}
+  describe "combinators" do
+    test "all_of requires all rules to pass" do
+      rule = RulesEngine.all_of([
+        RulesEngine.min_value(:age, 18),
+        RulesEngine.max_value(:debt_ratio, 0.5)
+      ])
 
-    test "returns a function" do
-      fmt = Rules.make_formatter()
-      assert is_function(fmt, 1)
+      assert rule.(@applicant)
+      refute rule.(%{age: 25, debt_ratio: 0.8})
     end
 
-    test "formats without symbol by default" do
-      fmt = Rules.make_formatter()
-      result = fmt.(@tx)
-      assert String.contains?(result, "T1")
-      assert String.contains?(result, "USD")
+    test "any_of requires at least one rule to pass" do
+      rule = RulesEngine.any_of([
+        RulesEngine.min_value(:age, 65),
+        RulesEngine.min_value(:years_employed, 10)
+      ])
+
+      refute rule.(@applicant)
+      assert rule.(%{age: 70, years_employed: 1})
     end
 
-    test "formats with currency symbol" do
-      fmt = Rules.make_formatter(currency_symbol: "$")
-      result = fmt.(@tx)
-      assert String.contains?(result, "$12.34")
+    test "negate inverts a rule" do
+      rule = RulesEngine.negate(RulesEngine.max_value(:age, 17))
+      assert rule.(@applicant)
+      refute rule.(%{age: 15})
     end
 
-    test "includes status when show_status is true" do
-      fmt = Rules.make_formatter(show_status: true)
-      result = fmt.(@tx)
-      assert String.contains?(result, "approved")
-    end
+    test "combinators compose deeply" do
+      rule = RulesEngine.all_of([
+        RulesEngine.min_value(:age, 18),
+        RulesEngine.any_of([
+          RulesEngine.min_value(:income, 50_000),
+          RulesEngine.min_value(:years_employed, 10)
+        ]),
+        RulesEngine.negate(RulesEngine.in_set(:state, MapSet.new(["XX"])))
+      ])
 
-    test "omits status by default" do
-      fmt = Rules.make_formatter()
-      result = fmt.(@tx)
-      refute String.contains?(result, "approved")
+      assert rule.(@applicant)
     end
   end
 
-  describe "make_validator/1" do
-    @amount_v fn tx -> if tx.amount_cents > 0, do: :ok, else: {:error, "bad amount"} end
-    @currency_v fn tx -> if is_binary(tx.currency), do: :ok, else: {:error, "bad currency"} end
+  describe "evaluate/2" do
+    test "returns detailed results" do
+      rules = [
+        {"minimum age", RulesEngine.min_value(:age, 18)},
+        {"low debt", RulesEngine.max_value(:debt_ratio, 0.5)},
+        {"valid state", RulesEngine.in_set(:state, MapSet.new(["CA", "NY"]))}
+      ]
 
-    test "returns a function" do
-      v = Rules.make_validator([@amount_v])
-      assert is_function(v, 1)
+      result = RulesEngine.evaluate(rules, @applicant)
+      assert result.approved == true
+      assert length(result.passed) == 3
+      assert result.failed == []
+      assert result.total_rules == 3
     end
 
-    test "returns :ok when all validators pass" do
-      v = Rules.make_validator([@amount_v, @currency_v])
-      assert v.(%{amount_cents: 100, currency: "USD"}) == :ok
+    test "reports failures" do
+      rules = [
+        {"minimum age", RulesEngine.min_value(:age, 18)},
+        {"high income", RulesEngine.min_value(:income, 100_000)}
+      ]
+
+      result = RulesEngine.evaluate(rules, @applicant)
+      assert result.approved == false
+      assert "high income" in result.failed
+      assert "minimum age" in result.passed
+    end
+  end
+
+  describe "from_config/1" do
+    test "builds rules from declarative config" do
+      config = [
+        %{name: "adult", type: :min, field: :age, value: 18},
+        %{name: "low debt", type: :max, field: :debt_ratio, value: 0.5},
+        %{name: "valid state", type: :in, field: :state, value: ["CA", "NY"]}
+      ]
+
+      rules = RulesEngine.from_config(config)
+      result = RulesEngine.evaluate(rules, @applicant)
+      assert result.approved == true
     end
 
-    test "collects all error reasons" do
-      v = Rules.make_validator([@amount_v, @currency_v])
-      {:error, reasons} = v.(%{amount_cents: -1, currency: 123})
-      assert length(reasons) == 2
+    test "config-based rules work the same as manual rules" do
+      config_rules =
+        RulesEngine.from_config([
+          %{name: "age check", type: :min, field: :age, value: 18}
+        ])
+
+      manual_rules = [{"age check", RulesEngine.min_value(:age, 18)}]
+
+      subject = %{age: 25}
+      assert RulesEngine.evaluate(config_rules, subject) ==
+               RulesEngine.evaluate(manual_rules, subject)
+    end
+  end
+
+  describe "closure behavior" do
+    test "each factory call creates an independent function" do
+      rule_18 = RulesEngine.min_value(:age, 18)
+      rule_65 = RulesEngine.min_value(:age, 65)
+
+      subject = %{age: 30}
+      assert rule_18.(subject)
+      refute rule_65.(subject)
     end
 
-    test "empty validator list always passes" do
-      v = Rules.make_validator([])
-      assert v.(%{amount_cents: -999, currency: nil}) == :ok
+    test "closures capture values, not references" do
+      rules =
+        Enum.map([18, 21, 65], fn min ->
+          RulesEngine.min_value(:age, min)
+        end)
+
+      subject = %{age: 25}
+      results = Enum.map(rules, fn rule -> rule.(subject) end)
+      assert results == [true, true, false]
     end
   end
 end
@@ -398,77 +489,69 @@ end
 ### Run the tests
 
 ```bash
-mix test test/payments_cli/rules_test.exs --trace
+mix test --trace
 ```
 
 ---
 
-## Trade-off analysis
+## Anonymous functions vs named functions
 
-| Aspect | Closures as strategy (your impl) | Module callbacks (behaviour) | Config map + case |
-|--------|----------------------------------|------------------------------|-------------------|
-| Runtime configuration | Yes — captured at creation | No — fixed at compile time | Yes — passed per call |
-| Type safety | Limited — function type only | Full — @callback specs | None |
-| Testability | Test the closure directly | Test the callback module | Test the case branch |
-| Discovery | Implicit — who has the function? | Explicit — `@impl` | Explicit — case clauses |
-| Use case | Configurable runtime rules | Plugin systems, adapters | Simple branching |
+```elixir
+# Anonymous — created with fn/end, called with dot syntax
+add = fn a, b -> a + b end
+add.(1, 2)  # => 3
 
-Reflection question: `make_fee_calculator/2` returns a function with type
-`(integer() -> integer())`. How would you make multiple instances of this function
-in a map keyed by processor name, and then look up and call the right one for
-each transaction? Think about `Map.fetch/2` and calling the returned function.
+# Named — defined with def/defp inside a module
+defmodule Math do
+  def add(a, b), do: a + b
+end
+Math.add(1, 2)  # => 3
+
+# Key differences:
+# 1. Anonymous functions use .() to call
+# 2. Anonymous functions can close over variables
+# 3. Named functions can have multiple clauses with pattern matching
+# 4. Named functions can have guards
+# 5. Named functions are compile-time; anonymous are runtime
+```
+
+Use anonymous functions for: callbacks, closures, short transformations passed
+to Enum functions. Use named functions for: reusable logic, pattern-matching
+dispatching, public APIs.
 
 ---
 
 ## Common production mistakes
 
-**1. Calling anonymous functions without the dot**
+**1. Forgetting the dot for anonymous function calls**
+`fun(arg)` calls a named function. `fun.(arg)` calls an anonymous function.
+This is a frequent source of `UndefinedFunctionError` for newcomers.
+
+**2. Closures capture the value, not a reference**
 ```elixir
-calc = Rules.make_fee_calculator(250, 30)
-calc(1000)    # WRONG — UndefinedFunctionError: function calc/1 is undefined
-calc.(1000)   # CORRECT — dot is required for functions stored in variables
+x = 1
+f = fn -> x end
+x = 2
+f.()  # => 1, not 2 — the closure captured the VALUE 1
 ```
 
-**2. Closures capture the value, not the variable**
-```elixir
-rate = 250
-calc = fn amount -> div(amount * rate, 10_000) end
-rate = 500  # This does NOT affect calc — it captured rate = 250
-calc.(1000)  # still 25, not 50
-```
-The closure captured the value `250` at creation. Re-binding `rate` creates a new
-variable in the enclosing scope; the closure holds its own reference.
+**3. Capturing the wrong arity**
+`&String.trim/1` captures the 1-arity `trim`. If you need `&String.trim/2`
+(with a specific character), capture the right arity.
 
-**3. Generating closures in a loop with a shared mutable reference**
-In Elixir this is not a problem (variables are immutable). But developers from
-JavaScript backgrounds expect the classic "closure in a loop" bug where all closures
-share the last value of the loop variable. In Elixir, each iteration's binding is
-independent.
+**4. Over-using anonymous functions when named functions are clearer**
+If an anonymous function is more than 3 lines, extract it to a named function.
+Long anonymous functions are hard to read and cannot be individually tested.
 
-**4. `&` syntax cannot capture multi-clause functions**
-```elixir
-# WRONG — & cannot express multiple clauses
-filter = &(if &1.status == :approved and &1.amount_cents > 0, do: true, else: false)
-# This works but is hard to read. Prefer fn ... end for anything non-trivial.
-```
-Use `fn ... end` for functions with logic. Reserve `&` for simple expressions
-and function captures (`&String.upcase/1`).
-
-**5. Forgetting that `is_function/2` checks arity**
-```elixir
-calc = Rules.make_fee_calculator(250, 30)
-is_function(calc)    # true
-is_function(calc, 1) # true — arity 1
-is_function(calc, 2) # false — wrong arity
-```
-Use `is_function(f, expected_arity)` in guards and assertions to verify the
-contract, not just that something is a function.
+**5. Creating closures in loops without understanding capture semantics**
+Unlike JavaScript (pre-`let`), Elixir closures always capture the correct value
+in each iteration because bindings are immutable. No loop-variable bug.
 
 ---
 
 ## Resources
 
 - [Anonymous functions — Elixir Getting Started](https://elixir-lang.org/getting-started/basic-types.html#anonymous-functions)
-- [Capture operator &/1 — Kernel.SpecialForms](https://hexdocs.pm/elixir/Kernel.SpecialForms.html#&/1)
-- [Elixir School — Functions](https://elixirschool.com/en/lessons/basics/functions)
-- [Function — HexDocs](https://hexdocs.pm/elixir/Function.html) — `is_function/2`, `capture/3`
+- [Function — HexDocs](https://hexdocs.pm/elixir/Function.html)
+- [Closures — Elixir School](https://elixirschool.com/en/lessons/basics/functions#anonymous-functions-1)
+- [Enum — HexDocs](https://hexdocs.pm/elixir/Enum.html)
