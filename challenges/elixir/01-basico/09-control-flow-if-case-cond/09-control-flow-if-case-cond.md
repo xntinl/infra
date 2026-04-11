@@ -1,352 +1,457 @@
-# Control Flow: Transaction Routing and Validation Rules
+# Control Flow: Building a Data Validation Library
 
-**Project**: `payments_cli` — a CLI tool that processes payment transactions
-
----
-
-## Project context
-
-You are building `payments_cli`, a CLI tool that processes payment transactions from CSV
-files, validates them, applies business rules, and produces ledger reports.
-
-This exercise implements a `Router` module that makes routing decisions (which processor
-handles which transaction), applies validation rules with multiple conditions, chains
-steps that can each fail using `with`, and decides whether to retry failed transactions.
-The module is completely self-contained — it defines all routing, validation, processing,
-and retry logic from scratch.
+**Project**: `validator` — a user registration validator using `with` chains, `case`, and `cond`
 
 ---
 
-## The control flow decision matrix
+## Why `with` replaces nested case statements
 
-Elixir has four control flow mechanisms. The choice is not arbitrary:
+In most languages, validating user input means nested `if/else` or sequential
+`try/catch` blocks. In Elixir, the `with` expression provides flat, readable
+chains of validations that short-circuit on the first failure.
 
-| Mechanism | Use when |
-|-----------|----------|
-| `if` / `unless` | Simple boolean check, one or two branches |
-| `case` | Matching against shapes/patterns of a value |
-| `cond` | Multiple independent boolean conditions |
-| `with` | Chain of operations that each can return `{:ok, _}` or `{:error, _}` |
+The progression of control flow tools in Elixir:
 
-Common mistakes:
-- Using `cond` with literal values when `case` is cleaner
-- Using nested `case` when `with` flattens the code
-- Using `if` chains when `cond` expresses intent better
+- **`case`**: match one value against multiple patterns. Use for branching on a single input.
+- **`cond`**: evaluate multiple conditions. Use when patterns are boolean expressions.
+- **`with`**: chain multiple operations that each return `{:ok, value}` or `{:error, reason}`.
+  Use when you need "do A, then B, then C, stop at first failure."
+- **`if`/`unless`**: two-branch conditionals. Use sparingly — pattern matching is usually clearer.
 
-The key insight: **all four are expressions**. They return a value. You can assign
-the result of a `case` directly:
-
-```elixir
-fee_rate = case currency do
-  "USD" -> 0.025
-  "EUR" -> 0.020
-  _     -> 0.030
-end
-```
-
-This functional style is idiomatic Elixir and prevents the "assign default, then
-maybe override" pattern from imperative languages.
+The key insight: `with` is not a loop or a try/catch. It is a flat pipeline of
+pattern matches where each step feeds into the next. If any step does not match,
+`with` returns the non-matching value directly.
 
 ---
 
 ## The business problem
 
-The `Router` module needs to:
+Build a validation library for user registration that:
 
-1. Route transactions to the correct payment processor based on currency and amount
-2. Validate a transaction through multiple independent business rules (`cond`)
-3. Run the full processing pipeline using `with` to chain fallible steps
-4. Decide whether to retry a failed transaction based on error type
+1. Validates email format, password strength, age, and username
+2. Uses `with` to chain validations (all must pass)
+3. Uses `case` for single-field validation with multiple patterns
+4. Uses `cond` for password strength classification
+5. Returns all errors at once (not just the first)
 
 ---
 
 ## Implementation
 
-### `lib/payments_cli/router.ex`
-
-`route/1` uses `cond` because the routing rules are priority-ordered boolean
-conditions — not pattern matches on a single value. The amount check comes first
-(highest priority), then currency checks, then a catch-all.
-
-`validate/1` also uses `cond` because the validation rules are independent boolean
-checks. Each returns early with a specific error message. The `true ->` at the end
-is the happy path.
-
-`process/1` uses `with` to chain three fallible steps. The `with` expression
-flattens what would otherwise be three nested `case` expressions. Each `<-` clause
-pattern-matches the result; on mismatch, `with` returns the non-matching value
-immediately.
-
-`retryable?/1` uses `case` because it matches on the shape of a value (the error
-tuple), not on independent conditions.
+### `lib/validator.ex`
 
 ```elixir
-defmodule PaymentsCli.Router do
+defmodule Validator do
   @moduledoc """
-  Routes transactions to payment processors and applies business validation.
+  Validates user registration data using idiomatic Elixir control flow.
 
-  Demonstrates the four control flow mechanisms in context:
-  - if: simple binary decisions
-  - case: routing based on pattern/shape
-  - cond: multi-condition validation
-  - with: chaining fallible pipeline steps
+  Demonstrates `with` for sequential validation chains,
+  `case` for pattern-based branching, and `cond` for boolean conditions.
   """
 
+  @type validation_result :: :ok | {:error, String.t()}
+  @type field_errors :: %{atom() => [String.t()]}
+
   @doc """
-  Routes a transaction to the appropriate payment processor.
+  Validates all registration fields using a `with` chain.
 
-  Routing rules (in priority order):
-  1. Amounts > $5000 always go to :enterprise_processor
-  2. EUR currency goes to :sepa_processor
-  3. GBP currency goes to :bacs_processor
-  4. USD and all others go to :stripe
-
-  Returns the processor atom.
+  Stops at the first validation failure and returns the error.
+  Use `validate_all/1` to collect all errors at once.
 
   ## Examples
 
-      iex> PaymentsCli.Router.route(%{currency: "USD", amount_cents: 1000})
-      :stripe
-
-      iex> PaymentsCli.Router.route(%{currency: "EUR", amount_cents: 1000})
-      :sepa_processor
-
-      iex> PaymentsCli.Router.route(%{currency: "USD", amount_cents: 600_000})
-      :enterprise_processor
-
-  """
-  @spec route(map()) :: atom()
-  def route(%{currency: currency, amount_cents: amount}) do
-    cond do
-      amount > 500_000  -> :enterprise_processor
-      currency == "EUR" -> :sepa_processor
-      currency == "GBP" -> :bacs_processor
-      true              -> :stripe
-    end
-  end
-
-  @doc """
-  Validates a transaction against multiple independent business rules.
-
-  Returns :ok if all rules pass, or {:error, reason} for the first failure.
-
-  Rules:
-  1. amount_cents must be > 0
-  2. currency must be exactly 3 characters
-  3. id must be non-empty
-  4. status must be :pending (only pending transactions are processed)
-
-  ## Examples
-
-      iex> tx = %{id: "T1", amount_cents: 1000, currency: "USD", status: :pending}
-      iex> PaymentsCli.Router.validate(tx)
+      iex> Validator.validate(%{email: "user@example.com", password: "Str0ng!Pass", username: "alice", age: 25})
       :ok
 
-      iex> PaymentsCli.Router.validate(%{id: "T1", amount_cents: -1, currency: "USD", status: :pending})
-      {:error, "amount must be positive"}
+      iex> Validator.validate(%{email: "bad", password: "Str0ng!Pass", username: "alice", age: 25})
+      {:error, "email must contain exactly one @ character"}
 
   """
   @spec validate(map()) :: :ok | {:error, String.t()}
-  def validate(%{id: id, amount_cents: amount, currency: currency, status: status}) do
-    cond do
-      amount <= 0                  -> {:error, "amount must be positive"}
-      String.length(currency) != 3 -> {:error, "invalid currency code"}
-      id == "" or is_nil(id)       -> {:error, "id is required"}
-      status != :pending           -> {:error, "only pending transactions can be processed"}
-      true                         -> :ok
+  def validate(params) when is_map(params) do
+    with :ok <- validate_email(params[:email]),
+         :ok <- validate_password(params[:password]),
+         :ok <- validate_username(params[:username]),
+         :ok <- validate_age(params[:age]) do
+      :ok
     end
   end
 
   @doc """
-  Runs the full processing pipeline for a transaction.
+  Validates all fields and collects ALL errors, not just the first.
 
-  Steps (each can fail):
-  1. validate/1 — business rule validation
-  2. route/1 — determine processor
-  3. simulate_processor_call/2 — call the processor (simulated)
-
-  Uses `with` to chain the steps. If any step fails, the error propagates
-  immediately without executing subsequent steps.
-
-  Returns {:ok, %{processor: atom, transaction: map}} or {:error, reason}.
-  """
-  @spec process(map()) :: {:ok, map()} | {:error, term()}
-  def process(transaction) when is_map(transaction) do
-    with :ok           <- validate(transaction),
-         processor     = route(transaction),
-         {:ok, result} <- simulate_processor_call(processor, transaction) do
-      {:ok, %{processor: processor, transaction: result}}
-    end
-  end
-
-  @doc """
-  Determines whether a failed transaction should be retried.
-
-  Uses `case` to match on the error shape — not `if` chains.
-
-  Retryable errors: :timeout, :network_error, :rate_limited
-  Non-retryable: :insufficient_funds, :card_declined, :fraud_detected
+  This is the production pattern: show the user every problem at once
+  so they can fix everything in one round.
 
   ## Examples
 
-      iex> PaymentsCli.Router.retryable?({:error, :timeout})
-      true
+      iex> Validator.validate_all(%{email: "bad", password: "short", username: "", age: -1})
+      {:error, %{email: ["email must contain exactly one @ character"], password: ["password must be at least 8 characters"], username: ["username is required"], age: ["age must be between 13 and 120"]}}
 
-      iex> PaymentsCli.Router.retryable?({:error, :card_declined})
-      false
+      iex> Validator.validate_all(%{email: "a@b.com", password: "Str0ng!Pass", username: "alice", age: 25})
+      :ok
 
   """
-  @spec retryable?({:error, atom()}) :: boolean()
-  def retryable?(error_result) do
-    case error_result do
-      {:error, :timeout}       -> true
-      {:error, :network_error} -> true
-      {:error, :rate_limited}  -> true
-      {:error, _other}         -> false
+  @spec validate_all(map()) :: :ok | {:error, field_errors()}
+  def validate_all(params) when is_map(params) do
+    validations = [
+      {:email, validate_email(params[:email])},
+      {:password, validate_password(params[:password])},
+      {:username, validate_username(params[:username])},
+      {:age, validate_age(params[:age])}
+    ]
+
+    errors =
+      validations
+      |> Enum.filter(fn {_field, result} -> result != :ok end)
+      |> Enum.map(fn {field, {:error, msg}} -> {field, [msg]} end)
+      |> Map.new()
+
+    case errors do
+      empty when map_size(empty) == 0 -> :ok
+      errors -> {:error, errors}
     end
   end
 
-  # ---------------------------------------------------------------------------
-  # Private helper — simulates a processor API call
-  # ---------------------------------------------------------------------------
+  @doc """
+  Validates an email address using pattern matching and string functions.
 
-  defp simulate_processor_call(:enterprise_processor, tx) do
-    if Map.has_key?(tx, :reference) do
-      {:ok, Map.put(tx, :status, :approved)}
-    else
-      {:error, :missing_reference}
+  ## Examples
+
+      iex> Validator.validate_email("user@example.com")
+      :ok
+
+      iex> Validator.validate_email(nil)
+      {:error, "email is required"}
+
+      iex> Validator.validate_email("no-at-sign")
+      {:error, "email must contain exactly one @ character"}
+
+  """
+  @spec validate_email(term()) :: validation_result()
+  def validate_email(nil), do: {:error, "email is required"}
+  def validate_email(""), do: {:error, "email is required"}
+
+  def validate_email(email) when is_binary(email) do
+    case String.split(email, "@") do
+      [local, domain] when byte_size(local) > 0 and byte_size(domain) > 2 ->
+        if String.contains?(domain, ".") do
+          :ok
+        else
+          {:error, "email domain must contain a dot"}
+        end
+
+      [_, _] ->
+        {:error, "email local part or domain is too short"}
+
+      _ ->
+        {:error, "email must contain exactly one @ character"}
     end
   end
 
-  defp simulate_processor_call(_processor, tx) do
-    {:ok, Map.put(tx, :status, :approved)}
+  def validate_email(_), do: {:error, "email must be a string"}
+
+  @doc """
+  Validates password strength using `cond` for multi-condition checks.
+
+  ## Examples
+
+      iex> Validator.validate_password("Str0ng!Pass")
+      :ok
+
+      iex> Validator.validate_password("short")
+      {:error, "password must be at least 8 characters"}
+
+  """
+  @spec validate_password(term()) :: validation_result()
+  def validate_password(nil), do: {:error, "password is required"}
+
+  def validate_password(password) when is_binary(password) do
+    cond do
+      String.length(password) < 8 ->
+        {:error, "password must be at least 8 characters"}
+
+      not Regex.match?(~r/[A-Z]/, password) ->
+        {:error, "password must contain at least one uppercase letter"}
+
+      not Regex.match?(~r/[0-9]/, password) ->
+        {:error, "password must contain at least one digit"}
+
+      not Regex.match?(~r/[^a-zA-Z0-9]/, password) ->
+        {:error, "password must contain at least one special character"}
+
+      true ->
+        :ok
+    end
+  end
+
+  def validate_password(_), do: {:error, "password must be a string"}
+
+  @doc """
+  Classifies password strength using `cond`.
+
+  ## Examples
+
+      iex> Validator.password_strength("Str0ng!Password123")
+      :strong
+
+      iex> Validator.password_strength("Str0ng!P")
+      :medium
+
+      iex> Validator.password_strength("weak")
+      :weak
+
+  """
+  @spec password_strength(String.t()) :: :weak | :medium | :strong
+  def password_strength(password) when is_binary(password) do
+    score = compute_strength_score(password)
+
+    cond do
+      score >= 4 -> :strong
+      score >= 2 -> :medium
+      true -> :weak
+    end
+  end
+
+  @doc """
+  Validates a username.
+
+  ## Examples
+
+      iex> Validator.validate_username("alice")
+      :ok
+
+      iex> Validator.validate_username("")
+      {:error, "username is required"}
+
+      iex> Validator.validate_username("ab")
+      {:error, "username must be between 3 and 20 characters"}
+
+  """
+  @spec validate_username(term()) :: validation_result()
+  def validate_username(nil), do: {:error, "username is required"}
+  def validate_username(""), do: {:error, "username is required"}
+
+  def validate_username(username) when is_binary(username) do
+    len = String.length(username)
+
+    cond do
+      len < 3 or len > 20 ->
+        {:error, "username must be between 3 and 20 characters"}
+
+      not Regex.match?(~r/^[a-zA-Z0-9_]+$/, username) ->
+        {:error, "username must contain only letters, numbers, and underscores"}
+
+      true ->
+        :ok
+    end
+  end
+
+  def validate_username(_), do: {:error, "username must be a string"}
+
+  @doc """
+  Validates age using guards.
+
+  ## Examples
+
+      iex> Validator.validate_age(25)
+      :ok
+
+      iex> Validator.validate_age(10)
+      {:error, "age must be between 13 and 120"}
+
+      iex> Validator.validate_age(nil)
+      {:error, "age is required"}
+
+  """
+  @spec validate_age(term()) :: validation_result()
+  def validate_age(nil), do: {:error, "age is required"}
+
+  def validate_age(age) when is_integer(age) and age >= 13 and age <= 120 do
+    :ok
+  end
+
+  def validate_age(age) when is_integer(age) do
+    {:error, "age must be between 13 and 120"}
+  end
+
+  def validate_age(_), do: {:error, "age must be an integer"}
+
+  # --- Private helpers ---
+
+  @spec compute_strength_score(String.t()) :: non_neg_integer()
+  defp compute_strength_score(password) do
+    checks = [
+      String.length(password) >= 12,
+      Regex.match?(~r/[A-Z]/, password),
+      Regex.match?(~r/[a-z]/, password),
+      Regex.match?(~r/[0-9]/, password),
+      Regex.match?(~r/[^a-zA-Z0-9]/, password)
+    ]
+
+    Enum.count(checks, & &1)
   end
 end
 ```
 
 **Why this works:**
 
-- `route/1` uses `cond` because the routing decision depends on priority-ordered
-  conditions that mix different fields (amount and currency). A `case` on a single
-  value would not express the priority between amount and currency.
-
-- `validate/1` uses `cond` because each validation rule is an independent boolean
-  expression. The first failing condition returns its error immediately. The `true ->`
-  at the end is the happy path — all rules passed.
-
-- `process/1` uses `with` to chain three steps. `validate/1` returns `:ok` on success,
-  which the `<-` operator matches. `route/1` never fails, so it uses `=` instead of
-  `<-`. `simulate_processor_call/2` returns `{:ok, result}` or `{:error, reason}`.
-  If any `<-` clause does not match, `with` returns the non-matching value immediately.
-  Without `else`, the non-matching value passes through unchanged — this is usually
-  correct for `{:error, reason}` propagation.
-
-- `retryable?/1` uses `case` because it matches on the shape of a value (a tuple
-  with a specific atom). This is pattern matching, not boolean evaluation.
+- `validate/1` uses `with` to chain four validations. Each must return `:ok` for
+  the next to execute. If `validate_email/1` returns `{:error, msg}`, `with`
+  short-circuits and returns that error immediately. No nesting, no temporary variables.
+- `validate_all/1` runs all validations regardless of failures, collecting errors
+  into a map. This is the production pattern — users want to see all problems at once.
+- `validate_password/1` uses `cond` because the conditions are sequential checks on
+  the same value. `cond` is the right tool when you have multiple boolean conditions
+  that are not pattern-matchable.
+- `validate_email/1` uses `case` with pattern matching on `String.split/2` results.
+  This is cleaner than regex for structural validation.
+- `validate_age/1` uses guards (`when is_integer(age) and age >= 13`) for range
+  validation. Guards are compiled to efficient native checks.
 
 ### Tests
 
 ```elixir
-# test/payments_cli/router_test.exs
-defmodule PaymentsCli.RouterTest do
+# test/validator_test.exs
+defmodule ValidatorTest do
   use ExUnit.Case, async: true
 
-  alias PaymentsCli.Router
+  doctest Validator
 
-  describe "route/1" do
-    test "routes large amounts to enterprise processor" do
-      tx = %{currency: "USD", amount_cents: 600_000}
-      assert Router.route(tx) == :enterprise_processor
+  describe "validate/1 (with chain)" do
+    test "passes with valid data" do
+      params = %{
+        email: "user@example.com",
+        password: "Str0ng!Pass",
+        username: "alice",
+        age: 25
+      }
+
+      assert :ok = Validator.validate(params)
     end
 
-    test "routes EUR to SEPA" do
-      tx = %{currency: "EUR", amount_cents: 1000}
-      assert Router.route(tx) == :sepa_processor
+    test "stops at first failure" do
+      params = %{email: nil, password: nil, username: nil, age: nil}
+      assert {:error, "email is required"} = Validator.validate(params)
     end
 
-    test "routes GBP to BACS" do
-      tx = %{currency: "GBP", amount_cents: 1000}
-      assert Router.route(tx) == :bacs_processor
-    end
-
-    test "routes USD to Stripe" do
-      tx = %{currency: "USD", amount_cents: 1000}
-      assert Router.route(tx) == :stripe
-    end
-
-    test "large EUR amount still goes to enterprise" do
-      tx = %{currency: "EUR", amount_cents: 600_000}
-      assert Router.route(tx) == :enterprise_processor
+    test "returns password error when email is valid" do
+      params = %{email: "a@b.com", password: "short", username: "alice", age: 25}
+      assert {:error, msg} = Validator.validate(params)
+      assert msg =~ "password"
     end
   end
 
-  describe "validate/1" do
-    @valid %{id: "T1", amount_cents: 1000, currency: "USD", status: :pending}
-
-    test "valid transaction returns :ok" do
-      assert Router.validate(@valid) == :ok
+  describe "validate_all/1" do
+    test "returns all errors at once" do
+      params = %{email: "bad", password: "weak", username: "", age: -1}
+      assert {:error, errors} = Validator.validate_all(params)
+      assert Map.has_key?(errors, :email)
+      assert Map.has_key?(errors, :password)
+      assert Map.has_key?(errors, :username)
+      assert Map.has_key?(errors, :age)
     end
 
-    test "negative amount fails" do
-      tx = %{@valid | amount_cents: -1}
-      assert {:error, _} = Router.validate(tx)
-    end
+    test "returns :ok when all valid" do
+      params = %{
+        email: "user@example.com",
+        password: "Str0ng!Pass",
+        username: "alice",
+        age: 25
+      }
 
-    test "zero amount fails" do
-      tx = %{@valid | amount_cents: 0}
-      assert {:error, _} = Router.validate(tx)
-    end
-
-    test "invalid currency code fails" do
-      tx = %{@valid | currency: "US"}
-      assert {:error, _} = Router.validate(tx)
-    end
-
-    test "non-pending status fails" do
-      tx = %{@valid | status: :approved}
-      assert {:error, _} = Router.validate(tx)
+      assert :ok = Validator.validate_all(params)
     end
   end
 
-  describe "process/1" do
-    @valid %{id: "T1", amount_cents: 1000, currency: "USD", status: :pending}
-
-    test "processes a valid transaction" do
-      assert {:ok, result} = Router.process(@valid)
-      assert result.processor == :stripe
-      assert result.transaction.status == :approved
+  describe "validate_email/1" do
+    test "accepts valid email" do
+      assert :ok = Validator.validate_email("user@example.com")
     end
 
-    test "returns error for invalid transaction" do
-      assert {:error, _} = Router.process(%{@valid | amount_cents: 0})
+    test "rejects nil" do
+      assert {:error, _} = Validator.validate_email(nil)
     end
 
-    test "enterprise processor requires reference" do
-      large = %{@valid | amount_cents: 600_000}
-      assert {:error, :missing_reference} = Router.process(large)
+    test "rejects missing @" do
+      assert {:error, msg} = Validator.validate_email("noatsign")
+      assert msg =~ "@"
     end
 
-    test "enterprise processor succeeds with reference" do
-      large = %{@valid | amount_cents: 600_000, reference: "REF001"}
-      assert {:ok, _result} = Router.process(large)
+    test "rejects domain without dot" do
+      assert {:error, _} = Validator.validate_email("user@localhost")
     end
   end
 
-  describe "retryable?/1" do
-    test "timeout is retryable" do
-      assert Router.retryable?({:error, :timeout}) == true
+  describe "validate_password/1" do
+    test "accepts strong password" do
+      assert :ok = Validator.validate_password("Str0ng!Pass")
     end
 
-    test "network error is retryable" do
-      assert Router.retryable?({:error, :network_error}) == true
+    test "rejects short password" do
+      assert {:error, msg} = Validator.validate_password("Sh0rt!")
+      assert msg =~ "8 characters"
     end
 
-    test "card declined is not retryable" do
-      assert Router.retryable?({:error, :card_declined}) == false
+    test "rejects without uppercase" do
+      assert {:error, msg} = Validator.validate_password("str0ng!pass")
+      assert msg =~ "uppercase"
     end
 
-    test "fraud detected is not retryable" do
-      assert Router.retryable?({:error, :fraud_detected}) == false
+    test "rejects without digit" do
+      assert {:error, msg} = Validator.validate_password("StrongPass!")
+      assert msg =~ "digit"
+    end
+
+    test "rejects without special character" do
+      assert {:error, msg} = Validator.validate_password("Str0ngPass")
+      assert msg =~ "special"
+    end
+  end
+
+  describe "password_strength/1" do
+    test "strong password scores high" do
+      assert Validator.password_strength("Str0ng!Password123") == :strong
+    end
+
+    test "medium password" do
+      assert Validator.password_strength("Str0ng!P") == :medium
+    end
+
+    test "weak password" do
+      assert Validator.password_strength("weak") == :weak
+    end
+  end
+
+  describe "validate_username/1" do
+    test "accepts valid username" do
+      assert :ok = Validator.validate_username("alice_123")
+    end
+
+    test "rejects too short" do
+      assert {:error, _} = Validator.validate_username("ab")
+    end
+
+    test "rejects special characters" do
+      assert {:error, _} = Validator.validate_username("user@name")
+    end
+  end
+
+  describe "validate_age/1" do
+    test "accepts valid age" do
+      assert :ok = Validator.validate_age(25)
+    end
+
+    test "rejects under 13" do
+      assert {:error, _} = Validator.validate_age(10)
+    end
+
+    test "rejects over 120" do
+      assert {:error, _} = Validator.validate_age(150)
+    end
+
+    test "rejects non-integer" do
+      assert {:error, _} = Validator.validate_age("25")
     end
   end
 end
@@ -355,63 +460,73 @@ end
 ### Run the tests
 
 ```bash
-mix test test/payments_cli/router_test.exs --trace
+mix test --trace
 ```
 
 ---
 
-## Trade-off analysis
+## `with` vs nested `case`
 
-| Aspect | `with` (your impl) | Nested `case` | `try/rescue` |
-|--------|-------------------|---------------|-------------|
-| Happy path readability | Linear — no nesting | Pyramid of indentation | Flat but implicit flow |
-| Error propagation | Automatic on `<-` mismatch | Manual return at each level | Exception unwinds stack |
-| Error handling location | `else` block at bottom | At each `case` level | `rescue` block |
-| Testing | Test each step independently | Same | Harder to isolate |
+Without `with`, the same validation looks like this:
 
-Reflection question: `process/1` has a line `processor = route(transaction)` with
-`=` (not `<-`). What does `<-` do that `=` does not? When would using `<-` with
-a function that never returns `{:error, _}` cause a problem?
+```elixir
+# Nested case — the "pyramid of doom"
+case validate_email(params[:email]) do
+  :ok ->
+    case validate_password(params[:password]) do
+      :ok ->
+        case validate_username(params[:username]) do
+          :ok -> validate_age(params[:age])
+          error -> error
+        end
+      error -> error
+    end
+  error -> error
+end
+```
+
+With `with`:
+
+```elixir
+with :ok <- validate_email(params[:email]),
+     :ok <- validate_password(params[:password]),
+     :ok <- validate_username(params[:username]),
+     :ok <- validate_age(params[:age]) do
+  :ok
+end
+```
+
+Same logic, flat structure, no repetition of error handling.
 
 ---
 
 ## Common production mistakes
 
-**1. `cond` without a `true ->` catch-all**
-If no condition is truthy, `cond` raises `CondClauseError` at runtime. In payment
-processing, an unexpected transaction shape silently crashes the process. Always end
-`cond` with `true ->`.
-
-**2. Using `if` chains instead of `cond`**
+**1. Using `if` when `case` or pattern matching is clearer**
 ```elixir
-# WRONG — reads like imperative code, each branch re-evaluates
-if amount <= 0 do
-  {:error, "bad amount"}
-else
-  if String.length(currency) != 3 do ...
-```
-Use `cond` — it communicates "evaluate conditions until one is true" clearly.
+# Bad — testing a value you could pattern match
+if result == :ok, do: ...
 
-**3. Missing `else` block in `with`**
-Without an `else` block, `with` returns the first non-matching value as-is.
-For `process/1`, if `validate/1` returns `{:error, reason}`, `with` returns
-`{:error, reason}` directly. This is usually correct. But if you need to
-transform errors (add context, re-tag), add `else error -> handle(error) end`.
-
-**4. Elixir's truthiness surprise: `0` is truthy**
-In JavaScript and Python, `if 0` is falsy. In Elixir, only `false` and `nil` are
-falsy. `if 0, do: "yes"` returns `"yes"`. Write `if amount > 0` not `if amount`.
-
-**5. `case` without catch-all on external data**
-```elixir
-case Map.get(config, :mode) do
-  :fast -> ...
-  :safe -> ...
-  # No catch-all — crashes on unexpected :ultra_safe
+# Good
+case result do
+  :ok -> ...
+  {:error, reason} -> ...
 end
 ```
-For data that comes from configuration, environment variables, or external APIs,
-always include a catch-all clause in `case`.
+
+**2. Forgetting the `else` clause in `with`**
+Without an `else` clause, `with` returns the first non-matching value as-is.
+If your steps return different error shapes (`{:error, msg}`, `:error`, `nil`),
+add `else` to normalize them.
+
+**3. Using `cond` when `case` with patterns is available**
+`cond` evaluates boolean expressions. If you are matching on the shape of a value,
+`case` with patterns is more idiomatic and enables compiler checks.
+
+**4. Putting side effects inside `with` clauses**
+Each `<-` clause in `with` should be a pure function call. Putting IO or database
+writes inside `with` makes error handling unpredictable — what do you do if step 3
+fails but step 2 already wrote to the database?
 
 ---
 
@@ -419,5 +534,4 @@ always include a catch-all clause in `case`.
 
 - [case, cond, and if — Elixir Getting Started](https://elixir-lang.org/getting-started/case-cond-and-if.html)
 - [with — Kernel.SpecialForms](https://hexdocs.pm/elixir/Kernel.SpecialForms.html#with/1)
-- [Elixir School — Control Structures](https://elixirschool.com/en/lessons/basics/control_structures)
-- [Elixir in Action — Sasa Juric — Chapter 3 (control flow)](https://www.manning.com/books/elixir-in-action-third-edition)
+- [Guards — HexDocs](https://hexdocs.pm/elixir/patterns-and-guards.html#guards)
