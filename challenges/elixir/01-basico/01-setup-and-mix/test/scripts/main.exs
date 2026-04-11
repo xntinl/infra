@@ -6,4 +6,4 @@ defmodule Test do
 
 end
 
-IO.puts("tupla_ejemplo #{Test.tupla_ejemplo()}")
+IO.puts("tupla_ejemplo #{Test.tupla_example()}")
