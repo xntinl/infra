@@ -1,6 +1,6 @@
-defmodule PaymentsCli do
+defmodule JsonValidator do
   @moduledoc """
-  Documentation for `PaymentsCli`.
+  Documentation for `JsonValidator`.
   """
 
   @doc """
@@ -8,7 +8,7 @@ defmodule PaymentsCli do
 
   ## Examples
 
-      iex> PaymentsCli.hello()
+      iex> JsonValidator.hello()
       :world
 
   """
