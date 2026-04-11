@@ -380,7 +380,7 @@ mix test test/schemia/ --trace
 # bench/schemia_bench.exs
 alias Schemia.{Lexer, Parser, Evaluator, Stdlib}
 
-defp compile_and_run(source) do
+compile_and_run = fn source ->
   {:ok, tokens} = Lexer.tokenize(source)
   {:ok, exprs}  = Parser.parse(tokens)
   env = Stdlib.root_env()
