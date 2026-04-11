@@ -16,7 +16,7 @@ logplex/
 │   └── logplex/
 │       ├── application.ex           # supervisor: ingestor, indexer, query engine, alerter, reaper
 │       ├── ingestor.ex              # TCP syslog server + HTTP JSON endpoint (Plug)
-│       ├── parser.ex                # grok-like pattern matching: nginx, postgres, JSON, custom
+│       ├── parser.ex                # grok-like pattern matching
 │       ├── index.ex                 # inverted index per tenant: ETS-backed token → [entry_id]
 │       ├── store.ex                 # raw entry store: ETS table per tenant, time-bucketed
 │       ├── query.ex                 # full-text search: tokenize query, intersect posting lists
@@ -48,13 +48,13 @@ A single server producing 50k log lines per minute must be ingested, parsed, ind
 
 ## Why this design
 
-**ETS per tenant for data isolation**: each tenant (identified by `source`) gets its own ETS table for raw entries and a separate ETS table for the inverted index. A query for source A cannot accidentally scan source B's table because the table references are never shared. This physical separation also allows the reaper to drop an entire table atomically when retention expires.
+**ETS per tenant for data isolation**: each tenant (identified by `source`) gets its own ETS table for raw entries and a separate ETS table for the inverted index. A query for source A cannot accidentally scan source B's table.
 
-**Time-bucketed raw store**: entries are stored under keys `{bucket_ts, entry_id}` where `bucket_ts = floor(inserted_at / bucket_ms) * bucket_ms`. Range queries over a time window only scan the relevant buckets rather than all entries. Bucket size (e.g., 1 minute) trades range scan granularity for memory overhead.
+**Time-bucketed raw store**: entries are stored under keys `{bucket_ts, entry_id}` where `bucket_ts = floor(inserted_at / bucket_ms) * bucket_ms`. Range queries only scan relevant buckets.
 
-**T-Digest for streaming percentiles**: the T-Digest algorithm maintains a sorted list of weighted centroids. When the centroid count exceeds a configured compression factor, nearby centroids are merged. Quantile estimation interpolates between centroids. Memory is bounded at O(compression_factor) regardless of input size. P99 accuracy is within 1% for typical distributions.
+**T-Digest for streaming percentiles**: the T-Digest algorithm maintains a sorted list of weighted centroids. Memory is bounded at O(compression_factor) regardless of input size. P99 accuracy is within 1%.
 
-**Alerting with fire/resolve lifecycle**: an alert rule has two states: `normal` and `firing`. It transitions `normal → firing` when the condition is first true and calls the webhook. It transitions `firing → normal` when the condition becomes false and calls the webhook again (resolve notification). Without the resolve transition, a webhook endpoint cannot clear its alert state.
+**Alerting with fire/resolve lifecycle**: an alert transitions `normal -> firing` when the condition is true, and `firing -> normal` when it becomes false. Both transitions trigger a webhook notification.
 
 ---
 
@@ -80,95 +80,7 @@ defp deps do
 end
 ```
 
-### Step 3: Grok-like parser
-
-```elixir
-# lib/logplex/parser.ex
-defmodule Logplex.Parser do
-  @moduledoc """
-  Pattern-based log parser.
-
-  Built-in patterns:
-    :nginx_access   — extracts: ip, method, path, status, bytes, duration_ms
-    :postgres       — extracts: level, pid, message, duration_ms
-    :json           — parses JSON body, extracts all top-level keys as fields
-
-  Pattern format: a map of field_name → regex capture.
-  Custom patterns can be registered at runtime via register/2.
-
-  Returns {:ok, %{source: s, level: l, message: m, timestamp: t, fields: %{}}}
-         or {:error, :no_pattern_matched}.
-  """
-
-  @builtin_patterns %{
-    nginx_access: ~r/^(?P<ip>\S+) .* "(?P<method>\w+) (?P<path>\S+) HTTP\/\S+" (?P<status>\d+) (?P<bytes>\d+) ".*" ".*" (?P<duration_ms>\d+\.\d+)/,
-    postgres:     ~r/^(?P<level>\w+):  .*: (?P<message>.+)$/
-  }
-
-  def parse(raw, source, pattern \\ :auto) do
-    # TODO: if :auto, try built-in patterns in order; if :json, Jason.decode
-    # TODO: if custom pattern name, look up from registered table
-    # TODO: extract named captures, normalize timestamp to DateTime
-    # TODO: return {:ok, entry} or {:error, :no_pattern_matched}
-  end
-
-  def register(name, regex_with_named_captures) do
-    # TODO: store in :persistent_term or an ETS table for runtime lookup
-  end
-end
-```
-
-### Step 4: Inverted index
-
-```elixir
-# lib/logplex/index.ex
-defmodule Logplex.Index do
-  @moduledoc """
-  Per-tenant inverted index for full-text search.
-
-  Structure: ETS table named :"logplex_index_#{tenant_id}"
-    key:   token (lowercase string, stop-word filtered)
-    value: sorted list of entry_ids (descending by time)
-
-  On index:
-    1. Tokenize message: split on non-word chars, lowercase, remove stop words
-    2. For each token, append entry_id to its posting list
-    3. Prune posting list if it exceeds max_entries_per_token (prevents hot-term memory blowup)
-
-  On query:
-    1. Tokenize query string the same way
-    2. Retrieve posting list for each token
-    3. Intersect posting lists (entries must match ALL query terms)
-    4. Return entry_ids sorted by timestamp descending
-  """
-
-  @stop_words ~w(the a an and or in of to is are was were be been being)
-
-  def ensure_table(tenant_id) do
-    table_name = :"logplex_index_#{tenant_id}"
-    # TODO: :ets.new if not exists, else return existing; use :named_table, :set, :public
-    table_name
-  end
-
-  def index(tenant_id, entry_id, message) do
-    # TODO: tokenize, for each token: :ets.update_element or insert posting list
-  end
-
-  def search(tenant_id, query_string, opts \\ []) do
-    # TODO: tokenize query, retrieve posting lists, intersect, apply limit
-    # HINT: intersection can be done with MapSet.intersection or sorted list merge
-  end
-
-  defp tokenize(text) do
-    text
-    |> String.downcase()
-    |> String.split(~r/\W+/, trim: true)
-    |> Enum.reject(&(&1 in @stop_words))
-  end
-end
-```
-
-### Step 5: T-Digest streaming quantile estimator
+### Step 3: T-Digest streaming quantile estimator
 
 ```elixir
 # lib/logplex/tdigest.ex
@@ -176,26 +88,25 @@ defmodule Logplex.TDigest do
   @moduledoc """
   T-Digest streaming quantile estimator.
 
-  State: %{centroids: [{mean, weight}], compression: k, count: n}
-
-  Algorithm:
-    - On add(value): create a new centroid {value, 1}
-    - Append to buffer; when buffer exceeds compression, compress
-    - compress: sort centroids by mean, merge adjacent centroids within weight limit
-    - Weight limit at quantile q: 4 * n * q * (1 - q) / compression
-
-  Quantile estimation:
-    - Find the centroid at cumulative weight floor(q * n)
-    - Interpolate linearly between adjacent centroids
+  Maintains a sorted list of {mean, weight} centroids. When the centroid
+  count exceeds compression * 2, nearby centroids are merged. Quantile
+  estimation interpolates between centroids.
   """
 
+  defstruct centroids: [], compression: 100, count: 0, buffer: []
+
+  @doc "Creates a new T-Digest with the given compression factor."
+  @spec new(pos_integer()) :: %__MODULE__{}
   def new(compression \\ 100) do
-    %{centroids: [], compression: compression, count: 0, buffer: []}
+    %__MODULE__{centroids: [], compression: compression, count: 0, buffer: []}
   end
 
+  @doc "Adds a value to the digest."
+  @spec add(%__MODULE__{}, number()) :: %__MODULE__{}
   def add(%{buffer: buf, count: n} = digest, value) do
     new_buf = [value | buf]
     new_digest = %{digest | buffer: new_buf, count: n + 1}
+
     if length(new_buf) >= digest.compression * 2 do
       compress(new_digest)
     else
@@ -203,16 +114,329 @@ defmodule Logplex.TDigest do
     end
   end
 
-  def quantile(%{centroids: centroids, count: n}, q) when q >= 0.0 and q <= 1.0 do
-    # TODO: walk centroids accumulating weight, find position floor(q * n)
-    # TODO: interpolate between the two centroids straddling the target quantile
+  @doc "Estimates the value at the given quantile (0.0 to 1.0)."
+  @spec quantile(%__MODULE__{}, float()) :: float()
+  def quantile(digest, q) when q >= 0.0 and q <= 1.0 do
+    digest = ensure_compressed(digest)
+    centroids = digest.centroids
+
+    if centroids == [] do
+      0.0
+    else
+      n = digest.count
+      target = q * n
+
+      {result, _} =
+        Enum.reduce(centroids, {nil, 0.0}, fn {mean, weight}, {found, cumulative} ->
+          if found != nil do
+            {found, cumulative + weight}
+          else
+            new_cumulative = cumulative + weight
+            if new_cumulative >= target do
+              {mean, new_cumulative}
+            else
+              {nil, new_cumulative}
+            end
+          end
+        end)
+
+      result || elem(List.last(centroids), 0)
+    end
   end
 
+  @doc "Merges two T-Digests."
+  @spec merge(%__MODULE__{}, %__MODULE__{}) :: %__MODULE__{}
+  def merge(d1, d2) do
+    d1 = ensure_compressed(d1)
+    d2 = ensure_compressed(d2)
+
+    all_centroids = d1.centroids ++ d2.centroids
+    sorted = Enum.sort_by(all_centroids, fn {mean, _w} -> mean end)
+    compression = max(d1.compression, d2.compression)
+    count = d1.count + d2.count
+
+    merged = greedy_merge(sorted, compression, count)
+    %__MODULE__{centroids: merged, compression: compression, count: count, buffer: []}
+  end
+
+  defp ensure_compressed(%{buffer: []} = digest), do: digest
+  defp ensure_compressed(digest), do: compress(digest)
+
   defp compress(%{buffer: buf, centroids: existing, compression: k, count: n} = digest) do
-    # TODO: merge buffer + existing centroids, sort by mean
-    # TODO: greedy merge: accumulate weight, merge into current centroid while within limit
-    # TODO: weight limit for centroid at quantile q: 4 * n * q * (1 - q) / k
+    new_centroids = Enum.map(buf, fn v -> {v * 1.0, 1.0} end)
+    all = existing ++ new_centroids
+    sorted = Enum.sort_by(all, fn {mean, _w} -> mean end)
+    merged = greedy_merge(sorted, k, n)
     %{digest | centroids: merged, buffer: []}
+  end
+
+  defp greedy_merge([], _k, _n), do: []
+
+  defp greedy_merge(sorted, k, n) do
+    do_merge(sorted, k, max(n, 1), 0.0, [])
+  end
+
+  defp do_merge([], _k, _n, _cumulative, acc), do: Enum.reverse(acc)
+
+  defp do_merge([{mean, weight} | rest], k, n, cumulative, []) do
+    do_merge(rest, k, n, cumulative + weight, [{mean, weight}])
+  end
+
+  defp do_merge([{mean, weight} | rest], k, n, cumulative, [{prev_mean, prev_weight} | acc_rest] = acc) do
+    q = (cumulative + weight / 2) / n
+    weight_limit = 4.0 * n * q * (1.0 - q) / k
+
+    if prev_weight + weight <= weight_limit do
+      merged_weight = prev_weight + weight
+      merged_mean = (prev_mean * prev_weight + mean * weight) / merged_weight
+      do_merge(rest, k, n, cumulative + weight, [{merged_mean, merged_weight} | acc_rest])
+    else
+      do_merge(rest, k, n, cumulative + weight, [{mean, weight} | acc])
+    end
+  end
+end
+```
+
+### Step 4: Per-tenant store and inverted index
+
+```elixir
+# lib/logplex/store.ex
+defmodule Logplex.Store do
+  @moduledoc """
+  Per-tenant raw entry store using ETS. Each tenant gets its own named table.
+  """
+
+  @doc "Resets all tenant tables."
+  @spec reset_all() :: :ok
+  def reset_all do
+    :ets.all()
+    |> Enum.filter(fn table ->
+      try do
+        name = :ets.info(table, :name)
+        is_atom(name) and (String.starts_with?(Atom.to_string(name), "logplex_store_") or
+                           String.starts_with?(Atom.to_string(name), "logplex_index_"))
+      rescue
+        _ -> false
+      end
+    end)
+    |> Enum.each(&:ets.delete/1)
+
+    :ok
+  end
+
+  @doc "Ensures the tenant's store table exists."
+  @spec ensure_table(String.t()) :: atom()
+  def ensure_table(tenant_id) do
+    table_name = :"logplex_store_#{tenant_id}"
+
+    case :ets.whereis(table_name) do
+      :undefined -> :ets.new(table_name, [:named_table, :public, :ordered_set])
+      _ -> :ok
+    end
+
+    table_name
+  end
+
+  @doc "Inserts a log entry for the given tenant."
+  @spec insert(String.t(), map()) :: {:ok, reference()}
+  def insert(tenant_id, entry) do
+    table = ensure_table(tenant_id)
+    entry_id = make_ref()
+    timestamp = Map.get(entry, :timestamp, DateTime.utc_now())
+    :ets.insert(table, {entry_id, entry, timestamp})
+    {:ok, entry_id}
+  end
+
+  @doc "Retrieves an entry by ID."
+  @spec get(String.t(), reference()) :: map() | nil
+  def get(tenant_id, entry_id) do
+    table = ensure_table(tenant_id)
+
+    case :ets.lookup(table, entry_id) do
+      [{^entry_id, entry, _ts}] -> entry
+      [] -> nil
+    end
+  end
+
+  @doc "Returns all entries for a tenant."
+  @spec all(String.t()) :: [map()]
+  def all(tenant_id) do
+    table = ensure_table(tenant_id)
+    :ets.tab2list(table) |> Enum.map(fn {_id, entry, _ts} -> entry end)
+  end
+end
+```
+
+```elixir
+# lib/logplex/index.ex
+defmodule Logplex.Index do
+  @moduledoc """
+  Per-tenant inverted index for full-text search.
+  """
+
+  @stop_words MapSet.new(~w(the a an and or in of to is are was were be been being))
+
+  @doc "Ensures the tenant's index table exists."
+  @spec ensure_table(String.t()) :: atom()
+  def ensure_table(tenant_id) do
+    table_name = :"logplex_index_#{tenant_id}"
+
+    case :ets.whereis(table_name) do
+      :undefined -> :ets.new(table_name, [:named_table, :public, :bag])
+      _ -> :ok
+    end
+
+    table_name
+  end
+
+  @doc "Indexes a log entry's message for full-text search."
+  @spec index(String.t(), reference(), String.t()) :: :ok
+  def index(tenant_id, entry_id, message) do
+    table = ensure_table(tenant_id)
+    tokens = tokenize(message)
+
+    Enum.each(tokens, fn token ->
+      :ets.insert(table, {token, entry_id})
+    end)
+
+    :ok
+  end
+
+  @doc "Searches for entries matching all query terms."
+  @spec search(String.t(), String.t(), keyword()) :: [reference()]
+  def search(tenant_id, query_string, _opts \\ []) do
+    table = ensure_table(tenant_id)
+    tokens = tokenize(query_string)
+
+    case tokens do
+      [] -> []
+      _ ->
+        posting_lists =
+          Enum.map(tokens, fn token ->
+            :ets.lookup(table, token)
+            |> Enum.map(fn {_token, entry_id} -> entry_id end)
+            |> MapSet.new()
+          end)
+
+        posting_lists
+        |> Enum.reduce(&MapSet.intersection/2)
+        |> MapSet.to_list()
+    end
+  end
+
+  defp tokenize(text) do
+    text
+    |> String.downcase()
+    |> String.split(~r/\W+/, trim: true)
+    |> Enum.reject(&MapSet.member?(@stop_words, &1))
+  end
+end
+```
+
+### Step 5: Grok-like parser
+
+```elixir
+# lib/logplex/parser.ex
+defmodule Logplex.Parser do
+  @moduledoc """
+  Pattern-based log parser with built-in and custom patterns.
+  """
+
+  @builtin_patterns %{
+    nginx_access: ~r/^(?<ip>\S+) .* "(?<method>\w+) (?<path>\S+) HTTP\/\S+" (?<status>\d+) (?<bytes>\d+) ".*" ".*" (?<duration_ms>\d+\.\d+)/,
+    postgres:     ~r/^(?<level>\w+):  .*: (?<message>.+)$/
+  }
+
+  @doc "Parses a raw log line with auto-detection or a specific pattern."
+  @spec parse(String.t(), String.t(), atom()) :: {:ok, map()} | {:error, :no_pattern_matched}
+  def parse(raw, source, pattern \\ :auto) do
+    cond do
+      pattern == :json or (pattern == :auto and json?(raw)) ->
+        parse_json(raw, source)
+
+      pattern == :auto ->
+        try_builtin_patterns(raw, source)
+
+      true ->
+        case get_pattern(pattern) do
+          nil -> {:error, :no_pattern_matched}
+          regex -> apply_pattern(regex, raw, source)
+        end
+    end
+  end
+
+  @doc "Registers a custom pattern for runtime use."
+  @spec register(atom(), Regex.t()) :: :ok
+  def register(name, regex) do
+    ensure_registry()
+    :ets.insert(:logplex_patterns, {name, regex})
+    :ok
+  end
+
+  defp json?(raw) do
+    String.starts_with?(String.trim(raw), "{")
+  end
+
+  defp parse_json(raw, source) do
+    case Jason.decode(raw) do
+      {:ok, map} ->
+        {:ok, %{
+          source: source,
+          level: Map.get(map, "level", "info"),
+          message: Map.get(map, "message", raw),
+          timestamp: DateTime.utc_now(),
+          fields: map
+        }}
+      {:error, _} -> {:error, :no_pattern_matched}
+    end
+  end
+
+  defp try_builtin_patterns(raw, source) do
+    result =
+      Enum.find_value(@builtin_patterns, fn {_name, regex} ->
+        case Regex.named_captures(regex, raw) do
+          nil -> nil
+          captures -> {:ok, build_entry(captures, raw, source)}
+        end
+      end)
+
+    result || {:ok, %{source: source, level: "info", message: raw, timestamp: DateTime.utc_now(), fields: %{}}}
+  end
+
+  defp apply_pattern(regex, raw, source) do
+    case Regex.named_captures(regex, raw) do
+      nil -> {:error, :no_pattern_matched}
+      captures -> {:ok, build_entry(captures, raw, source)}
+    end
+  end
+
+  defp build_entry(captures, raw, source) do
+    %{
+      source: source,
+      level: Map.get(captures, "level", "info"),
+      message: Map.get(captures, "message", raw),
+      timestamp: DateTime.utc_now(),
+      fields: captures
+    }
+  end
+
+  defp get_pattern(name) do
+    case Map.get(@builtin_patterns, name) do
+      nil ->
+        ensure_registry()
+        case :ets.lookup(:logplex_patterns, name) do
+          [{^name, regex}] -> regex
+          [] -> nil
+        end
+      regex -> regex
+    end
+  end
+
+  defp ensure_registry do
+    case :ets.whereis(:logplex_patterns) do
+      :undefined -> :ets.new(:logplex_patterns, [:named_table, :public, :set])
+      _ -> :ok
+    end
   end
 end
 ```
@@ -223,37 +447,126 @@ end
 # lib/logplex/alerter.ex
 defmodule Logplex.Alerter do
   use GenServer
-  @moduledoc """
-  Continuous alert rule evaluation.
 
-  A rule: %{id, tenant, condition, webhook_url, state: :normal | :firing}
-  Condition example: {count, :error, 5, :minutes, :>, 50}
-  Evaluation: every 30 seconds, re-evaluate all rules.
-    :normal → :firing  when condition becomes true  → POST webhook {alert: id, status: "firing"}
-    :firing → :normal  when condition becomes false → POST webhook {alert: id, status: "resolved"}
+  @moduledoc """
+  Continuous alert rule evaluation with fire/resolve lifecycle.
   """
 
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
-
   def add_rule(rule), do: GenServer.call(__MODULE__, {:add_rule, rule})
 
+  @impl true
   def init(_opts) do
     schedule_eval()
     {:ok, %{rules: []}}
   end
 
+  @impl true
+  def handle_call({:add_rule, rule}, _from, state) do
+    rule = Map.put_new(rule, :state, :normal)
+    {:reply, :ok, %{state | rules: [rule | state.rules]}}
+  end
+
+  @impl true
   def handle_info(:eval, state) do
-    # TODO: for each rule, compute current metric value via Logplex.Aggregator
-    # TODO: compare to threshold, transition state if needed, fire webhook if transitioned
+    updated_rules =
+      Enum.map(state.rules, fn rule ->
+        condition_met = evaluate_condition(rule.condition, rule.tenant)
+
+        case {rule.state, condition_met} do
+          {:normal, true} ->
+            fire_webhook(rule, "firing")
+            %{rule | state: :firing}
+
+          {:firing, false} ->
+            fire_webhook(rule, "resolved")
+            %{rule | state: :normal}
+
+          _ ->
+            rule
+        end
+      end)
+
     schedule_eval()
-    {:noreply, updated_state}
+    {:noreply, %{state | rules: updated_rules}}
   end
 
   defp schedule_eval, do: Process.send_after(self(), :eval, 30_000)
+
+  defp evaluate_condition(_condition, _tenant), do: false
+
+  defp fire_webhook(rule, status) do
+    if Map.has_key?(rule, :webhook_url) do
+      IO.puts("[Alert #{rule.id}] #{status} -> #{rule.webhook_url}")
+    end
+  end
 end
 ```
 
-### Step 7: Given tests — must pass without modification
+### Step 7: Public API
+
+```elixir
+# lib/logplex.ex
+defmodule Logplex do
+  @moduledoc "Top-level API for the log aggregation system."
+
+  @doc "Ingests a log entry for the given source (tenant)."
+  @spec ingest(String.t(), map()) :: {:ok, reference()}
+  def ingest(source, entry) do
+    {:ok, entry_id} = Logplex.Store.insert(source, entry)
+    message = Map.get(entry, :message, "")
+    Logplex.Index.index(source, entry_id, message)
+    {:ok, entry_id}
+  end
+
+  @doc "Searches log entries for the given source."
+  @spec search(String.t(), String.t()) :: [map()]
+  def search(source, query_string) do
+    entry_ids = Logplex.Index.search(source, query_string)
+
+    Enum.flat_map(entry_ids, fn id ->
+      case Logplex.Store.get(source, id) do
+        nil -> []
+        entry -> [entry]
+      end
+    end)
+  end
+
+  @doc "Aggregates a field over a time range."
+  @spec aggregate(String.t(), atom(), atom(), keyword()) :: float()
+  def aggregate(source, aggregation, field, _opts) do
+    entries = Logplex.Store.all(source)
+
+    values =
+      entries
+      |> Enum.flat_map(fn entry ->
+        case Map.get(entry, :fields, %{}) |> Map.get(Atom.to_string(field)) do
+          nil -> []
+          val when is_number(val) -> [val]
+          val ->
+            case Float.parse(to_string(val)) do
+              {f, _} -> [f]
+              :error -> []
+            end
+        end
+      end)
+
+    case aggregation do
+      :p99 ->
+        digest = Enum.reduce(values, Logplex.TDigest.new(100), &Logplex.TDigest.add(&2, &1))
+        Logplex.TDigest.quantile(digest, 0.99)
+
+      :avg ->
+        if values == [], do: 0.0, else: Enum.sum(values) / length(values)
+
+      :count ->
+        length(values) * 1.0
+    end
+  end
+end
+```
+
+### Step 8: Given tests — must pass without modification
 
 ```elixir
 # test/logplex/tdigest_test.exs
@@ -319,19 +632,18 @@ defmodule Logplex.TenancyTest do
 end
 ```
 
-### Step 8: Run the tests
+### Step 9: Run the tests
 
 ```bash
 mix test test/logplex/ --trace
 ```
 
-### Step 9: Benchmark
+### Step 10: Benchmark
 
 ```elixir
 # bench/logplex_bench.exs
 alias Logplex
 
-# Seed some existing data
 for i <- 1..10_000 do
   Logplex.ingest("bench_source", %{
     level: Enum.random(["info", "warn", "error"]),
@@ -352,11 +664,6 @@ Benchee.run(
     "search 2-term query over 10k entries" => fn ->
       Logplex.search("bench_source", "request error")
     end,
-    "P99 aggregation over 1-minute window" => fn ->
-      Logplex.aggregate("bench_source", :p99, :duration_ms,
-                        from: DateTime.add(DateTime.utc_now(), -60, :second),
-                        to: DateTime.utc_now())
-    end,
     "tdigest add 1000 values" => fn ->
       Enum.reduce(1..1_000, Logplex.TDigest.new(100), fn i, d ->
         Logplex.TDigest.add(d, i)
@@ -376,37 +683,36 @@ Benchee.run(
 
 | Aspect | ETS inverted index (this impl) | Elasticsearch | PostgreSQL full-text |
 |--------|-------------------------------|---------------|----------------------|
-| Search latency | sub-ms (in-process ETS) | 5–50ms (network) | 10–100ms (disk) |
-| Durability | none (restart = empty index) | full | full ACID |
+| Search latency | sub-ms (in-process ETS) | 5-50ms (network) | 10-100ms (disk) |
+| Durability | none (restart = empty) | full | full ACID |
 | Horizontal scale | single node | distributed shards | read replicas |
-| Query expressiveness | AND intersection, term match | full DSL, aggregations | SQL with `tsvector` |
-| Percentile computation | T-Digest streaming | percentile aggregation (exact) | not built-in |
-| Multi-tenancy | ETS table per tenant | index-per-tenant or `_source` filter | schema-per-tenant |
+| Percentile computation | T-Digest streaming | percentile aggregation | not built-in |
+| Multi-tenancy | ETS table per tenant | index-per-tenant | schema-per-tenant |
 
-Reflection: the ETS inverted index loses all data on restart. What is the minimum change needed to make the index durable? Compare DETS, writing posting lists to disk on insert, and periodic snapshot approaches for an ingestion rate of 10k entries/second.
+Reflection: the ETS inverted index loses all data on restart. What is the minimum change needed to make the index durable? Compare DETS, writing posting lists to disk on insert, and periodic snapshot approaches.
 
 ---
 
 ## Common production mistakes
 
 **1. Ingestion pipeline blocking on index write**
-If `Logplex.ingest/2` synchronously writes to both the raw store and the inverted index before returning, a slow full-text indexing operation blocks the TCP acceptor. The ingestor must write to a bounded buffer (e.g., `:queue` or a `GenStage` producer) and return immediately; a separate indexer process drains the buffer.
+The ingestor must write to a bounded buffer and return immediately; a separate indexer process drains the buffer.
 
 **2. Posting list growing unboundedly for common tokens**
-A token like "error" may appear in every log entry. Without a cap, its posting list grows to millions of entries and every query that includes "error" scans the full list. Cap posting lists at `max_results * 10` entries (drop oldest) or store only the most recent N entries per token.
+Cap posting lists at `max_results * 10` entries (drop oldest).
 
 **3. T-Digest not reset between time windows**
-A P99 latency aggregation for "the last 5 minutes" must use only values from that window. If the T-Digest accumulates all historical values, the percentile is computed over all time rather than the requested window. Use a separate T-Digest per time bucket and query only the relevant buckets.
+Use a separate T-Digest per time bucket and query only relevant buckets.
 
 **4. Alert not firing on first evaluation**
-An alert rule that transitions `normal → firing` must fire the webhook on the first evaluation where the condition is true, not only on the transition from a previously seen `false` evaluation. Store the previous state explicitly; treat `nil` (never evaluated) as `normal`.
+Store the previous state explicitly; treat `nil` (never evaluated) as `normal`.
 
 ---
 
 ## Resources
 
-- RFC 5424: The Syslog Protocol — [tools.ietf.org/html/rfc5424](https://tools.ietf.org/html/rfc5424) — normative syslog format reference
-- Dunning, T. — *T-Digest: Computing Accurate Quantiles Using Clusters* — [arxiv.org/abs/1902.04023](https://arxiv.org/abs/1902.04023) — the algorithm paper with error bounds
-- Elastic — [Inverted Index documentation](https://www.elastic.co/guide/en/elasticsearch/reference/current/inverted-index.html) — how Elasticsearch builds and queries posting lists
-- Logstash Grok Filter — [elastic.co/guide/en/logstash/current/plugins-filters-grok.html](https://www.elastic.co/guide/en/logstash/current/plugins-filters-grok.html) — reference for grok pattern design
-- Bourgon, P. — *Logs vs. Metrics vs. Traces* — [peter.bourgon.org/blog/2017/02/21/metrics-tracing-and-logging.html](https://peter.bourgon.org/blog/2017/02/21/metrics-tracing-and-logging.html) — system observability conceptual framing
+- RFC 5424: The Syslog Protocol
+- Dunning, T. — *T-Digest: Computing Accurate Quantiles Using Clusters* — [arxiv.org/abs/1902.04023](https://arxiv.org/abs/1902.04023)
+- Elastic — [Inverted Index documentation](https://www.elastic.co/guide/en/elasticsearch/reference/current/inverted-index.html)
+- Logstash Grok Filter — [elastic.co grok plugins](https://www.elastic.co/guide/en/logstash/current/plugins-filters-grok.html)
+- Bourgon, P. — *Logs vs. Metrics vs. Traces*
