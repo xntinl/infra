@@ -1,391 +1,388 @@
-# Functions and Arity: The Transaction Module API
+# Functions and Arity: Building a Middleware Pipeline
 
-**Project**: `payments_cli` — a CLI tool that processes payment transactions
-
----
-
-## Project context
-
-You are building `payments_cli`, a CLI tool that processes payment transactions from CSV
-files, validates them, applies business rules, and produces ledger reports.
-
-This exercise implements a `Transaction` module with a well-designed public API that
-demonstrates multiple function clauses, guards, arity conventions, and default arguments.
-The module is completely self-contained — it defines all status classification, comparison,
-description, and formatting functions from scratch.
+**Project**: `pipeline` — a composable middleware system (like Plug) using function composition and multi-arity functions
 
 ---
 
-## Why arity is part of the function identity
+## Why arity matters in Elixir
 
-In Elixir, `Transaction.describe/1` and `Transaction.describe/2` are completely
-distinct functions — as different as `describe` and `describe_with_context`. The
-notation `Module.function/arity` is the canonical identifier for a function in:
+In Elixir, `process/1` and `process/2` are different functions — not overloads of
+the same function. This is called arity (the number of arguments), and it is part
+of the function's identity. When you see `Enum.map/2`, the `/2` is not documentation
+decoration — it is how the runtime identifies the function.
 
-- Documentation: `see Transaction.classify_status/1`
-- Error messages: `UndefinedFunctionError: function Transaction.classify_status/0 is undefined`
-- Function capture: `&Transaction.classify_status/1`
-
-This design eliminates a class of bugs where calling a function with the wrong number
-of arguments silently uses defaults. In Elixir, calling `classify_status()` with no
-arguments is a compile error — it looks for `classify_status/0` which does not exist.
-
-Multiple clauses with pattern matching let you express business rules as data, not as
-procedural conditionals. A payment processor that routes transactions based on currency
-reads better as:
+This has practical consequences:
 
 ```elixir
-def route_to_processor(:USD), do: :stripe
-def route_to_processor(:EUR), do: :adyen
-def route_to_processor(_),    do: :fallback_processor
+# These are TWO DIFFERENT functions
+def process(data), do: process(data, [])
+def process(data, opts), do: # ...
+
+# You reference them separately
+&process/1  # captures the 1-arity version
+&process/2  # captures the 2-arity version
+
+# Default arguments generate multiple arities automatically
+def process(data, opts \\ [])
+# Generates process/1 and process/2 at compile time
 ```
 
-than as a long `cond` block.
+Understanding arity is essential for: function capture (`&fun/n`), pattern matching
+on function references, and designing APIs with default arguments.
 
 ---
 
 ## The business problem
 
-The `Transaction` module needs a complete API:
+Build a middleware pipeline system where:
 
-1. Describe a transaction for logging (multiple clauses by status)
-2. Determine if a transaction is reversible (guard-based business rule)
-3. Compare two transactions by amount (multiple arity variant)
-4. Build a display label (default argument for optional currency symbol)
+1. Each middleware is a function that transforms a context map
+2. Middlewares compose into a pipeline that runs sequentially
+3. Any middleware can halt the pipeline (like Plug's `halt`)
+4. The system uses multi-arity functions for configuration
+5. Function capture (`&`) is used to reference middleware functions
 
 ---
 
 ## Implementation
 
-### `lib/payments_cli/transaction.ex`
-
-Each function demonstrates a different aspect of Elixir's function design.
-`describe/1` uses one clause per status — each case is isolated, testable, and
-adding a new status means adding one clause. `reversible?/1` puts the business
-rule in a guard, making the condition visible at the function head. `compare/2`
-and `compare/3` show arity-based differentiation. `label/1` and `label/2` use a
-default argument with a header declaration required by multiple clauses.
+### `lib/pipeline.ex`
 
 ```elixir
-defmodule PaymentsCli.Transaction do
+defmodule Pipeline do
   @moduledoc """
-  Represents a payment transaction and provides a rich API for
-  status classification, comparison, description, and formatting.
+  A composable middleware pipeline inspired by Plug.
 
-  Status atoms are the canonical representation internally.
+  Each middleware is a function that receives a context map and returns
+  a (possibly modified) context map. The pipeline runs middlewares
+  sequentially until all complete or one halts execution.
   """
 
-  @valid_statuses [:pending, :approved, :declined, :reversed, :flagged]
+  @type context :: %{
+          required(:halted) => boolean(),
+          required(:assigns) => map(),
+          optional(atom()) => term()
+        }
+
+  @type middleware :: (context() -> context())
 
   @doc """
-  Returns the list of valid transaction statuses.
-  """
-  @spec valid_statuses() :: [atom()]
-  def valid_statuses, do: @valid_statuses
-
-  @doc """
-  Classifies a transaction status atom into a reporting category string.
+  Creates a new empty context.
 
   ## Examples
 
-      iex> PaymentsCli.Transaction.classify_status(:approved)
-      "successful"
-
-      iex> PaymentsCli.Transaction.classify_status(:declined)
-      "failed"
+      iex> ctx = Pipeline.new_context()
+      iex> ctx.halted
+      false
+      iex> ctx.assigns
+      %{}
 
   """
-  @spec classify_status(atom()) :: String.t()
-  def classify_status(:approved), do: "successful"
-  def classify_status(:reversed), do: "successful"
-  def classify_status(:declined), do: "failed"
-  def classify_status(:flagged), do: "under_review"
-  def classify_status(:pending), do: "pending"
-  def classify_status(_unknown), do: "unknown"
+  @spec new_context() :: context()
+  def new_context do
+    %{halted: false, assigns: %{}, status: nil, body: nil}
+  end
 
   @doc """
-  Parses a status string from external input into a status atom.
+  Creates a context with initial assigns.
 
-  Returns {:ok, atom} for known statuses, {:error, :unknown_status} for anything else.
-  Uses String.to_existing_atom/1 so it NEVER creates new atoms from external input.
+  ## Examples
+
+      iex> ctx = Pipeline.new_context(%{user_id: 42})
+      iex> ctx.assigns.user_id
+      42
+
   """
-  @spec parse_status(String.t()) :: {:ok, atom()} | {:error, :unknown_status}
-  def parse_status(string) when is_binary(string) do
-    atom =
-      try do
-        String.to_existing_atom(string)
-      rescue
-        ArgumentError -> nil
+  @spec new_context(map()) :: context()
+  def new_context(initial_assigns) when is_map(initial_assigns) do
+    %{halted: false, assigns: initial_assigns, status: nil, body: nil}
+  end
+
+  @doc """
+  Runs a list of middleware functions against a context.
+
+  Stops execution when a middleware sets `halted: true`.
+
+  ## Examples
+
+      iex> add_header = fn ctx -> put_in(ctx, [:assigns, :powered_by], "Elixir") end
+      iex> set_status = fn ctx -> %{ctx | status: 200} end
+      iex> ctx = Pipeline.run([add_header, set_status], Pipeline.new_context())
+      iex> ctx.assigns.powered_by
+      "Elixir"
+      iex> ctx.status
+      200
+
+  """
+  @spec run([middleware()], context()) :: context()
+  def run(middlewares, context) when is_list(middlewares) do
+    Enum.reduce_while(middlewares, context, fn middleware, ctx ->
+      if ctx.halted do
+        {:halt, ctx}
+      else
+        {:cont, middleware.(ctx)}
       end
-
-    if atom in @valid_statuses do
-      {:ok, atom}
-    else
-      {:error, :unknown_status}
-    end
+    end)
   end
 
   @doc """
-  Returns a human-readable log description for a transaction.
+  Assigns a key-value pair to the context's assigns map.
 
-  Uses multiple clauses — one per status — so each case is explicit.
-  A catch-all handles statuses added in the future without breaking existing code.
+  This is a convenience function — the same as `put_in(ctx, [:assigns, key], value)`.
 
   ## Examples
 
-      iex> PaymentsCli.Transaction.describe(%{id: "T1", status: :approved, amount_cents: 1000, currency: "USD"})
-      "T1: approved USD 10.00"
-
-      iex> PaymentsCli.Transaction.describe(%{id: "T2", status: :declined, amount_cents: 500, currency: "USD"})
-      "T2: DECLINED (amount: USD 5.00)"
+      iex> ctx = Pipeline.new_context() |> Pipeline.assign(:role, :admin)
+      iex> ctx.assigns.role
+      :admin
 
   """
-  @spec describe(map()) :: String.t()
-  def describe(%{id: id, status: :approved, amount_cents: cents, currency: currency}) do
-    "#{id}: approved #{format_display(cents, currency)}"
-  end
-
-  def describe(%{id: id, status: :declined, amount_cents: cents, currency: currency}) do
-    "#{id}: DECLINED (amount: #{format_display(cents, currency)})"
-  end
-
-  def describe(%{id: id, status: :flagged, amount_cents: cents, currency: currency}) do
-    "#{id}: FLAGGED FOR REVIEW — #{format_display(cents, currency)}"
-  end
-
-  def describe(%{id: id, status: :reversed, amount_cents: cents, currency: currency}) do
-    "#{id}: reversed #{format_display(cents, currency)}"
-  end
-
-  def describe(%{id: id, status: status}) do
-    "#{id}: #{status}"
+  @spec assign(context(), atom(), term()) :: context()
+  def assign(context, key, value) when is_atom(key) do
+    put_in(context, [:assigns, key], value)
   end
 
   @doc """
-  Returns true if a transaction can be reversed.
-
-  Business rules:
-  - Only :approved transactions can be reversed
-  - Amount must be positive (> 0)
-  - Uses guards so the rule is enforced at the function head, not in the body
+  Halts the pipeline. Subsequent middlewares will not execute.
 
   ## Examples
 
-      iex> PaymentsCli.Transaction.reversible?(%{status: :approved, amount_cents: 1000})
+      iex> ctx = Pipeline.new_context() |> Pipeline.halt_pipeline()
+      iex> ctx.halted
       true
 
-      iex> PaymentsCli.Transaction.reversible?(%{status: :declined, amount_cents: 1000})
+  """
+  @spec halt_pipeline(context()) :: context()
+  def halt_pipeline(context) do
+    %{context | halted: true}
+  end
+end
+```
+
+### `lib/pipeline/middlewares.ex`
+
+```elixir
+defmodule Pipeline.Middlewares do
+  @moduledoc """
+  Common middleware functions demonstrating multi-arity patterns,
+  default arguments, and the function capture operator.
+  """
+
+  @doc """
+  Middleware that adds a timestamp to the context.
+
+  Uses a default argument for the time function, allowing tests
+  to inject a fixed time.
+
+  ## Examples
+
+      iex> ctx = Pipeline.Middlewares.timestamp(Pipeline.new_context())
+      iex> is_binary(ctx.assigns.timestamp)
+      true
+
+  """
+  @spec timestamp(Pipeline.context(), (() -> String.t())) :: Pipeline.context()
+  def timestamp(context, time_fn \\ &default_timestamp/0) do
+    Pipeline.assign(context, :timestamp, time_fn.())
+  end
+
+  @doc """
+  Creates an authentication middleware configured with a set of valid tokens.
+
+  Returns a function (closure) that captures the `valid_tokens` set.
+  This is the factory pattern: a function that returns a middleware function.
+
+  ## Examples
+
+      iex> auth = Pipeline.Middlewares.authenticate(MapSet.new(["secret123"]))
+      iex> ctx = Pipeline.new_context(%{token: "secret123"}) |> auth.()
+      iex> ctx.assigns.authenticated
+      true
+
+      iex> auth = Pipeline.Middlewares.authenticate(MapSet.new(["secret123"]))
+      iex> ctx = Pipeline.new_context(%{token: "wrong"}) |> auth.()
+      iex> ctx.halted
+      true
+
+  """
+  @spec authenticate(MapSet.t()) :: Pipeline.middleware()
+  def authenticate(valid_tokens) do
+    fn context ->
+      token = get_in(context, [:assigns, :token])
+
+      if MapSet.member?(valid_tokens, token) do
+        Pipeline.assign(context, :authenticated, true)
+      else
+        context
+        |> Pipeline.assign(:authenticated, false)
+        |> Map.put(:status, 401)
+        |> Map.put(:body, "Unauthorized")
+        |> Pipeline.halt_pipeline()
+      end
+    end
+  end
+
+  @doc """
+  Creates a rate limiter middleware.
+
+  Takes a maximum request count. The middleware checks
+  `assigns.request_count` and halts if exceeded.
+
+  ## Examples
+
+      iex> limiter = Pipeline.Middlewares.rate_limit(100)
+      iex> ctx = Pipeline.new_context(%{request_count: 50}) |> limiter.()
+      iex> ctx.halted
       false
 
-  """
-  @spec reversible?(map()) :: boolean()
-  def reversible?(%{status: :approved, amount_cents: cents}) when cents > 0, do: true
-  def reversible?(_), do: false
-
-  @doc """
-  Compares two transactions by amount.
-
-  Returns :gt, :lt, or :eq.
-
-  ## Examples
-
-      iex> t1 = %{amount_cents: 1000}
-      iex> t2 = %{amount_cents: 500}
-      iex> PaymentsCli.Transaction.compare(t1, t2)
-      :gt
+      iex> limiter = Pipeline.Middlewares.rate_limit(100)
+      iex> ctx = Pipeline.new_context(%{request_count: 150}) |> limiter.()
+      iex> ctx.halted
+      true
+      iex> ctx.status
+      429
 
   """
-  @spec compare(map(), map()) :: :gt | :lt | :eq
-  def compare(%{amount_cents: a}, %{amount_cents: b}) do
-    cond do
-      a > b -> :gt
-      a < b -> :lt
-      true  -> :eq
+  @spec rate_limit(pos_integer()) :: Pipeline.middleware()
+  def rate_limit(max_requests) when is_integer(max_requests) and max_requests > 0 do
+    fn context ->
+      count = get_in(context, [:assigns, :request_count]) || 0
+
+      if count > max_requests do
+        context
+        |> Map.put(:status, 429)
+        |> Map.put(:body, "Rate limit exceeded")
+        |> Pipeline.halt_pipeline()
+      else
+        context
+      end
     end
   end
 
   @doc """
-  Compares two transactions by a specified field.
+  Middleware that logs the request (adds a log entry to assigns).
 
-  The field must exist in both transactions and must be comparable.
-
-  ## Examples
-
-      iex> t1 = %{amount_cents: 1000, id: "TXN002"}
-      iex> t2 = %{amount_cents: 500,  id: "TXN001"}
-      iex> PaymentsCli.Transaction.compare(t1, t2, :id)
-      :gt
-
-  """
-  @spec compare(map(), map(), atom()) :: :gt | :lt | :eq
-  def compare(tx1, tx2, field) when is_atom(field) do
-    v1 = Map.get(tx1, field)
-    v2 = Map.get(tx2, field)
-
-    cond do
-      v1 > v2 -> :gt
-      v1 < v2 -> :lt
-      true    -> :eq
-    end
-  end
-
-  @doc """
-  Builds a short display label for a transaction.
-
-  `symbol` is optional — defaults to the currency code when not provided.
+  Uses the function capture operator (&) to reference a named function.
+  Demonstrates how `&Module.function/arity` creates a function reference.
 
   ## Examples
 
-      iex> tx = %{id: "T1", amount_cents: 1234, currency: "USD"}
-      iex> PaymentsCli.Transaction.label(tx)
-      "T1 [USD 12.34]"
-
-      iex> PaymentsCli.Transaction.label(tx, "$")
-      "T1 [$12.34]"
+      iex> ctx = Pipeline.new_context() |> Pipeline.Middlewares.logger()
+      iex> is_list(ctx.assigns.log)
+      true
 
   """
-  @spec label(map(), String.t()) :: String.t()
-  def label(tx, symbol \\ nil)
-
-  def label(%{id: id, amount_cents: cents, currency: currency}, nil) do
-    "#{id} [#{currency} #{format_cents(cents)}]"
+  @spec logger(Pipeline.context()) :: Pipeline.context()
+  def logger(context) do
+    log_entry = "Request processed at #{default_timestamp()}"
+    existing = Map.get(context.assigns, :log, [])
+    Pipeline.assign(context, :log, [log_entry | existing])
   end
 
-  def label(%{id: id, amount_cents: cents}, symbol) when is_binary(symbol) do
-    "#{id} [#{symbol}#{format_cents(cents)}]"
-  end
-
-  # ---------------------------------------------------------------------------
-  # Private helpers
-  # ---------------------------------------------------------------------------
-
-  defp format_cents(cents) do
-    major = div(cents, 100)
-    minor = rem(cents, 100)
-    "#{major}.#{minor |> Integer.to_string() |> String.pad_leading(2, "0")}"
-  end
-
-  defp format_display(cents, currency) do
-    "#{currency} #{format_cents(cents)}"
+  @spec default_timestamp() :: String.t()
+  defp default_timestamp do
+    DateTime.utc_now() |> DateTime.to_iso8601()
   end
 end
 ```
 
 **Why this works:**
 
-- `describe/1` has five clauses, one per known status plus a catch-all. The catch-all
-  `%{id: id, status: status}` handles any future status without crashing. Clauses are
-  ordered from most specific to least specific — the catch-all is always last.
-
-- `reversible?/1` puts the business rule (`cents > 0`) in a guard. The guard is
-  evaluated before the function body executes. If the guard fails, the clause does not
-  match and the next clause is tried. The second clause `def reversible?(_)` catches
-  everything else and returns `false`.
-
-- `compare/2` pattern-matches `amount_cents` from both maps in the function head, then
-  uses `cond` for the three-way comparison. `compare/3` is a separate function (different
-  arity) that accepts an arbitrary field name and uses `Map.get/2` to extract values.
-
-- `label/1` and `label/2` use a default argument `symbol \\ nil`. When a function
-  with a default argument has multiple clauses, a header-only declaration is required
-  (`def label(tx, symbol \\ nil)` with no body). The compiler generates `label/1`
-  which calls `label/2` with `nil` as the second argument.
-
-- `format_cents/1` splits the integer into major and minor units using `div/2` and
-  `rem/2`, then pads the minor unit to two digits. `format_display/2` prepends the
-  currency code.
+- `timestamp/2` has a default argument (`time_fn \\ &default_timestamp/0`). This
+  generates two function heads at compile time: `timestamp/1` (uses default) and
+  `timestamp/2` (uses provided function). The default argument makes production code
+  simple while allowing tests to inject deterministic timestamps.
+- `authenticate/1` returns a function — this is the factory pattern. The returned
+  function closes over `valid_tokens`, capturing it at creation time. Each call to
+  `authenticate/1` with different tokens produces a different middleware.
+- `&default_timestamp/0` is the function capture operator. It converts a named
+  function into an anonymous function that can be passed as an argument.
+- `rate_limit/1` uses a guard `when is_integer(max_requests) and max_requests > 0`
+  to validate configuration at middleware creation time, not at request time.
 
 ### Tests
 
 ```elixir
-# test/payments_cli/transaction_api_test.exs
-defmodule PaymentsCli.TransactionApiTest do
+# test/pipeline_test.exs
+defmodule PipelineTest do
   use ExUnit.Case, async: true
 
-  alias PaymentsCli.Transaction
+  doctest Pipeline
+  doctest Pipeline.Middlewares
 
-  @approved  %{id: "T1", status: :approved,  amount_cents: 1000, currency: "USD"}
-  @declined  %{id: "T2", status: :declined,  amount_cents: 500,  currency: "USD"}
-  @flagged   %{id: "T3", status: :flagged,   amount_cents: 750,  currency: "EUR"}
-  @reversed  %{id: "T4", status: :reversed,  amount_cents: 200,  currency: "GBP"}
-  @pending   %{id: "T5", status: :pending,   amount_cents: 300,  currency: "USD"}
+  describe "run/2" do
+    test "executes middlewares in order" do
+      m1 = fn ctx -> Pipeline.assign(ctx, :step1, true) end
+      m2 = fn ctx -> Pipeline.assign(ctx, :step2, true) end
 
-  describe "describe/1" do
-    test "describes approved transaction" do
-      result = Transaction.describe(@approved)
-      assert String.contains?(result, "T1")
-      assert String.contains?(result, "approved")
+      ctx = Pipeline.run([m1, m2], Pipeline.new_context())
+      assert ctx.assigns.step1 == true
+      assert ctx.assigns.step2 == true
     end
 
-    test "describes declined transaction with emphasis" do
-      result = Transaction.describe(@declined)
-      assert String.contains?(result, "DECLINED")
+    test "stops at halted middleware" do
+      halt = fn ctx -> Pipeline.halt_pipeline(ctx) end
+      never = fn _ctx -> raise "should not be called" end
+
+      ctx = Pipeline.run([halt, never], Pipeline.new_context())
+      assert ctx.halted == true
     end
 
-    test "describes flagged transaction" do
-      result = Transaction.describe(@flagged)
-      assert String.contains?(result, "FLAGGED")
-    end
-
-    test "describes reversed transaction" do
-      result = Transaction.describe(@reversed)
-      assert String.contains?(result, "reversed")
-    end
-
-    test "catch-all handles pending" do
-      result = Transaction.describe(@pending)
-      assert is_binary(result)
-      assert String.contains?(result, "T5")
+    test "empty pipeline returns context unchanged" do
+      ctx = Pipeline.new_context(%{original: true})
+      assert Pipeline.run([], ctx) == ctx
     end
   end
 
-  describe "reversible?/1" do
-    test "approved transaction with positive amount is reversible" do
-      assert Transaction.reversible?(@approved) == true
+  describe "full pipeline" do
+    test "authentication + rate limiting + timestamp" do
+      auth = Pipeline.Middlewares.authenticate(MapSet.new(["valid_token"]))
+      limiter = Pipeline.Middlewares.rate_limit(1000)
+
+      fixed_time = fn -> "2024-01-01T00:00:00Z" end
+      stamp = fn ctx -> Pipeline.Middlewares.timestamp(ctx, fixed_time) end
+
+      ctx =
+        Pipeline.new_context(%{token: "valid_token", request_count: 5})
+        |> then(&Pipeline.run([auth, limiter, stamp], &1))
+
+      assert ctx.assigns.authenticated == true
+      assert ctx.assigns.timestamp == "2024-01-01T00:00:00Z"
+      refute ctx.halted
     end
 
-    test "declined transaction is not reversible" do
-      assert Transaction.reversible?(@declined) == false
+    test "pipeline halts on bad token" do
+      auth = Pipeline.Middlewares.authenticate(MapSet.new(["valid_token"]))
+      stamp = fn ctx -> Pipeline.Middlewares.timestamp(ctx) end
+
+      ctx =
+        Pipeline.new_context(%{token: "bad_token"})
+        |> then(&Pipeline.run([auth, stamp], &1))
+
+      assert ctx.halted
+      assert ctx.status == 401
+      refute Map.has_key?(ctx.assigns, :timestamp)
     end
 
-    test "approved transaction with zero amount is not reversible" do
-      tx = %{status: :approved, amount_cents: 0}
-      assert Transaction.reversible?(tx) == false
+    test "pipeline halts on rate limit" do
+      auth = Pipeline.Middlewares.authenticate(MapSet.new(["tok"]))
+      limiter = Pipeline.Middlewares.rate_limit(10)
+
+      ctx =
+        Pipeline.new_context(%{token: "tok", request_count: 100})
+        |> then(&Pipeline.run([auth, limiter], &1))
+
+      assert ctx.halted
+      assert ctx.status == 429
     end
   end
 
-  describe "compare/2 and compare/3" do
-    test "returns :gt when first amount is greater" do
-      assert Transaction.compare(@approved, @declined) == :gt
-    end
-
-    test "returns :lt when first amount is less" do
-      assert Transaction.compare(@declined, @approved) == :lt
-    end
-
-    test "returns :eq for equal amounts" do
-      same = %{amount_cents: 1000}
-      assert Transaction.compare(@approved, same) == :eq
-    end
-
-    test "compare/3 compares by specified field" do
-      t1 = %{amount_cents: 1000, id: "TXN002"}
-      t2 = %{amount_cents: 500,  id: "TXN001"}
-      assert Transaction.compare(t1, t2, :id) == :gt
-    end
-  end
-
-  describe "label/1 and label/2" do
-    test "label/1 uses currency code" do
-      result = Transaction.label(@approved)
-      assert String.contains?(result, "T1")
-      assert String.contains?(result, "USD")
-    end
-
-    test "label/2 uses provided symbol" do
-      result = Transaction.label(@approved, "$")
-      assert String.contains?(result, "$")
-      refute String.contains?(result, "USD")
+  describe "function capture" do
+    test "named function as middleware using &" do
+      # &Pipeline.Middlewares.logger/1 captures the named function
+      pipeline = [&Pipeline.Middlewares.logger/1]
+      ctx = Pipeline.run(pipeline, Pipeline.new_context())
+      assert is_list(ctx.assigns.log)
     end
   end
 end
@@ -394,71 +391,92 @@ end
 ### Run the tests
 
 ```bash
-mix test test/payments_cli/transaction_api_test.exs --trace
+mix test --trace
 ```
 
 ---
 
-## Trade-off analysis
+## The function capture operator `&`
 
-| Aspect | Multiple clauses (your impl) | Single function with `cond` | Single function with `if` |
-|--------|-----------------------------|-----------------------------|--------------------------|
-| Adding a new status | Add one clause | Edit the `cond` block | Nest another `if` |
-| Pattern match guards | First-class, in the head | Separate condition | Separate condition |
-| Dialyzer exhaustiveness | Can warn on unhandled | Cannot | Cannot |
-| Readability | Each case isolated | All cases in one block | Deeply nested |
-| Catch-all | Natural final clause | `true ->` at end | Final `else` |
+```elixir
+# Capture a named function
+fun = &String.upcase/1
+fun.("hello")  # => "HELLO"
 
-Reflection question: `label/1` uses a default argument `symbol \\ nil`. The
-compiler generates two functions: `label/1` and `label/2`. What does `label/1`
-actually do at the call site? Look at what Mix generates with `mix compile` and
-inspect the beam file with `:beam_lib.chunks/2`.
+# Capture a local function
+defmodule Example do
+  def double(x), do: x * 2
+
+  def run do
+    Enum.map([1, 2, 3], &double/1)  # => [2, 4, 6]
+  end
+end
+
+# Short syntax for anonymous functions
+Enum.map([1, 2, 3], &(&1 * 2))  # => [2, 4, 6]
+# &1 refers to the first argument
+
+# Multi-argument short syntax
+Enum.reduce([1, 2, 3], 0, &(&1 + &2))  # => 6
+# &1 = element, &2 = accumulator
+```
+
+The `&` operator is not syntactic sugar — it creates a real function value that can
+be stored, passed, and invoked. `&String.upcase/1` is equivalent to
+`fn x -> String.upcase(x) end` but more concise.
+
+---
+
+## Default arguments and generated arities
+
+```elixir
+def send_email(to, subject, opts \\ [])
+# Generates: send_email/2 and send_email/3
+
+def connect(host, port \\ 5432, timeout \\ 5000)
+# Generates: connect/1, connect/2, and connect/3
+```
+
+Default arguments are filled left to right. `connect("db.example.com", 3306)` sets
+`host` to `"db.example.com"` and `port` to `3306`, keeping `timeout` at `5000`.
+
+When a module has multiple clauses with the same name/arity, default arguments must
+be declared in a bodyless function head:
+
+```elixir
+def process(data, opts \\ [])
+def process(data, opts) when is_map(data), do: # ...
+def process(data, opts) when is_list(data), do: # ...
+```
 
 ---
 
 ## Common production mistakes
 
-**1. Catch-all clause before specific clauses**
-```elixir
-def describe(_tx), do: "unknown"  # catches everything — wrong position
-def describe(%{status: :approved}), do: "approved"  # never reached
-```
-Elixir evaluates clauses top-to-bottom and uses the first match. Specific clauses
-must come before the catch-all. The compiler warns, but only if `--warnings-as-errors`
-is set (which it should be in CI).
+**1. Confusing `fun/1` and `fun/2`**
+`Enum.map(list, &process/1)` calls the 1-arity version. If your `process` function
+takes 2 arguments, this is a compile error — not a runtime error.
 
-**2. Default arguments with multiple clauses need a header declaration**
-```elixir
-# WRONG — compiler error with multiple clauses that have a default
-def label(tx, symbol \\ nil)  # this is the header-only declaration
-def label(tx, nil), do: ...   # clause 1
-def label(tx, symbol), do: ... # clause 2
-```
-The header-only declaration (`def label(tx, symbol \\ nil)` with no body) is
-required when a function with a default argument has multiple clauses. Omitting it
-causes a compilation error.
+**2. Forgetting the dot for anonymous function calls**
+Named functions: `String.upcase("hello")`. Anonymous functions: `fun.("hello")`.
+The dot is required for anonymous functions and is not optional style.
 
-**3. Guards cannot call user-defined functions**
-`when reversible?(tx)` is not valid in a guard. Guards are limited to BIFs
-(built-in functions) like `is_integer/1`, `is_binary/1`, `>`, `<`, `rem/2`.
-The reason: guards must be pure and side-effect-free. Move complex conditions
-to the function body.
+**3. Default arguments in multiple clauses**
+Defining defaults in more than one clause is a compile error. Use a bodyless head.
 
-**4. Function capture captures the arity**
-`&Transaction.compare/2` and `&Transaction.compare/3` are different captures.
-Passing `&Transaction.compare/2` to `Enum.sort_by/3` will fail if you intended
-the three-argument version.
+**4. Capturing private functions from outside the module**
+`&MyModule.private_fun/1` only works inside `MyModule`. From outside, private
+functions are invisible. This is by design — it enforces encapsulation.
 
-**5. Forgetting that `defp` breaks the public contract**
-Changing `def validate/1` to `defp validate/1` breaks every caller outside the
-module. Unlike access modifiers in OO languages, there is no warning from the
-compiler — callers just get `UndefinedFunctionError` at runtime.
+**5. `&(&1)` is not a function**
+`&(&1)` is the identity function (`fn x -> x end`). It works, but it is confusing.
+Write `& &1` or `fn x -> x end` for clarity.
 
 ---
 
 ## Resources
 
-- [Modules and Functions — Elixir Getting Started](https://elixir-lang.org/getting-started/modules-and-functions.html)
-- [def/defp — Kernel docs](https://hexdocs.pm/elixir/Kernel.html#def/2)
-- [Guards — Elixir Getting Started](https://elixir-lang.org/getting-started/case-cond-and-if.html#guards)
-- [Elixir School — Functions](https://elixirschool.com/en/lessons/basics/functions)
+- [Functions — Elixir Getting Started](https://elixir-lang.org/getting-started/modules-and-functions.html)
+- [Function captures — HexDocs](https://hexdocs.pm/elixir/Function.html)
+- [Default arguments — Elixir Getting Started](https://elixir-lang.org/getting-started/modules-and-functions.html#default-arguments)
+- [Plug — HexDocs](https://hexdocs.pm/plug/Plug.html) (the inspiration for this pattern)
