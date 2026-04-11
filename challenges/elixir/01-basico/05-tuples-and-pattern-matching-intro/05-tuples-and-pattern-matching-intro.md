@@ -1,298 +1,386 @@
-# Tuples and Pattern Matching: Transaction Result Handling
+# Tuples and Pattern Matching: Building an HTTP Response Handler
 
-**Project**: `payments_cli` — a CLI tool that processes payment transactions
-
----
-
-## Project context
-
-You are building `payments_cli`, a CLI tool that processes payment transactions from CSV
-files, validates them, applies business rules, and produces ledger reports.
-
-This exercise implements a `Pipeline` module that processes CSV lines through a
-parse-validate-classify pipeline. Every operation can fail, and Elixir's pattern matching
-with the `{:ok, value}` / `{:error, reason}` convention handles these failures explicitly.
-The module is completely self-contained — it defines all the helper functions it needs
-for CSV parsing, validation, and status conversion.
+**Project**: `http_client` — a response processor that pattern matches on HTTP result tuples
 
 ---
 
-## Why `=` is not assignment in Elixir
+## Why tuples and pattern matching replace exceptions
 
-In Python and Java, `x = 5` assigns the value `5` to `x`. In Elixir, `x = 5` is
-a **match expression**. The left side must be compatible with the right side, or
-the process raises `MatchError`.
+In Java or Python, HTTP client errors typically throw exceptions. The caller wraps
+everything in `try/catch` and hopes they caught the right exception type. In Elixir,
+the convention is different: functions return tagged tuples like `{:ok, result}` or
+`{:error, reason}`, and callers use pattern matching to handle each case explicitly.
 
-This distinction becomes important when you write:
+This is not just style — it is a design decision with real consequences:
 
-```elixir
-{:ok, transaction} = process(line)
-```
+1. **Exhaustiveness**: `case` on a tuple forces you to handle all variants. An uncaught
+   exception silently propagates until something crashes.
+2. **Composability**: tuples can be piped through `with` chains. Exceptions cannot.
+3. **Testability**: returning `{:error, :timeout}` is easy to assert. Catching
+   `%HTTPoison.Error{reason: :timeout}` requires exception-specific test infrastructure.
 
-This is not "assign the result to a variable called `transaction`". It is:
-"assert that `process/1` returned a two-element tuple where the first element
-is the atom `:ok`, and bind the second element to the variable `transaction`".
-If `process/1` returns `{:error, :invalid_amount}`, the match fails and the
-process dies with a `MatchError`.
-
-That failure is **not a bug** — it is Elixir's fail-fast design. A MatchError
-with a clear message (`no match of right hand side value: {:error, :invalid_amount}`)
-is better than silently continuing with corrupted data.
+Tuples in Elixir are fixed-size, contiguous in memory, and O(1) to access by index.
+They are perfect for small, fixed-structure return values — but wrong for collections
+(use lists) or named fields (use maps/structs).
 
 ---
 
 ## The business problem
 
-The `Pipeline` module needs to:
+Your service calls multiple external APIs. Each response comes as a tuple
+`{status_code, headers, body}`. You need a response processor that:
 
-1. Process a single CSV line through parse -> validate -> classify
-2. Return `{:ok, transaction_map}` on success
-3. Return `{:error, reason}` on any failure, identifying which step failed
-4. Process a batch of lines and separate successes from failures
+1. Pattern matches on status code ranges (2xx, 4xx, 5xx)
+2. Extracts specific headers using tuple/list pattern matching
+3. Parses JSON bodies conditionally
+4. Composes multiple API calls using `with` for early exit on failure
 
 ---
 
 ## Implementation
 
-### `lib/payments_cli/pipeline.ex`
-
-The pipeline processes each CSV line through three steps: parse, validate, and status
-conversion. Each step returns `{:ok, data}` or `{:error, reason}`. On error, we tag
-the error with the step name so the caller knows where the failure occurred.
-
-The batch processor uses `Enum.with_index/2` to track line numbers and
-`Enum.reduce/3` to split results into successes and errors in a single pass.
-Results are prepended (O(1)) then reversed at the end (O(n) once) — the standard
-pattern for building lists efficiently in Elixir.
+### `lib/http_client/response.ex`
 
 ```elixir
-defmodule PaymentsCli.Pipeline do
+defmodule HttpClient.Response do
   @moduledoc """
-  Orchestrates the transaction processing pipeline.
+  Processes HTTP response tuples into domain results.
 
-  Each step returns {:ok, data} or {:error, reason}. The pipeline
-  stops at the first failure and propagates the error upward.
-  This is the explicit error handling model — no exceptions, no nil checks.
+  Follows the Elixir convention where every function returns
+  {:ok, value} or {:error, reason} — never raises for expected failures.
   """
 
-  @valid_statuses [:pending, :approved, :declined, :reversed, :flagged]
+  @type headers :: [{String.t(), String.t()}]
+  @type raw_response :: {pos_integer(), headers(), String.t()}
 
   @doc """
-  Processes a single CSV line through the full pipeline.
+  Processes an HTTP response tuple into a domain result.
 
-  Returns {:ok, transaction} with a validated transaction map,
-  or {:error, {step, reason}} identifying which step failed.
+  Pattern matches on the status code to determine success or failure,
+  then parses the body accordingly.
 
   ## Examples
 
-      iex> PaymentsCli.Pipeline.process_line("TXN001,1234,USD,Coffee Shop,approved")
-      {:ok, %{id: "TXN001", amount_cents: 1234, currency: "USD", merchant: "Coffee Shop", status: :approved}}
+      iex> HttpClient.Response.process({200, [{"content-type", "application/json"}], ~s({"user": "alice"})})
+      {:ok, %{"user" => "alice"}}
 
-      iex> PaymentsCli.Pipeline.process_line("bad data")
-      {:error, {:parse, "expected 5 fields, got 1"}}
+      iex> HttpClient.Response.process({404, [], "Not Found"})
+      {:error, {:client_error, 404, "Not Found"}}
 
-  """
-  @spec process_line(String.t()) :: {:ok, map()} | {:error, {atom(), term()}}
-  def process_line(line) when is_binary(line) do
-    case parse_csv_line(line) do
-      {:error, reason} ->
-        {:error, {:parse, reason}}
-
-      {:ok, parsed} ->
-        case validate_transaction(parsed) do
-          {:error, reason} ->
-            {:error, {:validate, reason}}
-
-          {:ok, validated} ->
-            case convert_status(validated.status) do
-              {:error, reason} ->
-                {:error, {:status, reason}}
-
-              {:ok, status_atom} ->
-                {:ok, Map.put(validated, :status, status_atom)}
-            end
-        end
-    end
-  end
-
-  @doc """
-  Processes a list of CSV lines and separates results.
-
-  Returns {successful_transactions, errors} where:
-  - successful_transactions is a list of transaction maps
-  - errors is a list of {line_number, error} tuples
-
-  ## Examples
-
-      iex> lines = ["TXN001,1000,USD,Shop,approved", "bad", "TXN002,500,USD,Cafe,pending"]
-      iex> {ok, errors} = PaymentsCli.Pipeline.process_batch(lines)
-      iex> length(ok)
-      2
-      iex> length(errors)
-      1
+      iex> HttpClient.Response.process({500, [], "Internal Server Error"})
+      {:error, {:server_error, 500, "Internal Server Error"}}
 
   """
-  @spec process_batch([String.t()]) :: {[map()], [{pos_integer(), term()}]}
-  def process_batch(lines) when is_list(lines) do
-    {successes, errors} =
-      lines
-      |> Enum.with_index(1)
-      |> Enum.reduce({[], []}, fn {line, line_number}, {ok_acc, err_acc} ->
-        case process_line(line) do
-          {:ok, tx} -> {[tx | ok_acc], err_acc}
-          {:error, reason} -> {ok_acc, [{line_number, reason} | err_acc]}
-        end
-      end)
-
-    {Enum.reverse(successes), Enum.reverse(errors)}
-  end
-
-  # ---------------------------------------------------------------------------
-  # Private helpers — CSV parsing, validation, and status conversion
-  # ---------------------------------------------------------------------------
-
-  @spec parse_csv_line(String.t()) :: {:ok, map()} | {:error, String.t()}
-  defp parse_csv_line(line) do
-    fields = line |> String.split(",") |> Enum.map(&String.trim/1)
-
-    case fields do
-      [id, amount_str, currency, merchant, status] ->
-        case Integer.parse(amount_str) do
-          {amount, ""} ->
-            {:ok, %{
-              id: id,
-              amount_cents: amount,
-              currency: currency,
-              merchant: merchant,
-              status: status
-            }}
-
-          _ ->
-            {:error, "invalid amount: #{amount_str}"}
-        end
-
-      _ ->
-        {:error, "expected 5 fields, got #{length(fields)}"}
-    end
-  end
-
-  @spec validate_transaction(map()) :: {:ok, map()} | {:error, String.t()}
-  defp validate_transaction(%{amount_cents: amount, currency: currency} = tx) do
-    cond do
-      amount <= 0 ->
-        {:error, "amount must be positive"}
-
-      String.length(currency) != 3 ->
-        {:error, "currency must be 3 characters"}
-
-      true ->
-        {:ok, tx}
-    end
-  end
-
-  @spec convert_status(String.t()) :: {:ok, atom()} | {:error, :unknown_status}
-  defp convert_status(status_string) when is_binary(status_string) do
-    atom =
-      try do
-        String.to_existing_atom(status_string)
-      rescue
-        ArgumentError -> nil
-      end
-
-    if atom in @valid_statuses do
-      {:ok, atom}
+  @spec process(raw_response()) :: {:ok, term()} | {:error, term()}
+  def process({status, headers, body}) when status >= 200 and status < 300 do
+    if json_content?(headers) do
+      parse_json_body(body)
     else
-      {:error, :unknown_status}
+      {:ok, body}
+    end
+  end
+
+  def process({status, _headers, body}) when status >= 400 and status < 500 do
+    {:error, {:client_error, status, body}}
+  end
+
+  def process({status, _headers, body}) when status >= 500 do
+    {:error, {:server_error, status, body}}
+  end
+
+  def process({status, _headers, body}) when status >= 300 and status < 400 do
+    {:error, {:redirect, status, body}}
+  end
+
+  @doc """
+  Extracts a specific header value from a headers list.
+
+  Headers are stored as a list of {key, value} tuples. This function
+  searches case-insensitively, matching real HTTP header behavior.
+
+  ## Examples
+
+      iex> headers = [{"Content-Type", "application/json"}, {"X-Request-Id", "abc123"}]
+      iex> HttpClient.Response.get_header(headers, "content-type")
+      {:ok, "application/json"}
+
+      iex> HttpClient.Response.get_header([], "content-type")
+      :error
+
+  """
+  @spec get_header(headers(), String.t()) :: {:ok, String.t()} | :error
+  def get_header(headers, name) when is_list(headers) and is_binary(name) do
+    downcased = String.downcase(name)
+
+    case Enum.find(headers, fn {key, _val} -> String.downcase(key) == downcased end) do
+      {_key, value} -> {:ok, value}
+      nil -> :error
+    end
+  end
+
+  @doc """
+  Checks if a response indicates a retryable error.
+
+  Status 429 (rate limited) and 5xx errors are retryable.
+  Client errors (4xx except 429) are not.
+
+  ## Examples
+
+      iex> HttpClient.Response.retryable?({429, [], "Rate Limited"})
+      true
+
+      iex> HttpClient.Response.retryable?({503, [], "Service Unavailable"})
+      true
+
+      iex> HttpClient.Response.retryable?({404, [], "Not Found"})
+      false
+
+      iex> HttpClient.Response.retryable?({200, [], "OK"})
+      false
+
+  """
+  @spec retryable?(raw_response()) :: boolean()
+  def retryable?({429, _headers, _body}), do: true
+  def retryable?({status, _headers, _body}) when status >= 500, do: true
+  def retryable?({_status, _headers, _body}), do: false
+
+  @spec json_content?(headers()) :: boolean()
+  defp json_content?(headers) do
+    case get_header(headers, "content-type") do
+      {:ok, content_type} -> String.contains?(content_type, "json")
+      :error -> false
+    end
+  end
+
+  @spec parse_json_body(String.t()) :: {:ok, term()} | {:error, :invalid_json}
+  defp parse_json_body(body) do
+    case Jason.decode(body) do
+      {:ok, data} -> {:ok, data}
+      {:error, _} -> {:error, :invalid_json}
     end
   end
 end
 ```
 
-**Why this works:**
+### `lib/http_client/api.ex`
 
-- `process_line/1` uses nested `case` expressions to chain three fallible steps. Each
-  `case` pattern-matches on the result tuple: `{:ok, data}` continues to the next step,
-  `{:error, reason}` wraps the reason with a step tag and returns immediately. The
-  nesting is intentional — understanding the explicit `case` chain is essential before
-  learning the `with` macro that flattens this pattern.
+```elixir
+defmodule HttpClient.Api do
+  @moduledoc """
+  Composes multiple API calls using `with` for early exit on failure.
 
-- `process_batch/1` uses `Enum.with_index(lines, 1)` to pair each line with its 1-based
-  line number, then reduces into two accumulators. Each result is prepended to the
-  appropriate accumulator (O(1) per step), then both lists are reversed at the end
-  (O(n) total). This is O(n) overall, not O(n^2).
+  Demonstrates how tagged tuples compose through `with` chains —
+  the functional equivalent of try/catch with multiple operations.
+  """
 
-- `validate_transaction/1` uses `cond` because the checks are independent boolean
-  conditions, not pattern matches on a value's shape. `cond` is the right tool when
-  you have "check this, then that, then the other" logic.
+  alias HttpClient.Response
 
-- `parse_csv_line/1` splits on commas, trims whitespace, and validates the field count.
-  `Integer.parse/1` returns `{integer, rest}` on success — matching on `{amount, ""}`
-  ensures the entire string was consumed.
+  @doc """
+  Fetches a user profile by first getting the user ID from an auth token,
+  then fetching the profile with that ID.
 
-- `convert_status/1` safely converts string status to atom using `String.to_existing_atom/1`
-  with a rescue, then verifies membership in the valid statuses list.
+  Uses `with` to chain two API calls. If the first fails, the second
+  never executes — `with` short-circuits on the first non-matching clause.
+
+  The `http_client` parameter is a function that simulates HTTP calls,
+  making this testable without real network access.
+
+  ## Examples
+
+      iex> client = fn
+      ...>   :get, "/auth/me" -> {200, [{"content-type", "application/json"}], ~s({"id": "u123"})}
+      ...>   :get, "/users/u123" -> {200, [{"content-type", "application/json"}], ~s({"name": "Alice", "email": "alice@example.com"})}
+      ...> end
+      iex> {:ok, profile} = HttpClient.Api.fetch_user_profile(client)
+      iex> profile["name"]
+      "Alice"
+
+  """
+  @spec fetch_user_profile((atom(), String.t() -> Response.raw_response())) ::
+          {:ok, map()} | {:error, term()}
+  def fetch_user_profile(http_client) do
+    with {:ok, %{"id" => user_id}} <-
+           http_client.(:get, "/auth/me") |> Response.process(),
+         {:ok, profile} <-
+           http_client.(:get, "/users/#{user_id}") |> Response.process() do
+      {:ok, profile}
+    end
+  end
+
+  @doc """
+  Fetches data from multiple endpoints and merges results.
+
+  Demonstrates pattern matching on tuples within Enum operations.
+  Collects all successful results and all errors separately.
+
+  ## Examples
+
+      iex> client = fn
+      ...>   :get, "/status" -> {200, [{"content-type", "application/json"}], ~s({"healthy": true})}
+      ...>   :get, "/version" -> {200, [{"content-type", "application/json"}], ~s({"version": "1.0"})}
+      ...>   :get, "/broken" -> {500, [], "down"}
+      ...> end
+      iex> {successes, errors} = HttpClient.Api.fetch_all(client, ["/status", "/version", "/broken"])
+      iex> length(successes)
+      2
+      iex> length(errors)
+      1
+
+  """
+  @spec fetch_all(
+          (atom(), String.t() -> Response.raw_response()),
+          [String.t()]
+        ) :: {[{String.t(), term()}], [{String.t(), term()}]}
+  def fetch_all(http_client, paths) do
+    results =
+      Enum.map(paths, fn path ->
+        {path, http_client.(:get, path) |> Response.process()}
+      end)
+
+    successes =
+      for {path, {:ok, data}} <- results, do: {path, data}
+
+    errors =
+      for {path, {:error, reason}} <- results, do: {path, reason}
+
+    {successes, errors}
+  end
+end
+```
 
 ### Tests
 
 ```elixir
-# test/payments_cli/pipeline_test.exs
-defmodule PaymentsCli.PipelineTest do
+# test/http_client/response_test.exs
+defmodule HttpClient.ResponseTest do
   use ExUnit.Case, async: true
 
-  alias PaymentsCli.Pipeline
+  alias HttpClient.Response
 
-  describe "process_line/1" do
-    test "processes a valid line" do
-      assert {:ok, tx} = Pipeline.process_line("TXN001,1234,USD,Coffee Shop,approved")
-      assert tx.id == "TXN001"
-      assert tx.amount_cents == 1234
-      assert tx.status == :approved
+  doctest HttpClient.Response
+
+  describe "process/1" do
+    test "parses 200 with JSON body" do
+      response = {200, [{"content-type", "application/json"}], ~s({"key": "value"})}
+      assert {:ok, %{"key" => "value"}} = Response.process(response)
     end
 
-    test "returns parse error for bad format" do
-      assert {:error, {:parse, _reason}} = Pipeline.process_line("not csv at all")
+    test "returns raw body for non-JSON 200" do
+      response = {200, [{"content-type", "text/plain"}], "hello"}
+      assert {:ok, "hello"} = Response.process(response)
     end
 
-    test "returns validate error for negative amount" do
-      assert {:error, {:validate, _reason}} = Pipeline.process_line("TXN001,-100,USD,Shop,approved")
+    test "returns client error for 4xx" do
+      response = {404, [], "Not Found"}
+      assert {:error, {:client_error, 404, "Not Found"}} = Response.process(response)
     end
 
-    test "returns validate error for zero amount" do
-      assert {:error, {:validate, _reason}} = Pipeline.process_line("TXN001,0,USD,Shop,approved")
+    test "returns server error for 5xx" do
+      response = {503, [], "Service Unavailable"}
+      assert {:error, {:server_error, 503, "Service Unavailable"}} = Response.process(response)
     end
 
-    test "returns status error for unknown status" do
-      assert {:error, {:status, _reason}} = Pipeline.process_line("TXN001,100,USD,Shop,exploded")
+    test "returns redirect for 3xx" do
+      response = {301, [], "Moved"}
+      assert {:error, {:redirect, 301, "Moved"}} = Response.process(response)
     end
 
-    test "converts status string to atom" do
-      assert {:ok, tx} = Pipeline.process_line("TXN001,500,USD,Shop,pending")
-      assert is_atom(tx.status)
-      assert tx.status == :pending
+    test "returns error for invalid JSON in 200" do
+      response = {200, [{"content-type", "application/json"}], "not json"}
+      assert {:error, :invalid_json} = Response.process(response)
     end
   end
 
-  describe "process_batch/1" do
+  describe "get_header/2" do
+    test "finds header case-insensitively" do
+      headers = [{"Content-Type", "application/json"}, {"X-Request-Id", "abc"}]
+      assert {:ok, "application/json"} = Response.get_header(headers, "content-type")
+      assert {:ok, "abc"} = Response.get_header(headers, "x-request-id")
+    end
+
+    test "returns :error for missing header" do
+      assert :error = Response.get_header([], "content-type")
+    end
+  end
+
+  describe "retryable?/1" do
+    test "429 is retryable" do
+      assert Response.retryable?({429, [], "Rate Limited"})
+    end
+
+    test "5xx is retryable" do
+      assert Response.retryable?({500, [], "Error"})
+      assert Response.retryable?({503, [], "Unavailable"})
+    end
+
+    test "4xx (except 429) is not retryable" do
+      refute Response.retryable?({400, [], "Bad Request"})
+      refute Response.retryable?({404, [], "Not Found"})
+    end
+
+    test "2xx is not retryable" do
+      refute Response.retryable?({200, [], "OK"})
+    end
+  end
+end
+```
+
+```elixir
+# test/http_client/api_test.exs
+defmodule HttpClient.ApiTest do
+  use ExUnit.Case, async: true
+
+  alias HttpClient.Api
+
+  doctest HttpClient.Api
+
+  describe "fetch_user_profile/1" do
+    test "chains two successful calls" do
+      client = fn
+        :get, "/auth/me" ->
+          {200, [{"content-type", "application/json"}], ~s({"id": "u42"})}
+
+        :get, "/users/u42" ->
+          {200, [{"content-type", "application/json"}], ~s({"name": "Bob"})}
+      end
+
+      assert {:ok, %{"name" => "Bob"}} = Api.fetch_user_profile(client)
+    end
+
+    test "short-circuits when auth fails" do
+      client = fn
+        :get, "/auth/me" -> {401, [], "Unauthorized"}
+        :get, "/users/" <> _ -> raise "should not be called"
+      end
+
+      assert {:error, {:client_error, 401, "Unauthorized"}} =
+               Api.fetch_user_profile(client)
+    end
+
+    test "fails when profile fetch fails" do
+      client = fn
+        :get, "/auth/me" ->
+          {200, [{"content-type", "application/json"}], ~s({"id": "u42"})}
+
+        :get, "/users/u42" ->
+          {500, [], "Database down"}
+      end
+
+      assert {:error, {:server_error, 500, "Database down"}} =
+               Api.fetch_user_profile(client)
+    end
+  end
+
+  describe "fetch_all/2" do
     test "separates successes from errors" do
-      lines = [
-        "TXN001,1000,USD,Shop A,approved",
-        "bad line",
-        "TXN002,500,USD,Shop B,pending"
-      ]
+      client = fn
+        :get, "/ok" -> {200, [{"content-type", "application/json"}], ~s({"status": "up"})}
+        :get, "/fail" -> {500, [], "down"}
+      end
 
-      {successes, errors} = Pipeline.process_batch(lines)
-      assert length(successes) == 2
+      {successes, errors} = Api.fetch_all(client, ["/ok", "/fail"])
+      assert length(successes) == 1
       assert length(errors) == 1
-    end
-
-    test "errors include line number" do
-      lines = ["good,100,USD,Shop,approved", "bad"]
-      {_ok, [{line_number, _reason}]} = Pipeline.process_batch(lines)
-      assert line_number == 2
-    end
-
-    test "empty batch returns empty results" do
-      assert {[], []} = Pipeline.process_batch([])
     end
   end
 end
@@ -301,65 +389,62 @@ end
 ### Run the tests
 
 ```bash
-mix test test/payments_cli/pipeline_test.exs --trace
+mix test --trace
 ```
 
 ---
 
-## Trade-off analysis
+## When to use tuples vs other data structures
 
-| Aspect | `{:ok, v}` / `{:error, r}` (your impl) | Raise exceptions | `nil` returns |
-|--------|----------------------------------------|-----------------|---------------|
-| Error visibility | Forced — caller must handle | Implicit — may be uncaught | Silent — nil propagates |
-| Error context | Tagged with step: `{:parse, reason}` | Stack trace | None |
-| Pattern exhaustiveness | Dialyzer can check | Nothing enforced | Nothing enforced |
-| Code structure | `case` / `with` chains | `try/rescue` | `if x != nil` chains |
-| Testing | Test each branch explicitly | Rescue in tests | Check for nil |
+| Data structure | Access | Size | Use when |
+|----------------|--------|------|----------|
+| Tuple `{a, b}` | O(1) by index | Fixed, small (2-4 elements) | Return values, coordinates, tagged results |
+| List `[a, b]` | O(n) by index, O(1) prepend | Variable | Collections, sequences |
+| Map `%{k: v}` | O(log n) by key | Variable | Named fields, lookups |
+| Struct `%S{}` | O(log n) by key | Fixed keys | Domain entities |
 
-Reflection question: `process_line/1` uses nested `case` expressions. The `with` macro
-can flatten this pattern. Compare the two approaches — what does `with` add
-beyond syntactic convenience?
+Tuples with more than 4 elements are a code smell. If you find yourself writing
+`{status, headers, body, timestamp, request_id}`, use a map or struct instead.
 
 ---
 
 ## Common production mistakes
 
-**1. Bare match `{:ok, x} = function()` in non-trivial code**
-A bare match crashes the process on failure. This is intentional in tests
-(`assert {:ok, x} = ...`) and in contexts where failure should propagate to
-a supervisor. In a pipeline where you want to collect errors, use `case`.
-
-**2. Deeply nested `case` expressions**
-Three levels of `case` for three pipeline steps is the warning sign that you
-need `with`. `with` flattens the happy path and makes error handling at the bottom.
-
-**3. Losing error context through re-wrapping**
+**1. Using `elem/2` instead of pattern matching**
 ```elixir
-case step1() do
-  {:error, _} -> {:error, "step1 failed"}  # BAD: lost the original reason
-  {:error, reason} -> {:error, {:step1, reason}}  # GOOD: reason preserved
+# Bad — loses the compiler's ability to check tuple shape
+status = elem(response, 0)
+
+# Good — compiler sees the expected shape
+{status, _headers, _body} = response
+```
+
+**2. Matching the wrong tuple size**
+```elixir
+# This crashes if the function returns {:error, reason, context}
+{:error, reason} = some_function()  # MatchError if 3-element tuple
+```
+Always check the function's typespec or documentation for all possible tuple shapes.
+
+**3. Ignoring the error case in `with`**
+```elixir
+with {:ok, a} <- step1(),
+     {:ok, b} <- step2(a) do
+  {:ok, b}
 end
+# If step1 returns {:error, reason}, `with` returns it unchanged.
+# Make sure the caller handles this.
 ```
-Always preserve the original error reason when re-wrapping.
 
-**4. The pin operator `^` is often needed in tests**
-```elixir
-expected_id = "TXN001"
-assert {:ok, %{id: ^expected_id}} = Pipeline.process_line(line)
-```
-Without `^`, `id: expected_id` would rebind `expected_id` to whatever the map
-contains, and the assertion would always pass.
-
-**5. Ignoring the wildcard `_` warning**
-The compiler warns when a match arm uses `_` in a position that hides data.
-A test with `{:error, _}` silently passes even if the error reason changes.
-Use `{:error, message}` and assert on `message` when the reason matters.
+**4. Raising on expected failures**
+If a file might not exist, `File.read/1` returns `{:error, :enoent}`. Use pattern
+matching. Do not use `File.read!/1` (which raises) unless you genuinely want to crash.
 
 ---
 
 ## Resources
 
-- [Pattern Matching — Elixir Getting Started](https://elixir-lang.org/getting-started/pattern-matching.html)
-- [Tuple — HexDocs](https://hexdocs.pm/elixir/Tuple.html)
+- [Tuples — Elixir Getting Started](https://elixir-lang.org/getting-started/basic-types.html#tuples)
+- [Pattern matching — Elixir Getting Started](https://elixir-lang.org/getting-started/pattern-matching.html)
 - [with — Kernel.SpecialForms](https://hexdocs.pm/elixir/Kernel.SpecialForms.html#with/1)
-- [Elixir School — Pattern Matching](https://elixirschool.com/en/lessons/basics/pattern_matching)
+- [Tuple — HexDocs](https://hexdocs.pm/elixir/Tuple.html)
