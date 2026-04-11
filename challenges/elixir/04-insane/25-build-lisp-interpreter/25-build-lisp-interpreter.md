@@ -394,19 +394,19 @@ fib_source = """
     (+ (fib (- n 1)) (fib (- n 2)))))
 """
 
-compile_and_run(fib_source)
+compile_and_run.(fib_source)
 
 Benchee.run(
   %{
-    "fib(20) — tree recursion"     => fn -> compile_and_run("(fib 20)") end,
+    "fib(20) — tree recursion"     => fn -> compile_and_run.("(fib 20)") end,
     "fact(10000) — tail recursion" => fn ->
-      compile_and_run("""
+      compile_and_run.("""
       (define (fact n acc) (if (= n 0) acc (fact (- n 1) (* n acc))))
       (fact 10000 1)
       """)
     end,
     "list construction 1000 items" => fn ->
-      compile_and_run("""
+      compile_and_run.("""
       (define (build n acc) (if (= n 0) acc (build (- n 1) (cons n acc))))
       (build 1000 '())
       """)
