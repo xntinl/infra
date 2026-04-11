@@ -13,12 +13,12 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "challenges/elixir/01-basico/02-atoms-and-symbols/02-atoms-and-symbols.md",
+                "file": "challenges/elixir/02-intermedio/01-procesos-spawn-send-receive/01-procesos-spawn-send-receive.md",
                 "mode": "source",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "02-atoms-and-symbols"
+              "title": "01-procesos-spawn-send-receive"
             }
           }
         ]
@@ -210,6 +210,14 @@
   },
   "active": "e170d91267f0c529",
   "lastOpenFiles": [
+    "challenges/elixir/01-basico/10-recursion-and-tail-call-optimization/10-recursion-and-tail-call-optimization.md",
+    "challenges/elixir/01-basico/11-enum-module-and-immutability/11-enum-module-and-immutability.md",
+    "challenges/elixir/01-basico/12-pipe-operator-and-composition/12-pipe-operator-and-composition.md",
+    "challenges/elixir/01-basico/13-anonymous-functions-and-closures/13-anonymous-functions-and-closures.md",
+    "challenges/elixir/01-basico/14-modules-and-function-visibility/14-modules-and-function-visibility.md",
+    "challenges/elixir/01-basico/15-structs-and-basic-validation/15-structs-and-basic-validation.md",
+    "challenges/elixir/01-basico/04-strings-and-binaries-basics/04-strings-and-binaries-basics.md",
+    "challenges/elixir/01-basico/02-atoms-and-symbols/02-atoms-and-symbols.md",
     "challenges/elixir/04-insane/01-build-distributed-raft-consensus/01-build-distributed-raft-consensus.md",
     "challenges/elixir/01-basico/01-setup-and-mix/01-setup-and-mix.md",
     "challenges/elixir/es/01-basico/15-structs-and-basic-validation/15-structs-and-basic-validation.md",
@@ -218,7 +226,6 @@
     "challenges/elixir/en/01-basico/14-modules-and-function-visibility/14-modules-and-function-visibility.md",
     "challenges/elixir/es/01-basico/13-anonymous-functions-and-closures/13-anonymous-functions-and-closures.md",
     "challenges/elixir/en/01-basico/13-anonymous-functions-and-closures/13-anonymous-functions-and-closures.md",
-    "challenges/elixir/01-basico/02-atoms-and-symbols/02-atoms-and-symbols.md",
     "challenges/elixir/es/01-basico/12-pipe-operator-and-composition/12-pipe-operator-and-composition.md",
     "challenges/elixir/en/01-basico/12-pipe-operator-and-composition/12-pipe-operator-and-composition.md",
     "challenges/elixir/es/01-basico/11-enum-module-and-immutability/11-enum-module-and-immutability.md",
@@ -229,13 +236,6 @@
     "challenges/elixir/en/01-basico/09-control-flow-if-case-cond/09-control-flow-if-case-cond.md",
     "challenges/elixir/es/01-basico/08-functions-and-arity/08-functions-and-arity.md",
     "challenges/elixir/en/01-basico/08-functions-and-arity/08-functions-and-arity.md",
-    "challenges/elixir/es/01-basico/07-maps-and-keyword-lists/07-maps-and-keyword-lists.md",
-    "challenges/elixir/en/01-basico/07-maps-and-keyword-lists/07-maps-and-keyword-lists.md",
-    "challenges/elixir/es/01-basico/06-lists-and-head-tail-pattern/06-lists-and-head-tail-pattern.md",
-    "challenges/elixir/en/01-basico/06-lists-and-head-tail-pattern/06-lists-and-head-tail-pattern.md",
-    "challenges/elixir/es/01-basico/05-tuples-and-pattern-matching-intro/05-tuples-and-pattern-matching-intro.md",
-    "challenges/elixir/en/01-basico/05-tuples-and-pattern-matching-intro/05-tuples-and-pattern-matching-intro.md",
-    "challenges/elixir/es/01-basico/04-strings-and-binaries-basics/04-strings-and-binaries-basics.md",
     "challenges/elixir/es/01-basico/15-structs-and-basic-validation",
     "challenges/elixir/es/01-basico/14-modules-and-function-visibility",
     "challenges/elixir/es/01-basico/13-anonymous-functions-and-closures",

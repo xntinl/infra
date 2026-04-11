@@ -62,7 +62,7 @@ The `#EXT-X-TARGETDURATION` playlist tag must equal the maximum segment duration
 
 ## Why the sliding window matters for live streaming
 
-A live stream generates segments indefinitely. Without a window, the media.m3u8 grows unbounded — a client that joins late would need to download all past segments to seek to the live edge. HLS specifies that a live playlist should keep only the last N segments (typically 3–5). Older segments are removed from the playlist and their storage is freed.
+A live stream generates segments indefinitely. Without a window, the media.m3u8 grows unbounded — a client that joins late would need to download all past segments to seek to the live edge. HLS specifies that a live playlist should keep only the last N segments (typically 3-5). Older segments are removed from the playlist and their storage is freed.
 
 The `#EXT-X-MEDIA-SEQUENCE` tag tells clients which sequence number the first segment in the current playlist has. This prevents clients from re-requesting segments they have already seen.
 
@@ -93,13 +93,19 @@ end
 
 ### Step 3: `lib/hls_server/segmenter.ex`
 
+The segmenter splits a video binary into fixed-byte-size segments. In real HLS, segments must start on keyframes; this implementation uses fixed byte boundaries as a simulation.
+
+The critical design choice is using `:binary.part/3` for segment extraction. This function returns a sub-binary that shares memory with the parent binary -- no data is copied. A 1GB video split into 100 segments uses ~1GB total, not ~2GB. If you instead used binary pattern matching like `<<chunk::binary-size(n), _rest::binary>>`, each `chunk` would be a new allocation because the compiler cannot prove the reference is safe to share.
+
+The `segment_duration/2` function correctly handles the last segment, which is almost always shorter than the configured duration. Reporting the wrong duration in `#EXTINF` causes players to stall waiting for bytes that do not exist.
+
 ```elixir
 defmodule HLSServer.Segmenter do
   @moduledoc """
   Splits a video binary into fixed-size segments.
 
   In real HLS, segments must start on keyframes. This implementation uses
-  fixed byte boundaries as a simulation — treating each chunk as if it
+  fixed byte boundaries as a simulation -- treating each chunk as if it
   starts on a keyframe, which is valid for our testing purposes.
 
   Memory design: store the entire video binary in an Agent (or :persistent_term).
@@ -110,6 +116,8 @@ defmodule HLSServer.Segmenter do
   that extracts into a new variable), you pay 2x memory. Measure with
   :erlang.memory(:binary) before and after segmentation.
   """
+
+  @type t :: %__MODULE__{}
 
   defstruct [:video_binary, :segment_size_bytes, :num_segments, :duration_s]
 
@@ -145,8 +153,9 @@ defmodule HLSServer.Segmenter do
       {:error, :out_of_range}
     else
       length = min(seg.segment_size_bytes, total_size - offset)
-      # TODO: :binary.part(seg.video_binary, offset, length)
-      # This is a zero-copy sub-binary reference
+      # :binary.part/3 returns a sub-binary referencing the same underlying
+      # memory as the parent. This is the zero-copy operation that keeps
+      # memory usage at O(video_size) instead of O(video_size * num_segments).
       {:ok, :binary.part(seg.video_binary, offset, length)}
     end
   end
@@ -159,16 +168,26 @@ defmodule HLSServer.Segmenter do
   @spec segment_duration(t(), non_neg_integer()) :: float()
   def segment_duration(%__MODULE__{} = seg, index) do
     if index < seg.num_segments - 1 do
+      # All segments except the last have the full configured duration
       seg.duration_s * 1.0
     else
-      # TODO: calculate actual duration of the last (possibly short) segment
-      seg.duration_s * 1.0
+      # The last segment covers whatever bytes remain. Its duration is
+      # proportional to its byte size relative to a full segment.
+      total_size = byte_size(seg.video_binary)
+      last_offset = index * seg.segment_size_bytes
+      last_length = total_size - last_offset
+      # Duration scales linearly with byte count (constant bitrate assumption)
+      last_length / seg.segment_size_bytes * seg.duration_s * 1.0
     end
   end
 end
 ```
 
 ### Step 4: `lib/hls_server/playlist/media.ex`
+
+The media playlist generates HLS-compliant `.m3u8` output for a single quality variant. It supports both VOD (video on demand, with `#EXT-X-ENDLIST`) and live (sliding window, no endlist) modes.
+
+For live playlists, `add_segment/3` appends a new segment and evicts the oldest when the window size is exceeded. The `media_sequence` counter increments with each eviction, telling clients that earlier segments are no longer available. This is how HLS handles unbounded live streams without unbounded playlists.
 
 ```elixir
 defmodule HLSServer.Playlist.Media do
@@ -193,6 +212,8 @@ defmodule HLSServer.Playlist.Media do
   - #EXT-X-MEDIA-SEQUENCE increments as old segments are evicted
   - only the last K segments appear in the playlist
   """
+
+  @type t :: %__MODULE__{}
 
   defstruct [
     :variant_name,
@@ -232,8 +253,9 @@ defmodule HLSServer.Playlist.Media do
     new_segments = playlist.segments ++ [new_seg]
 
     if w != nil and length(new_segments) > w do
-      # TODO: evict the oldest segment and increment media_sequence
-      # This signals to clients that they should not request the evicted segment
+      # Evict the oldest segment by dropping the head of the list.
+      # Incrementing media_sequence signals to clients that the evicted
+      # segment is no longer available, preventing them from requesting it.
       %{playlist | segments: tl(new_segments), media_sequence: playlist.media_sequence + 1}
     else
       %{playlist | segments: new_segments}
@@ -266,6 +288,15 @@ end
 
 ### Step 5: `lib/hls_server/range_handler.ex`
 
+The range handler implements RFC 7233 (HTTP Range Requests) for video segments. It parses the `Range` header, validates the requested byte range against the content length, and returns either the full content (200) or a partial content slice (206).
+
+Three range formats are supported:
+- `bytes=N-M` : specific byte range [N, M] inclusive
+- `bytes=N-` : from offset N to end of file
+- `bytes=-N` : last N bytes of file
+
+Out-of-range requests return 416 (Range Not Satisfiable). The `Content-Range` header in the 206 response tells the client exactly which bytes it received and the total content length, enabling the client to request subsequent ranges for resumable downloads.
+
 ```elixir
 defmodule HLSServer.RangeHandler do
   @moduledoc """
@@ -278,12 +309,6 @@ defmodule HLSServer.RangeHandler do
   1. Seeking: a player can jump to position X without downloading from the start.
   2. Resumable downloads: interrupted transfers can resume from the last byte.
   3. Parallel chunk downloads: multiple range requests for different parts.
-
-  Your implementation must handle:
-  - bytes=N-M: specific byte range [N, M] inclusive
-  - bytes=N-: from N to end of file
-  - bytes=-N: last N bytes of file
-  - Invalid ranges: return 416 Range Not Satisfiable
   """
 
   @doc """
@@ -487,7 +512,7 @@ mix test test/hls_server/ --trace
 
 | Aspect | HLS (your impl) | MPEG-DASH | WebRTC |
 |--------|----------------|-----------|--------|
-| Latency | 15–30s (segment duration) | 4–12s | < 500ms |
+| Latency | 15-30s (segment duration) | 4-12s | < 500ms |
 | CDN compatibility | excellent (plain HTTP) | excellent | limited |
 | Adaptive bitrate | yes (variant playlists) | yes | yes |
 | Seeking support | segment granularity | byte-range | N/A |

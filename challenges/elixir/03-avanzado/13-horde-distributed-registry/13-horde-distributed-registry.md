@@ -147,6 +147,10 @@ end
 
 ### Step 2: `lib/api_gateway/cluster/horde_membership.ex`
 
+The HordeMembership GenServer listens for node up/down events and synchronizes
+Horde's member list. Without this, Horde would not know about new nodes joining
+the cluster and processes would not be distributed to them.
+
 ```elixir
 defmodule ApiGateway.Cluster.HordeMembership do
   use GenServer
@@ -154,7 +158,7 @@ defmodule ApiGateway.Cluster.HordeMembership do
 
   @horde_members [
     ApiGateway.CircuitBreaker.Registry,
-    ApiGateway.CircuitBreaker.Supervisor,
+    ApiGateway.CircuitBreaker.HordeSupervisor
   ]
 
   def start_link(opts) do
@@ -163,11 +167,11 @@ defmodule ApiGateway.Cluster.HordeMembership do
 
   @impl true
   def init(_opts) do
-    # TODO: subscribe to node events so cluster topology changes trigger membership sync
-    # HINT: :net_kernel.monitor_nodes(true)
+    # Subscribe to node events so cluster topology changes trigger membership sync
+    :net_kernel.monitor_nodes(true)
 
-    # TODO: sync membership immediately on startup
-    # HINT: send(self(), :sync_members)
+    # Sync membership immediately on startup
+    send(self(), :sync_members)
 
     {:ok, []}
   end
@@ -175,14 +179,14 @@ defmodule ApiGateway.Cluster.HordeMembership do
   @impl true
   def handle_info({:nodeup, node}, state) do
     Logger.info("HordeMembership: node joined #{node}, syncing Horde members")
-    # TODO: call sync_members() and {:noreply, state}
+    sync_members()
     {:noreply, state}
   end
 
   @impl true
   def handle_info({:nodedown, node}, state) do
     Logger.warning("HordeMembership: node left #{node}, syncing Horde members")
-    # TODO: call sync_members() and {:noreply, state}
+    sync_members()
     {:noreply, state}
   end
 
@@ -196,25 +200,33 @@ defmodule ApiGateway.Cluster.HordeMembership do
   # Private
   # ---------------------------------------------------------------------------
 
+  # Collect all nodes (self + connected) and update Horde's member lists.
+  # Each Horde component (Registry, DynamicSupervisor) needs to know about
+  # all instances of itself across the cluster.
   defp sync_members do
-    # TODO:
-    # 1. Collect all nodes: [node() | Node.list()]
-    # 2. For each horde component in @horde_members, build the member list:
-    #    [{ComponentModule, node} for node in all_nodes]
-    # 3. Call Horde.Cluster.set_members/2 for each component
-    #
-    # HINT:
-    #   all_nodes = [node() | Node.list()]
-    #   Enum.each(@horde_members, fn component ->
-    #     members = Enum.map(all_nodes, &{component, &1})
-    #     Horde.Cluster.set_members(component, members)
-    #   end)
-    :ok
+    all_nodes = [node() | Node.list()]
+
+    Enum.each(@horde_members, fn component ->
+      members = Enum.map(all_nodes, &{component, &1})
+
+      case Horde.Cluster.set_members(component, members) do
+        :ok ->
+          Logger.debug("HordeMembership: synced #{inspect(component)} with #{length(members)} members")
+
+        {:error, reason} ->
+          Logger.error("HordeMembership: failed to sync #{inspect(component)}: #{inspect(reason)}")
+      end
+    end)
   end
 end
 ```
 
 ### Step 3: Extend `lib/api_gateway/circuit_breaker/worker.ex`
+
+The worker uses a `via` tuple to register with `Horde.Registry` instead of the
+local `Registry`. This makes the worker discoverable from any node in the cluster.
+The `child_spec` uses `restart: :transient` so that workers removed intentionally
+(clean exit) are not restarted by Horde, while crashed workers are.
 
 ```elixir
 defmodule ApiGateway.CircuitBreaker.Worker do
@@ -232,22 +244,27 @@ defmodule ApiGateway.CircuitBreaker.Worker do
     %{
       id:      {__MODULE__, service_name},
       start:   {__MODULE__, :start_link, [service_name]},
-      # TODO: restart: :transient — if the worker exits cleanly (e.g., service removed),
-      # Horde should not restart it.
+      # :transient means: if the worker exits cleanly (e.g., service removed),
+      # Horde does not restart it. Crashes (abnormal exits) are restarted.
       restart: :transient
     }
   end
 
-  # Via tuple for Horde.Registry lookup — replaces the old Process.register/2
+  # Via tuple for Horde.Registry lookup — makes this process discoverable
+  # from any node in the cluster. The registry key is the service name.
   defp via(service_name) do
-    # TODO: return {:via, Horde.Registry, {ApiGateway.CircuitBreaker.Registry, service_name}}
+    {:via, Horde.Registry, {ApiGateway.CircuitBreaker.Registry, service_name}}
   end
 
-  # ... existing GenServer callbacks ...
+  # ... existing GenServer callbacks (init, handle_call, handle_cast, etc.) ...
 end
 ```
 
 ### Step 4: Replace `lib/api_gateway/circuit_breaker/supervisor.ex`
+
+The Supervisor module becomes a facade that wraps `Horde.DynamicSupervisor` and
+`Horde.Registry` operations. The actual process supervision is done by the Horde
+components started in `application.ex`.
 
 ```elixir
 defmodule ApiGateway.CircuitBreaker.Supervisor do
@@ -258,44 +275,45 @@ defmodule ApiGateway.CircuitBreaker.Supervisor do
   """
 
   @doc "Start a circuit breaker worker for a service. Idempotent — safe to call if already started."
+  @spec start_worker(String.t()) :: {:ok, pid()} | {:error, term()}
   def start_worker(service_name) do
-    # TODO: use Horde.DynamicSupervisor.start_child/2 with the Worker child spec
-    # Return {:ok, pid} or {:error, {:already_started, pid}} — both are acceptable
-    # HINT:
-    #   Horde.DynamicSupervisor.start_child(
-    #     ApiGateway.CircuitBreaker.HordeSupervisor,
-    #     ApiGateway.CircuitBreaker.Worker.child_spec(service_name)
-    #   )
+    child_spec = ApiGateway.CircuitBreaker.Worker.child_spec(service_name)
+
+    case Horde.DynamicSupervisor.start_child(ApiGateway.CircuitBreaker.HordeSupervisor, child_spec) do
+      {:ok, pid} -> {:ok, pid}
+      {:error, {:already_started, pid}} -> {:ok, pid}
+      {:error, reason} -> {:error, reason}
+    end
   end
 
   @doc "Look up the PID of a running circuit breaker worker."
+  @spec find_worker(String.t()) :: {:ok, pid()} | {:error, :not_found}
   def find_worker(service_name) do
-    # TODO: use Horde.Registry.lookup/2
-    # Return {:ok, pid} or {:error, :not_found}
-    # HINT:
-    #   case Horde.Registry.lookup(ApiGateway.CircuitBreaker.Registry, service_name) do
-    #     [{pid, _meta}] -> {:ok, pid}
-    #     []             -> {:error, :not_found}
-    #   end
+    case Horde.Registry.lookup(ApiGateway.CircuitBreaker.Registry, service_name) do
+      [{pid, _meta}] -> {:ok, pid}
+      [] -> {:error, :not_found}
+    end
   end
 
   @doc "List PIDs of all running circuit breaker workers across the cluster."
+  @spec list_workers() :: [pid()]
   def list_workers do
-    # TODO: use Horde.Registry.select/2 to enumerate all registered workers
-    # HINT:
-    #   Horde.Registry.select(ApiGateway.CircuitBreaker.Registry,
-    #     [{{:"$1", :"$2", :"$3"}, [], [:"$2"]}]
-    #   )
-    []
+    Horde.Registry.select(ApiGateway.CircuitBreaker.Registry,
+      [{{:"$1", :"$2", :"$3"}, [], [:"$2"]}]
+    )
   end
 end
 ```
 
 ### Step 5: Update `application.ex`
 
+Replace the old `CircuitBreaker.Supervisor` child spec with Horde components. The
+Registry and DynamicSupervisor start with empty member lists — the `HordeMembership`
+GenServer will populate them immediately after startup.
+
 ```elixir
 # In lib/api_gateway/application.ex, replace the old CircuitBreaker.Supervisor
-# child spec with Horde components. Add BEFORE CoreSupervisor:
+# child spec with Horde components:
 
 {Horde.Registry,
   name:    ApiGateway.CircuitBreaker.Registry,
@@ -307,7 +325,7 @@ end
   strategy: :one_for_one,
   members:  []},
 
-ApiGateway.Cluster.HordeMembership,
+ApiGateway.Cluster.HordeMembership
 ```
 
 ### Step 6: Given tests — must pass without modification
