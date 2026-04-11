@@ -47,6 +47,19 @@ Build a file system tree walker that:
 
 ---
 
+## Project structure
+
+```
+tree/
+├── lib/
+│   └── tree.ex
+├── test/
+│   └── tree_test.exs
+└── mix.exs
+```
+
+---
+
 ## Implementation
 
 ### `lib/tree.ex`

@@ -49,6 +49,19 @@ Build a `Money` module that:
 
 ---
 
+## Project structure
+
+```
+money/
+├── lib/
+│   └── money.ex
+├── test/
+│   └── money_test.exs
+└── mix.exs
+```
+
+---
+
 ## Implementation
 
 ### `lib/money.ex`

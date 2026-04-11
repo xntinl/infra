@@ -35,6 +35,23 @@ cancel a delivered order. The state machine must:
 
 ---
 
+## Project structure
+
+```
+order_fsm/
+├── lib/
+│   └── order_fsm/
+│       ├── order.ex
+│       └── state.ex
+├── test/
+│   └── order_fsm/
+│       ├── order_test.exs
+│       └── state_test.exs
+└── mix.exs
+```
+
+---
+
 ## Implementation
 
 ### `lib/order_fsm/state.ex`

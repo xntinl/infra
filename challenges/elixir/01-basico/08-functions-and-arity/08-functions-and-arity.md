@@ -44,6 +44,21 @@ Build a middleware pipeline system where:
 
 ---
 
+## Project structure
+
+```
+pipeline/
+├── lib/
+│   ├── pipeline.ex
+│   └── pipeline/
+│       └── middlewares.ex
+├── test/
+│   └── pipeline_test.exs
+└── mix.exs
+```
+
+---
+
 ## Implementation
 
 ### `lib/pipeline.ex`

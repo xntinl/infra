@@ -35,6 +35,30 @@ them, you need a CLI tool that:
 
 ---
 
+## Project structure
+
+```
+json_validator/
+├── lib/
+│   └── json_validator/
+│       ├── cli.ex
+│       └── core.ex
+├── test/
+│   └── json_validator/
+│       ├── cli_test.exs
+│       └── core_test.exs
+├── config/
+│   ├── config.exs
+│   ├── dev.exs
+│   ├── test.exs
+│   ├── prod.exs
+│   └── runtime.exs
+├── .formatter.exs
+└── mix.exs
+```
+
+---
+
 ## Implementation
 
 ### Step 1: Create the project

@@ -51,6 +51,19 @@ Build a parser that:
 
 ---
 
+## Project structure
+
+```
+log_parser/
+├── lib/
+│   └── log_parser.ex
+├── test/
+│   └── log_parser_test.exs
+└── mix.exs
+```
+
+---
+
 ## Implementation
 
 ### `lib/log_parser.ex`

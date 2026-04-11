@@ -13,12 +13,12 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "challenges/elixir/01-basico/01-setup-and-mix/01-setup-and-mix.md",
+                "file": "ClaudeCode/Features/Engram.md",
                 "mode": "source",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "01-setup-and-mix"
+              "title": "Engram"
             }
           }
         ]
@@ -210,6 +210,8 @@
   },
   "active": "e170d91267f0c529",
   "lastOpenFiles": [
+    "challenges/elixir/01-basico/01-setup-and-mix/01-setup-and-mix.md",
+    "challenges/elixir/01-basico/02-atoms-and-symbols/02-atoms-and-symbols.md",
     "challenges/elixir/01-basico/01-setup-and-mix/json_validator/_build/dev/lib/json_validator/ebin/json_validator.app",
     "challenges/elixir/01-basico/01-setup-and-mix/json_validator/_build/dev/lib/json_validator/consolidated/Elixir.Inspect.beam",
     "challenges/elixir/01-basico/01-setup-and-mix/json_validator/_build/dev/lib/json_validator/consolidated/Elixir.JSON.Encoder.beam",
@@ -220,7 +222,6 @@
     "challenges/elixir/01-basico/01-setup-and-mix/json_validator/_build/dev/lib/json_validator/consolidated/Elixir.Collectable.beam",
     "challenges/elixir/01-basico/01-setup-and-mix/json_validator/_build/dev/lib/json_validator/consolidated/Elixir.JSON.Decoder.beam",
     "challenges/elixir/01-basico/01-setup-and-mix/json_validator/_build/dev/lib/json_validator/consolidated",
-    "challenges/elixir/01-basico/01-setup-and-mix/json_validator/_build/dev/lib/json_validator/ebin/Elixir.JsonValidator.beam",
     "challenges/elixir/01-basico/01-setup-and-mix/json_validator/deps/json/README.md",
     "challenges/elixir/01-basico/01-setup-and-mix/json_validator/deps/jason/README.md",
     "challenges/elixir/01-basico/01-setup-and-mix/json_validator/deps/jason/CHANGELOG.md",
@@ -228,8 +229,6 @@
     "challenges/elixir/01-basico/01-setup-and-mix/json_validator/deps/excoveralls/CHANGELOG.md",
     "challenges/elixir/01-basico/01-setup-and-mix/json_validator/README.md",
     "challenges/elixir/01-basico/03-numbers-and-arithmetic/03-numbers-and-arithmetic.md",
-    "challenges/elixir/01-basico/01-setup-and-mix/01-setup-and-mix.md",
-    "challenges/elixir/01-basico/02-atoms-and-symbols/02-atoms-and-symbols.md",
     "challenges/elixir/01-basico/01-setup-and-mix/payments_cli/README.md",
     "challenges/elixir/01-basico/06-lists-and-head-tail-pattern/06-lists-and-head-tail-pattern.md",
     "challenges/elixir/01-basico/07-maps-and-keyword-lists/07-maps-and-keyword-lists.md",

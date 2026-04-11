@@ -37,6 +37,23 @@ Your service calls multiple external APIs. Each response comes as a tuple
 
 ---
 
+## Project structure
+
+```
+http_client/
+├── lib/
+│   └── http_client/
+│       ├── api.ex
+│       └── response.ex
+├── test/
+│   └── http_client/
+│       ├── api_test.exs
+│       └── response_test.exs
+└── mix.exs
+```
+
+---
+
 ## Implementation
 
 ### `lib/http_client/response.ex`

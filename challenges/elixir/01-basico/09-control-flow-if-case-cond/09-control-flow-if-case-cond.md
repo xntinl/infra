@@ -36,6 +36,19 @@ Build a validation library for user registration that:
 
 ---
 
+## Project structure
+
+```
+validator/
+├── lib/
+│   └── validator.ex
+├── test/
+│   └── validator_test.exs
+└── mix.exs
+```
+
+---
+
 ## Implementation
 
 ### `lib/validator.ex`

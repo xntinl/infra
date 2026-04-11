@@ -53,6 +53,19 @@ Build a rules engine for an insurance quoting system that:
 
 ---
 
+## Project structure
+
+```
+rules_engine/
+├── lib/
+│   └── rules_engine.ex
+├── test/
+│   └── rules_engine_test.exs
+└── mix.exs
+```
+
+---
+
 ## Implementation
 
 ### `lib/rules_engine.ex`

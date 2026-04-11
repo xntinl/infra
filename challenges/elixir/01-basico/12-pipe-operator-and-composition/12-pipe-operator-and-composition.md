@@ -45,6 +45,19 @@ The entire flow should be a single pipe chain from input to output.
 
 ---
 
+## Project structure
+
+```
+etl/
+├── lib/
+│   └── etl.ex
+├── test/
+│   └── etl_test.exs
+└── mix.exs
+```
+
+---
+
 ## Implementation
 
 ### `lib/etl.ex`

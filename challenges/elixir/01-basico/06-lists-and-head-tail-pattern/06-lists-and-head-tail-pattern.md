@@ -51,6 +51,19 @@ multi-line constructs (like code blocks) that require state across lines.
 
 ---
 
+## Project structure
+
+```
+md_lite/
+├── lib/
+│   └── md_lite.ex
+├── test/
+│   └── md_lite_test.exs
+└── mix.exs
+```
+
+---
+
 ## Implementation
 
 ### `lib/md_lite.ex`

@@ -35,6 +35,19 @@ Your analytics system receives event logs as lists of maps. You need to:
 
 ---
 
+## Project structure
+
+```
+analytics/
+├── lib/
+│   └── analytics.ex
+├── test/
+│   └── analytics_test.exs
+└── mix.exs
+```
+
+---
+
 ## Implementation
 
 ### `lib/analytics.ex`

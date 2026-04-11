@@ -38,6 +38,19 @@ Build a user domain model that:
 
 ---
 
+## Project structure
+
+```
+user_schema/
+├── lib/
+│   └── user_schema.ex
+├── test/
+│   └── user_schema_test.exs
+└── mix.exs
+```
+
+---
+
 ## Implementation
 
 ### `lib/user_schema.ex`

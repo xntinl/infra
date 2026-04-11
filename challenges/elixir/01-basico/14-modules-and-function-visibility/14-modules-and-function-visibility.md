@@ -40,6 +40,21 @@ Build a payment gateway adapter that:
 
 ---
 
+## Project structure
+
+```
+pay_adapter/
+├── lib/
+│   ├── pay_adapter.ex
+│   └── pay_adapter/
+│       └── receipt.ex
+├── test/
+│   └── pay_adapter_test.exs
+└── mix.exs
+```
+
+---
+
 ## Implementation
 
 ### `lib/pay_adapter.ex`

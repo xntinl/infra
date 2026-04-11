@@ -43,6 +43,19 @@ Build a configuration system that:
 
 ---
 
+## Project structure
+
+```
+app_config/
+├── lib/
+│   └── app_config.ex
+├── test/
+│   └── app_config_test.exs
+└── mix.exs
+```
+
+---
+
 ## Implementation
 
 ### `lib/app_config.ex`
