@@ -312,3 +312,19 @@ Elixir añade sobre Erlang una sintaxis moderna y expresiva, metaprogramación p
 4. **Lee los errores completos**. El compilador y runtime de Elixir tienen mensajes de error excepcionalmente claros. Léelos antes de buscar ayuda.
 
 5. **Para los ejercicios Insane**: no hay solución de referencia. Investiga, diseña, itera. La especificación es el contrato; la implementación es tu decisión.
+
+
+
+
+```
+1. Proyecto independiente por ejercicio con explicación corta de qué trata
+  2. Estructura de proyecto al inicio (árbol de directorios completo)
+  3. Código 100% resuelto, sin TODO, sin HINT
+  4. Tests completos — solo los más necesarios
+  5. Inglés en todo (variables, docs, prosa)
+  6. Sin metadata (sin estrellas, sin tiempo estimado)
+  7. Sin REPL standalone — todo dentro de proyecto Mix
+  8. Trade-offs y errores comunes de producción
+  9. Autocontenido — sin referencias a otros ejercicios
+  10. Buenas prácticas con ejemplos reales enfocados en senior
+```

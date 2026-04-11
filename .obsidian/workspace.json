@@ -4,21 +4,17 @@
     "type": "split",
     "children": [
       {
-        "id": "2e0fed1acaf13222",
+        "id": "77c64444211c643f",
         "type": "tabs",
         "children": [
           {
-            "id": "e170d91267f0c529",
+            "id": "76d7be64c31371ce",
             "type": "leaf",
             "state": {
-              "type": "markdown",
-              "state": {
-                "file": "ClaudeCode/Features/Engram.md",
-                "mode": "source",
-                "source": false
-              },
+              "type": "empty",
+              "state": {},
               "icon": "lucide-file",
-              "title": "Engram"
+              "title": "New tab"
             }
           }
         ]
@@ -208,8 +204,10 @@
       "open-vscode:VS Code": false
     }
   },
-  "active": "e170d91267f0c529",
+  "active": "76d7be64c31371ce",
   "lastOpenFiles": [
+    "challenges/elixir/elixir.md",
+    "ClaudeCode/Features/Engram.md",
     "challenges/elixir/01-basico/01-setup-and-mix/01-setup-and-mix.md",
     "challenges/elixir/01-basico/02-atoms-and-symbols/02-atoms-and-symbols.md",
     "challenges/elixir/01-basico/01-setup-and-mix/json_validator/_build/dev/lib/json_validator/ebin/json_validator.app",
@@ -244,7 +242,6 @@
     "challenges/elixir/01-basico/15-structs-and-basic-validation/15-structs-and-basic-validation.md",
     "challenges/elixir/01-basico/04-strings-and-binaries-basics/04-strings-and-binaries-basics.md",
     "challenges/elixir/04-insane/01-build-distributed-raft-consensus/01-build-distributed-raft-consensus.md",
-    "challenges/elixir/es/01-basico/15-structs-and-basic-validation/15-structs-and-basic-validation.md",
     "Presentacion/poc-just/web/node_modules/ordered-binary/assets/powers-dre.png",
     "Presentacion/poc-just/web/node_modules/retry/equation.gif",
     "Untitled.canvas"
