@@ -1,6 +1,8 @@
-# 52. Build a Multi-tenant SaaS Framework
+# Multi-tenant SaaS Framework
 
-## Context
+**Project**: `tenant_framework` — Multi-tenancy via Postgres Row-Level Security with ETS-backed rate limiting and feature flags
+
+## Project context
 
 Your team is building a B2B SaaS product: a project management tool sold to companies. Each company (tenant) has its own users, projects, and data. The first version used a single `tenant_id` column on every table. It worked, but a bug in one query caused tenant A's data to appear in tenant B's response. The data leak cost two enterprise contracts.
 
@@ -63,7 +65,7 @@ tenant_framework/
     └── resolution_overhead.exs
 ```
 
-## Step 1 — Custom Ecto.Repo with tenant scoping
+### Step 1: Custom Ecto.Repo with tenant scoping
 
 ```elixir
 defmodule TenantFramework.Repo do
@@ -91,7 +93,7 @@ defmodule TenantFramework.Repo do
 end
 ```
 
-## Step 2 — Tenant resolution plug
+### Step 2: Tenant resolution plug
 
 ```elixir
 defmodule TenantFramework.Plug.TenantResolver do
@@ -168,7 +170,7 @@ defmodule TenantFramework.Plug.TenantResolver do
 end
 ```
 
-## Step 3 — Tenant provisioning
+### Step 3: Tenant provisioning
 
 ```elixir
 defmodule TenantFramework.Provisioning do
@@ -237,7 +239,7 @@ defmodule TenantFramework.Provisioning do
 end
 ```
 
-## Step 4 — Rate limiter
+### Step 4: Rate limiter
 
 ```elixir
 defmodule TenantFramework.Plug.RateLimiter do
@@ -277,7 +279,7 @@ defmodule TenantFramework.Plug.RateLimiter do
 end
 ```
 
-## Step 5 — Feature flags
+### Step 5: Feature flags
 
 ```elixir
 defmodule TenantFramework.Flags.Cache do
@@ -329,7 +331,7 @@ defmodule TenantFramework.Flags.Evaluator do
 end
 ```
 
-## Step 6 — Billing webhook handler
+### Step 6: Billing webhook handler
 
 ```elixir
 defmodule TenantFramework.Billing.WebhookHandler do
@@ -536,7 +538,7 @@ defmodule TenantFramework.BillingTest do
 end
 ```
 
-## Trade-offs
+## Trade-off analysis
 
 | Isolation strategy | Schema-per-tenant | RLS (row-level security) | Trade-off |
 |---|---|---|---|
@@ -551,7 +553,7 @@ end
 | Failure mode | ETS owned by supervisor; survives process crashes | If GenServer crashes, state lost | Redis down = no rate limiting |
 | Cluster-wide accuracy | Node-local only | Node-local only | Accurate across cluster |
 
-## Production mistakes
+## Common production mistakes
 
 **Forgetting to SET LOCAL in checkout_with_tenant.** `SET app.current_tenant = X` sets the session variable globally for the connection. If that connection is returned to the pool without resetting it, the next request using that connection sees the wrong tenant. Use `SET LOCAL` (transaction-scoped) or always reset after use. With `Ecto.Repo.checkout/1`, the transaction boundary ensures `SET LOCAL` is automatically reset on `COMMIT` or `ROLLBACK`.
 

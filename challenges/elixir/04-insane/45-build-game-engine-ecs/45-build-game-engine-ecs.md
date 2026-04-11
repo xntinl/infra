@@ -1,6 +1,8 @@
-# 45. Build a Game Engine with ECS Architecture
+# Game Engine with ECS Architecture
 
-## Context
+**Project**: `game_engine` — Entity-Component-System game engine with ETS world state and ANSI terminal renderer
+
+## Project context
 
 Your team is prototyping a game for an internal hackathon. The game runs in a terminal — no browser, no GUI library. The first attempt used a simple loop with a big map of game state, and adding a second moving enemy required forking the entire update logic. Adding a power-up broke the renderer. The code became an inheritance tree six levels deep.
 
@@ -57,7 +59,7 @@ game_engine/
     └── game.ex                # mix game.snake
 ```
 
-## Step 1 — Components
+### Step 1: Components
 
 ```elixir
 defmodule GameEngine.Components.Position do
@@ -91,7 +93,7 @@ defmodule GameEngine.Components.InputListener do
 end
 ```
 
-## Step 2 — World
+### Step 2: World
 
 ```elixir
 defmodule GameEngine.World do
@@ -150,7 +152,7 @@ defmodule GameEngine.World do
 end
 ```
 
-## Step 3 — Query
+### Step 3: Query
 
 ```elixir
 defmodule GameEngine.Query do
@@ -180,7 +182,7 @@ defmodule GameEngine.Query do
 end
 ```
 
-## Step 4 — Physics system
+### Step 4: Physics system
 
 ```elixir
 defmodule GameEngine.Systems.Physics do
@@ -221,7 +223,7 @@ defmodule GameEngine.Systems.Physics do
 end
 ```
 
-## Step 5 — Render system
+### Step 5: Render system
 
 ```elixir
 defmodule GameEngine.Systems.Render do
@@ -269,7 +271,7 @@ defmodule GameEngine.Systems.Render do
 end
 ```
 
-## Step 6 — Input system
+### Step 6: Input system
 
 ```elixir
 defmodule GameEngine.Systems.Input do
@@ -314,7 +316,7 @@ defmodule GameEngine.Systems.Input do
 end
 ```
 
-## Step 7 — Engine loop
+### Step 7: Engine loop
 
 ```elixir
 defmodule GameEngine.Engine do
@@ -359,7 +361,7 @@ defmodule GameEngine.Engine do
 end
 ```
 
-## Step 8 — Snake game
+### Step 8: Snake game
 
 ```elixir
 defmodule Games.Snake do
@@ -542,7 +544,7 @@ defmodule GameEngine.EngineTest do
 end
 ```
 
-## Trade-offs
+## Trade-off analysis
 
 | Design | Selected | Alternative | Trade-off |
 |---|---|---|---|
@@ -553,7 +555,7 @@ end
 | Fixed timestep | Fiedler accumulator | Variable delta | Variable delta: different hardware → different physics; fixed: deterministic |
 | ANSI output | Single `IO.write` per frame | One write per cell | Batching reduces syscalls from N_changed to 1 per frame |
 
-## Production mistakes
+## Common production mistakes
 
 **Forgetting to restore terminal on crash.** If the game crashes with the terminal in raw mode, the user's shell becomes unusable (no echo, no line buffering). Always use `Process.flag(:trap_exit, true)` and restore in `terminate/2`. Also catch `System.stop/1` signals.
 

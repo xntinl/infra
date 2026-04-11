@@ -1,6 +1,8 @@
-# 46. Build a LiveView Clone
+# LiveView Clone
 
-## Context
+**Project**: `vivo` — Server-driven UI framework with GenServer per connection and compile-time template DSL
+
+## Project context
 
 Your team is building a dashboard that shows live telemetry from a fleet of IoT sensors — thousands of readings per second. The first iteration used a React SPA polling an API every second. The result: 10,000 concurrent browser clients × 1 API call/second = 10k HTTP requests/second sustained, each requiring auth, serialization, and full state transfer.
 
@@ -56,7 +58,7 @@ vivo/
     └── connections.exs        # 10k concurrent connection benchmark
 ```
 
-## Step 1 — WebSocket channel protocol
+### Step 1: WebSocket channel protocol
 
 ```elixir
 defmodule Vivo.Socket do
@@ -109,7 +111,7 @@ defmodule Vivo.Channel do
 end
 ```
 
-## Step 2 — LiveView behaviour and process
+### Step 2: LiveView behaviour and process
 
 ```elixir
 defmodule Vivo.LiveView do
@@ -194,7 +196,7 @@ defmodule Vivo.Process do
 end
 ```
 
-## Step 3 — Compile-time template DSL
+### Step 3: Compile-time template DSL
 
 ```elixir
 defmodule Vivo.Template.Engine do
@@ -235,7 +237,7 @@ defmodule Vivo.Template.Rendered do
 end
 ```
 
-## Step 4 — Structural DOM diff
+### Step 4: Structural DOM diff
 
 ```elixir
 defmodule Vivo.Diff.Tree do
@@ -290,7 +292,7 @@ defmodule Vivo.Diff.Diff do
 end
 ```
 
-## Step 5 — Client runtime (vivo.js)
+### Step 5: Client runtime (vivo.js)
 
 ```javascript
 // lib/vivo_web/static/vivo.js
@@ -533,7 +535,7 @@ end
 Vivo.Bench.Connections.run()
 ```
 
-## Trade-offs
+## Trade-off analysis
 
 | Design choice | Selected | Alternative | Trade-off |
 |---|---|---|---|
@@ -543,7 +545,7 @@ Vivo.Bench.Connections.run()
 | Client protocol | JSON arrays `[join_ref, msg_ref, topic, event, payload]` | Binary protocol | Binary: smaller frames; JSON: debuggable, no decoder needed, ~100 bytes overhead negligible |
 | Keyed list diff | Myers algorithm on key sequence | Index-based zip | Index-based: wrong for reordering (treats move as delete+insert); keyed: O(N) extra memory, correct semantics |
 
-## Production mistakes
+## Common production mistakes
 
 **Sending full rendered HTML after every event.** The whole point of this architecture is to send only diffs. If `handle_event` returns assigns that produce a new render, always compute the diff first and send nothing if the rendered output is identical. An early implementation may send full re-renders "to be safe," destroying the bandwidth advantage.
 

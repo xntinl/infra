@@ -1,6 +1,8 @@
-# 48. Build a Compile-time Type System for Elixir Macros
+# Compile-time Type System for Elixir Macros
 
-## Context
+**Project**: `type_check` — Compile-time type annotation macro that raises CompileError on type mismatches
+
+## Project context
 
 Your team maintains a large Elixir codebase. Dialyzer catches some type bugs but runs after compilation in a separate pass. When a developer passes a string to a function expecting an integer, the error appears at runtime in production, not at compile time in the editor. The team wants a lightweight annotation system that catches obvious type mismatches during `mix compile`.
 
@@ -43,7 +45,7 @@ type_check/
     └── compile_overhead.exs   # Measures compile time with/without TypeCheck
 ```
 
-## Step 1 — Type algebra
+### Step 1: Type algebra
 
 ```elixir
 defmodule TypeCheck.Types do
@@ -104,7 +106,7 @@ defmodule TypeCheck.Types do
 end
 ```
 
-## Step 2 — Type inference
+### Step 2: Type inference
 
 ```elixir
 defmodule TypeCheck.Infer do
@@ -176,7 +178,7 @@ defmodule TypeCheck.Infer do
 end
 ```
 
-## Step 3 — Type compatibility
+### Step 3: Type compatibility
 
 ```elixir
 defmodule TypeCheck.Check do
@@ -230,7 +232,7 @@ defmodule TypeCheck.Check do
 end
 ```
 
-## Step 4 — Annotation parsing
+### Step 4: Annotation parsing
 
 ```elixir
 defmodule TypeCheck.Annotation do
@@ -264,7 +266,7 @@ defmodule TypeCheck.Annotation do
 end
 ```
 
-## Step 5 — Main macro
+### Step 5: Main macro
 
 ```elixir
 defmodule TypeCheck do
@@ -562,7 +564,7 @@ end
 TypeCheck.Bench.CompileOverhead.run()
 ```
 
-## Trade-offs
+## Trade-off analysis
 
 | Design decision | Selected approach | Alternative | Trade-off |
 |---|---|---|---|
@@ -573,7 +575,7 @@ TypeCheck.Bench.CompileOverhead.run()
 | Dialyzer integration | Generate `@spec` from annotations | Separate `@spec` required | Generated: no duplication; separate: user can express types TypeCheck cannot |
 | Error verbosity | Full file/line/expr/expected/got | Short message | Full: slower string building; essential for developer productivity |
 
-## Production mistakes
+## Common production mistakes
 
 **Stripping AST metadata before type inference.** `quote/2` preserves line numbers in the `:meta` field of each AST node. `Macro.escape/1` and some macro operations strip this metadata. If you strip metadata before running type inference, every `CompileError` reports line 0. Always pass the original, unmodified AST to the type checker.
 

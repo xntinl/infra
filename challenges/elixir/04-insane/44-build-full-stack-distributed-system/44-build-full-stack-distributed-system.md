@@ -1,6 +1,8 @@
-# 44. Build a Full-Stack Distributed System
+# Full-Stack Distributed System
 
-## Context
+**Project**: `platform` — Capstone: integrating all prior components into a cohesive production system
+
+## Project context
 
 This is the capstone exercise. You have built every component in isolation across exercises 29–43: a metrics collector, a profiler, a test framework, a web framework, an API gateway, a load balancer, a streaming server, a blockchain, a P2P file sharer, a service mesh, a WebAssembly interpreter, an event sourcing framework, a macro DSL system, and an inference engine.
 
@@ -88,7 +90,7 @@ The simplified Raft you implement here does not need log replication — only le
 
 Storing every latency observation in memory is O(n) space per metric per window. At 50k RPS over a 1-minute window, that is 3 million samples. Reservoir sampling (Vitter's Algorithm R) maintains a fixed-size sample (1000 observations) with each incoming observation having equal probability of being included. The P99 estimate from 1000 samples has a confidence interval of ±1% at 95% confidence. This is accurate enough for alerting.
 
-## Step 1 — Gateway
+### Step 1: Gateway
 
 ```elixir
 defmodule Platform.Gateway.RateLimiter do
@@ -139,7 +141,7 @@ defmodule Platform.Gateway.CircuitBreaker do
 end
 ```
 
-## Step 2 — Coordinator (simplified Raft)
+### Step 2: Coordinator (simplified Raft)
 
 ```elixir
 defmodule Platform.Coordinator.Raft do
@@ -186,7 +188,7 @@ defmodule Platform.Coordinator.Raft do
 end
 ```
 
-## Step 3 — Storage
+### Step 3: Storage
 
 ```elixir
 defmodule Platform.Storage.Store do
@@ -215,7 +217,7 @@ defmodule Platform.Storage.Store do
 end
 ```
 
-## Step 4 — Queue
+### Step 4: Queue
 
 ```elixir
 defmodule Platform.Queue.Scheduler do
@@ -259,7 +261,7 @@ defmodule Platform.Queue.Scheduler do
 end
 ```
 
-## Step 5 — Stream processor
+### Step 5: Stream processor
 
 ```elixir
 defmodule Platform.Stream.Window do
@@ -291,7 +293,7 @@ defmodule Platform.Stream.Operators do
 end
 ```
 
-## Step 6 — Telemetry and tracing
+### Step 6: Telemetry and tracing
 
 ```elixir
 defmodule Platform.Telemetry.Collector do
@@ -353,7 +355,7 @@ defmodule Platform.Tracing.Context do
 end
 ```
 
-## Step 7 — Region transport
+### Step 7: Region transport
 
 ```elixir
 defmodule Platform.Region.Transport do
@@ -647,7 +649,7 @@ end
 Platform.Bench.LoadTest.run()
 ```
 
-## Trade-offs
+## Trade-off analysis
 
 | Design choice | Selected approach | Alternative | Why not the alternative |
 |---|---|---|---|
@@ -658,7 +660,7 @@ Platform.Bench.LoadTest.run()
 | Queue visibility timeout | Periodic reaper process | Per-job timer | One timer per job at 50k RPS creates 50k active timers; reaper batches the check |
 | Inter-region communication | Simulated `Process.sleep` | Real Erlang distribution | Keeps the exercise local; real distribution requires cluster setup |
 
-## Production mistakes
+## Common production mistakes
 
 **Coordinated omission in your benchmark.** If you measure latency only from when you actually send the request, you miss the queue-waiting time. The correct approach is to schedule requests at fixed intervals (`t0 + i * interval`) and measure from the scheduled time, not the actual send time. Gil Tene's "How NOT to Measure Latency" talks documents this in detail.
 

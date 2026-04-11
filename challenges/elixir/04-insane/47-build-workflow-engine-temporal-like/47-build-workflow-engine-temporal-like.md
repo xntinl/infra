@@ -1,6 +1,8 @@
-# 47. Build a Distributed Workflow Engine (Temporal-like)
+# Distributed Workflow Engine (Temporal-like)
 
-## Context
+**Project**: `workflow_engine` — Durable workflow orchestrator with replay-safe execution and persistent event history
+
+## Project context
 
 Your team runs a payment processing pipeline: charge card → reserve inventory → send confirmation email → update analytics. Each step is a network call to a third-party service. Any step can fail or time out. If the charge succeeds but the inventory reservation crashes, you need to refund the charge. If the confirmation email service is down, you need to retry for up to 24 hours without holding a process open.
 
@@ -52,7 +54,7 @@ workflow_engine/
     └── concurrent_workflows.exs
 ```
 
-## Step 1 — Events
+### Step 1: Events
 
 ```elixir
 defmodule WorkflowEngine.Event do
@@ -80,7 +82,7 @@ defmodule WorkflowEngine.Event do
 end
 ```
 
-## Step 2 — History (event store)
+### Step 2: History (event store)
 
 ```elixir
 defmodule WorkflowEngine.History do
@@ -112,7 +114,7 @@ defmodule WorkflowEngine.History do
 end
 ```
 
-## Step 3 — Workflow sandbox and execution model
+### Step 3: Workflow sandbox and execution model
 
 ```elixir
 defmodule WorkflowEngine.Sandbox do
@@ -179,7 +181,7 @@ defmodule WorkflowEngine.Sandbox do
 end
 ```
 
-## Step 4 — Workflow public API
+### Step 4: Workflow public API
 
 ```elixir
 defmodule Workflow do
@@ -251,7 +253,7 @@ defmodule Workflow do
 end
 ```
 
-## Step 5 — Worker (replay engine)
+### Step 5: Worker (replay engine)
 
 ```elixir
 defmodule WorkflowEngine.Worker do
@@ -327,7 +329,7 @@ defmodule WorkflowEngine.Worker do
 end
 ```
 
-## Step 6 — Activity scheduler with retry
+### Step 6: Activity scheduler with retry
 
 ```elixir
 defmodule WorkflowEngine.Activity do
@@ -528,7 +530,7 @@ defmodule WorkflowEngine.DurabilityTest do
 end
 ```
 
-## Trade-offs
+## Trade-off analysis
 
 | Concern | Temporal's approach | This exercise's approach | Trade-off |
 |---|---|---|---|
@@ -538,7 +540,7 @@ end
 | Timer granularity | Sub-second, backed by timer service cluster | Polling every 1s | 1s polling is sufficient for business workflows; <1s timers need dedicated timer processes |
 | Activity isolation | Separate worker processes / machines | Task.start per activity | Same BEAM node is not true isolation; separate nodes needed for production |
 
-## Production mistakes
+## Common production mistakes
 
 **Calling `DateTime.utc_now()` or `:rand.uniform/1` directly in workflow code.** During replay, these return different values, causing the workflow to take a different branch than the original execution. This corrupts the event history and may cause duplicate activity executions. All non-determinism must go through the sandbox.
 

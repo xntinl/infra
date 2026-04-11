@@ -1,16 +1,14 @@
-# 43. Build an AI Inference Engine
+# AI Inference Engine
 
-## Context
+**Project**: `inference_engine` — Elixir ML inference runtime for ONNX models with int8 quantization
+
+## Project context
 
 Your team maintains a real-time fraud detection pipeline. The data science team delivers trained models as ONNX files. Currently, every inference request is forwarded to a Python microservice that runs PyTorch. That service adds 30–80ms of network latency, requires a separate deployment, and cannot share BEAM process memory with your Elixir application.
 
 The ask is clear: load a trained model directly in the Elixir process and run inference without any network hop. The models are convolutional classifiers — five to ten layers, weights in the hundreds of MB range. Accuracy must match the Python service to within 2%.
 
 You will build `InferenceEngine`: a pure-Elixir ML inference runtime that loads a subset of ONNX, runs forward passes, and supports int8 quantization for faster throughput.
-
-## Why this matters at the senior level
-
-This exercise forces you to confront Elixir's design priorities. The language is optimized for message passing and fault isolation, not cache-friendly numerical loops. Every design decision — tensor representation, convolution algorithm, parallelism strategy — involves a genuine trade-off between idiomatic Elixir and raw compute performance. Understanding where to push and where to defer to C (NIFs, Rustler) is the lesson.
 
 ## Project Structure
 
@@ -56,7 +54,7 @@ Float32 arithmetic requires 4 bytes per weight and uses the FPU. Int8 uses 1 byt
 
 For fraud detection classifiers, empirical accuracy loss is typically under 1% on calibration data. For safety-critical models, post-training quantization of this type is not appropriate without careful per-layer calibration data.
 
-## Step 1 — Tensor type
+### Step 1: Tensor type
 
 ```elixir
 defmodule InferenceEngine.Tensor do
@@ -129,7 +127,7 @@ defmodule InferenceEngine.Tensor do
 end
 ```
 
-## Step 2 — Operators
+### Step 2: Operators
 
 ```elixir
 defmodule InferenceEngine.Ops do
@@ -162,7 +160,7 @@ defmodule InferenceEngine.Ops do
 end
 ```
 
-## Step 3 — Conv2D
+### Step 3: Conv2D
 
 ```elixir
 defmodule InferenceEngine.Conv2D do
@@ -197,7 +195,7 @@ defmodule InferenceEngine.Conv2D do
 end
 ```
 
-## Step 4 — Model and loader
+### Step 4: Model and loader
 
 ```elixir
 defmodule InferenceEngine.Model do
@@ -240,7 +238,7 @@ defmodule InferenceEngine.Loader do
 end
 ```
 
-## Step 5 — Quantization
+### Step 5: Quantization
 
 ```elixir
 defmodule InferenceEngine.Quantize do
@@ -274,7 +272,7 @@ defmodule InferenceEngine.Quantize do
 end
 ```
 
-## Step 6 — Inference engine
+### Step 6: Inference engine
 
 ```elixir
 defmodule InferenceEngine.Engine do
@@ -574,7 +572,7 @@ IO.puts("Target: < 100 ms")
 IO.puts("Pass:   #{if median < 100, do: "YES", else: "NO — consider NIF for matmul"}")
 ```
 
-## Trade-offs
+## Trade-off analysis
 
 | Approach | Throughput | Memory | Accuracy | Complexity |
 |---|---|---|---|---|
@@ -585,7 +583,7 @@ IO.puts("Pass:   #{if median < 100, do: "YES", else: "NO — consider NIF for ma
 | Rustler NIF for matmul | 10–50× over pure Elixir | Same | Exact float32 | High |
 | Full Nx/EXLA | Maximum | CUDA-dependent | Same | Low (but external dep) |
 
-## Production mistakes
+## Common production mistakes
 
 **Returning tensors with stale data references.** A common bug is returning a sub-binary view that holds a reference to a large parent binary, preventing GC. Use `:binary.copy/1` when the parent binary is a large loaded model file and you only need a small slice.
 

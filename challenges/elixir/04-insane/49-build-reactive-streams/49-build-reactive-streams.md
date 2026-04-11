@@ -1,6 +1,8 @@
-# 49. Build a Reactive Streams Implementation
+# Reactive Streams Implementation
 
-## Context
+**Project**: `rstreams` — Reactive Streams implementation with explicit backpressure protocol and hot/cold observables
+
+## Project context
 
 Your team ingests sensor telemetry: 100,000 events per second from IoT devices, each requiring parsing, enrichment, filtering, and forwarding to three downstream consumers (a database, an alerting system, and an analytics pipeline). The consumers have different throughputs: the database writes at 80k/s, the alerting system at 10k/s, and the analytics pipeline at 5k/s.
 
@@ -61,7 +63,7 @@ rstreams/
     └── pipeline.exs
 ```
 
-## Step 1 — Core protocols
+### Step 1: Core protocols
 
 ```elixir
 defmodule RStreams.Publisher do
@@ -92,7 +94,7 @@ defmodule RStreams.Subscription do
 end
 ```
 
-## Step 2 — Publisher (cold, from list)
+### Step 2: Publisher (cold, from list)
 
 ```elixir
 defmodule RStreams.Sources.FromList do
@@ -144,7 +146,7 @@ defmodule RStreams.Sources.FromList do
 end
 ```
 
-## Step 3 — Operator: map (Processor)
+### Step 3: Operator: map (Processor)
 
 ```elixir
 defmodule RStreams.Operators.Map do
@@ -208,7 +210,7 @@ defmodule RStreams.Operators.Map do
 end
 ```
 
-## Step 4 — Flat map (hardest operator)
+### Step 4: Flat map (hardest operator)
 
 ```elixir
 defmodule RStreams.Operators.FlatMap do
@@ -254,7 +256,7 @@ defmodule RStreams.Operators.FlatMap do
 end
 ```
 
-## Step 5 — Connectable observable
+### Step 5: Connectable observable
 
 ```elixir
 defmodule RStreams.Connectable do
@@ -539,7 +541,7 @@ end
 RStreams.Bench.Pipeline.run()
 ```
 
-## Trade-offs
+## Trade-off analysis
 
 | Design aspect | RS spec requirement | BEAM-native alternative | Trade-off |
 |---|---|---|---|
@@ -549,7 +551,7 @@ RStreams.Bench.Pipeline.run()
 | `flat_map` buffering | Unbounded inner subscriptions | Bounded concurrency | Unbounded: spec-compliant; bounded: safer under load, needs spec extension |
 | Hot observable multicast | Connectable via explicit `connect/1` | PubSub broadcast | PubSub: BEAM-native, cluster-aware; Connectable: spec-compliant, single node |
 
-## Production mistakes
+## Common production mistakes
 
 **Sending `on_next` from a different process than the one managing demand.** The demand counter for a subscriber is modified by `request(n)` (from the subscriber's process) and by emit logic (from the publisher's process). Without atomic update, the counter can go negative or allow excess emission. Use a single GenServer for demand bookkeeping per subscription, not a shared Agent.
 

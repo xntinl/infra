@@ -1,6 +1,8 @@
-# 51. Build a Production Job Queue (Oban-like)
+# Production Job Queue (Oban-like)
 
-## Context
+**Project**: `job_queue` — PostgreSQL-backed job queue using FOR UPDATE SKIP LOCKED and LISTEN/NOTIFY
+
+## Project context
 
 Your team runs a SaaS platform. Sending confirmation emails, generating PDF invoices, syncing user data to a CRM, and charging credit cards — all of these operations are triggered by HTTP requests but must not block the response. They must survive node crashes, retry on transient failures, and never execute more than once (or at most once more if the process died mid-execution).
 
@@ -67,7 +69,7 @@ job_queue/
     └── throughput.exs
 ```
 
-## Step 1 — Database migration
+### Step 1: Database migration
 
 ```elixir
 # priv/repo/migrations/20240101000000_create_jobs.exs
@@ -131,7 +133,7 @@ defmodule JobQueue.Repo.Migrations.CreateJobs do
 end
 ```
 
-## Step 2 — Job schema and state machine
+### Step 2: Job schema and state machine
 
 ```elixir
 defmodule JobQueue.Job do
@@ -216,7 +218,7 @@ defmodule JobQueue.Job do
 end
 ```
 
-## Step 3 — Worker behaviour
+### Step 3: Worker behaviour
 
 ```elixir
 defmodule JobQueue.Worker do
@@ -300,7 +302,7 @@ defmodule JobQueue.Worker do
 end
 ```
 
-## Step 4 — Poller
+### Step 4: Poller
 
 ```elixir
 defmodule JobQueue.Queue.Poller do
@@ -369,7 +371,7 @@ defmodule JobQueue.Queue.Poller do
 end
 ```
 
-## Step 5 — Orphan rescue
+### Step 5: Orphan rescue
 
 ```elixir
 defmodule JobQueue.Plugins.OrphanRescue do
@@ -606,7 +608,7 @@ end
 JobQueue.Bench.Throughput.run()
 ```
 
-## Trade-offs
+## Trade-off analysis
 
 | Design | Selected | Alternative | Trade-off |
 |---|---|---|---|
@@ -617,7 +619,7 @@ JobQueue.Bench.Throughput.run()
 | Backoff jitter | ±20% uniform random | Fixed exponential | Fixed: retry storms when many jobs fail simultaneously; jitter: desynchronizes retries |
 | Global concurrency | Node-local counter GenServer | Cluster-wide DB counter | DB counter: correct across nodes; local counter: simpler, sufficient for most deployments |
 
-## Production mistakes
+## Common production mistakes
 
 **Not indexing on `(state, queue, priority, scheduled_at)`.** A full table scan on 10 million jobs at 500ms poll interval is catastrophic. The poller's `SELECT ... FOR UPDATE SKIP LOCKED` must use the partial index. Run `EXPLAIN ANALYZE` on the claim query in your test environment with `SET enable_seqscan = off` disabled to verify the index is used.
 

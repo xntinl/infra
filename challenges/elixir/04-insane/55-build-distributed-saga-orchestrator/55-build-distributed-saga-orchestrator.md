@@ -1,6 +1,8 @@
-# 55. Build a Distributed Saga Orchestrator
+# Distributed Saga Orchestrator
 
-## Context
+**Project**: `saga_engine` — Durable saga orchestrator with append-only event log and crash recovery
+
+## Project context
 
 Your team runs an e-commerce platform. Placing an order requires four sequential operations across three independent services: reserve inventory (inventory service), charge payment (payment service), create shipment (fulfillment service), and notify customer (notification service).
 
@@ -60,7 +62,7 @@ saga_engine/
     └── throughput.exs
 ```
 
-## Step 1 — Saga DSL
+### Step 1: Saga DSL
 
 ```elixir
 defmodule SagaEngine.DSL do
@@ -145,7 +147,7 @@ defmodule SagaEngine.DSL do
 end
 ```
 
-## Step 2 — Event log
+### Step 2: Event log
 
 ```elixir
 defmodule SagaEngine.EventLog do
@@ -192,7 +194,7 @@ defmodule SagaEngine.EventLog do
 end
 ```
 
-## Step 3 — Orchestrator GenServer
+### Step 3: Orchestrator GenServer
 
 ```elixir
 defmodule SagaEngine.Orchestrator do
@@ -346,7 +348,7 @@ defmodule SagaEngine.Orchestrator do
 end
 ```
 
-## Step 4 — Compensation
+### Step 4: Compensation
 
 ```elixir
 defmodule SagaEngine.Compensation do
@@ -376,7 +378,7 @@ defmodule SagaEngine.Compensation do
 end
 ```
 
-## Step 5 — Recovery
+### Step 5: Recovery
 
 ```elixir
 defmodule SagaEngine.Recovery do
@@ -605,7 +607,7 @@ end
 SagaEngine.Bench.Throughput.run()
 ```
 
-## Trade-offs
+## Trade-off analysis
 
 | Design | Selected approach | Alternative | Trade-off |
 |---|---|---|---|
@@ -615,7 +617,7 @@ SagaEngine.Bench.Throughput.run()
 | Recovery | Replay event log | Restart from snapshot | Replay: always correct; snapshot: faster but snapshot may be stale |
 | Dead letter | Explicit state with manual intervention API | Infinite retry | Infinite retry: blocks other sagas; explicit DLQ: actionable by operators |
 
-## Production mistakes
+## Common production mistakes
 
 **Compensation function calling external service without the stored output.** `refund_payment` must receive the payment transaction ID returned by `charge_payment`. If it queries the payment service to get the transaction ID, the service may return nothing (transaction was never recorded on their side, e.g., timeout) or the wrong transaction. Always pass the forward step's output to the compensation function — and always persist the output before advancing.
 

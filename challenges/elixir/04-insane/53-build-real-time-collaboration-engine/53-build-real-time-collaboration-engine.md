@@ -1,6 +1,8 @@
-# 53. Build a Real-time Collaboration Engine
+# Real-time Collaboration Engine
 
-## Context
+**Project**: `collab` — Operational Transformation engine for real-time collaborative editing
+
+## Project context
 
 Your team is building a shared document editor — think Google Docs. Two users simultaneously edit the same paragraph. User A inserts "Hello" at position 0. User B inserts "World" at position 0. Both edits are valid. The final document should be "HelloWorld" or "WorldHello" — deterministically, consistently on both clients.
 
@@ -55,7 +57,7 @@ collab/
     └── concurrent_edits.exs
 ```
 
-## Step 1 — Operations and application
+### Step 1: Operations and application
 
 ```elixir
 defmodule Collab.OT.Operation do
@@ -84,7 +86,7 @@ defmodule Collab.OT.Apply do
 end
 ```
 
-## Step 2 — OT transform function
+### Step 2: OT transform function
 
 ```elixir
 defmodule Collab.OT.Transform do
@@ -165,7 +167,7 @@ defmodule Collab.OT.Transform do
 end
 ```
 
-## Step 3 — Document GenServer
+### Step 3: Document GenServer
 
 ```elixir
 defmodule Collab.Document do
@@ -231,7 +233,7 @@ defmodule Collab.Document do
 end
 ```
 
-## Step 4 — Presence with throttling
+### Step 4: Presence with throttling
 
 ```elixir
 defmodule Collab.Presence do
@@ -290,7 +292,7 @@ defmodule Collab.Presence do
 end
 ```
 
-## Step 5 — Per-user undo manager
+### Step 5: Per-user undo manager
 
 ```elixir
 defmodule Collab.UndoManager do
@@ -348,7 +350,7 @@ defmodule Collab.UndoManager do
 end
 ```
 
-## Step 6 — Offline merge
+### Step 6: Offline merge
 
 ```elixir
 defmodule Collab.OfflineMerge do
@@ -529,7 +531,7 @@ defmodule Collab.PresenceTest do
 end
 ```
 
-## Trade-offs
+## Trade-off analysis
 
 | Algorithm | OT (Operational Transformation) | CRDT (YATA/Yjs) | Trade-off |
 |---|---|---|---|
@@ -539,7 +541,7 @@ end
 | Character overhead | No per-character metadata | Position identifiers per character | CRDT: documents can be 3–10× larger in memory due to position IDs |
 | Implementation correctness | Hard; many published OT algorithms are wrong | Easier to verify | CRDT invariants are simpler to test; OT transform function has subtle cases |
 
-## Production mistakes
+## Common production mistakes
 
 **Not using a tiebreaker for concurrent inserts at the same position.** If two users insert at position 5 and you compare only clocks (which are equal for concurrent ops), the ordering is non-deterministic. Always include the user ID as a tiebreaker. This must be consistent on every client and server.
 

@@ -1,6 +1,8 @@
-# 50. Build a Distributed Lock Service (ZooKeeper-like)
+# Distributed Lock Service (ZooKeeper-like)
 
-## Context
+**Project**: `locksmith` — Distributed lock manager using quorum writes and lease-based TTL
+
+## Project context
 
 Your team runs a three-node Elixir cluster. A background job — reindexing a large catalog — must not run on more than one node simultaneously. Using `:global.register_name/2` worked in development but caused a split-brain incident in production: after a network hiccup, both nodes thought they were the sole index job runner and both completed, writing conflicting data.
 
@@ -45,7 +47,7 @@ locksmith/
     └── contention.exs
 ```
 
-## Step 1 — Lease and epoch
+### Step 1: Lease and epoch
 
 ```elixir
 defmodule Locksmith.Lease do
@@ -75,7 +77,7 @@ defmodule Locksmith.Lease do
 end
 ```
 
-## Step 2 — Lock manager (per node)
+### Step 2: Lock manager (per node)
 
 ```elixir
 defmodule Locksmith.LockManager do
@@ -207,7 +209,7 @@ defmodule Locksmith.LockManager do
 end
 ```
 
-## Step 3 — Quorum protocol
+### Step 3: Quorum protocol
 
 ```elixir
 defmodule Locksmith.Quorum do
@@ -281,7 +283,7 @@ defmodule Locksmith.Quorum do
 end
 ```
 
-## Step 4 — Leader election
+### Step 4: Leader election
 
 ```elixir
 defmodule Locksmith.Election do
@@ -531,7 +533,7 @@ end
 Locksmith.Bench.Contention.run()
 ```
 
-## Trade-offs
+## Trade-off analysis
 
 | Design choice | Selected | Alternative | Trade-off |
 |---|---|---|---|
@@ -541,7 +543,7 @@ Locksmith.Bench.Contention.run()
 | Fencing token | Monotonic integer per lock | No fencing | No fencing: double-write possible if old holder acts after expiry; token: storage backend can reject stale writes |
 | Split-brain detection | Node count check before acquire | None | None: two nodes each grant a lock during partition; count check: sacrifices availability on partition side |
 
-## Production mistakes
+## Common production mistakes
 
 **Using wall-clock time for TTL.** Different BEAM nodes may have different system clocks (NTP drift up to ~100ms). A lock acquired with TTL 30s based on node A's clock may expire after 29.9s from node B's perspective. Use monotonic time within each node for expiry checks, and accept ±500ms inaccuracy in cross-node TTL comparisons. Critical operations should use a grace period.
 

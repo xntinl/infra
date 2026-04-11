@@ -1,6 +1,8 @@
-# 54. Build an AI Agents Framework
+# AI Agents Framework
 
-## Context
+**Project**: `agent_framework` — Native BEAM AI agents framework with ReAct loop, tool execution, and AST sandboxing
+
+## Project context
 
 Your team is building an AI assistant for a legal research platform. The assistant must search case law databases, summarize documents, run code to compute statistics, and delegate specialized tasks (contract analysis, precedent ranking) to specialist sub-agents. The orchestration logic is complex: plan a research question, call search tools, analyze results, synthesize findings, produce a final report.
 
@@ -63,7 +65,7 @@ agent_framework/
     └── concurrent_agents.exs
 ```
 
-## Step 1 — Tool behaviour
+### Step 1: Tool behaviour
 
 ```elixir
 defmodule AgentFramework.Tool do
@@ -120,7 +122,7 @@ defmodule AgentFramework.Tool do
 end
 ```
 
-## Step 2 — Agent GenServer with ReAct loop
+### Step 2: Agent GenServer with ReAct loop
 
 ```elixir
 defmodule AgentFramework.Agent do
@@ -271,7 +273,7 @@ defmodule AgentFramework.Agent do
 end
 ```
 
-## Step 3 — Code execution tool with AST sandbox
+### Step 3: Code execution tool with AST sandbox
 
 ```elixir
 defmodule AgentFramework.Tools.CodeExecution do
@@ -369,7 +371,7 @@ defmodule AgentFramework.Tools.CodeExecution do
 end
 ```
 
-## Step 4 — LLM behaviour and retry
+### Step 4: LLM behaviour and retry
 
 ```elixir
 defmodule AgentFramework.LLM do
@@ -411,7 +413,7 @@ defmodule AgentFramework.LLM.Retry do
 end
 ```
 
-## Step 5 — Context summarization (short-term memory)
+### Step 5: Context summarization (short-term memory)
 
 ```elixir
 defmodule AgentFramework.Memory.ShortTerm do
@@ -567,7 +569,7 @@ defmodule AgentFramework.PoolTest do
 end
 ```
 
-## Trade-offs
+## Trade-off analysis
 
 | Design | Selected | Alternative | Trade-off |
 |---|---|---|---|
@@ -578,7 +580,7 @@ end
 | Marketplace discovery | pgvector cosine similarity | Tag-based exact match | Tag match: faster, deterministic; vector: handles natural language queries |
 | LLM provider abstraction | Behaviour + adapter modules | HTTP library wrapper | Library wrapper: simpler but provider-specific; behaviour: hot-swappable providers |
 
-## Production mistakes
+## Common production mistakes
 
 **Not handling partial JSON in LLM tool call responses.** LLMs sometimes emit malformed JSON for tool call parameters (truncated, unescaped characters). The framework must handle `Jason.decode/1` errors gracefully — return a structured error to the LLM with the original invalid JSON and ask it to retry. Do not let a JSON parse error propagate as an uncaught exception.
 
