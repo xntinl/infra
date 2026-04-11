@@ -1,285 +1,385 @@
-# Recursion and TCO: Building the Transaction Report
+# Recursion and Tail Call Optimization: Building a File System Tree Walker
 
-**Project**: `payments_cli` — a CLI tool that processes payment transactions
-
----
-
-## Project context
-
-You are building `payments_cli`, a CLI tool that processes payment transactions from CSV
-files, validates them, applies business rules, and produces ledger reports.
-
-This exercise implements report-building functions in a `Ledger` module using tail-recursive
-algorithms. These functions walk lists of transactions to count by status, filter by
-threshold, and build CSV report strings. Understanding tail-call optimization (TCO)
-determines whether your code handles 1,000 transactions or 1,000,000.
+**Project**: `tree` — a recursive directory lister with depth limits, filtering, and size calculation
 
 ---
 
-## Why TCO matters in a payments context
+## Why recursion replaces loops in Elixir
 
-A bank transaction export can have millions of rows. A function that processes
-each transaction naively — building up a stack frame per transaction — will exhaust
-the process stack before finishing.
+Elixir has no `for` loops, no `while` loops, no mutable loop counters. All iteration
+is either recursion or higher-order functions (`Enum.map/2`, `Enum.reduce/3`) which
+are built on recursion internally.
 
-The BEAM VM provides a guarantee: **a tail call never grows the stack**. The current
-frame is reused. This is not an optimization; it is a language contract. Erlang and
-Elixir GenServers are implemented as infinite recursive loops that never blow the
-stack precisely because of this guarantee.
+For a senior developer from Java or Go, this seems limiting. It is not — it is a
+guarantee. Without mutable state, every recursive function is:
 
-The key distinction:
+1. **Predictable**: the only inputs are the function arguments
+2. **Concurrent-safe**: no shared mutable counter to synchronize
+3. **Testable**: call with inputs, check outputs
+
+The catch: naive recursion can overflow the stack. Elixir solves this with Tail Call
+Optimization (TCO). When the recursive call is the **last** operation in the function
+(not wrapped in another operation), the BEAM reuses the current stack frame. This
+turns recursion into a constant-space loop.
 
 ```elixir
-# NOT a tail call — the + happens AFTER the recursive call returns
-def sum([h | t]), do: h + sum(t)
-#                         ^^^^^^ this result is needed to compute + h
-# Stack grows: sum([1,2,3]) needs sum([2,3]) needs sum([3]) needs sum([])
+# NOT tail-recursive — multiplication happens AFTER the recursive call
+def factorial(0), do: 1
+def factorial(n), do: n * factorial(n - 1)  # stack grows with each call
 
-# Tail call — recursive call IS the last operation
-def sum([h | t], acc), do: sum(t, h + acc)
-#                          ^^^^^^^^^^^^^^^ this IS the last thing that happens
-# Stack stays flat: each call replaces the current frame
+# Tail-recursive — recursive call IS the last operation
+def factorial(n), do: factorial(n, 1)
+defp factorial(0, acc), do: acc
+defp factorial(n, acc), do: factorial(n - 1, n * acc)  # constant stack
 ```
-
-The accumulator pattern converts a naive recursive function to a tail-recursive one
-by moving the "work in progress" into an argument.
 
 ---
 
 ## The business problem
 
-The `Ledger` module needs report-building functions that must handle large
-transaction lists without stack overflow:
+Build a file system tree walker that:
 
-1. Count transactions by status (tail-recursive counter)
-2. Find all transactions above an amount threshold (tail-recursive filter)
-3. Compute a CSV report string from a transaction list (tail-recursive string builder)
-4. Verify that both naive and TCO versions produce identical results
+1. Recursively lists directory contents
+2. Respects a configurable depth limit
+3. Filters files by extension
+4. Calculates total size of matching files
+5. Uses tail-recursive accumulation for large directory trees
 
 ---
 
 ## Implementation
 
-### `lib/payments_cli/ledger.ex`
-
-Each function uses the accumulator pattern for tail recursion. The public function
-accepts the user-facing arguments and delegates to a private helper that adds the
-accumulator. The private helper has three clauses: base case (empty list), matching
-case (element qualifies), and non-matching case (skip and continue).
+### `lib/tree.ex`
 
 ```elixir
-defmodule PaymentsCli.Ledger do
+defmodule Tree do
   @moduledoc """
-  Report-building functions for the payments ledger.
+  Recursive file system tree walker.
 
-  All list-processing functions use tail-recursive implementations
-  with the accumulator pattern, ensuring constant stack usage
-  regardless of input size. Safe for million-row transaction exports.
+  Demonstrates tail recursion with accumulators, depth-limited
+  recursion, and the difference between body recursion and
+  tail recursion for stack safety.
   """
 
-  @doc """
-  Counts the number of transactions matching the given status.
+  @type entry :: %{
+          path: String.t(),
+          name: String.t(),
+          type: :file | :directory,
+          size: non_neg_integer(),
+          depth: non_neg_integer()
+        }
 
-  Implemented with TCO — safe for arbitrarily long transaction lists.
+  @doc """
+  Lists all files and directories under the given path recursively.
+
+  Options:
+    - `:max_depth` — maximum recursion depth (default: infinity)
+    - `:extensions` — list of file extensions to include, e.g. `[".ex", ".exs"]`
+    - `:include_dirs` — whether to include directories in output (default: true)
 
   ## Examples
 
-      iex> txs = [%{status: :approved}, %{status: :declined}, %{status: :approved}]
-      iex> PaymentsCli.Ledger.count_by_status(txs, :approved)
-      2
-
-  """
-  @spec count_by_status([map()], atom()) :: non_neg_integer()
-  def count_by_status(transactions, status) when is_list(transactions) and is_atom(status) do
-    count_by_status(transactions, status, 0)
-  end
-
-  defp count_by_status([], _status, acc), do: acc
-
-  defp count_by_status([%{status: s} | rest], status, acc) when s == status do
-    count_by_status(rest, status, acc + 1)
-  end
-
-  defp count_by_status([_ | rest], status, acc) do
-    count_by_status(rest, status, acc)
-  end
-
-  @doc """
-  Returns all transactions where amount_cents exceeds the threshold.
-
-  Tail-recursive. Preserves order of the original list.
-
-  ## Examples
-
-      iex> txs = [%{id: "A", amount_cents: 100}, %{id: "B", amount_cents: 500}, %{id: "C", amount_cents: 50}]
-      iex> PaymentsCli.Ledger.above_threshold(txs, 200)
-      [%{id: "B", amount_cents: 500}]
-
-  """
-  @spec above_threshold([map()], integer()) :: [map()]
-  def above_threshold(transactions, threshold_cents)
-      when is_list(transactions) and is_integer(threshold_cents) do
-    do_above_threshold(transactions, threshold_cents, [])
-  end
-
-  defp do_above_threshold([], _threshold, acc), do: Enum.reverse(acc)
-
-  defp do_above_threshold([%{amount_cents: amount} = tx | rest], threshold, acc)
-       when amount > threshold do
-    do_above_threshold(rest, threshold, [tx | acc])
-  end
-
-  defp do_above_threshold([_ | rest], threshold, acc) do
-    do_above_threshold(rest, threshold, acc)
-  end
-
-  @doc """
-  Builds a CSV report string from a list of transactions.
-
-  Format: one line per transaction, comma-separated, with header row.
-  "id,amount_cents,currency,status\\n" + one line per transaction.
-
-  Tail-recursive — builds the line list with prepend, then joins at the end.
-
-  ## Examples
-
-      iex> txs = [%{id: "T1", amount_cents: 1000, currency: "USD", status: :approved}]
-      iex> report = PaymentsCli.Ledger.to_csv(txs)
-      iex> String.starts_with?(report, "id,amount_cents,currency,status")
-      true
-      iex> String.contains?(report, "T1,1000,USD,approved")
+      iex> entries = Tree.list("/tmp/tree_test_dir", max_depth: 1)
+      iex> is_list(entries)
       true
 
   """
-  @spec to_csv([map()]) :: String.t()
-  def to_csv(transactions) when is_list(transactions) do
-    header = "id,amount_cents,currency,status"
-    lines = build_csv_lines(transactions, [])
-    all_lines = [header | Enum.reverse(lines)]
-    Enum.join(all_lines, "\n")
+  @spec list(String.t(), keyword()) :: [entry()]
+  def list(root_path, opts \\ []) do
+    max_depth = Keyword.get(opts, :max_depth, :infinity)
+    extensions = Keyword.get(opts, :extensions, nil)
+    include_dirs = Keyword.get(opts, :include_dirs, true)
+
+    walk([{root_path, 0}], [], max_depth, extensions, include_dirs)
   end
 
-  defp build_csv_lines([], acc), do: acc
+  @doc """
+  Calculates the total size of all files matching the given criteria.
 
-  defp build_csv_lines([tx | rest], acc) do
-    line = "#{tx.id},#{tx.amount_cents},#{tx.currency},#{tx.status}"
-    build_csv_lines(rest, [line | acc])
+  Uses a tail-recursive accumulator to avoid stack overflow on
+  deeply nested directories with millions of files.
+
+  ## Examples
+
+      iex> Tree.total_size("/tmp/tree_test_dir")
+      size when is_integer(size) and size >= 0
+
+  """
+  @spec total_size(String.t(), keyword()) :: non_neg_integer()
+  def total_size(root_path, opts \\ []) do
+    root_path
+    |> list(Keyword.put(opts, :include_dirs, false))
+    |> sum_sizes(0)
   end
+
+  @doc """
+  Formats a tree listing as an indented string, similar to the Unix `tree` command.
+
+  ## Examples
+
+      iex> entries = [
+      ...>   %{path: "/a", name: "a", type: :directory, size: 0, depth: 0},
+      ...>   %{path: "/a/b.ex", name: "b.ex", type: :file, size: 100, depth: 1}
+      ...> ]
+      iex> Tree.format(entries)
+      "a/\\n  b.ex (100 B)"
+
+  """
+  @spec format([entry()]) :: String.t()
+  def format(entries) do
+    entries
+    |> Enum.map(&format_entry/1)
+    |> Enum.join("\n")
+  end
+
+  @doc """
+  Counts files grouped by extension.
+
+  Returns a map of extension => count.
+
+  ## Examples
+
+      iex> entries = [
+      ...>   %{path: "/a.ex", name: "a.ex", type: :file, size: 0, depth: 0},
+      ...>   %{path: "/b.ex", name: "b.ex", type: :file, size: 0, depth: 0},
+      ...>   %{path: "/c.md", name: "c.md", type: :file, size: 0, depth: 0}
+      ...> ]
+      iex> Tree.count_by_extension(entries)
+      %{".ex" => 2, ".md" => 1}
+
+  """
+  @spec count_by_extension([entry()]) :: %{String.t() => non_neg_integer()}
+  def count_by_extension(entries) do
+    entries
+    |> Enum.filter(&(&1.type == :file))
+    |> Enum.group_by(&Path.extname(&1.name))
+    |> Enum.map(fn {ext, files} -> {ext, length(files)} end)
+    |> Map.new()
+  end
+
+  # --- Private: tail-recursive tree walker ---
+
+  # The work list pattern: instead of recursive function calls that build up
+  # the stack, we maintain an explicit work list (stack) of paths to visit.
+  # This is tail-recursive because `walk` is the last call in every branch.
+
+  @spec walk(
+          [{String.t(), non_neg_integer()}],
+          [entry()],
+          non_neg_integer() | :infinity,
+          [String.t()] | nil,
+          boolean()
+        ) :: [entry()]
+  defp walk([], acc, _max_depth, _extensions, _include_dirs) do
+    Enum.reverse(acc)
+  end
+
+  defp walk([{path, depth} | rest], acc, max_depth, extensions, include_dirs) do
+    case File.stat(path) do
+      {:ok, %File.Stat{type: :directory, size: size}} ->
+        entry = %{
+          path: path,
+          name: Path.basename(path),
+          type: :directory,
+          size: size,
+          depth: depth
+        }
+
+        new_acc = if include_dirs, do: [entry | acc], else: acc
+
+        children =
+          if depth_allowed?(depth, max_depth) do
+            list_children(path, depth + 1)
+          else
+            []
+          end
+
+        walk(children ++ rest, new_acc, max_depth, extensions, include_dirs)
+
+      {:ok, %File.Stat{type: :regular, size: size}} ->
+        name = Path.basename(path)
+
+        if extension_matches?(name, extensions) do
+          entry = %{
+            path: path,
+            name: name,
+            type: :file,
+            size: size,
+            depth: depth
+          }
+
+          walk(rest, [entry | acc], max_depth, extensions, include_dirs)
+        else
+          walk(rest, acc, max_depth, extensions, include_dirs)
+        end
+
+      _ ->
+        walk(rest, acc, max_depth, extensions, include_dirs)
+    end
+  end
+
+  @spec depth_allowed?(non_neg_integer(), non_neg_integer() | :infinity) :: boolean()
+  defp depth_allowed?(_depth, :infinity), do: true
+  defp depth_allowed?(depth, max_depth), do: depth < max_depth
+
+  @spec list_children(String.t(), non_neg_integer()) ::
+          [{String.t(), non_neg_integer()}]
+  defp list_children(dir_path, child_depth) do
+    case File.ls(dir_path) do
+      {:ok, names} ->
+        names
+        |> Enum.sort()
+        |> Enum.map(fn name -> {Path.join(dir_path, name), child_depth} end)
+
+      {:error, _} ->
+        []
+    end
+  end
+
+  @spec extension_matches?(String.t(), [String.t()] | nil) :: boolean()
+  defp extension_matches?(_name, nil), do: true
+
+  defp extension_matches?(name, extensions) do
+    Path.extname(name) in extensions
+  end
+
+  # Tail-recursive size accumulator
+  @spec sum_sizes([entry()], non_neg_integer()) :: non_neg_integer()
+  defp sum_sizes([], acc), do: acc
+  defp sum_sizes([%{size: size} | rest], acc), do: sum_sizes(rest, acc + size)
+
+  @spec format_entry(entry()) :: String.t()
+  defp format_entry(%{name: name, type: :directory, depth: depth}) do
+    indent = String.duplicate("  ", depth)
+    "#{indent}#{name}/"
+  end
+
+  defp format_entry(%{name: name, type: :file, size: size, depth: depth}) do
+    indent = String.duplicate("  ", depth)
+    "#{indent}#{name} (#{format_size(size)})"
+  end
+
+  @spec format_size(non_neg_integer()) :: String.t()
+  defp format_size(bytes) when bytes < 1024, do: "#{bytes} B"
+  defp format_size(bytes) when bytes < 1_048_576, do: "#{div(bytes, 1024)} KB"
+  defp format_size(bytes), do: "#{div(bytes, 1_048_576)} MB"
 end
 ```
 
 **Why this works:**
 
-- `count_by_status/2` delegates to `count_by_status/3` with an initial accumulator of `0`.
-  The three private clauses handle: empty list (return accumulator), matching status
-  (increment and recurse), non-matching status (skip and recurse). Every recursive call
-  is in tail position — it is the last operation in the function body.
-
-- `above_threshold/2` delegates to `do_above_threshold/3` with an empty accumulator.
-  Matching transactions are prepended to the accumulator (O(1)). The base case reverses
-  the accumulator once (O(n)) to restore the original order. Total: O(n).
-
-- `to_csv/1` delegates to `build_csv_lines/2` which builds lines in reverse order by
-  prepending each line to the accumulator. After the recursion, `Enum.reverse/1` restores
-  the correct order, then `Enum.join/2` combines header and lines with newlines.
-
-- All three functions are safe for 100k+ elements because every recursive call is a
-  tail call — the BEAM reuses the current stack frame.
+- `walk/5` uses the **work list pattern** instead of direct recursion. The first
+  argument is a list of `{path, depth}` tuples to process. When we encounter a
+  directory, we prepend its children to the work list instead of making a recursive
+  call. This keeps the recursion tail-recursive because `walk` is always the last
+  call.
+- `sum_sizes/2` is a classic tail-recursive accumulator. The sum is passed as the
+  second argument, updated with each element. No stack frames accumulate.
+- `File.stat/1` returns `{:ok, %File.Stat{}}` or `{:error, reason}`. We pattern
+  match on the `type` field (`:directory`, `:regular`) to decide how to handle
+  each path. Errors (permission denied, broken symlinks) are silently skipped.
 
 ### Tests
 
 ```elixir
-# test/payments_cli/ledger_recursion_test.exs
-defmodule PaymentsCli.LedgerRecursionTest do
+# test/tree_test.exs
+defmodule TreeTest do
   use ExUnit.Case, async: true
 
-  alias PaymentsCli.Ledger
+  @test_dir Path.join(System.tmp_dir!(), "tree_test_#{:erlang.unique_integer([:positive])}")
 
-  # Generate a large list to verify TCO (no stack overflow)
-  @large_count 100_000
-  @large_txs Enum.map(1..@large_count, fn i ->
-    status = if rem(i, 3) == 0, do: :declined, else: :approved
-    %{id: "T#{i}", amount_cents: i * 10, currency: "USD", status: status}
-  end)
+  setup_all do
+    File.rm_rf!(@test_dir)
+    File.mkdir_p!(Path.join(@test_dir, "src/lib"))
+    File.mkdir_p!(Path.join(@test_dir, "test"))
+    File.write!(Path.join(@test_dir, "mix.exs"), "# mix file")
+    File.write!(Path.join(@test_dir, "src/app.ex"), String.duplicate("x", 100))
+    File.write!(Path.join(@test_dir, "src/lib/helper.ex"), String.duplicate("y", 50))
+    File.write!(Path.join(@test_dir, "src/lib/utils.ex"), String.duplicate("z", 75))
+    File.write!(Path.join(@test_dir, "test/app_test.exs"), String.duplicate("t", 200))
+    File.write!(Path.join(@test_dir, "README.md"), "# Readme")
 
-  describe "count_by_status/2" do
-    test "counts approved transactions" do
-      txs = [
-        %{status: :approved},
-        %{status: :declined},
-        %{status: :approved},
-        %{status: :flagged}
-      ]
-      assert Ledger.count_by_status(txs, :approved) == 2
+    on_exit(fn -> File.rm_rf!(@test_dir) end)
+    :ok
+  end
+
+  describe "list/2" do
+    test "lists all files and directories" do
+      entries = Tree.list(@test_dir)
+      names = Enum.map(entries, & &1.name)
+      assert "src" in names
+      assert "test" in names
+      assert "mix.exs" in names
+      assert "app.ex" in names
     end
 
-    test "returns 0 when no match" do
-      assert Ledger.count_by_status([%{status: :approved}], :declined) == 0
+    test "respects max_depth" do
+      entries = Tree.list(@test_dir, max_depth: 1)
+      depths = Enum.map(entries, & &1.depth)
+      assert Enum.all?(depths, &(&1 <= 1))
+      names = Enum.map(entries, & &1.name)
+      refute "helper.ex" in names
     end
 
-    test "handles empty list" do
-      assert Ledger.count_by_status([], :approved) == 0
+    test "filters by extension" do
+      entries = Tree.list(@test_dir, extensions: [".ex"])
+      names = Enum.map(entries, & &1.name)
+      assert "app.ex" in names
+      assert "helper.ex" in names
+      refute "app_test.exs" in names
+      refute "README.md" in names
     end
 
-    test "handles 100k transactions without stack overflow" do
-      # If not tail-recursive, this crashes with stack overflow
-      result = Ledger.count_by_status(@large_txs, :approved)
-      # 2/3 of 100k are approved (those not divisible by 3)
-      assert result > 0
-      assert result < @large_count
+    test "excludes directories when include_dirs: false" do
+      entries = Tree.list(@test_dir, include_dirs: false)
+      types = Enum.map(entries, & &1.type)
+      assert Enum.all?(types, &(&1 == :file))
+    end
+
+    test "handles non-existent directory" do
+      entries = Tree.list("/tmp/definitely_does_not_exist_#{:rand.uniform(999999)}")
+      assert entries == []
     end
   end
 
-  describe "above_threshold/2" do
-    test "filters by threshold" do
-      txs = [
-        %{id: "A", amount_cents: 100},
-        %{id: "B", amount_cents: 500},
-        %{id: "C", amount_cents: 50}
-      ]
-      result = Ledger.above_threshold(txs, 200)
-      assert length(result) == 1
-      assert hd(result).id == "B"
+  describe "total_size/2" do
+    test "sums file sizes" do
+      size = Tree.total_size(@test_dir)
+      # mix.exs(10) + app.ex(100) + helper.ex(50) + utils.ex(75) + app_test.exs(200) + README.md(8)
+      assert size > 0
     end
 
-    test "preserves original order" do
-      txs = [
-        %{id: "Z", amount_cents: 1000},
-        %{id: "A", amount_cents: 900}
-      ]
-      [first, second] = Ledger.above_threshold(txs, 500)
-      assert first.id == "Z"
-      assert second.id == "A"
-    end
-
-    test "returns empty for all below threshold" do
-      txs = [%{id: "X", amount_cents: 10}]
-      assert Ledger.above_threshold(txs, 100) == []
-    end
-
-    test "handles 100k transactions without stack overflow" do
-      result = Ledger.above_threshold(@large_txs, 500_000)
-      assert is_list(result)
+    test "filters by extension in size calculation" do
+      size_ex = Tree.total_size(@test_dir, extensions: [".ex"])
+      size_all = Tree.total_size(@test_dir)
+      assert size_ex < size_all
+      assert size_ex > 0
     end
   end
 
-  describe "to_csv/1" do
-    test "includes header row" do
-      result = Ledger.to_csv([])
-      assert String.starts_with?(result, "id,amount_cents,currency,status")
-    end
+  describe "format/1" do
+    test "indents by depth" do
+      entries = [
+        %{path: "/a", name: "a", type: :directory, size: 0, depth: 0},
+        %{path: "/a/b.ex", name: "b.ex", type: :file, size: 100, depth: 1},
+        %{path: "/a/c/d.ex", name: "d.ex", type: :file, size: 50, depth: 2}
+      ]
 
-    test "includes transaction data" do
-      txs = [%{id: "T1", amount_cents: 1000, currency: "USD", status: :approved}]
-      result = Ledger.to_csv(txs)
-      assert String.contains?(result, "T1,1000,USD,approved")
+      output = Tree.format(entries)
+      lines = String.split(output, "\n")
+      assert Enum.at(lines, 0) == "a/"
+      assert Enum.at(lines, 1) == "  b.ex (100 B)"
+      assert Enum.at(lines, 2) == "    d.ex (50 B)"
     end
+  end
 
-    test "handles 100k transactions without stack overflow" do
-      result = Ledger.to_csv(@large_txs)
-      line_count = result |> String.split("\n") |> length()
-      # header + 100k lines
-      assert line_count == @large_count + 1
+  describe "count_by_extension/1" do
+    test "groups files by extension" do
+      entries = Tree.list(@test_dir, include_dirs: false)
+      counts = Tree.count_by_extension(entries)
+      assert counts[".ex"] >= 3
+      assert counts[".exs"] >= 1
+      assert counts[".md"] >= 1
     end
   end
 end
@@ -288,63 +388,65 @@ end
 ### Run the tests
 
 ```bash
-mix test test/payments_cli/ledger_recursion_test.exs --trace
+mix test --trace
 ```
-
-The 100k transaction tests will fail if your implementation is not tail-recursive —
-they exist specifically to surface stack overflow.
 
 ---
 
-## Trade-off analysis
+## Tail recursion vs body recursion
 
-| Aspect | Tail-recursive with accumulator | Naive recursion | `Enum.reduce/3` |
-|--------|--------------------------------|-----------------|-----------------|
-| Stack usage | O(1) — constant | O(n) — grows with list | O(1) — implemented with TCO internally |
-| Max list size | Unlimited | ~10k-100k depending on frame size | Unlimited |
-| Code clarity | Requires accumulator pattern knowledge | Reads like math | Most readable |
-| When to use | When Enum doesn't fit the logic | Learning, or guaranteed small lists | Production code |
-| Performance | Comparable to Enum | Comparable for small n | Preferred |
+```elixir
+# Body recursion — operation AFTER recursive call
+# Stack: [sum(4), sum(3), sum(2), sum(1), sum(0)] — grows with input
+def sum([]), do: 0
+def sum([head | tail]), do: head + sum(tail)
 
-Reflection question: `to_csv/1` builds lines with prepend + reverse. If the CSV
-report is later streamed to a file instead of held in memory, how would the
-implementation change? Think about `Stream.map/2` and `IO.stream/2`.
+# Tail recursion — recursive call IS the last operation
+# Stack: constant size, reuses the same frame
+def sum(list), do: sum(list, 0)
+defp sum([], acc), do: acc
+defp sum([head | tail], acc), do: sum(tail, head + acc)
+```
+
+The BEAM detects when the recursive call is in tail position and reuses the
+current stack frame. This means tail-recursive functions run in constant space,
+no matter the input size. Body-recursive functions grow the stack linearly.
+
+For small inputs (<10,000 elements), the difference is negligible. For large
+inputs (millions of files in a directory tree), body recursion overflows the stack.
 
 ---
 
 ## Common production mistakes
 
-**1. Naive recursion on user-provided data**
-A bank file with 1M transactions crashes a naive recursive sum. The call stack
-default is ~10,000 frames on most BEAM configurations. Use TCO or `Enum` for
-anything that processes external data.
+**1. Thinking `Enum` functions are "not recursive"**
+`Enum.map/2`, `Enum.reduce/3`, etc. are all built on recursion internally. They
+are tail-recursive and handle the accumulator for you. Prefer `Enum` functions
+over hand-written recursion unless you need work-list patterns or multi-value
+accumulation.
 
-**2. Accumulator in wrong argument position**
-The tail call must be the **last** operation. `n * factorial(n-1, acc)` is NOT a
-tail call — the multiplication happens after the recursive call returns. The tail
-call form is `factorial(n-1, n * acc)` — the multiplication is in the argument,
-not in the return expression.
+**2. Forgetting to reverse the accumulator**
+Prepending to a list (`[element | acc]`) builds it in reverse. Always reverse at
+the end: `Enum.reverse(acc)`. This is O(n) total, which is optimal.
 
-**3. Forgetting `Enum.reverse/1` after prepend-accumulation**
-The accumulator reverses the order because `[new_item | acc]` prepends. Without
-`Enum.reverse/1` at the end, your results are backwards. This produces subtle
-bugs in ordered reports that are hard to catch without a large test dataset.
+**3. Using `++` to "append" in recursive functions**
+`list ++ [element]` is O(n) per call. In a recursive function over n elements,
+that is O(n^2) total. Always prepend and reverse.
 
-**4. Using `++` in the accumulator**
-`acc ++ [new_item]` in every recursive step is O(n^2). Use `[new_item | acc]` then
-reverse once. With 100k transactions, the difference is milliseconds vs minutes.
+**4. Not handling the empty case**
+Every recursive function needs a base case. For lists, it is the empty list `[]`.
+For numbers, it is usually 0 or 1. Forgetting the base case causes infinite recursion.
 
-**5. Reinventing `Enum` in production code**
-The exercises build recursive functions to teach the mechanism. In production, use
-`Enum.count/2`, `Enum.filter/2`, `Enum.map_join/3` — they are correct, optimized,
-and readable. Write manual recursion only when the logic genuinely does not fit
-the Enum API (tree traversal, state machines, non-linear accumulation).
+**5. Assuming TCO works through `try/rescue`**
+`try` blocks break tail call optimization. If you wrap a recursive call in `try`,
+the BEAM cannot reuse the stack frame. Move error handling outside the recursive
+loop.
 
 ---
 
 ## Resources
 
 - [Recursion — Elixir Getting Started](https://elixir-lang.org/getting-started/recursion.html)
-- [Erlang Efficiency Guide — Tail Recursion](https://www.erlang.org/doc/efficiency_guide/eff_guide.html)
-- [Enum — HexDocs](https://hexdocs.pm/elixir/Enum.html)
-- [Elixir in Action — Sasa Juric — Chapter 3 (recursion and loops)](https://www.manning.com/books/elixir-in-action-third-edition)
+- [Tail calls — Erlang efficiency guide](https://www.erlang.org/doc/efficiency_guide/functions.html)
+- [File — HexDocs](https://hexdocs.pm/elixir/File.html)
+- [Path — HexDocs](https://hexdocs.pm/elixir/Path.html)
