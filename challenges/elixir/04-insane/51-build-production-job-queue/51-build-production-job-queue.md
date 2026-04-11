@@ -1,174 +1,639 @@
 # 51. Build a Production Job Queue (Oban-like)
 
-**Difficulty**: Insane
+## Context
 
-**Estimated time**: 120+ hours
+Your team runs a SaaS platform. Sending confirmation emails, generating PDF invoices, syncing user data to a CRM, and charging credit cards — all of these operations are triggered by HTTP requests but must not block the response. They must survive node crashes, retry on transient failures, and never execute more than once (or at most once more if the process died mid-execution).
 
-## Overview
+The first attempt used an in-memory queue backed by a GenServer. When the node restarted, the queue was empty. Lost jobs meant unpaid invoices and unsent emails. The second attempt used Redis, but job enqueue and database insert were two separate operations: if the database rolled back after the Redis enqueue, a ghost job existed for data that was never committed.
 
-Background job processing is a foundational primitive of every production web application. Sending emails, generating reports, syncing data with third-party APIs, charging credit cards — any operation that must not block an HTTP response and must survive application restarts belongs in a job queue. The production-grade requirements are unforgiving: jobs must never be silently lost, must not execute more times than necessary, must retry intelligently under transient failures, and must degrade gracefully under partial infrastructure outages.
+The only correct foundation is PostgreSQL: job insertion is transactional with the business operation. If the outer transaction rolls back, the job does not exist. `SELECT FOR UPDATE SKIP LOCKED` ensures mutual exclusion at the database level without any in-memory coordination between nodes.
 
-This exercise demands that you build a complete, production-quality background job system backed by PostgreSQL — one that solves the same class of problems as Oban, Sidekiq, or Faktory, but entirely from first principles using the BEAM's native concurrency primitives. The system must be correct under adversarial conditions: database connection loss, node crashes mid-job, thundering herd on retry, race conditions between competing workers on a cluster, and zombie jobs left by dead processes.
+You will build `JobQueue`: a production-quality background job system backed by PostgreSQL.
 
-The fundamental design constraint is that job insertion must be transactional with the business operation that enqueues it. If the outer database transaction rolls back, the job must not exist. This eliminates an entire class of consistency bugs that plague systems that use Redis or an external message broker.
+## Why `FOR UPDATE SKIP LOCKED` and not advisory locks
 
-## The Challenge
+PostgreSQL advisory locks are manual; the application must release them explicitly. If a worker crashes, the advisory lock is held until the session closes. `FOR UPDATE SKIP LOCKED` works at the row level: when a worker claims a job row, the row is locked for the duration of the worker's transaction. Other workers trying to claim the same job see it as locked and skip it (SKIP LOCKED). When the worker commits (marking the job `executing`), the lock is released and the job is no longer available for claiming. The lock lifetime equals the transaction duration — no manual cleanup.
 
-Design and implement a background job processing system in Elixir that satisfies the following non-negotiable properties:
+## Why LISTEN/NOTIFY instead of polling-only
 
-- **At-least-once delivery**: every job that is successfully enqueued will eventually be executed, even after worker crashes or node restarts.
-- **No silent loss**: a job that fails due to a bug, timeout, or crash is never silently discarded — it transitions to a well-defined terminal or retryable state with full error context.
-- **Transactional enqueue**: inserting a job within an `Ecto.Multi` or `Repo.transaction/1` block commits if and only if the surrounding transaction commits.
-- **Correct concurrency**: `FOR UPDATE SKIP LOCKED` is the only mechanism used to claim jobs; no in-memory coordination primitives may be used as a substitute for database-level mutual exclusion.
-- **Correct under distribution**: the system must produce correct results when multiple BEAM nodes run the same queue configuration simultaneously, with no single point of coordination outside PostgreSQL.
+Polling at 1-second intervals adds up to 1 second of latency for every enqueued job. `NOTIFY` from a trigger fires immediately when a row is inserted. The LISTEN connection receives the notification within ~5ms on a local database. This reduces median latency from ~500ms (average of 1s interval) to ~10ms. Polling is the fallback when the NOTIFY connection drops — it handles missed notifications without data loss.
 
-The system must be observable, configurable without restarting, and shut down gracefully without abandoning in-flight jobs.
+## Why at-least-once and not exactly-once
 
-## Core Requirements
+Exactly-once delivery requires distributed transactions or two-phase commit — prohibitively complex. At-least-once is achievable with idempotent workers: the job may execute more than once (if the worker dies after running `perform/1` but before marking the job `completed`), but if `perform/1` is idempotent (safe to run multiple times), the observable outcome is correct. The orphan rescue returns jobs to `available` if the worker dies, which may cause a second execution. This is the explicit design contract.
 
-### 1. Schema and State Machine
+## Project Structure
 
-The system persists all job state in a single PostgreSQL table. The table must model a complete job lifecycle with the following states: `available`, `scheduled`, `executing`, `completed`, `retryable`, `discarded`, `cancelled`. State transitions must be enforced at the application layer and documented as an explicit finite state machine. The table design must support all query patterns in this specification without full table scans, using appropriate composite indexes. The `args` column must be stored as JSONB. The `errors` column must be a JSONB array that accumulates the full error history across all attempts, including timestamps, error messages, and stacktraces.
+```
+job_queue/
+├── mix.exs
+├── priv/
+│   └── repo/
+│       └── migrations/
+│           └── 20240101000000_create_jobs.exs
+├── lib/
+│   └── job_queue/
+│       ├── job.ex              # Job schema: state machine, fields
+│       ├── worker.ex           # Worker behaviour: perform/1, enqueue/2, new/2
+│       ├── queue/
+│       │   ├── supervisor.ex   # DynamicSupervisor for queues
+│       │   ├── poller.ex       # GenServer: poll loop, SKIP LOCKED claim
+│       │   ├── executor.ex     # Task.Supervisor: run perform/1, handle results
+│       │   └── circuit_breaker.ex  # GenServer: failure rate, open/half_open/closed
+│       ├── scheduler/
+│       │   ├── cron.ex         # Cron expression parser and evaluator
+│       │   └── cron_scheduler.ex   # GenServer: evaluate registered workers per minute
+│       ├── plugins/
+│       │   ├── orphan_rescue.ex    # Periodic scan for stuck executing jobs
+│       │   ├── pruner.ex           # Periodic delete of terminal jobs past retention
+│       │   └── notify_listener.ex  # LISTEN on jobs_available channel
+│       ├── global_limiter.ex   # GenServer: global concurrency counter + waiting queue
+│       ├── rate_limiter.ex     # GenServer: per-worker rate limit (token bucket)
+│       └── telemetry.ex        # Event emission helpers
+├── test/
+│   ├── support/
+│   │   └── test_worker.ex
+│   ├── job_test.exs
+│   ├── poller_test.exs
+│   ├── orphan_rescue_test.exs
+│   ├── uniqueness_test.exs
+│   ├── cron_test.exs
+│   └── integration/
+│       ├── transactional_enqueue_test.exs
+│       ├── at_least_once_test.exs
+│       ├── concurrency_test.exs
+│       └── distributed_test.exs   # 3-node test
+└── bench/
+    └── throughput.exs
+```
 
-### 2. Worker Behaviour
+## Step 1 — Database migration
 
-Workers are Elixir modules that declare their configuration and implement a `perform/1` callback. A worker module must be able to specify: the target queue name, the maximum number of attempts before discarding, a custom backoff function, an execution timeout, and uniqueness constraints. The `perform/1` function receives the full job struct and returns `:ok`, `{:ok, result}`, `{:error, reason}`, or raises an exception. All of these outcomes must be handled correctly: non-ok results and exceptions must trigger the retry/discard logic; `:ok` and `{:ok, _}` must mark the job as completed. The worker module must expose a `new/2` function that builds a job changeset, and an `enqueue/2` function that persists it.
+```elixir
+# priv/repo/migrations/20240101000000_create_jobs.exs
+defmodule JobQueue.Repo.Migrations.CreateJobs do
+  use Ecto.Migration
 
-### 3. Multiple Named Queues with Per-Queue Concurrency
+  def change do
+    create table(:jobs) do
+      add :queue, :string, null: false
+      add :worker, :string, null: false
+      add :args, :map, null: false, default: %{}
+      add :meta, :map, null: false, default: %{}
+      add :state, :string, null: false, default: "available"
+      add :priority, :integer, null: false, default: 0
+      add :attempt, :integer, null: false, default: 0
+      add :max_attempts, :integer, null: false, default: 3
+      add :errors, {:array, :map}, null: false, default: []
+      add :scheduled_at, :utc_datetime_usec, null: false, default: fragment("now()")
+      add :attempted_at, :utc_datetime_usec
+      add :completed_at, :utc_datetime_usec
+      add :discarded_at, :utc_datetime_usec
+      add :cancelled_at, :utc_datetime_usec
+      add :attempted_by, {:array, :string}, null: false, default: []
+      add :unique_key, :string
+      add :depends_on, {:array, :bigint}, null: false, default: []
+      timestamps()
+    end
 
-The system supports arbitrarily named queues, each with an independent concurrency limit. The concurrency limit is the maximum number of simultaneously executing jobs in that queue across the entire node. Each queue is managed by a dedicated supervisor subtree. Changing a queue's concurrency limit at runtime — increasing or decreasing it — must take effect within one polling cycle without restarting the application. Removing a queue from the configuration must drain its in-flight jobs before the queue process tree shuts down.
+    # Poller query index: available/retryable jobs ordered by priority, scheduled_at
+    create index(:jobs, [:state, :queue, :priority, :scheduled_at],
+      where: "state IN ('available', 'retryable')")
 
-### 4. Scheduled Jobs
+    # Uniqueness: partial index covering non-terminal states
+    create unique_index(:jobs, [:unique_key],
+      where: "state IN ('available', 'scheduled', 'executing', 'retryable') AND unique_key IS NOT NULL")
 
-A job can be enqueued with a future `scheduled_at` timestamp. Jobs with `scheduled_at > now()` are in the `scheduled` state and must not be picked up by any worker until their scheduled time arrives. The system must support both absolute timestamps (`scheduled_at: datetime`) and relative offsets (`schedule_in: seconds`). Scheduled jobs must be cancellable before their scheduled time. The polling query must filter on `scheduled_at <= now()` to avoid fetching premature jobs.
+    # Orphan rescue: find executing jobs for heartbeat check
+    create index(:jobs, [:state, :attempted_at], where: "state = 'executing'")
 
-### 5. Recurring Cron Jobs
+    # Pruner: find old terminal jobs
+    create index(:jobs, [:state, :completed_at], where: "state = 'completed'")
 
-Workers may declare a cron expression and optional timezone. The scheduler evaluates all registered cron workers once per minute and enqueues jobs whose cron expression matches the current minute. The scheduler must use the uniqueness mechanism to prevent duplicate cron jobs from being enqueued on the same minute when multiple nodes are running. The cron scheduler must support standard five-field cron expressions and the shorthand aliases `@hourly`, `@daily`, `@weekly`, and `@monthly`. The scheduler must correctly handle DST transitions for timezone-aware expressions.
+    # Trigger for NOTIFY on insert
+    execute """
+    CREATE OR REPLACE FUNCTION notify_job_available() RETURNS trigger AS $$
+    BEGIN
+      PERFORM pg_notify('jobs_available', NEW.queue);
+      RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql;
+    """, "DROP FUNCTION IF EXISTS notify_job_available();"
 
-### 6. Retry with Exponential Backoff and Jitter
+    execute """
+    CREATE TRIGGER jobs_notify_insert
+      AFTER INSERT ON jobs
+      FOR EACH ROW
+      WHEN (NEW.state = 'available')
+      EXECUTE FUNCTION notify_job_available();
+    """, "DROP TRIGGER IF EXISTS jobs_notify_insert ON jobs;"
+  end
+end
+```
 
-When a job fails and has remaining attempts, it transitions to `retryable` and its `scheduled_at` is set to `now() + backoff(attempt)`. The default backoff function is `15 * 2^attempt` seconds. Workers may override the backoff function. All backoff values must include random jitter to prevent synchronized retry storms: the jitter must be drawn from a uniform distribution over ±20% of the computed backoff value. The `attempt` counter is incremented on each failure. When `attempt == max_attempts`, the job transitions to `discarded`. The `errors` array on the job must contain one entry per failed attempt.
+## Step 2 — Job schema and state machine
 
-### 7. Dead Letter Queue
+```elixir
+defmodule JobQueue.Job do
+  use Ecto.Schema
+  import Ecto.Changeset
 
-Discarded jobs — those that exhausted all retry attempts — are not deleted. They remain in the database in the `discarded` state with their complete error history. The system must provide a query interface to list discarded jobs filtered by worker, queue, time range, and error content. It must also provide a `retry_discarded/1` function that resets a discarded job's state back to `available` with a fresh attempt count, allowing manual intervention after a bug fix.
+  @states ~w(available scheduled executing completed retryable discarded cancelled)
+  @terminal_states ~w(completed discarded cancelled)
 
-### 8. Job Uniqueness
+  # Valid transitions:
+  # available → executing | cancelled
+  # scheduled → available | cancelled
+  # executing → completed | retryable | discarded
+  # retryable → executing | cancelled
+  # (terminal states are irreversible)
+  @transitions %{
+    "available" => ~w(executing cancelled),
+    "scheduled" => ~w(available cancelled),
+    "executing" => ~w(completed retryable discarded),
+    "retryable" => ~w(executing cancelled)
+  }
 
-Workers may declare uniqueness constraints via a `unique` option specifying a time window in seconds and the fields to include in the uniqueness key (any combination of: `args`, `queue`, `worker`, `meta`). The uniqueness key is a SHA-256 hash of the specified fields. If a job with the same uniqueness key exists in the `available`, `scheduled`, `executing`, or `retryable` states within the time window, the new insertion is rejected as a conflict and returns `{:ok, %Job{conflict: true, conflict_job_id: id}}` without inserting a duplicate. The uniqueness check and conditional insert must be atomic via a database-level unique index on the hash column with a partial index predicate covering only non-terminal states.
+  schema "jobs" do
+    field :queue, :string
+    field :worker, :string
+    field :args, :map, default: %{}
+    field :meta, :map, default: %{}
+    field :state, :string, default: "available"
+    field :priority, :integer, default: 0
+    field :attempt, :integer, default: 0
+    field :max_attempts, :integer, default: 3
+    field :errors, {:array, :map}, default: []
+    field :scheduled_at, :utc_datetime_usec
+    field :attempted_at, :utc_datetime_usec
+    field :completed_at, :utc_datetime_usec
+    field :discarded_at, :utc_datetime_usec
+    field :cancelled_at, :utc_datetime_usec
+    field :attempted_by, {:array, :string}, default: []
+    field :unique_key, :string
+    field :depends_on, {:array, :integer}, default: []
+    # Virtual: set when uniqueness conflict detected
+    field :conflict, :boolean, virtual: true, default: false
+    field :conflict_job_id, :integer, virtual: true
+    timestamps()
+  end
 
-### 9. Priority Within Queues
+  def new_changeset(attrs) do
+    %__MODULE__{}
+    |> cast(attrs, [:queue, :worker, :args, :meta, :priority, :max_attempts,
+                     :scheduled_at, :unique_key, :depends_on])
+    |> validate_required([:queue, :worker])
+    |> put_scheduled_at()
+    |> put_state()
+  end
 
-Each job has an integer priority field (lower value = higher priority). Within a queue, the polling query must order jobs by `(priority ASC, scheduled_at ASC)` so that high-priority jobs are always dequeued before lower-priority ones, regardless of insertion order. The default priority is `0`. Priority must be specifiable per job at enqueue time.
+  defp put_scheduled_at(changeset) do
+    if get_field(changeset, :scheduled_at) do
+      changeset
+    else
+      put_change(changeset, :scheduled_at, DateTime.utc_now())
+    end
+  end
 
-### 10. Orphan Rescue
+  defp put_state(changeset) do
+    scheduled_at = get_field(changeset, :scheduled_at)
+    state = if scheduled_at && DateTime.compare(scheduled_at, DateTime.utc_now()) == :gt,
+      do: "scheduled", else: "available"
+    put_change(changeset, :state, state)
+  end
 
-Jobs in the `executing` state that have not received a heartbeat update within a configurable `execution_timeout` window are considered orphaned (their worker process died without cleanly transitioning the job). A dedicated rescue process must periodically scan for orphaned jobs and return them to `available`, incrementing their attempt counter. The rescue interval and execution timeout must be configurable. The rescue process must use `FOR UPDATE SKIP LOCKED` to avoid conflicts with active workers claiming the same jobs simultaneously.
+  @doc "Validate that a state transition is allowed"
+  def validate_transition(job, new_state) do
+    allowed = Map.get(@transitions, job.state, [])
+    if new_state in allowed do
+      :ok
+    else
+      {:error, "Invalid transition: #{job.state} → #{new_state}"}
+    end
+  end
 
-### 11. Pruner
+  def terminal?(job), do: job.state in @terminal_states
+end
+```
 
-A periodic background process removes terminal jobs (`completed`, `discarded`, `cancelled`) that are older than configurable retention windows. Default retention: 7 days for `completed`, 30 days for `discarded`, and 7 days for `cancelled`. The pruner must process deletions in configurable batch sizes to avoid table lock contention. The pruner must emit telemetry events with the count of jobs deleted per state per run.
+## Step 3 — Worker behaviour
 
-### 12. LISTEN/NOTIFY Push Dispatch
+```elixir
+defmodule JobQueue.Worker do
+  @callback perform(job :: JobQueue.Job.t()) ::
+    :ok | {:ok, term()} | {:error, term()}
 
-When a job is inserted into the database, a PostgreSQL trigger fires `NOTIFY jobs_available, '<queue_name>'` on the `jobs_available` channel. The system maintains a dedicated PostgreSQL connection that listens on `jobs_available`. When a notification arrives for a queue, the corresponding queue process immediately polls for new jobs without waiting for the next scheduled polling interval. The polling interval remains as a fallback for missed notifications. The notification mechanism must not be a hard dependency: if the NOTIFY connection is lost, the system must continue functioning via polling alone until the connection is restored.
+  @doc """
+  Define a worker with configuration.
+  Usage:
+    use JobQueue.Worker,
+      queue: "default",
+      max_attempts: 5,
+      unique: [within: 60, fields: [:args, :worker]],
+      cron: "0 * * * *"
+  """
+  defmacro __using__(opts) do
+    quote do
+      @behaviour JobQueue.Worker
+      @worker_opts unquote(opts)
 
-### 13. Telemetry
+      def new(args, overrides \\ []) do
+        JobQueue.Worker.build_changeset(__MODULE__, args, @worker_opts, overrides)
+      end
 
-The system emits the following telemetry events with no exceptions:
+      def enqueue(args, overrides \\ []) do
+        new(args, overrides) |> JobQueue.Worker.insert(__MODULE__, @worker_opts)
+      end
+    end
+  end
 
-- `[:my_queue, :job, :start]` — when a worker begins executing a job; measurements: `system_time`; metadata: full job struct, queue name, worker module.
-- `[:my_queue, :job, :stop]` — when a job completes; measurements: `duration` (microseconds), `system_time`; metadata: full job struct, `result` (`:success` or `:failure`).
-- `[:my_queue, :job, :exception]` — when a job raises; measurements: `duration`, `system_time`; metadata: full job struct, `kind`, `reason`, `stacktrace`.
-- `[:my_queue, :queue, :poll]` — per polling cycle; measurements: `jobs_found`, `duration`; metadata: queue name.
-- `[:my_queue, :job, :rescued]` — when an orphan job is rescued; measurements: `count`; metadata: queue name.
-- `[:my_queue, :pruner, :run]` — per pruner run; measurements: `deleted_completed`, `deleted_discarded`, `deleted_cancelled`; metadata: `duration`.
-- `[:my_queue, :circuit_breaker, :trip]` and `[:my_queue, :circuit_breaker, :reset]` — when a circuit breaker opens or closes; metadata: queue name.
+  def build_changeset(module, args, opts, overrides) do
+    queue = Keyword.get(opts, :queue, "default")
+    max_attempts = Keyword.get(opts, :max_attempts, 3)
+    unique_key = compute_unique_key(module, args, opts)
+    scheduled_at = compute_scheduled_at(Keyword.merge(opts, overrides))
 
-### 14. Circuit Breaker per Queue
+    JobQueue.Job.new_changeset(%{
+      worker: to_string(module),
+      queue: queue,
+      args: args,
+      max_attempts: max_attempts,
+      unique_key: unique_key,
+      scheduled_at: scheduled_at
+    })
+  end
 
-Each queue has an associated circuit breaker that tracks the failure rate of jobs executed in that queue over a sliding window. If the failure rate exceeds a configurable threshold within the window, the circuit breaker trips and the queue stops polling for new jobs. When the circuit is open, the queue enters a half-open probe state after a configurable cooldown period and executes a single job as a probe; if the probe succeeds, the circuit closes and normal polling resumes. The circuit breaker state must be local to the node (not shared across the cluster) and must survive queue process restarts.
+  def insert(changeset, module, opts) do
+    unique_key = Ecto.Changeset.get_field(changeset, :unique_key)
 
-### 15. Graceful Drain on Shutdown
+    if unique_key && Keyword.has_key?(opts, :unique) do
+      # TODO: check for existing job with same unique_key in non-terminal state
+      # TODO: if exists: return {:ok, %Job{conflict: true, conflict_job_id: existing.id}}
+      # TODO: if not exists: insert normally
+      # HINT: use INSERT ... ON CONFLICT DO NOTHING with RETURNING, check if row was inserted
+      JobQueue.Repo.insert(changeset)
+    else
+      JobQueue.Repo.insert(changeset)
+    end
+  end
 
-When the application receives a shutdown signal, the job queue system must stop accepting new jobs from the poller and wait for all currently executing jobs to finish before allowing the BEAM to shut down. The drain timeout is configurable; if in-flight jobs do not complete within the timeout, they are abandoned (their database state is reset to `available` by the orphan rescue on the next startup) and shutdown proceeds. During drain, the queue supervisor must not accept new poll cycles.
+  defp compute_unique_key(_module, _args, opts) do
+    case Keyword.get(opts, :unique) do
+      nil -> nil
+      unique_opts ->
+        # TODO: hash selected fields into a stable key
+        # HINT: :crypto.hash(:sha256, :erlang.term_to_binary(sorted_fields)) |> Base.encode16()
+        nil
+    end
+  end
 
-### 16. Global Concurrency Limits
+  defp compute_scheduled_at(opts) do
+    cond do
+      schedule_in = Keyword.get(opts, :schedule_in) ->
+        DateTime.add(DateTime.utc_now(), schedule_in, :second)
+      at = Keyword.get(opts, :scheduled_at) ->
+        at
+      true ->
+        nil
+    end
+  end
+end
+```
 
-In addition to per-queue concurrency, the system supports a global concurrency limit that caps the total number of simultaneously executing jobs across all queues on a single node. This prevents a single node from being overwhelmed when many queues each have high concurrency settings. The global limit is checked before the per-queue limit; if the global slot is unavailable, the per-queue poller backs off until a slot is released. Global slots are managed by a dedicated GenServer with a counter and a waiting queue for pollers.
+## Step 4 — Poller
 
-### 17. Rate Limiting per Worker Type
+```elixir
+defmodule JobQueue.Queue.Poller do
+  use GenServer
+  require Logger
 
-Workers may declare a rate limit as a `{count, window}` tuple (e.g., `{100, :second}` or `{1000, :minute}`). The rate limiter enforces that at most `count` jobs of that worker type begin execution within any rolling `window` interval on the current node. Jobs that cannot start due to rate limiting are not discarded — they remain in `executing` state and are held in a local queue until the rate window allows them to proceed. The rate limiter state is node-local and must not require database access.
+  def start_link(opts) do
+    GenServer.start_link(__MODULE__, opts, name: via(opts[:queue]))
+  end
 
-### 18. Job Dependencies
+  def init(opts) do
+    state = %{
+      queue: opts[:queue],
+      concurrency: opts[:concurrency] || 10,
+      poll_interval: opts[:poll_interval] || 1_000,
+      executing: 0
+    }
+    schedule_poll(state.poll_interval)
+    {:ok, state}
+  end
 
-A job can declare that it depends on one or more other jobs by their IDs. A dependent job remains in the `scheduled` state until all its dependencies have transitioned to `completed`. If any dependency is `discarded` or `cancelled`, the dependent job is also cancelled and the cancellation reason includes the ID of the failed dependency. Dependency resolution is evaluated by a periodic process, not by triggers. Circular dependencies must be detected at enqueue time and rejected with a descriptive error.
+  def handle_info(:poll, state) do
+    available_slots = state.concurrency - state.executing
+    if available_slots > 0 do
+      jobs = claim_jobs(state.queue, available_slots)
+      new_executing = state.executing + length(jobs)
+      Enum.each(jobs, &JobQueue.Queue.Executor.execute/1)
+      schedule_poll(state.poll_interval)
+      {:noreply, %{state | executing: new_executing}}
+    else
+      schedule_poll(state.poll_interval)
+      {:noreply, state}
+    end
+  end
 
-### 19. Distributed Execution across BEAM Cluster
+  def handle_info({:job_done, _job_id}, state) do
+    {:noreply, %{state | executing: state.executing - 1}}
+  end
 
-When multiple nodes in a connected BEAM cluster run the same job queue system, they cooperate transparently: each node independently polls PostgreSQL using `FOR UPDATE SKIP LOCKED`, ensuring that no job is executed on more than one node simultaneously. The cron scheduler uses job uniqueness to avoid duplicate cron insertions. The circuit breaker is node-local. Global concurrency limits are node-local (not cluster-wide, unless the Stretch Goals section is implemented). Each node's queue configuration is independent and may differ in concurrency settings.
+  def handle_cast(:notify, state) do
+    # Immediate poll triggered by LISTEN/NOTIFY
+    send(self(), :poll)
+    {:noreply, state}
+  end
 
-## Acceptance Criteria
+  defp claim_jobs(queue, limit) do
+    # TODO: use FOR UPDATE SKIP LOCKED to atomically claim jobs
+    # SQL:
+    #   UPDATE jobs SET state = 'executing', attempted_at = now(),
+    #          attempted_by = array_append(attempted_by, $node)
+    #   WHERE id IN (
+    #     SELECT id FROM jobs
+    #     WHERE state IN ('available', 'retryable')
+    #       AND queue = $queue
+    #       AND scheduled_at <= now()
+    #     ORDER BY priority ASC, scheduled_at ASC
+    #     LIMIT $limit
+    #     FOR UPDATE SKIP LOCKED
+    #   )
+    #   RETURNING *
+    []
+  end
 
-- [ ] **Transactional enqueue**: a job inserted inside a `Repo.transaction/1` block that is explicitly rolled back does not appear in the `jobs` table; a job inserted in a transaction that commits is immediately queryable; this is verified by an integration test that rolls back and commits transactions and asserts job presence accordingly.
-- [ ] **State machine completeness**: the system correctly handles all valid state transitions; invalid transitions (e.g., `completed → executing`) are rejected with a descriptive error; every terminal state (`completed`, `discarded`, `cancelled`) is irreversible.
-- [ ] **At-least-once delivery**: a node crash simulated by `Process.exit(pid, :kill)` against the worker process during job execution causes the job to be recovered by the orphan rescue and eventually completed on the next execution attempt; verified by an integration test that asserts the job reaches `completed` state despite the mid-execution crash.
-- [ ] **Per-queue concurrency**: a queue with concurrency limit `N` never executes more than `N` jobs simultaneously; verified by a test that enqueues `3N` jobs with artificial 500 ms sleep and asserts via telemetry that the peak concurrent execution count never exceeds `N`.
-- [ ] **Scheduled jobs**: a job with `scheduled_at = now() + 5s` is not executed before its scheduled time; it is executed within 2 seconds of its scheduled time under normal polling load.
-- [ ] **Cron deduplication**: with 3 nodes running the cron scheduler simultaneously, a worker with `cron: "* * * * *"` produces exactly one job insertion per minute — verified over a 5-minute integration test window with a counter assertion.
-- [ ] **Backoff and jitter**: a job that fails 3 times before succeeding has `scheduled_at` values that are monotonically increasing and follow the exponential backoff formula within the ±20% jitter tolerance; the `errors` array contains exactly 3 entries after the third failure.
-- [ ] **Uniqueness enforcement**: inserting a job with uniqueness constraints when a conflicting job exists in a non-terminal state returns `{:ok, %Job{conflict: true}}` without inserting a new row; inserting the same job after the original reaches `completed` state succeeds and inserts a new row.
-- [ ] **Priority ordering**: with 100 jobs of priority `0` and 10 jobs of priority `-1` enqueued simultaneously against a queue with concurrency `1`, the 10 high-priority jobs are the first 10 to begin execution — verified by recording `attempted_at` timestamps.
-- [ ] **Orphan rescue**: setting `execution_timeout: 2s` and then killing a worker process without updating the job state causes the job to appear back in `available` state within one rescue cycle; the `attempt` counter is incremented.
-- [ ] **Dead letter**: a job with `max_attempts: 3` that fails every attempt reaches `discarded` state with 3 entries in the `errors` array; `retry_discarded/1` resets it to `available` with `attempt: 0`; the job then executes and completes successfully.
-- [ ] **Pruner correctness**: completed jobs older than the retention window are deleted; completed jobs within the retention window are preserved; the pruner telemetry event reports the exact number of deleted jobs.
-- [ ] **LISTEN/NOTIFY latency**: inserting a job while a subscriber is listening on the `jobs_available` channel causes the corresponding queue poller to activate within 100 ms; the end-to-end latency from `Repo.insert!/1` to `perform/1` invocation is under 200 ms on a local PostgreSQL instance.
-- [ ] **Telemetry completeness**: attaching a handler for all specified events and running a full job lifecycle (enqueue → execute → complete) produces exactly the events specified in Core Requirements §13, with correct measurements and metadata on each event.
-- [ ] **Circuit breaker**: a queue with a circuit breaker threshold of 80% failure rate trips after enough consecutive failures; while open, no new jobs are polled from that queue; the circuit enters half-open after the cooldown and resumes normal operation after a successful probe job.
-- [ ] **Graceful drain**: calling the drain function with `timeout: 5000` while 5 jobs with 200 ms sleep are executing allows all 5 to complete before returning; no job is left in `executing` state after a clean drain.
-- [ ] **Global concurrency**: with a global limit of 10 and 3 queues each with concurrency 10, the system never exceeds 10 simultaneous executions across all queues; excess pollers block without error and resume when global slots are freed.
-- [ ] **Rate limiting**: a worker with `rate_limit: {5, :second}` never starts more than 5 executions per second on a single node — verified by recording `start` telemetry event timestamps and asserting the rate constraint holds across a 10-second test window.
-- [ ] **Job dependencies**: a dependent job with `depends_on: [job_a_id, job_b_id]` remains in `scheduled` state until both dependencies reach `completed`; if `job_a_id` is discarded, the dependent job transitions to `cancelled` with the dependency ID in its cancellation metadata.
-- [ ] **Distributed correctness**: with 3 BEAM nodes polling the same PostgreSQL database and 1000 jobs enqueued, every job is executed exactly once — verified by storing execution records in a separate table and asserting no duplicates and no missing entries after all jobs complete.
-- [ ] **Throughput baseline**: on a local PostgreSQL instance with a single BEAM node, the system sustains at least 500 job completions per second for jobs whose `perform/1` is a no-op — measured over a 30-second sustained run with a queue concurrency of 50.
-- [ ] **Recovery time**: after a full node crash (simulated by `System.stop/1`) with 20 jobs in `executing` state, restarting the node and allowing one orphan rescue cycle returns all 20 jobs to `available` within the `execution_timeout + rescue_interval` bound.
+  defp via(queue_name), do: {:via, Registry, {JobQueue.Registry, {__MODULE__, queue_name}}}
+  defp schedule_poll(interval), do: Process.send_after(self(), :poll, interval)
+end
+```
 
-## Constraints & Rules
+## Step 5 — Orphan rescue
 
-- PostgreSQL is the only allowed persistence and coordination mechanism. Redis, Mnesia, external message brokers, and ETS-based distributed state are not permitted as substitutes for database-level coordination.
-- `SELECT ... FOR UPDATE SKIP LOCKED` is mandatory for job claiming. Advisory locks, application-level mutexes, and optimistic locking are not acceptable alternatives for the claim step.
-- The `Postgrex` library is the only allowed PostgreSQL client. `Ecto` may wrap it. No other database libraries are permitted.
-- Worker `perform/1` functions must run inside `Task.Supervisor`-supervised tasks. Unsupervised tasks that crash silently are a correctness violation.
-- The system must start cleanly under an OTP application supervisor tree. All stateful processes must be linked to supervisors with appropriate restart strategies. An uncaught crash in any single queue must not bring down other queues.
-- No global mutable state outside of PostgreSQL and ETS is permitted. GenServer-based mutable state is allowed only for node-local concerns (rate limiting, circuit breaker, global slot counter).
-- All database operations that modify job state must use transactions or atomic SQL constructs. Multi-step operations that are not atomic are a correctness bug.
-- The public API surface must be minimal: `enqueue/2`, `cancel_job/1`, `retry_discarded/1`, `drain_queue/2`, `get_job/1`, `list_jobs/1`. No additional public functions unless required by the acceptance criteria.
-- All time-based tests must use deterministic time injection (a configurable time source) rather than `Process.sleep` for synchronization. Tests that rely on wall-clock timing with fixed sleeps are not acceptable.
+```elixir
+defmodule JobQueue.Plugins.OrphanRescue do
+  use GenServer
+  require Logger
 
-## Stretch Goals
+  @default_interval_ms 60_000
+  @default_timeout_ms 300_000  # 5 minutes
 
-These are not required for passing evaluation but demonstrate mastery at the system design level.
+  def start_link(opts \\ []) do
+    GenServer.start_link(__MODULE__, opts)
+  end
 
-- **Cluster-wide global concurrency**: extend the global concurrency mechanism to be enforced across all nodes in the cluster using a distributed counter backed by a PostgreSQL row with `FOR UPDATE` — each node holds a lease for a subset of global slots and checks in periodically.
-- **Job batching**: a worker may declare `batch_size: N`, causing the poller to fetch up to N jobs and deliver them as a list to a single `perform_batch/1` call — reducing database round-trips for high-throughput workers.
-- **Pause and resume queues**: implement `pause_queue/1` and `resume_queue/1` that stop and restart polling for a specific queue without dropping in-flight jobs or altering any job state in the database.
-- **Web dashboard**: a LiveView-based dashboard that shows live queue depths, execution rates, error rates, circuit breaker states, and a paginated job browser with filtering by state, worker, queue, and time range — all data sourced from telemetry events and direct database queries.
-- **Job result storage**: allow jobs to store a result value in the database upon completion — a JSONB `result` column populated by the return value of `perform/1` — and expose `get_result/1` for retrieval.
-- **Encrypted job args**: at-rest encryption of the `args` JSONB column using a configurable key, with transparent decryption at the worker level — preventing sensitive data in job arguments from being readable in database backups.
-- **Flow control back-pressure**: when the global concurrency limit is saturated, the poller must use exponential backoff on its polling interval (up to a configurable maximum) rather than spinning at the base interval — reducing unnecessary database load under saturation.
+  def init(opts) do
+    interval = Keyword.get(opts, :interval, @default_interval_ms)
+    timeout = Keyword.get(opts, :execution_timeout, @default_timeout_ms)
+    schedule_rescue(interval)
+    {:ok, %{interval: interval, execution_timeout: timeout}}
+  end
 
-## Evaluation Criteria
+  def handle_info(:rescue, state) do
+    cutoff = DateTime.add(DateTime.utc_now(), -state.execution_timeout, :millisecond)
+    rescued = rescue_orphans(cutoff)
+    :telemetry.execute([:job_queue, :job, :rescued], %{count: rescued}, %{})
+    Logger.info("Orphan rescue: recovered #{rescued} jobs")
+    schedule_rescue(state.interval)
+    {:noreply, state}
+  end
 
-Submissions are evaluated across five dimensions. Each must be demonstrated through the acceptance criteria tests.
+  defp rescue_orphans(cutoff) do
+    # TODO: SQL:
+    #   UPDATE jobs SET
+    #     state = CASE WHEN attempt >= max_attempts THEN 'discarded' ELSE 'retryable' END,
+    #     attempt = attempt + 1,
+    #     scheduled_at = now() + (backoff_seconds || ' seconds')::interval,
+    #     errors = errors || jsonb_build_array(jsonb_build_object(
+    #       'at', now(), 'error', 'orphan_rescue: worker died'
+    #     ))
+    #   WHERE state = 'executing'
+    #     AND attempted_at < $cutoff
+    #   FOR UPDATE SKIP LOCKED
+    #   RETURNING id
+    0
+  end
 
-**Correctness under failure (40%)**: The primary evaluation dimension. Every at-least-once guarantee, every state transition invariant, every concurrency boundary, and every orphan rescue scenario must be verifiable by a test. Correctness deficiencies are disqualifying: a system that occasionally loses jobs or executes them twice is not a job queue, regardless of how polished the rest of the implementation is.
+  defp schedule_rescue(interval), do: Process.send_after(self(), :rescue, interval)
+end
+```
 
-**Architecture and OTP design (25%)**: The supervision tree must be well-structured with appropriate restart strategies. No single point of failure outside PostgreSQL. Process naming, registry use, and DynamicSupervisor patterns must be idiomatic OTP. The separation between the queue machinery (infrastructure) and the worker API (domain) must be clean, with no leaking abstractions.
+## Given tests
 
-**Observability (15%)**: All telemetry events must be present, correctly named, and carry accurate measurements and metadata. The system must be instrumentable without modifying source code. Telemetry events must be emitted for all failure paths, not just happy paths. Log output at critical transitions (circuit breaker trips, orphan rescue, drain completion) must include structured metadata.
+```elixir
+# test/integration/transactional_enqueue_test.exs
+defmodule JobQueue.Integration.TransactionalEnqueueTest do
+  use ExUnit.Case, async: false
 
-**Performance and throughput (10%)**: The 500 jobs/second no-op baseline must be achieved and sustained. The LISTEN/NOTIFY path must deliver the sub-200 ms end-to-end latency. Database query plans for the poller query must use the composite index without sequential scans — verified with `EXPLAIN ANALYZE` output included in the submission.
+  defmodule TestWorker do
+    use JobQueue.Worker, queue: "test"
+    def perform(_job), do: :ok
+  end
 
-**Test quality (10%)**: Tests must cover the failure scenarios described in the acceptance criteria, not just the happy path. Property-based tests or fuzzing for the uniqueness and conflict resolution logic are expected. Integration tests must use real PostgreSQL (not mocks) for all acceptance criteria involving database state. The test suite must be runnable with a single command and must pass without flakiness on three consecutive runs.
+  test "job does not exist when transaction rolls back" do
+    result = JobQueue.Repo.transaction(fn ->
+      {:ok, job} = TestWorker.enqueue(%{value: 1})
+      JobQueue.Repo.rollback(:intentional)
+      job
+    end)
+    assert {:error, :intentional} = result
+    # No job should exist
+    assert JobQueue.Repo.aggregate(JobQueue.Job, :count) == 0
+  end
+
+  test "job exists when transaction commits" do
+    {:ok, job} = JobQueue.Repo.transaction(fn ->
+      {:ok, j} = TestWorker.enqueue(%{value: 2})
+      j
+    end)
+    assert JobQueue.Repo.get(JobQueue.Job, job.id) != nil
+  end
+end
+
+# test/integration/at_least_once_test.exs
+defmodule JobQueue.Integration.AtLeastOnceTest do
+  use ExUnit.Case, async: false
+  @tag timeout: 30_000
+
+  defmodule CrashWorker do
+    use JobQueue.Worker, queue: "crash-test", max_attempts: 3
+    def perform(job) do
+      if job.attempt == 0 do
+        # Simulate crash by killing the executor task
+        Process.exit(self(), :kill)
+      end
+      :ok
+    end
+  end
+
+  test "job is recovered and completed after worker crash" do
+    {:ok, job} = CrashWorker.enqueue(%{})
+    # Wait for orphan rescue to recover and retry
+    assert_job_state(job.id, "completed", timeout: 20_000)
+  end
+
+  defp assert_job_state(job_id, state, opts) do
+    timeout = Keyword.get(opts, :timeout, 5_000)
+    deadline = System.monotonic_time(:millisecond) + timeout
+    wait_for_state(job_id, state, deadline)
+  end
+
+  defp wait_for_state(job_id, state, deadline) do
+    if System.monotonic_time(:millisecond) > deadline do
+      flunk("Job #{job_id} did not reach state #{state}")
+    end
+    job = JobQueue.Repo.get!(JobQueue.Job, job_id)
+    if job.state == state do
+      :ok
+    else
+      Process.sleep(100)
+      wait_for_state(job_id, state, deadline)
+    end
+  end
+end
+
+# test/integration/concurrency_test.exs
+defmodule JobQueue.Integration.ConcurrencyTest do
+  use ExUnit.Case, async: false
+  @tag timeout: 30_000
+
+  defmodule SlowWorker do
+    use JobQueue.Worker, queue: "slow-test"
+    def perform(_job), do: Process.sleep(500)
+  end
+
+  test "queue never exceeds concurrency limit" do
+    concurrency = 3
+    n = concurrency * 3  # 9 jobs
+
+    peak_concurrent = Agent.start_link(fn -> 0 end) |> elem(1)
+    current = Agent.start_link(fn -> 0 end) |> elem(1)
+
+    :telemetry.attach("concurrency-test", [:job_queue, :job, :start], fn _, _, meta, _ ->
+      c = Agent.get_and_update(current, fn c -> {c + 1, c + 1} end)
+      Agent.update(peak_concurrent, fn peak -> max(peak, c) end)
+    end, nil)
+
+    :telemetry.attach("concurrency-test-stop", [:job_queue, :job, :stop], fn _, _, _, _ ->
+      Agent.update(current, fn c -> c - 1 end)
+    end, nil)
+
+    for _ <- 1..n, do: SlowWorker.enqueue(%{})
+
+    # Wait for all jobs to complete
+    Process.sleep(5_000)
+
+    peak = Agent.get(peak_concurrent, & &1)
+    assert peak <= concurrency, "Peak concurrent #{peak} exceeded limit #{concurrency}"
+
+    :telemetry.detach("concurrency-test")
+    :telemetry.detach("concurrency-test-stop")
+  end
+end
+
+# test/uniqueness_test.exs
+defmodule JobQueue.UniquenessTest do
+  use ExUnit.Case, async: false
+
+  defmodule UniqueWorker do
+    use JobQueue.Worker,
+      queue: "unique-test",
+      unique: [within: 60, fields: [:args, :worker]]
+    def perform(_job), do: :ok
+  end
+
+  test "duplicate enqueue returns conflict without inserting" do
+    {:ok, job1} = UniqueWorker.enqueue(%{task_id: "abc"})
+    {:ok, job2} = UniqueWorker.enqueue(%{task_id: "abc"})
+
+    assert job2.conflict == true
+    assert job2.conflict_job_id == job1.id
+    assert JobQueue.Repo.aggregate(JobQueue.Job, :count) == 1
+  end
+
+  test "same args after completion can be enqueued again" do
+    {:ok, job} = UniqueWorker.enqueue(%{task_id: "xyz"})
+    # Mark job as completed
+    job |> Ecto.Changeset.change(state: "completed") |> JobQueue.Repo.update!()
+    {:ok, job2} = UniqueWorker.enqueue(%{task_id: "xyz"})
+    refute job2.conflict
+    assert job2.id != job.id
+  end
+end
+```
+
+## Benchmark
+
+```elixir
+# bench/throughput.exs
+defmodule JobQueue.Bench.Throughput do
+  @duration_s 30
+  @concurrency 50
+
+  defmodule NoopWorker do
+    use JobQueue.Worker, queue: "bench"
+    def perform(_job), do: :ok
+  end
+
+  def run do
+    # Ensure queue is started with target concurrency
+    # Pre-insert jobs
+    count = @concurrency * @duration_s * 2  # 2× to ensure queue is never starved
+    IO.puts("Pre-inserting #{count} noop jobs...")
+    for _ <- 1..count, do: NoopWorker.enqueue(%{})
+
+    completed = Agent.start_link(fn -> 0 end) |> elem(1)
+    :telemetry.attach("bench-complete", [:job_queue, :job, :stop], fn _, _, _, _ ->
+      Agent.update(completed, &(&1 + 1))
+    end, nil)
+
+    start = System.monotonic_time(:millisecond)
+    Process.sleep(@duration_s * 1000)
+    elapsed_s = (System.monotonic_time(:millisecond) - start) / 1000.0
+
+    total = Agent.get(completed, & &1)
+    throughput = total / elapsed_s
+
+    IO.puts("Completed: #{total} jobs in #{Float.round(elapsed_s, 1)}s")
+    IO.puts("Throughput: #{Float.round(throughput, 0)} jobs/s")
+    IO.puts("Target:     500 jobs/s")
+    IO.puts("Pass:       #{if throughput >= 500, do: "YES", else: "NO"}")
+    :telemetry.detach("bench-complete")
+  end
+end
+
+JobQueue.Bench.Throughput.run()
+```
+
+## Trade-offs
+
+| Design | Selected | Alternative | Trade-off |
+|---|---|---|---|
+| Claim mechanism | `FOR UPDATE SKIP LOCKED` | Advisory locks / Redis | Advisory locks: manual cleanup on crash; Redis: not transactional with business data |
+| Uniqueness | DB unique index on hash | Application-level check | Application check: race condition window; DB index: atomic by construction |
+| Dispatch trigger | PostgreSQL NOTIFY | HTTP callback / in-memory | HTTP: couples services; in-memory: lost on restart; NOTIFY: native, zero extra infrastructure |
+| Orphan detection | Periodic scan with `attempted_at` | Process monitors | Monitors: instant but cross-node monitors can miss network partitions; scan: always correct |
+| Backoff jitter | ±20% uniform random | Fixed exponential | Fixed: retry storms when many jobs fail simultaneously; jitter: desynchronizes retries |
+| Global concurrency | Node-local counter GenServer | Cluster-wide DB counter | DB counter: correct across nodes; local counter: simpler, sufficient for most deployments |
+
+## Production mistakes
+
+**Not indexing on `(state, queue, priority, scheduled_at)`.** A full table scan on 10 million jobs at 500ms poll interval is catastrophic. The poller's `SELECT ... FOR UPDATE SKIP LOCKED` must use the partial index. Run `EXPLAIN ANALYZE` on the claim query in your test environment with `SET enable_seqscan = off` disabled to verify the index is used.
+
+**Inserting jobs outside a transaction alongside business data.** `Repo.insert!(job)` and `Repo.update!(order, state: "confirmed")` in sequence without a transaction has a window where the order is confirmed but the job does not exist (if the process crashes between the two). Always use `Ecto.Multi` or `Repo.transaction/1` to wrap both operations.
+
+**Not guarding `perform/1` timeout.** A job that hangs indefinitely holds the worker's `Task.Supervisor` slot. Set a `timeout` option on the `Task.async` that runs `perform/1`. On timeout, send `{:error, :timeout}` back and the job enters `retryable`. Without this, one hung job can starve the queue.
+
+**Cron scheduler running on all nodes without deduplication.** Three nodes, each running a cron scheduler, each inserting a job for the same minute = three copies of the same job. The uniqueness constraint must include the cron expression and the truncated minute timestamp as the unique key. All three inserts compete for the unique index; only one wins.
+
+**TTL on unique_key not matching the unique window.** If a job's `unique` window is 60 seconds but the job can stay in `executing` state for 10 minutes (due to a slow worker), a second enqueue within the unique window is correctly blocked. But after the window expires, a third enqueue is allowed — even if the original job is still running. This is correct per spec but may surprise callers. Document that `unique` is a window from insertion time, not from completion time.
+
+## Resources
+
+- Oban documentation — https://hexdocs.pm/oban/ (Elixir reference implementation; study design rationale)
+- PostgreSQL `SELECT FOR UPDATE` — https://www.postgresql.org/docs/current/sql-select.html#SQL-FOR-UPDATE-SHARE
+- PostgreSQL LISTEN/NOTIFY — https://www.postgresql.org/docs/current/sql-notify.html
+- Ecto.Multi documentation — https://hexdocs.pm/ecto/Ecto.Multi.html
+- Postgrex.Notifications module — https://hexdocs.pm/postgrex/Postgrex.Notifications.html
+- Ongaro & Ousterhout — "In Search of an Understandable Consensus Algorithm" (2014) (background on distributed job coordination)
