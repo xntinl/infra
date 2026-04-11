@@ -210,6 +210,7 @@
   },
   "active": "80db5d002a546a52",
   "lastOpenFiles": [
+    "challenges/elixir/03-avanzado/71-rate-limiter-ets/71-rate-limiter-ets.md",
     "challenges/elixir/03-avanzado/71-rate-limiter-ets/71-rate-limiter-ets.en.md",
     "challenges/elixir/03-avanzado/71-rate-limiter-ets/71-rate-limiter-ets.es.md",
     "challenges/elixir/03-avanzado/71-rate-limiter-ets",
@@ -245,7 +246,6 @@
     "Claude code/Mejoras.md",
     "Run code.md",
     "challenges/advanced-topics/12-type-theory-and-fp/01-type-inference-and-hindley-milner/01-type-inference-and-hindley-milner.md",
-    "challenges/elixir/03-avanzado/20-ets-counter-and-atomics/20-ets-counter-and-atomics.md",
     "Presentacion/poc-just/web/node_modules/ordered-binary/assets/powers-dre.png",
     "Presentacion/poc-just/web/node_modules/retry/equation.gif",
     "Untitled.canvas"

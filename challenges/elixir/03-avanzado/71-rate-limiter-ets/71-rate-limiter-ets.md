@@ -1,7 +1,5 @@
 # Rate Limiter with ETS and Sliding Window
 
-**Difficulty**: ★★★★☆
-**Estimated time**: 4–6 hours
 **Project**: `api_gateway` — built incrementally across the advanced level
 
 ---
