@@ -17,11 +17,11 @@ schemia/
 │       ├── application.ex           # REPL supervisor
 │       ├── lexer.ex                 # tokenizes source: symbols, numbers, strings, parens
 │       ├── parser.ex                # token list → nested Elixir lists (s-expressions)
-│       ├── evaluator.ex             # eval/2: expressions × environments → values
+│       ├── evaluator.ex             # eval/2: expressions x environments → values
 │       ├── environment.ex           # lexical scope: linked chain of maps
 │       ├── special_forms.ex         # define, lambda, if, begin, let, let*, letrec, cond, quote
 │       ├── stdlib.ex                # built-in procedures: arithmetic, list ops, predicates
-│       ├── tco.ex                   # trampoline: {:tail_call, thunk} → loop
+│       ├── tco.ex                   # trampoline: {:tail_call, expr, env} → loop
 │       └── repl.ex                  # read-eval-print loop with multi-line support
 ├── test/
 │   └── schemia/
@@ -39,19 +39,19 @@ schemia/
 
 ## The problem
 
-A Lisp interpreter appears simple: an evaluator is just `eval(expr, env)` applied recursively. The hard part is that Lisp programs are naturally tail-recursive — `(define (loop n) (loop (+ n 1)))` is perfectly valid and must run forever without growing the call stack. The BEAM supports tail calls between Elixir functions but not across the recursive `eval/2` calls inside the interpreter. Without an explicit trampolining mechanism, `(fact 1000000 1)` overflows the BEAM process stack at roughly 10k–50k recursive evaluator calls.
+A Lisp interpreter appears simple: an evaluator is just `eval(expr, env)` applied recursively. The hard part is that Lisp programs are naturally tail-recursive — `(define (loop n) (loop (+ n 1)))` is perfectly valid and must run forever without growing the call stack. The BEAM supports tail calls between Elixir functions but not across the recursive `eval/2` calls inside the interpreter. Without an explicit trampolining mechanism, `(fact 1000000 1)` overflows the BEAM process stack.
 
 ---
 
 ## Why this design
 
-**Lexical environments as linked maps**: an environment is `%{bindings: map, parent: env | nil}`. Symbol lookup walks the chain from child to parent. `define` adds to the current frame; `set!` mutates the frame that owns the binding. This exactly models Scheme's environment semantics with no global mutation.
+**Lexical environments as linked maps**: an environment is `%{bindings: map, parent: env | nil}`. Symbol lookup walks the chain from child to parent. `define` adds to the current frame; `set!` mutates the frame that owns the binding.
 
-**Trampoline for TCO**: instead of calling `eval/2` directly in tail position, the evaluator returns `{:tail_call, expr, env}`. The `tco.ex` trampoline loops until it gets a non-thunk value. This converts the recursive interpreter call stack into a heap-allocated loop — `(fact 1000000 1)` becomes 1 million iterations of the trampoline, not 1 million stack frames.
+**Trampoline for TCO**: instead of calling `eval/2` directly in tail position, the evaluator returns `{:tail_call, expr, env}`. The trampoline loops until it gets a non-thunk value. This converts the recursive interpreter call stack into a heap-allocated loop.
 
-**Homoiconicity via Elixir data structures**: Lisp code and data share the same representation. A parsed s-expression `(+ 1 2)` is the Elixir list `[:+, 1, 2]`. `quote` returns the unevaluated list directly. This means `eval` is just a pattern match on Elixir terms.
+**Homoiconicity via Elixir data structures**: Lisp code and data share the same representation. A parsed s-expression `(+ 1 2)` is the Elixir list `[:+, 1, 2]`. `quote` returns the unevaluated list directly.
 
-**REPL with paren-balance detection**: a single readline does not make a complete expression if parentheses are unbalanced. The REPL counts open/close parens and continues reading lines until the expression is balanced before calling the parser.
+**REPL with paren-balance detection**: a single readline does not make a complete expression if parentheses are unbalanced. The REPL counts open/close parens and continues reading lines until balanced.
 
 ---
 
@@ -81,25 +81,71 @@ end
 # lib/schemia/lexer.ex
 defmodule Schemia.Lexer do
   @moduledoc """
-  Tokenizes Scheme source text.
-
-  Token types:
-    {:lparen, line}
-    {:rparen, line}
-    {:symbol, name, line}
-    {:integer, n, line}
-    {:float, f, line}
-    {:string, s, line}       -- with \" and \\ escape sequences resolved
-    {:bool, true | false, line}
-    {:quote_shorthand, line} -- the ' character
+  Tokenizes Scheme source text into a list of tokens.
   """
 
+  @doc "Tokenizes source code. Returns {:ok, tokens} or {:error, message}."
+  @spec tokenize(String.t()) :: {:ok, [tuple()]} | {:error, String.t()}
   def tokenize(source) when is_binary(source) do
-    # TODO: walk source character by character, accumulate tokens
-    # HINT: use a recursive helper with (chars, line, acc)
-    # HINT: skip whitespace and ; line comments
-    # HINT: string parsing must handle \" and \\
-    # HINT: numbers are tried first; if :float.parse fails, try integer; else it is a symbol
+    chars = String.to_charlist(source)
+    {:ok, do_tokenize(chars, 1, [])}
+  end
+
+  defp do_tokenize([], _line, acc), do: Enum.reverse(acc)
+
+  defp do_tokenize([?\n | rest], line, acc), do: do_tokenize(rest, line + 1, acc)
+  defp do_tokenize([c | rest], line, acc) when c in [?\s, ?\t, ?\r], do: do_tokenize(rest, line, acc)
+
+  defp do_tokenize([?; | rest], line, acc) do
+    remaining = Enum.drop_while(rest, &(&1 != ?\n))
+    do_tokenize(remaining, line, acc)
+  end
+
+  defp do_tokenize([?( | rest], line, acc), do: do_tokenize(rest, line, [{:lparen, line} | acc])
+  defp do_tokenize([?) | rest], line, acc), do: do_tokenize(rest, line, [{:rparen, line} | acc])
+  defp do_tokenize([?' | rest], line, acc), do: do_tokenize(rest, line, [{:quote_shorthand, line} | acc])
+
+  defp do_tokenize([?" | rest], line, acc) do
+    {str, remaining, new_line} = read_string(rest, line, [])
+    do_tokenize(remaining, new_line, [{:string, List.to_string(str), line} | acc])
+  end
+
+  defp do_tokenize([?# , ?t | rest], line, acc), do: do_tokenize(rest, line, [{:bool, true, line} | acc])
+  defp do_tokenize([?# , ?f | rest], line, acc), do: do_tokenize(rest, line, [{:bool, false, line} | acc])
+
+  defp do_tokenize([c | _] = chars, line, acc) when c in ?0..?9 or (c == ?- and length(chars) > 1) do
+    {token_chars, remaining} = read_number_or_symbol(chars)
+    token_str = List.to_string(token_chars)
+
+    token =
+      case Integer.parse(token_str) do
+        {n, ""} -> {:integer, n, line}
+        _ ->
+          case Float.parse(token_str) do
+            {f, ""} -> {:float, f, line}
+            _ -> {:symbol, token_str, line}
+          end
+      end
+
+    do_tokenize(remaining, line, [token | acc])
+  end
+
+  defp do_tokenize([c | _] = chars, line, acc) when c not in [?(, ?), ?\s, ?\t, ?\n, ?\r] do
+    {sym_chars, remaining} = Enum.split_while(chars, &(&1 not in [?(, ?), ?\s, ?\t, ?\n, ?\r, ?;]))
+    name = List.to_string(sym_chars)
+    do_tokenize(remaining, line, [{:symbol, name, line} | acc])
+  end
+
+  defp read_string([], line, acc), do: {Enum.reverse(acc), [], line}
+  defp read_string([?" | rest], line, acc), do: {Enum.reverse(acc), rest, line}
+  defp read_string([?\\, ?" | rest], line, acc), do: read_string(rest, line, [?" | acc])
+  defp read_string([?\\, ?\\ | rest], line, acc), do: read_string(rest, line, [?\\ | acc])
+  defp read_string([?\\, ?n | rest], line, acc), do: read_string(rest, line, [?\n | acc])
+  defp read_string([?\n | rest], line, acc), do: read_string(rest, line + 1, [?\n | acc])
+  defp read_string([c | rest], line, acc), do: read_string(rest, line, [c | acc])
+
+  defp read_number_or_symbol(chars) do
+    Enum.split_while(chars, &(&1 not in [?(, ?), ?\s, ?\t, ?\n, ?\r, ?;]))
   end
 end
 ```
@@ -111,24 +157,55 @@ end
 defmodule Schemia.Parser do
   @moduledoc """
   Converts a flat token list to nested Elixir structures representing s-expressions.
-
-  Scheme → Elixir:
-    ()       → []
-    (a b c)  → [:a, :b, :c]
-    (a (b c) d) → [:a, [:b, :c], :d]
-    'expr    → [:quote, expr]
-    42       → 42
-    "hi"     → "hi"
-    #t       → true
-    #f       → false
   """
 
-  @doc "Returns {:ok, [expr]} or {:error, {line, message}}."
+  @doc "Parses tokens into a list of expressions."
+  @spec parse([tuple()]) :: {:ok, [term()]} | {:error, {integer(), String.t()}}
   def parse(tokens) do
-    # TODO: recursive descent; read_expr consumes tokens and returns {expr, remaining_tokens}
-    # TODO: {:lparen, _} → consume until matching :rparen, collecting sub-expressions
-    # TODO: {:quote_shorthand, _} → wrap next expression in [:quote, expr]
-    # TODO: mismatched parens → {:error, {line, "unexpected )"}} or "unexpected EOF"
+    {exprs, remaining} = parse_all(tokens, [])
+
+    case remaining do
+      [] -> {:ok, Enum.reverse(exprs)}
+      [{:rparen, line} | _] -> {:error, {line, "unexpected )"}}
+      _ -> {:ok, Enum.reverse(exprs)}
+    end
+  end
+
+  defp parse_all([], acc), do: {acc, []}
+  defp parse_all([{:rparen, _} | _] = tokens, acc), do: {acc, tokens}
+
+  defp parse_all(tokens, acc) do
+    {expr, rest} = read_expr(tokens)
+    parse_all(rest, [expr | acc])
+  end
+
+  defp read_expr([{:lparen, _line} | rest]) do
+    {elements, remaining} = read_list(rest, [])
+    {elements, remaining}
+  end
+
+  defp read_expr([{:quote_shorthand, _line} | rest]) do
+    {expr, remaining} = read_expr(rest)
+    {[:quote, expr], remaining}
+  end
+
+  defp read_expr([{:integer, n, _} | rest]), do: {n, rest}
+  defp read_expr([{:float, f, _} | rest]), do: {f, rest}
+  defp read_expr([{:string, s, _} | rest]), do: {s, rest}
+  defp read_expr([{:bool, b, _} | rest]), do: {b, rest}
+  defp read_expr([{:symbol, name, _} | rest]), do: {String.to_atom(name), rest}
+
+  defp read_list([{:rparen, _} | rest], acc) do
+    {Enum.reverse(acc), rest}
+  end
+
+  defp read_list([], acc) do
+    {Enum.reverse(acc), []}
+  end
+
+  defp read_list(tokens, acc) do
+    {expr, rest} = read_expr(tokens)
+    read_list(rest, [expr | acc])
   end
 end
 ```
@@ -140,28 +217,50 @@ end
 defmodule Schemia.Environment do
   @moduledoc """
   Lexical environment as a linked chain of frames.
-
-  %{bindings: %{atom => value}, parent: env | nil}
   """
 
+  @doc "Creates a new environment frame."
+  @spec new(map() | nil) :: map()
   def new(parent \\ nil), do: %{bindings: %{}, parent: parent}
 
+  @doc "Creates a child frame with the given bindings."
+  @spec extend(map() | nil, map()) :: map()
   def extend(parent, bindings) when is_map(bindings) do
     %{bindings: bindings, parent: parent}
   end
 
-  def lookup(env, name) do
-    # TODO: check bindings, recurse to parent, raise on not found
-    # HINT: raise "Unbound variable: #{name}" at root
+  @doc "Looks up a symbol in the environment chain."
+  @spec lookup(map(), atom()) :: term()
+  def lookup(%{bindings: bindings, parent: parent}, name) do
+    case Map.fetch(bindings, name) do
+      {:ok, value} -> value
+      :error ->
+        if parent do
+          lookup(parent, name)
+        else
+          raise "Unbound variable: #{name}"
+        end
+    end
   end
 
-  def define(env, name, value) do
-    # TODO: add to current frame (creates new frame map, returns updated env)
+  @doc "Defines a binding in the current frame. Returns updated env."
+  @spec define(map(), atom(), term()) :: map()
+  def define(%{bindings: bindings} = env, name, value) do
+    %{env | bindings: Map.put(bindings, name, value)}
   end
 
-  def set!(env, name, value) do
-    # TODO: find the frame that owns `name`, update it
-    # TODO: raise "Unbound variable: #{name}" if not found in any frame
+  @doc "Mutates the binding in the frame that owns it."
+  @spec set!(map(), atom(), term()) :: map()
+  def set!(%{bindings: bindings, parent: parent} = env, name, value) do
+    if Map.has_key?(bindings, name) do
+      %{env | bindings: Map.put(bindings, name, value)}
+    else
+      if parent do
+        %{env | parent: set!(parent, name, value)}
+      else
+        raise "Unbound variable: #{name}"
+      end
+    end
   end
 end
 ```
@@ -173,19 +272,17 @@ end
 defmodule Schemia.TCO do
   @moduledoc """
   Trampoline for tail call optimization.
-
-  The evaluator returns {:tail_call, expr, env} when it encounters a call
-  in tail position. The trampoline loops until a non-thunk value is produced.
-
-  This converts recursive interpreter calls into a flat while-loop equivalent.
+  Converts recursive interpreter calls into a flat while-loop equivalent.
   """
 
-  def run(thunk) do
-    # TODO: loop while result is {:tail_call, expr, env}
-    # HINT:
-    #   defp trampoline({:tail_call, expr, env}), do: trampoline(Schemia.Evaluator.eval(expr, env))
-    #   defp trampoline(value), do: value
+  @doc "Runs the evaluator with trampolining until a final value is produced."
+  @spec run(term()) :: term()
+  def run({:tail_call, expr, env}) do
+    result = Schemia.Evaluator.eval(expr, env)
+    run(result)
   end
+
+  def run(value), do: value
 end
 ```
 
@@ -196,36 +293,109 @@ end
 defmodule Schemia.Evaluator do
   @moduledoc """
   Evaluates s-expressions in a given environment.
-
-  eval(expr, env) returns a value OR {:tail_call, expr, env} for TCO.
-
-  Dispatch rules:
-    integer/float/string/bool   → self-evaluating
-    atom                        → environment lookup
-    [:quote, x]                 → x (unevaluated)
-    [:if, test, then, else_]    → eval test; branch; TCO on result branch
-    [:define, name, body]       → eval body, extend env
-    [:lambda, params, body]     → {:closure, params, body, env}
-    [:begin | exprs]            → eval all; last in tail position
-    [:let, bindings, body]      → create new env, eval body
-    [f | args]                  → eval f and all args; apply
+  Returns a value OR {:tail_call, expr, env} for TCO.
   """
 
   alias Schemia.{Environment, TCO}
 
-  def eval(expr, env) do
-    # TODO: implement pattern dispatch for all expression forms
-    # TODO: self-evaluating: integers, floats, booleans, strings
-    # TODO: symbol: Environment.lookup(env, expr)
-    # TODO: special forms by first element
-    # TODO: procedure application: eval all elements, then apply/3
+  @doc "Evaluates an expression in the given environment."
+  @spec eval(term(), map()) :: term()
+  def eval(expr, env) when is_integer(expr) or is_float(expr), do: expr
+  def eval(expr, env) when is_binary(expr), do: expr
+  def eval(true, _env), do: true
+  def eval(false, _env), do: false
+  def eval(expr, env) when is_atom(expr), do: Environment.lookup(env, expr)
+
+  def eval([:quote, x], _env), do: x
+
+  def eval([:if, test_expr, then_expr], env) do
+    if TCO.run(eval(test_expr, env)) do
+      {:tail_call, then_expr, env}
+    else
+      nil
+    end
   end
 
-  defp apply({:closure, params, body, closure_env}, args, _env) do
-    # TODO: bind params to args, create child env from closure_env, eval body with TCO
+  def eval([:if, test_expr, then_expr, else_expr], env) do
+    if TCO.run(eval(test_expr, env)) do
+      {:tail_call, then_expr, env}
+    else
+      {:tail_call, else_expr, env}
+    end
   end
-  defp apply(builtin, args, _env) when is_function(builtin) do
-    # TODO: call the built-in function directly
+
+  def eval([:define, name, body], env) when is_atom(name) do
+    value = TCO.run(eval(body, env))
+    Environment.define(env, name, value)
+    value
+  end
+
+  def eval([:lambda, params, body], env) do
+    {:closure, params, body, env}
+  end
+
+  def eval([:begin | exprs], env) do
+    eval_begin(exprs, env)
+  end
+
+  def eval([:let, bindings_list, body], env) do
+    new_bindings =
+      Enum.reduce(bindings_list, %{}, fn [name, val_expr], acc ->
+        value = TCO.run(eval(val_expr, env))
+        Map.put(acc, name, value)
+      end)
+
+    child_env = Environment.extend(env, new_bindings)
+    {:tail_call, body, child_env}
+  end
+
+  def eval([:"set!", name, value_expr], env) do
+    value = TCO.run(eval(value_expr, env))
+    Environment.set!(env, name, value)
+    value
+  end
+
+  def eval([:cond | clauses], env) do
+    eval_cond(clauses, env)
+  end
+
+  def eval([f_expr | arg_exprs], env) do
+    func = TCO.run(eval(f_expr, env))
+    args = Enum.map(arg_exprs, fn a -> TCO.run(eval(a, env)) end)
+    apply_func(func, args, env)
+  end
+
+  def eval([], _env), do: []
+
+  defp eval_begin([last], env), do: {:tail_call, last, env}
+
+  defp eval_begin([head | tail], env) do
+    TCO.run(eval(head, env))
+    eval_begin(tail, env)
+  end
+
+  defp eval_cond([], _env), do: nil
+
+  defp eval_cond([[:else | body] | _], env) do
+    eval_begin(body, env)
+  end
+
+  defp eval_cond([[test | body] | rest], env) do
+    if TCO.run(eval(test, env)) do
+      eval_begin(body, env)
+    else
+      eval_cond(rest, env)
+    end
+  end
+
+  defp apply_func({:closure, params, body, closure_env}, args, _call_env) do
+    bindings = Enum.zip(params, args) |> Map.new()
+    child_env = Environment.extend(closure_env, bindings)
+    {:tail_call, body, child_env}
+  end
+
+  defp apply_func(builtin, args, _env) when is_function(builtin) do
+    builtin.(args)
   end
 end
 ```
@@ -237,42 +407,59 @@ end
 defmodule Schemia.Stdlib do
   @moduledoc """
   Built-in procedures bound in the root environment.
-
-  Each entry is {scheme_symbol, elixir_function}.
-  Functions receive a list of evaluated arguments.
   """
 
+  alias Schemia.{Environment, Evaluator, TCO}
+
+  @doc "Returns the root environment with all standard library bindings."
+  @spec root_env() :: map()
   def root_env do
-    Schemia.Environment.extend(nil, bindings())
+    Environment.extend(nil, bindings())
   end
 
   defp bindings do
     %{
-      :+ => fn [a, b] -> a + b end,
+      :+ => fn args -> Enum.reduce(args, 0, &+/2) end,
       :- => fn [a, b] -> a - b end,
-      :* => fn [a, b] -> a * b end,
-      :/ => fn [a, b] -> a / b end,
+      :* => fn args -> Enum.reduce(args, 1, &*/2) end,
+      :/ => fn [a, b] -> div(a, b) end,
       := => fn [a, b] -> a == b end,
       :< => fn [a, b] -> a < b end,
       :> => fn [a, b] -> a > b end,
+      :<= => fn [a, b] -> a <= b end,
+      :>= => fn [a, b] -> a >= b end,
       :car   => fn [[h | _]] -> h end,
       :cdr   => fn [[_ | t]] -> t end,
       :cons  => fn [h, t] -> [h | t] end,
       :list  => fn args -> args end,
+      :length => fn [l] -> length(l) end,
+      :append => fn [a, b] -> a ++ b end,
       :"null?"  => fn [[]] -> true; [_] -> false end,
       :"pair?"  => fn [[_ | _]] -> true; [_] -> false end,
       :"number?" => fn [n] -> is_number(n) end,
       :"symbol?" => fn [s] -> is_atom(s) end,
+      :"string?" => fn [s] -> is_binary(s) end,
       :"equal?" => fn [a, b] -> a == b end,
       :not    => fn [x] -> !x end,
+      :abs    => fn [x] -> abs(x) end,
+      :modulo => fn [a, b] -> rem(a, b) end,
+      :map => fn [func, lst] ->
+        Enum.map(lst, fn item -> TCO.run(Evaluator.eval([func, [:quote, item]], Environment.new())) end)
+      end,
+      :filter => fn [func, lst] ->
+        Enum.filter(lst, fn item -> TCO.run(Evaluator.eval([func, [:quote, item]], Environment.new())) end)
+      end,
+      :apply => fn [func | args] ->
+        flat_args = List.flatten(args)
+        TCO.run(Evaluator.eval([func | Enum.map(flat_args, fn a -> [:quote, a] end)], Environment.new()))
+      end,
       :display => fn [x] -> IO.write(inspect_val(x)); x end,
-      :newline => fn [] -> IO.write("\n"); :ok end,
-      # TODO: implement map, filter, for-each, apply
-      # HINT: map applies a closure to each element; it must call Evaluator.eval
+      :newline => fn [] -> IO.write("\n"); :ok end
     }
   end
 
   defp inspect_val(x) when is_atom(x), do: Atom.to_string(x)
+  defp inspect_val(x) when is_list(x), do: "(" <> Enum.map_join(x, " ", &inspect_val/1) <> ")"
   defp inspect_val(x), do: inspect(x)
 end
 ```
@@ -305,7 +492,6 @@ defmodule Schemia.TCOTest do
     """
     eval_str(program)
 
-    # 1_000_000 recursive calls — would overflow without TCO
     result = eval_str("(fact 1000000 1)")
     assert is_integer(result) or is_float(result)
   end
@@ -404,12 +590,6 @@ Benchee.run(
       (define (fact n acc) (if (= n 0) acc (fact (- n 1) (* n acc))))
       (fact 10000 1)
       """)
-    end,
-    "list construction 1000 items" => fn ->
-      compile_and_run.("""
-      (define (build n acc) (if (= n 0) acc (build (- n 1) (cons n acc))))
-      (build 1000 '())
-      """)
     end
   },
   time: 5,
@@ -424,37 +604,35 @@ Benchee.run(
 
 | Aspect | Trampoline (this impl) | CPS transform | Native BEAM tail calls |
 |--------|----------------------|---------------|------------------------|
-| TCO mechanism | trampoline loop on heap | continuation closures | BEAM call optimization |
-| Implementation complexity | moderate | high | requires compiling to real modules |
-| Mutual recursion | yes (any call can trampoline) | yes | yes |
-| Continuation capture (`call/cc`) | not supported | natural | not supported |
+| TCO mechanism | trampoline loop | continuation closures | BEAM call optimization |
+| Implementation complexity | moderate | high | requires compiling to modules |
+| Mutual recursion | yes | yes | yes |
 | Memory per tail call | 1 heap tuple | 1 closure allocation | 0 (overwrite stack frame) |
-| Suitable for | interpreters, prototypes | full Scheme with `call/cc` | compiled targets |
 
-Reflection: trampolining creates a `{:tail_call, expr, env}` heap tuple on every tail call. In a deeply tail-recursive loop, this allocates N tuples that are immediately collected. How does this compare to the memory cost of native tail-call optimization where the stack frame is reused?
+Reflection: trampolining creates a `{:tail_call, expr, env}` heap tuple on every tail call. How does this compare to native tail-call optimization where the stack frame is reused?
 
 ---
 
 ## Common production mistakes
 
 **1. Evaluating all subexpressions before detecting special forms**
-Calling `Enum.map(args, &eval(&1, env))` before checking if the head is a special form (`define`, `lambda`, `if`) evaluates the arguments eagerly. Special forms must intercept the list before argument evaluation.
+Special forms must intercept the list before argument evaluation.
 
 **2. Closure captures mutable environment reference**
-If the environment is mutated after a closure is created (e.g., via `set!`), a closure that holds a reference to the parent map sees the mutation. Use persistent (copy-on-write) maps for bindings so each frame is immutable once created.
+Use persistent (copy-on-write) maps for bindings so each frame is immutable once created.
 
 **3. Trampoline not applied to `begin` body**
-`(begin expr1 expr2 expr3)` must evaluate `expr1` and `expr2` normally and put only `expr3` in tail position. Trampolining all expressions in `begin` returns the wrong value.
+`(begin expr1 expr2 expr3)` must only put `expr3` in tail position.
 
 **4. `apply` not handling variadic argument lists**
-`(apply + '(1 2 3))` must evaluate `+` and then call it with `[1, 2, 3]` as arguments. A naive implementation that always passes the last argument as a list element fails: `(apply + 1 2 '(3 4))` should call `+` with `[1, 2, 3, 4]`.
+`(apply + 1 2 '(3 4))` should call `+` with `[1, 2, 3, 4]`.
 
 ---
 
 ## Resources
 
-- Abelson, H. & Sussman, G.J. — *Structure and Interpretation of Computer Programs* (SICP), MIT Press — the canonical reference; chapter 4 builds a metacircular evaluator
-- Friedman, D.P. & Felleisen, M. — *The Little Schemer* — intuition for recursive thinking in Scheme
-- R7RS Small Language Specification — [r7rs.org](https://r7rs.org) — normative reference for Scheme semantics
-- Norvig, P. — [lis.py](https://norvig.com/lispy.html) — 90-line Python Scheme interpreter; the minimal reference implementation
-- Queinnec, C. — *Lisp in Small Pieces* — full treatment of closures, continuations, and compilation
+- Abelson, H. & Sussman, G.J. — *Structure and Interpretation of Computer Programs* (SICP)
+- Friedman, D.P. & Felleisen, M. — *The Little Schemer*
+- R7RS Small Language Specification — [r7rs.org](https://r7rs.org)
+- Norvig, P. — [lis.py](https://norvig.com/lispy.html) — 90-line Python Scheme interpreter
+- Queinnec, C. — *Lisp in Small Pieces*
