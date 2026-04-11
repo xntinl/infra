@@ -1,217 +1,638 @@
 # 55. Build a Distributed Saga Orchestrator
 
-**Difficulty**: Insane
+## Context
 
-**Estimated time**: 120+ hours
+Your team runs an e-commerce platform. Placing an order requires four sequential operations across three independent services: reserve inventory (inventory service), charge payment (payment service), create shipment (fulfillment service), and notify customer (notification service).
 
-## Overview
+The first implementation used a 2-phase commit (2PC) across all services. It was correct but catastrophically slow (held locks for ~500ms per order) and had no fallback when any service was unavailable. The second implementation used "fire and forget" with async events — which produced a class of bugs where payment was captured but inventory was never reserved, or shipment was created but payment failed.
 
-The Saga pattern solves one of the hardest problems in distributed systems: how to maintain data consistency across multiple independent services when a global ACID transaction is impossible. Instead of a two-phase commit that holds locks across service boundaries, a Saga decomposes a long-running business transaction into a sequence of local transactions, each paired with a compensating transaction that semantically undoes its effect if a later step fails.
+The Saga pattern solves this: decompose the order flow into local transactions, each with a compensating transaction that semantically undoes its effect. If shipment fails after payment captured: run `refund_payment` then `release_inventory`. No distributed locks. No 2PC. The customer is never charged for an order that was not shipped.
 
-This exercise demands building a production-grade Saga orchestrator on the BEAM — a system that coordinates multi-step distributed transactions with durable state, automatic compensation, idempotent execution, and full observability. The canonical domain is e-commerce: `reserve_inventory → charge_payment → ship_order → notify_customer`, where each step has a corresponding compensation (`release_inventory`, `refund_payment`, `cancel_shipment`, `send_cancellation_notice`).
+You will build `SagaEngine`: a distributed saga orchestrator where each saga is a durable GenServer, every state transition is an append-only event in a persistent log, and recovery resumes in-progress sagas after any crash.
 
-The orchestrator must guarantee that every saga either completes fully or is fully compensated — partial completion is never an acceptable final state.
+## Why each saga is a GenServer and not a plain function
 
-## The Challenge
+A saga may run for minutes (waiting for a payment gateway to respond, a shipment API to confirm). During this time, the saga must be monitorable, cancellable, and recoverable. A GenServer holds state, can be registered by name (for lookup), can be supervised (auto-restarted), and can receive external signals (cancel, timeout). A plain function cannot be preempted or inspected.
 
-Design and implement a distributed saga orchestration engine in Elixir/OTP that manages the full lifecycle of distributed business transactions. The engine must operate correctly in a multi-node BEAM cluster, survive process crashes and node failures, and resume in-progress sagas from durable checkpoints without data loss or duplicate side effects.
+More importantly: all state mutations for a saga go through one serialized process. No two processes can concurrently advance the same saga. This prevents the class of bugs where two concurrent recoveries both advance step 3, producing a duplicate side effect.
 
-### E-Commerce Saga Reference Example
+## Why compensation must use data from the event log, not from external services
 
-The following saga must be implementable using your DSL and must execute correctly under all failure and recovery scenarios described in this exercise:
+When compensating `charge_payment`, you need the payment transaction ID to issue a refund. That ID was returned by the payment service when the forward step succeeded. If you re-query the payment service to get it, the service may have no record of the transaction (if it rolled back), or may return a different transaction for a retry. The compensating function must receive its data from the saga event log: the exact output recorded when the forward step succeeded. This is why every step's output is persisted before moving to the next step.
 
-**Steps (in order)**:
-1. `reserve_inventory` — decrements available stock for each SKU in the order; compensation: `release_inventory` restores the reserved quantities
-2. `charge_payment` — initiates a payment capture against the customer's stored payment method; compensation: `refund_payment` initiates a full reversal
-3. `ship_order` — creates a shipment record with the fulfillment provider and assigns a tracking number; compensation: `cancel_shipment` voids the shipment before it leaves the warehouse
-4. `notify_customer` — sends an order confirmation email and push notification; compensation: `send_cancellation_notice` sends a cancellation email if compensation is triggered after this step
+## Why the event log is the single source of truth
 
-**Invariant**: if `charge_payment` succeeds but `ship_order` fails, `refund_payment` and then `release_inventory` must execute — in that order — before the saga is considered terminated. The customer must never be charged for an order that was not shipped.
+Traditional state machines store "current state." An event log stores every transition. The difference: with an event log, you can replay the log to reconstruct any past state, detect gaps (step started but no result), and audit every decision. When the orchestrator crashes between persisting a step result and advancing to the next step, recovery replays the log and sees "step 2 completed, step 3 not started" — it resumes from step 3. With only current state, you cannot distinguish "step 3 not started" from "step 3 was started but the start was not persisted."
 
-## Core Requirements
+## Project Structure
 
-### 1. Saga Definition DSL
+```
+saga_engine/
+├── mix.exs
+├── priv/
+│   └── repo/migrations/
+├── lib/
+│   └── saga_engine/
+│       ├── dsl.ex              # Macro DSL: defsaga, step, compensate, parallel, branch
+│       ├── orchestrator.ex     # GenServer: state machine, step execution loop
+│       ├── event_log.ex        # Append-only event log: persist, replay
+│       ├── backends/
+│       │   ├── backend.ex      # Behaviour: append/2, read/1, list_active/0
+│       │   ├── ecto.ex         # PostgreSQL backend via Ecto
+│       │   └── ets.ex          # In-memory ETS backend for tests
+│       ├── recovery.ex         # Startup scan: find in-progress sagas, resume
+│       ├── compensation.ex     # Reverse-order compensation executor
+│       ├── parallel.ex         # Parallel group: Task.async_stream + cancel on failure
+│       ├── dead_letter.ex      # Dead-letter store and manual intervention API
+│       ├── tracer.ex           # get_trace/1: chronological event list
+│       ├── telemetry.ex        # Event emission for all lifecycle transitions
+│       └── testing.ex          # Saga.Testing: simulate_failure, assert_compensated
+├── test/
+│   ├── support/
+│   │   └── ecommerce_saga.ex  # Reference e-commerce saga definition
+│   ├── orchestrator_test.exs
+│   ├── compensation_test.exs
+│   ├── recovery_test.exs
+│   ├── parallel_test.exs
+│   └── property/
+│       └── invariant_test.exs  # Property: always completed or compensated
+└── bench/
+    └── throughput.exs
+```
 
-Provide a declarative macro-based DSL for defining sagas. A saga definition must specify:
+## Step 1 — Saga DSL
 
-- An ordered list of steps, each identified by a unique atom name
-- For each step: the module/function or anonymous function that executes the step, the expected return value shape, and the timeout in milliseconds after which the step is considered failed
-- For each step: the corresponding compensation function that undoes the step's effect, also with its own timeout
-- An optional global saga timeout after which the entire saga is forcibly compensated regardless of step progress
-- Step-level retry policy: maximum attempts, backoff strategy (linear or exponential), and maximum backoff interval
-- Parallel step groups: a set of steps that may be executed concurrently because they have no data dependency between them; the group completes only when all steps in it complete, or triggers compensation if any step in the group fails
-- Conditional branching: a step may return a tagged value that causes the engine to skip certain subsequent steps or choose between alternative step sequences
+```elixir
+defmodule SagaEngine.DSL do
+  @moduledoc """
+  Declarative DSL for defining sagas.
 
-### 2. Orchestration Mode
+  Example:
 
-The orchestrator is the single authoritative coordinator of a saga execution. It must:
+    defmodule OrderSaga do
+      use SagaEngine.DSL
 
-- Assign a globally unique saga ID (UUID v4) to each new saga instance at creation time
-- Persist the saga's initial state — definition reference, input parameters, creation timestamp — to durable storage before executing the first step
-- Execute steps sequentially in the defined order, or concurrently for parallel groups
-- After each successful step, persist a checkpoint containing: step name, step output, completion timestamp, and current saga status
-- Pass the accumulated step outputs as context to each subsequent step, allowing later steps to use data produced by earlier steps
-- On step failure: determine whether to retry based on the step's retry policy, or proceed to compensation
-- On compensation trigger: execute compensations in reverse order of the steps that completed, passing the original step output to each compensation function so it has the exact data needed to undo the effect
+      defsaga :place_order do
+        timeout 300_000  # 5 minute global timeout
 
-### 3. Choreography Mode
+        step :reserve_inventory,
+          execute: {InventoryService, :reserve, []},
+          compensate: {InventoryService, :release, []},
+          timeout: 10_000,
+          max_attempts: 3,
+          backoff: :exponential
 
-In choreography mode, the orchestrator does not call services directly. Instead:
+        step :charge_payment,
+          execute: {PaymentService, :charge, []},
+          compensate: {PaymentService, :refund, []},
+          timeout: 30_000,
+          max_attempts: 1  # No retry for payments — idempotency must handle it
 
-- Each step publishes an event to a named topic upon initiation; the corresponding service subscribes to that topic, performs the work, and publishes a result event (success or failure) to a reply topic
-- The orchestrator subscribes to reply topics and advances the saga state machine upon receiving result events
-- The orchestrator must handle duplicate result events idempotently: receiving the same result event twice must not advance the saga state twice
-- The orchestrator must handle out-of-order result events: a result for step N arriving before step N-1 completes must be queued and applied only when the saga reaches step N
-- The event transport backend must be pluggable: at minimum an in-memory `Phoenix.PubSub` backend for development and tests, and a persistent backend for production
+        step :ship_order,
+          execute: {FulfillmentService, :ship, []},
+          compensate: {FulfillmentService, :cancel, []},
+          timeout: 15_000,
+          max_attempts: 3
 
-### 4. Persistent Saga State
+        step :notify_customer,
+          execute: {NotificationService, :confirm, []},
+          compensate: {NotificationService, :cancel, []},
+          timeout: 5_000,
+          max_attempts: 5
+      end
+    end
+  """
 
-The saga state must survive any single process crash or node failure:
+  defmacro __using__(_opts) do
+    quote do
+      import SagaEngine.DSL, only: [defsaga: 2, step: 2, parallel: 1, branch: 2]
+      Module.register_attribute(__MODULE__, :saga_definitions, accumulate: true)
+      @before_compile SagaEngine.DSL
+    end
+  end
 
-- The state backend must be pluggable: the engine ships with at least two implementations — an Ecto/PostgreSQL backend for production and an in-memory ETS backend for testing
-- Every state transition — step started, step succeeded, step failed, compensation started, compensation succeeded, saga completed, saga failed — must be persisted as an immutable event in an append-only saga event log
-- The current saga status must be fully derivable by replaying the event log from the beginning
-- A recovery process must run at application startup: it scans the event log for sagas in `running` or `compensating` status, reconstructs their state, and resumes execution from the last successful checkpoint
+  defmacro defsaga(name, do: block) do
+    quote do
+      Module.put_attribute(__MODULE__, :current_saga, unquote(name))
+      Module.put_attribute(__MODULE__, :current_steps, [])
+      unquote(block)
+      steps = Module.get_attribute(__MODULE__, :current_steps) |> Enum.reverse()
+      Module.put_attribute(__MODULE__, :saga_definitions,
+        {unquote(name), steps})
+    end
+  end
 
-### 5. Compensation
+  defmacro step(name, opts) do
+    quote do
+      step_def = %{
+        name: unquote(name),
+        execute: unquote(Keyword.fetch!(opts, :execute)),
+        compensate: unquote(Keyword.fetch!(opts, :compensate)),
+        timeout: unquote(Keyword.get(opts, :timeout, 30_000)),
+        max_attempts: unquote(Keyword.get(opts, :max_attempts, 3)),
+        backoff: unquote(Keyword.get(opts, :backoff, :exponential))
+      }
+      Module.put_attribute(__MODULE__, :current_steps,
+        [step_def | Module.get_attribute(__MODULE__, :current_steps)])
+    end
+  end
 
-Compensation is not optional and must be implemented with the same rigor as forward execution:
+  defmacro __before_compile__(_env) do
+    quote do
+      def __saga_definitions__, do: @saga_definitions
+    end
+  end
+end
+```
 
-- Compensations execute in strictly reverse order: if steps A, B, C succeeded and step D failed, compensations run as C-comp, B-comp, A-comp
-- For parallel step groups where all steps succeeded before a later failure: all compensation functions for the parallel group run concurrently, and the saga waits for all of them to complete before moving to the next compensation
-- Compensation functions receive the original step output as input so they can reference the exact resource identifiers created by the forward step
-- If a compensation function itself fails: retry it according to its retry policy; if all retries are exhausted, move the saga to `dead_letter` status — do not silently ignore the failure or skip to the next compensation
-- A compensation that times out is treated identically to a compensation that returned an error
+## Step 2 — Event log
 
-### 6. Idempotency
+```elixir
+defmodule SagaEngine.EventLog do
+  @type event_type ::
+    :saga_started | :step_started | :step_completed | :step_failed | :step_timed_out |
+    :compensation_started | :compensation_completed | :compensation_failed |
+    :saga_completed | :saga_compensated | :saga_dead_letter | :saga_blocked |
+    :branch_taken
 
-Every step and every compensation must be executable multiple times without producing duplicate side effects:
+  defstruct [:saga_id, :event_type, :step_name, :data, :sequence, :timestamp]
 
-- Each step execution attempt is assigned a unique idempotency key derived from `{saga_id, step_name, attempt_number}`
-- The idempotency key is passed to the step function; the step function is responsible for using it when making external calls — as an HTTP idempotency key header, or as a database deduplication key
-- The engine must detect when a step or compensation was already successfully executed by checking the event log, and skip re-execution, returning the previously recorded output instead
-- This guarantee must hold across crashes: if the engine crashed after the step executed but before it wrote the checkpoint, the recovery path must re-run the step with the same idempotency key and handle the case where the external system already processed it
+  @doc "Append an event. Returns {:ok, event_with_sequence}"
+  def append(backend, saga_id, event_type, step_name \\ nil, data \\ %{}) do
+    event = %__MODULE__{
+      saga_id: saga_id,
+      event_type: event_type,
+      step_name: step_name,
+      data: data,
+      timestamp: System.system_time(:millisecond)
+    }
+    backend.append(event)
+  end
 
-### 7. Timeout Handling
+  @doc "Replay event log to reconstruct saga state"
+  def reconstruct(events) do
+    Enum.reduce(events, %{status: :pending, completed_steps: [], context: %{}, branch: nil}, fn
+      %{event_type: :saga_started, data: data}, state ->
+        %{state | status: :running, context: data.input}
+      %{event_type: :step_completed, step_name: name, data: data}, state ->
+        %{state | completed_steps: [{name, data.output} | state.completed_steps],
+                  context: Map.put(state.context, name, data.output)}
+      %{event_type: :branch_taken, data: data}, state ->
+        %{state | branch: data.branch}
+      %{event_type: :saga_completed}, state ->
+        %{state | status: :completed}
+      %{event_type: :saga_compensated}, state ->
+        %{state | status: :compensated}
+      %{event_type: :saga_dead_letter}, state ->
+        %{state | status: :dead_letter}
+      _, state ->
+        state
+    end)
+  end
+end
+```
 
-- Each step has a per-step deadline measured from the moment the step begins execution
-- If the deadline elapses before the step returns: the engine cancels the step via `Process.exit/2` on the step Task, records a timeout failure event, and begins compensation
-- Timeout is treated identically to a step error for the purpose of retry and compensation logic
-- The global saga timeout, if configured, takes precedence: if it elapses while any step or compensation is in progress, the engine immediately begins compensating all completed steps and moves to `timed_out` as the final status
+## Step 3 — Orchestrator GenServer
 
-### 8. Parallel Steps
+```elixir
+defmodule SagaEngine.Orchestrator do
+  use GenServer
+  require Logger
 
-- A parallel step group is defined as a set of steps with no data dependency between them
-- All steps in a parallel group are started simultaneously
-- The group succeeds only if all steps succeed; if any step fails, all in-progress steps in the group are cancelled and compensation begins for the steps that already completed within the group
-- The outputs of all parallel steps are merged into the context map using step names as keys before passing to subsequent sequential steps
-- Parallel steps within the same group do not have access to each other's outputs during execution — only the accumulated context from prior sequential steps is available
+  def start_link(opts) do
+    saga_id = Keyword.fetch!(opts, :saga_id)
+    GenServer.start_link(__MODULE__, opts, name: via(saga_id))
+  end
 
-### 9. Conditional Branching
+  def run(saga_id, definition_module, saga_type, input) do
+    GenServer.call(via(saga_id), {:run, definition_module, saga_type, input}, :infinity)
+  end
 
-- A step may return `{:ok, output, branch: :branch_name}` to select a named execution path
-- The saga definition specifies which subsequent steps belong to which branch
-- Steps not on the selected branch are skipped and are not compensated, since they never executed
-- Branch decisions are recorded in the event log so that recovery can reconstruct the correct remaining execution path without re-evaluating step outputs
+  def cancel(saga_id) do
+    GenServer.cast(via(saga_id), :cancel)
+  end
 
-### 10. Dead Letter
+  def init(opts) do
+    {:ok, %{
+      saga_id: Keyword.fetch!(opts, :saga_id),
+      backend: Keyword.fetch!(opts, :backend),
+      status: :idle
+    }}
+  end
 
-- A saga enters `dead_letter` status when it cannot complete forward execution and also cannot complete compensation
-- Dead-letter sagas are stored in a dedicated queryable dead-letter store with their full event log, last error, and original saga input
-- The dead-letter store exposes an API for manual intervention: inspect the saga state, manually mark a compensation as succeeded with an audit record, and resume compensation from that point
-- A `:telemetry` event is emitted with event name `saga.dead_letter` whenever a saga enters this status
+  def handle_call({:run, def_mod, saga_type, input}, _from, state) do
+    saga_id = state.saga_id
+    backend = state.backend
+    steps = get_steps(def_mod, saga_type)
 
-### 11. Distributed Execution
+    # Persist saga start
+    {:ok, _} = SagaEngine.EventLog.append(backend, saga_id, :saga_started, nil, %{input: input})
+    :telemetry.execute([:saga_engine, :saga, :started], %{system_time: System.system_time()},
+      %{saga_id: saga_id, saga_type: saga_type})
 
-- Step functions may execute on any node in the BEAM cluster, not necessarily the node where the orchestrator runs
-- The orchestrator uses `:rpc` or `Task` with explicit node targeting to dispatch step execution to remote nodes
-- If the node executing a step goes down mid-execution: the orchestrator detects the node failure via `Node.monitor/2`, treats the step as failed, and retries on a different node if retries remain
-- The orchestrator process itself is protected against single-node failure: in a multi-node cluster, a supervisor using `:global` or Horde ensures that if the orchestrator node fails, another node restarts the orchestrator and resumes from the last checkpoint
+    case execute_steps(steps, %{input: input}, saga_id, backend) do
+      {:ok, context} ->
+        {:ok, _} = SagaEngine.EventLog.append(backend, saga_id, :saga_completed)
+        :telemetry.execute([:saga_engine, :saga, :completed], %{}, %{saga_id: saga_id})
+        {:reply, {:ok, context}, %{state | status: :completed}}
 
-### 12. Recovery
+      {:error, failed_step, completed_steps, context} ->
+        SagaEngine.EventLog.append(backend, saga_id, :compensation_started)
+        case SagaEngine.Compensation.run(completed_steps, context, saga_id, backend) do
+          :ok ->
+            SagaEngine.EventLog.append(backend, saga_id, :saga_compensated)
+            :telemetry.execute([:saga_engine, :saga, :compensated], %{}, %{saga_id: saga_id})
+            {:reply, {:error, :compensated, failed_step}, %{state | status: :compensated}}
+          {:error, dead_step, reason} ->
+            SagaEngine.EventLog.append(backend, saga_id, :saga_dead_letter, dead_step,
+              %{reason: reason})
+            :telemetry.execute([:saga_engine, :saga, :dead_letter], %{}, %{saga_id: saga_id})
+            {:reply, {:error, :dead_letter, dead_step}, %{state | status: :dead_letter}}
+        end
+    end
+  end
 
-- At startup, the engine runs a recovery scan before accepting new saga submissions
-- For each saga in `running` or `compensating` status found in the event log: reconstruct the saga state by replaying all events, then resume from the step after the last successful checkpoint
-- Recovery must handle the case where a step was started but no result was recorded — the process crashed mid-step: re-execute the step with the same idempotency key
-- Recovery must complete within a bounded time configurable at application startup; sagas that cannot be recovered within this window are moved to `dead_letter`
-- The recovery process emits a structured log entry for every saga it recovers, including saga ID, recovered step, and reason
+  defp execute_steps([], context, _saga_id, _backend) do
+    {:ok, context}
+  end
 
-### 13. Observability
+  defp execute_steps([step | rest], context, saga_id, backend) do
+    idempotency_key = "#{saga_id}:#{step.name}:1"
 
-- Every saga lifecycle event emits a `:telemetry` event with a consistent schema: `saga_id`, `saga_type`, `event_name`, `step_name`, `duration_us`, `node`, `timestamp`
-- A `SagaTracer` module provides `get_trace(saga_id)` returning a complete chronological list of all events for the saga, including timing between steps, total saga duration, compensation events, and final status
-- Each trace event includes: wall-clock timestamp, monotonic time offset from saga start, step name, event type, executing node, and any error details
-- The engine exports aggregated metrics via `:telemetry.execute`: sagas started per minute, sagas completed per minute, sagas compensated per minute, sagas in dead-letter, average step duration per step name, P95 and P99 step duration per step name
+    # Check if step was already completed (idempotency on recovery)
+    case check_already_completed(backend, saga_id, step.name) do
+      {:ok, prior_output} ->
+        new_context = Map.put(context, step.name, prior_output)
+        execute_steps(rest, new_context, saga_id, backend)
+      :not_found ->
+        execute_new_step(step, rest, context, saga_id, backend, idempotency_key, 0)
+    end
+  end
 
-### 14. Multi-Saga Coordination
+  defp execute_new_step(step, rest, context, saga_id, backend, idem_key, attempt) do
+    SagaEngine.EventLog.append(backend, saga_id, :step_started, step.name,
+      %{attempt: attempt, idempotency_key: idem_key})
+    :telemetry.execute([:saga_engine, :step, :started], %{system_time: System.system_time()},
+      %{saga_id: saga_id, step: step.name})
 
-- A saga definition may declare a dependency on another saga: `depends_on: {:saga_type, parent_saga_id}`
-- A dependent saga does not begin execution until its dependency saga reaches `completed` status
-- If the dependency saga enters `failed`, `compensated`, or `dead_letter` status, the dependent saga is automatically moved to `blocked` status with a reason recorded in its event log
-- The dependency mechanism uses a subscription model: the dependent saga registers a watcher on the dependency saga's ID and is notified via message passing when the dependency's status changes
+    t0 = System.monotonic_time(:microsecond)
+    result = execute_with_timeout(step.execute, context, idem_key, step.timeout)
+    duration = System.monotonic_time(:microsecond) - t0
 
-### 15. Testing Utilities
+    case result do
+      {:ok, output, branch: branch_name} ->
+        SagaEngine.EventLog.append(backend, saga_id, :branch_taken, step.name, %{branch: branch_name})
+        SagaEngine.EventLog.append(backend, saga_id, :step_completed, step.name, %{output: output})
+        :telemetry.execute([:saga_engine, :step, :completed],
+          %{duration_microseconds: duration},
+          %{saga_id: saga_id, step: step.name})
+        new_context = Map.put(context, step.name, output)
+        # TODO: filter rest based on selected branch
+        execute_steps(rest, new_context, saga_id, backend)
 
-Provide a `Saga.Testing` module with the following capabilities:
+      {:ok, output} ->
+        SagaEngine.EventLog.append(backend, saga_id, :step_completed, step.name, %{output: output})
+        :telemetry.execute([:saga_engine, :step, :completed],
+          %{duration_microseconds: duration},
+          %{saga_id: saga_id, step: step.name})
+        new_context = Map.put(context, step.name, output)
+        execute_steps(rest, new_context, saga_id, backend)
 
-- `Saga.Testing.simulate_failure(saga_id, step_name)` — injects a failure into the next execution of the named step for the given saga, causing it to return `{:error, :simulated_failure}`
-- `Saga.Testing.simulate_timeout(saga_id, step_name)` — causes the named step to hang until its timeout elapses
-- `Saga.Testing.replay(saga_id)` — re-runs a completed or failed saga from its recorded event log using recorded step outputs with no external calls, asserting that the final state matches the original
-- `Saga.Testing.assert_compensated(saga_id)` — asserts that the saga reached `compensated` status and that every completed step has a corresponding compensation event in the log
-- `Saga.Testing.step_sequence(saga_id)` — returns the ordered list of step names actually executed, including compensations, for use in test assertions
+      {:error, reason} ->
+        SagaEngine.EventLog.append(backend, saga_id, :step_failed, step.name, %{reason: inspect(reason), attempt: attempt})
+        if attempt < step.max_attempts - 1 do
+          backoff = compute_backoff(step.backoff, attempt)
+          Process.sleep(backoff)
+          new_idem_key = "#{saga_id}:#{step.name}:#{attempt + 2}"
+          execute_new_step(step, rest, context, saga_id, backend, new_idem_key, attempt + 1)
+        else
+          {:error, step.name, [step | []], context}
+        end
 
-## Acceptance Criteria
+      :timeout ->
+        SagaEngine.EventLog.append(backend, saga_id, :step_timed_out, step.name, %{})
+        {:error, step.name, [step | []], context}
+    end
+  end
 
-- [ ] **DSL completeness**: the e-commerce saga (reserve → charge → ship → notify, with all four compensations) is definable using the DSL without any imperative orchestration code outside the definition; the definition compiles with no warnings
-- [ ] **Orchestration forward execution**: a saga with five sequential steps executes all steps in order, each step receives the accumulated context from prior steps, and the saga reaches `completed` status; the complete event log is persisted and readable
-- [ ] **Compensation order**: when step 3 of a five-step saga fails after steps 1 and 2 succeeded, compensations execute as step-2-comp then step-1-comp; this is verified by a test that records execution order via a shared ETS table and asserts the exact sequence
-- [ ] **Compensation on timeout**: a step that exceeds its configured timeout triggers compensation without any manual intervention; the step's process is killed and a `step_timed_out` event appears in the saga event log before any compensation event
-- [ ] **Parallel group success**: four independent steps defined as a parallel group all execute concurrently — verified by timing showing total time less than the sum of individual step durations — and their outputs are all available in the context for subsequent steps
-- [ ] **Parallel group failure**: if one step in a parallel group fails, the remaining in-progress steps in the group are cancelled within 100 ms, compensations for the steps that already completed run concurrently, and the saga does not proceed to subsequent sequential steps
-- [ ] **Conditional branching**: a step returning `{:ok, output, branch: :express}` causes the saga to skip the steps defined for the `:standard` branch and execute only the `:express` branch steps; skipped steps produce no events in the event log
-- [ ] **Idempotency under re-execution**: a step that is re-executed after a crash using the same idempotency key produces the same observable outcome; if the external system returns "already processed" for the idempotency key, the engine accepts the original recorded output and does not fail
-- [ ] **Dead letter**: a saga where both the forward step and all compensation retries fail enters `dead_letter` status; a `:telemetry` event with event name `saga.dead_letter` is emitted; the saga is queryable via the dead-letter API with its full event log
-- [ ] **Manual dead-letter recovery**: after a saga is in `dead_letter`, calling `DeadLetter.mark_compensation_succeeded(saga_id, step_name)` with a valid audit reason allows the remaining compensations to proceed; the saga ultimately reaches `compensated` status
-- [ ] **Distributed step execution**: in a two-node test cluster, step functions execute on the remote node — verified by checking `node()` inside the step function; if the remote node is killed mid-step, the orchestrator retries the step on the local node and the saga completes or compensates correctly
-- [ ] **Orchestrator failover**: the orchestrator process running on node A is killed along with node A; the orchestrator restarts on node B and resumes all in-progress sagas from their last checkpoint within 10 seconds; no saga is lost and none is double-executed
-- [ ] **Recovery after crash**: a saga in `running` status when the application crashes is detected by the recovery scan at next startup; it resumes execution from the step after the last persisted checkpoint; verified by an integration test that kills the application mid-saga via `:init.stop/0`
-- [ ] **Recovery idempotency**: a step that executed but whose checkpoint was never written — process killed after external call but before `checkpoint/2` — is re-executed on recovery; the external system receives the same idempotency key; the saga does not produce a duplicate side effect; verified with a mock that counts invocations per idempotency key
-- [ ] **Observability trace**: `SagaTracer.get_trace(saga_id)` returns events strictly ordered by monotonic timestamp; every step that executed has a corresponding `step_started` and either `step_completed` or `step_failed` event; total saga duration in the trace is within 5% of wall-clock time
-- [ ] **Telemetry metrics**: running 100 sagas generates exactly 100 `saga.started` events and exactly 100 terminal events across `saga.completed`, `saga.compensated`, and `saga.dead_letter`; no saga start event is emitted without a terminal event after all sagas finish
-- [ ] **Multi-saga dependency**: saga B declared as dependent on saga A does not begin execution until saga A reaches `completed`; if saga A is compensated before completing, saga B enters `blocked` status without executing any of its steps
-- [ ] **Choreography duplicate events**: in choreography mode, delivering the same result event twice for a given step does not cause the step to be recorded as completed twice; the event log contains exactly one `step_completed` event per step regardless of how many times the result event is delivered
-- [ ] **Testing utilities**: `Saga.Testing.simulate_failure/2` causes the next execution of the target step to fail; the saga enters `compensating` status; `Saga.Testing.assert_compensated/1` passes after compensation completes
-- [ ] **E-commerce saga end-to-end**: the reference e-commerce saga (reserve → charge → ship → notify) executes successfully with mock service implementations; when `ship_order` is configured to fail after `charge_payment` succeeded, the saga compensates with `refund_payment` followed by `release_inventory`; the customer is never in a state where payment was captured but no refund was issued
+  defp execute_with_timeout({mod, fun, extra_args}, context, idem_key, timeout) do
+    task = Task.async(fn ->
+      apply(mod, fun, [Map.put(context, :idempotency_key, idem_key) | extra_args])
+    end)
+    case Task.yield(task, timeout) || Task.shutdown(task, :brutal_kill) do
+      {:ok, result} -> result
+      nil -> :timeout
+    end
+  end
 
-## Constraints & Rules
+  defp check_already_completed(backend, saga_id, step_name) do
+    events = backend.read(saga_id)
+    case Enum.find(events, fn e -> e.event_type == :step_completed and e.step_name == step_name end) do
+      nil -> :not_found
+      event -> {:ok, event.data.output}
+    end
+  end
 
-- The orchestrator core — state machine, compensation logic, recovery — must be implemented in pure Elixir/OTP with no external orchestration frameworks; Ecto, Phoenix.PubSub, Horde, and standard library dependencies are permitted
-- Step functions must execute in isolated `Task` processes supervised by a `DynamicSupervisor`; a crashing step function must not crash the orchestrator
-- All saga state transitions must go through a single serialized GenServer per saga instance; no two processes may concurrently mutate the state of the same saga
-- The persistent state backend must be swappable at configuration time without changes to the orchestrator logic; the interface between the orchestrator and the backend is defined by an Elixir behaviour
-- Compensation logic must never depend on external service state — it must use only the data recorded in the saga event log; if a compensation needs a resource identifier, that identifier must have been recorded by the forward step
-- The engine must handle clock skew between nodes: do not use wall-clock timestamps for ordering; use logical event sequence numbers for ordering within a saga
-- No step function or compensation function may be defined as `nil` or omitted; every step that executes must have a defined compensation, even if that compensation is a documented no-op that explicitly states why no reversal is needed
-- The `dead_letter` path must be explicit and observable; silently ignoring a compensation failure is forbidden
-- Test coverage must include at minimum one property-based test using `StreamData` that generates random failure injection points across a five-step saga and asserts that the saga always ends in either `completed` or `compensated`, never stuck or partially compensated
+  defp compute_backoff(:exponential, attempt), do: min(round(1000 * :math.pow(2, attempt)), 30_000)
+  defp compute_backoff(:linear, attempt), do: 1000 * (attempt + 1)
 
-## Stretch Goals
+  defp get_steps(def_mod, saga_type) do
+    def_mod.__saga_definitions__()
+    |> Enum.find(fn {name, _} -> name == saga_type end)
+    |> elem(1)
+  end
 
-- Implement a Sagas-as-a-Service HTTP API: register saga definitions via `POST /sagas/definitions`, start saga instances via `POST /sagas/instances`, and query saga state via `GET /sagas/instances/:id`; expose the complete trace via `GET /sagas/instances/:id/trace`
-- Add a LiveView dashboard that shows all active sagas in real time, their current step, elapsed time, and a visual step progress indicator; auto-updates via PubSub without polling
-- Implement saga versioning: a saga definition may be updated while instances of the previous version are still running; in-flight instances continue using the version they were started with; new instances use the latest version; definitions are stored with a version number and each instance records its definition version at creation time
-- Implement distributed rate limiting on saga starts: a saga type may have a maximum concurrency limit across all nodes; new start requests beyond the limit are queued with a configurable maximum queue depth and queue timeout
-- Implement a saga simulator: given a saga definition and step mock functions with configurable failure probabilities, run 1000 simulated executions concurrently and produce a report showing completion rate, compensation rate, dead-letter rate, average saga duration, average compensation duration, and step failure frequency histogram
-- Support sub-sagas: a step may start a child saga and wait for its completion before the parent step is considered complete; the child saga's compensation is the parent step's compensation; if the child saga fails, the parent step fails and triggers the parent saga's compensation chain
+  defp via(saga_id), do: {:via, Registry, {SagaEngine.Registry, saga_id}}
+end
+```
 
-## Evaluation Criteria
+## Step 4 — Compensation
 
-**Correctness** (40%): the compensation invariant holds under all tested failure scenarios — no saga ends in a partially compensated state; idempotency holds under re-execution with the same idempotency key; recovery resumes from the correct checkpoint every time without skipping or duplicating steps
+```elixir
+defmodule SagaEngine.Compensation do
+  require Logger
 
-**Durability and Recovery** (25%): the engine correctly recovers all in-progress sagas after a full process restart; no saga is lost, duplicated, or stuck in a terminal-but-incorrect state; the event log is the authoritative source of truth and is never corrupted by concurrent writes or partial updates
+  @doc "Execute compensations in reverse order of completed steps"
+  def run(completed_steps, context, saga_id, backend) do
+    # completed_steps is [{step_name, output}] in forward order
+    # Compensate in reverse: last completed first
+    completed_steps
+    |> Enum.reverse()
+    |> Enum.reduce_while(:ok, fn {step_name, step_output}, :ok ->
+      case compensate_step(step_name, step_output, context, saga_id, backend) do
+        :ok -> {:cont, :ok}
+        {:error, reason} -> {:halt, {:error, step_name, reason}}
+      end
+    end)
+  end
 
-**Design and Abstraction** (20%): the saga DSL is expressive and eliminates orchestration boilerplate; the boundary between the orchestrator and the pluggable state backend is clean and enforced by a well-typed behaviour; the orchestrator GenServer is free of infrastructure concerns; step execution and compensation are symmetric in design
+  defp compensate_step(step_name, step_output, context, saga_id, backend) do
+    SagaEngine.EventLog.append(backend, saga_id, :compensation_started, step_name)
+    # TODO: look up compensation function from step definition
+    # TODO: execute with timeout and retry policy
+    # TODO: append :compensation_completed or :compensation_failed
+    :ok
+  end
+end
+```
 
-**Observability** (10%): traces are complete, accurate, and include timing data; telemetry events are correctly structured and cover all lifecycle transitions; dead-letter sagas are discoverable, queryable, and actionable without restarting the application
+## Step 5 — Recovery
 
-**Test Quality** (5%): the property-based test covers arbitrary failure injection points and asserts correctness for all outcomes; the testing utilities are usable from any ExUnit test without additional infrastructure setup; tests are deterministic and do not rely on `Process.sleep` for synchronization
+```elixir
+defmodule SagaEngine.Recovery do
+  require Logger
+
+  @doc "Scan event log at startup and resume in-progress sagas"
+  def run(backend, recovery_timeout_ms \\ 30_000) do
+    active = backend.list_active()  # sagas with status :running or :compensating
+    Logger.info("Recovery: found #{length(active)} in-progress sagas")
+
+    Task.async_stream(active, fn saga_id ->
+      try do
+        resume(saga_id, backend)
+      rescue
+        e ->
+          Logger.error("Recovery failed for saga #{saga_id}: #{inspect(e)}")
+          SagaEngine.EventLog.append(backend, saga_id, :saga_dead_letter, nil,
+            %{reason: "recovery failed: #{inspect(e)}"})
+      end
+    end, max_concurrency: 10, timeout: recovery_timeout_ms)
+    |> Enum.to_list()
+
+    :ok
+  end
+
+  defp resume(saga_id, backend) do
+    events = backend.read(saga_id)
+    state = SagaEngine.EventLog.reconstruct(events)
+    Logger.info("Recovery: resuming saga #{saga_id} from step after last checkpoint")
+    # TODO: find last completed step from events
+    # TODO: determine next step to execute
+    # TODO: start orchestrator GenServer and resume from next step
+    :ok
+  end
+end
+```
+
+## Given tests
+
+```elixir
+# test/support/ecommerce_saga.ex
+defmodule OrderSaga do
+  use SagaEngine.DSL
+
+  defsaga :place_order do
+    step :reserve_inventory,
+      execute: {MockInventory, :reserve, []},
+      compensate: {MockInventory, :release, []},
+      timeout: 5_000,
+      max_attempts: 2
+
+    step :charge_payment,
+      execute: {MockPayment, :charge, []},
+      compensate: {MockPayment, :refund, []},
+      timeout: 5_000,
+      max_attempts: 1
+
+    step :ship_order,
+      execute: {MockFulfillment, :ship, []},
+      compensate: {MockFulfillment, :cancel, []},
+      timeout: 5_000,
+      max_attempts: 2
+
+    step :notify_customer,
+      execute: {MockNotification, :confirm, []},
+      compensate: {MockNotification, :cancel, []},
+      timeout: 5_000,
+      max_attempts: 3
+  end
+end
+
+# test/compensation_test.exs
+defmodule SagaEngine.CompensationTest do
+  use ExUnit.Case, async: false
+  alias SagaEngine.{Orchestrator, EventLog, Testing}
+
+  test "compensation runs in reverse order when step 3 fails" do
+    sequence = Agent.start_link(fn -> [] end) |> elem(1)
+
+    defmodule TraceInventory do
+      def reserve(ctx), do: (Agent.update(:sequence_agent, &[:reserve | &1]); {:ok, "inv-123"})
+      def release(ctx), do: (Agent.update(:sequence_agent, &[:release | &1]); :ok)
+    end
+
+    defmodule TracePayment do
+      def charge(ctx), do: (Agent.update(:sequence_agent, &[:charge | &1]); {:ok, "pay-456"})
+      def refund(ctx), do: (Agent.update(:sequence_agent, &[:refund | &1]); :ok)
+    end
+
+    defmodule TraceShipping do
+      def ship(_ctx), do: {:error, :warehouse_unavailable}
+      def cancel(_ctx), do: :ok  # Should not be called — ship never succeeded
+    end
+
+    Process.register(sequence, :sequence_agent)
+    backend = SagaEngine.Backends.ETS.new()
+    saga_id = "comp-test-#{System.unique_integer()}"
+    {:ok, _} = Orchestrator.start_link(saga_id: saga_id, backend: backend)
+
+    result = Orchestrator.run(saga_id, TraceOrderSaga, :place_order, %{order_id: "001"})
+    assert {:error, :compensated, :ship_order} = result
+
+    seq = Agent.get(sequence, &Enum.reverse/1)
+    # Forward: reserve, charge; then compensation: refund, release
+    assert seq == [:reserve, :charge, :refund, :release]
+  end
+
+  test "compensation failure moves saga to dead_letter" do
+    backend = SagaEngine.Backends.ETS.new()
+    saga_id = "dead-test-#{System.unique_integer()}"
+    # Configure a compensation that always fails
+    Testing.inject_compensation_failure(saga_id, :reserve_inventory)
+    {:ok, _} = Orchestrator.start_link(saga_id: saga_id, backend: backend)
+    result = Orchestrator.run(saga_id, FailOrderSaga, :place_order, %{})
+    assert {:error, :dead_letter, _} = result
+    assert_receive {:telemetry, [:saga_engine, :saga, :dead_letter], _, _}
+  end
+end
+
+# test/recovery_test.exs
+defmodule SagaEngine.RecoveryTest do
+  use ExUnit.Case, async: false
+  @tag timeout: 30_000
+
+  test "saga resumes from checkpoint after orchestrator crash" do
+    backend = SagaEngine.Backends.ETS.new()
+    saga_id = "recovery-test-#{System.unique_integer()}"
+
+    # Start saga, let it complete step 1 then crash
+    {:ok, pid} = SagaEngine.Orchestrator.start_link(saga_id: saga_id, backend: backend)
+    # Inject a delay in step 2 so we can kill mid-saga
+    SagaEngine.Testing.simulate_delay(saga_id, :charge_payment, 500)
+    task = Task.async(fn ->
+      SagaEngine.Orchestrator.run(saga_id, OrderSaga, :place_order, %{order_id: "R001"})
+    end)
+    Process.sleep(100)  # Let step 1 complete
+    Process.exit(pid, :kill)
+
+    # Recovery: restart and resume
+    {:ok, _} = SagaEngine.Orchestrator.start_link(saga_id: saga_id, backend: backend)
+    SagaEngine.Recovery.run(backend)
+
+    result = Task.await(task, 10_000)
+    # Saga should complete or compensate — never stuck
+    assert match?({:ok, _}, result) or match?({:error, :compensated, _}, result)
+
+    # Verify step 1 was not executed twice
+    events = backend.read(saga_id)
+    step1_starts = Enum.count(events, fn e ->
+      e.event_type == :step_started and e.step_name == :reserve_inventory
+    end)
+    assert step1_starts == 1, "reserve_inventory was executed #{step1_starts} times"
+  end
+end
+
+# test/property/invariant_test.exs
+defmodule SagaEngine.InvariantPropertyTest do
+  use ExUnit.Case, async: false
+  use ExUnitProperties
+
+  property "saga always ends in :completed or :compensated, never stuck" do
+    check all(
+      failure_steps <- list_of(member_of([:reserve_inventory, :charge_payment, :ship_order, :notify_customer])),
+      min_runs: 200
+    ) do
+      backend = SagaEngine.Backends.ETS.new()
+      saga_id = "prop-#{:rand.uniform(9_999_999)}"
+
+      # Inject failures for randomly selected steps
+      Enum.each(failure_steps, fn step ->
+        SagaEngine.Testing.simulate_failure(saga_id, step)
+      end)
+
+      {:ok, _} = SagaEngine.Orchestrator.start_link(saga_id: saga_id, backend: backend)
+      result = SagaEngine.Orchestrator.run(saga_id, OrderSaga, :place_order, %{})
+
+      final_status = case result do
+        {:ok, _} -> :completed
+        {:error, :compensated, _} -> :compensated
+        {:error, :dead_letter, _} -> :dead_letter
+      end
+
+      assert final_status in [:completed, :compensated, :dead_letter],
+        "Saga ended in unexpected status: #{inspect(result)}"
+
+      if final_status == :compensated do
+        SagaEngine.Testing.assert_compensated!(saga_id, backend)
+      end
+    end
+  end
+end
+```
+
+## Benchmark
+
+```elixir
+# bench/throughput.exs
+defmodule SagaEngine.Bench.Throughput do
+  @saga_count 1_000
+  @concurrency 50
+
+  def run do
+    backend = SagaEngine.Backends.ETS.new()
+    IO.puts("Running #{@saga_count} sagas with concurrency #{@concurrency}")
+    t0 = System.monotonic_time(:millisecond)
+
+    results =
+      1..@saga_count
+      |> Task.async_stream(fn i ->
+        saga_id = "bench-#{i}"
+        {:ok, _} = SagaEngine.Orchestrator.start_link(saga_id: saga_id, backend: backend)
+        SagaEngine.Orchestrator.run(saga_id, OrderSaga, :place_order, %{order_id: i})
+      end, max_concurrency: @concurrency, timeout: 60_000)
+      |> Enum.to_list()
+
+    elapsed_ms = System.monotonic_time(:millisecond) - t0
+    completed = Enum.count(results, fn {:ok, r} -> match?({:ok, _}, r) end)
+    failed = @saga_count - completed
+
+    IO.puts("Completed: #{completed}, Failed: #{failed}")
+    IO.puts("Total time: #{elapsed_ms} ms")
+    IO.puts("Throughput: #{Float.round(@saga_count / (elapsed_ms / 1000), 0)} sagas/s")
+  end
+end
+
+SagaEngine.Bench.Throughput.run()
+```
+
+## Trade-offs
+
+| Design | Selected approach | Alternative | Trade-off |
+|---|---|---|---|
+| Saga state | Append-only event log (event sourcing) | Current-state snapshot | Snapshot: simpler queries; event log: full audit trail, replay for recovery |
+| Orchestration | Central GenServer per saga | Choreography (no central coordinator) | Choreography: no single point of failure; orchestration: easier to reason about, clearer compensation order |
+| Compensation data | Stored in event log from forward step output | Re-query external service | Re-query: may fail or return stale data; event log: always available, exactly the right data |
+| Recovery | Replay event log | Restart from snapshot | Replay: always correct; snapshot: faster but snapshot may be stale |
+| Dead letter | Explicit state with manual intervention API | Infinite retry | Infinite retry: blocks other sagas; explicit DLQ: actionable by operators |
+
+## Production mistakes
+
+**Compensation function calling external service without the stored output.** `refund_payment` must receive the payment transaction ID returned by `charge_payment`. If it queries the payment service to get the transaction ID, the service may return nothing (transaction was never recorded on their side, e.g., timeout) or the wrong transaction. Always pass the forward step's output to the compensation function — and always persist the output before advancing.
+
+**Not handling idempotency key collision on retry.** If `charge_payment` times out (HTTP timeout, not service timeout), the payment may or may not have been processed. The retry uses the same idempotency key. The payment service must return "already processed" for the same key. If the service returns an error for duplicate keys (not all payment services support idempotency keys), the retry charges the customer twice. Verify idempotency support with each external service before using retries.
+
+**Parallel compensation not waiting for all compensations.** If steps A and B ran in parallel and both succeeded, and a later step fails, compensations for A and B must also run in parallel. More importantly, the saga must NOT proceed to compensate earlier steps until BOTH A-comp and B-comp complete. A naive sequential loop misses this.
+
+**Recovery running two orchestrators for the same saga.** If recovery starts a new orchestrator for saga X, and the original orchestrator (which was thought to be dead) reconnects (network partition, not crash), both run concurrently and may execute the same step twice. Use `:global.register_name/2` or Horde for distributed process registration to ensure at most one orchestrator per saga ID.
+
+**Storing compensation results separately from the event log.** Some implementations write "saga state" to a separate table and use the event log only for audit. This introduces a consistency window: if the process crashes after updating the event log but before updating the state table, the two disagree. The event log must be the single source of truth — derive all state from it.
+
+## Resources
+
+- Garcia-Molina & Salem — "Sagas" (1987) — ACM SIGMOD (original paper)
+- Richardson — "Microservices Patterns" Chapter 4: Managing transactions with Sagas (Manning, 2018)
+- Kleppmann — "Designing Data-Intensive Applications" Chapter 9: Consistency and Consensus
+- Temporal documentation — https://docs.temporal.io (production saga orchestration reference)
+- Fowler — "Event Sourcing" — https://martinfowler.com/eaaDev/EventSourcing.html
+- Horde library — https://github.com/derekkraan/horde (distributed process registry and supervisor)
+- Ecto.Multi documentation — https://hexdocs.pm/ecto/Ecto.Multi.html (for state backend implementation)

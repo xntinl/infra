@@ -13,12 +13,12 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "challenges/elixir/01-basico/01-setup-and-mix/01-setup-and-mix.md",
+                "file": "challenges/elixir/04-insane/01-build-distributed-raft-consensus/01-build-distributed-raft-consensus.md",
                 "mode": "source",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "01-setup-and-mix"
+              "title": "01-build-distributed-raft-consensus"
             }
           }
         ]
@@ -210,6 +210,7 @@
   },
   "active": "e170d91267f0c529",
   "lastOpenFiles": [
+    "challenges/elixir/01-basico/01-setup-and-mix/01-setup-and-mix.md",
     "challenges/elixir/es/01-basico/15-structs-and-basic-validation/15-structs-and-basic-validation.md",
     "challenges/elixir/en/01-basico/15-structs-and-basic-validation/15-structs-and-basic-validation.md",
     "challenges/elixir/es/01-basico/14-modules-and-function-visibility/14-modules-and-function-visibility.md",
@@ -235,7 +236,6 @@
     "challenges/elixir/en/01-basico/05-tuples-and-pattern-matching-intro/05-tuples-and-pattern-matching-intro.md",
     "challenges/elixir/es/01-basico/04-strings-and-binaries-basics/04-strings-and-binaries-basics.md",
     "challenges/elixir/en/01-basico/04-strings-and-binaries-basics/04-strings-and-binaries-basics.md",
-    "challenges/elixir/es/01-basico/03-numbers-and-arithmetic/03-numbers-and-arithmetic.md",
     "challenges/elixir/es/01-basico/15-structs-and-basic-validation",
     "challenges/elixir/es/01-basico/14-modules-and-function-visibility",
     "challenges/elixir/es/01-basico/13-anonymous-functions-and-closures",
