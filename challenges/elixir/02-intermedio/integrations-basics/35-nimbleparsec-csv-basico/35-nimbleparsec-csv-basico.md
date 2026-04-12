@@ -1,278 +1,276 @@
-# NimbleParsec: Parser Combinators for Structured Input
+# Parsing CSV with NimbleParsec (quotes, escapes, and all)
 
-## Goal
+**Project**: `csv_parser_nimble` — a hand-built CSV parser using `NimbleParsec` combinators, including the RFC-4180 double-quote escaping rule.
 
-Build a CSV parser for `task_queue` job batch imports using NimbleParsec. Handle quoted fields, escaped quotes, Unicode characters, empty fields, and both Unix and Windows line endings. Learn why parser combinators are more maintainable than regex for structured formats.
+**Difficulty**: ★★★☆☆
+**Estimated time**: 3–4 hours
 
 ---
 
-## Why NimbleParsec and not `String.split` or regex
+## Project context
 
-`String.split(line, ",")` fails for `"Smith, John",30` -- the comma inside the quotes is a field separator, not a value comma.
+CSV looks trivial until you read RFC 4180 and realize it isn't: fields can
+be quoted; quoted fields can contain commas, newlines, and literal double
+quotes escaped as `""`. `String.split/2` does not handle any of that. A
+regex technically can, but it's unreadable and slow on big files.
 
-Regular expressions can handle CSV, but the expression is opaque. Every edge case adds another branch.
+`NimbleParsec` is Dashbit's parser-combinator library: you compose tiny
+parsers (`ascii_char`, `string`, `choice`, `repeat`) into bigger ones,
+and at compile time it generates an efficient recursive-descent parser.
+It's what Phoenix, Calendar, and Floki use for their grammars. Writing a
+CSV parser by hand is the canonical first NimbleParsec exercise because
+the grammar is small but has enough subtleties (escaping!) to matter.
 
-NimbleParsec composes parsers from named building blocks. Each combinator is testable in isolation. Adding a new edge case is adding a new combinator, not modifying a regex. NimbleParsec also generates parser code at compile time via macros, so performance is excellent.
+Project structure:
+
+```
+csv_parser_nimble/
+├── lib/
+│   └── csv_parser_nimble.ex
+├── test/
+│   └── csv_parser_nimble_test.exs
+└── mix.exs
+```
+
+---
+
+## Core concepts
+
+### 1. Parser-combinators as a pipeline
+
+```elixir
+defparsec :field, choice([quoted_field, unquoted_field])
+```
+
+`defparsec/2` compiles a parser into a function you can call with a
+binary input. It returns `{:ok, results, rest, context, line, column}` or
+`{:error, reason, rest, context, line, column}`. You compose a grammar by
+naming sub-parsers with `defparsecp` (private) and gluing them together
+with `choice`, `concat`, `repeat`, `optional`, `times`.
+
+### 2. `utf8_char` vs `ascii_char`
+
+`ascii_char([not: ?,])` — matches one ASCII byte that is not a comma.
+`utf8_char([not: ?,])` — matches one UTF-8 codepoint that is not a comma.
+
+CSV data is often not pure ASCII (accents, emoji). Use `utf8_char` for
+text fields. Use `ascii_char` for structural punctuation (commas, quotes,
+newlines) because they're always single-byte.
+
+### 3. The escaped-quote rule
+
+In a quoted field, a literal `"` is written as `""`. So `"He said ""hi"""`
+parses to the string `He said "hi"`. The trick is to express this as
+"either any non-quote codepoint, or a two-char sequence `""` that emits
+a single `"`".
+
+```
+quoted_field = `"` ( not_quote | `""`→`"` )* `"`
+```
+
+### 4. `reduce/3` — post-process match results into a single value
+
+A parser builds a list of matched tokens. `reduce/3` lets you fold them
+into one term — e.g. a list of chars into a binary via `List.to_string/1`.
+This keeps the parser output tidy without a post-walk.
+
+### 5. Compile-time vs runtime
+
+`defparsec` generates code at compile time. That means grammar changes
+require a recompile; it also means the parser is as fast as hand-written
+Elixir pattern matching (which is what it compiles to). This is why
+NimbleParsec is preferred over runtime parser-combinator libraries for
+hot-path code.
 
 ---
 
 ## Implementation
 
-### Step 1: `mix.exs`
+### Step 1: Create the project
+
+```bash
+mix new csv_parser_nimble
+cd csv_parser_nimble
+```
+
+Add `:nimble_parsec` in `mix.exs`:
 
 ```elixir
-defmodule TaskQueue.MixProject do
-  use Mix.Project
-
-  def project do
-    [
-      app: :task_queue,
-      version: "0.1.0",
-      elixir: "~> 1.15",
-      start_permanent: Mix.env() == :prod,
-      deps: deps()
-    ]
-  end
-
-  def application do
-    [extra_applications: [:logger]]
-  end
-
-  defp deps do
-    [
-      {:nimble_parsec, "~> 1.4"}
-    ]
-  end
+defp deps do
+  [
+    {:nimble_parsec, "~> 1.4"}
+  ]
 end
 ```
 
-### Step 2: `lib/task_queue/csv_parser.ex`
+Run `mix deps.get`.
 
-The parser is built from small composable pieces:
-
-- `escaped_quote`: inside a quoted field, `""` represents a literal `"` character
-- `non_quote_char`: any UTF-8 character that is not `"`
-- `quoted_field`: content between `"..."`, with `""` unescaped to `"`
-- `unquoted_field`: any characters except `,`, `\n`, `\r`
-- `field`: either a quoted or unquoted field
-- `row`: a field followed by zero or more `, field` pairs
-- `line_ending`: `\r\n` (Windows) or `\n` (Unix)
-
-The `reduce({List, :to_string, []})` combinator collects the matched codepoints into a single string. The `ignore/1` combinator drops delimiters (quotes, commas, newlines) from the output.
-
-`parse_rows/1` splits the input by line endings first, then parses each line individually. This is simpler than trying to track row boundaries in a flat list of fields from the parser.
-
-`parse_with_headers/1` treats the first row as header keys and zips them with each subsequent row to produce maps.
+### Step 2: `lib/csv_parser_nimble.ex`
 
 ```elixir
-defmodule TaskQueue.CsvParser do
+defmodule CsvParserNimble do
   @moduledoc """
-  CSV parser for the task_queue job batch import format.
+  A small, RFC-4180-aware CSV parser built with NimbleParsec.
 
-  Handles quoted fields, escaped quotes, Unicode, empty fields,
-  and both Unix (LF) and Windows (CRLF) line endings.
+  Supported:
+    * Comma separator, LF or CRLF line terminators.
+    * Quoted fields with embedded commas, CRs, LFs, and `""`-escaped quotes.
+    * UTF-8 field contents.
+
+  Not supported (intentional, to keep the grammar teachable):
+    * Configurable separator (always `,`).
+    * Streaming — `parse/1` expects the whole document in memory.
+    * Header extraction — callers can `[headers | rows]` themselves.
   """
 
   import NimbleParsec
 
-  escaped_quote =
-    ignore(ascii_char([?"]))
-    |> ascii_char([?"])
+  # --- Character classes ----------------------------------------------------
+  # Structural bytes are always ASCII, so `ascii_char` is fine here.
+  comma = ascii_char([?,])
+  dquote = ascii_char([?"])
 
-  non_quote_char =
-    utf8_char([{:not, ?"}])
+  # End-of-line is LF or CRLF. Match CRLF first so CR doesn't get swallowed
+  # by something else (like an unquoted char) before we see the LF.
+  eol = choice([string("\r\n"), string("\n")]) |> replace(:eol)
 
-  quoted_field =
-    ignore(ascii_char([?"]))
-    |> repeat(choice([escaped_quote, non_quote_char]))
-    |> ignore(ascii_char([?"]))
-    |> reduce({List, :to_string, []})
+  # --- Unquoted field -------------------------------------------------------
+  # Anything except comma, CR, LF, or double-quote. UTF-8 codepoints allowed.
+  unquoted_char = utf8_char([{:not, ?,}, {:not, ?\r}, {:not, ?\n}, {:not, ?"}])
 
   unquoted_field =
-    repeat(utf8_char([{:not, ?,}, {:not, ?\n}, {:not, ?\r}]))
+    repeat(unquoted_char)
     |> reduce({List, :to_string, []})
+    |> unwrap_and_tag(:field)
 
+  # --- Quoted field ---------------------------------------------------------
+  # Inside a quoted field:
+  #   - any codepoint that isn't `"` is literal, OR
+  #   - `""` is a single literal `"`.
+  escaped_quote = string(~s("")) |> replace(?")
+  quoted_char = choice([utf8_char([{:not, ?"}]), escaped_quote])
+
+  quoted_field =
+    ignore(dquote)
+    |> repeat(quoted_char)
+    |> ignore(dquote)
+    |> reduce({List, :to_string, []})
+    |> unwrap_and_tag(:field)
+
+  # A field is quoted OR unquoted. Order matters: try quoted first, because
+  # an unquoted field happily matches zero chars and would beat quoted to it.
   field = choice([quoted_field, unquoted_field])
 
-  comma = ignore(ascii_char([?,]))
+  # --- Record (one line of N fields) ---------------------------------------
+  # A record is: field, (`,` field)*.
+  record =
+    field
+    |> repeat(ignore(comma) |> concat(field))
+    |> tag(:record)
 
-  row = field |> repeat(comma |> concat(field))
+  # --- Document -------------------------------------------------------------
+  # A document is one or more records separated by EOLs, with an optional
+  # trailing EOL.
+  document =
+    record
+    |> repeat(ignore(eol) |> concat(record))
+    |> optional(ignore(eol))
 
-  line_ending = choice([string("\r\n"), string("\n")])
+  defparsec :parse_document, document
 
-  csv =
-    row
-    |> repeat(ignore(line_ending) |> concat(row))
-    |> ignore(optional(line_ending))
-
-  @doc false
-  defparsec :parse_row_raw, row
-  @doc false
-  defparsec :parse_csv_raw, csv
+  # --- Public API -----------------------------------------------------------
 
   @doc """
-  Parses a single CSV line into a list of field strings.
-
-  Returns `{:ok, [field, ...]}` or `{:error, reason}`.
+  Parses a CSV document into a list of rows. Each row is a list of strings.
 
   ## Examples
 
-      iex> TaskQueue.CsvParser.parse_line("type,handler,priority")
-      {:ok, ["type", "handler", "priority"]}
-
-      iex> TaskQueue.CsvParser.parse_line(~s("Smith, John",30,"high"))
-      {:ok, ["Smith, John", "30", "high"]}
-
+      iex> CsvParserNimble.parse("a,b,c\\n1,\\"2,2\\",3\\n")
+      {:ok, [["a", "b", "c"], ["1", "2,2", "3"]]}
   """
-  @spec parse_line(String.t()) :: {:ok, [String.t()]} | {:error, term()}
-  def parse_line(line) when is_binary(line) do
-    case parse_row_raw(line) do
-      {:ok, fields, "", _, _, _} -> {:ok, fields}
-      {:ok, _, rest, _, _, _}    -> {:error, "unexpected input: #{inspect(rest)}"}
-      {:error, reason, _, _, _, _} -> {:error, reason}
+  @spec parse(binary()) :: {:ok, [[String.t()]]} | {:error, String.t()}
+  def parse(input) when is_binary(input) do
+    case parse_document(input) do
+      {:ok, tagged, "", _context, _line, _col} ->
+        {:ok, Enum.map(tagged, &extract_record/1)}
+
+      {:ok, _, rest, _, line, col} ->
+        {:error, "trailing unparsed input at line #{line}, column #{col}: #{inspect(rest)}"}
+
+      {:error, reason, rest, _, line, col} ->
+        {:error, "#{reason} at line #{line}, column #{col}: #{inspect(rest)}"}
     end
   end
 
-  @doc """
-  Parses a multi-line CSV string into a list of rows.
-
-  Returns `{:ok, [[field, ...], ...]}` or `{:error, reason}`.
-
-  ## Examples
-
-      iex> TaskQueue.CsvParser.parse_rows("a,b\\nc,d")
-      {:ok, [["a", "b"], ["c", "d"]]}
-
-  """
-  @spec parse_rows(String.t()) :: {:ok, [[String.t()]]} | {:error, term()}
-  def parse_rows(input) when is_binary(input) do
-    input
-    |> String.split(~r/\r?\n/, trim: true)
-    |> Enum.reduce_while([], fn line, acc ->
-      case parse_line(line) do
-        {:ok, fields} -> {:cont, [fields | acc]}
-        {:error, _} = err -> {:halt, err}
-      end
-    end)
-    |> case do
-      {:error, _} = err -> err
-      rows -> {:ok, Enum.reverse(rows)}
-    end
-  end
-
-  @doc """
-  Parses a CSV string with a header row.
-
-  Returns `{:ok, [%{header => value, ...}, ...]}` or `{:error, reason}`.
-
-  ## Examples
-
-      iex> csv = "type,handler\\nsend_email,TaskQueue.Handlers.Email"
-      iex> TaskQueue.CsvParser.parse_with_headers(csv)
-      {:ok, [%{"type" => "send_email", "handler" => "TaskQueue.Handlers.Email"}]}
-
-  """
-  @spec parse_with_headers(String.t()) :: {:ok, [map()]} | {:error, term()}
-  def parse_with_headers(input) when is_binary(input) do
-    with {:ok, [headers | data_rows]} <- parse_rows(input) do
-      maps = Enum.map(data_rows, fn row -> Enum.zip(headers, row) |> Map.new() end)
-      {:ok, maps}
-    end
-  end
+  # Each record comes back as `{:record, [{:field, "a"}, {:field, "b"}, ...]}`.
+  defp extract_record({:record, fields}), do: Enum.map(fields, fn {:field, v} -> v end)
 end
 ```
 
-### Step 3: Tests
+### Step 3: `test/csv_parser_nimble_test.exs`
 
 ```elixir
-# test/task_queue/csv_parser_test.exs
-defmodule TaskQueue.CsvParserTest do
+defmodule CsvParserNimbleTest do
   use ExUnit.Case, async: true
+  doctest CsvParserNimble
 
-  alias TaskQueue.CsvParser
-
-  describe "parse_line/1 -- single row" do
-    test "simple fields without quotes" do
-      assert {:ok, ["type", "handler", "priority"]} =
-        CsvParser.parse_line("type,handler,priority")
+  describe "parse/1 — unquoted fields" do
+    test "single row, three fields" do
+      assert {:ok, [["a", "b", "c"]]} = CsvParserNimble.parse("a,b,c")
     end
 
-    test "quoted field with comma inside" do
-      assert {:ok, ["Smith, John", "30"]} =
-        CsvParser.parse_line(~s("Smith, John",30))
+    test "empty fields are preserved" do
+      assert {:ok, [["a", "", "c"]]} = CsvParserNimble.parse("a,,c")
     end
 
-    test "escaped quote inside quoted field" do
-      assert {:ok, ["He said \"hello\"", "done"]} =
-        CsvParser.parse_line(~s("He said ""hello""",done))
+    test "multiple rows separated by LF" do
+      assert {:ok, [["1", "2"], ["3", "4"]]} = CsvParserNimble.parse("1,2\n3,4")
     end
 
-    test "empty fields" do
-      assert {:ok, ["type", "", "priority"]} =
-        CsvParser.parse_line("type,,priority")
+    test "multiple rows separated by CRLF" do
+      assert {:ok, [["1", "2"], ["3", "4"]]} = CsvParserNimble.parse("1,2\r\n3,4")
     end
 
-    test "unicode characters in unquoted field" do
-      assert {:ok, ["cafe", "resume"]} = CsvParser.parse_line("cafe,resume")
-    end
-
-    test "unicode characters in quoted field" do
-      assert {:ok, ["cafe, naive"]} = CsvParser.parse_line(~s("cafe, naive"))
-    end
-
-    test "single field with no comma" do
-      assert {:ok, ["hello"]} = CsvParser.parse_line("hello")
-    end
-
-    test "all quoted fields" do
-      assert {:ok, ["a", "b", "c"]} = CsvParser.parse_line(~s("a","b","c"))
+    test "trailing newline is accepted" do
+      assert {:ok, [["x"]]} = CsvParserNimble.parse("x\n")
     end
   end
 
-  describe "parse_rows/1 -- multiple rows" do
-    test "two rows" do
-      assert {:ok, [["a", "b"], ["c", "d"]]} = CsvParser.parse_rows("a,b\nc,d")
+  describe "parse/1 — quoted fields" do
+    test "embedded commas don't split the field" do
+      assert {:ok, [["a", "b,c", "d"]]} = CsvParserNimble.parse(~s(a,"b,c",d))
     end
 
-    test "windows line endings (CRLF)" do
-      assert {:ok, [["a", "b"], ["c", "d"]]} = CsvParser.parse_rows("a,b\r\nc,d")
+    test "embedded newlines are preserved" do
+      assert {:ok, [["a", "line1\nline2", "z"]]} =
+               CsvParserNimble.parse(~s(a,"line1\nline2",z))
     end
 
-    test "trailing newline is ignored" do
-      assert {:ok, [["a", "b"]]} = CsvParser.parse_rows("a,b\n")
+    test ~s("" inside a quoted field becomes a literal ") do
+      assert {:ok, [["a", ~s(he said "hi"), "z"]]} =
+               CsvParserNimble.parse(~s(a,"he said ""hi""",z))
     end
 
-    test "three rows with quoted fields" do
-      csv = ~s(type,handler\nsend_email,"TaskQueue.Handlers.Email"\nsend_sms,"TaskQueue.Handlers.SMS")
-      assert {:ok, rows} = CsvParser.parse_rows(csv)
-      assert length(rows) == 3
+    test "empty quoted field" do
+      assert {:ok, [["a", "", "z"]]} = CsvParserNimble.parse(~s(a,"",z))
     end
   end
 
-  describe "parse_with_headers/1 -- header row" do
-    test "maps each row to header keys" do
-      csv = "type,handler,priority\nsend_email,TaskQueue.Handlers.Email,high"
-      assert {:ok, [row]} = CsvParser.parse_with_headers(csv)
-      assert row["type"] == "send_email"
-      assert row["handler"] == "TaskQueue.Handlers.Email"
-      assert row["priority"] == "high"
+  describe "parse/1 — UTF-8" do
+    test "accepts multi-byte characters in unquoted fields" do
+      assert {:ok, [["café", "niño", "🚀"]]} = CsvParserNimble.parse("café,niño,🚀")
     end
 
-    test "multiple data rows" do
-      csv = "type,priority\nsend_email,high\nsend_sms,low"
-      assert {:ok, rows} = CsvParser.parse_with_headers(csv)
-      assert length(rows) == 2
-      assert hd(rows)["type"] == "send_email"
+    test "accepts multi-byte characters in quoted fields" do
+      assert {:ok, [["a", "día, soleado", "z"]]} =
+               CsvParserNimble.parse(~s(a,"día, soleado",z))
     end
+  end
 
-    test "quoted values in data rows" do
-      csv = ~s(type,handler\n"send_email","TaskQueue.Handlers.Email")
-      assert {:ok, [row]} = CsvParser.parse_with_headers(csv)
-      assert row["type"] == "send_email"
-    end
-
-    test "returns error for invalid CSV" do
-      assert {:error, _} = CsvParser.parse_with_headers("only one field")
+  describe "parse/1 — errors" do
+    test "unterminated quoted field is reported" do
+      assert {:error, reason} = CsvParserNimble.parse(~s(a,"unterminated,z))
+      assert reason =~ "line"
     end
   end
 end
@@ -281,47 +279,54 @@ end
 ### Step 4: Run
 
 ```bash
-mix deps.get
-mix test test/task_queue/csv_parser_test.exs --trace
+mix test
 ```
 
 ---
 
-## Trade-off analysis
+## Trade-offs and production gotchas
 
-| Approach | Handles quoted commas | Escaped quotes | Unicode | Maintainability |
-|----------|-----------------------|---------------|---------|----------------|
-| `String.split(",")` | no | no | yes | high (simple) |
-| Regex | yes (complex) | yes (complex) | yes | low (opaque) |
-| NimbleParsec | yes | yes | yes | high (named combinators) |
-| `NimbleCSV` library | yes | yes | yes | high (drop-in) |
+**1. NimbleParsec is compile-time only**
+Your grammar is frozen at compile. If you need a user-configurable
+separator (`;` or `\t`), either generate multiple parsers at compile time
+(one per separator) or use a runtime solution like `NimbleCSV`'s
+pre-built parsers. Do not rebuild the parser at runtime — you'd lose
+the speed that justified NimbleParsec.
 
-NimbleParsec generates parser code at compile time. If you change the grammar in `csv_parser.ex`, only `csv_parser.ex` itself needs recompilation -- modules that call `CsvParser.parse_line/1` do not change.
+**2. This parser is non-streaming**
+`parse/1` takes the full binary. For gigabyte CSVs you want `NimbleCSV`
+(same authors) which is line-oriented and streams. The grammar here is
+for learning; `NimbleCSV` is the library you ship.
 
----
+**3. Error messages are positional, not semantic**
+NimbleParsec reports "expected X" at a line/column, not "you forgot to
+close a quote". Good enough for developer-facing errors, wrong tool for
+showing messages to end users. Wrap `{:error, _}` with your own
+domain-level diagnostics if users see them.
 
-## Common production mistakes
+**4. Beware `utf8_char` in hot loops**
+UTF-8 decoding is more expensive than byte matching. If your CSV is
+known-ASCII (many machine-generated files are), swapping to `ascii_char`
+gives a measurable speedup.
 
-**1. Not handling `{:ok, fields, rest, _, _, _}` where `rest` is non-empty**
-A successful parse can still have unconsumed input. Always check `rest == ""`.
+**5. The grammar deliberately rejects quotes in unquoted fields**
+`"hello"world` or `hel"lo` are not valid RFC-4180. This parser will
+fail on them (the quote puts it into quoted mode). If your real-world
+input is dirty, you'll need a permissive mode — and you'll cry.
 
-**2. Using `ascii_char/1` for multi-byte UTF-8 instead of `utf8_char/1`**
-`ascii_char/1` matches single bytes. For UTF-8 characters, use `utf8_char/1`.
-
-**3. Forgetting that `repeat/1` can succeed with zero repetitions**
-`repeat(field)` matches zero or more. Use `times(field, min: 1)` if at least one is required.
-
-**4. Building the grammar in function bodies instead of module-level `defparsec`**
-`defparsec` generates optimized parser functions at compile time. Calling combinators at runtime defeats the purpose.
-
-**5. Not handling Windows line endings (`\r\n`)**
-Files from Windows use `\r\n`. `String.split(input, "\n")` leaves a trailing `\r` on every line.
+**6. When NOT to use NimbleParsec**
+- For CSV specifically, use `NimbleCSV` — faster, streaming, battle-tested.
+- For JSON, use `Jason`. Never hand-roll.
+- For "I just need to split on commas", use `String.split/2`.
+- NimbleParsec shines when you own a DSL or a format with no library:
+  query languages, config files, protocol headers.
 
 ---
 
 ## Resources
 
-- [NimbleParsec -- official hex package](https://hexdocs.pm/nimble_parsec/NimbleParsec.html)
-- [NimbleCSV -- drop-in CSV library built on NimbleParsec](https://hexdocs.pm/nimble_csv/NimbleCSV.html)
-- [Parser combinators explained -- Sasa Juric](https://www.theerlangelist.com/article/parser_combinators)
-- [CSV RFC 4180 -- the standard](https://www.rfc-editor.org/rfc/rfc4180)
+- [`NimbleParsec` — hexdocs](https://hexdocs.pm/nimble_parsec/)
+- [Dashbit blog — NimbleParsec announcements and deep dives](https://dashbit.co/blog/)
+- [`NimbleCSV`](https://hexdocs.pm/nimble_csv/) — the production-grade CSV parser you'd actually ship
+- [RFC 4180 — the CSV spec](https://datatracker.ietf.org/doc/html/rfc4180)
+- [`NimbleParsec.Helpers` — combinator cheat sheet](https://hexdocs.pm/nimble_parsec/NimbleParsec.html#functions)

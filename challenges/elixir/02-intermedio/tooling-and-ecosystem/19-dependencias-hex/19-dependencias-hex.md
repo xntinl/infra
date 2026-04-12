@@ -1,38 +1,106 @@
-# Hex Dependencies and mix.lock
+# Managing dependencies with Hex
 
-## Goal
+**Project**: `deps_intro` — a tiny app that declares Hex, path, and Git
+dependencies and teaches you how version constraints and the lockfile
+actually work.
 
-Build a `task_queue` project that uses external Hex dependencies for JSON encoding, HTTP requests, and dev tooling. Learn how `mix.exs` manages dependencies by environment, why `mix.lock` matters, and how the `~>` operator controls version ranges.
-
----
-
-## Why the lockfile is a production concern
-
-`mix.lock` records exact resolved versions including transitive dependencies. Without committing it, two developers running `mix deps.get` on the same `mix.exs` may resolve different transitive versions. A bug that only reproduces on CI often traces back to a missing or inconsistent lockfile.
-
-The lockfile also records SHA hashes of downloaded tarballs, making supply-chain tampering detectable.
-
-```
-mix.lock entry anatomy:
-"jason": {:hex, :jason, "1.4.4",
-  "b9226785a9aa77b6857ca22832cffa5d5150298a",   <- tarball SHA
-  [:mix], [{:decimal, "~> 1.0 or ~> 2.0", [hex: :decimal, optional: true]}],
-  "hexpm", "..."}
-```
-
-Rule: `mix.lock` is always committed alongside `mix.exs`. It is never in `.gitignore`.
+**Difficulty**: ★★☆☆☆
+**Estimated time**: 1–2 hours
 
 ---
 
-## Why `~>` and not `>=`
+## Project context
 
-`~>` (the optimistic operator) pins the upper bound to the next breaking version:
+Every Elixir project is a `mix.exs` with a `deps/0` list. New developers
+copy/paste `{:jason, "~> 1.4"}` without understanding what the `~>` does,
+what `mix.lock` is for, or the difference between `mix deps.get` and
+`mix deps.update`. This exercise exists to make those mechanics concrete.
 
-- `~> 1.4` means `>= 1.4.0 and < 2.0.0` -- allows minor and patch bumps
-- `~> 1.4.2` means `>= 1.4.2 and < 1.5.0` -- only allows patch bumps
-- `>= 1.4.0` has no upper bound -- could resolve `2.0.0` with breaking changes
+You'll declare three kinds of dependencies — a Hex package, a path dep
+(for local development inside an umbrella), and a Git dep (for a fork or
+an unpublished library) — and walk through the four commands that anyone
+maintaining an Elixir project runs weekly:
 
-For stable, widely-used libraries like Jason, `~> 1.4` is idiomatic. For less stable APIs, `~> 1.4.2` gives tighter control.
+| Command                    | What it actually does                                   |
+|----------------------------|---------------------------------------------------------|
+| `mix deps.get`             | Download deps to match `mix.lock`; create it if absent. |
+| `mix deps.update jason`    | Rewrite `mix.lock` for one dep; respect `mix.exs`.      |
+| `mix deps.update --all`    | Rewrite `mix.lock` for all deps; respect `mix.exs`.     |
+| `mix deps.unlock --unused` | Drop entries from `mix.lock` that no longer appear.     |
+
+Project structure:
+
+```
+deps_intro/
+├── lib/
+│   └── deps_intro.ex
+├── test/
+│   └── deps_intro_test.exs
+├── mix.exs
+└── mix.lock      # generated — COMMIT THIS
+```
+
+---
+
+## Core concepts
+
+### 1. Version constraints: `~>`, `>=`, `==`
+
+Hex uses SemVer. The constraint controls which NEW versions `deps.update`
+is allowed to pick.
+
+| Constraint           | Accepts                          | Example        |
+|----------------------|----------------------------------|----------------|
+| `"~> 1.4"`           | `>= 1.4.0 and < 2.0.0`           | most common    |
+| `"~> 1.4.2"`         | `>= 1.4.2 and < 1.5.0`           | stricter patch |
+| `">= 1.4.0"`         | anything ≥ 1.4.0 (no upper!)     | avoid in libs  |
+| `"== 1.4.2"`         | exactly 1.4.2                    | pinning        |
+| `"~> 1.4 or ~> 2.0"` | either major line                | migration time |
+
+**Rule of thumb**: apps use `~> MAJOR.MINOR`, libraries use `~> MAJOR.MINOR`
+and lean on SemVer + the lockfile to prevent surprises.
+
+### 2. `mix.lock` is the source of truth for reproducible builds
+
+`mix.exs` says "I want Jason ~> 1.4". `mix.lock` says "I resolved it to
+1.4.4 with checksum abc123". CI and your teammates install **from
+`mix.lock`**, not from `mix.exs`. Always commit it.
+
+`deps.get` creates/respects the lock. `deps.update` deliberately ignores
+the lock for the deps you name, re-resolves within the constraint, and
+rewrites the lock.
+
+### 3. Path deps for umbrellas and local development
+
+```elixir
+{:core, path: "../core"}
+{:core, path: "../core", in_umbrella: true}  # umbrella apps
+```
+
+Path deps are recompiled on every change — no publishing, no caching. They
+do NOT go into `mix.lock`. Use them only during local development.
+
+### 4. Git deps for forks and unreleased code
+
+```elixir
+{:some_lib, git: "https://github.com/you/some_lib.git", tag: "v0.3.1"}
+{:some_lib, git: "https://github.com/you/some_lib.git", branch: "main"}
+{:some_lib, git: "https://github.com/you/some_lib.git", ref: "abc1234"}
+```
+
+Git deps **do** go into the lockfile (pinned to a SHA). Prefer `ref` or
+`tag` over `branch` — a moving branch means non-reproducible builds.
+
+### 5. `only:` and `runtime:` — scope deps to environments
+
+```elixir
+{:credo, "~> 1.7", only: [:dev, :test], runtime: false}
+{:ex_doc, "~> 0.31", only: :dev, runtime: false}
+```
+
+`only:` skips the dep when building other envs (shrinks releases).
+`runtime: false` tells OTP not to start it as an application — essential
+for tool-only deps like Credo or ExDoc that would pollute your app start.
 
 ---
 
@@ -41,20 +109,19 @@ For stable, widely-used libraries like Jason, `~> 1.4` is idiomatic. For less st
 ### Step 1: Create the project
 
 ```bash
-mix new task_queue --sup
-cd task_queue
+mix new deps_intro
+cd deps_intro
 ```
 
-### Step 2: `mix.exs` -- configure dependencies by environment
+### Step 2: `mix.exs` — declare a realistic mix of deps
 
 ```elixir
-# mix.exs
-defmodule TaskQueue.MixProject do
+defmodule DepsIntro.MixProject do
   use Mix.Project
 
   def project do
     [
-      app: :task_queue,
+      app: :deps_intro,
       version: "0.1.0",
       elixir: "~> 1.15",
       start_permanent: Mix.env() == :prod,
@@ -63,190 +130,146 @@ defmodule TaskQueue.MixProject do
   end
 
   def application do
-    [
-      extra_applications: [:logger],
-      mod: {TaskQueue.Application, []}
-    ]
+    [extra_applications: [:logger]]
   end
 
   defp deps do
     [
-      # Production dependencies -- available in all environments
+      # --- Hex dependency, pessimistic on minor (recommended default) ---
       {:jason, "~> 1.4"},
-      {:req, "~> 0.5"},
 
-      # Dev-only -- static analysis, never included in a release
-      {:dialyxir, "~> 1.0", only: :dev, runtime: false},
-
-      # Dev-only -- documentation generation
+      # --- Dev/test-only tooling; not a runtime application ---
       {:ex_doc, "~> 0.31", only: :dev, runtime: false},
 
-      # Test-only -- mocking for external HTTP calls
-      {:mox, "~> 1.0", only: :test},
+      # --- Example path dep (commented out — uncomment if you have ../shared) ---
+      # {:shared, path: "../shared"},
 
-      # Dev + test -- seed data generation
-      {:faker, "~> 0.18", only: [:dev, :test]}
+      # --- Example Git dep pinned to a tag; SWAP for a real one when needed ---
+      # {:nimble_parsec, git: "https://github.com/dashbitco/nimble_parsec.git", tag: "v1.4.0"}
     ]
   end
 end
 ```
 
-The `only:` option restricts in which environments a dependency is fetched and compiled. `runtime: false` prevents the dependency's OTP application from being started at boot -- important for CLI tools like Dialyxir that should never start as an application.
-
-### Step 3: `lib/task_queue/application.ex`
+### Step 3: `lib/deps_intro.ex` — prove Jason works
 
 ```elixir
-defmodule TaskQueue.Application do
-  use Application
-
-  @impl true
-  def start(_type, _args) do
-    children = []
-    opts = [strategy: :one_for_one, name: TaskQueue.Supervisor]
-    Supervisor.start_link(children, opts)
-  end
-end
-```
-
-### Step 4: `lib/task_queue/worker.ex` -- use Jason for payload encoding
-
-Jason is a production dependency declared in `mix.exs`. The Worker uses `Jason.encode/1` and `Jason.decode/1` for round-tripping job payloads through JSON. This is the most common pattern for Hex dependencies: declare in `mix.exs`, call in application code.
-
-```elixir
-defmodule TaskQueue.Worker do
+defmodule DepsIntro do
   @moduledoc """
-  Processes a single job from the queue.
-
-  Job payloads are JSON-encoded strings. Workers decode them, execute the job,
-  and optionally notify a webhook when done.
+  Trivial user of a Hex dependency (`jason`) — just to demonstrate that after
+  `mix deps.get` and `mix compile`, external deps are available at runtime.
   """
 
   @doc """
-  Executes a job given its JSON-encoded payload.
+  Encodes a map to JSON via Jason.
 
-  Returns `{:ok, result}` or `{:error, reason}`.
+  ## Examples
+
+      iex> DocsDemo = DepsIntro
+      iex> DepsIntro.to_json(%{a: 1}) |> Jason.decode!()
+      %{"a" => 1}
   """
-  @spec execute(String.t()) :: {:ok, term()} | {:error, term()}
-  def execute(encoded_payload) when is_binary(encoded_payload) do
-    case Jason.decode(encoded_payload) do
-      {:ok, decoded} ->
-        do_work(decoded)
-
-      {:error, reason} ->
-        {:error, {:bad_payload, reason}}
-    end
+  @spec to_json(map()) :: String.t()
+  def to_json(map) when is_map(map) do
+    Jason.encode!(map)
   end
 
-  @doc """
-  Encodes a job map as a JSON string for enqueueing.
-
-  Returns `{:ok, json_string}` or `{:error, reason}`.
-  """
-  @spec encode_job(map()) :: {:ok, String.t()} | {:error, term()}
-  def encode_job(job_map) when is_map(job_map) do
-    Jason.encode(job_map)
+  @doc "Decodes a JSON string into a map with string keys."
+  @spec from_json(String.t()) :: {:ok, term()} | {:error, Jason.DecodeError.t()}
+  def from_json(json) when is_binary(json) do
+    Jason.decode(json)
   end
-
-  defp do_work(%{"type" => type, "args" => args}) do
-    {:ok, %{type: type, args: args, processed_at: DateTime.utc_now()}}
-  end
-
-  defp do_work(_invalid), do: {:error, :missing_required_fields}
 end
 ```
 
-### Step 5: Tests
+### Step 4: `test/deps_intro_test.exs`
 
 ```elixir
-# test/task_queue/worker_test.exs
-defmodule TaskQueue.WorkerTest do
+defmodule DepsIntroTest do
   use ExUnit.Case, async: true
 
-  alias TaskQueue.Worker
+  test "round-trips a map" do
+    original = %{"x" => 1, "y" => [1, 2, 3]}
+    encoded = DepsIntro.to_json(original)
+    assert {:ok, ^original} = DepsIntro.from_json(encoded)
+  end
 
-  describe "encode_job/1 and execute/1 round-trip" do
-    test "encodes and decodes a valid job" do
-      job = %{"type" => "send_email", "args" => %{"to" => "user@example.com"}}
-
-      assert {:ok, encoded} = Worker.encode_job(job)
-      assert is_binary(encoded)
-
-      assert {:ok, result} = Worker.execute(encoded)
-      assert result.type == "send_email"
-    end
-
-    test "returns error for invalid JSON payload" do
-      assert {:error, {:bad_payload, _}} = Worker.execute("not valid json {{{")
-    end
-
-    test "returns error for payload missing required fields" do
-      assert {:ok, encoded} = Worker.encode_job(%{"incomplete" => true})
-      assert {:error, :missing_required_fields} = Worker.execute(encoded)
-    end
+  test "returns an error tuple on invalid JSON" do
+    assert {:error, %Jason.DecodeError{}} = DepsIntro.from_json("{not json")
   end
 end
 ```
 
-### Step 6: Run
+### Step 5: Run through the commands
 
 ```bash
-mix deps.get
-mix test test/task_queue/worker_test.exs --trace
+mix deps.get      # fetches Jason; creates mix.lock
+mix deps.tree     # shows the dependency tree (your deps + their transitives)
+mix hex.outdated  # shows which deps have newer versions available
+mix test          # build and run tests
+mix deps.update jason --only        # update Jason, respecting its constraint
+mix deps.unlock --unused             # prune stale lockfile entries
 ```
 
-All 3 tests pass. `execute/1` decodes JSON via `Jason.decode/1`, pattern-matches on the decoded map to extract `"type"` and `"args"`, and delegates to `do_work/1`. `encode_job/1` delegates directly to `Jason.encode/1`.
+Peek at `mix.lock`:
 
-### Step 7: Verify environment isolation
-
-```bash
-# Only jason, req appear -- no dialyxir, ex_doc, mox, faker
-MIX_ENV=prod mix deps
-
-# All deps appear
-MIX_ENV=dev mix deps
-
-# Verify the lockfile was created
-ls -la mix.lock
+```elixir
+# mix.lock (abbreviated)
+%{
+  "jason": {:hex, :jason, "1.4.4", "b9226...", [:mix], [], "hexpm", "c5ef..."}
+}
 ```
+
+The important bits: the resolved version (`1.4.4`) and the checksum. That's
+what guarantees your teammate installs byte-identical code.
 
 ---
 
-## Trade-off analysis
+## Trade-offs and production gotchas
 
-| Aspect | `~> 1.4` (minor range) | `~> 1.4.2` (patch range) | `>= 1.4.0` (no ceiling) |
-|--------|------------------------|--------------------------|-------------------------|
-| Flexibility | accepts minor bumps | patch bumps only | accepts breaking changes |
-| CI reproducibility | depends on lock | depends on lock | lock required, high risk |
-| Typical use | stable public APIs | unstable minor releases | almost never appropriate |
-| lock needed? | yes | yes | especially yes |
+**1. Never use `>= X` without an upper bound in a library**
+`>= 1.0.0` means "any future version, forever, including major breaking
+releases I haven't reviewed". In a published library this forces downstream
+users into dependency hell. Use `~> X.Y` in `mix.exs` for libraries.
 
-Why does `runtime: false` on `dialyxir` matter for releases, even though `only: :dev` already excludes it from production builds? `only: :dev` prevents the dependency from being fetched and compiled in prod. `runtime: false` prevents the dependency's OTP application from being started when the app boots in dev. Without `runtime: false`, `dialyxir` registers itself as a started application, adding startup overhead and potentially interfering with the dev supervision tree. Both options serve different purposes and should be used together for CLI tools.
+**2. `mix deps.update` ignores the lock — that's the point**
+People confuse `deps.get` (honor lock) with `deps.update` (rewrite lock).
+If your lock is already correct and you just added a dep, `deps.get` is
+what you want. `deps.update --all` in CI is a very easy way to accidentally
+"update everything on every build".
 
----
+**3. Path deps DO NOT go in `mix.lock`**
+If you ship an app with a `{:core, path: "../core"}` dep, whoever clones
+the repo must also have `../core`. This is fine in umbrellas (the umbrella
+root guarantees the layout) but bad for open source. Publish the lib to
+Hex or vendor it.
 
-## Common production mistakes
+**4. Git deps on `branch:` are non-reproducible**
+If you point at `branch: "main"`, `mix deps.get` on day 1 and day 30 give
+you different code — even though `mix.lock` pins the SHA. The moment
+someone runs `deps.update`, the SHA jumps. Prefer `tag:` or `ref:`.
 
-**1. `mix.lock` in `.gitignore`**
-Two developers resolve different transitive versions. Bug appears in CI but not locally. Always commit `mix.lock`.
+**5. `:runtime` flag on tool deps prevents boot-time application starts**
+`{:credo, "~> 1.7", only: [:dev, :test], runtime: false}` tells Mix not to
+list Credo in `:applications`. Without `runtime: false`, Credo's OTP app
+would try to start with your app in dev — usually harmless, but confusing
+and wasteful.
 
-**2. `mix compile` without `mix deps.get` first**
-After editing `mix.exs`, you must run `mix deps.get`. The compiler uses whatever is in `deps/` -- it does not auto-fetch.
+**6. When NOT to add a dep**
+- It's 50 lines of code and you'd spend more time vendoring than reading it.
+- It depends on 30 transitives for a trivial feature.
+- It has not been updated in 4 years and has open CVEs.
+- You can `:telemetry`, `:persistent_term`, or standard-lib your way out.
 
-**3. `~>` with the wrong precision**
-`{:plug, "~> 1.14"}` allows `1.15`, `1.16`, etc. `{:plug, "~> 1.14.2"}` locks to `1.14.x`. Using two-digit `~>` for well-maintained libraries is idiomatic; three-digit when you want strict patch stability.
-
-**4. Forgetting `runtime: false` on CLI tools**
-Without it, `dialyxir` starts as an OTP application at runtime -- adding startup overhead and potentially conflicting with your app's process tree.
-
-**5. `path:` dependencies left in production**
-`{:my_lib, path: "../my_lib"}` is useful during local development but must never be deployed. Use it only in dev, with the Hex version commented out alongside it.
+Every dep is a support contract you inherit. Read the CHANGELOG and the
+maintainer's release cadence before adding.
 
 ---
 
 ## Resources
 
-- [Hex Package Manager](https://hex.pm)
-- [Mix.Tasks.Deps -- official docs](https://hexdocs.pm/mix/Mix.Tasks.Deps.html)
-- [Version constraints in Elixir](https://hexdocs.pm/elixir/Version.html)
-- [Jason -- JSON library](https://hexdocs.pm/jason/Jason.html)
-- [Req -- HTTP client](https://hexdocs.pm/req/Req.html)
+- ["Managing Deps" — Mix guide](https://hexdocs.pm/mix/Mix.Tasks.Deps.html) — every `deps.*` task explained
+- [`Version` — Elixir stdlib](https://hexdocs.pm/elixir/Version.html) — the exact rules for `~>`, `>=`, etc.
+- [Hex.pm docs — "Publishing a package"](https://hex.pm/docs/publish)
+- [`mix hex.outdated`](https://hexdocs.pm/hex/Mix.Tasks.Hex.Outdated.html)
+- ["SemVer"](https://semver.org/) — the spec that Hex constraints are built on

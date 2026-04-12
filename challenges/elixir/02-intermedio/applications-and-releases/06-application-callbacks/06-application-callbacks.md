@@ -1,313 +1,251 @@
-# Application: The OTP Entry Point
+# Application callbacks — `start/2` and `stop/1`
 
-## Why Application matters
+**Project**: `my_service_app` — an OTP application with an explicit `Application`
+module, a supervision root, and a lifecycle you can observe start and stop.
 
-`Application` is the topmost layer of an OTP release. It is the contract between your code
-and the BEAM runtime: OTP calls `start/2` when the VM boots, and your code returns the root
-Supervisor PID. Everything else in the system hangs from that PID.
-
-Without a registered Application module, your Supervisor is never started. You would have
-to manually call your supervisor's `start_link/0` every time. More importantly:
-
-- OTP guarantees dependency ordering for your application's dependencies.
-- `Application.get_env/3` is the standard runtime configuration API.
-- `stop/1` gives you a hook to flush logs and release resources before the VM exits.
+**Difficulty**: ★★☆☆☆
+**Estimated time**: 1–2 hours
 
 ---
 
-## The business problem
+## Project context
 
-Build a `TaskQueue.Application` that:
+Every production Elixir service is an *OTP application*: a unit that BEAM
+knows how to start, stop, and depend on. `mix new` gives you a library by
+default — no supervision tree, no callbacks. The moment you need long-lived
+state (a cache, a connection pool, a GenServer worker), you must graduate
+to an application with a `start/2` callback that boots a supervision tree.
 
-1. Reads configuration: max queue size, job TTL, worker count, and log level.
-2. Starts the root Supervisor with TaskRegistry, QueueServer, and Worker children.
-3. Logs the startup configuration for observability.
-4. In `stop/1`, logs the shutdown event.
+This exercise wires the plumbing from scratch so you can see exactly what
+`mix new --sup` generates — and what the runtime calls at boot and at
+shutdown.
 
-All modules are defined completely in this exercise.
-
----
-
-## Project setup
+Project structure:
 
 ```
-task_queue/
+my_service_app/
 ├── lib/
-│   └── task_queue/
-│       ├── application.ex
-│       ├── task_registry.ex
-│       ├── queue_server.ex
-│       └── worker.ex
-├── config/
-│   ├── config.exs
-│   └── dev.exs
+│   ├── my_service_app.ex
+│   ├── my_service_app/
+│   │   ├── application.ex
+│   │   └── worker.ex
 ├── test/
-│   └── task_queue/
-│       └── application_test.exs
+│   └── my_service_app_test.exs
 └── mix.exs
 ```
 
 ---
 
+## Core concepts
+
+### 1. The `Application` behaviour
+
+An OTP application is a module implementing the `Application` behaviour
+with at least `start/2`. BEAM calls `start(:normal, args)` when the
+application boots and expects `{:ok, pid}` pointing at the top supervisor.
+That pid is the root of your supervision tree and the lifeline of the app.
+
+```
+BEAM boot ──▶ MyServiceApp.Application.start(:normal, [])
+                       │
+                       └─▶ Supervisor.start_link(children, opts) ──▶ {:ok, sup_pid}
+```
+
+### 2. Declaring the callback module in `mix.exs`
+
+Adding `application/0` with `mod: {MyServiceApp.Application, []}` to your
+`mix.exs` is what tells BEAM which module to invoke. Without it, your
+`:my_service_app` entry exists but has no callback — it loads but never
+starts.
+
+### 3. `stop/1` — the graceful shutdown hook
+
+When the application terminates, BEAM calls `stop(state)` where `state` is
+whatever you returned from `start/2`. Use it for flushing buffers, closing
+sockets that aren't owned by a child, emitting a final telemetry event.
+Do **not** stop children here — the supervision tree already does that.
+
+### 4. Supervision tree as the backbone
+
+The pid returned by `start/2` owns every GenServer, every Task, every pool
+in your app via the supervisor. If the supervisor dies, the app dies, and
+the BEAM shutdown strategy (`:permanent` / `:transient` / `:temporary` in
+mix.exs) decides whether the whole node comes down with it.
+
+---
+
 ## Implementation
 
-### `config/config.exs`
+### Step 1: Create the project with a supervision tree
 
-```elixir
-import Config
-
-config :task_queue,
-  max_queue_size: 1_000,
-  job_ttl_ms: 300_000,
-  worker_count: 4,
-  log_level: :info
-
-import_config "#{config_env()}.exs"
+```bash
+mix new my_service_app --sup
+cd my_service_app
 ```
 
-### `config/dev.exs`
+The `--sup` flag scaffolds `application.ex` for you — we'll rewrite it to
+see every piece explicitly.
+
+### Step 2: `mix.exs` — declare the callback module
 
 ```elixir
-import Config
+defmodule MyServiceApp.MixProject do
+  use Mix.Project
 
-config :task_queue,
-  max_queue_size: 100,
-  job_ttl_ms: 60_000,
-  log_level: :debug
-```
-
-### `mix.exs` — register the Application module
-
-```elixir
-def application do
-  [
-    mod: {TaskQueue.Application, []},
-    extra_applications: [:logger, :crypto]
-  ]
-end
-```
-
-Without the `mod:` key, OTP never calls `start/2`. The application compiles fine,
-but in production `mix run --no-halt` starts nothing.
-
-### `lib/task_queue/task_registry.ex`
-
-```elixir
-defmodule TaskQueue.TaskRegistry do
-  use Agent
-
-  def start_link(initial \\ %{}) do
-    Agent.start_link(fn -> initial end, name: __MODULE__)
+  def project do
+    [
+      app: :my_service_app,
+      version: "0.1.0",
+      elixir: "~> 1.17",
+      start_permanent: Mix.env() == :prod,
+      deps: []
+    ]
   end
 
-  def register(task_id) do
-    entry = %{status: :pending, updated_at: System.monotonic_time(:millisecond)}
-    Agent.update(__MODULE__, fn state -> Map.put(state, task_id, entry) end)
-  end
-
-  def get(task_id) do
-    Agent.get(__MODULE__, fn state -> Map.get(state, task_id) end)
-  end
-
-  def stats do
-    Agent.get(__MODULE__, fn state ->
-      Enum.reduce(state, %{pending: 0, running: 0, done: 0, failed: 0}, fn {_id, entry}, acc ->
-        Map.update(acc, entry.status, 1, &(&1 + 1))
-      end)
-    end)
+  # The `mod:` key is what turns this project into a *started* application.
+  # Without it, the app would only be *loaded* — code available but no callback.
+  def application do
+    [
+      extra_applications: [:logger],
+      mod: {MyServiceApp.Application, []}
+    ]
   end
 end
 ```
 
-### `lib/task_queue/queue_server.ex`
+### Step 3: `lib/my_service_app/application.ex`
 
 ```elixir
-defmodule TaskQueue.QueueServer do
-  use GenServer
-  require Logger
+defmodule MyServiceApp.Application do
+  @moduledoc """
+  OTP entry point. BEAM invokes `start/2` when the application boots and
+  `stop/1` when it shuts down. The pid returned from `start/2` is the root
+  of the supervision tree — the single point BEAM uses to stop everything.
+  """
 
-  def start_link(opts \\ []) do
-    GenServer.start_link(__MODULE__, opts, name: __MODULE__)
-  end
-
-  def push(payload) do
-    job = %{
-      id: :crypto.strong_rand_bytes(8) |> Base.url_encode64(padding: false),
-      payload: payload,
-      queued_at: System.monotonic_time(:millisecond)
-    }
-    GenServer.cast(__MODULE__, {:push, job})
-  end
-
-  def pop, do: GenServer.call(__MODULE__, :pop)
-  def size, do: GenServer.call(__MODULE__, :size)
-
-  @impl GenServer
-  def init(_opts), do: {:ok, []}
-
-  @impl GenServer
-  def handle_cast({:push, job}, state), do: {:noreply, state ++ [job]}
-
-  @impl GenServer
-  def handle_call(:pop, _from, []), do: {:reply, {:error, :empty}, []}
-  def handle_call(:pop, _from, [job | rest]), do: {:reply, {:ok, job}, rest}
-
-  @impl GenServer
-  def handle_call(:size, _from, state), do: {:reply, length(state), state}
-
-  @impl GenServer
-  def handle_info(_, state), do: {:noreply, state}
-end
-```
-
-### `lib/task_queue/worker.ex`
-
-```elixir
-defmodule TaskQueue.Worker do
-  use GenServer
-  require Logger
-
-  def start_link(opts \\ []) do
-    GenServer.start_link(__MODULE__, opts, name: __MODULE__)
-  end
-
-  @impl GenServer
-  def init(_opts) do
-    Logger.info("Worker started")
-    {:ok, %{jobs_processed: 0}}
-  end
-
-  @impl GenServer
-  def handle_info(_, state), do: {:noreply, state}
-end
-```
-
-### `lib/task_queue/application.ex`
-
-```elixir
-defmodule TaskQueue.Application do
   use Application
   require Logger
 
-  @impl Application
-  def start(_type, _args) do
-    max_queue_size = Application.get_env(:task_queue, :max_queue_size, 1_000)
-    job_ttl_ms     = Application.get_env(:task_queue, :job_ttl_ms, 300_000)
-    worker_count   = Application.get_env(:task_queue, :worker_count, 4)
-    log_level      = Application.get_env(:task_queue, :log_level, :info)
-
-    Logger.configure(level: log_level)
-
-    Logger.info("""
-    TaskQueue starting
-      max_queue_size: #{max_queue_size}
-      job_ttl_ms:     #{job_ttl_ms}
-      worker_count:   #{worker_count}
-      log_level:      #{log_level}
-    """)
+  @impl true
+  @spec start(Application.start_type(), term()) :: {:ok, pid()} | {:error, term()}
+  def start(type, args) do
+    Logger.info("MyServiceApp starting: type=#{inspect(type)} args=#{inspect(args)}")
 
     children = [
-      TaskQueue.TaskRegistry,
-      TaskQueue.QueueServer,
-      TaskQueue.Worker
+      # A single demo worker — real apps have pools, registries, endpoints here.
+      MyServiceApp.Worker
     ]
 
-    opts = [strategy: :one_for_one, name: TaskQueue.RootSupervisor]
+    # `:one_for_one` — if a child dies, only that child restarts. The app
+    # stays up as long as the supervisor itself is alive.
+    opts = [strategy: :one_for_one, name: MyServiceApp.Supervisor]
     Supervisor.start_link(children, opts)
   end
 
-  @impl Application
-  def stop(_state) do
-    Logger.info("TaskQueue stopped")
+  @impl true
+  @spec stop(term()) :: :ok
+  def stop(state) do
+    # Children are already being terminated by the supervisor. Use this hook
+    # only for *application-level* cleanup (flushing, telemetry, external notice).
+    Logger.info("MyServiceApp stopping: state=#{inspect(state)}")
     :ok
   end
 end
 ```
 
-Configuration is read at runtime with `Application.get_env/3`, not at compile time
-with module attributes. This means config values can be changed between compilations
-(e.g., via `config/runtime.exs` in production) without recompiling.
-
-### Tests
+### Step 4: `lib/my_service_app/worker.ex`
 
 ```elixir
-# test/task_queue/application_test.exs
-defmodule TaskQueue.ApplicationTest do
+defmodule MyServiceApp.Worker do
+  @moduledoc """
+  Trivial GenServer that exposes a ping for tests and logs its own lifecycle —
+  the point is to prove the supervision tree actually started it.
+  """
+
+  use GenServer
+  require Logger
+
+  @spec start_link(keyword()) :: GenServer.on_start()
+  def start_link(opts \\ []) do
+    GenServer.start_link(__MODULE__, :ok, Keyword.put_new(opts, :name, __MODULE__))
+  end
+
+  @spec ping(GenServer.server()) :: :pong
+  def ping(server \\ __MODULE__), do: GenServer.call(server, :ping)
+
+  @impl true
+  def init(:ok) do
+    Logger.debug("Worker booted pid=#{inspect(self())}")
+    {:ok, %{started_at: System.system_time(:millisecond)}}
+  end
+
+  @impl true
+  def handle_call(:ping, _from, state), do: {:reply, :pong, state}
+end
+```
+
+### Step 5: `test/my_service_app_test.exs`
+
+```elixir
+defmodule MyServiceAppTest do
   use ExUnit.Case, async: false
 
-  test "Application is listed in started_applications after mix start" do
-    started = Application.started_applications() |> Enum.map(&elem(&1, 0))
-    assert :task_queue in started
+  test "application is started and the supervisor is alive" do
+    assert {:ok, _apps} = Application.ensure_all_started(:my_service_app)
+    sup = Process.whereis(MyServiceApp.Supervisor)
+    assert is_pid(sup) and Process.alive?(sup)
   end
 
-  test "RootSupervisor is running" do
-    assert pid = Process.whereis(TaskQueue.RootSupervisor)
-    assert is_pid(pid)
-    assert Process.alive?(pid)
+  test "worker under the supervision tree responds" do
+    assert MyServiceApp.Worker.ping() == :pong
   end
 
-  test "all supervised children are running" do
-    assert Process.whereis(TaskQueue.TaskRegistry) != nil
-    assert Process.whereis(TaskQueue.QueueServer) != nil
-    assert Process.whereis(TaskQueue.Worker) != nil
-  end
-
-  test "Application.get_env reads task_queue config" do
-    assert is_integer(Application.get_env(:task_queue, :max_queue_size))
-    assert is_integer(Application.get_env(:task_queue, :job_ttl_ms))
-  end
-
-  test "Application.spec returns metadata for task_queue" do
-    spec = Application.spec(:task_queue)
-    assert spec != nil
-    assert Keyword.get(spec, :description) != nil
-  end
-
-  test "end-to-end: push a job and process it through the running system" do
-    TaskQueue.TaskRegistry.register("e2e_job")
-    TaskQueue.QueueServer.push("e2e_payload")
-    Process.sleep(20)
-
-    assert 1 = TaskQueue.QueueServer.size()
-    TaskQueue.QueueServer.pop()
-    assert 0 = TaskQueue.QueueServer.size()
+  test "stop/1 is called on Application.stop/1" do
+    # Stopping and restarting the application should leave it healthy.
+    :ok = Application.stop(:my_service_app)
+    {:ok, _} = Application.ensure_all_started(:my_service_app)
+    assert MyServiceApp.Worker.ping() == :pong
   end
 end
 ```
 
-### Run the tests
+### Step 6: Run
 
 ```bash
-mix test test/task_queue/application_test.exs --trace
+mix test
 ```
 
 ---
 
-## Common production mistakes
+## Trade-offs and production gotchas
 
-**1. Forgetting `mod:` in mix.exs**
-Without `mod: {TaskQueue.Application, []}`, OTP never calls `start/2`.
+**1. `start/2` must return fast**
+BEAM waits for `start/2` to return before considering the app started.
+Doing slow I/O (DB migrations, network calls) here delays boot and can
+timeout your release. Do slow work in a child GenServer's `handle_continue/2`
+instead.
 
-**2. Not returning `{:ok, pid}` from `start/2`**
-`start/2` must return `{:ok, pid}` — the value from `Supervisor.start_link`.
+**2. Don't put business logic in `Application`**
+`Application` is an entry point, not a service. If you find yourself adding
+functions beyond `start/2` and `stop/1`, move them to a dedicated module.
 
-**3. Reading `Application.get_env` at compile time**
-```elixir
-# WRONG — resolved at compile time
-@max_size Application.get_env(:task_queue, :max_queue_size, 1_000)
+**3. `stop/1` is best-effort**
+On a hard crash (`System.halt/1`, OOM, `kill -9`), `stop/1` never runs.
+Never rely on it for data durability — persist as you go.
 
-# CORRECT — resolved at runtime
-def max_size, do: Application.get_env(:task_queue, :max_queue_size, 1_000)
-```
+**4. `extra_applications` vs `applications`**
+Use `extra_applications` for OTP bundled apps (`:logger`, `:crypto`). `deps`
+entries are auto-added. Only use the manual `applications:` key when you
+need to override the full list, which is rare.
 
-**4. Doing slow initialization in `start/2`**
-OTP has a startup timeout. Slow initialization should happen in a dedicated GenServer's
-`init/1` — not in `start/2`.
+**5. When NOT to add `mod:`**
+Pure libraries (no processes, no state) should omit `mod:`. Loading the
+app is enough — starting it is overhead for a library with no runtime.
 
 ---
 
 ## Resources
 
-- [Application — HexDocs](https://hexdocs.pm/elixir/Application.html)
-- [Config — HexDocs](https://hexdocs.pm/elixir/Config.html)
-- [Mix and OTP: Application](https://elixir-lang.org/getting-started/mix-otp/supervisor-and-application.html)
+- [`Application` — Elixir stdlib](https://hexdocs.pm/elixir/Application.html)
+- ["OTP applications" — Elixir getting started](https://hexdocs.pm/elixir/mix-otp-0.html)
+- [Erlang Application design principles](https://www.erlang.org/doc/design_principles/applications.html)
