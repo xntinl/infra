@@ -13,12 +13,12 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "challenges/elixir/elixir.md",
+                "file": "challenges/elixir/01-basico/01-setup-and-mix/01-setup-and-mix.md",
                 "mode": "source",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "elixir"
+              "title": "01-setup-and-mix"
             }
           }
         ]
@@ -210,28 +210,29 @@
   },
   "active": "76d7be64c31371ce",
   "lastOpenFiles": [
-    "challenges/tutorial.md",
-    "challenges/elixir/elixir.md",
-    "ClaudeCode/Features/Engram.md",
-    "challenges/elixir/01-basico/01-setup-and-mix/01-setup-and-mix.md",
+    "challenges/elixir/01-basico/01-setup-and-mix/json_validator/config/runtime.exs",
+    "challenges/elixir/01-basico/01-setup-and-mix/json_validator/config/prod.exs",
+    "challenges/elixir/01-basico/01-setup-and-mix/json_validator/config/test.exs",
+    "challenges/elixir/01-basico/01-setup-and-mix/json_validator/config/dev.exs",
+    "challenges/elixir/01-basico/01-setup-and-mix/json_validator/config/config.exs",
+    "challenges/elixir/01-basico/01-setup-and-mix/json_validator/config",
+    "challenges/elixir/01-basico/03-numbers-and-arithmetic/03-numbers-and-arithmetic.md",
     "challenges/elixir/01-basico/02-atoms-and-symbols/02-atoms-and-symbols.md",
+    "challenges/elixir/01-basico/01-setup-and-mix/01-setup-and-mix.md",
+    "challenges/elixir/elixir.md",
+    "challenges/tutorial.md",
+    "ClaudeCode/Features/Engram.md",
     "challenges/elixir/01-basico/01-setup-and-mix/json_validator/_build/dev/lib/json_validator/ebin/json_validator.app",
     "challenges/elixir/01-basico/01-setup-and-mix/json_validator/_build/dev/lib/json_validator/consolidated/Elixir.Inspect.beam",
     "challenges/elixir/01-basico/01-setup-and-mix/json_validator/_build/dev/lib/json_validator/consolidated/Elixir.JSON.Encoder.beam",
     "challenges/elixir/01-basico/01-setup-and-mix/json_validator/_build/dev/lib/json_validator/consolidated/Elixir.IEx.Info.beam",
     "challenges/elixir/01-basico/01-setup-and-mix/json_validator/_build/dev/lib/json_validator/consolidated/Elixir.Enumerable.beam",
-    "challenges/elixir/01-basico/01-setup-and-mix/json_validator/_build/dev/lib/json_validator/consolidated/Elixir.String.Chars.beam",
-    "challenges/elixir/01-basico/01-setup-and-mix/json_validator/_build/dev/lib/json_validator/consolidated/Elixir.List.Chars.beam",
-    "challenges/elixir/01-basico/01-setup-and-mix/json_validator/_build/dev/lib/json_validator/consolidated/Elixir.Collectable.beam",
-    "challenges/elixir/01-basico/01-setup-and-mix/json_validator/_build/dev/lib/json_validator/consolidated/Elixir.JSON.Decoder.beam",
-    "challenges/elixir/01-basico/01-setup-and-mix/json_validator/_build/dev/lib/json_validator/consolidated",
     "challenges/elixir/01-basico/01-setup-and-mix/json_validator/deps/json/README.md",
     "challenges/elixir/01-basico/01-setup-and-mix/json_validator/deps/jason/README.md",
     "challenges/elixir/01-basico/01-setup-and-mix/json_validator/deps/jason/CHANGELOG.md",
     "challenges/elixir/01-basico/01-setup-and-mix/json_validator/deps/excoveralls/README.md",
     "challenges/elixir/01-basico/01-setup-and-mix/json_validator/deps/excoveralls/CHANGELOG.md",
     "challenges/elixir/01-basico/01-setup-and-mix/json_validator/README.md",
-    "challenges/elixir/01-basico/03-numbers-and-arithmetic/03-numbers-and-arithmetic.md",
     "challenges/elixir/01-basico/01-setup-and-mix/payments_cli/README.md",
     "challenges/elixir/01-basico/06-lists-and-head-tail-pattern/06-lists-and-head-tail-pattern.md",
     "challenges/elixir/01-basico/07-maps-and-keyword-lists/07-maps-and-keyword-lists.md",
@@ -245,7 +246,6 @@
     "challenges/elixir/01-basico/13-anonymous-functions-and-closures/13-anonymous-functions-and-closures.md",
     "challenges/elixir/01-basico/14-modules-and-function-visibility/14-modules-and-function-visibility.md",
     "challenges/elixir/01-basico/15-structs-and-basic-validation/15-structs-and-basic-validation.md",
-    "challenges/elixir/01-basico/04-strings-and-binaries-basics/04-strings-and-binaries-basics.md",
     "Presentacion/poc-just/web/node_modules/ordered-binary/assets/powers-dre.png",
     "Presentacion/poc-just/web/node_modules/retry/equation.gif",
     "Untitled.canvas"
