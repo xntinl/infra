@@ -210,6 +210,7 @@
   },
   "active": "1ad63260abcf073e",
   "lastOpenFiles": [
+    "challenges/elixir/03-avanzado/metaprogramming/144-spec-gen/144-spec-gen.md",
     "challenges/elixir/03-avanzado/metaprogramming/143-dsl-router-builder/143-dsl-router-builder.md",
     "challenges/elixir/03-avanzado/metaprogramming/142-dsl-schema-builder/142-dsl-schema-builder.md",
     "challenges/elixir/03-avanzado/metaprogramming/141-macro-expand-debug/141-macro-expand-debug.md",
@@ -235,7 +236,6 @@
     "challenges/elixir/03-avanzado/distribution-and-clustering/101-libcluster-epmd/101-libcluster-epmd.md",
     "challenges/elixir/03-avanzado/data-pipelines/177-broadway-rabbit/177-broadway-rabbit.md",
     "challenges/elixir/03-avanzado/interop-and-native/164-port-driver/164-port-driver.md",
-    "challenges/elixir/02-intermedio/applications-and-releases/06-application-callbacks/06-application-callbacks.md",
     "challenges/elixir/03-avanzado/supervision-advanced/90-bulkhead-supervisors",
     "challenges/elixir/03-avanzado/supervision-advanced/89-significant-child",
     "challenges/elixir/03-avanzado/supervision-advanced/88-drain-on-deploy",
