@@ -210,6 +210,8 @@
   },
   "active": "1ad63260abcf073e",
   "lastOpenFiles": [
+    "challenges/elixir/03-avanzado/ecto-advanced/287-custom-query-macros/287-custom-query-macros.md",
+    "challenges/elixir/03-avanzado/ecto-advanced/287-custom-query-macros",
     "challenges/elixir/03-avanzado/ecto-advanced/286-embedded-schemas-nested-changesets/286-embedded-schemas-nested-changesets.md",
     "challenges/elixir/03-avanzado/ecto-advanced/286-embedded-schemas-nested-changesets",
     "challenges/elixir/03-avanzado/ecto-advanced/285-full-text-search-tsvector/285-full-text-search-tsvector.md",
@@ -242,10 +244,8 @@
     "challenges/elixir/03-avanzado/beam-internals-and-perf/363-gc-tuning-per-process/363-gc-tuning-per-process.md",
     "challenges/elixir/03-avanzado/advanced-testing/301-mutation-testing-elixir/301-mutation-testing-elixir.md",
     "challenges/elixir/03-avanzado/resilience-patterns/315-saga-compensating-actions/315-saga-compensating-actions.md",
-    "challenges/elixir/03-avanzado/resilience-patterns/315-saga-compensating-actions",
     "challenges/elixir/03-avanzado/ets-dets-mnesia/377-mnesia-transactions-indices/377-mnesia-transactions-indices.md",
     "challenges/elixir/03-avanzado/ecto-advanced/281-schemaless-queries-etl/281-schemaless-queries-etl.md",
-    "challenges/elixir/03-avanzado/beam-internals-and-perf/362-process-heap-tuning/362-process-heap-tuning.md",
     "Presentacion/poc-just/web/node_modules/ordered-binary/assets/powers-dre.png",
     "Presentacion/poc-just/web/node_modules/retry/equation.gif",
     "Untitled.canvas"
