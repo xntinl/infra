@@ -1,367 +1,346 @@
-# Dynamic Registry
+# Dynamic Registry for named chat rooms
 
-## Why Registry
+**Project**: `chat_rooms_registry` — look up chat-room processes by name using a unique-keyed `Registry`.
 
-`Registry` is the OTP solution for dynamic process naming: it maps arbitrary names to
-PIDs and cleans up automatically when a registered process dies. Unlike a manual map of
-`{name => pid}` in an Agent, Registry has no stale PID problem — when a worker exits,
-its entry is automatically removed.
+**Difficulty**: ★★★☆☆
+**Estimated time**: 2–3 hours
 
 ---
 
-## Registry vs ETS directly
+## Project context
 
-| | Registry | ETS |
-|--|---------|-----|
-| Automatic cleanup on process exit | Yes | No |
-| Multiple registrations per name | Configurable (`:unique` or `:duplicate`) | Manual |
-| Dispatch (broadcast) | `Registry.dispatch/3` | Manual iteration |
-| Process discovery | Primary use case | Secondary use case |
+You're building the naming layer for a chat service. Every room has a
+human-readable name (`"general"`, `"dev-ops"`, `"coffee"`) and exactly one
+GenServer behind it. Rooms come and go dynamically: users create them at
+runtime, they disappear when empty, and you can't know the full set up
+front — so you can't use atom names (you'd leak atoms) and you don't need
+cluster-wide naming (rooms are node-local here).
 
-Use Registry when: the values are process PIDs and you need automatic cleanup.
-Use ETS when: the values are arbitrary data, or you need maximum read throughput.
+`Registry` in `:unique` mode is the canonical answer: string keys, automatic
+cleanup when a room process dies, and no atom-table pressure. Combined with
+`DynamicSupervisor`, it gives you "find-or-spawn a room by name" in a few
+lines.
 
----
-
-## The business problem
-
-Build a `TaskQueue.WorkerPool` that manages a dynamic pool of workers:
-
-- Workers are started with `DynamicSupervisor`.
-- Each worker registers itself under a `{:worker, worker_id}` key in Registry.
-- The pool manager can look up any worker by ID, broadcast to all, and list active IDs.
-- When a worker exits, its Registry entry disappears automatically.
-
-All modules are defined completely in this exercise.
-
----
-
-## Project setup
+Project structure:
 
 ```
-task_queue/
+chat_rooms_registry/
 ├── lib/
-│   └── task_queue/
-│       ├── application.ex
-│       ├── dynamic_worker.ex
-│       └── worker_pool.ex
+│   ├── chat_rooms_registry.ex
+│   ├── chat_rooms_registry/application.ex
+│   ├── chat_rooms_registry/room.ex
+│   └── chat_rooms_registry/rooms.ex
 ├── test/
-│   └── task_queue/
-│       └── registry_test.exs
+│   └── chat_rooms_registry_test.exs
 └── mix.exs
 ```
 
 ---
 
+## Core concepts
+
+### 1. `Registry` is an ETS-backed naming store
+
+A `Registry` is a supervision tree wrapping one (or several, if partitioned)
+ETS tables. Keys are arbitrary Elixir terms — usually strings or tuples — and
+values are associated metadata. Lookups are O(1), reads are lock-free, and
+entries are automatically removed when the owning process dies. It's local
+to one node; for cross-node naming use `:global` or `:pg` (exercises 83, 85).
+
+### 2. `:unique` vs `:duplicate` keys
+
+```
+:unique     one pid per key → "name this process"
+:duplicate  many pids per key → "subscribe to this topic"
+```
+
+For chat rooms, you want `:unique` — each room name maps to exactly one room
+process. Registering the same key twice returns
+`{:error, {:already_registered, pid}}`, which is the hook for "find or spawn".
+
+### 3. `{:via, Registry, {name, key}}` — the via tuple
+
+GenServer (and most OTP-shaped modules) accept a `name:` option of the form
+`{:via, Module, term}`. The module must export `register_name/2`,
+`whereis_name/1`, `unregister_name/1`, and `send/2`. `Registry` implements
+that protocol, so you can `GenServer.start_link(Room, arg, name: via_tuple)`
+and later `GenServer.call(via_tuple, :msg)` without ever holding the pid.
+
+### 4. Automatic cleanup via process monitoring
+
+`Registry` monitors every registered process. When a process dies — normal
+exit, crash, kill — its entry is removed. There's a subtlety: the cleanup
+is asynchronous, so a `lookup/2` right after a crash can briefly return a
+dead pid. In tests, wait on `Process.monitor/1` + `:DOWN` before asserting
+the registry is empty.
+
+---
+
 ## Implementation
 
-### `lib/task_queue/application.ex`
-
-```elixir
-defmodule TaskQueue.Application do
-  use Application
-
-  @impl Application
-  def start(_type, _args) do
-    children = [
-      {Registry, keys: :unique, name: TaskQueue.WorkerRegistry},
-      {DynamicSupervisor, strategy: :one_for_one, name: TaskQueue.WorkerSupervisor}
-    ]
-
-    opts = [strategy: :one_for_one, name: TaskQueue.RootSupervisor]
-    Supervisor.start_link(children, opts)
-  end
-end
-```
-
-### `lib/task_queue/dynamic_worker.ex`
-
-```elixir
-defmodule TaskQueue.DynamicWorker do
-  use GenServer
-  require Logger
-
-  @registry TaskQueue.WorkerRegistry
-
-  def start_link(worker_id) when is_binary(worker_id) do
-    GenServer.start_link(__MODULE__, worker_id, name: via(worker_id))
-  end
-
-  @doc "Returns the via tuple for Registry-based naming."
-  @spec via(String.t()) :: {:via, Registry, {module(), {atom(), String.t()}}}
-  def via(worker_id) do
-    {:via, Registry, {@registry, {:worker, worker_id}}}
-  end
-
-  @doc "Returns the PID of the worker with the given ID, or nil."
-  @spec lookup(String.t()) :: pid() | nil
-  def lookup(worker_id) do
-    case Registry.lookup(@registry, {:worker, worker_id}) do
-      [{pid, _meta}] -> pid
-      [] -> nil
-    end
-  end
-
-  @doc "Returns all currently registered worker IDs."
-  @spec list_ids() :: [String.t()]
-  def list_ids do
-    @registry
-    |> Registry.select([{{:"$1", :"$2", :"$3"}, [], [:"$1"]}])
-    |> Enum.map(fn {:worker, id} -> id end)
-  end
-
-  @doc "Sends a message to all registered workers."
-  @spec broadcast(any()) :: :ok
-  def broadcast(message) do
-    for id <- list_ids() do
-      case lookup(id) do
-        nil -> :ok
-        pid -> send(pid, message)
-      end
-    end
-    :ok
-  end
-
-  @doc "Requests a worker to process a job. Returns result."
-  @spec process_job(String.t()) :: {:ok, any()} | {:error, any()}
-  def process_job(worker_id) do
-    GenServer.call(via(worker_id), :process_job, 30_000)
-  end
-
-  @doc "Returns statistics for a specific worker."
-  @spec stats(String.t()) :: map() | {:error, :not_found}
-  def stats(worker_id) do
-    case lookup(worker_id) do
-      nil -> {:error, :not_found}
-      _pid -> GenServer.call(via(worker_id), :stats)
-    end
-  end
-
-  @impl GenServer
-  def init(worker_id) do
-    Logger.info("DynamicWorker #{worker_id} started, PID=#{inspect(self())}")
-    state = %{
-      worker_id: worker_id,
-      jobs_processed: 0,
-      jobs_failed: 0,
-      started_at: System.monotonic_time(:millisecond)
-    }
-    {:ok, state}
-  end
-
-  @impl GenServer
-  def handle_call(:process_job, _from, state) do
-    result =
-      try do
-        {:ok, :processed}
-      rescue
-        e -> {:error, e}
-      end
-
-    new_state =
-      case result do
-        {:ok, _} -> %{state | jobs_processed: state.jobs_processed + 1}
-        {:error, _} -> %{state | jobs_failed: state.jobs_failed + 1}
-      end
-
-    {:reply, result, new_state}
-  end
-
-  @impl GenServer
-  def handle_call(:stats, _from, state) do
-    uptime_ms = System.monotonic_time(:millisecond) - state.started_at
-    stats = Map.take(state, [:worker_id, :jobs_processed, :jobs_failed])
-    {:reply, Map.put(stats, :uptime_ms, uptime_ms), state}
-  end
-
-  @impl GenServer
-  def handle_info(_, state), do: {:noreply, state}
-end
-```
-
-The `via/1` function returns a `:via` tuple that Registry understands. When passed as
-`name:` to `GenServer.start_link/3`, the GenServer registers itself in the Registry.
-The same tuple routes `GenServer.call` through the Registry to the correct PID.
-
-### `lib/task_queue/worker_pool.ex`
-
-```elixir
-defmodule TaskQueue.WorkerPool do
-  @moduledoc """
-  Manages a dynamic pool of DynamicWorker processes.
-  Workers are started on demand and supervised by DynamicSupervisor.
-  """
-
-  alias TaskQueue.DynamicWorker
-
-  @supervisor TaskQueue.WorkerSupervisor
-
-  @doc "Starts a new worker with the given ID."
-  @spec start_worker(String.t()) :: {:ok, pid()} | {:error, any()}
-  def start_worker(worker_id) do
-    DynamicSupervisor.start_child(@supervisor, {DynamicWorker, worker_id})
-  end
-
-  @doc "Stops the worker with the given ID gracefully."
-  @spec stop_worker(String.t()) :: :ok | {:error, :not_found}
-  def stop_worker(worker_id) do
-    case DynamicWorker.lookup(worker_id) do
-      nil -> {:error, :not_found}
-      pid ->
-        DynamicSupervisor.terminate_child(@supervisor, pid)
-        :ok
-    end
-  end
-
-  @doc "Returns the number of currently running workers."
-  @spec count() :: non_neg_integer()
-  def count do
-    DynamicWorker.list_ids() |> length()
-  end
-
-  @doc "Ensures at least `n` workers are running."
-  @spec ensure_min_workers(pos_integer()) :: :ok
-  def ensure_min_workers(n) do
-    current = count()
-    needed = max(0, n - current)
-
-    for _ <- 1..needed, needed > 0 do
-      worker_id = "worker_#{:crypto.strong_rand_bytes(4) |> Base.url_encode64(padding: false)}"
-      start_worker(worker_id)
-    end
-
-    :ok
-  end
-
-  @doc "Collects stats from all active workers."
-  @spec all_stats() :: [map()]
-  def all_stats do
-    DynamicWorker.list_ids()
-    |> Enum.map(&DynamicWorker.stats/1)
-    |> Enum.filter(&is_map/1)
-  end
-end
-```
-
-### Tests
-
-```elixir
-# test/task_queue/registry_test.exs
-defmodule TaskQueue.RegistryTest do
-  use ExUnit.Case, async: false
-
-  alias TaskQueue.DynamicWorker
-  alias TaskQueue.WorkerPool
-
-  setup do
-    for id <- DynamicWorker.list_ids(), do: WorkerPool.stop_worker(id)
-    Process.sleep(50)
-    :ok
-  end
-
-  describe "DynamicWorker registration" do
-    test "worker registers itself on start" do
-      {:ok, _} = WorkerPool.start_worker("w_test_1")
-      assert pid = DynamicWorker.lookup("w_test_1")
-      assert is_pid(pid)
-      assert Process.alive?(pid)
-      WorkerPool.stop_worker("w_test_1")
-    end
-
-    test "lookup returns nil for unknown worker" do
-      assert nil == DynamicWorker.lookup("nonexistent")
-    end
-
-    test "Registry cleans up entry when worker exits" do
-      {:ok, _} = WorkerPool.start_worker("w_exit_test")
-      Process.sleep(10)
-      assert pid = DynamicWorker.lookup("w_exit_test")
-      WorkerPool.stop_worker("w_exit_test")
-      Process.sleep(50)
-      assert nil == DynamicWorker.lookup("w_exit_test")
-    end
-
-    test "via tuple routes GenServer calls to the correct worker" do
-      {:ok, _} = WorkerPool.start_worker("w_via_test")
-      stats = DynamicWorker.stats("w_via_test")
-      assert stats.worker_id == "w_via_test"
-      WorkerPool.stop_worker("w_via_test")
-    end
-  end
-
-  describe "WorkerPool" do
-    test "start_worker starts a supervised worker" do
-      assert {:ok, pid} = WorkerPool.start_worker("w_pool_1")
-      assert is_pid(pid)
-      assert Process.alive?(pid)
-      WorkerPool.stop_worker("w_pool_1")
-    end
-
-    test "count reflects active workers" do
-      initial = WorkerPool.count()
-      WorkerPool.start_worker("w_count_1")
-      WorkerPool.start_worker("w_count_2")
-      Process.sleep(20)
-      assert WorkerPool.count() == initial + 2
-      WorkerPool.stop_worker("w_count_1")
-      WorkerPool.stop_worker("w_count_2")
-    end
-
-    test "ensure_min_workers starts workers to reach the minimum" do
-      WorkerPool.ensure_min_workers(3)
-      Process.sleep(50)
-      assert WorkerPool.count() >= 3
-    end
-
-    test "all_stats returns stats for each active worker" do
-      WorkerPool.start_worker("w_stats_1")
-      WorkerPool.start_worker("w_stats_2")
-      Process.sleep(20)
-      stats = WorkerPool.all_stats()
-      assert Enum.all?(stats, &is_map/1)
-    end
-
-    test "worker crashed by DynamicSupervisor is restarted, new PID" do
-      {:ok, _} = WorkerPool.start_worker("w_crash_test")
-      pid1 = DynamicWorker.lookup("w_crash_test")
-      assert pid1 != nil
-
-      Process.exit(pid1, :kill)
-      Process.sleep(200)
-
-      pid2 = DynamicWorker.lookup("w_crash_test")
-      assert pid2 != nil
-      assert pid2 != pid1
-      WorkerPool.stop_worker("w_crash_test")
-    end
-  end
-end
-```
-
-### Run the tests
+### Step 1: Create the project
 
 ```bash
-mix test test/task_queue/registry_test.exs --trace
+mix new chat_rooms_registry --sup
+cd chat_rooms_registry
+```
+
+The `--sup` flag generates an `Application` module — we'll extend it to
+start the `Registry` and a `DynamicSupervisor`.
+
+### Step 2: `lib/chat_rooms_registry/application.ex`
+
+```elixir
+defmodule ChatRoomsRegistry.Application do
+  @moduledoc false
+
+  use Application
+
+  @impl true
+  def start(_type, _args) do
+    children = [
+      # Unique registry: one pid per room name. `keys: :unique` is required
+      # for `:via` usage — duplicate registries do not support naming.
+      {Registry, keys: :unique, name: ChatRoomsRegistry.Registry},
+      # DynamicSupervisor hosts room processes started at runtime.
+      {DynamicSupervisor, strategy: :one_for_one, name: ChatRoomsRegistry.RoomSup}
+    ]
+
+    Supervisor.start_link(children, strategy: :one_for_one, name: ChatRoomsRegistry.Supervisor)
+  end
+end
+```
+
+Wire it in `mix.exs`:
+
+```elixir
+def application do
+  [extra_applications: [:logger], mod: {ChatRoomsRegistry.Application, []}]
+end
+```
+
+### Step 3: `lib/chat_rooms_registry/room.ex`
+
+```elixir
+defmodule ChatRoomsRegistry.Room do
+  @moduledoc """
+  A single chat room. State is just a list of messages; what matters for
+  this exercise is that the room is *addressable by name* via the Registry.
+  """
+
+  use GenServer
+
+  # ── Public API ──────────────────────────────────────────────────────────
+
+  @doc "Starts a room registered under `name` in the shared Registry."
+  @spec start_link(String.t()) :: GenServer.on_start()
+  def start_link(name) when is_binary(name) do
+    GenServer.start_link(__MODULE__, name, name: via(name))
+  end
+
+  @doc "Appends a message to the room. Accepts the room name, not a pid."
+  @spec post(String.t(), String.t()) :: :ok
+  def post(name, msg), do: GenServer.cast(via(name), {:post, msg})
+
+  @doc "Returns all messages in the room (newest last)."
+  @spec history(String.t()) :: [String.t()]
+  def history(name), do: GenServer.call(via(name), :history)
+
+  # Construct the `:via` tuple once — every caller uses this helper so the
+  # registry name is defined in one place.
+  defp via(name), do: {:via, Registry, {ChatRoomsRegistry.Registry, name}}
+
+  # ── Callbacks ───────────────────────────────────────────────────────────
+
+  @impl true
+  def init(name), do: {:ok, %{name: name, messages: []}}
+
+  @impl true
+  def handle_cast({:post, msg}, %{messages: msgs} = state) do
+    {:noreply, %{state | messages: msgs ++ [msg]}}
+  end
+
+  @impl true
+  def handle_call(:history, _from, %{messages: msgs} = state) do
+    {:reply, msgs, state}
+  end
+end
+```
+
+### Step 4: `lib/chat_rooms_registry/rooms.ex`
+
+```elixir
+defmodule ChatRoomsRegistry.Rooms do
+  @moduledoc """
+  Façade over the Registry + DynamicSupervisor pair. `find_or_start/1` is
+  the usual "get me a room by name, spawning one if needed" operation.
+  """
+
+  alias ChatRoomsRegistry.Room
+
+  @registry ChatRoomsRegistry.Registry
+  @sup ChatRoomsRegistry.RoomSup
+
+  @doc """
+  Returns `{:ok, pid}` for the room named `name`, starting it under the
+  DynamicSupervisor if it does not yet exist. Idempotent and safe to call
+  from many processes concurrently.
+  """
+  @spec find_or_start(String.t()) :: {:ok, pid()}
+  def find_or_start(name) do
+    case Registry.lookup(@registry, name) do
+      [{pid, _}] ->
+        {:ok, pid}
+
+      [] ->
+        # The Registry itself handles the concurrent race: a second starter
+        # will receive `{:error, {:already_started, pid}}` from start_child,
+        # and we return that pid.
+        case DynamicSupervisor.start_child(@sup, {Room, name}) do
+          {:ok, pid} -> {:ok, pid}
+          {:error, {:already_started, pid}} -> {:ok, pid}
+        end
+    end
+  end
+
+  @doc "List currently registered room names."
+  @spec list() :: [String.t()]
+  def list do
+    # select/2 with a match spec is the cheapest way to enumerate keys.
+    Registry.select(@registry, [{{:"$1", :_, :_}, [], [:"$1"]}])
+  end
+
+  @doc "Stop a room by name. Returns :ok whether or not it existed."
+  @spec stop(String.t()) :: :ok
+  def stop(name) do
+    case Registry.lookup(@registry, name) do
+      [{pid, _}] -> DynamicSupervisor.terminate_child(@sup, pid)
+      [] -> :ok
+    end
+
+    :ok
+  end
+end
+```
+
+### Step 5: `test/chat_rooms_registry_test.exs`
+
+```elixir
+defmodule ChatRoomsRegistryTest do
+  use ExUnit.Case, async: false
+
+  alias ChatRoomsRegistry.{Room, Rooms}
+
+  setup do
+    # Each test starts from a clean slate.
+    for name <- Rooms.list(), do: Rooms.stop(name)
+    :ok
+  end
+
+  describe "find_or_start/1" do
+    test "starts a new room the first time it is requested" do
+      assert {:ok, pid} = Rooms.find_or_start("general")
+      assert Process.alive?(pid)
+      assert "general" in Rooms.list()
+    end
+
+    test "returns the same pid on subsequent calls" do
+      {:ok, pid1} = Rooms.find_or_start("dev-ops")
+      {:ok, pid2} = Rooms.find_or_start("dev-ops")
+      assert pid1 == pid2
+    end
+
+    test "different names get different processes" do
+      {:ok, a} = Rooms.find_or_start("a")
+      {:ok, b} = Rooms.find_or_start("b")
+      refute a == b
+    end
+  end
+
+  describe "post/2 and history/1" do
+    test "messages are addressable by room name, not pid" do
+      {:ok, _} = Rooms.find_or_start("coffee")
+      Room.post("coffee", "hello")
+      Room.post("coffee", "world")
+      assert Room.history("coffee") == ["hello", "world"]
+    end
+  end
+
+  describe "automatic cleanup on crash" do
+    test "registry entry disappears when the room dies" do
+      {:ok, pid} = Rooms.find_or_start("ephemeral")
+      ref = Process.monitor(pid)
+
+      # Force a non-normal exit. The DynamicSupervisor default child spec
+      # is :permanent, so the supervisor will try to restart the room;
+      # for the registry-cleanup demo, we also terminate via the supervisor.
+      DynamicSupervisor.terminate_child(ChatRoomsRegistry.RoomSup, pid)
+      assert_receive {:DOWN, ^ref, :process, ^pid, _}, 500
+
+      # Wait for the async Registry cleanup to drain.
+      :ok = wait_until(fn -> Registry.lookup(ChatRoomsRegistry.Registry, "ephemeral") == [] end)
+    end
+  end
+
+  defp wait_until(fun, deadline \\ 500) do
+    cond do
+      fun.() -> :ok
+      deadline <= 0 -> flunk("timeout")
+      true -> (Process.sleep(10); wait_until(fun, deadline - 10))
+    end
+  end
+end
+```
+
+### Step 6: Run
+
+```bash
+mix test
 ```
 
 ---
 
-## Common production mistakes
+## Trade-offs and production gotchas
 
-**1. Forgetting to start Registry before workers that register**
-If workers start before Registry, registration fails with `(ArgumentError) unknown registry`.
+**1. Registry is local-node only**
+`Registry` lives in ETS on one node. If you distribute rooms across a
+cluster you need `:global`, `:pg`, or a library like Horde or Syn. Don't
+discover halfway through production that your single-node registry can't
+follow the room to another node.
 
-**2. Not accounting for the race in lookup + call**
-Between `Registry.lookup` returning a PID and `GenServer.call(pid, ...)`, the process
-may have exited. Use the `via` tuple which handles this internally.
+**2. Registration cleanup is asynchronous**
+When a process dies, its entries are removed by the registry's monitor
+handler — not atomically with the death. A `lookup/2` immediately after a
+crash can still return the dead pid. Consumers should handle `:noproc`
+errors from `GenServer.call` gracefully.
 
-**3. Using Registry for non-process values**
-Registry entries are tied to the process that called `Registry.register/3`. When that
-process exits, the entry is gone.
+**3. Prefer strings/tuples over dynamic atoms**
+The classic reason to use `Registry` instead of `Process.register/2` is
+that atom names are never garbage-collected. If your keys come from user
+input, atom-based naming is a memory leak waiting to happen.
+
+**4. `:via` only works with `:unique` registries**
+The via protocol requires a single pid per name. Attempting to use a
+`:duplicate` registry as `{:via, Registry, ...}` crashes at runtime.
+Duplicate registries are for pubsub-style dispatch (exercise 81), not
+for naming.
+
+**5. Don't use `Registry` as a database**
+It's fast, but it's still a process-level cache keyed by pid liveness. If
+you need persistence, durable lookups, or history, back it with a real
+store and keep the `Registry` as a pid-locator only.
+
+**6. When NOT to use Registry**
+For a fixed, known-at-compile-time set of named servers (a single cache,
+a single scheduler), `Process.register/2` with an atom name is simpler and
+marginally faster. Reach for `Registry` when names are dynamic or when you
+need duplicate-key pubsub semantics.
 
 ---
 
 ## Resources
 
-- [Registry — HexDocs](https://hexdocs.pm/elixir/Registry.html)
-- [DynamicSupervisor — HexDocs](https://hexdocs.pm/elixir/DynamicSupervisor.html)
+- [`Registry` — Elixir stdlib](https://hexdocs.pm/elixir/Registry.html)
+- [`DynamicSupervisor` — Elixir stdlib](https://hexdocs.pm/elixir/DynamicSupervisor.html)
+- [Demystifying the Registry module in Elixir — Arpan Ghoshal](https://arpanghoshal3.medium.com/demystifying-the-registry-module-in-elixir-f0e07e770ec0)
+- [José Valim / Dashbit — "What's new in Elixir 1.4" (Registry announcement)](https://dashbit.co/blog/whats-new-in-elixir-1-4)

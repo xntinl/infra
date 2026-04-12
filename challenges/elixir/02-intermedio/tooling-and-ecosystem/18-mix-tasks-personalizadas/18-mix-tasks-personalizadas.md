@@ -1,507 +1,357 @@
-# Custom Mix Tasks
+# Custom Mix tasks with `Mix.Task`
 
-## Why Mix tasks
+**Project**: `my_mix_task` — a hand-rolled `mix hello` task plus a real one
+that parses arguments with `OptionParser`.
 
-Mix tasks are the idiomatic Elixir CLI. They:
-
-1. Run inside the Mix project context — your application's modules are available.
-2. Can start the Application (with `Mix.Task.run("app.start")`) and use live GenServers.
-3. Are documented with `@shortdoc` (appears in `mix help`) and `@moduledoc`.
-4. Are testable — you can call `Mix.Task.run("my.task", args)` in an ExUnit test.
-5. Compose — one task can invoke other tasks with `Mix.Task.run/2`.
-
-The name-to-module mapping is automatic: `Mix.Tasks.TaskQueue.Status` becomes `mix
-task_queue.status`.
+**Difficulty**: ★★★☆☆
+**Estimated time**: 2–3 hours
 
 ---
 
-## The business problem
+## Project context
 
-Three tasks:
+Every Elixir project eventually grows a folder of one-off scripts — data
+migrations, seed files, reports, import/export tools. The idiomatic home
+for them is **custom Mix tasks**, not `scripts/*.exs`. A Mix task runs
+inside your app's OTP environment (apps started, config loaded, deps
+compiled), integrates with `mix help`, and is callable from CI and from
+other Mix tasks.
 
-1. `mix task_queue.status` — prints current queue depth, active worker count, and
-   per-status job counts from the registry.
-2. `mix task_queue.submit --type TYPE --payload JSON [--priority PRIORITY]` — submits a
-   single job to the queue and prints its ID.
-3. `mix task_queue.drain [--timeout SECONDS]` — drains the queue by popping and discarding
-   jobs, with a configurable timeout.
+In this exercise you implement:
 
-All modules are defined completely in this exercise.
+1. `mix hello` — the minimal task, to learn the `Mix.Task` behaviour.
+2. `mix my_mix_task.greet NAME --shout` — a realistic task with argument
+   parsing via `OptionParser` and user-facing help.
 
----
+You'll also learn the file-layout rule that trips up everyone who writes
+their first Mix task: **the module name dictates the task name**.
 
-## Project setup
+Project structure:
 
 ```
-task_queue/
+my_mix_task/
 ├── lib/
-│   ├── task_queue/
-│   │   ├── application.ex
-│   │   ├── task_registry.ex
-│   │   ├── queue_server.ex
-│   │   └── worker_pool.ex
-│   └── mix/
-│       └── tasks/
-│           ├── task_queue.status.ex
-│           ├── task_queue.submit.ex
-│           └── task_queue.drain.ex
+│   ├── mix/
+│   │   └── tasks/
+│   │       ├── hello.ex
+│   │       └── my_mix_task.greet.ex
+│   └── my_mix_task.ex
 ├── test/
-│   └── task_queue/
-│       └── mix_tasks_test.exs
+│   ├── mix/
+│   │   └── tasks/
+│   │       └── my_mix_task.greet_test.exs
+│   └── my_mix_task_test.exs
 └── mix.exs
 ```
 
-Add `jason` to `mix.exs`:
+---
+
+## Core concepts
+
+### 1. The module-name convention
+
+Mix discovers tasks by scanning modules named `Mix.Tasks.<Whatever>`.
+
+| Module                       | Task name                |
+|------------------------------|--------------------------|
+| `Mix.Tasks.Hello`            | `mix hello`              |
+| `Mix.Tasks.MyMixTask.Greet`  | `mix my_mix_task.greet`  |
+| `Mix.Tasks.Db.Seed`          | `mix db.seed`            |
+
+Dots in the task name become dots in the module path. Namespace your tasks
+with your app name (`my_mix_task.*`) — otherwise they clash with built-ins
+like `mix test` or tasks from other libraries.
+
+### 2. The `Mix.Task` behaviour
+
+You need exactly two things:
 
 ```elixir
-defp deps do
-  [
-    {:jason, "~> 1.4"}
-  ]
-end
+use Mix.Task
+@shortdoc "..."   # one-line summary shown by `mix help`
+@moduledoc "..."  # long help shown by `mix help my_task`
+def run(args), do: ...
 ```
+
+`run/1` receives the raw argv list — everything after the task name on the
+command line.
+
+### 3. `OptionParser.parse!/2` — idiomatic argument parsing
+
+```elixir
+{opts, positional} =
+  OptionParser.parse!(args,
+    strict: [shout: :boolean, times: :integer],
+    aliases: [s: :shout, t: :times]
+  )
+```
+
+- `strict:` rejects unknown flags — use it. The non-strict variant silently
+  accepts typos.
+- `aliases:` maps short flags (`-s`) to long ones (`--shout`).
+- `parse!/2` raises on invalid options — the right call for tasks.
+
+### 4. `Mix.Task.run/1` — calling tasks from tasks
+
+Inside a task you can chain to others:
+
+```elixir
+Mix.Task.run("app.start")   # start your OTP app if you need it
+Mix.Task.run("compile")     # compile if needed
+```
+
+Mix memoizes this — re-running a task within the same invocation is a
+no-op, which is what you want for most dependencies.
 
 ---
 
 ## Implementation
 
-### `lib/task_queue/application.ex`
+### Step 1: Create the project
 
-```elixir
-defmodule TaskQueue.Application do
-  use Application
-
-  @impl Application
-  def start(_type, _args) do
-    children = [
-      TaskQueue.TaskRegistry,
-      TaskQueue.QueueServer,
-      {Registry, keys: :unique, name: TaskQueue.WorkerRegistry},
-      {DynamicSupervisor, strategy: :one_for_one, name: TaskQueue.WorkerSupervisor}
-    ]
-
-    opts = [strategy: :one_for_one, name: TaskQueue.RootSupervisor]
-    Supervisor.start_link(children, opts)
-  end
-end
+```bash
+mix new my_mix_task
+cd my_mix_task
 ```
 
-### `lib/task_queue/task_registry.ex`
+### Step 2: The minimal task — `lib/mix/tasks/hello.ex`
 
 ```elixir
-defmodule TaskQueue.TaskRegistry do
-  use Agent
-
-  def start_link(initial \\ %{}) do
-    Agent.start_link(fn -> initial end, name: __MODULE__)
-  end
-
-  def register(task_id) do
-    entry = %{status: :pending, updated_at: System.monotonic_time(:millisecond)}
-    Agent.update(__MODULE__, fn state -> Map.put(state, task_id, entry) end)
-  end
-
-  def stats do
-    Agent.get(__MODULE__, fn state ->
-      Enum.reduce(state, %{pending: 0, running: 0, done: 0, failed: 0}, fn {_id, entry}, acc ->
-        Map.update(acc, entry.status, 1, &(&1 + 1))
-      end)
-    end)
-  end
-end
-```
-
-### `lib/task_queue/queue_server.ex`
-
-```elixir
-defmodule TaskQueue.QueueServer do
-  use GenServer
-  require Logger
-
-  def start_link(opts \\ []) do
-    GenServer.start_link(__MODULE__, opts, name: __MODULE__)
-  end
-
-  def push(payload) do
-    job = %{
-      id: :crypto.strong_rand_bytes(8) |> Base.url_encode64(padding: false),
-      payload: payload,
-      queued_at: System.monotonic_time(:millisecond)
-    }
-    GenServer.cast(__MODULE__, {:push, job})
-  end
-
-  def pop, do: GenServer.call(__MODULE__, :pop)
-  def size, do: GenServer.call(__MODULE__, :size)
-
-  @impl GenServer
-  def init(_opts), do: {:ok, []}
-
-  @impl GenServer
-  def handle_cast({:push, job}, state), do: {:noreply, state ++ [job]}
-
-  @impl GenServer
-  def handle_call(:pop, _from, []), do: {:reply, {:error, :empty}, []}
-  def handle_call(:pop, _from, [job | rest]), do: {:reply, {:ok, job}, rest}
-
-  @impl GenServer
-  def handle_call(:size, _from, state), do: {:reply, length(state), state}
-
-  @impl GenServer
-  def handle_info(_, state), do: {:noreply, state}
-end
-```
-
-### `lib/task_queue/worker_pool.ex`
-
-```elixir
-defmodule TaskQueue.WorkerPool do
-  @moduledoc "Provides a count of active workers via Registry."
-
-  def count do
-    TaskQueue.WorkerRegistry
-    |> Registry.select([{{:"$1", :"$2", :"$3"}, [], [:"$1"]}])
-    |> length()
-  end
-end
-```
-
-### `lib/mix/tasks/task_queue.status.ex`
-
-```elixir
-defmodule Mix.Tasks.TaskQueue.Status do
-  use Mix.Task
-
-  @shortdoc "Prints the current task_queue status"
-
+defmodule Mix.Tasks.Hello do
   @moduledoc """
-  Prints the current task_queue system status: queue depth, worker count,
-  and per-status counts from the registry.
+  A minimal Mix task. Prints "Hello, world!".
 
-  ## Usage
-
-      mix task_queue.status
+      $ mix hello
+      Hello, world!
   """
+  @shortdoc "Says hello"
+
+  use Mix.Task
 
   @impl Mix.Task
   def run(_args) do
-    Mix.Task.run("app.start")
-
-    queue_depth = TaskQueue.QueueServer.size()
-    worker_count = TaskQueue.WorkerPool.count()
-    stats = TaskQueue.TaskRegistry.stats()
-
-    IO.puts("Task Queue Status")
-    IO.puts("─────────────────")
-    IO.puts("Queue depth:    #{queue_depth}")
-    IO.puts("Active workers: #{worker_count}")
-    IO.puts("Jobs by status:")
-
-    Enum.each(stats, fn {status, count} ->
-      IO.puts("  #{status}: #{count}")
-    end)
+    Mix.shell().info("Hello, world!")
   end
 end
 ```
 
-### `lib/mix/tasks/task_queue.submit.ex`
+`Mix.shell().info/1` is the preferred way to print from a task — tests can
+swap the shell out and capture messages (see the test in step 5).
+
+### Step 3: A real task — `lib/mix/tasks/my_mix_task.greet.ex`
 
 ```elixir
-defmodule Mix.Tasks.TaskQueue.Submit do
-  use Mix.Task
-
-  @shortdoc "Submits a job to the task_queue"
-
+defmodule Mix.Tasks.MyMixTask.Greet do
   @moduledoc """
-  Submits a single job to the task_queue.
+  Greets the given name(s).
 
-  ## Usage
+      $ mix my_mix_task.greet Alice
+      Hello, Alice!
 
-      mix task_queue.submit --type TYPE --payload JSON [--priority PRIORITY]
+      $ mix my_mix_task.greet Alice Bob --shout
+      HELLO, ALICE!
+      HELLO, BOB!
+
+      $ mix my_mix_task.greet Alice --times 3
+      Hello, Alice!
+      Hello, Alice!
+      Hello, Alice!
 
   ## Options
 
-  - `--type` (required) — job type: webhook, cron, pipeline, batch, adhoc
-  - `--payload` (required) — job payload as a JSON string
-  - `--priority` (optional, default: normal) — low, normal, high, critical
+    * `--shout` / `-s` — uppercase the greeting.
+    * `--times N` / `-t N` — repeat the greeting N times (default 1).
   """
+  @shortdoc "Greets the given name(s)"
 
-  @valid_types ["webhook", "cron", "pipeline", "batch", "adhoc"]
-  @valid_priorities ["low", "normal", "high", "critical"]
-
-  @impl Mix.Task
-  def run(args) do
-    {opts, _remaining, _invalid} =
-      OptionParser.parse(args, strict: [type: :string, payload: :string, priority: :string])
-
-    job_type = Keyword.get(opts, :type)
-    payload_json = Keyword.get(opts, :payload)
-    priority = Keyword.get(opts, :priority, "normal")
-
-    cond do
-      is_nil(job_type) ->
-        Mix.raise("--type is required. Valid values: #{Enum.join(@valid_types, ", ")}")
-
-      job_type not in @valid_types ->
-        Mix.raise("Invalid type '#{job_type}'. Valid values: #{Enum.join(@valid_types, ", ")}")
-
-      is_nil(payload_json) ->
-        Mix.raise("--payload is required (JSON string)")
-
-      priority not in @valid_priorities ->
-        Mix.raise("Invalid priority '#{priority}'. Valid values: #{Enum.join(@valid_priorities, ", ")}")
-
-      true ->
-        :ok
-    end
-
-    payload =
-      case Jason.decode(payload_json) do
-        {:ok, decoded} -> decoded
-        {:error, _} -> Mix.raise("--payload must be valid JSON. Got: #{payload_json}")
-      end
-
-    Mix.Task.run("app.start")
-
-    job_id = "job_#{:crypto.strong_rand_bytes(6) |> Base.url_encode64(padding: false)}"
-
-    TaskQueue.TaskRegistry.register(job_id)
-
-    job = %{
-      id: job_id,
-      type: String.to_existing_atom(job_type),
-      priority: String.to_existing_atom(priority),
-      payload: payload,
-      retry_count: 0
-    }
-
-    TaskQueue.QueueServer.push(job)
-
-    IO.puts("Submitted job: #{job_id} (type: #{job_type}, priority: #{priority})")
-  end
-end
-```
-
-### `lib/mix/tasks/task_queue.drain.ex`
-
-```elixir
-defmodule Mix.Tasks.TaskQueue.Drain do
   use Mix.Task
 
-  @shortdoc "Drains the task_queue by popping and discarding all jobs"
-
-  @moduledoc """
-  Removes all pending jobs from the queue.
-
-  ## Usage
-
-      mix task_queue.drain [--timeout SECONDS]
-
-  ## Options
-
-  - `--timeout` (optional, default: 30) — maximum seconds to wait
-  """
+  @switches [shout: :boolean, times: :integer]
+  @aliases [s: :shout, t: :times]
 
   @impl Mix.Task
   def run(args) do
-    {opts, _remaining, _} = OptionParser.parse(args, strict: [timeout: :integer])
-    timeout_s = Keyword.get(opts, :timeout, 30)
+    {opts, names} = OptionParser.parse!(args, strict: @switches, aliases: @aliases)
 
-    Mix.Task.run("app.start")
-
-    depth = TaskQueue.QueueServer.size()
-    IO.puts("Draining queue... #{depth} jobs found.")
-
-    start_ms = System.monotonic_time(:millisecond)
-    deadline_ms = start_ms + timeout_s * 1_000
-
-    drained = drain_loop(0, deadline_ms)
-
-    elapsed_s = (System.monotonic_time(:millisecond) - start_ms) / 1_000
-    IO.puts("Drained #{drained} jobs in #{Float.round(elapsed_s, 1)}s.")
-  end
-
-  defp drain_loop(count, deadline_ms) do
-    if System.monotonic_time(:millisecond) > deadline_ms do
-      IO.puts("Timeout reached. #{count} jobs drained so far.")
-      count
-    else
-      case TaskQueue.QueueServer.pop() do
-        {:error, :empty} ->
-          count
-
-        {:ok, _job} ->
-          drain_loop(count + 1, deadline_ms)
-      end
+    if names == [] do
+      # Fail loudly — Mix tasks should not silently succeed on missing input.
+      Mix.raise("mix my_mix_task.greet expects at least one NAME. See `mix help my_mix_task.greet`.")
     end
+
+    shout? = Keyword.get(opts, :shout, false)
+    times = Keyword.get(opts, :times, 1)
+
+    if times < 1, do: Mix.raise("--times must be >= 1, got: #{times}")
+
+    for name <- names, _ <- 1..times do
+      Mix.shell().info(MyMixTask.greeting(name, shout: shout?))
+    end
+
+    :ok
   end
 end
 ```
 
-### Tests
+### Step 4: The library function it uses — `lib/my_mix_task.ex`
 
 ```elixir
-# test/task_queue/mix_tasks_test.exs
-defmodule TaskQueue.MixTasksTest do
+defmodule MyMixTask do
+  @moduledoc """
+  Library code used by the custom Mix tasks.
+
+  Putting the logic here (not inside the task module) keeps tasks thin and
+  the real behavior unit-testable without invoking Mix.
+  """
+
+  @doc """
+  Builds a greeting string.
+
+  ## Examples
+
+      iex> MyMixTask.greeting("Ada")
+      "Hello, Ada!"
+
+      iex> MyMixTask.greeting("Ada", shout: true)
+      "HELLO, ADA!"
+  """
+  @spec greeting(String.t(), keyword()) :: String.t()
+  def greeting(name, opts \\ []) when is_binary(name) do
+    msg = "Hello, #{name}!"
+    if Keyword.get(opts, :shout, false), do: String.upcase(msg), else: msg
+  end
+end
+```
+
+### Step 5: Tests
+
+`test/my_mix_task_test.exs`:
+
+```elixir
+defmodule MyMixTaskTest do
+  use ExUnit.Case, async: true
+
+  doctest MyMixTask
+
+  test "greeting/2 with shout uppercases" do
+    assert MyMixTask.greeting("Ada", shout: true) == "HELLO, ADA!"
+  end
+
+  test "greeting/2 without shout is plain" do
+    assert MyMixTask.greeting("Ada") == "Hello, Ada!"
+  end
+end
+```
+
+`test/mix/tasks/my_mix_task.greet_test.exs`:
+
+```elixir
+defmodule Mix.Tasks.MyMixTask.GreetTest do
+  # async: false — Mix.shell() is a process-wide setting for the test node.
   use ExUnit.Case, async: false
-  import ExUnit.CaptureIO
 
   setup do
-    Mix.Task.reenable("task_queue.status")
-    Mix.Task.reenable("task_queue.submit")
-    Mix.Task.reenable("task_queue.drain")
-
-    case Process.whereis(TaskQueue.QueueServer) do
-      nil -> :ok
-      _ ->
-        for _ <- 1..TaskQueue.QueueServer.size(), do: TaskQueue.QueueServer.pop()
-    end
-    Process.sleep(10)
+    # :process shell captures messages instead of writing to stdout.
+    Mix.shell(Mix.Shell.Process)
+    on_exit(fn -> Mix.shell(Mix.Shell.IO) end)
     :ok
   end
 
-  describe "mix task_queue.status" do
-    test "prints queue depth header" do
-      output = capture_io(fn ->
-        Mix.Task.run("task_queue.status", [])
-      end)
+  test "greets a single name" do
+    Mix.Tasks.MyMixTask.Greet.run(["Ada"])
+    assert_received {:mix_shell, :info, ["Hello, Ada!"]}
+  end
 
-      assert String.contains?(output, "Queue depth:")
-      assert String.contains?(output, "Active workers:")
-    end
+  test "greets multiple names with --shout" do
+    Mix.Tasks.MyMixTask.Greet.run(["Ada", "Bob", "--shout"])
+    assert_received {:mix_shell, :info, ["HELLO, ADA!"]}
+    assert_received {:mix_shell, :info, ["HELLO, BOB!"]}
+  end
 
-    test "shows zero depth for empty queue" do
-      output = capture_io(fn ->
-        Mix.Task.run("task_queue.status", [])
-      end)
+  test "--times N repeats N times" do
+    Mix.Tasks.MyMixTask.Greet.run(["Ada", "--times", "2"])
+    assert_received {:mix_shell, :info, ["Hello, Ada!"]}
+    assert_received {:mix_shell, :info, ["Hello, Ada!"]}
+  end
 
-      assert String.contains?(output, "Queue depth:    0")
+  test "short aliases work (-s, -t)" do
+    Mix.Tasks.MyMixTask.Greet.run(["Ada", "-s", "-t", "2"])
+    assert_received {:mix_shell, :info, ["HELLO, ADA!"]}
+    assert_received {:mix_shell, :info, ["HELLO, ADA!"]}
+  end
+
+  test "raises on missing NAME" do
+    assert_raise Mix.Error, ~r/expects at least one NAME/, fn ->
+      Mix.Tasks.MyMixTask.Greet.run([])
     end
   end
 
-  describe "mix task_queue.submit" do
-    test "submits a job and prints the job ID" do
-      output = capture_io(fn ->
-        Mix.Task.run("task_queue.submit", [
-          "--type", "batch",
-          "--payload", "{\"key\":\"value\"}",
-          "--priority", "normal"
-        ])
-      end)
-
-      assert String.contains?(output, "Submitted job:")
-      assert String.contains?(output, "batch")
-    end
-
-    test "exits with error for missing --type" do
-      assert_raise Mix.Error, ~r/--type is required/, fn ->
-        Mix.Task.run("task_queue.submit", ["--payload", "{}"])
-      end
-    end
-
-    test "exits with error for invalid --type" do
-      assert_raise Mix.Error, ~r/Invalid type/, fn ->
-        Mix.Task.run("task_queue.submit", ["--type", "invalid", "--payload", "{}"])
-      end
-    end
-
-    test "exits with error for invalid JSON payload" do
-      assert_raise Mix.Error, ~r/valid JSON/, fn ->
-        Mix.Task.run("task_queue.submit", ["--type", "batch", "--payload", "not-json"])
-      end
-    end
-
-    test "queue depth increases by 1 after submit" do
-      initial_depth = TaskQueue.QueueServer.size()
-
-      capture_io(fn ->
-        Mix.Task.run("task_queue.submit", [
-          "--type", "adhoc",
-          "--payload", "{}"
-        ])
-      end)
-
-      Process.sleep(20)
-      assert TaskQueue.QueueServer.size() == initial_depth + 1
-    end
-  end
-
-  describe "mix task_queue.drain" do
-    test "drains all jobs from the queue" do
-      TaskQueue.QueueServer.push(:job1)
-      TaskQueue.QueueServer.push(:job2)
-      TaskQueue.QueueServer.push(:job3)
-      Process.sleep(10)
-      assert 3 = TaskQueue.QueueServer.size()
-
-      capture_io(fn ->
-        Mix.Task.run("task_queue.drain", [])
-      end)
-
-      assert 0 = TaskQueue.QueueServer.size()
-    end
-
-    test "prints drain summary with job count" do
-      TaskQueue.QueueServer.push(:drain_test)
-      Process.sleep(10)
-
-      output = capture_io(fn ->
-        Mix.Task.run("task_queue.drain", [])
-      end)
-
-      assert String.contains?(output, "Drained")
-      assert String.contains?(output, "jobs")
-    end
-
-    test "drain on empty queue prints 0 jobs drained" do
-      output = capture_io(fn ->
-        Mix.Task.run("task_queue.drain", [])
-      end)
-
-      assert String.contains?(output, "0 jobs")
-    end
-  end
-
-  describe "OptionParser usage" do
-    test "drain respects --timeout argument" do
-      assert capture_io(fn ->
-        Mix.Task.run("task_queue.drain", ["--timeout", "5"])
-      end) =~ "Drained"
+  test "rejects unknown options" do
+    assert_raise OptionParser.ParseError, fn ->
+      Mix.Tasks.MyMixTask.Greet.run(["Ada", "--unknown"])
     end
   end
 end
 ```
 
-### Run the tests
+### Step 6: Run
 
 ```bash
-mix test test/task_queue/mix_tasks_test.exs --trace
+mix test
+mix hello
+mix my_mix_task.greet Ada Bob --shout
+mix help my_mix_task.greet
 ```
+
+The last command prints your `@moduledoc` — free documentation.
 
 ---
 
-## Common production mistakes
+## Trade-offs and production gotchas
 
-**1. Not calling `Mix.Task.run("app.start")` before accessing GenServers**
-Without starting the application, named GenServers are not running.
+**1. Tasks run without your app started by default**
+`run/1` is called before `application: :my_mix_task` boots. If your task
+needs `Repo`, `Application.get_env/2`, or started children, you must call
+`Mix.Task.run("app.start")` first. Forgetting this is the #1 "my task can't
+find the Repo" bug.
 
-**2. Using `String.to_atom` instead of `String.to_existing_atom`**
-`String.to_atom/1` creates a new atom for any string. Atoms are never garbage-collected.
+**2. Tasks are not in production releases**
+Mix tasks live in `lib/mix/tasks/` and are loaded from your app. In a
+production release (`mix release`), Mix itself is NOT included — your
+custom tasks disappear. For production operations, use a release CLI
+(`lib/my_app/release.ex`) or a script module invoked by the release.
 
-**3. Forgetting `Mix.Task.reenable/1` before re-running in tests**
-By default, Mix tasks only run once per Mix session.
+**3. `Mix.shell().info` vs `IO.puts`**
+Tests can swap `Mix.shell()` to `Mix.Shell.Process` and assert on the
+messages. `IO.puts` is untestable without `ExUnit.CaptureIO`. Use the
+shell abstraction.
 
-**4. Printing progress to stdout when the task output is piped**
-Separate progress (stderr) from data (stdout):
-```elixir
-IO.puts(:stderr, "Connecting...")
-IO.puts("queue_depth=#{n}")
-```
+**4. `OptionParser.parse/2` vs `parse!/2` vs `parse_head!/2`**
+- `parse/2` — returns invalid opts in a third tuple element; easy to ignore
+  and forget, which hides typos.
+- `parse!/2` — raises on invalid; use for tasks.
+- `parse_head!/2` — stops at the first positional arg; use when you want
+  `my_task foo --flag` vs `my_task --flag foo` to both work predictably.
+
+**5. Namespacing conflicts**
+If you name your task `mix build`, you shadow no built-in — but you might
+shadow one from a library that is added later. Namespace with your app:
+`my_app.build`. Exceptions: tasks you genuinely intend to be global (and
+which you own — don't ship `mix build` in a published Hex package).
+
+**6. When NOT to write a Mix task**
+- One-off migrations that need database transactions with rollback — use
+  `Ecto.Migration`, not a task.
+- Anything that runs in production from an OTP release — put it on a
+  `release.ex` module and call it via `bin/my_app eval`.
+- Logic shared across apps in an umbrella — put it in a library and call
+  the library from each app's task.
 
 ---
 
 ## Resources
 
-- [Mix.Task — HexDocs](https://hexdocs.pm/mix/Mix.Task.html)
-- [OptionParser — HexDocs](https://hexdocs.pm/elixir/OptionParser.html)
-- [Mix Tasks — Elixir School](https://elixirschool.com/en/lessons/mix/mix_tasks)
+- [`Mix.Task` — Elixir docs](https://hexdocs.pm/mix/Mix.Task.html)
+- [`Mix` overview and conventions](https://hexdocs.pm/mix/Mix.html)
+- [`OptionParser`](https://hexdocs.pm/elixir/OptionParser.html) — every detail of argument parsing
+- [`Mix.Shell`](https://hexdocs.pm/mix/Mix.Shell.html) and [`Mix.Shell.Process`](https://hexdocs.pm/mix/Mix.Shell.Process.html) — testable task I/O
+- ["Writing a Mix task"](https://hexdocs.pm/mix/Mix.Task.html#module-examples) — the canonical walkthrough
