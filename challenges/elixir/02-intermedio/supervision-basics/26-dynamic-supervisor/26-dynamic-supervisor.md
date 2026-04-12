@@ -1,318 +1,289 @@
-# DynamicSupervisor
+# DynamicSupervisor — starting children at runtime
 
-## Goal
+**Project**: `worker_factory` — a DynamicSupervisor that spawns job workers on demand, one per incoming request.
 
-Build a `task_queue` dynamic worker pool using `DynamicSupervisor`. Workers are started on demand when jobs arrive and terminated after completion. The pool is capped at `max_children` to prevent resource exhaustion. Crashed workers are automatically restarted.
+**Difficulty**: ★★★☆☆
+**Estimated time**: 2–3 hours
 
 ---
 
-## Why `DynamicSupervisor` and not spawning processes directly
+## Project context
 
-Spawning with `spawn/1` or `Task.start/1` creates processes with no supervision:
+`Supervisor` is great when you know your children up front: a Phoenix app
+has exactly one Repo, one Endpoint, one PubSub. But most real systems also
+need **on-demand** processes: one worker per job, one connection per client,
+one session per user. You don't know how many you'll need or when.
+
+`DynamicSupervisor` is the OTP answer. Its children are declared at runtime
+via `start_child/2`, not in `init/1`. The strategy is always `:one_for_one`
+— children are independent, so a crash in one must never cascade.
+
+Project structure:
 
 ```
-spawn/1 -> process crashes -> process disappears silently -> job is lost
+worker_factory/
+├── lib/
+│   ├── worker_factory.ex
+│   ├── worker_factory/
+│   │   ├── job_worker.ex
+│   │   └── supervisor.ex
+├── test/
+│   └── worker_factory_test.exs
+└── mix.exs
 ```
 
-`DynamicSupervisor` provides:
-- **Automatic restart** -- a crashed worker is restarted according to the restart strategy
-- **Shutdown propagation** -- when the supervisor shuts down, it terminates children cleanly
-- **Observability** -- `DynamicSupervisor.which_children/1` gives you the current process list
-- **Backpressure via `max_children`** -- reject new work when the pool is at capacity
+---
 
-The key insight: `Supervisor` requires knowing all children at startup. `DynamicSupervisor` manages children whose count and identity are not known until runtime.
+## Core concepts
+
+### 1. No static children list
+
+```elixir
+def init(_) do
+  DynamicSupervisor.init(strategy: :one_for_one)
+end
+```
+
+That's the whole init. You don't list children — you add them at runtime
+with `DynamicSupervisor.start_child(sup, child_spec)`.
+
+### 2. `start_child/2` returns the new worker's pid
+
+```
+  DynamicSupervisor.start_child(sup, {Worker, arg})
+        │
+        ▼
+  {:ok, #PID<0.123.0>}   ← the supervisor started a new Worker
+```
+
+The caller owns the pid. You can monitor it, message it, or look it up
+via a `Registry` later (exercise 61).
+
+### 3. Only `:one_for_one` is supported
+
+DynamicSupervisor deliberately forbids `:one_for_all` and `:rest_for_one`.
+Dynamic children have no defined ordering — there is no "rest" to restart.
+If you need group-wide restarts, use a regular `Supervisor`.
+
+### 4. Restart strategy defaults to `:permanent`
+
+Just like with `Supervisor`, a crashed child is restarted by default.
+For one-shot jobs, set `restart: :transient` or `:temporary` on the
+worker's `child_spec`. See exercise 64.
+
+### 5. `max_restarts` applies to the whole tree
+
+Even though each child is independent, if the whole tree crashes more than
+`max_restarts` times in `max_seconds`, the DynamicSupervisor itself crashes.
+Tune these for workloads with many short-lived workers.
 
 ---
 
 ## Implementation
 
-### Step 1: `mix.exs`
+### Step 1: Create the project
 
-```elixir
-defmodule TaskQueue.MixProject do
-  use Mix.Project
-
-  def project do
-    [
-      app: :task_queue,
-      version: "0.1.0",
-      elixir: "~> 1.15",
-      start_permanent: Mix.env() == :prod,
-      deps: deps()
-    ]
-  end
-
-  def application do
-    [
-      extra_applications: [:logger],
-      mod: {TaskQueue.Application, []}
-    ]
-  end
-
-  defp deps, do: []
-end
+```bash
+mix new worker_factory
+cd worker_factory
 ```
 
-### Step 2: `lib/task_queue/application.ex`
+### Step 2: `lib/worker_factory/job_worker.ex`
 
 ```elixir
-defmodule TaskQueue.Application do
-  use Application
-
-  @impl true
-  def start(_type, _args) do
-    children = [
-      TaskQueue.WorkerSupervisor
-    ]
-
-    opts = [strategy: :one_for_one, name: TaskQueue.Supervisor]
-    Supervisor.start_link(children, opts)
-  end
-end
-```
-
-### Step 3: `lib/task_queue/worker.ex` -- Worker as a supervised GenServer
-
-`DynamicSupervisor` manages child processes. A child must implement `start_link/1` and `child_spec/1`. The Worker is a GenServer that accepts a job on startup and stays alive holding the job state until explicitly terminated or until `execute/1` is called.
-
-```elixir
-defmodule TaskQueue.Worker do
+defmodule WorkerFactory.JobWorker do
   @moduledoc """
-  A supervised worker process managed by TaskQueue.WorkerSupervisor.
-
-  The job is passed as the argument to `start_link/1`. The process stays
-  alive holding the job state until explicitly terminated or until
-  `execute/1` is called.
+  Minimal job worker. Holds a job id and an arbitrary payload. Exposes
+  `describe/1` so callers can verify the worker is alive and has the right
+  state, and `crash/1` / `finish/1` to simulate the two termination paths.
   """
 
-  use GenServer
+  # :transient = restart only on abnormal exit, not on :normal/:shutdown.
+  use GenServer, restart: :transient
 
-  @doc """
-  Starts a worker process linked to the calling supervisor.
-  """
-  def start_link(job) when is_map(job) do
-    GenServer.start_link(__MODULE__, job)
+  @type job_id :: term()
+
+  @spec start_link(keyword()) :: GenServer.on_start()
+  def start_link(opts) do
+    id = Keyword.fetch!(opts, :id)
+    payload = Keyword.get(opts, :payload, %{})
+    GenServer.start_link(__MODULE__, {id, payload})
   end
 
-  @doc """
-  Executes the job held by `pid` and returns the result.
-  """
-  @spec execute(pid()) :: {:ok, term()} | {:error, term()}
-  def execute(pid) do
-    GenServer.call(pid, :execute)
-  end
+  @spec describe(pid()) :: {job_id(), map()}
+  def describe(pid), do: GenServer.call(pid, :describe)
+
+  @spec crash(pid()) :: :ok
+  def crash(pid), do: GenServer.cast(pid, :crash)
+
+  @spec finish(pid()) :: :ok
+  def finish(pid), do: GenServer.cast(pid, :finish)
 
   @impl true
-  def init(job), do: {:ok, job}
+  def init({id, payload}), do: {:ok, %{id: id, payload: payload}}
 
   @impl true
-  def handle_call(:execute, _from, job) do
-    result = do_execute(Map.get(job, :type), Map.get(job, :args, %{}))
-    {:reply, result, job}
-  end
+  def handle_call(:describe, _from, %{id: id, payload: p} = s),
+    do: {:reply, {id, p}, s}
 
-  defp do_execute("noop", _args), do: {:ok, :noop}
-  defp do_execute("echo", args), do: {:ok, args}
-  defp do_execute(type, _args), do: {:error, {:unknown_type, type}}
+  @impl true
+  def handle_cast(:crash, _state), do: raise("job blew up")
+  # :transient + :normal → supervisor will NOT restart.
+  def handle_cast(:finish, state), do: {:stop, :normal, state}
 end
 ```
 
-### Step 4: `lib/task_queue/worker_supervisor.ex` -- dynamic worker pool
-
-The `max_children` option in `DynamicSupervisor.init/1` is the primary backpressure mechanism. When the pool is full, `start_child/2` returns `{:error, :max_children}`, which the wrapper translates to `{:error, :max_workers_reached}`. This is safer than checking `active_count` first, because that introduces a TOCTOU race condition.
+### Step 3: `lib/worker_factory/supervisor.ex`
 
 ```elixir
-defmodule TaskQueue.WorkerSupervisor do
+defmodule WorkerFactory.Supervisor do
   @moduledoc """
-  Manages the dynamic pool of TaskQueue.Worker processes.
-
-  Workers are started on demand when jobs arrive and terminate after
-  completing their job. The pool is capped at `max_children` to
-  prevent overwhelming downstream services.
+  DynamicSupervisor for job workers. Public helpers hide the
+  `DynamicSupervisor.start_child/2` call from consumers.
   """
 
   use DynamicSupervisor
 
-  @max_workers 20
-
+  @spec start_link(keyword()) :: Supervisor.on_start()
   def start_link(opts \\ []) do
-    DynamicSupervisor.start_link(__MODULE__, opts, name: __MODULE__)
+    DynamicSupervisor.start_link(__MODULE__, :ok, Keyword.put_new(opts, :name, __MODULE__))
   end
 
   @impl true
-  def init(_opts) do
-    DynamicSupervisor.init(strategy: :one_for_one, max_children: @max_workers)
+  def init(:ok) do
+    # max_restarts bumped from the default 3 because job workers can
+    # legitimately crash under load and we don't want to take the factory
+    # down at the first small spike.
+    DynamicSupervisor.init(strategy: :one_for_one, max_restarts: 10, max_seconds: 10)
   end
 
   @doc """
-  Starts a supervised worker to process the given job.
-
-  Returns `{:ok, pid}` on success, `{:error, :max_workers_reached}` when the
-  pool is at capacity, or `{:error, reason}` for other failures.
+  Spawns a new job worker under the factory. Returns `{:ok, pid}` or an
+  error tuple from `DynamicSupervisor.start_child/2`.
   """
-  @spec start_worker(map()) :: {:ok, pid()} | {:error, term()}
-  def start_worker(job) when is_map(job) do
-    child_spec = {TaskQueue.Worker, job}
-
-    case DynamicSupervisor.start_child(__MODULE__, child_spec) do
-      {:error, :max_children} -> {:error, :max_workers_reached}
-      other -> other
-    end
+  @spec start_job(term(), map()) :: DynamicSupervisor.on_start_child()
+  def start_job(id, payload \\ %{}) do
+    spec = {WorkerFactory.JobWorker, [id: id, payload: payload]}
+    DynamicSupervisor.start_child(__MODULE__, spec)
   end
 
-  @doc """
-  Terminates a specific worker by PID.
-  """
-  @spec terminate_worker(pid()) :: :ok | {:error, :not_found}
-  def terminate_worker(pid) when is_pid(pid) do
-    case DynamicSupervisor.terminate_child(__MODULE__, pid) do
-      :ok -> :ok
-      {:error, :not_found} -> {:error, :not_found}
-    end
-  end
-
-  @doc """
-  Returns the number of currently active worker processes.
-  """
-  @spec active_count() :: non_neg_integer()
-  def active_count do
-    DynamicSupervisor.count_children(__MODULE__).active
-  end
-
-  @doc """
-  Returns a list of PIDs for all active workers.
-  """
-  @spec active_pids() :: [pid()]
-  def active_pids do
-    __MODULE__
-    |> DynamicSupervisor.which_children()
-    |> Enum.flat_map(fn
-      {_, pid, _, _} when is_pid(pid) -> [pid]
-      _ -> []
-    end)
+  @spec children_count() :: non_neg_integer()
+  def children_count do
+    %{active: active} = DynamicSupervisor.count_children(__MODULE__)
+    active
   end
 end
 ```
 
-### Step 5: Tests
+### Step 4: `test/worker_factory_test.exs`
 
 ```elixir
-# test/task_queue/dynamic_supervisor_test.exs
-defmodule TaskQueue.DynamicSupervisorTest do
+defmodule WorkerFactoryTest do
   use ExUnit.Case, async: false
 
-  alias TaskQueue.WorkerSupervisor
-
   setup do
-    WorkerSupervisor.active_pids()
-    |> Enum.each(&WorkerSupervisor.terminate_worker/1)
-
+    start_supervised!(WorkerFactory.Supervisor)
     :ok
   end
 
-  describe "WorkerSupervisor -- start and terminate" do
-    test "starts a supervised worker" do
-      assert {:ok, pid} = WorkerSupervisor.start_worker(%{type: "noop", args: %{}})
-      assert is_pid(pid)
-      assert Process.alive?(pid)
-    end
+  test "starts workers on demand" do
+    assert WorkerFactory.Supervisor.children_count() == 0
 
-    test "active_count increases after starting a worker" do
-      count_before = WorkerSupervisor.active_count()
-      {:ok, _pid} = WorkerSupervisor.start_worker(%{type: "noop", args: %{}})
-      assert WorkerSupervisor.active_count() == count_before + 1
-    end
+    {:ok, pid1} = WorkerFactory.Supervisor.start_job(:job_1, %{n: 1})
+    {:ok, pid2} = WorkerFactory.Supervisor.start_job(:job_2, %{n: 2})
 
-    test "terminate_worker stops the process" do
-      {:ok, pid} = WorkerSupervisor.start_worker(%{type: "noop", args: %{}})
-      assert :ok = WorkerSupervisor.terminate_worker(pid)
-      refute Process.alive?(pid)
-    end
-
-    test "terminate_worker returns not_found for unknown pid" do
-      {:ok, pid} = WorkerSupervisor.start_worker(%{type: "noop", args: %{}})
-      WorkerSupervisor.terminate_worker(pid)
-      assert {:error, :not_found} = WorkerSupervisor.terminate_worker(pid)
-    end
-
-    test "active_pids returns list of live pids" do
-      {:ok, pid1} = WorkerSupervisor.start_worker(%{type: "noop", args: %{}})
-      {:ok, pid2} = WorkerSupervisor.start_worker(%{type: "noop", args: %{}})
-      pids = WorkerSupervisor.active_pids()
-      assert pid1 in pids
-      assert pid2 in pids
-    end
-
-    test "crashed worker is restarted by supervisor" do
-      {:ok, pid} = WorkerSupervisor.start_worker(%{type: "noop", args: %{}})
-      count_before = WorkerSupervisor.active_count()
-
-      Process.exit(pid, :kill)
-      Process.sleep(50)
-
-      assert WorkerSupervisor.active_count() == count_before
-    end
+    assert WorkerFactory.Supervisor.children_count() == 2
+    assert {:job_1, %{n: 1}} == WorkerFactory.JobWorker.describe(pid1)
+    assert {:job_2, %{n: 2}} == WorkerFactory.JobWorker.describe(pid2)
   end
 
-  describe "WorkerSupervisor -- max_children enforcement" do
-    test "returns :max_workers_reached when pool is full" do
-      results = for _ <- 1..20 do
-        WorkerSupervisor.start_worker(%{type: "noop", args: %{}})
-      end
+  test "transient worker is restarted on crash" do
+    {:ok, pid} = WorkerFactory.Supervisor.start_job(:restart_me)
+    ref = Process.monitor(pid)
 
-      assert Enum.all?(results, &match?({:ok, _}, &1))
+    WorkerFactory.JobWorker.crash(pid)
+    assert_receive {:DOWN, ^ref, :process, ^pid, _reason}, 500
 
-      assert {:error, :max_workers_reached} =
-        WorkerSupervisor.start_worker(%{type: "noop", args: %{}})
-    end
+    # Supervisor restarts the child — count returns to 1 after a brief moment.
+    Process.sleep(50)
+    assert WorkerFactory.Supervisor.children_count() == 1
+
+    [{_, new_pid, _, _}] = DynamicSupervisor.which_children(WorkerFactory.Supervisor)
+    assert new_pid != pid
+    assert Process.alive?(new_pid)
+  end
+
+  test "transient + :normal stop is NOT restarted" do
+    {:ok, pid} = WorkerFactory.Supervisor.start_job(:one_shot)
+    ref = Process.monitor(pid)
+
+    WorkerFactory.JobWorker.finish(pid)
+    assert_receive {:DOWN, ^ref, :process, ^pid, :normal}, 500
+
+    Process.sleep(50)
+    assert WorkerFactory.Supervisor.children_count() == 0
+  end
+
+  test "siblings are independent on crash" do
+    {:ok, a} = WorkerFactory.Supervisor.start_job(:a)
+    {:ok, b} = WorkerFactory.Supervisor.start_job(:b)
+
+    ref_a = Process.monitor(a)
+    WorkerFactory.JobWorker.crash(a)
+    assert_receive {:DOWN, ^ref_a, :process, ^a, _}, 500
+
+    # b was not touched.
+    assert Process.alive?(b)
   end
 end
 ```
 
-### Step 6: Run
+### Step 5: Run
 
 ```bash
-mix test test/task_queue/dynamic_supervisor_test.exs --trace
+mix test
 ```
 
 ---
 
-## Trade-off analysis
+## Trade-offs and production gotchas
 
-| Aspect | `Supervisor` (static) | `DynamicSupervisor` |
-|--------|-----------------------|---------------------|
-| Children known at startup | yes | no |
-| Add children at runtime | no | yes (`start_child/2`) |
-| Remove children at runtime | no (only restart) | yes (`terminate_child/2`) |
-| `max_children` cap | not applicable | yes -- rejects when full |
-| Use case | fixed server processes | pools, per-job workers |
-| Overhead per child | low | low (same ETS entry per child) |
+**1. You lose the pid when you don't register it**
+`start_child/2` returns a pid but the DynamicSupervisor does not index
+children by name. If callers need "find the worker for job 42 later", pair
+it with a `Registry` (exercise 61). Otherwise you'll be walking
+`which_children/1` linearly — fine for dozens of children, terrible for
+thousands.
 
-The restart intensity mechanism (`max_restarts`, `max_seconds`) protects against infinite crash loops. If more than `max_restarts` (default 3) restarts occur within `max_seconds` (default 5), the DynamicSupervisor itself shuts down. For invalid payloads, validate before starting the child -- do not rely on restart limits.
+**2. `which_children/1` is not free**
+It walks all children under a read lock. Avoid calling it on the hot path;
+use it for diagnostics and tests.
 
----
+**3. `max_restarts` can mask real bugs**
+Raising `max_restarts` to "stop the supervisor from dying" is a smell. If
+workers restart constantly, fix the root cause instead of loosening the
+safety valve. A healthy DynamicSupervisor sees a handful of restarts an
+hour, not thousands.
 
-## Common production mistakes
+**4. Graceful shutdown kills children in parallel, not in order**
+Dynamic children have no ordering. On `Supervisor.stop/1`, all children
+get the shutdown signal simultaneously. Set each worker's `:shutdown`
+option (exercise 62) thoughtfully — especially for workers holding open
+connections or writing to disk.
 
-**1. Not setting `max_children` in production**
-Without it, a burst of incoming jobs starts an unbounded number of workers, leading to memory exhaustion.
-
-**2. Assuming `terminate_child` waits for the child to finish its work**
-It sends a shutdown signal and waits up to the child's `shutdown` timeout. The job is lost unless the worker handles `terminate/2`.
-
-**3. Using `DynamicSupervisor` when `Task.async_stream` suffices**
-For short-lived batch processing, `Task.async_stream/3` is simpler.
-
-**4. Starting a `DynamicSupervisor` with no name and losing the reference**
-Register a name so any process can call `start_child/2`.
-
-**5. Checking `active_count` to decide whether to start a new worker -- race condition**
-Rely on `max_children` enforcement in the supervisor itself. `start_child` returns `{:error, :max_children}` atomically.
+**5. When NOT to use DynamicSupervisor**
+If children are few and known at compile time, just use `Supervisor`. If
+children form a tight pipeline where stage N+1 depends on stage N, use
+`Supervisor` with `:rest_for_one`. If you need a bounded pool with reuse
+(not create-and-destroy semantics), reach for `poolboy` or `nimble_pool`
+— DynamicSupervisor creates a new process per call, which is cheap but
+not zero.
 
 ---
 
 ## Resources
 
-- [DynamicSupervisor -- official docs](https://hexdocs.pm/elixir/DynamicSupervisor.html)
-- [Supervisor and GenServer -- Elixir official guide](https://elixir-lang.org/getting-started/mix-otp/supervisor-and-application.html)
-- [OTP supervision strategies -- Learn You Some Erlang](https://learnyousomeerlang.com/supervisors)
+- [`DynamicSupervisor` — Elixir stdlib](https://hexdocs.pm/elixir/DynamicSupervisor.html)
+- [`Registry` — stdlib](https://hexdocs.pm/elixir/Registry.html) — pairs naturally with DynamicSupervisor
+- [`nimble_pool` — bounded resource pool](https://hexdocs.pm/nimble_pool/) — for connection-like workloads
+- ["Migrating from `:simple_one_for_one`"](https://hexdocs.pm/elixir/DynamicSupervisor.html#module-migrating-from-supervisor-simple_one_for_one) — historical context

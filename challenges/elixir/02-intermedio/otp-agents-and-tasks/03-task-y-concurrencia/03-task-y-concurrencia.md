@@ -1,325 +1,257 @@
-# Task: Structured Concurrency
+# Parallel I/O with `Task.async`/`Task.await`
 
-## Why Task and not spawn
+**Project**: `parallel_scraper` — fetch N URLs in parallel and aggregate results.
 
-`spawn` is a primitive: you launch a process, lose the reference, and if you want results
-you must build a manual reply protocol. `Task` solves that:
-
-- `Task.async/1` returns a `%Task{}` struct that carries the PID and a unique reference.
-- `Task.await/2` uses that reference to match exactly the reply from that task.
-- `Task.async_stream/3` bounds parallelism automatically via `max_concurrency`, preventing
-  the system from spawning 10,000 processes for a 10,000-item batch.
-
-The boundary: `Task` is for **one-shot concurrent work that produces a result**. For
-long-running processes that maintain state, use GenServer.
+**Difficulty**: ★★☆☆☆
+**Estimated time**: 1–2 hours
 
 ---
 
-## The business problem
+## Project context
 
-Build a `TaskQueue.BatchRunner` that receives a list of job functions and:
+You have a list of URLs (or database IDs, or files) and need to fetch
+each one. Done serially, total time = sum of latencies. Done in parallel
+via `Task.async` + `Task.await`, total time ≈ slowest call — exactly what
+you want for I/O-bound work.
 
-1. Runs them all in parallel, collecting `{:ok, result} | {:error, reason}` for each.
-2. Enforces a per-job timeout — jobs that take too long yield `{:error, :timeout}`.
-3. Provides a `run_stream/3` variant that processes jobs with bounded concurrency.
-4. Reports aggregate stats: how many succeeded, how many timed out, how many errored.
+This exercise uses a simulated "HTTP fetch" (`Process.sleep` + synthetic
+result) so you can focus on the concurrency pattern, not on real network
+plumbing. The same code shape applies to `Finch`, `Ecto.Repo.all`, file
+reads, etc.
 
----
+You'll learn: the `async/await` lifecycle, why `Task.await` has a
+timeout, how errors propagate through a link, and why bare `Task.async`
+is *not* the right answer for unbounded inputs — which sets up exercises
+50, 51, and 55.
 
-## Project setup
+Project structure:
 
 ```
-task_queue/
+parallel_scraper/
 ├── lib/
-│   └── task_queue/
-│       └── batch_runner.ex
+│   └── parallel_scraper.ex
 ├── test/
-│   └── task_queue/
-│       └── batch_runner_test.exs
+│   └── parallel_scraper_test.exs
 └── mix.exs
 ```
 
 ---
 
+## Core concepts
+
+### 1. `Task.async/1` spawns a **linked, monitored** process
+
+```
+Task.async(fn -> work end)
+  ├── spawn_link from the caller
+  ├── monitor from the caller
+  └── returns %Task{pid, ref, owner}
+```
+
+Because it's linked, if the task crashes, the caller crashes too. Because
+it's monitored, `Task.await/2` can receive a `:DOWN` message and turn it
+into an exception in the caller.
+
+The ownership rule: **only the process that called `Task.async` may call
+`Task.await`**. The struct is not shareable.
+
+### 2. `Task.await/2` blocks until a reply or a timeout
+
+```elixir
+result = Task.await(task, 5_000)
+# Success: returns the function's return value.
+# Timeout: raises; the task is NOT cancelled automatically.
+# Crash:   raises with the exit reason.
+```
+
+Default timeout is 5 seconds. A timeout in `await` does **not** kill the
+task — the task keeps running, now orphaned. Use `Task.shutdown/2` if you
+need to actually cancel work past the deadline (exercise 54).
+
+### 3. Parallelism is bounded by the scheduler, not by your input
+
+`Task.async` does not limit fan-out. If you map over 10_000 URLs, you
+will spawn 10_000 tasks. For CPU-bound work that's wasteful; for I/O
+with external rate limits it's often a self-DDoS. For bounded
+concurrency, use `Task.async_stream` (exercise 51) or a pool
+(exercise 55).
+
+### 4. Pattern: map → async → await_many
+
+```
+urls                          [t1 t2 t3 t4]
+  |> Enum.map(&Task.async)  → processes running in parallel
+  |> Task.await_many(5_000) → caller blocks until all return
+```
+
+`Task.await_many/2` (Elixir 1.13+) awaits a list of tasks with a single
+timeout. If any task crashes or times out, the others in the batch are
+shut down. See exercise 50 for the `await_many` vs `yield_many` choice.
+
+---
+
 ## Implementation
 
-### `lib/task_queue/batch_runner.ex`
-
-```elixir
-defmodule TaskQueue.BatchRunner do
-  @moduledoc """
-  Runs batches of job functions in parallel and collects results.
-
-  Provides both unbounded parallel execution (Task.async / Task.await_many)
-  and bounded parallel execution (Task.async_stream) for large batches.
-  """
-
-  @type job :: (-> any())
-  @type job_result :: {:ok, any()} | {:error, any()}
-
-  @doc """
-  Runs all jobs in parallel and waits for all to complete.
-
-  Returns a list of results in the same order as the input jobs.
-  Jobs that exceed `timeout_ms` return {:error, :timeout}.
-  Jobs that raise return {:error, exception}.
-  """
-  @spec run_all(list(job()), pos_integer()) :: list(job_result())
-  def run_all(jobs, timeout_ms \\ 5_000) do
-    jobs
-    |> Task.async_stream(
-      fn job -> job.() end,
-      timeout: timeout_ms,
-      on_timeout: :kill_task,
-      ordered: true
-    )
-    |> Enum.map(&normalize_stream_result/1)
-  end
-
-  @doc """
-  Runs jobs with bounded concurrency — at most `max_concurrency` jobs run at once.
-
-  Use this for large batches to avoid overwhelming the scheduler or downstream services.
-  Returns results in the same order as the input.
-  """
-  @spec run_stream(list(job()), pos_integer(), pos_integer()) :: list(job_result())
-  def run_stream(jobs, max_concurrency, timeout_ms \\ 5_000) do
-    jobs
-    |> Task.async_stream(
-      fn job -> job.() end,
-      timeout: timeout_ms,
-      on_timeout: :kill_task,
-      ordered: true,
-      max_concurrency: max_concurrency
-    )
-    |> Enum.map(&normalize_stream_result/1)
-  end
-
-  @doc """
-  Fires all jobs and discards results — caller does not wait.
-
-  Use this for background work where the outcome does not affect the caller's flow.
-  Returns immediately after launching all tasks.
-  """
-  @spec fire_and_forget(list(job())) :: :ok
-  def fire_and_forget(jobs) do
-    Enum.each(jobs, fn job -> Task.start(fn -> job.() end) end)
-  end
-
-  @doc """
-  Returns aggregate statistics for a list of job results.
-
-  Example return: %{total: 10, ok: 8, timeout: 1, error: 1}
-  """
-  @spec stats(list(job_result())) :: map()
-  def stats(results) do
-    base = %{total: length(results), ok: 0, timeout: 0, error: 0}
-
-    Enum.reduce(results, base, fn
-      {:ok, _}, acc -> Map.update!(acc, :ok, &(&1 + 1))
-      {:error, :timeout}, acc -> Map.update!(acc, :timeout, &(&1 + 1))
-      {:error, _}, acc -> Map.update!(acc, :error, &(&1 + 1))
-    end)
-  end
-
-  @doc """
-  Runs a list of jobs in parallel, calling `on_result.(index, result)` for each
-  completion as it arrives — not waiting for all to finish first.
-
-  Useful for streaming progress updates back to a caller.
-  """
-  @spec run_with_callback(list(job()), (non_neg_integer(), job_result() -> any())) :: :ok
-  def run_with_callback(jobs, on_result) do
-    jobs
-    |> Enum.with_index()
-    |> Task.async_stream(
-      fn {job, idx} ->
-        result =
-          try do
-            {:ok, job.()}
-          rescue
-            e -> {:error, e}
-          end
-
-        {idx, result}
-      end,
-      ordered: false,
-      timeout: 10_000,
-      on_timeout: :kill_task
-    )
-    |> Enum.each(fn
-      {:ok, {idx, result}} -> on_result.(idx, result)
-      {:exit, :timeout} -> :ok
-    end)
-  end
-
-  defp normalize_stream_result({:ok, value}), do: {:ok, value}
-  defp normalize_stream_result({:exit, :timeout}), do: {:error, :timeout}
-  defp normalize_stream_result({:exit, reason}), do: {:error, reason}
-end
-```
-
-The `normalize_stream_result/1` function translates `Task.async_stream` output format
-into the application's `{:ok, value} | {:error, reason}` convention. `Task.async_stream`
-wraps successful results in `{:ok, value}` and failures in `{:exit, reason}`. The
-`:timeout` atom is a special exit reason produced by `on_timeout: :kill_task`.
-
-`run_with_callback/2` uses `ordered: false` so that results are delivered to the callback
-as soon as each task finishes, enabling real-time progress tracking.
-
-`fire_and_forget/1` uses `Task.start/1` instead of `Task.async/1` because no result
-collection is needed. `Task.start` creates an unlinked task — if it crashes, the caller
-is not affected.
-
-### Tests
-
-```elixir
-# test/task_queue/batch_runner_test.exs
-defmodule TaskQueue.BatchRunnerTest do
-  use ExUnit.Case, async: true
-
-  alias TaskQueue.BatchRunner
-
-  describe "run_all/2" do
-    test "returns results in job order" do
-      jobs = [fn -> 1 end, fn -> 2 end, fn -> 3 end]
-      assert [{:ok, 1}, {:ok, 2}, {:ok, 3}] = BatchRunner.run_all(jobs)
-    end
-
-    test "captures exceptions as {:error, reason}" do
-      jobs = [
-        fn -> :ok_result end,
-        fn -> raise "boom" end,
-        fn -> :another_ok end
-      ]
-
-      results = BatchRunner.run_all(jobs)
-      assert {:ok, :ok_result} = Enum.at(results, 0)
-      assert {:error, _} = Enum.at(results, 1)
-      assert {:ok, :another_ok} = Enum.at(results, 2)
-    end
-
-    test "returns {:error, :timeout} for slow jobs" do
-      jobs = [
-        fn -> :fast end,
-        fn -> Process.sleep(200) end
-      ]
-
-      results = BatchRunner.run_all(jobs, 50)
-      assert {:ok, :fast} = Enum.at(results, 0)
-      assert {:error, :timeout} = Enum.at(results, 1)
-    end
-  end
-
-  describe "run_stream/3" do
-    test "processes all jobs with bounded concurrency" do
-      jobs = Enum.map(1..20, fn n -> fn -> n * 2 end end)
-      results = BatchRunner.run_stream(jobs, 4)
-      expected = Enum.map(1..20, fn n -> {:ok, n * 2} end)
-      assert expected == results
-    end
-
-    test "never exceeds max_concurrency" do
-      {:ok, counter} = Agent.start_link(fn -> {0, 0} end)
-
-      jobs =
-        Enum.map(1..10, fn _ ->
-          fn ->
-            Agent.update(counter, fn {current, peak} ->
-              new = current + 1
-              {new, max(new, peak)}
-            end)
-            Process.sleep(10)
-            Agent.update(counter, fn {current, peak} -> {current - 1, peak} end)
-          end
-        end)
-
-      BatchRunner.run_stream(jobs, 3, 5_000)
-      {_current, peak} = Agent.get(counter, & &1)
-      Agent.stop(counter)
-      assert peak <= 3
-    end
-  end
-
-  describe "stats/1" do
-    test "counts results by category" do
-      results = [
-        {:ok, 1},
-        {:ok, 2},
-        {:error, :timeout},
-        {:error, :timeout},
-        {:error, :some_error}
-      ]
-
-      assert %{total: 5, ok: 2, timeout: 2, error: 1} = BatchRunner.stats(results)
-    end
-  end
-
-  describe "run_with_callback/2" do
-    test "calls on_result for each completed job" do
-      jobs = [fn -> :a end, fn -> :b end, fn -> :c end]
-      collected = Agent.start_link(fn -> [] end) |> elem(1)
-
-      BatchRunner.run_with_callback(jobs, fn _idx, result ->
-        Agent.update(collected, fn acc -> [result | acc] end)
-      end)
-
-      results = Agent.get(collected, & &1) |> Enum.sort()
-      Agent.stop(collected)
-      assert [{:ok, :a}, {:ok, :b}, {:ok, :c}] == results
-    end
-  end
-end
-```
-
-### Run the tests
+### Step 1: Create the project
 
 ```bash
-mix test test/task_queue/batch_runner_test.exs --trace
+mix new parallel_scraper
+cd parallel_scraper
 ```
 
----
+### Step 2: `lib/parallel_scraper.ex`
 
-## Trade-off analysis
-
-| Aspect | Task.async + await_many | Task.async_stream | spawn |
-|--------|------------------------|-------------------|-------|
-| Result ordering | Guaranteed (by position) | Configurable (ordered:) | Manual |
-| Memory for 10k jobs | 10k processes at once | Bounded by max_concurrency | 10k processes at once |
-| Backpressure | None | max_concurrency provides it | None |
-| Error handling | Propagates via exit signals | :kill_task or :exit_task | Manual try/rescue |
-| When to use | Small, bounded batches | Large batches, I/O-heavy work | When you need full control |
-
----
-
-## Common production mistakes
-
-**1. Forgetting max_concurrency on large inputs**
-`Task.async_stream` without `max_concurrency` defaults to `System.schedulers_online/0`.
-Always set `max_concurrency` explicitly based on your resource constraints.
-
-**2. Ignoring `on_timeout: :kill_task`**
-Without this option, a timed-out task is still running after `async_stream` considers
-it done. Use `:kill_task` to ensure termination.
-
-**3. Using Task.async/Task.await in a GenServer callback**
-If you `Task.async` inside `handle_call` and then `Task.await`, you block the GenServer
-for the full duration. Use `Task.start` + `GenServer.reply/2` pattern instead.
-
-**4. Swallowing exit reasons in async_stream**
 ```elixir
-# WRONG — discards the reason
-{:exit, _} -> {:error, :unknown}
+defmodule ParallelScraper do
+  @moduledoc """
+  Demonstrates parallel I/O with `Task.async` + `Task.await`.
 
-# CORRECT — preserve the reason for observability
-{:exit, :timeout} -> {:error, :timeout}
-{:exit, reason}   -> {:error, {:crashed, reason}}
+  The `fetch` step is simulated with `Process.sleep/1` so the exercise
+  focuses on the concurrency pattern. Swap in an HTTP client (Finch,
+  Req) in real code — the shape of the orchestration does not change.
+  """
+
+  @type url :: String.t()
+  @type fetched :: %{url: url(), bytes: non_neg_integer(), latency_ms: pos_integer()}
+
+  @doc """
+  Fetches all `urls` serially. Baseline for comparison — total time is
+  the sum of per-URL latencies.
+  """
+  @spec fetch_serial([url()]) :: [fetched()]
+  def fetch_serial(urls) do
+    Enum.map(urls, &simulate_fetch/1)
+  end
+
+  @doc """
+  Fetches all `urls` in parallel using `Task.async` + `Task.await_many`.
+
+  Total time is roughly the slowest single fetch, as long as the
+  scheduler has cores to run them on.
+
+  Options:
+    * `:timeout` — per-batch timeout in ms (default 5_000). Applies to
+      the whole `await_many` call.
+  """
+  @spec fetch_parallel([url()], keyword()) :: [fetched()]
+  def fetch_parallel(urls, opts \\ []) do
+    timeout = Keyword.get(opts, :timeout, 5_000)
+
+    urls
+    |> Enum.map(fn url -> Task.async(fn -> simulate_fetch(url) end) end)
+    |> Task.await_many(timeout)
+  end
+
+  # Simulates an HTTP request: sleeps for a pseudo-random latency derived
+  # from the URL (so tests are deterministic), then returns a fake payload.
+  @spec simulate_fetch(url()) :: fetched()
+  defp simulate_fetch(url) do
+    latency = :erlang.phash2(url, 50) + 20
+    Process.sleep(latency)
+    %{url: url, bytes: byte_size(url) * 10, latency_ms: latency}
+  end
+end
 ```
+
+### Step 3: `test/parallel_scraper_test.exs`
+
+```elixir
+defmodule ParallelScraperTest do
+  use ExUnit.Case, async: true
+
+  @urls ~w(
+    https://a.example
+    https://b.example
+    https://c.example
+    https://d.example
+    https://e.example
+  )
+
+  describe "fetch_serial/1" do
+    test "returns one result per URL in order" do
+      results = ParallelScraper.fetch_serial(@urls)
+      assert length(results) == length(@urls)
+      assert Enum.map(results, & &1.url) == @urls
+    end
+  end
+
+  describe "fetch_parallel/2" do
+    test "returns one result per URL in input order" do
+      results = ParallelScraper.fetch_parallel(@urls)
+      assert Enum.map(results, & &1.url) == @urls
+    end
+
+    test "is meaningfully faster than serial for I/O-bound work" do
+      {serial_us, _} = :timer.tc(fn -> ParallelScraper.fetch_serial(@urls) end)
+      {parallel_us, _} = :timer.tc(fn -> ParallelScraper.fetch_parallel(@urls) end)
+
+      # Parallel should be at most ~60% of serial — loose bound to keep the
+      # test stable on busy CI runners.
+      assert parallel_us < serial_us * 0.6,
+             "expected parallel to be faster: serial=#{serial_us}us parallel=#{parallel_us}us"
+    end
+
+    test "raises when the timeout is too short for the slowest task" do
+      # Pick an impossibly tight budget so await_many times out.
+      assert catch_exit(ParallelScraper.fetch_parallel(@urls, timeout: 1))
+    end
+  end
+end
+```
+
+### Step 4: Run
+
+```bash
+mix test
+```
+
+---
+
+## Trade-offs and production gotchas
+
+**1. `Task.async` is linked — a crash in one task crashes your caller**
+If you map 100 tasks and one of them raises, the caller dies too. For
+work where a single failure shouldn't abort the batch, use
+`Task.Supervisor.async_nolink` (exercise 52) or `Task.async_stream` with
+`on_timeout: :kill_task`.
+
+**2. `Task.await` timeout does NOT cancel the task**
+A 5-second `await` that times out leaves the task running. In a request
+handler, that's a leak — you returned an error to the user but the work
+continues. Use `Task.shutdown(task, :brutal_kill)` (exercise 54) or
+switch to `yield_many`/`async_stream`.
+
+**3. Unbounded fan-out is a foot-gun**
+`urls |> Enum.map(&Task.async/1)` for 10_000 URLs spawns 10_000
+processes. Your target API will probably rate-limit or outright reject
+you. Use `Task.async_stream(max_concurrency: N)` (exercise 51) or a
+bounded pool (exercise 55) whenever the input size isn't small and fixed.
+
+**4. Ownership is not transferable**
+Only the process that called `Task.async` can `Task.await`. Passing a
+task struct to another process to await "for you" won't work — the
+monitor and link are tied to the owner. If you need work that outlives
+its owner, use `Task.Supervisor.async_nolink` or a full GenServer.
+
+**5. `await_many` has batch-level failure semantics**
+If one task raises, `Task.await_many` shuts down the rest and re-raises.
+That's the right default for "all or nothing" batches. For "give me
+what's ready by the deadline", use `Task.yield_many` (exercise 53).
+
+**6. When NOT to use `Task.async`**
+- Fire-and-forget work where you don't want a link to the caller →
+  `Task.Supervisor.start_child` (exercise 52).
+- Long-running background jobs — these should be supervised named
+  processes, not `Task`s.
+- CPU-bound work exceeding `System.schedulers_online/0` parallelism —
+  there's no benefit in spawning more tasks than cores.
 
 ---
 
 ## Resources
 
-- [Task — HexDocs](https://hexdocs.pm/elixir/Task.html)
-- [Task.async_stream/3 — HexDocs](https://hexdocs.pm/elixir/Task.html#async_stream/5)
-- [Task.Supervisor — HexDocs](https://hexdocs.pm/elixir/Task.Supervisor.html)
+- [`Task` — Elixir stdlib](https://hexdocs.pm/elixir/Task.html)
+- [`Task.async_stream/3`](https://hexdocs.pm/elixir/Task.html#async_stream/3) — bounded-concurrency mapping
+- [`Task.Supervisor`](https://hexdocs.pm/elixir/Task.Supervisor.html) — for unlinked tasks
+- ["Concurrency and parallelism in Elixir"](https://hexdocs.pm/elixir/processes.html) — Elixir getting started
+- [Saša Jurić — "Elixir in Action", ch. 5](https://www.manning.com/books/elixir-in-action-second-edition) — excellent on Task semantics
