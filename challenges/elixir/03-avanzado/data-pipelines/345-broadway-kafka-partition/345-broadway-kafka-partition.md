@@ -1,0 +1,372 @@
+# Broadway with Kafka — `partition_by` for Per-Key Ordering
+
+**Project**: `user_events_consumer` — consumes `user-events` Kafka topic and processes events per `user_id` in arrival order while still using all cores in parallel.
+
+## Project context
+
+You consume a Kafka topic `user-events` with 24 partitions, producing ~30k
+events/sec. Downstream must process events for a given user in strict
+arrival order (e.g. `user.login` must be applied before `user.profile_updated`)
+but events for different users are independent.
+
+Kafka already guarantees per-partition ordering. The producer hashes `user_id
+→ partition`, so all events for user 42 land on the same partition. On the
+consumer side, Broadway's `BroadwayKafka.Producer` assigns partitions to
+processor stages. If you use `partition_by:` with the same hash as the
+producer, you preserve ordering end-to-end even across processors within a
+partition (edge case: concurrent processors reading the same partition).
+
+```
+user_events_consumer/
+├── lib/
+│   └── user_events_consumer/
+│       ├── application.ex
+│       ├── pipeline.ex
+│       └── processor.ex
+├── test/
+│   └── user_events_consumer/
+│       └── pipeline_test.exs
+├── bench/
+│   └── throughput_bench.exs
+└── mix.exs
+```
+
+## Why BroadwayKafka and not brod directly
+
+`brod` is the Erlang Kafka client. It works, but:
+
+- Offset commit is manual.
+- No built-in concurrency model — you plumb processes yourself.
+- No back-pressure.
+- No ack/fail semantics tied to offset commits.
+
+`BroadwayKafka` wraps brod:
+
+- Subscribes to consumer group, handles partition rebalance.
+- Translates messages to `Broadway.Message` struct with offset tracking.
+- Commits offsets only for successfully acked messages — at-least-once with
+  no manual bookkeeping.
+
+Alternatives we rejected:
+
+- **brod directly**: acceptable only for trivial single-partition consumers.
+- **Kafka Connect sink to PostgreSQL + Oban**: heavy ops surface.
+- **Debezium + another Broadway**: double-hop with no gain for this workload.
+
+## Core concepts
+
+### 1. Partition-aware concurrency
+
+```
+Kafka topic (24 partitions)
+        │
+        ▼
+BroadwayKafka.Producer (fetches from assigned partitions)
+        │
+        ▼
+Processors (concurrency: N, partition_by: user_id → stage)
+```
+
+If `concurrency: 8, partition_by: &(&1.user_id |> :erlang.phash2(8))`, events
+for the same `user_id` always go to the same processor stage. Per-user
+ordering is preserved even when Kafka puts multiple partitions on the same
+node (rare but possible during rebalance).
+
+### 2. Offset semantics
+
+Broadway commits offsets in batches after successful ack. If a message fails,
+its offset is NOT committed — on restart, Kafka re-delivers from the last
+committed offset (at-least-once). You never manually call commit.
+
+### 3. Rebalance safety
+
+When a Kafka consumer joins or leaves the group, partitions are reassigned.
+`BroadwayKafka` pauses the producer, drains in-flight messages, commits
+offsets, then resumes on the new assignment. Your code doesn't need to be
+aware of rebalance events for correctness — but long handle_message/batch
+times can cause rebalance-driven duplicate delivery.
+
+## Design decisions
+
+- **Option A — No `partition_by`, rely on Kafka partition**:
+  - Pros: simplest. Kafka already gives you per-partition order.
+  - Cons: within a processor stage handling messages from multiple partitions,
+    order across partitions is up to processing interleaving.
+- **Option B — `partition_by` on the consumer using the same key as the producer**:
+  - Pros: preserves ordering per key through the whole Elixir pipeline.
+  - Cons: some processors may be underutilised if key distribution is skewed.
+- **Option C — Single processor (concurrency: 1)**:
+  - Pros: strict global order.
+  - Cons: one core utilised. Throughput collapses.
+
+We pick **Option B** — it matches the semantics our business needs
+(per-user order) while using all cores.
+
+## Implementation
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defmodule UserEventsConsumer.MixProject do
+  use Mix.Project
+
+  def project do
+    [
+      app: :user_events_consumer,
+      version: "0.1.0",
+      elixir: "~> 1.16",
+      deps: deps()
+    ]
+  end
+
+  def application do
+    [mod: {UserEventsConsumer.Application, []}, extra_applications: [:logger]]
+  end
+
+  defp deps do
+    [
+      {:broadway, "~> 1.1"},
+      {:broadway_kafka, "~> 0.4"},
+      {:jason, "~> 1.4"},
+      {:benchee, "~> 1.3", only: :dev}
+    ]
+  end
+end
+```
+
+### Step 1: Pipeline
+
+```elixir
+defmodule UserEventsConsumer.Pipeline do
+  use Broadway
+
+  alias Broadway.Message
+
+  @stages 8
+
+  def start_link(_opts) do
+    Broadway.start_link(__MODULE__,
+      name: __MODULE__,
+      producer: [
+        module:
+          {BroadwayKafka.Producer,
+           hosts: [localhost: 9092],
+           group_id: "user_events_consumer",
+           topics: ["user-events"],
+           offset_commit_interval_seconds: 5,
+           client_config: [connect_timeout: 30_000]},
+        concurrency: 1
+      ],
+      processors: [
+        default: [
+          concurrency: @stages,
+          max_demand: 100,
+          partition_by: &partition_by_user/1
+        ]
+      ],
+      batchers: [
+        default: [concurrency: 2, batch_size: 200, batch_timeout: 500]
+      ]
+    )
+  end
+
+  @impl true
+  def handle_message(_processor, %Message{data: data} = message, _ctx) do
+    case Jason.decode(data) do
+      {:ok, %{"user_id" => uid} = event} ->
+        UserEventsConsumer.Processor.apply_event(uid, event)
+        message
+
+      {:ok, _} ->
+        Message.failed(message, "missing user_id")
+
+      {:error, _} ->
+        Message.failed(message, "invalid json") |> Message.configure_ack(on_failure: :reject)
+    end
+  end
+
+  @impl true
+  def handle_batch(:default, messages, _info, _ctx), do: messages
+
+  # ---- routing ---------------------------------------------------------
+
+  # Keep the hash stable across releases — it determines per-user order.
+  defp partition_by_user(%Message{data: data}) do
+    case Jason.decode(data) do
+      {:ok, %{"user_id" => uid}} -> :erlang.phash2(uid, @stages)
+      _ -> 0
+    end
+  end
+end
+```
+
+### Step 2: Per-user processor
+
+```elixir
+defmodule UserEventsConsumer.Processor do
+  @moduledoc """
+  Applies an event to the read model. Replace with real repo writes.
+
+  Because Broadway routes events for the same user_id to the same processor
+  stage, two concurrent calls to apply_event/2 for the same user cannot
+  happen — we do not need a lock or CAS here.
+  """
+
+  def apply_event(user_id, event) do
+    :telemetry.execute(
+      [:user_events, :applied],
+      %{count: 1},
+      %{user_id: user_id, type: event["type"]}
+    )
+
+    :ok
+  end
+end
+```
+
+## Why this works
+
+- Kafka partitions `user-events` by `user_id` at the producer. All events
+  for user 42 land on the same partition.
+- BroadwayKafka assigns partitions to the single producer stage. Messages
+  flow to processors.
+- `partition_by: &partition_by_user/1` hashes `user_id` to a processor index.
+  Same hash function, same stage: per-user events are serialised.
+- Offsets commit every 5 seconds or at batch end. On restart the consumer
+  resumes from the last committed offset — at-least-once.
+
+## Tests
+
+```elixir
+defmodule UserEventsConsumer.PipelineTest do
+  use ExUnit.Case, async: false
+
+  alias UserEventsConsumer.Pipeline
+
+  describe "processing" do
+    test "applies a valid event and acks" do
+      msg = ~s({"user_id":"u42","type":"login"})
+      ref = Broadway.test_message(Pipeline, msg)
+      assert_receive {:ack, ^ref, [%Broadway.Message{}], []}, 2_000
+    end
+
+    test "fails messages without user_id" do
+      msg = ~s({"type":"orphan"})
+      ref = Broadway.test_message(Pipeline, msg)
+      assert_receive {:ack, ^ref, [], [%Broadway.Message{status: {:failed, _}}]}, 2_000
+    end
+  end
+
+  describe "partition_by ordering" do
+    test "events for the same user_id hit the same processor index" do
+      events =
+        for i <- 1..200 do
+          ~s({"user_id":"u42","type":"e#{i}"})
+        end
+
+      # Snapshot which processor PID handles each message.
+      # With partition_by, all should route to the same stage.
+      :telemetry.attach(
+        "test-stage",
+        [:user_events, :applied],
+        fn _e, _m, meta, parent -> send(parent, {:applied, meta.user_id, self()}) end,
+        self()
+      )
+
+      ref = Broadway.test_batch(Pipeline, events)
+      assert_receive {:ack, ^ref, _ok, _fail}, 5_000
+
+      :telemetry.detach("test-stage")
+
+      pids =
+        for _ <- 1..200 do
+          receive do
+            {:applied, "u42", pid} -> pid
+          after
+            100 -> nil
+          end
+        end
+        |> Enum.reject(&is_nil/1)
+        |> Enum.uniq()
+
+      assert length(pids) == 1, "events for u42 were split across #{length(pids)} processors"
+    end
+  end
+end
+```
+
+## Benchmark
+
+```elixir
+# bench/throughput_bench.exs
+# Requires a local Kafka broker on localhost:9092.
+# Pre-create topic: bin/kafka-topics.sh --create --topic user-events --partitions 24 ...
+
+# This benchmark uses the Broadway test harness with batches of synthetic events.
+events =
+  for i <- 1..50_000 do
+    Jason.encode!(%{user_id: "u#{rem(i, 1_000)}", type: "e#{i}"})
+  end
+
+Benchee.run(%{
+  "50k events" => fn ->
+    ref = Broadway.test_batch(UserEventsConsumer.Pipeline, events)
+    receive do
+      {:ack, ^ref, _ok, _fail} -> :ok
+    after 60_000 -> flunk("timeout") end
+  end
+}, time: 10, warmup: 3)
+```
+
+**Target**: 20k–40k events/sec on an 8-core host with the stub processor.
+Real throughput is bounded by downstream writes.
+
+## Trade-offs and production gotchas
+
+**1. `partition_by` must use the SAME hash as the Kafka producer.**
+If the Elixir consumer uses `:erlang.phash2` but the producer (Java,
+Go, Python) uses Kafka's default MurmurHash, messages for the same key
+will land on different processor stages (and lose per-key order) unless
+you override. Either align hash functions or keep the consumer side
+partitioning as a lookup only, trusting Kafka's per-partition order.
+
+**2. Re-balancing under load = duplicate delivery.**
+When a consumer joins or leaves the group, Kafka rebalances partitions.
+In-flight messages whose offsets are not yet committed will be redelivered
+to a different consumer. Design for idempotency (unique keys, upserts).
+
+**3. Slow handle_message triggers session timeout.**
+Default session timeout is 30s. If handle_message takes >30s the broker
+considers the consumer dead, rebalances, and the message gets redelivered.
+Monitor `:telemetry.event_duration` and keep handle_message fast; move slow
+work to an async queue if needed.
+
+**4. Per-user lag can hide behind average lag.**
+If user 42 sends 1k events/s and other users send 1/s, measuring average
+partition lag tells you nothing about user 42. Expose per-partition lag
+(Kafka's `consumer_lag_max` metric) to catch skewed hot keys.
+
+**5. Offset commit latency vs at-least-once window.**
+With `offset_commit_interval_seconds: 5` the worst-case re-delivery window
+is 5s of processed-but-not-committed messages. Tighten to 1s if your
+downstream is expensive to re-run, but pay more Kafka API calls.
+
+**6. When NOT to use BroadwayKafka.**
+If your workload is request/response, use HTTP. If your workload is
+bounded file processing, use Flow. Kafka shines for streaming with
+replay, high throughput, and strict per-key ordering.
+
+## Reflection
+
+You deploy `partition_by: &:erlang.phash2(&1.user_id, 8)` with
+`concurrency: 8`. A week later you need to scale to 16 processors. You
+bump `concurrency: 16` but forget to update the hash mod. What breaks,
+and what's the minimal-downtime migration path to 16 stages while
+preserving per-user ordering?
+
+## Resources
+
+- [BroadwayKafka — hexdocs](https://hexdocs.pm/broadway_kafka/BroadwayKafka.Producer.html)
+- [Broadway `partition_by:` docs](https://hexdocs.pm/broadway/Broadway.html#start_link/2-processors-options)
+- [brod — Erlang Kafka client](https://github.com/kafka4beam/brod)
+- [Kafka Consumer Group protocol](https://kafka.apache.org/documentation/#consumerconfigs)
