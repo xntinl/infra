@@ -1,396 +1,286 @@
-# GenStage: Backpressure and Demand-Driven Pipelines
+# GenStage basics — a Producer and a Consumer driven by demand
 
-## Goal
+**Project**: `genstage_intro` — the smallest possible GenStage pipeline:
+one `Producer` emitting integers, one `Consumer` pulling them, with
+back-pressure driven by consumer demand.
 
-Build a `task_queue` processing pipeline with GenStage where a producer emits jobs from a queue, a producer_consumer validates them, and a consumer executes them. The pipeline provides built-in backpressure: consumers declare how many events they can handle, and producers emit exactly that many.
-
----
-
-## Why GenStage and not `Task.async_stream` or a simple `send`
-
-`Task.async_stream` processes a bounded collection concurrently. It has no concept of a continuous producer. When new jobs arrive while workers are busy, there is no built-in mechanism to pause the producer.
-
-A direct `send` from producer to consumer creates unbounded mailboxes:
-
-```
-producer sends 10,000 messages
-consumer processes 100/sec
-mailbox grows at 9,900 messages/sec -> OOM in ~1 minute
-```
-
-GenStage's demand protocol inverts control:
-
-```
-consumer: "I can handle 10 more events"
-producer: emits exactly 10 events
-consumer: (processes 10)
-consumer: "I can handle 10 more events"
-producer: emits exactly 10 more
-```
-
-The producer never sends more than what was requested. Mailboxes stay small.
+**Difficulty**: ★★★☆☆
+**Estimated time**: 2–3 hours
 
 ---
 
-## The three roles
+## Project context
 
-| Role | `use GenStage` callback | Receives | Emits |
-|------|------------------------|----------|-------|
-| `:producer` | `handle_demand/2` | demand count | events |
-| `:consumer` | `handle_events/3` | events | nothing |
-| `:producer_consumer` | `handle_events/3` | events | transformed events |
+GenStage is the Elixir building block for **demand-driven** data pipelines.
+Unlike a plain GenServer where the producer decides when to send data
+(and can overwhelm a slow consumer), GenStage flips the flow: the consumer
+asks for N items, the producer emits at most N items. This is back-pressure
+at the protocol level.
+
+It's the foundation under `Flow` (high-level parallel pipelines) and
+`Broadway` (data ingestion). Before those, you need the two-stage base
+case: understand `handle_demand/2` in a producer and the `subscribe_to:`
+option in a consumer, and the rest generalizes.
+
+Project structure:
+
+```
+genstage_intro/
+├── lib/
+│   ├── genstage_intro.ex
+│   ├── genstage_intro/producer.ex
+│   └── genstage_intro/consumer.ex
+├── test/
+│   └── genstage_intro_test.exs
+└── mix.exs
+```
+
+---
+
+## Core concepts
+
+### 1. Three stage types
+
+- **Producer** — only emits events. Implements `handle_demand/2`.
+- **Consumer** — only receives events. Implements `handle_events/3`.
+- **ProducerConsumer** — both (see exercise 107).
+
+A pipeline is a chain: `Producer -> [ProducerConsumer...] -> Consumer`.
+
+### 2. Demand is an integer request
+
+When a consumer subscribes to a producer, it asks "send me up to N events".
+The producer replies with `{:noreply, events, state}` where `events` has
+at most N items. If the producer has fewer events ready, it sends what it
+has and remembers the remaining demand for later. **The producer never
+pushes events that weren't demanded.**
+
+```
+Consumer ──demand 500──▶ Producer
+Producer ──events [1..500]──▶ Consumer
+Consumer ──demand 500──▶ Producer  (once it's processed them)
+```
+
+### 3. `min_demand` and `max_demand`
+
+When a consumer subscribes, it configures a window:
+
+- `max_demand` — high-water mark; initial ask.
+- `min_demand` — low-water mark; when buffer drains below this, ask again.
+
+Defaults are `500` and `250`. Smaller values give tighter back-pressure
+and smaller batches; larger values give higher throughput at the cost of
+more in-flight events.
+
+### 4. The producer's state *drives* demand
+
+A producer that can't satisfy demand returns an empty `events` list and
+stores the outstanding demand in state. When more data is available
+(timer, async fetch, upstream event), it dispatches what it has against
+the stored demand. **Never emit more than was demanded** — downstream
+buffers aren't prepared for it.
 
 ---
 
 ## Implementation
 
-### Step 1: `mix.exs`
+### Step 1: Create the project
+
+```bash
+mix new genstage_intro --sup
+cd genstage_intro
+```
+
+Add `gen_stage` to `mix.exs` dependencies:
 
 ```elixir
-defmodule TaskQueue.MixProject do
-  use Mix.Project
-
-  def project do
-    [
-      app: :task_queue,
-      version: "0.1.0",
-      elixir: "~> 1.15",
-      start_permanent: Mix.env() == :prod,
-      deps: deps()
-    ]
-  end
-
-  def application do
-    [
-      extra_applications: [:logger],
-      mod: {TaskQueue.Application, []}
-    ]
-  end
-
-  defp deps do
-    [
-      {:gen_stage, "~> 1.2"}
-    ]
-  end
+defp deps do
+  [{:gen_stage, "~> 1.2"}]
 end
 ```
 
-### Step 2: `lib/task_queue/application.ex`
+Then `mix deps.get`.
+
+### Step 2: `lib/genstage_intro/producer.ex`
 
 ```elixir
-defmodule TaskQueue.Application do
-  use Application
-
-  @impl true
-  def start(_type, _args) do
-    children = [
-      TaskQueue.QueueServer
-    ]
-
-    opts = [strategy: :one_for_one, name: TaskQueue.Supervisor]
-    Supervisor.start_link(children, opts)
-  end
-end
-```
-
-### Step 3: `lib/task_queue/queue_server.ex` -- in-memory queue
-
-The QueueServer is a simple GenServer holding an Erlang `:queue`. The GenStage producer dequeues from it when demand arrives.
-
-```elixir
-defmodule TaskQueue.QueueServer do
-  use GenServer
-
-  def start_link(opts \\ []) do
-    GenServer.start_link(__MODULE__, :queue.new(), name: __MODULE__)
-  end
-
-  def enqueue(job) when is_map(job) do
-    GenServer.call(__MODULE__, {:enqueue, job})
-  end
-
-  def dequeue do
-    GenServer.call(__MODULE__, :dequeue)
-  end
-
-  @impl true
-  def init(queue), do: {:ok, queue}
-
-  @impl true
-  def handle_call({:enqueue, job}, _from, queue) do
-    new_q = :queue.in(job, queue)
-    {:reply, {:ok, :queue.len(new_q)}, new_q}
-  end
-
-  @impl true
-  def handle_call(:dequeue, _from, queue) do
-    case :queue.out(queue) do
-      {{:value, job}, new_q} -> {:reply, {:ok, job}, new_q}
-      {:empty, _} -> {:reply, {:error, :empty}, queue}
-    end
-  end
-end
-```
-
-### Step 4: `lib/task_queue/worker.ex` -- job executor
-
-```elixir
-defmodule TaskQueue.Worker do
+defmodule GenstageIntro.Producer do
   @moduledoc """
-  Executes individual jobs. Used by the GenStage consumer.
-  """
-
-  @spec execute(map()) :: {:ok, term()} | {:error, term()}
-  def execute(%{type: "noop", args: _}), do: {:ok, :noop}
-  def execute(%{type: "echo", args: args}), do: {:ok, args}
-  def execute(%{type: "fail", args: %{reason: reason}}), do: {:error, {:job_failed, reason}}
-  def execute(%{type: type}), do: {:error, {:unknown_type, type}}
-  def execute(_), do: {:error, :invalid_job}
-end
-```
-
-### Step 5: `lib/task_queue/pipeline/job_producer.ex`
-
-The producer responds to demand by dequeuing up to `demand` jobs from the QueueServer. If fewer jobs are available, it emits only what exists and tracks unmet demand in its state. GenStage retries demand automatically on the next tick.
-
-```elixir
-defmodule TaskQueue.Pipeline.JobProducer do
-  @moduledoc """
-  GenStage producer that emits jobs from the task queue.
+  A trivial counter producer. It emits consecutive integers starting at 0,
+  as many per batch as the consumer demands.
   """
 
   use GenStage
 
-  def start_link(opts \\ []) do
-    GenStage.start_link(__MODULE__, :ok, name: __MODULE__)
+  @spec start_link(non_neg_integer()) :: GenServer.on_start()
+  def start_link(initial \\ 0) do
+    GenStage.start_link(__MODULE__, initial, name: __MODULE__)
   end
 
   @impl true
-  def init(:ok) do
-    {:producer, %{pending_demand: 0}}
-  end
+  def init(counter), do: {:producer, counter}
 
   @impl true
-  def handle_demand(demand, state) when demand > 0 do
-    jobs = dequeue_batch(demand)
-    {:noreply, jobs, %{state | pending_demand: demand - length(jobs)}}
-  end
-
-  defp dequeue_batch(n), do: dequeue_batch(n, [])
-
-  defp dequeue_batch(0, acc), do: Enum.reverse(acc)
-
-  defp dequeue_batch(n, acc) do
-    case TaskQueue.QueueServer.dequeue() do
-      {:ok, job}       -> dequeue_batch(n - 1, [job | acc])
-      {:error, :empty} -> Enum.reverse(acc)
-    end
+  def handle_demand(demand, counter) when demand > 0 do
+    # Emit exactly `demand` events: counter, counter+1, ..., counter+demand-1.
+    # The producer contract is "emit AT MOST demand"; we always have more
+    # integers to hand out, so we satisfy the full request.
+    events = Enum.to_list(counter..(counter + demand - 1))
+    {:noreply, events, counter + demand}
   end
 end
 ```
 
-### Step 6: `lib/task_queue/pipeline/job_validator.ex`
-
-The validator is a producer_consumer -- it receives events from the producer, filters invalid ones, annotates valid ones with a `:validated_at` timestamp, and passes them downstream. Invalid jobs are silently dropped (in production you would log them).
+### Step 3: `lib/genstage_intro/consumer.ex`
 
 ```elixir
-defmodule TaskQueue.Pipeline.JobValidator do
+defmodule GenstageIntro.Consumer do
   @moduledoc """
-  GenStage producer_consumer that validates jobs from the producer.
-  Valid jobs are passed downstream. Invalid jobs are dropped.
+  Subscribes to `Producer` and forwards every event to a caller-supplied pid
+  as `{:consumed, event}`. Using a forwarder pid (rather than printing) keeps
+  the consumer deterministic and testable.
   """
 
   use GenStage
 
-  def start_link(opts \\ []) do
-    GenStage.start_link(__MODULE__, :ok, name: __MODULE__)
+  @spec start_link(pid()) :: GenServer.on_start()
+  def start_link(notify_pid) when is_pid(notify_pid) do
+    GenStage.start_link(__MODULE__, notify_pid)
   end
 
   @impl true
-  def init(:ok) do
-    {:producer_consumer, :ok}
+  def init(notify_pid) do
+    # Subscribe at init. Small max_demand keeps batches small so tests can
+    # observe back-pressure clearly.
+    {:consumer, notify_pid,
+     subscribe_to: [{GenstageIntro.Producer, max_demand: 10, min_demand: 5}]}
   end
 
   @impl true
-  def handle_events(jobs, _from, state) do
-    valid_jobs =
-      jobs
-      |> Enum.filter(&valid_job?/1)
-      |> Enum.map(&Map.put(&1, :validated_at, System.monotonic_time()))
-
-    {:noreply, valid_jobs, state}
+  def handle_events(events, _from, notify_pid) do
+    for event <- events, do: send(notify_pid, {:consumed, event})
+    # Consumers return {:noreply, [], state} — they do not emit events themselves.
+    {:noreply, [], notify_pid}
   end
-
-  defp valid_job?(%{type: _, args: _}), do: true
-  defp valid_job?(_), do: false
 end
 ```
 
-### Step 7: `lib/task_queue/pipeline/job_consumer.ex`
-
-The consumer executes validated jobs. It must return an empty event list `[]` -- consumers do not emit events downstream. The `subscribe_to` option in `init/1` wires the consumer to the validator with a `max_demand` that limits in-flight events.
+### Step 4: `lib/genstage_intro.ex` — start the pipeline
 
 ```elixir
-defmodule TaskQueue.Pipeline.JobConsumer do
+defmodule GenstageIntro do
   @moduledoc """
-  GenStage consumer that executes validated jobs.
+  Starts a Producer and a Consumer wired together. Returns the consumer pid
+  so tests can stop it deterministically.
   """
 
-  use GenStage
+  alias GenstageIntro.{Producer, Consumer}
 
-  @max_demand 5
-
-  def start_link(opts \\ []) do
-    GenStage.start_link(__MODULE__, :ok, name: __MODULE__)
-  end
-
-  @impl true
-  def init(:ok) do
-    {:consumer, :ok, subscribe_to: [{TaskQueue.Pipeline.JobValidator, max_demand: @max_demand}]}
-  end
-
-  @impl true
-  def handle_events(jobs, _from, state) do
-    Enum.each(jobs, fn job ->
-      case TaskQueue.Worker.execute(job) do
-        {:ok, result}    -> :logger.info("Job done: #{inspect(result)}")
-        {:error, reason} -> :logger.warning("Job failed: #{inspect(reason)}")
-      end
-    end)
-
-    {:noreply, [], state}
+  @spec start_pipeline(pid()) :: {:ok, pid()}
+  def start_pipeline(notify_pid) do
+    {:ok, _producer} = Producer.start_link(0)
+    {:ok, consumer} = Consumer.start_link(notify_pid)
+    {:ok, consumer}
   end
 end
 ```
 
-### Step 8: Tests
-
-The tests call `handle_demand/2` and `handle_events/3` directly to verify behavior without starting the full GenStage subscription pipeline. This is the idiomatic way to unit-test GenStage stages.
+### Step 5: `test/genstage_intro_test.exs`
 
 ```elixir
-# test/task_queue/genstage_test.exs
-defmodule TaskQueue.GenStageTest do
+defmodule GenstageIntroTest do
   use ExUnit.Case, async: false
 
-  alias TaskQueue.Pipeline.{JobProducer, JobValidator, JobConsumer}
-  alias TaskQueue.QueueServer
-
   setup do
-    drain_queue()
+    {:ok, consumer} = GenstageIntro.start_pipeline(self())
+
+    on_exit(fn ->
+      # Stop producer and consumer between tests so each test starts fresh.
+      if Process.whereis(GenstageIntro.Producer),
+        do: GenStage.stop(GenstageIntro.Producer)
+
+      if Process.alive?(consumer), do: GenStage.stop(consumer)
+    end)
+
     :ok
   end
 
-  defp drain_queue do
-    case QueueServer.dequeue() do
-      {:ok, _}         -> drain_queue()
-      {:error, :empty} -> :ok
+  test "consumer receives a stream of events starting at 0" do
+    # With max_demand: 10, the first batch has at most 10 events.
+    assert_receive {:consumed, 0}, 500
+    assert_receive {:consumed, 1}, 500
+    # Let a few more come in.
+    for expected <- 2..9 do
+      assert_receive {:consumed, ^expected}, 500
     end
   end
 
-  describe "JobValidator.handle_events/3" do
-    test "passes valid jobs through" do
-      valid_job = %{type: "echo", args: %{msg: "hello"}}
-      {:noreply, events, _} = JobValidator.handle_events([valid_job], self(), :ok)
-      assert length(events) == 1
-      assert hd(events).type == "echo"
-    end
+  test "back-pressure: events keep flowing as consumer drains" do
+    # Collect 50 events — this forces multiple demand rounds.
+    received =
+      for _ <- 1..50 do
+        assert_receive {:consumed, n}, 1_000
+        n
+      end
 
-    test "attaches validated_at timestamp" do
-      valid_job = %{type: "echo", args: %{}}
-      {:noreply, [validated], _} = JobValidator.handle_events([valid_job], self(), :ok)
-      assert Map.has_key?(validated, :validated_at)
-    end
-
-    test "drops invalid jobs" do
-      invalid_job = %{bad: "structure"}
-      {:noreply, events, _} = JobValidator.handle_events([invalid_job], self(), :ok)
-      assert events == []
-    end
-
-    test "filters mixed batch" do
-      jobs = [
-        %{type: "noop", args: %{}},
-        %{bad: "job"},
-        %{type: "echo", args: %{}}
-      ]
-      {:noreply, valid, _} = JobValidator.handle_events(jobs, self(), :ok)
-      assert length(valid) == 2
-    end
-  end
-
-  describe "JobProducer.handle_demand/2" do
-    test "returns empty list when queue is empty" do
-      {:noreply, events, _state} = JobProducer.handle_demand(5, %{pending_demand: 0})
-      assert events == []
-    end
-
-    test "emits available jobs up to demand" do
-      QueueServer.enqueue(%{type: "noop", args: %{}})
-      QueueServer.enqueue(%{type: "noop", args: %{}})
-
-      {:noreply, events, _state} = JobProducer.handle_demand(10, %{pending_demand: 0})
-      assert length(events) == 2
-    end
-
-    test "does not emit more than demand" do
-      for _ <- 1..5, do: QueueServer.enqueue(%{type: "noop", args: %{}})
-
-      {:noreply, events, _state} = JobProducer.handle_demand(3, %{pending_demand: 0})
-      assert length(events) == 3
-    end
-  end
-
-  describe "JobConsumer.handle_events/3" do
-    test "executes jobs and returns empty events" do
-      jobs = [%{type: "noop", args: %{}, validated_at: System.monotonic_time()}]
-      {:noreply, [], _state} = JobConsumer.handle_events(jobs, self(), :ok)
-    end
+    # They arrive strictly in order from the producer.
+    assert received == Enum.to_list(0..49)
   end
 end
 ```
 
-### Step 9: Run
+### Step 6: Run
 
 ```bash
-mix deps.get
-mix test test/task_queue/genstage_test.exs --trace
+mix test
 ```
 
 ---
 
-## Trade-off analysis
+## Trade-offs and production gotchas
 
-| Aspect | GenStage pipeline | Plain `send/2` | `Task.async_stream` |
-|--------|-------------------|----------------|---------------------|
-| Backpressure | built-in via demand | none | bounded by collection size |
-| Continuous event streams | yes | yes (unbounded) | no -- requires known collection |
-| Memory under burst | bounded by `max_demand` | unbounded mailbox | bounded by stream chunk |
-| Complexity | high (3 modules, subscriptions) | low | low |
-| Best for | long-running pipelines | low-volume messaging | batch processing |
+**1. Demand is the *only* back-pressure signal**
+Don't buffer events inside the producer "just in case". If a downstream is
+slow, demand slows and your producer naturally pauses. Buffering defeats
+the whole design.
 
----
+**2. `handle_demand` must be fast**
+It runs in the producer process; while it executes, no new demand is
+served. If your source is slow (HTTP, DB), fetch in a separate task and
+reply with `{:noreply, [], state}`, storing outstanding demand. Dispatch
+when the data arrives.
 
-## Common production mistakes
+**3. Beware unbounded demand on fast consumers**
+`max_demand: 10_000` + a fast producer = 10_000 events in flight per
+subscription. RAM pressure can be large. Start with defaults and tune
+downward only when measurement says to.
 
-**1. Forgetting to subscribe stages to each other**
-`use GenStage` defines callbacks but does not wire the pipeline. Use `subscribe_to:` in `init/1` or `GenStage.sync_subscribe/3`.
+**4. Producer termination does not drain the consumer**
+When a producer stops, its subscribers get a cancel event. Any events
+still in transit are delivered; anything *not yet* produced is lost. If
+you need graceful drain, wire a signal through the data itself (e.g. a
+final `:end_of_stream` event) rather than relying on process death.
 
-**2. Returning events from a consumer**
-Consumers must return `{:noreply, [], state}`. Returning events raises.
+**5. One producer per "logical source"**
+The classic pitfall is starting one producer per request. Producers are
+long-lived; request-lifecycle work belongs in a `Task` or `Broadway`
+pipeline, not a fresh `GenStage`.
 
-**3. Setting `max_demand: 1` expecting sequential processing**
-It processes one event at a time per consumer but does not guarantee ordering across multiple consumers.
-
-**4. Not tracking unmet demand in the producer**
-If `handle_demand` returns fewer events than demanded, store the unmet demand and fulfill it when new items arrive via `handle_info`.
-
-**5. Using `GenStage.call/2` on a stage from within its own callbacks**
-A GenStage stage is a GenServer. Calling itself causes a deadlock.
+**6. When NOT to use GenStage**
+- Event rate fits a single process comfortably and you don't need
+  back-pressure → a plain GenServer with `handle_info` is simpler.
+- You want parallel map/reduce over data → use `Flow`, which is GenStage
+  configured for you.
+- You want data ingestion from queues (SQS, Kafka, RabbitMQ) → use
+  `Broadway`, which is GenStage pre-wired with acknowledgements and rate
+  limiting.
 
 ---
 
 ## Resources
 
-- [GenStage -- official hex package](https://hexdocs.pm/gen_stage/GenStage.html)
-- [Introduction to GenStage -- Jose Valim](https://elixir-lang.org/blog/2016/07/14/announcing-genstage/)
-- [Flow: built on GenStage for parallel data processing](https://hexdocs.pm/flow/Flow.html)
+- [`GenStage` — hexdocs](https://hexdocs.pm/gen_stage/GenStage.html)
+- [`gen_stage` — GitHub README](https://github.com/elixir-lang/gen_stage)
+- [José Valim — "Announcing GenStage"](https://elixir-lang.org/blog/2016/07/14/announcing-genstage/) — original blog post with design rationale
+- [`Flow`](https://hexdocs.pm/flow/Flow.html) — high-level, parallel pipelines on top of GenStage
+- [`Broadway`](https://hexdocs.pm/broadway/Broadway.html) — data ingestion built on GenStage

@@ -1,235 +1,192 @@
-# Access Behaviour: Custom Lens-Like Access Patterns
+# `Access` behaviour — bracket syntax for a `User` struct
 
-## Goal
+**Project**: `user_access` — a `User` struct that supports `user[:profile][:name]` and `put_in/get_in/update_in` by implementing `Access`.
 
-Build `task_queue` job configuration structs that implement the `Access` behaviour, enabling `get_in/2`, `put_in/3`, and `update_in/3` on nested structs. Learn the three callbacks (`fetch`, `get_and_update`, `pop`), how to expose only safe fields via an allow-list, and why the return value must be re-wrapped into the struct.
+**Difficulty**: ★★★☆☆
+**Estimated time**: 2–3 hours
 
 ---
 
-## What the Access behaviour requires
+## Project context
 
-The `Access` behaviour defines three callbacks:
+Elixir's bracket syntax — `user[:profile]` — and the `Kernel.get_in/2`,
+`put_in/2`, and `update_in/2` family are all powered by the `Access`
+behaviour. Maps and keyword lists implement it out of the box. Structs do
+NOT — by default `user[:field]` raises.
+
+This matters the moment your domain model is more than a flat map. A `User`
+that nests a `Profile` is awkward to traverse with pattern matching alone:
 
 ```elixir
-@callback fetch(container, key) :: {:ok, value} | :error
-@callback get_and_update(container, key, (value -> {get_value, new_value} | :pop)) :: {get_value, new_container}
-@callback pop(container, key) :: {value, new_container}
+%{user | profile: %{user.profile | name: "new"}}  # painful
+put_in(user[:profile][:name], "new")              # with Access
 ```
 
-`fetch/2` is used by `get_in/2`. `get_and_update/3` is used by `update_in/3` and `get_and_update_in/3`. `pop/2` is used by `pop_in/2`.
+Implementing `Access` on your own struct unlocks the same ergonomics users
+already expect from maps. This exercise does exactly that, with care taken
+around the callbacks' exact semantics — `get_and_update` and `pop` are
+easy to get subtly wrong.
 
-The simplest implementation delegates to `Map.fetch`, `Map.get_and_update`, and `Map.pop` on the struct converted to a map, then wraps the result back into the struct.
+Project structure:
+
+```
+user_access/
+├── lib/
+│   └── user.ex
+├── test/
+│   └── user_test.exs
+└── mix.exs
+```
+
+---
+
+## Core concepts
+
+### 1. `Access` has three callbacks
+
+```elixir
+@callback fetch(t, key) :: {:ok, value} | :error
+@callback get_and_update(t, key, (value | nil -> {get, value} | :pop)) ::
+            {get, t}
+@callback pop(t, key) :: {value, t}
+```
+
+`fetch/2` drives `user[:k]`. `get_and_update/3` drives `update_in`, `put_in`,
+and `Kernel.update_in`. `pop/2` drives `pop_in`.
+
+### 2. `get_in/2` composes `Access` dispatch
+
+`get_in(user, [:profile, :name])` calls `Access.get(user, :profile)`, then
+`Access.get(result, :name)`. Implementing `Access` once on your struct makes
+it work seamlessly with nested structures.
+
+### 3. Structs do NOT get `Access` for free
+
+This is an intentional design choice. Structs have a fixed shape; throwing
+arbitrary keys at `user[:typo]` should fail loudly. You implement `Access`
+only when you've decided bracket access makes sense for your type.
+
+### 4. `Kernel.get_in/put_in` also accept functions
+
+If your struct shouldn't implement `Access` but you still want nested traversal,
+you can pass an accessor function: `get_in(user, [Access.key(:profile), :name])`.
+See `Access.key/2` and `Access.all/0` for built-in accessors.
 
 ---
 
 ## Implementation
 
-### Step 1: `mix.exs`
+### Step 1: Create the project
 
-```elixir
-defmodule TaskQueue.MixProject do
-  use Mix.Project
-
-  def project do
-    [
-      app: :task_queue,
-      version: "0.1.0",
-      elixir: "~> 1.15",
-      start_permanent: Mix.env() == :prod,
-      deps: deps()
-    ]
-  end
-
-  def application do
-    [extra_applications: [:logger]]
-  end
-
-  defp deps, do: []
-end
+```bash
+mix new user_access
+cd user_access
 ```
 
-### Step 2: `lib/task_queue/job_config.ex` -- structs with Access behaviour
-
-`RetryPolicy` implements Access by delegating to `Map.fetch/2`, `Map.get_and_update/2`, and `Map.pop/2` on the struct-to-map conversion. The critical detail is re-wrapping the result with `struct(__MODULE__, updated_map)` -- without this, `update_in` returns a plain map instead of the struct, breaking downstream pattern matches.
-
-`JobConfig` uses an explicit allow-list (`@accessible_keys`) to hide internal fields like `_version`. When `fetch/2` receives a key not in the allow-list, it returns `:error`, making `get_in(config, [:_version])` return `nil` instead of the actual value.
+### Step 2: `lib/user.ex`
 
 ```elixir
-defmodule TaskQueue.JobConfig.RetryPolicy do
-  @moduledoc "Retry configuration for a job."
-
-  @behaviour Access
-
-  defstruct [
-    max_attempts: 3,
-    backoff_ms: 1_000,
-    max_backoff_ms: 30_000
-  ]
-
-  @type t :: %__MODULE__{
-    max_attempts:  pos_integer(),
-    backoff_ms:    pos_integer(),
-    max_backoff_ms: pos_integer()
-  }
-
-  @impl Access
-  def fetch(policy, key) do
-    Map.fetch(Map.from_struct(policy), key)
-  end
-
-  @impl Access
-  def get_and_update(policy, key, fun) do
-    {get, updated_map} = Map.get_and_update(Map.from_struct(policy), key, fun)
-    {get, struct(__MODULE__, updated_map)}
-  end
-
-  @impl Access
-  def pop(policy, key) do
-    {value, map} = Map.pop(Map.from_struct(policy), key)
-    {value, struct(__MODULE__, map)}
-  end
-end
-
-defmodule TaskQueue.JobConfig do
+defmodule User do
   @moduledoc """
-  Top-level job configuration.
-
-  Implements `Access` to allow path-based reads and updates:
-
-      get_in(config, [:retry, :max_attempts])
-      update_in(config, [:retry, :backoff_ms], &(&1 * 2))
-
-  Only `:handler`, `:retry`, and `:timeout_ms` are accessible via Access.
-  Internal fields like `:_version` are hidden.
+  A small user struct that supports bracket-access (`user[:profile]`) and
+  works with `get_in`, `put_in`, and `update_in`. Implements the `Access`
+  behaviour.
   """
 
   @behaviour Access
 
-  defstruct [
-    :handler,
-    retry: %TaskQueue.JobConfig.RetryPolicy{},
-    timeout_ms: 5_000,
-    _version: 1
-  ]
+  @enforce_keys [:id, :profile]
+  defstruct [:id, :profile]
 
-  @type t :: %__MODULE__{
-    handler:    String.t() | nil,
-    retry:      TaskQueue.JobConfig.RetryPolicy.t(),
-    timeout_ms: pos_integer()
-  }
+  @type t :: %__MODULE__{id: term(), profile: map()}
 
-  @accessible_keys ~w(handler retry timeout_ms)a
+  @doc "Build a new user with id and a profile map."
+  @spec new(term(), map()) :: t
+  def new(id, profile) when is_map(profile), do: %__MODULE__{id: id, profile: profile}
 
-  @impl Access
-  def fetch(config, key) when key in @accessible_keys do
-    Map.fetch(Map.from_struct(config), key)
-  end
-
-  def fetch(_config, _key), do: :error
+  # ── Access callbacks ───────────────────────────────────────────────────
+  #
+  # We delegate to the underlying map for storage, but restrict which keys
+  # are accessible — only declared struct fields. Attempting to fetch an
+  # unknown key returns :error, which is the documented "not present" signal.
 
   @impl Access
-  def get_and_update(config, key, fun) when key in @accessible_keys do
-    {get, updated_map} = Map.get_and_update(Map.from_struct(config), key, fun)
-    {get, struct(__MODULE__, updated_map)}
+  def fetch(%__MODULE__{} = user, key) when key in [:id, :profile] do
+    {:ok, Map.fetch!(user, key)}
   end
 
-  def get_and_update(config, _key, fun) do
-    {get, _} = fun.(nil)
-    {get, config}
+  def fetch(%__MODULE__{}, _key), do: :error
+
+  @impl Access
+  def get_and_update(%__MODULE__{} = user, key, fun)
+      when key in [:id, :profile] and is_function(fun, 1) do
+    current = Map.fetch!(user, key)
+
+    case fun.(current) do
+      {get, new_value} ->
+        {get, Map.put(user, key, new_value)}
+
+      :pop ->
+        # Pop is allowed only for optional fields; id/profile are enforced.
+        raise ArgumentError, "cannot pop required key #{inspect(key)} from User"
+    end
   end
 
   @impl Access
-  def pop(config, key) when key in @accessible_keys do
-    {value, map} = Map.pop(Map.from_struct(config), key)
-    {value, struct(__MODULE__, map)}
+  def pop(%__MODULE__{}, key) do
+    raise ArgumentError, "cannot pop key #{inspect(key)} from User (all keys required)"
   end
-
-  def pop(config, _key), do: {nil, config}
 end
 ```
 
-### Step 3: Tests
+### Step 3: `test/user_test.exs`
 
 ```elixir
-# test/task_queue/access_test.exs
-defmodule TaskQueue.AccessTest do
+defmodule UserTest do
   use ExUnit.Case, async: true
 
-  alias TaskQueue.JobConfig
-  alias TaskQueue.JobConfig.RetryPolicy
+  setup do
+    %{user: User.new(1, %{name: "Jane", email: "j@x.io"})}
+  end
 
-  describe "RetryPolicy -- Access behaviour" do
-    test "fetch returns value for existing key" do
-      policy = %RetryPolicy{max_attempts: 5}
-      assert {:ok, 5} = Access.fetch(policy, :max_attempts)
+  describe "bracket access" do
+    test "top-level field via brackets", %{user: user} do
+      assert user[:id] == 1
+      assert user[:profile] == %{name: "Jane", email: "j@x.io"}
     end
 
-    test "fetch returns :error for missing key" do
-      policy = %RetryPolicy{}
-      assert :error = Access.fetch(policy, :nonexistent)
+    test "unknown struct key returns nil (Access.get default)", %{user: user} do
+      # fetch/2 returns :error → get/2 returns nil, matching Map semantics.
+      assert user[:nope] == nil
     end
 
-    test "get_and_update modifies a field" do
-      policy = %RetryPolicy{backoff_ms: 1_000}
-      {old, new_policy} = Access.get_and_update(policy, :backoff_ms, fn v -> {v, v * 2} end)
-      assert old == 1_000
-      assert new_policy.backoff_ms == 2_000
-    end
-
-    test "pop removes and returns a field" do
-      policy = %RetryPolicy{max_attempts: 3}
-      {value, new_policy} = Access.pop(policy, :max_attempts)
-      assert value == 3
-      assert new_policy.max_attempts == nil or is_integer(new_policy.max_attempts)
+    test "nested access via brackets", %{user: user} do
+      # profile is a plain map; Map already implements Access, so this chains.
+      assert user[:profile][:name] == "Jane"
     end
   end
 
-  describe "JobConfig -- Access behaviour with path operations" do
-    test "get_in reads top-level field" do
-      config = %JobConfig{handler: "TaskQueue.Handlers.Email"}
-      assert get_in(config, [:handler]) == "TaskQueue.Handlers.Email"
+  describe "get_in / put_in / update_in" do
+    test "get_in/2 traverses into the profile map", %{user: user} do
+      assert get_in(user, [:profile, :name]) == "Jane"
     end
 
-    test "get_in reads nested struct field" do
-      config = %JobConfig{retry: %RetryPolicy{max_attempts: 5}}
-      assert get_in(config, [:retry, :max_attempts]) == 5
+    test "put_in/2 replaces a nested value", %{user: user} do
+      updated = put_in(user, [:profile, :name], "Janet")
+      assert updated.profile.name == "Janet"
+      # Original is untouched — immutable, as always.
+      assert user.profile.name == "Jane"
     end
 
-    test "update_in modifies nested struct field" do
-      config = %JobConfig{retry: %RetryPolicy{backoff_ms: 1_000}}
-      new_config = update_in(config, [:retry, :backoff_ms], &(&1 * 2))
-      assert new_config.retry.backoff_ms == 2_000
-    end
-
-    test "put_in sets nested field" do
-      config = %JobConfig{retry: %RetryPolicy{max_attempts: 3}}
-      new_config = put_in(config, [:retry, :max_attempts], 10)
-      assert new_config.retry.max_attempts == 10
-    end
-
-    test "internal fields are not accessible via Access" do
-      config = %JobConfig{}
-      assert get_in(config, [:_version]) == nil
-    end
-
-    test "update_in returns same struct type" do
-      config = %JobConfig{timeout_ms: 5_000}
-      new_config = update_in(config, [:timeout_ms], &(&1 + 1_000))
-      assert %JobConfig{} = new_config
-      assert new_config.timeout_ms == 6_000
-    end
-
-    test "update_in on nested struct returns nested struct type" do
-      config = %JobConfig{}
-      new_config = update_in(config, [:retry, :max_attempts], &(&1 + 1))
-      assert %RetryPolicy{} = new_config.retry
+    test "update_in/2 transforms a nested value", %{user: user} do
+      updated = update_in(user, [:profile, :name], &String.upcase/1)
+      assert updated.profile.name == "JANE"
     end
   end
 
-  describe "Access behaviour in get_in with Access helpers" do
-    test "Access.key/1 works with structs implementing Access" do
-      config = %JobConfig{retry: %RetryPolicy{max_attempts: 7}}
-      assert get_in(config, [Access.key(:retry), Access.key(:max_attempts)]) == 7
+  describe "pop semantics" do
+    test "pop on a required key raises", %{user: user} do
+      assert_raise ArgumentError, fn -> pop_in(user, [:profile]) end
     end
   end
 end
@@ -238,43 +195,43 @@ end
 ### Step 4: Run
 
 ```bash
-mix test test/task_queue/access_test.exs --trace
+mix test
 ```
 
 ---
 
-## Trade-off analysis
+## Trade-offs and production gotchas
 
-| Approach | Works with `get_in/update_in` | Hides internal fields | Boilerplate | Best for |
-|----------|------------------------------|----------------------|-------------|----------|
-| `@behaviour Access` custom | yes | yes (explicit allow-list) | medium | domain structs with controlled public interface |
-| `@derive [Access]` via macro | yes | no -- exposes all fields | none | simple structs, all fields public |
-| Manual `Map.from_struct` | no -- must call explicitly | depends | high | one-off conversions |
-| Pattern matching | no | N/A | none | simple, one-level access |
+**1. Implementing `Access` is a public API decision**
+Once callers use `user[:field]`, renaming a field is a breaking change — the
+bracket form happily returns `nil` for the old key without any warning. Pin
+field names via `@enforce_keys` and restrict `fetch/2` to the known set to
+fail loudly on typos at the server boundary.
 
----
+**2. `get_and_update/3` must handle `:pop` correctly**
+`update_in` callbacks may return `:pop` to remove the key. If your struct
+can't represent "key absent", you must either raise (as above) or coerce to
+a default. Silently ignoring `:pop` corrupts state.
 
-## Common production mistakes
+**3. `Kernel.put_in/3` is NOT the same as `Map.put/3`**
+`put_in(user, [:profile, :name], "x")` requires `Access` on `user`. If you
+forget to implement it, the error message is about the struct, not the key —
+expect confused issue reports.
 
-**1. Not wrapping `Map.get_and_update` result back into the struct**
-Without `struct(__MODULE__, updated_map)`, `update_in` returns a plain map.
+**4. Bracket access is `nil`-lenient; dot access is strict**
+`user[:missing]` returns `nil`. `user.missing` raises `KeyError`. Don't let
+code drift between the two styles — pick one per abstraction layer.
 
-**2. Not handling the `:pop` atom from `get_and_update`**
-The function in `get_and_update/3` can return `{get_value, new_value}` OR `:pop`. Delegating to `Map.get_and_update` handles this correctly.
-
-**3. Exposing all fields including internal ones**
-A field prefixed with `_` signals "internal." Use an explicit allow-list to prevent callers from `update_in`-ing invariants.
-
-**4. Using `Access.key/1` on a struct without `Access` implemented**
-`Access.key/1` calls `Access.fetch/2`. If the struct does not implement `Access`, this raises.
-
-**5. Confusing `Access.fetch/2` with `Map.fetch/2`**
-`Map.fetch(my_struct, :key)` works (structs are maps) but bypasses your custom `Access` implementation, exposing all fields.
+**5. When NOT to implement `Access`**
+If the struct's shape is opaque (an encoded blob, an internal cache), don't.
+Force callers to go through functions you control. `Access` is for value
+objects, not for stateful or invariant-heavy types.
 
 ---
 
 ## Resources
 
-- [Access behaviour -- official docs](https://hexdocs.pm/elixir/Access.html)
-- [get_in/put_in/update_in -- Kernel docs](https://hexdocs.pm/elixir/Kernel.html#get_in/2)
-- [Access.key/2 -- path helpers](https://hexdocs.pm/elixir/Access.html#key/2)
+- [`Access` behaviour — Elixir stdlib](https://hexdocs.pm/elixir/Access.html)
+- [`Kernel.get_in/2`, `put_in/3`, `update_in/3`](https://hexdocs.pm/elixir/Kernel.html#get_in/2)
+- [`Access.key/2` — accessor for missing-or-present fields](https://hexdocs.pm/elixir/Access.html#key/2)
+- ["The Access behaviour and you" — ElixirSchool](https://elixirschool.com/en/lessons/advanced/protocols/)

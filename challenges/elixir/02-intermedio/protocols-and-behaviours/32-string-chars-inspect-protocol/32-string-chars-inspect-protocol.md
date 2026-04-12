@@ -1,236 +1,177 @@
-# String.Chars and Inspect Protocols
+# `String.Chars` and `Inspect` — pretty printing a `Money` struct
 
-## Goal
+**Project**: `pretty_money` — a `Money` struct that renders nicely through `to_string/1` and the IEx/`inspect` output.
 
-Build a `task_queue` Job struct that implements the `String.Chars` protocol for human-readable string interpolation and the `Inspect` protocol for developer-friendly debug output. Learn why these protocols control how your structs appear in logs, IEx, and error messages.
+**Difficulty**: ★★☆☆☆
+**Estimated time**: 1–2 hours
 
 ---
 
-## The two protocols
+## Project context
 
-**`String.Chars`** controls what `to_string(value)` and string interpolation `"#{value}"` produce. It should return a human-readable representation for end-user output. For a Job, this is a compact identifier like `"send_email:abc-123 [failed]"`.
+Every struct you define eventually shows up in two places: somewhere a human
+reads `to_string(value)` or an interpolation (`"the price is #{amount}"`),
+and somewhere a developer reads `IO.inspect(value)` or IEx output. Elixir
+uses two distinct protocols for these — `String.Chars` for the first,
+`Inspect` for the second — and mixing them up is a common source of
+surprise.
 
-**`Inspect`** controls what `inspect(value)` produces. It is used by IEx, `IO.inspect/2`, and `dbg/1`. It should return a developer-friendly debug representation. For a Job, this is `#TaskQueue.Job<id: "abc-123", type: "send_email", status: :failed, retries: 2>`.
+This exercise builds a tiny `Money` struct and implements both protocols so
+that:
 
-The key difference: `String.Chars` is for users; `Inspect` is for developers.
+- `"cost: #{money}"` shows `cost: 12.34 EUR` (human output).
+- `inspect(money)` shows `#Money<12.34 EUR>` (developer output).
+
+Project structure:
+
+```
+pretty_money/
+├── lib/
+│   └── money.ex
+├── test/
+│   └── money_test.exs
+└── mix.exs
+```
+
+---
+
+## Core concepts
+
+### 1. `String.Chars` powers interpolation and `to_string/1`
+
+`"x = #{value}"` calls `String.Chars.to_string(value)`. If your type has no
+impl, interpolation raises `Protocol.UndefinedError`. Implementing it is how
+you opt into "I can appear in a user-facing string".
+
+### 2. `Inspect` powers IEx, `IO.inspect`, and error messages
+
+`Inspect` output is for developers. It should be unambiguous — show the type,
+show enough state to debug, and **never lie**. The convention is `#Type<...>`
+when the default struct rendering isn't good enough.
+
+### 3. `Inspect.Algebra` for complex layouts
+
+Simple inspect can return a string via `concat/1`. For nested or
+configurable output, use `Inspect.Algebra` primitives: `concat`, `nest`,
+`break`, `group`. Exercise 80 goes deep on this.
+
+### 4. Human vs developer output — do NOT conflate
+
+`to_string(user)` returning `"Jane Doe"` is great for UIs, terrible for
+debugging (you can't tell a `User` from a `String`). `inspect(user)` returning
+`#User<id: 42, name: "Jane Doe">` is debuggable. Always implement both, and
+keep them different.
 
 ---
 
 ## Implementation
 
-### Step 1: `mix.exs`
+### Step 1: Create the project
 
-```elixir
-defmodule TaskQueue.MixProject do
-  use Mix.Project
-
-  def project do
-    [
-      app: :task_queue,
-      version: "0.1.0",
-      elixir: "~> 1.15",
-      start_permanent: Mix.env() == :prod,
-      deps: deps()
-    ]
-  end
-
-  def application do
-    [extra_applications: [:logger, :crypto]]
-  end
-
-  defp deps, do: []
-end
+```bash
+mix new pretty_money
+cd pretty_money
 ```
 
-### Step 2: `lib/task_queue/job.ex` -- struct with protocol implementations
-
-The struct uses `@enforce_keys [:type]` to catch missing required fields at compile time. The `new/2` function generates a random hex ID using `:crypto.strong_rand_bytes/1`.
-
-The `String.Chars` implementation returns a compact `"type:id [status]"` format. If `id` is nil (not yet persisted), it renders as `"new"`.
-
-The `Inspect` implementation uses `Inspect.Algebra.concat/1` to build the output. It deliberately hides `args` (potentially large, may contain secrets) and `scheduled_at` (implementation detail). The field `retry_count` is renamed to `retries` for brevity in debug output.
+### Step 2: `lib/money.ex`
 
 ```elixir
-defmodule TaskQueue.Job do
+defmodule Money do
   @moduledoc """
-  Represents a unit of work in the task queue.
+  A minimal money value with integer-cent precision and a currency code.
 
-  Implements `String.Chars` for human-readable string interpolation
-  and `Inspect` for developer-friendly debug output.
+  Demonstrates `String.Chars` (for interpolation) and `Inspect` (for
+  developer output). Not a real money type — use `ex_money` in production.
   """
 
-  @enforce_keys [:type]
+  @enforce_keys [:cents, :currency]
+  defstruct [:cents, :currency]
 
-  defstruct [
-    :id,
-    :type,
-    :last_error,
-    :scheduled_at,
-    args: %{},
-    status: :pending,
-    retry_count: 0
-  ]
+  @type t :: %__MODULE__{cents: integer(), currency: String.t()}
 
-  @type t :: %__MODULE__{
-    id:           String.t() | nil,
-    type:         String.t(),
-    args:         map(),
-    status:       :pending | :running | :completed | :failed,
-    retry_count:  non_neg_integer(),
-    last_error:   String.t() | nil,
-    scheduled_at: DateTime.t() | nil
-  }
-
-  @doc """
-  Creates a new Job struct with a generated ID.
-
-  ## Examples
-
-      iex> job = TaskQueue.Job.new("send_email", %{to: "user@example.com"})
-      iex> job.type
-      "send_email"
-      iex> job.status
-      :pending
-
-  """
-  @spec new(String.t(), map()) :: t()
-  def new(type, args \\ %{}) when is_binary(type) do
-    %__MODULE__{
-      id:   generate_id(),
-      type: type,
-      args: args
-    }
+  @doc "Build a `Money` from a decimal amount (float) and a currency code."
+  @spec new(number(), String.t()) :: t
+  def new(amount, currency) when is_number(amount) and is_binary(currency) do
+    # Round to integer cents once, at construction — avoids FP drift later.
+    %__MODULE__{cents: round(amount * 100), currency: currency}
   end
 
-  defp generate_id do
-    :crypto.strong_rand_bytes(8) |> Base.encode16(case: :lower)
+  @doc "Format as a decimal string (no currency), e.g. `12.34`."
+  @spec format_amount(t) :: String.t()
+  def format_amount(%__MODULE__{cents: c}) do
+    sign = if c < 0, do: "-", else: ""
+    abs_c = abs(c)
+    whole = div(abs_c, 100)
+    frac = rem(abs_c, 100)
+    # Pad cents to two digits so 5 cents renders as "0.05", not "0.5".
+    "#{sign}#{whole}.#{String.pad_leading(Integer.to_string(frac), 2, "0")}"
   end
 end
 
-defimpl String.Chars, for: TaskQueue.Job do
-  def to_string(%TaskQueue.Job{id: id, type: type, status: status}) do
-    "#{type}:#{id || "new"} [#{status}]"
+defimpl String.Chars, for: Money do
+  @moduledoc """
+  Human-facing: `"paid #{money}"` becomes `"paid 12.34 EUR"`.
+  """
+  def to_string(%Money{currency: cur} = m) do
+    Money.format_amount(m) <> " " <> cur
   end
 end
 
-defimpl Inspect, for: TaskQueue.Job do
+defimpl Inspect, for: Money do
+  @moduledoc """
+  Developer-facing: `inspect(money)` returns `#Money<12.34 EUR>`. The
+  `#Type<...>` convention signals "this is a custom inspect, not the
+  default struct dump" so readers know it's intentional.
+  """
   import Inspect.Algebra
 
-  def inspect(%TaskQueue.Job{id: id, type: type, status: status, retry_count: retries}, opts) do
-    inner =
-      Enum.join(
-        [
-          "id: #{Kernel.inspect(id)}",
-          "type: #{Kernel.inspect(type)}",
-          "status: #{Kernel.inspect(status)}",
-          "retries: #{retries}"
-        ],
-        ", "
-      )
-
-    concat(["#TaskQueue.Job<", inner, ">"])
+  def inspect(%Money{currency: cur} = m, _opts) do
+    concat(["#Money<", Money.format_amount(m), " ", cur, ">"])
   end
 end
 ```
 
-### Step 3: Tests
+### Step 3: `test/money_test.exs`
 
 ```elixir
-# test/task_queue/protocol_impl_test.exs
-defmodule TaskQueue.ProtocolImplTest do
+defmodule MoneyTest do
   use ExUnit.Case, async: true
 
-  alias TaskQueue.Job
-
-  describe "String.Chars implementation" do
-    test "to_string/1 returns compact format" do
-      job = %Job{id: "abc-123", type: "send_email", status: :pending, retry_count: 0}
-      assert to_string(job) == "send_email:abc-123 [pending]"
+  describe "construction and formatting" do
+    test "new/2 stores cents as integer" do
+      assert %Money{cents: 1234, currency: "EUR"} = Money.new(12.34, "EUR")
     end
 
-    test "string interpolation uses String.Chars" do
-      job = %Job{id: "xyz-456", type: "run_report", status: :running, retry_count: 1}
-      assert "Job: #{job}" == "Job: run_report:xyz-456 [running]"
+    test "format_amount/1 pads cents to two digits" do
+      assert Money.format_amount(Money.new(0.05, "USD")) == "0.05"
+      assert Money.format_amount(Money.new(7, "USD")) == "7.00"
     end
 
-    test "nil id renders as 'new'" do
-      job = %Job{id: nil, type: "heartbeat", status: :pending, retry_count: 0}
-      assert to_string(job) == "heartbeat:new [pending]"
-    end
-
-    test "failed status is included" do
-      job = %Job{id: "j1", type: "send_sms", status: :failed, retry_count: 3}
-      assert String.contains?(to_string(job), "failed")
-    end
-
-    test "IO.puts does not raise" do
-      job = %Job{id: "j2", type: "noop", status: :completed, retry_count: 0}
-      assert capture_io(fn -> IO.puts(job) end) =~ "noop:j2"
+    test "format_amount/1 renders negatives" do
+      assert Money.format_amount(Money.new(-3.50, "USD")) == "-3.50"
     end
   end
 
-  describe "Inspect implementation" do
-    test "inspect/1 returns developer format" do
-      job = %Job{id: "abc-123", type: "send_email", status: :failed, retry_count: 2}
-      result = inspect(job)
-      assert result =~ "#TaskQueue.Job<"
-      assert result =~ "abc-123"
-      assert result =~ "send_email"
-      assert result =~ "failed"
-      assert result =~ "retries: 2"
+  describe "String.Chars (interpolation)" do
+    test "interpolation uses human format" do
+      assert "#{Money.new(12.34, "EUR")}" == "12.34 EUR"
     end
 
-    test "inspect does not expose args" do
-      job = %Job{
-        id: "j3",
-        type: "send_email",
-        args: %{to: "user@example.com", password: "secret"},
-        status: :pending,
-        retry_count: 0
-      }
-      result = inspect(job)
-      refute result =~ "password"
-      refute result =~ "secret"
-    end
-
-    test "inspect does not expose scheduled_at" do
-      job = %Job{
-        id: "j4",
-        type: "noop",
-        status: :pending,
-        retry_count: 0,
-        scheduled_at: ~U[2024-01-15 10:00:00Z]
-      }
-      result = inspect(job)
-      refute result =~ "scheduled_at"
-    end
-
-    test "IO.inspect returns the job unchanged" do
-      job = %Job{id: "j5", type: "noop", status: :pending, retry_count: 0}
-      assert IO.inspect(job) == job
+    test "to_string/1 matches interpolation" do
+      m = Money.new(5, "USD")
+      assert to_string(m) == "5.00 USD"
     end
   end
 
-  describe "Job.new/2" do
-    test "creates a job with a generated id" do
-      job = Job.new("send_email", %{to: "user@example.com"})
-      assert job.type == "send_email"
-      assert job.args == %{to: "user@example.com"}
-      assert is_binary(job.id)
-      assert String.length(job.id) > 0
-      assert job.status == :pending
-      assert job.retry_count == 0
+  describe "Inspect (developer output)" do
+    test "inspect/1 uses the #Money<...> form" do
+      assert inspect(Money.new(12.34, "EUR")) == "#Money<12.34 EUR>"
     end
 
-    test "two jobs have different ids" do
-      job1 = Job.new("noop")
-      job2 = Job.new("noop")
-      assert job1.id != job2.id
+    test "inspect/1 differs from to_string/1" do
+      m = Money.new(1, "GBP")
+      refute inspect(m) == to_string(m)
     end
-  end
-
-  defp capture_io(fun) do
-    ExUnit.CaptureIO.capture_io(fun)
   end
 end
 ```
@@ -238,46 +179,44 @@ end
 ### Step 4: Run
 
 ```bash
-mix test test/task_queue/protocol_impl_test.exs --trace
+mix test
 ```
 
 ---
 
-## Trade-off analysis
+## Trade-offs and production gotchas
 
-| Approach | String interpolation | Debug output | Hides sensitive fields | Location |
-|----------|---------------------|--------------|----------------------|----------|
-| `String.Chars` + `Inspect` | automatic via `#{}` | automatic via `inspect/1` | yes (Inspect) | protocol implementations |
-| Custom `to_string_job/1` | must call explicitly | N/A | yes | module function |
-| Default struct inspect | N/A | yes but verbose | no -- shows all fields | automatic |
-| `@derive [Inspect]` with except | N/A | yes, filtered | yes | module attribute |
+**1. `String.Chars` errors are confusing at the call site**
+A missing impl manifests as `protocol String.Chars not implemented for %MyStruct{}`
+raised from a completely unrelated interpolation — frustrating for users of
+your library. Either implement it or document clearly that the type is not
+meant to be stringified.
 
-`@derive [Inspect, except: [:args, :scheduled_at]]` would hide those fields automatically. Write a full `defimpl Inspect` when you need a custom format that `@derive` cannot produce -- like `#TaskQueue.Job<...>` with `retries:` instead of `retry_count:`, or computing derived fields.
+**2. Don't derive `Inspect` when sensitive fields exist**
+`@derive Inspect` is convenient, but it will happily print passwords, tokens,
+and API keys. Prefer `@derive {Inspect, except: [:password, :token]}`, or
+write a hand-rolled impl.
 
----
+**3. Inspect output is read by humans AND by diffing tools**
+ExUnit diffs values via `inspect`. If your inspect is noisy or unstable
+(timestamps, random refs), assertions produce unreadable diffs. Keep it
+deterministic.
 
-## Common production mistakes
+**4. `to_string/1` should not truncate or lie**
+`to_string(money)` returning `"$12"` when the actual value is `$12.34` breaks
+everything downstream that parses it. Either show the full value or don't
+implement the protocol.
 
-**1. `String.Chars` returning a binary that includes secrets**
-If `args` contains API keys, every log line leaks credentials. Only include identifier fields.
-
-**2. Calling `to_string` in `defimpl Inspect`**
-The `Inspect` protocol expects developer context. Using `to_string(value)` inside `inspect/2` loses developer context.
-
-**3. Raising in `String.Chars` for nil fields**
-`to_string/1` is called in string interpolation inside `rescue` clauses and log handlers. If it raises, you lose the original error.
-
-**4. Not testing with `IO.inspect`**
-Your `Inspect` implementation must return the struct unchanged from `IO.inspect/2`.
-
-**5. `@derive Inspect` with `:only` ignoring the `:id` field**
-Debug output becomes ambiguous -- you cannot distinguish two different jobs of the same type and status.
+**5. When NOT to implement these protocols**
+If the value has no sensible text representation (a giant binary, a socket),
+don't force one — let callers who need a string build it explicitly. A
+missing impl is clearer than a garbage string.
 
 ---
 
 ## Resources
 
-- [String.Chars protocol -- official docs](https://hexdocs.pm/elixir/String.Chars.html)
-- [Inspect protocol -- official docs](https://hexdocs.pm/elixir/Inspect.html)
-- [Inspect.Algebra -- building custom inspect output](https://hexdocs.pm/elixir/Inspect.Algebra.html)
-- [Implementing protocols -- Elixir official guide](https://elixir-lang.org/getting-started/protocols.html)
+- [`String.Chars` — Elixir stdlib](https://hexdocs.pm/elixir/String.Chars.html)
+- [`Inspect` — Elixir stdlib](https://hexdocs.pm/elixir/Inspect.html)
+- [`Inspect.Algebra`](https://hexdocs.pm/elixir/Inspect.Algebra.html)
+- [`ex_money`](https://hexdocs.pm/ex_money/) — a production money library
