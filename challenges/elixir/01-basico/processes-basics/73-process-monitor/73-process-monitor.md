@@ -1,0 +1,287 @@
+# Monitors — observing processes without dying with them
+
+**Project**: `worker_watcher` — a standalone watcher that observes a pool of workers, counts their deaths, and stays alive regardless.
+
+**Difficulty**: ★☆☆☆☆
+**Estimated time**: 1 hour
+
+---
+
+## Project context
+
+You saw in the previous exercise that links are bidirectional and kill both sides.
+Sometimes that's the opposite of what you want: "tell me when that process dies,
+but leave me alone". That's a **monitor**.
+
+In this exercise you build a watcher — no GenServer, no Supervisor — that:
+
+1. Spawns N worker processes.
+2. Monitors each of them.
+3. Reports deaths without dying.
+4. Survives even if every worker crashes.
+
+Project structure:
+
+```
+worker_watcher/
+├── lib/
+│   └── worker_watcher.ex
+├── test/
+│   └── worker_watcher_test.exs
+└── mix.exs
+```
+
+---
+
+## Core concepts
+
+### 1. A monitor is unidirectional
+
+`Process.monitor(pid)` returns a reference. When `pid` dies (for any reason, normal
+or abnormal), the monitoring process receives ONE message:
+
+```elixir
+{:DOWN, ref, :process, pid, reason}
+```
+
+The monitored process neither knows nor cares that it's being watched. If the watcher
+dies first, the monitor is cleaned up silently.
+
+### 2. Monitor vs link — the decision
+
+| Property | Link | Monitor |
+|----------|------|---------|
+| Direction | bidirectional | unidirectional |
+| On crash, other dies? | yes (unless trapping) | no |
+| Fires on `:normal` exit? | no | YES |
+| Multiple between same pair | no | yes (each with its own ref) |
+| Cleanup | automatic | ref-based (`Process.demonitor/2`) |
+
+Rule of thumb: **link** when two processes have a shared lifetime. **Monitor** when
+one process needs to react to another's death but is otherwise independent.
+
+### 3. Monitors fire on normal exits too
+
+A linked `:normal` exit is silent. A monitored `:normal` exit delivers
+`{:DOWN, ref, :process, pid, :normal}`. This catches people out — if your code
+only handles "abnormal" deaths, remember that monitors don't make that distinction.
+
+### 4. `Process.demonitor(ref, [:flush])`
+
+If you're done watching, demonitor. The `:flush` option also removes any
+already-queued `:DOWN` message from your mailbox for that ref — useful to avoid
+a stale message triggering dead-pid logic later.
+
+---
+
+## Implementation
+
+### Step 1: Create the project
+
+```bash
+mix new worker_watcher
+cd worker_watcher
+```
+
+### Step 2: `lib/worker_watcher.ex`
+
+```elixir
+defmodule WorkerWatcher do
+  @moduledoc """
+  Spawns workers, monitors each, and counts deaths. The watcher is independent
+  of the workers — it uses monitors (not links), so worker crashes never affect it.
+  """
+
+  @doc """
+  Starts a watcher process. It returns a pid that will accept `:spawn_worker`
+  and `:stats` messages. See `spawn_worker/1` and `stats/1`.
+  """
+  @spec start() :: pid()
+  def start do
+    # The watcher does NOT trap exits and does NOT link to its workers —
+    # it uses monitors, which are immune to worker crashes by design.
+    spawn(fn -> watcher_loop(%{refs: %{}, dead: 0}) end)
+  end
+
+  @doc "Asks the watcher to spawn+monitor a new worker that will crash on :crash."
+  @spec spawn_worker(pid()) :: :ok
+  def spawn_worker(watcher) do
+    send(watcher, {:spawn_worker, self()})
+    :ok
+  end
+
+  @doc "Returns {alive_count, dead_count}."
+  @spec stats(pid()) :: {non_neg_integer(), non_neg_integer()}
+  def stats(watcher) do
+    send(watcher, {:stats, self()})
+
+    receive do
+      {:stats_reply, stats} -> stats
+    after
+      1_000 -> raise "watcher unresponsive"
+    end
+  end
+
+  # --- internals -------------------------------------------------------------
+
+  defp watcher_loop(state) do
+    receive do
+      {:spawn_worker, reply_to} ->
+        # Use spawn (not spawn_link) — we are NOT tied to the worker's fate.
+        worker = spawn(&worker_loop/0)
+
+        # Monitor is unidirectional: worker dies -> we get a :DOWN message.
+        # Worker has no idea it's being monitored. Watcher is unaffected by its crash.
+        ref = Process.monitor(worker)
+
+        send(reply_to, {:worker_spawned, worker})
+
+        watcher_loop(%{state | refs: Map.put(state.refs, ref, worker)})
+
+      {:stats, reply_to} ->
+        alive = map_size(state.refs)
+        send(reply_to, {:stats_reply, {alive, state.dead}})
+        watcher_loop(state)
+
+      # The central message of this exercise: a monitored process died.
+      # Shape is always {:DOWN, ref, :process, pid, reason}.
+      {:DOWN, ref, :process, _pid, _reason} ->
+        # Drop the ref from our tracking map and increment the death counter.
+        # We're still running — the worker's crash did not touch us.
+        watcher_loop(%{
+          state
+          | refs: Map.delete(state.refs, ref),
+            dead: state.dead + 1
+        })
+    end
+  end
+
+  defp worker_loop do
+    receive do
+      :crash -> exit(:boom)
+      :stop -> :ok
+    end
+  end
+end
+```
+
+### Step 3: `test/worker_watcher_test.exs`
+
+```elixir
+defmodule WorkerWatcherTest do
+  use ExUnit.Case, async: true
+
+  describe "monitor semantics" do
+    test "watcher survives worker crashes" do
+      watcher = WorkerWatcher.start()
+      watcher_ref = Process.monitor(watcher)
+
+      # Spawn three workers and collect their pids.
+      workers =
+        for _ <- 1..3 do
+          :ok = WorkerWatcher.spawn_worker(watcher)
+
+          receive do
+            {:worker_spawned, w} -> w
+          after
+            500 -> flunk("did not receive worker pid")
+          end
+        end
+
+      # Crash all of them.
+      Enum.each(workers, &send(&1, :crash))
+
+      # Give the watcher a moment to process every :DOWN.
+      Process.sleep(50)
+
+      # Watcher is still alive — monitors do not propagate death.
+      refute_receive {:DOWN, ^watcher_ref, _, _, _}, 100
+      assert Process.alive?(watcher)
+
+      # And it counted the deaths.
+      assert {0, 3} = WorkerWatcher.stats(watcher)
+    end
+
+    test "monitor fires on normal exit too (unlike links)" do
+      watcher = WorkerWatcher.start()
+
+      :ok = WorkerWatcher.spawn_worker(watcher)
+
+      worker =
+        receive do
+          {:worker_spawned, w} -> w
+        end
+
+      # :stop causes a normal exit. Links would NOT propagate this.
+      # Monitors fire anyway — that's a key behavioral difference.
+      send(worker, :stop)
+      Process.sleep(50)
+
+      assert {0, 1} = WorkerWatcher.stats(watcher)
+    end
+  end
+
+  describe "direct monitor usage" do
+    test ":DOWN message shape is {:DOWN, ref, :process, pid, reason}" do
+      {pid, ref} = spawn_monitor(fn -> exit(:pow) end)
+
+      assert_receive {:DOWN, ^ref, :process, ^pid, :pow}, 500
+    end
+
+    test "demonitor with :flush removes a queued :DOWN message" do
+      # Start a short-lived process and grab its ref.
+      {pid, ref} = spawn_monitor(fn -> :ok end)
+
+      # Wait for it to die and queue :DOWN.
+      Process.sleep(20)
+
+      # Flush both the monitor and any queued message for the ref.
+      Process.demonitor(ref, [:flush])
+
+      refute_receive {:DOWN, ^ref, :process, ^pid, _}, 50
+    end
+  end
+end
+```
+
+### Step 4: Run
+
+```bash
+mix test
+```
+
+---
+
+## Trade-offs and production gotchas
+
+**1. Monitors leak if you don't demonitor**
+If you monitor a long-lived process and then lose interest, the monitor stays.
+When the process eventually dies, you get a `:DOWN` you no longer want — and
+possibly a pattern-match crash because the rest of your code has moved on.
+Call `Process.demonitor(ref, [:flush])` when done.
+
+**2. Monitors fire on `:normal` — links don't**
+This trips people converting link code to monitor code. Handle `:normal` in
+your `:DOWN` clause or pattern-match only the reasons you care about.
+
+**3. You can't monitor an already-dead pid safely as a "missed the crash" signal**
+`Process.monitor(dead_pid)` immediately sends you `{:DOWN, ref, :process, pid, :noproc}`.
+That's fine — just be ready to handle `:noproc` as "it was already gone".
+
+**4. Multiple monitors on the same target are independent**
+Each call to `Process.monitor/1` returns a fresh ref and produces its own `:DOWN`.
+This is useful when two subsystems each need their own signal, but it means you
+can't treat "did I already monitor this pid?" as a boolean — track your own refs.
+
+**5. When NOT to use monitors**
+If you need the watcher to die with the target (co-lifetime), use a link.
+If you need automatic restart, use a Supervisor. Monitors are the building block
+for "tell me, I'll decide" logic — they are not a restart mechanism on their own.
+
+---
+
+## Resources
+
+- [`Process.monitor/1`](https://hexdocs.pm/elixir/Process.html#monitor/1)
+- [`spawn_monitor/1`](https://hexdocs.pm/elixir/Kernel.html#spawn_monitor/1) — one-call spawn + monitor
+- ["Monitors" in Learn You Some Erlang](https://learnyousomeerlang.com/errors-and-processes#monitors) — clear visual explanation

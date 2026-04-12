@@ -10,7 +10,6 @@ defmodule JsonValidator do
   @spec parse_args([String.t()]) :: {:validate, String.t(), keyword()} | :help
   def parse_args(argv) do
     switches = [strict: :boolean, help: :boolean, keys: :string]
-
   end
 
   defp run(:help) do

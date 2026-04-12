@@ -1,0 +1,279 @@
+# Code evaluation — why it's dangerous and how to sandbox safely
+
+**Project**: `formula_eval` — evaluates simple arithmetic formulas from user input using AST whitelisting, NOT `Code.eval_string/1`.
+
+**Difficulty**: ★★☆☆☆
+**Estimated time**: 1–2 hours
+
+---
+
+## Project context
+
+Product wants users to enter formulas like `(salary + bonus) * 0.8` in a spreadsheet
+cell. The naive solution is `Code.eval_string(formula, bindings)`. Don't do it.
+
+This exercise builds the right version: parse to AST, walk the tree, reject anything
+that isn't a number or one of the four basic operators, then evaluate the safe subset
+by hand.
+
+Project structure:
+
+```
+formula_eval/
+├── lib/
+│   └── formula_eval.ex
+├── test/
+│   └── formula_eval_test.exs
+└── mix.exs
+```
+
+---
+
+## Core concepts
+
+### 1. `Code.eval_string/2` evaluates arbitrary Elixir
+
+`Code.eval_string("File.rm_rf!(\"/\")")` runs. There is no sandbox. Elixir is a
+full language with file, network, and system access. Any input that reaches
+`Code.eval_string/1` is effectively a remote shell.
+
+This is not a hypothetical. "Let the user enter a small expression" is the #1 path
+to RCE in internal tools. The interpreter does not care that you *meant* for the
+input to be arithmetic.
+
+### 2. `Code.string_to_quoted/1` parses without executing
+
+It returns `{:ok, ast}` — an Elixir AST. No code runs. This is the safe primitive.
+You then walk the AST and either evaluate it yourself or reject anything outside
+your whitelist.
+
+### 3. AST shape for arithmetic
+
+```elixir
+Code.string_to_quoted!("1 + 2 * 3")
+# => {:+, [...], [1, {:*, [...], [2, 3]}]}
+```
+
+Numbers are literals (`1`, `2.5`). Operators are three-tuples `{op, meta, args}`.
+Anything else — variables, function calls, module references — is out of scope
+and must be rejected.
+
+### 4. Whitelisting > blacklisting
+
+You do NOT enumerate dangerous things to block. You enumerate the few safe things
+to allow and reject everything else. Any novel AST node should fail closed.
+
+---
+
+## Implementation
+
+### Step 1: Create the project
+
+```bash
+mix new formula_eval
+cd formula_eval
+```
+
+### Step 2: `lib/formula_eval.ex`
+
+```elixir
+defmodule FormulaEval do
+  @moduledoc """
+  Evaluates arithmetic formulas safely by whitelisting AST nodes.
+
+  Allowed:
+    - integer and float literals
+    - binary operators: +, -, *, /
+    - unary minus
+    - parentheses (implicit in the AST)
+
+  Everything else — variables, function calls, atoms, strings, lists, maps,
+  module references — is rejected at the AST level. No code is ever executed
+  by the interpreter.
+  """
+
+  @allowed_binary_ops [:+, :-, :*, :/]
+
+  @doc """
+  Evaluates `formula`. Returns `{:ok, number}` or `{:error, reason}`.
+
+  ## Examples
+
+      iex> FormulaEval.eval("1 + 2 * 3")
+      {:ok, 7}
+
+      iex> FormulaEval.eval("(10 - 2) / 4")
+      {:ok, 2.0}
+
+      iex> FormulaEval.eval("File.rm_rf!(\\"/\\")")
+      {:error, :forbidden_expression}
+  """
+  @spec eval(String.t()) :: {:ok, number()} | {:error, atom()}
+  def eval(formula) when is_binary(formula) do
+    # Step 1: parse to AST — no execution happens here.
+    with {:ok, ast} <- Code.string_to_quoted(formula),
+         # Step 2: walk the tree and evaluate by hand, using our whitelist.
+         {:ok, result} <- safe_eval(ast) do
+      {:ok, result}
+    else
+      {:error, {_meta, _msg, _token}} -> {:error, :parse_error}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  # --- safe evaluator --------------------------------------------------------
+
+  # Number literals are the leaves of every valid formula.
+  defp safe_eval(n) when is_integer(n) or is_float(n), do: {:ok, n}
+
+  # Binary operators: {op, _meta, [left, right]}.
+  # We pattern match the operator explicitly against the whitelist — any op
+  # outside the list falls through to the catch-all clause below.
+  defp safe_eval({op, _meta, [l, r]}) when op in @allowed_binary_ops do
+    with {:ok, lv} <- safe_eval(l),
+         {:ok, rv} <- safe_eval(r) do
+      apply_op(op, lv, rv)
+    end
+  end
+
+  # Unary minus: `-x` parses as {:-, meta, [x]} — one arg, not two.
+  defp safe_eval({:-, _meta, [x]}) do
+    with {:ok, v} <- safe_eval(x), do: {:ok, -v}
+  end
+
+  # Catch-all: anything else is forbidden. Variables, calls, atoms, all land here.
+  # Fail closed — this is the core safety guarantee.
+  defp safe_eval(_other), do: {:error, :forbidden_expression}
+
+  # Division by zero must be caught — the BEAM raises ArithmeticError otherwise,
+  # which is an uncontrolled exit for our caller.
+  defp apply_op(:/, _l, 0), do: {:error, :division_by_zero}
+  defp apply_op(:/, _l, 0.0), do: {:error, :division_by_zero}
+  defp apply_op(:+, l, r), do: {:ok, l + r}
+  defp apply_op(:-, l, r), do: {:ok, l - r}
+  defp apply_op(:*, l, r), do: {:ok, l * r}
+  defp apply_op(:/, l, r), do: {:ok, l / r}
+end
+```
+
+### Step 3: `test/formula_eval_test.exs`
+
+```elixir
+defmodule FormulaEvalTest do
+  use ExUnit.Case, async: true
+  doctest FormulaEval
+
+  describe "eval/1 — happy path" do
+    test "evaluates integer arithmetic" do
+      assert {:ok, 7} = FormulaEval.eval("1 + 2 * 3")
+      assert {:ok, 9} = FormulaEval.eval("(1 + 2) * 3")
+    end
+
+    test "evaluates with floats" do
+      assert {:ok, 2.5} = FormulaEval.eval("5 / 2")
+      assert {:ok, 3.0} = FormulaEval.eval("1.5 * 2")
+    end
+
+    test "handles unary minus" do
+      assert {:ok, -5} = FormulaEval.eval("-5")
+      assert {:ok, -1} = FormulaEval.eval("2 + -3")
+    end
+  end
+
+  describe "eval/1 — safety" do
+    test "rejects function calls" do
+      assert {:error, :forbidden_expression} =
+               FormulaEval.eval("File.rm_rf!(\"/tmp\")")
+    end
+
+    test "rejects variables" do
+      assert {:error, :forbidden_expression} = FormulaEval.eval("x + 1")
+    end
+
+    test "rejects module references" do
+      assert {:error, :forbidden_expression} = FormulaEval.eval(":os.cmd('ls')")
+    end
+
+    test "rejects anonymous functions" do
+      assert {:error, :forbidden_expression} = FormulaEval.eval("fn -> 1 end")
+    end
+
+    test "rejects string literals" do
+      # Even innocent-looking things — strings, lists — are out of scope.
+      assert {:error, :forbidden_expression} = FormulaEval.eval("\"hello\"")
+      assert {:error, :forbidden_expression} = FormulaEval.eval("[1, 2, 3]")
+    end
+
+    test "rejects bitwise ops (not in our whitelist)" do
+      # `|||` is bitwise OR — a perfectly valid Elixir op but NOT whitelisted.
+      # This is the whole point of a whitelist: new ops fail closed.
+      assert {:error, :forbidden_expression} = FormulaEval.eval("1 ||| 2")
+    end
+  end
+
+  describe "eval/1 — errors" do
+    test "returns :parse_error on malformed input" do
+      assert {:error, :parse_error} = FormulaEval.eval("1 +")
+      assert {:error, :parse_error} = FormulaEval.eval("((1)")
+    end
+
+    test "catches division by zero instead of crashing" do
+      assert {:error, :division_by_zero} = FormulaEval.eval("1 / 0")
+      assert {:error, :division_by_zero} = FormulaEval.eval("1 / (2 - 2)")
+    end
+  end
+end
+```
+
+### Step 4: Run
+
+```bash
+mix test
+```
+
+---
+
+## Trade-offs and production gotchas
+
+**1. `Code.eval_string/1` has no safe mode**
+There is no option to disable `File`, `System`, or `:os`. Any input reaching it is
+a command execution primitive. Treat it like `eval()` in JavaScript or `exec()` in
+Python — never on untrusted data, and "untrusted" includes any input from a form,
+API, or database row that was once a form.
+
+**2. The "I'll just block the dangerous atoms" trap**
+Attempted blacklists always miss something. Escaping, Unicode lookalikes, creative
+atom construction — by the time you've patched all the bypasses, you've rebuilt a
+parser anyway. Whitelist from day one.
+
+**3. Variables need a binding store you control**
+If you extend this to support `x + y`, do NOT pass `bindings` to `Code.eval_string`.
+Add a clause to `safe_eval/1` that looks up variables in a map YOU control:
+
+```elixir
+defp safe_eval({name, _meta, nil}, bindings) when is_atom(name) do
+  case Map.fetch(bindings, name) do
+    {:ok, v} when is_number(v) -> {:ok, v}
+    _ -> {:error, :unknown_variable}
+  end
+end
+```
+
+**4. Parsing is cheap, evaluating is bounded**
+`Code.string_to_quoted/1` on adversarial input (deeply nested parens) can be slow
+but not dangerous — it produces an AST, not side effects. Still worth a length
+limit on input (e.g. reject formulas > 1 KB).
+
+**5. When NOT to do any of this**
+If users need a real spreadsheet language, use an embedded language designed for
+it (Lua via `:luerl`, a DSL via `NimbleParsec`). Hand-rolling an arithmetic
+evaluator is fine; hand-rolling a full language is a yak too big to shave.
+
+---
+
+## Resources
+
+- [`Code.string_to_quoted/2`](https://hexdocs.pm/elixir/Code.html#string_to_quoted/2)
+- ["The Elixir AST" — Elixir docs](https://hexdocs.pm/elixir/syntax-reference.html#the-elixir-ast)
+- [`NimbleParsec`](https://hexdocs.pm/nimble_parsec/) — when you outgrow AST whitelisting and need a real parser
+- [OWASP — Injection](https://owasp.org/www-community/Injection_Flaws) — the class of bugs this exercise is about

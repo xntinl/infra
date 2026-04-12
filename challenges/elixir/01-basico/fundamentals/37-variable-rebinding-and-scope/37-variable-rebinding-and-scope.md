@@ -1,0 +1,255 @@
+# Variable Rebinding and Scope: A Config Reloader Demo
+
+**Project**: `config_reloader_demo` — shows why rebinding a variable inside a function never mutates the caller's data
+
+**Difficulty**: ★☆☆☆☆
+**Estimated time**: 1 hour
+
+---
+
+## Project structure
+
+```
+config_reloader_demo/
+├── lib/
+│   └── config_reloader_demo.ex
+├── test/
+│   └── config_reloader_demo_test.exs
+└── mix.exs
+```
+
+---
+
+## Core concepts
+
+Elixir allows variable **rebinding** — writing `x = 1` then `x = 2` is legal.
+But this is NOT mutation. The second assignment binds the name `x` to a new
+value; any reference to the old value elsewhere is untouched.
+
+Coming from Java/Python, the instinct is "passing a map to a function lets it
+mutate the map". In Elixir this is impossible. Data is immutable. Functions
+return new values; callers keep the original unless they rebind their own
+variable to the result.
+
+The second concept is **scope**. `case`, `if`, `cond`, and anonymous functions
+introduce a new scope. Rebinding `x` inside an `if` does NOT propagate to the
+outer scope. This catches senior devs off-guard constantly.
+
+---
+
+## The business problem
+
+A config reloader reads a config map, adds a derived field (expiry timestamp),
+and returns the updated map. Callers who forget to use the return value end
+up with stale config. The demo makes the rebinding semantics obvious.
+
+---
+
+## Implementation
+
+### `lib/config_reloader_demo.ex`
+
+```elixir
+defmodule ConfigReloaderDemo do
+  @moduledoc """
+  Demonstrates rebinding vs mutation and scope rules.
+
+  Every function returns a NEW map. The caller's original map is never
+  modified, regardless of what happens inside the function.
+  """
+
+  @type config :: %{required(:name) => String.t(), optional(atom()) => term()}
+
+  @doc """
+  "Reloads" a config by adding a timestamp and version bump.
+
+  Inside this function we rebind `config` three times. None of those
+  rebindings affect the caller — the caller still holds the original map.
+  """
+  @spec reload(config()) :: config()
+  def reload(config) when is_map(config) do
+    # Rebinding: the name `config` now points to a new map.
+    # The caller's variable is unchanged.
+    config = Map.put(config, :reloaded_at, System.system_time(:second))
+    config = Map.update(config, :version, 1, &(&1 + 1))
+    config = Map.put(config, :status, :active)
+    config
+  end
+
+  @doc """
+  Shows that an inner rebinding inside `if` does NOT leak out.
+
+  In Ruby/Python, reassigning inside a conditional would leak. In Elixir
+  the outer `status` is untouched by the inner rebinding.
+  """
+  @spec describe_status(config()) :: String.t()
+  def describe_status(config) do
+    status = :unknown
+
+    # `status` rebinding inside `if` lives in the `if` scope.
+    # Elixir emits a compiler warning if you ignore the returned value.
+    status =
+      if Map.get(config, :active, false) do
+        :running
+      else
+        status
+      end
+
+    Atom.to_string(status)
+  end
+
+  @doc """
+  Pipeline style — idiomatic Elixir.
+
+  Instead of rebinding `config` line by line, thread the value through
+  `|>`. Each step returns a new map; no intermediate names needed.
+  """
+  @spec reload_pipeline(config()) :: config()
+  def reload_pipeline(config) do
+    config
+    |> Map.put(:reloaded_at, System.system_time(:second))
+    |> Map.update(:version, 1, &(&1 + 1))
+    |> Map.put(:status, :active)
+  end
+
+  @doc """
+  Demonstrates that `case` clauses have their own scope.
+
+  The `value` bound inside a clause does NOT leak to the outer function.
+  Each clause binds its own `value`.
+  """
+  @spec classify(integer()) :: {String.t(), integer()}
+  def classify(n) when is_integer(n) do
+    label =
+      case n do
+        value when value < 0 -> "negative: #{value}"
+        0 -> "zero"
+        value when value > 100 -> "large: #{value}"
+        value -> "small: #{value}"
+      end
+
+    # `value` is NOT in scope here — it was bound inside `case` clauses.
+    # Returning `n` (the original parameter) proves the point.
+    {label, n}
+  end
+end
+```
+
+### `test/config_reloader_demo_test.exs`
+
+```elixir
+defmodule ConfigReloaderDemoTest do
+  use ExUnit.Case, async: true
+
+  alias ConfigReloaderDemo
+
+  describe "reload/1" do
+    test "returns a new map with added fields" do
+      original = %{name: "api", version: 3}
+      reloaded = ConfigReloaderDemo.reload(original)
+
+      assert reloaded.version == 4
+      assert reloaded.status == :active
+      assert is_integer(reloaded.reloaded_at)
+    end
+
+    test "caller's original map is unchanged" do
+      # This is the whole point: immutability.
+      original = %{name: "api", version: 3}
+      _ignored = ConfigReloaderDemo.reload(original)
+
+      assert original == %{name: "api", version: 3}
+      refute Map.has_key?(original, :status)
+      refute Map.has_key?(original, :reloaded_at)
+    end
+
+    test "defaults version to 1 when missing" do
+      assert %{version: 1} = ConfigReloaderDemo.reload(%{name: "svc"})
+    end
+  end
+
+  describe "reload_pipeline/1" do
+    test "produces equivalent result to reload/1" do
+      config = %{name: "api", version: 10}
+      a = ConfigReloaderDemo.reload(config)
+      b = ConfigReloaderDemo.reload_pipeline(config)
+
+      # Compare everything except the timestamp which may differ by a second.
+      assert Map.delete(a, :reloaded_at) == Map.delete(b, :reloaded_at)
+    end
+  end
+
+  describe "describe_status/1" do
+    test "active config returns running" do
+      assert ConfigReloaderDemo.describe_status(%{name: "x", active: true}) == "running"
+    end
+
+    test "inactive config keeps outer status" do
+      # Proves that the inner rebinding didn't overwrite the outer :unknown
+      # in the false branch.
+      assert ConfigReloaderDemo.describe_status(%{name: "x", active: false}) == "unknown"
+    end
+  end
+
+  describe "classify/1" do
+    test "case clause bindings stay local" do
+      assert {"negative: -5", -5} = ConfigReloaderDemo.classify(-5)
+      assert {"zero", 0} = ConfigReloaderDemo.classify(0)
+      assert {"small: 42", 42} = ConfigReloaderDemo.classify(42)
+      assert {"large: 500", 500} = ConfigReloaderDemo.classify(500)
+    end
+  end
+end
+```
+
+### Run it
+
+```bash
+mix new config_reloader_demo
+cd config_reloader_demo
+mix test
+```
+
+---
+
+## Trade-offs and production mistakes
+
+**1. Forgetting to capture the return value**
+```elixir
+def handle(conn) do
+  Plug.Conn.put_resp_header(conn, "x-trace", "abc")  # Bug: return ignored
+  conn  # returns unmodified conn
+end
+```
+The compiler warns about unused results for most stdlib functions. Listen.
+
+**2. Rebinding inside `if` expecting it to leak out**
+```elixir
+result = :start
+if some_condition, do: (result = :changed)
+result  # still :start
+```
+Always assign the `if` expression's return value: `result = if cond, do: ...`.
+
+**3. Shadowing in `for` and anonymous functions**
+`Enum.map(items, fn item -> ... end)` — `item` inside the fn shadows any
+outer `item`. Fine, but rename for clarity in nested comprehensions.
+
+**4. "Mutation" illusion with ETS or processes**
+GenServer state looks mutable because the same PID holds different state over
+time. It is not — each callback returns a new state that replaces the old one.
+
+## When NOT to rebind
+
+- Inside a pipeline, rebinding breaks the flow. Use `|>` all the way.
+- When testing immutability invariants — rebinding the test subject hides bugs.
+- In complex `with` chains — rebinding the same name across steps defeats the
+  purpose of named intermediate values.
+
+---
+
+## Resources
+
+- [Pattern matching and rebinding](https://hexdocs.pm/elixir/pattern-matching.html)
+- [The match operator](https://elixir-lang.org/getting-started/pattern-matching.html)
+- [Scope rules — Elixir docs](https://hexdocs.pm/elixir/Kernel.SpecialForms.html#case/2)
