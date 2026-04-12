@@ -1,351 +1,303 @@
-# ETS: In-Process Shared State
+# ETS basics — create, insert, lookup, delete
 
-## Why ETS is not just a faster Agent
+**Project**: `ets_intro` — your first hands-on with Erlang Term Storage: open a
+table, put tuples in, pull them out, delete them, and understand who owns the
+table and what happens when that owner dies.
 
-ETS and Agent have different consistency models:
-
-- **Agent**: every operation is serialized through the process mailbox. All reads and
-  writes see a consistent, sequential view.
-- **ETS `:public`**: multiple processes read and write concurrently. Individual operations
-  are atomic, but sequences of operations are not.
-
-Choose ETS when: reads vastly outnumber writes, individual operation atomicity is
-sufficient, and you do not need cross-operation transactions.
-
-Choose Agent when: you need atomic multi-step operations (read-then-write).
+**Difficulty**: ★★☆☆☆
+**Estimated time**: 1–2 hours
 
 ---
 
-## The business problem
+## Project context
 
-Build a `TaskQueue.EtsRegistry` — a GenServer that **owns** an ETS table, but allows all
-reads to bypass the GenServer process (reads go straight to ETS).
+ETS (Erlang Term Storage) is the in-memory key/value store built into the BEAM.
+It's what `Registry`, `:pg`, Phoenix's `Presence`, `Mnesia`, `Hackney` pools,
+and dozens of other libraries use under the hood. It's **not** a database —
+it's a shared-memory tuple store with O(1) or O(log N) access depending on the
+table type, and it does not survive a node restart.
 
-Build a `TaskQueue.JobCounter` that uses `:ets.update_counter/4` for atomic increments,
-demonstrating the one ETS operation that is truly atomic for concurrent writers.
+This first exercise is deliberately minimal: no GenServer, no supervisor, no
+match specs. Just the four fundamental verbs — **new**, **insert**, **lookup**,
+**delete** — plus the single most important concept that trips people up the
+first time: **table ownership**. When the process that opened a table dies,
+the table dies with it. Understanding that rule is the difference between
+"ETS is magic" and "ETS is predictable".
 
-All modules are defined completely in this exercise.
-
----
-
-## Project setup
+Project structure:
 
 ```
-task_queue/
+ets_intro/
 ├── lib/
-│   └── task_queue/
-│       ├── ets_registry.ex
-│       └── job_counter.ex
+│   └── ets_intro.ex
 ├── test/
-│   └── task_queue/
-│       └── ets_test.exs
+│   └── ets_intro_test.exs
 └── mix.exs
 ```
 
 ---
 
-## Implementation
+## Core concepts
 
-### `lib/task_queue/ets_registry.ex`
+### 1. `:ets.new/2` — creating a table
 
 ```elixir
-defmodule TaskQueue.EtsRegistry do
-  use GenServer
-  require Logger
-
-  @table :tq_registry
-
-  def start_link(opts \\ []) do
-    GenServer.start_link(__MODULE__, opts, name: __MODULE__)
-  end
-
-  @doc "Reads a task entry directly from ETS — no GenServer roundtrip."
-  @spec get(String.t()) :: map() | nil
-  def get(task_id) do
-    case :ets.lookup(@table, task_id) do
-      [{^task_id, entry}] -> entry
-      [] -> nil
-    end
-  end
-
-  @doc "Registers a new task. Goes through GenServer to ensure the table exists."
-  @spec register(String.t(), atom()) :: :ok
-  def register(task_id, status \\ :pending) do
-    entry = %{status: status, updated_at: now()}
-    GenServer.cast(__MODULE__, {:put, task_id, entry})
-  end
-
-  @doc "Updates the status of an existing task via GenServer (serialized write)."
-  @spec update_status(String.t(), atom()) :: :ok | {:error, :not_found}
-  def update_status(task_id, new_status) do
-    GenServer.call(__MODULE__, {:update_status, task_id, new_status})
-  end
-
-  @doc "Returns all task IDs with the given status. Direct ETS read."
-  @spec by_status(atom()) :: [String.t()]
-  def by_status(status) do
-    @table
-    |> :ets.match_object({:"$1", %{status: status, updated_at: :"$2"}})
-    |> Enum.map(fn {task_id, _entry} -> task_id end)
-  end
-
-  @doc "Returns total count of all registered tasks."
-  @spec count() :: non_neg_integer()
-  def count do
-    :ets.info(@table, :size)
-  end
-
-  @impl GenServer
-  def init(_opts) do
-    table = :ets.new(@table, [:named_table, :public, :set, read_concurrency: true])
-    {:ok, %{table: table}}
-  end
-
-  @impl GenServer
-  def handle_cast({:put, task_id, entry}, state) do
-    :ets.insert(@table, {task_id, entry})
-    {:noreply, state}
-  end
-
-  @impl GenServer
-  def handle_call({:update_status, task_id, new_status}, _from, state) do
-    case :ets.lookup(@table, task_id) do
-      [] ->
-        {:reply, {:error, :not_found}, state}
-
-      [{^task_id, entry}] ->
-        updated = %{entry | status: new_status, updated_at: now()}
-        :ets.insert(@table, {task_id, updated})
-        {:reply, :ok, state}
-    end
-  end
-
-  @impl GenServer
-  def terminate(_reason, _state), do: :ok
-
-  defp now, do: System.monotonic_time(:millisecond)
-end
+:ets.new(:my_table, [:set, :protected, read_concurrency: true])
 ```
 
-The key design: `get/1`, `by_status/1`, and `count/0` read directly from ETS without
-going through the GenServer. 100 concurrent readers do not contend with each other.
-The `read_concurrency: true` option uses multiple read locks for parallel read throughput.
+The first argument is the table name (an atom); the second is a list of
+options. The most important options on day one:
 
-Writes go through the GenServer to prevent concurrent read-modify-write races.
+- **Type**: `:set` (default, one tuple per key), `:ordered_set`, `:bag`,
+  `:duplicate_bag`. You'll explore the differences in exercise 95.
+- **Access**: `:public` (any process can read/write), `:protected` (owner
+  writes, everyone reads — default), `:private` (only owner).
+- **`:named_table`**: if present, you refer to the table by its atom name;
+  otherwise you keep the *reference* returned by `:ets.new/2`.
 
-### `lib/task_queue/job_counter.ex`
+Without `:named_table`, `:ets.new(:foo, [])` returns an opaque `tid()` — a
+reference — and you address the table via that reference, not via `:foo`.
+The atom there is just an informational tag.
+
+### 2. Ownership and lifecycle
+
+Every ETS table has exactly one **owner process**. When that process dies,
+**the table is destroyed** (unless the owner gave it away via
+`:ets.give_away/3` or set a heir with `{:heir, pid, data}`). This is the
+single most surprising thing about ETS for newcomers: if you open a table
+from an `iex` session experiment, then the `iex` evaluator crashes, your
+table vanishes.
+
+In a real app, open ETS tables inside a **long-lived GenServer** (or a
+dedicated owner process under your supervision tree). That's how `Registry`,
+`:pg`, and friends do it.
+
+### 3. Insert / lookup / delete
 
 ```elixir
-defmodule TaskQueue.JobCounter do
-  use GenServer
-  require Logger
+:ets.insert(table, {:alice, 30})       # overwrites in a :set
+:ets.lookup(table, :alice)             # => [{:alice, 30}]  (ALWAYS a list)
+:ets.delete(table, :alice)             # removes the key
+:ets.delete(table)                     # destroys the TABLE
+```
 
-  @table :tq_job_counters
+Two things to internalize:
 
-  def start_link(opts \\ []) do
-    GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+- `:ets.lookup/2` **always returns a list**, even in a `:set`. Empty list
+  when the key is absent. This is because bag-type tables can return many
+  tuples, and the API stays uniform.
+- `:ets.delete/1` (one argument) destroys the entire table. `:ets.delete/2`
+  removes one key. Same function name, different arity, very different
+  consequences.
+
+### 4. Tuples, not maps
+
+ETS stores **tuples**. By default the key is element 1 (`{:alice, 30}` is
+keyed by `:alice`). You can change the key position with the `{:keypos, N}`
+option when creating the table. That's how people store structs directly:
+
+```elixir
+:ets.new(:users, [:set, keypos: 2])
+:ets.insert(:users, %User{id: 1, name: "Alice"})  # if you match the shape
+```
+
+For this exercise we'll keep it boring: plain `{key, value}` tuples.
+
+---
+
+## Implementation
+
+### Step 1: Create the project
+
+```bash
+mix new ets_intro
+cd ets_intro
+```
+
+### Step 2: `lib/ets_intro.ex`
+
+```elixir
+defmodule EtsIntro do
+  @moduledoc """
+  Minimal ETS playground. Creates an owned table, exposes insert/lookup/delete,
+  and demonstrates the lifecycle rule: when the owner dies, the table dies.
+
+  The owner is the process that calls `open/1`. In a real system this would be
+  a GenServer; here it's just the calling process to keep the concepts bare.
+  """
+
+  @type table :: :ets.tid() | atom()
+
+  @doc """
+  Creates a new ETS table owned by the calling process.
+
+  Options forwarded to `:ets.new/2`. Defaults to `[:set, :protected]`.
+  The caller is the owner — if it dies, this table is destroyed.
+  """
+  @spec open(atom(), keyword()) :: table()
+  def open(name, opts \\ [:set, :protected]) do
+    :ets.new(name, opts)
+  end
+
+  @doc "Inserts a `{key, value}` tuple. Overwrites on a `:set` table."
+  @spec put(table(), any(), any()) :: true
+  def put(table, key, value) do
+    :ets.insert(table, {key, value})
   end
 
   @doc """
-  Atomically increments counter `key` by `amount`.
-  Uses :ets.update_counter which is atomic even with concurrent callers.
-  """
-  @spec increment(atom(), pos_integer()) :: non_neg_integer()
-  def increment(key, amount \\ 1) do
-    :ets.update_counter(@table, key, {2, amount}, {key, 0})
-  end
+  Looks up a key. Returns `{:ok, value}` or `:error`.
 
-  @doc "Returns the current value of a counter. Returns 0 if not found."
-  @spec get(atom()) :: non_neg_integer()
-  def get(key) do
-    case :ets.lookup(@table, key) do
-      [{^key, count}] -> count
-      [] -> 0
+  `:ets.lookup/2` returns a list — we unwrap it to a more idiomatic shape for
+  the common `:set` case. For `:bag` tables, you'd want the raw list.
+  """
+  @spec get(table(), any()) :: {:ok, any()} | :error
+  def get(table, key) do
+    case :ets.lookup(table, key) do
+      [{^key, value}] -> {:ok, value}
+      [] -> :error
     end
   end
 
-  @doc "Returns all counters as a map."
-  @spec all() :: %{atom() => non_neg_integer()}
-  def all do
-    @table
-    |> :ets.tab2list()
-    |> Map.new(fn {key, count} -> {key, count} end)
-  end
+  @doc "Deletes a single key from the table."
+  @spec delete(table(), any()) :: true
+  def delete(table, key), do: :ets.delete(table, key)
 
-  @doc "Resets a specific counter to 0."
-  @spec reset(atom()) :: :ok
-  def reset(key) do
-    GenServer.cast(__MODULE__, {:reset, key})
-  end
+  @doc "Destroys the entire table. After this call the reference is invalid."
+  @spec close(table()) :: true
+  def close(table), do: :ets.delete(table)
 
-  @impl GenServer
-  def init(_opts) do
-    table = :ets.new(@table, [:named_table, :public, :set, write_concurrency: true])
-    {:ok, %{table: table}}
-  end
-
-  @impl GenServer
-  def handle_cast({:reset, key}, state) do
-    :ets.insert(@table, {key, 0})
-    {:noreply, state}
-  end
+  @doc "Returns how many tuples the table holds."
+  @spec size(table()) :: non_neg_integer()
+  def size(table), do: :ets.info(table, :size)
 end
 ```
 
-The `increment/2` function uses `:ets.update_counter/4` — the 4-argument form that
-accepts a default tuple. If the key does not exist, ETS inserts `{key, 0}` first, then
-applies the increment. This entire operation is atomic.
-
-### Tests
+### Step 3: `test/ets_intro_test.exs`
 
 ```elixir
-# test/task_queue/ets_test.exs
-defmodule TaskQueue.EtsTest do
-  use ExUnit.Case, async: false
+defmodule EtsIntroTest do
+  use ExUnit.Case, async: true
 
-  alias TaskQueue.EtsRegistry
-  alias TaskQueue.JobCounter
-
-  setup do
-    for mod <- [EtsRegistry, JobCounter] do
-      case Process.whereis(mod) do
-        nil -> :ok
-        pid -> GenServer.stop(pid)
-      end
+  describe "basic CRUD" do
+    setup do
+      # Each test owns its own anonymous table — no :named_table means no
+      # global-atom collision between async tests.
+      table = EtsIntro.open(:t, [:set, :protected])
+      on_exit(fn -> if :ets.info(table) != :undefined, do: :ets.delete(table) end)
+      %{table: table}
     end
 
-    {:ok, _} = EtsRegistry.start_link()
-    {:ok, _} = JobCounter.start_link()
-    :ok
-  end
-
-  describe "EtsRegistry" do
-    test "register and get round-trip" do
-      EtsRegistry.register("task_a")
-      Process.sleep(10)
-      entry = EtsRegistry.get("task_a")
-      assert entry != nil
-      assert entry.status == :pending
+    test "put then get round-trips", %{table: t} do
+      EtsIntro.put(t, :alice, 30)
+      assert EtsIntro.get(t, :alice) == {:ok, 30}
     end
 
-    test "get returns nil for unknown task" do
-      assert nil == EtsRegistry.get("nonexistent")
+    test "get on missing key returns :error", %{table: t} do
+      assert EtsIntro.get(t, :nobody) == :error
     end
 
-    test "update_status changes status" do
-      EtsRegistry.register("task_b")
-      Process.sleep(10)
-      assert :ok = EtsRegistry.update_status("task_b", :running)
-      assert %{status: :running} = EtsRegistry.get("task_b")
+    test "put on existing key overwrites (because :set)", %{table: t} do
+      EtsIntro.put(t, :k, 1)
+      EtsIntro.put(t, :k, 2)
+      assert EtsIntro.get(t, :k) == {:ok, 2}
+      assert EtsIntro.size(t) == 1
     end
 
-    test "update_status returns error for unknown task" do
-      assert {:error, :not_found} = EtsRegistry.update_status("ghost", :running)
-    end
-
-    test "by_status returns task IDs in the requested status" do
-      EtsRegistry.register("ta", :pending)
-      EtsRegistry.register("tb", :pending)
-      EtsRegistry.register("tc", :running)
-      Process.sleep(10)
-
-      pending = EtsRegistry.by_status(:pending)
-      assert "ta" in pending
-      assert "tb" in pending
-      refute "tc" in pending
-    end
-
-    test "count reflects registered tasks" do
-      EtsRegistry.register("c1")
-      EtsRegistry.register("c2")
-      Process.sleep(10)
-      assert EtsRegistry.count() >= 2
-    end
-
-    test "100 concurrent readers do not crash" do
-      EtsRegistry.register("shared_task", :running)
-      Process.sleep(10)
-
-      tasks = Enum.map(1..100, fn _ ->
-        Task.async(fn -> EtsRegistry.get("shared_task") end)
-      end)
-
-      results = Task.await_many(tasks, 5_000)
-      assert Enum.all?(results, &is_map/1)
+    test "delete removes a key but keeps the table alive", %{table: t} do
+      EtsIntro.put(t, :k, 1)
+      EtsIntro.delete(t, :k)
+      assert EtsIntro.get(t, :k) == :error
+      # Table still exists and accepts new inserts.
+      EtsIntro.put(t, :k2, 2)
+      assert EtsIntro.get(t, :k2) == {:ok, 2}
     end
   end
 
-  describe "JobCounter" do
-    test "increment returns new count" do
-      count = JobCounter.increment(:jobs_submitted)
-      assert is_integer(count)
-      assert count >= 1
-    end
+  describe "ownership lifecycle" do
+    test "table dies when its owner process dies" do
+      # Spawn a short-lived owner that creates a named table and exits.
+      test_pid = self()
 
-    test "increment accumulates correctly" do
-      JobCounter.reset(:test_counter)
-      Process.sleep(10)
-      JobCounter.increment(:test_counter)
-      JobCounter.increment(:test_counter)
-      JobCounter.increment(:test_counter, 5)
-      assert 7 = JobCounter.get(:test_counter)
-    end
+      owner =
+        spawn(fn ->
+          t = :ets.new(:owned_by_me, [:set, :public, :named_table])
+          :ets.insert(t, {:x, 1})
+          send(test_pid, :ready)
+          receive do
+            :die -> :ok
+          end
+        end)
 
-    test "concurrent increments are atomic" do
-      JobCounter.reset(:concurrent_counter)
-      Process.sleep(10)
+      assert_receive :ready, 500
 
-      tasks = Enum.map(1..100, fn _ ->
-        Task.async(fn -> JobCounter.increment(:concurrent_counter) end)
-      end)
+      # From the outside we can read the table while the owner is alive.
+      assert :ets.lookup(:owned_by_me, :x) == [{:x, 1}]
 
-      Task.await_many(tasks, 5_000)
-      assert 100 = JobCounter.get(:concurrent_counter)
-    end
+      # Kill the owner; wait for it to actually be down.
+      ref = Process.monitor(owner)
+      send(owner, :die)
+      assert_receive {:DOWN, ^ref, :process, ^owner, _}, 500
 
-    test "all returns a map of all counters" do
-      JobCounter.reset(:all_test_a)
-      JobCounter.reset(:all_test_b)
-      Process.sleep(10)
-      JobCounter.increment(:all_test_a, 3)
-      JobCounter.increment(:all_test_b, 7)
-
-      counters = JobCounter.all()
-      assert is_map(counters)
-      assert Map.get(counters, :all_test_a) >= 3
+      # The table is gone with the owner — calling :ets.info returns :undefined.
+      assert :ets.info(:owned_by_me) == :undefined
     end
   end
 end
 ```
 
-### Run the tests
+### Step 4: Run
 
 ```bash
-mix test test/task_queue/ets_test.exs --trace
+mix test
 ```
 
 ---
 
-## Common production mistakes
+## Trade-offs and production gotchas
 
-**1. Reading ETS from the GenServer instead of directly**
-If `get/1` calls `GenServer.call`, you have eliminated the entire concurrency benefit.
+**1. Ownership is invisible until it bites**
+The first time a supervisor restarts the GenServer that owned your ETS table,
+the table is gone — all its data with it. Either (a) treat ETS as a cache
+that's fine to rebuild on startup, or (b) use `:ets.give_away/3` / the `:heir`
+option to transfer ownership to a long-lived process before the owner exits.
+See erlang.org/doc/man/ets.html#give_away-3.
 
-**2. Table destroyed when owner crashes**
-ETS tables are owned by the creating process. If the owner crashes, the table is gone.
-Mitigate with `:ets.give_away/3` or recreate in `init/1`.
+**2. `lookup/2` copies data out of the table**
+Every read is a **term copy** from ETS memory into the caller's heap. Looking
+up a 1 MB binary means copying 1 MB. For large shared blobs, store them in
+`:persistent_term` or use refc binaries carefully.
 
-**3. Forgetting `read_concurrency: true` on read-heavy tables**
-Without it, ETS uses a single lock per table for reads.
+**3. `:set` overwrites silently**
+`:ets.insert/2` on a `:set` with an existing key silently replaces it. If you
+need "insert only if absent", use `:ets.insert_new/2`, which returns `false`
+instead of overwriting.
 
-**4. `:ets.update_counter` on a missing key without a default**
-The 3-argument form raises `ArgumentError` if the key does not exist. Use the 4-argument
-form with a default tuple.
+**4. Named tables are a global namespace**
+`:named_table` puts the atom in a VM-wide registry. Two libraries that both
+open a `:cache` named table will collide. For library code, prefer
+non-named tables (use the returned reference) unless the atom is clearly
+yours (e.g. `MyApp.Cache`).
+
+**5. ETS is not a database**
+It's in-memory, non-transactional across multiple keys, and dies with the
+node. If you need persistence, look at DETS (disk), Mnesia, or an external
+store. The "Learn You Some Erlang" ETS chapter hammers this point and it's
+worth reading before you build anything serious on top of ETS.
+
+**6. When NOT to use ETS**
+- When a plain `Map` inside a single GenServer fits: you avoid cross-process
+  copying and you serialize access for free.
+- When you need persistence or ACID transactions.
+- When the data is tiny, read-only, and process-local — `@module_attr` or
+  `:persistent_term` may be cheaper.
 
 ---
 
 ## Resources
 
-- [`:ets` — Erlang/OTP documentation](https://www.erlang.org/doc/man/ets.html)
-- [ETS — Elixir School](https://elixirschool.com/en/lessons/storage/ets)
-- [Benchee](https://github.com/bencheeorg/benchee)
+- [Erlang `ets` module — official docs](https://www.erlang.org/doc/man/ets.html)
+- [Elixir `:ets` wrapper guide — Elixir School](https://elixirschool.com/en/lessons/storage/ets)
+- ["Learn You Some Erlang — ETS"](https://learnyousomeerlang.com/ets) — the canonical tour
+- [Fred Hébert — "Erlang in Anger"](https://www.erlang-in-anger.com/) — chapter on ETS operational pitfalls
+- [`:ets.info/1` reference](https://www.erlang.org/doc/man/ets.html#info-1) — the first tool you reach for when debugging

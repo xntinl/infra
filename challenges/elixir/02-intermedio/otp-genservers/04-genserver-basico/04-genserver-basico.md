@@ -1,329 +1,270 @@
-# GenServer: Stateful Process with a Clear API
+# Basic GenServer: an in-memory key/value store
 
-## Why GenServer
+**Project**: `kv_store_gs` — a minimal `get/put/delete` key/value store as a GenServer, with proper API separation.
 
-GenServer brings two things that matter in production: a structured callback model that
-separates the public API from internal state management, and built-in integration with
-Supervisor. Agent only exposes `get/update/get_and_update`. GenServer exposes `call`
-(synchronous), `cast` (asynchronous), and `handle_info` (timer messages and raw sends).
+**Difficulty**: ★★☆☆☆
+**Estimated time**: 1–2 hours
 
 ---
 
-## The critical rule: two layers, two processes
+## Project context
 
-Every GenServer module has two distinct layers:
+Almost every Elixir service eventually grows an in-process cache, a session
+store, a config holder, or a lookup table that must be shared across
+concurrent callers. Before reaching for ETS or a database, the idiomatic
+first step is a small GenServer wrapping a map.
 
-```
-Client process             GenServer process
-─────────────              ─────────────────
-push/1          ──cast──▶  handle_cast   (runs here, modifies state)
-pop/0           ──call──▶  handle_call   (runs here, returns reply)
-                           handle_info   (runs here, receives timer)
-```
+This exercise builds that canonical shape: a public API that hides the
+GenServer machinery, a single process owning a map, and the three classic
+operations (`get`, `put`, `delete`). You will also set up the convention
+that the rest of OTP depends on: **callers never call `GenServer.call`
+directly — the module exposes a domain-shaped API**.
 
-The public functions run **in the caller's process**. The callbacks run **in the GenServer
-process**. `self()` inside a callback is the GenServer's PID, not the caller's. Mixing
-these up is the most common GenServer bug.
-
----
-
-## The business problem
-
-Build a `TaskQueue.QueueServer` that manages a FIFO queue of pending jobs:
-
-- `push/1` — adds a job to the back of the queue. Fire-and-forget.
-- `pop/0` — takes the front job off the queue. Synchronous. Returns `{:ok, job}` or
-  `{:error, :empty}`.
-- `peek/0` — returns the front job without removing it.
-- `size/0` — returns the current queue length.
-- `flush/0` — removes all jobs older than `@job_ttl_ms`, returns how many were removed.
-- The server schedules a periodic cleanup every `@cleanup_interval_ms`.
-
----
-
-## Project setup
+Project structure:
 
 ```
-task_queue/
+kv_store_gs/
 ├── lib/
-│   └── task_queue/
-│       └── queue_server.ex
+│   └── kv_store_gs.ex
 ├── test/
-│   └── task_queue/
-│       └── queue_server_test.exs
+│   └── kv_store_gs_test.exs
 └── mix.exs
 ```
 
 ---
 
-## Implementation
+## Core concepts
 
-### `lib/task_queue/queue_server.ex`
+### 1. API module vs. server module
+
+Good OTP modules expose domain functions (`KvStoreGs.put(pid, key, val)`)
+and hide `GenServer.call/2` inside them. Callers should not know whether
+the store is a GenServer, an ETS table, a GenStage pipeline, or a database
+— that is an implementation detail. This separation is what lets you
+refactor a GenServer into ETS without touching caller code.
+
+### 2. `call` vs. `cast` — the default is `call`
+
+`call/2` is synchronous: you wait for a reply, you find out if the server
+crashed, and back-pressure happens naturally because callers block when
+the server is busy. `cast/2` is asynchronous: no reply, no crash detection,
+and no back-pressure. **Default to `call`** until you have a specific
+reason to use `cast` (hot-path writes, telemetry).
+
+### 3. `init/1` runs inside the server process
+
+Code in `init/1` runs in the newly-spawned server process, not the caller.
+Heavy work here blocks `start_link/1` from returning — which in turn
+blocks the supervisor's startup. If init needs to do I/O, use
+`{:ok, state, {:continue, :load}}` so the server starts fast and defers
+heavy work to `handle_continue/2`.
+
+### 4. Pattern matching on state
+
+Idiomatic callbacks match on the state directly in the function head:
 
 ```elixir
-defmodule TaskQueue.QueueServer do
+def handle_call({:get, key}, _from, %{} = state) do
+  {:reply, Map.get(state, key), state}
+end
+```
+
+This turns the callback into a pure function of `(request, state) -> {reply, state}`,
+which is what makes GenServer code so easy to test.
+
+---
+
+## Implementation
+
+### Step 1: Create the project
+
+```bash
+mix new kv_store_gs
+cd kv_store_gs
+```
+
+### Step 2: `lib/kv_store_gs.ex`
+
+```elixir
+defmodule KvStoreGs do
+  @moduledoc """
+  An in-memory key/value store backed by a single GenServer.
+
+  The public API (`get/2`, `put/3`, `delete/2`) hides all GenServer
+  mechanics; callers must not depend on the store being a process.
+  """
+
   use GenServer
-  require Logger
 
-  @cleanup_interval_ms 30_000
-  @job_ttl_ms 300_000
+  @type key :: term()
+  @type value :: term()
 
-  @type job :: %{id: String.t(), payload: any(), queued_at: integer()}
+  # ── Public API ──────────────────────────────────────────────────────────
 
+  @doc """
+  Starts the store. Accepts standard `GenServer` options (e.g. `:name`).
+  The initial state is always an empty map.
+  """
+  @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts \\ []) do
-    GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+    GenServer.start_link(__MODULE__, %{}, opts)
   end
 
-  @doc "Adds a job to the back of the queue. Returns immediately."
-  @spec push(any()) :: :ok
-  def push(payload) do
-    job = %{
-      id: generate_id(),
-      payload: payload,
-      queued_at: System.monotonic_time(:millisecond)
-    }
+  @doc "Reads `key`. Returns `nil` if missing — callers can override with a default at the call site."
+  @spec get(GenServer.server(), key()) :: value() | nil
+  def get(server, key), do: GenServer.call(server, {:get, key})
 
-    GenServer.cast(__MODULE__, {:push, job})
+  @doc "Inserts or replaces `key` with `value`. Synchronous so writes are observable on return."
+  @spec put(GenServer.server(), key(), value()) :: :ok
+  def put(server, key, value), do: GenServer.call(server, {:put, key, value})
+
+  @doc "Removes `key`. Idempotent — deleting a missing key is a no-op."
+  @spec delete(GenServer.server(), key()) :: :ok
+  def delete(server, key), do: GenServer.call(server, {:delete, key})
+
+  @doc "Returns the full map. Useful for tests and introspection."
+  @spec snapshot(GenServer.server()) :: map()
+  def snapshot(server), do: GenServer.call(server, :snapshot)
+
+  # ── Callbacks ───────────────────────────────────────────────────────────
+
+  @impl true
+  def init(%{} = initial), do: {:ok, initial}
+
+  @impl true
+  def handle_call({:get, key}, _from, state) do
+    {:reply, Map.get(state, key), state}
   end
 
-  @doc "Takes the front job off the queue. Blocks until the server replies."
-  @spec pop() :: {:ok, job()} | {:error, :empty}
-  def pop do
-    GenServer.call(__MODULE__, :pop)
+  def handle_call({:put, key, value}, _from, state) do
+    {:reply, :ok, Map.put(state, key, value)}
   end
 
-  @doc "Returns the front job without removing it."
-  @spec peek() :: {:ok, job()} | {:error, :empty}
-  def peek do
-    GenServer.call(__MODULE__, :peek)
+  def handle_call({:delete, key}, _from, state) do
+    {:reply, :ok, Map.delete(state, key)}
   end
 
-  @doc "Returns the current number of jobs in the queue."
-  @spec size() :: non_neg_integer()
-  def size do
-    GenServer.call(__MODULE__, :size)
-  end
-
-  @doc "Manually triggers cleanup of stale jobs. Returns the number removed."
-  @spec flush() :: non_neg_integer()
-  def flush do
-    GenServer.call(__MODULE__, :flush)
-  end
-
-  # --- GenServer callbacks ---
-
-  @impl GenServer
-  def init(_opts) do
-    Process.send_after(self(), :cleanup, @cleanup_interval_ms)
-    Logger.info("QueueServer started")
-    {:ok, []}
-  end
-
-  @impl GenServer
-  def handle_cast({:push, job}, state) do
-    {:noreply, state ++ [job]}
-  end
-
-  @impl GenServer
-  def handle_call(:pop, _from, state) do
-    case state do
-      [] ->
-        {:reply, {:error, :empty}, state}
-
-      [job | rest] ->
-        {:reply, {:ok, job}, rest}
-    end
-  end
-
-  @impl GenServer
-  def handle_call(:peek, _from, state) do
-    case state do
-      [] -> {:reply, {:error, :empty}, state}
-      [job | _] -> {:reply, {:ok, job}, state}
-    end
-  end
-
-  @impl GenServer
-  def handle_call(:size, _from, state) do
-    {:reply, length(state), state}
-  end
-
-  @impl GenServer
-  def handle_call(:flush, _from, state) do
-    cutoff = System.monotonic_time(:millisecond) - @job_ttl_ms
-    remaining = Enum.filter(state, fn job -> job.queued_at > cutoff end)
-    removed = length(state) - length(remaining)
-
-    if removed > 0 do
-      Logger.info("QueueServer cleanup: removed #{removed} stale jobs")
-    end
-
-    {:reply, removed, remaining}
-  end
-
-  @impl GenServer
-  def handle_info(:cleanup, state) do
-    cutoff = System.monotonic_time(:millisecond) - @job_ttl_ms
-    remaining = Enum.filter(state, fn job -> job.queued_at > cutoff end)
-    removed = length(state) - length(remaining)
-
-    if removed > 0 do
-      Logger.info("QueueServer cleanup: removed #{removed} stale jobs")
-    end
-
-    Process.send_after(self(), :cleanup, @cleanup_interval_ms)
-    {:noreply, remaining}
-  end
-
-  @impl GenServer
-  def handle_info(unexpected, state) do
-    Logger.warning("QueueServer received unexpected message: #{inspect(unexpected)}")
-    {:noreply, state}
-  end
-
-  @impl GenServer
-  def terminate(reason, state) do
-    Logger.info("QueueServer terminating (reason: #{inspect(reason)}, queue size: #{length(state)})")
-    :ok
-  end
-
-  defp generate_id do
-    :crypto.strong_rand_bytes(8) |> Base.url_encode64(padding: false)
+  def handle_call(:snapshot, _from, state) do
+    {:reply, state, state}
   end
 end
 ```
 
-The `handle_cast({:push, job}, state)` appends the job to the end of the list with
-`state ++ [job]`. This is O(n), which is acceptable for moderate queue sizes. For
-high-throughput queues, Erlang's `:queue` provides O(1) enqueue/dequeue.
-
-The `handle_info` catch-all clause logs unexpected messages at warning level. Without
-this, an unexpected message would crash the GenServer.
-
-### Tests
+### Step 3: `test/kv_store_gs_test.exs`
 
 ```elixir
-# test/task_queue/queue_server_test.exs
-defmodule TaskQueue.QueueServerTest do
-  use ExUnit.Case, async: false
-
-  alias TaskQueue.QueueServer
+defmodule KvStoreGsTest do
+  use ExUnit.Case, async: true
 
   setup do
-    case Process.whereis(QueueServer) do
-      nil -> :ok
-      pid -> GenServer.stop(pid)
-    end
-
-    {:ok, _} = QueueServer.start_link()
-    :ok
+    {:ok, store} = KvStoreGs.start_link()
+    %{store: store}
   end
 
-  describe "push/1 and pop/0" do
-    test "pop returns jobs in FIFO order" do
-      QueueServer.push("job_a")
-      QueueServer.push("job_b")
-      QueueServer.push("job_c")
-      Process.sleep(10)
-
-      assert {:ok, %{payload: "job_a"}} = QueueServer.pop()
-      assert {:ok, %{payload: "job_b"}} = QueueServer.pop()
-      assert {:ok, %{payload: "job_c"}} = QueueServer.pop()
+  describe "put/3 and get/2" do
+    test "stores and retrieves a value", %{store: store} do
+      assert :ok = KvStoreGs.put(store, :user, "alice")
+      assert "alice" = KvStoreGs.get(store, :user)
     end
 
-    test "pop returns {:error, :empty} on an empty queue" do
-      assert {:error, :empty} = QueueServer.pop()
+    test "get on missing key returns nil", %{store: store} do
+      assert nil == KvStoreGs.get(store, :missing)
+    end
+
+    test "put overwrites existing value", %{store: store} do
+      KvStoreGs.put(store, :k, 1)
+      KvStoreGs.put(store, :k, 2)
+      assert 2 = KvStoreGs.get(store, :k)
     end
   end
 
-  describe "peek/0" do
-    test "returns front job without removing it" do
-      QueueServer.push("peek_job")
-      Process.sleep(10)
+  describe "delete/2" do
+    test "removes a key", %{store: store} do
+      KvStoreGs.put(store, :k, 1)
+      assert :ok = KvStoreGs.delete(store, :k)
+      assert nil == KvStoreGs.get(store, :k)
+    end
 
-      assert {:ok, %{payload: "peek_job"}} = QueueServer.peek()
-      assert {:ok, %{payload: "peek_job"}} = QueueServer.peek()
-      assert 1 = QueueServer.size()
+    test "is idempotent on missing keys", %{store: store} do
+      assert :ok = KvStoreGs.delete(store, :never_existed)
     end
   end
 
-  describe "size/0" do
-    test "reflects queue length after push and pop" do
-      assert 0 = QueueServer.size()
-      QueueServer.push(:a)
-      QueueServer.push(:b)
-      Process.sleep(10)
-      assert 2 = QueueServer.size()
-      QueueServer.pop()
-      assert 1 = QueueServer.size()
-    end
-  end
-
-  describe "flush/0" do
-    test "removes stale jobs and returns the count" do
-      stale_job = %{id: "stale", payload: :stale, queued_at: 0}
-      fresh_job = %{id: "fresh", payload: :fresh, queued_at: System.monotonic_time(:millisecond)}
-      :sys.replace_state(QueueServer, fn _state -> [stale_job, fresh_job] end)
-
-      removed = QueueServer.flush()
-      assert removed == 1
-      assert 1 = QueueServer.size()
-      assert {:ok, %{id: "fresh"}} = QueueServer.pop()
+  describe "snapshot/1" do
+    test "returns the full map", %{store: store} do
+      KvStoreGs.put(store, :a, 1)
+      KvStoreGs.put(store, :b, 2)
+      assert %{a: 1, b: 2} = KvStoreGs.snapshot(store)
     end
   end
 
   describe "concurrent access" do
-    test "handles concurrent pushes without losing jobs" do
-      tasks = Enum.map(1..50, fn n -> Task.async(fn -> QueueServer.push(n) end) end)
-      Task.await_many(tasks, 5_000)
-      Process.sleep(50)
-      assert 50 = QueueServer.size()
+    test "serialized writes produce a deterministic final state", %{store: store} do
+      # 50 concurrent writers, each putting their own key. Because the
+      # GenServer serializes writes, no updates are lost.
+      tasks =
+        for i <- 1..50 do
+          Task.async(fn -> KvStoreGs.put(store, i, i * 10) end)
+        end
+
+      Enum.each(tasks, &Task.await/1)
+
+      snapshot = KvStoreGs.snapshot(store)
+      assert map_size(snapshot) == 50
+      assert snapshot[7] == 70
     end
   end
 end
 ```
 
-### Run the tests
+### Step 4: Run
 
 ```bash
-mix test test/task_queue/queue_server_test.exs --trace
+mix test
 ```
 
 ---
 
-## Trade-off analysis
+## Trade-offs and production gotchas
 
-| Aspect | cast (push) | call (pop/peek) | handle_info (cleanup) |
-|--------|------------|-----------------|----------------------|
-| Caller blocks? | No | Yes, until reply | N/A — internal |
-| Ordering guarantee | Messages are ordered in mailbox | Same | Timer fires after interval |
-| Failure visibility | Caller never knows if cast failed | Caller gets exit signal on crash | Lost silently |
-| When to use | Fire-and-forget writes | Reads that need a result | Timers, monitor signals |
+**1. A GenServer serializes all access — this is the point, and the cost**
+Every `get/2` pays the round-trip to the server. Under high read load,
+this is the bottleneck. For read-heavy workloads, back the store with
+an ETS table (`:set`, `read_concurrency: true`) and use the GenServer
+only for writes, or make it a *gatekeeper* that owns the table and
+callers read directly.
 
----
+**2. Large maps in process state hurt GC**
+BEAM processes GC their entire heap together. A multi-megabyte map in
+state means multi-megabyte GCs on every major collection pause. Keep
+large data in ETS/persistent_term; keep the GenServer state small.
 
-## Common production mistakes
+**3. `get/2` returning `nil` conflates "missing" and "stored nil"**
+If callers may legitimately store `nil`, expose `fetch/2` returning
+`{:ok, value} | :error` instead. This exercise chooses simplicity; a
+production KV store should not.
 
-**1. `@impl GenServer` missing on callbacks**
-Without `@impl`, the compiler cannot warn you when a callback name is misspelled.
+**4. Naming: registered name vs. pid**
+Registering the server with `name: KvStoreGs` is convenient but creates
+global state — only one instance per node. For multi-tenant stores,
+start many unnamed instances and pass the pid (or use a `Registry`).
 
-**2. Slow work inside `handle_call`**
-`handle_call` blocks the GenServer for its entire duration. Extract slow work to a Task.
+**5. Every crash wipes the map**
+GenServer state is purely in memory. If the process crashes — or the
+supervisor restarts it — everything is gone. If the data must survive a
+crash, persist it (disk, ETS `:dets`, or a database) and reload in `init/1`.
 
-**3. Forgetting `handle_info` for unexpected messages**
-Without a catch-all clause, the GenServer crashes on the first unexpected message.
-
-**4. Using `call` for fire-and-forget writes**
-Using `call` where `cast` suffices halves throughput for no benefit.
-
-**5. State mutation outside callbacks**
-State is only valid inside callbacks. Never store state in a module attribute or ETS
-outside the GenServer.
+**6. When NOT to use a GenServer KV store**
+For shared read-heavy caches across many callers, ETS is strictly better.
+For persistent data, use a database. A GenServer KV store is right when
+you need serialized writes, a small working set, and the simplicity of
+"one process owns the data".
 
 ---
 
 ## Resources
 
-- [GenServer — HexDocs](https://hexdocs.pm/elixir/GenServer.html)
-- [Mix and OTP: GenServer](https://elixir-lang.org/getting-started/mix-otp/genserver.html)
-- [Saša Jurić — The Soul of Erlang](https://www.youtube.com/watch?v=JvBT4XBdoUE)
+- [`GenServer` — Elixir stdlib](https://hexdocs.pm/elixir/GenServer.html)
+- [`Map` — Elixir stdlib](https://hexdocs.pm/elixir/Map.html)
+- [Saša Jurić, *Elixir in Action*](https://www.manning.com/books/elixir-in-action-second-edition) — chapters on GenServer and OTP
+- [`:ets` — when you outgrow a map in a GenServer](https://www.erlang.org/doc/man/ets.html)

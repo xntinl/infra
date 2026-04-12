@@ -1,352 +1,396 @@
-# Documentation with ExDoc
+# Generating documentation with ExDoc
 
-## Goal
+**Project**: `docs_demo` — a library with rich docs, doctests, cross-module
+links, and an `extras/` guide, rendered by ExDoc to the same HTML you see
+on hexdocs.pm.
 
-Build a `task_queue` project with comprehensive documentation using `@moduledoc`, `@doc`, doctests (`iex>` examples), and ExDoc HTML generation. Learn why documentation is first-class in Elixir and how to write testable examples.
+**Difficulty**: ★★☆☆☆
+**Estimated time**: 1–2 hours
 
 ---
 
-## Why documentation is first-class in Elixir
+## Project context
 
-`@doc` and `@moduledoc` are not comments -- they are module attributes compiled into the BEAM binary and accessible at runtime via `h/1` in IEx. This means:
+ExDoc is the tool that renders Elixir's module docs into the site you've
+been reading for the last 20 exercises. If you publish to Hex, ExDoc runs
+on their build server and the output becomes your `hexdocs.pm/<pkg>` page.
+If you don't publish, running `mix docs` locally gives you an identical
+site in `doc/`.
 
-- Documentation is introspectable without reading source code
-- `doctest` runs the `iex>` examples as ExUnit tests -- stale examples fail CI
-- Libraries published on Hex are rated by HexDocs coverage
+This exercise shows the full documentation pipeline:
 
-The cultural norm in the Elixir ecosystem is that an undocumented public function is incomplete code, not a style choice.
+1. `@moduledoc` + `@doc` with Markdown, typespecs, and examples.
+2. Doctests so examples in docs are TESTED on every CI run.
+3. Cross-module links with the backtick notation.
+4. Extras: free-form guides (a `GUIDE.md`) rendered alongside module docs.
+5. `mix docs` configured with `source_url`, logo, groups, and extras.
+
+Project structure:
+
+```
+docs_demo/
+├── lib/
+│   ├── docs_demo.ex
+│   └── docs_demo/
+│       ├── string_utils.ex
+│       └── math_utils.ex
+├── guides/
+│   └── getting_started.md
+├── test/
+│   ├── string_utils_test.exs
+│   └── math_utils_test.exs
+└── mix.exs
+```
+
+---
+
+## Core concepts
+
+### 1. `@moduledoc` and `@doc` are just Markdown
+
+```elixir
+defmodule MathUtils do
+  @moduledoc """
+  Numeric helpers.
+
+  ## Quick start
+
+      iex> MathUtils.square(3)
+      9
+  """
+end
+```
+
+Two rules you'll forget:
+
+- The docstring must be `"""`-delimited — single-line `@doc "foo"` works
+  but can't contain Markdown sections.
+- `@moduledoc false` hides a module from docs entirely. Use it for internal
+  helpers so your public surface stays clean.
+
+### 2. Doctests: examples that run on CI
+
+Any block indented under `## Examples` that looks like `iex>` prompts is
+executed as a test when the test file calls `doctest ModuleName`.
+
+```elixir
+@doc """
+## Examples
+
+    iex> MathUtils.square(3)
+    9
+"""
+```
+
+**If the example is wrong, `mix test` fails.** Your docs cannot drift from
+reality. This is the single highest-ROI habit in the Elixir ecosystem.
+
+### 3. Cross-module references
+
+Inside a docstring, backticks with a `Module.function/arity` shape become
+hyperlinks:
+
+| Markdown                   | Rendered link            |
+|----------------------------|--------------------------|
+| `` `String.upcase/1` ``    | → the stdlib doc         |
+| `` `MathUtils` ``          | → your own module        |
+| `` `t:Enumerable.t/0` ``   | → a type                 |
+| `` `c:GenServer.init/1` ``| → a callback             |
+
+Prefixes: `t:` for types, `c:` for callbacks, `mfa` (bare) for functions.
+
+### 4. Extras — long-form guides
+
+Add `extras: ["guides/getting_started.md"]` to `mix docs` config and ExDoc
+renders Markdown files as sibling pages to the API reference. Use extras
+for tutorials, migration guides, and design rationale that don't belong on
+any one module.
 
 ---
 
 ## Implementation
 
-### Step 1: `mix.exs` -- add ExDoc configuration
+### Step 1: Create the project
+
+```bash
+mix new docs_demo
+cd docs_demo
+```
+
+### Step 2: Add ExDoc to `mix.exs`
 
 ```elixir
-defmodule TaskQueue.MixProject do
+defmodule DocsDemo.MixProject do
   use Mix.Project
+
+  @source_url "https://github.com/example/docs_demo"
+  @version "0.1.0"
 
   def project do
     [
-      app: :task_queue,
-      version: "0.1.0",
+      app: :docs_demo,
+      version: @version,
       elixir: "~> 1.15",
-      name: "TaskQueue",
-      source_url: "https://github.com/your-org/task_queue",
-      docs: [
-        main: "TaskQueue",
-        extras: ["README.md"],
-        groups_for_modules: [
-          "Core": [TaskQueue, TaskQueue.QueueServer, TaskQueue.Worker],
-          "Infrastructure": [TaskQueue.Scheduler]
-        ]
-      ],
       start_permanent: Mix.env() == :prod,
-      deps: deps()
+      deps: deps(),
+
+      # --- ExDoc-specific configuration ---
+      name: "DocsDemo",
+      source_url: @source_url,
+      homepage_url: @source_url,
+      docs: docs()
     ]
   end
 
-  def application do
-    [
-      extra_applications: [:logger],
-      mod: {TaskQueue.Application, []}
-    ]
-  end
+  def application, do: [extra_applications: [:logger]]
 
   defp deps do
     [
-      {:jason, "~> 1.4"},
       {:ex_doc, "~> 0.31", only: :dev, runtime: false}
     ]
   end
-end
-```
 
-### Step 2: `lib/task_queue/application.ex`
-
-```elixir
-defmodule TaskQueue.Application do
-  use Application
-
-  @impl true
-  def start(_type, _args) do
-    children = [
-      TaskQueue.QueueServer
+  defp docs do
+    [
+      main: "readme",
+      source_url: @source_url,
+      source_ref: "v#{@version}",
+      extras: [
+        "README.md",
+        "guides/getting_started.md": [title: "Getting Started"]
+      ],
+      groups_for_modules: [
+        "Utilities": [
+          DocsDemo.StringUtils,
+          DocsDemo.MathUtils
+        ]
+      ],
+      groups_for_docs: [
+        "Math": &(&1[:section] == :math),
+        "Strings": &(&1[:section] == :strings)
+      ]
     ]
-
-    opts = [strategy: :one_for_one, name: TaskQueue.Supervisor]
-    Supervisor.start_link(children, opts)
   end
 end
 ```
 
-### Step 3: `lib/task_queue/queue_server.ex` -- documented GenServer
-
-The `@moduledoc` goes immediately after `defmodule`. The `@doc` before each public function includes `iex>` examples that `doctest` can verify. `@doc false` hides internal functions from the generated HTML while keeping them `def` (public) so they can be called from tests or other modules.
+### Step 3: `lib/docs_demo.ex` — the entry-point module
 
 ```elixir
-defmodule TaskQueue.QueueServer do
-  use GenServer
-
+defmodule DocsDemo do
   @moduledoc """
-  Manages the in-memory job queue for `task_queue`.
+  Entry point for `DocsDemo`.
 
-  Jobs are enqueued as maps and processed in FIFO order.
-  The queue is bounded -- enqueueing to a full queue returns `{:error, :queue_full}`.
+  This library is a demo of the ExDoc pipeline. See:
 
-  ## Usage
+    * `DocsDemo.StringUtils` — text helpers.
+    * `DocsDemo.MathUtils` — numeric helpers.
 
-      iex> {:ok, _pid} = TaskQueue.QueueServer.start_link(max_size: 100)
-      iex> TaskQueue.QueueServer.enqueue(%{type: "send_email", args: %{}})
-      {:ok, 1}
-
-  ## Notes
-
-  All public functions return `{:ok, value}` or `{:error, reason}`.
-  The queue is not persistent -- it is lost when the process restarts.
+  It also ships with the ["Getting Started"](getting_started.html) guide.
   """
 
-  @default_max_size 1_000
-
   @doc """
-  Starts the QueueServer process with optional configuration.
-
-  ## Options
-
-    * `:max_size` - maximum number of jobs the queue can hold (default: #{@default_max_size})
+  Returns the library version.
 
   ## Examples
 
-      iex> {:ok, pid} = TaskQueue.QueueServer.start_link(max_size: 100)
-      iex> is_pid(pid)
+      iex> is_binary(DocsDemo.version())
       true
-
   """
-  def start_link(opts \\ []) do
-    max_size = Keyword.get(opts, :max_size, @default_max_size)
-    GenServer.start_link(__MODULE__, %{queue: :queue.new(), max_size: max_size}, name: __MODULE__)
-  end
+  @spec version() :: String.t()
+  def version, do: Application.spec(:docs_demo, :vsn) |> to_string()
+end
+```
 
+### Step 4: `lib/docs_demo/string_utils.ex`
+
+```elixir
+defmodule DocsDemo.StringUtils do
+  @moduledoc """
+  Small string helpers, used to demonstrate `@doc`, `@spec`, and doctests.
+
+  See also `DocsDemo.MathUtils` for the numeric counterpart.
+  """
+
+  @doc section: :strings
   @doc """
-  Enqueues a job and returns the new queue length.
+  Shouts a string by uppercasing and appending an exclamation mark.
 
-  Returns `{:error, :queue_full}` if the queue has reached its maximum size.
+  Delegates the uppercase step to `String.upcase/1`.
 
   ## Examples
 
-      iex> TaskQueue.QueueServer.enqueue(%{type: "ping", args: %{}})
-      {:ok, 1}
+      iex> DocsDemo.StringUtils.shout("hello")
+      "HELLO!"
 
-      iex> TaskQueue.QueueServer.enqueue("not a map")
-      {:error, :invalid_job}
-
+      iex> DocsDemo.StringUtils.shout("")
+      "!"
   """
-  def enqueue(job) when is_map(job) do
-    GenServer.call(__MODULE__, {:enqueue, job})
-  end
+  @spec shout(String.t()) :: String.t()
+  def shout(text) when is_binary(text), do: String.upcase(text) <> "!"
 
-  def enqueue(_), do: {:error, :invalid_job}
-
+  @doc section: :strings
   @doc """
-  Dequeues and returns the next job, or `{:error, :empty}` if the queue is empty.
+  Reverses a string.
 
   ## Examples
 
-      iex> TaskQueue.QueueServer.enqueue(%{type: "ping", args: %{}})
-      {:ok, 1}
-      iex> {:ok, job} = TaskQueue.QueueServer.dequeue()
-      iex> job.type
-      "ping"
-
+      iex> DocsDemo.StringUtils.reverse("abc")
+      "cba"
   """
-  def dequeue do
-    GenServer.call(__MODULE__, :dequeue)
-  end
+  @spec reverse(String.t()) :: String.t()
+  def reverse(text) when is_binary(text), do: String.reverse(text)
 
+  # Internal helper; @doc false hides it from ExDoc output.
+  @doc false
+  def __private_helper__, do: :ok
+end
+```
+
+### Step 5: `lib/docs_demo/math_utils.ex`
+
+```elixir
+defmodule DocsDemo.MathUtils do
+  @moduledoc """
+  Numeric helpers.
+
+  Use with `DocsDemo.StringUtils` for the full "hello world" experience.
+  """
+
+  @typedoc "A non-negative integer used as a count or size."
+  @type non_neg :: non_neg_integer()
+
+  @doc section: :math
   @doc """
-  Returns the current number of jobs in the queue.
+  Returns the square of a number.
 
   ## Examples
 
-      iex> TaskQueue.QueueServer.size()
+      iex> DocsDemo.MathUtils.square(3)
+      9
+
+      iex> DocsDemo.MathUtils.square(-4)
+      16
+  """
+  @spec square(number()) :: number()
+  def square(n) when is_number(n), do: n * n
+
+  @doc section: :math
+  @doc """
+  Clamps `n` to the range `[min, max]`.
+
+  Raises `ArgumentError` if `min > max`.
+
+  ## Examples
+
+      iex> DocsDemo.MathUtils.clamp(5, 0, 10)
+      5
+
+      iex> DocsDemo.MathUtils.clamp(-1, 0, 10)
       0
 
+      iex> DocsDemo.MathUtils.clamp(99, 0, 10)
+      10
   """
-  def size do
-    GenServer.call(__MODULE__, :size)
-  end
-
-  @doc false
-  def __reset__ do
-    GenServer.call(__MODULE__, :reset)
-  end
-
-  @impl true
-  def init(state), do: {:ok, state}
-
-  @impl true
-  def handle_call({:enqueue, job}, _from, %{queue: q, max_size: max} = state) do
-    if :queue.len(q) >= max do
-      {:reply, {:error, :queue_full}, state}
-    else
-      new_q = :queue.in(job, q)
-      {:reply, {:ok, :queue.len(new_q)}, %{state | queue: new_q}}
-    end
-  end
-
-  @impl true
-  def handle_call(:dequeue, _from, %{queue: q} = state) do
-    case :queue.out(q) do
-      {{:value, job}, new_q} -> {:reply, {:ok, job}, %{state | queue: new_q}}
-      {:empty, _} -> {:reply, {:error, :empty}, state}
-    end
-  end
-
-  @impl true
-  def handle_call(:size, _from, %{queue: q} = state) do
-    {:reply, :queue.len(q), state}
-  end
-
-  @impl true
-  def handle_call(:reset, _from, %{max_size: max}) do
-    {:reply, :ok, %{queue: :queue.new(), max_size: max}}
-  end
+  @spec clamp(number(), number(), number()) :: number()
+  def clamp(_n, min, max) when min > max, do: raise(ArgumentError, "min > max")
+  def clamp(n, min, _max) when n < min, do: min
+  def clamp(n, _min, max) when n > max, do: max
+  def clamp(n, _min, _max), do: n
 end
 ```
 
-### Step 4: `lib/task_queue/worker.ex` -- documented with tested doctests
+### Step 6: `guides/getting_started.md`
 
-Jason sorts keys alphabetically, so `%{b: 2, a: 1}` encodes to `{"a":1,"b":2}`, not `{"b":2,"a":1}`. Doctests must match the actual output exactly.
+```markdown
+# Getting Started
 
-```elixir
-defmodule TaskQueue.Worker do
-  @moduledoc """
-  Processes a single job from the task queue.
-
-  Encodes jobs as JSON for transport and decodes them for execution.
-  Each worker is supervised and may retry failed jobs up to `max_retries` times.
-  """
-
-  @doc """
-  Encodes a job map as a JSON string.
-
-  ## Examples
-
-      iex> TaskQueue.Worker.encode_job(%{type: "ping"})
-      {:ok, ~s({"type":"ping"})}
-
-      iex> TaskQueue.Worker.encode_job(%{b: 2, a: 1})
-      {:ok, ~s({"a":1,"b":2})}
-
-      iex> TaskQueue.Worker.encode_job(%{})
-      {:ok, "{}"}
-
-  """
-  def encode_job(job) when is_map(job) do
-    Jason.encode(job)
-  end
-
-  def encode_job(_), do: {:error, :not_a_map}
-
-  @doc """
-  Returns the configured maximum number of retries.
-
-  ## Examples
-
-      iex> is_integer(TaskQueue.Worker.max_retries())
-      true
-
-  """
-  def max_retries do
-    Application.get_env(:task_queue, :max_retries, 3)
-  end
-
-  @doc false
-  def __test_reset__ do
-    :ok
-  end
-end
+`DocsDemo` is a demo library for learning ExDoc. Install by adding
+`{:docs_demo, "~> 0.1"}` to your deps, then use `DocsDemo.MathUtils.square/1`
+or `DocsDemo.StringUtils.shout/1` from anywhere in your code.
 ```
 
-### Step 5: Tests -- doctests verified automatically
+### Step 7: Tests (with doctests enabled)
+
+`test/math_utils_test.exs`:
 
 ```elixir
-# test/task_queue/doc_test.exs
-defmodule TaskQueue.DocTest do
+defmodule DocsDemo.MathUtilsTest do
   use ExUnit.Case, async: true
 
-  doctest TaskQueue.QueueServer
-  doctest TaskQueue.Worker
+  doctest DocsDemo.MathUtils
 
-  test "__reset__/0 has no public documentation" do
-    docs = Code.fetch_docs(TaskQueue.QueueServer)
-    {:docs_v1, _, _, _, _, _, fn_docs} = docs
-
-    reset_doc =
-      Enum.find(fn_docs, fn {{type, name, _arity}, _, _, _, _} ->
-        type == :function and name == :__reset__
-      end)
-
-    assert elem(reset_doc, 3) == :hidden
+  test "clamp/3 raises when min > max" do
+    assert_raise ArgumentError, fn -> DocsDemo.MathUtils.clamp(1, 10, 0) end
   end
 end
 ```
 
-The `doctest` macro extracts every `iex>` example from `@doc` and `@moduledoc`, runs it as an ExUnit assertion, and fails CI if the output does not match. This is why doctests must be precise -- including map key ordering and exact return values.
+`test/string_utils_test.exs`:
 
-### Step 6: Run doctests and generate docs
+```elixir
+defmodule DocsDemo.StringUtilsTest do
+  use ExUnit.Case, async: true
+
+  doctest DocsDemo.StringUtils
+end
+```
+
+### Step 8: Build the docs
 
 ```bash
 mix deps.get
-mix test test/task_queue/doc_test.exs --trace
-mix docs
+mix test        # doctests + normal tests
+mix docs        # generates doc/index.html
 open doc/index.html
 ```
 
----
-
-## Trade-off analysis
-
-| Aspect | `@doc` with `iex>` examples | `@doc` prose only | No `@doc` |
-|--------|----------------------------|-------------------|-----------|
-| Testable | yes -- `doctest` catches staleness | no | no |
-| IEx `h/1` support | full | full | shows "No documentation" |
-| HexDocs coverage | high | medium | zero |
-| Maintenance cost | must keep examples accurate | lower | none |
-
-When would `@doc false` be preferable to `defp`? When the function is public by necessity -- for example, callbacks invoked by macros (`__using__/1`), functions called by test helpers (`__reset__/0` for resetting GenServer state), or functions required by behaviours that are implementation details rather than user-facing API.
+You get the full hexdocs.pm UX locally: sidebar with extras, module groups,
+search, "source" links pointing back at GitHub.
 
 ---
 
-## Common production mistakes
+## Trade-offs and production gotchas
 
-**1. Doctest result on the same line as the expression**
-```elixir
-# Wrong
-iex> String.upcase("hello") "HELLO"
+**1. Doctests are tests — they fail the build**
+This is a feature, not a bug. If you change behavior without updating
+docs, CI fails. But it means you can't put speculative/aspirational
+examples in docs — only things that work right now. Use `## Examples` for
+real examples and plain prose for everything else.
 
-# Right
-iex> String.upcase("hello")
-"HELLO"
-```
+**2. `@moduledoc false` vs omitting it**
+Omitting `@moduledoc` emits a compiler warning (in `--warnings-as-errors`
+it breaks CI). Modules that are genuinely internal should have explicit
+`@moduledoc false` — it tells both the compiler and the reader this is
+intentional.
 
-**2. `@moduledoc` after `@behaviour` or other attributes**
-ExDoc ignores or misplaces `@moduledoc` when it is not immediately after `defmodule`. Always place it first.
+**3. `source_ref:` matters for Hex**
+Without `source_ref: "v#{@version}"`, the "Source" links in docs point to
+the default branch — which will drift. For a published package, `source_ref`
+pins links to the exact tag.
 
-**3. Map key order in doctests**
-Maps are unordered. `%{a: 1, b: 2}` and `%{b: 2, a: 1}` are the same map but print differently. Pin the representation or test with `assert`.
+**4. Extras order matters**
+The `extras:` list order is the sidebar order. Put your "Getting Started"
+first, migration guides next, reference last.
 
-**4. `@doc false` on `defp` functions**
-Private functions are already excluded from documentation. `@doc false` has no effect on `defp`.
+**5. Doctests are slow if you have many**
+Each doctest is a separate ExUnit test with its own setup. Thousands of
+doctests can noticeably slow the suite. Keep doctests for API illustration;
+use `describe`-grouped unit tests for edge cases.
 
-**5. ExDoc without `runtime: false`**
-Without `runtime: false`, ExDoc starts as an OTP application, adding startup overhead to every `iex -S mix` session.
+**6. When NOT to add a doctest**
+- The example depends on wall-clock time, randomness, or environment (fails
+  on CI).
+- The output is a huge map/list (the doctest becomes unreadable).
+- The behavior is platform-specific.
+
+For those, describe the behavior in prose and test it in the test file.
 
 ---
 
 ## Resources
 
-- [Writing Documentation -- Elixir official guide](https://hexdocs.pm/elixir/writing-documentation.html)
-- [ExDoc -- hex package](https://hexdocs.pm/ex_doc/readme.html)
-- [ExUnit doctest -- docs](https://hexdocs.pm/ex_unit/ExUnit.DocTest.html)
-- [h/1 in IEx -- Kernel.SpecialForms](https://hexdocs.pm/iex/IEx.Helpers.html#h/1)
+- [ExDoc](https://hexdocs.pm/ex_doc/) — main docs, configuration options
+- [Writing documentation — the Elixir guide](https://hexdocs.pm/elixir/writing-documentation.html) — idioms for `@moduledoc`, `@doc`, `@typedoc`
+- [ExUnit.DocTest](https://hexdocs.pm/ex_unit/ExUnit.DocTest.html) — doctest mechanics and escape hatches
+- [Hex.pm — "Publishing docs"](https://hex.pm/docs/publish#publishing-docs) — how `mix hex.publish` uploads to hexdocs.pm

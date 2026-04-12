@@ -1,333 +1,264 @@
-# Mix Releases
+# `mix release` — a first self-contained release
 
-## Goal
+**Project**: `mini_release` — a tiny app packaged as a Mix release so you
+can inspect the resulting directory, run the `bin/mini_release` launcher,
+and understand what actually ships to production.
 
-Build a `task_queue` project as a Mix release -- a self-contained binary that runs without Elixir or Erlang installed on the target server. Learn how to configure releases in `mix.exs`, build them, operate them (start/stop/remote shell), and understand why `runtime.exs` is what makes releases configurable.
+**Difficulty**: ★★★☆☆
+**Estimated time**: 2–3 hours
 
 ---
 
-## What a release contains
+## Project context
+
+Your team has been deploying with `mix phx.server` on the target machine.
+It works until it doesn't: you're dragging `mix`, Hex, the full source,
+and the entire build toolchain into production. Releases fix this by
+bundling your compiled code, the Erlang runtime (ERTS), and every
+dependency into a single tarball you can copy and run — with zero build
+tools on the host.
+
+This exercise produces a minimal release and walks its directory so you
+can see the moving parts: the launcher, ERTS, the release payload, and
+the runtime config file.
+
+Project structure (source):
 
 ```
-_build/prod/rel/task_queue/
-├── bin/
-│   ├── task_queue          <- control script (start, stop, remote, eval, ...)
-│   └── task_queue.bat      <- Windows equivalent
-├── erts-15.x/              <- Erlang runtime -- no Erlang needed on target server
+mini_release/
+├── config/
+│   ├── config.exs
+│   └── runtime.exs
 ├── lib/
-│   ├── task_queue-0.1.0/   <- your compiled code
-│   ├── jason-1.4.4/        <- all dependencies included
-│   └── ...
-└── releases/
-    └── 0.1.0/
-        └── task_queue.rel  <- OTP release descriptor
+│   ├── mini_release.ex
+│   └── mini_release/
+│       └── application.ex
+├── test/
+│   └── mini_release_test.exs
+└── mix.exs
 ```
 
-The `erts/` inclusion means the same binary runs on any machine with the same OS and CPU architecture. No Elixir, no `mix`, nothing else required.
+Release output layout (after `mix release`):
+
+```
+_build/prod/rel/mini_release/
+├── bin/
+│   └── mini_release            # launcher script — start/stop/remote/eval/rpc
+├── erts-<ver>/                 # the Erlang runtime; no system Erlang required
+├── lib/                        # your app + deps, compiled
+│   └── mini_release-0.1.0/
+├── releases/
+│   └── 0.1.0/
+│       ├── env.sh              # shell env wiring
+│       ├── runtime.exs         # runtime config, read on every boot
+│       ├── sys.config          # compile-time config, baked in
+│       └── vm.args             # BEAM flags (node name, cookie, limits)
+└── ...
+```
 
 ---
 
-## Why `runtime.exs` is what makes releases configurable
+## Core concepts
 
-Without `runtime.exs`, configuration is frozen in the binary at compile time. Every environment change requires a recompile and redeploy. With `runtime.exs`, the same binary reads env vars fresh on each startup -- one build, multiple environments.
+### 1. `mix release` vs `mix run`
+
+`mix run` assumes Mix, deps as source, and the build toolchain exist on
+the host. `mix release` produces a **single directory** with ERTS, your
+compiled beams, your deps' compiled beams, and a launcher — no Mix, no
+source, no Hex. Copy the tree, run `bin/<app> start`, done.
+
+### 2. `releases/<ver>/` — the three config files
+
+| File           | Evaluated when     | Source                        |
+|----------------|--------------------|-------------------------------|
+| `sys.config`   | Compile / assembly | `config/config.exs` + env     |
+| `runtime.exs` | Every boot         | `config/runtime.exs`           |
+| `vm.args`      | Every boot         | release assembly defaults      |
+
+`sys.config` is a flat Erlang term file; `runtime.exs` is live Elixir
+code run before apps start. Together they define the boot environment.
+
+### 3. The launcher commands
 
 ```
-Build time: compile source + bake in config.exs/prod.exs values
-Start time: evaluate runtime.exs, read env vars, start the app
+bin/mini_release start     # boot in foreground
+bin/mini_release daemon    # boot detached
+bin/mini_release stop      # graceful stop
+bin/mini_release remote    # attach a remote IEx shell
+bin/mini_release eval "..." # run code in a short-lived node
+bin/mini_release rpc  "..." # run code in the live node
 ```
+
+`remote`, `eval`, and `rpc` are operations gold — covered in exercise 70.
+
+### 4. `:releases` in `mix.exs`
+
+A single `releases:` stanza declares the release name, applications
+included, and options like `include_executables_for:` (cross-platform
+launcher scripts).
 
 ---
 
 ## Implementation
 
-### Step 1: `mix.exs` -- add release configuration
+### Step 1: Create the project
+
+```bash
+mix new mini_release --sup
+cd mini_release
+mkdir -p config
+```
+
+### Step 2: `mix.exs`
 
 ```elixir
-defmodule TaskQueue.MixProject do
+defmodule MiniRelease.MixProject do
   use Mix.Project
 
   def project do
     [
-      app: :task_queue,
+      app: :mini_release,
       version: "0.1.0",
-      elixir: "~> 1.15",
+      elixir: "~> 1.17",
       start_permanent: Mix.env() == :prod,
-      deps: deps(),
+      deps: [],
       releases: releases()
-    ]
-  end
-
-  defp releases do
-    [
-      task_queue: [
-        include_executables_for: [:unix],
-        include_erts: true
-      ]
     ]
   end
 
   def application do
     [
       extra_applications: [:logger],
-      mod: {TaskQueue.Application, []}
+      mod: {MiniRelease.Application, []}
     ]
   end
 
-  defp deps do
+  # Release definition. `include_executables_for: [:unix]` skips Windows
+  # scripts; add `:windows` if you ship there. `applications:` is inferred
+  # automatically — listed here only when you want to override :permanent.
+  defp releases do
     [
-      {:jason, "~> 1.4"},
-      {:dialyxir, "~> 1.0", only: :dev, runtime: false},
-      {:ex_doc, "~> 0.31", only: :dev, runtime: false}
+      mini_release: [
+        include_executables_for: [:unix],
+        applications: [mini_release: :permanent]
+      ]
     ]
   end
 end
 ```
 
-The `releases/0` function configures the release: `include_executables_for: [:unix]` generates the shell control scripts, and `include_erts: true` bundles the Erlang runtime so the target machine does not need Erlang installed.
-
-### Step 2: Configuration files
+### Step 3: `config/config.exs` and `config/runtime.exs`
 
 ```elixir
 # config/config.exs
 import Config
 
-config :task_queue,
-  max_retries: 3,
-  worker_pool_size: 5,
-  webhook_url: nil
-
-config :logger, level: :info
-
-import_config "#{config_env()}.exs"
-```
-
-```elixir
-# config/dev.exs
-import Config
-
-config :task_queue,
-  worker_pool_size: 2,
-  webhook_url: "http://localhost:4000/webhook"
-
-config :logger, level: :debug
-```
-
-```elixir
-# config/test.exs
-import Config
-
-config :task_queue,
-  worker_pool_size: 1,
-  max_retries: 1,
-  webhook_url: nil
-
-config :logger, level: :warning
-```
-
-```elixir
-# config/prod.exs
-import Config
-
-config :logger, level: :info
+config :mini_release, greeting: "hello from sys.config"
 ```
 
 ```elixir
 # config/runtime.exs
 import Config
 
-if config_env() == :prod do
-  webhook_url =
-    System.get_env("WEBHOOK_URL") ||
-      raise """
-      environment variable WEBHOOK_URL is missing.
-      Set it to the URL that should receive job completion notifications.
-      """
-
-  worker_pool_size =
-    System.get_env("WORKER_POOL_SIZE", "5")
-    |> String.to_integer()
-
-  max_retries =
-    System.get_env("MAX_RETRIES", "3")
-    |> String.to_integer()
-
-  config :task_queue,
-    webhook_url: webhook_url,
-    worker_pool_size: worker_pool_size,
-    max_retries: max_retries
-end
+# Read at boot on the target machine. Defaults keep `mix` workflows happy.
+config :mini_release,
+  greeting: System.get_env("GREETING", "hello from runtime.exs")
 ```
 
-### Step 3: `lib/task_queue/application.ex` -- startup instrumentation
+### Step 4: `lib/mini_release/application.ex` and `lib/mini_release.ex`
 
 ```elixir
-defmodule TaskQueue.Application do
+defmodule MiniRelease.Application do
+  @moduledoc false
   use Application
+  require Logger
 
   @impl true
   def start(_type, _args) do
-    pool_size = Application.get_env(:task_queue, :worker_pool_size, 5)
-    :logger.info("TaskQueue starting: pool_size=#{pool_size}")
-
-    children = []
-    opts = [strategy: :one_for_one, name: TaskQueue.Supervisor]
-    Supervisor.start_link(children, opts)
+    Logger.info("mini_release booting; greeting=#{MiniRelease.greeting()}")
+    Supervisor.start_link([], strategy: :one_for_one, name: MiniRelease.Supervisor)
   end
 end
 ```
 
-### Step 4: `lib/task_queue/scheduler.ex` -- config reader
-
 ```elixir
-defmodule TaskQueue.Scheduler do
+defmodule MiniRelease do
   @moduledoc """
-  Dispatches jobs from the queue to available workers.
-  Reads configuration from the application environment at runtime.
+  Tiny public surface so we can exercise the release via `bin/mini_release eval`.
   """
 
-  @spec worker_pool_size() :: pos_integer()
-  def worker_pool_size do
-    Application.get_env(:task_queue, :worker_pool_size, 5)
-  end
+  @spec greeting() :: String.t()
+  def greeting, do: Application.fetch_env!(:mini_release, :greeting)
 
-  @spec max_retries() :: non_neg_integer()
-  def max_retries do
-    Application.get_env(:task_queue, :max_retries, 3)
-  end
-
-  @spec webhook_url() :: String.t() | nil
-  def webhook_url do
-    Application.get_env(:task_queue, :webhook_url, nil)
-  end
-
-  @spec config() :: map()
-  def config do
-    %{
-      worker_pool_size: worker_pool_size(),
-      max_retries: max_retries(),
-      webhook_url: webhook_url(),
-      log_level: Application.get_env(:logger, :level, :info)
-    }
-  end
+  @spec shout() :: String.t()
+  def shout, do: String.upcase(greeting())
 end
 ```
 
-### Step 5: Build and inspect the release
-
-```bash
-MIX_ENV=prod mix deps.get
-MIX_ENV=prod mix release
-
-ls _build/prod/rel/task_queue/
-ls _build/prod/rel/task_queue/bin/
-du -sh _build/prod/rel/task_queue/
-```
-
-### Step 6: Operate the release
-
-```bash
-RELEASE="./_build/prod/rel/task_queue/bin/task_queue"
-
-# Start in foreground -- logs to stdout, Ctrl+C to stop
-WEBHOOK_URL="https://hooks.example.com/notify" $RELEASE start
-
-# Start as background daemon
-WEBHOOK_URL="https://hooks.example.com/notify" $RELEASE daemon
-
-# Verify it's running
-$RELEASE pid
-
-# Evaluate an expression in the running node -- no interruption
-$RELEASE eval "IO.puts(TaskQueue.Scheduler.worker_pool_size())"
-
-# Stop the daemon
-$RELEASE stop
-```
-
-### Step 7: Remote shell -- live production debugging
-
-```bash
-# While the daemon is running:
-$RELEASE remote
-
-# Inside the remote shell -- you are connected to the live node
-Supervisor.which_children(TaskQueue.Supervisor)
-TaskQueue.Scheduler.config()
-
-# IMPORTANT: to exit WITHOUT killing the node:
-# Press Ctrl+C twice (disconnects the shell, node keeps running)
-# Do NOT call System.halt() -- that kills the running application
-```
-
-### Step 8: Tests
+### Step 5: `test/mini_release_test.exs`
 
 ```elixir
-# test/task_queue/release_config_test.exs
-defmodule TaskQueue.ReleaseConfigTest do
-  use ExUnit.Case, async: true
+defmodule MiniReleaseTest do
+  use ExUnit.Case, async: false
 
-  alias TaskQueue.Scheduler
-
-  test "application starts and exposes config" do
-    config = Scheduler.config()
-    assert is_integer(config.worker_pool_size)
-    assert is_integer(config.max_retries)
-    assert config.worker_pool_size >= 1
+  test "greeting has a runtime default" do
+    assert MiniRelease.greeting() =~ "hello"
   end
 
-  test "worker_pool_size is 1 in test environment (from test.exs)" do
-    assert Scheduler.worker_pool_size() == 1
-  end
-
-  test "webhook_url is nil in test environment" do
-    assert Scheduler.webhook_url() == nil
+  test "shout/0 uppercases the greeting" do
+    assert MiniRelease.shout() == String.upcase(MiniRelease.greeting())
   end
 end
 ```
 
+### Step 6: Build and run the release
+
 ```bash
-mix test test/task_queue/release_config_test.exs --trace
+MIX_ENV=prod mix release
+
+# Inspect the layout
+ls _build/prod/rel/mini_release
+
+# Run it in the foreground (Ctrl+C twice to stop)
+GREETING="hello production" _build/prod/rel/mini_release/bin/mini_release start
+
+# Or run a one-off expression against the compiled release
+_build/prod/rel/mini_release/bin/mini_release eval "IO.puts MiniRelease.shout()"
 ```
 
 ---
 
-## Trade-off analysis
+## Trade-offs and production gotchas
 
-| Aspect | Source deployment | Mix release |
-|--------|-------------------|-------------|
-| Requires Elixir on server | yes | no |
-| Build artifact size | source files only | ~25-40 MB with ERTS |
-| Configuration | `mix run` reads config files | `runtime.exs` reads env vars |
-| Remote debugging | `iex -S mix` | `bin/app remote` |
-| Hot code upgrades | manual | `bin/app upgrade` (advanced) |
-| CI reproducibility | depends on Elixir version on server | self-contained |
+**1. ERTS is platform-specific**
+A release built on macOS won't run on Linux. Always build on (or for) the
+deployment target — typically a Linux container matching your base image.
+For cross-OS dev, see `include_erts: false` to reuse the host Erlang.
 
-`start_permanent: Mix.env() == :prod` causes the Erlang VM to exit if the top-level supervisor crashes. In production, a crashed top-level supervisor means the application is broken beyond recovery -- exiting lets the orchestrator (systemd, Docker, Kubernetes) restart from a clean state. In development, you want the VM to stay alive after a crash so you can inspect the error in IEx.
+**2. `MIX_ENV=prod` matters**
+Releases default to `prod`. If you build in `dev`, you'll ship unoptimized
+beams and pull in dev-only deps. Always set `MIX_ENV=prod` explicitly in CI.
 
----
+**3. Secrets do not belong in `sys.config`**
+Anything in `config.exs` ends up in plaintext inside the release tarball.
+Secrets belong in env vars read by `runtime.exs` — or in a config provider
+(see exercise 68).
 
-## Common production mistakes
+**4. `start_permanent: true` means the node halts if your app stops**
+In prod, that's what you want — a crashed top supervisor should bring the
+node down so the orchestrator restarts it. In dev/test you'd rather stay
+alive, which is why the flag is gated on `Mix.env()`.
 
-**1. Building the release without `MIX_ENV=prod`**
-Dev dependencies are included, dev config is baked in, and `start_permanent` is `false`.
-
-**2. `System.halt()` in the remote shell**
-This kills the Erlang VM and terminates your production application. To disconnect, press Ctrl+C twice.
-
-**3. Assuming code changes take effect without a rebuild**
-A release is a compiled binary. Editing `lib/` has no effect until you run `mix release` again.
-
-**4. Not setting `WEBHOOK_URL` before starting in prod**
-With `runtime.exs` configured to raise on missing vars, the application will refuse to start. This is intentional.
-
-**5. Not testing `runtime.exs` validation locally**
-Run `MIX_ENV=prod mix run --no-halt` without the env vars. You should see the `raise` message immediately.
+**5. When NOT to use `mix release`**
+Pure libraries never ship as releases — they ship to Hex. Scripts you run
+on your dev machine are fine with `mix run`. Releases are for deployed
+services.
 
 ---
 
 ## Resources
 
-- [Mix.Tasks.Release -- official docs](https://hexdocs.pm/mix/Mix.Tasks.Release.html)
-- [Releases guide -- Elixir official](https://elixir-lang.org/getting-started/mix-otp/config-and-releases.html)
-- [Deploying with Releases -- Phoenix guide](https://hexdocs.pm/phoenix/releases.html)
-- [Runtime Configuration -- Config module](https://hexdocs.pm/elixir/Config.html)
+- [`mix release` task](https://hexdocs.pm/mix/Mix.Tasks.Release.html)
+- [`Mix.Release` module](https://hexdocs.pm/mix/Mix.Release.html)
+- [Config and releases guide](https://hexdocs.pm/elixir/config-and-releases.html)
+- [Why releases? — Dashbit blog](https://dashbit.co/blog/mix-releases-is-here)

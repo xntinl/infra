@@ -1,255 +1,284 @@
-# Macros: Compile-Time Code Generation
+# Macros and quote/unquote — the AST in your hands
 
-## Why macros exist — and the cost
+**Project**: `macro_basics` — a handful of tiny macros that show how Elixir code becomes data, how `quote` captures it, and how `unquote` splices runtime values back in.
 
-Macros let you extend Elixir syntax at compile time. Every `defmodule`, `def`, `use`,
-`import`, and `require` is itself a macro.
-
-The cost: macros are harder to debug. A wrong `unquote` produces non-obvious compilation
-errors. Stack traces point to generated code, not the macro definition.
-
-**Rule of thumb**: write a function first. Reach for a macro only when:
-1. You need to inject code into the **caller's module** (new function definitions).
-2. You need access to the caller's **AST**.
-3. You need something that cannot be expressed as a function.
+**Difficulty**: ★★★☆☆
+**Estimated time**: 2–3 hours
 
 ---
 
-## The business problem
+## Project context
 
-Build a `TaskQueue.Defhandler` macro module used inside handler modules to:
+Before you can write a useful macro you need a very concrete mental model of
+what a macro *is*: a function that runs at compile time, takes **AST** as
+input, and returns **AST** as output. The compiler then splices that AST back
+into the caller's code.
 
-1. `defhandler/2` — defines a `handle_job/1` function with automatic error wrapping,
-   logging, and duration tracking. The user only writes the business logic.
-2. `defjob_type/1` — defines a `supported?/1` function that returns true for a list of
-   job type atoms.
+In this exercise you'll poke at the AST directly with `quote/2`, splice values
+back in with `unquote/1`, and write your first `defmacro` that does something
+you couldn't do with a regular function: inspect the *code* its caller wrote,
+not the value that code evaluates to.
 
-All modules are defined completely in this exercise.
+You'll also meet **hygiene** for the first time: why a variable you bind
+inside a quoted block doesn't leak into the caller, and why that's a feature,
+not a bug.
 
----
-
-## Project setup
+Project structure:
 
 ```
-task_queue/
+macro_basics/
 ├── lib/
-│   └── task_queue/
-│       └── defhandler.ex
+│   └── macro_basics.ex
 ├── test/
-│   └── task_queue/
-│       └── macros_test.exs
+│   └── macro_basics_test.exs
 └── mix.exs
 ```
 
 ---
 
+## Core concepts
+
+### 1. Elixir code is a tree of tuples
+
+Every Elixir expression has an AST representation: a 3-tuple
+`{name, metadata, args}` for calls, or a literal for atoms, numbers, and
+binaries. `quote do ... end` returns that tree *without* evaluating it:
+
+```
+quote do: 1 + 2
+#=> {:+, [context: Elixir, import: Kernel], [1, 2]}
+```
+
+A macro is just a function `AST -> AST`. `defmacro` wires it into the
+compiler so the returned AST is spliced at the call site.
+
+### 2. `unquote/1` injects a value into quoted code
+
+Inside a `quote` block, `unquote(expr)` evaluates `expr` *now* (at macro
+expansion time) and splices the result into the AST. Without it, the name
+would be a literal reference, not a substitution:
+
+```
+value = 42
+quote do: x = unquote(value)   # => x = 42 in the AST
+quote do: x = value            # => x = value — references a *variable* named value
+```
+
+### 3. `defmacro` vs `def`
+
+A `def` receives **values**. A `defmacro` receives **AST**. That's the whole
+difference. Everything else (pattern matching, guards, clauses) works the
+same, but the arguments are trees, not runtime data.
+
+```elixir
+defmacro my_macro(expr) do
+  # expr is AST, e.g. {:+, _, [1, 2]} — not the number 3
+  quote do: IO.inspect(unquote(expr))
+end
+```
+
+### 4. Hygiene, in one sentence
+
+Variables introduced inside `quote` live in the macro's scope, not the
+caller's. That prevents accidental capture and makes macros composable. You
+*can* break hygiene with `var!/2` when you really need to — but you almost
+never should. See exercise 94 for the pitfalls.
+
+---
+
 ## Implementation
 
-### `lib/task_queue/defhandler.ex`
-
-```elixir
-defmodule TaskQueue.Defhandler do
-  @moduledoc """
-  Macros for defining job handlers with built-in observability.
-
-  Usage in a handler module:
-      defmodule MyHandler do
-        use TaskQueue.Defhandler
-
-        defhandler :my_job, job do
-          {:ok, process(job.payload)}
-        end
-
-        defjob_type [:my_job, :related_job]
-      end
-  """
-
-  defmacro __using__(_opts) do
-    quote do
-      import TaskQueue.Defhandler, only: [defhandler: 2, defjob_type: 1]
-      require Logger
-    end
-  end
-
-  @doc """
-  Defines a `handle_job/1` function that wraps the body with:
-  - Duration tracking (start/end monotonic time)
-  - Error capture (exceptions become {:error, exception} return values)
-  - Logging (handler name, job_id, duration_ms, outcome)
-  """
-  defmacro defhandler(handler_name, job_var, do: body) do
-    quote do
-      def handle_job(%{type: unquote(handler_name)} = unquote(job_var)) do
-        start_ms = System.monotonic_time(:millisecond)
-
-        result =
-          try do
-            unquote(body)
-          rescue
-            e -> {:error, e}
-          end
-
-        duration_ms = System.monotonic_time(:millisecond) - start_ms
-
-        case result do
-          {:ok, _} ->
-            Logger.debug(
-              "handler=#{unquote(handler_name)} job_id=#{unquote(job_var).id} " <>
-              "status=ok duration_ms=#{duration_ms}"
-            )
-
-          {:error, reason} ->
-            Logger.warning(
-              "handler=#{unquote(handler_name)} job_id=#{unquote(job_var).id} " <>
-              "status=error reason=#{inspect(reason)} duration_ms=#{duration_ms}"
-            )
-        end
-
-        result
-      end
-    end
-  end
-
-  @doc """
-  Defines a `supported?/1` function that returns true if the given job type
-  is in the provided list.
-  """
-  defmacro defjob_type(types) do
-    evaluated_types = Macro.expand(types, __CALLER__)
-
-    clauses =
-      Enum.map(evaluated_types, fn type ->
-        quote do
-          def supported?(unquote(type)), do: true
-        end
-      end)
-
-    catch_all =
-      quote do
-        def supported?(_), do: false
-      end
-
-    {:__block__, [], clauses ++ [catch_all]}
-  end
-end
-```
-
-When the caller writes `defhandler :webhook, job do ... end`, the macro expands to a full
-function definition that records start time, wraps the body in `try/rescue`, calculates
-duration, logs the outcome, and returns the result.
-
-The `defjob_type/1` macro generates one `def supported?(type), do: true` clause per type,
-plus a catch-all `def supported?(_), do: false`.
-
-### Tests
-
-```elixir
-# test/task_queue/macros_test.exs
-defmodule TaskQueue.MacrosTest do
-  use ExUnit.Case, async: true
-
-  defmodule TestHandler do
-    use TaskQueue.Defhandler
-
-    defhandler :test_job, job do
-      if job.payload == :fail do
-        raise "intentional failure"
-      end
-
-      {:ok, "processed: #{inspect(job.payload)}"}
-    end
-
-    defhandler :another_job, job do
-      {:ok, job.payload * 2}
-    end
-
-    defjob_type [:test_job, :another_job]
-  end
-
-  describe "defhandler/2" do
-    test "generates handle_job/1 that returns {:ok, result} for successful execution" do
-      job = %{id: "j1", type: :test_job, payload: :hello}
-      assert {:ok, "processed: :hello"} = TestHandler.handle_job(job)
-    end
-
-    test "wraps exceptions into {:error, exception}" do
-      job = %{id: "j2", type: :test_job, payload: :fail}
-      assert {:error, %RuntimeError{}} = TestHandler.handle_job(job)
-    end
-
-    test "dispatches to the correct clause based on job type" do
-      job = %{id: "j3", type: :another_job, payload: 21}
-      assert {:ok, 42} = TestHandler.handle_job(job)
-    end
-
-    test "raises FunctionClauseError for unsupported job type" do
-      job = %{id: "j4", type: :unknown_type, payload: :x}
-
-      assert_raise FunctionClauseError, fn ->
-        TestHandler.handle_job(job)
-      end
-    end
-  end
-
-  describe "defjob_type/1" do
-    test "supported? returns true for declared types" do
-      assert TestHandler.supported?(:test_job)
-      assert TestHandler.supported?(:another_job)
-    end
-
-    test "supported? returns false for unknown types" do
-      refute TestHandler.supported?(:cron)
-      refute TestHandler.supported?(:webhook)
-      refute TestHandler.supported?(:nonexistent)
-    end
-  end
-
-  describe "Macro expansion inspection" do
-    test "handle_job/1 is a real function in the module" do
-      assert function_exported?(TestHandler, :handle_job, 1)
-    end
-
-    test "supported?/1 is a real function in the module" do
-      assert function_exported?(TestHandler, :supported?, 1)
-    end
-  end
-end
-```
-
-### Run the tests
+### Step 1: Create the project
 
 ```bash
-mix test test/task_queue/macros_test.exs --trace
+mix new macro_basics
+cd macro_basics
+```
+
+### Step 2: `lib/macro_basics.ex`
+
+```elixir
+defmodule MacroBasics do
+  @moduledoc """
+  A small tour of quote/unquote and defmacro.
+
+  The macros here are deliberately trivial — the point is to see the AST
+  transformation, not to build anything production-worthy.
+  """
+
+  @doc """
+  Returns the AST of an expression without evaluating it.
+
+  This is a macro because it needs the *unevaluated* form of its argument —
+  a regular function would receive the already-computed value.
+  """
+  defmacro ast_of(expr) do
+    # `expr` is already AST here. We quote it *inside another quote* so that
+    # at the call site we get back a literal representation of that AST.
+    quoted = Macro.escape(expr)
+    quote do: unquote(quoted)
+  end
+
+  @doc """
+  Logs the source form of an expression alongside its value.
+
+  Example:
+
+      iex> MacroBasics.debug(1 + 2 * 3)
+      [debug] 1 + 2 * 3 = 7
+      7
+  """
+  defmacro debug(expr) do
+    # Macro.to_string turns AST back into source — very useful for error
+    # messages and logging macros. Notice we use it at *expansion time*,
+    # so the string is baked into the compiled output.
+    source = Macro.to_string(expr)
+
+    quote do
+      value = unquote(expr)
+      IO.puts("[debug] " <> unquote(source) <> " = " <> inspect(value))
+      value
+    end
+  end
+
+  @doc """
+  `times(n, do: block)` — run `block` `n` times.
+
+  Demonstrates a macro that wraps a block (`do: ...`) and splices it into
+  a generated loop. Because the block is AST, it is *re-evaluated* on every
+  iteration — exactly what you'd expect from a language construct.
+  """
+  defmacro times(n, do: block) do
+    quote do
+      Enum.each(1..unquote(n), fn _ -> unquote(block) end)
+    end
+  end
+
+  @doc """
+  Defines a constant function at compile time.
+
+  `defconst greeting, "hello"` expands into `def greeting, do: "hello"`.
+  A first taste of code-generating macros.
+  """
+  defmacro defconst(name, value) do
+    quote do
+      def unquote(name)(), do: unquote(value)
+    end
+  end
+end
+```
+
+### Step 3: `test/macro_basics_test.exs`
+
+```elixir
+defmodule MacroBasicsTest do
+  use ExUnit.Case, async: true
+  import ExUnit.CaptureIO
+  require MacroBasics
+
+  describe "ast_of/1" do
+    test "returns AST, not the value" do
+      ast = MacroBasics.ast_of(1 + 2)
+      assert match?({:+, _, [1, 2]}, ast)
+    end
+  end
+
+  describe "debug/1" do
+    test "prints the source and returns the value" do
+      output =
+        capture_io(fn ->
+          assert MacroBasics.debug(1 + 2 * 3) == 7
+        end)
+
+      assert output =~ "1 + 2 * 3"
+      assert output =~ "= 7"
+    end
+  end
+
+  describe "times/2" do
+    test "runs the block n times" do
+      {:ok, agent} = Agent.start_link(fn -> 0 end)
+
+      MacroBasics.times(5, do: Agent.update(agent, &(&1 + 1)))
+
+      assert Agent.get(agent, & &1) == 5
+    end
+  end
+
+  describe "defconst/2" do
+    # Use a throwaway module to exercise code generation.
+    defmodule Consts do
+      require MacroBasics
+      MacroBasics.defconst(:pi, 3.14159)
+      MacroBasics.defconst(:answer, 42)
+    end
+
+    test "generates compile-time constants" do
+      assert Consts.pi() == 3.14159
+      assert Consts.answer() == 42
+    end
+  end
+end
+```
+
+### Step 4: Run
+
+```bash
+mix test
+```
+
+Play with it in IEx to build intuition:
+
+```
+iex> quote do: 1 + 2
+iex> quote do: if true, do: :yes, else: :no
+iex> Macro.to_string(quote do: Enum.map([1,2,3], &(&1 * 2)))
 ```
 
 ---
 
-## Common production mistakes
+## Trade-offs and production gotchas
 
-**1. Using a macro when a function works**
-If you can pass the value as an argument, use a function. Macros are only necessary when
-you need to manipulate the caller's AST or inject into the caller's module.
+**1. Macros complicate stack traces and debuggers**
+When a macro expands, the resulting code appears to come from the caller's
+line, but errors may reference the macro's internals. Tooling (ElixirLS,
+error messages) handles this well, but junior readers get lost fast. Write
+a function unless the macro earns its keep.
 
-**2. Forgetting `quote` hygiene**
-Variables bound inside `quote do` are hygienic — they do not leak into the caller's scope.
-Use `var!(name)` explicitly if needed.
+**2. `require` is mandatory to call a macro**
+`defmacro` is not callable without `require Module` first (or `import`).
+This is because macros run at compile time and the compiler needs to know
+to load the module early. Forgetting `require` yields a confusing
+"undefined function" error.
 
-**3. `IO.puts` inside a macro runs at compile time**
-```elixir
-defmacro log_and_call(expr) do
-  IO.puts("Expanding macro")  # Prints during mix compile
-  quote do: unquote(expr)
-end
-```
+**3. Do everything you can at runtime in a function; use macros for code shape**
+Rule of thumb: if the same thing could be done by a function, it should be.
+Macros are for things functions *cannot* do: inspecting source code, generating
+new function heads, compile-time assertions, DSL syntax.
 
-**4. Calling macros before `require`**
-Macros are compile-time constructs. You must `require` the module before using its macros.
+**4. `Macro.escape/1` is needed for non-AST values inside `quote`**
+If you want to splice a complex term (a map, a struct, a tuple that happens
+to look like AST) into a quote, wrap it in `Macro.escape/1`. Otherwise the
+compiler tries to interpret its shape as code and usually crashes.
+
+**5. Quoted code is a contract with your caller**
+Every identifier you leak, every import you assume, every variable you
+capture is part of the public surface of the macro. Treat macro output like
+a public API — small, well-documented, hygienic by default.
+
+**6. When NOT to use a macro**
+Skip the macro when a higher-order function, protocol, or behaviour would
+do the job. Libraries like Ecto and Phoenix use macros heavily, but they do
+so because they need to generate functions at compile time from user
+declarations — a job functions can't do. If your use case is "pass some
+logic around," use a function or a fun.
 
 ---
 
 ## Resources
 
-- [Macros — Elixir Getting Started](https://elixir-lang.org/getting-started/meta/macros.html)
-- [Kernel.SpecialForms — HexDocs](https://hexdocs.pm/elixir/Kernel.SpecialForms.html)
-- [Macro — HexDocs](https://hexdocs.pm/elixir/Macro.html)
-- [Metaprogramming Elixir — Chris McCord](https://pragprog.com/titles/cmelixir/metaprogramming-elixir/)
+- [`Kernel.SpecialForms.quote/2`](https://hexdocs.pm/elixir/Kernel.SpecialForms.html#quote/2) — the compiler primitive, exhaustively documented
+- [`Macro` — stdlib helpers](https://hexdocs.pm/elixir/Macro.html) — `to_string/1`, `escape/1`, `expand/2`, `prewalk/2`
+- ["Metaprogramming Elixir" — Chris McCord](https://pragprog.com/titles/cmelixir/metaprogramming-elixir/) — the canonical book; chapters 1–3 cover this exercise
+- ["Macros" — Elixir guide](https://hexdocs.pm/elixir/macros.html) — the official conceptual intro
+- [Sasa Juric — "Understanding Elixir macros"](https://www.theerlangelist.com/article/macros_1) — a six-part series, start here
