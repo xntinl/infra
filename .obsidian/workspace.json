@@ -206,6 +206,7 @@
   },
   "active": "cda3cf7535287934",
   "lastOpenFiles": [
+    "challenges/elixir/02-intermedio/integrations-basics/132-telemetry-span/132-telemetry-span.md",
     "challenges/elixir/02-intermedio/tooling-and-ecosystem/124-observer-inspection/124-observer-inspection.md",
     "challenges/elixir/02-intermedio/integrations-basics/131-telemetry-metrics-prom/131-telemetry-metrics-prom.md",
     "challenges/elixir/02-intermedio/tooling-and-ecosystem/123-iex-helpers/123-iex-helpers.md",
@@ -232,7 +233,6 @@
     "challenges/elixir/02-intermedio/protocols-and-behaviours/76-behaviour-adapter/76-behaviour-adapter.md",
     "challenges/elixir/02-intermedio/supervision-basics/64-transient-temporary-permanent/64-transient-temporary-permanent.md",
     "challenges/elixir/02-intermedio/streams-and-lazy/105-stream-chunk-every/105-stream-chunk-every.md",
-    "challenges/elixir/02-intermedio/testing-and-quality/119-coverage-ci/119-coverage-ci.md",
     "challenges/elixir/02-intermedio/integrations-basics/139-broadway-rabbit-basic",
     "challenges/elixir/02-intermedio/macros-intro/94-macro-hygiene-pitfalls",
     "challenges/elixir/02-intermedio/integrations-basics/138-csv-streaming",
