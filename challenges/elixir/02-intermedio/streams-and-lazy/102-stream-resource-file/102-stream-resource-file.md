@@ -3,9 +3,6 @@
 **Project**: `stream_resource_file` — process a multi-gigabyte CSV-like file
 line by line using `Stream.resource/3` for precise control over open/read/close.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
-
 ---
 
 ## Project context
@@ -73,6 +70,20 @@ To *write* a file from a stream, pipe into `Stream.into(File.stream!(path))`
 or `Enum.into(File.stream!(path, [:write]))`. `Stream.resource/3` models
 the *source*; for sinks, use `Collectable` via `File.stream!/1` in write
 mode.
+
+---
+
+## Design decisions
+
+**Option A — `File.stream!/1` for everything**
+- Pros: one-line API; stdlib; sufficient for line-by-line reads with default framing.
+- Cons: reopens/closes the file on every enumeration; no place to hold auxiliary state; limited control over read mode and cleanup hooks.
+
+**Option B — Hand-rolled `Stream.resource/3`** (chosen)
+- Pros: guaranteed `after_fun` cleanup even on crash; one open handle across the whole enumeration; room for auxiliary state (parser, counters, cursor).
+- Cons: more code; must own error handling; harder to get right on first try.
+
+→ Chose **B** because the exercise is precisely about the primitive behind `File.stream!`, and production pipelines frequently outgrow the default wrapper.
 
 ---
 
@@ -203,6 +214,26 @@ end
 mix test
 ```
 
+### Why this works
+
+`Stream.resource/3` guarantees that `after_fun` runs exactly once — on natural halt, early `Enum.take`, or exception — so the file descriptor is always closed. `next_fun` is invoked one line at a time, so peak memory is O(one line) regardless of file size. `:halt` signals end-of-stream, and `Enum.count/1` just increments a counter without retaining lines.
+
+---
+
+## Benchmark
+
+```elixir
+# Generate a 100 MB test file
+path = "/tmp/bench.txt"
+File.write!(path, Enum.map_join(1..2_000_000, "\n", &"line-#{&1}"))
+
+{t1, _} = :timer.tc(fn -> StreamResourceFile.count_lines(path) end)
+{t2, _} = :timer.tc(fn -> File.read!(path) |> String.split("\n") |> length() end)
+IO.puts("stream=#{div(t1, 1000)}ms  eager=#{div(t2, 1000)}ms")
+```
+
+Target esperado: streaming counts a 100 MB file in <500 ms with ~constant RAM; eager approach uses >200 MB RAM and is 20-50 % slower due to binary → list conversion.
+
 ---
 
 ## Trade-offs and production gotchas
@@ -243,6 +274,13 @@ consider `File.open/2` with `:delayed_write` for better throughput.
   explicit GenServer holding the port is clearer than a stream.
 - For tiny files (`< 1 MB`) the setup cost of laziness is not worth it —
   `File.read!/1 |> String.split("\n")` is simpler and faster.
+
+---
+
+## Reflection
+
+- Your `next_fun` needs to track both the file handle and a CSV parser state (header row, column types). How do you structure the accumulator without reopening the file? Compare with wrapping the whole thing in a GenServer.
+- If the process holding the stream crashes mid-read, is the file descriptor leaked? How would you prove it under load?
 
 ---
 

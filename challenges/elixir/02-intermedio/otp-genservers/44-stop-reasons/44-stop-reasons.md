@@ -2,9 +2,6 @@
 
 **Project**: `stop_reasons_gs` — a GenServer that stops with different reasons, observed under supervision.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
-
 ---
 
 ## Project context
@@ -39,6 +36,12 @@ stop_reasons_gs/
 ```
 
 ---
+
+
+## Why X and not Y
+
+- **Why not always `:normal`?** It silences real failures in SASL logs and disables restart policies.
+- **Why not `raise`?** Raising inside a callback becomes `:normal` → `:shutdown` tagging in the supervisor — explicit reasons are clearer.
 
 ## Core concepts
 
@@ -83,7 +86,31 @@ all paths, but flush a commit only if the reason is not `:shutdown`
 
 ---
 
+## Design decisions
+
+**Option A — always `:normal` to avoid noisy logs**
+- Pros: simpler upfront, fewer moving parts.
+- Cons: hides the trade-off that this exercise exists to teach.
+
+**Option B — use semantic reasons (`:normal`, `:shutdown`, `{:shutdown, term}`, custom) (chosen)**
+- Pros: explicit about the semantic that matters in production.
+- Cons: one more concept to internalize.
+
+→ Chose **B** because reason drives supervisor restart policy and SASL logs — silencing it hides real failures.
+
+
 ## Implementation
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defp deps do
+  [
+    # stdlib-only by default; add `{:benchee, "~> 1.3", only: :dev}` if you benchmark
+  ]
+end
+```
+
 
 ### Step 1: Create the project
 
@@ -274,6 +301,15 @@ mix test
 
 ---
 
+### Why this works
+
+The design leans on OTP primitives that already encode the invariants we care about (supervision, back-pressure, explicit message semantics), so failure modes are visible at the right layer instead of being reinvented ad-hoc. Tests exercise the edges (timeouts, crashes, boundary states), which is where hand-rolled alternatives silently drift over time.
+
+
+## Benchmark
+
+<!-- benchmark N/A: tema conceptual -->
+
 ## Trade-offs and production gotchas
 
 **1. `:normal` vs. `:shutdown` — a subtle convention**
@@ -313,6 +349,11 @@ bad input means every bad input restarts the process — a trivial DOS.
 Reserve `{:stop, ...}` for "this process cannot continue".
 
 ---
+
+
+## Reflection
+
+- Diseñá una taxonomía de `stop reasons` para un sistema de pagos. Cuáles son `:normal`, cuáles `:shutdown`, cuáles fallan ruidoso.
 
 ## Resources
 

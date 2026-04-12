@@ -2,9 +2,6 @@
 
 **Project**: `ttl_cache_agent` — a key/value cache where every entry expires, plus a sweeper to reap the dead.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
-
 ---
 
 ## Project context
@@ -36,6 +33,11 @@ ttl_cache_agent/
 ```
 
 ---
+
+
+## Why X and not Y
+
+- **Why not a lower-level alternative?** For agent ttl cache, OTP's pattern is what reviewers will expect and what observability tools support out of the box.
 
 ## Core concepts
 
@@ -91,7 +93,31 @@ read or write can see a half-purged state.
 
 ---
 
+## Design decisions
+
+**Option A — lazy TTL checked on read**
+- Pros: simpler upfront, fewer moving parts.
+- Cons: hides the trade-off that this exercise exists to teach.
+
+**Option B — periodic sweeper that evicts expired entries (chosen)**
+- Pros: explicit about the semantic that matters in production.
+- Cons: one more concept to internalize.
+
+→ Chose **B** because eager eviction bounds memory; lazy TTL leaves zombies when reads stop.
+
+
 ## Implementation
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defp deps do
+  [
+    # stdlib-only by default; add `{:benchee, "~> 1.3", only: :dev}` if you benchmark
+  ]
+end
+```
+
 
 ### Step 1: Create the project
 
@@ -305,6 +331,19 @@ mix test
 
 ---
 
+### Why this works
+
+The design leans on OTP primitives that already encode the invariants we care about (supervision, back-pressure, explicit message semantics), so failure modes are visible at the right layer instead of being reinvented ad-hoc. Tests exercise the edges (timeouts, crashes, boundary states), which is where hand-rolled alternatives silently drift over time.
+
+
+## Benchmark
+
+```elixir
+# Medí get/put bajo carga con TTL activo
+```
+
+Target esperado: >100k ops/s, sweeper no toma más de 10 ms por tick con 100k entries.
+
 ## Trade-offs and production gotchas
 
 **1. `Agent` is single-threaded — sweep blocks reads and writes**
@@ -342,6 +381,11 @@ means your TTL is too short or your keys are too sparse.
   only by age, not by usage. `cachex` supports both.
 
 ---
+
+
+## Reflection
+
+- ¿Cómo testeás que el sweeper corre y evicta sin hacer `Process.sleep` en los tests?
 
 ## Resources
 

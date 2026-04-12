@@ -2,9 +2,6 @@
 
 **Project**: `validated_state_gs` — a GenServer that enforces domain invariants on every state transition, fail-fast.
 
-**Difficulty**: ★★☆☆☆
-**Estimated time**: 1–2 hours
-
 ---
 
 ## Project context
@@ -42,6 +39,11 @@ validated_state_gs/
 ```
 
 ---
+
+
+## Why X and not Y
+
+- **Why not a lower-level alternative?** For state validation, OTP's pattern is what reviewers will expect and what observability tools support out of the box.
 
 ## Core concepts
 
@@ -83,7 +85,31 @@ state directly. One source of truth for "what makes this struct valid".
 
 ---
 
+## Design decisions
+
+**Option A — trust callers, no invariant checks**
+- Pros: simpler upfront, fewer moving parts.
+- Cons: hides the trade-off that this exercise exists to teach.
+
+**Option B — validate state transitions in every callback (chosen)**
+- Pros: explicit about the semantic that matters in production.
+- Cons: one more concept to internalize.
+
+→ Chose **B** because fail-fast on invalid transitions beats silent corruption that surfaces hours later.
+
+
 ## Implementation
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defp deps do
+  [
+    # stdlib-only by default; add `{:benchee, "~> 1.3", only: :dev}` if you benchmark
+  ]
+end
+```
+
 
 ### Step 1: Create the project
 
@@ -279,6 +305,15 @@ mix test
 
 ---
 
+### Why this works
+
+The design leans on OTP primitives that already encode the invariants we care about (supervision, back-pressure, explicit message semantics), so failure modes are visible at the right layer instead of being reinvented ad-hoc. Tests exercise the edges (timeouts, crashes, boundary states), which is where hand-rolled alternatives silently drift over time.
+
+
+## Benchmark
+
+<!-- benchmark N/A: tema conceptual -->
+
 ## Trade-offs and production gotchas
 
 **1. Validation is a boundary concern, not a per-field concern**
@@ -317,6 +352,11 @@ overhead is noise. Use it when your state has business meaning and
 subtle invariants that would cause a production incident if violated.
 
 ---
+
+
+## Reflection
+
+- Si agregás validación en cada transición y el cost pasa de 1µs a 10µs por call, ¿vale? Definí en qué cargas sí y en cuáles no.
 
 ## Resources
 

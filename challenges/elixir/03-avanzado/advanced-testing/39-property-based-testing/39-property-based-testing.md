@@ -1,59 +1,151 @@
 # Property-Based Testing with StreamData
 
-**Project**: `api_gateway` — a standalone HTTP gateway exercise
+**Project**: `property_testing` — a currency conversion library with invariants.
+**Difficulty**: ★★★★☆
+**Estimated time**: 3–5 hours
 
 ---
 
 ## Project context
 
-You are building `api_gateway`, an HTTP gateway that routes traffic to microservices. The
-gateway has two modules with non-trivial pure logic: a binary parser for HTTP request lines
-and a topic matcher for the event bus. Both are good candidates for property-based testing:
-the parser must produce consistent results for all valid inputs, and the topic matcher has
-rules that hold for all possible topic strings.
+Your team owns `money_calc`, an internal library for multi-currency invoice computations.
+It's used across 12 services and three bugs slipped through unit tests last quarter, all
+of the form "developer forgot an edge case": negative amounts, near-zero conversion rates,
+rounding boundaries, and currency pairs with different decimal precisions (JPY has 0 decimals,
+USD has 2, BHD has 3).
+
+Example-based tests catch what you can imagine. Property-based tests catch what you didn't.
+Instead of asserting on a handful of handpicked values, you declare **properties** that must
+hold for all valid inputs — commutativity, monotonicity, inverse, identity — and let
+[StreamData](https://hexdocs.pm/stream_data) generate thousands of cases per property, shrink
+failures to minimal counterexamples, and regress on the same seed.
+
+This exercise introduces StreamData generators, `check all`, shrinking, `StreamData.bind/2`,
+and the stateful state-machine testing variant. The domain is intentionally small so the
+focus stays on property design.
 
 Project structure:
 
 ```
-api_gateway/
+property_testing/
 ├── lib/
-│   └── api_gateway/
-│       ├── middleware/
-│       │   └── parser.ex            # HTTP request line parser (defined below)
-│       └── event_bus/
-│           └── topic_matcher.ex     # wildcard topic matcher (defined below)
+│   └── money_calc/
+│       ├── money.ex              # value type {amount, currency}
+│       ├── converter.ex          # conversion logic with rates
+│       └── invoice.ex            # sums, discounts, tax
 ├── test/
-│   └── api_gateway/
-│       ├── middleware/
-│       │   └── parser_properties_test.exs   # given tests
-│       └── event_bus/
-│           └── topic_matcher_properties_test.exs
+│   ├── generators.ex             # shared generators (in test/support)
+│   ├── money_calc/
+│   │   ├── money_test.exs
+│   │   ├── converter_property_test.exs
+│   │   └── invoice_property_test.exs
+│   └── test_helper.exs
 └── mix.exs
 ```
 
 ---
 
-## The business problem
+## Core concepts
 
-Unit tests check specific examples. Properties check invariants:
+### 1. Properties instead of examples
 
-- **Parser roundtrip**: for any valid HTTP request line, `parse(serialize(request)) == request`
-- **Topic matcher completeness**: for any topic `"a.b.c"`, the pattern `"a.*.*"` matches it
-- **Token bucket monotonicity**: after N allowed requests, the N+1th is denied (for any N <= capacity)
+An example-based test asserts on specific inputs:
 
-These invariants are hard to verify exhaustively with hand-written examples. StreamData
-generates hundreds of cases and shrinks failures to their minimal reproducing input.
+```elixir
+assert Money.add(Money.new(100, :usd), Money.new(50, :usd)) == Money.new(150, :usd)
+```
 
----
+A property asserts a general truth:
 
-## Algorithm: property-based testing in three steps
+```elixir
+property "addition is commutative" do
+  check all a <- money(), b <- money(), a.currency == b.currency do
+    assert Money.add(a, b) == Money.add(b, a)
+  end
+end
+```
+
+StreamData generates ~100 pairs `(a, b)` per run, shrinks any failure to the smallest input
+that still fails, and re-runs with a deterministic seed so failures are reproducible in CI.
+
+### 2. Generators compose
+
+A generator is a `%StreamData{}` struct that lazily produces values. Primitives:
+
+```elixir
+StreamData.integer()                    # any integer
+StreamData.integer(1..100)              # bounded
+StreamData.member_of([:usd, :eur, :jpy])
+StreamData.string(:alphanumeric, max_length: 10)
+StreamData.list_of(integer(), length: 1..5)
+```
+
+Composite via `bind/2` (dependency) or `tuple/1`, `fixed_map/1`:
 
 ```
-1. Define a generator: what inputs are valid?
-2. Write a property: what must always be true for those inputs?
-3. Run check all: StreamData generates 100 cases, tries to falsify the property
-   If falsified: shrinks to minimal failing case and reports it
+    integer(1..100) ── bind ──▶  fn n -> list_of(integer(), length: n) end
+         |                                 |
+         v                                 v
+     generates n                   generates list of size n
 ```
+
+### 3. Shrinking — the real power
+
+When a property fails, StreamData does NOT hand you the random input that broke it. It
+recursively tries smaller inputs and reports the smallest failure. If a 500-element list
+triggers the bug, it'll shrink to the 3-element list that still triggers it.
+
+```
+  Initial failure:       [17, -42, 99, 0, ..., 131]   (500 elements)
+         |
+         v  shrink
+  [17, -42, 99]          (3 elements)
+         |
+         v  shrink
+  [-1]                   (minimal counterexample)
+```
+
+Your generators must be **shrinkable**: built-in generators are; custom ones built via
+`map/2` lose shrinking if they break monotonicity. Prefer `bind/2` when possible.
+
+### 4. Metamorphic properties — the cheat code
+
+You don't have a second implementation to compare against ("oracle test"). How do you assert
+correctness of a function you're testing?
+
+Use **metamorphic relations**: properties that relate one call to another:
+
+- **Inverse**: `decode(encode(x)) == x`
+- **Idempotency**: `f(f(x)) == f(x)`
+- **Commutativity**: `f(a, b) == f(b, a)`
+- **Associativity**: `f(a, f(b, c)) == f(f(a, b), c)`
+- **Distributivity**: `f(a, g(b, c)) == g(f(a, b), f(a, c))`
+
+For `Money.Converter`: `convert(convert(m, :eur, :usd), :usd, :eur) ≈ m` (inverse with
+tolerance for rounding error).
+
+### 5. Custom generator discipline
+
+Not every random input is valid. For currency conversion, the rate must be `> 0`. A bad
+generator produces `0` and blows up in the code, which is a useless failure (garbage-in).
+
+Constrain generators:
+
+```elixir
+def positive_decimal do
+  StreamData.bind(StreamData.integer(1..10_000), fn n ->
+    StreamData.constant(n / 100.0)
+  end)
+end
+```
+
+Or filter (slow — rejects are expensive):
+
+```elixir
+StreamData.filter(StreamData.float(), fn x -> x > 0.0 end)
+```
+
+Rule: filter only when rejection rate is low (< 20%). Otherwise bind from a smaller domain.
 
 ---
 
@@ -62,294 +154,406 @@ generates hundreds of cases and shrinks failures to their minimal reproducing in
 ### Step 1: `mix.exs`
 
 ```elixir
-defp deps do
-  [
-    {:stream_data, "~> 0.6"}
-  ]
+defmodule MoneyCalc.MixProject do
+  use Mix.Project
+
+  def project do
+    [
+      app: :money_calc,
+      version: "0.1.0",
+      elixir: "~> 1.16",
+      elixirc_paths: elixirc_paths(Mix.env()),
+      deps: deps()
+    ]
+  end
+
+  def application, do: [extra_applications: [:logger]]
+
+  defp elixirc_paths(:test), do: ["lib", "test/support"]
+  defp elixirc_paths(_), do: ["lib"]
+
+  defp deps do
+    [{:stream_data, "~> 1.1", only: [:test, :dev]}]
+  end
 end
 ```
 
-### Step 2: Topic matcher module
-
-This module handles `*` (single-segment wildcard), `#` (multi-segment wildcard),
-and literal segments. It is used by the property tests below.
+### Step 2: Domain — `Money`
 
 ```elixir
-defmodule ApiGateway.EventBus.TopicMatcher do
-  @moduledoc "Wildcard topic matching for the event bus."
+# lib/money_calc/money.ex
+defmodule MoneyCalc.Money do
+  @moduledoc "Monetary values as integer minor units to avoid float rounding."
 
-  @type compiled :: list(:single | :multi | String.t())
+  @type currency :: :usd | :eur | :gbp | :jpy | :bhd
+  @type t :: %__MODULE__{amount: integer(), currency: currency()}
 
-  @doc """
-  Compile a pattern to a list of segment tokens.
-  Call once at subscribe time, not on every publish.
-  """
-  @spec compile(String.t()) :: compiled()
-  def compile(pattern) do
-    pattern
-    |> String.split(".")
-    |> Enum.map(fn
-      "*" -> :single
-      "#" -> :multi
-      seg -> seg
+  defstruct [:amount, :currency]
+
+  @decimals %{usd: 2, eur: 2, gbp: 2, jpy: 0, bhd: 3}
+
+  @spec new(integer(), currency()) :: t()
+  def new(amount, currency) when is_integer(amount) and is_map_key(@decimals, currency) do
+    %__MODULE__{amount: amount, currency: currency}
+  end
+
+  @spec add(t(), t()) :: t()
+  def add(%__MODULE__{currency: c} = a, %__MODULE__{currency: c} = b) do
+    %__MODULE__{amount: a.amount + b.amount, currency: c}
+  end
+
+  def add(%__MODULE__{}, %__MODULE__{}),
+    do: raise(ArgumentError, "cannot add different currencies directly")
+
+  @spec negate(t()) :: t()
+  def negate(%__MODULE__{amount: a, currency: c}), do: %__MODULE__{amount: -a, currency: c}
+
+  @spec decimals(currency()) :: non_neg_integer()
+  def decimals(c), do: Map.fetch!(@decimals, c)
+end
+```
+
+### Step 3: Converter
+
+```elixir
+# lib/money_calc/converter.ex
+defmodule MoneyCalc.Converter do
+  @moduledoc "Converts between currencies using a rate map."
+
+  alias MoneyCalc.Money
+
+  @type rates :: %{{Money.currency(), Money.currency()} => float()}
+
+  @spec convert(Money.t(), Money.currency(), rates()) :: Money.t()
+  def convert(%Money{currency: c} = m, c, _rates), do: m
+
+  def convert(%Money{amount: a, currency: from}, to, rates) do
+    rate = Map.fetch!(rates, {from, to})
+    from_dec = Money.decimals(from)
+    to_dec = Money.decimals(to)
+
+    # convert to major units, apply rate, re-scale to target minor units, round
+    major = a / :math.pow(10, from_dec)
+    converted_major = major * rate
+    new_amount = round(converted_major * :math.pow(10, to_dec))
+    Money.new(new_amount, to)
+  end
+end
+```
+
+### Step 4: Invoice
+
+```elixir
+# lib/money_calc/invoice.ex
+defmodule MoneyCalc.Invoice do
+  @moduledoc "Sums line items, applies discount and tax — same currency assumed."
+
+  alias MoneyCalc.Money
+
+  @spec total([Money.t()], float(), float()) :: Money.t()
+  def total(line_items, discount_pct, tax_pct)
+      when discount_pct >= 0 and discount_pct <= 1 and tax_pct >= 0 do
+    [%Money{currency: c} | _] = line_items
+    subtotal = Enum.reduce(line_items, Money.new(0, c), &Money.add/2)
+    after_discount = round(subtotal.amount * (1 - discount_pct))
+    after_tax = round(after_discount * (1 + tax_pct))
+    Money.new(after_tax, c)
+  end
+end
+```
+
+### Step 5: Shared generators
+
+```elixir
+# test/support/generators.ex
+defmodule MoneyCalc.Generators do
+  @moduledoc "Reusable StreamData generators for Money test suites."
+  import StreamData
+
+  alias MoneyCalc.Money
+
+  def currency, do: member_of([:usd, :eur, :gbp, :jpy, :bhd])
+
+  @doc "Money with arbitrary signed amount and arbitrary currency."
+  def money do
+    bind(currency(), fn c ->
+      bind(integer(-1_000_000..1_000_000), fn amt ->
+        constant(Money.new(amt, c))
+      end)
     end)
   end
 
-  @doc "Return true if `topic` matches the compiled pattern."
-  @spec matches?(compiled(), String.t()) :: boolean()
-  def matches?(compiled_pattern, topic) do
-    segments = String.split(topic, ".")
-    do_match(compiled_pattern, segments)
+  @doc "Positive money with arbitrary currency."
+  def positive_money do
+    bind(currency(), fn c ->
+      bind(integer(1..1_000_000), fn amt ->
+        constant(Money.new(amt, c))
+      end)
+    end)
   end
 
-  defp do_match([], []),               do: true
-  defp do_match([:multi | _], _),      do: true
-  defp do_match([:single | rp], [_ | rt]), do: do_match(rp, rt)
-  defp do_match([seg | rp], [seg | rt]),   do: do_match(rp, rt)
-  defp do_match(_, _),                 do: false
+  @doc "Money fixed to given currency."
+  def money_in(c) do
+    bind(integer(-1_000_000..1_000_000), fn amt -> constant(Money.new(amt, c)) end)
+  end
+
+  @doc "Realistic rate (0.001..1000) between two currencies."
+  def rate do
+    bind(integer(1..1_000_000), fn n -> constant(n / 1000.0) end)
+  end
+
+  @doc "Rate table that always includes both directions for a fixed currency pair."
+  def consistent_rates(from, to) do
+    bind(rate(), fn r ->
+      constant(%{{from, to} => r, {to, from} => 1.0 / r})
+    end)
+  end
 end
 ```
 
-### Step 3: Given tests — must pass without modification
-
-The parser properties test uses custom generators for HTTP methods, paths, and versions.
-Each generator produces only valid values, so every generated request line is well-formed.
-The properties verify invariants that hold for all valid inputs.
+### Step 6: Money property tests
 
 ```elixir
-# test/api_gateway/middleware/parser_properties_test.exs
-defmodule ApiGateway.Middleware.ParserPropertiesTest do
+# test/money_calc/money_test.exs
+defmodule MoneyCalc.MoneyTest do
   use ExUnit.Case, async: true
   use ExUnitProperties
 
-  @moduledoc """
-  Properties for ApiGateway.Middleware.Parser.
-  Focuses on invariants that hold for all valid HTTP request lines.
-  """
+  import MoneyCalc.Generators
+  alias MoneyCalc.Money
 
-  # Generator for valid HTTP methods
-  defp gen_method do
-    one_of([
-      constant("GET"),
-      constant("POST"),
-      constant("PUT"),
-      constant("DELETE"),
-      constant("PATCH")
-    ])
-  end
-
-  # Generator for valid URL paths (no spaces, starts with /)
-  defp gen_path do
-    ExUnitProperties.gen all segment_count <- integer(1..5),
-                             segments <- list_of(
-                               string(:alphanumeric, min_length: 1, max_length: 10),
-                               length: segment_count
-                             ) do
-      "/" <> Enum.join(segments, "/")
+  describe "add/2 properties" do
+    property "is commutative within the same currency" do
+      check all c <- currency(),
+                a <- money_in(c),
+                b <- money_in(c) do
+        assert Money.add(a, b) == Money.add(b, a)
+      end
     end
-  end
 
-  # Generator for valid HTTP versions
-  defp gen_version do
-    one_of([constant("HTTP/1.0"), constant("HTTP/1.1"), constant("HTTP/2.0")])
-  end
-
-  # Generator for a complete valid request line: "METHOD /path HTTP/version"
-  defp gen_request_line do
-    ExUnitProperties.gen all method  <- gen_method(),
-                             path    <- gen_path(),
-                             version <- gen_version() do
-      "#{method} #{path} #{version}"
+    property "is associative within the same currency" do
+      check all c <- currency(),
+                a <- money_in(c),
+                b <- money_in(c),
+                d <- money_in(c) do
+        left = Money.add(Money.add(a, b), d)
+        right = Money.add(a, Money.add(b, d))
+        assert left == right
+      end
     end
-  end
 
-  property "parse: method is always one of the known HTTP methods" do
-    check all line <- gen_request_line() do
-      [method | _] = String.split(line, " ", parts: 3)
-      assert method in ~w(GET POST PUT DELETE PATCH)
+    property "zero is the identity element" do
+      check all m <- money() do
+        zero = Money.new(0, m.currency)
+        assert Money.add(m, zero) == m
+        assert Money.add(zero, m) == m
+      end
     end
-  end
 
-  property "parse: path always starts with /" do
-    check all line <- gen_request_line() do
-      [_method, path | _] = String.split(line, " ", parts: 3)
-      assert String.starts_with?(path, "/")
+    property "negation is an inverse" do
+      check all m <- money() do
+        zero = Money.new(0, m.currency)
+        assert Money.add(m, Money.negate(m)) == zero
+      end
     end
-  end
 
-  property "parse: version always matches HTTP/N.N format" do
-    check all line <- gen_request_line() do
-      parts = String.split(line, " ", parts: 3)
-      version = List.last(parts)
-      assert String.match?(version, ~r/^HTTP\/\d+\.\d+$/)
-    end
-  end
-
-  property "roundtrip: parse(serialize(req)) == req" do
-    check all method  <- gen_method(),
-              path    <- gen_path(),
-              version <- gen_version() do
-      original = %{method: method, path: path, version: version}
-      serialized = "#{method} #{path} #{version}"
-
-      [m, p, v] = String.split(serialized, " ", parts: 3)
-      parsed = %{method: m, path: p, version: v}
-
-      assert parsed == original
-    end
-  end
-
-  property "parse: splitting on space always yields at least 3 parts for valid lines" do
-    check all line <- gen_request_line() do
-      parts = String.split(line, " ", parts: 3)
-      assert length(parts) == 3
+    property "mixing currencies raises" do
+      check all a <- money_in(:usd), b <- money_in(:eur) do
+        assert_raise ArgumentError, fn -> Money.add(a, b) end
+      end
     end
   end
 end
 ```
 
-The topic matcher properties test verifies wildcard matching invariants. The `#` wildcard
-must match every topic. The `*` wildcard must match exactly one segment. Literal patterns
-must match themselves and no other topic.
+### Step 7: Converter property tests
 
 ```elixir
-# test/api_gateway/event_bus/topic_matcher_properties_test.exs
-defmodule ApiGateway.EventBus.TopicMatcherPropertiesTest do
+# test/money_calc/converter_property_test.exs
+defmodule MoneyCalc.ConverterPropertyTest do
   use ExUnit.Case, async: true
   use ExUnitProperties
 
-  alias ApiGateway.EventBus.TopicMatcher
+  import MoneyCalc.Generators
+  alias MoneyCalc.{Money, Converter}
 
-  # Generator for a single topic segment (no dots, no wildcards)
-  defp gen_segment do
-    string(:alphanumeric, min_length: 1, max_length: 10)
-  end
-
-  # Generator for a complete topic: "seg1.seg2.seg3"
-  defp gen_topic(min_depth \\ 1, max_depth \\ 4) do
-    ExUnitProperties.gen all depth    <- integer(min_depth..max_depth),
-                             segments <- list_of(gen_segment(), length: depth) do
-      Enum.join(segments, ".")
+  describe "convert/3 metamorphic properties" do
+    property "identity: converting to same currency is a no-op" do
+      check all m <- money() do
+        assert Converter.convert(m, m.currency, %{}) == m
+      end
     end
-  end
 
-  property "#' pattern matches every topic" do
-    check all topic <- gen_topic() do
-      assert TopicMatcher.matches?(TopicMatcher.compile("#"), topic)
+    property "round trip is approximately identity (within rounding error)" do
+      check all m <- positive_money(),
+                to <- currency(),
+                m.currency != to,
+                rates <- consistent_rates(m.currency, to) do
+        back = m |> Converter.convert(to, rates) |> Converter.convert(m.currency, rates)
+
+        # Tolerance: rounding twice can lose up to 1 minor unit of source currency,
+        # scaled by rate. Allow 1% relative or 1 unit absolute.
+        diff = abs(back.amount - m.amount)
+        tolerance = max(1, div(m.amount, 100))
+        assert diff <= tolerance,
+               "round-trip drift #{diff} exceeds tolerance #{tolerance} for #{inspect(m)}"
+      end
     end
-  end
 
-  property "exact pattern matches itself and nothing else (different depth)" do
-    check all topic <- gen_topic(2, 4) do
-      compiled = TopicMatcher.compile(topic)
-      assert TopicMatcher.matches?(compiled, topic)
-    end
-  end
+    property "scaling: doubling input doubles output (modulo rounding)" do
+      check all m <- positive_money(),
+                to <- currency(),
+                m.currency != to,
+                rates <- consistent_rates(m.currency, to) do
+        single = Converter.convert(m, to, rates)
+        doubled_input = Money.new(m.amount * 2, m.currency)
+        doubled = Converter.convert(doubled_input, to, rates)
 
-  property "'*' at any position matches exactly one segment" do
-    check all prefix_segs <- list_of(gen_segment(), min_length: 0, max_length: 2),
-              suffix_segs <- list_of(gen_segment(), min_length: 0, max_length: 2),
-              wild_seg    <- gen_segment() do
-      topic_segs   = prefix_segs ++ [wild_seg] ++ suffix_segs
-      topic        = Enum.join(topic_segs, ".")
-
-      pattern_segs = prefix_segs ++ ["*"] ++ suffix_segs
-      pattern      = Enum.join(pattern_segs, ".")
-
-      assert TopicMatcher.matches?(TopicMatcher.compile(pattern), topic)
-    end
-  end
-
-  property "'*' does NOT match zero segments" do
-    check all prefix <- gen_topic(1, 3) do
-      pattern = prefix <> ".*"
-      refute TopicMatcher.matches?(TopicMatcher.compile(pattern), prefix)
-    end
-  end
-
-  property "compile is deterministic: same pattern always gives same result" do
-    check all topic <- gen_topic() do
-      compiled1 = TopicMatcher.compile(topic)
-      compiled2 = TopicMatcher.compile(topic)
-      assert compiled1 == compiled2
-    end
-  end
-
-  property "a topic matches itself as a literal pattern" do
-    check all topic <- gen_topic() do
-      assert TopicMatcher.matches?(TopicMatcher.compile(topic), topic)
-    end
-  end
-
-  property "two different literal topics do not match each other" do
-    check all seg1 <- gen_segment(),
-              seg2 <- gen_segment(),
-              seg1 != seg2 do
-      refute TopicMatcher.matches?(TopicMatcher.compile(seg1), seg2)
+        diff = abs(doubled.amount - single.amount * 2)
+        assert diff <= 1
+      end
     end
   end
 end
 ```
 
-### Step 4: Run the tests
+### Step 8: Invoice property tests
+
+```elixir
+# test/money_calc/invoice_property_test.exs
+defmodule MoneyCalc.InvoicePropertyTest do
+  use ExUnit.Case, async: true
+  use ExUnitProperties
+
+  import MoneyCalc.Generators
+  alias MoneyCalc.{Invoice, Money}
+
+  describe "total/3 invariants" do
+    property "a single-item invoice with zero discount and zero tax equals the item" do
+      check all m <- positive_money() do
+        assert Invoice.total([m], 0.0, 0.0) == m
+      end
+    end
+
+    property "100% discount makes the total zero regardless of tax" do
+      check all c <- currency(),
+                items <- list_of(money_in(c), min_length: 1, max_length: 10),
+                tax <- float(min: 0.0, max: 1.0) do
+        total = Invoice.total(items, 1.0, tax)
+        assert total.amount == 0
+      end
+    end
+
+    property "splitting an invoice in halves sums back to the original (modulo ±1 rounding)" do
+      check all c <- currency(),
+                items <- list_of(money_in(c), min_length: 2, max_length: 10) do
+        {h1, h2} = Enum.split(items, div(length(items), 2))
+        full = Invoice.total(items, 0.0, 0.0)
+        parts = Money.add(Invoice.total(h1, 0.0, 0.0), Invoice.total(h2, 0.0, 0.0))
+        assert abs(full.amount - parts.amount) <= 1
+      end
+    end
+  end
+end
+```
+
+### Step 9: Running properties with more iterations
 
 ```bash
-mix test test/api_gateway/middleware/parser_properties_test.exs --trace
-mix test test/api_gateway/event_bus/topic_matcher_properties_test.exs --trace
+mix test
+mix test --seed 0                                           # deterministic
+mix test test/money_calc/converter_property_test.exs --trace
+MIX_ENV=test elixir --erl "+S 1" -S mix test                # single scheduler for reproducibility
+```
+
+To increase coverage locally (slower):
+
+```elixir
+# in config/test.exs
+config :stream_data, max_runs: 1_000
 ```
 
 ---
 
-## Trade-off analysis
+## Trade-offs and production gotchas
 
-| Aspect | Property-based test | Example-based unit test |
-|--------|--------------------|-----------------------|
-| Edge case discovery | Automatic (hundreds of cases) | Manual (you think of them) |
-| Regression precision | Properties hold for all inputs | Specific inputs regression |
-| Readability | Higher abstraction | More concrete |
-| Debugging | Shrunk minimal case | Exact failing input |
-| Best for | Invariants, roundtrips, pure functions | Business rules, error messages, UI |
+**1. Property tests are slower than example tests**
+Each property runs 100 iterations by default. A suite with 50 properties at 10ms each is 50s.
+Keep property tests focused on core invariants; let example tests cover edge cases you've
+already characterised.
 
-| Generator combinator | Use when |
-|---------------------|---------|
-| `map/2` | Transform output of a generator |
-| `filter/2` | Exclude values — use sparingly (> 90% pass rate needed) |
-| `gen all ... do` | Compose dependent generators (later values depend on earlier) |
-| `one_of/1` | Choose from a fixed set of options |
-| `list_of/2` | Generate variable-length lists with optional `min_length`, `max_length` |
+**2. Shrinking can hide bugs if generators aren't well-designed**
+If your generator never emits a value that would expose the bug (e.g. always positive when
+the bug is on negatives), no amount of iterations will find it. Audit your generators by
+printing sample values: `StreamData.sample(money(), 10)`.
+
+**3. Flaky properties are almost always your bug, not StreamData's**
+If a property passes on seed 42 and fails on seed 17, your property has a hidden precondition
+you didn't encode. Either add a guard (`... when a > 0`) or fix the code under test.
+
+**4. Floating-point arithmetic ruins strict equality**
+Properties like `f(g(x)) == x` fail with floats. Use absolute or relative tolerance. For
+money, prefer integer minor-unit representation (as shown here) — avoids floats entirely
+in domain logic.
+
+**5. Overly-constrained generators hide the space you care about**
+If your `positive_money` generator caps amounts at 100, you never test overflow around
+`2^63`. Set realistic bounds informed by production data — invoice totals can reach millions.
+
+**6. `StreamData.filter` is a trap**
+Filter discards values that don't match a predicate. If 90% are discarded, every iteration
+wastes cycles. Rewrite as `bind` from a constrained primitive.
+
+**7. Don't test tautologies**
+```elixir
+property "add returns the result of add" do
+  check all a <- money(), b <- money() do
+    assert Money.add(a, b) == Money.add(a, b)
+  end
+end
+```
+This tests determinism. Possibly useful, usually not.
+
+**8. When NOT to use property-based testing**
+- UI logic and workflows — prefer integration tests.
+- Code with unbounded external side effects (HTTP, DB writes) — property tests need to run
+  thousands of iterations; real I/O makes that untenable.
+- Pure mapping / transformation code that's trivially correct by inspection — example tests
+  are faster to read and maintain.
 
 ---
 
-## Common production mistakes
+## Stateful property testing (preview)
 
-**1. Writing trivially true properties**
-`assert is_list(Enum.sort(list))` is always true and tests nothing. A property must be
-falsifiable — ask yourself: "what code change would make this property fail?"
+For GenServer / state-machine testing use `StreamData`'s lower-level combinators to generate
+*sequences of commands* and check invariants after each step. This is covered separately in
+exercise 202 — the short version:
 
-**2. Using `filter/2` aggressively**
-StreamData discards filtered values. If `filter/2` discards 80% of generated values,
-the test needs 5x more time to reach the configured `max_runs`. Use `map/2` instead:
-generate exactly what you need rather than generating broadly and throwing most away.
+```elixir
+commands = list_of(one_of([
+  {constant(:push), integer()},
+  constant(:pop),
+  constant(:peek)
+]))
 
-**3. Properties with side effects**
-`check all` runs 100 iterations. If each iteration inserts into a database, your test
-writes 100 rows. Properties should test pure functions or use per-iteration cleanup.
+property "stack commands are consistent with a reference list implementation" do
+  check all cmds <- commands do
+    {_real_state, _ref_state, ok} =
+      Enum.reduce(cmds, {Stack.new(), [], true}, &apply_and_compare/2)
+    assert ok
+  end
+end
+```
 
-**4. Ignoring the shrunk failure case**
-When a property fails, StreamData reports the original failing case AND the minimal
-shrunk case. The shrunk case is the actionable one — it is the smallest input that
-still triggers the bug. Always read the shrunk case, not the original.
-
-**5. Properties that duplicate unit tests**
-Do not write `property "sort([1,2,3]) == [1,2,3]"`. Write
-`property "for any list, sort is idempotent"`. Properties complement unit tests by
-covering the infinite space between explicit examples.
+See exercise 202 for the full treatment.
 
 ---
 
 ## Resources
 
-- [StreamData — HexDocs](https://hexdocs.pm/stream_data/StreamData.html)
-- [ExUnitProperties — HexDocs](https://hexdocs.pm/stream_data/ExUnitProperties.html)
-- [Property-Based Testing with PropEr, Erlang, and Elixir — Fred Hebert & Laura Castro](https://pragprog.com/titles/fhproper/property-based-testing-with-proper-erlang-and-elixir/)
-- [The Anatomy of a Property — Fred Hebert](https://ferd.ca/the-anatomy-of-a-property.html)
+- [StreamData hexdocs](https://hexdocs.pm/stream_data) — API reference, especially `bind/2`, `filter/2`, `map/2`
+- [ExUnitProperties](https://hexdocs.pm/stream_data/ExUnitProperties.html) — `check all` macro
+- ["Writing efficient StreamData generators" — Andrea Leopardi](https://andrealeopardi.com/posts/property-based-testing-in-beam/) — the author of StreamData
+- [PropEr TESTing — Fred Hébert](https://propertesting.com/) — the definitive text (Erlang but applies)
+- ["Metamorphic testing" — ACM paper](https://dl.acm.org/doi/10.1145/2934466) — foundational reference
+- [QuickCheck papers — John Hughes](https://www.cse.chalmers.se/~rjmh/QuickCheck/) — the original

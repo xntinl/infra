@@ -2,9 +2,6 @@
 
 **Project**: `rest_for_one_demo` — a pipeline of three stages where each stage depends on the previous; crashing a middle stage restarts it and everything downstream.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
-
 ---
 
 ## Project context
@@ -33,6 +30,11 @@ rest_for_one_demo/
 ```
 
 ---
+
+
+## Why X and not Y
+
+- **Why not the other strategies?** Each encodes a different coupling assumption; picking the wrong one either over-restarts or under-restarts.
 
 ## Core concepts
 
@@ -74,7 +76,31 @@ than a globally registered pid.
 
 ---
 
+## Design decisions
+
+**Option A — `:one_for_all`**
+- Pros: simpler upfront, fewer moving parts.
+- Cons: hides the trade-off that this exercise exists to teach.
+
+**Option B — `:rest_for_one` (chosen)**
+- Pros: explicit about the semantic that matters in production.
+- Cons: one more concept to internalize.
+
+→ Chose **B** because children form a startup-order dependency chain; only downstream children need to restart.
+
+
 ## Implementation
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defp deps do
+  [
+    # stdlib-only by default; add `{:benchee, "~> 1.3", only: :dev}` if you benchmark
+  ]
+end
+```
+
 
 ### Step 1: Create the project
 
@@ -260,6 +286,15 @@ mix test
 
 ---
 
+### Why this works
+
+The design leans on OTP primitives that already encode the invariants we care about (supervision, back-pressure, explicit message semantics), so failure modes are visible at the right layer instead of being reinvented ad-hoc. Tests exercise the edges (timeouts, crashes, boundary states), which is where hand-rolled alternatives silently drift over time.
+
+
+## Benchmark
+
+<!-- benchmark N/A: tema conceptual -->
+
 ## Trade-offs and production gotchas
 
 **1. Order in the children list is now a semantic contract**
@@ -291,6 +326,11 @@ share mutable state bidirectionally (use `:one_for_all`). When the
 GenStage job, not a supervision strategy.
 
 ---
+
+
+## Reflection
+
+- Si agregás un child al medio del orden, ¿qué pasa con la semántica de `:rest_for_one`? Describí los riesgos operacionales.
 
 ## Resources
 

@@ -4,8 +4,6 @@
 that inject a systemd unit file, a wrapper script, and a runtime
 configuration sample into the release tarball.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
 
 ---
 
@@ -57,6 +55,11 @@ _build/prod/rel/runtime_overlays/
 
 ---
 
+
+## Why X and not Y
+
+- **Why not rebuild per env?** Slower deploys, more artifact churn, and env drift. One release + overlays is the modern pattern.
+
 ## Core concepts
 
 ### 1. `steps:` customization in `mix.exs`
@@ -91,7 +94,31 @@ script just symlinks it into `/etc/systemd/system/`.
 
 ---
 
+## Design decisions
+
+**Option A — rebuild the release per env**
+- Pros: simpler upfront, fewer moving parts.
+- Cons: hides the trade-off that this exercise exists to teach.
+
+**Option B — runtime overlays applied at boot (chosen)**
+- Pros: explicit about the semantic that matters in production.
+- Cons: one more concept to internalize.
+
+→ Chose **B** because one artifact, many environments — overlays let ops tune without a rebuild.
+
+
 ## Implementation
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defp deps do
+  [
+    # stdlib-only by default; add `{:benchee, "~> 1.3", only: :dev}` if you benchmark
+  ]
+end
+```
+
 
 ### Step 1: Create the project and overlay directory
 
@@ -261,6 +288,15 @@ cat _build/prod/rel/runtime_overlays/scripts/migrate.sh
 
 ---
 
+### Why this works
+
+The design leans on OTP primitives that already encode the invariants we care about (supervision, back-pressure, explicit message semantics), so failure modes are visible at the right layer instead of being reinvented ad-hoc. Tests exercise the edges (timeouts, crashes, boundary states), which is where hand-rolled alternatives silently drift over time.
+
+
+## Benchmark
+
+<!-- benchmark N/A: tema conceptual -->
+
 ## Trade-offs and production gotchas
 
 **1. Overlays are a copy, not a template**
@@ -290,6 +326,11 @@ cron jobs managed by a config-management tool), let that tool own
 it. Overlays are for files whose lifecycle matches the release.
 
 ---
+
+
+## Reflection
+
+- ¿Cuándo un overlay es preferible a un `runtime.exs` con `System.get_env`? Dá el criterio.
 
 ## Resources
 

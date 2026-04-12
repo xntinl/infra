@@ -1,425 +1,446 @@
-# Phoenix Presence: Connected Client Tracking
+# Phoenix Presence — CRDT-Backed User Tracking
 
-## Overview
+**Project**: `presence_channels` — "who's online in this chat room" across a multi-node Phoenix cluster.
 
-Implement distributed, conflict-free tracking of connected clients for an API gateway
-using Phoenix Presence. Track who is connected, how long they've been connected, and enforce
-per-room limits on concurrent debug sessions -- all with automatic cleanup when sockets die.
+**Difficulty**: ★★★★☆
+**Estimated time**: 4–6 hours
 
-Project structure:
+---
+
+## Project context
+
+Continuing the chat backend from exercise 53, product wants a live "who's here"
+indicator in each room: agent avatars on the left, customer avatars on the right,
+with typing indicators. The tricky part is that the app runs on three Phoenix
+nodes behind a load balancer. User A's WebSocket may land on node 1; user B's
+on node 2. Both must see each other, and when node 1 restarts, user A's presence
+must disappear from node 2's view.
+
+The classical shared-nothing approach — a central Redis with TTLs — has two
+problems:
+
+1. **Single point of failure**. If Redis goes down, presence is lost across
+   the cluster.
+2. **Staleness**. TTL-based expiry is coarse (typical 30s); a user who closes
+   their laptop takes 30s to disappear.
+
+Phoenix Presence solves both by replicating presence state as a CRDT (ORSWOT —
+Observed-Remove Set Without Tombstones) across the cluster. Each node gossips
+its local presence to peers; merges are commutative and conflict-free. No
+Redis, no coordinator, no quorum. When a node dies, BEAM's process monitoring
+(`:net_kernel.monitor_nodes/1`) triggers removal of its entries from every
+peer.
+
+Requirements for this exercise:
+
+1. Track `{user_id, meta}` per room topic.
+2. Broadcast join/leave diffs to clients subscribed to the room.
+3. Support metadata updates (typing indicator) without rejoining.
+4. Work across at least two nodes — tests include a cluster scenario.
+
+Project structure at this point:
 
 ```
-api_gateway/
+presence_channels/
 ├── lib/
-│   └── api_gateway_web/
-│       ├── presence.ex
-│       └── channels/
-│           ├── user_socket.ex
-│           ├── debug_session_channel.ex
-│           └── client_monitor_channel.ex
+│   ├── presence_channels/
+│   │   ├── application.ex
+│   │   ├── auth.ex
+│   │   └── presence.ex                # use Phoenix.Presence
+│   └── presence_channels_web/
+│       ├── endpoint.ex
+│       ├── channels/
+│       │   ├── user_socket.ex
+│       │   └── room_channel.ex
+│       └── telemetry.ex
 └── test/
-    └── api_gateway_web/channels/
-        └── debug_session_channel_test.exs
+    └── presence_channels_web/
+        └── channels/
+            └── room_channel_test.exs
 ```
 
 ---
 
-## Why Presence and not a custom ETS table
+## Core concepts
 
-When you track connected clients in ETS directly, you get a race condition: between `join/3`
-checking the count and `track/3` inserting the new entry, another connection can slip in.
-You also get stale entries when a node crashes -- ETS is in-memory and lost.
+### 1. Why CRDTs for presence
 
-Phoenix Presence is built on `Phoenix.Tracker`, a CRDTs-based distributed tracker. It:
-- Automatically removes entries when a socket process dies (via monitoring)
-- Synchronizes across nodes using delta CRDTs -- no centralized coordinator
-- Broadcasts `presence_diff` events to all subscribers when membership changes
+Presence is a set of `{key, meta}` entries per topic. Two nodes observe slightly
+different sets because of network delay. The classical mutex-based sync would
+serialize through a coordinator; CRDTs let each node merge independently and
+always converge to the same result.
+
+Phoenix Presence uses an **ORSWOT** (Observed-Remove Set Without Tombstones):
+
+```
+Node A: {"user-1" => [meta_A]}    ─┐
+                                    ├─▶ gossip → merge → {"user-1" => [meta_A, meta_B]}
+Node B: {"user-1" => [meta_B]}    ─┘
+```
+
+The same key can appear with multiple metas (one per connection). A user with
+three tabs open shows up as one presence key with three entries in the metas list.
 
 ---
 
-## The `after_join` pattern
+### 2. Diffs, not full state
 
-Calling `Presence.track/3` directly inside `join/3` creates a race condition: the socket
-is not yet fully initialized. The correct pattern:
+Presence broadcasts deltas: `joins` and `leaves`. The client state is built by
+applying diffs to the initial `presence_state` payload received on join:
+
+```
+server        client
+  │    presence_state {u1: [m1], u2: [m2]}
+  │───────────────────────────────────────▶
+  │    presence_diff  {joins: {u3: [m3]}, leaves: {}}
+  │───────────────────────────────────────▶
+  │    presence_diff  {joins: {}, leaves: {u2: [m2]}}
+  │───────────────────────────────────────▶
+```
+
+This keeps the wire payload proportional to the changes, not the total presence.
+In a 1000-user room, one person joining transmits ~100 bytes, not 100KB.
+
+---
+
+### 3. Keys and metas
 
 ```elixir
-def join("room:x", params, socket) do
-  send(self(), :after_join)
-  {:ok, socket}
-end
-
-def handle_info(:after_join, socket) do
-  {:ok, _} = Presence.track(socket, ...)
-  push(socket, "presence_state", Presence.list(socket))
-  {:noreply, socket}
-end
+Presence.track(socket, _key = "user-1", _meta = %{online_at: 1234, typing?: false})
 ```
+
+Key is typically `user_id`. Meta is a map — whatever your UI needs. You can call
+`track/3` multiple times with the same key but different metas to represent
+multiple connections. Each `untrack/2` (or process exit) removes one meta,
+not the whole key.
+
+---
+
+### 4. Updating meta without rejoining
+
+Use `Presence.update/4`:
+
+```elixir
+Presence.update(socket, user_id, &Map.put(&1, :typing?, true))
+```
+
+This emits a `leave` + `join` diff (the only way to represent a meta change in
+an observed-remove set). Clients reconcile: same key appears in both `leaves`
+and `joins` within one diff — they should replace the meta rather than animating
+an exit/enter.
+
+---
+
+### 5. Node failure is handled by BEAM
+
+When a node leaves the cluster, its PubSub-over-`:pg` membership drops, and
+every peer removes that node's tracked keys. No TTL polling. No heartbeat
+timeout to tune. This is a major reason to prefer Presence over ad-hoc
+Redis-based solutions.
 
 ---
 
 ## Implementation
 
-### Step 1: `lib/api_gateway_web/presence.ex`
+### Step 1: Create the project and the Presence module
+
+```bash
+mix phx.new presence_channels --no-ecto --no-mailer --no-html
+cd presence_channels
+```
+
+`lib/presence_channels/presence.ex`:
 
 ```elixir
-defmodule ApiGatewayWeb.Presence do
+defmodule PresenceChannels.Presence do
+  @moduledoc """
+  Presence tracker. The `fetch/2` callback is called on every diff and on
+  initial state to enrich metas — we use it to attach display names without
+  asking the client to send them.
+  """
   use Phoenix.Presence,
-    otp_app: :api_gateway,
-    pubsub_server: ApiGateway.PubSub
+    otp_app: :presence_channels,
+    pubsub_server: PresenceChannels.PubSub
+
+  @impl true
+  def fetch(_topic, presences) do
+    Enum.into(presences, %{}, fn {key, %{metas: metas}} ->
+      display = display_for(key)
+      {key, %{metas: metas, display_name: display}}
+    end)
+  end
+
+  defp display_for("user-" <> n), do: "User #{n}"
+  defp display_for(other), do: other
 end
 ```
 
-Add to `application.ex`:
+### Step 2: Supervise Presence
 
 ```elixir
+# lib/presence_channels/application.ex — children list
 children = [
-  ApiGatewayWeb.Endpoint,
-  ApiGatewayWeb.Presence
+  PresenceChannelsWeb.Telemetry,
+  {Phoenix.PubSub, name: PresenceChannels.PubSub},
+  PresenceChannels.Presence,
+  PresenceChannelsWeb.Endpoint
 ]
 ```
 
-### Step 2: `lib/api_gateway_web/channels/user_socket.ex`
+The order matters: `PubSub` must start before `Presence`, `Presence` before
+the `Endpoint` (channels reference it).
+
+### Step 3: UserSocket
 
 ```elixir
-defmodule ApiGatewayWeb.UserSocket do
+defmodule PresenceChannelsWeb.UserSocket do
   use Phoenix.Socket
 
-  channel "debug:*",    ApiGatewayWeb.DebugSessionChannel
-  channel "ops:monitor", ApiGatewayWeb.ClientMonitorChannel
+  channel "room:*", PresenceChannelsWeb.RoomChannel
 
   @impl true
   def connect(%{"token" => token}, socket, _connect_info) do
-    case Phoenix.Token.verify(ApiGatewayWeb.Endpoint, "socket", token, max_age: 86_400) do
-      {:ok, client_id} ->
-        {:ok, assign(socket, :client_id, client_id)}
-      {:error, _reason} ->
-        :error
+    case PresenceChannels.Auth.verify(PresenceChannelsWeb.Endpoint, token) do
+      {:ok, user_id} -> {:ok, assign(socket, :user_id, user_id)}
+      {:error, _} -> :error
     end
   end
 
+  def connect(_params, _socket, _connect_info), do: :error
+
   @impl true
-  def id(socket), do: "client_socket:#{socket.assigns.client_id}"
+  def id(socket), do: "user_socket:#{socket.assigns.user_id}"
 end
 ```
 
-### Step 3: `lib/api_gateway_web/channels/debug_session_channel.ex`
+(The `PresenceChannels.Auth` module is a copy of exercise 53's, using
+`Phoenix.Token.sign/verify` — included in the starter repo.)
 
-Debug sessions allow clients to receive detailed trace logs for their requests. The gateway
-limits each debug room to 5 concurrent sessions to prevent resource exhaustion.
+### Step 4: RoomChannel
 
 ```elixir
-defmodule ApiGatewayWeb.DebugSessionChannel do
+defmodule PresenceChannelsWeb.RoomChannel do
   use Phoenix.Channel
-  alias ApiGatewayWeb.Presence
 
-  @max_sessions 5
+  alias PresenceChannels.Presence
 
   @impl true
-  def join("debug:" <> room_id, %{"trace_level" => level}, socket) do
-    presences = Presence.list("debug:#{room_id}")
-
-    cond do
-      Map.has_key?(presences, socket.assigns.client_id) ->
-        socket = socket
-        |> assign(:room_id, room_id)
-        |> assign(:trace_level, level)
-        send(self(), :after_join)
-        {:ok, socket}
-
-      map_size(presences) >= @max_sessions ->
-        {:error, %{
-          reason: "room_full",
-          current: map_size(presences),
-          max: @max_sessions
-        }}
-
-      true ->
-        socket = socket
-        |> assign(:room_id, room_id)
-        |> assign(:trace_level, level)
-        send(self(), :after_join)
-        {:ok, socket}
-    end
+  def join("room:" <> _rest, _payload, socket) do
+    send(self(), :after_join)
+    {:ok, socket}
   end
 
   @impl true
   def handle_info(:after_join, socket) do
-    {:ok, _} = Presence.track(socket, socket.assigns.client_id, %{
-      trace_level: socket.assigns.trace_level,
-      joined_at: DateTime.utc_now()
-    })
+    {:ok, _ref} =
+      Presence.track(socket, socket.assigns.user_id, %{
+        online_at: System.system_time(:second),
+        typing?: false,
+        node: Node.self()
+      })
 
     push(socket, "presence_state", Presence.list(socket))
-
-    broadcast_from!(socket, "session_joined", %{
-      client_id: socket.assigns.client_id,
-      trace_level: socket.assigns.trace_level
-    })
-
     {:noreply, socket}
   end
 
   @impl true
-  def handle_in("set_trace_level", %{"level" => level}, socket)
-      when level in ["debug", "info", "warn", "error"] do
-    {:ok, _} = Presence.update(socket, socket.assigns.client_id, fn meta ->
-      Map.put(meta, :trace_level, level)
-    end)
+  def handle_in("typing", %{"typing?" => typing?}, socket) when is_boolean(typing?) do
+    {:ok, _} =
+      Presence.update(socket, socket.assigns.user_id, fn meta ->
+        Map.put(meta, :typing?, typing?)
+      end)
 
-    {:reply, :ok, assign(socket, :trace_level, level)}
+    {:reply, :ok, socket}
   end
 
-  def handle_in("set_trace_level", _, socket) do
-    {:reply, {:error, %{reason: "invalid trace level"}}, socket}
-  end
-
-  @impl true
-  def handle_in("get_sessions", _payload, socket) do
-    sessions = Presence.list(socket)
-    |> Enum.map(fn {client_id, %{metas: [meta | _]}} ->
-      %{client_id: client_id, trace_level: meta.trace_level, joined_at: meta.joined_at}
-    end)
-    {:reply, {:ok, %{sessions: sessions}}, socket}
-  end
+  def handle_in(_other, _payload, socket), do: {:reply, {:error, :unknown_event}, socket}
 end
 ```
 
-### Step 4: `lib/api_gateway_web/channels/client_monitor_channel.ex`
+Two important details:
 
-This channel gives the ops team a live view of all connected clients.
+- `Presence.track/3` must be called from the channel process **after** join
+  completes. That's why we use `send(self(), :after_join)` — calling `track`
+  inside `join/3` races with the subscription setup.
+- `push(socket, "presence_state", ...)` sends the initial state to the newly
+  joined client. From then on, the framework emits `presence_diff` events
+  automatically.
+
+### Step 5: Tests — `test/presence_channels_web/channels/room_channel_test.exs`
 
 ```elixir
-defmodule ApiGatewayWeb.ClientMonitorChannel do
-  use Phoenix.Channel
-  alias ApiGatewayWeb.Presence
+defmodule PresenceChannelsWeb.RoomChannelTest do
+  use PresenceChannelsWeb.ChannelCase, async: false
+  # async: false because Presence state is shared across tests
 
-  @topic "ops:clients"
+  alias PresenceChannels.{Auth, Presence}
+  alias PresenceChannelsWeb.{Endpoint, UserSocket, RoomChannel}
 
-  @impl true
-  def join("ops:monitor", _params, socket) do
-    if socket.assigns[:role] == :ops do
-      send(self(), :after_join)
-      {:ok, socket}
-    else
-      {:error, %{reason: "unauthorized"}}
+  defp join_as(user_id, topic) do
+    token = Auth.sign(Endpoint, user_id)
+    {:ok, socket} = connect(UserSocket, %{"token" => token})
+    subscribe_and_join(socket, RoomChannel, topic)
+  end
+
+  describe "presence lifecycle" do
+    test "tracks user on join and broadcasts state" do
+      {:ok, _, _channel} = join_as("user-1", "room:test:1")
+
+      assert_push "presence_state", state
+      assert Map.has_key?(state, "user-1")
+    end
+
+    test "two users see each other" do
+      {:ok, _, channel_a} = join_as("user-1", "room:test:2")
+      assert_push "presence_state", _
+
+      {:ok, _, _channel_b} = join_as("user-2", "room:test:2")
+
+      # A receives a diff announcing B's join
+      assert_push "presence_diff", %{joins: joins, leaves: leaves}
+      assert Map.has_key?(joins, "user-2")
+      assert leaves == %{}
+
+      # A still sees both
+      list = Presence.list(channel_a)
+      assert Map.has_key?(list, "user-1")
+      assert Map.has_key?(list, "user-2")
+    end
+
+    test "typing update emits a leave+join diff" do
+      {:ok, _, _channel} = join_as("user-3", "room:test:3")
+      assert_push "presence_state", _
+
+      {:ok, _, channel} = join_as("user-4", "room:test:3")
+      assert_push "presence_state", _
+
+      ref = push(channel, "typing", %{"typing?" => true})
+      assert_reply ref, :ok
+
+      assert_push "presence_diff", %{joins: joins, leaves: leaves}
+      assert Map.has_key?(joins, "user-4")
+      assert Map.has_key?(leaves, "user-4")
+      [meta | _] = joins["user-4"][:metas]
+      assert meta.typing? == true
+    end
+
+    test "leave removes presence on channel termination" do
+      {:ok, _, channel} = join_as("user-5", "room:test:4")
+      assert_push "presence_state", _
+
+      Process.unlink(channel.channel_pid)
+      ref = leave(channel)
+      assert_reply ref, :ok
+
+      # Re-join fresh to inspect state
+      {:ok, _, channel2} = join_as("user-6", "room:test:4")
+      assert_push "presence_state", state
+      refute Map.has_key?(state, "user-5")
+      _ = channel2
     end
   end
 
-  @impl true
-  def handle_info(:after_join, socket) do
-    {:ok, _} = Presence.track(socket, socket.assigns.client_id, %{
-      role: :ops,
-      connected_at: DateTime.utc_now()
-    })
-
-    push(socket, "presence_state", Presence.list(@topic))
-
-    {:noreply, socket}
-  end
-
-  @impl true
-  def handle_in("disconnect_client", %{"client_id" => client_id}, socket) do
-    ApiGatewayWeb.Endpoint.broadcast("client_socket:#{client_id}", "disconnect", %{})
-    {:reply, :ok, socket}
+  describe "enriched metadata via fetch/2" do
+    test "injects display_name without client input" do
+      {:ok, _, _channel} = join_as("user-7", "room:test:5")
+      assert_push "presence_state", state
+      assert state["user-7"].display_name == "User 7"
+    end
   end
 end
 ```
 
-### Step 5: JavaScript client
+### Step 6: Multi-node smoke test (optional but recommended)
 
-```javascript
-import { Socket, Presence } from "phoenix"
-
-const socket = new Socket("/socket", { params: { token: authToken } })
-socket.connect()
-
-const channel = socket.channel("debug:payments-service", {
-  trace_level: "debug"
-})
-
-const presence = new Presence(channel)
-
-channel.join()
-  .receive("ok", () => console.log("Joined debug session"))
-  .receive("error", ({ reason, current, max }) => {
-    if (reason === "room_full") {
-      showError(`Debug room full: ${current}/${max} sessions active`)
-    }
-  })
-
-presence.onSync(() => {
-  const sessions = presence.list((id, { metas: [first] }) => ({
-    clientId: id,
-    traceLevel: first.trace_level,
-    joinedAt: first.joined_at
-  }))
-  renderSessionList(sessions)
-})
-
-presence.onJoin((id, _current, newPresence) => {
-  console.log(`${id} joined with trace level: ${newPresence.metas[0].trace_level}`)
-})
-
-presence.onLeave((id, current) => {
-  if (current.metas.length === 0) {
-    console.log(`${id} left the debug session`)
-  }
-})
-
-function setTraceLevel(level) {
-  channel.push("set_trace_level", { level })
-    .receive("ok", () => console.log("Trace level updated"))
-    .receive("error", ({ reason }) => console.error("Invalid level:", reason))
-}
-```
-
-### Step 6: Tests
-
-```elixir
-# test/api_gateway_web/channels/debug_session_channel_test.exs
-defmodule ApiGatewayWeb.DebugSessionChannelTest do
-  use ApiGatewayWeb.ChannelCase
-
-  alias ApiGatewayWeb.Presence
-
-  defp make_socket(client_id) do
-    ApiGatewayWeb.UserSocket
-    |> socket(client_id, %{client_id: client_id})
-  end
-
-  test "join succeeds and pushes presence_state" do
-    {:ok, _, _socket} =
-      make_socket("c1")
-      |> subscribe_and_join(
-        ApiGatewayWeb.DebugSessionChannel,
-        "debug:test-room",
-        %{"trace_level" => "debug"}
-      )
-
-    assert_push "presence_state", _
-  end
-
-  test "rejects when room is at max capacity" do
-    Enum.each(1..5, fn i ->
-      {:ok, _, _} =
-        make_socket("client-#{i}")
-        |> subscribe_and_join(
-          ApiGatewayWeb.DebugSessionChannel,
-          "debug:full-room",
-          %{"trace_level" => "info"}
-        )
-    end)
-
-    assert {:error, %{reason: "room_full", max: 5}} =
-      make_socket("client-6")
-      |> subscribe_and_join(
-        ApiGatewayWeb.DebugSessionChannel,
-        "debug:full-room",
-        %{"trace_level" => "info"}
-      )
-  end
-
-  test "presence clears when client disconnects" do
-    {:ok, _, socket} =
-      make_socket("dc-client")
-      |> subscribe_and_join(
-        ApiGatewayWeb.DebugSessionChannel,
-        "debug:dc-room",
-        %{"trace_level" => "warn"}
-      )
-
-    Process.sleep(50)
-    assert 1 == Presence.list("debug:dc-room") |> map_size()
-
-    Process.exit(socket.channel_pid, :normal)
-    Process.sleep(50)
-
-    assert 0 == Presence.list("debug:dc-room") |> map_size()
-  end
-
-  test "set_trace_level updates presence metadata" do
-    {:ok, _, socket} =
-      make_socket("level-client")
-      |> subscribe_and_join(
-        ApiGatewayWeb.DebugSessionChannel,
-        "debug:level-room",
-        %{"trace_level" => "info"}
-      )
-
-    ref = push(socket, "set_trace_level", %{"level" => "debug"})
-    assert_reply ref, :ok
-
-    Process.sleep(50)
-    presences = Presence.list("debug:level-room")
-    [meta | _] = presences["level-client"].metas
-    assert meta.trace_level == "debug"
-  end
-
-  test "rejects invalid trace level" do
-    {:ok, _, socket} =
-      make_socket("inv-client")
-      |> subscribe_and_join(
-        ApiGatewayWeb.DebugSessionChannel,
-        "debug:inv-room",
-        %{"trace_level" => "info"}
-      )
-
-    ref = push(socket, "set_trace_level", %{"level" => "verbose"})
-    assert_reply ref, :error, %{reason: "invalid trace level"}
-  end
-end
-```
-
-### Step 7: Run the tests
+Start two nodes in separate terminals:
 
 ```bash
-mix test test/api_gateway_web/channels/ --trace
+iex --sname node_a --cookie secret -S mix phx.server
+iex --sname node_b --cookie secret -S mix phx.server
+```
+
+From either node:
+
+```elixir
+Node.connect(:"node_b@hostname")
+# Now open two browser tabs, one per node, join the same room.
+# Users from both nodes appear in each other's presence list.
 ```
 
 ---
 
-## Trade-off analysis
+## Trade-offs and production gotchas
 
-| Aspect | Phoenix Presence | Manual ETS tracking | External Redis SETEX |
-|--------|-----------------|--------------------|--------------------|
-| Auto-cleanup on disconnect | yes (monitors process) | no (manual cleanup) | no (TTL required) |
-| Distributed sync | yes (delta CRDTs) | no (node-local) | yes (shared Redis) |
-| Consistency | eventual | strong (single node) | strong |
-| Race condition on join | mitigated (after_join pattern) | inherent | mitigated (SETNX) |
-| Metadata updates | Presence.update/3 | :ets.insert | HSET |
-| Overhead | PubSub broadcast per change | ETS write | network round-trip |
+**1. Presence is not a persistence layer**
+Presence state lives in RAM. If the entire cluster restarts, presence is gone.
+This is correct semantics ("who is connected RIGHT NOW") but don't use it for
+"last seen" — use Ecto for that.
+
+**2. Meta should be small**
+Every update ships the full meta in a diff. A 10KB meta × 1000 users × 10 updates/s =
+100MB/s of gossip. Keep metas to keys the UI actually renders. Put heavy data
+behind a separate query.
+
+**3. Clock skew in `online_at`**
+`System.system_time(:second)` varies across nodes by NTP skew. If your UI shows
+"connected 3s ago" computed from `online_at`, it can go negative on a peer with
+a slightly fast clock. Compute duration client-side relative to when the meta
+arrived.
+
+**4. `fetch/2` runs on every list call**
+Don't do DB queries there. It's called when the initial state is computed and
+when clients call `Presence.list`. For display names, cache in ETS or pre-compute.
+
+**5. `Presence.track` vs. `Presence.track(pid, ...)`**
+The channel variant binds the tracked entry to the channel's pid — when the
+pid dies, the entry is removed. The pid variant binds to an arbitrary process.
+Pick the right lifetime owner.
+
+**6. Cluster misconfiguration is silent**
+If nodes are running but not clustered (`Node.list/0` is empty), presence still
+works within a single node. You won't see errors — just missing users. Add a
+startup check that logs cluster membership.
+
+**7. `:after_join` vs. `join/3`**
+Tracking inside `join/3` can race with the framework's subscription setup:
+the client may receive the first `presence_diff` before the `presence_state`,
+causing a momentarily inconsistent UI. Always track in `handle_info(:after_join, ...)`.
+
+**8. When NOT to use Presence**
+If you need to query "who is online" from a non-Elixir service (analytics, a
+Python worker), CRDT state in-process is the wrong shape. Pair Presence with
+a projection: a GenServer that subscribes to presence diffs and writes to
+Postgres, so external systems can read a stable row.
 
 ---
 
-## Common production mistakes
+## Performance notes
 
-**1. Not adding `Presence` to the supervision tree**
-`Presence.track/3` calls the Presence GenServer process. If it's not supervised, the call
-raises `no process`. Add it explicitly to `application.ex` children.
+Phoenix Presence scales in published benchmarks to hundreds of thousands of
+tracked entries per node. The hot path is the diff merge on `:presence_diff`
+broadcasts. Measure with `:telemetry`:
 
-**2. Calling `Presence.track/3` directly in `join/3`**
-The socket is not fully initialized when `join/3` runs. The `send(self(), :after_join)`
-pattern defers tracking until after `join/3` has returned.
+```elixir
+:telemetry.attach(
+  "presence-diff",
+  [:phoenix, :presence, :broadcast],
+  fn _event, measurements, metadata, _ ->
+    IO.inspect({measurements, metadata.topic}, label: "presence broadcast")
+  end,
+  nil
+)
+```
 
-**3. Not canceling timers before creating new ones**
-If you add timer-based metadata (e.g., "typing" indicator), calling `Process.send_after`
-on every keystroke without canceling the previous timer accumulates timers. Store the
-`timer_ref` in socket assigns and call `Process.cancel_timer/1` first.
-
-**4. Using `map_size(Presence.list(...))` for strict capacity enforcement**
-`Presence.list` reflects the CRDT state at query time. Under concurrent joins, this is
-eventually consistent. For hard capacity limits, a GenServer with serialized join logic
-is more appropriate.
-
-**5. Sending `presence_state` before `Presence.track/3`**
-If you push `presence_state` before tracking yourself, the joining client sees the list
-without themselves. Always track first, then push the state.
+If diffs become CPU-heavy, look at (a) meta size, (b) topic fan-out (10k
+subscribers per topic is a lot — consider sharding rooms).
 
 ---
 
 ## Resources
 
-- [`Phoenix.Presence`](https://hexdocs.pm/phoenix/Phoenix.Presence.html) -- API reference and CRDTs explanation
-- [`Phoenix.Tracker`](https://hexdocs.pm/phoenix_pubsub/Phoenix.Tracker.html) -- the underlying distributed tracker
-- [phoenix.js `Presence` class](https://hexdocs.pm/phoenix/js/) -- `onSync`, `onJoin`, `onLeave` callbacks
-- [CRDTs explained](https://crdt.tech/) -- the theory behind conflict-free replicated data types
+- [`Phoenix.Presence`](https://hexdocs.pm/phoenix/Phoenix.Presence.html) — API and callbacks
+- [Chris McCord — Real-world distributed Elixir / Presence](https://www.youtube.com/watch?v=n338leKvqnA) — the original Presence talk
+- [Marc Shapiro et al. — "A comprehensive study of Convergent and Commutative Replicated Data Types"](https://hal.inria.fr/inria-00555588/document) — the CRDT paper behind Presence
+- [`phoenix_pubsub`](https://hexdocs.pm/phoenix_pubsub/) — the adapter Presence builds on
+- [`:net_kernel.monitor_nodes/1`](https://www.erlang.org/doc/man/net_kernel.html#monitor_nodes-1) — cluster membership events
+- [José Valim — LiveView + Presence blog](https://dashbit.co/blog/live-view-with-presence)

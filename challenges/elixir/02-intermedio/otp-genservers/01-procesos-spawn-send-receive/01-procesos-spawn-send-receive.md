@@ -2,9 +2,6 @@
 
 **Project**: `process_primitives` — build a tiny stateful worker from scratch with only the three core BEAM primitives.
 
-**Difficulty**: ★★☆☆☆
-**Estimated time**: 1–2 hours
-
 ---
 
 ## Project context
@@ -34,6 +31,11 @@ process_primitives/
 ```
 
 ---
+
+
+## Why X and not Y
+
+- **Why not a lower-level alternative?** For procesos spawn send receive, OTP's pattern is what reviewers will expect and what observability tools support out of the box.
 
 ## Core concepts
 
@@ -80,7 +82,31 @@ detection so a dead server doesn't leave you blocked forever.
 
 ---
 
+## Design decisions
+
+**Option A — `spawn` with ad-hoc protocols**
+- Pros: simpler upfront, fewer moving parts.
+- Cons: hides the trade-off that this exercise exists to teach.
+
+**Option B — `spawn_link` + tagged messages (chosen)**
+- Pros: explicit about the semantic that matters in production.
+- Cons: one more concept to internalize.
+
+→ Chose **B** because linking makes failures observable; tagging prevents mailbox confusion.
+
+
 ## Implementation
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defp deps do
+  [
+    # stdlib-only by default; add `{:benchee, "~> 1.3", only: :dev}` if you benchmark
+  ]
+end
+```
+
 
 ### Step 1: Create the project
 
@@ -263,6 +289,15 @@ mix test
 
 ---
 
+### Why this works
+
+The design leans on OTP primitives that already encode the invariants we care about (supervision, back-pressure, explicit message semantics), so failure modes are visible at the right layer instead of being reinvented ad-hoc. Tests exercise the edges (timeouts, crashes, boundary states), which is where hand-rolled alternatives silently drift over time.
+
+
+## Benchmark
+
+<!-- benchmark N/A: tema conceptual -->
+
 ## Trade-offs and production gotchas
 
 **1. `send/2` to a dead pid is silent**
@@ -301,6 +336,11 @@ libraries that need non-standard protocols, and BEAM internals. This
 exercise exists only so the abstractions above stop feeling magical.
 
 ---
+
+
+## Reflection
+
+- ¿Cuándo deberías escribir tu propio receive-loop en lugar de usar GenServer? Dá 2 casos reales.
 
 ## Resources
 

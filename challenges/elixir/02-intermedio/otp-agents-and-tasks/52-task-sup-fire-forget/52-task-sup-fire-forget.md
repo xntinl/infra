@@ -2,9 +2,6 @@
 
 **Project**: `fire_forget_sup` — launch background work that must NOT crash its caller.
 
-**Difficulty**: ★★☆☆☆
-**Estimated time**: 1–2 hours
-
 ---
 
 ## Project context
@@ -41,6 +38,11 @@ fire_forget_sup/
 ```
 
 ---
+
+
+## Why X and not Y
+
+- **Why not `spawn`?** No supervision, no logs on crash, no cleanup guarantee. `Task.Supervisor` gives you all three.
 
 ## Core concepts
 
@@ -88,7 +90,31 @@ to flush; ephemeral calculations can be zero.
 
 ---
 
+## Design decisions
+
+**Option A — `spawn` + ignore failures**
+- Pros: simpler upfront, fewer moving parts.
+- Cons: hides the trade-off that this exercise exists to teach.
+
+**Option B — `Task.Supervisor.start_child` with `:temporary` (chosen)**
+- Pros: explicit about the semantic that matters in production.
+- Cons: one more concept to internalize.
+
+→ Chose **B** because supervised fire-and-forget still logs crashes; bare `spawn` silently drops them.
+
+
 ## Implementation
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defp deps do
+  [
+    # stdlib-only by default; add `{:benchee, "~> 1.3", only: :dev}` if you benchmark
+  ]
+end
+```
+
 
 ### Step 1: Create the project
 
@@ -227,6 +253,15 @@ mix test
 
 ---
 
+### Why this works
+
+The design leans on OTP primitives that already encode the invariants we care about (supervision, back-pressure, explicit message semantics), so failure modes are visible at the right layer instead of being reinvented ad-hoc. Tests exercise the edges (timeouts, crashes, boundary states), which is where hand-rolled alternatives silently drift over time.
+
+
+## Benchmark
+
+<!-- benchmark N/A: tema conceptual -->
+
 ## Trade-offs and production gotchas
 
 **1. Fire-and-forget throws away results — by design**
@@ -266,6 +301,11 @@ with a bounded pool (exercise 55).
   pipeline, not a pile of independent supervised tasks.
 
 ---
+
+
+## Reflection
+
+- ¿Cuándo es aceptable perder una tarea silenciosamente? Dá un ejemplo real donde fire-and-forget es la respuesta correcta.
 
 ## Resources
 

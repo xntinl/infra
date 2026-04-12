@@ -2,9 +2,6 @@
 
 **Project**: `yield_many_demo` — collect what finishes by the deadline; cancel the rest.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
-
 ---
 
 ## Project context
@@ -35,6 +32,11 @@ yield_many_demo/
 ```
 
 ---
+
+
+## Why X and not Y
+
+- **Why not `await_many`?** All-or-nothing semantics; `yield_many` returns partials + lets you shutdown stragglers.
 
 ## Core concepts
 
@@ -93,7 +95,31 @@ not receive the `:DOWN` messages and would block forever.
 
 ---
 
+## Design decisions
+
+**Option A — `Task.await_many` (all-or-nothing)**
+- Pros: simpler upfront, fewer moving parts.
+- Cons: hides the trade-off that this exercise exists to teach.
+
+**Option B — `Task.yield_many` + `shutdown` (chosen)**
+- Pros: explicit about the semantic that matters in production.
+- Cons: one more concept to internalize.
+
+→ Chose **B** because partial results under deadline pressure beat failing the whole batch.
+
+
 ## Implementation
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defp deps do
+  [
+    # stdlib-only by default; add `{:benchee, "~> 1.3", only: :dev}` if you benchmark
+  ]
+end
+```
+
 
 ### Step 1: Create the project
 
@@ -247,6 +273,15 @@ mix test
 
 ---
 
+### Why this works
+
+The design leans on OTP primitives that already encode the invariants we care about (supervision, back-pressure, explicit message semantics), so failure modes are visible at the right layer instead of being reinvented ad-hoc. Tests exercise the edges (timeouts, crashes, boundary states), which is where hand-rolled alternatives silently drift over time.
+
+
+## Benchmark
+
+<!-- benchmark N/A: tema conceptual -->
+
 ## Trade-offs and production gotchas
 
 **1. `:brutal_kill` forfeits cleanup — always**
@@ -283,6 +318,11 @@ correctly, but a naive implementation that assumes "shutdown ⇒
 - Tasks should outlive the caller → use `Task.Supervisor` (exercise 52).
 
 ---
+
+
+## Reflection
+
+- Diseñá la política de resultados parciales: ¿qué hacés con las tasks que no respondieron dentro del deadline?
 
 ## Resources
 

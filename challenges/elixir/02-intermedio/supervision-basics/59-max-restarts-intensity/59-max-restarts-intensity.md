@@ -2,9 +2,6 @@
 
 **Project**: `restart_intensity_demo` — a supervisor tuned to demonstrate the restart-intensity safety valve and how it escalates failures upward.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
-
 ---
 
 ## Project context
@@ -35,6 +32,11 @@ restart_intensity_demo/
 ```
 
 ---
+
+
+## Why X and not Y
+
+- **Why not the defaults?** Defaults are a starting point; they don't match bursty failures or long-lived pools.
 
 ## Core concepts
 
@@ -81,7 +83,31 @@ during normal operation but above transient hiccups.
 
 ---
 
+## Design decisions
+
+**Option A — defaults (3 restarts / 5s)**
+- Pros: simpler upfront, fewer moving parts.
+- Cons: hides the trade-off that this exercise exists to teach.
+
+**Option B — tuned `max_restarts`/`max_seconds` per subtree (chosen)**
+- Pros: explicit about the semantic that matters in production.
+- Cons: one more concept to internalize.
+
+→ Chose **B** because defaults are a reasonable starting point, but long-lived pools and flaky externals need different curves.
+
+
 ## Implementation
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defp deps do
+  [
+    # stdlib-only by default; add `{:benchee, "~> 1.3", only: :dev}` if you benchmark
+  ]
+end
+```
+
 
 ### Step 1: Create the project
 
@@ -234,6 +260,15 @@ mix test
 
 ---
 
+### Why this works
+
+The design leans on OTP primitives that already encode the invariants we care about (supervision, back-pressure, explicit message semantics), so failure modes are visible at the right layer instead of being reinvented ad-hoc. Tests exercise the edges (timeouts, crashes, boundary states), which is where hand-rolled alternatives silently drift over time.
+
+
+## Benchmark
+
+<!-- benchmark N/A: tema conceptual -->
+
 ## Trade-offs and production gotchas
 
 **1. Bumping `max_restarts` to hide crashes is a code smell**
@@ -266,6 +301,11 @@ library (Oban, Broadway) with explicit retry/backoff. Intensity is for
 process-level stability, not domain-level retry logic.
 
 ---
+
+
+## Reflection
+
+- ¿Preferís fallar rápido con `max_restarts: 1` o ser tolerante con `max_restarts: 100`? Definí en qué subtree se aplica cada uno.
 
 ## Resources
 

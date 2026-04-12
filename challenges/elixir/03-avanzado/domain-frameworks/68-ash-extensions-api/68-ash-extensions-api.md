@@ -1,645 +1,596 @@
-# Ash — Extensions, Calculations, Aggregates, and API Generation
+# Ash extensions — JSON:API, GraphQL, Admin
+
+**Project**: `ash_extensions` — auto-generated JSON:API, GraphQL and admin UI on top of Ash resources.
+
+**Difficulty**: ★★★★☆
+**Estimated time**: 4–6 hours
+
+---
 
 ## Project context
 
-You are building `api_gateway`, an internal HTTP gateway. The configuration management subsystem needs computed fields on services (health score, display label), token-based authentication via an Operator resource, role-based policies, and a REST API auto-generated from resources. All modules — including the Ash domain, resources, calculations, operator, and policies — are defined from scratch.
+You built the `Catalog` domain with Ash resources (exercise 67). Product managers now want a REST API for external partners (stable, cacheable, JSON:API-compatible), a GraphQL endpoint for the mobile app (flexible, single-request), and an internal admin UI for the ops team to manage the catalog without shipping frontend code.
 
-Project structure:
+Hand-writing each of these from scratch is weeks of work and triples the surface where bugs hide. Ash ships three first-party extensions that derive these APIs from the resource definitions:
+
+- [`AshJsonApi`](https://hexdocs.pm/ash_json_api/) — JSON:API 1.0 REST routes (Plug-compatible, mount in Phoenix).
+- [`AshGraphql`](https://hexdocs.pm/ash_graphql/) — Absinthe schema generation from resources.
+- [`AshAdmin`](https://hexdocs.pm/ash_admin/) — LiveView admin UI for CRUD, forms and action invocation.
+
+In this exercise you wire all three onto the `Catalog` domain from the previous exercise. You will learn how one declarative resource turns into three consumer-facing APIs — and what the trade-offs of auto-generation are in production.
 
 ```
-api_gateway/
+ash_extensions/
 ├── lib/
-│   └── api_gateway/
-│       ├── repo.ex                                     # Ecto.Repo
-│       ├── metrics_store.ex                            # simple GenServer for metrics
-│       └── config/
-│           ├── config.ex                               # Ash.Domain
-│           └── resources/
-│               ├── service.ex                          # Service resource with calculations + policies
-│               ├── route_rule.ex                       # RouteRule resource
-│               ├── route_rule/
-│               │   └── validations/
-│               │       └── path_format.ex              # custom validation
-│               ├── operator.ex                         # Operator resource (AshAuthentication)
-│               └── service/
-│                   └── calculations/
-│                       ├── health_score.ex             # computed health score
-│                       └── display_label.ex            # computed display string
+│   └── ash_extensions/
+│       ├── application.ex
+│       ├── endpoint.ex               # Phoenix endpoint
+│       ├── router.ex                 # mounts json_api / graphql / admin
+│       ├── catalog/
+│       │   ├── catalog.ex            # extends domain with api extensions
+│       │   ├── product.ex            # adds json_api + graphql blocks
+│       │   ├── category.ex
+│       │   └── price.ex
+│       └── graphql_schema.ex
 ├── test/
-│   └── api_gateway/
-│       └── config/
-│           ├── calculations_test.exs
-│           └── policy_test.exs
+│   └── api_test.exs
 └── mix.exs
 ```
 
 ---
 
-## The business problem
+## Core concepts
 
-1. **No REST API** — operators cannot query configuration from the dashboard without deploying code.
-2. **No computed health data** — the dashboard wants a `health_score` per service (0.0-1.0) derived from metrics, but this field does not exist in the database.
-3. **No authentication** — anyone on the internal network can modify route rules.
+### 1. Extensions sit on resources, routes sit on domains
 
-Ash extensions solve all three without adding controllers, serializers, or custom authentication code.
+Each extension has two parts:
 
----
+- A **resource-level DSL block** (`json_api do ... end`, `graphql do ... end`) declaring endpoints, field names, filters.
+- A **domain-level config** listing which resources are exposed and under what base path.
 
-## Why calculations are not just virtual Ecto fields
+Mount order: the domain's router macro emits a Plug that knows about every public action of every resource, based on the resource-level declarations.
 
-An Ecto `@virtual` field exists in the struct but is silently `nil` if you forget to populate it. An Ash `calculation` is part of the resource contract with a declared return type and opt-in loading via `Ash.Query.load([:health_score])`. It cannot be silently nil because Ash will raise if you access it without loading.
+```
+   resource Product  ──┐
+                        │
+   resource Category ──┼──▶ Ash.Domain ──▶ AshJsonApi.Router → /api/json
+                        │                ──▶ AshGraphql.Schema → /api/gql
+   resource Price   ──┘                ──▶ AshAdmin.Router → /admin
+```
+
+### 2. JSON:API — convention-over-configuration REST
+
+`AshJsonApi` produces `/products`, `/products/:id`, `/products/:id/relationships/category`, filtering via `?filter[status]=draft`, pagination via `?page[limit]=20`, sparse fieldsets via `?fields[product]=sku,name`. The spec is strict — use it and your clients get standardized behaviour for free.
+
+### 3. GraphQL — resources become types, actions become fields
+
+```elixir
+graphql do
+  type :product
+  queries do
+    get :get_product, :read
+    list :list_products, :read
+  end
+  mutations do
+    create :register_product, :register
+    update :publish_product, :publish
+  end
+end
+```
+
+Each `list_products` query supports filtering by any public attribute, relationship loading via the GraphQL selection set, and pagination via `first:`/`after:` (Relay-style cursors).
+
+### 4. Admin UI — derived forms with zero frontend code
+
+`AshAdmin` scans the domain and renders a LiveView with:
+
+- A resource list on the left.
+- A table + create/edit forms derived from attribute types.
+- Invocable custom actions (e.g., "Publish", "Archive") as buttons.
+- Relationship editors (searchable selects driven by `read` actions).
+
+It is opinionated. For a bespoke internal UI, you will still write LiveView. For the 90% case ("let the ops team do CRUD without deploying frontend"), it is enough.
+
+### 5. All three share the same policies and validations
+
+Because the extensions all go through the Ash action pipeline, authorization and validation rules you wrote in exercise 67 apply uniformly. There is no "REST-only" bypass.
 
 ---
 
 ## Implementation
 
-### Step 1: `mix.exs` additions
+### Step 1: `mix.exs`
 
 ```elixir
-defp deps do
-  [
-    {:ash, "~> 3.0"},
-    {:ash_postgres, "~> 2.0"},
-    {:ash_json_api, "~> 1.0"},
-    {:ash_authentication, "~> 4.0"},
-    {:ecto_sql, "~> 3.11"},
-    {:postgrex, "~> 0.18"},
-    {:bcrypt_elixir, "~> 3.0"},
-    {:open_api_spex, "~> 3.18"}
-  ]
-end
-```
+defmodule AshExtensions.MixProject do
+  use Mix.Project
 
-### Step 2: MetricsStore — `lib/api_gateway/metrics_store.ex`
-
-A simple GenServer that provides metrics data for the HealthScore calculation.
-
-```elixir
-defmodule ApiGateway.MetricsStore do
-  @moduledoc """
-  In-memory metrics store that provides per-service error rate and latency.
-  Used by the HealthScore calculation to compute a health score without
-  hitting the database.
-  """
-  use GenServer
-
-  @spec start_link(keyword()) :: GenServer.on_start()
-  def start_link(opts \\ []), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
-
-  @spec get_metrics(String.t()) :: %{error_rate: float(), p99_latency_ms: number()} | nil
-  def get_metrics(service_name) do
-    GenServer.call(__MODULE__, {:get, service_name})
+  def project do
+    [app: :ash_extensions, version: "0.1.0", elixir: "~> 1.16", deps: deps()]
   end
 
-  @spec put_metrics(String.t(), map()) :: :ok
-  def put_metrics(service_name, metrics) do
-    GenServer.cast(__MODULE__, {:put, service_name, metrics})
+  def application do
+    [extra_applications: [:logger], mod: {AshExtensions.Application, []}]
   end
 
-  @impl true
-  def init(_opts), do: {:ok, %{}}
-
-  @impl true
-  def handle_call({:get, name}, _from, state) do
-    {:reply, Map.get(state, name), state}
-  end
-
-  @impl true
-  def handle_cast({:put, name, metrics}, state) do
-    {:noreply, Map.put(state, name, metrics)}
+  defp deps do
+    [
+      {:ash, "~> 3.0"},
+      {:ash_postgres, "~> 2.0"},
+      {:ash_json_api, "~> 1.4"},
+      {:ash_graphql, "~> 1.3"},
+      {:ash_admin, "~> 0.11"},
+      {:ash_phoenix, "~> 2.0"},
+      {:absinthe_plug, "~> 1.5"},
+      {:phoenix, "~> 1.7"},
+      {:phoenix_live_view, "~> 0.20"},
+      {:plug_cowboy, "~> 2.6"},
+      {:jason, "~> 1.4"}
+    ]
   end
 end
 ```
 
-### Step 3: Domain — `lib/api_gateway/config/config.ex`
+### Step 2: Extend the domain — `lib/ash_extensions/catalog/catalog.ex`
 
 ```elixir
-defmodule ApiGateway.Config do
-  @moduledoc """
-  Ash domain for gateway configuration resources.
-  All external code calls Config.create!/2, Config.read!/1, etc.
-  """
-
-  use Ash.Domain
+defmodule AshExtensions.Catalog do
+  use Ash.Domain,
+    extensions: [AshJsonApi.Domain, AshGraphql.Domain, AshAdmin.Domain]
 
   resources do
-    resource ApiGateway.Config.Resources.Service
-    resource ApiGateway.Config.Resources.RouteRule
-    resource ApiGateway.Config.Resources.Operator
+    resource AshExtensions.Catalog.Product
+    resource AshExtensions.Catalog.Category
+    resource AshExtensions.Catalog.Price
+  end
+
+  json_api do
+    prefix "/api/json"
+  end
+
+  graphql do
+    root_level_errors? true
+  end
+
+  admin do
+    show? true
   end
 end
 ```
 
-### Step 4: HealthScore calculation — `lib/api_gateway/config/resources/service/calculations/health_score.ex`
+### Step 3: Extend the Product resource
 
 ```elixir
-defmodule ApiGateway.Config.Resources.Service.Calculations.HealthScore do
-  @moduledoc """
-  Computes a 0.0-1.0 health score per service from the in-memory MetricsStore.
-
-  Formula: max(0.0, 1.0 - error_rate - latency_penalty)
-  where latency_penalty = min(p99_ms / 10_000, 0.5)
-  """
-
-  use Ash.Resource.Calculation
-
-  @impl true
-  def calculate(records, _opts, _context) do
-    Enum.map(records, fn service ->
-      case ApiGateway.MetricsStore.get_metrics(service.name) do
-        nil ->
-          1.0
-
-        %{error_rate: error_rate, p99_latency_ms: p99_ms} ->
-          latency_penalty = min(p99_ms / 10_000.0, 0.5)
-          score = max(0.0, 1.0 - error_rate - latency_penalty)
-          Float.round(score, 2)
-      end
-    end)
-  end
-
-  @impl true
-  def load(_query, _opts, _context), do: [:name]
-end
-```
-
-### Step 5: DisplayLabel calculation — `lib/api_gateway/config/resources/service/calculations/display_label.ex`
-
-```elixir
-defmodule ApiGateway.Config.Resources.Service.Calculations.DisplayLabel do
-  @moduledoc """
-  Returns a human-readable label for dashboard display: \"name (upstream_url)\".
-  """
-
-  use Ash.Resource.Calculation
-
-  @impl true
-  def calculate(records, _opts, _context) do
-    Enum.map(records, fn service ->
-      "#{service.name} (#{service.upstream_url})"
-    end)
-  end
-
-  @impl true
-  def load(_query, _opts, _context), do: [:name, :upstream_url]
-end
-```
-
-### Step 6: Service resource — `lib/api_gateway/config/resources/service.ex`
-
-```elixir
-defmodule ApiGateway.Config.Resources.Service do
-  @moduledoc """
-  A backend service registered in the gateway.
-  Includes calculations for health_score and display_label,
-  AshJsonApi for REST generation, and policies for role-based access.
-  """
-
+defmodule AshExtensions.Catalog.Product do
   use Ash.Resource,
-    domain: ApiGateway.Config,
+    domain: AshExtensions.Catalog,
     data_layer: AshPostgres.DataLayer,
-    extensions: [AshJsonApi.Resource],
-    authorizers: [Ash.Policy.Authorizer]
+    extensions: [AshJsonApi.Resource, AshGraphql.Resource]
+
+  # ... attributes/relationships/actions from exercise 67 ...
 
   postgres do
-    table "gateway_services"
-    repo ApiGateway.Repo
+    table "products"
+    repo AshExtensions.Repo
   end
 
   attributes do
     uuid_primary_key :id
-
-    attribute :name, :string do
-      allow_nil? false
-      public? true
-      constraints min_length: 2, max_length: 64
-    end
-
-    attribute :upstream_url, :string do
-      allow_nil? false
-      public? true
-      constraints min_length: 8
-    end
-
+    attribute :sku, :string, allow_nil?: false, public?: true
+    attribute :name, :string, allow_nil?: false, public?: true
+    attribute :description, :string, public?: true
     attribute :status, :atom do
-      constraints one_of: [:active, :draining, :offline]
-      default :active
-      allow_nil? false
+      constraints one_of: [:draft, :published, :archived]
+      default :draft
       public? true
     end
-
-    attribute :weight, :integer do
-      default 100
-      allow_nil? false
-      public? true
-      constraints min: 1, max: 100
-    end
-
     timestamps()
   end
 
-  calculations do
-    calculate :high_priority, :boolean, expr(weight > 50)
+  relationships do
+    belongs_to :category, AshExtensions.Catalog.Category do
+      allow_nil? false
+      public? true
+    end
+    has_many :prices, AshExtensions.Catalog.Price
+  end
 
-    calculate :health_score, :float,
-      ApiGateway.Config.Resources.Service.Calculations.HealthScore
-
-    calculate :display_label, :string,
-      ApiGateway.Config.Resources.Service.Calculations.DisplayLabel
+  identities do
+    identity :unique_sku, [:sku]
   end
 
   actions do
-    defaults [:create, :read, :update, :destroy]
+    defaults [:read, :destroy]
 
-    update :drain do
-      change set_attribute(:status, :draining)
+    create :register do
+      accept [:sku, :name, :description, :category_id]
     end
 
-    update :take_offline do
-      change set_attribute(:status, :offline)
+    update :publish do
+      accept []
+      change set_attribute(:status, :published)
+      validate attribute_equals(:status, :draft)
     end
 
-    update :activate do
-      change set_attribute(:status, :active)
-    end
-
-    read :active do
-      filter expr(status == :active)
-    end
-
-    read :routable do
-      filter expr(status in [:active, :draining])
-
-      pagination do
-        keyset? true
-        default_limit 50
-        countable true
-      end
+    update :archive do
+      accept []
+      change set_attribute(:status, :archived)
     end
   end
 
   json_api do
-    type "services"
+    type "product"
 
     routes do
-      base "/services"
-      index :routable
+      base "/products"
       get :read
-      post :create
-      patch :update
+      index :read
+      post :register
+      patch :publish, route: "/:id/publish"
+      patch :archive, route: "/:id/archive"
       delete :destroy
-      patch :drain, route: "/:id/drain"
-      patch :take_offline, route: "/:id/take-offline"
-      patch :activate, route: "/:id/activate"
+      relationship :category, :read
     end
   end
 
-  policies do
-    policy action_type(:read) do
-      authorize_if actor_present()
+  graphql do
+    type :product
+
+    queries do
+      get :get_product, :read
+      list :list_products, :read
     end
 
-    policy action_type([:create, :update, :destroy]) do
-      authorize_if actor_attribute_equals(:role, :admin)
+    mutations do
+      create :register_product, :register
+      update :publish_product, :publish
+      update :archive_product, :archive
+      destroy :delete_product, :destroy
     end
   end
 
-  identities do
-    identity :unique_name, [:name]
-  end
-end
-```
-
-### Step 7: PathFormat validation — `lib/api_gateway/config/resources/route_rule/validations/path_format.ex`
-
-```elixir
-defmodule ApiGateway.Config.Resources.RouteRule.Validations.PathFormat do
-  @moduledoc "Validates that path_prefix starts with / and has no whitespace."
-
-  use Ash.Resource.Validation
-
-  @impl true
-  def validate(changeset, _opts, _context) do
-    path = Ash.Changeset.get_attribute(changeset, :path_prefix)
-
-    cond do
-      is_nil(path) -> :ok
-      not String.starts_with?(path, "/") -> {:error, field: :path_prefix, message: "must start with /"}
-      String.match?(path, ~r/\s/) -> {:error, field: :path_prefix, message: "must not contain whitespace"}
-      true -> :ok
+  admin do
+    table_columns [:sku, :name, :status, :category_id]
+    form do
+      field :sku, type: :default
+      field :name, type: :default
+      field :description, type: :long_text
+      field :category_id, type: :default
     end
   end
 end
 ```
 
-### Step 8: RouteRule resource — `lib/api_gateway/config/resources/route_rule.ex`
+### Step 4: Category and Price — same pattern
 
 ```elixir
-defmodule ApiGateway.Config.Resources.RouteRule do
-  @moduledoc "Maps inbound path prefix to a registered Service."
-
+# lib/ash_extensions/catalog/category.ex
+defmodule AshExtensions.Catalog.Category do
   use Ash.Resource,
-    domain: ApiGateway.Config,
-    data_layer: AshPostgres.DataLayer
+    domain: AshExtensions.Catalog,
+    data_layer: AshPostgres.DataLayer,
+    extensions: [AshJsonApi.Resource, AshGraphql.Resource]
 
   postgres do
-    table "gateway_route_rules"
-    repo ApiGateway.Repo
+    table "categories"
+    repo AshExtensions.Repo
   end
 
   attributes do
     uuid_primary_key :id
-
-    attribute :path_prefix, :string do
-      allow_nil? false
-      public? true
-      constraints min_length: 1, max_length: 256
-    end
-
-    attribute :priority, :integer do
-      allow_nil? false
-      public? true
-      constraints min: 1, max: 1000
-    end
-
-    attribute :active, :boolean, default: true, public?: true
+    attribute :name, :string, allow_nil?: false, public?: true
+    attribute :slug, :string, allow_nil?: false, public?: true
     timestamps()
   end
 
-  validations do
-    validate {ApiGateway.Config.Resources.RouteRule.Validations.PathFormat, []}
+  relationships do
+    has_many :products, AshExtensions.Catalog.Product
+  end
+
+  identities do
+    identity :unique_slug, [:slug]
   end
 
   actions do
     defaults [:create, :read, :update, :destroy]
+  end
 
-    read :ordered do
-      filter expr(active == true)
-      prepare build(sort: [priority: :asc])
+  json_api do
+    type "category"
+    routes do
+      base "/categories"
+      get :read
+      index :read
+      post :create
+      patch :update
+      delete :destroy
     end
   end
 
-  relationships do
-    belongs_to :service, ApiGateway.Config.Resources.Service do
-      allow_nil? false
-      public? true
+  graphql do
+    type :category
+    queries do
+      get :get_category, :read
+      list :list_categories, :read
+    end
+    mutations do
+      create :create_category, :create
+      update :update_category, :update
+      destroy :delete_category, :destroy
     end
   end
 end
-```
 
-### Step 9: Operator resource — `lib/api_gateway/config/resources/operator.ex`
-
-```elixir
-defmodule ApiGateway.Config.Resources.Operator do
-  @moduledoc """
-  A human operator who manages gateway configuration.
-  Roles: :readonly (read only) and :admin (full CRUD).
-  """
-
+# lib/ash_extensions/catalog/price.ex
+defmodule AshExtensions.Catalog.Price do
   use Ash.Resource,
-    domain: ApiGateway.Config,
-    data_layer: AshPostgres.DataLayer
+    domain: AshExtensions.Catalog,
+    data_layer: AshPostgres.DataLayer,
+    extensions: [AshJsonApi.Resource, AshGraphql.Resource]
 
   postgres do
-    table "gateway_operators"
-    repo ApiGateway.Repo
+    table "prices"
+    repo AshExtensions.Repo
   end
 
   attributes do
     uuid_primary_key :id
-
-    attribute :email, :string do
-      allow_nil? false
-      public? true
-    end
-
-    attribute :role, :atom do
-      constraints one_of: [:readonly, :admin]
-      default :readonly
-      allow_nil? false
-      public? true
-    end
-
+    attribute :amount_cents, :integer, allow_nil?: false, public?: true
+    attribute :currency, :string, allow_nil?: false, public?: true, default: "USD"
+    attribute :valid_from, :utc_datetime_usec, allow_nil?: false, public?: true
+    attribute :valid_until, :utc_datetime_usec, public?: true
     timestamps()
   end
 
+  relationships do
+    belongs_to :product, AshExtensions.Catalog.Product do
+      allow_nil? false
+      public? true
+    end
+  end
+
   actions do
-    defaults [:read, :create, :destroy]
+    defaults [:create, :read, :destroy]
+  end
 
-    update :promote_to_admin do
-      change set_attribute(:role, :admin)
-    end
-
-    update :demote_to_readonly do
-      change set_attribute(:role, :readonly)
+  json_api do
+    type "price"
+    routes do
+      base "/prices"
+      get :read
+      index :read
+      post :create
+      delete :destroy
     end
   end
 
-  identities do
-    identity :unique_email, [:email]
+  graphql do
+    type :price
+    queries do
+      list :list_prices, :read
+    end
+    mutations do
+      create :create_price, :create
+    end
   end
 end
 ```
 
-### Step 10: Given tests — must pass without modification
+### Step 5: GraphQL schema — `lib/ash_extensions/graphql_schema.ex`
 
 ```elixir
-# test/api_gateway/config/calculations_test.exs
-defmodule ApiGateway.Config.CalculationsTest do
-  use ApiGateway.DataCase, async: true
+defmodule AshExtensions.GraphqlSchema do
+  use Absinthe.Schema
+  use AshGraphql, domains: [AshExtensions.Catalog]
+end
+```
 
-  alias ApiGateway.Config
-  alias ApiGateway.Config.Resources.Service
+### Step 6: JSON:API router module
 
-  defp insert_service(attrs \\ %{}) do
-    defaults = %{
-      name: "svc-#{:rand.uniform(9_999_999)}",
-      upstream_url: "https://upstream.internal",
-      status: :active,
-      weight: 100
-    }
+```elixir
+defmodule AshExtensions.JsonApiRouter do
+  use AshJsonApi.Router,
+    domains: [AshExtensions.Catalog],
+    open_api: "/open_api"
+end
+```
 
-    Service
-    |> Ash.Changeset.for_create(:create, Map.merge(defaults, attrs))
-    |> Config.create!()
+### Step 7: Phoenix router — `lib/ash_extensions/router.ex`
+
+```elixir
+defmodule AshExtensions.Router do
+  use Phoenix.Router
+  import Plug.Conn
+  import Phoenix.Controller
+  import AshAdmin.Router
+
+  pipeline :api do
+    plug :accepts, ["json"]
   end
 
-  test "high_priority is true when weight > 50" do
-    svc = insert_service(weight: 80)
-
-    [loaded] =
-      Service
-      |> Ash.Query.filter(id == ^svc.id)
-      |> Ash.Query.load([:high_priority])
-      |> Config.read!()
-
-    assert loaded.high_priority == true
+  pipeline :browser do
+    plug :accepts, ["html"]
+    plug :fetch_session
+    plug :protect_from_forgery
   end
 
-  test "high_priority is false when weight <= 50" do
-    svc = insert_service(weight: 30)
-
-    [loaded] =
-      Service
-      |> Ash.Query.filter(id == ^svc.id)
-      |> Ash.Query.load([:high_priority])
-      |> Config.read!()
-
-    assert loaded.high_priority == false
+  scope "/api/json" do
+    pipe_through :api
+    forward "/", AshExtensions.JsonApiRouter
   end
 
-  test "display_label is 'name (upstream_url)'" do
-    svc = insert_service(name: "billing", upstream_url: "https://billing.internal")
+  scope "/api/gql" do
+    pipe_through :api
 
-    [loaded] =
-      Service
-      |> Ash.Query.filter(id == ^svc.id)
-      |> Ash.Query.load([:display_label])
-      |> Config.read!()
+    forward "/playground", Absinthe.Plug.GraphiQL,
+      schema: AshExtensions.GraphqlSchema,
+      interface: :playground
 
-    assert loaded.display_label == "billing (https://billing.internal)"
+    forward "/", Absinthe.Plug, schema: AshExtensions.GraphqlSchema
   end
 
-  test "health_score is a float between 0.0 and 1.0" do
-    svc = insert_service()
+  scope "/admin" do
+    pipe_through :browser
+    ash_admin "/"
+  end
+end
+```
 
-    [loaded] =
-      Service
-      |> Ash.Query.filter(id == ^svc.id)
-      |> Ash.Query.load([:health_score])
-      |> Config.read!()
+### Step 8: Endpoint + Application
 
-    assert is_float(loaded.health_score)
-    assert loaded.health_score >= 0.0
-    assert loaded.health_score <= 1.0
+```elixir
+defmodule AshExtensions.Endpoint do
+  use Phoenix.Endpoint, otp_app: :ash_extensions
+
+  plug Plug.Session,
+    store: :cookie,
+    key: "_ash_extensions_key",
+    signing_salt: "change_me"
+
+  plug AshExtensions.Router
+end
+
+defmodule AshExtensions.Application do
+  use Application
+
+  @impl true
+  def start(_type, _args) do
+    children = [
+      AshExtensions.Repo,
+      AshExtensions.Endpoint
+    ]
+
+    Supervisor.start_link(children, strategy: :one_for_one)
+  end
+end
+```
+
+### Step 9: Tests — `test/api_test.exs`
+
+```elixir
+defmodule AshExtensions.ApiTest do
+  use ExUnit.Case, async: false
+
+  alias AshExtensions.Catalog
+  alias AshExtensions.Catalog.{Category, Product}
+
+  setup do
+    :ok = Ecto.Adapters.SQL.Sandbox.checkout(AshExtensions.Repo)
+    Ecto.Adapters.SQL.Sandbox.mode(AshExtensions.Repo, {:shared, self()})
+
+    {:ok, category} =
+      Category
+      |> Ash.Changeset.for_create(:create, %{name: "Widgets", slug: "widgets"})
+      |> Ash.create()
+
+    %{category: category}
   end
 
-  test "accessing calculation without load raises" do
-    svc = insert_service()
+  describe "JSON:API — POST /api/json/products" do
+    test "creates a product", %{category: cat} do
+      body =
+        Jason.encode!(%{
+          data: %{
+            type: "product",
+            attributes: %{sku: "W-001", name: "Red Widget"},
+            relationships: %{
+              category: %{data: %{type: "category", id: cat.id}}
+            }
+          }
+        })
 
-    [raw] =
-      Service
-      |> Ash.Query.filter(id == ^svc.id)
-      |> Config.read!()
+      conn =
+        Plug.Test.conn(:post, "/api/json/products", body)
+        |> Plug.Conn.put_req_header("content-type", "application/vnd.api+json")
 
-    assert_raise RuntimeError, fn ->
-      _ = raw.health_score
+      response = AshExtensions.JsonApiRouter.call(conn, [])
+      assert response.status == 201
+    end
+  end
+
+  describe "GraphQL — register_product" do
+    test "runs the register action", %{category: cat} do
+      query = """
+      mutation {
+        registerProduct(input: {sku: "W-002", name: "Blue", categoryId: "#{cat.id}"}) {
+          result { sku name status }
+          errors { message }
+        }
+      }
+      """
+
+      {:ok, %{data: data}} = Absinthe.run(query, AshExtensions.GraphqlSchema)
+      assert data["registerProduct"]["result"]["sku"] == "W-002"
+      assert data["registerProduct"]["result"]["status"] == "draft"
     end
   end
 end
 ```
 
-```elixir
-# test/api_gateway/config/policy_test.exs
-defmodule ApiGateway.Config.PolicyTest do
-  use ApiGateway.DataCase, async: true
-
-  alias ApiGateway.Config
-  alias ApiGateway.Config.Resources.{Service, Operator}
-
-  defp insert_service(attrs \\ %{}) do
-    Service
-    |> Ash.Changeset.for_create(:create, %{
-      name: "svc-#{:rand.uniform(9_999_999)}",
-      upstream_url: "https://up.internal",
-      status: :active,
-      weight: 100
-    } |> Map.merge(attrs))
-    |> Config.create!()
-  end
-
-  defp make_operator(role) do
-    %Operator{id: Ecto.UUID.generate(), role: role, email: "op@test.io"}
-  end
-
-  test "readonly operator can read services" do
-    _svc = insert_service()
-    op = make_operator(:readonly)
-
-    result =
-      Service
-      |> Ash.Query.for_read(:active, %{}, actor: op)
-      |> Config.read()
-
-    assert {:ok, _services} = result
-  end
-
-  test "readonly operator cannot create services" do
-    op = make_operator(:readonly)
-
-    result =
-      Service
-      |> Ash.Changeset.for_create(:create, %{
-        name: "new-svc",
-        upstream_url: "https://new.internal",
-        status: :active,
-        weight: 50
-      }, actor: op)
-      |> Config.create()
-
-    assert {:error, %Ash.Error.Forbidden{}} = result
-  end
-
-  test "admin operator can create services" do
-    op = make_operator(:admin)
-
-    result =
-      Service
-      |> Ash.Changeset.for_create(:create, %{
-        name: "admin-svc-#{:rand.uniform(999_999)}",
-        upstream_url: "https://admin.internal",
-        status: :active,
-        weight: 75
-      }, actor: op)
-      |> Config.create()
-
-    assert {:ok, _svc} = result
-  end
-end
-```
-
-### Step 11: Run the tests
+### Step 10: Run
 
 ```bash
-mix test test/api_gateway/config/ --trace
+mix deps.get
+mix ash_postgres.generate_migrations --name api_initial
+mix ash_postgres.migrate
+mix test
+iex -S mix phx.server
+# visit http://localhost:4000/admin
+# visit http://localhost:4000/api/gql/playground
 ```
 
 ---
 
-## Trade-off analysis
+## Trade-offs and production gotchas
 
-| Aspect | Ash calculations | Virtual Ecto field | Database computed column |
-|--------|-----------------|--------------------|--------------------------|
-| Declaration site | Resource (single source) | Schema + populating code | Migration |
-| Auto-loaded | No — opt-in via `load` | No — silent nil | Yes — always |
-| External data (GenServer) | Yes (module calculation) | Yes (manual call) | No |
-| SQL pushdown | Yes (expr calculations) | No | Yes |
-| Queryable (filter/sort) | Yes (expr only) | No | Yes |
+**1. Auto-generated APIs expose your internals**
+Every public attribute becomes visible via at least one API. Auditing "what can an external partner see?" requires reading the resource, not the controller. Use `public?: false` aggressively on fields you do not want exposed.
 
-Reflection question: `calculate :health_score` calls `MetricsStore.get_metrics/1` for each service record. If a query returns 200 services, that is 200 GenServer calls. How would you redesign `HealthScore.calculate/3` to call a batch function once?
+**2. Filter surface can be larger than expected**
+AshJsonApi exposes filter operators on every attribute (`eq`, `in`, `gt`, `lt`, `like`) unless you restrict via the `filterable?` attribute on policies. A naive deployment lets anyone scan your table with `?filter[price][lt]=...`. Lock down filter shapes for untrusted clients.
+
+**3. GraphQL depth attacks**
+Without depth/complexity limits, an attacker issues `product { category { products { category { products ... }}}}` and hammers your DB. Configure Absinthe's `Absinthe.Complexity` plug and reject queries above a threshold.
+
+**4. AshAdmin is not a public surface**
+It has minimal auth by default. Put it behind your session auth and a role check — never expose it to the internet. Use `ash_authentication` or a Plug guard.
+
+**5. Breaking GraphQL schema changes are silent**
+Renaming a field on a resource renames the GraphQL field. Mobile clients pinned to the old field break. Introduce a deprecation path: keep the old field, add the new one, migrate clients, remove later.
+
+**6. JSON:API + custom routes — all or nothing**
+The JSON:API spec is strict. Once you expose `POST /products/:id/publish`, you're outside strict JSON:API for that endpoint. Either embrace sub-resources (`/products/:id/relationships/status`) or accept that some actions are pragmatic REST.
+
+**7. Admin forms are opinionated, not bespoke**
+A custom workflow (multi-step form, preview of an action's effect before confirming) does not fit AshAdmin's single-form-per-action model. For those cases build a custom LiveView and keep Admin for the CRUD majority.
+
+**8. When NOT to use Ash extensions**
+If the only consumer is one LiveView app, AshAdmin and AshGraphql are overkill. Plain Phoenix + Ash code interface is simpler and faster. Extensions earn their weight when you have ≥2 consumers of different shapes.
 
 ---
 
-## Common production mistakes
+## Performance notes
 
-**1. Returning `[values]` from `calculate/3` in the wrong order**
-`calculate/3` receives `records` in query order and must return values in the same order. Sorting inside `calculate/3` silently assigns wrong values.
+Auto-generated APIs have three overhead layers:
 
-**2. `json_api` block without `public?: true` on attributes**
-AshJsonApi exposes only public attributes. Omitted attributes are invisible in the REST response with no error.
+| Layer | Typical cost | Mitigation |
+|-------|--------------|------------|
+| Plug parsing + body decode | 0.2–1 ms | Keep payloads small, use HTTP/2 |
+| Ash action pipeline (policies, changes, validations) | 0.5–2 ms | Precompile policies, avoid runtime closures |
+| Underlying Ecto query | dominates (5–100 ms) | Indexes, preloads, proper `load:` lists |
 
-**3. Policies that allow actions but not the data layer**
-A policy that says "readonly can read" must also allow the underlying data layer read. Test with real actor structs.
+GraphQL query complexity matters more than raw request/response time: a single GraphQL mutation with a deep selection may fire 5 SQL queries where the equivalent REST sequence would fire 10 round-trips. That is the main perf win.
 
-**4. AshAuthentication token resource not in the domain**
-If omitted from `resources do ... end`, token verification silently fails.
+Benchmark a representative workload with [Wrk](https://github.com/wg/wrk) against `/api/json/products` and `/api/gql`. Expect 1–3k rps per core with warm caches; Ecto preloads dominate beyond that.
 
 ---
 
 ## Resources
 
-- [AshJsonApi](https://hexdocs.pm/ash_json_api) — routes, JSON:API format, OpenAPI generation
-- [AshAuthentication](https://hexdocs.pm/ash_authentication) — password strategy, tokens
-- [Ash Calculations](https://hexdocs.pm/ash/calculations.html) — expr vs module, load dependencies
-- [Ash Policies](https://hexdocs.pm/ash/policies.html) — authorize_if, actor_attribute_equals, actor_present
+- [AshJsonApi hexdocs](https://hexdocs.pm/ash_json_api/) — full DSL
+- [AshGraphql hexdocs](https://hexdocs.pm/ash_graphql/) — full DSL
+- [AshAdmin hexdocs](https://hexdocs.pm/ash_admin/) — setup guide
+- [JSON:API specification](https://jsonapi.org/format/) — know this before exposing REST routes
+- [Absinthe.Complexity docs](https://hexdocs.pm/absinthe/complexity-analysis.html) — GraphQL safety net
+- [Zach Daniel — "Ash 3.0 overview"](https://www.youtube.com/results?search_query=ash+3.0+zach+daniel) — creator's talks
+- [Ash + Phoenix production guide](https://hexdocs.pm/ash_phoenix/) — recommended integration patterns

@@ -3,8 +3,6 @@
 **Project**: `my_service_app` — an OTP application with an explicit `Application`
 module, a supervision root, and a lifecycle you can observe start and stop.
 
-**Difficulty**: ★★☆☆☆
-**Estimated time**: 1–2 hours
 
 ---
 
@@ -35,6 +33,11 @@ my_service_app/
 ```
 
 ---
+
+
+## Why X and not Y
+
+- **Why not start processes at module-load time?** No supervision, no ordering, no test isolation. `Application.start/2` is the OTP-blessed entry point.
 
 ## Core concepts
 
@@ -74,7 +77,31 @@ mix.exs) decides whether the whole node comes down with it.
 
 ---
 
+## Design decisions
+
+**Option A — start children directly in `mix.exs` or at import-time**
+- Pros: simpler upfront, fewer moving parts.
+- Cons: hides the trade-off that this exercise exists to teach.
+
+**Option B — `Application.start/2` callback (chosen)**
+- Pros: explicit about the semantic that matters in production.
+- Cons: one more concept to internalize.
+
+→ Chose **B** because the callback is where supervision tree construction belongs — testable, restartable, and ordered.
+
+
 ## Implementation
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defp deps do
+  [
+    # stdlib-only by default; add `{:benchee, "~> 1.3", only: :dev}` if you benchmark
+  ]
+end
+```
+
 
 ### Step 1: Create the project with a supervision tree
 
@@ -217,6 +244,15 @@ mix test
 
 ---
 
+### Why this works
+
+The design leans on OTP primitives that already encode the invariants we care about (supervision, back-pressure, explicit message semantics), so failure modes are visible at the right layer instead of being reinvented ad-hoc. Tests exercise the edges (timeouts, crashes, boundary states), which is where hand-rolled alternatives silently drift over time.
+
+
+## Benchmark
+
+<!-- benchmark N/A: tema conceptual -->
+
 ## Trade-offs and production gotchas
 
 **1. `start/2` must return fast**
@@ -243,6 +279,11 @@ Pure libraries (no processes, no state) should omit `mod:`. Loading the
 app is enough — starting it is overhead for a library with no runtime.
 
 ---
+
+
+## Reflection
+
+- Tu `start/2` necesita leer config de DB antes de construir el tree. ¿Dónde leés y qué pasa si la DB no responde?
 
 ## Resources
 

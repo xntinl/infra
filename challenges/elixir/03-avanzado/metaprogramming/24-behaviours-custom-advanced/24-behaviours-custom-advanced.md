@@ -1,497 +1,403 @@
-# Advanced Behaviours with Compile-Time Validation
+# Advanced Behaviours with Optional Callbacks and Runtime Checks
+
+**Project**: `behaviours_advanced` — a plugin system that defines a behaviour with required, optional, and versioned callbacks, enforces them at compile time, and performs runtime `ensure_loaded?` checks for hot-reloaded plugins.
+
+**Difficulty**: ★★★★☆
+**Estimated time**: 4–6 hours
+
+---
 
 ## Project context
 
-You are building `api_gateway`, an internal HTTP gateway that routes traffic to microservices.
-The gateway supports pluggable middleware components,
-and teams contribute new middleware constantly. Without a formal contract, middleware
-modules vary in their function signatures, miss required callbacks, or skip optional
-lifecycle hooks — causing runtime crashes that only appear when a specific request
-hits the missing code path.
+You run a multi-tenant notification service with a plugin architecture. Third parties
+drop in modules that implement `Notifier` (Slack, SMS, Email, Push, Webhook). Each
+plugin must:
 
-The solution is a formal `ApiGateway.Middleware.Behaviour` that:
-1. Defines required and optional callbacks with full typespecs
-2. Validates at compile time (via `@before_compile`) that every required callback
-   is implemented — catching missing implementations at `mix compile`, not in prod
-3. Provides default implementations for optional callbacks via `__using__/1`
+- Implement `send_notification/2` — required
+- Optionally implement `healthcheck/0` — if absent, the supervisor skips it
+- Optionally implement `format_preview/1` — used by the admin UI
+- Export a `version/0` that matches a minimum
 
-Project structure:
+A misconfigured plugin today (missing required callback, wrong arity) crashes at boot.
+You want compile-time feedback plus runtime tolerance when optional callbacks are
+absent. This is what OTP, Plug, and Phoenix Channels do — their behaviours
+mix `@callback` and `@optional_callbacks`, and the host uses
+`function_exported?/3` before calling an optional one.
 
 ```
-api_gateway/
+behaviours_advanced/
 ├── lib/
-│   └── api_gateway/
-│       ├── application.ex
-│       ├── router.ex
-│       └── middleware/
-│           └── behaviour.ex
+│   └── behaviours_advanced/
+│       ├── notifier.ex              # the behaviour contract
+│       ├── registry.ex              # loads + validates plugins at runtime
+│       ├── plugins/
+│       │   ├── slack.ex             # full impl
+│       │   ├── sms.ex               # full impl
+│       │   └── partial.ex           # missing optional callbacks
+│       └── application.ex
 ├── test/
-│   └── api_gateway/
-│       └── middleware/
-│           └── behaviour_test.exs
+│   └── notifier_test.exs
 └── mix.exs
 ```
 
-The `ApiGateway.Conn` struct used by the behaviour is defined as:
+---
+
+## Core concepts
+
+### 1. `@callback` vs `@optional_callbacks`
 
 ```elixir
-defmodule ApiGateway.Conn do
-  @moduledoc "Represents an in-flight HTTP connection through the gateway."
-  defstruct [:method, :path, :status, :remote_ip, :assigns]
+@callback send_notification(user :: map(), msg :: String.t()) :: :ok | {:error, term()}
+@callback healthcheck() :: :ok | {:error, term()}
+@callback format_preview(msg :: String.t()) :: String.t()
+
+@optional_callbacks [healthcheck: 0, format_preview: 1]
+```
+
+The compiler will warn (via `@behaviour Notifier`) when a required callback is
+missing. Optional callbacks are only checked when the host actively calls them.
+
+### 2. Compile-time validation hook: `@after_compile`
+
+`@after_compile` runs a function after the implementing module finishes compiling. You
+receive `env` and the `bytecode`. This is where you can cross-check arities, version
+numbers, or enforce additional project-specific rules.
+
+### 3. Runtime `function_exported?/3` gate
+
+```
+if function_exported?(mod, :healthcheck, 0) do
+  mod.healthcheck()
+else
+  :skip
 end
 ```
 
----
+`function_exported?/3` returns `false` before the module is loaded; call
+`Code.ensure_loaded?(mod)` first in release mode, because modules are lazily loaded.
 
-## The business problem
+### 4. `@impl true` annotations
 
-Two requirements:
+`@impl true` on a function tells the compiler "I intend this as behaviour impl". If
+the behaviour changes a signature and you forget to update, you get an explicit warning
+instead of silent drift. Use it on every callback implementation.
 
-1. **Compile-time contract enforcement**: if a developer creates a middleware module
-   and forgets to implement `call/2`, the build must fail with a clear message
-   (`"Module Foo.Bar claims to be a middleware but does not implement call/2"`).
-   A runtime crash on the first request is unacceptable.
+### 5. Versioned behaviours
 
-2. **Optional lifecycle hooks**: middleware can optionally implement `init/1`
-   (called once at startup to validate options), `on_error/3` (called when an
-   exception escapes), and `telemetry_prefix/0` (returns the telemetry event
-   prefix). Middleware that doesn't implement these gets sensible defaults:
-   `init/1` returns its argument unchanged, `on_error/3` re-raises.
-
----
-
-## Behaviours vs Protocols — when to use which
-
-| | Behaviour | Protocol |
-|---|-----------|---------|
-| Polymorphism over | Module identity | Value type |
-| Dispatch | Explicit — `Module.function()` | Implicit — `Protocol.function(value)` |
-| Compile-time check | Via `@before_compile` or Dialyzer | Via `Protocol.impl_for!/1` in tests |
-| Default impl | Yes — via `__using__/1` | Yes — via `for: Any` |
-| Use case | Plugins, adapters, drivers | Data transformation, formatting |
-
-Middleware is a *module-level* contract: the pipeline calls `Module.call(conn, opts)`.
-This is a behaviour, not a protocol — no value dispatch is needed.
-
----
-
-## `@optional_callbacks` — how they work
-
-```elixir
-@optional_callbacks [init: 1, on_error: 3, telemetry_prefix: 0]
-@callback init(opts :: keyword()) :: keyword()
-@callback on_error(conn :: Conn.t(), error :: Exception.t(), stacktrace :: list()) :: Conn.t()
-@callback telemetry_prefix() :: [atom()]
-```
-
-`@optional_callbacks` tells the compiler not to emit a warning when a module
-that `@behaviour MyBehaviour` does not implement these callbacks. The behaviour
-module itself can then check `function_exported?(mod, :init, 1)` at runtime to
-decide whether to call the optional implementation or use the default.
-
----
-
-## `@macrocallback` — when the implementation must be a macro
-
-```elixir
-@macrocallback transform_opts(opts :: Macro.t()) :: Macro.t()
-```
-
-`@macrocallback` is used when the implementing module must provide a macro, not a
-function. This is rare — it's used by DSLs (like `Ecto.Schema`) where the callback
-must inject quoted code into the caller's module. For the middleware behaviour, all
-callbacks are regular functions.
+A behaviour can evolve. Having impls declare `version/0` and the host compare against
+`@minimum_version` gives you graceful compatibility. This is how Phoenix handles
+`endpoint/init` signature changes across majors.
 
 ---
 
 ## Implementation
 
-### Step 1: `lib/api_gateway/middleware/behaviour.ex`
+### Step 1: `lib/behaviours_advanced/notifier.ex`
 
 ```elixir
-defmodule ApiGateway.Middleware.Behaviour do
+defmodule BehavioursAdvanced.Notifier do
   @moduledoc """
-  Behaviour contract for all ApiGateway middleware modules.
+  Behaviour for notification plugins.
 
-  Required callbacks:
-    - call/2: processes a connection; must be implemented by every middleware
+  Required:
+    * `send_notification/2`
+    * `version/0`
 
-  Optional callbacks (have defaults via __using__/1):
-    - init/1: validates options at startup; default returns opts unchanged
-    - on_error/3: handles escaped exceptions; default re-raises
-    - telemetry_prefix/0: prefix for :telemetry events; default uses module name
-
-  Usage:
-    defmodule ApiGateway.Middleware.Auth do
-      use ApiGateway.Middleware.Behaviour
-
-      @impl true
-      def call(conn, opts) do
-        # ... auth logic
-        conn
-      end
-
-      @impl true
-      def init(opts) do
-        Keyword.validate!(opts, [:realm, :required])
-      end
-    end
-
-  The __using__/1 macro injects three things into the implementing module:
-  1. @behaviour declaration (enables compiler callback checking)
-  2. Default implementations for all optional callbacks (overridable)
-  3. @before_compile hook that validates call/2 is explicitly defined
+  Optional:
+    * `healthcheck/0`
+    * `format_preview/1`
   """
 
-  alias ApiGateway.Conn
+  @type user :: %{required(:id) => String.t(), optional(atom()) => term()}
+  @type msg :: String.t()
 
-  # ── Required callbacks ──────────────────────────────────────────────────────
+  @callback send_notification(user(), msg()) :: :ok | {:error, term()}
+  @callback version() :: Version.t() | String.t()
+  @callback healthcheck() :: :ok | {:error, term()}
+  @callback format_preview(msg()) :: String.t()
 
-  @doc """
-  Processes an in-flight connection.
-  Must return the (possibly modified) conn.
-  """
-  @callback call(conn :: Conn.t(), opts :: keyword()) :: Conn.t()
+  @optional_callbacks [healthcheck: 0, format_preview: 1]
 
-  # ── Optional callbacks ──────────────────────────────────────────────────────
-
-  @optional_callbacks [init: 1, on_error: 3, telemetry_prefix: 0]
-
-  @doc """
-  Called once when the middleware is initialized (at pipeline build time).
-  Use to validate options and raise ArgumentError for bad configuration.
-  Default: returns opts unchanged.
-  """
-  @callback init(opts :: keyword()) :: keyword()
-
-  @doc """
-  Called when an exception escapes from call/2.
-  Must return a conn (to send an error response) or re-raise.
-  Default: re-raises the exception with the original stacktrace.
-  """
-  @callback on_error(conn :: Conn.t(), error :: Exception.t(), stacktrace :: list()) :: Conn.t()
-
-  @doc """
-  Returns the :telemetry event name prefix for this middleware.
-  Default: [:api_gateway, :middleware, <module_name_snake_case>]
-  """
-  @callback telemetry_prefix() :: [atom()]
-
-  # ── __using__/1 — injects defaults and registers compile-time validation ────
+  @minimum_version "1.0.0"
 
   defmacro __using__(_opts) do
     quote do
-      @behaviour ApiGateway.Middleware.Behaviour
-
-      # Default implementations for optional callbacks.
-      # Implementing modules may override these with @impl true.
-
-      @impl ApiGateway.Middleware.Behaviour
-      def init(opts), do: opts
-
-      @impl ApiGateway.Middleware.Behaviour
-      def on_error(_conn, error, stacktrace), do: reraise(error, stacktrace)
-
-      @impl ApiGateway.Middleware.Behaviour
-      def telemetry_prefix do
-        # Derive the telemetry prefix from the module name.
-        # Takes the last component of the module name (e.g., "Auth" from
-        # "ApiGateway.Middleware.Auth"), converts it to snake_case, and
-        # builds the standard telemetry prefix path.
-        last_part =
-          __MODULE__
-          |> Module.split()
-          |> List.last()
-          |> Macro.underscore()
-          |> String.to_atom()
-
-        [:api_gateway, :middleware, last_part]
-      end
-
-      # Allow implementing modules to override the defaults
-      defoverridable [init: 1, on_error: 3, telemetry_prefix: 0]
-
-      # Register compile-time validation
-      @before_compile ApiGateway.Middleware.Behaviour
+      @behaviour BehavioursAdvanced.Notifier
+      @after_compile BehavioursAdvanced.Notifier
     end
   end
 
-  # ── Compile-time validation ──────────────────────────────────────────────────
+  @doc false
+  def __after_compile__(env, _bytecode) do
+    ensure_version!(env.module)
+  end
 
-  defmacro __before_compile__(env) do
-    module = env.module
+  @spec ensure_version!(module()) :: :ok
+  def ensure_version!(mod) do
+    case function_exported?(mod, :version, 0) do
+      false ->
+        raise CompileError,
+          description: "#{inspect(mod)} must implement version/0"
 
-    # Module.defines?/3 checks if the function is explicitly defined in this module.
-    # At this point the module body has been fully evaluated, so all `def` declarations
-    # are visible. If call/2 is not defined, the module cannot function as middleware.
-    unless Module.defines?(module, {:call, 2}, :def) do
-      raise CompileError,
-        file: env.file,
-        line: env.line,
-        description:
-          "#{inspect(module)} uses ApiGateway.Middleware.Behaviour " <>
-          "but does not implement the required callback call/2"
+      true ->
+        v = mod.version() |> to_version()
+        min = Version.parse!(@minimum_version)
+
+        if Version.compare(v, min) == :lt do
+          raise CompileError,
+            description:
+              "#{inspect(mod)} reports version #{v}, minimum required is #{@minimum_version}"
+        end
+
+        :ok
     end
+  end
 
+  defp to_version(%Version{} = v), do: v
+  defp to_version(bin) when is_binary(bin), do: Version.parse!(bin)
+end
+```
+
+### Step 2: `lib/behaviours_advanced/plugins/slack.ex`
+
+```elixir
+defmodule BehavioursAdvanced.Plugins.Slack do
+  use BehavioursAdvanced.Notifier
+
+  @impl true
+  def send_notification(%{id: _id}, msg) do
+    # In real code: HTTP POST to Slack webhook.
+    {:ok, :sent_via_slack_with: msg}
     :ok
   end
 
-  # ── Runtime helpers for the pipeline ────────────────────────────────────────
+  @impl true
+  def version, do: "1.2.0"
 
-  @doc """
-  Calls init/1 on `module` if it exports the function, otherwise returns opts unchanged.
-  Used by the pipeline builder to initialize each middleware.
-  """
-  @spec maybe_init(module(), keyword()) :: keyword()
-  def maybe_init(module, opts) do
-    if function_exported?(module, :init, 1) do
-      module.init(opts)
-    else
-      opts
-    end
-  end
+  @impl true
+  def healthcheck, do: :ok
 
-  @doc """
-  Calls on_error/3 on `module` if it exports the function,
-  otherwise re-raises the error.
-  """
-  @spec maybe_on_error(module(), Conn.t(), Exception.t(), list()) :: Conn.t()
-  def maybe_on_error(module, conn, error, stacktrace) do
-    if function_exported?(module, :on_error, 3) do
-      module.on_error(conn, error, stacktrace)
-    else
-      reraise(error, stacktrace)
-    end
-  end
-
-  @doc """
-  Returns true if `module` is a valid middleware (implements the behaviour).
-  Uses behaviour_info/1 introspection.
-
-  First checks Code.ensure_loaded?/1 to avoid errors for non-existent modules,
-  then inspects the module's :behaviour attribute list to verify this specific
-  behaviour is declared.
-  """
-  @spec middleware?(module()) :: boolean()
-  def middleware?(module) do
-    Code.ensure_loaded?(module) &&
-      module.__info__(:attributes)
-      |> Keyword.get_values(:behaviour)
-      |> List.flatten()
-      |> Enum.member?(__MODULE__)
-  end
+  @impl true
+  def format_preview(msg), do: "[slack] " <> String.slice(msg, 0, 80)
 end
 ```
 
-### Step 2: Given tests — must pass without modification
+### Step 3: `lib/behaviours_advanced/plugins/sms.ex`
 
 ```elixir
-# test/api_gateway/middleware/behaviour_test.exs
-defmodule ApiGateway.Middleware.BehaviourTest do
-  use ExUnit.Case, async: true
+defmodule BehavioursAdvanced.Plugins.SMS do
+  use BehavioursAdvanced.Notifier
 
-  alias ApiGateway.Middleware.Behaviour, as: MWBehaviour
+  @impl true
+  def send_notification(%{id: _id}, msg) when byte_size(msg) <= 160, do: :ok
+  def send_notification(_, _), do: {:error, :too_long}
 
-  # ---------------------------------------------------------------------------
-  # A correct middleware implementation
-  # ---------------------------------------------------------------------------
+  @impl true
+  def version, do: "1.0.0"
 
-  defmodule ValidMiddleware do
-    use ApiGateway.Middleware.Behaviour
-
-    @impl true
-    def call(conn, _opts), do: Map.put(conn, :valid_mw, true)
-  end
-
-  # A middleware with all optional callbacks overridden
-  defmodule FullMiddleware do
-    use ApiGateway.Middleware.Behaviour
-
-    @impl true
-    def call(conn, _opts), do: Map.put(conn, :full_mw, true)
-
-    @impl true
-    def init(opts), do: Keyword.put(opts, :initialized, true)
-
-    @impl true
-    def on_error(_conn, _error, _stacktrace), do: %{status: 500, error: true}
-
-    @impl true
-    def telemetry_prefix(), do: [:api_gateway, :middleware, :full]
-  end
-
-  # ---------------------------------------------------------------------------
-  # Tests
-  # ---------------------------------------------------------------------------
-
-  describe "required callback enforcement" do
-    test "module implementing call/2 compiles without error" do
-      # ValidMiddleware was defined above — if it compiled, this passes
-      assert function_exported?(ValidMiddleware, :call, 2)
-    end
-
-    test "compile-time error for missing call/2" do
-      assert_raise CompileError, ~r/call\/2/, fn ->
-        defmodule MissingCallMiddleware do
-          use ApiGateway.Middleware.Behaviour
-          # Intentionally no call/2
-        end
-      end
+  @impl true
+  def healthcheck do
+    case :rand.uniform(100) do
+      n when n > 5 -> :ok
+      _ -> {:error, :carrier_down}
     end
   end
 
-  describe "default implementations" do
-    test "init/1 default returns opts unchanged" do
-      opts = [realm: "admin", timeout: 5_000]
-      assert ValidMiddleware.init(opts) == opts
-    end
+  # deliberately omits format_preview/1 — it's optional
+end
+```
 
-    test "telemetry_prefix/0 default returns a list of atoms" do
-      prefix = ValidMiddleware.telemetry_prefix()
-      assert is_list(prefix)
-      assert Enum.all?(prefix, &is_atom/1)
-      assert length(prefix) >= 2
-    end
+### Step 4: `lib/behaviours_advanced/plugins/partial.ex`
+
+```elixir
+defmodule BehavioursAdvanced.Plugins.Partial do
+  @moduledoc "Minimal plugin — only implements required callbacks."
+  use BehavioursAdvanced.Notifier
+
+  @impl true
+  def send_notification(_user, _msg), do: :ok
+
+  @impl true
+  def version, do: "1.0.0"
+end
+```
+
+### Step 5: `lib/behaviours_advanced/registry.ex`
+
+```elixir
+defmodule BehavioursAdvanced.Registry do
+  @moduledoc "Runtime coordinator: dispatches to plugins, gracefully handling optional callbacks."
+
+  @spec dispatch([module()], map(), String.t()) :: %{required(module()) => :ok | {:error, term()}}
+  def dispatch(plugins, user, msg) do
+    plugins
+    |> Enum.map(fn mod -> {mod, safe_send(mod, user, msg)} end)
+    |> Map.new()
   end
 
-  describe "optional callback overrides" do
-    test "init/1 override is called instead of default" do
-      opts = [foo: :bar]
-      result = FullMiddleware.init(opts)
-      assert result[:initialized] == true
-      assert result[:foo] == :bar
-    end
-
-    test "telemetry_prefix/0 override returns custom prefix" do
-      assert FullMiddleware.telemetry_prefix() == [:api_gateway, :middleware, :full]
-    end
-
-    test "on_error/3 override returns a map instead of re-raising" do
-      result = FullMiddleware.on_error(%{}, %RuntimeError{message: "test"}, [])
-      assert result.error == true
-    end
+  @spec healthchecks([module()]) :: %{required(module()) => :ok | {:error, term()} | :not_implemented}
+  def healthchecks(plugins) do
+    plugins
+    |> Enum.map(fn mod -> {mod, call_optional(mod, :healthcheck, [])} end)
+    |> Map.new()
   end
 
-  describe "maybe_init/2 and maybe_on_error/4" do
-    test "maybe_init/2 calls init when exported" do
-      opts = MWBehaviour.maybe_init(FullMiddleware, [])
-      assert opts[:initialized] == true
-    end
-
-    test "maybe_init/2 returns opts unchanged when init not exported" do
-      # ValidMiddleware uses the default init (defoverridable + re-defined as default)
-      # But the default is exported — use a plain module without use
-      defmodule NoInitModule do
-        @behaviour ApiGateway.Middleware.Behaviour
-        def call(conn, _), do: conn
-      end
-
-      opts = [key: :value]
-      assert MWBehaviour.maybe_init(NoInitModule, opts) == opts
-    end
+  @spec previews([module()], String.t()) :: %{required(module()) => String.t() | :not_implemented}
+  def previews(plugins, msg) do
+    plugins
+    |> Enum.map(fn mod -> {mod, call_optional(mod, :format_preview, [msg])} end)
+    |> Map.new()
   end
 
-  describe "middleware?/1" do
-    test "returns true for a module using the behaviour" do
-      assert MWBehaviour.middleware?(ValidMiddleware) == true
-    end
-
-    test "returns false for a plain module" do
-      defmodule PlainModule do
-        def hello, do: :world
-      end
-
-      assert MWBehaviour.middleware?(PlainModule) == false
-    end
-
-    test "returns false for non-existent module" do
-      assert MWBehaviour.middleware?(NonExistent.Module.XYZ) == false
-    end
+  defp safe_send(mod, user, msg) do
+    mod.send_notification(user, msg)
+  rescue
+    e -> {:error, Exception.message(e)}
   end
 
-  describe "behaviour_info introspection" do
-    test "required callbacks includes call/2" do
-      all_callbacks = MWBehaviour.behaviour_info(:callbacks)
-      assert {:call, 2} in all_callbacks
-    end
+  defp call_optional(mod, fun, args) do
+    _ = Code.ensure_loaded(mod)
+    arity = length(args)
 
-    test "optional callbacks includes init/1, on_error/3, telemetry_prefix/0" do
-      optional = MWBehaviour.behaviour_info(:optional_callbacks)
-      assert {:init, 1} in optional
-      assert {:on_error, 3} in optional
-      assert {:telemetry_prefix, 0} in optional
-    end
-
-    test "call/2 is NOT in optional callbacks" do
-      optional = MWBehaviour.behaviour_info(:optional_callbacks)
-      refute {:call, 2} in optional
+    if function_exported?(mod, fun, arity) do
+      apply(mod, fun, args)
+    else
+      :not_implemented
     end
   end
 end
 ```
 
-### Step 3: Run the tests
+### Step 6: Tests
 
-```bash
-mix test test/api_gateway/middleware/behaviour_test.exs --trace
+```elixir
+defmodule BehavioursAdvanced.NotifierTest do
+  use ExUnit.Case, async: true
+
+  alias BehavioursAdvanced.Plugins.{Slack, SMS, Partial}
+  alias BehavioursAdvanced.Registry
+
+  @user %{id: "u-1"}
+
+  describe "dispatch/3 — required callback" do
+    test "calls send_notification on every plugin" do
+      result = Registry.dispatch([Slack, SMS, Partial], @user, "hello")
+      assert result[Slack] == :ok
+      assert result[SMS] == :ok
+      assert result[Partial] == :ok
+    end
+
+    test "SMS rejects messages over 160 bytes" do
+      long = String.duplicate("a", 200)
+      result = Registry.dispatch([SMS], @user, long)
+      assert result[SMS] == {:error, :too_long}
+    end
+  end
+
+  describe "healthchecks/1 — optional callback" do
+    test "Slack and SMS return :ok or an error" do
+      result = Registry.healthchecks([Slack, SMS])
+      assert result[Slack] in [:ok]
+      assert result[SMS] in [:ok, {:error, :carrier_down}]
+    end
+
+    test "Partial plugin returns :not_implemented" do
+      result = Registry.healthchecks([Partial])
+      assert result[Partial] == :not_implemented
+    end
+  end
+
+  describe "previews/2 — optional callback" do
+    test "Slack formats a preview" do
+      result = Registry.previews([Slack], "hi there")
+      assert result[Slack] =~ "[slack]"
+    end
+
+    test "SMS and Partial return :not_implemented" do
+      result = Registry.previews([SMS, Partial], "hi")
+      assert result[SMS] == :not_implemented
+      assert result[Partial] == :not_implemented
+    end
+  end
+
+  describe "version enforcement" do
+    test "plugin below minimum version fails to compile" do
+      code = """
+      defmodule TooOld do
+        use BehavioursAdvanced.Notifier
+        @impl true
+        def send_notification(_, _), do: :ok
+        @impl true
+        def version, do: "0.9.0"
+      end
+      """
+
+      assert_raise CompileError, ~r/minimum required is 1.0.0/, fn ->
+        Code.compile_string(code)
+      end
+    end
+  end
+end
 ```
 
 ---
 
-## Trade-off analysis
+## Trade-offs and production gotchas
 
-| Approach | Compile-time safety | Runtime overhead | Default impls | Polymorphism |
-|----------|--------------------|-----------------|--------------|----|
-| `@behaviour` + `@before_compile` check | High — missing callbacks = compile error | None | Via `__using__` + `defoverridable` | Module-level only |
-| `@behaviour` only (no extra check) | Medium — Dialyzer warns, compiler does not | None | Via `__using__` + `defoverridable` | Module-level only |
-| Protocol | Low (unless `impl_for!/1` in tests) | O(1) consolidated | Via `for: Any` | Value-type dispatch |
-| Plain function contract (docs only) | None | None | N/A | None |
+**1. `function_exported?/3` returns false for unloaded modules.** Under releases,
+modules load lazily. Always call `Code.ensure_loaded/1` first when you cannot rely on
+the module having been referenced in code.
 
-**When `@before_compile` validation is worth it**: when the behaviour is widely
-implemented by many teams (internal or external contributors) and a missing
-callback causes a hard crash rather than a graceful error. Gateway middleware is
-a perfect fit: `call/2` is load-bearing; forgetting it means every request crashes.
+**2. `@after_compile` runs once per impl but does NOT see other impls.** Cross-module
+coherence checks (e.g. "exactly one plugin exports a slug") require a registry pattern,
+not `@after_compile`.
+
+**3. `@impl true` is advisory but critical.** Without it, renaming a callback silently
+passes. Enforce `warnings_as_errors: true` in CI and `@impl true` everywhere.
+
+**4. Optional callback wrappers cost a dispatch.** The `call_optional/3` path does a
+`function_exported?` check per call. For very hot paths, cache the boolean in ETS on
+boot.
+
+**5. Behaviours do NOT enforce return types.** `@callback send_notification(...) :: :ok`
+is a Dialyzer contract, not a runtime check. Tests remain necessary.
+
+**6. Versioning gotcha — Version.parse!/1 crashes on garbage.** Wrap the parse in a
+more helpful error or document the constraint.
+
+**7. `@callback` with a private type.** If the behaviour declares `@type user :: ...`,
+impls do NOT inherit it — they must redeclare or reference the full name.
+
+**8. When NOT to use optional callbacks.** If 80% of impls will override the
+"optional" callback, it is not optional — just make it required and provide a default
+via `defoverridable` + `__using__`.
 
 ---
 
-## Common production mistakes
+## Benchmark
 
-**1. Not using `defoverridable` before providing defaults**
-If you define a default `def init(opts)` in the `__using__` quote block without
-`defoverridable [init: 1]`, implementing modules that define their own `init/1`
-get a compile warning about redefining a function. Always call `defoverridable`
-before providing defaults.
+```elixir
+# bench/behaviour_bench.exs
+alias BehavioursAdvanced.Registry
+alias BehavioursAdvanced.Plugins.{Slack, SMS, Partial}
 
-**2. Checking `function_exported?/3` for `@optional_callbacks` in the wrong place**
-`function_exported?(mod, :init, 1)` returns `true` even when the implementing
-module uses the default `init/1` injected by `__using__`. If you want to know
-whether the implementing module *explicitly overrode* the callback, check
-`Module.defines?(mod, {:init, 1}, :def)` at compile time, or compare the function
-body — but this is rarely needed in practice.
+Benchee.run(%{
+  "dispatch — 3 plugins"   => fn -> Registry.dispatch([Slack, SMS, Partial], %{id: "u"}, "hi") end,
+  "healthchecks — optional" => fn -> Registry.healthchecks([Slack, SMS, Partial]) end
+})
+```
 
-**3. Using `@macrocallback` when you mean `@callback`**
-`@macrocallback` requires the implementing module to define a `defmacro`, not a
-`def`. Mixing the two raises a confusing error. Use `@macrocallback` only when
-the callback must inject quoted code into the caller at compile time — almost
-never the case for middleware.
-
-**4. Skipping `Code.ensure_loaded?/1` before `behaviour_info/1`**
-Calling `SomeModule.behaviour_info(:callbacks)` on a module that doesn't exist
-or hasn't been loaded raises `UndefinedFunctionError`. Always check
-`Code.ensure_loaded?(mod)` first when doing runtime behaviour introspection.
-
-**5. `@before_compile` validation running too early**
-`@before_compile` runs after the module body is fully evaluated. Do NOT use
-`Module.defines?/3` inside the `__using__` quote block (which runs when `use` is
-called, before the function definitions). The call will return `false` for every
-function. Put the validation exclusively in `__before_compile__/1`.
+Expect ~1–3 µs for `dispatch/3` per plugin and ~0.2 µs for the optional check (which
+is mostly `function_exported?` lookup, cached in the VM after first call).
 
 ---
 
 ## Resources
 
-- [Elixir `@behaviour` documentation](https://hexdocs.pm/elixir/Module.html#module-behaviour) — `@callback`, `@optional_callbacks`, `behaviour_info/1`
-- [GenServer source — Elixir stdlib](https://github.com/elixir-lang/elixir/blob/main/lib/elixir/lib/gen_server.ex) — production example of `__using__`, `defoverridable`, and `@before_compile` validation
-- [Plug behaviour](https://github.com/elixir-plug/plug/blob/master/lib/plug.ex) — real-world middleware behaviour with `init/1` and `call/2`
-- [Dialyzer and behaviours](https://hexdocs.pm/mix/Mix.Tasks.Dialyzer.html) — Dialyzer catches missing callbacks without `@before_compile`, but only if you run it
-- [Elixir guide: Behaviours](https://elixir-lang.org/getting-started/typespecs-and-behaviours.html) — official intro to the behaviour system
+- [`Module` — hexdocs.pm](https://hexdocs.pm/elixir/Module.html) — `@callback`, `@optional_callbacks`
+- [`Behaviour` discussion in Elixir docs](https://hexdocs.pm/elixir/typespecs.html#behaviours)
+- [Plug behaviour source](https://github.com/elixir-plug/plug/blob/main/lib/plug.ex) — canonical
+- [Phoenix.Channel behaviour](https://github.com/phoenixframework/phoenix/blob/main/lib/phoenix/channel.ex) — real optional callbacks
+- [Code.ensure_loaded — Elixir docs](https://hexdocs.pm/elixir/Code.html#ensure_loaded/1)
+- [José Valim on behaviours](https://dashbit.co/blog) — Dashbit
+- [Erlang docs — behaviours](https://www.erlang.org/doc/design_principles/des_princ.html#behaviours)

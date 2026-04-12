@@ -1,385 +1,603 @@
-# Plug Pipeline and Middleware
+# Plug Pipeline and Middleware — Composable Request Transforms
+
+**Project**: `plug_pipeline` — a standalone HTTP middleware stack (request ID, structured logging, timing, auth) built from scratch without Phoenix.
+
+**Difficulty**: ★★★★☆
+**Estimated time**: 3–5 hours
+
+---
 
 ## Project context
 
-You are building `api_gateway`, an internal HTTP gateway that routes traffic to microservices. The gateway needs a middleware pipeline that runs on every inbound request before it reaches the router: request ID propagation, authentication, and rate limiting — in that order.
+You've been asked to stand up a tiny HTTP service that sits in front of a
+legacy internal API. It performs three responsibilities:
 
-Project structure:
+1. Inject a `X-Request-ID` header if missing (for distributed tracing).
+2. Record structured request/response logs with timing.
+3. Verify a service-to-service API key before forwarding.
+
+Phoenix is overkill: no HTML, no channels, no LiveView. The right abstraction
+is **Plug** — the specification every Elixir web library (including Phoenix,
+Bandit, and Ecto's `plug` integrations) implements. By the end of this
+exercise you'll understand why the Plug specification is only two callbacks
+and how composable middleware is built from that minimal surface.
+
+Project structure at this point:
 
 ```
-api_gateway/
+plug_pipeline/
 ├── lib/
-│   └── api_gateway/
-│       └── middleware/
-│           ├── request_id.ex       # propagates or generates X-Request-ID
-│           ├── auth.ex             # validates X-Client-ID header
-│           ├── rate_limit.ex       # checks per-client rate limit via ETS
-│           └── pipeline.ex         # declares the plug chain
-├── test/
-│   └── api_gateway/
-│       └── middleware_test.exs     # given tests — must pass without modification
-└── mix.exs
+│   ├── plug_pipeline/
+│   │   ├── application.ex             # starts the HTTP server via Bandit
+│   │   ├── endpoint.ex                # use Plug.Builder — the pipeline
+│   │   ├── plugs/
+│   │   │   ├── request_id.ex          # module plug — generates request IDs
+│   │   │   ├── timing.ex              # module plug — measures duration
+│   │   │   ├── structured_logger.ex   # module plug — emits JSON log lines
+│   │   │   └── api_key.ex             # module plug — checks X-API-Key header
+│   │   └── upstream.ex                # the final plug — proxies to upstream
+└── test/
+    └── plug_pipeline/
+        ├── plugs/
+        │   ├── request_id_test.exs
+        │   ├── timing_test.exs
+        │   └── api_key_test.exs
+        └── endpoint_test.exs
 ```
 
 ---
 
-## The business problem
+## Core concepts
 
-Every request hitting the gateway needs three things before reaching the router:
+### 1. The Plug specification — two callbacks
 
-1. A **request ID** — either propagated from `X-Request-ID` or generated fresh. Used to correlate log lines across the entire request lifecycle and returned to the caller.
-2. **Authentication** — the `X-Client-ID` header must be present and non-empty. The gateway trusts it (downstream services do their own authz); if missing, 401 immediately.
-3. **Rate limiting** — an ETS-backed counter checks per-client request count within a sliding window. If the limit is exceeded, the middleware returns 429.
-
-The pipeline must run these in order. If any plug calls `halt/1`, the downstream plugs must not execute.
-
----
-
-## Why `Plug.Builder` and not manual chaining
-
-Without `Plug.Builder` you would write:
+A Plug is a module that exports:
 
 ```elixir
-conn
-|> RequestId.call(RequestId.init([]))
-|> Auth.call(Auth.init([]))
-|> RateLimit.call(RateLimit.init([]))
+@callback init(opts) :: opts_compiled
+@callback call(conn, opts_compiled) :: Plug.Conn.t()
 ```
 
-`Plug.Builder` generates this chain at compile time from a declarative list. More importantly, it checks `conn.halted` between each plug — if `Auth` halts, `RateLimit` never runs. With manual chaining you must implement that check yourself.
+`init/1` runs **at compile time** (when `use Plug.Builder` compiles the pipeline).
+Its return value is baked into the bytecode that calls `call/2`. That's how Plug
+achieves zero-overhead composition: no runtime options map lookup.
 
-The pattern:
+`call/2` runs per request. It takes a `Plug.Conn`, returns a transformed
+`Plug.Conn`. That's it — the entire spec.
 
 ```
-request → RequestId → Auth → [HALT if no client-id] → …
-request → RequestId → Auth → RateLimit → [HALT if limited] → router
-request → RequestId → Auth → RateLimit → router → 200
+     Plug.Conn (struct carrying the request) ───▶ call/2 ───▶ Plug.Conn (possibly mutated)
 ```
 
 ---
 
-## Why `halt/1` is cooperative, not an exception
+### 2. Module plugs vs. function plugs
 
-`halt/1` sets `conn.halted = true` and returns the conn unchanged otherwise. It does NOT raise. `Plug.Builder` checks the flag between plugs and skips the rest of the chain. This design means:
+**Module plug** — full module with `init/1` and `call/2`. Preferred for reusable
+middleware:
 
-- A plug that calls `send_resp` + `halt` has full control over what the client receives.
-- No exception handling needed for early exits — it is a first-class value.
-- A plug can inspect `conn.halted` explicitly if it needs to react to upstream halts.
+```elixir
+defmodule MyPlug do
+  @behaviour Plug
+  def init(opts), do: opts
+  def call(conn, _opts), do: conn
+end
+```
+
+**Function plug** — a single function with arity 2 that takes a conn and opts.
+Used inline inside a pipeline for one-off transforms:
+
+```elixir
+plug :authenticate
+
+defp authenticate(conn, _opts) do
+  # ...
+  conn
+end
+```
+
+Same runtime semantics; module plug is just a module around the function.
+
+---
+
+### 3. `Plug.Builder` — composing a pipeline
+
+`use Plug.Builder` turns a module into a plug that invokes a sequence of
+plugs in order. The order is the order of `plug` declarations.
+
+```elixir
+defmodule MyPipeline do
+  use Plug.Builder
+
+  plug Plugs.RequestId
+  plug Plugs.StructuredLogger
+  plug Plugs.ApiKey, allowed: ["secret-1", "secret-2"]
+  plug :final_handler
+
+  defp final_handler(conn, _opts), do: Plug.Conn.send_resp(conn, 200, "ok")
+end
+```
+
+Under the hood, `Plug.Builder` builds a nested `call/2` at compile time. The
+macro generates code roughly equivalent to:
+
+```elixir
+def call(conn, opts) do
+  conn = Plugs.RequestId.call(conn, @request_id_opts)
+  conn = Plugs.StructuredLogger.call(conn, @logger_opts)
+  conn = Plugs.ApiKey.call(conn, @api_key_opts)
+  final_handler(conn, [])
+end
+```
+
+Pure function composition. No middleware framework, no magic.
+
+---
+
+### 4. Halting the pipeline
+
+Any plug can short-circuit the rest of the pipeline by calling `Plug.Conn.halt/1`:
+
+```
+conn = conn |> put_status(401) |> send_resp(401, "unauthorized") |> halt()
+```
+
+`Plug.Builder`'s generated `call/2` checks `conn.halted` between plugs and skips
+the remainder when set. This is how `ApiKey` refuses a request without letting
+`StructuredLogger` or `Upstream` observe it — except you usually WANT the logger
+to run even on rejections, so the order matters.
+
+---
+
+### 5. `register_before_send/2` — run code at response time
+
+Some work must happen after the body has been computed but before the socket
+flushes: adding response headers, recording final status, emitting metrics.
+`Plug.Conn.register_before_send/2` registers a callback that runs when
+`send_resp/3` is called:
+
+```elixir
+def call(conn, _opts) do
+  conn = put_req_header(conn, "x-request-id", request_id)
+  register_before_send(conn, fn conn ->
+    put_resp_header(conn, "x-request-id", request_id)
+  end)
+end
+```
+
+This is how `Plug.Logger` measures duration: start timer in `call/2`, compute
+elapsed in the `before_send` callback, log both request and response in one
+structured line.
 
 ---
 
 ## Implementation
 
-### Step 1: `mix.exs` — add plug_cowboy and jason
+### Step 1: Create the project
+
+```bash
+mix new plug_pipeline --sup
+cd plug_pipeline
+```
+
+`mix.exs` deps:
 
 ```elixir
-# mix.exs
 defp deps do
   [
-    {:plug_cowboy, "~> 2.7"},
+    {:plug, "~> 1.16"},
+    {:bandit, "~> 1.5"},
     {:jason, "~> 1.4"}
   ]
 end
 ```
 
-### Step 2: `lib/api_gateway/middleware/request_id.ex`
+### Step 2: `lib/plug_pipeline/plugs/request_id.ex`
 
 ```elixir
-defmodule ApiGateway.Middleware.RequestId do
+defmodule PlugPipeline.Plugs.RequestId do
   @moduledoc """
-  Propagates X-Request-ID from the caller or generates a new one.
-  Injects the ID into Logger metadata so every log line in this request
-  carries it automatically — without passing it as a parameter.
+  Accepts an incoming `X-Request-ID` header or generates a new one. Stores the
+  value in `conn.assigns.request_id` and in the response headers.
   """
+  @behaviour Plug
   import Plug.Conn
-  require Logger
 
   @header "x-request-id"
 
-  @spec init(keyword()) :: keyword()
+  @impl true
   def init(opts), do: opts
 
-  @spec call(Plug.Conn.t(), keyword()) :: Plug.Conn.t()
+  @impl true
   def call(conn, _opts) do
-    request_id = get_or_generate(conn)
-
-    # Logger.metadata/1 affects only the current process — each request
-    # runs in its own Cowboy process, so there is no cross-contamination.
-    Logger.metadata(request_id: request_id)
+    request_id =
+      case get_req_header(conn, @header) do
+        [id | _] when byte_size(id) > 0 -> id
+        _ -> generate()
+      end
 
     conn
     |> assign(:request_id, request_id)
     |> put_resp_header(@header, request_id)
-    |> register_before_send(&log_response/1)
   end
 
-  # -- private --
-
-  defp get_or_generate(conn) do
-    case get_req_header(conn, @header) do
-      [id | _] when byte_size(id) > 0 -> id
-      _ -> generate_id()
-    end
-  end
-
-  # 16 bytes of random data, URL-safe base64 — shorter than a UUID string
-  defp generate_id do
-    :crypto.strong_rand_bytes(16) |> Base.url_encode64(padding: false)
-  end
-
-  defp log_response(conn) do
-    Logger.info("request completed",
-      status: conn.status,
-      method: conn.method,
-      path: conn.request_path
-    )
-    conn
+  defp generate do
+    :crypto.strong_rand_bytes(12) |> Base.url_encode64(padding: false)
   end
 end
 ```
 
-### Step 3: `lib/api_gateway/middleware/auth.ex`
+### Step 3: `lib/plug_pipeline/plugs/timing.ex`
 
 ```elixir
-defmodule ApiGateway.Middleware.Auth do
+defmodule PlugPipeline.Plugs.Timing do
   @moduledoc """
-  Validates the X-Client-ID header.
-
-  The gateway trusts the client ID without cryptographic verification —
-  downstream microservices are responsible for authorization. This plug
-  only enforces that an identity is declared.
+  Records the wall-clock duration of the request by stashing the start time
+  and reading it back in a `before_send` callback.
   """
+  @behaviour Plug
   import Plug.Conn
 
-  @header "x-client-id"
-
-  @spec init(keyword()) :: keyword()
+  @impl true
   def init(opts), do: opts
 
-  @spec call(Plug.Conn.t(), keyword()) :: Plug.Conn.t()
+  @impl true
   def call(conn, _opts) do
-    case get_req_header(conn, @header) do
-      [id | _] when id != "" ->
-        assign(conn, :client_id, id)
+    start = System.monotonic_time()
 
-      _ ->
-        conn
-        |> put_resp_content_type("application/json")
-        |> send_resp(401, Jason.encode!(%{error: "missing or empty X-Client-ID header"}))
-        |> halt()
-    end
+    register_before_send(conn, fn conn ->
+      duration_us =
+        System.convert_time_unit(System.monotonic_time() - start, :native, :microsecond)
+
+      assign(conn, :duration_us, duration_us)
+    end)
   end
 end
 ```
 
-The pattern match `[id | _] when id != ""` covers both the case where the header is present with a non-empty value and the case where multiple values are sent (it takes the first). The guard `id != ""` rejects explicitly empty strings. When neither clause matches — the header is absent (empty list) or all values are empty — the `_` clause sends a 401 JSON response and halts the pipeline. `halt/1` must always be the last call in the chain because it returns the conn with `halted: true`, signalling `Plug.Builder` to skip all subsequent plugs.
-
-### Step 4: `lib/api_gateway/middleware/rate_limit.ex`
+### Step 4: `lib/plug_pipeline/plugs/structured_logger.ex`
 
 ```elixir
-defmodule ApiGateway.Middleware.RateLimit do
+defmodule PlugPipeline.Plugs.StructuredLogger do
   @moduledoc """
-  ETS-backed sliding-window rate limiter as a Plug.
-
-  Uses an ETS table to track per-client request timestamps within a
-  configurable window. Each request inserts a timestamp; the count of
-  timestamps within the window determines whether the request is allowed.
-
-  This module is entirely self-contained — it creates and manages its own
-  ETS table. No external GenServer dependency is required.
+  Emits a single JSON log line per request on response. Reads `request_id` and
+  `duration_us` from assigns — depends on `RequestId` and `Timing` running first.
   """
+  @behaviour Plug
+  require Logger
   import Plug.Conn
 
-  @table :rate_limit_table
+  @impl true
+  def init(opts), do: opts
 
-  @spec init(keyword()) :: {pos_integer(), pos_integer()}
-  def init(opts) do
-    limit = Keyword.get(opts, :limit, 100)
-    window_ms = Keyword.get(opts, :window_ms, 60_000)
+  @impl true
+  def call(conn, _opts) do
+    register_before_send(conn, fn conn ->
+      payload = %{
+        ts: System.os_time(:millisecond),
+        method: conn.method,
+        path: conn.request_path,
+        status: conn.status,
+        request_id: conn.assigns[:request_id],
+        duration_us: conn.assigns[:duration_us]
+      }
 
-    unless :ets.whereis(@table) != :undefined do
-      :ets.new(@table, [:named_table, :public, :bag])
-    end
-
-    {limit, window_ms}
-  end
-
-  @spec call(Plug.Conn.t(), {pos_integer(), pos_integer()}) :: Plug.Conn.t()
-  def call(conn, {limit, window_ms}) do
-    client_id = conn.assigns[:client_id]
-    now = System.monotonic_time(:millisecond)
-    cutoff = now - window_ms
-
-    # Remove expired entries for this client
-    :ets.select_delete(@table, [{{client_id, :"$1"}, [{:<, :"$1", cutoff}], [true]}])
-
-    # Count current entries
-    count = length(:ets.lookup(@table, client_id))
-
-    if count < limit do
-      :ets.insert(@table, {client_id, now})
-      remaining = limit - count - 1
-
+      Logger.info(Jason.encode!(payload))
       conn
-      |> put_resp_header("x-ratelimit-remaining", Integer.to_string(remaining))
-    else
-      retry_after_seconds = ceil(window_ms / 1_000)
-
-      conn
-      |> put_resp_content_type("application/json")
-      |> put_resp_header("retry-after", Integer.to_string(retry_after_seconds))
-      |> send_resp(429, Jason.encode!(%{
-        error: "rate limit exceeded",
-        retry_after_seconds: retry_after_seconds
-      }))
-      |> halt()
-    end
+    end)
   end
 end
 ```
 
-`init/1` extracts configuration options with sensible defaults and returns them as a tuple. It also ensures the ETS table exists. Plug.Builder calls `init/1` once at compile time and caches the result; `call/2` receives it on every request.
-
-In `call/2`, expired entries are cleaned up via `select_delete`, and then the current count is checked. The allow branch inserts a new timestamp and adds the remaining count as a response header. The deny branch sends a 429 JSON body and halts.
-
-### Step 5: `lib/api_gateway/middleware/pipeline.ex`
+### Step 5: `lib/plug_pipeline/plugs/api_key.ex`
 
 ```elixir
-defmodule ApiGateway.Middleware.Pipeline do
+defmodule PlugPipeline.Plugs.ApiKey do
   @moduledoc """
-  The request pipeline for api_gateway.
-
-  Order matters:
-    1. RequestId  — must run first so every subsequent log has the ID
-    2. Auth       — identity must be established before rate limiting
-    3. RateLimit  — checks per-client-id, so Auth must run before this
+  Verifies the `X-API-Key` header against an allow-list. Halts the pipeline
+  with a 401 on failure. Runs AFTER RequestId and Timing so the rejected
+  request is still logged with its id and duration.
   """
+  @behaviour Plug
+  import Plug.Conn
+
+  @header "x-api-key"
+
+  @impl true
+  def init(opts) do
+    %{
+      allowed: Keyword.fetch!(opts, :allowed) |> MapSet.new(),
+      skip_paths: Keyword.get(opts, :skip_paths, []) |> MapSet.new()
+    }
+  end
+
+  @impl true
+  def call(%Plug.Conn{request_path: path} = conn, %{skip_paths: skip} = cfg) do
+    if MapSet.member?(skip, path) do
+      conn
+    else
+      check(conn, cfg)
+    end
+  end
+
+  defp check(conn, %{allowed: allowed}) do
+    case get_req_header(conn, @header) do
+      [key | _] ->
+        if MapSet.member?(allowed, key) do
+          assign(conn, :api_key_valid, true)
+        else
+          reject(conn, "invalid_api_key")
+        end
+
+      [] ->
+        reject(conn, "missing_api_key")
+    end
+  end
+
+  defp reject(conn, reason) do
+    body = Jason.encode!(%{error: reason, request_id: conn.assigns[:request_id]})
+
+    conn
+    |> put_resp_content_type("application/json")
+    |> send_resp(401, body)
+    |> halt()
+  end
+end
+```
+
+### Step 6: The endpoint — `lib/plug_pipeline/endpoint.ex`
+
+```elixir
+defmodule PlugPipeline.Endpoint do
+  @moduledoc "The composed pipeline. Order matters — read the comments."
   use Plug.Builder
 
-  plug ApiGateway.Middleware.RequestId
-  plug ApiGateway.Middleware.Auth
-  plug ApiGateway.Middleware.RateLimit, limit: 100, window_ms: 60_000
+  # 1. Assign a request id. Everything that follows can use it for correlation.
+  plug PlugPipeline.Plugs.RequestId
+
+  # 2. Start the timer. We wrap the whole pipeline so the reported duration
+  #    includes auth rejections.
+  plug PlugPipeline.Plugs.Timing
+
+  # 3. Register the logger's before_send BEFORE auth, so rejected requests
+  #    are still logged with their request id and duration.
+  plug PlugPipeline.Plugs.StructuredLogger
+
+  # 4. API key check. Skip paths for /healthz so load balancers can poll
+  #    without credentials.
+  plug PlugPipeline.Plugs.ApiKey,
+    allowed: ["dev-key-1", "dev-key-2"],
+    skip_paths: ["/healthz"]
+
+  # 5. Terminal handler. Anything authenticated lands here.
+  plug :handle
+
+  defp handle(%Plug.Conn{request_path: "/healthz"} = conn, _opts) do
+    send_resp(conn, 200, "ok")
+  end
+
+  defp handle(conn, _opts) do
+    body =
+      Jason.encode!(%{
+        message: "authenticated",
+        request_id: conn.assigns.request_id
+      })
+
+    conn
+    |> put_resp_content_type("application/json")
+    |> send_resp(200, body)
+  end
 end
 ```
 
-`Plug.Builder` compiles these three `plug` declarations into a single `call/2` function at compile time. Between each plug it inserts a `conn.halted` check. If `Auth` halts (because `X-Client-ID` is missing), `RateLimit` never executes — the conn flows directly to the caller with the 401 response already set.
-
-The `limit: 100, window_ms: 60_000` options are passed to `RateLimit.init/1` at compile time. Changing them requires recompilation.
-
-### Step 6: Given tests — must pass without modification
+### Step 7: Supervise Bandit — `lib/plug_pipeline/application.ex`
 
 ```elixir
-# test/api_gateway/middleware_test.exs
-defmodule ApiGateway.MiddlewareTest do
-  use ExUnit.Case, async: false
+defmodule PlugPipeline.Application do
+  @moduledoc false
+  use Application
+
+  @impl true
+  def start(_type, _args) do
+    children = [
+      {Bandit, plug: PlugPipeline.Endpoint, port: 4001}
+    ]
+
+    Supervisor.start_link(children, strategy: :one_for_one, name: PlugPipeline.Supervisor)
+  end
+end
+```
+
+### Step 8: Tests
+
+`test/plug_pipeline/plugs/request_id_test.exs`:
+
+```elixir
+defmodule PlugPipeline.Plugs.RequestIdTest do
+  use ExUnit.Case, async: true
   use Plug.Test
 
-  alias ApiGateway.Middleware.{RequestId, Auth, Pipeline}
+  alias PlugPipeline.Plugs.RequestId
 
   describe "RequestId" do
-    test "generates a request ID when none is present" do
+    test "generates an id when none present" do
       conn = conn(:get, "/") |> RequestId.call([])
-      assert get_resp_header(conn, "x-request-id") != []
-      assert conn.assigns[:request_id] != nil
+      assert byte_size(conn.assigns.request_id) >= 16
+      assert [id] = Plug.Conn.get_resp_header(conn, "x-request-id")
+      assert id == conn.assigns.request_id
     end
 
-    test "propagates an existing X-Request-ID" do
-      conn =
-        conn(:get, "/")
-        |> put_req_header("x-request-id", "my-trace-abc")
-        |> RequestId.call([])
-
-      assert get_resp_header(conn, "x-request-id") == ["my-trace-abc"]
-      assert conn.assigns[:request_id] == "my-trace-abc"
-    end
-  end
-
-  describe "Auth" do
-    test "assigns client_id when X-Client-ID is present" do
-      conn =
-        conn(:get, "/")
-        |> put_req_header("x-client-id", "client-42")
-        |> Auth.call([])
-
-      refute conn.halted
-      assert conn.assigns[:client_id] == "client-42"
+    test "honors an incoming id" do
+      conn = conn(:get, "/") |> put_req_header("x-request-id", "abc-123") |> RequestId.call([])
+      assert conn.assigns.request_id == "abc-123"
     end
 
-    test "halts with 401 when X-Client-ID is missing" do
-      conn = conn(:get, "/") |> Auth.call([])
-      assert conn.halted
-      assert conn.status == 401
-    end
-
-    test "halts with 401 when X-Client-ID is empty" do
-      conn =
-        conn(:get, "/")
-        |> put_req_header("x-client-id", "")
-        |> Auth.call([])
-
-      assert conn.halted
-      assert conn.status == 401
-    end
-  end
-
-  describe "Pipeline order" do
-    test "a request without client-id never reaches the rate limiter" do
-      # If Auth halts, RateLimit must not run. We verify by checking that
-      # no rate-limit headers are present on a 401 response.
-      conn = conn(:get, "/") |> Pipeline.call([])
-
-      assert conn.halted
-      assert conn.status == 401
-      assert get_resp_header(conn, "x-ratelimit-remaining") == []
+    test "ignores empty incoming header" do
+      conn = conn(:get, "/") |> put_req_header("x-request-id", "") |> RequestId.call([])
+      assert conn.assigns.request_id != ""
     end
   end
 end
 ```
 
-### Step 7: Run the tests
+`test/plug_pipeline/plugs/api_key_test.exs`:
+
+```elixir
+defmodule PlugPipeline.Plugs.ApiKeyTest do
+  use ExUnit.Case, async: true
+  use Plug.Test
+
+  alias PlugPipeline.Plugs.ApiKey
+
+  @opts ApiKey.init(allowed: ["good"], skip_paths: ["/healthz"])
+
+  describe "ApiKey" do
+    test "accepts a valid key" do
+      conn = conn(:get, "/") |> put_req_header("x-api-key", "good") |> ApiKey.call(@opts)
+      refute conn.halted
+      assert conn.assigns.api_key_valid
+    end
+
+    test "rejects missing key with 401" do
+      conn = conn(:get, "/") |> ApiKey.call(@opts)
+      assert conn.halted
+      assert conn.status == 401
+      assert conn.resp_body =~ "missing_api_key"
+    end
+
+    test "rejects wrong key" do
+      conn = conn(:get, "/") |> put_req_header("x-api-key", "bad") |> ApiKey.call(@opts)
+      assert conn.halted
+      assert conn.status == 401
+      assert conn.resp_body =~ "invalid_api_key"
+    end
+
+    test "skips allow-listed paths" do
+      conn = conn(:get, "/healthz") |> ApiKey.call(@opts)
+      refute conn.halted
+    end
+  end
+end
+```
+
+`test/plug_pipeline/endpoint_test.exs`:
+
+```elixir
+defmodule PlugPipeline.EndpointTest do
+  use ExUnit.Case, async: true
+  use Plug.Test
+
+  alias PlugPipeline.Endpoint
+
+  describe "full pipeline" do
+    test "health check bypasses auth" do
+      conn = conn(:get, "/healthz") |> Endpoint.call([])
+      assert conn.status == 200
+      assert conn.resp_body == "ok"
+    end
+
+    test "unauthenticated request is logged AND rejected" do
+      conn = conn(:get, "/some/path") |> Endpoint.call([])
+      assert conn.status == 401
+      assert conn.assigns.request_id
+      assert conn.assigns.duration_us > 0
+    end
+
+    test "authenticated request reaches the terminal handler" do
+      conn =
+        conn(:get, "/any")
+        |> put_req_header("x-api-key", "dev-key-1")
+        |> Endpoint.call([])
+
+      assert conn.status == 200
+      body = Jason.decode!(conn.resp_body)
+      assert body["message"] == "authenticated"
+      assert body["request_id"] == conn.assigns.request_id
+    end
+  end
+end
+```
 
 ```bash
-mix test test/api_gateway/middleware_test.exs --trace
+mix test
 ```
 
 ---
 
-## Trade-off analysis
+## Trade-offs and production gotchas
 
-| Aspect | `Plug.Builder` pipeline | Manual chaining | Phoenix.Endpoint |
-|--------|------------------------|-----------------|------------------|
-| Halt semantics | Built-in `halted` check | Must implement manually | Same as Builder |
-| Compile-time | Chain generated at compile | Runtime composition | Compile-time |
-| Composability | Reusable plug modules | Ad hoc | Plug-compatible |
-| Visibility | Declarative list | Scattered function calls | Phoenix-specific config |
-| When to use | Gateways, microservices | One-off transforms | Full Phoenix apps |
+**1. `init/1` runs at COMPILE time by default**
+If `init/1` reads config via `Application.get_env/2`, the value is captured at
+compile time. When you change config and restart, the value doesn't update
+unless you recompile. Use `init_mode: :runtime` on `use Plug.Builder` to defer
+`init/1` to runtime when the config is dynamic.
 
-Reflection question: `register_before_send/2` runs the callback after the pipeline finishes but before Cowboy flushes the socket. What does this make possible that logging directly in `call/2` cannot do?
+**2. Pipeline order is load-bearing**
+Putting `ApiKey` before `RequestId` means rejected requests have no id in their
+error body and no correlatable log line. Putting `StructuredLogger` after
+`ApiKey` means rejected requests are not logged. Draw the order diagram once
+and stick to it.
+
+**3. `halt/1` without `send_resp/3` leaves the client hanging**
+`halt/1` just sets a flag. You must also actually send a response. If you
+halt without sending, the server keeps the connection until timeout.
+
+**4. `register_before_send/2` runs in reverse order of registration**
+Callbacks are LIFO: the last registered runs first on send. Watch out when
+multiple plugs add response headers — later plugs overwrite earlier ones.
+
+**5. Copying request bodies for logging blows memory**
+Logging the request body looks useful but on large POSTs (file uploads,
+10MB JSON) it balloons memory and GC pressure. Log body size, not body content.
+Use `Plug.Parsers` opts `:length` to cap body reads.
+
+**6. `assign` vs. `private`**
+`conn.assigns` is for data your application uses. `conn.private` is for Plug
+libraries (Phoenix uses it for action name, etc.). Don't put your data in
+`private` — you may collide with a library you import later.
+
+**7. When NOT to use `Plug.Builder`**
+If you have dynamic routing (different pipelines per path), use `Plug.Router`
+(exercise 58). `Plug.Builder` is for a single straight-through pipeline.
+Mixing routing into a `Builder` pipeline with `case` statements is harder to
+read than `Plug.Router`'s dispatch.
+
+**8. Keep plugs pure where possible**
+A plug that writes to the database on every call couples request handling to
+a side effect that's hard to test and retry. Keep plugs about conn
+transformations; put business side effects in a controller or a service layer
+downstream.
 
 ---
 
-## Common production mistakes
+## Performance notes
 
-**1. Wrong plug order**
-Rate limiting before auth means the rate limiter has no client identity to key on. It would rate limit by IP instead, which breaks when clients share a NAT gateway.
+Bench the whole pipeline with `:timer.tc/1`:
 
-**2. Forgetting `halt/1` after `send_resp/3`**
-`send_resp/3` writes the response. Without `halt/1`, subsequent plugs see a conn that already has a response sent and may try to send another one — Cowboy will crash with a "response already sent" error.
+```elixir
+{micros, _conn} =
+  :timer.tc(fn ->
+    conn = Plug.Test.conn(:get, "/") |> Plug.Conn.put_req_header("x-api-key", "dev-key-1")
+    PlugPipeline.Endpoint.call(conn, [])
+  end)
 
-**3. `Logger.metadata/1` leaks across requests**
-It does not — each request runs in its own Cowboy process. The metadata is local to the process and disappears when the process ends.
+IO.puts("#{micros}µs")
+```
 
-**4. `init/1` called at runtime instead of compile time**
-`Plug.Builder` calls `init/1` once at compile time and caches the result. Putting expensive work (DB connections, API calls) in `init/1` runs it only once — which is usually what you want for configuration, but a bug if you expect fresh values per request.
+Expected: < 200µs end-to-end on a dev laptop, dominated by `Jason.encode!`.
+The middleware overhead itself is typically < 20µs total — `Plug.Builder`
+compiles to straight function calls with no reflection.
 
-**5. Reading `conn.assigns` before the plug that sets it**
-If `RateLimit` runs before `Auth`, `conn.assigns[:client_id]` is nil. The pipeline declaration is the contract — plugs lower in the list can depend on assigns from plugs higher up.
+Compare the hot path by removing `StructuredLogger` — you should see a
+measurable drop, confirming the logger is the heaviest component.
 
 ---
 
 ## Resources
 
-- [Plug.Conn documentation](https://hexdocs.pm/plug/Plug.Conn.html) — full conn struct fields
-- [Plug.Builder](https://hexdocs.pm/plug/Plug.Builder.html) — how `plug` macro compiles the chain
-- [Plug source — halt/1](https://github.com/elixir-plug/plug/blob/main/lib/plug/conn.ex) — it really is just `%{conn | halted: true}`
-- [Plug.Test](https://hexdocs.pm/plug/Plug.Test.html) — `conn/2` and `put_req_header/3` for unit tests
+- [`Plug` specification](https://hexdocs.pm/plug/Plug.html) — the whole spec in one page
+- [`Plug.Builder`](https://hexdocs.pm/plug/Plug.Builder.html) — how pipelines are composed
+- [`Plug.Conn`](https://hexdocs.pm/plug/Plug.Conn.html) — the full conn API
+- [Plug source](https://github.com/elixir-plug/plug) — read `Plug.Logger` and `Plug.RequestId` for reference plugs
+- [Bandit HTTP adapter](https://github.com/mtrudel/bandit) — modern Elixir-native HTTP server
+- [José Valim — "Mastering Elixir's Plug" (hex.pm blog)](https://dashbit.co/blog) — search for Plug posts

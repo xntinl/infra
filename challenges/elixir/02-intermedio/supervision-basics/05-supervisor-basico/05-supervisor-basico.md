@@ -2,9 +2,6 @@
 
 **Project**: `basic_supervisor` — a supervisor that starts two GenServer workers at boot and restarts any one that crashes.
 
-**Difficulty**: ★★☆☆☆
-**Estimated time**: 1–2 hours
-
 ---
 
 ## Project context
@@ -34,6 +31,11 @@ basic_supervisor/
 ```
 
 ---
+
+
+## Why X and not Y
+
+- **Why not a lower-level alternative?** For supervisor basico, OTP's pattern is what reviewers will expect and what observability tools support out of the box.
 
 ## Core concepts
 
@@ -78,7 +80,31 @@ instead of leaking orphan processes.
 
 ---
 
+## Design decisions
+
+**Option A — manual `spawn_link` + restart loop**
+- Pros: simpler upfront, fewer moving parts.
+- Cons: hides the trade-off that this exercise exists to teach.
+
+**Option B — a Supervisor (chosen)**
+- Pros: explicit about the semantic that matters in production.
+- Cons: one more concept to internalize.
+
+→ Chose **B** because supervisors encode restart intensity, strategy, and shutdown timeouts that hand-rolled loops always get wrong.
+
+
 ## Implementation
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defp deps do
+  [
+    # stdlib-only by default; add `{:benchee, "~> 1.3", only: :dev}` if you benchmark
+  ]
+end
+```
+
 
 ### Step 1: Create the project
 
@@ -234,6 +260,15 @@ mix test
 
 ---
 
+### Why this works
+
+The design leans on OTP primitives that already encode the invariants we care about (supervision, back-pressure, explicit message semantics), so failure modes are visible at the right layer instead of being reinvented ad-hoc. Tests exercise the edges (timeouts, crashes, boundary states), which is where hand-rolled alternatives silently drift over time.
+
+
+## Benchmark
+
+<!-- benchmark N/A: tema conceptual -->
+
 ## Trade-offs and production gotchas
 
 **1. State is lost on restart — by design**
@@ -250,7 +285,7 @@ pids via dependency injection so you can run multiple instances in tests.
 **3. Default `max_restarts = 3` in 5 seconds**
 If the same child crashes more than 3 times in 5 seconds, the supervisor
 itself crashes, which escalates to its parent. This is a safety valve
-against crash loops — see exercise 59 for tuning.
+against crash loops — 
 
 **4. Static children only — for dynamic children use `DynamicSupervisor`**
 `Supervisor` expects its `init/1` to return the full child list up front.
@@ -264,6 +299,11 @@ where later stages depend on earlier ones, you want `:rest_for_one`. Plain
 `:one_for_one` is for independent children only.
 
 ---
+
+
+## Reflection
+
+- Tu supervisor reinicia un child 100 veces en 5s por un bug de config. ¿Qué valores de `max_restarts`/`max_seconds` te hacen fallar rápido sin ser frágil en condiciones normales?
 
 ## Resources
 

@@ -2,9 +2,6 @@
 
 **Project**: `restart_strategies_demo` — three workers, one of each restart strategy, demonstrating exactly when each triggers a restart.
 
-**Difficulty**: ★★☆☆☆
-**Estimated time**: 1–2 hours
-
 ---
 
 ## Project context
@@ -37,6 +34,11 @@ restart_strategies_demo/
 ```
 
 ---
+
+
+## Why X and not Y
+
+- **Why not `:permanent` for all?** One-shot jobs shouldn't restart forever on failure; user sessions should restart only on abnormal exits.
 
 ## Core concepts
 
@@ -80,7 +82,31 @@ supervisor drops all references. You can't query it via
 
 ---
 
+## Design decisions
+
+**Option A — `:permanent` for everything**
+- Pros: simpler upfront, fewer moving parts.
+- Cons: hides the trade-off that this exercise exists to teach.
+
+**Option B — restart type chosen per child role (chosen)**
+- Pros: explicit about the semantic that matters in production.
+- Cons: one more concept to internalize.
+
+→ Chose **B** because one-shot jobs should be `:temporary`; workers `:permanent`; user sessions often `:transient`.
+
+
 ## Implementation
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defp deps do
+  [
+    # stdlib-only by default; add `{:benchee, "~> 1.3", only: :dev}` if you benchmark
+  ]
+end
+```
+
 
 ### Step 1: Create the project
 
@@ -266,6 +292,15 @@ mix test
 
 ---
 
+### Why this works
+
+The design leans on OTP primitives that already encode the invariants we care about (supervision, back-pressure, explicit message semantics), so failure modes are visible at the right layer instead of being reinvented ad-hoc. Tests exercise the edges (timeouts, crashes, boundary states), which is where hand-rolled alternatives silently drift over time.
+
+
+## Benchmark
+
+<!-- benchmark N/A: tema conceptual -->
+
 ## Trade-offs and production gotchas
 
 **1. `:permanent` + `stop(:normal)` = restart loop you didn't ask for**
@@ -293,6 +328,11 @@ change it unless you have a concrete reason. The two other values are
 tools for specific situations, not expressions of taste.
 
 ---
+
+
+## Reflection
+
+- Un worker reintenta un job y si falla 3 veces, no debe reiniciar. ¿Qué restart type usás y cómo implementás el límite?
 
 ## Resources
 

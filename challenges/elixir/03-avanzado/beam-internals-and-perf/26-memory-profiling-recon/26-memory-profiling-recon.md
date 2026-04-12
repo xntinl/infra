@@ -1,466 +1,507 @@
-# Memory Profiling and Leak Detection with Recon
+# Memory profiling with :recon and :recon_alloc
+
+**Project**: `memory_profiling` — diagnose memory issues in a running BEAM node without restarting it.
+
+**Difficulty**: ★★★★☆
+**Estimated time**: 3–6 hours
+
+---
 
 ## Project context
 
-You are building `api_gateway`, an internal HTTP gateway that routes traffic to microservices.
-After two weeks in production, the gateway node's memory climbs from 400 MB at startup
-to 1.8 GB over 48 hours before triggering an OOM restart. The team suspects a leak but
-has no visibility: the application logs show nothing abnormal, and adding more logging
-would require a deploy. The fix must be diagnosable and applied to a live node without
-restarting it.
+At 3 AM the on-call page fires: RSS on one of the API nodes is 6.2 GB,
+heading for OOM-kill. Restarting the node makes the symptom disappear for
+a few hours and then it comes back. This is the production reality where
+`:observer` is usually not available (the cluster is headless) and you
+have only an iex remote shell.
 
-This exercise covers BEAM's memory model, binary leak patterns, the `:recon`
-library for live diagnosis, and GenServer design changes that reduce GC pressure.
+You are building `memory_profiling`, a small library wrapping `:recon` and
+`:recon_alloc` into ergonomic Elixir functions that the SRE team can call
+from a remote shell to answer three questions: *where is memory going*,
+*is it leaking or fragmenting*, and *which specific processes are at fault*.
 
 Project structure:
 
 ```
-api_gateway/
+memory_profiling/
 ├── lib/
-│   └── api_gateway/
-│       ├── application.ex
-│       ├── router.ex
-│       └── middleware/
-│           └── body_reader.ex
+│   └── memory_profiling/
+│       ├── node_report.ex      # high-level node memory breakdown
+│       ├── process_report.ex   # top-N processes by memory
+│       ├── alloc_report.ex     # allocator fragmentation
+│       └── leak_hunter.ex      # correlate growth over two snapshots
 ├── test/
-│   └── api_gateway/
-│       └── middleware/
-│           └── body_reader_test.exs
+│   └── memory_profiling/
+│       ├── node_report_test.exs
+│       └── process_report_test.exs
 └── mix.exs
 ```
 
-The `ApiGateway.Conn` struct used by this exercise is defined as:
-
-```elixir
-defmodule ApiGateway.Conn do
-  @moduledoc "Represents an in-flight HTTP connection through the gateway."
-  defstruct [:method, :path, :status, :remote_ip, :assigns, :raw_body]
-end
-```
-
-Add `:recon` to `mix.exs`:
-```elixir
-defp deps do
-  [
-    # ...
-    {:recon, "~> 2.5"}
-  ]
-end
-```
-
 ---
 
-## The business problem
+## Core concepts
 
-Two requirements:
+### 1. The BEAM memory map
 
-1. **Binary leak diagnosis**: the request body reader middleware accumulates
-   large binaries in process heap. Even after requests complete, the binaries
-   are not released because the processes that held them keep a sub-binary
-   reference. The fix requires understanding ProcBin vs heap binary and knowing
-   when to force GC.
+`:erlang.memory/0` returns eight buckets. You need to know what they mean:
 
-2. **Memory snapshot tooling**: a `ApiGateway.Dev.MemorySnapshot` module that
-   wraps `:recon` to produce a structured memory report without a running
-   `:observer` GUI -- usable from `iex -S mix` on the production node.
-
----
-
-## BEAM's memory model -- why binaries leak
-
-BEAM has two binary storage locations:
-
-### Heap binaries (<= 64 bytes)
-Stored directly in the process heap. Garbage collected with the process heap.
-When the process dies, the binary is freed immediately.
-
-### Reference-counted binaries -- ProcBin (> 64 bytes)
-Stored in a shared binary heap outside process memory. The process heap holds
-a `ProcBin` pointer (16 bytes). Multiple processes can reference the same binary
-without copying it.
-
-**The leak pattern**:
 ```
-Request process reads body (10 KB binary) -> stored in shared binary heap
-Process creates a sub-binary: String.slice(body, 0, 100)
-Sub-binary holds a ProcBin reference to the original 10 KB binary
-Request process completes, its heap is GC'd
-BUT: the ProcBin reference count is still > 0 -- the 10 KB binary survives
+total     = sum of everything BEAM has allocated (not RSS — see below)
+processes = sum of heap + stack + mailbox + PCB for all processes
+binary    = refc binaries > 64 bytes (shared, ref-counted — see exercise 149)
+ets       = all ETS tables
+code      = loaded BEAM modules (bigger with hot upgrades)
+atom      = atom table (never shrinks! — monitor this)
+system    = runtime itself (drivers, NIF memory, etc.)
 ```
 
-Sub-binaries and pattern-match results from large binaries keep the original
-ProcBin alive. This is the most common BEAM memory leak pattern.
+BEAM's `total` is usually **less** than OS RSS because of allocator
+overhead and fragmentation. Don't trust RSS — trust `:erlang.memory/0` for
+what the VM thinks it uses, and `:recon_alloc.memory(:allocated)` for what
+allocators have reserved from the OS.
 
-**The fix**: copy the sub-binary with `:binary.copy/1` to create an independent
-heap binary (if <= 64 bytes) or a new ProcBin (if > 64 bytes) that does not
-reference the original:
+### 2. Carriers and fragmentation
 
-```elixir
-# LEAKS -- sub_binary holds a ProcBin reference to the 10 KB body
-sub = binary_part(body, 0, 50)
+BEAM allocates in chunks called **carriers** (multi-block or single-block).
+When you free a block, the carrier isn't returned to the OS until every
+block in it is free. A long-lived process with a short-lived spike can
+leave a carrier 95% empty but still charged against RSS.
 
-# SAFE -- independent copy, original ProcBin can be collected
-sub = :binary.copy(binary_part(body, 0, 50))
+```
+carrier (2 MB)
+├── [used]  [used]  [free]  [used]  [free]  [free]
+                            ▲
+                            still alive → carrier stays
 ```
 
----
+`:recon_alloc` exposes `cache_hit_rates`, `fragmentation`, and
+`sbcs_to_mbcs` to diagnose this. A fragmentation ratio above 0.5
+consistently is worth acting on (tune `+MBas`, restart the specific
+allocator, or simply reduce allocation pressure).
 
-## `:recon` -- safe production diagnosis
+### 3. `:recon.proc_count/2`: top-N without OOM
 
-`:recon` is designed for use on live production nodes. Its functions are
-rate-limited and safe; they do not crash the node or cause significant overhead.
+`Process.list/0 |> Enum.sort` on a node with 500k processes allocates
+hundreds of megabytes. `:recon.proc_count(:memory, 10)` keeps a bounded
+top-N heap in C and costs near zero. Use `:recon.proc_count` for
+attribute-based top-N and `:recon.proc_window/3` for *change over time*.
 
-Key functions:
+### 4. What "process memory" actually means
 
-```elixir
-# Top processes by memory
-:recon.proc_count(:memory, 10)
-# => [{#PID<0.123.0>, 2_097_152, [{registered_name, []}, {current_function, ...}]}, ...]
+`Process.info(pid, :memory)` returns total memory owned by that process:
 
-# Top processes by binary memory (detects binary leaks)
-:recon.proc_count(:binary_memory, 10)
+- `:heap_size` — live heap (words)
+- `:total_heap_size` — heap + old heap (before fullsweep, see 151)
+- `:stack_size` — stack (words)
+- `:memory` — bytes: heap + stack + mailbox messages + PCB
 
-# Process info for a specific pid
-:recon.info(pid, [:memory, :binary, :message_queue_len, :current_function])
+Binaries over 64 bytes are **not** counted here — they live in the shared
+refc binary pool. A process can keep 2 GB "alive" while showing 50 KB of
+`:memory`. That's the classic binary leak (exercise 149).
 
-# Binary memory usage across all processes
-:recon_alloc.memory(:usage)
+### 5. `:recon_alloc.memory/1` flavors
 
-# Force GC on a process (use sparingly)
-:recon.proc_count(:binary_memory, 5)
-|> Enum.each(fn {pid, _, _} -> :erlang.garbage_collect(pid) end)
 ```
+:allocated        # bytes reserved from OS (carriers × carrier_size)
+:used             # bytes of live blocks
+:unused           # :allocated - :used   (fragmentation + cache)
+:usage            # :used / :allocated   (0.0 - 1.0)
+:allocated_types  # per allocator type
+```
+
+`:usage` < 0.5 on `:binary_alloc` is the signature of binary leak.
+`:usage` < 0.5 on `:eheap_alloc` usually means a process heap grew to
+handle a burst and hasn't been GC'd since (fullsweep_after tuning, 150).
 
 ---
 
 ## Implementation
 
-### Step 1: `lib/api_gateway/middleware/body_reader.ex`
+### Step 1: project
+
+```bash
+mix new memory_profiling --sup
+cd memory_profiling
+```
+
+### Step 2: `mix.exs`
 
 ```elixir
-defmodule ApiGateway.Middleware.BodyReader do
-  @moduledoc """
-  Reads and parses the request body, storing the result in conn.assigns.
+defmodule MemoryProfiling.MixProject do
+  use Mix.Project
 
-  This middleware has two implementations:
-    - read_body_leaky/2: exhibits the ProcBin sub-binary leak pattern
-    - read_body_safe/2: uses :binary.copy/1 to break sub-binary references
-
-  The call/2 function delegates to read_body_safe/2.
-  """
-
-  @doc """
-  Processes a connection by reading the body safely.
-  Delegates to read_body_safe/2 to avoid binary leaks.
-  """
-  @spec call(map(), keyword()) :: map()
-  def call(conn, opts) do
-    read_body_safe(conn, opts)
+  def project do
+    [app: :memory_profiling, version: "0.1.0", elixir: "~> 1.16", deps: deps()]
   end
 
-  @doc """
-  LEAKY: reads the request body and extracts sub-fields using binary_part/3.
-  The sub-binary references keep the original body ProcBin alive after the
-  request completes.
-  """
-  @spec read_body_leaky(map(), keyword()) :: map()
-  def read_body_leaky(conn, _opts) do
-    body = Map.get(conn, :raw_body, "")
+  def application, do: [extra_applications: [:logger], mod: {MemoryProfiling.Application, []}]
 
-    # These sub-binaries hold ProcBin references to `body`
-    # If body > 64 bytes, these references prevent GC of the full body
-    content_type = extract_content_type(body)
-    first_line = extract_first_line(body)
-
-    %{conn | assigns: Map.merge(conn.assigns || %{}, %{
-      content_type: content_type,
-      first_line: first_line,
-      body_size: byte_size(body)
-    })}
-  end
-
-  @doc """
-  SAFE: uses :binary.copy/1 to break ProcBin references.
-  After this function returns, the original body binary can be GC'd.
-
-  Each extracted sub-binary is wrapped with :binary.copy/1. This creates
-  an independent binary that does not reference the original body. After
-  the function returns, `body` has no surviving references and becomes
-  eligible for garbage collection.
-  """
-  @spec read_body_safe(map(), keyword()) :: map()
-  def read_body_safe(conn, _opts) do
-    body = Map.get(conn, :raw_body, "")
-
-    content_type = body |> extract_content_type() |> copy_binary()
-    first_line = body |> extract_first_line() |> copy_binary()
-
-    %{conn | assigns: Map.merge(conn.assigns || %{}, %{
-      content_type: content_type,
-      first_line: first_line,
-      body_size: byte_size(body)
-    })}
-  end
-
-  # Creates an independent copy of a binary, breaking any sub-binary reference
-  # to a larger parent binary. For empty binaries, returns as-is to avoid
-  # unnecessary allocation.
-  defp copy_binary(""), do: ""
-  defp copy_binary(bin), do: :binary.copy(bin)
-
-  # Private helpers that produce sub-binaries
-  defp extract_content_type(body) when byte_size(body) > 12 do
-    # Returns a sub-binary reference -- caller must :binary.copy if needed
-    binary_part(body, 0, min(50, byte_size(body)))
-  end
-  defp extract_content_type(_), do: ""
-
-  defp extract_first_line(body) do
-    case :binary.split(body, "\n") do
-      [line | _] -> line   # sub-binary reference
-      [] -> ""
-    end
+  defp deps do
+    [{:recon, "~> 2.5"}, {:benchee, "~> 1.3", only: :dev}]
   end
 end
 ```
 
-### Step 2: `lib/api_gateway/dev/memory_snapshot.ex`
+### Step 3: `lib/memory_profiling/application.ex`
 
 ```elixir
-defmodule ApiGateway.Dev.MemorySnapshot do
+defmodule MemoryProfiling.Application do
+  @moduledoc false
+  use Application
+
+  @impl true
+  def start(_type, _args) do
+    Supervisor.start_link([], strategy: :one_for_one, name: MemoryProfiling.Supervisor)
+  end
+end
+```
+
+### Step 4: `lib/memory_profiling/node_report.ex`
+
+```elixir
+defmodule MemoryProfiling.NodeReport do
   @moduledoc """
-  Wraps :recon to produce structured memory reports for live diagnosis.
-
-  All functions are safe to call on a production node.
-  They do not cause significant overhead and do not require :observer.
-
-  Usage from IEx on the production node:
-    iex> ApiGateway.Dev.MemorySnapshot.report()
-    iex> ApiGateway.Dev.MemorySnapshot.top_binary_consumers(5)
-    iex> ApiGateway.Dev.MemorySnapshot.force_gc_top_consumers(3)
+  High-level node memory breakdown. Renders `:erlang.memory/0` plus
+  allocator totals in bytes and percentages.
   """
 
-  @doc """
-  Returns a structured map with system-wide memory stats.
-  """
-  @spec report() :: map()
-  def report do
+  @type breakdown :: %{
+          total_bytes: non_neg_integer(),
+          allocated_bytes: non_neg_integer(),
+          rss_overhead_pct: float(),
+          buckets: %{atom() => {non_neg_integer(), float()}}
+        }
+
+  @spec build() :: breakdown()
+  def build do
     mem = :erlang.memory()
+    total = Keyword.fetch!(mem, :total)
+    allocated = :recon_alloc.memory(:allocated)
+    used = :recon_alloc.memory(:used)
+
+    buckets =
+      mem
+      |> Keyword.delete(:total)
+      |> Map.new(fn {k, v} -> {k, {v, pct(v, total)}} end)
 
     %{
-      total_mb: div(mem[:total], 1_048_576),
-      processes_mb: div(mem[:processes], 1_048_576),
-      binary_mb: div(mem[:binary], 1_048_576),
-      code_mb: div(mem[:code], 1_048_576),
-      ets_mb: div(mem[:ets], 1_048_576),
-      process_count: :erlang.system_info(:process_count),
-      scheduler_count: System.schedulers_online()
+      total_bytes: total,
+      allocated_bytes: allocated,
+      rss_overhead_pct: pct(allocated - used, allocated),
+      buckets: buckets
+    }
+  end
+
+  @spec format(breakdown()) :: String.t()
+  def format(%{buckets: buckets, total_bytes: total, allocated_bytes: alloc, rss_overhead_pct: overhead}) do
+    lines =
+      buckets
+      |> Enum.sort_by(fn {_k, {v, _}} -> -v end)
+      |> Enum.map(fn {k, {v, pct}} -> "  #{pad(k, 10)}  #{human(v)}  #{Float.round(pct, 1)}%" end)
+
+    IO.iodata_to_binary([
+      "Total:      #{human(total)}\n",
+      "Allocated:  #{human(alloc)}  (overhead: #{Float.round(overhead, 1)}%)\n",
+      "\n",
+      Enum.intersperse(lines, "\n")
+    ])
+  end
+
+  defp pct(_, 0), do: 0.0
+  defp pct(num, denom), do: num / denom * 100.0
+
+  defp pad(a, n), do: a |> Atom.to_string() |> String.pad_trailing(n)
+
+  defp human(n) when n >= 1_073_741_824, do: "#{Float.round(n / 1_073_741_824, 2)} GiB"
+  defp human(n) when n >= 1_048_576, do: "#{Float.round(n / 1_048_576, 2)} MiB"
+  defp human(n) when n >= 1_024, do: "#{Float.round(n / 1_024, 2)} KiB"
+  defp human(n), do: "#{n} B"
+end
+```
+
+### Step 5: `lib/memory_profiling/process_report.ex`
+
+```elixir
+defmodule MemoryProfiling.ProcessReport do
+  @moduledoc """
+  Top-N processes by selected attribute. Uses `:recon.proc_count/2`.
+  """
+
+  @type attribute :: :memory | :reductions | :message_queue_len | :total_heap_size | :binary_memory
+
+  @spec top(attribute(), pos_integer()) :: [map()]
+  def top(attribute, n) when n > 0 do
+    attribute
+    |> :recon.proc_count(n)
+    |> Enum.map(&format/1)
+  end
+
+  defp format({pid, value, info_list}) do
+    %{
+      pid: pid,
+      value: value,
+      current_function: Keyword.get(info_list, :current_function),
+      registered_name: Keyword.get(info_list, :registered_name) || nil,
+      initial_call: Keyword.get(info_list, :initial_call)
     }
   end
 
   @doc """
-  Returns the top `n` processes by binary memory usage.
-  Each entry: {pid, binary_bytes, process_info_keyword_list}
-
-  Uses :recon.proc_count/2 which safely inspects all processes and returns
-  the top N sorted by the given attribute. Safe for production use.
+  Top-N by *change* over `window_ms`. The best leak hunter — catches
+  processes that grew during the window, not just the fattest ones.
   """
-  @spec top_binary_consumers(pos_integer()) :: list()
-  def top_binary_consumers(n \\ 10) do
-    :recon.proc_count(:binary_memory, n)
-  end
-
-  @doc """
-  Returns the top `n` processes by total heap memory.
-  """
-  @spec top_memory_consumers(pos_integer()) :: list()
-  def top_memory_consumers(n \\ 10) do
-    :recon.proc_count(:memory, n)
-  end
-
-  @doc """
-  Forces GC on the top `n` processes by binary memory.
-  Returns the total binary memory freed (before - after).
-
-  Use this as a diagnostic tool -- not a production fix.
-  Frequent forced GC indicates a binary leak that must be fixed at the source.
-  """
-  @spec force_gc_top_consumers(pos_integer()) :: non_neg_integer()
-  def force_gc_top_consumers(n \\ 5) do
-    before_total = :erlang.memory(:binary)
-
-    top_binary_consumers(n)
-    |> Enum.each(fn {pid, _bytes, _info} ->
-      # :erlang.garbage_collect/1 returns true on success, false if pid is dead.
-      # We ignore the return value because dead pids are harmless here.
-      try do
-        :erlang.garbage_collect(pid)
-      catch
-        _, _ -> :ok
-      end
-    end)
-
-    after_total = :erlang.memory(:binary)
-    max(0, before_total - after_total)
-  end
-
-  @doc """
-  Returns process info for a specific pid as a map.
-  Uses :recon.info/2 which is safe for production and does not crash on dead pids.
-  """
-  @spec process_info(pid()) :: map()
-  def process_info(pid) do
-    keys = [:memory, :binary, :message_queue_len, :current_function, :registered_name, :status]
-
-    case :recon.info(pid, keys) do
-      info when is_list(info) -> Map.new(info)
-      _ -> %{}
-    end
+  @spec window(attribute(), pos_integer(), pos_integer()) :: [map()]
+  def window(attribute, n, window_ms) when n > 0 and window_ms > 0 do
+    attribute
+    |> :recon.proc_window(n, window_ms)
+    |> Enum.map(&format/1)
   end
 end
 ```
 
-### Step 3: Tests
+### Step 6: `lib/memory_profiling/alloc_report.ex`
 
 ```elixir
-# test/api_gateway/middleware/body_reader_test.exs
-defmodule ApiGateway.Middleware.BodyReaderTest do
-  use ExUnit.Case, async: true
+defmodule MemoryProfiling.AllocReport do
+  @moduledoc """
+  Per-allocator usage and fragmentation.
 
-  alias ApiGateway.Middleware.BodyReader
-  alias ApiGateway.Dev.MemorySnapshot
+  `:binary_alloc` with usage < 0.5 is the signature of a refc binary leak.
+  `:eheap_alloc` with usage < 0.5 signals process heaps pinned large after
+  a burst (candidates for `:erlang.garbage_collect/1`).
+  """
 
-  # A body large enough to be stored as ProcBin (> 64 bytes)
-  @large_body String.duplicate("application/json; charset=utf-8\nContent-Length: 42\n", 10)
+  @type alloc_info :: %{
+          allocator: atom(),
+          usage: float(),
+          allocated: non_neg_integer(),
+          used: non_neg_integer()
+        }
 
-  describe "read_body_safe/2" do
-    test "assigns are populated correctly" do
-      conn = %ApiGateway.Conn{method: "POST", path: "/", assigns: %{}, raw_body: @large_body}
-      result = BodyReader.read_body_safe(conn, [])
+  @spec summary() :: [alloc_info()]
+  def summary do
+    :recon_alloc.memory(:allocated_types)
+    |> Enum.map(fn {alloc_name, allocated} ->
+      used = bytes_used_for(alloc_name)
+      usage = if allocated == 0, do: 0.0, else: used / allocated
 
-      assert result.assigns.body_size == byte_size(@large_body)
-      assert is_binary(result.assigns.content_type)
-      assert is_binary(result.assigns.first_line)
-    end
+      %{
+        allocator: alloc_name,
+        usage: Float.round(usage, 3),
+        allocated: allocated,
+        used: used
+      }
+    end)
+    |> Enum.sort_by(& &1.usage)
+  end
 
-    test "safe version produces same assigns as leaky version" do
-      conn = %ApiGateway.Conn{method: "POST", path: "/", assigns: %{}, raw_body: @large_body}
-      leaky = BodyReader.read_body_leaky(conn, [])
-      safe = BodyReader.read_body_safe(conn, [])
+  defp bytes_used_for(alloc_name) do
+    :recon_alloc.sbcs_to_mbcs(:current)
+    |> Enum.reduce(0, fn _, acc -> acc end)
 
-      assert leaky.assigns == safe.assigns
-    end
+    # Use :recon_alloc.average_block_sizes for per-type used bytes
+    case :recon_alloc.fragmentation(:current) do
+      [] ->
+        0
 
-    test "extracted sub-binaries are independent copies (not sub-binary references)" do
-      conn = %ApiGateway.Conn{method: "POST", path: "/", assigns: %{}, raw_body: @large_body}
-      result = BodyReader.read_body_safe(conn, [])
-
-      # :binary.referenced_byte_size/1 returns the size of the original binary
-      # that a binary references. For a truly independent copy:
-      #   :binary.referenced_byte_size(copy) == byte_size(copy)
-      # For a sub-binary reference:
-      #   :binary.referenced_byte_size(sub) == byte_size(original)  (much larger)
-      ct = result.assigns.content_type
-      if byte_size(ct) > 0 do
-        assert :binary.referenced_byte_size(ct) == byte_size(ct),
-               "content_type is a sub-binary reference -- use :binary.copy/1"
-      end
+      frags ->
+        frags
+        |> Enum.find_value(0, fn {{^alloc_name, _instance}, kvs} ->
+          Keyword.get(kvs, :sbcs_usage, 0) + Keyword.get(kvs, :mbcs_usage, 0)
+        end) || 0
     end
   end
 
-  describe "MemorySnapshot" do
-    test "report/0 returns a map with expected keys" do
-      report = MemorySnapshot.report()
-
-      assert is_map(report)
-      assert is_integer(report.total_mb) and report.total_mb > 0
-      assert is_integer(report.binary_mb)
-      assert is_integer(report.process_count) and report.process_count > 0
-    end
-
-    test "top_binary_consumers/1 returns a list" do
-      result = MemorySnapshot.top_binary_consumers(3)
-      assert is_list(result)
-    end
-
-    test "top_memory_consumers/1 returns a list of length <= n" do
-      result = MemorySnapshot.top_memory_consumers(5)
-      assert is_list(result)
-      assert length(result) <= 5
-    end
-
-    test "force_gc_top_consumers/1 returns a non-negative integer" do
-      freed = MemorySnapshot.force_gc_top_consumers(3)
-      assert is_integer(freed) and freed >= 0
-    end
-
-    test "process_info/1 returns a map for the current process" do
-      info = MemorySnapshot.process_info(self())
-      assert is_map(info)
-    end
+  @spec suspicious(float()) :: [alloc_info()]
+  def suspicious(threshold \\ 0.5) when is_float(threshold) do
+    summary()
+    |> Enum.filter(&(&1.usage < threshold and &1.allocated > 1_048_576))
   end
 end
 ```
 
-### Step 4: Run the tests
+### Step 7: `lib/memory_profiling/leak_hunter.ex`
 
-```bash
-mix test test/api_gateway/middleware/body_reader_test.exs --trace
+```elixir
+defmodule MemoryProfiling.LeakHunter do
+  @moduledoc """
+  Correlates memory across two snapshots. A process that grows linearly
+  over two 30-second windows is almost always a leak.
+  """
+
+  @spec hunt(pos_integer(), pos_integer()) :: [map()]
+  def hunt(n, window_ms) when n > 0 and window_ms > 0 do
+    before = snapshot()
+    Process.sleep(window_ms)
+    now = snapshot()
+
+    before
+    |> Enum.map(fn {pid, mem_before} ->
+      case Map.fetch(now, pid) do
+        {:ok, mem_after} -> {pid, mem_after - mem_before, mem_after}
+        :error -> {pid, 0, 0}
+      end
+    end)
+    |> Enum.reject(fn {_pid, delta, _} -> delta <= 0 end)
+    |> Enum.sort_by(fn {_pid, delta, _} -> -delta end)
+    |> Enum.take(n)
+    |> Enum.map(&describe/1)
+  end
+
+  defp snapshot do
+    for pid <- Process.list(), into: %{} do
+      case Process.info(pid, :memory) do
+        {:memory, m} -> {pid, m}
+        nil -> {pid, 0}
+      end
+    end
+  end
+
+  defp describe({pid, delta, current}) do
+    info = Process.info(pid, [:registered_name, :current_function, :initial_call]) || []
+
+    %{
+      pid: pid,
+      delta_bytes: delta,
+      current_bytes: current,
+      registered_name: Keyword.get(info, :registered_name) || nil,
+      current_function: Keyword.get(info, :current_function),
+      initial_call: Keyword.get(info, :initial_call)
+    }
+  end
+end
+```
+
+### Step 8: tests
+
+```elixir
+# test/memory_profiling/node_report_test.exs
+defmodule MemoryProfiling.NodeReportTest do
+  use ExUnit.Case, async: true
+
+  alias MemoryProfiling.NodeReport
+
+  test "build/0 returns expected buckets" do
+    report = NodeReport.build()
+    assert is_integer(report.total_bytes) and report.total_bytes > 0
+    assert is_integer(report.allocated_bytes) and report.allocated_bytes > 0
+    assert Map.has_key?(report.buckets, :processes)
+    assert Map.has_key?(report.buckets, :ets)
+    assert Map.has_key?(report.buckets, :binary)
+  end
+
+  test "format/1 produces human-readable text" do
+    out = NodeReport.build() |> NodeReport.format()
+    assert out =~ "Total:"
+    assert out =~ "Allocated:"
+    assert out =~ "processes"
+  end
+end
+```
+
+```elixir
+# test/memory_profiling/process_report_test.exs
+defmodule MemoryProfiling.ProcessReportTest do
+  use ExUnit.Case, async: false
+
+  alias MemoryProfiling.ProcessReport
+
+  test "top/2 by memory returns at most N processes" do
+    results = ProcessReport.top(:memory, 5)
+    assert length(results) <= 5
+
+    for r <- results do
+      assert is_pid(r.pid)
+      assert is_integer(r.value) and r.value >= 0
+    end
+  end
+
+  test "window/3 returns processes that grew" do
+    # Spawn one process that accumulates a large list
+    pid =
+      spawn(fn ->
+        Enum.reduce(1..1_000_000, [], fn i, acc -> [i | acc] end)
+        Process.sleep(:infinity)
+      end)
+
+    on_exit(fn -> Process.exit(pid, :kill) end)
+
+    results = ProcessReport.window(:memory, 5, 150)
+    assert is_list(results)
+  end
+end
+```
+
+### Step 9: remote-shell usage
+
+```
+iex> MemoryProfiling.NodeReport.build() |> MemoryProfiling.NodeReport.format() |> IO.puts()
+iex> MemoryProfiling.ProcessReport.top(:memory, 10)
+iex> MemoryProfiling.ProcessReport.window(:binary_memory, 10, 10_000)
+iex> MemoryProfiling.AllocReport.suspicious()
+iex> MemoryProfiling.LeakHunter.hunt(10, 30_000)
 ```
 
 ---
 
-## Trade-off analysis
+## Trade-offs and production gotchas
 
-| Approach | Binary leak risk | Memory overhead | GC pressure | Throughput |
-|----------|-----------------|-----------------|-------------|------------|
-| Return sub-binary directly | High -- original ProcBin survives | Low (16-byte ProcBin ptr) | Low (no copy) | Highest |
-| `:binary.copy/1` always | None | Medium (extra allocation) | Medium (triggers GC sooner) | Lower |
-| Avoid large binary creation | None | Lowest | Lowest | Highest |
-| Stream body (don't accumulate) | None | Constant | None | Best for large bodies |
+**1. `Process.list/0` on a 500k-process node**
+`LeakHunter.hunt/2` walks the full table twice. On very large nodes that
+alone is 50+ MB of temporary allocation. Prefer
+`:recon.proc_window(:memory, N, window_ms)` for production — it's the
+same idea but bounded.
 
-**Rule of thumb**: use `:binary.copy/1` for any sub-binary that will outlive
-the function that created the original large binary. For sub-binaries that are
-local (used and discarded in the same function), copying is unnecessary.
+**2. `:recon_alloc` returns raw integers in bytes, not words**
+Old docs mix words and bytes. `:recon_alloc.memory/1` is bytes;
+`Process.info(pid, :heap_size)` is words. Multiply by
+`:erlang.system_info(:wordsize)` when comparing.
+
+**3. Atom table leak is invisible here**
+Atoms never GC. If someone does `String.to_atom(user_input)` you will
+eventually hit the `+t` limit (1,048,576 atoms by default) and the node
+crashes. Monitor `:erlang.system_info(:atom_count)` separately.
+
+**4. `:erlang.garbage_collect/0` on all processes is a footgun**
+Tempting from a remote shell ("just GC everything") — but it stops every
+scheduler for each process and can pause a busy node for seconds. Target
+the specific large processes instead.
+
+**5. Allocator tuning rarely fixes application bugs**
+Fragmentation is almost always downstream of allocation pattern. Fix the
+pattern (process hibernation, controlled binary lifetime, ETS eviction)
+before touching `+MBlmbcs` / `+MBas`.
+
+**6. `:recon.bin_leak/1` sends a GC message to every process**
+It forces a fullsweep on every process to release held refc binaries.
+Useful in emergency but expensive. See exercise 149 for a deeper study.
+
+**7. When NOT to use this**
+For long-term trend analysis you want telemetry exported to Prometheus —
+not ad-hoc iex commands. This toolkit is for *incident response*:
+landing on a sick node, answering "where did my RAM go?" in under 60
+seconds.
 
 ---
 
-## Common production mistakes
+## Performance notes
 
-**1. Calling `:erlang.garbage_collect/1` in production loops**
-Forced GC is a diagnostic tool, not a fix. If you need to call `garbage_collect`
-to prevent OOM, the real problem is a sub-binary reference or a process accumulating
-state. Find and fix the source; do not mask it with forced GC.
-
-**2. Confusing `:erlang.memory(:binary)` growing with a leak**
-`:erlang.memory(:binary)` grows when large binaries are *being used*, not only when
-they leak. A spike followed by a return to baseline is normal. A monotonically
-increasing baseline over hours is a leak signal. Use `:recon.proc_count(:binary_memory, 10)`
-to find which process owns the growing binaries.
-
-**3. Using `String.split/2` on large binaries and keeping the results in GenServer state**
-`String.split` returns a list of sub-binary references. If these are stored in a
-GenServer's state, the original binary is pinned in memory until the GenServer
-restarts. Always apply `:binary.copy/1` to list elements before storing.
-
-**4. Not calling `:recon` -- using `:observer` instead in production**
-`:observer.start/0` over a remote shell is fine for development. In production,
-the Observer GUI connects over distribution and streams all process state to your
-laptop. This creates significant network and CPU overhead. Use `:recon` functions
-instead -- they compute summaries on the node and return compact results.
-
-**5. Adding `:recon` only to `:dev` deps**
-`:recon` is a diagnostic library that must be present in the production release.
-Add it to the main `deps/0` list (not scoped to `:dev` or `:test`), and include
-it in the release `applications` list. A library you can't use in production is
-useless for production diagnosis.
+| Call | Cost (10k procs) | Notes |
+|------|------------------|-------|
+| `NodeReport.build/0` | ~200 µs | dominated by `:erlang.memory/0` |
+| `ProcessReport.top(:memory, 10)` | ~3 ms | bounded heap in C |
+| `ProcessReport.window(:memory, 10, 5_000)` | ~5005 ms | `sleep(5000)` + snapshots |
+| `LeakHunter.hunt(10, 5_000)` | ~5100 ms, 80 MB transient | consider `:recon.proc_window` |
+| `AllocReport.summary/0` | ~1 ms | one pass over allocator instances |
 
 ---
 
 ## Resources
 
-- [`:recon` documentation](https://ferd.github.io/recon/) -- Fred Hebert's production diagnostic library
-- [Erlang in Anger -- Fred Hebert](https://www.erlang-in-anger.com/) -- free book, chapter 7 covers memory analysis
-- [BEAM book: binaries and memory](https://happi.github.io/theBeamBook/#_binaries) -- ProcBin vs heap binary internals
-- [`:binary.referenced_byte_size/1` -- Erlang docs](https://www.erlang.org/doc/man/binary.html#referenced_byte_size-1) -- diagnosing sub-binary references
-- [`:recon_alloc` -- memory allocator stats](https://ferd.github.io/recon/recon_alloc.html) -- allocator-level memory analysis
+- [`:recon` docs](https://ferd.github.io/recon/) — Fred Hébert
+- [Erlang in Anger — chapter 7 Memory](https://www.erlang-in-anger.com/) — free PDF
+- [`:recon_alloc`](https://ferd.github.io/recon/recon_alloc.html) — allocator API reference
+- [Erlang memory layout — ERTS User's Guide](https://www.erlang.org/doc/apps/erts/alloc.html)
+- ["The Hitchhiker's Tour of the BEAM"](https://www.youtube.com/watch?v=_Pwlvy3zz9M) — Robert Virding
+- [Dashbit blog — debugging memory](https://dashbit.co/blog) — look for posts by José Valim on profiling
+- [LiveDashboard Memory page source](https://github.com/phoenixframework/phoenix_live_dashboard/blob/main/lib/phoenix/live_dashboard/pages/home_page.ex)

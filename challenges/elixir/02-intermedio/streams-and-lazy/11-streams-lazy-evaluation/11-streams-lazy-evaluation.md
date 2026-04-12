@@ -3,9 +3,6 @@
 **Project**: `lazy_pipeline` — run the same pipeline through `Enum` and
 `Stream` and measure the memory cost in bytes.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
-
 ---
 
 ## Project context
@@ -84,6 +81,20 @@ after_mem - before
 
 Numbers fluctuate — garbage collection and scheduler state both move them.
 Run several times and look at the order of magnitude, not the last digit.
+
+---
+
+## Design decisions
+
+**Option A — Use `Enum` throughout for simplicity**
+- Pros: one module to learn; predictable strict semantics; often faster for small inputs.
+- Cons: allocates every intermediate list; cannot early-terminate over huge sources; dominates RAM on multi-stage pipelines.
+
+**Option B — Use `Stream` for the body, terminate with `Enum`** (chosen)
+- Pros: single-pass composition, early exit on `Enum.take`, O(1) extra memory regardless of input size.
+- Cons: closure-per-element overhead; side effects are deferred; forgetting the terminal call is a common bug.
+
+→ Chose **B** because the whole point of the exercise is to *measure* the difference, and the measurement only pays off when input size and partial consumption meet the Stream sweet spot.
 
 ---
 
@@ -207,6 +218,23 @@ mix test
 mix test --only memory
 ```
 
+### Why this works
+
+Each `Stream.*` call returns a `%Stream{}` struct holding the enumerable source and a composed reducer function. No list is ever built between stages — a terminal `Enum.*` pulls elements one at a time through the whole pipeline, and `Enum.take/2` halts the pull as soon as it has enough. The memory delta measured with `:erlang.memory(:total)` reflects only the final result size plus a constant per-element closure cost.
+
+---
+
+## Benchmark
+
+```elixir
+n = 1_000_000
+{_, strict_us} = :timer.tc(fn -> LazyPipeline.strict_pipeline(n) end)
+{_, lazy_us}   = :timer.tc(fn -> LazyPipeline.lazy_pipeline(n) end)
+IO.puts("strict=#{strict_us}µs  lazy=#{lazy_us}µs")
+```
+
+Target esperado: on modern hardware with n=1_000_000, `strict` runs ~50-150 ms and allocates >50 MB; `lazy` runs <1 ms and allocates a few KB — an order-of-magnitude win on both axes.
+
 ---
 
 ## Trade-offs and production gotchas
@@ -249,6 +277,13 @@ that differ by 20 percent.
 - You already have a concrete list on hand and plan to consume all of it.
 - You're composing two steps — the readability cost of `Stream.` prefixes
   usually isn't worth it below three stages.
+
+---
+
+## Reflection
+
+- Your service computes a 3-stage transform over a 500k-row daily export and you always consume the full result. Would you still prefer `Stream` over `Enum`? Justify in terms of closure overhead vs allocation savings.
+- How would you redesign `measure/1` to be safe under concurrent load (multiple processes calling it)? `:erlang.memory(:total)` is VM-global — what does that imply?
 
 ---
 

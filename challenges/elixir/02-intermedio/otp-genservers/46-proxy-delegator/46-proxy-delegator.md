@@ -2,9 +2,6 @@
 
 **Project**: `proxy_gs` — a GenServer that forwards requests to a backend process while enforcing a per-second rate cap.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
-
 ---
 
 ## Project context
@@ -41,6 +38,11 @@ proxy_gs/
 
 ---
 
+
+## Why X and not Y
+
+- **Why not direct calls from every caller?** Cross-cutting concerns (retries, circuit breaking, metrics) explode across callers; a proxy centralizes them.
+
 ## Core concepts
 
 ### 1. A proxy is a GenServer that forwards
@@ -65,7 +67,7 @@ requests. On each request:
 3. Otherwise, reject with `{:error, :rate_limited}`.
 
 This exercise uses a simple list of monotonic timestamps. For very high
-rates, prefer `:counters` + a rotating bucket (see exercise 38).
+rates, prefer `:counters` + a rotating bucket.
 
 ### 3. `GenServer.call` inside `handle_call` — beware deadlocks
 
@@ -85,7 +87,31 @@ and immediately acknowledge.
 
 ---
 
+## Design decisions
+
+**Option A — direct calls from every caller**
+- Pros: simpler upfront, fewer moving parts.
+- Cons: hides the trade-off that this exercise exists to teach.
+
+**Option B — a proxy GenServer that delegates (chosen)**
+- Pros: explicit about the semantic that matters in production.
+- Cons: one more concept to internalize.
+
+→ Chose **B** because proxy centralizes retries, circuit-breaking, and metrics without touching callers.
+
+
 ## Implementation
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defp deps do
+  [
+    # stdlib-only by default; add `{:benchee, "~> 1.3", only: :dev}` if you benchmark
+  ]
+end
+```
+
 
 ### Step 1: Create the project
 
@@ -191,7 +217,7 @@ defmodule ProxyGs do
   defp monotonic_ms, do: System.monotonic_time(:millisecond)
 
   # Drop timestamps older than `window_ms` ago. Cheap for small caps;
-  # if cap grows, replace with a counter per bucket (see exercise 38).
+  # if cap grows, replace with a counter per bucket.
   defp prune(timestamps, now, window_ms) do
     threshold = now - window_ms
     Enum.filter(timestamps, &(&1 > threshold))
@@ -274,6 +300,15 @@ mix test
 
 ---
 
+### Why this works
+
+The design leans on OTP primitives that already encode the invariants we care about (supervision, back-pressure, explicit message semantics), so failure modes are visible at the right layer instead of being reinvented ad-hoc. Tests exercise the edges (timeouts, crashes, boundary states), which is where hand-rolled alternatives silently drift over time.
+
+
+## Benchmark
+
+<!-- benchmark N/A: tema conceptual -->
+
 ## Trade-offs and production gotchas
 
 **1. A proxy is a bottleneck by design**
@@ -316,6 +351,11 @@ CRDT-based library (`Hammer` with a shared backend). Single-GenServer
 proxies are for single-node, single-quota gatekeeping.
 
 ---
+
+
+## Reflection
+
+- Cuando el servicio real cae, ¿el proxy debe crashear o degradar silenciosamente? Justificá en función del tipo de cliente downstream.
 
 ## Resources
 

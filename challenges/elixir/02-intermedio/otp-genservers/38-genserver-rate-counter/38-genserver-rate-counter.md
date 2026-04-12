@@ -2,9 +2,6 @@
 
 **Project**: `rate_counter_gs` — a GenServer that counts events per second using a 1-second sliding window and a self-scheduled tick via `Process.send_after/3`.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
-
 ---
 
 ## Project context
@@ -38,6 +35,12 @@ rate_counter_gs/
 
 ---
 
+
+## Why X and not Y
+
+- **Why not Hammer/ExRated?** Fine in prod, but this exercise teaches the primitive; libraries hide the window-reset decision.
+- **Why not ETS atomic counters?** ETS can't express the atomic window rollover we need.
+
 ## Core concepts
 
 ### 1. `handle_info/2` — the catch-all message handler
@@ -61,7 +64,7 @@ Process.send_after(self(), :tick, 1_000)   # one-shot; you reschedule in the han
 `send_after` returns a ref you can cancel with `Process.cancel_timer/1`.
 It also avoids the `:timer` server bottleneck (`:timer` is a single gen_server
 in Erlang's stdlib). For per-process periodic work, **always prefer
-`send_after` + self-reschedule**. See exercise 40 for a deeper dive.
+`send_after` + self-reschedule**. 
 
 ### 3. Sliding window via bucket rotation
 
@@ -87,7 +90,31 @@ not by an external timer server.
 
 ---
 
+## Design decisions
+
+**Option A — ETS atomic counters**
+- Pros: simpler upfront, fewer moving parts.
+- Cons: hides the trade-off that this exercise exists to teach.
+
+**Option B — GenServer with periodic window reset (chosen)**
+- Pros: explicit about the semantic that matters in production.
+- Cons: one more concept to internalize.
+
+→ Chose **B** because GenServer gives us atomic window rollover semantics that ETS counters cannot express cleanly.
+
+
 ## Implementation
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defp deps do
+  [
+    # stdlib-only by default; add `{:benchee, "~> 1.3", only: :dev}` if you benchmark
+  ]
+end
+```
+
 
 ### Step 1: Create the project
 
@@ -263,6 +290,21 @@ mix test
 
 ---
 
+### Why this works
+
+The design leans on OTP primitives that already encode the invariants we care about (supervision, back-pressure, explicit message semantics), so failure modes are visible at the right layer instead of being reinvented ad-hoc. Tests exercise the edges (timeouts, crashes, boundary states), which is where hand-rolled alternatives silently drift over time.
+
+
+## Benchmark
+
+```elixir
+{us, _} = :timer.tc(fn ->
+  for _ <- 1..1_000_000, do: RateCounter.check(:key)
+end)
+```
+
+Target esperado: <1 µs por `check` con ETS, <5 µs con GenServer.
+
 ## Trade-offs and production gotchas
 
 **1. Timer drift is real — `send_after` does not compensate**
@@ -299,6 +341,11 @@ StatsD). A GenServer is fine for *internal* feedback loops (e.g. a
 circuit breaker reading its own recent error rate), not for observability.
 
 ---
+
+
+## Reflection
+
+- Con 100k clientes activos cada uno con su rate limiter, ¿seguís con GenServers per-key o migrás a ETS/Redis? Justificá con números.
 
 ## Resources
 

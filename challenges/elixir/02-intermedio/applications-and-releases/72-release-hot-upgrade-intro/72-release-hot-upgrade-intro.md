@@ -6,8 +6,6 @@ not a recommendation: the goal is to know what the feature is, when
 it was useful, and why modern Elixir deployments almost always pick
 rolling restarts instead.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
 
 ---
 
@@ -41,6 +39,11 @@ hot_upgrade_intro/
 ```
 
 ---
+
+
+## Why X and not Y
+
+- **Why not blue/green?** Simpler and what most shops pick; hot upgrade is taught because understanding `code_change/3` informs design even when you don't use relups.
 
 ## Core concepts
 
@@ -89,7 +92,31 @@ state.
 
 ---
 
+## Design decisions
+
+**Option A — blue/green redeploy (simpler)**
+- Pros: simpler upfront, fewer moving parts.
+- Cons: hides the trade-off that this exercise exists to teach.
+
+**Option B — relup hot upgrade (chosen here for learning)**
+- Pros: explicit about the semantic that matters in production.
+- Cons: one more concept to internalize.
+
+→ Chose **B** because understanding `code_change/3` and appups is foundational even if most shops pick blue/green in practice.
+
+
 ## Implementation
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defp deps do
+  [
+    # stdlib-only by default; add `{:benchee, "~> 1.3", only: :dev}` if you benchmark
+  ]
+end
+```
+
 
 ### Step 1: Create the project
 
@@ -241,6 +268,15 @@ which is Mix's polite way of steering you toward rolling restarts.
 
 ---
 
+### Why this works
+
+The design leans on OTP primitives that already encode the invariants we care about (supervision, back-pressure, explicit message semantics), so failure modes are visible at the right layer instead of being reinvented ad-hoc. Tests exercise the edges (timeouts, crashes, boundary states), which is where hand-rolled alternatives silently drift over time.
+
+
+## Benchmark
+
+<!-- benchmark N/A: tema conceptual -->
+
 ## Trade-offs and production gotchas
 
 **1. `code_change/3` runs INSIDE the live server**
@@ -274,6 +310,11 @@ millions to reboot. Latency-critical single-node systems. That's
 about it.
 
 ---
+
+
+## Reflection
+
+- ¿Hot upgrade o blue/green para un servicio de pagos? Justificá con criterios operacionales concretos.
 
 ## Resources
 

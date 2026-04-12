@@ -2,9 +2,6 @@
 
 **Project**: `terminate_cleanup_gs` — a GenServer that owns a file handle and releases it on graceful shutdown.
 
-**Difficulty**: ★★☆☆☆
-**Estimated time**: 1–2 hours
-
 ---
 
 ## Project context
@@ -39,6 +36,11 @@ terminate_cleanup_gs/
 ```
 
 ---
+
+
+## Why X and not Y
+
+- **Why not trust `terminate/2`?** It isn't called on `:brutal_kill`, node crashes, or `:kill` signals. External state needs idempotent cleanup independent of it.
 
 ## Core concepts
 
@@ -85,7 +87,31 @@ flushes over slow networks.
 
 ---
 
+## Design decisions
+
+**Option A — rely on `terminate/2` for all cleanup**
+- Pros: simpler upfront, fewer moving parts.
+- Cons: hides the trade-off that this exercise exists to teach.
+
+**Option B — use process links and a supervisor hook + idempotent cleanup (chosen)**
+- Pros: explicit about the semantic that matters in production.
+- Cons: one more concept to internalize.
+
+→ Chose **B** because `terminate/2` isn't guaranteed to run on brutal_kill; idempotent external cleanup is the only safe pattern.
+
+
 ## Implementation
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defp deps do
+  [
+    # stdlib-only by default; add `{:benchee, "~> 1.3", only: :dev}` if you benchmark
+  ]
+end
+```
+
 
 ### Step 1: Create the project
 
@@ -245,6 +271,15 @@ mix test
 
 ---
 
+### Why this works
+
+The design leans on OTP primitives that already encode the invariants we care about (supervision, back-pressure, explicit message semantics), so failure modes are visible at the right layer instead of being reinvented ad-hoc. Tests exercise the edges (timeouts, crashes, boundary states), which is where hand-rolled alternatives silently drift over time.
+
+
+## Benchmark
+
+<!-- benchmark N/A: tema conceptual -->
+
 ## Trade-offs and production gotchas
 
 **1. Without `trap_exit`, a supervisor shutdown skips `terminate/2`**
@@ -284,6 +319,11 @@ write, or use a persistent log. `terminate/2` is for hygiene, not
 correctness.
 
 ---
+
+
+## Reflection
+
+- Tu `terminate/2` escribe a disco. El supervisor lo mata con `:brutal_kill`. ¿Qué perdiste y cómo lo diseñarías para que no importe?
 
 ## Resources
 

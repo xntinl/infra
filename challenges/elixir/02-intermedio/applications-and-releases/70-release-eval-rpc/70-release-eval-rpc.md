@@ -4,8 +4,6 @@
 you can drive via both `eval` (new short-lived node) and `rpc`
 (the live node), so the difference is concrete.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
 
 ---
 
@@ -44,6 +42,11 @@ release_eval_rpc/
 ```
 
 ---
+
+
+## Why X and not Y
+
+- **Why not SSH + iex?** No audit trail, no typed interface, and easy to run destructive code by mistake.
 
 ## Core concepts
 
@@ -93,7 +96,31 @@ because they run under `eval` without the full supervision tree.
 
 ---
 
+## Design decisions
+
+**Option A — SSH into the node and hope**
+- Pros: simpler upfront, fewer moving parts.
+- Cons: hides the trade-off that this exercise exists to teach.
+
+**Option B — `bin/app eval` and `bin/app rpc` (chosen)**
+- Pros: explicit about the semantic that matters in production.
+- Cons: one more concept to internalize.
+
+→ Chose **B** because release scripts give you a typed, auditable interface to a running node.
+
+
 ## Implementation
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defp deps do
+  [
+    # stdlib-only by default; add `{:benchee, "~> 1.3", only: :dev}` if you benchmark
+  ]
+end
+```
+
 
 ### Step 1: Create the project
 
@@ -284,6 +311,15 @@ $REL/bin/release_eval_rpc stop
 
 ---
 
+### Why this works
+
+The design leans on OTP primitives that already encode the invariants we care about (supervision, back-pressure, explicit message semantics), so failure modes are visible at the right layer instead of being reinvented ad-hoc. Tests exercise the edges (timeouts, crashes, boundary states), which is where hand-rolled alternatives silently drift over time.
+
+
+## Benchmark
+
+<!-- benchmark N/A: tema conceptual -->
+
 ## Trade-offs and production gotchas
 
 **1. `eval` does NOT start your supervision tree**
@@ -310,6 +346,11 @@ endpoint (admin port with auth) or a telemetry metric. `rpc`/`eval`
 are human-driven tools, not RPC for other services.
 
 ---
+
+
+## Reflection
+
+- Diseñá un script de migración de DB que corra bajo `bin/app eval`. ¿Cómo lo testeás sin una release?
 
 ## Resources
 

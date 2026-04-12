@@ -4,8 +4,6 @@
 reads a JSON file on the target machine at release boot and merges
 it into the application environment, before any app starts.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
 
 ---
 
@@ -43,6 +41,11 @@ config_providers_demo/
 ```
 
 ---
+
+
+## Why X and not Y
+
+- **Why not a shell wrapper?** Wrappers run outside the release boot and can't fail gracefully inside the supervision tree.
 
 ## Core concepts
 
@@ -85,7 +88,31 @@ the JSON inside `load/2` where the release environment is live.
 
 ---
 
+## Design decisions
+
+**Option A — shell wrappers that mutate env before boot**
+- Pros: simpler upfront, fewer moving parts.
+- Cons: hides the trade-off that this exercise exists to teach.
+
+**Option B — a `Config.Provider` (chosen)**
+- Pros: explicit about the semantic that matters in production.
+- Cons: one more concept to internalize.
+
+→ Chose **B** because providers run inside the release boot sequence with proper ordering and error surfacing.
+
+
 ## Implementation
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defp deps do
+  [
+    # stdlib-only by default; add `{:benchee, "~> 1.3", only: :dev}` if you benchmark
+  ]
+end
+```
+
 
 ### Step 1: Create the project and add Jason
 
@@ -274,6 +301,15 @@ APP_CONFIG_JSON=$PWD/priv/sample_config.json \
 
 ---
 
+### Why this works
+
+The design leans on OTP primitives that already encode the invariants we care about (supervision, back-pressure, explicit message semantics), so failure modes are visible at the right layer instead of being reinvented ad-hoc. Tests exercise the edges (timeouts, crashes, boundary states), which is where hand-rolled alternatives silently drift over time.
+
+
+## Benchmark
+
+<!-- benchmark N/A: tema conceptual -->
+
 ## Trade-offs and production gotchas
 
 **1. Atoms from JSON are dangerous**
@@ -301,6 +337,11 @@ there's `toml` provider packages on Hex. Roll your own only when no
 existing solution fits.
 
 ---
+
+
+## Reflection
+
+- Diseñá un `Config.Provider` que lea de Vault. ¿Qué pasa si Vault no responde al boot?
 
 ## Resources
 

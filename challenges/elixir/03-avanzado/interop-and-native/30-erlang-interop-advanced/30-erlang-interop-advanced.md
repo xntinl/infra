@@ -1,497 +1,395 @@
-# Erlang Interop — Advanced Data Structures
+# Erlang Interop — Calling OTP Libraries from Elixir
 
-**Project**: `api_gateway` — a standalone HTTP gateway exercise
+**Project**: `erlang_interop` — an internal toolbox that wraps battle-tested Erlang/OTP libraries (`:crypto`, `:inet_res`, `:queue`, `:digraph`) behind idiomatic Elixir APIs.
+
+**Difficulty**: ★★★★☆
+
+**Estimated time**: 3–6 hours
 
 ---
 
 ## Project context
 
-You are building `api_gateway`, an HTTP gateway that routes traffic to microservices. The gateway
-needs two subsystems that cannot be built efficiently using Elixir's standard library alone:
-a job dispatch queue and a request-priority scheduler. Both require data structures with
-semantics that `List` and `Map` do not provide. Additionally, a legacy Erlang auth service
-returns user records as Erlang tuples and proplists that must be normalized to Elixir maps.
+Elixir sits on top of the Erlang VM and every Erlang module is directly callable from Elixir. In production codebases, a large fraction of real performance-sensitive work is delegated to OTP libraries: `:crypto` for MACs and AES-GCM, `:queue` for O(1) FIFO, `:digraph` for dependency graphs, `:ets`/`:dets` for caches, `:ssl` for TLS, `:inet_res` for DNS. Idiomatic Elixir wrappers may not exist for what you need, or may lag upstream Erlang.
 
-Project structure:
+Knowing how Erlang interop really works — atom casing, records, keyword-vs-proplist arguments, iolists, binary vs charlist, `:error`-tuple conventions — separates a developer who "uses Elixir" from one who understands the BEAM ecosystem. Phoenix, Plug, Ecto, and Broadway all rely on Erlang modules under the hood.
+
+In this exercise you'll build `erlang_interop`, a cohesive wrapper layer exposing Erlang functionality as Elixir modules with proper typespecs, idiomatic error tuples, and tests that pin behavior you might otherwise take on faith.
 
 ```
-api_gateway/
+erlang_interop/
 ├── lib/
-│   └── api_gateway/
-│       ├── application.ex
-│       ├── router.ex
-│       └── middleware/
-│           ├── job_queue.ex            # ← FIFO queue backed by :queue
-│           ├── priority_scheduler.ex   # ← priority queue backed by :gb_trees
-│           └── erlang_adapter.ex       # ← Erlang data normalization
+│   └── erlang_interop/
+│       ├── crypto.ex         # :crypto wrapper — AES-GCM, HMAC
+│       ├── fifo.ex           # :queue wrapper — O(1) FIFO
+│       ├── dns.ex            # :inet_res wrapper — DNS lookups
+│       ├── graph.ex          # :digraph wrapper — dependency graphs
+│       └── records.ex        # Record.defrecord examples
 ├── test/
-│   └── api_gateway/
-│       └── middleware/
-│           ├── job_queue_test.exs
-│           ├── priority_scheduler_test.exs
-│           └── erlang_adapter_test.exs
+│   └── erlang_interop_test.exs
 └── mix.exs
 ```
 
 ---
 
-## The business problem
+## Core concepts
 
-Two problems exposed in production:
+### 1. Atoms and module names
 
-1. **Job dispatch**: the router dispatches async jobs via a GenServer. The current
-   implementation appends to a list (`state ++ [job]`), which is O(n). Under burst
-   traffic of 2,000 jobs/s, the GenServer's state modification alone costs ~4ms per
-   enqueue. You need O(1) amortized enqueue and dequeue.
+An Elixir module `Foo.Bar` compiles to the Erlang atom `Elixir.Foo.Bar`. Erlang modules are lowercase atoms (`:crypto`, `:inet`, `:ets`). To call an Erlang function:
 
-2. **Priority scheduling**: the rate limiter has three tiers of clients (`:premium`,
-   `:standard`, `:free`). When the system is under pressure, premium requests must be
-   served first. You need an ordered collection where `pop_min` is efficient.
-
-3. **Legacy Erlang library**: the auth service returns user records as Erlang tuples and
-   proplists. The gateway must normalize these into idiomatic Elixir maps before passing
-   them downstream.
-
----
-
-## Why Erlang modules and not Elixir equivalents
-
-Elixir's standard library covers most daily work. These cases are the exceptions:
-
-| Need | Use | Why not Elixir |
-|------|-----|----------------|
-| O(1) FIFO queue | `:queue` | `List` enqueue is O(n); no queue in Elixir stdlib |
-| Ordered key-value | `:gb_trees` | `Map` has no ordering guarantee |
-| Sorted set with membership | `:gb_sets` | `MapSet` has no ordering |
-| Erlang legacy record interop | `:proplists` | No Elixir equivalent for Erlang proplists |
-
-All Erlang standard modules are available as atoms prefixed with `:`. There is no import
-step — they are loaded as part of OTP.
-
----
-
-## `:queue` — how the two-stack trick works
-
-`:queue` stores a FIFO queue as two lists: `in` (reversed) and `out`. Enqueue appends to
-`in` in O(1). Dequeue takes from `out` in O(1). When `out` is empty, reverse `in` into
-`out` — O(n) but amortized O(1) over N operations.
-
-```
-enqueue :a, :b, :c  →  in = [:c, :b, :a],  out = []
-dequeue              →  reverse in → out = [:a, :b, :c], return :a
-dequeue              →  out = [:b, :c],     return :b   (O(1))
+```elixir
+:crypto.hash(:sha256, "payload")   # Erlang: crypto:hash(sha256, <<"payload">>)
 ```
 
-## `:gb_trees` — ordered key-value
+Rule: if the Erlang module/function starts with a lowercase letter, prefix `:`. Atoms in Erlang are unquoted lowercase identifiers; in Elixir they are prefixed with `:`.
 
-A balanced binary tree that maintains sorted order by key at all times. Unlike `Map`
-(hash-based, no order), `:gb_trees` keeps keys sorted so `smallest/1`, `largest/1`, and
-`to_list/1` are always O(log n) or O(n) and always in order.
+### 2. Strings: binary vs charlist
 
-Cost: O(log n) for insert and delete vs O(1) amortized for `Map`.
+Erlang's default string is a **charlist** (`[104, 101, 108, 108, 111]`). Elixir's default is a **binary** (`"hello"`). Some Erlang APIs are strict:
+
+| Function | Expects | Note |
+|---|---|---|
+| `:file.read_file/1` | binary or charlist | both |
+| `:inet.parse_address/1` | **charlist** | predates unicode binaries |
+| `:crypto.hash/2` | binary | modern API |
+| `:io_lib.format/2` | returns iolist | flatten with `IO.iodata_to_binary/1` |
+
+A common source of `:badarg` errors is passing a binary where a charlist is required.
+
+### 3. Records — compile-time tagged tuples
+
+Erlang records are syntactic sugar for tagged tuples. `-record(user, {id, name})` becomes `{user, Id, Name}`. In Elixir, `Record.defrecord/2` generates macros:
+
+```elixir
+require Record
+Record.defrecord(:user, id: nil, name: nil)
+
+user()              # => {:user, nil, nil}
+user(id: 1, name: "a")  # => {:user, 1, "a"}
+user(rec, :id)      # => elem(rec, 1)
+```
+
+Used when interoperating with Erlang libraries that expose record definitions in `.hrl` files (`:mnesia`, `:dialyzer`, `:diameter`).
+
+### 4. `atom_to_list` and the atom-table trap
+
+`:erlang.atom_to_list/1` returns a charlist. The inverse, `:erlang.list_to_atom/1`, is **dangerous** — atoms are never garbage-collected and the VM caps them at 1,048,576 by default. User-controlled input can exhaust the table and crash the node.
+
+```elixir
+# SAFE
+:erlang.list_to_existing_atom(~c"user_created")
+
+# DANGEROUS with untrusted input
+:erlang.list_to_atom(user_input)
+```
+
+### 5. Error return conventions
+
+Erlang functions typically return `{:ok, value}`, `{:error, reason}`, `:ok`, or a bare value. Wrappers often add a bang version that raises on error. Note the **inconsistencies** you have to normalize — `:crypto.crypto_one_time_aead` returns a bare `:error` atom on auth failure; `:queue.out` returns `{:empty, q}`, not `:empty`.
+
+### 6. Options: keyword list vs proplist
+
+Elixir idiom: `[timeout: 5000, retries: 3]`. Erlang "proplist" also accepts bare atoms (`[:ssl, {:timeout, 5000}]`). Check docs per call — mixing them can silently ignore options.
 
 ---
 
 ## Implementation
 
-### Step 1: `lib/api_gateway/middleware/job_queue.ex`
-
-The `JobQueue` wraps Erlang's `:queue` module in a GenServer. Each callback delegates to the
-corresponding `:queue` function. The state is a single `:queue.queue()` value — no wrapper
-struct needed because the GenServer itself provides the process boundary.
+### Step 1: `mix.exs`
 
 ```elixir
-defmodule ApiGateway.Middleware.JobQueue do
-  @moduledoc """
-  FIFO job queue backed by :queue.
+defmodule ErlangInterop.MixProject do
+  use Mix.Project
 
-  Replaces the previous list-based implementation that had O(n) enqueue.
-  All operations are O(1) amortized.
-  """
-  use GenServer
-
-  # ---------------------------------------------------------------------------
-  # Public API
-  # ---------------------------------------------------------------------------
-
-  def start_link(opts \\ []) do
-    GenServer.start_link(__MODULE__, :ok, opts)
+  def project do
+    [app: :erlang_interop, version: "0.1.0", elixir: "~> 1.15", deps: []]
   end
 
-  @spec enqueue(GenServer.server(), term()) :: :ok
-  def enqueue(pid, job), do: GenServer.call(pid, {:enqueue, job})
-
-  @spec dequeue(GenServer.server()) :: {:ok, term()} | {:error, :empty}
-  def dequeue(pid), do: GenServer.call(pid, :dequeue)
-
-  @spec peek(GenServer.server()) :: {:ok, term()} | {:error, :empty}
-  def peek(pid), do: GenServer.call(pid, :peek)
-
-  @spec size(GenServer.server()) :: non_neg_integer()
-  def size(pid), do: GenServer.call(pid, :size)
-
-  @spec drain(GenServer.server()) :: [term()]
-  def drain(pid), do: GenServer.call(pid, :drain)
-
-  # ---------------------------------------------------------------------------
-  # GenServer callbacks
-  # ---------------------------------------------------------------------------
-
-  @impl true
-  def init(:ok) do
-    {:ok, :queue.new()}
-  end
-
-  @impl true
-  def handle_call({:enqueue, job}, _from, queue) do
-    {:reply, :ok, :queue.in(job, queue)}
-  end
-
-  @impl true
-  def handle_call(:dequeue, _from, queue) do
-    case :queue.out(queue) do
-      {{:value, item}, new_queue} ->
-        {:reply, {:ok, item}, new_queue}
-
-      {:empty, ^queue} ->
-        {:reply, {:error, :empty}, queue}
-    end
-  end
-
-  @impl true
-  def handle_call(:peek, _from, queue) do
-    case :queue.peek(queue) do
-      {:value, item} -> {:reply, {:ok, item}, queue}
-      :empty -> {:reply, {:error, :empty}, queue}
-    end
-  end
-
-  @impl true
-  def handle_call(:size, _from, queue) do
-    {:reply, :queue.len(queue), queue}
-  end
-
-  @impl true
-  def handle_call(:drain, _from, queue) do
-    {:reply, :queue.to_list(queue), :queue.new()}
-  end
+  def application, do: [extra_applications: [:logger, :crypto, :ssl, :inets]]
 end
 ```
 
-### Step 2: `lib/api_gateway/middleware/priority_scheduler.ex`
-
-The priority scheduler uses `:gb_trees` as its backing store. Keys are `{priority, sequence_number}`
-tuples. Because `:gb_trees` sorts by key, and tuples compare element-by-element, items with
-lower priority numbers are served first. The sequence number breaks ties within the same
-priority level, preserving insertion order (FIFO within priority).
+### Step 2: `lib/erlang_interop/crypto.ex`
 
 ```elixir
-defmodule ApiGateway.Middleware.PriorityScheduler do
+defmodule ErlangInterop.Crypto do
   @moduledoc """
-  Priority queue for request scheduling.
-
-  Uses :gb_trees as the backing store. Keys are {priority, sequence_number}
-  tuples to allow multiple items with the same numeric priority while
-  preserving insertion order within the same priority level.
-
-  Lower priority number = higher urgency (1 is served before 3).
+  Idiomatic wrapper over `:crypto`. AES-GCM and HMAC with consistent
+  `{:ok, _} | {:error, _}` contracts.
   """
 
-  @type priority :: pos_integer()
-  @type t :: {:gb_trees.tree(), non_neg_integer()}
+  @type key :: <<_::128>> | <<_::256>>
+  @type iv :: <<_::96>>
+
+  @spec hmac_sha256(binary(), binary()) :: binary()
+  def hmac_sha256(key, data) when is_binary(key) and is_binary(data) do
+    :crypto.mac(:hmac, :sha256, key, data)
+  end
+
+  @spec encrypt_aes_gcm(key(), iv(), binary(), binary()) ::
+          {:ok, {binary(), <<_::128>>}} | {:error, term()}
+  def encrypt_aes_gcm(key, iv, plaintext, aad \\ <<>>)
+      when byte_size(iv) == 12 and byte_size(key) in [16, 32] do
+    {ct, tag} =
+      :crypto.crypto_one_time_aead(:aes_256_gcm, key, iv, plaintext, aad, true)
+
+    {:ok, {ct, tag}}
+  rescue
+    e -> {:error, e}
+  end
+
+  @spec decrypt_aes_gcm(key(), iv(), binary(), <<_::128>>, binary()) ::
+          {:ok, binary()} | {:error, :auth_failed | term()}
+  def decrypt_aes_gcm(key, iv, ct, tag, aad \\ <<>>)
+      when byte_size(iv) == 12 and byte_size(tag) == 16 do
+    case :crypto.crypto_one_time_aead(:aes_256_gcm, key, iv, ct, aad, tag, false) do
+      :error -> {:error, :auth_failed}
+      pt when is_binary(pt) -> {:ok, pt}
+    end
+  rescue
+    e -> {:error, e}
+  end
+
+  @spec random_iv() :: iv()
+  def random_iv, do: :crypto.strong_rand_bytes(12)
+
+  @spec random_key(128 | 256) :: key()
+  def random_key(256), do: :crypto.strong_rand_bytes(32)
+  def random_key(128), do: :crypto.strong_rand_bytes(16)
+end
+```
+
+### Step 3: `lib/erlang_interop/fifo.ex`
+
+```elixir
+defmodule ErlangInterop.Fifo do
+  @moduledoc "O(1) FIFO backed by Erlang's `:queue` (Okasaki's banker's queue)."
+
+  @opaque t(a) :: {list(a), list(a)}
+
+  @spec new() :: t(any())
+  def new, do: :queue.new()
+
+  @spec push(t(a), a) :: t(a) when a: var
+  def push(q, item), do: :queue.in(item, q)
+
+  @spec pop(t(a)) :: {:ok, a, t(a)} | :empty when a: var
+  def pop(q) do
+    case :queue.out(q) do
+      {{:value, item}, rest} -> {:ok, item, rest}
+      {:empty, _} -> :empty
+    end
+  end
+
+  @spec size(t(any())) :: non_neg_integer()
+  def size(q), do: :queue.len(q)
+
+  @spec to_list(t(a)) :: [a] when a: var
+  def to_list(q), do: :queue.to_list(q)
+end
+```
+
+### Step 4: `lib/erlang_interop/dns.ex`
+
+```elixir
+defmodule ErlangInterop.Dns do
+  @moduledoc "DNS lookups via `:inet_res`. Takes **charlists**, not binaries."
+
+  @spec resolve(String.t(), :a | :aaaa | :txt | :mx | :srv, timeout()) ::
+          {:ok, [term()]} | {:error, term()}
+  def resolve(hostname, type \\ :a, timeout \\ 5_000) when is_binary(hostname) do
+    host = String.to_charlist(hostname)
+
+    case :inet_res.resolve(host, :in, type, [timeout: timeout]) do
+      {:ok, {:dns_rec, _, _, answers, _, _}} ->
+        {:ok, Enum.map(answers, &extract_rdata/1)}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp extract_rdata({:dns_rr, _name, _type, _class, _cnt, _ttl, data, _, _, _}), do: data
+end
+```
+
+### Step 5: `lib/erlang_interop/graph.ex`
+
+```elixir
+defmodule ErlangInterop.Graph do
+  @moduledoc """
+  Directed acyclic graph via `:digraph` — a process-backed mutable structure.
+  Callers MUST call `delete/1` to free the underlying ETS tables.
+  """
+
+  @opaque t :: :digraph.graph()
 
   @spec new() :: t()
-  def new do
-    {:gb_trees.empty(), 0}
-  end
+  def new, do: :digraph.new([:acyclic])
 
-  @spec insert(t(), priority(), term()) :: t()
-  def insert({tree, seq}, priority, value) do
-    new_tree = :gb_trees.insert({priority, seq}, value, tree)
-    {new_tree, seq + 1}
-  end
+  @spec delete(t()) :: true
+  def delete(g), do: :digraph.delete(g)
 
-  @spec peek_min(t()) :: {:ok, {priority(), term()}} | {:error, :empty}
-  def peek_min({tree, _seq}) do
-    if :gb_trees.is_empty(tree) do
-      {:error, :empty}
-    else
-      {{priority, _seq_num}, value} = :gb_trees.smallest(tree)
-      {:ok, {priority, value}}
+  @spec add_dependency(t(), term(), term()) :: :ok | {:error, :cycle}
+  def add_dependency(g, from, to) do
+    :digraph.add_vertex(g, from)
+    :digraph.add_vertex(g, to)
+
+    case :digraph.add_edge(g, from, to) do
+      {:error, {:bad_edge, _}} -> {:error, :cycle}
+      _edge -> :ok
     end
   end
 
-  @spec pop_min(t()) :: {{:ok, {priority(), term()}}, t()} | {{:error, :empty}, t()}
-  def pop_min({tree, seq}) do
-    if :gb_trees.is_empty(tree) do
-      {{:error, :empty}, {tree, seq}}
-    else
-      {{priority, _seq_num}, value, new_tree} = :gb_trees.take_smallest(tree)
-      {{:ok, {priority, value}}, {new_tree, seq}}
+  @spec topological_sort(t()) :: [term()] | :cycle_detected
+  def topological_sort(g) do
+    case :digraph_utils.topsort(g) do
+      false -> :cycle_detected
+      sorted -> sorted
     end
-  end
-
-  @spec size(t()) :: non_neg_integer()
-  def size({tree, _seq}) do
-    :gb_trees.size(tree)
-  end
-
-  @spec to_sorted_list(t()) :: [{priority(), term()}]
-  def to_sorted_list({tree, _seq}) do
-    tree
-    |> :gb_trees.to_list()
-    |> Enum.map(fn {{priority, _seq_num}, value} -> {priority, value} end)
   end
 end
 ```
 
-### Step 3: `lib/api_gateway/middleware/erlang_adapter.ex`
-
-The adapter converts legacy Erlang data structures to idiomatic Elixir. The key challenge is
-charlist detection: Erlang strings are lists of integers, which look identical to regular lists
-at the type level. `:io_lib.deep_char_list/1` inspects the list contents to determine whether
-it represents a printable string.
+### Step 6: `lib/erlang_interop/records.ex`
 
 ```elixir
-defmodule ApiGateway.Middleware.ErlangAdapter do
-  @moduledoc """
-  Normalizes data returned by the legacy Erlang auth service.
+defmodule ErlangInterop.Records do
+  @moduledoc "Example usage of `Record.defrecord/2` for Erlang record shapes."
 
-  The auth service returns:
-  - User records as Erlang tuples: {:user, charlist_name, integer_age, charlist_role}
-  - Session data as Erlang proplists: [{:key, value}, ...]
-  - Nested charlists throughout
+  require Record
+  Record.defrecord(:user, id: nil, name: nil, email: nil)
 
-  This module converts all of the above to idiomatic Elixir.
-  """
+  @type user :: record(:user, id: integer(), name: String.t(), email: String.t())
 
-  @type record :: tuple()
-  @type proplist :: [{atom(), term()}]
+  @spec new_user(integer(), String.t(), String.t()) :: user()
+  def new_user(id, name, email), do: user(id: id, name: name, email: email)
 
-  @doc """
-  Converts an Erlang record tuple to a map, given the field names (excluding
-  the record name at position 0).
+  @spec user_id(user()) :: integer()
+  def user_id(u) when Record.is_record(u, :user), do: user(u, :id)
 
-  Example:
-    record_to_map({:user, 'Alice', 30, 'admin'}, [:name, :age, :role])
-    #=> %{name: "Alice", age: 30, role: "admin"}
-  """
-  @spec record_to_map(record(), [atom()]) :: map()
-  def record_to_map(record, fields) when is_tuple(record) do
-    values =
-      record
-      |> Tuple.to_list()
-      |> tl()
+  @spec is_user(term()) :: boolean()
+  def is_user(term), do: Record.is_record(term, :user)
+end
+```
 
-    fields
-    |> Enum.zip(values)
-    |> Map.new(fn {field, value} -> {field, deep_charlist_to_string(value)} end)
-  end
+### Step 7: `test/erlang_interop_test.exs`
 
-  @doc """
-  Converts an Erlang proplist to an Elixir map.
+```elixir
+defmodule ErlangInteropTest do
+  use ExUnit.Case, async: true
 
-  Example:
-    proplist_to_map([{:name, 'Bob'}, {:age, 25}])
-    #=> %{name: "Bob", age: 25}
-  """
-  @spec proplist_to_map(proplist()) :: map()
-  def proplist_to_map(proplist) do
-    keys = :proplists.get_keys(proplist)
+  alias ErlangInterop.{Crypto, Fifo, Graph, Records}
 
-    Map.new(keys, fn key ->
-      value = :proplists.get_value(key, proplist)
-      {key, deep_charlist_to_string(value)}
-    end)
-  end
+  describe "Crypto" do
+    test "HMAC-SHA256 is deterministic and 32 bytes" do
+      mac = Crypto.hmac_sha256("secret", "payload")
+      assert byte_size(mac) == 32
+      assert mac == Crypto.hmac_sha256("secret", "payload")
+    end
 
-  @doc """
-  Recursively converts charlists to strings anywhere in a nested structure.
+    test "AES-GCM roundtrip" do
+      key = Crypto.random_key(256)
+      iv = Crypto.random_iv()
+      {:ok, {ct, tag}} = Crypto.encrypt_aes_gcm(key, iv, "top secret", "aad")
+      assert {:ok, "top secret"} = Crypto.decrypt_aes_gcm(key, iv, ct, tag, "aad")
+    end
 
-  Handles: lists (charlist or regular), tuples, maps, and scalar values.
-  """
-  @spec deep_charlist_to_string(term()) :: term()
-  def deep_charlist_to_string(value) when is_list(value) do
-    if :io_lib.deep_char_list(value) do
-      List.to_string(value)
-    else
-      Enum.map(value, &deep_charlist_to_string/1)
+    test "AES-GCM detects tampering" do
+      key = Crypto.random_key(256)
+      iv = Crypto.random_iv()
+      {:ok, {ct, tag}} = Crypto.encrypt_aes_gcm(key, iv, "hi", "")
+      tampered = <<0>> <> binary_part(ct, 1, byte_size(ct) - 1)
+      assert {:error, :auth_failed} = Crypto.decrypt_aes_gcm(key, iv, tampered, tag, "")
     end
   end
 
-  def deep_charlist_to_string(value) when is_tuple(value) do
-    value
-    |> Tuple.to_list()
-    |> Enum.map(&deep_charlist_to_string/1)
-    |> List.to_tuple()
+  describe "Fifo" do
+    test "push/pop is FIFO" do
+      q = Fifo.new() |> Fifo.push(:a) |> Fifo.push(:b) |> Fifo.push(:c)
+      assert {:ok, :a, q} = Fifo.pop(q)
+      assert {:ok, :b, q} = Fifo.pop(q)
+      assert Fifo.size(q) == 1
+    end
+
+    test "pop on empty" do
+      assert :empty = Fifo.pop(Fifo.new())
+    end
   end
 
-  def deep_charlist_to_string(value), do: value
-end
-```
+  describe "Graph" do
+    test "topological sort on acyclic graph" do
+      g = Graph.new()
+      :ok = Graph.add_dependency(g, :compile, :test)
+      :ok = Graph.add_dependency(g, :test, :release)
+      assert [:compile, :test, :release] = Graph.topological_sort(g)
+      Graph.delete(g)
+    end
 
-### Step 4: Given tests — must pass without modification
-
-```elixir
-# test/api_gateway/middleware/job_queue_test.exs
-defmodule ApiGateway.Middleware.JobQueueTest do
-  use ExUnit.Case, async: true
-
-  alias ApiGateway.Middleware.JobQueue
-
-  setup do
-    {:ok, pid} = JobQueue.start_link()
-    {:ok, queue: pid}
+    test "cycle rejected" do
+      g = Graph.new()
+      :ok = Graph.add_dependency(g, :a, :b)
+      assert {:error, :cycle} = Graph.add_dependency(g, :b, :a)
+      Graph.delete(g)
+    end
   end
 
-  test "enqueue and dequeue preserve FIFO order", %{queue: q} do
-    JobQueue.enqueue(q, :a)
-    JobQueue.enqueue(q, :b)
-    JobQueue.enqueue(q, :c)
-
-    assert {:ok, :a} = JobQueue.dequeue(q)
-    assert {:ok, :b} = JobQueue.dequeue(q)
-    assert {:ok, :c} = JobQueue.dequeue(q)
-    assert {:error, :empty} = JobQueue.dequeue(q)
-  end
-
-  test "peek does not remove the element", %{queue: q} do
-    JobQueue.enqueue(q, :first)
-    assert {:ok, :first} = JobQueue.peek(q)
-    assert {:ok, :first} = JobQueue.peek(q)
-    assert JobQueue.size(q) == 1
-  end
-
-  test "drain returns all elements and empties the queue", %{queue: q} do
-    for i <- 1..5, do: JobQueue.enqueue(q, i)
-    assert [1, 2, 3, 4, 5] = JobQueue.drain(q)
-    assert JobQueue.size(q) == 0
-  end
-
-  test "dequeue from empty queue returns error", %{queue: q} do
-    assert {:error, :empty} = JobQueue.dequeue(q)
-    assert {:error, :empty} = JobQueue.peek(q)
+  describe "Records" do
+    test "record access via macro" do
+      u = Records.new_user(1, "Ada", "ada@example.com")
+      assert Records.user_id(u) == 1
+      assert Records.is_user(u)
+      assert elem(u, 0) == :user
+    end
   end
 end
-
-# test/api_gateway/middleware/priority_scheduler_test.exs
-defmodule ApiGateway.Middleware.PrioritySchedulerTest do
-  use ExUnit.Case, async: true
-
-  alias ApiGateway.Middleware.PriorityScheduler
-
-  test "pop_min always returns the lowest priority number" do
-    pq =
-      PriorityScheduler.new()
-      |> PriorityScheduler.insert(3, :low)
-      |> PriorityScheduler.insert(1, :urgent)
-      |> PriorityScheduler.insert(2, :normal)
-
-    {{:ok, {1, :urgent}}, pq} = PriorityScheduler.pop_min(pq)
-    {{:ok, {2, :normal}}, pq} = PriorityScheduler.pop_min(pq)
-    {{:ok, {3, :low}}, _pq} = PriorityScheduler.pop_min(pq)
-  end
-
-  test "insertion order preserved for equal priorities" do
-    pq =
-      PriorityScheduler.new()
-      |> PriorityScheduler.insert(1, :first)
-      |> PriorityScheduler.insert(1, :second)
-      |> PriorityScheduler.insert(1, :third)
-
-    {{:ok, {1, :first}}, pq} = PriorityScheduler.pop_min(pq)
-    {{:ok, {1, :second}}, pq} = PriorityScheduler.pop_min(pq)
-    {{:ok, {1, :third}}, _pq} = PriorityScheduler.pop_min(pq)
-  end
-
-  test "to_sorted_list returns elements in ascending priority" do
-    pq =
-      PriorityScheduler.new()
-      |> PriorityScheduler.insert(2, :b)
-      |> PriorityScheduler.insert(1, :a)
-      |> PriorityScheduler.insert(3, :c)
-
-    assert [{1, :a}, {2, :b}, {3, :c}] = PriorityScheduler.to_sorted_list(pq)
-  end
-end
-
-# test/api_gateway/middleware/erlang_adapter_test.exs
-defmodule ApiGateway.Middleware.ErlangAdapterTest do
-  use ExUnit.Case, async: true
-
-  alias ApiGateway.Middleware.ErlangAdapter
-
-  test "record_to_map converts tuple record to map" do
-    record = {:user, 'Alice', 30, 'admin'}
-    result = ErlangAdapter.record_to_map(record, [:name, :age, :role])
-    assert %{name: "Alice", age: 30, role: "admin"} = result
-  end
-
-  test "proplist_to_map converts Erlang proplist to Elixir map" do
-    proplist = [{:name, 'Bob'}, {:age, 25}, {:active, true}]
-    result = ErlangAdapter.proplist_to_map(proplist)
-    assert %{name: "Bob", age: 25, active: true} = result
-  end
-
-  test "deep_charlist_to_string converts nested charlists" do
-    assert ErlangAdapter.deep_charlist_to_string('hello') == "hello"
-    assert ErlangAdapter.deep_charlist_to_string(['a', 'b']) == ["a", "b"]
-    assert ErlangAdapter.deep_charlist_to_string({:user, 'Alice'}) == {:user, "Alice"}
-    assert ErlangAdapter.deep_charlist_to_string(42) == 42
-  end
-end
-```
-
-### Step 5: Run the tests
-
-```bash
-mix test test/api_gateway/middleware/ --trace
 ```
 
 ---
 
-## Trade-off analysis
+## Trade-offs and production gotchas
 
-| Aspect | `:queue` | List as queue | `:gb_trees` | `Map` |
-|--------|----------|---------------|-------------|-------|
-| Enqueue (back) | O(1) amortized | O(n) | O(log n) | O(1) amortized |
-| Dequeue (front) | O(1) amortized | O(1) | O(log n) | N/A |
-| Ordered iteration | O(n) FIFO | O(n) | O(n) sorted | Not guaranteed |
-| Memory overhead | 2 lists | 1 list | Tree nodes | Hash buckets |
-| Best for | FIFO dispatch queues | LIFO (stack) | Priority queues, ordered scans | Unordered lookup |
+**1. Atom table exhaustion.** Never call `String.to_atom/1` or `:erlang.list_to_atom/1` on untrusted input. Atoms are permanent and capped. Use the `_to_existing_atom` variants.
 
-Reflection: the router accumulates deferred jobs during a rate-limit burst. Should you use
-`:queue` or a list here? Consider the ratio of enqueue to dequeue operations in that scenario.
+**2. Charlist vs binary confusion.** `:inet_res`, `:inet`, `:gen_tcp` options differ in what they accept. Normalize at the wrapper boundary — don't leak the confusion to callers.
+
+**3. Records are macros, not structs.** `Record.is_record/2` is guard-safe; `user(u, :id)` expands to `elem(u, 1)` at compile time. No key-based access. For new Elixir code prefer structs.
+
+**4. `:digraph` owns ETS tables.** Not GC'd. Forgetting `:digraph.delete/1` leaks 3 ETS tables per graph. In long-lived processes wrap with `try/after`.
+
+**5. Error shape inconsistency.** Bare `:error` vs `{:error, reason}` vs `{:empty, q}` varies per function. Your wrapper must normalize or callers will branch inconsistently.
+
+**6. Iolists leak everywhere.** `:io_lib.format/2`, `:ssl` and `:gen_tcp` often return iolists. `String.length/1` on an iolist raises. Flatten with `IO.iodata_to_binary/1` before exposing.
+
+**7. Dialyzer strictness.** Erlang specs use wide union types. Narrow them in your `@spec`s at the wrapper boundary if you want Dialyzer to catch misuse.
+
+**8. When NOT to use this.** If an idiomatic Elixir wrapper exists (`Argon2`, `libgraph`, `:telemetry`) and is maintained, prefer it — better docs, typespecs, and community feedback. Wrap Erlang directly only when no Elixir equivalent exists or the wrapper adds measurable overhead.
 
 ---
 
-## Common production mistakes
+## Performance notes
 
-**1. List append as queue (`state ++ [job]`)**
-This is the most common performance regression when prototyping GenServers. It copies the
-entire list on each append. Replace with `:queue` the moment queuing semantics appear.
+`:queue` is a persistent (immutable) banker's queue with amortized O(1) `in/2` and `out/1`. Never substitute `list ++ [x]` for FIFO — that's O(n).
 
-**2. `:gb_trees.insert/3` on duplicate keys**
-`:gb_trees.insert/3` raises `{:key_exists, key}` if the key already exists. Use
-`:gb_trees.enter/3` to upsert, or model keys as `{priority, sequence_number}` for uniqueness.
+```elixir
+Benchee.run(%{
+  "queue.in/2"   => fn q -> :queue.in(:x, q) end,
+  "list ++ [x]"  => fn l -> l ++ [:x] end
+}, inputs: %{"1k" => {Enum.to_list(1..1000) |> Enum.reduce(:queue.new(), &:queue.in/2),
+                     Enum.to_list(1..1000)}})
+```
 
-**3. Trusting charlists from Erlang libraries without converting**
-Passing a charlist to `String.length/1` raises `ArgumentError`. Always convert at the
-boundary — in the adapter module, before the data enters application code.
-
-**4. `:io_lib.deep_char_list/1` returns `:true`/`:false`, not `true`/`false`**
-In older OTP versions, this function returns Erlang atoms. Pattern match on both or use
-`== true` in a guard to be safe.
-
-**5. Using `:proplists.get_value/3` without a default**
-If the key is missing, `:proplists.get_value/2` returns `undefined` (the atom). Provide
-an explicit default or guard against it at the boundary.
+On a 1,000-element FIFO, `list ++ [x]` is roughly 200× slower.
 
 ---
 
 ## Resources
 
-- [`:queue` — Erlang docs](https://www.erlang.org/doc/man/queue.html)
-- [`:gb_trees` — Erlang docs](https://www.erlang.org/doc/man/gb_trees.html)
-- [`:proplists` — Erlang docs](https://www.erlang.org/doc/man/proplists.html)
-- [Erlang in Anger — Fred Hebert](https://www.erlang-in-anger.com/) — chapter on data structures (free PDF)
+- https://hexdocs.pm/elixir/Record.html — Record module reference
+- https://www.erlang.org/doc/man/crypto.html — `:crypto` reference
+- https://www.erlang.org/doc/man/queue.html — banker's queue internals
+- https://www.erlang.org/doc/man/digraph.html — `:digraph`
+- https://learnyousomeerlang.com/a-short-visit-to-common-data-structures — queue, digraph, gb_trees
+- https://dashbit.co/blog/writing-assertive-code-with-elixir — defensive patterns at interop boundaries
+- https://www.erlang.org/doc/apps/erts/absform.html — atom table limits

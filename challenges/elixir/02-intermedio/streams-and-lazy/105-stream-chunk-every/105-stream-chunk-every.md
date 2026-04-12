@@ -3,9 +3,6 @@
 **Project**: `chunk_batch` — batch a stream of events with explicit control
 over chunk size, step (stride), and leftover handling.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
-
 ---
 
 ## Project context
@@ -82,6 +79,20 @@ Stream.chunk_every([1, 2, 3, 4, 5], 3, 3, [0, 0])
 
 Padding is useful when downstream requires uniform shape (FFT, matrix ops,
 fixed-schema writes).
+
+---
+
+## Design decisions
+
+**Option A — Manual `Enum.reduce` with accumulator + flush**
+- Pros: explicit control over batching logic; easy to add side effects per batch.
+- Cons: verbose; must reimplement for sliding windows, strided sampling, padding.
+
+**Option B — `Stream.chunk_every/4` with tuned `step` and `leftover`** (chosen)
+- Pros: four-argument primitive covers non-overlapping, sliding, strided, and padded cases; lazy; one line per pattern.
+- Cons: no time-based flush; `:discard` silently drops tail — easy bug.
+
+→ Chose **B** because the exercise is a tour of the four arguments, and in practice 90 % of batching needs are expressible without rolling your own reducer.
 
 ---
 
@@ -217,7 +228,13 @@ end
 mix test
 ```
 
+### Why this works
+
+`Stream.chunk_every/4` advances a cursor by `step` each emission and accumulates the next `count` elements as a chunk. Sliding windows fall out of `step: 1`, strided sampling out of `step > count`, and n-grams are just named sliding windows. Laziness holds because each chunk is produced on demand from the underlying source — taking the first N chunks reads only `(N-1) * step + count` elements from the source.
+
 ---
+
+<!-- benchmark N/A: chunk_every is O(n) with small constant; perf dominated by downstream work -->
 
 ## Trade-offs and production gotchas
 
@@ -253,9 +270,16 @@ smaller representation before windowing.
 **6. When NOT to use `chunk_every`**
 - For streaming aggregation (running sum, exp moving average),
   `Stream.transform/3` with a scalar accumulator is O(1) memory per step,
-  not O(window). See exercise 106.
+  not O(window) — use `Stream.transform/3` with a scalar accumulator.
 - For time-windowed batching, use GenStage / Broadway with explicit
-  buffer options — see exercise 108.
+  buffer options.
+
+---
+
+## Reflection
+
+- A log shipper must flush every 500 events OR every 2 seconds, whichever fires first. Why can't `chunk_every/4` do this, and what primitive would you reach for?
+- For a 1-hour moving average over a 1 Hz sensor, would you use `sliding/2` with size 3600, or a running-sum trick? Quantify the memory/CPU trade.
 
 ---
 

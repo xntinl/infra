@@ -2,9 +2,6 @@
 
 **Project**: `counter_reset_gs` — a minimal GenServer counter that exposes `increment`, `decrement`, `get`, and `reset`, chosen deliberately to illustrate when to use `handle_call` vs `handle_cast`.
 
-**Difficulty**: ★★☆☆☆
-**Estimated time**: 1–2 hours
-
 ---
 
 ## Project context
@@ -39,6 +36,12 @@ counter_reset_gs/
 ```
 
 ---
+
+
+## Why X and not Y
+
+- **Why not a pure Agent?** Agent hides the `call` vs `cast` distinction — this exercise is exactly about that boundary.
+- **Why not `:counters`?** `:counters` is faster but has no custom logic, timeouts, or supervision hooks.
 
 ## Core concepts
 
@@ -85,7 +88,31 @@ value for logs/metrics, and under load you want back-pressure.
 
 ---
 
+## Design decisions
+
+**Option A — single `call` for every op including reset**
+- Pros: simpler upfront, fewer moving parts.
+- Cons: hides the trade-off that this exercise exists to teach.
+
+**Option B — `call` for read/write, `cast` for reset (chosen)**
+- Pros: explicit about the semantic that matters in production.
+- Cons: one more concept to internalize.
+
+→ Chose **B** because reset has no meaningful reply and is rare; mixing semantics teaches the boundary.
+
+
 ## Implementation
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defp deps do
+  [
+    # stdlib-only by default; add `{:benchee, "~> 1.3", only: :dev}` if you benchmark
+  ]
+end
+```
+
 
 ### Step 1: Create the project
 
@@ -220,6 +247,23 @@ mix test
 
 ---
 
+### Why this works
+
+The design leans on OTP primitives that already encode the invariants we care about (supervision, back-pressure, explicit message semantics), so failure modes are visible at the right layer instead of being reinvented ad-hoc. Tests exercise the edges (timeouts, crashes, boundary states), which is where hand-rolled alternatives silently drift over time.
+
+
+## Benchmark
+
+```elixir
+{:ok, pid} = CounterResetGs.start_link(initial: 0)
+{us, _} = :timer.tc(fn ->
+  for _ <- 1..100_000, do: CounterResetGs.increment(pid)
+end)
+IO.puts("#{us / 100_000} µs per call")
+```
+
+Target esperado: <2 µs por `increment` en hardware moderno (GenServer call local).
+
 ## Trade-offs and production gotchas
 
 **1. Casts have no back-pressure — ever**
@@ -253,6 +297,11 @@ per-scheduler, and orders of magnitude faster than a GenServer. Reach for
 a GenServer when you need logic, not just a number.
 
 ---
+
+
+## Reflection
+
+- Si necesitaras exponer `reset` a usuarios no admins, ¿seguiría siendo `cast`? ¿Qué cambiás y por qué?
 
 ## Resources
 

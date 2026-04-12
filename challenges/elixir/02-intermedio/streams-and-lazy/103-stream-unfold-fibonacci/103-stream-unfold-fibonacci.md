@@ -3,9 +3,6 @@
 **Project**: `unfold_fib` — generate Fibonacci, Collatz, and other recurrences
 as lazy infinite streams using `Stream.unfold/2`.
 
-**Difficulty**: ★★☆☆☆
-**Estimated time**: 1–2 hours
-
 ---
 
 ## Project context
@@ -81,6 +78,20 @@ We emit `n` before halting, so the final sequence includes `1`.
 output. `Stream.unfold/2` decouples state from output, so the *emitted* value
 can differ from the next state. Use `iterate` when state == output; `unfold`
 when they diverge (Fibonacci: we track `{a, b}`, emit only `a`).
+
+---
+
+## Design decisions
+
+**Option A — Recursive function with explicit list accumulator**
+- Pros: simple to write; one function; no abstraction.
+- Cons: must bound up front; no laziness; stack-consuming unless tail-recursive; can't share infinite-sequence logic cleanly.
+
+**Option B — `Stream.unfold/2` returning a lazy stream** (chosen)
+- Pros: decouples "how to step" from "how many to take"; infinite streams are cheap; composes with other `Stream.*` and terminates only at the consumer.
+- Cons: per-element function call overhead; no cleanup hook — use `Stream.resource/3` if you need one.
+
+→ Chose **B** because the point is to internalize the unfold primitive and see that infinite sequences are just a recipe, not a materialized list.
 
 ---
 
@@ -197,6 +208,21 @@ end
 mix test
 ```
 
+### Why this works
+
+`Stream.unfold/2` captures the step function in a `%Stream{}` and defers all computation. Each pull invokes the step function once with the current state, yielding `{value, next_state}` or `nil`. Because nothing is allocated beyond the current state, a stream of 10 billion Fibonacci numbers costs the same memory as a stream of ten — only the indices you consume pay compute.
+
+---
+
+## Benchmark
+
+```elixir
+{t, _} = :timer.tc(fn -> UnfoldFib.fibonacci() |> Enum.take(10_000) |> List.last() end)
+IO.puts("fib(10_000) in #{div(t, 1000)}ms")
+```
+
+Target esperado: 10_000 Fibonacci elements in <50 ms on modern hardware; most of the cost is the bigint arithmetic on the last few thousand (the 10_000th has ~2090 digits).
+
 ---
 
 ## Trade-offs and production gotchas
@@ -205,7 +231,7 @@ mix test
 `Stream.unfold/2` calls your function once per element. If your "state"
 is a large map that you rebuild each step, you're paying that cost per
 element. For big stateful transforms over a source, `Stream.transform/3`
-(see exercise 106) is usually better — it gives you an outer source plus
+is usually better — it gives you an outer source plus
 an accumulator, not two conflated things.
 
 **2. Infinite streams require an upstream bound**
@@ -236,6 +262,13 @@ instead.
 - When the next step needs information from *outside* the state (DB,
   another stream) — use `Stream.transform/3` or `Stream.zip/2` instead.
 - For simple arithmetic progressions — `Stream.iterate/2` is shorter.
+
+---
+
+## Reflection
+
+- You need Newton-Raphson iterations for `sqrt(x)` stopping when `|x_{n+1} - x_n| < eps`. Can you express that with `Stream.unfold/2` alone, or do you need `Stream.take_while/2` layered on top? Why?
+- Storing a closure as unfold state is possible but discouraged. Invent a concrete case where doing so would actually be clearer than using plain data, then argue against yourself.
 
 ---
 

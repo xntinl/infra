@@ -2,9 +2,6 @@
 
 **Project**: `config_agent` — a tiny key/value store for runtime configuration backed by `Agent`.
 
-**Difficulty**: ★★☆☆☆
-**Estimated time**: 1–2 hours
-
 ---
 
 ## Project context
@@ -35,6 +32,11 @@ config_agent/
 ```
 
 ---
+
+
+## Why X and not Y
+
+- **Why not a lower-level alternative?** For agent basico, OTP's pattern is what reviewers will expect and what observability tools support out of the box.
 
 ## Core concepts
 
@@ -77,7 +79,31 @@ want a `GenServer`. Mixing "holds state" and "reacts to things" in an
 
 ---
 
+## Design decisions
+
+**Option A — a GenServer for shared state**
+- Pros: simpler upfront, fewer moving parts.
+- Cons: hides the trade-off that this exercise exists to teach.
+
+**Option B — an Agent (chosen)**
+- Pros: explicit about the semantic that matters in production.
+- Cons: one more concept to internalize.
+
+→ Chose **B** because state is trivial and has no logic — Agent's smaller API reduces boilerplate.
+
+
 ## Implementation
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defp deps do
+  [
+    # stdlib-only by default; add `{:benchee, "~> 1.3", only: :dev}` if you benchmark
+  ]
+end
+```
+
 
 ### Step 1: Create the project
 
@@ -230,6 +256,15 @@ mix test
 
 ---
 
+### Why this works
+
+The design leans on OTP primitives that already encode the invariants we care about (supervision, back-pressure, explicit message semantics), so failure modes are visible at the right layer instead of being reinvented ad-hoc. Tests exercise the edges (timeouts, crashes, boundary states), which is where hand-rolled alternatives silently drift over time.
+
+
+## Benchmark
+
+<!-- benchmark N/A: tema conceptual -->
+
 ## Trade-offs and production gotchas
 
 **1. `Agent` serializes everything — even reads**
@@ -268,6 +303,11 @@ pass the pid through the context.
   CRDT, or a proper database.
 
 ---
+
+
+## Reflection
+
+- Si agregás validación y side-effects al Agent, ¿cuándo sabés que es momento de migrar a GenServer? Dá el criterio concreto.
 
 ## Resources
 

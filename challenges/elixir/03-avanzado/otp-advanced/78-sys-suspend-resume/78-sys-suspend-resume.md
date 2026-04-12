@@ -1,0 +1,405 @@
+# Freezing a GenServer with `:sys.suspend/1` and `:sys.resume/1`
+
+**Project**: `sys_suspend_resume` — pause a process in place for live inspection and staged upgrades.
+**Difficulty**: ★★★★☆
+**Estimated time**: 3–5 hours
+
+---
+
+## Project context
+
+You maintain `CachePrimer`, a long-running `GenServer` that streams warming
+requests to Redis on behalf of the product catalog service. Each tick it picks
+the next 100 SKUs from a rotating ring, fetches them from Postgres, writes them
+to Redis, and records Telemetry. Normal steady state: one tick every 500 ms,
+25 ms CPU per tick.
+
+At 02:10 UTC the Redis team deploys a config change. During the 30-second
+window, Redis returns `MOVED` redirects that `CachePrimer` is not ready for.
+The SREs want to **pause** the primer cleanly while the config settles — not
+kill it (which would lose the cursor position), not scale it down (which would
+not stop the in-flight work fast enough).
+
+`:sys.suspend/1` is OTP's built-in "pause button". The process stops dispatching
+user messages, queues them in its own mailbox, and answers only system messages
+(`:sys.get_state`, `:sys.replace_state`, `:sys.resume`). When the operator is
+ready, `:sys.resume/1` unblocks the mailbox and the GenServer continues as if
+nothing happened.
+
+This exercise teaches the suspend/resume lifecycle, how it interacts with the
+mailbox, timeouts, and monitors, and when a suspend is the right pause button
+vs a feature flag or circuit breaker.
+
+Project layout:
+
+```
+sys_suspend_resume/
+├── lib/
+│   └── sys_suspend_resume/
+│       ├── application.ex
+│       ├── primer.ex              # GenServer we pause/resume
+│       └── operator.ex            # sugar over :sys.suspend/:sys.resume
+├── test/
+│   └── sys_suspend_resume/
+│       ├── primer_test.exs
+│       └── operator_test.exs
+└── mix.exs
+```
+
+---
+
+## Core concepts
+
+### 1. Suspend is cooperative and *asynchronous to user callbacks*
+
+`:sys.suspend(pid)` sends a `{:system, From, :suspend}` message. The `gen_server`
+loop, on the next iteration, sees the system message, flips an internal flag,
+and from then on routes **every** subsequent mailbox message into a pending list
+instead of dispatching it to `handle_call`/`handle_cast`/`handle_info`. System
+messages are still served, which is how `:sys.resume` can reach you.
+
+```
+           before suspend             suspended                    after resume
+time ─▶    msg → handle_*             msg → pending queue          drains queue
+           system → handle_system     system → handle_system       normal dispatch
+```
+
+### 2. In-flight callback is not cancelled
+
+If suspend arrives while `handle_call/3` is running, the current callback runs
+to completion. Only the **next** dispatch is blocked. This is usually what you
+want — you are not interrupting the in-flight Redis write mid-flight — but it
+means *suspend is not a hard stop*. If `handle_call/3` is stuck in a 30-second
+network call, `:sys.suspend/1` only takes effect after that call returns.
+
+### 3. Mailbox vs pending queue
+
+There are two queues to reason about. The OS-level **mailbox** still accepts
+messages (Erlang has no API to block message delivery into a process). The
+**pending queue** is an internal `gen_server` list of messages it has already
+read from the mailbox but decided to defer. On resume, the pending queue is
+drained *before* fresh mailbox messages.
+
+| Source                | Mailbox grows? | Pending queue grows? | Served while suspended? |
+|-----------------------|----------------|-----------------------|--------------------------|
+| `GenServer.call`      | yes            | yes (after read)      | no                       |
+| `GenServer.cast`      | yes            | yes                   | no                       |
+| `Process.send/2`      | yes            | yes                   | no                       |
+| `:sys.get_state/1`    | yes            | no                    | yes                      |
+| `:sys.resume/1`       | yes            | no                    | yes                      |
+
+### 4. Caller-side timeout risk
+
+A `GenServer.call(pid, msg, 5_000)` issued **while** `pid` is suspended will
+time out unless you resume within 5s. The process itself is healthy — it simply
+chose not to answer. Callers must not misdiagnose this as a crash. In practice
+this is why you either (a) keep suspend windows short (< 1s) or (b) pre-inform
+callers via a feature flag so they stop calling.
+
+### 5. Built-in support in `code_change/3`
+
+`:sys.suspend/1` predates hot code upgrades but is used during them. A `release
+handler` upgrade suspends every relevant GenServer, runs `code_change/3` on
+the state, and resumes. You rarely run this flow by hand, but the system
+protocol is the same — which is why you should treat suspend/resume as a
+first-class production primitive, not a debugging curiosity.
+
+---
+
+## Implementation
+
+### Step 1: `mix.exs`
+
+```elixir
+defmodule SysSuspendResume.MixProject do
+  use Mix.Project
+
+  def project, do: [
+    app: :sys_suspend_resume,
+    version: "0.1.0",
+    elixir: "~> 1.16",
+    deps: []
+  ]
+
+  def application, do: [
+    extra_applications: [:logger],
+    mod: {SysSuspendResume.Application, []}
+  ]
+end
+```
+
+### Step 2: `lib/sys_suspend_resume/application.ex`
+
+```elixir
+defmodule SysSuspendResume.Application do
+  @moduledoc false
+  use Application
+
+  @impl true
+  def start(_type, _args) do
+    Supervisor.start_link([SysSuspendResume.Primer],
+      strategy: :one_for_one,
+      name: SysSuspendResume.Supervisor
+    )
+  end
+end
+```
+
+### Step 3: `lib/sys_suspend_resume/primer.ex`
+
+```elixir
+defmodule SysSuspendResume.Primer do
+  @moduledoc """
+  A periodic worker that, on each tick, pretends to warm the cache.
+
+  The real system would fetch from Postgres and push to Redis. Here we
+  increment a counter so tests can observe tick progress deterministically.
+  """
+
+  use GenServer
+
+  @tick_ms 50
+
+  def start_link(opts \\ []) do
+    GenServer.start_link(__MODULE__, :ok, Keyword.put_new(opts, :name, __MODULE__))
+  end
+
+  @spec ticks(GenServer.server()) :: non_neg_integer()
+  def ticks(server \\ __MODULE__), do: GenServer.call(server, :ticks)
+
+  @impl true
+  def init(:ok) do
+    schedule_tick()
+    {:ok, %{ticks: 0}}
+  end
+
+  @impl true
+  def handle_call(:ticks, _from, %{ticks: n} = state), do: {:reply, n, state}
+
+  @impl true
+  def handle_info(:tick, %{ticks: n} = state) do
+    schedule_tick()
+    {:noreply, %{state | ticks: n + 1}}
+  end
+
+  defp schedule_tick, do: Process.send_after(self(), :tick, @tick_ms)
+end
+```
+
+### Step 4: `lib/sys_suspend_resume/operator.ex`
+
+```elixir
+defmodule SysSuspendResume.Operator do
+  @moduledoc """
+  Operator-facing wrapper around `:sys.suspend/1` and `:sys.resume/1`.
+
+  * Emits Telemetry events `[:sys_suspend_resume, :suspend | :resume]`.
+  * Guards against double-suspend (idempotent).
+  * Exposes `with_suspended/2` for scoped maintenance windows.
+  """
+
+  require Logger
+
+  @type server :: GenServer.server()
+
+  @spec suspend(server(), timeout()) :: :ok
+  def suspend(server, timeout \\ 5_000) do
+    :telemetry.execute([:sys_suspend_resume, :suspend], %{}, %{server: inspect(server)})
+
+    try do
+      :sys.suspend(server, timeout)
+    catch
+      :exit, {:already_suspended, _} -> :ok
+    end
+  end
+
+  @spec resume(server(), timeout()) :: :ok
+  def resume(server, timeout \\ 5_000) do
+    :telemetry.execute([:sys_suspend_resume, :resume], %{}, %{server: inspect(server)})
+
+    try do
+      :sys.resume(server, timeout)
+    catch
+      :exit, {:not_suspended, _} -> :ok
+    end
+  end
+
+  @doc """
+  Runs `fun.()` while `server` is suspended, guaranteeing resume even on crash.
+  """
+  @spec with_suspended(server(), (-> result)) :: result when result: term()
+  def with_suspended(server, fun) when is_function(fun, 0) do
+    :ok = suspend(server)
+
+    try do
+      fun.()
+    after
+      :ok = resume(server)
+    end
+  end
+end
+```
+
+Note: `:telemetry` is not listed as a dependency above because the test does
+not rely on it. In a real project add `{:telemetry, "~> 1.2"}` to `mix.exs`.
+For this exercise we stub it with a no-op if missing:
+
+```elixir
+unless Code.ensure_loaded?(:telemetry) do
+  defmodule :telemetry do
+    def execute(_event, _measurements, _metadata), do: :ok
+  end
+end
+```
+
+Drop that snippet at the top of `application.ex`.
+
+### Step 5: `test/sys_suspend_resume/primer_test.exs`
+
+```elixir
+defmodule SysSuspendResume.PrimerTest do
+  use ExUnit.Case, async: false
+
+  alias SysSuspendResume.Primer
+
+  setup do
+    pid = start_supervised!({Primer, name: :primer_base})
+    %{pid: pid}
+  end
+
+  test "ticks grow over time when not suspended", %{pid: pid} do
+    Process.sleep(200)
+    first = Primer.ticks(pid)
+    assert first >= 2
+    Process.sleep(200)
+    assert Primer.ticks(pid) > first
+  end
+end
+```
+
+### Step 6: `test/sys_suspend_resume/operator_test.exs`
+
+```elixir
+defmodule SysSuspendResume.OperatorTest do
+  use ExUnit.Case, async: false
+
+  alias SysSuspendResume.{Primer, Operator}
+
+  setup do
+    pid = start_supervised!({Primer, name: :primer_op})
+    %{pid: pid}
+  end
+
+  test "suspended primer stops incrementing ticks", %{pid: pid} do
+    Process.sleep(150)
+    :ok = Operator.suspend(pid)
+
+    before = :sys.get_state(pid).ticks
+    Process.sleep(200)
+    # :sys.get_state works while suspended; verify no progress.
+    assert :sys.get_state(pid).ticks == before
+
+    :ok = Operator.resume(pid)
+    Process.sleep(200)
+    assert :sys.get_state(pid).ticks > before
+  end
+
+  test "GenServer.call times out while suspended", %{pid: pid} do
+    :ok = Operator.suspend(pid)
+    assert catch_exit(GenServer.call(pid, :ticks, 100)) |> elem(0) == :timeout
+    :ok = Operator.resume(pid)
+    assert is_integer(Primer.ticks(pid))
+  end
+
+  test "with_suspended resumes even if fun raises", %{pid: pid} do
+    assert_raise RuntimeError, "boom", fn ->
+      Operator.with_suspended(pid, fn -> raise "boom" end)
+    end
+
+    # Server resumed and is serving again.
+    assert is_integer(Primer.ticks(pid))
+  end
+
+  test "double suspend is idempotent", %{pid: pid} do
+    :ok = Operator.suspend(pid)
+    :ok = Operator.suspend(pid)
+    :ok = Operator.resume(pid)
+  end
+end
+```
+
+---
+
+## Trade-offs and production gotchas
+
+**1. Not a circuit breaker.** Suspend stops the *process* from doing work.
+It does not stop *callers* from piling messages into the mailbox. If 500
+req/s of `GenServer.call` keep flowing while you hold the suspend, every one
+of those callers will `:timeout`-exit and your supervision tree lights up.
+
+**2. Message flood on resume.** On `:sys.resume/1`, the pending queue is
+drained *first*, synchronously. If you were suspended for 5 seconds under
+1000 msg/s load, resume blocks you while 5000 messages are processed. Plan
+for a resume spike, not a smooth ramp.
+
+**3. Monitors and links are unaffected.** The process remains alive, linked,
+and monitored. A linked parent does not get `{:EXIT, pid, _}`. This is exactly
+why suspend is safer than `exit(pid, :normal)` when you just need a pause.
+
+**4. In-flight callbacks run to completion.** A long `handle_call` will not
+be interrupted. If you suspend a process stuck in a 30s HTTP call, the
+suspend does not take effect until that call returns (or the HTTP library
+times out). Combine suspend with explicit timeouts inside callbacks.
+
+**5. Cannot `:sys.suspend` a process that does not speak the sys protocol.**
+Raw `spawn` / `spawn_link` processes will not respond. You need `gen_server`,
+`gen_statem`, `gen_event`, or a `proc_lib` special process that handles
+system messages (see exercise 80).
+
+**6. Suspend blocks `code_change/3`.** During a release upgrade, a process
+must be resumed for the upgrade to apply. A forgotten suspend at deploy
+time is a common cause of `release_handler` hanging.
+
+**7. When NOT to use this.** For any pause longer than ~1 second in
+production, you want a **feature flag** that short-circuits the work inside
+the callback, not a suspend. Feature flags keep the mailbox flowing and
+give you room to roll back. Suspend is for short, atomic, operator-driven
+windows (typically < 500 ms) during which you are actively inspecting or
+patching state.
+
+**8. Nested `with_suspended` is not safe.** Two concurrent `with_suspended`
+calls on the same server will call `resume` twice; the second resume hits
+`{:not_suspended, _}` (handled here) but you have now un-suspended someone
+else's window. Use a mutex or a supervisor-level pause lock for nested use.
+
+---
+
+## Performance notes
+
+Measure the cost of the suspend/resume round-trip on your hardware:
+
+```elixir
+{us, _} = :timer.tc(fn ->
+  for _ <- 1..1_000 do
+    :sys.suspend(pid)
+    :sys.resume(pid)
+  end
+end)
+IO.puts("per suspend/resume pair: #{div(us, 1_000)} µs")
+```
+
+On an M-series MacBook you should see 20–40 µs per pair. The suspend itself
+is `O(1)` — it is a single message round-trip plus a boolean flip. The
+expensive part is always the pending queue drain on resume, which is
+`O(pending)`.
+
+---
+
+## Resources
+
+- [`:sys.suspend/1` — OTP docs](https://www.erlang.org/doc/man/sys.html#suspend-1)
+- [`gen_server` sys message handling (source)](https://github.com/erlang/otp/blob/master/lib/stdlib/src/gen_server.erl)
+- [Learn You Some Erlang — "Building an Application With OTP"](https://learnyousomeerlang.com/building-otp-applications)
+- [Fred Hebert — *Erlang in Anger*, ch. 6](https://www.erlang-in-anger.com/)
+- [Saša Jurić — *Elixir in Action*, 2e, §10.3](https://www.manning.com/books/elixir-in-action-second-edition)
+- [OTP Design Principles — Release Handling](https://www.erlang.org/doc/design_principles/release_handling.html)

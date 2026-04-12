@@ -4,8 +4,6 @@
 lazily via `Application.fetch_env!/2` so every value is resolved fresh
 from the application environment at the moment of the call.
 
-**Difficulty**: ★★☆☆☆
-**Estimated time**: 1–2 hours
 
 ---
 
@@ -39,6 +37,11 @@ app_env_runtime/
 ```
 
 ---
+
+
+## Why X and not Y
+
+- **Why not scattered `System.get_env`?** Unreviewable, untypable, and impossible to override cleanly in tests.
 
 ## Core concepts
 
@@ -79,7 +82,31 @@ effect immediately — no restart required.
 
 ---
 
+## Design decisions
+
+**Option A — `System.get_env` scattered across modules**
+- Pros: simpler upfront, fewer moving parts.
+- Cons: hides the trade-off that this exercise exists to teach.
+
+**Option B — centralized `runtime.exs` + `Application.get_env` (chosen)**
+- Pros: explicit about the semantic that matters in production.
+- Cons: one more concept to internalize.
+
+→ Chose **B** because one place to read env, typed config, easy to override in tests.
+
+
 ## Implementation
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defp deps do
+  [
+    # stdlib-only by default; add `{:benchee, "~> 1.3", only: :dev}` if you benchmark
+  ]
+end
+```
+
 
 ### Step 1: Create the project
 
@@ -227,6 +254,20 @@ APP_ENDPOINT=https://prod.example.com iex -S mix
 
 ---
 
+### Why this works
+
+The design leans on OTP primitives that already encode the invariants we care about (supervision, back-pressure, explicit message semantics), so failure modes are visible at the right layer instead of being reinvented ad-hoc. Tests exercise the edges (timeouts, crashes, boundary states), which is where hand-rolled alternatives silently drift over time.
+
+
+## Benchmark
+
+```elixir
+{us, _} = :timer.tc(fn -> hot_path() end)
+IO.puts("#{us} µs")
+```
+
+Target esperado: medición relevante según el hot path del módulo.
+
 ## Trade-offs and production gotchas
 
 **1. `fetch_env!/2` is great for required; use `get_env/3` for optional**
@@ -253,6 +294,11 @@ Library code should accept config as arguments to `start_link/1`, not
 reach into `Application.env`. Apps own their env; libraries are guests.
 
 ---
+
+
+## Reflection
+
+- ¿Cuándo `Application.get_env` se vuelve un anti-pattern y pasás a pasar config explícitamente por arg? Definí el límite.
 
 ## Resources
 

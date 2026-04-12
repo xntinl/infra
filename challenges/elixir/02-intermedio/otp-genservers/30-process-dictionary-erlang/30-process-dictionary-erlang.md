@@ -2,9 +2,6 @@
 
 **Project**: `process_dict_lab` — explore `Process.put/get`, its niche legitimate uses, and the refactor back to explicit state.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 1–2 hours
-
 ---
 
 ## Project context
@@ -41,6 +38,11 @@ process_dict_lab/
 ```
 
 ---
+
+
+## Why X and not Y
+
+- **Why not a lower-level alternative?** For process dictionary erlang, OTP's pattern is what reviewers will expect and what observability tools support out of the box.
 
 ## Core concepts
 
@@ -84,7 +86,31 @@ Business logic is almost never cross-cutting.
 
 ---
 
+## Design decisions
+
+**Option A — store context in process dictionary**
+- Pros: simpler upfront, fewer moving parts.
+- Cons: hides the trade-off that this exercise exists to teach.
+
+**Option B — pass state explicitly (chosen)**
+- Pros: explicit about the semantic that matters in production.
+- Cons: one more concept to internalize.
+
+→ Chose **B** because process dictionary is invisible to tests and crashes; explicit state is greppable and reviewable.
+
+
 ## Implementation
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defp deps do
+  [
+    # stdlib-only by default; add `{:benchee, "~> 1.3", only: :dev}` if you benchmark
+  ]
+end
+```
+
 
 ### Step 1: Create the project
 
@@ -260,6 +286,15 @@ mix test
 
 ---
 
+### Why this works
+
+The design leans on OTP primitives that already encode the invariants we care about (supervision, back-pressure, explicit message semantics), so failure modes are visible at the right layer instead of being reinvented ad-hoc. Tests exercise the edges (timeouts, crashes, boundary states), which is where hand-rolled alternatives silently drift over time.
+
+
+## Benchmark
+
+<!-- benchmark N/A: tema conceptual -->
+
 ## Trade-offs and production gotchas
 
 **1. The dictionary hides inputs — call-graph tools cannot see them**
@@ -298,6 +333,11 @@ a struct argument, or a `Registry` lookup would work. Which is — to a
 first approximation — everywhere you were about to reach for it.
 
 ---
+
+
+## Reflection
+
+- Describí un caso real donde el process dictionary sigue siendo la herramienta correcta en 2026.
 
 ## Resources
 

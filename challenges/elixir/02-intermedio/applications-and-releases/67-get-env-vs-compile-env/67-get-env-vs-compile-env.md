@@ -4,8 +4,6 @@
 side by side so the difference is unambiguous: one value moves with the
 environment, the other is frozen in the BEAM files.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
 
 ---
 
@@ -36,6 +34,11 @@ env_vs_compile/
 ```
 
 ---
+
+
+## Why X and not Y
+
+- **Why not always `get_env`?** `compile_env` lets the compiler warn when the config shape breaks — catches deploy-time errors at build time.
 
 ## Core concepts
 
@@ -73,7 +76,31 @@ Feature flag decided at build?   ──▶ compile_env/2 (and recompile to toggl
 
 ---
 
+## Design decisions
+
+**Option A — `Application.get_env` everywhere (runtime)**
+- Pros: simpler upfront, fewer moving parts.
+- Cons: hides the trade-off that this exercise exists to teach.
+
+**Option B — `compile_env` for static, `get_env` for runtime (chosen)**
+- Pros: explicit about the semantic that matters in production.
+- Cons: one more concept to internalize.
+
+→ Chose **B** because `compile_env` lets the compiler warn when the shape of config changes; runtime values must stay runtime.
+
+
 ## Implementation
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defp deps do
+  [
+    # stdlib-only by default; add `{:benchee, "~> 1.3", only: :dev}` if you benchmark
+  ]
+end
+```
+
 
 ### Step 1: Create the project
 
@@ -194,6 +221,15 @@ mix test
 
 ---
 
+### Why this works
+
+The design leans on OTP primitives that already encode the invariants we care about (supervision, back-pressure, explicit message semantics), so failure modes are visible at the right layer instead of being reinvented ad-hoc. Tests exercise the edges (timeouts, crashes, boundary states), which is where hand-rolled alternatives silently drift over time.
+
+
+## Benchmark
+
+<!-- benchmark N/A: tema conceptual -->
+
 ## Trade-offs and production gotchas
 
 **1. `compile_env` with `runtime.exs` writes the same key = compiler warning**
@@ -223,6 +259,11 @@ flags you might toggle without a rebuild) — always `get_env` /
 `fetch_env!`.
 
 ---
+
+
+## Reflection
+
+- Si `compile_env` cambia en runtime, ¿qué warning ves y cuándo? Describí el flujo exacto.
 
 ## Resources
 

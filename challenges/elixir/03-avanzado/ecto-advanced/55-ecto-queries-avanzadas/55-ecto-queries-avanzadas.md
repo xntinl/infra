@@ -1,462 +1,556 @@
-# Advanced Ecto Queries
+# Advanced Ecto Queries: Joins, Subqueries, Aggregations
 
-## Overview
+**Project**: `ecto_queries_deep` — a reporting/analytics layer for an e-commerce platform.
 
-Build advanced query patterns for an API gateway's analytics and billing system: window
-functions via `fragment/1`, dynamic filters with `dynamic/2`, atomic multi-table operations
-with `Ecto.Multi`, and streaming millions of rows with `Repo.stream`. All code lives in
-the gateway's core domain layer.
+**Difficulty**: ★★★★☆
+**Estimated time**: 4–6 hours
 
-Project structure:
+---
+
+## Project context
+
+You're the backend lead on an e-commerce platform that grew from 10k to 2M orders over two
+years. The product team needs dashboards: top buyers, monthly cohort retention, average order
+value by category, slow-moving SKUs. The previous engineer wrote all reports as
+`Repo.all |> Enum.group_by |> ...` pipelines. At 2M rows the BEAM process that generates the
+"top buyers" report allocates 1.6 GB and takes 42 s. Something has to move into SQL.
+
+The target is to push aggregation, grouping and ranking into PostgreSQL using `Ecto.Query`
+composition. A query expressed correctly in Ecto compiles to a single SQL statement executed
+in the database, returning only the aggregated rows. You trade "familiar Elixir pipelines"
+for two to three orders of magnitude in latency and memory.
+
+This module teaches query composition beyond the `from(x in X, where: ...)` basics: joins
+(inner/left/lateral), aggregations with `group_by` and `having`, subqueries as virtual tables,
+`select_merge`, and `dynamic/2` for runtime-built filters. The code is written against a
+realistic schema used across later exercises (`Order`, `LineItem`, `Product`, `Customer`).
+
+---
 
 ```
-api_gateway/
+ecto_queries_deep/
 ├── lib/
-│   └── api_gateway/
+│   └── ecto_queries_deep/
+│       ├── application.ex
 │       ├── repo.ex
 │       ├── schemas/
-│       │   ├── client.ex
-│       │   ├── request_log.ex
-│       │   └── billing_audit.ex
-│       ├── analytics.ex
-│       ├── billing/
-│       │   └── transfers.ex
-│       └── client_filters.ex
-└── test/
-    └── api_gateway/
-        ├── analytics_test.exs
-        ├── billing_transfers_test.exs
-        └── client_filters_test.exs
+│       │   ├── customer.ex
+│       │   ├── order.ex
+│       │   ├── line_item.ex
+│       │   └── product.ex
+│       └── reports.ex                # all query builders live here
+├── priv/
+│   └── repo/
+│       └── migrations/
+│           └── 20260101000000_create_tables.exs
+├── test/
+│   └── ecto_queries_deep/
+│       └── reports_test.exs
+├── config/
+│   └── config.exs
+└── mix.exs
 ```
 
 ---
 
-## Why these patterns matter in production
+## Core concepts
 
-- **Window functions with `fragment`**: analytics dashboards need ranked data per category.
-  Doing the ranking in Elixir requires loading all rows first. Doing it in SQL means the DB
-  returns only the ranked results.
+### 1. Query composability
 
-- **`dynamic/2` for optional filters**: building SQL strings by concatenation is an injection
-  risk. `dynamic/2` composes boolean expressions at the Ecto layer safely.
+Every `Ecto.Query` is a struct. `from`, `where`, `join`, `select`, `order_by` all return a
+new query. This means you can build queries incrementally:
 
-- **`Ecto.Multi`**: any operation that modifies more than one table must be atomic. Without
-  `Multi`, a crash between two `Repo.update` calls leaves the database inconsistent.
+```
+base_query ──▶ filter_by_tenant ──▶ filter_by_date ──▶ paginate ──▶ Repo.all
+                   (adds where)        (adds where)     (adds limit/offset)
+```
 
-- **`Repo.stream`**: loading 5 million billing records with `Repo.all` allocates gigabytes
-  of heap. `Repo.stream` uses PostgreSQL server-side cursors -- fetching rows in chunks.
+Each helper takes a query, returns a query. A report becomes a pipeline of small
+composable functions. Prefer this over giant `from(...)` blocks — it is the single biggest
+maintainability win in Ecto.
+
+### 2. Binding positions and named bindings
+
+In `from(o in Order, join: c in assoc(o, :customer), where: ...)` the positional bindings
+are `[o, c]`. When queries are composed across functions, positions shift and readers get
+lost. Named bindings fix this:
+
+```elixir
+from(o in Order, as: :order,
+  join: c in assoc(o, :customer), as: :customer)
+```
+
+Then `where: [as: :customer].country == "AR"` works regardless of what else was added.
+Named bindings are required once you compose three or more helpers.
+
+### 3. `group_by` + `having` vs `where`
+
+`where` filters rows **before** aggregation. `having` filters rows **after** aggregation.
+A condition on `count(*) > 5` must live in `having` — `count` does not exist per-row.
+Postgres enforces: any non-aggregated column in `select` must appear in `group_by`.
+
+### 4. Joins: inner, left, lateral
+
+- `:inner_join` — rows must exist on both sides; drops unmatched orders-without-customer.
+- `:left_join` — keeps left rows; right side becomes `nil` when no match. Use for
+  "customers and their order count (including customers with zero)".
+- `:lateral_join` — right side is a subquery that can reference columns from the left row
+  by row. Essential for "top-N per group" (top 3 orders per customer).
+
+### 5. `subquery/1` as a virtual table
+
+A complex aggregation can be wrapped as `subquery(inner)` and joined again. This maps
+to `FROM (SELECT ...) AS sub` in SQL. Use it when you need an aggregated value per group
+and then filter by that value — the outer query treats the subquery like a schema.
+
+### 6. `dynamic/2` for runtime filters
+
+Search forms let users combine N optional filters. Building a query with `if`-branches
+produces unreadable code. `Ecto.Query.dynamic/2` fragments compose as boolean expressions:
+
+```elixir
+filters =
+  Enum.reduce(params, dynamic(true), fn
+    {"country", v}, acc -> dynamic([customer: c], ^acc and c.country == ^v)
+    _, acc -> acc
+  end)
+
+from(o in Order, as: :order, join: c in assoc(o, :customer), as: :customer, where: ^filters)
+```
 
 ---
 
 ## Implementation
 
-### Part 1: Window functions with `fragment/1`
-
-```elixir
-# lib/api_gateway/analytics.ex
-defmodule ApiGateway.Analytics do
-  import Ecto.Query
-  alias ApiGateway.{Repo, RequestLog, BillingEntry}
-
-  @doc """
-  Returns request counts per client with rank within their plan tier.
-
-  Uses PostgreSQL `rank() OVER (PARTITION BY ...)` via fragment.
-  Ecto does not expose window functions as macros -- fragment is the correct tool.
-  """
-  @spec client_usage_ranking() :: [map()]
-  def client_usage_ranking do
-    from(r in RequestLog,
-      join: c in assoc(r, :client),
-      group_by: [r.client_id, c.name, c.plan],
-      select: %{
-        client_name:  c.name,
-        plan:         c.plan,
-        request_count: count(r.id),
-        rank: fragment(
-          "rank() OVER (PARTITION BY ? ORDER BY count(?) DESC)",
-          c.plan,
-          r.id
-        )
-      }
-    )
-    |> Repo.all()
-  end
-
-  @doc """
-  Running total of requests per client, ordered by time.
-  Demonstrates cumulative window function.
-  """
-  @spec client_request_running_totals(integer()) :: [map()]
-  def client_request_running_totals(client_id) do
-    from(r in RequestLog,
-      where: r.client_id == ^client_id,
-      select: %{
-        ts:            r.inserted_at,
-        request_count: 1,
-        running_total: fragment(
-          "sum(1) OVER (ORDER BY ? ROWS UNBOUNDED PRECEDING)",
-          r.inserted_at
-        )
-      },
-      order_by: r.inserted_at
-    )
-    |> Repo.all()
-  end
-
-  @doc """
-  Clients whose average request duration exceeds the global average.
-
-  Uses subquery/1 -- the average is computed in the DB, no Elixir round-trip.
-  """
-  @spec above_average_clients() :: [map()]
-  def above_average_clients do
-    avg_subquery =
-      from(r in RequestLog,
-        select: avg(r.duration_ms)
-      )
-
-    from(r in RequestLog,
-      join: c in assoc(r, :client),
-      group_by: [r.client_id, c.name],
-      having: avg(r.duration_ms) > subquery(avg_subquery),
-      select: %{client_name: c.name, avg_duration_ms: avg(r.duration_ms)}
-    )
-    |> Repo.all()
-  end
-
-  @doc """
-  Recalculates billing for all unprocessed request logs.
-
-  Uses Repo.stream to process rows in chunks without loading all into memory.
-  Must run inside a transaction -- PostgreSQL server-side cursors require it.
-  """
-  @spec recalculate_billing() :: {:ok, any()} | {:error, any()}
-  def recalculate_billing do
-    query = from(r in RequestLog,
-      where: r.billing_processed == false,
-      select: r
-    )
-
-    Repo.transaction(fn ->
-      query
-      |> Repo.stream(max_rows: 500)
-      |> Stream.map(&compute_billing_entry/1)
-      |> Stream.chunk_every(200)
-      |> Enum.each(fn batch ->
-        Repo.insert_all(BillingEntry, batch, on_conflict: :nothing)
-      end)
-    end, timeout: :infinity)
-  end
-
-  defp compute_billing_entry(%RequestLog{} = log) do
-    %{
-      client_id:    log.client_id,
-      request_id:   log.id,
-      cost:         calculate_cost(log.duration_ms, log.bytes_transferred),
-      computed_at:  DateTime.utc_now()
-    }
-  end
-
-  defp calculate_cost(duration_ms, bytes) do
-    base = Decimal.new("0.0001")
-    dur  = Decimal.mult(base, Decimal.new(div(duration_ms, 100)))
-    bw   = Decimal.mult(Decimal.new("0.00001"), Decimal.new(div(bytes, 1024)))
-    Decimal.add(dur, bw)
-  end
-end
-```
-
-### Part 2: Dynamic filters with `dynamic/2`
-
-The admin dashboard has 6 optional filter fields. Never concatenate SQL strings.
-
-```elixir
-# lib/api_gateway/client_filters.ex
-defmodule ApiGateway.ClientFilters do
-  import Ecto.Query
-  alias ApiGateway.{Repo, Client}
-
-  @doc """
-  Searches clients with optional filters from the admin dashboard.
-
-  Accepted params (all optional, string-keyed):
-    "plan"         -- "free" | "pro" | "enterprise"
-    "active"       -- "true" | "false"
-    "min_requests" -- integer
-    "max_requests" -- integer
-    "name_like"    -- substring match (case-insensitive)
-    "created_after" -- ISO date string
-  """
-  @spec search(map()) :: [map()]
-  def search(params) when is_map(params) do
-    Client
-    |> where(^build_filters(params))
-    |> join(:left, [c], r in assoc(c, :request_logs), as: :logs)
-    |> group_by([c], c.id)
-    |> maybe_having(params)
-    |> select([c, logs: r], %{client: c, request_count: count(r.id)})
-    |> order_by([c], asc: c.name)
-    |> Repo.all()
-  end
-
-  defp build_filters(params) do
-    Enum.reduce(params, dynamic(true), fn
-      {"plan", plan}, acc ->
-        dynamic([c], ^acc and c.plan == ^plan)
-
-      {"active", "true"}, acc ->
-        dynamic([c], ^acc and c.active == true)
-
-      {"active", "false"}, acc ->
-        dynamic([c], ^acc and c.active == false)
-
-      {"name_like", q}, acc ->
-        dynamic([c], ^acc and ilike(c.name, ^"%#{q}%"))
-
-      {"created_after", date_str}, acc ->
-        case Date.from_iso8601(date_str) do
-          {:ok, date} -> dynamic([c], ^acc and c.inserted_at >= ^date)
-          _           -> acc
-        end
-
-      _unknown, acc ->
-        acc
-    end)
-  end
-
-  defp maybe_having(query, %{"min_requests" => n}) when is_integer(n) do
-    having(query, [c, logs: r], count(r.id) >= ^n)
-  end
-
-  defp maybe_having(query, %{"max_requests" => n}) when is_integer(n) do
-    having(query, [c, logs: r], count(r.id) <= ^n)
-  end
-
-  defp maybe_having(query, _params), do: query
-end
-```
-
-### Part 3: `Ecto.Multi` for atomic operations
-
-The billing system debits a client's quota and inserts an audit record. Both must succeed
-or both must fail.
-
-```elixir
-# lib/api_gateway/billing/transfers.ex
-defmodule ApiGateway.Billing.Transfers do
-  import Ecto.Query
-  alias ApiGateway.{Repo, Client, BillingAudit}
-  alias Ecto.Multi
-
-  @doc """
-  Deducts `amount` requests from `client_id`'s quota and records the audit entry.
-
-  Returns {:ok, %{client: updated_client, audit: audit_entry}}
-  or {:error, failed_step, reason, changes_so_far}.
-  """
-  @spec deduct_quota(integer(), pos_integer(), String.t()) ::
-          {:ok, map()} | {:error, atom(), term(), map()}
-  def deduct_quota(client_id, amount, reason) do
-    Multi.new()
-    |> Multi.run(:client, fn repo, _ ->
-      case repo.get(Client, client_id) do
-        nil    -> {:error, :client_not_found}
-        client -> {:ok, client}
-      end
-    end)
-    |> Multi.run(:check_quota, fn _repo, %{client: client} ->
-      if client.quota_remaining >= amount do
-        {:ok, client}
-      else
-        {:error, :insufficient_quota}
-      end
-    end)
-    |> Multi.run(:debit, fn repo, %{client: client} ->
-      client
-      |> Client.changeset(%{quota_remaining: client.quota_remaining - amount})
-      |> repo.update()
-    end)
-    |> Multi.insert(:audit, fn %{client: client} ->
-      %BillingAudit{
-        client_id: client.id,
-        amount:    amount,
-        reason:    reason,
-        occurred_at: DateTime.utc_now()
-      }
-    end)
-    |> Repo.transaction()
-  end
-end
-```
-
-Usage pattern:
-
-```elixir
-case ApiGateway.Billing.Transfers.deduct_quota(client_id, 1_000, "api_batch_request") do
-  {:ok, %{client: client, audit: _}} ->
-    Logger.info("Quota deducted: client=#{client.id} remaining=#{client.quota_remaining}")
-
-  {:error, :check_quota, :insufficient_quota, _} ->
-    {:error, :quota_exceeded}
-
-  {:error, :client, :client_not_found, _} ->
-    {:error, :not_found}
-
-  {:error, failed_step, reason, _changes} ->
-    Logger.error("Transfer failed at #{failed_step}: #{inspect(reason)}")
-    {:error, :internal}
-end
-```
-
-### Step 4: Tests
-
-```elixir
-# test/api_gateway/client_filters_test.exs
-defmodule ApiGateway.ClientFiltersTest do
-  use ApiGateway.DataCase
-
-  alias ApiGateway.ClientFilters
-
-  test "empty params returns all clients" do
-    insert_list(3, :client)
-    results = ClientFilters.search(%{})
-    assert length(results) == 3
-  end
-
-  test "filters by plan" do
-    insert(:client, plan: :free)
-    insert(:client, plan: :pro)
-    insert(:client, plan: :pro)
-
-    results = ClientFilters.search(%{"plan" => "pro"})
-    assert length(results) == 2
-    assert Enum.all?(results, fn %{client: c} -> c.plan == :pro end)
-  end
-
-  test "filters by active status" do
-    insert(:client, active: true)
-    insert(:client, active: false)
-
-    results = ClientFilters.search(%{"active" => "false"})
-    assert length(results) == 1
-    assert hd(results).client.active == false
-  end
-
-  test "filters by name_like (case-insensitive)" do
-    insert(:client, name: "Acme Corp")
-    insert(:client, name: "Beta Ltd")
-
-    results = ClientFilters.search(%{"name_like" => "acme"})
-    assert length(results) == 1
-    assert hd(results).client.name == "Acme Corp"
-  end
-
-  test "multiple filters compose with AND" do
-    insert(:client, plan: :pro, active: true,  name: "Active Pro")
-    insert(:client, plan: :pro, active: false, name: "Inactive Pro")
-    insert(:client, plan: :free, active: true, name: "Active Free")
-
-    results = ClientFilters.search(%{"plan" => "pro", "active" => "true"})
-    assert length(results) == 1
-    assert hd(results).client.name == "Active Pro"
-  end
-end
-```
-
-```elixir
-# test/api_gateway/billing_transfers_test.exs
-defmodule ApiGateway.Billing.TransfersTest do
-  use ApiGateway.DataCase
-
-  alias ApiGateway.Billing.Transfers
-  alias ApiGateway.Client
-
-  test "deducts quota and creates audit entry" do
-    client = insert(:client, quota_remaining: 10_000)
-
-    assert {:ok, %{client: updated, audit: audit}} =
-      Transfers.deduct_quota(client.id, 1_000, "api_batch")
-
-    assert updated.quota_remaining == 9_000
-    assert audit.amount == 1_000
-    assert audit.reason == "api_batch"
-  end
-
-  test "fails with :insufficient_quota when quota is too low" do
-    client = insert(:client, quota_remaining: 500)
-
-    assert {:error, :check_quota, :insufficient_quota, _} =
-      Transfers.deduct_quota(client.id, 1_000, "too_much")
-
-    assert ApiGateway.Repo.get!(Client, client.id).quota_remaining == 500
-  end
-
-  test "fails with :client_not_found for unknown client" do
-    assert {:error, :client, :client_not_found, _} =
-      Transfers.deduct_quota(-1, 100, "test")
-  end
-end
-```
-
-### Step 5: Run the tests
+### Step 1: Create the project
 
 ```bash
-mix test test/api_gateway/client_filters_test.exs \
-         test/api_gateway/billing_transfers_test.exs \
-         --trace
+mix new ecto_queries_deep --sup
+cd ecto_queries_deep
 ```
 
-Debug any query with:
+`mix.exs`:
 
 ```elixir
-# In iex -S mix:
-{sql, params} = ApiGateway.Repo.to_sql(:all, ApiGateway.ClientFilters.search(%{"plan" => "pro"}))
-IO.puts(sql)
+defp deps do
+  [
+    {:ecto_sql, "~> 3.11"},
+    {:postgrex, "~> 0.17"}
+  ]
+end
+```
+
+`config/config.exs`:
+
+```elixir
+import Config
+
+config :ecto_queries_deep, ecto_repos: [EctoQueriesDeep.Repo]
+
+config :ecto_queries_deep, EctoQueriesDeep.Repo,
+  database: "ecto_queries_deep_#{config_env()}",
+  username: "postgres",
+  password: "postgres",
+  hostname: "localhost",
+  pool_size: 10
+```
+
+### Step 2: Repo and schemas
+
+```elixir
+# lib/ecto_queries_deep/repo.ex
+defmodule EctoQueriesDeep.Repo do
+  use Ecto.Repo, otp_app: :ecto_queries_deep, adapter: Ecto.Adapters.Postgres
+end
+
+# lib/ecto_queries_deep/application.ex
+defmodule EctoQueriesDeep.Application do
+  use Application
+
+  @impl true
+  def start(_type, _args) do
+    Supervisor.start_link([EctoQueriesDeep.Repo],
+      strategy: :one_for_one, name: EctoQueriesDeep.Supervisor)
+  end
+end
+```
+
+Schemas (trimmed; see project tree):
+
+```elixir
+defmodule EctoQueriesDeep.Schemas.Customer do
+  use Ecto.Schema
+
+  schema "customers" do
+    field :email, :string
+    field :country, :string
+    field :tier, :string, default: "standard"
+    has_many :orders, EctoQueriesDeep.Schemas.Order
+    timestamps()
+  end
+end
+
+defmodule EctoQueriesDeep.Schemas.Product do
+  use Ecto.Schema
+
+  schema "products" do
+    field :sku, :string
+    field :name, :string
+    field :category, :string
+    field :price_cents, :integer
+    timestamps()
+  end
+end
+
+defmodule EctoQueriesDeep.Schemas.Order do
+  use Ecto.Schema
+
+  schema "orders" do
+    field :status, :string
+    field :placed_at, :utc_datetime
+    field :total_cents, :integer
+    belongs_to :customer, EctoQueriesDeep.Schemas.Customer
+    has_many :line_items, EctoQueriesDeep.Schemas.LineItem
+    timestamps()
+  end
+end
+
+defmodule EctoQueriesDeep.Schemas.LineItem do
+  use Ecto.Schema
+
+  schema "line_items" do
+    field :quantity, :integer
+    field :unit_price_cents, :integer
+    belongs_to :order, EctoQueriesDeep.Schemas.Order
+    belongs_to :product, EctoQueriesDeep.Schemas.Product
+  end
+end
+```
+
+### Step 3: Migrations
+
+```elixir
+defmodule EctoQueriesDeep.Repo.Migrations.CreateTables do
+  use Ecto.Migration
+
+  def change do
+    create table(:customers) do
+      add :email, :string, null: false
+      add :country, :string, null: false
+      add :tier, :string, null: false, default: "standard"
+      timestamps()
+    end
+    create unique_index(:customers, [:email])
+    create index(:customers, [:country])
+
+    create table(:products) do
+      add :sku, :string, null: false
+      add :name, :string, null: false
+      add :category, :string, null: false
+      add :price_cents, :integer, null: false
+      timestamps()
+    end
+    create unique_index(:products, [:sku])
+
+    create table(:orders) do
+      add :customer_id, references(:customers, on_delete: :restrict), null: false
+      add :status, :string, null: false
+      add :placed_at, :utc_datetime, null: false
+      add :total_cents, :integer, null: false
+      timestamps()
+    end
+    create index(:orders, [:customer_id])
+    create index(:orders, [:placed_at])
+    create index(:orders, [:status])
+
+    create table(:line_items) do
+      add :order_id, references(:orders, on_delete: :delete_all), null: false
+      add :product_id, references(:products, on_delete: :restrict), null: false
+      add :quantity, :integer, null: false
+      add :unit_price_cents, :integer, null: false
+    end
+    create index(:line_items, [:order_id])
+    create index(:line_items, [:product_id])
+  end
+end
+```
+
+### Step 4: Reports module — the core of this exercise
+
+```elixir
+defmodule EctoQueriesDeep.Reports do
+  @moduledoc """
+  Production reporting queries. Every function returns rows as maps so callers are free
+  of schema coupling.
+  """
+
+  import Ecto.Query
+
+  alias EctoQueriesDeep.Repo
+  alias EctoQueriesDeep.Schemas.{LineItem, Order, Product}
+
+  @type date_range :: {DateTime.t(), DateTime.t()}
+
+  @doc """
+  Top N customers by lifetime revenue in a date range. Pushes aggregation entirely into
+  the database.
+  """
+  @spec top_customers_by_revenue(date_range(), pos_integer()) :: [map()]
+  def top_customers_by_revenue({from_dt, to_dt}, limit) do
+    from(o in Order,
+      as: :order,
+      join: c in assoc(o, :customer),
+      as: :customer,
+      where: o.status == "completed",
+      where: o.placed_at >= ^from_dt and o.placed_at < ^to_dt,
+      group_by: [c.id, c.email],
+      having: sum(o.total_cents) > 0,
+      order_by: [desc: sum(o.total_cents)],
+      limit: ^limit,
+      select: %{
+        customer_id: c.id,
+        email: c.email,
+        order_count: count(o.id),
+        revenue_cents: sum(o.total_cents),
+        avg_order_cents: avg(o.total_cents)
+      }
+    )
+    |> Repo.all()
+  end
+
+  @doc """
+  Average order value per category. Uses a subquery to compute per-order category totals
+  first, then aggregates.
+  """
+  @spec avg_order_value_by_category() :: [map()]
+  def avg_order_value_by_category do
+    per_order_category =
+      from li in LineItem,
+        join: p in assoc(li, :product),
+        group_by: [li.order_id, p.category],
+        select: %{
+          order_id: li.order_id,
+          category: p.category,
+          subtotal_cents: sum(li.quantity * li.unit_price_cents)
+        }
+
+    from(s in subquery(per_order_category),
+      group_by: s.category,
+      order_by: [desc: avg(s.subtotal_cents)],
+      select: %{
+        category: s.category,
+        avg_subtotal_cents: avg(s.subtotal_cents),
+        order_count: count(s.order_id)
+      }
+    )
+    |> Repo.all()
+  end
+
+  @doc """
+  Slow-moving SKUs: products that sold fewer than `threshold` units in the last `days`
+  days. LEFT JOIN keeps products with zero sales.
+  """
+  @spec slow_moving_skus(pos_integer(), non_neg_integer()) :: [map()]
+  def slow_moving_skus(days, threshold) do
+    since = DateTime.add(DateTime.utc_now(), -days * 86_400, :second)
+
+    from(p in Product,
+      as: :product,
+      left_join: li in LineItem,
+      on: li.product_id == p.id,
+      left_join: o in Order,
+      on: o.id == li.order_id and o.placed_at >= ^since and o.status == "completed",
+      group_by: [p.id, p.sku, p.name],
+      having: coalesce(sum(li.quantity), 0) < ^threshold,
+      order_by: [asc: coalesce(sum(li.quantity), 0)],
+      select: %{
+        sku: p.sku,
+        name: p.name,
+        units_sold: coalesce(sum(li.quantity), 0)
+      }
+    )
+    |> Repo.all()
+  end
+
+  @doc """
+  Dynamic filter builder. Accepts a map of optional filters; ignores unknown keys.
+  """
+  @spec search_orders(map()) :: [Order.t()]
+  def search_orders(params) do
+    filters =
+      Enum.reduce(params, dynamic(true), fn
+        {"status", v}, acc ->
+          dynamic([order: o], ^acc and o.status == ^v)
+
+        {"country", v}, acc ->
+          dynamic([customer: c], ^acc and c.country == ^v)
+
+        {"min_total_cents", v}, acc ->
+          dynamic([order: o], ^acc and o.total_cents >= ^v)
+
+        {"tier", v}, acc ->
+          dynamic([customer: c], ^acc and c.tier == ^v)
+
+        _ignore, acc ->
+          acc
+      end)
+
+    from(o in Order,
+      as: :order,
+      join: c in assoc(o, :customer),
+      as: :customer,
+      where: ^filters,
+      order_by: [desc: o.placed_at]
+    )
+    |> Repo.all()
+  end
+end
+```
+
+### Step 5: Tests
+
+```elixir
+defmodule EctoQueriesDeep.ReportsTest do
+  use ExUnit.Case, async: false
+
+  alias EctoQueriesDeep.Repo
+  alias EctoQueriesDeep.Reports
+  alias EctoQueriesDeep.Schemas.{Customer, Order}
+
+  setup do
+    Ecto.Adapters.SQL.Sandbox.checkout(Repo)
+    :ok
+  end
+
+  defp insert_customer(attrs) do
+    %Customer{}
+    |> Ecto.Changeset.cast(attrs, [:email, :country, :tier])
+    |> Ecto.Changeset.validate_required([:email, :country])
+    |> Repo.insert!()
+  end
+
+  defp insert_order(customer, total, status \\ "completed") do
+    %Order{
+      customer_id: customer.id,
+      status: status,
+      placed_at: DateTime.utc_now() |> DateTime.truncate(:second),
+      total_cents: total
+    }
+    |> Repo.insert!()
+  end
+
+  describe "top_customers_by_revenue/2" do
+    test "returns top N customers ordered by summed revenue" do
+      c1 = insert_customer(%{email: "a@x", country: "AR"})
+      c2 = insert_customer(%{email: "b@x", country: "AR"})
+      insert_order(c1, 5_000)
+      insert_order(c1, 5_000)
+      insert_order(c2, 3_000)
+
+      range = {~U[2000-01-01 00:00:00Z], ~U[3000-01-01 00:00:00Z]}
+      [first, second] = Reports.top_customers_by_revenue(range, 10)
+
+      assert first.email == "a@x"
+      assert first.revenue_cents == 10_000
+      assert second.email == "b@x"
+    end
+
+    test "excludes cancelled orders" do
+      c = insert_customer(%{email: "c@x", country: "AR"})
+      insert_order(c, 9_999, "cancelled")
+      range = {~U[2000-01-01 00:00:00Z], ~U[3000-01-01 00:00:00Z]}
+      assert [] = Reports.top_customers_by_revenue(range, 10)
+    end
+  end
+
+  describe "search_orders/1" do
+    test "combines country + tier filters dynamically" do
+      c_ar = insert_customer(%{email: "ar@x", country: "AR", tier: "gold"})
+      c_br = insert_customer(%{email: "br@x", country: "BR", tier: "gold"})
+      _o1 = insert_order(c_ar, 1000)
+      _o2 = insert_order(c_br, 1000)
+
+      results = Reports.search_orders(%{"country" => "AR", "tier" => "gold"})
+      assert length(results) == 1
+    end
+  end
+end
 ```
 
 ---
 
-## Trade-off analysis
+## Trade-offs and production gotchas
 
-| Technique | When to use | When NOT to use |
-|-----------|-------------|-----------------|
-| `fragment/1` for window functions | SQL-level aggregation that Ecto macros don't support | Simple counts, sums -- use Ecto macros |
-| `dynamic/2` | Optional filters from user input | Fixed WHERE clauses -- use `where/3` directly |
-| `Ecto.Multi` | Any change touching > 1 table | Single-table operations |
-| `Repo.stream` | > 100k rows; batch processing | Small result sets -- cursor overhead outweighs benefit |
-| `subquery/1` | Value depends on same DB | External computation -- fetch separately |
+**1. N+1 still lurks in `select`**
+Putting `c.email` in `select` while joining is fine; putting `%{customer: c}` and then
+accessing `c.orders` in the result is an N+1 waiting to happen. Use `preload` with joins
+for association loading, not `select`.
+
+**2. `group_by` column lists get out of sync with `select`**
+Every non-aggregated column in `select` must appear in `group_by`. When you add `c.tier`
+to `select` and forget `group_by`, Postgres returns `column must appear in GROUP BY`.
+
+**3. `having` on aliased aggregates does not work everywhere**
+`having: total > 100` where `total` is a `select` alias fails on many databases. Repeat
+the aggregate: `having: sum(o.total_cents) > 100`. It's ugly but portable.
+
+**4. `dynamic/2` silently skips unknown keys**
+Our `search_orders` reduces over params and ignores unknown filters. If your API accepts
+`status_in: [...]` and you forget to add a clause, users think the filter works and the
+query returns all rows. Always have an explicit whitelist test.
+
+**5. Subqueries can block index usage**
+`FROM (SELECT ... GROUP BY ...) sub WHERE sub.x = 1` often cannot use an index on `x`
+because Postgres cannot push the predicate through the aggregation. Measure with
+`EXPLAIN ANALYZE`, not intuition.
+
+**6. `avg` returns `Decimal` in Postgres**
+`avg(integer)` is `numeric` in SQL → `Decimal` in Elixir. Your tests that do
+`assert avg == 5` fail silently against `Decimal.new(5)`. Use `Decimal.equal?/2`.
+
+**7. `coalesce(sum(x), 0)` is mandatory with LEFT JOIN**
+A LEFT JOIN with no matches yields `sum(NULL) = NULL`. If you compare `< threshold`,
+`NULL < 10` is `NULL` (not true) and the row gets dropped. Always wrap aggregates
+over outer joins in `coalesce`.
+
+**8. When NOT to use this**
+If the report needs 50+ lines of business logic (ranking ties broken by multiple rules,
+currency conversion with rate history, forecasting) — push it to a materialized view
+or an OLAP store (ClickHouse, DuckDB). Ecto queries excel at composition; they become
+write-only past ~80 lines.
 
 ---
 
-## Common production mistakes
+## Performance notes
 
-**1. Using `Repo.all` without LIMIT on production tables**
-A table with 10 million rows loaded via `Repo.all` allocates the entire dataset in the
-process heap. Always add `limit/2` for user-facing queries; use `Repo.stream` for batch jobs.
+Measure a report both ways:
 
-**2. `dynamic/2` with user-controlled field names**
-`dynamic([c], field(c, ^String.to_atom(user_input)) == ^value)` is dangerous for field names
-if not validated against a whitelist. Always validate field names before converting to atoms.
+```elixir
+{t_elixir, _} = :timer.tc(fn ->
+  Order |> Repo.all()
+  |> Enum.group_by(& &1.customer_id)
+  |> Enum.map(fn {id, orders} -> {id, Enum.sum(Enum.map(orders, & &1.total_cents))} end)
+  |> Enum.sort_by(&elem(&1, 1), :desc)
+  |> Enum.take(10)
+end)
 
-**3. `Ecto.Multi` step returning `{:error, reason}` vs raising**
-If a Multi step raises, Ecto rolls back and re-raises. If it returns `{:error, reason}`,
-Ecto rolls back and returns `{:error, step_name, reason, changes}`. Be consistent.
+{t_sql, _} = :timer.tc(fn ->
+  Reports.top_customers_by_revenue({~U[2000-01-01 00:00:00Z], ~U[3000-01-01 00:00:00Z]}, 10)
+end)
 
-**4. `Repo.stream` outside a transaction**
-PostgreSQL server-side cursors require an active transaction. Calling `Repo.stream` without
-wrapping in `Repo.transaction` raises `DBConnection.ConnectionError`.
+IO.inspect({t_elixir, t_sql}, label: "microseconds")
+```
 
-**5. Window functions in `having/2`**
-Window functions are not allowed in `HAVING` clauses. Wrap the window function result in a
-subquery if you need to filter on it.
+With 100k orders expect `t_sql` to be 20–50× faster and allocate almost nothing on the
+BEAM heap, because the aggregated result set is ~10 rows.
 
 ---
 
 ## Resources
 
-- [`fragment/1`](https://hexdocs.pm/ecto/Ecto.Query.API.html#fragment/1) -- inject raw SQL safely
-- [`dynamic/2`](https://hexdocs.pm/ecto/Ecto.Query.html#dynamic/2) -- composable boolean expressions
-- [`Ecto.Multi`](https://hexdocs.pm/ecto/Ecto.Multi.html) -- named, composable transactions
-- [`Repo.stream/2`](https://hexdocs.pm/ecto/Ecto.Repo.html#c:stream/2) -- cursor-based streaming
-- [PostgreSQL window functions](https://www.postgresql.org/docs/current/tutorial-window.html) -- complete reference
+- [`Ecto.Query` — hexdocs](https://hexdocs.pm/ecto/Ecto.Query.html) — canonical reference; read Composition and Bindings sections first.
+- [Ecto.Query.dynamic/2](https://hexdocs.pm/ecto/Ecto.Query.html#dynamic/2) — official examples of runtime filter composition.
+- [Programming Ecto — Darin Wilson & Eric Meadows-Jönsson](https://pragprog.com/titles/wmecto/programming-ecto/) — chapters 5–7 on query composition.
+- [PostgreSQL `EXPLAIN ANALYZE`](https://www.postgresql.org/docs/current/using-explain.html) — understand what your Ecto query actually runs.
+- [Dashbit blog](https://dashbit.co/blog) — recurring posts on Ecto query composition.
+- [Phoenix LiveDashboard Ecto page source](https://github.com/phoenixframework/phoenix_live_dashboard) — real-world aggregation queries.

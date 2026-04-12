@@ -1,379 +1,445 @@
-# Supervision Tree Design: Modeling Failure Domains
+# Supervision tree design: isolation boundaries and dependency graphs
 
-## Goal
+**Project**: `tree_design` — design a supervision tree from first principles using failure domains.
 
-Design and implement a complete supervision tree for an API gateway that separates components into three failure domains (Core, Middleware, Telemetry), uses appropriate strategies per domain, and ensures a crashing metrics reporter never takes down payment-processing components. This includes a `PartitionSupervisor` for rate limiting, a `DynamicSupervisor` for circuit breakers, and a `Task.Supervisor` for concurrent operations.
-
----
-
-## Principles for supervision tree design
-
-### Dependency ordering
-Children start in order and terminate in reverse order. If `RateLimiter` fails to start, `RouteTable` and `Router` never start. On shutdown, `Router` stops first (drains requests), then `RouteTable`, then `RateLimiter` last.
-
-### Failure domains
-A failure domain is the set of components that must fail or recover together. Components belong to the same domain if the crash of one leaves the other in an invalid state.
-
-### Circular dependency deadlock
-Circular dependencies in `init/1` cause silent deadlocks at startup. Use `handle_continue/2` to defer any calls to other processes until after `init/1` returns.
+**Difficulty**: ★★★★☆
+**Estimated time**: 4–6 hours
 
 ---
 
-## Full implementation
+## Project context
 
-### All worker modules (self-contained)
+You are rescuing an inherited Phoenix-less OTP application. `application.ex` has 27 children in a flat `:one_for_one` list. When the Redis client crashes, the Kafka consumer is restarted too (because `:one_for_one` budget hits the root). When someone deploys a change that makes the DB migrator crash on startup, the HTTP listener never starts, blocking readiness probes even though the app could serve cached traffic.
+
+The core problem is **no explicit failure domains**. Every process is treated as equally important, so any flap affects everything. You need to redesign the tree with three principles:
+
+1. **Isolation boundaries** — group children by blast radius. A crash in telemetry must never reach payments.
+2. **Dependency order** — within a boundary, children start in dataflow order and `:rest_for_one` encodes it.
+3. **Start order respects hard dependencies** — the DB pool starts before anything that queries it; the cache starts before the warmer.
+
+This exercise walks you through modeling an e-commerce backend: Infrastructure (DB, cache, message bus) → Domain (inventory, pricing, orders) → Edge (HTTP API, background jobs) → Observability (metrics, tracing). You end up with a three-level tree whose top-level supervisor uses `:rest_for_one`.
+
+```
+tree_design/
+├── lib/
+│   └── tree_design/
+│       ├── application.ex
+│       ├── infra/
+│       │   ├── supervisor.ex
+│       │   ├── db_pool.ex
+│       │   ├── cache.ex
+│       │   └── message_bus.ex
+│       ├── domain/
+│       │   ├── supervisor.ex
+│       │   ├── inventory.ex
+│       │   ├── pricing.ex
+│       │   └── orders.ex
+│       ├── edge/
+│       │   ├── supervisor.ex
+│       │   ├── http_api.ex
+│       │   └── job_runner.ex
+│       └── observability/
+│           ├── supervisor.ex
+│           └── metrics.ex
+└── test/
+    └── tree_design/
+        └── tree_topology_test.exs
+```
+
+---
+
+## Core concepts
+
+### 1. Failure domains from dependency graphs
+
+Draw your system as a directed graph of "uses":
+
+```
+observability  ←──────┐
+                       │
+edge      →  domain  →  infra
+(http)      (orders)   (db, cache, bus)
+```
+
+Observability is read-only: it SUBSCRIBES to events. It has no children depending on it. It should be in its own supervisor that can die freely without affecting anything else.
+
+Infra has no dependencies (it IS the bottom). It should start first and die last. Everything above depends on it — if infra dies, everything above must restart too.
+
+Domain uses infra. If infra restarts (losing DB connections), domain processes with cached schema metadata must also restart. `:rest_for_one`.
+
+Edge uses domain. Same logic.
+
+This gives the shape:
+
+```
+                 Application (:rest_for_one, 5/30)
+                 │
+        ┌────────┼────────┬──────────────┐
+        │        │        │              │
+      Infra   Domain    Edge       Observability
+    (:o4o)  (:rfo)   (:o4o)        (:o4o)
+```
+
+Root is `:rest_for_one` in the order `[Infra, Domain, Edge, Observability]`. If Infra restarts, Domain and Edge restart, but Observability is unaffected (comes later and only observes via events, not calls).
+
+Actually — reread that. `:rest_for_one` restarts children *after* the failed one. So Observability (last) would restart if Domain dies. We want the opposite. Solution: put Observability FIRST in the list so it starts first, dies only when explicitly killed, and is not affected by later restarts.
+
+```
+Supervisor.init(
+  [Observability, Infra, Domain, Edge],
+  strategy: :rest_for_one
+)
+```
+
+### 2. Three-level tree pattern
+
+Each subsystem has its own supervisor. Leaves are workers; middle nodes are supervisors. Rule: **a supervisor contains either workers OR supervisors, never both**. Mixing them obscures the failure semantics and makes `:rest_for_one` ordering confusing.
+
+### 3. Start order is child-list order
+
+Supervisor starts children in list order and terminates in reverse. This is your most important lever. Whatever appears first must be fully started before the second starts.
 
 ```elixir
-defmodule ApiGateway.RateLimiter.Server do
-  use GenServer
-
-  def start_link(opts \\ []) do
-    GenServer.start_link(__MODULE__, opts)
-  end
-
-  @impl true
-  def init(_opts) do
-    table = :ets.new(:rate_limiter_shard, [:bag, :public])
-    {:ok, %{table: table}}
-  end
-end
-
-defmodule ApiGateway.RouteTable.Server do
-  use GenServer
-
-  def start_link(opts) do
-    GenServer.start_link(__MODULE__, opts, name: __MODULE__)
-  end
-
-  @impl true
-  def init(opts) do
-    traffic_class = Keyword.get(opts, :traffic_class, :default)
-    {:ok, %{routes: %{}, ready: false, traffic_class: traffic_class}, {:continue, :load_routes}}
-  end
-
-  @impl true
-  def handle_continue(:load_routes, state) do
-    # Simulated lazy load -- in production this would call a remote config service
-    routes = %{
-      "/api/payments" => "http://payments-svc:8080",
-      "/api/orders" => "http://orders-svc:8080"
-    }
-    {:noreply, %{state | routes: routes, ready: true}}
-  end
-end
-
-defmodule ApiGateway.CircuitBreaker.Worker do
-  use GenServer
-
-  def start_link(service_name) do
-    GenServer.start_link(__MODULE__, service_name)
-  end
-
-  @impl true
-  def init(service_name) do
-    {:ok, %{service: service_name, status: :closed, failures: 0}}
-  end
-end
-
-defmodule ApiGateway.CircuitBreaker.Supervisor do
-  use DynamicSupervisor
-
-  def start_link(opts) do
-    DynamicSupervisor.start_link(__MODULE__, opts, name: __MODULE__)
-  end
-
-  @impl true
-  def init(_opts) do
-    DynamicSupervisor.init(strategy: :one_for_one)
-  end
-
-  @spec start_worker(String.t()) :: {:ok, pid()} | {:error, term()}
-  def start_worker(service_name) do
-    spec = {ApiGateway.CircuitBreaker.Worker, service_name}
-    DynamicSupervisor.start_child(__MODULE__, spec)
-  end
-
-  @spec list_workers() :: [pid()]
-  def list_workers do
-    DynamicSupervisor.which_children(__MODULE__)
-    |> Enum.map(fn {_, pid, _, _} -> pid end)
-    |> Enum.filter(&is_pid/1)
-  end
-end
-
-defmodule ApiGateway.Middleware.AuditWriter do
-  use GenServer
-
-  def start_link(_opts) do
-    GenServer.start_link(__MODULE__, [], name: __MODULE__)
-  end
-
-  @impl true
-  def init(_), do: {:ok, %{}}
-end
-
-defmodule ApiGateway.Middleware.PriorityDispatcher do
-  use GenServer
-
-  def start_link(_opts) do
-    GenServer.start_link(__MODULE__, [], name: __MODULE__)
-  end
-
-  @impl true
-  def init(_), do: {:ok, %{}}
-end
-
-defmodule ApiGateway.Telemetry.Reporter do
-  use GenServer
-
-  def start_link(_opts) do
-    GenServer.start_link(__MODULE__, [], name: __MODULE__)
-  end
-
-  @impl true
-  def init(_), do: {:ok, %{}}
-end
-
-defmodule ApiGateway.Telemetry.HealthChecker do
-  use GenServer
-
-  def start_link(_opts) do
-    GenServer.start_link(__MODULE__, [], name: __MODULE__)
-  end
-
-  @impl true
-  def init(_), do: {:ok, %{}}
-end
+[Infra.Supervisor,  Domain.Supervisor,  Edge.Supervisor]
+   ↑ starts first    ↑ can query DB     ↑ can call domain
 ```
 
-### The supervision tree
+During shutdown: Edge drains first, then Domain, then Infra last — so outbound requests can still query the DB while draining.
 
-```
-ApiGateway.Application
-  -> ApiGateway.Supervisors.CoreSupervisor          (rest_for_one)
-      -> ApiGateway.RateLimiter.Partitions           PartitionSupervisor
-      -> ApiGateway.RouteTable.Server                GenServer
-      -> ApiGateway.CircuitBreaker.Supervisor        DynamicSupervisor
-      -> ApiGateway.TaskSupervisor                   Task.Supervisor
-  -> ApiGateway.Supervisors.MiddlewareSupervisor     (one_for_one)
-      -> ApiGateway.Middleware.AuditWriter            GenServer
-      -> ApiGateway.Middleware.PriorityDispatcher     GenServer
-  -> ApiGateway.Supervisors.TelemetrySupervisor      (one_for_one)
-      -> ApiGateway.Telemetry.Reporter               GenServer  :transient
-      -> ApiGateway.Telemetry.HealthChecker          GenServer  :permanent
-```
+### 4. `:one_for_one` at leaves
+
+Within `Infra`, DB, cache, and message bus are independent — each can flap without affecting the others. `:one_for_one`. If ALL three repeatedly fail, the budget expires and `Infra.Supervisor` dies, which triggers `:rest_for_one` at the root.
+
+### 5. Identifying boundaries: the "same tier" test
+
+Two children belong in the SAME supervisor if:
+- they have the same failure radius (either both affect users or neither does)
+- they share restart policy (`:permanent` vs `:transient`)
+- their startup order can be ignored OR is naturally encoded by list order
+
+They belong in DIFFERENT supervisors if:
+- one is a hard dependency of the other (and you want explicit `:rest_for_one`)
+- they have different `max_restarts` budgets (telemetry: generous; payments: strict)
+- one owns shared state (ETS table) the other reads from
+
+---
+
+## Implementation
+
+### Step 1: Root application
 
 ```elixir
-defmodule ApiGateway.Application do
+# lib/tree_design/application.ex
+defmodule TreeDesign.Application do
   use Application
-  require Logger
 
   @impl true
   def start(_type, _args) do
-    Logger.info("ApiGateway starting")
-
+    # Order is dataflow. Observability first (no deps); Infra next
+    # (pure infrastructure); Domain (uses Infra); Edge (uses Domain).
     children = [
-      ApiGateway.Supervisors.CoreSupervisor,
-      ApiGateway.Supervisors.MiddlewareSupervisor,
-      ApiGateway.Supervisors.TelemetrySupervisor
+      TreeDesign.Observability.Supervisor,
+      TreeDesign.Infra.Supervisor,
+      TreeDesign.Domain.Supervisor,
+      TreeDesign.Edge.Supervisor
     ]
 
     Supervisor.start_link(children,
-      strategy: :one_for_one,
-      name:     ApiGateway.Supervisor
-    )
-  end
-
-  @impl true
-  def prep_stop(_state) do
-    Logger.info("ApiGateway initiating graceful shutdown")
-  end
-
-  @impl true
-  def stop(_state) do
-    Logger.info("ApiGateway shutdown complete")
-  end
-end
-```
-
-```elixir
-defmodule ApiGateway.Supervisors.CoreSupervisor do
-  use Supervisor
-
-  def start_link(opts) do
-    Supervisor.start_link(__MODULE__, opts, name: __MODULE__)
-  end
-
-  @impl true
-  def init(_opts) do
-    children = [
-      {PartitionSupervisor,
-        child_spec: ApiGateway.RateLimiter.Server,
-        name: ApiGateway.RateLimiter.Partitions,
-        partitions: System.schedulers_online()},
-      {ApiGateway.RouteTable.Server, [traffic_class: :default]},
-      ApiGateway.CircuitBreaker.Supervisor,
-      {Task.Supervisor, name: ApiGateway.TaskSupervisor}
-    ]
-
-    Supervisor.init(children,
-      strategy:     :rest_for_one,
+      strategy: :rest_for_one,
       max_restarts: 5,
-      max_seconds:  30
+      max_seconds: 30,
+      name: TreeDesign.Supervisor
     )
   end
 end
 ```
 
-```elixir
-defmodule ApiGateway.Supervisors.MiddlewareSupervisor do
-  use Supervisor
+### Step 2: Infra — `:one_for_one` of independent resources
 
-  def start_link(opts) do
-    Supervisor.start_link(__MODULE__, opts, name: __MODULE__)
-  end
+```elixir
+# lib/tree_design/infra/supervisor.ex
+defmodule TreeDesign.Infra.Supervisor do
+  use Supervisor
+  def start_link(_), do: Supervisor.start_link(__MODULE__, :ok, name: __MODULE__)
 
   @impl true
-  def init(_opts) do
-    children = [
-      ApiGateway.Middleware.AuditWriter,
-      ApiGateway.Middleware.PriorityDispatcher
-    ]
-
-    Supervisor.init(children,
-      strategy:     :one_for_one,
+  def init(:ok) do
+    Supervisor.init(
+      [
+        TreeDesign.Infra.DbPool,
+        TreeDesign.Infra.Cache,
+        TreeDesign.Infra.MessageBus
+      ],
+      strategy: :one_for_one,
       max_restarts: 10,
-      max_seconds:  60
+      max_seconds: 30
     )
   end
 end
+
+# lib/tree_design/infra/db_pool.ex
+defmodule TreeDesign.Infra.DbPool do
+  use GenServer
+  def start_link(_), do: GenServer.start_link(__MODULE__, :ok, name: __MODULE__)
+  def query(sql), do: GenServer.call(__MODULE__, {:query, sql})
+  @impl true
+  def init(:ok), do: {:ok, %{conns: 10}}
+  @impl true
+  def handle_call({:query, _sql}, _from, s), do: {:reply, {:ok, []}, s}
+end
+
+# lib/tree_design/infra/cache.ex
+defmodule TreeDesign.Infra.Cache do
+  use GenServer
+  def start_link(_), do: GenServer.start_link(__MODULE__, :ok, name: __MODULE__)
+  def get(key), do: GenServer.call(__MODULE__, {:get, key})
+  def put(key, val), do: GenServer.call(__MODULE__, {:put, key, val})
+  @impl true
+  def init(:ok), do: {:ok, %{}}
+  @impl true
+  def handle_call({:get, k}, _from, s), do: {:reply, Map.get(s, k), s}
+  def handle_call({:put, k, v}, _from, s), do: {:reply, :ok, Map.put(s, k, v)}
+end
+
+# lib/tree_design/infra/message_bus.ex
+defmodule TreeDesign.Infra.MessageBus do
+  use GenServer
+  def start_link(_), do: GenServer.start_link(__MODULE__, :ok, name: __MODULE__)
+  def publish(topic, msg), do: GenServer.cast(__MODULE__, {:publish, topic, msg})
+  @impl true
+  def init(:ok), do: {:ok, %{}}
+  @impl true
+  def handle_cast({:publish, _t, _m}, s), do: {:noreply, s}
+end
 ```
 
-```elixir
-defmodule ApiGateway.Supervisors.TelemetrySupervisor do
-  use Supervisor
+### Step 3: Domain — `:rest_for_one` pipeline
 
-  def start_link(opts) do
-    Supervisor.start_link(__MODULE__, opts, name: __MODULE__)
-  end
+```elixir
+# lib/tree_design/domain/supervisor.ex
+defmodule TreeDesign.Domain.Supervisor do
+  use Supervisor
+  def start_link(_), do: Supervisor.start_link(__MODULE__, :ok, name: __MODULE__)
 
   @impl true
-  def init(_opts) do
-    children = [
-      %{
-        id:      ApiGateway.Telemetry.Reporter,
-        start:   {ApiGateway.Telemetry.Reporter, :start_link, [[]]},
-        restart: :transient
-      },
-      {ApiGateway.Telemetry.HealthChecker, []}
-    ]
-
-    Supervisor.init(children,
-      strategy:     :one_for_one,
-      max_restarts: 20,
-      max_seconds:  60
+  def init(:ok) do
+    # Inventory feeds Pricing; Pricing feeds Orders. Linear dataflow.
+    Supervisor.init(
+      [
+        TreeDesign.Domain.Inventory,
+        TreeDesign.Domain.Pricing,
+        TreeDesign.Domain.Orders
+      ],
+      strategy: :rest_for_one,
+      max_restarts: 5,
+      max_seconds: 30
     )
+  end
+end
+
+# lib/tree_design/domain/inventory.ex
+defmodule TreeDesign.Domain.Inventory do
+  use GenServer
+  def start_link(_), do: GenServer.start_link(__MODULE__, :ok, name: __MODULE__)
+  def stock(sku), do: GenServer.call(__MODULE__, {:stock, sku})
+  @impl true
+  def init(:ok), do: {:ok, %{"sku-a" => 10, "sku-b" => 3}}
+  @impl true
+  def handle_call({:stock, sku}, _from, s), do: {:reply, Map.get(s, sku, 0), s}
+end
+
+# lib/tree_design/domain/pricing.ex
+defmodule TreeDesign.Domain.Pricing do
+  use GenServer
+  def start_link(_), do: GenServer.start_link(__MODULE__, :ok, name: __MODULE__)
+  def price(sku), do: GenServer.call(__MODULE__, {:price, sku})
+  @impl true
+  def init(:ok), do: {:ok, %{"sku-a" => 199, "sku-b" => 499}}
+  @impl true
+  def handle_call({:price, sku}, _from, s), do: {:reply, Map.get(s, sku, 0), s}
+end
+
+# lib/tree_design/domain/orders.ex
+defmodule TreeDesign.Domain.Orders do
+  use GenServer
+  def start_link(_), do: GenServer.start_link(__MODULE__, :ok, name: __MODULE__)
+  def place(sku, qty), do: GenServer.call(__MODULE__, {:place, sku, qty})
+  @impl true
+  def init(:ok), do: {:ok, %{seq: 0}}
+  @impl true
+  def handle_call({:place, sku, qty}, _from, s) do
+    {:reply, {:ok, "ord-#{s.seq}-#{sku}-#{qty}"}, %{s | seq: s.seq + 1}}
   end
 end
 ```
 
-### Tests
+### Step 4: Edge — `:one_for_one` (http and jobs are peers)
 
 ```elixir
-# test/api_gateway/supervision_tree_test.exs
-defmodule ApiGateway.SupervisionTreeTest do
+# lib/tree_design/edge/supervisor.ex
+defmodule TreeDesign.Edge.Supervisor do
+  use Supervisor
+  def start_link(_), do: Supervisor.start_link(__MODULE__, :ok, name: __MODULE__)
+
+  @impl true
+  def init(:ok) do
+    Supervisor.init(
+      [TreeDesign.Edge.HttpApi, TreeDesign.Edge.JobRunner],
+      strategy: :one_for_one,
+      max_restarts: 3,
+      max_seconds: 10
+    )
+  end
+end
+
+defmodule TreeDesign.Edge.HttpApi do
+  use GenServer
+  def start_link(_), do: GenServer.start_link(__MODULE__, :ok, name: __MODULE__)
+  @impl true
+  def init(:ok), do: {:ok, %{}}
+end
+
+defmodule TreeDesign.Edge.JobRunner do
+  use GenServer
+  def start_link(_), do: GenServer.start_link(__MODULE__, :ok, name: __MODULE__)
+  @impl true
+  def init(:ok), do: {:ok, %{}}
+end
+```
+
+### Step 5: Observability
+
+```elixir
+# lib/tree_design/observability/supervisor.ex
+defmodule TreeDesign.Observability.Supervisor do
+  use Supervisor
+  def start_link(_), do: Supervisor.start_link(__MODULE__, :ok, name: __MODULE__)
+
+  @impl true
+  def init(:ok) do
+    Supervisor.init(
+      [TreeDesign.Observability.Metrics],
+      strategy: :one_for_one,
+      max_restarts: 10,
+      max_seconds: 60
+    )
+  end
+end
+
+defmodule TreeDesign.Observability.Metrics do
+  use GenServer
+  def start_link(_), do: GenServer.start_link(__MODULE__, :ok, name: __MODULE__)
+  @impl true
+  def init(:ok), do: {:ok, %{}}
+end
+```
+
+### Step 6: Topology tests — encode the design
+
+```elixir
+# test/tree_design/tree_topology_test.exs
+defmodule TreeDesign.TreeTopologyTest do
   use ExUnit.Case, async: false
 
-  describe "failure domain isolation" do
-    test "telemetry supervisor crash does not affect core components" do
-      rate_limiter_pid = Process.whereis(ApiGateway.RateLimiter.Server) ||
-        GenServer.whereis({:via, PartitionSupervisor,
-          {ApiGateway.RateLimiter.Partitions, 0}})
+  test "root children start in declared order" do
+    children = Supervisor.which_children(TreeDesign.Supervisor)
+    ids = Enum.map(children, fn {id, _, _, _} -> id end) |> Enum.reverse()
 
-      reporter_pid = Process.whereis(ApiGateway.Telemetry.Reporter)
-
-      if reporter_pid && Process.alive?(reporter_pid) do
-        ref = Process.monitor(reporter_pid)
-        Process.exit(reporter_pid, :kill)
-        assert_receive {:DOWN, ^ref, :process, _, _}, 1_000
-      end
-
-      Process.sleep(200)
-
-      core_pid = Process.whereis(ApiGateway.Supervisors.CoreSupervisor)
-      assert core_pid != nil
-      assert Process.alive?(core_pid)
-    end
-
-    test "middleware supervisor is independent of core supervisor" do
-      audit_pid = Process.whereis(ApiGateway.Middleware.AuditWriter)
-      assert audit_pid != nil
-
-      core_pid = Process.whereis(ApiGateway.Supervisors.CoreSupervisor)
-      assert core_pid != nil
-
-      audit_sup = Process.info(audit_pid, :dictionary)[:"$ancestors"] |> List.first()
-      core_name = ApiGateway.Supervisors.CoreSupervisor
-      assert audit_sup != Process.whereis(core_name)
-    end
-
-    test "all three domain supervisors are running at startup" do
-      assert Process.alive?(Process.whereis(ApiGateway.Supervisors.CoreSupervisor))
-      assert Process.alive?(Process.whereis(ApiGateway.Supervisors.MiddlewareSupervisor))
-      assert Process.alive?(Process.whereis(ApiGateway.Supervisors.TelemetrySupervisor))
-    end
+    assert ids == [
+             TreeDesign.Observability.Supervisor,
+             TreeDesign.Infra.Supervisor,
+             TreeDesign.Domain.Supervisor,
+             TreeDesign.Edge.Supervisor
+           ]
   end
 
-  describe "startup ordering" do
-    test "core components are available before middleware" do
-      audit_pid = Process.whereis(ApiGateway.Middleware.AuditWriter)
-      route_table_pid = Process.whereis(ApiGateway.RouteTable.Server)
+  test "infra crash restarts domain and edge (rest_for_one at root)" do
+    pid_obs = Process.whereis(TreeDesign.Observability.Supervisor)
+    pid_domain = Process.whereis(TreeDesign.Domain.Supervisor)
+    pid_edge = Process.whereis(TreeDesign.Edge.Supervisor)
+    pid_infra = Process.whereis(TreeDesign.Infra.Supervisor)
 
-      assert audit_pid != nil
-      assert route_table_pid != nil
-    end
+    ref = Process.monitor(pid_infra)
+    Process.exit(pid_infra, :kill)
+    assert_receive {:DOWN, ^ref, :process, ^pid_infra, _}, 500
+
+    wait_until(fn ->
+      pid_domain_new = Process.whereis(TreeDesign.Domain.Supervisor)
+      pid_edge_new = Process.whereis(TreeDesign.Edge.Supervisor)
+
+      is_pid(pid_domain_new) and pid_domain_new != pid_domain and
+        is_pid(pid_edge_new) and pid_edge_new != pid_edge
+    end)
+
+    # Observability is BEFORE infra in the rest_for_one order → untouched.
+    assert Process.whereis(TreeDesign.Observability.Supervisor) == pid_obs
   end
 
-  describe "dynamic circuit breaker workers" do
-    test "workers can be added after startup" do
-      {:ok, pid} = ApiGateway.CircuitBreaker.Supervisor.start_worker("test-upstream")
-      assert Process.alive?(pid)
-      assert Enum.member?(ApiGateway.CircuitBreaker.Supervisor.list_workers(), pid)
-    end
+  test "leaf inventory crash does not affect orders' siblings above" do
+    pid_inv = Process.whereis(TreeDesign.Domain.Inventory)
+    pid_pricing = Process.whereis(TreeDesign.Domain.Pricing)
+    pid_orders = Process.whereis(TreeDesign.Domain.Orders)
+
+    ref = Process.monitor(pid_inv)
+    Process.exit(pid_inv, :kill)
+    assert_receive {:DOWN, ^ref, :process, ^pid_inv, _}, 500
+
+    wait_until(fn ->
+      pricing_new = Process.whereis(TreeDesign.Domain.Pricing)
+      orders_new = Process.whereis(TreeDesign.Domain.Orders)
+      # rest_for_one: inventory crash restarts pricing and orders
+      pricing_new != pid_pricing and orders_new != pid_orders
+    end)
+  end
+
+  defp wait_until(fun, timeout \\ 1_000) do
+    deadline = System.monotonic_time(:millisecond) + timeout
+
+    Stream.repeatedly(fn -> fun.() end)
+    |> Enum.find(fn
+      true -> true
+      _ ->
+        if System.monotonic_time(:millisecond) > deadline,
+          do: raise("wait_until timeout"),
+          else: (Process.sleep(10); false)
+    end)
   end
 end
 ```
 
 ---
 
-## How it works
+## Trade-offs and production gotchas
 
-1. **Three-layer hierarchy**: top-level `:one_for_one` because the three domain supervisors are independent failure domains.
+**1. Flat trees are tempting but lie about your system.** A 27-child flat `:one_for_one` says "everything is equally important and independent". That is never true. A three-level tree is more code but encodes real failure semantics.
 
-2. **`:rest_for_one` in CoreSupervisor**: RateLimiter is first because everything depends on it. If it crashes, RouteTable and CircuitBreaker.Supervisor restart. If RouteTable crashes alone, only it and things after it restart.
+**2. `:rest_for_one` ordering traps.** If you put Observability last, a Domain crash restarts Observability — but Observability may be publishing metrics that Domain subscribers read, creating oscillation. Put passive observers FIRST or outside the subtree.
 
-3. **`:transient` for Reporter**: exits cleanly when Datadog is unreachable, and the supervisor does NOT restart it in a loop.
+**3. Start order is NOT async-safe.** `Supervisor.init/1` returns before `init/1` of children completes. A child that is "started" may not yet be `ready`. If Domain.Pricing.init queries DbPool during init, the DbPool might still be connecting. Use `Application.ensure_all_started/1` + explicit readiness probes.
 
-4. **`handle_continue` for RouteTable**: prevents startup deadlock when RouteTable needs to call other core components during initialization.
+**4. Budget exhaustion cascades.** If a leaf flaps 10 times and its parent has `max_restarts: 3`, the parent dies. If that parent is a child of the root with `max_restarts: 5`, you've used 1 of 5. Five such cascades and the whole app dies. Monitor supervisor terminations via `:telemetry` or SASL logs.
+
+**5. `Supervisor.which_children/1` is O(n) under mutex.** Do NOT call it from hot paths. For topology assertions (tests), it's fine. For observability, sample it every few seconds.
+
+**6. Child specs with `name:` break topology on restart.** Between exit and re-registration, `Process.whereis/1` returns `nil`. Tests that grab a pid and then send it a message race with restart. Always re-lookup after a restart.
+
+**7. Circular dependencies are invisible until deploy.** If Domain calls Edge (say, to notify of price changes) and Edge calls Domain, your `:rest_for_one` ordering becomes impossible. Break the cycle with a message bus (publish-subscribe) so neither directly depends on the other.
+
+**8. When NOT to use this.** For a script, a single-purpose service with <5 processes, or an early-stage prototype, a flat `:one_for_one` is fine. The three-level tree pays for itself past ~10 processes with heterogeneous failure characteristics.
 
 ---
 
-## Common production mistakes
+## Performance notes
 
-**1. A flat list of children for complex systems**
-A single supervisor governing all workers means a noisy metrics worker can hit `max_restarts` and take down database connections.
-
-**2. Implicit dependencies through global names**
-If someone reorders the children list, processes that depend on each other may fail silently.
-
-**3. Expensive external calls in `init/1`**
-Use `handle_continue` so `init/1` always returns immediately.
+Supervisor dispatch is ~1 µs per message. Deep trees (5+ levels) don't measurably slow startup. What does slow startup is `init/1` I/O — each `init/1` is serial within its supervisor. Do heavy work in `handle_continue/2` so `init/1` returns in microseconds and the supervisor proceeds to the next child.
 
 ---
 
 ## Resources
 
-- [OTP Design Principles -- Supervisor Behaviour](https://www.erlang.org/doc/design_principles/sup_princ.html)
-- [HexDocs -- Supervisor](https://hexdocs.pm/elixir/Supervisor.html)
-- [HexDocs -- DynamicSupervisor](https://hexdocs.pm/elixir/DynamicSupervisor.html)
-- [Fred Hebert -- The Zen of Erlang](https://ferd.ca/the-zen-of-erlang.html)
+- [Designing Elixir Systems with OTP — James Edward Gray II & Bruce Tate](https://pragprog.com/titles/jgotp/designing-elixir-systems-with-otp/) — the definitive book on tree design.
+- [Supervisor — hexdocs](https://hexdocs.pm/elixir/Supervisor.html) — strategies, start/shutdown order.
+- [Fred Hébert — Stuff Goes Bad: Erlang in Anger](https://www.erlang-in-anger.com/) — free PDF, chapter on supervision trees in production.
+- [Phoenix Application supervisor](https://github.com/phoenixframework/phoenix/blob/main/lib/phoenix/endpoint/supervisor.ex) — read a real three-level tree.
+- [Dashbit blog — Your OTP app as an umbrella or not](https://dashbit.co/blog/are-umbrella-apps-dead-in-elixir) — José Valim on structural choices.
+- [Saša Jurić — Elixir in Action, 2nd ed., Ch. 9](https://www.manning.com/books/elixir-in-action-second-edition) — worked examples of supervisor hierarchies.

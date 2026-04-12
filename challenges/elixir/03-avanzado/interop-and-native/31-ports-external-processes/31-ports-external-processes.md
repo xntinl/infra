@@ -1,548 +1,298 @@
-# Ports and External Processes
+# Ports — Wrapping External Processes Safely
 
-**Project**: `api_gateway` — a standalone HTTP gateway exercise
+**Project**: `port_demo` — a long-lived wrapper around an external CLI (`ffmpeg`, `imagemagick`, a Python ML model) exposed as an OTP GenServer to the rest of the system.
+
+**Difficulty**: ★★★★☆
+
+**Estimated time**: 3–6 hours
 
 ---
 
 ## Project context
 
-You are building `api_gateway`, an HTTP gateway that routes traffic to microservices. The
-gateway needs two integrations with external processes: a Python-based ML scoring service
-that cannot be rewritten in Elixir, and a live log tailer that streams gateway access logs
-to monitoring subscribers. Both require bidirectional, long-lived communication with OS
-processes.
+Sooner or later every Elixir system needs to run a program the BEAM didn't write — `ffmpeg`, `ocrmypdf`, a Python tokenizer, a Go binary, a shell pipeline. The naive reach is `System.cmd/3`, but it has three fatal limits: it blocks the calling process, spawns a fresh OS process per call, and has no way to stream stdout as it arrives. For anything heavier than `echo`, you need a **Port**.
 
-Project structure:
+Ports are the BEAM's mechanism to own an external OS process as a linked "port" object. The VM sends bytes to the program's stdin and receives messages when bytes arrive on stdout. Link semantics let you crash the owning Elixir process if the port dies, and vice versa — with one enormous caveat: **an Elixir process killed without closing its port leaks the OS process**.
+
+In this exercise you wrap `cat -u` (line-buffered) as a stand-in for a real subprocess and build `port_demo` — a GenServer that owns the port, serializes requests, streams responses by line, and handles crashes deterministically.
 
 ```
-api_gateway/
+port_demo/
 ├── lib/
-│   └── api_gateway/
+│   └── port_demo/
 │       ├── application.ex
-│       ├── router.ex
-│       └── middleware/
-│           ├── ml_scorer.ex        # ← GenServer wrapping a Python Port
-│           └── log_tailer.ex       # ← tail -f fanout to subscribers
+│       ├── worker.ex           # GenServer owning the port
+│       └── line_buffer.ex      # stdin/stdout framing helper
 ├── test/
-│   └── api_gateway/
-│       └── middleware/
-│           ├── ml_scorer_test.exs
-│           └── log_tailer_test.exs
-├── priv/
-│   └── scorer.py                   # given — do not modify
+│   └── port_demo/
+│       └── worker_test.exs
 └── mix.exs
 ```
 
 ---
 
-## The business problem
+## Core concepts
 
-**ML scorer**: the fraud detection team trained a Python model. They deliver it as a script
-that reads JSON requests from stdin and writes JSON responses to stdout. The gateway must call
-it on every payment request. The model takes ~30ms per call, so the Port must stay alive
-across requests — spawning a new Python process per request would be 200ms+ of startup overhead.
-
-**Log tailer**: the ops team subscribes to gateway access logs in real time. Multiple
-monitoring processes (Prometheus exporter, alerting agent) must receive every new log line.
-The simplest source is `tail -f` on the access log file, wrapped in a Port with fanout.
-
----
-
-## Why Ports and not `System.cmd`
+### 1. Port anatomy
 
 ```
-System.cmd: spawns a process, waits for it to finish, returns {output, exit_code}
-             Blocking. One-shot. No streaming. Simple.
-
-Port.open:  creates a long-lived bridge to an OS process.
-             Messages flow in both directions while both sides are alive.
-             The Port dies when the OS process dies, and vice versa.
+ Elixir process (owner)
+       │
+       │  Port.command(port, data)           # send bytes to stdin
+       │
+       ▼
+     Port ──────────────────────────────────▶ external OS program
+       ▲                                           (stdin/stdout pipe)
+       │
+       │  {port, {:data, bytes}}             # stdout message
+       │  {port, {:exit_status, n}}          # process exit
+       │
+ Elixir process (owner mailbox)
 ```
 
-A Port behaves like a process: you send it messages and receive messages from it. You can
-monitor it with `Port.monitor/1`. When the GenServer that owns the Port dies, the Port
-closes and the OS process receives EOF on stdin.
+A Port is referenced by a `port()` BEAM term. Only the owning process can send commands to it. Messages are delivered to the owner's mailbox.
 
-```
-GenServer  ---send({self(), {:command, data}})----->  Port  ---stdin----->  OS process
-           <---{port, {:data, response}}-----------         <---stdout--
-```
+### 2. Port options — the ones that matter
 
----
+| Option | Effect |
+|---|---|
+| `:binary` | deliver data as binaries (not charlists) — **always use this** |
+| `{:packet, N}` | frame messages with an N-byte length prefix (1, 2, or 4) |
+| `:line` (N) | deliver one line at a time, buffered up to N bytes |
+| `:stream` | raw stream, no framing — caller handles partials |
+| `:exit_status` | send `{:exit_status, N}` when program exits |
+| `:use_stdio` | communicate via stdin/stdout (default) |
+| `:stderr_to_stdout` | merge stderr into stdout |
+| `{:args, [...]}` | argv (safe — no shell interpretation) |
+| `{:cd, path}` | working directory |
+| `{:env, [{k, v}]}` | environment |
 
-## Given Python script — `priv/scorer.py`
+For most wrappers, `[:binary, :exit_status, {:args, argv}, :stderr_to_stdout]` is the safe baseline.
 
-```python
-#!/usr/bin/env python3
-import sys, json
+### 3. Framing modes — why `:packet` matters
 
-for line in sys.stdin:
-    req = json.loads(line.strip())
-    action = req.get("action", "")
-    if action == "score":
-        amount = req.get("amount", 0)
-        # Fake model: flag amounts > 1000 as high risk
-        score = min(1.0, amount / 1000.0)
-        print(json.dumps({"score": score, "risk": "high" if score > 0.7 else "low"}),
-              flush=True)
-    else:
-        print(json.dumps({"error": f"unknown action: {action}"}), flush=True)
-```
+With `:stream` you receive arbitrary byte chunks — a single `puts "hello"` may arrive as two `{:data, _}` messages. You must reassemble. Options:
+
+- **`:line` mode** — BEAM buffers until `\n`. Good for line-oriented tools.
+- **`{:packet, 4}`** — BEAM prepends/expects a 4-byte big-endian length header. The other side must do the same. Use this when you control the program (e.g., a Rust or Go helper you wrote).
+- **`:stream`** — for binary protocols where you implement your own framing.
+
+### 4. The zombie process problem
+
+If the Elixir owner crashes without closing the port, BEAM closes the port — but the external program **may survive** if it doesn't watch for stdin EOF. Classic zombie: `Port.open({:spawn_executable, path}, ...)` and the owner crashes while the external is in a `sleep` loop. The process keeps running, detached.
+
+Mitigations:
+1. The external program must exit when it reads EOF on stdin.
+2. Use `erlexec` / `:exec` library for proper SIGKILL on port close.
+3. Wrap spawn with a shell script that traps parent death (`prctl(PR_SET_PDEATHSIG)` on Linux).
+
+### 5. `System.cmd/3` vs `Port.open/2` vs `:os.cmd/1`
+
+| API | Use when |
+|---|---|
+| `System.cmd/3` | one-shot, small output, don't care about streaming |
+| `:os.cmd/1` | quick debug only — **shell interpolation risk** |
+| `Port.open/2` | long-lived subprocess, streaming, bidirectional |
+| `:exec.run/2` (erlexec) | need proper signal handling, kill on orphan |
+
+### 6. Backpressure via port_command
+
+`Port.command/2` (and `send/2` under the hood) will block the owner if the OS pipe buffer fills. This is BEAM-level backpressure: your GenServer's `handle_call` will stall until the external drains stdin. Use `Port.command(port, data, [:nosuspend])` to fail fast instead if you prefer.
 
 ---
 
 ## Implementation
 
-### Step 1: `lib/api_gateway/middleware/ml_scorer.ex`
-
-The MlScorer GenServer opens a Python process via a Port at startup and keeps it alive across
-requests. Each scoring request is serialized as a JSON line to the Port's stdin; the response
-arrives as a JSON line on stdout. The GenServer stores the caller's `from` reference and replies
-asynchronously when the Port sends back data.
-
-The restart logic uses exponential backoff: if the Python process crashes, the GenServer waits
-progressively longer before re-opening the Port, up to `@max_retries` attempts.
+### Step 1: `mix.exs`
 
 ```elixir
-defmodule ApiGateway.Middleware.MlScorer do
-  @moduledoc """
-  GenServer that keeps a Python scoring process alive via a Port.
+defmodule PortDemo.MixProject do
+  use Mix.Project
 
-  The Port is opened once at startup and reused across all requests.
-  Requests are sent as JSON lines; responses arrive as JSON lines.
+  def project, do: [app: :port_demo, version: "0.1.0", elixir: "~> 1.15", deps: []]
+  def application, do: [extra_applications: [:logger], mod: {PortDemo.Application, []}]
+end
+```
 
-  Single-request-at-a-time semantics: the GenServer holds the caller's
-  `from` reference and replies when the Port sends back data.
-  For concurrent requests, a correlation-ID scheme would be needed.
-  """
-  use GenServer
+### Step 2: `lib/port_demo/application.ex`
 
-  defstruct [:port, :pending, :script_path, :retries, :status]
-
-  @max_retries 3
-
-  # ---------------------------------------------------------------------------
-  # Public API
-  # ---------------------------------------------------------------------------
-
-  def start_link(opts) do
-    script_path = Keyword.fetch!(opts, :script_path)
-    GenServer.start_link(__MODULE__, script_path, opts)
-  end
-
-  @spec score(GenServer.server(), map(), timeout()) ::
-          {:ok, map()} | {:error, term()}
-  def score(pid, request, timeout \\ 5_000) do
-    GenServer.call(pid, {:score, request}, timeout)
-  end
-
-  # ---------------------------------------------------------------------------
-  # GenServer lifecycle
-  # ---------------------------------------------------------------------------
+```elixir
+defmodule PortDemo.Application do
+  use Application
 
   @impl true
-  def init(script_path) do
-    state = %__MODULE__{
-      script_path: script_path,
-      retries: 0,
-      status: :starting,
-      pending: nil
-    }
+  def start(_type, _args) do
+    children = [
+      {PortDemo.Worker, cmd: ~w(cat -u)}
+    ]
 
-    case open_port(script_path) do
-      {:ok, port} ->
-        {:ok, %{state | port: port, status: :running}}
-
-      {:error, reason} ->
-        {:stop, {:port_open_failed, reason}}
-    end
-  end
-
-  # ---------------------------------------------------------------------------
-  # Callbacks
-  # ---------------------------------------------------------------------------
-
-  @impl true
-  def handle_call({:score, _request}, _from, %{status: :restarting} = state) do
-    {:reply, {:error, :restarting}, state}
-  end
-
-  @impl true
-  def handle_call({:score, request}, from, state) do
-    json_line = Jason.encode!(request) <> "\n"
-    send(state.port, {self(), {:command, json_line}})
-    {:noreply, %{state | pending: from}}
-  end
-
-  @impl true
-  def handle_info({port, {:data, {:eol, line}}}, %{port: port} = state) do
-    case Jason.decode(line) do
-      {:ok, decoded} ->
-        if state.pending, do: GenServer.reply(state.pending, {:ok, decoded})
-
-      {:error, reason} ->
-        if state.pending, do: GenServer.reply(state.pending, {:error, {:decode_failed, reason}})
-    end
-
-    {:noreply, %{state | pending: nil}}
-  end
-
-  @impl true
-  def handle_info({port, {:exit_status, _code}}, %{port: port} = state) do
-    if state.pending do
-      GenServer.reply(state.pending, {:error, :scorer_crashed})
-    end
-
-    attempt_restart(%{state | pending: nil, status: :restarting})
-  end
-
-  @impl true
-  def handle_info({:DOWN, _ref, :port, _port, reason}, state) do
-    if state.pending do
-      GenServer.reply(state.pending, {:error, {:port_down, reason}})
-    end
-
-    attempt_restart(%{state | pending: nil, status: :restarting})
-  end
-
-  @impl true
-  def handle_info(:do_restart, state) do
-    case open_port(state.script_path) do
-      {:ok, port} ->
-        Process.send_after(self(), :reset_retries, 30_000)
-        {:noreply, %{state | port: port, status: :running, retries: state.retries}}
-
-      {:error, _reason} ->
-        attempt_restart(state)
-    end
-  end
-
-  @impl true
-  def handle_info(:reset_retries, state) do
-    {:noreply, %{state | retries: 0}}
-  end
-
-  @impl true
-  def terminate(_reason, state) do
-    if state.port && Port.info(state.port) != nil do
-      Port.close(state.port)
-    end
-  end
-
-  # ---------------------------------------------------------------------------
-  # Private helpers
-  # ---------------------------------------------------------------------------
-
-  defp open_port(script_path) do
-    python = System.find_executable("python3") || System.find_executable("python")
-
-    if is_nil(python) do
-      {:error, :python_not_found}
-    else
-      port =
-        Port.open({:spawn_executable, python}, [
-          :binary,
-          :exit_status,
-          {:line, 4096},
-          args: [script_path]
-        ])
-
-      Port.monitor(port)
-      {:ok, port}
-    end
-  end
-
-  defp attempt_restart(%{retries: n}) when n >= @max_retries do
-    {:stop, {:exhausted_retries, @max_retries}, %__MODULE__{}}
-  end
-
-  defp attempt_restart(%{retries: n} = state) do
-    delay = trunc(100 * :math.pow(2, n))
-    Process.send_after(self(), :do_restart, delay)
-    {:noreply, %{state | retries: n + 1}}
+    Supervisor.start_link(children, strategy: :one_for_one, name: PortDemo.Supervisor)
   end
 end
 ```
 
-### Step 2: `lib/api_gateway/middleware/log_tailer.ex`
-
-The LogTailer opens `tail -f` via a Port and fans out each new line to all subscribed processes.
-Subscribers are monitored with `Process.monitor/1` so dead subscribers are automatically
-removed from the fanout list without affecting the others.
+### Step 3: `lib/port_demo/worker.ex`
 
 ```elixir
-defmodule ApiGateway.Middleware.LogTailer do
+defmodule PortDemo.Worker do
   @moduledoc """
-  Follows a log file with `tail -f` and broadcasts each new line to subscribers.
-
-  Subscribers are monitored. When a subscriber process dies, it is removed
-  automatically from the fanout list without affecting the others.
+  GenServer wrapping an external process via `Port.open/2` in `:line` mode.
+  Serializes `send/2` requests and returns the next full line from stdout.
   """
   use GenServer
+  require Logger
 
-  # ---------------------------------------------------------------------------
-  # Public API
-  # ---------------------------------------------------------------------------
+  @type opt :: {:cmd, [String.t()]} | {:name, GenServer.name()}
 
+  @spec start_link([opt()]) :: GenServer.on_start()
   def start_link(opts) do
-    file_path  = Keyword.fetch!(opts, :file_path)
-    subscriber = Keyword.fetch!(opts, :subscriber)
-    GenServer.start_link(__MODULE__, {file_path, subscriber}, opts)
+    {name, opts} = Keyword.pop(opts, :name, __MODULE__)
+    GenServer.start_link(__MODULE__, opts, name: name)
   end
 
-  @spec subscribe(GenServer.server(), pid()) :: :ok
-  def subscribe(pid, subscriber), do: GenServer.call(pid, {:subscribe, subscriber})
-
-  @spec unsubscribe(GenServer.server(), pid()) :: :ok | {:error, :not_subscribed}
-  def unsubscribe(pid, subscriber), do: GenServer.call(pid, {:unsubscribe, subscriber})
-
-  @spec stop(GenServer.server()) :: :ok
-  def stop(pid), do: GenServer.stop(pid)
-
-  # ---------------------------------------------------------------------------
-  # GenServer lifecycle
-  # ---------------------------------------------------------------------------
+  @spec send(GenServer.server(), binary(), timeout()) :: {:ok, binary()} | {:error, term()}
+  def send(server \\ __MODULE__, payload, timeout \\ 5_000) do
+    GenServer.call(server, {:send, payload}, timeout)
+  end
 
   @impl true
-  def init({file_path, subscriber}) do
-    tail = System.find_executable("tail")
+  def init(opts) do
+    [exe | args] = Keyword.fetch!(opts, :cmd)
+    path = System.find_executable(exe) || raise "executable not found: #{exe}"
 
     port =
-      Port.open({:spawn_executable, tail}, [
-        :binary,
-        {:line, 4096},
-        args: ["-f", file_path]
-      ])
+      Port.open(
+        {:spawn_executable, path},
+        [
+          :binary,
+          :exit_status,
+          :stderr_to_stdout,
+          {:line, 8192},
+          {:args, args}
+        ]
+      )
 
-    ref = Process.monitor(subscriber)
-    {:ok, %{port: port, subscribers: %{subscriber => ref}}}
+    Process.flag(:trap_exit, true)
+    {:ok, %{port: port, waiting: :queue.new()}}
   end
 
-  # ---------------------------------------------------------------------------
-  # Callbacks
-  # ---------------------------------------------------------------------------
+  @impl true
+  def handle_call({:send, payload}, from, %{port: port, waiting: q} = state) do
+    Port.command(port, payload <> "\n")
+    {:noreply, %{state | waiting: :queue.in(from, q)}}
+  end
 
   @impl true
-  def handle_call({:subscribe, pid}, _from, state) do
-    if Map.has_key?(state.subscribers, pid) do
-      {:reply, :ok, state}
-    else
-      ref = Process.monitor(pid)
-      {:reply, :ok, %{state | subscribers: Map.put(state.subscribers, pid, ref)}}
+  def handle_info({port, {:data, {:eol, line}}}, %{port: port, waiting: q} = state) do
+    case :queue.out(q) do
+      {{:value, from}, q2} ->
+        GenServer.reply(from, {:ok, line})
+        {:noreply, %{state | waiting: q2}}
+
+      {:empty, _} ->
+        Logger.warning("unexpected stdout line, no waiter: #{inspect(line)}")
+        {:noreply, state}
     end
   end
 
   @impl true
-  def handle_call({:unsubscribe, pid}, _from, state) do
-    case Map.pop(state.subscribers, pid) do
-      {nil, _subs} ->
-        {:reply, {:error, :not_subscribed}, state}
-
-      {ref, new_subs} ->
-        Process.demonitor(ref, [:flush])
-        {:reply, :ok, %{state | subscribers: new_subs}}
-    end
+  def handle_info({port, {:exit_status, status}}, %{port: port, waiting: q} = state) do
+    Logger.error("external process exited with status #{status}")
+    for from <- :queue.to_list(q), do: GenServer.reply(from, {:error, {:exit, status}})
+    {:stop, {:port_exited, status}, state}
   end
 
   @impl true
-  def handle_info({port, {:data, {:eol, line}}}, %{port: port} = state) do
-    Enum.each(state.subscribers, fn {pid, _ref} ->
-      send(pid, {:new_line, line})
-    end)
-
-    {:noreply, state}
-  end
-
-  @impl true
-  def handle_info({:DOWN, ref, :process, pid, _reason}, state) do
-    new_subs = Map.reject(state.subscribers, fn {p, r} -> p == pid and r == ref end)
-    {:noreply, %{state | subscribers: new_subs}}
+  def handle_info({:EXIT, port, reason}, %{port: port} = state) do
+    {:stop, {:port_exit, reason}, state}
   end
 
   @impl true
   def terminate(_reason, %{port: port}) do
-    Port.close(port)
-  end
-end
-```
-
-### Step 3: Given tests — must pass without modification
-
-```elixir
-# test/api_gateway/middleware/ml_scorer_test.exs
-defmodule ApiGateway.Middleware.MlScorerTest do
-  use ExUnit.Case, async: false
-
-  @script Path.expand("../../../priv/scorer.py", __DIR__)
-
-  setup do
-    skip_if_no_python()
-    {:ok, pid} = ApiGateway.Middleware.MlScorer.start_link(script_path: @script)
-    {:ok, scorer: pid}
-  end
-
-  test "scores a low-risk request", %{scorer: scorer} do
-    assert {:ok, %{"score" => score, "risk" => "low"}} =
-             ApiGateway.Middleware.MlScorer.score(scorer, %{"action" => "score", "amount" => 50})
-
-    assert score < 0.7
-  end
-
-  test "scores a high-risk request", %{scorer: scorer} do
-    assert {:ok, %{"score" => score, "risk" => "high"}} =
-             ApiGateway.Middleware.MlScorer.score(scorer, %{"action" => "score", "amount" => 900})
-
-    assert score > 0.7
-  end
-
-  test "returns error for unknown action", %{scorer: scorer} do
-    assert {:ok, %{"error" => _}} =
-             ApiGateway.Middleware.MlScorer.score(scorer, %{"action" => "unknown"})
-  end
-
-  defp skip_if_no_python do
-    unless System.find_executable("python3") || System.find_executable("python") do
-      ExUnit.skip("python3 not found")
-    end
-  end
-end
-```
-
-### Step 4: `log_tailer_test.exs` — given tests
-
-```elixir
-# test/api_gateway/middleware/log_tailer_test.exs
-defmodule ApiGateway.Middleware.LogTailerTest do
-  use ExUnit.Case, async: false
-
-  alias ApiGateway.Middleware.LogTailer
-
-  @log_path "/tmp/test_gateway_#{:erlang.unique_integer([:positive])}.log"
-
-  setup do
-    File.write!(@log_path, "")
-
-    on_exit(fn -> File.rm(@log_path) end)
+    if Port.info(port), do: Port.close(port)
     :ok
   end
+end
+```
 
-  defp start_tailer do
-    {:ok, pid} =
-      LogTailer.start_link(file_path: @log_path, subscriber: self())
+### Step 4: `test/port_demo/worker_test.exs`
 
-    pid
+```elixir
+defmodule PortDemo.WorkerTest do
+  use ExUnit.Case, async: false
+
+  alias PortDemo.Worker
+
+  setup do
+    name = :"worker_#{System.unique_integer([:positive])}"
+    pid = start_supervised!({Worker, cmd: ~w(cat -u), name: name})
+    %{worker: name, pid: pid}
   end
 
-  test "delivers new log lines to the subscriber" do
-    skip_if_no_tail()
-    tailer = start_tailer()
-
-    Process.sleep(200)
-
-    File.write!(@log_path, "line one\n", [:append])
-    assert_receive {:new_line, "line one"}, 2_000
-
-    File.write!(@log_path, "line two\n", [:append])
-    assert_receive {:new_line, "line two"}, 2_000
-
-    LogTailer.stop(tailer)
+  test "echoes back the payload", %{worker: w} do
+    assert {:ok, "hello"} = Worker.send(w, "hello")
+    assert {:ok, "world"} = Worker.send(w, "world")
   end
 
-  test "additional subscriber receives lines after subscribe/2" do
-    skip_if_no_tail()
-    tailer = start_tailer()
-    other  = self()
-
-    Process.sleep(100)
-    LogTailer.subscribe(tailer, other)
-    Process.sleep(100)
-
-    File.write!(@log_path, "shared line\n", [:append])
-    assert_receive {:new_line, "shared line"}, 2_000
-
-    LogTailer.stop(tailer)
+  test "handles many rapid sends", %{worker: w} do
+    replies = for i <- 1..100, do: Worker.send(w, "msg-#{i}")
+    expected = for i <- 1..100, do: {:ok, "msg-#{i}"}
+    assert replies == expected
   end
 
-  test "dead subscriber is removed automatically" do
-    skip_if_no_tail()
-    tailer = start_tailer()
-
-    dead_sub = spawn(fn -> receive do: (:stop -> :ok) end)
-    LogTailer.subscribe(tailer, dead_sub)
-    Process.exit(dead_sub, :kill)
-    Process.sleep(100)
-
-    # Writing to the file must not crash the tailer
-    File.write!(@log_path, "after death\n", [:append])
-    assert_receive {:new_line, "after death"}, 2_000
-
-    LogTailer.stop(tailer)
-  end
-
-  defp skip_if_no_tail do
-    unless System.find_executable("tail") do
-      ExUnit.skip("tail not found on this system")
-    end
+  test "crashes cleanly when external dies", %{worker: w, pid: pid} do
+    Process.monitor(pid)
+    {:os_pid, os_pid} = Port.info(:sys.get_state(pid).port, :os_pid)
+    System.cmd("kill", ["-9", Integer.to_string(os_pid)])
+    assert_receive {:DOWN, _ref, :process, ^pid, {:port_exited, _}}, 2_000
   end
 end
 ```
 
-### Step 5: Run the tests
+---
 
-```bash
-mix test test/api_gateway/middleware/ml_scorer_test.exs --trace
-mix test test/api_gateway/middleware/log_tailer_test.exs --trace
+## Trade-offs and production gotchas
+
+**1. Zombie external processes.** If the GenServer dies and the external doesn't read stdin EOF, the process survives detached. Either write the helper to exit on EOF, or use `erlexec`.
+
+**2. Ordering assumption.** The line-buffered wrapper assumes the external responds in the same order requests arrived. True for `cat`, not for a multi-threaded Python service — you'd need per-request correlation IDs.
+
+**3. Partial lines.** `:line, N` truncates if a single line exceeds N bytes and delivers `{:noeol, data}` instead of `{:eol, data}`. Test with huge lines or raise N.
+
+**4. `:stderr_to_stdout` is lossy.** Interleaving stderr into stdout corrupts structured output. For JSON-over-stdout, keep stderr separate and log it — use `:stderr_to_stdout` only for human-readable CLIs.
+
+**5. Shell injection via `:spawn`.** `Port.open({:spawn, cmd_string}, ...)` goes through `/bin/sh -c`. **Never** use `:spawn` with user input. Always `{:spawn_executable, path}` + `{:args, list}`.
+
+**6. Backpressure hangs your GenServer.** If the external stalls reading stdin, `Port.command/2` blocks the GenServer, backing up `handle_call`. Consider `:nosuspend` + a send queue + timeout.
+
+**7. Restart storms.** If the external flaps (init → crash in 100ms), a Supervisor with `:permanent` will respawn indefinitely. Set `max_restarts: 3, max_seconds: 60` and tag the child.
+
+**8. When NOT to use this.** Short-lived, one-shot invocations — `System.cmd/3` is simpler and fine. Heavy binary protocols with complex framing — consider a NIF or Rustler instead. Sub-millisecond latency — the OS process boundary kills you.
+
+---
+
+## Performance notes
+
+Round-trip latency for a line-mode `cat -u`:
+
+```elixir
+:timer.tc(fn ->
+  for _ <- 1..10_000, do: Worker.send(:worker, "x")
+end)
 ```
 
----
+Typical: ~0.3–0.8 ms per round-trip on localhost Linux — dominated by pipe syscall overhead, not BEAM scheduling. Batching (write 1000 lines, read 1000 replies) drops per-op cost by 10×.
 
-## Trade-off analysis
-
-| Aspect | Port (line mode) | Port (packet N) | `System.cmd` |
-|--------|-----------------|-----------------|--------------|
-| Communication | Text lines | Framed binary | One-shot |
-| Suitable for | JSON-over-stdio protocols | Binary protocols | Quick commands |
-| Streaming | Yes | Yes | No |
-| Backpressure | None (OS pipe buffer) | None | N/A |
-| Latency per call | ~0.1ms IPC | ~0.1ms IPC | 100-300ms (spawn) |
-| Crash handling | Monitor Port, restart | Monitor Port, restart | Check exit code |
-
-Reflection: the ML scorer currently processes one request at a time. If you needed 50
-concurrent scoring requests, what would you change? Consider a pool of Ports vs. correlation
-IDs in a single Port vs. a `ConsumerSupervisor` pattern.
-
----
-
-## Common production mistakes
-
-**1. Spawning a new Port per request**
-OS process startup is 50-300ms. Opening a Port once and keeping it alive is the reason
-`MlScorer` is a GenServer. Never `Port.open` inside a request handler.
-
-**2. Not handling `{:exit_status, code}` in `handle_info`**
-When the OS process dies, the Port sends `{port, {:exit_status, code}}`. Without this
-clause, the GenServer does not know the process is gone and the next `send` to the port
-raises a `Port not open` error.
-
-**3. Not flushing stdout in the external process**
-If the Python script buffers its output (the default when stdout is not a TTY), the Port
-never receives data. Always call `flush=True` in `print()` or use `sys.stdout.flush()`.
-Node.js scripts need `process.stdout.write(...)` followed by synchronous drain.
-
-**4. Using `{:spawn, "cmd arg"}` instead of `{:spawn_executable, path}`**
-The first form invokes a shell (unsafe with user-controlled arguments). The second bypasses
-the shell and passes `args` as a list — safer and avoids shell injection.
-
-**5. Not cleaning up dead subscribers in the log tailer**
-Without `Process.monitor/1`, dead subscribers stay in the fanout list forever. Every
-`send/2` to a dead pid silently succeeds (messages go to the dead process's mailbox, which
-no longer exists), but the map grows without bound.
+For comparison, `System.cmd/3` spawning a fresh process takes 3–10 ms each due to `fork+exec`.
 
 ---
 
 ## Resources
 
-- [Port — Elixir docs](https://hexdocs.pm/elixir/Port.html)
-- [`:erlang.open_port/2` — Erlang docs](https://www.erlang.org/doc/man/erlang.html#open_port-2)
-- [Erlang in Anger — Ports and external processes](https://www.erlang-in-anger.com/)
-- [Porcelain — higher-level Port wrapper](https://github.com/alco/porcelain)
+- https://hexdocs.pm/elixir/Port.html — Port module reference
+- https://www.erlang.org/doc/man/erlang.html#open_port-2 — `erlang:open_port/2`
+- https://hexdocs.pm/erlexec/ — `:exec` library with proper signal handling
+- https://hexdocs.pm/porcelain/ — high-level wrapper (deprecated but pedagogically useful)
+- https://stuff-things.net/2016/05/24/elixir-ports/ — long-form Ports writeup
+- https://theerlangelist.com/article/outside_elixir — Saša Jurić on external processes
+- https://dashbit.co/blog/running-port-drivers-on-elixir — Dashbit on port lifecycle

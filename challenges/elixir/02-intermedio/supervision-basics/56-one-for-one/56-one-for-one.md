@@ -2,9 +2,6 @@
 
 **Project**: `one_for_one_demo` — three independent workers where a crash in one does not disturb the others.
 
-**Difficulty**: ★★☆☆☆
-**Estimated time**: 1–2 hours
-
 ---
 
 ## Project context
@@ -35,6 +32,11 @@ one_for_one_demo/
 
 ---
 
+
+## Why X and not Y
+
+- **Why not the other strategies?** Each encodes a different coupling assumption; picking the wrong one either over-restarts or under-restarts.
+
 ## Core concepts
 
 ### 1. "Only the crashed child" — nothing else moves
@@ -62,11 +64,35 @@ sending messages into a black hole. In that case either use `Registry`
 
 Even with `:one_for_one`, the supervisor tracks `max_restarts`/`max_seconds`
 across ALL children. If the *tree as a whole* restarts too many times, the
-supervisor itself dies. See exercise 59.
+supervisor itself dies. 
 
 ---
 
+## Design decisions
+
+**Option A — `:one_for_all`**
+- Pros: simpler upfront, fewer moving parts.
+- Cons: hides the trade-off that this exercise exists to teach.
+
+**Option B — `:one_for_one` (chosen)**
+- Pros: explicit about the semantic that matters in production.
+- Cons: one more concept to internalize.
+
+→ Chose **B** because children are independent; restarting siblings on one failure is unnecessary blast radius.
+
+
 ## Implementation
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defp deps do
+  [
+    # stdlib-only by default; add `{:benchee, "~> 1.3", only: :dev}` if you benchmark
+  ]
+end
+```
+
 
 ### Step 1: Create the project
 
@@ -207,6 +233,15 @@ mix test
 
 ---
 
+### Why this works
+
+The design leans on OTP primitives that already encode the invariants we care about (supervision, back-pressure, explicit message semantics), so failure modes are visible at the right layer instead of being reinvented ad-hoc. Tests exercise the edges (timeouts, crashes, boundary states), which is where hand-rolled alternatives silently drift over time.
+
+
+## Benchmark
+
+<!-- benchmark N/A: tema conceptual -->
+
 ## Trade-offs and production gotchas
 
 **1. Cached pids in siblings become stale on restart**
@@ -236,6 +271,11 @@ stages, or a parent-built lookup table that references pids. Use
 `:one_for_all` (exercise 57) or `:rest_for_one` (exercise 58) instead.
 
 ---
+
+
+## Reflection
+
+- Dá un caso donde `:one_for_one` parece correcto pero en realidad estás escondiendo un acoplamiento que debería romperse.
 
 ## Resources
 

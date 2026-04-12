@@ -4,8 +4,6 @@
 can inspect the resulting directory, run the `bin/mini_release` launcher,
 and understand what actually ships to production.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
 
 ---
 
@@ -58,6 +56,11 @@ _build/prod/rel/mini_release/
 
 ---
 
+
+## Why X and not Y
+
+- **Why not `mix run` in prod?** Ships Mix, ships your dev deps, requires Elixir installed, no bootscripts, no RPC — the opposite of what you want in prod.
+
 ## Core concepts
 
 ### 1. `mix release` vs `mix run`
@@ -99,7 +102,31 @@ launcher scripts).
 
 ---
 
+## Design decisions
+
+**Option A — Mix in production**
+- Pros: simpler upfront, fewer moving parts.
+- Cons: hides the trade-off that this exercise exists to teach.
+
+**Option B — `mix release` (chosen)**
+- Pros: explicit about the semantic that matters in production.
+- Cons: one more concept to internalize.
+
+→ Chose **B** because releases include ERTS and exclude Mix, giving reproducible, self-contained deploys.
+
+
 ## Implementation
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defp deps do
+  [
+    # stdlib-only by default; add `{:benchee, "~> 1.3", only: :dev}` if you benchmark
+  ]
+end
+```
+
 
 ### Step 1: Create the project
 
@@ -228,6 +255,20 @@ _build/prod/rel/mini_release/bin/mini_release eval "IO.puts MiniRelease.shout()"
 
 ---
 
+### Why this works
+
+The design leans on OTP primitives that already encode the invariants we care about (supervision, back-pressure, explicit message semantics), so failure modes are visible at the right layer instead of being reinvented ad-hoc. Tests exercise the edges (timeouts, crashes, boundary states), which is where hand-rolled alternatives silently drift over time.
+
+
+## Benchmark
+
+```elixir
+{us, _} = :timer.tc(fn -> hot_path() end)
+IO.puts("#{us} µs")
+```
+
+Target esperado: medición relevante según el hot path del módulo.
+
 ## Trade-offs and production gotchas
 
 **1. ERTS is platform-specific**
@@ -241,8 +282,7 @@ beams and pull in dev-only deps. Always set `MIX_ENV=prod` explicitly in CI.
 
 **3. Secrets do not belong in `sys.config`**
 Anything in `config.exs` ends up in plaintext inside the release tarball.
-Secrets belong in env vars read by `runtime.exs` — or in a config provider
-(see exercise 68).
+Secrets belong in env vars read by `runtime.exs` — or in a config provider.
 
 **4. `start_permanent: true` means the node halts if your app stops**
 In prod, that's what you want — a crashed top supervisor should bring the
@@ -255,6 +295,11 @@ on your dev machine are fine with `mix run`. Releases are for deployed
 services.
 
 ---
+
+
+## Reflection
+
+- Tu equipo quiere deployar con `mix run` en producción. Dá 3 razones concretas para migrar a releases.
 
 ## Resources
 

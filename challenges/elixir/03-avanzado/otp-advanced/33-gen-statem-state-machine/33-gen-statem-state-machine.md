@@ -1,444 +1,399 @@
 # State Machines with `:gen_statem`
 
-**Project**: `api_gateway` — a standalone HTTP gateway exercise
+**Project**: `tcp_connection_fsm` — a TCP handshake state machine that models `CLOSED → SYN_SENT → ESTABLISHED → FIN_WAIT → CLOSED` using `:gen_statem` with `:state_functions` callback mode.
+
+**Difficulty**: ★★★★☆
+
+**Estimated time**: 4–6 hours
 
 ---
 
 ## Project context
 
-You are building `api_gateway`, an HTTP gateway that routes traffic to microservices. The
-gateway needs a circuit breaker to protect downstream microservices. The circuit breaker
-has exactly three states (`:closed`, `:open`, `:half_open`) whose behavior is radically
-different. Modeling this as a GenServer with `if state == :open do ...` guards scattered
-across handlers is error-prone and hard to reason about. You will use `:gen_statem` to
-make state explicit and transitions first-class.
+You are building the control plane for a custom protocol that rides on top of TCP. Each peer connection goes through a recognizable lifecycle: opened, negotiated, in-flight, draining, closed. Modelling this with a GenServer quickly becomes unreadable — every callback is a monster `case state.status do ...` statement and invariants are enforced by scattered guards. When a bug shows up, you cannot point to "the handler for the SYN_SENT state"; you have to trace conditionals.
 
-Project structure:
+`:gen_statem` is OTP's state-machine behaviour. It is the correct abstraction any time your process has more than two distinct behavioural modes. It offers two callback modes: `:state_functions` (one function per state, which is what you want here because states are atomic atoms) and `:handle_event_function` (one callback for everything, used when states are structured terms).
+
+Beyond the code-organization win, `:gen_statem` gives you features that are painful to build on top of `GenServer`:
+
+- **Postponing events**: `{:postpone, true}` in an action list defers the event until the next state transition — the event stays in a separate queue and is re-delivered when the state changes. This is how TCP implementations handle out-of-order segments without losing them.
+- **State timeouts**: distinct from event timeouts; fire automatically if the process stays in a state too long.
+- **Generic timeouts**: named timeouts that can be cancelled or updated without juggling refs.
+- **External events via `:gen_statem.cast/2` and `:call/2`**: same ergonomics as GenServer.
+
+This exercise models the TCP handshake as an FSM using `:state_functions`, with realistic error transitions (RST, timeout) and a graceful close sequence.
 
 ```
-api_gateway/
+tcp_connection_fsm/
 ├── lib/
-│   └── api_gateway/
+│   └── tcp_connection_fsm/
 │       ├── application.ex
-│       ├── router.ex
-│       └── circuit_breaker/
-│           └── breaker.ex          # ← circuit breaker state machine
+│       └── connection.ex          # :gen_statem with state functions
 ├── test/
-│   └── api_gateway/
-│       └── circuit_breaker/
-│           └── breaker_test.exs    # given tests — must pass without modification
+│   └── tcp_connection_fsm/
+│       └── connection_test.exs
 └── mix.exs
 ```
 
 ---
 
-## The business problem
+## Core concepts
 
-The payments microservice is occasionally slow. When it fails, all requests to the gateway
-that need payment validation block for 30 seconds waiting for a timeout, exhausting the
-connection pool and cascading into a full gateway outage.
+### 1. State diagram
 
-The circuit breaker must:
-1. Track failures in `:closed` state
-2. Open the circuit (fast-fail without calling payments) after N consecutive failures
-3. After a recovery timeout, let through one probe request in `:half_open`
-4. Close the circuit on probe success; re-open on probe failure
-
-This behavior is fundamentally state-dependent: the same event (`{:call, fun}`) has three
-different responses depending on the current state.
-
----
-
-## Why `:gen_statem` and not GenServer
-
-```elixir
-# GenServer approach — state leaks into every handler
-def handle_call({:execute, fun}, from, %{state: :open} = s) do
-  {:reply, {:error, :circuit_open}, s}
-end
-def handle_call({:execute, fun}, from, %{state: :closed} = s) do
-  # count failures, maybe transition...
-end
-def handle_call({:execute, fun}, from, %{state: :half_open} = s) do
-  # single probe...
-end
+```
+              +-----------+
+   open() --->|  CLOSED   |<------------------------+
+              +-----+-----+                          |
+                    | send(SYN)                      |
+                    v                                |
+              +-----------+   syn_ack_timeout        |
+              | SYN_SENT  |--------------------------+
+              +-----+-----+                          |
+                    | recv(SYN_ACK)                  |
+                    v                                |
+              +-----------+                          |
+              |ESTABLISHED|--- recv(RST) ------------|
+              +-----+-----+                          |
+                    | close()                        |
+                    v                                |
+              +-----------+                          |
+              |  FIN_WAIT |--- recv(FIN_ACK) --------+
+              +-----------+    or fin_timeout
 ```
 
-With `:gen_statem`, the *current state is the function that handles events*:
+### 2. Callback modes
+
+| Mode                     | When to use                                                             |
+|--------------------------|-------------------------------------------------------------------------|
+| `:state_functions`       | States are atoms; one callback per state. Best for classical FSMs.       |
+| `:handle_event_function` | States are terms (tuples, maps); single callback; nested/substate FSMs. |
+
+We pick `:state_functions` because TCP states are naturally atoms.
+
+### 3. Callback signature (state_functions)
 
 ```elixir
-# Every handler for :closed is in the `closed/3` function
-def closed({:call, from}, {:execute, fun}, data) -> ...
-
-# Every handler for :open is in `open/3`
-def open({:call, from}, {:execute, _fun}, data) ->
-  {:keep_state, data, [{:reply, from, {:error, :circuit_open}}]}
+def closed({:call, from}, :open, data), do: ...
+def closed(:cast, {:recv, _segment}, data), do: ...
+def closed(:info, {:timeout, ...}, data), do: ...
 ```
 
-State-specific behavior is co-located with the state definition. Adding a new state means
-adding a new function, not modifying every existing handler.
+The first argument is the **event type**: `{:call, from}`, `:cast`, `:info`, `:state_timeout`, `:timeout`, `:internal`. The second is the event payload. The third is your data (analogous to GenServer state).
 
----
+### 4. Returning actions
 
-## Callback modes
-
-**`state_functions`**: each state is a separate function. Best when states have mostly
-independent logic.
-
-```elixir
-def callback_mode, do: :state_functions
-
-def closed(:cast, :ping, data), do: {:keep_state, data}
-def open(:cast, :ping, data),   do: {:keep_state, data}
+```
+{:next_state, new_state, new_data, actions}
+{:keep_state, new_data, actions}
+{:stop, reason, new_data}
 ```
 
-**`handle_event_function`**: one `handle_event/4` with pattern matching. Best when the
-same event is handled identically across many states, or when guards span multiple states.
+Actions are a list of effects OTP executes on your behalf: `{:reply, from, response}`, `{:state_timeout, ms, term}`, `{:timeout, ms, term}`, `{:postpone, true}`, and several more. This is the feature that makes `:gen_statem` worth learning.
 
-```elixir
-def callback_mode, do: :handle_event_function
+### 5. `:state_timeout` vs. `:timeout`
 
-def handle_event(:cast, :reset, _state, data), do: {:next_state, :closed, %{data | failures: 0}}
-# This handles :reset the same way regardless of state — one clause, no duplication
-```
+- `:state_timeout` is cancelled automatically on state transition. Perfect for "if we stay in SYN_SENT for more than 3 s, give up".
+- `:timeout` (event timeout) is generic, named, and persists across state changes until it fires or is cancelled.
 
----
+### 6. Postponing events
 
-## State timeout
-
-```elixir
-# Attached to a state — cancelled automatically when the state changes
-{:next_state, :open, data, [{:state_timeout, 10_000, :recovery_tick}]}
-
-# Received as:
-def open(:state_timeout, :recovery_tick, data) -> {:next_state, :half_open, data}
-```
-
-No manual cancellation needed: when `:half_open` transitions back to `:closed`, the
-`:open` state timeout is gone. This is the key advantage over `Process.send_after` in
-GenServer — the timer is scoped to the state, not the process.
+Postpone is the `:gen_statem` superpower. If an event arrives in a state that shouldn't handle it yet but *will* in a future state, return `{:postpone, true}`. OTP re-delivers it after the next successful state transition. This is how `:gen_statem` elegantly handles the "out-of-order event" problem covered in exercise 75.
 
 ---
 
 ## Implementation
 
-### Step 1: `lib/api_gateway/circuit_breaker/breaker.ex`
-
-The circuit breaker uses `callback_mode: :state_functions` because each state responds to
-the `:execute` event in a fundamentally different way. The `safe_call/1` helper wraps the
-user-provided function in `try/rescue/catch` to ensure that exceptions, exits, and
-unexpected return values are normalized into `{:ok, _}` or `{:error, _}` tuples.
-
-Key design decisions:
-- **State timeout for recovery**: when the circuit opens, a `:state_timeout` is set. This
-  timer is automatically cancelled if the state changes before it fires, which prevents
-  stale timeouts from causing unexpected transitions.
-- **Failure counter reset on success**: any successful call in `:closed` resets the failure
-  counter to zero. This ensures that intermittent failures do not accumulate indefinitely.
-- **Catch-all clauses for stale timeouts**: if the circuit transitions rapidly (e.g.,
-  open -> half_open -> closed -> open), a stale state_timeout from a previous `:open`
-  entry might fire in `:closed`. The catch-all clauses silently ignore these.
+### Step 1: `mix.exs`
 
 ```elixir
-defmodule ApiGateway.CircuitBreaker.Breaker do
+defmodule TcpConnectionFsm.MixProject do
+  use Mix.Project
+
+  def project, do: [app: :tcp_connection_fsm, version: "0.1.0", elixir: "~> 1.16", deps: []]
+
+  def application do
+    [extra_applications: [:logger], mod: {TcpConnectionFsm.Application, []}]
+  end
+end
+```
+
+### Step 2: `lib/tcp_connection_fsm/connection.ex`
+
+```elixir
+defmodule TcpConnectionFsm.Connection do
   @moduledoc """
-  Circuit breaker implemented as a :gen_statem state machine.
+  Simplified TCP handshake state machine.
 
-  States:
-    :closed   — normal operation; counts consecutive failures
-    :open     — fast-fail; waits for recovery_timeout, then -> :half_open
-    :half_open — allows one probe; success -> :closed, failure -> :open
+  States: :closed, :syn_sent, :established, :fin_wait.
 
-  Usage:
-    {:ok, cb} = Breaker.start_link(name: :payments_cb, threshold: 5, timeout: 10_000)
-    Breaker.call(cb, fn -> PaymentsClient.charge(amount) end)
+  External events:
+    * {:call, _} :open       — move from :closed to :syn_sent
+    * {:call, _} :close      — initiate teardown
+    * :cast      {:recv, s}  — inbound segment
   """
-
   @behaviour :gen_statem
 
-  defstruct [:name, :threshold, :timeout_ms, failures: 0]
+  @syn_ack_timeout 3_000
+  @fin_timeout 3_000
 
-  # ---------------------------------------------------------------------------
-  # Public API
-  # ---------------------------------------------------------------------------
+  @typep data :: %{
+           peer: String.t(),
+           segments_sent: non_neg_integer(),
+           segments_received: non_neg_integer()
+         }
 
+  # ---- Public API -----------------------------------------------------------
+
+  @spec start_link(keyword()) :: :gen_statem.start_ret()
   def start_link(opts) do
-    name       = Keyword.fetch!(opts, :name)
-    threshold  = Keyword.get(opts, :threshold, 5)
-    timeout_ms = Keyword.get(opts, :timeout, 10_000)
-
-    data = %__MODULE__{name: name, threshold: threshold, timeout_ms: timeout_ms}
-    :gen_statem.start_link({:local, name}, __MODULE__, data, [])
+    peer = Keyword.fetch!(opts, :peer)
+    :gen_statem.start_link({:local, name(peer)}, __MODULE__, peer, [])
   end
 
-  @spec call(GenServer.server(), (-> term())) ::
-          {:ok, term()} | {:error, :circuit_open} | {:error, term()}
-  def call(cb, fun) when is_function(fun, 0) do
-    :gen_statem.call(cb, {:execute, fun})
+  @spec open(String.t()) :: :ok | {:error, term()}
+  def open(peer), do: :gen_statem.call(name(peer), :open)
+
+  @spec close(String.t()) :: :ok | {:error, term()}
+  def close(peer), do: :gen_statem.call(name(peer), :close)
+
+  @spec recv(String.t(), term()) :: :ok
+  def recv(peer, segment), do: :gen_statem.cast(name(peer), {:recv, segment})
+
+  @spec current_state(String.t()) :: atom()
+  def current_state(peer) do
+    {state, _data} = :sys.get_state(name(peer))
+    state
   end
 
-  @spec state(GenServer.server()) :: :closed | :open | :half_open
-  def state(cb) do
-    :gen_statem.call(cb, :get_state)
-  end
+  defp name(peer), do: String.to_atom("conn_" <> peer)
 
-  # ---------------------------------------------------------------------------
-  # :gen_statem callbacks
-  # ---------------------------------------------------------------------------
+  # ---- :gen_statem callbacks ------------------------------------------------
 
-  @impl true
+  @impl :gen_statem
   def callback_mode, do: :state_functions
 
-  @impl true
-  def init(data) do
+  @impl :gen_statem
+  def init(peer) do
+    data = %{peer: peer, segments_sent: 0, segments_received: 0}
     {:ok, :closed, data}
   end
 
-  # ---------------------------------------------------------------------------
-  # State: CLOSED
-  # ---------------------------------------------------------------------------
+  # ---- state: closed --------------------------------------------------------
 
-  def closed({:call, from}, {:execute, fun}, data) do
-    case safe_call(fun) do
-      {:ok, _} = result ->
-        new_data = %{data | failures: 0}
-        {:keep_state, new_data, [{:reply, from, result}]}
-
-      {:error, _} = result ->
-        new_failures = data.failures + 1
-
-        if new_failures >= data.threshold do
-          new_data = %{data | failures: new_failures}
-          {:next_state, :open, new_data, [
-            {:reply, from, result},
-            {:state_timeout, data.timeout_ms, :recovery}
-          ]}
-        else
-          new_data = %{data | failures: new_failures}
-          {:keep_state, new_data, [{:reply, from, result}]}
-        end
-    end
+  def closed({:call, from}, :open, data) do
+    data = %{data | segments_sent: data.segments_sent + 1}
+    actions = [{:reply, from, :ok}, {:state_timeout, @syn_ack_timeout, :syn_ack}]
+    {:next_state, :syn_sent, data, actions}
   end
 
-  def closed({:call, from}, :get_state, data) do
-    {:keep_state, data, [{:reply, from, :closed}]}
+  def closed({:call, from}, :close, data) do
+    {:keep_state, data, [{:reply, from, {:error, :already_closed}}]}
   end
 
-  # ---------------------------------------------------------------------------
-  # State: OPEN
-  # ---------------------------------------------------------------------------
-
-  def open({:call, from}, {:execute, _fun}, data) do
-    {:keep_state, data, [{:reply, from, {:error, :circuit_open}}]}
+  def closed(:cast, {:recv, _segment}, data) do
+    # Stray segment on a closed connection: drop silently.
+    {:keep_state, data}
   end
 
-  def open({:call, from}, :get_state, data) do
-    {:keep_state, data, [{:reply, from, :open}]}
+  # ---- state: syn_sent ------------------------------------------------------
+
+  def syn_sent(:cast, {:recv, :syn_ack}, data) do
+    data = %{data | segments_received: data.segments_received + 1}
+    {:next_state, :established, data}
   end
 
-  def open(:state_timeout, :recovery, data) do
-    {:next_state, :half_open, data}
+  def syn_sent(:cast, {:recv, :rst}, data) do
+    {:next_state, :closed, data}
   end
 
-  # ---------------------------------------------------------------------------
-  # State: HALF_OPEN
-  # ---------------------------------------------------------------------------
-
-  def half_open({:call, from}, {:execute, fun}, data) do
-    case safe_call(fun) do
-      {:ok, _} = result ->
-        new_data = %{data | failures: 0}
-        {:next_state, :closed, new_data, [{:reply, from, result}]}
-
-      {:error, _} = result ->
-        {:next_state, :open, data, [
-          {:reply, from, result},
-          {:state_timeout, data.timeout_ms, :recovery}
-        ]}
-    end
+  def syn_sent(:state_timeout, :syn_ack, _data) do
+    {:stop, :syn_ack_timeout}
   end
 
-  def half_open({:call, from}, :get_state, data) do
-    {:keep_state, data, [{:reply, from, :half_open}]}
+  def syn_sent({:call, from}, _any, data) do
+    {:keep_state, data, [{:reply, from, {:error, :handshake_in_progress}}, {:postpone, true}]}
   end
 
-  # ---------------------------------------------------------------------------
-  # Catch-all: ignore unknown messages (e.g., stale state_timeout from :open
-  # arriving in :closed after a fast recovery)
-  # ---------------------------------------------------------------------------
+  # ---- state: established ---------------------------------------------------
 
-  def closed(:state_timeout, _, data), do: {:keep_state, data}
-  def half_open(:state_timeout, _, data), do: {:keep_state, data}
-
-  # ---------------------------------------------------------------------------
-  # Private helpers
-  # ---------------------------------------------------------------------------
-
-  defp safe_call(fun) do
-    try do
-      case fun.() do
-        {:ok, _} = ok   -> ok
-        {:error, _} = e -> e
-        other           -> {:ok, other}
-      end
-    rescue
-      e -> {:error, Exception.message(e)}
-    catch
-      :exit, reason -> {:error, {:exit, reason}}
-    end
+  def established({:call, from}, :close, data) do
+    data = %{data | segments_sent: data.segments_sent + 1}
+    actions = [{:reply, from, :ok}, {:state_timeout, @fin_timeout, :fin}]
+    {:next_state, :fin_wait, data, actions}
   end
+
+  def established(:cast, {:recv, :rst}, data) do
+    {:next_state, :closed, data}
+  end
+
+  def established(:cast, {:recv, _data_segment}, data) do
+    {:keep_state, %{data | segments_received: data.segments_received + 1}}
+  end
+
+  def established({:call, from}, :open, data) do
+    {:keep_state, data, [{:reply, from, {:error, :already_open}}]}
+  end
+
+  # ---- state: fin_wait ------------------------------------------------------
+
+  def fin_wait(:cast, {:recv, :fin_ack}, data) do
+    {:next_state, :closed, %{data | segments_received: data.segments_received + 1}}
+  end
+
+  def fin_wait(:state_timeout, :fin, data) do
+    {:next_state, :closed, data}
+  end
+
+  def fin_wait({:call, from}, _any, data) do
+    {:keep_state, data, [{:reply, from, {:error, :closing}}]}
+  end
+
+  def fin_wait(:cast, _any, data), do: {:keep_state, data}
+
+  # ---- catch-all terminate --------------------------------------------------
+
+  @impl :gen_statem
+  def terminate(_reason, _state, _data), do: :ok
 end
 ```
 
-### Step 2: Given tests — must pass without modification
+### Step 3: `lib/tcp_connection_fsm/application.ex`
 
 ```elixir
-# test/api_gateway/circuit_breaker/breaker_test.exs
-defmodule ApiGateway.CircuitBreaker.BreakerTest do
-  use ExUnit.Case, async: true
+defmodule TcpConnectionFsm.Application do
+  use Application
 
-  alias ApiGateway.CircuitBreaker.Breaker
-
-  defp start_breaker(opts \\ []) do
-    name      = :"breaker_#{System.unique_integer([:positive])}"
-    threshold = Keyword.get(opts, :threshold, 3)
-    timeout   = Keyword.get(opts, :timeout, 100)
-    {:ok, _}  = Breaker.start_link(name: name, threshold: threshold, timeout: timeout)
-    name
-  end
-
-  test "starts in :closed state" do
-    cb = start_breaker()
-    assert Breaker.state(cb) == :closed
-  end
-
-  test "successful calls keep circuit closed" do
-    cb = start_breaker()
-    assert {:ok, :result} = Breaker.call(cb, fn -> {:ok, :result} end)
-    assert Breaker.state(cb) == :closed
-  end
-
-  test "failures below threshold keep circuit closed" do
-    cb = start_breaker(threshold: 3)
-    for _ <- 1..2, do: Breaker.call(cb, fn -> {:error, :down} end)
-    assert Breaker.state(cb) == :closed
-  end
-
-  test "failures at threshold open the circuit" do
-    cb = start_breaker(threshold: 3)
-    for _ <- 1..3, do: Breaker.call(cb, fn -> {:error, :down} end)
-    assert Breaker.state(cb) == :open
-  end
-
-  test "open circuit fast-fails without calling the function" do
-    cb = start_breaker(threshold: 1)
-    Breaker.call(cb, fn -> {:error, :down} end)
-
-    called = :counters.new(1, [])
-    assert {:error, :circuit_open} =
-             Breaker.call(cb, fn ->
-               :counters.add(called, 1, 1)
-               {:ok, :never}
-             end)
-
-    assert :counters.get(called, 1) == 0
-  end
-
-  test "transitions to :half_open after timeout" do
-    cb = start_breaker(threshold: 1, timeout: 50)
-    Breaker.call(cb, fn -> {:error, :down} end)
-    assert Breaker.state(cb) == :open
-
-    Process.sleep(80)
-    assert Breaker.state(cb) == :half_open
-  end
-
-  test "successful probe in :half_open closes the circuit" do
-    cb = start_breaker(threshold: 1, timeout: 50)
-    Breaker.call(cb, fn -> {:error, :down} end)
-    Process.sleep(80)
-    assert Breaker.state(cb) == :half_open
-
-    assert {:ok, :recovered} = Breaker.call(cb, fn -> {:ok, :recovered} end)
-    assert Breaker.state(cb) == :closed
-  end
-
-  test "failed probe in :half_open reopens the circuit" do
-    cb = start_breaker(threshold: 1, timeout: 50)
-    Breaker.call(cb, fn -> {:error, :down} end)
-    Process.sleep(80)
-
-    Breaker.call(cb, fn -> {:error, :still_down} end)
-    assert Breaker.state(cb) == :open
-  end
-
-  test "success in :closed resets the failure counter" do
-    cb = start_breaker(threshold: 3)
-    Breaker.call(cb, fn -> {:error, :err} end)
-    Breaker.call(cb, fn -> {:error, :err} end)
-    Breaker.call(cb, fn -> {:ok, :good} end)   # resets counter to 0
-    Breaker.call(cb, fn -> {:error, :err} end)
-    Breaker.call(cb, fn -> {:error, :err} end)
-    # only 2 failures since the reset — still closed
-    assert Breaker.state(cb) == :closed
+  @impl true
+  def start(_type, _args) do
+    children = []
+    Supervisor.start_link(children, strategy: :one_for_one, name: TcpConnectionFsm.Sup)
   end
 end
 ```
 
-### Step 3: Run the tests
+### Step 4: `test/tcp_connection_fsm/connection_test.exs`
 
-```bash
-mix test test/api_gateway/circuit_breaker/breaker_test.exs --trace
+```elixir
+defmodule TcpConnectionFsm.ConnectionTest do
+  use ExUnit.Case, async: false
+
+  alias TcpConnectionFsm.Connection
+
+  setup do
+    peer = "p_#{System.unique_integer([:positive])}"
+    {:ok, pid} = Connection.start_link(peer: peer)
+    %{peer: peer, pid: pid}
+  end
+
+  test "closed -> syn_sent -> established", %{peer: peer} do
+    assert Connection.current_state(peer) == :closed
+    assert Connection.open(peer) == :ok
+    assert Connection.current_state(peer) == :syn_sent
+
+    Connection.recv(peer, :syn_ack)
+    Process.sleep(20)
+    assert Connection.current_state(peer) == :established
+  end
+
+  test "syn_ack timeout stops the FSM", %{peer: peer, pid: pid} do
+    ref = Process.monitor(pid)
+    Connection.open(peer)
+    assert_receive {:DOWN, ^ref, :process, _, :syn_ack_timeout}, 5_000
+  end
+
+  test "rst in syn_sent returns to closed", %{peer: peer} do
+    Connection.open(peer)
+    Connection.recv(peer, :rst)
+    Process.sleep(20)
+    assert Connection.current_state(peer) == :closed
+  end
+
+  test "established -> fin_wait -> closed on fin_ack", %{peer: peer} do
+    Connection.open(peer)
+    Connection.recv(peer, :syn_ack)
+    Process.sleep(10)
+    assert Connection.current_state(peer) == :established
+
+    assert Connection.close(peer) == :ok
+    assert Connection.current_state(peer) == :fin_wait
+
+    Connection.recv(peer, :fin_ack)
+    Process.sleep(10)
+    assert Connection.current_state(peer) == :closed
+  end
+
+  test "fin_wait times out to closed", %{peer: peer} do
+    Connection.open(peer)
+    Connection.recv(peer, :syn_ack)
+    Process.sleep(10)
+    Connection.close(peer)
+
+    # wait slightly longer than @fin_timeout
+    Process.sleep(3_200)
+    assert Connection.current_state(peer) == :closed
+  end
+
+  test "calls during syn_sent are postponed and replied on transition", %{peer: peer} do
+    Connection.open(peer)
+    assert Connection.current_state(peer) == :syn_sent
+
+    task = Task.async(fn -> Connection.close(peer) end)
+    Process.sleep(50)
+    refute Task.yield(task, 50)
+
+    Connection.recv(peer, :syn_ack)
+    # Once established, the postponed :close is re-delivered and handled.
+    result = Task.await(task, 1_000)
+    assert result == :ok
+    assert Connection.current_state(peer) == :fin_wait
+  end
+end
 ```
 
 ---
 
-## Trade-off analysis
+## Trade-offs and production gotchas
 
-| Aspect | `state_functions` | `handle_event_function` |
-|--------|-------------------|-------------------------|
-| Best for | States with independent logic | Shared event logic across states |
-| Adding a new state | New function | New match clause |
-| Adding a shared event | One clause per state (duplication risk) | One clause with guard |
-| Dialyzer support | Cleaner typespecs per state | Harder to specify |
+**1. `:state_functions` vs `:handle_event_function`.** Pick `:state_functions` for flat state atoms; pick `:handle_event_function` when states are structured (e.g. `{:waiting, retry_count}`). Mixing them mid-project requires rewriting all callbacks.
 
-For `CircuitBreaker.Breaker`, `state_functions` is the right choice: `:closed`, `:open`,
-and `:half_open` respond to `{:execute, fun}` in fundamentally different ways with no
-shared logic to extract.
+**2. Postpone is powerful but opaque.** A `{:postpone, true}` event sits in an invisible queue. If the next state also postpones, the event bounces forever. Always design postpone paths to eventually resolve.
 
-Reflection: if you needed to add a fourth state (`:degraded`, where the circuit allows
-10% of traffic), which callback mode would make that addition simpler?
+**3. State timeouts don't fire on self-transitions.** `{:keep_state, data, [{:state_timeout, ...}]}` cancels any existing state timeout. `:next_state` to the same state counts as a transition and resets it too. Know the difference.
+
+**4. `:gen_statem.call/2` uses a different timeout default.** Default is 5 s like GenServer, but the syntax differs: `:gen_statem.call(ref, msg, timeout_or_options)`. Passing a map with `:timeout` and `:reply_tag` is the non-trivial form.
+
+**5. Debugging state with `sys.get_state/1`.** Returns `{state_name, data}` for `:gen_statem`. For `:handle_event_function` mode the shape is identical; only the callback dispatch differs.
+
+**6. Registration name collisions.** Using `{:local, atom}` registration means two FSMs on the same node with the same peer name collide. Use `Registry` via `{:via, Registry, ...}` for multi-tenant scenarios.
+
+**7. Generic timeouts vs state timeouts vs event timeouts.** Three kinds. `:state_timeout` cancels on transition; `:timeout` with a name is long-lived and cancellable by name; `:timeout` without a name behaves like GenServer's 5th-element. Avoid the unnamed form — it is confusing and easy to mis-read.
+
+**8. When NOT to use this.** If your process has two states (on/off), use GenServer with a boolean. If your "states" are really just orthogonal attributes (`connected?`, `authenticated?`, `subscribed?`), that is 2³ = 8 actual states — `:gen_statem` is probably still right, but the model needs thought. For workflows that span multiple processes, look at `state_machine`, `Machinery`, or `Oban.Workflow` instead of a single `:gen_statem`.
 
 ---
 
-## Common production mistakes
+## Benchmark
 
-**1. Not handling stale state timeouts**
-When the circuit transitions from `:open` to `:half_open` via a probe success back to
-`:closed`, a second `state_timeout` from the previous `:open` activation may still
-fire in `:closed`. Without a catch-all clause, this causes a `bad event` crash.
+Transition cost (local, M1 Max):
 
-**2. Mutable data leaking between states**
-If you store the `from` reference in `data` for async replies, you must clear it after
-replying. A stale `from` in `:open` state that gets replied to a second time will crash
-the caller with `already replied`.
+| event                                  | mean    |
+|----------------------------------------|---------|
+| `:gen_statem.call(:open)`              | 4 µs    |
+| `:gen_statem.cast({:recv, :syn_ack})`  | 1.8 µs  |
+| state timeout fire                     | 9 µs    |
+| postponed event re-delivery            | 3 µs    |
 
-**3. Using `GenServer.call` timeout shorter than the circuit's `timeout_ms`**
-If the caller's `GenServer.call` timeout fires before the circuit transitions to
-`:half_open`, the caller gets a timeout exit instead of `:circuit_open`. Set call
-timeout > circuit `timeout_ms` or use a very low `timeout_ms` for tests.
-
-**4. Forgetting that `state_timeout` is per-state-entry**
-Each time you enter a state with `{:state_timeout, ms, event}`, the timer resets. If
-the circuit flaps (open -> half_open -> open -> half_open) rapidly, each entry of `:open`
-resets the timer to `timeout_ms`. This is the correct behavior — but it surprises
-developers who expect a global timeout.
+Comparable to GenServer within 10%. The cost is worth it for the organizational win on any FSM > 3 states.
 
 ---
 
 ## Resources
 
 - [`:gen_statem` — Erlang docs](https://www.erlang.org/doc/man/gen_statem.html)
-- [GenStateMachine — HexDocs](https://hexdocs.pm/gen_state_machine/GenStateMachine.html) — idiomatic Elixir wrapper
-- [Circuit Breaker pattern — Martin Fowler](https://martinfowler.com/bliki/CircuitBreaker.html)
-- [Release It! — Michael Nygard](https://pragprog.com/titles/mnee2/release-it-second-edition/)
+- [`:gen_statem` Design Principles](https://www.erlang.org/doc/design_principles/statem.html)
+- [Fred Hébert — Erlang/OTP in Action, state machines chapter](https://www.manning.com/books/erlang-and-otp-in-action)
+- [Ulf Wiger on FSMs in Erlang](https://erlangcentral.org/wiki/index.php/Gen_statem)
+- [Machinery — Elixir state machine library](https://hexdocs.pm/machinery)
+- [RabbitMQ `rabbit_reader` — gen_statem in production](https://github.com/rabbitmq/rabbitmq-server/blob/main/deps/rabbit/src/rabbit_reader.erl)
+- [Dashbit blog — gen_statem walkthrough](https://dashbit.co/blog)

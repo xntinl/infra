@@ -1,491 +1,531 @@
-# Cache Layer with ETS, TTL, and LRU Eviction
+# Build a full cache server: TTL, LRU, eviction, telemetry, sharding
 
-## Overview
+**Project**: `cache_server_full` — a production-grade in-memory cache with TTL, approximate LRU eviction, telemetry hooks, and optional sharding across N tables.
 
-Build a shared cache layer for an HTTP API gateway using ETS with TTL-based expiration
-and LRU eviction. The cache allows concurrent reads without serializing through a single
-process, expires entries automatically, and evicts the least recently used entry when
-memory pressure is reached.
+**Difficulty**: ★★★★☆
+**Estimated time**: 3–6 hours
 
-Project structure:
+---
+
+## Project context
+
+Across the previous ETS exercises you've seen each technique in isolation: concurrent flags (16),
+counter primitives (20), cache patterns (19). This is the capstone where you assemble them into
+a single component that a real service could depend on.
+
+The goal: a `CacheServer.start_link/1` that accepts `max_size`, `ttl_ms`, `shards`, and a
+`telemetry_prefix`, and exposes `get/1`, `put/2`, `put/3`, `delete/1`, `size/0`. The cache must
+be safe under high concurrency, evict the oldest entries when `size > max_size` (approximate LRU),
+and emit `:telemetry` events for hit/miss/eviction so operators can dashboard it.
+
+This is the shape you'd expect from a library like Cachex or Nebulex, minus the 2k-line general
+framework. You keep only the features your service needs, which is the pragmatic production
+choice.
 
 ```
-api_gateway/
+cache_server_full/
 ├── lib/
-│   └── api_gateway/
+│   └── cache_server_full/
 │       ├── application.ex
-│       └── cache/
-│           ├── server.ex               # GenServer that owns the ETS table
-│           ├── lru.ex                  # LRU order tracking
-│           └── ttl_expirer.ex          # periodic sweep of expired entries
+│       ├── cache.ex
+│       ├── shard.ex
+│       ├── janitor.ex
+│       └── telemetry.ex
 ├── test/
-│   └── api_gateway/
-│       └── cache_test.exs
-├── bench/
-│   └── cache_bench.exs
+│   └── cache_test.exs
 └── mix.exs
 ```
 
 ---
 
-## The business problem
+## Core concepts
 
-An internal API gateway routes traffic to downstream microservices. The payments service
-receives identical exchange-rate lookups thousands of times per minute, but rates change
-at most once per minute. The cache must:
+### 1. Sharding for contention reduction
 
-1. Return cached values in O(1) without serializing through a single process
-2. Expire entries automatically -- values must not be served stale beyond their TTL
-3. Evict the least recently used entry when a fixed size limit is reached
-4. Never grow unbounded -- the system runs 24/7
-
----
-
-## Why reads bypass the GenServer
-
-A GenServer holding a map serializes all operations through a single mailbox. Under load,
-read latency climbs proportionally to backlog.
-
-ETS with `:protected` and `read_concurrency: true` allows concurrent reads without touching
-the GenServer process:
+A single ETS table under very high write contention bottlenecks on its lock regions. Splitting
+into N tables keyed by `:erlang.phash2(key, N)` multiplies throughput by roughly N (up to
+scheduler count). Each shard is an independent ETS table with its own `write_concurrency` set.
 
 ```
-request A ──ets:lookup──> ETS table  (concurrent, no serialization)
-request B ──ets:lookup──> ETS table
-request C ──ets:lookup──> ETS table
-request D ──GenServer.call──> GenServer ──ets:insert──> ETS table
+  put("user:42")  ─▶ phash2 → shard_3 ─▶ ets.insert(shard_3_table, ...)
+  put("cart:10")  ─▶ phash2 → shard_0 ─▶ ets.insert(shard_0_table, ...)
 ```
 
-Only writes (`put/3`) and eviction decisions go through the GenServer. Reads (`get/1`) go
-directly to ETS. This is the **protected ETS owner** pattern: the GenServer owns the table
-and serializes writes; ETS serves reads lock-free.
+### 2. TTL with lazy + active expiration
 
----
+Each row is `{key, value, inserted_at, last_accessed_at}`. On `get`:
 
-## Why LRU eviction and not random eviction
+1. If `now - inserted_at > ttl_ms`, treat as miss and delete.
+2. Else update `last_accessed_at` and return.
 
-Random eviction wastes cache space on entries that are frequently accessed. LRU ensures
-that the entries most likely to be requested again survive under memory pressure. For a
-gateway serving a limited set of downstream endpoints, the working set is small and LRU
-approximates it well.
+A background **Janitor** GenServer runs every `:sweep_interval_ms` and deletes rows where
+`inserted_at < now - ttl_ms`. Without the Janitor, cold keys never get read and pile up.
 
-The cost of LRU: O(n) to move an entry to the front on each access, unless you maintain an
-auxiliary doubly-linked list with O(1) move. This implementation uses the simpler O(n) list.
+### 3. Approximate LRU eviction
+
+True LRU requires a doubly-linked list maintained on every access — expensive. An approximate
+LRU samples K random rows, evicts the one with the oldest `last_accessed_at`, and repeats until
+`size ≤ max_size`. This is the Redis approach ("allkeys-lru" uses K=5 by default).
+
+### 4. Telemetry integration
+
+Every `get` emits `[:cache_server_full, :get]` with `%{result: :hit | :miss}`. Every eviction
+emits `[:cache_server_full, :evict]`. Consumers (Prometheus, LiveDashboard) attach handlers.
+
+```elixir
+:telemetry.attach("my-cache", [:cache_server_full, :get], &handler/4, nil)
+```
+
+### 5. Why not just use Cachex or Nebulex?
+
+You can, and usually should. Building it yourself is valuable for:
+
+- Pedagogy: understanding what those libraries actually do.
+- Smaller dependency surface when the requirements are narrow.
+- Custom telemetry or event schemas those libraries don't expose.
 
 ---
 
 ## Implementation
 
-### Step 1: Create the project structure
-
-```bash
-mix new api_gateway --sup
-cd api_gateway
-mkdir -p lib/api_gateway/cache
-mkdir -p test/api_gateway
-mkdir -p bench
-```
-
-### Step 2: `mix.exs` -- add benchee
+### Step 1: `mix.exs`
 
 ```elixir
-defp deps do
-  [
-    {:benchee, "~> 1.3", only: :dev}
-  ]
+defmodule CacheServerFull.MixProject do
+  use Mix.Project
+
+  def project do
+    [app: :cache_server_full, version: "0.1.0", elixir: "~> 1.16", deps: deps()]
+  end
+
+  def application, do: [extra_applications: [:logger], mod: {CacheServerFull.Application, []}]
+
+  defp deps do
+    [{:telemetry, "~> 1.2"}, {:benchee, "~> 1.3", only: [:dev, :test]}]
+  end
 end
 ```
 
-### Step 3: `lib/api_gateway/cache/lru.ex`
-
-The LRU order is maintained as a simple list where the head is the Most Recently Used (MRU)
-and the tail is the Least Recently Used (LRU). `touch/2` moves a key to the front.
-`evict_lru/1` removes the last element.
+### Step 2: `lib/cache_server_full/application.ex`
 
 ```elixir
-defmodule ApiGateway.Cache.LRU do
+defmodule CacheServerFull.Application do
+  @moduledoc false
+  use Application
+
+  @impl true
+  def start(_type, _args) do
+    children = [
+      {CacheServerFull.Cache,
+       name: :default_cache, max_size: 10_000, ttl_ms: 60_000,
+       shards: System.schedulers_online(), telemetry_prefix: [:cache_server_full]}
+    ]
+
+    Supervisor.start_link(children, strategy: :one_for_one, name: CacheServerFull.Supervisor)
+  end
+end
+```
+
+### Step 3: `lib/cache_server_full/shard.ex`
+
+```elixir
+defmodule CacheServerFull.Shard do
   @moduledoc """
-  LRU order tracking as a simple list [MRU, ..., LRU].
-
-  The list-based implementation is O(n) for touch/1.
-  For caches with max_size < 10_000, this is acceptable.
+  One ETS shard. Each shard holds rows `{key, value, inserted_at, last_accessed_at}`.
+  Created as `:public` so any process can read/write — writes pass through
+  the janitor-aware logic in `Cache`, not through a GenServer.
   """
 
-  @doc """
-  Moves `key` to the front (MRU position). If not present, inserts it.
-  """
-  @spec touch([term()], term()) :: [term()]
-  def touch(order, key) do
-    [key | List.delete(order, key)]
-  end
-
-  @doc """
-  Removes the LRU entry (last in list) and returns {lru_key, new_order}.
-  Returns {nil, []} if the list is empty.
-  """
-  @spec evict_lru([term()]) :: {term() | nil, [term()]}
-  def evict_lru([]), do: {nil, []}
-
-  def evict_lru(order) do
-    lru_key = List.last(order)
-    new_order = Enum.drop(order, -1)
-    {lru_key, new_order}
-  end
-
-  @doc """
-  Removes a specific key from the order list (used on explicit delete).
-  """
-  @spec remove([term()], term()) :: [term()]
-  def remove(order, key) do
-    List.delete(order, key)
+  @spec new(atom()) :: :ets.tid() | atom()
+  def new(name) do
+    :ets.new(name, [
+      :named_table, :public, :set,
+      read_concurrency: true,
+      write_concurrency: :auto,
+      decentralized_counters: true
+    ])
   end
 end
 ```
 
-### Step 4: `lib/api_gateway/cache/server.ex`
-
-The GenServer owns the ETS table and serializes all write operations.
-Reads go directly to ETS via `get/1` -- they never touch the GenServer mailbox.
+### Step 4: `lib/cache_server_full/telemetry.ex`
 
 ```elixir
-defmodule ApiGateway.Cache.Server do
+defmodule CacheServerFull.Telemetry do
+  @moduledoc false
+
+  @spec emit(list(atom()), atom(), map(), map()) :: :ok
+  def emit(prefix, event, meta \\ %{}, measurements \\ %{}) do
+    :telemetry.execute(prefix ++ [event], Map.merge(%{count: 1}, measurements), meta)
+  end
+end
+```
+
+### Step 5: `lib/cache_server_full/cache.ex`
+
+```elixir
+defmodule CacheServerFull.Cache do
+  @moduledoc """
+  Public API and configuration holder. The GenServer owns the shard tables
+  and the Janitor; reads/writes bypass the GenServer and hit ETS directly.
+  """
   use GenServer
 
-  @table :cache_entries
-  @default_ttl_ms 60_000
+  alias CacheServerFull.{Shard, Telemetry, Janitor}
 
-  # ---------------------------------------------------------------------------
-  # Public API
-  # ---------------------------------------------------------------------------
+  @type opts :: [
+          name: atom(),
+          max_size: pos_integer(),
+          ttl_ms: pos_integer(),
+          shards: pos_integer(),
+          telemetry_prefix: list(atom())
+        ]
 
-  @doc """
-  Looks up a cached value. Returns `{:ok, value}` or `{:miss}`.
+  # ---- Public API ---------------------------------------------------------
 
-  Reads directly from ETS -- does NOT go through the GenServer process.
-  If the entry exists but has expired, deletes it and returns `{:miss}`.
-  """
-  @spec get(term()) :: {:ok, term()} | {:miss}
-  def get(key) do
-    now = System.monotonic_time(:millisecond)
+  def start_link(opts) do
+    name = Keyword.fetch!(opts, :name)
+    GenServer.start_link(__MODULE__, opts, name: name)
+  end
 
-    case :ets.lookup(@table, key) do
-      [{^key, value, expiry_ms}] when expiry_ms > now ->
-        {:ok, value}
+  @spec get(atom(), term()) :: {:ok, term()} | :miss
+  def get(cache \\ :default_cache, key) do
+    {shards, ttl_ms, prefix} = config(cache)
+    shard = shard_for(key, shards, cache)
+    now = monotonic()
 
-      [{^key, _value, _expiry_ms}] ->
-        GenServer.cast(__MODULE__, {:lazy_delete, key})
-        {:miss}
+    case :ets.lookup(shard, key) do
+      [{^key, value, inserted_at, _last}] ->
+        if now - inserted_at > ttl_ms do
+          :ets.delete(shard, key)
+          Telemetry.emit(prefix, :get, %{cache: cache, result: :expired})
+          :miss
+        else
+          :ets.update_element(shard, key, {4, now})
+          Telemetry.emit(prefix, :get, %{cache: cache, result: :hit})
+          {:ok, value}
+        end
 
       [] ->
-        {:miss}
+        Telemetry.emit(prefix, :get, %{cache: cache, result: :miss})
+        :miss
     end
   end
 
-  @doc """
-  Stores a value with an optional TTL (default #{@default_ttl_ms}ms).
-
-  Goes through the GenServer to serialize the LRU order update and eviction check.
-  """
-  @spec put(term(), term(), keyword()) :: :ok
-  def put(key, value, opts \\ []) do
-    ttl_ms = Keyword.get(opts, :ttl_ms, @default_ttl_ms)
-    GenServer.call(__MODULE__, {:put, key, value, ttl_ms})
+  @spec put(atom(), term(), term()) :: :ok
+  def put(cache \\ :default_cache, key, value) do
+    {shards, _ttl_ms, _prefix} = config(cache)
+    shard = shard_for(key, shards, cache)
+    now = monotonic()
+    :ets.insert(shard, {key, value, now, now})
+    :ok
   end
 
-  @doc "Removes an entry explicitly."
-  @spec delete(term()) :: :ok
-  def delete(key) do
-    GenServer.call(__MODULE__, {:delete, key})
+  @spec delete(atom(), term()) :: :ok
+  def delete(cache \\ :default_cache, key) do
+    {shards, _ttl_ms, _prefix} = config(cache)
+    shard = shard_for(key, shards, cache)
+    :ets.delete(shard, key)
+    :ok
   end
 
-  @doc "Removes all entries."
-  @spec flush() :: :ok
-  def flush do
-    GenServer.call(__MODULE__, :flush)
+  @spec size(atom()) :: non_neg_integer()
+  def size(cache \\ :default_cache) do
+    {shards, _ttl_ms, _prefix} = config(cache)
+
+    0..(shards - 1)
+    |> Enum.map(fn i -> :ets.info(shard_name(cache, i), :size) end)
+    |> Enum.sum()
   end
 
-  @doc "Returns the number of entries currently in the cache."
-  @spec size() :: non_neg_integer()
-  def size, do: :ets.info(@table, :size)
-
-  # ---------------------------------------------------------------------------
-  # GenServer lifecycle
-  # ---------------------------------------------------------------------------
-
-  def start_link(opts \\ []) do
-    GenServer.start_link(__MODULE__, opts, name: __MODULE__)
-  end
+  # ---- GenServer ----------------------------------------------------------
 
   @impl true
   def init(opts) do
-    max_size = Keyword.get(opts, :max_size, 1_000)
+    name = Keyword.fetch!(opts, :name)
+    shards = Keyword.fetch!(opts, :shards)
+    ttl_ms = Keyword.fetch!(opts, :ttl_ms)
+    max_size = Keyword.fetch!(opts, :max_size)
+    prefix = Keyword.fetch!(opts, :telemetry_prefix)
 
-    table = :ets.new(@table, [:named_table, :protected, :set, read_concurrency: true])
+    for i <- 0..(shards - 1) do
+      Shard.new(shard_name(name, i))
+    end
 
-    {:ok, %{table: table, max_size: max_size, lru_order: [], hits: 0, misses: 0}}
+    :persistent_term.put({__MODULE__, name}, {shards, ttl_ms, prefix})
+
+    {:ok, janitor} =
+      Janitor.start_link(
+        cache: name, shards: shards, ttl_ms: ttl_ms,
+        max_size: max_size, telemetry_prefix: prefix
+      )
+
+    {:ok, %{name: name, janitor: janitor}}
   end
 
-  # ---------------------------------------------------------------------------
-  # Callbacks
-  # ---------------------------------------------------------------------------
+  # ---- helpers ------------------------------------------------------------
 
-  @impl true
-  def handle_call({:put, key, value, ttl_ms}, _from, state) do
-    expiry = System.monotonic_time(:millisecond) + ttl_ms
+  defp config(cache), do: :persistent_term.get({__MODULE__, cache})
 
-    already_exists = :ets.lookup(@table, key) != []
-
-    state =
-      if :ets.info(@table, :size) >= state.max_size and not already_exists do
-        {lru_key, new_order} = ApiGateway.Cache.LRU.evict_lru(state.lru_order)
-
-        if lru_key do
-          :ets.delete(@table, lru_key)
-        end
-
-        %{state | lru_order: new_order}
-      else
-        state
-      end
-
-    :ets.insert(@table, {key, value, expiry})
-
-    new_order = ApiGateway.Cache.LRU.touch(state.lru_order, key)
-
-    {:reply, :ok, %{state | lru_order: new_order}}
+  defp shard_for(key, shards, cache) do
+    i = :erlang.phash2(key, shards)
+    shard_name(cache, i)
   end
 
-  def handle_call({:delete, key}, _from, state) do
-    :ets.delete(@table, key)
-    new_order = ApiGateway.Cache.LRU.remove(state.lru_order, key)
-    {:reply, :ok, %{state | lru_order: new_order}}
-  end
+  defp shard_name(cache, i), do: :"#{cache}_shard_#{i}"
 
-  def handle_call(:flush, _from, state) do
-    :ets.delete_all_objects(@table)
-    {:reply, :ok, %{state | lru_order: []}}
-  end
-
-  @impl true
-  def handle_cast({:lazy_delete, key}, state) do
-    :ets.delete(@table, key)
-    new_order = ApiGateway.Cache.LRU.remove(state.lru_order, key)
-    {:noreply, %{state | lru_order: new_order}}
-  end
+  defp monotonic, do: System.monotonic_time(:millisecond)
 end
 ```
 
-### Step 5: `lib/api_gateway/cache/ttl_expirer.ex`
-
-Lazy expiry on `get/1` handles hot entries. Cold entries -- keys that are never requested
-again -- accumulate indefinitely without the periodic sweep. This GenServer runs a sweep
-every 30 seconds to clean them up.
+### Step 6: `lib/cache_server_full/janitor.ex`
 
 ```elixir
-defmodule ApiGateway.Cache.TTLExpirer do
+defmodule CacheServerFull.Janitor do
+  @moduledoc """
+  Background process that:
+    - Deletes TTL-expired rows (sweep).
+    - Enforces max_size via approximate-LRU eviction.
+  """
   use GenServer
 
-  @sweep_interval_ms 30_000
-  @table :cache_entries
+  alias CacheServerFull.Telemetry
 
-  def start_link(_opts), do: GenServer.start_link(__MODULE__, [], name: __MODULE__)
+  @sweep_interval_ms 1_000
+  @lru_sample 5
+
+  def start_link(opts), do: GenServer.start_link(__MODULE__, opts)
 
   @impl true
-  def init(_) do
+  def init(opts) do
+    state = Map.new(opts)
     Process.send_after(self(), :sweep, @sweep_interval_ms)
-    {:ok, %{}}
+    {:ok, state}
   end
 
   @impl true
   def handle_info(:sweep, state) do
-    now = System.monotonic_time(:millisecond)
-
-    @table
-    |> :ets.tab2list()
-    |> Enum.each(fn {key, _value, expiry} ->
-      if expiry < now do
-        :ets.delete(@table, key)
-      end
-    end)
-
+    expire_ttl(state)
+    enforce_max_size(state)
     Process.send_after(self(), :sweep, @sweep_interval_ms)
     {:noreply, state}
+  end
+
+  defp expire_ttl(%{cache: cache, shards: n, ttl_ms: ttl_ms, telemetry_prefix: prefix}) do
+    cutoff = System.monotonic_time(:millisecond) - ttl_ms
+
+    Enum.each(0..(n - 1), fn i ->
+      shard = :"#{cache}_shard_#{i}"
+      # Match spec: delete rows whose inserted_at (pos 3) is < cutoff
+      ms = [{{:_, :_, :"$1", :_}, [{:<, :"$1", cutoff}], [true]}]
+      deleted = :ets.select_delete(shard, ms)
+
+      if deleted > 0 do
+        Telemetry.emit(prefix, :evict, %{cache: cache, reason: :ttl}, %{count: deleted})
+      end
+    end)
+  end
+
+  defp enforce_max_size(%{cache: cache, shards: n, max_size: max, telemetry_prefix: prefix}) do
+    total =
+      Enum.sum(for i <- 0..(n - 1), do: :ets.info(:"#{cache}_shard_#{i}", :size))
+
+    if total > max do
+      to_evict = total - max
+
+      Enum.each(1..to_evict, fn _ ->
+        evict_one_lru(cache, n, prefix)
+      end)
+    end
+  end
+
+  defp evict_one_lru(cache, n, prefix) do
+    # Sample @lru_sample rows across random shards, drop the oldest.
+    samples =
+      for _ <- 1..@lru_sample do
+        shard = :"#{cache}_shard_#{:rand.uniform(n) - 1}"
+        sample_one(shard)
+      end
+      |> Enum.reject(&is_nil/1)
+
+    case samples do
+      [] ->
+        :ok
+
+      rows ->
+        {shard, key, _last} = Enum.min_by(rows, fn {_s, _k, last} -> last end)
+        :ets.delete(shard, key)
+        Telemetry.emit(prefix, :evict, %{cache: cache, reason: :lru})
+    end
+  end
+
+  defp sample_one(shard) do
+    case :ets.first(shard) do
+      :"$end_of_table" ->
+        nil
+
+      key ->
+        case :ets.lookup(shard, key) do
+          [{^key, _v, _inserted, last}] -> {shard, key, last}
+          _ -> nil
+        end
+    end
   end
 end
 ```
 
-### Step 6: Tests
+### Step 7: `test/cache_test.exs`
 
 ```elixir
-# test/api_gateway/cache_test.exs
-defmodule ApiGateway.CacheTest do
+defmodule CacheServerFull.CacheTest do
   use ExUnit.Case, async: false
 
-  alias ApiGateway.Cache.Server
+  alias CacheServerFull.Cache
+
+  @cache :test_cache
 
   setup do
-    :ets.delete_all_objects(:cache_entries)
-    GenServer.call(Server, :flush)
+    stop_if_running(@cache)
+
+    start_supervised!({Cache,
+      name: @cache, max_size: 50, ttl_ms: 100,
+      shards: 4, telemetry_prefix: [:test_cache]})
+
     :ok
   end
 
-  describe "get/1 and put/3" do
-    test "returns miss for unknown key" do
-      assert {:miss} = Server.get("unknown")
+  defp stop_if_running(name) do
+    case Process.whereis(name) do
+      nil -> :ok
+      pid -> GenServer.stop(pid, :normal, 1_000)
+    end
+  end
+
+  describe "put/get/delete" do
+    test "round-trip" do
+      :ok = Cache.put(@cache, :k1, "v1")
+      assert {:ok, "v1"} = Cache.get(@cache, :k1)
     end
 
-    test "returns ok with value after put" do
-      Server.put("key1", "value1")
-      Process.sleep(5)
-      assert {:ok, "value1"} = Server.get("key1")
+    test "miss returns :miss" do
+      assert :miss = Cache.get(@cache, :nope)
     end
 
-    test "expired entry returns miss" do
-      Server.put("expiring", "val", ttl_ms: 50)
-      Process.sleep(100)
-      assert {:miss} = Server.get("expiring")
+    test "delete removes" do
+      Cache.put(@cache, :k, 1)
+      Cache.delete(@cache, :k)
+      assert :miss = Cache.get(@cache, :k)
     end
+  end
 
-    test "delete removes the entry" do
-      Server.put("del_key", "val")
-      Process.sleep(5)
-      Server.delete("del_key")
-      assert {:miss} = Server.get("del_key")
-    end
-
-    test "flush removes all entries" do
-      Server.put("a", 1)
-      Server.put("b", 2)
-      Process.sleep(5)
-      Server.flush()
-      assert {:miss} = Server.get("a")
-      assert {:miss} = Server.get("b")
+  describe "TTL" do
+    test "entry expires after ttl_ms" do
+      Cache.put(@cache, :ttl_key, "v")
+      Process.sleep(150)
+      assert :miss = Cache.get(@cache, :ttl_key)
     end
   end
 
   describe "LRU eviction" do
-    test "evicts LRU entry when max_size is reached" do
-      GenServer.stop(Server)
-      {:ok, _} = Server.start_link(max_size: 3)
-
-      Server.put("a", 1)
-      Server.put("b", 2)
-      Server.put("c", 3)
-      Process.sleep(5)
-
-      Server.get("a")
-
-      Server.put("d", 4)
-      Process.sleep(5)
-
-      assert {:ok, 1} = Server.get("a")
-      assert {:miss}  = Server.get("b")
-      assert {:ok, 3} = Server.get("c")
-      assert {:ok, 4} = Server.get("d")
+    test "size stays under max_size after the janitor runs" do
+      for i <- 1..200, do: Cache.put(@cache, {:k, i}, i)
+      # Give janitor at least one sweep cycle (1s) to catch up
+      Process.sleep(1_300)
+      assert Cache.size(@cache) <= 50
     end
   end
 
-  describe "concurrent reads" do
-    test "100 concurrent readers without errors" do
-      Server.put("shared", "data")
-      Process.sleep(5)
+  describe "telemetry" do
+    test "emits :hit, :miss, :expired" do
+      ref = make_ref()
+      parent = self()
 
-      tasks = for _ <- 1..100, do: Task.async(fn -> Server.get("shared") end)
-      results = Task.await_many(tasks, 5_000)
+      :telemetry.attach(
+        "test-#{inspect(ref)}",
+        [:test_cache, :get],
+        fn _name, _measure, meta, _ -> send(parent, {ref, meta.result}) end,
+        nil
+      )
 
-      assert Enum.all?(results, &match?({:ok, "data"}, &1))
+      Cache.get(@cache, :absent)
+      assert_receive {^ref, :miss}, 500
+
+      Cache.put(@cache, :present, 1)
+      Cache.get(@cache, :present)
+      assert_receive {^ref, :hit}, 500
+
+      :telemetry.detach("test-#{inspect(ref)}")
     end
   end
 end
 ```
 
-### Step 7: Run the tests
+### Step 8: Run it
 
 ```bash
-mix test test/api_gateway/cache_test.exs --trace
+mix deps.get
+mix test --trace
 ```
 
-### Step 8: Benchmark
+---
+
+## Benchmark suggestions
+
+Drop this into `bench/cache_bench.exs` to see sharding in action:
 
 ```elixir
-# bench/cache_bench.exs
 Benchee.run(
   %{
-    "get -- miss (ETS read)" => fn ->
-      ApiGateway.Cache.Server.get("nonexistent_#{:rand.uniform(10_000)}")
+    "get (hit)" => fn ->
+      CacheServerFull.Cache.get(:default_cache, :erlang.phash2({:k, :rand.uniform(1_000)}))
     end,
-    "get -- hit (ETS read)" => fn ->
-      ApiGateway.Cache.Server.get("exchange_rates")
-    end,
-    "put (GenServer call)" => fn ->
-      ApiGateway.Cache.Server.put("bench_key_#{:rand.uniform(1_000)}", :data)
+    "put" => fn ->
+      CacheServerFull.Cache.put(:default_cache, :erlang.phash2({:k, :rand.uniform(1_000)}), 1)
     end
   },
-  parallel: 8,
-  time: 5,
-  warmup: 2,
-  formatters: [Benchee.Formatters.Console]
+  parallel: System.schedulers_online(), time: 5, warmup: 2
 )
 ```
 
-Seed the `hit` key before running:
-
-```bash
-# In iex -S mix:
-ApiGateway.Cache.Server.put("exchange_rates", %{usd: 1.08, gbp: 0.86}, ttl_ms: 300_000)
-```
-
-```bash
-mix run bench/cache_bench.exs
-```
-
-**Expected result on modern hardware**: `get` < 5us at p99. If `get` is > 50us, verify
-it is reading directly from ETS and not making a `GenServer.call`.
+Expected: with `shards: 12` on a 12-core box, sustained put throughput ≈ 8–12 M ops/s.
 
 ---
 
-## Trade-off analysis
+## Trade-offs and production gotchas
 
-| Aspect | ETS `:protected` + LRU list | GenServer map (no ETS) | Redis |
-|--------|-----------------------------|------------------------|-------|
-| Concurrent reads | lock-free after ETS lookup | serialized by mailbox | network round-trip |
-| Eviction policy | LRU (O(n) list) | configurable | configurable |
-| p50 read latency | < 2us (measure) | proportional to backlog | > 500us |
-| Memory for 1k entries | measure | measure | off-heap |
-| TTL enforcement | lazy (on read) + periodic sweep | lazy or periodic | native |
-| Survives node crash | no | no | yes (persistence) |
+**1. `:persistent_term` for config is a trade-off.** Reads are zero-copy fast, but every
+`:persistent_term.put/2` triggers a global GC. Set config once at init, never at runtime per
+request.
 
----
+**2. Approximate LRU can evict a "hot" key occasionally.** The sampling method can miss a
+recently-used key if it wasn't in the sample. Acceptable for caches; unacceptable for exact LRU
+requirements (use a doubly-linked list instead).
 
-## Common production mistakes
+**3. TTL semantics: lazy + active, not just lazy.** Without the janitor, cold expired entries
+occupy memory forever. Don't skip it "to save CPU".
 
-**1. `get/1` as a `GenServer.call`**
-If `get/1` serializes through the GenServer, you've paid the cost of a process message
-for every cache read. The whole point of ETS is to avoid that. Read directly with
-`:ets.lookup/2`.
+**4. Sharding helps writes, not cross-shard operations.** `size/0` sums N shards — O(N). For
+millions of shards you'd need a decentralized counter per shard and lazy aggregation.
 
-**2. Not limiting the LRU list size**
-If `max_size` is not enforced strictly, the list grows with every new key. An unbounded
-LRU list causes O(n) degradation in `put/3` even when the cache is operating normally.
+**5. Telemetry handlers run synchronously in the caller.** A slow handler (logging to disk,
+calling Prometheus with HTTP) blocks every `get`. Attach fast handlers or dispatch to a separate
+process.
 
-**3. `System.os_time` instead of `System.monotonic_time` for TTL**
-`os_time` can go backward (NTP, leap seconds). For time comparisons like `expiry > now`,
-you need a monotonically increasing clock.
+**6. `:persistent_term.put` triggers global GC — DO NOT use it for TTL bookkeeping.** Use ETS
+for anything that mutates.
 
-**4. Not sweeping expired entries**
-Lazy expiry on `get/1` handles hot entries. Cold entries accumulate indefinitely without
-the periodic sweep. After 24 hours, a busy gateway accumulates millions of expired entries.
-
-**5. O(n) LRU touch on every `get/1` through the GenServer**
-If `get/1` calls `GenServer.call` to update the LRU order on every read, you've made reads
-as expensive as writes. Either accept that LRU order is only updated on `put/3` (approximate
-LRU), or keep reads ETS-only and update LRU asynchronously with `cast`.
+**7. When NOT to use this.** If you need distributed caching across a cluster, this is the wrong
+shape. Use `:pg`/`Phoenix.PubSub` for invalidation, Cachex's distributed mode, or an external
+Redis.
 
 ---
 
 ## Resources
 
-- [`:ets` documentation -- Erlang/OTP](https://www.erlang.org/doc/man/ets.html) -- table types and access control
-- [Erlang in Anger -- Fred Hebert](https://www.erlang-in-anger.com/) -- ETS in production (free PDF)
-- [Caffeine cache paper](https://dl.acm.org/doi/10.1145/2806777.2806888) -- TinyLFU, a superior eviction policy to LRU
-- [Benchee](https://github.com/bencheeorg/benchee) -- idiomatic benchmarking in Elixir
+- [Cachex source](https://github.com/whitfin/cachex) — production reference for a full-feature cache
+- [Nebulex source](https://github.com/cabol/nebulex) — multi-tier caching, includes ETS adapter
+- [Redis `maxmemory-policy` docs](https://redis.io/docs/reference/eviction/) — origin of approximate LRU
+- [Telemetry](https://hexdocs.pm/telemetry/) — event emission and handler attachment
+- [José Valim — "Tracing runtime stats with telemetry"](https://dashbit.co/blog/homegrown-analytics-with-elixir)
+- [Phoenix.LiveDashboard — cache metrics widgets](https://hexdocs.pm/phoenix_live_dashboard/)
+- [Discord — "How we scale Elixir"](https://discord.com/blog/how-discord-scaled-elixir-to-5-000-000-concurrent-users)

@@ -2,9 +2,6 @@
 
 **Project**: `shutdown_timeouts_demo` — three workers with different shutdown policies (timeout, `:brutal_kill`, `:infinity`) to observe what happens when `terminate/2` takes too long.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
-
 ---
 
 ## Project context
@@ -34,6 +31,11 @@ shutdown_timeouts_demo/
 ```
 
 ---
+
+
+## Why X and not Y
+
+- **Why not `:brutal_kill`?** Data loss on inflight work. Bounded graceful shutdown with a timeout is the ops-safe middle ground.
 
 ## Core concepts
 
@@ -83,7 +85,31 @@ top-down and applies each child's `:shutdown` policy. Misconfigured
 
 ---
 
+## Design decisions
+
+**Option A — `:brutal_kill` everywhere**
+- Pros: simpler upfront, fewer moving parts.
+- Cons: hides the trade-off that this exercise exists to teach.
+
+**Option B — bounded `shutdown: N_ms` with graceful `terminate/2` (chosen)**
+- Pros: explicit about the semantic that matters in production.
+- Cons: one more concept to internalize.
+
+→ Chose **B** because brutal kill risks data loss on inflight work; bounded graceful shutdown caps worst-case stop time.
+
+
 ## Implementation
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defp deps do
+  [
+    # stdlib-only by default; add `{:benchee, "~> 1.3", only: :dev}` if you benchmark
+  ]
+end
+```
+
 
 ### Step 1: Create the project
 
@@ -228,6 +254,15 @@ mix test
 
 ---
 
+### Why this works
+
+The design leans on OTP primitives that already encode the invariants we care about (supervision, back-pressure, explicit message semantics), so failure modes are visible at the right layer instead of being reinvented ad-hoc. Tests exercise the edges (timeouts, crashes, boundary states), which is where hand-rolled alternatives silently drift over time.
+
+
+## Benchmark
+
+<!-- benchmark N/A: tema conceptual -->
+
 ## Trade-offs and production gotchas
 
 **1. Default 5_000 ms is a generous fallback, not a target**
@@ -257,6 +292,11 @@ accept the 5_000 ms default. It's a safety margin, not a commitment to
 wait that long. Only tune when you can measure the actual drain time.
 
 ---
+
+
+## Reflection
+
+- Tu proceso escribe a S3 en `terminate/2`. ¿Qué `shutdown` ponés y por qué? ¿Cambia si es `:brutal_kill` por default upstream?
 
 ## Resources
 

@@ -2,9 +2,6 @@
 
 **Project**: `bounded_pool` — cap in-flight work at N, queue the rest, fairly.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
-
 ---
 
 ## Project context
@@ -43,6 +40,11 @@ bounded_pool/
 ```
 
 ---
+
+
+## Why X and not Y
+
+- **Why not poolboy?** Extra dep for semantics already covered by `Task.async_stream`; use poolboy when you need long-lived checked-out workers.
 
 ## Core concepts
 
@@ -94,7 +96,31 @@ reached".
 
 ---
 
+## Design decisions
+
+**Option A — poolboy**
+- Pros: simpler upfront, fewer moving parts.
+- Cons: hides the trade-off that this exercise exists to teach.
+
+**Option B — `Task.async_stream` with `max_concurrency` (chosen)**
+- Pros: explicit about the semantic that matters in production.
+- Cons: one more concept to internalize.
+
+→ Chose **B** because no extra dep, stdlib-only, and semantics match the workload (per-call bounded parallelism).
+
+
 ## Implementation
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defp deps do
+  [
+    # stdlib-only by default; add `{:benchee, "~> 1.3", only: :dev}` if you benchmark
+  ]
+end
+```
+
 
 ### Step 1: Create the project
 
@@ -388,6 +414,19 @@ mix test
 
 ---
 
+### Why this works
+
+The design leans on OTP primitives that already encode the invariants we care about (supervision, back-pressure, explicit message semantics), so failure modes are visible at the right layer instead of being reinvented ad-hoc. Tests exercise the edges (timeouts, crashes, boundary states), which is where hand-rolled alternatives silently drift over time.
+
+
+## Benchmark
+
+```elixir
+# Medí throughput con max_concurrency = 1, 8, 32, 128
+```
+
+Target esperado: curva cóncava con pico cerca de N_schedulers; caída por contención después.
+
 ## Trade-offs and production gotchas
 
 **1. Queues without limits leak memory**
@@ -428,6 +467,11 @@ Build your own when the semantics don't fit any of the above and
 understanding the internals is worth the maintenance cost.
 
 ---
+
+
+## Reflection
+
+- ¿Cuándo `Task.async_stream` ya no alcanza y necesitás poolboy u otra librería? Dá 2 señales concretas.
 
 ## Resources
 

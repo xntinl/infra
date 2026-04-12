@@ -4,9 +4,6 @@
 one `Producer` emitting integers, one `Consumer` pulling them, with
 back-pressure driven by consumer demand.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
-
 ---
 
 ## Project context
@@ -43,7 +40,7 @@ genstage_intro/
 
 - **Producer** — only emits events. Implements `handle_demand/2`.
 - **Consumer** — only receives events. Implements `handle_events/3`.
-- **ProducerConsumer** — both (see exercise 107).
+- **ProducerConsumer** — both: emits events downstream AND receives from upstream.
 
 A pipeline is a chain: `Producer -> [ProducerConsumer...] -> Consumer`.
 
@@ -82,24 +79,39 @@ buffers aren't prepared for it.
 
 ---
 
+## Design decisions
+
+**Option A — Plain GenServer with `handle_info` push**
+- Pros: fewer moving parts; no extra dependency.
+- Cons: no back-pressure — a fast producer can flood a slow consumer's mailbox until the VM runs out of memory.
+
+**Option B — GenStage with demand-driven producer + consumer** (chosen)
+- Pros: back-pressure is protocol-level; consumer pulls exactly `max_demand` events; composes cleanly with Flow and Broadway.
+- Cons: adds a dependency; two modules instead of one; you must reason about outstanding demand on slow sources.
+
+→ Chose **B** because the whole point is the demand-driven primitive. Every realistic pipeline needs back-pressure; learning it once pays for Flow and Broadway later.
+
+---
+
 ## Implementation
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defp deps do
+  [
+    {:gen_stage, "~> 1.2"}
+  ]
+end
+```
 
 ### Step 1: Create the project
 
 ```bash
 mix new genstage_intro --sup
 cd genstage_intro
+mix deps.get
 ```
-
-Add `gen_stage` to `mix.exs` dependencies:
-
-```elixir
-defp deps do
-  [{:gen_stage, "~> 1.2"}]
-end
-```
-
-Then `mix deps.get`.
 
 ### Step 2: `lib/genstage_intro/producer.ex`
 
@@ -235,7 +247,13 @@ end
 mix test
 ```
 
+### Why this works
+
+The consumer subscribes with `max_demand: 10`, which sends an initial `{:"$gen_producer", {consumer, ref}, {:ask, 10}}` message to the producer. The producer's `handle_demand/2` is invoked with `demand=10`, emits ten integers, and returns them in `{:noreply, events, state}`. Once the consumer drains below `min_demand: 5`, it asks again. The producer never sends events that weren't asked for — that is the entire back-pressure contract.
+
 ---
+
+<!-- benchmark N/A: GenStage throughput depends heavily on downstream work; measured in later exercises -->
 
 ## Trade-offs and production gotchas
 
@@ -274,6 +292,13 @@ pipeline, not a fresh `GenStage`.
 - You want data ingestion from queues (SQS, Kafka, RabbitMQ) → use
   `Broadway`, which is GenStage pre-wired with acknowledgements and rate
   limiting.
+
+---
+
+## Reflection
+
+- Your producer wraps a slow HTTP API (200 ms per call, batches of 50). Where would you put the async fetch so `handle_demand/2` never blocks the producer process? Sketch the state machine.
+- A consumer with `max_demand: 10_000` and `min_demand: 5_000` feels fast but spikes RAM. How do you decide the right window size in production? What signal tells you to reduce it?
 
 ---
 

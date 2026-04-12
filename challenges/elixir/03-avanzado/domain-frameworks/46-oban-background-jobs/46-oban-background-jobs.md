@@ -1,442 +1,531 @@
-# Background Jobs with Oban
+# Oban — Background Jobs with Postgres as a Queue
 
-## Overview
+**Project**: `oban_intro` — durable, retryable background jobs backed by a Postgres queue.
+**Difficulty**: ★★★★☆
+**Estimated time**: 3–6 hours
 
-Build a durable background job system for an HTTP API gateway using Oban, the standard
-library for background processing in the Elixir ecosystem. The gateway generates events --
-client registrations, billing threshold alerts, audit log entries -- that must be processed
-asynchronously without coupling request latency to email delivery or external API calls.
+---
+
+## Project context
+
+You run the operations side of a B2B invoicing platform. Three workflows keep
+surfacing as pain points:
+
+1. **Invoice PDF rendering** — slow (3–8 s), CPU-heavy, must not happen inside
+   the HTTP request.
+2. **Webhook retries** — customers' systems are flaky; when a POST to a webhook
+   URL fails we need to retry with backoff for up to 24 hours.
+3. **Email sending** — must survive deploys; losing a "your invoice is ready"
+   email is unacceptable.
+
+All three have the same requirements: **durability** (survives restarts),
+**retries with backoff**, **observability**, and **priority** (a password-reset
+email is more urgent than a monthly newsletter).
+
+You already run Postgres for your primary database. The pragmatic choice is
+[Oban](https://github.com/oban-bg/oban): it uses Postgres as the queue via
+`SKIP LOCKED` row-level locking, with zero extra infrastructure. Sidekiq-style
+durability without a Redis operational story.
+
+The previous exercises (42, 44) built **in-VM** schedulers. This exercise is
+about crossing the durability boundary: when losing a job equals losing money,
+you need Postgres underneath.
 
 Project structure:
 
 ```
-api_gateway/
+oban_intro/
 ├── lib/
-│   └── api_gateway/
+│   └── oban_intro/
 │       ├── application.ex
 │       ├── repo.ex
 │       ├── workers/
-│       │   ├── notification_worker.ex  # welcome emails, threshold alerts
-│       │   ├── audit_worker.ex         # fire-and-forget audit log writes
-│       │   └── report_worker.ex        # slow report generation with chaining
-│       └── oban_logger.ex             # telemetry-based structured logging
+│       │   ├── pdf_worker.ex
+│       │   ├── webhook_worker.ex
+│       │   └── email_worker.ex
+│       └── observability/
+│           └── telemetry.ex
 ├── priv/repo/migrations/
-│   └── *_add_oban_jobs_table.exs
+│   ├── 20260412120000_add_oban.exs
+│   └── 20260412120100_add_oban_peers.exs
 ├── test/
-│   └── api_gateway/
+│   └── oban_intro/
 │       └── workers/
-│           ├── notification_worker_test.exs
-│           ├── audit_worker_test.exs
-│           └── report_worker_test.exs
+│           ├── pdf_worker_test.exs
+│           └── webhook_worker_test.exs
+├── config/config.exs
 └── mix.exs
 ```
 
 ---
 
-## The business problem
+## Core concepts
 
-Three event types need background processing:
+### 1. Why Postgres as a queue
 
-1. **Client registration** -- send welcome notification (email + push); must not duplicate
-   if the job is enqueued twice by accident
-2. **API request** -- write an audit log entry to a separate analytics store; fire-and-forget,
-   high volume
-3. **Billing threshold** -- generate a usage report and deliver it; slow (5 min), must chain
-   a notification when complete
+Oban's core insight: modern Postgres already has everything a durable queue needs.
 
----
+```sql
+-- Classic "fetch a job" statement
+SELECT * FROM oban_jobs
+WHERE state = 'available'
+  AND queue = $1
+ORDER BY priority, scheduled_at, id
+LIMIT $2
+FOR UPDATE SKIP LOCKED;
+```
 
-## Why Oban over a custom in-memory scheduler
+`FOR UPDATE SKIP LOCKED` is the magic: multiple worker processes can run this
+query concurrently, and each one grabs a disjoint set of rows. No broker, no
+coordination service. The queue is **just a table** with careful indexes. This
+pattern (sometimes called "queueing by database") is documented in PostgreSQL's
+docs since version 9.5.
 
-An in-memory scheduler loses all pending jobs if the node restarts. Oban uses PostgreSQL as
-a durable queue:
+Trade-off vs Redis/RabbitMQ:
 
-- Jobs survive node crashes (persisted before enqueue returns)
-- At-least-once delivery: Oban's Lifeline plugin re-enqueues jobs that were executing
-  when the node died
-- Unique jobs: PostgreSQL-level deduplication prevents duplicate processing
-- Distributed: multiple nodes share the same queue without coordination code
+| Aspect | Oban/Postgres | Redis (Sidekiq) | RabbitMQ |
+|--------|---------------|-----------------|----------|
+| Durability | transactional with business data | requires AOF+replication | persistent queues |
+| Transactional enqueue | YES (same TX) | NO | NO |
+| Ops overhead | already run Postgres | extra system | extra system |
+| Throughput ceiling | ~50k jobs/min per node | ~150k jobs/min | ~500k msg/sec |
+| Cost | ~free (existing DB) | separate Redis | separate RMQ cluster |
 
-The cost: a PostgreSQL dependency and the overhead of a DB round-trip per enqueue. For the
-event volumes in this system (registrations, threshold alerts), it's acceptable.
+### 2. Transactional enqueue
 
----
+This is Oban's killer feature. Because the jobs table lives in the same database
+as your domain data, you can enqueue inside a transaction:
 
-## Why `{:cancel, reason}` versus `{:error, reason}` matters
+```elixir
+Ecto.Multi.new()
+|> Ecto.Multi.insert(:invoice, invoice_changeset)
+|> Oban.insert(:render_pdf, PdfWorker.new(%{invoice_id: 42}))
+|> Repo.transaction()
+```
 
-Oban distinguishes permanent failures from transient ones:
+If the transaction rolls back, the job never existed. No orphans. No "we inserted
+the invoice but the Redis enqueue failed" classes of bug. This is impossible with
+Redis-based queues.
 
-- `{:error, reason}` -- transient. Oban retries with exponential backoff up to `max_attempts`.
-  Use this when the downstream might recover (DB temporarily unavailable, rate limit).
-- `{:cancel, reason}` -- permanent. Oban marks the job as cancelled, no retries.
-  Use this when retrying is pointless (user not found, invalid input).
-- Raising an exception -- Oban treats this as `{:error, ...}` with the exception as the reason.
+### 3. Queues, workers, and priority
+
+```
+ ┌─────────────┐    ┌───────────────────────────────────────┐
+ │  producers  │───▶│  oban_jobs table (durable, indexed)   │
+ └─────────────┘    └───────────────┬───────────────────────┘
+                                    │ SKIP LOCKED polling
+       ┌────────────────────────────┼────────────────────────────┐
+       ▼                            ▼                            ▼
+ queue=:default              queue=:webhooks               queue=:emails
+ limit: 20 workers           limit: 5 workers              limit: 10 workers
+```
+
+A **queue** is a named partition. You configure concurrency per queue (how many
+jobs run in parallel). A **worker** is the module that `perform/1`s a job.
+**Priority** is 0–9 within a queue (0 is highest).
+
+### 4. Retries and backoff
+
+Each worker declares `max_attempts`. On failure the job moves to `retryable`
+state; Oban schedules it again with:
+
+```
+next_run_at = now + (attempt^4) seconds
+```
+
+Attempt 1 failure → retry at +1s, attempt 2 → +16s, attempt 3 → +81s, attempt 4
+→ +256s … This polynomial formula is the default; you can override
+`c:Oban.Worker.backoff/1`.
+
+### 5. Unique jobs (preview)
+
+`unique: [period: 60, keys: [:invoice_id]]` prevents duplicates within a window.
+We skim this here and cover it in depth in exercise 258.
 
 ---
 
 ## Implementation
 
-### Step 1: `mix.exs` -- add Oban
+### Step 1: Create the project
+
+```bash
+mix new oban_intro --sup
+cd oban_intro
+```
+
+In `mix.exs`:
 
 ```elixir
 defp deps do
   [
-    {:oban, "~> 2.17"},
+    {:oban, "~> 2.18"},
     {:ecto_sql, "~> 3.11"},
-    {:postgrex, ">= 0.0.0"},
-    {:jason, "~> 1.4"}
+    {:postgrex, "~> 0.17"},
+    {:jason, "~> 1.4"},
+    {:telemetry, "~> 1.2"}
   ]
 end
 ```
 
-### Step 2: Migration
+### Step 2: `config/config.exs`
 
 ```elixir
-# priv/repo/migrations/YYYYMMDDHHMMSS_add_oban_jobs_table.exs
-defmodule ApiGateway.Repo.Migrations.AddObanJobsTable do
+import Config
+
+config :oban_intro, ecto_repos: [ObanIntro.Repo]
+
+config :oban_intro, ObanIntro.Repo,
+  database: "oban_intro_dev",
+  username: "postgres",
+  password: "postgres",
+  hostname: "localhost",
+  pool_size: 20
+
+config :oban_intro, Oban,
+  repo: ObanIntro.Repo,
+  engine: Oban.Engines.Basic,
+  notifier: Oban.Notifiers.Postgres,
+  queues: [
+    default: 20,
+    webhooks: 5,
+    emails: 10,
+    pdf: 3
+  ],
+  plugins: [
+    {Oban.Plugins.Pruner, max_age: 60 * 60 * 24 * 7}
+  ]
+
+if config_env() == :test do
+  config :oban_intro, Oban, testing: :manual
+end
+```
+
+### Step 3: Repo and migrations
+
+```elixir
+# lib/oban_intro/repo.ex
+defmodule ObanIntro.Repo do
+  use Ecto.Repo,
+    otp_app: :oban_intro,
+    adapter: Ecto.Adapters.Postgres
+end
+```
+
+```elixir
+# priv/repo/migrations/20260412120000_add_oban.exs
+defmodule ObanIntro.Repo.Migrations.AddOban do
   use Ecto.Migration
 
-  def up,   do: Oban.Migration.up(version: 12)
+  def up, do: Oban.Migration.up(version: 12)
   def down, do: Oban.Migration.down(version: 1)
 end
 ```
 
-### Step 3: Configuration
+Run migrations:
 
-```elixir
-# config/config.exs
-config :api_gateway, Oban,
-  repo: ApiGateway.Repo,
-  plugins: [
-    {Oban.Plugins.Pruner, max_age: 60 * 60 * 24 * 7},
-    {Oban.Plugins.Lifeline, rescue_after: :timer.minutes(30)},
-    Oban.Plugins.Stager
-  ],
-  queues: [
-    notifications: [limit: 10],
-    audit:         [limit: 50],
-    reports:       [limit: 2]
-  ]
-
-# config/test.exs
-config :api_gateway, Oban, testing: :inline
+```bash
+mix ecto.create
+mix ecto.migrate
 ```
 
-### Step 4: Application setup
+### Step 4: `lib/oban_intro/application.ex`
 
 ```elixir
-# lib/api_gateway/application.ex -- add Oban to children
-children = [
-  ApiGateway.Repo,
-  {Oban, Application.fetch_env!(:api_gateway, Oban)}
-]
+defmodule ObanIntro.Application do
+  @moduledoc false
+  use Application
+
+  @impl true
+  def start(_type, _args) do
+    children = [
+      ObanIntro.Repo,
+      {Oban, Application.fetch_env!(:oban_intro, Oban)},
+      ObanIntro.Observability.Telemetry
+    ]
+
+    Supervisor.start_link(children, strategy: :one_for_one, name: ObanIntro.Supervisor)
+  end
+end
 ```
 
-### Step 5: `lib/api_gateway/workers/notification_worker.ex`
-
-The notification worker handles welcome emails and threshold alerts. It uses Oban's
-`unique` option to prevent duplicate welcome notifications for the same client within
-a 5-minute window.
+### Step 5: Workers
 
 ```elixir
-defmodule ApiGateway.Workers.NotificationWorker do
+# lib/oban_intro/workers/pdf_worker.ex
+defmodule ObanIntro.Workers.PdfWorker do
+  @moduledoc """
+  Renders a PDF for a given invoice. CPU-heavy, offloaded to the `:pdf` queue
+  with low concurrency (3) because PDF rendering is CPU-bound.
+  """
+
   use Oban.Worker,
-    queue: :notifications,
+    queue: :pdf,
     max_attempts: 5,
-    unique: [period: 300, fields: [:args]]
+    priority: 2,
+    unique: [period: 300, fields: [:worker, :args]]
+
+  alias ObanIntro.Repo
 
   @impl Oban.Worker
-  def perform(%Oban.Job{args: %{"type" => "welcome", "client_id" => client_id}}) do
-    case ApiGateway.Clients.get(client_id) do
-      nil ->
-        {:cancel, "client #{client_id} not found"}
-
-      client ->
-        with :ok <- ApiGateway.Mailer.send_welcome(client),
-             :ok <- ApiGateway.PushNotifier.send_welcome(client) do
-          :ok
-        else
-          {:error, :service_unavailable} ->
-            {:error, "email service unavailable"}
-
-          {:error, reason} ->
-            {:error, reason}
-        end
-    end
+  def perform(%Oban.Job{args: %{"invoice_id" => invoice_id}}) do
+    # In production: fetch the invoice, render PDF with ChromicPdf / Typst,
+    # upload to S3. For this exercise we simulate work.
+    Process.sleep(50)
+    {:ok, %{invoice_id: invoice_id, bytes: 1234}}
   end
 
-  def perform(%Oban.Job{args: %{"type" => "threshold_alert", "client_id" => client_id, "threshold" => pct}}) do
-    case ApiGateway.Clients.get(client_id) do
-      nil ->
-        {:cancel, "client #{client_id} not found"}
-
-      client ->
-        message = "Usage has reached #{pct}% of your plan quota."
-
-        with :ok <- ApiGateway.Mailer.send_alert(client, message),
-             :ok <- ApiGateway.PushNotifier.send_alert(client, message) do
-          :ok
-        else
-          {:error, reason} -> {:error, reason}
-        end
-    end
-  end
-
-  def perform(%Oban.Job{args: %{"type" => "report_ready", "client_id" => client_id}}) do
-    case ApiGateway.Clients.get(client_id) do
-      nil ->
-        {:cancel, "client #{client_id} not found"}
-
-      client ->
-        ApiGateway.Mailer.send_report_ready(client)
-    end
-  end
-
-  def perform(%Oban.Job{args: %{"type" => type}}) do
-    {:cancel, "unknown notification type: #{type}"}
+  @impl Oban.Worker
+  def backoff(%Oban.Job{attempt: attempt}) do
+    trunc(:math.pow(2, attempt) * 10)
   end
 end
 ```
 
-### Step 6: `lib/api_gateway/workers/audit_worker.ex`
-
-The audit worker writes event logs to the analytics store. It runs at high volume
-on a dedicated queue with 50 concurrent slots.
-
 ```elixir
-defmodule ApiGateway.Workers.AuditWorker do
+# lib/oban_intro/workers/webhook_worker.ex
+defmodule ObanIntro.Workers.WebhookWorker do
+  @moduledoc """
+  Delivers a webhook. Retries up to 20 times across ~24 hours.
+  `max_attempts: 20` with polynomial backoff covers about a day of retries.
+  """
+
   use Oban.Worker,
-    queue: :audit,
-    max_attempts: 3
-
-  @known_events ~w(api_request client_login client_logout rate_limited config_changed)
+    queue: :webhooks,
+    max_attempts: 20,
+    priority: 3,
+    tags: ["external", "retryable"]
 
   @impl Oban.Worker
-  def perform(%Oban.Job{args: %{"event" => event, "client_id" => client_id, "metadata" => meta}}) do
-    unless event in @known_events do
-      return {:cancel, "unknown event type: #{event}"}
-    end
-
-    audit_entry = %{
-      event: event,
-      client_id: client_id,
-      metadata: meta,
-      recorded_at: DateTime.utc_now()
-    }
-
-    case ApiGateway.Analytics.record(audit_entry) do
-      :ok ->
-        :ok
-
-      {:error, :connection_refused} ->
-        {:error, "analytics store unavailable"}
-
-      {:error, reason} ->
-        {:error, reason}
+  def perform(%Oban.Job{args: %{"url" => url, "payload" => payload}}) do
+    case deliver(url, payload) do
+      {:ok, status} when status in 200..299 -> :ok
+      {:ok, 429} -> {:snooze, 60}
+      {:ok, status} when status in 400..499 -> {:cancel, {:client_error, status}}
+      {:ok, status} -> {:error, {:server_error, status}}
+      {:error, reason} -> {:error, reason}
     end
   end
 
-  def perform(%Oban.Job{args: %{"event" => event}}) when event not in @known_events do
-    {:cancel, "unknown event type: #{event}"}
+  defp deliver(_url, _payload) do
+    # In production: HTTP client call (Req/Finch). Stubbed here for the exercise.
+    {:ok, 200}
   end
 end
 ```
 
-### Step 7: `lib/api_gateway/workers/report_worker.ex`
-
-The report worker handles slow, CPU-bound report generation. It chains a notification
-job upon completion so the client is informed when their report is ready.
-
 ```elixir
-defmodule ApiGateway.Workers.ReportWorker do
-  use Oban.Worker,
-    queue: :reports,
-    max_attempts: 3,
-    unique: [period: 3_600, fields: [:args, :worker], keys: [:client_id, :period]]
+# lib/oban_intro/workers/email_worker.ex
+defmodule ObanIntro.Workers.EmailWorker do
+  @moduledoc """
+  Sends transactional emails. Priority 0 for password resets, 7 for newsletters.
+  """
+
+  use Oban.Worker, queue: :emails, max_attempts: 5
 
   @impl Oban.Worker
-  def perform(%Oban.Job{args: %{"client_id" => client_id, "period" => period}}) do
-    case ApiGateway.Clients.get(client_id) do
-      nil ->
-        {:cancel, "client #{client_id} not found"}
-
-      client ->
-        with {:ok, report} <- ApiGateway.Reports.generate(client, period),
-             {:ok, _stored} <- ApiGateway.Reports.store(report) do
-          %{"type" => "report_ready", "client_id" => client_id}
-          |> ApiGateway.Workers.NotificationWorker.new()
-          |> Oban.insert()
-
-          :ok
-        else
-          {:error, :timeout} ->
-            {:error, "report generation timed out"}
-
-          {:error, reason} ->
-            {:error, reason}
-        end
-    end
+  def perform(%Oban.Job{args: %{"template" => template, "to" => to}}) do
+    # In production: Swoosh/Bamboo. Stubbed.
+    Process.sleep(10)
+    {:ok, %{template: template, to: to}}
   end
-
-  def timeout(_job), do: :timer.minutes(10)
 end
 ```
 
-### Step 8: `lib/api_gateway/oban_logger.ex`
-
-Structured logging for all Oban job lifecycle events.
+### Step 6: Telemetry
 
 ```elixir
-defmodule ApiGateway.ObanLogger do
+# lib/oban_intro/observability/telemetry.ex
+defmodule ObanIntro.Observability.Telemetry do
+  @moduledoc false
+  use GenServer
+
   require Logger
 
-  def attach do
+  def start_link(_), do: GenServer.start_link(__MODULE__, [], name: __MODULE__)
+
+  @impl true
+  def init(_) do
     events = [
       [:oban, :job, :start],
       [:oban, :job, :stop],
-      [:oban, :job, :exception]
+      [:oban, :job, :exception],
+      [:oban, :circuit, :trip]
     ]
-    :telemetry.attach_many("api-gateway-oban", events, &handle_event/4, [])
+
+    :telemetry.attach_many("oban-logger", events, &handle/4, nil)
+    {:ok, %{}}
   end
 
-  def handle_event([:oban, :job, :stop], %{duration: dur}, meta, _) do
-    ms = System.convert_time_unit(dur, :native, :millisecond)
-    Logger.info("[Oban] #{meta.worker} #{meta.queue} #{meta.state} #{ms}ms " <>
-                "attempt=#{meta.attempt}/#{meta.max_attempts}")
-  end
-
-  def handle_event([:oban, :job, :exception], _measurements, meta, _) do
-    Logger.error("[Oban] #{meta.worker} failed: #{inspect(meta.reason)}",
-      job: meta.job,
-      stacktrace: meta.stacktrace
+  def handle([:oban, :job, :stop], measurements, meta, _) do
+    Logger.info(
+      "job ok: worker=#{meta.worker} queue=#{meta.queue} " <>
+        "dur_ms=#{System.convert_time_unit(measurements.duration, :native, :millisecond)}"
     )
   end
 
-  def handle_event([:oban, :job, :start], _, meta, _) do
-    Logger.debug("[Oban] #{meta.worker} starting attempt #{meta.attempt}")
-  end
-end
-```
-
-### Step 9: Tests
-
-```elixir
-# test/api_gateway/workers/notification_worker_test.exs
-defmodule ApiGateway.Workers.NotificationWorkerTest do
-  use ApiGateway.DataCase
-  use Oban.Testing, repo: ApiGateway.Repo
-
-  alias ApiGateway.Workers.NotificationWorker
-
-  test "welcome job succeeds for existing client" do
-    client = insert(:client)
-
-    assert :ok = perform_job(NotificationWorker, %{
-      "type"      => "welcome",
-      "client_id" => client.id
-    })
-  end
-
-  test "cancels for unknown notification type" do
-    assert {:cancel, _reason} = perform_job(NotificationWorker, %{
-      "type"      => "nonexistent_type",
-      "client_id" => "any"
-    })
-  end
-
-  test "unique jobs: second enqueue returns conflict" do
-    args = %{"type" => "welcome", "client_id" => "client-42"}
-
-    {:ok, %{conflict?: false}} = NotificationWorker.new(args) |> Oban.insert()
-    {:ok, %{conflict?: true}}  = NotificationWorker.new(args) |> Oban.insert()
-  end
-end
-```
-
-```elixir
-# test/api_gateway/workers/report_worker_test.exs
-defmodule ApiGateway.Workers.ReportWorkerTest do
-  use ApiGateway.DataCase
-  use Oban.Testing, repo: ApiGateway.Repo
-
-  alias ApiGateway.Workers.{ReportWorker, NotificationWorker}
-
-  test "report job enqueues notification on completion" do
-    client = insert(:client)
-
-    assert :ok = perform_job(ReportWorker, %{
-      "client_id" => client.id,
-      "period"    => "2026-03"
-    })
-
-    assert_enqueued(
-      worker: NotificationWorker,
-      args: %{"type" => "report_ready", "client_id" => client.id}
+  def handle([:oban, :job, :exception], _m, meta, _) do
+    Logger.error(
+      "job fail: worker=#{meta.worker} queue=#{meta.queue} " <>
+        "attempt=#{meta.attempt} reason=#{inspect(meta.reason)}"
     )
   end
 
-  test "scheduled jobs are inserted in :scheduled state" do
-    {:ok, job} = ReportWorker.new(
-      %{"client_id" => "c1", "period" => "2026-04"},
-      scheduled_at: DateTime.add(DateTime.utc_now(), 3600, :second)
-    ) |> Oban.insert()
+  def handle(_event, _m, _meta, _), do: :ok
+end
+```
 
-    assert job.state == "scheduled"
+### Step 7: Tests
+
+```elixir
+# test/test_helper.exs
+ExUnit.start()
+Ecto.Adapters.SQL.Sandbox.mode(ObanIntro.Repo, :manual)
+```
+
+```elixir
+# test/oban_intro/workers/pdf_worker_test.exs
+defmodule ObanIntro.Workers.PdfWorkerTest do
+  use ExUnit.Case, async: true
+  use Oban.Testing, repo: ObanIntro.Repo
+
+  alias ObanIntro.Workers.PdfWorker
+
+  setup do
+    :ok = Ecto.Adapters.SQL.Sandbox.checkout(ObanIntro.Repo)
+  end
+
+  test "perform/1 returns ok with pdf bytes" do
+    assert {:ok, %{invoice_id: 7}} = perform_job(PdfWorker, %{invoice_id: 7})
+  end
+
+  test "unique constraint prevents duplicates" do
+    {:ok, _} = PdfWorker.new(%{invoice_id: 7}) |> Oban.insert()
+    assert {:ok, %Oban.Job{conflict?: true}} = PdfWorker.new(%{invoice_id: 7}) |> Oban.insert()
+  end
+
+  test "backoff grows exponentially" do
+    assert PdfWorker.backoff(%Oban.Job{attempt: 1}) < PdfWorker.backoff(%Oban.Job{attempt: 3})
   end
 end
 ```
 
-### Step 10: Run the tests
+```elixir
+# test/oban_intro/workers/webhook_worker_test.exs
+defmodule ObanIntro.Workers.WebhookWorkerTest do
+  use ExUnit.Case, async: true
+  use Oban.Testing, repo: ObanIntro.Repo
+
+  alias ObanIntro.Workers.WebhookWorker
+
+  setup do
+    :ok = Ecto.Adapters.SQL.Sandbox.checkout(ObanIntro.Repo)
+  end
+
+  test "delivers successfully with 2xx" do
+    assert :ok =
+             perform_job(WebhookWorker, %{
+               "url" => "https://example.com/hook",
+               "payload" => %{"event" => "order.placed"}
+             })
+  end
+end
+```
+
+Run tests:
 
 ```bash
-mix test test/api_gateway/workers/ --trace
+mix test
+```
+
+### Step 8: Enqueue in IEx
+
+```elixir
+iex -S mix
+
+{:ok, _} = ObanIntro.Workers.PdfWorker.new(%{invoice_id: 42}) |> Oban.insert()
+
+{:ok, _} = ObanIntro.Workers.EmailWorker.new(
+  %{template: "welcome", to: "alice@example.com"},
+  priority: 0
+) |> Oban.insert()
+
+# Schedule for later
+ObanIntro.Workers.EmailWorker.new(%{template: "nudge", to: "bob@example.com"},
+  scheduled_at: DateTime.add(DateTime.utc_now(), 3600, :second)
+) |> Oban.insert()
 ```
 
 ---
 
-## Trade-off analysis
+## Trade-offs and production gotchas
 
-| Aspect | Oban (PostgreSQL) | Custom in-memory scheduler | Raw `Task.async` |
-|--------|-------------------|---------------------------|-----------------|
-| Durability on crash | yes (DB-persisted) | no | no |
-| At-least-once | yes (Lifeline plugin) | no | no |
-| Unique jobs | yes (DB constraint) | no | no |
-| Distributed | yes (shared DB) | no (single node) | no |
-| Latency to enqueue | DB round-trip (~5ms) | none | none |
-| Dependencies | Oban + Ecto + Postgres | none | none |
-| Observability | Oban Web dashboard | custom | none |
+**1. Postgres is the bottleneck.** Throughput is limited by how fast Postgres
+can lock and update rows. Expect 20–50k jobs/minute per small instance. For
+higher throughput, partition queues across multiple DBs or use Oban Pro's
+`SmartEngine`.
+
+**2. `unique: [period: N]` scans the jobs table.** The unique check runs a `SELECT`
+on every enqueue. With millions of queued jobs this becomes slow. Make sure the
+`oban_jobs` indexes are healthy and use `Oban.Plugins.Pruner` to evict completed
+rows.
+
+**3. Long-running jobs block their slot.** If one `:pdf` job takes 10 minutes,
+that slot is unavailable. Either raise queue concurrency or break the job into
+smaller chunks.
+
+**4. Deploys with in-flight jobs.** Default graceful shutdown waits 30 s. Jobs
+running longer are killed and retried on the next boot. Set `:shutdown_grace_period`
+explicitly (e.g., 60_000 ms) and keep jobs idempotent.
+
+**5. Transactional enqueue requires `Oban.insert/1` inside `Ecto.Multi`.** Using
+`%{...} |> MyWorker.new() |> Oban.insert()` inside a changeset pipeline but
+*outside* the Multi DOES NOT participate in the transaction.
+
+**6. `{:cancel, reason}` is permanent.** A worker returning `{:cancel, _}` marks
+the job `cancelled` — no retries, no alerts by default. Use it for non-retryable
+errors (e.g., malformed input). Don't confuse with `{:error, _}`.
+
+**7. Priority is per-queue, not global.** A priority-0 email does not preempt a
+priority-9 invoice PDF; they live in different queues. If you need global
+priorities, collapse them into one queue.
+
+**8. When NOT to use Oban.** High-fanout pub/sub (use Phoenix.PubSub), real-time
+streaming (Broadway/GenStage), or ephemeral intra-node tasks (exercise 44). If
+you don't already run Postgres, the operational overhead isn't worth it for
+low-volume workloads — use a simple in-VM scheduler or Oban's SQLite engine.
 
 ---
 
-## Common production mistakes
+## Performance notes
 
-**1. Using `{:error, reason}` for invalid arguments**
-If a job is enqueued with `client_id: nil` and you return `{:error, "client not found"}`,
-Oban retries it 5 times before discarding. Use `{:cancel, reason}` for logic errors that
-retrying cannot fix.
+Benchmark enqueue throughput with a single Postgres 16 instance on local SSD:
 
-**2. Not configuring `testing: :inline` in test.exs**
-Without `testing: :inline`, Oban in tests starts its polling infrastructure and jobs run
-asynchronously. Tests become flaky and slow. Always set `testing: :inline` for tests.
+```elixir
+# bench/enqueue_bench.exs
+jobs =
+  for i <- 1..10_000 do
+    ObanIntro.Workers.EmailWorker.new(%{template: "t", to: "u#{i}@x.com"})
+  end
 
-**3. Overloading the `:default` queue**
-All workers in the same queue compete for the concurrency limit. A slow `report_worker`
-consuming the limit of `:default` will delay urgent `notification_worker` jobs. Separate
-queues by criticality and expected duration.
+{time, _} = :timer.tc(fn -> Oban.insert_all(jobs) end)
+IO.puts("#{10_000 / (time / 1_000_000)} jobs/sec")
+```
 
-**4. Not setting `timeout/1` on long-running workers**
-A stuck `ReportWorker` holds a slot in the queue forever without a timeout. The Lifeline
-plugin rescues jobs after 30 minutes, but a per-job timeout gives you finer control.
+Expect around 8k–15k inserts/sec via `insert_all`. Individual `Oban.insert/1`
+calls go at 1–3k/sec due to round-trip overhead.
 
-**5. `Oban.insert!/1` instead of `Oban.insert/1` in production code**
-`insert!/1` raises on error (DB down, constraint violation). In a request handler, this
-crashes the request. Use `insert/1` and handle the `{:error, changeset}` case.
+Execution throughput scales with queue concurrency. Measure with the
+`[:oban, :job, :stop]` telemetry event; a queue of `concurrency: 50` doing 20 ms
+of work per job can push ~2,500 jobs/sec.
 
 ---
 
 ## Resources
 
-- [Oban documentation](https://hexdocs.pm/oban/Oban.html) -- complete API reference
-- [Oban.Testing](https://hexdocs.pm/oban/Oban.Testing.html) -- `perform_job/2`, `assert_enqueued/1`
-- [Oban plugins](https://hexdocs.pm/oban/Oban.Plugins.Pruner.html) -- Pruner, Lifeline, Stager
-- [Oban Web](https://getoban.pro/oban-web) -- commercial dashboard for monitoring queues
+- [Oban — hexdocs.pm](https://hexdocs.pm/oban/Oban.html)
+- [Oban — GitHub](https://github.com/oban-bg/oban)
+- [Parker Selbert — "Reliable background jobs in Elixir and Postgres"](https://soren.blog/post/reliable-background-jobs-in-elixir-and-postgres/)
+- [PostgreSQL docs — SKIP LOCKED](https://www.postgresql.org/docs/current/sql-select.html#SQL-FOR-UPDATE-SHARE)
+- [Oban telemetry guide — hexdocs.pm](https://hexdocs.pm/oban/Oban.Telemetry.html)
+- [Dashbit — Ecto Multi & Oban](https://dashbit.co/blog/oban-recipes-part-1-unique-jobs)
+- [AWS — Exponential Backoff and Jitter](https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/)

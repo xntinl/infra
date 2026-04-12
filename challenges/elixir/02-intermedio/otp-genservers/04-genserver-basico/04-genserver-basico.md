@@ -2,9 +2,6 @@
 
 **Project**: `kv_store_gs` — a minimal `get/put/delete` key/value store as a GenServer, with proper API separation.
 
-**Difficulty**: ★★☆☆☆
-**Estimated time**: 1–2 hours
-
 ---
 
 ## Project context
@@ -32,6 +29,11 @@ kv_store_gs/
 ```
 
 ---
+
+
+## Why X and not Y
+
+- **Why not a lower-level alternative?** For genserver basico, OTP's pattern is what reviewers will expect and what observability tools support out of the box.
 
 ## Core concepts
 
@@ -74,7 +76,31 @@ which is what makes GenServer code so easy to test.
 
 ---
 
+## Design decisions
+
+**Option A — a bare process with `receive`**
+- Pros: simpler upfront, fewer moving parts.
+- Cons: hides the trade-off that this exercise exists to teach.
+
+**Option B — a GenServer (chosen)**
+- Pros: explicit about the semantic that matters in production.
+- Cons: one more concept to internalize.
+
+→ Chose **B** because OTP gives us timeouts, code_change, supervision, and introspection for free.
+
+
 ## Implementation
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defp deps do
+  [
+    # stdlib-only by default; add `{:benchee, "~> 1.3", only: :dev}` if you benchmark
+  ]
+end
+```
+
 
 ### Step 1: Create the project
 
@@ -225,6 +251,15 @@ mix test
 
 ---
 
+### Why this works
+
+The design leans on OTP primitives that already encode the invariants we care about (supervision, back-pressure, explicit message semantics), so failure modes are visible at the right layer instead of being reinvented ad-hoc. Tests exercise the edges (timeouts, crashes, boundary states), which is where hand-rolled alternatives silently drift over time.
+
+
+## Benchmark
+
+<!-- benchmark N/A: tema conceptual -->
+
 ## Trade-offs and production gotchas
 
 **1. A GenServer serializes all access — this is the point, and the cost**
@@ -261,6 +296,11 @@ you need serialized writes, a small working set, and the simplicity of
 "one process owns the data".
 
 ---
+
+
+## Reflection
+
+- Un colega propone un GenServer para guardar una constante de configuración. ¿Qué le recomendás y por qué?
 
 ## Resources
 

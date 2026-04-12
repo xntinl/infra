@@ -2,9 +2,6 @@
 
 **Project**: `nested_trees` — a root supervisor with two independent subtree supervisors; a crash-loop in one subtree must not affect the other.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
-
 ---
 
 ## Project context
@@ -38,6 +35,11 @@ nested_trees/
 ```
 
 ---
+
+
+## Why X and not Y
+
+- **Why not a flat supervisor?** Blast radius is the whole app; nesting lets subtrees fail independently.
 
 ## Core concepts
 
@@ -87,7 +89,31 @@ put them under separate subtrees with a `:one_for_one` root.
 
 ---
 
+## Design decisions
+
+**Option A — flat supervisor**
+- Pros: simpler upfront, fewer moving parts.
+- Cons: hides the trade-off that this exercise exists to teach.
+
+**Option B — nested supervision trees (chosen)**
+- Pros: explicit about the semantic that matters in production.
+- Cons: one more concept to internalize.
+
+→ Chose **B** because blast radius control — a subtree crash shouldn't take down unrelated siblings.
+
+
 ## Implementation
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defp deps do
+  [
+    # stdlib-only by default; add `{:benchee, "~> 1.3", only: :dev}` if you benchmark
+  ]
+end
+```
+
 
 ### Step 1: Create the project
 
@@ -268,6 +294,15 @@ mix test
 
 ---
 
+### Why this works
+
+The design leans on OTP primitives that already encode the invariants we care about (supervision, back-pressure, explicit message semantics), so failure modes are visible at the right layer instead of being reinvented ad-hoc. Tests exercise the edges (timeouts, crashes, boundary states), which is where hand-rolled alternatives silently drift over time.
+
+
+## Benchmark
+
+<!-- benchmark N/A: tema conceptual -->
+
 ## Trade-offs and production gotchas
 
 **1. Flat trees look simpler but couple failure domains**
@@ -297,6 +332,11 @@ background-job-only service probably has Supervisor → [queue, worker
 pool] and that's fine. Premature nesting is architecture theater.
 
 ---
+
+
+## Reflection
+
+- Diseñá el árbol de supervisión para un servicio con DB pool + HTTP clients + job queue. Dibujá las fronteras y justificá cada subtree.
 
 ## Resources
 

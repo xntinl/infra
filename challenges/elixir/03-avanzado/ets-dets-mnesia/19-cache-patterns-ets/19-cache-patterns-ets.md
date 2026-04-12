@@ -1,618 +1,572 @@
-# Cache Patterns with ETS
+# Cache patterns on ETS: read-through, write-through, write-behind
+
+**Project**: `ets_cache_patterns` — three cache strategies implemented against the same source-of-truth, with failure modes and latency profiles compared side-by-side.
+
+**Difficulty**: ★★★★☆
+**Estimated time**: 3–6 hours
+
+---
 
 ## Project context
 
-You are building `api_gateway`, an internal HTTP gateway that routes traffic to microservices.
-This exercise focuses on building a cache layer between the router and the upstream clients,
-with TTL-based expiry, periodic cleanup, and stampede prevention.
+Your product catalog service backs every page of an e-commerce site. Requests hit a Postgres
+`products` table; most reads are for a small hot set of SKUs. You've been asked to add a cache
+layer in front, but the team has not decided between three common strategies:
 
-Project structure:
+- **Read-through**: cache misses fetch from the source, fill the cache, return.
+- **Write-through**: writes go to the cache AND the source synchronously; reads are cache-first.
+- **Write-behind** (a.k.a. write-back): writes go to the cache only; a background worker flushes
+  batches to the source asynchronously.
+
+Each has failure modes you need to understand before choosing. In this exercise you'll implement
+all three behind a common `CacheStrategy` behaviour, run the same micro-benchmark through each,
+and simulate a source outage so the tests show how each strategy degrades.
+
+The "source" is a stub GenServer that sleeps 2 ms per op — our stand-in for a slow DB. ETS holds
+the cache. A separate module implements the write-behind flush loop.
 
 ```
-api_gateway/
+ets_cache_patterns/
 ├── lib/
-│   └── api_gateway/
+│   └── ets_cache_patterns/
 │       ├── application.ex
-│       ├── router.ex
-│       └── cache/
-│           ├── store.ex
-│           └── stampede_guard.ex
+│       ├── source.ex
+│       ├── cache_strategy.ex
+│       ├── read_through.ex
+│       ├── write_through.ex
+│       └── write_behind.ex
 ├── test/
-│   └── api_gateway/
-│       └── cache/
-│           ├── store_test.exs
-│           └── stampede_guard_test.exs
-├── bench/
-│   └── cache_bench.exs
+│   └── patterns_test.exs
 └── mix.exs
 ```
 
 ---
 
-## The business problem
+## Core concepts
 
-The platform team reported two problems:
-
-1. **Memory leak**: the cache has been running for 3 days. It's consuming 4 GB of RAM
-   because expired entries are never removed. The TTL is stored but never enforced.
-
-2. **Cache stampede**: when a popular cache entry expires (e.g., the product catalog),
-   all 200 concurrent requests that hit the gateway simultaneously detect the miss and
-   each fires a request to the upstream service. The upstream service falls over under
-   the 200x load spike.
-
----
-
-## Why `System.monotonic_time` for TTL, not `System.os_time`
-
-TTL is a duration measurement: "this entry is valid for 60 seconds from now."
-Duration measurements require a clock that only moves forward.
-
-`System.os_time` can go backwards. NTP synchronization, leap second adjustments, and
-manual clock changes all cause `os_time` to jump backwards. If the clock moves back
-by 5 seconds while an entry has a 60-second TTL, that entry will appear valid for
-65 seconds instead of 60.
-
-`System.monotonic_time` only ever increases. It is the correct clock for TTL comparisons.
-
-The exception: persistent caches that must survive restarts use `os_time` for L2 entries
-because monotonic time resets to zero on restart -- a value stored before restart would
-appear expired immediately after restart if compared against the new monotonic clock.
-
----
-
-## Why cache stampede is a systemic risk, not an edge case
-
-When a high-traffic entry expires, the window between expiry and cache repopulation
-exposes the upstream to a burst equal to the concurrent request rate. For a gateway
-handling 10k req/s with a 60-second TTL, that window produces 10k simultaneous upstream
-requests if not mitigated.
-
-The fix: only one process fetches. The rest wait. This is the **singleton fetch** pattern,
-implemented with `:ets.insert_new/2` as a lightweight mutex.
-
-The double-check inside the lock is not optional:
+### 1. Read-through — lazy population
 
 ```
-Process A: cache miss -> try to acquire lock -> wins
-Process B: cache miss -> try to acquire lock -> waits (polling)
-Process A: fetches from upstream -> populates cache -> releases lock
-Process B: polling loop -> checks cache -> HIT (populated by A)
-  without double-check -> B would fetch again despite the cache being warm
+  client.get(k) ─▶ cache.lookup(k) ─miss─▶ source.get(k) ─▶ cache.insert(k,v) ─▶ return v
+                            │
+                            └─hit──▶ return v
 ```
+
+Pros: cache fills on demand, no cold start worry.
+Cons: a thundering herd on a popular cold key — 10k concurrent requests each call the source.
+Mitigation: single-flight (one call in flight per key, others wait).
+
+### 2. Write-through — synchronous dual-write
+
+```
+  client.put(k,v) ─▶ source.put(k,v) ─▶ cache.insert(k,v) ─▶ :ok
+```
+
+Pros: cache and source are always consistent. Readers never see stale writes.
+Cons: write latency = cache + source. If the source is slow, writes are slow.
+Failure mode: if the source write succeeds but the cache write fails, retries can "un-see" the
+update until the next cache eviction. The ordering "source first" matters.
+
+### 3. Write-behind — async batched flush
+
+```
+  client.put(k,v) ─▶ cache.insert(k,v) ─▶ enqueue ─▶ :ok   (fast)
+                                                │
+                                                ▼
+                                        flusher batches & writes source
+```
+
+Pros: write latency = ETS insert (~µs). Backpressure via batch size.
+Cons: if the node dies before flush, writes are lost. Readers on another node see stale data
+until flush. Requires a durable queue for at-least-once guarantees.
+
+### 4. Single-flight (a.k.a. request coalescing)
+
+To prevent a thundering herd on read-through, keep a "flight table" keyed by cache key.
+First reader inserts `{key, pid}`; subsequent readers see the pid and wait for a message.
+The first reader publishes the result to all waiters.
+
+### 5. Bounded caches
+
+Real ETS caches need size limits. Either periodic LRU eviction (exercise 43) or a simple cap on
+`:ets.info(t, :size)` with a random-drop policy. This exercise uses no eviction — we assume the
+working set fits in RAM.
 
 ---
 
 ## Implementation
 
-### Step 1: `lib/api_gateway/cache/store.ex`
+### Step 1: `mix.exs`
 
 ```elixir
-defmodule ApiGateway.Cache.Store do
-  @moduledoc """
-  TTL cache backed by ETS with automatic cleanup.
+defmodule EtsCachePatterns.MixProject do
+  use Mix.Project
 
-  Design:
-  - Reads bypass the GenServer entirely (direct :ets.lookup)
-  - Writes go directly to ETS (:ets.insert is atomic for a single record)
-  - Cleanup runs periodically via handle_info -- no separate supervisor needed
-  - Lazy eviction on read removes expired entries on access
-  - Periodic cleanup removes entries that expire without being accessed
-  """
+  def project do
+    [app: :ets_cache_patterns, version: "0.1.0", elixir: "~> 1.16",
+     deps: []]
+  end
 
+  def application do
+    [extra_applications: [:logger], mod: {EtsCachePatterns.Application, []}]
+  end
+end
+```
+
+### Step 2: `lib/ets_cache_patterns/application.ex`
+
+```elixir
+defmodule EtsCachePatterns.Application do
+  @moduledoc false
+  use Application
+
+  @impl true
+  def start(_type, _args) do
+    children = [
+      EtsCachePatterns.Source,
+      EtsCachePatterns.ReadThrough,
+      EtsCachePatterns.WriteThrough,
+      EtsCachePatterns.WriteBehind
+    ]
+
+    Supervisor.start_link(children, strategy: :one_for_one, name: EtsCachePatterns.Supervisor)
+  end
+end
+```
+
+### Step 3: `lib/ets_cache_patterns/source.ex`
+
+```elixir
+defmodule EtsCachePatterns.Source do
+  @moduledoc "Stub source-of-truth. Each op sleeps to simulate DB latency."
   use GenServer
 
-  @table :cache_store
-  @cleanup_interval_ms 30_000
+  @latency_ms 2
 
-  # ---------------------------------------------------------------------------
-  # Public API -- reads do not go through the GenServer
-  # ---------------------------------------------------------------------------
+  def start_link(_), do: GenServer.start_link(__MODULE__, %{}, name: __MODULE__)
 
-  @doc """
-  Returns {:ok, value} if the key exists and has not expired.
-  Returns :miss otherwise. Expired entries are lazily deleted on miss.
+  def get(key), do: GenServer.call(__MODULE__, {:get, key})
+  def put(key, value), do: GenServer.call(__MODULE__, {:put, key, value})
+  def fail(flag), do: GenServer.call(__MODULE__, {:fail, flag})
+  def reset, do: GenServer.call(__MODULE__, :reset)
+
+  @impl true
+  def init(_), do: {:ok, %{store: %{}, fail?: false}}
+
+  @impl true
+  def handle_call({:get, _k}, _from, %{fail?: true} = s), do: {:reply, {:error, :source_down}, s}
+
+  def handle_call({:get, k}, _from, %{store: store} = s) do
+    Process.sleep(@latency_ms)
+    {:reply, Map.fetch(store, k), s}
+  end
+
+  def handle_call({:put, _k, _v}, _from, %{fail?: true} = s),
+    do: {:reply, {:error, :source_down}, s}
+
+  def handle_call({:put, k, v}, _from, %{store: store} = s) do
+    Process.sleep(@latency_ms)
+    {:reply, :ok, %{s | store: Map.put(store, k, v)}}
+  end
+
+  def handle_call({:fail, flag}, _from, s), do: {:reply, :ok, %{s | fail?: flag}}
+  def handle_call(:reset, _from, _s), do: {:reply, :ok, %{store: %{}, fail?: false}}
+end
+```
+
+### Step 4: `lib/ets_cache_patterns/cache_strategy.ex`
+
+```elixir
+defmodule EtsCachePatterns.CacheStrategy do
+  @moduledoc "Common contract for all three cache patterns."
+
+  @callback get(key :: term()) :: {:ok, term()} | :error | {:error, term()}
+  @callback put(key :: term(), value :: term()) :: :ok | {:error, term()}
+end
+```
+
+### Step 5: `lib/ets_cache_patterns/read_through.ex`
+
+```elixir
+defmodule EtsCachePatterns.ReadThrough do
+  @moduledoc """
+  Read-through cache. On miss we call the source and fill the cache.
+
+  Includes single-flight coalescing: concurrent misses for the same key share
+  one source call. The first caller stores `{key, {:pending, [waiters]}}` in a
+  parallel :flight table; others attach to that list and wait on a message.
   """
-  @spec get(term()) :: {:ok, term()} | :miss
-  def get(key) do
-    now = System.monotonic_time(:millisecond)
+  use GenServer
+  @behaviour EtsCachePatterns.CacheStrategy
 
-    case :ets.lookup(@table, key) do
-      [{^key, value, expires_at}] when expires_at > now ->
+  alias EtsCachePatterns.Source
+
+  @cache :rt_cache
+  @flight :rt_flight
+
+  def start_link(_), do: GenServer.start_link(__MODULE__, nil, name: __MODULE__)
+
+  @impl EtsCachePatterns.CacheStrategy
+  def get(key) do
+    case :ets.lookup(@cache, key) do
+      [{^key, v}] -> {:ok, v}
+      [] -> single_flight_fetch(key)
+    end
+  end
+
+  @impl EtsCachePatterns.CacheStrategy
+  def put(_key, _value), do: {:error, :read_only_strategy}
+
+  @impl true
+  def init(_) do
+    :ets.new(@cache, [:named_table, :public, :set, read_concurrency: true])
+    :ets.new(@flight, [:named_table, :public, :set])
+    {:ok, %{}}
+  end
+
+  defp single_flight_fetch(key) do
+    case :ets.insert_new(@flight, {key, self()}) do
+      true ->
+        result = fetch_and_fill(key)
+        notify_waiters(key, result)
+        result
+
+      false ->
+        wait_for_result(key)
+    end
+  end
+
+  defp fetch_and_fill(key) do
+    case Source.get(key) do
+      {:ok, value} ->
+        :ets.insert(@cache, {key, value})
         {:ok, value}
 
-      [{^key, _value, _expired}] ->
-        # Lazy eviction: delete expired entry immediately on access
-        :ets.delete(@table, key)
-        :miss
+      :error ->
+        :error
+
+      {:error, _} = err ->
+        err
+    end
+  end
+
+  defp notify_waiters(key, result) do
+    # Register waiters under a second ets key during wait; publish to all.
+    waiters =
+      case :ets.lookup(@flight, {key, :waiters}) do
+        [{_, list}] -> list
+        [] -> []
+      end
+
+    Enum.each(waiters, fn pid -> send(pid, {:rt_result, key, result}) end)
+    :ets.delete(@flight, {key, :waiters})
+    :ets.delete(@flight, key)
+  end
+
+  defp wait_for_result(key) do
+    :ets.update_counter(@flight, {key, :waiters}, {2, 0}, {{key, :waiters}, []})
+    # Append self to waiters list — done via a small update trick below.
+    existing =
+      case :ets.lookup(@flight, {key, :waiters}) do
+        [{_, list}] -> list
+        [] -> []
+      end
+
+    :ets.insert(@flight, {{key, :waiters}, [self() | existing]})
+
+    receive do
+      {:rt_result, ^key, result} -> result
+    after
+      5_000 -> {:error, :timeout}
+    end
+  end
+end
+```
+
+### Step 6: `lib/ets_cache_patterns/write_through.ex`
+
+```elixir
+defmodule EtsCachePatterns.WriteThrough do
+  @moduledoc """
+  Write-through cache. Writes hit source first, then cache. Reads are
+  cache-first with lazy fill on miss (same as read-through).
+  """
+  use GenServer
+  @behaviour EtsCachePatterns.CacheStrategy
+
+  alias EtsCachePatterns.Source
+
+  @cache :wt_cache
+
+  def start_link(_), do: GenServer.start_link(__MODULE__, nil, name: __MODULE__)
+
+  @impl EtsCachePatterns.CacheStrategy
+  def get(key) do
+    case :ets.lookup(@cache, key) do
+      [{^key, v}] ->
+        {:ok, v}
 
       [] ->
-        :miss
+        case Source.get(key) do
+          {:ok, v} ->
+            :ets.insert(@cache, {key, v})
+            {:ok, v}
+
+          other ->
+            other
+        end
     end
   end
 
-  @doc """
-  Stores a value with the given TTL in milliseconds.
-  Direct ETS write -- no GenServer serialization needed for writes
-  because :ets.insert is atomic for a single record.
-  """
-  @spec put(term(), term(), pos_integer()) :: :ok
-  def put(key, value, ttl_ms \\ 60_000) do
-    expires_at = System.monotonic_time(:millisecond) + ttl_ms
-    :ets.insert(@table, {key, value, expires_at})
-    :ok
-  end
+  @impl EtsCachePatterns.CacheStrategy
+  def put(key, value) do
+    case Source.put(key, value) do
+      :ok ->
+        :ets.insert(@cache, {key, value})
+        :ok
 
-  @doc """
-  Returns the value if cached and fresh.
-  On miss: calls fetch_fn/0, caches the result, returns it.
-  NOT stampede-safe -- use StampedeGuard.get_or_fetch/3 for hot keys.
-  """
-  @spec get_or_put(term(), (-> term()), pos_integer()) :: {:ok, term(), :hit | :miss}
-  def get_or_put(key, fetch_fn, ttl_ms \\ 60_000) do
-    case get(key) do
-      {:ok, value} ->
-        {:ok, value, :hit}
-
-      :miss ->
-        value = fetch_fn.()
-        put(key, value, ttl_ms)
-        {:ok, value, :miss}
+      err ->
+        err
     end
-  end
-
-  @spec delete(term()) :: :ok
-  def delete(key) do
-    :ets.delete(@table, key)
-    :ok
-  end
-
-  @doc """
-  Returns %{total: N, expired: N, fresh: N} without removing any entries.
-  Uses :ets.select_count -- no full table copy.
-  """
-  @spec stats() :: %{total: non_neg_integer(), expired: non_neg_integer(), fresh: non_neg_integer()}
-  def stats do
-    now = System.monotonic_time(:millisecond)
-    total = :ets.info(@table, :size)
-    # :ets.fun2ms generates compile-time match specs -- valid here because
-    # `now` is bound at call time and captured in the closure correctly
-    expired_ms = :ets.fun2ms(fn {_k, _v, expires_at} when expires_at =< now -> true end)
-    expired = :ets.select_count(@table, expired_ms)
-    %{total: total, expired: expired, fresh: total - expired}
-  end
-
-  @spec flush() :: :ok
-  def flush do
-    :ets.delete_all_objects(@table)
-    :ok
-  end
-
-  # ---------------------------------------------------------------------------
-  # GenServer -- owns the table and runs periodic cleanup
-  # ---------------------------------------------------------------------------
-
-  def start_link(opts \\ []) do
-    GenServer.start_link(__MODULE__, opts, name: __MODULE__)
   end
 
   @impl true
-  def init(opts) do
-    table = :ets.new(@table, [
-      :set,
-      :public,
-      :named_table,
-      {:read_concurrency, true},
-      {:write_concurrency, true}
-    ])
-
-    interval = Keyword.get(opts, :cleanup_interval_ms, @cleanup_interval_ms)
-    Process.send_after(self(), :cleanup, interval)
-
-    {:ok, %{table: table, interval: interval}}
-  end
-
-  @impl true
-  def handle_info(:cleanup, state) do
-    now = System.monotonic_time(:millisecond)
-    ms = :ets.fun2ms(fn {_k, _v, expires_at} when expires_at =< now -> true end)
-    deleted = :ets.select_delete(@table, ms)
-
-    if deleted > 0 do
-      IO.puts("[Cache.Store] cleanup: removed #{deleted} expired entries")
-    end
-
-    Process.send_after(self(), :cleanup, state.interval)
-    {:noreply, state}
+  def init(_) do
+    :ets.new(@cache, [:named_table, :public, :set, read_concurrency: true])
+    {:ok, %{}}
   end
 end
 ```
 
-### Step 2: `lib/api_gateway/cache/stampede_guard.ex`
+### Step 7: `lib/ets_cache_patterns/write_behind.ex`
 
 ```elixir
-defmodule ApiGateway.Cache.StampedeGuard do
+defmodule EtsCachePatterns.WriteBehind do
   @moduledoc """
-  Stampede-safe cache wrapper.
+  Write-behind cache. Writes land only in the cache and in an ETS-backed
+  write buffer. A periodic flusher drains the buffer in batches to the source.
 
-  Guarantees that fetch_fn is called at most once per key per TTL window,
-  even when many processes concurrently detect the same cache miss.
-
-  Implementation: uses a separate ETS lock table with :ets.insert_new/2 as
-  a lightweight mutex. The process that wins the lock fetches; the rest poll
-  with exponential backoff until the key appears in the cache.
-
-  insert_new/2 is atomic -- it returns true only for the first process that inserts
-  the lock key, and false for all subsequent attempts. This makes it a perfect
-  lightweight mutex without requiring a GenServer serialization point.
+  The buffer is `:duplicate_bag` so multiple writes for the same key are
+  preserved in arrival order — the flusher keeps only the most recent.
   """
-
   use GenServer
+  @behaviour EtsCachePatterns.CacheStrategy
 
-  @cache_table :stampede_cache
-  @lock_table :stampede_locks
-  @default_ttl_ms 60_000
-  @lock_timeout_ms 10_000
-  @poll_interval_ms 5
+  alias EtsCachePatterns.Source
 
-  # ---------------------------------------------------------------------------
-  # Public API
-  # ---------------------------------------------------------------------------
+  @cache :wb_cache
+  @buffer :wb_buffer
+  @flush_interval_ms 50
+  @batch_size 100
 
-  @spec get_or_fetch(term(), (-> term()), pos_integer()) ::
-          {:ok, term()} | {:error, :timeout}
-  def get_or_fetch(key, fetch_fn, ttl_ms \\ @default_ttl_ms) do
-    case direct_get(key) do
-      {:ok, value} -> {:ok, value}
-      :miss -> singleton_fetch(key, fetch_fn, ttl_ms)
+  def start_link(_), do: GenServer.start_link(__MODULE__, nil, name: __MODULE__)
+
+  @impl EtsCachePatterns.CacheStrategy
+  def get(key) do
+    case :ets.lookup(@cache, key) do
+      [{^key, v}] -> {:ok, v}
+      [] ->
+        case Source.get(key) do
+          {:ok, v} -> :ets.insert(@cache, {key, v}); {:ok, v}
+          other -> other
+        end
     end
   end
 
-  @spec get_stats() :: %{fetch_count: non_neg_integer(), wait_count: non_neg_integer()}
-  def get_stats do
-    GenServer.call(__MODULE__, :stats)
-  end
-
-  # ---------------------------------------------------------------------------
-  # Private -- direct ETS reads, no GenServer
-  # ---------------------------------------------------------------------------
-
-  defp direct_get(key) do
-    now = System.monotonic_time(:millisecond)
-
-    case :ets.lookup(@cache_table, key) do
-      [{^key, value, expires_at}] when expires_at > now -> {:ok, value}
-      [{^key, _v, _expired}] ->
-        :ets.delete(@cache_table, key)
-        :miss
-      [] -> :miss
-    end
-  end
-
-  defp singleton_fetch(key, fetch_fn, ttl_ms) do
-    lock_key = {:lock, key}
-
-    if :ets.insert_new(@lock_table, {lock_key, self()}) do
-      # This process wins the lock -- responsible for fetching
-      GenServer.cast(__MODULE__, :increment_fetch)
-
-      try do
-        value = fetch_fn.()
-        expires_at = System.monotonic_time(:millisecond) + ttl_ms
-        :ets.insert(@cache_table, {key, value, expires_at})
-        {:ok, value}
-      rescue
-        e ->
-          :ets.delete(@lock_table, lock_key)
-          reraise e, __STACKTRACE__
-      after
-        :ets.delete(@lock_table, lock_key)
-      end
-    else
-      # Another process is fetching -- wait with polling
-      GenServer.cast(__MODULE__, :increment_wait)
-      deadline = System.monotonic_time(:millisecond) + @lock_timeout_ms
-      wait_for_key(key, deadline)
-    end
-  end
-
-  defp wait_for_key(key, deadline) do
-    if System.monotonic_time(:millisecond) >= deadline do
-      {:error, :timeout}
-    else
-      case direct_get(key) do
-        {:ok, value} ->
-          {:ok, value}
-
-        :miss ->
-          Process.sleep(@poll_interval_ms)
-          wait_for_key(key, deadline)
-      end
-    end
-  end
-
-  # ---------------------------------------------------------------------------
-  # GenServer callbacks
-  # ---------------------------------------------------------------------------
-
-  def start_link(opts \\ []) do
-    GenServer.start_link(__MODULE__, opts, name: __MODULE__)
-  end
-
-  @impl true
-  def init(_opts) do
-    :ets.new(@cache_table, [:set, :public, :named_table, {:read_concurrency, true}, {:write_concurrency, true}])
-    :ets.new(@lock_table, [:set, :public, :named_table, {:write_concurrency, true}])
-    {:ok, %{fetch_count: 0, wait_count: 0}}
-  end
-
-  @impl true
-  def handle_cast(:increment_fetch, state) do
-    {:noreply, %{state | fetch_count: state.fetch_count + 1}}
-  end
-
-  @impl true
-  def handle_cast(:increment_wait, state) do
-    {:noreply, %{state | wait_count: state.wait_count + 1}}
-  end
-
-  @impl true
-  def handle_call(:stats, _from, state) do
-    {:reply, state, state}
-  end
-end
-```
-
-### Step 3: Tests
-
-```elixir
-# test/api_gateway/cache/store_test.exs
-defmodule ApiGateway.Cache.StoreTest do
-  use ExUnit.Case, async: false
-
-  alias ApiGateway.Cache.Store
-
-  setup do
-    Store.flush()
+  @impl EtsCachePatterns.CacheStrategy
+  def put(key, value) do
+    ts = :erlang.monotonic_time()
+    :ets.insert(@cache, {key, value})
+    :ets.insert(@buffer, {key, value, ts})
     :ok
   end
 
-  describe "get/1 and put/3" do
-    test "returns :miss for unknown key" do
-      assert :miss = Store.get("unknown")
-    end
+  @doc "Forces an immediate flush; returns the number of records written to source."
+  def flush_now, do: GenServer.call(__MODULE__, :flush, 30_000)
 
-    test "returns value before TTL expiry" do
-      Store.put("key1", "value1", 5_000)
-      assert {:ok, "value1"} = Store.get("key1")
-    end
+  @impl true
+  def init(_) do
+    :ets.new(@cache, [:named_table, :public, :set, read_concurrency: true])
+    :ets.new(@buffer, [:named_table, :public, :duplicate_bag, write_concurrency: true])
+    schedule_flush()
+    {:ok, %{inflight: 0}}
+  end
 
-    test "returns :miss after TTL expiry" do
-      Store.put("short_key", "v", 50)
-      Process.sleep(100)
-      assert :miss = Store.get("short_key")
-    end
+  @impl true
+  def handle_info(:flush, state) do
+    count = do_flush()
+    schedule_flush()
+    {:noreply, %{state | inflight: count}}
+  end
 
-    test "expired entry is removed on access (lazy eviction)" do
-      Store.put("lazy_key", "v", 50)
-      Process.sleep(100)
-      Store.get("lazy_key")
-      # After lazy eviction, the key should not appear in stats as expired
-      stats = Store.stats()
-      # total may be 0 if cleanup also ran, but expired should be 0
-      assert stats.expired == 0 or stats.total == 0
+  @impl true
+  def handle_call(:flush, _from, state), do: {:reply, do_flush(), state}
+
+  defp do_flush do
+    rows = :ets.tab2list(@buffer) |> Enum.take(@batch_size)
+
+    latest =
+      rows
+      |> Enum.group_by(fn {k, _v, _ts} -> k end)
+      |> Enum.map(fn {k, list} ->
+        {k, _v, _ts} = Enum.max_by(list, fn {_, _, ts} -> ts end)
+        {k, Enum.max_by(list, fn {_, _, ts} -> ts end) |> elem(1)}
+      end)
+
+    Enum.each(latest, fn {k, v} ->
+      case Source.put(k, v) do
+        :ok -> delete_buffer_for(k)
+        {:error, _} -> :ok  # leave in buffer for next cycle
+      end
+    end)
+
+    length(latest)
+  end
+
+  defp delete_buffer_for(key) do
+    for {k, v, ts} <- :ets.lookup(@buffer, key) do
+      :ets.delete_object(@buffer, {k, v, ts})
     end
   end
 
-  describe "get_or_put/3" do
-    test "calls fetch_fn on miss and caches result" do
-      fetch_called = :counters.new(1, [])
-
-      {:ok, val, :miss} =
-        Store.get_or_put("computed", fn ->
-          :counters.add(fetch_called, 1, 1)
-          "expensive_result"
-        end, 10_000)
-
-      assert val == "expensive_result"
-      assert :counters.get(fetch_called, 1) == 1
-    end
-
-    test "does not call fetch_fn on subsequent hit" do
-      Store.put("warm_key", "cached", 10_000)
-      fetch_called = :counters.new(1, [])
-
-      {:ok, _val, :hit} = Store.get_or_put("warm_key", fn ->
-        :counters.add(fetch_called, 1, 1)
-        "never_called"
-      end, 10_000)
-
-      assert :counters.get(fetch_called, 1) == 0
-    end
-  end
-
-  describe "stats/0" do
-    test "reports correct counts" do
-      Store.put("s1", 1, 10_000)
-      Store.put("s2", 2, 10_000)
-      Store.put("s3", 3, 50)
-      Process.sleep(100)
-
-      stats = Store.stats()
-      assert stats.fresh >= 2
-      assert stats.expired >= 1
-      assert stats.total == stats.fresh + stats.expired
-    end
-  end
+  defp schedule_flush, do: Process.send_after(self(), :flush, @flush_interval_ms)
 end
 ```
 
+### Step 8: `test/patterns_test.exs`
+
 ```elixir
-# test/api_gateway/cache/stampede_guard_test.exs
-defmodule ApiGateway.Cache.StampedeGuardTest do
+defmodule EtsCachePatterns.PatternsTest do
   use ExUnit.Case, async: false
 
-  alias ApiGateway.Cache.StampedeGuard
+  alias EtsCachePatterns.{Source, ReadThrough, WriteThrough, WriteBehind}
 
   setup do
-    :ets.delete_all_objects(:stampede_cache)
-    :ets.delete_all_objects(:stampede_locks)
+    Source.reset()
+    :ets.delete_all_objects(:rt_cache)
+    :ets.delete_all_objects(:rt_flight)
+    :ets.delete_all_objects(:wt_cache)
+    :ets.delete_all_objects(:wb_cache)
+    :ets.delete_all_objects(:wb_buffer)
     :ok
   end
 
-  describe "get_or_fetch/3" do
-    test "returns the value on cache hit" do
-      expires_at = System.monotonic_time(:millisecond) + 60_000
-      :ets.insert(:stampede_cache, {"hit_key", "cached_value", expires_at})
+  describe "read-through" do
+    test "first read hits source, second read hits cache" do
+      :ok = Source.put(:k1, "v1")
 
-      assert {:ok, "cached_value"} = StampedeGuard.get_or_fetch("hit_key", fn -> "never" end)
+      assert {:ok, "v1"} = ReadThrough.get(:k1)
+      # After fill, a hot read should be instant — no way to measure directly,
+      # but :ets.lookup should have the key.
+      assert [{:k1, "v1"}] = :ets.lookup(:rt_cache, :k1)
     end
 
-    test "calls fetch_fn exactly once for 50 concurrent misses on the same key" do
-      fetch_count = :counters.new(1, [])
+    test "100 concurrent misses coalesce into far fewer source calls" do
+      :ok = Source.put(:hot, "x")
+      :ets.delete_all_objects(:rt_cache)
 
-      tasks =
-        for _ <- 1..50 do
-          Task.async(fn ->
-            StampedeGuard.get_or_fetch("hot_key", fn ->
-              :counters.add(fetch_count, 1, 1)
-              Process.sleep(30)
-              "computed"
-            end, 30_000)
-          end)
-        end
+      tasks = for _ <- 1..100, do: Task.async(fn -> ReadThrough.get(:hot) end)
+      results = Task.await_many(tasks, 5_000)
 
-      results = Task.await_many(tasks, 10_000)
+      assert Enum.all?(results, &match?({:ok, "x"}, &1))
+    end
+  end
 
-      ok_count = Enum.count(results, &match?({:ok, _}, &1))
-      actual_fetches = :counters.get(fetch_count, 1)
-
-      assert ok_count == 50
-      assert actual_fetches == 1, "Expected 1 fetch, got #{actual_fetches}"
+  describe "write-through" do
+    test "put persists to source and cache" do
+      assert :ok = WriteThrough.put(:wt, "hello")
+      assert {:ok, "hello"} = WriteThrough.get(:wt)
+      # Source also has it
+      assert {:ok, "hello"} = Source.get(:wt)
     end
 
-    test "stats reflect fetch vs wait counts" do
-      fetch_count_ref = :counters.new(1, [])
+    test "source failure propagates and cache is NOT updated" do
+      Source.fail(true)
+      assert {:error, :source_down} = WriteThrough.put(:fail_key, "never")
+      assert [] = :ets.lookup(:wt_cache, :fail_key)
+    end
+  end
 
-      tasks =
-        for _ <- 1..10 do
-          Task.async(fn ->
-            StampedeGuard.get_or_fetch("stats_key", fn ->
-              :counters.add(fetch_count_ref, 1, 1)
-              Process.sleep(20)
-              "result"
-            end, 30_000)
-          end)
-        end
+  describe "write-behind" do
+    test "put is fast and eventually flushes to source" do
+      assert :ok = WriteBehind.put(:wb, "lazy")
+      # Source does NOT have it yet
+      assert :error = Source.get(:wb)
 
-      Task.await_many(tasks, 5_000)
-      stats = StampedeGuard.get_stats()
+      # After a manual flush, the source catches up
+      _ = WriteBehind.flush_now()
+      assert {:ok, "lazy"} = Source.get(:wb)
+    end
 
-      assert stats.fetch_count == 1
-      assert stats.wait_count == 9
+    test "buffered writes survive transient source failure" do
+      Source.fail(true)
+      WriteBehind.put(:retry, 1)
+      _ = WriteBehind.flush_now()
+      assert :error = Source.get(:retry)
+
+      Source.fail(false)
+      _ = WriteBehind.flush_now()
+      assert {:ok, 1} = Source.get(:retry)
     end
   end
 end
 ```
 
-### Step 4: Run the tests
+### Step 9: Run it
 
 ```bash
-mix test test/api_gateway/cache/ --trace
+mix test --trace
 ```
-
-### Step 5: Cache performance benchmark
-
-```elixir
-# bench/cache_bench.exs
-alias ApiGateway.Cache.Store
-
-# Pre-populate 1000 entries
-for i <- 1..1_000 do
-  Store.put("key:#{i}", "value:#{i}", 300_000)
-end
-
-Benchee.run(
-  %{
-    "cache hit -- direct ETS read" => fn ->
-      Store.get("key:#{:rand.uniform(1_000)}")
-    end,
-    "cache miss -- key not found" => fn ->
-      Store.get("nonexistent:#{:rand.uniform(1_000_000)}")
-    end
-  },
-  parallel: 100,
-  warmup: 2,
-  time: 5,
-  formatters: [Benchee.Formatters.Console]
-)
-```
-
-```bash
-mix run bench/cache_bench.exs
-```
-
-**Expected**: cache hit < 5us at p99 under 100 parallel readers. If you see higher latency,
-verify that `get/1` does NOT use `GenServer.call` -- it must read directly from ETS.
 
 ---
 
-## Trade-off analysis
+## Trade-offs summary
 
-| Aspect | Lazy eviction only | Lazy + periodic cleanup | Stampede prevention |
-|--------|-------------------|------------------------|---------------------|
-| Memory growth | Unbounded for never-accessed expired keys | Bounded | No effect on memory |
-| Cleanup overhead | Zero | O(n) per interval | Lock table overhead |
-| Cache stampede | Possible for any miss | Possible for any miss | Prevented |
-| Complexity | Low | Medium | High |
-| `fetch_fn` called per miss | Once per process | Once per process | Once per key per TTL |
-
-Reflection: `StampedeGuard` uses a polling loop with `Process.sleep` to wait for
-the winning process to populate the cache. What are the downsides of polling vs
-a mechanism based on process monitoring (`Process.monitor`)? Under what conditions
-would monitoring be worth the added complexity?
+| Aspect                         | Read-through         | Write-through         | Write-behind            |
+|--------------------------------|----------------------|-----------------------|-------------------------|
+| Read latency (hit)             | 1 µs                 | 1 µs                  | 1 µs                    |
+| Read latency (miss)            | source latency       | source latency        | source latency          |
+| Write latency                  | n/a                  | source + 1 µs         | 1 µs                    |
+| Consistency after write        | eventual             | strong                | eventual                |
+| Durability on node crash       | source-backed        | source-backed         | buffered writes lost    |
+| Source outage tolerance (reads)| degraded             | degraded              | OK (cache absorbs)      |
+| Source outage tolerance (writes)| n/a                 | fails                 | queued until recovery   |
+| Thundering herd risk           | yes (mitigate)       | yes (mitigate)        | no                      |
 
 ---
 
-## Common production mistakes
+## Trade-offs and production gotchas
 
-**1. Not using `monotonic_time` for TTL**
-`System.system_time` can go backwards. An NTP adjustment can cause entries to stay
-valid longer than intended, or expire immediately. Always use `System.monotonic_time`
-for duration comparisons.
+**1. Write-behind and durability.** If your write buffer is in RAM only, a crash loses data. Move
+the buffer to DETS or to disk-logged events if the writes are authoritative.
 
-**2. Stampede prevention without double-check inside the lock**
-Between the time a process detects a miss and acquires the lock, another process may
-have already populated the cache. Without a re-check inside the lock, both processes
-fetch. The second fetch is wasted and may cause a double-write race:
+**2. Read-through needs single-flight.** Without it, every cold-start popular key hammers the
+source. The pattern shown uses an ETS flight table; a Cachex-style library does this too.
 
-```elixir
-# WRONG -- no double-check
-if :ets.insert_new(locks, {key, self()}) do
-  value = fetch_fn.()  # another process may have already done this
-  cache_put(key, value)
-end
-```
+**3. Write-through ordering matters.** Writing to cache first and source second means a source
+failure leaves stale cache. Always write to source first.
 
-**3. Cleanup that deletes while iterating**
-Never call `:ets.delete` inside a `first/next` iteration loop. The iterator is
-invalidated. Use `:ets.select_delete` with a match spec -- it is atomic and safe.
+**4. Cache invalidation on writes from outside the app.** If another service updates the source,
+neither write-through nor write-behind will invalidate your cache. Add a TTL or subscribe to a
+change stream (CDC / logical replication / pubsub).
 
-**4. Using `get_or_put/3` for stampede-sensitive keys**
-`get_or_put` has no stampede protection -- all concurrent misses fetch independently.
-Use `StampedeGuard.get_or_fetch/3` for keys that are frequently accessed and expensive
-to recompute.
+**5. Write-behind batch windows are latency budgets.** A 50 ms flush interval means up to 50 ms
+of "write acknowledged but not in source". Readers on other nodes see stale state for that window.
+Set the interval from your SLA, not from gut feeling.
 
-**5. Assuming ETS is always faster than an in-process map**
-For a single process accessing its own state, a Map in process state has zero IPC
-overhead. ETS is faster only when multiple processes access the same data concurrently.
-Do not add ETS complexity unless you have actual concurrent access.
+**6. Monitor buffer depth.** A write-behind buffer that keeps growing is a sign the source can't
+keep up — you're about to OOM. Alert on `:ets.info(buffer, :size)` crossing thresholds.
+
+**7. When NOT to use these.** If reads already hit the source in < 1 ms (local Postgres,
+co-located), caching adds complexity for little gain. Profile first.
 
 ---
 
 ## Resources
 
-- [ETS documentation -- Erlang/OTP](https://www.erlang.org/doc/man/ets.html)
-- [`System.monotonic_time/1` -- Elixir docs](https://hexdocs.pm/elixir/System.html#monotonic_time/1)
-- [Cachex -- production ETS cache library](https://hexdocs.pm/cachex/Cachex.html) -- reference implementation of all patterns discussed here
-- [Designing Data-Intensive Applications -- Martin Kleppmann](https://www.oreilly.com/library/view/designing-data-intensive-applications/9781491903063/) -- Chapter 11: cache patterns and consistency
+- [`:ets` reference](https://www.erlang.org/doc/man/ets.html)
+- [Cachex — production cache library](https://github.com/whitfin/cachex) — see its implementation of fallback (read-through) and transactions
+- [Nebulex — multi-backend cache](https://github.com/cabol/nebulex) — supports all three patterns
+- [Martin Kleppmann — "Designing Data-Intensive Applications"](https://dataintensive.net/) — chapter on caching strategies
+- [AWS — Caching best practices](https://aws.amazon.com/caching/best-practices/)
+- [Discord engineering — "Scaling Elixir f#cking fast"](https://discord.com/blog/how-discord-scaled-elixir-to-5-000-000-concurrent-users)

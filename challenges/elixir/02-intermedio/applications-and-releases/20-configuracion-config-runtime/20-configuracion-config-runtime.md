@@ -4,8 +4,6 @@
 compile-time config and runtime config so you can see exactly when each
 one is evaluated.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
 
 ---
 
@@ -38,6 +36,11 @@ runtime_config_demo/
 ```
 
 ---
+
+
+## Why X and not Y
+
+- **Why not `config.exs` for everything?** Compile-time config bakes values into artifacts — fatal for releases that ship across envs.
 
 ## Core concepts
 
@@ -89,7 +92,31 @@ config/runtime.exs                           (always runs, regardless of env)
 
 ---
 
+## Design decisions
+
+**Option A — `config/config.exs` (compile-time)**
+- Pros: simpler upfront, fewer moving parts.
+- Cons: hides the trade-off that this exercise exists to teach.
+
+**Option B — `config/runtime.exs` for env-dependent values (chosen)**
+- Pros: explicit about the semantic that matters in production.
+- Cons: one more concept to internalize.
+
+→ Chose **B** because runtime config is required for releases; compile-time config bakes secrets into artifacts.
+
+
 ## Implementation
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defp deps do
+  [
+    # stdlib-only by default; add `{:benchee, "~> 1.3", only: :dev}` if you benchmark
+  ]
+end
+```
+
 
 ### Step 1: Create the project
 
@@ -215,6 +242,15 @@ SERVICE_ENDPOINT=https://api.prod iex -S mix
 
 ---
 
+### Why this works
+
+The design leans on OTP primitives that already encode the invariants we care about (supervision, back-pressure, explicit message semantics), so failure modes are visible at the right layer instead of being reinvented ad-hoc. Tests exercise the edges (timeouts, crashes, boundary states), which is where hand-rolled alternatives silently drift over time.
+
+
+## Benchmark
+
+<!-- benchmark N/A: tema conceptual -->
+
 ## Trade-offs and production gotchas
 
 **1. `compile_env` will warn — loudly — if you later change the value at runtime**
@@ -243,6 +279,11 @@ to `start_link/1`. `runtime.exs` is for the application's own settings,
 not for dependencies that should be configured by their host.
 
 ---
+
+
+## Reflection
+
+- Listá 3 valores que DEBEN estar en `runtime.exs` y 3 que DEBEN estar en `config.exs`. Justificá cada uno.
 
 ## Resources
 

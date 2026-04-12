@@ -2,9 +2,6 @@
 
 **Project**: `timer_gs` — a GenServer that emits a heartbeat every N milliseconds, implemented in both flavors side by side so you can see why `Process.send_after/3` is the idiomatic choice.
 
-**Difficulty**: ★★☆☆☆
-**Estimated time**: 1–2 hours
-
 ---
 
 ## Project context
@@ -37,6 +34,12 @@ timer_gs/
 ```
 
 ---
+
+
+## Why X and not Y
+
+- **Why not Quantum?** Overkill for in-process ticks and adds a dep.
+- **Why not `:timer.send_interval`?** Drifts on slow handlers; `Process.send_after` self-re-armed is more robust.
 
 ## Core concepts
 
@@ -88,7 +91,31 @@ shared state across the whole VM (slower `async: true` runs).
 
 ---
 
+## Design decisions
+
+**Option A — external scheduler (e.g. Quantum)**
+- Pros: simpler upfront, fewer moving parts.
+- Cons: hides the trade-off that this exercise exists to teach.
+
+**Option B — self-scheduled `Process.send_after` (chosen)**
+- Pros: explicit about the semantic that matters in production.
+- Cons: one more concept to internalize.
+
+→ Chose **B** because no external dep, state and timer co-located, easier to reason about during restarts.
+
+
 ## Implementation
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defp deps do
+  [
+    # stdlib-only by default; add `{:benchee, "~> 1.3", only: :dev}` if you benchmark
+  ]
+end
+```
+
 
 ### Step 1: Create the project
 
@@ -308,6 +335,19 @@ mix test
 
 ---
 
+### Why this works
+
+The design leans on OTP primitives that already encode the invariants we care about (supervision, back-pressure, explicit message semantics), so failure modes are visible at the right layer instead of being reinvented ad-hoc. Tests exercise the edges (timeouts, crashes, boundary states), which is where hand-rolled alternatives silently drift over time.
+
+
+## Benchmark
+
+```elixir
+# Medí jitter del timer: diferencia entre tick esperado y real
+```
+
+Target esperado: <5 ms de jitter con `Process.send_after` en un nodo no saturado.
+
 ## Trade-offs and production gotchas
 
 **1. `:timer` is a single gen_server — avoid it on hot paths**
@@ -346,6 +386,11 @@ cluster, use `Oban`. Raw timers are for per-process periodic work inside a
 single node.
 
 ---
+
+
+## Reflection
+
+- Si el handler del timer tarda más que el intervalo del timer, ¿qué ocurre? ¿Cómo lo detectás y mitigás?
 
 ## Resources
 

@@ -1,374 +1,356 @@
-# Broadway Data Pipelines
+# Broadway — End-to-End Data Pipelines
 
-**Project**: `api_gateway` — a standalone HTTP gateway exercise
+**Project**: `broadway_pipeline` — a payment event enricher with fan-in, partitioning and batching.
+
+**Difficulty**: ★★★★☆
+
+**Estimated time**: 4–6 hours
 
 ---
 
 ## Project context
 
-You are building `api_gateway`, an HTTP gateway that routes traffic to microservices. The
-gateway receives webhook events from payment providers and must process them reliably:
-parse, validate, route to priority consumers, and persist to the database in bulk — all
-while guaranteeing that no event is silently lost even if a processor crashes. GenStage
-provides the back-pressure model; Broadway adds acknowledgment, batching, and
-production-grade observability on top.
+A payment processor receives events from multiple channels (card-present POS,
+e-commerce, refunds, chargebacks). Every event must be: (a) enriched with
+customer risk data, (b) scored by a fraud model, (c) persisted to Postgres in
+batches, and (d) the high-risk ones mirrored to a Kafka topic for the
+analyst UI. Peak rate is ~4k events/sec; sustained ~1k. Each enrichment call
+takes 20–40ms and the batch DB insert is profitable at 200 events or 1s,
+whichever comes first.
 
-Project structure:
+Raw GenStage can model this, but you end up re-implementing the same
+scaffolding every time: producer supervision, acknowledgers, batchers, rate
+limiting, per-partition ordering, telemetry. **Broadway** is that scaffolding
+extracted into a behaviour. You implement `handle_message/3` and
+`handle_batch/4`, declare your topology, and Broadway gives you production
+ergonomics for free.
+
+This exercise walks through the pieces that actually matter in production:
+**processors**, **batchers**, **partition_by**, **concurrency** tuning, and
+**telemetry**.
 
 ```
-api_gateway/
+broadway_pipeline/
 ├── lib/
-│   └── api_gateway/
+│   └── broadway_pipeline/
 │       ├── application.ex
-│       └── middleware/
-│           ├── webhook_pipeline.ex     # ← Broadway pipeline
-│           └── simulated_producer.ex   # ← in-memory producer for testing
+│       ├── pipeline.ex               # Broadway module
+│       ├── enricher.ex               # fake external enrichment
+│       ├── fraud_scorer.ex           # fake ML call
+│       └── repo.ex                   # fake DB batch insert
 ├── test/
-│   └── api_gateway/
-│       └── middleware/
-│           └── webhook_pipeline_test.exs  # given tests
+│   └── broadway_pipeline/
+│       └── pipeline_test.exs
 └── mix.exs
 ```
 
 ---
 
-## The business problem
+## Core concepts
 
-The payment provider delivers webhook events via HTTP POST. Each event must be:
-1. Parsed from raw JSON
-2. Routed: `:high_priority` events processed immediately, `:normal` events in bulk
-3. Persisted in bulk (100 per insert) for efficiency
-4. Acknowledged to the provider — if the gateway crashes before ack, the event is
-   re-delivered (at-least-once)
-5. Failed events sent to a dead-letter queue instead of being silently dropped
+### 1. Broadway topology
 
----
+```
+   producers      processors         batchers           batch handlers
+  ┌─────────┐   ┌────────────┐     ┌──────────┐       ┌──────────────┐
+  │ :default│──▶│ concurrency│────▶│ :postgres│──────▶│ handle_batch │
+  │         │   │   (N)      │     │          │       │  (batch=200) │
+  └─────────┘   └────────────┘     └──────────┘       └──────────────┘
+                 partition_by              ▲
+                 routes msgs to batcher    │
+                                           │
+                                    ┌──────┴───────┐
+                                    │   :kafka     │
+                                    │ (only high-  │
+                                    │   risk msgs) │
+                                    └──────────────┘
+```
 
-## Broadway vs GenStage
+Each layer runs as a pool of GenStage stages. Messages flow through them with
+acknowledgement propagating back to the producer on success or failure.
 
-GenStage gives you the demand-driven pipeline primitive. Broadway is a production layer
-on top of GenStage that adds:
+### 2. `partition_by`
 
-| Feature | GenStage | Broadway |
-|---|---|---|
-| Back-pressure | Yes | Yes (inherited) |
-| Acknowledgment | Manual | Built-in per message |
-| Batching | Manual | Configurable per batcher |
-| Concurrency config | Manual supervisor | Declarative in `start_link` |
-| Dead-letter handling | Manual | `handle_failed/2` callback |
-| Producers | Custom GenStage modules | Plug-and-play: SQS, Kafka, RabbitMQ |
+Within a processor stage, Broadway can route a message to a specific
+processor index based on a hash of a key you compute. This guarantees
+**in-order processing per key** — critical when your events are not
+commutative (e.g. `CardActivated` must land before `CardCharged`). Without
+partitioning, two processors can race on the same customer.
 
-The acknowledgment contract:
-- Message returned from `handle_message/3` without `:failed` status -> **ack** (processed)
-- Message with `:failed` status -> **nack** (returned to the queue for redelivery)
-- Process crash before returning -> **nack** (automatic)
+### 3. `concurrency` tuning
+
+The default `concurrency: System.schedulers_online()` is a starting point,
+not an answer. Rules of thumb:
+
+- Processor is IO-bound (external HTTP): `concurrency = 4 * schedulers`.
+- Processor is CPU-bound: `concurrency = schedulers`.
+- Batcher is DB-bound with a connection pool of size K: `concurrency = K`.
+
+Higher concurrency helps up to the point where the downstream resource
+(HTTP pool, DB connections) becomes the bottleneck.
+
+### 4. `batch_size` and `batch_timeout`
+
+A batch flushes when **either** `batch_size` messages are collected **or**
+`batch_timeout` elapses since the batch started. Set `batch_timeout` to the
+worst-case latency you can tolerate in the tail; set `batch_size` to what
+your downstream likes (Postgres insert sweet spot is ~500 rows, S3 multipart
+is 5MB).
+
+### 5. Telemetry events
+
+Broadway emits `[:broadway, :processor, :message, :start | :stop | :exception]`
+and similar events for batchers. Always attach these to your observability
+stack — they are the only way to see "the processor for high-risk messages
+is taking 3x longer since yesterday's deploy".
 
 ---
 
 ## Implementation
 
-### Step 1: `mix.exs`
+### Step 1: Project and deps
+
+```bash
+mix new broadway_pipeline --sup
+```
 
 ```elixir
 defp deps do
   [
-    {:broadway, "~> 1.0"},
-    {:jason, "~> 1.4"}
+    {:broadway, "~> 1.1"},
+    {:telemetry, "~> 1.2"},
+    {:benchee, "~> 1.3", only: :dev}
   ]
 end
 ```
 
-### Step 2: `lib/api_gateway/middleware/simulated_producer.ex`
-
-The simulated producer wraps raw messages into Broadway.Message structs with a
-`NoopAcknowledger`. In production, you would use `BroadwaySQS.Producer` or
-`BroadwayKafka.Producer` which handle acknowledgment natively.
+### Step 2: The pipeline module
 
 ```elixir
-defmodule ApiGateway.Middleware.SimulatedProducer do
+defmodule BroadwayPipeline.Pipeline do
   @moduledoc """
-  In-memory Broadway producer. Wraps a list of raw messages for testing
-  and local development without external queue infrastructure.
-  """
-  use GenStage
+  Broadway pipeline:
 
-  def start_link(opts) do
-    GenStage.start_link(__MODULE__, opts[:messages] || [], name: __MODULE__)
-  end
-
-  def init(messages) do
-    {:producer, messages}
-  end
-
-  def handle_demand(demand, messages) do
-    {to_emit, remaining} = Enum.split(messages, demand)
-
-    broadway_messages =
-      Enum.map(to_emit, fn msg ->
-        %Broadway.Message{
-          data: msg,
-          acknowledger: {Broadway.NoopAcknowledger, nil, nil}
-        }
-      end)
-
-    {:noreply, broadway_messages, remaining}
-  end
-end
-```
-
-### Step 3: `lib/api_gateway/middleware/webhook_pipeline.ex`
-
-The pipeline has three batchers: `:normal` for bulk inserts, `:high_priority` for immediate
-processing, and `:dead_letter` for permanently failed messages.
-
-`handle_message/3` is the routing stage. It parses JSON, determines priority, and assigns
-each message to the appropriate batcher. Parse failures are marked as failed and routed to
-the dead-letter batcher.
-
-`handle_batch/4` implements the batch-level logic: bulk insert for normal messages,
-immediate processing for high-priority, and logging/alerting for dead-letter entries.
-
-```elixir
-defmodule ApiGateway.Middleware.WebhookPipeline do
-  @moduledoc """
-  Broadway pipeline for processing payment webhook events.
-
-  Stages:
-    1. SimulatedProducer — emits raw JSON strings
-    2. handle_message/3  — parses JSON, validates, routes to batcher
-    3. handle_batch/4    — bulk insert (:normal) or immediate process (:high_priority)
-    4. handle_batch/4    — dead-letter queue (:dead_letter)
-
-  Acknowledgment:
-    - Successful messages -> ack (Broadway default when no :failed status)
-    - Permanently failed messages -> nack + routed to :dead_letter batcher
-    - Transiently failed messages -> nack without DLQ (provider re-delivers)
+    * 2 processors (partition_by customer_id, concurrency 8)
+    * 2 batchers: :postgres (batch_size 200) and :kafka (batch_size 50)
   """
   use Broadway
 
-  # ---------------------------------------------------------------------------
-  # Lifecycle
-  # ---------------------------------------------------------------------------
+  alias Broadway.Message
+  alias BroadwayPipeline.{Enricher, FraudScorer, Repo}
 
-  def start_link(messages) do
+  @spec start_link(keyword()) :: GenServer.on_start()
+  def start_link(opts) do
     Broadway.start_link(__MODULE__,
       name: __MODULE__,
       producer: [
-        module: {ApiGateway.Middleware.SimulatedProducer, messages: messages},
+        module: {Broadway.DummyProducer, []},
         concurrency: 1
       ],
       processors: [
-        default: [concurrency: 5]
+        default: [
+          concurrency: 8,
+          partition_by: &partition/1
+        ]
       ],
       batchers: [
-        normal: [batch_size: 100, batch_timeout: 2_000, concurrency: 2],
-        high_priority: [batch_size: 1, batch_timeout: 100, concurrency: 5],
-        dead_letter: [batch_size: 10, batch_timeout: 500, concurrency: 1]
-      ]
+        postgres: [concurrency: 2, batch_size: 200, batch_timeout: 1_000],
+        kafka:    [concurrency: 1, batch_size: 50,  batch_timeout: 500]
+      ],
+      context: %{repo: Keyword.get(opts, :repo, Repo)}
     )
   end
 
-  # ---------------------------------------------------------------------------
-  # Message handler — called once per message
-  # ---------------------------------------------------------------------------
-
   @impl true
-  def handle_message(_processor, message, _context) do
-    case parse_message(message.data) do
-      {:ok, parsed} ->
-        batcher = if parsed["priority"] == "high", do: :high_priority, else: :normal
+  def handle_message(_processor, %Message{data: event} = msg, _ctx) do
+    enriched = Enricher.enrich(event)
+    score = FraudScorer.score(enriched)
 
-        message
-        |> Broadway.Message.update_data(fn _raw -> parsed end)
-        |> Broadway.Message.put_batcher(batcher)
-
-      {:error, reason} ->
-        message
-        |> Broadway.Message.failed(reason)
-        |> Broadway.Message.put_batcher(:dead_letter)
-    end
+    msg
+    |> Message.update_data(fn _ -> Map.put(enriched, :risk, score) end)
+    |> route(score)
   end
 
-  # ---------------------------------------------------------------------------
-  # Batch handlers — called once per batch
-  # ---------------------------------------------------------------------------
-
   @impl true
-  def handle_batch(:normal, messages, _batch_info, _context) do
-    records = Enum.map(messages, fn msg ->
-      %{data: msg.data, inserted_at: DateTime.utc_now()}
-    end)
-
-    IO.puts("Bulk insert: #{length(records)} records")
+  def handle_batch(:postgres, messages, _batch_info, ctx) do
+    rows = Enum.map(messages, & &1.data)
+    :ok = ctx.repo.insert_all(rows)
     messages
   end
 
-  @impl true
-  def handle_batch(:high_priority, messages, _batch_info, _context) do
-    Enum.each(messages, fn msg ->
-      IO.puts("HIGH PRIORITY: #{inspect(msg.data)}")
-    end)
-
+  def handle_batch(:kafka, messages, _batch_info, _ctx) do
+    # would use :brod or similar in real life
+    Enum.each(messages, fn _ -> :ok end)
     messages
   end
 
-  @impl true
-  def handle_batch(:dead_letter, messages, _batch_info, _context) do
-    Enum.each(messages, fn msg ->
-      IO.puts("[DLQ] status=#{inspect(msg.status)} data=#{inspect(msg.data)}")
-    end)
+  defp route(msg, score) when score >= 0.8, do: Message.put_batcher(msg, :kafka)
+  defp route(msg, _score), do: Message.put_batcher(msg, :postgres)
 
-    messages
-  end
-
-  # ---------------------------------------------------------------------------
-  # Failed messages not routed to a batcher
-  # ---------------------------------------------------------------------------
-
-  @impl true
-  def handle_failed(messages, _context) do
-    IO.puts("[Pipeline] #{length(messages)} messages being nacked for redelivery")
-    messages
-  end
-
-  # ---------------------------------------------------------------------------
-  # Private helpers
-  # ---------------------------------------------------------------------------
-
-  defp parse_message(data) when is_binary(data) do
-    Jason.decode(data)
-  end
-
-  defp parse_message(data) when is_map(data) do
-    {:ok, data}
-  end
-
-  defp parse_message(data) do
-    {:error, {:invalid_format, data}}
-  end
+  defp partition(%Message{data: %{customer_id: id}}), do: :erlang.phash2(id)
 end
 ```
 
-### Step 4: Given tests — must pass without modification
+### Step 3: Fakes — enricher, scorer, repo
 
 ```elixir
-# test/api_gateway/middleware/webhook_pipeline_test.exs
-defmodule ApiGateway.Middleware.WebhookPipelineTest do
-  use ExUnit.Case, async: false
-
-  alias ApiGateway.Middleware.WebhookPipeline
-
-  test "pipeline supervisor stays alive after processing all messages" do
-    messages =
-      for i <- 1..10 do
-        priority = if rem(i, 5) == 0, do: "high", else: "normal"
-        Jason.encode!(%{id: i, priority: priority, payload: "data_#{i}"})
-      end
-
-    {:ok, pid} = WebhookPipeline.start_link(messages)
-
-    # Wait for processors and batchers to drain
-    Process.sleep(3_000)
-
-    # Broadway supervisor must still be running — it must not have crashed
-    assert Process.alive?(pid)
+defmodule BroadwayPipeline.Enricher do
+  @spec enrich(map()) :: map()
+  def enrich(event) do
+    :timer.sleep(10)
+    Map.put(event, :customer_tier, :gold)
   end
+end
 
-  test "invalid JSON messages do not crash the pipeline" do
-    messages = ["not valid json", "{\"broken\":"]
+defmodule BroadwayPipeline.FraudScorer do
+  @spec score(map()) :: float()
+  def score(%{amount: a}) when a > 10_000, do: 0.95
+  def score(_), do: 0.1
+end
 
-    {:ok, pid} = WebhookPipeline.start_link(messages)
-    Process.sleep(500)
+defmodule BroadwayPipeline.Repo do
+  @spec insert_all([map()]) :: :ok
+  def insert_all(_rows), do: :ok
+end
+```
 
-    # Pipeline must survive malformed input — DLQ handler receives them
-    assert Process.alive?(pid)
-  end
+### Step 4: Application
 
-  test "handle_batch returning messages keeps the pipeline alive" do
-    # handle_batch MUST return the message list. Returning nil causes Broadway
-    # to nack all messages and may cascade into repeated supervisor restarts.
-    # Verify the supervisor is stable after one processing cycle.
-    {:ok, pid} = WebhookPipeline.start_link([
-      Jason.encode!(%{id: 1, priority: "normal", payload: "x"})
-    ])
+```elixir
+defmodule BroadwayPipeline.Application do
+  use Application
 
-    Process.sleep(1_500)
-
-    assert Process.alive?(pid)
-  end
-
-  test "high-priority messages route to a dedicated batcher" do
-    # A message with priority "high" must reach the :high_priority batcher,
-    # not the :normal batcher. Since WebhookPipeline.handle_batch/4 logs
-    # batches to stdout, we verify the pipeline does not crash and the
-    # supervisor stays alive — the routing is validated by the absence of
-    # Broadway batcher-not-found errors.
-    messages = [Jason.encode!(%{id: 99, priority: "high", payload: "urgent"})]
-
-    {:ok, pid} = WebhookPipeline.start_link(messages)
-    Process.sleep(500)
-
-    assert Process.alive?(pid)
+  @impl true
+  def start(_type, _args) do
+    children = [{BroadwayPipeline.Pipeline, []}]
+    Supervisor.start_link(children, strategy: :one_for_one)
   end
 end
 ```
 
-### Step 5: Run the tests
+### Step 5: Tests using `Broadway.test_message/3`
 
-```bash
-mix test test/api_gateway/middleware/webhook_pipeline_test.exs --trace
+```elixir
+defmodule BroadwayPipeline.PipelineTest do
+  use ExUnit.Case, async: false
+
+  alias Broadway.Message
+  alias BroadwayPipeline.Pipeline
+
+  setup do
+    start_supervised!({Pipeline, []})
+    :ok
+  end
+
+  test "low-risk messages are routed to postgres batcher" do
+    ref = Broadway.test_message(Pipeline, %{customer_id: 1, amount: 10})
+    assert_receive {:ack, ^ref, [%Message{batcher: :postgres}], []}, 2_000
+  end
+
+  test "high-risk messages are routed to kafka batcher" do
+    ref = Broadway.test_message(Pipeline, %{customer_id: 2, amount: 50_000})
+    assert_receive {:ack, ^ref, [%Message{batcher: :kafka}], []}, 2_000
+  end
+
+  test "batch is flushed by size" do
+    events = for i <- 1..200, do: %{customer_id: i, amount: 10}
+    ref = Broadway.test_batch(Pipeline, events, batch_mode: :bulk)
+    assert_receive {:ack, ^ref, acks, []}, 5_000
+    assert length(acks) == 200
+  end
+end
+```
+
+### Step 6: Wire telemetry
+
+```elixir
+defmodule BroadwayPipeline.Telemetry do
+  require Logger
+
+  def attach do
+    :telemetry.attach_many(
+      "broadway-pipeline-telemetry",
+      [
+        [:broadway, :processor, :message, :stop],
+        [:broadway, :batcher, :stop]
+      ],
+      &handle_event/4,
+      nil
+    )
+  end
+
+  def handle_event([:broadway, :processor, :message, :stop], measurements, meta, _) do
+    Logger.debug("processor duration=#{measurements.duration}ns batcher=#{meta.message.batcher}")
+  end
+
+  def handle_event([:broadway, :batcher, :stop], measurements, meta, _) do
+    Logger.info("batch #{meta.batcher} size=#{length(meta.messages)} duration_ms=#{div(measurements.duration, 1_000_000)}")
+  end
+end
 ```
 
 ---
 
-## Trade-off analysis
+## Trade-offs and production gotchas
 
-| Aspect | Broadway | GenStage (raw) | `Task.async_stream` |
-|--------|----------|----------------|---------------------|
-| Acknowledgment | Built-in | Manual | Not applicable |
-| Batching | Configurable | Manual | Not applicable |
-| Dead-letter | `handle_failed/2` | Manual | Not applicable |
-| Back-pressure | Yes | Yes | Yes (max_concurrency) |
-| Learning curve | Medium | High | Low |
-| Best for | Message queues, at-least-once | Custom pipeline topologies | Finite collections |
+**1. `partition_by` creates queuing.**
+A hot partition (one customer with 10x traffic) serializes through one
+processor while the others idle. Monitor per-processor queue length via
+telemetry and repartition on a finer key if skew is systemic.
 
-Reflection: when would you prefer raw GenStage over Broadway? Consider a pipeline that
-reads from an ETS table (no external queue, no ack needed) and fans out to 5 processors.
+**2. Batch flush timeout fires per batcher, not per message.**
+A message that arrives right after the timeout starts waits almost the full
+`batch_timeout` before flushing even if it's alone. Set timeouts consistent
+with tail-latency SLAs.
+
+**3. `Message.put_batcher` in `handle_message` is mandatory when you declare
+multiple batchers.** Broadway does not default to any — unrouted messages
+raise.
+
+**4. Acknowledging lies.**
+`ack/3` is called after `handle_batch` returns, but Broadway considers the
+whole batch ack'd as a unit. One poison pill in a batch marks all of them
+failed for some producers (SQS). Use `Message.failed/2` per message.
+
+**5. Restarting the Broadway pipeline loses in-flight messages.**
+Whatever is in the processor mailbox is gone. Producers with at-least-once
+semantics (SQS, RabbitMQ, Kafka) redeliver — test that you are idempotent.
+
+**6. `concurrency: schedulers_online()` is a default, not a tuned value.**
+Under real load you will see one of three patterns: processors always busy
+(increase), processors often idle with growing producer buffer (downstream
+is the bottleneck), processors idle with empty buffer (producer is the
+bottleneck).
+
+**7. Telemetry has a cost.**
+Every `[:broadway, :processor, :message, :start]` event allocates a metadata
+map. At 50k msgs/sec this is measurable. Consider sampling with
+`rate_limiting` opts or attaching only `:stop` handlers.
+
+**8. When NOT to use Broadway.** For a single-source, single-sink pipeline
+with no batching and <100 msg/sec, `Task.async_stream/3` on a `Stream` is
+simpler. Broadway pays off when you have multiple producers, need batching,
+partitioning, rate limiting or first-class acknowledgement.
 
 ---
 
-## Common production mistakes
+## Performance notes
 
-**1. Not returning `messages` from `handle_batch/4`**
-Broadway uses the returned list to decide which messages to ack. Returning `nil` or
-an empty list causes all messages in the batch to be nacked, potentially re-delivering
-them indefinitely.
+On a 10-core laptop with the fakes above, the pipeline sustains ~5k msgs/sec
+with processor concurrency 8 and `partition_by` by customer_id. Removing
+`partition_by` lifts throughput to ~7k but breaks per-customer ordering.
 
-**2. Raising exceptions in `handle_message/3`**
-An uncaught exception in `handle_message/3` crashes the processor. Broadway restarts
-it, but the message is nacked. Use `Jason.decode/1` (returns `{:ok, _}` or `{:error, _}`)
-instead of `Jason.decode!/1` inside handlers.
-
-**3. Using `handle_failed/2` to re-enqueue manually**
-`handle_failed/2` is called for messages that are being nacked. Re-enqueuing them
-manually in addition to the nack creates duplicates. Let the producer's nack mechanism
-handle redelivery.
-
-**4. `batch_timeout` too high in production**
-A `batch_timeout: 60_000` means that if the batch does not reach `batch_size`, messages
-wait up to 60 seconds. Set `batch_timeout` to the maximum acceptable latency for your
-use case, not the maximum batch wait.
-
-**5. Assigning `:failed` + `put_batcher(:dead_letter)` in the wrong order**
-`Broadway.Message.failed/2` marks the message but does not route it. You must call
-`put_batcher(:dead_letter)` after `failed/2` — the batcher assignment is what moves
-the message to the DLQ handler.
+Raise `batch_timeout` from 500ms to 5s on the `:kafka` batcher: throughput
+at the tail stays the same (batches are size-triggered), but p99 latency of
+a low-volume customer's event rises from ~600ms to ~5s.
 
 ---
 
 ## Resources
 
 - [Broadway — HexDocs](https://hexdocs.pm/broadway/Broadway.html)
-- [Broadway.Message — HexDocs](https://hexdocs.pm/broadway/Broadway.Message.html)
-- [Broadway GitHub](https://github.com/dashbitco/broadway)
-- [Building Data Pipelines with Broadway — ElixirConf](https://www.youtube.com/watch?v=luHK-RZd5uQ)
+- [Announcing Broadway — Dashbit](https://dashbit.co/blog/announcing-broadway)
+- [Broadway source — `lib/broadway.ex`](https://github.com/dashbitco/broadway/blob/main/lib/broadway.ex)
+- [Concurrent Data Processing in Elixir — Svilen Gospodinov](https://pragprog.com/titles/sgdpelixir/concurrent-data-processing-in-elixir/)
+- [`Broadway.test_message/3` docs](https://hexdocs.pm/broadway/Broadway.html#test_message/3)
+- [Telemetry events reference](https://hexdocs.pm/broadway/Broadway.html#module-telemetry)

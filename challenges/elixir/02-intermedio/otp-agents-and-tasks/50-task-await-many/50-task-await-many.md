@@ -2,9 +2,6 @@
 
 **Project**: `task_await_many` — three ways to collect results from a batch of tasks, and the semantics that differ.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
-
 ---
 
 ## Project context
@@ -37,6 +34,11 @@ task_await_many/
 ```
 
 ---
+
+
+## Why X and not Y
+
+- **Why not `Enum.map(&Task.await/1)`?** Sequential awaits mean the slowest task dictates wall time and timeouts don't compose cleanly.
 
 ## Core concepts
 
@@ -90,7 +92,31 @@ Once you name the contract explicitly, the right choice is obvious.
 
 ---
 
+## Design decisions
+
+**Option A — sequential awaits in a loop**
+- Pros: simpler upfront, fewer moving parts.
+- Cons: hides the trade-off that this exercise exists to teach.
+
+**Option B — `Task.await_many/2` (chosen)**
+- Pros: explicit about the semantic that matters in production.
+- Cons: one more concept to internalize.
+
+→ Chose **B** because parallel awaits with a single timeout correctly reflect the wall-clock semantics callers want.
+
+
 ## Implementation
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defp deps do
+  [
+    # stdlib-only by default; add `{:benchee, "~> 1.3", only: :dev}` if you benchmark
+  ]
+end
+```
+
 
 ### Step 1: Create the project
 
@@ -229,6 +255,20 @@ mix test
 
 ---
 
+### Why this works
+
+The design leans on OTP primitives that already encode the invariants we care about (supervision, back-pressure, explicit message semantics), so failure modes are visible at the right layer instead of being reinvented ad-hoc. Tests exercise the edges (timeouts, crashes, boundary states), which is where hand-rolled alternatives silently drift over time.
+
+
+## Benchmark
+
+```elixir
+tasks = for _ <- 1..1000, do: Task.async(fn -> :timer.sleep(10); :ok end)
+{us, _} = :timer.tc(fn -> Task.await_many(tasks, 5_000) end)
+```
+
+Target esperado: ~10–15 ms para 1k tasks de 10 ms (paralelismo real).
+
 ## Trade-offs and production gotchas
 
 **1. `await_many` kills the survivors on failure — sometimes you want that, sometimes you don't**
@@ -268,6 +308,11 @@ collect them.
   supervised GenServer).
 
 ---
+
+
+## Reflection
+
+- Con 1k tasks y timeout 5s, ¿qué pasa si 990 terminan en 1s y 10 cuelgan? Describí el comportamiento exacto y el impacto.
 
 ## Resources
 

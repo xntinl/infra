@@ -1,380 +1,351 @@
-# Graceful Shutdown & Drain
+# Graceful shutdown and drain
 
-## Goal
+**Project**: `drain_shutdown` — drain in-flight requests before `terminate/2` completes.
 
-Implement graceful shutdown for three API gateway components: a Router that drains in-flight HTTP requests, an AuditWriter that drains its internal queue, and a ConnectionPool that waits for checked-out connections to be returned. Each component uses `Process.flag(:trap_exit, true)` to intercept the supervisor's shutdown signal and convert it into a controlled drain sequence.
-
----
-
-## The OTP shutdown lifecycle
-
-```
-SIGTERM received by the VM
-  -> Application.prep_stop/1
-  -> Supervisor.stop (each supervisor, in reverse start order)
-  -> Each child receives its shutdown signal:
-     - Worker with trap_exit -> {:EXIT, sup_pid, :shutdown} in handle_info
-     - Worker without trap_exit -> terminate/2 called directly
-  -> Worker has :shutdown ms to finish -- then :brutal_kill
-  -> Application.stop/1
-```
-
-The `:shutdown` field in `child_spec` is the budget each process gets for cleanup. Default is 5,000 ms.
+**Difficulty**: ★★★★☆
+**Estimated time**: 4–5 hours
 
 ---
 
-## The drain pattern
+## Project context
 
-The challenge: `terminate/2` runs inside the GenServer process. If you block there waiting for work to finish, the GenServer cannot process the `handle_info` messages that signal work completion -- deadlock.
+You run an HTTP API that handles 800 rps with a p95 of 120 ms. Deploys happen 8 times a day. Each deploy kills the old VM — historically by sending `SIGKILL` after Kubernetes' 30 s grace period. Reality: the 30 s was being wasted because the app was not wired for graceful shutdown. Every deploy dropped ~100 in-flight requests, which returned `502 Bad Gateway` to clients. That was acceptable a year ago; now it's a user-facing SLO violation.
 
-Solution: intercept the shutdown signal in `handle_info`, stop accepting new work, and let the normal message loop drive the drain:
+You need to implement a four-stage shutdown for your request-handling GenServer:
+
+1. **Stop accepting new work** (reject fast, flip an "unavailable" flag).
+2. **Wait for in-flight work to complete** (bounded by a drain timeout).
+3. **Flush side effects** (commit pending DB writes, ship telemetry buffer).
+4. **Exit cleanly** so the supervisor reports `:shutdown` not `:killed`.
+
+Pattern: `Process.flag(:trap_exit, true)` in `init/1` to intercept the `:shutdown` signal from the supervisor, then run the drain in `terminate/2`. The parent supervisor must specify a `shutdown:` timeout ≥ your drain budget, otherwise the supervisor sends `:brutal_kill` before drain completes.
 
 ```
-trap_exit: true in init/1
-  -> Supervisor sends :shutdown
-  -> {:EXIT, sup_pid, :shutdown} arrives in handle_info
-  -> Stop accepting new work, set state.draining = true
-  -> Normal message loop processes remaining work
-  -> When drained: {:stop, :shutdown, state}
-  -> terminate/2 runs (logs final state)
+drain_shutdown/
+├── lib/
+│   └── drain_shutdown/
+│       ├── application.ex
+│       ├── server.ex          # the drainable GenServer
+│       └── dispatcher.ex      # sends jobs, mimics the request layer
+└── test/
+    └── drain_shutdown/
+        └── drain_test.exs
 ```
 
 ---
 
-## Full implementation
+## Core concepts
 
-### `lib/api_gateway/router.ex` -- drain in-flight requests
+### 1. The shutdown signal path
+
+```
+Supervisor.terminate_child(sup, pid)
+       │
+       ├── sends {:EXIT, sup_pid, :shutdown} to the child
+       │
+       ├── waits up to `shutdown:` ms for child to exit
+       │
+       └── if still alive → Process.exit(pid, :kill)  # brutal
+```
+
+Without `trap_exit: true`, a `GenServer` receiving `{:EXIT, sup_pid, :shutdown}` exits immediately, skipping `terminate/2`. With `trap_exit`, the EXIT becomes a regular message, the `GenServer` runs `terminate/2`, and you have the full `shutdown:` budget to drain.
+
+### 2. `shutdown:` values and their meaning
 
 ```elixir
-defmodule ApiGateway.Router do
+%{id: MyServer,
+  start: {MyServer, :start_link, []},
+  shutdown: 10_000,      # ms
+  restart: :permanent}
+```
+
+| Value | Behavior |
+|---|---|
+| `:brutal_kill` | `Process.exit(pid, :kill)` immediately. No `terminate/2`. |
+| `:infinity` | Wait forever. Dangerous — hangs shutdown if drain hangs. |
+| integer N (ms) | Wait N ms; then `Process.exit(pid, :kill)`. |
+
+Pick N = (typical drain) + (safety margin). Never `:infinity` for workers; reserve it for nested supervisors only.
+
+### 3. Application-wide shutdown timeout
+
+`Application.stop/1` has its own timer (default `:infinity`). The OS supervisor (systemd, K8s) gives you a fixed window (K8s `terminationGracePeriodSeconds`, default 30 s). If your app's drain takes 60 s, K8s sends `SIGKILL` at 30 s regardless.
+
+Align these three:
+
+```
+K8s terminationGracePeriodSeconds (30s)
+    ≥  Application drain budget (25s)
+        ≥  Root supervisor shutdown (20s)
+            ≥  Leaf server shutdown (15s)
+```
+
+### 4. The four-stage drain pattern
+
+```elixir
+def terminate(reason, state) do
+  # Stage 1: flip gate to reject new work.
+  :ets.insert(:gate, {:accepting, false})
+
+  # Stage 2: wait for in-flight work to drain.
+  wait_for_drain(state, _deadline_ms = 10_000)
+
+  # Stage 3: flush side effects.
+  flush_buffer(state)
+
+  # Stage 4: return — Supervisor will log reason.
+  :ok
+end
+```
+
+### 5. The gate pattern
+
+A public "accepting" flag (ETS or `:persistent_term`) that the entry points check BEFORE doing work:
+
+```elixir
+def handle(req) do
+  if accepting?() do
+    GenServer.call(Server, {:handle, req})
+  else
+    {:error, :draining}
+  end
+end
+```
+
+The flag is set by the GenServer's `terminate/2` in stage 1. Readers do NOT go through the GenServer, so the flip is effective even if the GenServer is already handling 50 queued messages.
+
+---
+
+## Implementation
+
+### Step 1: Application
+
+```elixir
+# lib/drain_shutdown/application.ex
+defmodule DrainShutdown.Application do
+  use Application
+
+  @impl true
+  def start(_type, _args) do
+    :ets.new(:drain_gate, [:named_table, :public, read_concurrency: true])
+    :ets.insert(:drain_gate, {:accepting, true})
+
+    children = [
+      %{
+        id: DrainShutdown.Server,
+        start: {DrainShutdown.Server, :start_link, []},
+        shutdown: 15_000,
+        restart: :permanent
+      }
+    ]
+
+    Supervisor.start_link(children,
+      strategy: :one_for_one,
+      name: DrainShutdown.Supervisor
+    )
+  end
+end
+```
+
+### Step 2: The drainable server
+
+```elixir
+# lib/drain_shutdown/server.ex
+defmodule DrainShutdown.Server do
+  @moduledoc """
+  Request-handling GenServer with four-stage graceful shutdown.
+  """
   use GenServer
   require Logger
 
-  @drain_timeout_ms 30_000
+  @drain_deadline_ms 10_000
 
-  def child_spec(opts) do
-    %{
-      id:       __MODULE__,
-      start:    {__MODULE__, :start_link, [opts]},
-      restart:  :permanent,
-      shutdown: @drain_timeout_ms + 5_000,
-      type:     :worker
-    }
+  # ---------------------------------------------------------------------------
+  # Public API — the gate is on the CLIENT side for fast rejection.
+  # ---------------------------------------------------------------------------
+
+  @spec handle(term()) :: {:ok, term()} | {:error, :draining}
+  def handle(req) do
+    if accepting?() do
+      GenServer.call(__MODULE__, {:handle, req}, 30_000)
+    else
+      {:error, :draining}
+    end
   end
 
-  def start_link(opts \\ []) do
-    GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+  @spec in_flight() :: non_neg_integer()
+  def in_flight, do: GenServer.call(__MODULE__, :in_flight)
+
+  defp accepting? do
+    case :ets.lookup(:drain_gate, :accepting) do
+      [{:accepting, true}] -> true
+      _ -> false
+    end
   end
 
-  @doc "Returns :accepting or :draining."
-  @spec status() :: :accepting | :draining
-  def status, do: GenServer.call(__MODULE__, :status)
+  def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
 
-  @doc "Simulates handling a new incoming request."
-  @spec handle_request(String.t(), (-> any())) :: {:ok, String.t()} | {:error, :draining}
-  def handle_request(request_id, work_fn) do
-    GenServer.call(__MODULE__, {:new_request, request_id, work_fn})
-  end
+  # ---------------------------------------------------------------------------
+  # Callbacks
+  # ---------------------------------------------------------------------------
 
   @impl true
   def init(_opts) do
+    # Without trap_exit, terminate/2 is NOT called on :shutdown from supervisor.
     Process.flag(:trap_exit, true)
-    {:ok, %{accepting: true, active: MapSet.new(), draining_ref: nil}}
+    {:ok, %{in_flight: 0, buffer: []}}
   end
 
   @impl true
-  def handle_call(:status, _from, state) do
-    status = if state.accepting, do: :accepting, else: :draining
-    {:reply, status, state}
-  end
+  def handle_call({:handle, req}, from, state) do
+    # Simulate async work: spawn a task, reply when done.
+    parent = self()
+    ref = make_ref()
 
-  @impl true
-  def handle_call({:new_request, _id, _fn}, _from, %{accepting: false} = state) do
-    {:reply, {:error, :draining}, state}
-  end
-
-  @impl true
-  def handle_call({:new_request, request_id, work_fn}, _from, state) do
-    server = self()
     Task.start(fn ->
-      work_fn.()
-      send(server, {:request_done, request_id})
+      Process.sleep(100)
+      send(parent, {:work_done, ref, from, {:ok, {:handled, req}}})
     end)
 
-    new_state = %{state | active: MapSet.put(state.active, request_id)}
-    {:reply, {:ok, request_id}, new_state}
+    {:noreply, %{state | in_flight: state.in_flight + 1}}
   end
 
-  @impl true
-  def handle_info({:request_done, request_id}, state) do
-    new_active = MapSet.delete(state.active, request_id)
-    new_state = %{state | active: new_active}
-
-    if state.draining_ref && MapSet.size(new_active) == 0 do
-      {:stop, :shutdown, new_state}
-    else
-      {:noreply, new_state}
-    end
-  end
+  def handle_call(:in_flight, _from, state), do: {:reply, state.in_flight, state}
 
   @impl true
-  def handle_info({:EXIT, _from, reason}, state) do
-    Logger.info("Router draining #{MapSet.size(state.active)} active requests")
-    new_state = %{state | accepting: false}
-
-    if MapSet.size(state.active) == 0 do
-      {:stop, reason, new_state}
-    else
-      Process.send_after(self(), {:drain_timeout, reason}, @drain_timeout_ms)
-      {:noreply, %{new_state | draining_ref: reason}}
-    end
-  end
-
-  @impl true
-  def handle_info({:drain_timeout, reason}, state) do
-    Logger.warning("Router drain timeout -- #{MapSet.size(state.active)} requests abandoned")
-    {:stop, reason, state}
+  def handle_info({:work_done, _ref, from, reply}, state) do
+    GenServer.reply(from, reply)
+    {:noreply, %{state | in_flight: state.in_flight - 1, buffer: [reply | state.buffer]}}
   end
 
   @impl true
   def terminate(reason, state) do
-    Logger.info("Router terminated. Reason: #{inspect(reason)}. " <>
-                "Remaining active: #{MapSet.size(state.active)}")
+    Logger.info("[drain] starting, reason=#{inspect(reason)}, in_flight=#{state.in_flight}")
+
+    # Stage 1: stop accepting new requests.
+    :ets.insert(:drain_gate, {:accepting, false})
+
+    # Stage 2: wait for in-flight work to complete.
+    final_state = wait_for_drain(state, System.monotonic_time(:millisecond) + @drain_deadline_ms)
+
+    # Stage 3: flush buffer.
+    flushed = flush_buffer(final_state.buffer)
+    Logger.info("[drain] flushed #{flushed} buffered replies")
+
+    # Stage 4: return :ok so Supervisor logs :shutdown cleanly.
     :ok
   end
-end
-```
 
-### `lib/api_gateway/cache/connection_pool.ex` -- wait for checked-out connections
+  # ---------------------------------------------------------------------------
+  # Drain loop — process messages ourselves while draining.
+  # ---------------------------------------------------------------------------
 
-```elixir
-defmodule ApiGateway.Cache.ConnectionPool do
-  use GenServer
-  require Logger
+  defp wait_for_drain(%{in_flight: 0} = state, _deadline), do: state
 
-  @checkin_timeout_ms 10_000
+  defp wait_for_drain(state, deadline) do
+    now = System.monotonic_time(:millisecond)
 
-  def child_spec(opts) do
-    %{
-      id:       __MODULE__,
-      start:    {__MODULE__, :start_link, [opts]},
-      restart:  :permanent,
-      shutdown: @checkin_timeout_ms + 5_000,
-      type:     :worker
-    }
-  end
-
-  def start_link(opts \\ []) do
-    pool_size = Keyword.get(opts, :pool_size, 5)
-    GenServer.start_link(__MODULE__, pool_size, name: __MODULE__)
-  end
-
-  @doc "Checks out a connection. Returns {:ok, ref, conn} or {:error, reason}."
-  @spec checkout() :: {:ok, reference(), map()} | {:error, atom()}
-  def checkout, do: GenServer.call(__MODULE__, :checkout, 5_000)
-
-  @doc "Returns a connection to the pool."
-  @spec checkin(reference()) :: :ok
-  def checkin(ref), do: GenServer.cast(__MODULE__, {:checkin, ref})
-
-  @impl true
-  def init(pool_size) do
-    Process.flag(:trap_exit, true)
-    connections = Enum.map(1..pool_size, &open_conn/1)
-    {:ok, %{available: connections, checked_out: %{}, accepting: true, shutdown: false}}
-  end
-
-  @impl true
-  def handle_call(:checkout, _from, %{accepting: false} = state) do
-    {:reply, {:error, :pool_shutting_down}, state}
-  end
-
-  @impl true
-  def handle_call(:checkout, _from, state) do
-    case state.available do
-      [] ->
-        {:reply, {:error, :pool_empty}, state}
-
-      [conn | rest] ->
-        ref = make_ref()
-        {:reply, {:ok, ref, conn},
-         %{state | available: rest, checked_out: Map.put(state.checked_out, ref, conn)}}
-    end
-  end
-
-  @impl true
-  def handle_cast({:checkin, ref}, state) do
-    case Map.pop(state.checked_out, ref) do
-      {nil, _} ->
-        {:noreply, state}
-
-      {conn, remaining} ->
-        new_state = %{state |
-          available:   [conn | state.available],
-          checked_out: remaining
-        }
-
-        if state.shutdown && map_size(remaining) == 0 do
-          {:stop, :shutdown, new_state}
-        else
-          {:noreply, new_state}
-        end
-    end
-  end
-
-  @impl true
-  def handle_info({:EXIT, _from, reason}, state) do
-    Enum.each(state.available, &close_conn/1)
-    new_state = %{state | available: [], accepting: false, shutdown: true}
-
-    if map_size(state.checked_out) == 0 do
-      {:stop, reason, new_state}
+    if now >= deadline do
+      Logger.warning("[drain] deadline exceeded with #{state.in_flight} in flight")
+      state
     else
-      Logger.info("Pool waiting for #{map_size(state.checked_out)} connections to be returned")
-      Process.send_after(self(), :force_close, @checkin_timeout_ms)
-      {:noreply, new_state}
+      remaining = deadline - now
+
+      receive do
+        {:work_done, _ref, from, reply} ->
+          GenServer.reply(from, reply)
+          new_state = %{state | in_flight: state.in_flight - 1, buffer: [reply | state.buffer]}
+          wait_for_drain(new_state, deadline)
+      after
+        remaining -> state
+      end
     end
   end
 
-  @impl true
-  def handle_info(:force_close, state) do
-    Logger.warning("Pool force-closing #{map_size(state.checked_out)} unreturned connections")
-    Enum.each(state.checked_out, fn {_, conn} -> close_conn(conn) end)
-    {:stop, :shutdown, %{state | checked_out: %{}}}
-  end
-
-  @impl true
-  def terminate(reason, state) do
-    Logger.info("ConnectionPool terminated. Reason: #{inspect(reason)}. " <>
-                "Leaked connections: #{map_size(state.checked_out)}")
-    :ok
-  end
-
-  defp open_conn(n),  do: %{id: n, status: :connected}
-  defp close_conn(c), do: Logger.info("Closing connection #{c.id}")
+  defp flush_buffer(buffer), do: length(buffer)
 end
 ```
 
-### Tests
+### Step 3: Tests
 
 ```elixir
-# test/api_gateway/shutdown/router_drain_test.exs
-defmodule ApiGateway.Shutdown.RouterDrainTest do
+# test/drain_shutdown/drain_test.exs
+defmodule DrainShutdown.DrainTest do
   use ExUnit.Case, async: false
 
-  alias ApiGateway.Router
+  alias DrainShutdown.Server
 
   setup do
-    {:ok, _pid} = Router.start_link([])
-    on_exit(fn ->
-      if pid = Process.whereis(Router), do: GenServer.stop(pid, :normal, 5_000)
-    end)
+    :ets.insert(:drain_gate, {:accepting, true})
     :ok
   end
 
-  test "rejects new requests during drain" do
-    pid = Process.whereis(Router)
-    send(pid, {:EXIT, pid, :shutdown})
+  test "accepts requests under normal conditions" do
+    assert {:ok, {:handled, :ping}} = Server.handle(:ping)
+  end
+
+  test "terminate drains in-flight work before returning" do
+    # Kick off 5 in-flight requests.
+    tasks = for i <- 1..5, do: Task.async(fn -> Server.handle({:req, i}) end)
     Process.sleep(20)
-    assert {:error, :draining} = Router.handle_request("late-req", fn -> :ok end)
+
+    # Manually invoke terminate under controlled conditions.
+    pid = Process.whereis(Server)
+    ref = Process.monitor(pid)
+
+    # Send a :shutdown exit like the supervisor would.
+    Process.exit(pid, :shutdown)
+
+    assert_receive {:DOWN, ^ref, :process, ^pid, :shutdown}, 15_000
+
+    # All in-flight tasks should have received a reply (not a timeout/exit).
+    results = Task.await_many(tasks, 15_000)
+    assert Enum.all?(results, &match?({:ok, {:handled, _}}, &1))
   end
 
-  test "active requests complete before shutdown" do
-    done = self()
-    Router.handle_request("r1", fn ->
-      Process.sleep(200)
-      send(done, :work_done)
-    end)
-
-    pid = Process.whereis(Router)
-    send(pid, {:EXIT, pid, :shutdown})
-
-    assert_receive :work_done, 1_000
-  end
-
-  test "status transitions from accepting to draining" do
-    assert Router.status() == :accepting
-    pid = Process.whereis(Router)
-    send(pid, {:EXIT, pid, :shutdown})
-    Process.sleep(20)
-    assert Router.status() == :draining
-  end
-end
-```
-
-```elixir
-# test/api_gateway/shutdown/pool_drain_test.exs
-defmodule ApiGateway.Shutdown.PoolDrainTest do
-  use ExUnit.Case, async: false
-
-  alias ApiGateway.Cache.ConnectionPool
-
-  setup do
-    {:ok, _pid} = ConnectionPool.start_link(pool_size: 3)
-    on_exit(fn ->
-      if pid = Process.whereis(ConnectionPool), do: GenServer.stop(pid, :normal, 15_000)
-    end)
-    :ok
-  end
-
-  test "rejects checkout after shutdown signal" do
-    pid = Process.whereis(ConnectionPool)
-    send(pid, {:EXIT, pid, :shutdown})
-    Process.sleep(20)
-    assert {:error, :pool_shutting_down} = ConnectionPool.checkout()
-  end
-
-  test "checked-out connections are waited for before shutdown" do
-    {:ok, ref1, _} = ConnectionPool.checkout()
-    {:ok, ref2, _} = ConnectionPool.checkout()
-
-    pid = Process.whereis(ConnectionPool)
-    send(pid, {:EXIT, pid, :shutdown})
-    Process.sleep(50)
-
-    assert Process.alive?(pid)
-
-    ConnectionPool.checkin(ref1)
-    ConnectionPool.checkin(ref2)
-    Process.sleep(100)
-
-    refute Process.alive?(pid)
+  test "rejects new work after gate flips" do
+    :ets.insert(:drain_gate, {:accepting, false})
+    assert {:error, :draining} = Server.handle(:new_req)
   end
 end
 ```
 
 ---
 
-## How it works
+## Trade-offs and production gotchas
 
-1. **`trap_exit` in `init/1`**: converts the supervisor's shutdown signal from an immediate kill into a `{:EXIT, ...}` message in `handle_info`.
+**1. `trap_exit` + slow `terminate/2` + short `shutdown:` = brutal kill.** The supervisor enforces `shutdown:`. If your drain takes 20 s but `shutdown: 5_000`, at 5 s the supervisor sends `:kill` and `terminate/2` is interrupted mid-flush. Always: `shutdown:` ≥ drain budget + 2s safety.
 
-2. **Stop accepting, keep processing**: on receiving the shutdown signal, set `accepting: false` and schedule a drain timeout. The normal message loop continues processing remaining work.
+**2. `terminate/2` runs in the GenServer's process — it still receives messages.** Casts and calls keep arriving during drain. The `receive` loop above only handles `:work_done`; other messages pile up in the mailbox. Either selectively receive (as shown) or explicitly drain the mailbox.
 
-3. **Drain completion**: when all active work finishes (requests drained, connections returned, queue empty), return `{:stop, :shutdown, state}`.
+**3. The gate must be accessible without going through the GenServer.** If `accepting?/0` calls `GenServer.call(Server, :accepting?)`, and the GenServer is busy draining, new callers block on the call. ETS or `:persistent_term` with O(1) read is the correct primitive.
 
-4. **Custom `:shutdown` in child_spec**: gives the supervisor enough time to wait for the drain before force-killing.
+**4. `:persistent_term.put/2` is NOT fast on hot paths.** Each put triggers a global GC scan. Use it ONCE at shutdown, not per-request. ETS is the better fit for flipping state during normal operation.
+
+**5. K8s `preStop` hook races with `SIGTERM`.** K8s sends `preStop` THEN `SIGTERM` simultaneously. If your app starts draining on `SIGTERM` but your Service endpoint still routes traffic for 2 s (endpoint propagation delay), your "unavailable" window accepts traffic. Solution: `preStop` sleep(3s) + separate readiness probe that fails as soon as drain starts.
+
+**6. `terminate/2` does NOT run on `:brutal_kill`, VM crash, or `Process.exit(pid, :kill)`.** It is a best-effort hook. Durability invariants belong in the DB, not `terminate/2`. Idempotent writes + DB transactions are the real guarantee.
+
+**7. Monitored callers see `:noproc` not `:draining`.** If a request is in `GenServer.call` when the GenServer dies, the caller gets `{:noproc, _}` or `:timeout`. Wrap all calls with a try/catch or make them idempotent at the client layer.
+
+**8. When NOT to use this.** For stateless workers whose loss is harmless (pure in-memory caches, telemetry aggregators that re-read on startup), `:brutal_kill` is simpler and faster. Drain is for processes with external side effects or user-visible replies.
 
 ---
 
-## Common production mistakes
+## Performance notes
 
-**1. `:brutal_kill` for all workers**
-Terminates processes immediately without cleanup. Requests are dropped, connections leaked.
+`Process.flag(:trap_exit, true)` has no measurable runtime cost — it's a single bit on the PCB. The drain itself is bounded by the slowest in-flight job; measure it with `:timer.tc/1` wrapped around the supervisor's terminate call.
 
-**2. Not setting `trap_exit`**
-Without it, the supervisor's shutdown signal kills the process directly. The drain logic in `handle_info` never runs.
-
-**3. Shutdown timeout smaller than maximum work duration**
-If a request can take 30 seconds and `:shutdown` is 5 seconds, the supervisor kills mid-request.
-
-**4. Doing expensive work in `terminate/2`**
-`terminate/2` should be fast. Do not call other processes there -- they may already be shutting down.
+ETS lookups for the gate are ~50 ns. `:persistent_term.get/1` is ~20 ns but with global GC cost on writes — the trade-off favors ETS for frequently-flipped flags.
 
 ---
 
 ## Resources
 
-- [HexDocs -- GenServer.terminate/2](https://hexdocs.pm/elixir/GenServer.html#c:terminate/2)
-- [Erlang OTP -- Shutdown](https://www.erlang.org/doc/design_principles/sup_princ.html#shutdown)
-- [Kubernetes Container Lifecycle Hooks](https://kubernetes.io/docs/concepts/containers/container-lifecycle-hooks/)
+- [`Process.flag(:trap_exit, true)` — hexdocs](https://hexdocs.pm/elixir/Process.html#flag/2) — the EXIT interception semantics.
+- [`GenServer.terminate/2` — hexdocs](https://hexdocs.pm/elixir/GenServer.html#c:terminate/2) — when it runs and when it doesn't.
+- [OTP Design Principles — sys and proc_lib](https://www.erlang.org/doc/design_principles/spec_proc.html) — under-the-hood shutdown protocol.
+- [Fred Hébert — Handling Overload](https://ferd.ca/handling-overload.html) — load shedding patterns that pair with drain.
+- [K8s pod termination lifecycle](https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#pod-termination) — how `preStop`, `SIGTERM`, `terminationGracePeriodSeconds` interact.
+- [Phoenix.Endpoint draining (ranch)](https://github.com/phoenixframework/phoenix/blob/main/lib/phoenix/endpoint/cowboy2_adapter.ex) — real HTTP drain with ranch's protocol.
+- [Plug.Cowboy drain](https://hexdocs.pm/plug_cowboy/Plug.Cowboy.html#module-options) — production drain hooks.

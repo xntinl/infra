@@ -1,768 +1,530 @@
-# Advanced Ecto Schemas
+# Advanced Ecto Schemas: embedded, virtual, custom types, polymorphism
 
-## Overview
+**Project**: `ecto_schemas_deep` — schema layer for a CRM with flexible contact data.
 
-Implement advanced Ecto schema patterns for an API gateway: polymorphic audit events,
-embedded schemas stored as JSONB, multi-tenant query scoping with `put_query_prefix/2`,
-preload optimization to prevent N+1 queries, and transactional side effects with
-`prepare_changes/1`.
+**Difficulty**: ★★★★☆
+**Estimated time**: 4–6 hours
 
-Project structure:
+---
+
+## Project context
+
+You're building the schema layer for a CRM product. Contacts store addresses (not worth a
+separate table — always loaded together), tags (a list of strings), a flexible "attributes"
+map for per-tenant custom fields, and phone numbers that must always be normalized to E.164.
+The contact also has a derived "full_name" that should not be persisted but must be present
+in forms. Notes are polymorphic: a note can belong to a `Contact`, a `Company`, or a `Deal`.
+
+The naive path — creating tables for addresses, tags, attributes, polymorphic note
+associations via per-type foreign keys — leads to 8 tables, 12 joins, and brittle cascades.
+This exercise uses the tools Ecto gives you to collapse that complexity: `embedded_schema`,
+`embeds_one` / `embeds_many`, `field :virtual`, custom `Ecto.Type`, and a single `notes` table
+with a `{notable_id, notable_type}` pair + runtime polymorphic dispatch.
+
+The value of mastering this: you stop reaching for `jsonb` columns and parsing them in the
+application, you stop writing boilerplate `Phone.parse/1` in every changeset, and you stop
+fighting the type system. You move validation into the schema where it belongs.
+
+---
 
 ```
-api_gateway/
+ecto_schemas_deep/
 ├── lib/
-│   └── api_gateway/
+│   └── ecto_schemas_deep/
+│       ├── application.ex
 │       ├── repo.ex
+│       ├── types/
+│       │   └── phone_e164.ex            # custom Ecto.Type
 │       ├── schemas/
-│       │   ├── client.ex
-│       │   ├── request_log.ex
-│       │   ├── request_metadata.ex
-│       │   ├── request_header.ex
-│       │   └── billing_entry.ex
-│       ├── audit/
-│       │   ├── event.ex
-│       │   └── events.ex
-│       ├── tenant/
-│       │   └── scope.ex
-│       └── analytics/
-│           └── preloader.ex
-└── test/
-    └── api_gateway/
-        ├── audit_event_test.exs
-        ├── request_log_test.exs
-        └── tenant_scope_test.exs
+│       │   ├── address.ex               # embedded_schema
+│       │   ├── contact.ex
+│       │   ├── company.ex
+│       │   ├── deal.ex
+│       │   └── note.ex                  # polymorphic parent
+│       └── notes.ex                     # context module
+├── priv/repo/migrations/
+│   └── 20260101000000_create_schemas.exs
+├── test/
+│   └── ecto_schemas_deep/
+│       ├── contact_test.exs
+│       └── note_test.exs
+└── mix.exs
 ```
 
 ---
 
-## Why these patterns matter in production
+## Core concepts
 
-- **Polymorphic associations**: audit events reference clients, workers, and webhook
-  endpoints -- all different tables. One `audit_events` table with `auditable_type` /
-  `auditable_id` handles all three without tripling the schema.
+### 1. `embedded_schema` vs `schema`
 
-- **`embeds_one` / `embeds_many`**: request metadata (headers, query params, TLS info)
-  changes shape frequently. Storing it as JSONB with an `embedded_schema` gives full Ecto
-  validation without a JOIN.
+A `schema "table"` maps to a real database table. An `embedded_schema` has no table — it
+is serialized inside another schema's `embeds_one`/`embeds_many` column (a `jsonb` in
+Postgres, a `text` with JSON encoding in SQLite, a `map` field in `Ecto.Adapters.MyXQL`).
 
-- **`put_query_prefix/2`**: enterprise clients get isolated PostgreSQL schemas. A missing
-  prefix silently reads the wrong tenant's data. The `Scope` module makes accidental
-  cross-tenant reads structurally impossible.
+Use embedded when the child has no identity of its own and is never queried independently.
+"Address inside Contact" is the canonical case: you never do "find all addresses where
+country = AR"; you always load addresses as part of a contact.
 
-- **Preload optimization**: the admin dashboard loads clients with their last 5 request
-  logs. Without explicit preloads, Ecto issues one query per client (N+1).
+### 2. Virtual fields
+
+`field :password, :string, virtual: true` is not written to the database. Its purpose:
+hold data that exists in changesets and structs but not on disk. Typical uses:
+
+- `:password` — validated, then put_change `:password_hash` and remove `:password`.
+- `:full_name` — derived from `first_name <> " " <> last_name`, useful in templates.
+- `:current_user_id` — passed through a changeset for authorization checks.
+
+Virtual fields are just `Map.put(struct, :field, value)` — they do NOT appear in `select`,
+`preload`, or migrations.
+
+### 3. Custom `Ecto.Type`
+
+Built-in types (`:string`, `:integer`, `:map`, `:utc_datetime`) cover 90% of cases.
+Sometimes you need round-trip transformation: store a normalized phone (`"+541112345678"`)
+but accept user input like `"11 1234-5678"`. Implement the `Ecto.Type` behaviour:
+
+```elixir
+@behaviour Ecto.Type
+def type, do: :string
+def cast(raw), do: {:ok, normalized} | :error     # user input → Elixir
+def load(db),  do: {:ok, value}                   # database row → Elixir
+def dump(val), do: {:ok, db_value}                # Elixir → database
+```
+
+This moves normalization into `cast/1`, a single point. Any changeset that
+`cast(:phone, ..., PhoneE164)` gets E.164 for free.
+
+### 4. Polymorphic associations
+
+Rails-style polymorphism (`notable_id + notable_type`) has no native Ecto helper because
+Ecto prefers explicit FKs. Two approaches:
+
+- **Dedicated join tables** (`contact_notes`, `company_notes`, `deal_notes`). Simple,
+  typed, but duplicated structure.
+- **Single `notes` table with `(notable_id, notable_type)`**. Less typing, but associations
+  must be resolved at runtime via a dispatcher.
+
+This exercise implements approach 2 and shows the escape hatch (a `Notes.for(parent)`
+function that picks the right schema) — often cleaner than duplicated join tables when the
+child schema itself (the `Note`) is identical across parents.
+
+### 5. `embeds_many` with ordered composition
+
+`embeds_many :tags, Tag, on_replace: :delete` holds a list where the order is preserved.
+`on_replace: :delete` says "when the parent changeset replaces the list, delete the
+missing ones". Alternatives: `:raise` (default, forces explicit ordering), `:mark_as_invalid`,
+`:update`. Getting `on_replace` wrong causes silent data loss.
+
+### 6. `Ecto.Changeset.cast_embed/3` vs `cast/3`
+
+`cast/3` assigns simple fields. `cast_embed/3` runs the embedded schema's own changeset
+function recursively. This is how validation composes: the `Contact` changeset calls
+`cast_embed(:address, with: &Address.changeset/2)` and address errors bubble up under the
+`:address` key.
 
 ---
 
 ## Implementation
 
-### Part 1: Polymorphic audit events
+### Step 1: Project setup
 
 ```elixir
-# lib/api_gateway/audit/event.ex
-defmodule ApiGateway.Audit.Event do
-  use Ecto.Schema
-  import Ecto.Changeset
+# mix.exs
+defp deps do
+  [
+    {:ecto_sql, "~> 3.11"},
+    {:postgrex, "~> 0.17"},
+    {:jason, "~> 1.4"}
+  ]
+end
+```
 
-  @auditable_types ["Client", "Worker", "WebhookEndpoint"]
+### Step 2: Custom type — `PhoneE164`
 
-  schema "audit_events" do
-    field :action,         :string
-    field :actor_id,       :integer
-    field :actor_type,     :string
-    field :auditable_id,   :integer
-    field :auditable_type, :string
-    field :metadata,       :map, default: %{}
-    timestamps(updated_at: false)
+```elixir
+# lib/ecto_schemas_deep/types/phone_e164.ex
+defmodule EctoSchemasDeep.Types.PhoneE164 do
+  @moduledoc """
+  Ecto type that normalizes phone numbers to E.164 format on cast and dump.
+
+  Accepts strings with arbitrary separators; stores digits with leading `+`.
+  """
+  use Ecto.Type
+
+  @impl true
+  def type, do: :string
+
+  @impl true
+  def cast(value) when is_binary(value) do
+    case normalize(value) do
+      {:ok, e164} -> {:ok, e164}
+      :error -> :error
+    end
   end
 
-  @required_fields ~w(action auditable_id auditable_type)a
-  @optional_fields ~w(actor_id actor_type metadata)a
+  def cast(nil), do: {:ok, nil}
+  def cast(_), do: :error
 
-  @spec changeset(t(), map()) :: Ecto.Changeset.t()
-  def changeset(event, attrs) do
-    event
-    |> cast(attrs, @required_fields ++ @optional_fields)
-    |> validate_required(@required_fields)
-    |> validate_inclusion(:auditable_type, @auditable_types)
-    |> validate_length(:action, min: 1, max: 100)
+  @impl true
+  def load(value) when is_binary(value), do: {:ok, value}
+  def load(nil), do: {:ok, nil}
+
+  @impl true
+  def dump(value) when is_binary(value) do
+    case normalize(value) do
+      {:ok, e164} -> {:ok, e164}
+      :error -> :error
+    end
+  end
+
+  def dump(nil), do: {:ok, nil}
+  def dump(_), do: :error
+
+  defp normalize(raw) do
+    digits = raw |> to_string() |> String.replace(~r/[^\d+]/, "")
+
+    case digits do
+      "+" <> rest when byte_size(rest) in 8..15 ->
+        if String.match?(rest, ~r/^\d+$/), do: {:ok, "+" <> rest}, else: :error
+
+      rest when byte_size(rest) in 8..15 ->
+        if String.match?(rest, ~r/^\d+$/), do: {:ok, "+" <> rest}, else: :error
+
+      _ ->
+        :error
+    end
   end
 end
 ```
 
-```sql
--- Migration
-CREATE TABLE audit_events (
-  id              BIGSERIAL PRIMARY KEY,
-  action          VARCHAR(100) NOT NULL,
-  actor_id        INTEGER,
-  actor_type      VARCHAR(50),
-  auditable_id    INTEGER NOT NULL,
-  auditable_type  VARCHAR(50) NOT NULL,
-  metadata        JSONB DEFAULT '{}',
-  inserted_at     TIMESTAMP NOT NULL
-);
-
-CREATE INDEX audit_events_on_auditable ON audit_events (auditable_type, auditable_id);
-CREATE INDEX audit_events_on_inserted_at ON audit_events (inserted_at DESC);
-```
-
-#### Query module
+### Step 3: Embedded `Address` schema
 
 ```elixir
-# lib/api_gateway/audit/events.ex
-defmodule ApiGateway.Audit.Events do
-  import Ecto.Query
-  alias ApiGateway.{Repo, Audit.Event}
+# lib/ecto_schemas_deep/schemas/address.ex
+defmodule EctoSchemasDeep.Schemas.Address do
+  use Ecto.Schema
+  import Ecto.Changeset
 
-  @doc """
-  Returns audit events for a given entity struct.
-
-  ## Examples
-
-      Events.for(%Client{id: 1})
-      Events.for(%Worker{id: 42}, limit: 20)
-  """
-  @spec for(struct(), keyword()) :: [Event.t()]
-  def for(auditable, opts \\ []) do
-    type = auditable.__struct__ |> Module.split() |> List.last()
-    limit = Keyword.get(opts, :limit, 50)
-
-    from(e in Event,
-      where: e.auditable_type == ^type and e.auditable_id == ^auditable.id,
-      order_by: [desc: e.inserted_at],
-      limit: ^limit
-    )
-    |> Repo.all()
+  @primary_key false
+  embedded_schema do
+    field :street, :string
+    field :city, :string
+    field :country, :string
+    field :postal_code, :string
   end
 
-  @doc """
-  Records a new audit event. Raises on validation failure.
-  """
-  @spec record!(struct(), String.t(), map()) :: Event.t()
-  def record!(auditable, action, metadata \\ %{}) do
-    type = auditable.__struct__ |> Module.split() |> List.last()
+  @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+  def changeset(address, attrs) do
+    address
+    |> cast(attrs, [:street, :city, :country, :postal_code])
+    |> validate_required([:street, :city, :country])
+    |> validate_length(:country, is: 2)
+  end
+end
+```
 
-    %Event{}
-    |> Event.changeset(%{
-      auditable_type: type,
-      auditable_id: auditable.id,
-      action: action,
-      metadata: metadata
+### Step 4: `Contact` with embeds + virtual field + custom type
+
+```elixir
+# lib/ecto_schemas_deep/schemas/contact.ex
+defmodule EctoSchemasDeep.Schemas.Contact do
+  use Ecto.Schema
+  import Ecto.Changeset
+
+  alias EctoSchemasDeep.Schemas.Address
+  alias EctoSchemasDeep.Types.PhoneE164
+
+  schema "contacts" do
+    field :first_name, :string
+    field :last_name, :string
+    field :phone, PhoneE164
+    field :tags, {:array, :string}, default: []
+    field :custom_attrs, :map, default: %{}
+
+    # Derived on load; never persisted.
+    field :full_name, :string, virtual: true
+
+    embeds_one :address, Address, on_replace: :update
+
+    timestamps()
+  end
+
+  @required ~w(first_name last_name)a
+  @optional ~w(phone tags custom_attrs)a
+
+  @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+  def changeset(contact, attrs) do
+    contact
+    |> cast(attrs, @required ++ @optional)
+    |> validate_required(@required)
+    |> cast_embed(:address, with: &Address.changeset/2)
+    |> validate_length(:tags, max: 20)
+    |> put_full_name()
+  end
+
+  defp put_full_name(changeset) do
+    first = get_field(changeset, :first_name)
+    last = get_field(changeset, :last_name)
+
+    case {first, last} do
+      {f, l} when is_binary(f) and is_binary(l) ->
+        put_change(changeset, :full_name, "#{f} #{l}")
+
+      _ ->
+        changeset
+    end
+  end
+end
+```
+
+### Step 5: Polymorphic `Note`
+
+```elixir
+# lib/ecto_schemas_deep/schemas/note.ex
+defmodule EctoSchemasDeep.Schemas.Note do
+  use Ecto.Schema
+  import Ecto.Changeset
+
+  @notable_types ~w(contact company deal)
+
+  schema "notes" do
+    field :body, :string
+    field :notable_id, :integer
+    field :notable_type, :string
+    timestamps()
+  end
+
+  @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+  def changeset(note, attrs) do
+    note
+    |> cast(attrs, [:body, :notable_id, :notable_type])
+    |> validate_required([:body, :notable_id, :notable_type])
+    |> validate_inclusion(:notable_type, @notable_types)
+    |> validate_length(:body, min: 1, max: 10_000)
+  end
+
+  @spec notable_types() :: [String.t()]
+  def notable_types, do: @notable_types
+end
+```
+
+### Step 6: Context module for polymorphic dispatch
+
+```elixir
+# lib/ecto_schemas_deep/notes.ex
+defmodule EctoSchemasDeep.Notes do
+  @moduledoc "Runtime dispatcher for polymorphic notes."
+
+  import Ecto.Query
+
+  alias EctoSchemasDeep.Repo
+  alias EctoSchemasDeep.Schemas.{Company, Contact, Deal, Note}
+
+  @type notable :: Contact.t() | Company.t() | Deal.t()
+
+  @doc "Creates a note attached to any notable parent."
+  @spec create(notable(), String.t()) :: {:ok, Note.t()} | {:error, Ecto.Changeset.t()}
+  def create(notable, body) do
+    %Note{}
+    |> Note.changeset(%{
+      body: body,
+      notable_id: notable.id,
+      notable_type: type_for(notable)
     })
-    |> Repo.insert!()
+    |> Repo.insert()
   end
 
-  @doc """
-  Returns the count of events per action for a given entity.
-  """
-  @spec action_summary(struct()) :: [%{action: String.t(), count: integer()}]
-  def action_summary(auditable) do
-    type = auditable.__struct__ |> Module.split() |> List.last()
+  @doc "Returns all notes for a given parent."
+  @spec for_parent(notable()) :: [Note.t()]
+  def for_parent(notable) do
+    type = type_for(notable)
 
-    from(e in Event,
-      where: e.auditable_type == ^type and e.auditable_id == ^auditable.id,
-      group_by: e.action,
-      select: %{action: e.action, count: count(e.id)}
-    )
-    |> Repo.all()
-  end
-end
-```
-
----
-
-### Part 2: Embedded request metadata
-
-Each request log stores HTTP metadata as JSONB alongside the row.
-
-```elixir
-# lib/api_gateway/schemas/request_header.ex
-defmodule ApiGateway.RequestHeader do
-  use Ecto.Schema
-  import Ecto.Changeset
-
-  embedded_schema do
-    field :name,  :string
-    field :value, :string
-  end
-
-  @spec changeset(t(), map()) :: Ecto.Changeset.t()
-  def changeset(header, attrs) do
-    header
-    |> cast(attrs, [:name, :value])
-    |> validate_required([:name, :value])
-    |> validate_format(:name, ~r/^[a-z][a-z0-9-]*$/)
-  end
-end
-```
-
-```elixir
-# lib/api_gateway/schemas/request_metadata.ex
-defmodule ApiGateway.RequestMetadata do
-  use Ecto.Schema
-  import Ecto.Changeset
-
-  embedded_schema do
-    field :user_agent,   :string
-    field :remote_ip,    :string
-    field :tls_version,  :string
-    field :request_id,   :string
-    field :referer,      :string
-    embeds_many :custom_headers, ApiGateway.RequestHeader, on_replace: :delete
-  end
-
-  @spec changeset(t(), map()) :: Ecto.Changeset.t()
-  def changeset(meta, attrs) do
-    meta
-    |> cast(attrs, [:user_agent, :remote_ip, :tls_version, :request_id, :referer])
-    |> cast_embed(:custom_headers)
-    |> validate_format(:remote_ip, ~r/^\d{1,3}(\.\d{1,3}){3}$|^[0-9a-f:]+$/i)
-    |> validate_inclusion(:tls_version, ["TLSv1.2", "TLSv1.3", nil])
-  end
-end
-```
-
-```elixir
-# lib/api_gateway/schemas/request_log.ex
-defmodule ApiGateway.RequestLog do
-  use Ecto.Schema
-  import Ecto.Changeset
-
-  schema "request_logs" do
-    field :client_id,        :integer
-    field :method,           :string
-    field :path,             :string
-    field :status,           :integer
-    field :duration_ms,      :integer
-    field :bytes_transferred, :integer
-    field :billing_processed, :boolean, default: false
-
-    embeds_one :metadata, ApiGateway.RequestMetadata, on_replace: :update
-
-    timestamps()
-  end
-
-  @spec changeset(t(), map()) :: Ecto.Changeset.t()
-  def changeset(log, attrs) do
-    log
-    |> cast(attrs, [:client_id, :method, :path, :status, :duration_ms, :bytes_transferred])
-    |> validate_required([:client_id, :method, :path, :status])
-    |> validate_inclusion(:method, ~w(GET POST PUT PATCH DELETE HEAD OPTIONS))
-    |> validate_number(:status, greater_than_or_equal_to: 100, less_than: 600)
-    |> cast_embed(:metadata)
-  end
-end
-```
-
-```sql
-ALTER TABLE request_logs ADD COLUMN metadata JSONB;
-CREATE INDEX request_logs_metadata_gin ON request_logs USING GIN (metadata);
-```
-
-Usage:
-
-```elixir
-attrs = %{
-  client_id: 1, method: "GET", path: "/api/v1/users", status: 200,
-  duration_ms: 45, bytes_transferred: 1_024,
-  metadata: %{
-    remote_ip: "10.0.0.1", tls_version: "TLSv1.3",
-    user_agent: "GatewayClient/2.0",
-    custom_headers: [%{name: "x-request-id", value: "abc-123"}]
-  }
-}
-
-changeset = ApiGateway.RequestLog.changeset(%ApiGateway.RequestLog{}, attrs)
-changeset.valid?   # true -- metadata validated recursively
-```
-
----
-
-### Part 3: Multi-tenancy with `put_query_prefix/2`
-
-Enterprise clients get their own PostgreSQL schema. All queries for a tenant must target
-their schema -- a query missing the prefix silently reads the wrong data.
-
-```elixir
-# lib/api_gateway/tenant/scope.ex
-defmodule ApiGateway.Tenant.Scope do
-  import Ecto.Query
-  alias ApiGateway.Repo
-
-  @valid_tenant_pattern ~r/^[a-z][a-z0-9_]{0,62}$/
-
-  @doc """
-  Applies the tenant prefix to an Ecto query.
-  Raises ArgumentError if the tenant ID does not match the safe pattern.
-  """
-  @spec scope(Ecto.Queryable.t(), String.t()) :: Ecto.Query.t()
-  def scope(query, tenant_id) do
-    validate_tenant_id!(tenant_id)
-    query |> Ecto.Queryable.to_query() |> put_query_prefix("tenant_#{tenant_id}")
-  end
-
-  @doc "Repo.all scoped to a tenant."
-  @spec all(Ecto.Queryable.t(), String.t()) :: [struct()]
-  def all(query, tenant_id) do
-    validate_tenant_id!(tenant_id)
-    scope(query, tenant_id) |> Repo.all()
-  end
-
-  @doc "Repo.get scoped to a tenant."
-  @spec get(module(), integer(), String.t()) :: struct() | nil
-  def get(schema, id, tenant_id) do
-    validate_tenant_id!(tenant_id)
-    Repo.get(schema, id, prefix: "tenant_#{tenant_id}")
-  end
-
-  @doc "Repo.insert scoped to a tenant."
-  @spec insert(Ecto.Changeset.t(), String.t()) :: {:ok, struct()} | {:error, Ecto.Changeset.t()}
-  def insert(changeset, tenant_id) do
-    validate_tenant_id!(tenant_id)
-    Repo.insert(changeset, prefix: "tenant_#{tenant_id}")
-  end
-
-  @doc "Repo.update scoped to a tenant."
-  @spec update(Ecto.Changeset.t(), String.t()) :: {:ok, struct()} | {:error, Ecto.Changeset.t()}
-  def update(changeset, tenant_id) do
-    validate_tenant_id!(tenant_id)
-    Repo.update(changeset, prefix: "tenant_#{tenant_id}")
-  end
-
-  defp validate_tenant_id!(tenant_id) do
-    unless Regex.match?(@valid_tenant_pattern, tenant_id) do
-      raise ArgumentError, "unsafe tenant_id: #{inspect(tenant_id)}"
-    end
-  end
-end
-```
-
-The generated SQL targets the tenant's schema:
-
-```sql
--- Scope.all(Client, "acme_corp")
-SELECT c0."id", c0."name" FROM "tenant_acme_corp"."clients" AS c0
-
--- Scope.all(Client, "globex")
-SELECT c0."id", c0."name" FROM "tenant_globex"."clients" AS c0
-```
-
-A Plug injects the tenant at the request boundary:
-
-```elixir
-# lib/api_gateway_web/plugs/tenant_plug.ex
-defmodule ApiGatewayWeb.TenantPlug do
-  import Plug.Conn
-
-  def init(opts), do: opts
-
-  def call(conn, _opts) do
-    tenant_id = get_req_header(conn, "x-tenant-id") |> List.first()
-
-    cond do
-      is_nil(tenant_id) ->
-        conn |> send_resp(400, "Missing X-Tenant-Id header") |> halt()
-
-      not Regex.match?(~r/^[a-z][a-z0-9_]{0,62}$/, tenant_id) ->
-        conn |> send_resp(400, "Invalid tenant identifier") |> halt()
-
-      true ->
-        assign(conn, :tenant_id, tenant_id)
-    end
-  end
-end
-```
-
----
-
-### Part 4: Preload optimization for the admin dashboard
-
-```elixir
-# lib/api_gateway/analytics/preloader.ex
-defmodule ApiGateway.Analytics.Preloader do
-  import Ecto.Query
-  alias ApiGateway.{Repo, Client, RequestLog}
-
-  @doc """
-  Loads all clients for the dashboard with their recent request logs preloaded.
-
-  Uses two queries total (not N+1):
-    1. SELECT * FROM clients ORDER BY name
-    2. SELECT * FROM request_logs WHERE client_id IN (...) ORDER BY inserted_at DESC
-  """
-  @spec clients_with_recent_logs(integer()) :: [Client.t()]
-  def clients_with_recent_logs(log_limit \\ 5) do
-    recent_logs =
-      from(r in RequestLog,
-        order_by: [desc: r.inserted_at],
-        limit: ^log_limit
-      )
-
-    from(c in Client,
-      order_by: c.name,
-      preload: [request_logs: ^recent_logs]
+    from(n in Note,
+      where: n.notable_id == ^notable.id and n.notable_type == ^type,
+      order_by: [desc: n.inserted_at]
     )
     |> Repo.all()
   end
 
-  @doc """
-  Loads a single client with all associations needed for the detail page.
-
-  Uses a JOIN for billing (needed for the WHERE clause) and a separate
-  preload for request_logs.
-  """
-  @spec client_detail(integer()) :: Client.t() | nil
-  def client_detail(client_id) do
-    recent_logs =
-      from(r in RequestLog,
-        order_by: [desc: r.inserted_at],
-        limit: 10
-      )
-
-    from(c in Client,
-      left_join: b in assoc(c, :billing_entries), as: :billing,
-      where: c.id == ^client_id,
-      preload: [billing_entries: b, request_logs: ^recent_logs]
-    )
-    |> Repo.one()
-  end
-
-  @doc """
-  Detects potential N+1: returns true if the struct has a loaded association.
-  Use in tests to catch missing preloads before they hit production.
-  """
-  @spec loaded?(struct(), atom()) :: boolean()
-  def loaded?(struct, assoc_name) do
-    case Map.get(struct, assoc_name) do
-      %Ecto.Association.NotLoaded{} -> false
-      _                             -> true
-    end
-  end
+  defp type_for(%Contact{}), do: "contact"
+  defp type_for(%Company{}), do: "company"
+  defp type_for(%Deal{}), do: "deal"
 end
 ```
 
----
-
-### Part 5: `prepare_changes/1` for transactional side effects
-
-When a client's plan changes, the rate limiter ETS table must be updated atomically
-with the DB write.
+### Step 7: Migrations
 
 ```elixir
-# lib/api_gateway/schemas/client.ex
-defmodule ApiGateway.Client do
-  use Ecto.Schema
-  import Ecto.Changeset
+defmodule EctoSchemasDeep.Repo.Migrations.CreateSchemas do
+  use Ecto.Migration
 
-  schema "clients" do
-    field :name,             :string
-    field :plan,             Ecto.Enum, values: [:free, :pro, :enterprise]
-    field :active,           :boolean, default: true
-    field :quota_remaining,  :integer
-    has_many :request_logs,   ApiGateway.RequestLog
-    has_many :billing_entries, ApiGateway.BillingEntry
-    timestamps()
-  end
-
-  @spec changeset(t(), map()) :: Ecto.Changeset.t()
-  def changeset(client, attrs) do
-    client
-    |> cast(attrs, [:name, :plan, :active, :quota_remaining])
-    |> validate_required([:name, :plan])
-  end
-
-  @doc """
-  Changeset for plan upgrades. Records an audit event and refreshes the
-  rate limiter ETS table inside the same transaction.
-
-  prepare_changes/1 runs ONLY if the changeset is valid AND inside the DB transaction.
-  """
-  @spec plan_upgrade_changeset(t(), map()) :: Ecto.Changeset.t()
-  def plan_upgrade_changeset(client, attrs) do
-    client
-    |> cast(attrs, [:plan, :quota_remaining])
-    |> validate_required([:plan])
-    |> validate_change(:plan, fn :plan, new_plan ->
-      if plan_rank(new_plan) > plan_rank(client.plan),
-        do: [],
-        else: [plan: "can only upgrade, not downgrade"]
-    end)
-    |> prepare_changes(&record_plan_change_audit/1)
-    |> prepare_changes(&refresh_rate_limiter/1)
-  end
-
-  defp record_plan_change_audit(changeset) do
-    old_plan = changeset.data.plan
-    new_plan = get_change(changeset, :plan)
-
-    if new_plan && new_plan != old_plan do
-      changeset.repo.insert!(%ApiGateway.Audit.Event{
-        auditable_type: "Client",
-        auditable_id: changeset.data.id,
-        action: "plan_upgraded",
-        metadata: %{from: old_plan, to: new_plan}
-      })
+  def change do
+    create table(:contacts) do
+      add :first_name, :string, null: false
+      add :last_name, :string, null: false
+      add :phone, :string
+      add :tags, {:array, :string}, default: []
+      add :custom_attrs, :map, default: %{}
+      add :address, :map
+      timestamps()
     end
 
-    changeset
-  end
-
-  defp refresh_rate_limiter(changeset) do
-    if new_plan = get_change(changeset, :plan) do
-      :ets.insert(:rate_limiter_config, {changeset.data.id, quota_for(new_plan)})
+    create table(:companies) do
+      add :name, :string, null: false
+      timestamps()
     end
 
-    changeset
-  end
+    create table(:deals) do
+      add :title, :string, null: false
+      add :amount_cents, :integer, null: false
+      timestamps()
+    end
 
-  defp plan_rank(:free),       do: 1
-  defp plan_rank(:pro),        do: 2
-  defp plan_rank(:enterprise), do: 3
-
-  defp quota_for(:free),       do: 1_000
-  defp quota_for(:pro),        do: 50_000
-  defp quota_for(:enterprise), do: :unlimited
-end
-```
-
----
-
-### Step 6: Tests
-
-```elixir
-# test/api_gateway/audit_event_test.exs
-defmodule ApiGateway.Audit.EventTest do
-  use ApiGateway.DataCase
-
-  alias ApiGateway.Audit.{Event, Events}
-
-  test "record! creates an audit event for a client" do
-    client = insert(:client)
-
-    event = Events.record!(client, "rate_limited", %{limit: 1000, actual: 1500})
-
-    assert event.auditable_type == "Client"
-    assert event.auditable_id   == client.id
-    assert event.action         == "rate_limited"
-    assert event.metadata       == %{"limit" => 1000, "actual" => 1500}
-  end
-
-  test "for/1 returns events for the given entity only" do
-    client_a = insert(:client)
-    client_b = insert(:client)
-
-    Events.record!(client_a, "created")
-    Events.record!(client_a, "updated")
-    Events.record!(client_b, "created")
-
-    events = Events.for(client_a)
-    assert length(events) == 2
-    assert Enum.all?(events, fn e -> e.auditable_id == client_a.id end)
-  end
-
-  test "for/1 respects the limit option" do
-    client = insert(:client)
-    Enum.each(1..10, fn _ -> Events.record!(client, "ping") end)
-
-    assert length(Events.for(client, limit: 3)) == 3
-  end
-
-  test "changeset rejects unknown auditable_type" do
-    attrs = %{action: "created", auditable_id: 1, auditable_type: "Invoice"}
-    cs = Event.changeset(%Event{}, attrs)
-    refute cs.valid?
-    assert {:auditable_type, _} = hd(cs.errors)
-  end
-
-  test "action_summary groups events by action" do
-    client = insert(:client)
-    Events.record!(client, "rate_limited")
-    Events.record!(client, "rate_limited")
-    Events.record!(client, "updated")
-
-    summary = Events.action_summary(client)
-    by_action = Map.new(summary, fn %{action: a, count: c} -> {a, c} end)
-
-    assert by_action["rate_limited"] == 2
-    assert by_action["updated"] == 1
+    create table(:notes) do
+      add :body, :text, null: false
+      add :notable_id, :integer, null: false
+      add :notable_type, :string, null: false
+      timestamps()
+    end
+    create index(:notes, [:notable_type, :notable_id])
   end
 end
 ```
 
-```elixir
-# test/api_gateway/request_log_test.exs
-defmodule ApiGateway.RequestLogTest do
-  use ApiGateway.DataCase
-
-  alias ApiGateway.RequestLog
-
-  @valid_attrs %{
-    client_id: 1, method: "GET", path: "/api/v1/resources", status: 200,
-    duration_ms: 42, bytes_transferred: 512,
-    metadata: %{
-      remote_ip: "10.0.0.1", tls_version: "TLSv1.3",
-      user_agent: "TestAgent/1.0", request_id: "req-abc",
-      custom_headers: [%{name: "x-trace-id", value: "trace-xyz"}]
-    }
-  }
-
-  test "valid request log with embedded metadata" do
-    cs = RequestLog.changeset(%RequestLog{}, @valid_attrs)
-    assert cs.valid?
-  end
-
-  test "embedded metadata is validated recursively" do
-    attrs = put_in(@valid_attrs, [:metadata, :tls_version], "SSLv3")
-    cs = RequestLog.changeset(%RequestLog{}, attrs)
-    refute cs.valid?
-    refute cs.changes.metadata.valid?
-  end
-
-  test "custom header name must be lowercase" do
-    attrs = put_in(@valid_attrs, [:metadata, :custom_headers], [%{name: "X-Trace", value: "1"}])
-    cs = RequestLog.changeset(%RequestLog{}, attrs)
-    refute cs.valid?
-  end
-
-  test "metadata is preserved as JSONB on insert" do
-    {:ok, log} = %RequestLog{}
-    |> RequestLog.changeset(@valid_attrs)
-    |> ApiGateway.Repo.insert()
-
-    loaded = ApiGateway.Repo.get!(RequestLog, log.id)
-    assert loaded.metadata.remote_ip == "10.0.0.1"
-    assert loaded.metadata.tls_version == "TLSv1.3"
-    assert hd(loaded.metadata.custom_headers).name == "x-trace-id"
-  end
-
-  test "missing method is invalid" do
-    attrs = Map.delete(@valid_attrs, :method)
-    cs = RequestLog.changeset(%RequestLog{}, attrs)
-    refute cs.valid?
-  end
-end
-```
+### Step 8: Tests
 
 ```elixir
-# test/api_gateway/tenant_scope_test.exs
-defmodule ApiGateway.Tenant.ScopeTest do
-  use ApiGateway.DataCase
+# test/ecto_schemas_deep/contact_test.exs
+defmodule EctoSchemasDeep.ContactTest do
+  use ExUnit.Case, async: false
 
-  alias ApiGateway.Tenant.Scope
-  alias ApiGateway.Client
+  alias EctoSchemasDeep.Repo
+  alias EctoSchemasDeep.Schemas.Contact
 
   setup do
-    ApiGateway.Repo.query!("CREATE SCHEMA IF NOT EXISTS tenant_test_co")
-    ApiGateway.Repo.query!("""
-      CREATE TABLE IF NOT EXISTS tenant_test_co.clients
-        (LIKE public.clients INCLUDING ALL)
-    """)
-    on_exit(fn ->
-      ApiGateway.Repo.query!("DROP SCHEMA tenant_test_co CASCADE")
-    end)
+    Ecto.Adapters.SQL.Sandbox.checkout(Repo)
     :ok
   end
 
-  test "scope/2 applies the correct PostgreSQL schema prefix" do
-    {sql, _} = ApiGateway.Repo.to_sql(:all, Scope.scope(Client, "test_co"))
-    assert sql =~ ~s("tenant_test_co"."clients")
-  end
+  describe "changeset/2 — phone custom type" do
+    test "normalizes a phone number to E.164" do
+      cs = Contact.changeset(%Contact{}, %{
+        first_name: "Ada",
+        last_name: "Lovelace",
+        phone: "+54 11 1234-5678"
+      })
 
-  test "all/2 reads from the tenant schema" do
-    ApiGateway.Repo.insert!(%Client{name: "Tenant Client", plan: :pro}, prefix: "tenant_test_co")
-
-    results = Scope.all(Client, "test_co")
-    assert length(results) == 1
-    assert hd(results).name == "Tenant Client"
-  end
-
-  test "all/2 does not read from the default schema" do
-    insert(:client, name: "Default Schema Client")
-
-    results = Scope.all(Client, "test_co")
-    assert results == []
-  end
-
-  test "scope/2 raises on unsafe tenant_id" do
-    assert_raise ArgumentError, fn ->
-      Scope.scope(Client, "../../etc/passwd")
+      assert cs.valid?
+      assert Ecto.Changeset.get_change(cs, :phone) == "+5411123456781"
+             or Ecto.Changeset.get_change(cs, :phone) == "+541112345678"
     end
 
-    assert_raise ArgumentError, fn ->
-      Scope.scope(Client, "'; DROP TABLE clients; --")
+    test "rejects gibberish phone" do
+      cs = Contact.changeset(%Contact{}, %{
+        first_name: "Ada",
+        last_name: "Lovelace",
+        phone: "abc"
+      })
+
+      refute cs.valid?
+      assert %{phone: ["is invalid"]} = errors_on(cs)
     end
   end
 
-  test "insert/2 writes to the tenant schema" do
-    {:ok, client} =
-      %Client{}
-      |> Client.changeset(%{name: "New Tenant Client", plan: :free})
-      |> Scope.insert("test_co")
+  describe "changeset/2 — embedded address" do
+    test "casts nested address errors" do
+      cs = Contact.changeset(%Contact{}, %{
+        first_name: "Ada",
+        last_name: "Lovelace",
+        address: %{street: "Main 1", city: "BA", country: "ARGENTINA"}
+      })
 
-    assert client.name == "New Tenant Client"
-    assert Scope.all(Client, "test_co") |> length() == 1
-    assert ApiGateway.Repo.all(Client) |> length() == 0
+      refute cs.valid?
+      assert %{address: %{country: ["should be 2 character(s)"]}} = errors_on(cs)
+    end
+  end
+
+  describe "changeset/2 — virtual full_name" do
+    test "derives full_name on cast" do
+      cs = Contact.changeset(%Contact{}, %{first_name: "Ada", last_name: "Lovelace"})
+      assert Ecto.Changeset.get_change(cs, :full_name) == "Ada Lovelace"
+    end
+  end
+
+  defp errors_on(changeset) do
+    Ecto.Changeset.traverse_errors(changeset, fn {message, opts} ->
+      Regex.replace(~r"%{(\w+)}", message, fn _, key ->
+        opts |> Keyword.get(String.to_existing_atom(key), key) |> to_string()
+      end)
+    end)
   end
 end
 ```
 
-### Step 7: Run the tests
+---
 
-```bash
-mix test test/api_gateway/audit_event_test.exs \
-         test/api_gateway/request_log_test.exs \
-         test/api_gateway/tenant_scope_test.exs \
-         --trace
+## Trade-offs and production gotchas
+
+**1. Embedded schemas lose queryability**
+`where: contact.address.country == "AR"` is a JSONB path query. Ecto supports
+`fragment("? ->> 'country'", c.address)`, but you lose compile-time field checks. If
+you need to filter by an embedded field regularly, promote it to a top-level column or
+a real association.
+
+**2. `on_replace` default is `:raise`**
+Forgetting `on_replace: :delete` (or `:update`) on `embeds_many` means any update that
+changes the list raises. Document your choice explicitly — it's not a "minor config".
+
+**3. Custom type `cast/1` runs on user input only**
+`cast/1` is invoked by `Ecto.Changeset.cast/3`. If you insert with `Repo.insert(%Contact{phone: "bad"})`
+directly, `dump/1` runs but does not always reject — test both paths.
+
+**4. Virtual fields don't survive JSON serialization unless you opt in**
+`Jason.encode!(contact)` includes virtual fields because they're struct keys. But
+`Contact |> Repo.all() |> Jason.encode!()` yields `"full_name": null` because the virtual
+was never computed. Compute it after load with a `Repo.after_compile` hook or a view layer.
+
+**5. Polymorphic via `(notable_id, notable_type)` cannot use foreign keys**
+There's no FK constraint ensuring the `notable_id` exists in any specific table. You
+accept orphan risk. Mitigate with a background cleanup job or by adding a CHECK trigger.
+
+**6. `embeds_many` with 10k entries is an antipattern**
+Every read hydrates the entire JSON blob. Above ~100 entries, promote to a real
+`has_many`. Measure with `Repo.query!("SELECT pg_column_size(tags) FROM contacts")`.
+
+**7. `{:array, :string}` is Postgres-only**
+SQLite and MySQL do not support native arrays. Use a custom type that serializes to JSON
+text if you need cross-DB portability.
+
+**8. When NOT to use this**
+If the "embedded" data must be searched by external systems, reported on independently,
+or shared across entities (e.g., a company address that applies to many contacts),
+promote it to its own table. Embedded is for locality, not for flexibility.
+
+---
+
+## Performance notes
+
+Measure embedded vs joined address retrieval:
+
+```elixir
+{t_embed, _} = :timer.tc(fn ->
+  for _ <- 1..1_000, do: Repo.get!(Contact, contact_id)
+end)
 ```
 
----
-
-## Trade-off analysis
-
-| Pattern | When to use | When NOT to use |
-|---------|-------------|-----------------|
-| Polymorphic `auditable_type/id` | One event type targets many entity types | When referential integrity is critical -- use separate tables with FK constraints |
-| `embeds_one` / `embeds_many` | Data queried only with parent; schema changes frequently | Data queried independently; needs FK constraints or its own indexes |
-| `put_query_prefix/2` | Hard isolation between tenants; different data retention policies | Shared data across tenants; schema-per-tenant migration overhead is unacceptable |
-| `preload:` keyword in query | Need to filter/order by the association | No filter needed -- use `preload/2` call for cleaner separation |
-| `prepare_changes/1` | Single side effect tightly coupled to the DB write | Multiple independent side effects -- use `Ecto.Multi` for explicitness |
-
----
-
-## Common production mistakes
-
-**1. No composite index on `(auditable_type, auditable_id)`**
-Every `Events.for/1` call does a full table scan without this index. Add the composite
-index at migration time.
-
-**2. `embeds_many` without `on_replace: :delete`**
-The default `on_replace` behavior for embeds is `:raise`. Use `on_replace: :delete` to
-allow the embedded list to be replaced via `cast_embed/3`.
-
-**3. Building the tenant prefix from raw user input**
-`put_query_prefix(query, "tenant_" <> conn.params["tenant"])` allows any string as a
-prefix. Always validate the tenant ID against a strict regex before building the prefix.
-
-**4. `preload: [request_logs: ^query]` with `limit` applies globally, not per-parent**
-Adding `limit: 5` to a preload query applies `LIMIT 5` to the whole result set, not per
-client. To get N rows per parent, use a window function: `ROW_NUMBER() OVER (PARTITION BY
-client_id ORDER BY inserted_at DESC)` and filter `row_number <= 5` in a subquery.
-
-**5. `prepare_changes/1` for ETS writes is not fully atomic**
-`prepare_changes/1` runs inside the PostgreSQL transaction, but ETS writes are not
-transactional. If the ETS write succeeds and then the DB transaction rolls back, the ETS
-state is inconsistent. For ETS state derived from DB state, prefer updating ETS *after*
-the `{:ok, result}` from `Repo.update/1`.
+A contact with an embedded address is a single `SELECT * FROM contacts` row.
+A contact with a joined address is an additional query (or JOIN) per record. For
+1000 lookups, embedded is typically 2–3× faster and allocates less on the BEAM heap
+because there's one struct instead of two.
 
 ---
 
 ## Resources
 
-- [`Ecto.Schema.embeds_one/3`](https://hexdocs.pm/ecto/Ecto.Schema.html#embeds_one/3) -- embedded schemas and JSONB
-- [`Ecto.Query.put_query_prefix/2`](https://hexdocs.pm/ecto/Ecto.Query.html#put_query_prefix/2) -- schema-per-tenant queries
-- [`Ecto.Changeset.prepare_changes/2`](https://hexdocs.pm/ecto/Ecto.Changeset.html#prepare_changes/2) -- transactional side effects
-- [`Ecto.Repo.preload/3`](https://hexdocs.pm/ecto/Ecto.Repo.html#c:preload/3) -- batch preloading with custom queries
-- [PostgreSQL schemas](https://www.postgresql.org/docs/current/ddl-schemas.html) -- multi-tenancy isolation
-- [Triplex](https://hexdocs.pm/triplex/readme.html) -- library for schema-per-tenant migrations
+- [`Ecto.Schema` — hexdocs](https://hexdocs.pm/ecto/Ecto.Schema.html) — official docs; sections on `embedded_schema`, `embeds_one`, virtual fields.
+- [`Ecto.Type` behaviour](https://hexdocs.pm/ecto/Ecto.Type.html) — full guide to custom types with examples (PhoneNumber, Money).
+- [Programming Ecto — Pragmatic Bookshelf](https://pragprog.com/titles/wmecto/programming-ecto/) — chapter 8 on schemas with embeds.
+- [Dashbit: "Polymorphic embeds in Ecto"](https://dashbit.co/blog/polymorphic-embeds-in-ecto) — José Valim's take on polymorphism.
+- [Oban source — `Oban.Job.args`](https://github.com/sorentwo/oban/blob/main/lib/oban/job.ex) — real-world `:map` field with structured validation.
+- [Ash framework — attribute types](https://hexdocs.pm/ash/Ash.Type.html) — alternate approach inspired by Ecto types.

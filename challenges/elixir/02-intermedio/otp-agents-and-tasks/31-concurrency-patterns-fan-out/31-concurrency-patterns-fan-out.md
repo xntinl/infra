@@ -2,9 +2,6 @@
 
 **Project**: `fanout_aggregator` — dispatch a request to N workers and merge their results.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
-
 ---
 
 ## Project context
@@ -44,6 +41,11 @@ fanout_aggregator/
 ```
 
 ---
+
+
+## Why X and not Y
+
+- **Why not a lower-level alternative?** For concurrency patterns fan out, OTP's pattern is what reviewers will expect and what observability tools support out of the box.
 
 ## Core concepts
 
@@ -98,7 +100,31 @@ inconsistent behavior.
 
 ---
 
+## Design decisions
+
+**Option A — sequential processing**
+- Pros: simpler upfront, fewer moving parts.
+- Cons: hides the trade-off that this exercise exists to teach.
+
+**Option B — fan-out via `Task.async_stream` (chosen)**
+- Pros: explicit about the semantic that matters in production.
+- Cons: one more concept to internalize.
+
+→ Chose **B** because embarrassingly-parallel work should saturate cores; `async_stream` also bounds memory.
+
+
 ## Implementation
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defp deps do
+  [
+    # stdlib-only by default; add `{:benchee, "~> 1.3", only: :dev}` if you benchmark
+  ]
+end
+```
+
 
 ### Step 1: Create the project
 
@@ -267,6 +293,19 @@ mix test
 
 ---
 
+### Why this works
+
+The design leans on OTP primitives that already encode the invariants we care about (supervision, back-pressure, explicit message semantics), so failure modes are visible at the right layer instead of being reinvented ad-hoc. Tests exercise the edges (timeouts, crashes, boundary states), which is where hand-rolled alternatives silently drift over time.
+
+
+## Benchmark
+
+```elixir
+{us, _} = :timer.tc(fn -> fan_out_compute(1000) end)
+```
+
+Target esperado: ~1/N del tiempo secuencial con N cores.
+
 ## Trade-offs and production gotchas
 
 **1. `ordered: false` gives you throughput, not determinism**
@@ -306,6 +345,11 @@ cheap (sums, merges, list-cons) and do heavy post-processing after
   certain caches). Fan-out breaks the sequence.
 
 ---
+
+
+## Reflection
+
+- Si una de las tareas en el fan-out falla, ¿cancelás todas o juntás los resultados parciales? Justificá según el dominio.
 
 ## Resources
 

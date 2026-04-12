@@ -2,9 +2,6 @@
 
 **Project**: `task_shutdown_demo` — the exact difference between graceful, brutal, and raw-kill termination.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
-
 ---
 
 ## Project context
@@ -41,6 +38,11 @@ task_shutdown_demo/
 ```
 
 ---
+
+
+## Why X and not Y
+
+- **Why not `:infinity`?** Blocks supervisor shutdown indefinitely — operationally unsafe.
 
 ## Core concepts
 
@@ -97,7 +99,31 @@ cleanup, log, and exit on its own terms. Without `trap_exit`,
 
 ---
 
+## Design decisions
+
+**Option A — default `:infinity` shutdown**
+- Pros: simpler upfront, fewer moving parts.
+- Cons: hides the trade-off that this exercise exists to teach.
+
+**Option B — explicit `shutdown: N_ms` tuned per task (chosen)**
+- Pros: explicit about the semantic that matters in production.
+- Cons: one more concept to internalize.
+
+→ Chose **B** because `:infinity` blocks supervisor shutdown; bounded shutdown is the only ops-safe choice.
+
+
 ## Implementation
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defp deps do
+  [
+    # stdlib-only by default; add `{:benchee, "~> 1.3", only: :dev}` if you benchmark
+  ]
+end
+```
+
 
 ### Step 1: Create the project
 
@@ -242,6 +268,15 @@ mix test
 
 ---
 
+### Why this works
+
+The design leans on OTP primitives that already encode the invariants we care about (supervision, back-pressure, explicit message semantics), so failure modes are visible at the right layer instead of being reinvented ad-hoc. Tests exercise the edges (timeouts, crashes, boundary states), which is where hand-rolled alternatives silently drift over time.
+
+
+## Benchmark
+
+<!-- benchmark N/A: tema conceptual -->
+
 ## Trade-offs and production gotchas
 
 **1. "Brutal" is not a slur — it's sometimes correct**
@@ -281,6 +316,11 @@ time and risks leaving side effects half-applied. "Don't cancel, just
 ignore" is a legitimate strategy when the work is short.
 
 ---
+
+
+## Reflection
+
+- Si el shutdown timeout es 5s pero tu task necesita 30s para finalizar graciosamente, ¿qué hacés? Hay varias respuestas correctas — elegí una y defendela.
 
 ## Resources
 

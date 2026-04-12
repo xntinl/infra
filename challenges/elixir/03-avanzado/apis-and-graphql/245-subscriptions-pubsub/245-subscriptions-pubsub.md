@@ -1,0 +1,412 @@
+# Absinthe Subscriptions via Phoenix.PubSub
+
+**Project**: `absinthe_subscriptions` — real-time comment feed pushed to subscribed clients over a Phoenix socket.
+
+**Difficulty**: ★★★★☆
+**Estimated time**: 4–6 hours
+
+---
+
+## Project context
+
+Your GraphQL API already serves queries and mutations. Product wants live comments on
+article pages: when any reader posts a comment, every connected reader of that article
+sees it within a second without polling. Polling `{ comments(articleId: 42) }` every
+5 seconds scales to exactly nobody — at 10k concurrent readers you'd be running 2k req/s
+of pure waste.
+
+Absinthe subscriptions cover this case. A client opens a WebSocket through
+`Phoenix.Socket`, sends a GraphQL subscription document, and gets pushed payloads
+whenever the server triggers that subscription topic. Under the hood Absinthe runs
+every trigger through the same resolver pipeline as a query — caching, dataloader,
+auth middleware all still apply.
+
+This exercise wires the full stack: `Phoenix.PubSub`, `Absinthe.Subscription`,
+`Absinthe.Phoenix.Socket`, a `:subscription` root object, and the `publish` side in
+the comment creator.
+
+```
+absinthe_subscriptions/
+├── lib/
+│   └── absinthe_subscriptions/
+│       ├── application.ex
+│       ├── repo.ex
+│       ├── endpoint.ex            # Phoenix.Endpoint
+│       ├── socket.ex              # UserSocket
+│       ├── blog/
+│       │   ├── article.ex
+│       │   └── comment.ex
+│       └── graphql/
+│           ├── schema.ex
+│           └── types/
+│               └── comment_types.ex
+├── test/
+│   └── absinthe_subscriptions/
+│       └── subscription_test.exs
+└── mix.exs
+```
+
+---
+
+## Core concepts
+
+### 1. Three-layer subscription stack
+
+```
+client (WebSocket)
+   │  GraphQL subscription document
+   ▼
+Absinthe.Phoenix.Socket          ── registers the subscription
+   │  topic = "comment_added:#{article_id}"
+   ▼
+Absinthe.Subscription             ── stores {subscription_id → topic}
+   │  publish(schema, data, topic: ...)
+   ▼
+Phoenix.PubSub                    ── broadcasts to all local+remote nodes
+   │
+   ▼
+client receives `data` frame
+```
+
+Each layer has a separate supervisor. `Absinthe.Subscription.start_link/1` owns the
+in-memory subscription registry and Phoenix.PubSub ensures multi-node fanout.
+
+### 2. `trigger` vs explicit `publish`
+
+There are two ways to emit subscription events:
+
+| Mechanism | Use when |
+|-----------|----------|
+| `trigger :comment_added, topic: ...` on a mutation | The event is a direct 1:1 consequence of the mutation's success |
+| `Absinthe.Subscription.publish/3` | The event originates elsewhere (background job, CDC, another service) |
+
+`trigger` is coupling-friendly for simple cases but hides the publish call inside
+schema DSL — the explicit `publish/3` is easier to test and reason about for domain
+events.
+
+### 3. Topic scoping
+
+A subscription is scoped by the argument hash. `subscription { commentAdded(articleId: 42) }`
+and `commentAdded(articleId: 43)` are different topics. The `topic` function in the
+subscription field definition MUST return a deterministic key from the arguments —
+otherwise publishing cannot find the right subscribers.
+
+### 4. Back-pressure and socket buffers
+
+When a client is slow (mobile with flaky signal), its Phoenix channel buffer fills up.
+Phoenix by default drops the slow client rather than back-pressuring the publisher —
+that's the right choice for a pub/sub feed. You do NOT want slow subscribers to hold
+up everyone else.
+
+---
+
+## Implementation
+
+### Step 1: Dependencies
+
+```elixir
+defp deps do
+  [
+    {:phoenix, "~> 1.7"},
+    {:phoenix_pubsub, "~> 2.1"},
+    {:absinthe, "~> 1.7"},
+    {:absinthe_plug, "~> 1.5"},
+    {:absinthe_phoenix, "~> 2.0"},
+    {:ecto_sql, "~> 3.11"},
+    {:postgrex, "~> 0.17"},
+    {:jason, "~> 1.4"}
+  ]
+end
+```
+
+### Step 2: Application supervision tree
+
+```elixir
+# lib/absinthe_subscriptions/application.ex
+defmodule AbsintheSubscriptions.Application do
+  use Application
+
+  @impl true
+  def start(_type, _args) do
+    children = [
+      AbsintheSubscriptions.Repo,
+      {Phoenix.PubSub, name: AbsintheSubscriptions.PubSub},
+      AbsintheSubscriptions.Endpoint,
+      {Absinthe.Subscription, AbsintheSubscriptions.Endpoint}
+    ]
+    Supervisor.start_link(children, strategy: :one_for_one, name: AbsintheSubscriptions.Supervisor)
+  end
+end
+```
+
+The order matters: `PubSub` before `Endpoint` before `Absinthe.Subscription`. The
+supervisor crashes on startup otherwise.
+
+### Step 3: Endpoint
+
+```elixir
+# lib/absinthe_subscriptions/endpoint.ex
+defmodule AbsintheSubscriptions.Endpoint do
+  use Phoenix.Endpoint, otp_app: :absinthe_subscriptions
+  use Absinthe.Phoenix.Endpoint
+
+  socket "/socket", AbsintheSubscriptions.UserSocket,
+    websocket: true,
+    longpoll: false
+
+  plug Plug.Parsers,
+    parsers: [:urlencoded, :multipart, :json, Absinthe.Plug.Parser],
+    json_decoder: Jason
+
+  plug Absinthe.Plug,
+    schema: AbsintheSubscriptions.Graphql.Schema
+end
+```
+
+`use Absinthe.Phoenix.Endpoint` injects `broadcast/3` implementations that satisfy
+`Absinthe.Subscription.PubSub`.
+
+### Step 4: UserSocket
+
+```elixir
+# lib/absinthe_subscriptions/socket.ex
+defmodule AbsintheSubscriptions.UserSocket do
+  use Phoenix.Socket
+  use Absinthe.Phoenix.Socket, schema: AbsintheSubscriptions.Graphql.Schema
+
+  @impl true
+  def connect(params, socket, _connect_info) do
+    viewer_id = params["viewer_id"]
+    socket = Absinthe.Phoenix.Socket.put_options(socket, context: %{viewer_id: viewer_id})
+    {:ok, socket}
+  end
+
+  @impl true
+  def id(socket), do: "user_socket:#{socket.assigns[:viewer_id] || "anon"}"
+end
+```
+
+### Step 5: Schema with subscription root
+
+```elixir
+# lib/absinthe_subscriptions/graphql/types/comment_types.ex
+defmodule AbsintheSubscriptions.Graphql.Types.CommentTypes do
+  use Absinthe.Schema.Notation
+
+  object :comment do
+    field :id, non_null(:id)
+    field :body, non_null(:string)
+    field :article_id, non_null(:id)
+    field :inserted_at, non_null(:string)
+  end
+
+  input_object :create_comment_input do
+    field :article_id, non_null(:id)
+    field :body, non_null(:string)
+  end
+end
+```
+
+```elixir
+# lib/absinthe_subscriptions/graphql/schema.ex
+defmodule AbsintheSubscriptions.Graphql.Schema do
+  use Absinthe.Schema
+
+  import_types AbsintheSubscriptions.Graphql.Types.CommentTypes
+
+  alias AbsintheSubscriptions.{Repo, Blog.Comment}
+
+  query do
+    field :ping, :string, resolve: fn _, _, _ -> {:ok, "pong"} end
+  end
+
+  mutation do
+    field :create_comment, :comment do
+      arg :input, non_null(:create_comment_input)
+
+      resolve fn _p, %{input: input}, _r ->
+        %Comment{}
+        |> Comment.changeset(input)
+        |> Repo.insert()
+      end
+
+      # Emit the event on successful insert.
+      middleware fn resolution, _ ->
+        case resolution.value do
+          %Comment{} = comment ->
+            Absinthe.Subscription.publish(
+              AbsintheSubscriptions.Endpoint,
+              comment,
+              comment_added: "article:#{comment.article_id}"
+            )
+
+          _ ->
+            :ok
+        end
+
+        resolution
+      end
+    end
+  end
+
+  subscription do
+    field :comment_added, :comment do
+      arg :article_id, non_null(:id)
+
+      config fn %{article_id: id}, _info ->
+        {:ok, topic: "article:#{id}"}
+      end
+    end
+  end
+end
+```
+
+### Step 6: Comment schema
+
+```elixir
+# lib/absinthe_subscriptions/blog/comment.ex
+defmodule AbsintheSubscriptions.Blog.Comment do
+  use Ecto.Schema
+  import Ecto.Changeset
+
+  schema "comments" do
+    field :body, :string
+    field :article_id, :integer
+    timestamps()
+  end
+
+  def changeset(comment, attrs) do
+    comment
+    |> cast(attrs, [:body, :article_id])
+    |> validate_required([:body, :article_id])
+    |> validate_length(:body, min: 1, max: 5000)
+  end
+end
+```
+
+### Step 7: Subscription integration test
+
+```elixir
+# test/absinthe_subscriptions/subscription_test.exs
+defmodule AbsintheSubscriptions.SubscriptionTest do
+  use ExUnit.Case, async: false
+  use Absinthe.Phoenix.SubscriptionTest, schema: AbsintheSubscriptions.Graphql.Schema
+
+  alias AbsintheSubscriptions.Repo
+
+  setup do
+    Ecto.Adapters.SQL.Sandbox.checkout(Repo, ownership_timeout: :infinity)
+    Ecto.Adapters.SQL.Sandbox.mode(Repo, {:shared, self()})
+    {:ok, socket} = Phoenix.ChannelTest.connect(AbsintheSubscriptions.UserSocket, %{})
+    {:ok, socket: socket}
+  end
+
+  test "a subscribed client receives a payload on createComment", %{socket: socket} do
+    subscription = """
+    subscription ($id: ID!) {
+      commentAdded(articleId: $id) { id body articleId }
+    }
+    """
+
+    ref = push_doc(socket, subscription, variables: %{"id" => "42"})
+    assert_reply ref, :ok, %{subscriptionId: _sub_id}
+
+    # Create a comment via mutation.
+    mutation = """
+    mutation ($input: CreateCommentInput!) {
+      createComment(input: $input) { id }
+    }
+    """
+    push_doc(socket, mutation, variables: %{"input" => %{"articleId" => "42", "body" => "first!"}})
+
+    assert_push "subscription:data", %{result: %{data: %{"commentAdded" => payload}}}
+    assert payload["body"] == "first!"
+    assert payload["articleId"] == "42"
+  end
+
+  test "clients subscribed to a different article do not get the push", %{socket: socket} do
+    push_doc(socket, "subscription ($id: ID!) { commentAdded(articleId: $id) { id } }",
+             variables: %{"id" => "99"})
+
+    push_doc(socket, """
+      mutation { createComment(input: {articleId: "42", body: "x"}) { id } }
+    """)
+
+    refute_push "subscription:data", _, 100
+  end
+end
+```
+
+---
+
+## Trade-offs and production gotchas
+
+**1. `config` runs on every subscribe, not on publish.** If `config` does DB I/O
+("look up article to check it exists"), every client subscribe pays that cost. Keep
+`config` pure or fast.
+
+**2. Publishing inside the resolver blocks the caller.** `Absinthe.Subscription.publish/3`
+is synchronous: it serializes the payload and routes to PubSub. For wide fanout
+(10k+ subscribers) move it to a `Task.Supervisor.start_child/2` so the mutation
+latency stays flat.
+
+**3. Subscription payloads re-run the full resolution pipeline.** Your comment
+resolver runs once per active subscription. With 10k subscribers all loading a
+`dataloader(:author)` you just N+1'd at subscription-publish time. Return minimal
+data in the subscription payload or cache author lookups.
+
+**4. Distributed deployments need `Phoenix.PubSub.PG2` or `Phoenix.PubSub.Redis`.**
+The default `Phoenix.PubSub` is local-only. A 3-node cluster without the distributed
+adapter silently drops cross-node events.
+
+**5. Introspection of subscriptions leaks topic conventions.** `topic:
+"article:#{id}"` is a server detail. If clients can guess topics, they can
+subscribe to arbitrary article IDs they should not see. Apply auth middleware on
+the subscription field, not only on mutations.
+
+**6. Absinthe Phoenix doesn't retry failed pushes.** If a client's socket buffer
+is full and the message is dropped, it's gone. For high-value events (payments,
+orders), pair subscriptions with a pull fallback (`{ events(since: "...") }`).
+
+**7. WebSocket compression defaults are off.** `permessage-deflate` can cut
+bandwidth by 60–80% for verbose JSON payloads but costs CPU. Benchmark with your
+payload size before flipping it globally.
+
+**8. When NOT to use this.** For server-to-server eventing, use Phoenix.PubSub or
+`Broadway` directly — GraphQL subscriptions add serialization overhead and a
+socket handshake you don't need. For one-off "is this job done yet?" polling,
+short-lived polling is simpler than a WebSocket.
+
+---
+
+## Performance notes
+
+A single Phoenix node on an M2 Air sustains ~30k concurrent subscribers to the
+same topic and publishes ~8k events/s before CPU saturates (JSON encoding
+dominates). Spreading across topics is cheap — Absinthe stores subscriptions in
+an ETS-backed registry with O(log n) topic lookup.
+
+Benchee snippet for the publish path:
+
+```elixir
+Benchee.run(%{
+  "publish 1 subscriber"     => fn -> publish(1) end,
+  "publish 100 subscribers"  => fn -> publish(100) end,
+  "publish 1000 subscribers" => fn -> publish(1000) end
+})
+```
+
+Scaling above 100k concurrent subscribers per node starts to hit socket
+accept-queue limits and GC pressure on Cowboy workers. The standard solution is
+a horizontal shard: route clients by `article_id % N` to N distinct backends.
+
+---
+
+## Resources
+
+- [Absinthe subscriptions guide — hexdocs](https://hexdocs.pm/absinthe/subscriptions.html)
+- [`Absinthe.Phoenix` source](https://github.com/absinthe-graphql/absinthe_phoenix)
+- [Phoenix.PubSub documentation](https://hexdocs.pm/phoenix_pubsub/Phoenix.PubSub.html)
+- [Chris McCord — "Real-time Phoenix" (PragProg, 2021)](https://pragprog.com/titles/cmphx/real-time-phoenix/)
+- [Dashbit — How Phoenix channels scale](https://dashbit.co/blog/how-we-scaled-phoenix)
+- [GraphQL subscription spec (graphql-ws protocol)](https://github.com/enisdenjo/graphql-ws/blob/master/PROTOCOL.md)

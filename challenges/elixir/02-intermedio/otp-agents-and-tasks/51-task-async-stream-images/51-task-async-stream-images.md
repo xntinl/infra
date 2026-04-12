@@ -2,9 +2,6 @@
 
 **Project**: `image_processor` — process N "images" concurrently with a hard cap on in-flight work.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
-
 ---
 
 ## Project context
@@ -36,6 +33,11 @@ image_processor/
 ```
 
 ---
+
+
+## Why X and not Y
+
+- **Why not raw `Task.async`?** Unbounded parallelism exhausts FDs/memory; `async_stream` caps concurrency and streams results.
 
 ## Core concepts
 
@@ -90,7 +92,31 @@ reason.
 
 ---
 
+## Design decisions
+
+**Option A — unbounded parallel `Task.async`**
+- Pros: simpler upfront, fewer moving parts.
+- Cons: hides the trade-off that this exercise exists to teach.
+
+**Option B — `Task.async_stream` with `max_concurrency` (chosen)**
+- Pros: explicit about the semantic that matters in production.
+- Cons: one more concept to internalize.
+
+→ Chose **B** because unbounded parallelism exhausts file handles and memory; bounded streams are production-safe.
+
+
 ## Implementation
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defp deps do
+  [
+    # stdlib-only by default; add `{:benchee, "~> 1.3", only: :dev}` if you benchmark
+  ]
+end
+```
+
 
 ### Step 1: Create the project
 
@@ -249,6 +275,23 @@ mix test
 
 ---
 
+### Why this works
+
+The design leans on OTP primitives that already encode the invariants we care about (supervision, back-pressure, explicit message semantics), so failure modes are visible at the right layer instead of being reinvented ad-hoc. Tests exercise the edges (timeouts, crashes, boundary states), which is where hand-rolled alternatives silently drift over time.
+
+
+## Benchmark
+
+```elixir
+{us, _} = :timer.tc(fn ->
+  1..1000
+  |> Task.async_stream(&process/1, max_concurrency: 32)
+  |> Enum.to_list()
+end)
+```
+
+Target esperado: memoria acotada, throughput ~N veces el secuencial con N = max_concurrency.
+
 ## Trade-offs and production gotchas
 
 **1. `max_concurrency: :infinity` defeats the purpose**
@@ -288,6 +331,11 @@ materializing a list of results.
   `GenStage` or a supervised fan-out pipeline fits better.
 
 ---
+
+
+## Reflection
+
+- Definí `max_concurrency` para un proceso que hace HTTP a una API con rate limit de 100 req/s. Justificá.
 
 ## Resources
 

@@ -1,0 +1,534 @@
+# Application Start Phases for Ordered Boot
+
+**Project**: `start_phases` — use `Application.start_phase/3` to coordinate boot across applications with complex dependencies.
+**Difficulty**: ★★★★☆
+**Estimated time**: 3–6 hours
+
+---
+
+## Project context
+
+Your system has five OTP applications. App A owns a cluster-wide lock manager. App B is
+a cache that must populate from disk before accepting traffic. App C is a scheduler that
+assumes B is populated. App D exposes HTTP and must not bind its port until A, B, and C
+all report ready. App E is telemetry and must start before everybody so it can observe.
+
+You can express some of this with `:applications` declarations. But application start
+has a structural property that makes pure `:applications` ordering insufficient: when
+an application's `Application.start/2` returns `{:ok, pid}`, the app is considered
+started — the next app's `start/2` fires immediately. There is no barrier between
+"supervisor tree built" and "ready to serve". If B's `init/1` schedules a `:load_cache`
+message via `handle_continue`, B is "started" long before the cache is populated.
+
+`start_phases` is the OTP-native solution. In `mix.exs` you declare named phases, and
+each application gets `start_phase/3` callbacks fired in a coordinated way: phase N
+runs on every app that opts in to phase N, across the whole release, before phase N+1
+begins. This gives you an ordered, cross-app boot sequence with explicit synchronization
+points — exactly what a multi-app startup needs.
+
+Your job: encode the five-app boot of `start_phases` with three phases — `:reserve_locks`,
+`:warm_caches`, `:bind_ports` — each executed across the subset of apps that care, with
+a smoke test that asserts every phase completed before the next began.
+
+---
+
+## Tree
+
+```
+start_phases/
+├── lib/
+│   └── start_phases/
+│       ├── application.ex
+│       ├── lock_manager.ex
+│       ├── cache.ex
+│       ├── scheduler.ex
+│       ├── http_endpoint.ex
+│       └── telemetry_spine.ex
+├── test/
+│   ├── start_phases_test.exs
+│   └── ordering_test.exs
+└── mix.exs
+```
+
+Note: for brevity we model the five "apps" as five modules inside one app. In a real
+umbrella each would be its own OTP application with its own `mix.exs` and
+`start_phases` declaration. The mechanism is identical; see Step 9 for the multi-app
+variant.
+
+---
+
+## Core concepts
+
+### 1. What `start_phases` does
+
+In `mix.exs`:
+
+```elixir
+def application do
+  [
+    mod: {MyApp.Application, []},
+    start_phases: [reserve_locks: [], warm_caches: [], bind_ports: []]
+  ]
+end
+```
+
+And in the callback module:
+
+```elixir
+def start_phase(:reserve_locks, _start_type, _args), do: ...
+def start_phase(:warm_caches, _start_type, _args), do: ...
+def start_phase(:bind_ports, _start_type, _args), do: ...
+```
+
+The VM calls `start/2` on the app. Then it calls `start_phase/3` in order, one phase at
+a time, across **all applications** that declared that phase in their `application`
+metadata. A phase must complete on all participating apps before the next begins.
+
+### 2. Phase contract
+
+Each `start_phase/3` callback returns:
+
+- `:ok` — phase completed successfully.
+- `{:error, reason}` — abort the whole boot.
+
+This is a synchronous barrier: if app B's `warm_caches` takes 5 seconds, no app runs
+`bind_ports` for those 5 seconds.
+
+### 3. Where phases run in the OTP lifecycle
+
+```
+  application_controller start sequence:
+  ┌──────────────────────────────────────────┐
+  │ for each app in :applications order:     │
+  │   1. Application.start/2 -> {:ok, pid}   │
+  │   2. sup tree builds (children start)    │
+  │ end                                      │
+  │                                          │
+  │ then, for each phase in declared order:  │
+  │   for each app declaring that phase:     │
+  │     start_phase(phase, type, args)       │
+  │   end                                    │
+  │ end                                      │
+  └──────────────────────────────────────────┘
+```
+
+Phase order is the order they appear in `start_phases` keyword list of the **first** app
+to declare them. Subsequent apps' ordering is ignored; they either participate in a
+phase or they don't. To make this deterministic, agree on a shared phase vocabulary.
+
+### 4. When to use phases vs `handle_continue`
+
+| Situation | Tool |
+|-----------|------|
+| One app, one process, needs two-stage init | `handle_continue/2` |
+| Multiple processes in one app must reach a ready state before returning | Ad-hoc barrier in `Application.start/2` |
+| Multiple apps coordinate ordered boot | `start_phases` |
+| Across clusters | Distributed coordination (libcluster + :global) |
+
+### 5. Failure recovery
+
+If `start_phase` returns `{:error, reason}`, OTP stops the application that failed,
+propagating the error up. Already-started siblings remain running (SASL logs the fault).
+In a release with `start_permanent: true` the VM shuts down. Be conservative in
+start_phases — they are one of the few places where a programming error halts the whole
+node during boot.
+
+---
+
+## Implementation
+
+### Step 1: `mix.exs`
+
+```elixir
+defmodule StartPhases.MixProject do
+  use Mix.Project
+
+  def project do
+    [
+      app: :start_phases,
+      version: "0.1.0",
+      elixir: "~> 1.16",
+      deps: [{:telemetry, "~> 1.2"}]
+    ]
+  end
+
+  def application do
+    [
+      extra_applications: [:logger],
+      mod: {StartPhases.Application, []},
+      start_phases: [
+        reserve_locks: [],
+        warm_caches: [],
+        bind_ports: []
+      ]
+    ]
+  end
+end
+```
+
+### Step 2: `lib/start_phases/application.ex`
+
+```elixir
+defmodule StartPhases.Application do
+  @moduledoc false
+  use Application
+  require Logger
+
+  @impl true
+  def start(_type, _args) do
+    children = [
+      {Registry, keys: :unique, name: StartPhases.Registry},
+      StartPhases.TelemetrySpine,
+      StartPhases.LockManager,
+      StartPhases.Cache,
+      StartPhases.Scheduler,
+      StartPhases.HttpEndpoint
+    ]
+
+    Supervisor.start_link(children, strategy: :rest_for_one, name: StartPhases.RootSup)
+  end
+
+  @impl true
+  def start_phase(:reserve_locks, _start_type, _args) do
+    Logger.info("phase: reserve_locks")
+    StartPhases.LockManager.reserve()
+  end
+
+  def start_phase(:warm_caches, _start_type, _args) do
+    Logger.info("phase: warm_caches")
+    StartPhases.Cache.warm()
+  end
+
+  def start_phase(:bind_ports, _start_type, _args) do
+    Logger.info("phase: bind_ports")
+    StartPhases.HttpEndpoint.bind()
+  end
+end
+```
+
+### Step 3: `lib/start_phases/telemetry_spine.ex`
+
+```elixir
+defmodule StartPhases.TelemetrySpine do
+  @moduledoc """
+  Observes every phase transition for later assertion.
+  """
+  use GenServer
+
+  def start_link(opts \\ []), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+
+  @spec record(atom()) :: :ok
+  def record(event), do: GenServer.cast(__MODULE__, {:record, event, System.monotonic_time()})
+
+  @spec timeline() :: [{atom(), integer()}]
+  def timeline, do: GenServer.call(__MODULE__, :timeline)
+
+  @impl true
+  def init(_), do: {:ok, %{timeline: []}}
+
+  @impl true
+  def handle_cast({:record, event, ts}, state),
+    do: {:noreply, %{state | timeline: [{event, ts} | state.timeline]}}
+
+  @impl true
+  def handle_call(:timeline, _from, state),
+    do: {:reply, Enum.reverse(state.timeline), state}
+end
+```
+
+### Step 4: `lib/start_phases/lock_manager.ex`
+
+```elixir
+defmodule StartPhases.LockManager do
+  @moduledoc """
+  Simulates a cluster-wide lock reservation. Phase 1 duty.
+  """
+  use GenServer
+
+  def start_link(opts \\ []), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+
+  @spec reserve() :: :ok | {:error, term()}
+  def reserve do
+    StartPhases.TelemetrySpine.record(:lock_reserved_begin)
+    GenServer.call(__MODULE__, :reserve, 10_000)
+  end
+
+  @spec reserved?() :: boolean()
+  def reserved?, do: GenServer.call(__MODULE__, :reserved?)
+
+  @impl true
+  def init(_), do: {:ok, %{reserved: false}}
+
+  @impl true
+  def handle_call(:reserve, _from, state) do
+    # Pretend to talk to Consul/etcd
+    Process.sleep(50)
+    StartPhases.TelemetrySpine.record(:lock_reserved_end)
+    {:reply, :ok, %{state | reserved: true}}
+  end
+
+  def handle_call(:reserved?, _from, state), do: {:reply, state.reserved, state}
+end
+```
+
+### Step 5: `lib/start_phases/cache.ex`
+
+```elixir
+defmodule StartPhases.Cache do
+  @moduledoc """
+  Pre-populates from disk. Phase 2 duty. Requires LockManager to be reserved.
+  """
+  use GenServer
+
+  def start_link(opts \\ []), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+
+  @spec warm() :: :ok | {:error, term()}
+  def warm do
+    StartPhases.TelemetrySpine.record(:cache_warm_begin)
+
+    unless StartPhases.LockManager.reserved?() do
+      {:error, :lock_not_reserved}
+    else
+      GenServer.call(__MODULE__, :warm, 10_000)
+    end
+  end
+
+  @spec warmed?() :: boolean()
+  def warmed?, do: GenServer.call(__MODULE__, :warmed?)
+
+  @impl true
+  def init(_), do: {:ok, %{warmed: false, size: 0}}
+
+  @impl true
+  def handle_call(:warm, _from, state) do
+    Process.sleep(80)
+    StartPhases.TelemetrySpine.record(:cache_warm_end)
+    {:reply, :ok, %{state | warmed: true, size: 10_000}}
+  end
+
+  def handle_call(:warmed?, _from, state), do: {:reply, state.warmed, state}
+end
+```
+
+### Step 6: `lib/start_phases/scheduler.ex`
+
+```elixir
+defmodule StartPhases.Scheduler do
+  @moduledoc """
+  Starts tick immediately but only schedules if Cache is warm — it participates
+  in phase 2 implicitly by reading StartPhases.Cache.warmed? in its own init.
+  """
+  use GenServer
+  require Logger
+
+  def start_link(opts \\ []), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+
+  @impl true
+  def init(_) do
+    # Do not block init; we'll defer scheduling to a continue.
+    {:ok, %{ticks: 0}, {:continue, :maybe_start}}
+  end
+
+  @impl true
+  def handle_continue(:maybe_start, state) do
+    if StartPhases.Cache.warmed?() do
+      Process.send_after(self(), :tick, 100)
+    else
+      # try again later
+      Process.send_after(self(), {:retry, :maybe_start}, 50)
+    end
+
+    {:noreply, state}
+  end
+
+  @impl true
+  def handle_info(:tick, state) do
+    Process.send_after(self(), :tick, 100)
+    {:noreply, %{state | ticks: state.ticks + 1}}
+  end
+
+  def handle_info({:retry, :maybe_start}, state), do: handle_continue(:maybe_start, state)
+end
+```
+
+### Step 7: `lib/start_phases/http_endpoint.ex`
+
+```elixir
+defmodule StartPhases.HttpEndpoint do
+  @moduledoc """
+  Fake HTTP endpoint. Phase 3 binds the port; init does NOT.
+  """
+  use GenServer
+
+  def start_link(opts \\ []), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+
+  @spec bind() :: :ok | {:error, term()}
+  def bind do
+    StartPhases.TelemetrySpine.record(:bind_begin)
+
+    cond do
+      not StartPhases.LockManager.reserved?() -> {:error, :lock_not_reserved}
+      not StartPhases.Cache.warmed?() -> {:error, :cache_cold}
+      true -> GenServer.call(__MODULE__, :bind)
+    end
+  end
+
+  @spec bound?() :: boolean()
+  def bound?, do: GenServer.call(__MODULE__, :bound?)
+
+  @impl true
+  def init(_), do: {:ok, %{bound: false, port: 4000}}
+
+  @impl true
+  def handle_call(:bind, _from, state) do
+    Process.sleep(20)
+    StartPhases.TelemetrySpine.record(:bind_end)
+    {:reply, :ok, %{state | bound: true}}
+  end
+
+  def handle_call(:bound?, _from, state), do: {:reply, state.bound, state}
+end
+```
+
+### Step 8: `test/start_phases_test.exs`
+
+```elixir
+defmodule StartPhasesTest do
+  use ExUnit.Case, async: false
+
+  test "all three phases complete" do
+    assert StartPhases.LockManager.reserved?()
+    assert StartPhases.Cache.warmed?()
+    assert StartPhases.HttpEndpoint.bound?()
+  end
+end
+```
+
+### Step 9: `test/ordering_test.exs`
+
+```elixir
+defmodule StartPhases.OrderingTest do
+  use ExUnit.Case, async: false
+
+  test "phases execute in the declared order" do
+    timeline = StartPhases.TelemetrySpine.timeline() |> Enum.map(&elem(&1, 0))
+
+    assert [
+             :lock_reserved_begin,
+             :lock_reserved_end,
+             :cache_warm_begin,
+             :cache_warm_end,
+             :bind_begin,
+             :bind_end
+           ] = Enum.filter(timeline, &(&1 in [
+             :lock_reserved_begin,
+             :lock_reserved_end,
+             :cache_warm_begin,
+             :cache_warm_end,
+             :bind_begin,
+             :bind_end
+           ]))
+  end
+
+  test "phase 2 does not begin until phase 1 is done" do
+    timeline = StartPhases.TelemetrySpine.timeline()
+
+    {_, lock_end_ts} = Enum.find(timeline, fn {e, _} -> e == :lock_reserved_end end)
+    {_, warm_begin_ts} = Enum.find(timeline, fn {e, _} -> e == :cache_warm_begin end)
+
+    assert warm_begin_ts > lock_end_ts
+  end
+end
+```
+
+### Step 10: Multi-app variant (illustrative)
+
+In a real umbrella, each app declares `start_phases` in its own `mix.exs`:
+
+```elixir
+# apps/lock_manager/mix.exs
+def application do
+  [mod: {LockManager.App, []}, start_phases: [reserve_locks: []]]
+end
+
+# apps/cache/mix.exs
+def application do
+  [mod: {Cache.App, []}, start_phases: [warm_caches: []]]
+end
+
+# apps/http/mix.exs
+def application do
+  [mod: {Http.App, []}, start_phases: [bind_ports: []]]
+end
+```
+
+Only the apps that declare a phase participate. The union of all declared phases is
+ordered by the first app to mention them. To make the order global and explicit, use
+the `mix release` `applications` manifest plus a documented phase vocabulary.
+
+---
+
+## Trade-offs and production gotchas
+
+**1. Synchronous barriers lengthen boot.** If three apps each take 2 seconds in
+`warm_caches`, total boot includes 6 seconds of serial cache-warm time (phases are
+sequential across apps). For heavy warm-up, either shard the warming or run it in
+parallel within a single app's phase (spawn tasks in `start_phase`, await all).
+
+**2. `{:error, reason}` kills the node.** A phase that returns `{:error, _}` under
+`start_permanent: true` halts the VM. Make phases defensive: retry transient failures
+internally, only error out on truly unrecoverable conditions.
+
+**3. Circular phase dependencies.** App X's `warm_caches` calls into App Y. App Y's
+`warm_caches` calls into App X. Deadlock is not possible (phases are sequential per
+app) but partial state is. Keep each phase's work local; use the phase-transition
+boundary to signal "now other apps can call me".
+
+**4. Rolling deploys and release-level consistency.** Phases run only at boot. Hot
+code upgrade does NOT re-run them. If you add a new phase and deploy to half your
+fleet, the new pods run it; old pods do not. Phases work best with full restart
+deploys (blue/green, rolling-with-drain).
+
+**5. Shared clock assumptions.** `TelemetrySpine` uses monotonic time, which is per-VM.
+Do not use wall-clock for phase ordering assertions across nodes — different VMs, different
+clocks. The cross-node ordering guarantee comes from the application_controller itself.
+
+**6. Start_phases + release `:applications`.** In a release, you control app boot order
+via `applications: [...]` in `releases.umbrella_boot`. Phases respect that order — app
+A's `reserve_locks` runs before app B's `reserve_locks` if A is earlier in the manifest.
+
+**7. Tests that span application restart.** Many test harnesses use `Application.stop/1`
+and `Application.start/2` — this re-runs `start/2` but does NOT re-run `start_phase/3`
+unless you also call `Application.start_phase/3` manually. Use `Application.ensure_all_started/1`
+in tests that need the full phase sequence.
+
+**8. When NOT to use this.** For a single app with one ordered init step, use
+`handle_continue/2`. For three apps with simple dep graphs resolvable by `:applications`,
+stop there. Reach for `start_phases` when you have genuine cross-app synchronization
+needs — usually when an app's "ready" is a function of state owned by another app.
+
+---
+
+## Performance notes
+
+Each phase invocation is a direct function call on the app module. Overhead is sub-µs.
+The cost is whatever your phase callback does — typically I/O bound.
+
+Typical budgets:
+- Lock reservation: 10–100 ms (network round-trip to Consul/etcd)
+- Cache warm: 100 ms – 10 s (disk/DB read + deserialize)
+- Port bind: < 10 ms
+
+Log a warning if any phase exceeds 1 second; kill the app if it exceeds 30 seconds.
+Use `Task` with a timeout inside your phase callback.
+
+---
+
+## Resources
+
+- [`Application` — start_phases](https://hexdocs.pm/elixir/Application.html#module-start-phases)
+- [Erlang — application:start_phase/3](https://www.erlang.org/doc/man/application.html)
+- [GenServer `handle_continue/2`](https://hexdocs.pm/elixir/GenServer.html#c:handle_continue/2)
+- [Designing Elixir Systems with OTP — start phases chapter](https://pragprog.com/titles/jgotp/)
+- [Learn You Some Erlang — Included Applications & Start Phases](https://learnyousomeerlang.com/building-applications-with-otp)
+- [Dashbit — Release lifecycle blog post](https://dashbit.co/blog)

@@ -4,8 +4,6 @@
 (pure domain) and `tiny_web` (depends on core), to show what umbrellas
 buy you and what they cost.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
 
 ---
 
@@ -45,6 +43,11 @@ tiny_umbrella/
 ```
 
 ---
+
+
+## Why X and not Y
+
+- **Why not one mix app?** Fine until you need independent dep sets or test isolation across subsystems.
 
 ## Core concepts
 
@@ -86,7 +89,31 @@ canonical place for cross-app settings.
 
 ---
 
+## Design decisions
+
+**Option A — a single mix app**
+- Pros: simpler upfront, fewer moving parts.
+- Cons: hides the trade-off that this exercise exists to teach.
+
+**Option B — an umbrella project (chosen)**
+- Pros: explicit about the semantic that matters in production.
+- Cons: one more concept to internalize.
+
+→ Chose **B** because independent apps with their own deps and tests, while still shipping as one release.
+
+
 ## Implementation
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defp deps do
+  [
+    # stdlib-only by default; add `{:benchee, "~> 1.3", only: :dev}` if you benchmark
+  ]
+end
+```
+
 
 ### Step 1: Create the umbrella
 
@@ -291,6 +318,15 @@ MIX_ENV=prod mix release  # packages both into one release
 
 ---
 
+### Why this works
+
+The design leans on OTP primitives that already encode the invariants we care about (supervision, back-pressure, explicit message semantics), so failure modes are visible at the right layer instead of being reinvented ad-hoc. Tests exercise the edges (timeouts, crashes, boundary states), which is where hand-rolled alternatives silently drift over time.
+
+
+## Benchmark
+
+<!-- benchmark N/A: tema conceptual -->
+
 ## Trade-offs and production gotchas
 
 **1. Umbrellas don't enforce boundaries — they suggest them**
@@ -322,6 +358,11 @@ several apps share a domain core and get deployed together (e.g.
 `core` + `web` + `worker`).
 
 ---
+
+
+## Reflection
+
+- ¿Cuándo un umbrella es prematuro y un solo mix app es más honesto? Dá los 2 indicadores más fuertes.
 
 ## Resources
 

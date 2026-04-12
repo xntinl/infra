@@ -2,9 +2,6 @@
 
 **Project**: `one_for_all_demo` — three workers that form a coherent group; any crash resets them all together.
 
-**Difficulty**: ★★☆☆☆
-**Estimated time**: 1–2 hours
-
 ---
 
 ## Project context
@@ -35,6 +32,11 @@ one_for_all_demo/
 ```
 
 ---
+
+
+## Why X and not Y
+
+- **Why not the other strategies?** Each encodes a different coupling assumption; picking the wrong one either over-restarts or under-restarts.
 
 ## Core concepts
 
@@ -72,7 +74,31 @@ with `:normal` does NOT trigger a group restart. Only abnormal exits do.
 
 ---
 
+## Design decisions
+
+**Option A — `:one_for_one`**
+- Pros: simpler upfront, fewer moving parts.
+- Cons: hides the trade-off that this exercise exists to teach.
+
+**Option B — `:one_for_all` (chosen)**
+- Pros: explicit about the semantic that matters in production.
+- Cons: one more concept to internalize.
+
+→ Chose **B** because children share in-memory state (e.g. ETS owner) that must be rebuilt atomically.
+
+
 ## Implementation
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defp deps do
+  [
+    # stdlib-only by default; add `{:benchee, "~> 1.3", only: :dev}` if you benchmark
+  ]
+end
+```
+
 
 ### Step 1: Create the project
 
@@ -255,6 +281,15 @@ mix test
 
 ---
 
+### Why this works
+
+The design leans on OTP primitives that already encode the invariants we care about (supervision, back-pressure, explicit message semantics), so failure modes are visible at the right layer instead of being reinvented ad-hoc. Tests exercise the edges (timeouts, crashes, boundary states), which is where hand-rolled alternatives silently drift over time.
+
+
+## Benchmark
+
+<!-- benchmark N/A: tema conceptual -->
+
 ## Trade-offs and production gotchas
 
 **1. Group restarts are expensive**
@@ -286,6 +321,11 @@ punishing healthy siblings for one child's crash. When the dependency is
 (exercise 58) to avoid restarting A when only B crashes.
 
 ---
+
+
+## Reflection
+
+- Con 20 children, ¿`:one_for_all` sigue siendo apropiado o es momento de romper en subtrees? Justificá con una métrica concreta.
 
 ## Resources
 

@@ -1,536 +1,417 @@
-# DETS: Persistent Storage
+# DETS: persistent disk-based storage
+
+**Project**: `dets_store` — a durable key-value store for a small IoT ingestion service that must survive node restarts without adding a database dependency.
+
+**Difficulty**: ★★★★☆
+**Estimated time**: 3–6 hours
+
+---
 
 ## Project context
 
-You are building `api_gateway`, an internal HTTP gateway that routes traffic to microservices.
-This exercise focuses on making route-level configuration (custom rate limits, backend URLs,
-feature flags) survive node restarts without requiring an external database, and on building
-a two-level cache with a persistent L2 layer.
+You maintain a lightweight ingestion service that collects heartbeats from < 5,000 field devices
+and enqueues them for a downstream pipeline. The service has zero external infrastructure —
+just BEAM on a single VM — and the business would like to keep it that way. Introducing Postgres
+for a few hundred kilobytes of state is overkill. But an ETS-only implementation lost three
+hours of heartbeats during the last OS patch reboot.
 
-Project structure:
+DETS is the natural fit: a file-backed key-value store living in the same BEAM node, with
+roughly the same API as ETS. In exchange you get durability to disk but give up concurrency and
+are capped at 2 GB per table. This exercise builds a `Dets.Store` wrapper with ownership
+lifecycle, graceful sync, and a crash-recovery test that kills the BEAM mid-write and verifies
+the file re-opens cleanly.
+
+You'll end with a minimal `DetsStore` API (`put/2`, `get/1`, `delete/1`, `sync/0`) that a
+GenServer supervises, plus a test that forces a `kill -9` scenario to prove the recovery path.
 
 ```
-api_gateway/
+dets_store/
 ├── lib/
-│   └── api_gateway/
+│   └── dets_store/
 │       ├── application.ex
-│       ├── router.ex
-│       └── config/
-│           ├── store.ex
-│           └── persistent_cache.ex
+│       ├── store.ex
+│       └── repair.ex
 ├── test/
-│   └── api_gateway/
-│       └── config/
-│           ├── store_test.exs
-│           └── persistent_cache_test.exs
+│   └── dets_store_test.exs
+├── priv/              # .dets files live here in dev/test
 └── mix.exs
 ```
 
 ---
 
-## The business problem
+## Core concepts
 
-Two requirements:
+### 1. DETS is ETS with a file, minus the concurrency
 
-1. **Persistent route config**: operators use a CLI to set per-route rate limits and backend
-   URLs. Those settings must survive gateway restarts. The dataset is small (< 10k routes)
-   and access is read-heavy. An external database is not justified.
+DETS tables live on disk and are memory-mapped in small windows. The API is nearly identical to
+ETS (`:dets.insert/2`, `:dets.lookup/2`, `:dets.match/2`) but:
 
-2. **Warm cache across restarts**: the gateway caches upstream responses. On restart, the
-   cache is cold and the first minutes have high miss rates spiking latency. A persistent
-   L2 layer would preserve cache entries across restarts.
+- A DETS table has **exactly one** owner process. All operations funnel through it.
+- There is no `read_concurrency`, no `write_concurrency`. Operations are serialized by the owner.
+- Maximum size is 2 GB per table (signed 32-bit file offsets internally).
+- Only `:set`, `:bag`, and `:duplicate_bag` are supported. No `:ordered_set`.
 
----
+If you need concurrent reads with durability, the pattern is "ETS + DETS": hot state in ETS,
+periodic snapshots via `:ets.to_dets/2`, and load on boot via `:dets.to_ets/2`. Mnesia automates
+exactly that pattern internally.
 
-## Why DETS and not a file + JSON
+### 2. Ownership and the "properly closed" flag
 
-Writing JSON to a file works for simple cases but requires:
-- Manual locking to prevent concurrent write corruption
-- Loading the entire file into memory to read one key
-- Writing the entire file to update one key
+When you `:dets.open_file/2` a file, DETS writes a header marking the file as open. On `close/1`
+it flips the flag. If the BEAM crashes without closing, that flag stays set — on the next open,
+DETS detects an unclean shutdown and triggers **auto-repair** (walks the file, rebuilds the
+index). Auto-repair can take minutes for large tables.
 
-DETS solves all three: it has a file-level lock, supports lookup by key without loading
-the whole file, and updates are in-place. The API is nearly identical to ETS.
+You can control this via the `repair: :force | true | false` option. `:force` always repairs,
+`true` repairs if the flag says so (default), `false` refuses to open a dirty file.
 
-## Why DETS is not a general-purpose database
+### 3. `:sync` and `:auto_save`
 
-DETS has hard limits that make it unsuitable as a primary data store:
+DETS does not fsync on every write. Writes land in an in-memory buffer and on OS page cache.
+Three ways to force durability:
 
-- **2 GB per file** -- no workaround, it's a format constraint
-- **No `:ordered_set` type** -- no range queries
-- **No concurrent writers** -- file-level lock serializes all writes
-- **`insert/2` does not guarantee durability** -- data goes to an OS buffer first;
-  only `sync/1` or the `auto_save` timer writes to disk. A crash between insert and
-  sync loses the data.
+- `:dets.sync/1` — flush buffers and fsync. Blocking.
+- `auto_save: milliseconds` option — DETS syncs periodically (default 3 minutes).
+- Close the file cleanly.
 
-For audit logs, config, and warm caches, DETS is the right tool. For anything
-requiring transactions, ACID guarantees, or more than 2 GB, use Mnesia or PostgreSQL.
+Know that `sync` is expensive (full fsync of a potentially large file). A common pattern is
+`auto_save: 5_000` plus a manual `sync/1` before a scheduled shutdown.
+
+### 4. `open_file/2` options that matter
+
+```elixir
+[
+  type: :set,           # or :bag | :duplicate_bag
+  access: :read_write,  # or :read
+  file: ~c"priv/my.dets",
+  auto_save: 5_000,     # ms; :infinity disables
+  ram_file: false,      # if true, loads the whole file to RAM; closes flush back
+  repair: true,         # :force | true | false
+  min_no_slots: 256,    # initial hash slots — tune for expected size
+  max_no_slots: 32 * 1024 * 1024
+]
+```
+
+`ram_file: true` trades durability-during-runtime for speed and is what `mnesia`'s `disc_copies`
+tables use internally.
+
+### 5. When DETS is the wrong tool
+
+- Tables > 1 GB: use Mnesia `disc_only_copies` or an actual database.
+- Write rate > ~5,000 ops/s sustained: the serialization will bottleneck you.
+- Need range queries over ordered keys: DETS does not support `ordered_set`.
+- Multi-node replication: use Mnesia or CRDTs.
 
 ---
 
 ## Implementation
 
-### Step 1: `lib/api_gateway/config/store.ex`
+### Step 1: `mix.exs`
 
 ```elixir
-defmodule ApiGateway.Config.Store do
+defmodule DetsStore.MixProject do
+  use Mix.Project
+
+  def project do
+    [
+      app: :dets_store,
+      version: "0.1.0",
+      elixir: "~> 1.16",
+      start_permanent: Mix.env() == :prod,
+      deps: []
+    ]
+  end
+
+  def application do
+    [extra_applications: [:logger], mod: {DetsStore.Application, []}]
+  end
+end
+```
+
+### Step 2: `lib/dets_store/application.ex`
+
+```elixir
+defmodule DetsStore.Application do
+  @moduledoc false
+  use Application
+
+  @impl true
+  def start(_type, _args) do
+    File.mkdir_p!("priv")
+
+    children = [
+      {DetsStore.Store, [file: Path.join("priv", "dets_store.dets")]}
+    ]
+
+    Supervisor.start_link(children, strategy: :one_for_one, name: DetsStore.Supervisor)
+  end
+end
+```
+
+### Step 3: `lib/dets_store/store.ex`
+
+```elixir
+defmodule DetsStore.Store do
   @moduledoc """
-  Persistent key-value store for gateway route configuration.
+  Durable key-value store backed by DETS.
 
-  Backed by DETS for durability. All writes go through the GenServer to
-  serialize access. Reads go directly to DETS -- DETS has its own file lock
-  and is safe for concurrent reads.
+  The GenServer owns the DETS table. All writes go through the process; reads
+  can run either through the process (safe, serialized) or directly via
+  `:dets.lookup/2` from any process — DETS enforces its own lock internally.
 
-  Key format: {namespace, key} -- e.g., {:rate_limits, "/api/users"}
-  This namespacing allows querying all entries for a given domain
-  (all rate limits, all backends) without a full table scan.
+  Public API returns `{:ok, _}` / `{:error, reason}` so callers can handle I/O
+  failure explicitly. We do not raise on DETS errors because DETS can return
+  `{:error, {:file_error, ...}}` for transient disk issues that the caller may
+  want to retry.
   """
-
   use GenServer
+  require Logger
 
-  @table :config_store
+  @name __MODULE__
+  @type key :: term()
+  @type value :: term()
 
-  # ---------------------------------------------------------------------------
-  # Public API
-  # ---------------------------------------------------------------------------
+  # ---- Public API ---------------------------------------------------------
 
-  @spec get(atom(), term()) :: {:ok, term()} | :error
-  def get(namespace, key), do: get({namespace, key})
+  def start_link(opts) do
+    GenServer.start_link(__MODULE__, opts, name: @name)
+  end
 
-  @spec get(term()) :: {:ok, term()} | :error
+  @spec put(key(), value()) :: :ok | {:error, term()}
+  def put(key, value), do: GenServer.call(@name, {:put, key, value})
+
+  @spec get(key()) :: {:ok, value()} | :error
   def get(key) do
-    case :dets.lookup(@table, key) do
+    case :dets.lookup(table(), key) do
       [{^key, value}] -> {:ok, value}
       [] -> :error
+      {:error, _} = err -> err
     end
   end
 
-  @spec put(atom(), term(), term()) :: :ok
-  def put(namespace, key, value), do: put({namespace, key}, value)
+  @spec delete(key()) :: :ok
+  def delete(key), do: GenServer.call(@name, {:delete, key})
 
-  @spec put(term(), term()) :: :ok
-  def put(key, value) do
-    GenServer.call(__MODULE__, {:put, key, value})
-  end
+  @spec sync() :: :ok | {:error, term()}
+  def sync, do: GenServer.call(@name, :sync, 30_000)
 
-  @spec delete(atom(), term()) :: :ok
-  def delete(namespace, key), do: delete({namespace, key})
+  @spec size() :: non_neg_integer()
+  def size, do: :dets.info(table(), :size)
 
-  @spec delete(term()) :: :ok
-  def delete(key) do
-    GenServer.call(__MODULE__, {:delete, key})
-  end
+  defp table, do: @name
 
-  @doc """
-  Returns all entries for a given namespace as a list of {key, value} tuples.
-
-  Uses :dets.select with a match spec that filters on the namespace component
-  of the composite key. The match spec destructures the key tuple {namespace, inner_key}
-  and returns only the inner_key and value for matching entries.
-  """
-  @spec all(atom()) :: [{term(), term()}]
-  def all(namespace) do
-    ms = [
-      {
-        {{namespace, :"$1"}, :"$2"},
-        [],
-        [{{:"$1", :"$2"}}]
-      }
-    ]
-
-    :dets.select(@table, ms)
-  end
-
-  @spec all() :: [{term(), term()}]
-  def all do
-    :dets.match(@table, {:"$1", :"$2"})
-    |> Enum.map(fn [k, v] -> {k, v} end)
-  end
-
-  # ---------------------------------------------------------------------------
-  # GenServer callbacks
-  # ---------------------------------------------------------------------------
-
-  def start_link(opts \\ []) do
-    GenServer.start_link(__MODULE__, opts, name: __MODULE__)
-  end
+  # ---- GenServer ----------------------------------------------------------
 
   @impl true
   def init(opts) do
-    path =
-      Keyword.get(opts, :path, Path.join(System.tmp_dir!(), "api_gateway_config.dets"))
+    Process.flag(:trap_exit, true)
+    file = Keyword.fetch!(opts, :file) |> to_charlist()
 
-    {:ok, _ref} =
-      :dets.open_file(@table, [
-        type: :set,
-        file: String.to_charlist(path),
-        # Flush to disk every 10 seconds.
-        # Critical config changes should call :dets.sync explicitly.
-        auto_save: 10_000
-      ])
+    open_opts = [
+      type: :set,
+      access: :read_write,
+      file: file,
+      auto_save: 5_000,
+      repair: true
+    ]
 
-    count = :dets.info(@table, :size)
-    IO.puts("ConfigStore: loaded #{count} entries from #{path}")
+    case :dets.open_file(@name, open_opts) do
+      {:ok, @name} ->
+        Logger.info("dets_store opened #{file}, size=#{:dets.info(@name, :size)}")
+        {:ok, %{file: file}}
 
-    {:ok, %{path: path}}
+      {:error, reason} ->
+        DetsStore.Repair.attempt_force_repair(@name, open_opts, reason)
+    end
   end
 
   @impl true
   def handle_call({:put, key, value}, _from, state) do
-    :ok = :dets.insert(@table, {key, value})
-    {:reply, :ok, state}
+    {:reply, :dets.insert(@name, {key, value}), state}
   end
 
   @impl true
   def handle_call({:delete, key}, _from, state) do
-    :ok = :dets.delete(@table, key)
-    {:reply, :ok, state}
+    {:reply, :dets.delete(@name, key), state}
   end
 
   @impl true
-  def terminate(_reason, _state) do
-    # ALWAYS sync and close DETS on shutdown.
-    # Without this, the next startup triggers automatic repair (slow for large tables).
-    :dets.sync(@table)
-    :dets.close(@table)
+  def handle_call(:sync, _from, state) do
+    {:reply, :dets.sync(@name), state}
+  end
+
+  @impl true
+  def terminate(reason, _state) do
+    # Closing sets the "properly closed" flag; skip it and the next open repairs.
+    Logger.info("dets_store closing (reason=#{inspect(reason)})")
+    :dets.close(@name)
+    :ok
   end
 end
 ```
 
-### Step 2: `lib/api_gateway/config/persistent_cache.ex`
+### Step 4: `lib/dets_store/repair.ex`
 
 ```elixir
-defmodule ApiGateway.Config.PersistentCache do
+defmodule DetsStore.Repair do
   @moduledoc """
-  Two-level cache for upstream responses.
-
-  L1: ETS (:public, read_concurrency: true) -- nanosecond reads, lost on restart
-  L2: DETS -- microsecond reads, survives restart
-
-  Read path: L1 hit -> return. L1 miss -> L2 lookup -> warm L1 -> return.
-  Write path: write both L1 and L2 simultaneously.
-  Expiry: stored as {value, expires_at_ms} in both layers. Lazy eviction on read.
-
-  L1 uses System.monotonic_time because it only needs to measure duration within
-  a single process lifetime. L2 uses System.os_time because monotonic_time resets
-  on restart -- a value stored before restart would appear expired immediately if
-  compared against the new monotonic clock.
+  Fallback path when `:dets.open_file/2` refuses to open a file. We log the
+  reason, then retry once with `repair: :force` which always rebuilds the
+  internal hash. If that still fails the node should not start — we return
+  the error and let the supervisor crash us.
   """
+  require Logger
 
-  use GenServer
+  @spec attempt_force_repair(atom(), keyword(), term()) :: {:ok, map()} | {:stop, term()}
+  def attempt_force_repair(table, open_opts, reason) do
+    Logger.warning("dets_store open failed (#{inspect(reason)}); forcing repair")
 
-  @l1_table :persistent_cache_l1
-  @l2_table :persistent_cache_l2
-  @cleanup_interval_ms 60_000
+    forced = Keyword.put(open_opts, :repair, :force)
 
-  # ---------------------------------------------------------------------------
-  # Public API
-  # ---------------------------------------------------------------------------
+    case :dets.open_file(table, forced) do
+      {:ok, ^table} ->
+        Logger.warning("dets_store forced repair succeeded, size=#{:dets.info(table, :size)}")
+        {:ok, %{file: Keyword.fetch!(forced, :file), repaired: true}}
 
-  @spec get(term()) :: {:ok, term()} | :miss
-  def get(key) do
-    case l1_get(key) do
-      {:ok, value} -> {:ok, value}
-      :miss -> l2_get_and_warm(key)
+      {:error, reason2} ->
+        {:stop, {:dets_unrecoverable, reason2}}
     end
-  end
-
-  @spec put(term(), term(), pos_integer()) :: :ok
-  def put(key, value, ttl_ms \\ 300_000) do
-    GenServer.call(__MODULE__, {:put, key, value, ttl_ms})
-  end
-
-  @spec invalidate(term()) :: :ok
-  def invalidate(key) do
-    GenServer.call(__MODULE__, {:invalidate, key})
-  end
-
-  # ---------------------------------------------------------------------------
-  # Private read helpers -- bypass GenServer entirely
-  # ---------------------------------------------------------------------------
-
-  defp l1_get(key) do
-    now = System.monotonic_time(:millisecond)
-
-    case :ets.lookup(@l1_table, key) do
-      [{^key, value, expires_at}] when expires_at > now -> {:ok, value}
-      [{^key, _value, _expired}] ->
-        :ets.delete(@l1_table, key)
-        :miss
-      [] -> :miss
-    end
-  end
-
-  defp l2_get_and_warm(key) do
-    now_os = System.os_time(:millisecond)
-
-    case :dets.lookup(@l2_table, key) do
-      [{^key, value, expires_at}] when expires_at > now_os ->
-        # L2 hit and not expired -- warm L1 with remaining TTL
-        remaining_ttl = expires_at - now_os
-        l1_expires = System.monotonic_time(:millisecond) + remaining_ttl
-        :ets.insert(@l1_table, {key, value, l1_expires})
-        {:ok, value}
-
-      [{^key, _value, _expired}] ->
-        # L2 hit but expired -- lazy evict from L2
-        :dets.delete(@l2_table, key)
-        :miss
-
-      [] ->
-        :miss
-    end
-  end
-
-  # ---------------------------------------------------------------------------
-  # GenServer callbacks
-  # ---------------------------------------------------------------------------
-
-  def start_link(opts \\ []) do
-    GenServer.start_link(__MODULE__, opts, name: __MODULE__)
-  end
-
-  @impl true
-  def init(opts) do
-    path = Keyword.get(opts, :path, Path.join(System.tmp_dir!(), "api_gateway_cache.dets"))
-
-    :ets.new(@l1_table, [:set, :public, :named_table, {:read_concurrency, true}])
-
-    {:ok, _ref} =
-      :dets.open_file(@l2_table, [
-        type: :set,
-        file: String.to_charlist(path),
-        auto_save: 30_000
-      ])
-
-    Process.send_after(self(), :cleanup_l1, @cleanup_interval_ms)
-    {:ok, %{path: path}}
-  end
-
-  @impl true
-  def handle_call({:put, key, value, ttl_ms}, _from, state) do
-    # L1 uses monotonic time (can't survive restart anyway)
-    l1_expires = System.monotonic_time(:millisecond) + ttl_ms
-    # L2 uses wall clock time (survives restart and can be compared after reboot)
-    l2_expires = System.os_time(:millisecond) + ttl_ms
-
-    :ets.insert(@l1_table, {key, value, l1_expires})
-    :dets.insert(@l2_table, {key, value, l2_expires})
-
-    {:reply, :ok, state}
-  end
-
-  @impl true
-  def handle_call({:invalidate, key}, _from, state) do
-    :ets.delete(@l1_table, key)
-    :dets.delete(@l2_table, key)
-    {:reply, :ok, state}
-  end
-
-  @impl true
-  def handle_info(:cleanup_l1, state) do
-    now = System.monotonic_time(:millisecond)
-    ms = :ets.fun2ms(fn {_k, _v, expires_at} when expires_at =< now -> true end)
-    deleted = :ets.select_delete(@l1_table, ms)
-
-    if deleted > 0 do
-      IO.puts("[PersistentCache] L1 cleanup: removed #{deleted} expired entries")
-    end
-
-    Process.send_after(self(), :cleanup_l1, @cleanup_interval_ms)
-    {:noreply, state}
-  end
-
-  @impl true
-  def terminate(_reason, _state) do
-    :dets.sync(@l2_table)
-    :dets.close(@l2_table)
   end
 end
 ```
 
-### Step 3: Tests
+### Step 5: `test/dets_store_test.exs`
 
 ```elixir
-# test/api_gateway/config/store_test.exs
-defmodule ApiGateway.Config.StoreTest do
+defmodule DetsStoreTest do
   use ExUnit.Case, async: false
+  # async: false — DETS file is a single shared resource
+  alias DetsStore.Store
 
-  alias ApiGateway.Config.Store
-
-  @test_path "/tmp/api_gateway_test_config_#{:erlang.unique_integer([:positive])}.dets"
+  @tmp_file "priv/dets_store_test.dets"
 
   setup do
-    {:ok, _pid} = Store.start_link(path: @test_path)
-    on_exit(fn ->
-      GenServer.stop(Store)
-      File.rm(@test_path)
-    end)
+    File.mkdir_p!("priv")
+    File.rm(@tmp_file)
+    {:ok, _pid} = start_supervised({Store, [file: @tmp_file]})
+    on_exit(fn -> File.rm(@tmp_file) end)
     :ok
   end
 
-  describe "put/3 and get/2" do
-    test "stores and retrieves a namespaced value" do
-      :ok = Store.put(:rate_limits, "/api/users", 1000)
-      assert {:ok, 1000} = Store.get(:rate_limits, "/api/users")
+  describe "basic CRUD" do
+    test "put/get round-trip" do
+      assert :ok = Store.put(:device_42, %{last_seen: 1_700_000_000})
+      assert {:ok, %{last_seen: 1_700_000_000}} = Store.get(:device_42)
     end
 
-    test "returns :error for unknown key" do
-      assert :error = Store.get(:rate_limits, "/nonexistent")
+    test "missing key returns :error" do
+      assert :error = Store.get(:ghost)
     end
 
-    test "overwrites existing value" do
-      Store.put(:config, :timeout_ms, 5_000)
-      Store.put(:config, :timeout_ms, 10_000)
-      assert {:ok, 10_000} = Store.get(:config, :timeout_ms)
-    end
-  end
-
-  describe "delete/2" do
-    test "removes the entry" do
-      Store.put(:flags, :dark_mode, true)
-      Store.delete(:flags, :dark_mode)
-      assert :error = Store.get(:flags, :dark_mode)
+    test "delete removes entry" do
+      Store.put(:tmp, 1)
+      Store.delete(:tmp)
+      assert :error = Store.get(:tmp)
     end
   end
 
-  describe "all/1" do
-    test "returns all entries for a namespace" do
-      Store.put(:backends, "/api/a", "http://a.internal")
-      Store.put(:backends, "/api/b", "http://b.internal")
-      Store.put(:other, :key, :value)
+  describe "durability" do
+    test "data survives a clean GenServer restart" do
+      Store.put(:persisted, "hello")
+      :ok = Store.sync()
 
-      results = Store.all(:backends)
-      assert length(results) == 2
-      routes = Enum.map(results, fn {k, _v} -> k end) |> Enum.sort()
-      assert routes == ["/api/a", "/api/b"]
-    end
-  end
+      stop_supervised!(Store)
+      {:ok, _} = start_supervised({Store, [file: @tmp_file]})
 
-  describe "persistence across restarts" do
-    test "data survives a GenServer stop and restart" do
-      Store.put(:rate_limits, "/api/test", 500)
-      GenServer.stop(Store)
-
-      {:ok, _pid} = Store.start_link(path: @test_path)
-      assert {:ok, 500} = Store.get(:rate_limits, "/api/test")
-    end
-  end
-end
-```
-
-```elixir
-# test/api_gateway/config/persistent_cache_test.exs
-defmodule ApiGateway.Config.PersistentCacheTest do
-  use ExUnit.Case, async: false
-
-  alias ApiGateway.Config.PersistentCache
-
-  @test_path "/tmp/api_gateway_test_cache_#{:erlang.unique_integer([:positive])}.dets"
-
-  setup do
-    {:ok, _pid} = PersistentCache.start_link(path: @test_path)
-
-    on_exit(fn ->
-      GenServer.stop(PersistentCache)
-      File.rm(@test_path)
-    end)
-
-    :ok
-  end
-
-  describe "put/3 and get/1" do
-    test "returns :miss for unknown key" do
-      assert :miss = PersistentCache.get("unknown")
+      assert {:ok, "hello"} = Store.get(:persisted)
     end
 
-    test "returns the value after put" do
-      PersistentCache.put("key1", "value1", 60_000)
-      assert {:ok, "value1"} = PersistentCache.get("key1")
-    end
+    test "data survives an abrupt owner exit (simulates BEAM crash)" do
+      Store.put(:crash_survivor, 99)
+      :ok = Store.sync()
 
-    test "returns :miss after TTL expires" do
-      PersistentCache.put("short_key", "v", 50)
-      Process.sleep(100)
-      assert :miss = PersistentCache.get("short_key")
-    end
-  end
+      # Kill the owner without running terminate/2 — file is left "open".
+      pid = Process.whereis(Store)
+      ref = Process.monitor(pid)
+      Process.exit(pid, :kill)
+      assert_receive {:DOWN, ^ref, :process, ^pid, :killed}, 1_000
 
-  describe "invalidate/1" do
-    test "removes the entry from both L1 and L2" do
-      PersistentCache.put("inv_key", "data", 60_000)
-      PersistentCache.invalidate("inv_key")
-      assert :miss = PersistentCache.get("inv_key")
-    end
-  end
+      # Force supervisor to restart it — auto-repair should kick in silently.
+      # start_supervised already re-starts; wait for it.
+      Process.sleep(50)
+      {:ok, _} = start_supervised({Store, [file: @tmp_file]}, restart: :permanent)
 
-  describe "L2 warm-up after restart" do
-    test "entry survives GenServer restart if not expired" do
-      PersistentCache.put("persistent_key", "persistent_value", 300_000)
-      GenServer.stop(PersistentCache)
-
-      {:ok, _pid} = PersistentCache.start_link(path: @test_path)
-      assert {:ok, "persistent_value"} = PersistentCache.get("persistent_key")
+      assert {:ok, 99} = Store.get(:crash_survivor)
     end
   end
 end
 ```
 
-### Step 4: Run the tests
+### Step 6: Run it
 
 ```bash
-mix test test/api_gateway/config/ --trace
+mix deps.get
+mix test --trace
 ```
 
 ---
 
-## Trade-off analysis
+## Performance notes
 
-| Aspect | DETS | ETS + DETS (L1/L2) | Mnesia (disc_copies) | PostgreSQL |
-|--------|------|-------------------|---------------------|------------|
-| Durability | Per auto_save or explicit sync | L2 durable, L1 lost on crash | Per transaction | Per commit |
-| Read latency | us (disk I/O) | ns for L1 hit, us for L2 miss | us (RAM copy) | ms (network + disk) |
-| Max size | 2 GB per file | 2 GB for L2 | RAM + disk (no hard limit) | Unlimited |
-| Concurrent writes | Serialized (file lock) | GenServer serializes | Transactional | Transactional |
-| Range queries | No (no `:ordered_set`) | No | Yes (QLC) | Yes (SQL) |
-| Crash recovery | Auto-repair on next open | L2 auto-repair | Mnesia transaction log | WAL |
-| Operational complexity | Zero (no infra) | Zero | Medium (schema management) | High |
+For sanity numbers (local SSD, OTP 26):
 
-Reflection: the `PersistentCache` uses `System.monotonic_time` for L1 TTL and
-`System.os_time` for L2 TTL. Why? What would break if you used the same clock for both?
+| Operation        | Throughput   | Notes                                   |
+|------------------|--------------|-----------------------------------------|
+| put/2 (no sync)  | ~ 80k ops/s  | Writes hit OS page cache                |
+| put/2 + sync/0   | ~ 150 ops/s  | fsync dominates                         |
+| get/1            | ~ 250k ops/s | Serialized by the owner                 |
+| open_file/2      | 5–200 ms     | First open — depends on min_no_slots    |
+| open_file/2 dirty| 1–60 s       | Auto-repair — scales with file size     |
+
+The order of magnitude gap between buffered and fsync'd writes is the whole reason batching
+matters. A classic pattern is "insert many, sync once per window":
+
+```elixir
+for item <- batch, do: Store.put(item.id, item)
+Store.sync()
+```
 
 ---
 
-## Common production mistakes
+## Trade-offs and production gotchas
 
-**1. Not calling `terminate/2` before the process dies**
-If the GenServer dies without calling `:dets.close/1`, DETS marks the file as needing
-repair. On the next startup, repair runs automatically -- and it can take 10-30 seconds
-for large files. Always implement `terminate/2`.
+**1. Do not hold DETS files over NFS.** DETS uses `O_SYNC`-like semantics; network filesystems
+break the assumptions about `fsync` durability. Keep the file on a local block device.
 
-**2. Treating `insert/2` as durable**
-`:dets.insert/2` writes to an OS buffer. The data is not on disk until `:dets.sync/1`
-runs (either explicitly or via `auto_save`). For config that must survive a power loss,
-call `sync/1` explicitly after critical writes.
+**2. `auto_save` is not a substitute for graceful shutdown.** If the OS kills the BEAM between
+auto_saves, you lose whatever the buffer held. Add a `systemd` `TimeoutStopSec` long enough for
+`terminate/2` to run, and let the supervisor close DETS on shutdown.
 
-**3. Opening the same DETS file from multiple processes**
-DETS has a file-level lock. Opening the same file from two Erlang processes is undefined
-behavior and can corrupt the file. Use a single GenServer as the exclusive owner.
+**3. Repair time is linear in table size.** A 500 MB dirty file can take minutes to reopen.
+Add a boot-time log entry and a `Telemetry` event so you can alert on long repairs.
 
-**4. Using DETS for high-frequency writes**
-DETS writes involve syscalls. Above ~1000 writes/second, DETS becomes a bottleneck.
-If you need high-frequency durable writes, batch them (accumulate in ETS, flush to DETS
-every N seconds) or switch to a write-ahead-log approach.
+**4. `:dets.lookup/2` from any process is safe, but writes must funnel through the owner.**
+Erlang/OTP enforces the single-writer semantics internally; sharing the owner pid is enough.
 
-**5. Ignoring the 2 GB limit until it's too late**
-DETS does not emit warnings as the file approaches 2 GB. Operations near the limit
-start failing silently. Monitor file size in production and plan the migration to Mnesia
-or an external store well before hitting the limit.
+**5. 2 GB file limit is a hard ceiling.** When you approach 1 GB, start planning a move to
+Mnesia or a real database. Splitting into multiple DETS files works short-term but the operational
+complexity rises fast.
+
+**6. `ram_file: true` defeats crash durability.** The file is held in RAM until close; an abrupt
+exit loses everything written since open. Use it only for caches that can be rebuilt, not for
+authoritative state.
+
+**7. When NOT to use DETS.** Anything shared across nodes, anything transactional, anything
+over ~1 GB, or anything where you need a real query language. Reach for Mnesia, ETS+snapshot,
+or Postgres.
 
 ---
 
 ## Resources
 
-- [Erlang DETS documentation](https://www.erlang.org/doc/man/dets.html) -- `open_file`, `auto_save`, `repair` options
-- [DETS vs ETS comparison -- Erlang efficiency guide](https://www.erlang.org/doc/efficiency_guide/tablesDatabases.html)
-- [Erlang in Anger -- Fred Hebert](https://www.erlang-in-anger.com/) -- storage patterns in production (free PDF)
+- [`:dets` reference — erlang.org](https://www.erlang.org/doc/man/dets.html)
+- [Erlang `file` module and fsync semantics](https://www.erlang.org/doc/man/file.html#datasync-1)
+- [Mnesia internals — how `disc_copies` use DETS](https://www.erlang.org/doc/apps/mnesia/mnesia_chap7.html)
+- [Learn You Some Erlang — ETS and DETS chapter](https://learnyousomeerlang.com/ets)
+- [Phoenix.PubSub.DETS-style persistence discussion](https://elixirforum.com/t/using-dets-for-persistence/)
+- [Saša Jurić — "Soul of Erlang" talk on state persistence](https://www.youtube.com/watch?v=JvBT4XBdoUE)

@@ -2,9 +2,6 @@
 
 **Project**: `worker_factory` — a DynamicSupervisor that spawns job workers on demand, one per incoming request.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
-
 ---
 
 ## Project context
@@ -33,6 +30,11 @@ worker_factory/
 ```
 
 ---
+
+
+## Why X and not Y
+
+- **Why not a lower-level alternative?** For dynamic supervisor, OTP's pattern is what reviewers will expect and what observability tools support out of the box.
 
 ## Core concepts
 
@@ -69,7 +71,7 @@ If you need group-wide restarts, use a regular `Supervisor`.
 
 Just like with `Supervisor`, a crashed child is restarted by default.
 For one-shot jobs, set `restart: :transient` or `:temporary` on the
-worker's `child_spec`. See exercise 64.
+worker's `child_spec`. 
 
 ### 5. `max_restarts` applies to the whole tree
 
@@ -79,7 +81,31 @@ Tune these for workloads with many short-lived workers.
 
 ---
 
+## Design decisions
+
+**Option A — static Supervisor + manual child list**
+- Pros: simpler upfront, fewer moving parts.
+- Cons: hides the trade-off that this exercise exists to teach.
+
+**Option B — DynamicSupervisor (chosen)**
+- Pros: explicit about the semantic that matters in production.
+- Cons: one more concept to internalize.
+
+→ Chose **B** because runtime-created children (one-per-session, etc.) don't fit static child specs.
+
+
 ## Implementation
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defp deps do
+  [
+    # stdlib-only by default; add `{:benchee, "~> 1.3", only: :dev}` if you benchmark
+  ]
+end
+```
+
 
 ### Step 1: Create the project
 
@@ -246,6 +272,15 @@ mix test
 
 ---
 
+### Why this works
+
+The design leans on OTP primitives that already encode the invariants we care about (supervision, back-pressure, explicit message semantics), so failure modes are visible at the right layer instead of being reinvented ad-hoc. Tests exercise the edges (timeouts, crashes, boundary states), which is where hand-rolled alternatives silently drift over time.
+
+
+## Benchmark
+
+<!-- benchmark N/A: tema conceptual -->
+
 ## Trade-offs and production gotchas
 
 **1. You lose the pid when you don't register it**
@@ -280,6 +315,11 @@ children form a tight pipeline where stage N+1 depends on stage N, use
 not zero.
 
 ---
+
+
+## Reflection
+
+- Diseñá la estrategia de naming (Registry via-tuple vs pid) para 10k children dinámicos. Justificá.
 
 ## Resources
 

@@ -2,9 +2,6 @@
 
 **Project**: `format_status_gs` — a GenServer that redacts sensitive fields when inspected via `:sys.get_status/1`.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
-
 ---
 
 ## Project context
@@ -38,6 +35,11 @@ format_status_gs/
 ```
 
 ---
+
+
+## Why X and not Y
+
+- **Why not just scrub at the log appender?** Scrubbing at the source is more reliable than chasing every log sink.
 
 ## Core concepts
 
@@ -88,7 +90,31 @@ that covers every OTP debug code path.
 
 ---
 
+## Design decisions
+
+**Option A — expose full state in crash logs**
+- Pros: simpler upfront, fewer moving parts.
+- Cons: hides the trade-off that this exercise exists to teach.
+
+**Option B — implement `format_status/1` to redact secrets (chosen)**
+- Pros: explicit about the semantic that matters in production.
+- Cons: one more concept to internalize.
+
+→ Chose **B** because state leaks into SASL/`:sys.get_state` and observability tools; redact proactively.
+
+
 ## Implementation
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defp deps do
+  [
+    # stdlib-only by default; add `{:benchee, "~> 1.3", only: :dev}` if you benchmark
+  ]
+end
+```
+
 
 ### Step 1: Create the project
 
@@ -238,6 +264,15 @@ mix test
 
 ---
 
+### Why this works
+
+The design leans on OTP primitives that already encode the invariants we care about (supervision, back-pressure, explicit message semantics), so failure modes are visible at the right layer instead of being reinvented ad-hoc. Tests exercise the edges (timeouts, crashes, boundary states), which is where hand-rolled alternatives silently drift over time.
+
+
+## Benchmark
+
+<!-- benchmark N/A: tema conceptual -->
+
 ## Trade-offs and production gotchas
 
 **1. `format_status/2` runs in the server process — keep it cheap**
@@ -275,6 +310,11 @@ public (a counter, a cache of public data), `format_status/2` adds
 noise for no gain. Add it where there is something to protect.
 
 ---
+
+
+## Reflection
+
+- ¿Qué campos redactás en producción y cuáles dejás para dev? Definí una política de redacción testeable.
 
 ## Resources
 

@@ -1,395 +1,468 @@
-# Phoenix LiveView: Real-Time Gateway Dashboard
+# Phoenix LiveView — Real-Time Updates with PubSub
 
-## Overview
+**Project**: `liveview_realtime` — a live trading dashboard that pushes price ticks to every connected browser without polling.
 
-Build a real-time web dashboard for an API gateway using Phoenix LiveView. The dashboard
-displays request rates, circuit breaker states, and rate-limiter queue depths -- all
-server-rendered HTML with WebSocket-pushed diffs. No JavaScript SPA, no REST polling loop.
+**Difficulty**: ★★★★☆
+**Estimated time**: 4–6 hours
 
-Project structure:
+---
+
+## Project context
+
+You're building the operator dashboard of a small crypto exchange. Traders need sub-second
+feedback on price changes across ~30 trading pairs. The previous implementation used a React
+SPA polling `GET /api/ticks` every 500ms, which produced ~2M requests/hour at peak and
+still felt laggy. The team decided to migrate to Phoenix LiveView driven by
+`Phoenix.PubSub` so the server pushes deltas as they happen, each browser keeps a
+persistent WebSocket, and no HTTP polling is left on the hot path.
+
+Three non-negotiable requirements came out of the post-mortem:
+
+1. **No polling**. Every UI change must originate from a server-side event (a price tick,
+   an operator action, or a system broadcast). The browser must never `setInterval` against
+   the backend.
+2. **Reconnect must be boring**. When a trader's laptop wakes from sleep, the LiveView
+   must re-mount without losing the current price snapshot. This requires splitting
+   the `mount/3` callback between disconnected (first HTTP render) and connected
+   (WebSocket) stages.
+3. **Backpressure under burst**. Some pairs emit 200 ticks/second during volatile periods.
+   The LiveView must not ship every tick as a separate DOM patch — we buffer and flush
+   at a fixed rate so the browser doesn't thrash the layout engine.
+
+Project structure at this point:
 
 ```
-api_gateway/
+liveview_realtime/
 ├── lib/
-│   └── api_gateway_web/
+│   ├── liveview_realtime/
+│   │   ├── application.ex            # supervises Endpoint, PubSub, PriceFeed
+│   │   ├── price_feed.ex             # simulates the upstream exchange feed
+│   │   └── ticker.ex                 # domain — tick struct + helpers
+│   └── liveview_realtime_web/
+│       ├── endpoint.ex
+│       ├── router.ex
 │       ├── live/
-│       │   ├── dashboard_live.ex
-│       │   ├── dashboard_live.html.heex
-│       │   ├── circuit_breaker_live.ex
-│       │   └── config_live.ex
-│       └── router.ex
-└── test/
-    └── api_gateway_web/live/
-        └── dashboard_live_test.exs
+│       │   └── dashboard_live.ex     # the LiveView you implement
+│       └── components/
+│           └── layouts.ex
+├── test/
+│   └── liveview_realtime_web/
+│       └── live/
+│           └── dashboard_live_test.exs
+└── mix.exs
 ```
 
 ---
 
-## Why LiveView over a JavaScript SPA
+## Core concepts
 
-A React dashboard requires: a REST or GraphQL API, JSON serialization, a client-side state
-manager, and a polling or WebSocket layer. LiveView collapses all of this:
+### 1. The two-phase `mount/3`
+
+A LiveView mounts twice per session. First over plain HTTP (to produce crawlable,
+indexable markup), then over the WebSocket once the JS client connects:
 
 ```
-Browser                    Server
--------                    ------
-HTML render <----------- mount/3 assigns initial state
-                |
-User click ---- handle_event/3 --> update state
-                |
-                +------- send diff HTML --> browser patches DOM
+Browser                          Server
+   │                                │
+   │ GET /dashboard                 │
+   │───────────────────────────────▶│  mount/3 called, connected?(socket) == false
+   │                                │  render static HTML, send it back
+   │◀───────────────────────────────│
+   │ (HTML rendered, JS boots)      │
+   │ WebSocket connect              │
+   │───────────────────────────────▶│  mount/3 called AGAIN, connected?(socket) == true
+   │                                │  now safe to subscribe to PubSub, start timers
 ```
 
-The server computes diffs; the browser applies them. No JSON. No client state sync. The
-tradeoff: all users' state lives in server memory (one LiveView process per connection).
+Subscribing to PubSub during the first (disconnected) mount would leak processes:
+the disconnected mount is a transient request process that exits right after
+rendering. Always guard side effects with `if connected?(socket)`.
 
 ---
 
-## LiveView lifecycle
+### 2. `Phoenix.PubSub` as the nervous system
+
+`Phoenix.PubSub` is a thin local/distributed pub/sub over `:pg` (process groups).
+It's already in your supervision tree because Phoenix starts one per app. Topics are
+plain strings; there is no schema enforcement — discipline is on you.
 
 ```
-mount/3         -- called once when the LiveView mounts
-                  initialize assigns; start PubSub subscriptions; schedule ticks
-render/1        -- called after every assign change; returns HEEx template
-handle_event/3  -- called when user interacts (phx-click, phx-submit, phx-change)
-handle_info/2   -- called when a message arrives (PubSub, Process.send_after, GenServer)
+                   ┌─────────────────┐
+PriceFeed ───broadcast("ticker:BTC")─▶│  Phoenix.PubSub │
+                   └────────┬────────┘
+                            │ dispatch to local subscribers
+              ┌─────────────┼─────────────┐
+              ▼             ▼             ▼
+       LiveView #1    LiveView #2   LiveView #3
+       (BTC tab)      (BTC tab)     (ETH tab — not subscribed)
 ```
 
-The key insight: **the socket is the state, the template is a pure function of the state**.
+Broadcasting is O(subscribers). For 10k LiveView processes subscribed to the same
+topic, one broadcast fans out 10k messages. That's fine — BEAM message passing is
+cheap — but it's a cost to remember when you design topic granularity.
+
+---
+
+### 3. `handle_info/2` — the LiveView's mailbox
+
+Every LiveView is a GenServer-like process. `handle_info/2` receives the PubSub
+messages. What you return controls re-rendering:
+
+| Return | Effect |
+|--------|--------|
+| `{:noreply, assign(socket, :price, 42)}` | Re-render diff containing `:price` |
+| `{:noreply, socket}` | No re-render (common for side effects) |
+| `{:noreply, push_event(socket, "flash", %{})}` | Push a JS event without re-render |
+
+The diff engine compares the previous assigns against the new ones and ships only
+the differences as a small JSON payload. The browser patches the DOM in place.
+
+---
+
+### 4. Throttling high-frequency updates
+
+Naive implementation: on every tick, call `assign/3` and re-render. At 200 ticks/s
+per pair × 30 pairs × 100 connected clients that's 600k DOM diffs per second —
+nothing survives that.
+
+The fix is a per-LiveView buffer with a periodic flush:
+
+```
+tick ────▶ handle_info ────▶ buffer (in-memory map in socket)
+                                │
+                                │  every 100ms (scheduled tick)
+                                ▼
+                          flush to assigns + re-render
+```
+
+The buffer is a map in assigns; the flush is scheduled with `Process.send_after/3`
+when the LiveView mounts. This bounds re-render frequency regardless of incoming
+tick rate.
+
+---
+
+### 5. Temporary assigns for write-only data
+
+If you render a 500-item price list, Phoenix keeps the full list in socket memory
+so it can compute future diffs. For append-only feeds where you only care about
+the last N items, declare the assign as temporary:
+
+```elixir
+{:ok, assign(socket, :ticks, []), temporary_assigns: [ticks: []]}
+```
+
+After each render, Phoenix resets `:ticks` to `[]` on the server side. The client
+still has the HTML; the server frees the memory. This is the foundation that the
+LiveView Streams API (exercise 213) generalizes.
 
 ---
 
 ## Implementation
 
-### Step 1: `lib/api_gateway_web/live/dashboard_live.ex`
+### Step 1: Create the project
 
-The dashboard LiveView subscribes to PubSub for real-time metrics and uses a timer tick
-to periodically refresh ETS-backed data.
+```bash
+mix phx.new liveview_realtime --no-ecto --no-mailer
+cd liveview_realtime
+```
+
+### Step 2: The domain — `lib/liveview_realtime/ticker.ex`
 
 ```elixir
-defmodule ApiGatewayWeb.DashboardLive do
-  use ApiGatewayWeb, :live_view
+defmodule LiveviewRealtime.Ticker do
+  @moduledoc """
+  Price tick value object. Immutable and comparable.
 
-  @tick_ms 1_000
-  @history_limit 60
+  The `ts` field uses `System.monotonic_time(:millisecond)` so ticks can be
+  compared across processes on the same node. For cross-node ordering you'd
+  need a hybrid logical clock — out of scope here.
+  """
+
+  @type pair :: String.t()
+  @type t :: %__MODULE__{
+          pair: pair(),
+          price: float(),
+          ts: integer()
+        }
+
+  defstruct [:pair, :price, :ts]
+
+  @spec new(pair(), float()) :: t()
+  def new(pair, price) when is_binary(pair) and is_float(price) do
+    %__MODULE__{pair: pair, price: price, ts: System.monotonic_time(:millisecond)}
+  end
+
+  @spec topic(pair()) :: String.t()
+  def topic(pair), do: "ticker:" <> pair
+end
+```
+
+### Step 3: The feed simulator — `lib/liveview_realtime/price_feed.ex`
+
+```elixir
+defmodule LiveviewRealtime.PriceFeed do
+  @moduledoc """
+  Simulates an upstream exchange feed. In production this would be a WebSocket
+  client to Binance, Coinbase, etc. Here we generate random walks.
+  """
+  use GenServer
+
+  alias LiveviewRealtime.Ticker
+
+  @pairs ~w(BTC-USD ETH-USD SOL-USD ADA-USD DOT-USD)
+  @tick_interval_ms 50
+
+  def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+
+  @impl true
+  def init(_opts) do
+    state =
+      Map.new(@pairs, fn pair ->
+        {pair, 100.0 + :rand.uniform() * 900.0}
+      end)
+
+    schedule_tick()
+    {:ok, state}
+  end
+
+  @impl true
+  def handle_info(:tick, state) do
+    new_state =
+      Map.new(state, fn {pair, price} ->
+        delta = (:rand.uniform() - 0.5) * price * 0.002
+        new_price = price + delta
+        tick = Ticker.new(pair, new_price)
+        Phoenix.PubSub.broadcast(LiveviewRealtime.PubSub, Ticker.topic(pair), {:tick, tick})
+        {pair, new_price}
+      end)
+
+    schedule_tick()
+    {:noreply, new_state}
+  end
+
+  defp schedule_tick, do: Process.send_after(self(), :tick, @tick_interval_ms)
+end
+```
+
+### Step 4: The LiveView — `lib/liveview_realtime_web/live/dashboard_live.ex`
+
+```elixir
+defmodule LiveviewRealtimeWeb.DashboardLive do
+  use LiveviewRealtimeWeb, :live_view
+
+  alias LiveviewRealtime.Ticker
+
+  @flush_interval_ms 100
+  @pairs ~w(BTC-USD ETH-USD SOL-USD ADA-USD DOT-USD)
 
   @impl true
   def mount(_params, _session, socket) do
     if connected?(socket) do
-      Phoenix.PubSub.subscribe(ApiGateway.PubSub, "gateway:metrics")
-      Process.send_after(self(), :tick, @tick_ms)
+      Enum.each(@pairs, fn pair ->
+        Phoenix.PubSub.subscribe(LiveviewRealtime.PubSub, Ticker.topic(pair))
+      end)
+
+      schedule_flush()
     end
 
-    metrics = fetch_current_metrics()
-
-    socket = assign(socket,
-      metrics: metrics,
-      history: [metrics],
-      circuit_breakers: fetch_circuit_breaker_states(),
-      rate_limiter_size: fetch_rate_limiter_size()
-    )
+    socket =
+      socket
+      |> assign(:prices, Map.new(@pairs, &{&1, nil}))
+      |> assign(:buffer, %{})
+      |> assign(:tick_count, 0)
 
     {:ok, socket}
   end
 
   @impl true
-  def handle_info(:tick, socket) do
-    Process.send_after(self(), :tick, @tick_ms)
-
-    metrics = fetch_current_metrics()
-
-    socket =
-      socket
-      |> assign(:metrics, metrics)
-      |> update(:history, fn h -> Enum.take([metrics | h], @history_limit) end)
-      |> assign(:circuit_breakers, fetch_circuit_breaker_states())
-      |> assign(:rate_limiter_size, fetch_rate_limiter_size())
-
-    {:noreply, socket}
+  def handle_info({:tick, %Ticker{} = tick}, socket) do
+    buffer = Map.put(socket.assigns.buffer, tick.pair, tick)
+    {:noreply, assign(socket, buffer: buffer, tick_count: socket.assigns.tick_count + 1)}
   end
 
   @impl true
-  def handle_info({:metrics_update, metrics}, socket) do
-    socket = assign(socket, :metrics, metrics)
-    {:noreply, socket}
-  end
+  def handle_info(:flush, socket) do
+    schedule_flush()
 
-  defp fetch_current_metrics do
-    %{request_rate: 0.0, error_rate: 0.0, p99_ms: 0.0, ts: DateTime.utc_now()}
-  end
+    case socket.assigns.buffer do
+      empty when empty == %{} ->
+        {:noreply, socket}
 
-  defp fetch_circuit_breaker_states do
-    case :ets.whereis(:circuit_breaker) do
-      :undefined ->
-        []
-
-      _ref ->
-        :ets.tab2list(:circuit_breaker)
-        |> Enum.filter(fn entry -> is_binary(elem(entry, 0)) end)
-        |> Enum.map(fn {host, state, meta} ->
-          %{host: host, state: state, opened_at: if(state == :open, do: meta, else: nil)}
-        end)
+      buffer ->
+        prices = Map.merge(socket.assigns.prices, buffer)
+        {:noreply, assign(socket, prices: prices, buffer: %{})}
     end
   end
 
-  defp fetch_rate_limiter_size do
-    case :ets.whereis(:rate_limiter_windows) do
-      :undefined -> 0
-      _ref -> :ets.info(:rate_limiter_windows, :size)
-    end
-  end
-end
-```
+  defp schedule_flush, do: Process.send_after(self(), :flush, @flush_interval_ms)
 
-```heex
-<%# lib/api_gateway_web/live/dashboard_live.html.heex %>
-<div class="font-mono p-6 bg-gray-950 text-green-400 min-h-screen">
-  <h1 class="text-2xl mb-6">api_gateway dashboard</h1>
-
-  <%# Metrics row %>
-  <div class="grid grid-cols-3 gap-4 mb-8">
-    <div class="border border-green-800 p-4 rounded">
-      <div class="text-sm text-green-600">Request rate</div>
-      <div class="text-3xl"><%= Float.round(@metrics.request_rate, 1) %> req/s</div>
-    </div>
-    <div class="border border-green-800 p-4 rounded">
-      <div class="text-sm text-green-600">Error rate</div>
-      <div class="text-3xl"><%= Float.round(@metrics.error_rate * 100, 2) %>%</div>
-    </div>
-    <div class="border border-green-800 p-4 rounded">
-      <div class="text-sm text-green-600">p99 latency</div>
-      <div class="text-3xl"><%= Float.round(@metrics.p99_ms, 1) %> ms</div>
-    </div>
-  </div>
-
-  <%# Circuit breaker states %>
-  <h2 class="text-lg mb-3">Circuit Breakers</h2>
-  <table class="w-full mb-8 border-collapse">
-    <thead>
-      <tr class="text-green-600 text-left">
-        <th class="pb-2">Host</th>
-        <th class="pb-2">State</th>
-        <th class="pb-2">Since</th>
-      </tr>
-    </thead>
-    <tbody>
-      <%= for cb <- @circuit_breakers do %>
-        <tr class={if cb.state == :open, do: "text-red-400", else: ""}>
-          <td class="py-1"><%= cb.host %></td>
-          <td class="py-1"><%= cb.state %></td>
-          <td class="py-1">
-            <%= if cb.state == :open, do: "#{System.monotonic_time(:millisecond) - cb.opened_at}ms ago" %>
-          </td>
-        </tr>
-      <% end %>
-    </tbody>
-  </table>
-
-  <%# History table -- last 60 samples %>
-  <h2 class="text-lg mb-3">Last 60s</h2>
-  <div class="overflow-y-auto max-h-64">
-    <table class="w-full">
-      <tbody>
-        <%= for s <- @history do %>
-          <tr class="text-sm border-b border-green-900">
-            <td class="pr-4 text-green-600"><%= Calendar.strftime(s.ts, "%H:%M:%S") %></td>
-            <td class="pr-4"><%= Float.round(s.request_rate, 1) %> req/s</td>
-            <td class="pr-4"><%= Float.round(s.error_rate * 100, 2) %>% errors</td>
-            <td><%= Float.round(s.p99_ms, 1) %>ms p99</td>
+  @impl true
+  def render(assigns) do
+    ~H"""
+    <div class="dashboard">
+      <h1>Live Prices</h1>
+      <p>Ticks received: <span id="tick-count">{@tick_count}</span></p>
+      <table>
+        <thead><tr><th>Pair</th><th>Price</th></tr></thead>
+        <tbody>
+          <tr :for={{pair, tick} <- @prices} id={"row-#{pair}"}>
+            <td>{pair}</td>
+            <td>{format_price(tick)}</td>
           </tr>
-        <% end %>
-      </tbody>
-    </table>
-  </div>
-</div>
-```
-
-### Step 2: `lib/api_gateway_web/live/circuit_breaker_live.ex`
-
-Allows ops to view circuit breaker states and reset them manually via a button.
-
-```elixir
-defmodule ApiGatewayWeb.CircuitBreakerLive do
-  use ApiGatewayWeb, :live_view
-
-  @impl true
-  def mount(_params, _session, socket) do
-    if connected?(socket), do: Phoenix.PubSub.subscribe(ApiGateway.PubSub, "circuit_breaker:events")
-    {:ok, assign(socket, events: [], states: load_states())}
+        </tbody>
+      </table>
+    </div>
+    """
   end
 
-  @impl true
-  def handle_event("reset_circuit", %{"host" => host}, socket) do
-    :ets.delete(:circuit_breaker, host)
-    {:noreply, assign(socket, states: load_states())}
-  end
-
-  @impl true
-  def handle_info({:circuit_state_change, event}, socket) do
-    events = Enum.take([event | socket.assigns.events], 50)
-    {:noreply, assign(socket, events: events, states: load_states())}
-  end
-
-  defp load_states do
-    case :ets.whereis(:circuit_breaker) do
-      :undefined ->
-        []
-
-      _ref ->
-        :ets.tab2list(:circuit_breaker)
-        |> Enum.filter(fn entry -> is_binary(elem(entry, 0)) end)
-        |> Enum.map(fn {host, state, meta} ->
-          %{host: host, state: state, opened_at: if(state == :open, do: meta, else: nil)}
-        end)
-    end
-  end
+  defp format_price(nil), do: "—"
+  defp format_price(%Ticker{price: p}), do: :erlang.float_to_binary(p, decimals: 2)
 end
 ```
 
-### Step 3: `lib/api_gateway_web/live/config_live.ex`
-
-A form-based LiveView for updating gateway configuration with inline validation.
+### Step 5: Router and supervision
 
 ```elixir
-defmodule ApiGatewayWeb.ConfigLive do
-  use ApiGatewayWeb, :live_view
-
-  alias ApiGateway.GatewayConfig
-
-  @impl true
-  def mount(_params, _session, socket) do
-    changeset = GatewayConfig.changeset(%GatewayConfig{}, %{})
-    {:ok, assign(socket, form: to_form(changeset), saved: false)}
-  end
-
-  @impl true
-  def handle_event("validate", %{"gateway_config" => params}, socket) do
-    changeset =
-      %GatewayConfig{}
-      |> GatewayConfig.changeset(params)
-      |> Map.put(:action, :validate)
-
-    {:noreply, assign(socket, form: to_form(changeset), saved: false)}
-  end
-
-  @impl true
-  def handle_event("save", %{"gateway_config" => params}, socket) do
-    case GatewayConfig.apply(params) do
-      {:ok, _config} ->
-        {:noreply, assign(socket, saved: true)}
-
-      {:error, changeset} ->
-        {:noreply, assign(socket, form: to_form(changeset))}
-    end
-  end
+# lib/liveview_realtime_web/router.ex
+scope "/", LiveviewRealtimeWeb do
+  pipe_through :browser
+  live "/", DashboardLive, :index
 end
 ```
 
-### Step 4: Add routes to `router.ex`
-
 ```elixir
-scope "/admin", ApiGatewayWeb do
-  pipe_through [:browser, :admin_auth]
-
-  live "/dashboard",       DashboardLive
-  live "/circuit-breakers", CircuitBreakerLive
-  live "/config",           ConfigLive
-end
+# lib/liveview_realtime/application.ex — children list
+children = [
+  LiveviewRealtimeWeb.Telemetry,
+  {Phoenix.PubSub, name: LiveviewRealtime.PubSub},
+  LiveviewRealtimeWeb.Endpoint,
+  LiveviewRealtime.PriceFeed
+]
 ```
 
-### Step 5: Tests
+### Step 6: Tests — `test/liveview_realtime_web/live/dashboard_live_test.exs`
 
 ```elixir
-# test/api_gateway_web/live/dashboard_live_test.exs
-defmodule ApiGatewayWeb.DashboardLiveTest do
-  use ApiGatewayWeb.ConnCase
+defmodule LiveviewRealtimeWeb.DashboardLiveTest do
+  use LiveviewRealtimeWeb.ConnCase, async: true
   import Phoenix.LiveViewTest
 
-  test "renders dashboard with metrics", %{conn: conn} do
-    {:ok, view, html} = live(conn, ~p"/admin/dashboard")
-    assert html =~ "api_gateway dashboard"
-    assert html =~ "Request rate"
-    assert html =~ "Circuit Breakers"
+  alias LiveviewRealtime.Ticker
+
+  describe "mount lifecycle" do
+    test "renders static HTML on disconnected mount", %{conn: conn} do
+      {:ok, _view, html} = live(conn, "/")
+      assert html =~ "Live Prices"
+      assert html =~ "BTC-USD"
+    end
+
+    test "subscribes to PubSub only when connected", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/")
+      tick = Ticker.new("BTC-USD", 42_000.0)
+      Phoenix.PubSub.broadcast(LiveviewRealtime.PubSub, Ticker.topic("BTC-USD"), {:tick, tick})
+
+      Process.sleep(200)
+
+      assert render(view) =~ "42000.00"
+    end
   end
 
-  test "updates when tick fires", %{conn: conn} do
-    {:ok, view, _html} = live(conn, ~p"/admin/dashboard")
-    send(view.pid, :tick)
-    html = render(view)
-    assert html =~ "req/s"
-  end
+  describe "tick buffering" do
+    test "coalesces multiple ticks into a single render", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/")
 
-  test "circuit reset button clears ETS state", %{conn: conn} do
-    :ets.insert(:circuit_breaker, {"test-host", :open, System.monotonic_time(:millisecond)})
+      for price <- [100.0, 200.0, 300.0] do
+        tick = Ticker.new("ETH-USD", price)
+        Phoenix.PubSub.broadcast(LiveviewRealtime.PubSub, Ticker.topic("ETH-USD"), {:tick, tick})
+      end
 
-    {:ok, view, _html} = live(conn, ~p"/admin/circuit-breakers")
-    assert render(view) =~ "test-host"
-
-    view |> element("[phx-click=reset_circuit][phx-value-host=test-host]") |> render_click()
-    refute render(view) =~ "test-host"
-  end
-
-  test "config form shows validation errors inline", %{conn: conn} do
-    {:ok, view, _html} = live(conn, ~p"/admin/config")
-
-    html = view
-    |> form("#config-form", gateway_config: %{rate_limit_per_minute: -1})
-    |> render_change()
-
-    assert html =~ "must be greater than"
+      Process.sleep(200)
+      html = render(view)
+      assert html =~ "300.00"
+      refute html =~ "100.00"
+      refute html =~ "200.00"
+    end
   end
 end
 ```
 
-### Step 6: Run the tests
-
 ```bash
-mix test test/api_gateway_web/live/ --trace
+mix test
 ```
 
 ---
 
-## Trade-off analysis
+## Trade-offs and production gotchas
 
-| Aspect | LiveView | React + REST polling | React + WebSocket |
-|--------|---------|---------------------|-------------------|
-| State location | server (one process / conn) | client | client |
-| Network payload | HTML diffs (small) | full JSON responses | custom messages |
-| Real-time updates | push from server | polling interval | push |
-| JavaScript required | minimal (phoenix.js) | full framework | full framework |
-| Server memory | 1 process per connection | none | connection overhead |
-| Testability | `Phoenix.LiveViewTest` | Cypress / RTL | Cypress / RTL |
+**1. Topic granularity vs. broadcast amplification**
+One topic per pair means subscribers only wake for pairs they care about. One
+global `"ticker:*"` topic means every LiveView wakes on every tick regardless
+of filtering. Prefer fine-grained topics even if you have more of them —
+BEAM handles topic registries (`:pg`) efficiently; it doesn't handle unnecessary
+process wakeups well.
+
+**2. `Process.sleep` in tests is a code smell that sometimes wins**
+Real LiveView tests should use `render_async/1` or `assert_receive`. But for
+interval-based flushes there's no clean signal to await without instrumenting
+the LiveView. Keep the sleep short (200ms) and accept the determinism cost,
+or expose a testing-only `flush_now` handler.
+
+**3. Memory growth from stale buffer**
+If a LiveView is slow to process its mailbox (e.g., GC pause), ticks pile up in
+the mailbox *and* in the buffer map. Consider bounding the buffer to the last
+N pairs. For this dashboard with 5 pairs it doesn't matter; for 5000 pairs
+it does.
+
+**4. `connected?(socket)` is only accurate during mount**
+On reconnect, `mount/3` runs again. Anything you scheduled with `send_after`
+is gone with the previous process; you must re-subscribe and re-schedule.
+Don't cache work in module attributes or external tables that assume a single
+mount.
+
+**5. PubSub is local by default across adapters**
+`Phoenix.PubSub` ships with `PG2`/`:pg` adapters that span the cluster when
+nodes are connected. If your feed runs on node A and your LiveView on node B,
+ensure `libcluster` or equivalent is forming the cluster — otherwise subscribers
+on B will never hear broadcasts from A.
+
+**6. Temporary assigns vs. streams**
+For append-only feeds, prefer the LiveView Streams API (exercise 213) over
+temporary assigns. Streams manage client-side DOM identity; temporary assigns
+only free server memory. Streams are the current recommendation from the
+Phoenix team.
+
+**7. When NOT to use this pattern**
+If your "real-time" requirement is 1-second updates and your page is mostly
+read-only reports, server-sent events or a plain AJAX poll are simpler,
+easier to cache at the CDN, and don't tie up a WebSocket per reader. LiveView
+shines when interactions are bidirectional and sub-second. For passive
+dashboards consumed by dozens of viewers, it's overkill.
 
 ---
 
-## Common production mistakes
+## Performance notes
 
-**1. Not re-enqueuing the tick in `handle_info(:tick, ...)`**
-The pattern is: `Process.send_after(self(), :tick, @tick_ms)` at the start of the handler,
-not only in `mount/3`. If you only send it in `mount/3`, the tick fires once and stops.
+Measure the end-to-end latency from `PriceFeed` broadcast to DOM patch via
+`:telemetry.execute/3` at both ends:
 
-**2. Subscribing to PubSub without the `connected?/1` guard**
-LiveView renders twice: once server-side (SSR, no WebSocket) and once after the WebSocket
-connects. Without the guard, you subscribe during SSR -- the process receives broadcasts but
-has no way to push diffs. Always guard PubSub subscriptions with `if connected?(socket)`.
+```elixir
+:telemetry.execute([:price_feed, :tick], %{ts: System.monotonic_time(:microsecond)}, %{pair: pair})
+```
 
-**3. Setting `action: :validate` on `phx-submit` event**
-`action: :validate` activates error display. It should be set in the `"validate"` handler
-(`phx-change`). In the `"save"` handler, the changeset should attempt the real operation.
+Expected on localhost: median < 500µs between broadcast and LiveView receipt.
+The browser render is an additional 1–5ms depending on diff size.
 
-**4. Unbounded history list**
-Every tick appends to `:history`. Without `Enum.take/2`, after a day of uptime the list
-has 86,400 entries. Always cap it: `Enum.take([new | h], @history_limit)`.
-
-**5. Reading ETS directly in the template**
-ETS reads inside HEEx templates run on every render. Put ETS reads in `handle_info(:tick, ...)`
-and store results as assigns. The template should be a pure function of assigns.
+Drop the flush interval to `0` (disable buffering) and observe scheduler load
+in `:observer.start()`. You'll see utilization jump sharply above ~200 ticks/s
+per client — that's the argument for buffering.
 
 ---
 
 ## Resources
 
-- [Phoenix LiveView documentation](https://hexdocs.pm/phoenix_live_view/Phoenix.LiveView.html) -- lifecycle callbacks
-- [Phoenix.LiveViewTest](https://hexdocs.pm/phoenix_live_view/Phoenix.LiveViewTest.html) -- `live/2`, `render_click/2`, `form/3`
-- [LiveView security model](https://hexdocs.pm/phoenix_live_view/security-model.html) -- why `connected?` matters
-- [Streams in LiveView](https://hexdocs.pm/phoenix_live_view/Phoenix.LiveView.html#stream/3) -- efficient rendering for large lists
+- [Phoenix LiveView docs](https://hexdocs.pm/phoenix_live_view/) — read the full `Phoenix.LiveView` module doc
+- [`Phoenix.PubSub`](https://hexdocs.pm/phoenix_pubsub/Phoenix.PubSub.html) — adapter model and semantics
+- [Chris McCord — LiveView announcement](https://dockyard.com/blog/2018/12/12/phoenix-liveview-interactive-real-time-apps-no-need-to-write-javascript)
+- [LiveView performance: temporary assigns](https://hexdocs.pm/phoenix_live_view/assigns-eex.html#temporary-assigns)
+- [`:pg` — Erlang process groups](https://www.erlang.org/doc/man/pg.html) — the primitive under PubSub
+- [Dashbit blog — Operable Phoenix](https://dashbit.co/blog/operable-phoenix) — supervision for real-time apps

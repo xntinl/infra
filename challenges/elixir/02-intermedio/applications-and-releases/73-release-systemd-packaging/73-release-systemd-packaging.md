@@ -4,8 +4,6 @@
 and `EnvironmentFile` so the whole deployment is: copy release, drop
 env file, enable unit, start.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
 
 ---
 
@@ -55,6 +53,11 @@ Typical on-host layout:
 ```
 
 ---
+
+
+## Why X and not Y
+
+- **Why not `nohup`?** No restart policy, no journald integration, no dependency ordering. systemd is the OS-level supervisor.
 
 ## Core concepts
 
@@ -107,7 +110,31 @@ host.
 
 ---
 
+## Design decisions
+
+**Option A — `nohup` + pid file**
+- Pros: simpler upfront, fewer moving parts.
+- Cons: hides the trade-off that this exercise exists to teach.
+
+**Option B — systemd unit with `Restart=on-failure` (chosen)**
+- Pros: explicit about the semantic that matters in production.
+- Cons: one more concept to internalize.
+
+→ Chose **B** because systemd gives restart policy, journald logs, and dependency ordering — the OS-level supervisor.
+
+
 ## Implementation
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defp deps do
+  [
+    # stdlib-only by default; add `{:benchee, "~> 1.3", only: :dev}` if you benchmark
+  ]
+end
+```
+
 
 ### Step 1: Create the project
 
@@ -314,6 +341,15 @@ sudo journalctl -u systemd_packaged -f
 
 ---
 
+### Why this works
+
+The design leans on OTP primitives that already encode the invariants we care about (supervision, back-pressure, explicit message semantics), so failure modes are visible at the right layer instead of being reinvented ad-hoc. Tests exercise the edges (timeouts, crashes, boundary states), which is where hand-rolled alternatives silently drift over time.
+
+
+## Benchmark
+
+<!-- benchmark N/A: tema conceptual -->
+
 ## Trade-offs and production gotchas
 
 **1. `EnvironmentFile` does NOT support shell interpolation**
@@ -346,6 +382,11 @@ orchestrator owns lifecycle, restarts, env injection, and logs.
 systemd is for bare-metal and VM deployments.
 
 ---
+
+
+## Reflection
+
+- ¿Qué diferencia hay entre `Restart=always` y `Restart=on-failure` para un release OTP? ¿Cuál elegís y por qué?
 
 ## Resources
 

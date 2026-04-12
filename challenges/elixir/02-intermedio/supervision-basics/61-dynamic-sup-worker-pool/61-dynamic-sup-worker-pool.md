@@ -2,9 +2,6 @@
 
 **Project**: `dynamic_worker_pool` — a pool of workers where each worker is addressable by a logical key, not by pid.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
-
 ---
 
 ## Project context
@@ -36,6 +33,11 @@ dynamic_worker_pool/
 ```
 
 ---
+
+
+## Why X and not Y
+
+- **Why not poolboy?** Extra dep and its own supervision; DynamicSupervisor + Registry is stdlib-only and more flexible.
 
 ## Core concepts
 
@@ -84,7 +86,31 @@ workers, configure `partitions: System.schedulers_online()`.
 
 ---
 
+## Design decisions
+
+**Option A — poolboy**
+- Pros: simpler upfront, fewer moving parts.
+- Cons: hides the trade-off that this exercise exists to teach.
+
+**Option B — DynamicSupervisor + Registry (chosen)**
+- Pros: explicit about the semantic that matters in production.
+- Cons: one more concept to internalize.
+
+→ Chose **B** because stdlib-only, each worker is independently supervised and addressable.
+
+
 ## Implementation
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defp deps do
+  [
+    # stdlib-only by default; add `{:benchee, "~> 1.3", only: :dev}` if you benchmark
+  ]
+end
+```
+
 
 ### Step 1: Create the project
 
@@ -258,6 +284,19 @@ mix test
 
 ---
 
+### Why this works
+
+The design leans on OTP primitives that already encode the invariants we care about (supervision, back-pressure, explicit message semantics), so failure modes are visible at the right layer instead of being reinvented ad-hoc. Tests exercise the edges (timeouts, crashes, boundary states), which is where hand-rolled alternatives silently drift over time.
+
+
+## Benchmark
+
+```elixir
+# Registry.lookup vs Process.whereis en un pool de 10k workers
+```
+
+Target esperado: <5 µs por lookup en Registry partitioned.
+
 ## Trade-offs and production gotchas
 
 **1. Registry auto-cleanup is a killer feature — don't defeat it**
@@ -291,6 +330,11 @@ workers are logically tied to external state (user id, session id, job
 id) that creates and retires naturally.
 
 ---
+
+
+## Reflection
+
+- ¿Cómo evitás que un burst de clientes cree 100k workers? Diseñá el backpressure.
 
 ## Resources
 

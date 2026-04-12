@@ -1,419 +1,383 @@
-# Advanced Macros and AST Manipulation
+# Advanced Macros and AST Surgery
+
+**Project**: `ast_surgeon` — a toolkit that rewrites Elixir source code at compile time by walking and transforming the AST (Abstract Syntax Tree).
+
+**Difficulty**: ★★★★☆
+**Estimated time**: 4–6 hours
+
+---
 
 ## Project context
 
-You are building `api_gateway`, an internal HTTP gateway that routes traffic to microservices.
-This exercise focuses on compile-time AST inspection, automatic middleware instrumentation
-via macro-based code transformation, and static variable analysis.
+Your platform team maintains a large Elixir monorepo with ~300 modules. The security team
+wants every call to `HTTPoison.get/1`, `HTTPoison.post/2`, and friends to be wrapped in
+a tracing helper that emits `:telemetry` events and enforces a timeout. Manually editing
+300 files is out of the question — and even if you did, a developer adding a new call
+next week would bypass the instrumentation.
 
-Project structure:
+The right answer is a **compile-time AST transformation**: a macro that scans the quoted
+expression of a module body and rewrites every `HTTPoison.<fun>(args)` call into
+`Traced.HTTPoison.<fun>(args)`. This is exactly what libraries like `Boundary` and
+`Credo` do internally — they read the AST and either validate or rewrite it.
+
+The same technique powers Phoenix's `~H` sigil, Ecto's `from` query builder, and Nx's
+`defn` — all of them are macros that walk a quoted expression and produce a new one.
 
 ```
-api_gateway/
+ast_surgeon/
 ├── lib/
-│   └── api_gateway/
-│       ├── application.ex
-│       ├── router.ex
-│       ├── middleware/
-│       │   └── instrumentation.ex
-│       └── dev/
-│           └── ast_tools.ex
+│   └── ast_surgeon/
+│       ├── rewriter.ex         # Macro.prewalk / postwalk driver
+│       ├── transforms.ex       # individual transformation rules
+│       └── traced_http.ex      # runtime helper used after rewrite
 ├── test/
-│   └── api_gateway/
-│       └── middleware/
-│           └── instrumentation_test.exs
+│   └── ast_surgeon/
+│       ├── rewriter_test.exs
+│       └── transforms_test.exs
 └── mix.exs
 ```
 
 ---
 
-## The business problem
+## Core concepts
 
-Three tooling requirements:
+### 1. Quoted expressions are tagged tuples
 
-1. **Compile-time inspection**: during code review, developers want to print the AST
-   of any expression to understand what the compiler sees. The macro must print at
-   compile time (not runtime) and still return the correct value.
+Every Elixir expression, when quoted, becomes a 3-tuple `{call, meta, args}` or a literal.
 
-2. **Automatic instrumentation**: instead of manually wrapping every middleware function
-   with timing code, a macro should transform the function body at compile time to
-   add `System.monotonic_time` measurements and emit a telemetry event.
-
-3. **Variable analysis**: a static analysis tool that lists all variables referenced
-   in a block of code -- useful for dead code analysis and security audits.
-
----
-
-## The Elixir AST format
-
-Every Elixir expression, before compilation, is represented as nested tuples:
-
-```elixir
-quote do: 1 + 2
-#=> {:+, [context: Elixir, imports: [{2, Kernel}]], [1, 2]}
-
-quote do: foo(bar)
-#=> {:foo, [line: 1], [{:bar, [line: 1], Elixir}]}
-
-# Variables vs function calls -- distinguished by the third element:
-quote do: x         #=> {:x, [], Elixir}       # variable: atom context
-quote do: x()       #=> {:x, [], []}            # call: empty list args
-quote do: x(1)      #=> {:x, [], [1]}           # call with args: non-empty list
+```
+quote do: a + 1
+#=> {:+, [context: Elixir, imports: [...]], [{:a, [], Elixir}, 1]}
 ```
 
-The critical distinction: `{name, meta, context}` where `context` is an atom
-(or `nil`) for variables, and a list for function calls.
+Literals (atoms, integers, floats, empty list, 2-tuples of literals, binaries) are
+represented as themselves. Everything else is a 3-tuple. This is what makes traversal tractable.
 
----
+### 2. `Macro.prewalk/2` vs `Macro.postwalk/2`
 
-## Why `Macro.escape` matters
+- `prewalk` visits a node **before** its children — useful when the transformation
+  depends on outer context, e.g. wrapping a call without recursing into the wrapped form.
+- `postwalk` visits **after** children — useful when child transformations must
+  complete first, e.g. constant folding where `1 + 2` becomes `3` before the surrounding
+  `3 * x`.
 
-Inside a `quote do ... end` block, `unquote(expr)` inserts `expr` as **code to execute**.
-`unquote(Macro.escape(expr))` inserts the AST of `expr` as **data** (a literal value
-that produces the AST tuple when evaluated).
-
-```elixir
-expr = quote do: 1 + 2   # => {:+, [], [1, 2]}
-
-# Without Macro.escape:
-quote do: IO.inspect(unquote(expr))
-# expands to: IO.inspect(1 + 2)  <- evaluates to IO.inspect(3)
-
-# With Macro.escape:
-quote do: IO.inspect(unquote(Macro.escape(expr)))
-# expands to: IO.inspect({:+, [], [1, 2]})  <- prints the AST tuple
 ```
+        expr: f(g(x))
+        ┌────────────┐
+prewalk │ visits f/1 │ ──▶ then g/1 ──▶ then x
+        └────────────┘
+postwalk visits x ──▶ then g/1 ──▶ then f/1
+```
+
+### 3. `Macro.traverse/4` — the two-pass powerhouse
+
+When you need both pre and post handlers with shared accumulator state:
+
+```
+Macro.traverse(ast, acc,
+  fn node, acc -> {maybe_transformed, new_acc} end,   # pre
+  fn node, acc -> {maybe_transformed, new_acc} end    # post
+)
+```
+
+This is what Credo uses to both gather metadata (pre) and emit issues (post).
+
+### 4. Hygienic vs unhygienic substitution
+
+When a macro injects a variable like `var!(result)`, it deliberately breaks hygiene so
+the caller can reference it. Silent hygiene violations are a common AST-surgery bug —
+always use `Macro.var(name, context)` when building new variables to guarantee the
+correct context, and `Macro.unique_var/2` when you want a fresh collision-free name.
+
+### 5. `Macro.expand/2` vs raw AST
+
+Some nodes look like function calls but are actually macros that would expand further
+(e.g. `|>`, `if`, `unless`). If your rewriter ignores expansion, it will miss logic
+that only becomes visible after `Macro.expand/2`. For rewriters that operate on
+user-authored code (not post-expansion), this is usually fine — document it.
 
 ---
 
 ## Implementation
 
-### Step 1: `lib/api_gateway/dev/ast_tools.ex`
+### Step 1: `mix.exs`
 
 ```elixir
-defmodule ApiGateway.Dev.ASTTools do
-  @moduledoc """
-  Compile-time AST inspection and analysis utilities.
-  These macros operate at compile time -- all output is produced during compilation,
-  not during test or production runtime.
-  """
+defmodule AstSurgeon.MixProject do
+  use Mix.Project
 
-  @doc """
-  Prints the AST of `expr` at compile time, then evaluates and returns `expr` normally.
-
-  Usage:
-    import ApiGateway.Dev.ASTTools
-    result = ast_inspect(conn.method == "GET")
-    # During compilation prints the AST and code representation.
-    # At runtime, result = true or false depending on conn.method.
-  """
-  defmacro ast_inspect(expr) do
-    ast_str = Macro.to_string(expr)
-    escaped = Macro.escape(expr)
-
-    quote do
-      IO.inspect(unquote(escaped), label: "[AST] #{unquote(ast_str)}")
-      unquote(expr)
-    end
+  def project do
+    [app: :ast_surgeon, version: "0.1.0", elixir: "~> 1.16", deps: deps()]
   end
 
-  @doc """
-  Analyzes a block of code at compile time and returns the list of variable names
-  referenced in it, deduplicated and sorted.
+  def application, do: [extra_applications: [:logger, :telemetry]]
 
-  This is a compile-time operation: the returned list is available as a literal
-  value at the call site. The block is NOT executed.
+  defp deps do
+    [{:telemetry, "~> 1.2"}, {:benchee, "~> 1.3", only: :dev}]
+  end
+end
+```
 
-  Uses Macro.postwalk to traverse the AST bottom-up. Variables are identified by
-  the three-tuple {name, meta, context} where context is an atom (not a list).
-  Function calls have a list as the third element, so they are excluded.
-  Variables starting with underscore are excluded by convention (they signal
-  intentionally unused bindings).
+### Step 2: `lib/ast_surgeon/traced_http.ex` — the runtime target
 
-  Usage:
-    vars = ApiGateway.Dev.ASTTools.referenced_vars do
-      method = conn.method
-      path = conn.request_path
-      _ignored = conn.body_params
-    end
-    # vars == [:conn, :method, :path]
+```elixir
+defmodule AstSurgeon.TracedHTTP do
+  @moduledoc """
+  Runtime wrapper that the AST rewrite targets. Emits telemetry.
   """
-  defmacro referenced_vars(do: block) do
-    {_ast, vars} =
-      Macro.postwalk(block, [], fn
-        # Variables: third element is an atom (not a list)
-        {name, _meta, ctx} = node, acc
-        when is_atom(name) and not is_list(ctx) ->
-          {node, [name | acc]}
 
-        node, acc ->
-          {node, acc}
-      end)
+  @spec get(String.t(), keyword()) :: {:ok, map()} | {:error, term()}
+  def get(url, opts \\ []), do: traced(:get, [url, opts])
+
+  @spec post(String.t(), binary(), keyword()) :: {:ok, map()} | {:error, term()}
+  def post(url, body, opts \\ []), do: traced(:post, [url, body, opts])
+
+  defp traced(verb, args) do
+    start = System.monotonic_time()
+    :telemetry.execute([:ast_surgeon, :http, :start], %{system_time: start}, %{verb: verb})
 
     result =
-      vars
-      |> Enum.reject(fn name ->
-        name == :_ or String.starts_with?(to_string(name), "_")
-      end)
-      |> Enum.uniq()
-      |> Enum.sort()
+      try do
+        simulated_call(verb, args)
+      catch
+        kind, reason -> {:error, {kind, reason}}
+      end
 
-    # Macro.escape converts the list to an AST that produces the list at runtime
-    Macro.escape(result)
+    duration = System.monotonic_time() - start
+    :telemetry.execute([:ast_surgeon, :http, :stop], %{duration: duration}, %{verb: verb})
+    result
+  end
+
+  defp simulated_call(:get, [url | _]), do: {:ok, %{status: 200, url: url}}
+  defp simulated_call(:post, [url, _body | _]), do: {:ok, %{status: 201, url: url}}
+end
+```
+
+### Step 3: `lib/ast_surgeon/transforms.ex`
+
+```elixir
+defmodule AstSurgeon.Transforms do
+  @moduledoc """
+  Individual AST transformation rules. Each takes a node and returns a
+  possibly-rewritten node. Composed by `Rewriter`.
+  """
+
+  @doc """
+  Rewrites `HTTPoison.get(...)` / `HTTPoison.post(...)` into the traced helper.
+  """
+  @spec rewrite_http(Macro.t()) :: Macro.t()
+  def rewrite_http({{:., meta1, [{:__aliases__, alias_meta, [:HTTPoison]}, verb]}, meta2, args})
+      when verb in [:get, :post] do
+    target = {:__aliases__, alias_meta, [:AstSurgeon, :TracedHTTP]}
+    {{:., meta1, [target, verb]}, meta2, args}
+  end
+
+  def rewrite_http(node), do: node
+
+  @doc """
+  Constant-folds simple arithmetic on literal integers — demonstrates postwalk
+  bottom-up simplification.
+  """
+  @spec fold_constants(Macro.t()) :: Macro.t()
+  def fold_constants({op, _meta, [a, b]})
+      when op in [:+, :-, :*] and is_integer(a) and is_integer(b) do
+    case op do
+      :+ -> a + b
+      :- -> a - b
+      :* -> a * b
+    end
+  end
+
+  def fold_constants(node), do: node
+end
+```
+
+### Step 4: `lib/ast_surgeon/rewriter.ex`
+
+```elixir
+defmodule AstSurgeon.Rewriter do
+  @moduledoc """
+  Drives AST walks. Exposes `rewrite/2` for programmatic use and `deftraced/2`
+  for the DSL style.
+  """
+
+  alias AstSurgeon.Transforms
+
+  @type transform :: (Macro.t() -> Macro.t())
+
+  @spec rewrite(Macro.t(), [transform]) :: Macro.t()
+  def rewrite(ast, transforms) do
+    Macro.postwalk(ast, fn node ->
+      Enum.reduce(transforms, node, fn t, acc -> t.(acc) end)
+    end)
+  end
+
+  @spec collect(Macro.t(), (Macro.t() -> boolean())) :: [Macro.t()]
+  def collect(ast, predicate) do
+    {_, acc} =
+      Macro.prewalk(ast, [], fn node, acc ->
+        if predicate.(node), do: {node, [node | acc]}, else: {node, acc}
+      end)
+
+    Enum.reverse(acc)
+  end
+
+  defmacro __using__(_opts) do
+    quote do
+      import AstSurgeon.Rewriter, only: [deftraced: 2]
+    end
+  end
+
+  @doc """
+  Defines a function whose body is rewritten by the default transform list
+  (currently `rewrite_http/1`). Compile-time transformation, zero runtime cost.
+  """
+  defmacro deftraced(call, do: body) do
+    new_body = rewrite(body, [&Transforms.rewrite_http/1])
+
+    quote do
+      def unquote(call), do: unquote(new_body)
+    end
   end
 end
 ```
 
-### Step 2: `lib/api_gateway/middleware/instrumentation.ex`
+### Step 5: Tests
 
 ```elixir
-defmodule ApiGateway.Middleware.Instrumentation do
-  @moduledoc """
-  Compile-time AST transformation that wraps function bodies with timing and telemetry.
+defmodule AstSurgeon.TransformsTest do
+  use ExUnit.Case, async: true
+  alias AstSurgeon.Transforms
 
-  Usage:
-    defmodule ApiGateway.Middleware.AuthCheck do
-      import ApiGateway.Middleware.Instrumentation
-
-      instrument def call(conn, _opts) do
-        # ... middleware logic
-        conn
-      end
+  describe "rewrite_http/1" do
+    test "rewrites HTTPoison.get into TracedHTTP.get" do
+      ast = quote do: HTTPoison.get("https://example.com")
+      new_ast = Macro.postwalk(ast, &Transforms.rewrite_http/1)
+      source = Macro.to_string(new_ast)
+      assert source =~ "AstSurgeon.TracedHTTP.get"
+      refute source =~ "HTTPoison.get"
     end
 
-  The `instrument` macro transforms the AST of the function body to:
-    1. Record start time with System.monotonic_time(:microsecond)
-    2. Execute the original body
-    3. Emit a :telemetry event with elapsed time and function metadata
-
-  The macro pattern-matches on the AST structure of a `def` form to extract
-  the function name, arguments, and body. It then wraps the body in timing
-  code and re-emits the `def` with the instrumented body.
-  """
-
-  @doc """
-  Wraps a function definition with automatic timing instrumentation.
-  Transforms the function body at compile time -- no runtime overhead
-  beyond the timing calls themselves.
-  """
-  defmacro instrument({:def, meta, [{name, fun_meta, args}, [do: body]]}) do
-    module_ref = __CALLER__.module
-    fun_name_str = to_string(name)
-
-    instrumented_body =
-      quote do
-        __start__ = System.monotonic_time(:microsecond)
-
-        result =
-          try do
-            unquote(body)
-          rescue
-            e ->
-              elapsed = System.monotonic_time(:microsecond) - __start__
-              :telemetry.execute(
-                [:api_gateway, :middleware, :exception],
-                %{duration_us: elapsed},
-                %{module: unquote(module_ref), function: unquote(fun_name_str), error: e}
-              )
-              reraise e, __STACKTRACE__
-          end
-
-        elapsed = System.monotonic_time(:microsecond) - __start__
-
-        :telemetry.execute(
-          [:api_gateway, :middleware, :call],
-          %{duration_us: elapsed},
-          %{module: unquote(module_ref), function: unquote(fun_name_str)}
-        )
-
-        result
-      end
-
-    {:def, meta, [{name, fun_meta, args}, [do: instrumented_body]]}
+    test "leaves unrelated calls alone" do
+      ast = quote do: Enum.map([1, 2], &(&1 + 1))
+      assert Macro.postwalk(ast, &Transforms.rewrite_http/1) == ast
+    end
   end
 
-  @doc """
-  Counts the number of timing instrumentation injections a `do` block would receive
-  if passed through `instrument/1`. Used in testing to verify transformation behavior.
+  describe "fold_constants/1" do
+    test "reduces 1 + 2 * 3 to 7 bottom-up" do
+      ast = quote do: 1 + 2 * 3
+      assert Macro.postwalk(ast, &Transforms.fold_constants/1) == 7
+    end
 
-  Traverses the AST with Macro.prewalk, counting every {:def, _, _} node found.
-  Each such node represents one function definition that would be instrumented.
-  """
-  @spec count_instrument_sites(Macro.t()) :: non_neg_integer()
-  def count_instrument_sites(ast) do
-    {_ast, count} =
-      Macro.prewalk(ast, 0, fn
-        {:def, _meta, _args} = node, acc -> {node, acc + 1}
-        node, acc -> {node, acc}
-      end)
-
-    count
+    test "ignores non-literal operands" do
+      ast = quote do: x + 1
+      assert Macro.postwalk(ast, &Transforms.fold_constants/1) == ast
+    end
   end
 end
-```
 
-### Step 3: Tests
-
-```elixir
-# test/api_gateway/middleware/instrumentation_test.exs
-defmodule ApiGateway.Middleware.InstrumentationTest do
+defmodule AstSurgeon.RewriterTest do
   use ExUnit.Case, async: true
 
-  import ApiGateway.Middleware.Instrumentation
-  alias ApiGateway.Dev.ASTTools
+  defmodule Subject do
+    use AstSurgeon.Rewriter
 
-  # ---------------------------------------------------------------------------
-  # ASTTools tests
-  # ---------------------------------------------------------------------------
-
-  describe "referenced_vars/1" do
-    test "returns sorted, deduplicated variable names" do
-      vars =
-        ASTTools.referenced_vars do
-          method = conn.method
-          path = conn.request_path
-          result = String.upcase(method) <> path
-          _ignored = "not counted"
-        end
-
-      # conn, method, path, result -- conn appears multiple times but deduped
-      assert :conn in vars
-      assert :method in vars
-      assert :path in vars
-      assert :result in vars
-      # _ignored must be excluded
-      refute :_ignored in vars
-      # List must be sorted
-      assert vars == Enum.sort(vars)
-    end
-
-    test "excludes variables starting with underscore" do
-      vars =
-        ASTTools.referenced_vars do
-          _private = 1
-          _also_private = 2
-          public = 3
-        end
-
-      assert vars == [:public]
-    end
-
-    test "returns empty list for a block with no variables" do
-      vars =
-        ASTTools.referenced_vars do
-          1 + 2
-          "hello"
-        end
-
-      assert vars == []
+    deftraced fetch(url) do
+      HTTPoison.get(url)
     end
   end
 
-  # ---------------------------------------------------------------------------
-  # Instrumentation macro tests
-  # ---------------------------------------------------------------------------
+  test "deftraced rewrites body to call TracedHTTP" do
+    assert {:ok, %{status: 200, url: "https://x"}} = Subject.fetch("https://x")
+  end
 
-  describe "instrument/1" do
-    defmodule SampleMiddleware do
-      import ApiGateway.Middleware.Instrumentation
+  test "telemetry events fire" do
+    parent = self()
 
-      instrument def process(conn, _opts) do
-        Map.put(conn, :processed, true)
-      end
-    end
+    :telemetry.attach_many(
+      :ast_surgeon_test,
+      [[:ast_surgeon, :http, :start], [:ast_surgeon, :http, :stop]],
+      fn event, meas, meta, _ -> send(parent, {event, meas, meta}) end,
+      nil
+    )
 
-    setup do
-      # Attach a telemetry handler to capture events
-      handler_id = :test_handler
-      test_pid = self()
+    Subject.fetch("https://x")
 
-      :telemetry.attach(
-        handler_id,
-        [:api_gateway, :middleware, :call],
-        fn event, measurements, metadata, _config ->
-          send(test_pid, {:telemetry, event, measurements, metadata})
-        end,
-        nil
-      )
-
-      on_exit(fn -> :telemetry.detach(handler_id) end)
-      :ok
-    end
-
-    test "executes the original function logic correctly" do
-      result = SampleMiddleware.process(%{method: "GET"}, [])
-      assert result == %{method: "GET", processed: true}
-    end
-
-    test "emits a telemetry event with duration" do
-      SampleMiddleware.process(%{}, [])
-
-      assert_receive {:telemetry, [:api_gateway, :middleware, :call], measurements, metadata},
-                     1_000
-
-      assert is_integer(measurements.duration_us)
-      assert measurements.duration_us >= 0
-      assert metadata.function == "process"
-    end
+    assert_receive {[:ast_surgeon, :http, :start], _, %{verb: :get}}
+    assert_receive {[:ast_surgeon, :http, :stop], %{duration: _}, _}
+  after
+    :telemetry.detach(:ast_surgeon_test)
   end
 end
 ```
 
-### Step 4: Run the tests
+---
 
-```bash
-mix test test/api_gateway/middleware/instrumentation_test.exs --trace
+## Trade-offs and production gotchas
+
+**1. Compile-time cost scales with AST size.** Every `prewalk`/`postwalk` is O(n) in nodes.
+A 10k-LOC module can have ~300k AST nodes. Running 20 transforms sequentially = 6M ops
+per compile. Combine transforms into a single walk when possible.
+
+**2. Macro debugging is slippery.** `IO.inspect` inside a macro prints at compile time,
+not runtime. Use `Macro.to_string/1` to see generated source, and
+`Macro.expand_once/2` to step expansion manually. See exercise 141.
+
+**3. Hygiene surprises.** Variables you introduce inside the quoted output carry the
+macro's context, not the caller's. If you need the caller to see them, use `var!/1` and
+document it.
+
+**4. `@before_compile` runs once per module.** State accumulated across multiple macro
+invocations lives in module attributes. Accumulator attributes (exercise 133) are the
+right tool.
+
+**5. AST rewriting across abstraction boundaries is brittle.** If your user writes
+`alias HTTPoison, as: H` and then `H.get(...)`, your pattern on
+`{:__aliases__, _, [:HTTPoison]}` will miss it. Either expand aliases
+(`Macro.expand/2` with an `env`) or document the limitation.
+
+**6. Rewriting macros, not just function calls.** Nodes like `|>`, `for`, `with` are
+macros. Decide deliberately whether you operate before or after their expansion.
+
+**7. When NOT to use this.** If the rewrite can be expressed as a normal function wrapper
+(`def my_get(url), do: Traced.get(url)` + a Credo rule to ban direct calls), prefer that.
+AST surgery is only justified when the rewrite is invisible to callers, enforces a
+cross-cutting concern, or eliminates boilerplate across dozens of modules.
+
+---
+
+## Benchmark
+
+```elixir
+# bench/rewrite_bench.exs
+ast =
+  Enum.reduce(1..1_000, quote(do: :ok), fn _, acc ->
+    quote do
+      HTTPoison.get("https://example.com")
+      unquote(acc)
+    end
+  end)
+
+Benchee.run(%{
+  "postwalk rewrite" => fn ->
+    Macro.postwalk(ast, &AstSurgeon.Transforms.rewrite_http/1)
+  end,
+  "prewalk rewrite" => fn ->
+    Macro.prewalk(ast, &AstSurgeon.Transforms.rewrite_http/1)
+  end
+})
 ```
 
----
-
-## Trade-off analysis
-
-| Technique | Compile-time cost | Runtime overhead | Debuggability |
-|-----------|------------------|-----------------|---------------|
-| `Macro.prewalk` | O(n) AST nodes | Zero | Hard -- errors show AST positions |
-| `Macro.postwalk` | O(n) AST nodes | Zero | Hard -- same as prewalk |
-| `Macro.traverse` | O(n) AST nodes | Zero | Hardest -- pre+post in one pass |
-| `Code.eval_quoted` | O(n) | Runtime eval cost | Worst -- no compiler optimizations |
-| Regular function | None | Normal | Best |
-
-Reflection: `referenced_vars` is a compile-time macro -- the list of variables
-is a literal in the compiled beam file. What happens if you call it with a block
-that references variables that don't exist yet? Does the macro care? Why?
-
----
-
-## Common production mistakes
-
-**1. Using `Code.eval_quoted` in production hot paths**
-`Code.eval_quoted` bypasses the compiler -- no type checking, no optimization, no
-dialyzer analysis. Use it only for developer tooling or one-time startup operations.
-
-**2. Not using `Macro.escape` when passing AST as data**
-Without `Macro.escape`, `unquote(some_ast)` inside a `quote` block injects the
-code for evaluation, not the AST structure as a value. The difference is subtle
-and causes confusing runtime errors.
-
-**3. Writing match specs manually when `fun2ms` suffices**
-AST manipulation macros are powerful but complex. For ETS match specs specifically,
-`:ets.fun2ms/1` handles the transformation correctly within its constraints.
-Only write AST transformation when `fun2ms` cannot (dynamic runtime arguments).
-
-**4. Ignoring `@before_compile` ordering with multiple `use` calls**
-If a module uses two DSLs that both register `@before_compile` hooks, the hooks
-run in reverse registration order. Hooks that depend on each other must account
-for this ordering or use a single coordinating hook.
-
-**5. Accumulating module attributes in LIFO order**
-`Module.register_attribute(mod, :rules, accumulate: true)` inserts in LIFO order.
-`@rules :a; @rules :b` gives `[:b, :a]` when read. Always `Enum.reverse/1` the
-accumulator in `@before_compile`.
+Expect ~1–3 ms for 1k-node ASTs on modern hardware. Compile time only — zero runtime cost.
 
 ---
 
 ## Resources
 
-- [Elixir `Macro` module documentation](https://hexdocs.pm/elixir/Macro.html) -- `prewalk`, `postwalk`, `traverse`, `escape`
-- [Metaprogramming Elixir -- Chris McCord](https://pragprog.com/titles/cmelixir/metaprogramming-elixir/) -- the definitive book on Elixir macros
-- [Quote and unquote -- Elixir guides](https://elixir-lang.org/getting-started/meta/quote-and-unquote.html)
-- [`:telemetry` library](https://hexdocs.pm/telemetry/readme.html) -- the instrumentation standard in the Elixir ecosystem
+- [`Macro` — hexdocs.pm](https://hexdocs.pm/elixir/Macro.html) — canonical reference
+- [*Metaprogramming Elixir* — Chris McCord](https://pragprog.com/titles/cmelixir/metaprogramming-elixir/) — still the best intro
+- [Phoenix.HTML.Engine source](https://github.com/phoenixframework/phoenix_html/blob/main/lib/phoenix_html/engine.ex) — real-world AST walk
+- [Credo's AST code module](https://github.com/rrrene/credo/tree/master/lib/credo/code) — production-grade traversal
+- [Dashbit blog — compile-time techniques](https://dashbit.co/blog) — José Valim
+- [`Macro` source in Elixir](https://github.com/elixir-lang/elixir/blob/main/lib/elixir/lib/macro.ex) — read `traverse/4`

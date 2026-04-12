@@ -2,9 +2,6 @@
 
 **Project**: `parallel_scraper` — fetch N URLs in parallel and aggregate results.
 
-**Difficulty**: ★★☆☆☆
-**Estimated time**: 1–2 hours
-
 ---
 
 ## Project context
@@ -36,6 +33,11 @@ parallel_scraper/
 ```
 
 ---
+
+
+## Why X and not Y
+
+- **Why not a lower-level alternative?** For task y concurrencia, OTP's pattern is what reviewers will expect and what observability tools support out of the box.
 
 ## Core concepts
 
@@ -86,11 +88,35 @@ urls                          [t1 t2 t3 t4]
 
 `Task.await_many/2` (Elixir 1.13+) awaits a list of tasks with a single
 timeout. If any task crashes or times out, the others in the batch are
-shut down. See exercise 50 for the `await_many` vs `yield_many` choice.
+shut down. 
 
 ---
 
+## Design decisions
+
+**Option A — spawn unsupervised**
+- Pros: simpler upfront, fewer moving parts.
+- Cons: hides the trade-off that this exercise exists to teach.
+
+**Option B — `Task.async/await` (chosen)**
+- Pros: explicit about the semantic that matters in production.
+- Cons: one more concept to internalize.
+
+→ Chose **B** because linked tasks surface failures to the caller and clean up automatically.
+
+
 ## Implementation
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defp deps do
+  [
+    # stdlib-only by default; add `{:benchee, "~> 1.3", only: :dev}` if you benchmark
+  ]
+end
+```
+
 
 ### Step 1: Create the project
 
@@ -207,6 +233,15 @@ mix test
 
 ---
 
+### Why this works
+
+The design leans on OTP primitives that already encode the invariants we care about (supervision, back-pressure, explicit message semantics), so failure modes are visible at the right layer instead of being reinvented ad-hoc. Tests exercise the edges (timeouts, crashes, boundary states), which is where hand-rolled alternatives silently drift over time.
+
+
+## Benchmark
+
+<!-- benchmark N/A: tema conceptual -->
+
 ## Trade-offs and production gotchas
 
 **1. `Task.async` is linked — a crash in one task crashes your caller**
@@ -247,6 +282,11 @@ what's ready by the deadline", use `Task.yield_many` (exercise 53).
   there's no benefit in spawning more tasks than cores.
 
 ---
+
+
+## Reflection
+
+- Aplicá lo aprendido sobre task y concurrencia: describí un caso de tu trabajo donde este patrón cambiaría tu diseño, y qué medirías para validar la mejora.
 
 ## Resources
 

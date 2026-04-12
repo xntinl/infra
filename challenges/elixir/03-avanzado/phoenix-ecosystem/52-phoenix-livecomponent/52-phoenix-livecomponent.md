@@ -1,484 +1,498 @@
-# Phoenix LiveComponent: Encapsulated UI State
+# Phoenix LiveComponent — Stateful, Stateless, and Function Components
 
-## Overview
+**Project**: `live_components` — a composable cart UI with per-item state, reusable buttons, and a shared checkout summary.
 
-Extract reusable, stateful UI components from a monolithic LiveView using Phoenix
-LiveComponent. Build a sortable paginated table, an autocomplete search input with
-debounce, and a reusable confirmation modal -- each managing its own interaction state
-independently from the parent LiveView.
+**Difficulty**: ★★★★☆
+**Estimated time**: 4–6 hours
 
-Project structure:
+---
+
+## Project context
+
+You inherited a LiveView that grew past 1,200 lines. It renders a shopping cart, each
+line item has its own quantity stepper, a "remove" confirmation modal, a tax breakdown,
+and a sticky summary bar. Every interaction — changing a quantity, opening the modal,
+applying a promo — flows through the top-level LiveView's `handle_event/3`. That
+function is now an unreadable `case` on 23 branches, and every mutation re-renders the
+entire tree even when only one line item changed.
+
+The refactor plan is to decompose the page into three kinds of components,
+each with a clear purpose:
+
+1. **Function components** (`Phoenix.Component`) — pure render helpers, no state, no
+   server round-trip on interaction. Used for design-system atoms: buttons, inputs, cards.
+2. **Stateless LiveComponents** — reusable UI blocks that receive all state from the
+   parent via assigns, emit events upward via `send` or `phx-target` so the parent
+   decides how to react.
+3. **Stateful LiveComponents** — own private state (e.g., "is the modal open?")
+   that doesn't belong to the parent. They have their own `mount/1`, `update/2`,
+   and `handle_event/3`. Crucially, they share the parent's process — they are
+   not separate GenServers, they are render scopes with isolated state.
+
+The key production motivation is **targeted re-rendering**. When the quantity of
+one line changes, only that component's diff is shipped to the browser; the other
+nine line items and the summary bar are unaffected.
+
+Project structure at this point:
 
 ```
-api_gateway/
+live_components/
 ├── lib/
-│   └── api_gateway_web/
-│       └── components/
-│           ├── metrics_table_component.ex
-│           ├── autocomplete_component.ex
-│           └── confirm_modal_component.ex
+│   ├── live_components/
+│   │   ├── application.ex
+│   │   └── cart.ex                     # in-memory cart domain
+│   └── live_components_web/
+│       ├── endpoint.ex
+│       ├── router.ex
+│       ├── components/
+│       │   └── core_components.ex      # function components (button, input, card)
+│       ├── live/
+│       │   └── cart_live.ex            # parent LiveView
+│       └── live_components/
+│           ├── line_item_component.ex  # stateful LiveComponent
+│           └── summary_component.ex    # stateless LiveComponent
 └── test/
-    └── api_gateway_web/components/
-        └── metrics_table_component_test.exs
+    └── live_components_web/
+        └── live/
+            └── cart_live_test.exs
 ```
 
 ---
 
-## When to use LiveComponent vs LiveView vs function component
+## Core concepts
+
+### 1. Three flavors compared
 
 ```
-LiveView
-  +-- LiveComponent (stateful, own event handling, no route)
-        +-- function component (stateless, pure assigns -> HTML)
+                     Function component    Stateless LC        Stateful LC
+                     (Phoenix.Component)  (use LiveComponent)  (use LiveComponent + :id)
+                     ─────────────────    ─────────────────    ──────────────────────
+Has process?         no (compile-time)    no (runs in parent)  no (runs in parent)
+Has assigns?         yes (from caller)    yes (from parent)    yes (owned)
+Has handle_event?    no                   yes (target parent)  yes (target self)
+Has mount/update?    no                   no                   yes
+Has :id required?    no                   no                   YES (identity)
+Diff scope           inlined into parent  own change tracker   own change tracker
+Use case             buttons, labels      modal, tabs, lists   modal with local open/close
 ```
 
-Use a **LiveComponent** when:
-- The piece of UI has its own interaction state (pagination, sort order, open/closed)
-- The parent should not need to know the implementation details
-- Multiple instances of the same UI can exist on one page independently
-
-Use a **function component** when:
-- The UI is purely presentational -- it takes assigns and renders HTML
-- There is no interaction state to manage
-
-The boundary: **the component owns its interaction state; the parent owns the data**.
+The `:id` is what makes the difference. Without `:id`, a LiveComponent is **stateless**:
+every render recomputes everything from assigns, the server keeps no state for it between
+renders. With `:id`, Phoenix allocates a persistent change-tracking slot keyed by
+`{module, id}`, and `mount/1` runs once per distinct id.
 
 ---
 
-## Key mechanics
+### 2. `update/2` is the lifecycle hook you'll use most
 
-**`phx-target={@myself}`**: routes the event to this component instance, not to the
-parent LiveView. Without this, all events bubble up to the LiveView.
+Stateful LiveComponents have `mount/1` (called once per id when the component first
+renders) and `update/2` (called every time the parent passes new assigns). The default
+`update/2` just merges assigns. You override it when you need to react to external
+changes — for example, resetting a local "draft" state when the parent swaps the
+underlying record:
 
-**`update/2`**: called every time the parent passes new assigns. Use it to transform
-parent data into component-local state.
+```elixir
+def update(%{line_item: new_item} = assigns, socket) do
+  {:ok,
+   socket
+   |> assign(assigns)
+   |> assign(:draft_qty, new_item.qty)}
+end
+```
 
-**`send(self(), msg)`**: inside a LiveComponent, `self()` is the parent LiveView's PID.
-This is the idiomatic way for a component to notify its parent.
+`mount/1` fires once. `update/2` fires on every parent render. Conflating the two is
+a common source of "my local state keeps getting reset" bugs.
 
-**`send_update/3`**: allows the parent to push new assigns into a specific component by ID.
+---
+
+### 3. Event routing — `phx-target`
+
+When a stateless LiveComponent emits an event, it bubbles up to the parent LiveView
+by default. When you want the event to land in the component itself (the stateful
+case), you set `phx-target={@myself}`:
+
+```heex
+<button phx-click="toggle" phx-target={@myself}>Open</button>
+```
+
+`@myself` is a `%Phoenix.LiveComponent.CID{}` — a compile-time reference to the
+current component. The wire protocol uses the CID to route the event back. Without
+`phx-target`, the event goes to the parent, and you must pass data back via
+`send(self(), ...)` or by making the parent re-render with new assigns.
+
+---
+
+### 4. Targeted diffs — the performance payoff
+
+Phoenix tracks changes per component. When a stateful LC updates its own assigns,
+only that component's HTML diff ships to the browser. The outer LiveView does not
+re-render:
+
+```
+Parent LiveView (assigns: cart, user)
+├── LineItemComponent id="item-1" (assigns: item, qty, open?)      ← user clicks +
+├── LineItemComponent id="item-2" (assigns: item, qty, open?)      ← NOT re-rendered
+├── LineItemComponent id="item-3" (assigns: item, qty, open?)      ← NOT re-rendered
+└── SummaryComponent  id="summary" (assigns: total)                ← re-renders if total changed
+```
+
+This is a significant win versus monolithic LiveViews: for a cart with 20 line items,
+a quantity bump only transmits one component's diff (~200 bytes) instead of the whole
+cart's HTML (~20 KB).
+
+---
+
+### 5. When stateful LCs leak memory
+
+Stateful LCs are kept alive on the server for as long as their `:id` appears in the
+parent's render. If you scroll an infinite list and components drop out of view, they
+drop out of the render tree — and their state is discarded. That's usually what you
+want. But if you use a dynamic id (e.g., `id={"item-#{Ecto.UUID.generate()}"}` —
+don't do this), every render creates a fresh component. Keep ids stable and derived
+from the domain (`item.id`).
 
 ---
 
 ## Implementation
 
-### Step 1: `lib/api_gateway_web/components/metrics_table_component.ex`
-
-A sortable, paginated data table that manages its own sort order and page state.
-
-```elixir
-defmodule ApiGatewayWeb.MetricsTableComponent do
-  use ApiGatewayWeb, :live_component
-
-  @per_page 15
-
-  @impl true
-  def update(%{rows: rows, columns: columns} = _assigns, socket) do
-    socket =
-      socket
-      |> assign(rows: rows, columns: columns)
-      |> assign_new(:sort_col, fn -> nil end)
-      |> assign_new(:sort_dir, fn -> :asc end)
-      |> assign_new(:page, fn -> 1 end)
-      |> apply_sort_and_paginate()
-
-    {:ok, socket}
-  end
-
-  @impl true
-  def handle_event("sort", %{"col" => col}, socket) do
-    col = String.to_existing_atom(col)
-    dir =
-      if socket.assigns.sort_col == col and socket.assigns.sort_dir == :asc,
-        do: :desc,
-        else: :asc
-
-    socket =
-      socket
-      |> assign(sort_col: col, sort_dir: dir, page: 1)
-      |> apply_sort_and_paginate()
-
-    {:noreply, socket}
-  end
-
-  def handle_event("page", %{"n" => n}, socket) do
-    socket =
-      socket
-      |> assign(page: String.to_integer(n))
-      |> apply_sort_and_paginate()
-
-    {:noreply, socket}
-  end
-
-  @impl true
-  def render(assigns) do
-    ~H"""
-    <div>
-      <table class="w-full border-collapse text-sm">
-        <thead>
-          <tr class="border-b border-gray-700">
-            <%= for col <- @columns do %>
-              <th class="text-left py-2 px-3 cursor-pointer hover:bg-gray-800"
-                  phx-click="sort"
-                  phx-value-col={col.field}
-                  phx-target={@myself}>
-                <%= col.label %>
-                <%= sort_indicator(@sort_col, @sort_dir, col.field) %>
-              </th>
-            <% end %>
-          </tr>
-        </thead>
-        <tbody>
-          <%= for row <- @visible_rows do %>
-            <tr class="border-b border-gray-800 hover:bg-gray-900">
-              <%= for col <- @columns do %>
-                <td class="py-2 px-3"><%= Map.get(row, col.field) %></td>
-              <% end %>
-            </tr>
-          <% end %>
-        </tbody>
-      </table>
-
-      <%= if @total_pages > 1 do %>
-        <div class="flex gap-2 mt-3 justify-end text-sm">
-          <%= for n <- 1..@total_pages do %>
-            <button phx-click="page"
-                    phx-value-n={n}
-                    phx-target={@myself}
-                    class={if n == @page, do: "font-bold underline text-blue-400", else: "text-gray-400 hover:text-white"}>
-              <%= n %>
-            </button>
-          <% end %>
-        </div>
-      <% end %>
-    </div>
-    """
-  end
-
-  defp apply_sort_and_paginate(socket) do
-    %{rows: rows, sort_col: col, sort_dir: dir, page: page} = socket.assigns
-
-    sorted =
-      if col do
-        Enum.sort_by(rows, &Map.get(&1, col), dir)
-      else
-        rows
-      end
-
-    total_pages = max(1, ceil(length(sorted) / @per_page))
-    page = min(page, total_pages)
-    visible = sorted |> Enum.drop((page - 1) * @per_page) |> Enum.take(@per_page)
-
-    assign(socket, visible_rows: visible, total_pages: total_pages, page: page)
-  end
-
-  defp sort_indicator(col, dir, field) when col == field,
-    do: if(dir == :asc, do: " ↑", else: " ↓")
-  defp sort_indicator(_, _, _), do: ""
-end
-```
-
-Usage in a parent LiveView:
-
-```heex
-<.live_component
-  module={ApiGatewayWeb.MetricsTableComponent}
-  id="request-log"
-  rows={@recent_requests}
-  columns={[
-    %{field: :client_id,    label: "Client"},
-    %{field: :path,         label: "Path"},
-    %{field: :status,       label: "Status"},
-    %{field: :duration_ms,  label: "Duration (ms)"},
-    %{field: :ts,           label: "Time"}
-  ]}
-/>
-```
-
-### Step 2: `lib/api_gateway_web/components/autocomplete_component.ex`
-
-A search input with debounce that calls a parent-provided `fetch_fn` to load suggestions.
-Selecting an item notifies the parent LiveView via `send(self(), ...)`.
-
-```elixir
-defmodule ApiGatewayWeb.AutocompleteComponent do
-  use ApiGatewayWeb, :live_component
-
-  @impl true
-  def update(%{fetch_fn: _} = assigns, socket) do
-    {:ok, assign(socket, assigns) |> assign(query: "", suggestions: [], open: false)}
-  end
-
-  @impl true
-  def handle_event("search", %{"query" => q}, socket) when byte_size(q) >= 2 do
-    suggestions = socket.assigns.fetch_fn.(q)
-    {:noreply, assign(socket, query: q, suggestions: suggestions, open: true)}
-  end
-
-  def handle_event("search", %{"query" => q}, socket) do
-    {:noreply, assign(socket, query: q, suggestions: [], open: false)}
-  end
-
-  def handle_event("select", %{"value" => value}, socket) do
-    send(self(), {:autocomplete_selected, socket.assigns.id, value})
-    {:noreply, assign(socket, query: value, suggestions: [], open: false)}
-  end
-
-  def handle_event("clear", _params, socket) do
-    {:noreply, assign(socket, query: "", suggestions: [], open: false)}
-  end
-
-  @impl true
-  def render(assigns) do
-    ~H"""
-    <div class="relative">
-      <div class="flex items-center gap-1">
-        <input
-          name="query"
-          value={@query}
-          placeholder={assigns[:placeholder] || "Search..."}
-          phx-change="search"
-          phx-debounce="300"
-          phx-target={@myself}
-          autocomplete="off"
-          class="border rounded px-3 py-1.5 w-full text-sm"
-        />
-        <%= if @query != "" do %>
-          <button phx-click="clear" phx-target={@myself}
-                  class="text-gray-400 hover:text-gray-700 px-1">x</button>
-        <% end %>
-      </div>
-
-      <%= if @open and @suggestions != [] do %>
-        <ul class="absolute z-10 w-full bg-white border rounded shadow-lg mt-1
-                   max-h-48 overflow-y-auto text-sm">
-          <%= for s <- @suggestions do %>
-            <li phx-click="select"
-                phx-value-value={s}
-                phx-target={@myself}
-                class="px-3 py-1.5 hover:bg-blue-50 cursor-pointer">
-              <%= s %>
-            </li>
-          <% end %>
-        </ul>
-      <% end %>
-    </div>
-    """
-  end
-end
-```
-
-Parent LiveView receiving the notification:
-
-```elixir
-@impl true
-def handle_info({:autocomplete_selected, "client-search", value}, socket) do
-  {:noreply, assign(socket, selected_client: value)}
-end
-```
-
-### Step 3: `lib/api_gateway_web/components/confirm_modal_component.ex`
-
-A reusable confirmation modal. The parent opens it via `send_update/3` and receives
-`:modal_confirmed` or `:modal_closed` messages.
-
-```elixir
-defmodule ApiGatewayWeb.ConfirmModalComponent do
-  use ApiGatewayWeb, :live_component
-
-  @impl true
-  def update(assigns, socket) do
-    {:ok, assign(socket, assigns) |> assign_new(:open, fn -> false end)}
-  end
-
-  @impl true
-  def handle_event("close", _params, socket) do
-    send(self(), {:modal_closed, socket.assigns.id})
-    {:noreply, assign(socket, open: false)}
-  end
-
-  def handle_event("confirm", _params, socket) do
-    send(self(), {:modal_confirmed, socket.assigns.id})
-    {:noreply, assign(socket, open: false)}
-  end
-
-  @impl true
-  def render(assigns) do
-    ~H"""
-    <%= if @open do %>
-      <div class="fixed inset-0 z-50 flex items-center justify-center bg-black/60"
-           phx-window-keydown="close"
-           phx-key="Escape"
-           phx-target={@myself}>
-        <div class="bg-white rounded-lg shadow-xl p-6 max-w-md w-full mx-4">
-          <div class="flex justify-between items-start mb-4">
-            <h2 class="text-lg font-semibold"><%= assigns[:title] || "Confirm" %></h2>
-            <button phx-click="close" phx-target={@myself}
-                    class="text-gray-400 hover:text-gray-600 text-xl leading-none">x</button>
-          </div>
-
-          <div class="mb-6 text-gray-700">
-            <%= render_slot(@inner_block) %>
-          </div>
-
-          <div class="flex justify-end gap-3">
-            <button phx-click="close" phx-target={@myself}
-                    class="px-4 py-2 border rounded text-gray-700 hover:bg-gray-50">
-              Cancel
-            </button>
-            <button phx-click="confirm" phx-target={@myself}
-                    class="px-4 py-2 bg-red-600 text-white rounded hover:bg-red-700">
-              Confirm
-            </button>
-          </div>
-        </div>
-      </div>
-    <% end %>
-    """
-  end
-end
-```
-
-Parent LiveView using the modal:
-
-```elixir
-def handle_event("open_reset_modal", %{"host" => host}, socket) do
-  send_update(ApiGatewayWeb.ConfirmModalComponent, id: "reset-circuit-modal", open: true)
-  {:noreply, assign(socket, pending_reset_host: host)}
-end
-
-def handle_info({:modal_confirmed, "reset-circuit-modal"}, socket) do
-  :ets.delete(:circuit_breaker, socket.assigns.pending_reset_host)
-  {:noreply, assign(socket, pending_reset_host: nil)}
-end
-
-def handle_info({:modal_closed, _}, socket) do
-  {:noreply, assign(socket, pending_reset_host: nil)}
-end
-```
-
-```heex
-<.live_component module={ApiGatewayWeb.ConfirmModalComponent}
-                 id="reset-circuit-modal"
-                 title="Reset circuit breaker">
-  <p>This will immediately allow traffic to the service again.
-     Make sure the service is healthy before resetting.</p>
-</.live_component>
-```
-
-### Step 4: Tests
-
-```elixir
-# test/api_gateway_web/components/metrics_table_component_test.exs
-defmodule ApiGatewayWeb.MetricsTableComponentTest do
-  use ApiGatewayWeb.ConnCase
-  import Phoenix.LiveViewTest
-
-  alias ApiGatewayWeb.MetricsTableComponent
-
-  defmodule TestLive do
-    use ApiGatewayWeb, :live_view
-
-    @impl true
-    def mount(_params, _session, socket) do
-      rows = for i <- 1..20 do
-        %{client_id: "client-#{i}", path: "/api/test", status: 200, duration_ms: i * 10}
-      end
-      {:ok, assign(socket, rows: rows)}
-    end
-
-    @impl true
-    def render(assigns) do
-      ~H"""
-      <.live_component
-        module={ApiGatewayWeb.MetricsTableComponent}
-        id="test-table"
-        rows={@rows}
-        columns={[
-          %{field: :client_id, label: "Client"},
-          %{field: :duration_ms, label: "Duration"}
-        ]}
-      />
-      """
-    end
-  end
-
-  test "renders table with first page" do
-    {:ok, view, html} = live_isolated(build_conn(), TestLive)
-    assert html =~ "client-1"
-    refute html =~ "client-16"
-  end
-
-  test "click column header sorts ascending then descending" do
-    {:ok, view, _html} = live_isolated(build_conn(), TestLive)
-
-    html = view |> element("th[phx-value-col=duration_ms]") |> render_click()
-    assert html =~ "↑"
-
-    html = view |> element("th[phx-value-col=duration_ms]") |> render_click()
-    assert html =~ "↓"
-  end
-
-  test "pagination shows page 2" do
-    {:ok, view, _html} = live_isolated(build_conn(), TestLive)
-
-    html = view |> element("button[phx-value-n='2']") |> render_click()
-    assert html =~ "client-16"
-  end
-end
-```
-
-### Step 5: Run the tests
+### Step 1: Create the project
 
 ```bash
-mix test test/api_gateway_web/components/ --trace
+mix phx.new live_components --no-ecto --no-mailer
+cd live_components
+```
+
+### Step 2: The cart domain — `lib/live_components/cart.ex`
+
+```elixir
+defmodule LiveComponents.Cart do
+  @moduledoc "In-memory cart for the exercise. Not thread-safe; per-LV state."
+
+  @type line_item :: %{id: String.t(), name: String.t(), price: Decimal.t(), qty: pos_integer()}
+
+  @spec seed() :: [line_item()]
+  def seed do
+    [
+      %{id: "sku-1", name: "T-shirt", price: Decimal.new("19.90"), qty: 1},
+      %{id: "sku-2", name: "Mug", price: Decimal.new("9.50"), qty: 2},
+      %{id: "sku-3", name: "Sticker pack", price: Decimal.new("4.00"), qty: 3}
+    ]
+  end
+
+  @spec total([line_item()]) :: Decimal.t()
+  def total(items) do
+    Enum.reduce(items, Decimal.new(0), fn %{price: p, qty: q}, acc ->
+      Decimal.add(acc, Decimal.mult(p, q))
+    end)
+  end
+
+  @spec set_qty([line_item()], String.t(), pos_integer()) :: [line_item()]
+  def set_qty(items, id, qty) when qty >= 1 do
+    Enum.map(items, fn
+      %{id: ^id} = item -> %{item | qty: qty}
+      item -> item
+    end)
+  end
+
+  @spec remove([line_item()], String.t()) :: [line_item()]
+  def remove(items, id), do: Enum.reject(items, &(&1.id == id))
+end
+```
+
+### Step 3: Function components — `lib/live_components_web/components/core_components.ex`
+
+```elixir
+defmodule LiveComponentsWeb.CoreComponents do
+  @moduledoc "Design-system atoms. Pure render helpers, no LiveView state."
+  use Phoenix.Component
+
+  attr :kind, :atom, values: [:primary, :secondary, :danger], default: :primary
+  attr :rest, :global, include: ~w(phx-click phx-target disabled type)
+  slot :inner_block, required: true
+
+  def button(assigns) do
+    ~H"""
+    <button class={"btn btn-#{@kind}"} {@rest}>
+      {render_slot(@inner_block)}
+    </button>
+    """
+  end
+
+  attr :label, :string, required: true
+  attr :value, :any, required: true
+
+  def card(assigns) do
+    ~H"""
+    <div class="card">
+      <div class="card-label">{@label}</div>
+      <div class="card-value">{@value}</div>
+    </div>
+    """
+  end
+end
+```
+
+### Step 4: Stateful LiveComponent — `lib/live_components_web/live_components/line_item_component.ex`
+
+```elixir
+defmodule LiveComponentsWeb.LineItemComponent do
+  @moduledoc """
+  Stateful LiveComponent. Owns the "confirm removal" modal visibility.
+
+  Emits `{:remove, item_id}` and `{:set_qty, item_id, qty}` up to the parent
+  via `send/2`. Quantity changes are local until the user confirms, at which
+  point we notify the parent — this is the "draft state" pattern.
+  """
+  use Phoenix.LiveComponent
+
+  import LiveComponentsWeb.CoreComponents
+
+  @impl true
+  def mount(socket) do
+    {:ok, assign(socket, confirm_open?: false)}
+  end
+
+  @impl true
+  def update(%{item: item} = assigns, socket) do
+    {:ok,
+     socket
+     |> assign(assigns)
+     |> assign(:draft_qty, item.qty)}
+  end
+
+  @impl true
+  def handle_event("inc", _, socket) do
+    {:noreply, assign(socket, draft_qty: socket.assigns.draft_qty + 1)}
+  end
+
+  @impl true
+  def handle_event("dec", _, socket) do
+    {:noreply, assign(socket, draft_qty: max(1, socket.assigns.draft_qty - 1))}
+  end
+
+  @impl true
+  def handle_event("commit_qty", _, socket) do
+    send(self(), {:set_qty, socket.assigns.item.id, socket.assigns.draft_qty})
+    {:noreply, socket}
+  end
+
+  @impl true
+  def handle_event("open_confirm", _, socket) do
+    {:noreply, assign(socket, confirm_open?: true)}
+  end
+
+  @impl true
+  def handle_event("cancel_confirm", _, socket) do
+    {:noreply, assign(socket, confirm_open?: false)}
+  end
+
+  @impl true
+  def handle_event("confirm_remove", _, socket) do
+    send(self(), {:remove, socket.assigns.item.id})
+    {:noreply, assign(socket, confirm_open?: false)}
+  end
+
+  @impl true
+  def render(assigns) do
+    ~H"""
+    <div class="line-item" id={"li-#{@item.id}"}>
+      <span class="name">{@item.name}</span>
+      <span class="price">${Decimal.to_string(@item.price)}</span>
+      <div class="qty">
+        <.button kind={:secondary} phx-click="dec" phx-target={@myself}>-</.button>
+        <span class="qty-value">{@draft_qty}</span>
+        <.button kind={:secondary} phx-click="inc" phx-target={@myself}>+</.button>
+        <.button
+          :if={@draft_qty != @item.qty}
+          kind={:primary}
+          phx-click="commit_qty"
+          phx-target={@myself}
+        >
+          Update
+        </.button>
+      </div>
+      <.button kind={:danger} phx-click="open_confirm" phx-target={@myself}>Remove</.button>
+
+      <div :if={@confirm_open?} class="modal" role="dialog">
+        <p>Remove {@item.name} from cart?</p>
+        <.button kind={:danger} phx-click="confirm_remove" phx-target={@myself}>Yes</.button>
+        <.button kind={:secondary} phx-click="cancel_confirm" phx-target={@myself}>Cancel</.button>
+      </div>
+    </div>
+    """
+  end
+end
+```
+
+### Step 5: Stateless LiveComponent — `lib/live_components_web/live_components/summary_component.ex`
+
+```elixir
+defmodule LiveComponentsWeb.SummaryComponent do
+  @moduledoc """
+  Stateless — no own state, no id required for identity purposes.
+  Gets `items` from parent, derives total on every render.
+  """
+  use Phoenix.LiveComponent
+
+  alias LiveComponents.Cart
+
+  @impl true
+  def render(assigns) do
+    assigns = assign(assigns, :total, Cart.total(assigns.items))
+
+    ~H"""
+    <div class="summary">
+      <span>Items: {length(@items)}</span>
+      <span>Total: ${Decimal.to_string(@total)}</span>
+    </div>
+    """
+  end
+end
+```
+
+### Step 6: Parent LiveView — `lib/live_components_web/live/cart_live.ex`
+
+```elixir
+defmodule LiveComponentsWeb.CartLive do
+  use LiveComponentsWeb, :live_view
+
+  alias LiveComponents.Cart
+  alias LiveComponentsWeb.{LineItemComponent, SummaryComponent}
+
+  @impl true
+  def mount(_params, _session, socket) do
+    {:ok, assign(socket, items: Cart.seed())}
+  end
+
+  @impl true
+  def handle_info({:set_qty, id, qty}, socket) do
+    {:noreply, assign(socket, items: Cart.set_qty(socket.assigns.items, id, qty))}
+  end
+
+  @impl true
+  def handle_info({:remove, id}, socket) do
+    {:noreply, assign(socket, items: Cart.remove(socket.assigns.items, id))}
+  end
+
+  @impl true
+  def render(assigns) do
+    ~H"""
+    <div class="cart">
+      <h1>Cart</h1>
+      <.live_component
+        :for={item <- @items}
+        module={LineItemComponent}
+        id={"line-#{item.id}"}
+        item={item}
+      />
+      <.live_component module={SummaryComponent} id="summary" items={@items} />
+    </div>
+    """
+  end
+end
+```
+
+### Step 7: Tests — `test/live_components_web/live/cart_live_test.exs`
+
+```elixir
+defmodule LiveComponentsWeb.CartLiveTest do
+  use LiveComponentsWeb.ConnCase, async: true
+  import Phoenix.LiveViewTest
+
+  describe "line item stepper" do
+    test "increments draft qty without contacting parent until commit", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/cart")
+
+      view
+      |> element("#li-sku-1 button", "+")
+      |> render_click()
+
+      # Draft bumped from 1 to 2 locally; summary still shows 1*19.90 + 2*9.50 + 3*4.00
+      assert render(view) =~ "Total: $50.9"
+      # Commit
+      view |> element("#li-sku-1 button", "Update") |> render_click()
+      assert render(view) =~ "Total: $70.8"
+    end
+  end
+
+  describe "remove confirmation modal" do
+    test "opens, cancels, then confirms", %{conn: conn} do
+      {:ok, view, _html} = live(conn, "/cart")
+
+      view |> element("#li-sku-2 button", "Remove") |> render_click()
+      assert render(view) =~ "Remove Mug from cart?"
+
+      view |> element("#li-sku-2 button", "Cancel") |> render_click()
+      refute render(view) =~ "Remove Mug from cart?"
+
+      view |> element("#li-sku-2 button", "Remove") |> render_click()
+      view |> element("#li-sku-2 button", "Yes") |> render_click()
+
+      refute render(view) =~ "Mug"
+    end
+  end
+end
+```
+
+```bash
+mix test
 ```
 
 ---
 
-## Trade-off analysis
+## Trade-offs and production gotchas
 
-| Aspect | LiveComponent | LiveView (separate route) | Function component |
-|--------|--------------|--------------------------|-------------------|
-| Own state | yes | yes | no |
-| Own route | no | yes | no |
-| Process isolation | no (shares parent process) | yes (own process) | no |
-| Event routing | phx-target={@myself} | automatic | no events |
-| Inter-component comm | send/send_update | PubSub | n/a |
-| Re-render scope | component subtree | full LiveView | parent decides |
+**1. Stateful LCs share the parent's process**
+They are not GenServers. A long computation in `handle_event/3` blocks the
+entire LiveView (and every other component on the page). Offload with
+`Task.async/1` or `assign_async/3` (exercise 216), never with blocking work.
 
----
+**2. The `:id` must be stable and unique**
+Reusing the same id for two different renders merges the state; generating
+a new id every render throws away the state. Derive from domain (`"line-#{item.id}"`).
+A UUID per render is the classic anti-pattern.
 
-## Common production mistakes
+**3. Event routing ambiguity**
+Forgetting `phx-target={@myself}` silently routes the event to the parent.
+The parent's `handle_event/3` then fails to pattern-match and crashes with
+`FunctionClauseError`. Make parent `handle_event/3` deliberate about which
+events it owns; let component events stay in components.
 
-**1. Omitting `phx-target={@myself}` on interactive elements**
-Without `phx-target`, events bubble to the parent LiveView. The LiveView has no
-`handle_event("sort", ...)` -- the event is silently ignored or crashes.
+**4. `update/2` vs. `mount/1` for derived state**
+Put initialization that doesn't depend on parent assigns in `mount/1`. Put
+derivations (like `draft_qty = item.qty`) in `update/2` so they refresh
+whenever the parent passes a new item. Don't put them only in `mount/1` — a
+new parent-driven update will not refresh them.
 
-**2. Using `assign_new/3` for data the parent controls**
-`assign_new/3` only assigns if the key is absent. If the parent passes new `rows` and
-the component uses `assign_new(:rows, fn -> rows end)`, the component never sees updates.
-Use `assign(socket, assigns)` for parent-controlled data.
+**5. Don't over-componentize**
+Every LiveComponent has a change-tracking cost. Three LCs inside a LiveView
+is fine. Three hundred is not. If a table has 500 rows and each row is a
+stateful LC, you've built 500 change trackers. Prefer function components
+for rows when there's no per-row state; reserve LCs for the rare case where
+a row owns local state (e.g., inline edit).
 
-**3. IDs that are not unique per instance**
-If two component instances both have `id="table"`, Phoenix maps their events to the same
-state. Always use IDs that are unique per page: `id={"table-#{@context}"}`.
+**6. `send(self(), msg)` vs. `{:noreply, push_patch(socket, ...)}`**
+The component communicates with the parent process via `send`. This works
+because LCs share the parent's pid. It does NOT work across processes — don't
+confuse this with distributed messaging.
 
-**4. `self()` confusion**
-Inside a LiveComponent, `self()` is the parent LiveView's PID. `send(self(), msg)`
-correctly reaches `handle_info` in the parent. You cannot send a message to just the
-component -- components share their parent's process.
+**7. Tests must target the right element**
+`element("#li-sku-1 button", "+")` is specific. Using `element("button", "+")`
+without a scope hits every `+` button on the page and fails non-deterministically
+once you add more items. Always scope by a stable id.
 
-**5. Expensive computation in `render/1`**
-`render/1` is called after every assign change. Sorting a list of 10,000 rows in `render/1`
-runs on every diff. Move computation to `update/2` or event handlers, store the result
-as an assign, and read it in `render/1`.
+**8. When NOT to use this pattern**
+For a design system published across products, function components are the
+right boundary — they have no runtime dependency on LiveView. If your consumers
+include a regular Phoenix controller view, stateless LCs won't work there.
+Keep the atoms (buttons, inputs) as `Phoenix.Component`s, not LCs.
 
 ---
 
 ## Resources
 
-- [Phoenix LiveComponent docs](https://hexdocs.pm/phoenix_live_view/Phoenix.LiveComponent.html) -- lifecycle and communication
-- [`send_update/3`](https://hexdocs.pm/phoenix_live_view/Phoenix.LiveView.html#send_update/3) -- parent-to-component communication
-- [LiveView JS commands](https://hexdocs.pm/phoenix_live_view/Phoenix.LiveView.JS.html) -- client-side transitions
-- [Phoenix.LiveViewTest -- `live_isolated/3`](https://hexdocs.pm/phoenix_live_view/Phoenix.LiveViewTest.html#live_isolated/3) -- testing components in isolation
+- [`Phoenix.LiveComponent`](https://hexdocs.pm/phoenix_live_view/Phoenix.LiveComponent.html) — lifecycle and examples
+- [`Phoenix.Component`](https://hexdocs.pm/phoenix_live_view/Phoenix.Component.html) — function component API
+- [LiveView — Assigns and HEEx](https://hexdocs.pm/phoenix_live_view/assigns-eex.html)
+- [José Valim — LiveView 0.17 change-tracking](https://dashbit.co/blog/phoenix-live-view-0-17)
+- [Phoenix core_components source](https://github.com/phoenixframework/phoenix/blob/main/priv/templates/phx.new/lib/app_name_web/components/core_components.ex) — a reference for function-component style

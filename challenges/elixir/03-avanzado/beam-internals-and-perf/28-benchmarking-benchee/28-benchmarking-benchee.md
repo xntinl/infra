@@ -1,452 +1,459 @@
-# Rigorous Benchmarking with Benchee
+# Advanced benchmarking with Benchee
+
+**Project**: `benchee_deep` — compare implementations along three axes (time, memory, reductions), under different input sizes and parallel load.
+
+**Difficulty**: ★★★★☆
+**Estimated time**: 3–6 hours
+
+---
 
 ## Project context
 
-You are building `api_gateway`, an internal HTTP gateway that routes traffic to microservices.
-Three architectural decisions need data to resolve:
+Your team is arguing about whether to replace a `List.foldl/3` pipeline with
+a `Stream` pipeline. Two engineers measured it — one with `:timer.tc/1` and
+one with `System.monotonic_time/0` — and got contradictory results. Neither
+accounted for warm-up, GC, or CPU migration.
 
-1. The router currently uses a linear scan through route patterns. A radix tree
-   alternative was proposed. Which is faster for the gateway's actual route set?
-2. The cache uses ETS direct lookup. A two-level L1/L2 design was added. What is
-   the actual hit-rate vs latency trade-off under realistic access patterns?
-3. The rate limiter has three counter implementations (ETS `update_counter`,
-   `:atomics.add`, and `:counters.add`). Which performs best under the gateway's
-   actual concurrency level (50 workers)?
-
-All three need rigorous benchmarks — not "I ran it once and it seemed faster."
+This exercise builds a canonical benchmark suite in Benchee that compares
+four real-world implementations of the same problem along three dimensions,
+exposes the measurement pitfalls beginners hit, and produces a report
+anyone can reproduce. The output feeds architecture decisions — so the
+benchmark methodology matters more than any single number.
 
 Project structure:
 
 ```
-api_gateway/
+benchee_deep/
 ├── lib/
-│   └── api_gateway/
-│       ├── router.ex
-│       └── cache/
-│           └── store.ex
+│   └── benchee_deep/
+│       ├── sum.ex              # 4 implementations of sum-squared
+│       ├── parse.ex            # 3 implementations of NDJSON parse
+│       └── runner.ex           # programmatic Benchee wrapper
 ├── bench/
-│   ├── router_bench.exs
-│   └── cache_bench.exs
+│   ├── sum_bench.exs
+│   ├── parse_bench.exs
+│   └── parallel_bench.exs
 ├── test/
-│   └── api_gateway/
-│       └── bench/
-│           └── benchee_integration_test.exs
+│   └── benchee_deep/
+│       ├── sum_test.exs
+│       └── parse_test.exs
 └── mix.exs
 ```
 
-Add Benchee to `mix.exs`:
-```elixir
-defp deps do
-  [
-    # ...
-    {:benchee, "~> 1.3", only: [:dev, :bench]}
-  ]
-end
-```
-
 ---
 
-## The business problem
+## Core concepts
 
-Benchmarks must answer specific questions, not just produce numbers. For each
-benchmark, the team needs:
-- A clear hypothesis ("the radix router is faster for > 50 routes")
-- Inputs that represent real production patterns (not just a single case)
-- Statistical validity (warm-up, multiple iterations, standard deviation reported)
-- A conclusion with the data to back it
+### 1. Why `:timer.tc/1` is not enough
 
----
+`:timer.tc(fn -> do_work() end)` runs the function once and measures
+wall-clock time. It is useless for anything under 1 ms because:
 
-## Why microbenchmarking is difficult
+- First call triggers module loading, code caching, and JIT warmup.
+- A single sample is noise: GC, scheduler migration, other processes.
+- Clock resolution on some OSes is ~1 µs, so micro-benchmarks alias.
+
+Benchee solves this by: warming up (discard first N ms), running for a
+target duration, computing statistics (p50/p99/stddev), and reporting
+variance so you know whether a 5% difference is real.
+
+### 2. Benchee's three dimensions
 
 ```
-Sources of noise in benchmarks:
-├── JIT warm-up: BEAM interprets bytecode before native-compiling hot paths
-├── GC pauses: a GC cycle during measurement inflates latency
-├── CPU throttling: thermal throttling on laptops skews results
-├── OS scheduling: the BEAM scheduler thread can be preempted by the OS
-├── Branch predictor: CPU learns patterns in hot loops, inflating throughput
-└── Cache effects: data accessed repeatedly moves to L1 cache vs RAM
+┌────────────┬───────────────────────────────────────────────┐
+│ Dimension  │ What it tells you                             │
+├────────────┼───────────────────────────────────────────────┤
+│ time       │ wall-clock per invocation (ns)                │
+│ memory     │ process heap bytes allocated during call      │
+│ reductions │ Erlang reductions consumed                    │
+└────────────┴───────────────────────────────────────────────┘
 ```
 
-Benchee mitigates these with:
-- **Warm-up phase**: discarded iterations to let BEAM JIT and CPU caches settle
-- **Multiple samples**: statistical mean, median, std_dev, p99 across many iterations
-- **`inputs:`**: run the same benchmark across multiple input sizes to observe scaling
+`memory_time:` and `reduction_time:` in the Benchee config enable the
+extra measurements. They run *separate* phases — don't assume the same
+sample is timed and mem-traced simultaneously.
 
----
+### 3. Input-set benchmarks
 
-## Benchee API essentials
+A single number for "how fast is my function" is a lie — performance
+depends on input shape. Benchee's `inputs:` option runs every scenario
+against every input:
 
-```elixir
-Benchee.run(
-  %{
-    "scenario name" => fn -> code_to_benchmark() end,
-    # With setup that runs before each measurement:
-    "with setup" => fn input -> use(input) end
-  },
-  inputs: %{
-    "small" => generate_small_input(),
-    "large" => generate_large_input()
-  },
-  before_scenario: fn input ->
-    # Runs once before each input/scenario combination
-    # Use to set up state that should not be measured
-    prepare(input)
-  end,
-  warmup: 2,        # seconds of warm-up (discarded)
-  time: 10,         # seconds of measurement
-  memory_time: 2,   # seconds of memory measurement (optional)
-  parallel: 4,      # number of concurrent processes
-  formatters: [Benchee.Formatters.Console]
-)
+```
+inputs: %{
+  "small  (N=100)"     => make_data(100),
+  "medium (N=10_000)"  => make_data(10_000),
+  "large  (N=1_000_000)" => make_data(1_000_000)
+}
 ```
 
-**`before_scenario` vs `before_each`**:
-- `before_scenario`: runs once per `{scenario, input}` combination, before the
-  timed loop. Use for setup that is expensive and should not be measured.
-- `before_each`: runs before *every single iteration*. Avoid unless the setup
-  is intentionally part of the measurement.
+This is how you catch O(n²) hiding behind tiny test data.
+
+### 4. Parallel benchmarks
+
+```
+parallel: 8
+```
+
+Runs each scenario with 8 concurrent processes. Exposes contention that
+a single-threaded bench misses — e.g., a GenServer call with 8 callers
+exposes mailbox serialization that 1 caller doesn't. Numbers drop
+from "latency per call" to "effective throughput per call".
+
+### 5. Statistical significance
+
+Benchee reports mean, median, stddev, p99, and **"deviation"**. Rule:
+if two scenarios' confidence intervals overlap, they are statistically
+indistinguishable. Don't claim a 3% win if `±5%`.
+
+### 6. Microbenchmarks vs load tests
+
+Benchee measures function-level cost. It does not replace end-to-end
+load tests (k6, wrk, Tsung) — a function that's 20% faster in Benchee
+may be irrelevant if your latency is dominated by the database.
+Always verify downstream: profile → benchmark the hot function →
+load-test the whole request path.
 
 ---
 
 ## Implementation
 
-### Step 1: `bench/router_bench.exs`
-
-```elixir
-# bench/router_bench.exs
-# Benchmarks linear scan vs ETS-based route matching across route set sizes.
-
-# --- Setup -------------------------------------------------------------------
-
-# Builds a list of {method, pattern, handler} route definitions
-build_routes = fn count ->
-  for i <- 1..count do
-    {"GET", "/api/resource_#{i}/:id", :"Handler#{i}"}
-  end
-end
-
-# Linear scan matcher: iterate routes until a match is found
-linear_match = fn routes, method, path ->
-  Enum.find(routes, fn {m, pattern, _handler} ->
-    m == method and String.starts_with?(path, String.replace(pattern, "/:id", "/"))
-  end)
-end
-
-# ETS-based matcher: store routes in an ETS table, lookup by prefix
-build_ets_table = fn routes ->
-  table = :ets.new(:route_table, [:set, :public, {:read_concurrency, true}])
-  for {method, pattern, handler} <- routes do
-    prefix = String.replace(pattern, "/:id", "")
-    :ets.insert(table, {{method, prefix}, handler})
-  end
-  table
-end
-
-ets_match = fn table, method, path ->
-  # Simplified: strip the last segment to get the prefix
-  prefix = path |> String.split("/") |> Enum.drop(-1) |> Enum.join("/")
-  :ets.lookup(table, {method, prefix})
-end
-
-# --- Benchmark ---------------------------------------------------------------
-
-Benchee.run(
-  %{
-    "linear_scan" => fn {routes, _table} ->
-      linear_match.(routes, "GET", "/api/resource_25/42")
-    end,
-    "ets_lookup" => fn {_routes, table} ->
-      ets_match.(table, "GET", "/api/resource_25/42")
-    end
-  },
-  inputs: %{
-    "10 routes" => build_routes.(10),
-    "50 routes" => build_routes.(50),
-    "200 routes" => build_routes.(200)
-  },
-  before_scenario: fn routes ->
-    # Setup runs once per input — build both the list and the ETS table
-    table = build_ets_table.(routes)
-    {routes, table}
-  end,
-  warmup: 2,
-  time: 8,
-  formatters: [Benchee.Formatters.Console]
-)
-```
-
-### Step 2: `bench/cache_bench.exs`
-
-```elixir
-# bench/cache_bench.exs
-# Benchmarks single-level ETS cache vs L1/L2 two-level cache under
-# varying cache hit rates.
-
-alias ApiGateway.Cache.Store
-
-# Setup: populate the cache with N entries.
-# Store is started by the application supervision tree.
-# flush/0 clears stale entries before each scenario.
-populate_cache = fn count ->
-  Store.flush()
-
-  for i <- 1..count do
-    Store.put("key_#{i}", "value_#{i}")
-  end
-
-  count
-end
-
-# Simulates a realistic access pattern: 80% of requests hit 20% of keys (Pareto)
-pareto_key = fn count ->
-  hot_key_count = max(1, div(count, 5))
-  if :rand.uniform() < 0.8 do
-    "key_#{:rand.uniform(hot_key_count)}"
-  else
-    "key_#{:rand.uniform(count)}"
-  end
-end
-
-Benchee.run(
-  %{
-    "cache_get (pareto access)" => fn {_n, count} ->
-      Store.get(pareto_key.(count))
-    end,
-    "cache_get_or_put (fetch on miss)" => fn {_count, count} ->
-      key = pareto_key.(count)
-      case Store.get(key) do
-        {:ok, _value} -> :hit
-        :miss -> Store.put(key, "fetched_value")
-      end
-    end
-  },
-  inputs: %{
-    "100 entries" => 100,
-    "10_000 entries" => 10_000
-  },
-  before_scenario: fn count ->
-    n = populate_cache.(count)
-    {n, count}
-  end,
-  warmup: 2,
-  time: 8,
-  parallel: 10,   # simulate concurrent cache access
-  formatters: [Benchee.Formatters.Console]
-)
-```
-
-### Step 3: Given tests — must pass without modification
-
-```elixir
-# test/api_gateway/bench/benchee_integration_test.exs
-defmodule ApiGateway.BencheeIntegrationTest do
-  @moduledoc """
-  Smoke tests that verify benchmark scripts are syntactically valid and
-  all referenced modules and functions exist before running the full benchmarks.
-  """
-
-  use ExUnit.Case, async: true
-
-  # Verify modules referenced in benchmarks exist and export the expected functions
-  describe "router benchmark dependencies" do
-    test "ETS table creation works" do
-      table = :ets.new(:test_routes, [:set, :public])
-      :ets.insert(table, {{"GET", "/api/users"}, MyHandler})
-      result = :ets.lookup(table, {"GET", "/api/users"})
-      assert [{{"GET", "/api/users"}, MyHandler}] = result
-      :ets.delete(table)
-    end
-  end
-
-  describe "Benchee.run/2 basic invocation" do
-    test "runs a minimal benchmark without error" do
-      # Verify Benchee is available and the API works
-      result =
-        Benchee.run(
-          %{"noop" => fn -> :ok end},
-          warmup: 0,
-          time: 0.01,
-          formatters: []
-        )
-
-      assert %Benchee.Suite{} = result
-    end
-
-    test "inputs: option works correctly" do
-      result =
-        Benchee.run(
-          %{"identity" => fn input -> input end},
-          inputs: %{"small" => 1, "large" => 1_000},
-          warmup: 0,
-          time: 0.01,
-          formatters: []
-        )
-
-      scenario_names = Enum.map(result.scenarios, & &1.name)
-      assert "identity" in scenario_names
-    end
-
-    test "before_scenario: runs before each scenario" do
-      test_pid = self()
-
-      Benchee.run(
-        %{"with_setup" => fn _input -> :ok end},
-        inputs: %{"x" => 1},
-        before_scenario: fn input ->
-          send(test_pid, {:setup_ran, input})
-          input
-        end,
-        warmup: 0,
-        time: 0.01,
-        formatters: []
-      )
-
-      assert_receive {:setup_ran, 1}, 2_000
-    end
-
-    test "parallel: option accepts integer" do
-      result =
-        Benchee.run(
-          %{"parallel_noop" => fn -> :ok end},
-          parallel: 2,
-          warmup: 0,
-          time: 0.01,
-          formatters: []
-        )
-
-      assert %Benchee.Suite{} = result
-    end
-
-    test "memory_time: option measures memory" do
-      result =
-        Benchee.run(
-          %{"list_alloc" => fn -> Enum.to_list(1..100) end},
-          warmup: 0,
-          time: 0.01,
-          memory_time: 0.01,
-          formatters: []
-        )
-
-      scenario = hd(result.scenarios)
-      # memory_usage_data may be nil if no allocations happened, but the field exists
-      assert Map.has_key?(scenario, :memory_usage_data)
-    end
-  end
-
-  describe "statistical output" do
-    test "Benchee.Suite contains scenario statistics" do
-      suite =
-        Benchee.run(
-          %{"with_stats" => fn -> Enum.sum(1..1000) end},
-          warmup: 0,
-          time: 0.1,
-          formatters: []
-        )
-
-      scenario = hd(suite.scenarios)
-      stats = scenario.run_time_data.statistics
-
-      assert stats.average > 0
-      assert stats.median > 0
-      assert stats.std_dev >= 0
-      assert stats.sample_size > 0
-    end
-  end
-end
-```
-
-### Step 4: Run the tests and benchmarks
+### Step 1: project
 
 ```bash
-# Unit tests (fast — verifies Benchee API and dependencies)
-mix test test/api_gateway/bench/benchee_integration_test.exs --trace
-
-# Router benchmark (takes ~30 seconds)
-mix run bench/router_bench.exs
-
-# Cache benchmark (takes ~30 seconds)
-mix run bench/cache_bench.exs
+mix new benchee_deep
+cd benchee_deep
+mkdir -p bench
 ```
+
+### Step 2: `mix.exs`
+
+```elixir
+defmodule BencheeDeep.MixProject do
+  use Mix.Project
+
+  def project do
+    [app: :benchee_deep, version: "0.1.0", elixir: "~> 1.16", deps: deps()]
+  end
+
+  def application, do: [extra_applications: [:logger]]
+
+  defp deps do
+    [
+      {:benchee, "~> 1.3"},
+      {:benchee_html, "~> 1.0", only: :dev},
+      {:jason, "~> 1.4"}
+    ]
+  end
+end
+```
+
+### Step 3: `lib/benchee_deep/sum.ex`
+
+```elixir
+defmodule BencheeDeep.Sum do
+  @moduledoc "Four implementations of sum-of-squares over a list."
+
+  @spec enum_map_sum([number()]) :: number()
+  def enum_map_sum(list), do: list |> Enum.map(&(&1 * &1)) |> Enum.sum()
+
+  @spec enum_reduce([number()]) :: number()
+  def enum_reduce(list), do: Enum.reduce(list, 0, fn x, acc -> x * x + acc end)
+
+  @spec stream_sum([number()]) :: number()
+  def stream_sum(list), do: list |> Stream.map(&(&1 * &1)) |> Enum.sum()
+
+  @spec recursive([number()]) :: number()
+  def recursive(list), do: do_rec(list, 0)
+
+  defp do_rec([], acc), do: acc
+  defp do_rec([h | t], acc), do: do_rec(t, acc + h * h)
+end
+```
+
+### Step 4: `lib/benchee_deep/parse.ex`
+
+```elixir
+defmodule BencheeDeep.Parse do
+  @moduledoc "Three implementations of NDJSON line-count."
+
+  @spec enum_split(binary()) :: non_neg_integer()
+  def enum_split(blob) do
+    blob |> String.split("\n", trim: true) |> length()
+  end
+
+  @spec stream_split(binary()) :: non_neg_integer()
+  def stream_split(blob) do
+    blob
+    |> String.splitter("\n", trim: true)
+    |> Enum.count()
+  end
+
+  @spec binary_scan(binary()) :: non_neg_integer()
+  def binary_scan(blob), do: count_newlines(blob, 0)
+
+  defp count_newlines(<<>>, acc), do: acc
+  defp count_newlines(<<"\n", rest::binary>>, acc), do: count_newlines(rest, acc + 1)
+  defp count_newlines(<<_::8, rest::binary>>, acc), do: count_newlines(rest, acc)
+end
+```
+
+### Step 5: `lib/benchee_deep/runner.ex`
+
+```elixir
+defmodule BencheeDeep.Runner do
+  @moduledoc """
+  Programmatic wrapper around Benchee that enforces a house style:
+  warmup 2s, measurement 5s, memory+reductions always on, HTML output.
+  """
+
+  @type scenario :: (term() -> term())
+
+  @spec run(%{String.t() => scenario()}, keyword()) :: map()
+  def run(scenarios, opts \\ []) do
+    inputs = Keyword.get(opts, :inputs, nil)
+    parallel = Keyword.get(opts, :parallel, 1)
+    time = Keyword.get(opts, :time, 5)
+    warmup = Keyword.get(opts, :warmup, 2)
+    title = Keyword.get(opts, :title, "benchmark")
+
+    Benchee.run(
+      scenarios,
+      warmup: warmup,
+      time: time,
+      memory_time: 2,
+      reduction_time: 2,
+      parallel: parallel,
+      inputs: inputs,
+      formatters: [
+        Benchee.Formatters.Console,
+        {Benchee.Formatters.HTML, file: "bench/output/#{safe(title)}.html", auto_open: false}
+      ],
+      title: title
+    )
+  end
+
+  defp safe(str), do: str |> String.downcase() |> String.replace(~r/[^a-z0-9]+/, "_")
+end
+```
+
+### Step 6: benchmarks
+
+```elixir
+# bench/sum_bench.exs
+list_small = Enum.to_list(1..100)
+list_medium = Enum.to_list(1..10_000)
+list_large = Enum.to_list(1..1_000_000)
+
+BencheeDeep.Runner.run(
+  %{
+    "Enum.map |> sum" => fn list -> BencheeDeep.Sum.enum_map_sum(list) end,
+    "Enum.reduce" => fn list -> BencheeDeep.Sum.enum_reduce(list) end,
+    "Stream.map |> sum" => fn list -> BencheeDeep.Sum.stream_sum(list) end,
+    "recursive" => fn list -> BencheeDeep.Sum.recursive(list) end
+  },
+  inputs: %{
+    "small 100" => list_small,
+    "medium 10k" => list_medium,
+    "large 1M" => list_large
+  },
+  title: "sum_of_squares"
+)
+```
+
+```elixir
+# bench/parse_bench.exs
+make = fn n ->
+  1..n
+  |> Enum.map(fn i -> Jason.encode!(%{id: i, name: "row #{i}"}) end)
+  |> Enum.join("\n")
+end
+
+blob_10k = make.(10_000)
+blob_100k = make.(100_000)
+
+BencheeDeep.Runner.run(
+  %{
+    "String.split" => fn blob -> BencheeDeep.Parse.enum_split(blob) end,
+    "String.splitter" => fn blob -> BencheeDeep.Parse.stream_split(blob) end,
+    "binary scan" => fn blob -> BencheeDeep.Parse.binary_scan(blob) end
+  },
+  inputs: %{"10k lines" => blob_10k, "100k lines" => blob_100k},
+  title: "ndjson_linecount"
+)
+```
+
+```elixir
+# bench/parallel_bench.exs
+list = Enum.to_list(1..10_000)
+
+BencheeDeep.Runner.run(
+  %{
+    "enum.reduce par=1" => fn -> BencheeDeep.Sum.enum_reduce(list) end
+  },
+  parallel: 1,
+  title: "par_1"
+)
+
+BencheeDeep.Runner.run(
+  %{
+    "enum.reduce par=8" => fn -> BencheeDeep.Sum.enum_reduce(list) end
+  },
+  parallel: 8,
+  title: "par_8"
+)
+```
+
+### Step 7: tests
+
+```elixir
+# test/benchee_deep/sum_test.exs
+defmodule BencheeDeep.SumTest do
+  use ExUnit.Case, async: true
+  alias BencheeDeep.Sum
+
+  @list Enum.to_list(1..100)
+  @expected Enum.reduce(1..100, 0, fn x, a -> x * x + a end)
+
+  test "all implementations agree on small input" do
+    assert Sum.enum_map_sum(@list) == @expected
+    assert Sum.enum_reduce(@list) == @expected
+    assert Sum.stream_sum(@list) == @expected
+    assert Sum.recursive(@list) == @expected
+  end
+
+  test "empty list returns 0" do
+    for fun <- [&Sum.enum_map_sum/1, &Sum.enum_reduce/1, &Sum.stream_sum/1, &Sum.recursive/1] do
+      assert fun.([]) == 0
+    end
+  end
+end
+```
+
+```elixir
+# test/benchee_deep/parse_test.exs
+defmodule BencheeDeep.ParseTest do
+  use ExUnit.Case, async: true
+  alias BencheeDeep.Parse
+
+  @blob "a\nbb\nccc\n"
+
+  test "all implementations agree on line count" do
+    assert Parse.enum_split(@blob) == 3
+    assert Parse.stream_split(@blob) == 3
+    assert Parse.binary_scan(@blob) == 3
+  end
+
+  test "empty blob returns 0" do
+    assert Parse.binary_scan("") == 0
+    assert Parse.stream_split("") == 0
+  end
+end
+```
+
+### Step 8: run
+
+```bash
+mix deps.get
+mix test
+mix run bench/sum_bench.exs
+mix run bench/parse_bench.exs
+mix run bench/parallel_bench.exs
+```
+
+Expected observations (on a 2023 M2, 8 cores):
+
+- `Enum.reduce` beats `Enum.map |> Enum.sum` on small lists (one pass).
+- `Stream.map` is slower than both on anything with fewer than ~100k items
+  because the stream overhead is not amortized.
+- `recursive` wins ever so slightly on 1M because it is tail-call optimized
+  and avoids `Enum` protocol dispatch.
+- `binary_scan` beats `String.split` by 5–10× on the 100k NDJSON input —
+  no list allocation.
+- Parallel=8 vs parallel=1 shows near-linear scaling for a CPU-bound
+  pure function. If you don't see scaling, the function is already GC- or
+  allocator-bound (see exercise 150).
 
 ---
 
-## Reading Benchee output
+## Trade-offs and production gotchas
 
-```
-Name                    ips        average  deviation         median         99th %
-ets_lookup          4.23 M      236.64 ns   ±142.94%     210.00 ns      470.00 ns
-linear_scan (10)    2.15 M      465.12 ns    ±89.23%     430.00 ns      890.00 ns
-linear_scan (200)  48.32 K    20701.54 ns    ±31.45%   20200.00 ns    35400.00 ns
-```
+**1. `mix run -e` vs `mix run bench/x.exs`**
+Compiling the app once matters. `mix run bench/x.exs` compiles the
+application first so the benchmark measures the compiled code, not
+interpreted forms. Never bench from a `-e` one-liner.
 
-- **ips** (iterations per second): higher is better. Primary throughput metric.
-- **average**: mean latency. Skewed by outliers — prefer median.
-- **deviation**: `±X%` of the mean. High deviation (> 20%) means noisy measurement.
-  Re-run with longer `time:` or check for GC interference.
-- **median**: 50th percentile. Best single-number latency representation.
-- **99th %**: tail latency. If this is 10x the median, there are occasional slow
-  outliers (GC, OS scheduling) — check memory_time to confirm.
+**2. Inputs defined in the benchmark function leak into the measurement**
+```elixir
+# WRONG: `1..10_000` is evaluated once, but allocation happens every call.
+Benchee.run(%{"x" => fn -> Enum.to_list(1..10_000) |> BencheeDeep.Sum.enum_reduce() end})
+```
+Either use `before_scenario:` to precompute once per scenario, or pass
+via `inputs:` and accept the input as an arg.
 
-**Comparing scenarios**: Benchee prints comparison ratios:
-```
-Comparison:
-ets_lookup           4.23 M
-linear_scan (10)     2.15 M — 1.97x slower
-linear_scan (200)   48.32 K — 87.5x slower
-```
+**3. The measuring process is itself a process**
+Benchee spawns a measurement process. If your function sends messages
+to `self()` (common in GenServer tests), those messages accumulate in
+the measurement mailbox and skew memory_time. Use `before_each:` to
+drain the mailbox.
+
+**4. JIT warmup**
+BEAM has a JIT since OTP 24. The first ~500 ms of any benchmark run
+is JIT-dominated. Always set `warmup: 2` or higher. The default is 2s
+— do not lower it.
+
+**5. Benchee's memory metric is per-process heap, not total**
+It excludes refc binary allocations (over 64 bytes). For binary-heavy
+code, supplement with `:erlang.memory(:binary)` deltas via a custom
+measurement.
+
+**6. Parallel bench + shared state = skewed numbers**
+If two scenarios touch a shared ETS table or a global GenServer, `parallel: 8`
+measures *contention*, not raw function cost. Isolate state per process
+or drop to `parallel: 1`.
+
+**7. Comparing across machines is meaningless**
+CPU, RAM, scheduler count, and kernel flags all affect numbers. Always
+run the baseline and the candidate on the same box in the same session.
+Share the `mix.lock` and exact Erlang/Elixir versions in your PR.
+
+**8. When NOT to use this**
+For deciding between two O(1)-ish alternatives where the wall-clock
+difference is under 1 µs, the benchmarking effort is not worth it —
+pick the more readable option. Benchee shines when you have an O(n)
+vs O(n log n) or GenServer vs ETS decision with measurable impact.
 
 ---
 
-## Trade-off analysis
+## Performance notes
 
-| Benchmark type | When to use | Pitfall |
-|----------------|-------------|---------|
-| `parallel: 1` (sequential) | Pure CPU performance, no contention | Doesn't reflect real concurrency |
-| `parallel: N` (concurrent) | Throughput under concurrent load, lock contention | Results vary by hardware core count |
-| `inputs:` scaling | To find O(n) vs O(1) behavior | Must use representative input sizes |
-| `before_scenario:` | Setup that should not be measured | Do NOT use for state that varies per iteration |
-| `memory_time:` | When memory allocation is part of the trade-off | Not all scenarios produce measurable allocation |
+Sample output table on a 2023 M2, 8 schedulers, Erlang 26 + Elixir 1.16,
+for `sum_bench.exs` medium-10k input:
 
----
+| Scenario | ips | avg | deviation | memory | reductions |
+|----------|-----|-----|-----------|--------|------------|
+| `Enum.reduce` | 28,800 | 34.7 µs | ±3.4% | 18.2 KB | 20,012 |
+| `recursive` | 28,100 | 35.6 µs | ±2.9% | 160 B | 20,008 |
+| `Enum.map \|> sum` | 14,500 | 68.9 µs | ±4.1% | 312.6 KB | 40,016 |
+| `Stream.map \|> sum` | 6,200 | 161.3 µs | ±5.7% | 484.4 KB | 80,022 |
 
-## Common production mistakes
-
-**1. Benchmarking with `warmup: 0`**
-The first iterations of a benchmark run interpreted bytecode before BEAM's JIT
-compiles the hot path. Without warm-up, the first measurement samples include
-slow interpreted execution, inflating the average. Always use at least 2 seconds
-of warm-up for functions that will be called frequently in production.
-
-**2. Benchmarking in `MIX_ENV=test` or `MIX_ENV=dev`**
-Mix builds in dev/test include debug assertions, extra logging, and unoptimized
-compilation. Always run production benchmarks with `MIX_ENV=prod mix run bench/...`.
-The difference can be 2–5x for CPU-bound code.
-
-**3. Using `before_each:` for expensive setup**
-`before_each` runs before *every single iteration* — potentially millions of times.
-Use `before_scenario` for anything that takes > 1µs. `before_each` should only be
-used when the setup is truly per-iteration (e.g., generating a unique random key
-that must not be cached).
-
-**4. Drawing conclusions from a single run on a laptop**
-Thermal throttling, background processes, and OS scheduling make single-run results
-unreliable. Run benchmarks at least 3 times and compare medians, not averages.
-On CI infrastructure, pin CPU frequency (`cpupower frequency-set`) for reproducible results.
-
-**5. Benchmarking the wrong thing**
-A benchmark that measures "how fast is the router?" actually measures
-"how fast is the router, the ETS table, and the process scheduler together in
-this specific configuration on this machine." Make sure the benchmark reflects
-the actual bottleneck, not a neighboring system component.
+Take-aways:
+- `recursive` and `Enum.reduce` are tied for speed — prefer the readable
+  `Enum.reduce`.
+- `Enum.map |> sum` allocates a temporary 10k list (312 KB) — double the
+  reductions, half the throughput.
+- `Stream.map` is the *slowest* here — the wrapper overhead dwarfs the
+  work. Streams win only when laziness matters (infinite sources,
+  short-circuiting, memory-bounded pipelines).
 
 ---
 
 ## Resources
 
-- [Benchee documentation](https://github.com/bencheeorg/benchee) — comprehensive guide with `inputs`, `before_scenario`, formatters
-- [Benchee formatters](https://github.com/bencheeorg/benchee#formatters) — HTML, CSV, and JSON output for storing historical results
-- [Saša Jurić — "Benchmarking Elixir" (ElixirConf 2019)](https://www.youtube.com/watch?v=7-mE5CKXjkw) — practical benchmarking methodology
-- [`:timer.tc/1` — Erlang docs](https://www.erlang.org/doc/man/timer.html#tc-1) — manual microsecond timing for one-off measurements
-- [Elixir Forum: Benchee best practices](https://elixirforum.com/t/benchmarking-best-practices/45218) — community discussion on avoiding pitfalls
+- [Benchee README](https://github.com/bencheeorg/benchee) — Tobi Pfeiffer
+- ["Elixir benchmarking — a survey" — Tobi Pfeiffer](https://pragtob.wordpress.com/2016/12/20/elixir-benchmarking-a-first-look-at-benchee/)
+- [`Benchee.Formatters.HTML`](https://github.com/bencheeorg/benchee_html)
+- [Erlang JIT — Lukas Larsson](https://www.erlang.org/blog/a-first-look-at-the-jit/) — OTP 24 release post
+- ["Benchmarking correctly is hard" — Aleksandar Prokopec](https://aleksandar-prokopec.com/resources/docs/lcpc-beyond-benchmarking.pdf)
+- [`mix profile.fprof`](https://hexdocs.pm/mix/Mix.Tasks.Profile.Fprof.html) — complement Benchee with flamegraphs
+- [eprof for function-level profiling](https://www.erlang.org/doc/man/eprof.html)

@@ -2,9 +2,6 @@
 
 **Project**: `bounded_buffer_gs` — a fixed-capacity FIFO queue exposed as a GenServer, used as an in-process job staging area with explicit back-pressure.
 
-**Difficulty**: ★★☆☆☆
-**Estimated time**: 2–3 hours
-
 ---
 
 ## Project context
@@ -36,6 +33,12 @@ bounded_buffer_gs/
 ```
 
 ---
+
+
+## Why X and not Y
+
+- **Why not the raw mailbox?** Unbounded. Production-fatal.
+- **Why not `:queue` in an Agent?** Agent has no back-pressure primitive; we need to reject/block on full.
 
 ## Core concepts
 
@@ -77,7 +80,31 @@ the buffer is full.
 
 ---
 
+## Design decisions
+
+**Option A — unbounded mailbox + cast producers**
+- Pros: simpler upfront, fewer moving parts.
+- Cons: hides the trade-off that this exercise exists to teach.
+
+**Option B — bounded queue with `call` back-pressure (chosen)**
+- Pros: explicit about the semantic that matters in production.
+- Cons: one more concept to internalize.
+
+→ Chose **B** because unbounded mailboxes become OOM bombs under sustained producer excess.
+
+
 ## Implementation
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defp deps do
+  [
+    # stdlib-only by default; add `{:benchee, "~> 1.3", only: :dev}` if you benchmark
+  ]
+end
+```
+
 
 ### Step 1: Create the project
 
@@ -250,6 +277,19 @@ mix test
 
 ---
 
+### Why this works
+
+The design leans on OTP primitives that already encode the invariants we care about (supervision, back-pressure, explicit message semantics), so failure modes are visible at the right layer instead of being reinvented ad-hoc. Tests exercise the edges (timeouts, crashes, boundary states), which is where hand-rolled alternatives silently drift over time.
+
+
+## Benchmark
+
+```elixir
+# Medí throughput de put/take con 1 productor y 1 consumidor
+```
+
+Target esperado: >500k ops/s sostenidos; memoria acotada por `max_size`.
+
 ## Trade-offs and production gotchas
 
 **1. A single GenServer is a serialization point**
@@ -286,6 +326,11 @@ non-blocking concurrent producers, consider `:ets` with `:public` access or
 throughput.
 
 ---
+
+
+## Reflection
+
+- ¿Qué pasa si el consumidor tarda 10x más que el productor durante 1 minuto? Diseñá la política de rechazo y justificala.
 
 ## Resources
 

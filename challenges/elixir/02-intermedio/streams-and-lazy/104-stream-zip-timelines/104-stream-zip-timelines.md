@@ -4,9 +4,6 @@
 (timestamps from different sources) into aligned tuples, then merge them
 into a single chronologically-ordered timeline.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
-
 ---
 
 ## Project context
@@ -72,6 +69,20 @@ next element of each, pick the smallest, emit it, and advance that source.
 `Stream.unfold/2` with a state of `[{next_value, remaining_stream}, ...]`
 does this cleanly. This is a streaming k-way merge — the same algorithm
 used by external sort.
+
+---
+
+## Design decisions
+
+**Option A — Materialize all sources, sort once, emit**
+- Pros: one sort call; trivial to reason about; handles unsorted inputs.
+- Cons: breaks on large or infinite sources; peak memory = sum of all inputs.
+
+**Option B — Streaming k-way merge via `Stream.unfold/2` with peeked heads** (chosen)
+- Pros: O(k) memory for k sources; laziness preserved; terminates consumer can stop at any point.
+- Cons: requires sources to be pre-sorted; min-by-scan is O(k) per emit (fine up to ~20 sources).
+
+→ Chose **B** because most timestamped sources are already ordered by construction and we want to preserve laziness end-to-end.
 
 ---
 
@@ -251,7 +262,13 @@ end
 mix test
 ```
 
+### Why this works
+
+`Stream.zip` is an `Enumerable` that pulls one element from each source per emission and halts when any source reports `:done`. `merge_by_time/1` carries a list of peeked heads as unfold state; on each step it picks the head with the smallest timestamp, emits it, and refills that slot. Since peeks are one-deep per source, memory stays O(k) independent of total event count.
+
 ---
+
+<!-- benchmark N/A: performance dominated by source IO patterns, not the merge itself -->
 
 ## Trade-offs and production gotchas
 
@@ -294,6 +311,13 @@ accessor.
 - When each source is actually a live process emitting events, use
   `GenStage` with a dispatcher — `Stream.zip` is for pull-based
   enumerables, not push-based processes.
+
+---
+
+## Reflection
+
+- You must merge 500 timestamped Kafka partitions into a single ordered audit log. At what k do you replace the O(k) min-by-scan with a priority queue, and how do you decide the boundary experimentally?
+- What fails if one source is *almost* sorted (late events by up to 5 s) instead of strictly sorted? Sketch a bounded-disorder buffer that fixes it without materializing everything.
 
 ---
 

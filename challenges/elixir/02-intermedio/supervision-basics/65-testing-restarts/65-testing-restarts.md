@@ -2,9 +2,6 @@
 
 **Project**: `testing_restarts` — a worker with a small API and a full test suite that verifies crash → restart → recovery behavior without sleeps or flakiness.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
-
 ---
 
 ## Project context
@@ -34,6 +31,11 @@ testing_restarts/
 ```
 
 ---
+
+
+## Why X and not Y
+
+- **Why not integration tests only?** Restart logic needs targeted unit tests; integration tests rarely exercise the crash path cleanly.
 
 ## Core concepts
 
@@ -87,7 +89,31 @@ global name.
 
 ---
 
+## Design decisions
+
+**Option A — integration test at the app boundary**
+- Pros: simpler upfront, fewer moving parts.
+- Cons: hides the trade-off that this exercise exists to teach.
+
+**Option B — `start_supervised` + targeted crash assertions (chosen)**
+- Pros: explicit about the semantic that matters in production.
+- Cons: one more concept to internalize.
+
+→ Chose **B** because supervisor restart logic deserves unit-level coverage, not just happy-path integration.
+
+
 ## Implementation
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defp deps do
+  [
+    # stdlib-only by default; add `{:benchee, "~> 1.3", only: :dev}` if you benchmark
+  ]
+end
+```
+
 
 ### Step 1: Create the project
 
@@ -274,6 +300,15 @@ mix test
 
 ---
 
+### Why this works
+
+The design leans on OTP primitives that already encode the invariants we care about (supervision, back-pressure, explicit message semantics), so failure modes are visible at the right layer instead of being reinvented ad-hoc. Tests exercise the edges (timeouts, crashes, boundary states), which is where hand-rolled alternatives silently drift over time.
+
+
+## Benchmark
+
+<!-- benchmark N/A: tema conceptual -->
+
 ## Trade-offs and production gotchas
 
 **1. `Process.sleep/1` is almost always a test smell**
@@ -302,6 +337,11 @@ Restart semantics live in the supervision tree — test them ONCE per
 tree, not once per worker.
 
 ---
+
+
+## Reflection
+
+- ¿Cómo distinguís en un test si un child crasheó y reinició vs nunca crasheó? Dá el código.
 
 ## Resources
 

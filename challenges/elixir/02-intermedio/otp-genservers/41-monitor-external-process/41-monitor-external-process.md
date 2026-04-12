@@ -2,9 +2,6 @@
 
 **Project**: `external_monitor_gs` — a GenServer that watches a peer process and reacts to `:DOWN`.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
-
 ---
 
 ## Project context
@@ -36,6 +33,11 @@ external_monitor_gs/
 ```
 
 ---
+
+
+## Why X and not Y
+
+- **Why not `Process.link`?** Links are symmetric — you crash when they crash. Monitors are the right primitive for observing without coupling lifetimes.
 
 ## Core concepts
 
@@ -80,7 +82,31 @@ the standard shape.
 
 ---
 
+## Design decisions
+
+**Option A — link to the external process**
+- Pros: simpler upfront, fewer moving parts.
+- Cons: hides the trade-off that this exercise exists to teach.
+
+**Option B — monitor it (chosen)**
+- Pros: explicit about the semantic that matters in production.
+- Cons: one more concept to internalize.
+
+→ Chose **B** because links propagate exits; monitors let us observe without coupling lifetimes.
+
+
 ## Implementation
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defp deps do
+  [
+    # stdlib-only by default; add `{:benchee, "~> 1.3", only: :dev}` if you benchmark
+  ]
+end
+```
+
 
 ### Step 1: Create the project
 
@@ -318,6 +344,25 @@ mix test
 
 ---
 
+### Why this works
+
+The design leans on OTP primitives that already encode the invariants we care about (supervision, back-pressure, explicit message semantics), so failure modes are visible at the right layer instead of being reinvented ad-hoc. Tests exercise the edges (timeouts, crashes, boundary states), which is where hand-rolled alternatives silently drift over time.
+
+
+## Benchmark
+
+```elixir
+{us, _} = :timer.tc(fn ->
+  for _ <- 1..10_000 do
+    {:ok, pid} = Agent.start(fn -> nil end)
+    Process.monitor(pid)
+    Agent.stop(pid)
+  end
+end)
+```
+
+Target esperado: <50 µs por monitor+DOWN ciclo.
+
 ## Trade-offs and production gotchas
 
 **1. Monitors leak refs if you forget `demonitor`**
@@ -358,6 +403,11 @@ sharded storage and no single-GenServer bottleneck. Only build your
 own when you need per-entry business logic on DOWN.
 
 ---
+
+
+## Reflection
+
+- ¿Cuándo usarías `link` en lugar de `monitor`? Describí un caso donde cambiar de monitor a link mejoraría la arquitectura.
 
 ## Resources
 

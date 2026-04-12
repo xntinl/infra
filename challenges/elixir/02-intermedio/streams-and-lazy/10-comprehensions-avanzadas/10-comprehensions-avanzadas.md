@@ -3,9 +3,6 @@
 **Project**: `compr_advanced` — rebuild a small set of "what would be a nested
 loop in other languages" problems using a single Elixir `for` comprehension.
 
-**Difficulty**: ★★☆☆☆
-**Estimated time**: 1–2 hours
-
 ---
 
 ## Project context
@@ -85,6 +82,20 @@ for {k, v} <- pairs, into: %{}, do: {k, v}
 `:uniq: true` discards repeated *results* as they are produced — no need
 for a trailing `Enum.uniq/1`. It compares the final value (after `do:`),
 not the generator input.
+
+---
+
+## Design decisions
+
+**Option A — Pipeline of `Enum.map/flat_map/filter/uniq/into`**
+- Pros: every step has a name, easy to comment per-stage.
+- Cons: allocates an intermediate list at each stage; verbose for multi-generator combinations.
+
+**Option B — Single `for` comprehension with generators, filters, `:into`, `:uniq`** (chosen)
+- Pros: one expression, compiles to nested reduces, pattern-matching generators filter silently, `:into` targets any `Collectable`.
+- Cons: harder to debug mid-pipeline; strict (not lazy).
+
+→ Chose **B** because the exercise is specifically about the generator × filter × into model and how it collapses nested-loop patterns into one readable expression.
 
 ---
 
@@ -233,7 +244,13 @@ end
 mix test
 ```
 
+### Why this works
+
+`for` compiles to nested `Enum.reduce/3` calls: each generator becomes an outer reduce, each filter becomes a conditional inside, and `:into` wraps the final accumulator in the target `Collectable`. Pattern-matching generators simply skip non-matching values without raising. `:uniq: true` adds a set-based dedup check as results are produced, avoiding a trailing `Enum.uniq/1`.
+
 ---
+
+<!-- benchmark N/A: syntactic-sugar topic; the underlying reduce has the same perf as an explicit pipeline -->
 
 ## Trade-offs and production gotchas
 
@@ -267,6 +284,13 @@ a list result is often faster in practice because it uses bulk insert.
 - When each step would benefit from a name for readability → use a pipeline.
 - When you want early termination → `for` always walks every generator;
   use `Enum.reduce_while/3` or a `Stream.take_while/2`.
+
+---
+
+## Reflection
+
+- If you had to express a three-source join (users × orders × line_items) with filters on all three levels and an accumulator map keyed by `{user_id, order_id}`, would you keep a single `for`, or split into an explicit pipeline? Justify based on debuggability and allocation profile.
+- Pattern-matching generators silently drop non-matches. When is that dangerous, and how would you detect the drop statistically in a production data pipeline?
 
 ---
 

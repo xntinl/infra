@@ -2,9 +2,6 @@
 
 **Project**: `agent_vs_gs` — the same counter, implemented twice, so you can feel the ceiling of `Agent`.
 
-**Difficulty**: ★★☆☆☆
-**Estimated time**: 1–2 hours
-
 ---
 
 ## Project context
@@ -37,6 +34,11 @@ agent_vs_gs/
 ```
 
 ---
+
+
+## Why X and not Y
+
+- **Why not always GenServer?** For pure state, Agent's API is smaller and clearer — boilerplate matters for readability.
 
 ## Core concepts
 
@@ -91,7 +93,31 @@ and you won't feel the hurt unless you've used both.
 
 ---
 
+## Design decisions
+
+**Option A — Agent for everything with state**
+- Pros: simpler upfront, fewer moving parts.
+- Cons: hides the trade-off that this exercise exists to teach.
+
+**Option B — Agent only for pure state, GenServer for anything with logic (chosen)**
+- Pros: explicit about the semantic that matters in production.
+- Cons: one more concept to internalize.
+
+→ Chose **B** because logic in Agent callbacks hides behind closures and is untestable in isolation.
+
+
 ## Implementation
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defp deps do
+  [
+    # stdlib-only by default; add `{:benchee, "~> 1.3", only: :dev}` if you benchmark
+  ]
+end
+```
+
 
 ### Step 1: Create the project
 
@@ -295,6 +321,15 @@ mix test
 
 ---
 
+### Why this works
+
+The design leans on OTP primitives that already encode the invariants we care about (supervision, back-pressure, explicit message semantics), so failure modes are visible at the right layer instead of being reinvented ad-hoc. Tests exercise the edges (timeouts, crashes, boundary states), which is where hand-rolled alternatives silently drift over time.
+
+
+## Benchmark
+
+<!-- benchmark N/A: tema conceptual -->
+
 ## Trade-offs and decision rules
 
 **1. Use `Agent` when the API fits in three functions**
@@ -334,6 +369,11 @@ embedded/telecom systems), `GenServer` is the safer home.
   `:mnesia`, `Horde.Registry`, a CRDT, or a proper database.
 
 ---
+
+
+## Reflection
+
+- Escribí una regla de un párrafo que un dev junior pueda aplicar para decidir Agent vs GenServer sin preguntar.
 
 ## Resources
 

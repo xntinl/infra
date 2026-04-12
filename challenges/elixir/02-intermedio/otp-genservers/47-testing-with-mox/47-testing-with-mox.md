@@ -2,9 +2,6 @@
 
 **Project**: `mockable_gs` — a GenServer that depends on an external behaviour, mocked with `Mox` in tests.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
-
 ---
 
 ## Project context
@@ -38,6 +35,11 @@ mockable_gs/
 ```
 
 ---
+
+
+## Why X and not Y
+
+- **Why not Meck?** Meck patches modules at runtime; Mox uses explicit behaviours, compile-time checked, concurrency-safe.
 
 ## Core concepts
 
@@ -85,6 +87,19 @@ This exercise uses the global approach for simplicity; production
 codebases usually prefer `allow/3`.
 
 ---
+
+## Design decisions
+
+**Option A — in-process stubs**
+- Pros: simpler upfront, fewer moving parts.
+- Cons: hides the trade-off that this exercise exists to teach.
+
+**Option B — Mox-backed behaviour mocks (chosen)**
+- Pros: explicit about the semantic that matters in production.
+- Cons: one more concept to internalize.
+
+→ Chose **B** because explicit behaviour contracts + verify-on-exit prevent silent test drift.
+
 
 ## Implementation
 
@@ -265,6 +280,15 @@ mix test
 
 ---
 
+### Why this works
+
+The design leans on OTP primitives that already encode the invariants we care about (supervision, back-pressure, explicit message semantics), so failure modes are visible at the right layer instead of being reinvented ad-hoc. Tests exercise the edges (timeouts, crashes, boundary states), which is where hand-rolled alternatives silently drift over time.
+
+
+## Benchmark
+
+<!-- benchmark N/A: tema conceptual -->
+
 ## Trade-offs and production gotchas
 
 **1. `set_mox_global` forces `async: false`**
@@ -303,6 +327,11 @@ For process-boundary checks (did we send the right message?), use
 external collaborators.
 
 ---
+
+
+## Reflection
+
+- Si las behaviours cambian cada sprint, ¿Mox sigue valiendo la pena o caes en integración? Definí el punto de inflexión.
 
 ## Resources
 

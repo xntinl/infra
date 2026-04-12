@@ -1,425 +1,484 @@
-# Req + Finch — HTTP Clients for Upstream Calls
+# Req / Finch — HTTP Clients Deep Dive
+
+**Project**: `http_clients_deep` — Req on top of Finch with named pools, HTTP/2 multiplexing, structured telemetry, and streaming downloads.
+
+**Difficulty**: ★★★★☆
+**Estimated time**: 4–6 hours
+
+---
 
 ## Project context
 
-You are building `api_gateway`, an internal HTTP gateway. The gateway proxies requests to upstream services. Until now, upstream calls had no connection pooling, no retry, and no timeout enforcement. This exercise builds the upstream HTTP client with named Finch pools, Req middleware for retry and telemetry, and streaming support. All modules are defined from scratch.
+Finch is the production HTTP client for the BEAM — `mint` + `nimble_pool`,
+HTTP/1.1 and HTTP/2, per-host connection pools, zero-copy response streaming.
+Req sits on top and gives you Plug-like middleware (retry, auth, decompression,
+redirect) with an opinionated ergonomic API.
 
-Project structure:
+Most teams use Req without ever tuning Finch. That works until you hit one of:
+a slow upstream starving the default pool, an HTTP/2 upstream where you expect
+multiplexing but get one-request-per-connection latency, a large download that
+loads the whole body in memory. This exercise builds five realistic
+configurations and measures them — you leave knowing which knobs matter and
+which are cargo cult.
 
 ```
-api_gateway/
+http_clients_deep/
 ├── lib/
-│   └── api_gateway/
-│       └── upstream/
-│           ├── client.ex           # HTTP client with retry and telemetry
-│           ├── req_steps.ex        # custom Req middleware steps
-│           └── pool_supervisor.ex  # Finch pool configuration
+│   └── http_clients_deep/
+│       ├── application.ex
+│       ├── pools.ex                   # named Finch pools
+│       ├── client.ex                  # Req-based client
+│       ├── stream.ex                  # streaming download
+│       └── telemetry_reporter.ex      # attaches handlers
 ├── test/
-│   └── api_gateway/
-│       └── upstream/
-│           └── client_test.exs     # given tests — must pass without modification
+│   └── http_clients_deep/
+│       ├── client_test.exs
+│       └── stream_test.exs
+├── bench/
+│   └── pool_bench.exs
 └── mix.exs
 ```
 
 ---
 
-## The business problem
+## Core concepts
 
-The upstream client needs to satisfy four requirements:
+### 1. The Finch layering
 
-1. **Connection pooling**: limit TCP connections per upstream host so the OS does not exhaust file descriptors under burst load.
-2. **Retry with backoff**: transient upstream errors (502, 503, 504) should be retried automatically with exponential backoff.
-3. **Request tracing**: every upstream call must emit a telemetry event with duration, status code, and upstream host.
-4. **Streaming**: some upstreams return large response bodies. The client must stream the response to disk without loading the full body into the BEAM process heap.
+```
+┌────────────────────────────────────────────────┐
+│ Req         middleware (retry, auth, redirect) │
+├────────────────────────────────────────────────┤
+│ Finch       request dispatch, pool selection   │
+├────────────────────────────────────────────────┤
+│ NimblePool  checkout/checkin of connections    │
+├────────────────────────────────────────────────┤
+│ Mint        stateless HTTP/1.1 & HTTP/2 client │
+└────────────────────────────────────────────────┘
+```
 
----
+- **Mint** is stateless: given a socket, encode/decode HTTP. It does not own
+  sockets or pools.
+- **NimblePool** is a generic resource pool — same pattern Broadway uses.
+- **Finch** composes the two: one named pool per `{scheme, host, port}`
+  with configurable size, connection timeout, and protocol.
+- **Req** wraps Finch with middleware and an HTTP-verb API.
 
-## Why Finch manages pools instead of letting Hackney or httpc do it
+### 2. HTTP/2 multiplexing — why `count: 1` is often correct
 
-`httpc` creates a new TCP connection for every request unless you configure persistent connections manually. `hackney` has a global pool shared across all callers. Finch is designed around named pools: you start one `{Finch, name: ..., pools: ...}` per upstream domain with explicit `size` and `count` parameters. The pool is supervised independently. If one upstream's pool is exhausted, other upstream requests continue unaffected.
+Under HTTP/1.1, each connection serves one request at a time. `count: 50`
+means 50 concurrent requests max per host.
 
----
+Under HTTP/2, a single connection serves many concurrent streams (default
+100). `count: 50` means you have 50 * 100 = 5,000 concurrent streams — almost
+certainly far more than you need, wasting file descriptors and TLS handshakes.
 
-## Why retry belongs in a Req step and not in the caller
+For HTTP/2 upstreams (most modern APIs — Stripe, Google, GitHub), prefer
+`protocols: [:http2], count: 1, conn_opts: [transport_opts: [keepalive: true]]`.
 
-If the caller handles retries, every call site duplicates the retry logic with potentially different strategies. A Req step centralizes the retry policy. The caller calls `Client.get/1` and receives either a successful response or an error. The retry strategy is declared once.
+### 3. Pool-per-host, not pool-per-app
+
+One global pool routed across every upstream means a slow partner starves
+calls to your critical providers. Named pools per upstream decorrelate them:
+
+```elixir
+{Finch,
+ name: MyFinch,
+ pools: %{
+   "https://api.stripe.com"  => [size: 25, protocols: [:http2], count: 1],
+   "https://api.adyen.com"   => [size: 25, protocols: [:http2], count: 1],
+   "https://legacy.bank.net" => [size: 10, protocols: [:http1], count: 10]
+ }}
+```
+
+Finch matches the destination URL against these keys and picks the pool.
+
+### 4. Streaming vs buffered
+
+`Req.get!(url)` loads the full response into memory. For a 2GB CSV this is
+fatal. `Finch.stream/4` hands you chunks as they arrive so you can pipe them
+to disk or a parser:
+
+```
+Mint TCP ─▶ Finch.stream callback ─▶ chunk 1 ─▶ handler
+                                  └─▶ chunk 2 ─▶ handler
+                                  └─▶ chunk N ─▶ :done
+```
+
+The handler accumulates, writes to file, or pipes to `File.stream!/1` without
+ever materializing the whole body.
+
+### 5. Telemetry — what Finch already emits
+
+Finch emits `[:finch, :request, :start]`, `[:finch, :request, :stop]`,
+`[:finch, :request, :exception]`, plus `[:finch, :queue, :start]/:stop`
+(how long checkout waits), `[:finch, :connect, :start]/:stop`, and
+`[:finch, :recv, :start]/:stop`. Attaching handlers to these gives you
+checkout queue time (the #1 symptom of an undersized pool) for free.
 
 ---
 
 ## Implementation
 
-### Step 1: `mix.exs` additions
+### Step 1: mix.exs
 
 ```elixir
 defp deps do
   [
+    {:finch, "~> 0.18"},
     {:req, "~> 0.5"},
-    {:finch, "~> 0.19"},
-    {:jason, "~> 1.4"}
+    {:jason, "~> 1.4"},
+    {:telemetry, "~> 1.2"},
+    {:bypass, "~> 2.1", only: :test}
   ]
 end
 ```
 
-### Step 2: Pool supervisor — `lib/api_gateway/upstream/pool_supervisor.ex`
+### Step 2: `lib/http_clients_deep/pools.ex`
 
 ```elixir
-defmodule ApiGateway.Upstream.PoolSupervisor do
+defmodule HttpClientsDeep.Pools do
   @moduledoc """
-  Starts one named Finch pool per upstream service.
+  Finch pool specification. Keyed by normalized scheme://host[:port].
 
-  Pool sizing rules:
-  - size: concurrent connections per pool worker process
-  - count: number of pool worker processes
-  - Total max connections = size * count
+  Pool sizing rules of thumb:
 
-  HTTP/2 upstreams: size: 1, count: N (one connection multiplexes N streams)
-  HTTP/1.1 upstreams: size: N, count: 1 (N connections, each serves one request)
+    * HTTP/2 upstreams: `count: 1, size: 25` (25 multiplexed connections total).
+    * HTTP/1.1 upstreams: `count: N, size: N` where N ≈ p99 concurrency you expect.
+    * size is the MAX; NimblePool lazily creates connections as demand rises.
   """
 
   @spec child_spec(keyword()) :: Supervisor.child_spec()
-  def child_spec(_opts) do
-    upstreams = Application.get_env(:api_gateway, :upstreams, [])
+  def child_spec(opts) do
+    name = Keyword.get(opts, :name, HttpClientsDeep.Finch)
 
-    pools =
-      Enum.reduce(upstreams, %{}, fn {_name, config}, acc ->
-        url = Keyword.fetch!(config, :base_url)
-        protocol = Keyword.get(config, :protocol, :http1)
-        pool_size = Keyword.get(config, :pool_size, 25)
-        pool_count = Keyword.get(config, :pool_count, 2)
-
-        Map.put(acc, url, [
-          size: pool_size,
-          count: pool_count,
-          protocol: protocol
-        ])
-      end)
-
-    %{
-      id: ApiGateway.Upstream.Finch,
-      start: {Finch, :start_link, [[name: ApiGateway.Upstream.Finch, pools: pools]]}
-    }
+    {Finch,
+     name: name,
+     pools: %{
+       :default => [size: 25, protocols: [:http1], count: 1],
+       "https://api.stripe.com" => [
+         size: 25,
+         protocols: [:http2],
+         count: 1,
+         conn_opts: [transport_opts: [timeout: 5_000]]
+       ],
+       "https://legacy.bank.net" => [size: 10, protocols: [:http1], count: 10]
+     }}
   end
 end
 ```
 
-### Step 3: Req steps — `lib/api_gateway/upstream/req_steps.ex`
+### Step 3: `lib/http_clients_deep/client.ex`
 
 ```elixir
-defmodule ApiGateway.Upstream.ReqSteps do
+defmodule HttpClientsDeep.Client do
   @moduledoc """
-  Custom Req steps for the api_gateway upstream client.
-
-  A Req step is a function that receives a `Req.Request` struct and returns
-  either the request (to continue the pipeline) or a `{request, response}` tuple
-  (to short-circuit the pipeline).
+  Req-based client that routes through the named Finch instance, with retry,
+  redirect, decompression, and default timeouts wired in.
   """
 
+  @finch HttpClientsDeep.Finch
+
+  @spec request(Req.Request.method(), String.t(), keyword()) ::
+          {:ok, Req.Response.t()} | {:error, Exception.t()}
+  def request(method, url, opts \\ []) do
+    req =
+      Req.new(
+        method: method,
+        url: url,
+        finch: @finch,
+        receive_timeout: Keyword.get(opts, :receive_timeout, 15_000),
+        connect_options: [timeout: Keyword.get(opts, :connect_timeout, 5_000)],
+        retry: :safe_transient,
+        max_retries: 3,
+        retry_delay: fn n -> (:rand.uniform(100) + round(:math.pow(2, n) * 100)) end
+      )
+
+    Req.request(req, opts)
+  end
+
+  def get(url, opts \\ []), do: request(:get, url, opts)
+  def post(url, opts \\ []), do: request(:post, url, opts)
+end
+```
+
+### Step 4: Streaming download — `lib/http_clients_deep/stream.ex`
+
+```elixir
+defmodule HttpClientsDeep.Stream do
+  @moduledoc """
+  Stream a response body to disk without buffering in memory. Safe for
+  multi-GB files.
+  """
+
+  @spec download(String.t(), Path.t()) :: {:ok, pos_integer()} | {:error, term()}
+  def download(url, path) do
+    req = Finch.build(:get, url)
+    {:ok, file} = File.open(path, [:write, :binary, :raw])
+
+    try do
+      case Finch.stream(req, HttpClientsDeep.Finch, 0, &stream_handler(&1, &2, file)) do
+        {:ok, bytes_written} -> {:ok, bytes_written}
+        {:error, _} = err -> err
+      end
+    after
+      File.close(file)
+    end
+  end
+
+  defp stream_handler({:status, status}, _acc, _file) when status not in 200..299,
+    do: raise("unexpected status #{status}")
+
+  defp stream_handler({:status, _status}, acc, _file), do: acc
+  defp stream_handler({:headers, _headers}, acc, _file), do: acc
+
+  defp stream_handler({:data, chunk}, acc, file) do
+    :ok = :file.write(file, chunk)
+    acc + byte_size(chunk)
+  end
+end
+```
+
+### Step 5: Telemetry reporter
+
+```elixir
+defmodule HttpClientsDeep.TelemetryReporter do
   require Logger
 
-  @doc """
-  Telemetry step: emits [:api_gateway, :upstream, :request, :start/:stop]
-  events around every upstream HTTP request.
-  """
-  @spec telemetry(Req.Request.t()) :: {Req.Request.t(), (({Req.Request.t(), Req.Response.t()}) -> {Req.Request.t(), Req.Response.t()})}
-  def telemetry(request) do
-    start_time = System.monotonic_time()
+  @events [
+    [:finch, :request, :stop],
+    [:finch, :queue, :stop],
+    [:finch, :connect, :stop]
+  ]
 
-    metadata = %{
-      host: request.url.host,
-      method: request.method,
-      path: request.url.path
-    }
-
-    :telemetry.execute(
-      [:api_gateway, :upstream, :request, :start],
-      %{system_time: System.system_time()},
-      metadata
+  def attach do
+    :telemetry.attach_many(
+      "http-clients-deep",
+      @events,
+      &__MODULE__.handle/4,
+      nil
     )
-
-    {request,
-     fn {req, resp} ->
-       duration = System.monotonic_time() - start_time
-
-       :telemetry.execute(
-         [:api_gateway, :upstream, :request, :stop],
-         %{duration: duration},
-         Map.merge(metadata, %{status: resp.status})
-       )
-
-       {req, resp}
-     end}
   end
 
-  @doc """
-  Request ID propagation step: attaches the current request's X-Request-ID
-  to the upstream call for distributed tracing.
-  """
-  @spec propagate_request_id(Req.Request.t()) :: Req.Request.t()
-  def propagate_request_id(request) do
-    request_id =
-      Process.get(:request_id) ||
-        (:crypto.strong_rand_bytes(8) |> Base.encode16(case: :lower))
-
-    Req.Request.put_header(request, "x-request-id", request_id)
+  def handle([:finch, :request, :stop], %{duration: d}, meta, _cfg) do
+    Logger.info(
+      "finch req done host=#{meta.request.host} status=#{inspect(meta.result)} " <>
+        "dur_ms=#{System.convert_time_unit(d, :native, :millisecond)}"
+    )
   end
 
-  @doc """
-  ETS response cache step: caches GET responses for configurable TTL.
-  Cache key is the full URI string. Only 200 responses are cached.
-  """
-  @spec ets_cache(Req.Request.t()) :: Req.Request.t() | {Req.Request.t(), Req.Response.t()}
-  def ets_cache(request) do
-    if request.method == :get do
-      key = URI.to_string(request.url)
+  def handle([:finch, :queue, :stop], %{duration: d}, meta, _cfg) do
+    ms = System.convert_time_unit(d, :native, :millisecond)
 
-      case :ets.lookup(:upstream_response_cache, key) do
-        [{^key, cached_response, expires_at}]
-        when expires_at > System.monotonic_time(:second) ->
-          {Req.Request.halt(request), cached_response}
-
-        _ ->
-          {request,
-           fn {req, resp} ->
-             if resp.status == 200 do
-               ttl = Map.get(req.options, :cache_ttl, 30)
-               expires = System.monotonic_time(:second) + ttl
-               :ets.insert(:upstream_response_cache, {key, resp, expires})
-             end
-
-             {req, resp}
-           end}
-      end
-    else
-      request
+    if ms > 50 do
+      Logger.warning(
+        "finch pool checkout slow host=#{meta.pool} wait_ms=#{ms} — pool likely undersized"
+      )
     end
+  end
+
+  def handle([:finch, :connect, :stop], %{duration: d}, meta, _cfg) do
+    Logger.debug(
+      "finch connected host=#{meta.host} dur_ms=" <>
+        "#{System.convert_time_unit(d, :native, :millisecond)}"
+    )
   end
 end
 ```
 
-### Step 4: Upstream client — `lib/api_gateway/upstream/client.ex`
+### Step 6: `lib/http_clients_deep/application.ex`
 
 ```elixir
-defmodule ApiGateway.Upstream.Client do
-  @moduledoc """
-  HTTP client for upstream service calls.
+defmodule HttpClientsDeep.Application do
+  use Application
 
-  Builds a Req.Request with:
-  - Named Finch pool (ApiGateway.Upstream.Finch) for connection reuse
-  - Retry on transient errors (502, 503, 504, connection errors)
-  - Exponential backoff: 500ms, 1s, 2s
-  - Telemetry step for latency tracking
-  - Request ID propagation for distributed tracing
-  - 5 second connect timeout, 30 second read timeout
-  """
+  @impl true
+  def start(_type, _args) do
+    HttpClientsDeep.TelemetryReporter.attach()
 
-  alias ApiGateway.Upstream.ReqSteps
+    children = [
+      HttpClientsDeep.Pools
+    ]
 
-  @connect_timeout_ms 5_000
-  @receive_timeout_ms 30_000
-  @max_retries 3
-
-  defp client(base_url) do
-    Req.new(
-      base_url: base_url,
-      finch: ApiGateway.Upstream.Finch,
-      connect_options: [timeout: @connect_timeout_ms],
-      receive_timeout: @receive_timeout_ms,
-      retry: :transient,
-      max_retries: @max_retries,
-      retry_delay: &backoff/1
-    )
-    |> Req.Request.prepend_request_steps(
-      telemetry: &ReqSteps.telemetry/1,
-      request_id: &ReqSteps.propagate_request_id/1
-    )
-  end
-
-  # Backoff: 500ms -> 1s -> 2s
-  defp backoff(attempt) do
-    :timer.seconds(1) * Integer.pow(2, attempt - 1) |> div(2)
-  end
-
-  @doc """
-  Makes a GET request to `path` on the given upstream `base_url`.
-  Returns `{:ok, body}` on HTTP 2xx or `{:error, reason}` otherwise.
-  """
-  @spec get(String.t(), String.t(), keyword()) :: {:ok, term()} | {:error, term()}
-  def get(base_url, path, opts \\ []) do
-    case Req.get(client(base_url), url: path, params: Keyword.get(opts, :params, [])) do
-      {:ok, %{status: status, body: body}} when status in 200..299 ->
-        {:ok, body}
-
-      {:ok, %{status: 404}} ->
-        {:error, :not_found}
-
-      {:ok, %{status: status, body: body}} ->
-        {:error, {:upstream_error, status, body}}
-
-      {:error, exception} ->
-        {:error, {:network, exception}}
-    end
-  end
-
-  @doc """
-  Makes a POST request with a JSON body.
-  Returns `{:ok, body}` on HTTP 2xx or `{:error, reason}`.
-  """
-  @spec post(String.t(), String.t(), map(), keyword()) :: {:ok, term()} | {:error, term()}
-  def post(base_url, path, body, opts \\ []) do
-    case Req.post(client(base_url), url: path, json: body) do
-      {:ok, %{status: status, body: resp_body}} when status in 200..299 ->
-        {:ok, resp_body}
-
-      {:ok, %{status: 404}} ->
-        {:error, :not_found}
-
-      {:ok, %{status: status, body: resp_body}} ->
-        {:error, {:upstream_error, status, resp_body}}
-
-      {:error, exception} ->
-        {:error, {:network, exception}}
-    end
-  end
-
-  @doc """
-  Streams a GET response body to `dest_path` on disk.
-  Returns `{:ok, bytes_written}` or `{:error, reason}`.
-
-  The response body is never loaded into the BEAM heap: Req writes each
-  chunk directly to the file descriptor as it arrives from the socket.
-  """
-  @spec stream_to_file(String.t(), String.t(), String.t()) ::
-          {:ok, non_neg_integer()} | {:error, term()}
-  def stream_to_file(base_url, path, dest_path) do
-    file_stream = File.stream!(dest_path, [:write, :binary])
-
-    case Req.get(client(base_url), url: path, decode_body: false, into: file_stream) do
-      {:ok, %{status: status}} when status in 200..299 ->
-        %{size: bytes} = File.stat!(dest_path)
-        {:ok, bytes}
-
-      {:ok, %{status: status, body: body}} ->
-        File.rm(dest_path)
-        {:error, {:upstream_error, status, body}}
-
-      {:error, exception} ->
-        File.rm(dest_path)
-        {:error, {:network, exception}}
-    end
+    Supervisor.start_link(children, strategy: :one_for_one, name: HttpClientsDeep.Supervisor)
   end
 end
 ```
 
-### Step 5: Config — `config/config.exs`
+### Step 7: Tests with Bypass
 
 ```elixir
-config :api_gateway, :upstreams, [
-  billing:  [base_url: "https://billing.internal",  protocol: :http1, pool_size: 20, pool_count: 2],
-  auth:     [base_url: "https://auth.internal",     protocol: :http2, pool_size: 5,  pool_count: 1],
-  catalog:  [base_url: "https://catalog.internal",  protocol: :http1, pool_size: 10, pool_count: 2]
-]
-```
-
-### Step 6: Given tests — must pass without modification
-
-```elixir
-# test/api_gateway/upstream/client_test.exs
-defmodule ApiGateway.Upstream.ClientTest do
-  use ExUnit.Case, async: true
-
-  alias ApiGateway.Upstream.Client
+defmodule HttpClientsDeep.ClientTest do
+  use ExUnit.Case, async: false
+  alias HttpClientsDeep.Client
 
   setup do
-    Req.Test.stub(ApiGateway.Upstream.Finch, fn conn ->
-      case {conn.method, conn.request_path} do
-        {"GET", "/health"} ->
-          Plug.Conn.send_resp(conn, 200, Jason.encode!(%{status: "ok"}))
+    bypass = Bypass.open()
+    %{bypass: bypass, url: "http://localhost:#{bypass.port}/api"}
+  end
 
-        {"GET", "/missing"} ->
-          Plug.Conn.send_resp(conn, 404, Jason.encode!(%{error: "not found"}))
+  test "GET 200 returns body", %{bypass: bypass, url: url} do
+    Bypass.expect(bypass, "GET", "/api", fn conn ->
+      Plug.Conn.resp(conn, 200, ~s({"ok": true}))
+    end)
 
-        {"POST", "/echo"} ->
-          {:ok, body, conn} = Plug.Conn.read_body(conn)
-          Plug.Conn.send_resp(conn, 201, body)
+    assert {:ok, %Req.Response{status: 200, body: %{"ok" => true}}} = Client.get(url)
+  end
 
-        {"GET", "/error"} ->
-          Plug.Conn.send_resp(conn, 503, Jason.encode!(%{error: "service unavailable"}))
+  test "503 triggers safe_transient retry", %{bypass: bypass, url: url} do
+    counter = :counters.new(1, [])
+
+    Bypass.expect(bypass, "GET", "/api", fn conn ->
+      :counters.add(counter, 1, 1)
+
+      if :counters.get(counter, 1) < 3 do
+        Plug.Conn.resp(conn, 503, "")
+      else
+        Plug.Conn.resp(conn, 200, "ok")
       end
     end)
 
-    :ok
+    assert {:ok, %Req.Response{status: 200}} = Client.get(url)
+    assert :counters.get(counter, 1) == 3
   end
 
-  test "get/3 returns {:ok, body} on 200" do
-    assert {:ok, %{"status" => "ok"}} =
-             Client.get("https://billing.internal", "/health")
+  test "connect_timeout trips on unreachable host" do
+    assert {:error, %Mint.TransportError{reason: _}} =
+             Client.get("http://10.255.255.1:81/never", connect_timeout: 50)
+  end
+end
+
+defmodule HttpClientsDeep.StreamTest do
+  use ExUnit.Case, async: false
+  alias HttpClientsDeep.Stream, as: DStream
+
+  setup do
+    bypass = Bypass.open()
+    path = Path.join(System.tmp_dir!(), "http_clients_deep_stream_test.bin")
+    on_exit(fn -> File.rm(path) end)
+    %{bypass: bypass, path: path, url: "http://localhost:#{bypass.port}/file"}
   end
 
-  test "get/3 returns {:error, :not_found} on 404" do
-    assert {:error, :not_found} =
-             Client.get("https://billing.internal", "/missing")
-  end
+  test "writes chunked body to file", %{bypass: bypass, url: url, path: path} do
+    payload = :crypto.strong_rand_bytes(1_000_000)
 
-  test "get/3 returns {:error, {:upstream_error, 503, _body}} on 503" do
-    assert {:error, {:upstream_error, 503, _body}} =
-             Client.get("https://billing.internal", "/error")
-  end
+    Bypass.expect(bypass, "GET", "/file", fn conn ->
+      conn = Plug.Conn.send_chunked(conn, 200)
 
-  test "post/4 returns {:ok, body} on 2xx" do
-    payload = %{event: "test", value: 42}
+      Enum.reduce_while(:binary.bin_to_list(payload) |> Enum.chunk_every(8192), conn, fn
+        chunk, conn ->
+          case Plug.Conn.chunk(conn, :binary.list_to_bin(chunk)) do
+            {:ok, conn} -> {:cont, conn}
+            _ -> {:halt, conn}
+          end
+      end)
+    end)
 
-    assert {:ok, received} = Client.post("https://billing.internal", "/echo", payload)
-    assert received["event"] == "test"
-    assert received["value"] == 42
+    assert {:ok, bytes} = DStream.download(url, path)
+    assert bytes == byte_size(payload)
+    assert File.read!(path) == payload
   end
 end
 ```
 
-### Step 7: Run the tests
+### Step 8: Pool benchmark
 
-```bash
-mix test test/api_gateway/upstream/ --trace
+```elixir
+# bench/pool_bench.exs
+alias HttpClientsDeep.Client
+
+# Assumes HttpClientsDeep started and an Nginx at localhost:8080 returning 200.
+urls = for _ <- 1..1_000, do: "http://localhost:8080/hello"
+
+Benchee.run(
+  %{
+    "sequential" => fn ->
+      Enum.each(urls, fn u -> Client.get(u) end)
+    end,
+    "parallel 25" => fn ->
+      urls
+      |> Task.async_stream(&Client.get/1, max_concurrency: 25)
+      |> Stream.run()
+    end,
+    "parallel 200" => fn ->
+      urls
+      |> Task.async_stream(&Client.get/1, max_concurrency: 200)
+      |> Stream.run()
+    end
+  },
+  time: 10,
+  memory_time: 2
+)
 ```
 
----
-
-## Trade-off analysis
-
-| Aspect | Req + Finch (named pools) | Hackney (global pool) | httpc (no pool) |
-|--------|--------------------------|-----------------------|-----------------|
-| Per-upstream pool isolation | Yes | No — shared global pool | No pools |
-| HTTP/2 multiplexing | Yes (`protocol: :http2`) | Limited | No |
-| Retry middleware | Built-in (`retry: :transient`) | Manual | Manual |
-| Test stubbing | `Req.Test.stub/2` | Bypass or mock | Bypass or mock |
-| Connection leak on crash | Pool supervised — cleaned up | Risk | Risk |
-| Config per host | Yes (pools map) | Limited | No |
-
-Reflection question: `Client.stream_to_file/3` writes response chunks directly to disk. The gateway process is blocked on the Finch receive loop until the download completes. For a 10GB file over a slow upstream, this process is tied up for minutes. How would you restructure the download to avoid blocking the caller?
+Watch the `finch.queue.stop` logs. If `wait_ms` consistently exceeds 50ms at
+`parallel 200` but is near-zero at `parallel 25`, the pool is the bottleneck —
+raise `size` or increase `count` (HTTP/1.1) until queue time drops.
 
 ---
 
-## Common production mistakes
+## Trade-offs and production gotchas
 
-**1. One global Finch instance for all upstreams**
-If all upstream calls share one pool and a slow upstream exhausts it, every other upstream call queues behind it. One pool per upstream base URL.
+**1. HTTP/2 with `count: 10` is almost always wrong.** You end up with 10 TLS
+handshakes where 1 would suffice, burning CPU and warm-up latency. Use
+`count: 1, size: <multiplexing factor>` unless you measured otherwise.
 
-**2. `retry: :transient` on POST without an idempotency key**
-A retry on 503 after the upstream committed but before responding creates a duplicate. Always include an idempotency key in POST headers when enabling retry.
+**2. Default pool (`:default`) is a trap.** Any URL not matched by a named
+pool key falls through. In production we've seen a typo in the key cause all
+traffic to a 10-connection default pool, capping throughput at 10 rps.
 
-**3. Not propagating `X-Request-ID` downstream**
-Without request ID propagation, a failed upstream call is invisible in distributed traces.
+**3. `receive_timeout` vs `connect_options[:timeout]`.** Different knobs:
+connect is the TCP + TLS handshake, receive is between bytes of the response.
+Default receive is 15s; for idempotent requests behind a breaker, set it
+shorter (2–3s).
 
-**4. Using `receive_timeout` as wall-clock SLA**
-`receive_timeout` is for receiving the first byte. A slow stream will not trigger it.
+**4. Req's `retry: :safe_transient` only retries idempotent methods.** POSTs
+are not retried by default — that's correct for most cases. If you need to
+retry POSTs (with an `Idempotency-Key` header), pass
+`retry: :transient` and own the idempotency guarantee yourself.
 
-**5. Starting Finch outside the supervision tree**
-If started with `Finch.start_link/1` instead of as a supervised child, pool workers that fail are never recovered.
+**5. Streaming and back-pressure.** `Finch.stream/4`'s callback runs in the
+calling process. If the callback is slow, the TCP socket stops reading and
+the upstream slows down (back-pressure is automatic). Don't spawn the
+callback's work — let it block so back-pressure works.
+
+**6. Decompression in Req eats CPU.** Req auto-decodes gzip/br. For binary
+downloads you've already committed to stream raw, pass `decode_body: false`
+to keep the raw bytes on the wire.
+
+**7. Pool warm-up on deploy.** After a fresh deploy, the first N requests pay
+the TLS handshake latency. For hot paths, warm the pool in application start
+with a few concurrent HEAD requests to the critical upstreams.
+
+**8. When NOT to use Req.** For binary transports (gRPC, MQTT), or when you
+need custom frame-level control (WebSockets — use Mint.WebSocket), Req is the
+wrong layer. For high-frequency internal RPC inside a cluster, skip HTTP
+entirely and use `:erpc` or a cluster-local GenServer protocol.
+
+---
+
+## Performance notes
+
+On a 2023 M2 Pro against a local Nginx returning `200 OK` (empty body):
+
+| Config | RPS (single process) | RPS (200 parallel tasks) |
+|--------|----------------------|--------------------------|
+| HTTP/1.1 size=25 count=1 | ~1,200 | ~11,000 |
+| HTTP/1.1 size=25 count=10 | ~1,200 | ~24,000 |
+| HTTP/2 size=25 count=1 | ~1,800 | ~32,000 |
+
+Numbers are illustrative — always measure against your own upstream.
+Key insight: HTTP/2 multiplexing + `count: 1` beats HTTP/1.1 `count: 10` once
+you have any concurrency at all.
 
 ---
 
 ## Resources
 
-- [Req](https://hexdocs.pm/req) — request struct, steps, retry, streaming, Req.Test
-- [Finch](https://hexdocs.pm/finch) — pool configuration, HTTP/2, telemetry events
-- [Req.Test — HTTP stubs](https://hexdocs.pm/req/Req.Test.html) — stub/2, allow/3 for async tests
-- [Finch Telemetry](https://hexdocs.pm/finch/Finch.html#module-telemetry) — request/connect/send/recv events
+- [Finch hexdocs](https://hexdocs.pm/finch/Finch.html) — pool configuration reference
+- [Req hexdocs](https://hexdocs.pm/req/Req.html) — middleware catalog and examples
+- [Mint hexdocs](https://hexdocs.pm/mint/Mint.html) — stateless HTTP client underneath
+- [NimblePool hexdocs](https://hexdocs.pm/nimble_pool/NimblePool.html) — the pool semantics
+- [Dashbit — What's new in Finch 0.5](https://dashbit.co/blog/announcing-finch-0-5) — HTTP/2 rollout details
+- [José Valim on Mint/Finch design](https://www.youtube.com/watch?v=ZG3Ip7SLG5Y) — "The Soul of Erlang and Elixir" talk context
+- [RFC 7540 — HTTP/2](https://www.rfc-editor.org/rfc/rfc7540) — stream multiplexing semantics

@@ -2,9 +2,6 @@
 
 **Project**: `call_vs_cast_demo` — the same GenServer exposed twice (via `call` and via `cast`) with a micro-benchmark using `:timer.tc/1` so you can see the trade-offs in numbers.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
-
 ---
 
 ## Project context
@@ -41,6 +38,11 @@ call_vs_cast_demo/
 ```
 
 ---
+
+
+## Why X and not Y
+
+- **Why not a lower-level alternative?** For call vs cast tradeoffs, OTP's pattern is what reviewers will expect and what observability tools support out of the box.
 
 ## Core concepts
 
@@ -84,7 +86,31 @@ because the producer can't issue a second call until the first replies.
 
 ---
 
+## Design decisions
+
+**Option A — always `call` (synchronous, back-pressured)**
+- Pros: simpler upfront, fewer moving parts.
+- Cons: hides the trade-off that this exercise exists to teach.
+
+**Option B — mix `call` and `cast` by intent (chosen)**
+- Pros: explicit about the semantic that matters in production.
+- Cons: one more concept to internalize.
+
+→ Chose **B** because mailbox back-pressure matters where load is unbounded; `cast` is only safe on admin paths.
+
+
 ## Implementation
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defp deps do
+  [
+    # stdlib-only by default; add `{:benchee, "~> 1.3", only: :dev}` if you benchmark
+  ]
+end
+```
+
 
 ### Step 1: Create the project
 
@@ -294,6 +320,15 @@ mix test
 
 ---
 
+### Why this works
+
+The design leans on OTP primitives that already encode the invariants we care about (supervision, back-pressure, explicit message semantics), so failure modes are visible at the right layer instead of being reinvented ad-hoc. Tests exercise the edges (timeouts, crashes, boundary states), which is where hand-rolled alternatives silently drift over time.
+
+
+## Benchmark
+
+<!-- benchmark N/A: tema conceptual -->
+
 ## Trade-offs and production gotchas
 
 **1. Naive cast benchmarks lie**
@@ -328,6 +363,11 @@ operation can fail meaningfully, (c) you need back-pressure, (d) you need
 ordering guarantees against a subsequent read from the same caller.
 
 ---
+
+
+## Reflection
+
+- Tu GenServer recibe 10k casts/seg y procesa 8k/seg. Describí exactamente cómo y cuándo muere el nodo, y qué cambios harías para que falle ruidosamente antes.
 
 ## Resources
 

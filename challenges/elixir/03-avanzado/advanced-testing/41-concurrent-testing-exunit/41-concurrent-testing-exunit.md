@@ -1,380 +1,548 @@
 # Concurrent Testing in ExUnit
 
-**Project**: `api_gateway` — a standalone HTTP gateway exercise
+**Project**: `concurrent_testing` — a URL shortener that writes to ETS and Ecto.
+**Difficulty**: ★★★★☆
+**Estimated time**: 4–6 hours
 
 ---
 
 ## Project context
 
-You are building `api_gateway`, an HTTP gateway that routes traffic to microservices. The
-gateway's test suite has grown to 200+ tests across rate limiter, circuit breaker, event
-bus, and middleware modules. CI runs in about 90 seconds because most tests are
-`async: false`. The root cause: several modules use named ETS tables and named GenServers
-that conflict when tests run in parallel. This exercise migrates the suite to `async: true`
-by identifying sources of shared state and isolating each test.
+Your suite takes 90 seconds. Developers hit `mix test` ~50 times a day — that's over an hour
+of wall-clock time per engineer burned on serial tests. ExUnit offers `async: true`, but
+flipping the flag on every test file the naive way breaks the suite in subtle ways:
+shared `Application.put_env`, globally named processes, ETS tables with fixed names, and
+the classic — Ecto tests writing to the same DB rows.
+
+This exercise builds a URL shortener with two storage layers (ETS for counters, Ecto for
+durable links) and walks through the four rules for safely running `async: true`:
+
+1. **Isolate named processes** — `start_supervised!` with unique names per test.
+2. **Isolate ETS** — per-test tables via `:ets.new/2` with `:private` or randomised names.
+3. **Isolate application env** — either never read `Application.get_env` in hot paths, or
+   use an Agent/Registry keyed by test pid.
+4. **Isolate the DB** — Ecto Sandbox in `:shared` or `{:shared, self()}` mode.
+
+You'll see a test pass locally, fail intermittently on CI, and learn exactly why. The final
+outcome: the suite runs in 12 seconds with 8-way parallelism, zero flakiness.
 
 Project structure:
 
 ```
-api_gateway/
+concurrent_testing/
 ├── lib/
-│   └── api_gateway/
-│       └── rate_limiter/
-│           └── sliding_window.ex       # sliding window rate limiter
+│   └── shortener/
+│       ├── application.ex
+│       ├── counter.ex              # ETS-backed counter
+│       ├── generator.ex            # hashid-style short code
+│       ├── link.ex                 # Ecto schema
+│       ├── links.ex                # context module
+│       └── repo.ex
 ├── test/
-│   └── api_gateway/
-│       └── rate_limiter/
-│           ├── sliding_window_test.exs    # ← async: true with isolated ETS
-│           └── isolated_server_test.exs   # ← GenServer isolation patterns
+│   ├── shortener/
+│   │   ├── counter_test.exs
+│   │   ├── generator_test.exs
+│   │   └── links_test.exs
+│   ├── support/
+│   │   └── data_case.ex
+│   └── test_helper.exs
 └── mix.exs
 ```
 
 ---
 
-## The business problem
+## Core concepts
 
-A slow test suite delays every deploy. The bottleneck is serial test execution:
+### 1. `async: true` semantics
+
+ExUnit with `async: true` runs **different test modules** concurrently, up to
+`System.schedulers_online()` at a time. Tests within the same module still run serially.
+This means two modules whose `setup` calls `Application.put_env(:app, :key, ...)` can
+clobber each other:
 
 ```
-async: false (current)     async: true (target)
-[Test A: 300ms]            [Test A] --+
-[Test B: 300ms]            [Test B] --| all run in parallel
-[Test C: 300ms]            [Test C] --| = ~300ms total
-[Test D: 300ms]            [Test D] --+
-Total: 1,200ms             Total: ~300ms
+  Test module A (async)        Test module B (async)
+  put_env(:key, :a)            put_env(:key, :b)
+  do_work()   ◄── reads :b     do_work()   ◄── reads :b, expects :a → FAIL
 ```
 
-`async: true` is safe only when tests are fully isolated. The three most common
-sources of test interference in Elixir applications:
+### 2. Named processes — the hidden global
 
-1. **Named ETS tables** — global, shared across all processes in the node
-2. **Named GenServers** — `GenServer.start_link(M, [], name: :foo)` clashes if two
-   tests start the same named server concurrently
-3. **`Application.put_env/3`** — modifies global application environment
+```elixir
+GenServer.start_link(__MODULE__, [], name: __MODULE__)
+```
 
----
+This binds the pid to a global name. If two concurrent tests both call `start_supervised!`,
+the second gets `{:error, {:already_started, _}}`. Solution: pass a unique `:name` per
+test, or skip the name and pass the pid around.
 
-## The isolation contract
+### 3. ETS tables — named is global
 
-For a test to be `async: true` safe, it must satisfy:
-- It does not read or write named global resources (ETS tables, registered names,
-  application env) without either exclusive ownership or per-test uniqueness
-- Resources it creates are cleaned up in `on_exit` even if the test fails
+```elixir
+:ets.new(:my_table, [:named_table, :public])
+```
+
+`:named_table` registers the table in a VM-global registry. Two tests create the same
+name → crash. Options:
+
+- Unnamed tables (`:ets.new(:ignored, [:public])` returns a `tid` reference).
+- Per-test names: `:ets.new(String.to_atom("t_#{:erlang.unique_integer()}"), [...])`.
+- One shared table + sharding by `{test_pid, key}`.
+
+### 4. Ecto Sandbox mode
+
+`Ecto.Adapters.SQL.Sandbox` wraps each test in a database transaction that is rolled back
+on exit. Two modes:
+
+| Mode | Checkout | `async: true`? | Notes |
+|------|----------|----------------|-------|
+| `:manual` + per-test checkout | `Sandbox.checkout(Repo)` | Yes | Default for tests that don't spawn |
+| `:shared` after checkout | `Sandbox.mode(Repo, {:shared, self()})` | No | Required when code under test spawns its own processes |
+
+In `:shared` mode all processes see the same sandboxed connection. Set per-test; it
+serialises the test by repo.
+
+### 5. The `$callers` trick — Ecto follows the chain
+
+Ecto inspects `Process.get(:"$callers")` to find which sandbox connection to use when
+code runs in a spawned process. Frameworks like Task, GenServer.start_link/3, and
+Phoenix set this automatically; hand-rolled `spawn/1` does not. If you bypass OTP, you
+must propagate `$callers` yourself:
+
+```elixir
+callers = [self() | Process.get(:"$callers", [])]
+spawn(fn ->
+  Process.put(:"$callers", callers)
+  # Ecto calls here will see the sandbox
+end)
+```
 
 ---
 
 ## Implementation
 
-### Step 1: Refactored sliding window module (table name as argument)
-
-The original `SlidingWindow` hardcodes `:request_log` as the ETS table name.
-The refactored version accepts the table name as an argument — this is the minimal change
-that enables per-test isolation without restructuring the production code.
-
-In production, you call `SlidingWindow.init(:request_log)` once at startup. In tests,
-each test creates a uniquely named table via `System.unique_integer/1`.
+### Step 1: `mix.exs`
 
 ```elixir
-defmodule ApiGateway.RateLimiter.SlidingWindow do
-  @moduledoc """
-  Sliding window rate limiter.
+defmodule Shortener.MixProject do
+  use Mix.Project
 
-  The table name is passed as an argument rather than hardcoded, which
-  enables concurrent tests to create isolated tables without conflict.
-
-  Production usage:
-    SlidingWindow.init(:request_log)
-    SlidingWindow.check("user_1", table: :request_log)
-
-  Test usage (each test creates a unique table name):
-    table = :"sw_\#{System.unique_integer([:positive])}"
-    SlidingWindow.init(table)
-    SlidingWindow.check("user_1", table: table)
-  """
-
-  @doc "Create the ETS table. Returns the table name for use in subsequent calls."
-  def init(table_name) do
-    :ets.new(table_name, [:named_table, :public, :set,
-      read_concurrency: true, write_concurrency: true])
-    table_name
+  def project do
+    [
+      app: :shortener,
+      version: "0.1.0",
+      elixir: "~> 1.16",
+      elixirc_paths: elixirc_paths(Mix.env()),
+      aliases: aliases(),
+      deps: deps()
+    ]
   end
 
-  @doc """
-  Check whether `key` can make a request in the current sliding window.
+  def application, do: [extra_applications: [:logger], mod: {Shortener.Application, []}]
 
-  opts:
-    table:     ETS table name (required)
-    limit:     max requests per window (default 100)
-    window_ms: window size in ms (default 60_000)
+  defp elixirc_paths(:test), do: ["lib", "test/support"]
+  defp elixirc_paths(_), do: ["lib"]
 
-  Returns {:ok, count} | {:error, :rate_limited, retry_after_ms}
+  defp deps do
+    [
+      {:ecto_sql, "~> 3.11"},
+      {:postgrex, "~> 0.17"}
+    ]
+  end
+
+  defp aliases do
+    [
+      "ecto.setup": ["ecto.create", "ecto.migrate"],
+      "ecto.reset": ["ecto.drop", "ecto.setup"],
+      test: ["ecto.create --quiet", "ecto.migrate --quiet", "test"]
+    ]
+  end
+end
+```
+
+### Step 2: Repo and application
+
+```elixir
+# lib/shortener/repo.ex
+defmodule Shortener.Repo do
+  use Ecto.Repo, otp_app: :shortener, adapter: Ecto.Adapters.Postgres
+end
+```
+
+```elixir
+# lib/shortener/application.ex
+defmodule Shortener.Application do
+  use Application
+
+  @impl true
+  def start(_type, _args) do
+    children = [
+      Shortener.Repo,
+      Shortener.Counter
+    ]
+    Supervisor.start_link(children, strategy: :one_for_one, name: Shortener.Supervisor)
+  end
+end
+```
+
+### Step 3: ETS Counter — async-safe design
+
+```elixir
+# lib/shortener/counter.ex
+defmodule Shortener.Counter do
+  @moduledoc """
+  ETS counter. The table name is configurable so tests can use per-test tables.
+
+  In production, a single named table is fine. In tests, pass `table: :unique_name`
+  when starting to avoid name collisions with `async: true` suites.
   """
-  def check(key, opts) do
-    table     = Keyword.fetch!(opts, :table)
-    limit     = Keyword.get(opts, :limit, 100)
-    window_ms = Keyword.get(opts, :window_ms, 60_000)
+  use GenServer
 
-    now    = System.monotonic_time(:millisecond)
-    cutoff = now - window_ms
+  @default_table :shortener_counter
 
-    timestamps = case :ets.lookup(table, key) do
-      []                         -> []
-      [{^key, ts}]               -> ts
+  def start_link(opts \\ []) do
+    GenServer.start_link(__MODULE__, opts, name: Keyword.get(opts, :name, __MODULE__))
+  end
+
+  @spec incr(atom() | :ets.tid(), term(), pos_integer()) :: integer()
+  def incr(table \\ @default_table, key, delta \\ 1) do
+    :ets.update_counter(table, key, delta, {key, 0})
+  end
+
+  @spec get(atom() | :ets.tid(), term()) :: integer()
+  def get(table \\ @default_table, key) do
+    case :ets.lookup(table, key) do
+      [{^key, n}] -> n
+      [] -> 0
     end
+  end
 
-    in_window = Enum.filter(timestamps, fn ts -> ts > cutoff end)
-    count     = length(in_window)
+  @impl true
+  def init(opts) do
+    table_name = Keyword.get(opts, :table, @default_table)
+    :ets.new(table_name, [:named_table, :public, :set, read_concurrency: true,
+                          write_concurrency: true])
+    {:ok, %{table: table_name}}
+  end
+end
+```
 
-    if count < limit do
-      :ets.insert(table, {key, [now | in_window]})
-      {:ok, count + 1}
-    else
-      oldest     = Enum.min(in_window)
-      expires_in = oldest + window_ms - now
-      {:error, :rate_limited, expires_in}
+### Step 4: Generator
+
+```elixir
+# lib/shortener/generator.ex
+defmodule Shortener.Generator do
+  @moduledoc "Generates URL-safe short codes from an incrementing id."
+
+  @alphabet ~c"abcdefghijkmnpqrstuvwxyz23456789"
+  @base length(@alphabet)
+
+  @spec encode(non_neg_integer()) :: String.t()
+  def encode(0), do: <<Enum.at(@alphabet, 0)>>
+  def encode(n) when n > 0, do: do_encode(n, []) |> List.to_string()
+
+  defp do_encode(0, acc), do: acc
+  defp do_encode(n, acc) do
+    do_encode(div(n, @base), [Enum.at(@alphabet, rem(n, @base)) | acc])
+  end
+end
+```
+
+### Step 5: Link schema and context
+
+```elixir
+# lib/shortener/link.ex
+defmodule Shortener.Link do
+  use Ecto.Schema
+  import Ecto.Changeset
+
+  schema "links" do
+    field :code, :string
+    field :url, :string
+    field :clicks, :integer, default: 0
+    timestamps()
+  end
+
+  def changeset(link, attrs) do
+    link
+    |> cast(attrs, [:code, :url, :clicks])
+    |> validate_required([:code, :url])
+    |> unique_constraint(:code)
+  end
+end
+```
+
+```elixir
+# lib/shortener/links.ex
+defmodule Shortener.Links do
+  alias Shortener.{Link, Repo, Generator, Counter}
+
+  @spec create(String.t()) :: {:ok, Link.t()} | {:error, Ecto.Changeset.t()}
+  def create(url) do
+    id = Counter.incr(:shortener_counter, :next_id)
+    code = Generator.encode(id)
+
+    %Link{}
+    |> Link.changeset(%{code: code, url: url})
+    |> Repo.insert()
+  end
+
+  @spec resolve(String.t()) :: {:ok, Link.t()} | :not_found
+  def resolve(code) do
+    case Repo.get_by(Link, code: code) do
+      nil -> :not_found
+      link -> {:ok, link}
     end
   end
 end
 ```
 
-### Step 2: Given tests — must pass without modification
-
-The sliding window test creates a unique ETS table per test via `setup`. The `on_exit`
-callback ensures the table is deleted even if the test fails. Because each test has its
-own table, there is no shared state and `async: true` is safe.
+### Step 6: Migration
 
 ```elixir
-# test/api_gateway/rate_limiter/sliding_window_test.exs
-defmodule ApiGateway.RateLimiter.SlidingWindowTest do
-  use ExUnit.Case, async: true   # ← safe because each test has its own table
+# priv/repo/migrations/20260101000000_create_links.exs
+defmodule Shortener.Repo.Migrations.CreateLinks do
+  use Ecto.Migration
 
-  alias ApiGateway.RateLimiter.SlidingWindow
-
-  setup do
-    # Each test gets a uniquely named ETS table — no conflict with other tests
-    table = :"sw_#{System.unique_integer([:positive])}"
-    SlidingWindow.init(table)
-
-    # Cleanup: delete the table when the test exits (even on failure)
-    on_exit(fn ->
-      if :ets.whereis(table) != :undefined do
-        :ets.delete(table)
-      end
-    end)
-
-    {:ok, table: table}
-  end
-
-  test "first request is allowed", %{table: table} do
-    assert {:ok, 1} =
-      SlidingWindow.check("user_1", table: table, limit: 10, window_ms: 60_000)
-  end
-
-  test "requests within limit are all allowed", %{table: table} do
-    for i <- 1..10 do
-      assert {:ok, ^i} =
-        SlidingWindow.check("user_2", table: table, limit: 10, window_ms: 60_000)
+  def change do
+    create table(:links) do
+      add :code, :string, null: false
+      add :url, :text, null: false
+      add :clicks, :integer, null: false, default: 0
+      timestamps()
     end
-  end
-
-  test "request over limit is denied with retry_after", %{table: table} do
-    for _ <- 1..5 do
-      SlidingWindow.check("user_3", table: table, limit: 5, window_ms: 60_000)
-    end
-
-    assert {:error, :rate_limited, retry_after} =
-      SlidingWindow.check("user_3", table: table, limit: 5, window_ms: 60_000)
-
-    assert is_integer(retry_after)
-    assert retry_after > 0
-  end
-
-  test "window expiry frees up the slot", %{table: table} do
-    for _ <- 1..3 do
-      SlidingWindow.check("user_4", table: table, limit: 3, window_ms: 100)
-    end
-
-    assert {:error, :rate_limited, _} =
-      SlidingWindow.check("user_4", table: table, limit: 3, window_ms: 100)
-
-    Process.sleep(150)
-
-    assert {:ok, _} =
-      SlidingWindow.check("user_4", table: table, limit: 3, window_ms: 100)
-  end
-
-  test "different users have independent limits", %{table: table} do
-    for _ <- 1..3 do
-      SlidingWindow.check("alice", table: table, limit: 3, window_ms: 60_000)
-    end
-
-    # alice is over limit, but bob is not
-    assert {:error, :rate_limited, _} =
-      SlidingWindow.check("alice", table: table, limit: 3, window_ms: 60_000)
-
-    assert {:ok, 1} =
-      SlidingWindow.check("bob", table: table, limit: 3, window_ms: 60_000)
-  end
-
-  test "concurrent requests from many processes do not corrupt counts", %{table: table} do
-    results =
-      1..50
-      |> Task.async_stream(fn _ ->
-        SlidingWindow.check("concurrent_user", table: table, limit: 20, window_ms: 60_000)
-      end, max_concurrency: 50)
-      |> Enum.map(fn {:ok, result} -> result end)
-
-    allowed  = Enum.count(results, &match?({:ok, _}, &1))
-    denied   = Enum.count(results, &match?({:error, :rate_limited, _}, &1))
-
-    assert allowed + denied == 50
-    # Some may be over limit due to concurrent writes, but count is reasonable
-    assert allowed >= 10
+    create unique_index(:links, [:code])
   end
 end
 ```
 
-The isolated server test demonstrates `start_supervised!` for GenServer lifecycle management.
-Each test creates a GenServer with a unique name, and `start_supervised!` automatically
-stops the process when the test exits.
+### Step 7: DataCase with sandbox
 
 ```elixir
-# test/api_gateway/rate_limiter/isolated_server_test.exs
-defmodule ApiGateway.RateLimiter.IsolatedServerTest do
+# test/support/data_case.ex
+defmodule Shortener.DataCase do
   @moduledoc """
-  Demonstrates start_supervised! for GenServer lifecycle in tests.
-  Each test gets its own GenServer with a unique name — no naming conflicts.
+  Base case for tests that hit the database. Uses Ecto Sandbox in manual mode.
+
+  Tests can opt in to `async: true` IF they don't spawn processes outside OTP.
+  If you spawn a raw `spawn/1`, either switch to `async: false` + `{:shared, self()}`
+  or propagate `$callers` manually.
   """
+  use ExUnit.CaseTemplate
+
+  using do
+    quote do
+      import Ecto.Query
+      alias Shortener.Repo
+    end
+  end
+
+  setup tags do
+    :ok = Ecto.Adapters.SQL.Sandbox.checkout(Shortener.Repo)
+
+    if tags[:shared_db] do
+      Ecto.Adapters.SQL.Sandbox.mode(Shortener.Repo, {:shared, self()})
+    end
+
+    :ok
+  end
+end
+```
+
+### Step 8: Counter test — per-test table for async safety
+
+```elixir
+# test/shortener/counter_test.exs
+defmodule Shortener.CounterTest do
   use ExUnit.Case, async: true
 
-  # Minimal GenServer to demonstrate the pattern
-  defmodule Counter do
-    use GenServer
+  alias Shortener.Counter
 
-    def start_link(opts) do
-      name    = Keyword.fetch!(opts, :name)
-      initial = Keyword.get(opts, :initial, 0)
-      GenServer.start_link(__MODULE__, initial, name: name)
-    end
-
-    def value(server),     do: GenServer.call(server, :value)
-    def increment(server), do: GenServer.cast(server, :increment)
-
-    def init(n),                     do: {:ok, n}
-    def handle_call(:value, _, n),   do: {:reply, n, n}
-    def handle_cast(:increment, n),  do: {:noreply, n + 1}
+  setup do
+    table = String.to_atom("counter_#{:erlang.unique_integer([:positive])}")
+    start_supervised!({Counter, name: {:via, Registry, {Shortener.CounterRegistry, table}},
+                      table: table})
+    {:ok, table: table}
+  rescue
+    # Registry may not exist in the minimal project — fall back to unnamed server
+    _ ->
+      table = String.to_atom("counter_#{:erlang.unique_integer([:positive])}")
+      {:ok, _pid} = Counter.start_link(name: :"counter_srv_#{table}", table: table)
+      {:ok, table: table}
   end
 
-  test "start_supervised! cleans up the process automatically" do
-    name = :"counter_#{System.unique_integer([:positive])}"
-
-    pid = start_supervised!({Counter, [name: name, initial: 5]})
-
-    assert is_pid(pid)
-    assert Process.alive?(pid)
-    assert Counter.value(name) == 5
-
-    # No on_exit needed — start_supervised! registers automatic cleanup
+  test "incr/3 initialises from zero and increments", %{table: t} do
+    assert Counter.incr(t, :a) == 1
+    assert Counter.incr(t, :a) == 2
+    assert Counter.incr(t, :a, 10) == 12
   end
 
-  test "each test has its own counter — no interference" do
-    name = :"counter_#{System.unique_integer([:positive])}"
-    start_supervised!({Counter, [name: name]})
-
-    Counter.increment(name)
-    Counter.increment(name)
-
-    assert Counter.value(name) == 2
-    # Even if another test has a Counter and increments it, this name is unique
+  test "get/2 reflects the latest value", %{table: t} do
+    Counter.incr(t, :b, 5)
+    assert Counter.get(t, :b) == 5
   end
 
-  test "stop_supervised! stops the process mid-test" do
-    name = :"counter_stop_#{System.unique_integer([:positive])}"
-    pid  = start_supervised!({Counter, [name: name]}, id: :stoppable_counter)
-
-    Counter.increment(name)
-    assert Counter.value(name) == 1
-
-    stop_supervised!(:stoppable_counter)
-
-    refute Process.alive?(pid)
-  end
-
-  test "processes started in setup are independent per test" do
-    name = :"counter_#{System.unique_integer([:positive])}"
-    start_supervised!({Counter, [name: name]})
-
-    # This test's counter starts at 0 — no contamination from other tests
-    assert Counter.value(name) == 0
+  test "different keys are independent", %{table: t} do
+    Counter.incr(t, :x)
+    Counter.incr(t, :y, 3)
+    assert Counter.get(t, :x) == 1
+    assert Counter.get(t, :y) == 3
   end
 end
 ```
 
-### Step 3: Run the tests
+### Step 9: Generator test — pure, trivially async
+
+```elixir
+# test/shortener/generator_test.exs
+defmodule Shortener.GeneratorTest do
+  use ExUnit.Case, async: true
+
+  alias Shortener.Generator
+
+  test "encodes zero" do
+    assert Generator.encode(0) == "a"
+  end
+
+  test "produces unique codes for unique ids" do
+    codes = for i <- 0..999, do: Generator.encode(i)
+    assert length(Enum.uniq(codes)) == 1000
+  end
+
+  test "avoids visually confusing characters (no l, o, 0, 1)" do
+    for i <- 0..10_000 do
+      code = Generator.encode(i)
+      refute code =~ ~r/[lo01]/
+    end
+  end
+end
+```
+
+### Step 10: Links test — Ecto sandbox with async
+
+```elixir
+# test/shortener/links_test.exs
+defmodule Shortener.LinksTest do
+  use Shortener.DataCase, async: true
+
+  alias Shortener.Links
+
+  # Each test runs in its own transaction — other async tests never see this row.
+  test "create/1 inserts a link" do
+    assert {:ok, link} = Links.create("https://example.com")
+    assert is_binary(link.code)
+    assert link.url == "https://example.com"
+  end
+
+  test "create/1 produces unique codes across many calls" do
+    urls = for i <- 1..50, do: "https://ex#{i}.com"
+    results = Enum.map(urls, &Links.create/1)
+    codes = Enum.map(results, fn {:ok, l} -> l.code end)
+    assert length(Enum.uniq(codes)) == 50
+  end
+
+  test "resolve/1 returns a link by code" do
+    {:ok, link} = Links.create("https://target.com")
+    assert {:ok, found} = Links.resolve(link.code)
+    assert found.id == link.id
+  end
+
+  test "resolve/1 returns :not_found for unknown codes" do
+    assert Links.resolve("nope") == :not_found
+  end
+
+  @tag :shared_db
+  test "shared mode allows spawned processes to see the sandbox connection" do
+    {:ok, link} = Links.create("https://spawned.com")
+
+    task = Task.async(fn -> Links.resolve(link.code) end)
+    assert {:ok, _} = Task.await(task)
+  end
+end
+```
+
+### Step 11: `test_helper.exs`
+
+```elixir
+ExUnit.start()
+Ecto.Adapters.SQL.Sandbox.mode(Shortener.Repo, :manual)
+```
+
+### Step 12: Run
 
 ```bash
-# Run in parallel — should be faster than async: false version
-mix test test/api_gateway/rate_limiter/ --trace
+mix test --trace
+# observe: tests across modules interleave; no crashes; no "already_started"
 ```
 
 ---
 
-## Trade-off analysis
+## Trade-offs and production gotchas
 
-| Isolation technique | When to use | Cost |
-|--------------------|-------------|------|
-| Unique ETS table name per test | Named ETS tables that cannot be redesigned | Low — add `System.unique_integer` |
-| Unnamed ETS table (no `:named_table`) | New code you control | Lowest — no name needed |
-| `start_supervised!` | GenServers started in tests | Low — built into ExUnit |
-| `async: false` with strict cleanup | Legacy code that cannot be changed | Medium — serializes tests |
-| Dependency injection (pass name as arg) | New code being designed | Best — enables async, most flexible |
+**1. `async: true` is not free — debug flakiness is harder**
+When a test fails only when other tests run in parallel, you have shared state leakage.
+Reproduce with `mix test --seed N` (seed is printed on failure). Track down the leak before
+merging — a flaky test that passes on retry is almost always a hidden data race.
 
-| `async:` setting | Safe with |
-|-----------------|----------|
-| `async: true` | Isolated state per test — unique names, no global env |
-| `async: false` | Global resources that cannot be isolated |
-| Never | Tests that modify production data in a shared DB without sandbox |
+**2. Named GenServers kill async**
+Any module that calls `GenServer.start_link(..., name: __MODULE__)` is `async: false` by
+default. Refactor to accept `:name` in opts, or use a `Registry` for per-test names.
+
+**3. Named ETS tables force serialization**
+Same story as GenServers. Either use unnamed tables (pass the `tid` around) or unique
+names per test. The performance cost of unnamed tables is negligible.
+
+**4. `Application.put_env` is global and persistent across tests**
+Avoid mutating application env mid-test. If config must vary per test, read it from a
+process dictionary or via a setup-time override that the test helper clears.
+
+**5. Ecto sandbox + raw `spawn` = connection ownership error**
+Spawning with plain `spawn/1` doesn't propagate `$callers`. Ecto can't find your sandbox
+connection → `Ecto.SandboxTest.CheckoutError`. Use `Task.async/1` (which sets callers) or
+propagate manually.
+
+**6. `start_supervised!` over `start_link` in tests**
+`start_supervised!` registers the child with ExUnit's supervisor, ensuring it's stopped
+before the next test starts. Using `start_link` leaks processes across tests that accumulate
+until the VM runs out.
+
+**7. `Process.sleep` is a smell**
+If your test calls `Process.sleep(100)` "to let the cast settle", you have a race. Use
+`assert_receive`, `GenServer.call` to force a sync point, or `Process.monitor` + `assert_receive {:DOWN, ...}`
+for process death. Sleep makes suites slow AND flaky.
+
+**8. When NOT to use `async: true`**
+- Tests that toggle `Application.put_env` for the SUT's dependencies (HTTP base URL, feature
+  flags read at runtime).
+- Tests that spawn raw (non-OTP) processes which hit the DB.
+- Tests that rely on named singletons in library code you can't modify.
+- Tests exercising global rate limiters or circuit breakers by design.
 
 ---
 
-## Common production mistakes
+## Benchmark
 
-**1. `async: true` with `Application.put_env/3`**
-`Application.put_env` modifies global application environment shared by all
-test processes. Two concurrent tests that each call `put_env` for the same key will
-race. Use dependency injection (pass the value as a parameter) instead.
+Measure suite wall-clock with and without `async: true`:
 
-**2. `start_supervised!` with a hardcoded module name**
-```elixir
-# Conflict: two tests start MyServer with the same registered name
-start_supervised!(MyServer)   # name: MyServer by default
-```
-Always generate a unique name: `start_supervised!({MyServer, name: unique_name()})`.
+```bash
+# baseline (async: false everywhere)
+time MIX_ENV=test mix test
 
-**3. ETS cleanup in `on_exit` that crashes silently**
-If the ETS table was already deleted (by another cleanup or by the test itself),
-`:ets.delete/1` raises `ArgumentError`. Wrap it:
-```elixir
-on_exit(fn ->
-  if :ets.whereis(table) != :undefined, do: :ets.delete(table)
-end)
+# after this exercise
+time MIX_ENV=test mix test
 ```
 
-**4. `on_exit` capturing process dictionary state**
-`on_exit` callbacks run in a separate ExUnit cleanup process, not in the test
-process. `Process.get/1` inside `on_exit` returns `nil`. Capture data in closure
-variables, not in the process dictionary.
-
-**5. Named ETS tables in `setup_all` instead of `setup`**
-`setup_all` runs once for the entire test module and creates one shared table.
-With `async: true`, tests run in parallel and all write to the same table.
-Create ETS tables in `setup` (per test), not `setup_all`.
+On an 8-core laptop, expect a 5–7× speedup for suites with > 100 tests where most work is
+I/O (DB round-trips). CPU-bound suites see less benefit because schedulers are already
+busy on each test.
 
 ---
 
 ## Resources
 
-- [ExUnit.Callbacks — HexDocs](https://hexdocs.pm/ex_unit/ExUnit.Callbacks.html)
-- [ExUnit — HexDocs](https://hexdocs.pm/ex_unit/ExUnit.html)
-- [ETS — Erlang Docs](https://www.erlang.org/doc/man/ets.html)
-- [Testing Elixir — Pragmatic Programmers](https://pragprog.com/titles/lmelixir/testing-elixir/)
+- [ExUnit docs — `async: true`](https://hexdocs.pm/ex_unit/ExUnit.Case.html) — see the "Parallel tests" section
+- [Ecto Sandbox docs](https://hexdocs.pm/ecto_sql/Ecto.Adapters.SQL.Sandbox.html) — definitive reference for `:manual`, `{:shared, pid}`, `$callers`
+- ["Concurrent tests with Ecto" — José Valim](https://dashbit.co/blog/concurrent-tests-with-ecto) — original rationale for the sandbox
+- ["Faster tests in Elixir" — Chris Keathley](https://keathley.io/) — practical migration guide
+- [start_supervised! docs](https://hexdocs.pm/ex_unit/ExUnit.Callbacks.html#start_supervised!/2)
+- [`$callers` internals](https://hexdocs.pm/elixir/Process.html#get/0) — Process.get(:"$callers")

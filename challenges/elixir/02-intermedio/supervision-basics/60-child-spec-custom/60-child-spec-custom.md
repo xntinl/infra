@@ -2,9 +2,6 @@
 
 **Project**: `custom_child_spec` — a worker module that overrides `child_spec/1` to expose per-instance id, restart strategy, and shutdown timeout.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
-
 ---
 
 ## Project context
@@ -35,6 +32,11 @@ custom_child_spec/
 ```
 
 ---
+
+
+## Why X and not Y
+
+- **Why not accept the auto-generated spec?** It works for typical workers but hides `id`, `restart`, and `shutdown` that often need tuning.
 
 ## Core concepts
 
@@ -98,7 +100,31 @@ values, or a custom `child_spec/1` that derives id from opts.
 
 ---
 
+## Design decisions
+
+**Option A — default child_spec from `use GenServer`**
+- Pros: simpler upfront, fewer moving parts.
+- Cons: hides the trade-off that this exercise exists to teach.
+
+**Option B — custom `child_spec/1` (chosen)**
+- Pros: explicit about the semantic that matters in production.
+- Cons: one more concept to internalize.
+
+→ Chose **B** because custom `id`, `restart`, `shutdown`, `type` are needed when defaults don't match the role.
+
+
 ## Implementation
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defp deps do
+  [
+    # stdlib-only by default; add `{:benchee, "~> 1.3", only: :dev}` if you benchmark
+  ]
+end
+```
+
 
 ### Step 1: Create the project
 
@@ -260,6 +286,15 @@ mix test
 
 ---
 
+### Why this works
+
+The design leans on OTP primitives that already encode the invariants we care about (supervision, back-pressure, explicit message semantics), so failure modes are visible at the right layer instead of being reinvented ad-hoc. Tests exercise the edges (timeouts, crashes, boundary states), which is where hand-rolled alternatives silently drift over time.
+
+
+## Benchmark
+
+<!-- benchmark N/A: tema conceptual -->
+
 ## Trade-offs and production gotchas
 
 **1. Auto-generated `child_spec/1` uses the module as the id**
@@ -277,7 +312,7 @@ per codebase.
 Setting `shutdown: 30_000` only helps if the worker *implements*
 `terminate/2` and actually uses the grace period. A worker that ignores
 shutdown will still be killed after 30s — it just waited longer first.
-See exercise 62.
+
 
 **4. `:brutal_kill` skips `terminate/2` entirely**
 Don't use `:brutal_kill` on workers that hold OS resources (file
@@ -291,6 +326,11 @@ specs are a tool for the minority of cases that need them; avoid
 ceremony for its own sake.
 
 ---
+
+
+## Reflection
+
+- Un child tarda 60s en arrancar. ¿Qué ajustás en el child_spec y qué NO? Justificá.
 
 ## Resources
 

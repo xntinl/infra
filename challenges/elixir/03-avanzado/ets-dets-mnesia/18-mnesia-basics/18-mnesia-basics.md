@@ -1,573 +1,466 @@
-# Mnesia Basics
+# Mnesia basics: schemas, transactions, and storage types
+
+**Project**: `mnesia_intro` — a single-node order book that introduces schema creation, transactions, dirty vs safe reads, and the `ram_copies` / `disc_copies` / `disc_only_copies` trade-off.
+
+**Difficulty**: ★★★★☆
+**Estimated time**: 3–6 hours
+
+---
 
 ## Project context
 
-You are building `api_gateway`, an internal HTTP gateway that routes traffic to microservices.
-This exercise focuses on session management and atomic credit transfers using Mnesia --
-sessions must survive individual node restarts, be readable from any node in the cluster,
-and support transactional operations where renewing a session and invalidating old ones
-must be atomic.
+You're prototyping an in-memory order book for a desk that trades maybe 50k orders/day. The
+product team wants ACID-ish behavior (no partial updates), persistence across restarts, and the
+option to scale to a two-node cluster later. Postgres is an option but the team wants to
+evaluate Mnesia first because everything else is already BEAM.
 
-Project structure:
+Before writing distributed code you need to internalize Mnesia as a local engine: how the schema
+lives on disk, how transactions differ from "dirty" operations, and what each storage type means
+for durability and throughput. This exercise stays on a single node; distribution lands in a
+later exercise.
+
+The deliverable is an `OrderBook` module with `place/1`, `cancel/1`, `get/1`, and
+`match_bids_for/1`, running against three Mnesia tables (`orders`, `executions`, `accounts`).
+All writes are wrapped in `:mnesia.transaction/1`. Tests exercise rollback on error, dirty reads
+for the hot path, and survival across a node restart.
 
 ```
-api_gateway/
+mnesia_intro/
 ├── lib/
-│   └── api_gateway/
+│   └── mnesia_intro/
 │       ├── application.ex
-│       ├── router.ex
-│       └── auth/
-│           ├── session_store.ex
-│           └── account_system.ex
+│       ├── schema.ex
+│       └── order_book.ex
 ├── test/
-│   └── api_gateway/
-│       └── auth/
-│           ├── session_store_test.exs
-│           └── account_system_test.exs
+│   └── order_book_test.exs
 └── mix.exs
 ```
 
 ---
 
-## The business problem
+## Core concepts
 
-Two requirements:
+### 1. Schema, tables, storage types
 
-1. **Session store**: the gateway validates session tokens on every request. Sessions
-   must be readable from any node, must survive node restarts, and must support
-   "invalidate all sessions for user X" atomically.
+Mnesia stores its schema in a file under `-mnesia dir`. Before you can create tables, you must
+create the schema on the node (`:mnesia.create_schema/1`). The schema itself is a table with a
+storage type.
 
-2. **Credit transfers between accounts**: a billing module needs atomic debit + credit.
-   Both updates must succeed or neither happens. A crash mid-transfer must not leave
-   accounts in an inconsistent state.
+Three storage types for tables:
 
----
+| Storage             | RAM | Disk | Survives restart | Throughput          |
+|---------------------|-----|------|------------------|---------------------|
+| `ram_copies`        | yes | no   | no               | ETS-class           |
+| `disc_copies`       | yes | yes  | yes              | ETS + async log     |
+| `disc_only_copies`  | no  | yes  | yes              | DETS-class (slow)   |
 
-## Why Mnesia and not DETS + replication
+`disc_copies` is the sweet spot: reads are RAM-speed (it's ETS underneath), writes are logged to
+a transaction log plus periodic dumps to DETS. You get durability without paying DETS latency on
+every read.
 
-DETS is per-node. Sharing it across nodes would require a distributed file system
-(NFS, FUSE) with all the associated failure modes. Mnesia is designed from the ground up
-for distributed use: it replicates tables to multiple nodes, coordinates writes with
-distributed locks, and recovers consistently after node failures.
+### 2. Transactions vs dirty operations
 
-## The Mnesia bootstrapping order
+`:mnesia.transaction/1` wraps a function in ACID-ish semantics:
 
-Mnesia has a strict initialization sequence that cannot be skipped:
+- Reads see a consistent snapshot.
+- Writes are atomic: either all succeed or none does.
+- Locks are acquired (`:read`, `:write`, `:sticky_write`) and released on commit/abort.
+- If the function raises or returns via `:mnesia.abort/1`, the whole block is rolled back.
+
+Dirty operations (`:mnesia.dirty_read`, `:mnesia.dirty_write`) skip the lock manager. They're
+ETS-speed on `ram_copies` and `disc_copies`, at the cost of no isolation. Use them for
+read-heavy hot paths where stale reads are tolerable.
 
 ```
-1. :mnesia.create_schema([node()]) -- once per node, persists to disk
-2. :mnesia.start()                 -- start the Mnesia application
-3. :mnesia.create_table(...)       -- define tables (idempotent with {:aborted, {:already_exists, T}})
-4. :mnesia.wait_for_tables(...)    -- ALWAYS wait before making queries
+  read()   -> 5 µs  (dirty)  | 40 µs (transaction)
+  write()  -> 8 µs  (dirty)  | 80 µs (transaction, incl. log)
 ```
 
-Skipping step 4 causes `{:aborted, {no_exists, TableName}}` errors on the first query
-because Mnesia loads tables asynchronously.
+### 3. Record-based schema
 
-## Transactional vs dirty operations
-
-Every Mnesia read or write can be transactional or dirty:
+Mnesia tables are schema-ed on Erlang records. In Elixir:
 
 ```elixir
-# Transactional: ACID, distributed lock, ~3-10x slower
-:mnesia.transaction(fn ->
-  [session] = :mnesia.read({Session, id}, :write)
-  :mnesia.write(%{session | expires_at: new_expiry})
-end)
-
-# Dirty: no lock, no atomicity, ~10-100x faster
-:mnesia.dirty_read(Session, id)
-:mnesia.dirty_write(%Session{...})
+require Record
+Record.defrecord(:order, [:id, :side, :symbol, :qty, :price, :account_id, :status])
 ```
 
-Use dirty operations for reads of data that changes infrequently (cached config,
-active session lookups where stale data is acceptable). Use transactions for any
-operation that reads and then writes -- without a write lock, two concurrent processes
-can read the same value and both write conflicting updates.
+Each row is a tuple `{:order, id, side, symbol, qty, price, account_id, status}`. The first
+element is the table name, the second is the primary key. Queries by primary key are O(1);
+queries by other attributes need `:mnesia.index_read/3` (if you declared an index) or a match
+spec.
+
+### 4. Transaction retries
+
+Mnesia may restart a transaction internally when it detects a deadlock. That means the function
+you pass can run more than once. It must be idempotent: no `IO.puts`, no `send`, no external
+effects, no accumulators held outside the function.
+
+### 5. When Mnesia is not the answer
+
+- Multi-datacenter replication: Mnesia assumes a low-latency cluster. Latency over WAN breaks
+  its commit protocol.
+- Large tables with high write rate: the transaction log becomes a bottleneck.
+- Schema evolution: `:mnesia.transform_table/3` works but is painful compared to SQL migrations.
+- Queries across many attributes: no planner, no indexes beyond the ones you declare.
 
 ---
 
 ## Implementation
 
-### Step 1: `lib/api_gateway/auth/session_store.ex`
+### Step 1: `mix.exs`
 
 ```elixir
-defmodule ApiGateway.Auth.SessionStore do
-  @moduledoc """
-  Session store backed by Mnesia with disc_copies replication.
+defmodule MnesiaIntro.MixProject do
+  use Mix.Project
 
-  Call setup/0 once at application startup (before start/0).
-  The table is replicated to all nodes that call setup/0.
-
-  Uses disc_copies so that sessions survive node restarts. Index on :user_id
-  enables efficient "invalidate all sessions for user X" without a full table scan.
-  Index on :token enables O(1) token-based lookups for request authentication.
-  """
-
-  @table __MODULE__
-  @ttl_seconds 3_600
-
-  defstruct [:id, :user_id, :token, :expires_at, :metadata]
-
-  # ---------------------------------------------------------------------------
-  # Schema and table setup -- call once at startup
-  # ---------------------------------------------------------------------------
-
-  @spec setup() :: :ok
-  def setup do
-    nodes = [node()]
-
-    case :mnesia.create_schema(nodes) do
-      :ok -> :ok
-      {:error, {_, {:already_exists, _}}} -> :ok
-    end
-
-    :ok = :mnesia.start()
-
-    case :mnesia.create_table(@table, [
-      attributes: [:id, :user_id, :token, :expires_at, :metadata],
-      disc_copies: nodes,
-      type: :set,
-      index: [:user_id, :token]
-    ]) do
-      {:atomic, :ok} -> :ok
-      {:aborted, {:already_exists, @table}} -> :ok
-    end
-
-    # ALWAYS wait for tables before making queries
-    :ok = :mnesia.wait_for_tables([@table], 10_000)
+  def project do
+    [
+      app: :mnesia_intro,
+      version: "0.1.0",
+      elixir: "~> 1.16",
+      start_permanent: Mix.env() == :prod,
+      deps: []
+    ]
   end
 
-  # ---------------------------------------------------------------------------
-  # Public API
-  # ---------------------------------------------------------------------------
+  def application do
+    [
+      extra_applications: [:logger, :mnesia],
+      mod: {MnesiaIntro.Application, []}
+    ]
+  end
+end
+```
 
-  @doc """
-  Creates a new session for a user. Uses a transaction to ensure the write is
-  atomic and replicated to all nodes with disc_copies of this table.
+### Step 2: `lib/mnesia_intro/schema.ex`
+
+```elixir
+defmodule MnesiaIntro.Schema do
+  @moduledoc """
+  Creates the Mnesia schema and tables on this node if they do not exist.
+
+  Call `ensure!/0` at application startup. It's idempotent: running it twice
+  is harmless.
   """
-  @spec create(pos_integer(), map()) :: {:ok, t()} | {:error, term()}
-  def create(user_id, metadata \\ %{}) do
-    session = %__MODULE__{
-      id: :crypto.strong_rand_bytes(16) |> Base.url_encode64(padding: false),
-      user_id: user_id,
-      token: :crypto.strong_rand_bytes(32) |> Base.url_encode64(padding: false),
-      expires_at: :erlang.system_time(:second) + @ttl_seconds,
-      metadata: metadata
-    }
+  require Record
+  require Logger
 
-    case :mnesia.transaction(fn -> :mnesia.write(session) end) do
-      {:atomic, :ok} -> {:ok, session}
+  Record.defrecord(:order, [:id, :side, :symbol, :qty, :price, :account_id, :status])
+  Record.defrecord(:execution, [:id, :order_id, :qty, :price, :ts])
+  Record.defrecord(:account, [:id, :balance, :updated_at])
+
+  @spec ensure!() :: :ok
+  def ensure! do
+    :stopped = :mnesia.stop()
+    create_schema()
+    :ok = :mnesia.start()
+    ensure_table(:order, [:id, :side, :symbol, :qty, :price, :account_id, :status], [:symbol])
+    ensure_table(:execution, [:id, :order_id, :qty, :price, :ts], [:order_id])
+    ensure_table(:account, [:id, :balance, :updated_at], [])
+    :ok = :mnesia.wait_for_tables([:order, :execution, :account], 5_000)
+    :ok
+  end
+
+  defp create_schema do
+    case :mnesia.create_schema([node()]) do
+      :ok -> :ok
+      {:error, {_node, {:already_exists, _}}} -> :ok
+      {:error, reason} -> raise "mnesia schema creation failed: #{inspect(reason)}"
+    end
+  end
+
+  defp ensure_table(name, attrs, index_attrs) do
+    opts = [
+      attributes: attrs,
+      disc_copies: [node()],
+      index: index_attrs,
+      type: :set
+    ]
+
+    case :mnesia.create_table(name, opts) do
+      {:atomic, :ok} -> :ok
+      {:aborted, {:already_exists, ^name}} -> :ok
+      {:aborted, reason} -> raise "create_table #{name} failed: #{inspect(reason)}"
+    end
+  end
+end
+```
+
+### Step 3: `lib/mnesia_intro/application.ex`
+
+```elixir
+defmodule MnesiaIntro.Application do
+  @moduledoc false
+  use Application
+
+  @impl true
+  def start(_type, _args) do
+    MnesiaIntro.Schema.ensure!()
+    Supervisor.start_link([], strategy: :one_for_one, name: MnesiaIntro.Supervisor)
+  end
+end
+```
+
+### Step 4: `lib/mnesia_intro/order_book.ex`
+
+```elixir
+defmodule MnesiaIntro.OrderBook do
+  @moduledoc """
+  Order book operations wrapped in Mnesia transactions.
+
+  Side conventions: :buy or :sell. qty and price are positive integers
+  (cents and shares — no floats, ever, in financial code).
+  """
+  require MnesiaIntro.Schema
+  import MnesiaIntro.Schema, only: [order: 1, order: 2, execution: 1]
+
+  @type side :: :buy | :sell
+  @type order_id :: pos_integer()
+
+  @spec place(map()) :: {:ok, order_id()} | {:error, term()}
+  def place(%{side: side, symbol: sym, qty: qty, price: price, account_id: acct})
+      when side in [:buy, :sell] and qty > 0 and price > 0 do
+    id = :erlang.unique_integer([:positive, :monotonic])
+
+    txn = fn ->
+      ensure_account!(acct)
+
+      row =
+        order(id: id, side: side, symbol: sym, qty: qty, price: price,
+              account_id: acct, status: :open)
+
+      :ok = :mnesia.write(row)
+      id
+    end
+
+    case :mnesia.transaction(txn) do
+      {:atomic, id} -> {:ok, id}
+      {:aborted, reason} -> {:error, reason}
+    end
+  end
+
+  @spec cancel(order_id()) :: :ok | {:error, term()}
+  def cancel(id) do
+    txn = fn ->
+      case :mnesia.read({:order, id}) do
+        [] -> :mnesia.abort(:not_found)
+        [row] ->
+          :mnesia.write(order(row, status: :cancelled))
+      end
+    end
+
+    case :mnesia.transaction(txn) do
+      {:atomic, :ok} -> :ok
       {:aborted, reason} -> {:error, reason}
     end
   end
 
   @doc """
-  Looks up a session by its token. Uses dirty_index_read because token lookups
-  happen on every request and the slight staleness risk is acceptable for a
-  read-only operation. Checks expiry to avoid returning stale sessions.
+  Dirty read of a single order — used for hot-path lookups where eventual
+  consistency is acceptable.
   """
-  @spec get_by_token(String.t()) :: {:ok, t()} | {:error, :not_found | :expired}
-  def get_by_token(token) do
-    case :mnesia.dirty_index_read(@table, token, :token) do
-      [session] ->
-        if session.expires_at > :erlang.system_time(:second) do
-          {:ok, session}
-        else
-          {:error, :expired}
-        end
-
-      [] ->
-        {:error, :not_found}
+  @spec get(order_id()) :: {:ok, tuple()} | :error
+  def get(id) do
+    case :mnesia.dirty_read({:order, id}) do
+      [row] -> {:ok, row}
+      [] -> :error
     end
   end
 
-  @spec get_active_for_user(pos_integer()) :: [t()]
-  def get_active_for_user(user_id) do
-    now = :erlang.system_time(:second)
-    sessions = :mnesia.dirty_index_read(@table, user_id, :user_id)
-    Enum.filter(sessions, &(&1.expires_at > now))
-  end
-
   @doc """
-  Renews a session by extending its expiry. Uses a transaction with a :write lock
-  to prevent two concurrent renew calls from reading the same old expiry and both
-  writing updates -- the write lock serializes access to this specific session record.
+  Returns all open buy orders for `symbol`, ordered descending by price.
+  Uses an index read (declared on :symbol) for efficient filtering.
   """
-  @spec renew(String.t()) :: {:ok, t()} | {:error, :not_found}
-  def renew(session_id) do
-    result =
-      :mnesia.transaction(fn ->
-        case :mnesia.read({@table, session_id}, :write) do
-          [session] ->
-            new_expiry = :erlang.system_time(:second) + @ttl_seconds
-            updated = %{session | expires_at: new_expiry}
-            :mnesia.write(updated)
-            updated
+  @spec match_bids_for(String.t()) :: [tuple()]
+  def match_bids_for(symbol) do
+    txn = fn -> :mnesia.index_read(:order, symbol, :symbol) end
 
-          [] ->
-            :mnesia.abort(:not_found)
-        end
-      end)
+    case :mnesia.transaction(txn) do
+      {:atomic, rows} ->
+        rows
+        |> Enum.filter(&match?(order(side: :buy, status: :open), &1))
+        |> Enum.sort_by(&order(&1, :price), :desc)
 
-    case result do
-      {:atomic, updated_session} -> {:ok, updated_session}
-      {:aborted, :not_found} -> {:error, :not_found}
+      {:aborted, _} ->
+        []
     end
   end
 
-  @spec invalidate(String.t()) :: :ok
-  def invalidate(session_id) do
-    {:atomic, :ok} = :mnesia.transaction(fn ->
-      :mnesia.delete({@table, session_id})
-    end)
-    :ok
-  end
+  @spec record_execution(order_id(), pos_integer(), pos_integer()) :: :ok | {:error, term()}
+  def record_execution(order_id, qty, price) do
+    txn = fn ->
+      case :mnesia.read({:order, order_id}) do
+        [] ->
+          :mnesia.abort(:order_not_found)
 
-  @doc """
-  Invalidates all sessions for a given user. Uses a transaction to ensure
-  atomicity -- either all sessions are deleted or none are (on abort/retry).
-  Returns the count of deleted sessions for operational visibility.
-  """
-  @spec invalidate_all_for_user(pos_integer()) :: {:ok, non_neg_integer()}
-  def invalidate_all_for_user(user_id) do
-    {:atomic, count} =
-      :mnesia.transaction(fn ->
-        sessions = :mnesia.index_read(@table, user_id, :user_id)
+        [row] ->
+          remaining = order(row, :qty) - qty
 
-        Enum.each(sessions, fn session ->
-          :mnesia.delete({@table, session.id})
-        end)
+          if remaining < 0 do
+            :mnesia.abort(:overfill)
+          else
+            exec =
+              execution(id: :erlang.unique_integer([:positive, :monotonic]),
+                        order_id: order_id, qty: qty, price: price,
+                        ts: System.system_time(:millisecond))
 
-        length(sessions)
-      end)
+            :mnesia.write(exec)
 
-    {:ok, count}
-  end
-
-  @spec cleanup_expired() :: {:cleaned, non_neg_integer()}
-  def cleanup_expired do
-    now = :erlang.system_time(:second)
-    ms = [
-      {
-        {@table, :"$1", :_, :_, :"$2", :_},
-        [{:<, :"$2", now}],
-        [:"$1"]
-      }
-    ]
-
-    expired_ids = :mnesia.dirty_select(@table, ms)
-    Enum.each(expired_ids, fn id -> :mnesia.dirty_delete({@table, id}) end)
-    {:cleaned, length(expired_ids)}
-  end
-end
-```
-
-### Step 2: `lib/api_gateway/auth/account_system.ex`
-
-```elixir
-defmodule ApiGateway.Auth.AccountSystem do
-  @moduledoc """
-  Credit account system demonstrating multi-table atomic Mnesia transactions.
-
-  The canonical use case for transactions: debit + credit must be atomic.
-  Uses write locks in canonical order to prevent deadlocks.
-
-  Canonical lock ordering means: always acquire the lock on the lower ID first.
-  If process A transfers from account 1 to 2 and process B transfers from 2 to 1,
-  both acquire account 1's lock first, then account 2's. No circular wait is possible.
-  """
-
-  defmodule Account do
-    defstruct [:id, :user_id, :balance, :currency]
-  end
-
-  defmodule Transfer do
-    defstruct [:id, :from_account, :to_account, :amount, :timestamp, :status]
-  end
-
-  @account_table Account
-  @transfer_table Transfer
-
-  @spec setup() :: :ok
-  def setup do
-    nodes = [node()]
-    :mnesia.create_schema(nodes)
-    :mnesia.start()
-
-    for {table, attrs} <- [
-      {Account, [:id, :user_id, :balance, :currency]},
-      {Transfer, [:id, :from_account, :to_account, :amount, :timestamp, :status]}
-    ] do
-      case :mnesia.create_table(table, [
-        attributes: attrs,
-        ram_copies: nodes,
-        type: :set
-      ]) do
-        {:atomic, :ok} -> :ok
-        {:aborted, {:already_exists, _}} -> :ok
+            new_status = if remaining == 0, do: :filled, else: :open
+            :mnesia.write(order(row, qty: remaining, status: new_status))
+            :ok
+          end
       end
     end
 
-    :mnesia.wait_for_tables([@account_table, @transfer_table], 10_000)
-  end
-
-  @spec create_account(pos_integer(), number(), String.t()) :: {:ok, Account.t()}
-  def create_account(user_id, initial_balance, currency \\ "USD") do
-    account = %Account{
-      id: :erlang.unique_integer([:monotonic, :positive]),
-      user_id: user_id,
-      balance: initial_balance,
-      currency: currency
-    }
-
-    {:atomic, :ok} = :mnesia.transaction(fn -> :mnesia.write(account) end)
-    {:ok, account}
-  end
-
-  @spec get_balance(pos_integer()) :: {:ok, number(), String.t()} | {:error, :not_found}
-  def get_balance(account_id) do
-    case :mnesia.dirty_read(@account_table, account_id) do
-      [account] -> {:ok, account.balance, account.currency}
-      [] -> {:error, :not_found}
+    case :mnesia.transaction(txn) do
+      {:atomic, :ok} -> :ok
+      {:aborted, reason} -> {:error, reason}
     end
   end
 
-  @spec transfer(pos_integer(), pos_integer(), number()) ::
-          {:ok, Transfer.t()} | {:error, term()}
-  def transfer(from_id, to_id, amount) when amount > 0 do
-    {:atomic, result} =
-      :mnesia.transaction(fn ->
-        # Acquire write locks in canonical order (lower ID first) to prevent deadlocks.
-        # If process A locks account 1 then 2, and process B locks 2 then 1,
-        # they deadlock. Canonical order eliminates that possibility.
-        {first_key, second_key} =
-          if from_id < to_id,
-            do: {{@account_table, from_id}, {@account_table, to_id}},
-            else: {{@account_table, to_id}, {@account_table, from_id}}
+  defp ensure_account!(id) do
+    case :mnesia.read({:account, id}) do
+      [] ->
+        :mnesia.write({:account, id, 0, System.system_time(:millisecond)})
 
-        from_account =
-          case :mnesia.read(first_key, :write) do
-            [acc] -> acc
-            [] -> :mnesia.abort({:not_found, :from_account, from_id})
-          end
-
-        to_account =
-          case :mnesia.read(second_key, :write) do
-            [acc] -> acc
-            [] -> :mnesia.abort({:not_found, :to_account, to_id})
-          end
-
-        if from_account.currency != to_account.currency do
-          :mnesia.abort({:currency_mismatch, from_account.currency, to_account.currency})
-        end
-
-        if from_account.balance < amount do
-          :mnesia.abort({:insufficient_funds, from_account.balance, amount})
-        end
-
-        :mnesia.write(%{from_account | balance: from_account.balance - amount})
-        :mnesia.write(%{to_account | balance: to_account.balance + amount})
-
-        transfer = %Transfer{
-          id: :erlang.unique_integer([:monotonic, :positive]),
-          from_account: from_id,
-          to_account: to_id,
-          amount: amount,
-          timestamp: :erlang.system_time(:second),
-          status: :completed
-        }
-
-        :mnesia.write(transfer)
-        {:ok, transfer}
-      end)
-
-    result
-  end
-
-  @spec transfer_history(pos_integer()) :: [Transfer.t()]
-  def transfer_history(account_id) do
-    from = :mnesia.dirty_index_read(@transfer_table, account_id, :from_account)
-    to = :mnesia.dirty_index_read(@transfer_table, account_id, :to_account)
-    (from ++ to) |> Enum.sort_by(& &1.timestamp, :desc)
+      [_] ->
+        :ok
+    end
   end
 end
 ```
 
-### Step 3: Tests
+### Step 5: `test/order_book_test.exs`
 
 ```elixir
-# test/api_gateway/auth/session_store_test.exs
-defmodule ApiGateway.Auth.SessionStoreTest do
+defmodule MnesiaIntro.OrderBookTest do
   use ExUnit.Case, async: false
 
-  alias ApiGateway.Auth.SessionStore
-
-  setup_all do
-    SessionStore.setup()
-    :ok
-  end
+  alias MnesiaIntro.OrderBook
 
   setup do
-    SessionStore.cleanup_expired()
+    # Clean tables before each test — transactional wipe.
+    :mnesia.clear_table(:order)
+    :mnesia.clear_table(:execution)
+    :mnesia.clear_table(:account)
     :ok
   end
 
-  describe "create/2 and get_by_token/1" do
-    test "creates a session and retrieves it by token" do
-      {:ok, session} = SessionStore.create(1, %{device: "mobile"})
-      assert {:ok, fetched} = SessionStore.get_by_token(session.token)
-      assert fetched.id == session.id
-      assert fetched.user_id == 1
+  describe "place/1" do
+    test "persists a new order and returns its id" do
+      {:ok, id} = OrderBook.place(%{side: :buy, symbol: "AAPL", qty: 10, price: 19_050, account_id: 1})
+      assert is_integer(id)
+      assert {:ok, _} = OrderBook.get(id)
     end
 
-    test "returns {:error, :not_found} for unknown token" do
-      assert {:error, :not_found} = SessionStore.get_by_token("nonexistent_token")
-    end
-  end
-
-  describe "renew/1" do
-    test "extends the expiry and returns the updated session" do
-      {:ok, session} = SessionStore.create(10)
-      original_expiry = session.expires_at
-      Process.sleep(10)
-
-      {:ok, renewed} = SessionStore.renew(session.id)
-      assert renewed.expires_at > original_expiry
+    test "creates the account row on first use" do
+      {:ok, _} = OrderBook.place(%{side: :sell, symbol: "MSFT", qty: 5, price: 40_100, account_id: 42})
+      assert [_row] = :mnesia.dirty_read({:account, 42})
     end
   end
 
-  describe "invalidate_all_for_user/1" do
-    test "removes all sessions for a user" do
-      {:ok, _s1} = SessionStore.create(99)
-      {:ok, _s2} = SessionStore.create(99)
+  describe "cancel/1" do
+    test "flips status to :cancelled" do
+      {:ok, id} = OrderBook.place(%{side: :buy, symbol: "AAPL", qty: 10, price: 19_000, account_id: 1})
+      assert :ok = OrderBook.cancel(id)
 
-      {:ok, count} = SessionStore.invalidate_all_for_user(99)
-      assert count >= 2
+      {:ok, row} = OrderBook.get(id)
+      # Row is a record tuple: {:order, id, side, symbol, qty, price, account_id, status}
+      assert elem(row, 7) == :cancelled
+    end
 
-      assert [] = SessionStore.get_active_for_user(99)
+    test "returns :not_found when the id does not exist" do
+      assert {:error, :not_found} = OrderBook.cancel(99_999_999)
+    end
+  end
+
+  describe "record_execution/3 — transactional consistency" do
+    test "decrements qty and marks filled atomically" do
+      {:ok, id} = OrderBook.place(%{side: :sell, symbol: "GOOG", qty: 4, price: 150_000, account_id: 7})
+      :ok = OrderBook.record_execution(id, 4, 150_000)
+
+      {:ok, row} = OrderBook.get(id)
+      assert elem(row, 4) == 0           # qty
+      assert elem(row, 7) == :filled     # status
+    end
+
+    test "aborts on overfill and leaves no execution row" do
+      {:ok, id} = OrderBook.place(%{side: :sell, symbol: "GOOG", qty: 2, price: 150_000, account_id: 7})
+      assert {:error, :overfill} = OrderBook.record_execution(id, 10, 150_000)
+
+      assert :mnesia.dirty_read({:execution, id}) == []
+      {:ok, row} = OrderBook.get(id)
+      assert elem(row, 4) == 2  # untouched
+    end
+  end
+
+  describe "match_bids_for/1" do
+    test "returns only open buys for the symbol, sorted by price desc" do
+      {:ok, _} = OrderBook.place(%{side: :buy, symbol: "AAPL", qty: 1, price: 100, account_id: 1})
+      {:ok, _} = OrderBook.place(%{side: :buy, symbol: "AAPL", qty: 1, price: 200, account_id: 1})
+      {:ok, _} = OrderBook.place(%{side: :sell, symbol: "AAPL", qty: 1, price: 300, account_id: 1})
+
+      prices = OrderBook.match_bids_for("AAPL") |> Enum.map(&elem(&1, 5))
+      assert prices == [200, 100]
     end
   end
 end
 ```
 
-```elixir
-# test/api_gateway/auth/account_system_test.exs
-defmodule ApiGateway.Auth.AccountSystemTest do
-  use ExUnit.Case, async: false
-
-  alias ApiGateway.Auth.AccountSystem
-
-  setup_all do
-    AccountSystem.setup()
-    :ok
-  end
-
-  describe "transfer/3" do
-    test "transfers funds atomically" do
-      {:ok, alice} = AccountSystem.create_account(1, 1000, "USD")
-      {:ok, bob} = AccountSystem.create_account(2, 500, "USD")
-
-      {:ok, _txn} = AccountSystem.transfer(alice.id, bob.id, 200)
-
-      assert {:ok, 800, "USD"} = AccountSystem.get_balance(alice.id)
-      assert {:ok, 700, "USD"} = AccountSystem.get_balance(bob.id)
-    end
-
-    test "returns error and leaves balances unchanged on insufficient funds" do
-      {:ok, alice} = AccountSystem.create_account(10, 100, "USD")
-      {:ok, bob} = AccountSystem.create_account(11, 100, "USD")
-
-      result = AccountSystem.transfer(alice.id, bob.id, 500)
-      assert {:error, {:insufficient_funds, 100, 500}} = result
-
-      # Balances must be unchanged -- rollback verified
-      assert {:ok, 100, "USD"} = AccountSystem.get_balance(alice.id)
-      assert {:ok, 100, "USD"} = AccountSystem.get_balance(bob.id)
-    end
-
-    test "returns error on currency mismatch" do
-      {:ok, usd_acc} = AccountSystem.create_account(20, 500, "USD")
-      {:ok, eur_acc} = AccountSystem.create_account(21, 500, "EUR")
-
-      result = AccountSystem.transfer(usd_acc.id, eur_acc.id, 100)
-      assert {:error, {:currency_mismatch, "USD", "EUR"}} = result
-    end
-  end
-end
-```
-
-### Step 4: Run the tests
+### Step 6: Run it
 
 ```bash
-mix test test/api_gateway/auth/ --trace
+mix deps.get
+mix test
+```
+
+First run creates `Mnesia.nonode@nohost/` directory under the project root. Delete it to start
+fresh. In production set the directory explicitly:
+
+```bash
+iex --erl '-mnesia dir "\"/var/lib/my_app/mnesia\""' -S mix
 ```
 
 ---
 
-## Trade-off analysis
+## Trade-offs and production gotchas
 
-| Aspect | `ram_copies` | `disc_copies` | `disc_only_copies` |
-|--------|-------------|--------------|-------------------|
-| Read latency | Nanoseconds (RAM) | Nanoseconds (RAM cache) | Microseconds (disk I/O) |
-| Write latency | Nanoseconds | Microseconds (WAL write) | Milliseconds |
-| Durability | Lost on all-nodes-crash | Survives any single-node crash | Always durable |
-| RAM usage | Full table in RAM | Full table in RAM | Index only |
-| Use case | Ephemeral sessions, caches | Persistent sessions, config | Large tables, infrequent reads |
+**1. The transaction function must be idempotent.** Mnesia may retry it on deadlock. Any side
+effect (IO, send, calls to external services) runs twice. Do effects **after** the transaction
+commits.
 
-| Operation | Transactional | Dirty |
-|-----------|--------------|-------|
-| Read-modify-write | Required | Race condition |
-| Idempotent read | Overkill | Appropriate |
-| Batch delete of expired entries | Can use dirty | Appropriate |
-| Balance transfer | Required | Data loss |
+**2. `dirty_read` is fast but sees uncommitted writes from other transactions.** In the middle of
+a transaction, a dirty read by another process can see half-applied state. Use only when stale /
+inconsistent data is acceptable.
 
-Reflection: `transfer/3` acquires write locks in `min(from_id, to_id)` order.
-What deadlock scenario does this prevent? Draw the scenario with two concurrent transfers.
+**3. `disc_copies` doubles RAM usage.** Data lives in ETS and in the DETS log. If the table is
+10 GB you need 10+ GB of RAM. Switch to `disc_only_copies` when that's untenable — at the cost of
+DETS-level read latency.
 
----
+**4. Schema lives on disk.** If you rename a table in code but the file still has the old name,
+you get `{:aborted, {:no_exists, :foo}}`. Either migrate (`:mnesia.transform_table`) or delete the
+schema directory and let the code recreate it (development only).
 
-## Common production mistakes
+**5. Indexes are not free.** Each declared index adds an internal table. Writes must update the
+index. A three-index table has ~4x the write cost. Index only what you query on.
 
-**1. Not calling `wait_for_tables` before making queries**
-Mnesia loads tables asynchronously after `start/0`. The first query on a not-yet-loaded
-table returns `{:aborted, {no_exists, TableName}}`. Always call `wait_for_tables` with
-a reasonable timeout (10s) in your application startup sequence.
+**6. `:mnesia.start/0` is asynchronous.** Tables aren't ready immediately. Always call
+`:mnesia.wait_for_tables/2` before issuing reads at boot — skipping it produces sporadic
+`{:aborted, {:no_exists, table}}`.
 
-**2. Using dirty ops for read-modify-write**
-```elixir
-# WRONG -- race condition when two processes run concurrently
-[account] = :mnesia.dirty_read(Account, id)
-:mnesia.dirty_write(%{account | balance: account.balance - amount})
-
-# CORRECT -- write lock prevents concurrent modification
-:mnesia.transaction(fn ->
-  [account] = :mnesia.read({Account, id}, :write)
-  :mnesia.write(%{account | balance: account.balance - amount})
-end)
-```
-
-**3. Calling `create_schema` on multiple nodes independently**
-If two nodes call `create_schema([node()])` independently, they create incompatible
-schemas. Only the primary node calls `create_schema` with the full node list.
-Secondary nodes call `start/0` and `change_config(:extra_db_nodes, [primary])`.
-
-**4. Acquiring locks in inconsistent order**
-If process A locks account 1 then 2, and process B locks account 2 then 1,
-they deadlock. Mnesia detects this and aborts one transaction, which then retries.
-The retry storm can degrade performance significantly. Establish a canonical lock
-order and document it in the module.
-
-**5. Using `disc_copies` for tables that are purely ephemeral**
-`disc_copies` writes to disk on every committed transaction. For rate limiter counters
-or ephemeral session tokens that don't need to survive a cluster-wide crash,
-`ram_copies` is significantly faster and avoids unnecessary I/O.
+**7. When NOT to use Mnesia.** Anything with strict multi-DC replication, anything that needs
+SQL-class query planning, anything with > 100M rows. Mnesia shines in BEAM-shaped clusters of
+2–10 nodes with "small" datasets.
 
 ---
 
 ## Resources
 
-- [Erlang Mnesia user guide](https://www.erlang.org/doc/apps/mnesia/mnesia_chap1.html) -- official guide with replication examples
-- [Mnesia reference manual](https://www.erlang.org/doc/man/mnesia.html) -- full API reference
-- [Learn You Some Erlang -- Mnesia chapter](https://learnyousomeerlang.com/mnesia) -- clear tutorial with transaction examples
-- [Elixir in Action 2nd ed. -- Sasa Juric](https://www.manning.com/books/elixir-in-action-second-edition) -- persistence patterns chapter
+- [`:mnesia` user's guide](https://www.erlang.org/doc/apps/mnesia/users_guide.html)
+- [`:mnesia` reference](https://www.erlang.org/doc/man/mnesia.html)
+- [`Record` — Elixir stdlib](https://hexdocs.pm/elixir/Record.html) — how to use Erlang records idiomatically
+- [Mnesia in 3 examples — Saša Jurić](https://www.theerlangelist.com/article/mnesia_1)
+- [Elixir School — Mnesia](https://elixirschool.com/en/lessons/storage/mnesia)
+- [Ulf Wiger — "How we do Mnesia at Klarna"](https://www.youtube.com/watch?v=HQnfDpTGSJg)
