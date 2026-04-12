@@ -4,21 +4,17 @@
     "type": "split",
     "children": [
       {
-        "id": "2614916fe4c4b02e",
+        "id": "6190ac39fbd0cbdd",
         "type": "tabs",
         "children": [
           {
-            "id": "8f4838e93654ad7b",
+            "id": "1ad63260abcf073e",
             "type": "leaf",
             "state": {
-              "type": "markdown",
-              "state": {
-                "file": "challenges/elixir/01-basico/fundamentals/01-setup-and-mix/01-setup-and-mix.md",
-                "mode": "source",
-                "source": false
-              },
+              "type": "empty",
+              "state": {},
               "icon": "lucide-file",
-              "title": "01-setup-and-mix"
+              "title": "New tab"
             }
           }
         ]
@@ -208,7 +204,7 @@
       "open-vscode:VS Code": false
     }
   },
-  "active": "8f4838e93654ad7b",
+  "active": "cda3cf7535287934",
   "lastOpenFiles": [
     "challenges/elixir/01-basico/processes-basics/75-process-dict-when-not/75-process-dict-when-not.md",
     "challenges/elixir/01-basico/text-and-binaries/51-base64-url-encoding/51-base64-url-encoding.md",
