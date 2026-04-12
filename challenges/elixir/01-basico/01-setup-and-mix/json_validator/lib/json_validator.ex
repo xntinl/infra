@@ -11,7 +11,9 @@ defmodule JsonValidator do
   def parse_args(argv) do
     switches = [strict: :boolean, help: :boolean, keys: :string]
     aliases = [s: :string, h: :help, k: :keys]
+    case OptionParser.parse(argv,switches: switches, aliases: aliases) do
 
+    end
   end
 
   defp run(:help) do
