@@ -206,6 +206,7 @@
   },
   "active": "cda3cf7535287934",
   "lastOpenFiles": [
+    "challenges/elixir/02-intermedio/tooling-and-ecosystem/127-formatter-custom/127-formatter-custom.md",
     "challenges/elixir/02-intermedio/tooling-and-ecosystem/126-credo-rules/126-credo-rules.md",
     "challenges/elixir/02-intermedio/tooling-and-ecosystem/125-recon-intro/125-recon-intro.md",
     "challenges/elixir/02-intermedio/integrations-basics/132-telemetry-span/132-telemetry-span.md",
@@ -232,7 +233,6 @@
     "challenges/elixir/02-intermedio/streams-and-lazy/106-stream-transform-stateful/106-stream-transform-stateful.md",
     "challenges/elixir/02-intermedio/integrations-basics/128-ecto-changesets/128-ecto-changesets.md",
     "challenges/elixir/02-intermedio/otp-agents-and-tasks/53-task-yield-many-timeouts/53-task-yield-many-timeouts.md",
-    "challenges/elixir/02-intermedio/protocols-and-behaviours/76-behaviour-adapter/76-behaviour-adapter.md",
     "challenges/elixir/02-intermedio/integrations-basics/139-broadway-rabbit-basic",
     "challenges/elixir/02-intermedio/macros-intro/94-macro-hygiene-pitfalls",
     "challenges/elixir/02-intermedio/integrations-basics/138-csv-streaming",
