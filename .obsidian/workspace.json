@@ -206,6 +206,8 @@
   },
   "active": "cda3cf7535287934",
   "lastOpenFiles": [
+    "challenges/elixir/02-intermedio/tooling-and-ecosystem/124-observer-inspection/124-observer-inspection.md",
+    "challenges/elixir/02-intermedio/integrations-basics/131-telemetry-metrics-prom/131-telemetry-metrics-prom.md",
     "challenges/elixir/02-intermedio/tooling-and-ecosystem/123-iex-helpers/123-iex-helpers.md",
     "challenges/elixir/02-intermedio/streams-and-lazy/109-flow-parallel-word-count/109-flow-parallel-word-count.md",
     "challenges/elixir/02-intermedio/protocols-and-behaviours/80-inspect-algebra-custom/80-inspect-algebra-custom.md",
@@ -231,9 +233,7 @@
     "challenges/elixir/02-intermedio/supervision-basics/64-transient-temporary-permanent/64-transient-temporary-permanent.md",
     "challenges/elixir/02-intermedio/streams-and-lazy/105-stream-chunk-every/105-stream-chunk-every.md",
     "challenges/elixir/02-intermedio/testing-and-quality/119-coverage-ci/119-coverage-ci.md",
-    "challenges/elixir/02-intermedio/integrations-basics/139-broadway-rabbit-basic/139-broadway-rabbit-basic.md",
     "challenges/elixir/02-intermedio/integrations-basics/139-broadway-rabbit-basic",
-    "challenges/elixir/02-intermedio/macros-intro/94-macro-hygiene-pitfalls/94-macro-hygiene-pitfalls.md",
     "challenges/elixir/02-intermedio/macros-intro/94-macro-hygiene-pitfalls",
     "challenges/elixir/02-intermedio/integrations-basics/138-csv-streaming",
     "challenges/elixir/02-intermedio/macros-intro/93-quote-bind-quoted",
