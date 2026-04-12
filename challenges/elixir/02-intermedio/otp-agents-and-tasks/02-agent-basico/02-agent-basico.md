@@ -1,316 +1,277 @@
-# Agent: Managed Mutable State
+# Shared config with `Agent`
 
-## Why Agent
+**Project**: `config_agent` — a tiny key/value store for runtime configuration backed by `Agent`.
 
-Agent wraps the receive-loop-with-state pattern into a well-behaved OTP citizen: supervised,
-named, and with a clean API. It provides a supervised `start_link/1`, atomic
-`get_and_update` that eliminates race conditions between separate get and update, and
-consistent error semantics with timeout handling.
-
-The key limitation: the function you pass to `Agent.get/2` or `Agent.update/2` executes
-**inside the Agent process**. If that function is slow, every caller blocks. Never do I/O
-or expensive computation inside an Agent callback.
+**Difficulty**: ★★☆☆☆
+**Estimated time**: 1–2 hours
 
 ---
 
-## The business problem
+## Project context
 
-Build a `TaskQueue.TaskRegistry` that tracks every task submitted to a task queue system:
+You're building a small service that needs a handful of shared, mutable
+settings (feature flags, a rate limit, the current "theme") readable from
+many processes and occasionally updatable by an admin. A full `GenServer`
+is overkill — there's no request protocol, no side effects, just "hold
+some state for me and let me `get`/`update` it".
 
-- A task has an ID (string), a status (`:pending | :running | :done | :failed`), and a
-  timestamp for the last status change.
-- Multiple worker processes update the same registry concurrently.
-- The scheduler queries the registry to find tasks that have been `:running` for longer
-  than a configurable deadline (they may be stuck).
+`Agent` is exactly that: a one-function GenServer where the function is
+*your* closure. You get a dedicated process for the state, serialized
+updates, and a tiny API (`get`, `update`, `get_and_update`) — nothing else.
 
----
+This exercise teaches you when `Agent` is the right answer and when it's
+the wrong one (spoiler: as soon as you need to react to messages, it's
+the wrong one).
 
-## Project setup
+Project structure:
 
 ```
-task_queue/
+config_agent/
 ├── lib/
-│   └── task_queue/
-│       └── task_registry.ex
+│   └── config_agent.ex
 ├── test/
-│   └── task_queue/
-│       └── task_registry_test.exs
+│   └── config_agent_test.exs
 └── mix.exs
 ```
 
 ---
 
+## Core concepts
+
+### 1. `Agent` is a GenServer with a closure for state
+
+Under the hood, `Agent.start_link(fn -> initial end)` spawns a GenServer
+whose only job is to hold a term and run the closures you send it.
+
+```
+Agent.get(pid, fn state -> ... end)           # read-only, returns value
+Agent.update(pid, fn state -> new_state end)  # writer, returns :ok
+Agent.get_and_update(pid, fn s -> {v, s2} end) # both at once
+```
+
+The closure runs **inside the agent process**, not the caller. That matters
+for two reasons: the caller is blocked until the closure returns, and any
+exception inside the closure crashes the agent (not the caller, unless
+linked).
+
+### 2. All operations are serialized
+
+An `Agent` processes one message at a time. Two concurrent `update`s
+cannot race — they queue and apply in order. This is the whole reason to
+use an `Agent` instead of `:ets` or `:persistent_term`: you get
+update-as-a-function with consistent state.
+
+### 3. `get` is not a free read
+
+Even a read (`Agent.get/2`) is a message round-trip to the agent process.
+If you have hot-path readers at very high frequency, an `Agent` becomes
+the bottleneck. For read-heavy shared state, prefer `:ets` (with
+`read_concurrency: true`) or `:persistent_term`.
+
+### 4. `Agent` has no `handle_info`, no `handle_cast`, no timers
+
+As soon as you need to react to external events — a timer, a monitor DOWN,
+a message from another process — `Agent` stops being the right tool. You
+want a `GenServer`. Mixing "holds state" and "reacts to things" in an
+`Agent` is the #1 sign you should refactor.
+
+---
+
 ## Implementation
 
-### `lib/task_queue/task_registry.ex`
-
-```elixir
-defmodule TaskQueue.TaskRegistry do
-  @moduledoc """
-  Tracks task metadata across the lifetime of a task_queue run.
-
-  State shape: %{task_id => %{status: atom(), updated_at: integer()}}
-  """
-  use Agent
-
-  @type task_id :: String.t()
-  @type status :: :pending | :running | :done | :failed
-  @type task_entry :: %{status: status(), updated_at: integer()}
-
-  @doc """
-  Starts the registry and registers it under its module name.
-  Accepts an optional initial map of task entries (useful in tests).
-  """
-  @spec start_link(map()) :: Agent.on_start()
-  def start_link(initial \\ %{}) do
-    Agent.start_link(fn -> initial end, name: __MODULE__)
-  end
-
-  @doc "Registers a new task with :pending status."
-  @spec register(task_id()) :: :ok
-  def register(task_id) do
-    entry = %{status: :pending, updated_at: now()}
-    Agent.update(__MODULE__, fn state -> Map.put(state, task_id, entry) end)
-  end
-
-  @doc "Transitions a task to a new status. Returns {:error, :not_found} if unknown."
-  @spec transition(task_id(), status()) :: :ok | {:error, :not_found}
-  def transition(task_id, new_status) do
-    Agent.get_and_update(__MODULE__, fn state ->
-      case Map.get(state, task_id) do
-        nil ->
-          {{:error, :not_found}, state}
-
-        entry ->
-          updated_entry = %{entry | status: new_status, updated_at: now()}
-          {:ok, Map.put(state, task_id, updated_entry)}
-      end
-    end)
-  end
-
-  @doc "Returns the current entry for a task, or nil if not registered."
-  @spec get(task_id()) :: task_entry() | nil
-  def get(task_id) do
-    Agent.get(__MODULE__, fn state -> Map.get(state, task_id) end)
-  end
-
-  @doc "Returns all task IDs currently in the given status."
-  @spec by_status(status()) :: [task_id()]
-  def by_status(status) do
-    Agent.get(__MODULE__, fn state ->
-      state
-      |> Enum.filter(fn {_id, entry} -> entry.status == status end)
-      |> Enum.map(fn {id, _entry} -> id end)
-    end)
-  end
-
-  @doc """
-  Returns task IDs that have been in :running status for longer than `threshold_ms`.
-  Used by a scheduler to detect stuck workers.
-  """
-  @spec stale_running(pos_integer()) :: [task_id()]
-  def stale_running(threshold_ms) do
-    cutoff = now() - threshold_ms
-
-    Agent.get(__MODULE__, fn state ->
-      state
-      |> Enum.filter(fn {_id, entry} ->
-        entry.status == :running and entry.updated_at < cutoff
-      end)
-      |> Enum.map(fn {id, _entry} -> id end)
-    end)
-  end
-
-  @doc "Removes a task entry. Returns :ok regardless of whether the task existed."
-  @spec remove(task_id()) :: :ok
-  def remove(task_id) do
-    Agent.update(__MODULE__, fn state -> Map.delete(state, task_id) end)
-  end
-
-  @doc "Returns the count of tasks in each status as a map."
-  @spec stats() :: %{status() => non_neg_integer()}
-  def stats do
-    Agent.get(__MODULE__, fn state ->
-      Enum.reduce(state, %{pending: 0, running: 0, done: 0, failed: 0}, fn {_id, entry}, acc ->
-        Map.update(acc, entry.status, 1, &(&1 + 1))
-      end)
-    end)
-  end
-
-  defp now, do: System.monotonic_time(:millisecond)
-end
-```
-
-The `transition/2` function uses `Agent.get_and_update/2` — a single atomic operation
-that reads the current state, checks whether the task exists, and either updates it or
-returns an error. This is critical: if you separated this into a `get` followed by an
-`update`, another process could modify the state between the two calls, leading to
-a race condition where you overwrite their changes.
-
-The `stats/0` function uses `Enum.reduce` to count tasks by status in a single pass.
-Starting with the default map `%{pending: 0, running: 0, done: 0, failed: 0}` ensures
-that all statuses appear in the result even when no tasks have that status.
-
-### Tests
-
-```elixir
-# test/task_queue/task_registry_test.exs
-defmodule TaskQueue.TaskRegistryTest do
-  use ExUnit.Case, async: false
-  # async: false — tests share the named Agent process
-
-  alias TaskQueue.TaskRegistry
-
-  setup do
-    case Process.whereis(TaskRegistry) do
-      nil -> :ok
-      pid -> Agent.stop(pid)
-    end
-
-    {:ok, _} = TaskRegistry.start_link()
-    :ok
-  end
-
-  describe "register/1 and get/1" do
-    test "new task starts as :pending" do
-      TaskRegistry.register("task_001")
-      entry = TaskRegistry.get("task_001")
-      assert entry.status == :pending
-      assert is_integer(entry.updated_at)
-    end
-
-    test "get returns nil for unknown task" do
-      assert nil == TaskRegistry.get("nonexistent")
-    end
-  end
-
-  describe "transition/2" do
-    test "valid transition updates status" do
-      TaskRegistry.register("task_002")
-      assert :ok = TaskRegistry.transition("task_002", :running)
-      assert %{status: :running} = TaskRegistry.get("task_002")
-    end
-
-    test "transition returns error for unknown task" do
-      assert {:error, :not_found} = TaskRegistry.transition("ghost", :running)
-    end
-
-    test "updated_at changes on each transition" do
-      TaskRegistry.register("task_003")
-      registered_at = TaskRegistry.get("task_003").updated_at
-      Process.sleep(2)
-      TaskRegistry.transition("task_003", :running)
-      entry = TaskRegistry.get("task_003")
-      assert entry.updated_at > registered_at
-    end
-  end
-
-  describe "by_status/1" do
-    test "returns task IDs in the requested status" do
-      TaskRegistry.register("t_a")
-      TaskRegistry.register("t_b")
-      TaskRegistry.register("t_c")
-      TaskRegistry.transition("t_a", :running)
-      TaskRegistry.transition("t_b", :done)
-
-      assert ["t_c"] == TaskRegistry.by_status(:pending)
-      assert ["t_a"] == TaskRegistry.by_status(:running)
-      assert ["t_b"] == TaskRegistry.by_status(:done)
-      assert [] == TaskRegistry.by_status(:failed)
-    end
-  end
-
-  describe "stale_running/1" do
-    test "returns tasks running longer than threshold" do
-      TaskRegistry.register("slow_task")
-      TaskRegistry.transition("slow_task", :running)
-      Agent.update(TaskQueue.TaskRegistry, fn state ->
-        Map.update!(state, "slow_task", fn e -> %{e | updated_at: e.updated_at - 10_000} end)
-      end)
-
-      stale = TaskRegistry.stale_running(5_000)
-      assert "slow_task" in stale
-    end
-
-    test "does not return recently started running tasks" do
-      TaskRegistry.register("fresh_task")
-      TaskRegistry.transition("fresh_task", :running)
-      stale = TaskRegistry.stale_running(5_000)
-      refute "fresh_task" in stale
-    end
-  end
-
-  describe "stats/0" do
-    test "counts tasks by status" do
-      TaskRegistry.register("s1")
-      TaskRegistry.register("s2")
-      TaskRegistry.register("s3")
-      TaskRegistry.transition("s1", :running)
-      TaskRegistry.transition("s2", :done)
-
-      stats = TaskRegistry.stats()
-      assert stats.pending == 1
-      assert stats.running == 1
-      assert stats.done == 1
-      assert stats.failed == 0
-    end
-  end
-end
-```
-
-### Run the tests
+### Step 1: Create the project
 
 ```bash
-mix test test/task_queue/task_registry_test.exs --trace
+mix new config_agent
+cd config_agent
 ```
 
----
+### Step 2: `lib/config_agent.ex`
 
-## Trade-off analysis
-
-| Aspect | Agent | GenServer | ETS |
-|--------|-------|-----------|-----|
-| Boilerplate | Minimal | Medium | Low (no process overhead) |
-| Concurrent reads | Serialized through Agent process | Serialized through GenServer | True parallel reads |
-| Atomicity | Single get_and_update is atomic | Full control in callbacks | ets:update_counter is atomic; multi-op is not |
-| Observability | :sys.get_state/1 | :sys.get_state/1 | :ets.tab2list/1 |
-| Supervised restart | Yes — name survives restart | Yes | Table destroyed on owner crash |
-
----
-
-## Common production mistakes
-
-**1. Doing I/O inside Agent callbacks**
-The function passed to `Agent.get/update/get_and_update` executes inside the Agent process.
-A slow HTTP call there blocks every other caller.
-
-**2. Non-atomic read-then-update pattern**
 ```elixir
-# WRONG — another process can modify state between get and update
-status = Agent.get(__MODULE__, fn s -> s[task_id].status end)
-if status == :pending, do: Agent.update(__MODULE__, fn s -> ... end)
+defmodule ConfigAgent do
+  @moduledoc """
+  A small key/value configuration store backed by `Agent`.
 
-# CORRECT — get_and_update is a single atomic operation
-Agent.get_and_update(__MODULE__, fn state ->
-  case Map.get(state, task_id) do
-    %{status: :pending} = e -> {:ok, Map.put(state, task_id, %{e | status: :running})}
-    nil -> {{:error, :not_found}, state}
+  Designed for low-frequency reads and writes of process-shared settings
+  (feature flags, tunables, the current theme). For high-frequency reads,
+  see the trade-offs section and consider `:ets` or `:persistent_term`.
+  """
+
+  use Agent
+
+  @type key :: atom() | String.t()
+  @type value :: term()
+
+  @doc """
+  Starts the agent with an initial map of settings.
+
+  Options:
+    * `:name` — optional registered name (defaults to `__MODULE__`).
+    * `:initial` — initial map of settings (defaults to `%{}`).
+  """
+  @spec start_link(keyword()) :: Agent.on_start()
+  def start_link(opts \\ []) do
+    initial = Keyword.get(opts, :initial, %{})
+    name = Keyword.get(opts, :name, __MODULE__)
+    Agent.start_link(fn -> initial end, name: name)
   end
-end)
+
+  @doc "Returns the value at `key`, or `default` if absent."
+  @spec get(Agent.agent(), key(), value()) :: value()
+  def get(agent \\ __MODULE__, key, default \\ nil) do
+    Agent.get(agent, fn state -> Map.get(state, key, default) end)
+  end
+
+  @doc "Returns the full settings map — useful for diagnostics."
+  @spec all(Agent.agent()) :: map()
+  def all(agent \\ __MODULE__) do
+    Agent.get(agent, & &1)
+  end
+
+  @doc "Puts `value` at `key`, overwriting any previous value."
+  @spec put(Agent.agent(), key(), value()) :: :ok
+  def put(agent \\ __MODULE__, key, value) do
+    Agent.update(agent, fn state -> Map.put(state, key, value) end)
+  end
+
+  @doc """
+  Atomically updates `key` by applying `fun` to the current value (or to
+  `default` if absent). Returns the new value.
+  """
+  @spec update(Agent.agent(), key(), value(), (value() -> value())) :: value()
+  def update(agent \\ __MODULE__, key, default, fun) when is_function(fun, 1) do
+    Agent.get_and_update(agent, fn state ->
+      new_value = fun.(Map.get(state, key, default))
+      {new_value, Map.put(state, key, new_value)}
+    end)
+  end
+
+  @doc "Removes `key` from the store."
+  @spec delete(Agent.agent(), key()) :: :ok
+  def delete(agent \\ __MODULE__, key) do
+    Agent.update(agent, fn state -> Map.delete(state, key) end)
+  end
+end
 ```
 
-**3. Using Agent when reads vastly outnumber writes at high concurrency**
-At 10,000 req/s with 90% reads, the Agent process becomes the bottleneck. Every read goes
-through the process mailbox. This is the correct migration path to ETS.
+### Step 3: `test/config_agent_test.exs`
 
-**4. Forgetting that `start_link` must have the standard signature**
-Supervisors call `start_link(init_arg)` with exactly one argument. If your `start_link`
-expects zero arguments, the Supervisor cannot start your Agent.
+```elixir
+defmodule ConfigAgentTest do
+  use ExUnit.Case, async: true
+
+  setup do
+    # Give each test its own un-named agent to keep `async: true` viable.
+    {:ok, agent} = ConfigAgent.start_link(name: nil, initial: %{theme: :dark})
+    %{agent: agent}
+  end
+
+  describe "get/3 and put/3" do
+    test "returns the seeded value", %{agent: agent} do
+      assert ConfigAgent.get(agent, :theme) == :dark
+    end
+
+    test "returns the default when the key is missing", %{agent: agent} do
+      assert ConfigAgent.get(agent, :missing, :fallback) == :fallback
+    end
+
+    test "overwrites existing values", %{agent: agent} do
+      :ok = ConfigAgent.put(agent, :theme, :light)
+      assert ConfigAgent.get(agent, :theme) == :light
+    end
+  end
+
+  describe "update/4 — atomic read-modify-write" do
+    test "applies the function to the current value", %{agent: agent} do
+      :ok = ConfigAgent.put(agent, :counter, 10)
+      assert ConfigAgent.update(agent, :counter, 0, &(&1 + 1)) == 11
+      assert ConfigAgent.get(agent, :counter) == 11
+    end
+
+    test "uses the default when the key is missing", %{agent: agent} do
+      assert ConfigAgent.update(agent, :new_key, 5, &(&1 * 2)) == 10
+    end
+
+    test "concurrent updates are serialized", %{agent: agent} do
+      :ok = ConfigAgent.put(agent, :n, 0)
+
+      # 100 processes each incrementing — if we had a race, we'd lose some.
+      1..100
+      |> Enum.map(fn _ ->
+        Task.async(fn -> ConfigAgent.update(agent, :n, 0, &(&1 + 1)) end)
+      end)
+      |> Task.await_many(1_000)
+
+      assert ConfigAgent.get(agent, :n) == 100
+    end
+  end
+
+  describe "delete/2" do
+    test "removes the key", %{agent: agent} do
+      :ok = ConfigAgent.delete(agent, :theme)
+      assert ConfigAgent.get(agent, :theme, :absent) == :absent
+    end
+  end
+
+  describe "all/1" do
+    test "returns the full map", %{agent: agent} do
+      assert ConfigAgent.all(agent) == %{theme: :dark}
+    end
+  end
+end
+```
+
+### Step 4: Run
+
+```bash
+mix test
+```
+
+---
+
+## Trade-offs and production gotchas
+
+**1. `Agent` serializes everything — even reads**
+Every `get/update` is a message to the agent process. Under heavy read
+load, that single process becomes a bottleneck. For hot read paths (e.g.
+per-request feature-flag lookups at 10k rps), use `:ets` with
+`read_concurrency: true` or `:persistent_term` for truly read-mostly data.
+
+**2. Closures run inside the agent — don't do slow work there**
+`Agent.update(agent, &expensive_computation/1)` blocks every other caller
+until it returns. Compute first, then update with a small closure:
+
+```elixir
+result = expensive_computation(params)
+Agent.update(agent, &Map.put(&1, :result, result))
+```
+
+**3. A crash in the closure crashes the agent**
+If the function raises, the agent dies. If you used `start_link`, callers
+linked to it may die too. Validate inputs **before** calling `update`.
+
+**4. `Agent` cannot receive timers, monitors, or arbitrary messages**
+There's no `handle_info` hook. If you need periodic cleanup, a TTL, or
+reactions to external events, you've outgrown `Agent` — switch to
+`GenServer`. Exercise 49 (`agent_vs_gs`) walks through that trade-off.
+
+**5. Named agents break `async: true` test isolation**
+A named agent (`name: __MODULE__`) is global. Two tests running in parallel
+will stomp each other. In tests, start anonymous agents (`name: nil`) and
+pass the pid through the context.
+
+**6. When NOT to use `Agent`**
+- Read-heavy hot paths → `:ets`/`:persistent_term`.
+- Anything that needs timers, `handle_info`, or a protocol → `GenServer`.
+- State shared across nodes → `Agent` is node-local; use `:mnesia`, a
+  CRDT, or a proper database.
 
 ---
 
 ## Resources
 
-- [Agent — HexDocs](https://hexdocs.pm/elixir/Agent.html)
-- [Agent.get_and_update/3 — HexDocs](https://hexdocs.pm/elixir/Agent.html#get_and_update/3)
-- [Mix and OTP: Agent](https://elixir-lang.org/getting-started/mix-otp/agent.html)
+- [`Agent` — Elixir stdlib](https://hexdocs.pm/elixir/Agent.html)
+- ["Agent" — Elixir getting started](https://hexdocs.pm/elixir/agents.html)
+- [`:ets` — Erlang](https://www.erlang.org/doc/man/ets.html) — when you need concurrent reads
+- [`:persistent_term`](https://www.erlang.org/doc/man/persistent_term.html) — for rarely-updated, read-almost-always data

@@ -1,427 +1,247 @@
-# Typespecs and Dialyzer
+# Typespecs basics: `@spec`, `@type`, `@typep`
 
-## Why typespecs matter beyond documentation
+**Project**: `typespec_basics` — a tiny money/pricing module fully annotated with
+typespecs, validated by Dialyxir.
 
-`@spec` documents what types a function accepts and returns. Its value comes from:
-
-1. **Reader communication**: `@spec route(job_map()) :: module()` tells the caller exactly
-   what to pass and what to expect.
-2. **Dialyzer analysis**: Dialyzer performs success-typing analysis — it finds real bugs
-   that tests often miss.
-3. **IDE tooling**: ElixirLS uses specs for completion and inline type hints.
+**Difficulty**: ★★★☆☆
+**Estimated time**: 2–3 hours
 
 ---
 
-## The business problem
+## Project context
 
-Build a `TaskQueue.Scheduler` — the top-level coordinator that:
-1. Checks the queue depth.
-2. Decides whether to scale workers up or down.
-3. Dispatches the next batch of jobs to available workers.
-4. Returns a structured result with the outcome.
+You're introducing Elixir to a team coming from TypeScript. They keep asking
+"where are the types?". The honest answer: Elixir is dynamically typed, but
+`@spec` + Dialyzer gives you a separate static analyzer that catches real
+bugs — especially around `nil`, error tuples, and "I thought this always
+returned a map" surprises.
 
-The module must be fully specced. Additionally, build the supporting modules
-(`WorkerPool`, `DynamicWorker`, `QueueServer`) that the scheduler depends on.
+This exercise builds a small `Pricing` module — the kind of code that ends
+up handling money in every startup — and annotates it fully. You'll see
+`@type` (public), `@typep` (private), and `@spec` in action, and run
+Dialyzer on it to confirm the types match the code.
 
-All modules are defined completely in this exercise.
-
----
-
-## Project setup
+Project structure:
 
 ```
-task_queue/
+typespec_basics/
 ├── lib/
-│   └── task_queue/
-│       ├── application.ex
-│       ├── queue_server.ex
-│       ├── dynamic_worker.ex
-│       ├── worker_pool.ex
-│       └── scheduler.ex
+│   └── pricing.ex
 ├── test/
-│   └── task_queue/
-│       └── typespecs_test.exs
+│   └── pricing_test.exs
 └── mix.exs
 ```
 
-Add `dialyxir` to `mix.exs`:
+---
+
+## Core concepts
+
+### 1. `@type` vs `@typep` vs `@opaque`
 
 ```elixir
-defp deps do
-  [
-    {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false}
-  ]
-end
+@type money :: %{amount: integer(), currency: String.t()}   # public
+@typep internal_rate :: float()                              # private to this module
+@opaque handle :: reference()                                # public name, hidden shape
 ```
+
+Rule of thumb: expose `@type` for anything callers need to *pattern-match* or
+*construct*. Use `@typep` for intermediate helpers that don't leak. `@opaque`
+comes later (see exercise 115).
+
+### 2. `@spec` is not runtime enforcement
+
+`@spec` is a hint for humans and for Dialyzer. It is NOT checked at runtime.
+If your code actually returns `nil` but the spec says `:: integer()`, the
+program runs happily — only `mix dialyzer` will complain. This is by design:
+specs are zero-cost.
+
+### 3. Dialyxir's success typing
+
+Dialyzer uses *success typing*: it only flags code that *cannot succeed*
+for any input type. This means it rarely produces false positives but it
+also misses some real bugs. Treat Dialyzer as a high-signal linter, not a
+safety net.
+
+### 4. Common built-in types worth memorizing
+
+- `non_neg_integer()` / `pos_integer()` — integer with lower bound.
+- `String.t()` — UTF-8 binary (not `char_list()`).
+- `keyword()` / `keyword(t)` — a list of `{atom, any}` / `{atom, t}`.
+- `mfa()` — `{module, atom, arity}`.
+- `GenServer.on_start()` — the canonical `{:ok, pid} | {:error, reason}`.
 
 ---
 
 ## Implementation
 
-### `lib/task_queue/application.ex`
-
-```elixir
-defmodule TaskQueue.Application do
-  use Application
-
-  @impl Application
-  def start(_type, _args) do
-    children = [
-      TaskQueue.QueueServer,
-      {Registry, keys: :unique, name: TaskQueue.WorkerRegistry},
-      {DynamicSupervisor, strategy: :one_for_one, name: TaskQueue.WorkerSupervisor}
-    ]
-
-    opts = [strategy: :one_for_one, name: TaskQueue.RootSupervisor]
-    Supervisor.start_link(children, opts)
-  end
-end
-```
-
-### `lib/task_queue/queue_server.ex`
-
-```elixir
-defmodule TaskQueue.QueueServer do
-  use GenServer
-
-  def start_link(opts \\ []) do
-    GenServer.start_link(__MODULE__, opts, name: __MODULE__)
-  end
-
-  @spec push(any()) :: :ok
-  def push(payload) do
-    job = %{
-      id: :crypto.strong_rand_bytes(8) |> Base.url_encode64(padding: false),
-      payload: payload,
-      queued_at: System.monotonic_time(:millisecond)
-    }
-    GenServer.cast(__MODULE__, {:push, job})
-  end
-
-  @spec pop() :: {:ok, map()} | {:error, :empty}
-  def pop, do: GenServer.call(__MODULE__, :pop)
-
-  @spec size() :: non_neg_integer()
-  def size, do: GenServer.call(__MODULE__, :size)
-
-  @impl GenServer
-  def init(_opts), do: {:ok, []}
-
-  @impl GenServer
-  def handle_cast({:push, job}, state), do: {:noreply, state ++ [job]}
-
-  @impl GenServer
-  def handle_call(:pop, _from, []), do: {:reply, {:error, :empty}, []}
-  def handle_call(:pop, _from, [job | rest]), do: {:reply, {:ok, job}, rest}
-
-  @impl GenServer
-  def handle_call(:size, _from, state), do: {:reply, length(state), state}
-
-  @impl GenServer
-  def handle_info(_, state), do: {:noreply, state}
-end
-```
-
-### `lib/task_queue/dynamic_worker.ex`
-
-```elixir
-defmodule TaskQueue.DynamicWorker do
-  use GenServer
-  require Logger
-
-  @registry TaskQueue.WorkerRegistry
-
-  def start_link(worker_id) when is_binary(worker_id) do
-    GenServer.start_link(__MODULE__, worker_id, name: via(worker_id))
-  end
-
-  @spec via(String.t()) :: {:via, Registry, {module(), {atom(), String.t()}}}
-  def via(worker_id), do: {:via, Registry, {@registry, {:worker, worker_id}}}
-
-  @spec lookup(String.t()) :: pid() | nil
-  def lookup(worker_id) do
-    case Registry.lookup(@registry, {:worker, worker_id}) do
-      [{pid, _}] -> pid
-      [] -> nil
-    end
-  end
-
-  @spec list_ids() :: [String.t()]
-  def list_ids do
-    @registry
-    |> Registry.select([{{:"$1", :"$2", :"$3"}, [], [:"$1"]}])
-    |> Enum.map(fn {:worker, id} -> id end)
-  end
-
-  @spec process_job(String.t()) :: {:ok, any()} | {:error, any()}
-  def process_job(worker_id) do
-    GenServer.call(via(worker_id), :process_job, 30_000)
-  end
-
-  @impl GenServer
-  def init(worker_id) do
-    {:ok, %{worker_id: worker_id, jobs_processed: 0, started_at: System.monotonic_time(:millisecond)}}
-  end
-
-  @impl GenServer
-  def handle_call(:process_job, _from, state) do
-    case TaskQueue.QueueServer.pop() do
-      {:error, :empty} -> {:reply, {:error, :empty}, state}
-      {:ok, _job} -> {:reply, {:ok, :processed}, %{state | jobs_processed: state.jobs_processed + 1}}
-    end
-  end
-
-  @impl GenServer
-  def handle_info(_, state), do: {:noreply, state}
-end
-```
-
-### `lib/task_queue/worker_pool.ex`
-
-```elixir
-defmodule TaskQueue.WorkerPool do
-  alias TaskQueue.DynamicWorker
-
-  @supervisor TaskQueue.WorkerSupervisor
-
-  @spec start_worker(String.t()) :: {:ok, pid()} | {:error, any()}
-  def start_worker(worker_id) do
-    DynamicSupervisor.start_child(@supervisor, {DynamicWorker, worker_id})
-  end
-
-  @spec stop_worker(String.t()) :: :ok | {:error, :not_found}
-  def stop_worker(worker_id) do
-    case DynamicWorker.lookup(worker_id) do
-      nil -> {:error, :not_found}
-      pid ->
-        DynamicSupervisor.terminate_child(@supervisor, pid)
-        :ok
-    end
-  end
-
-  @spec count() :: non_neg_integer()
-  def count, do: DynamicWorker.list_ids() |> length()
-end
-```
-
-### `lib/task_queue/scheduler.ex`
-
-```elixir
-defmodule TaskQueue.Scheduler do
-  @moduledoc """
-  Coordinates the task_queue: monitors queue depth, scales workers,
-  and dispatches jobs to available workers.
-  """
-
-  require Logger
-
-  @type worker_id :: String.t()
-  @type job_id :: String.t()
-  @type scaling_decision :: :scale_up | :scale_down | :hold
-
-  @type dispatch_outcome :: %{
-    required(:job_id) => job_id(),
-    required(:worker_id) => worker_id(),
-    required(:result) => {:ok, any()} | {:error, any()}
-  }
-
-  @type scheduler_result :: %{
-    required(:queue_depth) => non_neg_integer(),
-    required(:active_workers) => non_neg_integer(),
-    required(:scaling_decision) => scaling_decision(),
-    required(:dispatched) => [dispatch_outcome()]
-  }
-
-  @min_workers 1
-  @max_workers 10
-  @scale_up_threshold 5
-  @scale_down_threshold 1
-
-  @doc "Runs one scheduling cycle: inspect, scale, dispatch."
-  @spec run_cycle() :: scheduler_result()
-  def run_cycle do
-    queue_depth = TaskQueue.QueueServer.size()
-    active_workers = TaskQueue.WorkerPool.count()
-
-    decision = decide_scaling(queue_depth, active_workers)
-    apply_scaling(decision, active_workers)
-
-    dispatched = dispatch_batch(queue_depth)
-
-    %{
-      queue_depth: queue_depth,
-      active_workers: TaskQueue.WorkerPool.count(),
-      scaling_decision: decision,
-      dispatched: dispatched
-    }
-  end
-
-  @spec decide_scaling(non_neg_integer(), non_neg_integer()) :: scaling_decision()
-  def decide_scaling(queue_depth, active_workers)
-      when queue_depth > @scale_up_threshold and active_workers < @max_workers do
-    :scale_up
-  end
-
-  def decide_scaling(queue_depth, active_workers)
-      when queue_depth <= @scale_down_threshold and active_workers > @min_workers do
-    :scale_down
-  end
-
-  def decide_scaling(_queue_depth, _active_workers), do: :hold
-
-  @spec apply_scaling(scaling_decision(), non_neg_integer()) :: integer()
-  def apply_scaling(:scale_up, _current) do
-    worker_id = "auto_#{:crypto.strong_rand_bytes(4) |> Base.url_encode64(padding: false)}"
-    case TaskQueue.WorkerPool.start_worker(worker_id) do
-      {:ok, _pid} -> 1
-      {:error, _} -> 0
-    end
-  end
-
-  def apply_scaling(:scale_down, current) when current > @min_workers do
-    case TaskQueue.DynamicWorker.list_ids() do
-      [] -> 0
-      [first_id | _] ->
-        TaskQueue.WorkerPool.stop_worker(first_id)
-        -1
-    end
-  end
-
-  def apply_scaling(:hold, _current), do: 0
-  def apply_scaling(_, _), do: 0
-
-  @spec dispatch_batch(non_neg_integer()) :: [dispatch_outcome()]
-  def dispatch_batch(0), do: []
-
-  def dispatch_batch(batch_size) do
-    worker_ids = TaskQueue.DynamicWorker.list_ids()
-
-    if worker_ids == [] do
-      []
-    else
-      limit = min(batch_size, length(worker_ids))
-
-      worker_ids
-      |> Enum.take(limit)
-      |> Enum.map(fn worker_id ->
-        result = TaskQueue.DynamicWorker.process_job(worker_id)
-        case result do
-          {:ok, _} -> %{job_id: "dispatched", worker_id: worker_id, result: result}
-          {:error, :empty} -> nil
-          {:error, _} -> %{job_id: "dispatched", worker_id: worker_id, result: result}
-        end
-      end)
-      |> Enum.reject(&is_nil/1)
-    end
-  end
-end
-```
-
-### Tests
-
-```elixir
-# test/task_queue/typespecs_test.exs
-defmodule TaskQueue.TypespecsTest do
-  use ExUnit.Case, async: false
-
-  alias TaskQueue.Scheduler
-
-  setup do
-    for id <- TaskQueue.DynamicWorker.list_ids(), do: TaskQueue.WorkerPool.stop_worker(id)
-    Process.sleep(50)
-    :ok
-  end
-
-  describe "decide_scaling/2" do
-    test "returns :scale_up when queue is deep and workers are below max" do
-      assert :scale_up = Scheduler.decide_scaling(10, 2)
-    end
-
-    test "returns :scale_down when queue is shallow and workers above min" do
-      assert :scale_down = Scheduler.decide_scaling(0, 3)
-    end
-
-    test "returns :hold when queue is moderate" do
-      assert :hold = Scheduler.decide_scaling(3, 5)
-    end
-
-    test "returns :hold when at max workers regardless of queue depth" do
-      assert :hold = Scheduler.decide_scaling(100, 10)
-    end
-
-    test "returns :hold when at min workers regardless of queue depth" do
-      assert :hold = Scheduler.decide_scaling(0, 1)
-    end
-  end
-
-  describe "run_cycle/0 return type" do
-    test "returns a map with required keys" do
-      result = Scheduler.run_cycle()
-      assert is_map(result)
-      assert Map.has_key?(result, :queue_depth)
-      assert Map.has_key?(result, :active_workers)
-      assert Map.has_key?(result, :scaling_decision)
-      assert Map.has_key?(result, :dispatched)
-    end
-
-    test ":scaling_decision is one of the valid atoms" do
-      result = Scheduler.run_cycle()
-      assert result.scaling_decision in [:scale_up, :scale_down, :hold]
-    end
-
-    test ":dispatched is a list" do
-      result = Scheduler.run_cycle()
-      assert is_list(result.dispatched)
-    end
-  end
-
-  describe "apply_scaling/2" do
-    test ":hold returns 0" do
-      assert 0 = Scheduler.apply_scaling(:hold, 5)
-    end
-
-    test ":scale_up with room returns 1 and a new worker appears" do
-      initial = TaskQueue.WorkerPool.count()
-      result = Scheduler.apply_scaling(:scale_up, initial)
-      Process.sleep(50)
-      assert result in [0, 1]
-      for id <- TaskQueue.DynamicWorker.list_ids(), do: TaskQueue.WorkerPool.stop_worker(id)
-    end
-  end
-end
-```
-
-### Run the tests
+### Step 1: Create the project
 
 ```bash
-mix dialyzer
-mix test test/task_queue/typespecs_test.exs --trace
+mix new typespec_basics
+cd typespec_basics
 ```
+
+Add Dialyxir to `mix.exs`:
+
+```elixir
+defp deps do
+  [{:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false}]
+end
+```
+
+Then `mix deps.get`.
+
+### Step 2: `lib/pricing.ex`
+
+```elixir
+defmodule Pricing do
+  @moduledoc """
+  Minimal pricing helpers for orders with line items. All public functions
+  carry `@spec`s so Dialyzer can verify the module end-to-end.
+  """
+
+  # Public types — callers may pattern-match or construct these.
+  @type currency :: String.t()
+  @type money :: %{amount: integer(), currency: currency()}
+  @type line_item :: %{sku: String.t(), unit_price: money(), quantity: pos_integer()}
+  @type discount :: {:percent, 0..100} | {:flat, money()}
+  @type pricing_error :: :currency_mismatch | :empty_cart
+
+  # Private type — only used by helpers inside this module.
+  @typep subtotal_acc :: %{currency: currency() | nil, amount: integer()}
+
+  @doc "Builds a money struct. Amount is in minor units (cents)."
+  @spec money(integer(), currency()) :: money()
+  def money(amount, currency) when is_integer(amount) and is_binary(currency) do
+    %{amount: amount, currency: currency}
+  end
+
+  @doc """
+  Computes the subtotal of a cart. Returns `{:error, :empty_cart}` if empty,
+  `{:error, :currency_mismatch}` if line items mix currencies.
+  """
+  @spec subtotal([line_item()]) :: {:ok, money()} | {:error, pricing_error()}
+  def subtotal([]), do: {:error, :empty_cart}
+
+  def subtotal(items) when is_list(items) do
+    Enum.reduce_while(items, %{currency: nil, amount: 0}, &accumulate/2)
+    |> finalize_subtotal()
+  end
+
+  @spec accumulate(line_item(), subtotal_acc()) ::
+          {:cont, subtotal_acc()} | {:halt, {:error, :currency_mismatch}}
+  defp accumulate(%{unit_price: %{currency: c, amount: a}, quantity: q}, %{currency: nil} = acc) do
+    {:cont, %{currency: c, amount: acc.amount + a * q}}
+  end
+
+  defp accumulate(%{unit_price: %{currency: c, amount: a}, quantity: q}, %{currency: c} = acc) do
+    {:cont, %{acc | amount: acc.amount + a * q}}
+  end
+
+  defp accumulate(_item, _acc), do: {:halt, {:error, :currency_mismatch}}
+
+  @spec finalize_subtotal(subtotal_acc() | {:error, :currency_mismatch}) ::
+          {:ok, money()} | {:error, pricing_error()}
+  defp finalize_subtotal({:error, _} = err), do: err
+  defp finalize_subtotal(%{currency: c, amount: a}), do: {:ok, money(a, c)}
+
+  @doc "Applies a discount to a `money()` total. Never goes below zero."
+  @spec apply_discount(money(), discount()) :: money()
+  def apply_discount(%{amount: a, currency: c}, {:percent, p}) when p in 0..100 do
+    money(max(a - div(a * p, 100), 0), c)
+  end
+
+  def apply_discount(%{amount: a, currency: c}, {:flat, %{amount: d, currency: c}}) do
+    money(max(a - d, 0), c)
+  end
+end
+```
+
+### Step 3: `test/pricing_test.exs`
+
+```elixir
+defmodule PricingTest do
+  use ExUnit.Case, async: true
+
+  describe "subtotal/1" do
+    test "sums line items in the same currency" do
+      items = [
+        %{sku: "A", unit_price: Pricing.money(1000, "USD"), quantity: 2},
+        %{sku: "B", unit_price: Pricing.money(500, "USD"), quantity: 3}
+      ]
+
+      assert {:ok, %{amount: 3500, currency: "USD"}} = Pricing.subtotal(items)
+    end
+
+    test "rejects mixed currencies" do
+      items = [
+        %{sku: "A", unit_price: Pricing.money(1000, "USD"), quantity: 1},
+        %{sku: "B", unit_price: Pricing.money(800, "EUR"), quantity: 1}
+      ]
+
+      assert {:error, :currency_mismatch} = Pricing.subtotal(items)
+    end
+
+    test "rejects empty cart" do
+      assert {:error, :empty_cart} = Pricing.subtotal([])
+    end
+  end
+
+  describe "apply_discount/2" do
+    test "percent discount" do
+      assert %{amount: 800, currency: "USD"} =
+               Pricing.apply_discount(Pricing.money(1000, "USD"), {:percent, 20})
+    end
+
+    test "flat discount cannot go below zero" do
+      assert %{amount: 0} =
+               Pricing.apply_discount(Pricing.money(500, "USD"), {:flat, Pricing.money(800, "USD")})
+    end
+  end
+end
+```
+
+### Step 4: Run tests and Dialyzer
+
+```bash
+mix test
+mix dialyzer
+```
+
+The first `mix dialyzer` run builds the PLT and is slow (minutes). Subsequent
+runs are fast. A clean run prints `done (passed successfully)`.
 
 ---
 
-## Common production mistakes
+## Trade-offs and production gotchas
 
-**1. Writing `@spec` after the fact as documentation only**
-A `@spec` that says `:: map()` when the function can return `nil` is a lie. Dialyzer
-will find this.
+**1. `@spec` does not run — tests still matter**
+Specs catch type mismatches; they don't catch wrong *values*. You still need
+tests for `apply_discount` returning 0 vs a negative number.
 
-**2. Using `any()` everywhere to silence Dialyzer**
-`@spec my_fn(any()) :: any()` defeats the purpose. Be as precise as possible.
+**2. Precision matters — vague specs don't help Dialyzer**
+`@spec subtotal(list()) :: any()` is worse than no spec: it tells Dialyzer
+to trust you. Use concrete element types like `[line_item()]`.
 
-**3. Overly broad `@type` definitions**
-```elixir
-# Too broad
-@type job :: map()
+**3. `@type` exports leak into your public API**
+Once a `@type` is exported, removing or changing it is a breaking change for
+callers who reference `Pricing.money()` in their own specs. Use `@typep` if
+the type is internal.
 
-# Specific — Dialyzer can find mismatches
-@type job :: %{required(:id) => String.t(), required(:type) => atom()}
-```
+**4. Dialyzer loves `no_return()` for raising functions**
+A function that only raises should be specced `:: no_return()`. Otherwise
+Dialyzer infers its "return" and propagates nonsense through call sites.
+
+**5. When NOT to bother with typespecs**
+Throwaway scripts, tiny modules with self-evident types, and test support
+code. Spec every *public* function of every *library* or *domain* module,
+and don't agonize over specing every private one.
 
 ---
 
 ## Resources
 
-- [Typespecs — HexDocs](https://hexdocs.pm/elixir/typespecs.html)
-- [Dialyxir — GitHub](https://github.com/jeremyjh/dialyxir)
-- [Learn You Some Erlang: Type Specifications](https://learnyousomeerlang.com/dialyzer)
+- [Typespecs — Elixir reference](https://hexdocs.pm/elixir/typespecs.html)
+- [Dialyxir](https://hexdocs.pm/dialyxir/readme.html)
+- ["Success Typings for Erlang" — Lindahl & Sagonas, 2006](https://user.it.uu.se/~kostis/Papers/succ_types.pdf) — the paper behind Dialyzer
+- [Learn You Some Erlang: Dialyzer](https://learnyousomeerlang.com/dialyzer)
