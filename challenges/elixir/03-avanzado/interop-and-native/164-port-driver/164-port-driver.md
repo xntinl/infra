@@ -2,10 +2,6 @@
 
 **Project**: `port_driver_demo` — a comparative study: the same "uppercase this string" operation implemented as a Port (external OS process), a linked-in Port Driver (C shared library), and a NIF, with benchmarks showing the trade-offs.
 
-**Difficulty**: ★★★★☆
-
-**Estimated time**: 3–6 hours
-
 ---
 
 ## Project context
@@ -37,6 +33,16 @@ port_driver_demo/
 ```
 
 ---
+
+## Why this approach and not alternatives
+
+Alternatives considered and discarded:
+
+- **Hand-rolled equivalent**: reinvents primitives the BEAM/ecosystem already provides; high risk of subtle bugs around concurrency, timeouts, or failure propagation.
+- **External service (e.g. Redis, sidecar)**: adds a network hop and an extra failure domain for a problem the VM can solve in-process with lower latency.
+- **Heavier framework abstraction**: couples the module to a framework lifecycle and makes local reasoning/testing harder.
+
+The chosen approach stays inside the BEAM, uses idiomatic OTP primitives, and keeps the contract small.
 
 ## Core concepts
 
@@ -101,6 +107,18 @@ Note: charlists, not strings — the driver API predates BEAM's binary-first era
 Both NIFs and Port Drivers run in-process — a segfault in either crashes the BEAM VM. The upside over OS-process Ports is speed; the downside is you lose BEAM's famed crash isolation. "Let it crash" only works if the crash is supervisable — a segfault isn't.
 
 ---
+
+## Design decisions
+
+**Option A — naive/simple approach**
+- Pros: minimal code, easy to reason about.
+- Cons: breaks under load, lacks observability, hard to evolve.
+
+**Option B — the approach used here** (chosen)
+- Pros: production-grade, handles edge cases, testable boundaries.
+- Cons: more moving parts, requires understanding of the BEAM primitives involved.
+
+→ Chose **B** because correctness under concurrency and failure modes outweighs the extra surface area.
 
 ## Implementation
 
@@ -318,6 +336,11 @@ end
 
 ---
 
+
+### Why this works
+
+The design leans on BEAM guarantees (process isolation, mailbox ordering, supervisor restarts) and pushes invariants to the boundaries of each module. State transitions are explicit, failure modes are declared rather than implicit, and each step is independently testable. That combination keeps the implementation correct under concurrent load and cheap to change later.
+
 ## Trade-offs and production gotchas
 
 **1. Port driver = legacy.** The API is clunky (callback tables, `ErlDrvEntry` with ~20 nullable fields). OTP recommends NIFs for new code. Use drivers only when you need fd-watching via `ready_input`.
@@ -361,6 +384,11 @@ via Port:        ~3 000 µs (3 ms — fork+exec dominates)
 6000× difference between Port and NIF. That's why NIFs exist.
 
 ---
+
+## Reflection
+
+- If the expected load grew by 100×, which assumption in this design would break first — the data structure, the process model, or the failure handling? Justify.
+- What would you measure in production to decide whether this implementation is still the right one six months from now?
 
 ## Resources
 

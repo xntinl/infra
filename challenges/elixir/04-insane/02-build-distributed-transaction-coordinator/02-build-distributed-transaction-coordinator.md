@@ -58,6 +58,18 @@ The second hard problem is concurrent transactions. Without isolation, two concu
 
 ---
 
+## Design decisions
+
+**Option A — Distributed Paxos Commit (Gray & Lamport)**
+- Pros: non-blocking on coordinator failure; each participant runs its own Paxos.
+- Cons: 3–4 message delays per commit; significantly more code; requires a separate consensus group per participant.
+
+**Option B — Classic two-phase commit with a WAL-backed coordinator** (chosen)
+- Pros: 2-round-trip latency; linear in participants; the invariants (prepare → vote → commit record → ack) are simple to audit; a crashed coordinator is recoverable from the WAL.
+- Cons: blocks participants between prepare and commit if the coordinator dies before the commit record is durable.
+
+→ Chose **B** because the project's goal is to make the failure window explicit and auditable — 2PC's single point of blocking is easier to reason about and test than a multi-Paxos commit fabric.
+
 ## Implementation milestones
 
 ### Step 1: Create the project
@@ -663,6 +675,21 @@ Benchee.run(
 
 Target: 1,000 cross-partition transactions/second on a 3-node cluster on localhost.
 
+### Why this works
+
+The WAL makes the commit point a single durable write: every participant either sees `:commit` or `:abort`, and a crashed coordinator resumes from exactly that record. MVCC on participants means prepared writes stay invisible until the commit record lands, so readers never observe a half-applied transaction.
+
+---
+
+## Benchmark
+
+```elixir
+# bench/dtx_bench.exs — already defined in Step 12
+# mix run bench/dtx_bench.exs
+```
+
+Target: 1,000 cross-partition commits/s on a 3-partition localhost cluster; p99 < 30 ms.
+
 ---
 
 ## Trade-off analysis
@@ -697,6 +724,11 @@ Running deadlock detection synchronously on lock acquisition blocks every transa
 
 **5. MVCC without garbage collection**
 Old row versions accumulate indefinitely. In a long-running system with many short transactions, this becomes a memory leak. Track the oldest active snapshot and periodically purge versions invisible to all active transactions.
+
+## Reflection
+
+- If the coordinator crashed with 1000 transactions prepared-but-not-committed, how long would your recovery take, and what upper bound can you prove on participant blocking?
+- Would you move to Paxos Commit if the dominant workload shifted to geo-distributed cross-region transactions? Quantify the RTT threshold where the switch pays for itself.
 
 ---
 

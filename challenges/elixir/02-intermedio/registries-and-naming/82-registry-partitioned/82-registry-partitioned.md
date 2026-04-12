@@ -2,9 +2,6 @@
 
 **Project**: `partitioned_reg` — a benchmark harness that measures contention in a default Registry vs a `:partitions`-configured one.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
-
 ---
 
 ## Project context
@@ -73,6 +70,30 @@ With N partitions, `Registry.dispatch/3` can spawn one task per partition
 to run the callback concurrently — useful for fanning out a pubsub
 broadcast to millions of subscribers. Pass `parallel: true`. Without it,
 dispatch walks partitions serially in the caller.
+
+---
+
+## Why `:partitions` and not a single registry or a pool of registries
+
+**Single-partition Registry.** One ETS table, one listener — a write-side serialization point once several schedulers hammer it concurrently. Fine for low-churn workloads.
+
+**Manual pool of N registries, sharded at the call site.** You pay for routing logic in every caller, lose `:via` integration (callers must know which registry owns a key), and re-implement something the stdlib already offers.
+
+**`Registry` with `:partitions` (chosen).** Built-in sharding by `phash2(key)`, same public API as a single registry, parallel `dispatch/3` when you need it, and the default recommendation from the Elixir core team.
+
+---
+
+## Design decisions
+
+**Option A — Keep one registry and scale vertically**
+- Pros: Simplest setup; one ETS table; `dispatch/3` aggregates naturally.
+- Cons: Write path bottlenecks on a single mutex once concurrency exceeds a couple of schedulers.
+
+**Option B — `:partitions: System.schedulers_online()`** (chosen)
+- Pros: Writes scale across cores; `dispatch/3` can fan out in parallel; same API surface as the single-partition version.
+- Cons: `dispatch/3` callbacks run per-partition (aggregation requires shared accumulators); partition count is fixed at `start_link/1`; more ETS tables and listeners.
+
+→ Chose **B** because under realistic churn (per-session GenServers, dynamic subscriptions) the write-side contention is the first wall the single-partition version hits, and the partition count heuristic is a one-line change.
 
 ---
 
@@ -237,6 +258,28 @@ On a multi-core machine you'll typically see the partitioned registry
 running 1.5x–3x faster under heavy write concurrency. On a single-core
 VM the numbers converge.
 
+### Why this works
+
+Partitioning shards registrations across N independent ETS tables keyed by `:erlang.phash2(key, N)`. Each table has its own mutex, so on an N-core box, N concurrent writers progress in parallel instead of serializing on a single write-lock. The public API is unchanged — `register/3`, `lookup/2`, and `dispatch/3` route transparently through the partition — which is why the upgrade is a one-line configuration change, not a rewrite.
+
+---
+
+## Benchmark
+
+The repo already ships a benchmark (`PartitionedReg.Bench.run/3`) wired into the test suite behind `@tag :bench`. Run it directly:
+
+```elixir
+workers = System.schedulers_online() * 4
+ops = 1_000
+
+single = PartitionedReg.Bench.run(:bench_single, workers, ops)
+parted = PartitionedReg.Bench.run(:bench_parted, workers, ops)
+
+IO.puts("single=#{single}µs parted=#{parted}µs ratio=#{Float.round(single / parted, 2)}x")
+```
+
+Target esperado: ratio ≥ 1.8x a favor de la versión particionada en un box multi-core con `workers = schedulers * 4`. En una VM single-core ambos convergen (~1.0x) — eso también es información útil.
+
 ---
 
 ## Trade-offs and production gotchas
@@ -271,6 +314,13 @@ Low-churn registries, single-topic pubsub, or small registries with
 hundreds of keys — the default 1 partition is fine. Partitioning adds
 complexity and you won't notice the difference below concurrency where
 ETS contention actually shows up (~thousands of ops/sec).
+
+---
+
+## Reflection
+
+- If your registry is 99% reads and 1% writes, does `:partitions` still buy you anything? What profile signal (e.g., `recon:scheduler_usage/1`, `:erlang.statistics(:scheduler_wall_time)`) would you inspect before turning the knob?
+- Your dispatch callback aggregates a count of delivered messages. With partitions, it's invoked once per partition — how do you combine the results safely (shared `:counters` atomic? post-process a list?) without introducing a new bottleneck?
 
 ---
 

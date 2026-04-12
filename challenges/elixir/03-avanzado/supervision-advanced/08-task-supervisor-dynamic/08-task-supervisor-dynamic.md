@@ -2,9 +2,6 @@
 
 **Project**: `task_sup_dynamic` — spawn supervised Tasks on demand with restart and lifecycle control.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 3–4 hours
-
 ---
 
 ## Project context
@@ -101,7 +98,36 @@ DynamicSupervisor.count_children(MyTaskSup)
 
 ---
 
+## Why `Task.Supervisor` and not Oban
+
+Oban persists jobs to Postgres: survives VM restarts, supports retries with backoff, has a UI. It is the correct tool when durability crosses process boundaries. The workloads here — verifying a signature, writing a row, emitting an event — are in-flight within one VM lifetime. Paying for a DB round-trip per job is wasteful. `Task.Supervisor` is the OTP-native answer: zero dependencies, in-memory, integrates with Supervisor drain semantics. The cost is that a hard VM crash loses in-flight work; for idempotent webhooks whose producer retries on timeout, that cost is acceptable.
+
+---
+
+## Design decisions
+
+**Option A — `Task.async/await` in the HTTP handler**
+- Pros: trivial; result flows back; zero supervision overhead.
+- Cons: task is linked to the request; request timeout kills the task mid-transaction; request crash kills idempotent work that already succeeded.
+
+**Option B — `Task.Supervisor.start_child` with `:transient` + max-attempts guard** (chosen)
+- Pros: decoupled lifecycle; supervisor-visible retry on crash; observable via `count_children/1`; participates in graceful shutdown drain.
+- Cons: must engineer idempotency and an explicit attempt counter to avoid infinite retries on deterministic crashes.
+
+→ Chose **B** because the incidents described ("request timeout kills mid-DB-commit", "handler crash loses idempotent progress") are direct consequences of linked lifecycle — and the Supervisor's observability is needed for deploy-time drain.
+
+---
+
 ## Implementation
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defp deps do
+  []
+end
+```
+
 
 ### Step 1: Application
 
@@ -297,6 +323,10 @@ defmodule TaskSupDynamic.BatchEnricherTest do
 end
 ```
 
+### Why this works
+
+`start_child` monitors (not links) the task, so the HTTP handler crashing leaves the task running. `restart: :transient` gives retry-on-crash while skipping `exit(:normal)` (the attempt-cap escape hatch). `shutdown: 30_000` gives the supervisor 30 s to drain during deploy, matching DB commit windows. For batch fan-out, `async_stream_nolink` with `on_timeout: :kill_task` turns a stuck task into a `{:exit, :timeout}` tuple rather than propagating the exit to the parent — partial results survive individual failures.
+
 ---
 
 ## Trade-offs and production gotchas
@@ -319,11 +349,20 @@ end
 
 ---
 
-## Performance notes
+## Benchmark
 
 `Task.Supervisor.start_child` is ~10–20 µs (one `DynamicSupervisor.start_child` call under the hood). The cost is dominated by the closure allocation, not the supervisor. For 100 k/s task creation you'll need to batch — do NOT start 100 k individual tasks, start 100 tasks that each process 1 000 items.
 
 `async_stream_nolink` with `max_concurrency: N` adds one extra `spawn_monitor` per task (~2 µs) plus the `Stream` overhead. Steady-state throughput for pure-Elixir work saturates at ~200 k tasks/s per scheduler before scheduler pressure dominates.
+
+Target: `start_child` latency ≤ 20 µs; `async_stream_nolink` throughput ≥ 50k items/s at `max_concurrency = schedulers × 2` for sub-millisecond work.
+
+---
+
+## Reflection
+
+1. Your webhook volume doubles and deploys now take 4 minutes because `shutdown: 30_000` × 50 in-flight tasks × serial draining. Do you shorten shutdown, add a pre-drain barrier (stop accepting new webhooks first), or move the work to Oban? What invariant breaks under each choice?
+2. A deterministic bug turns 0.5% of payloads into a crash that retries 3 times before hitting the attempt cap. At 1k webhooks/s, that is 15 extra task spawns/s + logs. Would you switch to a dead-letter table, a per-payload circuit breaker, or tighten the cap to 1? Use the retry logs as your telemetry source.
 
 ---
 

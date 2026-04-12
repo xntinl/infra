@@ -60,6 +60,18 @@ This is a variant of the bin-packing problem (NP-hard in the general case), solv
 
 ---
 
+## Design decisions
+
+**Option A — Central queue with a single dispatcher**
+- Pros: trivially correct ordering; easy to inspect.
+- Cons: single point of failure and throughput; dispatcher becomes the bottleneck at scale.
+
+**Option B — Sharded queues with leader-per-shard and gossip membership** (chosen)
+- Pros: throughput scales with shard count; leader election per shard isolates failure; gossip keeps members loosely synchronized without a central registry.
+- Cons: more moving parts; rebalance on topology change must avoid double-execution.
+
+→ Chose **B** because the whole point of a *distributed* scheduler is to survive the loss of the dispatcher — sharding with a per-shard leader makes that explicit.
+
 ## Implementation milestones
 
 ### Step 1: Create the project
@@ -500,6 +512,24 @@ Benchee.run(
 )
 ```
 
+### Why this works
+
+Each job is owned by exactly one shard (determined by consistent hashing on the job key), and each shard has exactly one leader that emits it. A leader lease tied to heartbeats guarantees that only one leader exists at a time, so a job is never executed twice.
+
+---
+
+## Benchmark
+
+```elixir
+# bench/scheduler_bench.exs
+Benchee.run(%{
+  "enqueue" => fn -> DistSched.enqueue(%{task: :noop}) end,
+  "dispatch" => fn -> DistSched.drain(1_000) end
+}, parallel: 10, time: 10)
+```
+
+Target: 10,000 jobs/second enqueued and dispatched end-to-end on a 3-shard localhost cluster.
+
 ---
 
 ## Trade-off analysis
@@ -531,6 +561,11 @@ A user's fair-share consumption should be measured over a rolling window, not in
 
 **4. Heartbeat timeout too aggressive**
 Setting the heartbeat timeout too low causes frequent false-positive node failures, triggering unnecessary job requeues and disrupting running work. Calibrate the timeout based on your network's p99 round-trip time, not its p50.
+
+## Reflection
+
+- If one shard leader is network-partitioned from the rest but still holds its lease, what guarantees do you lose? How would you shorten the blast radius?
+- Compare your scheduler to Oban (Postgres-backed). At what scale does the Postgres lock-based approach stop being competitive with sharded leaders?
 
 ---
 

@@ -1,7 +1,6 @@
 # Stream.resource and Lazy Infinite Sequences
 
-**Project**: `log_tailer` — standalone Mix project, 1–2 hours  
-**Difficulty**: ★★☆☆☆
+**Project**: `log_tailer` — a `tail -f`-style lazy file watcher built with `Stream.resource/3`
 
 ---
 
@@ -55,6 +54,20 @@ lets you own the loop: on EOF, sleep briefly and retry instead of halting.
 
 `File.stream!/3` also closes on error but not on early halt in all runtime versions.
 `Stream.resource` has explicit cleanup semantics — the `after` function runs no matter what.
+
+---
+
+## Design decisions
+
+**Option A — spawn a GenServer that reads the file and sends lines via `send/2`**
+- Pros: explicit process model; back-pressure via selective receive; restartable under a supervisor.
+- Cons: heavy for a read-only tailer; consumers must implement their own mailbox handling; halting cleanly requires a bespoke protocol; you've just reinvented a worse `Stream`.
+
+**Option B — `Stream.resource/3` with `start_fun` opening the file, `next_fun` reading chunks, `after_fun` closing the handle** (chosen)
+- Pros: cleanup on early halt (exceptions, `take/1`) is guaranteed by the runtime; composes with any `Stream`/`Enum` function; no process lifecycle to manage; the stream IS the abstraction.
+- Cons: `next_fun` must handle the "no data yet" case explicitly (sleep + return `{[], state}`); poll interval is a trade-off between latency and CPU; not suitable for thousands of concurrent tailers (each holds an FD).
+
+Chose **B** because the semantics we need — open once, yield as data arrives, close on any exit — are exactly what `Stream.resource/3` provides, with the runtime handling the cleanup contract for free.
 
 ---
 
@@ -185,6 +198,41 @@ mix test
 
 All 4 tests should pass.
 
+### Why this works
+
+`Stream.resource/3` gives three callbacks that map to the lifecycle of an external resource: `start_fun` opens the file exactly once and returns the state (the `File.io_device`), `next_fun` returns `{lines, new_state}` each time the consumer pulls — returning `{[], state}` on EOF after a short sleep to avoid busy-looping — and `after_fun` runs exactly once when the stream halts, whether from `Enum.take/1`, an exception in the consumer, or the file being deleted. Because the stream is lazy, the file is never opened until a terminal operation pulls; because `after_fun` is guaranteed, file descriptors never leak. `Stream.unfold/2` is the stateless cousin — same pull model, no cleanup needed.
+
+---
+
+## Benchmark
+
+```elixir
+# bench.exs
+defmodule Bench do
+  def run do
+    path = Path.join(System.tmp_dir!(), "bench_log_#{System.unique_integer([:positive])}.log")
+
+    # Pre-populate with 100k lines
+    File.write!(path, Enum.map_join(1..100_000, "\n", &"line-#{&1}") <> "\n")
+
+    {us, lines} =
+      :timer.tc(fn ->
+        LogTailer.tail(path, 0)
+        |> Enum.take(100_000)
+      end)
+
+    IO.puts("tail + take(100k): #{us} µs (#{us / 100_000} µs/line)")
+    IO.puts("lines read: #{length(lines)}")
+
+    File.rm!(path)
+  end
+end
+
+Bench.run()
+```
+
+Target: under 2 µs per line in steady state (file already populated, no sleep needed). The interesting metric is latency from write-to-read when new lines arrive — measure by having one process write while another tails, then record the delta.
+
 ---
 
 ## Trade-offs
@@ -226,6 +274,13 @@ from a connection you must close.
 
 If you need random access or need to rewind, you want a `File` handle directly, not a
 lazy stream — streams are strictly forward-only.
+
+---
+
+## Reflection
+
+1. Your tailer polls every 50 ms. For a monitoring tool consuming 1000 log files, that's 20k polls/sec — overkill when most files are idle. Would you switch to `:file_event` watchers (fs library), aggregate multiple files into one stream, or something else? How does `Stream.resource/3` compose (or not) with inotify-style event sources?
+2. `after_fun` is guaranteed to run — unless the BEAM is killed by the OS (`kill -9`). What files, sockets, or external state would still leak in that case? Is it the stream's responsibility to protect against it, or does the supervisor tree handle it one level up?
 
 ---
 

@@ -42,6 +42,22 @@ swarm/
 
 ---
 
+## Why rarest-first piece selection and not sequential piece selection
+
+rarest-first maximizes piece diversity across the swarm, so peers can exchange pieces with each other and leave the initial seed faster. Sequential selection creates a bottleneck at the seed for every piece.
+
+## Design decisions
+
+**Option A — centralized tracker only**
+- Pros: simple, easy to diagnose
+- Cons: single point of failure, scale bottleneck
+
+**Option B — DHT-based peer discovery (Kademlia) with tracker fallback** (chosen)
+- Pros: self-healing, horizontal scale, tolerates node churn
+- Cons: more complex to implement and debug
+
+→ Chose **B** because a P2P system that dies when its tracker dies isn't actually P2P — DHT is the whole point.
+
 ## The business problem
 
 The distributed systems team needs to transfer large datasets (10-100GB model files) between datacenter nodes without relying on a central file server. A central server is both a bottleneck and a single point of failure. With P2P, every node that has completed a download becomes an upload source, and aggregate bandwidth scales with the number of participants.
@@ -388,6 +404,9 @@ defmodule Swarm.MetadataTest do
 
   alias Swarm.Metadata
 
+
+  describe "Metadata" do
+
   test "pieces reassemble to original file" do
     data = :crypto.strong_rand_bytes(1_000_000)
     meta = Metadata.from_binary("test.bin", data, 256 * 1024)
@@ -409,6 +428,9 @@ defmodule Swarm.MetadataTest do
     m2 = Metadata.from_binary("f.txt", "content B")
     assert m1.info_hash != m2.info_hash
   end
+
+
+  end
 end
 ```
 
@@ -423,6 +445,9 @@ defmodule Swarm.PieceManagerTest do
     {:ok, pm} = PieceManager.start_link(num_pieces: 10)
     %{pm: pm}
   end
+
+
+  describe "PieceManager" do
 
   test "select_piece returns :none when peer has nothing we need", %{pm: pm} do
     PieceManager.update_peer_bitfield(pm, "peer1", [])
@@ -453,6 +478,9 @@ defmodule Swarm.PieceManagerTest do
 
     assert PieceManager.select_piece(pm, "peer1") == :none
   end
+
+
+  end
 end
 ```
 
@@ -463,6 +491,24 @@ mix test test/swarm/ --trace
 ```
 
 ---
+
+### Why this works
+
+The design separates concerns along their real axes: what must be correct (the P2P file sharing (BitTorrent-like) invariants), what must be fast (the hot path isolated from slow paths), and what must be evolvable (external contracts kept narrow). Each module has one job and fails loudly when given inputs outside its contract, so bugs surface near their source instead of as mysterious downstream symptoms. The tests exercise the invariants directly rather than implementation details, which keeps them useful across refactors.
+
+## Benchmark
+
+```elixir
+# Minimal timing harness — replace with Benchee for production measurement.
+{time_us, _result} = :timer.tc(fn ->
+  # exercise the hot path N times
+  for _ <- 1..10_000, do: :ok
+end)
+
+IO.puts("average: #{time_us / 10_000} µs per op")
+```
+
+Target: swarm of 100 peers should saturate available bandwidth within 30s of first-piece exchange.
 
 ## Trade-off analysis
 
@@ -496,6 +542,10 @@ Kademlia XOR distance is defined over integers, not over binary strings. `<<a::1
 The choker re-evaluates every 10 seconds which peers to unchoke. Using `Process.sleep(10_000)` in a loop blocks the entire process, preventing it from handling incoming upload speed updates. Use `Process.send_after(self(), :rechoke, 10_000)` and handle it in `handle_info`.
 
 ---
+
+## Reflection
+
+What happens to swarm health when 80% of peers are free-riders who download without uploading? Which of tit-for-tat, optimistic unchoking, or super-seeding would you implement first, and why?
 
 ## Resources
 

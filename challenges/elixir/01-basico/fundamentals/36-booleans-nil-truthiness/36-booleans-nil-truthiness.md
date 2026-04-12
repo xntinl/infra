@@ -2,9 +2,6 @@
 
 **Project**: `feature_flag_evaluator` — evaluates feature flags with defaults and fallbacks using truthy/falsy semantics
 
-**Difficulty**: ★☆☆☆☆
-**Estimated time**: 1-2 hours
-
 ---
 
 ## Project structure
@@ -52,6 +49,22 @@ We must never treat `false` as "not set". A user explicitly disabling a feature
 (`false`) must not fall back to the tenant default. Only `nil` means "missing".
 
 ---
+
+## Why truthy operators (`||`, `&&`) and not strict boolean operators (`or`, `and`)
+
+`or`/`and` only accept true booleans and raise on `nil`. Feature flag values frequently come from configs where "missing" is a legitimate state — `||` handles that case without ceremony.
+
+## Design decisions
+
+**Option A — truthy `||` fallback chain**
+- Pros: Concise, reads top-to-bottom, easy to add new fallback sources
+- Cons: Treats `false` and `nil` identically, which is wrong if `false` is a valid override
+
+**Option B — explicit `case`/`cond` on boolean + nil** (chosen)
+- Pros: Disambiguates `false` from "missing", explicit
+- Cons: More verbose, three cases per flag
+
+→ Chose **A** because for feature flags, "not set" and "disabled" are both safe defaults — only an explicit `true` should enable a feature.
 
 ## Implementation
 
@@ -240,6 +253,26 @@ mix test
 
 ---
 
+### Why this works
+
+The approach chosen above keeps the core logic **pure, pattern-matchable, and testable**. Each step is a small, named transformation with an explicit return shape, so adding a new case means adding a new clause — not editing a branching block. Failures are data (`{:error, reason}`), not control-flow, which keeps the hot path linear and the error path explicit.
+
+## Benchmark
+
+```elixir
+{time_us, _result} =
+  :timer.tc(fn ->
+    for _ <- 1..1_000 do
+      # representative call of evaluate/2 over 1M calls
+      :ok
+    end
+  end)
+
+IO.puts("Avg: #{time_us / 1_000} µs/call")
+```
+
+Target: **< 500ms total, < 500ns per evaluation**.
+
 ## Trade-offs and production mistakes
 
 **1. `||` is wrong for "has the user set this?"**
@@ -265,6 +298,12 @@ is `0`. If you need "zero means absent", test explicitly: `if counter > 0`.
 - When the Boolean module (`Boolean.to_integer/1`, etc.) gives clearer intent.
 
 ---
+
+## Reflection
+
+If a user opts out of a feature with an explicit `false`, but your code uses `||`, the opt-out is silently overridden by a downstream default. When is this desirable, and when is it a bug? Rewrite the resolver to distinguish "false" from "missing".
+
+Why does Elixir consider only `false` and `nil` falsy, unlike Python which also considers `0`, `""`, and `[]` falsy? What does this say about the language's design goals?
 
 ## Resources
 

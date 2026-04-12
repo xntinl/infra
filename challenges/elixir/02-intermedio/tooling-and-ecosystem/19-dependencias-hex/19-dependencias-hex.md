@@ -4,9 +4,6 @@
 dependencies and teaches you how version constraints and the lockfile
 actually work.
 
-**Difficulty**: ★★☆☆☆
-**Estimated time**: 1–2 hours
-
 ---
 
 ## Project context
@@ -101,6 +98,38 @@ Git deps **do** go into the lockfile (pinned to a SHA). Prefer `ref` or
 `only:` skips the dep when building other envs (shrinks releases).
 `runtime: false` tells OTP not to start it as an application — essential
 for tool-only deps like Credo or ExDoc that would pollute your app start.
+
+---
+
+## Why Hex + lockfile and not vendoring
+
+Vendoring (`git subtree`) gives you reproducibility but no dep graph
+resolution — if two deps need the same lib at different versions you
+solve it manually. Hex resolves the graph and `mix.lock` captures the
+resolution with checksums, so CI and every teammate build byte-identical
+trees. Vendoring has its place (forks you've modified, libs with no
+active maintainer) but for the common case, `~>` + `mix.lock` is the
+cheaper guarantee.
+
+---
+
+## Design decisions
+
+**Option A — Loose constraints (`>= 1.0`) everywhere**
+- Pros: Minimal upgrade friction; `deps.update` pulls latest always.
+- Cons: Any upstream breaking release silently enters your build; as a
+  library author, you force downstream into dependency hell.
+
+**Option B — `~> MAJOR.MINOR` + committed `mix.lock`** (chosen)
+- Pros: SemVer-safe upgrades (`deps.update` stays within the minor
+  range); lockfile pins exact versions for reproducibility; CI builds
+  are byte-identical across time.
+- Cons: Requires deliberate `deps.update` runs to move off a minor;
+  harmless but occasional "why is this version so old?" moments.
+
+→ Chose **B** because reproducibility is the foundation of debuggable
+  systems; the alternative ("works on my machine, today") is the origin
+  of 3am pager incidents.
 
 ---
 
@@ -223,6 +252,25 @@ Peek at `mix.lock`:
 The important bits: the resolved version (`1.4.4`) and the checksum. That's
 what guarantees your teammate installs byte-identical code.
 
+### Why this works
+
+`mix.exs` declares intent (a constraint); `mix.lock` captures the
+resolution (exact version + checksum). `deps.get` honors the lock,
+guaranteeing reproducibility. `deps.update` deliberately ignores the
+lock for named deps and re-resolves within the constraint — that's how
+upgrades happen on purpose instead of drifting. Environment scoping
+(`only:`, `runtime: false`) keeps dev tools out of production releases
+and out of OTP's application-start list.
+
+---
+
+## Benchmark
+
+<!-- benchmark N/A: dependency management is a build-time concern.
+     The metric that matters is "is my build reproducible?" — measured
+     by running `mix deps.get && mix compile` on two different machines
+     and comparing the resolved versions. Target: identical. -->
+
 ---
 
 ## Trade-offs and production gotchas
@@ -263,6 +311,20 @@ and wasteful.
 
 Every dep is a support contract you inherit. Read the CHANGELOG and the
 maintainer's release cadence before adding.
+
+---
+
+## Reflection
+
+- Your CI starts failing because a transitive dep (not one in your
+  `deps/0`) silently released a breaking change under a loose
+  constraint from a library you use. Walk through the diagnosis using
+  `mix deps.tree`, `mix hex.outdated`, and the lockfile. What would
+  you change in your setup to catch this before prod?
+- You inherit a repo with no `mix.lock` committed. Two developers
+  report "works on my machine" mismatches. Before adding the lockfile,
+  what's the fastest way to determine which versions are currently in
+  use by each developer, and how would you reconcile them?
 
 ---
 

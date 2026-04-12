@@ -1,7 +1,5 @@
 # Typespecs and Dialyzer
 
-**Difficulty**: ★★☆☆☆
-**Time**: 1.5–2 hours
 **Project**: `typed_calc` — a small calculator library with strict typespecs, checked by Dialyzer
 
 ---
@@ -55,6 +53,28 @@ every warning it DOES emit is almost certainly a real issue.
 
 ---
 
+## Why Dialyzer and not a full type system
+
+Elixir is not going to become statically typed overnight. Dialyzer's compromise — success typings — fits the language's pragma: it never rejects code that *might* work, it only flags code that *provably cannot* work. That means zero false positives but also accepts untyped code without complaint. The alternative (gradual types à la Gradient, or waiting for the set-theoretic type system landing in future Elixir versions) either adds intrusive annotations everywhere or isn't here yet.
+
+For a dynamic language with pattern matching as its main correctness tool, `@spec` + Dialyzer is currently the best-effort static layer you can layer on without changing how you write code.
+
+---
+
+## Design decisions
+
+**Option A — skip typespecs; rely on tests + runtime guards**
+- Pros: no extra tooling; fastest local dev loop; CI is only tests.
+- Cons: contracts live in test assertions and prose comments; refactors lose type drift until production; editor autocomplete has nothing to hint with.
+
+**Option B — `@spec` on all public functions + `mix dialyzer` in CI** (chosen)
+- Pros: static contract for every boundary; Dialyzer catches mismatches without executing code; specs become rendered docs in HexDocs; opaque types let you evolve internals safely.
+- Cons: first `mix dialyzer` run builds a multi-minute PLT; warnings without `@spec` are underwhelming; Dialyzer's success-typing model surprises people who expect strict typing.
+
+Chose **B** because the public API is small and the cost is paid once per CI run (PLT is cached) — the ROI is catching the "I silently changed the return shape" class of bugs before merge.
+
+---
+
 ## Implementation
 
 ### Step 1: Create the project
@@ -105,7 +125,7 @@ defmodule TypedCalc do
   @type op :: :add | :sub | :mul | :div
 
   # Tagged-tuple result type. We avoid exceptions for user-facing errors
-  # and reserve raise for programmer errors (see exercise 64).
+  # and reserve raise for programmer errors (invariant violations).
   @type result :: {:ok, number()} | {:error, :division_by_zero}
 
   # Private helper type — hidden from callers.
@@ -201,6 +221,16 @@ return a float (`5 / 2 == 2.5`). This is the point: the spec lied, Dialyzer caug
 
 Revert the spec before finishing.
 
+### Why this works
+
+`@type` publishes the domain shapes (`op`, `result`) so every `@spec` reads like a contract in business terms, not primitive soup. `@spec` declarations narrow Dialyzer's inferred success typings to the intended set, so any call site that passes something outside that set — or any clause that returns something outside it — gets flagged. Dialyzer never produces a false positive: if it reports a mismatch, there is a real path through your code where the types disagree. Running it in CI closes the loop; the specs stop being aspirational documentation and start being enforced.
+
+---
+
+## Benchmark
+
+<!-- benchmark N/A: typespecs are erased at compile time and Dialyzer is a static analyzer — there is nothing at runtime to measure. The relevant metric is CI time, not µs/call. -->
+
 ---
 
 ## Trade-offs
@@ -243,6 +273,13 @@ or struct destructuring.
 - **One-off scripts**: the PLT build time dwarfs the script runtime.
 - **Teams not running `mix dialyzer` in CI**: specs that no one checks are worse than no specs — they lie.
 - **Highly dynamic code**: metaprogramming-heavy DSLs confuse Dialyzer. `@spec`s on the generated functions often need `no_return` or unions wide enough to be useless.
+
+---
+
+## Reflection
+
+1. Dialyzer with success typings does not catch "you forgot to handle `{:error, :timeout}`" when both branches are legal. What complementary technique (tests, property checks, `with` pyramids, exhaustive pattern match warnings) would you pair with typespecs to close that gap?
+2. You inherit a 50k-line Elixir codebase with zero `@spec`. Adding specs everywhere is a months-long effort. What is the highest-leverage subset to spec first, and how do you prevent the team from shipping new code without specs while the backfill is in progress?
 
 ---
 

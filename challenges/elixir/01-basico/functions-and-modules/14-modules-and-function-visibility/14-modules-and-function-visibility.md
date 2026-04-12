@@ -55,6 +55,34 @@ pay_adapter/
 
 ---
 
+## Why `defp` and not runtime encapsulation tricks
+
+**Option A — mark "private" functions with a naming convention (`_build_req`) but keep them `def`**
+- Pros: every function is callable from tests; you can always poke at internals during debugging.
+- Cons: the public API is a social contract, not a machine-checked one; users import "private" helpers and suddenly they are part of your ABI. Refactors break clients you did not know existed.
+
+**Option B — `defp` for everything that is not part of the documented API** (chosen)
+- Pros: the compiler enforces the boundary; refactors of internals cannot accidentally break users; `&PayAdapter.build_request/2` from outside is a compile error, not a runtime surprise.
+- Cons: you cannot unit-test private functions directly — you must test them through the public API or extract genuinely complex logic to its own module.
+
+→ Chose **B** because a payment gateway's public surface is tiny (3–4 functions) and its internals change often. Shrink what you promise; iterate freely on what you don't.
+
+---
+
+## Design decisions
+
+**Option A — one flat module with everything in `pay_adapter.ex`**
+- Pros: fewest files; `alias`/`import` not needed.
+- Cons: the `Receipt` struct ends up defined next to HTTP plumbing; the module becomes a dumping ground; testing the data shape requires booting HTTP.
+
+**Option B — split by responsibility: `PayAdapter` (API + HTTP) and `PayAdapter.Receipt` (data)** (chosen)
+- Pros: `Receipt` has its own file, its own tests, and its own `@spec`; swapping gateways keeps the data contract stable.
+- Cons: you now manage two modules and must choose `alias` vs. full name at call sites.
+
+→ Chose **B** because the receipt outlives the transport. If tomorrow you add a second gateway (Stripe + a local PSP), they both produce `PayAdapter.Receipt` and downstream code does not care which gateway produced it.
+
+---
+
 ## Implementation
 
 ### `lib/pay_adapter.ex`
@@ -330,7 +358,7 @@ defmodule PayAdapter.Receipt do
 end
 ```
 
-**Why this works:**
+### Why this works
 
 - `PayAdapter` has 4 public functions (`charge/2`, `refund/2`, `status/1`,
   `base_url/0`, `api_version/0`) and 10+ private functions. The public API
@@ -478,6 +506,19 @@ Rules of thumb:
 - `import`: use sparingly, only `only:` specific functions
 - `require`: only when using macros
 - `use`: only when a library requires it (GenServer, Plug, Ecto.Schema)
+
+---
+
+## Benchmark
+
+<!-- benchmark N/A: visibility is a compile-time concept — there is no runtime cost difference between `def` and `defp`. Benchmarks would measure HTTP, not visibility. -->
+
+---
+
+## Reflection
+
+- Your `PayAdapter` has a `defp build_request/2` that grew to 120 lines. Do you extract it to a new *private* module `PayAdapter.RequestBuilder`, to a *public* sibling module, or keep it private and split into smaller `defp`s? What does each choice do to the testability/encapsulation trade-off?
+- A compliance reviewer wants every call to `charge/2` logged with request/response bodies (minus card data). Do you add logging inside `defp`, wrap the public API with a decorator module, or introduce a `use PayAdapter.Instrumented` macro? Which keeps the visibility boundary cleanest?
 
 ---
 

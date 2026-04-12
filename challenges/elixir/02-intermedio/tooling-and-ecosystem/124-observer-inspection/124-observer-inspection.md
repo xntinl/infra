@@ -4,9 +4,6 @@
 creates an ETS table, and opens an ephemeral port, so you can practice
 reading each of those things in Observer.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
-
 ---
 
 ## Project context
@@ -39,7 +36,7 @@ observable_app/
 > **Important**: `:observer` requires `wx`. Debian/Ubuntu: `apt install
 > erlang-observer`. macOS with Homebrew Erlang: `brew install erlang`
 > (installs with wx). Nerves and Alpine often don't have wx — use
-> `:observer_cli` (exercise 125 territory) there.
+> `:observer_cli` (headless TUI) there.
 
 ---
 
@@ -89,6 +86,35 @@ Observer's network tab will list it.
   entries (careful on huge tables — Observer loads them all).
 - **Ports** tab shows open ports and who owns them. This is how you
   detect leaked external-process ports.
+
+---
+
+## Why Observer and not logs + metrics
+
+Logs tell you what happened; metrics tell you trends over time. Neither
+answers "right now, which process is holding 500MB?" or "what's in this
+GenServer's state?". Observer is the live-node introspection layer:
+process state, mailbox contents, supervision topology — the shape of the
+system at this instant. You still need logs and metrics; Observer is the
+third leg.
+
+---
+
+## Design decisions
+
+**Option A — Run `:observer` directly on the production node**
+- Pros: Zero setup; immediate visibility into the node with the problem.
+- Cons: Needs `wx` (not in Alpine/distroless); allocates significant
+  memory on the target; ties the GUI session to the node's lifetime.
+
+**Option B — Run Observer locally, connect via distribution** (chosen)
+- Pros: The heavy GUI runs on your laptop; the prod node only pays the
+  cost of answering remote calls; survives local shell crashes.
+- Cons: Requires distribution + shared cookie + network reachability
+  (SSH tunnel in practice).
+
+→ Chose **B** because production nodes should stay lean and headless;
+  the observer workstation pattern is how every serious BEAM shop does it.
 
 ---
 
@@ -267,6 +293,23 @@ iex> port = Port.open({:spawn, "cat"}, [:binary])
 iex> Port.close(port)
 ```
 
+### Why this works
+
+Observer is a `runtime_tools` client that reads process / ETS / port info
+via the same BEAM primitives `Process.info/1` and `:ets.info/1` expose —
+it just packages them into an auto-refreshing GUI. Connecting over
+distribution means every query runs RPC-style on the remote node; the
+local VM only renders. The app's supervision tree, the ETS table, and
+the port on cat give the GUI something concrete to render in each tab.
+
+---
+
+## Benchmark
+
+<!-- benchmark N/A: Observer is an interactive introspection tool.
+     The relevant cost is the overhead it adds to the observed node
+     (~1-5% CPU per refresh window); absolute throughput is not meaningful. -->
+
 ---
 
 ## Trade-offs and production gotchas
@@ -275,7 +318,7 @@ iex> Port.close(port)
 Starting `:observer` on a production node allocates significant memory
 and pulls every process's info every second. Use it LOCALLY, connected
 to prod via distribution. For headless prod, use `:observer_cli` or
-`:recon` (exercise 125).
+`:recon`.
 
 **2. The Processes tab snapshots — reductions are rates, not totals**
 Observer's default Reductions column shows the delta since the last
@@ -303,6 +346,19 @@ Don't open your prod cookie over the public internet. Tunnel through SSH
   scraping.
 - For trace-level debugging — use `:recon_trace` or `:dbg`; Observer
   shows state, not call flow.
+
+---
+
+## Reflection
+
+- A prod node reports "memory keeps climbing, nothing restarts". You
+  open Observer over SSH. Walk through the sequence of tabs you'd visit
+  and what you'd look for in each to narrow down whether the culprit is
+  a specific process, ETS, binaries, or the atom table.
+- Your team ships on Alpine Linux containers without wx. How would you
+  reproduce an Observer-equivalent workflow for postmortem inspection,
+  and what tradeoffs would you accept (latency of inspection vs node
+  overhead vs expressiveness)?
 
 ---
 

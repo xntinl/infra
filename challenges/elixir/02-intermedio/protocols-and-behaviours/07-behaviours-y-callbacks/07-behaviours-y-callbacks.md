@@ -2,9 +2,6 @@
 
 **Project**: `storage_behaviour` — a pluggable key/value `Storage` behaviour with an in-memory implementation and an ETS-backed implementation sharing the same contract.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
-
 ---
 
 ## Project context
@@ -71,6 +68,30 @@ wrong". It turns typos into compiler errors instead of silent runtime mistakes.
 Unlike protocols, behaviours don't dispatch on the value's type. The caller
 picks the module: `impl.get(key)`. Behaviours are for "pick an adapter at
 config time", protocols are for "dispatch on this value's shape".
+
+---
+
+## Why a behaviour and not a protocol or a config-swapped module
+
+**Protocol.** Dispatches on the *value's* type (think `Enumerable`). Wrong tool here: there is no "storage value" — the operation picks the backend, not the data shape.
+
+**Config-swapped bare module.** `Application.get_env(:app, :storage)` plus `impl.get/1` works, but without `@callback` the compiler cannot tell you that an adapter forgot `delete/1` or got the arity wrong.
+
+**Behaviour (chosen).** Declares the contract with `@callback`; implementers opt in with `@behaviour Storage` and annotate with `@impl true` so renames and typos surface as compiler warnings. Same call-site ergonomics as the config-swap approach, plus static checking.
+
+---
+
+## Design decisions
+
+**Option A — One concrete storage module, swap at deploy time via config**
+- Pros: Fewer files; callers just call `Storage.get/1`.
+- Cons: Can't run two backends in the same VM (tests vs production), no compile-time check that adapters conform.
+
+**Option B — `Storage` behaviour + per-adapter modules, caller passes the impl** (chosen)
+- Pros: Compile-time conformance check; multiple backends coexist; tests run the same suite against each adapter.
+- Cons: One extra indirection; callers must know which module to pass (usually injected from config).
+
+→ Chose **B** because the compile-time check and the "same tests, multiple adapters" pattern pay for themselves the first time you add a new backend.
 
 ---
 
@@ -262,6 +283,32 @@ end
 mix test
 ```
 
+### Why this works
+
+The behaviour declares the contract once (`@callback get/1`, `put/2`, `delete/1`, plus the optional `clear/0`), and each adapter opts in with `@behaviour Storage`. The `@impl true` annotations turn typos and arity mistakes into compiler warnings — the cheapest feedback loop you can buy. The test suite is written once and parameterized over the list of adapters, so conformance is exercised, not just declared.
+
+---
+
+## Benchmark
+
+```elixir
+Storage.EtsStore.clear()
+
+{put_time, _} =
+  :timer.tc(fn ->
+    Enum.each(1..100_000, fn i -> Storage.EtsStore.put(i, i) end)
+  end)
+
+{get_time, _} =
+  :timer.tc(fn ->
+    Enum.each(1..100_000, fn i -> {:ok, _} = Storage.EtsStore.get(i) end)
+  end)
+
+IO.puts("ETS put=#{put_time / 100_000} µs  get=#{get_time / 100_000} µs")
+```
+
+Target esperado: <1 µs por `get` y <2 µs por `put` para el adaptador ETS en hardware moderno. El in-memory (process dict) es comparable para una sola clave pero escala peor con grandes keysets.
+
 ---
 
 ## Trade-offs and production gotchas
@@ -290,6 +337,13 @@ If the "contract" is really "one function that might do different things
 depending on the value", that's a protocol, not a behaviour. And if there
 will only ever be one implementation, skip the ceremony entirely — a direct
 module call is clearer.
+
+---
+
+## Reflection
+
+- You add a third adapter (`Storage.Redis`) that is async and may fail with network errors. Does the current `get/1` signature (`{:ok, value} | :error`) still fit, or do you need to evolve the contract? What's the minimal change that keeps the two existing adapters valid?
+- A consumer passes the adapter as a function argument everywhere; another passes it once via `Application.get_env/2`. Which approach survives better under test (especially `async: true`)? Why?
 
 ---
 

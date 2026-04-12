@@ -3,9 +3,6 @@
 **Project**: `debug_tools` — a tiny pipeline where you practice the three
 everyday Elixir debugging tools without reaching for a debugger.
 
-**Difficulty**: ★★☆☆☆
-**Estimated time**: 1–2 hours
-
 ---
 
 ## Project context
@@ -84,6 +81,38 @@ just inspect whatever you want.
 Debug prints get committed by accident and pollute production logs. Every
 `IO.inspect`, `dbg`, and `pry` should be temporary. Credo and even the
 compiler (in strict mode) will warn about stray `dbg` calls — lean into that.
+
+---
+
+## Why these three and not `inspect/1` + `IO.puts`
+
+`inspect/1` returns a string, so `x |> inspect() |> foo()` passes a
+string to `foo/1` — almost always wrong. `IO.puts` works on strings only
+and breaks the pipe because it returns `:ok`. `IO.inspect/2` is the
+pipeline-safe primitive: it prints AND returns its argument. `dbg/2`
+adds the expression source to the output (a macro superpower).
+`IEx.pry/0` gives you the full lexical scope, which the other two can't.
+
+---
+
+## Design decisions
+
+**Option A — Always use `IO.inspect/2`**
+- Pros: Works everywhere (IEx, test, production); zero tooling
+  requirements; pipeline-friendly.
+- Cons: Prints a value, not the expression producing it; no stepping;
+  gets committed and pollutes production logs.
+
+**Option B — Tiered approach: `IO.inspect` → `dbg` → `IEx.pry`** (chosen)
+- Pros: Each tool covers a different need — inline probing, expression
+  tracing, full lexical breakpoint. Choosing the least invasive tool
+  for the job keeps debugging cheap.
+- Cons: Requires knowing all three; `dbg/2` needs Elixir 1.14+ and
+  `--dbg pry` for stepping; `IEx.pry/0` requires `iex -S mix`.
+
+→ Chose **B** because each tool has a niche the others can't cover
+  cleanly, and picking the right one turns a 20-minute bug hunt into
+  two minutes.
 
 ---
 
@@ -259,6 +288,28 @@ iex> TextPipeline.process_with_pry("a b a")
 # then type `continue` to resume.
 ```
 
+### Why this works
+
+`IO.inspect/2` returns its argument, which is what lets you insert it
+anywhere in a pipe without changing behavior — a deliberate design
+choice so the debug probe is identity-on-value. `dbg/2` is a macro and
+therefore sees the AST; it can print the expression alongside the
+result and (with `--dbg pry`) pause between pipe stages because it
+rewrites the pipeline at compile time. `IEx.pry/0` hooks into the
+compiled module's debug_info to expose the local scope to the IEx
+shell, which is why it only works when the code is reached from an
+IEx-connected shell.
+
+---
+
+## Benchmark
+
+<!-- benchmark N/A: these are debugging tools; their overhead is
+     intentional (printing, formatting, pausing) and the right metric
+     is "did I find the bug?" not throughput. Roughly, `IO.inspect` on
+     a 1KB term is ~50µs on modern hardware — negligible outside hot
+     loops, pathological inside them. -->
+
 ---
 
 ## Trade-offs and production gotchas
@@ -294,6 +345,19 @@ If you need to inspect *why* a production node is misbehaving right now,
 you want `:recon`, `:observer`, or `:sys.get_state/1` — not `IO.inspect`.
 If you're debugging concurrency / scheduling, reach for tracing (`:dbg`,
 `:recon_trace`), not print statements.
+
+---
+
+## Reflection
+
+- Your team repeatedly ships PRs with leftover `IO.inspect` calls. Would
+  you fix this socially (code review), mechanically (Credo check
+  blocking CI), or technologically (a compile-time macro that strips
+  them in `:prod`)? What are the tradeoffs of each?
+- You're debugging a Phoenix controller that sometimes returns stale
+  data under load. `IO.inspect` shows correct values in isolation. What
+  tool from this exercise (or beyond it) matches the problem shape, and
+  why do print-based tools fail here?
 
 ---
 

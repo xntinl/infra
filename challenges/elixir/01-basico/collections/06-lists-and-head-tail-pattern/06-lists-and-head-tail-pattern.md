@@ -64,6 +64,20 @@ md_lite/
 
 ---
 
+## Design decisions
+
+**Option A — build the output with `list ++ [chunk]` (append as you go)**
+- Pros: reads in natural order; no final reverse; matches how many developers coming from Python/JS first think about the problem.
+- Cons: each `++` copies the entire accumulator — O(n²) over the whole document; visible slowness on long markdown inputs.
+
+**Option B — prepend to accumulator, reverse once at the end** (chosen)
+- Pros: O(n) total; idiomatic in Elixir and OTP; each recursive step stays O(1); the final `Enum.reverse/1` is explicit and cheap.
+- Cons: the accumulator is "backwards" during processing, which can confuse readers unfamiliar with the pattern; you must remember the reverse.
+
+Chose **B** because even a moderate-size markdown file (a few thousand lines) exposes the O(n²) cliff of option A — and the idiom is universal in Elixir list processing, so learning it pays off well beyond this exercise.
+
+---
+
 ## Implementation
 
 ### `lib/md_lite.ex`
@@ -219,7 +233,7 @@ defmodule MdLite do
 end
 ```
 
-**Why this works:**
+### Why this works
 
 - `process_lines/2` is tail-recursive with an accumulator. Each call prepends to
   `acc` (O(1)) and passes the tail of the input list. The result is reversed once
@@ -361,6 +375,40 @@ mix test --trace
 
 ---
 
+## Benchmark
+
+```elixir
+# bench.exs — compare O(n) prepend+reverse vs O(n²) append
+defmodule Bench do
+  def prepend_reverse(n) do
+    Enum.reduce(1..n, [], fn x, acc -> [x | acc] end) |> Enum.reverse()
+  end
+
+  def append(n) do
+    Enum.reduce(1..n, [], fn x, acc -> acc ++ [x] end)
+  end
+
+  def run do
+    {t_prepend, _} = :timer.tc(fn -> prepend_reverse(10_000) end)
+    {t_append, _} = :timer.tc(fn -> append(10_000) end)
+
+    IO.puts("prepend+reverse 10k: #{t_prepend} µs")
+    IO.puts("append          10k: #{t_append} µs  (expect ~100–1000× slower)")
+
+    # Also measure MdLite on a realistic document
+    doc = String.duplicate("# Heading\n\nA paragraph with **bold**.\n\n", 500)
+    {t_md, _} = :timer.tc(fn -> MdLite.to_html(doc) end)
+    IO.puts("MdLite.to_html 2000 lines: #{t_md} µs")
+  end
+end
+
+Bench.run()
+```
+
+Target: `prepend_reverse(10_000)` well under 2 ms; `append(10_000)` typically 100–1000× slower on modern hardware — that ratio IS the lesson. For the converter itself, expect <30 ms for a 2000-line document.
+
+---
+
 ## Prepend vs append performance
 
 This is the single most important list performance fact in Elixir:
@@ -411,6 +459,13 @@ in recursive functions.
 **5. Deeply nested `[head | [second | rest]]` matching**
 While valid, deep nesting is hard to read. Prefer `[first, second | rest]`
 which is equivalent and clearer.
+
+---
+
+## Reflection
+
+1. Your markdown converter processes one line at a time. A new requirement arrives: tables (`| a | b |`) that span variable row counts. Would you add another `consume_*` helper, or switch to a two-pass parser (first tokenize, then assemble)? What does each choice cost in terms of state and readability?
+2. If the input came as a `Stream` instead of a fully loaded string (e.g. a large markdown file read line-by-line), what changes in the recursion? Would you still reverse at the end, or can you emit HTML lazily?
 
 ---
 

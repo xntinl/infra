@@ -59,6 +59,34 @@ pipeline/
 
 ---
 
+## Why pattern-matching dispatch and not OO overload
+
+**Option A — single `process/2` with optional arg emulated at runtime**
+- Pros: looks familiar to people coming from languages with optional args.
+- Cons: you must branch on `nil`/sentinel values at runtime; you lose compile-time verification that each arity has a coherent contract.
+
+**Option B — distinct `process/1` and `process/2` resolved by arity** (chosen)
+- Pros: the BEAM indexes functions by `{name, arity}`, so dispatch is a table lookup. Default arguments (`opts \\ []`) generate both heads at compile time.
+- Cons: newcomers expect overloading; they must learn that `&fun/1` and `&fun/2` are different values.
+
+→ Chose **B** because it is the idiom the runtime is built around: `Enum.map/2` and `Enum.map/3` are not related functions, they are entries in different slots of the module's export table.
+
+---
+
+## Design decisions
+
+**Option A — middlewares as structs with a `call/2` callback (like Plug)**
+- Pros: each middleware can carry compile-time options; easier to introspect.
+- Cons: requires a module per middleware, more ceremony for one-off transforms, and obscures the fact that a middleware is *just a function*.
+
+**Option B — middlewares as plain functions of type `(ctx -> ctx)`** (chosen)
+- Pros: composition is `Enum.reduce`; testing is calling the function; closures capture configuration; `&Module.fun/1` references integrate with the rest of the language.
+- Cons: no standard place to hang compile-time metadata; harder to emit documentation per middleware.
+
+→ Chose **B** because the business problem is about composition, not about a formal plugin protocol. Plug's struct-based approach is only worth the cost when you need router-level dispatch and compile-time metadata.
+
+---
+
 ## Implementation
 
 ### `lib/pipeline.ex`
@@ -301,7 +329,7 @@ defmodule Pipeline.Middlewares do
 end
 ```
 
-**Why this works:**
+### Why this works
 
 - `timestamp/2` has a default argument (`time_fn \\ &default_timestamp/0`). This
   generates two function heads at compile time: `timestamp/1` (uses default) and
@@ -466,6 +494,27 @@ def process(data, opts) when is_list(data), do: # ...
 
 ---
 
+## Benchmark
+
+Measure pipeline dispatch overhead so you can compare it against struct-based approaches (e.g. Plug).
+
+```elixir
+auth = Pipeline.Middlewares.authenticate(MapSet.new(["tok"]))
+limiter = Pipeline.Middlewares.rate_limit(1_000)
+stamp = &Pipeline.Middlewares.timestamp/1
+ctx = Pipeline.new_context(%{token: "tok", request_count: 5})
+
+{us, _} = :timer.tc(fn ->
+  for _ <- 1..100_000, do: Pipeline.run([auth, limiter, stamp], ctx)
+end)
+
+IO.puts("per run: #{us / 100_000} µs")
+```
+
+Target esperado: <5 µs per 3-middleware run on modern hardware. If you see >50 µs, the cost is inside the middlewares (e.g. `DateTime.utc_now` dominating), not in the dispatch.
+
+---
+
 ## Common production mistakes
 
 **1. Confusing `fun/1` and `fun/2`**
@@ -486,6 +535,13 @@ functions are invisible. This is by design — it enforces encapsulation.
 **5. `&(&1)` is not a function**
 `&(&1)` is the identity function (`fn x -> x end`). It works, but it is confusing.
 Write `& &1` or `fn x -> x end` for clarity.
+
+---
+
+## Reflection
+
+- If a single middleware slows from 5 µs to 500 µs (e.g. it now does a synchronous HTTP call for feature flags), does your pipeline still belong in the request path, or do you move it off-hotpath? What signal tells you the threshold has been crossed?
+- Your pipeline accepts `[middleware()]`. A colleague asks you to add priorities so security middlewares always run first regardless of list order. Do you change the data structure, enforce ordering by convention at the call site, or refuse the request? Justify.
 
 ---
 

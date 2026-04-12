@@ -1,7 +1,6 @@
 # Enum.reduce Patterns for Aggregation
 
-**Project**: `event_aggregator` — standalone Mix project, 1–2 hours  
-**Difficulty**: ★★☆☆☆
+**Project**: `event_aggregator` — aggregating event logs with `Enum.reduce/3` and `Enum.reduce_while/3`
 
 ---
 
@@ -62,6 +61,20 @@ For a counter you only need a `%{type => integer}` map, which a single `reduce` 
 
 Rule of thumb: if you only need aggregated numbers (counters, sums, min/max), reach for `reduce`.
 If you need the grouped items themselves for downstream work, `group_by` is fine.
+
+---
+
+## Design decisions
+
+**Option A — `Enum.group_by/2` then `Enum.map/2` to reduce each group**
+- Pros: reads declaratively; the two passes mirror how SQL would express it (GROUP BY + aggregate); each pass is independently testable.
+- Cons: allocates `%{type => [event, event, ...]}` — the full partitioned input — only to immediately discard it; wastes memory proportional to input size when you only want counters.
+
+**Option B — single `Enum.reduce/3` with a map accumulator `%{type => count}`** (chosen)
+- Pros: one pass; memory proportional to the number of groups, not events; composes naturally with `reduce_while/3` for early exit; same shape handles counters, sums, and more complex aggregates uniformly.
+- Cons: the reducer function is slightly denser; less obvious than `group_by` at a glance; requires discipline to always prepend-and-reverse when building lists inside the accumulator.
+
+Chose **B** because the aggregate shape (`count`, `sum`, `avg`) never needs the grouped rows themselves — keeping them would burn memory for nothing. When downstream code DOES need the groups, `group_by` is right; this file is about the counter case.
 
 ---
 
@@ -213,6 +226,39 @@ mix test
 
 All 6 tests should pass.
 
+### Why this works
+
+`Enum.reduce/3` walks the input once, threading the accumulator through each call to the reducer. Using a map for counters keeps per-step work at O(log n) on the key count (small in practice) and avoids the intermediate list that `group_by` would materialize. `Enum.reduce_while/3` adds the `{:halt, acc}` escape hatch: the scanner for unique users returns as soon as it has N, so an input of a million events can terminate after processing the first few hundred. The tuple accumulator for revenue stats (`{count, sum}`) avoids map allocation churn when you know the shape is fixed — `{c + 1, s + amount}` is pure stack arithmetic.
+
+---
+
+## Benchmark
+
+```elixir
+# bench.exs
+defmodule Bench do
+  def run do
+    events =
+      for i <- 1..1_000_000 do
+        %{type: Enum.random([:click, :purchase, :view]), user_id: rem(i, 10_000), amount: 10.0}
+      end
+
+    {reduce_us, _} =
+      :timer.tc(fn -> EventAggregator.count_by_type(events) end)
+
+    {first_n_us, _} =
+      :timer.tc(fn -> EventAggregator.first_unique_users(events, 500) end)
+
+    IO.puts("count_by_type 1M events:            #{reduce_us} µs")
+    IO.puts("first_unique_users (N=500, 1M in):  #{first_n_us} µs")
+  end
+end
+
+Bench.run()
+```
+
+Target: `count_by_type` under 300 ms for 1M events (dominated by map updates); `first_unique_users` under 5 ms for N=500 because `reduce_while` halts long before the 1M tail runs. The second number IS the point — it's bound to N, not to input size.
+
 ---
 
 ## Trade-offs
@@ -249,6 +295,13 @@ aggregations the standard library doesn't cover.
 
 If you need to preserve all items and only transform them, use `Enum.map/2`. Reduce to build
 a list is a code smell unless you're also filtering or combining.
+
+---
+
+## Reflection
+
+1. Your `count_by_type` reducer uses `Map.update/4`. A teammate suggests `Map.put(acc, k, (acc[k] || 0) + 1)` because it "reads more clearly". Benchmark both on 1M events — which wins, and why? Is the winner also the one you'd merge?
+2. `first_unique_users` halts after N. What happens if the input is a `Stream` emitting events as an external API returns them, and the API is slow? Does `Enum.reduce_while/3` still short-circuit, or does it force the stream to materialize first? Design a test that distinguishes the two behaviours.
 
 ---
 

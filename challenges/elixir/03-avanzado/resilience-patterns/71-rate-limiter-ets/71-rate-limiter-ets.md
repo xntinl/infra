@@ -88,6 +88,18 @@ process dies, the table is destroyed) but is not the bottleneck for reads.
 
 ---
 
+## Design decisions
+
+**Option A — naive/simple approach**
+- Pros: minimal code, easy to reason about.
+- Cons: breaks under load, lacks observability, hard to evolve.
+
+**Option B — the approach used here** (chosen)
+- Pros: production-grade, handles edge cases, testable boundaries.
+- Cons: more moving parts, requires understanding of the BEAM primitives involved.
+
+→ Chose **B** because correctness under concurrency and failure modes outweighs the extra surface area.
+
 ## Implementation
 
 ### Step 1: Create the project
@@ -344,6 +356,11 @@ If you see latencies > 100µs, verify that `check/3` is NOT making a `GenServer.
 
 ---
 
+
+### Why this works
+
+The design leans on BEAM guarantees (process isolation, mailbox ordering, supervisor restarts) and pushes invariants to the boundaries of each module. State transitions are explicit, failure modes are declared rather than implicit, and each step is independently testable. That combination keeps the implementation correct under concurrent load and cheap to change later.
+
 ## Trade-off analysis
 
 Fill in this table based on your implementation and benchmark results.
@@ -386,6 +403,23 @@ Recording a timestamp needs no confirmation. Using `cast` releases the caller im
 Using `call` makes every request wait for a write acknowledgment.
 
 ---
+
+## Benchmark
+
+```elixir
+# Minimal measurement — replace with Benchee for distribution stats.
+{time_us, _} = :timer.tc(fn ->
+  for _ <- 1..10_000, do: run_operation()
+end)
+IO.puts("avg: #{time_us / 10_000} µs/op")
+```
+
+Target: operation should complete in the low-microsecond range on modern hardware; deviations by >2× indicate a regression worth investigating.
+
+## Reflection
+
+- If the expected load grew by 100×, which assumption in this design would break first — the data structure, the process model, or the failure handling? Justify.
+- What would you measure in production to decide whether this implementation is still the right one six months from now?
 
 ## Resources
 

@@ -2,9 +2,6 @@
 
 **Project**: `calc_repl` — an interactive calculator with history, colored output, and commands
 
-**Difficulty**: ★★☆☆☆
-**Estimated time**: 2 hours
-
 ---
 
 ## Why IO matters for a senior developer
@@ -73,6 +70,28 @@ data
 |> IO.inspect(label: "after transform")
 |> validate()
 ```
+
+---
+
+## Why IO.gets recursion and not IO.stream
+
+A one-shot `IO.stream(:stdio, :line) |> Enum.each(&handle/1)` is the elegant choice for filters (read all, process, exit). But a REPL needs per-line state (history, last result, mode flags) and must print a prompt between reads. `IO.stream` doesn't give you the hook point for "print prompt, then read". Recursion does: read, process, emit, recurse with updated state.
+
+Raw `:stdio` port access would give finer control (e.g. read a single key without newline for vim-style bindings) but costs several orders of magnitude in code, with manual EOF and signal handling. For a calculator REPL, `IO.gets` + recursion sits at the right level.
+
+---
+
+## Design decisions
+
+**Option A — `IO.stream` over stdin, one handler per line**
+- Pros: idiomatic for pure filter tools; no recursion to reason about; composes with `Enum`/`Stream`.
+- Cons: no natural place to print a prompt between reads; shared state (history) must live in a separate process anyway; doesn't fit the interactive model.
+
+**Option B — recursive `loop(state)` that does `IO.gets` → evaluate → `IO.puts` → recurse** (chosen)
+- Pros: state threaded cleanly through recursion; prompt prints exactly once per cycle; easy to test via `ExUnit.CaptureIO`; EOF (`:eof`) is a natural termination signal; handles both interactive and piped input uniformly.
+- Cons: manual tail call (BEAM optimizes this; not a real concern); must remember to handle `:eof` explicitly or the process hangs on piped input.
+
+Chose **B** because REPLs are the canonical recursion-over-state case and the BEAM handles tail calls for free. The code ends up shorter than the `IO.stream` alternative once prompt + history are included.
 
 ---
 
@@ -553,6 +572,16 @@ mix escript.build
 ./calc_repl
 ```
 
+### Why this works
+
+`IO.gets/1` blocks until a full line arrives, so the REPL loop provides natural back-pressure — no busy-waiting, no polling. Returning `:eof` on stdin closure lets the recursion terminate without signal plumbing. `IO.ANSI.format/2` emits escape sequences only when the output is a terminal; when piped (`echo ... | calc_repl > out`) the codes are stripped, so the same code path works in both contexts. History lives in a supervised `Agent`, which means a crash in `evaluate/1` doesn't lose prior entries — the Agent process stays alive and the REPL re-enters the loop on the next input.
+
+---
+
+## Benchmark
+
+<!-- benchmark N/A: an interactive REPL's performance is bounded by keyboard/piped input, not by computation. The meaningful metrics are per-line evaluation latency (already sub-millisecond for trivial math) and memory growth over long sessions, both of which you verify by eyeballing `:observer.start()` during a long interactive run. -->
+
 ---
 
 ## Trade-off analysis
@@ -608,6 +637,13 @@ files, or use `Kernel.dbg/2` which is stripped in production builds.
   `OptionParser` is simpler
 - When the tool will be invoked by scripts more than humans — stdin/stdout
   transforms without a prompt are easier to automate
+
+---
+
+## Reflection
+
+1. Your REPL is synchronous — one user, one terminal. You now want a multi-user version (SSH into a BEAM node, each session gets its own history). What changes structurally? Does the recursive loop still fit, or do you promote the loop into a `GenServer` per session?
+2. ANSI codes work on terminals. A customer pipes your tool into a CI log viewer that doesn't strip ANSI and renders the escape codes literally. `IO.ANSI.format/2` uses terminal detection — can you be explicit? Where does the decision ("emit colors: yes/no") belong: CLI flag, env var, or auto-detect?
 
 ---
 

@@ -45,6 +45,18 @@ You use GenServer and Supervisor every day but cannot explain why a call uses a 
 
 ---
 
+## Design decisions
+
+**Option A — Wrap OTP's `:supervisor` behaviour**
+- Pros: battle-tested; free features (dynamic children, restart intensity, shutdown order).
+- Cons: defeats the point of *understanding* how supervision works.
+
+**Option B — Implement a supervisor from scratch on top of `:proc_lib` and `Process.monitor/1`** (chosen)
+- Pros: every rule (`:one_for_one`, `:rest_for_one`, restart intensity window) is explicit in your code; makes the OTP contract visible.
+- Cons: you must implement shutdown correctness yourself, which is where real-world supervisors usually break.
+
+→ Chose **B** because the only way to internalize the OTP supervision contract is to re-derive it — the pedagogical value dominates the ergonomic loss.
+
 ## Implementation milestones
 
 ### Step 1: Create the project
@@ -471,6 +483,18 @@ Benchee.run(
 )
 ```
 
+### Why this works
+
+Each supervisor spawns children with `:proc_lib.start_link/3` and monitors them; when a monitored PID dies, the strategy function decides whether to restart the one, restart siblings after it, or restart all. A sliding-window counter enforces restart intensity exactly as OTP does.
+
+---
+
+## Benchmark
+
+<!-- benchmark N/A: conceptual — supervision overhead is dominated by OTP primitives -->
+
+Target: N/A (conceptual exercise; measurable overhead tracks `:proc_lib` fork cost).
+
 ---
 
 ## Trade-off analysis
@@ -502,6 +526,11 @@ A counter that resets every `max_seconds` does not correctly capture a burst of 
 
 **4. Starting children before the supervisor is ready**
 If children are started synchronously in `init` before the supervisor process is fully initialized, a child that crashes immediately may generate a `{:DOWN, ...}` before the supervisor is in its receive loop. Start children from the receive loop, or handle the `{:DOWN, ...}` before the loop is entered.
+
+## Reflection
+
+- Your `:one_for_all` strategy restarts every sibling on any failure. What happens if one sibling is slow to terminate and blocks the restart? Trace the invariant.
+- When would you prefer `:rest_for_one` over `:one_for_all` in a real supervision tree? Give a concrete example.
 
 ---
 

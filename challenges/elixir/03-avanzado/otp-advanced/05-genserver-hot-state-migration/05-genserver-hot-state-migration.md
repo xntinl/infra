@@ -2,10 +2,6 @@
 
 **Project**: `hot_state_migration` — a GenServer that migrates its state shape across versions in-place using OTP release upgrades, and an honest discussion of why almost nobody does this anymore.
 
-**Difficulty**: ★★★★☆
-
-**Estimated time**: 4–6 hours
-
 ---
 
 ## Project context
@@ -93,7 +89,36 @@ The niches where it still wins: embedded devices (Nerves), telecom-style single-
 
 ---
 
+## Why `code_change` and not blue/green
+
+Blue/green spins up a v4 instance, drains v3, and cuts over. It requires an external queue or database to hold state during the cut — which this system lacks (the pending queue is memory-resident, financial, and cannot be replayed). `code_change/3` transforms state in-place in < 10 ms of apparent downtime. The cost is tooling (`.appup`/`.relup`) and rollout discipline (`@vsn` bumps). Blue/green wins for anything that can persist state externally; `code_change` wins when the process *is* the state.
+
+---
+
+## Design decisions
+
+**Option A — ship a single `upgrade_v1_to_v4` that jumps versions**
+- Pros: one function to test; no chain.
+- Cons: impossible to deploy incrementally; a node at v2 has no upgrade path; forces "skip versions" which breaks downgrade.
+
+**Option B — composable step functions, one per adjacent pair** (chosen)
+- Pros: each transform is isolated and independently testable; `code_change/3` pipes them (`v1 |> up_1_2 |> up_2_3 |> up_3_4`); supports downgrades symmetrically.
+- Cons: N² potential bug surface if you compose incorrectly; must keep every step function alive forever.
+
+→ Chose **B** because a production upgrade chain survives 3+ years of evolution, and each step must be provable in isolation. The cost of keeping old step functions is trivial; the cost of a silently wrong composed upgrade is a corrupted financial queue.
+
+---
+
 ## Implementation
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defp deps do
+  []
+end
+```
+
 
 ### Step 1: `mix.exs`
 
@@ -298,6 +323,10 @@ defmodule HotStateMigration.PaymentQueueTest do
 end
 ```
 
+### Why this works
+
+Splitting the migration into adjacent-pair step functions means each is O(n) over the live state and provably preserves invariants (counts, merchant bucketing). The `code_change/3` clauses dispatch on the incoming version and compose the appropriate subset of steps. Downgrades invert the transformation deterministically — flattening a nested map is information-losing but reversible for the data domain. `@vsn 4` is the single source of truth OTP consults during `sys:change_code`; missing the bump is the #1 silent-failure mode.
+
 ---
 
 ## Trade-offs and production gotchas
@@ -320,7 +349,7 @@ end
 
 ---
 
-## Performance notes
+## Benchmark
 
 Migration of a 5k-payment queue (v3 → v4), measured locally:
 
@@ -332,7 +361,16 @@ Migration of a 5k-payment queue (v3 → v4), measured locally:
 | `sys:resume/1`                 | 30 µs |
 | total apparent downtime        | 5 ms  |
 
+Target: apparent downtime ≤ 50 ms for queues up to 50k entries; migration throughput ≥ 1M entries/s for shape-only changes (no I/O).
+
 A 5 ms blackout is usually fine. A 500 ms blackout (if your migration is expensive) is not. Benchmark your migration on representative state sizes.
+
+---
+
+## Reflection
+
+1. Your v4 migration took 5 ms on a 5k queue. The production queue grows to 500k entries during an incident. The upgrade window is now 500 ms — enough for mailbox backpressure to cascade. Do you chunk the migration across multiple suspend/resume cycles, pre-stage the transformation, or fall back to blue/green? What invariants break under each choice?
+2. A new engineer ships v5 but forgets to bump `@vsn`. The release installs silently and the next restart sees the new code against the old shape. How would you detect this in CI without actually performing a hot upgrade in the test suite?
 
 ---
 

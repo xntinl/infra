@@ -2,9 +2,6 @@
 
 **Project**: `versioned_schema_registry` — a schema registry module using `@version` and `@supported` attributes as compile-time constants
 
-**Difficulty**: ★★☆☆☆
-**Estimated time**: 2 hours
-
 ---
 
 ## Project structure
@@ -55,6 +52,22 @@ prior versions for backward compatibility. The registry must:
 4. Generate good documentation for downstream teams.
 
 ---
+
+## Why module attributes for compile-time constants and not `def constant_x, do: 42`
+
+A function call has a call-site cost and lives in the module's call graph. A module attribute is inlined at compile time into every reference — effectively free, and impossible to override.
+
+## Design decisions
+
+**Option A — `@version`/`@supported` module attributes evaluated at compile time**
+- Pros: Zero-cost at call site (inlined), impossible to change without recompiling, visible via `__info__/1`
+- Cons: Requires a recompile to change; cannot vary per environment
+
+**Option B — runtime lookup into `Application.get_env/2`** (chosen)
+- Pros: Changes without recompile, varies per environment via `runtime.exs`
+- Cons: Runtime cost on every read, easy to misconfigure silently
+
+→ Chose **A** because schema versions are part of the code artifact — changing one requires publishing a new version of the registry. Use B for per-env tunables.
 
 ## Implementation
 
@@ -255,6 +268,26 @@ mix docs  # if ex_doc is configured — @moduledoc renders the module page
 
 ---
 
+### Why this works
+
+The approach chosen above keeps the core logic **pure, pattern-matchable, and testable**. Each step is a small, named transformation with an explicit return shape, so adding a new case means adding a new clause — not editing a branching block. Failures are data (`{:error, reason}`), not control-flow, which keeps the hot path linear and the error path explicit.
+
+## Benchmark
+
+```elixir
+{time_us, _result} =
+  :timer.tc(fn ->
+    for _ <- 1..1_000 do
+      # representative call of Registry.version/0 inlined vs function call
+      :ok
+    end
+  end)
+
+IO.puts("Avg: #{time_us / 1_000} µs/call")
+```
+
+Target: **attribute-based access is ~2x faster at the BEAM instruction level (verify with `:timer.tc` over 10M calls)**.
+
 ## Trade-offs and production mistakes
 
 **1. Large list attributes rebuild at every call**
@@ -291,6 +324,12 @@ far. For single-value attributes it's the last write. Read the docs of
   test doubles harder.
 
 ---
+
+## Reflection
+
+If your schema registry must support loading new schemas at runtime (tenant-specific plugins), module attributes no longer fit. Which structure would you reach for, and what would you lose?
+
+Why can't module attributes capture values that depend on runtime state (like `DateTime.utc_now/0`)? What would happen if they could?
 
 ## Resources
 

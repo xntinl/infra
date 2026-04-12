@@ -53,6 +53,18 @@ Relational databases represent relationships as foreign keys — finding all peo
 
 ---
 
+## Design decisions
+
+**Option A — Adjacency matrix (dense)**
+- Pros: O(1) edge lookup; fast matrix algebra.
+- Cons: O(V²) memory — impossible past a few thousand nodes.
+
+**Option B — Adjacency list with per-vertex ETS tables** (chosen)
+- Pros: O(V + E) memory; scales to millions of vertices; traversal is natural.
+- Cons: edge-existence checks are O(deg(v)) without a secondary index.
+
+→ Chose **B** because real graph databases are sparse by construction; paying O(V²) memory for dense-matrix ergonomics isn't acceptable for any non-trivial dataset.
+
 ## Implementation milestones
 
 ### Step 1: Create the project
@@ -819,6 +831,21 @@ Benchee.run(
 
 Target: average shortest-path query under 100ms on a 1M-node, 10M-edge graph.
 
+### Why this works
+
+Each vertex stores its adjacency list in ETS; BFS/DFS traversal streams neighbor lists without materializing the whole graph. Query planning pushes filters into traversal to avoid enumerating the full neighborhood when only a few edges match.
+
+---
+
+## Benchmark
+
+```elixir
+# bench/graph_bench.exs
+Benchee.run(%{"2_hop" => fn -> Graph.query(g, :vertex_42, depth: 2) end}, time: 10)
+```
+
+Target: 2-hop queries in < 5 ms on a graph of 100k vertices and 1M edges.
+
 ---
 
 ## Trade-off analysis
@@ -849,6 +876,11 @@ An unparseable query should return `{:error, {:parse_error, message, line, col}}
 
 **4. Not deduplicating nodes in BFS results**
 If the graph has cycles (A -> B -> A), BFS without a visited set will loop forever. The visited set must contain node IDs, not tuples — otherwise the same node at different depths is visited multiple times.
+
+## Reflection
+
+- If your graph were write-heavy (1000 new edges/s), would adjacency lists still win over CSR (compressed sparse row)? Analyze.
+- How would you add transactional multi-edge inserts without globally locking the graph?
 
 ---
 

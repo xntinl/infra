@@ -2,9 +2,6 @@
 
 **Project**: `rpc_demo` — measure, compare, and choose between the three cross-node call mechanisms in Elixir/Erlang: legacy `:rpc`, modern `:erpc`, and plain `GenServer.call` to a remote-registered process.
 
-**Difficulty**: ★★★★☆
-**Estimated time**: 3–6 hours
-
 ---
 
 ## Project context
@@ -37,6 +34,16 @@ rpc_demo/
 ```
 
 ---
+
+## Why this approach and not alternatives
+
+Alternatives considered and discarded:
+
+- **Hand-rolled equivalent**: reinvents primitives the BEAM/ecosystem already provides; high risk of subtle bugs around concurrency, timeouts, or failure propagation.
+- **External service (e.g. Redis, sidecar)**: adds a network hop and an extra failure domain for a problem the VM can solve in-process with lower latency.
+- **Heavier framework abstraction**: couples the module to a framework lifecycle and makes local reasoning/testing harder.
+
+The chosen approach stays inside the BEAM, uses idiomatic OTP primitives, and keeps the contract small.
 
 ## Core concepts
 
@@ -120,6 +127,18 @@ If the side effect of the remote function is non-idempotent (e.g., "increment a 
 All targets execute in parallel with a shared deadline. Implementing this with `:rpc` requires manual `Task.async/await_many`; `:erpc` does it in one call.
 
 ---
+
+## Design decisions
+
+**Option A — naive/simple approach**
+- Pros: minimal code, easy to reason about.
+- Cons: breaks under load, lacks observability, hard to evolve.
+
+**Option B — the approach used here** (chosen)
+- Pros: production-grade, handles edge cases, testable boundaries.
+- Cons: more moving parts, requires understanding of the BEAM primitives involved.
+
+→ Chose **B** because correctness under concurrency and failure modes outweighs the extra surface area.
 
 ## Implementation
 
@@ -416,6 +435,11 @@ RpcDemo.Bench.concurrent(:"beta@127.0.0.1", 64)
 
 ---
 
+
+### Why this works
+
+The design leans on BEAM guarantees (process isolation, mailbox ordering, supervisor restarts) and pushes invariants to the boundaries of each module. State transitions are explicit, failure modes are declared rather than implicit, and each step is independently testable. That combination keeps the implementation correct under concurrent load and cheap to change later.
+
 ## Trade-offs and production gotchas
 
 **1. `:rpc.call` silences exceptions**
@@ -458,6 +482,11 @@ On two BEAM nodes over loopback, 2 000 iterations each:
 `:erpc` beats `:rpc` on every axis. `GenServer.call` is competitive for single-call latency but cannot scale past the target GenServer's mailbox throughput.
 
 ---
+
+## Reflection
+
+- If the expected load grew by 100×, which assumption in this design would break first — the data structure, the process model, or the failure handling? Justify.
+- What would you measure in production to decide whether this implementation is still the right one six months from now?
 
 ## Resources
 

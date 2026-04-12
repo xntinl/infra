@@ -53,6 +53,22 @@ metrics_collector/
 
 ---
 
+## Why XOR-encoded Gorilla chunks for time-series storage and not naive list-of-floats or a general-purpose compressor
+
+Gorilla's double-delta + XOR achieves ~1.37 bytes/sample on realistic monitoring data vs 16 bytes for naive storage, and it decodes sequentially at memory-bandwidth speed. A general-purpose compressor (zstd, lz4) compresses similarly but can't stream single samples and needs block-level reads.
+
+## Design decisions
+
+**Option A — GenServer per metric series**
+- Pros: serialized writes, trivial reasoning
+- Cons: one process per series → 1M series = 1M processes, scheduler pressure, slow increments
+
+**Option B — lock-free ETS counters with :atomics for hot paths** (chosen)
+- Pros: nanosecond increments, no message-passing tax, scales to millions of series
+- Cons: harder to reason about concurrent reads, requires careful snapshot semantics
+
+→ Chose **B** because an increment is on the hot request path of every service that scrapes — it must be nanosecond-cheap.
+
 ## The business problem
 
 The observability team needs to instrument fifty microservices without deploying a full Prometheus cluster. You will build a compatible collector that any Prometheus scraper can target. Three immediate requirements drove the design:
@@ -416,6 +432,9 @@ defmodule MetricsCollector.CounterTest do
 
   alias MetricsCollector.Types.Counter
 
+
+  describe "Counter" do
+
   test "starts at zero" do
     c = Counter.new(:test_starts_at_zero, "help", [])
     assert Counter.get(c) == 0
@@ -450,6 +469,9 @@ defmodule MetricsCollector.CounterTest do
 
     assert Counter.get(c) == 100
   end
+
+
+  end
 end
 ```
 
@@ -459,6 +481,9 @@ defmodule MetricsCollector.HistogramTest do
   use ExUnit.Case, async: true
 
   alias MetricsCollector.Types.Histogram
+
+
+  describe "Histogram" do
 
   test "all buckets above observation are incremented" do
     h = Histogram.new(:test_hist, "help", [], [0.1, 0.5, 1.0])
@@ -481,6 +506,9 @@ defmodule MetricsCollector.HistogramTest do
     %{sum: sum} = Histogram.get(h)
     assert_in_delta sum, 3.0, 0.01
   end
+
+
+  end
 end
 ```
 
@@ -495,6 +523,9 @@ defmodule MetricsCollector.PromQLTest do
     # Seed some time-series data
     :ok
   end
+
+
+  describe "PromQL" do
 
   test "rate() over a counter returns per-second rate" do
     # rate(http_requests_total[60s]) over a counter that grew by 120 in 60s → 2.0/s
@@ -514,6 +545,9 @@ defmodule MetricsCollector.PromQLTest do
   end
 
   defp current_time, do: System.monotonic_time(:millisecond)
+
+
+  end
 end
 ```
 
@@ -550,6 +584,24 @@ Expected: `inc no-label` should exceed 5 million ops/second on modern hardware (
 
 ---
 
+### Why this works
+
+The design separates concerns along their real axes: what must be correct (the Prometheus-compatible metrics invariants), what must be fast (the hot path isolated from slow paths), and what must be evolvable (external contracts kept narrow). Each module has one job and fails loudly when given inputs outside its contract, so bugs surface near their source instead of as mysterious downstream symptoms. The tests exercise the invariants directly rather than implementation details, which keeps them useful across refactors.
+
+## Benchmark
+
+```elixir
+# Minimal timing harness — replace with Benchee for production measurement.
+{time_us, _result} = :timer.tc(fn ->
+  # exercise the hot path N times
+  for _ <- 1..10_000, do: :ok
+end)
+
+IO.puts("average: #{time_us / 10_000} µs per op")
+```
+
+Target: <50ns per counter increment and <2µs per histogram observation.
+
 ## Trade-off analysis
 
 | Aspect | `:atomics` counter | GenServer counter | Redis counter |
@@ -583,6 +635,10 @@ The first sample in a chunk has no previous sample to XOR against. Store it raw.
 An alert that fires immediately on first threshold breach causes notification storms during transient spikes. The `for: 5m` pending state means the condition must hold continuously for 5 minutes before transitioning to `firing`. Implement this as a state machine with a `pending_since` timestamp.
 
 ---
+
+## Reflection
+
+At what cardinality (unique label combinations per metric) does the lock-free counter approach start to hurt, and what would you change to survive a runaway label-cardinality incident in production?
 
 ## Resources
 

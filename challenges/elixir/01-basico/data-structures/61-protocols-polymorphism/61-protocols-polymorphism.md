@@ -1,7 +1,5 @@
 # Protocols for Runtime Polymorphism
 
-**Difficulty**: ★★☆☆☆
-**Time**: 1.5–2 hours
 **Project**: `jsonish` — a serializer that turns strings, integers, and custom structs into a JSON-like string
 
 ---
@@ -51,6 +49,28 @@ built-in kind (`Integer`, `BitString`, `List`, `Map`, `Tuple`, `Atom`, `Function
 With `@fallback_to_any true` + `defimpl Protocol, for: Any`, unknown types get a default
 impl. Without it, dispatch raises `Protocol.UndefinedError`. Use `fallback_to_any`
 sparingly — it turns "missing impl" from a loud error into silent behavior.
+
+---
+
+## Why protocols and not a giant `case`
+
+A `case` dispatcher forces every new type to edit a central file. That turns type extensibility into a cross-team merge conflict — and worse, third-party libraries cannot add support for your protocol without forking you. Protocols invert the dependency: the type owner writes the impl, the protocol owner never learns about new types.
+
+Behaviours sound similar but answer a different question. Behaviours dispatch when the **caller** chooses the module; protocols dispatch when the **value** already carries its type. Serialization is value-driven (you hold a value, you want JSON), so protocols fit.
+
+---
+
+## Design decisions
+
+**Option A — central `case`/`cond` dispatcher in a single encoder module**
+- Pros: no metaprogramming; trivial to read the whole dispatch table at once; fastest for tiny fixed type sets.
+- Cons: every new type edits the same file; third parties cannot extend; the module grows without bound; consolidation benefits unavailable.
+
+**Option B — `defprotocol` + per-type `defimpl`** (chosen)
+- Pros: open extension (any module can `defimpl Jsonish, for: MyType`); consolidated dispatch at release time is near-constant cost; impls colocate with their type for discoverability.
+- Cons: discovery requires knowing to search for `defimpl`; `@fallback_to_any` is tempting and silently dangerous; missing impl error is runtime, not compile-time.
+
+Chose **B** because the type set is open — user structs must participate without us knowing about them — and the consolidation pass neutralizes the runtime-dispatch cost in releases.
 
 ---
 
@@ -179,6 +199,40 @@ end
 mix test
 ```
 
+### Why this works
+
+The protocol file declares the contract with zero logic — all the per-type code lives in `defimpl` blocks next to the type they serve. Elixir resolves dispatch at call time by inspecting the value's `__struct__` (for structs) or built-in kind tag (for integers, bitstrings, etc.), which is O(1) after protocol consolidation. No impl means a loud `Protocol.UndefinedError`, which is the correct failure mode: a missing case is a bug, not a default-to-`nil` moment.
+
+---
+
+## Benchmark
+
+```elixir
+# bench.exs
+defmodule Bench do
+  def run do
+    values = [
+      "hello",
+      42,
+      %Jsonish.User{id: 1, name: "Ana", email: "a@b.com"}
+    ]
+
+    {us, _} =
+      :timer.tc(fn ->
+        Enum.each(1..100_000, fn _ ->
+          Enum.each(values, &Jsonish.encode/1)
+        end)
+      end)
+
+    IO.puts("encode x300k values: #{us} µs (#{us / 300_000} µs/call)")
+  end
+end
+
+Bench.run()
+```
+
+Target: under 2 µs per `encode/1` call in `:prod` with consolidated protocols. Without consolidation the cost can be 5–10× higher — run `mix compile --force` in `:prod` to confirm the impact.
+
 ---
 
 ## Trade-offs
@@ -190,7 +244,7 @@ mix test
 | Protocols | value's type tag, across modules | open set — third-party types may add impls |
 | Behaviours | module passed explicitly | caller picks impl; no runtime dispatch on data |
 
-Protocols = **value-driven** polymorphism. Behaviours = **module-driven** (see exercise 62).
+Protocols = **value-driven** polymorphism. Behaviours = **module-driven**: the caller picks an implementation module explicitly, typically at configuration or startup time, instead of dispatching on the value itself.
 
 ---
 
@@ -220,6 +274,13 @@ impls. `defimpl` does not support inheritance.
 - **Single call site, fixed set of types**: a `case` is clearer. Protocols add indirection.
 - **You need to pick the impl explicitly**: use a behaviour. Protocols dispatch on the value — you cannot say "use impl X for this value of type Y".
 - **Performance-critical inner loops**: protocol dispatch has a (small) cost. For a 100M-iteration hot loop, specialize manually.
+
+---
+
+## Reflection
+
+1. Jason exposes `Jason.Encoder` as a protocol. If you build a payment system where every monetary value must serialize with exactly two decimals, would you add a `defimpl Jason.Encoder, for: Money` in your app — or wrap `Jason.encode/1` in a higher-level `Payment.encode/1` that normalizes first? What are the blast radii of each?
+2. The project chose to let unknown types raise `Protocol.UndefinedError`. Imagine a multi-tenant SaaS where a customer's plugin returns arbitrary data. Would you still refuse `@fallback_to_any`, or is there a middle ground (e.g. `Any` impl that returns `{:error, :unsupported}`)?
 
 ---
 

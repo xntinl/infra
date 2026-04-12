@@ -2,9 +2,6 @@
 
 **Project**: `validate_lib` — a tiny validation library offering both safe (tuple-based) and bang (raising) APIs
 
-**Difficulty**: ★★☆☆☆
-**Estimated time**: 1-2 hours
-
 ---
 
 ## Core concepts in this exercise
@@ -346,6 +343,38 @@ mix compile --warnings-as-errors
 
 All 8 tests must pass.
 
+### Why this works
+
+Both facades delegate to the same `Rules` module, so there is exactly one implementation of "what counts as a valid email". The `Safe` facade is a pure function of input → `{:ok, value} | {:error, reason}`, which composes with `with`. The `Bang` facade is a thin wrapper that calls `Safe` and raises `ValidationError` on `{:error, _}` — it never duplicates logic, never drifts from `Safe`. The bang version's exception carries `reason:` that equals the tuple's reason, so tests and observability can assert on the same key in both worlds.
+
+---
+
+## Design decisions
+
+**Option A — one facade with a `raise?: true` option**
+- Pros: single entry point; fewer functions to document.
+- Cons: the return type depends on a runtime flag; dialyzer cannot narrow it; the bang convention (`!`) is a machine-checkable signal, and you throw it away.
+
+**Option B — two facades (`Safe` and `Bang`) over one shared `Rules`** (chosen)
+- Pros: each facade has a single return type; callers opt in at call site; dialyzer and tooling understand the contract; follows the stdlib pattern (`Map.fetch` vs `Map.fetch!`).
+- Cons: two modules; someone must keep them in sync (trivial here because `Bang` is 3 lines per function).
+
+→ Chose **B** because it is the idiom the whole stdlib is built on. Your callers already know how `!` behaves; do not surprise them.
+
+---
+
+## Why two APIs and not just the safe one
+
+**Option A — only the safe API; callers who want to crash can pattern-match and raise themselves**
+- Pros: minimum surface; no duplication.
+- Cons: every boot script and test fixture now carries a `case … do {:ok, v} -> v; {:error, r} -> raise "#{inspect r}" end` five-line wrapper. Stack traces point at the wrapper, not the caller.
+
+**Option B — expose both; bang delegates to safe** (chosen)
+- Pros: ergonomic "assert this succeeds" at boot/test sites; stack traces point at the real call; bang is trivial to write because it reuses safe.
+- Cons: two functions per rule; API surface doubles.
+
+→ Chose **B** because the two call sites (UI validation vs. boot-time assertion) have genuinely different error ergonomics, and emulating bang at every caller is strictly worse than writing it once.
+
 ---
 
 ## Trade-off analysis
@@ -410,6 +439,43 @@ Copy-pasting rules is how the two APIs drift.
   Forcing callers through the tuple path keeps the business logic visible.
 - The call is inside a pipeline where the next step depends on the error type.
   Tuples make that routing trivial; exceptions obscure it.
+
+---
+
+## Benchmark
+
+Compare safe vs. bang on the happy path, then compare the cost of the failing bang (raise + rescue) against the failing safe:
+
+```elixir
+good = %{email: "a@b.co", password: "longenough"}
+bad  = %{email: "x", password: "short"}
+
+{us_safe_ok, _} = :timer.tc(fn -> for _ <- 1..100_000, do: ValidateLib.Safe.validate_signup(good) end)
+{us_bang_ok, _} = :timer.tc(fn -> for _ <- 1..100_000, do: ValidateLib.Bang.validate_signup!(good) end)
+
+{us_safe_err, _} = :timer.tc(fn -> for _ <- 1..100_000, do: ValidateLib.Safe.validate_signup(bad) end)
+
+{us_bang_err, _} = :timer.tc(fn ->
+  for _ <- 1..100_000 do
+    try do
+      ValidateLib.Bang.validate_signup!(bad)
+    rescue
+      _ -> :ok
+    end
+  end
+end)
+
+IO.inspect({us_safe_ok, us_bang_ok, us_safe_err, us_bang_err})
+```
+
+Target esperado: safe and bang indistinguishable on the happy path (<0.5 µs); on the failing path, bang is 10–20× more expensive than safe because the raise allocates an exception struct and unwinds the stack. That is the quantitative reason bang is wrong in a hot validation loop.
+
+---
+
+## Reflection
+
+- A teammate proposes adding a `validate_signup/2` that takes `mode: :safe | :bang` instead of two functions. What do you lose in static analysis (dialyzer) and IDE affordances? How would you explain the loss without invoking "because the stdlib does it that way"?
+- If the `Rules` module grows to 40 checks, the tuple API accumulates `{:field, :reason}` atoms that must be translated for UI. Do you invent a `Reason` struct, return `{:error, [%{field:, code:, message:}]}`, or keep the flat atoms and translate at the edge? What's the blast radius if you need to add localisation later?
 
 ---
 

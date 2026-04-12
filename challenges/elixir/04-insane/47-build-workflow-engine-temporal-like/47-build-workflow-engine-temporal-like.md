@@ -10,6 +10,22 @@ You tried choreography (events on a queue): too hard to reason about failure com
 
 You will build `Workflow`: a Temporal.io-equivalent engine where workflow functions are replay-safe Elixir code. Execution history is persisted after every step. On worker restart, the workflow replays its history deterministically and resumes from the last persisted event.
 
+## Why deterministic replay over checkpoint-and-restore and not checkpointing process state every N steps
+
+replay needs only the event history — which already exists for audit — and makes every historical run reproducible. Checkpoints require BEAM-level serialization of arbitrary process state, which doesn't round-trip cleanly.
+
+## Design decisions
+
+**Option A — process-per-workflow with state in memory**
+- Pros: simple, fast hot path
+- Cons: lose state on crash, no long-running workflows
+
+**Option B — event-sourced workflow with deterministic replay on recovery** (chosen)
+- Pros: crash-safe, resumable across deploys, full audit trail
+- Cons: workflow code must be deterministic — side effects must be activities
+
+→ Chose **B** because a workflow engine's entire value proposition is surviving crashes and deploys; in-memory state fails that test.
+
 ## Why event sourcing as the execution model
 
 A workflow process holds its execution state as a sequence of events: `WorkflowStarted`, `ActivityScheduled`, `ActivityCompleted`, `TimerStarted`, `TimerFired`, `SignalReceived`. When a worker crashes and restarts, it reads the event history and replays the workflow function. Since the function is deterministic, replay produces the same decisions — but activities are not re-executed (completed events are already in history).
@@ -574,6 +590,10 @@ defmodule WorkflowEngine.TimerService do
 end
 ```
 
+### Why this works
+
+The design isolates correctness-critical invariants from latency-critical paths and from evolution-critical contracts. Modules expose narrow interfaces and fail fast on contract violations, so bugs surface close to their source. Tests target invariants rather than implementation details, so refactors don't produce false alarms. The trade-offs are explicit in the Design decisions section, which makes the "why" auditable instead of folklore.
+
 ## Given tests
 
 ```elixir
@@ -587,6 +607,9 @@ defmodule WorkflowEngine.HistoryTest do
     History.init()
     :ok
   end
+
+
+  describe "History" do
 
   test "append assigns sequential sequence numbers" do
     e1 = History.append("wf-1", Event.new(:workflow_started, "wf-1"))
@@ -717,8 +740,25 @@ defmodule WorkflowEngine.DurabilityTest do
     assert completed != nil
     assert completed.payload.result == "step2_done:step1_done"
   end
+
+
+  end
 end
 ```
+
+## Benchmark
+
+```elixir
+# Minimal timing harness — replace with Benchee for production measurement.
+{time_us, _result} = :timer.tc(fn ->
+  # exercise the hot path N times
+  for _ <- 1..10_000, do: :ok
+end)
+
+IO.puts("average: #{time_us / 10_000} µs per op")
+```
+
+Target: <10ms to resume a workflow from a 1k-event history.
 
 ## Trade-off analysis
 
@@ -741,6 +781,10 @@ end
 **Not validating `get_version` ranges on existing workflows.** If an in-flight workflow recorded version 1 and you deploy code expecting min version 2, replay reads version 1 which is now out of range. Raise a `NonDeterministicError`.
 
 **Concurrent replay from two workers.** If both replay and write conflicting events, use optimistic locking on the event sequence number.
+
+## Reflection
+
+A workflow runs for 6 months. During that time you deploy 40 code changes. How do you guarantee deterministic replay when the workflow code itself has changed? Sketch your versioning contract.
 
 ## Resources
 

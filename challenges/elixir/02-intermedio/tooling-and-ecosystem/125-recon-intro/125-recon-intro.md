@@ -4,9 +4,6 @@
 process so you can practice the four or five `:recon` calls that save
 outages at 3am.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
-
 ---
 
 ## Project context
@@ -95,6 +92,38 @@ carriers.
 Traces up to 10 calls to `Enum.map/*` then AUTO-STOPS. Unlike raw `:dbg`,
 you cannot accidentally burn your node — `:recon_trace` rate-limits and
 time-limits every trace.
+
+---
+
+## Why recon and not raw `:dbg` + `Process.info`
+
+`Process.info/1` on a pid holding a large binary returns the binary
+inline, which IEx then tries to render — a classic "debug tool brought
+down the node I was debugging" story. `:dbg` has no rate limiting: a
+wildcard match on a hot function will flood the node with messages
+faster than the tracer can drain them. `:recon` wraps both with
+truncation and rate limits that make every function safe to call on a
+suffering production node.
+
+---
+
+## Design decisions
+
+**Option A — Pure OTP tools (`:erlang.process_info`, `:dbg`, `:erlang.memory`)**
+- Pros: Zero dependencies; always available; the lowest-level truth.
+- Cons: Each tool is dangerous (binary bombs, trace floods, manual
+  sorting); you reimplement the safe wrappers yourself on every outage.
+
+**Option B — `:recon` as a standard dep** (chosen)
+- Pros: Battle-tested wrappers; consistent output shape; rate-limited
+  tracing; allocator diagnostics (`:recon_alloc`) that OTP doesn't
+  package; the idioms match Fred Hébert's *Erlang in Anger*.
+- Cons: One extra dep; another vocabulary to learn (`proc_count` vs
+  `proc_window`, etc.).
+
+→ Chose **B** because the cost of a misused raw `:dbg` on a production
+  node vastly exceeds the 300KB of `:recon`. Every shop running BEAM in
+  production ships `:recon` as standard equipment.
 
 ---
 
@@ -290,6 +319,27 @@ iex> String.downcase("HELLO")
 # the trace prints once, auto-stops after 5.
 ```
 
+### Why this works
+
+`:recon.proc_count/2` sorts every live process by a BEAM-native metric
+(memory, reductions, mailbox), then returns the top N with identifying
+attributes so you can resolve a pid to "the process named X running
+function Y". `proc_window/3` does the same but computes deltas over a
+time window — distinguishing "process that's old and big" from "process
+that's busy right now". Combined with `:recon.info/1` (truncated,
+binary-safe process detail) you get a diagnostic loop that works on a
+struggling production node without tipping it over.
+
+---
+
+## Benchmark
+
+`:timer.tc(fn -> :recon.proc_count(:memory, 5) end)` on a node with 10k
+processes typically returns in under 10 ms. The cost scales linearly
+with the live process count. Target: well under 50 ms on healthy nodes
+(tens of thousands of processes). If it takes longer, the node is
+already in trouble and `:recon` is doing its job — surfacing it.
+
 ---
 
 ## Trade-offs and production gotchas
@@ -326,6 +376,19 @@ analyzer in Erlang docs or `crashdump_viewer`).
 - For CI — there's nothing interesting running.
 - If you have `:observer` and a GUI, prefer it; it's less error-prone
   because it forces you to click rather than remember call shapes.
+
+---
+
+## Reflection
+
+- Your monitoring alerts at 3am: `:erlang.memory(:total)` is climbing
+  at 50 MB/min. `ReconIntro.top_memory(20)` shows nothing above 20 MB.
+  What's your next three commands, and what would each of them rule in
+  or out?
+- You decide to keep a `:recon_trace.calls/2` running on a hot path in
+  production to collect data for a bug report. What failure modes does
+  that decision create, and what guardrails would you add (time limit,
+  rate limit, call-site scope) before leaving it running unattended?
 
 ---
 

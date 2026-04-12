@@ -2,9 +2,6 @@
 
 **Project**: `dataloader_ecto` — deep dive into `Dataloader.Ecto` for a marketplace catalog (products, variants, sellers, reviews) with complex filter-aware batching.
 
-**Difficulty**: ★★★★☆
-**Estimated time**: 4–6 hours
-
 ---
 
 ## Project context
@@ -45,6 +42,16 @@ dataloader_ecto/
 ```
 
 ---
+
+## Why this approach and not alternatives
+
+Alternatives considered and discarded:
+
+- **Hand-rolled equivalent**: reinvents primitives the BEAM/ecosystem already provides; high risk of subtle bugs around concurrency, timeouts, or failure propagation.
+- **External service (e.g. Redis, sidecar)**: adds a network hop and an extra failure domain for a problem the VM can solve in-process with lower latency.
+- **Heavier framework abstraction**: couples the module to a framework lifecycle and makes local reasoning/testing harder.
+
+The chosen approach stays inside the BEAM, uses idiomatic OTP primitives, and keeps the contract small.
 
 ## Core concepts
 
@@ -97,6 +104,18 @@ The first is easy and covers 80% of cases. The second lets you batch non-Ecto
 relationships or apply custom logic.
 
 ---
+
+## Design decisions
+
+**Option A — naive/simple approach**
+- Pros: minimal code, easy to reason about.
+- Cons: breaks under load, lacks observability, hard to evolve.
+
+**Option B — the approach used here** (chosen)
+- Pros: production-grade, handles edge cases, testable boundaries.
+- Cons: more moving parts, requires understanding of the BEAM primitives involved.
+
+→ Chose **B** because correctness under concurrency and failure modes outweighs the extra surface area.
 
 ## Implementation
 
@@ -386,6 +405,11 @@ end
 
 ---
 
+
+### Why this works
+
+The design leans on BEAM guarantees (process isolation, mailbox ordering, supervisor restarts) and pushes invariants to the boundaries of each module. State transitions are explicit, failure modes are declared rather than implicit, and each step is independently testable. That combination keeps the implementation correct under concurrent load and cheap to change later.
+
 ## Trade-offs and production gotchas
 
 **1. Global `query/2` surprises.** If you forget that every association load goes
@@ -440,6 +464,11 @@ The `Repo.preload` loses not on query count but on payload — loading 100 revie
 per product for display-3 is 33× wasted bytes.
 
 ---
+
+## Reflection
+
+- If the expected load grew by 100×, which assumption in this design would break first — the data structure, the process model, or the failure handling? Justify.
+- What would you measure in production to decide whether this implementation is still the right one six months from now?
 
 ## Resources
 

@@ -2,10 +2,6 @@
 
 **Project**: `backpressure_queue` — a GenServer that measures its own mailbox and rejects or defers work when overloaded.
 
-**Difficulty**: ★★★★☆
-
-**Estimated time**: 4–5 hours
-
 ---
 
 ## Project context
@@ -89,7 +85,32 @@ If you toggle "overloaded" at exactly the same threshold both ways, you get flap
 
 ---
 
+## Why self-measuring and not GenStage
+
+`GenStage`/`Broadway` solve back-pressure by inverting control: the consumer *pulls* demand, so the producer can never outrun it. That is the right answer when you own both ends. In this system the producer is a third-party Kafka consumer you cannot change — it pushes. Self-measuring via `:message_queue_len` is the only lever available: the consumer inspects its own load and signals back out-of-band (via the `call` reply). It is strictly weaker than demand-driven flow control, but it is deployable without negotiating a protocol change with the producer.
+
+---
+
+## Design decisions
+
+**Option A — reject (fail-fast, producer retries)**
+- Pros: zero state, O(1) decision, bounded memory, trivial to reason about.
+- Cons: the producer must implement retry; data is lost if the producer gives up; bursts turn into retry storms if the backoff is wrong.
+
+**Option B — defer (spill to disk, drain later)** (chosen for durable paths)
+- Pros: no data loss; producer sees success; the system survives bursts larger than memory.
+- Cons: disk I/O cost; needs a separate drainer; can reorder events; the overflow file is a new failure mode (ENOSPC, permissions).
+
+→ The implementation exposes **both** as per-call policies. Producers that can retry pick `:reject`; producers with no retry budget pick `:defer`. Mixing the two *for the same producer* is an anti-pattern because it double-enqueues under policy churn.
+
+---
+
 ## Implementation
+
+### Dependencies (`mix.exs`)
+
+Already included in Step 1: `{:benchee, "~> 1.3", only: :dev}`.
+
 
 ### Step 1: `mix.exs`
 
@@ -297,6 +318,10 @@ defmodule BackpressureQueue.NormalizerTest do
 end
 ```
 
+### Why this works
+
+The gate runs *inside* the GenServer's `handle_call`, which is the only point where `:message_queue_len` reflects a meaningful value for decision-making — at any other point a cast could arrive between measurement and decision. Hysteresis (`@high_water` = 500, `@low_water` = 300) stops the flag from flapping under steady-state load near the threshold. `call` (not `cast`) is essential: only `call` gives the producer a synchronous reply that carries the overload verdict back.
+
 ---
 
 ## Trade-offs and production gotchas
@@ -330,6 +355,15 @@ end
 | :defer   | 41,100   | 0        | 58,900   | 55 µs       | 1.8 ms      | 503          |
 
 Memory at peak without back-pressure: 1.1 GB. With back-pressure: 18 MB. The rejected events cost the producer a retry; the deferred events cost 3 MB of disk.
+
+Target: peak mailbox ≤ 2× `@high_water` under any burst; overload-decision latency ≤ 5 µs; steady-state throughput ≥ 40k events/s on one core.
+
+---
+
+## Reflection
+
+1. A producer sees 60% rejection rate during a burst and retries with exponential backoff. The aggregate retry traffic keeps the consumer at exactly `@high_water` for ten minutes. Is the system healthy? If not, what metric would reveal the problem, and how would you fix it without changing the producer?
+2. The `:defer` policy writes to disk sequentially. At 58k deferred events over 2 s (≈ 29k writes/s), the overflow file becomes a bottleneck on slow disks. Would you switch to a ring-buffered `:ets`, a per-shard file, or a separate writer process? Under what fleet size does each choice win?
 
 ---
 

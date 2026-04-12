@@ -10,6 +10,22 @@ A naive push model overwhelms the slowest consumer. A polling model adds latency
 
 You will build `RStreams`: a complete Reactive Streams implementation in Elixir. No GenStage. No Flow. The protocol: a `Subscriber` calls `Subscription.request(n)` to pull elements; a `Publisher` delivers at most `n` elements; operators are `Processor`s that implement both interfaces and propagate backpressure through the chain.
 
+## Why demand-based pull and not time-based throttling
+
+pull demand is self-regulating — consumers set the pace exactly at their processing speed. Time throttling is open-loop; any rate you pick is wrong for some consumer somewhere.
+
+## Design decisions
+
+**Option A — push-based with unbounded buffers**
+- Pros: simple to implement, no backpressure logic
+- Cons: fast producer crashes slow consumer with OOM
+
+**Option B — pull-based demand signaling (Reactive Streams spec)** (chosen)
+- Pros: producer never outpaces consumer, OOM-safe by construction
+- Cons: slightly more protocol overhead per batch
+
+→ Chose **B** because reactive streams without backpressure is just streams — the whole spec exists to make backpressure explicit.
+
 ## Why backpressure must be an explicit protocol
 
 TCP flow control is implicit backpressure at the network level. Application-level pipelines do not automatically inherit this. If a Publisher calls on_next in a loop without regard for subscriber capacity, the subscriber's process mailbox fills up. At 100k msg/s, a 10k/s subscriber accumulates 90k messages per second in its mailbox.
@@ -689,6 +705,9 @@ defmodule RStreams.TCK.PublisherTest do
   alias RStreams.Sources.FromList
   alias RStreams.Subscription
 
+
+  describe "Publisher" do
+
   test "RS 1.1: publisher delivers at most requested elements" do
     {:ok, pub} = FromList.start_link([1, 2, 3, 4, 5])
     parent = self()
@@ -863,8 +882,15 @@ defmodule RStreams.TCK.OperatorTest do
       500 -> send(parent, {:results, Enum.reverse(acc)})
     end
   end
+
+
+  end
 end
 ```
+
+### Why this works
+
+The design isolates correctness-critical invariants from latency-critical paths and from evolution-critical contracts. Modules expose narrow interfaces and fail fast on contract violations, so bugs surface close to their source. Tests target invariants rather than implementation details, so refactors don't produce false alarms. The trade-offs are explicit in the Design decisions section, which makes the "why" auditable instead of folklore.
 
 ## Benchmark
 
@@ -947,6 +973,10 @@ RStreams.Bench.Pipeline.run()
 **flat_map not requesting from outer after inner completes.** When inner completes, if downstream still has demand, the flat_map must immediately request from outer. Otherwise the pipeline stalls.
 
 **Ignoring Long.MAX_VALUE demand.** The RS spec allows requesting unlimited demand. In Elixir, integers are arbitrary precision, so cap at a reasonable maximum to prevent unbounded accumulation.
+
+## Reflection
+
+Your pipeline has producer → transform → sink. The sink stalls for 10 seconds. Where does demand propagate, how much buffers between stages, and when does the producer actually pause?
 
 ## Resources
 

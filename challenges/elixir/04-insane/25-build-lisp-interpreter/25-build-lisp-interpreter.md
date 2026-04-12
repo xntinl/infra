@@ -55,6 +55,18 @@ A Lisp interpreter appears simple: an evaluator is just `eval(expr, env)` applie
 
 ---
 
+## Design decisions
+
+**Option A — Compile to bytecode then interpret the bytecode**
+- Pros: faster steady-state; easier to add JIT later.
+- Cons: two layers to build, test, and debug; overkill for a didactic Lisp.
+
+**Option B — Tree-walking interpreter** (chosen)
+- Pros: the code maps 1:1 to the evaluation rules; closures, macros, and tail-call optimization are easy to express directly.
+- Cons: slower than bytecode; not a production strategy.
+
+→ Chose **B** because the point of this exercise is to make evaluation semantics visible — a tree walker is the most honest implementation.
+
 ## Implementation milestones
 
 ### Step 1: Create the project
@@ -598,6 +610,21 @@ Benchee.run(
 )
 ```
 
+### Why this works
+
+Each AST node has an `eval/2` clause that takes an environment and returns `{value, new_env}`. Closures capture the environment by reference, and `call/cc`-style continuations fall out of representing tail calls as trampolines in the interpreter loop.
+
+---
+
+## Benchmark
+
+```elixir
+# bench/lisp_bench.exs
+Benchee.run(%{"fib_20" => fn -> Lisp.eval("(fib 20)") end}, time: 10)
+```
+
+Target: `(fib 20)` in < 1 ms on a tree-walking interpreter; simple arithmetic in < 5 µs.
+
 ---
 
 ## Trade-off analysis
@@ -626,6 +653,11 @@ Use persistent (copy-on-write) maps for bindings so each frame is immutable once
 
 **4. `apply` not handling variadic argument lists**
 `(apply + 1 2 '(3 4))` should call `+` with `[1, 2, 3, 4]`.
+
+## Reflection
+
+- If you added a bytecode compiler, which Lisp features would force non-trivial encoding decisions (e.g., `call/cc`, dynamic-wind)? Pick one and sketch.
+- How would you add tail-call optimization without trampolines? Compare approaches.
 
 ---
 

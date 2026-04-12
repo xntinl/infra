@@ -1,7 +1,6 @@
 # Keyword Lists and Building a Small DSL
 
-**Project**: `mini_query` — standalone Mix project, 1–2 hours  
-**Difficulty**: ★★☆☆☆
+**Project**: `mini_query` — a validated keyword-list DSL for querying in-memory datasets
 
 ---
 
@@ -70,6 +69,20 @@ Keyword lists for **options**, maps for **data**. That's the community rule.
 `Keyword.validate!/2` (Elixir 1.13+) catches typos at call time and documents the allowed
 options in one place. Without it, `selcet: [:name]` silently uses the default for `:select`
 and produces wrong output — a debugging nightmare for users of your DSL.
+
+---
+
+## Design decisions
+
+**Option A — positional arguments `run(data, select, where, order_by, limit)`**
+- Pros: no DSL; arity is explicit; no keyword parsing cost.
+- Cons: "boolean trap" at call sites (`run(u, [:name], [], nil, 5)` — what does `nil` mean?); adding an option is a breaking change for every caller; doesn't read like English.
+
+**Option B — keyword list `run(data, opts)` with `Keyword.validate!/2`** (chosen)
+- Pros: reads like a natural-language query; options are self-documenting at the call site; adding a new option is backward-compatible; `Keyword.validate!/2` catches typos (`selcet:`) at call time; preserves order so stage order is deterministic.
+- Cons: slight runtime cost for validation; requires Elixir 1.13+ for `validate!/2`; callers passing bad shapes get a raise rather than a compile error (typespec + Dialyzer narrows that gap).
+
+Chose **B** because the problem IS a DSL and the whole standard library converges on this shape — using anything else would fight the community idiom. `Keyword.validate!/2` converts silent-bug-risk into loud-raise.
 
 ---
 
@@ -217,6 +230,42 @@ mix test
 
 All 7 tests should pass.
 
+### Why this works
+
+Keyword lists are plain lists of `{atom, value}` tuples — they have duplicate keys, preserved order, and compact literal sugar. `Keyword.validate!/2` walks the list once, checks every key is in the allowed set, applies defaults, and raises with a clear message on the first unknown key. Because the list is ordered, the DSL can defer stage composition (filter → sort → limit) to the order the caller wrote, which matches the English reading. `Keyword.get/3` with defaults gives you the final shape without a defensive `Enum.into/2` step.
+
+---
+
+## Benchmark
+
+```elixir
+# bench.exs
+defmodule Bench do
+  def run do
+    users =
+      for i <- 1..10_000 do
+        %{name: "User#{i}", age: rem(i, 80) + 18, role: Enum.random([:admin, :user])}
+      end
+
+    {us, _} =
+      :timer.tc(fn ->
+        MiniQuery.run(users,
+          select: [:name, :age],
+          where: [role: :admin],
+          order_by: :age,
+          limit: 100
+        )
+      end)
+
+    IO.puts("MiniQuery.run on 10k rows: #{us} µs")
+  end
+end
+
+Bench.run()
+```
+
+Target: under 10 ms for 10k rows with filter + sort + limit. `Keyword.validate!/2` adds microseconds — insignificant compared to the filter/sort pass over the data.
+
 ---
 
 ## Trade-offs
@@ -258,6 +307,13 @@ your code for "not respecting the option". Always validate opts in a public DSL.
 - For data that will live in a long-lived struct — use a `%__MODULE__{}` with named fields.
 - When you need O(1) lookup by key — keyword is O(n). Convert to a map first.
 - When the collection is dynamic-size user data — that's `Map` or `MapSet` territory.
+
+---
+
+## Reflection
+
+1. `Keyword.validate!/2` raises on unknown keys. That's the right choice for a DSL you control, but what if analysts pass queries through a web UI and a typo should become a friendly error message? Would you wrap `validate!/2` in a `validate/2` variant that returns `{:error, :unknown_option, key}`, or keep the raise and let the Phoenix layer translate? Where does the translation belong?
+2. Your DSL now needs joins between two datasets. Do you extend the keyword options with `join: [users: :user_id]`, introduce a dedicated `join/3` function in the pipeline, or bite the bullet and embed a real query language (Ecto.Query)? At what complexity does the keyword DSL stop paying off?
 
 ---
 

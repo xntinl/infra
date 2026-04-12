@@ -57,6 +57,18 @@ You need to process a stream of events — clicks, transactions, sensor readings
 
 ---
 
+## Design decisions
+
+**Option A — At-most-once processing (no checkpointing)**
+- Pros: simplest possible pipeline; no state to manage.
+- Cons: any failure drops in-flight data; unusable for anything that cares about correctness.
+
+**Option B — Chandy–Lamport distributed checkpoints with exactly-once semantics** (chosen)
+- Pros: barriers flow with the data; each operator snapshots on barrier; on failure, replay from last checkpoint produces exactly-once output.
+- Cons: state size and barrier alignment can dominate; requires idempotent sinks.
+
+→ Chose **B** because Flink's success is built on Chandy–Lamport; any serious stream processor needs this property and there's no simpler way to get it.
+
 ## Implementation milestones
 
 ### Step 1: Create the project
@@ -573,6 +585,21 @@ IO.puts("Throughput: #{Float.round(throughput)} events/second")
 
 Target: 1M events/second through a 5-operator pipeline. P99 end-to-end latency under 200ms.
 
+### Why this works
+
+Barriers are injected at sources and flow through operators; when an operator sees barriers on all inputs, it snapshots and forwards. A failure restarts operators from the most recent complete checkpoint and replays source offsets, reproducing the exact same output.
+
+---
+
+## Benchmark
+
+```elixir
+# bench/stream_bench.exs
+Benchee.run(%{"pipeline_100k" => fn -> Stream.run(pipeline, 100_000) end}, time: 10)
+```
+
+Target: 100,000 events/second through a 3-stage pipeline with 1-second checkpoints; recovery < 500 ms.
+
 ---
 
 ## Trade-off analysis
@@ -601,6 +628,11 @@ With millions of unique keys, creating one `Process.send_after` per key creates 
 
 **4. Credit exhaustion causing deadlock in cyclic DAGs**
 If the DAG has cycles, credit-based backpressure can deadlock. Validate that the job DAG is acyclic before starting.
+
+## Reflection
+
+- If your sink isn't idempotent, what guarantee can you actually give? Map it to two-phase commit semantics.
+- At 10x the state size, would you switch from aligned to unaligned checkpoints? What does that cost you in replay correctness?
 
 ---
 

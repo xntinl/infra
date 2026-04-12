@@ -54,6 +54,18 @@ SWIM (Scalable Weakly-consistent Infection-style Membership) solves this by sepa
 
 ---
 
+## Design decisions
+
+**Option A — Full broadcast heartbeats (all-to-all)**
+- Pros: simple; deterministic detection latency.
+- Cons: O(N²) messages per period; saturates network well before 1000 nodes.
+
+**Option B — SWIM-style gossip with indirect probing** (chosen)
+- Pros: O(N) bandwidth per node per period; dissemination time is O(log N); false-positive rate controllable via indirect probes.
+- Cons: convergence is probabilistic; tuning fanout and probe timeout is subtle.
+
+→ Chose **B** because SWIM is the only protocol in this family that scales past a few dozen nodes while preserving a tunable bound on detection accuracy.
+
 ## Implementation milestones
 
 ### Step 1: Create the project
@@ -615,6 +627,21 @@ Benchee.run(
 )
 ```
 
+### Why this works
+
+Each node probes one peer per period; if the direct probe fails, it asks K peers for indirect probes before marking the peer suspect. Suspicion is itself gossiped, so every live node converges on the membership view in expected O(log N) rounds.
+
+---
+
+## Benchmark
+
+```elixir
+# bench/gossip_bench.exs
+:timer.tc(fn -> Gossip.seed_cluster(100) |> Gossip.wait_convergence() end)
+```
+
+Target: Convergence under 2 seconds for a 100-node localhost cluster after a single join; O(log N) round count.
+
 ---
 
 ## Trade-off analysis
@@ -648,6 +675,11 @@ Gossip events accumulate indefinitely if not pruned. After `ceil(log(N))` dissem
 
 **5. Using wall-clock time for suspicion timeouts**
 Use `System.monotonic_time/1` for all timeout calculations. NTP adjustments can cause wall-clock time to jump backward, extending or collapsing suspicion windows unexpectedly.
+
+## Reflection
+
+- If your deployment had asymmetric network partitions (A→B works, B→A drops), would the indirect-probe mechanism still detect failures correctly? Walk through an example.
+- Suppose you add 10 new nodes per minute at steady state. At what churn rate does SWIM's suspicion window start producing false positives, and what parameters would you tune first?
 
 ---
 

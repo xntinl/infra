@@ -10,6 +10,22 @@ The ask is clear: load a trained model directly in the Elixir process and run in
 
 You will build `InferenceEngine`: a pure-Elixir ML inference runtime that loads a subset of ONNX, runs forward passes, and supports int8 quantization for faster throughput.
 
+## Why NIFs via Nx and EXLA for tensor ops and not pure-Elixir tensor implementations
+
+Elixir on the BEAM is not designed for tight numeric loops; it's 100-1000x slower than a BLAS kernel. NIFs let us call the actually-fast code while keeping the orchestration in Elixir where it belongs.
+
+## Design decisions
+
+**Option A — interpreted eager execution (each op dispatched individually)**
+- Pros: simple, matches PyTorch defaults
+- Cons: no kernel fusion, dispatch overhead dominates for small ops
+
+**Option B — graph-level tracing + kernel fusion before execution** (chosen)
+- Pros: fused ops amortize dispatch cost, unlocks operator-level optimizations
+- Cons: first call pays a trace-and-compile tax
+
+→ Chose **B** because for production inference the same model is called millions of times; a one-time trace cost is rounding error.
+
 ## Project Structure
 
 ```
@@ -990,6 +1006,10 @@ defmodule InferenceEngine.Engine do
 end
 ```
 
+### Why this works
+
+The design isolates correctness-critical invariants from latency-critical paths and from evolution-critical contracts. Modules expose narrow interfaces and fail fast on contract violations, so bugs surface close to their source. Tests target invariants rather than implementation details, so refactors don't produce false alarms. The trade-offs are explicit in the Design decisions section, which makes the "why" auditable instead of folklore.
+
 ## Given tests
 
 ```elixir
@@ -997,6 +1017,9 @@ end
 defmodule InferenceEngine.TensorTest do
   use ExUnit.Case, async: true
   alias InferenceEngine.Tensor
+
+
+  describe "Tensor" do
 
   test "from_list encodes and at/2 decodes correctly" do
     t = Tensor.from_list([1.0, 2.0, 3.0, 4.0], [2, 2])
@@ -1174,6 +1197,9 @@ defmodule InferenceEngine.EngineTest do
     overhead = (batch_time - direct_time) / direct_time
     assert overhead < 0.20, "Task overhead #{Float.round(overhead * 100, 1)}% exceeds 20%"
   end
+
+
+  end
 end
 ```
 
@@ -1262,6 +1288,10 @@ IO.puts("Pass:   #{if median < 100, do: "YES", else: "NO — consider NIF for ma
 **Quantizing activations with the wrong range.** Symmetric quantization assumes the distribution is centered at zero. For activations after ReLU (range [0, ∞)), asymmetric quantization (zero-point + scale) gives half the error for the same bit width. Using symmetric int8 for ReLU outputs wastes half the representable range.
 
 **Using `Task.async_stream` with `ordered: true` when you don't need order.** `ordered: true` buffers completed tasks until all preceding tasks in the stream finish. For large batches with uneven compute times, this serializes collection. Use `ordered: false` and sort by a tag if order matters.
+
+## Reflection
+
+You can run a 7B-parameter model on one GPU. A single request takes 500ms. At 100 req/s, what's your queuing strategy — batch, dedicated-replica-per-request, or speculative decoding? Pick one and defend.
 
 ## Resources
 

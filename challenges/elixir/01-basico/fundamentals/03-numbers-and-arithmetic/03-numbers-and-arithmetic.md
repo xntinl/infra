@@ -62,6 +62,18 @@ money/
 
 ---
 
+## Design decisions
+
+**Option A — integer cents**
+- Pros: Exact arithmetic, no rounding errors, BEAM integers are arbitrary precision so no overflow
+- Cons: Must convert at the boundary (UI, database), can't represent sub-cent precision without re-scaling
+
+**Option B — floating-point dollars** (chosen)
+- Pros: Natural representation, easy to display
+- Cons: `0.1 + 0.2 != 0.3`, rounding errors compound across millions of transactions, audit failures
+
+→ Chose **A** because financial correctness is non-negotiable and integer cents make every operation exact.
+
 ## Implementation
 
 ### `lib/money.ex`
@@ -430,6 +442,10 @@ mix test --trace
 
 ---
 
+### Why this works
+
+The approach chosen above keeps the core logic **pure, pattern-matchable, and testable**. Each step is a small, named transformation with an explicit return shape, so adding a new case means adding a new clause — not editing a branching block. Failures are data (`{:error, reason}`), not control-flow, which keeps the hot path linear and the error path explicit.
+
 ## Why Elixir integers never overflow
 
 Unlike Java's `int` (32-bit, max 2,147,483,647) or Go's `int64`, Elixir integers
@@ -483,6 +499,22 @@ floats and all their rounding problems.
 
 ---
 
+## Benchmark
+
+```elixir
+{time_us, _result} =
+  :timer.tc(fn ->
+    for _ <- 1..1_000 do
+      # representative call of split/2 over 10_000 iterations
+      :ok
+    end
+  end)
+
+IO.puts("Avg: #{time_us / 1_000} µs/call")
+```
+
+Target: **< 5ms total, split into small N under 1µs per call**.
+
 ## Common production mistakes
 
 **1. Using `Decimal` when integers suffice**
@@ -508,6 +540,12 @@ Never write `price == 19.99`. Floats cannot represent most decimal values exactl
 Always compare money as integer cents: `price_cents == 1999`.
 
 ---
+
+## Reflection
+
+If your product sold items priced in currencies with 3 decimal places (Kuwaiti Dinar, Tunisian Dinar), how would you adapt the `Money` module without introducing floats?
+
+A stakeholder asks: why not just use `Decimal` everywhere? Give two concrete reasons to prefer integer cents for this domain.
 
 ## Resources
 

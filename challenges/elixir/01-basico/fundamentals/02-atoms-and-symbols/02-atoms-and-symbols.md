@@ -52,6 +52,18 @@ order_fsm/
 
 ---
 
+## Design decisions
+
+**Option A — atom-based state machine with `String.to_existing_atom/1`**
+- Pros: Compile-time safety via `@valid_states`, O(1) comparisons, idiomatic Elixir
+- Cons: Must be careful with external input (atom table is never GC'd)
+
+**Option B — string-based state machine with explicit pattern matching on strings** (chosen)
+- Pros: No atom table pressure, safe for untrusted input by default
+- Cons: Slower comparisons, loses pattern-matching ergonomics, each state transition is a string compare
+
+→ Chose **A** because the order lifecycle has a fixed, known set of states and we validate external input through `parse/1` before any atom creation.
+
 ## Implementation
 
 ### `lib/order_fsm/state.ex`
@@ -426,6 +438,10 @@ mix test --trace
 
 ---
 
+### Why this works
+
+The approach chosen above keeps the core logic **pure, pattern-matchable, and testable**. Each step is a small, named transformation with an explicit return shape, so adding a new case means adding a new clause — not editing a branching block. Failures are data (`{:error, reason}`), not control-flow, which keeps the hot path linear and the error path explicit.
+
 ## The atom table security problem
 
 The BEAM atom table has a default limit of 1,048,576 atoms. Atoms are never garbage
@@ -457,6 +473,22 @@ This approach creates no new atoms and compiles to efficient pattern matching.
 
 ---
 
+## Benchmark
+
+```elixir
+{time_us, _result} =
+  :timer.tc(fn ->
+    for _ <- 1..1_000 do
+      # representative call of transition/2
+      :ok
+    end
+  end)
+
+IO.puts("Avg: #{time_us / 1_000} µs/call")
+```
+
+Target: **< 1µs per transition on modern hardware**.
+
 ## Common production mistakes
 
 **1. `true`, `false`, and `nil` are atoms**
@@ -478,6 +510,12 @@ internally (`Enum` is actually `:"Elixir.Enum"`). This means module references
 consume atom table entries too.
 
 ---
+
+## Reflection
+
+If your e-commerce platform had 50 different order states (B2B with custom workflows per customer), would you still use atoms, or model states as a struct field with a string? Why?
+
+How would you add a new state `:returned` without breaking existing orders already in the `:delivered` state?
 
 ## Resources
 

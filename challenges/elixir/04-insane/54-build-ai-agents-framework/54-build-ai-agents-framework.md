@@ -10,6 +10,18 @@ Python frameworks (LangChain, AutoGen) are considered but rejected: they carry r
 
 You will build `AgentFramework`: a native BEAM AI agents framework. No LangChain. No external runtimes. The only external protocol boundary is the HTTP wire format to the LLM provider.
 
+## Design decisions
+
+**Option A — single-shot prompt-then-tool-call**
+- Pros: simple, one request per decision
+- Cons: agents can't recover from tool failures, no memory across steps
+
+**Option B — ReAct loop with persistent state and tool-result feedback** (chosen)
+- Pros: agents can retry, recover, and chain reasoning steps
+- Cons: harder to bound cost and latency
+
+→ Chose **B** because agents that can't reason over their own failures are no different from RAG — the loop is what makes it an agent.
+
 ## Why agents are GenServers and not plain Task processes
 
 An agent must hold state across multiple turns: conversation history, tool registry, memory, cost accumulator. A `Task` is stateless and terminates. A `GenServer` holds state indefinitely, can be supervised (auto-restarted on crash), registered by name (discoverable by other agents), and receives messages (for approval signals, streaming results). The actor model maps directly to the agent abstraction.
@@ -511,6 +523,10 @@ defmodule AgentFramework.Memory.ShortTerm do
 end
 ```
 
+### Why this works
+
+The design isolates correctness-critical invariants from latency-critical paths and from evolution-critical contracts. Modules expose narrow interfaces and fail fast on contract violations, so bugs surface close to their source. Tests target invariants rather than implementation details, so refactors don't produce false alarms. The trade-offs are explicit in the Design decisions section, which makes the "why" auditable instead of folklore.
+
 ## Given tests
 
 ```elixir
@@ -518,6 +534,9 @@ end
 defmodule AgentFramework.Tools.CodeExecutionTest do
   use ExUnit.Case, async: true
   alias AgentFramework.Tools.CodeExecution
+
+
+  describe "CodeExecution" do
 
   test "executes safe code and returns result" do
     assert {:ok, %{return: 42}} = CodeExecution.execute(%{"code" => "21 * 2"})
@@ -619,8 +638,25 @@ defmodule AgentFramework.PoolTest do
 
     assert {:error, :pool_full} = AgentFramework.Pool.submit(pool, :run, ["overflow"])
   end
+
+
+  end
 end
 ```
+
+## Benchmark
+
+```elixir
+# Minimal timing harness — replace with Benchee for production measurement.
+{time_us, _result} = :timer.tc(fn ->
+  # exercise the hot path N times
+  for _ <- 1..10_000, do: :ok
+end)
+
+IO.puts("average: #{time_us / 10_000} µs per op")
+```
+
+Target: <2s end-to-end for a 3-step ReAct loop excluding LLM call latency.
 
 ## Trade-off analysis
 
@@ -644,6 +680,10 @@ end
 **Episodic log missing entries for tool calls that returned errors.** The episodic log must record every tool call attempt, including failed ones. If `execute/1` returns `{:error, reason}`, the log entry should include `error: reason`. Omitting error entries makes debugging impossible — you cannot reconstruct why an agent made a decision if you cannot see what tools it tried.
 
 **Pool not draining gracefully on shutdown.** When the application shuts down, the `PoolSupervisor` sends `:shutdown` to workers. If workers are mid-LLM-call and the timeout is `:infinity`, they block the shutdown sequence indefinitely. Set a `shutdown: 30_000` in the worker's child spec and handle the `:stop` signal in the agent's `terminate/2` callback to abort the current loop cleanly.
+
+## Reflection
+
+Your agent framework allows arbitrary tool calls. A misbehaving agent burns $200 in API credits on a single user request. What's your cost-control contract — per-agent budget, per-loop step cap, or both? Justify.
 
 ## Resources
 

@@ -55,6 +55,18 @@ Monitoring systems ingest millions of metric data points per second from thousan
 
 ---
 
+## Design decisions
+
+**Option A — Row-oriented storage (one row per (metric, timestamp) pair)**
+- Pros: simple schema; easy updates.
+- Cons: disk layout is wrong for range scans; compression ratios are poor.
+
+**Option B — Columnar chunks with per-chunk timestamp indexing** (chosen)
+- Pros: column-wise compression (delta, delta-of-delta, XOR for floats) reaches 10–20x; range scans read contiguous disk bytes.
+- Cons: point updates are awkward; chunks are immutable once closed.
+
+→ Chose **B** because time-series workloads are write-once-read-many and range-dominated — columnar is the native layout.
+
 ## Implementation milestones
 
 ### Step 1: Create the project
@@ -668,6 +680,21 @@ Benchee.run(
 
 Target: 1M data points/second sustained ingest, queries returning within 10ms for high-cardinality series.
 
+### Why this works
+
+Incoming points land in an in-memory head chunk; when it closes by size or time, it's compressed and written as a columnar segment. Queries narrow by timestamp range first (chunk index), then scan compressed columns, so I/O is proportional to the query window not the total data.
+
+---
+
+## Benchmark
+
+```elixir
+# bench/tsdb_bench.exs
+Benchee.run(%{"ingest_100k_points" => fn -> Tsdb.write(points) end}, time: 10)
+```
+
+Target: 1,000,000 points/second ingested on a single node; range queries over 1 hour of data in < 100 ms.
+
 ---
 
 ## Trade-off analysis
@@ -697,6 +724,11 @@ If the downsampler reads hourly chunks while ingest is writing them, it may read
 
 **4. Retention deleting aggregates before raw data**
 Retain raw data for 24h, hourly for 30 days, daily for 1 year. Deleting hourly aggregates before raw data is compacted to hourly would create a query gap. Ensure the downsampling schedule runs before the raw retention window expires.
+
+## Reflection
+
+- Prometheus uses delta-of-delta for timestamps and XOR for floats. If your metrics were monotonic counters only, would you change the encoding? Compute the savings.
+- How would you support downsampling (e.g., 1-minute averages from raw 1-second samples) without re-reading raw data every query?
 
 ---
 

@@ -55,6 +55,18 @@ VR solves this with three sub-protocols: normal operation (the happy path), view
 
 ---
 
+## Design decisions
+
+**Option A — Raft-style term-based elections**
+- Pros: industry standard; easier to cross-check.
+- Cons: you're rebuilding Raft.
+
+**Option B — Viewstamped Replication with deterministic primary rotation** (chosen)
+- Pros: view number + `view mod N` selects the primary without an election phase; operation numbers carry the log ordering; DO_VIEW_CHANGE collapses recovery into two phases.
+- Cons: less reference material; primary rotation is rigid if a node is repeatedly unhealthy.
+
+→ Chose **B** because the exercise is explicitly about learning the VR failure model, not about rebuilding Raft in disguise.
+
 ## Implementation milestones
 
 ### Step 1: Create the project
@@ -594,6 +606,20 @@ Benchee.run(
 
 Target: 5,000 linearizable operations/second on a 5-replica cluster on localhost.
 
+### Why this works
+
+The primary is determined by `view mod N`, so every backup can compute who it should be hearing from without coordination. A new view is only entered after a quorum of DO_VIEW_CHANGE messages, which means any committed operation survives the view change by the log-matching argument.
+
+---
+
+## Benchmark
+
+```elixir
+# bench/vr_bench.exs — see Step for full script
+```
+
+Target: 8,000 ops/second on a 3-replica localhost group; view change under 500 ms.
+
 ---
 
 ## Trade-off analysis
@@ -626,6 +652,11 @@ The client table stores (nonce, reply) per client. If a client reuses nonce 42 i
 
 **4. Not broadcasting COMMIT in normal operation**
 After reaching f+1 PREPARE-OKs, the primary must send COMMIT(commit_number) to all replicas so they can advance their commit-number and apply ops to the state machine. Skipping this leaves backups with ops in their log that are never applied.
+
+## Reflection
+
+- Under a steady stream of primary crashes, VR rotates primaries deterministically. Does this ever produce a worse outcome than Raft's log-comparison election? Give an example.
+- If you had to support reconfiguration (adding/removing nodes), would you bolt it on as a special op, or redesign view change entirely? Justify.
 
 ---
 

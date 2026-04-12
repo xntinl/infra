@@ -10,6 +10,18 @@ The team switches to an Entity-Component-System (ECS) architecture. After the re
 
 You will build `GameEngine`: an ECS engine with a fixed-timestep game loop, ETS-backed world state, ANSI terminal renderer, and a playable Snake game as the demo.
 
+## Design decisions
+
+**Option A — OOP-style entities with methods**
+- Pros: familiar to most devs
+- Cons: cache-unfriendly, hard to parallelize systems
+
+**Option B — struct-of-arrays ECS with systems iterating over archetypes** (chosen)
+- Pros: cache-friendly iteration, naturally parallel, composable
+- Cons: mental model shift from OOP
+
+→ Chose **B** because performance-critical ECS engines all converged on SoA layout — cache behavior matters more than code aesthetics.
+
 ## Why ECS and not OOP inheritance for game objects
 
 OOP inheritance for game objects produces a diamond-inheritance problem within three levels. An entity that is "a flying enemy that is also a projectile collector" either requires multiple inheritance or a deeply nested struct with duplicated fields.
@@ -595,6 +607,10 @@ defmodule Games.Snake do
 end
 ```
 
+### Why this works
+
+The design isolates correctness-critical invariants from latency-critical paths and from evolution-critical contracts. Modules expose narrow interfaces and fail fast on contract violations, so bugs surface close to their source. Tests target invariants rather than implementation details, so refactors don't produce false alarms. The trade-offs are explicit in the Design decisions section, which makes the "why" auditable instead of folklore.
+
 ## Given tests
 
 ```elixir
@@ -609,6 +625,9 @@ defmodule GameEngine.WorldTest do
     try do :ets.delete(:ecs_index) rescue _ -> :ok end
     :ok
   end
+
+
+  describe "World" do
 
   test "spawn_entity increments id" do
     world = World.new()
@@ -726,8 +745,25 @@ defmodule GameEngine.EngineTest do
     Process.sleep(50)
     assert not Process.alive?(engine_pid)
   end
+
+
+  end
 end
 ```
+
+## Benchmark
+
+```elixir
+# Minimal timing harness — replace with Benchee for production measurement.
+{time_us, _result} = :timer.tc(fn ->
+  # exercise the hot path N times
+  for _ <- 1..10_000, do: :ok
+end)
+
+IO.puts("average: #{time_us / 10_000} µs per op")
+```
+
+Target: <5ms to update 10k entities across 20 systems at 60 FPS.
 
 ## Trade-off analysis
 
@@ -751,6 +787,10 @@ end
 **Ignoring BEAM scheduler preemption in the game loop.** The BEAM preempts processes at reduction boundaries (~2000 reductions). A compute-heavy physics system may be preempted mid-tick, causing visual glitches. Keep system update functions short.
 
 **Not randomizing food spawn using a seeded generator.** `:rand.uniform/1` in tests produces different positions on every run, making snapshot tests flaky. Pass an explicit seed for reproducible test runs.
+
+## Reflection
+
+Your game has 10k entities and 50 components. A system iterates over entities with `Position + Velocity + Collider` each frame. How does frame time change if you go from 3 components to 30 in the query?
 
 ## Resources
 

@@ -2,9 +2,6 @@
 
 **Project**: `advanced_strategies` — compare `:one_for_one`, `:one_for_all`, and `:rest_for_one` against real failure scenarios.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 3–5 hours
-
 ---
 
 ## Project context
@@ -116,7 +113,35 @@ If `Feed` flaps 11 times in 30 s, `MarketData` supervisor exits. `Application` s
 
 ---
 
+## Why mixed strategies and not `:one_for_one` everywhere
+
+`:one_for_one` is the safe default but it lies about dataflow. A uniform `:one_for_one` tree lets `PricingEngine` serve stale prices for 20 s while `MarketDataFeed` restarts — a financial correctness bug, not a crash. The strategies are not style preferences; they are declarative constraints on *what consistency the subsystem requires after a failure*. `:rest_for_one` says "downstream must die with upstream"; `:one_for_all` says "these children share state and none makes sense alone"; `:one_for_one` says "these are genuinely independent". Choosing uniformly wastes the mechanism.
+
+---
+
+## Design decisions
+
+**Option A — `:one_for_one` root with children picking their own internal strategy**
+- Pros: failures contained per subsystem; root stays stable.
+- Cons: requires a subsystem supervisor per concern (one extra layer); slightly more wiring.
+
+**Option B — single root `:rest_for_one` with all leaf workers flat** (rejected)
+- Pros: flat tree, easy to read.
+- Cons: a telemetry crash would restart market data; conflates independent subsystems; restart budget becomes meaningless.
+
+→ Chose **A** because each subsystem has its own dataflow semantics (pipeline vs. shared state vs. independent) and its own restart-budget needs. Nesting is the cost of expressing those truthfully.
+
+---
+
 ## Implementation
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defp deps do
+  []
+end
+```
 
 ### Step 1: Application and root supervisor
 
@@ -472,6 +497,10 @@ defmodule AdvancedStrategies.RestartBudgetTest do
 end
 ```
 
+### Why this works
+
+Each subsystem supervisor encodes its dependency topology directly into the strategy: `:rest_for_one` with ordered children for the market-data pipeline, `:one_for_all` for the session bundle whose TLS key is shared, `:one_for_one` for unrelated telemetry. The restart budgets match the failure characteristics — tight on root for OS-level escalation, generous on upstream-sensitive pipelines. This composition makes a `PricingEngine` bug impossible to leave a stale-price window, because `:rest_for_one` guarantees the router is torn down alongside.
+
 ---
 
 ## Trade-offs and production gotchas
@@ -490,13 +519,22 @@ end
 
 **7. Supervisor code is hot-code-upgraded as a *child spec list*.** If you reorder, rename, or change the strategy in the same version as your children, `:sys.change_code/4` sees a structural delta and may restart the whole subtree during the upgrade. Separate topology changes into their own release.
 
-**8. When NOT to use this.** If all your processes are homogeneous, stateless workers scaled by load — do not hand-roll three strategy levels. Use `PartitionSupervisor` (exercise 07) or `DynamicSupervisor` (exercise 08). Custom strategy trees shine when you have heterogeneous components with distinct failure semantics.
+**8. When NOT to use this.** If all your processes are homogeneous, stateless workers scaled by load — do not hand-roll three strategy levels. Use `PartitionSupervisor` for keyed sharding or `DynamicSupervisor` for on-demand children. Custom strategy trees shine when you have heterogeneous components with distinct failure semantics.
 
 ---
 
-## Performance notes
+## Benchmark
 
 Strategy choice has no measurable steady-state cost — supervisors are idle when children are alive. It dominates only during incidents. Measure: wrap the crash test with `:timer.tc/1` and observe that `:rest_for_one` restarting 3 children takes <5 ms on modern hardware; `:one_for_all` the same. What actually costs money in production is the combined `init/1` time of the restarted children — if `init/1` does 200 ms of I/O, a `:one_for_all` restart is 600 ms of unavailability.
+
+Target: supervisor restart overhead ≤ 5 ms per child on modern hardware; subsystem unavailability window during restart bounded by ∑ `init/1` time of the affected children.
+
+---
+
+## Reflection
+
+1. You add a fourth subsystem, `RiskEngine`, that consumes from `PricingEngine` and feeds `OrderRouter`. Where does it live in the tree? Does `OrderRouter` move under the same `:rest_for_one` as `RiskEngine`, or does `RiskEngine` get its own supervisor? Justify using dataflow, not "symmetry with the existing tree".
+2. Ops reports the root supervisor has hit `max_restarts` twice in a month. Each time it was triggered by a specific subsystem flapping. Do you raise the root budget, tighten the leaf budget, or split the leaf into a grandchild sub-tree? What metric tells you which is correct?
 
 ---
 

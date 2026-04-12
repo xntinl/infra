@@ -41,6 +41,22 @@ meshex/
 
 ---
 
+## Why sidecar pattern with local control-plane sync and not library-in-process service mesh
+
+the sidecar is language-agnostic — Go, Python, Rust, Elixir services all get the same guarantees. An in-process library means N implementations to maintain and non-Elixir services are second-class.
+
+## Design decisions
+
+**Option A — shared proxy cluster (per datacenter)**
+- Pros: easier to operate, centralized config
+- Cons: extra network hop, blast radius of a proxy failure
+
+**Option B — sidecar-per-pod proxy (Envoy/Linkerd model)** (chosen)
+- Pros: zero extra hops, failure is local to the pod, per-service config
+- Cons: memory overhead × N pods, configuration complexity
+
+→ Chose **B** because a shared proxy fails the blast-radius test; a sidecar's failure is scoped to one pod.
+
 ## The business problem
 
 The security team requires mutual TLS for all service-to-service communication. The SRE team needs circuit breaking to prevent cascading failures. The product team wants canary deployments — 10% of traffic to v2 before full rollout. The observability team wants distributed traces with no code changes to services.
@@ -548,6 +564,9 @@ defmodule Meshex.TracingTest do
 
   alias Meshex.Tracing
 
+
+  describe "Tracing" do
+
   test "creates new trace when no traceparent header" do
     {trace_id, span_id} = Tracing.extract_or_create(%{})
     assert byte_size(trace_id) == 32  # 16 bytes hex = 32 chars
@@ -570,6 +589,9 @@ defmodule Meshex.TracingTest do
     {trace_id, _} = Tracing.extract_or_create(%{"traceparent" => "invalid"})
     assert byte_size(trace_id) == 32
   end
+
+
+  end
 end
 ```
 
@@ -584,6 +606,9 @@ defmodule Meshex.CircuitBreakerTest do
     {:ok, _} = start_supervised({CircuitBreaker, {"svc-a", "svc-b"}})
     :ok
   end
+
+
+  describe "CircuitBreaker" do
 
   test "starts closed" do
     assert CircuitBreaker.check({"svc-a", "svc-b"}) == :allow
@@ -603,6 +628,9 @@ defmodule Meshex.CircuitBreakerTest do
     # svc-a → svc-c should still be closed
     assert CircuitBreaker.check({"svc-a", "svc-c"}) == :allow
   end
+
+
+  end
 end
 ```
 
@@ -613,6 +641,24 @@ mix test test/meshex/ --trace
 ```
 
 ---
+
+### Why this works
+
+The design separates concerns along their real axes: what must be correct (the service mesh proxy invariants), what must be fast (the hot path isolated from slow paths), and what must be evolvable (external contracts kept narrow). Each module has one job and fails loudly when given inputs outside its contract, so bugs surface near their source instead of as mysterious downstream symptoms. The tests exercise the invariants directly rather than implementation details, which keeps them useful across refactors.
+
+## Benchmark
+
+```elixir
+# Minimal timing harness — replace with Benchee for production measurement.
+{time_us, _result} = :timer.tc(fn ->
+  # exercise the hot path N times
+  for _ <- 1..10_000, do: :ok
+end)
+
+IO.puts("average: #{time_us / 10_000} µs per op")
+```
+
+Target: <100µs per-request proxy latency at p99 with mTLS enabled.
 
 ## Trade-off analysis
 
@@ -647,6 +693,10 @@ If a service spawns a background task during request processing, the task's outb
 `Enum.flat_map(routes, fn {ep, w} -> List.duplicate(ep, w) end)` creates a new list on every selection. For routes with `{v1: 90, v2: 10}` this creates a 100-element list per request. Use the sum-of-weights algorithm: `rand_val = :rand.uniform(total_weight)` and iterate through weights cumulatively.
 
 ---
+
+## Reflection
+
+If your sidecar costs 30MB of RAM per pod and you run 10k pods per cluster, that's 300GB of RAM just for proxies. When does that number justify moving to a shared-proxy model, and what do you lose in the transition?
 
 ## Resources
 

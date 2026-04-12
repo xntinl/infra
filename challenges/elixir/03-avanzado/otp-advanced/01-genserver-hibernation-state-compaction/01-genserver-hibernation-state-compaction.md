@@ -2,10 +2,6 @@
 
 **Project**: `hibernating_worker` — an idle-aware GenServer that trades CPU (GC) for RAM at scale.
 
-**Difficulty**: ★★★★☆
-
-**Estimated time**: 4–5 hours
-
 ---
 
 ## Project context
@@ -95,7 +91,38 @@ Convert words to bytes with `:erlang.system_info(:wordsize)` (usually 8 on 64-bi
 
 ---
 
+## Why hibernation and not `:fullsweep_after`
+
+`Process.flag(:fullsweep_after, 0)` forces every minor GC to also sweep the old generation, which does reclaim tenured data, but it only fires **when the process allocates**. An idle worker allocates nothing, so `:fullsweep_after` alone never reclaims anything on an idle fleet. Hibernation, by contrast, actively runs a sweep *and* shrinks the heap to the continuation size. For the 4,800 idle workers in this system, `:fullsweep_after` would leave ~40 KB per process untouched; hibernation collapses them to < 1 KB. When the workload is a mix of active churn and idle tails, both tools combine: tune `:fullsweep_after` for the active phase, hibernate for the idle phase.
+
+---
+
+## Design decisions
+
+**Option A — driver-side idle tracking with `Process.send_after/3`**
+- Pros: explicit timer refs, easy to cancel on activity, works in any process type.
+- Cons: every callback must cancel + reschedule, easy to leak refs on hot paths, you manage monotonic timestamps by hand.
+
+**Option B — GenServer timeout tuple `{:noreply, state, @idle_ms}`** (chosen)
+- Pros: OTP re-arms the timeout on every callback return, zero leaks, no ref bookkeeping, `handle_info(:timeout, _)` is the single sink for the idle event.
+- Cons: one timeout per process — if you also need a periodic job, you must fold it into the same timeout or switch to explicit timers.
+
+→ Chose **B** because the exercise needs exactly one idle signal and OTP's built-in timeout is the zero-bookkeeping path. The "one timeout" constraint is acceptable: periodic health probes belong in a separate supervised process, not in the worker's critical path.
+
+---
+
 ## Implementation
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defp deps do
+  [
+    {:benchee, "~> 1.3", only: :dev}
+  ]
+end
+```
+
 
 ### Step 1: `mix.exs`
 
@@ -345,6 +372,10 @@ Expected numbers on an M1 / Ryzen-class machine:
 | warm cast                  | 1–2 µs  | 4 µs    |
 | cold cast (post-hibernate) | 80–200 µs | 400 µs |
 
+### Why this works
+
+The timeout-driven `:hibernate` return collapses idle state on each idle tick without leaking timer refs, and `compact/1` runs **before** the hibernation sweep so the GC has nothing to copy into the new heap. The supervisor is `:one_for_one` on a `DynamicSupervisor` because each worker is independent — one upstream's crash must not restart the other 4,999. The `Registry` indirection in `via/1` keeps callers decoupled from pids, which survives restarts without changing client code.
+
 ---
 
 ## Trade-offs and production gotchas
@@ -380,6 +411,15 @@ On a 5,000-worker fleet with 95% idle ratio, measured on M1 Max:
 | GC pauses / sec (system)     | 1,200               | 2,900                         |
 
 The jump in GC pauses per second is expected: each wake fires a GC. System-wide CPU attributable to GC rose from 1.3% to 2.1% — acceptable given the 15× memory win.
+
+Target: idle-worker footprint under 1 KB (`:erlang.process_info(pid, :memory)` < 1024 bytes) and wake p99 under 500 µs on a modern node.
+
+---
+
+## Reflection
+
+1. The 5,000-worker fleet swings between 100% active (during incidents) and 95% idle (overnight). How would you design the `@idle_ms` threshold so it adapts to the current active ratio instead of being a fixed constant, and what failure mode does that adaptive scheme introduce?
+2. If each worker's `request_log` were promoted to large binaries (full HTTP bodies off-heap), would hibernation still deliver a 15× memory win? What would you change in `compact/1` to keep the guarantee?
 
 ---
 

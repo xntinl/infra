@@ -45,6 +45,22 @@ wasmex/
 
 ---
 
+## Why LEB128 encoding for integers and not fixed 32/64-bit little-endian
+
+LEB128 packs small integers (the common case — indexes, local counts, opcodes) into 1 byte instead of 4; Wasm binaries are dominated by small integers, so LEB128 wins 3-4x on binary size without a meaningful decode cost.
+
+## Design decisions
+
+**Option A — tree-walking interpreter over the AST**
+- Pros: straightforward implementation
+- Cons: 10-50x slower than necessary, no hope of JIT
+
+**Option B — bytecode stack machine matching the Wasm execution model** (chosen)
+- Pros: matches spec semantics directly, simpler validation, room to add a threaded dispatch optimization
+- Cons: requires a decode pass
+
+→ Chose **B** because the Wasm spec is defined in terms of a stack machine; implementing it as anything else is a constant translation tax.
+
 ## The business problem
 
 The tooling team needs to run untrusted third-party code in their CI/CD pipeline without giving it OS-level access. WebAssembly's linear memory model and explicit import/export system make it an ideal sandbox: the module can only call functions you explicitly provide as imports, and can only access memory within its linear memory bounds. Any out-of-bounds access causes a trap (structured error), not a segfault.
@@ -580,6 +596,9 @@ defmodule Wasmex.Parser.LEB128Test do
 
   alias Wasmex.Parser.LEB128
 
+
+  describe "LEB128" do
+
   test "decodes single-byte unsigned" do
     assert {42, <<>>} = LEB128.decode_unsigned(<<42>>)
   end
@@ -609,6 +628,9 @@ defmodule Wasmex.Parser.LEB128Test do
     # Multi-byte value with only first byte present
     assert {:error, :truncated} = LEB128.decode_unsigned(<<0x80>>)
   end
+
+
+  end
 end
 ```
 
@@ -618,6 +640,9 @@ defmodule Wasmex.ParserTest do
   use ExUnit.Case, async: true
 
   alias Wasmex.Parser.Binary
+
+
+  describe "Parser" do
 
   test "parses wasm magic and version" do
     # Minimal valid wasm module: magic + version + empty
@@ -633,6 +658,9 @@ defmodule Wasmex.ParserTest do
   test "rejects unsupported version" do
     wasm = <<0x00, 0x61, 0x73, 0x6D, 0x02, 0x00, 0x00, 0x00>>
     assert {:error, :unsupported_version} = Binary.parse(wasm)
+  end
+
+
   end
 end
 ```
@@ -656,6 +684,8 @@ defmodule Wasmex.IntegrationTest do
   #           (call $fib (i32.sub (local.get 0) (i32.const 2))))))))
 
   @tag :wasm_fixtures
+  describe "Integration" do
+
   test "executes fibonacci(10) = 55" do
     wasm = File.read!(@fib_wasm_path)
     {:ok, module} = Wasmex.Parser.Binary.parse(wasm)
@@ -670,6 +700,8 @@ defmodule Wasmex.IntegrationTest do
     {:ok, instance} = Wasmex.Module.instantiate(module, %{})
     assert {:ok, [{:i32, 0}]} = Wasmex.Runtime.Machine.call(instance, "fib", [{:i32, 0}])
   end
+
+  end
 end
 ```
 
@@ -681,6 +713,24 @@ mix test test/wasmex/ --exclude wasm_fixtures --trace
 ```
 
 ---
+
+### Why this works
+
+The design separates concerns along their real axes: what must be correct (the WebAssembly interpreter invariants), what must be fast (the hot path isolated from slow paths), and what must be evolvable (external contracts kept narrow). Each module has one job and fails loudly when given inputs outside its contract, so bugs surface near their source instead of as mysterious downstream symptoms. The tests exercise the invariants directly rather than implementation details, which keeps them useful across refactors.
+
+## Benchmark
+
+```elixir
+# Minimal timing harness — replace with Benchee for production measurement.
+{time_us, _result} = :timer.tc(fn ->
+  # exercise the hot path N times
+  for _ <- 1..10_000, do: :ok
+end)
+
+IO.puts("average: #{time_us / 10_000} µs per op")
+```
+
+Target: <10x slowdown vs native for an integer-heavy benchmark (fib, sha256).
 
 ## Trade-off analysis
 
@@ -715,6 +765,10 @@ A valid i32 value fits in at most 5 bytes of LEB128 (ceil(32/7) = 5). A maliciou
 The `unreachable` instruction is not "undefined behavior" — it is a guaranteed trap. A module may use it to mark paths the developer believes are impossible. If reached at runtime, your interpreter must trap with `:unreachable`, not skip or panic.
 
 ---
+
+## Reflection
+
+Tree-walking your Wasm interpreter is probably 30x slower than V8's JIT. At what use case does that 30x gap stop mattering — plugin sandboxes, edge computing, or client validation? Pick one and justify.
 
 ## Resources
 

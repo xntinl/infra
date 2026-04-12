@@ -58,6 +58,26 @@ etl/
 
 ---
 
+## Design decisions
+
+**Option A — named intermediate bindings between steps**
+```elixir
+parsed = parse(input)
+typed = cast_types(parsed)
+valid = filter_valid(typed)
+encode_json(valid)
+```
+- Pros: easy to inspect each stage in a debugger; each binding reads like a noun that names the intermediate shape; no clever syntax.
+- Cons: verbose; invites variable-name drift (`typed`, `typed2`, `typed_final`); visually obscures the one-directional flow.
+
+**Option B — single pipe chain from input to output** (chosen)
+- Pros: reads top-to-bottom like a flowchart; no throwaway variable names; swapping/adding a stage is one line; the shape of the data at each step is implicit in the function used.
+- Cons: debugging a mid-pipe failure means inserting `IO.inspect/2` or splitting temporarily; long pipes (>8 stages) become harder to read; requires functions designed with subject-first signatures.
+
+Chose **B** because ETL is by nature a linear transformation; the pipe reflects the domain. When a stage gets complicated, extract it to a named function — but keep the top-level shape as a pipe.
+
+---
+
 ## Implementation
 
 ### `lib/etl.ex`
@@ -432,6 +452,36 @@ end
 mix test --trace
 ```
 
+### Why this works
+
+The pipe is mechanical: `a |> f(b)` is `f(a, b)` — no magic, just a rewrite. Its power comes from the discipline it enforces: every function in the chain must accept its primary input as the first argument. Once you follow that rule, `Enum`, `String`, `Map`, `Jason`, and your own modules all compose uniformly. Stage failures don't corrupt global state because nothing is stateful — each stage takes a value, returns a value, and hands off. For error handling inside a pipe, `with` or tagged-tuple fold patterns replace `try/rescue` without breaking the linear shape.
+
+---
+
+## Benchmark
+
+```elixir
+# bench.exs
+defmodule Bench do
+  def run do
+    csv =
+      ["name,age,email"] ++
+        for i <- 1..10_000 do
+          "User#{i},#{20 + rem(i, 60)},user#{i}@example.com"
+        end
+
+    input = Enum.join(csv, "\n")
+
+    {us, _} = :timer.tc(fn -> ETL.run(input) end)
+    IO.puts("ETL.run 10k rows: #{us} µs (#{us / 10_000} µs/row)")
+  end
+end
+
+Bench.run()
+```
+
+Target: under 50 µs per row end-to-end (parse + cast + filter + JSON encode) for typical 3–5 column CSV. Bottleneck is usually JSON encoding if the schema is wide; profile individual stages with `:timer.tc/1` if you fall below target.
+
 ---
 
 ## Designing pipe-friendly functions
@@ -519,6 +569,13 @@ Use `with` for conditional pipelines.
 **4. Too many transformations in one pipe**
 A 20-step pipe is hard to debug. Break it into named functions that each represent
 a meaningful transformation step.
+
+---
+
+## Reflection
+
+1. An ETL stage now needs to call an external HTTP API and can fail. Do you keep the pipe shape with `with` handling `{:ok, _} | {:error, _}` tuples, introduce a `Result` monad via a library, or break the pipe at the boundary and return an explicit error? Which option scales to 10 stages with partial failures?
+2. The ETL runs on a single process today. Events arrive at 500k/sec. What is the smallest architectural change that keeps the pipe abstraction but scales horizontally — `Task.async_stream/3`, `Flow`, `Broadway`, or something else? Why that one and not the others?
 
 ---
 

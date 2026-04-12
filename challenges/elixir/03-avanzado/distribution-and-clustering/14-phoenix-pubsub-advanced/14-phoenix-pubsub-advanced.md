@@ -2,9 +2,6 @@
 
 **Project**: `pubsub_advanced` — a fan-out subsystem that broadcasts domain events across a BEAM cluster using `Phoenix.PubSub`, swappable between the default PG2 adapter and the Redis adapter, with partial failure tolerance.
 
-**Difficulty**: ★★★★☆
-**Estimated time**: 3–6 hours
-
 ---
 
 ## Project context
@@ -36,6 +33,16 @@ pubsub_advanced/
 ```
 
 ---
+
+## Why this approach and not alternatives
+
+Alternatives considered and discarded:
+
+- **Hand-rolled equivalent**: reinvents primitives the BEAM/ecosystem already provides; high risk of subtle bugs around concurrency, timeouts, or failure propagation.
+- **External service (e.g. Redis, sidecar)**: adds a network hop and an extra failure domain for a problem the VM can solve in-process with lower latency.
+- **Heavier framework abstraction**: couples the module to a framework lifecycle and makes local reasoning/testing harder.
+
+The chosen approach stays inside the BEAM, uses idiomatic OTP primitives, and keeps the contract small.
 
 ## Core concepts
 
@@ -97,6 +104,18 @@ Cost: 2× bandwidth, one extra ETS lookup per delivery, and you must keep adapte
 Phoenix.PubSub emits `[:phoenix, :pubsub, :broadcast]` events. Attach a handler to record delivery latency and adapter errors; feed into Prometheus, StatsD, or `telemetry_metrics_prometheus`.
 
 ---
+
+## Design decisions
+
+**Option A — naive/simple approach**
+- Pros: minimal code, easy to reason about.
+- Cons: breaks under load, lacks observability, hard to evolve.
+
+**Option B — the approach used here** (chosen)
+- Pros: production-grade, handles edge cases, testable boundaries.
+- Cons: more moving parts, requires understanding of the BEAM primitives involved.
+
+→ Chose **B** because correctness under concurrency and failure modes outweighs the extra surface area.
 
 ## Implementation
 
@@ -435,6 +454,11 @@ mix test
 
 ---
 
+
+### Why this works
+
+The design leans on BEAM guarantees (process isolation, mailbox ordering, supervisor restarts) and pushes invariants to the boundaries of each module. State transitions are explicit, failure modes are declared rather than implicit, and each step is independently testable. That combination keeps the implementation correct under concurrent load and cheap to change later.
+
 ## Trade-offs and production gotchas
 
 **1. PG2 message fan-out is O(N) per broadcast**
@@ -504,6 +528,11 @@ Measured on a 3-node loopback cluster + local Redis:
 The dual-publish winner is almost always PG2 on LAN. Redis kicks in when disterl is partitioned or when you span regions without connected BEAM nodes.
 
 ---
+
+## Reflection
+
+- If the expected load grew by 100×, which assumption in this design would break first — the data structure, the process model, or the failure handling? Justify.
+- What would you measure in production to decide whether this implementation is still the right one six months from now?
 
 ## Resources
 

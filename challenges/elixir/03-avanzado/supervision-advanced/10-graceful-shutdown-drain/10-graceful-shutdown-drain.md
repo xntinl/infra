@@ -2,9 +2,6 @@
 
 **Project**: `drain_shutdown` — drain in-flight requests before `terminate/2` completes.
 
-**Difficulty**: ★★★★☆
-**Estimated time**: 4–5 hours
-
 ---
 
 ## Project context
@@ -116,7 +113,35 @@ The flag is set by the GenServer's `terminate/2` in stage 1. Readers do NOT go t
 
 ---
 
+## Why a four-stage drain and not `Process.flag(:trap_exit, true)` alone
+
+Trapping exits converts the supervisor's `:shutdown` signal into a `terminate/2` call — that is necessary but not sufficient. Without a gate that rejects new work, producers keep `call`-ing the GenServer during drain and push its mailbox beyond the shutdown budget. Without a deadline inside the drain loop, `terminate/2` blocks forever on a stuck downstream and the supervisor `:brutal_kill`s at `shutdown:` expiry — losing exactly the state you were trying to flush. The four stages (gate → drain → flush → exit) are the minimum needed to make the guarantee load-bearing.
+
+---
+
+## Design decisions
+
+**Option A — accept everything and drain on terminate, no gate**
+- Pros: simplest code; single state transition.
+- Cons: producers keep writing into the mailbox during drain; the drain window never closes; `:brutal_kill` dominates under load.
+
+**Option B — gate flag + bounded drain + flush** (chosen)
+- Pros: producers see `:unavailable` immediately and back off; the drain budget is deterministic; flush happens once the mailbox is empty of in-flight work.
+- Cons: more state (`draining?` flag), and every public callback must inspect it — a touch point that is easy to forget on new endpoints.
+
+→ Chose **B** because the SLO is about not dropping in-flight requests, which requires a bounded closing window that only gating makes possible.
+
+---
+
 ## Implementation
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defp deps do
+  []
+end
+```
 
 ### Step 1: Application
 
@@ -310,6 +335,10 @@ defmodule DrainShutdown.DrainTest do
 end
 ```
 
+### Why this works
+
+`trap_exit` turns the supervisor's `:shutdown` into a `terminate/2` call instead of an instant death. The ETS-backed gate flag flips in `terminate/2` and is read by public callbacks *without* going through the GenServer itself — so callers get `:unavailable` instantly instead of queuing behind the draining process. The bounded `receive` loop in `terminate/2` processes remaining `:work_done` signals until either the in-flight counter hits zero or the drain deadline expires; either way `terminate/2` returns within the `shutdown:` budget, so the supervisor never has to fall back to `:brutal_kill`.
+
 ---
 
 ## Trade-offs and production gotchas
@@ -332,11 +361,20 @@ end
 
 ---
 
-## Performance notes
+## Benchmark
 
 `Process.flag(:trap_exit, true)` has no measurable runtime cost — it's a single bit on the PCB. The drain itself is bounded by the slowest in-flight job; measure it with `:timer.tc/1` wrapped around the supervisor's terminate call.
 
 ETS lookups for the gate are ~50 ns. `:persistent_term.get/1` is ~20 ns but with global GC cost on writes — the trade-off favors ETS for frequently-flipped flags.
+
+Target: drain completes within `shutdown:` budget for 99% of deploys; new-request rejection latency ≤ 1 µs (ETS read); zero `502`s attributable to in-flight loss after deploy.
+
+---
+
+## Reflection
+
+1. Your deploys finish drain in 4 s on average but once a week a single slow request pushes it past the 10 s `shutdown:` budget and the supervisor `:brutal_kill`s. Do you raise `shutdown:`, add a per-request timeout that fails the one slow request, or split the GenServer into two (fast + slow paths)? What's the cost of each under a deploy-every-hour cadence?
+2. K8s sends `SIGTERM` and removes the pod from Service endpoints simultaneously, but endpoint propagation takes ~2 s. Your gate flips immediately, so for 2 s clients that still resolve to this pod hit a `:unavailable` response. How do you close that window without adding a `Process.sleep` to your `terminate/2`?
 
 ---
 

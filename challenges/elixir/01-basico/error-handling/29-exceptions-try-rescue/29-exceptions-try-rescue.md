@@ -2,9 +2,6 @@
 
 **Project**: `retry_http` — a minimal HTTP client wrapper that retries recoverable errors and surfaces unrecoverable ones
 
-**Difficulty**: ★★☆☆☆
-**Estimated time**: 1-2 hours
-
 ---
 
 ## Core concepts in this exercise
@@ -27,6 +24,34 @@ A retry policy is the classic place where this distinction shines. Network timeo
 are recoverable and worth retrying. A 401 Unauthorized is not — retrying won't help.
 A malformed URL at the call site is a bug and should crash loudly. Three categories,
 three different mechanisms. Getting them right is a senior-level concern.
+
+---
+
+## Why exceptions and not only error tuples
+
+**Option A — every failure returns `{:error, reason}`, no raises**
+- Pros: uniform API; `with` composition is natural; no stack unwinding; callers cannot forget to rescue.
+- Cons: a `nil` URL passed by accident becomes `{:error, :nil_url}` and propagates silently — bugs and business errors look identical.
+
+**Option B — tuples for expected failures, exceptions for programmer errors and transport faults** (chosen)
+- Pros: bugs crash with a useful stack trace; retryable transport faults are rescued at the boundary and converted to tuples; the two categories are visibly different in the code.
+- Cons: requires discipline at the boundary — you must rescue *your* exceptions, not every Exception.
+
+→ Chose **B** because the three failure categories (retryable, unrecoverable, programmer error) demand different mechanisms. Collapsing them into one shape hides the distinction that senior callers care about.
+
+---
+
+## Design decisions
+
+**Option A — retry logic inside the transport module**
+- Pros: callers never see the retry; one place to tune backoff.
+- Cons: transport can't distinguish "this call is idempotent" from "this call mutates state"; retries silently duplicate POSTs.
+
+**Option B — retry in `Client`, transport is a pure side-effecting function** (chosen)
+- Pros: retry policy is explicit at the call site; unit tests inject a fake transport; idempotence is a caller concern, where it belongs.
+- Cons: retry code is duplicated if multiple callers need retries; requires a helper.
+
+→ Chose **B** because safety of retrying is context-dependent. The transport cannot know it; the caller must.
 
 ---
 
@@ -257,7 +282,7 @@ defmodule RetryHttp.Client do
 end
 ```
 
-**Why this works:**
+### Why this works
 
 - `rescue` binds the exception struct to `e`, so we can inspect `e.reason` and
   `e.status`. Without custom exceptions we'd be parsing string messages.
@@ -401,6 +426,39 @@ rescue inexplicably doesn't fire, check whether the callee is using `throw` or
 If you rescue, log, and do not re-raise, you silently swallow the error. Use
 `reraise e, __STACKTRACE__` to rescue for a side effect (logging) but still let
 it propagate.
+
+---
+
+## Benchmark
+
+Measure the cost of the happy path (no raise) vs. a raised-and-rescued path so you can decide whether rescue is acceptable in a hot loop.
+
+```elixir
+happy = fn -> :ok end
+
+raising = fn ->
+  try do
+    raise RetryHttp.Errors.RecoverableError, reason: :timeout
+  rescue
+    _ -> :ok
+  end
+end
+
+{us_ok, _}    = :timer.tc(fn -> for _ <- 1..100_000, do: happy.() end)
+{us_raise, _} = :timer.tc(fn -> for _ <- 1..100_000, do: raising.() end)
+
+IO.puts("no raise:     #{us_ok / 100_000} µs")
+IO.puts("raise+rescue: #{us_raise / 100_000} µs")
+```
+
+Target esperado: happy path <0.1 µs, raise+rescue 5–15 µs. A raise is 50–100× a normal function return. That is fine at an HTTP boundary (once per request); it is not fine inside an inner loop over a million records.
+
+---
+
+## Reflection
+
+- The current retry policy is linear (`backoff * n`). If you replace it with exponential-plus-jitter, do you keep the retry logic in `Client`, move it into `:telemetry` handlers, or reach for a library like `Retry`? Which choice makes the *tests* harder?
+- `RecoverableError` and `UnrecoverableError` are decided by HTTP status. What happens if a 500 actually means "the API is in a broken state and retrying will make it worse"? How would you promote a status-based classification to one that also reads the response body?
 
 ---
 

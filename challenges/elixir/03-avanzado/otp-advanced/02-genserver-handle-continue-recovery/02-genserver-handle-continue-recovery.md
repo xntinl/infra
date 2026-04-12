@@ -2,10 +2,6 @@
 
 **Project**: `continue_recovery_gs` — a crash-recovering GenServer that survives restarts via DETS and never blocks its supervisor at boot.
 
-**Difficulty**: ★★★★☆
-
-**Estimated time**: 3–5 hours
-
 ---
 
 ## Project context
@@ -86,7 +82,36 @@ ETS loses data on process death. DETS loses the last `snapshot_interval_ms` on b
 
 ---
 
+## Why `handle_continue` and not `Task.start_link` from init
+
+You could spawn a task from `init/1` to load DETS and `send` results back. That returns control quickly too, but it drops OTP's ordering guarantee: between the moment `init` returns and the moment the task replies, `cast`s can hit `handle_cast` against an empty state. `handle_continue/2` runs **before any mailbox message**, so every public call sees the recovered state. You get non-blocking boot without the half-initialized window.
+
+---
+
+## Design decisions
+
+**Option A — async loader process (Task.Supervisor)**
+- Pros: truly parallel — the aggregator can answer "cheap" reads while DETS loads.
+- Cons: complex state machine (`:loading` vs `:ready`), extra process, every callback must handle the not-ready case, race conditions on `cast` during load.
+
+**Option B — `{:continue, :recover}` from init/1** (chosen)
+- Pros: OTP guarantees no message interleaves before recovery finishes; single state shape; supervisor boot is non-blocking; the recovery cost stays on the process's own scheduler so it self-throttles.
+- Cons: the process cannot answer calls during recovery — they queue. For a 3 s load that is a 3 s p99 hit on early callers.
+
+→ Chose **B** because the system's SLO tolerates a ~1 s queue after node boot (callers retry on DNS failover anyway), while it cannot tolerate a half-initialized state answering `nil` for a known topic. Correctness > early availability here.
+
+---
+
 ## Implementation
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defp deps do
+  []
+end
+```
+
 
 ### Step 1: `mix.exs`
 
@@ -296,6 +321,10 @@ defmodule ContinueRecoveryGs.RecoveryTest do
 end
 ```
 
+### Why this works
+
+`{:continue, :recover}` runs with mailbox priority: OTP dispatches it before any `call`/`cast`/`info`, so callers observe a fully hydrated `offsets` map on their first request. The `snapshot_armed?` flag debounces writes: one timer coalesces a burst of `set/2` into a single `:dets.sync`, giving O(1) disk pressure per second regardless of write rate. `terminate/2` is an optimization, not a correctness guarantee — the periodic snapshot is what survives `:kill`.
+
 ---
 
 ## Trade-offs and production gotchas
@@ -318,7 +347,7 @@ end
 
 ---
 
-## Performance notes
+## Benchmark
 
 Measured on an M1 Max with a 47k-entry DETS file (~3.8 MB on disk):
 
@@ -331,6 +360,15 @@ Measured on an M1 Max with a 47k-entry DETS file (~3.8 MB on disk):
 | periodic snapshot (47k entries) | 65 ms      | 22 ms      |
 
 The continuation is dominated by DETS load time; the win is moving that cost off the supervisor's critical boot path.
+
+Target: `init/1` returns in < 5 ms regardless of DETS size; recovery throughput of ≥ 50k entries/s on warm cache; snapshot write amortized to ≤ 1 flush/second.
+
+---
+
+## Reflection
+
+1. The supervisor boot SLO is 5 s and recovery takes 3 s on cold cache. A new requirement says "offsets must be queryable within 100 ms of boot". Do you switch to an async loader (Option A), add a second-level cache, or push recovery to a sidecar process? Justify under what traffic pattern each choice wins.
+2. If you replaced DETS with a remote store (Redis, Postgres), would you still keep `handle_continue/2` or move the connection handshake into `init/1`? What fails differently when the remote store is down at boot?
 
 ---
 

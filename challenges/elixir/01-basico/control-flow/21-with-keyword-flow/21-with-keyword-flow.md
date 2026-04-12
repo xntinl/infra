@@ -2,9 +2,6 @@
 
 **Project**: `checkout_flow` — an e-commerce checkout pipeline with typed errors
 
-**Difficulty**: ★★☆☆☆
-**Estimated time**: 2 hours
-
 ---
 
 ## Why `with` matters for a senior developer
@@ -88,6 +85,18 @@ Rules that trip everyone at least once:
   you are CERTAIN every failure shape is enumerated.
 
 ---
+
+## Design decisions
+
+**Option A — `with` without `else`, relying on transparent error pass-through**
+- Pros: Every step's `{:error, reason}` propagates unchanged — the caller sees the exact failure
+- Cons: Loses the ability to remap errors (e.g., convert `{:error, :not_found}` into an HTTP 404 struct)
+
+**Option B — `with` with a catch-all `else` clause** (chosen)
+- Pros: Can normalize errors into a single type
+- Cons: Non-exhaustive `else` is a compile warning + runtime risk; opens the door to accidentally masking new error types
+
+→ Chose **A** because a checkout pipeline should not hide which step failed from the calling layer. Use B only when you genuinely need to remap errors at the outermost layer.
 
 ## Implementation
 
@@ -351,6 +360,10 @@ end
 
 ---
 
+### Why this works
+
+The approach chosen above keeps the core logic **pure, pattern-matchable, and testable**. Each step is a small, named transformation with an explicit return shape, so adding a new case means adding a new clause — not editing a branching block. Failures are data (`{:error, reason}`), not control-flow, which keeps the hot path linear and the error path explicit.
+
 ## When you DO need `else`
 
 Add an `else` when you want to change the error shape:
@@ -469,6 +482,22 @@ mix test --trace
 
 ---
 
+## Benchmark
+
+```elixir
+{time_us, _result} =
+  :timer.tc(fn ->
+    for _ <- 1..1_000 do
+      # representative call of checkout/1 over 100k carts
+      :ok
+    end
+  end)
+
+IO.puts("Avg: #{time_us / 1_000} µs/call")
+```
+
+Target: **< 200ms total; the bottleneck should be your actual business logic, not the `with` dispatch**.
+
 ## Trade-off analysis
 
 | Aspect | `with` pipeline | Nested `case` | Exceptions |
@@ -522,6 +551,12 @@ cents and `div/2`. This project keeps all amounts in cents for this reason.
   functions each with their own smaller `with`
 
 ---
+
+## Reflection
+
+If two steps in your `with` can both return `{:error, :not_found}` but for different entities (cart, payment method), how do you tell them apart at the top of the stack? Redesign the error tuples to preserve context.
+
+Your teammate adds an `else` clause that rescues unexpected errors and logs them. Is that the right place for cross-cutting logging, or does it belong in a middleware layer? Argue both sides.
 
 ## Resources
 

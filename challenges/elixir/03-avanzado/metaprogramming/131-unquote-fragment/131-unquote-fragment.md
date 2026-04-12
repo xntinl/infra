@@ -2,9 +2,6 @@
 
 **Project**: `unquote_fragment` — generate dozens of specialized functions at compile time using `unquote_splicing` and `bind_quoted` fragments, the same technique used by Ecto's `schema` and Jason's encoder.
 
-**Difficulty**: ★★★★☆
-**Estimated time**: 3–5 hours
-
 ---
 
 ## Project context
@@ -31,6 +28,24 @@ unquote_fragment/
 │   └── converter_test.exs
 └── mix.exs
 ```
+
+---
+
+## Why compile-time generation and not runtime dispatch
+
+**Runtime dispatch** (one `convert/2` with a `case` or map lookup) is simpler
+to read, change at runtime, and debug. It pays one map lookup and one branch
+per call.
+
+**Compile-time generation** emits one `def to_<code>/1` per row, each with the
+rate baked in as a numeric literal. The BEAM compiles these into a jump table:
+no lookup, no branch on currency. The cost: recompilation required to add a
+currency, larger BEAM file, and surprising stacktraces if you never read the
+generated AST.
+
+The rule of thumb: generate when the list is closed at compile time and hot on
+the call path. Use runtime dispatch when the list changes, is loaded from a
+DB, or performance is not the bottleneck.
 
 ---
 
@@ -80,6 +95,20 @@ atom directly to code through the BEAM's apply dispatch.
 
 `Module.definitions_in(mod, :def)` returns `[{name, arity}, ...]` — useful at
 `@before_compile` for emitting a companion `__functions__/0` that docs can enumerate.
+
+---
+
+## Design decisions
+
+**Option A — single `convert/2` with a runtime map**
+- Pros: trivial to add/remove currencies, small BEAM file, no metaprogramming to explain.
+- Cons: one `Map.fetch!/2` plus one branch per call; no compile-time guarantees about unknown currencies until the call fires.
+
+**Option B — `unquote_splicing` fragment generation** (chosen)
+- Pros: each generated `to_<code>/1` is a pure numeric transform with the rate inlined; compile-time errors for malformed rate tables; matches how Ecto and Phoenix emit their per-field/per-route handlers.
+- Cons: adding a currency requires recompile; generated AST is harder to debug without `Macro.to_string/1`.
+
+→ Chose **B** because the currency table is closed and the converter sits on a hot path; the recompile cost is acceptable and the style mirrors canonical Elixir libraries the reader will meet later.
 
 ---
 
@@ -232,6 +261,15 @@ defmodule UnquoteFragment.ConverterTest do
 end
 ```
 
+### Why this works
+
+The `for` comprehension runs inside the module body at compile time, so each
+iteration emits a fresh `def` clause into the same module. The rate is
+captured via `unquote(rate)`, which splices a literal float into the AST — by
+the time the module loads, every function has its constant baked in. The BEAM
+compiler turns the N clauses into a single jump table keyed by function name,
+which is why dispatch is effectively free.
+
 ---
 
 ## Trade-offs and production gotchas
@@ -281,6 +319,20 @@ Benchee.run(%{
 ```
 
 Expect the generated version to be ~1.5–3× faster — the map lookup disappears.
+
+Target: generated `to_eur/1` under 50 ns per call on modern hardware; runtime
+`convert/2` around 100–150 ns. Gap widens as the currency list grows.
+
+---
+
+## Reflection
+
+- If the currency table grew to 5,000 symbols (one per ticker), would you still
+  generate one function per symbol, or switch to a runtime map? At what N does
+  the compile-time cost outweigh the dispatch win?
+- You are told rates must refresh every 5 minutes from an external feed. How
+  does that single requirement change the design, and which parts of the
+  current approach survive?
 
 ---
 

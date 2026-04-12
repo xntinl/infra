@@ -5,9 +5,6 @@
 `:read_concurrency` / `:write_concurrency` change the shape of concurrent
 access.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
-
 ---
 
 ## Project context
@@ -27,6 +24,20 @@ state) or throughput (everyone serializing through a single owner).
 
 This exercise builds one small tally table four different ways and probes
 what each access mode allows.
+
+## Why tune access modes and not default everything
+
+**Why not always `:public`?** Because `:public` means any process — including
+buggy ones — can mutate your table. `:protected` gives you read-sharing
+without losing write authority.
+
+**Why not always `:protected`?** Because in a shared cache / registry shape
+(many writers, e.g. `Registry`), routing all writes through one owner
+serializes the hot path unnecessarily.
+
+**Why not skip `:read_concurrency`/`:write_concurrency` and rely on defaults?**
+At low throughput, correct. At high throughput, these flags are the
+difference between 50k and 500k ops/sec. Profiling tells you when it matters.
 
 Project structure:
 
@@ -95,6 +106,25 @@ default.
 | Hot counters, many writers | `:public` + `:write_concurrency` |
 | One writer + many readers | `:protected` + `:read_concurrency` |
 | Secret per-process state | `:private` |
+
+---
+
+## Design decisions
+
+**Option A — One table, parameterized mode at creation**
+- Pros: Mode is a fact about the table; clients don't need to know it.
+- Cons: Testing needs a clean process-ownership split to observe
+  `:protected`/`:private` semantics.
+
+**Option B — Spawned owner process per test** (chosen)
+- Pros: The owner and the client are genuinely different processes, which
+  is the only way to see `:private` fail and `:protected` accept reads.
+- Cons: A tiny ad-hoc `loop/1` owner replaces what a real app would do with
+  a GenServer.
+
+→ Chose **B** because the **observable difference** between access modes
+requires a real process boundary. A GenServer would be correct in production
+but noisy for a teaching example.
 
 ---
 
@@ -292,6 +322,41 @@ end
 mix test
 ```
 
+### Why this works
+
+ETS access enforcement is implemented at the VM level: `:ets.insert/2` from
+a non-owner against a `:protected` or `:private` table raises `:badarg` before
+any data is touched. Tests exercise this by spawning an owner in one process
+and attempting reads/writes from the test process — each mode's rule falls
+out as a predictable `ArgumentError` pattern or a successful call.
+
+---
+
+## Benchmark
+
+```elixir
+# Effect of :read_concurrency on parallel read throughput.
+for flag <- [false, true] do
+  t = :ets.new(:b, [:set, :public, read_concurrency: flag])
+  for i <- 1..10_000, do: :ets.insert(t, {i, i})
+
+  {us, _} = :timer.tc(fn ->
+    Task.async_stream(1..1_000, fn _ ->
+      for k <- 1..100, do: :ets.lookup(t, k)
+    end, max_concurrency: System.schedulers_online())
+    |> Stream.run()
+  end)
+
+  IO.puts("read_concurrency=#{flag}: #{us}µs")
+  :ets.delete(t)
+end
+```
+
+Target esperado: en máquinas de 8+ cores, `read_concurrency: true` reduce
+el tiempo total en 20–50% bajo alta concurrencia de lectura. Con bajo
+paralelismo (<4 lectores), la diferencia puede ser negativa por el costo
+extra de escritura.
+
 ---
 
 ## Trade-offs and production gotchas
@@ -332,6 +397,18 @@ table with rare reads, leaving it off is fine.
 For a table with a dozen entries and no concurrency, default options
 (`:set`, `:protected`, no flags) are fine. These options become relevant
 at scale (thousands of ops/sec, many cores, hot keys).
+
+---
+
+## Reflection
+
+- You inherit a codebase where every ETS table is `:public` "just in case".
+  Pick one table (session store) and justify tightening it to `:protected`.
+  What in the existing code needs to change?
+- A GenServer holds 500MB of state across millions of tuples and spends
+  most of its time in GC. You're considering moving the state into a
+  `:private` ETS table the GenServer owns. What do you benchmark before
+  committing, and what could go worse?
 
 ---
 

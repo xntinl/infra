@@ -46,6 +46,22 @@ apigw/
 
 ---
 
+## Why circuit breakers per upstream and not per-request timeouts only
+
+timeouts alone let a degraded upstream exhaust gateway resources indefinitely. A breaker trips on error rate and fails fast, giving the upstream time to recover instead of piling on retries.
+
+## Design decisions
+
+**Option A — per-request process spawn for upstream calls**
+- Pros: isolated failures, trivial cancellation
+- Cons: process-creation overhead dominates under high RPS
+
+**Option B — pooled upstream connections + async Task supervision** (chosen)
+- Pros: connection reuse, bounded resource usage
+- Cons: more complex failure-isolation model
+
+→ Chose **B** because a gateway fronts millions of requests/day; connection reuse is non-negotiable for upstream health.
+
 ## The business problem
 
 A misconfigured client is retrying a failing request 1000 times per second against the payments service. Other clients are degraded. The platform team needs a gateway that isolates this impact without touching any backend: rate limit the offending API key, open the circuit breaker when the payments service error rate spikes, and cache the responses that were healthy before the spike.
@@ -497,6 +513,9 @@ defmodule Apigw.CircuitBreakerTest do
     :ok
   end
 
+
+  describe "CircuitBreaker" do
+
   test "starts closed and allows requests" do
     assert CircuitBreaker.check("test-backend") == :allow
   end
@@ -516,6 +535,9 @@ defmodule Apigw.CircuitBreakerTest do
     Process.sleep(10)
 
     assert CircuitBreaker.check("test-backend") == :allow
+  end
+
+
   end
 end
 ```
@@ -538,6 +560,9 @@ defmodule Apigw.AuthTest do
     "#{signing_input}.#{sig}"
   end
 
+
+  describe "Auth" do
+
   test "valid HS256 token with future expiry verifies" do
     token = make_token(%{"sub" => "user_1", "exp" => System.system_time(:second) + 3600}, @secret)
     assert {:ok, claims} = JWT.verify(token, @secret)
@@ -559,6 +584,9 @@ defmodule Apigw.AuthTest do
   test "malformed token returns error" do
     assert {:error, :malformed_token} = JWT.verify("not.a.jwt.token.at.all", @secret)
   end
+
+
+  end
 end
 ```
 
@@ -569,6 +597,24 @@ mix test test/apigw/ --trace
 ```
 
 ---
+
+### Why this works
+
+The design separates concerns along their real axes: what must be correct (the API gateway invariants), what must be fast (the hot path isolated from slow paths), and what must be evolvable (external contracts kept narrow). Each module has one job and fails loudly when given inputs outside its contract, so bugs surface near their source instead of as mysterious downstream symptoms. The tests exercise the invariants directly rather than implementation details, which keeps them useful across refactors.
+
+## Benchmark
+
+```elixir
+# Minimal timing harness — replace with Benchee for production measurement.
+{time_us, _result} = :timer.tc(fn ->
+  # exercise the hot path N times
+  for _ <- 1..10_000, do: :ok
+end)
+
+IO.puts("average: #{time_us / 10_000} µs per op")
+```
+
+Target: <500µs gateway overhead per request at p99 excluding upstream latency.
 
 ## Trade-off analysis
 
@@ -603,6 +649,10 @@ If two routes `/users?sort=name` and `/users?sort=email` map to the same cache k
 When a backend dies mid-request, the connection count for that backend is never decremented if decrement happens in the response handler. Use `try/after` to guarantee decrement regardless of proxy outcome.
 
 ---
+
+## Reflection
+
+Your gateway sits between 200 microservices. How do you prevent a single misbehaving upstream from consuming all gateway goroutines/processes, and how does that policy interact with fairness across tenants?
 
 ## Resources
 

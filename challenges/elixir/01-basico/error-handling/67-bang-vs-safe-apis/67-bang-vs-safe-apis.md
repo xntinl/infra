@@ -1,8 +1,6 @@
 # Bang (!) vs Safe APIs
 
-**Difficulty**: ★☆☆☆☆
-**Time**: 1–1.5 hours
-**Project**: `config_loader` — a config loader exposing both `load/1` and `load!/1`
+**Project**: `config_loader` — a config loader exposing both `load/1` and `load!/1`.
 
 ---
 
@@ -55,6 +53,38 @@ version pattern-matches and unwraps.
 
 If the bang version always succeeds (no failure mode), do not add it — it is noise.
 If the safe version always succeeds, the `{:ok, _}` wrapping is noise — return the value.
+
+---
+
+## Why mirror and not choose one
+
+**Option A — expose only the safe API; callers who want to crash wrap in `case`+`raise`**
+- Pros: single API surface; no risk of confusion about which to call.
+- Cons: every call site that "knows" the call must succeed grows a 5-line `case` that reports bad stack traces and no structured context.
+
+**Option B — expose only the bang API; callers who want tuples wrap in `try/rescue`**
+- Pros: ergonomic at confident call sites.
+- Cons: `try/rescue` allocates; every caller that wants branching pays 10×; code becomes exception-driven.
+
+**Option C — expose both; bang delegates to safe** (chosen)
+- Pros: each call site opts in; bang is a one-line delegate so there is no duplication; matches stdlib patterns (`File.read` / `File.read!`).
+- Cons: API size doubles.
+
+→ Chose **C** because call sites genuinely differ. The cost of mirror pairs is negligible (one-line delegate); the cost of forcing every caller to adapt is borne forever.
+
+---
+
+## Design decisions
+
+**Option A — safe returns `value | nil`, bang raises on `nil`**
+- Pros: concise; no tuple boxing.
+- Cons: `nil` is ambiguous — a config key whose value is `nil` is indistinguishable from "missing"; callers cannot differentiate.
+
+**Option B — safe returns `{:ok, value} | {:error, reason}`, bang unwraps or raises** (chosen)
+- Pros: disambiguates "found `nil`" from "not found"; `reason` carries structured context; `with` composition is direct.
+- Cons: more verbose at the call site; the `{:ok, _}` wrapping is redundant in the common success case.
+
+→ Chose **B** because config loaders serve as the source of truth for other components. Ambiguity about "missing vs. nil" causes production bugs that are hard to trace back.
 
 ---
 
@@ -216,6 +246,28 @@ end
 mix test
 ```
 
+### Why this works
+
+`load!/1` delegates to `load/1` and raises on `{:error, reason}`. There is one implementation of "what a valid config looks like" and one implementation of "what errors can occur". The bang variant exists purely to pick the error-handling *strategy* (crash vs. branch). Because bang reuses safe, the two APIs cannot drift — a new rule added to `load/1` is automatically enforced by `load!/1`. The cost of mirroring is one line per function; the payoff is that every caller can pick the ergonomics it needs without sacrificing consistency.
+
+---
+
+## Benchmark
+
+Compare the two paths on the happy case to confirm the mirror pattern has no measurable cost:
+
+```elixir
+good_path = "test/fixtures/valid.exs"
+
+{us_safe, _} = :timer.tc(fn -> for _ <- 1..10_000, do: ConfigLoader.load(good_path) end)
+{us_bang, _} = :timer.tc(fn -> for _ <- 1..10_000, do: ConfigLoader.load!(good_path) end)
+
+IO.puts("safe: #{us_safe / 10_000} µs")
+IO.puts("bang: #{us_bang / 10_000} µs")
+```
+
+Target esperado: safe and bang within noise (<5% difference) on the happy path — bang is just an `{:ok, v} -> v` unwrap. On the failing path, bang pays 10–20× the cost because it raises, so reserve it for call sites where failure is a bug.
+
 ---
 
 ## Trade-offs
@@ -262,6 +314,13 @@ If `load/1` returns `{:error, :enoent}`, `load!/1` should raise an exception who
 - **No failure mode** — if the function cannot fail, no bang needed.
 - **Internal helpers** — pick one style. Consistency inside a module matters more than completeness.
 - **Expected failure in hot paths** — raise is slow (stack trace capture). Stick with tagged tuples where performance matters.
+
+---
+
+## Reflection
+
+- Your library exposes `load/1` and `load!/1`. A year later, you add a `load/2` that takes defaults. Do you also add `load!/2`? What rule do you follow so the mirror never drifts, and how do you enforce it in CI?
+- A caller writes `config = ConfigLoader.load!(path) || default`. This compiles but never triggers the default (bang raises, never returns `nil`). How would you surface this misuse — credo rule, dialyzer spec, or a `load_with_default/2`? Which is the least intrusive?
 
 ---
 

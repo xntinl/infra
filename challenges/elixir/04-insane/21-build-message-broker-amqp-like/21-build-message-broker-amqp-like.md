@@ -59,6 +59,18 @@ The hard part is the binary protocol. AMQP frames have a specific binary layout;
 
 ---
 
+## Design decisions
+
+**Option A — Pull-based consumers (consumer polls broker)**
+- Pros: broker doesn't track slow consumers; backpressure is natural.
+- Cons: higher latency; wastes polls when queues are empty.
+
+**Option B — Push-based delivery with per-consumer prefetch window** (chosen)
+- Pros: sub-millisecond delivery latency; prefetch bounds broker memory per consumer; matches AMQP semantics.
+- Cons: broker must track consumer liveness and reassign unacked messages on disconnect.
+
+→ Chose **B** because AMQP's push model with prefetch is the shape that matches Elixir's process mailbox naturally — the prefetch window is exactly the backpressure mechanism we need.
+
 ## Implementation milestones
 
 ### Step 1: Create the project
@@ -466,6 +478,21 @@ Benchee.run(
 )
 ```
 
+### Why this works
+
+The broker tracks each consumer's unacked set in ETS and only pushes up to `prefetch` messages at a time. When a consumer disconnects, unacked messages are requeued to the next eligible consumer, preserving at-least-once delivery.
+
+---
+
+## Benchmark
+
+```elixir
+# bench/broker_bench.exs
+Benchee.run(%{"publish_consume" => fn -> Broker.publish(q, msg); Broker.consume(q) end}, time: 10)
+```
+
+Target: 50,000 messages/second routed end-to-end with 10 consumers and prefetch=100.
+
 ---
 
 ## Trade-off analysis
@@ -496,6 +523,11 @@ In AMQP, `"orders.#"` must match `"orders"` (zero additional segments) as well a
 
 **4. Publisher confirms sent before DETS fsync**
 A `basic.ack` to the producer means "this message will survive a broker crash." Sending the ack before writing to DETS violates this guarantee.
+
+## Reflection
+
+- If a consumer acks messages out of order, do you have any safety issue? What invariant does AMQP rely on?
+- When would you pick NATS/JetStream over an AMQP-style broker? Name the workload difference.
 
 ---
 

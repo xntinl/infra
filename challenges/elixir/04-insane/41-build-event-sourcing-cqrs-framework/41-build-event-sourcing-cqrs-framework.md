@@ -40,6 +40,22 @@ eventsource/
 
 ---
 
+## Why append-only log as the source of truth and not mutable state snapshot as the source of truth
+
+the log is the only representation that can answer "what was the state at time T?" without historical snapshots. A mutable snapshot loses history the moment it's updated.
+
+## Design decisions
+
+**Option A — single write model that is also the read model**
+- Pros: simpler, no eventual consistency
+- Cons: can't optimize reads independently, complex queries are slow
+
+**Option B — append-only event log + projections into read-optimized views** (chosen)
+- Pros: unbounded query shapes via independent projections, full audit trail
+- Cons: eventual consistency window to manage
+
+→ Chose **B** because event-sourcing's value only materializes when projections are physically separate and independently rebuildable.
+
 ## The business problem
 
 The accounting team needs a complete audit trail — every state change must be attributable to a specific command from a specific user at a specific time. Traditional CRUD databases overwrite state. Event sourcing never overwrites: every change is an appended event. The current state is derived by replaying events, and any past state is available by replaying up to a given sequence number.
@@ -391,6 +407,9 @@ defmodule Eventsource.Store.EventStoreTest do
     :ok
   end
 
+
+  describe "EventStore" do
+
   test "appends to a new stream starting at version -1" do
     events = [%{type: :created, payload: %{name: "Alice"}}]
     assert {:ok, 0} = EventStore.append("users-1", events, -1)
@@ -419,6 +438,9 @@ defmodule Eventsource.Store.EventStoreTest do
     events = EventStore.read_stream("users-4", 1)
     assert length(events) == 1
     assert hd(events).seq == 1
+  end
+
+
   end
 end
 ```
@@ -451,6 +473,9 @@ defmodule Eventsource.AggregateTest do
     end
   end
 
+
+  describe "Aggregate" do
+
   test "command produces events that update state" do
     {:ok, events} = Counter.handle(%{count: 5, id: "c1"}, %{type: :increment, by: 3})
     assert [%{type: :incremented, payload: %{by: 3}}] = events
@@ -466,6 +491,9 @@ defmodule Eventsource.AggregateTest do
     {:ok, state, _version} = Eventsource.CommandHandler.load_aggregate(Counter, "counter-1")
     assert state.count == 8
   end
+
+
+  end
 end
 ```
 
@@ -476,6 +504,24 @@ mix test test/eventsource/ --trace
 ```
 
 ---
+
+### Why this works
+
+The design separates concerns along their real axes: what must be correct (the event sourcing + CQRS invariants), what must be fast (the hot path isolated from slow paths), and what must be evolvable (external contracts kept narrow). Each module has one job and fails loudly when given inputs outside its contract, so bugs surface near their source instead of as mysterious downstream symptoms. The tests exercise the invariants directly rather than implementation details, which keeps them useful across refactors.
+
+## Benchmark
+
+```elixir
+# Minimal timing harness — replace with Benchee for production measurement.
+{time_us, _result} = :timer.tc(fn ->
+  # exercise the hot path N times
+  for _ <- 1..10_000, do: :ok
+end)
+
+IO.puts("average: #{time_us / 10_000} µs per op")
+```
+
+Target: <50µs per event append and >100k events/s projection throughput.
 
 ## Trade-off analysis
 
@@ -510,6 +556,10 @@ An aggregate with 100k events replays 100k events on every command. If commands 
 The upcaster transforms events from old schema to current schema. It must run on raw events from the store, before they are passed to the aggregate. If the aggregate's `apply/2` receives raw v1 events when it only knows v2, it silently ignores unknown fields, producing wrong state.
 
 ---
+
+## Reflection
+
+If a projection gets corrupted and must be rebuilt from 100M events, how long does your system take, and what does your read endpoint return during the rebuild? Design the degraded-mode contract.
 
 ## Resources
 

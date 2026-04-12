@@ -2,14 +2,11 @@
 
 **Project**: `jsonable_deep` — a `Jsonable` protocol with a `@fallback_to_any true` default, a reflective `Any` impl for structs, and `@derive Jsonable` for opt-in auto-encoding.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
-
 ---
 
 ## Project context
 
-The basic `Jsonable` from exercise 08 works for primitives and collections but
+A basic `Jsonable` protocol works for primitives and collections but
 fails loudly on any struct — because protocols dispatch on the concrete type,
 and a struct is its own type. In a real app you have hundreds of structs:
 writing `defimpl Jsonable, for: MyStruct` for every one is tedious.
@@ -79,6 +76,30 @@ encoding for any struct without a hand-written impl.
 `@fallback_to_any` is convenient but encodes everything, including fields you
 meant to keep private. `@derive {Jsonable, only: [...]}` is the production
 choice: explicit, auditable, and easy to review.
+
+---
+
+## Why combine `@fallback_to_any` with `@derive`
+
+**`@fallback_to_any` only.** Every struct encodes — including sensitive fields you forgot to exclude. Password/token leaks are a matter of time.
+
+**`@derive` only (no fallback).** Every struct needs an explicit `@derive Jsonable` line. Forgetting one surfaces as `Protocol.UndefinedError` at runtime, not at compile time.
+
+**Both (chosen).** `@derive {Jsonable, only: [...]}` for structs where you want explicit, field-selective encoding; reflective fallback for quick-and-dirty audit types (logs, introspection tools) where every field is OK to emit. The fallback raises on types that should never serialize (PIDs, refs, funs).
+
+---
+
+## Design decisions
+
+**Option A — Hand-write `defimpl Jsonable, for: MyStruct` on every struct**
+- Pros: Zero macros, fully auditable per struct.
+- Cons: N files to maintain; adding a field means editing two places; tempting to cut corners.
+
+**Option B — `@fallback_to_any` + `__deriving__/3` with `:only` / `:except`** (chosen)
+- Pros: `@derive {Jsonable, only: [:id, :name]}` is one line on each struct and enforces a whitelist; compile-time deriver means no runtime reflection on hot paths; the `Any` fallback catches audit-style structs without ceremony but refuses unserializable types.
+- Cons: Two escape hatches coexist — easy to pick the wrong one for sensitive data; `@derive` must be placed before `defstruct`.
+
+→ Chose **B** because it matches how production libraries (Jason, Ecto) ship derivation: explicit, field-selective, compile-time-generated.
 
 ---
 
@@ -296,6 +317,29 @@ end
 mix test
 ```
 
+### Why this works
+
+`defmacro __deriving__/3` runs at compile time when a struct adds `@derive Jsonable`, generating a dedicated `defimpl` with exactly the fields you asked for. At call time, dispatch finds the derived impl directly — no reflection, no cost. Structs without `@derive` fall through to `Any.to_json/1`, which converts via `Map.from_struct/1` and recurses; unserializable values (PIDs, refs, funs) hit the second `Any.to_json/1` clause and raise `Protocol.UndefinedError` instead of producing garbage.
+
+---
+
+## Benchmark
+
+```elixir
+user = %SampleStructs.User{id: 1, name: "Jane", password: "secret"}
+row = %SampleStructs.AuditRow{table: "users", changes: %{name: "new"}}
+
+{derived_time, _} =
+  :timer.tc(fn -> Enum.each(1..100_000, fn _ -> Jsonable.to_json(user) end) end)
+
+{fallback_time, _} =
+  :timer.tc(fn -> Enum.each(1..100_000, fn _ -> Jsonable.to_json(row) end) end)
+
+IO.puts("derived=#{derived_time / 100_000} µs  fallback=#{fallback_time / 100_000} µs")
+```
+
+Target esperado: el impl derivado debería ser ~2–5x más rápido que el fallback reflectivo (evita `Map.from_struct/1` + recursión sobre el map). Diferencias mayores suelen indicar que el protocolo no se consolidó.
+
 ---
 
 ## Trade-offs and production gotchas
@@ -325,6 +369,13 @@ Libraries should almost never enable it. A missing impl is a contract signal
 to the user — "this type is unsupported, please implement". Fallback makes
 the error silent. Use it only in app-internal protocols where you control
 both sides.
+
+---
+
+## Reflection
+
+- You roll this out across a service with 200 structs. Half are already `@derive`d, half rely on the `Any` fallback. A security review requires "no PII in logs". How do you use `@fallback_to_any` vs `@derive` to enforce that, and which would you revoke at the protocol level?
+- `@derive {Jsonable, only: [...]}` is a whitelist. Would you prefer `:except` (blacklist) for audit structs, or does whitelist-by-default belong on *every* struct? Argue one position.
 
 ---
 

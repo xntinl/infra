@@ -4,9 +4,6 @@
 `start_supervised!/1` instead of ad-hoc `GenServer.start_link/3`, ensuring
 automatic cleanup between tests.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
-
 ---
 
 ## Project context
@@ -22,6 +19,21 @@ If you're writing tests against GenServers, Agents, Tasks, or
 `DynamicSupervisor`-style code, `start_supervised!/1` should be your
 default. The only reason to use raw `start_link` is when you're explicitly
 testing the startup/crash behavior.
+
+## Why `start_supervised!/1` and not X
+
+**Why not `start_link/1` + `on_exit(fn -> stop end)`?** It's two code paths
+that must stay in sync — one to start, one to clean up. Forget either and
+tests leak or fail cryptically. `start_supervised!` is one line with correct
+teardown baked in.
+
+**Why not `Application.start/1` or a real Application supervisor?** Because
+those are process-global and shared across tests. You'd lose `async: true`
+and test isolation together.
+
+**Why the bang version?** Because failure at setup should abort the test
+with a clear reason. `start_supervised/1` (no bang) returns `{:error, _}`,
+which means silent tests when setup fails.
 
 Project structure:
 
@@ -75,6 +87,23 @@ will collide, because the name is global. Either:
 - Use `async: false`.
 - Pass per-test unique names.
 - Use `:via` registries keyed by the test pid.
+
+---
+
+## Design decisions
+
+**Option A — `start_supervised!/1` (no link)** (chosen default)
+- Pros: Child crash doesn't take out the test, so unrelated assertions
+  can still execute and report cleanly.
+- Cons: A silent crash can hide a bug unless you also monitor the pid.
+
+**Option B — `start_link_supervised!/1`**
+- Pros: Crashes propagate to the test process; no silent failures.
+- Cons: One buggy child fails every other assertion in the test.
+
+→ Chose **A as the default**. Pair with `Process.monitor/1` +
+`assert_receive {:DOWN, ...}` when crash detection is the test's point.
+Reach for **B** only when an unexpected crash should end the test.
 
 ---
 
@@ -197,6 +226,22 @@ mix test
 mix test --trace
 ```
 
+### Why this works
+
+ExUnit spins up a dedicated supervisor per test. Every child started via
+`start_supervised[!]` lives under it, and when the test finishes (pass or
+fail) ExUnit shuts the supervisor down — terminating all children in
+reverse start order, synchronously. That removes the entire class of "I
+forgot `on_exit`" leaks and ensures determinism between tests in an
+`async: true` suite.
+
+---
+
+## Benchmark
+
+<!-- benchmark N/A: tema de estructura de tests; la única medición
+pertinente es "tiempo de teardown por test" y suele ser sub-ms. -->
+
 ---
 
 ## Trade-offs and production gotchas
@@ -225,6 +270,17 @@ B — otherwise B crashes during teardown, logging noise.
 When you're explicitly testing start/crash semantics ("does the supervisor
 restart this child after an exit?"). There, you want raw `start_link`
 or a test-local supervisor you fully control.
+
+---
+
+## Reflection
+
+- You're testing a GenServer that registers itself as `{:global, :foo}` on
+  start. How do you make this compatible with `async: true` tests, and
+  what happens if you don't?
+- Given two interdependent children (A uses B's pid at init), explain in
+  what order you start them with `start_supervised!`, and what goes wrong
+  at **teardown** if you get it wrong.
 
 ---
 

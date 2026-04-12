@@ -3,9 +3,6 @@
 **Project**: `my_mix_task` — a hand-rolled `mix hello` task plus a real one
 that parses arguments with `OptionParser`.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
-
 ---
 
 ## Project context
@@ -102,6 +99,35 @@ Mix.Task.run("compile")     # compile if needed
 
 Mix memoizes this — re-running a task within the same invocation is a
 no-op, which is what you want for most dependencies.
+
+---
+
+## Why Mix tasks and not `scripts/*.exs`
+
+A plain `mix run scripts/seed.exs` works but loses four things a Mix
+task gives you for free: argument parsing (`OptionParser`), `mix help`
+integration, composability (`Mix.Task.run("app.start")`), and test
+harnesses (`Mix.Shell.Process`). Tasks also live where teammates expect
+to find them — `mix <tab>` lists them all. Scripts become trivia after
+the author leaves.
+
+---
+
+## Design decisions
+
+**Option A — Put all logic inside the task module (`Mix.Tasks.*`)**
+- Pros: Single file per task; no extra plumbing.
+- Cons: Task modules are awkward to unit-test (they call `Mix.shell()`,
+  side effects everywhere); logic is coupled to the CLI surface.
+
+**Option B — Thin task module delegating to a library module** (chosen)
+- Pros: The library (`MyMixTask`) is pure and unit-testable; the task
+  module is tiny and tests only the CLI wiring via `Mix.Shell.Process`.
+- Cons: Two modules instead of one; slight indirection.
+
+→ Chose **B** because tasks with non-trivial logic inevitably get
+  imported into other contexts (another task, a release command, a
+  LiveBook). Keeping the behavior in a plain library makes that free.
 
 ---
 
@@ -304,6 +330,25 @@ mix help my_mix_task.greet
 
 The last command prints your `@moduledoc` — free documentation.
 
+### Why this works
+
+Mix discovers tasks purely by module-name convention (`Mix.Tasks.*`),
+so the file layout under `lib/mix/tasks/` is the whole registration
+protocol. `OptionParser.parse!/2` with `strict:` gives fail-fast
+argument parsing — unknown flags raise instead of silently dropping.
+`Mix.shell().info/1` routes output through a swappable abstraction,
+which is why the test can substitute `Mix.Shell.Process` and assert on
+received messages instead of scraping stdout.
+
+---
+
+## Benchmark
+
+<!-- benchmark N/A: Mix task startup is dominated by VM and dep
+     compilation; task body throughput depends on what the task does.
+     For CLI ergonomics, the target is sub-second startup, which is
+     achievable with `--no-compile` when running from a warm project. -->
+
 ---
 
 ## Trade-offs and production gotchas
@@ -345,6 +390,20 @@ which you own — don't ship `mix build` in a published Hex package).
   `release.ex` module and call it via `bin/my_app eval`.
 - Logic shared across apps in an umbrella — put it in a library and call
   the library from each app's task.
+
+---
+
+## Reflection
+
+- You ship a Mix task `mix my_app.import_users FILE`. It works in dev
+  but fails in production because the release doesn't include Mix.
+  Walk through the refactor to move the logic behind a release command
+  invoked via `bin/my_app eval "MyApp.Release.import_users('...')"`.
+  What stays in the task module, what moves, and why?
+- A new task needs to read the project's Ecto `Repo` and update records.
+  Do you call `Mix.Task.run("app.start")` or `Mix.Task.run("ecto.create")`?
+  What are the failure modes of each, and how do you test a task that
+  depends on the app being started?
 
 ---
 

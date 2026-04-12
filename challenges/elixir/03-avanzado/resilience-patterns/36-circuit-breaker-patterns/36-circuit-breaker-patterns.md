@@ -2,9 +2,6 @@
 
 **Project**: `circuit_breaker_patterns` — a hand-rolled circuit breaker with closed / open / half-open states, telemetry, and production-grade failure classification.
 
-**Difficulty**: ★★★★☆
-**Estimated time**: 4–6 hours
-
 ---
 
 ## Project context
@@ -15,7 +12,7 @@ degrades: responses go from 50ms to 30 seconds before timing out, saturating the
 connection pool and bringing down the whole payment pipeline. The post-mortems
 always end the same way — "we need a circuit breaker".
 
-You could pull in `:fuse` (see exercise 188) and be done. But before you hide the
+You could pull in `:fuse` and be done. But before you hide the
 problem behind a library you want to own the state machine end-to-end: understand
 why half-open exists, how to calibrate the failure window, what to count as a
 "failure", and how to expose telemetry so SRE can dashboard it. This exercise
@@ -43,6 +40,16 @@ circuit_breaker_patterns/
 ```
 
 ---
+
+## Why this approach and not alternatives
+
+Alternatives considered and discarded:
+
+- **Hand-rolled equivalent**: reinvents primitives the BEAM/ecosystem already provides; high risk of subtle bugs around concurrency, timeouts, or failure propagation.
+- **External service (e.g. Redis, sidecar)**: adds a network hop and an extra failure domain for a problem the VM can solve in-process with lower latency.
+- **Heavier framework abstraction**: couples the module to a framework lifecycle and makes local reasoning/testing harder.
+
+The chosen approach stays inside the BEAM, uses idiomatic OTP primitives, and keeps the contract small.
 
 ## Core concepts
 
@@ -128,6 +135,18 @@ behind a GenServer mailbox would make the breaker itself a bottleneck —
 the opposite of what we want.
 
 ---
+
+## Design decisions
+
+**Option A — naive/simple approach**
+- Pros: minimal code, easy to reason about.
+- Cons: breaks under load, lacks observability, hard to evolve.
+
+**Option B — the approach used here** (chosen)
+- Pros: production-grade, handles edge cases, testable boundaries.
+- Cons: more moving parts, requires understanding of the BEAM primitives involved.
+
+→ Chose **B** because correctness under concurrency and failure modes outweighs the extra surface area.
 
 ## Implementation
 
@@ -505,6 +524,11 @@ end
 
 ---
 
+
+### Why this works
+
+The design leans on BEAM guarantees (process isolation, mailbox ordering, supervisor restarts) and pushes invariants to the boundaries of each module. State transitions are explicit, failure modes are declared rather than implicit, and each step is independently testable. That combination keeps the implementation correct under concurrent load and cheap to change later.
+
 ## Trade-offs and production gotchas
 
 **1. Generation counter against stale timer fires.** Timers scheduled during one
@@ -569,6 +593,11 @@ short-circuit mode ~ 1 µs (ETS lookup + telemetry dispatch). In production this
 is pure win vs 30-second upstream timeouts.
 
 ---
+
+## Reflection
+
+- If the expected load grew by 100×, which assumption in this design would break first — the data structure, the process model, or the failure handling? Justify.
+- What would you measure in production to decide whether this implementation is still the right one six months from now?
 
 ## Resources
 

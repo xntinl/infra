@@ -51,6 +51,20 @@ user_schema/
 
 ---
 
+## Design decisions
+
+**Option A — use Ecto schemas and changesets**
+- Pros: mature API with built-in validators, casts, and error accumulation; integrates with DB if one appears later; everyone on an Elixir team recognizes it.
+- Cons: pulls in Ecto as a dependency even when no DB is needed; couples your domain types to an ORM's conventions; conceptually heavy for a plain domain entity.
+
+**Option B — `defstruct` + `@enforce_keys` + hand-rolled `new/1` that returns `{:ok, struct} | {:error, errors}`** (chosen)
+- Pros: zero dependencies; the validation code is small enough to audit line-by-line; you understand exactly what happens; mirrors the Ecto.Changeset mental model so migration to Ecto later is straightforward.
+- Cons: you write and maintain the validator list; no DB, no casts, no uniqueness constraints — they'd have to be built from scratch if needed.
+
+Chose **B** because this is a domain core (no DB concern yet) and owning the validation layer keeps the dependency graph small. When persistence arrives, the `new/1` pattern maps cleanly to an Ecto changeset without re-thinking the model.
+
+---
+
 ## Implementation
 
 ### `lib/user_schema.ex`
@@ -515,6 +529,34 @@ end
 mix test --trace
 ```
 
+### Why this works
+
+`@enforce_keys` prevents constructing a struct that is missing a required field at its literal site, but it stops there — it doesn't validate types, formats, or cross-field invariants. The `new/1` constructor closes that gap: it takes a keyword list or map, runs each field through a validator, accumulates errors into a list, and only builds the struct when the error list is empty. The tagged-tuple return (`{:ok, user} | {:error, errors}`) makes every call site decide explicitly how to handle invalid input — no exceptions cross the API boundary. `update/2` reuses the same validation pipeline so you never have a code path that builds an invalid struct.
+
+---
+
+## Benchmark
+
+```elixir
+# bench.exs
+defmodule Bench do
+  def run do
+    params = %{email: "a@b.com", name: "Ana", age: 30, role: :user}
+
+    {new_us, _} =
+      :timer.tc(fn ->
+        Enum.each(1..100_000, fn _ -> UserSchema.new(params) end)
+      end)
+
+    IO.puts("new/1 x100k: #{new_us} µs (#{new_us / 100_000} µs/call)")
+  end
+end
+
+Bench.run()
+```
+
+Target: under 10 µs per `new/1` call for a ~5 field struct with simple validators. The cost scales linearly with validator count; if you add regex or expensive checks, profile them individually.
+
 ---
 
 ## Structs vs maps vs Ecto schemas
@@ -559,6 +601,13 @@ will not match. This is intentional — structs provide type-safe dispatching.
 `struct(MyStruct, fields)` does NOT enforce `@enforce_keys` — it silently defaults
 missing keys to `nil`. Use `struct!(MyStruct, fields)` to get the enforcement, or
 validate in your constructor before creating.
+
+---
+
+## Reflection
+
+1. Your `new/1` accumulates errors into a list. A UX designer asks for field-level errors tied to form inputs (so the UI can highlight the right field). What is the minimum change to the error shape that preserves the accumulator semantics? Would you still return a flat list or switch to a keyword list / map?
+2. You now need persistence in Postgres. Do you rewrite `UserSchema` as an `Ecto.Schema`, keep `UserSchema` and add a separate `UserSchema.Repo` layer that casts to/from Ecto, or introduce a new `User.Record` module alongside? What does each option cost in terms of module count and validation duplication?
 
 ---
 

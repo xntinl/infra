@@ -56,6 +56,18 @@ A single-node rate limiter is trivial: maintain a counter in ETS, check it on ev
 
 ---
 
+## Design decisions
+
+**Option A — Redis-backed rate limiter (`INCR` + TTL)**
+- Pros: trivially distributed; battle-tested.
+- Cons: every check is a network round trip; Redis becomes a dependency and a bottleneck.
+
+**Option B — Local token bucket in ETS with periodic gossip-based reconciliation** (chosen)
+- Pros: per-check cost is < 5 µs; survives Redis outage; accuracy is tunable via reconciliation period.
+- Cons: allows brief over-limit bursts during reconciliation gaps.
+
+→ Chose **B** because at our scale target (tens of µs per check), a network hop is an order of magnitude too slow; local buckets with bounded error are the right trade.
+
 ## Implementation milestones
 
 ### Step 1: Create the project
@@ -401,6 +413,21 @@ Benchee.run(
 
 Target: 500k checks/second on a 3-node cluster with P99 < 1ms.
 
+### Why this works
+
+Each node maintains its own bucket in ETS and gossips consumption deltas periodically. Refill is lazy (computed on read from last-refill-time), so no timer is needed, and the bucket state is a single atomic ETS update.
+
+---
+
+## Benchmark
+
+```elixir
+# bench/rl_bench.exs
+Benchee.run(%{"check" => fn -> RateLimiter.check(user_id()) end}, time: 10)
+```
+
+Target: < 5 µs per check on a single node; accuracy within ±5% under 1k nodes gossiping at 1 Hz.
+
 ---
 
 ## Trade-off analysis
@@ -429,6 +456,11 @@ Ensure the read quorum is strictly `floor(R/2) + 1` and that writes and reads sh
 
 **4. Sliding window growing unboundedly**
 Always filter expired timestamps before inserting a new one.
+
+## Reflection
+
+- If your system has 100k active users at any moment, would you keep ETS for the buckets, or move to Redis for central accuracy? Justify the tradeoff.
+- Under a coordinated attack from 10k clients, would gossip reconciliation still bound the error? Walk through the failure mode.
 
 ---
 

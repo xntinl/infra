@@ -4,9 +4,6 @@
 match spec to answer "give me every event between timestamps A and B" in
 O(log N + K) time.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
-
 ---
 
 ## Project context
@@ -21,6 +18,20 @@ of the tree — the same shape of operation a SQL B-tree index does for a
 Match specs look alien the first time; this exercise keeps them simple and
 focuses on the two patterns that cover 80% of real usage: **range on the key**
 and **range plus a value filter**.
+
+## Why `:ordered_set` + match spec and not X
+
+**Why not `:set` + `Enum.filter`?** A `:set` cannot walk keys in order; any
+range query becomes a full table scan regardless of how small the window is.
+For a 1M-row event log with a 100-event window, that's 10 000× more work.
+
+**Why not a SQL store for "events between A and B"?** For in-memory, short-lived,
+node-local event windows (rate limiters, tail buffers, debug traces), ETS is
+orders of magnitude faster and requires no schema or connection pool.
+
+**Why not an in-process ordered structure like `:gb_trees`?** Because multiple
+consumer processes need to read the same events without routing through one
+serializer. ETS gives you shared-memory + concurrent reads in one primitive.
 
 Project structure:
 
@@ -81,6 +92,23 @@ Match specs are notoriously hard to write by hand. `:ets.fun2ms/1` (exercise 98)
 compiles an Elixir/Erlang fun into the equivalent match spec at compile time —
 much nicer. But you should be able to read a raw match spec in logs and in
 OTP library internals, so this exercise writes them by hand deliberately.
+
+---
+
+## Design decisions
+
+**Option A — Hand-written match spec**
+- Pros: Explicit, no library dependency, forces understanding of the shape.
+- Cons: Easy to get wrong (double braces, prefix operators, `:"$N"` quoting).
+
+**Option B — `:ets.fun2ms/1` / `Ex2ms.fun`** (chosen in real code, but not here)
+- Pros: Write a normal Elixir fun, compiler generates the spec.
+- Cons: Hides the shape; when you have to debug a spec in prod logs you still
+  need to read raw match specs.
+
+→ Chose **A (hand-written) for this exercise** because reading raw match specs
+is a required skill — you'll encounter them in OTP library internals and in
+tracing (`:dbg`). `fun2ms` is introduced in a later exercise.
 
 ---
 
@@ -228,6 +256,42 @@ end
 mix test
 ```
 
+### Why this works
+
+`:ordered_set` stores keys in term order inside a balanced tree, so
+`:ets.select/2` can start at `from`, walk in order, and stop when the key
+exceeds `to`. The match spec's key-bound guards (`:>=` and `:"=<"` on
+`:"$1"`) are the signal the engine uses to decide it can prune — without
+them it would scan the whole table. Returning `{{:"$1", :"$2"}}` as the body
+preserves the original tuple shape so the caller sees familiar data.
+
+---
+
+## Benchmark
+
+```elixir
+# Compare a 1% window on :ordered_set vs :set full-scan filter.
+t_os = :ets.new(:os, [:ordered_set, :public])
+t_s  = :ets.new(:s,  [:set, :public])
+for i <- 1..100_000 do
+  :ets.insert(t_os, {i, :event})
+  :ets.insert(t_s,  {i, :event})
+end
+
+{us_os, _} = :timer.tc(fn ->
+  :ets.select(t_os, [{{:"$1", :"$2"}, [{:>=, :"$1", 50_000}, {:"=<", :"$1", 51_000}], [{{:"$1", :"$2"}}]}])
+end)
+{us_s, _} = :timer.tc(fn ->
+  :ets.select(t_s, [{{:"$1", :"$2"}, [{:>=, :"$1", 50_000}, {:"=<", :"$1", 51_000}], [{{:"$1", :"$2"}}]}])
+end)
+
+IO.puts("ordered_set: #{us_os}µs  set: #{us_s}µs")
+```
+
+Target esperado: sobre 100k filas con ventana del 1%, `:ordered_set` debería
+completar en <1ms mientras `:set` escanea la tabla completa (~5–20ms). La
+relación debería ser al menos 10× a favor de `:ordered_set`.
+
 ---
 
 ## Trade-offs and production gotchas
@@ -247,8 +311,8 @@ ranges, you may be better off with `:set` + a secondary index table.
 Match specs are a low-level DSL; they predate maps and structs. You cannot
 destructure a map with more than a handful of keys cleanly, and struct
 matching requires matching `:__struct__`. For anything elaborate, use
-`:ets.fun2ms/1` — it translates `fn {ts, v} when ts in from..to -> v end`
-into the same match spec you'd write by hand, with less pain.
+`:ets.fun2ms/1` — it translates a normal Elixir fun into the same match
+spec you'd write by hand, with less pain.
 
 **4. `:ordered_set` and `:write_concurrency`**
 `write_concurrency: true` is silently ignored on `:ordered_set`; the tree
@@ -265,6 +329,18 @@ when you don't know the result size — it streams chunks.
 If your "range" is always "the last N events", a bounded ring-buffer inside
 a GenServer is simpler and faster. ETS range queries shine when the window
 is arbitrary and ad-hoc.
+
+---
+
+## Reflection
+
+- Your service stores 10M audit events keyed by `{user_id, timestamp}` and
+  serves two query shapes: "everything for user U" and "everything in
+  window [A, B] across all users". Would a single `:ordered_set` handle
+  both efficiently? Design the alternative if not.
+- Under what circumstances would you shard a single `:ordered_set` into
+  multiple tables by time bucket (e.g. one per hour) to escape the write
+  serialization penalty? At what write rate does this pay off?
 
 ---
 

@@ -1,7 +1,5 @@
 # Behaviours as Module Contracts
 
-**Difficulty**: ★★☆☆☆
-**Time**: 1.5–2 hours
 **Project**: `kv_store` — a storage backend behaviour with two implementations (in-memory and file)
 
 ---
@@ -30,8 +28,31 @@ for dev, Redis for prod. The call site should not know or care which backend is 
 A **behaviour** defines the contract (which functions, what types). Each implementing
 module opts in with `@behaviour`. The caller picks the module at runtime.
 
-This is the module-level counterpart to protocols (exercise 61). Protocols dispatch on
-**values**; behaviours are chosen explicitly by **modules**.
+This is the module-level counterpart to protocol-based polymorphism. Protocols dispatch on
+**values**; behaviours are chosen explicitly by **modules** — the caller (often via config)
+picks which implementation to use.
+
+---
+
+## Why behaviours and not duck-typed function passing
+
+Passing a module around (`KvStore.get(MyBackend, key)`) works without any formal contract — but then the compiler never warns you when a backend is missing `put/3`, or when someone renames `get/2` to `fetch/2` in one impl and forgets the others. The first failure is a runtime `UndefinedFunctionError` after deployment.
+
+Behaviours encode the contract in `@callback` declarations. `@impl true` on each implementer makes the compiler check that every listed callback exists with the right arity. Protocols don't fit here because the value being passed (`key`) doesn't carry backend information — the caller must explicitly choose a backend, and that's the module-driven case.
+
+---
+
+## Design decisions
+
+**Option A — pass a module by name, no `@behaviour`**
+- Pros: simplest; no ceremony; works with any module that happens to have the right functions.
+- Cons: typos and missing callbacks become runtime errors; no single place documents the contract; editor tooling can't surface "what must a backend implement?".
+
+**Option B — `@callback` in a dedicated behaviour module + `@behaviour` in each impl** (chosen)
+- Pros: compiler verifies all required callbacks are present; `@impl true` flags renames and typos; Dialyzer can use the contract for inter-procedural checks; the behaviour file IS the documentation.
+- Cons: more files; adding a callback is a breaking change for every impl (which is also the point).
+
+Chose **B** because the whole reason for swappable backends is enforceable uniformity — losing the compile-time check defeats the purpose.
 
 ---
 
@@ -251,6 +272,16 @@ end
 mix test
 ```
 
+### Why this works
+
+The `KvStore.Backend` module contains only `@callback` declarations — zero executable code — so it acts as a pure contract. Each impl declares `@behaviour KvStore.Backend` and marks every callback with `@impl true`, which makes the compiler check that the set of `def` matches the set of `@callback`. At the call site, the caller passes the implementing module as an argument or reads it from config; dispatch is a plain `Module.function/arity` call with no protocol lookup. `@optional_callbacks` plus `function_exported?/3` cleanly encodes "capability some backends have, others don't" without forcing every impl to stub the function.
+
+---
+
+## Benchmark
+
+<!-- benchmark N/A: behaviours compile to plain function calls — there is no dispatch overhead to measure. Performance depends entirely on the chosen backend, not on the behaviour mechanism itself. -->
+
 ---
 
 ## Trade-offs
@@ -295,6 +326,13 @@ in a distributed KV). If every reasonable backend implements it, make it mandato
 - **One impl, no plans for another**: YAGNI. A plain module is fine. Add the behaviour when the second impl appears.
 - **Value-driven polymorphism**: use a protocol. Behaviours require the caller to know which module to call.
 - **Cross-language contracts**: behaviours are BEAM-only. Use an explicit wire protocol (JSON, protobuf) at the boundary.
+
+---
+
+## Reflection
+
+1. Your app ships with `KvStore.InMemory` for tests and `KvStore.File` for dev. A new requirement arrives: persist to Postgres in prod. Do you add `KvStore.Postgres` as a new `@behaviour` impl, or is this the moment the abstraction leaks (transactions, connection pooling) and a different design is warranted? Where is the line?
+2. `@optional_callbacks` lets one backend skip `list_keys/1`. When you deploy a new feature that needs `list_keys`, how do you discover which backends break? Is runtime `function_exported?/3` enough, or would you promote it to mandatory and force the compile error?
 
 ---
 

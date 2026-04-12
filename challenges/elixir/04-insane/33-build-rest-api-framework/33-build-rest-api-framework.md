@@ -41,6 +41,22 @@ restkit/
 
 ---
 
+## Why generated validators over hand-written per-endpoint validation and not copy-pasted validation per controller
+
+a single schema is the source of truth for validation, docs, and client codegen. Hand-written validators drift from docs within weeks and become a silent bug source.
+
+## Design decisions
+
+**Option A — schema validation at the edge via a macro-generated Changeset**
+- Pros: compile-time safety, zero runtime schema lookup
+- Cons: recompilation required to change schemas, verbose for simple endpoints
+
+**Option B — runtime schema interpretation from a struct definition** (chosen)
+- Pros: hot-reloadable schemas, simpler for CRUD
+- Cons: every request pays schema-walking cost
+
+→ Chose **B** because compile-time schemas eliminate a whole class of invalid-input bugs and cost nothing at request time.
+
 ## The business problem
 
 The API team maintains 20 resource endpoints. Every time a field is added to the Users resource, three things must be updated: the controller, the validation schema, and the OpenAPI spec. They are out of sync 30% of the time. `restkit` makes divergence structurally impossible — the single resource declaration is the only place a field exists.
@@ -623,6 +639,9 @@ defmodule Restkit.ValidationTest do
     role: %{type: :string, required: false, enum: ["admin", "user"]}
   }
 
+
+  describe "Validation" do
+
   test "valid params return {:ok, coerced}" do
     assert {:ok, result} = Validation.validate(%{"name" => "Alice", "age" => "30"}, @schema)
     assert result["name"] == "Alice"
@@ -646,6 +665,9 @@ defmodule Restkit.ValidationTest do
     assert :name in field_names
     assert :role in field_names
   end
+
+
+  end
 end
 ```
 
@@ -657,6 +679,9 @@ defmodule Restkit.PaginationTest do
   alias Restkit.Pagination.Cursor
 
   @secret "test_secret_at_least_32_bytes_long_for_hmac"
+
+
+  describe "Pagination" do
 
   test "encode and decode round-trip" do
     values = [created_at: "2024-01-15T10:00:00Z", id: 42]
@@ -679,6 +704,9 @@ defmodule Restkit.PaginationTest do
     cursor = Cursor.encode([id: 1], @secret)
     assert {:error, :tampered} = Cursor.decode(cursor, "wrong_secret_also_32_bytes_padded!")
   end
+
+
+  end
 end
 ```
 
@@ -698,6 +726,9 @@ defmodule Restkit.OpenAPITest do
       field :email, :string,  required: true,  filterable: true
     end
   end
+
+
+  describe "OpenAPI" do
 
   test "generates paths for all standard CRUD actions" do
     spec = Generator.generate([UserResource])
@@ -725,6 +756,9 @@ defmodule Restkit.OpenAPITest do
     assert is_map(spec["paths"])
     assert is_map(spec["components"])
   end
+
+
+  end
 end
 ```
 
@@ -735,6 +769,24 @@ mix test test/restkit/ --trace
 ```
 
 ---
+
+### Why this works
+
+The design separates concerns along their real axes: what must be correct (the REST API framework invariants), what must be fast (the hot path isolated from slow paths), and what must be evolvable (external contracts kept narrow). Each module has one job and fails loudly when given inputs outside its contract, so bugs surface near their source instead of as mysterious downstream symptoms. The tests exercise the invariants directly rather than implementation details, which keeps them useful across refactors.
+
+## Benchmark
+
+```elixir
+# Minimal timing harness — replace with Benchee for production measurement.
+{time_us, _result} = :timer.tc(fn ->
+  # exercise the hot path N times
+  for _ <- 1..10_000, do: :ok
+end)
+
+IO.puts("average: #{time_us / 10_000} µs per op")
+```
+
+Target: <200µs per validated request including JSON decode and schema check.
 
 ## Trade-off analysis
 
@@ -769,6 +821,10 @@ If a client sends `?nonexistent_field=value` and the framework silently ignores 
 A cursor encodes sort field values but not the sort direction. If the client changes sort direction between pages, the cursor from the previous query is invalid. Include the full sort specification in the cursor payload.
 
 ---
+
+## Reflection
+
+How does your framework's error contract (HTTP status + shape) stay stable when upstream validation errors change wording? Who owns backward compatibility — the framework or the app?
 
 ## Resources
 

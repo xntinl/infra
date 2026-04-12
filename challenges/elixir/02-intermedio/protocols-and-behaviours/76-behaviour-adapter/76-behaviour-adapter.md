@@ -2,9 +2,6 @@
 
 **Project**: `notifier_adapter` — a `Notifier` behaviour that abstracts "send a notification", with `Email` and `Slack` adapters selected at runtime via configuration.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
-
 ---
 
 ## Project context
@@ -78,6 +75,30 @@ swapping. For most cases, runtime lookup is correct.
 A process-local adapter that captures sent messages makes every downstream
 test trivial and never flakes on network. This is standard practice —
 `Bamboo.TestAdapter`, `Swoosh.Adapters.Test`, etc.
+
+---
+
+## Why a behaviour + façade and not direct `Application.get_env` at every call
+
+**Direct `Application.get_env/2` at every call site.** Couples every caller to the config key and to `apply/3`-style indirection. No compile-time check that the configured module conforms.
+
+**Branching on env in a single function (`if Mix.env() == :prod`).** Works for tiny apps; breaks down the moment you need a test adapter, a staging backend, or per-tenant overrides.
+
+**Behaviour + façade (chosen).** The façade is the single dispatch point; the behaviour is the compile-time contract; `Application.fetch_env!/2` is read once per call (or at compile time for hot paths). Tests swap adapters with `put_env/3`, production swaps them in `runtime.exs`.
+
+---
+
+## Design decisions
+
+**Option A — `Application.compile_env!/2` in the façade, baked at compile time**
+- Pros: Zero per-call lookup; adapter inlined.
+- Cons: No runtime swapping; tests must recompile to change backends.
+
+**Option B — `Application.fetch_env!/2` at each call** (chosen)
+- Pros: Tests override with `put_env/3` and take effect immediately; same code path in dev, test, staging, prod; per-tenant or per-request overrides remain possible.
+- Cons: Microseconds per call from the env lookup — noise for notifications, matters for RPC-heavy hot paths.
+
+→ Chose **B** because notifications are not a hot path and the test-time flexibility is load-bearing. For `Finch`/`Req`-style RPC adapters, flip to A.
 
 ---
 
@@ -276,6 +297,27 @@ end
 mix test
 ```
 
+### Why this works
+
+The behaviour declares the `deliver/2` contract once and the compiler enforces that every adapter implements it. The façade reads the adapter module from application env at each call, so tests use `Application.put_env/3` in `setup` and the next `Notifier.deliver/2` picks it up — no recompilation, no global mutation beyond the scoped config. `TestAdapter` turns delivery into a mailbox message, so `assert_receive` replaces network-dependent assertions.
+
+---
+
+## Benchmark
+
+```elixir
+Application.put_env(:notifier_adapter, :adapter, Notifier.TestAdapter)
+
+{time, _} =
+  :timer.tc(fn ->
+    Enum.each(1..100_000, fn _ -> Notifier.deliver("dest", "msg") end)
+  end)
+
+IO.puts("avg dispatch: #{time / 100_000} µs")
+```
+
+Target esperado: <2 µs por llamada a `Notifier.deliver/2` con `TestAdapter` (runtime env lookup + mailbox send). Si migrás a `compile_env!/2`, esperá ~0.3–0.5 µs por llamada — el delta justifica la rigidez solo en hot paths.
+
 ---
 
 ## Trade-offs and production gotchas
@@ -306,6 +348,13 @@ in `runtime.exs` — otherwise releases ignore the env var entirely.
 If you have exactly one implementation and no near-term need for another,
 don't. YAGNI. A direct `Notifier.Email.deliver(...)` is simpler; refactor
 to a behaviour the day you add the second backend.
+
+---
+
+## Reflection
+
+- You need to deliver via *both* Email and Slack on production alerts. Does the adapter pattern still fit, or do you need a "composite adapter" that calls a list of backends? What does that do to error semantics (any failure fails the call vs all-or-nothing)?
+- A PR adds `Application.get_env(:notifier_adapter, :adapter)` inline at four different call sites "to avoid the indirection". What concretely breaks in async tests, and what's the shortest review comment that justifies reverting it?
 
 ---
 

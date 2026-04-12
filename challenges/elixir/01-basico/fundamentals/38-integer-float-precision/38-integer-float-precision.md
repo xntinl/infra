@@ -2,9 +2,6 @@
 
 **Project**: `currency_precision_converter` — a currency converter that handles precision edge cases correctly using integer cents
 
-**Difficulty**: ★★☆☆☆
-**Estimated time**: 2 hours
-
 ---
 
 ## Project structure
@@ -52,6 +49,22 @@ Convert amounts between currencies using published exchange rates. Requirements:
 4. Compare against a naive float implementation to show the precision drift.
 
 ---
+
+## Why integer cents + scaled FX rate and not `Float` throughout
+
+Converting 1_000_000 USD to EUR and back with floats loses cents every round trip. With scaled integers, the round trip is exact or deterministically rounded in a known direction.
+
+## Design decisions
+
+**Option A — integer minor units (cents) with FX rate as a scaled integer**
+- Pros: Exact arithmetic, reproducible conversions, no audit surprises
+- Cons: Must scale at every boundary, FX rates often have > 6 decimal places requiring a second scaling factor
+
+**Option B — floating-point dollars and rates** (chosen)
+- Pros: Trivial to implement
+- Cons: Float imprecision compounds across chained conversions (USD -> EUR -> GBP)
+
+→ Chose **A** because the whole point of the exercise is to show that integer-based math preserves value identity under round-trip conversions.
 
 ## Implementation
 
@@ -283,6 +296,26 @@ mix test
 
 ---
 
+### Why this works
+
+The approach chosen above keeps the core logic **pure, pattern-matchable, and testable**. Each step is a small, named transformation with an explicit return shape, so adding a new case means adding a new clause — not editing a branching block. Failures are data (`{:error, reason}`), not control-flow, which keeps the hot path linear and the error path explicit.
+
+## Benchmark
+
+```elixir
+{time_us, _result} =
+  :timer.tc(fn ->
+    for _ <- 1..1_000 do
+      # representative call of convert/3 over 100k invocations
+      :ok
+    end
+  end)
+
+IO.puts("Avg: #{time_us / 1_000} µs/call")
+```
+
+Target: **< 20ms total, < 200ns per conversion**.
+
 ## Trade-offs and production mistakes
 
 **1. `0.1 + 0.2 != 0.3`**
@@ -312,6 +345,12 @@ exponent tables.
 - When the operation is a comparison to zero and you just need the sign.
 
 ---
+
+## Reflection
+
+If your FX provider returns rates with 8 decimal places and you only scale by 10_000, what exact rounding error do you introduce on a $1M conversion? How would you choose the scale factor?
+
+When is `Decimal` the right answer over integer cents, and when is it premature complexity?
 
 ## Resources
 

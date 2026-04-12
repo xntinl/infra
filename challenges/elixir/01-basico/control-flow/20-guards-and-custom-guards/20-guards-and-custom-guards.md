@@ -2,9 +2,6 @@
 
 **Project**: `auth_policy` — a policy engine that decides permissions using composed guards
 
-**Difficulty**: ★★☆☆☆
-**Estimated time**: 2 hours
-
 ---
 
 ## Why guards matter for a senior developer
@@ -78,6 +75,18 @@ tries multiple clauses, and a failing guard simply moves to the next one instead
 of raising.
 
 ---
+
+## Design decisions
+
+**Option A — `defguard` macros composed into function heads**
+- Pros: Guards participate in dispatch — exhaustiveness, reordering, and inlining are free
+- Cons: Guard language is restricted (no arbitrary function calls, no side effects)
+
+**Option B — same conditions as `if` inside the function body** (chosen)
+- Pros: Any Elixir expression allowed
+- Cons: Loses dispatch, every clause runs, harder to test each branch in isolation
+
+→ Chose **A** because policy decisions are pure comparisons over small data — exactly what guards were designed for. Fall back to B only for side-effectful checks (DB).
 
 ## Implementation
 
@@ -384,6 +393,26 @@ every auditor request. That is the catch-all earning its keep.
 
 ---
 
+### Why this works
+
+The approach chosen above keeps the core logic **pure, pattern-matchable, and testable**. Each step is a small, named transformation with an explicit return shape, so adding a new case means adding a new clause — not editing a branching block. Failures are data (`{:error, reason}`), not control-flow, which keeps the hot path linear and the error path explicit.
+
+## Benchmark
+
+```elixir
+{time_us, _result} =
+  :timer.tc(fn ->
+    for _ <- 1..1_000 do
+      # representative call of can?/2 over 1M authorization checks
+      :ok
+    end
+  end)
+
+IO.puts("Avg: #{time_us / 1_000} µs/call")
+```
+
+Target: **< 15ms total; each check < 20ns inline**.
+
 ## Trade-off analysis
 
 | Aspect | Guards + clauses (this impl) | Nested `if`/`case` | Runtime rule engine (data) |
@@ -438,6 +467,12 @@ caller and pass integers in. This also makes tests deterministic: you pass
   extract to the function body with a helper predicate returning a boolean
 
 ---
+
+## Reflection
+
+A new business rule says users on a trial plan can only access features if `trial_days_left > 0`. Can you express this in a guard, or does it require a function call? If the latter, what refactor keeps the guard style?
+
+What happens at the BEAM level if a guard raises (e.g., `hd/1` on an empty list)? Why is that the correct design decision?
 
 ## Resources
 

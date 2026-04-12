@@ -66,6 +66,34 @@ rules_engine/
 
 ---
 
+## Why closures and not behaviour modules
+
+**Option A — one module per rule, all implementing a `Rule` behaviour**
+- Pros: each rule is documented and testable in isolation; compile-time dispatch; plays well with hot code reload.
+- Cons: defining a 5-line rule requires a new module and a new file; runtime composition (e.g. loading rules from config) becomes a metaprogramming exercise.
+
+**Option B — rules as closures passed as values** (chosen)
+- Pros: rules are created, composed, and stored at runtime; `min_age_rule(18)` and `min_age_rule(65)` are *different values*, not different modules; combinators (`and_rule/2`) are ordinary functions.
+- Cons: rules are anonymous in stack traces (`#Function<...>`), so debugging requires naming conventions or tagged tuples.
+
+→ Chose **B** because rules come from configuration, user input, or the database — not from the source tree. Closures match the data lifecycle.
+
+---
+
+## Design decisions
+
+**Option A — rule returns boolean, combinators operate on booleans**
+- Pros: simplest possible interface; easy to parallelise.
+- Cons: a failed decision gives you no explanation; debugging a rejected applicant means re-running each rule by hand.
+
+**Option B — rule returns `{:pass, name}` or `{:fail, name, reason}`, combinators carry the trace** (chosen)
+- Pros: the engine can produce "rule X failed because …" without re-executing; auditability comes for free.
+- Cons: combinators must short-circuit while preserving the trace, so `and_rule/2` is slightly more than `Enum.all?/2`.
+
+→ Chose **B** because in insurance underwriting the *why* of a rejection is regulated artefact. Losing it to compress the interface is a false economy.
+
+---
+
 ## Implementation
 
 ### `lib/rules_engine.ex`
@@ -317,7 +345,7 @@ defmodule RulesEngine do
 end
 ```
 
-**Why this works:**
+### Why this works
 
 - Rule factories (`min_value/2`, `max_value/2`, etc.) return anonymous functions
   that close over their parameters. Each call creates a new function with different
@@ -531,6 +559,38 @@ Math.add(1, 2)  # => 3
 Use anonymous functions for: callbacks, closures, short transformations passed
 to Enum functions. Use named functions for: reusable logic, pattern-matching
 dispatching, public APIs.
+
+---
+
+## Benchmark
+
+Measure the cost of evaluating a composed rule so you can decide whether to cache decisions or re-run on every quote.
+
+```elixir
+rule =
+  RulesEngine.and_rule([
+    RulesEngine.min_age_rule(18),
+    RulesEngine.max_age_rule(70),
+    fn user -> user.verified end
+  ])
+
+applicant = %{age: 32, verified: true}
+
+{us, _} = :timer.tc(fn ->
+  for _ <- 1..1_000_000, do: rule.(applicant)
+end)
+
+IO.puts("per evaluation: #{us / 1_000_000} µs")
+```
+
+Target esperado: <1 µs per evaluation for a 3-rule composition. If you approach 10 µs, the cost is inside the predicates (e.g. database calls hiding in a rule), not in closure dispatch.
+
+---
+
+## Reflection
+
+- A product manager wants rules to be editable from an admin UI at runtime. Do you keep closures (and evaluate serialised expressions with something like `Abacus`), switch to a behaviour with recompilation, or store rule ASTs and interpret them? What's the blast radius of each choice if a bad rule ships to production?
+- Your trace format is `{:fail, rule_name, reason}`. A regulator asks for the exact *input value* that caused each failure, for every rejected applicant. How do you retrofit that without duplicating every predicate?
 
 ---
 

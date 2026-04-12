@@ -33,6 +33,22 @@ dsl_kit/
 
 ---
 
+## Why quote/unquote with `Macro.escape/1` discipline and not string concatenation and `Code.eval_string/1`
+
+quote preserves hygiene and line numbers for stack traces; eval_string throws both away and turns every DSL error into an unhelpful "syntax error on line 1." Quote-based macros give compiler-quality errors.
+
+## Design decisions
+
+**Option A — runtime-interpreted DSL via a GenServer**
+- Pros: hot-reload, simpler mental model
+- Cons: runtime cost, no compile-time validation, no autocomplete
+
+**Option B — compile-time macro expansion into native Elixir code** (chosen)
+- Pros: zero runtime cost, compiler errors for malformed DSL, tooling-friendly
+- Cons: macros are harder to write and test
+
+→ Chose **B** because a DSL users write in production deserves compile-time validation — the earlier we fail, the cheaper the fix.
+
 ## The business problem
 
 The framework team is building a toolkit where every service defines its own resources using a declarative DSL. Today, three separate systems handle state machines, validations, and routing — each with its own configuration format. A misconfiguration in any of them is only discovered at runtime. `dsl_kit` makes the configuration itself be code, verified at compile time.
@@ -355,6 +371,9 @@ defmodule DslKit.StateMachineTest do
     transition :yellow, :red,    on: :stop
   end
 
+
+  describe "StateMachine" do
+
   test "valid transitions" do
     assert {:ok, :green}  = TrafficLight.transition(:red,    :go)
     assert {:ok, :yellow} = TrafficLight.transition(:green,  :slow)
@@ -379,6 +398,9 @@ defmodule DslKit.StateMachineTest do
   test "initial_state/0" do
     assert TrafficLight.initial_state() == :red
   end
+
+
+  end
 end
 ```
 
@@ -393,6 +415,9 @@ defmodule DslKit.ValidationTest do
     validates :email, [required: true, format: ~r/@/]
     validates :role,  [required: true, inclusion: ["admin", "user"]]
   end
+
+
+  describe "Validation" do
 
   test "valid attributes pass" do
     attrs = %{"name" => "Alice", "email" => "alice@example.com", "role" => "admin"}
@@ -416,6 +441,9 @@ defmodule DslKit.ValidationTest do
     assert {:error, errors} = UserSchema.validate(%{"name" => "X", "email" => "x@y.com", "role" => "superadmin"})
     assert Map.has_key?(errors, :role)
   end
+
+
+  end
 end
 ```
 
@@ -438,6 +466,9 @@ defmodule DslKit.ComposeTest do
     validates :currency, [required: true, inclusion: ["USD", "EUR"]]
   end
 
+
+  describe "Compose" do
+
   test "state machine works in composed module" do
     assert {:ok, :submitted} = OrderModule.transition(:draft, :submit)
   end
@@ -445,6 +476,9 @@ defmodule DslKit.ComposeTest do
   test "validation works in composed module" do
     assert {:ok, _} = OrderModule.validate(%{"amount" => 100, "currency" => "USD"})
     assert {:error, _} = OrderModule.validate(%{"amount" => -1, "currency" => "USD"})
+  end
+
+
   end
 end
 ```
@@ -456,6 +490,24 @@ mix test test/dsl_kit/ --trace
 ```
 
 ---
+
+### Why this works
+
+The design separates concerns along their real axes: what must be correct (the macro DSL system invariants), what must be fast (the hot path isolated from slow paths), and what must be evolvable (external contracts kept narrow). Each module has one job and fails loudly when given inputs outside its contract, so bugs surface near their source instead of as mysterious downstream symptoms. The tests exercise the invariants directly rather than implementation details, which keeps them useful across refactors.
+
+## Benchmark
+
+```elixir
+# Minimal timing harness — replace with Benchee for production measurement.
+{time_us, _result} = :timer.tc(fn ->
+  # exercise the hot path N times
+  for _ <- 1..10_000, do: :ok
+end)
+
+IO.puts("average: #{time_us / 10_000} µs per op")
+```
+
+Target: DSL compilation should add <50ms to a module with 1000 DSL statements.
 
 ## Trade-off analysis
 
@@ -490,6 +542,10 @@ Macros have hygiene by default: variables defined in `quote do ... end` don't le
 If a user's module defines a function with the same name as one your DSL generates, you'll get a `function already defined` warning or error. Namespace your generated functions or document clearly which names are reserved.
 
 ---
+
+## Reflection
+
+If your DSL allows users to write what looks like arbitrary Elixir, when do you stop being a DSL and start being a compiler? Where would you draw the line between "allowed" and "unsafe" for a DSL exposed to end users?
 
 ## Resources
 

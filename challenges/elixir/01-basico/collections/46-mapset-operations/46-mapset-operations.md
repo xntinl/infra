@@ -1,7 +1,6 @@
 # MapSet Operations for Set Arithmetic
 
-**Project**: `visitor_tracker` — standalone Mix project, 1–2 hours  
-**Difficulty**: ★☆☆☆☆
+**Project**: `visitor_tracker` — returning/new/total visitor metrics via `MapSet` set algebra
 
 ---
 
@@ -64,6 +63,20 @@ semantics out of the box. It costs nothing extra at runtime — internally it's 
 `list1 -- list2` is O(n * m). For 100k visitors per day that's 10 billion comparisons.
 `MapSet.difference/2` is O(n log m). On the same input: ~1.7 million operations.
 Four orders of magnitude faster, and you stop worrying about it in code review.
+
+---
+
+## Design decisions
+
+**Option A — lists + `Enum.uniq/1` + `--`**
+- Pros: zero new types; every Elixir developer knows lists cold; fine for small inputs (<1k).
+- Cons: `list1 -- list2` is O(n × m); on 100k visitors per day that's 10 billion comparisons; no semantic type ("is this a set or a bag?" is a comment, not a type).
+
+**Option B — `MapSet` with `union/2`, `intersection/2`, `difference/2`** (chosen)
+- Pros: O(n log n) build and O(log n) membership; the type name documents intent; operations are exactly the words the domain uses (returning = intersection, new = difference); internally a map, so allocation profile is familiar.
+- Cons: not directly JSON-serializable (must call `MapSet.to_list/1`); no stable iteration order; one more type for newcomers to learn.
+
+Chose **B** because the problem is literally set algebra and the algorithmic gap between the two options is four orders of magnitude at production scale. The type hint alone makes review easier.
 
 ---
 
@@ -202,6 +215,45 @@ mix test
 
 All 6 tests should pass.
 
+### Why this works
+
+`MapSet` is backed by Erlang's persistent map — the same data structure as `%{}` — so insertion and membership are O(log n) with a small constant. Operations that look like set algebra (`union`, `intersection`, `difference`) are implemented in terms of map merge/filter primitives, not list scans, so they stay logarithmic. Building the set deduplicates for free: `Enum.into(list, MapSet.new())` doesn't care how many duplicates the list has. Because values are compared by structural equality, visitor IDs being atoms, integers, or strings all work uniformly as long as you're consistent.
+
+---
+
+## Benchmark
+
+```elixir
+# bench.exs
+defmodule Bench do
+  def run do
+    today = Enum.map(1..100_000, &(rem(&1, 80_000)))       # duplicates + overlap
+    yesterday = Enum.map(1..100_000, &(rem(&1, 80_000) + 20_000))
+
+    {mapset_us, _} =
+      :timer.tc(fn ->
+        s1 = MapSet.new(today)
+        s2 = MapSet.new(yesterday)
+        {MapSet.intersection(s1, s2), MapSet.difference(s1, s2), MapSet.union(s1, s2)}
+      end)
+
+    {list_us, _} =
+      :timer.tc(fn ->
+        t = Enum.uniq(today)
+        y = Enum.uniq(yesterday)
+        {t -- (t -- y), t -- y, Enum.uniq(t ++ y)}
+      end)
+
+    IO.puts("MapSet algebra, 100k each: #{mapset_us} µs")
+    IO.puts("List algebra,   100k each: #{list_us} µs (expect >10,000× slower)")
+  end
+end
+
+Bench.run()
+```
+
+Target: MapSet algebra under 200 ms for 100k visitors on both sides. The list version will either take minutes or be the kind of slow that makes CI time out — that IS the lesson.
+
 ---
 
 ## Trade-offs
@@ -240,6 +292,13 @@ serialization boundary.
 - When you need a value per key (not just membership). Use a `Map`.
 - When the collection is tiny (< 20 items) and built once. `Enum.uniq/1` + `Enum.member?/2`
   is readable and fast enough; don't over-engineer.
+
+---
+
+## Reflection
+
+1. You now have 100k active users and the daily visitor set fits in memory. At 10M users the sets (~80 MB each) still fit but GC pressure is noticeable. Would you keep `MapSet` in-process, move to Redis sets, or maintain an ETS table? What trade-off breaks first?
+2. The intersection/difference pattern works for pairwise comparison. Product now asks "users present in ALL of the last 7 days". Do you fold `MapSet.intersection/2` across the 7 sets, compute from raw logs with a single-pass reduce counting per-user appearances, or push the problem to the database? Which approach scales best?
 
 ---
 

@@ -2,9 +2,6 @@
 
 **Project**: `metrics_prom` — defines `Telemetry.Metrics` definitions (counters, summaries, last_value) fed by `:telemetry` events, exported in Prometheus text format via `TelemetryMetricsPrometheus.Core`.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 3 hours
-
 ---
 
 ## Project context
@@ -111,6 +108,38 @@ That starts a registered process owning the ETS tables. `scrape/1`
 takes the same `name`. If the process dies, you lose your in-memory
 metric state — Prometheus will see a reset counter, which it handles
 natively, so this is OK in practice.
+
+---
+
+## Why Telemetry.Metrics and not a metrics SDK directly
+
+A Prometheus-only SDK couples your instrumentation points to Prometheus
+semantics. `Telemetry.Metrics` decouples the two: you declare metric
+definitions once, and any reporter (Prometheus, StatsD, LiveDashboard,
+Datadog) consumes the same declarations. Switch exporters without
+changing a single instrumentation line. You also get to emit raw
+`:telemetry` events from libraries you don't own — Ecto, Phoenix, Finch
+all emit into the same bus.
+
+---
+
+## Design decisions
+
+**Option A — Aggregate client-side via a stateful GenServer**
+- Pros: Full control over buckets, percentiles, and reporting cadence.
+- Cons: You reimplement what reporters already do; GenServer becomes
+  a bottleneck under high event rates; tag cardinality bugs crash it.
+
+**Option B — `Telemetry.Metrics` definitions + Prometheus reporter** (chosen)
+- Pros: Definitions are pure data; the reporter handles ETS-backed
+  aggregation; swapping reporters is a supervisor-child change.
+- Cons: Reporter lifecycle (restart = counter reset) is visible to
+  downstream scrapers; tag cardinality still a hazard, just a declared
+  one.
+
+→ Chose **B** because every serious Elixir observability path — Phoenix
+  LiveDashboard, PromEx, OpenTelemetry bridges — builds on
+  `Telemetry.Metrics`. Going your own way forecloses on the ecosystem.
 
 ---
 
@@ -347,6 +376,28 @@ end
 mix test
 ```
 
+### Why this works
+
+`:telemetry.execute/3` is a synchronous fan-out to every handler
+attached to the event name; the Prometheus reporter attaches handlers
+that increment/sum/observe ETS-backed counters keyed by tag tuples.
+`scrape/1` walks those tables and formats them in Prometheus text
+format. Unit conversion in the metric definition (`unit: {:native,
+:millisecond}`) is applied at emit time, so durations reported by
+`:telemetry.span/3` (which uses `:native` time) come out in the unit
+dashboards expect.
+
+---
+
+## Benchmark
+
+Emitting an event via `:telemetry.execute/3` with 2-3 attached handlers
+typically takes under 10µs; scraping a registry with ~50 metric series
+runs in a few hundred microseconds. Target: emission latency should
+stay under 20µs at the 99th percentile (it's in the request's hot path).
+If it exceeds that, you have too many handlers or a handler doing work
+it shouldn't (blocking I/O, heavy encoding).
+
 ---
 
 ## Trade-offs and production gotchas
@@ -390,6 +441,18 @@ For dev-only visibility, `Phoenix.LiveDashboard`'s Metrics page (also a
 `Telemetry.Metrics` reporter) is zero-config. For commercial observability
 stacks (Datadog, Honeycomb), use their SDKs or OpenTelemetry — Prometheus
 is great for self-hosted, less so when you already pay for a vendor.
+
+---
+
+## Reflection
+
+- A developer adds `tags: [:user_id]` to a counter because "it would be
+  useful". A week later Prometheus is OOMing. What tool and process
+  would you put in place to catch the cardinality bug before it ships?
+- Your SRE team wants cluster-wide p99 latency. You currently publish
+  `summary("…duration")`. Why does averaging p99s across nodes give a
+  wrong answer, and what's the `distribution/2` + `histogram_quantile()`
+  alternative? Walk through the tradeoffs (disk, query cost, accuracy).
 
 ---
 

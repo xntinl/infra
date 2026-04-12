@@ -3,9 +3,6 @@
 **Project**: `aliases_demo` — a project that shows how to chain, override,
 and inline Mix aliases for CI-friendly composed commands.
 
-**Difficulty**: ★★☆☆☆
-**Estimated time**: 1–2 hours
-
 ---
 
 ## Project context
@@ -78,6 +75,36 @@ aliases: [greet: [&Mix.shell().info/1, "app.start"]]
 
 A function reference as a step is called with the alias's argv. Useful for
 printing banners, setting env vars, or branching based on arguments.
+
+---
+
+## Why aliases and not shell scripts
+
+A `scripts/check.sh` wrapping `mix format && mix credo && mix test` works
+but lives outside Mix: it has no argv pass-through, no ordered halt-on-
+failure semantics tied to Mix tasks, and it can't call inline Elixir
+functions. Aliases are first-class Mix citizens — editor integrations,
+release tooling, and `mix help` all see them. A shell script is a black
+box to everything above it.
+
+---
+
+## Design decisions
+
+**Option A — One mega-alias (`all: [fmt, credo, dialyzer, test, docs]`)**
+- Pros: Single entry point; "just run `mix all`".
+- Cons: 10-minute runs block every commit; no way to skip the slow steps
+  locally; CI and dev share the same command, which is rarely right.
+
+**Option B — Two aliases: `setup` + `check`** (chosen)
+- Pros: `setup` runs once on clone; `check` is the fast pre-push pipeline.
+  Slow steps (dialyzer, full docs) get their own named alias that CI
+  calls explicitly.
+- Cons: More alias names to remember; requires documenting the intent of
+  each in `mix.exs`.
+
+→ Chose **B** because "one command to rule them all" always ends up too
+  slow to run before every commit, and once that happens nobody runs it.
 
 ---
 
@@ -193,6 +220,22 @@ mix ci.docs
 Open `mix.exs` and tweak the alias order / steps, then re-run to see how
 Mix halts on the first failure.
 
+### Why this works
+
+Each alias is a plain list of steps Mix executes left-to-right, halting
+on the first non-zero return. Overriding `test` preserves the original
+task because Mix resolves `"test"` inside the list to the built-in, not
+the alias. Argv forwarding targets the last step, so keeping `"test"`
+bare at the end lets users run `mix check --stale` without code changes.
+
+---
+
+## Benchmark
+
+<!-- benchmark N/A: alias dispatch is compile-time composition; overhead
+     is a constant microsecond-scale function call before the first real
+     task runs. Wall time is dominated by the tasks themselves. -->
+
 ---
 
 ## Trade-offs and production gotchas
@@ -230,6 +273,19 @@ operations, write a release module (`lib/my_app/release.ex`).
   to test, has proper argv parsing).
 - You need conditional execution based on env vars — a task with
   `if System.get_env/1` is clearer than four aliases for four envs.
+
+---
+
+## Reflection
+
+- Your CI takes 12 minutes: `mix check` runs format, credo, dialyzer,
+  test, and a coverage report. Developers complain the pre-commit hook
+  is too slow, so they start skipping it. How do you split the alias to
+  keep CI thorough while giving devs a sub-30-second local check?
+- A teammate writes `aliases: [release: [&build_assets/1, "phx.gen.release"]]`
+  where `build_assets/1` shells out to `npm run build`. A year later the
+  npm step fails silently in one CI runner because `$PATH` differs. What
+  refactor would make this failure loud and portable?
 
 ---
 

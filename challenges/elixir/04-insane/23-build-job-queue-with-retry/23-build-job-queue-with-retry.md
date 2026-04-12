@@ -57,6 +57,18 @@ Services need to offload work to background processes: send emails, generate rep
 
 ---
 
+## Design decisions
+
+**Option A — Postgres-backed queue (Oban-style)**
+- Pros: durability for free; SQL introspection.
+- Cons: Postgres becomes the throughput ceiling; every enqueue is a row insert.
+
+**Option B — ETS-backed in-memory queue with WAL for durability** (chosen)
+- Pros: sub-millisecond enqueue/dequeue; WAL gives crash safety without Postgres; retry policies are simple local state.
+- Cons: must implement WAL correctness and bounded memory yourself.
+
+→ Chose **B** because at our scale target (10k jobs/s), Postgres-backed queues spend most of their time in index maintenance; an in-memory queue with a dedicated WAL hits the target with headroom.
+
 ## Implementation milestones
 
 ### Step 1: Create the project
@@ -520,6 +532,21 @@ Benchee.run(
 )
 ```
 
+### Why this works
+
+Jobs enqueue into ETS and append to a WAL before acknowledging; workers claim jobs via atomic ETS updates. Retries are scheduled by rescheduling the job with an exponential-backoff `run_at` timestamp, which the dispatcher reads on each tick.
+
+---
+
+## Benchmark
+
+```elixir
+# bench/queue_bench.exs
+Benchee.run(%{"enqueue" => fn -> Queue.enqueue(job()) end}, time: 10)
+```
+
+Target: 10,000 jobs/second processed end-to-end with retry and persistence enabled.
+
 ---
 
 ## Trade-off analysis
@@ -549,6 +576,11 @@ After a restart, the cron engine must check whether any scheduled ticks were mis
 
 **4. Dependency resolution not handling already-completed dependencies**
 If `depends_on: [job_id]` is submitted after the dependency is already completed, the dependent job must immediately move to `queued`.
+
+## Reflection
+
+- If the worker crashes after executing a job but before acking, the job runs twice. Under what workload is this acceptable, and when must you switch to a 2PC-style ack?
+- Compare this design to Oban. At what throughput does Oban's Postgres-backed queue start hurting, and what would you change first?
 
 ---
 

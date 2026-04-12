@@ -2,9 +2,6 @@
 
 **Project**: `tx_lab` — a two-step "transfer funds" operation implemented three ways: `Repo.transaction/1` with a function, explicit `Repo.rollback/1`, and `Ecto.Multi`.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 3 hours
-
 ---
 
 ## Project context
@@ -122,6 +119,39 @@ to show the full shape.
 
 ---
 
+## Why Multi and not a closure
+
+A closure (`Repo.transaction(fn -> ... end)`) is fine for two or three
+straight-line writes. It breaks down when you need (a) to know *which*
+step failed for logging, (b) to pass intermediate values to later steps
+declaratively, or (c) to test each step in isolation. `Multi` is a data
+structure — you can inspect it, compose it, and its error return tells
+you the failing step name plus every prior success. Closures are code
+you run; `Multi` is a plan you submit.
+
+---
+
+## Design decisions
+
+**Option A — Closure-only (`Repo.transaction(fn -> ... end)` + `Repo.rollback/1`)**
+- Pros: Familiar, reads like regular Elixir; easier for a single short
+  transaction.
+- Cons: No step names in the error return; chaining `{:ok, _} <- ...`
+  inside the closure gets noisy; harder to unit-test a single step.
+
+**Option B — `Ecto.Multi` for anything beyond two steps** (chosen)
+- Pros: Named steps, per-step failure reporting, composable (you can
+  `Multi.append/2` conditionally); every step has access to the map of
+  prior results.
+- Cons: A bit more ceremony for trivial 2-step transactions; `Multi.run/3`
+  callbacks receive `repo` explicitly, which some find awkward.
+
+→ Chose **B** as the default once a transaction exceeds two steps; the
+  `transfer_raw` and `transfer_with_rollback` variants are shown for
+  pedagogy and for the truly-simple case.
+
+---
+
 ## Implementation
 
 ### Step 1: Create the project
@@ -133,8 +163,8 @@ cd tx_lab
 
 ### Step 2: `mix.exs`, `config/config.exs`, `repo.ex`, `application.ex`
 
-Same shape as exercise 129 — Ecto + SQLite, one Repo child under the
-Application supervisor, `test` alias for drop/create/migrate.
+Standard shape — Ecto + SQLite, one Repo child under the Application
+supervisor, `test` alias for drop/create/migrate.
 
 ```elixir
 # mix.exs deps / aliases
@@ -408,6 +438,27 @@ end
 mix test
 ```
 
+### Why this works
+
+`Repo.transaction/1` wraps its callback in a SAVEPOINT at the DB;
+uncaught raises or `Repo.rollback/1` calls inside abort the SAVEPOINT
+and return `{:error, reason}`. `Ecto.Multi` is a declarative queue of
+named operations — when you hand it to `Repo.transaction/1`, the same
+SAVEPOINT mechanics apply, but the error tuple is richer
+(`{:error, failed_op, value, changes}`). Optimistic locking via
+`optimistic_lock/3` adds a `WHERE lock_version = ?` guard so two
+concurrent transfers produce a stale-entry error instead of a lost update.
+
+---
+
+## Benchmark
+
+`:timer.tc(fn -> TxLab.transfer_multi(a.id, b.id, 1) end)` on SQLite
+typically clocks around 1-3 ms including the two SELECTs and two
+UPDATEs; on Postgres with a local socket, closer to 500µs-1ms. Target:
+a simple 4-step transfer should stay under 5ms on commodity hardware;
+higher numbers point at contention or missing indexes on the PK lookups.
+
 ---
 
 ## Trade-offs and production gotchas
@@ -453,6 +504,20 @@ Read-only workflows. Idempotent operations. Operations where partial
 success is an acceptable outcome (metrics ingestion). Transactions cost
 connection-holding time — use them only when atomicity is part of the
 contract.
+
+---
+
+## Reflection
+
+- Your transfer function needs to also send a webhook notification.
+  Where do you put the HTTP call — inside the `Multi` (via `Multi.run/3`)
+  or after `Repo.transaction/1` returns `{:ok, _}`? What's the failure
+  mode of each choice, and how does an outbox pattern resolve it?
+- Under high contention, `optimistic_lock/3` starts returning
+  `Ecto.StaleEntryError` for ~5% of transfers. Do you switch to
+  `Ecto.Query.lock/2` (SELECT FOR UPDATE), add client-side retry
+  logic, or redesign the data model? What factors (p99 latency,
+  throughput, connection count) push you toward each?
 
 ---
 

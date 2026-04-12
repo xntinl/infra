@@ -2,9 +2,6 @@
 
 **Project**: `chat_rooms_registry` — look up chat-room processes by name using a unique-keyed `Registry`.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
-
 ---
 
 ## Project context
@@ -45,7 +42,7 @@ A `Registry` is a supervision tree wrapping one (or several, if partitioned)
 ETS tables. Keys are arbitrary Elixir terms — usually strings or tuples — and
 values are associated metadata. Lookups are O(1), reads are lock-free, and
 entries are automatically removed when the owning process dies. It's local
-to one node; for cross-node naming use `:global` or `:pg` (exercises 83, 85).
+to one node; for cross-node naming use `:global` or `:pg`.
 
 ### 2. `:unique` vs `:duplicate` keys
 
@@ -73,6 +70,30 @@ exit, crash, kill — its entry is removed. There's a subtlety: the cleanup
 is asynchronous, so a `lookup/2` right after a crash can briefly return a
 dead pid. In tests, wait on `Process.monitor/1` + `:DOWN` before asserting
 the registry is empty.
+
+---
+
+## Why Registry and not `Process.register/2` or `:global`
+
+**`Process.register/2` with atom names.** Simple and fast, but atom names are never garbage-collected. Room names come from user input — atom-based naming is a memory leak. Viable only for a known, fixed set of servers.
+
+**`:global` / Horde / Syn.** Cluster-wide naming with distributed consensus. Overkill for node-local rooms, and every registration pays a network round-trip. Use them when rooms must survive node failover.
+
+**`Registry` (chosen).** ETS-backed, string keys, O(1) lookup, automatic cleanup on process death, zero atom-table pressure, and plugs into OTP via `:via` tuples.
+
+---
+
+## Design decisions
+
+**Option A — `DynamicSupervisor` + manual pid tracking**
+- Pros: Explicit control, no external dependency beyond stdlib.
+- Cons: You re-implement monitor-based cleanup, race handling on concurrent `find_or_start`, and name→pid lookup yourself.
+
+**Option B — `Registry` (`:unique`) + `DynamicSupervisor` + `:via` tuple** (chosen)
+- Pros: Lookup, naming, and cleanup are handled by stdlib; `:via` keeps call sites pid-free; the race on concurrent starts collapses into `{:error, {:already_started, pid}}`.
+- Cons: Cleanup is asynchronous, so a `lookup/2` immediately after a crash can briefly return a dead pid.
+
+→ Chose **B** because the stdlib primitives solve naming, monitoring, and the start-race in a few lines, and the asynchronous-cleanup caveat is bounded and documented.
 
 ---
 
@@ -298,6 +319,29 @@ end
 mix test
 ```
 
+### Why this works
+
+`Registry` in `:unique` mode gives you a lock-free ETS index keyed by room name, and its monitor on each registered pid guarantees entries vanish when the owner dies. The `:via` tuple lets every call site address rooms by name without ever touching pids, and the `DynamicSupervisor` turns `find_or_start/1` into a race-safe idempotent operation thanks to `{:already_started, pid}`.
+
+---
+
+## Benchmark
+
+```elixir
+{:ok, _} = ChatRoomsRegistry.Rooms.find_or_start("bench")
+
+{time, _} =
+  :timer.tc(fn ->
+    Enum.each(1..100_000, fn _ ->
+      Registry.lookup(ChatRoomsRegistry.Registry, "bench")
+    end)
+  end)
+
+IO.puts("avg lookup: #{time / 100_000} µs")
+```
+
+Target esperado: <1 µs por `Registry.lookup/2` en hardware moderno (read-concurrency ETS).
+
 ---
 
 ## Trade-offs and production gotchas
@@ -322,8 +366,7 @@ input, atom-based naming is a memory leak waiting to happen.
 **4. `:via` only works with `:unique` registries**
 The via protocol requires a single pid per name. Attempting to use a
 `:duplicate` registry as `{:via, Registry, ...}` crashes at runtime.
-Duplicate registries are for pubsub-style dispatch (exercise 81), not
-for naming.
+Duplicate registries are for pubsub-style dispatch, not for naming.
 
 **5. Don't use `Registry` as a database**
 It's fast, but it's still a process-level cache keyed by pid liveness. If
@@ -335,6 +378,13 @@ For a fixed, known-at-compile-time set of named servers (a single cache,
 a single scheduler), `Process.register/2` with an atom name is simpler and
 marginally faster. Reach for `Registry` when names are dynamic or when you
 need duplicate-key pubsub semantics.
+
+---
+
+## Reflection
+
+- If rooms need to follow users across a 5-node cluster (a user on node B joins a room whose process lives on node A), would you still reach for `Registry`, or switch to Horde/Syn? What changes in the `find_or_start/1` contract?
+- A room that crashes is auto-restarted by the `DynamicSupervisor` under a new pid, but the `Registry` entry is removed asynchronously. How would you design the client retry loop so callers never observe a stale `:noproc`?
 
 ---
 

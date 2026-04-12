@@ -59,6 +59,18 @@ json_validator/
 
 ---
 
+## Design decisions
+
+**Option A — escript**
+- Pros: Single compiled binary, no Erlang runtime required on target, trivial distribution
+- Cons: No supervision tree, one-shot execution, cannot be a long-running daemon
+
+**Option B — mix release** (chosen)
+- Pros: Full OTP release with runtime, supervision, hot upgrades
+- Cons: Heavier artifact, target must match OS/arch, overkill for a CLI that runs and exits
+
+→ Chose **A** because a validator is a one-shot tool, not a supervised application.
+
 ## Implementation
 
 ### Step 1: Create the project
@@ -532,6 +544,26 @@ mix escript.build
 
 ---
 
+### Why this works
+
+The approach chosen above keeps the core logic **pure, pattern-matchable, and testable**. Each step is a small, named transformation with an explicit return shape, so adding a new case means adding a new clause — not editing a branching block. Failures are data (`{:error, reason}`), not control-flow, which keeps the hot path linear and the error path explicit.
+
+## Benchmark
+
+```elixir
+{time_us, _result} =
+  :timer.tc(fn ->
+    for _ <- 1..1_000 do
+      # representative call of parse_args
+      :ok
+    end
+  end)
+
+IO.puts("Avg: #{time_us / 1_000} µs/call")
+```
+
+Target: **1000 invocations under 10ms total (single parse < 10µs)**.
+
 ## Trade-off analysis
 
 | Aspect | Current approach | Alternative |
@@ -576,6 +608,12 @@ If it does not, `mix escript.build` succeeds but the binary crashes at runtime w
 `UndefinedFunctionError`. Always verify with `./your_binary --help` after building.
 
 ---
+
+## Reflection
+
+If your validator needed to process a directory of 10k JSON files in parallel, would you stay with an escript, or move to a Mix release with a Task supervisor? Justify based on startup cost and supervision needs.
+
+Suppose `required_keys` came from a database instead of config — where would that lookup live, and how would you keep the CLI testable?
 
 ## Resources
 

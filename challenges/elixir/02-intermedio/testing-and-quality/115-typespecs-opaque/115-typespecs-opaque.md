@@ -3,9 +3,6 @@
 **Project**: `opaque_types` — a `UserId` module that exposes an opaque type
 so callers can't peek at (or depend on) the internal representation.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
-
 ---
 
 ## Project context
@@ -21,6 +18,20 @@ reference `UserId.t()` in their own specs) but **hides the structure**.
 Dialyzer will flag any caller that tries to pattern-match or manipulate
 the underlying representation. It's Elixir's closest equivalent to a
 nominal type.
+
+## Why `@opaque` and not X
+
+**Why not just `@type t :: String.t()`?** Because callers then legitimately
+treat it as a string — when you refactor the representation, their code
+breaks.
+
+**Why not runtime wrappers (classes/objects)?** The BEAM has no classes;
+structs are data + a `__struct__` field. `@opaque` gives you the
+abstraction boundary at the type-checking layer without runtime overhead.
+
+**Why not just trust callers to use the public API?** In a private
+monorepo maybe. At a library boundary or a team boundary,
+Dialyzer-enforced opacity is the cheapest enforcement mechanism.
 
 Project structure:
 
@@ -71,6 +82,21 @@ dependency leaks before they ship.
 The typical `@opaque` usage: expose a constructor (`UserId.new/1`), an
 accessor (`UserId.to_string/1`), and optionally comparisons/equality.
 Never let the internal structure escape.
+
+---
+
+## Design decisions
+
+**Option A — Opaque wrapping a `String.t()`**
+- Pros: Minimal change from an existing string-based API.
+- Cons: No room to add tenant/metadata later without a breaking change.
+
+**Option B — Opaque wrapping a struct `%__MODULE__{value, tenant}`** (chosen)
+- Pros: Future-proof — fields can grow; callers unaffected.
+- Cons: Slight construction cost vs a bare string.
+
+→ Chose **B** because the whole point of opacity is enabling internal
+evolution. Picking a string kneecaps that future.
 
 ---
 
@@ -213,6 +239,23 @@ Dialyzer should report zero issues. Now try uncommenting the `bad/1`
 function in `consumer.ex` and re-run — you'll see an opacity warning
 identifying the offending line.
 
+### Why this works
+
+`@opaque t :: %__MODULE__{...}` exports the type name to callers while
+telling Dialyzer "treat anything produced inside this module as an
+abstract token". When a caller writes `user_id.value` or
+`%UserId{value: v}`, Dialyzer sees the attempt to unpack a value that
+should be opaque and emits an opacity warning with the exact file:line.
+The VM isn't involved — the struct is still a struct at runtime — but
+the typing discipline catches accidental leaks before they merge.
+
+---
+
+## Benchmark
+
+<!-- benchmark N/A: el costo de construir un struct vs una string es
+sub-nanosegundo; no es el criterio de decisión. -->
+
 ---
 
 ## Trade-offs and production gotchas
@@ -243,6 +286,17 @@ For internal modules your team fully controls. The ceremony of
 constructors + accessors isn't worth it. `@opaque` shines at **library
 boundaries** and at **bounded-context edges** where you don't control the
 caller.
+
+---
+
+## Reflection
+
+- You ship version 1 of a library with `@type t :: String.t()`. Six months
+  later you want tenant support. Compare the upgrade path from `@type`
+  vs `@opaque` — what changes, and what breaks for whom?
+- A caller needs to log `UserId.t()` values for debugging. Design the
+  `Inspect` implementation that balances opacity with operational
+  usefulness.
 
 ---
 

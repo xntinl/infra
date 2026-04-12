@@ -59,6 +59,18 @@ LSM-trees invert this: all writes are sequential. Data is first written to a WAL
 
 ---
 
+## Design decisions
+
+**Option A — B-tree (or B+tree) on disk**
+- Pros: great for read-heavy workloads; balanced tree guarantees O(log N) everything.
+- Cons: in-place writes require random I/O and WAL; write amplification under high insert rates.
+
+**Option B — LSM tree with memtable + sorted string tables** (chosen)
+- Pros: all writes are sequential appends; compaction batches disk work; memtable absorbs bursts.
+- Cons: reads may touch multiple SSTables; compaction adds background write amplification.
+
+→ Chose **B** because the workload we're targeting (ingest-heavy, analytical reads) is exactly the one LSM was designed for; B-tree's in-place update cost is the wrong trade-off.
+
 ## Implementation milestones
 
 ### Step 1: Create the project
@@ -639,6 +651,21 @@ Benchee.run(
 
 Targets: 100k sequential writes/second, 200k random reads/second (warm Bloom filter).
 
+### Why this works
+
+Writes hit an in-memory skiplist; when it fills, it's flushed as an immutable SSTable. Compaction merges overlapping SSTables into larger levels, which bounds the number of files a read must consult and amortizes disk work.
+
+---
+
+## Benchmark
+
+```elixir
+# bench/lsm_bench.exs
+Benchee.run(%{"put" => fn -> Lsm.put(db, k(), v()) end, "get" => fn -> Lsm.get(db, k()) end}, time: 10)
+```
+
+Target: 500,000 puts/second (memtable) and 10,000 gets/second at a 10 GB working set; p99 get < 5 ms.
+
 ---
 
 ## Trade-off analysis
@@ -671,6 +698,11 @@ If the Bloom filter is built only in memory, a process restart requires reading 
 
 **4. Compaction running while snapshots are active**
 Compaction must not discard a tombstone if any active snapshot could still see the key before the tombstone. Track the minimum snapshot sequence number and only compact below it.
+
+## Reflection
+
+- Under uniform-random reads vs hot-key reads, which compaction policy (size-tiered vs leveled) wins, and why?
+- How would you tune the memtable size and compaction triggers if disk I/O were 10x slower (e.g., spinning disks)?
 
 ---
 

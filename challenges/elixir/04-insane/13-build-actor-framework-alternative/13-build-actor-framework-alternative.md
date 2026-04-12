@@ -55,6 +55,18 @@ The second problem is location transparency. `GenServer.call(pid, msg)` only wor
 
 ---
 
+## Design decisions
+
+**Option A — Thin wrapper over GenServer**
+- Pros: inherits OTP supervision for free.
+- Cons: can't tune mailbox semantics or scheduling; you're not actually building an actor framework, just decorating one.
+
+**Option B — Custom process with `:proc_lib` and explicit mailbox handling** (chosen)
+- Pros: direct control over receive patterns, priority mailboxes, and message selection; can experiment with selective receive and actor-private state.
+- Cons: must re-implement every OTP feature you want (sys messages, code upgrades, shutdown).
+
+→ Chose **B** because a framework whose distinguishing feature is how it handles messages must control the message loop — a GenServer wrapper hides exactly the part you're trying to teach.
+
 ## Implementation milestones
 
 ### Step 1: Create the project
@@ -388,6 +400,21 @@ Benchee.run(
 
 Target: TypedActors throughput within 30% of GenServer for calls, 20% for casts.
 
+### Why this works
+
+Each actor runs a custom `:proc_lib` process with a hand-written receive loop that uses selective receive to prioritize system messages. Per-actor state is passed explicitly through the loop, which keeps the actor purely functional and easy to test.
+
+---
+
+## Benchmark
+
+```elixir
+# bench/actor_bench.exs
+Benchee.run(%{"ping_pong" => fn -> send(actor, {:ping, self()}); receive do _ -> :ok end end}, time: 10)
+```
+
+Target: 1,000,000 messages/second in a ping-pong loop between two local actors.
+
 ---
 
 ## Trade-off analysis
@@ -417,6 +444,11 @@ When you call `update_behavior/2`, messages already in the GenServer mailbox wil
 
 **4. UnknownMessageError not listing declared types**
 The error message must include the list of declared types to be useful. Without this, the developer sees `UnknownMessageError: got %BadMsg{}` and has no idea what types are valid. Accumulate the types in `@declared_messages` and embed them in the error struct.
+
+## Reflection
+
+- OTP gives you `sys` trace, hot code load, and `:handle_continue`. Which of these would you add first to your framework, and what is the cost in code size?
+- Under what workload would your custom mailbox strictly beat GenServer, and by how much? Propose a benchmark.
 
 ---
 

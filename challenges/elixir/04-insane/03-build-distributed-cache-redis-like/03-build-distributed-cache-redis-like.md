@@ -59,6 +59,18 @@ You need a cache that multiple services connect to over TCP using the Redis prot
 
 ---
 
+## Design decisions
+
+**Option A — Modulo-N sharding (`hash(key) mod N`)**
+- Pros: trivial to implement; zero lookup structure.
+- Cons: adding or removing a node remaps almost every key; cache hit rate collapses on every topology change.
+
+**Option B — Consistent hashing with virtual nodes** (chosen)
+- Pros: only `1/N` of keys move on a topology change; hot-spot mitigation via vnodes; well-known invariants.
+- Cons: ring lookup is O(log N) instead of O(1); more bookkeeping per join/leave.
+
+→ Chose **B** because the cost of a single rebalance under mod-N (cold cache → origin stampede) dominates any lookup savings; consistent hashing is the only choice once topology isn't static.
+
 ## Implementation milestones
 
 ### Step 1: Create the project
@@ -399,6 +411,21 @@ Benchee.run(
 
 Target: 100,000 reads/second and 50,000 writes/second with AOF enabled and R=2 quorum.
 
+### Why this works
+
+Each key maps to exactly one primary owner on the ring, and replicas follow the next R-1 vnodes clockwise. Because vnodes are hash-distributed, adding a node moves only its share of keys, and reads can fall back to replicas without violating the ownership invariant.
+
+---
+
+## Benchmark
+
+```elixir
+# bench/cache_bench.exs — see Implementation Step for full script
+# mix run bench/cache_bench.exs
+```
+
+Target: 100k GETs/s and 50k PUTs/s aggregate across 3 nodes on localhost; p99 < 2 ms.
+
 ---
 
 ## Trade-off analysis
@@ -431,6 +458,11 @@ ETS `:ordered_set` orders by key, not by access time. To implement LRU, you must
 
 **5. Blocking the accept loop**
 The accept loop must only call `:gen_tcp.accept/1` and spawn a handler process. Any work beyond that blocks new connections. Each connection runs in its own process.
+
+## Reflection
+
+- If you had to guarantee linearizable reads (not just eventual), would you keep the replica-fallback read path? Prove your answer with a concrete interleaving.
+- Suppose 1% of your keys drive 50% of traffic. Would vnode count alone fix the hot-spot problem, or would you add per-key replication / request coalescing? Justify.
 
 ---
 

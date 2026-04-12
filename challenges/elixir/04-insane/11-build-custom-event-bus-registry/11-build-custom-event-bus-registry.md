@@ -57,6 +57,18 @@ The registry must have O(1) lookup and automatic cleanup when processes die. The
 
 ---
 
+## Design decisions
+
+**Option A — Central dispatcher GenServer**
+- Pros: easy to reason about ordering; single place to add middleware.
+- Cons: becomes the bottleneck at high fan-out; one slow subscriber stalls the bus.
+
+**Option B — ETS-backed registry with sender-side fan-out** (chosen)
+- Pros: publishers read subscriber list from ETS with zero copy and send directly; no central hop; slow subscribers only hurt themselves.
+- Cons: ordering guarantees are per-sender, not global.
+
+→ Chose **B** because the whole reason to skip the central dispatcher is to remove the head-of-line blocking it introduces — this is the pattern Phoenix.PubSub uses for exactly this reason.
+
 ## Implementation milestones
 
 ### Step 1: Create the project
@@ -485,6 +497,21 @@ Benchee.run(
 )
 ```
 
+### Why this works
+
+Subscriptions are rows in an ETS `:bag` keyed by topic, so lookup is O(1) and concurrent-safe. The publisher sends directly to each subscriber PID, which means backpressure surfaces naturally through mailbox length on the slow subscriber rather than the bus.
+
+---
+
+## Benchmark
+
+```elixir
+# bench/bus_bench.exs
+Benchee.run(%{"publish_1000_subs" => fn -> Bus.publish(:topic, msg) end}, time: 10)
+```
+
+Target: 200,000 messages/second published to a 1000-subscriber topic on a single node.
+
 ---
 
 ## Trade-off analysis
@@ -514,6 +541,11 @@ A subscriber that is slow or crashed causes the publisher to retry at the config
 
 **4. Cross-node subscriptions not cleaned up on node disconnect**
 When a remote node disconnects, subscriptions registered by processes on that node must be removed. Monitor the node with `Node.monitor/2` and clean up on `:nodedown`.
+
+## Reflection
+
+- If one subscriber blocks on a 100 ms disk write per message, how does the rest of the bus behave? What guardrails would you add?
+- Would you change the design if subscribers needed exactly-once delivery? Justify the trade-off.
 
 ---
 

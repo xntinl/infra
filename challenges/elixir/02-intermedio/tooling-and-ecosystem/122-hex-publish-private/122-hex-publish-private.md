@@ -4,9 +4,6 @@
 `mix hex.publish`, demonstrating the split between public publishing and
 private-organization publishing.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
-
 ---
 
 ## Project context
@@ -96,6 +93,38 @@ gives you a confusing "no package found" error.
 `mix hex.build` produces a local tarball and prints what's inside. Run it
 BEFORE `hex.publish`, every single time. It's the only safeguard against
 shipping secrets or unwanted files.
+
+---
+
+## Why Hex private orgs and not a Git dep
+
+A Git dep (`{:lib, git: "git@github.com:org/lib.git", tag: "v0.1.0"}`)
+works for sharing closed code, but it has three sharp edges: no immutable
+versions (a tag can be force-moved), no resolved dep graph (your tag may
+depend on Git tags of other libs recursively), and no docs hosting. Hex
+private orgs give you immutable versions, proper resolution, and
+hexdocs.pm in one step. Git deps are fine for one-off prototypes; once
+more than one team consumes a lib, pay for the org.
+
+---
+
+## Design decisions
+
+**Option A — Publish everything to public Hex**
+- Pros: Free; zero auth ceremony; the widest reach.
+- Cons: Impossible if the code is proprietary; leaks internal naming
+  conventions and architecture; immutable forever.
+
+**Option B — Private org on hex.pm** (chosen)
+- Pros: Same workflow as public Hex (same `mix.exs` shape, same commands),
+  immutable versions, hosted docs, proper dep resolution.
+- Cons: Paid; every consumer (humans + CI) needs `mix hex.organization
+  auth`; forgetting the `organization:` flag on a dep produces a confusing
+  "not found" error.
+
+→ Chose **B** because closed-source libraries shared across teams need
+  the same guarantees as public Hex (immutability, resolution) without
+  exposing the code.
 
 ---
 
@@ -262,6 +291,23 @@ mix hex.user auth
 # mix hex.publish --organization your_org
 ```
 
+### Why this works
+
+The `package/0` whitelist is the only source of truth Hex consults when
+building the tarball, so declaring `files:` explicitly gives you a
+reviewable list instead of the implicit default. `mix hex.build` produces
+the exact artifact that would be uploaded, so `tar tf` is a reliable
+audit. The `organization:` field on the package and the dep side give
+the same library two routing modes (public vs private) through one
+configuration surface.
+
+---
+
+## Benchmark
+
+<!-- benchmark N/A: publishing is a one-shot network operation; the
+     relevant metric is correctness of the tarball, not throughput. -->
+
 ---
 
 ## Trade-offs and production gotchas
@@ -298,6 +344,19 @@ private dep needs the flag.
   an umbrella or as a path dep during development.
 - It contains proprietary code you cannot leak publicly — use a private
   org or Git, never public Hex.
+
+---
+
+## Reflection
+
+- Your company has 14 internal libraries. Two choices: publish each to
+  the private org, or use Git deps via SSH. Under what team size / release
+  cadence does the Hex org pay off, and when is Git deps still the
+  pragmatic choice?
+- A junior accidentally shipped a version with a hardcoded token to the
+  private org. `mix hex.retire` marks it as retired, but the tarball is
+  still downloadable. What process and tooling changes would you put in
+  place to make that class of bug impossible, not just retrievable?
 
 ---
 

@@ -3,9 +3,6 @@
 **Project**: `capture_log_demo` — a `PaymentGateway` module that logs each
 attempt, tested with `ExUnit.CaptureLog` to assert on log content.
 
-**Difficulty**: ★★☆☆☆
-**Estimated time**: 1–2 hours
-
 ---
 
 ## Project context
@@ -18,6 +15,20 @@ the log exists are first-line observability.
 `ExUnit.CaptureLog` is the idiomatic answer. It captures the log output
 of a block, returns it as a string, and suppresses it from the console.
 You assert on the string. No mocking Logger, no weird handlers.
+
+## Why `ExUnit.CaptureLog` and not X
+
+**Why not mock `Logger` itself?** Logger is a complex async pipeline
+(backends, metadata, formatters). Mocking it means reimplementing half
+of OTP in the test. CaptureLog drops in at the right seam.
+
+**Why not a custom `Logger` backend in `test_helper.exs`?** You could, but
+now every test shares one backend and you lose isolation across `async`
+tests. CaptureLog is per-block and per-process.
+
+**Why not just disable logging in tests?** Because the log line **is** part
+of the contract for an incident-debuggable system. Asserting on it is the
+cheapest observability test you can write.
 
 Project structure:
 
@@ -69,6 +80,23 @@ you `use ExUnit.Case, async: true` AND set `capture_log: true` in
 Don't assert on timestamps, PIDs, or the exact output format — Logger
 formatters change. Assert on the **business message**: the error code,
 the user id, the action name.
+
+---
+
+## Design decisions
+
+**Option A — Assert exact log strings**
+- Pros: Precise; catches formatting regressions.
+- Cons: Breaks on every Logger formatter tweak; tests become maintenance
+  burden.
+
+**Option B — Assert on stable phrases (`=~`)** (chosen)
+- Pros: Robust to formatter changes; captures the behavioral contract.
+- Cons: A typo in the expected substring could match by accident.
+
+→ Chose **B**. The log line is part of behavior, but the formatter is not
+your concern — assert on business-relevant substrings (error code, user id)
+and use regex (`~r/amount=\d+/`) when you need structural matches.
 
 ---
 
@@ -191,6 +219,22 @@ mix test
 mix test --trace
 ```
 
+### Why this works
+
+`ExUnit.CaptureLog` temporarily attaches a capture backend scoped to the
+calling process and the duration of the fun. Messages emitted inside the
+block go to the capture instead of the normal backends; the function
+returns the captured string after a flush. Because the capture is
+process-scoped, `async: true` tests can use it in parallel without
+cross-contamination — as long as `capture_log: true` is in
+`test_helper.exs`.
+
+---
+
+## Benchmark
+
+<!-- benchmark N/A: tema sobre aserciones en tests; no hay workload a medir. -->
+
 ---
 
 ## Trade-offs and production gotchas
@@ -219,6 +263,19 @@ For structured logging (`Logger.metadata/1`, JSON formatters), you're
 better off attaching a test-only Logger backend that captures structured
 events, or using `:telemetry` which is designed for this. CaptureLog is
 for human-readable messages.
+
+---
+
+## Reflection
+
+- Your team rolls out a new JSON logger for production and half the
+  CaptureLog assertions break. What changes in the assertion style to
+  survive both backends, and is there a deeper problem the test was
+  supposed to catch?
+- You want to verify that "no warnings are emitted on the happy path"
+  for a critical flow. Write the smallest CaptureLog test that encodes
+  that invariant, and explain how it fails when someone adds a stray
+  `Logger.warning/1`.
 
 ---
 

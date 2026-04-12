@@ -2,9 +2,6 @@
 
 **Project**: `umbrella_services` — three OTP apps under one umbrella, deployed as one release.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 4–5 hours
-
 ---
 
 ## Project context
@@ -138,7 +135,31 @@ end
 
 ---
 
+## Why umbrella and not poncho
+
+Poncho gives stricter isolation — each app has its own `deps`, config, and release. That wins when one of the apps will genuinely be extracted to its own repo on its own deploy cadence. In this system, the three apps ship together on one VM, share the same TLS certs, and have never been deployed separately. Paying poncho's boilerplate tax for isolation that is never exercised is pure cost. Umbrella's shared `deps`, shared `config`, and single release match the deployment shape; the per-app `mix.exs` still enforces module-level boundaries.
+
+---
+
+## Design decisions
+
+**Option A — single monolithic app with internal contexts**
+- Pros: zero boilerplate; one `mix.exs`; trivial `iex -S mix`.
+- Cons: nothing enforces the context boundary; config conflicts; 150 k LOC recompiles together; teams collide on a single `application.ex`.
+
+**Option B — umbrella with three child apps** (chosen)
+- Pros: enforced app-level boundaries (you can't accidentally depend on a transitive module); per-app test suites; cached per-app compilation; `applications:` list gives declarative start order; one release artifact.
+- Cons: directory overhead; release config is per-umbrella; extracting an app later requires mechanical (but real) work.
+
+→ Chose **B** because the pain described (90 s compile, shared config conflicts, team coupling) is exactly what umbrella's per-app boundaries solve, and the deploy shape stays single-artifact.
+
+---
+
 ## Implementation
+
+### Dependencies (umbrella root `mix.exs`)
+
+The root project declares no runtime deps — children declare their own. Each child's `mix.exs` lists its `applications:` to control start order.
 
 ### Step 1: Root `mix.exs`
 
@@ -416,6 +437,10 @@ mix test
 # Runs all apps' tests. Use `mix test apps/pricing` to scope.
 ```
 
+### Why this works
+
+Each child's `application.ex` declares its `applications:` list; this is the single source of truth OTP uses to compute a topological sort of app starts. `catalog` declares only `[:logger]`, so it starts first. `pricing` declares `[:logger, :catalog]`, forcing `catalog`'s supervisor to be fully up before `pricing.init/1` runs. `checkout` declares both. By the time a cross-app `GenServer.call/2` happens in production, every upstream supervisor has completed its start callback — no `:noproc` races possible.
+
 ### Step 7: Building the release
 
 ```bash
@@ -455,11 +480,20 @@ Order is guaranteed by `extra_applications`. If `pricing` starts before `catalog
 
 ---
 
-## Performance notes
+## Benchmark
 
 Umbrella compile time scales near-linearly with app count if apps compile in parallel (Elixir 1.14+ does this automatically for independent apps). The shared `_build` means stdlib modules compile once, not N times.
 
 Release size for this toy umbrella: ~35 MB (most of which is ERTS). Adding apps adds only their BEAM files. The real cost is `deps/` if each app has distinct deps — prefer to hoist common deps to the umbrella root.
+
+Target: umbrella `mix compile` cold ≤ 30 s for a 3-app tree of ~5 k LOC each; incremental re-compile on a single-app change ≤ 2 s; release artifact ≤ 50 MB.
+
+---
+
+## Reflection
+
+1. One of the three apps (`checkout`) starts needing its own scaling profile — you want to run 10 instances of it behind a load balancer while `catalog` and `pricing` remain single-node. Do you extract `checkout` to its own mix project, keep it in the umbrella and deploy the whole VM 10 times, or split into two releases from the same umbrella? What does each cost in ops and code duplication?
+2. A new dev accidentally imports `Catalog.Repo` directly from `checkout`, bypassing the public API boundary. `mix compile` succeeds because they're in the same umbrella. How would you enforce boundaries at compile time without extracting the apps to separate repos?
 
 ---
 

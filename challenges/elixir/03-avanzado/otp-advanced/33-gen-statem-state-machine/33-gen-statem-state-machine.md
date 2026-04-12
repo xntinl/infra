@@ -2,10 +2,6 @@
 
 **Project**: `tcp_connection_fsm` — a TCP handshake state machine that models `CLOSED → SYN_SENT → ESTABLISHED → FIN_WAIT → CLOSED` using `:gen_statem` with `:state_functions` callback mode.
 
-**Difficulty**: ★★★★☆
-
-**Estimated time**: 4–6 hours
-
 ---
 
 ## Project context
@@ -98,11 +94,40 @@ Actions are a list of effects OTP executes on your behalf: `{:reply, from, respo
 
 ### 6. Postponing events
 
-Postpone is the `:gen_statem` superpower. If an event arrives in a state that shouldn't handle it yet but *will* in a future state, return `{:postpone, true}`. OTP re-delivers it after the next successful state transition. This is how `:gen_statem` elegantly handles the "out-of-order event" problem covered in exercise 75.
+Postpone is the `:gen_statem` superpower. If an event arrives in a state that shouldn't handle it yet but *will* in a future state, return `{:postpone, true}`. OTP re-delivers it after the next successful state transition. This is how `:gen_statem` elegantly handles the "out-of-order event" problem: the event is kept in an internal queue and automatically re-played against the new state's callbacks, with no explicit buffer on your side.
+
+---
+
+## Why `:gen_statem` and not GenServer with a status field
+
+A GenServer implementing the same FSM requires every `handle_call`/`handle_cast` to branch on `state.status`, scattering the invariants across every callback. When you add a new state, you must update N callbacks. `:gen_statem` collapses each state to its own function (in `:state_functions` mode), so a new state is one new function, and the dispatcher is OTP. Add `postpone`, `state_timeout`, and named generic timeouts — which require ref-juggling in GenServer — and the organizational delta compounds. GenServer stays right for 1–2 status modes; `:gen_statem` is right above that.
+
+---
+
+## Design decisions
+
+**Option A — `:handle_event_function` (single callback)**
+- Pros: one entry point; states can be structured terms `{:waiting, n}`; supports nested/hierarchical sub-states via pattern matching.
+- Cons: every event passes through one function; pattern-matching on (state, event) grows combinatorially; harder to grep for "what handles event X in state Y".
+
+**Option B — `:state_functions` (one function per state)** (chosen)
+- Pros: each state is a named function; adding a state is a local change; callbacks are easy to locate; test names read naturally.
+- Cons: states must be atoms; no structured-state sugar; hierarchical FSMs require manual encoding.
+
+→ Chose **B** because the TCP handshake is flat, atomic, and standard-reference — states map 1:1 to atoms. `:handle_event_function` pays for flexibility we don't need.
 
 ---
 
 ## Implementation
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defp deps do
+  []
+end
+```
+
 
 ### Step 1: `mix.exs`
 
@@ -351,6 +376,10 @@ defmodule TcpConnectionFsm.ConnectionTest do
 end
 ```
 
+### Why this works
+
+Each state's function pattern-matches on event type (`:call`, `:cast`, `:state_timeout`) and payload, so invalid transitions fall through to a catch-all that replies with a domain-specific error instead of crashing. `{:state_timeout, 3000, :syn_ack}` is cancelled automatically on state change, so there are no dangling timer refs. `{:postpone, true}` moves the `:close` call into an internal queue where OTP re-delivers it after `:established` arrives — the caller blocks on `:gen_statem.call` until the handshake completes, exactly matching real TCP behaviour.
+
 ---
 
 ## Trade-offs and production gotchas
@@ -385,6 +414,15 @@ Transition cost (local, M1 Max):
 | postponed event re-delivery            | 3 µs    |
 
 Comparable to GenServer within 10%. The cost is worth it for the organizational win on any FSM > 3 states.
+
+Target: transition latency ≤ 5 µs; postponed-event re-delivery ≤ 10 µs; no timer refs held outside `:gen_statem` internals.
+
+---
+
+## Reflection
+
+1. A new requirement adds a `CLOSE_WAIT` state for passive close (peer initiates FIN). How many functions do you add, and which existing ones change? Compare the delta to what a GenServer-with-status-field implementation would require.
+2. Your FSM models a single peer. Under 100k concurrent connections, `:state_functions` mode allocates one function-lookup dispatch per event. Would you migrate to `:handle_event_function` to reduce dispatch overhead, or would the readability loss dominate? What would you measure to decide?
 
 ---
 

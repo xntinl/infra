@@ -2,9 +2,6 @@
 
 **Project**: `role_permission_matcher` — decides allow/deny for (role, resource) pairs using `case` + `when` clauses
 
-**Difficulty**: ★★☆☆☆
-**Estimated time**: 2 hours
-
 ---
 
 ## Project structure
@@ -62,6 +59,22 @@ The engine must be fast (runs on every request), auditable (decisions must
 be explainable), and deny-by-default.
 
 ---
+
+## Why `case` + guards and not a lookup table (map of rules)
+
+A lookup table is better when rules are truly tabular (role -> resource set). But once rules include context (`role == :admin and resource not in [:audit_log]`), `case` + guards expresses the logic more compactly than building tables dynamically.
+
+## Design decisions
+
+**Option A — `case` with `when` guards in each clause**
+- Pros: Each (role, resource) rule is a one-liner, guards are visible at the top of each clause
+- Cons: Guards can only use a restricted set of functions (no arbitrary calls)
+
+**Option B — nested `if` inside a single `case` branch** (chosen)
+- Pros: Can use arbitrary function calls in conditions
+- Cons: Logic hidden inside the clause body; clauses become hard to compare at a glance
+
+→ Chose **A** because role-permission rules fit naturally into the guard language (comparisons, `in`, boolean composition).
 
 ## Implementation
 
@@ -297,6 +310,26 @@ mix test
 
 ---
 
+### Why this works
+
+The approach chosen above keeps the core logic **pure, pattern-matchable, and testable**. Each step is a small, named transformation with an explicit return shape, so adding a new case means adding a new clause — not editing a branching block. Failures are data (`{:error, reason}`), not control-flow, which keeps the hot path linear and the error path explicit.
+
+## Benchmark
+
+```elixir
+{time_us, _result} =
+  :timer.tc(fn ->
+    for _ <- 1..1_000 do
+      # representative call of can?/3 over 1M authorizations
+      :ok
+    end
+  end)
+
+IO.puts("Avg: #{time_us / 1_000} µs/call")
+```
+
+Target: **< 20ms total; < 20ns per check**.
+
 ## Trade-offs and production mistakes
 
 **1. Arbitrary functions forbidden in guards**
@@ -333,6 +366,12 @@ instead of denying. Your choice: crash or deny; never implicit allow.
   engines. A single `case` with dozens of patterns is hard to audit.
 
 ---
+
+## Reflection
+
+If your permission model grew to support row-level permissions (a user can edit *their own* document but not others'), could you still express it with `case` + guards? At what point would you reach for a dedicated policy library like `Bodyguard`?
+
+Your security team requires an audit log of every denied permission. Where would you hook that in without scattering logging calls across every clause?
 
 ## Resources
 

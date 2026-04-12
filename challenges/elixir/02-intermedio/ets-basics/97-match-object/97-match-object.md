@@ -4,9 +4,6 @@
 patterns, wildcards `:_`, and bindings `:"$1"`/`:"$2"`, without reaching for
 a full match spec.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
-
 ---
 
 ## Project context
@@ -21,6 +18,21 @@ This is the 80%-case API: simpler than match specs, more restricted,
 but enough for most "filter by field shape" queries. In real code you'll
 see all three — `match/2`, `match_object/2`, and `select/2` — and it's
 worth knowing exactly what each returns.
+
+## Why match patterns and not X
+
+**Why not always use `:ets.select/2` with a match spec?** Overkill for shape
+queries. A match pattern `{:_, :"$1", :admin}` is read instantly; the
+equivalent match spec wraps it in a 3-tuple with empty guards and a body.
+For pure shape filtering, the pattern API is the right abstraction.
+
+**Why not `:ets.foldl/3` + Elixir filtering?** Because every discarded tuple
+is still copied out of ETS before your fun rejects it. Match patterns filter
+**inside** the ETS engine — only matching tuples cross the boundary.
+
+**Why not `lookup/2`?** `lookup/2` needs the key; match patterns work when
+you want to query **by non-key fields** (e.g. "all admins", where `:admin`
+is in position 3, not the key).
 
 Project structure:
 
@@ -65,8 +77,8 @@ randomly shaped data but occasionally elegant for "self-referencing" rows.
 ### 4. Match patterns can't do guards
 
 You can't write "`:"$1" > 10`" in a match pattern. The moment you need a
-comparison, you graduate to `:ets.select/2` with a full match spec
-(exercise 98). Match patterns = equality and shape only.
+comparison, you graduate to `:ets.select/2` with a full match spec. Match
+patterns = equality and shape only.
 
 ### 5. When the first element is bound, there's no key-index optimization
 
@@ -74,6 +86,23 @@ comparison, you graduate to `:ets.select/2` with a full match spec
 a key-position-1 table) is essentially `lookup/2` with a reshape — OTP
 doesn't do anything smarter. If the key is known, **use `lookup/2`**; it's
 clearer and exactly as fast.
+
+---
+
+## Design decisions
+
+**Option A — `:ets.match/2` returning binding lists**
+- Pros: Lean return; only the fields you asked for are copied.
+- Cons: Shape is `[[v1], [v2]]` — a list-of-lists that needs reshaping.
+
+**Option B — `:ets.match_object/2` returning full tuples** (chosen for most APIs)
+- Pros: Return shape matches stored shape; ergonomic downstream.
+- Cons: Copies every field of matching tuples, even ones you don't need.
+
+→ Chose **both, side by side** in this exercise to make the trade-off visible.
+The rule of thumb in production: use `match/2` when projecting a few fields
+from wide tuples; use `match_object/2` when you'd end up reconstructing the
+tuple anyway.
 
 ---
 
@@ -222,6 +251,38 @@ end
 mix test
 ```
 
+### Why this works
+
+Match patterns are a **literal shape** against which each stored tuple is
+unified: literal atoms (`:admin`) must match exactly, `:_` matches-and-discards,
+`:"$N"` captures. The ETS engine evaluates the pattern inside its own heap
+before copying, so non-matching tuples never cross the boundary — which is
+why `match_object/2` over a big table still beats a naive `foldl + filter` in
+Elixir. The difference between `match/2` and `match_object/2` is purely at
+the return-shape layer; the scanning cost is the same.
+
+---
+
+## Benchmark
+
+```elixir
+# Projection vs full-tuple copy on a wide-tuple table.
+t = :ets.new(:b, [:set, :public])
+for i <- 1..100_000 do
+  :ets.insert(t, {i, "user_#{i}", :admin, %{payload: :rand.bytes(256)}})
+end
+
+{us_proj, _} = :timer.tc(fn -> :ets.match(t, {:"$1", :_, :admin, :_}) end)
+{us_full, _} = :timer.tc(fn -> :ets.match_object(t, {:_, :_, :admin, :_}) end)
+
+IO.puts("match (projection): #{us_proj}µs  match_object (full): #{us_full}µs")
+:ets.delete(t)
+```
+
+Target esperado: con tuplas anchas (payload de 256 bytes), `match/2`
+proyectando solo el id es 3–10× más rápido que `match_object/2`, porque el
+copy-out omite los 256 bytes por tupla.
+
 ---
 
 ## Trade-offs and production gotchas
@@ -233,8 +294,7 @@ is `:_` or `:"$1"`, the engine scans the whole table. Know your table size.
 
 **2. `match/2` cannot express comparisons**
 `>`, `<`, `!=` are not available in match patterns. Hitting this limit is
-the signal that it's time for `:ets.select/2` with a match spec
-(exercise 98) or `fun2ms`.
+the signal that it's time for `:ets.select/2` with a match spec or `fun2ms`.
 
 **3. Return-shape trap: `match/2` returns a list-of-lists**
 Every time. Even if your pattern has one binding, you get `[[v1], [v2], ...]`,
@@ -254,8 +314,20 @@ loop of `delete/2` — and atomic from the table's point of view.
 **6. When NOT to use match patterns**
 - When the key is known: use `lookup/2`.
 - When you need comparisons or complex logic: use `select/2` + match spec.
-- When you want an ergonomic API: use `fun2ms` (exercise 98) and get a
-  match spec generated from a fun.
+- When you want an ergonomic API: use `fun2ms` and get a match spec
+  generated from a fun.
+
+---
+
+## Reflection
+
+- You have a table of 5M `{id, email, role, tenant_id, ...}` rows. Queries
+  are always "admins for tenant T". Would `match_object/2` be acceptable,
+  or would you add a secondary index table? At what scale does the
+  secondary index win?
+- A teammate proposes replacing all your `match/2` calls with
+  `:ets.foldl/3 + Enum.filter` for "readability". What's the performance
+  argument against that, and when would you accept the trade?
 
 ---
 
@@ -266,3 +338,4 @@ loop of `delete/2` — and atomic from the table's point of view.
 - [`:ets.match_delete/2`](https://www.erlang.org/doc/man/ets.html#match_delete-2)
 - ["Learn You Some Erlang — ETS"](https://learnyousomeerlang.com/ets) — match patterns walkthrough
 - [Erlang match spec reference](https://www.erlang.org/doc/apps/erts/match_spec.html) — for when patterns aren't enough
+

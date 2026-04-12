@@ -48,6 +48,20 @@ analytics/
 
 ---
 
+## Design decisions
+
+**Option A — write each transformation as a named function that takes and returns a list**
+- Pros: each step is individually testable; the pipeline reads top-to-bottom; discoverable for readers new to `Enum`.
+- Cons: many small functions for what could be expressive one-liners; intermediate lists allocated at each step; performance penalty on large inputs.
+
+**Option B — chain `Enum` functions via `|>` inside higher-level operations** (chosen)
+- Pros: idiomatic Elixir; the pipeline reads like a SQL query; fewer moving parts; `Stream` can be swapped in where laziness matters without reshaping the code.
+- Cons: intermediate `Enum` passes still allocate (only `Stream` avoids that); debugging a failing pipe stage requires breaking the chain or using `IO.inspect/2`.
+
+Chose **B** because the language optimizes for this shape: the pipe operator, `Enum`'s uniform signatures, and `Stream`'s drop-in laziness all assume you compose transformations left-to-right. Naming each step is sometimes right, but only when the step carries non-trivial business meaning.
+
+---
+
 ## Implementation
 
 ### `lib/analytics.ex`
@@ -408,6 +422,49 @@ end
 mix test --trace
 ```
 
+### Why this works
+
+Every `Enum` function takes an enumerable, produces a new enumerable, and never touches the input. That turns each pipe stage into a pure function whose only contract is shape-in / shape-out — testable in isolation, composable in any order, safe to reuse from concurrent processes because immutability removes the shared-mutable-state class of bugs. The BEAM's per-process heap and persistent data structures mean "new list at each step" is cheap: structural sharing keeps allocations bounded, and short-lived garbage is collected almost for free.
+
+---
+
+## Benchmark
+
+```elixir
+# bench.exs
+defmodule Bench do
+  def run do
+    events =
+      for i <- 1..100_000 do
+        %{id: i, user_id: rem(i, 500), type: Enum.random([:click, :view, :buy]), amount: i}
+      end
+
+    {enum_us, _} =
+      :timer.tc(fn ->
+        events
+        |> Enum.filter(&(&1.type == :buy))
+        |> Enum.group_by(& &1.user_id, & &1.amount)
+        |> Enum.map(fn {uid, amts} -> {uid, Enum.sum(amts)} end)
+      end)
+
+    {stream_us, _} =
+      :timer.tc(fn ->
+        events
+        |> Stream.filter(&(&1.type == :buy))
+        |> Enum.group_by(& &1.user_id, & &1.amount)
+        |> Enum.map(fn {uid, amts} -> {uid, Enum.sum(amts)} end)
+      end)
+
+    IO.puts("Enum   100k events: #{enum_us} µs")
+    IO.puts("Stream 100k events: #{stream_us} µs")
+  end
+end
+
+Bench.run()
+```
+
+Target: under 80 ms for the full Enum pipeline on 100k events. `Stream` shines when you add `.take(n)` at the end; with `group_by` as a terminal operation, the benefit shrinks.
+
 ---
 
 ## Lazy vs eager: when to use Stream
@@ -467,6 +524,13 @@ key preserves their original relative order.
 Coming from JavaScript, you might write `Map.put(acc, key, value)` thinking
 you are mutating `acc`. You are not — `Map.put` returns a new map. This is
 correct but sometimes confusing.
+
+---
+
+## Reflection
+
+1. Your analytics module runs all pipelines in-process. Events now arrive at 10k/sec and a single summary takes 200 ms. Do you parallelize with `Task.async_stream/3`, switch to `Flow`, precompute per-bucket aggregates incrementally, or push the aggregation to the database? What are the failure modes of each?
+2. An `Enum.reduce/3` one-liner combines filter+group+sum into a single pass. At what point does consolidating multiple `Enum` passes into a single reduce become worth the readability hit? Describe a concrete signal that the refactor pays off.
 
 ---
 

@@ -4,9 +4,6 @@
 table type behaves when you insert duplicates, look up by key, and traverse
 in order.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
-
 ---
 
 ## Project context
@@ -21,6 +18,22 @@ is almost never the right answer, yet it shows up in codebases because
 In this exercise you'll implement a tiny "tag store" four times — once per
 table type — and write tests that pin down the exact semantic difference.
 By the end you'll know, from muscle memory, which type to reach for.
+
+## Why ETS types and not a single generic table
+
+**Why not just always use `:set`?** Because some workloads genuinely want
+multi-value keys (tag indexes, subscriber lists) and forcing a `:set` there
+pushes you into storing `{key, MapSet.new([...])}` and round-tripping the
+whole set through `insert/lookup` on every mutation — slower and noisier.
+
+**Why not wrap everything in a GenServer with a `Map`?** Because the whole
+reason you picked ETS is shared memory without a serialization point. Picking
+the wrong ETS type is a smaller mistake than falling back to a GenServer
+bottleneck.
+
+**Why not `:duplicate_bag` everywhere "just in case"?** It disables the dedup
+guarantee you probably want, and at scale it leaks memory quietly when
+producers retry.
 
 Project structure:
 
@@ -79,6 +92,24 @@ Every insert adds a new tuple, duplicates and all. Useful when tuples
 carry timestamps or sequence numbers and you truly want an append-only
 log per key. Rarely what you want; almost always a `:bag` (if you're
 deduping) or a purpose-built log (if you're not) is clearer.
+
+---
+
+## Design decisions
+
+**Option A — One module per table type (`TagStore.Set`, `TagStore.Bag`, ...)**
+- Pros: Each module's semantics are self-documenting; no runtime branching.
+- Cons: Four near-identical modules; the comparison (the whole pedagogical
+  point) gets spread out and hard to diff.
+
+**Option B — One `TagStore` module parameterized by type at `new/1`** (chosen)
+- Pros: `add_tag/tags_for` code is **identical** across types — the runtime
+  behavior differs, not the code. That's exactly the lesson.
+- Cons: Slightly more defensive at `new/1` (guard on allowed types).
+
+→ Chose **B** because the whole point of the exercise is "same code, different
+table type, dramatically different result". Collapsing it into one module
+makes the diff between types visible to the reader.
 
 ---
 
@@ -228,6 +259,39 @@ end
 mix test
 ```
 
+### Why this works
+
+The four table types share one API (`:ets.insert/2`, `:ets.lookup/2`), so the
+**only** thing varying across the `demo/1` calls is the `type` passed to
+`:ets.new/2`. That isolates the semantic difference to a single axis: how
+the storage engine treats duplicate keys and duplicate tuples. The tests
+assert on the exact shape of `lookup/2`'s return — the list length tells
+you, without ambiguity, whether dedup happened.
+
+---
+
+## Benchmark
+
+```elixir
+# bench/compare.exs — rough per-type insert+lookup timing
+for type <- [:set, :ordered_set, :bag, :duplicate_bag] do
+  t = :ets.new(:b, [type, :public])
+  {us, _} =
+    :timer.tc(fn ->
+      for i <- 1..10_000, do: :ets.insert(t, {rem(i, 100), i})
+      for k <- 0..99, do: :ets.lookup(t, k)
+    end)
+  IO.puts("#{type}: #{us}µs")
+  :ets.delete(t)
+end
+```
+
+Target esperado en hardware moderno: `:set` y `:ordered_set` en el orden de
+5–15ms para 10k inserts + 100 lookups; `:bag` ~10–25ms; `:duplicate_bag`
+similar a `:bag` pero con listas de retorno crecientes (10k tuplas para una
+key "caliente"). La diferencia absoluta es secundaria; lo importante es que
+`:bag`/`:duplicate_bag` escalan con el tamaño de la lista por key.
+
 ---
 
 ## Trade-offs and production gotchas
@@ -254,14 +318,24 @@ duplicate counts do.
 **4. `:ordered_set` does not support `:write_concurrency`**
 With `write_concurrency: true` you get better write parallelism on `:set`,
 `:bag`, and `:duplicate_bag`, but the flag is ignored for `:ordered_set`.
-For write-hot workloads, this makes `:ordered_set` a concurrency
-bottleneck. See exercise 100 for the full access/concurrency story.
+For write-hot workloads, this makes `:ordered_set` a concurrency bottleneck.
 
 **5. When NOT to differentiate**
 If your store is small (a few thousand entries) and read-light, the type
 barely matters — `:set` is the safe default. The differences become
 significant at scale (>100k entries), under high concurrency, or when you
-need range queries (exercise 96) or match patterns (exercise 97).
+need range queries or match patterns.
+
+---
+
+## Reflection
+
+- Imagine a subscription system where `{topic, subscriber_pid}` pairs must
+  be unique and cheap to enumerate per topic. Which table type would you
+  pick, and what breaks if you pick `:duplicate_bag` instead?
+- If your "tag store" grew to 500k items, each with up to 50 tags, would
+  you still use `:bag`? Explain what the per-lookup cost looks like at
+  that size and what alternative representation you'd consider.
 
 ---
 

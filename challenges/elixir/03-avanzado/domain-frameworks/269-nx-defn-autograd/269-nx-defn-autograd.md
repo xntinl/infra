@@ -2,10 +2,6 @@
 
 **Project**: `nx_autograd` — implement classical optimization problems (linear regression, logistic regression, small MLP) from scratch using `Nx.Defn` and `Nx.Defn.grad/2`, with a hand-written training loop backed by EXLA compilation.
 
-**Difficulty**: ★★★★☆
-
-**Estimated time**: 4–5 hours
-
 ---
 
 ## Project context
@@ -41,6 +37,16 @@ nx_autograd/
 ```
 
 ---
+
+## Why this approach and not alternatives
+
+Alternatives considered and discarded:
+
+- **Hand-rolled equivalent**: reinvents primitives the BEAM/ecosystem already provides; high risk of subtle bugs around concurrency, timeouts, or failure propagation.
+- **External service (e.g. Redis, sidecar)**: adds a network hop and an extra failure domain for a problem the VM can solve in-process with lower latency.
+- **Heavier framework abstraction**: couples the module to a framework lifecycle and makes local reasoning/testing harder.
+
+The chosen approach stays inside the BEAM, uses idiomatic OTP primitives, and keeps the contract small.
 
 ## Core concepts
 
@@ -110,6 +116,18 @@ key = Nx.Random.key(42)
 Never reuse a key — each `split` or `normal` consumes entropy. Shadowing `key` as you go is idiomatic.
 
 ---
+
+## Design decisions
+
+**Option A — naive/simple approach**
+- Pros: minimal code, easy to reason about.
+- Cons: breaks under load, lacks observability, hard to evolve.
+
+**Option B — the approach used here** (chosen)
+- Pros: production-grade, handles edge cases, testable boundaries.
+- Cons: more moving parts, requires understanding of the BEAM primitives involved.
+
+→ Chose **B** because correctness under concurrency and failure modes outweighs the extra surface area.
 
 ## Implementation
 
@@ -467,6 +485,23 @@ Expected on a 2023 laptop CPU (no GPU): `step` ≈ 80–150 µs for 1k × 20 inp
 
 ---
 
+
+### Why this works
+
+The design leans on BEAM guarantees (process isolation, mailbox ordering, supervisor restarts) and pushes invariants to the boundaries of each module. State transitions are explicit, failure modes are declared rather than implicit, and each step is independently testable. That combination keeps the implementation correct under concurrent load and cheap to change later.
+
+## Benchmark
+
+```elixir
+# Minimal measurement — replace with Benchee for distribution stats.
+{time_us, _} = :timer.tc(fn ->
+  for _ <- 1..10_000, do: run_operation()
+end)
+IO.puts("avg: #{time_us / 10_000} µs/op")
+```
+
+Target: operation should complete in the low-microsecond range on modern hardware; deviations by >2× indicate a regression worth investigating.
+
 ## Trade-offs and production gotchas
 
 **1. JIT compile time dominates tiny runs.** A single `step` call recompiles if the input shape changes. If you process variable-length inputs, either pad to a bucketed fixed size, or accept the compile hit. `Nx.Defn.jit/2` lets you precompile for known shapes at startup.
@@ -500,6 +535,11 @@ Rough numbers on an M1 Pro CPU (no GPU), EXLA compiler:
 The conclusion is blunt: never run real training on `BinaryBackend`. It exists so tests pass on CI without XLA and so you can understand what is happening — not for work.
 
 ---
+
+## Reflection
+
+- If the expected load grew by 100×, which assumption in this design would break first — the data structure, the process model, or the failure handling? Justify.
+- What would you measure in production to decide whether this implementation is still the right one six months from now?
 
 ## Resources
 

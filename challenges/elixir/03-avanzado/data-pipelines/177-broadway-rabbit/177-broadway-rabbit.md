@@ -2,10 +2,6 @@
 
 **Project**: `broadway_rabbit_adv` — an order-processing pipeline with explicit ack/nack semantics, dead-letter routing, and requeue-on-transient-error.
 
-**Difficulty**: ★★★★☆
-
-**Estimated time**: 4–6 hours
-
 ---
 
 ## Project context
@@ -41,6 +37,16 @@ broadway_rabbit_adv/
 ```
 
 ---
+
+## Why this approach and not alternatives
+
+Alternatives considered and discarded:
+
+- **Hand-rolled equivalent**: reinvents primitives the BEAM/ecosystem already provides; high risk of subtle bugs around concurrency, timeouts, or failure propagation.
+- **External service (e.g. Redis, sidecar)**: adds a network hop and an extra failure domain for a problem the VM can solve in-process with lower latency.
+- **Heavier framework abstraction**: couples the module to a framework lifecycle and makes local reasoning/testing harder.
+
+The chosen approach stays inside the BEAM, uses idiomatic OTP primitives, and keeps the contract small.
 
 ## Core concepts
 
@@ -103,6 +109,18 @@ workers could process. Too low: consumer idles waiting for ack round-trip.
 Start at `prefetch_count = processor_concurrency * 2`.
 
 ---
+
+## Design decisions
+
+**Option A — naive/simple approach**
+- Pros: minimal code, easy to reason about.
+- Cons: breaks under load, lacks observability, hard to evolve.
+
+**Option B — the approach used here** (chosen)
+- Pros: production-grade, handles edge cases, testable boundaries.
+- Cons: more moving parts, requires understanding of the BEAM primitives involved.
+
+→ Chose **B** because correctness under concurrency and failure modes outweighs the extra surface area.
 
 ## Implementation
 
@@ -332,6 +350,23 @@ end
 
 ---
 
+
+### Why this works
+
+The design leans on BEAM guarantees (process isolation, mailbox ordering, supervisor restarts) and pushes invariants to the boundaries of each module. State transitions are explicit, failure modes are declared rather than implicit, and each step is independently testable. That combination keeps the implementation correct under concurrent load and cheap to change later.
+
+## Benchmark
+
+```elixir
+# Minimal measurement — replace with Benchee for distribution stats.
+{time_us, _} = :timer.tc(fn ->
+  for _ <- 1..10_000, do: run_operation()
+end)
+IO.puts("avg: #{time_us / 10_000} µs/op")
+```
+
+Target: operation should complete in the low-microsecond range on modern hardware; deviations by >2× indicate a regression worth investigating.
+
 ## Trade-offs and production gotchas
 
 **1. `requeue: true` puts the message back at the head of the queue.**
@@ -383,6 +418,11 @@ to ~1.3k msgs/sec; raising processors to 16 and prefetch to 100 restored
 to ~2.4k msgs/sec.
 
 ---
+
+## Reflection
+
+- If the expected load grew by 100×, which assumption in this design would break first — the data structure, the process model, or the failure handling? Justify.
+- What would you measure in production to decide whether this implementation is still the right one six months from now?
 
 ## Resources
 

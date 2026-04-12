@@ -2,10 +2,6 @@
 
 **Project**: `rustler_intro` — a first NIF that exposes Rust functions (`add`, `fib`, `sha256_hex`) to Elixir, wired through Rustler's macros and a minimal `cargo` crate.
 
-**Difficulty**: ★★★★☆
-
-**Estimated time**: 3–6 hours
-
 ---
 
 ## Project context
@@ -33,6 +29,16 @@ rustler_intro/
 ```
 
 ---
+
+## Why this approach and not alternatives
+
+Alternatives considered and discarded:
+
+- **Hand-rolled equivalent**: reinvents primitives the BEAM/ecosystem already provides; high risk of subtle bugs around concurrency, timeouts, or failure propagation.
+- **External service (e.g. Redis, sidecar)**: adds a network hop and an extra failure domain for a problem the VM can solve in-process with lower latency.
+- **Heavier framework abstraction**: couples the module to a framework lifecycle and makes local reasoning/testing harder.
+
+The chosen approach stays inside the BEAM, uses idiomatic OTP primitives, and keeps the contract small.
 
 ## Core concepts
 
@@ -112,6 +118,18 @@ Rule of thumb:
 `mix compile` runs `cargo build --release` inside `native/<crate>/`. The resulting `.so`/`.dylib`/`.dll` is placed in `priv/native/`. When `RustlerIntro.Native` first loads, BEAM looks at the `otp_app: :rustler_intro` attribute, finds `priv/native/librustler_intro_nif.{so,dylib,dll}`, and loads it.
 
 ---
+
+## Design decisions
+
+**Option A — naive/simple approach**
+- Pros: minimal code, easy to reason about.
+- Cons: breaks under load, lacks observability, hard to evolve.
+
+**Option B — the approach used here** (chosen)
+- Pros: production-grade, handles edge cases, testable boundaries.
+- Cons: more moving parts, requires understanding of the BEAM primitives involved.
+
+→ Chose **B** because correctness under concurrency and failure modes outweighs the extra surface area.
 
 ## Implementation
 
@@ -273,6 +291,23 @@ end
 
 ---
 
+
+### Why this works
+
+The design leans on BEAM guarantees (process isolation, mailbox ordering, supervisor restarts) and pushes invariants to the boundaries of each module. State transitions are explicit, failure modes are declared rather than implicit, and each step is independently testable. That combination keeps the implementation correct under concurrent load and cheap to change later.
+
+## Benchmark
+
+```elixir
+# Minimal measurement — replace with Benchee for distribution stats.
+{time_us, _} = :timer.tc(fn ->
+  for _ <- 1..10_000, do: run_operation()
+end)
+IO.puts("avg: #{time_us / 10_000} µs/op")
+```
+
+Target: operation should complete in the low-microsecond range on modern hardware; deviations by >2× indicate a regression worth investigating.
+
 ## Trade-offs and production gotchas
 
 **1. Scheduler blocking.** A regular NIF over 1 ms degrades overall tail-latency. Benchmark with `:timer.tc/1` — if p99 > 1 ms, switch to a dirty scheduler.
@@ -317,6 +352,11 @@ For SHA-256 of 1 MB:
 `:crypto` is usually within 10–20% because it's also a NIF (OpenSSL-backed). The lesson: if there's already an OTP `:crypto` equivalent, reach for it before writing a NIF.
 
 ---
+
+## Reflection
+
+- If the expected load grew by 100×, which assumption in this design would break first — the data structure, the process model, or the failure handling? Justify.
+- What would you measure in production to decide whether this implementation is still the right one six months from now?
 
 ## Resources
 

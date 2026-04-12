@@ -58,6 +58,18 @@ You need a durable, high-throughput message channel between services. Producers 
 
 ---
 
+## Design decisions
+
+**Option A — Single global log with B-tree indexed reads**
+- Pros: ordered reads are simple; range scans are cheap.
+- Cons: appends compete for a single write lock; read and write paths share the same pages.
+
+**Option B — Segmented append-only log with per-partition offsets** (chosen)
+- Pros: append is O(1); segments are immutable so compaction never blocks writes; partitions scale writes horizontally.
+- Cons: cross-partition ordering must be reconstructed by the consumer.
+
+→ Chose **B** because the Kafka-style segmented log is the shape that actually scales write throughput — B-trees are the wrong structure for an append-dominated workload.
+
 ## Implementation milestones
 
 ### Step 1: Create the project
@@ -445,6 +457,21 @@ Benchee.run(
 
 Target: 500,000 messages/second write throughput (`acks=1`), 1M messages/second read throughput.
 
+### Why this works
+
+Each partition is a sequence of append-only segments; writes are serialized per partition via a GenServer, and offsets are monotonic by construction. Readers seek by offset into a segment index, so reads never contend with the active segment's writer.
+
+---
+
+## Benchmark
+
+```elixir
+# bench/log_bench.exs
+Benchee.run(%{"append_1kb" => fn -> EventLog.append("p1", :binary.copy("x", 1024)) end}, time: 10)
+```
+
+Target: 100,000 1 KB appends/second per partition on local disk; fsync every 10 ms.
+
 ---
 
 ## Trade-off analysis
@@ -474,6 +501,11 @@ When a segment is rotated (a new segment file is created), the in-memory list of
 
 **4. Idempotent deduplication window too small**
 Deduplication by (producer_id, sequence) is only effective within a session. If the producer_id is recycled across restarts and the sequence resets, a retry that looks like a new message will be applied. Use a persistent producer_id (UUID at startup, stored to disk) rather than a generated PID.
+
+## Reflection
+
+- If you moved from fsync-every-10ms to fsync-per-append, what fraction of throughput would you lose, and what durability guarantee would you gain? Be quantitative.
+- How does your design compare to Kafka's ISR replication? What safety property would you need to add to claim equivalent durability?
 
 ---
 

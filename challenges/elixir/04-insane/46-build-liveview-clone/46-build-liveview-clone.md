@@ -10,6 +10,18 @@ The team proposes a server-driven UI model: each browser holds one WebSocket con
 
 You will build `Vivo`: a Phoenix LiveView-equivalent framework. One GenServer per connection holds view state. A compile-time template DSL separates static HTML (sent once) from dynamic expressions (diffed per update). The benchmark target is 10,000 concurrent connections with memory overhead under 10MB above baseline.
 
+## Design decisions
+
+**Option A — server sends full HTML on every state change**
+- Pros: simplest to implement
+- Cons: bandwidth waste, flicker, lost input focus
+
+**Option B — tree-diffing with static/dynamic partition sent as minimal patches** (chosen)
+- Pros: minimal bandwidth, preserves client state, batches updates
+- Cons: requires a template compiler
+
+→ Chose **B** because LiveView's value is entirely in the diffing — without it, it's just a worse SPA.
+
 ## Why a GenServer per connection and not a single shared process
 
 LiveView's process-per-connection model maps to the BEAM's cheap process model. A minimal GenServer with no heap data costs ~3KB of memory. 10,000 connections x 3KB = 30MB. The advantage: failure isolation. A crash in one user's view process does not affect any other user.
@@ -756,6 +768,10 @@ const Vivo = {
 };
 ```
 
+### Why this works
+
+The design isolates correctness-critical invariants from latency-critical paths and from evolution-critical contracts. Modules expose narrow interfaces and fail fast on contract violations, so bugs surface close to their source. Tests target invariants rather than implementation details, so refactors don't produce false alarms. The trade-offs are explicit in the Design decisions section, which makes the "why" auditable instead of folklore.
+
 ## Given tests
 
 ```elixir
@@ -764,6 +780,9 @@ defmodule Vivo.DiffTest do
   use ExUnit.Case, async: true
   alias Vivo.Template.Rendered
   alias Vivo.Diff.Diff
+
+
+  describe "Diff" do
 
   test "no diff when dynamic values unchanged" do
     r = %Rendered{static: ["<div>", "</div>"], dynamic: ["Alice"]}
@@ -882,6 +901,9 @@ defmodule Vivo.DiffPropertyTest do
       assert patched_dynamic == new.dynamic
     end
   end
+
+
+  end
 end
 ```
 
@@ -966,6 +988,10 @@ Vivo.Bench.Connections.run()
 **Not handling WebSocket close frames.** A client that closes gracefully sends a close frame (opcode 0x8). Handle it immediately to avoid zombie connections.
 
 **Template DSL not raising on missing assigns.** If `@count` is used but `count` is not in assigns, the behavior may silently render nil. Raise a `KeyError` in dev mode with file and line.
+
+## Reflection
+
+A LiveView page with a 10k-row table gets a single-cell update. Does your framework send 10k rows, 1 row, or 1 cell? What does the template have to look like to hit the best case?
 
 ## Resources
 

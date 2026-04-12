@@ -1,8 +1,6 @@
 # Custom Exception Modules with defexception
 
-**Difficulty**: ★☆☆☆☆
-**Time**: 1–1.5 hours
-**Project**: `domain_errors` — a library of domain-specific exceptions for a payments module
+**Project**: `domain_errors` — a library of domain-specific exceptions for a payments module.
 
 ---
 
@@ -49,8 +47,35 @@ Pattern-matches the rescued exception by its struct tag. You can list multiple:
 
 ### `@enforce_keys` for exceptions
 
-Same as ordinary structs (exercise 60). Forcing key presence at raise time means no
-`%InvalidEmail{address: nil}` silently loses context.
+Same as ordinary structs: `@enforce_keys [:address]` makes the struct's constructor reject a missing `address`. Applied to exceptions, this prevents `%InvalidEmail{address: nil}` from being raised — the context you rely on at rescue time is guaranteed at raise time.
+
+---
+
+## Why defexception and not Map-shaped errors
+
+**Option A — raise `{:error, :invalid_email, %{address: "..."}}` or `raise "invalid email: #{addr}"`**
+- Pros: no module ceremony; every raise site is self-documenting.
+- Cons: rescuing requires string parsing or ad-hoc tuple pattern matching; different parts of the codebase invent slightly different shapes; `Exception.message/1` and `Exception.format/2` do not work.
+
+**Option B — `defexception` with typed fields and a custom `message/1`** (chosen)
+- Pros: `rescue e in InvalidEmail -> e.address` is a typed, discoverable access; the Exception protocol integrates with `Logger`, `:telemetry`, and error trackers; `@enforce_keys` guarantees context.
+- Cons: one module per error category (mitigated by grouping related errors in a single file).
+
+→ Chose **B** because domain errors are part of your public API. Giving them a name and a shape pays back every time you observe them in production.
+
+---
+
+## Design decisions
+
+**Option A — one mega `DomainError` struct with a `:kind` atom**
+- Pros: one module; rescue `in DomainError` once.
+- Cons: every rescue branches on `:kind`; dialyzer cannot distinguish kinds; you lose per-kind fields (an `InvalidEmail` needs `address`, a `CardDeclined` needs `reason` and `code`).
+
+**Option B — one exception module per domain concept** (chosen)
+- Pros: each struct enforces its own mandatory fields; `rescue e in InvalidEmail` is narrow and expressive; easy to add new kinds without risking the wider type.
+- Cons: grows the module count; a convention to group them (`DomainErrors.InvalidEmail`, `DomainErrors.CardDeclined`) helps.
+
+→ Chose **B** because domain errors genuinely are different kinds, not one kind with a polymorphic payload. The BEAM's dispatch already does the work for free.
 
 ---
 
@@ -215,6 +240,42 @@ end
 mix test
 ```
 
+### Why this works
+
+`defexception` generates a module that implements the `Exception` behaviour: it exposes `exception/1` (used internally by `raise Mod, opts`), a struct of your declared fields, and — if you override it — a `message/1` that callers like `Logger` and `Exception.format/2` rely on. `@enforce_keys` at the struct level composes with this: the compiler refuses `%InvalidEmail{}` without `:address`, so by the time `rescue` binds `e`, `e.address` is non-nil by construction. Together these give you structured domain errors that interoperate with every tool in the ecosystem.
+
+---
+
+## Benchmark
+
+Measure the cost of raising a custom exception vs. returning a tagged tuple so you know which to pick per call volume:
+
+```elixir
+defmodule Bench do
+  defexception [:address]
+  @impl true
+  def message(e), do: "invalid email: #{e.address}"
+end
+
+raise_path = fn ->
+  try do
+    raise Bench, address: "a@b"
+  rescue
+    e in Bench -> e.address
+  end
+end
+
+tuple_path = fn -> {:error, :invalid_email, "a@b"} end
+
+{us_raise, _} = :timer.tc(fn -> for _ <- 1..100_000, do: raise_path.() end)
+{us_tuple, _} = :timer.tc(fn -> for _ <- 1..100_000, do: tuple_path.() end)
+
+IO.puts("raise: #{us_raise / 100_000} µs")
+IO.puts("tuple: #{us_tuple / 100_000} µs")
+```
+
+Target esperado: tuple path <0.2 µs; raise path 5–15 µs. That 50–100× ratio is why custom exceptions belong at boundaries (once per request, once per job), not inside loops.
+
 ---
 
 ## Trade-offs
@@ -260,6 +321,13 @@ one module per error class — it is cheap.
 - **User-facing validation errors** — return changesets or tagged tuples. Raising forces every call site to wrap in `try/rescue`.
 - **Library-internal signaling** — a private `{:error, :not_found}` is simpler than a custom exception.
 - **Crossing BEAM boundaries** — exceptions don't serialize meaningfully to JSON. Convert to a tagged tuple at the HTTP/queue edge.
+
+---
+
+## Reflection
+
+- Your `PaymentError` exception carries `%{amount:, currency:, gateway_response:}`. Error trackers like Sentry serialise exception fields. The `gateway_response` is large and sometimes contains PII. Do you override `message/1` to omit it, add a `redact/1` step before raising, or drop the field from the struct? How do you keep diagnostic power while staying compliant?
+- An exception from a dependency wraps the one from *your* domain. `Exception.message/1` now shows "RuntimeError: wrapped: %InvalidEmail{...}". What tools does OTP give you to unwrap it, and what does a clean "caused by" chain look like in Elixir (there is no built-in one — design one)?
 
 ---
 

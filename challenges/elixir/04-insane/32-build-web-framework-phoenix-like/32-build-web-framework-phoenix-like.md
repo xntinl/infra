@@ -45,6 +45,22 @@ nova/
 
 ---
 
+## Why pattern-matched function-head routing and not a trie or regex-based router
+
+the BEAM's pattern matcher is already a highly optimized decision tree; compiling routes into function heads lets us reuse that engine for free. A user-space trie reimplements what the compiler gives us.
+
+## Design decisions
+
+**Option A — runtime route lookup via Enum.find over a list**
+- Pros: trivial to implement, dynamic routes at runtime
+- Cons: O(n) per request, unacceptable for >50 routes
+
+**Option B — compile-time route compilation into pattern-matched function heads** (chosen)
+- Pros: O(1) dispatch via BEAM's pattern matcher, zero allocation
+- Cons: routes are fixed at compile time
+
+→ Chose **B** because routing is on every request's hot path; O(n) scanning would dominate latency on realistic apps.
+
 ## The business problem
 
 The platform team maintains 12 internal tools. Each depends on Phoenix, which brings Ecto, Telemetry, Cowboy, and 30 other transitive dependencies. A vulnerability in any of them triggers an upgrade across all 12 services. Nova must run with only the Elixir standard library — any production tool built on it will have a minimal, auditable dependency tree.
@@ -555,6 +571,9 @@ defmodule Nova.HttpParserTest do
 
   alias Nova.Transport.HttpParser
 
+
+  describe "HttpParser" do
+
   test "parses GET request with no body" do
     raw = "GET /users/42?include=posts HTTP/1.1\r\nHost: example.com\r\n\r\n"
     assert {:ok, req, ""} = HttpParser.parse(raw)
@@ -581,6 +600,9 @@ defmodule Nova.HttpParserTest do
     assert {:ok, req, ""} = HttpParser.parse(raw)
     assert List.keymember?(req.headers, "content-type", 0)
   end
+
+
+  end
 end
 ```
 
@@ -592,6 +614,9 @@ defmodule Nova.SessionTest do
   alias Nova.Session
 
   @secret "test_secret_key_minimum_32_bytes_long"
+
+
+  describe "Session" do
 
   test "sign and verify round-trips" do
     payload = %{"user_id" => 42, "role" => "admin"}
@@ -616,6 +641,9 @@ defmodule Nova.SessionTest do
   test "empty session returns error" do
     assert {:error, _} = Session.verify("", @secret)
   end
+
+
+  end
 end
 ```
 
@@ -625,6 +653,9 @@ defmodule Nova.WebSocketTest do
   use ExUnit.Case, async: true
 
   alias Nova.WebSocket.Handshake
+
+
+  describe "WebSocket" do
 
   test "computes correct Sec-WebSocket-Accept for RFC example" do
     # RFC 6455 example key
@@ -639,6 +670,9 @@ defmodule Nova.WebSocketTest do
     assert String.contains?(response, "HTTP/1.1 101")
     assert String.contains?(response, "Upgrade: websocket")
     assert String.contains?(response, "Sec-WebSocket-Accept:")
+  end
+
+
   end
 end
 ```
@@ -676,6 +710,24 @@ Expected: dispatch with 100 routes should be under 1us. If you see > 10us, verif
 
 ---
 
+### Why this works
+
+The design separates concerns along their real axes: what must be correct (the Phoenix-like web framework invariants), what must be fast (the hot path isolated from slow paths), and what must be evolvable (external contracts kept narrow). Each module has one job and fails loudly when given inputs outside its contract, so bugs surface near their source instead of as mysterious downstream symptoms. The tests exercise the invariants directly rather than implementation details, which keeps them useful across refactors.
+
+## Benchmark
+
+```elixir
+# Minimal timing harness — replace with Benchee for production measurement.
+{time_us, _result} = :timer.tc(fn ->
+  # exercise the hot path N times
+  for _ <- 1..10_000, do: :ok
+end)
+
+IO.puts("average: #{time_us / 10_000} µs per op")
+```
+
+Target: <1µs dispatch for a 100-route application.
+
 ## Trade-off analysis
 
 | Aspect | Nova (yours) | Phoenix | Plug standalone |
@@ -710,6 +762,10 @@ Calling `EEx.eval_file/2` on every request re-reads and re-compiles the template
 A client may request `/users/alice%20smith`. Your path splitter must URL-decode each segment before matching. Failure to do so means `%20` never matches a `:name` capture for `"alice smith"`.
 
 ---
+
+## Reflection
+
+Your framework compiles 10k routes into function heads. Do you hit a beam file size limit, compile-time limit, or dispatch-time limit first? Where would you split routers?
 
 ## Resources
 

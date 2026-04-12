@@ -54,6 +54,18 @@ The hard problems are: a caller that times out must be cleanly removed from the 
 
 ---
 
+## Design decisions
+
+**Option A — Round-robin dispatch from a central queue**
+- Pros: simple; fair.
+- Cons: ignores worker load; can queue behind a slow worker while idle workers sit empty.
+
+**Option B — Least-loaded checkout with worker-self-announced availability** (chosen)
+- Pros: workers advertise `:ready` after each task, so checkout picks a truly free worker; naturally adapts to heterogeneous task durations.
+- Cons: more coordination messages; the ready-set data structure must be correct under races.
+
+→ Chose **B** because poolboy's real-world pain is head-of-line blocking on uneven task durations; a ready-set design removes it outright.
+
 ## Implementation milestones
 
 ### Step 1: Create the project
@@ -463,6 +475,21 @@ Benchee.run(
 )
 ```
 
+### Why this works
+
+Workers register with the pool when idle and deregister when busy; `checkout/1` pops from the ready-set or enqueues the caller. Because the set is kept in ETS, multiple callers don't contend on a single dispatcher process.
+
+---
+
+## Benchmark
+
+```elixir
+# bench/pool_bench.exs
+Benchee.run(%{"checkout" => fn -> Pool.transaction(fn _ -> :ok end) end}, parallel: 50, time: 10)
+```
+
+Target: 50,000 checkouts/second on a 100-worker pool; p99 checkout latency < 200 µs.
+
 ---
 
 ## Trade-off analysis
@@ -495,6 +522,11 @@ A running sum is unbounded and accumulates floating-point error over time. Use a
 
 **4. Overflow workers not destroyed on checkin**
 An overflow worker checked back in to the pool is incorrectly added to the available pool, causing the pool to permanently grow. Track which workers are overflow workers (e.g., with a MapSet) and stop them instead of recycling them.
+
+## Reflection
+
+- If tasks have bimodal durations (1 ms vs 1 s), does least-loaded still win over round-robin, or do you need priority queuing? Measure the tail latency.
+- Compare your design to poolboy. Which pool exhaustion semantics (queue vs reject) would you default to, and why?
 
 ---
 

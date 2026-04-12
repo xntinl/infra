@@ -8,6 +8,18 @@ Your team maintains a large Elixir codebase. Dialyzer catches some type bugs but
 
 You will build `TypeCheck`: a compile-time type annotation macro that raises `CompileError` with precise file and line information when function argument types or return types are violated. No runtime overhead. No external processes. Pure macro expansion.
 
+## Design decisions
+
+**Option A — runtime type checks via pattern matching + raise**
+- Pros: simple, visible at call sites
+- Cons: runs tests to find bugs, cost on every call
+
+**Option B — macro-based inference that reports errors at compile time** (chosen)
+- Pros: bugs caught before test time, zero runtime cost
+- Cons: macros are harder to write and integrate with dialyzer
+
+→ Chose **B** because type errors are cheapest at compile time — anywhere later multiplies the feedback loop.
+
 ## Why build a type checker as macros and not as a Mix task
 
 A Mix task runs after compilation. The compilation has already succeeded. Macros run during compilation. A `CompileError` raised inside a macro stops the compilation of the current module immediately, with file path and line number from AST metadata.
@@ -555,6 +567,10 @@ defmodule TypeCheck do
 end
 ```
 
+### Why this works
+
+The design isolates correctness-critical invariants from latency-critical paths and from evolution-critical contracts. Modules expose narrow interfaces and fail fast on contract violations, so bugs surface close to their source. Tests target invariants rather than implementation details, so refactors don't produce false alarms. The trade-offs are explicit in the Design decisions section, which makes the "why" auditable instead of folklore.
+
 ## Given tests
 
 ```elixir
@@ -562,6 +578,9 @@ end
 defmodule TypeCheck.TypesTest do
   use ExUnit.Case, async: true
   alias TypeCheck.Types
+
+
+  describe "Types" do
 
   test "union flattens nested unions" do
     t = Types.union([Types.union([Types.integer(), Types.string()]), Types.boolean()])
@@ -722,6 +741,9 @@ defmodule TypeCheck.IntegrationTest do
     {:ok, specs} = Code.Typespec.fetch_specs(mod)
     assert Enum.any?(specs, fn {{name, _arity}, _} -> name == :double end)
   end
+
+
+  end
 end
 ```
 
@@ -813,6 +835,10 @@ TypeCheck.Bench.CompileOverhead.run()
 **Macro expansion order with `@before_compile`.** Attributes are accumulated by `type_checked` calls. If `type_checked` appears inside another macro that runs after `@before_compile`, spec generation misses those functions.
 
 **Not testing with `--warnings-as-errors`.** A generated `@spec` may conflict with an existing one, producing a warning. Enable `--warnings-as-errors` in tests.
+
+## Reflection
+
+How does your compile-time checker behave when 10% of the codebase is untyped? Is the boundary between checked and unchecked code a hole or a wall, and what's the blast radius of a type error at the boundary?
 
 ## Resources
 

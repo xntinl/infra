@@ -41,6 +41,22 @@ hls_server/
 
 ---
 
+## Why pre-segmented storage over on-the-fly segmentation and not live slicing from MP4 on request
+
+pre-segmenting amortizes I/O and makes every segment independently cacheable at the CDN edge. On-the-fly slicing means every request touches the origin disk and can't be CDN-cached.
+
+## Design decisions
+
+**Option A — serving whole files from disk on every request**
+- Pros: simplest implementation
+- Cons: no adaptive bitrate, high bandwidth waste on mobile
+
+**Option B — HLS segment-based delivery with adaptive bitrate manifests** (chosen)
+- Pros: mobile-friendly, CDN-cacheable, supports seek/pause cheaply
+- Cons: requires transcoding pipeline, manifest generation
+
+→ Chose **B** because adaptive bitrate is the baseline user expectation in 2025; anything else is unshippable.
+
 ## The business problem
 
 The media team streams training videos to employees in three office locations. Each location has different available bandwidth. A single fixed-bitrate stream means the high-bandwidth office gets poor quality and the low-bandwidth office buffers constantly. Adaptive bitrate streaming solves this: each client measures its download speed and switches to the appropriate quality variant automatically.
@@ -388,6 +404,9 @@ defmodule HLSServer.SegmenterTest do
     %{seg: seg, video: video}
   end
 
+
+  describe "Segmenter" do
+
   test "produces correct number of segments", %{seg: seg} do
     # 1MB at ~16.6KB/s over 60s, split into 6s chunks → ~10 segments
     assert seg.num_segments > 0
@@ -414,6 +433,9 @@ defmodule HLSServer.SegmenterTest do
     # We can't test this directly, but we can verify the size is correct.
     assert byte_size(seg0) == seg.segment_size_bytes
   end
+
+
+  end
 end
 ```
 
@@ -423,6 +445,9 @@ defmodule HLSServer.PlaylistTest do
   use ExUnit.Case, async: true
 
   alias HLSServer.Playlist.Media
+
+
+  describe "Playlist" do
 
   test "VOD playlist contains #EXT-X-ENDLIST" do
     segments = for i <- 0..4, do: {i, 6.0, "/segments/720p/#{i}.ts"}
@@ -458,6 +483,9 @@ defmodule HLSServer.PlaylistTest do
     rendered = Media.render(playlist)
     assert String.contains?(rendered, "#EXT-X-MEDIA-SEQUENCE:5")
   end
+
+
+  end
 end
 ```
 
@@ -469,6 +497,9 @@ defmodule HLSServer.RangeHandlerTest do
   alias HLSServer.RangeHandler
 
   @content "0123456789"  # 10 bytes for easy math
+
+
+  describe "RangeHandler" do
 
   test "no Range header returns 200 with full content" do
     {:ok, resp} = RangeHandler.handle(@content, nil)
@@ -497,6 +528,9 @@ defmodule HLSServer.RangeHandlerTest do
   test "out of range returns 416" do
     assert {:error, 416} = RangeHandler.handle(@content, "bytes=100-200")
   end
+
+
+  end
 end
 ```
 
@@ -507,6 +541,24 @@ mix test test/hls_server/ --trace
 ```
 
 ---
+
+### Why this works
+
+The design separates concerns along their real axes: what must be correct (the video streaming (HLS/DASH) invariants), what must be fast (the hot path isolated from slow paths), and what must be evolvable (external contracts kept narrow). Each module has one job and fails loudly when given inputs outside its contract, so bugs surface near their source instead of as mysterious downstream symptoms. The tests exercise the invariants directly rather than implementation details, which keeps them useful across refactors.
+
+## Benchmark
+
+```elixir
+# Minimal timing harness — replace with Benchee for production measurement.
+{time_us, _result} = :timer.tc(fn ->
+  # exercise the hot path N times
+  for _ <- 1..10_000, do: :ok
+end)
+
+IO.puts("average: #{time_us / 10_000} µs per op")
+```
+
+Target: sustained >10 Gbps per node with <100ms segment TTFB.
 
 ## Trade-off analysis
 
@@ -541,6 +593,10 @@ A CDN node caches segment 0. The live producer evicts segment 0. A client reques
 If `GET /metrics` calls a GenServer to read counters, it serializes with all counter updates. Use `:ets.update_counter/3` for writes (atomic, no GenServer) and `:ets.lookup` for reads (concurrent, no lock).
 
 ---
+
+## Reflection
+
+If 10k users request the same segment within 100ms of each other (a live event), what protects the origin — CDN shielding, a request coalescer in the origin, or both? Sketch the failure mode if you pick only one.
 
 ## Resources
 

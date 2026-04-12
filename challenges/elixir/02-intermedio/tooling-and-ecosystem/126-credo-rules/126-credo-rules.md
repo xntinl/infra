@@ -4,9 +4,6 @@
 disabled check, a priority-raised check, and a hand-written custom check
 that fires on TODO comments without an author.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
-
 ---
 
 ## Project context
@@ -93,6 +90,39 @@ end
 `Credo.Check` gives you `format_issue/2` and the `params` plumbing. The
 `SourceFile` struct exposes the AST (`Credo.Code.ast/1`) and the raw
 text (`SourceFile.source/1`).
+
+---
+
+## Why Credo and not only `mix format` + Dialyzer
+
+The three tools cover different layers. `mix format` is mechanical and
+non-negotiable (whitespace, parens). Dialyzer is type-level (success
+typing). Credo sits in between: convention and smell detection — things
+that are technically correct but violate the team's agreed style
+(cyclomatic complexity, stray `IO.inspect`, unused aliases). Drop any
+one of the three and you leak that layer into code review.
+
+---
+
+## Design decisions
+
+**Option A — Adopt Credo's defaults verbatim**
+- Pros: Zero config; fastest to get running; someone else curated the
+  rules.
+- Cons: Credo defaults reflect one team's taste (e.g. single-pipe
+  warnings); noise ratio is often too high for legacy codebases.
+
+**Option B — Curated `.credo.exs` with disabled/raised checks** (chosen)
+- Pros: Every rule is there on purpose — the file is a record of team
+  decisions; CI runs `--strict` and blocks on real issues; custom
+  checks encode project-specific conventions.
+- Cons: The config needs maintenance; adding a new check requires a
+  discussion; `requires:` wiring for in-project custom checks is
+  another moving part.
+
+→ Chose **B** because a linter whose warnings people ignore is worse
+  than no linter — once the ratio of "real issues : noise" drops, the
+  signal is lost. Curation keeps it actionable.
 
 ---
 
@@ -272,6 +302,25 @@ mix check            # what CI should run
 You should see an issue pointing to the unnamed `TODO:` in
 `lib/credo_setup.ex`. Fix it with a name — the issue disappears.
 
+### Why this works
+
+`.credo.exs` is read once per run; the `checks:` list is the single
+source of truth (enabled, disabled, re-prioritized, custom). The
+custom check is a plain Elixir module implementing the `Credo.Check`
+behaviour — Credo compiles it via `requires:` and calls `run/2` with
+the source file, expecting a list of `Credo.Issue`. Raw-text matching
+works here because the TODO pattern is purely lexical; AST-level checks
+use `Credo.Code.prewalk/2` for the same plumbing.
+
+---
+
+## Benchmark
+
+<!-- benchmark N/A: Credo's runtime is dominated by file I/O and AST
+     parsing; each check contributes microseconds per file. On a medium
+     codebase (~20k LOC), `mix credo --strict` typically runs in under
+     3 seconds — well below the threshold where it would slow down CI. -->
+
 ---
 
 ## Trade-offs and production gotchas
@@ -310,6 +359,19 @@ for anything beyond line-level rules.
   that fails the build.
 - The rule fires on less than 5% of your codebase — it's probably noise,
   not a convention.
+
+---
+
+## Reflection
+
+- Your team adopts a new convention: every public function must have a
+  `@spec`. Would you enforce it via a Credo check, a compile-time macro,
+  or Dialyzer? What are the tradeoffs in false-positive rate, developer
+  friction, and CI cost?
+- A legacy codebase you inherit emits 1,200 Credo issues at
+  `--strict`. Going through all of them is unrealistic. What strategy
+  would you use to surface the bleeding — high-priority checks, scoped
+  `files:` globs, ratchet-up-over-time — and why?
 
 ---
 

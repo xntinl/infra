@@ -3,9 +3,6 @@
 **Project**: `doctests_demo` — a `StringKit` module whose `@doc` examples
 are executed as tests via `doctest`.
 
-**Difficulty**: ★★☆☆☆
-**Estimated time**: 1–2 hours
-
 ---
 
 ## Project context
@@ -18,6 +15,21 @@ in your `@doc` as a test. If the example drifts from reality, CI fails.
 This is doubly valuable because `ex_doc` renders `@doc` as the HTML
 documentation on HexDocs — the same examples your users copy-paste are
 the ones your CI verifies. One artifact, two jobs.
+
+## Why doctests and not X
+
+**Why not tests-only + code comments?** Because comments go stale silently.
+Doctests fail CI the moment the example drifts, so they stay current by
+construction.
+
+**Why not tests-only (skip the `@doc` examples)?** Because the HexDocs page
+is the first thing users read. Copy-pasteable, verified examples are the
+single highest-leverage piece of docs you can ship.
+
+**Why not replace unit tests with doctests?** Doctests are poor at edge
+cases and error paths — cramming corner cases into `@doc` clutters the
+docs. Use both: doctests for happy-path illustrations, `_test.exs` for
+the rest.
 
 Project structure:
 
@@ -82,6 +94,21 @@ They're great for showing how to USE a function. They're terrible for
 edge cases, error paths, or anything that makes the docs noisy. Rule of
 thumb: one happy-path example per public function. Put corner cases in
 `_test.exs`.
+
+---
+
+## Design decisions
+
+**Option A — All examples as doctests**
+- Pros: Everything is rendered in HexDocs and verified.
+- Cons: Docs become noisy with edge cases; readers scan past them.
+
+**Option B — One happy-path doctest per function + separate edge tests** (chosen)
+- Pros: Docs stay skimmable; CI still verifies the copy-pasteable example.
+- Cons: Edge cases live in two places (test file), not in docs.
+
+→ Chose **B**. Public readers want the "how do I call this?" example;
+private tests cover the "but what about…" cases.
 
 ---
 
@@ -224,6 +251,21 @@ mix test --trace
 
 Each `iex>` example shows up as its own test line.
 
+### Why this works
+
+`ExUnit.DocTest` parses each `@doc` block at compile time, extracts every
+`iex>` line, and generates one ExUnit test per example. Shared bindings
+across successive `iex>` lines are handled by evaluating the group as a
+single script; the expected output is compared with `==`. Because the
+generator runs at compile time, CI failures point exactly to the offending
+file:line pair in the source module, not in the test file.
+
+---
+
+## Benchmark
+
+<!-- benchmark N/A: doctests son aserciones puras; no hay workload. -->
+
 ---
 
 ## Trade-offs and production gotchas
@@ -254,6 +296,17 @@ tests in the same module. Rarely matters, but can surprise.
 For modules with heavy state (GenServers, Ecto schemas), for anything
 involving IO or the network, or for error-path testing. Doctests shine
 for **pure utility functions** where the example is also the tutorial.
+
+---
+
+## Reflection
+
+- Your module's function returns a map whose key ordering isn't guaranteed.
+  Write a doctest that passes deterministically, and explain why the
+  naive version fails on some runs.
+- A team mate wants to doctest a function that calls `DateTime.utc_now/0`.
+  What's your counter-proposal, and what's the minimal refactor that
+  makes the function doctestable?
 
 ---
 

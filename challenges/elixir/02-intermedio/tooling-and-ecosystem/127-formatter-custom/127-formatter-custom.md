@@ -4,9 +4,6 @@
 `.formatter.exs`: custom `:locals_without_parens`, imported deps,
 multiple file globs, and a (demo) formatter plugin.
 
-**Difficulty**: ★★☆☆☆
-**Estimated time**: 1–2 hours
-
 ---
 
 ## Project context
@@ -96,6 +93,38 @@ which you add to `:plugins`. Then `mix format` handles `.heex` too.
 
 Plugins implement the `Mix.Tasks.Format` behaviour (two callbacks:
 `features/1` and `format/2`).
+
+---
+
+## Why `mix format` and not Prettier-style configurability
+
+The deliberate lack of options (no "indent: 4", no "single vs double
+quotes") is the feature: every Elixir codebase looks the same, so
+cross-project reviews and copy-paste work without visual noise.
+Prettier's success proved the same point in JS. The place for stylistic
+flexibility is Credo (suggestions), not the formatter (mechanical).
+
+---
+
+## Design decisions
+
+**Option A — Accept the defaults and never customize `.formatter.exs`**
+- Pros: Zero config; matches what `mix new` emits.
+- Cons: Breaks on DSLs (your test-like macros get parenthesized);
+  silently skips files outside `lib/` and `test/`; doesn't handle
+  `.heex` or other non-`.ex` files.
+
+**Option B — Curated `.formatter.exs` with `:inputs`, `:locals_without_parens`,
+`:import_deps`, and `:plugins`** (chosen)
+- Pros: The formatter covers every file in the repo; DSLs stay readable;
+  third-party libraries pipe their own rules in via `:import_deps`;
+  `.heex` and similar files get formatted too.
+- Cons: More config surface to maintain; `:import_deps` requires the
+  dep's `.formatter.exs` to be compiled before formatting works.
+
+→ Chose **B** because the defaults only cover the trivial case (a plain
+  library with no DSL); once you have Ecto, Phoenix, or a project DSL,
+  customization is the cheapest way to preserve readable code.
 
 ---
 
@@ -256,6 +285,27 @@ And into Git (optional, with `husky`, `lefthook`, or a plain
 mix format --check-formatted
 ```
 
+### Why this works
+
+`.formatter.exs` is evaluated by Mix at format time; the keyword list
+is the whole API surface. `:locals_without_parens` tells the formatter
+"these names are known parens-free calls, don't rewrite them" — which
+is all a DSL needs to survive formatting. `:import_deps` delegates
+upstream libraries' formatter configs so Ecto's `from/2`, Phoenix's
+`socket/3`, and similar DSLs are respected without manual copying.
+`:inputs` defines the world `mix format` sees — anything outside the
+glob is silently skipped, which is why CI's `--check-formatted` is the
+safety net.
+
+---
+
+## Benchmark
+
+<!-- benchmark N/A: the formatter is I/O bound; wall time scales with
+     file count. On a ~20k LOC codebase, `mix format` typically finishes
+     in under 2 seconds. The metric that matters is pass/fail, not
+     throughput. -->
+
 ---
 
 ## Trade-offs and production gotchas
@@ -293,6 +343,20 @@ warnings. Use `elixir-ls` or an LSP that knows about Mix.
 - You want to "turn off formatting in this file" — use `# credo:disable`
   for Credo, but `mix format` has no such escape hatch (except
   `#! formatter:skip-file`, which is rare and strongly discouraged).
+
+---
+
+## Reflection
+
+- Your team ships a library with a public DSL (parens-free macros).
+  Consumers don't know about your `.formatter.exs` and see `mix format`
+  rewrite their code. How would you distribute the formatter rules so
+  consumers inherit them automatically, and what's the boundary between
+  your library's concerns and theirs?
+- A new file type (say, `.sql` migrations) lands in the repo. Would you
+  write a formatter plugin, use an external tool via a pre-commit hook,
+  or leave it unformatted? What factors drive the decision (team size,
+  edit frequency, available libraries)?
 
 ---
 

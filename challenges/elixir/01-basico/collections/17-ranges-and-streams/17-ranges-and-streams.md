@@ -2,9 +2,6 @@
 
 **Project**: `page_stream` — processes millions of records from a paginated API without loading them all in memory
 
-**Difficulty**: ★★☆☆☆
-**Estimated time**: 2-3 hours
-
 ---
 
 ## Why streams matter for a senior developer
@@ -111,6 +108,20 @@ files, connections, or cursors.
 
 The rule of thumb: use `Stream` for everything except the final step. The final
 step (the one that materializes) is an `Enum` function.
+
+---
+
+## Design decisions
+
+**Option A — `Enum` + pagination loop, accumulating into a list**
+- Pros: simplest mental model; all tools (`Enum.map`, `Enum.filter`) work directly on the accumulated list at the end.
+- Cons: memory scales with total row count (2M rows × ~1 KB each = 2 GB resident); OOM risk on large datasets; cannot start emitting downstream until fully loaded.
+
+**Option B — `Stream.resource/3` that pulls one page at a time** (chosen)
+- Pros: peak memory bounded by one page (~hundreds of KB); downstream consumers see rows as they arrive; clean `stop_fun` runs on completion or error; composes with any `Stream`/`Enum` pipeline.
+- Cons: API slightly more complex (three callbacks: start, next, stop); debugging requires understanding when each callback fires; premature termination semantics need care with external cursors.
+
+Chose **B** because bounded memory is the non-negotiable constraint for "millions of records" and `Stream.resource/3` gives exactly that without pulling in `Flow` or `GenStage`.
 
 ---
 
@@ -404,6 +415,42 @@ mix compile --warnings-as-errors
 mix test --trace
 ```
 
+### Why this works
+
+`Stream.resource/3` gives the stream a lifecycle: `start_fun` opens the external resource (cursor, file, HTTP client), `next_fun` pulls one batch per demand — returning `{elements, new_state}` or `{:halt, state}` — and `stop_fun` runs exactly once to release whatever was opened. Because the stream is lazy, a downstream `Enum.take(n)` stops pulling new pages the moment it has enough. Because the stream is pull-based, the upstream never gets ahead of the consumer; memory is bounded by the size of a single page. Composing further `Stream` functions (filter, map, transform) adds zero allocation — they build a new stream, not a new list.
+
+---
+
+## Benchmark
+
+```elixir
+# bench.exs
+defmodule Bench do
+  def run do
+    # Simulate paginated source returning 100 items per page, 1000 pages total
+    pages =
+      for page <- 1..1_000, into: %{} do
+        {page, Enum.map(1..100, &%{id: page * 100 + &1, payload: :crypto.strong_rand_bytes(64)})}
+      end
+
+    fake_fetch = fn page -> {:ok, Map.get(pages, page, [])} end
+
+    {stream_us, _} =
+      :timer.tc(fn ->
+        PageStream.paginate(fake_fetch)
+        |> Stream.filter(&(rem(&1.id, 2) == 0))
+        |> Enum.take(10_000)
+      end)
+
+    IO.puts("Stream.resource + take(10k) over 1000 pages: #{stream_us} µs")
+  end
+end
+
+Bench.run()
+```
+
+Target: under 200 ms end-to-end when `fetch` is in-memory. The benchmark's value is memory, not wall-clock: run `:erlang.memory(:total)` before/after to confirm peak stays within a page's worth.
+
 ---
 
 ## Trade-off analysis
@@ -458,6 +505,13 @@ the bug. Always decide your error policy explicitly.
 - You need to iterate the same data multiple times — materialize once with
   `Enum.to_list/1` and reuse.
 - You need parallelism — use `Flow` or `Task.async_stream/3` instead.
+
+---
+
+## Reflection
+
+1. Your paginator pulls pages sequentially. The upstream API allows 20 concurrent requests. Would you keep `Stream.resource/3` and add a concurrent layer, switch to `Task.async_stream/3` over explicit page numbers, or move to `Flow`? Which option preserves the "bounded memory" guarantee?
+2. What happens if the API returns an error on page 47 of 1000? Describe the failure path through `next_fun` and `stop_fun`. How do you distinguish a transient network error (retry) from a hard error (abort the stream)?
 
 ---
 

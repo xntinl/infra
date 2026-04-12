@@ -49,6 +49,18 @@ validator/
 
 ---
 
+## Design decisions
+
+**Option A — `with` chain of `{:ok, _}` / `{:error, _}` steps**
+- Pros: Flat, reads top-to-bottom, each failure path is explicit
+- Cons: Requires each step to already return tagged tuples
+
+**Option B — nested `case` statements** (chosen)
+- Pros: No new construct to learn
+- Cons: Rightward drift, each added step increases indentation, shared error handling is copy-pasted
+
+→ Chose **A** because validation is exactly the "sequence of fallible steps" pattern `with` was designed for.
+
 ## Implementation
 
 ### `lib/validator.ex`
@@ -478,6 +490,10 @@ mix test --trace
 
 ---
 
+### Why this works
+
+The approach chosen above keeps the core logic **pure, pattern-matchable, and testable**. Each step is a small, named transformation with an explicit return shape, so adding a new case means adding a new clause — not editing a branching block. Failures are data (`{:error, reason}`), not control-flow, which keeps the hot path linear and the error path explicit.
+
 ## `with` vs nested `case`
 
 Without `with`, the same validation looks like this:
@@ -513,6 +529,22 @@ Same logic, flat structure, no repetition of error handling.
 
 ---
 
+## Benchmark
+
+```elixir
+{time_us, _result} =
+  :timer.tc(fn ->
+    for _ <- 1..1_000 do
+      # representative call of validate_registration/1 over 100k registrations
+      :ok
+    end
+  end)
+
+IO.puts("Avg: #{time_us / 1_000} µs/call")
+```
+
+Target: **< 50ms total, < 500ns per pipeline**.
+
 ## Common production mistakes
 
 **1. Using `if` when `case` or pattern matching is clearer**
@@ -542,6 +574,12 @@ writes inside `with` makes error handling unpredictable — what do you do if st
 fails but step 2 already wrote to the database?
 
 ---
+
+## Reflection
+
+If one validation step is expensive (e.g., a database uniqueness check), how would you order the `with` clauses to fail fast on cheap checks first? What trade-off does that create for the UX?
+
+Your product owner asks to collect *all* validation errors, not just the first. Does `with` still fit, or do you need a different structure? Sketch the alternative.
 
 ## Resources
 

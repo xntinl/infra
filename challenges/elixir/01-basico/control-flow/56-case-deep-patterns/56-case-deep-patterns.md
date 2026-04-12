@@ -2,9 +2,6 @@
 
 **Project**: `http_status_classifier` — classifies HTTP-shaped tuples into actionable categories
 
-**Difficulty**: ★★☆☆☆
-**Estimated time**: 1–2 hours
-
 ---
 
 ## Project structure
@@ -56,6 +53,18 @@ shape: `{:ok, status}`, `{:error, {:http, status}}`, `{:error, {:network, reason
 matching with guards is how you express "shape + numeric range" in one readable block.
 
 ---
+
+## Design decisions
+
+**Option A — single `case` with deep patterns + guards**
+- Pros: No allocation, direct dispatch, rules visible in one place
+- Cons: Becomes hard to read beyond 5-6 clauses
+
+**Option B — pre-flatten into a struct then `case`** (chosen)
+- Pros: Normalizes the input, decouples shape from classification
+- Cons: Extra allocation, more code, indirection
+
+→ Chose **A** because a single-purpose HTTP status classifier is small enough to keep the rules in one `case`. Use B when the same shape is classified in multiple places.
 
 ## Implementation
 
@@ -201,6 +210,26 @@ All 11 tests pass.
 
 ---
 
+### Why this works
+
+The approach chosen above keeps the core logic **pure, pattern-matchable, and testable**. Each step is a small, named transformation with an explicit return shape, so adding a new case means adding a new clause — not editing a branching block. Failures are data (`{:error, reason}`), not control-flow, which keeps the hot path linear and the error path explicit.
+
+## Benchmark
+
+```elixir
+{time_us, _result} =
+  :timer.tc(fn ->
+    for _ <- 1..1_000 do
+      # representative call of classify/1 over 1M responses
+      :ok
+    end
+  end)
+
+IO.puts("Avg: #{time_us / 1_000} µs/call")
+```
+
+Target: **< 30ms total; each classification ~30ns**.
+
 ## Trade-offs
 
 | Style | When to pick |
@@ -243,6 +272,12 @@ not compile. If you need that, compute it before the `case` or match on the head
 the category is `:unknown` — future-you will thank present-you.
 
 ---
+
+## Reflection
+
+Your team adds a rule: classify `429 Too Many Requests` as `:retry_later` only if the `Retry-After` header is present. Where does the new rule go in the `case`, and does its position matter? Why?
+
+How would you unit-test each classification branch without building an HTTP response? What does that imply about input types?
 
 ## Resources
 

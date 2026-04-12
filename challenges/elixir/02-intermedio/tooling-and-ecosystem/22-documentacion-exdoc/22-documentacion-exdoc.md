@@ -4,9 +4,6 @@
 links, and an `extras/` guide, rendered by ExDoc to the same HTML you see
 on hexdocs.pm.
 
-**Difficulty**: ★★☆☆☆
-**Estimated time**: 1–2 hours
-
 ---
 
 ## Project context
@@ -105,6 +102,35 @@ Add `extras: ["guides/getting_started.md"]` to `mix docs` config and ExDoc
 renders Markdown files as sibling pages to the API reference. Use extras
 for tutorials, migration guides, and design rationale that don't belong on
 any one module.
+
+---
+
+## Why ExDoc + doctests and not external docs (Sphinx, MkDocs)
+
+External doc generators treat code and docs as separate artifacts that
+drift independently. ExDoc reads `@moduledoc` and `@doc` directly from
+source, and doctests execute examples as part of `mix test` — docs that
+lie fail CI. External tools replicate the first half (source-extracted
+API reference) but never the second, so they become outdated the moment
+an example becomes aspirational.
+
+---
+
+## Design decisions
+
+**Option A — Keep all narrative docs in `README.md` only**
+- Pros: One file; familiar to every developer; renders on GitHub.
+- Cons: Becomes a wall of text; no navigation between topics; can't
+  cross-link to API reference.
+
+**Option B — `@moduledoc` + `@doc` + `extras/` guides via ExDoc** (chosen)
+- Pros: API docs live next to the code; guides live in Markdown;
+  doctests prevent drift; the output matches what Hex users see.
+- Cons: Two places for different kinds of content (module vs guide);
+  `extras:` requires ordering and titling; CI cost of running doctests.
+
+→ Chose **B** because the "next to the code" part is load-bearing:
+  docs that live in a separate repo or file are the ones that rot.
 
 ---
 
@@ -348,6 +374,25 @@ open doc/index.html
 You get the full hexdocs.pm UX locally: sidebar with extras, module groups,
 search, "source" links pointing back at GitHub.
 
+### Why this works
+
+ExDoc extracts `@moduledoc` / `@doc` attributes from compiled beam
+files, so docs live next to the code they describe — no drift, no
+duplication. Doctests use the same docstrings as source for ExUnit's
+`doctest` macro, which lexes the `iex>` blocks and asserts each
+expression matches. Grouping (`groups_for_modules`, `groups_for_docs`)
+plus `extras:` let you shape the generated site without leaving `mix.exs`.
+
+---
+
+## Benchmark
+
+<!-- benchmark N/A: `mix docs` on a medium library (50 modules, 20
+     guides) typically completes in under 10 seconds — CPU bound on
+     Markdown parsing. Doctests add roughly 1 ms per example to the
+     test suite. The useful metric is "docs match reality", enforced
+     by the test suite, not throughput. -->
+
 ---
 
 ## Trade-offs and production gotchas
@@ -385,6 +430,19 @@ use `describe`-grouped unit tests for edge cases.
 - The behavior is platform-specific.
 
 For those, describe the behavior in prose and test it in the test file.
+
+---
+
+## Reflection
+
+- Your library has 400 doctests. CI is now slower because of them and a
+  teammate proposes replacing 80% with plain unit tests. What's the
+  argument for keeping them as doctests (beyond "testing")? When is the
+  speed tradeoff worth it, and when isn't it?
+- A customer reports the docs on hexdocs.pm differ from what they see
+  when cloning the repo and running `mix docs` locally. What's the
+  likely root cause — given `source_ref`, `@version`, and `mix.lock` as
+  candidate culprits — and what's your debugging sequence?
 
 ---
 

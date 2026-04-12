@@ -60,6 +60,18 @@ The hard part is not the happy path. The hard part is correctness under failure:
 
 ---
 
+## Design decisions
+
+**Option A — Multi-Paxos as the consensus core**
+- Pros: historically robust; flexible leader selection.
+- Cons: notoriously hard to specify correctly; view-change rules diffuse across papers; fewer reference implementations with matching invariants.
+
+**Option B — Raft with term + log-comparison leader election** (chosen)
+- Pros: single spec (Figure 2 of the Raft paper); invariants are local and checkable; large body of reference code (etcd, TiKV) to cross-check against; randomized election timeouts collapse split votes quickly.
+- Cons: leader bottlenecks all writes; log must be fully ordered, no per-key concurrency.
+
+→ Chose **B** because the goal is a correct, auditable implementation; Raft's explicit rule set ("commit only current-term entries", "reset timer on every AppendEntries") is the whole point of picking Raft over Paxos.
+
 ## Implementation milestones
 
 ### Step 1: Create the project
@@ -868,6 +880,21 @@ mix run bench/raft_bench.exs
 
 Target: 10,000 linearizable writes/second on a 3-node cluster on localhost.
 
+### Why this works
+
+The leader serializes every write through a single log, so there is exactly one order of operations per term. Quorum commit guarantees that any future leader has every committed entry (by the log-up-to-date vote rule), so no committed data is ever lost. Randomized election timeouts make split votes self-correct in one or two rounds, and `maybe_step_down/2` keeps every node on the highest term it has seen — which is what makes the safety argument hold without a global clock.
+
+---
+
+## Benchmark
+
+```elixir
+# bench/raft_bench.exs — already defined in Step 11
+# mix run bench/raft_bench.exs
+```
+
+Target: 10,000 linearizable writes/second on a 3-node localhost cluster; p99 < 20 ms under `parallel: 10`.
+
 ---
 
 ## Trade-off analysis
@@ -903,6 +930,13 @@ The Raft node must not block its own message loop waiting for RPCs. Fire RPCs fr
 
 **5. Using wall-clock time for election timeouts**
 Use `System.monotonic_time/1`. Wall-clock time can jump backward after NTP correction, causing spurious elections.
+
+---
+
+## Reflection
+
+- If your cluster grew from 5 to 50 nodes, would you keep Raft as-is, shard into multiple Raft groups (à la CockroachDB / TiKV), or switch to a leaderless protocol? Justify in terms of write latency and failure blast radius.
+- Suppose 2 of 5 nodes are in a slow data center adding 80 ms of RTT. Would you change the quorum composition, tune election timeouts per-node, or accept the latency hit? Back your answer with the quorum-commit rule.
 
 ---
 

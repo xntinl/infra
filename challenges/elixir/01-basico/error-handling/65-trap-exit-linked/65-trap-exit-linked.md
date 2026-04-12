@@ -1,8 +1,6 @@
 # Trap Exit and Linked Processes
 
-**Difficulty**: ★★☆☆☆
-**Time**: 1.5–2 hours
-**Project**: `worker_wrapper` — capture crashes from a linked worker without using GenServer
+**Project**: `worker_wrapper` — capture crashes from a linked worker without using GenServer.
 
 ---
 
@@ -58,6 +56,34 @@ suspended for this process.
 
 Use **monitors** when you need to observe without coupling lifetimes. Use **links + trap**
 when you are responsible for the child's lifecycle.
+
+---
+
+## Why trap_exit and not monitors
+
+**Option A — use `Process.monitor/1` and react to `{:DOWN, ...}`**
+- Pros: unidirectional; the monitored process is unaffected if the monitor dies; no risk of the wrapper accidentally killing the worker.
+- Cons: you cannot propagate graceful shutdown to the child; you cannot abort the child by exiting the wrapper.
+
+**Option B — `spawn_link` + `Process.flag(:trap_exit, true)`** (chosen here for the exercise)
+- Pros: the wrapper owns the child's lifecycle — if the wrapper terminates, the child terminates; `:EXIT` messages let the wrapper decide restart policy; mirrors what OTP supervisors do.
+- Cons: trapping exits changes process semantics globally within the wrapper; a bug in the wrapper can silently absorb supervisor shutdowns.
+
+→ Chose **B** for this exercise because the stated business problem is "capture crashes from a worker you own". Ownership implies lifetime coupling, which is exactly what links provide. Use monitors when you only observe.
+
+---
+
+## Design decisions
+
+**Option A — build this on top of `GenServer` and `Supervisor`**
+- Pros: battle-tested; one-line restart strategies; observability via `:sys`.
+- Cons: hides the `trap_exit` mechanics behind callbacks; you learn nothing about the underlying signals.
+
+**Option B — raw `spawn_link` + receive + `trap_exit`** (chosen)
+- Pros: makes the mechanism visible; no library abstraction between you and the signal; you end this exercise able to debug supervisors, not just use them.
+- Cons: you would never ship this to production; `Supervisor` handles edge cases (shutdown order, `:brutal_kill`, `:shutdown` timeouts) you are intentionally skipping here.
+
+→ Chose **B** because the goal is to *understand* what OTP does when a link fires. Writing a miniature supervisor is the shortest path to that understanding.
 
 ---
 
@@ -183,6 +209,32 @@ end
 mix test
 ```
 
+### Why this works
+
+`spawn_link` creates a bidirectional link; an exit signal flows automatically in either direction. Setting `Process.flag(:trap_exit, true)` converts incoming exit signals (except `:kill`) into ordinary messages of shape `{:EXIT, pid, reason}`, which your `receive` can pattern-match. That is the *entire* mechanism by which OTP supervisors observe children: `Supervisor` is a process that traps exits and reacts according to a restart strategy. Reading `{:EXIT, _, :normal}` vs. `{:EXIT, _, reason}` lets the wrapper distinguish clean shutdown from abnormal termination — the same distinction that controls whether a supervisor restarts a child.
+
+---
+
+## Benchmark
+
+Measure the cost of a link+trap round-trip so you know the overhead budget for a wrapper that spawns one child per request:
+
+```elixir
+{us, _} = :timer.tc(fn ->
+  for _ <- 1..10_000 do
+    Process.flag(:trap_exit, true)
+    pid = spawn_link(fn -> :ok end)
+    receive do
+      {:EXIT, ^pid, _} -> :ok
+    end
+  end
+end)
+
+IO.puts("per spawn+link+trap: #{us / 10_000} µs")
+```
+
+Target esperado: <10 µs per spawn+link+trap cycle on modern hardware. If you are close to 100 µs, the bottleneck is mailbox traffic, not the trap mechanism.
+
 ---
 
 ## Trade-offs
@@ -229,6 +281,13 @@ If you only want to observe, use `Process.monitor/1` — no symmetric death risk
 - **Observing, not owning**: use a monitor. Monitors are unidirectional and do not require trapping.
 - **OTP apps**: let `Supervisor` handle it. Rolling your own trap-exit logic for long-lived workers duplicates what OTP already does correctly.
 - **Inside GenServer callbacks**: GenServer has first-class handling for `terminate/2` and linked children via `Supervisor`. Direct `trap_exit` in a GenServer is legitimate but rare.
+
+---
+
+## Reflection
+
+- Your wrapper traps exits and logs every `{:EXIT, _, reason}`. A supervisor above the wrapper sends `{:EXIT, _, :shutdown}` during application stop. What happens if your wrapper "handles" that exit by restarting the child and does not terminate itself? How would you prove the bug exists in a test?
+- `Process.exit(pid, :kill)` is not trapped — it always kills the target. Under what circumstances is that the right tool, and how do you decide between `:kill` and a cooperative `:shutdown` with a timeout?
 
 ---
 

@@ -58,6 +58,18 @@ Ranking is the second problem. A document that mentions "machine" 100 times is n
 
 ---
 
+## Design decisions
+
+**Option A — Trie of query prefixes**
+- Pros: excellent for prefix search and autocomplete.
+- Cons: full-text search is awkward; ranking requires a separate structure.
+
+**Option B — Inverted index (term → posting list) with BM25 scoring** (chosen)
+- Pros: canonical full-text shape; trivial intersection for AND queries; BM25 gives relevance ranking out of the box.
+- Cons: updates require segment merges à la Lucene.
+
+→ Chose **B** because every production full-text engine (Lucene, Tantivy, Bleve) converges on inverted indexes for a reason: they are the shape of the problem.
+
 ## Implementation milestones
 
 ### Step 1: Create the project
@@ -695,6 +707,21 @@ Benchee.run(
 
 Target: top-10 BM25 query under 50ms on a 1M-document corpus.
 
+### Why this works
+
+Documents are tokenized, and each token maps to a posting list of `(doc_id, term_freq, positions)`. Queries intersect posting lists in sorted order, and BM25 scores each hit using per-term IDF and document-length normalization.
+
+---
+
+## Benchmark
+
+```elixir
+# bench/search_bench.exs
+Benchee.run(%{"query" => fn -> Search.query("elixir genserver") end}, time: 10)
+```
+
+Target: 1M-document index; query latency p99 < 10 ms for 2-term intersections.
+
 ---
 
 ## Trade-off analysis
@@ -724,6 +751,11 @@ If documents are added incrementally, the average length changes. IDF also chang
 
 **4. Phrase query using global visited set**
 Positional intersection for phrases must check consecutive positions per document. Using a global set instead of per-document checking produces incorrect results when the same term appears at different positions in different documents.
+
+## Reflection
+
+- If queries became 10-term AND-heavy, would you switch posting-list intersection order, add skip lists, or precompute phrase indexes? Justify.
+- How does your design cope with updates? Compare to Lucene's segment-merge strategy.
 
 ---
 

@@ -2,9 +2,6 @@
 
 **Project**: `pretty_money` — a `Money` struct that renders nicely through `to_string/1` and the IEx/`inspect` output.
 
-**Difficulty**: ★★☆☆☆
-**Estimated time**: 1–2 hours
-
 ---
 
 ## Project context
@@ -53,7 +50,7 @@ when the default struct rendering isn't good enough.
 
 Simple inspect can return a string via `concat/1`. For nested or
 configurable output, use `Inspect.Algebra` primitives: `concat`, `nest`,
-`break`, `group`. Exercise 80 goes deep on this.
+`break`, `group`.
 
 ### 4. Human vs developer output — do NOT conflate
 
@@ -61,6 +58,30 @@ configurable output, use `Inspect.Algebra` primitives: `concat`, `nest`,
 debugging (you can't tell a `User` from a `String`). `inspect(user)` returning
 `#User<id: 42, name: "Jane Doe">` is debuggable. Always implement both, and
 keep them different.
+
+---
+
+## Why implement both protocols instead of "one good `to_string`"
+
+**`to_string/1` (via `String.Chars`) only.** You lose the developer/human distinction — your IEx output either lies or looks like a string, which is terrible for debugging.
+
+**`inspect/1` (via `Inspect`) only.** Users interpolating `"#{money}"` get `Protocol.UndefinedError`. Library ergonomics suffer.
+
+**Both (chosen).** `String.Chars` for user-facing interpolation (`"12.34 EUR"`), `Inspect` for developer-facing dumps (`#Money<12.34 EUR>`). The `#Type<...>` convention signals "intentional custom inspect" so readers don't confuse it with the default struct dump.
+
+---
+
+## Design decisions
+
+**Option A — `@derive Inspect` and skip `String.Chars`**
+- Pros: Zero handwritten code.
+- Cons: Shows raw struct fields (including integer cents) in IEx; interpolation still crashes.
+
+**Option B — Hand-rolled `String.Chars` + hand-rolled `Inspect` using `Inspect.Algebra`** (chosen)
+- Pros: Two distinct audiences, two distinct outputs; sensitive fields can be masked in `Inspect`; interpolation just works.
+- Cons: Two more small impls to maintain; easy to let them drift if formatting rules change.
+
+→ Chose **B** because the whole point is separating user-facing from developer-facing rendering, and the impls are tiny.
 
 ---
 
@@ -182,6 +203,16 @@ end
 mix test
 ```
 
+### Why this works
+
+Integer cents kill floating-point drift at the boundary (`round(amount * 100)`), so every render is deterministic. `String.Chars` returns the plain human form used by interpolation; `Inspect` wraps it in `#Money<...>` so IEx output is unambiguous. Both share `Money.format_amount/1`, which is the single source of truth for formatting — change it once, both outputs stay consistent.
+
+---
+
+## Benchmark
+
+<!-- benchmark N/A: string formatting of a small struct — not a meaningful hot path. The interesting complexity is in `Inspect.Algebra` layouts, covered in the custom-algebra exercise. -->
+
 ---
 
 ## Trade-offs and production gotchas
@@ -211,6 +242,13 @@ implement the protocol.
 If the value has no sensible text representation (a giant binary, a socket),
 don't force one — let callers who need a string build it explicitly. A
 missing impl is clearer than a garbage string.
+
+---
+
+## Reflection
+
+- You add a `:metadata` field to `Money` that may contain arbitrary user data (including PII). Which impl must you change to prevent leaking the metadata into IEx and assertion diffs, and what pattern (`@derive {Inspect, except: [...]}` vs hand-rolled) is more maintainable?
+- A teammate proposes making `String.Chars` include the currency symbol (`€12.34`) instead of the code (`12.34 EUR`). Which downstream consumers (logs, CSV exports, other services parsing your output) does that break, and how would you stage the change?
 
 ---
 

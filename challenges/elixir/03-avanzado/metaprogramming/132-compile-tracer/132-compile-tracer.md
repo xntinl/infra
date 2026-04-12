@@ -2,9 +2,6 @@
 
 **Project**: `compile_tracer` — install a `Code.compiler_options(:tracers)` hook that collects every module compiled in the project, records imports/aliases/references, and enforces a boundary policy at compile time.
 
-**Difficulty**: ★★★★☆
-**Estimated time**: 4–6 hours
-
 ---
 
 ## Project context
@@ -38,6 +35,24 @@ compile_tracer/
 │   └── tracer_test.exs
 └── mix.exs
 ```
+
+---
+
+## Why a tracer and not a post-compile analyzer
+
+**Post-compile analysis** (walking `.beam` files or parsing `.ex` sources
+after the build) is language-agnostic and decoupled from the compiler, but it
+sees only what the compiler left behind — macro expansions are frozen, and
+you duplicate the parser.
+
+**A compile tracer** runs inside the compiler and receives every `alias`,
+`import`, `remote_function`, and macro call as they happen, with live
+`Macro.Env`. Violations fail the build on the offending line instead of an
+out-of-band report.
+
+Use a tracer when the rule must be enforced as a build-breaker and must see
+post-expansion references (this is how Boundary works). Use a separate pass
+when you want advisory output or richer graph analytics.
 
 ---
 
@@ -82,6 +97,20 @@ not in process state — to keep the picture consistent.
 
 Raising inside `trace/2` aborts the current compilation. Use `CompileError` with a
 `file:` and `line:` for the error to land on the offending source line.
+
+---
+
+## Design decisions
+
+**Option A — in-process dictionary for the reference graph**
+- Pros: no ETS setup, zero extra processes.
+- Cons: parallel compilation runs in separate OS processes/schedulers; state is never shared and violations slip through.
+
+**Option B — ETS `:public` table with `write_concurrency`** (chosen)
+- Pros: survives concurrent tracer callbacks, shared across all compile workers, cheap reads after compile for summary.
+- Cons: global mutable state needs teardown between runs; must guard `init` against repeated creation.
+
+→ Chose **B** because the tracer must see every edge from every worker, and ETS is the lightest cross-process shared mutable store in OTP.
 
 ---
 
@@ -289,6 +318,16 @@ defmodule CompileTracer.TracerTest do
 end
 ```
 
+### Why this works
+
+The tracer callback runs synchronously inside the compiler with the live
+`Macro.Env`, so `env.module` and `env.file` are always the place that emitted
+the reference. Recording into a `:public` ETS table with
+`write_concurrency: true` lets parallel compilation workers insert without
+contention. Raising a `CompileError` with `file:` and `line:` makes the build
+fail at the offending source location, turning a policy into a mechanical
+guarantee rather than a convention.
+
 ---
 
 ## Trade-offs and production gotchas
@@ -330,6 +369,21 @@ host of edge cases you would re-invent badly.
 There is nothing to measure at runtime — the tracer runs only at compile time.
 For pathological sanity, time a full `mix compile --force` with and without the
 tracer installed; expect < 5% overhead on most projects.
+
+Target: under 5% wall-clock overhead on a 500-module project, measured with
+`time mix compile --force`.
+
+---
+
+## Reflection
+
+- Your monorepo grows to 20 bounded contexts and the policy map becomes the
+  bottleneck. How would you restructure the policy so adding a new context
+  does not require editing a central file, while still failing builds on
+  violations?
+- A macro in a shared library expands into a call that crosses a boundary.
+  The author of the caller did nothing wrong. How do you decide whether to
+  carve an exception, rewrite the macro, or rethink the boundary?
 
 ---
 

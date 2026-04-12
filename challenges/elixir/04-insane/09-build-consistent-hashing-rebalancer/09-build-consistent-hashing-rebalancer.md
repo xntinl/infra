@@ -56,6 +56,18 @@ The hard part is live migration. When a new node joins and takes ownership of so
 
 ---
 
+## Design decisions
+
+**Option A — Jump consistent hashing (Lamping & Veach)**
+- Pros: O(ln N) time, zero memory per key.
+- Cons: can only add or remove the *last* bucket without remapping; not general enough for arbitrary topology churn.
+
+**Option B — Hash ring with virtual nodes and rendezvous fallback** (chosen)
+- Pros: arbitrary add/remove; `1/N` key movement on any topology change; vnodes smooth out per-node load.
+- Cons: O(log N) ring lookup; vnode count must be tuned.
+
+→ Chose **B** because production rebalancing must cope with arbitrary node churn, not just appending to the tail; jump hash is not expressive enough.
+
 ## Implementation milestones
 
 ### Step 1: Create the project
@@ -484,6 +496,21 @@ Benchee.run(
 
 Target: `lookup/2` < 1µs per call with 10 physical nodes and V=150.
 
+### Why this works
+
+Virtual nodes hash-spread each physical node into many ring slots, so load distribution is `1 ± ε` even with few nodes. When a node joins or leaves, only the keys that fall into its vnode arcs move, which is provably `1/N` of the keyspace in expectation.
+
+---
+
+## Benchmark
+
+```elixir
+# bench/ring_bench.exs
+Benchee.run(%{"lookup" => fn -> Ring.locate(ring, "key_#{:rand.uniform(1_000_000)}") end}, time: 10)
+```
+
+Target: Lookup p99 < 1 µs at 1024 vnodes; rebalance of 1 M keys on add/remove completes in under 500 ms.
+
 ---
 
 ## Trade-off analysis
@@ -513,6 +540,11 @@ Reading from the destination before the key has been migrated returns `not_found
 
 **4. Hotspot detection in the read path**
 Incrementing an access counter on every read adds serialization to what should be a concurrent ETS lookup. Sample access frequency in a separate process, not inline in the read path.
+
+## Reflection
+
+- If the workload is 99% reads from a small hot key set, does the vnode-balancing argument still hold? How would you measure it?
+- Compare jump hash vs your ring at 3 nodes and at 300 nodes. Where does each win on memory, lookup time, and rebalance cost?
 
 ---
 

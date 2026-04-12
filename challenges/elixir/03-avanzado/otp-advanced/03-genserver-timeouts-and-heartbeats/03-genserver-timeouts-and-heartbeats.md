@@ -2,10 +2,6 @@
 
 **Project**: `heartbeat_gs` — a session tracker that detects frozen callers via liveness heartbeats and the 5th-element timeout trick.
 
-**Difficulty**: ★★★★☆
-
-**Estimated time**: 3–4 hours
-
 ---
 
 ## Project context
@@ -99,7 +95,36 @@ Without the flush, a stale `:pong_deadline` fires after you thought you had canc
 
 ---
 
+## Why heartbeats and not TCP keepalive
+
+Linux TCP keepalive defaults to 2 h idle + 75 s interval × 9 probes — detection lag exceeds two hours. Tuning keepalive per-socket is possible but requires NIF access and is ignored by many NAT middleboxes that recycle idle flows after 60 s of silence. An application-layer ping/pong runs in user space, respects business-level liveness (the peer's scheduler might be alive while its handler loop is deadlocked), and is tunable per-session. The 5th-element timeout handles orthogonal "no business activity" detection.
+
+---
+
+## Design decisions
+
+**Option A — single inactivity timer (5th-element only)**
+- Pros: zero timer refs, single `:timeout` message, trivial state.
+- Cons: any mailbox noise (telemetry probes, monitor DOWNs) resets the timer; cannot distinguish "peer alive" from "process alive".
+
+**Option B — heartbeat + independent inactivity timer** (chosen)
+- Pros: two orthogonal questions get two orthogonal answers; heartbeat catches half-open sockets, inactivity catches abandoned sessions; each can tune its own threshold.
+- Cons: two timer refs plus a `Process.cancel_timer` flush pattern; you must compute `idle_remaining/1` by hand so heartbeat traffic doesn't reset inactivity.
+
+→ Chose **B** because the failure modes are genuinely different (frozen peer vs. idle user) and the SLO demands sub-10 s peer detection while tolerating 30 min of legitimate user idleness.
+
+---
+
 ## Implementation
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defp deps do
+  []
+end
+```
+
 
 ### Step 1: `mix.exs`
 
@@ -326,6 +351,10 @@ defmodule HeartbeatGs.SessionTrackerTest do
 end
 ```
 
+### Why this works
+
+`last_ping_id` (a `make_ref()`) guarantees stale pongs cannot extend a dead session. `idle_remaining/1` subtracts elapsed time from the inactivity budget so heartbeat messages never reset the business timer — the two liveness checks stay orthogonal. The `Process.cancel_timer` + `receive after 0` pattern drains fired-but-late deadline messages so they can't masquerade as genuine timeouts in the next cycle.
+
 ---
 
 ## Trade-offs and production gotchas
@@ -359,6 +388,15 @@ Detection lag, measured with 10k active sessions on a 10-core M1 Max:
 | 5th-elt inactivity (no heartbeat)     | 30.0 s  | 30.1 s  |
 
 CPU cost of the heartbeat mesh (10k sessions, 5 s interval): ~0.8% of one core, dominated by Registry lookups on pong delivery.
+
+Target: peer-death detection p99 ≤ `@ping_ms + @pong_ms + 200 ms` (= 7.2 s with defaults); heartbeat CPU ≤ 1% of one core per 10k sessions.
+
+---
+
+## Reflection
+
+1. Your fleet grows from 10k to 500k sessions. At 5 s ping intervals, that is 100k pings/s across the cluster. Do you raise `@ping_ms` uniformly, shard by node, or switch to monitor-based liveness where possible? What observability would you need to decide?
+2. A mobile client goes through 8 s of background suspension and resumes cleanly. With defaults (5 s + 2 s), the session dies mid-suspension. How would you distinguish "transient suspension" from "dead peer" without lengthening detection for genuine failures?
 
 ---
 

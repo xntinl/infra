@@ -3,9 +3,6 @@
 **Project**: `setup_contexts` — a `UserRepo` backed by an Agent, tested with
 per-test and per-module fixtures via `setup`, `setup_all`, and context tags.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
-
 ---
 
 ## Project context
@@ -19,6 +16,19 @@ Done right, this eliminates three bad habits at once:
 1. Copy-pasting fixture code across tests.
 2. Relying on global `Application.put_env` mutations.
 3. Using `Process.sleep/1` to wait for a process to be "ready".
+
+## Why ExUnit setup and not X
+
+**Why not module-level `@fixture` attributes?** Module attributes are
+evaluated once at compile time — they can't hold a live pid or a freshly
+seeded process. They're data; fixtures are procedures.
+
+**Why not a macro-based "factories" library?** Most of what ExUnit supports
+via `setup`/`setup_all` + tags needs no DSL. Factories pay off when you
+need graph-shaped object construction; for a pid + seed they're overkill.
+
+**Why not `Process.put` globals?** Because `async: true` tests run in
+parallel processes, and a global write-path destroys test isolation.
 
 Project structure:
 
@@ -80,8 +90,28 @@ This is the idiomatic way to parameterize fixtures without a test factory DSL.
 
 `setup` blocks can register cleanup callbacks with `on_exit/1`. They run
 after the test finishes, regardless of pass/fail — the right place to
-kill processes, delete files, or drop temp tables. See also exercise 113
-for the higher-level `start_supervised!/1`.
+kill processes, delete files, or drop temp tables. For the higher-level
+`start_supervised!/1`, see the supervised-start exercise.
+
+---
+
+## Design decisions
+
+**Option A — Per-test `setup`, fresh state every time**
+- Pros: Full isolation; no test depends on another.
+- Cons: Per-test cost of starting the Agent.
+
+**Option B — `setup_all` once, shared state across the module** (rejected)
+- Pros: Faster overall.
+- Cons: Mutation between tests; breaks under `async: true`.
+
+**Option C — `setup_all` for immutable data + `setup` for mutable pids** (chosen)
+- Pros: Best of both — expensive constants computed once, per-test pids
+  isolated.
+- Cons: Two layers to understand.
+
+→ Chose **C** because it's the idiomatic ExUnit shape. `setup_all` carries
+seed names (immutable), `setup` starts the Agent (mutable).
 
 ---
 
@@ -228,6 +258,23 @@ mix test --only with_seed
 mix test --trace  # see each test name and duration
 ```
 
+### Why this works
+
+`setup_all` runs once per module in its own process and merges its return
+value into every test's context. `setup` runs before each test in the test's
+own process, so pids it starts are isolated from other tests — `async: true`
+is safe. Tag-driven branching (`if n = context[:seed]`) keeps fixtures
+parameterized without a DSL; `on_exit/1` guarantees cleanup regardless of
+pass/fail.
+
+---
+
+## Benchmark
+
+<!-- benchmark N/A: tema conceptual sobre estructura de fixtures; la
+performance relevante es "tests totales / duración del suite" y se mide
+con `mix test --trace`, no con un microbenchmark. -->
+
 ---
 
 ## Trade-offs and production gotchas
@@ -253,8 +300,18 @@ not to reset a `Process.put/2` value in the test process.
 
 **5. When NOT to use `setup_all`**
 If you're tempted to put a started GenServer in `setup_all`, stop. It
-introduces test-order coupling. Use `setup` + `start_supervised!/1`
-(exercise 113) instead.
+introduces test-order coupling. Use `setup` + `start_supervised!/1` instead.
+
+---
+
+## Reflection
+
+- Your test suite has 500 tests and a shared Ecto Sandbox setup. A new hire
+  proposes moving sandbox checkout into `setup_all` "for speed". What goes
+  wrong, and how do you explain it with a minimal example?
+- At what point does the branching inside a tag-driven `setup` become bad
+  enough that you should extract it into a `TestFixtures` module? Write
+  the rule you'd enforce on code review.
 
 ---
 

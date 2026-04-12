@@ -36,6 +36,22 @@ beam_profiler/
 
 ---
 
+## Why stack sampling for most diagnoses and targeted instrumentation for specific functions and not pure instrumentation for everything
+
+sampling answers "where is CPU spent?" cheaply and is representative at scale; instrumentation answers "how often and how long does this specific call take?" with zero sampling error. You pick the tool per question, not one for all.
+
+## Design decisions
+
+**Option A — always-on instrumentation via :erlang.trace/3 on every call**
+- Pros: perfect fidelity — no sample misses
+- Cons: 30-80% throughput overhead, unsuitable for production
+
+**Option B — statistical stack sampling at 99 Hz** (chosen)
+- Pros: <2% overhead in production, flame graphs converge with minutes of data
+- Cons: short-lived hot paths may be undersampled
+
+→ Chose **B** because the tool must attach to a live production node; anything above 5% throughput tax is a non-starter.
+
 ## The business problem
 
 A production service handling 10k req/s started showing P99 latency spikes at 15:00 every day. Adding `IO.inspect` is not an option on a live system. The profiler must attach without restart, collect data for 30 seconds, and detach — leaving the node in exactly the state it was in before.
@@ -490,6 +506,9 @@ defmodule BeamProfiler.CallGraphTest do
     stack: [{MyApp.Controller, :index, 2}, {MyApp.Router, :call, 2}]
   }
 
+
+  describe "CallGraph" do
+
   test "self samples count only for leaf nodes" do
     graph = CallGraph.build([@sample_a, @sample_b, @sample_c])
     # Router.call appears in all 3 samples as non-leaf → self = 0
@@ -526,6 +545,9 @@ defmodule BeamProfiler.CallGraphTest do
       node -> node.total_samples
     end
   end
+
+
+  end
 end
 ```
 
@@ -535,6 +557,9 @@ defmodule BeamProfiler.FlamegraphTest do
   use ExUnit.Case, async: true
 
   alias BeamProfiler.Flamegraph
+
+
+  describe "Flamegraph" do
 
   test "identical stacks are merged with summed counts" do
     samples = [
@@ -560,6 +585,9 @@ defmodule BeamProfiler.FlamegraphTest do
     assert Enum.any?(counts, fn {_k, v} -> v == 1 end)
 
     File.rm!(path)
+  end
+
+
   end
 end
 ```
@@ -600,6 +628,24 @@ Expected: sampling 500 processes should complete in under 1ms per round. At 100 
 
 ---
 
+### Why this works
+
+The design separates concerns along their real axes: what must be correct (the BEAM profiler invariants), what must be fast (the hot path isolated from slow paths), and what must be evolvable (external contracts kept narrow). Each module has one job and fails loudly when given inputs outside its contract, so bugs surface near their source instead of as mysterious downstream symptoms. The tests exercise the invariants directly rather than implementation details, which keeps them useful across refactors.
+
+## Benchmark
+
+```elixir
+# Minimal timing harness — replace with Benchee for production measurement.
+{time_us, _result} = :timer.tc(fn ->
+  # exercise the hot path N times
+  for _ <- 1..10_000, do: :ok
+end)
+
+IO.puts("average: #{time_us / 10_000} µs per op")
+```
+
+Target: <2% throughput overhead at 99 Hz sampling on a node doing 50k req/s.
+
 ## Trade-off analysis
 
 | Aspect | Sampling (100 Hz) | Instrumentation (:dbg) | Both simultaneously |
@@ -633,6 +679,10 @@ If your profiler crashes without stopping `:dbg`, the node continues tracing sil
 The `recon` library's `recon_trace` module implements a safety limit on trace message rate. Study its approach before attaching to any node handling real traffic.
 
 ---
+
+## Reflection
+
+If a latency spike lasts exactly 400ms once per hour, will your 99 Hz sampler catch it? What sampling strategy would guarantee capture, and at what overhead cost?
 
 ## Resources
 

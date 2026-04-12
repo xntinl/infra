@@ -39,6 +39,22 @@ mytest/
 
 ---
 
+## Why module attributes (`@tests`) for accumulation and not an Agent or ETS table
+
+attributes are evaluated at compile time and baked into the beam file — no process, no state to reset, no race between test registration and test running. An Agent adds a process boot to every test module load.
+
+## Design decisions
+
+**Option A — runtime registration via a GenServer collecting tests at boot**
+- Pros: simple mental model, dynamic test generation
+- Cons: slow startup, non-deterministic ordering, no compile-time guarantees
+
+**Option B — compile-time macros that accumulate tests into a module attribute** (chosen)
+- Pros: zero runtime cost, deterministic ordering, compiler errors for malformed tests
+- Cons: macros are harder to debug, requires understanding Elixir AST
+
+→ Chose **B** because test frameworks must have negligible startup overhead and fail loudly on malformed test definitions.
+
 ## The business problem
 
 The tooling team needs a test runner that can be embedded in a custom CI pipeline, emit JSON results consumed by a dashboard, and filter tests by domain tags (`:billing`, `:payments`, `:slow`) without modifying test code. ExUnit's formatting is not flexible enough and its JSON output is not stable across versions.
@@ -733,6 +749,8 @@ defmodule MyTest.RunnerTest do
   # Define test modules inline for the runner to discover
   defmodule PassingModule do
     use MyTest.Case
+    describe "Runner" do
+
     test "always passes" do: assert 1 == 1
     test "also passes" do: assert true
   end
@@ -771,6 +789,8 @@ defmodule MyTest.RunnerTest do
     assert summary.total == 4
     assert summary.passed + summary.failed + summary.errors == summary.total
   end
+
+    end
 end
 ```
 
@@ -780,6 +800,9 @@ defmodule MyTest.PropertyTest do
   use ExUnit.Case, async: true
 
   alias MyTest.Property.{Generator, Shrinker}
+
+
+  describe "Property" do
 
   test "integer generator produces values in range" do
     gen = Generator.integer(0, 10)
@@ -820,6 +843,9 @@ defmodule MyTest.PropertyTest do
         :ok
     end
   end
+
+
+  end
 end
 ```
 
@@ -830,6 +856,24 @@ mix test test/mytest/ --trace
 ```
 
 ---
+
+### Why this works
+
+The design separates concerns along their real axes: what must be correct (the test framework invariants), what must be fast (the hot path isolated from slow paths), and what must be evolvable (external contracts kept narrow). Each module has one job and fails loudly when given inputs outside its contract, so bugs surface near their source instead of as mysterious downstream symptoms. The tests exercise the invariants directly rather than implementation details, which keeps them useful across refactors.
+
+## Benchmark
+
+```elixir
+# Minimal timing harness — replace with Benchee for production measurement.
+{time_us, _result} = :timer.tc(fn ->
+  # exercise the hot path N times
+  for _ <- 1..10_000, do: :ok
+end)
+
+IO.puts("average: #{time_us / 10_000} µs per op")
+```
+
+Target: <10ms to compile and run a 100-test file.
 
 ## Trade-off analysis
 
@@ -864,6 +908,10 @@ Integer generators must shrink toward 0, not toward the minimum of the range. A 
 The ETS table used by your Registry is global. If async tests call `Registry.register/4` with the same metric name, they race. Prefix metric names with a unique test ID, or use a per-test ETS table created in `setup` and deleted in `on_exit`.
 
 ---
+
+## Reflection
+
+If someone writes 100k `test` blocks in one module, where does the compile-time-attribute approach break first — memory, compile time, or beam file size? How would you mitigate it?
 
 ## Resources
 

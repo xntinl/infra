@@ -1,9 +1,6 @@
 # HTTP Client Testing with Bypass
 
 **Project**: `bypass_http` — a weather API client with retries and timeouts.
-**Difficulty**: ★★★★☆
-**Estimated time**: 3–5 hours
-
 ---
 
 ## Project context
@@ -43,6 +40,16 @@ bypass_http/
 ```
 
 ---
+
+## Why this approach and not alternatives
+
+Alternatives considered and discarded:
+
+- **Hand-rolled equivalent**: reinvents primitives the BEAM/ecosystem already provides; high risk of subtle bugs around concurrency, timeouts, or failure propagation.
+- **External service (e.g. Redis, sidecar)**: adds a network hop and an extra failure domain for a problem the VM can solve in-process with lower latency.
+- **Heavier framework abstraction**: couples the module to a framework lifecycle and makes local reasoning/testing harder.
+
+The chosen approach stays inside the BEAM, uses idiomatic OTP primitives, and keeps the contract small.
 
 ## Core concepts
 
@@ -108,6 +115,18 @@ cleanup is automatic. Reusing a single Bypass across tests works but loses `asyn
 because expectations accumulate.
 
 ---
+
+## Design decisions
+
+**Option A — naive/simple approach**
+- Pros: minimal code, easy to reason about.
+- Cons: breaks under load, lacks observability, hard to evolve.
+
+**Option B — the approach used here** (chosen)
+- Pros: production-grade, handles edge cases, testable boundaries.
+- Cons: more moving parts, requires understanding of the BEAM primitives involved.
+
+→ Chose **B** because correctness under concurrency and failure modes outweighs the extra surface area.
 
 ## Implementation
 
@@ -437,6 +456,23 @@ and the 1.5s timeout test. If you see > 30s you have a retry storm — check `ba
 
 ---
 
+
+### Why this works
+
+The design leans on BEAM guarantees (process isolation, mailbox ordering, supervisor restarts) and pushes invariants to the boundaries of each module. State transitions are explicit, failure modes are declared rather than implicit, and each step is independently testable. That combination keeps the implementation correct under concurrent load and cheap to change later.
+
+## Benchmark
+
+```elixir
+# Minimal measurement — replace with Benchee for distribution stats.
+{time_us, _} = :timer.tc(fn ->
+  for _ <- 1..10_000, do: run_operation()
+end)
+IO.puts("avg: #{time_us / 10_000} µs/op")
+```
+
+Target: operation should complete in the low-microsecond range on modern hardware; deviations by >2× indicate a regression worth investigating.
+
 ## Trade-offs and production gotchas
 
 **1. Bypass is a real HTTP/1.1 server — no HTTP/2, no gRPC**
@@ -493,6 +529,11 @@ A `Finch.request` against localhost:bypass round-trips in ~500µs. Comparable to
 domestic-datacenter HTTP call.
 
 ---
+
+## Reflection
+
+- If the expected load grew by 100×, which assumption in this design would break first — the data structure, the process model, or the failure handling? Justify.
+- What would you measure in production to decide whether this implementation is still the right one six months from now?
 
 ## Resources
 

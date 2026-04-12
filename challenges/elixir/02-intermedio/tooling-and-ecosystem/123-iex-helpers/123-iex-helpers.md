@@ -4,9 +4,6 @@
 a custom helpers module, plus a tour of the built-in IEx helpers everyone
 should know.
 
-**Difficulty**: ★★☆☆☆
-**Estimated time**: 1–2 hours
-
 ---
 
 ## Project context
@@ -77,8 +74,42 @@ want to call by bare name inside IEx. Import it from `.iex.exs` and every
 
 ### 4. `dbg/2` and `IEx.pry/0` integrate with IEx
 
-See exercise 17 — `IEx.pry/0` is a breakpoint at the source level, useful
-when paired with `iex -S mix` for interactive debugging.
+`IEx.pry/0` is a breakpoint at the source level: drop it into a function,
+run the call, and IEx pauses with the lexical scope available. Combined
+with `break!/2` from `IEx.Helpers`, you get a GDB-style debugger wired
+into the shell.
+
+---
+
+## Why X and not Y
+
+**IEx helpers vs shell aliases (bash/zsh)**: shell aliases run outside
+the BEAM and can't touch your running node. Helpers live inside the VM,
+so `top/1` can enumerate processes, read reductions, and inspect state.
+
+**Project-local `.iex.exs` vs `~/.iex.exs`**: user-home helpers are
+convenient but travel with the developer, not the repo. Teammates and CI
+don't get them. Project-local `.iex.exs` is code the team can review,
+version, and rely on.
+
+---
+
+## Design decisions
+
+**Option A — Put helpers directly in `.iex.exs`**
+- Pros: One file, no extra module; fine for 2–3 one-liners.
+- Cons: Untestable (ExUnit doesn't run `.iex.exs`); grows unwieldy fast;
+  helpers can't be reused outside IEx.
+
+**Option B — Module under `lib/`, imported from `.iex.exs`** (chosen)
+- Pros: Helpers are normal code — documented, tested, refactorable.
+  `.iex.exs` stays a thin wiring file (imports + banner).
+- Cons: One extra file to maintain; helpers must be compilable even when
+  nobody imports them.
+
+→ Chose **B** because shell helpers that matter enough to exist also
+  matter enough to test. A broken helper on a prod remote shell is worse
+  than no helper at all.
 
 ---
 
@@ -233,6 +264,23 @@ iex> recompile()          # reload changes without restarting the VM
 iex> respawn()            # start a fresh shell, keep the VM
 ```
 
+### Why this works
+
+`.iex.exs` runs as ordinary Elixir at shell start with full access to
+the compiled project (because `iex -S mix` compiles first). Importing a
+tested helpers module gives bare-name ergonomics without sacrificing
+testability. Built-in helpers (`h/1`, `i/1`, `v/1`) cover reflection and
+history; custom helpers cover project-specific conveniences — together
+they turn IEx from a REPL into an operational console.
+
+---
+
+## Benchmark
+
+<!-- benchmark N/A: IEx helpers are interactive; the value is
+     ergonomics, not throughput. `top/1` enumerates processes in
+     O(number_of_processes) which is acceptable for ad-hoc use. -->
+
 ---
 
 ## Trade-offs and production gotchas
@@ -274,9 +322,23 @@ minimal (imports, aliases, banner) and put logic in testable modules.
 
 ---
 
+## Reflection
+
+- Your team has a shared `IExHelpers.Prod` module with helpers like
+  `reset_cache/0` that work over `Node.list()`. One of them accidentally
+  does `Process.exit/2` with the wrong PID in a staging incident. What
+  guardrails would you add so a dangerous helper can't be invoked by
+  typing its bare name?
+- `recompile/0` is fast but doesn't re-init GenServers — a captured
+  closure keeps holding old code. If a dev reports "my changes don't
+  show up after recompile()", what's your mental model for deciding
+  between `recompile/0`, `respawn/0`, and restarting the whole VM?
+
+---
+
 ## Resources
 
 - [`IEx.Helpers`](https://hexdocs.pm/iex/IEx.Helpers.html) — all built-in helpers
 - [`IEx` overview](https://hexdocs.pm/iex/IEx.html) — configuration, `.iex.exs`, history
 - ["The `.iex.exs` file"](https://hexdocs.pm/iex/IEx.html#module-the-iex-exs-file) — loading order and examples
-- [`:recon`](https://hexdocs.pm/recon/) — production-grade analog of `top/1`, covered in exercise 125
+- [`:recon`](https://hexdocs.pm/recon/) — production-grade analog of `top/1` for live-node diagnostics

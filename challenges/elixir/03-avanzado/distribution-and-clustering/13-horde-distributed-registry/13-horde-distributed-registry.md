@@ -2,9 +2,6 @@
 
 **Project**: `horde_registry_demo` — distribute tens of thousands of stateful workers across a BEAM cluster using `Horde.Registry` + `Horde.DynamicSupervisor`, surviving node churn without a global lock.
 
-**Difficulty**: ★★★★☆
-**Estimated time**: 3–6 hours
-
 ---
 
 ## Project context
@@ -13,7 +10,7 @@ You're running a collaborative-editing backend where every open document spawns 
 
 `Horde` (by Derek Kraan) replaces `:global` + `DynamicSupervisor` with **delta-CRDT**-backed peers: every node keeps a local copy of the registry and the supervisor state, propagating deltas via gossip. Reads are always local and cheap; writes are eventually consistent across the cluster. Crucially, when a node dies, its processes are **redistributed** to surviving nodes according to a pluggable distribution strategy (uniform, weighted, active-anti-entropy).
 
-This exercise builds `horde_registry_demo` on top of libcluster's Epmd strategy (see exercise 101). You will register 10 000 synthetic workers, kill a node, and observe automatic rebalance with zero manual intervention. You will also see the downside: two nodes can briefly register the same name during a partition heal.
+This exercise builds `horde_registry_demo` on top of libcluster's Epmd strategy. You will register 10 000 synthetic workers, kill a node, and observe automatic rebalance with zero manual intervention. You will also see the downside: two nodes can briefly register the same name during a partition heal.
 
 Project structure:
 
@@ -37,6 +34,16 @@ horde_registry_demo/
 ```
 
 ---
+
+## Why this approach and not alternatives
+
+Alternatives considered and discarded:
+
+- **Hand-rolled equivalent**: reinvents primitives the BEAM/ecosystem already provides; high risk of subtle bugs around concurrency, timeouts, or failure propagation.
+- **External service (e.g. Redis, sidecar)**: adds a network hop and an extra failure domain for a problem the VM can solve in-process with lower latency.
+- **Heavier framework abstraction**: couples the module to a framework lifecycle and makes local reasoning/testing harder.
+
+The chosen approach stays inside the BEAM, uses idiomatic OTP primitives, and keeps the contract small.
 
 ## Core concepts
 
@@ -92,9 +99,19 @@ When Horde redistributes a process, by default it **terminates** the old pid (re
 - On `{:EXIT, _, :shutdown}`, snapshot state to an external store (ETS, Postgres, S3) keyed by name.
 - On `init/1`, load the snapshot if present.
 
-See exercise 104 for a complete handoff example.
-
 ---
+
+## Design decisions
+
+**Option A — naive/simple approach**
+- Pros: minimal code, easy to reason about.
+- Cons: breaks under load, lacks observability, hard to evolve.
+
+**Option B — the approach used here** (chosen)
+- Pros: production-grade, handles edge cases, testable boundaries.
+- Cons: more moving parts, requires understanding of the BEAM primitives involved.
+
+→ Chose **B** because correctness under concurrency and failure modes outweighs the extra surface area.
 
 ## Implementation
 
@@ -448,9 +465,14 @@ HordeRegistryDemo.SessionRouter.count_sessions()
 #=> 3000 (all redistributed to node1 + node3)
 ```
 
-The ~1 000 sessions that were on `node2` have been restarted on the survivors (without their in-memory state — see exercise 104 for handoff).
+The ~1 000 sessions that were on `node2` have been restarted on the survivors (without their in-memory state —
 
 ---
+
+
+### Why this works
+
+The design leans on BEAM guarantees (process isolation, mailbox ordering, supervisor restarts) and pushes invariants to the boundaries of each module. State transitions are explicit, failure modes are declared rather than implicit, and each step is independently testable. That combination keeps the implementation correct under concurrent load and cheap to change later.
 
 ## Trade-offs and production gotchas
 
@@ -501,6 +523,11 @@ Equivalent with `:global`:
 Horde is ~20× faster than `:global` here, and scales linearly with cluster size instead of quadratically.
 
 ---
+
+## Reflection
+
+- If the expected load grew by 100×, which assumption in this design would break first — the data structure, the process model, or the failure handling? Justify.
+- What would you measure in production to decide whether this implementation is still the right one six months from now?
 
 ## Resources
 

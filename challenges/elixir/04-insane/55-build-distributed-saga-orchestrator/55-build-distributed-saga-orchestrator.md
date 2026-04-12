@@ -12,6 +12,18 @@ The Saga pattern solves this: decompose the order flow into local transactions, 
 
 You will build `SagaEngine`: a distributed saga orchestrator where each saga is a durable GenServer, every state transition is an append-only event in a persistent log, and recovery resumes in-progress sagas after any crash.
 
+## Design decisions
+
+**Option A — 2-phase commit across services**
+- Pros: strong consistency
+- Cons: holds distributed locks for the duration — unacceptable for online systems
+
+**Option B — saga with append-only event log + compensating actions** (chosen)
+- Pros: non-blocking, fault-tolerant, services stay independent
+- Cons: eventual consistency window, compensations must be idempotent
+
+→ Chose **B** because 2PC fails the latency and availability test at any real-world scale; sagas are the documented industry answer.
+
 ## Why each saga is a GenServer and not a plain function
 
 A saga may run for minutes (waiting for a payment gateway to respond, a shipment API to confirm). During this time, the saga must be monitorable, cancellable, and recoverable. A GenServer holds state, can be registered by name (for lookup), can be supervised (auto-restarted), and can receive external signals (cancel, timeout). A plain function cannot be preempted or inspected.
@@ -554,6 +566,10 @@ defmodule SagaEngine.Recovery do
 end
 ```
 
+### Why this works
+
+The design isolates correctness-critical invariants from latency-critical paths and from evolution-critical contracts. Modules expose narrow interfaces and fail fast on contract violations, so bugs surface close to their source. Tests target invariants rather than implementation details, so refactors don't produce false alarms. The trade-offs are explicit in the Design decisions section, which makes the "why" auditable instead of folklore.
+
 ## Given tests
 
 ```elixir
@@ -592,6 +608,9 @@ end
 defmodule SagaEngine.CompensationTest do
   use ExUnit.Case, async: false
   alias SagaEngine.{Orchestrator, EventLog, Testing}
+
+
+  describe "Compensation" do
 
   test "compensation runs in reverse order when step 3 fails" do
     sequence = Agent.start_link(fn -> [] end) |> elem(1)
@@ -699,6 +718,9 @@ defmodule SagaEngine.InvariantPropertyTest do
       end
     end
   end
+
+
+  end
 end
 ```
 
@@ -758,6 +780,10 @@ SagaEngine.Bench.Throughput.run()
 **Recovery running two orchestrators for the same saga.** If recovery starts a new orchestrator for saga X, and the original orchestrator (which was thought to be dead) reconnects (network partition, not crash), both run concurrently and may execute the same step twice. Use `:global.register_name/2` or Horde for distributed process registration to ensure at most one orchestrator per saga ID.
 
 **Storing compensation results separately from the event log.** Some implementations write "saga state" to a separate table and use the event log only for audit. This introduces a consistency window: if the process crashes after updating the event log but before updating the state table, the two disagree. The event log must be the single source of truth — derive all state from it.
+
+## Reflection
+
+A saga has 5 steps. Step 4 fails; compensations for 3, 2, 1 must run. If the compensation for step 2 itself fails, what does your system do — retry forever, escalate, or give up? Define the contract.
 
 ## Resources
 

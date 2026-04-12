@@ -1,5 +1,9 @@
 # Error Handling: try/rescue/else/after and Custom Exceptions
 
+**Project**: `task_queue` — a worker with structured error handling using custom exceptions, `try/rescue` boundaries, `after` cleanup, and `reraise` log-and-propagate patterns.
+
+---
+
 ## Goal
 
 Build a `task_queue` worker with structured error handling using custom exceptions (`defexception`), `try/rescue` boundaries that convert exceptions into `{:error, reason}` tuples, `after` clauses for resource cleanup, and `reraise` for log-and-propagate patterns.
@@ -23,6 +27,20 @@ The practical rule:
 ## Why `defexception` and not plain atoms
 
 Atoms like `:timeout` are too coarse for diagnosis. `defexception` defines structured exception types with named fields. When rescued, `e.job_id` and `e.reason` are available for structured logging -- not just a string message.
+
+---
+
+## Design decisions
+
+**Option A — let every raise bubble up to the supervisor; no `try/rescue` in the worker**
+- Pros: the worker stays tiny; supervisor restart strategy owns recovery; no risk of swallowing bugs.
+- Cons: you lose per-job context (which job? which step?); every bug restarts the worker and drops the rest of its mailbox; observability relies entirely on crash reports.
+
+**Option B — `try/rescue` at the job boundary, convert to `{:error, reason}`, `reraise` on programmer errors** (chosen)
+- Pros: per-job failures do not kill the worker; you can classify errors (transient vs. fatal) and retry selectively; structured exceptions carry context for logging.
+- Cons: requires discipline to `reraise` bugs instead of silently returning `{:error, :oops}`; the boundary is easy to draw in the wrong place.
+
+→ Chose **B** because task queues are long-lived processes serving many jobs. Isolation of *each job's* failure from the worker's lifecycle is the whole point.
 
 ---
 
@@ -297,6 +315,47 @@ end
 ```bash
 mix test test/task_queue/error_handling_test.exs --trace
 ```
+
+### Why this works
+
+`try/rescue` draws the boundary at the job level, not the worker level: each call runs inside its own try block, so a raise from one job never touches the next. `defexception` keeps the rescue clauses narrow (you rescue *your* errors, not every Exception), which means genuine bugs still crash and still show up as supervisor reports — exactly what you want. `after` runs on both success and failure paths, so acquired resources (connections, file handles, metrics timers) are released even if the handler raises. Finally `reraise e, __STACKTRACE__` preserves the original origin, so logs point at the real line of code, not at the rescue clause.
+
+---
+
+## Benchmark
+
+Compare the overhead of entering a `try/rescue` on the happy path against calling the handler directly:
+
+```elixir
+handler = fn job -> {:ok, job.id} end
+job = %{id: 1}
+
+{us_plain, _} = :timer.tc(fn ->
+  for _ <- 1..1_000_000, do: handler.(job)
+end)
+
+{us_rescued, _} = :timer.tc(fn ->
+  for _ <- 1..1_000_000 do
+    try do
+      handler.(job)
+    rescue
+      e -> {:error, e}
+    end
+  end
+end)
+
+IO.puts("plain:   #{us_plain / 1_000_000} µs/call")
+IO.puts("rescued: #{us_rescued / 1_000_000} µs/call")
+```
+
+Target esperado: <0.5 µs overhead per call on modern hardware. The `try/rescue` frame is essentially free on the non-raising path — the BEAM only pays the cost when an exception is actually raised.
+
+---
+
+## Reflection
+
+- Your worker processes 5k jobs/min. A regression makes 0.5% of jobs raise `ArgumentError` (a genuine bug). With the current design, bugs crash the worker via `reraise`. Do you keep that, switch to classifying `ArgumentError` as `{:error, :bad_input}`, or add a circuit breaker? What signal tells you the bug fix shipped vs. the workaround became permanent?
+- `after` runs on every path — success, rescue, and re-raised exceptions. If `after` itself raises (e.g. closing a dead connection), the original exception is lost. How do you defend against that in a production worker?
 
 ---
 

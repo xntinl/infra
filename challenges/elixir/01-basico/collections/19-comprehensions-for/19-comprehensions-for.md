@@ -2,9 +2,6 @@
 
 **Project**: `grid_combo` — generates cartesian products, filters combinations, and reshapes grids for a product configurator
 
-**Difficulty**: ★★☆☆☆
-**Estimated time**: 2 hours
-
 ---
 
 ## Why `for` comprehensions matter for a senior developer
@@ -124,6 +121,20 @@ this is a FILTER in disguise, not an error:
 for {:ok, value} <- [{:ok, 1}, {:error, :nope}, {:ok, 2}], do: value
 # [1, 2]
 ```
+
+---
+
+## Design decisions
+
+**Option A — chained `Enum.flat_map/2` for cartesian products, followed by `Enum.filter/2`**
+- Pros: only uses core `Enum`; no new syntax to learn; stages can be named and reused.
+- Cons: 3+ generators become nested `flat_map` pyramids; the cartesian intent is hidden under callback noise; `into:` shape has to be applied as a separate `Enum.into/2`.
+
+**Option B — `for` comprehension with multiple generators, filters, and `into:`** (chosen)
+- Pros: declares intent — "for each x, y, z where P, yield T"; multi-generator is first-class syntax; `into:` lets you target any `Collectable` (list, map, MapSet, stream); pattern matching in generators silently skips non-matching elements without an `if`.
+- Cons: syntax diverges from Python/JS `for`; very long comprehensions resist extraction into helpers; debugging a bad filter inside the comprehension is less obvious than an `Enum.filter/2` stage.
+
+Chose **B** because the problem IS cartesian product with filtering, which is exactly what `for` was designed for. The declarative form reads like a set-builder, which is how the domain thinks about it.
 
 ---
 
@@ -403,6 +414,43 @@ mix compile --warnings-as-errors
 mix test --trace
 ```
 
+### Why this works
+
+A `for` comprehension desugars to nested enumerations with filters short-circuiting per combination. Each generator iterates its source; pattern matching in the generator head silently skips elements that don't match (so `for {:ok, v} <- results` drops errors with no `case`). Filters apply per combination, so excluded combinations never reach the body — no wasted allocation. `into:` routes the result to any `Collectable`: a list by default, a `Map`, a `MapSet`, or a `File.Stream` for write-through. The compiler fuses the generators and filters into a single pass whenever the shape allows.
+
+---
+
+## Benchmark
+
+```elixir
+# bench.exs
+defmodule Bench do
+  def run do
+    sizes = [10, 20, 40]  # 10x10x10, 20x20x20, 40x40x40 cartesian products
+
+    for n <- sizes do
+      {us, count} =
+        :timer.tc(fn ->
+          result =
+            for x <- 1..n,
+                y <- 1..n,
+                z <- 1..n,
+                rem(x + y + z, 3) == 0,
+                do: {x, y, z}
+
+          length(result)
+        end)
+
+      IO.puts("n=#{n}: #{count} tuples in #{us} µs")
+    end
+  end
+end
+
+Bench.run()
+```
+
+Target: under 50 ms for n=40 (64k filtered tuples out of 64k × 3 iterations). The cost is dominated by allocation, not the filter — if you're building a giant list only to consume it once, consider a `Stream` instead.
+
 ---
 
 ## Trade-off analysis
@@ -465,6 +513,13 @@ not warn you. Always sanity-check the product of generator sizes or use
   or multiple generators — using `for` is overkill and obscures intent.
 - You are building a recursive algorithm that depends on accumulated state —
   write a tail-recursive function instead.
+
+---
+
+## Reflection
+
+1. A `for` comprehension with 4 generators and 3 filters fits in 10 lines but the code review calls it "clever". When is dense declarative syntax worth defending, and when is the pragmatic answer to expand into explicit `Enum` stages? What signal tells you?
+2. The cartesian product in this project is bounded (a few thousand combinations). For a combinatorial explosion (1M+ tuples), what changes: do you switch to `Stream.flat_map/2`, precompute only the prefixes that matter, or reject the cartesian approach entirely? How does `for`'s eager evaluation guide the decision?
 
 ---
 

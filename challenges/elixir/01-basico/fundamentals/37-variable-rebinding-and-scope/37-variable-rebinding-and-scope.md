@@ -2,9 +2,6 @@
 
 **Project**: `config_reloader_demo` — shows why rebinding a variable inside a function never mutates the caller's data
 
-**Difficulty**: ★☆☆☆☆
-**Estimated time**: 1 hour
-
 ---
 
 ## Project structure
@@ -44,6 +41,22 @@ and returns the updated map. Callers who forget to use the return value end
 up with stale config. The demo makes the rebinding semantics obvious.
 
 ---
+
+## Why explicit return + reassignment in caller and not process dictionary or ETS for "global mutable state"
+
+Process dictionary breaks referential transparency and makes code untestable. Returning new values and reassigning at the call site keeps data flow explicit and functions pure.
+
+## Design decisions
+
+**Option A — rebind within function scope, return new value**
+- Pros: Pure-functional, safe across processes, trivial to test
+- Cons: Beginners confused that `x = x + 1` inside a function doesn't change the caller's `x`
+
+**Option B — try to mutate caller's binding** (chosen)
+- Pros: Would match imperative expectations from other languages
+- Cons: Impossible in Elixir — bindings are lexical and immutable references; would require process state or ETS
+
+→ Chose **A** because immutability is the foundation of BEAM concurrency — any other choice breaks the model.
 
 ## Implementation
 
@@ -212,6 +225,14 @@ mix test
 
 ---
 
+### Why this works
+
+The approach chosen above keeps the core logic **pure, pattern-matchable, and testable**. Each step is a small, named transformation with an explicit return shape, so adding a new case means adding a new clause — not editing a branching block. Failures are data (`{:error, reason}`), not control-flow, which keeps the hot path linear and the error path explicit.
+
+## Benchmark
+
+<!-- benchmark N/A: tema conceptual -->
+
 ## Trade-offs and production mistakes
 
 **1. Forgetting to capture the return value**
@@ -247,6 +268,12 @@ time. It is not — each callback returns a new state that replaces the old one.
   purpose of named intermediate values.
 
 ---
+
+## Reflection
+
+If you come from Python/JS, name two situations where you'd instinctively reach for mutation and describe how you'd express them functionally in Elixir (accumulator, pipeline, `Enum.reduce`).
+
+How does rebinding differ from mutation at the BEAM level? What does this mean for garbage collection of the old value?
 
 ## Resources
 

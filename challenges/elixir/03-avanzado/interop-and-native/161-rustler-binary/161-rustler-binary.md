@@ -2,10 +2,6 @@
 
 **Project**: `rustler_binary` — a NIF crate that processes large binaries (XOR mask, byte histogram, UTF-8 validation) without copying bytes between BEAM and Rust.
 
-**Difficulty**: ★★★★☆
-
-**Estimated time**: 3–6 hours
-
 ---
 
 ## Project context
@@ -27,6 +23,16 @@ rustler_binary/
 ```
 
 ---
+
+## Why this approach and not alternatives
+
+Alternatives considered and discarded:
+
+- **Hand-rolled equivalent**: reinvents primitives the BEAM/ecosystem already provides; high risk of subtle bugs around concurrency, timeouts, or failure propagation.
+- **External service (e.g. Redis, sidecar)**: adds a network hop and an extra failure domain for a problem the VM can solve in-process with lower latency.
+- **Heavier framework abstraction**: couples the module to a framework lifecycle and makes local reasoning/testing harder.
+
+The chosen approach stays inside the BEAM, uses idiomatic OTP primitives, and keeps the contract small.
 
 ## Core concepts
 
@@ -83,6 +89,18 @@ Rustler wraps these behind `Binary` and `OwnedBinary`.
 If you generate output in chunks (compression, encoding), build a `Vec<Binary>` or a tuple list and let Elixir flatten with `IO.iodata_to_binary/1`. Avoids one big `OwnedBinary::new` allocation.
 
 ---
+
+## Design decisions
+
+**Option A — naive/simple approach**
+- Pros: minimal code, easy to reason about.
+- Cons: breaks under load, lacks observability, hard to evolve.
+
+**Option B — the approach used here** (chosen)
+- Pros: production-grade, handles edge cases, testable boundaries.
+- Cons: more moving parts, requires understanding of the BEAM primitives involved.
+
+→ Chose **B** because correctness under concurrency and failure modes outweighs the extra surface area.
 
 ## Implementation
 
@@ -234,6 +252,11 @@ end
 
 ---
 
+
+### Why this works
+
+The design leans on BEAM guarantees (process isolation, mailbox ordering, supervisor restarts) and pushes invariants to the boundaries of each module. State transitions are explicit, failure modes are declared rather than implicit, and each step is independently testable. That combination keeps the implementation correct under concurrent load and cheap to change later.
+
 ## Trade-offs and production gotchas
 
 **1. `Binary` lifetime is per-call.** You cannot stash `Binary<'a>` in a NIF resource or pass across threads. If you need to keep bytes, copy them into an `OwnedBinary` first.
@@ -248,7 +271,7 @@ end
 
 **6. SIMD is tempting but tricky.** Rust's `std::simd` is nightly-only; `packed_simd` adds a huge dep. For byte scans, LLVM autovectorizes tight loops well — benchmark before reaching for intrinsics.
 
-**7. Scheduler time on big inputs.** `xor_mask` on 100 MB takes 50–100 ms. That's dirty-scheduler territory. See exercise 162.
+**7. Scheduler time on big inputs.** `xor_mask` on 100 MB takes 50–100 ms. That's dirty-scheduler territory.
 
 **8. When NOT to use this.** Small (< 10 KB) or infrequent binaries — the NIF call overhead (~100 ns) makes pure Elixir fine. Operations already available in `:crypto` or `:erlang.binary_*` — they're NIFs too.
 
@@ -272,6 +295,11 @@ Benchee.run(%{
 ~200× speedup for a trivial byte loop. The gap widens as inputs grow.
 
 ---
+
+## Reflection
+
+- If the expected load grew by 100×, which assumption in this design would break first — the data structure, the process model, or the failure handling? Justify.
+- What would you measure in production to decide whether this implementation is still the right one six months from now?
 
 ## Resources
 

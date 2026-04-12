@@ -2,9 +2,6 @@
 
 **Project**: `naming_review` — a capstone exercise that juxtaposes the five naming strategies in one codebase, with a comparative table to internalize the trade-offs.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
-
 ---
 
 ## Project context
@@ -84,6 +81,36 @@ running `async: true` that both register `:cache` will collide. A crash
 + restart window briefly has `:cache` unregistered and callers will
 crash with `:noproc`. Default to pids; introduce names only when you
 need them for addressing.
+
+---
+
+## Why pids first, and names only when addressing demands it
+
+Naming is a coupling point: every consumer of a name is tied to it, every collision is a cross-test bug, and every restart window briefly has the name unregistered. The five strategies exist to cover distinct *addressing needs*, not to be picked by vibes.
+
+**Pid.** The default. Use it whenever the caller already holds the reference.
+
+**Atom.** Compile-time-known singletons only. Leak-prone with dynamic keys.
+
+**`Registry` + `:via`.** Dynamic local addressing with automatic cleanup. The workhorse for per-entity processes.
+
+**`:global`.** Cluster-wide singletons. Expensive, netsplit-sensitive — reserve for leaders/schedulers.
+
+**`:pg` group.** Cluster-wide *membership*, not single-pid naming. For fan-out and pubsub across nodes.
+
+---
+
+## Design decisions
+
+**Option A — Expose one façade (e.g., always via-Registry) and hide the rest**
+- Pros: Simpler API surface; every caller looks the same.
+- Cons: Loses the dimensions of the problem (scope, cardinality) that the choice encodes; forces dynamic-local semantics onto cluster-singleton cases.
+
+**Option B — Five sibling helpers, one per strategy, with the same `Counter` subject** (chosen)
+- Pros: The comparative table becomes executable; the tests isolate each strategy's distinctive behavior (collision, cleanup, scope, membership); easy to extract the table for PR review.
+- Cons: Bigger surface area; without discipline, different concepts end up using different strategies ad hoc.
+
+→ Chose **B** because the goal is a review capstone, not production architecture. In production, wrap each concept behind its own façade.
 
 ---
 
@@ -292,6 +319,16 @@ end
 mix test
 ```
 
+### Why this works
+
+Each starter returns the natural *address* for its strategy (pid, atom, via-tuple, `{:global, term}`, or a group atom + pid), and every test exercises exactly the axis where that strategy differs from the others: the atom test asserts on collision, the Registry test on auto-cleanup, the `:global` test on arbitrary-term keys, and the `:pg` test on multi-pid membership with `bump_group/1`. Keeping the subject (`Counter`) constant across strategies is the design choice that makes the comparative table concrete instead of aspirational.
+
+---
+
+## Benchmark
+
+<!-- benchmark N/A: review/capstone exercise — per-strategy benchmarks live in exercises 82, 83, and 85. -->
+
 ---
 
 ## Comparative table
@@ -340,6 +377,13 @@ the docs once; bookmark the scope column in the table above.
 For one-off workers, Tasks, short-lived computations — no naming. Pass
 the pid (or its monitor ref) explicitly. Naming costs complexity and
 test-isolation pain; don't pay for it unless you need the address.
+
+---
+
+## Reflection
+
+- Walk through a real feature in your current codebase (e.g., per-user session GenServer, per-order workflow, a single leader scheduler) and map it to the decision tree. Does your current choice survive the three-dimensions test (scope, cardinality, key source)?
+- A junior on your team proposes using `:global` for everything "to be safe". In 3 bullets and one concrete failure mode, explain why that's expensive and wrong.
 
 ---
 

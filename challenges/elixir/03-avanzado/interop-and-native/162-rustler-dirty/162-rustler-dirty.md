@@ -2,10 +2,6 @@
 
 **Project**: `rustler_dirty` — a NIF that runs CPU-heavy work (Argon2id password hashing, prime sieve) on dirty CPU schedulers, plus an I/O NIF on dirty IO schedulers.
 
-**Difficulty**: ★★★★☆
-
-**Estimated time**: 3–6 hours
-
 ---
 
 ## Project context
@@ -27,6 +23,16 @@ rustler_dirty/
 ```
 
 ---
+
+## Why this approach and not alternatives
+
+Alternatives considered and discarded:
+
+- **Hand-rolled equivalent**: reinvents primitives the BEAM/ecosystem already provides; high risk of subtle bugs around concurrency, timeouts, or failure propagation.
+- **External service (e.g. Redis, sidecar)**: adds a network hop and an extra failure domain for a problem the VM can solve in-process with lower latency.
+- **Heavier framework abstraction**: couples the module to a framework lifecycle and makes local reasoning/testing harder.
+
+The chosen approach stays inside the BEAM, uses idiomatic OTP primitives, and keeps the contract small.
 
 ## Core concepts
 
@@ -88,6 +94,18 @@ Each entry is `{scheduler_id, active_time, total_time}`. The ratio tells you sch
 Moving a NIF call onto a dirty scheduler is not free — BEAM migrates the call to another OS thread, touches a mutex, and runs. Measured overhead: ~1–3 µs. If your NIF runs in 500 ns, dirty scheduling makes it slower. Only worth it when the NIF itself is ≥ 100 µs.
 
 ---
+
+## Design decisions
+
+**Option A — naive/simple approach**
+- Pros: minimal code, easy to reason about.
+- Cons: breaks under load, lacks observability, hard to evolve.
+
+**Option B — the approach used here** (chosen)
+- Pros: production-grade, handles edge cases, testable boundaries.
+- Cons: more moving parts, requires understanding of the BEAM primitives involved.
+
+→ Chose **B** because correctness under concurrency and failure modes outweighs the extra surface area.
 
 ## Implementation
 
@@ -258,6 +276,11 @@ end
 
 ---
 
+
+### Why this works
+
+The design leans on BEAM guarantees (process isolation, mailbox ordering, supervisor restarts) and pushes invariants to the boundaries of each module. State transitions are explicit, failure modes are declared rather than implicit, and each step is independently testable. That combination keeps the implementation correct under concurrent load and cheap to change later.
+
 ## Trade-offs and production gotchas
 
 **1. Overhead for fast paths.** Flagging `DirtyCpu` on a 100 ns function makes it 20× slower. Benchmark first; flag only what actually exceeds 1 ms.
@@ -266,7 +289,7 @@ end
 
 **3. Saturation cascades.** 100 argon2 hashes queued on 8 DirtyCpu schedulers = ~12 hashes per scheduler, each 200 ms = 2.4 s wait for the last caller. Put a GenServer pool in front to bound concurrency and fail fast.
 
-**4. `DirtyIo` is not async I/O.** The thread *blocks* on the syscall. If you block 10 DirtyIo schedulers on 10 slow file reads, the 11th queues. For true concurrency, use async I/O in Rust (tokio) — see exercise 172.
+**4. `DirtyIo` is not async I/O.** The thread *blocks* on the syscall. If you block 10 DirtyIo schedulers on 10 slow file reads, the 11th queues. For true concurrency, use async I/O in Rust (tokio) —
 
 **5. Panics on dirty schedulers.** Same story — Rustler catches, raises in Elixir. But unwind across the dirty/regular boundary used to have bugs pre-OTP 26; stay on recent OTP.
 
@@ -293,6 +316,11 @@ Benchee.run(%{
 ```
 
 ---
+
+## Reflection
+
+- If the expected load grew by 100×, which assumption in this design would break first — the data structure, the process model, or the failure handling? Justify.
+- What would you measure in production to decide whether this implementation is still the right one six months from now?
 
 ## Resources
 

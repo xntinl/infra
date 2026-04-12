@@ -2,9 +2,6 @@
 
 **Project**: `local_pubsub` — a minimal in-process pub/sub bus built on `Registry` in `:duplicate` mode.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
-
 ---
 
 ## Project context
@@ -61,7 +58,7 @@ end)
 `dispatch/3` invokes your callback once per partition with the list of
 `{pid, value}` entries for that key. Compared to `lookup/2` + manual
 iteration, it's safer (no snapshot-then-send race) and it integrates with
-`:partitions` (exercise 82) to fan out in parallel.
+`:partitions` to fan out in parallel.
 
 ### 3. The subscriber is the registered process
 
@@ -75,6 +72,30 @@ a huge ergonomic win over ad-hoc lists of pids.
 The third argument to `register/3` is arbitrary metadata stored alongside
 the pid. Common uses: filter expressions, subscriber-type tags, or message
 transforms applied before `send/2`. For a starter pubsub, pass `nil`.
+
+---
+
+## Why Registry `:duplicate` and not Phoenix.PubSub or a `GenServer` of subscribers
+
+**Phoenix.PubSub.** Clustered, pluggable adapters (PG2, Redis), and integrates with Phoenix channels. Overkill when the whole system is a single node and you don't want Phoenix as a dependency.
+
+**A `GenServer` holding a list of subscriber pids.** Serializes every publish through one mailbox, requires you to monitor and prune dead subscribers yourself, and does not parallelize fan-out.
+
+**`Registry` (`:duplicate`) (chosen).** ETS-backed, zero bespoke cleanup code, `dispatch/3` fans out without the publisher holding a lock, and the same primitive scales into partitions when the subscriber count grows.
+
+---
+
+## Design decisions
+
+**Option A — Roll your own `GenServer` subscriber list**
+- Pros: Full control over dispatch order and filtering logic.
+- Cons: You re-implement monitor-based cleanup, the publish path serializes through one process, and parallel fan-out is on you.
+
+**Option B — `Registry` in `:duplicate` mode + `dispatch/3`** (chosen)
+- Pros: Subscriptions clean up automatically when subscribers die; `dispatch/3` is partition-aware; scales to thousands of subscribers per topic; no extra process hop on publish.
+- Cons: Delivery is best-effort `send/2` (no acks, no backpressure); every subscriber must match the envelope pattern.
+
+→ Chose **B** because the auto-cleanup and non-serialized fan-out are load-bearing for a pubsub primitive, and the caveats are the same ones you accept with any in-BEAM pubsub.
 
 ---
 
@@ -98,7 +119,7 @@ defmodule LocalPubsub.Application do
   def start(_type, _args) do
     children = [
       # :duplicate lets the same topic have many subscribers.
-      # No partitions here — exercise 82 covers that.
+      # No partitions here — a partitioned variant is a separate exercise.
       {Registry, keys: :duplicate, name: LocalPubsub.Registry}
     ]
 
@@ -270,6 +291,34 @@ end
 mix test
 ```
 
+### Why this works
+
+`Registry` in `:duplicate` mode is a multi-map keyed by topic, stored in read-concurrent ETS and maintained by a monitor on every subscriber pid. `dispatch/3` walks the partition's entries and runs the fan-out callback without holding a lock on the registry, so the publisher never blocks registrations or other publishes. Because the subscriber pid is the unit of identity, dead subscribers are reaped without any bookkeeping on your part.
+
+---
+
+## Benchmark
+
+```elixir
+for i <- 1..1_000 do
+  spawn(fn ->
+    LocalPubsub.subscribe("bench")
+    receive do _ -> :ok end
+  end)
+end
+
+:timer.sleep(50)
+
+{time, _} =
+  :timer.tc(fn ->
+    Enum.each(1..1_000, fn _ -> LocalPubsub.broadcast("bench", :ping) end)
+  end)
+
+IO.puts("avg broadcast to 1k subs: #{time / 1_000} µs")
+```
+
+Target esperado: <200 µs por broadcast a 1k suscriptores locales (single partition, hardware moderno).
+
 ---
 
 ## Trade-offs and production gotchas
@@ -298,14 +347,20 @@ it serializes registration through the ALERT process and gives you nothing.
 **5. `dispatch/3` runs in the caller process by default**
 A slow callback blocks the publisher. If you're dispatching to thousands
 of subscribers and doing non-trivial work per subscriber, use partitions
-(exercise 82) and pass `parallel: true` to fan the dispatch across
-scheduler cores.
+and pass `parallel: true` to fan the dispatch across scheduler cores.
 
 **6. When NOT to use Registry pubsub**
 Cross-node pubsub: use `Phoenix.PubSub` (clustered backends like `PG2`
 or Redis) or `:pg`. Durable queues: use RabbitMQ, Kafka, or Broadway.
 Registry pubsub is local, in-memory, and ephemeral — perfect for a single
 node, wrong for anything else.
+
+---
+
+## Reflection
+
+- Suppose your publisher produces 10k events/sec to a topic with 5k subscribers, and subscribers occasionally block on I/O. At what point does `send/2` fan-out stop being viable, and what replaces it — partitions with `parallel: true`, a bounded `GenStage`, or something else?
+- How would you change the API (or the envelope) to support "replay the last N messages on subscribe" without retroactively making the bus stateful?
 
 ---
 

@@ -2,16 +2,13 @@
 
 **Project**: `pg_groups_demo` — broadcast to a named group of processes using Erlang's `:pg` module.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
-
 ---
 
 ## Project context
 
 You have a handful of services that should all react when a system-wide
 event happens: cache invalidation, config reload, feature flag toggle. On
-a single node you'd reach for `Registry` in duplicate mode (exercise 81).
+a single node you'd reach for `Registry` in duplicate mode.
 Across a cluster you need something distributed — and you really don't
 want to build a CRDT or run a message broker for what is, fundamentally,
 "send to this set of pids".
@@ -87,6 +84,32 @@ If node A joins a group and node B queries immediately, B may not see A
 yet. `:pg` guarantees eventual convergence — and a critical caveat: if
 A and B are not directly connected (even if both reach a third node),
 they don't see each other's groups. Membership is *not* transitive.
+
+---
+
+## Why `:pg` and not `Phoenix.PubSub`, `:global`, or a broker
+
+**`:global`.** Meant for *unique* names across a cluster with consensus. Joining a group would be abusing a locking mechanism for a multi-valued data structure, and every change acquires a cluster-wide lock.
+
+**`Phoenix.PubSub`.** Rides on top of `:pg` for its PG2 adapter. Great if you're already in Phoenix; drag-heavy otherwise.
+
+**A broker (RabbitMQ / Kafka).** Durable, backpressured delivery — the right answer when messages must survive node death or slow consumers, wrong when you just want "send to these pids, now, best-effort".
+
+**`:pg` (chosen).** Lock-free gossip, strong-eventual consistency, no master, and it's already in OTP. The underlying primitive for most cluster-wide pubsub in Elixir.
+
+---
+
+## Design decisions
+
+**Option A — Use the default `:pg` scope started by kernel**
+- Pros: Zero supervision code; just `:pg.join(:my_group, pid)`.
+- Cons: Application-level groups share a namespace with any library using `:pg`; tests can leak state into other test runs on the same VM.
+
+**Option B — Start a dedicated scope in the app's supervision tree** (chosen)
+- Pros: Isolation from libraries (Phoenix.PubSub, Horde) that also use `:pg`; tests and production code never collide on group names.
+- Cons: One extra child in the supervision tree; callers must route through a wrapper that knows the scope.
+
+→ Chose **B** because scope isolation costs nothing and prevents a whole class of "why did my group suddenly have extra members?" bugs when a second library lands in the project.
 
 ---
 
@@ -275,6 +298,41 @@ iex --sname b@localhost -S mix
 In one shell: `Node.connect(:"a@localhost")`. Join a group in both shells
 and observe that `PgGroupsDemo.members/1` returns pids from both nodes.
 
+### Why this works
+
+`:pg` runs one gossip-based scope process per node. `join/3` asks the scope to add a pid; the scope propagates the membership delta to peers it is directly connected to, and monitors local pids so that `:DOWN` triggers a leave. Because there is no central coordinator, joins and leaves never block on consensus, and `broadcast/2` is "read current members, `send/2` to each" — best-effort, no backpressure, no cross-node ordering guarantee.
+
+---
+
+## Benchmark
+
+```elixir
+# Register 1_000 local subscribers and broadcast 1_000 messages.
+parent = self()
+
+pids =
+  for _ <- 1..1_000 do
+    spawn(fn ->
+      PgGroupsDemo.join(:bench)
+      send(parent, :ready)
+      Process.sleep(:infinity)
+    end)
+  end
+
+for _ <- 1..1_000, do: receive do :ready -> :ok end
+
+{time, _} =
+  :timer.tc(fn ->
+    Enum.each(1..1_000, fn _ -> PgGroupsDemo.broadcast(:bench, :ping) end)
+  end)
+
+IO.puts("avg broadcast to 1k members: #{time / 1_000} µs")
+
+Enum.each(pids, &Process.exit(&1, :kill))
+```
+
+Target esperado: <500 µs por broadcast local a 1k miembros en hardware moderno (single node). En cluster real, sumá RTT entre nodos por cada `send/2` remoto.
+
 ---
 
 ## Trade-offs and production gotchas
@@ -307,10 +365,17 @@ with application-level groups. Follow suit: don't stuff everything into
 the default `:pg` scope.
 
 **6. When NOT to use `:pg`**
-Same-node only: use `Registry` in duplicate mode (exercise 81) — lighter
+Same-node only: use `Registry` in duplicate mode — lighter
 and cleanup is stronger. Durable delivery: use Kafka/RabbitMQ. Cluster
 request/reply RPC: use `GenServer.call` to a named server (`:global` or
 Horde), not a pg group.
+
+---
+
+## Reflection
+
+- Your cluster goes through a 10-second netsplit where node A loses contact with B (both reach C). During the split, node A's members of a group include only A's local pids. When the split heals, what's the ordering of events A sees, and which of your invariants (e.g., "every node has a leader") might briefly break?
+- You need cluster-wide "exactly-once" notification on a config change. Is `:pg` + broadcast enough, or do you need to layer acknowledgements / version numbers / a broker on top? Justify.
 
 ---
 

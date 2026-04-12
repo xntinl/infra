@@ -2,9 +2,6 @@
 
 **Project**: `jsonable_proto` — a `Jsonable` protocol that turns primitives, lists and maps into JSON strings via polymorphic dispatch.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
-
 ---
 
 ## Project context
@@ -71,6 +68,30 @@ baked into a single optimized dispatch table. Unconsolidated protocols work
 A protocol answers "what does this value know how to do?". A behaviour
 answers "which adapter am I using?". They solve different problems — don't
 use one where the other fits.
+
+---
+
+## Why a protocol and not a behaviour or a `cond`/`case` ladder
+
+**Giant `case is_integer/is_binary/is_list/...` ladder.** Every new type requires editing the central function. Breaks the open/closed principle and makes libraries un-extensible by consumers.
+
+**Behaviour.** Dispatches on a *module* the caller picks, not on the value's shape. Fine for adapters; wrong for "one function that does the right thing for any value".
+
+**Protocol (chosen).** Dispatches on the first argument's type via a table built at compile-time consolidation. New types plug in with `defimpl` without touching the protocol module — the exact shape of `Enum`, `Inspect`, `String.Chars`, and `Jason.Encoder`.
+
+---
+
+## Design decisions
+
+**Option A — Hand-rolled `to_json/1` with a big `cond` / `case`**
+- Pros: Minimal ceremony, all logic in one file.
+- Cons: Not extensible by library users; every new type requires editing the central module; grows unreadable fast.
+
+**Option B — `Jsonable` protocol with one `defimpl` per supported type** (chosen)
+- Pros: Open for extension (users add `defimpl` for their own types); compile-time consolidation yields a fast dispatch table; matches the idiomatic Elixir pattern.
+- Cons: Unconsolidated protocols are slower in dev; a missing `defimpl` surfaces as `Protocol.UndefinedError` at runtime, not compile time.
+
+→ Chose **B** because extensibility across library boundaries is the whole reason protocols exist, and the dev-vs-prod consolidation difference is well-understood.
 
 ---
 
@@ -215,6 +236,28 @@ end
 mix test
 ```
 
+### Why this works
+
+`defprotocol` declares the single dispatch function, and each `defimpl … for: Type` registers one branch. At compile time, `mix` consolidates the protocol into an optimized dispatch function, so `Jsonable.to_json(42)` in production is effectively a direct call into the `Integer` impl. The `Protocol.UndefinedError` on unsupported types (e.g., tuples) is not a bug — it's the protocol telling you exactly which extension point is missing.
+
+---
+
+## Benchmark
+
+```elixir
+# Compare protocol dispatch vs hand-rolled guards.
+payload = %{user: "ada", ids: [1, 2, 3, 4, 5], active: true}
+
+{proto_time, _} =
+  :timer.tc(fn ->
+    Enum.each(1..100_000, fn _ -> Jsonable.to_json(payload) end)
+  end)
+
+IO.puts("avg to_json: #{proto_time / 100_000} µs")
+```
+
+Target esperado: <5 µs por encode de mapa pequeño en `:prod` (consolidado). En `:dev` sin consolidación podés ver 2–5x peor — señal útil de que `Protocol.Consolidation` no corrió.
+
 ---
 
 ## Trade-offs and production gotchas
@@ -238,14 +281,20 @@ a feature (predictability) but surprises newcomers.
 **4. `@fallback_to_any true` exists — use it sparingly**
 You can declare a protocol fallback to `Any`, then define `defimpl Proto, for: Any`
 as a catch-all. Convenient, but it hides missing implementations behind a
-generic default. Prefer explicit impls per type. See exercise 75 for a
-focused dive.
+generic default. Prefer explicit impls per type.
 
 **5. When NOT to use a protocol**
 If the behavior depends on more than the first argument's type (e.g., the
 result depends on two argument types jointly), a protocol doesn't fit — use
 a module with pattern matching, or multiple dispatched arguments via a
 different design.
+
+---
+
+## Reflection
+
+- You want to encode a `Date` struct as an ISO-8601 string. Do you add a `defimpl Jsonable, for: Date` in your app, upstream it to the protocol owner, or `@fallback_to_any` with a generic struct handler? What changes between those choices?
+- A teammate proposes adding a second argument (`opts`) to `to_json/2` to support pretty-printing. Does the protocol still dispatch correctly? What breaks in every existing `defimpl`, and what alternative (e.g., a separate `to_json/1` protocol and a config keyword list) avoids the churn?
 
 ---
 

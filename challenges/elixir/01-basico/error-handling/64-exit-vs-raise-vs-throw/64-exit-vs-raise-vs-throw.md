@@ -1,8 +1,6 @@
 # exit vs raise vs throw
 
-**Difficulty**: ★★☆☆☆
-**Time**: 1–1.5 hours
-**Project**: `workflow_runner` — a step runner that distinguishes the three error flavors
+**Project**: `workflow_runner` — a step runner that distinguishes the three error flavors.
 
 ---
 
@@ -73,6 +71,34 @@ end
 
 `rescue` is for exceptions. `catch` handles `:throw` and `:exit`. A bare `catch value`
 is the old Erlang form — prefer the tagged form for clarity.
+
+---
+
+## Why three mechanisms and not just `raise`
+
+**Option A — collapse everything into `raise`; signal intent via exception struct**
+- Pros: one mechanism to teach; one `try/rescue` to remember.
+- Cons: OTP is built around `:exit` signals between processes; coercing supervisor semantics into exceptions fights the runtime. You also lose `throw` as a cheap non-local return that reducers like `Enum.reduce_while` use under the hood.
+
+**Option B — keep three mechanisms with distinct semantics** (chosen)
+- Pros: each mechanism maps to a different runtime concept (exception = bug/abnormal; throw = control flow; exit = process lifecycle); supervisors and `Process.flag(:trap_exit, true)` interact with `:exit` specifically.
+- Cons: higher cognitive load; newcomers confuse them.
+
+→ Chose **B** because OTP and the BEAM treat them differently. A supervisor reacts to `:exit`, not to `raise`. Throws unwind without touching the process heap's stacktrace machinery. Smoothing over these differences breaks real guarantees.
+
+---
+
+## Design decisions
+
+**Option A — `Workflow.Runner` raises on any step failure; caller rescues**
+- Pros: simple flow; uniform rescue.
+- Cons: conflates "step told me it cannot continue" (business) with "step code is buggy" (programmer error). Retries, alerts, and dashboards cannot distinguish them.
+
+**Option B — steps return `{:ok | :error, _}`; `Runner` uses `throw` only for short-circuit unwinding; `exit` only for unrecoverable misconfiguration** (chosen)
+- Pros: three signals map to three operator responses (retry, fix code, page humans); the runner is itself testable because throws stay inside it.
+- Cons: contributors must know which mechanism belongs where.
+
+→ Chose **B** because operators need these categories to react. Silently collapsing them into "it failed" is useless at 3am.
 
 ---
 
@@ -180,6 +206,49 @@ end
 mix test
 ```
 
+### Why this works
+
+`raise` pushes an Exception struct onto the current process and unwinds until a matching `rescue` is found; it is the BEAM's mechanism for "an abnormal event inside one process". `throw` is cheaper — it carries any term and is meant to bail out of nested computation without crossing module boundaries (reducers use it internally). `exit(reason)` is a *process* concept: the scheduler tears the process down and delivers `{:EXIT, pid, reason}` to linked and trapping processes. Using each for what the runtime designed it for means supervisors, `trap_exit`, and `try/rescue` each see exactly the kind of signal they know how to handle.
+
+---
+
+## Benchmark
+
+Measure the cost of the three short-circuit mechanisms so you can pick the cheapest one for tight inner loops:
+
+```elixir
+raise_path = fn ->
+  try do
+    raise "stop"
+  rescue
+    _ -> :ok
+  end
+end
+
+throw_path = fn ->
+  try do
+    throw(:stop)
+  catch
+    :throw, _ -> :ok
+  end
+end
+
+exit_path = fn ->
+  try do
+    exit(:stop)
+  catch
+    :exit, _ -> :ok
+  end
+end
+
+for {name, fun} <- [raise: raise_path, throw: throw_path, exit: exit_path] do
+  {us, _} = :timer.tc(fn -> for _ <- 1..100_000, do: fun.() end)
+  IO.puts("#{name}: #{us / 100_000} µs")
+end
+```
+
+Target esperado: `throw` is the cheapest (~1–2 µs), `exit` is next, `raise` is slowest because it builds a stacktrace and an Exception struct (~5–15 µs). That quantitative gap is why `Enum.reduce_while` uses throw under the hood, not raise.
+
 ---
 
 ## Trade-offs and decision table
@@ -225,6 +294,13 @@ If your step opens a file or ETS table, use `try/after` to release even when `ra
 - **Use tagged tuples, not `raise`, for expected failure**: network timeouts, missing config, malformed input at an I/O edge. `raise` is for "this should not happen".
 - **Do not `throw` across module boundaries**: the receiving module should not have to know you throw. Keep throws within one function's call tree.
 - **Do not `exit(:normal)` from non-process-owning code**: `:normal` exits from workers confuse supervisors. If you want to "succeed and stop", return from the function.
+
+---
+
+## Reflection
+
+- Your `WorkflowRunner` uses `throw` to short-circuit a reducer. A colleague replaces it with `Enum.reduce_while` and tagged tuples "for clarity". Benchmarks show a 3× slowdown in a nested pipeline. Do you accept the slowdown for readability, document the throw-based version, or hide it behind a helper? How does the answer change if the runner is in a hot request path vs. a batch job?
+- A library you depend on calls `exit(:timeout)` inside a function you invoke synchronously. Your process has `trap_exit` set to false. What actually happens, and how do you prevent it without asking the library author to change?
 
 ---
 

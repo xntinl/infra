@@ -10,6 +10,22 @@ The team decides to rebuild with strict isolation: PostgreSQL Row Level Security
 
 You will build `TenantFramework`: the foundational layer for a multi-tenant SaaS application.
 
+## Why Postgres RLS policies and not application-level `where tenant_id = ?` everywhere
+
+RLS enforces the filter at the database, so a forgotten filter in application code cannot leak data. App-level filtering relies on every query being correct — a high-impact, easy-to-miss bug class.
+
+## Design decisions
+
+**Option A — schema-per-tenant (logical isolation)**
+- Pros: strong isolation, per-tenant schema evolution
+- Cons: high per-tenant fixed cost, doesn't scale to 10k+ tenants
+
+**Option B — shared-schema with tenant_id column + row-level security** (chosen)
+- Pros: cheap per-tenant cost, one migration for all
+- Cons: a bug in tenant_id filtering leaks data across tenants
+
+→ Chose **B** because SaaS economics only work if the per-tenant cost is near zero — shared-schema with RLS is the standard.
+
 ## Why RLS over schema-per-tenant for most deployments
 
 Schema-per-tenant gives the strongest isolation: each tenant's data is in a separate PostgreSQL schema. But it has operational costs: running migrations requires iterating over N schemas, connection pooling by schema is complex, and at 10,000 tenants, the schema count becomes unwieldy.
@@ -553,6 +569,10 @@ defmodule TenantFramework.Billing.WebhookHandler do
 end
 ```
 
+### Why this works
+
+The design isolates correctness-critical invariants from latency-critical paths and from evolution-critical contracts. Modules expose narrow interfaces and fail fast on contract violations, so bugs surface close to their source. Tests target invariants rather than implementation details, so refactors don't produce false alarms. The trade-offs are explicit in the Design decisions section, which makes the "why" auditable instead of folklore.
+
 ## Given tests
 
 ```elixir
@@ -586,6 +606,9 @@ defmodule TenantFramework.IsolationTest do
       Repo.delete!(tenant_b)
     end
   end
+
+
+  describe "Isolation" do
 
   test "provisioning rolls back when Stripe fails" do
     count_before = Repo.aggregate(TenantFramework.Tenant, :count)
@@ -679,8 +702,25 @@ defmodule TenantFramework.BillingTest do
     sig_header = "t=#{ts},v1=#{sig}"
     TenantFramework.Billing.WebhookHandler.process_verified(body, sig_header)
   end
+
+
+  end
 end
 ```
+
+## Benchmark
+
+```elixir
+# Minimal timing harness — replace with Benchee for production measurement.
+{time_us, _result} = :timer.tc(fn ->
+  # exercise the hot path N times
+  for _ <- 1..10_000, do: :ok
+end)
+
+IO.puts("average: #{time_us / 10_000} µs per op")
+```
+
+Target: <5% RLS overhead on common query patterns.
 
 ## Trade-off analysis
 
@@ -708,6 +748,10 @@ end
 **Feature flag evaluation that falls back to false silently.** When an unknown flag is evaluated (flag not in ETS), returning `false` by default is safe. But if the ETS table is empty due to a failed cache reload, all features silently disable. Log a warning when the flags table is empty, and distinguish between "flag explicitly disabled" and "flag unknown."
 
 **Provisioning tenant creation not being idempotent on retry.** If the network call to Stripe times out, the caller retries `create_tenant`. If the first attempt created the database rows but the Stripe call timed out (not failed — timed out), retrying inserts a duplicate tenant row. Add a unique constraint on `slug` and handle the unique violation in provisioning to detect and recover partial creations.
+
+## Reflection
+
+One of your 10k tenants is 100x the size of the median. Does your shared-schema approach still work, or do you move that tenant to a dedicated database? What's the trigger metric for that decision?
 
 ## Resources
 

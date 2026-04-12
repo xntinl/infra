@@ -4,9 +4,6 @@
 (`:fast` / `:slow`), by external dependency (`:integration`, `:external`), and
 by environment (`:skip`).
 
-**Difficulty**: ★★☆☆☆
-**Estimated time**: 1–2 hours
-
 ---
 
 ## Project context
@@ -18,6 +15,19 @@ plugins, no separate test runner.
 
 Tags also let you temporarily skip a flaky test (`@tag :skip`), mark an
 OS-specific test, or gate a test behind `mix test --only integration`.
+
+## Why ExUnit tags and not X
+
+**Why not separate test directories (`test/fast`, `test/integration`)?**
+Because you'd lose co-location — the integration test for module `X` lives
+right next to the unit test for `X`. Directory splits force duplication.
+
+**Why not a separate test runner or plugin?** You'd fight two tools; ExUnit
+tags handle it natively with `--include` / `--exclude` / `--only`.
+
+**Why not comments + grep?** Tags are first-class metadata that `mix test`
+understands; comments require human discipline. The moment CI depends on it,
+you want a structured check.
 
 Project structure:
 
@@ -66,6 +76,21 @@ them on with `mix test --include integration`.
 `ExUnit.start(exclude: [:skip])` in `test_helper.exs` plus `@tag :skip` on
 an individual test is the cleanest way to park a flaky test without
 deleting it. Always leave a comment explaining *why* it's skipped.
+
+---
+
+## Design decisions
+
+**Option A — Include everything by default, exclude slow locally**
+- Pros: CI sees everything; developers can opt out.
+- Cons: Every `mix test` hits the network by default; painful locally.
+
+**Option B — Exclude `:integration`/`:external` by default, include in CI** (chosen)
+- Pros: `mix test` stays fast for developers; CI opts in explicitly.
+- Cons: A developer could forget to run integration tests before pushing.
+
+→ Chose **B** because the fast-feedback loop beats the safety net; CI is
+the safety net. Pair it with a pre-push hook or a required CI job.
 
 ---
 
@@ -187,6 +212,23 @@ mix test --include integration
 mix test --exclude slow
 ```
 
+### Why this works
+
+`ExUnit.start(exclude: [...])` establishes the default filter. `@tag`,
+`@describetag`, and `@moduletag` attach metadata to the test struct; the
+runner compares each test's tags against the include/exclude sets before
+running it. CLI flags layer on top: `--include` unmasks an excluded tag,
+`--only` inverts — run **only** the listed tag. This gives per-run control
+without changing code.
+
+---
+
+## Benchmark
+
+<!-- benchmark N/A: tema organizacional; el "benchmark" relevante es
+"tiempo total del suite por modo", medible con `mix test --trace` y
+comparando con/sin `--include integration`. -->
+
 ---
 
 ## Trade-offs and production gotchas
@@ -210,12 +252,24 @@ un-skipping or deleting the test.
 **4. Tags do not propagate into child processes**
 A tag is just metadata on the test struct. If your test spawns a GenServer
 that logs something, the logger has no idea it's inside a `:slow` test.
-Use `ExUnit.configure(capture_log: true)` or CaptureLog (exercise 112).
+Use `ExUnit.configure(capture_log: true)` or `ExUnit.CaptureLog`.
 
 **5. When NOT to use tags**
 If you're tempted to add a tag per module, you probably want two separate
 `describe` blocks or two separate test files. Tags shine for cross-cutting
 concerns (speed, externality), not organization.
+
+---
+
+## Reflection
+
+- Your team adds `@tag :skip` to three tests in one week, each with a
+  different ticket number. Design a CI rule (or a simple script) that
+  warns when skipped tests accumulate beyond a threshold. What shape
+  does the warning take?
+- You inherit a 2 000-test suite with no tags and a 40-minute CI run.
+  Where do you start adding tags, and how do you validate the split is
+  correct before trusting CI with it?
 
 ---
 

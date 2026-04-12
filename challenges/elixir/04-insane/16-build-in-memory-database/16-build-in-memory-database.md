@@ -61,6 +61,18 @@ Writers create new row versions rather than updating in place. The old version g
 
 ---
 
+## Design decisions
+
+**Option A — Red-black tree indexed storage**
+- Pros: tight worst-case bounds; classic choice.
+- Cons: pointer chasing blows CPU cache; concurrent writes require coarse locks.
+
+**Option B — Skiplist-backed storage with snapshot MVCC** (chosen)
+- Pros: lock-free writers via CAS on skiplist levels; snapshots are cheap (just a version number); matches Erlang's preferred concurrency model.
+- Cons: probabilistic balance; requires careful memory ordering.
+
+→ Chose **B** because skiplists are what Redis and LevelDB use because they combine O(log N) ops with simple concurrent-insert logic — red-black trees require too much locking for our target workload.
+
 ## Implementation milestones
 
 ### Step 1: Create the project
@@ -695,6 +707,21 @@ Benchee.run(
 
 Targets: 1M reads/second, 100k writes/second on a 1M-row table.
 
+### Why this works
+
+Each key points to a version chain; readers snapshot the latest committed version at transaction start and ignore newer writes. Because skiplist inserts are lock-free, write throughput scales with core count up to the cache-coherence ceiling.
+
+---
+
+## Benchmark
+
+```elixir
+# bench/imdb_bench.exs
+Benchee.run(%{"put" => ..., "get" => ..., "range_scan" => ...}, time: 10)
+```
+
+Target: 100,000 ops/second (mixed read/write) on a single node; p99 get < 50 µs.
+
 ---
 
 ## Trade-off analysis
@@ -724,6 +751,11 @@ Cycle detection with DFS is O(V + E). Running it synchronously on every lock acq
 
 **4. B-tree mutations without copy-on-write**
 Updating the B-tree in place under concurrent reads requires locking. A persistent (immutable) B-tree where each mutation produces a new root reference eliminates read/write conflicts at the cost of GC pressure on old tree versions.
+
+## Reflection
+
+- If you had to add secondary indexes, would you reuse the skiplist or introduce a different structure? Justify in terms of write amplification.
+- Compare your MVCC approach to 2PL. Under which workload mix does 2PL win?
 
 ---
 

@@ -3,9 +3,6 @@
 **Project**: `my_generator` — a custom Mix task that generates new module
 files from templates using `Mix.Generator.copy_template/3`.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
-
 ---
 
 ## Project context
@@ -91,6 +88,36 @@ underscored = Macro.underscore(base) # "user_notifier"
 ```
 
 Use the camelized form in module names, the underscored form in filenames.
+
+---
+
+## Why Mix.Generator and not plain `File.write/2`
+
+Rolling your own with `File.write/2` plus string interpolation technically
+works but you reinvent three things Mix already solved: conflict prompts
+(`file exists, overwrite?`), consistent shell output (`* creating …`), and
+`priv/` path resolution across dev and releases. `Mix.Generator` gives you
+all three for free and matches what every Phoenix user already reads when
+they run `phx.gen.*`. Rolling your own also means your tests have to mock
+`IO.gets/1` for the prompt; `force: true` handles it in one line.
+
+---
+
+## Design decisions
+
+**Option A — Embedded templates via `embed_template/2`**
+- Pros: No runtime `priv/` lookup; templates compile into the task module.
+- Cons: Can't be edited or previewed without recompiling; awkward for
+  multi-line templates; loses syntax highlighting in editors.
+
+**Option B — External `.eex` files under `priv/templates/`** (chosen)
+- Pros: Templates are real files (editable, highlightable, diffable);
+  survive releases; match Phoenix's convention.
+- Cons: One extra runtime lookup via `Application.app_dir/2`; a missing
+  template file is a runtime error, not a compile error.
+
+→ Chose **B** because the ergonomics of editable template files and the
+  alignment with Phoenix's own generators outweigh the trivial runtime cost.
 
 ---
 
@@ -279,6 +306,23 @@ mix my_generator.worker MyApp.Workers.Emailer
 # Inspect the two new files under lib/ and test/.
 ```
 
+### Why this works
+
+`copy_template/3` composes three primitives: EEx rendering, conflict
+detection, and consistent shell output. By keeping templates in `priv/`
+we get release-safe paths via `Application.app_dir/2`, and by splitting
+the name with `Macro.camelize/1` + `Macro.underscore/1` we accept either
+casing convention without branching. `force: true` in tests sidesteps the
+interactive prompt that would otherwise hang CI.
+
+---
+
+## Benchmark
+
+<!-- benchmark N/A: generator task is I/O bound and runs once per invocation;
+     throughput is not a meaningful metric. Expected wall time is <50ms
+     for a two-file scaffold on a warm filesystem. -->
+
 ---
 
 ## Trade-offs and production gotchas
@@ -315,6 +359,19 @@ you wondering what changed. Either prompt on conflict (default), or fail
 
 Good generators produce *boring, non-logic, copy-ish* files: boilerplate
 test files, migration stubs, config skeletons. Not business logic.
+
+---
+
+## Reflection
+
+- Your team asks for a generator that scaffolds a full "context" with
+  schema, migration, and service module — three files with inter-dependent
+  names. Would you keep using `Mix.Generator` directly, or would you now
+  reach for `Mix.Generator` wrapped in a higher-level DSL (like Phoenix's
+  `Mix.Phoenix` helpers)? What's the breaking point?
+- Users start asking for "dry-run" mode (show what would be generated
+  without writing). How would you retrofit that onto `copy_template/3`
+  without forking the function?
 
 ---
 

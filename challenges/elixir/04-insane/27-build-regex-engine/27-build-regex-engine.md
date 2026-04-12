@@ -55,6 +55,18 @@ Most production regex engines (PCRE, Java, Python `re`) use backtracking NFA sim
 
 ---
 
+## Design decisions
+
+**Option A — PCRE-style backtracking engine**
+- Pros: supports backreferences and lookaround; most feature-rich.
+- Cons: catastrophic backtracking on pathological inputs (`(a+)+$`); not safe for untrusted patterns.
+
+**Option B — Thompson NFA / Pike VM (RE2-style)** (chosen)
+- Pros: linear in input length regardless of pattern; no catastrophic backtracking; parallel NFA states via bit-sets.
+- Cons: no backreferences; lookaround support is limited.
+
+→ Chose **B** because a regex engine that accepts untrusted input must be linear-time; RE2's NFA approach is the only choice that gives that guarantee.
+
 ## Implementation milestones
 
 ### Step 1: Create the project
@@ -646,6 +658,21 @@ Benchee.run(
 )
 ```
 
+### Why this works
+
+The compiler turns the pattern into an NFA with ε-transitions; the VM maintains a set of active states and advances all of them in parallel per input character. Because each state is either active or not (no backtracking), match time is O(|pattern| × |input|).
+
+---
+
+## Benchmark
+
+```elixir
+# bench/regex_bench.exs
+Benchee.run(%{"match" => fn -> Regex2.match?(nfa, "aaab") end}, time: 10)
+```
+
+Target: Match of a 20-char pattern against a 10 KB input in < 100 µs; no catastrophic cases on `(a+)+$`-style inputs.
+
 ---
 
 ## Trade-off analysis
@@ -674,6 +701,11 @@ Refine based on which target block a transition reaches, not whether a transitio
 
 **4. Character class negation not excluding newline**
 `[^a]` must not match newline by default.
+
+## Reflection
+
+- What's the smallest regex feature set that still covers 90% of real-world use? Would you drop backreferences, lookaround, or neither?
+- Compare NFA vs DFA compilation. When would pre-building the DFA pay off, and when is the state explosion prohibitive?
 
 ---
 

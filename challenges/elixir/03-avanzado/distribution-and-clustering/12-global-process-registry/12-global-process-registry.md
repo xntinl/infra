@@ -2,9 +2,6 @@
 
 **Project**: `global_registry` — singleton workers registered cluster-wide with `:global.register_name/2`. Explore conflict resolution, leader election, and why `:global` is unsuitable for high-churn workloads.
 
-**Difficulty**: ★★★★☆
-**Estimated time**: 3–6 hours
-
 ---
 
 ## Project context
@@ -32,6 +29,16 @@ global_registry/
 ```
 
 ---
+
+## Why this approach and not alternatives
+
+Alternatives considered and discarded:
+
+- **Hand-rolled equivalent**: reinvents primitives the BEAM/ecosystem already provides; high risk of subtle bugs around concurrency, timeouts, or failure propagation.
+- **External service (e.g. Redis, sidecar)**: adds a network hop and an extra failure domain for a problem the VM can solve in-process with lower latency.
+- **Heavier framework abstraction**: couples the module to a framework lifecycle and makes local reasoning/testing harder.
+
+The chosen approach stays inside the BEAM, uses idiomatic OTP primitives, and keeps the contract small.
 
 ## Core concepts
 
@@ -111,6 +118,18 @@ end)
 ```
 
 ---
+
+## Design decisions
+
+**Option A — naive/simple approach**
+- Pros: minimal code, easy to reason about.
+- Cons: breaks under load, lacks observability, hard to evolve.
+
+**Option B — the approach used here** (chosen)
+- Pros: production-grade, handles edge cases, testable boundaries.
+- Cons: more moving parts, requires understanding of the BEAM primitives involved.
+
+→ Chose **B** because correctness under concurrency and failure modes outweighs the extra surface area.
 
 ## Implementation
 
@@ -358,9 +377,14 @@ GlobalRegistry.TenantWorker.whereis("shared")
 # => :undefined      (the name is unregistered when the pid dies)
 ```
 
-`:global` does **not** restart the singleton on another node — you need Horde.DynamicSupervisor (see exercise 104).
+`:global` does **not** restart the singleton on another node — you need Horde.DynamicSupervisor.
 
 ---
+
+
+### Why this works
+
+The design leans on BEAM guarantees (process isolation, mailbox ordering, supervisor restarts) and pushes invariants to the boundaries of each module. State transitions are explicit, failure modes are declared rather than implicit, and each step is independently testable. That combination keeps the implementation correct under concurrent load and cheap to change later.
 
 ## Trade-offs and production gotchas
 
@@ -418,6 +442,11 @@ Results:
 Compare to `Horde.Registry` at ~100 µs irrespective of cluster size (asynchronous CRDT merge).
 
 ---
+
+## Reflection
+
+- If the expected load grew by 100×, which assumption in this design would break first — the data structure, the process model, or the failure handling? Justify.
+- What would you measure in production to decide whether this implementation is still the right one six months from now?
 
 ## Resources
 

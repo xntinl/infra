@@ -58,6 +58,18 @@ In a distributed system where network partitions are possible, you have two choi
 
 ---
 
+## Design decisions
+
+**Option A — State-based CRDTs (CvRDT) with full-state sync**
+- Pros: merge function is trivially commutative/associative/idempotent; no delivery guarantees required.
+- Cons: O(|state|) bandwidth per sync; doesn't scale to large sets.
+
+**Option B — Delta-state CRDTs (δ-CRDTs)** (chosen)
+- Pros: ship only the increments since last sync; retains state-based correctness proofs; practical at scale.
+- Cons: must track delta intervals; anti-entropy on delta loss is more intricate.
+
+→ Chose **B** because δ-CRDTs are the sweet spot between CvRDT simplicity and op-based bandwidth; they're what Redis Enterprise and Riak use for the same reason.
+
 ## Implementation milestones
 
 ### Step 1: Create the project
@@ -555,6 +567,21 @@ Benchee.run(
 )
 ```
 
+### Why this works
+
+Each replica tracks a vector clock of its local updates and ships deltas since the last known peer version. The merge function is still a join on the semilattice, so convergence is guaranteed regardless of delivery order or duplication.
+
+---
+
+## Benchmark
+
+```elixir
+# bench/crdt_bench.exs
+Benchee.run(%{"merge_10k_updates" => fn -> Crdt.merge(a, b) end}, time: 10)
+```
+
+Target: Merge of two 10k-element OR-sets in < 100 µs; convergence under 50 ms across 5 replicas.
+
 ---
 
 ## Trade-off analysis
@@ -584,6 +611,11 @@ Two nodes insert at the same position concurrently. Without a deterministic tie-
 
 **4. Gossip not accounting for partial state exchange**
 State-based gossip sends the full CRDT state to a random peer. For a large ORSet with millions of elements, this is expensive. Delta-CRDT gossip sends only the changes since the last exchange.
+
+## Reflection
+
+- Why can't OR-set removals be implemented as plain deletes? Walk through a concurrent add/remove example.
+- When would you reach for an op-based CRDT instead of a δ-CRDT? Name a workload and justify.
 
 ---
 

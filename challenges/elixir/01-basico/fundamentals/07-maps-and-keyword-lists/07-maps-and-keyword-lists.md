@@ -56,6 +56,18 @@ app_config/
 
 ---
 
+## Design decisions
+
+**Option A — layered deep-merge with maps for config values**
+- Pros: Supports arbitrary key types, O(log n) access, pattern-matchable
+- Cons: No ordering guarantees (irrelevant for config), slightly more ceremony than keyword lists
+
+**Option B — flat Keyword list at every level** (chosen)
+- Pros: Ordered, supports duplicate keys, natural for compile-time option passing
+- Cons: Keys must be atoms, O(n) access, not suitable for large nested trees
+
+→ Chose **A** because application config is a nested tree with heterogeneous key sources; maps handle that cleanly while keyword lists fit better at the API boundary. Keep keyword lists at the function-call boundary (options).
+
 ## Implementation
 
 ### `lib/app_config.ex`
@@ -405,6 +417,10 @@ mix test --trace
 
 ---
 
+### Why this works
+
+The approach chosen above keeps the core logic **pure, pattern-matchable, and testable**. Each step is a small, named transformation with an explicit return shape, so adding a new case means adding a new clause — not editing a branching block. Failures are data (`{:error, reason}`), not control-flow, which keeps the hot path linear and the error path explicit.
+
 ## Map access: dot notation vs bracket notation
 
 ```elixir
@@ -429,6 +445,22 @@ Use dot notation when you know the key exists (structs, validated configs). Use
 bracket notation or `Map.get/3` when the key might be missing.
 
 ---
+
+## Benchmark
+
+```elixir
+{time_us, _result} =
+  :timer.tc(fn ->
+    for _ <- 1..1_000 do
+      # representative call of deep_merge of two 5-level configs
+      :ok
+    end
+  end)
+
+IO.puts("Avg: #{time_us / 1_000} µs/call")
+```
+
+Target: **< 50µs for a config tree with < 1000 keys total**.
 
 ## Common production mistakes
 
@@ -455,6 +487,12 @@ value in your domain, use `Map.fetch/2` which distinguishes missing from nil.
 match on a subset. This is different from tuples, which must match exactly.
 
 ---
+
+## Reflection
+
+If your config tree had 100k keys (e.g., feature flags per tenant), would you still deep-merge in memory, or move to ETS with per-tenant namespaces? What changes at that scale?
+
+Why does Elixir enforce atom keys for keyword lists but not for maps? How does that constraint affect API design?
 
 ## Resources
 

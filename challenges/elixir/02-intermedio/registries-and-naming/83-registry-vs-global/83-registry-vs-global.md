@@ -2,9 +2,6 @@
 
 **Project**: `naming_compared` — the same GenServer registered three ways, with a test suite highlighting the differences.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
-
 ---
 
 ## Project context
@@ -80,6 +77,32 @@ chat servers, per-entity workers.
 | Cleanup on death | manual unregister | automatic | automatic |
 | Works with `{:via, ...}` | no (use `name:`) | yes | yes |
 | Netsplit behavior | N/A | conflict resolver runs | N/A |
+
+---
+
+## Why compare all three instead of picking one up front
+
+This exercise exists because the wrong choice is almost always an *overreach*: `:global` used where atoms or a local `Registry` would suffice, atoms used where the key set is unbounded, or `Registry` used where genuine cluster singletons are required.
+
+**Atom `Process.register/2`.** Node-local, O(1), but leaks atoms if keys aren't compile-time. Bounded-set only.
+
+**`:global`.** Cluster-wide consensus. Every registration takes a multi-node lock; netsplit resolution can kill a pid outright (`:random_exit`). Reserve for true cluster singletons.
+
+**`Registry` + `:via` (chosen for dynamic local naming).** Atom-free, dynamic keys, automatic cleanup on death, no cluster cost. The right default for per-entity processes on one node.
+
+---
+
+## Design decisions
+
+**Option A — Pick one backend and hide it behind a façade**
+- Pros: Less surface area for callers; swapping later is a single-file change.
+- Cons: Obscures the trade-offs, and the wrong choice becomes architecturally sticky (especially if you lock in `:global`).
+
+**Option B — Expose all three via sibling helpers, let each use site pick** (chosen for this exercise)
+- Pros: Forces an explicit decision per call site; tests make the observable differences (collision, cleanup, scope) concrete.
+- Cons: Without discipline, a codebase ends up using all three for the same concept.
+
+→ Chose **B** because the point of the exercise is to *see* the differences, not to hide them. In production, collapse to a façade once the choice is settled.
 
 ---
 
@@ -238,6 +261,37 @@ end
 mix test
 ```
 
+### Why this works
+
+Each backend is wrapped in a helper with the same `Counter` GenServer behind it, so the only variable across the three test sections is the naming strategy. Collisions surface as `{:already_started, _}` from `start_link`, automatic cleanup surfaces as a `Registry.lookup/2` that returns `[]` after `:DOWN`, and `:global`'s any-term keys are demonstrated with a string as a name. The tests are the executable decision table.
+
+---
+
+## Benchmark
+
+```elixir
+# Register 10_000 distinct names per backend and measure wall-clock.
+registry_time =
+  :timer.tc(fn ->
+    for i <- 1..10_000 do
+      {:ok, _} = NamingCompared.start_via("k-#{i}")
+    end
+  end)
+  |> elem(0)
+
+global_time =
+  :timer.tc(fn ->
+    for i <- 1..10_000 do
+      {:ok, _} = NamingCompared.start_global({:k, i})
+    end
+  end)
+  |> elem(0)
+
+IO.puts("registry=#{registry_time}µs global=#{global_time}µs")
+```
+
+Target esperado (single node, healthy cluster): `Registry` completes in O(10 µs/registration); `:global` is typically 10–50x slower per registration even without other nodes connected, because every registration still takes the global lock.
+
 ---
 
 ## Trade-offs and production gotchas
@@ -274,6 +328,13 @@ Callers must handle `:noproc` from `GenServer.call` gracefully.
 For ad-hoc, short-lived workers passed by pid (Task, Flow), don't
 register at all. Naming has cost; naming things you don't look up by name
 is pointless.
+
+---
+
+## Reflection
+
+- You inherit a codebase that uses `:global` for every named GenServer, including single-node-only caches. What migration path gives you the least runtime risk — big-bang rewrite, per-concept façade, or feature-flagged dual-register? Justify.
+- After a 30-second netsplit, `:global` fires its conflict resolver and one of two duplicate pids is killed. Which of your system's invariants would that break, and how would you detect it in logs/metrics before a user does?
 
 ---
 

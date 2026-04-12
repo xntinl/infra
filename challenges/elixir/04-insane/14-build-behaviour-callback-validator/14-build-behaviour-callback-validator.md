@@ -56,6 +56,18 @@ This tool closes those gaps by reading module metadata from `.beam` files after 
 
 ---
 
+## Design decisions
+
+**Option A — Runtime reflection with `Code.ensure_loaded/1` and `function_exported?/3`**
+- Pros: works without macro magic; easy to debug.
+- Cons: errors surface at runtime, not at compile time — exactly the opposite of what a validator should give you.
+
+**Option B — Compile-time `@after_compile` hook that inspects the module** (chosen)
+- Pros: invalid implementations fail `mix compile`, not at runtime; integrates with the editor; errors point at source lines.
+- Cons: macro code is harder to read and test; must account for module attributes not finalized until after compile.
+
+→ Chose **B** because a behaviour validator exists precisely to catch bugs before runtime; doing it at runtime defeats its entire purpose.
+
 ## Implementation milestones
 
 ### Step 1: Create the project
@@ -312,6 +324,21 @@ echo "Exit code: $?"
 
 Expected: exit code 0 on a clean project, exit code 1 if any violations exist.
 
+### Why this works
+
+The `@after_compile` callback inspects the module's `__info__(:functions)` and compares it to the behaviour's `@callback` list, raising `CompileError` with a precise message and source location. This makes the validator fully declarative at the use-site.
+
+---
+
+## Benchmark
+
+```elixir
+# bench/validator_bench.exs
+:timer.tc(fn -> Code.compile_file("lib/sample.ex") end)
+```
+
+Target: Validation adds < 100 ms to `mix compile` even on a 200-module project.
+
 ---
 
 ## Trade-off analysis
@@ -343,6 +370,11 @@ Erlang behaviour modules store callback info in `module.behaviour_info(:callback
 
 **4. Emitting errors for optional callbacks**
 Required and optional callbacks have different enforcement rules. Confusing them causes false positives that block compilation for valid modules.
+
+## Reflection
+
+- If a behaviour has 50 optional callbacks, should your validator warn on missing optional ones, or silently accept? Make a policy argument.
+- How would you extend this to validate callback *types* (not just arity) using `@spec`? Sketch the approach.
 
 ---
 

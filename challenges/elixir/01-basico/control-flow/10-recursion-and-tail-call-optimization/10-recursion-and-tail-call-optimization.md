@@ -60,6 +60,18 @@ tree/
 
 ---
 
+## Design decisions
+
+**Option A — tail-recursive accumulator with explicit `acc`**
+- Pros: Constant stack usage regardless of tree depth, safe on very deep trees
+- Cons: Reverses the natural order — must `Enum.reverse/1` at the end if order matters
+
+**Option B — body-recursive (stack-accumulating) version** (chosen)
+- Pros: Reads closer to the mathematical definition
+- Cons: Stack grows with depth; on a 100k-deep path, stack overflow or huge memory use
+
+→ Chose **A** because a file-system walker can encounter arbitrarily deep trees — tail-call optimization is not optional.
+
 ## Implementation
 
 ### `lib/tree.ex`
@@ -406,6 +418,10 @@ mix test --trace
 
 ---
 
+### Why this works
+
+The approach chosen above keeps the core logic **pure, pattern-matchable, and testable**. Each step is a small, named transformation with an explicit return shape, so adding a new case means adding a new clause — not editing a branching block. Failures are data (`{:error, reason}`), not control-flow, which keeps the hot path linear and the error path explicit.
+
 ## Tail recursion vs body recursion
 
 ```elixir
@@ -429,6 +445,22 @@ For small inputs (<10,000 elements), the difference is negligible. For large
 inputs (millions of files in a directory tree), body recursion overflows the stack.
 
 ---
+
+## Benchmark
+
+```elixir
+{time_us, _result} =
+  :timer.tc(fn ->
+    for _ <- 1..1_000 do
+      # representative call of walk of a 100k-file tree
+      :ok
+    end
+  end)
+
+IO.puts("Avg: #{time_us / 1_000} µs/call")
+```
+
+Target: **< 1s wall time; memory stays flat across the traversal (check with `:erlang.memory(:total)` before/after)**.
 
 ## Common production mistakes
 
@@ -456,6 +488,12 @@ the BEAM cannot reuse the stack frame. Move error handling outside the recursive
 loop.
 
 ---
+
+## Reflection
+
+If the filesystem has symlink loops, your walker enters an infinite recursion. How do you detect and break the cycle, and where does that bookkeeping live (accumulator, ETS, process dict)?
+
+Would you parallelize the tree walk with `Task.async_stream/3`? What would you gain on a 10-drive NAS, and what would you lose on a single SSD?
 
 ## Resources
 

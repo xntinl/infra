@@ -2,9 +2,6 @@
 
 **Project**: `pricing_rule_engine` — applies tier discounts and taxes to a cart total
 
-**Difficulty**: ★★☆☆☆
-**Estimated time**: 1–2 hours
-
 ---
 
 ## Project structure
@@ -56,6 +53,18 @@ against the cart. That is the textbook `cond` shape — a cascade where the firs
 rule wins. Inside each branch, `if` shines for a final yes/no (taxable or not).
 
 ---
+
+## Design decisions
+
+**Option A — `cond` for multi-way branching on unrelated booleans**
+- Pros: Each condition reads top-to-bottom, no indentation growth, easy to insert a new tier
+- Cons: All conditions evaluated top-to-bottom — if a condition is expensive, order matters
+
+**Option B — nested `if`/`else`** (chosen)
+- Pros: Familiar from imperative languages
+- Cons: Indentation grows per level, hard to reorder, easy to miss a branch
+
+→ Chose **A** because discount tiers are a multi-way branch on unrelated thresholds — that's exactly `cond`'s sweet spot. Use B only for binary true/false.
 
 ## Implementation
 
@@ -188,6 +197,26 @@ All 7 tests pass.
 
 ---
 
+### Why this works
+
+The approach chosen above keeps the core logic **pure, pattern-matchable, and testable**. Each step is a small, named transformation with an explicit return shape, so adding a new case means adding a new clause — not editing a branching block. Failures are data (`{:error, reason}`), not control-flow, which keeps the hot path linear and the error path explicit.
+
+## Benchmark
+
+```elixir
+{time_us, _result} =
+  :timer.tc(fn ->
+    for _ <- 1..1_000 do
+      # representative call of apply_discount/1 over 1M cart totals
+      :ok
+    end
+  end)
+
+IO.puts("Avg: #{time_us / 1_000} µs/call")
+```
+
+Target: **< 20ms total; each lookup ~20ns**.
+
 ## Trade-offs
 
 | Situation | Use |
@@ -236,6 +265,12 @@ Elixir treats `nil` and `false` as falsy; *everything else* is truthy, including
 and `""`. `if list, do: ...` is true even for `[]`. Use explicit checks (`list != []`).
 
 ---
+
+## Reflection
+
+If your pricing rules come from a database (sales team changes them weekly), is `cond` still the right choice, or does the rule engine need to become data-driven? Sketch both approaches.
+
+How does the ordering of `cond` clauses affect performance when the first clause is expensive? Where should short-circuit cheap-but-decisive checks sit?
 
 ## Resources
 

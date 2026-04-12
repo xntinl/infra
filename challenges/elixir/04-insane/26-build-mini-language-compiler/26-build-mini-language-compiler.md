@@ -55,6 +55,18 @@ Writing a compiler that targets a real runtime is harder than writing an interpr
 
 ---
 
+## Design decisions
+
+**Option A — Tree-walking interpreter**
+- Pros: dead simple; great for teaching.
+- Cons: interpretive overhead dominates; optimizations are hard to express.
+
+**Option B — Compile AST to a bytecode VM** (chosen)
+- Pros: separates parsing from execution; lets you reason about instruction dispatch cost; enables simple optimizations (constant folding, dead-code elimination) at compile time.
+- Cons: two stages to test; VM design is a project in its own right.
+
+→ Chose **B** because a *compiler* project must produce compiled code — otherwise it's an interpreter in disguise; the bytecode VM is the natural target.
+
 ## Implementation milestones
 
 ### Step 1: Create the project
@@ -707,6 +719,21 @@ Benchee.run(
 )
 ```
 
+### Why this works
+
+The compiler lowers the AST to a linear sequence of stack-machine opcodes, performs a constant-folding pass, and emits bytecode. The VM is a tight `case` loop dispatching on opcode, with call frames for function invocation and lexical scopes as arrays.
+
+---
+
+## Benchmark
+
+```elixir
+# bench/compiler_bench.exs
+Benchee.run(%{"compile_100loc" => fn -> MiniLang.compile(source) end, "run" => fn -> VM.run(bc) end}, time: 10)
+```
+
+Target: 100 LOC compile in < 5 ms; bytecode execution ~5x faster than a tree-walking baseline.
+
 ---
 
 ## Trade-off analysis
@@ -735,6 +762,11 @@ Nested lambdas may have transitive free variables.
 
 **4. Core Erlang module not exporting public functions**
 `:cerl.c_module/3` requires an explicit export list.
+
+## Reflection
+
+- Which classical optimization (CSE, inlining, loop-invariant hoisting) would give the biggest win on your bytecode VM, and why?
+- If you added a register-based VM, what would change in the instruction set? Compare register vs stack architectures.
 
 ---
 

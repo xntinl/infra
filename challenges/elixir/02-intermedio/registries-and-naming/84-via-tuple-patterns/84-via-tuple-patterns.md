@@ -2,9 +2,6 @@
 
 **Project**: `via_tuple_patterns` — common via-tuple usages: Registry via, custom `:via` module, and tagged names.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
-
 ---
 
 ## Project context
@@ -83,8 +80,31 @@ implementation later becomes a one-line change.
 A via tuple resolves to a pid via `whereis_name/1`. If the lookup returns
 `:undefined`, any `GenServer.call` using it raises `:noproc`. The
 canonical pattern is: try the call, rescue `:noproc`, start the process,
-retry. Or, wrap it in a `find_or_start` helper like the chat-rooms
-exercise.
+retry. Or, wrap it in a `find_or_start` helper.
+
+---
+
+## Why write your own `:via` backend once (and then use `Registry` forever)
+
+**Reach for `Registry`.** It monitors every registered pid, cleans up on `:DOWN`, supports unique and duplicate keys, and plugs into the via protocol without any glue.
+
+**Reach for `:global` / Horde / Syn.** When the name must resolve across nodes.
+
+**Write a handwritten via backend.** Only as an exercise (this one) or when you have a truly bespoke naming semantics no stdlib module gives you. The minute you care about cleanup on pid death, you're re-implementing `Registry` badly.
+
+---
+
+## Design decisions
+
+**Option A — Keep `{:via, Registry, ...}` inline at every call site**
+- Pros: Zero indirection; the backend is obvious when reading.
+- Cons: Swapping `Registry` for `Horde.Registry` (or a partitioned variant) is an N-file diff.
+
+**Option B — Centralize via-tuple construction in `defp via/1`** (chosen)
+- Pros: The backend, key shape, and registry name live in one place; swap is a one-line change; call sites read as domain code, not infrastructure.
+- Cons: One more indirection to trace through the first time you open the file.
+
+→ Chose **B** because the cost (one private helper) is trivial and the payoff (future-proofing the naming layer) is load-bearing.
 
 ---
 
@@ -303,6 +323,34 @@ end
 mix test
 ```
 
+### Why this works
+
+The `:via` protocol is four functions — `register_name/2`, `whereis_name/1`, `unregister_name/1`, `send/2` — so any module that implements them can stand in as a naming backend. The `Registry`-backed path shows the everyday usage with a single `via/1` helper, and `EtsVia` exposes the protocol with no abstractions in between. Together they make the point that `Registry` is not magic — it is the four-function protocol *plus* the monitor-based cleanup you would otherwise have to write yourself.
+
+---
+
+## Benchmark
+
+```elixir
+{:ok, _} = ViaTuplePatterns.find_or_start(:bench)
+via = ViaTuplePatterns.via(:bench)
+pid = GenServer.whereis(via)
+
+{via_time, _} =
+  :timer.tc(fn ->
+    Enum.each(1..100_000, fn _ -> ViaTuplePatterns.Worker.tag(via) end)
+  end)
+
+{pid_time, _} =
+  :timer.tc(fn ->
+    Enum.each(1..100_000, fn _ -> ViaTuplePatterns.Worker.tag(pid) end)
+  end)
+
+IO.puts("via=#{via_time / 100_000} µs/call  pid=#{pid_time / 100_000} µs/call")
+```
+
+Target esperado: diferencia de 1–3 µs por `GenServer.call` entre via-tuple y pid directo en hardware moderno — la lookup ETS es el sobrecosto y confirma la guía "cachea el pid en hot-paths estables".
+
 ---
 
 ## Trade-offs and production gotchas
@@ -335,6 +383,13 @@ handoff. Know which you have before shipping.
 For a single, fixed, compile-time-known process, `name: MyServer` (atom)
 is simpler, faster, and documents intent better than a via tuple. Reach
 for via when the set of names is dynamic.
+
+---
+
+## Reflection
+
+- You're on a hot path (10k calls/sec to the same named GenServer). Do you keep calling through the via tuple or cache the pid? What goes wrong if the pid changes (restart) and you held it stale?
+- The handwritten `EtsVia` leaks entries for dead pids. Add process monitoring: what invariants do you need (per-process monitor ref, cleanup on `:DOWN`, race between `whereis_name` and `:DOWN`) and how does the result compare to just using `Registry`?
 
 ---
 

@@ -2,9 +2,6 @@
 
 **Project**: `tree_design` — design a supervision tree from first principles using failure domains.
 
-**Difficulty**: ★★★★☆
-**Estimated time**: 4–6 hours
-
 ---
 
 ## Project context
@@ -124,7 +121,36 @@ They belong in DIFFERENT supervisors if:
 
 ---
 
+## Why layered supervisors and not a flat `:one_for_one`
+
+A flat list treats every child as interchangeable. It cannot express "DB crash must cascade to consumers" (needs `:rest_for_one`) and it cannot express "telemetry flap must not reach payments" (needs isolation). Layering gives you both axes: inter-subsystem dataflow at the root (`:rest_for_one`), intra-subsystem peer independence at the leaves (`:one_for_one`). Flat trees scale in line count but not in expressiveness; at ~10+ children the "27-child flat list" anti-pattern becomes a correctness problem, not a style problem.
+
+---
+
+## Design decisions
+
+**Option A — single root supervisor with all 27 workers flat**
+- Pros: no indirection; `Supervisor.which_children/1` returns everything at once.
+- Cons: impossible to encode inter-subsystem dependencies; restart budget shared across unrelated concerns; any flap pressures the whole root.
+
+**Option B — three-level tree (root → subsystem → workers)** (chosen)
+- Pros: failure domain boundaries are first-class; `:rest_for_one` at root encodes dataflow; subsystems can have independent budgets; trivial to add a new subsystem without touching existing ones.
+- Cons: more files; more cognitive load; `:rest_for_one` ordering pitfalls (Observability-last trap described above).
+
+→ Chose **B** because each of the four subsystems has distinct failure semantics and must be reasoned about independently. Flat supervision is the right default for < 5 children; above that it stops scaling organizationally.
+
+---
+
 ## Implementation
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defp deps do
+  []
+end
+```
+
 
 ### Step 1: Root application
 
@@ -407,6 +433,10 @@ defmodule TreeDesign.TreeTopologyTest do
 end
 ```
 
+### Why this works
+
+Placing `Observability.Supervisor` first in the root list keeps it untouched by any `:rest_for_one` cascade — passive observers never need to restart because of dataflow changes. `Infra` → `Domain` → `Edge` after it encodes the real dependency chain: a DB flap cascades forward through domain and edge, exactly where stale caches and open connections need reset. Each subsystem runs its own budget, so a flap in Edge cannot use up Infra's restart budget, and the root stays tight (5/30) so OS-level supervisors can intervene on whole-app instability.
+
 ---
 
 ## Trade-offs and production gotchas
@@ -429,9 +459,18 @@ end
 
 ---
 
-## Performance notes
+## Benchmark
 
 Supervisor dispatch is ~1 µs per message. Deep trees (5+ levels) don't measurably slow startup. What does slow startup is `init/1` I/O — each `init/1` is serial within its supervisor. Do heavy work in `handle_continue/2` so `init/1` returns in microseconds and the supervisor proceeds to the next child.
+
+Target: cold-boot end-to-end ≤ 200 ms for the full tree; any single `init/1` ≤ 5 ms; supervisor cascade restart ≤ 50 ms on Infra death.
+
+---
+
+## Reflection
+
+1. Product adds a `Recommendations` subsystem that consumes Domain events and publishes to Edge. Where does it live — under Domain, under Edge, or as its own subsystem? Justify using the "same tier test" from Core concepts.
+2. Your root runs at `max_restarts: 5, max_seconds: 30`. Ops reports the root exited twice in a week, each time after a cascading Infra → Domain → Edge restart triggered by a Redis blip. Do you widen the root budget, move Redis out of Infra, or add a circuit breaker in front of Redis? What's the minimum change that preserves cascade correctness?
 
 ---
 

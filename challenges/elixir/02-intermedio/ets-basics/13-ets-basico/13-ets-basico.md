@@ -4,9 +4,6 @@
 table, put tuples in, pull them out, delete them, and understand who owns the
 table and what happens when that owner dies.
 
-**Difficulty**: ★★☆☆☆
-**Estimated time**: 1–2 hours
-
 ---
 
 ## Project context
@@ -23,6 +20,21 @@ match specs. Just the four fundamental verbs — **new**, **insert**, **lookup**
 first time: **table ownership**. When the process that opened a table dies,
 the table dies with it. Understanding that rule is the difference between
 "ETS is magic" and "ETS is predictable".
+
+## Why ETS and not X
+
+**Why not a `Map` inside a GenServer?** For single-process state it works
+fine. The moment you have N reader processes, every `get` becomes a
+`GenServer.call` — serialized through one mailbox. ETS lets readers bypass
+the owner entirely.
+
+**Why not `:persistent_term`?** `:persistent_term` is faster for reads but
+triggers a global GC on every write. It's read-heavy only. ETS handles mixed
+read/write cleanly.
+
+**Why not a real database?** Because ETS is in-memory, node-local, and free
+of I/O latency. Use a database when you need durability or cross-node
+coordination; otherwise ETS is almost always cheaper.
 
 Project structure:
 
@@ -102,6 +114,24 @@ option when creating the table. That's how people store structs directly:
 ```
 
 For this exercise we'll keep it boring: plain `{key, value}` tuples.
+
+---
+
+## Design decisions
+
+**Option A — Wrap every ETS call in a GenServer API**
+- Pros: Centralized access control; easy to add metrics / logging.
+- Cons: You lose ETS's read-without-call advantage — every `get/2` pays
+  a message round-trip.
+
+**Option B — Thin module of pure ETS calls, caller owns the table** (chosen)
+- Pros: No serialization; the exercise demonstrates the raw ownership rule
+  without a GenServer hiding it.
+- Cons: Production code would wrap this in a supervised owner; here we keep
+  it minimal.
+
+→ Chose **B** because the lesson is the **lifecycle** rule, and a GenServer
+would just pay you to forget it. Real apps add the GenServer back on top.
 
 ---
 
@@ -252,6 +282,50 @@ end
 mix test
 ```
 
+### Why this works
+
+`:ets.new/2` creates a table owned by the calling process; the VM tracks
+ownership and tears the table down when the owner exits. The tests exploit
+this by `spawn`ing an owner, waiting for `:DOWN`, then asserting
+`:ets.info/1 == :undefined`. CRUD operations (`insert`, `lookup`, `delete`)
+are all single-step and atomic per operation — no cross-key transactions,
+but no torn writes either.
+
+---
+
+## Benchmark
+
+```elixir
+# Compare ETS vs Map for 100k sequential inserts then 100k lookups,
+# single process, no concurrency.
+n = 100_000
+
+{us_ets_insert, t} = :timer.tc(fn ->
+  t = :ets.new(:b, [:set, :public])
+  for i <- 1..n, do: :ets.insert(t, {i, i})
+  t
+end)
+{us_ets_lookup, _} = :timer.tc(fn ->
+  for i <- 1..n, do: :ets.lookup(t, i)
+end)
+:ets.delete(t)
+
+{us_map_insert, m} = :timer.tc(fn ->
+  Enum.reduce(1..n, %{}, fn i, acc -> Map.put(acc, i, i) end)
+end)
+{us_map_lookup, _} = :timer.tc(fn ->
+  for i <- 1..n, do: Map.get(m, i)
+end)
+
+IO.puts("ETS insert=#{us_ets_insert}µs lookup=#{us_ets_lookup}µs")
+IO.puts("Map insert=#{us_map_insert}µs lookup=#{us_map_lookup}µs")
+```
+
+Target esperado: para 100k elementos en un solo proceso, `Map` es típicamente
+más rápido en lookup (sin copy-out), pero más lento en inserts (persistent
+structure cost). La inversión ocurre en el momento en que múltiples procesos
+necesitan leer.
+
 ---
 
 ## Trade-offs and production gotchas
@@ -291,6 +365,17 @@ worth reading before you build anything serious on top of ETS.
 - When you need persistence or ACID transactions.
 - When the data is tiny, read-only, and process-local — `@module_attr` or
   `:persistent_term` may be cheaper.
+
+---
+
+## Reflection
+
+- You open an ETS table in an `iex` session for quick experiments. The
+  `iex` evaluator crashes. Why is your table gone, and how would you
+  redesign if the data must survive the crash but stay in-memory?
+- A GenServer owns a 100MB ETS table for a cache. When the GenServer is
+  restarted by its supervisor, the cache is empty. Is that a bug or a
+  feature? Design both answers and the trade-off between them.
 
 ---
 

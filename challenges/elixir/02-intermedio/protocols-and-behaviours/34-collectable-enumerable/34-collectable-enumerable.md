@@ -2,9 +2,6 @@
 
 **Project**: `custom_bag` — a multiset (`Bag`) struct that fully implements `Enumerable` (so `Enum.*` works) and `Collectable` (so `Enum.into/2` works).
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
-
 ---
 
 ## Project context
@@ -20,8 +17,7 @@ companion protocols:
 
 These are the two most complex stdlib protocols because they deal with
 streaming, suspension, and early termination. This exercise implements the
-minimum correct version; exercise 79 extends the idea to a tree with a
-full lazy `reduce/3`.
+minimum correct version.
 
 Project structure:
 
@@ -76,6 +72,30 @@ resources (file handles, ports). For pure data structures, return `:ok`.
 For list-like structures with random access, implementing `slice/1` unlocks
 `Enum.at/2` and `Enum.slice/2` in O(1). For a `Bag` it doesn't make sense —
 opt out.
+
+---
+
+## Why implement both `Enumerable` and `Collectable` together
+
+**`Enumerable` only.** `Enum.map/2` works, but `Enum.into/2` and `for ... into:` don't — callers must write a manual `Enum.reduce/3` to build a `Bag` from a list.
+
+**`Collectable` only.** `Enum.into(list, bag)` works, but reading back with `Enum.count/1`, `Enum.map/2`, etc. doesn't — callers pattern-match `bag.counts` directly, leaking the internal shape.
+
+**Both (chosen).** `Bag` behaves like any stdlib collection: `Enum.*` reads, `Enum.into` writes, `for ... into:` builds. The implementation cost is modest and the ergonomic payoff is the whole reason custom collections exist.
+
+---
+
+## Design decisions
+
+**Option A — Implement `Enumerable.reduce/3` by walking the count map directly**
+- Pros: Zero intermediate allocation; streams cleanly with `:suspend`.
+- Cons: More state-machine code in the reduce loop; easier to get `:halt` / `:suspend` wrong.
+
+**Option B — Materialize to a list-with-duplicates and reuse a list reducer** (chosen)
+- Pros: The reduce loop is the canonical 4-clause pattern; easy to audit for correctness on `:cont` / `:halt` / `:suspend`.
+- Cons: Allocates `O(size)` temporary list; bad for large bags in a hot path.
+
+→ Chose **B** because correctness of the `Enumerable` contract is the main learning goal, and the list-materialization cost is localized to one function you can optimize later without changing the public surface.
 
 ---
 
@@ -232,6 +252,28 @@ end
 mix test
 ```
 
+### Why this works
+
+`Enumerable.reduce/3` is a four-clause state machine that honors `:cont` (keep going), `:halt` (stop now), and `:suspend` (return a continuation) — those three states are what make `Enum.take/2`, `Stream.zip/2`, and lazy interop work. `count/1` is `{:ok, total}` because the count map makes size an O(map-values) operation, but `slice/1` returns `{:error, __MODULE__}` because there is no meaningful random-access order for a multiset. `Collectable.into/1` returns a 2-arity collector that funnels `{:cont, elem}` through `Bag.put/2` and cleanly handles `:halt` for error paths.
+
+---
+
+## Benchmark
+
+```elixir
+bag =
+  Enum.reduce(1..10_000, Bag.new(), fn i, acc ->
+    Bag.put(acc, rem(i, 100))
+  end)
+
+{count_time, _} = :timer.tc(fn -> Enum.count(bag) end)
+{map_time, _}   = :timer.tc(fn -> Enum.map(bag, &(&1 * 2)) end)
+
+IO.puts("count=#{count_time} µs  map=#{map_time} µs (size=#{Bag.size(bag)})")
+```
+
+Target esperado: `Enum.count/1` debería completar en <50 µs (O(keys)); `Enum.map/2` escala con el tamaño del multiset materializado (~10k elementos aquí) y debería completar en unos pocos ms. Si `map` tarda órdenes de magnitud más, probablemente olvidaste una cláusula de `reduce/3`.
+
 ---
 
 ## Trade-offs and production gotchas
@@ -261,6 +303,13 @@ leaks handles.
 If iteration doesn't have a natural single-pass order (e.g. a graph), forcing
 it into `Enumerable` makes a meaningless order feel meaningful. Offer
 explicit traversal functions (`walk_bfs/1`, `walk_dfs/1`) instead.
+
+---
+
+## Reflection
+
+- Rewrite `reduce/3` to iterate the count map directly, without materializing an intermediate list. What's the trickiest part — tracking the remaining count of the current key, or threading the `:suspend` continuation through that state?
+- A teammate proposes `count/1` return `{:ok, map_size(counts)}` (number of distinct elements) because "it's O(1)". What breaks in the test suite, and what does this reveal about the difference between *cardinality* and *size* in a multiset?
 
 ---
 

@@ -56,6 +56,18 @@ The hard part is context propagation: the trace ID and parent span ID must flow 
 
 ---
 
+## Design decisions
+
+**Option A — Tail-based sampling (keep all spans, sample at span completion)**
+- Pros: can keep every trace that contains an error or high latency; no bias.
+- Cons: requires buffering all spans per trace until the root completes; memory grows with trace duration.
+
+**Option B — Head-based probabilistic sampling with trace-id hash** (chosen)
+- Pros: O(1) memory per span; deterministic per-trace decision so every service in a trace agrees; low overhead in the hot path.
+- Cons: you cannot retroactively keep a trace that turned out to be interesting.
+
+→ Chose **B** because in a high-throughput ingest path, predictable memory and CPU cost dominate; tail-based sampling is a valid mode but belongs behind a flag, not as the default.
+
 ## Implementation milestones
 
 ### Step 1: Create the project
@@ -515,6 +527,21 @@ Benchee.run(
 
 Target: start + finish span < 5µs per operation at p99 on a warm collector.
 
+### Why this works
+
+Hashing the trace-id to decide sampling means every service makes the same decision without coordination, so a sampled trace is never half-dropped. The span processor batches writes and flushes on size or age, bounding memory and disk I/O regardless of traffic.
+
+---
+
+## Benchmark
+
+```elixir
+# bench/tracing_bench.exs
+Benchee.run(%{"record_span" => fn -> Tracer.span("work", fn -> :ok end) end}, time: 10)
+```
+
+Target: 50,000 spans/second ingested on a single node; p99 record overhead < 20 µs.
+
 ---
 
 ## Trade-off analysis
@@ -544,6 +571,11 @@ The tail sampler must know which span is the root to know when the trace is comp
 
 **4. Blocking the hot path with Jaeger export**
 The Jaeger exporter performs HTTP requests or binary encoding. This must happen in a background process (the aggregator or a dedicated exporter process), never in the span finish path.
+
+## Reflection
+
+- If you need to guarantee that every trace containing a 5xx response is retained, would you keep head sampling and add an error-override channel, or switch to tail sampling? Compare memory costs.
+- How would your design change for mobile clients where samples must be uploaded in bursts and bandwidth is metered?
 
 ---
 

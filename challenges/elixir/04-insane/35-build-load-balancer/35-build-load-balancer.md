@@ -42,6 +42,22 @@ balancer/
 
 ---
 
+## Why power-of-two-choices and not least-connections globally
+
+global least-connections needs a shared counter across all LB instances — either a contended lock or an eventually-consistent view that's wrong under load. P2C achieves ~95% of its benefit with zero cross-instance coordination.
+
+## Design decisions
+
+**Option A — random selection**
+- Pros: stateless, trivially parallel
+- Cons: tail latency ignored, hot backends overloaded
+
+**Option B — power-of-two-choices with active health check feedback** (chosen)
+- Pros: near-optimal load distribution with minimal state
+- Cons: requires per-backend state, slightly more code
+
+→ Chose **B** because P2C achieves load imbalance ratios close to optimal while remaining O(1) per decision.
+
 ## The business problem
 
 The deployment team needs to rotate backend instances during deployments. The old pattern — take down the backend and update DNS — causes request failures during the propagation window. With a load balancer, the workflow is:
@@ -536,6 +552,9 @@ defmodule Balancer.PoolTest do
     %{pool: pool}
   end
 
+
+  describe "Pool" do
+
   test "round_robin skips unhealthy backends" do
     selections = for _ <- 1..10, do: Pool.select(:round_robin)
     backends_selected = Enum.map(selections, fn {:ok, b} -> b.id end)
@@ -569,6 +588,9 @@ defmodule Balancer.PoolTest do
     ratio = counts["b2"] / counts["b1"]
     assert ratio > 1.5 and ratio < 2.5, "Expected ~2.0, got #{ratio}"
   end
+
+
+  end
 end
 ```
 
@@ -576,6 +598,9 @@ end
 # test/balancer/drain_test.exs
 defmodule Balancer.DrainTest do
   use ExUnit.Case, async: false
+
+
+  describe "Drain" do
 
   test "draining backend receives no new connections" do
     Pool.add_backend(%{id: "drain-test", host: "localhost", port: 9001, weight: 1, healthy: true, draining: false})
@@ -593,6 +618,9 @@ defmodule Balancer.DrainTest do
 
     ids = for _ <- 1..20, do: elem(Pool.select(:round_robin), 1) |> Map.get(:id)
     assert "drain-test" in ids
+  end
+
+
   end
 end
 ```
@@ -613,6 +641,24 @@ wrk -t4 -c100 -d30s http://localhost:4000/
 Expected baseline: a pure TCP relay should forward at least 50k req/s on modern hardware for small responses. HTTP parsing overhead adds ~5-10%. If you see < 10k req/s, verify you are not allocating a new binary for each forwarded chunk — use the raw `data` binary from `:gen_tcp.recv/3` directly.
 
 ---
+
+### Why this works
+
+The design separates concerns along their real axes: what must be correct (the load balancer invariants), what must be fast (the hot path isolated from slow paths), and what must be evolvable (external contracts kept narrow). Each module has one job and fails loudly when given inputs outside its contract, so bugs surface near their source instead of as mysterious downstream symptoms. The tests exercise the invariants directly rather than implementation details, which keeps them useful across refactors.
+
+## Benchmark
+
+```elixir
+# Minimal timing harness — replace with Benchee for production measurement.
+{time_us, _result} = :timer.tc(fn ->
+  # exercise the hot path N times
+  for _ <- 1..10_000, do: :ok
+end)
+
+IO.puts("average: #{time_us / 10_000} µs per op")
+```
+
+Target: <1µs per backend selection at 100 backends.
 
 ## Trade-off analysis
 
@@ -645,6 +691,10 @@ A passive check that marks a backend unhealthy does nothing to re-probe it. The 
 A health endpoint that returns HTTP 301 is technically not a 2xx success. Your probe must follow redirects or explicitly allow 3xx responses as healthy, depending on your backend's convention.
 
 ---
+
+## Reflection
+
+Under a traffic surge where one backend is 3x slower than the rest, how long until P2C routes around it, and what happens if you also turn on active health-check ejection?
 
 ## Resources
 

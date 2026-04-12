@@ -2,9 +2,6 @@
 
 **Project**: `user_access` — a `User` struct that supports `user[:profile][:name]` and `put_in/get_in/update_in` by implementing `Access`.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
-
 ---
 
 ## Project context
@@ -71,6 +68,30 @@ only when you've decided bracket access makes sense for your type.
 If your struct shouldn't implement `Access` but you still want nested traversal,
 you can pass an accessor function: `get_in(user, [Access.key(:profile), :name])`.
 See `Access.key/2` and `Access.all/0` for built-in accessors.
+
+---
+
+## Why implement `Access` and not just expose helper functions
+
+**Hand-rolled `User.get_profile_name/1` / `User.put_profile_name/2`.** Readable for one level of nesting; combinatorial explosion at three levels. Every new nested field ships a new helper.
+
+**`Access.key/2` accessor functions in `get_in/2` without implementing `Access` on the struct.** Works, but every call site builds the path with `[Access.key(:profile), :name]`. Verbose and leaks the "this struct doesn't support brackets" detail.
+
+**Implement `Access` on the struct (chosen).** Callers use `user[:profile][:name]`, `put_in`, and `update_in` just like they do with maps. You keep control by restricting `fetch/2` to declared fields, so typos still fail loudly.
+
+---
+
+## Design decisions
+
+**Option A — Do not implement `Access`; callers use `Access.key/2` accessors**
+- Pros: Preserves struct strictness by default.
+- Cons: Every nested traversal is verbose; consumers confuse "does it support brackets?" with "is it a map?".
+
+**Option B — Implement `Access` with a closed `fetch/2` key set and a raising `pop/2`** (chosen)
+- Pros: Bracket ergonomics; typos return `nil` via `get`, but `pop_in` on required fields raises loudly; `get_and_update/3` reroutes `:pop` into a meaningful error.
+- Cons: `user[:typo]` silently returns `nil` (bracket semantics), so external callers need to know the field set.
+
+→ Chose **B** because the ergonomic win is large and the `:pop` raise prevents the silent-corruption class of bugs.
 
 ---
 
@@ -198,6 +219,16 @@ end
 mix test
 ```
 
+### Why this works
+
+`fetch/2` restricts bracket access to the declared struct fields — unknown keys return `:error`, which `Access.get/2` turns into `nil`, matching map semantics without bypassing struct strictness. `get_and_update/3` routes a `:pop` return into an explicit `ArgumentError`, so `pop_in` on required fields fails loudly instead of silently corrupting state. Because `profile` is a plain map, `user[:profile][:name]` chains through two `Access` impls (yours + `Map`'s) without extra code.
+
+---
+
+## Benchmark
+
+<!-- benchmark N/A: bracket access vs function access is a few nanoseconds; the interesting complexity is the API ergonomics, not the cost. -->
+
 ---
 
 ## Trade-offs and production gotchas
@@ -226,6 +257,13 @@ code drift between the two styles — pick one per abstraction layer.
 If the struct's shape is opaque (an encoded blob, an internal cache), don't.
 Force callers to go through functions you control. `Access` is for value
 objects, not for stateful or invariant-heavy types.
+
+---
+
+## Reflection
+
+- You add an optional `:preferences` field. Should `pop_in(user, [:preferences])` succeed (field becomes `nil` or absent)? How does the answer change `get_and_update/3` and `pop/2`, and what invariant does each choice preserve?
+- A consumer calls `user[:profil]` (typo). Bracket access returns `nil`; dot access (`user.profil`) raises `KeyError`. In a codebase where both styles coexist, which one would you ban in code review for struct fields, and why?
 
 ---
 

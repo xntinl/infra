@@ -2,9 +2,6 @@
 
 **Project**: `migrations_lab` — a repo with three migrations that create a table, alter it (add column + index), and add a database-level constraint.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
-
 ---
 
 ## Project context
@@ -108,6 +105,38 @@ create constraint(:posts, :published_at_not_in_future,
 The constraint runs on the DB. In the changeset, `check_constraint/3`
 translates a violation into a friendly `:error` entry — the same pattern
 as `unique_constraint/2`.
+
+---
+
+## Why migrations and not raw SQL files in git
+
+Raw `.sql` files in `db/migrations/` tracked by convention work, but
+reinvent half the plumbing Ecto ships with: ordering (timestamps vs
+filenames), applied-set tracking (`schema_migrations`), rollback, and a
+testable DSL that works across Postgres/MySQL/SQLite. `Ecto.Migration`
+is that plumbing plus a DSL that's reviewable — `add :foo, :string,
+null: false` is easier to diff and reason about than the corresponding
+DDL variants across three dialects.
+
+---
+
+## Design decisions
+
+**Option A — One giant migration per feature release**
+- Pros: One PR, one file to review.
+- Cons: A failed step halfway leaves the DB in a partial state; you
+  can't roll back half the change; long-running DDL (indexes) blocks
+  shorter ones behind it.
+
+**Option B — Small, single-purpose migrations** (chosen)
+- Pros: Each migration is independently rollback-able; `change/0` works
+  for most of them; long-running ops (concurrent indexes) get their
+  own file with `@disable_ddl_transaction true`; review is focused.
+- Cons: More files; more PRs; ordering matters.
+
+→ Chose **B** because a migration that takes 30 minutes to run (index
+  on a 500M row table) must be its own file so it can be run
+  concurrently without holding a DDL lock on unrelated changes.
 
 ---
 
@@ -392,6 +421,27 @@ end
 mix test
 ```
 
+### Why this works
+
+Each migration is a timestamped file; `mix ecto.migrate` runs them in
+sort order and records applied versions in `schema_migrations`, making
+the operation idempotent. `change/0` describes the forward direction
+in a dialect Ecto can auto-reverse (`create` → `drop`, `alter add` →
+`alter remove`). `references/2` couples FK column creation and the
+constraint in one statement. `check_constraint/3` in the changeset
+bridges the DB-level guarantee (enforced even against direct SQL
+writes) to the form-level error (per-field message the UI can render).
+
+---
+
+## Benchmark
+
+<!-- benchmark N/A: migrations are one-shot DDL; the metric that
+     matters is duration on the target dataset (minutes, not
+     microseconds). Target: every migration should either complete in
+     under 100ms on a dev DB, or declare itself long-running via
+     `@disable_ddl_transaction true` and be run concurrently. -->
+
 ---
 
 ## Trade-offs and production gotchas
@@ -434,6 +484,18 @@ changeset renders the message.
 For seed data, use `priv/repo/seeds.exs` or a Mix task — not a migration.
 Migrations should be pure schema changes. Data backfills belong in a
 separate, idempotent, resumable script (you'll want to re-run them).
+
+---
+
+## Reflection
+
+- You need to add a NOT NULL column to a 500M row table. A single
+  migration is clearly wrong (it'll lock writes). Sketch the multi-
+  migration plan (add nullable → backfill → add check/NOT NULL), and
+  explain which parts belong in migrations vs a separate backfill script.
+- A junior writes a data migration that updates every row in a table
+  inside `change/0`. It runs fine in dev but OOMs prod. What's the
+  failure mode, and what's the minimal refactor to make it safe?
 
 ---
 

@@ -8,6 +8,18 @@ Your team is building a SaaS platform that handles user-submitted analytics jobs
 
 There are no shortcuts. Every subsystem must be wired with real error handling, circuit breakers, health checks, and graceful shutdown. The goal is not a demo; it is a system you would hand to an SRE on call at 3am.
 
+## Design decisions
+
+**Option A — monolithic BEAM cluster with libcluster**
+- Pros: simple deployment, trivial RPC, shared observability
+- Cons: language lock-in, single-runtime blast radius
+
+**Option B — polyglot services over gRPC with explicit contracts** (chosen)
+- Pros: teams can pick their stack, explicit versioning
+- Cons: network tax, tracing harder, more operational surface
+
+→ Chose **B** because the exercise is explicitly about what BEAM clustering gives you — it's the whole point.
+
 ## Why this is harder than the sum of its parts
 
 Individual components fail cleanly in isolation. In a composed system, failure cascades: the Storage layer's compaction pauses reads, the Gateway's circuit breaker trips, the Queue backs up, the Stream Processor's late event watermarks drift. Identifying and breaking these cascades requires understanding each component's failure modes AND the contract it offers to its callers.
@@ -1181,6 +1193,10 @@ defmodule Platform do
 end
 ```
 
+### Why this works
+
+The design isolates correctness-critical invariants from latency-critical paths and from evolution-critical contracts. Modules expose narrow interfaces and fail fast on contract violations, so bugs surface close to their source. Tests target invariants rather than implementation details, so refactors don't produce false alarms. The trade-offs are explicit in the Design decisions section, which makes the "why" auditable instead of folklore.
+
 ## Given tests
 
 ```elixir
@@ -1193,6 +1209,9 @@ defmodule Platform.GatewayTest do
     RateLimiter.init()
     :ok
   end
+
+
+  describe "Gateway" do
 
   test "rate limiter allows requests under limit" do
     for _ <- 1..5 do
@@ -1354,6 +1373,9 @@ defmodule Platform.IntegrationTest do
            |> Base.url_encode64(padding: false)
     "#{header}.#{payload}.#{sig}"
   end
+
+
+  end
 end
 ```
 
@@ -1454,6 +1476,10 @@ Platform.Bench.LoadTest.run()
 **WAL sync policy causing write latency spikes.** Calling `:file.sync/1` after every write adds ~1ms of fsync latency. Use group commit: buffer writes for 2ms, then fsync once for the batch.
 
 **Raft election timeout not randomized.** If all followers use the same timeout, they start elections simultaneously, splitting votes indefinitely. Each node must pick a random timeout in a range (300-600ms).
+
+## Reflection
+
+At what cluster size (nodes × connections) does the default full-mesh Erlang distribution stop being viable, and what's your first step — hidden nodes, Partisan, or splitting the cluster?
 
 ## Resources
 

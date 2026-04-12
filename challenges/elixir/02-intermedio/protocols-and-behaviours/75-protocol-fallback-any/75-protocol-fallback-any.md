@@ -2,9 +2,6 @@
 
 **Project**: `fallback_any_demo` — a `Describable` protocol with `@fallback_to_any true` and an `Any` impl, contrasted against the version without fallback to make the trade-offs concrete.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
-
 ---
 
 ## Project context
@@ -71,6 +68,30 @@ The ergonomic win is "everything works". The cost is "you won't notice when
 the default is wrong". Only enable fallback when the default is objectively
 correct for all foreseeable types, or when the protocol is app-internal and
 you accept the trade-off.
+
+---
+
+## Why enable `@fallback_to_any` here (and not for contract protocols)
+
+**No fallback.** Every missing impl raises `Protocol.UndefinedError`. Loud, correct, and the right default for *contract* protocols (encoding, serialization, comparison).
+
+**`@fallback_to_any true` + `Any` impl (chosen for this descriptive use case).** `Describable` is cosmetic — a debugging aid — where a weak default (`inspect/1`) is strictly better than a crash. The `Any` impl branches on `is_struct/1` so structs get a shape-aware description.
+
+The rule: fallback for descriptive/cosmetic protocols, no fallback for contractual ones.
+
+---
+
+## Design decisions
+
+**Option A — Skip `@fallback_to_any`; force every type to have a specific impl**
+- Pros: Missing impls fail at the call site, preventing silent degradation.
+- Cons: Every new type (including user structs) requires boilerplate; wrong for a descriptive protocol.
+
+**Option B — `@fallback_to_any` with an `Any` impl that branches on `is_struct/1`** (chosen)
+- Pros: Ergonomic default for every value; specific impls still override; readers can see the two defaults (struct vs everything-else) in one place.
+- Cons: Silently hides missing impls; if a specific type needs richer output you must remember to add the impl, not rely on the fallback.
+
+→ Chose **B** because `Describable` is deliberately cosmetic — a missing per-type description is a nit, not a bug, and the fallback is objectively safe via `inspect/1`.
 
 ---
 
@@ -205,6 +226,16 @@ end
 mix test
 ```
 
+### Why this works
+
+`@fallback_to_any true` is the only way Elixir accepts `defimpl Describable, for: Any` — the compiler rejects it otherwise, which is the deliberate opt-in. Dispatch precedence is "specific impl first, `Any` last", so adding `defimpl Describable, for: Float` automatically takes floats off the fallback path. Branching inside `Any` on `is_struct/1` keeps the two defaults (struct shape vs everything-else `inspect`) in a single readable place.
+
+---
+
+## Benchmark
+
+<!-- benchmark N/A: descriptive protocol with trivial impls — the interesting behavior is dispatch precedence, not throughput. -->
+
 ---
 
 ## Trade-offs and production gotchas
@@ -237,6 +268,13 @@ Any time the protocol represents a *contract* (encoding, serialization,
 comparison). Use it only for protocols that are genuinely descriptive or
 cosmetic (logging, debugging summaries), where a weak default is always
 better than a crash.
+
+---
+
+## Reflection
+
+- Take a serialization protocol (like `Jason.Encoder`) and argue whether `@fallback_to_any` would help or hurt. What class of production bugs does each choice cause — and which is more expensive to diagnose?
+- Your `Any` impl currently has two clauses (struct vs other). A teammate keeps adding branches (`is_tuple/1`, `is_map/1`, `is_list/1`). At what point should those branches become separate `defimpl` blocks instead, and what signal tells you you've crossed the line?
 
 ---
 

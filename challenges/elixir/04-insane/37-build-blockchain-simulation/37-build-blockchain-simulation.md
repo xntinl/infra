@@ -37,6 +37,22 @@ chainex/
 
 ---
 
+## Why content-addressed blocks (key = hash of block) and not sequence-numbered blocks
+
+content addressing makes block identity independent of arrival order or fork context — a block's identity is its content. Sequence numbers collide across forks and encode assumptions about linearity that don't hold.
+
+## Design decisions
+
+**Option A — list-of-blocks in a GenServer**
+- Pros: trivial to implement, easy to inspect
+- Cons: O(n) tip lookup, fork resolution is painful
+
+**Option B — DAG of blocks keyed by hash with longest-chain pointer** (chosen)
+- Pros: O(1) tip lookup, fork-choice is a single comparison
+- Cons: hash-based lookup requires careful map semantics
+
+→ Chose **B** because a chain with forks is naturally a DAG; modeling it as a list forces fork-choice logic into every traversal.
+
 ## The business problem
 
 The team needs to understand exactly how blockchain consensus prevents double-spending and how forks resolve. The simulation must be observable: you can watch two nodes mine competing blocks at the same time, see both propagate their versions, and observe the network converge to the longer chain — returning orphaned transactions to the mempool.
@@ -476,6 +492,9 @@ defmodule Chainex.BlockTest do
 
   alias Chainex.Block
 
+
+  describe "Block" do
+
   test "genesis block has all-zero previous hash" do
     g = Block.genesis()
     assert String.starts_with?(g.previous_hash, "0000000000000000")
@@ -498,6 +517,9 @@ defmodule Chainex.BlockTest do
     g = Block.genesis()
     assert Block.compute_hash(g) == Block.compute_hash(g)
   end
+
+
+  end
 end
 ```
 
@@ -507,6 +529,9 @@ defmodule Chainex.WalletTest do
   use ExUnit.Case, async: true
 
   alias Chainex.Wallet
+
+
+  describe "Wallet" do
 
   test "generates a key pair" do
     w = Wallet.generate()
@@ -533,6 +558,9 @@ defmodule Chainex.WalletTest do
     w2 = Wallet.generate()
     assert w1.address != w2.address
   end
+
+
+  end
 end
 ```
 
@@ -540,6 +568,9 @@ end
 # test/chainex/consensus_test.exs
 defmodule Chainex.ConsensusTest do
   use ExUnit.Case, async: false
+
+
+  describe "Consensus" do
 
   test "network converges after fork" do
     # Start two nodes connected to each other
@@ -562,6 +593,9 @@ defmodule Chainex.ConsensusTest do
     assert length(chain1) == 2
     assert length(chain2) == 2
     assert List.last(chain1).hash == List.last(chain2).hash
+  end
+
+
   end
 end
 ```
@@ -600,6 +634,24 @@ Expected: difficulty=2 (hash starts with "00") requires on average ~256 nonce it
 
 ---
 
+### Why this works
+
+The design separates concerns along their real axes: what must be correct (the blockchain simulation invariants), what must be fast (the hot path isolated from slow paths), and what must be evolvable (external contracts kept narrow). Each module has one job and fails loudly when given inputs outside its contract, so bugs surface near their source instead of as mysterious downstream symptoms. The tests exercise the invariants directly rather than implementation details, which keeps them useful across refactors.
+
+## Benchmark
+
+```elixir
+# Minimal timing harness — replace with Benchee for production measurement.
+{time_us, _result} = :timer.tc(fn ->
+  # exercise the hot path N times
+  for _ <- 1..10_000, do: :ok
+end)
+
+IO.puts("average: #{time_us / 10_000} µs per op")
+```
+
+Target: <5ms to validate and insert a block with 1000 transactions.
+
 ## Trade-off analysis
 
 | Aspect | Proof of Work (your impl) | Proof of Stake | Practical Byzantine Fault Tolerance |
@@ -633,6 +685,10 @@ When a peer sends a longer valid block, mining the current nonce range is wasted
 If your transaction signing function signs `inspect(transaction)` (which includes Elixir struct metadata), the signature will vary across BEAM versions. Sign a canonical binary encoding — never string representations of Elixir terms.
 
 ---
+
+## Reflection
+
+If two miners produce valid blocks 50ms apart, your node receives them in some order. Walk through the state transitions under longest-chain rule vs GHOST and note where a naive implementation double-counts transactions.
 
 ## Resources
 

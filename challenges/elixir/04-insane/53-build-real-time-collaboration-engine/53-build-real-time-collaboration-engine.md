@@ -10,6 +10,18 @@ Without a convergence algorithm, one of three bad things happens: the later-arri
 
 You will build `Collab`: a real-time collaboration engine using Operational Transformation for convergence, Phoenix Channels for presence, and document versioning with snapshots. The engine must handle offline editing, per-user undo, and section-level permissions.
 
+## Design decisions
+
+**Option A — operational transformation (OT) with a central server**
+- Pros: intuitive for text, well-known algorithms
+- Cons: OT composition is famously buggy — the literature has multiple correctness errata
+
+**Option B — CRDT (RGA or Yjs-style) with peer-to-peer sync** (chosen)
+- Pros: provably convergent, no central transform server, offline-friendly
+- Cons: larger payloads, more complex garbage collection
+
+→ Chose **B** because CRDT's convergence proof eliminates a whole class of concurrency bugs OT has been fighting for 30 years.
+
 ## Why OT and not CRDT for this exercise
 
 Both Operational Transformation and CRDTs solve the convergence problem. CRDTs (specifically YATA/Yjs) are simpler to implement correctly because they embed ordering into the operation identifier — no `transform` function required. However, OT is educationally more valuable: it forces you to understand the core convergence problem at the algorithmic level. You will implement both (OT for the server, a CRDT simulation for comparison) and observe where the implementations diverge in complexity.
@@ -396,6 +408,10 @@ defmodule Collab.OfflineMerge do
 end
 ```
 
+### Why this works
+
+The design isolates correctness-critical invariants from latency-critical paths and from evolution-critical contracts. Modules expose narrow interfaces and fail fast on contract violations, so bugs surface close to their source. Tests target invariants rather than implementation details, so refactors don't produce false alarms. The trade-offs are explicit in the Design decisions section, which makes the "why" auditable instead of folklore.
+
 ## Given tests
 
 ```elixir
@@ -405,6 +421,8 @@ defmodule Collab.OT.TransformTest do
   alias Collab.OT.{Operation, Transform, Apply}
 
   @doc "The classic OT diamond test"
+  describe "Transform" do
+
   test "convergence: insert at 0 from two users" do
     doc = "base"
     op_a = %Operation{type: :insert, pos: 0, text: "A", clock: 1, user_id: "user_a"}
@@ -523,8 +541,24 @@ defmodule Collab.PresenceTest do
     assert_receive {:cursors_update, cursors}, 1000
     refute Map.has_key?(cursors, "user-x")
   end
+
+  end
 end
 ```
+
+## Benchmark
+
+```elixir
+# Minimal timing harness — replace with Benchee for production measurement.
+{time_us, _result} = :timer.tc(fn ->
+  # exercise the hot path N times
+  for _ <- 1..10_000, do: :ok
+end)
+
+IO.puts("average: #{time_us / 10_000} µs per op")
+```
+
+Target: <1ms to apply a remote op on a 10k-character document.
 
 ## Trade-off analysis
 
@@ -547,6 +581,10 @@ end
 **Presence state not cleaned up after process crash.** If the Phoenix Channel process crashes (not a clean disconnect), the `handle_info({:DOWN, ...})` callback must be implemented to remove the user's cursor. Without this, ghost cursors appear for crashed users.
 
 **Storing the full operation log in GenServer memory without snapshots.** 10k operations on a document consuming 500 bytes each is 5MB in the GenServer's heap. A GenServer with 5MB heap gets garbage collected frequently by the BEAM, adding GC pauses to every edit. Snapshot every 100 operations to PostgreSQL and keep only the last 100 operations in memory for undo purposes.
+
+## Reflection
+
+Two users each make 500 edits while offline for a week. When they reconnect, what's the upper bound on merge time, and what's the UX if merge takes >500ms? Design the reconnection contract.
 
 ## Resources
 

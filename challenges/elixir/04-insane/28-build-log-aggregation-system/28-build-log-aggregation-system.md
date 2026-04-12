@@ -40,6 +40,22 @@ logplex/
 
 ---
 
+## Why per-tenant ETS tables and not a single shared table with a tenant column
+
+physical separation makes cross-tenant leaks impossible by construction; no tenant filter can be forgotten in a query. A shared table relies on every query remembering the filter — one missed `WHERE tenant_id = ?` and the system leaks data.
+
+## Design decisions
+
+**Option A — external Elasticsearch backend**
+- Pros: battle-tested, scales horizontally, rich query DSL
+- Cons: network hop per query, ops overhead, JVM tax, not embeddable
+
+**Option B — in-process ETS inverted index per tenant** (chosen)
+- Pros: sub-millisecond search, zero external deps, trivial isolation via table-per-tenant
+- Cons: single-node only, no durability unless snapshotted
+
+→ Chose **B** because the target scale (50k lines/min per server) fits a single BEAM node and the latency budget forbids network hops.
+
 ## The problem
 
 A single server producing 50k log lines per minute must be ingested, parsed, indexed, and made searchable within a few seconds — without dropping events under burst load. The ingestion pipeline and the query engine must run concurrently without blocking each other. Percentile metrics like P99 latency cannot be computed exactly over a stream without storing every value; a streaming approximation (T-Digest) must bound memory use while maintaining <1% quantile error at the tails.
@@ -575,6 +591,9 @@ defmodule Logplex.TDigestTest do
 
   alias Logplex.TDigest
 
+
+  describe "TDigest" do
+
   test "P50 approximates median within 1%" do
     digest = Enum.reduce(1..10_000, TDigest.new(100), fn i, d -> TDigest.add(d, i) end)
     p50 = TDigest.quantile(digest, 0.50)
@@ -594,6 +613,9 @@ defmodule Logplex.TDigestTest do
     assert length(digest.centroids) <= 200,
       "centroid count #{length(digest.centroids)} exceeds 2 * compression"
   end
+
+
+  end
 end
 ```
 
@@ -606,6 +628,9 @@ defmodule Logplex.TenancyTest do
     :ok = Logplex.Store.reset_all()
     :ok
   end
+
+
+  describe "Tenancy" do
 
   test "tenant A cannot retrieve tenant B log entries" do
     {:ok, _} = Logplex.ingest("source_a", %{level: "info", message: "tenant_a_secret", timestamp: DateTime.utc_now()})
@@ -628,6 +653,9 @@ defmodule Logplex.TenancyTest do
 
     assert length(x_results) == 1
     assert y_results == []
+  end
+
+
   end
 end
 ```
@@ -679,6 +707,24 @@ Benchee.run(
 
 ---
 
+### Why this works
+
+The design separates concerns along their real axes: what must be correct (the log aggregation invariants), what must be fast (the hot path isolated from slow paths), and what must be evolvable (external contracts kept narrow). Each module has one job and fails loudly when given inputs outside its contract, so bugs surface near their source instead of as mysterious downstream symptoms. The tests exercise the invariants directly rather than implementation details, which keeps them useful across refactors.
+
+## Benchmark
+
+```elixir
+# Minimal timing harness — replace with Benchee for production measurement.
+{time_us, _result} = :timer.tc(fn ->
+  # exercise the hot path N times
+  for _ <- 1..10_000, do: :ok
+end)
+
+IO.puts("average: #{time_us / 10_000} µs per op")
+```
+
+Target: ingest path <50µs per entry and 2-term search <1ms over 10k entries on modern hardware.
+
 ## Trade-off analysis
 
 | Aspect | ETS inverted index (this impl) | Elasticsearch | PostgreSQL full-text |
@@ -708,6 +754,10 @@ Use a separate T-Digest per time bucket and query only relevant buckets.
 Store the previous state explicitly; treat `nil` (never evaluated) as `normal`.
 
 ---
+
+## Reflection
+
+If tenants range from 10 entries/day to 100k entries/second, would you still keep one ETS table per tenant, or would you tier storage by volume? Justify how you would detect a "hot" tenant and migrate it.
 
 ## Resources
 

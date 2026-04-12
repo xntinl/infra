@@ -12,6 +12,18 @@ The only correct foundation is PostgreSQL: job insertion is transactional with t
 
 You will build `JobQueue`: a production-quality background job system backed by PostgreSQL.
 
+## Design decisions
+
+**Option A — in-memory GenServer-based queue**
+- Pros: sub-ms enqueue, trivial implementation
+- Cons: jobs lost on restart — unusable for production
+
+**Option B — Postgres-backed queue with SKIP LOCKED and advisory locks** (chosen)
+- Pros: crash-safe, survives deploys, transactional enqueue with business data
+- Cons: higher per-job overhead than in-memory
+
+→ Chose **B** because any production queue must survive a node restart; durability is the minimum bar.
+
 ## Why `FOR UPDATE SKIP LOCKED` and not advisory locks
 
 PostgreSQL advisory locks are manual; the application must release them explicitly. If a worker crashes, the advisory lock is held until the session closes. `FOR UPDATE SKIP LOCKED` works at the row level: when a worker claims a job row, the row is locked for the duration of the worker's transaction. Other workers trying to claim the same job see it as locked and skip it (SKIP LOCKED). When the worker commits (marking the job `executing`), the lock is released and the job is no longer available for claiming. The lock lifetime equals the transaction duration — no manual cleanup.
@@ -505,6 +517,10 @@ defmodule JobQueue.Plugins.OrphanRescue do
 end
 ```
 
+### Why this works
+
+The design isolates correctness-critical invariants from latency-critical paths and from evolution-critical contracts. Modules expose narrow interfaces and fail fast on contract violations, so bugs surface close to their source. Tests target invariants rather than implementation details, so refactors don't produce false alarms. The trade-offs are explicit in the Design decisions section, which makes the "why" auditable instead of folklore.
+
 ## Given tests
 
 ```elixir
@@ -516,6 +532,9 @@ defmodule JobQueue.Integration.TransactionalEnqueueTest do
     use JobQueue.Worker, queue: "test"
     def perform(_job), do: :ok
   end
+
+
+  describe "TransactionalEnqueue" do
 
   test "job does not exist when transaction rolls back" do
     result = JobQueue.Repo.transaction(fn ->
@@ -642,6 +661,9 @@ defmodule JobQueue.UniquenessTest do
     refute job2.conflict
     assert job2.id != job.id
   end
+
+
+  end
 end
 ```
 
@@ -708,6 +730,10 @@ JobQueue.Bench.Throughput.run()
 **Cron scheduler running on all nodes without deduplication.** Three nodes, each running a cron scheduler, each inserting a job for the same minute = three copies of the same job. The uniqueness constraint must include the cron expression and the truncated minute timestamp as the unique key. All three inserts compete for the unique index; only one wins.
 
 **TTL on unique_key not matching the unique window.** If a job's `unique` window is 60 seconds but the job can stay in `executing` state for 10 minutes (due to a slow worker), a second enqueue within the unique window is correctly blocked. But after the window expires, a third enqueue is allowed — even if the original job is still running. This is correct per spec but may surprise callers. Document that `unique` is a window from insertion time, not from completion time.
+
+## Reflection
+
+Your queue suddenly has 10M jobs backed up because a downstream API has been down for an hour. How does your system catch up without DoS'ing the recovering API, and what's your SLA to the producer during the backlog?
 
 ## Resources
 

@@ -2,9 +2,6 @@
 
 **Project**: `partition_sup_demo` — use `PartitionSupervisor` (Elixir 1.14+) to remove a single-process bottleneck.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 3–4 hours
-
 ---
 
 ## Project context
@@ -84,7 +81,38 @@ When partition 3 crashes, `Supervisor` restarts it. During the restart window (t
 
 ---
 
+## Why `PartitionSupervisor` and not ETS `:update_counter`
+
+ETS with `:update_counter` gives O(1) atomic increments and beats any GenServer on raw throughput — but it is *just* a number. The counter participates in rate-limit decisions that need per-tenant ordering, telemetry hooks on each increment, and an eventual flush-to-DB. ETS forces you to bolt on a separate process for those concerns, recreating the serialization point you were trying to avoid. `PartitionSupervisor` keeps the GenServer contract (serial, stateful, attachable side effects) while spreading load across schedulers. You lose ~2× raw throughput vs. ETS, but you keep the abstraction.
+
+---
+
+## Design decisions
+
+**Option A — hand-rolled N-copy Registry with manual hashing**
+- Pros: arbitrary routing (consistent hashing, jump hash, custom load metric); fine-grained control over rebalance semantics.
+- Cons: every call site rewrites the routing boilerplate; Registry-lookup cost per call; more moving parts.
+
+**Option B — `PartitionSupervisor` with `{:via, PartitionSupervisor, ...}`** (chosen)
+- Pros: stock OTP primitive since Elixir 1.14; routing is a `phash2` + named lookup; child specs stay vanilla; consistent behaviour across teams.
+- Cons: no rebalance on partition count change (reshard = full migration); no built-in hot-key mitigation; single-node only.
+
+→ Chose **B** because the workload is single-node, partition count is chosen at boot, and the uniform ergonomics win against the flexibility that a hand-rolled registry would provide.
+
+---
+
 ## Implementation
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defp deps do
+  [
+    {:benchee, "~> 1.3", only: :dev}
+  ]
+end
+```
+
 
 ### Step 1: Application supervisor
 
@@ -244,6 +272,10 @@ Expected on an 8-core machine with `parallel: 8`:
 | Single GenServer | ~4–8 k ips | ~25 ms |
 | Partitioned (×8) | ~45–70 k ips | ~2 ms |
 
+### Why this works
+
+`{:via, PartitionSupervisor, {name, key}}` resolves deterministically via `:erlang.phash2(key, N)`: no registry lookup, no hop, just a hash. Each partition is an independent scheduler citizen, so the mailbox bottleneck that pinned one core becomes N mailboxes across N cores. The cost is a single additional indirection per call (~0.3 µs), dwarfed by the contention relief. Partition count = `System.schedulers_online/0` keeps each partition on its own scheduler without oversubscription.
+
 ---
 
 ## Trade-offs and production gotchas
@@ -266,7 +298,7 @@ Expected on an 8-core machine with `parallel: 8`:
 
 ---
 
-## Performance notes
+## Benchmark
 
 Measure the mailbox before and after:
 
@@ -279,6 +311,15 @@ end
 On a saturated single counter you'll see queue lengths in the hundreds. With partitions equal to schedulers you should see single-digit queues across all partitions under the same load — that's your signal the bottleneck moved.
 
 The cost of `{:via, PartitionSupervisor, ...}` resolution is a single `phash2` + an ETS lookup, sub-microsecond.
+
+Target: partition mailbox ≤ 20 under peak load; p99 call latency < 5 ms; via-routing overhead ≤ 1 µs per call.
+
+---
+
+## Reflection
+
+1. One tenant (`"acme"`) sends 80% of your traffic and keeps hashing onto partition 3. You've ruled out adding a second partition tier. Would you compound the key with a request counter, detect hot tenants and route them to a dedicated pool, or migrate `"acme"`-only traffic to ETS? What observability do you need to decide?
+2. You need to go from 8 partitions to 16 for a bigger host. The state is in-memory only. Describe a zero-downtime reshard procedure that preserves per-tenant counts, and identify the exact window during which double-counts or missed increments can occur.
 
 ---
 

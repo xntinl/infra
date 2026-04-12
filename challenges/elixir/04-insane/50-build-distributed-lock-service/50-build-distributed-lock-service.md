@@ -10,6 +10,18 @@ The problem with `:global`: it uses two-phase locking with no progress guarantee
 
 You will build `Locksmith`: a quorum-based distributed lock service where acquiring a lock requires agreement from a majority (2 of 3) of nodes. Locks are lease-based with TTL: a dead holder's lock expires automatically. Watches enable leader-election without polling.
 
+## Design decisions
+
+**Option A — single-leader lock manager**
+- Pros: trivially linearizable, simple to reason about
+- Cons: leader is a SPOF and a bottleneck
+
+**Option B — Raft-replicated lock state with lease-based client leases** (chosen)
+- Pros: HA, linearizable, leases survive client crashes
+- Cons: Raft adds latency on every lock acquire
+
+→ Chose **B** because a lock service that loses locks on node failure is worse than no lock service — HA is mandatory.
+
 ## Why quorum (majority) and not consensus of all nodes
 
 Requiring all 3 nodes to agree makes the service unavailable if any one node is down. Requiring only a majority (2 of 3) tolerates one node failure. The key property: any two quorums share at least one node in common. If node A grants a lock to process X with quorum {A, B}, and node C later tries to grant the same lock to process Y, C must contact at least one of {A, B} — and that node will report the lock is held. The overlap guarantees no two processes can hold the lock simultaneously.
@@ -695,6 +707,10 @@ defmodule Locksmith do
 end
 ```
 
+### Why this works
+
+The design isolates correctness-critical invariants from latency-critical paths and from evolution-critical contracts. Modules expose narrow interfaces and fail fast on contract violations, so bugs surface close to their source. Tests target invariants rather than implementation details, so refactors don't produce false alarms. The trade-offs are explicit in the Design decisions section, which makes the "why" auditable instead of folklore.
+
 ## Given tests
 
 ```elixir
@@ -702,6 +718,9 @@ end
 defmodule Locksmith.ConcurrentTest do
   use ExUnit.Case, async: false
   alias Locksmith.Quorum
+
+
+  describe "Concurrent" do
 
   test "exactly one of N concurrent acquire attempts succeeds" do
     lock_name = "test-lock-#{System.unique_integer()}"
@@ -806,6 +825,9 @@ defmodule Locksmith.QuorumTest do
     assert {:ok, new_lease} = Locksmith.Quorum.renew(lease, 5_000)
     assert new_lease.expires_at > lease.expires_at
   end
+
+
+  end
 end
 ```
 
@@ -878,6 +900,10 @@ Locksmith.Bench.Contention.run()
 **Not testing split-brain explicitly.** The split-brain scenario requires two separate clusters each with a majority. In a test, simulate this by starting 4 nodes and using `:net_kernel.disconnect/1` to partition {A, B} from {C, D}. Verify that {A, B} can grant a lock and {C, D} can grant the same lock (it should fail in your quorum implementation but passing this test is what validates the design).
 
 **Storing watch subscriptions only on one node.** If a watcher is on node A and the lock is managed by node B, the watch event must reach node A. Use `send(watcher_pid, event)` directly — BEAM message passing is location-transparent across connected nodes. But if the network is partitioned, the event may be dropped. Buffer events in the LockManager for N seconds and replay on reconnect.
+
+## Reflection
+
+A client acquires a lock, GC-pauses for 30 seconds, then wakes up and mutates the resource. Your lease was 10s. What prevents the pause-and-write from corrupting state, and what happens if the client ignores fencing?
 
 ## Resources
 

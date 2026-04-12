@@ -4,9 +4,6 @@
 in-memory data structures with `:timer.tc/1` and Benchee, then interpret
 the results honestly.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
-
 ---
 
 ## Project context
@@ -23,6 +20,20 @@ This exercise writes a benchmark that pins down the crossover points on
 your machine. By the end you'll have concrete numbers for: at what size
 is `Keyword` no longer acceptable, at what size `Map` overtakes ETS, and
 vice versa.
+
+## Why Benchee + :timer.tc and not X
+
+**Why not just eyeball two implementations?** Microbenchmark gut feeling is
+consistently wrong. Without warmup and iteration counts, you're measuring
+scheduler jitter and cache state, not the code.
+
+**Why not pick one tool?** `:timer.tc` is the right size for 1ms+ operations
+and is in the standard library — no deps. Benchee handles sub-microsecond
+ops, memory, and percentiles. This exercise uses both deliberately.
+
+**Why `Keyword` at all if it's obviously slower?** Because it's idiomatic
+for small option lists and beginners sometimes reach for it as a store. The
+benchmark quantifies exactly when that stops being acceptable.
 
 Project structure:
 
@@ -95,6 +106,21 @@ any "one writer, many readers" shape.
   GC pressure. ETS is often the saner choice even for a single owner.
 
 Your numbers will vary. Run the benchmark.
+
+---
+
+## Design decisions
+
+**Option A — Single bench file with one tool (Benchee)**
+- Pros: Clean, one source of truth.
+- Cons: Hides the fact that `:timer.tc` exists and is often fine.
+
+**Option B — Tests use `:timer.tc`, bench file uses Benchee** (chosen)
+- Pros: Shows both tools at their correct job (coarse asserts vs fine
+  profiling). Tests can sanity-check the ranking without a deps install.
+- Cons: Two code paths to understand.
+
+→ Chose **B** because teaching the tool selection is half the lesson.
 
 ---
 
@@ -278,6 +304,35 @@ mix test
 mix run bench/lookup_bench.exs
 ```
 
+### Why this works
+
+The three structures have fundamentally different access paths: `Keyword` is
+a linear list traversal (O(N)), `Map` uses a hash-array-mapped-trie rooted in
+the caller's heap (O(log N) but effectively constant for small N, no copy),
+and ETS walks a hash table in its own heap then copies the tuple out. Benchee
+isolates these by warming up the JIT/cache and measuring distribution; the
+`:timer.tc` test asserts only on gross ratios (3× or more) so CI jitter
+doesn't make it flaky.
+
+---
+
+## Benchmark
+
+The whole exercise **is** the benchmark. Target numbers (hardware-dependent,
+Apple M-series / modern x86):
+
+```
+N = 100
+  keyword:  ~300 ns/lookup
+  map:      ~20  ns/lookup
+  ets:      ~350 ns/lookup   (copy cost dominates at small N)
+
+N = 10_000
+  keyword:  ~30_000 ns/lookup  (catastrophic)
+  map:      ~40 ns/lookup
+  ets:      ~400 ns/lookup
+```
+
 ---
 
 ## Trade-offs and production gotchas
@@ -321,6 +376,18 @@ iterations if you want worst-case cache behavior.
 If your structure fits in a few hundred entries and is read a few times
 per request, any of the three is fine; the decision should be driven by
 access pattern (shared? mutable?) and code clarity, not by nanoseconds.
+
+---
+
+## Reflection
+
+- Your cache currently lives in a GenServer state `Map` and is read by 30
+  worker processes on every request. The request latency is dominated by
+  `GenServer.call`. What are your realistic options, and what numbers
+  would you measure before switching?
+- When Benchee reports "near-zero memory per iteration" for an ETS bench,
+  what does that actually mean, and why is it misleading? How would you
+  measure the real memory cost?
 
 ---
 

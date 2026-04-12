@@ -4,9 +4,6 @@
 concurrent processes using `:ets.update_counter/3`, then compare it with
 the OTP 21+ `:counters` module for the same workload.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
-
 ---
 
 ## Project context
@@ -30,6 +27,20 @@ counter-only workloads and they don't need a table at all.
 
 This exercise builds both, then races 100 processes bumping them simultaneously
 to prove the atomicity holds.
+
+## Why `update_counter` / `:counters` and not X
+
+**Why not `Agent` or a GenServer?** Every increment would serialize through
+one process. Under heavy concurrent writers, the mailbox becomes the
+bottleneck — you'd trade atomicity (which the callbacks provide) for
+throughput you didn't want to lose.
+
+**Why not `Application.put_env` or `:persistent_term`?** Neither is atomic
+under concurrent writers. `:persistent_term` is read-optimized and pays a
+global GC cost on writes; using it as a counter is actively harmful.
+
+**Why not a plain lookup + insert dance?** Because it's a race — the exercise
+includes a failing test demonstrating this exact antipattern.
 
 Project structure:
 
@@ -102,6 +113,22 @@ value will be less than 1000. If you spawn them each doing
 `update_counter/3`, the final value is exactly 1000. That's the guarantee
 in action, and it's worth writing the bad version at least once to feel
 the pain.
+
+---
+
+## Design decisions
+
+**Option A — ETS `:set` + `update_counter/3`**
+- Pros: Dynamic keys (per-user, per-route, per-tenant); returns post-value.
+- Cons: Slight overhead per op vs `:counters`; still needs a table and owner.
+
+**Option B — `:counters` module** (chosen for fixed-schema hot paths)
+- Pros: Lock-free with `:write_concurrency`; zero table overhead.
+- Cons: Fixed size at creation; indices are ints, not arbitrary terms.
+
+→ This exercise implements **both**. In real code, pick B when the counter
+schema is static (HTTP status buckets, scheduler-indexed metrics); pick A
+when the keyspace is dynamic.
 
 ---
 
@@ -272,6 +299,44 @@ end
 mix test
 ```
 
+### Why this works
+
+`:ets.update_counter/3` is implemented as a single BEAM operation that
+acquires the row lock, reads the element at `pos`, applies the increment,
+writes back, and releases — all without yielding. No other process can
+observe the intermediate state, which is exactly what atomicity means.
+`:counters` goes a step further: per-scheduler shards eliminate the lock
+contention entirely for the write path, at the cost of slightly weaker
+read consistency.
+
+---
+
+## Benchmark
+
+```elixir
+# Compare throughput of the three flavors under 1000 concurrent writers.
+n = 1_000
+
+t = EtsCountersDemo.new_ets_table()
+{us_atomic, _} = :timer.tc(fn ->
+  Task.async_stream(1..n, fn _ -> EtsCountersDemo.atomic_inc(t, :k) end, max_concurrency: 100)
+  |> Stream.run()
+end)
+
+ref = EtsCountersDemo.new_counters(1)
+{us_counters, _} = :timer.tc(fn ->
+  Task.async_stream(1..n, fn _ -> EtsCountersDemo.counters_inc(ref, 1) end, max_concurrency: 100)
+  |> Stream.run()
+end)
+
+IO.puts("ets update_counter: #{us_atomic}µs  :counters: #{us_counters}µs")
+:ets.delete(t)
+```
+
+Target esperado: `:counters` es típicamente 2–5× más rápido que
+`:ets.update_counter/3` bajo alta concurrencia (>32 writers). Sin
+contención, la diferencia es marginal (<10%).
+
 ---
 
 ## Trade-offs and production gotchas
@@ -310,6 +375,17 @@ tuples per key — "the" counter is ambiguous. OTP will raise.
 - Fixed schema, maximum throughput → `:counters`.
 - Lightly contended, per-process counters → plain integers in state.
 - Long-term time series → `:telemetry` + Prometheus/StatsD, not ETS.
+
+---
+
+## Reflection
+
+- Your app tracks one counter per active session (100k sessions, bumped on
+  every request). Would you pick ETS `update_counter` or a `:counters`
+  array, and how would you map session IDs to slots if you chose the latter?
+- `:counters` with `:write_concurrency` can return slightly stale reads.
+  Design a scenario where that's acceptable, and one where it's a bug.
+  What's the tell?
 
 ---
 

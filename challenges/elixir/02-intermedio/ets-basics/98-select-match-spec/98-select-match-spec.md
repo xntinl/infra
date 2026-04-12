@@ -4,14 +4,11 @@
 compile them to match specs with `:ets.fun2ms/1`, and run them against ETS
 with `:ets.select/2`.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
-
 ---
 
 ## Project context
 
-Match specs (exercise 96 introduced them) are the full query language of ETS.
+Match specs are the full query language of ETS.
 They support guards, projections, expression bodies — everything. But
 writing them by hand is error-prone and unreadable. The OTP team's answer is
 `:ets.fun2ms/1`: a **parse-transform** (Erlang) / **special form** (Elixir via
@@ -32,6 +29,22 @@ ets:fun2ms(fun({Id, Name, Age}) when Age >= 18 -> {Id, Name} end).
 …and you get the match spec out. In Elixir, since `fun2ms` needs a parse
 transform, the idiomatic wrapper is the `Ex2ms` library, which provides a
 `fun` macro that does the same job at compile time. This exercise uses both.
+
+## Why `fun2ms` / Ex2ms and not hand-written specs
+
+**Why not just always hand-write match specs?** Because the shape is
+error-prone: double-braces for tuple literals, prefix operators
+(`{:>=, x, y}` not `x >= y`), atoms quoted as `:"$1"`. A typo compiles and
+fails at runtime with `:badarg`.
+
+**Why not skip match specs and filter in Elixir?** Filtering after `select/2`
+with no guards means copying every row out of ETS before rejection — and on
+a million-row table that's the dominant cost. Guards in match specs filter
+inside the engine.
+
+**Why both in this exercise?** You need to **read** raw specs (they show up
+in OTP internals, `:dbg` traces, library code) even when you **write** via
+`Ex2ms` in your own code.
 
 Project structure:
 
@@ -97,6 +110,22 @@ If you write something inexpressible (e.g. call a user function in the
 guard), `fun2ms` raises at compile time with a message. That's one of its
 biggest wins over hand-written specs, which fail silently at runtime with
 `:badarg`.
+
+---
+
+## Design decisions
+
+**Option A — Use `:ets.fun2ms/1` directly**
+- Pros: No library dependency; uses OTP's parse transform.
+- Cons: Elixir doesn't run Erlang parse transforms, so `:ets.fun2ms` only
+  works at runtime with a literal fun, which is fragile.
+
+**Option B — Use `Ex2ms.fun` macro** (chosen)
+- Pros: Compile-time AST transform; errors caught at compile time.
+- Cons: Adds a tiny deps entry (`{:ex2ms, "~> 1.6"}`).
+
+→ Chose **B** because compile-time validation of the spec is the whole point,
+and the dependency is trivial.
 
 ---
 
@@ -264,6 +293,40 @@ mix deps.get
 mix test
 ```
 
+### Why this works
+
+`:ets.select/2` accepts a match spec — a list of `{head, guards, body}`
+triples. The engine scans tuples, tests each against the head pattern and
+guards, and for matches constructs the body term. Because guards run inside
+the ETS engine (in C), filtering is fast and only matching rows are copied
+out to the caller's heap. `Ex2ms.fun` compiles a familiar `fn ... -> ... end`
+into that triple-list at compile time, so you get BEAM-level error reporting
+instead of runtime `:badarg`.
+
+---
+
+## Benchmark
+
+```elixir
+t = :ets.new(:p, [:set, :public])
+for i <- 1..100_000, do: :ets.insert(t, {i, "name_#{i}", rem(i, 100)})
+
+require Ex2ms
+ms = Ex2ms.fun do {id, name, age} when age >= 50 -> {id, name} end
+
+{us_spec, _} = :timer.tc(fn -> :ets.select(t, ms) end)
+{us_elixir, _} = :timer.tc(fn ->
+  :ets.tab2list(t) |> Enum.filter(fn {_, _, age} -> age >= 50 end)
+end)
+
+IO.puts("select+spec: #{us_spec}µs  tab2list+filter: #{us_elixir}µs")
+:ets.delete(t)
+```
+
+Target esperado: el filtro con match spec debería ser 3–10× más rápido para
+un ratio de match de ~50%, porque evita copiar las filas descartadas al
+heap del caller.
+
 ---
 
 ## Trade-offs and production gotchas
@@ -298,10 +361,22 @@ at that point, `lookup/2` is usually clearer.
 
 **6. When NOT to use match specs**
 - Key is known → `lookup/2`.
-- You only need shape filter, no guards → `match_object/2` (exercise 97).
+- You only need shape filter, no guards → `match_object/2`.
 - Your filtering is complex or involves user functions → `:ets.foldl/3`
   with an Elixir function body. Slower in theory, saner to read and debug
   in practice for rare operations.
+
+---
+
+## Reflection
+
+- Imagine you need to run the same `Ex2ms.fun` query with a different `age`
+  threshold each time. The threshold must be a variable. How do you thread it
+  into the match spec, and what are the options for runtime-parameterized
+  specs?
+- A match spec guard is hitting a complex business rule ("adults in tier-2
+  tenants with verified email"). At what point does the readability cost
+  outweigh the performance win, and what's your fallback pattern?
 
 ---
 

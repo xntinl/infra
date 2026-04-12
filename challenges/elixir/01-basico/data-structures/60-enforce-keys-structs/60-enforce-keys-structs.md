@@ -1,7 +1,5 @@
 # Structs with @enforce_keys for Required Fields
 
-**Difficulty**: ★☆☆☆☆
-**Time**: 1–1.5 hours
 **Project**: `user_signup` — a struct-based signup record with required and optional fields
 
 ---
@@ -50,6 +48,28 @@ Structs do NOT implement the `Access` behaviour by default — `user[:email]` fa
 You can derive it with `@derive {Access, ...}` or use `Map.get/2`, `get_in/2`, pattern
 matching. For public structs, deriving `Access` makes the API friendlier; for internal
 structs, the lack of `Access` prevents accidental misuse.
+
+---
+
+## Why @enforce_keys and not runtime validation
+
+A runtime validator (`validate(struct)`) catches missing fields only when the function is called — potentially far from the construction site, in a different module, after the bad struct has traveled through several layers. `@enforce_keys` fails at the literal `%UserSignup{...}` expression, so the stack trace points to the exact line that created the invalid state. Runtime checks still have a role for cross-field invariants (e.g. "end_date must be after start_date"), but presence checks belong to the compiler.
+
+Ecto changesets are the right tool for external input with accumulated errors, format rules, and uniqueness constraints — but they are heavy for internal domain records and add a dependency you may not need.
+
+---
+
+## Design decisions
+
+**Option A — plain `defstruct` + runtime `validate/1` function**
+- Pros: no compile-time rigidity; easy to build partial structs in tests.
+- Cons: missing fields only discovered when `validate/1` is called; constructors scattered; stack traces point to the validator, not to the buggy caller.
+
+**Option B — `@enforce_keys` + `from_params/1` safe constructor** (chosen)
+- Pros: missing fields fail at compile site with precise location; safe constructor returns tagged tuple for I/O boundaries; internal code uses the struct literal directly and gets instant feedback.
+- Cons: cannot build incomplete structs for tests without a helper; refactoring required fields is a breaking change for every call site.
+
+Chose **B** because the domain invariant (`email` and `password_hash` must exist) is worth a breaking change when it shifts — call-site errors are cheap; a `nil` email reaching the notification worker is not.
 
 ---
 
@@ -168,6 +188,34 @@ mix test
 
 All tests must pass.
 
+### Why this works
+
+`@enforce_keys` hooks into the struct literal expansion: any `%UserSignup{...}` that omits a required key raises at the expression site, not at an opaque function deep in the call stack. `from_params/1` wraps that behaviour for untrusted input — it atomizes string keys safely with `String.to_existing_atom/1`, collects missing required keys into a single tagged-tuple error, and never lets the compile-time exception escape the I/O boundary. Internal code stays explicit with struct literals; external code stays safe with the constructor.
+
+---
+
+## Benchmark
+
+```elixir
+# bench.exs
+defmodule Bench do
+  def run do
+    params = %{"email" => "a@b.com", "password_hash" => "x"}
+
+    {enforce_us, _} =
+      :timer.tc(fn ->
+        Enum.each(1..100_000, fn _ -> UserSignup.from_params(params) end)
+      end)
+
+    IO.puts("from_params x100k: #{enforce_us} µs (#{enforce_us / 100_000} µs/call)")
+  end
+end
+
+Bench.run()
+```
+
+Target: under 5 µs per `from_params/1` call on modern hardware — most of the cost is the atom conversion and map reshape, not the `@enforce_keys` check (which is effectively free at runtime because it runs at the struct literal expansion).
+
 ---
 
 ## Trade-offs
@@ -210,6 +258,13 @@ type information. Add `@type t` even for trivial structs.
 - **Short-lived data between two functions in the same module**: a plain map is lighter.
 - **Heterogeneous collections**: if the shape varies, use a tagged tuple or a sum type, not a struct with half the fields nil.
 - **Wire formats** (JSON, protobuf): decode into a struct at the edge, but do not define a struct that mirrors a protocol 1:1 — that couples your domain to the wire format.
+
+---
+
+## Reflection
+
+1. If a new required field (`country_code`) must be added to `UserSignup`, every existing call site that uses the struct literal breaks at compile time. Is that a feature or a defect? How would your answer change if the struct is used in 200 places across 5 applications?
+2. `from_params/1` returns `{:error, {:missing, [...]}}` with a flat list of missing keys. Would you change the shape if the caller needs to render field-level errors in a signup form, or keep the boundary minimal and let the presentation layer translate?
 
 ---
 

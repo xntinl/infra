@@ -2,9 +2,6 @@
 
 **Project**: `changeset_lab` — a schemaless and a schema-backed changeset exploring `cast`, `validate_required`, `validate_format`, and the difference between `valid?` and `changes`.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
-
 ---
 
 ## Project context
@@ -103,6 +100,39 @@ validation that doesn't map to a table.
 types = %{name: :string, age: :integer}
 {%{}, types} |> cast(attrs, Map.keys(types)) |> validate_required([:name])
 ```
+
+---
+
+## Why changesets and not ad-hoc validation
+
+A `with`-chain of `Map.fetch`, pattern matches, and regex checks works
+for one field but collapses under real forms: you need to collect
+multiple errors (not bail on the first), preserve the bad input for
+re-rendering, distinguish "not provided" from "provided but invalid",
+and translate DB constraint violations into the same error list.
+Changesets solve all four in one data structure designed around that
+exact workflow.
+
+---
+
+## Design decisions
+
+**Option A — One big `validate_all/1` function returning `{:ok, map} | {:error, list}`**
+- Pros: Simple signature; no Ecto dep needed; familiar to most devs.
+- Cons: Errors are a flat list — hard to bind to form fields; no
+  distinction between cast failure and validation failure; no hook
+  for DB constraint errors.
+
+**Option B — `Ecto.Changeset` pipeline (cast + validate_*)** (chosen)
+- Pros: Errors are keyed by field (form-friendly); `changes` preserves
+  bad input; `valid?` and `changes` are orthogonal and meaningful;
+  constraint hooks integrate with `Repo.insert/update` cleanly.
+- Cons: Requires the `:ecto` dep even for schemaless use; the API is
+  learned, not intuitive (`cast` vs `validate_required` surprises).
+
+→ Chose **B** because any form that grows beyond three fields hits the
+  limits of ad-hoc validation fast; changesets scale from schemaless
+  forms to full DB-backed writes without rewriting the validation layer.
 
 ---
 
@@ -350,6 +380,26 @@ end
 mix test
 ```
 
+### Why this works
+
+`cast/3` filters attributes against a whitelist — the mass-assignment
+guard. `validate_*` functions append to the changeset's `errors` list
+without bailing, so one pass yields every problem at once. `valid?` is
+derived from `errors == []`, and `changes` carries whatever was
+accepted (including bad-but-castable values) so forms can re-render
+the user's input next to the error message. Schemaless mode uses the
+same pipeline with an in-memory type map, so "form that doesn't map to
+a table" reuses the same machinery.
+
+---
+
+## Benchmark
+
+<!-- benchmark N/A: changeset evaluation is microseconds-per-field on
+     modern hardware; wall time is dominated by DB round-trips, not
+     validation. Target: a 10-field signup changeset runs in well under
+     100µs end-to-end. -->
+
 ---
 
 ## Trade-offs and production gotchas
@@ -368,7 +418,7 @@ you expected "must always be in this submission", it's surprising.
 `unique_constraint(:email)` does not check uniqueness in the changeset.
 It attaches a pattern that translates a DB `unique_violation` into a
 changeset error during `Repo.insert`. If the index doesn't exist, the
-violation never fires, and duplicates slip through. See exercise 129.
+violation never fires, and duplicates slip through.
 
 **4. An empty `changes` still returns `{:ok, record}` on update**
 `Repo.update/1` short-circuits when there are no changes. If you rely on
@@ -386,6 +436,18 @@ For internal data transformations where you control both sides, changesets
 are overhead. For CLI arg parsing, `OptionParser` is simpler. For one-off
 coercions, `Ecto.Type.cast/2` directly beats a full changeset. Changesets
 shine for *external* input: HTTP forms, JSON bodies, CSV rows.
+
+---
+
+## Reflection
+
+- Your signup form has 20 fields across three tabs. Would you use one
+  changeset or three? What are the tradeoffs in error display,
+  per-tab persistence, and the "user went back and forth" case?
+- A legacy endpoint accepts a payload with inconsistent key casing
+  (`email`, `Email`, `EMAIL`). Cast only accepts predictable keys.
+  How would you normalize input before casting without swallowing the
+  silent-drop safety cast provides?
 
 ---
 

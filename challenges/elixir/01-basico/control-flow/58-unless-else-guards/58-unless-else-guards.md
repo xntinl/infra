@@ -2,9 +2,6 @@
 
 **Project**: `feature_gate` — decides whether a user sees a feature based on env + role + rollout %
 
-**Difficulty**: ★★☆☆☆
-**Estimated time**: 1–2 hours
-
 ---
 
 ## Project structure
@@ -58,6 +55,18 @@ all pass. It is a crisp demo of compound guards in a function head, plus `unless
 "skip rollout check entirely for admins" shortcut.
 
 ---
+
+## Design decisions
+
+**Option A — `if` with compound guards (preferred form)**
+- Pros: Positive condition reads naturally, `else` branch is obvious
+- Cons: Slightly longer for the simplest "do X only if not Y" case
+
+**Option B — `unless ... else` with negated condition** (chosen)
+- Pros: Reads well for the simplest single-condition case
+- Cons: With `else`, the reader mentally double-negates; compound conditions become unreadable
+
+→ Chose **A** because compound boolean logic with an `else` branch is where `unless` actively hurts readability. Use B only for one-liners without `else`.
 
 ## Implementation
 
@@ -201,6 +210,26 @@ All 11 tests pass.
 
 ---
 
+### Why this works
+
+The approach chosen above keeps the core logic **pure, pattern-matchable, and testable**. Each step is a small, named transformation with an explicit return shape, so adding a new case means adding a new clause — not editing a branching block. Failures are data (`{:error, reason}`), not control-flow, which keeps the hot path linear and the error path explicit.
+
+## Benchmark
+
+```elixir
+{time_us, _result} =
+  :timer.tc(fn ->
+    for _ <- 1..1_000 do
+      # representative call of can_see?/2 over 1M users
+      :ok
+    end
+  end)
+
+IO.puts("Avg: #{time_us / 1_000} µs/call")
+```
+
+Target: **< 15ms total; rollout bucketing is the hot path and should stay under 50ns**.
+
 ## Trade-offs
 
 | Construct | Reads best for |
@@ -243,6 +272,12 @@ strictly require booleans; `&&`/`||` short-circuit on truthiness. Mixing them bi
 across types). Always pair with `is_integer/1` or similar when types matter.
 
 ---
+
+## Reflection
+
+Your team has a style rule: `unless` is banned except for single-line statements without `else`. Is that too strict? Give a case where the rule helps and one where it forces awkward code.
+
+Compound guards combine `and`/`or`/`not`. What's the BEAM-level difference between `and` and `&&`, and when does it matter for a feature-gate hot path?
 
 ## Resources
 
