@@ -1,369 +1,306 @@
-# Debugging: IO.inspect, dbg, and Observability
+# Debugging with `IO.inspect`, `dbg/2`, and `IEx.pry`
 
-## The two debugging modes
+**Project**: `debug_tools` — a tiny pipeline where you practice the three
+everyday Elixir debugging tools without reaching for a debugger.
 
-**Interactive debugging** (`iex -S mix`): you are at the keyboard, the system is running,
-you can inject calls and inspect live state. Tools: `:sys.get_state`, `Process.info`,
-`:observer.start()`.
-
-**Code-level debugging** (deployed staging, test failures): you add probes to the code and
-re-run. Tools: `IO.inspect` (non-destructive, returns its input), `dbg` (shows full
-expression context), `ExUnit.CaptureLog`.
-
-The critical property of `IO.inspect`: **it returns its first argument unchanged**. You
-can drop it into any pipeline without modifying the data flow. `IO.puts` returns `:ok`,
-breaking the pipeline.
+**Difficulty**: ★★☆☆☆
+**Estimated time**: 1–2 hours
 
 ---
 
-## The business problem
+## Project context
 
-Build a debugging-focused test suite that demonstrates `IO.inspect` in pipelines,
-`:sys.get_state` for GenServer introspection, `Process.info`, `CaptureLog` for log
-assertion, and `dbg`.
+Before you install `:observer`, before you hook up tracing, before you even
+think about a real debugger — Elixir gives you three tools that solve 90% of
+the "what is this value right now?" problems:
 
-All modules are defined completely in this exercise.
+- `IO.inspect/2` — inline printing that is pipeline-friendly because it
+  returns its argument unchanged.
+- `dbg/2` (Elixir 1.14+) — a macro that prints the expression and its value,
+  and in IEx opens an interactive debugger that lets you step through pipes.
+- `IEx.pry/0` — freezes execution at a point in your code and drops you into
+  an IEx prompt bound to the local variables in scope.
 
----
+This exercise builds a trivial `TextPipeline` module and practices each tool
+on it. You'll understand *when* to use which, and the traps that bite people
+who reach for `IO.puts` and `inspect/1` instead.
 
-## Project setup
+Project structure:
 
 ```
-task_queue/
+debug_tools/
 ├── lib/
-│   └── task_queue/
-│       ├── application.ex
-│       ├── queue_server.ex
-│       ├── dynamic_worker.ex
-│       └── worker_pool.ex
+│   └── text_pipeline.ex
 ├── test/
-│   └── task_queue/
-│       └── debugging_test.exs
+│   └── text_pipeline_test.exs
 └── mix.exs
 ```
 
 ---
 
+## Core concepts
+
+### 1. `IO.inspect/2` returns its argument — that's the whole point
+
+```elixir
+"hello"
+|> String.upcase()
+|> IO.inspect(label: "after upcase")
+|> String.reverse()
+```
+
+Because `IO.inspect/2` returns the value it prints, you can drop it anywhere
+in a pipeline without breaking the data flow. Use `label:` to name the
+probe, `limit: :infinity` to defeat the default truncation of long lists,
+and `pretty: true` (the default in most terminals) for readable maps/structs.
+
+### 2. `dbg/2` — inspect the *expression*, not just the value
+
+```elixir
+x = 2
+dbg(x + 3)   # => x + 3 #=> 5
+```
+
+`dbg/2` is a macro, so it sees the AST. It prints the source expression
+alongside the result, which is wildly more useful than `IO.inspect(x + 3)`
+(which only prints `5`). In **IEx with `--dbg pry`** (Elixir 1.14+), calling
+a function that contains `dbg()` pauses execution and lets you step through
+each stage of the pipe, inspecting intermediate values.
+
+### 3. `IEx.pry/0` — a breakpoint you write in source
+
+```elixir
+require IEx
+IEx.pry()
+```
+
+When execution hits `IEx.pry()`, if you are running inside `iex -S mix`, the
+VM pauses at that line and gives you an IEx prompt *with the local variables
+in scope*. Type `continue` to resume, `respawn` to restart the shell, or
+just inspect whatever you want.
+
+### 4. None of this is a replacement for tests
+
+Debug prints get committed by accident and pollute production logs. Every
+`IO.inspect`, `dbg`, and `pry` should be temporary. Credo and even the
+compiler (in strict mode) will warn about stray `dbg` calls — lean into that.
+
+---
+
 ## Implementation
 
-### `lib/task_queue/application.ex`
-
-```elixir
-defmodule TaskQueue.Application do
-  use Application
-
-  @impl Application
-  def start(_type, _args) do
-    children = [
-      TaskQueue.QueueServer,
-      {Registry, keys: :unique, name: TaskQueue.WorkerRegistry},
-      {DynamicSupervisor, strategy: :one_for_one, name: TaskQueue.WorkerSupervisor}
-    ]
-
-    opts = [strategy: :one_for_one, name: TaskQueue.RootSupervisor]
-    Supervisor.start_link(children, opts)
-  end
-end
-```
-
-### `lib/task_queue/queue_server.ex`
-
-```elixir
-defmodule TaskQueue.QueueServer do
-  use GenServer
-  require Logger
-
-  @job_ttl_ms 300_000
-
-  def start_link(opts \\ []) do
-    GenServer.start_link(__MODULE__, opts, name: __MODULE__)
-  end
-
-  def push(payload) do
-    job = %{
-      id: :crypto.strong_rand_bytes(8) |> Base.url_encode64(padding: false),
-      payload: payload,
-      queued_at: System.monotonic_time(:millisecond)
-    }
-    GenServer.cast(__MODULE__, {:push, job})
-  end
-
-  def pop, do: GenServer.call(__MODULE__, :pop)
-  def size, do: GenServer.call(__MODULE__, :size)
-
-  def flush, do: GenServer.call(__MODULE__, :flush)
-
-  @impl GenServer
-  def init(_opts), do: {:ok, []}
-
-  @impl GenServer
-  def handle_cast({:push, job}, state), do: {:noreply, state ++ [job]}
-
-  @impl GenServer
-  def handle_call(:pop, _from, []), do: {:reply, {:error, :empty}, []}
-  def handle_call(:pop, _from, [job | rest]), do: {:reply, {:ok, job}, rest}
-
-  @impl GenServer
-  def handle_call(:size, _from, state), do: {:reply, length(state), state}
-
-  @impl GenServer
-  def handle_call(:flush, _from, state) do
-    cutoff = System.monotonic_time(:millisecond) - @job_ttl_ms
-    remaining = Enum.filter(state, fn job -> job.queued_at > cutoff end)
-    removed = length(state) - length(remaining)
-    if removed > 0, do: Logger.info("QueueServer cleanup: removed #{removed} stale jobs")
-    {:reply, removed, remaining}
-  end
-
-  @impl GenServer
-  def handle_info(_, state), do: {:noreply, state}
-end
-```
-
-### `lib/task_queue/dynamic_worker.ex`
-
-```elixir
-defmodule TaskQueue.DynamicWorker do
-  use GenServer
-
-  @registry TaskQueue.WorkerRegistry
-
-  def start_link(worker_id) when is_binary(worker_id) do
-    GenServer.start_link(__MODULE__, worker_id, name: via(worker_id))
-  end
-
-  def via(worker_id), do: {:via, Registry, {@registry, {:worker, worker_id}}}
-
-  def lookup(worker_id) do
-    case Registry.lookup(@registry, {:worker, worker_id}) do
-      [{pid, _}] -> pid
-      [] -> nil
-    end
-  end
-
-  def list_ids do
-    @registry
-    |> Registry.select([{{:"$1", :"$2", :"$3"}, [], [:"$1"]}])
-    |> Enum.map(fn {:worker, id} -> id end)
-  end
-
-  def stats(worker_id) do
-    case lookup(worker_id) do
-      nil -> {:error, :not_found}
-      _pid -> GenServer.call(via(worker_id), :stats)
-    end
-  end
-
-  @impl GenServer
-  def init(worker_id) do
-    {:ok, %{worker_id: worker_id, jobs_processed: 0, jobs_failed: 0,
-            started_at: System.monotonic_time(:millisecond)}}
-  end
-
-  @impl GenServer
-  def handle_call(:stats, _from, state) do
-    uptime_ms = System.monotonic_time(:millisecond) - state.started_at
-    stats = Map.take(state, [:worker_id, :jobs_processed, :jobs_failed])
-    {:reply, Map.put(stats, :uptime_ms, uptime_ms), state}
-  end
-
-  @impl GenServer
-  def handle_info(_, state), do: {:noreply, state}
-end
-```
-
-### `lib/task_queue/worker_pool.ex`
-
-```elixir
-defmodule TaskQueue.WorkerPool do
-  alias TaskQueue.DynamicWorker
-  @supervisor TaskQueue.WorkerSupervisor
-
-  def start_worker(worker_id) do
-    DynamicSupervisor.start_child(@supervisor, {DynamicWorker, worker_id})
-  end
-
-  def stop_worker(worker_id) do
-    case DynamicWorker.lookup(worker_id) do
-      nil -> {:error, :not_found}
-      pid ->
-        DynamicSupervisor.terminate_child(@supervisor, pid)
-        :ok
-    end
-  end
-
-  def count, do: DynamicWorker.list_ids() |> length()
-end
-```
-
-### Tests
-
-```elixir
-# test/task_queue/debugging_test.exs
-defmodule TaskQueue.DebuggingTest do
-  use ExUnit.Case, async: false
-  import ExUnit.CaptureIO
-  import ExUnit.CaptureLog
-  require Logger
-
-  alias TaskQueue.QueueServer
-
-  setup do
-    case Process.whereis(QueueServer) do
-      nil -> :ok
-      pid -> GenServer.stop(pid, :normal)
-    end
-
-    {:ok, _} = QueueServer.start_link()
-    :ok
-  end
-
-  describe "IO.inspect in pipelines" do
-    test "IO.inspect returns its first argument unchanged" do
-      result = [1, 2, 3]
-        |> IO.inspect(label: "before_map")
-        |> Enum.map(&(&1 * 2))
-        |> IO.inspect(label: "after_map")
-
-      assert result == [2, 4, 6]
-    end
-
-    test "IO.inspect with options does not change the value" do
-      value = %{a: 1, b: %{c: 2, d: %{e: 3}}}
-      result = IO.inspect(value, limit: 5, pretty: true)
-      assert result == value
-    end
-
-    test "IO.inspect output is captured by CaptureIO" do
-      output = capture_io(fn ->
-        [1, 2, 3] |> IO.inspect(label: "test_label")
-      end)
-
-      assert String.contains?(output, "test_label")
-      assert String.contains?(output, "[1, 2, 3]")
-    end
-  end
-
-  describe ":sys.get_state for GenServer introspection" do
-    test "reads QueueServer state directly without going through public API" do
-      QueueServer.push(:job_a)
-      QueueServer.push(:job_b)
-      Process.sleep(10)
-
-      state = :sys.get_state(QueueServer)
-      assert is_list(state)
-      assert length(state) == 2
-      payloads = Enum.map(state, & &1.payload)
-      assert :job_a in payloads
-      assert :job_b in payloads
-    end
-
-    test "worker stats available via GenServer.call — public API is observable" do
-      {:ok, _} = TaskQueue.WorkerPool.start_worker("debug_worker")
-      stats = TaskQueue.DynamicWorker.stats("debug_worker")
-      assert is_map(stats)
-      assert stats.worker_id == "debug_worker"
-      assert Map.has_key?(stats, :jobs_processed)
-      assert Map.has_key?(stats, :uptime_ms)
-      TaskQueue.WorkerPool.stop_worker("debug_worker")
-    end
-  end
-
-  describe "Process introspection" do
-    test "Process.info shows message queue length for a live process" do
-      pid = Process.whereis(QueueServer)
-      info = Process.info(pid, :message_queue_len)
-      assert {:message_queue_len, n} = info
-      assert n >= 0
-    end
-
-    test "Process.list includes the QueueServer" do
-      queue_pid = Process.whereis(QueueServer)
-      assert queue_pid in Process.list()
-    end
-  end
-
-  describe "CaptureLog for log assertion" do
-    test "Logger output is captured and assertable" do
-      log = capture_log(fn ->
-        Logger.warning("test_event job_id=test_123 status=failed")
-      end)
-
-      assert String.contains?(log, "test_event")
-      assert String.contains?(log, "test_123")
-    end
-
-    test "QueueServer emits a log when cleanup removes stale jobs" do
-      stale = %{id: "stale_id", payload: :x, queued_at: 0}
-      :sys.replace_state(QueueServer, fn _ -> [stale] end)
-
-      log = capture_log(fn -> QueueServer.flush() end)
-      assert String.contains?(log, "stale")
-    end
-  end
-
-  describe "dbg/1 — Elixir 1.14+" do
-    test "dbg returns the expression value unchanged" do
-      result = capture_io(:stderr, fn ->
-        value = dbg(1 + 1)
-        send(self(), {:result, value})
-      end)
-
-      assert_receive {:result, 2}
-      assert String.contains?(result, "1 + 1")
-    end
-  end
-end
-```
-
-### Run the tests
+### Step 1: Create the project
 
 ```bash
-mix test test/task_queue/debugging_test.exs --trace
+mix new debug_tools
+cd debug_tools
 ```
 
----
-
-## Interactive debugging with `iex -S mix`
+### Step 2: `lib/text_pipeline.ex`
 
 ```elixir
-# Inspect running process state
-iex> :sys.get_state(TaskQueue.QueueServer)
+defmodule TextPipeline do
+  @moduledoc """
+  A trivial pipeline used as a target for debugging practice.
 
-# Push a job and watch the queue depth
-iex> TaskQueue.QueueServer.push(:my_test_job)
-iex> TaskQueue.QueueServer.size()
+  `process/1` takes a string, normalizes it, and returns a map of word
+  frequencies. The individual steps are exposed so you can probe each one
+  with `IO.inspect`, `dbg`, or `IEx.pry`.
+  """
 
-# Start the visual observer (opens a GUI window)
-iex> :observer.start()
+  @doc """
+  Normalizes, tokenizes, and counts word frequencies.
 
-# Trace all messages to a GenServer
-iex> :sys.trace(TaskQueue.QueueServer, true)
-iex> TaskQueue.QueueServer.push(:traced_job)
-iex> :sys.trace(TaskQueue.QueueServer, false)
+  ## Examples
+
+      iex> TextPipeline.process("Hello hello world")
+      %{"hello" => 2, "world" => 1}
+  """
+  @spec process(String.t()) :: %{String.t() => non_neg_integer()}
+  def process(text) when is_binary(text) do
+    text
+    |> normalize()
+    |> tokenize()
+    |> count()
+  end
+
+  @doc "Lowercases and trims extra whitespace."
+  @spec normalize(String.t()) :: String.t()
+  def normalize(text) do
+    text
+    |> String.downcase()
+    |> String.trim()
+  end
+
+  @doc "Splits on whitespace, drops empties."
+  @spec tokenize(String.t()) :: [String.t()]
+  def tokenize(text) do
+    String.split(text, ~r/\s+/, trim: true)
+  end
+
+  @doc "Counts occurrences of each word."
+  @spec count([String.t()]) :: %{String.t() => non_neg_integer()}
+  def count(words), do: Enum.frequencies(words)
+
+  # ── Debugging showcase ──────────────────────────────────────────────────
+
+  @doc """
+  Same as `process/1`, but instrumented with `IO.inspect` probes at every
+  stage. Use this to SEE the pipeline values without changing control flow.
+  Each probe returns its argument unchanged, so the final result is identical.
+  """
+  @spec process_with_inspect(String.t()) :: %{String.t() => non_neg_integer()}
+  def process_with_inspect(text) do
+    text
+    |> IO.inspect(label: "input")
+    |> normalize()
+    |> IO.inspect(label: "normalized")
+    |> tokenize()
+    |> IO.inspect(label: "tokens", limit: :infinity)
+    |> count()
+    |> IO.inspect(label: "counts", pretty: true)
+  end
+
+  @doc """
+  Same pipeline wrapped in `dbg/2`. In `iex --dbg pry -S mix`, calling this
+  function PAUSES at each pipe stage and lets you step through interactively.
+  Outside IEx it just prints the expressions and their values.
+  """
+  @spec process_with_dbg(String.t()) :: %{String.t() => non_neg_integer()}
+  def process_with_dbg(text) do
+    text
+    |> normalize()
+    |> tokenize()
+    |> count()
+    |> dbg()
+  end
+
+  @doc """
+  Demonstrates `IEx.pry/0`. Run `iex -S mix` and call
+  `TextPipeline.process_with_pry("hello world")` — execution pauses at the
+  `IEx.pry()` line and you can inspect `normalized`, `tokens`, and `counts`
+  by name from the IEx prompt.
+  """
+  @spec process_with_pry(String.t()) :: %{String.t() => non_neg_integer()}
+  def process_with_pry(text) do
+    require IEx
+
+    normalized = normalize(text)
+    tokens = tokenize(normalized)
+    counts = count(tokens)
+
+    IEx.pry()
+
+    counts
+  end
+end
+```
+
+### Step 3: `test/text_pipeline_test.exs`
+
+```elixir
+defmodule TextPipelineTest do
+  use ExUnit.Case, async: true
+
+  import ExUnit.CaptureIO
+
+  doctest TextPipeline
+
+  describe "process/1" do
+    test "counts words case-insensitively" do
+      assert TextPipeline.process("Hello HELLO world") == %{"hello" => 2, "world" => 1}
+    end
+
+    test "handles extra whitespace" do
+      assert TextPipeline.process("  a   b  a  ") == %{"a" => 2, "b" => 1}
+    end
+
+    test "empty string yields an empty map" do
+      assert TextPipeline.process("") == %{}
+    end
+  end
+
+  describe "process_with_inspect/1" do
+    test "returns the same result as process/1 and prints the probes" do
+      io =
+        capture_io(fn ->
+          result = TextPipeline.process_with_inspect("Hi hi")
+          assert result == %{"hi" => 2}
+        end)
+
+      # The labels we added with IO.inspect appear in stdout.
+      assert io =~ "input:"
+      assert io =~ "normalized:"
+      assert io =~ "tokens:"
+      assert io =~ "counts:"
+    end
+  end
+end
+```
+
+### Step 4: Run and explore
+
+```bash
+mix test
+
+# Inspect everything inline:
+iex -S mix
+iex> TextPipeline.process_with_inspect("Hello world hello")
+
+# Step-through debugging (Elixir 1.14+):
+iex --dbg pry -S mix
+iex> TextPipeline.process_with_dbg("Hello world hello")
+# press Enter / n at each prompt to step through the pipe
+
+# Breakpoint-style:
+iex -S mix
+iex> TextPipeline.process_with_pry("a b a")
+# you drop into a nested IEx prompt; type `normalized`, `tokens`, `counts`
+# then type `continue` to resume.
 ```
 
 ---
 
-## Common production mistakes
+## Trade-offs and production gotchas
 
-**1. Using `IO.puts` in a pipeline instead of `IO.inspect`**
-`IO.puts` returns `:ok`, which replaces the pipeline value.
+**1. `IO.inspect` in hot paths is slow and noisy**
+Formatting and printing takes microseconds and synchronizes on `:stdio`. In
+a tight loop, printing once per iteration can dominate runtime. It also
+scrambles log output in concurrent tests. Keep probes scoped and remove
+them before committing.
 
-**2. `dbg` left in production code**
-`dbg` prints to stderr on every call.
+**2. `inspect/1` vs `IO.inspect/2`** — they are NOT the same
+`inspect/1` returns a string. `IO.inspect/2` prints *and* returns the value.
+If you write `x |> inspect() |> foo()`, you just passed a string to `foo/1`
+— that's almost never what you want.
 
-**3. `:sys.get_state` in production monitoring**
-It is a synchronous call that temporarily pauses the GenServer.
+**3. `dbg/2` leaves pretty output in production logs**
+`dbg` prints colored, formatted output to stderr. If a stray `dbg(x)` ships,
+your logs are noisy AND colored (with ANSI escapes) in environments that
+can't render them. Configure Credo's `Credo.Check.Warning.Dbg` to fail CI.
 
-**4. Forgetting the `label:` option on `IO.inspect`**
-Multiple inspect calls produce interleaved output that is hard to read without labels.
+**4. `IEx.pry` only works when the code is reached from an IEx session**
+If your code runs inside a Task spawned by Phoenix during a request, the
+`pry` prompt opens in the IEx shell *on the BEAM node* — you need to have
+`iex -S mix phx.server` (not `mix phx.server`) for it to be usable.
+
+**5. `IO.inspect` truncates — `:infinity` exists for a reason**
+Default `:limit` is 50 items, default `:printable_limit` is 4096 bytes.
+Missing this leads to "why is the list cut off?" confusion. When in doubt:
+`IO.inspect(x, limit: :infinity, printable_limit: :infinity)`.
+
+**6. When NOT to use these tools**
+If you need to inspect *why* a production node is misbehaving right now,
+you want `:recon`, `:observer`, or `:sys.get_state/1` — not `IO.inspect`.
+If you're debugging concurrency / scheduling, reach for tracing (`:dbg`,
+`:recon_trace`), not print statements.
 
 ---
 
 ## Resources
 
-- [IO.inspect/2 — HexDocs](https://hexdocs.pm/elixir/IO.html#inspect/2)
-- [Kernel.dbg/2 — HexDocs](https://hexdocs.pm/elixir/Kernel.html#dbg/2)
-- [:sys module — Erlang/OTP](https://www.erlang.org/doc/man/sys.html)
-- [Observer — Erlang/OTP](https://www.erlang.org/doc/apps/observer/observer_ug.html)
+- [`IO.inspect/2` — Elixir stdlib](https://hexdocs.pm/elixir/IO.html#inspect/2)
+- [`Kernel.dbg/2`](https://hexdocs.pm/elixir/Kernel.html#dbg/2) — the macro, including the `--dbg pry` flag
+- [`IEx.pry/0`](https://hexdocs.pm/iex/IEx.html#pry/0) — source-level breakpoints
+- [`Inspect.Opts`](https://hexdocs.pm/elixir/Inspect.Opts.html) — every flag you can pass (`limit`, `printable_limit`, `pretty`, `structs`, `syntax_colors`, etc.)
+- ["Debugging" — the Elixir guide](https://hexdocs.pm/elixir/debugging.html) — official walkthrough of all three tools

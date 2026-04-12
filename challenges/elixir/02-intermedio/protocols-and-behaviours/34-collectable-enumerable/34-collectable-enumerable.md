@@ -1,265 +1,226 @@
-# Enumerable and Collectable Protocols
+# `Enumerable` and `Collectable` — a custom `Bag` collection
 
-## Goal
+**Project**: `custom_bag` — a multiset (`Bag`) struct that fully implements `Enumerable` (so `Enum.*` works) and `Collectable` (so `Enum.into/2` works).
 
-Build a `task_queue` FIFO job queue struct that implements `Enumerable` (enabling all `Enum.*` and `Stream.*` functions) and `Collectable` (enabling `Enum.into/2` and `for ... into:`). Learn how these protocols work internally and how to implement them for custom data structures.
+**Difficulty**: ★★★☆☆
+**Estimated time**: 2–3 hours
 
 ---
 
-## The two protocols
+## Project context
 
-**`Enumerable`** enables all `Enum` and `Stream` functions. It requires four callbacks: `reduce/3`, `count/1`, `member?/2`, and `slice/1`. The simplest approach: convert to a list and delegate to `Enumerable.List`.
+You're building a small multiset — a collection where each element is stored
+with its count, and order doesn't matter. You want it to feel native: iterate
+with `Enum.map/2`, count with `Enum.count/1`, and build from other
+collections with `Enum.into(list, %Bag{})`. That means implementing two
+companion protocols:
 
-**`Collectable`** enables `Enum.into/2` and `for ... into:` comprehensions. It requires one callback: `into/1` which returns `{initial_acc, collector_fun}`. The collector function receives `(accumulator, command)` where command is `{:cont, element}`, `:done`, or `:halt`.
+- `Enumerable` — how `Enum` reads from you.
+- `Collectable` — how `Enum.into` / `for ... into:` writes into you.
+
+These are the two most complex stdlib protocols because they deal with
+streaming, suspension, and early termination. This exercise implements the
+minimum correct version; exercise 79 extends the idea to a tree with a
+full lazy `reduce/3`.
+
+Project structure:
+
+```
+custom_bag/
+├── lib/
+│   └── bag.ex
+├── test/
+│   └── bag_test.exs
+└── mix.exs
+```
+
+---
+
+## Core concepts
+
+### 1. `Enumerable.reduce/3` is the heart of `Enum`
+
+Every `Enum` function is built on top of `reduce/3`. Its signature is:
+
+```
+reduce(enum, acc, reducer) :: result
+acc      :: {:cont, term} | {:halt, term} | {:suspend, term}
+result   :: {:done, term} | {:halted, term} | {:suspended, term, continuation}
+```
+
+You must honor the three accumulator states: `:cont` means keep going,
+`:halt` means stop now, `:suspend` means pause and return a continuation.
+Suspension is what makes `Stream.zip/2` work without loading both sides.
+
+### 2. `count/1` and `member?/2` can opt out
+
+Returning `{:error, __MODULE__}` from `count/1` or `member?/2` tells `Enum`
+"I can't answer in O(1), please derive this from `reduce/3`". Always opt
+out when the O(1) answer requires traversing anyway — it's honest and it
+keeps the protocol usable.
+
+### 3. `Collectable.into/1` returns a two-arity collector
+
+```
+{initial_acc, collector_fun}
+collector_fun(acc, {:cont, elem}) :: acc'
+collector_fun(acc, :done)         :: final_collection
+collector_fun(acc, :halt)         :: :ok   # cleanup on error
+```
+
+`:halt` is called if `Enum.into` raises mid-stream — use it to release
+resources (file handles, ports). For pure data structures, return `:ok`.
+
+### 4. `slice/1` is optional — leave it as `{:error, _}` unless O(1) slicing applies
+
+For list-like structures with random access, implementing `slice/1` unlocks
+`Enum.at/2` and `Enum.slice/2` in O(1). For a `Bag` it doesn't make sense —
+opt out.
 
 ---
 
 ## Implementation
 
-### Step 1: `mix.exs`
+### Step 1: Create the project
 
-```elixir
-defmodule TaskQueue.MixProject do
-  use Mix.Project
-
-  def project do
-    [
-      app: :task_queue,
-      version: "0.1.0",
-      elixir: "~> 1.15",
-      start_permanent: Mix.env() == :prod,
-      deps: deps()
-    ]
-  end
-
-  def application do
-    [extra_applications: [:logger]]
-  end
-
-  defp deps, do: []
-end
+```bash
+mix new custom_bag
+cd custom_bag
 ```
 
-### Step 2: `lib/task_queue/job_queue.ex` -- custom queue with protocol implementations
-
-The `JobQueue` struct wraps an Erlang `:queue` (a double-ended queue with O(1) amortized push/pop). The `to_list/1` function converts it to a list for the `Enumerable` implementation.
-
-The `Enumerable` implementation delegates to `Enumerable.List.reduce/3` which correctly handles all three accumulator signals (`{:cont, acc}`, `{:halt, acc}`, `{:suspend, acc}`). This means `Enum.take(queue, 2)` stops after two elements instead of traversing the entire queue. `count/1` returns `{:ok, size}` for O(1) counting.
-
-The `Collectable` implementation's collector function takes `(accumulator, command)` -- note that accumulator is first and the command tuple is second. This is a common source of bugs when the arguments are swapped.
+### Step 2: `lib/bag.ex`
 
 ```elixir
-defmodule TaskQueue.JobQueue do
+defmodule Bag do
   @moduledoc """
-  An in-memory FIFO job queue implemented as a struct.
+  A multiset: each element is stored with a positive integer count. Order is
+  not preserved. Iteration yields one copy of each element per count.
 
-  Implements `Enumerable` to support all `Enum.*` and `Stream.*` operations.
-  Implements `Collectable` to support `Enum.into/2` and `for ... into:`.
+  Implements `Enumerable` and `Collectable`, so all `Enum` functions work.
   """
 
-  defstruct jobs: :queue.new()
+  defstruct counts: %{}
 
-  @type t :: %__MODULE__{jobs: :queue.queue()}
+  @type t :: %__MODULE__{counts: %{optional(term()) => pos_integer()}}
 
-  @doc """
-  Creates an empty queue.
-  """
-  @spec new() :: t()
+  @doc "An empty bag."
+  @spec new() :: t
   def new, do: %__MODULE__{}
 
-  @doc """
-  Adds a job to the back of the queue.
-  """
-  @spec push(t(), map()) :: t()
-  def push(%__MODULE__{jobs: q} = queue, job) when is_map(job) do
-    %{queue | jobs: :queue.in(job, q)}
+  @doc "Add `element` to the bag (increments its count by 1)."
+  @spec put(t, term()) :: t
+  def put(%__MODULE__{counts: counts} = bag, element) do
+    %{bag | counts: Map.update(counts, element, 1, &(&1 + 1))}
   end
 
-  @doc """
-  Removes and returns the front job, or `{:error, :empty}`.
-  """
-  @spec pop(t()) :: {map(), t()} | {:error, :empty}
-  def pop(%__MODULE__{jobs: q} = queue) do
-    case :queue.out(q) do
-      {{:value, job}, new_q} -> {job, %{queue | jobs: new_q}}
-      {:empty, _}            -> {:error, :empty}
-    end
-  end
-
-  @doc """
-  Returns the number of jobs in the queue.
-  """
-  @spec size(t()) :: non_neg_integer()
-  def size(%__MODULE__{jobs: q}), do: :queue.len(q)
-
-  @doc false
-  def to_list(%__MODULE__{jobs: q}), do: :queue.to_list(q)
-end
-
-defimpl Enumerable, for: TaskQueue.JobQueue do
-  def reduce(queue, acc, fun) do
-    Enumerable.List.reduce(TaskQueue.JobQueue.to_list(queue), acc, fun)
-  end
-
-  def count(queue) do
-    {:ok, TaskQueue.JobQueue.size(queue)}
-  end
-
-  def member?(queue, element) do
-    {:ok, element in TaskQueue.JobQueue.to_list(queue)}
-  end
-
-  def slice(queue) do
-    list = TaskQueue.JobQueue.to_list(queue)
-    size = length(list)
-    {:ok, size, &Enumerable.List.slice(list, &1, &2, size)}
+  @doc "Total number of elements (counting duplicates)."
+  @spec size(t) :: non_neg_integer()
+  def size(%__MODULE__{counts: counts}) do
+    counts |> Map.values() |> Enum.sum()
   end
 end
 
-defimpl Collectable, for: TaskQueue.JobQueue do
-  def into(initial_queue) do
-    collector_fun = fn
-      queue, {:cont, job} -> TaskQueue.JobQueue.push(queue, job)
-      queue, :done        -> queue
-      _, :halt            -> :ok
+defimpl Enumerable, for: Bag do
+  # ── count/member?/slice — cheap metadata hooks ──────────────────────────
+  def count(%Bag{} = bag), do: {:ok, Bag.size(bag)}
+
+  def member?(%Bag{counts: counts}, element) do
+    {:ok, Map.has_key?(counts, element)}
+  end
+
+  # Opt out: Bag has no meaningful random-access slice.
+  def slice(_bag), do: {:error, __MODULE__}
+
+  # ── reduce/3 — the iteration engine ─────────────────────────────────────
+  #
+  # We materialize the bag as a list of elements (duplicated by count) and
+  # reuse the standard list reduction. For a real collection with millions
+  # of entries you would stream counts without allocating a list.
+  def reduce(%Bag{counts: counts}, acc, fun) do
+    counts
+    |> Enum.flat_map(fn {element, n} -> List.duplicate(element, n) end)
+    |> do_reduce(acc, fun)
+  end
+
+  # Canonical reduce loop — honor :cont, :halt, and :suspend exactly.
+  defp do_reduce(_list, {:halt, acc}, _fun), do: {:halted, acc}
+
+  defp do_reduce(list, {:suspend, acc}, fun) do
+    # Suspend: return a continuation the caller can resume later.
+    {:suspended, acc, &do_reduce(list, &1, fun)}
+  end
+
+  defp do_reduce([], {:cont, acc}, _fun), do: {:done, acc}
+
+  defp do_reduce([head | tail], {:cont, acc}, fun) do
+    do_reduce(tail, fun.(head, acc), fun)
+  end
+end
+
+defimpl Collectable, for: Bag do
+  def into(%Bag{} = bag) do
+    collector = fn
+      acc, {:cont, element} -> Bag.put(acc, element)
+      acc, :done -> acc
+      _acc, :halt -> :ok
     end
 
-    {initial_queue, collector_fun}
+    {bag, collector}
   end
 end
 ```
 
-### Step 3: Tests
+### Step 3: `test/bag_test.exs`
 
 ```elixir
-# test/task_queue/protocols_test.exs
-defmodule TaskQueue.ProtocolsTest do
+defmodule BagTest do
   use ExUnit.Case, async: true
 
-  alias TaskQueue.JobQueue
-
-  describe "Enumerable -- basic operations" do
-    setup do
-      queue =
-        JobQueue.new()
-        |> JobQueue.push(%{type: "send_email", status: :pending})
-        |> JobQueue.push(%{type: "send_sms", status: :pending})
-        |> JobQueue.push(%{type: "send_email", status: :failed})
-
-      {:ok, queue: queue}
+  describe "Enumerable" do
+    test "Enum.count/1 returns total size with duplicates" do
+      bag = Bag.new() |> Bag.put(:a) |> Bag.put(:a) |> Bag.put(:b)
+      assert Enum.count(bag) == 3
     end
 
-    test "Enum.count/1 returns number of jobs", %{queue: queue} do
-      assert Enum.count(queue) == 3
+    test "Enum.member?/2 checks element presence" do
+      bag = Bag.new() |> Bag.put(:a)
+      assert Enum.member?(bag, :a)
+      refute Enum.member?(bag, :b)
     end
 
-    test "Enum.count/2 with predicate counts matching jobs", %{queue: queue} do
-      assert Enum.count(queue, fn j -> j.type == "send_email" end) == 2
+    test "Enum.to_list/1 yields one entry per count" do
+      bag = Bag.new() |> Bag.put(:x) |> Bag.put(:x) |> Bag.put(:y)
+      assert Enum.sort(Enum.to_list(bag)) == [:x, :x, :y]
     end
 
-    test "Enum.filter/2 returns matching jobs", %{queue: queue} do
-      failed = Enum.filter(queue, fn j -> j.status == :failed end)
-      assert length(failed) == 1
-      assert hd(failed).type == "send_email"
+    test "Enum.map/2 works and yields count-many results" do
+      bag = Bag.new() |> Bag.put(1) |> Bag.put(2) |> Bag.put(2)
+      assert bag |> Enum.map(&(&1 * 10)) |> Enum.sort() == [10, 20, 20]
     end
 
-    test "Enum.map/2 transforms jobs", %{queue: queue} do
-      types = Enum.map(queue, & &1.type)
-      assert types == ["send_email", "send_sms", "send_email"]
-    end
-
-    test "Enum.any?/2 works", %{queue: queue} do
-      assert Enum.any?(queue, fn j -> j.status == :failed end)
-      refute Enum.any?(queue, fn j -> j.type == "nonexistent" end)
-    end
-
-    test "Enum.member?/2 checks containment", %{queue: queue} do
-      job = %{type: "send_email", status: :pending}
-      assert Enum.member?(queue, job)
-      refute Enum.member?(queue, %{type: "unknown"})
-    end
-
-    test "Enum.to_list/1 returns all jobs in order", %{queue: queue} do
-      list = Enum.to_list(queue)
-      assert length(list) == 3
-      assert hd(list).type == "send_email"
-    end
-
-    test "Enum.reduce/3 works", %{queue: queue} do
-      count = Enum.reduce(queue, 0, fn _, acc -> acc + 1 end)
-      assert count == 3
-    end
-
-    test "Stream.filter works (lazy evaluation)", %{queue: queue} do
-      stream = Stream.filter(queue, fn j -> j.type == "send_email" end)
-      result = Enum.to_list(stream)
-      assert length(result) == 2
+    test "Enum.take/2 halts early (uses :halt)" do
+      bag = Bag.new() |> Bag.put(:a) |> Bag.put(:a) |> Bag.put(:a) |> Bag.put(:a)
+      # take/2 must halt after n elements; if :halt isn't honored, this loops forever.
+      assert Enum.take(bag, 2) |> length() == 2
     end
   end
 
-  describe "Collectable -- Enum.into" do
-    test "Enum.into/2 collects a list of jobs into a queue" do
-      jobs = [
-        %{type: "noop", status: :pending},
-        %{type: "echo", status: :pending}
-      ]
-
-      queue = Enum.into(jobs, JobQueue.new())
-
-      assert JobQueue.size(queue) == 2
-      assert Enum.count(queue) == 2
+  describe "Collectable" do
+    test "Enum.into/2 collects from a list" do
+      bag = Enum.into([:a, :a, :b], Bag.new())
+      assert bag.counts == %{a: 2, b: 1}
     end
 
-    test "for ... into: works with a JobQueue" do
-      source = [%{type: "a"}, %{type: "b"}, %{type: "c"}]
-
-      queue =
-        for job <- source, into: JobQueue.new() do
-          Map.put(job, :processed, true)
-        end
-
-      assert JobQueue.size(queue) == 3
-      assert Enum.all?(queue, fn j -> Map.get(j, :processed) == true end)
+    test "for ... into: builds a bag" do
+      bag = for x <- 1..3, into: Bag.new(), do: rem(x, 2)
+      # 1 -> 1, 2 -> 0, 3 -> 1
+      assert bag.counts == %{0 => 1, 1 => 2}
     end
 
-    test "Enum.into with filter -- only passing jobs collected" do
-      all_jobs = [
-        %{type: "send_email", status: :pending},
-        %{type: "send_email", status: :failed},
-        %{type: "noop", status: :pending}
-      ]
-
-      pending_queue =
-        all_jobs
-        |> Enum.filter(fn j -> j.status == :pending end)
-        |> Enum.into(JobQueue.new())
-
-      assert JobQueue.size(pending_queue) == 2
-    end
-
-    test "copying from one queue to another with Enum.into" do
-      source =
-        JobQueue.new()
-        |> JobQueue.push(%{type: "a"})
-        |> JobQueue.push(%{type: "b"})
-
-      dest = Enum.into(source, JobQueue.new())
-
-      assert JobQueue.size(dest) == 2
-    end
-  end
-
-  describe "Enumerable -- empty queue" do
-    test "Enum.count on empty queue returns 0" do
-      assert Enum.count(JobQueue.new()) == 0
-    end
-
-    test "Enum.to_list on empty queue returns []" do
-      assert Enum.to_list(JobQueue.new()) == []
-    end
-
-    test "Enum.any? on empty queue returns false" do
-      refute Enum.any?(JobQueue.new(), fn _ -> true end)
+    test "collecting into a non-empty bag accumulates" do
+      start = Bag.new() |> Bag.put(:a)
+      bag = Enum.into([:a, :b], start)
+      assert bag.counts == %{a: 2, b: 1}
     end
   end
 end
@@ -268,44 +229,44 @@ end
 ### Step 4: Run
 
 ```bash
-mix test test/task_queue/protocols_test.exs --trace
+mix test
 ```
 
 ---
 
-## Trade-off analysis
+## Trade-offs and production gotchas
 
-| Approach | Supports `Enum.*` | Supports `Enum.into` | Lazy streams | Implementation effort |
-|----------|------------------|---------------------|--------------|----------------------|
-| `defimpl Enumerable` | yes | no | yes (via Stream) | medium -- 4 callbacks |
-| `defimpl Collectable` | no | yes | N/A | low -- 1 callback |
-| Both | yes | yes | yes | medium |
-| Convert to list first | only after conversion | no | no | none -- but loses struct type |
+**1. `reduce/3` MUST honor `:suspend`**
+Skipping the suspension clause breaks `Stream.zip/2`, `Enum.zip/2` against
+streams, and any caller that pauses iteration. The test suite above doesn't
+exercise it directly — add a stream-zip assertion if you intend to rely on
+lazy interop.
 
----
+**2. Materializing to a list defeats streaming**
+The implementation above expands counts into a list, which is fine for small
+bags but bad for millions. A production `Bag` should iterate the count map
+directly, emitting one element per iteration without a flat_map.
 
-## Common production mistakes
+**3. Returning `{:ok, count}` from `count/1` is a promise of O(1)**
+If your "count" actually traverses the whole collection, return
+`{:error, __MODULE__}` instead — `Enum.count/1` will do the traversal itself,
+and callers who want O(1) size won't be misled.
 
-**1. Not handling `{:halt, acc}` in the `reduce` callback**
-`Enum.take/2` sends a halt signal. If your `reduce` ignores it, `Enum.take(queue, 1)` processes the entire queue. Delegating to `Enumerable.List.reduce/3` handles this correctly.
+**4. Collectable's `:halt` is for cleanup**
+If you implement `Collectable` for a file or a port, `:halt` is your chance
+to close the resource when the surrounding pipeline crashes. Ignoring it
+leaks handles.
 
-**2. Returning the wrong shape from the `Collectable` collector**
-The collector receives `(accumulator, command)`. The accumulator is first, the command tuple is second. Swapping them causes a `FunctionClauseError`.
-
-**3. `count/1` returning `{:error, __MODULE__}` instead of `{:ok, n}`**
-If `count/1` returns `{:error, __MODULE__}`, `Enum.count/1` falls back to a full traversal via `reduce/3`. Returning `{:ok, n}` gives O(1) count.
-
-**4. `member?/2` returning `{:error, __MODULE__}` causing unnecessary traversals**
-If `member?/2` returns `{:error, __MODULE__}`, `Enum.member?/2` traverses the entire collection.
-
-**5. Mutable state in the `Collectable` collector closure**
-The collector function receives the accumulator as an argument and returns the new accumulator. Do not use captured mutable state.
+**5. When NOT to implement Enumerable**
+If iteration doesn't have a natural single-pass order (e.g. a graph), forcing
+it into `Enumerable` makes a meaningless order feel meaningful. Offer
+explicit traversal functions (`walk_bfs/1`, `walk_dfs/1`) instead.
 
 ---
 
 ## Resources
 
-- [Enumerable protocol -- official docs](https://hexdocs.pm/elixir/Enumerable.html)
-- [Collectable protocol -- official docs](https://hexdocs.pm/elixir/Collectable.html)
-- [Implementing Enumerable -- Elixir School](https://elixirschool.com/en/lessons/advanced/protocols)
-- [Stream module -- lazy enumeration](https://hexdocs.pm/elixir/Stream.html)
+- [`Enumerable` — Elixir stdlib](https://hexdocs.pm/elixir/Enumerable.html)
+- [`Collectable` — Elixir stdlib](https://hexdocs.pm/elixir/Collectable.html)
+- [`Stream` — lazy enumerables](https://hexdocs.pm/elixir/Stream.html)
+- ["Writing assertive code with Elixir" — José Valim](http://blog.plataformatec.com.br/2014/09/writing-assertive-code-with-elixir/)
