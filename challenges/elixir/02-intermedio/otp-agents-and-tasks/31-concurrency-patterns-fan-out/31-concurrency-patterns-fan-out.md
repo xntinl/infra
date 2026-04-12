@@ -1,370 +1,315 @@
-# Concurrency Patterns: Fan-Out / Fan-In
+# Fan-out / fan-in aggregation
 
-## Goal
+**Project**: `fanout_aggregator` — dispatch a request to N workers and merge their results.
 
-Build a `task_queue` notification system and batch processor using fan-out/fan-in concurrency patterns. The Notifier uses `Task.yield_many/2` to call multiple webhooks in parallel with a shared deadline. The BatchProcessor uses `Task.async_stream/3` for bounded concurrent job execution with ordered results.
+**Difficulty**: ★★★☆☆
+**Estimated time**: 2–3 hours
 
 ---
 
-## The two tools: `Task.async_stream` vs `Task.yield_many`
+## Project context
 
-**`Task.async_stream/3`** processes a collection with bounded concurrency and preserves order:
+You need to answer a query by consulting several sources and combining
+their answers: a price comparator hitting 4 upstream APIs, a search
+ranker querying 3 shards, a dashboard widget pulling metrics from
+several services. The pattern is always the same:
 
-```elixir
-jobs
-|> Task.async_stream(&Worker.execute/1, max_concurrency: 5, timeout: 5_000)
-|> Enum.to_list()
-# => [{:ok, result}, {:ok, result}, {:exit, :timeout}, ...]
+```
+         ┌──► worker_1 ──►┐
+request ─┼──► worker_2 ──►┼─► aggregate ─► reply
+         └──► worker_N ──►┘
 ```
 
-**`Task.yield_many/2`** starts all tasks immediately and collects results up to a shared deadline:
+Fan-out the work, fan-in the results. The interesting bits are:
 
-```elixir
-tasks = Enum.map(webhooks, &Task.async(fn -> notify(&1) end))
-results = Task.yield_many(tasks, timeout: 1_000)
-# => [{task, {:ok, result}}, {task, nil}, ...]   nil = timed out
+- How do you combine partial failures? (fail the whole request, or
+  return what you have?)
+- How do you enforce a deadline? (one slow worker shouldn't punish the
+  caller.)
+- How do you keep ordering or associate each result with its source?
+
+This exercise builds a generic fan-out aggregator on top of
+`Task.async_stream` and a user-supplied reducer, then shows how to handle
+partial timeouts.
+
+Project structure:
+
+```
+fanout_aggregator/
+├── lib/
+│   └── fanout_aggregator.ex
+├── test/
+│   └── fanout_aggregator_test.exs
+└── mix.exs
 ```
 
-The key difference: `async_stream` processes a stream lazily with backpressure. `yield_many` starts all tasks immediately.
+---
+
+## Core concepts
+
+### 1. Fan-out is a map; fan-in is a reduce
+
+Dispatching N tasks is a map. Combining their results — summing numbers,
+picking the minimum, merging lists, choosing the fastest — is a reduce.
+Keep the two separate in your code:
+
+```
+sources |> map(run/1) |> reduce(combiner/2, initial)
+```
+
+The combiner is where your domain logic lives. Everything else is
+plumbing.
+
+### 2. `Task.async_stream` for bounded fan-out with per-task timeout
+
+```
+Task.async_stream(sources, fun,
+  max_concurrency: 8,   # hard cap, not just a hint
+  timeout: 500,         # per-task deadline
+  on_timeout: :kill_task # slow task is killed, stream yields {:exit, :timeout}
+)
+```
+
+Each element yields `{:ok, value}` or `{:exit, reason}`. You decide in
+the reducer what "exit" means for your query — often "skip and continue",
+sometimes "abort".
+
+### 3. Deadline belongs to the request, not the worker
+
+If you need the answer in 500ms, that budget applies to the whole fan-out.
+Setting a per-task timeout of 500ms means the slowest accepted worker can
+take 500ms and the *total* call can also take 500ms (tasks run in
+parallel) — as long as `max_concurrency >= N`. If you throttle, the
+effective budget grows.
+
+### 4. Partial results vs total failure
+
+Two canonical strategies:
+
+- **All-or-nothing**: any worker failure fails the request. Use
+  `Task.await_many` (exercise 50) or `on_timeout: :kill_task` + reducer
+  that raises on `:exit`.
+- **Best-effort**: collect whatever succeeded by the deadline, annotate
+  the response with which sources were unavailable. Use the reducer to
+  skip `:exit` entries.
+
+Pick one explicitly — "it depends on the caller" is how you end up with
+inconsistent behavior.
 
 ---
 
 ## Implementation
 
-### Step 1: `mix.exs`
-
-```elixir
-defmodule TaskQueue.MixProject do
-  use Mix.Project
-
-  def project do
-    [
-      app: :task_queue,
-      version: "0.1.0",
-      elixir: "~> 1.15",
-      start_permanent: Mix.env() == :prod,
-      deps: deps()
-    ]
-  end
-
-  def application do
-    [extra_applications: [:logger]]
-  end
-
-  defp deps, do: []
-end
-```
-
-### Step 2: `lib/task_queue/worker.ex` -- job executor
-
-```elixir
-defmodule TaskQueue.Worker do
-  @moduledoc """
-  Executes individual jobs. Used by the BatchProcessor.
-  """
-
-  @spec execute(map()) :: {:ok, term()} | {:error, term()}
-  def execute(%{type: "noop", args: _}), do: {:ok, :noop}
-  def execute(%{type: "echo", args: args}), do: {:ok, args}
-
-  def execute(%{type: "fail", args: %{reason: reason}}) do
-    {:error, {:job_failed, reason}}
-  end
-
-  def execute(%{type: type}), do: {:error, {:unknown_type, type}}
-  def execute(_), do: {:error, :invalid_job}
-end
-```
-
-### Step 3: `lib/task_queue/notifier.ex` -- fan-out webhook notifications
-
-The Notifier starts one `Task.async` per webhook URL, then collects all results with `Task.yield_many/2`. The shared timeout means all webhooks complete within the deadline. Results are classified into three buckets: `:ok` (success), `:error` (failure), `:timeout` (did not respond in time).
-
-When `yield_many` returns `nil` for a task, that task is still running -- it must be explicitly killed with `Task.shutdown/2` to prevent orphaned processes.
-
-```elixir
-defmodule TaskQueue.Notifier do
-  @moduledoc """
-  Notifies multiple webhook endpoints concurrently when jobs complete.
-  Uses `Task.yield_many/2` for fan-out with a shared deadline.
-  """
-
-  @default_timeout 5_000
-
-  @doc """
-  Notifies all webhooks concurrently about completed jobs.
-
-  Returns a map with:
-  - `:ok` -- list of URLs that responded successfully
-  - `:error` -- list of `{url, reason}` for failed notifications
-  - `:timeout` -- list of URLs that did not respond within `timeout`
-  """
-  @spec notify_all([String.t()], map(), keyword()) :: %{
-    ok: [String.t()],
-    error: [{String.t(), term()}],
-    timeout: [String.t()]
-  }
-  def notify_all(webhook_urls, payload, opts \\ []) when is_list(webhook_urls) do
-    timeout = Keyword.get(opts, :timeout, @default_timeout)
-
-    tasks =
-      Enum.map(webhook_urls, fn url ->
-        Task.async(fn -> {url, notify_one(url, payload)} end)
-      end)
-
-    results = Task.yield_many(tasks, timeout: timeout)
-
-    task_to_url =
-      Enum.zip(tasks, webhook_urls)
-      |> Map.new(fn {task, url} -> {task.ref, url} end)
-
-    Enum.reduce(results, %{ok: [], error: [], timeout: []}, fn
-      {_task, {:ok, {url, :ok}}}, acc ->
-        Map.update!(acc, :ok, &[url | &1])
-
-      {_task, {:ok, {url, {:error, reason}}}}, acc ->
-        Map.update!(acc, :error, &[{url, reason} | &1])
-
-      {task, nil}, acc ->
-        Task.shutdown(task, :brutal_kill)
-        url = Map.get(task_to_url, task.ref, "unknown")
-        Map.update!(acc, :timeout, &[url | &1])
-    end)
-  end
-
-  @doc """
-  Sends a notification to a single webhook URL.
-  Returns `:ok` on success, `{:error, reason}` on failure.
-  """
-  @spec notify_one(String.t(), map()) :: :ok | {:error, term()}
-  def notify_one(url, _payload) do
-    cond do
-      String.contains?(url, "timeout") ->
-        :timer.sleep(60_000)
-        :ok
-
-      String.contains?(url, "error") ->
-        {:error, :connection_refused}
-
-      true ->
-        :timer.sleep(10)
-        :ok
-    end
-  end
-end
-```
-
-### Step 4: `lib/task_queue/batch_processor.ex` -- fan-out job processing
-
-The BatchProcessor uses `Task.async_stream/3` with bounded concurrency. The `on_timeout: :kill_task` option kills tasks that exceed the per-item timeout. Results are zipped with the original jobs to correlate output with input, since `async_stream` preserves order.
-
-```elixir
-defmodule TaskQueue.BatchProcessor do
-  @moduledoc """
-  Processes a list of jobs concurrently using `Task.async_stream/3`.
-  Results are returned in input order.
-  """
-
-  @default_concurrency 5
-  @default_timeout 30_000
-
-  @doc """
-  Processes a list of jobs concurrently and returns a summary.
-
-  Returns `%{succeeded: [...], failed: [...], timed_out: [...]}`.
-  """
-  @spec process_batch([map()], keyword()) :: %{
-    succeeded: [{map(), term()}],
-    failed: [{map(), term()}],
-    timed_out: [map()]
-  }
-  def process_batch(jobs, opts \\ []) when is_list(jobs) do
-    concurrency = Keyword.get(opts, :max_concurrency, @default_concurrency)
-    timeout     = Keyword.get(opts, :timeout, @default_timeout)
-
-    jobs
-    |> Task.async_stream(
-      &TaskQueue.Worker.execute/1,
-      max_concurrency: concurrency,
-      timeout: timeout,
-      on_timeout: :kill_task
-    )
-    |> Enum.zip(jobs)
-    |> Enum.reduce(%{succeeded: [], failed: [], timed_out: []}, fn
-      {{:ok, {:ok, result}}, job}, acc ->
-        Map.update!(acc, :succeeded, &[{job, result} | &1])
-
-      {{:ok, {:error, reason}}, job}, acc ->
-        Map.update!(acc, :failed, &[{job, reason} | &1])
-
-      {{:exit, :timeout}, job}, acc ->
-        Map.update!(acc, :timed_out, &[job | &1])
-    end)
-  end
-
-  @doc """
-  Returns a summary string for a batch result.
-
-  ## Examples
-
-      iex> result = %{succeeded: [1, 2], failed: [], timed_out: []}
-      iex> TaskQueue.BatchProcessor.summarize(result)
-      "2 succeeded, 0 failed, 0 timed out"
-
-  """
-  @spec summarize(map()) :: String.t()
-  def summarize(%{succeeded: ok, failed: err, timed_out: to}) do
-    "#{length(ok)} succeeded, #{length(err)} failed, #{length(to)} timed out"
-  end
-end
-```
-
-### Step 5: Tests
-
-```elixir
-# test/task_queue/fan_out_test.exs
-defmodule TaskQueue.FanOutTest do
-  use ExUnit.Case, async: true
-
-  alias TaskQueue.{Notifier, BatchProcessor}
-
-  describe "Notifier.notify_all/3" do
-    test "classifies successful notifications" do
-      urls = ["https://good1.example.com/hook", "https://good2.example.com/hook"]
-      result = Notifier.notify_all(urls, %{event: "batch_complete"}, timeout: 1_000)
-
-      assert length(result.ok) == 2
-      assert result.error == []
-      assert result.timeout == []
-    end
-
-    test "classifies failed notifications" do
-      urls = ["https://error.example.com/hook"]
-      result = Notifier.notify_all(urls, %{event: "batch_complete"}, timeout: 1_000)
-
-      assert result.ok == []
-      assert length(result.error) == 1
-      assert elem(hd(result.error), 1) == :connection_refused
-    end
-
-    test "classifies timed-out notifications" do
-      urls = ["https://timeout.example.com/hook"]
-      result = Notifier.notify_all(urls, %{event: "batch_complete"}, timeout: 100)
-
-      assert result.ok == []
-      assert length(result.timeout) == 1
-    end
-
-    test "handles mixed results" do
-      urls = [
-        "https://good.example.com/hook",
-        "https://error.example.com/hook",
-        "https://timeout.example.com/hook"
-      ]
-      result = Notifier.notify_all(urls, %{event: "test"}, timeout: 100)
-
-      assert length(result.ok) == 1
-      assert length(result.error) == 1
-      assert length(result.timeout) == 1
-    end
-
-    test "total time is bounded by max latency, not sum" do
-      urls = for i <- 1..5, do: "https://good#{i}.example.com/hook"
-
-      start = System.monotonic_time(:millisecond)
-      Notifier.notify_all(urls, %{}, timeout: 1_000)
-      elapsed = System.monotonic_time(:millisecond) - start
-
-      assert elapsed < 100
-    end
-  end
-
-  describe "BatchProcessor.process_batch/2" do
-    test "processes jobs concurrently" do
-      jobs = [
-        %{type: "noop", args: %{}},
-        %{type: "echo", args: %{x: 1}},
-        %{type: "noop", args: %{}}
-      ]
-
-      result = BatchProcessor.process_batch(jobs)
-
-      assert length(result.succeeded) == 3
-      assert result.failed == []
-      assert result.timed_out == []
-    end
-
-    test "classifies failed jobs separately" do
-      jobs = [
-        %{type: "noop", args: %{}},
-        %{type: "fail", args: %{reason: :test_error}}
-      ]
-
-      result = BatchProcessor.process_batch(jobs)
-
-      assert length(result.succeeded) == 1
-      assert length(result.failed) == 1
-    end
-
-    test "respects max_concurrency" do
-      counter = :counters.new(1, [])
-
-      jobs = for _ <- 1..10 do
-        %{type: "noop", args: %{counter: counter}}
-      end
-
-      BatchProcessor.process_batch(jobs, max_concurrency: 3)
-      assert :counters.get(counter, 1) >= 0
-    end
-
-    test "summarize/1 returns formatted string" do
-      result = %{succeeded: [1, 2], failed: [{:job, :error}], timed_out: []}
-      assert BatchProcessor.summarize(result) == "2 succeeded, 1 failed, 0 timed out"
-    end
-  end
-end
-```
-
-### Step 6: Run
+### Step 1: Create the project
 
 ```bash
-mix test test/task_queue/fan_out_test.exs --trace
+mix new fanout_aggregator
+cd fanout_aggregator
+```
+
+### Step 2: `lib/fanout_aggregator.ex`
+
+```elixir
+defmodule FanoutAggregator do
+  @moduledoc """
+  Generic fan-out / fan-in helper: runs a function against a list of
+  sources concurrently, then reduces the results with a user-supplied
+  combiner. Partial failures are surfaced in the return value so the
+  caller can decide whether to treat them as fatal.
+  """
+
+  @type source :: term()
+  @type result :: term()
+
+  @type aggregate_response :: %{
+          value: term(),
+          ok: non_neg_integer(),
+          failed: non_neg_integer(),
+          failures: [{source(), term()}]
+        }
+
+  @doc """
+  Runs `fun` against every element of `sources` concurrently, then
+  folds successful results through `combiner` starting from `initial`.
+
+  Options:
+    * `:max_concurrency` — default `System.schedulers_online() * 2`.
+    * `:timeout` — per-task deadline in ms, default `5_000`.
+  """
+  @spec aggregate([source()], (source() -> result()), term(), (result(), term() -> term()), keyword()) ::
+          aggregate_response()
+  def aggregate(sources, fun, initial, combiner, opts \\ [])
+      when is_list(sources) and is_function(fun, 1) and is_function(combiner, 2) do
+    max_concurrency = Keyword.get(opts, :max_concurrency, System.schedulers_online() * 2)
+    timeout = Keyword.get(opts, :timeout, 5_000)
+
+    sources
+    |> Task.async_stream(fun,
+      max_concurrency: max_concurrency,
+      timeout: timeout,
+      on_timeout: :kill_task,
+      ordered: false
+    )
+    |> Enum.zip(sources)
+    |> Enum.reduce(%{value: initial, ok: 0, failed: 0, failures: []}, fn
+      {{:ok, value}, _source}, acc ->
+        %{acc | value: combiner.(value, acc.value), ok: acc.ok + 1}
+
+      {{:exit, reason}, source}, acc ->
+        %{acc | failed: acc.failed + 1, failures: [{source, reason} | acc.failures]}
+    end)
+  end
+end
+```
+
+### Step 3: `test/fanout_aggregator_test.exs`
+
+```elixir
+defmodule FanoutAggregatorTest do
+  use ExUnit.Case, async: true
+
+  describe "aggregate/5 — happy path" do
+    test "sums integers from all sources" do
+      sources = [1, 2, 3, 4, 5]
+
+      result =
+        FanoutAggregator.aggregate(sources, &(&1 * 10), 0, &Kernel.+/2)
+
+      assert result.value == 150
+      assert result.ok == 5
+      assert result.failed == 0
+      assert result.failures == []
+    end
+
+    test "merges maps from all sources" do
+      sources = [:a, :b, :c]
+
+      result =
+        FanoutAggregator.aggregate(
+          sources,
+          fn s -> %{s => to_string(s)} end,
+          %{},
+          &Map.merge/2
+        )
+
+      assert result.value == %{a: "a", b: "b", c: "c"}
+      assert result.ok == 3
+    end
+
+    test "runs in parallel — slowest source dominates, not the sum" do
+      sources = 1..5 |> Enum.to_list()
+
+      {elapsed_us, _result} =
+        :timer.tc(fn ->
+          FanoutAggregator.aggregate(
+            sources,
+            fn _ -> Process.sleep(80); :ok end,
+            [],
+            fn v, acc -> [v | acc] end,
+            max_concurrency: 5
+          )
+        end)
+
+      # Serial would be ~400ms. Parallel should be ~80ms plus overhead.
+      assert elapsed_us < 200_000
+    end
+  end
+
+  describe "aggregate/5 — partial failure" do
+    test "records timeouts as failures and keeps the good results" do
+      sources = [:fast_a, :slow, :fast_b]
+
+      result =
+        FanoutAggregator.aggregate(
+          sources,
+          fn
+            :slow -> Process.sleep(500); :late
+            other -> other
+          end,
+          [],
+          fn v, acc -> [v | acc] end,
+          timeout: 50
+        )
+
+      assert result.ok == 2
+      assert result.failed == 1
+      assert [{:slow, _reason}] = result.failures
+      assert Enum.sort(result.value) == [:fast_a, :fast_b]
+    end
+
+    test "records raised errors as failures" do
+      sources = [:ok1, :boom, :ok2]
+
+      result =
+        FanoutAggregator.aggregate(
+          sources,
+          fn
+            :boom -> raise "nope"
+            other -> other
+          end,
+          [],
+          fn v, acc -> [v | acc] end
+        )
+
+      assert result.ok == 2
+      assert result.failed == 1
+      assert [{:boom, _}] = result.failures
+    end
+  end
+end
+```
+
+### Step 4: Run
+
+```bash
+mix test
 ```
 
 ---
 
-## Trade-off analysis
+## Trade-offs and production gotchas
 
-| Tool | Ordered results | Backpressure | Shared deadline | Best for |
-|------|----------------|-------------|----------------|----------|
-| `Task.async_stream` | yes | yes (max_concurrency) | per-item timeout | batch processing |
-| `Task.yield_many` | no (by arrival) | no -- all start immediately | yes (shared) | fan-out with a single deadline |
-| `Task.async` + `Task.await` | yes | no | per-task timeout | simple parallel computation |
-| `GenStage` | configurable | yes (demand) | no | continuous streaming pipeline |
+**1. `ordered: false` gives you throughput, not determinism**
+With `ordered: false`, the first result returned is the first to finish,
+not the first source in the input. For associative combiners (sum, union,
+max) this is fine. For order-sensitive reducers, use `ordered: true` and
+accept the cost of waiting for earlier-in-input slow tasks.
 
----
+**2. `on_timeout: :kill_task` brutalizes the worker**
+A killed task cannot clean up. If it holds external resources (an open
+transaction, a file handle, a bookshop reservation), those leak. For
+work with external side effects, prefer `Task.yield_many` + explicit
+`Task.shutdown` (exercise 53) or an in-worker deadline.
 
-## Common production mistakes
+**3. `max_concurrency` bounds in-flight, not total time**
+With 100 sources, `max_concurrency: 10`, and 500ms per task, the total
+wall time is ~5s — not 500ms. The deadline is per-task, not per-batch.
+If you need a request-level deadline, wrap the whole call in a separate
+`Task` + `Task.yield` + `Task.shutdown`.
 
-**1. Not shutting down timed-out tasks from `yield_many`**
-When `yield_many` returns `nil`, the task is still running. Call `Task.shutdown(task, :brutal_kill)`.
+**4. Partial-result APIs need explicit contract**
+A function that returns "2 of 3 sources succeeded" forces every caller
+to handle partial data. Either document clearly which sources may be
+missing, or decide the endpoint is all-or-nothing. Don't leave it
+ambiguous — callers will assume completeness and be wrong.
 
-**2. Using `Task.async` for work that must survive the caller's crash**
-Tasks are linked to the calling process. Use `Task.Supervisor.start_child/2` for independent work.
+**5. The reducer runs in the caller, in result order**
+If the reducer is slow, it bottlenecks the whole fan-in. Keep combiners
+cheap (sums, merges, list-cons) and do heavy post-processing after
+`aggregate` returns.
 
-**3. Unbounded fan-out without `max_concurrency`**
-Starting 10,000 tasks simultaneously overwhelms downstream services. Use `Task.async_stream` with bounded concurrency.
-
-**4. Assuming `async_stream` result order matches input order for failures**
-`{:exit, :timeout}` entries appear in the position of the timed-out item. Zip results with inputs before classifying.
-
-**5. Catching `Task.yield_many` nil as an error**
-A `nil` means the task did not finish within the timeout, not that it failed. The task may still succeed. Call `Task.shutdown/2` to abandon it.
+**6. When NOT to fan out**
+- Single-source queries — obvious.
+- Sources that share a rate limit: parallel requests get throttled or
+  banned. Serialize or use a dedicated pool.
+- Sources that must see requests in a strict order (event sourcing,
+  certain caches). Fan-out breaks the sequence.
 
 ---
 
 ## Resources
 
-- [Task module -- official docs](https://hexdocs.pm/elixir/Task.html)
-- [Task.async_stream/5 -- docs](https://hexdocs.pm/elixir/Task.html#async_stream/5)
-- [Task.yield_many/2 -- docs](https://hexdocs.pm/elixir/Task.html#yield_many/2)
+- [`Task.async_stream/3`](https://hexdocs.pm/elixir/Task.html#async_stream/3)
+- [`Task.yield_many/2`](https://hexdocs.pm/elixir/Task.html#yield_many/2) — for deadline-oriented collection
+- ["Scatter-gather" — Enterprise Integration Patterns](https://www.enterpriseintegrationpatterns.com/patterns/messaging/BroadcastAggregate.html)
+- [Fred Hebert — "Stuff Goes Bad: Erlang in Anger"](https://www.erlang-in-anger.com/) — chapters on timeouts and partial failure
