@@ -681,6 +681,19 @@ mix test test/meshex/ --trace
 
 The design separates concerns along their real axes: what must be correct (the service mesh proxy invariants), what must be fast (the hot path isolated from slow paths), and what must be evolvable (external contracts kept narrow). Each module has one job and fails loudly when given inputs outside its contract, so bugs surface near their source instead of as mysterious downstream symptoms. The tests exercise the invariants directly rather than implementation details, which keeps them useful across refactors.
 
+
+## Main Entry Point
+
+```elixir
+def main do
+  IO.puts("======== 39 build service mesh proxy ========")
+  IO.puts("Demonstrating core functionality")
+  IO.puts("")
+  
+  IO.puts("Run: mix test")
+end
+```
+
 ## Benchmark
 
 ```elixir
@@ -708,15 +721,17 @@ Benchee.run(%{
     Meshex.Tracing.build_traceparent("abc123def456abc123def456abc123de", "0102030405060708")
   end
 }, time: 10, warmup: 3)
+```
 
-def main do
-  IO.puts("[Meshex] Service mesh sidecar proxy with mTLS, circuit breaking, retries, tracing")
-  IO.puts("Per-(source, destination) circuit breakers isolate failure domains")
-  IO.puts("Retry budget prevents amplification during cascading failures")
-  IO.puts("SPIFFE ephemeral certificates eliminate revocation overhead")
-  IO.puts("W3C TraceContext propagation enables distributed tracing across the mesh")
-  :ok
-end
+## Quick start
+
+```bash
+# Start the application
+mix deps.get
+mix test
+
+# Or run the benchmark:
+mix run bench/meshex_bench.exs
 ```
 
 Target: <100µs per-request proxy latency at p99 with mTLS enabled.

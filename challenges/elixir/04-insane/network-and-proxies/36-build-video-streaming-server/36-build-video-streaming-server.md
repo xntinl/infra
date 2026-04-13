@@ -579,6 +579,19 @@ mix test test/hls_server/ --trace
 
 The design separates concerns along their real axes: what must be correct (the video streaming (HLS/DASH) invariants), what must be fast (the hot path isolated from slow paths), and what must be evolvable (external contracts kept narrow). Each module has one job and fails loudly when given inputs outside its contract, so bugs surface near their source instead of as mysterious downstream symptoms. The tests exercise the invariants directly rather than implementation details, which keeps them useful across refactors.
 
+
+## Main Entry Point
+
+```elixir
+def main do
+  IO.puts("======== 36 build video streaming server ========")
+  IO.puts("Demonstrating core functionality")
+  IO.puts("")
+  
+  IO.puts("Run: mix test")
+end
+```
+
 ## Benchmark
 
 ```elixir
@@ -605,14 +618,17 @@ Benchee.run(%{
     HLSServer.Playlist.Media.render(playlist)
   end
 }, time: 10, warmup: 3)
+```
 
-def main do
-  IO.puts("[HLSServer] Adaptive bitrate video streaming server (HLS)")
-  IO.puts("Segment-based delivery enables CDN caching and resume/seek without re-encoding")
-  IO.puts("Sliding-window playlists for live streams prevent unbounded playlist growth")
-  IO.puts("Range request support enables parallel chunk downloads and resumable transfers")
-  :ok
-end
+## Quick start
+
+```bash
+# Start the application
+mix deps.get
+mix test
+
+# Or run the benchmark:
+mix run bench/hls_server_bench.exs
 ```
 
 Target: sustained >10 Gbps per node with <100ms segment TTFB.

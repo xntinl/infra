@@ -554,6 +554,19 @@ Subscriptions are rows in an ETS `:bag` keyed by topic, so lookup is O(1) and co
 
 ---
 
+
+## Main Entry Point
+
+```elixir
+def main do
+  IO.puts("======== 11 build custom event bus registry ========")
+  IO.puts("Demonstrating core functionality")
+  IO.puts("")
+  
+  IO.puts("Run: mix test")
+end
+```
+
 ## Benchmark
 
 **Objective**: Measure publisher throughput with increasing fan-out and validate ETS lookup performance.

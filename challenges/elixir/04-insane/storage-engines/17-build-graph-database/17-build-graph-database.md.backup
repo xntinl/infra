@@ -882,12 +882,19 @@ Each vertex stores its adjacency list in ETS; BFS/DFS traversal streams neighbor
 ```elixir
 # bench/graph_bench.exs
 Benchee.run(%{"2_hop" => fn -> Graph.query(g, :vertex_42, depth: 2) end}, time: 10)
-def main do
-  IO.puts("[GraphDB.Parser] GenServer demo")
-  :ok
-end
-
 ```
+
+## Quick start
+
+```bash
+# Start the application
+mix deps.get
+mix test
+
+# Or run the benchmark:
+mix run bench/graph_bench.exs
+```
+
 
 Target: 2-hop queries in < 5 ms on a graph of 100k vertices and 1M edges.
 

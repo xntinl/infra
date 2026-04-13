@@ -759,6 +759,19 @@ The compiler lowers the AST to a linear sequence of stack-machine opcodes, perfo
 
 ---
 
+
+## Main Entry Point
+
+```elixir
+def main do
+  IO.puts("======== 26 build mini language compiler ========")
+  IO.puts("Demonstrating core functionality")
+  IO.puts("")
+  
+  IO.puts("Run: mix test")
+end
+```
+
 ## Benchmark workload
 
 El benchmark mide compilación (parsing + type checking) y ejecución. El programa es factorial recursivo, que expone:

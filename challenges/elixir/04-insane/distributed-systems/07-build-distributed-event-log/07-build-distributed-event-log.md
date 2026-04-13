@@ -483,6 +483,19 @@ For production deployment:
 
 ---
 
+
+## Main Entry Point
+
+```elixir
+def main do
+  IO.puts("======== 07 build distributed event log ========")
+  IO.puts("Demonstrating core functionality")
+  IO.puts("")
+  
+  IO.puts("Run: mix test")
+end
+```
+
 ## Benchmark
 
 **Target**: 500,000 messages/second write throughput (`acks=1`), 1M messages/second read throughput.

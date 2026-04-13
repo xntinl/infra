@@ -700,6 +700,19 @@ Writes hit an in-memory skiplist; when it fills, it's flushed as an immutable SS
 
 ---
 
+
+## Main Entry Point
+
+```elixir
+def main do
+  IO.puts("======== 15 build lsm tree storage engine ========")
+  IO.puts("Demonstrating core functionality")
+  IO.puts("")
+  
+  IO.puts("Run: mix test")
+end
+```
+
 ## Benchmark
 
 ```elixir

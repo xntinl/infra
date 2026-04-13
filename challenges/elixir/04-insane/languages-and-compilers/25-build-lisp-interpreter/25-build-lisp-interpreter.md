@@ -682,6 +682,19 @@ This converts the interpreter's call stack into a heap-allocated loop, allowing 
 
 ---
 
+
+## Main Entry Point
+
+```elixir
+def main do
+  IO.puts("======== 25 build lisp interpreter ========")
+  IO.puts("Demonstrating core functionality")
+  IO.puts("")
+  
+  IO.puts("Run: mix test")
+end
+```
+
 ## Benchmark workload
 
 El benchmark debe contrastar dos patrones distintos:

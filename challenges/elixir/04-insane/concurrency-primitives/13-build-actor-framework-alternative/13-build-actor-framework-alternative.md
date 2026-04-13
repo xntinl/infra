@@ -446,6 +446,19 @@ Each actor runs a custom `:proc_lib` process with a hand-written receive loop th
 
 ---
 
+
+## Main Entry Point
+
+```elixir
+def main do
+  IO.puts("======== 13 build actor framework alternative ========")
+  IO.puts("Demonstrating core functionality")
+  IO.puts("")
+  
+  IO.puts("Run: mix test")
+end
+```
+
 ## Benchmark
 
 **Objective**: Measure typed dispatch overhead and hot-swap latency impact.

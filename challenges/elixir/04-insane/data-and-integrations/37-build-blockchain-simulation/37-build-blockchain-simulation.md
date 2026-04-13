@@ -700,6 +700,19 @@ mix run bench/mining_bench.exs
 
 Expected output: All cryptographic tests pass (genesis consistency, signature round-trips, deterministic hashing), wallet generation produces unique addresses, and the consensus test shows two nodes converging to the same chain after a fork within 100ms.
 
+
+## Main Entry Point
+
+```elixir
+def main do
+  IO.puts("======== 37 build blockchain simulation ========")
+  IO.puts("Demonstrating core functionality")
+  IO.puts("")
+  
+  IO.puts("Run: mix test")
+end
+```
+
 ## Benchmark
 
 ```elixir

@@ -670,6 +670,19 @@ defmodule AgentFramework.PoolTest do
 end
 ```
 
+
+## Main Entry Point
+
+```elixir
+def main do
+  IO.puts("======== 54 build ai agents framework ========")
+  IO.puts("Demonstrating core functionality")
+  IO.puts("")
+  
+  IO.puts("Run: mix test")
+end
+```
+
 ## Benchmark
 
 ```elixir
@@ -680,12 +693,19 @@ end
 end)
 
 IO.puts("average: #{time_us / 10_000} µs per op")
-def main do
-  IO.puts("[AgentFramework.LLM] GenServer demo")
-  :ok
-end
-
 ```
+
+## Quick start
+
+```bash
+# Start the application
+mix deps.get
+mix test
+
+# Or run the benchmark:
+mix run bench/agents_bench.exs
+```
+
 
 Target: <2s end-to-end for a 3-step ReAct loop excluding LLM call latency.
 

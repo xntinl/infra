@@ -527,6 +527,19 @@ mix test test/swarm/ --trace
 
 The design separates concerns along their real axes: what must be correct (the P2P file sharing (BitTorrent-like) invariants), what must be fast (the hot path isolated from slow paths), and what must be evolvable (external contracts kept narrow). Each module has one job and fails loudly when given inputs outside its contract, so bugs surface near their source instead of as mysterious downstream symptoms. The tests exercise the invariants directly rather than implementation details, which keeps them useful across refactors.
 
+
+## Main Entry Point
+
+```elixir
+def main do
+  IO.puts("======== 38 build p2p file sharing ========")
+  IO.puts("Demonstrating core functionality")
+  IO.puts("")
+  
+  IO.puts("Run: mix test")
+end
+```
+
 ## Benchmark
 
 ```elixir
@@ -552,14 +565,17 @@ Benchee.run(%{
     Swarm.Metadata.piece_range(meta, rem(:rand.uniform(1000), Swarm.Metadata.num_pieces(meta)))
   end
 }, time: 10, warmup: 3)
+```
 
-def main do
-  IO.puts("[Swarm] BitTorrent-inspired P2P file sharing with DHT")
-  IO.puts("Rarest-first piece selection maximizes swarm distribution")
-  IO.puts("Kademlia DHT enables peer discovery without a central tracker")
-  IO.puts("Token bucket rate limiting prevents peer saturation and balances uploads")
-  :ok
-end
+## Quick start
+
+```bash
+# Start the application
+mix deps.get
+mix test
+
+# Or run the benchmark:
+mix run bench/swarm_bench.exs
 ```
 
 Target: swarm of 100 peers should saturate available bandwidth within 30s of first-piece exchange.

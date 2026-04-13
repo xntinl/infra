@@ -1232,6 +1232,19 @@ defmodule InferenceEngine.EngineTest do
 end
 ```
 
+
+## Main Entry Point
+
+```elixir
+def main do
+  IO.puts("======== 43 build ai inference engine ========")
+  IO.puts("Demonstrating core functionality")
+  IO.puts("")
+  
+  IO.puts("Run: mix test")
+end
+```
+
 ## Benchmark
 
 ```elixir

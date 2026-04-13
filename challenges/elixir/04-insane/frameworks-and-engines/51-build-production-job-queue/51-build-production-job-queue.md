@@ -693,6 +693,19 @@ defmodule JobQueue.UniquenessTest do
 end
 ```
 
+
+## Main Entry Point
+
+```elixir
+def main do
+  IO.puts("======== 51 build production job queue ========")
+  IO.puts("Demonstrating core functionality")
+  IO.puts("")
+  
+  IO.puts("Run: mix test")
+end
+```
+
 ## Benchmark
 
 ```elixir

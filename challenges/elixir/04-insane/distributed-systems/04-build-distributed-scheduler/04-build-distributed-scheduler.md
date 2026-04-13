@@ -547,6 +547,19 @@ This is a single-dispatcher implementation. For distributed deployment:
 
 ---
 
+
+## Main Entry Point
+
+```elixir
+def main do
+  IO.puts("======== 04 build distributed scheduler ========")
+  IO.puts("Demonstrating core functionality")
+  IO.puts("")
+  
+  IO.puts("Run: mix test")
+end
+```
+
 ## Benchmark
 
 **Target**: 10,000 jobs/second enqueued and dispatched end-to-end on a 3-shard localhost cluster.

@@ -728,6 +728,19 @@ For a production deployment:
 
 ---
 
+
+## Main Entry Point
+
+```elixir
+def main do
+  IO.puts("======== 02 build distributed transaction coordinator ========")
+  IO.puts("Demonstrating core functionality")
+  IO.puts("")
+  
+  IO.puts("Run: mix test")
+end
+```
+
 ## Benchmark
 
 **Target**: 1,000 cross-partition transactions/second on a 3-partition localhost cluster; p99 < 30 ms.

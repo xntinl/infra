@@ -778,6 +778,19 @@ defmodule WorkflowEngine.DurabilityTest do
 end
 ```
 
+
+## Main Entry Point
+
+```elixir
+def main do
+  IO.puts("======== 47 build workflow engine temporal like ========")
+  IO.puts("Demonstrating core functionality")
+  IO.puts("")
+  
+  IO.puts("Run: mix test")
+end
+```
+
 ## Benchmark
 
 ```elixir

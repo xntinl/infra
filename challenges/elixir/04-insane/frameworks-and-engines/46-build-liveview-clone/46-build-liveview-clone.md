@@ -933,6 +933,19 @@ defmodule Vivo.DiffPropertyTest do
 end
 ```
 
+
+## Main Entry Point
+
+```elixir
+def main do
+  IO.puts("======== 46 build liveview clone ========")
+  IO.puts("Demonstrating core functionality")
+  IO.puts("")
+  
+  IO.puts("Run: mix test")
+end
+```
+
 ## Benchmark
 
 ```elixir

@@ -877,6 +877,19 @@ Each vertex stores its adjacency list in ETS; BFS/DFS traversal streams neighbor
 
 ---
 
+
+## Main Entry Point
+
+```elixir
+def main do
+  IO.puts("======== 17 build graph database ========")
+  IO.puts("Demonstrating core functionality")
+  IO.puts("")
+  
+  IO.puts("Run: mix test")
+end
+```
+
 ## Benchmark
 
 ```elixir

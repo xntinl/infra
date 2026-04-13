@@ -133,6 +133,19 @@ If you batch telemetry events and crash before sending the batch, the events are
 
 ---
 
+
+## Main Entry Point
+
+```elixir
+def main do
+  IO.puts("======== 44 build full stack distributed system ========")
+  IO.puts("Demonstrating core functionality")
+  IO.puts("")
+  
+  IO.puts("Run: mix test")
+end
+```
+
 ## Reflection
 
 1. **Cascading failure chain**: Trace through the cascade scenario above. At what point would you intervene, and how?

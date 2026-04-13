@@ -989,6 +989,19 @@ This is a educational, single-node simulation. For distributed deployment:
 
 ---
 
+
+## Main Entry Point
+
+```elixir
+def main do
+  IO.puts("======== 01 build distributed raft consensus ========")
+  IO.puts("Demonstrating core functionality")
+  IO.puts("")
+  
+  IO.puts("Run: mix test")
+end
+```
+
 ## Benchmark
 
 **Target**: 10,000 linearizable writes/second on a 5-node localhost cluster; p99 < 20 ms.

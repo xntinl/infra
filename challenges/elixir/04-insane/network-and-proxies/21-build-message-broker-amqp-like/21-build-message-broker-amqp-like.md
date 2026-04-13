@@ -519,6 +519,19 @@ The broker tracks each consumer's unacked set in ETS and only pushes up to `pref
 
 ---
 
+
+## Main Entry Point
+
+```elixir
+def main do
+  IO.puts("======== 21 build message broker amqp like ========")
+  IO.puts("Demonstrating core functionality")
+  IO.puts("")
+  
+  IO.puts("Run: mix test")
+end
+```
+
 ## Benchmark
 
 ```elixir
@@ -541,13 +554,17 @@ Benchee.run(%{
     AMQP.Connection.close(conn)
   end
 }, time: 10, warmup: 3)
+```
 
-def main do
-  IO.puts("[Brokex] AMQP 0-9-1 message broker")
-  IO.puts("Publisher confirms enable at-least-once delivery semantics")
-  IO.puts("Pre-segmented storage and durable queues provide recovery guarantees")
-  :ok
-end
+## Quick start
+
+```bash
+# Start the application
+mix deps.get
+mix test
+
+# Or run the benchmark:
+mix run bench/brokex_bench.exs
 ```
 
 Target: 50,000 messages/second routed end-to-end with 10 consumers and prefetch=100.

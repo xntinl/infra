@@ -667,6 +667,19 @@ Expected: sampling 500 processes should complete in under 1ms per round. At 100 
 
 The design separates concerns along their real axes: what must be correct (the BEAM profiler invariants), what must be fast (the hot path isolated from slow paths), and what must be evolvable (external contracts kept narrow). Each module has one job and fails loudly when given inputs outside its contract, so bugs surface near their source instead of as mysterious downstream symptoms. The tests exercise the invariants directly rather than implementation details, which keeps them useful across refactors.
 
+
+## Main Entry Point
+
+```elixir
+def main do
+  IO.puts("======== 30 build profiler performance analyzer ========")
+  IO.puts("Demonstrating core functionality")
+  IO.puts("")
+  
+  IO.puts("Run: mix test")
+end
+```
+
 ## Benchmark
 
 ```elixir

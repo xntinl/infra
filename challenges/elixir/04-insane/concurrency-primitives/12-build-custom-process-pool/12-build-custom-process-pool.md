@@ -525,6 +525,19 @@ Workers register with the pool when idle and deregister when busy; `checkout/1` 
 
 ---
 
+
+## Main Entry Point
+
+```elixir
+def main do
+  IO.puts("======== 12 build custom process pool ========")
+  IO.puts("Demonstrating core functionality")
+  IO.puts("")
+  
+  IO.puts("Run: mix test")
+end
+```
+
 ## Benchmark
 
 **Objective**: Measure checkout+checkin throughput under sustained concurrent load and verify priority queue fairness.

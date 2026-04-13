@@ -636,6 +636,19 @@ mix test test/apigw/ --trace
 
 The design separates concerns along their real axes: what must be correct (the API gateway invariants), what must be fast (the hot path isolated from slow paths), and what must be evolvable (external contracts kept narrow). Each module has one job and fails loudly when given inputs outside its contract, so bugs surface near their source instead of as mysterious downstream symptoms. The tests exercise the invariants directly rather than implementation details, which keeps them useful across refactors.
 
+
+## Main Entry Point
+
+```elixir
+def main do
+  IO.puts("======== 34 build api gateway ========")
+  IO.puts("Demonstrating core functionality")
+  IO.puts("")
+  
+  IO.puts("Run: mix test")
+end
+```
+
 ## Benchmark
 
 ```elixir
@@ -670,14 +683,17 @@ defp make_test_jwt do
   sig = :crypto.mac(:hmac, :sha256, "secret", "#{header}.#{payload}") |> Base.url_encode64(padding: false)
   "#{header}.#{payload}.#{sig}"
 end
+```
 
-def main do
-  IO.puts("[Apigw] Production API gateway with discovery, auth, rate limiting, circuit breaking")
-  IO.puts("Circuit breakers prevent cascading failures across backends")
-  IO.puts("Lease-based rate limiting scales across multiple gateway nodes")
-  IO.puts("JWT verification with constant-time comparison prevents timing attacks")
-  :ok
-end
+## Quick start
+
+```bash
+# Start the application
+mix deps.get
+mix test
+
+# Or run the benchmark:
+mix run bench/apigw_bench.exs
 ```
 
 Target: <500µs gateway overhead per request at p99 excluding upstream latency.

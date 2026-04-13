@@ -544,6 +544,19 @@ Each supervisor spawns children with `:proc_lib.start_link/3` and monitors them;
 
 ---
 
+
+## Main Entry Point
+
+```elixir
+def main do
+  IO.puts("======== 10 build custom genserver supervisor ========")
+  IO.puts("Demonstrating core functionality")
+  IO.puts("")
+  
+  IO.puts("Run: mix test")
+end
+```
+
 ## Benchmark
 
 **Objective**: Measure the overhead of the custom GenServer call/cast protocol and restart monitoring against native OTP.

@@ -661,6 +661,19 @@ Target: `lookup/2` < 1µs per call with 10 physical nodes and V=150.
 
 ---
 
+
+## Main Entry Point
+
+```elixir
+def main do
+  IO.puts("======== 09 build consistent hashing rebalancer ========")
+  IO.puts("Demonstrating core functionality")
+  IO.puts("")
+  
+  IO.puts("Run: mix test")
+end
+```
+
 ## Reflection
 
 1. **Load imbalance vs vnode count**: How does doubling V from 75 to 150 affect the standard deviation of key counts per node? Run the distribution test at both V levels.

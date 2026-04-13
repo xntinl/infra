@@ -448,6 +448,19 @@ Each key maps to exactly one primary owner on the ring, and replicas follow the 
 
 ---
 
+
+## Main Entry Point
+
+```elixir
+def main do
+  IO.puts("======== 03 build distributed cache redis like ========")
+  IO.puts("Demonstrating core functionality")
+  IO.puts("")
+  
+  IO.puts("Run: mix test")
+end
+```
+
 ## Benchmark
 
 ```elixir

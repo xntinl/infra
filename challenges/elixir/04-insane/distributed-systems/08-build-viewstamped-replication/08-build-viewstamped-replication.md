@@ -942,6 +942,19 @@ Target: 5,000 linearizable operations/second on a 5-replica cluster; view-change
 
 ---
 
+
+## Main Entry Point
+
+```elixir
+def main do
+  IO.puts("======== 08 build viewstamped replication ========")
+  IO.puts("Demonstrating core functionality")
+  IO.puts("")
+  
+  IO.puts("Run: mix test")
+end
+```
+
 ## Reflection
 
 1. Under a steady stream of primary crashes, VR rotates primaries deterministically. Does this ever produce a worse outcome than Raft's log-comparison election? Give an example.

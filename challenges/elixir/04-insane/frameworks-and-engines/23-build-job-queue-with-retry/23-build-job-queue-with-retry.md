@@ -564,6 +564,19 @@ Jobs enqueue into ETS and append to a WAL before acknowledging; workers claim jo
 
 ---
 
+
+## Main Entry Point
+
+```elixir
+def main do
+  IO.puts("======== 23 build job queue with retry ========")
+  IO.puts("Demonstrating core functionality")
+  IO.puts("")
+  
+  IO.puts("Run: mix test")
+end
+```
+
 ## Benchmark
 
 ```elixir

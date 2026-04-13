@@ -753,6 +753,19 @@ Documents are tokenized, and each token maps to a posting list of `(doc_id, term
 
 ---
 
+
+## Main Entry Point
+
+```elixir
+def main do
+  IO.puts("======== 19 build search engine inverted index ========")
+  IO.puts("Demonstrating core functionality")
+  IO.puts("")
+  
+  IO.puts("Run: mix test")
+end
+```
+
 ## Benchmark
 
 ```elixir

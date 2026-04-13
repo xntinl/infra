@@ -651,6 +651,19 @@ For production deployment:
 
 ---
 
+
+## Main Entry Point
+
+```elixir
+def main do
+  IO.puts("======== 05 build gossip membership protocol ========")
+  IO.puts("Demonstrating core functionality")
+  IO.puts("")
+  
+  IO.puts("Run: mix test")
+end
+```
+
 ## Benchmark
 
 **Target**: Convergence under 2 seconds for a 100-node localhost cluster after a single join; O(log N) round count.

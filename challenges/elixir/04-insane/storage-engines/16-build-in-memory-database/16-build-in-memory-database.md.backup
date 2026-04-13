@@ -756,12 +756,19 @@ Each key points to a version chain; readers snapshot the latest committed versio
 ```elixir
 # bench/imdb_bench.exs
 Benchee.run(%{"put" => ..., "get" => ..., "range_scan" => ...}, time: 10)
-def main do
-  IO.puts("[Memdb.MVCC] GenServer demo")
-  :ok
-end
-
 ```
+
+## Quick start
+
+```bash
+# Start the application
+mix deps.get
+mix test
+
+# Or run the benchmark:
+mix run bench/imdb_bench.exs
+```
+
 
 Target: 100,000 ops/second (mixed read/write) on a single node; p99 get < 50 µs.
 

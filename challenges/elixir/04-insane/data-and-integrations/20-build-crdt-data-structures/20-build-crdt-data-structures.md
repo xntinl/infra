@@ -633,6 +633,19 @@ mix run bench/crdts_bench.exs
 
 Expected output: All lattice law tests pass (commutativity, associativity, idempotency), and the 5-node convergence test completes within 1 second after network healing.
 
+
+## Main Entry Point
+
+```elixir
+def main do
+  IO.puts("======== 20 build crdt data structures ========")
+  IO.puts("Demonstrating core functionality")
+  IO.puts("")
+  
+  IO.puts("Run: mix test")
+end
+```
+
 ## Benchmark
 
 ```elixir

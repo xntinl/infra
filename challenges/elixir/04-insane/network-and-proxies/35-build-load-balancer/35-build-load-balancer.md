@@ -685,6 +685,19 @@ Expected baseline: a pure TCP relay should forward at least 50k req/s on modern 
 
 The design separates concerns along their real axes: what must be correct (the load balancer invariants), what must be fast (the hot path isolated from slow paths), and what must be evolvable (external contracts kept narrow). Each module has one job and fails loudly when given inputs outside its contract, so bugs surface near their source instead of as mysterious downstream symptoms. The tests exercise the invariants directly rather than implementation details, which keeps them useful across refactors.
 
+
+## Main Entry Point
+
+```elixir
+def main do
+  IO.puts("======== 35 build load balancer ========")
+  IO.puts("Demonstrating core functionality")
+  IO.puts("")
+  
+  IO.puts("Run: mix test")
+end
+```
+
 ## Benchmark
 
 ```elixir
@@ -714,14 +727,17 @@ Benchee.run(%{
     {:ok, _} = Balancer.Pool.select(:least_connections)
   end
 }, time: 10, warmup: 3)
+```
 
-def main do
-  IO.puts("[Balancer] TCP/HTTP load balancer with health checking")
-  IO.puts("Power-of-two-choices achieves near-optimal load balance with O(1) overhead")
-  IO.puts("Weighted round-robin using current-weight algorithm scales to large weights")
-  IO.puts("Active + passive health checks prevent cascading failures")
-  :ok
-end
+## Quick start
+
+```bash
+# Start the application
+mix deps.get
+mix test
+
+# Or run the benchmark:
+mix run bench/balancer_bench.exs
 ```
 
 Target: <1µs per backend selection at 100 backends.

@@ -191,7 +191,20 @@ end
 mix test test/locksmith/ --trace
 ```
 
-### Benchmark
+#
+## Main Entry Point
+
+```elixir
+def main do
+  IO.puts("======== 50 build distributed lock service ========")
+  IO.puts("Demonstrating core functionality")
+  IO.puts("")
+  
+  IO.puts("Run: mix test")
+end
+```
+
+## Benchmark
 
 **Objective**: Quantify contention and latency under load so lock fairness and throughput stay measured.
 

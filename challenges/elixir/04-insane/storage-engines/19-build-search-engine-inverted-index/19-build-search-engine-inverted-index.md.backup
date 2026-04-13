@@ -758,12 +758,19 @@ Documents are tokenized, and each token maps to a posting list of `(doc_id, term
 ```elixir
 # bench/search_bench.exs
 Benchee.run(%{"query" => fn -> Search.query("elixir genserver") end}, time: 10)
-def main do
-  IO.puts("[Searcher.Engine] GenServer demo")
-  :ok
-end
-
 ```
+
+## Quick start
+
+```bash
+# Start the application
+mix deps.get
+mix test
+
+# Or run the benchmark:
+mix run bench/search_bench.exs
+```
+
 
 Target: 1M-document index; query latency p99 < 10 ms for 2-term intersections.
 

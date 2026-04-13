@@ -701,6 +701,19 @@ The compiler turns the pattern into an NFA with ε-transitions; the VM maintains
 
 ---
 
+
+## Main Entry Point
+
+```elixir
+def main do
+  IO.puts("======== 27 build regex engine ========")
+  IO.puts("Demonstrating core functionality")
+  IO.puts("")
+  
+  IO.puts("Run: mix test")
+end
+```
+
 ## Benchmark workload
 
 El benchmark contrasta:

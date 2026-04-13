@@ -523,6 +523,19 @@ Target: 500k checks/second on a 3-node cluster with P99 < 1ms.
 
 ---
 
+
+## Main Entry Point
+
+```elixir
+def main do
+  IO.puts("======== 24 build distributed rate limiter ========")
+  IO.puts("Demonstrating core functionality")
+  IO.puts("")
+  
+  IO.puts("Run: mix test")
+end
+```
+
 ## Reflection
 
 1. **Lease size tradeoff**: If you acquire a lease for K tokens over T seconds, what happens if two nodes acquire leases for the same account during the same epoch?

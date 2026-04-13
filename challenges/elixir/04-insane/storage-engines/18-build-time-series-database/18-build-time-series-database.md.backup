@@ -728,12 +728,19 @@ Incoming points land in an in-memory head chunk; when it closes by size or time,
 ```elixir
 # bench/tsdb_bench.exs
 Benchee.run(%{"ingest_100k_points" => fn -> Tsdb.write(points) end}, time: 10)
-def main do
-  IO.puts("[Chronos.Gorilla] GenServer demo")
-  :ok
-end
-
 ```
+
+## Quick start
+
+```bash
+# Start the application
+mix deps.get
+mix test
+
+# Or run the benchmark:
+mix run bench/tsdb_bench.exs
+```
+
 
 Target: 1,000,000 points/second ingested on a single node; range queries over 1 hour of data in < 100 ms.
 

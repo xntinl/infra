@@ -222,7 +222,20 @@ end
 mix test test/saga_engine/ --trace
 ```
 
-### Benchmark
+#
+## Main Entry Point
+
+```elixir
+def main do
+  IO.puts("======== 55 build distributed saga orchestrator ========")
+  IO.puts("Demonstrating core functionality")
+  IO.puts("")
+  
+  IO.puts("Run: mix test")
+end
+```
+
+## Benchmark
 
 **Objective**: Quantify saga throughput under load so orchestration overhead stays measured.
 

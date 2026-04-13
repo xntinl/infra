@@ -384,6 +384,19 @@ The `@after_compile` callback inspects the module's `__info__(:functions)` and c
 
 ---
 
+
+## Main Entry Point
+
+```elixir
+def main do
+  IO.puts("======== 14 build behaviour callback validator ========")
+  IO.puts("Demonstrating core functionality")
+  IO.puts("")
+  
+  IO.puts("Run: mix test")
+end
+```
+
 ## Benchmark
 
 **Objective**: Measure validation overhead on project compile and verify it scales linearly.

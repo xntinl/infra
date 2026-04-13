@@ -628,6 +628,19 @@ Barriers are injected at sources and flow through operators; when an operator se
 
 ---
 
+
+## Main Entry Point
+
+```elixir
+def main do
+  IO.puts("======== 22 build stream processor flink like ========")
+  IO.puts("Demonstrating core functionality")
+  IO.puts("")
+  
+  IO.puts("Run: mix test")
+end
+```
+
 ## Benchmark
 
 ```elixir
@@ -660,13 +673,17 @@ Benchee.run(%{
     Flowex.Runtime.flush(runtime)
   end
 }, time: 10, warmup: 2)
+```
 
-def main do
-  IO.puts("[Flowex] Exactly-once stream processing engine")
-  IO.puts("Chandy-Lamport barriers enable consistent snapshots across distributed pipelines")
-  IO.puts("Watermarks drive event-time windowed aggregations with late event grace periods")
-  :ok
-end
+## Quick start
+
+```bash
+# Start the application
+mix deps.get
+mix test
+
+# Or run the benchmark:
+mix run bench/flowex_bench.exs
 ```
 
 Target: 1M events/second through a 5-operator pipeline with 1-second checkpoints; recovery < 500ms.
